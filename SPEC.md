@@ -1,4 +1,4 @@
-# Baserunna — Specification
+# Baserunna Specification
 
 Baserunna is a web service that hosts small databases on object storage.
 Each database supports serializable transactions, KV APIs, and tables.
@@ -6,8 +6,6 @@ Service metadata is itself stored in a Baserunna database.
 
 Status: v1 specification. Sections marked **(future)** are explicitly out of
 scope for v1.
-
----
 
 ## 1. Goals and non-goals
 
@@ -369,9 +367,8 @@ transactions validate their reads at commit time.
 
 ### 6.1 Semantics
 
-- Default isolation is **serializable**, strictly serializable for
-  committed read-write transactions. This uses optimistic concurrency control
-  with backward validation:
+- Default isolation is serializable, strictly serializable for committed read-write transactions.
+  This uses optimistic concurrency control with backward validation:
   - the read set holds point keys (including misses) and scanned intervals.
     A scan that stopped at `limit` records only the interval it actually
     covered;

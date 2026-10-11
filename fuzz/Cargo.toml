@@ -1,0 +1,46 @@
+[package]
+name = "baserunna-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+baserunna = { path = "..", default-features = false }
+bytes = "1"
+serde_json = "1"
+
+# Standalone workspace so the main crate never builds these.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment"
+path = "fuzz_targets/segment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tuple_and_row"
+path = "fuzz_targets/tuple_and_row.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ops_json"
+path = "fuzz_targets/ops_json.rs"
+test = false
+doc = false
+bench = false

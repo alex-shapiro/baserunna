@@ -1,0 +1,3389 @@
+{
+  "components": {
+    "responses": {
+      "Error": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        },
+        "description": "Error"
+      }
+    },
+    "schemas": {
+      "ApiKey": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "type": "integer"
+          },
+          "db": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "db",
+          "read_only",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "Begin": {
+        "additionalProperties": false,
+        "properties": {
+          "commit_id": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "integer"
+          },
+          "idle_timeout_ms": {
+            "type": "integer"
+          },
+          "read_version": {
+            "type": "integer"
+          },
+          "txn_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "txn_id",
+          "commit_id",
+          "read_version",
+          "expires_at",
+          "idle_timeout_ms"
+        ],
+        "type": "object"
+      },
+      "BeginRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "encoding": {
+            "enum": [
+              "utf8",
+              "base64"
+            ],
+            "type": "string"
+          },
+          "isolation": {
+            "enum": [
+              "serializable",
+              "snapshot"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "BlobMeta": {
+        "additionalProperties": false,
+        "description": "An out-of-band blob.",
+        "properties": {
+          "blob_id": {
+            "type": "string"
+          },
+          "content_type": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "blob_id",
+          "size",
+          "sha256",
+          "content_type"
+        ],
+        "type": "object"
+      },
+      "Column": {
+        "additionalProperties": false,
+        "properties": {
+          "default": {},
+          "name": {
+            "type": "string"
+          },
+          "nullable": {
+            "type": "boolean"
+          },
+          "type": {
+            "$ref": "#/components/schemas/ColumnType"
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ],
+        "type": "object"
+      },
+      "ColumnType": {
+        "enum": [
+          "string",
+          "int",
+          "float",
+          "bool",
+          "bytes",
+          "json",
+          "blob"
+        ],
+        "type": "string"
+      },
+      "CommitStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "commit_id": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "committed",
+              "not_committed"
+            ],
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "commit_id"
+        ],
+        "type": "object"
+      },
+      "Committed": {
+        "additionalProperties": false,
+        "properties": {
+          "commit_id": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "commit_id"
+        ],
+        "type": "object"
+      },
+      "CreateApiKey": {
+        "additionalProperties": false,
+        "properties": {
+          "db": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "CreateTable": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/Column"
+            },
+            "type": "array"
+          },
+          "if_not_exists": {
+            "type": "boolean"
+          },
+          "indexes": {
+            "items": {
+              "$ref": "#/components/schemas/Index"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "primary_key": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "columns",
+          "primary_key"
+        ],
+        "type": "object"
+      },
+      "Credentials": {
+        "additionalProperties": false,
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "password": {
+            "minLength": 8,
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "password"
+        ],
+        "type": "object"
+      },
+      "DbInfo": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "stats": {
+            "additionalProperties": false,
+            "properties": {
+              "lease_holder": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "segment_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "segments": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "tail_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "version"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_at",
+          "stats"
+        ],
+        "type": "object"
+      },
+      "DbSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "DeleteResult": {
+        "additionalProperties": false,
+        "properties": {
+          "existed": {
+            "type": "boolean"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "existed"
+        ],
+        "type": "object"
+      },
+      "Empty": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "Error": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "enum": [
+                  "invalid_argument",
+                  "unauthenticated",
+                  "permission_denied",
+                  "not_found",
+                  "txn_not_found",
+                  "conflict",
+                  "already_exists",
+                  "precondition_failed",
+                  "too_large",
+                  "unavailable",
+                  "internal"
+                ],
+                "type": "string"
+              },
+              "details": {
+                "additionalProperties": false,
+                "properties": {
+                  "lease_holder": {
+                    "type": "string"
+                  },
+                  "op_index": {
+                    "type": "integer"
+                  },
+                  "outcome": {
+                    "enum": [
+                      "unknown",
+                      "not_applied"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [],
+                "type": "object"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "Filter": {
+        "additionalProperties": true,
+        "description": "`{\"and\": [...]}`, `{\"or\": [...]}`, `{\"not\": f}` or `{\"col\": name, \"op\": eq|ne|lt|le|gt|ge|in|prefix|is_null, \"value\": v}`.",
+        "type": "object"
+      },
+      "Found": {
+        "additionalProperties": false,
+        "properties": {
+          "found": {
+            "type": "boolean"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "found",
+          "version"
+        ],
+        "type": "object"
+      },
+      "Index": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "unique": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "columns"
+        ],
+        "type": "object"
+      },
+      "InsertRows": {
+        "additionalProperties": false,
+        "properties": {
+          "row": {
+            "$ref": "#/components/schemas/Row"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/Row"
+            },
+            "type": "array"
+          },
+          "upsert": {
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "KvItem": {
+        "additionalProperties": false,
+        "description": "A key and its value. Keys/values that are not valid UTF-8 in utf8 mode are returned in `key_b64` / `value_b64`. Values stored as blobs larger than the inline JSON limit only carry `blob`.",
+        "properties": {
+          "blob": {
+            "$ref": "#/components/schemas/BlobMeta"
+          },
+          "key": {
+            "type": "string"
+          },
+          "key_b64": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          },
+          "value_b64": {
+            "type": "string"
+          },
+          "version": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "type": "object"
+      },
+      "Me": {
+        "additionalProperties": false,
+        "properties": {
+          "credential": {
+            "additionalProperties": false,
+            "properties": {
+              "db": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "read_only": {
+                "type": "boolean"
+              },
+              "type": {
+                "enum": [
+                  "session",
+                  "api_key"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          "user": {
+            "$ref": "#/components/schemas/UserPublic"
+          }
+        },
+        "required": [
+          "user",
+          "credential"
+        ],
+        "type": "object"
+      },
+      "Node": {
+        "additionalProperties": false,
+        "properties": {
+          "addr": {
+            "type": "string"
+          },
+          "heartbeat_at": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "live": {
+            "type": "boolean"
+          },
+          "started_at": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "addr",
+          "started_at",
+          "heartbeat_at",
+          "live"
+        ],
+        "type": "object"
+      },
+      "Op": {
+        "description": "One operation. Keys and values are UTF-8 strings unless the request sets `encoding: base64`.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "op": {
+                "const": "get"
+              }
+            },
+            "required": [
+              "op",
+              "key"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "end": {
+                "type": "string"
+              },
+              "keys_only": {
+                "type": "boolean"
+              },
+              "limit": {
+                "maximum": 1000,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "op": {
+                "const": "scan"
+              },
+              "prefix": {
+                "type": "string"
+              },
+              "reverse": {
+                "type": "boolean"
+              },
+              "start": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "blob_id": {
+                "type": "string"
+              },
+              "key": {
+                "type": "string"
+              },
+              "op": {
+                "const": "put"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "key"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "op": {
+                "const": "delete"
+              }
+            },
+            "required": [
+              "op",
+              "key"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "end": {
+                "type": "string"
+              },
+              "op": {
+                "const": "delete_range"
+              },
+              "prefix": {
+                "type": "string"
+              },
+              "start": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "exists": {
+                "type": "boolean"
+              },
+              "key": {
+                "type": "string"
+              },
+              "op": {
+                "const": "check"
+              },
+              "value": {
+                "type": "string"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "op",
+              "key"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "by": {
+                "type": "integer"
+              },
+              "key": {
+                "type": "string"
+              },
+              "op": {
+                "const": "increment"
+              }
+            },
+            "required": [
+              "op",
+              "key"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "op": {
+                "const": "get_row"
+              },
+              "pk": {},
+              "table": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "table",
+              "pk"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "op": {
+                "const": "insert_row"
+              },
+              "row": {
+                "$ref": "#/components/schemas/Row"
+              },
+              "table": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "table",
+              "row"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "op": {
+                "const": "upsert_row"
+              },
+              "row": {
+                "$ref": "#/components/schemas/Row"
+              },
+              "table": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "table",
+              "row"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "op": {
+                "const": "update_row"
+              },
+              "pk": {},
+              "set": {
+                "$ref": "#/components/schemas/Row"
+              },
+              "table": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "table",
+              "pk",
+              "set"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "op": {
+                "const": "delete_row"
+              },
+              "pk": {},
+              "table": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "table",
+              "pk"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Query"
+              }
+            ],
+            "properties": {
+              "op": {
+                "const": "query_rows"
+              },
+              "table": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "table"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "OpResult": {
+        "additionalProperties": false,
+        "description": "Result of one op; the fields present depend on the op (see Op).",
+        "properties": {
+          "blob": {
+            "$ref": "#/components/schemas/BlobMeta"
+          },
+          "found": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/KvItem"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "row": {
+            "$ref": "#/components/schemas/Row"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/Row"
+            },
+            "type": "array"
+          },
+          "value": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "value_b64": {
+            "type": "string"
+          },
+          "version": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "OpsRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "ops": {
+            "items": {
+              "$ref": "#/components/schemas/Op"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ops"
+        ],
+        "type": "object"
+      },
+      "OpsResult": {
+        "additionalProperties": false,
+        "properties": {
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/OpResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ],
+        "type": "object"
+      },
+      "PkRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "consistency": {
+            "type": "string"
+          },
+          "max_staleness_ms": {
+            "type": "integer"
+          },
+          "pk": {}
+        },
+        "required": [
+          "pk"
+        ],
+        "type": "object"
+      },
+      "Query": {
+        "additionalProperties": false,
+        "description": "Scan the primary key (default) or a secondary index: equality on a prefix of its columns (`eq`), an optional range on the next column, a residual filter, and pagination via `cursor`.",
+        "properties": {
+          "consistency": {
+            "enum": [
+              "strong",
+              "snapshot"
+            ],
+            "type": "string"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "eq": {
+            "items": {},
+            "type": "array"
+          },
+          "filter": {
+            "$ref": "#/components/schemas/Filter"
+          },
+          "index": {
+            "type": "string"
+          },
+          "limit": {
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_staleness_ms": {
+            "type": "integer"
+          },
+          "range": {
+            "additionalProperties": false,
+            "properties": {
+              "gt": {},
+              "gte": {},
+              "lt": {},
+              "lte": {}
+            },
+            "required": [],
+            "type": "object"
+          },
+          "reverse": {
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "QueryResult": {
+        "additionalProperties": false,
+        "properties": {
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/Row"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows",
+          "next_cursor",
+          "version"
+        ],
+        "type": "object"
+      },
+      "Row": {
+        "additionalProperties": true,
+        "description": "Column name to value. `bytes` are base64; `blob` columns take a staged `blob_id` on write and return BlobMeta on read.",
+        "type": "object"
+      },
+      "RowCount": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "type": "integer"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "count",
+          "version"
+        ],
+        "type": "object"
+      },
+      "RowResult": {
+        "additionalProperties": false,
+        "properties": {
+          "found": {
+            "type": "boolean"
+          },
+          "row": {
+            "$ref": "#/components/schemas/Row"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "found",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ScanResult": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/KvItem"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "type": "object"
+      },
+      "Session": {
+        "additionalProperties": false,
+        "properties": {
+          "token": {
+            "type": "string"
+          },
+          "user": {
+            "$ref": "#/components/schemas/UserPublic"
+          }
+        },
+        "required": [
+          "token",
+          "user"
+        ],
+        "type": "object"
+      },
+      "TableSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/Column"
+            },
+            "type": "array"
+          },
+          "indexes": {
+            "items": {
+              "$ref": "#/components/schemas/Index"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "primary_key": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "columns",
+          "primary_key",
+          "indexes"
+        ],
+        "type": "object"
+      },
+      "TxnRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "consistency": {
+            "enum": [
+              "strong",
+              "snapshot"
+            ],
+            "type": "string"
+          },
+          "encoding": {
+            "enum": [
+              "utf8",
+              "base64"
+            ],
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "isolation": {
+            "enum": [
+              "serializable",
+              "snapshot"
+            ],
+            "type": "string"
+          },
+          "max_staleness_ms": {
+            "type": "integer"
+          },
+          "ops": {
+            "items": {
+              "$ref": "#/components/schemas/Op"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ops"
+        ],
+        "type": "object"
+      },
+      "TxnResult": {
+        "additionalProperties": false,
+        "properties": {
+          "commit_id": {
+            "type": "string"
+          },
+          "committed": {
+            "type": "boolean"
+          },
+          "replayed": {
+            "type": "boolean"
+          },
+          "results": {
+            "oneOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/OpResult"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "committed",
+          "results"
+        ],
+        "type": "object"
+      },
+      "UpdateRow": {
+        "additionalProperties": false,
+        "properties": {
+          "pk": {},
+          "set": {
+            "$ref": "#/components/schemas/Row"
+          }
+        },
+        "required": [
+          "pk",
+          "set"
+        ],
+        "type": "object"
+      },
+      "UserPublic": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "type": "integer"
+          },
+          "disabled": {
+            "type": "boolean"
+          },
+          "email": {
+            "type": "string"
+          },
+          "google_linked": {
+            "type": "boolean"
+          },
+          "has_password": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "is_admin": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "is_admin"
+        ],
+        "type": "object"
+      },
+      "Version": {
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Transactional key-value and table databases on object storage. Authenticate with `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for writes).",
+    "title": "Baserunna",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/healthz": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "node": {
+                      "type": "object"
+                    },
+                    "ok": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "ok"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [],
+        "summary": "Liveness and node status",
+        "tags": [
+          "ops"
+        ]
+      }
+    },
+    "/v1/admin/nodes": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "nodes": {
+                      "items": {
+                        "$ref": "#/components/schemas/Node"
+                      },
+                      "type": "array"
+                    },
+                    "this_node": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "nodes",
+                    "this_node"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Nodes"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Cluster membership (admin)",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/users": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "users": {
+                      "items": {
+                        "$ref": "#/components/schemas/UserPublic"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "users"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Users"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List users (admin)",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/users/{id}/disable": {
+      "post": {
+        "parameters": [
+          {
+            "description": "User id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "disabled": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Empty"
+                }
+              }
+            },
+            "description": "Done"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Disable or re-enable a user (admin)",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/api-keys": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "api_keys": {
+                      "items": {
+                        "$ref": "#/components/schemas/ApiKey"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "api_keys"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Keys"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List API keys",
+        "tags": [
+          "auth"
+        ]
+      },
+      "post": {
+        "description": "Keys may be limited to one database (`db`) and/or be read-only. Requires a session.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateApiKey"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "api_key": {
+                      "$ref": "#/components/schemas/ApiKey"
+                    },
+                    "key": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "key",
+                    "api_key"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The full key is shown only once"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Create an API key",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/api-keys/{id}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Key id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Empty"
+                }
+              }
+            },
+            "description": "Revoked"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Revoke an API key",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/google/callback": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Authorization code",
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "State",
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Signed in; redirect to return_to"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [],
+        "summary": "Google OAuth callback",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/google/start": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Relative path to return to",
+            "in": "query",
+            "name": "return_to",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to Google"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [],
+        "summary": "Begin Google sign-in",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/login": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "Session"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [],
+        "summary": "Sign in with email and password",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/logout": {
+      "post": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Empty"
+                }
+              }
+            },
+            "description": "Signed out"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "End the current session",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/signup": {
+      "post": {
+        "description": "Subject to the server's sign-up policy. The first account becomes an administrator.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "Signed up; a session is returned and set as a cookie"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [],
+        "summary": "Create an account (password)",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/dbs": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "databases": {
+                      "items": {
+                        "$ref": "#/components/schemas/DbSummary"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "databases"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Databases"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List your databases",
+        "tags": [
+          "databases"
+        ]
+      },
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DbSummary"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Create a database",
+        "tags": [
+          "databases"
+        ]
+      }
+    },
+    "/v1/dbs/{db}": {
+      "delete": {
+        "description": "Immediately invisible everywhere; storage is purged after a grace period. The name can be reused at once.",
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Empty"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Delete a database",
+        "tags": [
+          "databases"
+        ]
+      },
+      "get": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DbInfo"
+                }
+              }
+            },
+            "description": "Info"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Database info and stats",
+        "tags": [
+          "databases"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/blobs": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlobMeta"
+                }
+              }
+            },
+            "description": "Staged; bind it with a put op (blob_id) or a blob column within an hour"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Stage a blob (streamed upload)",
+        "tags": [
+          "kv"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/blobs/{blob_id}": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Blob id",
+            "in": "path",
+            "name": "blob_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Content"
+          },
+          "206": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Partial content"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Download a blob by id",
+        "tags": [
+          "kv"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/commits/{id}": {
+      "get": {
+        "description": "Fences in-flight attempts first, so the answer is final for commits whose request has ended (wait at least the commit deadline, about 15 s, after an ambiguous failure).",
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "commit_id (hex) or key:<idempotency key>",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitStatus"
+                }
+              }
+            },
+            "description": "Definitive status"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Resolve an ambiguous commit",
+        "tags": [
+          "transactions"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/kv": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Key prefix",
+            "in": "query",
+            "name": "prefix",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Inclusive start",
+            "in": "query",
+            "name": "start",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exclusive end",
+            "in": "query",
+            "name": "end",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "1..=1000 (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Descending order",
+            "in": "query",
+            "name": "reverse",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Omit values",
+            "in": "query",
+            "name": "keys_only",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Key/value encoding",
+            "in": "query",
+            "name": "encoding",
+            "required": false,
+            "schema": {
+              "enum": [
+                "utf8",
+                "base64"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanResult"
+                }
+              }
+            },
+            "description": "A page of items"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Scan keys",
+        "tags": [
+          "kv"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/kv/{key}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The key (percent-encoded bytes; `/` must be encoded as %2F)",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "\"<version>\"",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResult"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Delete a key",
+        "tags": [
+          "kv"
+        ]
+      },
+      "get": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The key (percent-encoded bytes; `/` must be encoded as %2F)",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "bytes=a-b",
+            "in": "header",
+            "name": "Range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The value",
+            "headers": {
+              "ETag": {
+                "description": "\"<version>\"",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-baserunna-version": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "206": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Partial content (Range)"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read a value as raw bytes",
+        "tags": [
+          "kv"
+        ]
+      },
+      "put": {
+        "description": "Large bodies are streamed into an out-of-band blob. Content-Type is preserved for blobs.",
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The key (percent-encoded bytes; `/` must be encoded as %2F)",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "\"<version>\": write only if unchanged",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "*: create only",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Version"
+                }
+              }
+            },
+            "description": "Written"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Write a value from raw bytes",
+        "tags": [
+          "kv"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/tables": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "tables": {
+                      "items": {
+                        "$ref": "#/components/schemas/TableSchema"
+                      },
+                      "type": "array"
+                    },
+                    "version": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "tables",
+                    "version"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Tables"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List tables",
+        "tags": [
+          "tables"
+        ]
+      },
+      "post": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTable"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableSchema"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Create a table",
+        "tags": [
+          "tables"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/tables/{t}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Version"
+                }
+              }
+            },
+            "description": "Dropped"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Drop a table",
+        "tags": [
+          "tables"
+        ]
+      },
+      "get": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableSchema"
+                }
+              }
+            },
+            "description": "Schema"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Describe a table",
+        "tags": [
+          "tables"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/tables/{t}/columns": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Column"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableSchema"
+                }
+              }
+            },
+            "description": "Schema"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Add a column",
+        "tags": [
+          "tables"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/tables/{t}/columns/{c}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Column",
+            "in": "path",
+            "name": "c",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableSchema"
+                }
+              }
+            },
+            "description": "Schema"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Drop a column",
+        "tags": [
+          "tables"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/tables/{t}/indexes": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Index"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableSchema"
+                }
+              }
+            },
+            "description": "Schema"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Add an index (backfilled transactionally)",
+        "tags": [
+          "tables"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/tables/{t}/indexes/{i}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Index",
+            "in": "path",
+            "name": "i",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableSchema"
+                }
+              }
+            },
+            "description": "Schema"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Drop an index",
+        "tags": [
+          "tables"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/tables/{t}/rows": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InsertRows"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RowCount"
+                }
+              }
+            },
+            "description": "Upserted"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RowCount"
+                }
+              }
+            },
+            "description": "Inserted"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Insert (or upsert) rows",
+        "tags": [
+          "tables"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/tables/{t}/rows/delete": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Found"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Delete a row",
+        "tags": [
+          "tables"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/tables/{t}/rows/get": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RowResult"
+                }
+              }
+            },
+            "description": "Row"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a row by primary key",
+        "tags": [
+          "tables"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/tables/{t}/rows/query": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Query"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueryResult"
+                }
+              }
+            },
+            "description": "Rows"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Query rows",
+        "tags": [
+          "tables"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/tables/{t}/rows/update": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateRow"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Found"
+                }
+              }
+            },
+            "description": "Updated"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Update columns of a row",
+        "tags": [
+          "tables"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/transactions": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BeginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Begin"
+                }
+              }
+            },
+            "description": "Begun"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Begin an interactive transaction",
+        "tags": [
+          "transactions"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/transactions/{id}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Transaction id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Empty"
+                }
+              }
+            },
+            "description": "Aborted"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Abort",
+        "tags": [
+          "transactions"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/transactions/{id}/commit": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Transaction id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Committed"
+                }
+              }
+            },
+            "description": "Committed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Commit",
+        "tags": [
+          "transactions"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/transactions/{id}/ops": {
+      "post": {
+        "description": "Any error aborts the transaction.",
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Transaction id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpsResult"
+                }
+              }
+            },
+            "description": "Results"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Run ops in a transaction",
+        "tags": [
+          "transactions"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/txn": {
+      "post": {
+        "description": "Ops execute in order with read-your-writes, atomically. Serializable by default; conflicts are retried server-side. With `idempotency_key`, retries never apply twice (a replay returns `replayed: true` and null results).",
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TxnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TxnResult"
+                }
+              }
+            },
+            "description": "Results (committed if it wrote)"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Run a one-shot transaction",
+        "tags": [
+          "transactions"
+        ]
+      }
+    },
+    "/v1/me": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            },
+            "description": "Me"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "The authenticated principal",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "OpenAPI document"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [],
+        "summary": "This document",
+        "tags": [
+          "ops"
+        ]
+      }
+    }
+  },
+  "security": [
+    {
+      "bearer": []
+    }
+  ],
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "tags": [
+    {
+      "name": "auth"
+    },
+    {
+      "name": "databases"
+    },
+    {
+      "name": "kv"
+    },
+    {
+      "name": "transactions"
+    },
+    {
+      "name": "tables"
+    },
+    {
+      "name": "admin"
+    },
+    {
+      "name": "ops"
+    }
+  ]
+}

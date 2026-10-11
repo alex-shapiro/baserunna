@@ -1,0 +1,183 @@
+//! A small async Rust client for the Baserunna HTTP API (used by the
+//! examples; usable as a minimal SDK).
+
+use axum::body::Body;
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
+use std::fmt;
+
+#[derive(Debug, Clone)]
+pub struct ApiError {
+    pub status: u16,
+    pub code: String,
+    pub message: String,
+    pub body: Value,
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HTTP {} {}: {}", self.status, self.code, self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+impl ApiError {
+    pub fn retryable(&self) -> bool {
+        self.body["error"]["retryable"] == true
+    }
+}
+
+#[derive(Clone)]
+pub struct Client {
+    base: String,
+    token: Option<String>,
+    http: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
+}
+
+/// Percent-encode one path segment (e.g. a key).
+pub fn seg(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+impl Client {
+    pub fn new(base: &str) -> Client {
+        Client {
+            base: base.trim_end_matches('/').to_string(),
+            token: None,
+            http: hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(hyper_util::client::legacy::connect::HttpConnector::new()),
+        }
+    }
+
+    /// A copy of this client that authenticates with `token` (a session
+    /// token or an API key).
+    pub fn with_token(&self, token: &str) -> Client {
+        Client { token: Some(token.to_string()), ..self.clone() }
+    }
+
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
+    /// Send a request; returns status, headers and body bytes.
+    pub async fn raw(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> Result<(u16, http::HeaderMap, Bytes), ApiError> {
+        let mut b = http::Request::builder().method(method).uri(format!("{}{}", self.base, path));
+        if let Some(t) = &self.token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let req = b.body(Body::from(body)).map_err(|e| net(e.to_string()))?;
+        let resp = self.http.request(req).await.map_err(|e| net(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let headers = resp.headers().clone();
+        let bytes = resp.into_body().collect().await.map_err(|e| net(e.to_string()))?.to_bytes();
+        Ok((status, headers, bytes))
+    }
+
+    /// JSON request; non-2xx responses become [`ApiError`].
+    pub async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, ApiError> {
+        let bytes = body.map(|b| Bytes::from(b.to_string())).unwrap_or_default();
+        let (status, _, out) = self.raw(method, path, &[("content-type", "application/json")], bytes).await?;
+        let v: Value = if out.is_empty() { Value::Null } else { serde_json::from_slice(&out).unwrap_or(Value::Null) };
+        if (200..300).contains(&status) {
+            Ok(v)
+        } else {
+            Err(ApiError {
+                status,
+                code: v["error"]["code"].as_str().unwrap_or("").to_string(),
+                message: v["error"]["message"].as_str().unwrap_or("").to_string(),
+                body: v,
+            })
+        }
+    }
+
+    pub async fn get(&self, path: &str) -> Result<Value, ApiError> {
+        self.call("GET", path, None).await
+    }
+
+    pub async fn post(&self, path: &str, body: Value) -> Result<Value, ApiError> {
+        self.call("POST", path, Some(body)).await
+    }
+
+    pub async fn delete(&self, path: &str) -> Result<Value, ApiError> {
+        self.call("DELETE", path, None).await
+    }
+
+    // ---- convenience wrappers
+
+    pub async fn signup(&self, email: &str, password: &str) -> Result<Client, ApiError> {
+        let r = self.post("/v1/auth/signup", json!({"email": email, "password": password})).await?;
+        Ok(self.with_token(r["token"].as_str().unwrap_or_default()))
+    }
+
+    pub async fn login(&self, email: &str, password: &str) -> Result<Client, ApiError> {
+        let r = self.post("/v1/auth/login", json!({"email": email, "password": password})).await?;
+        Ok(self.with_token(r["token"].as_str().unwrap_or_default()))
+    }
+
+    pub async fn create_db(&self, name: &str) -> Result<Value, ApiError> {
+        self.post("/v1/dbs", json!({"name": name})).await
+    }
+
+    /// One-shot transaction.
+    pub async fn txn(&self, db: &str, ops: Value) -> Result<Value, ApiError> {
+        self.post(&format!("/v1/dbs/{}/txn", seg(db)), json!({"ops": ops})).await
+    }
+
+    pub async fn put_bytes(&self, db: &str, key: &str, data: Bytes, content_type: &str) -> Result<u64, ApiError> {
+        let (st, _, out) = self
+            .raw("PUT", &format!("/v1/dbs/{}/kv/{}", seg(db), seg(key)), &[("content-type", content_type)], data)
+            .await?;
+        let v: Value = serde_json::from_slice(&out).unwrap_or(Value::Null);
+        if st == 200 { Ok(v["version"].as_u64().unwrap_or(0)) } else { Err(api_err(st, v)) }
+    }
+
+    /// Raw bytes of a key (optionally a `Range` like `bytes=0-99`).
+    pub async fn get_bytes(&self, db: &str, key: &str, range: Option<&str>) -> Result<Option<Bytes>, ApiError> {
+        let h: Vec<(&str, &str)> = range.map(|r| vec![("range", r)]).unwrap_or_default();
+        let (st, _, out) = self.raw("GET", &format!("/v1/dbs/{}/kv/{}", seg(db), seg(key)), &h, Bytes::new()).await?;
+        match st {
+            200 | 206 => Ok(Some(out)),
+            404 => Ok(None),
+            _ => Err(api_err(st, serde_json::from_slice(&out).unwrap_or(Value::Null))),
+        }
+    }
+
+    pub async fn stage_blob(&self, db: &str, data: Bytes, content_type: &str) -> Result<Value, ApiError> {
+        let (st, _, out) =
+            self.raw("POST", &format!("/v1/dbs/{}/blobs", seg(db)), &[("content-type", content_type)], data).await?;
+        let v: Value = serde_json::from_slice(&out).unwrap_or(Value::Null);
+        if st == 201 { Ok(v) } else { Err(api_err(st, v)) }
+    }
+}
+
+fn net(m: String) -> ApiError {
+    ApiError { status: 0, code: "network".into(), message: m, body: Value::Null }
+}
+
+fn api_err(status: u16, v: Value) -> ApiError {
+    ApiError {
+        status,
+        code: v["error"]["code"].as_str().unwrap_or("").to_string(),
+        message: v["error"]["message"].as_str().unwrap_or("").to_string(),
+        body: v,
+    }
+}

@@ -1,0 +1,412 @@
+//! HTTP API (axum). See SPEC §10 and `openapi.json`.
+
+mod account;
+pub mod body;
+mod data;
+pub mod openapi;
+
+use crate::cluster::{CLUSTER_KEY_HEADER, HOPS_HEADER};
+use crate::engine::{Consistency, Db};
+use crate::error::{Error, Result};
+use crate::meta::DbRecord;
+use crate::node::{Node, Principal};
+use axum::Router;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Request, State};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use bytes::Bytes;
+use http::{HeaderMap, HeaderValue, StatusCode};
+use serde::de::DeserializeOwned;
+use serde_json::{Value as Json, json};
+use std::sync::Arc;
+
+pub const SESSION_COOKIE: &str = "brs_session";
+
+impl IntoResponse for Error {
+    fn into_response(self) -> Response {
+        let status = StatusCode::from_u16(self.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let mut err = json!({
+            "code": self.code(),
+            "message": self.message(),
+            "retryable": self.retryable(),
+        });
+        let mut retry_after = None;
+        match &self {
+            Error::PreconditionFailed { op_index: Some(i), .. } => err["details"] = json!({"op_index": i}),
+            Error::NotOwner { holder, retry_after_ms } => {
+                err["details"] = json!({"lease_holder": holder});
+                retry_after = Some(*retry_after_ms);
+            }
+            Error::Unavailable { outcome_unknown, retry_after_ms, .. } => {
+                err["details"] = json!({"outcome": if *outcome_unknown { "unknown" } else { "not_applied" }});
+                retry_after = *retry_after_ms;
+            }
+            _ => {}
+        }
+        if let Error::Internal(m) = &self {
+            crate::warn!("internal error: {m}");
+        }
+        let mut resp = (status, axum::Json(json!({"error": err}))).into_response();
+        if let Some(ms) = retry_after {
+            let secs = ms.div_ceil(1000).max(1);
+            if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut().insert(http::header::RETRY_AFTER, v);
+            }
+        }
+        resp
+    }
+}
+
+/// Rebuild an [`Error`] from an error response (used when forwarding).
+pub fn error_from_json(status: u16, j: &Json) -> Error {
+    let e = &j["error"];
+    let m = e["message"].as_str().unwrap_or("request failed").to_string();
+    match e["code"].as_str().unwrap_or("") {
+        "invalid_argument" => Error::InvalidArgument(m),
+        "unauthenticated" => Error::Unauthenticated(m),
+        "permission_denied" => Error::PermissionDenied(m),
+        "not_found" => Error::NotFound(m),
+        "txn_not_found" => Error::TxnNotFound,
+        "conflict" => Error::Conflict(m),
+        "already_exists" => Error::AlreadyExists(m),
+        "precondition_failed" => {
+            Error::PreconditionFailed { message: m, op_index: e["details"]["op_index"].as_u64().map(|i| i as usize) }
+        }
+        "too_large" => Error::TooLarge(m),
+        "unavailable" => Error::Unavailable {
+            message: m,
+            retry_after_ms: Some(500),
+            outcome_unknown: e["details"]["outcome"] == "unknown",
+        },
+        _ => Error::Internal(format!("{status}: {m}")),
+    }
+}
+
+/// JSON body extractor that reports errors in the API's format.
+pub struct JsonBody<T>(pub T);
+
+impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for JsonBody<T> {
+    type Rejection = Error;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self> {
+        let b = Bytes::from_request(req, state).await.map_err(|e| match e.status() {
+            StatusCode::PAYLOAD_TOO_LARGE => Error::TooLarge("request body too large".into()),
+            _ => Error::invalid(format!("could not read body: {e}")),
+        })?;
+        let b: &[u8] = if b.iter().all(|c| c.is_ascii_whitespace()) { b"{}" } else { &b };
+        serde_json::from_slice(b).map(JsonBody).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))
+    }
+}
+
+/// Bearer token or session cookie.
+pub fn credential(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+        && let Some(t) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer "))
+    {
+        return Some(t.trim().to_string());
+    }
+    cookie(headers, SESSION_COOKIE)
+}
+
+pub fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    for v in headers.get_all(http::header::COOKIE) {
+        let Ok(s) = v.to_str() else { continue };
+        for part in s.split(';') {
+            if let Some((k, val)) = part.trim().split_once('=')
+                && k == name
+            {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Authenticated principal extractor.
+pub struct Auth(pub Principal);
+
+impl FromRequestParts<Arc<Node>> for Auth {
+    type Rejection = Error;
+
+    async fn from_request_parts(parts: &mut http::request::Parts, node: &Arc<Node>) -> Result<Self> {
+        if let Some(p) = parts.extensions.get::<Principal>() {
+            return Ok(Auth(p.clone()));
+        }
+        let t = credential(&parts.headers).ok_or_else(|| Error::Unauthenticated("missing credentials".into()))?;
+        Ok(Auth(node.authenticate(&t).await?))
+    }
+}
+
+/// Context for database-scoped routes (inserted by [`db_routing`]).
+#[derive(Clone)]
+pub struct DbCtx {
+    pub principal: Principal,
+    pub rec: DbRecord,
+    pub db: Arc<Db>,
+}
+
+pub fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let h = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(v) = h {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn db_name_from_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/v1/dbs/")?;
+    let name = rest.split('/').next()?;
+    if name.is_empty() {
+        return None;
+    }
+    String::from_utf8(percent_decode(name)).ok()
+}
+
+fn clone_parts(req: &Request) -> http::request::Builder {
+    let mut b = http::Request::builder().method(req.method().clone()).uri(req.uri().clone()).version(req.version());
+    if let Some(h) = b.headers_mut() {
+        *h = req.headers().clone();
+    }
+    b
+}
+
+const BUFFER_FORWARD_MAX: u64 = 1024 * 1024;
+
+/// Middleware for `/v1/dbs/{db}/…`: authenticate, resolve the database,
+/// then either forward the request to the database's owner node or handle
+/// it here.
+async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
+    let res: Result<Response> = async {
+        let name = db_name_from_path(req.uri().path()).ok_or_else(|| Error::not_found("no such route"))?;
+        let token = credential(req.headers()).ok_or_else(|| Error::Unauthenticated("missing credentials".into()))?;
+        let principal = node.authenticate(&token).await?;
+        let mut rec = node.resolve_db(&principal, &name).await?;
+        let hops: u32 =
+            req.headers().get(HOPS_HEADER).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0);
+        if hops < 2
+            && let Some((target, addr)) = node.route(&rec.id).await
+        {
+            let small = req.method() == http::Method::GET
+                || req.method() == http::Method::DELETE
+                || req
+                    .headers()
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .is_some_and(|n| n <= BUFFER_FORWARD_MAX);
+            if small {
+                let (parts, body) = req.into_parts();
+                let bytes = axum::body::to_bytes(body, BUFFER_FORWARD_MAX as usize)
+                    .await
+                    .map_err(|e| Error::invalid(format!("could not read body: {e}")))?;
+                let mut fwd = http::Request::builder()
+                    .method(parts.method.clone())
+                    .uri(parts.uri.clone())
+                    .version(parts.version)
+                    .body(Body::from(bytes.clone()))
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                *fwd.headers_mut() = parts.headers.clone();
+                fwd.headers_mut().insert(HOPS_HEADER, HeaderValue::from(hops + 1));
+                let idempotent = parts.method == http::Method::GET || parts.method == http::Method::HEAD;
+                match node.transport.call(&addr, fwd).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(te) if te.maybe_delivered && !idempotent => {
+                        return Err(Error::Unavailable {
+                            message: format!("forwarding to {target} failed: {}", te.message),
+                            retry_after_ms: Some(1000),
+                            outcome_unknown: true,
+                        });
+                    }
+                    Err(_) => {
+                        // Never delivered: handle it here, keeping the
+                        // original parts (and routing extensions).
+                        node.mark_suspect(&target);
+                        req = Request::from_parts(parts, Body::from(bytes));
+                    }
+                }
+            } else {
+                let mut fwd = clone_parts(&req)
+                    .body(std::mem::take(req.body_mut()))
+                    .map_err(|e| Error::internal(e.to_string()))?;
+                fwd.headers_mut().insert(HOPS_HEADER, HeaderValue::from(hops + 1));
+                return match node.transport.call(&addr, fwd).await {
+                    Ok(resp) => Ok(resp),
+                    Err(te) => {
+                        node.mark_suspect(&target);
+                        Err(Error::Unavailable {
+                            message: format!("forwarding to {target} failed: {}", te.message),
+                            retry_after_ms: Some(1000),
+                            outcome_unknown: te.maybe_delivered,
+                        })
+                    }
+                };
+            }
+        }
+        // A cached name may point at a database deleted (and possibly
+        // purged or recreated) since: verify, and re-resolve once if so.
+        let opened = match node.open_db(&rec).await {
+            Ok(db) => match db.read_version(Consistency::Strong).await {
+                Err(Error::NotFound(m)) => Err(m),
+                Err(e) => return Err(e),
+                Ok(_) => Ok(db),
+            },
+            Err(Error::NotFound(m)) => Err(m),
+            Err(e) => return Err(e),
+        };
+        let db = match opened {
+            Ok(db) => db,
+            Err(m) if name.starts_with("id:") => return Err(Error::NotFound(m)),
+            Err(m) => {
+                let fresh = node.resolve_db_strong(&principal, &name).await?;
+                if fresh.id == rec.id {
+                    // Deleted in storage but still named in metadata: a
+                    // delete that was interrupted halfway. Finish it.
+                    if node.run_meta(crate::meta::MetaCmd::DeleteDb { id: rec.id.clone() }).await.is_ok() {
+                        node.forget_db_name(&rec.owner_id, &rec.name);
+                    }
+                    return Err(Error::NotFound(m));
+                }
+                rec = fresh;
+                node.open_db(&rec).await?
+            }
+        };
+        req.extensions_mut().insert(principal.clone());
+        req.extensions_mut().insert(DbCtx { principal, rec: rec.clone(), db });
+        let resp = next.run(req).await;
+        if resp.status() == StatusCode::NOT_FOUND {
+            // A stale name mapping can point at a deleted database.
+            node.forget_db_name(&rec.owner_id, &rec.name);
+        }
+        Ok(resp)
+    }
+    .await;
+    res.unwrap_or_else(|e| e.into_response())
+}
+
+/// Internal endpoints always require the cluster key (configured, or
+/// generated per cluster and kept in the system database).
+async fn internal_auth(State(node): State<Arc<Node>>, req: Request, next: Next) -> Response {
+    let ok = match node.cluster_key() {
+        None => false,
+        Some(k) => req
+            .headers()
+            .get(CLUSTER_KEY_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| crate::util::ct_eq(v.as_bytes(), k.as_bytes())),
+    };
+    if !ok {
+        return Error::PermissionDenied("bad cluster key".into()).into_response();
+    }
+    next.run(req).await
+}
+
+/// Parse `consistency` / `max_staleness_ms` query parameters.
+pub fn consistency_of(q: &std::collections::BTreeMap<String, String>) -> Result<Consistency> {
+    match q.get("consistency").map(|s| s.as_str()) {
+        None | Some("strong") => Ok(Consistency::Strong),
+        Some("snapshot") => Ok(Consistency::Snapshot {
+            max_staleness_ms: q
+                .get("max_staleness_ms")
+                .map(|s| s.parse().map_err(|_| Error::invalid("bad max_staleness_ms")))
+                .transpose()?
+                .unwrap_or(5000),
+        }),
+        Some(o) => Err(Error::invalid(format!("unknown consistency {o:?}"))),
+    }
+}
+
+/// Run `$body` (with `$t: &mut Txn`) in a transaction and commit,
+/// retrying optimistic-concurrency conflicts. Evaluates to `(T, Seq)`;
+/// errors return from the enclosing handler.
+macro_rules! with_txn {
+    ($node:expr, $db:expr, $p:expr, |$t:ident| $body:expr) => {{
+        $p.require_writable()?;
+        let mut attempt_ = 0u32;
+        let deadline_ =
+            tokio::time::Instant::now() + std::time::Duration::from_millis($db.shared().cfg.commit_timeout_ms);
+        loop {
+            let mut txn_ =
+                $db.begin(crate::engine::Isolation::Serializable, crate::engine::Consistency::Strong).await?;
+            let out_ = {
+                let $t: &mut crate::engine::Txn = &mut txn_;
+                $body
+            }?;
+            let mut req_ = txn_.into_request();
+            req_.deadline = Some(deadline_);
+            match $db.commit(req_).await {
+                Ok(v) => break (out_, v),
+                Err(crate::error::Error::Conflict(_)) if attempt_ < $node.cfg.txn_retries => {
+                    attempt_ += 1;
+                    let d = 5 * (1u64 << attempt_) + $node.env.random_below(10);
+                    tokio::time::sleep(std::time::Duration::from_millis(d)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }};
+}
+pub(crate) use with_txn;
+
+/// Run `$body` (with `$t: &mut Txn`) on a read snapshot. Evaluates to
+/// `(T, Seq)`.
+macro_rules! with_read {
+    ($db:expr, $c:expr, |$t:ident| $body:expr) => {{
+        let mut txn_ = $db.begin(crate::engine::Isolation::Serializable, $c).await?;
+        let v_ = txn_.read_version();
+        let out_ = {
+            let $t: &mut crate::engine::Txn = &mut txn_;
+            $body
+        }?;
+        (out_, v_)
+    }};
+}
+pub(crate) use with_read;
+
+async fn healthz(State(node): State<Arc<Node>>) -> Response {
+    axum::Json(json!({"ok": true, "node": node.status_json()})).into_response()
+}
+
+async fn openapi() -> Response {
+    ([(http::header::CONTENT_TYPE, "application/json")], openapi::document_json()).into_response()
+}
+
+async fn not_found() -> Error {
+    Error::not_found("no such route")
+}
+
+/// Build the full router (API, internal endpoints, console).
+pub fn router(node: Arc<Node>) -> Router {
+    let db_routes = data::routes().route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
+    let internal = Router::new()
+        .route("/internal/v1/meta", post(account::internal_meta))
+        .route_layer(middleware::from_fn_with_state(node.clone(), internal_auth));
+    let r = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/v1/openapi.json", get(openapi))
+        .merge(account::routes())
+        .route("/v1/dbs", get(data::list_dbs).post(data::create_db))
+        .merge(db_routes)
+        .merge(internal)
+        .merge(crate::console::routes())
+        .fallback(not_found)
+        .layer(DefaultBodyLimit::max(node.cfg.max_json_body))
+        .with_state(node.clone());
+    node.set_router(r.clone());
+    r
+}
+
+pub(crate) use axum::extract::Query as QueryParams;
+pub(crate) type Params = QueryParams<std::collections::BTreeMap<String, String>>;

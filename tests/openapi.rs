@@ -1,7 +1,5 @@
-//! OpenAPI document checks: well-formed, every reference resolves, and the
-//! documented routes are exactly the router's public routes. (Every
-//! simulated response is additionally validated against the document by the
-//! simulation client.)
+//! The OpenAPI document is well formed, every reference resolves, and the
+//! documented routes are exactly the router's public routes.
 
 use baserunna::sim::SimResponse;
 use baserunna::sim::openapi_check::{check_response, doc, match_path, validate};

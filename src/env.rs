@@ -14,12 +14,13 @@
 use crate::util::rng::Rng;
 use std::future::Future;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 enum Clock {
     Real,
-    Sim { base_ms: u64, origin: Instant, skew_ms: i64 },
+    Sim { base_ms: u64, origin: Instant, skew_ms: AtomicI64 },
 }
 
 pub type Tracer = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
@@ -42,7 +43,7 @@ impl Env {
     /// wall clock.
     pub fn sim(seed: u64, base_ms: u64, origin: Instant, skew_ms: i64) -> Env {
         Env {
-            clock: Clock::Sim { base_ms, origin, skew_ms },
+            clock: Clock::Sim { base_ms, origin, skew_ms: AtomicI64::new(skew_ms) },
             rng: Mutex::new(Some(Rng::new(seed))),
             tasks: Mutex::new(JoinSet::new()),
             tracer: Mutex::new(None),
@@ -79,8 +80,16 @@ impl Env {
                 .unwrap_or(0),
             Clock::Sim { base_ms, origin, skew_ms } => {
                 let elapsed = Instant::now().saturating_duration_since(*origin).as_millis() as i64;
-                (*base_ms as i64 + elapsed + *skew_ms).max(0) as u64
+                (*base_ms as i64 + elapsed + skew_ms.load(Ordering::SeqCst)).max(0) as u64
             }
+        }
+    }
+
+    /// Step this node's wall clock by `delta_ms` (simulation only; the
+    /// production clock is the system's).
+    pub fn step_clock(&self, delta_ms: i64) {
+        if let Clock::Sim { skew_ms, .. } = &self.clock {
+            skew_ms.fetch_add(delta_ms, Ordering::SeqCst);
         }
     }
 
@@ -154,7 +163,6 @@ impl Drop for Env {
     }
 }
 
-/// Sleep helper.
 pub async fn sleep_ms(ms: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
 }

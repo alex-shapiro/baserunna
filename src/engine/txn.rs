@@ -1,7 +1,7 @@
 //! Engine-level optimistic transactions: a snapshot, a read set, and a
 //! buffered write set. Reads see the transaction's own writes.
 
-use super::types::{BlobRef, Entry, Seq, Value};
+use super::types::{Entry, Seq, Value};
 use super::version::{KeyRange, Version};
 use crate::error::{Error, Result};
 use bytes::Bytes;
@@ -65,6 +65,8 @@ pub struct CommitRequest {
     pub read_version: Seq,
     pub isolation: Isolation,
     pub reads: Vec<ReadItem>,
+    /// Reads validated under every isolation level (see [`Txn::get_pinned`]).
+    pub pinned_reads: Vec<Bytes>,
     pub writes: WriteSet,
 }
 
@@ -81,6 +83,7 @@ pub struct Txn {
     pub snapshot: Arc<Version>,
     pub isolation: Isolation,
     pub reads: Vec<ReadItem>,
+    pinned_reads: Vec<Bytes>,
     pub writes: WriteSet,
     pub commit_id: u128,
     write_bytes: usize,
@@ -93,6 +96,7 @@ impl Txn {
             snapshot,
             isolation,
             reads: Vec::new(),
+            pinned_reads: Vec::new(),
             writes: WriteSet::default(),
             commit_id,
             write_bytes: 0,
@@ -124,6 +128,14 @@ impl Txn {
         Ok(self.snapshot.get(key).await?.map(|e| ReadValue { key: e.key, value: e.value, seq: Some(e.seq) }))
     }
 
+    /// Point read that the commit validates even under snapshot isolation:
+    /// for data the transaction's writes are derived from, such as a table
+    /// schema that decides which index entries a row write maintains.
+    pub async fn get_pinned(&mut self, key: &[u8]) -> Result<Option<ReadValue>> {
+        self.pinned_reads.push(Bytes::copy_from_slice(key));
+        self.get(key).await
+    }
+
     /// Range read with read-your-writes. Records the interval actually
     /// covered (up to the last returned key when `limit` is hit).
     pub async fn scan(&mut self, range: &KeyRange, reverse: bool, limit: usize) -> Result<Vec<ReadValue>> {
@@ -135,15 +147,15 @@ impl Txn {
         let mut window = range.clone();
         loop {
             let snap = self.snapshot.scan(&window, reverse, batch, false).await?;
-            let exhausted = snap.len() < batch;
-            // The part of the range examined in this round.
-            let examined = match (exhausted, snap.last()) {
-                (true, _) | (false, None) => window.clone(),
-                (false, Some(last)) => {
+            // Where this round stopped, unless it exhausted the window.
+            let last = snap.last().filter(|_| snap.len() == batch).map(|e| e.key.clone());
+            let examined = match &last {
+                None => window.clone(),
+                Some(k) => {
                     if reverse {
-                        KeyRange::new(Bound::Included(last.key.clone()), window.end.clone())
+                        KeyRange::new(Bound::Included(k.clone()), window.end.clone())
                     } else {
-                        KeyRange::new(window.start.clone(), Bound::Included(last.key.clone()))
+                        KeyRange::new(window.start.clone(), Bound::Included(k.clone()))
                     }
                 }
             };
@@ -177,22 +189,15 @@ impl Txn {
                 self.reads.push(ReadItem::Range(covered));
                 return Ok(out);
             }
-            if exhausted {
+            let Some(k) = last else {
                 self.reads.push(ReadItem::Range(range.clone()));
                 return Ok(out);
-            }
+            };
             // Continue after the examined part.
-            window = match examined {
-                KeyRange { end: Bound::Included(k), .. } if !reverse => {
-                    KeyRange::new(Bound::Excluded(k), window.end.clone())
-                }
-                KeyRange { start: Bound::Included(k), .. } if reverse => {
-                    KeyRange::new(window.start.clone(), Bound::Excluded(k))
-                }
-                _ => {
-                    self.reads.push(ReadItem::Range(range.clone()));
-                    return Ok(out);
-                }
+            window = if reverse {
+                KeyRange::new(window.start.clone(), Bound::Excluded(k))
+            } else {
+                KeyRange::new(Bound::Excluded(k), window.end.clone())
             };
         }
     }
@@ -209,10 +214,6 @@ impl Txn {
         self.account(key.len() + value.size())?;
         self.writes.puts.insert(key, Some(value));
         Ok(())
-    }
-
-    pub fn put_blob(&mut self, key: Bytes, blob: BlobRef) -> Result<()> {
-        self.put(key, Value::Blob(blob))
     }
 
     pub fn delete(&mut self, key: Bytes) -> Result<()> {
@@ -241,6 +242,7 @@ impl Txn {
             read_version: self.snapshot.version(),
             isolation: self.isolation,
             reads: self.reads,
+            pinned_reads: self.pinned_reads,
             writes: self.writes,
         }
     }
@@ -255,6 +257,7 @@ pub async fn validate(req: &CommitRequest, base: &Version, earlier: &[&WriteSet]
         Isolation::Snapshot => {
             let mut v: Vec<ReadItem> = req.writes.puts.keys().cloned().map(ReadItem::Key).collect();
             v.extend(req.writes.range_deletes.iter().cloned().map(ReadItem::Range));
+            v.extend(req.pinned_reads.iter().cloned().map(ReadItem::Key));
             v
         }
     };

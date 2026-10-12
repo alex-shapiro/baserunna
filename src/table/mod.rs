@@ -9,7 +9,7 @@ use crate::engine::{BlobRef, Db, KeyRange, ReadValue, Txn, Value, blob};
 use crate::error::{Error, Result};
 use crate::util::b64;
 use bytes::Bytes;
-use schema::{ColType, Column, Datum, IndexDef, Row, TableSchema, datum_from_json, key_from_json, valid_ident};
+use schema::{ColType, Column, Datum, IndexDef, Row, TableSchema, datum_from_json, key_from_json};
 use serde::Deserialize;
 use serde_json::{Map, Value as Json};
 use std::collections::BTreeSet;
@@ -85,8 +85,10 @@ fn decode_schema(it: &ReadValue) -> Result<TableSchema> {
     }
 }
 
+/// A table's schema. Pinned: every write derived from it must commit
+/// against the schema it was derived from, whatever the isolation level.
 pub async fn get_schema(txn: &mut Txn, name: &str) -> Result<TableSchema> {
-    match txn.get(&catalog_key(name)).await? {
+    match txn.get_pinned(&catalog_key(name)).await? {
         Some(it) => decode_schema(&it),
         None => Err(Error::not_found(format!("table {name:?} not found"))),
     }
@@ -221,20 +223,10 @@ pub async fn drop_column(txn: &mut Txn, table: &str, name: &str) -> Result<Table
         return Err(Error::invalid(format!("column is used by index {:?}; drop it first", i.name)));
     }
     if col.ty == ColType::Blob {
-        // Remove side entries of this column.
-        let prefix = table_prefix(SPACE_ROW_BLOBS, s.id);
-        let mut start = Bound::Included(Bytes::from(prefix.clone()));
-        let end = crate::util::prefix_end(&prefix).map(|e| Bound::Excluded(Bytes::from(e))).unwrap_or(Bound::Unbounded);
-        loop {
-            let page = txn.scan(&KeyRange::new(start.clone(), end.clone()), false, 1000).await?;
-            for it in &page {
-                if it.key.ends_with(&col.id.to_be_bytes()) {
-                    txn.delete(it.key.clone())?;
-                }
-            }
-            match page.last() {
-                Some(l) if page.len() == 1000 => start = Bound::Excluded(l.key.clone()),
-                _ => break,
+        let mut pages = Pages::new(KeyRange::prefix(&table_prefix(SPACE_ROW_BLOBS, s.id)));
+        while let Some(page) = pages.next(txn).await? {
+            for it in page.iter().filter(|it| it.key.ends_with(&col.id.to_be_bytes())) {
+                txn.delete(it.key.clone())?;
             }
         }
     }
@@ -254,13 +246,7 @@ pub async fn add_index(txn: &mut Txn, table: &str, spec: &IndexSpec) -> Result<T
     s.validate_index(&idx)?;
     s.next_index_id += 1;
     s.indexes.push(idx.clone());
-    // Backfill.
-    let rows = scan_all_rows(txn, &s, MAX_BACKFILL_ROWS + 1).await?;
-    if rows.len() > MAX_BACKFILL_ROWS {
-        return Err(Error::TooLarge(format!(
-            "tables over {MAX_BACKFILL_ROWS} rows cannot be indexed in one transaction"
-        )));
-    }
+    let rows = all_rows(txn, &s, MAX_BACKFILL_ROWS).await?;
     let mut seen = BTreeSet::new();
     for (pk, row) in &rows {
         let (k, v) = index_entry(&s, &idx, row, pk)?;
@@ -284,32 +270,32 @@ pub async fn drop_index(txn: &mut Txn, table: &str, name: &str) -> Result<TableS
 
 // ---------------------------------------------------------------- rows
 
+/// The key of a row from [`row_from_json`], which has already rejected
+/// missing and null key columns.
 fn pk_keys_of_row(s: &TableSchema, row: &Row) -> Result<Vec<Key>> {
     s.primary_key
         .iter()
         .map(|p| {
-            let c = s.column(p).ok_or_else(|| Error::internal("pk column missing"))?;
-            match row.get(&c.id) {
-                Some(d) if !d.is_null() => d.to_key().ok_or_else(|| Error::internal("pk not indexable")),
-                _ => Err(Error::invalid(format!("primary key column {p:?} is required"))),
-            }
+            s.column(p)
+                .and_then(|c| row.get(&c.id))
+                .and_then(Datum::to_key)
+                .ok_or_else(|| Error::internal(format!("row has no key value for {p:?}")))
         })
         .collect()
 }
 
 /// Parse a primary key given as a scalar (single-column keys) or an array.
 pub fn parse_pk(s: &TableSchema, pk: &Json) -> Result<Vec<Key>> {
-    let vals: Vec<Json> = match pk {
-        Json::Array(a) => a.clone(),
-        other if s.primary_key.len() == 1 => vec![other.clone()],
-        _ => return Err(Error::invalid("composite primary keys must be given as an array")),
+    let vals = match pk {
+        Json::Array(a) => a.as_slice(),
+        scalar => std::slice::from_ref(scalar),
     };
     if vals.len() != s.primary_key.len() {
         return Err(Error::invalid(format!("primary key has {} columns, got {}", s.primary_key.len(), vals.len())));
     }
     s.primary_key
         .iter()
-        .zip(&vals)
+        .zip(vals)
         .map(|(p, v)| {
             let c = s.column(p).ok_or_else(|| Error::internal("pk column missing"))?;
             if v.is_null() {
@@ -369,7 +355,6 @@ async fn row_from_json(s: &TableSchema, obj: &Json, blobs: &BlobResolver<'_>, ba
             }
             None => match base.and_then(|b| b.get(&c.id)) {
                 Some(d) => d.clone(),
-                None if base.is_some() => Datum::Null,
                 None => match &c.default {
                     Some(dv) => datum_from_json(c.ty, dv, &c.name)?,
                     None => Datum::Null,
@@ -406,10 +391,9 @@ async fn load_row(txn: &mut Txn, s: &TableSchema, pk: &[Key]) -> Result<Option<R
     let Value::Inline(data) = &it.value else {
         return Err(Error::internal("row stored out of line"));
     };
+    // Values of dropped columns stay until the row is rewritten; readers
+    // only look up the schema's columns.
     let mut row = schema::decode_row(data)?;
-    // Apply defaults for columns added after the row was written, drop
-    // values of dropped columns.
-    row.retain(|id, _| s.column_by_id(*id).is_some());
     fill_defaults(s, &mut row)?;
     for c in &s.columns {
         if c.ty == ColType::Blob {
@@ -539,30 +523,54 @@ pub async fn get(txn: &mut Txn, table: &str, pk: &Json) -> Result<Option<Json>> 
     Ok(load_row(txn, &s, &pk).await?.map(|r| row_to_json(&s, &r)))
 }
 
-async fn scan_all_rows(txn: &mut Txn, s: &TableSchema, max: usize) -> Result<Vec<(Vec<Key>, Row)>> {
+/// Reads a key range a page at a time, so that memory stays bounded however
+/// large the range.
+struct Pages {
+    rest: Option<KeyRange>,
+}
+
+impl Pages {
+    const SIZE: usize = 1000;
+
+    fn new(range: KeyRange) -> Pages {
+        Pages { rest: Some(range) }
+    }
+
+    async fn next(&mut self, txn: &mut Txn) -> Result<Option<Vec<ReadValue>>> {
+        let Some(range) = self.rest.take() else {
+            return Ok(None);
+        };
+        let page = txn.scan(&range, false, Self::SIZE).await?;
+        if let Some(last) = page.last()
+            && page.len() == Self::SIZE
+        {
+            self.rest = Some(KeyRange::new(Bound::Excluded(last.key.clone()), range.end));
+        }
+        Ok(Some(page))
+    }
+}
+
+/// Every row of a table, with defaults applied. Tables over `max` rows are
+/// refused, as too large to index in one transaction.
+async fn all_rows(txn: &mut Txn, s: &TableSchema, max: usize) -> Result<Vec<(Vec<Key>, Row)>> {
     let prefix = table_prefix(SPACE_ROWS, s.id);
     let mut out = Vec::new();
-    let mut range = KeyRange::prefix(&prefix);
-    loop {
-        let page = txn.scan(&range, false, 1000).await?;
+    let mut pages = Pages::new(KeyRange::prefix(&prefix));
+    while let Some(page) = pages.next(txn).await? {
         for it in &page {
             let pk = tuple::decode_all(&it.key[prefix.len()..])?;
             let Value::Inline(d) = &it.value else {
                 return Err(Error::internal("row stored out of line"));
             };
             let mut row = schema::decode_row(d)?;
-            row.retain(|id, _| s.column_by_id(*id).is_some());
             fill_defaults(s, &mut row)?;
             out.push((pk, row));
-            if out.len() >= max {
-                return Ok(out);
+            if out.len() > max {
+                return Err(Error::TooLarge(format!("tables over {max} rows cannot be indexed in one transaction")));
             }
         }
-        match page.last() {
-            Some(l) if page.len() == 1000 => range = KeyRange::new(Bound::Excluded(l.key.clone()), range.end.clone()),
-            _ => return Ok(out),
-        }
     }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- queries
@@ -676,7 +684,6 @@ fn cmp_value(c: &Column, v: &Json) -> Result<Datum> {
     match c.ty {
         ColType::Json => Ok(Datum::Json(v.clone())),
         ColType::Blob => Err(Error::invalid("blob columns cannot be filtered (use is_null)")),
-        ColType::Float if v.is_i64() => Ok(Datum::Float(v.as_f64().unwrap_or(0.0))),
         ty => datum_from_json(ty, v, &c.name),
     }
 }
@@ -684,8 +691,6 @@ fn cmp_value(c: &Column, v: &Json) -> Result<Datum> {
 fn datum_cmp(a: &Datum, b: &Datum) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Datum::Json(x), Datum::Json(y)) => (x == y).then_some(std::cmp::Ordering::Equal),
-        (Datum::Int(x), Datum::Float(y)) => (*x as f64).partial_cmp(y),
-        (Datum::Float(x), Datum::Int(y)) => x.partial_cmp(&(*y as f64)),
         _ => {
             let (ka, kb) = (a.to_key()?, b.to_key()?);
             if std::mem::discriminant(&ka) != std::mem::discriminant(&kb) {
@@ -864,7 +869,7 @@ pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult>
 /// stored index entries (consistency checker used by tests and the DST).
 pub async fn check_indexes(txn: &mut Txn, table: &str) -> Result<()> {
     let s = get_schema(txn, table).await?;
-    let rows = scan_all_rows(txn, &s, usize::MAX).await?;
+    let rows = all_rows(txn, &s, usize::MAX).await?;
     for idx in &s.indexes {
         let mut want = std::collections::BTreeMap::new();
         for (pk, row) in &rows {
@@ -894,19 +899,41 @@ pub async fn check_indexes(txn: &mut Txn, table: &str) -> Result<()> {
     Ok(())
 }
 
-/// Name validation exposed for the API layer.
-pub fn valid_table_name(s: &str) -> bool {
-    valid_ident(s)
-}
-
-/// Convenience used by the API: JSON schema description.
-pub fn describe(s: &TableSchema) -> Json {
-    s.to_json()
-}
-
-/// Convenience used by the console.
-pub fn empty_query() -> Query {
-    Query { limit: Some(50), ..Default::default() }
+/// Every row and index entry must belong to a live table and index, and
+/// every row blob to a live row and blob column: dropping any of them must
+/// leave nothing behind, even when racing writes.
+pub async fn check_no_orphans(txn: &mut Txn) -> Result<()> {
+    let tables = list_tables(txn).await?;
+    let live: BTreeSet<u32> = tables.iter().map(|s| s.id).collect();
+    let live_idx: BTreeSet<(u32, u32)> = tables.iter().flat_map(|s| s.indexes.iter().map(|i| (s.id, i.id))).collect();
+    let blob_cols: BTreeSet<(u32, u32)> =
+        tables.iter().flat_map(|s| s.columns.iter().filter(|c| c.ty == ColType::Blob).map(|c| (s.id, c.id))).collect();
+    let all = KeyRange::half_open(Bytes::from_static(&[SPACE_ROWS]), Some(Bytes::from_static(&[SPACE_ROW_BLOBS + 1])));
+    let id_at = |k: &[u8], at: usize| k.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    // Rows sort before their blobs (SPACE_ROWS < SPACE_ROW_BLOBS).
+    let mut rows = BTreeSet::new();
+    for it in txn.scan(&all, false, usize::MAX).await? {
+        let k = &it.key;
+        let orphan = match (k[0], id_at(k, 1)) {
+            (SPACE_INDEX, Some(t)) => id_at(k, 5).is_none_or(|i| !live_idx.contains(&(t, i))),
+            (SPACE_ROW_BLOBS, Some(t)) => {
+                // The key is the row's key (in the row-blob space) and the column id.
+                let (row, col) = k.split_at(k.len() - 4);
+                let mut row = row.to_vec();
+                row[0] = SPACE_ROWS;
+                !rows.contains(&row) || id_at(col, 0).is_none_or(|c| !blob_cols.contains(&(t, c)))
+            }
+            (SPACE_ROWS, Some(t)) => {
+                rows.insert(k.to_vec());
+                !live.contains(&t)
+            }
+            _ => true,
+        };
+        if orphan {
+            return Err(Error::internal(format!("orphaned entry {} of a dropped table or index", b64::hex(k))));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

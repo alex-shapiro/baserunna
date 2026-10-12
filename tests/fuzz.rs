@@ -276,3 +276,26 @@ fn fuzz_http_api() {
     });
     assert!(out.result.is_ok(), "{:?}", out.result);
 }
+
+/// Structure-aware fuzzing of the transaction-op language against an exact
+/// model (`sim::txn_fuzz`). Scale with `FUZZ_ITERS`; `FUZZ_VERBOSE` prints
+/// response counts per route and status (`FUZZ_DEBUG` adds error messages).
+#[test]
+fn fuzz_txn_ops_against_model() {
+    let iters = baserunna::util::prop::env_u64("FUZZ_ITERS").unwrap_or(400);
+    let base = baserunna::util::prop::env_u64("FUZZ_SEED").unwrap_or(1);
+    for i in 0..iters {
+        let seed = base.wrapping_add(i);
+        let mut r = Rng::new(seed);
+        let n = r.usize(600);
+        let data = r.bytes(n);
+        if let Err(e) = baserunna::sim::txn_fuzz::run_input(&data) {
+            panic!("{e}\nreproduce with: FUZZ_SEED={seed} FUZZ_ITERS=1 cargo test --test fuzz fuzz_txn_ops");
+        }
+    }
+    if std::env::var("FUZZ_VERBOSE").is_ok() {
+        for (k, n) in baserunna::sim::txn_fuzz::stats() {
+            eprintln!("{n:>7} {k}");
+        }
+    }
+}

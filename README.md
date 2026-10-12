@@ -88,44 +88,16 @@ Each example starts real nodes on localhost and talks to them over HTTP:
 ## Testing
 
 ```sh
-cargo test                                   # unit, property, fuzz, lint, OpenAPI and simulation tests
+cargo test                                   # unit, property, fuzz, lint, OpenAPI, cost and simulation tests
 SIM_SEEDS=500 cargo test --release --test sim                      # longer simulation campaigns
 cargo run --release --example sim_tool -- campaign all 3000        # very long campaigns
 cargo run --release --example sim_tool -- trace bank 101863        # print a run's full trace
 SIM_SEED=4242 cargo test --test sim sim_bank -- --nocapture        # reproduce one seed
-cd fuzz && cargo +nightly fuzz run manifest                        # coverage-guided fuzzing (optional)
+cd fuzz && cargo +nightly fuzz run http_txn -- -rss_limit_mb=1500  # coverage-guided fuzzing (optional)
+cargo run --release --example cost_model                           # store requests per operation, $/DB/month
+cargo bench --bench throughput                                     # one node, thousands of active databases
+scripts/mutants.sh                                                 # mutation testing (several hours)
 ```
-
-The test layers:
-
-- **Deterministic simulation** (`src/sim`, `tests/sim.rs`). N nodes, a
-  fault-injecting S3-semantics object store (latency, failures, writes that
-  apply but lose their response, delayed in-flight writes after a crash),
-  node crashes and restarts, network partitions, clock skew, and a fake
-  Google OIDC provider. The workloads are:
-  - an exact KV model across every API form;
-  - bank transfers, checked for serializability and conservation;
-  - register reads and writes, checked for real-time linearizability;
-  - tables and indexes, recomputed and compared at the end;
-  - blobs plus a full GC cycle;
-  - auth and permissions;
-  - database lifecycle;
-  - console flows driven like a browser;
-  - a tour of the remaining endpoints.
-
-  Every response is validated against the OpenAPI document, and a coverage
-  test requires every documented operation to be exercised by the
-  simulator. Every run ends with storage invariants. Running a seed twice
-  produces an identical trace.
-
-- **Property tests** use the in-crate seeded generator and shrinker. They
-  cover engine vs. a model (flushes, compaction, GC, snapshots), tables vs. a
-  model, tuple-encoding order preservation, and codec round trips.
-- **Fuzz tests**: random and mutated HTTP requests must never produce a 500
-  or break the schema. Decoders must never panic. `fuzz/` holds the libFuzzer
-  targets.
-- **Lints** forbid nondeterministic constructs (random-order tokio
-  primitives, direct wall-clock, unseeded randomness) in service code.
 
 ## Layout
 

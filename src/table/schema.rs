@@ -169,10 +169,6 @@ impl TableSchema {
         self.columns.iter().find(|c| c.name == name)
     }
 
-    pub fn column_by_id(&self, id: u32) -> Option<&Column> {
-        self.columns.iter().find(|c| c.id == id)
-    }
-
     pub fn index(&self, name: &str) -> Option<&IndexDef> {
         self.indexes.iter().find(|i| i.name == name)
     }
@@ -196,10 +192,7 @@ impl TableSchema {
                 if c.ty == ColType::Blob {
                     return Err(Error::invalid("blob columns cannot have defaults"));
                 }
-                let dd = datum_from_json(c.ty, d, &c.name)?;
-                if dd.is_null() && !c.nullable {
-                    return Err(Error::invalid(format!("column {:?}: null default on non-nullable column", c.name)));
-                }
+                datum_from_json(c.ty, d, &c.name)?;
             }
         }
         if self.primary_key.is_empty() || self.primary_key.len() > 8 {

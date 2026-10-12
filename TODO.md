@@ -60,10 +60,19 @@ the design context for several of these.
 - [ ] **Leveled or hybrid compaction.** Size-tiered compaction is simple
       but amplifies space. Measure write and space amplification on
       realistic workloads before changing it.
-- [ ] **Faster write failover.** After a crash, writers wait up to the
-      15 s lease. Options: shorter leases with renewal piggybacked on
-      commits, or eager release driven by membership when a node's
-      heartbeat disappears.
+- [ ] **Faster write failover.** After a crash, writers wait up to two
+      lease periods (§5.7). Options: shorter leases renewed by commits, or
+      releasing a lease once its holder's heartbeat disappears.
+- [ ] **Make GC independent of clock skew.** Its grace periods compare
+      timestamps from different clocks (§5.8). Express them in store time,
+      or measure each node's offset from the store and pause GC when it is
+      large.
+- [ ] **Cheaper membership.** Each node writes about 360 heartbeat PUTs an
+      hour to the system database (about $1.30 per node-month), and every
+      non-holder reads it about 240 times an hour.
+- [ ] **O(1) database creation.** `MetaCmd::CreateDb` reads up to 1000 of
+      the owner's database rows to enforce `max_dbs_per_user`, so concurrent
+      creates by one user conflict. Keep a per-user counter row instead.
 - [ ] **Long blob downloads.** A download must finish within `gc_grace`
       (30 min) of the blob being dereferenced. Pin blobs that are being
       read, or extend the grace period while a reader is active.
@@ -94,23 +103,9 @@ the design context for several of these.
 
 - [ ] **Run simulation campaigns continuously in CI.**
       For example, run nightly with fresh seeds, keep failing seeds as regression tests,
-      and run the `sim_tool determinism` check on every PR.
-- [ ] **Add simulator fault types**
-  - object-store list results that are eventually consistent (some S3-compatible stores)
-  - slow-but-successful object-store requests that are longer than the lease
-  - asymmetric network partitions
-  - forwarded requests that are duplicated or reordered
-  - more extreme clock skew, which should fail safe
-- [ ] **Add simulator workloads**:
-  - concurrent schema changes racing row writes
-  - interactive transactions abandoned mid-flight across failovers
-  - blob range reads racing GC
-  - many-DB churn to stress handle eviction and the cache.
-- [ ] **Run libFuzzer targets in CI** for a time budget, with a corpus.
-      Add an HTTP-level structure-aware fuzzer for transaction-op JSON.
-- [ ] **Benchmarks and a cost model.**
-  - Measure object-store requests per commit and per read
-  - Measure cold-open latency
-  - Measure throughput per node with thousands of active DBs
-  - Turn benchmarks into a cost estimate per DB per month and guard against regressions.
-- [ ] **Mutation testing** (for example `cargo-mutants`) on the engine and checkers, to confirm the simulator catches injected bugs.
+      and run the `sim_tool determinism` check on every PR (include a `*_hostile` scenario).
+- [ ] **Run libFuzzer targets in CI** for a time budget, with a corpus. Include the
+      structure-aware `http_txn` target, which checks results against a model.
+- [ ] **Run mutation testing in CI**, e.g. `scripts/mutants.sh --in-diff` on every PR and the
+      full configuration weekly.
+- [ ] **Run the cost guard and throughput benchmark in CI** and track the numbers over time.

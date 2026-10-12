@@ -4,11 +4,24 @@
 
 use crate::meta::NodeRecord;
 use crate::store::BoxFut;
+use crate::util::DetHashMap;
 use axum::body::Body;
+use bytes::Bytes;
 use http::{Request, Response};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::time::Instant;
 
 pub const HOPS_HEADER: &str = "x-baserunna-hops";
 pub const CLUSTER_KEY_HEADER: &str = "x-baserunna-cluster-key";
+/// A random id the forwarding node gives each forwarded request, so the
+/// receiver can execute a request that the network delivers twice only once.
+pub const FORWARD_ID_HEADER: &str = "x-baserunna-forward-id";
+/// The node id a forwarded request is meant for, so that a node restarted
+/// at the same address refuses copies it can no longer deduplicate.
+pub const FORWARD_TO_HEADER: &str = "x-baserunna-forward-to";
+/// The forwarded request's commit deadline (wall-clock ms since the epoch).
+pub const DEADLINE_HEADER: &str = "x-baserunna-deadline-ms";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportError {
@@ -76,6 +89,105 @@ impl Transport for NoTransport {
     }
 }
 
+/// A response kept for replay to duplicates of a forwarded request.
+#[derive(Clone, Debug)]
+pub struct ReplayedResponse {
+    pub status: http::StatusCode,
+    pub headers: http::HeaderMap,
+    pub body: Bytes,
+}
+
+#[derive(Default)]
+struct Slot {
+    /// `Some(None)`: finished without a replayable response.
+    result: Mutex<Option<Option<ReplayedResponse>>>,
+    done: tokio::sync::Notify,
+}
+
+impl Slot {
+    fn finish(&self, r: Option<ReplayedResponse>) {
+        let mut g = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            *g = Some(r);
+        }
+        drop(g);
+        self.done.notify_waiters();
+    }
+
+    async fn wait(&self) -> Option<ReplayedResponse> {
+        loop {
+            let notified = self.done.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(r) = self.result.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                return r;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Exactly-once execution of forwarded requests on the receiving node.
+///
+/// The first copy of a forwarded request runs; later copies wait for it and
+/// get the same response. Ids are remembered for `retention`, far longer
+/// than any network delay.
+pub struct ForwardDedup {
+    slots: Mutex<DetHashMap<String, (Instant, Arc<Slot>)>>,
+    retention: Duration,
+}
+
+/// Handle of the copy that executes a forwarded request. Dropping it
+/// without [`FirstCopy::finish`] (e.g. the handler was cancelled) tells
+/// waiting duplicates that the outcome is unknown.
+pub struct FirstCopy(Arc<Slot>);
+
+impl FirstCopy {
+    pub fn finish(self, r: Option<ReplayedResponse>) {
+        self.0.finish(r);
+    }
+}
+
+impl Drop for FirstCopy {
+    fn drop(&mut self) {
+        self.0.finish(None);
+    }
+}
+
+pub enum Delivery {
+    First(FirstCopy),
+    /// Resolves to the first copy's response, or `None` if it has none to
+    /// share.
+    Duplicate(BoxFut<'static, Option<ReplayedResponse>>),
+}
+
+impl ForwardDedup {
+    pub fn new(retention: Duration) -> ForwardDedup {
+        ForwardDedup { slots: Mutex::new(DetHashMap::default()), retention }
+    }
+
+    pub fn deliver(&self, id: &str) -> Delivery {
+        let mut g = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() > 100_000 {
+            let keep = self.retention;
+            g.retain(|_, (t, _)| t.elapsed() < keep);
+        }
+        if let Some((_, s)) = g.get(id) {
+            let s = s.clone();
+            return Delivery::Duplicate(Box::pin(async move { s.wait().await }));
+        }
+        let s = Arc::new(Slot::default());
+        g.insert(id.to_string(), (Instant::now(), s.clone()));
+        Delivery::First(FirstCopy(s))
+    }
+
+    /// Forget ids older than the retention period.
+    pub fn expire(&self) {
+        let keep = self.retention;
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (t, _)| t.elapsed() < keep);
+    }
+}
+
 fn fnv(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in data {
@@ -132,6 +244,36 @@ mod tests {
         for c in counts.values() {
             assert!(*c > 800, "unbalanced: {counts:?}");
         }
+    }
+
+    #[test]
+    fn forwarded_requests_run_once() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        rt.block_on(async {
+            let d = ForwardDedup::new(Duration::from_secs(60));
+            let (Delivery::First(first), Delivery::Duplicate(dup)) = (d.deliver("a"), d.deliver("a")) else {
+                panic!("the first copy must run and the second wait");
+            };
+            let ok = ReplayedResponse {
+                status: http::StatusCode::CREATED,
+                headers: http::HeaderMap::new(),
+                body: Bytes::from_static(b"done"),
+            };
+            first.finish(Some(ok));
+            assert_eq!(
+                dup.await.map(|r| (r.status, r.body)),
+                Some((http::StatusCode::CREATED, Bytes::from_static(b"done")))
+            );
+            let Delivery::Duplicate(late) = d.deliver("a") else { panic!("a late copy must not run again") };
+            assert!(late.await.is_some());
+            // A first copy that never finished leaves its duplicates unsure.
+            let (Delivery::First(first), Delivery::Duplicate(dup)) = (d.deliver("b"), d.deliver("b")) else {
+                panic!("the first copy must run and the second wait");
+            };
+            drop(first);
+            assert!(dup.await.is_none());
+            assert!(matches!(d.deliver("c"), Delivery::First(_)));
+        });
     }
 
     #[test]

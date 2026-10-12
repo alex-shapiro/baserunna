@@ -160,3 +160,48 @@ fn check(h: &[Op]) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn w(key: usize, start: u64, end: u64, version: u64, value: &str) -> Op {
+        Op { key, start, end, version: Some(version), value: value.into(), write: true, client: "w".into() }
+    }
+
+    fn r(key: usize, start: u64, end: u64, version: u64, value: &str) -> Op {
+        Op { key, start, end, version: Some(version), value: value.into(), write: false, client: "r".into() }
+    }
+
+    #[test]
+    fn accepts_linearizable_histories() {
+        let h =
+            [w(0, 0, 10, 1, "a"), r(0, 5, 8, 0, ""), r(0, 20, 30, 1, "a"), w(0, 25, 40, 2, "b"), r(0, 30, 35, 1, "a")];
+        check(&h).unwrap();
+        // Concurrent reads may see either side of a concurrent write.
+        check(&[w(0, 0, 100, 1, "a"), r(0, 10, 20, 1, "a"), r(1, 30, 40, 0, "")]).unwrap();
+        // Equal timestamps do not order operations: a read starting the
+        // moment a write (or another read) ends is concurrent with it.
+        check(&[w(0, 0, 10, 1, "a"), r(0, 10, 20, 0, "")]).unwrap();
+        check(&[w(0, 0, 100, 1, "a"), r(0, 5, 10, 1, "a"), r(0, 10, 20, 0, "")]).unwrap();
+    }
+
+    #[test]
+    fn rejects_violations() {
+        let stale = [w(0, 0, 10, 1, "a"), w(0, 11, 15, 2, "b"), r(0, 20, 30, 1, "a")];
+        assert!(check(&stale).unwrap_err().contains("stale read"));
+        let missing = [w(0, 0, 10, 1, "a"), r(0, 20, 30, 0, "")];
+        assert!(check(&missing).unwrap_err().contains("stale read"));
+        let backwards = [w(0, 0, 5, 1, "a"), w(0, 0, 100, 2, "b"), r(0, 20, 30, 2, "b"), r(0, 40, 50, 1, "a")];
+        assert!(check(&backwards).unwrap_err().contains("non-monotonic"));
+        let duplicate = [w(0, 0, 10, 1, "a"), w(0, 0, 10, 1, "b")];
+        assert!(check(&duplicate).unwrap_err().contains("two writes"));
+        let wrong = [w(0, 0, 10, 1, "a"), r(0, 20, 30, 1, "b")];
+        assert!(check(&wrong).unwrap_err().contains("that version wrote"));
+        let invented = [w(0, 0, 10, 1, "a"), r(0, 20, 30, 7, "zzz")];
+        assert!(check(&invented).unwrap_err().contains("never written"));
+        // Keys are independent.
+        let other_key = [w(1, 0, 10, 1, "a"), r(0, 20, 30, 0, "")];
+        check(&other_key).unwrap();
+    }
+}

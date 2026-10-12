@@ -29,6 +29,17 @@ async fn balances(c: &Client, db: &str, consistency: &str) -> Option<Vec<i64>> {
     Some(items.iter().map(|it| it["value"].as_str().and_then(|v| v.parse().ok()).unwrap_or(i64::MIN)).collect())
 }
 
+/// Every account is present, none is negative, and money is conserved.
+fn audit(b: &[i64], accounts: usize) -> Result<(), String> {
+    if b.len() != accounts {
+        return Err(format!("auditor saw {} accounts", b.len()));
+    }
+    if b.iter().sum::<i64>() != INITIAL * accounts as i64 || b.iter().any(|x| *x < 0) {
+        return Err(format!("invariant violated: balances {b:?}"));
+    }
+    Ok(())
+}
+
 /// One transfer attempt loop. Returns true if it committed.
 async fn transfer(c: &Client, db: &str, a: usize, b: usize, amt: i64) -> Result<bool, String> {
     let base = format!("/v1/dbs/{db}");
@@ -117,13 +128,7 @@ pub async fn run(sim: Arc<Sim>, accounts: usize, clients: usize, transfers: usiz
                 let strong = c.rng().chance(0.5);
                 let mode = if strong { "strong" } else { "snapshot" };
                 if let Some(b) = balances(&c, db, mode).await {
-                    if b.len() != accounts {
-                        return Err(format!("auditor saw {} accounts", b.len()));
-                    }
-                    let total: i64 = b.iter().sum();
-                    if total != INITIAL * accounts as i64 || b.iter().any(|x| *x < 0) {
-                        return Err(format!("invariant violated ({mode} read): balances {b:?}"));
-                    }
+                    audit(&b, accounts).map_err(|e| format!("{e} ({mode} read)"))?;
                     checks += 1;
                 }
             }
@@ -182,4 +187,18 @@ pub async fn run(sim: Arc<Sim>, accounts: usize, clients: usize, transfers: usiz
         return Err("auditor never completed a check".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_rejects_broken_ledgers() {
+        audit(&[100, 100, 100], 3).unwrap();
+        audit(&[0, 150, 150], 3).unwrap();
+        assert!(audit(&[100, 100], 3).is_err());
+        assert!(audit(&[100, 100, 101], 3).is_err());
+        assert!(audit(&[-1, 151, 150], 3).is_err());
+    }
 }

@@ -166,4 +166,31 @@ mod tests {
         assert_eq!(c.stats().entries, 0);
         assert_eq!(c.stats().bytes, 0);
     }
+
+    #[test]
+    fn accounts_bytes_exactly() {
+        let one = block(10).size();
+        let c = Cache::new(2 * one);
+        let key = |i: u32| CacheKey { seg_path: Arc::from("s"), block: i };
+        c.insert(key(0), block(10));
+        c.insert(key(0), block(10));
+        assert_eq!(c.stats().bytes, one, "replacing an entry must not double count it");
+        c.insert(key(1), block(10));
+        assert_eq!((c.stats().bytes, c.stats().entries), (2 * one, 2), "filling the budget exactly evicts nothing");
+        let exact = Cache::new(one);
+        exact.insert(key(0), block(10));
+        assert!(exact.get(&key(0)).is_some(), "an entry as large as the budget is cached");
+        let small = Cache::new(one - 1);
+        small.insert(key(0), block(10));
+        assert_eq!((small.stats().bytes, small.stats().entries), (0, 0), "an entry over budget is not cached");
+        assert_eq!((small.stats().hits, small.stats().misses), (0, 0));
+        assert!(small.get(&key(0)).is_none());
+        assert!(exact.get(&key(0)).is_some());
+        assert_eq!((small.stats().misses, exact.stats().hits), (1, 2));
+        let other = CacheKey { seg_path: Arc::from("t"), block: 0 };
+        c.insert(other.clone(), block(10));
+        c.evict_prefix("s");
+        assert_eq!((c.stats().bytes, c.stats().entries), (one, 1), "evicting a prefix releases its bytes");
+        assert!(c.get(&other).is_some());
+    }
 }

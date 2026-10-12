@@ -1,13 +1,17 @@
 //! Simulation workloads and checkers (SPEC §13.3).
 
+pub mod abandoned;
 pub mod api_tour;
 pub mod auth;
 pub mod bank;
+pub mod blob_gc_race;
 pub mod blobs;
 pub mod console;
+pub mod db_churn;
 pub mod kv_model;
 pub mod lifecycle;
 pub mod register;
+pub mod schema_race;
 pub mod tables;
 
 use super::Sim;
@@ -18,7 +22,8 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
     sim.sleep(500 + sim.rand_below(4_000)).await;
     let n = sim.node_count();
     let up = sim.up_nodes();
-    match sim.rand_below(12) {
+    let extra = &sim.cfg.chaos;
+    match sim.rand_below(16) {
         0 | 1 if up.len() > 1 || n == 1 => {
             let i = up[sim.rand_below(up.len() as u64) as usize];
             if n == 1 {
@@ -42,6 +47,19 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
         6 => {
             // A long pause: leases expire, caches go stale.
             sim.sleep(sim.rand_below(20_000)).await;
+        }
+        9 if n > 1 && extra.one_way_partitions => {
+            let a = sim.rand_below(n as u64) as usize;
+            let b = (a + 1 + sim.rand_below(n as u64 - 1) as usize) % n;
+            sim.partition_one_way(a, b);
+        }
+        10 if extra.store_isolation && !up.is_empty() => {
+            sim.isolate_from_store(up[sim.rand_below(up.len() as u64) as usize]);
+        }
+        11 if extra.clock_step_max_ms > 0 && !up.is_empty() => {
+            let i = up[sim.rand_below(up.len() as u64) as usize];
+            let m = extra.clock_step_max_ms;
+            sim.step_clock(i, sim.rand_below(2 * m + 1) as i64 - m as i64);
         }
         _ => {}
     }
@@ -111,6 +129,35 @@ fn faulty4() -> super::SimConfig {
     super::SimConfig::faulty(4)
 }
 
+fn hostile3() -> super::SimConfig {
+    super::SimConfig::hostile(3)
+}
+
+fn hostile4() -> super::SimConfig {
+    super::SimConfig::hostile(4)
+}
+
+fn blob_gc_cfg() -> super::SimConfig {
+    blob_gc_race::config(super::SimConfig::faulty(3))
+}
+
+/// Hostile, but with clocks well within the shrunken grace periods (GC
+/// safety assumes clock skew far below them).
+fn blob_gc_hostile_cfg() -> super::SimConfig {
+    let mut c = blob_gc_race::config(super::SimConfig::hostile(3));
+    c.max_skew_ms = 150;
+    c.chaos.clock_step_max_ms = 0;
+    c
+}
+
+fn churn_cfg() -> super::SimConfig {
+    db_churn::config(super::SimConfig::faulty(3))
+}
+
+fn churn_hostile_cfg() -> super::SimConfig {
+    db_churn::config(super::SimConfig::hostile(3))
+}
+
 fn console_cfg() -> super::SimConfig {
     // Fault handling is covered elsewhere; here form posts (not
     // idempotent) must be unambiguous. Two nodes exercise forwarding.
@@ -138,6 +185,29 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario { name: "console", config: console_cfg, run: |s| Box::pin(console::run(s)) },
         Scenario { name: "chaos", config: faulty4, run: |s| Box::pin(chaos_mix(s, 2)) },
         Scenario { name: "api_tour", config: faulty3, run: |s| Box::pin(api_tour::run(s)) },
+        Scenario { name: "schema_race", config: faulty3, run: |s| Box::pin(schema_race::run(s, 3, 40, true)) },
+        Scenario { name: "abandoned", config: faulty3, run: |s| Box::pin(abandoned::run(s, 4, 12, true)) },
+        Scenario { name: "blob_gc_race", config: blob_gc_cfg, run: |s| Box::pin(blob_gc_race::run(s, 2, 3, 30, true)) },
+        Scenario { name: "db_churn", config: churn_cfg, run: |s| Box::pin(db_churn::run(s, 4, 10, 60, true)) },
+        Scenario { name: "kv_hostile", config: hostile3, run: |s| Box::pin(kv_model::run(s, 2, 60, true)) },
+        Scenario { name: "bank_hostile", config: hostile3, run: |s| Box::pin(bank::run(s, 6, 4, 12, true)) },
+        Scenario { name: "register_hostile", config: hostile3, run: |s| Box::pin(register::run(s, 3, 3, 30, true)) },
+        Scenario { name: "tables_hostile", config: hostile3, run: |s| Box::pin(tables::run(s, 80, 3, true)) },
+        Scenario { name: "blobs_hostile", config: hostile3, run: |s| Box::pin(blobs::run(s, 40, true)) },
+        Scenario { name: "lifecycle_hostile", config: hostile3, run: |s| Box::pin(lifecycle::run(s, 4, true)) },
+        Scenario { name: "schema_race_hostile", config: hostile3, run: |s| Box::pin(schema_race::run(s, 3, 40, true)) },
+        Scenario { name: "abandoned_hostile", config: hostile3, run: |s| Box::pin(abandoned::run(s, 4, 12, true)) },
+        Scenario {
+            name: "blob_gc_race_hostile",
+            config: blob_gc_hostile_cfg,
+            run: |s| Box::pin(blob_gc_race::run(s, 2, 3, 30, true)),
+        },
+        Scenario {
+            name: "db_churn_hostile",
+            config: churn_hostile_cfg,
+            run: |s| Box::pin(db_churn::run(s, 4, 10, 60, true)),
+        },
+        Scenario { name: "chaos_hostile", config: hostile4, run: |s| Box::pin(chaos_mix(s, 2)) },
     ]
 }
 

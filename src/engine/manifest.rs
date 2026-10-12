@@ -4,7 +4,7 @@
 //! a conditional PUT. Small writes are kept inline in `tail`, which makes the
 //! manifest the write-ahead log as well.
 
-use super::types::{Entry, Seq};
+use super::types::{Entry, Seq, valid_object_id};
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
 use crate::util::crc32c::crc32c;
 use bytes::Bytes;
@@ -257,11 +257,6 @@ impl Manifest {
     pub fn commit_version(&self, id: u128) -> Option<Seq> {
         self.recent_commits.iter().rev().find(|(c, _)| *c == id).map(|(_, v)| *v)
     }
-}
-
-/// Object ids (segments, blobs) are 32 lowercase hex characters.
-pub fn valid_object_id(id: &str) -> bool {
-    id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[cfg(test)]

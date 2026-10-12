@@ -127,7 +127,7 @@ impl Shared {
             return Ok(i);
         }
         let key = seg_key(db, &seg.id);
-        if seg.size <= self.cfg.segment_whole_fetch_max {
+        if seg.size <= self.cfg.segment_whole_fetch_max.max(FOOTER_LEN as u64) {
             let g = self.retry.run(|| self.store.get(&key, GetOpts::default())).await?;
             let idx = Arc::new(SegmentIndex::decode_whole(&g.data)?);
             for (bi, (_, off, len)) in idx.blocks.iter().enumerate() {
@@ -139,9 +139,6 @@ impl Shared {
             return Ok(idx);
         }
         let size = seg.size;
-        if size < FOOTER_LEN as u64 {
-            return Err(Error::internal("segment smaller than footer"));
-        }
         let g = self
             .retry
             .run(|| self.store.get(&key, GetOpts { range: Some(size - FOOTER_LEN as u64..size), ..Default::default() }))
@@ -198,10 +195,6 @@ enum Cursor {
 }
 
 impl Version {
-    pub fn db_id(&self) -> &str {
-        &self.m.db_id
-    }
-
     pub fn version(&self) -> Seq {
         self.m.version
     }
@@ -233,19 +226,14 @@ impl Version {
         Ok(self.get_entry(key).await?.filter(|e| !e.value.is_tombstone()))
     }
 
-    async fn cursors(&self, range: &KeyRange, reverse: bool, min_seq: Option<Seq>) -> Result<Vec<Cursor>> {
+    /// Cursors over `range`, leaving out segments with no entry newer than
+    /// `newer_than`.
+    async fn cursors(&self, range: &KeyRange, reverse: bool, newer_than: Option<Seq>) -> Result<Vec<Cursor>> {
         let mut cursors = Vec::with_capacity(1 + self.m.segments.len());
-        let tail: Vec<Entry> = self
-            .m
-            .tail
-            .iter()
-            .filter(|e| range.contains(&e.key))
-            .filter(|e| min_seq.is_none_or(|s| e.seq > s))
-            .cloned()
-            .collect();
+        let tail: Vec<Entry> = self.m.tail.iter().filter(|e| range.contains(&e.key)).cloned().collect();
         cursors.push(Cursor::Tail { entries: tail, pos: 0 });
         for seg in &self.m.segments {
-            if min_seq.is_some_and(|s| seg.max_seq <= s) || seg.entries == 0 {
+            if newer_than.is_some_and(|s| seg.max_seq <= s) {
                 continue;
             }
             if !range.overlaps_keys(&seg.min_key, &seg.max_key) {

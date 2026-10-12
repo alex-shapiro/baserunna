@@ -158,6 +158,7 @@ pub struct Node {
     /// `cluster_secret`, else a key generated once per cluster and stored in
     /// the system database (every node reads the same store).
     cluster_key: Mutex<Option<String>>,
+    pub forwards: cluster::ForwardDedup,
     pub started_ms: u64,
     router: OnceLock<axum::Router>,
 }
@@ -192,6 +193,7 @@ impl Node {
             txns: Mutex::new(DetHashMap::default()),
             cookie_key: Mutex::new(Vec::new()),
             cluster_key: Mutex::new(None),
+            forwards: cluster::ForwardDedup::new(Duration::from_secs(60)),
             router: OnceLock::new(),
             cfg,
         });
@@ -403,7 +405,7 @@ impl Node {
                 && holder != self.id
                 && let Some(addr) = self.addr_of(&holder)
             {
-                match self.forward_meta(&addr, &cmd).await {
+                match self.forward_meta(&holder, &addr, &cmd).await {
                     Ok(r) => return Ok(r),
                     // A peer rejected our cluster key: it was created after
                     // we started. Reload it and retry.
@@ -415,6 +417,11 @@ impl Node {
                             *lock(&self.cluster_key) = Some(k);
                         }
                         last_err = Error::unavailable("cluster key mismatch");
+                        continue;
+                    }
+                    // Not applied there (e.g. the holder restarted): retry.
+                    Err(Ok(e @ Error::Unavailable { outcome_unknown: false, .. })) => {
+                        last_err = e;
                         continue;
                     }
                     Err(Ok(e)) => return Err(e),
@@ -454,6 +461,7 @@ impl Node {
 
     async fn forward_meta(
         &self,
+        holder: &str,
         addr: &str,
         cmd: &MetaCmd,
     ) -> std::result::Result<Json, std::result::Result<Error, cluster::TransportError>> {
@@ -466,6 +474,12 @@ impl Node {
             && let Ok(v) = k.parse()
         {
             req.headers_mut().insert(CLUSTER_KEY_HEADER, v);
+        }
+        if let Ok(v) = self.env.random_hex(16).parse() {
+            req.headers_mut().insert(cluster::FORWARD_ID_HEADER, v);
+        }
+        if let Ok(v) = holder.parse() {
+            req.headers_mut().insert(cluster::FORWARD_TO_HEADER, v);
         }
         let resp = self.transport.call(addr, req).await.map_err(Err)?;
         let status = resp.status();
@@ -642,6 +656,7 @@ impl Node {
         lock(&self.auth_cache).retain(|_, (t, _)| t.elapsed() < ttl);
         lock(&self.name_cache).retain(|_, (t, _)| t.elapsed() < ttl);
         lock(&self.suspects).retain(|_, t| t.elapsed() < Duration::from_secs(10));
+        self.forwards.expire();
     }
 
     /// Purge deleted databases whose grace period has passed (system

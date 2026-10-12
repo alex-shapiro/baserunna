@@ -1,16 +1,18 @@
-//! Fault-injecting simulated object store with S3 semantics.
+//! Simulated object store with S3 semantics and injected faults.
 //!
-//! Every operation takes simulated time. Writes are applied by a detached
-//! "network" task, so a request that was sent before its caller crashed can
-//! still land later — exactly the ambiguity a real object store presents.
+//! A detached task applies each write, so a write sent before its caller
+//! crashed can still land later. Everything is strongly consistent except
+//! LIST, which may lag.
 
 use super::Trace;
 use crate::store::*;
 use crate::util::rng::Rng;
 use bytes::Bytes;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::time::Instant;
 
 #[derive(Clone, Debug)]
 pub struct StoreFaults {
@@ -18,20 +20,59 @@ pub struct StoreFaults {
     pub latency_max_ms: u64,
     /// Probability of a slow request (10x latency).
     pub p_slow: f64,
+    /// Probability that a request stalls for a duration drawn from
+    /// `stall_ms` (typically longer than a lease) and then succeeds.
+    pub p_stall: f64,
+    pub stall_ms: (u64, u64),
     /// Probability that a request fails before being applied.
     pub p_fail_before: f64,
     /// Probability that a write is applied but its response is lost.
     pub p_fail_after: f64,
+    /// Listings are eventually consistent: a new object may stay invisible
+    /// to LIST, and a deleted one may keep appearing, for up to this long.
+    pub list_lag_ms: u64,
 }
 
 impl StoreFaults {
     pub fn none() -> StoreFaults {
-        StoreFaults { latency_min_ms: 1, latency_max_ms: 5, p_slow: 0.0, p_fail_before: 0.0, p_fail_after: 0.0 }
+        StoreFaults {
+            latency_min_ms: 1,
+            latency_max_ms: 5,
+            p_slow: 0.0,
+            p_stall: 0.0,
+            stall_ms: (0, 0),
+            p_fail_before: 0.0,
+            p_fail_after: 0.0,
+            list_lag_ms: 0,
+        }
     }
 
     pub fn moderate() -> StoreFaults {
-        StoreFaults { latency_min_ms: 2, latency_max_ms: 40, p_slow: 0.02, p_fail_before: 0.02, p_fail_after: 0.02 }
+        StoreFaults {
+            latency_min_ms: 2,
+            latency_max_ms: 40,
+            p_slow: 0.02,
+            p_fail_before: 0.02,
+            p_fail_after: 0.02,
+            ..StoreFaults::none()
+        }
     }
+}
+
+struct Draw {
+    latency_ms: u64,
+    fail_before: bool,
+    fail_after: bool,
+    list_lag_ms: u64,
+}
+
+/// What LIST shows differently from the current contents.
+#[derive(Default)]
+struct ListView {
+    /// Objects created recently that LIST does not show yet.
+    hidden_until: BTreeMap<String, Instant>,
+    /// Objects deleted recently that LIST still shows.
+    ghosts: BTreeMap<String, (ObjectMeta, Instant)>,
 }
 
 #[derive(Default, Debug)]
@@ -49,6 +90,7 @@ pub struct SimStore {
     faults: Mutex<StoreFaults>,
     enabled: AtomicBool,
     trace: Arc<Trace>,
+    view: Arc<Mutex<ListView>>,
     pub stats: StoreStats,
 }
 
@@ -60,6 +102,7 @@ impl SimStore {
             faults: Mutex::new(faults),
             enabled: AtomicBool::new(true),
             trace,
+            view: Arc::new(Mutex::new(ListView::default())),
             stats: StoreStats::default(),
         }
     }
@@ -73,17 +116,59 @@ impl SimStore {
         *self.faults.lock().unwrap_or_else(|e| e.into_inner()) = f;
     }
 
-    fn draw(&self) -> (u64, bool, bool) {
+    fn draw(&self) -> Draw {
         let f = self.faults.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut r = self.rng.lock().unwrap_or_else(|e| e.into_inner());
-        let mut lat = r.range(f.latency_min_ms, f.latency_max_ms.max(f.latency_min_ms) + 1);
+        let mut latency_ms = r.range(f.latency_min_ms, f.latency_max_ms.max(f.latency_min_ms) + 1);
         if r.chance(f.p_slow) {
-            lat *= 10;
+            latency_ms *= 10;
         }
         let on = self.enabled.load(Ordering::SeqCst);
-        let before = on && r.chance(f.p_fail_before);
-        let after = on && r.chance(f.p_fail_after);
-        (lat, before, after)
+        if on && r.chance(f.p_stall) {
+            latency_ms = r.range(f.stall_ms.0, f.stall_ms.1.max(f.stall_ms.0) + 1);
+            self.trace.event(&format!("store stall {latency_ms}ms"));
+        }
+        Draw {
+            latency_ms,
+            fail_before: on && r.chance(f.p_fail_before),
+            fail_after: on && r.chance(f.p_fail_after),
+            list_lag_ms: if on && f.list_lag_ms > 0 { r.below(f.list_lag_ms + 1) } else { 0 },
+        }
+    }
+
+    fn view(&self) -> std::sync::MutexGuard<'_, ListView> {
+        self.view.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One page of a listing as an eventually consistent store would show
+    /// it: lagging creations hidden, lagging deletions still present.
+    fn lagged_list(&self, prefix: &str, start_after: Option<&str>, limit: usize) -> ListPage {
+        let now = Instant::now();
+        let mut view = self.view();
+        view.hidden_until.retain(|_, t| *t > now);
+        view.ghosts.retain(|_, (_, t)| *t > now);
+        if view.hidden_until.is_empty() && view.ghosts.is_empty() {
+            return self.mem.list_sync(prefix, start_after, limit);
+        }
+        let after = |k: &str| k.starts_with(prefix) && start_after.is_none_or(|s| k > s);
+        let mut all: BTreeMap<String, ObjectMeta> = self
+            .mem
+            .list_sync(prefix, start_after, usize::MAX)
+            .objects
+            .into_iter()
+            .filter(|o| !view.hidden_until.contains_key(&o.key))
+            .map(|o| (o.key.clone(), o))
+            .collect();
+        for (k, (m, _)) in &view.ghosts {
+            if after(k) {
+                all.entry(k.clone()).or_insert_with(|| m.clone());
+            }
+        }
+        let limit = limit.max(1);
+        let more = all.len() > limit;
+        let objects: Vec<ObjectMeta> = all.into_values().take(limit).collect();
+        let next = if more { objects.last().map(|o| o.key.clone()) } else { None };
+        ListPage { objects, next }
     }
 
     fn injected(&self) {
@@ -99,9 +184,9 @@ impl ObjectStore for SimStore {
     fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
         Box::pin(async move {
             self.stats.gets.fetch_add(1, Ordering::Relaxed);
-            let (lat, before, _) = self.draw();
-            tokio::time::sleep(Duration::from_millis(lat)).await;
-            if before {
+            let d = self.draw();
+            tokio::time::sleep(Duration::from_millis(d.latency_ms)).await;
+            if d.fail_before {
                 self.injected();
                 self.trace.event(&format!("store get {key} -> injected error"));
                 return Err(unavailable("injected get failure"));
@@ -121,16 +206,25 @@ impl ObjectStore for SimStore {
     fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
         Box::pin(async move {
             self.stats.puts.fetch_add(1, Ordering::Relaxed);
-            let (lat, before, after) = self.draw();
+            let Draw { latency_ms: lat, fail_before: before, fail_after: after, list_lag_ms } = self.draw();
             let (tx, rx) = tokio::sync::oneshot::channel();
             let mem = self.mem.clone();
             let trace = self.trace.clone();
+            let view = self.view.clone();
             let key2 = key.to_string();
             // Detached: survives the caller being cancelled (crash).
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(lat / 2 + 1)).await;
+                let existed = mem.get_sync(&key2, &GetOpts::default()).is_ok();
                 let r =
                     if before { Err(unavailable("injected put failure")) } else { mem.put_sync(&key2, data, &mode) };
+                if r.is_ok() && list_lag_ms > 0 {
+                    let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+                    v.ghosts.remove(&key2);
+                    if !existed {
+                        v.hidden_until.insert(key2.clone(), Instant::now() + Duration::from_millis(list_lag_ms));
+                    }
+                }
                 trace.event(&format!(
                     "store put {key2} {mode:?} -> {}",
                     match &r {
@@ -156,11 +250,25 @@ impl ObjectStore for SimStore {
     fn delete<'a>(&'a self, key: &'a str) -> BoxFut<'a, SResult<()>> {
         Box::pin(async move {
             self.stats.deletes.fetch_add(1, Ordering::Relaxed);
-            let (lat, before, _) = self.draw();
-            tokio::time::sleep(Duration::from_millis(lat)).await;
-            if before {
+            let d = self.draw();
+            tokio::time::sleep(Duration::from_millis(d.latency_ms)).await;
+            if d.fail_before {
                 self.injected();
                 return Err(unavailable("injected delete failure"));
+            }
+            if d.list_lag_ms > 0
+                && let Ok(g) = self.mem.get_sync(key, &GetOpts::default())
+            {
+                let meta = ObjectMeta {
+                    key: key.to_string(),
+                    size: g.size,
+                    etag: g.etag,
+                    last_modified_ms: g.last_modified_ms,
+                };
+                let until = Instant::now() + Duration::from_millis(d.list_lag_ms);
+                let mut v = self.view();
+                v.hidden_until.remove(key);
+                v.ghosts.insert(key.to_string(), (meta, until));
             }
             self.mem.delete_sync(key);
             self.trace.event(&format!("store delete {key}"));
@@ -176,13 +284,13 @@ impl ObjectStore for SimStore {
     ) -> BoxFut<'a, SResult<ListPage>> {
         Box::pin(async move {
             self.stats.lists.fetch_add(1, Ordering::Relaxed);
-            let (lat, before, _) = self.draw();
-            tokio::time::sleep(Duration::from_millis(lat)).await;
-            if before {
+            let d = self.draw();
+            tokio::time::sleep(Duration::from_millis(d.latency_ms)).await;
+            if d.fail_before {
                 self.injected();
                 return Err(unavailable("injected list failure"));
             }
-            let p = self.mem.list_sync(prefix, start_after, limit);
+            let p = self.lagged_list(prefix, start_after, limit);
             self.trace.event(&format!("store list {prefix} -> {}", p.objects.len()));
             Ok(p)
         })

@@ -1,9 +1,7 @@
 //! `kv_model`: one client per database issues random KV operations through
-//! every API form (one-shot transactions, interactive transactions, raw
-//! KV endpoints) while the cluster suffers faults. Every response is
-//! compared with an exact model. Ambiguous outcomes are resolved the way a
-//! careful real client would: idempotency keys for one-shot transactions,
-//! and fenced commit-status queries or fenced read-backs otherwise.
+//! every API form under faults, and every response must match an exact
+//! model. Ambiguous outcomes are resolved as a careful client would: with
+//! idempotency keys, fenced commit-status queries or fenced read-backs.
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, url_escape};
@@ -534,7 +532,6 @@ impl KvModel {
                 }
             }
             2 => {
-                // Raw GET with an optional range.
                 let cur = self.model.data.get(&k).cloned();
                 let (range, hdr) = match (&cur, self.rng.chance(0.4)) {
                     (Some((v, _)), true) if !v.is_empty() => {
@@ -706,4 +703,44 @@ pub async fn run(sim: Arc<Sim>, clients: usize, steps: usize, chaos: bool) -> Re
         w.full_check().await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_checks_reject_mismatches() {
+        check_value(&json!({"value": "abc"}), b"abc", "t").unwrap();
+        assert!(check_value(&json!({"value": "abd"}), b"abc", "t").is_err());
+        assert!(check_value(&json!({}), b"abc", "t").is_err());
+        check_value(&json!({"value": s(&[b'x'; INLINE_MAX])}), &[b'x'; INLINE_MAX], "inline at the limit").unwrap();
+        let big = vec![b'x'; INLINE_MAX + 1];
+        check_value(&json!({"value": s(&big), "blob": {"size": big.len()}}), &big, "t").unwrap();
+        assert!(check_value(&json!({"value": s(&big), "blob": {"size": 3}}), &big, "t").is_err());
+        let huge = vec![b'x'; JSON_VALUE_MAX + 1];
+        assert!(check_value(&json!({"value": s(&huge), "blob": {"size": huge.len()}}), &huge, "t").is_err());
+        check_version(&json!({"version": 4}), Some(4), "t").unwrap();
+        assert!(check_version(&json!({"version": 4}), Some(5), "t").is_err());
+        assert!(check_version(&json!({}), Some(5), "t").is_err());
+    }
+
+    #[test]
+    fn txn_model_has_read_your_writes() {
+        let mut base = Model::default();
+        base.data.insert(b"a/x".to_vec(), (b"1".to_vec(), 3));
+        base.data.insert(b"a/y".to_vec(), (b"2".to_vec(), 4));
+        let mut t = TxnSim::new(base.clone());
+        assert_eq!(t.get(b"a/x"), Some((b"1".to_vec(), Some(3))));
+        t.put(b"a/z".to_vec(), b"3".to_vec());
+        t.delete_range(prefix_range(b"a/x"));
+        assert_eq!(t.get(b"a/x"), None);
+        assert_eq!(t.get(b"a/z"), Some((b"3".to_vec(), None)));
+        let keys: Vec<Key> = t.scan(&prefix_range(b"a/"), false).into_iter().map(|e| e.0).collect();
+        assert_eq!(keys, vec![b"a/y".to_vec(), b"a/z".to_vec()]);
+        assert!(t.is_write());
+        t.apply(&mut base, 9);
+        assert_eq!(base.data.keys().cloned().collect::<Vec<_>>(), vec![b"a/y".to_vec(), b"a/z".to_vec()]);
+        assert_eq!(base.data[&b"a/z".to_vec()].1, 9);
+    }
 }

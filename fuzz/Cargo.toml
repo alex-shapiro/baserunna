@@ -44,3 +44,10 @@ path = "fuzz_targets/ops_json.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "http_txn"
+path = "fuzz_targets/http_txn.rs"
+test = false
+doc = false
+bench = false

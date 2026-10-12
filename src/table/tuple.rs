@@ -194,7 +194,10 @@ mod tests {
                 1 => f64::INFINITY,
                 2 => f64::NEG_INFINITY,
                 3 => r.range(0, 10) as f64 - 5.5,
-                _ => f64::from_bits(r.next_u64()).clamp(-1e300, 1e300),
+                _ => match f64::from_bits(r.next_u64()) {
+                    f if f.is_nan() => 0.5,
+                    f => f.clamp(-1e300, 1e300),
+                },
             }),
             4 => Key::Str(String::from_utf8_lossy(&prop::small_key(r, 5)).into_owned()),
             _ => Key::Bytes(prop::small_key(r, 5)),
@@ -205,9 +208,30 @@ mod tests {
         (0..r.usize(4)).map(|_| gen_key(r)).collect()
     }
 
+    /// The intended order, independent of the implementation: by type (in
+    /// the module's documented order), then numerically or bytewise.
+    fn oracle(a: &Key, b: &Key) -> Ordering {
+        let rank = |k: &Key| match k {
+            Key::Null => 0,
+            Key::Bool(false) => 1,
+            Key::Bool(true) => 2,
+            Key::Int(_) => 3,
+            Key::Float(_) => 4,
+            Key::Str(_) => 5,
+            Key::Bytes(_) => 6,
+        };
+        match (a, b) {
+            (Key::Int(x), Key::Int(y)) => x.cmp(y),
+            (Key::Float(x), Key::Float(y)) => x.partial_cmp(y).expect("keys are never NaN"),
+            (Key::Str(x), Key::Str(y)) => x.as_bytes().cmp(y.as_bytes()),
+            (Key::Bytes(x), Key::Bytes(y)) => x.cmp(y),
+            _ => rank(a).cmp(&rank(b)),
+        }
+    }
+
     fn cmp_tuples(a: &[Key], b: &[Key]) -> Ordering {
         for (x, y) in a.iter().zip(b) {
-            let c = x.cmp_key(y);
+            let c = oracle(x, y);
             if c != Ordering::Equal {
                 return c;
             }
@@ -226,11 +250,16 @@ mod tests {
                 let ea = encode(a);
                 let eb = encode(b);
                 let da = decode_all(&ea).map_err(|e| e.to_string())?;
-                if cmp_tuples(&da, a) != Ordering::Equal {
+                if da != *a {
                     return Err(format!("roundtrip {a:?} -> {da:?}"));
                 }
                 if ea.cmp(&eb) != cmp_tuples(a, b) {
                     return Err(format!("order mismatch {a:?} vs {b:?}"));
+                }
+                for (x, y) in a.iter().zip(b) {
+                    if x.cmp_key(y) != oracle(x, y) {
+                        return Err(format!("cmp_key {x:?} vs {y:?}"));
+                    }
                 }
                 // Prefix property.
                 if !a.is_empty() {

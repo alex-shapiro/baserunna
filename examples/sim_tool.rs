@@ -14,19 +14,10 @@ fn run_one(name: &str, seed: u64, keep_log: bool) -> (SimOutcome, Vec<String>) {
     let s = scenario(name).unwrap_or_else(|| panic!("unknown scenario {name}"));
     let mut cfg = (s.config)();
     cfg.keep_log = keep_log;
-    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let l2 = log.clone();
-    let runner = s.run;
-    let out = run(seed, cfg, move |sim| {
-        let l2 = l2.clone();
-        async move {
-            let r = runner(sim.clone()).await;
-            *l2.lock().unwrap() = sim.trace.dump();
-            r
-        }
-    });
-    let v = log.lock().unwrap().clone();
-    (out, v)
+    cfg.full_trace = keep_log;
+    let out = run(seed, cfg, s.run);
+    let log = out.trace_tail.clone();
+    (out, log)
 }
 
 fn main() {

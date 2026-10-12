@@ -11,7 +11,7 @@
 //! ```
 //! This module is pure (no I/O); see `version.rs` for loading.
 
-use super::types::{Entry, Seq, Value};
+use super::types::{Entry, Seq};
 use crate::util::bloom::Bloom;
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
 use crate::util::crc32c::crc32c;
@@ -69,11 +69,6 @@ impl SegmentBuilder {
 
     pub fn is_empty(&self) -> bool {
         self.entries == 0
-    }
-
-    /// Approximate size so far.
-    pub fn size(&self) -> usize {
-        self.out.len() + self.block.len()
     }
 
     /// Keys must be added in strictly increasing order.
@@ -344,14 +339,10 @@ pub fn read_all(data: &Bytes) -> DResult<Vec<Entry>> {
     Ok(out)
 }
 
-/// Helper used by tests and fuzzers: is the value a tombstone.
-pub fn live(e: &Entry) -> bool {
-    !matches!(e.value, Value::Tombstone)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::types::Value;
     use crate::util::prop;
     use crate::util::rng::Rng;
 
@@ -374,6 +365,101 @@ mod tests {
             .collect()
     }
 
+    /// A footer with a valid checksum but sections out of place must be
+    /// rejected, not trusted (or panicked on).
+    #[test]
+    fn rejects_inconsistent_layouts_with_valid_checksums() {
+        let entries: Vec<Entry> = (0..60u64)
+            .map(|i| Entry {
+                key: Bytes::from(format!("k{i:04}")),
+                seq: i,
+                value: Value::Inline(Bytes::from(vec![7u8; 40])),
+            })
+            .collect();
+        let (data, _) = build(&entries, 256);
+        assert_eq!(read_all(&data).unwrap(), entries);
+        let fo = data.len() - FOOTER_LEN;
+        // (offset, width) of index_off, index_len, bloom_off, bloom_len.
+        for (off, width) in [(8usize, 8usize), (16, 4), (20, 8), (28, 4)] {
+            for delta in [-1i64, 1, 1 << 20] {
+                let mut d = data.to_vec();
+                let f = &mut d[fo..];
+                let mut v = [0u8; 8];
+                v[..width].copy_from_slice(&f[off..off + width]);
+                let n = (u64::from_le_bytes(v) as i64).wrapping_add(delta) as u64;
+                f[off..off + width].copy_from_slice(&n.to_le_bytes()[..width]);
+                let crc = crc32c(&f[..60]);
+                f[60..].copy_from_slice(&crc.to_le_bytes());
+                let d = Bytes::from(d);
+                assert!(read_all(&d).is_err(), "footer field at {off} shifted by {delta} was accepted");
+                assert!(SegmentIndex::decode_whole(&d).is_err());
+            }
+        }
+    }
+
+    /// `data` with its block index replaced by `blocks`, followed by
+    /// `trailing` bytes, with valid checksums throughout.
+    fn with_index(data: &Bytes, blocks: &[(Bytes, u64, u32)], trailing: &[u8]) -> Bytes {
+        let fo = data.len() - FOOTER_LEN;
+        let footer = Footer::decode(&data[fo..], data.len() as u64).unwrap();
+        let mut iw = Writer::new();
+        iw.varint(blocks.len() as u64);
+        for (k, off, len) in blocks {
+            iw.bytes(k);
+            iw.u64(*off);
+            iw.u32(*len);
+        }
+        iw.raw(trailing);
+        let crc = crc32c(&iw.buf);
+        iw.u32(crc);
+        let mut f = data[fo..].to_vec();
+        f[16..20].copy_from_slice(&(iw.buf.len() as u32).to_le_bytes());
+        let crc = crc32c(&f[..60]);
+        f[60..].copy_from_slice(&crc.to_le_bytes());
+        let mut out = data[..footer.index_off as usize].to_vec();
+        out.extend_from_slice(&iw.buf);
+        out.extend_from_slice(&f);
+        Bytes::from(out)
+    }
+
+    /// The block index must tile the data section exactly, with blocks
+    /// large enough for their count and checksum.
+    #[test]
+    fn rejects_block_indexes_that_do_not_tile_the_data() {
+        let entries: Vec<Entry> = (0..60u64)
+            .map(|i| Entry {
+                key: Bytes::from(format!("k{i:04}")),
+                seq: i,
+                value: Value::Inline(Bytes::from(vec![7u8; 40])),
+            })
+            .collect();
+        let (data, _) = build(&entries, 256);
+        let blocks = SegmentIndex::decode_whole(&data).unwrap().blocks;
+        assert!(blocks.len() >= 3);
+        assert!(SegmentIndex::decode_whole(&with_index(&data, &blocks, &[])).is_ok(), "setup");
+        let mut gap = blocks.clone();
+        gap[1].1 += 1;
+        gap[1].2 -= 1;
+        let mut tiny = blocks.clone();
+        tiny[0].2 = 4;
+        tiny[1].1 = 4;
+        tiny[1].2 += blocks[0].2 - 4;
+        for (what, bad, trailing) in
+            [("gap", gap, &[][..]), ("tiny block", tiny, &[][..]), ("trailing", blocks, &[0][..])]
+        {
+            assert!(SegmentIndex::decode_whole(&with_index(&data, &bad, trailing)).is_err(), "{what} was accepted");
+        }
+    }
+
+    #[test]
+    fn blocks_too_short_for_their_count_are_rejected() {
+        for body in [&b""[..], b"\x01", b"\x01\x02\x03"] {
+            let mut raw = body.to_vec();
+            raw.extend_from_slice(&crc32c(body).to_le_bytes());
+            assert!(decode_block(Bytes::from(raw)).is_err(), "{body:?}");
+        }
+    }
+
     #[test]
     fn prop_roundtrip() {
         prop::check(
@@ -387,8 +473,17 @@ mod tests {
                 if &back != entries {
                     return Err("entries differ".into());
                 }
-                if stats.entries != entries.len() as u64 || stats.size != data.len() as u64 {
-                    return Err("bad stats".into());
+                let want = SegmentStats {
+                    size: data.len() as u64,
+                    entries: entries.len() as u64,
+                    tombstones: entries.iter().filter(|e| e.value.is_tombstone()).count() as u64,
+                    min_key: entries.first().map(|e| e.key.clone()).unwrap_or_default(),
+                    max_key: entries.last().map(|e| e.key.clone()).unwrap_or_default(),
+                    min_seq: entries.iter().map(|e| e.seq).min().unwrap_or(0),
+                    max_seq: entries.iter().map(|e| e.seq).max().unwrap_or(0),
+                };
+                if stats != want {
+                    return Err(format!("stats {stats:?}, want {want:?}"));
                 }
                 let idx = SegmentIndex::decode_whole(&data).map_err(|e| e.to_string())?;
                 for e in entries {
@@ -401,6 +496,12 @@ mod tests {
                         .map_err(|e| e.to_string())?;
                     if !b.iter().any(|x| x == e) {
                         return Err("entry not in its block".into());
+                    }
+                }
+                if let Some(last) = entries.last() {
+                    let past = [last.key.as_ref(), b"\xff"].concat();
+                    if idx.block_for(&past).is_some() {
+                        return Err("a block was found for a key past the last one".into());
                     }
                 }
                 Ok(())

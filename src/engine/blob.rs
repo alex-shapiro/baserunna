@@ -36,10 +36,6 @@ impl BlobWriter {
         }
     }
 
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
     async fn flush_chunk(&mut self, data: Bytes) -> Result<()> {
         let key = blob_chunk_key(&self.db, &self.id, self.next_chunk);
         self.shared.retry.run(|| self.shared.store.put(&key, data.clone(), PutMode::Overwrite)).await?;
@@ -88,7 +84,7 @@ pub fn blob_meta_key(db: &str, id: &str) -> String {
 
 /// Load the descriptor of a staged (or committed) blob by id.
 pub async fn load_staged(shared: &Shared, db: &str, id: &str) -> Result<BlobRef> {
-    if !super::types::valid_blob_id(id) {
+    if !super::types::valid_object_id(id) {
         return Err(Error::invalid(format!("invalid blob id {id:?}")));
     }
     let key = blob_meta_key(db, id);
@@ -133,7 +129,11 @@ pub async fn read_chunk(shared: &Shared, db: &str, blob: &BlobRef, ci: u64, r: R
         .run(|| shared.store.get(&key, GetOpts { range: Some(r.clone()), ..Default::default() }))
         .await
         .map_err(|e| match e {
-            crate::store::StoreError::NotFound => Error::internal(format!("blob {} chunk {ci} missing", blob.id)),
+            // The snapshot outlived the blob: it was dereferenced and then
+            // collected after `gc_grace`. A retry reads a newer snapshot.
+            crate::store::StoreError::NotFound => {
+                Error::unavailable(format!("blob {} was garbage collected during the read; retry", blob.id))
+            }
             other => other.into(),
         })?;
     if g.data.len() as u64 != r.end - r.start {

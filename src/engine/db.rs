@@ -27,6 +27,17 @@ pub enum Consistency {
     Snapshot { max_staleness_ms: u64 },
 }
 
+tokio::task_local! {
+    static INVOKED_AT: Instant;
+}
+
+/// Run `f` as one operation invoked at `at`: its strong reads may use a
+/// manifest validated at or after `at` (still linearizable), so several
+/// reads within one request pay for one validation.
+pub async fn invoked_at<F: std::future::Future>(at: Instant, f: F) -> F::Output {
+    INVOKED_AT.scope(at, f).await
+}
+
 enum Work {
     Commit {
         req: CommitRequest,
@@ -94,6 +105,9 @@ struct State {
     window_start: Instant,
     reads_in_window: u32,
     lease_requested: bool,
+    /// Our lease, as of the manifest write (`write_seq`) that last renewed
+    /// it, and the monotonic instant until which we may rely on it.
+    own_lease: Option<(u64, Instant)>,
     compacting: bool,
     sweeping: bool,
 }
@@ -111,8 +125,6 @@ pub struct Db {
     load_lock: tokio::sync::Mutex<()>,
     /// True while a manifest write by this node is in flight. Its result
     /// may already be visible to others, so lease reads wait for it.
-    /// (A plain `Notify` rather than `watch`: tokio's watch channel shards
-    /// waiters randomly, which would break simulation determinism.)
     writing: std::sync::atomic::AtomicBool,
     write_done: tokio::sync::Notify,
 }
@@ -149,6 +161,7 @@ impl Db {
                 window_start: now,
                 reads_in_window: 0,
                 lease_requested: false,
+                own_lease: None,
                 compacting: false,
                 sweeping: false,
             }),
@@ -185,28 +198,45 @@ impl Db {
             && st.last_access.elapsed() >= Duration::from_millis(ms)
     }
 
-    fn holds_lease(&self, m: &Manifest, now_ms: u64) -> bool {
-        m.lease.as_ref().is_some_and(|l| {
-            l.node == self.shared.node_id && now_ms + self.shared.cfg.clock_skew_margin_ms < l.expires_ms
-        })
+    // Lease validity is measured on each node's monotonic clock, never by
+    // comparing wall clocks: the holder counts from before it sent the
+    // renewing write, everyone else from when they first saw that renewal.
+    // Every observation follows the send, so others always consider a lease
+    // valid for longer than its holder relies on it, however skewed the
+    // wall clocks are. `expires_ms` in the manifest only identifies a
+    // renewal and serves as a hint.
+
+    /// How long we may still rely on our lease in `m` (zero if `m` is not
+    /// the manifest write that last renewed it).
+    fn own_lease_left(&self, st: &State, m: &Manifest) -> Duration {
+        let ours = m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id);
+        match st.own_lease {
+            Some((ws, until)) if ours && ws == m.write_seq => until.saturating_duration_since(Instant::now()),
+            _ => Duration::ZERO,
+        }
     }
 
-    /// Lease held by another node that is still valid from our viewpoint.
-    fn foreign_lease<'a>(&self, m: &'a Manifest, now_ms: u64) -> Option<&'a Lease> {
-        m.lease
-            .as_ref()
-            .filter(|l| l.node != self.shared.node_id && now_ms < l.expires_ms + self.shared.cfg.clock_skew_margin_ms)
+    fn holds_lease(&self, st: &State, m: &Manifest) -> bool {
+        !self.own_lease_left(st, m).is_zero()
+    }
+
+    /// A lease in `m` held by another node, with how long it may still be
+    /// valid from our viewpoint.
+    fn foreign_lease<'a>(&self, m: &'a Manifest) -> Option<(&'a Lease, Duration)> {
+        let l = m.lease.as_ref().filter(|l| l.node != self.shared.node_id)?;
+        let valid_for = Duration::from_millis(self.shared.cfg.lease_ms + self.shared.cfg.clock_skew_margin_ms);
+        let left = (self.shared.lease_seen(&self.id, l) + valid_for).saturating_duration_since(Instant::now());
+        (!left.is_zero()).then_some((l, left))
     }
 
     /// The node holding a valid lease on this database, if known.
     pub fn lease_holder(&self) -> Option<String> {
-        let cur = self.current()?;
-        let now = self.shared.env.now_ms();
-        cur.m
-            .lease
-            .as_ref()
-            .filter(|l| now < l.expires_ms + self.shared.cfg.clock_skew_margin_ms)
-            .map(|l| l.node.clone())
+        let st = self.st();
+        let cur = st.current.clone()?;
+        if self.holds_lease(&st, &cur.m) {
+            return Some(self.shared.node_id.clone());
+        }
+        self.foreign_lease(&cur.m).map(|(l, _)| l.node.clone())
     }
 
     pub fn stats(&self) -> Option<DbStats> {
@@ -240,6 +270,9 @@ impl Db {
                 v
             }
         };
+        if let Some(l) = installed.m.lease.as_ref().filter(|l| l.node != self.shared.node_id) {
+            self.shared.lease_seen(&self.id, l);
+        }
         st.trusted = true;
         if let Some(t) = verified
             && st.verified_at.is_none_or(|old| t > old)
@@ -305,7 +338,7 @@ impl Db {
         }
     }
 
-    /// Ensure the database exists (creating its manifest if needed).
+    /// Load the database, creating it if `create` and it does not exist.
     pub async fn open(self: &Arc<Self>, create: bool) -> Result<Arc<Version>> {
         if let Some(c) = self.current() {
             return Ok(c);
@@ -330,7 +363,6 @@ impl Db {
             }
         }
         let now = Instant::now();
-        let now_ms = self.shared.env.now_ms();
         let lease_ms = self.shared.cfg.lease_ms;
         let mut want_lease = false;
         {
@@ -343,7 +375,8 @@ impl Db {
             st.reads_in_window += 1;
             let hot = st.reads_in_window >= self.shared.cfg.lease_read_threshold;
             if let Some(cur) = st.current.clone() {
-                let leased = st.trusted && self.holds_lease(&cur.m, now_ms);
+                let lease_left = if st.trusted { self.own_lease_left(&st, &cur.m) } else { Duration::ZERO };
+                let leased = !lease_left.is_zero();
                 let fresh = match c {
                     Consistency::Strong => leased,
                     Consistency::Snapshot { max_staleness_ms } => {
@@ -353,12 +386,9 @@ impl Db {
                                 .is_some_and(|v| now.duration_since(v) <= Duration::from_millis(max_staleness_ms))
                     }
                 };
-                if leased && hot && !st.lease_requested {
-                    let remaining = cur.m.lease.as_ref().map(|l| l.expires_ms.saturating_sub(now_ms)).unwrap_or(0);
-                    if remaining < lease_ms / 2 {
-                        st.lease_requested = true;
-                        want_lease = true;
-                    }
+                if leased && hot && !st.lease_requested && lease_left < Duration::from_millis(lease_ms / 2) {
+                    st.lease_requested = true;
+                    want_lease = true;
                 }
                 if fresh {
                     drop(st);
@@ -375,15 +405,16 @@ impl Db {
                 }
             }
         }
-        let v = self.refresh(now, false).await?;
+        let not_before = match c {
+            Consistency::Strong => INVOKED_AT.try_with(|t| *t).unwrap_or(now).min(now),
+            Consistency::Snapshot { .. } => now,
+        };
+        let v = self.refresh(not_before, false).await?;
         self.shared.env.trace(|| format!("{} read v{} after refresh (lease={:?})", self.id, v.m.version, v.m.lease));
         let hot = {
             let mut st = self.st();
             let hot = st.reads_in_window >= self.shared.cfg.lease_read_threshold && !st.lease_requested;
-            if hot
-                && v.m.lease.as_ref().is_none_or(|l| l.node != self.shared.node_id)
-                && self.foreign_lease(&v.m, self.shared.env.now_ms()).is_none()
-            {
+            if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v.m).is_none() {
                 st.lease_requested = true;
                 true
             } else {
@@ -404,7 +435,6 @@ impl Db {
         rx.await.map_err(|_| Error::unavailable("delete interrupted"))?
     }
 
-    /// Begin an engine transaction.
     pub async fn begin(self: &Arc<Self>, isolation: Isolation, c: Consistency) -> Result<Txn> {
         let snap = self.read_version(c).await?;
         Ok(Txn::new(snap, isolation, self.shared.env.random_u128(), self.shared.cfg.txn_max_write_bytes))
@@ -463,10 +493,10 @@ impl Db {
         Ok(v.m.commit_version(id))
     }
 
-    /// Definitive commit status: first writes the manifest (a lease
-    /// renewal), which fences any in-flight attempt of an earlier ambiguous
-    /// commit, then checks the commit ring. `None` = not committed (if the
-    /// commit is recent enough to still be in the ring).
+    /// Definitive commit status: writes the manifest first, fencing any
+    /// in-flight attempt of an earlier ambiguous commit, then checks the
+    /// commit ring. `None` means not committed, if the commit is recent
+    /// enough to be in the ring.
     pub async fn commit_status_fenced(self: &Arc<Self>, id: u128) -> Result<Option<Seq>> {
         self.acquire_lease().await?;
         self.commit_status(id).await
@@ -531,12 +561,11 @@ impl Db {
         };
         loop {
             attempt += 1;
+            let attempt_started = Instant::now();
             let now_ms = self.shared.env.now_ms();
-            if let Some(l) = self.foreign_lease(&base.m, now_ms) {
-                let e = Error::NotOwner {
-                    holder: l.node.clone(),
-                    retry_after_ms: (l.expires_ms + cfg.clock_skew_margin_ms).saturating_sub(now_ms),
-                };
+            let foreign = self.foreign_lease(&base.m).map(|(l, left)| (l.node.clone(), left));
+            if let Some((holder, left)) = foreign {
+                let e = Error::NotOwner { holder, retry_after_ms: left.as_millis() as u64 };
                 self.finish_failed(batch, e);
                 return;
             }
@@ -576,6 +605,11 @@ impl Db {
             }
             match res {
                 Ok(etag) => {
+                    if m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id) {
+                        let until = attempt_started + Duration::from_millis(cfg.lease_ms)
+                            - Duration::from_millis(cfg.clock_skew_margin_ms.min(cfg.lease_ms));
+                        self.st().own_lease = Some((m.write_seq, until));
+                    }
                     let v = Arc::new(Version { m, etag, shared: self.shared.clone() });
                     let v = self.install(v, Some(started));
                     self.write_finished();
@@ -610,7 +644,6 @@ impl Db {
                 self.finish_failed(batch, e);
                 return;
             }
-            // Back off with jitter, then reload the latest manifest.
             let delay = 5 * (1u64 << attempt.min(6)) + self.shared.env.random_below(10);
             tokio::time::sleep(Duration::from_millis(delay)).await;
             loop {
@@ -796,7 +829,9 @@ impl Db {
         if data_changed && m.version_times.last().is_none_or(|(_, t)| *t + cfg.version_sample_ms <= now_ms) {
             m.version_times.push((m.version, now_ms));
         }
-        let keep_after = now_ms.saturating_sub(2 * cfg.txn_max_lifetime_ms);
+        // Keep the newest sample at least a transaction lifetime old: the
+        // tombstone purge horizons are read from it.
+        let keep_after = now_ms.saturating_sub(cfg.txn_max_lifetime_ms);
         while m.version_times.len() >= 2 && m.version_times[1].1 <= keep_after {
             m.version_times.remove(0);
         }
@@ -864,7 +899,7 @@ impl Db {
         loop {
             let Some(v) = self.current() else { return Ok(()) };
             let now_ms = self.shared.env.now_ms();
-            if !self.holds_lease(&v.m, now_ms) {
+            if !self.holds_lease(&self.st(), &v.m) {
                 return Ok(());
             }
             let Some(run) = pick_run(&v.m.segments, cfg.compaction_fanout, cfg.max_segments) else {
@@ -899,7 +934,7 @@ impl Db {
         let cfg = self.shared.cfg.clone();
         let v = self.refresh(Instant::now(), false).await?;
         let now_ms = self.shared.env.now_ms();
-        if !self.holds_lease(&v.m, now_ms) {
+        if !self.holds_lease(&self.st(), &v.m) {
             return Ok(());
         }
         let store = &*self.shared.store;
@@ -925,7 +960,7 @@ impl Db {
         let mut items = Vec::new();
         for o in &segs {
             let id = o.key.rsplit('/').next().unwrap_or("");
-            if super::manifest::valid_object_id(id)
+            if super::types::valid_object_id(id)
                 && !referenced_segs.contains(id)
                 && o.last_modified_ms + cfg.orphan_grace_ms <= now_ms
             {
@@ -942,7 +977,7 @@ impl Db {
         }
         for (id, mtime) in blob_mtimes {
             let created = super::types::blob_id_time(&id).unwrap_or(0);
-            if super::types::valid_blob_id(&id)
+            if super::types::valid_object_id(&id)
                 && !referenced_blobs.contains(&id)
                 && mtime + cfg.orphan_grace_ms <= now_ms
                 && created + cfg.blob_stage_ttl_ms <= now_ms
@@ -958,11 +993,6 @@ impl Db {
     /// Run a sweep now (tests and admin tooling).
     pub async fn sweep_now(self: &Arc<Self>) -> Result<()> {
         self.clone().sweep().await
-    }
-
-    /// Run compaction now if the policy wants it (tests and tooling).
-    pub async fn compact_now(self: &Arc<Self>) -> Result<()> {
-        self.clone().compact().await
     }
 
     /// Commit a no-op lease renewal that also performs due GC (tests).
@@ -1016,4 +1046,85 @@ async fn delete_object(shared: &Shared, db: &str, o: &Obsolete) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::EngineConfig;
+    use crate::engine::tests::{engine, rt};
+
+    fn meta(c: char) -> SegmentMeta {
+        SegmentMeta {
+            id: c.to_string().repeat(32),
+            size: 100,
+            entries: 1,
+            tombstones: 0,
+            min_key: Bytes::new(),
+            max_key: Bytes::new(),
+            min_seq: 0,
+            max_seq: 0,
+        }
+    }
+
+    /// The plan for `batch` on a manifest with `segments` (newest first)
+    /// and `obsolete` objects.
+    async fn plan(segments: &[SegmentMeta], obsolete: Vec<Obsolete>, batch: Vec<Work>) -> Plan {
+        let (eng, _, _) = engine(1, EngineConfig::small_for_tests());
+        let m = Manifest { segments: segments.to_vec(), obsolete, ..Manifest::new("d", 0) };
+        let base = Version { m, etag: String::new(), shared: eng.shared.clone() };
+        eng.db("d").build(&base, &batch, 1_000).await.unwrap()
+    }
+
+    fn compaction(inputs: &str, output: char) -> Work {
+        let (tx, _) = oneshot::channel();
+        Work::Compaction {
+            inputs: inputs.chars().map(|c| meta(c).id).collect(),
+            output: Some(meta(output)),
+            purged_max_seq: 0,
+            tx,
+        }
+    }
+
+    fn succeeded(p: &Plan) -> bool {
+        matches!(p.outcomes[..], [Outcome::Unit(Ok(()))])
+    }
+
+    fn segment_names(p: &Plan) -> Option<String> {
+        p.manifest.as_ref().map(|m| m.segments.iter().map(|s| &s.id[..1]).collect())
+    }
+
+    /// A compaction installs only if its inputs are still a contiguous run
+    /// of the current segments; installing it again is a no-op success.
+    #[test]
+    fn compaction_installs_check_their_inputs() {
+        rt().block_on(async {
+            let abc = [meta('a'), meta('b'), meta('c')];
+            let p = plan(&abc, vec![], vec![compaction("bc", 'x')]).await;
+            assert!(succeeded(&p));
+            assert_eq!(segment_names(&p).as_deref(), Some("ax"));
+            for inputs in ["bx", "bcd", "cb", "ac"] {
+                let p = plan(&abc, vec![], vec![compaction(inputs, 'y')]).await;
+                assert!(!succeeded(&p) && p.manifest.is_none(), "inputs {inputs} were installed");
+            }
+            let p = plan(&[meta('a'), meta('x')], vec![], vec![compaction("bc", 'x')]).await;
+            assert!(succeeded(&p) && p.manifest.is_none());
+        });
+    }
+
+    /// A sweep's findings are recorded once each, and never for a live
+    /// segment.
+    #[test]
+    fn obsolete_objects_are_recorded_once_and_never_live_segments() {
+        rt().block_on(async {
+            let ob = |kind, c: char| Obsolete { kind, id: c.to_string().repeat(32), since_ms: 0 };
+            let (seg, blob) = (ObjKind::Segment, ObjKind::Blob);
+            let (tx, _) = oneshot::channel();
+            let items = vec![ob(seg, 'a'), ob(seg, 'b'), ob(seg, 'c'), ob(blob, 'a'), ob(blob, 'd')];
+            let p = plan(&[meta('a')], vec![ob(seg, 'b'), ob(blob, 'd')], vec![Work::Obsolete { items, tx }]).await;
+            let got: Vec<(ObjKind, char)> =
+                p.manifest.unwrap().obsolete.iter().map(|o| (o.kind, o.id.chars().next().unwrap())).collect();
+            assert_eq!(got, [(seg, 'b'), (blob, 'd'), (seg, 'c'), (blob, 'a')]);
+        });
+    }
 }

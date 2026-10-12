@@ -1,0 +1,42 @@
+# Mutation testing (SPEC §13.4). Run it through `scripts/mutants.sh`, which
+# kills mutated tests that allocate without bound:
+#
+#   scripts/mutants.sh                          # everything below (hours)
+#   scripts/mutants.sh -F 'src/engine/txn.rs'   # a subset
+#
+# Surviving mutants are listed in mutants.out/missed.txt.
+
+profile = "mutants"
+# The cost guard catches mutants that only waste object-store requests.
+additional_cargo_test_args = ["--lib", "--test", "sim", "--test", "fuzz", "--test", "cost"]
+minimum_test_timeout = 60
+exclude_globs = [
+    "src/engine/tests.rs",
+    "src/table/tests.rs",
+    # Struct-field deletions ignore `examine_re`, so files that are mostly
+    # configuration literals are excluded whole.
+    "src/api/**",
+    "src/store/**",
+    "src/main.rs",
+    "src/meta.rs",
+    "src/client.rs",
+    "src/engine/config.rs",
+    "src/sim/mod.rs",
+    "src/sim/cost.rs",
+    "src/sim/store.rs",
+    "src/sim/google.rs",
+]
+# The storage engine, tables and ops entirely; of the simulator, only the
+# checkers (a weakened checker must be caught by its self-tests).
+examine_re = [
+    '^src/(engine|table)/',
+    '^src/ops\.rs',
+    '^src/sim/storage_check\.rs',
+    '^src/sim/workloads/\w+\.rs:.* in (check|audit|check_body|check_value|check_version|TxnSim::\w+)$',
+]
+exclude_re = [
+    # Diagnostics: tracing and formatting cannot change results.
+    'impl (std::fmt::)?(Debug|Display)',
+    ' in Env::trace',
+    'mem_size',
+]

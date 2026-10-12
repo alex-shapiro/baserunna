@@ -4,7 +4,7 @@
 //! unreferenced object and keep every referenced one.
 
 use super::super::Sim;
-use super::super::client::{Client, ZOMBIE_WAIT_MS};
+use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
 use crate::engine::manifest::{Manifest, ObjKind};
 use crate::engine::{Value, segment};
 use crate::util::{b64, sha256};
@@ -106,29 +106,17 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
                 kv.insert(key, data);
             }
             2 => {
-                // Stage, then bind in a transaction.
-                let staged = loop {
-                    match c
-                        .send(
-                            "POST",
-                            &format!("{base}/blobs"),
-                            &[("content-type", "application/pdf".into())],
-                            bytes::Bytes::from(data.clone()),
-                        )
-                        .await
-                    {
-                        Ok(r) if r.status == 201 => {
-                            break serde_json::from_slice::<serde_json::Value>(&r.body).map_err(|e| e.to_string())?;
-                        }
-                        _ => c.pause(200).await,
+                let r = stage_and_bind(&c, base, &data, "application/pdf", |staged| {
+                    if staged["size"] != json!(size) || staged["sha256"] != json!(b64::hex(&sha256(&data))) {
+                        return Err(format!("staged metadata wrong: {staged}"));
                     }
-                };
-                if staged["size"] != json!(size) || staged["sha256"] != json!(b64::hex(&sha256(&data))) {
-                    return Err(format!("staged metadata wrong: {staged}"));
-                }
-                let id = staged["blob_id"].as_str().unwrap_or_default();
-                let body = json!({"ops": [{"op": "put", "key": key, "blob_id": id}], "idempotency_key": format!("bind-{round}")});
-                let r = c.call_settled("POST", &format!("{base}/txn"), Some(body)).await;
+                    let id = staged["blob_id"].as_str().unwrap_or_default();
+                    Ok((
+                        format!("{base}/txn"),
+                        json!({"ops": [{"op": "put", "key": key, "blob_id": id}], "idempotency_key": format!("bind-{round}")}),
+                    ))
+                })
+                .await?;
                 if r.status != 200 {
                     return Err(format!("bind: {} {}", r.status, r.json));
                 }
@@ -136,16 +124,13 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
             }
             3 => {
                 let id = format!("asset{}", rng.below(4));
-                let staged = loop {
-                    match c.send("POST", &format!("{base}/blobs"), &[], bytes::Bytes::from(data.clone())).await {
-                        Ok(r) if r.status == 201 => {
-                            break serde_json::from_slice::<serde_json::Value>(&r.body).map_err(|e| e.to_string())?;
-                        }
-                        _ => c.pause(200).await,
-                    }
-                };
-                let body = json!({"row": {"id": id, "data": staged["blob_id"]}, "upsert": true});
-                let r = c.call_settled("POST", &format!("{base}/tables/assets/rows"), Some(body)).await;
+                let r = stage_and_bind(&c, base, &data, "application/octet-stream", |staged| {
+                    Ok((
+                        format!("{base}/tables/assets/rows"),
+                        json!({"row": {"id": id, "data": staged["blob_id"]}, "upsert": true}),
+                    ))
+                })
+                .await?;
                 if r.status != 200 {
                     return Err(format!("row upsert: {} {}", r.status, r.json));
                 }
@@ -178,7 +163,6 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
     super::recover(&sim).await;
     verify(&c, base, &kv, &rows, &mut rng).await?;
 
-    // Full GC cycle.
     let db_id = c.call_retry("GET", base, None).await.json["id"].as_str().unwrap_or_default().to_string();
     let e = &sim.cfg.engine;
     let touch = |n: u64| {
@@ -188,9 +172,8 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
             c.call_settled("POST", "/v1/dbs/media/txn", Some(body)).await;
         }
     };
-    // GC completeness is checked with store faults off: under faults a sweep
-    // may fail and is retried on a later cycle (safety, i.e. never deleting
-    // referenced data, is checked under faults throughout).
+    // Completeness is checked without store faults, under which a failed
+    // sweep waits for a later cycle.
     sim.store.set_faults_enabled(false);
     let (referenced0, _, _) = db_objects(&sim, &db_id)?;
     let garbage_before = stored_ids(&sim, &db_id, "blob").difference(&referenced0).count();
@@ -198,15 +181,24 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
     touch(1).await; // triggers the orphan sweep
     sim.sleep(10_000).await;
     sim.sleep(e.gc_grace_ms + 1_000).await;
-    touch(2).await; // deletes expired obsolete objects
-    sim.sleep(10_000).await;
-    let (referenced, listed, segs) = db_objects(&sim, &db_id)?;
-    let stored_blobs = stored_ids(&sim, &db_id, "blob");
-    for b in &stored_blobs {
-        if !referenced.contains(b) && !listed.contains(&format!("blob:{b}")) {
-            return Err(format!("garbage blob {b} survived a full GC cycle"));
+    touch(2).await; // deletes expired obsolete objects, in the background
+    let unlisted_garbage = || -> Result<Option<String>, String> {
+        let (referenced, listed, _) = db_objects(&sim, &db_id)?;
+        Ok(stored_ids(&sim, &db_id, "blob")
+            .into_iter()
+            .find(|b| !referenced.contains(b) && !listed.contains(&format!("blob:{b}"))))
+    };
+    for _ in 0..120 {
+        sim.sleep(1_000).await;
+        if unlisted_garbage()?.is_none() {
+            break;
         }
     }
+    if let Some(b) = unlisted_garbage()? {
+        return Err(format!("garbage blob {b} survived a full GC cycle"));
+    }
+    let (referenced, listed, segs) = db_objects(&sim, &db_id)?;
+    let stored_blobs = stored_ids(&sim, &db_id, "blob");
     for b in &referenced {
         if !stored_blobs.contains(b) {
             return Err(format!("referenced blob {b} was deleted"));
@@ -225,6 +217,34 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
         }
     }
     verify(&c, base, &kv, &rows, &mut rng).await
+}
+
+/// Stage `data` and bind it with the request `bind` builds from the staging
+/// response, staging again if retries outlast the staged blob's TTL.
+async fn stage_and_bind(
+    c: &Client,
+    base: &str,
+    data: &[u8],
+    content_type: &str,
+    bind: impl Fn(&serde_json::Value) -> Result<(String, serde_json::Value), String>,
+) -> Result<Resp, String> {
+    loop {
+        let staged = loop {
+            let headers = [("content-type", content_type.to_string())];
+            match c.send("POST", &format!("{base}/blobs"), &headers, bytes::Bytes::copy_from_slice(data)).await {
+                Ok(r) if r.status == 201 => {
+                    break serde_json::from_slice::<serde_json::Value>(&r.body).map_err(|e| e.to_string())?;
+                }
+                _ => c.pause(200).await,
+            }
+        };
+        let (path, body) = bind(&staged)?;
+        let r = c.call_settled("POST", &path, Some(body)).await;
+        if !(r.status == 400 && r.json["error"]["message"].as_str().is_some_and(|m| m.contains("staged blob expired")))
+        {
+            return Ok(r);
+        }
+    }
 }
 
 async fn verify(

@@ -29,7 +29,8 @@ async fn retry(c: &Client, path: &str, body: Json) -> Result<super::super::clien
     Ok(c.call_settled("POST", path, Some(body)).await)
 }
 
-/// Check every table's indexes directly in storage (via a node's engine).
+/// Check every table's indexes directly in storage (via a node's engine),
+/// and that nothing remains of dropped tables and indexes.
 pub async fn check_all_indexes(sim: &Arc<Sim>, db_id: &str) -> Result<(), String> {
     let n = sim.up_nodes().first().copied().ok_or("no node up")?;
     let node = sim.node(n).ok_or("node gone")?.node.clone();
@@ -41,7 +42,7 @@ pub async fn check_all_indexes(sim: &Arc<Sim>, db_id: &str) -> Result<(), String
     for s in tables {
         crate::table::check_indexes(&mut t, &s.name).await.map_err(|e| format!("table {}: {e}", s.name))?;
     }
-    Ok(())
+    crate::table::check_no_orphans(&mut t).await.map_err(|e| e.to_string())
 }
 
 pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) -> Result<(), String> {
@@ -168,7 +169,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
                 }
             }
             _ => {
-                // Index query with pagination.
                 let lim = 1 + rng.usize(4);
                 let mut q = json!({"index": "by_team_score", "eq": [team], "range": {"gte": score}, "limit": lim});
                 let mut got = Vec::new();
@@ -252,7 +252,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
     let info = c.call_retry("GET", base, None).await;
     let db_id = info.json["id"].as_str().ok_or("no db id")?.to_string();
     check_all_indexes(&sim, &db_id).await?;
-    // Final full comparison of the model's rows.
     let r = c
         .call_retry(
             "POST",

@@ -59,7 +59,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     let r = anon.call_retry("POST", "/v1/auth/signup", Some(json!({"email": "x@y.io", "password": "short"}))).await;
     expect(r.status == 400, "short password accepted")?;
 
-    // Login.
     let r = anon
         .call_retry("POST", "/v1/auth/login", Some(json!({"email": "alice@auth.test", "password": "wrong-password"})))
         .await;
@@ -148,7 +147,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
         expect(ro.call_retry("GET", "/v1/dbs/private/kv/secret", None).await.status == 401, "revoked key still works")?;
     }
 
-    // Logout.
     let r = alice2.call_retry("POST", "/v1/auth/logout", Some(json!({}))).await;
     // A retried logout finds the session already gone.
     expect(r.status == 200 || r.status == 401, format!("logout: {} {}", r.status, r.json))?;
@@ -156,7 +154,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     expect(alice2.call_retry("GET", "/v1/me", None).await.status == 401, "logged-out session works")?;
     expect(alice.call_retry("GET", "/v1/me", None).await.status == 200, "other session revoked")?;
 
-    // Admin powers.
     expect(alice.call_retry("GET", "/v1/admin/users", None).await.status == 403, "non-admin listed users")?;
     let users = admin.call_retry("GET", "/v1/admin/users", None).await;
     expect(users.json["users"].as_array().map(|a| a.len()) == Some(3), format!("users: {}", users.json))?;
@@ -226,7 +223,6 @@ async fn google(sim: &Arc<Sim>) -> Result<(), String> {
         email_verified: verified,
         tamper: Tamper::None,
     };
-    // New user via Google.
     let mut tries = 0;
     let session = loop {
         tries += 1;

@@ -1,24 +1,29 @@
 //! Deterministic simulation of a Baserunna cluster (SPEC §13).
 //!
-//! Everything — every node, the object store, the network between nodes and
-//! clients, and Google — runs on one current-thread tokio runtime with
-//! paused (virtual) time, and all randomness flows from one seed. Running a
-//! seed twice yields an identical trace hash.
+//! Nodes, the object store, the network and Google all run on one
+//! current-thread runtime in virtual time, with every random choice drawn
+//! from one seed, so a seed always produces the same trace.
 
 pub mod client;
+pub mod cost;
 pub mod google;
 pub mod openapi_check;
+mod storage_check;
 pub mod store;
+pub mod txn_fuzz;
 pub mod workloads;
+
+pub use storage_check::StorageReport;
 
 use crate::api;
 use crate::cluster::{Transport, TransportError};
-use crate::engine::manifest::Manifest;
-use crate::engine::{EngineConfig, Value, segment};
+use crate::engine::EngineConfig;
 use crate::env::Env;
 use crate::meta::SignupPolicy;
 use crate::node::{Node, NodeConfig};
-use crate::store::{BoxFut, DynStore, MemStore};
+use crate::store::{
+    BoxFut, DynStore, GetOpts, GetResult, ListPage, MemStore, ObjectStore, PutMode, SResult, StoreError,
+};
 use crate::util::rng::Rng;
 use axum::body::Body;
 use bytes::Bytes;
@@ -76,16 +81,41 @@ pub struct NetFaults {
     pub latency_max_ms: u64,
     /// Probability that a response is lost after the request was processed.
     pub p_lose_response: f64,
+    /// Probability that a request forwarded between nodes is delivered a
+    /// second time, up to `forward_delay_max_ms` later (or earlier).
+    pub p_forward_duplicate: f64,
+    /// Probability that a forwarded request is held back for up to
+    /// `forward_delay_max_ms`, letting later requests overtake it.
+    pub p_forward_delay: f64,
+    pub forward_delay_max_ms: u64,
 }
 
 impl NetFaults {
     pub fn none() -> NetFaults {
-        NetFaults { latency_min_ms: 0, latency_max_ms: 2, p_lose_response: 0.0 }
+        NetFaults {
+            latency_min_ms: 0,
+            latency_max_ms: 2,
+            p_lose_response: 0.0,
+            p_forward_duplicate: 0.0,
+            p_forward_delay: 0.0,
+            forward_delay_max_ms: 0,
+        }
     }
 
     pub fn moderate() -> NetFaults {
-        NetFaults { latency_min_ms: 1, latency_max_ms: 10, p_lose_response: 0.01 }
+        NetFaults { latency_min_ms: 1, latency_max_ms: 10, p_lose_response: 0.01, ..NetFaults::none() }
     }
+}
+
+/// Which fault actions [`workloads::chaos_step`] may take.
+#[derive(Clone, Debug, Default)]
+pub struct ChaosFaults {
+    /// Partitions that drop traffic in one direction only.
+    pub one_way_partitions: bool,
+    /// Cutting a node off from the object store (it still reaches peers).
+    pub store_isolation: bool,
+    /// Largest step of a node's wall clock (0 = clocks never jump).
+    pub clock_step_max_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -93,12 +123,14 @@ pub struct SimConfig {
     pub nodes: usize,
     pub store: StoreFaults,
     pub net: NetFaults,
-    /// Maximum absolute wall-clock skew per node (must stay below the
-    /// lease skew margin for lease reads to be linearizable).
+    /// Maximum absolute wall-clock skew per node at start.
     pub max_skew_ms: u64,
+    pub chaos: ChaosFaults,
     pub engine: EngineConfig,
     pub node: NodeConfig,
     pub keep_log: bool,
+    /// Report the whole trace in [`SimOutcome::trace_tail`], not just its end.
+    pub full_trace: bool,
     pub request_timeout_ms: u64,
 }
 
@@ -120,6 +152,7 @@ impl SimConfig {
             store: StoreFaults::none(),
             net: NetFaults::none(),
             max_skew_ms: 0,
+            chaos: ChaosFaults::default(),
             node: NodeConfig {
                 name: "n".into(),
                 pbkdf2_iterations: 10,
@@ -137,11 +170,13 @@ impl SimConfig {
             },
             engine,
             keep_log: std::env::var("SIM_LOG").is_ok(),
+            full_trace: std::env::var("SIM_LOG").as_deref() == Ok("all"),
             request_timeout_ms: 30_000,
         }
     }
 
-    /// Multi-node with store and network faults and clock skew.
+    /// Multi-node with store and network faults and clock skew within the
+    /// lease margin.
     pub fn faulty(nodes: usize) -> SimConfig {
         SimConfig {
             nodes,
@@ -149,6 +184,34 @@ impl SimConfig {
             net: NetFaults::moderate(),
             max_skew_ms: 150,
             ..SimConfig::basic()
+        }
+    }
+
+    /// [`SimConfig::faulty`] plus every rarer fault, with clock skew far
+    /// beyond the lease margin. Only availability may suffer.
+    pub fn hostile(nodes: usize) -> SimConfig {
+        let base = SimConfig::faulty(nodes);
+        let lease = base.engine.lease_ms;
+        SimConfig {
+            store: StoreFaults {
+                p_stall: 0.004,
+                stall_ms: (lease, 3 * lease),
+                list_lag_ms: 5_000,
+                ..StoreFaults::moderate()
+            },
+            net: NetFaults {
+                p_forward_duplicate: 0.03,
+                p_forward_delay: 0.05,
+                forward_delay_max_ms: 2_000,
+                ..NetFaults::moderate()
+            },
+            max_skew_ms: 10 * base.engine.clock_skew_margin_ms,
+            chaos: ChaosFaults {
+                one_way_partitions: true,
+                store_isolation: true,
+                clock_step_max_ms: 10 * base.engine.clock_skew_margin_ms,
+            },
+            ..base
         }
     }
 }
@@ -184,7 +247,10 @@ pub struct Sim {
     pub trace: Arc<Trace>,
     pub google: Arc<google::FakeGoogle>,
     slots: Vec<Mutex<Option<Arc<SimNode>>>>,
+    /// Blocked directions `(from, to)` between nodes.
     partitions: Mutex<BTreeSet<(usize, usize)>>,
+    /// Nodes that cannot reach the object store.
+    store_isolated: Mutex<BTreeSet<usize>>,
     origin: Instant,
     base_ms: u64,
     starts: AtomicU64,
@@ -238,7 +304,41 @@ impl Transport for SimTransport {
                 sim.net_delay().await;
                 return Err(undelivered("partitioned"));
             }
-            match sim.call_node(to, req).await {
+            let (parts, body) = req.into_parts();
+            let body = match http_body_util::BodyExt::collect(body).await {
+                Ok(b) => b.to_bytes(),
+                Err(e) => return Err(undelivered(&format!("request body: {e}"))),
+            };
+            let copy = || {
+                let mut r = Request::new(Body::from(body.clone()));
+                *r.method_mut() = parts.method.clone();
+                *r.uri_mut() = parts.uri.clone();
+                *r.headers_mut() = parts.headers.clone();
+                r
+            };
+            let net = &sim.cfg.net;
+            if sim.chance(net.p_forward_duplicate) {
+                let delay = sim.rand_below(net.forward_delay_max_ms + 1);
+                sim.trace.event(&format!("forward n{from}->n{to} {} duplicated (+{delay}ms)", parts.uri.path()));
+                let (sim2, dup) = (sim.clone(), copy());
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    let _ = sim2.call_node(to, dup).await;
+                });
+            }
+            if sim.chance(net.p_forward_delay) {
+                let delay = sim.rand_below(net.forward_delay_max_ms + 1);
+                sim.trace.event(&format!("forward n{from}->n{to} {} delayed {delay}ms", parts.uri.path()));
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            let r = sim.call_node(to, copy()).await;
+            if sim.partitioned(to, from) {
+                return Err(TransportError {
+                    message: "response lost (one-way partition)".into(),
+                    maybe_delivered: true,
+                });
+            }
+            match r {
                 Ok(r) => {
                     let mut resp = Response::new(Body::from(r.body));
                     *resp.status_mut() =
@@ -249,6 +349,61 @@ impl Transport for SimTransport {
                 Err(NetError::Refused) => Err(undelivered("connection refused")),
                 Err(e) => Err(TransportError { message: format!("{e:?}"), maybe_delivered: true }),
             }
+        })
+    }
+}
+
+/// A node's connection to the shared store, which a fault can cut.
+struct NodeStore {
+    idx: usize,
+    sim: Weak<Sim>,
+    inner: Arc<SimStore>,
+}
+
+impl NodeStore {
+    /// Fail (after a connect-timeout-like delay) if the node is cut off.
+    async fn reachable(&self, op: &str, key: &str) -> SResult<()> {
+        let Some(sim) = self.sim.upgrade() else { return Ok(()) };
+        if !sim.store_isolated(self.idx) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100 + sim.rand_below(900))).await;
+        sim.trace.event(&format!("n{} store {op} {key} -> unreachable", self.idx));
+        Err(StoreError::Unavailable("object store unreachable".into()))
+    }
+}
+
+impl ObjectStore for NodeStore {
+    fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
+        Box::pin(async move {
+            self.reachable("get", key).await?;
+            self.inner.get(key, opts).await
+        })
+    }
+
+    fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
+        Box::pin(async move {
+            self.reachable("put", key).await?;
+            self.inner.put(key, data, mode).await
+        })
+    }
+
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFut<'a, SResult<()>> {
+        Box::pin(async move {
+            self.reachable("delete", key).await?;
+            self.inner.delete(key).await
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+        start_after: Option<&'a str>,
+        limit: usize,
+    ) -> BoxFut<'a, SResult<ListPage>> {
+        Box::pin(async move {
+            self.reachable("list", prefix).await?;
+            self.inner.list(prefix, start_after, limit).await
         })
     }
 }
@@ -278,6 +433,7 @@ impl Sim {
             google,
             slots: (0..n).map(|_| Mutex::new(None)).collect(),
             partitions: Mutex::new(BTreeSet::new()),
+            store_isolated: Mutex::new(BTreeSet::new()),
             origin,
             base_ms,
             starts: AtomicU64::new(0),
@@ -319,8 +475,10 @@ impl Sim {
         (0..self.slots.len()).filter(|i| self.node(*i).is_some()).collect()
     }
 
-    /// Start (or restart) node `i`. Retries while the store is flaky.
+    /// Start (or restart) node `i`, as a fresh machine that can reach the
+    /// store. Retries while the store is flaky.
     pub async fn start(&self, i: usize) {
+        self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).remove(&i);
         let n = self.starts.fetch_add(1, Ordering::SeqCst);
         let skew = if self.cfg.max_skew_ms == 0 {
             0
@@ -344,7 +502,7 @@ impl Sim {
                 }));
             }
             let transport = Arc::new(SimTransport { from: i, sim: self.me.clone() });
-            let store: DynStore = self.store.clone();
+            let store: DynStore = Arc::new(NodeStore { idx: i, sim: self.me.clone(), inner: self.store.clone() });
             let oidc: Arc<dyn crate::auth::OidcProvider> = self.google.clone();
             match Node::start(cfg.clone(), env.clone(), store, transport, Some(oidc)).await {
                 Ok(node) => {
@@ -386,13 +544,40 @@ impl Sim {
         self.trace.event(&format!("partition {a}-{b}"));
     }
 
+    /// Drop traffic from `from` to `to` only; replies to requests that
+    /// `to` sends to `from` are lost after `from` processed them.
+    pub fn partition_one_way(&self, from: usize, to: usize) {
+        self.partitions.lock().unwrap_or_else(|e| e.into_inner()).insert((from, to));
+        self.trace.event(&format!("partition {from}->{to}"));
+    }
+
+    /// Cut node `i` off from the object store.
+    pub fn isolate_from_store(&self, i: usize) {
+        self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).insert(i);
+        self.trace.event(&format!("isolate n{i} from store"));
+    }
+
+    /// Heal every partition and store isolation.
     pub fn heal(&self) {
         self.partitions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.trace.event("heal");
     }
 
-    fn partitioned(&self, a: usize, b: usize) -> bool {
-        self.partitions.lock().unwrap_or_else(|e| e.into_inner()).contains(&(a, b))
+    fn partitioned(&self, from: usize, to: usize) -> bool {
+        self.partitions.lock().unwrap_or_else(|e| e.into_inner()).contains(&(from, to))
+    }
+
+    fn store_isolated(&self, i: usize) -> bool {
+        self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).contains(&i)
+    }
+
+    /// Step node `i`'s wall clock by `delta_ms`.
+    pub fn step_clock(&self, i: usize, delta_ms: i64) {
+        if let Some(n) = self.node(i) {
+            n.node.env.step_clock(delta_ms);
+            self.trace.event(&format!("clock n{i} {delta_ms:+}ms"));
+        }
     }
 
     async fn net_delay(&self) {
@@ -453,72 +638,6 @@ impl Sim {
     pub async fn sleep(&self, ms: u64) {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
-
-    /// Storage-level invariants at quiescence: every manifest decodes, every
-    /// referenced segment exists and decodes in order, every referenced blob
-    /// is complete.
-    pub async fn check_storage(&self) -> Result<StorageReport, String> {
-        let keys: BTreeSet<String> = self.mem.keys().into_iter().collect();
-        let mut rep = StorageReport::default();
-        let chunk = self.cfg.engine.blob_chunk_size as u64;
-        for k in keys.iter().filter(|k| k.ends_with("/manifest")) {
-            let db = k
-                .strip_prefix("dbs/")
-                .and_then(|s| s.strip_suffix("/manifest"))
-                .ok_or_else(|| format!("odd manifest key {k}"))?;
-            let g = self.mem.get_sync(k, &Default::default()).map_err(|e| e.to_string())?;
-            let m = Manifest::decode(&g.data).map_err(|e| format!("{k}: {e}"))?;
-            rep.databases += 1;
-            if m.is_deleted() {
-                continue;
-            }
-            let mut entries = m.tail.clone();
-            for s in &m.segments {
-                let sk = crate::engine::seg_key(db, &s.id);
-                let d = self
-                    .mem
-                    .get_sync(&sk, &Default::default())
-                    .map_err(|e| format!("db {db}: referenced segment {} missing: {e}", s.id))?;
-                let es = segment::read_all(&d.data).map_err(|e| format!("segment {sk}: {e}"))?;
-                if es.len() as u64 != s.entries {
-                    return Err(format!("segment {sk}: entry count mismatch"));
-                }
-                rep.segments += 1;
-                entries.extend(es);
-            }
-            // Only the newest entry per key is live; shadowed blob
-            // references in older segments may legitimately be collected.
-            let mut newest: std::collections::BTreeMap<Bytes, &crate::engine::Entry> =
-                std::collections::BTreeMap::new();
-            for e in &entries {
-                if newest.get(&e.key).is_none_or(|x| e.seq > x.seq) {
-                    newest.insert(e.key.clone(), e);
-                }
-            }
-            for e in newest.values() {
-                if let Value::Blob(b) = &e.value {
-                    let n = b.size.div_ceil(chunk);
-                    for c in 0..n {
-                        let ck = crate::engine::blob_chunk_key(db, &b.id, c);
-                        if !keys.contains(&ck) {
-                            return Err(format!("db {db}: blob {} chunk {c} missing", b.id));
-                        }
-                    }
-                    rep.blobs += 1;
-                }
-            }
-        }
-        rep.objects = keys.len();
-        Ok(rep)
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct StorageReport {
-    pub databases: usize,
-    pub segments: usize,
-    pub blobs: usize,
-    pub objects: usize,
 }
 
 #[derive(Debug)]
@@ -536,6 +655,22 @@ pub struct SimOutcome {
     pub trace_tail: Vec<String>,
 }
 
+/// Turns a panic while polling the workload into an error, so that the
+/// run still reports its trace and statistics.
+struct CatchPanic<F>(std::pin::Pin<Box<F>>);
+
+impl<F: Future> Future for CatchPanic<F> {
+    type Output = Result<F::Output, ()>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        let inner = self.get_mut().0.as_mut();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(p) => p.map(Ok),
+            Err(_) => std::task::Poll::Ready(Err(())),
+        }
+    }
+}
+
 /// Run one simulation to completion.
 pub fn run<F, Fut>(seed: u64, cfg: SimConfig, f: F) -> SimOutcome
 where
@@ -547,10 +682,14 @@ where
         crate::log::set_level(crate::log::ERROR);
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
+    let full_trace = cfg.full_trace;
     let out = rt.block_on(async move {
         let start = Instant::now();
         let sim = Sim::new(seed, cfg).await;
-        let mut result = f(sim.clone()).await;
+        let mut result = match CatchPanic(Box::pin(f(sim.clone()))).await {
+            Ok(r) => r,
+            Err(()) => Err("workload panicked".into()),
+        };
         let mut storage = StorageReport::default();
         if result.is_ok() {
             // Quiesce: stop faults, let in-flight work settle.
@@ -567,7 +706,7 @@ where
         let virtual_ms = start.elapsed().as_millis() as u64;
         sim.shutdown_all();
         let dump = sim.trace.dump();
-        let keep = if std::env::var("SIM_LOG").as_deref() == Ok("all") { dump.len() } else { 400 };
+        let keep = if full_trace { dump.len() } else { 400 };
         let trace_tail = dump[dump.len().saturating_sub(keep)..].to_vec();
         SimOutcome {
             seed,

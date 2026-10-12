@@ -92,13 +92,9 @@ pub async fn create_db(
     };
     let r = match node.run_meta(create.clone()).await {
         Err(Error::AlreadyExists(m)) => {
-            // The name may belong to a database whose deletion was
-            // interrupted after its storage was marked deleted: finish that
-            // deletion and create the new database.
+            // The name may belong to a database whose deletion stopped after
+            // flagging its manifest deleted: finish it, then create.
             let existing = node.resolve_db_strong(&p, &c.name).await?;
-            // Opening creates the manifest of a never-used database, so only
-            // a manifest that is actually flagged deleted counts as
-            // half-deleted (not merely a missing one).
             let db = node.open_db(&existing).await?;
             let deleted =
                 db.read_version(Consistency::Strong).await.is_err() && db.current().is_some_and(|v| v.m.is_deleted());
@@ -268,7 +264,7 @@ async fn put_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>,
         Upload::Small(b) => Value::Inline(b),
         Upload::Blob(r) => Value::Blob(r),
     };
-    let ((), v) = with_txn!(node, ctx.db, ctx.principal, |t| {
+    let ((), v) = with_txn!(node, ctx, |t| {
         if want_version.is_some() || if_none.is_some() {
             let cur = t.get(&key).await?;
             if if_none.is_some() && cur.is_some() {
@@ -292,7 +288,7 @@ async fn delete_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
         None => None,
         Some(v) => Some(v.parse().map_err(|_| Error::invalid("If-Match must be a version"))?),
     };
-    let (existed, v) = with_txn!(node, ctx.db, ctx.principal, |t| {
+    let (existed, v) = with_txn!(node, ctx, |t| {
         let cur = t.get(&key).await?;
         if let Some(w) = want
             && cur.as_ref().and_then(|c| c.seq) != Some(w)
@@ -435,7 +431,7 @@ async fn one_shot(
             "commit_id": commit_hex(commit_id), "results": Json::Null,
         })));
     }
-    let deadline = Instant::now() + Duration::from_millis(ctx.db.shared().cfg.commit_timeout_ms);
+    let deadline = ctx.deadline;
     let c = consistency_from(req.consistency.as_deref(), req.max_staleness_ms)?;
     if writes && c != Consistency::Strong {
         return Err(Error::invalid("transactions with writes must use strong consistency"));
@@ -609,7 +605,7 @@ async fn commit_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbC
     }
     let cid = t.commit_id;
     let mut creq = t.into_request();
-    creq.deadline = Some(Instant::now() + Duration::from_millis(ctx.db.shared().cfg.commit_timeout_ms));
+    creq.deadline = Some(ctx.deadline);
     let v = ctx.db.commit(creq).await.map_err(|e| match e {
         Error::Unavailable { message, retry_after_ms, outcome_unknown: true } => Error::Unavailable {
             message: format!("{message} (commit_id {})", commit_hex(cid)),
@@ -652,7 +648,7 @@ async fn commit_status(Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Re
 async fn list_tables(Extension(ctx): Extension<DbCtx>, q: Params) -> Result<J> {
     let c = consistency_of(&q)?;
     let (ts, v) = with_read!(ctx.db, c, |t| table::list_tables(t).await);
-    let out: Vec<Json> = ts.iter().map(table::describe).collect();
+    let out: Vec<Json> = ts.iter().map(|s| s.to_json()).collect();
     Ok(axum::Json(json!({"tables": out, "version": v})))
 }
 
@@ -661,8 +657,8 @@ async fn create_table(
     Extension(ctx): Extension<DbCtx>,
     JsonBody(def): JsonBody<CreateTable>,
 ) -> Result<Response> {
-    let (s, v) = with_txn!(node, ctx.db, ctx.principal, |t| table::create_table(t, &def).await);
-    let mut out = table::describe(&s);
+    let (s, v) = with_txn!(node, ctx, |t| table::create_table(t, &def).await);
+    let mut out = s.to_json();
     out["version"] = json!(v);
     Ok((StatusCode::CREATED, axum::Json(out)).into_response())
 }
@@ -671,12 +667,12 @@ async fn get_table(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, q: Params
     let name = param(&p, "t")?.to_string();
     let c = consistency_of(&q)?;
     let (s, _) = with_read!(ctx.db, c, |t| table::get_schema(t, &name).await);
-    Ok(axum::Json(table::describe(&s)))
+    Ok(axum::Json(s.to_json()))
 }
 
 async fn drop_table(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
     let name = param(&p, "t")?.to_string();
-    let ((), v) = with_txn!(node, ctx.db, ctx.principal, |t| table::drop_table(t, &name).await);
+    let ((), v) = with_txn!(node, ctx, |t| table::drop_table(t, &name).await);
     Ok(axum::Json(json!({"version": v})))
 }
 
@@ -687,8 +683,8 @@ async fn add_column(
     JsonBody(c): JsonBody<ColumnSpec>,
 ) -> Result<J> {
     let name = param(&p, "t")?.to_string();
-    let (s, v) = with_txn!(node, ctx.db, ctx.principal, |t| table::add_column(t, &name, &c).await);
-    let mut out = table::describe(&s);
+    let (s, v) = with_txn!(node, ctx, |t| table::add_column(t, &name, &c).await);
+    let mut out = s.to_json();
     out["version"] = json!(v);
     Ok(axum::Json(out))
 }
@@ -696,8 +692,8 @@ async fn add_column(
 async fn drop_column(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
     let name = param(&p, "t")?.to_string();
     let col = param(&p, "c")?.to_string();
-    let (s, v) = with_txn!(node, ctx.db, ctx.principal, |t| table::drop_column(t, &name, &col).await);
-    let mut out = table::describe(&s);
+    let (s, v) = with_txn!(node, ctx, |t| table::drop_column(t, &name, &col).await);
+    let mut out = s.to_json();
     out["version"] = json!(v);
     Ok(axum::Json(out))
 }
@@ -709,8 +705,8 @@ async fn add_index(
     JsonBody(i): JsonBody<IndexSpec>,
 ) -> Result<J> {
     let name = param(&p, "t")?.to_string();
-    let (s, v) = with_txn!(node, ctx.db, ctx.principal, |t| table::add_index(t, &name, &i).await);
-    let mut out = table::describe(&s);
+    let (s, v) = with_txn!(node, ctx, |t| table::add_index(t, &name, &i).await);
+    let mut out = s.to_json();
     out["version"] = json!(v);
     Ok(axum::Json(out))
 }
@@ -718,8 +714,8 @@ async fn add_index(
 async fn drop_index(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
     let name = param(&p, "t")?.to_string();
     let idx = param(&p, "i")?.to_string();
-    let (s, v) = with_txn!(node, ctx.db, ctx.principal, |t| table::drop_index(t, &name, &idx).await);
-    let mut out = table::describe(&s);
+    let (s, v) = with_txn!(node, ctx, |t| table::drop_index(t, &name, &idx).await);
+    let mut out = s.to_json();
     out["version"] = json!(v);
     Ok(axum::Json(out))
 }
@@ -752,7 +748,7 @@ async fn insert_rows(
     }
     let mode = if b.upsert { InsertMode::Upsert } else { InsertMode::Insert };
     let db = ctx.db.clone();
-    let (n, v) = with_txn!(node, ctx.db, ctx.principal, |t| {
+    let (n, v) = with_txn!(node, ctx, |t| {
         let blobs = BlobResolver { db: &db };
         for r in &rows {
             table::insert(t, &blobs, &name, r, mode).await?;
@@ -800,9 +796,7 @@ async fn update_row(
 ) -> Result<J> {
     let name = param(&p, "t")?.to_string();
     let db = ctx.db.clone();
-    let (found, v) = with_txn!(node, ctx.db, ctx.principal, |t| {
-        table::update(t, &BlobResolver { db: &db }, &name, &b.pk, &b.set).await
-    });
+    let (found, v) = with_txn!(node, ctx, |t| table::update(t, &BlobResolver { db: &db }, &name, &b.pk, &b.set).await);
     Ok(axum::Json(json!({"found": found, "version": v})))
 }
 
@@ -819,7 +813,7 @@ async fn delete_row(
     JsonBody(b): JsonBody<PkBody>,
 ) -> Result<J> {
     let name = param(&p, "t")?.to_string();
-    let (found, v) = with_txn!(node, ctx.db, ctx.principal, |t| table::delete(t, &name, &b.pk).await);
+    let (found, v) = with_txn!(node, ctx, |t| table::delete(t, &name, &b.pk).await);
     Ok(axum::Json(json!({"found": found, "version": v})))
 }
 

@@ -13,17 +13,17 @@ scope for v1.
 
 1. **Safety.** Acknowledged commits are never lost or reordered; reads never
    observe uncommitted or torn state; transactions are strictly serializable.
-   Correctness of committed data depends solely object storage routing and does
+   Correctness of committed data depends solely on object storage and does
    not depend on clocks, leases, routing, or membership.
-2. **Low cost.** An idle database pays only storage but not compute. An active
+2. **Low cost.** An idle database pays for storage only, not compute. An active
    database pays roughly one object-store PUT per group of commits. Reads on a
    warm node are served from the local cache.
 3. **Operational simplicity.** Nodes are stateless and interchangeable. A node
    can be killed at any moment. Any other node can serve reads immediately or
    writes within one lease period.
-4. **Testability.** The service, runs and tests fully inside a deterministic
+4. **Testability.** The whole service runs and is tested inside a deterministic
    simulator with fault injection.
-5. **Perf, within reason.** Hot reads are served from memory in microseonds.
+5. **Perf, within reason.** Hot reads are served from memory in microseconds.
    Each commit takes about one conditional PUT (tens of ms).
 
 ### Workload assumptions
@@ -45,17 +45,17 @@ scope for v1.
 ## 2. Storage Backend
 
 Baserunna stores data with a purpose-built engine (`engine` module) that borrows
-from SlateDB, a LSM engine for object storage. The original goal was to use SlateDB,
+from SlateDB, an LSM engine for object storage. The original goal was to use SlateDB,
 but that idea has been shelved for V1.
 
 Concerns:
 
 - **Idle DB overhead.** Each SlateDB database runs its own WAL flusher, memtable flusher, compactor, and GC tasks. Each open DB requires its own timer.
-  In Baserunna we want an idle DB to hold zero tasks, and instead use a acached `Arc<Version>` that the LRU can evict.
+  In Baserunna we want an idle DB to hold zero tasks, and instead use a cached `Arc<Version>` that the LRU can evict.
 - **Commit cost.** Each SlateDB commit is a WAL SST PUT + periodic L0 flush + manifest updates. Each Baserunna update requires one conditional PUT per group commit. Small writes are inlined in the manifest ("tail"), so the manifest doubles as the WAL.
 - **Failover.** A new SlateDB writer bumps the writer epoch before serving. In Baserunna, any node can read immediately, and a new writer takes over by CAS after the current lease expires.
 - **Fencing.** SlateDB stores the writer epoch in the manifest. Baserunna uses Manifest CAS (`If-Match`), and a stale writer fails at its next commit by construction.
-- **Deterministic Simulation.** SlateDB's internal tokio tasks and `object_store` crate make whole-system determinism hard to guarantee. Baserunnar routes every source of time, randomness, I/O, and task spawning through an injected `Env`, so te full stack runs deterministically in a test environment.
+- **Deterministic Simulation.** SlateDB's internal tokio tasks and `object_store` crate make whole-system determinism hard to guarantee. Baserunna routes every source of time, randomness, I/O, and task spawning through an injected `Env`, so the full stack runs deterministically in a test environment.
 - **DB Size.** SlateDB is tuned for large datasets. Baserunna is tuned for databases ≤ 100s of MB, where size-tiered compaction is cheap.
 
 The engine sits behind the `ObjectStore` trait and a narrow `Database` API,
@@ -80,7 +80,7 @@ The DST suite would then become its acceptance test.
 ```
 
 - **Node**: a process running the HTTP API, admin console, engine, and background
-- workers. No durable local state.
+  workers. No durable local state.
 - **Database (DB)**: an independent keyspace with its own manifest. The system DB
   (`sys`) is a DB with a fixed id.
 - **Owner**: the node that currently holds a DB lease (§6). If a DB has a known owner,
@@ -117,8 +117,8 @@ fuzz/               optional cargo-fuzz targets, share code with tests
 ### 4.1 Keys and values
 
 - Keys are byte strings of 1..=4096 bytes, ordered lexicographically by byte.
-- Values are byte strings, store in one of three ways:
-  - inline, if ≤ size is less than 32 KiB, in the tail or in segments
+- Values are byte strings, stored in one of three ways:
+  - inline, if at most 32 KiB, in the tail or in segments
   - out-of-band blob, if larger, with the value written as chunk objects and the key storing a `BlobRef` descriptor (§4.3)
   - tombstone, for deletes
 - Each committed entry carries a `seq`, the DB version that wrote it.
@@ -260,7 +260,8 @@ Each open DB has a per-node commit queue. One committer task drains it
 3. For each transaction in order, validate it (§6.1) against all writes with
    `seq > txn.read_version` in base and in transactions already accepted in
    this batch. Rejected transactions get `409 conflict`. Transactions past
-   their **commit deadline** (request start + `commit_timeout_ms`, 10 s) are
+   their **commit deadline** (arrival at the first node + `commit_timeout_ms`,
+   10 s; see §7 for forwarded requests) are
    refused without being applied. This bounds how long a "zombie" request
    can linger server-side after its client gave up. Each accepted
    transaction gets **its own sequence number** (`base.version + 1`,
@@ -320,9 +321,16 @@ retryable `409 conflict`.
 ### 5.7 Leases
 
 - The lease lives in the manifest and is written with the same CAS as data.
-- The holder treats its lease as valid until
-  `expires_at - clock_skew_margin`. Others treat it as valid until
-  `expires_at + clock_skew_margin`. Defaults: lease 15 s, margin 1 s.
+- Lease validity never compares wall clocks, so skew and clock jumps cannot
+  make lease reads stale. Each node measures on its own monotonic clock: the
+  holder relies on its lease until `lease_duration - margin` after it
+  _sent_ the renewing write, and every other node waits until
+  `lease_duration + margin` after it first _saw_ it. A renewal is seen only
+  after it was sent, so others always wait longer than the holder relies on
+  it; the margin absorbs clock rate drift. `expires_at` only identifies a
+  renewal and hints at routing. Defaults: lease 15 s, margin 1 s.
+- First sightings outlive database handles, so evicting an idle handle
+  never restarts the wait.
 - Holders renew on every commit. Read-only activity renews with a lease-only
   CAS when at least `lease_read_threshold` (16) strong reads happened in the
   last lease period. At ~$0.005 per 1000 PUTs, a renewal pays for itself
@@ -330,9 +338,10 @@ retryable `409 conflict`.
 - Non-holders never commit while another node's lease is valid, so the
   holder's cached Version is the latest. That is what makes lease reads
   linearizable.
-- If a holder dies, its DBs are write-unavailable for at most
-  `lease_duration + margin`. Strong reads stay available everywhere through
-  validated reads (§5.9).
+- If a holder dies, its DBs are write-unavailable until `lease_duration + margin`
+  after another node first saw its last renewal, so up to twice that for a
+  node that first looks after the crash. Strong reads stay available
+  everywhere through validated reads (§5.9).
 
 ### 5.8 Garbage collection
 
@@ -349,17 +358,26 @@ retryable `409 conflict`.
 - **Deleted databases**: deletion marks the DB in the system DB. After
   `db_delete_grace` (10 min, longer than metadata cache TTLs), a reaper on
   the system-DB lease holder deletes every object under `dbs/{id}/`, then
-  repeats once more after another grace period before removing the record.
+  once more after another grace period (catching objects a lagging listing
+  missed) before removing the record.
+- GC compares timestamps from different clocks (object `last_modified`,
+  blob-id creation times, `since` stamps of other nodes), so its safety
+  assumes clock skew far below the grace periods (minutes to hours). Lease
+  safety does not (§5.7).
+- A read that outlives `gc_grace` after its blob was dereferenced fails
+  with a retryable `503`; a retry reads a newer snapshot.
 
 ### 5.9 Consistency of reads
 
-| mode               | guarantee                                                            | mechanism                                                                                                                                                       |
-| ------------------ | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `strong` (default) | linearizable                                                         | served from cache if this node holds a valid lease and has no manifest write in flight; otherwise `GET manifest If-None-Match: etag` first (a 304 costs ~1 GET) |
-| `snapshot`         | serializable snapshot, at most `max_staleness_ms` old (default 5000) | any cached Version validated within the bound                                                                                                                   |
+| mode               | guarantee                                                            | mechanism                                                                                                                                                                                 |
+| ------------------ | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `strong` (default) | linearizable                                                         | served from cache if this node holds a valid lease and has no manifest write in flight; otherwise `GET manifest If-None-Match: etag` first (a 304 costs ~1 GET), at most once per request |
+| `snapshot`         | serializable snapshot, at most `max_staleness_ms` old (default 5000) | any cached Version validated within the bound                                                                                                                                             |
 
 Transactions always read from a fixed snapshot, and serializable
-transactions validate their reads at commit time.
+transactions validate their reads at commit time. A validation that
+happened after a request arrived serves all of that request's strong reads,
+which keeps them linearizable at the cost of one GET.
 
 ---
 
@@ -375,7 +393,11 @@ transactions validate their reads at commit time.
   - validation fails if any entry, including tombstones, in the current
     state with `seq > read_version` intersects the read set.
 - `snapshot` isolation validates only the write set (first-committer-wins).
-  Write skew is possible, as documented.
+  Write skew is possible, as documented. Reads that writes are derived from
+  are validated anyway: a row write commits only against the table schema
+  it was derived from, so a concurrent schema change (a new index, a
+  dropped column or table) makes it fail with a retryable `409 conflict`
+  rather than miss index maintenance.
 - Read-only transactions always succeed and serialize at `read_version`.
 - Blind-write transactions never conflict.
 - Reads within a transaction see its own earlier writes.
@@ -440,11 +462,23 @@ response is standard base64 instead.
 - **Routing**: for a request on DB `d`, the target is the lease holder if a
   valid lease is known, otherwise the live node maximizing
   `hash(node_id ‖ d)` (rendezvous hashing). If the target is another node, the
-  request is proxied unchanged, streaming the body, with header
-  `x-baserunna-hop: 1`. A request carrying that header is never forwarded
-  again. If forwarding fails, the receiving node handles the request itself.
-  It can serve reads, and it can write only if no other node holds a valid
-  lease (otherwise `503 unavailable` with `Retry-After`).
+  request is proxied, streaming large bodies, with `x-baserunna-hops`
+  incremented; a request already forwarded twice is handled where it is. If
+  forwarding certainly failed (the request never left), the receiving node
+  handles the request itself. It can serve reads, and it can write only if
+  no other node holds a valid lease (otherwise `503 unavailable` with
+  `Retry-After`).
+- **Forwarded requests execute at most once.** Each forward carries a random
+  `x-baserunna-forward-id`; the receiver runs the first copy and answers
+  duplicates (for a minute) with its response. That memory dies with the
+  process, so each forward also names its target process
+  (`x-baserunna-forward-to`), and a restarted node refuses copies meant for
+  its previous run with a not-applied `503`. GET and HEAD are not
+  deduplicated.
+- **Deadlines travel with forwards.** `x-baserunna-deadline-ms` carries the
+  first node's commit deadline (wall clock). The receiver caps it at its
+  own `commit_timeout_ms`, so a delayed forward cannot commit later than
+  the client expects, and skew can only shorten it.
 - **Internal endpoints** (`/internal/v1/…`, used to run system-DB
   transactions on its owner) always require `x-baserunna-cluster-key`. Its
   value is the configured `BASERUNNA_CLUSTER_SECRET` or, by default, a key
@@ -639,9 +673,8 @@ filesystem is not guaranteed.
   interleavings. All randomness comes from a seeded xoshiro256** PRNG.
 - Production code may not iterate `std::collections::HashMap` with the
   default random state where order affects behavior, and may not use
-  `select!` or `tokio::sync::watch`. The watch channel shards its waiters
-  with tokio's thread RNG, so wake order is random; the simulator caught
-  this. It uses `BTreeMap` or deterministic hashers instead. `tests/lint.rs`
+  `select!` or `tokio::sync::watch`, whose wake order is random. It uses
+  `BTreeMap` or deterministic hashers instead. `tests/lint.rs`
   enforces these rules, plus "no direct wall-clock time, randomness or
   `tokio::spawn` outside `Env`".
 - Each run produces a trace hash over every request, response, and store
@@ -650,39 +683,46 @@ filesystem is not guaranteed.
 
 ### 13.2 Simulated world
 
-- **SimStore**: an in-memory object store with S3 semantics (strong
-  read-after-write, conditional PUT/GET, list). Fault injection is per
-  operation and seeded: latency distributions; transient errors before
-  apply; **ambiguous** failures (applied, then the response is lost);
-  delayed application of in-flight PUTs after the caller died (the request
-  runs on a "network" task that a node crash does not cancel).
-- **SimCluster**: N nodes, each with its own `Node` instance, clock skew
-  (bounded by the margin), and task registry. Faults: **crash** (abort every
-  node task and in-flight request; memory lost), **restart**, network
-  **partition** between nodes (forward failures), and latency spikes.
-  Clients call nodes through the full axum router (`tower::ServiceExt`) and
-  pick nodes at random, which exercises forwarding.
+- **SimStore**: an in-memory object store with S3 semantics and seeded
+  per-operation faults: latency, errors before apply, **ambiguous**
+  failures (applied, response lost), PUTs that land after their caller
+  crashed, **stalls** longer than a lease, and **listings** that lag behind
+  creates and deletes.
+- **SimCluster**: N nodes, each with its own `Node`, clock and task
+  registry. Faults: **crashes** (all tasks and memory lost) and restarts,
+  two-way and **one-way partitions**, nodes **cut off from the store**,
+  **duplicated and delayed forwards**, **clock skew and jumps**, and latency
+  spikes. Clients call random nodes through the full router, which
+  exercises forwarding.
+- **Configurations**: `basic` (one node, no faults), `faulty` (store and
+  network faults, skew within the lease margin) and `hostile` (every fault,
+  with skew and jumps ten times the margin). Safety must hold under all
+  three; only availability may degrade.
 - **SimOAuth**: a fake Google with an RSA key generated in-process and a
   JWKS, so the full OIDC verification path runs.
 
 ### 13.3 Workloads and checkers
 
-| workload    | checks                                                                                                                                                                                                                                    |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kv_model`  | One client per DB issues random get/put/delete/scan/delete_range/check/increment ops (one-shot and interactive) under faults. Every response is compared with a `BTreeMap` model. Ambiguous commits are resolved through `/commits/{id}`. |
-| `bank`      | Concurrent transfers between accounts on several nodes. Total balance is invariant and no balance goes negative, checked with snapshot reads during the run and at the end.                                                               |
-| `register`  | Concurrent writers and readers on a few keys. Every strong read that starts after a write was acknowledged must observe a version ≥ that write's version (real-time linearizability). Versions observed by one client are monotonic.      |
-| `tables`    | Random schema changes and row ops against a model. At quiescence, every index must exactly match a recomputation from rows, and unique constraints must hold.                                                                             |
-| `blobs`     | Uploads with random sizes and chunk boundaries, range reads, overwrites, and deletes. Content SHA-256 is checked. After GC with simulated time past the graces, no referenced object is missing and every unreferenced object is gone.    |
-| `auth`      | Signup, login, sessions, API keys (scoped, read-only), logout, revocation, Google OAuth, permission matrix (who can access which DB).                                                                                                     |
-| `lifecycle` | Create, use, delete, and recreate DBs under crashes. Deleted data is never visible and is eventually purged.                                                                                                                              |
-| `console`   | Browser-style console flows: cookies, forms, CSRF rejection, HTML escaping of hostile input.                                                                                                                                              |
-| `api_tour`  | The remaining endpoints (schema drops, aborts, commit status by idempotency key, metadata) with result checks.                                                                                                                            |
-| `chaos`     | All of the above mixed together with crashes, partitions, and store faults.                                                                                                                                                               |
+| workload       | checks                                                                                                                                                                            |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kv_model`     | Random KV ops through every API form under faults, each response compared with a model. Ambiguous commits are resolved through `/commits/{id}`.                                   |
+| `bank`         | Concurrent transfers across nodes. The total never changes and no balance goes negative, checked during the run and at the end.                                                   |
+| `register`     | Concurrent writers and strong readers on a few keys, checked for real-time linearizability.                                                                                       |
+| `tables`       | Schema changes and row ops against a model. At quiescence indexes match a recomputation from rows, unique constraints hold, and dropped tables and indexes leave nothing behind.  |
+| `schema_race`  | Row writes on every path and at both isolation levels race schema changes. Indexes must match rows, nothing may be orphaned, and each writer's rows must match its model.         |
+| `blobs`        | Uploads of random sizes on every path, range reads, overwrites and deletes, checked by SHA-256. A final GC keeps every referenced object and removes every unreferenced one.      |
+| `blob_gc_race` | Blob reads race overwrites, deletes and GC, with grace periods shorter than a download. A read may fail cleanly but never return wrong bytes.                                     |
+| `abandoned`    | Interactive transactions abandoned, aborted or committed late while leases move. No update is lost, abandoned transactions never commit, and open transactions drain.             |
+| `db_churn`     | Databases created, used, deleted and recreated under a tiny cache and fast handle eviction. Each matches its model, deleted names answer 404, and handles and cache stay bounded. |
+| `auth`         | Signup, login, sessions, API keys (scoped, read-only), logout, revocation, Google OAuth, and who can access which DB.                                                             |
+| `lifecycle`    | Create, use, delete, and recreate DBs under crashes. Deleted data is never visible and is eventually purged.                                                                      |
+| `console`      | Browser-style console flows: cookies, forms, CSRF rejection, HTML escaping of hostile input.                                                                                      |
+| `api_tour`     | The remaining endpoints (schema drops, aborts, commit status by idempotency key, metadata) with result checks.                                                                    |
+| `chaos`        | Several workloads at once with crashes, partitions, and store faults.                                                                                                             |
 
-Every DST run ends with **storage invariants** at quiescence: each manifest
-decodes and every referenced segment and blob exists; the merged contents
-match the model; and the trace is deterministic.
+Most workloads also run under `hostile` (the `*_hostile` scenarios). Every
+run ends by checking **storage invariants**: each manifest decodes and
+every referenced segment and blob exists.
 
 ### 13.4 Other test layers
 
@@ -696,12 +736,51 @@ match the model; and the trace is deterministic.
   panic. The router gets random JSON bodies and paths and must never answer
   500 or panic. These run in `cargo test` with fixed seeds. The same
   functions are exposed as optional `cargo fuzz` targets in `fuzz/`.
+- **Transaction-op fuzzing** (`sim/txn_fuzz.rs`) checks the op language's
+  semantics, not just robustness. Fuzzer bytes choose one-shot and
+  interactive transactions, some malformed, and an exact model predicts
+  every response: results, versions, cursors, failing op indexes, unique
+  violations, replays and OCC conflicts. Rejected requests must leave no
+  trace. The model parses ops with its own copy of their types, so it
+  cannot share a parsing bug with the service.
 - **OpenAPI conformance**: every response in the DST is validated against
   `openapi.json` with an in-crate JSON-Schema subset checker. Every route in
   the router appears in the document, and every documented route exists.
   The checked-in `openapi.json` must equal the generated document.
 - **DST coverage**: `tests/coverage.rs` runs every scenario and fails if any
   documented operation was never exercised by the simulator.
+- **Checker self-tests**: a checker that cannot fail proves nothing, so
+  each one is fed known-bad input: non-linearizable register histories,
+  broken ledgers, missing or stale index entries, orphaned rows, missing
+  segments and blob chunks, and foreign bytes in blob reads.
+- **Mutation testing** (`scripts/mutants.sh`) checks that the suites catch
+  bugs injected into the engine, the table layer, the op language and the
+  checkers. They catch 1058 of 1083 viable mutants; the 25 survivors are
+  equivalent (off-by-one changes to timestamp comparisons and to length
+  checks that decoding repeats, guards a later check backs, and
+  performance heuristics). The script also kills mutated tests that
+  allocate without bound, which cargo-mutants' timeout cannot stop in time.
+- **Cost**: object-store requests dominate cost (goal 2), so `sim::cost`
+  counts them per operation on production-configured nodes (20 ms per
+  request, virtual time), and `tests/cost.rs` budgets them. Current counts:
+
+  | operation                               | requests                         |
+  | --------------------------------------- | -------------------------------- |
+  | commit (lease holder)                   | 1 PUT                            |
+  | 64 concurrent commits                   | 1 PUT in total                   |
+  | strong read, lease holder               | 0                                |
+  | strong read, engine on a non-holder     | 1 GET (304)                      |
+  | strong read through the API, no lease   | 1 GET                            |
+  | snapshot read within staleness          | 0                                |
+  | cold open + point read, 2 segments      | 4 GET (80 ms)                    |
+  | blob upload / download                  | 0.25 PUT / 0.125 GET per MiB     |
+  | steady writes, with flush/compaction/GC | 1.001 PUT, 0.002 GET per commit  |
+  | idle database                           | 0 per hour                       |
+  | node overhead (heartbeats, membership)  | 360 PUT + up to 240 GET per hour |
+
+  `cost_model` prices these with S3 Standard list prices for workload
+  profiles (idle, light, typical, heavy); the typical profile (100k reads
+  and 10k writes a day, 20 MB) must stay under its monthly budget.
 
 Commands:
 
@@ -711,12 +790,14 @@ SIM_SEEDS=500 cargo test --release --test sim                # longer DST campai
 cargo run --release --example sim_tool -- campaign all 3000  # very long campaigns
 cargo run --release --example sim_tool -- trace <scenario> <seed>
 SIM_SEED=12345 cargo test --test sim sim_chaos -- --nocapture # reproduce one seed
+cargo run --release --example cost_model                     # requests per operation, $/DB/month
+cargo bench --bench throughput                               # wall-clock throughput, thousands of DBs
+scripts/mutants.sh                                           # mutation testing (several hours)
 ```
 
 ### 13.5 Defects found by the simulator
 
-These bugs were found by the DST suite during development and fixed. Each
-is now covered by a seed in the regular suite:
+Bugs the DST suite found, each now covered by the regular suite:
 
 1. _Read-your-writes across nodes._ A database created through node A was
    briefly invisible through node B, because B read a stale metadata
@@ -749,6 +830,30 @@ is now covered by a seed in the regular suite:
     treated a never-opened database (no manifest yet, since manifests are
     created lazily) as deleted. A retried `create` then replaced a fresh
     database. Only a manifest flagged deleted counts now.
+11. _Duplicated forwards._ A duplicated forwarded `commit` applied while
+    the original reported `404 txn_not_found`, so the client transferred
+    again; a duplicated `PUT` resurrected a deleted key. Forwards now
+    execute at most once (§7).
+12. _Stale lease reads under clock skew._ A node with a slow clock kept
+    reading from its expired lease after a node with a fast clock took
+    over and committed. Leases are now measured on monotonic clocks (§5.7).
+13. _Failover livelock._ The first fix for 12 kept lease sightings in the
+    database handle; idle eviction discarded them, so a dead node's lease
+    looked new forever. Sightings now outlive handles.
+14. _Snapshot isolation and schema changes._ A snapshot-isolated row write
+    raced `add_index` with a disjoint write set, so both committed and the
+    index missed the row. Schema reads are now validated at every isolation
+    level (§6.1).
+15. _Collected blobs mid-read._ Reading a blob that GC removed mid-read
+    failed with `500`; it now fails with a retryable `503` (§5.8).
+16. _Duplicated forwards across a restart._ A duplicate forwarded `DELETE`
+    reached its target after a restart had erased the record of the first
+    copy, and deleted the database the client had since recreated.
+    Forwards are now addressed to one process (§7).
+
+The cost measurements (§13.4) found two more: a read-heavy database whose
+lease had lapsed never acquired it again (paying a validating GET per read
+forever), and a strong read without a lease validated the manifest twice.
 
 A review alongside the simulator also found that internal endpoints were
 open when no cluster secret was configured. Clusters now always generate
@@ -791,9 +896,11 @@ Tools: `sim_tool` runs simulation campaigns and prints traces.
   Multi-node deployments need an object store with conditional writes
   (S3, GCS, Azure, R2, MinIO).
 - After a node crash, writes to the databases it leased wait for the lease
-  (15 s) to expire. Reads continue immediately.
+  (15 s, counted from when the new writer first saw it; §5.7) to expire.
+  Reads continue immediately.
 - Blob downloads must finish within `gc_grace` (30 min) of the blob being
-  dereferenced.
+  dereferenced; later ones fail with a retryable error.
+- GC safety assumes clock skew far below the grace periods (§5.8).
 - Login has no rate limiting yet. Deploy behind a proxy that limits it.
 - `CloudStore` (S3/GCS/Azure through `object_store`) is exercised only by
   compile-time checks here; the simulator tests the same semantics through

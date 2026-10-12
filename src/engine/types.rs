@@ -27,7 +27,7 @@ impl BlobRef {
 
     pub fn decode(r: &mut Reader<'_>) -> DResult<BlobRef> {
         let id = r.string()?;
-        if !valid_blob_id(&id) {
+        if !valid_object_id(&id) {
             return Err(DecodeError("bad blob id"));
         }
         let size = r.varint()?;
@@ -36,19 +36,15 @@ impl BlobRef {
         let content_type = r.string()?;
         Ok(BlobRef { id, size, sha256, content_type })
     }
-
-    /// Creation time encoded in the id.
-    pub fn created_ms(&self) -> u64 {
-        blob_id_time(&self.id).unwrap_or(0)
-    }
 }
 
-pub fn valid_blob_id(id: &str) -> bool {
+/// Object ids (segments, blobs) are 32 lowercase hex characters.
+pub fn valid_object_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn blob_id_time(id: &str) -> Option<u64> {
-    if !valid_blob_id(id) {
+    if !valid_object_id(id) {
         return None;
     }
     u64::from_str_radix(&id[..12], 16).ok()
@@ -95,29 +91,15 @@ impl Value {
         }
     }
 
-    /// `src` must be the buffer the reader was created over; inline values
-    /// then share it without copying.
+    /// `src` must be the buffer the reader was created over: inline values
+    /// share it without copying.
     pub fn decode(r: &mut Reader<'_>, src: &Bytes) -> DResult<Value> {
         match r.u8()? {
-            0 => {
-                let b = r.bytes()?;
-                Ok(Value::Inline(share(src, r.pos(), b)))
-            }
+            0 => Ok(Value::Inline(src.slice_ref(r.bytes()?))),
             1 => Ok(Value::Blob(BlobRef::decode(r)?)),
             2 => Ok(Value::Tombstone),
             _ => Err(DecodeError("bad value kind")),
         }
-    }
-}
-
-/// `b` was just read from a reader over `src` that is now at `end`; return
-/// it as a zero-copy slice of `src` when possible.
-fn share(src: &Bytes, end: usize, b: &[u8]) -> Bytes {
-    let off = end.wrapping_sub(b.len());
-    if end <= src.len() && off <= end && std::ptr::eq(src[off..end].as_ptr(), b.as_ptr()) {
-        src.slice(off..end)
-    } else {
-        Bytes::copy_from_slice(b)
     }
 }
 
@@ -139,12 +121,14 @@ impl Entry {
         self.value.encode(w);
     }
 
+    /// `src` must be the buffer the reader was created over (see
+    /// [`Value::decode`]).
     pub fn decode(r: &mut Reader<'_>, src: &Bytes) -> DResult<Entry> {
         let k = r.bytes()?;
         if k.len() > MAX_KEY_LEN {
             return Err(DecodeError("key too long"));
         }
-        let key = share(src, r.pos(), k);
+        let key = src.slice_ref(k);
         let seq = r.varint()?;
         let value = Value::decode(r, src)?;
         Ok(Entry { key, seq, value })
@@ -158,9 +142,45 @@ mod tests {
     #[test]
     fn blob_ids() {
         let id = make_blob_id(1_700_000_000_123, &[7u8; 10]);
-        assert!(valid_blob_id(&id));
+        assert!(valid_object_id(&id));
         assert_eq!(blob_id_time(&id), Some(1_700_000_000_123));
-        assert!(!valid_blob_id("xyz"));
+        assert!(!valid_object_id("xyz"));
+        assert!(!valid_object_id(&id[..31]), "short");
+        assert!(!valid_object_id(&id.to_uppercase()), "uppercase");
+        assert!(!valid_object_id(&format!("{}g", &id[..31])), "not hex");
+    }
+
+    /// The size estimate that write limits and the cache account with
+    /// covers the encoding, with little slack.
+    #[test]
+    fn value_size_bounds_the_encoding() {
+        let blob = |size, ct: &str| {
+            Value::Blob(BlobRef { id: make_blob_id(1, &[1; 10]), size, sha256: [3; 32], content_type: ct.into() })
+        };
+        for v in [
+            Value::Tombstone,
+            Value::Inline(Bytes::new()),
+            Value::Inline(Bytes::from(vec![1; 100])),
+            Value::Inline(Bytes::from(vec![1; 100_000])),
+            blob(1, ""),
+            blob(1, "image/png"),
+            blob(u64::MAX, "application/vnd.openxmlformats-officedocument"),
+        ] {
+            let mut w = Writer::new();
+            v.encode(&mut w);
+            let n = w.into_inner().len();
+            assert!((n..=n + 16).contains(&v.size()), "{v:?}: size {} for {n} encoded bytes", v.size());
+        }
+    }
+
+    #[test]
+    fn decoding_bounds_key_length() {
+        for (len, ok) in [(4096 + 64, true), (4096 + 65, false)] {
+            let mut w = Writer::new();
+            Entry { key: Bytes::from(vec![b'k'; len]), seq: 1, value: Value::Tombstone }.encode(&mut w);
+            let src = Bytes::from(w.into_inner());
+            assert_eq!(Entry::decode(&mut Reader::new(&src), &src).is_ok(), ok, "key of {len} bytes");
+        }
     }
 
     #[test]
@@ -185,8 +205,14 @@ mod tests {
         }
         let src = Bytes::from(w.into_inner());
         let mut r = Reader::new(&src);
+        let within = |b: &Bytes| src.as_ptr_range().contains(&b.as_ptr());
         for e in &es {
-            assert_eq!(&Entry::decode(&mut r, &src).unwrap(), e);
+            let d = Entry::decode(&mut r, &src).unwrap();
+            assert_eq!(&d, e);
+            assert!(within(&d.key), "keys are decoded without copying");
+            if let Value::Inline(v) = &d.value {
+                assert!(within(v), "values are decoded without copying");
+            }
         }
         assert!(r.is_empty());
     }

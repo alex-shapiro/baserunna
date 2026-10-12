@@ -1,8 +1,5 @@
-//! The OpenAPI 3.1 document for the HTTP API. It is served at
-//! `GET /v1/openapi.json` and checked in as `openapi.json` (a test keeps the
-//! file identical to this document). The simulator validates every
-//! response against it, and a test checks that its routes are exactly the
-//! router's public routes.
+//! The OpenAPI 3.1 document for the HTTP API, served at
+//! `GET /v1/openapi.json` and checked in as `openapi.json`.
 
 use serde_json::{Map, Value, json};
 use std::sync::OnceLock;

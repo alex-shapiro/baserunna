@@ -91,7 +91,12 @@ mod tests {
         assert_eq!(pick_run(&[seg(10), seg(10), seg(10), seg(1000)], 4, 12), None);
         assert_eq!(pick_run(&[seg(10), seg(10), seg(10), seg(10), seg(1000)], 4, 12), Some(0..4));
         assert_eq!(pick_run(&[seg(300), seg(300), seg(300), seg(1000)], 4, 12), Some(0..4));
+        assert_eq!(pick_run(&[seg(10), seg(10)], 2, 12), Some(0..2));
+        // Segments too different in size to tier are merged only beyond
+        // `max_segments`.
         let many: Vec<_> = (0..14).map(|i| seg(1u64 << (3 * i))).collect();
+        assert_eq!(pick_run(&many[..12], 4, 12), None);
+        assert_eq!(pick_run(&many[..13], 4, 12), Some(0..2));
         assert_eq!(pick_run(&many, 4, 12), Some(0..3));
     }
 

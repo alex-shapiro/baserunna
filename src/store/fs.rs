@@ -2,25 +2,43 @@
 //!
 //! Each object is a file whose first 16 bytes are a random etag. Writes go to
 //! a temporary file that is renamed into place; conditional writes are
-//! serialized by a process-wide mutex, so compare-and-swap is only atomic
-//! within one process (documented as dev-only).
+//! serialized by a mutex owned by the store. That makes compare-and-swap
+//! atomic only within one `FsStore`, so the store takes an exclusive lock on
+//! its directory and a second store on the same directory (in this process
+//! or another) fails to open.
 
 use super::*;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const ETAG_LEN: usize = 16;
+const LOCK_FILE: &str = ".lock";
 
 pub struct FsStore {
     root: PathBuf,
     cas_lock: Arc<Mutex<()>>,
+    /// Holds the exclusive lock on the directory for the store's lifetime.
+    _dir_lock: std::fs::File,
 }
 
 impl FsStore {
+    /// Open (creating if needed) a store in `root`. Fails if another
+    /// `FsStore`, in this process or another, has the directory open.
     pub fn new(root: impl Into<PathBuf>) -> std::io::Result<FsStore> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
-        Ok(FsStore { root, cas_lock: Arc::new(Mutex::new(())) })
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(root.join(LOCK_FILE))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!("data directory {} is in use by another process", root.display()),
+                ));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+        Ok(FsStore { root, cas_lock: Arc::new(Mutex::new(())), _dir_lock: lock })
     }
 
     fn path(&self, key: &str) -> SResult<PathBuf> {
@@ -109,7 +127,7 @@ impl FsStore {
                 let ent = ent.map_err(|e| StoreError::Unavailable(e.to_string()))?;
                 let p = ent.path();
                 let name = ent.file_name().to_string_lossy().to_string();
-                if name.starts_with(".tmp-") {
+                if name.starts_with(".tmp-") || name == LOCK_FILE {
                     continue;
                 }
                 let ft = ent.file_type().map_err(|e| StoreError::Unavailable(e.to_string()))?;
@@ -205,6 +223,10 @@ impl ObjectStore for FsStore {
             blocking(move || Self::list_blocking(&root, &prefix, start_after.as_deref(), limit)).await
         })
     }
+
+    fn time_precision_ms(&self) -> u64 {
+        1
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +256,20 @@ mod tests {
         s.delete("d/seg/1").await.unwrap();
         s.delete("d/seg/1").await.unwrap();
         assert!(s.path("../x").is_err());
+        let all = s.list("", None, 10).await.unwrap();
+        assert!(all.objects.iter().all(|o| o.key.starts_with("d/")), "the lock file is not an object");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_has_one_store_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("baserunna-fs-lock-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = FsStore::new(&dir).unwrap();
+        let e = FsStore::new(&dir).err().expect("a second store on the same directory must fail");
+        assert!(e.to_string().contains("in use by another process"), "{e}");
+        drop(first);
+        FsStore::new(&dir).expect("the lock is released with the store");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

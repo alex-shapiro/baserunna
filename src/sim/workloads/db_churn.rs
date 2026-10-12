@@ -142,6 +142,7 @@ pub async fn run(sim: Arc<Sim>, clients: usize, dbs: usize, steps: usize, chaos:
         return Err(e);
     }
     super::recover(&sim).await;
+    super::check_db_counts(&sim).await?;
     for (model, c) in &done {
         for (db, want) in model {
             check_db(c, db, want, "final").await?;

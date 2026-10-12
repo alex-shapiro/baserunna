@@ -13,7 +13,8 @@ the design context for several of these.
       ranged GET. Run the `multi_node` example against MinIO in CI. Confirm
       that each provider's conditional-write semantics match what
       `SimStore` models, especially S3's `If-Match` support and R2/MinIO
-      edge cases.
+      edge cases, and that `last_modified` comes from one coherent clock
+      (garbage collection runs on it, SPEC §5.8).
 - [ ] **Test Google sign-in against real Google.** Only `FakeGoogle` has
       exercised it. Also add an OIDC `nonce` and PKCE (`code_verifier`) to
       the authorization-code flow. Today only `state` is used.
@@ -46,39 +47,14 @@ the design context for several of these.
 
 ## Storage engine
 
-- [ ] **Streaming compaction and orphan sweep.** Both currently hold a
-      DB's merged entries in memory. Use a k-way merge over segment
-      iterators so 100s-of-MB databases compact in bounded memory.
-- [ ] **Online index backfill.** `add_index` is a single transaction, which
-      limits it to about 100k rows. Backfill in batches with a
-      "building" index state, using the same approach as online schema
-      changes.
-- [ ] **Segment compression.** zstd or lz4 per block. This reduces storage
-      and egress cost, which are the primary costs.
-- [ ] **Local disk cache tier.** Spill evicted blocks and segments to local
-      disk so cold starts and failovers don't re-fetch from object storage.
-- [ ] **Leveled or hybrid compaction.** Size-tiered compaction is simple
-      but amplifies space. Measure write and space amplification on
-      realistic workloads before changing it.
-- [ ] **Faster write failover.** After a crash, writers wait up to two
-      lease periods (§5.7). Options: shorter leases renewed by commits, or
-      releasing a lease once its holder's heartbeat disappears.
-- [ ] **Make GC independent of clock skew.** Its grace periods compare
-      timestamps from different clocks (§5.8). Express them in store time,
-      or measure each node's offset from the store and pause GC when it is
-      large.
-- [ ] **Cheaper membership.** Each node writes about 360 heartbeat PUTs an
-      hour to the system database (about $1.30 per node-month), and every
-      non-holder reads it about 240 times an hour.
-- [ ] **O(1) database creation.** `MetaCmd::CreateDb` reads up to 1000 of
-      the owner's database rows to enforce `max_dbs_per_user`, so concurrent
-      creates by one user conflict. Keep a per-user counter row instead.
-- [ ] **Long blob downloads.** A download must finish within `gc_grace`
-      (30 min) of the blob being dereferenced. Pin blobs that are being
-      read, or extend the grace period while a reader is active.
-- [ ] **Multi-process `fs:` store.** Its compare-and-swap only works within
-      one process. Take an exclusive lock on the data directory at startup
-      so a second process can't silently corrupt it.
+- [ ] **Range tombstones.** `delete_range`, and dropping a table or an
+      index, expand to one tombstone per live key, built in the committing
+      node's memory and the manifest tail (SPEC §15). Store deleted ranges
+      instead, so dropping a large table costs one entry.
+- [ ] **Smaller manifests for large databases.** Every commit rewrites the
+      segment list, about 100 bytes per 2 MiB segment (25 KB at 500 MB).
+      Keep the deeper levels' lists in immutable objects that the manifest
+      references, rewritten only by compactions.
 
 ## Features
 

@@ -542,10 +542,11 @@ async fn table_page(
         .flatten()
         .map(|i| {
             format!(
-                "<li>{} ({}){}</li>",
+                "<li>{} ({}){}{}</li>",
                 esc(i["name"].as_str().unwrap_or("")),
                 esc(&i["columns"].to_string()),
-                if i["unique"] == true { " unique" } else { "" }
+                if i["unique"] == true { " unique" } else { "" },
+                if i["state"] == "building" { " (building)" } else { "" }
             )
         })
         .collect();

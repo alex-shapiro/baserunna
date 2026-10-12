@@ -3,12 +3,15 @@
 #
 #   scripts/mutants.sh                          # everything below (hours)
 #   scripts/mutants.sh -F 'src/engine/txn.rs'   # a subset
+#   git diff main > /tmp/d && scripts/mutants.sh --in-diff /tmp/d   # changed lines only
 #
 # Surviving mutants are listed in mutants.out/missed.txt.
 
 profile = "mutants"
 # The cost guard catches mutants that only waste object-store requests.
-additional_cargo_test_args = ["--lib", "--test", "sim", "--test", "fuzz", "--test", "cost"]
+# Building only these targets (not every test and example) keeps each
+# mutant's rebuild short.
+additional_cargo_args = ["--lib", "--test", "sim", "--test", "fuzz", "--test", "cost"]
 minimum_test_timeout = 60
 exclude_globs = [
     "src/engine/tests.rs",

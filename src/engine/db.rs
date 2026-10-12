@@ -3,9 +3,9 @@
 //! scheduling. See SPEC §5.5–§5.9.
 
 use super::blob::BlobWriter;
-use super::compaction::{merge, pick_run};
+use super::compaction;
 use super::manifest::{Lease, Manifest, ObjKind, Obsolete, SegmentMeta};
-use super::segment;
+use super::segment::SegmentBuilder;
 use super::txn::{CommitRequest, Isolation, Txn, WriteSet, live_keys_in_range, validate};
 use super::types::{Entry, Seq, Value};
 use super::version::Version;
@@ -45,12 +45,16 @@ enum Work {
     },
     Lease {
         release: bool,
+        /// Renewed for strong reads: takes the longer `read_lease_ms`.
+        for_reads: bool,
         tx: Option<oneshot::Sender<Result<()>>>,
     },
     Compaction {
         inputs: Vec<String>,
-        output: Option<SegmentMeta>,
+        outputs: Vec<SegmentMeta>,
         purged_max_seq: Seq,
+        /// The manifest's `compaction_seq` when the compaction was planned.
+        compaction_seq: u64,
         tx: oneshot::Sender<Result<()>>,
     },
     Obsolete {
@@ -102,14 +106,24 @@ struct State {
     /// Start time of the most recent successful validation of `current`.
     verified_at: Option<Instant>,
     last_access: Instant,
+    /// Strong reads in the current read lease period (window) and the
+    /// previous one.
     window_start: Instant,
     reads_in_window: u32,
+    reads_last_window: u32,
     lease_requested: bool,
     /// Our lease, as of the manifest write (`write_seq`) that last renewed
     /// it, and the monotonic instant until which we may rely on it.
     own_lease: Option<(u64, Instant)>,
     compacting: bool,
     sweeping: bool,
+}
+
+impl State {
+    /// Whether reads are frequent enough to pay for lease renewals.
+    fn hot(&self, threshold: u32) -> bool {
+        self.reads_in_window.max(self.reads_last_window) >= threshold
+    }
 }
 
 struct Queue {
@@ -160,6 +174,7 @@ impl Db {
                 last_access: now,
                 window_start: now,
                 reads_in_window: 0,
+                reads_last_window: 0,
                 lease_requested: false,
                 own_lease: None,
                 compacting: false,
@@ -224,8 +239,9 @@ impl Db {
     /// valid from our viewpoint.
     fn foreign_lease<'a>(&self, m: &'a Manifest) -> Option<(&'a Lease, Duration)> {
         let l = m.lease.as_ref().filter(|l| l.node != self.shared.node_id)?;
-        let valid_for = Duration::from_millis(self.shared.cfg.lease_ms + self.shared.cfg.clock_skew_margin_ms);
-        let left = (self.shared.lease_seen(&self.id, l) + valid_for).saturating_duration_since(Instant::now());
+        let valid_for = Duration::from_millis(l.ms + self.shared.cfg.lease_margin_ms);
+        let seen = self.shared.lease_seen(&self.id, l, m.write_seq);
+        let left = (seen + valid_for).saturating_duration_since(Instant::now());
         (!left.is_zero()).then_some((l, left))
     }
 
@@ -271,7 +287,7 @@ impl Db {
             }
         };
         if let Some(l) = installed.m.lease.as_ref().filter(|l| l.node != self.shared.node_id) {
-            self.shared.lease_seen(&self.id, l);
+            self.shared.lease_seen(&self.id, l, installed.m.write_seq);
         }
         st.trusted = true;
         if let Some(t) = verified
@@ -318,7 +334,7 @@ impl Db {
                     return Ok(self.install(v, Some(started)));
                 }
                 Err(StoreError::NotFound) if create => {
-                    let m = Manifest::new(&self.id, self.shared.env.now_ms());
+                    let m = Manifest::new(&self.id, self.shared.time_ms());
                     match self.shared.store.put(&key, m.encode(), PutMode::Create).await {
                         Ok(etag) => {
                             let v = Arc::new(Version { m, etag, shared: self.shared.clone() });
@@ -363,17 +379,20 @@ impl Db {
             }
         }
         let now = Instant::now();
-        let lease_ms = self.shared.cfg.lease_ms;
+        let cfg = &self.shared.cfg;
         let mut want_lease = false;
         {
             let mut st = self.st();
             st.last_access = now;
-            if now.duration_since(st.window_start) > Duration::from_millis(lease_ms) {
+            let window = Duration::from_millis(cfg.read_lease_ms);
+            let since = now.duration_since(st.window_start);
+            if since > window {
+                st.reads_last_window = if since > 2 * window { 0 } else { st.reads_in_window };
                 st.window_start = now;
                 st.reads_in_window = 0;
             }
             st.reads_in_window += 1;
-            let hot = st.reads_in_window >= self.shared.cfg.lease_read_threshold;
+            let hot = st.hot(self.shared.cfg.lease_read_threshold);
             if let Some(cur) = st.current.clone() {
                 let lease_left = if st.trusted { self.own_lease_left(&st, &cur.m) } else { Duration::ZERO };
                 let leased = !lease_left.is_zero();
@@ -386,7 +405,9 @@ impl Db {
                                 .is_some_and(|v| now.duration_since(v) <= Duration::from_millis(max_staleness_ms))
                     }
                 };
-                if leased && hot && !st.lease_requested && lease_left < Duration::from_millis(lease_ms / 2) {
+                // Renew shortly before the lease runs out: often enough not to
+                // lapse, rarely enough that each renewal covers many reads.
+                if leased && hot && !st.lease_requested && lease_left < Duration::from_millis(cfg.lease_ms / 5) {
                     st.lease_requested = true;
                     want_lease = true;
                 }
@@ -399,7 +420,7 @@ impl Db {
                         )
                     });
                     if want_lease {
-                        self.enqueue(Work::Lease { release: false, tx: None });
+                        self.enqueue(Work::Lease { release: false, for_reads: true, tx: None });
                     }
                     return check_live(cur);
                 }
@@ -413,7 +434,7 @@ impl Db {
         self.shared.env.trace(|| format!("{} read v{} after refresh (lease={:?})", self.id, v.m.version, v.m.lease));
         let hot = {
             let mut st = self.st();
-            let hot = st.reads_in_window >= self.shared.cfg.lease_read_threshold && !st.lease_requested;
+            let hot = st.hot(self.shared.cfg.lease_read_threshold) && !st.lease_requested;
             if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v.m).is_none() {
                 st.lease_requested = true;
                 true
@@ -422,7 +443,7 @@ impl Db {
             }
         };
         if hot && !v.m.is_deleted() {
-            self.enqueue(Work::Lease { release: false, tx: None });
+            self.enqueue(Work::Lease { release: false, for_reads: true, tx: None });
         }
         check_live(v)
     }
@@ -440,7 +461,12 @@ impl Db {
         Ok(Txn::new(snap, isolation, self.shared.env.random_u128(), self.shared.cfg.txn_max_write_bytes))
     }
 
-    pub fn blob_writer(&self, content_type: &str) -> BlobWriter {
+    /// A writer for a new staged blob. Its id records the store time, so the
+    /// clock is measured first if that is due.
+    pub async fn blob_writer(&self, content_type: &str) -> BlobWriter {
+        if let Err(e) = self.shared.store_time_ms().await {
+            crate::debug!("staging a blob without store time: {e}");
+        }
         BlobWriter::new(self.shared.clone(), &self.id, content_type)
     }
 
@@ -459,6 +485,10 @@ impl Db {
         if req.deadline.is_none() {
             req.deadline = Some(Instant::now() + Duration::from_millis(self.shared.cfg.commit_timeout_ms));
         }
+        if !req.writes.blob_ids().is_empty() {
+            // Binding a staged blob is checked against store time.
+            self.shared.store_time_ms().await?;
+        }
         let (tx, rx) = oneshot::channel();
         self.enqueue(Work::Commit { req, tx });
         rx.await.map_err(|_| Error::Unavailable {
@@ -471,7 +501,7 @@ impl Db {
     /// Acquire or renew this node's lease.
     pub async fn acquire_lease(self: &Arc<Self>) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.enqueue(Work::Lease { release: false, tx: Some(tx) });
+        self.enqueue(Work::Lease { release: false, for_reads: false, tx: Some(tx) });
         rx.await.map_err(|_| Error::unavailable("lease request interrupted"))?
     }
 
@@ -482,7 +512,7 @@ impl Db {
             return Ok(());
         }
         let (tx, rx) = oneshot::channel();
-        self.enqueue(Work::Lease { release: true, tx: Some(tx) });
+        self.enqueue(Work::Lease { release: true, for_reads: false, tx: Some(tx) });
         rx.await.map_err(|_| Error::unavailable("lease release interrupted"))?
     }
 
@@ -562,14 +592,14 @@ impl Db {
         loop {
             attempt += 1;
             let attempt_started = Instant::now();
-            let now_ms = self.shared.env.now_ms();
+            let now = Now { wall_ms: self.shared.env.now_ms(), store_ms: self.shared.store_now_ms() };
             let foreign = self.foreign_lease(&base.m).map(|(l, left)| (l.node.clone(), left));
             if let Some((holder, left)) = foreign {
                 let e = Error::NotOwner { holder, retry_after_ms: left.as_millis() as u64 };
                 self.finish_failed(batch, e);
                 return;
             }
-            let plan = match self.build(&base, &batch, now_ms).await {
+            let plan = match self.build(&base, &batch, now).await {
                 Ok(p) => p,
                 Err(e) => {
                     let e = if maybe_applied { unknown(e) } else { e };
@@ -605,9 +635,9 @@ impl Db {
             }
             match res {
                 Ok(etag) => {
-                    if m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id) {
-                        let until = attempt_started + Duration::from_millis(cfg.lease_ms)
-                            - Duration::from_millis(cfg.clock_skew_margin_ms.min(cfg.lease_ms));
+                    if let Some(l) = m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
+                        let until = attempt_started + Duration::from_millis(l.ms)
+                            - Duration::from_millis(cfg.lease_margin_ms.min(l.ms));
                         self.st().own_lease = Some((m.write_seq, until));
                     }
                     let v = Arc::new(Version { m, etag, shared: self.shared.clone() });
@@ -684,7 +714,7 @@ impl Db {
         }
     }
 
-    async fn build(&self, base: &Version, batch: &[Work], now_ms: u64) -> Result<Plan> {
+    async fn build(&self, base: &Version, batch: &[Work], now: Now) -> Result<Plan> {
         let cfg = &self.shared.cfg;
         let mut m = base.m.clone();
         let mut tail: BTreeMap<Bytes, Entry> = m.tail.drain(..).map(|e| (e.key.clone(), e)).collect();
@@ -696,6 +726,7 @@ impl Db {
         let mut data_changed = false;
         let mut meta_changed = false;
         let mut release = false;
+        let mut lease_ms = cfg.lease_ms;
         if base.m.is_deleted() {
             let outcomes = batch
                 .iter()
@@ -725,14 +756,8 @@ impl Db {
                         outcomes.push(Outcome::Seq(Err(e)));
                         continue;
                     }
-                    let expired = req
-                        .writes
-                        .blob_ids()
-                        .iter()
-                        .any(|id| super::types::blob_id_time(id).unwrap_or(0) + cfg.blob_stage_ttl_ms < now_ms);
-                    if expired {
-                        outcomes
-                            .push(Outcome::Seq(Err(Error::invalid("a staged blob expired before it was committed"))));
+                    if let Err(e) = bindable(&req.writes, &m, now.store_ms, cfg) {
+                        outcomes.push(Outcome::Seq(Err(e)));
                         continue;
                     }
                     let new_seq = last_seq + 1;
@@ -755,33 +780,52 @@ impl Db {
                     data_changed = true;
                     outcomes.push(Outcome::Seq(Ok(Committed { version: new_seq, replayed: false })));
                 }
-                Work::Lease { release: r, .. } => {
+                Work::Lease { release: r, for_reads, .. } => {
                     release |= *r;
+                    if *for_reads {
+                        lease_ms = lease_ms.max(cfg.read_lease_ms);
+                    }
                     meta_changed = true;
                     outcomes.push(Outcome::Unit(Ok(())));
                 }
-                Work::Compaction { inputs, output, purged_max_seq, .. } => {
-                    let pos = m.segments.iter().position(|s| Some(&s.id) == inputs.first());
-                    let ok = pos.is_some_and(|p| {
-                        p + inputs.len() <= m.segments.len()
-                            && m.segments[p..p + inputs.len()].iter().zip(inputs).all(|(s, i)| s.id == *i)
-                    });
-                    if let (true, Some(p)) = (ok, pos) {
-                        let out: Vec<SegmentMeta> = output.iter().cloned().collect();
-                        m.segments.splice(p..p + inputs.len(), out);
-                        for id in inputs {
+                Work::Compaction { inputs, outputs, purged_max_seq, compaction_seq, .. } => {
+                    let Some(now_ms) = now.store_ms else {
+                        outcomes.push(Outcome::Unit(Err(Error::unavailable("store clock not synchronized"))));
+                        continue;
+                    };
+                    let present = inputs.iter().all(|id| m.segments.iter().any(|s| s.id == *id));
+                    let installed = !outputs.is_empty()
+                        && outputs.iter().all(|o| m.segments.iter().any(|s| s.id == o.id && s.level == o.level));
+                    if m.compaction_seq == *compaction_seq && present {
+                        let mut segments: Vec<SegmentMeta> =
+                            m.segments.iter().filter(|s| !inputs.contains(&s.id)).cloned().collect();
+                        segments.extend(outputs.iter().cloned());
+                        let before = std::mem::replace(&mut m.segments, segments);
+                        m.sort_segments();
+                        if m.check_levels().is_err() {
+                            m.segments = before;
+                            outcomes.push(Outcome::Unit(Err(Error::internal("compaction output overlaps its level"))));
+                            continue;
+                        }
+                        for id in inputs.iter().filter(|id| !outputs.iter().any(|o| o.id == **id)) {
                             m.obsolete.push(Obsolete { kind: ObjKind::Segment, id: id.clone(), since_ms: now_ms });
                         }
                         m.tombstone_horizon = m.tombstone_horizon.max(*purged_max_seq);
+                        m.compaction_seq += 1;
                         meta_changed = true;
                         outcomes.push(Outcome::Unit(Ok(())));
-                    } else if output.as_ref().is_some_and(|o| m.segments.iter().any(|s| s.id == o.id)) {
+                    } else if installed {
+                        // An earlier, ambiguous attempt of this install landed.
                         outcomes.push(Outcome::Unit(Ok(())));
                     } else {
                         outcomes.push(Outcome::Unit(Err(Error::Conflict("compaction inputs changed".into()))));
                     }
                 }
                 Work::Obsolete { items, .. } => {
+                    let Some(now_ms) = now.store_ms else {
+                        outcomes.push(Outcome::Unit(Err(Error::unavailable("store clock not synchronized"))));
+                        continue;
+                    };
                     for it in items {
                         let listed = m.obsolete.iter().any(|o| o.kind == it.kind && o.id == it.id);
                         let live_seg = it.kind == ObjKind::Segment && m.segments.iter().any(|s| s.id == it.id);
@@ -809,7 +853,9 @@ impl Db {
         }
         m.tail = tail.into_values().collect();
         // Without segments, tail tombstones shadow nothing: purge old ones.
-        if m.segments.is_empty() {
+        if m.segments.is_empty()
+            && let Some(now_ms) = now.store_ms
+        {
             let purge = m.version_at_least_age(now_ms, cfg.txn_max_lifetime_ms);
             let mut horizon = m.tombstone_horizon;
             m.tail.retain(|e| {
@@ -826,29 +872,32 @@ impl Db {
             let n = m.recent_commits.len() - cfg.commit_ring_max;
             m.recent_commits.drain(..n);
         }
-        if data_changed && m.version_times.last().is_none_or(|(_, t)| *t + cfg.version_sample_ms <= now_ms) {
-            m.version_times.push((m.version, now_ms));
-        }
-        // Keep the newest sample at least a transaction lifetime old: the
-        // tombstone purge horizons are read from it.
-        let keep_after = now_ms.saturating_sub(cfg.txn_max_lifetime_ms);
-        while m.version_times.len() >= 2 && m.version_times[1].1 <= keep_after {
-            m.version_times.remove(0);
+        let mut gc = Vec::new();
+        if let Some(now_ms) = now.store_ms {
+            if data_changed && m.version_times.last().is_none_or(|(_, t)| *t + cfg.version_sample_ms <= now_ms) {
+                m.version_times.push((m.version, now_ms));
+            }
+            // Keep the newest sample at least a transaction lifetime old: the
+            // tombstone purge horizons are read from it.
+            let keep_after = now_ms.saturating_sub(cfg.txn_max_lifetime_ms);
+            while m.version_times.len() >= 2 && m.version_times[1].1 <= keep_after {
+                m.version_times.remove(0);
+            }
+            let keep;
+            (gc, keep) = m.obsolete.drain(..).partition(|o| o.since_ms + cfg.gc_grace_ms <= now_ms);
+            m.obsolete = keep;
         }
         m.lease = if release {
             None
         } else {
-            Some(Lease { node: self.shared.node_id.clone(), expires_ms: now_ms + cfg.lease_ms })
+            Some(Lease { node: self.shared.node_id.clone(), expires_ms: now.wall_ms + lease_ms, ms: lease_ms })
         };
-        let (gc, keep): (Vec<Obsolete>, Vec<Obsolete>) =
-            m.obsolete.drain(..).partition(|o| o.since_ms + cfg.gc_grace_ms <= now_ms);
-        m.obsolete = keep;
         if m.tail_bytes() > cfg.tail_max_bytes {
-            let (data, stats) = segment::build(&m.tail, cfg.block_target);
-            let id = self.shared.env.random_hex(16);
-            let key = seg_key(&self.id, &id);
-            self.shared.retry.run(|| self.shared.store.put(&key, data.clone(), PutMode::Overwrite)).await?;
-            m.segments.insert(0, seg_meta(id, &stats));
+            let mut b = SegmentBuilder::new(cfg.block_target, cfg.compression);
+            for e in &m.tail {
+                b.add(e);
+            }
+            m.segments.insert(0, compaction::write(&self.shared, &self.id, b, 0).await?);
             m.tail.clear();
         }
         m.write_seq += 1;
@@ -868,9 +917,10 @@ impl Db {
                 }
             });
         }
-        let now_ms = self.shared.env.now_ms();
+        self.shared.refresh_clock();
+        let store_now = self.shared.store_now_ms();
         let mut st = self.st();
-        if !st.compacting && pick_run(&v.m.segments, cfg.compaction_fanout, cfg.max_segments).is_some() {
+        if !st.compacting && compaction::pick(&v.m, cfg).is_some() {
             st.compacting = true;
             let me = self.clone();
             self.shared.env.spawn(async move {
@@ -880,7 +930,7 @@ impl Db {
                 me.st().compacting = false;
             });
         }
-        if !st.sweeping && v.m.last_sweep_ms + cfg.sweep_interval_ms <= now_ms {
+        if !st.sweeping && store_now.is_some_and(|now| v.m.last_sweep_ms + cfg.sweep_interval_ms <= now) {
             st.sweeping = true;
             let me = self.clone();
             self.shared.env.spawn(async move {
@@ -897,32 +947,28 @@ impl Db {
             self.shared.compaction_slots.acquire().await.map_err(|_| Error::internal("compaction semaphore closed"))?;
         let cfg = self.shared.cfg.clone();
         loop {
+            let store_now = self.shared.store_time_ms().await?;
             let Some(v) = self.current() else { return Ok(()) };
-            let now_ms = self.shared.env.now_ms();
             if !self.holds_lease(&self.st(), &v.m) {
                 return Ok(());
             }
-            let Some(run) = pick_run(&v.m.segments, cfg.compaction_fanout, cfg.max_segments) else {
+            let Some(plan) = compaction::pick(&v.m, &cfg) else {
                 return Ok(());
             };
-            let bottom = run.end == v.m.segments.len();
-            let purge_seq = v.m.version_at_least_age(now_ms, cfg.txn_max_lifetime_ms);
-            let inputs: Vec<SegmentMeta> = v.m.segments[run].to_vec();
-            let out = merge(&self.shared, &v.m, &inputs, bottom, purge_seq).await?;
-            let output = match out.data {
-                None => None,
-                Some((data, stats)) => {
-                    let id = self.shared.env.random_hex(16);
-                    let key = seg_key(&self.id, &id);
-                    self.shared.retry.run(|| self.shared.store.put(&key, data.clone(), PutMode::Overwrite)).await?;
-                    Some(seg_meta(id, &stats))
-                }
+            let (outputs, purged_max_seq) = if plan.trivial {
+                let moved = SegmentMeta { level: plan.output_level, ..plan.inputs[0].clone() };
+                (vec![moved], 0)
+            } else {
+                let purge_seq = v.m.version_at_least_age(store_now, cfg.txn_max_lifetime_ms);
+                let out = compaction::run(&self.shared, &v.m, &plan, purge_seq).await?;
+                (out.segments, out.purged_max_seq)
             };
             let (tx, rx) = oneshot::channel();
             self.enqueue(Work::Compaction {
-                inputs: inputs.iter().map(|s| s.id.clone()).collect(),
-                output,
-                purged_max_seq: out.purged_max_seq,
+                inputs: plan.inputs.iter().map(|s| s.id.clone()).collect(),
+                outputs,
+                purged_max_seq,
+                compaction_seq: v.m.compaction_seq,
                 tx,
             });
             rx.await.map_err(|_| Error::unavailable("compaction install interrupted"))??;
@@ -930,16 +976,18 @@ impl Db {
     }
 
     /// Find unreferenced (orphaned) objects and schedule them for deletion.
+    ///
+    /// Everything is compared in store time, read before the version whose
+    /// references are scanned: an object old enough at that moment cannot
+    /// be referenced by a commit that version does not contain (see
+    /// [`bindable`]).
     async fn sweep(self: Arc<Self>) -> Result<()> {
         let cfg = self.shared.cfg.clone();
+        let now_ms = self.shared.store_time_ms().await?;
         let v = self.refresh(Instant::now(), false).await?;
-        let now_ms = self.shared.env.now_ms();
         if !self.holds_lease(&self.st(), &v.m) {
             return Ok(());
         }
-        let store = &*self.shared.store;
-        let segs = crate::store::list_all(store, &format!("dbs/{}/seg/", self.id), &self.shared.retry).await?;
-        let blobs = crate::store::list_all(store, &format!("dbs/{}/blob/", self.id), &self.shared.retry).await?;
         let mut referenced_segs: BTreeSet<&str> = v.m.segments.iter().map(|s| s.id.as_str()).collect();
         let mut referenced_blobs: BTreeSet<String> = BTreeSet::new();
         for o in &v.m.obsolete {
@@ -952,13 +1000,15 @@ impl Db {
                 }
             }
         }
-        for e in v.all_entries(false).await? {
+        let mut it = v.iter_bulk(false);
+        while let Some(e) = it.next().await? {
             if let Value::Blob(b) = e.value {
                 referenced_blobs.insert(b.id);
             }
         }
         let mut items = Vec::new();
-        for o in &segs {
+        let mut segs = Listing::new(format!("dbs/{}/seg/", self.id));
+        while let Some(o) = segs.next(&self.shared).await? {
             let id = o.key.rsplit('/').next().unwrap_or("");
             if super::types::valid_object_id(id)
                 && !referenced_segs.contains(id)
@@ -967,23 +1017,33 @@ impl Db {
                 items.push(Obsolete { kind: ObjKind::Segment, id: id.to_string(), since_ms: now_ms });
             }
         }
-        let mut blob_mtimes: BTreeMap<String, u64> = BTreeMap::new();
-        for o in &blobs {
-            let mut parts = o.key.rsplit('/');
-            let _chunk = parts.next();
-            let Some(id) = parts.next() else { continue };
-            let e = blob_mtimes.entry(id.to_string()).or_insert(0);
-            *e = (*e).max(o.last_modified_ms);
-        }
-        for (id, mtime) in blob_mtimes {
+        // A blob's objects are listed together; it is as old as its newest.
+        let blob_of = |key: &str| key.rsplit('/').nth(1).map(|s| s.to_string());
+        let found = |id: String, mtime: u64, items: &mut Vec<Obsolete>| {
             let created = super::types::blob_id_time(&id).unwrap_or(0);
             if super::types::valid_object_id(&id)
                 && !referenced_blobs.contains(&id)
                 && mtime + cfg.orphan_grace_ms <= now_ms
-                && created + cfg.blob_stage_ttl_ms <= now_ms
+                && created + cfg.blob_stage_ttl_ms + bind_margin_ms(&cfg) <= now_ms
             {
                 items.push(Obsolete { kind: ObjKind::Blob, id, since_ms: now_ms });
             }
+        };
+        let mut blobs = Listing::new(format!("dbs/{}/blob/", self.id));
+        let mut cur: Option<(String, u64)> = None;
+        while let Some(o) = blobs.next(&self.shared).await? {
+            let Some(id) = blob_of(&o.key) else { continue };
+            match &mut cur {
+                Some((c, mtime)) if *c == id => *mtime = (*mtime).max(o.last_modified_ms),
+                _ => {
+                    if let Some((c, mtime)) = cur.replace((id, o.last_modified_ms)) {
+                        found(c, mtime, &mut items);
+                    }
+                }
+            }
+        }
+        if let Some((c, mtime)) = cur {
+            found(c, mtime, &mut items);
         }
         let (tx, rx) = oneshot::channel();
         self.enqueue(Work::Obsolete { items, tx });
@@ -998,6 +1058,71 @@ impl Db {
     /// Commit a no-op lease renewal that also performs due GC (tests).
     pub async fn maintenance_now(self: &Arc<Self>) -> Result<()> {
         self.acquire_lease().await
+    }
+}
+
+/// Clocks for one manifest write: the wall clock for hints (lease expiry),
+/// store time for everything garbage collection relies on (`None` if this
+/// node has no recent measurement, which pauses collection).
+#[derive(Clone, Copy, Debug)]
+struct Now {
+    wall_ms: u64,
+    store_ms: Option<u64>,
+}
+
+/// Measurement errors on the committing and sweeping nodes together stay
+/// below this, so a blob a sweep finds too old to bind stays too old for
+/// every committer.
+fn bind_margin_ms(cfg: &super::EngineConfig) -> u64 {
+    2 * cfg.clock_sync_max_error_ms
+}
+
+/// Whether `w` may bind the staged blobs it references: each must be
+/// younger than the stage TTL in store time, and not already found
+/// orphaned (the manifest write serializes binding with sweeps).
+fn bindable(w: &WriteSet, m: &Manifest, store_now: Option<u64>, cfg: &super::EngineConfig) -> Result<()> {
+    let ids = w.blob_ids();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let now = store_now.ok_or_else(|| Error::unavailable("store clock not synchronized"))?;
+    let expired = ids.iter().any(|id| {
+        super::types::blob_id_time(id).unwrap_or(0) + cfg.blob_stage_ttl_ms < now
+            || m.obsolete.iter().any(|o| o.kind == ObjKind::Blob && o.id == *id)
+    });
+    if expired {
+        return Err(Error::invalid("a staged blob expired before it was committed"));
+    }
+    Ok(())
+}
+
+/// A paged listing of a prefix, one object at a time.
+struct Listing {
+    prefix: String,
+    page: std::vec::IntoIter<crate::store::ObjectMeta>,
+    after: Option<String>,
+    done: bool,
+}
+
+impl Listing {
+    fn new(prefix: String) -> Listing {
+        Listing { prefix, page: Vec::new().into_iter(), after: None, done: false }
+    }
+
+    async fn next(&mut self, shared: &Shared) -> Result<Option<crate::store::ObjectMeta>> {
+        loop {
+            if let Some(o) = self.page.next() {
+                return Ok(Some(o));
+            }
+            if self.done {
+                return Ok(None);
+            }
+            let after = self.after.clone();
+            let p = shared.retry.run(|| shared.store.list(&self.prefix, after.as_deref(), 1000)).await?;
+            self.done = p.next.is_none();
+            self.after = p.next;
+            self.page = p.objects.into_iter();
+        }
     }
 }
 
@@ -1019,19 +1144,6 @@ fn unknown(e: Error) -> Error {
     }
 }
 
-fn seg_meta(id: String, s: &segment::SegmentStats) -> SegmentMeta {
-    SegmentMeta {
-        id,
-        size: s.size,
-        entries: s.entries,
-        tombstones: s.tombstones,
-        min_key: s.min_key.clone(),
-        max_key: s.max_key.clone(),
-        min_seq: s.min_seq,
-        max_seq: s.max_seq,
-    }
-}
-
 async fn delete_object(shared: &Shared, db: &str, o: &Obsolete) -> Result<()> {
     match o.kind {
         ObjKind::Segment => {
@@ -1039,6 +1151,12 @@ async fn delete_object(shared: &Shared, db: &str, o: &Obsolete) -> Result<()> {
             shared.retry.run(|| shared.store.delete(&key)).await?;
         }
         ObjKind::Blob => {
+            let now = shared.store_now_ms().ok_or_else(|| Error::unavailable("store clock not synchronized"))?;
+            if super::blob::pinned(shared, db, &o.id, now).await? {
+                // A long read still needs it. It is an orphan again, so a
+                // later sweep finds it once the read is over.
+                return Ok(());
+            }
             let objs = crate::store::list_all(&*shared.store, &blob_prefix(db, &o.id), &shared.retry).await?;
             for ob in objs {
                 shared.retry.run(|| shared.store.delete(&ob.key)).await?;
@@ -1054,34 +1172,38 @@ mod tests {
     use crate::engine::EngineConfig;
     use crate::engine::tests::{engine, rt};
 
-    fn meta(c: char) -> SegmentMeta {
+    /// A segment named `c` at `level` covering the keys `min..=max`.
+    fn meta(c: char, level: u8, min: &str, max: &str) -> SegmentMeta {
         SegmentMeta {
             id: c.to_string().repeat(32),
+            level,
             size: 100,
             entries: 1,
             tombstones: 0,
-            min_key: Bytes::new(),
-            max_key: Bytes::new(),
+            min_key: Bytes::copy_from_slice(min.as_bytes()),
+            max_key: Bytes::copy_from_slice(max.as_bytes()),
             min_seq: 0,
             max_seq: 0,
         }
     }
 
-    /// The plan for `batch` on a manifest with `segments` (newest first)
-    /// and `obsolete` objects.
+    /// The plan for `batch` on a manifest with `segments` and `obsolete`
+    /// objects, two compactions after its creation.
     async fn plan(segments: &[SegmentMeta], obsolete: Vec<Obsolete>, batch: Vec<Work>) -> Plan {
         let (eng, _, _) = engine(1, EngineConfig::small_for_tests());
-        let m = Manifest { segments: segments.to_vec(), obsolete, ..Manifest::new("d", 0) };
+        let mut m = Manifest { segments: segments.to_vec(), obsolete, compaction_seq: 2, ..Manifest::new("d", 0) };
+        m.sort_segments();
         let base = Version { m, etag: String::new(), shared: eng.shared.clone() };
-        eng.db("d").build(&base, &batch, 1_000).await.unwrap()
+        eng.db("d").build(&base, &batch, Now { wall_ms: 1_000, store_ms: Some(1_000) }).await.unwrap()
     }
 
-    fn compaction(inputs: &str, output: char) -> Work {
+    fn compaction(inputs: &str, outputs: Vec<SegmentMeta>, compaction_seq: u64) -> Work {
         let (tx, _) = oneshot::channel();
         Work::Compaction {
-            inputs: inputs.chars().map(|c| meta(c).id).collect(),
-            output: Some(meta(output)),
+            inputs: inputs.chars().map(|c| c.to_string().repeat(32)).collect(),
+            outputs,
             purged_max_seq: 0,
+            compaction_seq,
             tx,
         }
     }
@@ -1091,24 +1213,91 @@ mod tests {
     }
 
     fn segment_names(p: &Plan) -> Option<String> {
-        p.manifest.as_ref().map(|m| m.segments.iter().map(|s| &s.id[..1]).collect())
+        p.manifest.as_ref().map(|m| m.segments.iter().map(|s| format!("{}{}", &s.id[..1], s.level)).collect())
     }
 
-    /// A compaction installs only if its inputs are still a contiguous run
-    /// of the current segments; installing it again is a no-op success.
+    /// A compaction installs only onto the manifest it was planned from,
+    /// with all of its inputs present and its outputs fitting their level;
+    /// installing it again is a no-op success.
     #[test]
     fn compaction_installs_check_their_inputs() {
         rt().block_on(async {
-            let abc = [meta('a'), meta('b'), meta('c')];
-            let p = plan(&abc, vec![], vec![compaction("bc", 'x')]).await;
+            let segs = [meta('a', 0, "a", "z"), meta('b', 6, "a", "c"), meta('c', 6, "d", "f"), meta('d', 6, "x", "z")];
+            let x = || vec![meta('x', 6, "a", "f")];
+            let p = plan(&segs, vec![], vec![compaction("bc", x(), 2)]).await;
             assert!(succeeded(&p));
-            assert_eq!(segment_names(&p).as_deref(), Some("ax"));
-            for inputs in ["bx", "bcd", "cb", "ac"] {
-                let p = plan(&abc, vec![], vec![compaction(inputs, 'y')]).await;
-                assert!(!succeeded(&p) && p.manifest.is_none(), "inputs {inputs} were installed");
+            assert_eq!(segment_names(&p).as_deref(), Some("a0x6d6"));
+            let m = p.manifest.unwrap();
+            assert_eq!(m.compaction_seq, 3);
+            assert_eq!(m.obsolete.iter().map(|o| &o.id[..1]).collect::<String>(), "bc");
+            for (inputs, seq, out) in [("bc", 1, x()), ("be", 2, x()), ("b", 2, vec![meta('y', 6, "a", "z")])] {
+                let p = plan(&segs, vec![], vec![compaction(inputs, out, seq)]).await;
+                assert!(!succeeded(&p) && p.manifest.is_none(), "inputs {inputs} at {seq} were installed");
             }
-            let p = plan(&[meta('a'), meta('x')], vec![], vec![compaction("bc", 'x')]).await;
+            let installed = [meta('a', 0, "a", "z"), meta('x', 6, "a", "f")];
+            let p = plan(&installed, vec![], vec![compaction("bc", x(), 2)]).await;
             assert!(succeeded(&p) && p.manifest.is_none());
+        });
+    }
+
+    /// Without a store clock measurement nothing is collected or swept.
+    #[test]
+    fn collection_pauses_without_store_time() {
+        rt().block_on(async {
+            let (eng, _, _) = engine(1, EngineConfig::small_for_tests());
+            let ob = |c: char| Obsolete { kind: ObjKind::Segment, id: c.to_string().repeat(32), since_ms: 0 };
+            let m = Manifest { obsolete: vec![ob('a'), ob('b')], ..Manifest::new("d", 0) };
+            let base = Version { m, etag: String::new(), shared: eng.shared.clone() };
+            let (tx, _) = oneshot::channel();
+            let sweep = Work::Obsolete { items: vec![ob('c')], tx };
+            let lease = Work::Lease { release: false, for_reads: true, tx: None };
+            let db = eng.db("d");
+            let p = db.build(&base, &[lease, sweep], Now { wall_ms: 10_000_000, store_ms: None }).await.unwrap();
+            assert!(p.gc.is_empty());
+            assert!(matches!(p.outcomes[1], Outcome::Unit(Err(Error::Unavailable { .. }))));
+            assert_eq!(p.manifest.unwrap().obsolete.len(), 2, "kept for later");
+        });
+    }
+
+    /// A staged blob can be bound while it is young in store time and not
+    /// found orphaned; without store time, nothing is bound.
+    #[test]
+    fn binding_checks_age_and_the_obsolete_list() {
+        let cfg = EngineConfig::small_for_tests();
+        let now = 10_000_000;
+        let id = super::super::types::make_blob_id(now - 1_000, &[1; 10]);
+        let old = super::super::types::make_blob_id(now - cfg.blob_stage_ttl_ms - 1, &[1; 10]);
+        let other = super::super::types::make_blob_id(now, &[2; 10]);
+        let writes = |id: &str| {
+            let mut w = WriteSet::default();
+            let r =
+                super::super::types::BlobRef { id: id.into(), size: 1, sha256: [0; 32], content_type: String::new() };
+            w.puts.insert(Bytes::from_static(b"k"), Some(Value::Blob(r)));
+            w
+        };
+        let listed = |kind, id: &str| Manifest {
+            obsolete: vec![Obsolete { kind, id: id.into(), since_ms: 0 }],
+            ..Manifest::new("d", 0)
+        };
+        let fresh = Manifest::new("d", 0);
+        assert!(bindable(&writes(&id), &fresh, Some(now), &cfg).is_ok());
+        assert!(bindable(&WriteSet::default(), &fresh, None, &cfg).is_ok(), "no blob, no clock needed");
+        assert!(bindable(&writes(&id), &listed(ObjKind::Blob, &other), Some(now), &cfg).is_ok());
+        assert!(bindable(&writes(&id), &listed(ObjKind::Segment, &id), Some(now), &cfg).is_ok());
+        assert!(bindable(&writes(&id), &listed(ObjKind::Blob, &id), Some(now), &cfg).is_err(), "an orphaned blob");
+        assert!(bindable(&writes(&old), &fresh, Some(now), &cfg).is_err(), "an expired blob");
+        assert!(matches!(bindable(&writes(&id), &fresh, None, &cfg), Err(Error::Unavailable { .. })));
+    }
+
+    /// A trivial move changes a segment's level without making it obsolete.
+    #[test]
+    fn trivial_moves_keep_their_segment() {
+        rt().block_on(async {
+            let segs = [meta('a', 5, "a", "c"), meta('b', 6, "d", "f")];
+            let p = plan(&segs, vec![], vec![compaction("a", vec![meta('a', 6, "a", "c")], 2)]).await;
+            assert!(succeeded(&p));
+            assert_eq!(segment_names(&p).as_deref(), Some("a6b6"));
+            assert!(p.manifest.unwrap().obsolete.is_empty());
         });
     }
 
@@ -1121,7 +1310,9 @@ mod tests {
             let (seg, blob) = (ObjKind::Segment, ObjKind::Blob);
             let (tx, _) = oneshot::channel();
             let items = vec![ob(seg, 'a'), ob(seg, 'b'), ob(seg, 'c'), ob(blob, 'a'), ob(blob, 'd')];
-            let p = plan(&[meta('a')], vec![ob(seg, 'b'), ob(blob, 'd')], vec![Work::Obsolete { items, tx }]).await;
+            let p =
+                plan(&[meta('a', 0, "a", "b")], vec![ob(seg, 'b'), ob(blob, 'd')], vec![Work::Obsolete { items, tx }])
+                    .await;
             let got: Vec<(ObjKind, char)> =
                 p.manifest.unwrap().obsolete.iter().map(|o| (o.kind, o.id.chars().next().unwrap())).collect();
             assert_eq!(got, [(seg, 'b'), (blob, 'd'), (seg, 'c'), (blob, 'a')]);

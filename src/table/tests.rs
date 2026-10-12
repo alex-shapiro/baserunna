@@ -277,16 +277,19 @@ fn schema_changes_and_blobs() {
         assert!(get(&mut t, "docs", &json!(0)).await.is_err());
         // Add a column with a default, then index it (backfill uses default).
         add_column(&mut t, "docs", &serde_json::from_value(json!({"name": "rank", "type": "int", "nullable": false, "default": 5})).unwrap()).await.unwrap();
-        add_index(&mut t, "docs", &serde_json::from_value(json!({"name": "by_rank", "columns": ["rank", "title"]})).unwrap()).await.unwrap();
-        check_indexes(&mut t, "docs").await.unwrap();
         db.commit(t.into_request()).await.unwrap();
+        add_index(&db, "docs", &index_spec(json!({"name": "by_rank", "columns": ["rank", "title"]})), small()).await.unwrap();
 
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        check_indexes(&mut t, "docs").await.unwrap();
         let q: Query = serde_json::from_value(json!({"index": "by_rank", "eq": [5, "t1"]})).unwrap();
         assert_eq!(query(&mut t, "docs", &q).await.unwrap().rows.len(), 2);
         // Unique index over duplicate data fails.
-        let e = add_index(&mut t, "docs", &serde_json::from_value(json!({"name": "u", "columns": ["title"], "unique": true})).unwrap()).await;
+        let e = add_index(&db, "docs", &index_spec(json!({"name": "u", "columns": ["title"], "unique": true})), small()).await;
         assert!(matches!(e, Err(Error::AlreadyExists(_))));
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        assert!(get_schema(&mut t, "docs").await.unwrap().index("u").is_none(), "a failed build leaves no index");
+        check_no_orphans(&mut t).await.unwrap();
         assert!(drop_column(&mut t, "docs", "rank").await.is_err());
         drop_index(&mut t, "docs", "by_rank").await.unwrap();
         drop_column(&mut t, "docs", "rank").await.unwrap();
@@ -370,6 +373,9 @@ fn checkers_reject_corruption() {
         k.push(1);
         t.put(Bytes::from(k), Value::Inline(Bytes::new())).unwrap();
         assert!(check_no_orphans(&mut t).await.is_err(), "entry of a dropped index not detected");
+        let mut t = fresh().await;
+        t.put(backfill_key(s.id, by_n + 7), Value::Inline(Bytes::new())).unwrap();
+        assert!(check_no_orphans(&mut t).await.is_err(), "backfill cursor of a dropped index not detected");
     });
 }
 
@@ -379,6 +385,15 @@ async fn begin(db: &Arc<Db>) -> Txn {
 
 fn table_def(v: Json) -> CreateTable {
     serde_json::from_value(v).unwrap()
+}
+
+fn index_spec(v: Json) -> IndexSpec {
+    serde_json::from_value(v).unwrap()
+}
+
+/// Backfill batches small enough for tests to span many of them.
+fn small() -> Backfill {
+    Backfill { batch_rows: 7, ..Backfill::default() }
 }
 
 fn column(v: Json) -> ColumnSpec {
@@ -783,23 +798,6 @@ fn rg_table() -> CreateTable {
     }))
 }
 
-/// Reading a whole table refuses tables over the limit (index backfills
-/// pass `MAX_BACKFILL_ROWS`).
-#[test]
-fn whole_table_reads_are_bounded() {
-    rt().block_on(async {
-        let (eng, _store, _env) = engine(20, EngineConfig::small_for_tests());
-        let db = eng.db("big");
-        db.open(true).await.unwrap();
-        let mut t = begin(&db).await;
-        create_table(&mut t, &rg_table()).await.unwrap();
-        put_rows(&mut t, "r", 0..3).await;
-        let s = get_schema(&mut t, "r").await.unwrap();
-        assert_eq!(all_rows(&mut t, &s, 3).await.unwrap().len(), 3);
-        assert!(matches!(all_rows(&mut t, &s, 2).await, Err(Error::TooLarge(_))));
-    });
-}
-
 /// A query reads at most `MAX_EXAMINED_PER_QUERY` entries, then returns a
 /// cursor to continue from, even with no matching rows yet.
 #[test]
@@ -821,36 +819,346 @@ fn queries_examine_a_bounded_number_of_rows() {
     });
 }
 
-/// Index backfill reads every row, past the first page of them.
+/// Index backfill reads every row, in batches bounded by rows and by bytes.
 #[test]
 fn index_backfill_reads_every_row() {
     rt().block_on(async {
         let (eng, _store, _env) = engine(19, EngineConfig::small_for_tests());
         let db = eng.db("fill");
         db.open(true).await.unwrap();
+        let mut t = begin(&db).await;
+        create_table(&mut t, &rg_table()).await.unwrap();
+        put_rows(&mut t, "r", 0..1001).await;
+        db.commit(t.into_request()).await.unwrap();
+        // Commits a byte-bounded build of 1001 entries makes: the one that
+        // adds the index, then a batch each time `batch_bytes` fill.
+        let byte_batches = |entry: &dyn Fn(i64) -> usize| {
+            let (mut batches, mut bytes) = (1, 0);
+            for i in 0..1001 {
+                bytes += entry(i);
+                if bytes >= 4096 {
+                    batches += 1;
+                    bytes = 0;
+                }
+            }
+            1 + batches
+        };
+        let int = |i: i64| tuple::encode(&[Key::Int(i)]).len();
+        // Index keys are a 9-byte prefix and the indexed tuple; a unique
+        // index stores the primary key as the value, others append it.
+        let plain = byte_batches(&|i| 9 + int(i % 2) + int(i));
+        let unique = byte_batches(&|i| 9 + int(i) + int(i));
+        for (name, columns, is_unique, opts, commits) in [
+            ("by_rows", "g", false, Backfill { batch_rows: 300, ..Backfill::default() }, 1 + 4),
+            ("by_bytes", "g", false, Backfill { batch_rows: 1000, batch_bytes: 4096 }, plain),
+            ("unique_by_bytes", "id", true, Backfill { batch_rows: 1000, batch_bytes: 4096 }, unique),
+        ] {
+            let before = db.current().unwrap().version();
+            let spec = index_spec(json!({"name": name, "columns": [columns], "unique": is_unique}));
+            let (s, v) = add_index(&db, "r", &spec, opts).await.unwrap();
+            assert_eq!(s.index(name).unwrap().state, IndexState::Ready);
+            assert_eq!(v, db.current().unwrap().version());
+            assert_eq!(v - before, commits as u64, "{name}: commits of the build");
+            let mut t = begin(&db).await;
+            check_indexes(&mut t, "r").await.unwrap();
+            let mut q: Query = serde_json::from_value(json!({"index": name, "limit": 1000})).unwrap();
+            let mut n = 0;
+            loop {
+                let r = query(&mut t, "r", &q).await.unwrap();
+                n += r.rows.len();
+                match r.next_cursor {
+                    Some(c) => q.cursor = Some(c),
+                    None => break,
+                }
+            }
+            assert_eq!(n, 1001);
+        }
+        assert!(unique > byte_batches(&|_| 9) + 2, "setup: values do not count");
+    });
+}
+
+fn people_table() -> CreateTable {
+    table_def(json!({
+        "name": "p",
+        "columns": [
+            {"name": "id", "type": "int", "nullable": false},
+            {"name": "email", "type": "string"},
+            {"name": "g", "type": "int"}
+        ],
+        "primary_key": ["id"]
+    }))
+}
+
+async fn people(seed: u64, n: i64) -> Arc<Db> {
+    let (eng, _store, _env) = engine(seed, EngineConfig::small_for_tests());
+    let db = eng.db("people");
+    db.open(true).await.unwrap();
+    let mut t = begin(&db).await;
+    create_table(&mut t, &people_table()).await.unwrap();
+    let blobs = BlobResolver { db: &db };
+    for id in 0..n {
+        let row = json!({"id": id, "email": format!("e{id}"), "g": id % 3});
+        insert(&mut t, &blobs, "p", &row, InsertMode::Insert).await.unwrap();
+    }
+    db.commit(t.into_request()).await.unwrap();
+    db
+}
+
+/// Start building `spec` without backfilling anything yet.
+async fn start_build(db: &Arc<Db>, spec: &IndexSpec) -> IndexDef {
+    let mut t = begin(db).await;
+    let idx = begin_index(&mut t, "p", spec).await.unwrap();
+    db.commit(t.into_request()).await.unwrap();
+    idx
+}
+
+/// Run one backfill batch; `Some` once the index is ready.
+async fn build_step(db: &Arc<Db>, idx: &IndexDef) -> Result<Option<TableSchema>> {
+    let mut t = begin(db).await;
+    let r = backfill_batch(&mut t, "p", idx, small()).await?;
+    db.commit(t.into_request()).await?;
+    Ok(r)
+}
+
+async fn check(db: &Arc<Db>) {
+    let mut t = begin(db).await;
+    check_indexes(&mut t, "p").await.unwrap();
+    check_no_orphans(&mut t).await.unwrap();
+}
+
+/// Row inserts, updates and deletes between and during backfill batches,
+/// ahead of and behind its cursor, leave a complete index.
+#[test]
+fn backfill_races_row_writes() {
+    rt().block_on(async {
+        for unique in [false, true] {
+            let db = people(31, 60).await;
+            let blobs = BlobResolver { db: &db };
+            let cols = if unique { json!(["email"]) } else { json!(["g", "email"]) };
+            let idx = start_build(&db, &index_spec(json!({"name": "ix", "columns": cols, "unique": unique}))).await;
+            check(&db).await;
+            let mut r = Rng::new(5);
+            let mut next_id = 1000;
+            let mut steps = 0;
+            loop {
+                for _ in 0..4 {
+                    let mut t = begin(&db).await;
+                    let id = r.below(60) as i64;
+                    let res = match r.below(4) {
+                        0 => {
+                            next_id += 1;
+                            let row = json!({"id": next_id, "email": format!("n{next_id}"), "g": 1});
+                            insert(&mut t, &blobs, "p", &row, InsertMode::Insert).await
+                        }
+                        1 => delete(&mut t, "p", &json!(id)).await.map(|_| ()),
+                        _ => {
+                            let set = json!({"g": r.below(5), "email": format!("u{}", r.below(1000))});
+                            update(&mut t, &blobs, "p", &json!(id), &set).await.map(|_| ())
+                        }
+                    };
+                    match res {
+                        Ok(()) => {}
+                        Err(Error::AlreadyExists(_)) if unique => continue,
+                        Err(e) => panic!("row write failed: {e}"),
+                    }
+                    // Some writes overlap a batch: they begin before it
+                    // and commit after it (or conflict with it).
+                    if r.chance(0.3) {
+                        let done = build_step(&db, &idx).await.unwrap();
+                        match db.commit(t.into_request()).await {
+                            Ok(_) | Err(Error::Conflict(_)) => {}
+                            Err(e) => panic!("commit failed: {e}"),
+                        }
+                        if done.is_some() {
+                            break;
+                        }
+                    } else {
+                        db.commit(t.into_request()).await.unwrap();
+                    }
+                }
+                check(&db).await;
+                steps += 1;
+                let mut t = begin(&db).await;
+                if get_schema(&mut t, "p").await.unwrap().index("ix").unwrap().state == IndexState::Ready {
+                    break;
+                }
+                drop(t);
+                if build_step(&db, &idx).await.unwrap().is_some() {
+                    break;
+                }
+            }
+            assert!(steps > 3, "the build took several batches");
+            check(&db).await;
+        }
+    });
+}
+
+/// Abandoning a build removes only an index still building: one that
+/// another driver finished meanwhile stays.
+#[test]
+fn abandoning_leaves_finished_indexes_alone() {
+    rt().block_on(async {
+        let (eng, _store, _env) = engine(23, EngineConfig::small_for_tests());
+        let db = eng.db("ab");
+        db.open(true).await.unwrap();
+        let mut t = begin(&db).await;
+        create_table(&mut t, &rg_table()).await.unwrap();
+        put_rows(&mut t, "r", 0..10).await;
+        db.commit(t.into_request()).await.unwrap();
+        let opts = Backfill::default();
+        let (s, _) = add_index(&db, "r", &index_spec(json!({"name": "done", "columns": ["g"]})), opts).await.unwrap();
+        let done = s.index("done").unwrap().clone();
+        let mut t = begin(&db).await;
+        let building = begin_index(&mut t, "r", &index_spec(json!({"name": "busy", "columns": ["id"]}))).await.unwrap();
+        db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        abandon_index(&mut t, "r", &done).await.unwrap();
+        db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        let s = get_schema(&mut t, "r").await.unwrap();
+        assert_eq!(s.index("done").map(|i| i.state), Some(IndexState::Ready), "a finished index was abandoned");
+        assert_eq!(s.index("busy").map(|i| i.state), Some(IndexState::Building));
+        check_indexes(&mut t, "r").await.unwrap();
+        abandon_index(&mut t, "r", &building).await.unwrap();
+        db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        assert!(get_schema(&mut t, "r").await.unwrap().index("busy").is_none());
+        check_indexes(&mut t, "r").await.unwrap();
+        check_no_orphans(&mut t).await.unwrap();
+    });
+}
+
+/// A unique index over duplicate values is removed again, whether the
+/// duplicates predate the build or are written behind its cursor.
+#[test]
+fn unique_violations_abandon_the_build() {
+    rt().block_on(async {
+        let db = people(32, 40).await;
         let blobs = BlobResolver { db: &db };
         let mut t = begin(&db).await;
-        let def = table_def(json!({
-            "name": "r",
-            "columns": [{"name": "id", "type": "int"}, {"name": "g", "type": "int"}],
-            "primary_key": ["id"]
-        }));
-        create_table(&mut t, &def).await.unwrap();
-        for id in 0..1001 {
-            insert(&mut t, &blobs, "r", &json!({"id": id, "g": id % 2}), InsertMode::Insert).await.unwrap();
-        }
-        let spec: IndexSpec = serde_json::from_value(json!({"name": "by_g", "columns": ["g"]})).unwrap();
-        add_index(&mut t, "r", &spec).await.unwrap();
-        let mut q: Query = serde_json::from_value(json!({"index": "by_g", "limit": 1000})).unwrap();
-        let mut n = 0;
-        loop {
-            let r = query(&mut t, "r", &q).await.unwrap();
-            n += r.rows.len();
-            match r.next_cursor {
-                Some(c) => q.cursor = Some(c),
-                None => break,
-            }
-        }
-        assert_eq!(n, 1001);
+        insert(&mut t, &blobs, "p", &json!({"id": 100, "email": "e3"}), InsertMode::Insert).await.unwrap();
+        db.commit(t.into_request()).await.unwrap();
+        let spec = index_spec(json!({"name": "u", "columns": ["email"], "unique": true}));
+        let e = add_index(&db, "p", &spec, small()).await;
+        assert!(matches!(e, Err(Error::AlreadyExists(_))), "{e:?}");
+        let mut t = begin(&db).await;
+        assert!(get_schema(&mut t, "p").await.unwrap().index("u").is_none());
+        drop(t);
+        check(&db).await;
+
+        // Behind the cursor, a write that duplicates a backfilled value is
+        // refused like on a ready index.
+        let mut t = begin(&db).await;
+        delete(&mut t, "p", &json!(100)).await.unwrap();
+        db.commit(t.into_request()).await.unwrap();
+        let idx = start_build(&db, &spec).await;
+        build_step(&db, &idx).await.unwrap();
+        let mut t = begin(&db).await;
+        let e = insert(&mut t, &blobs, "p", &json!({"id": 101, "email": "e0"}), InsertMode::Insert).await;
+        assert!(matches!(e, Err(Error::AlreadyExists(_))), "{e:?}");
+        // Ahead of it, the duplicate is found by the backfill.
+        insert(&mut t, &blobs, "p", &json!({"id": 102, "email": "e39"}), InsertMode::Insert).await.unwrap();
+        db.commit(t.into_request()).await.unwrap();
+        check(&db).await;
+        let e = add_index(&db, "p", &spec, small()).await;
+        assert!(matches!(e, Err(Error::AlreadyExists(_))), "{e:?}");
+        check(&db).await;
+    });
+}
+
+/// An interrupted build is resumed by adding the same index again; a
+/// different index of the same name is refused meanwhile.
+#[test]
+fn interrupted_builds_resume() {
+    rt().block_on(async {
+        let db = people(33, 50).await;
+        let spec = index_spec(json!({"name": "by_g", "columns": ["g"]}));
+        let idx = start_build(&db, &spec).await;
+        assert!(build_step(&db, &idx).await.unwrap().is_none());
+        assert!(build_step(&db, &idx).await.unwrap().is_none());
+        check(&db).await;
+        let other = index_spec(json!({"name": "by_g", "columns": ["email"]}));
+        assert!(matches!(add_index(&db, "p", &other, small()).await, Err(Error::AlreadyExists(_))));
+        let (s, _) = add_index(&db, "p", &spec, small()).await.unwrap();
+        let i = s.index("by_g").unwrap();
+        assert_eq!((i.id, i.state), (idx.id, IndexState::Ready), "the same index was finished");
+        check(&db).await;
+        // A second driver of the same build finds it finished.
+        assert_eq!(
+            build_step(&db, &idx).await.unwrap().map(|s| s.index("by_g").unwrap().state),
+            Some(IndexState::Ready)
+        );
+        assert!(matches!(add_index(&db, "p", &spec, small()).await, Err(Error::AlreadyExists(_))));
+    });
+}
+
+/// Dropping a building index (or its table) stops the build and leaves
+/// nothing behind.
+#[test]
+fn dropping_a_building_index_stops_its_build() {
+    rt().block_on(async {
+        let db = people(34, 30).await;
+        let spec = index_spec(json!({"name": "by_g", "columns": ["g"]}));
+        let idx = start_build(&db, &spec).await;
+        build_step(&db, &idx).await.unwrap();
+        let mut t = begin(&db).await;
+        drop_index(&mut t, "p", "by_g").await.unwrap();
+        db.commit(t.into_request()).await.unwrap();
+        check(&db).await;
+        assert!(matches!(build_step(&db, &idx).await, Err(Error::NotFound(_))));
+
+        let idx = start_build(&db, &spec).await;
+        build_step(&db, &idx).await.unwrap();
+        let mut t = begin(&db).await;
+        drop_table(&mut t, "p").await.unwrap();
+        db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        check_no_orphans(&mut t).await.unwrap();
+        assert!(matches!(build_step(&db, &idx).await, Err(Error::NotFound(_))));
+    });
+}
+
+/// Queries cannot use an index before its backfill finishes.
+#[test]
+fn building_indexes_cannot_be_queried() {
+    rt().block_on(async {
+        let db = people(35, 20).await;
+        let idx = start_build(&db, &index_spec(json!({"name": "by_g", "columns": ["g"]}))).await;
+        build_step(&db, &idx).await.unwrap();
+        let q: Query = serde_json::from_value(json!({"index": "by_g", "eq": [1]})).unwrap();
+        let mut t = begin(&db).await;
+        let s = get_schema(&mut t, "p").await.unwrap();
+        assert_eq!(s.to_json()["indexes"][0]["state"], json!("building"));
+        assert!(matches!(query(&mut t, "p", &q).await, Err(Error::Unavailable { .. })));
+        drop(t);
+        while build_step(&db, &idx).await.unwrap().is_none() {}
+        let mut t = begin(&db).await;
+        assert_eq!(query(&mut t, "p", &q).await.unwrap().rows.len(), 7);
+    });
+}
+
+/// The checker for building indexes rejects entries missing behind the
+/// cursor and stale entries anywhere.
+#[test]
+fn building_index_checker_rejects_corruption() {
+    rt().block_on(async {
+        let db = people(36, 30).await;
+        let idx = start_build(&db, &index_spec(json!({"name": "by_g", "columns": ["g"]}))).await;
+        build_step(&db, &idx).await.unwrap();
+        check(&db).await;
+        let mut t = begin(&db).await;
+        let s = get_schema(&mut t, "p").await.unwrap();
+        let entries = t.scan(&KeyRange::prefix(&index_prefix(s.id, idx.id)), false, 100).await.unwrap();
+        assert_eq!(entries.len(), 7);
+        t.delete(entries[3].key.clone()).unwrap();
+        assert!(check_indexes(&mut t, "p").await.is_err(), "missing backfilled entry not detected");
+        let mut t = begin(&db).await;
+        let mut k = index_prefix(s.id, idx.id);
+        k.extend_from_slice(&tuple::encode(&[Key::Int(9), Key::Int(9)]));
+        t.put(Bytes::from(k), Value::Inline(Bytes::new())).unwrap();
+        assert!(check_indexes(&mut t, "p").await.is_err(), "stale entry not detected");
+        let mut t = begin(&db).await;
+        t.delete(backfill_key(s.id, idx.id)).unwrap();
+        assert!(check_indexes(&mut t, "p").await.is_err(), "missing cursor not detected");
     });
 }

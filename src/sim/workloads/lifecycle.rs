@@ -51,6 +51,7 @@ pub async fn run(sim: Arc<Sim>, cycles: usize, chaos: bool) -> Result<(), String
         h.abort();
     }
     super::recover(&sim).await;
+    super::check_db_counts(&sim).await?;
     // Wait for two purge passes (grace periods) plus reaper intervals.
     sim.sleep(2 * sim.cfg.node.db_delete_grace_ms + 3 * 60_000).await;
     let keys = sim.mem.keys();

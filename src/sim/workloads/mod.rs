@@ -76,6 +76,15 @@ pub async fn recover(sim: &Arc<Sim>) {
     sim.sleep(2 * sim.cfg.engine.lease_ms).await;
 }
 
+/// Every owner's database count in the system database matches its
+/// databases (read directly through a node's engine).
+pub async fn check_db_counts(sim: &Arc<Sim>) -> Result<(), String> {
+    let n = sim.up_nodes().first().copied().ok_or("no node up")?;
+    let node = sim.node(n).ok_or("node gone")?.node.clone();
+    let mut t = crate::node::retry_unavailable(|| node.sys_read_strong()).await.map_err(|e| e.to_string())?;
+    crate::meta::check_db_counts(&mut t).await.map_err(|e| e.to_string())
+}
+
 /// Spawn a chaos loop; abort the returned handle to stop it.
 pub fn spawn_chaos(sim: &Arc<Sim>) -> tokio::task::JoinHandle<()> {
     let sim = sim.clone();
@@ -141,12 +150,13 @@ fn blob_gc_cfg() -> super::SimConfig {
     blob_gc_race::config(super::SimConfig::faulty(3))
 }
 
-/// Hostile, but with clocks well within the shrunken grace periods (GC
-/// safety assumes clock skew far below them).
+/// Hostile, with node clocks hours apart and jumping by up to an hour:
+/// collection runs on the store's clock, so grace periods of a second or
+/// two must hold regardless.
 fn blob_gc_hostile_cfg() -> super::SimConfig {
     let mut c = blob_gc_race::config(super::SimConfig::hostile(3));
-    c.max_skew_ms = 150;
-    c.chaos.clock_step_max_ms = 0;
+    c.max_skew_ms = 3_600_000;
+    c.chaos.clock_step_max_ms = 3_600_000;
     c
 }
 

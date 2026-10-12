@@ -5,11 +5,11 @@
 pub mod schema;
 pub mod tuple;
 
-use crate::engine::{BlobRef, Db, KeyRange, ReadValue, Txn, Value, blob};
+use crate::engine::{BlobRef, Consistency, Db, Isolation, KeyRange, ReadValue, Seq, Txn, Value, blob};
 use crate::error::{Error, Result};
 use crate::util::b64;
 use bytes::Bytes;
-use schema::{ColType, Column, Datum, IndexDef, Row, TableSchema, datum_from_json, key_from_json};
+use schema::{ColType, Column, Datum, IndexDef, IndexState, Row, TableSchema, datum_from_json, key_from_json};
 use serde::Deserialize;
 use serde_json::{Map, Value as Json};
 use std::collections::BTreeSet;
@@ -23,13 +23,23 @@ pub const SPACE_ROWS: u8 = 0x02;
 pub const SPACE_INDEX: u8 = 0x03;
 pub const SPACE_ROW_BLOBS: u8 = 0x04;
 
-pub const MAX_BACKFILL_ROWS: usize = 100_000;
 const MAX_EXAMINED_PER_QUERY: usize = 10_000;
 
 fn catalog_key(name: &str) -> Bytes {
     let mut k = vec![SPACE_CATALOG];
     k.extend_from_slice(b"t/");
     k.extend_from_slice(name.as_bytes());
+    Bytes::from(k)
+}
+
+/// The progress of a building index: the key of the last row backfilled
+/// (empty before the first batch). Kept out of the schema, which every row
+/// write pins, so that backfill batches do not conflict with row writes.
+fn backfill_key(tid: u32, iid: u32) -> Bytes {
+    let mut k = vec![SPACE_CATALOG];
+    k.extend_from_slice(b"b/");
+    k.extend_from_slice(&tid.to_be_bytes());
+    k.extend_from_slice(&iid.to_be_bytes());
     Bytes::from(k)
 }
 
@@ -175,6 +185,7 @@ pub async fn create_table(txn: &mut Txn, def: &CreateTable) -> Result<TableSchem
             name: i.name.clone(),
             columns: i.columns.clone(),
             unique: i.unique,
+            state: IndexState::Ready,
         });
         s.next_index_id += 1;
     }
@@ -188,6 +199,9 @@ pub async fn drop_table(txn: &mut Txn, name: &str) -> Result<()> {
     let s = get_schema(txn, name).await?;
     for space in [SPACE_ROWS, SPACE_INDEX, SPACE_ROW_BLOBS] {
         txn.delete_range(KeyRange::prefix(&table_prefix(space, s.id)))?;
+    }
+    for i in s.indexes.iter().filter(|i| i.state == IndexState::Building) {
+        txn.delete(backfill_key(s.id, i.id))?;
     }
     txn.delete(catalog_key(name))
 }
@@ -236,33 +250,182 @@ pub async fn drop_column(txn: &mut Txn, table: &str, name: &str) -> Result<Table
     Ok(s)
 }
 
-pub async fn add_index(txn: &mut Txn, table: &str, spec: &IndexSpec) -> Result<TableSchema> {
+/// Batch sizes of an index backfill (see [`add_index`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Backfill {
+    /// Rows read per batch transaction.
+    pub batch_rows: usize,
+    /// Index bytes written per batch transaction (a batch stops early once
+    /// it has written this much).
+    pub batch_bytes: usize,
+}
+
+impl Default for Backfill {
+    fn default() -> Backfill {
+        Backfill { batch_rows: 1000, batch_bytes: 1 << 20 }
+    }
+}
+
+/// Conflicts a backfill transaction retries before giving up.
+const BACKFILL_RETRIES: u32 = 50;
+
+/// Run `$body` (with `$t: &mut Txn`) in a serializable transaction on
+/// `$db`, retrying conflicts. Evaluates to `(T, Seq)`; returns errors from
+/// the enclosing function.
+macro_rules! retrying_txn {
+    ($db:expr, |$t:ident| $body:expr) => {{
+        let mut attempt_ = 0u32;
+        loop {
+            let mut txn_ = $db.begin(Isolation::Serializable, Consistency::Strong).await?;
+            let out_ = {
+                let $t: &mut Txn = &mut txn_;
+                $body
+            }?;
+            match $db.commit(txn_.into_request()).await {
+                Ok(v) => break (out_, v),
+                Err(Error::Conflict(_)) if attempt_ < BACKFILL_RETRIES => {
+                    attempt_ += 1;
+                    let d = 5 * (1u64 << attempt_.min(6)) + $db.shared().env.random_below(10);
+                    tokio::time::sleep(std::time::Duration::from_millis(d)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }};
+}
+
+/// Add an index to a table without blocking writes to it.
+///
+/// The index is first added in the `building` state, in which every row
+/// write maintains it but queries cannot use it yet. It is then backfilled
+/// from the table's rows in batches of separate transactions, the last of
+/// which marks it ready. Returns the schema and the version of that last
+/// transaction.
+///
+/// If the build is interrupted (a crash, a lost connection), the index
+/// stays `building`; calling `add_index` again with the same definition
+/// resumes it. A unique index whose rows turn out to hold duplicate values
+/// is removed again, and the call fails with `AlreadyExists`.
+pub async fn add_index(db: &Arc<Db>, table: &str, spec: &IndexSpec, opts: Backfill) -> Result<(TableSchema, Seq)> {
+    let (idx, _) = retrying_txn!(db, |t| begin_index(t, table, spec).await);
+    match backfill(db, table, &idx, opts).await {
+        Err(Error::AlreadyExists(m)) => {
+            retrying_txn!(db, |t| abandon_index(t, table, &idx).await);
+            Err(Error::AlreadyExists(m))
+        }
+        other => other,
+    }
+}
+
+/// Add `spec` to the table as a building index, or find the building
+/// index with the same definition to resume.
+async fn begin_index(txn: &mut Txn, table: &str, spec: &IndexSpec) -> Result<IndexDef> {
     let mut s = get_schema(txn, table).await?;
-    if s.index(&spec.name).is_some() {
+    if let Some(i) = s.index(&spec.name) {
+        if i.state == IndexState::Building && i.columns == spec.columns && i.unique == spec.unique {
+            return Ok(i.clone());
+        }
         return Err(Error::AlreadyExists(format!("index {:?} already exists", spec.name)));
     }
-    let idx =
-        IndexDef { id: s.next_index_id, name: spec.name.clone(), columns: spec.columns.clone(), unique: spec.unique };
+    let idx = IndexDef {
+        id: s.next_index_id,
+        name: spec.name.clone(),
+        columns: spec.columns.clone(),
+        unique: spec.unique,
+        state: IndexState::Building,
+    };
     s.validate_index(&idx)?;
     s.next_index_id += 1;
     s.indexes.push(idx.clone());
-    let rows = all_rows(txn, &s, MAX_BACKFILL_ROWS).await?;
-    let mut seen = BTreeSet::new();
-    for (pk, row) in &rows {
-        let (k, v) = index_entry(&s, &idx, row, pk)?;
-        if !seen.insert(k.clone()) {
+    put_schema(txn, &s)?;
+    txn.put(backfill_key(s.id, idx.id), Value::Inline(Bytes::new()))?;
+    Ok(idx)
+}
+
+async fn backfill(db: &Arc<Db>, table: &str, idx: &IndexDef, opts: Backfill) -> Result<(TableSchema, Seq)> {
+    loop {
+        if let (Some(s), v) = retrying_txn!(db, |t| backfill_batch(t, table, idx, opts).await) {
+            return Ok((s, v));
+        }
+    }
+}
+
+/// Backfill the next batch of rows into `idx`. Returns the schema once the
+/// index is ready.
+async fn backfill_batch(txn: &mut Txn, table: &str, idx: &IndexDef, opts: Backfill) -> Result<Option<TableSchema>> {
+    let mut s = get_schema(txn, table).await?;
+    let state = s.indexes.iter().find(|i| i.id == idx.id).map(|i| i.state);
+    match state {
+        None => return Err(Error::not_found(format!("index {:?} was dropped while it was being built", idx.name))),
+        Some(IndexState::Ready) => return Ok(Some(s)),
+        Some(IndexState::Building) => {}
+    }
+    let ck = backfill_key(s.id, idx.id);
+    let cursor = match txn.get(&ck).await? {
+        Some(ReadValue { value: Value::Inline(c), .. }) => c,
+        _ => return Err(Error::internal(format!("index {:?} has no backfill cursor", idx.name))),
+    };
+    let prefix = table_prefix(SPACE_ROWS, s.id);
+    let mut range = KeyRange::prefix(&prefix);
+    if !cursor.is_empty() {
+        range.start = Bound::Excluded(cursor);
+    }
+    let batch = opts.batch_rows.max(1);
+    let page = txn.scan(&range, false, batch).await?;
+    let mut last = None;
+    let (mut bytes, mut written) = (0, 0);
+    for it in &page {
+        let (pk, row) = decode_stored_row(&s, &prefix, it)?;
+        let (k, v) = index_entry(&s, idx, &row, &pk)?;
+        if idx.unique
+            && !v.is_empty()
+            && let Some(existing) = txn.get(&k).await?
+            && !matches!(&existing.value, Value::Inline(b) if *b == v)
+        {
             return Err(Error::AlreadyExists(format!("duplicate values for unique index {:?}", idx.name)));
         }
+        bytes += k.len() + v.len();
         txn.put(k, Value::Inline(v))?;
+        last = Some(it.key.clone());
+        written += 1;
+        if bytes >= opts.batch_bytes {
+            break;
+        }
+    }
+    // A short page read to its end leaves no rows behind it.
+    let done = written == page.len() && page.len() < batch;
+    if !done {
+        let last = last.ok_or_else(|| Error::internal("empty backfill batch"))?;
+        txn.put(ck, Value::Inline(last))?;
+        return Ok(None);
+    }
+    txn.delete(ck)?;
+    for i in s.indexes.iter_mut().filter(|i| i.id == idx.id) {
+        i.state = IndexState::Ready;
     }
     put_schema(txn, &s)?;
-    Ok(s)
+    Ok(Some(s))
+}
+
+/// Remove a building index and everything written for it.
+async fn abandon_index(txn: &mut Txn, table: &str, idx: &IndexDef) -> Result<()> {
+    let mut s = get_schema(txn, table).await?;
+    if s.indexes.iter().any(|i| i.id == idx.id && i.state == IndexState::Building) {
+        txn.delete_range(KeyRange::prefix(&index_prefix(s.id, idx.id)))?;
+        txn.delete(backfill_key(s.id, idx.id))?;
+        s.indexes.retain(|i| i.id != idx.id);
+        put_schema(txn, &s)?;
+    }
+    Ok(())
 }
 
 pub async fn drop_index(txn: &mut Txn, table: &str, name: &str) -> Result<TableSchema> {
     let mut s = get_schema(txn, table).await?;
     let idx = s.index(name).cloned().ok_or_else(|| Error::not_found(format!("index {name:?} not found")))?;
     txn.delete_range(KeyRange::prefix(&index_prefix(s.id, idx.id)))?;
+    if idx.state == IndexState::Building {
+        txn.delete(backfill_key(s.id, idx.id))?;
+    }
     s.indexes.retain(|i| i.name != name);
     put_schema(txn, &s)?;
     Ok(s)
@@ -550,24 +713,27 @@ impl Pages {
     }
 }
 
-/// Every row of a table, with defaults applied. Tables over `max` rows are
-/// refused, as too large to index in one transaction.
-async fn all_rows(txn: &mut Txn, s: &TableSchema, max: usize) -> Result<Vec<(Vec<Key>, Row)>> {
+/// A row as stored under `prefix` (the table's row space), with defaults
+/// applied and without its blob columns.
+fn decode_stored_row(s: &TableSchema, prefix: &[u8], it: &ReadValue) -> Result<(Vec<Key>, Row)> {
+    let pk = tuple::decode_all(&it.key[prefix.len()..])?;
+    let Value::Inline(d) = &it.value else {
+        return Err(Error::internal("row stored out of line"));
+    };
+    let mut row = schema::decode_row(d)?;
+    fill_defaults(s, &mut row)?;
+    Ok((pk, row))
+}
+
+/// Every row of a table by row key, with defaults applied.
+async fn all_rows(txn: &mut Txn, s: &TableSchema) -> Result<Vec<(Bytes, Vec<Key>, Row)>> {
     let prefix = table_prefix(SPACE_ROWS, s.id);
     let mut out = Vec::new();
     let mut pages = Pages::new(KeyRange::prefix(&prefix));
     while let Some(page) = pages.next(txn).await? {
         for it in &page {
-            let pk = tuple::decode_all(&it.key[prefix.len()..])?;
-            let Value::Inline(d) = &it.value else {
-                return Err(Error::internal("row stored out of line"));
-            };
-            let mut row = schema::decode_row(d)?;
-            fill_defaults(s, &mut row)?;
-            out.push((pk, row));
-            if out.len() > max {
-                return Err(Error::TooLarge(format!("tables over {max} rows cannot be indexed in one transaction")));
-            }
+            let (pk, row) = decode_stored_row(s, &prefix, it)?;
+            out.push((it.key.clone(), pk, row));
         }
     }
     Ok(out)
@@ -757,6 +923,13 @@ pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult>
         None => (table_prefix(SPACE_ROWS, s.id), s.primary_key.clone(), None),
         Some(name) => {
             let idx = s.index(name).cloned().ok_or_else(|| Error::not_found(format!("index {name:?} not found")))?;
+            if idx.state == IndexState::Building {
+                return Err(Error::Unavailable {
+                    message: format!("index {name:?} is still being built"),
+                    retry_after_ms: Some(1000),
+                    outcome_unknown: false,
+                });
+            }
             (index_prefix(s.id, idx.id), idx.columns.clone(), Some(idx))
         }
     };
@@ -867,25 +1040,54 @@ pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult>
 
 /// Recompute every index of a table from its rows and compare with the
 /// stored index entries (consistency checker used by tests and the DST).
+/// A building index must hold the entries of every row its backfill has
+/// passed, and no entry that matches no row.
 pub async fn check_indexes(txn: &mut Txn, table: &str) -> Result<()> {
+    use std::collections::BTreeMap;
     let s = get_schema(txn, table).await?;
-    let rows = all_rows(txn, &s, usize::MAX).await?;
+    let rows = all_rows(txn, &s).await?;
     for idx in &s.indexes {
-        let mut want = std::collections::BTreeMap::new();
-        for (pk, row) in &rows {
-            let (k, v) = index_entry(&s, idx, row, pk)?;
-            if want.insert(k, v).is_some() {
-                return Err(Error::internal(format!("unique index {} violated", idx.name)));
-            }
-        }
         let stored = txn.scan(&KeyRange::prefix(&index_prefix(s.id, idx.id)), false, usize::MAX).await?;
-        let got: std::collections::BTreeMap<Bytes, Bytes> = stored
+        let got: BTreeMap<Bytes, Bytes> = stored
             .into_iter()
             .map(|it| match it.value {
                 Value::Inline(v) => (it.key, v),
                 _ => (it.key, Bytes::new()),
             })
             .collect();
+        if idx.state == IndexState::Building {
+            let cursor = match txn.get(&backfill_key(s.id, idx.id)).await? {
+                Some(ReadValue { value: Value::Inline(c), .. }) => c,
+                _ => return Err(Error::internal(format!("building index {} has no backfill cursor", idx.name))),
+            };
+            let mut all = BTreeSet::new();
+            for (key, pk, row) in &rows {
+                let entry = index_entry(&s, idx, row, pk)?;
+                if key <= &cursor && got.get(&entry.0) != Some(&entry.1) {
+                    return Err(Error::internal(format!(
+                        "building index {}.{} misses a backfilled row",
+                        table, idx.name
+                    )));
+                }
+                all.insert(entry);
+            }
+            if let Some((k, _)) = got.iter().find(|(k, v)| !all.contains(&((*k).clone(), (*v).clone()))) {
+                return Err(Error::internal(format!(
+                    "building index {}.{} has a stale entry {}",
+                    table,
+                    idx.name,
+                    b64::hex(k)
+                )));
+            }
+            continue;
+        }
+        let mut want = BTreeMap::new();
+        for (_, pk, row) in &rows {
+            let (k, v) = index_entry(&s, idx, row, pk)?;
+            if want.insert(k, v).is_some() {
+                return Err(Error::internal(format!("unique index {} violated", idx.name)));
+            }
+        }
         if got != want {
             return Err(Error::internal(format!(
                 "index {}.{} inconsistent: {} stored vs {} expected",
@@ -908,6 +1110,15 @@ pub async fn check_no_orphans(txn: &mut Txn) -> Result<()> {
     let live_idx: BTreeSet<(u32, u32)> = tables.iter().flat_map(|s| s.indexes.iter().map(|i| (s.id, i.id))).collect();
     let blob_cols: BTreeSet<(u32, u32)> =
         tables.iter().flat_map(|s| s.columns.iter().filter(|c| c.ty == ColType::Blob).map(|c| (s.id, c.id))).collect();
+    let building: BTreeSet<Bytes> = tables
+        .iter()
+        .flat_map(|s| s.indexes.iter().filter(|i| i.state == IndexState::Building).map(|i| backfill_key(s.id, i.id)))
+        .collect();
+    for it in txn.scan(&KeyRange::prefix(&[SPACE_CATALOG, b'b', b'/']), false, usize::MAX).await? {
+        if !building.contains(&it.key) {
+            return Err(Error::internal(format!("orphaned backfill cursor {}", b64::hex(&it.key))));
+        }
+    }
     let all = KeyRange::half_open(Bytes::from_static(&[SPACE_ROWS]), Some(Bytes::from_static(&[SPACE_ROW_BLOBS + 1])));
     let id_at = |k: &[u8], at: usize| k.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
     // Rows sort before their blobs (SPACE_ROWS < SPACE_ROW_BLOBS).

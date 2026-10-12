@@ -8,7 +8,8 @@ pub struct Bloom {
     k: u8,
 }
 
-fn hash64(key: &[u8]) -> u64 {
+/// The hash a filter uses for `key` (see [`Bloom::insert_hash`]).
+pub fn key_hash(key: &[u8]) -> u64 {
     // FNV-1a followed by a SplitMix finalizer for better bit dispersion.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in key {
@@ -36,7 +37,11 @@ impl Bloom {
     }
 
     pub fn insert(&mut self, key: &[u8]) {
-        let h = hash64(key);
+        self.insert_hash(key_hash(key));
+    }
+
+    /// Insert a key by its [`key_hash`], so builders need not keep keys.
+    pub fn insert_hash(&mut self, h: u64) {
         let (mut a, b) = (h, h.rotate_left(32) | 1);
         let nbits = self.nbits();
         for _ in 0..self.k {
@@ -50,7 +55,7 @@ impl Bloom {
         if self.bits.is_empty() {
             return true;
         }
-        let h = hash64(key);
+        let h = key_hash(key);
         let (mut a, b) = (h, h.rotate_left(32) | 1);
         let nbits = self.nbits();
         for _ in 0..self.k {

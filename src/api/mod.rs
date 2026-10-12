@@ -152,15 +152,16 @@ pub struct DbCtx {
 
 /// The commit deadline of a request: `commit_timeout_ms` after it arrived,
 /// or the earlier deadline a forwarding node passed along. The passed
-/// deadline is wall-clock time, so it is capped at `commit_timeout_ms` from
-/// now: a skewed clock can shorten it, never extend it.
+/// deadline is in cluster time ([`Node::now_ms`]) and capped at
+/// `commit_timeout_ms` from now, so clock errors can shorten it, never
+/// extend it.
 fn request_deadline(node: &Node, headers: &HeaderMap) -> tokio::time::Instant {
     let timeout = node.cfg.engine.commit_timeout_ms;
     let remaining = headers
         .get(DEADLINE_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
-        .map_or(timeout, |d| d.saturating_sub(node.env.now_ms()).min(timeout));
+        .map_or(timeout, |d| d.saturating_sub(node.now_ms()).min(timeout));
     tokio::time::Instant::now() + std::time::Duration::from_millis(remaining)
 }
 
@@ -325,7 +326,7 @@ fn tag_forward(node: &Node, req: &mut http::Request<Body>, target: &str, deadlin
         req.headers_mut().insert(FORWARD_TO_HEADER, v);
     }
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis() as u64;
-    req.headers_mut().insert(DEADLINE_HEADER, HeaderValue::from(node.env.now_ms() + remaining));
+    req.headers_mut().insert(DEADLINE_HEADER, HeaderValue::from(node.now_ms() + remaining));
 }
 
 /// Execute each forwarded request once, however often the network

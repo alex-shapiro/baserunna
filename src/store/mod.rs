@@ -105,6 +105,11 @@ pub trait ObjectStore: Send + Sync + 'static {
     /// Objects with the given prefix and key > `start_after`, in key order.
     fn list<'a>(&'a self, prefix: &'a str, start_after: Option<&'a str>, limit: usize)
     -> BoxFut<'a, SResult<ListPage>>;
+    /// How coarsely `last_modified_ms` is truncated (S3 and HTTP dates:
+    /// whole seconds).
+    fn time_precision_ms(&self) -> u64 {
+        1_000
+    }
 }
 
 pub type DynStore = Arc<dyn ObjectStore>;

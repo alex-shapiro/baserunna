@@ -44,6 +44,19 @@ pub struct IndexDef {
     pub name: String,
     pub columns: Vec<String>,
     pub unique: bool,
+    #[serde(default)]
+    pub state: IndexState,
+}
+
+/// Every row write maintains an index in either state, but only a ready
+/// index is complete enough to answer queries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexState {
+    #[default]
+    Ready,
+    /// Being backfilled from the table's rows (see `table::add_index`).
+    Building,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -250,7 +263,7 @@ impl TableSchema {
                 o
             }).collect::<Vec<_>>(),
             "primary_key": self.primary_key,
-            "indexes": self.indexes.iter().map(|i| json!({"name": i.name, "columns": i.columns, "unique": i.unique})).collect::<Vec<_>>(),
+            "indexes": self.indexes.iter().map(|i| json!({"name": i.name, "columns": i.columns, "unique": i.unique, "state": i.state})).collect::<Vec<_>>(),
         })
     }
 }
@@ -375,12 +388,24 @@ mod tests {
                 Column { id: 3, name: "meta".into(), ty: ColType::Json, nullable: true, default: None },
             ],
             primary_key: vec!["id".into()],
-            indexes: vec![IndexDef { id: 1, name: "by_email".into(), columns: vec!["email".into()], unique: true }],
+            indexes: vec![IndexDef {
+                id: 1,
+                name: "by_email".into(),
+                columns: vec!["email".into()],
+                unique: true,
+                state: IndexState::Ready,
+            }],
             next_column_id: 4,
             next_index_id: 2,
         };
         s.validate().unwrap();
-        s.indexes.push(IndexDef { id: 2, name: "bad".into(), columns: vec!["meta".into()], unique: false });
+        s.indexes.push(IndexDef {
+            id: 2,
+            name: "bad".into(),
+            columns: vec!["meta".into()],
+            unique: false,
+            state: IndexState::Ready,
+        });
         assert!(s.validate().is_err());
         s.indexes.pop();
         s.primary_key = vec!["email".into()];

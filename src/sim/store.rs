@@ -295,4 +295,8 @@ impl ObjectStore for SimStore {
             Ok(p)
         })
     }
+
+    fn time_precision_ms(&self) -> u64 {
+        self.mem.time_precision_ms()
+    }
 }

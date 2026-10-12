@@ -246,10 +246,13 @@ fn schemas() -> Value {
         "ColumnType": enum_of(&["string", "int", "float", "bool", "bytes", "json", "blob"]),
         "Column": obj(json!({"name": s(), "type": r("ColumnType"), "nullable": b(), "default": any()}), &["name", "type"]),
         "Index": obj(json!({"name": s(), "columns": arr(s()), "unique": b()}), &["name", "columns"]),
+        "IndexInfo": obj_desc(json!({"name": s(), "columns": arr(s()), "unique": b(),
+            "state": enum_of(&["ready", "building"])}), &["name", "columns", "unique", "state"],
+            "A `building` index is maintained by writes but cannot be queried until its backfill finishes."),
         "CreateTable": obj(json!({"name": s(), "columns": arr(r("Column")), "primary_key": arr(s()),
             "indexes": arr(r("Index")), "if_not_exists": b()}), &["name", "columns", "primary_key"]),
         "TableSchema": obj(json!({"name": s(), "columns": arr(r("Column")), "primary_key": arr(s()),
-            "indexes": arr(r("Index")), "version": i()}), &["name", "columns", "primary_key", "indexes"]),
+            "indexes": arr(r("IndexInfo")), "version": i()}), &["name", "columns", "primary_key", "indexes"]),
         "Row": {"type": "object", "additionalProperties": true,
             "description": "Column name to value. `bytes` are base64; `blob` columns take a staged `blob_id` \
                 on write and return BlobMeta on read."},
@@ -683,7 +686,13 @@ fn paths() -> Value {
         Op {
             body: Some(json_body(r("Index"))),
             params: vec![db(), table()],
-            ..op("Add an index (backfilled transactionally)", "tables", vec![("200", resp("Schema", r("TableSchema")))])
+            desc: Some(
+                "Adds the index in the `building` state, backfills it from the table's rows in batches of \
+                 separate transactions while writes continue, and returns once it is `ready`. If the request \
+                 fails midway, the index stays `building`; repeating the request resumes the backfill. A unique \
+                 index over duplicate values is removed again and the request fails with `409 already_exists`.",
+            ),
+            ..op("Add an index (backfilled online)", "tables", vec![("200", resp("Schema", r("TableSchema")))])
         },
     );
     add(

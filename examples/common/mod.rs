@@ -44,7 +44,8 @@ pub async fn start(store: DynStore, name: &str, signup: SignupPolicy) -> Server 
         signup,
         // Fast hashing for demos; production uses 600k iterations.
         pbkdf2_iterations: 10_000,
-        heartbeat_ms: 1_000,
+        heartbeat_ms: 5_000,
+        members_refresh_ms: 1_000,
         ..NodeConfig::default()
     };
     let node =

@@ -4,6 +4,7 @@
 //! current-thread runtime in virtual time, with every random choice drawn
 //! from one seed, so a seed always produces the same trace.
 
+pub mod amp;
 pub mod client;
 pub mod cost;
 pub mod google;
@@ -18,6 +19,7 @@ pub use storage_check::StorageReport;
 use crate::api;
 use crate::cluster::{Transport, TransportError};
 use crate::engine::EngineConfig;
+use crate::engine::local::{LocalTier, MemLocal};
 use crate::env::Env;
 use crate::meta::SignupPolicy;
 use crate::node::{Node, NodeConfig};
@@ -139,12 +141,16 @@ impl SimConfig {
     pub fn basic() -> SimConfig {
         let engine = EngineConfig {
             lease_ms: 3_000,
-            clock_skew_margin_ms: 200,
+            read_lease_ms: 6_000,
+            lease_margin_ms: 200,
             txn_max_lifetime_ms: 30_000,
             gc_grace_ms: 60_000,
             orphan_grace_ms: 400_000,
             blob_stage_ttl_ms: 300_000,
             sweep_interval_ms: 120_000,
+            clock_sync_interval_ms: 30_000,
+            clock_sync_max_age_ms: 120_000,
+            clock_sync_max_error_ms: 100,
             ..EngineConfig::small_for_tests()
         };
         SimConfig {
@@ -156,7 +162,8 @@ impl SimConfig {
             node: NodeConfig {
                 name: "n".into(),
                 pbkdf2_iterations: 10,
-                heartbeat_ms: 1_000,
+                heartbeat_ms: 5_000,
+                members_refresh_ms: 1_000,
                 auth_cache_ms: 1_000,
                 sys_staleness_ms: 200,
                 db_delete_grace_ms: 60_000,
@@ -164,6 +171,7 @@ impl SimConfig {
                 txn_max_ms: 30_000,
                 db_idle_evict_ms: 20_000,
                 json_value_max: 4096,
+                index_backfill_batch_rows: 8,
                 signup: SignupPolicy::Open,
                 engine: engine.clone(),
                 ..NodeConfig::default()
@@ -205,11 +213,11 @@ impl SimConfig {
                 forward_delay_max_ms: 2_000,
                 ..NetFaults::moderate()
             },
-            max_skew_ms: 10 * base.engine.clock_skew_margin_ms,
+            max_skew_ms: 10 * base.engine.lease_margin_ms,
             chaos: ChaosFaults {
                 one_way_partitions: true,
                 store_isolation: true,
-                clock_step_max_ms: 10 * base.engine.clock_skew_margin_ms,
+                clock_step_max_ms: 10 * base.engine.lease_margin_ms,
             },
             ..base
         }
@@ -247,6 +255,8 @@ pub struct Sim {
     pub trace: Arc<Trace>,
     pub google: Arc<google::FakeGoogle>,
     slots: Vec<Mutex<Option<Arc<SimNode>>>>,
+    /// Each node slot's local disk tier, which outlives crashes.
+    disks: Vec<LocalTier>,
     /// Blocked directions `(from, to)` between nodes.
     partitions: Mutex<BTreeSet<(usize, usize)>>,
     /// Nodes that cannot reach the object store.
@@ -280,6 +290,9 @@ fn install_panic_hook() {
 fn take_panic() -> Option<String> {
     PANIC.with(|p| p.borrow_mut().take())
 }
+
+/// A small local tier per node, so that it evicts.
+const LOCAL_TIER_BYTES: u64 = 64 * 1024;
 
 pub fn addr_of(i: usize) -> String {
     format!("sim://n{i}")
@@ -406,6 +419,10 @@ impl ObjectStore for NodeStore {
             self.inner.list(prefix, start_after, limit).await
         })
     }
+
+    fn time_precision_ms(&self) -> u64 {
+        self.inner.time_precision_ms()
+    }
 }
 
 impl Sim {
@@ -432,6 +449,7 @@ impl Sim {
             trace,
             google,
             slots: (0..n).map(|_| Mutex::new(None)).collect(),
+            disks: (0..n).map(|_| LocalTier(Arc::new(MemLocal::new(LOCAL_TIER_BYTES)))).collect(),
             partitions: Mutex::new(BTreeSet::new()),
             store_isolated: Mutex::new(BTreeSet::new()),
             origin,
@@ -490,6 +508,7 @@ impl Sim {
         cfg.addr = addr_of(i);
         cfg.public_url = "https://baserunna.test".into();
         cfg.engine = self.cfg.engine.clone();
+        cfg.engine.local_tier = Some(self.disks[i].clone());
         for attempt in 0..50u64 {
             let env = Arc::new(Env::sim(self.seed ^ (n * 7919 + attempt + 1), self.base_ms, self.origin, skew));
             if self.cfg.keep_log {

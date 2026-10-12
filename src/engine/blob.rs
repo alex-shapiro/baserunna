@@ -2,7 +2,7 @@
 //! objects under `dbs/{db}/blob/{id}/`.
 
 use super::types::{BlobRef, make_blob_id};
-use super::{Shared, blob_chunk_key};
+use super::{EngineConfig, Shared, blob_chunk_key, pin_key};
 use crate::error::{Error, Result};
 use crate::store::{GetOpts, PutMode};
 use crate::util::Sha256;
@@ -23,7 +23,7 @@ pub struct BlobWriter {
 
 impl BlobWriter {
     pub fn new(shared: Arc<Shared>, db: &str, content_type: &str) -> BlobWriter {
-        let id = make_blob_id(shared.env.now_ms(), &shared.env.random_bytes(10));
+        let id = make_blob_id(shared.time_ms(), &shared.env.random_bytes(10));
         BlobWriter {
             buf: Vec::with_capacity(shared.cfg.blob_chunk_size.min(1 << 20)),
             shared,
@@ -99,6 +99,39 @@ pub async fn load_staged(shared: &Shared, db: &str, id: &str) -> Result<BlobRef>
     Ok(r)
 }
 
+/// A read that has streamed a blob for this long pins it, and renews the
+/// pin as often.
+pub fn pin_interval_ms(cfg: &EngineConfig) -> u64 {
+    cfg.gc_grace_ms / 3
+}
+
+/// How long a pin protects its blob, in store time: two renewal intervals
+/// plus the clock error of the reader and the collector.
+pub fn pin_ttl_ms(cfg: &EngineConfig) -> u64 {
+    2 * pin_interval_ms(cfg) + 2 * cfg.clock_sync_max_error_ms
+}
+
+/// Pin a blob that is being read: garbage collection does not delete a
+/// blob whose pin was written within [`pin_ttl_ms`]. A blob is collected
+/// at least `gc_grace` after it stops being referenced, so a read that pins
+/// within [`pin_interval_ms`] of starting, and renews as often, keeps its
+/// blob however long it takes.
+pub async fn pin(shared: &Shared, db: &str, id: &str) -> Result<()> {
+    let key = pin_key(db, id);
+    shared.retry.run(|| shared.store.put(&key, Bytes::new(), PutMode::Overwrite)).await?;
+    Ok(())
+}
+
+/// Whether a fresh pin protects blob `id` at store time `now_ms`.
+pub async fn pinned(shared: &Shared, db: &str, id: &str, now_ms: u64) -> Result<bool> {
+    let key = pin_key(db, id);
+    match shared.retry.run(|| shared.store.get(&key, GetOpts::default())).await {
+        Ok(g) => Ok(g.last_modified_ms + pin_ttl_ms(&shared.cfg) > now_ms),
+        Err(crate::store::StoreError::NotFound) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Write a whole in-memory value as a blob.
 pub async fn write_blob(shared: &Arc<Shared>, db: &str, data: &[u8], content_type: &str) -> Result<BlobRef> {
     let mut w = BlobWriter::new(shared.clone(), db, content_type);
@@ -157,6 +190,17 @@ pub async fn read_range(shared: &Shared, db: &str, blob: &BlobRef, range: Range<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read pins its blob well before `gc_grace` runs out, and renews
+    /// the pin before it lapses.
+    #[test]
+    fn pins_are_written_in_time_and_renewed_before_they_lapse() {
+        for cfg in [EngineConfig::default(), EngineConfig::small_for_tests()] {
+            let (interval, ttl) = (pin_interval_ms(&cfg), pin_ttl_ms(&cfg));
+            assert!(interval > 0 && 2 * interval < cfg.gc_grace_ms, "{interval} ms against {}", cfg.gc_grace_ms);
+            assert_eq!(ttl, 2 * interval + 2 * cfg.clock_sync_max_error_ms, "two renewals and the clock errors");
+        }
+    }
 
     #[test]
     fn plan() {

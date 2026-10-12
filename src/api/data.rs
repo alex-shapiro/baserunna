@@ -2,6 +2,7 @@
 
 use super::body::{BlobBody, Upload, parse_range, read_upload};
 use super::{Auth, DbCtx, JsonBody, Params, consistency_of, percent_decode, with_read, with_txn};
+use crate::engine::manifest::ObjKind;
 use crate::engine::{Consistency, Isolation, Value, blob};
 use crate::error::{Error, Result};
 use crate::meta::{self, MetaCmd};
@@ -322,13 +323,26 @@ async fn stage_blob(Extension(ctx): Extension<DbCtx>, req: Request) -> Result<Re
 async fn get_blob(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, req: Request) -> Result<Response> {
     let id = param(&p, "blob_id")?;
     let r = blob::load_staged(ctx.db.shared(), &ctx.db.id, id).await?;
+    // A blob read by id may be unreferenced already, and collected soon.
+    let doomed = ctx
+        .db
+        .read_version(Consistency::Strong)
+        .await?
+        .m
+        .obsolete
+        .iter()
+        .any(|o| o.kind == ObjKind::Blob && o.id == r.id);
     let range_h = req.headers().get(http::header::RANGE).and_then(|v| v.to_str().ok());
     let range = match parse_range(range_h, r.size) {
         Ok(x) => x,
         Err(_) => return Ok(StatusCode::RANGE_NOT_SATISFIABLE.into_response()),
     };
     let rr = range.clone().unwrap_or(0..r.size);
-    let mut resp = Response::new(Body::new(BlobBody::new(ctx.db.shared().clone(), &ctx.db.id, r.clone(), rr.clone())));
+    let mut body = BlobBody::new(ctx.db.shared().clone(), &ctx.db.id, r.clone(), rr.clone());
+    if doomed {
+        body = body.pinned_first();
+    }
+    let mut resp = Response::new(Body::new(body));
     if range.is_some() {
         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
         if let Ok(v) = HeaderValue::from_str(&format!("bytes {}-{}/{}", rr.start, rr.end.saturating_sub(1), r.size)) {
@@ -525,7 +539,7 @@ async fn begin_txn(
             "txn_id": id,
             "commit_id": commit_hex(cid),
             "read_version": rv,
-            "expires_at": node.env.now_ms() + node.cfg.txn_max_ms,
+            "expires_at": node.now_ms() + node.cfg.txn_max_ms,
             "idle_timeout_ms": node.cfg.txn_idle_ms,
         })),
     )
@@ -704,8 +718,10 @@ async fn add_index(
     Path(p): PathMap,
     JsonBody(i): JsonBody<IndexSpec>,
 ) -> Result<J> {
+    ctx.principal.require_writable()?;
     let name = param(&p, "t")?.to_string();
-    let (s, v) = with_txn!(node, ctx, |t| table::add_index(t, &name, &i).await);
+    let opts = table::Backfill { batch_rows: node.cfg.index_backfill_batch_rows, ..Default::default() };
+    let (s, v) = table::add_index(&ctx.db, &name, &i, opts).await?;
     let mut out = s.to_json();
     out["version"] = json!(v);
     Ok(axum::Json(out))

@@ -65,7 +65,9 @@ All configuration is through environment variables (see SPEC §12):
 | `BASERUNNA_ADMIN_EMAIL` / `_PASSWORD`    | none                      | bootstrap an admin account                                                 |
 | `BASERUNNA_GOOGLE_CLIENT_ID` / `_SECRET` | none                      | enables "Sign in with Google"                                              |
 | `BASERUNNA_CACHE_MB`                     | 512                       | block cache budget                                                         |
-| `BASERUNNA_LEASE_MS`                     | 15000                     | write-failover time bound                                                  |
+| `BASERUNNA_DISK_CACHE_DIR`               | none                      | local disk tier for segment data, kept across restarts                     |
+| `BASERUNNA_DISK_CACHE_MB`                | 10240                     | local disk tier budget                                                     |
+| `BASERUNNA_LEASE_MS`                     | 5000                      | write-failover time bound (leases renewed for reads last 3×)               |
 | `BASERUNNA_LOG`                          | `warn`                    | `error` / `warn` / `info` / `debug`                                        |
 
 For a cluster, run any number of nodes against the same bucket behind any
@@ -95,6 +97,7 @@ cargo run --release --example sim_tool -- trace bank 101863        # print a run
 SIM_SEED=4242 cargo test --test sim sim_bank -- --nocapture        # reproduce one seed
 cd fuzz && cargo +nightly fuzz run http_txn -- -rss_limit_mb=1500  # coverage-guided fuzzing (optional)
 cargo run --release --example cost_model                           # store requests per operation, $/DB/month
+cargo run --release --example amplification                        # compaction's write/space/read amplification
 cargo bench --bench throughput                                     # one node, thousands of active databases
 scripts/mutants.sh                                                 # mutation testing (several hours)
 ```
@@ -102,7 +105,8 @@ scripts/mutants.sh                                                 # mutation te
 ## Layout
 
 ```
-src/engine   storage engine: segments, manifest, versions, group commit, leases, compaction, GC, blobs
+src/engine   storage engine: compressed segments, manifest, versions, group commit, leases,
+             leveled compaction, local disk tier, store clock, GC, blobs
 src/table    tuple encoding, schemas, rows, indexes, queries
 src/ops.rs   the JSON transaction-op language
 src/meta.rs  system database schema and metadata commands (dogfooded on the table layer)

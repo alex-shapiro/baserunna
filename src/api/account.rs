@@ -133,7 +133,7 @@ async fn google_start(State(node): State<Arc<Node>>, q: Params) -> Result<Respon
     let oidc = node.oidc.clone().ok_or_else(|| Error::not_found("Google sign-in is not configured"))?;
     let state = node.env.random_hex(16);
     let ret = safe_return_to(q.get("return_to"));
-    let signed = auth::sign_value(&node.cookie_key(), &format!("{state}|{ret}"), node.env.now_ms() + 600_000);
+    let signed = auth::sign_value(&node.cookie_key(), &format!("{state}|{ret}"), node.now_ms() + 600_000);
     let url = oidc.authorize_url(&state, &redirect_uri(&node));
     let mut r = (StatusCode::FOUND, [(http::header::LOCATION, url)]).into_response();
     let secure = if node.cfg.secure_cookies { "; Secure" } else { "" };
@@ -152,8 +152,7 @@ async fn google_callback(State(node): State<Arc<Node>>, headers: HeaderMap, q: P
         return Err(bad(e));
     }
     let signed = cookie(&headers, OAUTH_COOKIE).ok_or_else(|| bad("missing state cookie"))?;
-    let payload =
-        auth::verify_signed(&node.cookie_key(), &signed, node.env.now_ms()).ok_or_else(|| bad("bad state"))?;
+    let payload = auth::verify_signed(&node.cookie_key(), &signed, node.now_ms()).ok_or_else(|| bad("bad state"))?;
     let (state, ret) = payload.split_once('|').ok_or_else(|| bad("bad state"))?;
     if q.get("state").map(|s| s.as_str()) != Some(state) {
         return Err(bad("state mismatch"));
@@ -161,7 +160,7 @@ async fn google_callback(State(node): State<Arc<Node>>, headers: HeaderMap, q: P
     let code = q.get("code").ok_or_else(|| bad("missing code"))?;
     let id_token = oidc.exchange_code(code, &redirect_uri(&node)).await?;
     let jwks = oidc.jwks().await?;
-    let claims = auth::verify_id_token(&id_token, &jwks, oidc.client_id(), oidc.issuers(), node.env.now_ms())?;
+    let claims = auth::verify_id_token(&id_token, &jwks, oidc.client_id(), oidc.issuers(), node.now_ms())?;
     let r = node
         .run_meta(MetaCmd::GoogleLogin {
             new_id: node.env.random_hex(8),
@@ -249,7 +248,7 @@ async fn create_key(
         secret_hash,
         db_id,
         read_only: c.read_only,
-        created_at: node.env.now_ms() as i64,
+        created_at: node.now_ms() as i64,
     };
     node.run_meta(MetaCmd::CreateApiKey { key: key.clone() }).await?;
     Ok((StatusCode::CREATED, axum::Json(json!({"key": full, "api_key": key.public_json(c.db.as_deref())})))

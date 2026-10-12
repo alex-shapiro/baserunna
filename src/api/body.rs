@@ -1,6 +1,6 @@
 //! Streaming request/response bodies for blobs, and HTTP Range parsing.
 
-use crate::engine::blob::{BlobWriter, chunk_plan, read_chunk};
+use crate::engine::blob::{self, BlobWriter, chunk_plan, read_chunk};
 use crate::engine::{BlobRef, Shared};
 use crate::error::{Error, Result};
 use crate::store::BoxFut;
@@ -13,8 +13,11 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::time::Instant;
 
-/// Streams a byte range of a blob chunk by chunk.
+/// Streams a byte range of a blob chunk by chunk. A long read pins the
+/// blob (see [`blob::pin`]), so garbage collection cannot remove it midway.
 pub struct BlobBody {
     shared: Arc<Shared>,
     db: String,
@@ -22,12 +25,31 @@ pub struct BlobBody {
     plan: VecDeque<(u64, Range<u64>)>,
     remaining: u64,
     fut: Option<BoxFut<'static, Result<Bytes>>>,
+    /// When the read started, or when it last pinned the blob.
+    pinned_at: Instant,
+    pin_now: bool,
 }
 
 impl BlobBody {
     pub fn new(shared: Arc<Shared>, db: &str, blob: BlobRef, range: Range<u64>) -> BlobBody {
         let plan = chunk_plan(shared.cfg.blob_chunk_size as u64, range.clone()).into();
-        BlobBody { shared, db: db.to_string(), blob, plan, remaining: range.end - range.start, fut: None }
+        BlobBody {
+            shared,
+            db: db.to_string(),
+            blob,
+            plan,
+            remaining: range.end - range.start,
+            fut: None,
+            pinned_at: Instant::now(),
+            pin_now: false,
+        }
+    }
+
+    /// Pin the blob before reading anything: for a blob already found
+    /// unreferenced, whose collection may be near.
+    pub fn pinned_first(mut self) -> BlobBody {
+        self.pin_now = true;
+        self
     }
 }
 
@@ -59,7 +81,17 @@ impl http_body::Body for BlobBody {
                     let shared = this.shared.clone();
                     let db = this.db.clone();
                     let blob = this.blob.clone();
-                    this.fut = Some(Box::pin(async move { read_chunk(&shared, &db, &blob, ci, r).await }));
+                    let interval = Duration::from_millis(blob::pin_interval_ms(&shared.cfg));
+                    let pin = std::mem::take(&mut this.pin_now) || this.pinned_at.elapsed() >= interval;
+                    if pin {
+                        this.pinned_at = Instant::now();
+                    }
+                    this.fut = Some(Box::pin(async move {
+                        if pin && let Err(e) = blob::pin(&shared, &db, &blob.id).await {
+                            crate::warn!("could not pin blob {} of {db} for a long read: {e}", blob.id);
+                        }
+                        read_chunk(&shared, &db, &blob, ci, r).await
+                    }));
                 }
             }
         }
@@ -82,18 +114,18 @@ pub enum Upload {
 
 /// Stream `body` into storage. Bodies up to `inline_max` stay in memory
 /// (unless `force_blob`); larger ones are written as a blob as they arrive.
-pub async fn read_upload(
+pub async fn read_upload<F: std::future::Future<Output = BlobWriter>>(
     body: Body,
     inline_max: usize,
     force_blob: bool,
-    writer: impl FnOnce() -> BlobWriter,
+    writer: impl FnOnce() -> F,
 ) -> Result<Upload> {
     let mut body = body;
     let mut buf: Vec<u8> = Vec::new();
     let mut w: Option<BlobWriter> = None;
     let mut make = Some(writer);
-    if force_blob {
-        w = make.take().map(|f| f());
+    if force_blob && let Some(f) = make.take() {
+        w = Some(f().await);
     }
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|e| Error::invalid(format!("could not read body: {e}")))?;
@@ -103,7 +135,7 @@ pub async fn read_upload(
             None => {
                 buf.extend_from_slice(&data);
                 if buf.len() > inline_max {
-                    let mut nw = make.take().map(|f| f()).ok_or_else(|| Error::internal("writer"))?;
+                    let mut nw = make.take().ok_or_else(|| Error::internal("writer"))?().await;
                     nw.write(&buf).await?;
                     buf = Vec::new();
                     w = Some(nw);

@@ -7,6 +7,7 @@
 
 use crate::api;
 use crate::cluster::{Transport, TransportError};
+use crate::engine::local::{LocalTier, MemLocal};
 use crate::engine::{Consistency, EngineConfig};
 use crate::env::Env;
 use crate::meta::SignupPolicy;
@@ -175,6 +176,10 @@ impl ObjectStore for MeteredStore {
             self.inner.list(prefix, start_after, limit).await
         })
     }
+
+    fn time_precision_ms(&self) -> u64 {
+        self.inner.time_precision_ms()
+    }
 }
 
 // -------------------------------------------------------------- world
@@ -231,6 +236,8 @@ pub struct World {
     pub store: Arc<MeteredStore>,
     pub mem: Arc<MemStore>,
     nodes: Vec<Arc<Node>>,
+    /// Each node's local disk tier, kept across restarts.
+    disks: Vec<LocalTier>,
     peers: Peers,
     origin: Instant,
     base_ms: u64,
@@ -245,7 +252,7 @@ impl World {
             base_ms + Instant::now().saturating_duration_since(origin).as_millis() as u64
         })));
         let store = Arc::new(MeteredStore::new(mem.clone(), latency_ms));
-        let mut w = World { store, mem, nodes: Vec::new(), peers: Arc::default(), origin, base_ms };
+        let mut w = World { store, mem, nodes: Vec::new(), disks: Vec::new(), peers: Arc::default(), origin, base_ms };
         for _ in 0..n {
             w.start_node().await;
         }
@@ -254,16 +261,30 @@ impl World {
 
     pub async fn start_node(&mut self) -> usize {
         let i = self.nodes.len();
-        let addr = format!("cost://n{i}");
-        let env = Arc::new(Env::sim(0xc057 + i as u64, self.base_ms, self.origin, 0));
-        let store: DynStore = self.store.clone();
-        let transport = Arc::new(PeerTransport { peers: self.peers.clone() });
-        let node =
-            Node::start(node_config(&format!("n{i}"), &addr), env, store, transport, None).await.expect("node starts");
-        let router = api::router(node.clone());
-        self.peers.lock().unwrap_or_else(|e| e.into_inner()).insert(addr, router);
+        self.disks.push(LocalTier(Arc::new(MemLocal::new(256 << 20))));
+        let node = self.boot(i).await;
         self.nodes.push(node);
         i
+    }
+
+    /// Restart node `i` as a new process on the same machine: memory is
+    /// lost, its local disk tier is not.
+    pub async fn restart_node(&mut self, i: usize) {
+        self.nodes[i].env.shutdown();
+        self.nodes[i] = self.boot(i).await;
+    }
+
+    async fn boot(&self, i: usize) -> Arc<Node> {
+        let addr = format!("cost://n{i}");
+        let env = Arc::new(Env::sim(0xc057 + i as u64 + 1000 * self.nodes.len() as u64, self.base_ms, self.origin, 0));
+        let store: DynStore = self.store.clone();
+        let transport = Arc::new(PeerTransport { peers: self.peers.clone() });
+        let mut cfg = node_config(&format!("n{i}"), &addr);
+        cfg.engine.local_tier = Some(self.disks[i].clone());
+        let node = Node::start(cfg, env, store, transport, None).await.expect("node starts");
+        let router = api::router(node.clone());
+        self.peers.lock().unwrap_or_else(|e| e.into_inner()).insert(addr, router);
+        node
     }
 
     pub fn node(&self, i: usize) -> &Arc<Node> {
@@ -416,8 +437,10 @@ impl<'a> Recorder<'a> {
     }
 }
 
+/// `n` random lowercase letters: compressible like text, not more.
 fn value(n: usize, seed: usize) -> Bytes {
-    Bytes::from((0..n).map(|i| b'a' + ((i * 7 + seed * 13) % 26) as u8).collect::<Vec<u8>>())
+    let mut r = crate::util::rng::Rng::new(seed as u64);
+    Bytes::from((0..n).map(|_| b'a' + r.below(26) as u8).collect::<Vec<u8>>())
 }
 
 /// Run every measurement (deterministic; a few seconds of wall time).
@@ -592,6 +615,16 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
         v.get(&key).await.expect("get");
     }
     out.push(r.stop("snapshot_read", "read", 10.0, true));
+
+    // A restarted node reads what it fetched before from its local tier.
+    w.restart_node(other).await;
+    let db = w.node(other).engine.db(&id);
+    let r = Recorder::start(&w.store, &id);
+    let v = db.read_version(Consistency::Strong).await.expect("open after restart");
+    assert!(v.get(&key).await.expect("read").is_some());
+    let all = v.scan(&crate::engine::KeyRange::all(), false, usize::MAX, false).await.expect("scan");
+    assert_eq!(all.len(), 128);
+    out.push(r.stop("restart_open_and_scan", "open", 1.0, true));
     segs
 }
 
@@ -691,7 +724,7 @@ pub fn monthly_cost(r: &Report, p: &Profile) -> Bill {
     let reads = if p.reads_per_day == 0.0 || p.active_hours == 0.0 {
         0.0
     } else {
-        let lease_s = cfg.lease_ms as f64 / 1000.0;
+        let lease_s = cfg.read_lease_ms as f64 / 1000.0;
         let periods = p.active_hours * 3600.0 / lease_s;
         let per_period = p.reads_per_day / periods;
         let period_cost = if per_period >= cfg.lease_read_threshold as f64 {

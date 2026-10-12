@@ -303,7 +303,8 @@ fn group_commit_batches_concurrent_commits() {
         let (eng, store, _env) = engine(2, EngineConfig::default());
         let db = eng.db("g");
         db.open(true).await.unwrap();
-        let before = store.len();
+        let objects = || store.keys().iter().filter(|k| k.starts_with("dbs/")).count();
+        let before = objects();
         let ws_before = db.current().unwrap().m.write_seq;
         let mut handles = Vec::new();
         for i in 0..20u32 {
@@ -325,7 +326,7 @@ fn group_commit_batches_concurrent_commits() {
         // ...but they share manifest writes.
         let writes = db.current().unwrap().m.write_seq - ws_before;
         assert!(writes < 20, "expected batching, got {writes} manifest writes");
-        assert_eq!(store.len(), before);
+        assert_eq!(objects(), before);
         let v = db.read_version(Consistency::Strong).await.unwrap();
         assert_eq!(v.scan(&KeyRange::all(), false, 100, false).await.unwrap().len(), 20);
     });
@@ -339,14 +340,14 @@ fn lease_sightings_outlive_handles_and_prune_when_full() {
     rt().block_on(async {
         let (eng, _store, _env) = engine(3, EngineConfig::small_for_tests());
         let sh = &eng.shared;
-        let lease = |node: &str, exp: u64| Lease { node: node.into(), expires_ms: exp };
-        let first = sh.lease_seen("a", &lease("x", 5));
+        let lease = |node: &str| Lease { node: node.into(), expires_ms: 7, ms: 5_000 };
+        let first = sh.lease_seen("a", &lease("x"), 5);
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        assert_eq!(sh.lease_seen("a", &lease("x", 5)), first, "the same renewal must keep its first sighting");
-        assert!(sh.lease_seen("a", &lease("x", 6)) > first, "a renewal is a new sighting");
-        assert!(sh.lease_seen("a", &lease("y", 6)) > first, "another holder is a new sighting");
-        let a_seen = sh.lease_seen("a", &lease("y", 6));
-        let v = sh.cfg.lease_ms + sh.cfg.clock_skew_margin_ms;
+        assert_eq!(sh.lease_seen("a", &lease("x"), 5), first, "the same renewal must keep its first sighting");
+        assert!(sh.lease_seen("a", &lease("x"), 6) > first, "a renewal is a new sighting, whatever its expiry");
+        assert!(sh.lease_seen("a", &lease("y"), 6) > first, "another holder is a new sighting");
+        let a_seen = sh.lease_seen("a", &lease("y"), 6);
+        let v = sh.cfg.read_lease_ms + sh.cfg.lease_margin_ms;
         let present = |id: &str| sh.lease_sightings.lock().unwrap().contains_key(id);
         let age_to = |x: u64| async move {
             let now = tokio::time::Instant::now();
@@ -354,14 +355,14 @@ fn lease_sightings_outlive_handles_and_prune_when_full() {
         };
         age_to(5_000).await;
         for i in 0..100_000 {
-            sh.lease_seen(&format!("d{i}"), &lease("x", 1));
+            sh.lease_seen(&format!("d{i}"), &lease("x"), 1);
         }
         assert!(present("a"), "a sighting 50 leases old must survive pruning");
         age_to(9_500).await;
-        sh.lease_seen("b", &lease("x", 1));
+        sh.lease_seen("b", &lease("x"), 1);
         assert!(present("a"), "a sighting 95 leases old must survive pruning");
         age_to(10_500).await;
-        sh.lease_seen("c", &lease("x", 1));
+        sh.lease_seen("c", &lease("x"), 1);
         assert!(!present("a") && present("c"), "a full table must drop sightings over 100 leases old");
     });
 }
@@ -402,6 +403,8 @@ struct DelayStore {
     manifest_puts: AtomicU32,
     /// Every GET served: the key, and whether it was conditional.
     gets: Mutex<Vec<(String, bool)>>,
+    /// The size of every segment GET's response.
+    seg_get_bytes: Mutex<Vec<usize>>,
 }
 
 /// Consumes one of `n` remaining faults.
@@ -423,6 +426,9 @@ impl ObjectStore for DelayStore {
                 return Err(StoreError::Unavailable("injected".into()));
             }
             let r = self.mem.get_sync(key, &opts);
+            if let (true, Ok(g)) = (key.contains("/seg/"), &r) {
+                self.seg_get_bytes.lock().unwrap().push(g.data.len());
+            }
             tokio::time::sleep(Duration::from_millis(self.get_reply_ms.load(SeqCst))).await;
             r
         })
@@ -452,6 +458,10 @@ impl ObjectStore for DelayStore {
     fn list<'a>(&'a self, prefix: &'a str, after: Option<&'a str>, limit: usize) -> BoxFut<'a, SResult<ListPage>> {
         self.mem.list(prefix, after, limit)
     }
+
+    fn time_precision_ms(&self) -> u64 {
+        self.mem.time_precision_ms()
+    }
 }
 
 fn delayed_engine(node: &str) -> (Arc<Engine>, Arc<DelayStore>) {
@@ -472,6 +482,7 @@ fn delayed_engine_with(node: &str, cfg: EngineConfig) -> (Arc<Engine>, Arc<Delay
         manifest_get_outages: 0.into(),
         manifest_puts: 0.into(),
         gets: Mutex::default(),
+        seg_get_bytes: Mutex::default(),
     });
     (Engine::new(store.clone(), env, cfg, node.into()), store)
 }
@@ -657,6 +668,152 @@ async fn sweep_case(cfg: EngineConfig) {
     let keys = store.mem.keys();
     assert!(!keys.contains(&seg_key("d", &seg)) && !keys.iter().any(|k| k.contains(&blob)), "{keys:?}");
     assert!(keys.contains(&foreign), "an object that is not ours was deleted");
+}
+
+/// A blob that a long read keeps pinned survives garbage collection, and
+/// is collected by a later sweep once the pin lapses.
+#[test]
+fn pinned_blobs_outlive_collection_until_the_pin_lapses() {
+    rt().block_on(async {
+        let cfg = EngineConfig {
+            orphan_grace_ms: 60_000,
+            blob_stage_ttl_ms: 30_000,
+            txn_max_lifetime_ms: 30_000,
+            gc_grace_ms: 90_000,
+            clock_sync_max_error_ms: 1_000,
+            ..EngineConfig::small_for_tests()
+        };
+        let (eng, store) = delayed_engine_with("a", cfg.clone());
+        let db = opened(&eng, "d").await;
+        let r = blob::write_blob(&eng.shared, "d", &[7u8; 3000], "x/y").await.unwrap();
+        for v in [Value::Blob(r.clone()), inline("small")] {
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            t.put(Bytes::from_static(b"k"), v).unwrap();
+            db.commit(t.into_request()).await.unwrap();
+        }
+        let has_blob = || store.mem.keys().iter().any(|k| k.contains(&r.id) && k.contains("/blob/"));
+        let listed = || db.current().unwrap().m.obsolete.iter().any(|o| o.id == r.id);
+        tokio::time::sleep(Duration::from_millis(cfg.orphan_grace_ms + 4 * cfg.clock_sync_max_error_ms)).await;
+        db.maintenance_now().await.unwrap();
+        db.sweep_now().await.unwrap();
+        assert!(listed(), "setup: the dereferenced blob was not found");
+        // A reader pins it and renews the pin past the grace period.
+        let interval = blob::pin_interval_ms(&cfg);
+        let mut waited = 0;
+        while waited <= cfg.gc_grace_ms + interval {
+            blob::pin(&eng.shared, "d", &r.id).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(interval)).await;
+            db.maintenance_now().await.unwrap();
+            waited += interval;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!listed(), "setup: collection did not run");
+        assert!(has_blob(), "a pinned blob was deleted");
+        assert_eq!(blob::read_range(&eng.shared, "d", &r, 0..3000).await.unwrap().len(), 3000);
+        // The read ends; once its pin lapses the blob is an orphan again.
+        tokio::time::sleep(Duration::from_millis(blob::pin_ttl_ms(&cfg).max(cfg.orphan_grace_ms))).await;
+        db.maintenance_now().await.unwrap();
+        db.sweep_now().await.unwrap();
+        assert!(listed());
+        tokio::time::sleep(Duration::from_millis(cfg.gc_grace_ms + 1)).await;
+        db.maintenance_now().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!has_blob(), "an unpinned orphan survived");
+        assert!(!store.mem.keys().contains(&pin_key("d", &r.id)), "its pin was left behind");
+    });
+}
+
+/// Collection runs on the store's clock: a node whose wall clock is hours
+/// ahead neither takes young orphans for old ones nor deletes obsolete
+/// segments early.
+#[test]
+fn collection_ignores_node_clock_skew() {
+    rt().block_on(async {
+        let cfg = EngineConfig::small_for_tests();
+        let origin = tokio::time::Instant::now();
+        let base = 1_700_000_000_000;
+        let skewed = Arc::new(Env::sim(9, base, origin, 5 * 3_600_000));
+        let mem = Arc::new(MemStore::new(Box::new(move || base + origin.elapsed().as_millis() as u64)));
+        let eng = Engine::new(mem.clone(), skewed.clone(), cfg.clone(), "a".into());
+        let db = opened(&eng, "d").await;
+        put(&db, "k", "1").await;
+        let seg = skewed.random_hex(16);
+        let blob = super::types::make_blob_id(base, &[3u8; 10]);
+        for k in [seg_key("d", &seg), blob_chunk_key("d", &blob, 0)] {
+            mem.put_sync(&k, Bytes::from_static(b"x"), &PutMode::Overwrite).unwrap();
+        }
+        db.sweep_now().await.unwrap();
+        assert!(db.current().unwrap().m.obsolete.is_empty(), "young orphans looked old to a fast clock");
+        let store_now = eng.shared.store_now_ms().unwrap();
+        assert!(store_now.abs_diff(base + origin.elapsed().as_millis() as u64) < 100, "store time is the store's");
+        // Obsolete segments wait out the grace period in store time.
+        for i in 0..8 {
+            put_many(&db, &format!("r{i}"), 5, 500).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let obsolete: Vec<String> = db.current().unwrap().m.obsolete.iter().map(|o| o.id.clone()).collect();
+        assert!(!obsolete.is_empty(), "setup: compaction obsoleted nothing");
+        tokio::time::sleep(Duration::from_millis(cfg.gc_grace_ms / 2)).await;
+        db.maintenance_now().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        for id in &obsolete {
+            assert!(mem.keys().contains(&seg_key("d", id)), "segment {id} deleted within gc_grace");
+        }
+    });
+}
+
+/// An orphaned blob becomes collectable exactly when it is both
+/// `orphan_grace` old by its objects and `blob_stage_ttl` plus the binding
+/// margin old by its id, whichever comes last.
+#[test]
+fn orphaned_blobs_wait_out_both_graces_exactly() {
+    for (orphan_grace_ms, blob_stage_ttl_ms) in [(600_000, 300_000), (300_000, 600_000)] {
+        rt().block_on(async move {
+            let cfg = EngineConfig { orphan_grace_ms, blob_stage_ttl_ms, ..EngineConfig::small_for_tests() };
+            let (eng, store) = delayed_engine_with("a", cfg.clone());
+            let db = opened(&eng, "d").await;
+            put(&db, "k", "1").await;
+            let start = Instant::now();
+            let blob = super::types::make_blob_id(eng.shared.env.now_ms(), &[5u8; 10]);
+            store.mem.put_sync(&blob_chunk_key("d", &blob, 0), Bytes::from_static(b"x"), &PutMode::Overwrite).unwrap();
+            let due = Duration::from_millis(orphan_grace_ms.max(blob_stage_ttl_ms + 2 * cfg.clock_sync_max_error_ms));
+            let listed_at = |at: Duration| {
+                let db = db.clone();
+                let blob = blob.clone();
+                async move {
+                    tokio::time::sleep_until(start + at).await;
+                    db.maintenance_now().await.unwrap();
+                    db.sweep_now().await.unwrap();
+                    db.current().unwrap().m.obsolete.iter().any(|o| o.id == blob)
+                }
+            };
+            assert!(!listed_at(due - Duration::from_secs(1)).await, "collectable a second early ({cfg:?})");
+            assert!(listed_at(due + Duration::from_secs(1)).await, "not collectable a second late ({cfg:?})");
+        });
+    }
+}
+
+/// A blob is as old as its newest object: old chunks under a fresh pin are
+/// not collected.
+#[test]
+fn a_blob_is_as_old_as_its_newest_object() {
+    rt().block_on(async {
+        let cfg = EngineConfig::small_for_tests();
+        let (eng, store) = delayed_engine_with("a", cfg.clone());
+        let db = opened(&eng, "d").await;
+        put(&db, "k", "1").await;
+        let blob = super::types::make_blob_id(eng.shared.env.now_ms(), &[6u8; 10]);
+        for c in 0..3 {
+            store.mem.put_sync(&blob_chunk_key("d", &blob, c), Bytes::from_static(b"x"), &PutMode::Overwrite).unwrap();
+        }
+        let wait = cfg.orphan_grace_ms.max(cfg.blob_stage_ttl_ms + 2 * cfg.clock_sync_max_error_ms);
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        blob::pin(&eng.shared, "d", &blob).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        db.maintenance_now().await.unwrap();
+        db.sweep_now().await.unwrap();
+        assert!(!db.current().unwrap().m.obsolete.iter().any(|o| o.id == blob), "a freshly pinned blob was collected");
+    });
 }
 
 /// Transactions committed in one batch are validated against the writes
@@ -919,7 +1076,7 @@ fn foreign_leases_block_commits_until_they_expire() {
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         t.put(Bytes::from_static(b"k"), inline("b")).unwrap();
         tokio::time::sleep(Duration::from_millis(5_000)).await;
-        let left = b.shared.cfg.lease_ms + b.shared.cfg.clock_skew_margin_ms - 5_000;
+        let left = b.shared.cfg.lease_ms + b.shared.cfg.lease_margin_ms - 5_000;
         match db.commit(t.into_request()).await {
             Err(Error::NotOwner { holder, retry_after_ms }) => {
                 assert_eq!((holder.as_str(), retry_after_ms), ("a", left))
@@ -957,7 +1114,7 @@ fn holders_stop_relying_on_their_lease_a_margin_early() {
         let db = opened(&eng, "d").await;
         let start = Instant::now();
         put(&db, "k", "v").await;
-        let rely = Duration::from_millis(eng.shared.cfg.lease_ms - eng.shared.cfg.clock_skew_margin_ms);
+        let rely = Duration::from_millis(eng.shared.cfg.lease_ms - eng.shared.cfg.lease_margin_ms);
         let manifest_gets = || store.gets_matching(|k| k.ends_with("/manifest"));
         let before = manifest_gets();
         tokio::time::sleep_until(start + rely - Duration::from_millis(1)).await;
@@ -1119,10 +1276,11 @@ fn version_samples_are_spaced_and_reach_a_lifetime_back() {
         for i in 0..120 {
             tokio::time::sleep(Duration::from_millis(10_000)).await;
             let v = put(&db, &format!("k{}", i % 7), "v").await;
-            history.push((eng.shared.env.now_ms(), v));
+            history.push((eng.shared.time_ms(), v));
         }
         let m = db.current().unwrap().m.clone();
-        let now = eng.shared.env.now_ms();
+        // Samples are in store time.
+        let now = eng.shared.store_now_ms().unwrap();
         let times: Vec<u64> = m.version_times.iter().map(|(_, t)| *t).collect();
         for w in times.windows(2) {
             let gap = w[1] - w[0];
@@ -1163,45 +1321,33 @@ fn tail_tombstones_are_dropped_after_a_transaction_lifetime() {
     });
 }
 
-/// Background compaction keeps the number of segments bounded as flushes
-/// accumulate.
+/// Background compaction keeps level 0 short and the levels well formed
+/// as flushes accumulate.
 #[test]
 fn flushes_are_compacted_in_the_background() {
     rt().block_on(async {
-        let (eng, _store) = delayed_engine("a");
+        let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
+        // Slow writes, so compactions overlap later commits.
+        store.put_reply_ms.store(4, SeqCst);
         for i in 0..40 {
             put_many(&db, &format!("r{i:02}-"), 5, 500).await;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let segs = db.current().unwrap().m.segments.len();
-        assert!((1..=eng.shared.cfg.max_segments).contains(&segs), "{segs} segments");
-    });
-}
-
-/// Compacting newer segments without the oldest keeps their tombstones,
-/// which still shadow older values there.
-#[test]
-fn tombstones_outlive_compactions_above_the_oldest_segment() {
-    rt().block_on(async {
-        let (eng, _store) = delayed_engine("a");
-        let db = opened(&eng, "d").await;
-        let cfg = eng.shared.cfg.clone();
-        put_many(&db, "a", 50, 500).await;
-        tokio::time::sleep(Duration::from_millis(cfg.version_sample_ms)).await;
-        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-        t.delete(Bytes::from_static(b"a07")).unwrap();
-        for i in 0..5 {
-            t.put(Bytes::from(format!("p{i}")), Value::Inline(Bytes::from(vec![b'v'; 500]))).unwrap();
+        let m = &db.current().unwrap().m;
+        m.check_levels().unwrap();
+        assert!(m.compaction_seq > 0);
+        assert!(m.level(0).len() < eng.shared.cfg.l0_compaction_trigger, "{} level 0 segments", m.level(0).len());
+        let (base, targets) = compaction::level_targets(m, &eng.shared.cfg);
+        for l in 1..manifest::MAX_LEVEL {
+            assert!(m.level_bytes(l) <= targets[l as usize], "level {l} over its target (base {base})");
         }
-        db.commit(t.into_request()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(cfg.txn_max_lifetime_ms + cfg.version_sample_ms)).await;
-        for i in 0..3 {
-            put_many(&db, &format!("q{i}-"), 5, 500).await;
+        // One compaction at a time: none was planned twice and discarded.
+        let known: Vec<&str> =
+            m.segments.iter().map(|s| s.id.as_str()).chain(m.obsolete.iter().map(|o| o.id.as_str())).collect();
+        for k in store.mem.keys().iter().filter(|k| k.contains("/seg/")) {
+            assert!(known.iter().any(|id| k.ends_with(id)), "orphaned segment {k}");
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(db.current().unwrap().m.segments.len(), 2, "setup: the newer segments were not compacted alone");
-        assert_eq!(strong_get(&db, "a07").await, None);
     });
 }
 
@@ -1282,7 +1428,7 @@ fn streamed_blob_writes_fill_whole_chunks() {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
         let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
-        let mut w = db.blob_writer("application/octet-stream");
+        let mut w = db.blob_writer("application/octet-stream").await;
         for piece in data.chunks(700) {
             w.write(piece).await.unwrap();
         }
@@ -1295,39 +1441,390 @@ fn streamed_blob_writes_fill_whole_chunks() {
     });
 }
 
-fn stored_segment(store: &MemStore, id: char, entries: &[Entry]) -> manifest::SegmentMeta {
-    let (data, s) = segment::build(entries, 512);
+fn stored_segment(store: &MemStore, id: char, level: u8, entries: &[Entry]) -> manifest::SegmentMeta {
+    let (data, s) = segment::build(entries, 512, segment::Compression::Zstd(1));
     let id = id.to_string().repeat(32);
     store.put_sync(&seg_key("d", &id), data, &PutMode::Overwrite).unwrap();
-    manifest::SegmentMeta {
-        id,
-        size: s.size,
-        entries: s.entries,
-        tombstones: s.tombstones,
-        min_key: s.min_key,
-        max_key: s.max_key,
-        min_seq: s.min_seq,
-        max_seq: s.max_seq,
-    }
+    compaction::seg_meta(id, level, &s)
 }
 
-/// A merge at the bottom of the tree drops the tombstones no snapshot can
-/// need any more, keeps newer ones, and writes nothing if nothing is left.
+/// A merge drops old tombstones unless a deeper level may still hold an
+/// entry they shadow, keeps newer ones, and writes nothing if nothing is
+/// left.
 #[test]
-fn bottom_merges_purge_only_old_tombstones() {
+fn merges_purge_only_tombstones_nothing_needs() {
     rt().block_on(async {
         let (eng, store, _env) = engine(1, EngineConfig::small_for_tests());
         let e = |k: &str, seq, value| Entry { key: Bytes::from(k.to_string()), seq, value };
         let v = || inline("v");
-        let newer = stored_segment(&store, 'a', &[e("a", 5, Value::Tombstone), e("b", 9, Value::Tombstone)]);
-        let older = stored_segment(&store, 'b', &[e("a", 1, v()), e("b", 2, v()), e("c", 3, v())]);
-        let m = manifest::Manifest::new("d", 0);
-        let out = compaction::merge(&eng.shared, &m, &[newer.clone(), older], true, 6).await.unwrap();
+        let t = Value::Tombstone;
+        let newer = stored_segment(&store, 'a', 5, &[e("a", 5, t.clone()), e("b", 9, t.clone()), e("d", 4, t.clone())]);
+        let older = stored_segment(&store, 'b', 6, &[e("a", 1, v()), e("b", 2, v()), e("c", 3, v())]);
+        let mut m = manifest::Manifest::new("d", 0);
+        m.segments = vec![newer.clone(), older.clone()];
+        let read = |segs: &[manifest::SegmentMeta]| {
+            assert_eq!(segs.len(), 1);
+            let k = seg_key("d", &segs[0].id);
+            segment::read_all(&store.get_sync(&k, &GetOpts::default()).unwrap().data).unwrap()
+        };
+        let plan = |inputs: Vec<manifest::SegmentMeta>, output_level| compaction::Plan {
+            inputs,
+            output_level,
+            trivial: false,
+        };
+        let out = compaction::run(&eng.shared, &m, &plan(vec![newer.clone(), older.clone()], 6), 6).await.unwrap();
         assert_eq!(out.purged_max_seq, 5);
-        let (data, _) = out.data.unwrap();
-        assert_eq!(segment::read_all(&data).unwrap(), [e("b", 9, Value::Tombstone), e("c", 3, v())]);
-        let out = compaction::merge(&eng.shared, &m, &[newer], true, 9).await.unwrap();
-        assert!(out.data.is_none(), "wrote an empty segment");
+        assert_eq!(read(&out.segments), [e("b", 9, t.clone()), e("c", 3, v())]);
+        // Into level 5 with `older` below: tombstones over its keys stay.
+        let out = compaction::run(&eng.shared, &m, &plan(vec![newer.clone()], 5), 9).await.unwrap();
+        assert_eq!(out.purged_max_seq, 4);
+        assert_eq!(read(&out.segments), [e("a", 5, t.clone()), e("b", 9, t.clone())]);
+        m.segments = vec![newer.clone()];
+        let out = compaction::run(&eng.shared, &m, &plan(vec![newer], 6), 9).await.unwrap();
+        assert!(out.segments.is_empty(), "wrote an empty segment");
         assert_eq!(out.purged_max_seq, 9);
+    });
+}
+
+/// Compaction streams: a database many times larger than a segment and
+/// than a read compacts with every store read bounded, every output
+/// segment near the target size, and nothing lost.
+#[test]
+fn large_databases_compact_in_bounded_requests() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let cfg = eng.shared.cfg.clone();
+        let db = opened(&eng, "d").await;
+        let mut r = Rng::new(11);
+        let mut model = BTreeMap::new();
+        for _ in 0..150 {
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            for _ in 0..10 {
+                let k = format!("k{:05}", r.below(3_000));
+                let len = 50 + r.usize(150);
+                let v = Bytes::from(r.bytes(len));
+                t.put(Bytes::from(k.clone()), Value::Inline(v.clone())).unwrap();
+                model.insert(Bytes::from(k), v);
+            }
+            db.commit(t.into_request()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let v = db.read_version(Consistency::Strong).await.unwrap();
+        let total: u64 = v.m.segments.iter().map(|s| s.size).sum();
+        assert!(total > 30 * cfg.segment_target_bytes as u64, "setup: only {total} bytes of segments");
+        assert!(v.m.compaction_seq > 10, "setup: little compaction");
+        let largest_read = store.seg_get_bytes.lock().unwrap().iter().copied().max().unwrap_or(0);
+        let bound = cfg.segment_whole_fetch_max.max(cfg.bulk_read_bytes) as usize;
+        assert!(largest_read <= bound, "a {largest_read}-byte segment read");
+        for s in v.m.segments.iter().filter(|s| s.level > 0) {
+            assert!(s.size <= (cfg.segment_target_bytes + 2 * cfg.block_target) as u64, "{} bytes", s.size);
+        }
+        let got: BTreeMap<Bytes, Bytes> = v
+            .all_entries(false)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| match e.value {
+                Value::Inline(b) => (e.key, b),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(got == model, "contents differ after compaction");
+    });
+}
+
+/// A scan reading many blocks of a segment reads ahead in bulk requests,
+/// while a short scan reads only the blocks it needs.
+#[test]
+fn long_scans_read_ahead() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let cfg = eng.shared.cfg.clone();
+        let mut r = Rng::new(3);
+        let entries: Vec<Entry> = (0..400u64)
+            .map(|i| Entry {
+                key: Bytes::from(format!("k{i:05}")),
+                seq: 1,
+                value: Value::Inline(Bytes::from(r.bytes(100))),
+            })
+            .collect();
+        let seg = stored_segment(&store.mem, 'a', 6, &entries);
+        assert!(seg.size > 8 * cfg.bulk_read_bytes, "setup: a {}-byte segment", seg.size);
+        let mut m = manifest::Manifest::new("d", 0);
+        m.segments = vec![seg.clone()];
+        let v = Version { m, etag: String::new(), shared: eng.shared.clone() };
+        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        v.scan(&KeyRange::all(), false, 3, false).await.unwrap();
+        let short = gets();
+        assert!(short <= 3, "a short scan made {short} requests (index and one block)");
+        let largest_block = eng.shared.seg_index("d", &seg).await.unwrap().blocks.iter().map(|b| b.2).max().unwrap();
+        let last_read = *store.seg_get_bytes.lock().unwrap().last().unwrap();
+        assert!(last_read <= largest_block as usize, "a short scan read {last_read} bytes ahead");
+        // Reverse scans read block by block, cold or not.
+        let cold = second_node(&eng, &store, "b");
+        let v2 = Version { m: v.m.clone(), etag: String::new(), shared: cold.shared.clone() };
+        let back: Vec<Entry> = v2.scan(&KeyRange::all(), true, usize::MAX, false).await.unwrap();
+        assert!(back.iter().rev().eq(entries.iter()), "a cold reverse scan");
+        let before = gets();
+        assert_eq!(v.scan(&KeyRange::all(), false, usize::MAX, false).await.unwrap().len(), 400);
+        let blocks = eng.shared.seg_index("d", &seg).await.unwrap().blocks.len();
+        let full = gets() - before;
+        // Reads of `bulk_read_bytes` hold three of these blocks.
+        assert!(full <= 2 + blocks.div_ceil(3), "{full} requests for {blocks} blocks");
+        let before = gets();
+        v.scan(&KeyRange::all(), false, usize::MAX, false).await.unwrap();
+        assert_eq!(gets(), before, "blocks read ahead were cached");
+    });
+}
+
+/// A node keeps the segments it writes: reading what it just flushed or
+/// compacted needs no request.
+#[test]
+fn written_segments_are_read_without_requests() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        put_many(&db, "k", 5, 500).await;
+        assert!(db.current().unwrap().m.tail.is_empty(), "setup: no flush");
+        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        let before = gets();
+        assert!(strong_get(&db, "k03").await.is_some());
+        assert_eq!(gets(), before, "a flushed segment was fetched back");
+    });
+}
+
+/// Appended data moves down the levels without being rewritten: some
+/// segment keeps its id while it changes level, and compaction settles.
+#[test]
+fn appends_move_down_without_rewrites() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        let mut r = Rng::new(17);
+        let mut levels: BTreeMap<String, std::collections::BTreeSet<u8>> = BTreeMap::new();
+        for i in 0..300 {
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            t.put(Bytes::from(format!("log{i:06}")), Value::Inline(Bytes::from(r.bytes(400)))).unwrap();
+            db.commit(t.into_request()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            for s in &db.current().unwrap().m.segments {
+                levels.entry(s.id.clone()).or_default().insert(s.level);
+            }
+        }
+        assert!(levels.values().any(|l| l.len() > 1 && !l.contains(&0)), "no segment moved down a level as it was");
+        let writes = store.manifest_puts.load(SeqCst);
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(store.manifest_puts.load(SeqCst), writes, "compaction kept writing the manifest");
+    });
+}
+
+/// Segments a node wrote, small or large, are read from its local tier
+/// after a restart, without store requests.
+#[test]
+fn restarted_nodes_read_what_they_wrote_locally() {
+    rt().block_on(async {
+        let tier = local::LocalTier(Arc::new(local::MemLocal::new(64 << 20)));
+        let cfg = EngineConfig { local_tier: Some(tier), ..EngineConfig::small_for_tests() };
+        let (a, store) = delayed_engine_with("a", cfg.clone());
+        let db = opened(&a, "d").await;
+        let mut r = Rng::new(4);
+        for i in 0..60 {
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            for j in 0..5 {
+                t.put(Bytes::from(format!("k{i:03}{j}")), Value::Inline(Bytes::from(r.bytes(120)))).unwrap();
+            }
+            db.commit(t.into_request()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let m = db.current().unwrap().m.clone();
+        let whole = |s: &manifest::SegmentMeta| s.size <= cfg.segment_whole_fetch_max;
+        assert!(m.segments.iter().any(whole) && !m.segments.iter().all(whole), "setup: segment sizes");
+        let restarted = Engine::new(store.clone(), a.shared.env.clone(), cfg, "a2".into());
+        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        let before = gets();
+        let v = restarted.db("d").read_version(Consistency::Strong).await.unwrap();
+        assert_eq!(v.all_entries(false).await.unwrap().len(), 300);
+        assert_eq!(gets(), before, "segment requests after a restart");
+    });
+}
+
+/// Bulk reads fetch as many whole blocks as fit their window, and at least
+/// one however small the window.
+#[test]
+fn bulk_reads_take_whole_blocks() {
+    let mut r = Rng::new(9);
+    let entries: Vec<Entry> = (0..100u64)
+        .map(|i| Entry { key: Bytes::from(format!("k{i:04}")), seq: 1, value: Value::Inline(Bytes::from(r.bytes(80))) })
+        .collect();
+    for window in [1, 1_600] {
+        rt().block_on(async {
+            let cfg = EngineConfig { bulk_read_bytes: window, ..EngineConfig::small_for_tests() };
+            let (eng, store) = delayed_engine_with("a", cfg);
+            let seg = stored_segment(&store.mem, 'a', 6, &entries);
+            let mut m = manifest::Manifest::new("d", 0);
+            m.segments = vec![seg];
+            let v = Version { m, etag: String::new(), shared: eng.shared.clone() };
+            let idx = eng.shared.seg_index("d", &v.m.segments[0]).await.unwrap();
+            let largest = idx.blocks.iter().map(|b| b.2 as u64).max().unwrap();
+            assert!(window == 1 || window >= 2 * largest, "setup: blocks of up to {largest} bytes");
+            let before = store.seg_get_bytes.lock().unwrap().len();
+            let mut it = v.iter_bulk(true);
+            let mut got = Vec::new();
+            while let Some(e) = it.next().await.unwrap() {
+                got.push(e);
+            }
+            assert_eq!(got, entries);
+            let reads: Vec<usize> = store.seg_get_bytes.lock().unwrap()[before..].to_vec();
+            if window == 1 {
+                assert_eq!(reads.len(), idx.blocks.len(), "one block per request");
+            } else {
+                assert!(reads.iter().all(|n| *n as u64 <= window), "a read over the window: {reads:?}");
+                assert!(reads.len() * 2 <= idx.blocks.len(), "{} reads for {} blocks", reads.len(), idx.blocks.len());
+            }
+            assert_eq!(v.all_entries(true).await.unwrap(), entries, "reading ahead");
+        });
+    }
+}
+
+/// A point lookup consults every covering level 0 segment and at most one
+/// segment per deeper level.
+#[test]
+fn lookups_consult_one_segment_per_level() {
+    let (eng, _store, _env) = engine(1, EngineConfig::small_for_tests());
+    let seg = |id: char, level: u8, min: &str, max: &str| manifest::SegmentMeta {
+        id: id.to_string().repeat(32),
+        level,
+        size: 1,
+        entries: 1,
+        tombstones: 0,
+        min_key: Bytes::copy_from_slice(min.as_bytes()),
+        max_key: Bytes::copy_from_slice(max.as_bytes()),
+        min_seq: 0,
+        max_seq: 0,
+    };
+    let mut m = manifest::Manifest::new("d", 0);
+    m.segments = vec![
+        seg('a', 0, "a", "z"),
+        seg('b', 0, "m", "p"),
+        seg('c', 5, "a", "f"),
+        seg('d', 5, "g", "p"),
+        seg('e', 6, "a", "k"),
+        seg('f', 6, "l", "z"),
+    ];
+    let v = Version { m, etag: String::new(), shared: eng.shared.clone() };
+    for (key, want) in [("b", 3), ("n", 4), ("h", 3), ("q", 2), ("0", 0)] {
+        assert_eq!(v.segments_for_key(key.as_bytes()), want, "{key}");
+    }
+}
+
+/// A range changed since `after` if an entry in it, in the tail or in a
+/// segment, is newer than `after`; entries as old as `after` are no change.
+#[test]
+fn changes_are_entries_newer_than_the_snapshot() {
+    rt().block_on(async {
+        let (eng, store, _env) = engine(1, EngineConfig::small_for_tests());
+        let e = |k: &str, seq| Entry { key: Bytes::from(k.to_string()), seq, value: inline("v") };
+        let seg = stored_segment(&store, 'a', 6, &[e("a", 3), e("c", 7)]);
+        let mut m = manifest::Manifest::new("d", 0);
+        m.segments = vec![seg];
+        m.tail = vec![e("b", 5)];
+        let v = Version { m, etag: String::new(), shared: eng.shared.clone() };
+        let range =
+            |a: &str, b: &str| KeyRange::half_open(Bytes::from(a.to_string()), Some(Bytes::from(b.to_string())));
+        for (r, after, changed) in [
+            (range("b", "c"), 5, false),
+            (range("b", "c"), 4, true),
+            (range("c", "d"), 7, false),
+            (range("c", "d"), 6, true),
+            (range("a", "b"), 2, true),
+            (range("a", "b"), 3, false),
+        ] {
+            assert_eq!(v.changed_since(&r, after).await.unwrap(), changed, "{r:?} after {after}");
+        }
+    });
+}
+
+/// A database runs one compaction at a time: commits that find one running
+/// do not start another, whose work would be discarded.
+#[test]
+fn one_compaction_at_a_time() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        // Slow writes: compactions run while later flushes commit.
+        store.put_reply_ms.store(50, SeqCst);
+        for i in 0..16 {
+            put_many(&db, &format!("a{i:02}-"), 5, 500).await;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let m = db.current().unwrap().m.clone();
+        let known: Vec<&str> =
+            m.segments.iter().map(|s| s.id.as_str()).chain(m.obsolete.iter().map(|o| o.id.as_str())).collect();
+        for k in store.mem.keys().iter().filter(|k| k.contains("/seg/")) {
+            assert!(known.iter().any(|id| k.ends_with(id)), "orphaned segment {k}: a compaction was discarded");
+        }
+    });
+}
+
+/// A sweep pages through listings longer than a page.
+#[test]
+fn sweeps_page_through_long_listings() {
+    rt().block_on(async {
+        let cfg = EngineConfig::small_for_tests();
+        let (eng, store) = delayed_engine_with("a", cfg.clone());
+        let db = opened(&eng, "d").await;
+        put(&db, "k", "v").await;
+        let mut ids = Vec::new();
+        for i in 0..1_500u64 {
+            let id = super::types::make_blob_id(eng.shared.env.now_ms(), &i.to_le_bytes()[..].repeat(2)[..10]);
+            for c in 0..2 {
+                store
+                    .mem
+                    .put_sync(&blob_chunk_key("d", &id, c), Bytes::from_static(b"x"), &PutMode::Overwrite)
+                    .unwrap();
+            }
+            ids.push(id);
+        }
+        tokio::time::sleep(Duration::from_millis(cfg.orphan_grace_ms.max(cfg.blob_stage_ttl_ms) + 60_000)).await;
+        db.maintenance_now().await.unwrap();
+        db.sweep_now().await.unwrap();
+        let listed = db.current().unwrap().m.obsolete.len();
+        assert_eq!(listed, ids.len());
+    });
+}
+
+/// Compaction output is split into segments of about the target size, in
+/// key order, and later reads find every entry.
+#[test]
+fn compaction_output_is_split_into_bounded_segments() {
+    rt().block_on(async {
+        let (eng, store, _env) = engine(1, EngineConfig::small_for_tests());
+        let cfg = eng.shared.cfg.clone();
+        let mut r = Rng::new(5);
+        let entries: Vec<Entry> = (0..400u64)
+            .map(|i| {
+                let len = r.usize(90);
+                let value = Value::Inline(Bytes::from(r.bytes(len)));
+                Entry { key: Bytes::from(format!("k{i:05}")), seq: i + 1, value }
+            })
+            .collect();
+        let input = stored_segment(&store, 'a', 0, &entries);
+        let mut m = manifest::Manifest::new("d", 0);
+        m.segments = vec![input.clone()];
+        let plan = compaction::Plan { inputs: vec![input], output_level: 6, trivial: false };
+        let out = compaction::run(&eng.shared, &m, &plan, 0).await.unwrap();
+        assert!(out.segments.len() >= 3, "{} segments", out.segments.len());
+        for s in &out.segments {
+            assert!(s.size <= (cfg.segment_target_bytes + 2 * cfg.block_target) as u64, "{} bytes", s.size);
+        }
+        m.segments = out.segments;
+        m.check_levels().unwrap();
+        let v = Version { m, etag: String::new(), shared: eng.shared.clone() };
+        assert_eq!(v.all_entries(true).await.unwrap(), entries);
+        for e in &entries {
+            assert_eq!(v.get_entry(&e.key).await.unwrap().as_ref(), Some(e));
+        }
     });
 }

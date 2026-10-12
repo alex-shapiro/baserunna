@@ -2,6 +2,7 @@
 //! (SPEC §12).
 
 use baserunna::cluster::{HttpTransport, Transport};
+use baserunna::engine::local::{DiskCache, LocalTier};
 use baserunna::env::Env;
 use baserunna::meta::SignupPolicy;
 use baserunna::node::{Node, NodeConfig};
@@ -57,7 +58,13 @@ fn config() -> Result<(NodeConfig, String, String), String> {
         ..NodeConfig::default()
     };
     cfg.engine.cache_bytes = parse("BASERUNNA_CACHE_MB", 512usize)? * 1024 * 1024;
-    cfg.engine.lease_ms = parse("BASERUNNA_LEASE_MS", 15_000u64)?;
+    if let Some(dir) = var("BASERUNNA_DISK_CACHE_DIR") {
+        let bytes = parse("BASERUNNA_DISK_CACHE_MB", 10_240u64)? * 1024 * 1024;
+        let tier = DiskCache::open(&dir, bytes).map_err(|e| format!("cannot open disk cache {dir}: {e}"))?;
+        cfg.engine.local_tier = Some(LocalTier(Arc::new(tier)));
+    }
+    cfg.engine.lease_ms = parse("BASERUNNA_LEASE_MS", 5_000u64)?;
+    cfg.engine.read_lease_ms = 3 * cfg.engine.lease_ms;
     let store = var("BASERUNNA_STORE").unwrap_or_else(|| "fs:./data".into());
     Ok((cfg, listen, store))
 }

@@ -20,7 +20,7 @@ use serde_json::json;
 
 fn fake_image(seed: u8, len: usize) -> Bytes {
     // A deterministic stand-in for real file contents.
-    let mut x: u32 = seed as u32 * 2654435761;
+    let mut x: u32 = (seed as u32).wrapping_mul(2654435761);
     Bytes::from(
         (0..len)
             .map(|_| {

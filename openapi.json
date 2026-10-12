@@ -466,6 +466,38 @@
         ],
         "type": "object"
       },
+      "IndexInfo": {
+        "additionalProperties": false,
+        "description": "A `building` index is maintained by writes but cannot be queried until its backfill finishes.",
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "ready",
+              "building"
+            ],
+            "type": "string"
+          },
+          "unique": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "columns",
+          "unique",
+          "state"
+        ],
+        "type": "object"
+      },
       "InsertRows": {
         "additionalProperties": false,
         "properties": {
@@ -1127,7 +1159,7 @@
           },
           "indexes": {
             "items": {
-              "$ref": "#/components/schemas/Index"
+              "$ref": "#/components/schemas/IndexInfo"
             },
             "type": "array"
           },
@@ -2700,6 +2732,7 @@
     },
     "/v1/dbs/{db}/tables/{t}/indexes": {
       "post": {
+        "description": "Adds the index in the `building` state, backfills it from the table's rows in batches of separate transactions while writes continue, and returns once it is `ready`. If the request fails midway, the index stays `building`; repeating the request resumes the backfill. A unique index over duplicate values is removed again and the request fails with `409 already_exists`.",
         "parameters": [
           {
             "description": "Database name (or `id:<db_id>` for administrators).",
@@ -2745,7 +2778,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Add an index (backfilled transactionally)",
+        "summary": "Add an index (backfilled online)",
         "tags": [
           "tables"
         ]

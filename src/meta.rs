@@ -160,6 +160,10 @@ fn tables() -> Vec<Json> {
             {"name": "name", "type": "string", "nullable": false},
             {"name": "created_at", "type": "int", "nullable": false}
         ], "indexes": [{"name": "by_owner_name", "columns": ["owner_id", "name"], "unique": true}]}),
+        json!({"name": "db_counts", "primary_key": ["owner_id"], "columns": [
+            {"name": "owner_id", "type": "string", "nullable": false},
+            {"name": "count", "type": "int", "nullable": false}
+        ]}),
         json!({"name": "deleted_databases", "primary_key": ["id"], "columns": [
             {"name": "id", "type": "string", "nullable": false},
             {"name": "owner_id", "type": "string", "nullable": false},
@@ -236,8 +240,11 @@ pub enum MetaCmd {
     DeleteDb {
         id: String,
     },
+    /// Record a purge of a deleted database's objects. `passes` is the
+    /// count the purge was made at, so concurrent reapers count it once.
     PurgePass {
         id: String,
+        passes: i64,
     },
     /// Delete up to `limit` sessions that expired before `before_ms`.
     ExpireSessions {
@@ -247,6 +254,10 @@ pub enum MetaCmd {
     Heartbeat {
         node: NodeRecord,
         dead_after_ms: i64,
+    },
+    /// Remove a node from the membership table (graceful shutdown).
+    Leave {
+        id: String,
     },
 }
 
@@ -268,6 +279,7 @@ impl MetaCmd {
             MetaCmd::PurgePass { .. } => "purge_pass",
             MetaCmd::ExpireSessions { .. } => "expire_sessions",
             MetaCmd::Heartbeat { .. } => "heartbeat",
+            MetaCmd::Leave { .. } => "leave",
         }
     }
 }
@@ -315,6 +327,17 @@ pub async fn user_by_google(txn: &mut Txn, sub: &str) -> Result<Option<User>> {
 
 pub async fn list_users(txn: &mut Txn) -> Result<Vec<User>> {
     query_all(txn, "users", Query::default()).await?.into_iter().map(from_row).collect()
+}
+
+/// Whether some session expired before `before_ms`.
+pub async fn any_session_expired(txn: &mut Txn, before_ms: i64) -> Result<bool> {
+    let q = Query {
+        index: Some("by_expiry".into()),
+        range: Some(crate::table::RangeSpec { lt: Some(json!(before_ms)), ..Default::default() }),
+        limit: Some(1),
+        ..Default::default()
+    };
+    Ok(!table::query(txn, "sessions", &q).await?.rows.is_empty())
 }
 
 pub async fn get_session(txn: &mut Txn, token_hash: &str) -> Result<Option<Session>> {
@@ -372,6 +395,41 @@ pub async fn is_migrated(txn: &mut Txn) -> Result<bool> {
         Err(Error::NotFound(_)) => Ok(false),
         Err(e) => Err(e),
     }
+}
+
+/// How many databases `owner_id` has (kept in `db_counts`, so creating a
+/// database reads one row however many the owner has).
+async fn db_count(txn: &mut Txn, owner_id: &str) -> Result<i64> {
+    Ok(table::get(txn, "db_counts", &json!(owner_id)).await?.and_then(|r| r["count"].as_i64()).unwrap_or(0))
+}
+
+async fn set_db_count(txn: &mut Txn, blobs: &BlobResolver<'_>, owner_id: &str, count: i64) -> Result<()> {
+    if count <= 0 {
+        table::delete(txn, "db_counts", &json!(owner_id)).await?;
+    } else {
+        table::insert(txn, blobs, "db_counts", &json!({"owner_id": owner_id, "count": count}), InsertMode::Upsert)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Every owner's `db_counts` row must equal its number of databases, and
+/// owners without databases have no row (consistency checker for tests and
+/// the simulator).
+pub async fn check_db_counts(txn: &mut Txn) -> Result<()> {
+    let mut want: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for d in list_all_dbs(txn).await? {
+        *want.entry(d.owner_id).or_default() += 1;
+    }
+    let mut got = std::collections::BTreeMap::new();
+    for r in query_all(txn, "db_counts", Query::default()).await? {
+        let owner = r["owner_id"].as_str().unwrap_or_default().to_string();
+        got.insert(owner, r["count"].as_i64().unwrap_or(-1));
+    }
+    if got != want {
+        return Err(Error::internal(format!("database counts {got:?} do not match the databases {want:?}")));
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------- writes
@@ -513,23 +571,16 @@ pub async fn apply(txn: &mut Txn, blobs: &BlobResolver<'_>, cmd: &MetaCmd, now_m
             if !valid_db_name(name) {
                 return Err(Error::invalid("database names are 1-63 chars of [a-z0-9_-], starting alphanumeric"));
             }
-            let existing = table::query(
-                txn,
-                "databases",
-                &q_index("by_owner_name", vec![json!(owner_id)], (*max_dbs).clamp(1, 1000)),
-            )
-            .await?;
-            if existing.rows.iter().any(|r| r["name"] == json!(name)) {
-                return Err(Error::AlreadyExists(format!("database {name:?} already exists")));
-            }
-            if existing.rows.len() >= *max_dbs {
-                return Err(Error::PermissionDenied(format!("database limit of {max_dbs} reached")));
-            }
+            let count = db_count(txn, owner_id).await?;
             let d = DbRecord { id: id.clone(), owner_id: owner_id.clone(), name: name.clone(), created_at: now_ms };
             table::insert(txn, blobs, "databases", &to_row(&d), InsertMode::Insert).await.map_err(|e| match e {
                 Error::AlreadyExists(_) => Error::AlreadyExists(format!("database {name:?} already exists")),
                 other => other,
             })?;
+            if count >= *max_dbs as i64 {
+                return Err(Error::PermissionDenied(format!("database limit of {max_dbs} reached")));
+            }
+            set_db_count(txn, blobs, owner_id, count + 1).await?;
             Ok(json!({"id": id, "name": name, "created_at": now_ms}))
         }
         MetaCmd::DeleteDb { id } => {
@@ -537,16 +588,21 @@ pub async fn apply(txn: &mut Txn, blobs: &BlobResolver<'_>, cmd: &MetaCmd, now_m
                 return Err(Error::not_found("database not found"));
             };
             table::delete(txn, "databases", &json!(id)).await?;
+            let count = db_count(txn, &d.owner_id).await?;
+            set_db_count(txn, blobs, &d.owner_id, count - 1).await?;
             let del =
                 DeletedDb { id: d.id.clone(), owner_id: d.owner_id, name: d.name, deleted_at: now_ms, purge_passes: 0 };
             table::insert(txn, blobs, "deleted_databases", &to_row(&del), InsertMode::Upsert).await?;
             Ok(json!({}))
         }
-        MetaCmd::PurgePass { id } => {
+        MetaCmd::PurgePass { id, passes } => {
             let Some(row) = table::get(txn, "deleted_databases", &json!(id)).await? else {
                 return Ok(json!({"done": true}));
             };
             let d: DeletedDb = from_row(row)?;
+            if d.purge_passes != *passes {
+                return Ok(json!({"done": false}));
+            }
             if d.purge_passes >= 1 {
                 table::delete(txn, "deleted_databases", &json!(id)).await?;
                 return Ok(json!({"done": true}));
@@ -582,6 +638,10 @@ pub async fn apply(txn: &mut Txn, blobs: &BlobResolver<'_>, cmd: &MetaCmd, now_m
                     table::delete(txn, "nodes", &json!(n.id)).await?;
                 }
             }
+            Ok(json!({}))
+        }
+        MetaCmd::Leave { id } => {
+            table::delete(txn, "nodes", &json!(id)).await?;
             Ok(json!({}))
         }
     }
@@ -642,10 +702,18 @@ mod tests {
             assert!(matches!(run(c("d3", "three")).await, Err(Error::PermissionDenied(_))));
             run(MetaCmd::DeleteDb { id: "d1".into() }).await.unwrap();
             run(c("d3", "one")).await.unwrap();
+            run(MetaCmd::DeleteDb { id: "d2".into() }).await.unwrap();
+            run(MetaCmd::DeleteDb { id: "d3".into() }).await.unwrap();
             let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            check_db_counts(&mut t).await.unwrap();
+            assert!(table::get(&mut t, "db_counts", &json!("u2")).await.unwrap().is_none(), "no row at zero");
+            run(c("d2", "two")).await.unwrap();
+            run(c("d3", "one")).await.unwrap();
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            check_db_counts(&mut t).await.unwrap();
             assert_eq!(resolve_db(&mut t, "u2", "one").await.unwrap().unwrap().id, "d3");
             assert_eq!(list_dbs(&mut t, "u2").await.unwrap().len(), 2);
-            assert_eq!(list_deleted_dbs(&mut t).await.unwrap().len(), 1);
+            assert_eq!(list_deleted_dbs(&mut t).await.unwrap().len(), 3);
             assert_eq!(user_by_email(&mut t, "b@x.io").await.unwrap().unwrap().id, "u2");
             for name in ["users", "databases", "api_keys"] {
                 table::check_indexes(&mut t, name).await.unwrap();
@@ -655,6 +723,9 @@ mod tests {
                     .await
                     .unwrap();
             }
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            assert!(!any_session_expired(&mut t, 100).await.unwrap());
+            assert!(any_session_expired(&mut t, 101).await.unwrap());
             let r = run(MetaCmd::ExpireSessions { before_ms: 1000, limit: 10 }).await.unwrap();
             assert_eq!(r["deleted"], json!(2));
             let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();

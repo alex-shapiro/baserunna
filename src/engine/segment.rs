@@ -2,17 +2,21 @@
 //!
 //! ```text
 //! [data block]* [bloom] [index] [footer: 64 bytes]
-//! block  = entry* ++ count:u32 ++ crc32c:u32
+//! block  = codec:u8 ++ payload ++ crc32c:u32        (crc covers codec and payload)
+//!          payload = entries ++ count:u32            (codec 0: raw)
+//!          payload = raw_len:varint ++ zstd(entries ++ count:u32)   (codec 1)
 //! bloom  = Bloom ++ crc32c:u32
 //! index  = count:varint ++ (last_key, offset:u64, len:u32)* ++ crc32c:u32
 //! footer = "BRSG" format:u16 0:u16 index_off:u64 index_len:u32
 //!          bloom_off:u64 bloom_len:u32 entries:u64 min_seq:u64 max_seq:u64
 //!          pad:u32 crc32c:u32
 //! ```
-//! This module is pure (no I/O); see `version.rs` for loading.
+//! Blocks are compressed independently, so a point read fetches and
+//! decompresses one block. This module is pure (no I/O); see `version.rs`
+//! for loading.
 
 use super::types::{Entry, Seq};
-use crate::util::bloom::Bloom;
+use crate::util::bloom::{Bloom, key_hash};
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
 use crate::util::crc32c::crc32c;
 use bytes::Bytes;
@@ -20,8 +24,23 @@ use std::sync::Arc;
 
 pub const FOOTER_LEN: usize = 64;
 const MAGIC: &[u8; 4] = b"BRSG";
-const FORMAT: u16 = 1;
+const FORMAT: u16 = 2;
 const BLOOM_BITS_PER_KEY: usize = 10;
+const CODEC_RAW: u8 = 0;
+const CODEC_ZSTD: u8 = 1;
+/// Decompressed blocks larger than this are rejected as corrupt.
+const MAX_BLOCK_RAW: u64 = 64 << 20;
+/// Smallest valid block: codec, entry count and checksum.
+const MIN_BLOCK_LEN: u32 = 9;
+
+/// How data blocks are compressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compression {
+    None,
+    /// zstd at the given level. A block is stored raw when compression
+    /// saves less than an eighth of it.
+    Zstd(i32),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentStats {
@@ -34,36 +53,39 @@ pub struct SegmentStats {
     pub max_seq: Seq,
 }
 
+/// Builds a segment in memory from entries added in key order.
 pub struct SegmentBuilder {
     out: Vec<u8>,
     block: Writer,
     block_entries: u32,
     block_target: usize,
+    compression: Compression,
     index: Vec<(Bytes, u64, u32)>,
-    key_hashes: Vec<Bytes>,
+    hashes: Vec<u64>,
     entries: u64,
     tombstones: u64,
     min_seq: Seq,
     max_seq: Seq,
     first_key: Option<Bytes>,
-    last_key: Option<Bytes>,
+    last_key: Vec<u8>,
 }
 
 impl SegmentBuilder {
-    pub fn new(block_target: usize) -> SegmentBuilder {
+    pub fn new(block_target: usize, compression: Compression) -> SegmentBuilder {
         SegmentBuilder {
             out: Vec::new(),
             block: Writer::new(),
             block_entries: 0,
             block_target: block_target.max(256),
+            compression,
             index: Vec::new(),
-            key_hashes: Vec::new(),
+            hashes: Vec::new(),
             entries: 0,
             tombstones: 0,
             min_seq: Seq::MAX,
             max_seq: 0,
             first_key: None,
-            last_key: None,
+            last_key: Vec::new(),
         }
     }
 
@@ -71,10 +93,27 @@ impl SegmentBuilder {
         self.entries == 0
     }
 
-    /// Keys must be added in strictly increasing order.
+    /// Bytes the segment would have if finished now: exact without
+    /// compression, an upper bound with it.
+    pub fn size_estimate(&self) -> usize {
+        let varint = |v: usize| (usize::BITS - (v | 1).leading_zeros()).div_ceil(7) as usize;
+        // An index entry: the key and its length, offset and length.
+        let entry = |k: usize| varint(k) + k + 12;
+        let (blocks, pending) = match self.block_entries {
+            0 => (self.index.len(), 0),
+            _ => (self.index.len() + 1, self.block.len() + 9 + entry(self.last_key.len())),
+        };
+        let bits = (self.hashes.len() * BLOOM_BITS_PER_KEY).max(64).div_ceil(8);
+        let bloom = 1 + varint(bits) + bits + 4;
+        let index = varint(blocks) + self.index.iter().map(|(k, _, _)| entry(k.len())).sum::<usize>() + 4;
+        self.out.len() + pending + bloom + index + FOOTER_LEN
+    }
+
+    /// Keys must be added in strictly increasing order. Keys and values
+    /// are copied, so the entry's buffers are not retained.
     pub fn add(&mut self, e: &Entry) {
-        if let Some(last) = &self.last_key {
-            assert!(e.key > *last, "segment keys must be strictly increasing");
+        if self.entries > 0 {
+            assert!(e.key[..] > self.last_key[..], "segment keys must be strictly increasing");
         }
         e.encode(&mut self.block);
         self.block_entries += 1;
@@ -85,10 +124,11 @@ impl SegmentBuilder {
         self.min_seq = self.min_seq.min(e.seq);
         self.max_seq = self.max_seq.max(e.seq);
         if self.first_key.is_none() {
-            self.first_key = Some(e.key.clone());
+            self.first_key = Some(Bytes::copy_from_slice(&e.key));
         }
-        self.last_key = Some(e.key.clone());
-        self.key_hashes.push(e.key.clone());
+        self.last_key.clear();
+        self.last_key.extend_from_slice(&e.key);
+        self.hashes.push(key_hash(&e.key));
         if self.block.len() >= self.block_target {
             self.finish_block();
         }
@@ -98,22 +138,40 @@ impl SegmentBuilder {
         if self.block_entries == 0 {
             return;
         }
-        let mut b = std::mem::take(&mut self.block);
-        b.u32(self.block_entries);
-        let crc = crc32c(&b.buf);
-        b.u32(crc);
-        let off = self.out.len() as u64;
-        let len = b.buf.len() as u32;
-        self.out.extend_from_slice(&b.buf);
-        self.index.push((self.last_key.clone().unwrap_or_default(), off, len));
+        let mut raw = std::mem::take(&mut self.block);
+        raw.u32(self.block_entries);
+        let off = self.out.len();
+        let compressed = match self.compression {
+            Compression::Zstd(level) if raw.len() >= 64 => {
+                zstd::bulk::compress(&raw.buf, level).ok().filter(|c| c.len() + 10 < raw.len() - raw.len() / 8)
+            }
+            _ => None,
+        };
+        match compressed {
+            Some(c) => {
+                self.out.push(CODEC_ZSTD);
+                let mut len = Writer::with_capacity(10);
+                len.varint(raw.len() as u64);
+                self.out.extend_from_slice(&len.buf);
+                self.out.extend_from_slice(&c);
+            }
+            None => {
+                self.out.push(CODEC_RAW);
+                self.out.extend_from_slice(&raw.buf);
+            }
+        }
+        let crc = crc32c(&self.out[off..]);
+        self.out.extend_from_slice(&crc.to_le_bytes());
+        let len = (self.out.len() - off) as u32;
+        self.index.push((Bytes::copy_from_slice(&self.last_key), off as u64, len));
         self.block_entries = 0;
     }
 
     pub fn finish(mut self) -> (Bytes, SegmentStats) {
         self.finish_block();
-        let mut bloom = Bloom::new(self.key_hashes.len(), BLOOM_BITS_PER_KEY);
-        for k in &self.key_hashes {
-            bloom.insert(k);
+        let mut bloom = Bloom::new(self.hashes.len(), BLOOM_BITS_PER_KEY);
+        for h in &self.hashes {
+            bloom.insert_hash(*h);
         }
         let bloom_off = self.out.len() as u64;
         let mut bw = Writer::new();
@@ -160,7 +218,7 @@ impl SegmentBuilder {
             entries: self.entries,
             tombstones: self.tombstones,
             min_key: self.first_key.unwrap_or_default(),
-            max_key: self.last_key.unwrap_or_default(),
+            max_key: if self.entries == 0 { Bytes::new() } else { Bytes::from(self.last_key) },
             min_seq,
             max_seq: self.max_seq,
         };
@@ -169,8 +227,8 @@ impl SegmentBuilder {
 }
 
 /// Build a segment from sorted, unique entries.
-pub fn build(entries: &[Entry], block_target: usize) -> (Bytes, SegmentStats) {
-    let mut b = SegmentBuilder::new(block_target);
+pub fn build(entries: &[Entry], block_target: usize, compression: Compression) -> (Bytes, SegmentStats) {
+    let mut b = SegmentBuilder::new(block_target, compression);
     for e in entries {
         b.add(e);
     }
@@ -257,7 +315,7 @@ impl SegmentIndex {
             let k = Bytes::copy_from_slice(r.bytes()?);
             let off = r.u64()?;
             let len = r.u32()?;
-            if off != prev_end || len < 8 {
+            if off != prev_end || len < MIN_BLOCK_LEN {
                 return Err(DecodeError("bad block layout"));
             }
             prev_end = off + len as u64;
@@ -294,6 +352,13 @@ impl SegmentIndex {
         if i < self.blocks.len() { Some(i) } else { None }
     }
 
+    /// The byte range of blocks `first..end`.
+    pub fn span(&self, blocks: std::ops::Range<usize>) -> std::ops::Range<u64> {
+        let start = self.blocks[blocks.start].1;
+        let (_, off, len) = self.blocks[blocks.end - 1];
+        start..off + len as u64
+    }
+
     pub fn mem_size(&self) -> usize {
         self.blocks.iter().map(|(k, _, _)| k.len() + 32).sum::<usize>() + self.bloom.size_bytes() + 128
     }
@@ -301,15 +366,34 @@ impl SegmentIndex {
 
 pub type Block = Arc<Vec<Entry>>;
 
-/// Decode and verify one block (including its trailing count and crc).
+/// Decode and verify one stored block.
 pub fn decode_block(raw: Bytes) -> DResult<Block> {
     let body = check_crc(&raw)?;
-    if body.len() < 4 {
+    let (&codec, _) = body.split_first().ok_or(DecodeError("block too short"))?;
+    let payload = raw.slice(1..body.len());
+    let data = match codec {
+        CODEC_RAW => payload,
+        CODEC_ZSTD => {
+            let mut r = Reader::new(&payload);
+            let n = r.varint()?;
+            if n > MAX_BLOCK_RAW {
+                return Err(DecodeError("block too large"));
+            }
+            let c = &payload[payload.len() - r.remaining()..];
+            let d = zstd::bulk::decompress(c, n as usize).map_err(|_| DecodeError("bad compressed block"))?;
+            if d.len() as u64 != n {
+                return Err(DecodeError("compressed block length mismatch"));
+            }
+            Bytes::from(d)
+        }
+        _ => return Err(DecodeError("unknown block codec")),
+    };
+    if data.len() < 4 {
         return Err(DecodeError("block too short"));
     }
-    let n = u32::from_le_bytes([body[body.len() - 4], body[body.len() - 3], body[body.len() - 2], body[body.len() - 1]])
-        as usize;
-    let entries_bytes = raw.slice(0..body.len() - 4);
+    let tail = &data[data.len() - 4..];
+    let n = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as usize;
+    let entries_bytes = data.slice(0..data.len() - 4);
     let mut r = Reader::new(&entries_bytes);
     let mut out = Vec::with_capacity(n.min(entries_bytes.len()));
     for _ in 0..n {
@@ -328,7 +412,22 @@ pub fn decode_block(raw: Bytes) -> DResult<Block> {
     Ok(Arc::new(out))
 }
 
-/// Read every entry of a fully-loaded segment (tests, compaction).
+/// Decode the blocks `first..` of a segment from `data`, the segment's bytes
+/// starting at block `first`'s offset (a bulk read of consecutive blocks).
+pub fn decode_blocks(idx: &SegmentIndex, first: usize, data: &Bytes) -> DResult<Vec<Block>> {
+    let base = idx.blocks.get(first).ok_or(DecodeError("block out of range"))?.1;
+    let mut out = Vec::new();
+    for (_, off, len) in &idx.blocks[first..] {
+        let (s, e) = ((off - base) as usize, (off - base + *len as u64) as usize);
+        if e > data.len() {
+            break;
+        }
+        out.push(decode_block(data.slice(s..e))?);
+    }
+    Ok(out)
+}
+
+/// Read every entry of a fully-loaded segment (tests, checks).
 pub fn read_all(data: &Bytes) -> DResult<Vec<Entry>> {
     let idx = SegmentIndex::decode_whole(data)?;
     let mut out = Vec::with_capacity(idx.footer.entries as usize);
@@ -376,7 +475,7 @@ mod tests {
                 value: Value::Inline(Bytes::from(vec![7u8; 40])),
             })
             .collect();
-        let (data, _) = build(&entries, 256);
+        let (data, _) = build(&entries, 256, Compression::None);
         assert_eq!(read_all(&data).unwrap(), entries);
         let fo = data.len() - FOOTER_LEN;
         // (offset, width) of index_off, index_len, bloom_off, bloom_len.
@@ -433,7 +532,7 @@ mod tests {
                 value: Value::Inline(Bytes::from(vec![7u8; 40])),
             })
             .collect();
-        let (data, _) = build(&entries, 256);
+        let (data, _) = build(&entries, 256, Compression::None);
         let blocks = SegmentIndex::decode_whole(&data).unwrap().blocks;
         assert!(blocks.len() >= 3);
         assert!(SegmentIndex::decode_whole(&with_index(&data, &blocks, &[])).is_ok(), "setup");
@@ -441,9 +540,9 @@ mod tests {
         gap[1].1 += 1;
         gap[1].2 -= 1;
         let mut tiny = blocks.clone();
-        tiny[0].2 = 4;
-        tiny[1].1 = 4;
-        tiny[1].2 += blocks[0].2 - 4;
+        tiny[0].2 = MIN_BLOCK_LEN - 1;
+        tiny[1].1 = (MIN_BLOCK_LEN - 1) as u64;
+        tiny[1].2 += blocks[0].2 - (MIN_BLOCK_LEN - 1);
         for (what, bad, trailing) in
             [("gap", gap, &[][..]), ("tiny block", tiny, &[][..]), ("trailing", blocks, &[0][..])]
         {
@@ -451,12 +550,77 @@ mod tests {
         }
     }
 
+    fn sealed(body: &[u8]) -> Bytes {
+        let mut raw = body.to_vec();
+        raw.extend_from_slice(&crc32c(body).to_le_bytes());
+        Bytes::from(raw)
+    }
+
     #[test]
     fn blocks_too_short_for_their_count_are_rejected() {
-        for body in [&b""[..], b"\x01", b"\x01\x02\x03"] {
-            let mut raw = body.to_vec();
-            raw.extend_from_slice(&crc32c(body).to_le_bytes());
-            assert!(decode_block(Bytes::from(raw)).is_err(), "{body:?}");
+        for body in [&b""[..], b"\x00", b"\x00\x01", b"\x00\x01\x02\x03"] {
+            assert!(decode_block(sealed(body)).is_err(), "{body:?}");
+        }
+    }
+
+    /// Compressed blocks with valid checksums but a wrong declared length,
+    /// a length past the limit, garbage, or an unknown codec are rejected.
+    #[test]
+    fn rejects_bad_compressed_blocks() {
+        let mut raw = Writer::new();
+        Entry { key: Bytes::from_static(b"k"), seq: 1, value: Value::Inline(Bytes::from(vec![b'x'; 300])) }
+            .encode(&mut raw);
+        raw.u32(1);
+        let z = zstd::bulk::compress(&raw.buf, 3).unwrap();
+        let block = |codec: u8, n: u64, payload: &[u8]| {
+            let mut w = Writer::new();
+            w.u8(codec);
+            w.varint(n);
+            w.raw(payload);
+            sealed(&w.buf)
+        };
+        assert_eq!(decode_block(block(CODEC_ZSTD, raw.len() as u64, &z)).unwrap().len(), 1, "setup");
+        for (what, b) in [
+            ("short length", block(CODEC_ZSTD, raw.len() as u64 - 1, &z)),
+            ("long length", block(CODEC_ZSTD, raw.len() as u64 + 1, &z)),
+            ("over the limit", block(CODEC_ZSTD, MAX_BLOCK_RAW + 1, &z)),
+            // Rejected before anything is allocated for it.
+            ("a terabyte", block(CODEC_ZSTD, 1 << 40, &z)),
+            ("garbage", block(CODEC_ZSTD, raw.len() as u64, &z[..z.len() / 2])),
+            ("unknown codec", block(7, raw.len() as u64, &z)),
+        ] {
+            assert!(decode_block(b).is_err(), "{what} was accepted");
+        }
+    }
+
+    /// Compressible data shrinks; incompressible data is stored raw and
+    /// costs one byte per block.
+    #[test]
+    fn compression_pays_or_is_skipped() {
+        let mut r = Rng::new(3);
+        let entries = |random: bool, r: &mut Rng| -> Vec<Entry> {
+            (0..500u64)
+                .map(|i| Entry {
+                    key: Bytes::from(format!("row/{i:06}")),
+                    seq: i,
+                    value: Value::Inline(Bytes::from(if random {
+                        r.bytes(100)
+                    } else {
+                        format!("{{\"id\":{i},\"name\":\"user number {i}\",\"active\":true}}").into_bytes()
+                    })),
+                })
+                .collect()
+        };
+        for random in [false, true] {
+            let es = entries(random, &mut r);
+            let (plain, _) = build(&es, 4096, Compression::None);
+            let (packed, _) = build(&es, 4096, Compression::Zstd(3));
+            assert_eq!(read_all(&packed).unwrap(), es);
+            if random {
+                assert_eq!(packed.len(), plain.len(), "incompressible blocks are stored as they are");
+            } else {
+                assert!(packed.len() * 3 < plain.len(), "{} vs {} bytes", packed.len(), plain.len());
+            }
         }
     }
 
@@ -465,10 +629,13 @@ mod tests {
         prop::check(
             "segment-roundtrip",
             200,
-            |r| (gen_entries(r), 256 + r.usize(4096)),
-            |(v, bt)| prop::shrink_vec(v).into_iter().map(|v| (v, *bt)).collect(),
-            |(entries, bt)| {
-                let (data, stats) = build(entries, *bt);
+            |r| {
+                let c = if r.chance(0.5) { Compression::None } else { Compression::Zstd(1 + r.below(5) as i32) };
+                (gen_entries(r), 256 + r.usize(4096), c)
+            },
+            |(v, bt, c)| prop::shrink_vec(v).into_iter().map(|v| (v, *bt, *c)).collect(),
+            |(entries, bt, c)| {
+                let (data, stats) = build(entries, *bt, *c);
                 let back = read_all(&data).map_err(|e| e.to_string())?;
                 if &back != entries {
                     return Err("entries differ".into());
@@ -509,13 +676,45 @@ mod tests {
         );
     }
 
+    /// The size estimate that cuts compaction output is the size of the
+    /// finished segment, at every point of building it (uncompressed).
+    #[test]
+    fn size_estimates_track_the_finished_size() {
+        let mut r = Rng::new(8);
+        for _ in 0..50 {
+            let entries = gen_entries(&mut r);
+            let block_target = 256 + r.usize(2048);
+            for cut in [entries.len() / 3, entries.len()] {
+                let mut b = SegmentBuilder::new(block_target, Compression::None);
+                for e in &entries[..cut] {
+                    b.add(e);
+                }
+                let estimate = b.size_estimate();
+                let (data, _) = b.finish();
+                let diff = estimate as i64 - data.len() as i64;
+                assert_eq!(diff, 0, "estimated {estimate} bytes for {}", data.len());
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "strictly increasing")]
+    fn keys_out_of_order_are_refused() {
+        let e = |k: &'static [u8]| Entry { key: Bytes::from_static(k), seq: 1, value: Value::Tombstone };
+        let mut b = SegmentBuilder::new(256, Compression::None);
+        b.add(&e(b"b"));
+        b.add(&e(b"c"));
+        b.add(&e(b"a"));
+    }
+
     #[test]
     fn fuzz_decoders_never_panic() {
         let mut r = Rng::new(99);
-        let (good, _) = build(&gen_entries(&mut Rng::new(1)), 512);
+        let (plain, _) = build(&gen_entries(&mut Rng::new(1)), 512, Compression::None);
+        let (packed, _) = build(&gen_entries(&mut Rng::new(1)), 512, Compression::Zstd(3));
         for i in 0..3000 {
-            let mut d = if i % 2 == 0 {
-                good.to_vec()
+            let mut d = if i % 3 < 2 {
+                if i % 3 == 0 { plain.to_vec() } else { packed.to_vec() }
             } else {
                 let n = r.usize(300);
                 r.bytes(n)
@@ -537,7 +736,7 @@ mod tests {
 
     #[test]
     fn empty_segment() {
-        let (data, stats) = build(&[], 1024);
+        let (data, stats) = build(&[], 1024, Compression::Zstd(3));
         assert_eq!(stats.entries, 0);
         assert!(read_all(&data).unwrap().is_empty());
     }

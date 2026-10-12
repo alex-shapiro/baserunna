@@ -30,11 +30,17 @@ pub struct NodeConfig {
     pub admin_password: Option<String>,
     pub pbkdf2_iterations: u32,
     pub session_ttl_ms: u64,
+    /// How often a node rewrites its membership record. A node whose record
+    /// is older than three intervals is dead.
     pub heartbeat_ms: u64,
+    /// How often a node re-reads the membership table.
+    pub members_refresh_ms: u64,
     pub auth_cache_ms: u64,
     pub sys_staleness_ms: u64,
     pub db_delete_grace_ms: u64,
     pub max_dbs_per_user: usize,
+    /// Rows per transaction when backfilling a new index.
+    pub index_backfill_batch_rows: usize,
     pub json_value_max: u64,
     pub max_json_body: usize,
     pub txn_idle_ms: u64,
@@ -57,11 +63,13 @@ impl Default for NodeConfig {
             admin_password: None,
             pbkdf2_iterations: 600_000,
             session_ttl_ms: 30 * 24 * 3_600_000,
-            heartbeat_ms: 10_000,
+            heartbeat_ms: 120_000,
+            members_refresh_ms: 30_000,
             auth_cache_ms: 30_000,
             sys_staleness_ms: 2_000,
             db_delete_grace_ms: 10 * 60_000,
             max_dbs_per_user: 1000,
+            index_backfill_batch_rows: 1000,
             json_value_max: 1024 * 1024,
             max_json_body: 32 * 1024 * 1024,
             txn_idle_ms: 30_000,
@@ -149,7 +157,7 @@ pub struct Node {
     pub transport: Arc<dyn Transport>,
     pub oidc: Option<Arc<dyn OidcProvider>>,
     members: Mutex<Vec<NodeRecord>>,
-    suspects: Mutex<DetHashMap<String, Instant>>,
+    suspects: Mutex<DetHashMap<String, Suspect>>,
     auth_cache: Mutex<DetHashMap<String, (Instant, Principal)>>,
     name_cache: Mutex<DetHashMap<(String, String), (Instant, DbRecord)>>,
     pub(crate) txns: Mutex<DetHashMap<String, Arc<tokio::sync::Mutex<OpenTxn>>>>,
@@ -162,6 +170,20 @@ pub struct Node {
     pub started_ms: u64,
     router: OnceLock<axum::Router>,
 }
+
+/// A peer that a forwarded request certainly did not reach.
+struct Suspect {
+    /// Its membership record when it was last suspected.
+    started_at: i64,
+    heartbeat_at: i64,
+    strikes: u32,
+    /// It stays out of routing until then, unless it heartbeats first.
+    until: Instant,
+}
+
+/// Suspicion after a first failed forward; it doubles with each further
+/// failure, up to the membership liveness window.
+const SUSPECT_MIN: Duration = Duration::from_secs(10);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -177,11 +199,12 @@ impl Node {
         transport: Arc<dyn Transport>,
         oidc: Option<Arc<dyn OidcProvider>>,
     ) -> Result<Arc<Node>> {
+        cfg.engine.validate().map_err(|e| Error::invalid(format!("engine configuration: {e}")))?;
         let id = format!("{}-{}", cfg.name, env.random_hex(4));
         let engine = Engine::new(store, env.clone(), cfg.engine.clone(), id.clone());
         let node = Arc::new(Node {
             id,
-            started_ms: env.now_ms(),
+            started_ms: engine.shared.time_ms(),
             env,
             engine,
             transport,
@@ -203,6 +226,9 @@ impl Node {
     }
 
     async fn bootstrap(self: &Arc<Self>) -> Result<()> {
+        if let Err(e) = self.engine.shared.store_time_ms().await {
+            crate::warn!("{}: could not measure the store clock yet: {e}", self.id);
+        }
         let sys = self.engine.db(SYS_DB);
         retry_unavailable(|| sys.open(true)).await?;
         // Members and the cluster key first, so that metadata commands can be
@@ -254,13 +280,17 @@ impl Node {
 
     fn spawn_background(self: &Arc<Self>) {
         let me = Arc::downgrade(self);
-        let hb = self.cfg.heartbeat_ms;
+        let (refresh, hb) = (self.cfg.members_refresh_ms, Duration::from_millis(self.cfg.heartbeat_ms));
         self.env.spawn(async move {
+            let mut last_heartbeat = Instant::now();
             loop {
-                tokio::time::sleep(Duration::from_millis(hb)).await;
+                tokio::time::sleep(Duration::from_millis(refresh)).await;
                 let Some(n) = me.upgrade() else { return };
-                if let Err(e) = n.heartbeat().await {
-                    crate::debug!("{}: heartbeat failed: {e}", n.id);
+                if last_heartbeat.elapsed() >= hb {
+                    match n.heartbeat().await {
+                        Ok(()) => last_heartbeat = Instant::now(),
+                        Err(e) => crate::debug!("{}: heartbeat failed: {e}", n.id),
+                    }
                 }
                 let _ = n.refresh_members().await;
             }
@@ -303,11 +333,13 @@ impl Node {
         lock(&self.cookie_key).clone()
     }
 
-    /// Give up leases and stop background work.
+    /// Give up leases, leave the membership table and stop background work.
     pub async fn shutdown(&self) {
         for db in self.engine.open_dbs() {
             let _ = tokio::time::timeout(Duration::from_secs(2), db.release_lease()).await;
         }
+        let leave = self.run_meta(MetaCmd::Leave { id: self.id.clone() });
+        let _ = tokio::time::timeout(Duration::from_secs(2), leave).await;
         self.env.shutdown();
     }
 
@@ -317,24 +349,30 @@ impl Node {
         lock(&self.members).clone()
     }
 
+    /// Members with a recent heartbeat that no failed forward has made
+    /// suspect.
     pub fn live_members(&self) -> Vec<NodeRecord> {
-        let now = self.env.now_ms() as i64;
-        let suspects = lock(&self.suspects);
+        let now = self.now_ms() as i64;
         cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
             .into_iter()
-            .filter(|n| n.id == self.id || !suspects.get(&n.id).is_some_and(|t| t.elapsed() < Duration::from_secs(10)))
+            .filter(|n| n.id == self.id || !self.is_suspect(&n.id))
             .collect()
     }
 
     pub async fn refresh_members(&self) -> Result<()> {
         let mut t = self.sys_read().await?;
         let nodes = meta::list_nodes(&mut t).await?;
+        // A suspect that heartbeated since (or restarted, or left) is
+        // forgiven.
+        lock(&self.suspects).retain(|id, s| {
+            nodes.iter().any(|n| n.id == *id && n.started_at == s.started_at && n.heartbeat_at <= s.heartbeat_at)
+        });
         *lock(&self.members) = nodes;
         Ok(())
     }
 
     async fn heartbeat(&self) -> Result<()> {
-        let now = self.env.now_ms() as i64;
+        let now = self.now_ms() as i64;
         self.run_meta(MetaCmd::Heartbeat {
             node: NodeRecord {
                 id: self.id.clone(),
@@ -352,8 +390,22 @@ impl Node {
         lock(&self.members).iter().find(|n| n.id == node_id).map(|n| n.addr.clone())
     }
 
+    /// Keep `node_id` out of routing after a request certainly failed to
+    /// reach it: until membership shows a newer heartbeat from it, or a
+    /// backoff passes that starts at 10 s and doubles with every further
+    /// failure, up to the liveness window.
     pub fn mark_suspect(&self, node_id: &str) {
-        lock(&self.suspects).insert(node_id.to_string(), Instant::now());
+        let rec = lock(&self.members).iter().find(|n| n.id == node_id).cloned();
+        let (started_at, heartbeat_at) = rec.map(|n| (n.started_at, n.heartbeat_at)).unwrap_or((0, i64::MIN));
+        let mut g = lock(&self.suspects);
+        let strikes = g.get(node_id).map_or(1, |s| s.strikes.saturating_add(1));
+        let max = Duration::from_millis(3 * self.cfg.heartbeat_ms).max(SUSPECT_MIN);
+        let backoff = SUSPECT_MIN.saturating_mul(1u32 << (strikes - 1).min(16)).min(max);
+        g.insert(node_id.to_string(), Suspect { started_at, heartbeat_at, strikes, until: Instant::now() + backoff });
+    }
+
+    fn is_suspect(&self, node_id: &str) -> bool {
+        lock(&self.suspects).get(node_id).is_some_and(|s| Instant::now() < s.until)
     }
 
     /// Where requests for `db_id` should go: `None` = handle here.
@@ -370,7 +422,7 @@ impl Node {
         if target == self.id {
             return None;
         }
-        if lock(&self.suspects).get(&target).is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
+        if self.is_suspect(&target) {
             return None;
         }
         let addr = self.addr_of(&target)?;
@@ -454,7 +506,7 @@ impl Node {
     pub async fn run_meta_local(&self, cmd: &MetaCmd) -> Result<Json> {
         let sys = self.engine.db(SYS_DB);
         let mut t = sys.begin(Isolation::Serializable, Consistency::Strong).await?;
-        let r = meta::apply(&mut t, &BlobResolver { db: &sys }, cmd, self.env.now_ms() as i64).await?;
+        let r = meta::apply(&mut t, &BlobResolver { db: &sys }, cmd, self.now_ms() as i64).await?;
         sys.commit(t.into_request()).await?;
         Ok(r)
     }
@@ -528,7 +580,7 @@ impl Node {
             Principal { user, cred: Credential::ApiKey { id: k.id, db_id: k.db_id, read_only: k.read_only } }
         } else if token.starts_with(auth::SESSION_PREFIX) {
             let s = meta::get_session(&mut t, cache_key).await?.ok_or_else(unauth)?;
-            if s.expires_at < self.env.now_ms() as i64 {
+            if s.expires_at < self.now_ms() as i64 {
                 return Err(unauth());
             }
             let user = meta::get_user(&mut t, &s.user_id).await?.ok_or_else(unauth)?;
@@ -560,7 +612,7 @@ impl Node {
         self.run_meta(MetaCmd::CreateSession {
             token_hash: hash,
             user_id: user_id.to_string(),
-            expires_at: (self.env.now_ms() + self.cfg.session_ttl_ms) as i64,
+            expires_at: (self.now_ms() + self.cfg.session_ttl_ms) as i64,
         })
         .await?;
         Ok(token)
@@ -646,6 +698,7 @@ impl Node {
 
     fn housekeeping(&self) {
         self.engine.evict_idle(self.cfg.db_idle_evict_ms);
+        self.engine.shared.refresh_clock();
         let idle = Duration::from_millis(self.cfg.txn_idle_ms);
         let max = Duration::from_millis(self.cfg.txn_max_ms);
         lock(&self.txns).retain(|_, t| match t.try_lock() {
@@ -655,31 +708,47 @@ impl Node {
         let ttl = Duration::from_millis(self.cfg.auth_cache_ms);
         lock(&self.auth_cache).retain(|_, (t, _)| t.elapsed() < ttl);
         lock(&self.name_cache).retain(|_, (t, _)| t.elapsed() < ttl);
-        lock(&self.suspects).retain(|_, t| t.elapsed() < Duration::from_secs(10));
         self.forwards.expire();
     }
 
-    /// Purge deleted databases whose grace period has passed (system
-    /// database lease holder only).
+    /// Purge deleted databases whose grace period has passed. Runs on the
+    /// node that requests for the system database go to, and only with a
+    /// store clock measurement (deletion times are store time).
     pub async fn reap_deleted(&self) -> Result<usize> {
-        let sys = self.engine.db(SYS_DB);
-        if sys.lease_holder().as_deref() != Some(self.id.as_str()) {
+        if self.route(SYS_DB).await.is_some() {
             return Ok(0);
         }
-        let mut t = self.sys_read().await?;
-        let now = self.env.now_ms() as i64;
+        let Some(store_now) = self.engine.shared.store_now_ms() else {
+            return Ok(0);
+        };
+        let now = self.now_ms() as i64;
+        // Minutes of staleness are harmless against a grace period of
+        // minutes, and membership refreshes keep this snapshot validated.
+        let sys = self.engine.db(SYS_DB);
+        let stale_ok = Consistency::Snapshot { max_staleness_ms: 2 * self.cfg.members_refresh_ms };
+        let mut t = sys.begin(Isolation::Serializable, stale_ok).await?;
         let mut n = 0;
         for d in meta::list_deleted_dbs(&mut t).await? {
-            if d.deleted_at + (self.cfg.db_delete_grace_ms as i64) > now {
+            if d.deleted_at + (self.cfg.db_delete_grace_ms as i64) > store_now as i64 {
                 continue;
             }
             self.engine.purge(&d.id).await?;
-            self.run_meta(MetaCmd::PurgePass { id: d.id.clone() }).await?;
+            self.run_meta(MetaCmd::PurgePass { id: d.id.clone(), passes: d.purge_passes }).await?;
             n += 1;
         }
         // Expired sessions (bounded work per pass).
-        self.run_meta(MetaCmd::ExpireSessions { before_ms: now, limit: 500 }).await?;
+        if meta::any_session_expired(&mut t, now).await? {
+            self.run_meta(MetaCmd::ExpireSessions { before_ms: now, limit: 500 }).await?;
+        }
         Ok(n)
+    }
+
+    /// Cluster time for metadata: the store's clock as this node measured
+    /// it, so that timestamps written by one node and compared by another
+    /// (heartbeats, session expiry, deadlines, deletions) do not depend on
+    /// node clock skew. This node's wall clock until the first measurement.
+    pub fn now_ms(&self) -> u64 {
+        self.engine.shared.time_ms()
     }
 
     pub fn open_txn_count(&self) -> usize {
@@ -718,4 +787,41 @@ where
         }
     }
     f().await
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sim::cost::{World, run_paused};
+    use std::time::Duration;
+
+    /// A peer that a forward failed to reach leaves routing until it
+    /// heartbeats again, or for a backoff that grows with each failure;
+    /// a node that shuts down leaves the membership table.
+    #[test]
+    fn suspects_come_back_and_leavers_go() {
+        run_paused(async {
+            let w = World::new(2, 1).await;
+            let (a, b) = (w.node(0).clone(), w.node(1).clone());
+            a.refresh_members().await.unwrap();
+            let live = |n: &super::Node| n.live_members().into_iter().map(|m| m.id).collect::<Vec<_>>();
+            assert!(live(&a).contains(&b.id));
+            a.mark_suspect(&b.id);
+            assert!(!live(&a).contains(&b.id), "a suspect is not routed to");
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            assert!(live(&a).contains(&b.id), "the first suspicion lasts 10 s");
+            a.mark_suspect(&b.id);
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            assert!(!live(&a).contains(&b.id), "repeated failures back off longer");
+            for _ in 0..8 {
+                a.mark_suspect(&b.id);
+            }
+            // The backoff is now the liveness window, but b's next
+            // heartbeat ends it.
+            tokio::time::sleep(Duration::from_millis(a.cfg.heartbeat_ms + 2 * a.cfg.members_refresh_ms)).await;
+            assert!(live(&a).contains(&b.id), "a new heartbeat forgives a suspect");
+            b.shutdown().await;
+            a.refresh_members().await.unwrap();
+            assert!(a.members().iter().all(|m| m.id != b.id), "a node that shut down left the membership");
+        });
+    }
 }

@@ -151,6 +151,10 @@ impl ObjectStore for MemStore {
     ) -> BoxFut<'a, SResult<ListPage>> {
         Box::pin(async move { Ok(self.list_sync(prefix, start_after, limit)) })
     }
+
+    fn time_precision_ms(&self) -> u64 {
+        1
+    }
 }
 
 #[cfg(test)]

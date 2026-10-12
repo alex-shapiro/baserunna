@@ -13,18 +13,31 @@ const MAGIC: &[u8; 4] = b"BRMF";
 
 /// The database was deleted: every read and commit fails with not-found.
 pub const FLAG_DELETED: u64 = 1;
-const FORMAT: u16 = 1;
+const FORMAT: u16 = 2;
+
+/// Deepest segment level. Level 0 holds flushed tails, newest first, which
+/// may overlap; each level from 1 to `MAX_LEVEL` is one sorted run of
+/// segments with disjoint key ranges.
+pub const MAX_LEVEL: u8 = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lease {
     pub node: String,
+    /// The holder's wall-clock expiry: identifies a renewal and hints at
+    /// routing, but is never compared with another clock.
     pub expires_ms: u64,
+    /// The lease's duration, which other nodes wait out (plus a margin)
+    /// from when they first see this renewal.
+    pub ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentMeta {
     /// 32 hex chars, unique.
     pub id: String,
+    /// Not stored in the segment: moving a segment to another level is a
+    /// manifest change.
+    pub level: u8,
     pub size: u64,
     pub entries: u64,
     pub tombstones: u64,
@@ -58,8 +71,14 @@ pub struct Manifest {
     /// Bit flags; see [`FLAG_DELETED`].
     pub flags: u64,
     pub lease: Option<Lease>,
-    /// Newest first.
+    /// Ordered by level. Level 0 is newest first; deeper levels are in key
+    /// order. For any key, a shallower segment holds a newer entry than a
+    /// deeper one.
     pub segments: Vec<SegmentMeta>,
+    /// Incremented by every compaction install. A compaction installs only
+    /// onto the manifest it was planned from (flushes aside), so two
+    /// compactions can never interleave.
+    pub compaction_seq: u64,
     /// Sorted by key; newest entry per key.
     pub tail: Vec<Entry>,
     pub tombstone_horizon: Seq,
@@ -105,11 +124,13 @@ impl Manifest {
                 w.u8(1);
                 w.str(&l.node);
                 w.u64(l.expires_ms);
+                w.varint(l.ms);
             }
         }
         w.varint(self.segments.len() as u64);
         for s in &self.segments {
             w.str(&s.id);
+            w.u8(s.level);
             w.varint(s.size);
             w.varint(s.entries);
             w.varint(s.tombstones);
@@ -118,6 +139,7 @@ impl Manifest {
             w.varint(s.min_seq);
             w.varint(s.max_seq);
         }
+        w.varint(self.compaction_seq);
         w.varint(self.tail.len() as u64);
         for e in &self.tail {
             e.encode(&mut w);
@@ -168,7 +190,7 @@ impl Manifest {
         let flags = r.varint()?;
         let lease = match r.u8()? {
             0 => None,
-            1 => Some(Lease { node: r.string()?, expires_ms: r.u64()? }),
+            1 => Some(Lease { node: r.string()?, expires_ms: r.u64()?, ms: r.varint()? }),
             _ => return Err(DecodeError("bad lease tag")),
         };
         let max = r.remaining();
@@ -177,6 +199,7 @@ impl Manifest {
         for _ in 0..n {
             let s = SegmentMeta {
                 id: r.string()?,
+                level: r.u8()?,
                 size: r.varint()?,
                 entries: r.varint()?,
                 tombstones: r.varint()?,
@@ -190,6 +213,7 @@ impl Manifest {
             }
             segments.push(s);
         }
+        let compaction_seq = r.varint()?;
         let n = r.len(r.remaining())?;
         let mut tail: Vec<Entry> = Vec::with_capacity(n.min(65536));
         for _ in 0..n {
@@ -230,7 +254,7 @@ impl Manifest {
         if !r.is_empty() {
             return Err(DecodeError("manifest trailing data"));
         }
-        Ok(Manifest {
+        let m = Manifest {
             db_id,
             version,
             write_seq,
@@ -238,13 +262,54 @@ impl Manifest {
             flags,
             lease,
             segments,
+            compaction_seq,
             tail,
             tombstone_horizon,
             recent_commits,
             version_times,
             obsolete,
             last_sweep_ms,
-        })
+        };
+        m.check_levels().map_err(DecodeError)?;
+        Ok(m)
+    }
+
+    /// The segments of `level`.
+    pub fn level(&self, level: u8) -> &[SegmentMeta] {
+        let start = self.segments.partition_point(|s| s.level < level);
+        let end = self.segments.partition_point(|s| s.level <= level);
+        &self.segments[start..end]
+    }
+
+    pub fn level_bytes(&self, level: u8) -> u64 {
+        self.level(level).iter().map(|s| s.size).sum()
+    }
+
+    /// Restore the segment order after changes: by level, level 0 keeping
+    /// its relative (recency) order, deeper levels by key.
+    pub fn sort_segments(&mut self) {
+        self.segments.sort_by(|a, b| {
+            a.level
+                .cmp(&b.level)
+                .then_with(|| if a.level == 0 { std::cmp::Ordering::Equal } else { a.min_key.cmp(&b.min_key) })
+        });
+    }
+
+    /// Levels are in order, within range, and disjoint below level 0.
+    pub fn check_levels(&self) -> Result<(), &'static str> {
+        for w in self.segments.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            if a.level > b.level {
+                return Err("segments out of level order");
+            }
+            if a.level == b.level && a.level > 0 && a.max_key >= b.min_key {
+                return Err("overlapping segments within a level");
+            }
+        }
+        if self.segments.iter().any(|s| s.level > MAX_LEVEL || s.min_key > s.max_key) {
+            return Err("bad segment level or key range");
+        }
+        Ok(())
     }
 
     /// Newest sampled version that is at least `age_ms` old at `now_ms`
@@ -270,9 +335,11 @@ mod tests {
         m.version = 42;
         m.write_seq = 50;
         m.flags = FLAG_DELETED;
-        m.lease = Some(Lease { node: "n1".into(), expires_ms: 999 });
+        m.lease = Some(Lease { node: "n1".into(), expires_ms: 999, ms: 5_000 });
+        m.compaction_seq = 9;
         m.segments.push(SegmentMeta {
             id: "0".repeat(32),
+            level: 0,
             size: 100,
             entries: 3,
             tombstones: 1,
@@ -303,6 +370,43 @@ mod tests {
         assert_eq!(m.commit_version(u128::MAX), Some(42));
         assert_eq!(m.version_at_least_age(250, 100), 0);
         assert_eq!(m.version_at_least_age(400, 100), 40);
+    }
+
+    fn seg(id: char, level: u8, min: &str, max: &str) -> SegmentMeta {
+        SegmentMeta {
+            id: id.to_string().repeat(32),
+            level,
+            size: 10,
+            entries: 1,
+            tombstones: 0,
+            min_key: Bytes::copy_from_slice(min.as_bytes()),
+            max_key: Bytes::copy_from_slice(max.as_bytes()),
+            min_seq: 0,
+            max_seq: 0,
+        }
+    }
+
+    #[test]
+    fn levels() {
+        let mut m = Manifest::new("d", 0);
+        m.segments = vec![seg('a', 0, "a", "z"), seg('b', 0, "b", "c"), seg('c', 2, "m", "p"), seg('d', 2, "a", "c")];
+        assert!(m.check_levels().is_err(), "level 2 out of key order");
+        m.sort_segments();
+        assert!(m.check_levels().is_ok());
+        let ids = |l: &[SegmentMeta]| l.iter().map(|s| &s.id[..1]).collect::<String>();
+        assert_eq!((ids(m.level(0)), ids(m.level(1)), ids(m.level(2))), ("ab".into(), "".into(), "dc".into()));
+        assert_eq!(m.level_bytes(2), 20);
+        assert!(Manifest::decode(&m.encode()).is_ok());
+        let mut overlapping = m.clone();
+        overlapping.segments.push(seg('e', 2, "p", "q"));
+        assert!(overlapping.check_levels().is_err(), "keys shared by neighbors in a level");
+        assert!(Manifest::decode(&overlapping.encode()).is_err());
+        let mut deep = m.clone();
+        deep.segments.push(seg('f', MAX_LEVEL + 1, "a", "b"));
+        assert!(deep.check_levels().is_err());
+        let mut inverted = m;
+        inverted.segments[0] = seg('a', 0, "z", "a");
+        assert!(inverted.check_levels().is_err());
     }
 
     #[test]

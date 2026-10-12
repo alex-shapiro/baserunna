@@ -56,7 +56,7 @@ Concerns:
 - **Failover.** A new SlateDB writer bumps the writer epoch before serving. In Baserunna, any node can read immediately, and a new writer takes over by CAS after the current lease expires.
 - **Fencing.** SlateDB stores the writer epoch in the manifest. Baserunna uses Manifest CAS (`If-Match`), and a stale writer fails at its next commit by construction.
 - **Deterministic Simulation.** SlateDB's internal tokio tasks and `object_store` crate make whole-system determinism hard to guarantee. Baserunna routes every source of time, randomness, I/O, and task spawning through an injected `Env`, so the full stack runs deterministically in a test environment.
-- **DB Size.** SlateDB is tuned for large datasets. Baserunna is tuned for databases ≤ 100s of MB, where size-tiered compaction is cheap.
+- **DB Size.** SlateDB is tuned for large datasets. Baserunna is tuned for databases ≤ 100s of MB: a few compaction levels, segments of 2 MiB, and streaming merges with bounded memory.
 
 The engine sits behind the `ObjectStore` trait and a narrow `Database` API,
 so swapping the current engine for SlateDB may be possible in the future.
@@ -96,8 +96,9 @@ src/
   env.rs            Env: clock, RNG, task spawning
   util/             crc32c, varint codec, base64, hex, PRNG, bloom filter
   store/            ObjectStore trait; MemStore, FsStore, CloudStore(feature)
-  engine/           segments, manifest, versions, reads, commits, compaction, GC, blobs
-  txn.rs            transaction ops, read/write sets, validation
+  engine/           segments, manifest, versions, reads, commits (with read/write sets and
+                    validation), leveled compaction, local tier, store clock, GC, blobs
+  ops.rs            the JSON transaction-op language
   table/            tuple encoding, schema, rows, indexes, queries
   cluster.rs        membership, rendezvous routing, forwarding, leases policy
   meta.rs           system DB schema + repository (users, sessions, keys, dbs, nodes)
@@ -106,7 +107,8 @@ src/
   console/          server-rendered admin console
   api/openapi.rs    OpenAPI 3.1 document
   client.rs         small async Rust client
-  sim/              deterministic simulation: SimStore, transport, fake Google, workloads, checkers
+  sim/              deterministic simulation: SimStore, transport, fake Google, workloads, checkers;
+                    cost and amplification measurements
 tests/              integration, property, fuzz and DST suites
 examples/           runnable real-world use cases
 fuzz/               optional cargo-fuzz targets, share code with tests
@@ -150,7 +152,7 @@ The inline KV reference to a blob is a `BlobRef { id, size, sha256, content_type
 
 During a write, blobs are staged first (uploaded, unreferenced) and then bound to a key
 or blob column by a transaction. A commit rejects binding a blob whose id time is older
-than `blob_stage_ttl` (1 h).
+than `blob_stage_ttl` (1 h). Both times are store time (§5.8).
 
 Blob reads support HTTP byte ranges. A range maps onto ranged GETs of the affected chunks.
 
@@ -177,9 +179,17 @@ key of one or more columns, and secondary indexes.
   entries, and writes new ones. A unique violation aborts the transaction with
   `409 already_exists`.
 - Schema changes (create/drop table, add/drop column, add/drop index) are
-  transactional. Adding an index backfills it in the same transaction, which
-  is fine at the target DB sizes; tables above `index_backfill_max_rows`
-  (100k) are rejected in v1.
+  transactional, except that adding an index does not block writes. The
+  index is added in the `building` state: every row write maintains it
+  (including unique checks), but queries refuse it with a retryable `503`.
+  It is then backfilled from the table's rows in batches of separate
+  serializable transactions (`index_backfill_batch_rows`, 1000 rows, and at
+  most 1 MiB of entries each); the last batch marks it `ready`. Progress is
+  kept in its own catalog key, not in the schema that row writes pin, so a
+  batch conflicts only with writes to the rows it covers. An interrupted
+  build stays `building`, and adding the same index again resumes it. A
+  unique index whose rows hold duplicate values is removed again, and the
+  request fails with `409 already_exists`.
 - Queries: lookup by primary key; range or prefix scan by primary key;
   equality on an index prefix with an optional range on the next column;
   optional residual `filter` (and/or/not, eq/ne/lt/le/gt/ge/in/prefix/is_null)
@@ -193,6 +203,9 @@ key of one or more columns, and secondary indexes.
 dbs/{db_id}/manifest                 mutable; updated only with If-Match / If-None-Match
 dbs/{db_id}/seg/{seg_id}             immutable sorted segment (SST)
 dbs/{db_id}/blob/{blob_id}/{chunk}   immutable blob chunks
+dbs/{db_id}/blob/{blob_id}/meta      the blob's descriptor (BlobRef), for binding by id
+dbs/{db_id}/blob/{blob_id}/pin       rewritten by long reads (§5.8)
+clock                                every node's store-clock probe (§5.8)
 ```
 
 The system DB uses `db_id = "sys"`.
@@ -205,13 +218,15 @@ The manifest is a binary, CRC32C-checksummed document (`engine/manifest.rs`):
 magic "BRMF", format u16
 db_id
 version: u64                                  data version = seq of the last commit
-lease: Option<{node_id, expires_at_ms}>
-segments: [SegmentMeta]                       newest first; non-overlapping in time, overlapping in key space
+write_seq: u64                                incremented by every manifest write
+lease: Option<{node_id, expires_at_ms, duration_ms}>
+segments: [SegmentMeta]                       by level: level 0 newest first, deeper levels in key order
+compaction_seq: u64                           incremented by every compaction install
 tail: [Entry]                                 sorted by key, newest value per key (the inline write log)
 tombstone_horizon: u64                        tombstones with seq <= horizon may have been purged
 recent_commits: [(commit_id u128, version)]   bounded ring for idempotence / ambiguity resolution
-version_times: [(version, time_ms)]           sparse samples (≥30 s apart) for time-based policies
-obsolete: [(kind, id, since_ms)]              segments/blobs awaiting deletion after grace
+version_times: [(version, store_ms)]          sparse samples (≥30 s apart) for time-based policies
+obsolete: [(kind, id, since_store_ms)]        segments/blobs awaiting deletion after grace
 ```
 
 A **Version** is an immutable, decoded manifest plus the store's etag. A
@@ -223,26 +238,44 @@ Segments are immutable and built from sorted entries:
 
 ```
 [data block]* [bloom filter] [index] [footer 64 B]
-block   = entries (key, seq, kind, value) + crc32c       target 64 KiB
+block   = codec, entries (key, seq, kind, value) and their count, + crc32c   target 64 KiB
 index   = per block: last_key, offset, len + crc32c
 bloom   = 10 bits/key, k = 7, + crc32c
 footer  = magic "BRSG", format, offsets/lengths, entry_count, crc32c
 ```
 
-Segments under `segment_whole_fetch_max` (1 MiB) are fetched in one GET.
-Larger ones are read footer-first, then by ranged GET per block. Blocks,
-indexes, and blooms are cached in a node-wide LRU with a byte budget
-(`cache_bytes`, default 512 MiB). Cache keys are `(db_id, seg_id, block)`.
-Segments are immutable, so cache entries never need invalidation.
+Each block is compressed on its own with zstd (level 3), so a point read
+still fetches and decompresses one block; a block that would shrink by less
+than an eighth is stored raw. Storage and transfer are the main costs, and
+on row-like data compressed segments take about a fifth of the space
+(§5.6).
+
+Segments up to `segment_whole_fetch_max` (1 MiB) are fetched in one GET.
+Larger ones are read footer-first, then by ranged GET per block; a forward
+scan that has fetched two blocks of a segment reads ahead, fetching the rest
+of the blocks it needs in requests of up to `bulk_read_bytes` (1 MiB).
+
+Indexes, blooms and decoded blocks are cached in a node-wide LRU with a byte
+budget (`cache_bytes`, default 512 MiB), keyed by `(db_id, seg_id, block)`.
+Below it, an optional **local tier** on the node's disk
+(`BASERUNNA_DISK_CACHE_DIR`) keeps the stored bytes of small segments, of
+large segments' metadata, and of blocks, each checked by CRC32C when read.
+Whatever a node fetches or writes goes there, so a restarted node, or one
+that gets a database back after a failover, reads from local disk instead
+of object storage. Segments are immutable, so no cache ever needs
+invalidation.
 
 ### 5.4 Reads
 
-- A point lookup checks the tail, then segments newest to oldest (skipping a
-  segment if the bloom filter or key bounds rule it out). The first hit wins.
-  A tombstone means not found.
-- A range scan does a k-way merge of the tail and the segment cursors. The
-  newest source wins per key, and tombstones are skipped. Blocks load lazily,
-  so `limit` bounds the I/O.
+- A point lookup checks the tail, then the level 0 segments newest to
+  oldest, then at most one segment per deeper level (the one whose key
+  range covers the key), skipping a segment if its bloom filter rules the
+  key out. The first hit wins, because a shallower source always holds the
+  newer entry. A tombstone means not found.
+- A range scan does a k-way merge of the tail, each level 0 segment and each
+  deeper level (a level is one sorted run, read segment after segment). The
+  entry with the highest seq wins per key, and tombstones are skipped.
+  Blocks load lazily, so `limit` bounds the I/O.
 - Snapshot isolation comes for free: a transaction keeps its `Arc<Version>`.
   Objects referenced by any version younger than `txn_max_lifetime` are never
   deleted (§5.8).
@@ -254,9 +287,9 @@ Each open DB has a per-node commit queue. One committer task drains it
 
 1. Take the batch of pending transactions. Base = the latest Version known
    to this node.
-2. Lease check: if `base.lease` belongs to another node and has not expired
-   (with skew margin), fail the batch with `not_owner` (the API layer
-   forwards or returns 503).
+2. Lease check: if `base.lease` belongs to another node and is still valid
+   from this node's viewpoint (§5.7), fail the batch with `not_owner` (the
+   API layer forwards or returns 503).
 3. For each transaction in order, validate it (§6.1) against all writes with
    `seq > txn.read_version` in base and in transactions already accepted in
    this batch. Rejected transactions get `409 conflict`. Transactions past
@@ -269,10 +302,10 @@ Each open DB has a per-node commit queue. One committer task drains it
    though the whole batch costs one manifest write. `delete_range` expands
    to point tombstones against the merged state at this moment.
 4. If the new tail exceeds `tail_max_bytes` (256 KiB), write it to a new
-   segment (unconditional PUT to a fresh random id) and clear the tail.
-5. Renew the lease (`node_id = self`, `expires_at = now + lease_duration`).
-   Append the commit ids to `recent_commits` and maybe sample
-   `version_times`.
+   level 0 segment (unconditional PUT to a fresh random id) and clear the
+   tail.
+5. Renew the lease (`node_id = self`, `lease_ms`, §5.7). Append the commit
+   ids to `recent_commits` and maybe sample `version_times`.
 6. `PUT manifest If-Match: base.etag`:
    - **ok**: install the new Version and acknowledge the accepted
      transactions with `version = base.version + 1`.
@@ -300,72 +333,143 @@ GC removes it (§5.8).
 
 ### 5.6 Compaction
 
-This is size-tiered compaction tuned for small DBs. Segments are ordered
-newest first. Starting from the newest segment, a run is extended while the
-next older segment is ≤ `2 ×` the run's accumulated size. A run of ≥ 4
-segments is merged. If there are more than 12 segments, the newest segments
-are merged until at most 12 remain. Merging a contiguous run preserves
-recency order.
+Compaction is leveled, with level sizes derived from the data:
 
-Only the lease holder compacts, in a background task. The output segment is
-installed with a CAS that replaces exactly the input ids. If the inputs
-changed, the output is discarded and becomes an orphan.
+- **Levels.** Level 0 holds flushed tails, newest first; their key ranges may
+  overlap. Levels 1 to 6 are each one sorted run of segments with disjoint
+  key ranges. The deepest level holds most of the data, and each level above
+  it targets `level_size_ratio` (8) times less. Levels whose target would be
+  under `level_base_bytes` (1 MiB) stay empty; the shallowest level in use is
+  the _base_ level. A 10 MB database uses level 0, a base level of about
+  1.3 MB, and the deepest level.
+- **Picking.** When level 0 has 4 segments, its oldest (at most 12) merge
+  with the base-level segments they overlap. When a deeper level exceeds its
+  target, its segment that overlaps the least of the next level, relative to
+  its own size, merges with the segments it overlaps there. A segment that
+  overlaps nothing below moves down without being rewritten, so appends are
+  written about twice.
+- **Streaming.** A merge reads each input in requests of up to
+  `bulk_read_bytes` and cuts its output into segments of about
+  `segment_target_bytes` (2 MiB), each written as it fills. Memory stays
+  bounded by one read per input and one output segment, however large the
+  database. Sweeps (§5.8) stream the same way.
 
-When the run includes the oldest segment, tombstones with
-`seq ≤ purge_seq` are dropped. `purge_seq` is the newest sampled version at
-least `txn_max_lifetime` old. The manifest then records
+Only the lease holder compacts, in a background task. An install replaces
+exactly its input segments, and only on a manifest with the
+`compaction_seq` it was planned from: flushes may have added level 0
+segments meanwhile, all newer than its inputs, but no other compaction may
+have moved data between levels. Otherwise its output becomes an orphan.
+
+A merge drops a tombstone with `seq ≤ purge_seq` if no level below the
+output's has a segment covering its key. `purge_seq` is the newest sampled
+version at least `txn_max_lifetime` old. The manifest then records
 `tombstone_horizon = max(horizon, max dropped seq)`. A transaction with
 `read_version < tombstone_horizon` fails validation conservatively with a
 retryable `409 conflict`.
 
+Leveled compaction replaced size-tiered compaction after measuring both
+(`sim::amp`, `cargo run --release --example amplification`): five workloads
+on a database of about 10 MB with production sizes and compression off, to
+isolate the policy. Write amplification is segment bytes written per
+logical byte; space amplification is stored per live bytes, after garbage
+collection (settled) and at worst during the run; read amplification is
+segments a point lookup may consult.
+
+| workload                | write, tiered → leveled | space settled | space worst | read      |
+| ----------------------- | ----------------------- | ------------- | ----------- | --------- |
+| uniform updates         | 4.1 → 7.3               | 1.57 → 1.08   | 1.64 → 1.23 | 3.0 → 2.0 |
+| skewed updates          | 3.5 → 6.2               | 1.43 → 1.11   | 1.61 → 1.22 | 3.0 → 4.0 |
+| appends                 | 5.3 → 2.1               | 1.03 → 1.03   | 1.07 → 1.07 | 1.0 → 1.0 |
+| queue (insert + delete) | 4.1 → 7.1               | 1.70 → 1.37   | 2.18 → 1.53 | 1.6 → 1.0 |
+| mixed                   | 3.5 → 5.5               | 1.27 → 1.18   | 1.83 → 1.83 | 4.7 → 1.9 |
+
+The trade favors cost: PUTs are priced per request, not per byte, so
+rewriting 2 MiB segments a few more times costs little, while stored bytes
+are billed every month. With compression on, the stored bytes are about a
+fifth of the above. `tests/cost.rs` budgets these numbers for small
+databases.
+
 ### 5.7 Leases
 
 - The lease lives in the manifest and is written with the same CAS as data.
+  Each renewal records how long it lasts.
 - Lease validity never compares wall clocks, so skew and clock jumps cannot
   make lease reads stale. Each node measures on its own monotonic clock: the
-  holder relies on its lease until `lease_duration - margin` after it
-  _sent_ the renewing write, and every other node waits until
-  `lease_duration + margin` after it first _saw_ it. A renewal is seen only
-  after it was sent, so others always wait longer than the holder relies on
-  it; the margin absorbs clock rate drift. `expires_at` only identifies a
-  renewal and hints at routing. Defaults: lease 15 s, margin 1 s.
+  holder relies on its lease until its duration minus a margin after it
+  _sent_ the renewing write, and every other node waits until the duration
+  plus the margin after it first _saw_ it. A renewal is seen only after it
+  was sent, so others always wait longer than the holder relies on it; the
+  margin absorbs clock rate drift and scheduling delays. `expires_at` only
+  identifies a renewal and hints at routing.
+- Commits renew the lease, at no cost, for `lease_ms` (5 s). Read-only
+  activity renews it with a lease-only CAS, for the longer `read_lease_ms`
+  (15 s), when at least `lease_read_threshold` (16) strong reads happened in
+  the current or previous read lease period. Such a renewal happens about a
+  second before the lease would lapse, so it covers most of a period. At
+  ~$0.005 per 1000 PUTs, a renewal pays for itself versus per-read
+  validation GETs once it covers about 12 reads. The margin is 0.5 s.
 - First sightings outlive database handles, so evicting an idle handle
   never restarts the wait.
-- Holders renew on every commit. Read-only activity renews with a lease-only
-  CAS when at least `lease_read_threshold` (16) strong reads happened in the
-  last lease period. At ~$0.005 per 1000 PUTs, a renewal pays for itself
-  versus per-read validation GETs once it covers about 12 reads.
 - Non-holders never commit while another node's lease is valid, so the
   holder's cached Version is the latest. That is what makes lease reads
   linearizable.
-- If a holder dies, its DBs are write-unavailable until `lease_duration + margin`
-  after another node first saw its last renewal, so up to twice that for a
-  node that first looks after the crash. Strong reads stay available
-  everywhere through validated reads (§5.9).
+- If a holder dies, its DBs are write-unavailable until the last renewal's
+  duration plus the margin after another node first saw it. A node that
+  first looks after the crash may see the renewal just before it would have
+  run out, so the wait is at most twice that: 11 s for a database whose last
+  renewal was a commit, 31 s for one renewed for reads. Strong reads stay
+  available everywhere through validated reads (§5.9).
 
 ### 5.8 Garbage collection
 
+- **Store time.** Garbage collection compares timestamps that different
+  nodes write with each other and with the store's own `last_modified`, so
+  every one of them is in the store's clock. Each node measures its offset
+  from it: it overwrites the `clock` object and reads back its
+  `last_modified`, which lies between the request's start and the response
+  (widened by the store's timestamp precision, a second on S3). The
+  interval's midpoint is the offset and its half-width the error. The
+  offset is kept against the monotonic clock, so wall-clock jumps do not
+  disturb it. A node re-measures every 10 minutes, retries probes whose
+  error exceeds `clock_sync_max_error_ms` (10 s), and trusts a measurement
+  for an hour. Without one it collects nothing: it neither sweeps, nor
+  records or deletes obsolete objects, nor binds staged blobs. Collection is
+  therefore independent of node clock skew; the `blob_gc_race_hostile`
+  scenario runs with node clocks an hour apart and grace periods of about a
+  second.
 - **Obsolete segments**: compaction moves replaced segment ids into
-  `obsolete` with `since = now`. Any commit or compaction by the lease holder
-  deletes entries older than `gc_grace` (30 min, which must be at least
-  `txn_max_lifetime` + margin) and drops them from the list.
+  `obsolete` with `since = now`. Any commit or compaction by the lease
+  holder deletes entries older than `gc_grace` (30 min, which must exceed
+  `txn_max_lifetime` by twice the clock error bound) and drops them from the
+  list.
 - **Orphans**: segments or blobs in storage that are neither referenced nor
-  listed. A periodic per-DB sweep (lease holder, at most hourly, only for DBs
-  with activity) lists `seg/` and `blob/`. Unreferenced objects whose
-  `last_modified` is older than `orphan_grace` (2 h) are moved into
-  `obsolete` (not deleted directly). Unreferenced blobs must also be older
-  than `blob_stage_ttl` so they can never be bound again.
+  listed. A periodic per-DB sweep (lease holder, at most hourly, only for
+  DBs with activity) streams the database's entries to collect blob
+  references and pages through the `seg/` and `blob/` listings.
+  Unreferenced objects whose `last_modified` is older than `orphan_grace`
+  (2 h) are moved into `obsolete` (not deleted directly). Unreferenced blobs
+  must also be older, by their id's time, than `blob_stage_ttl` plus twice
+  the clock error bound, and a commit binds a staged blob only if it is
+  younger than `blob_stage_ttl` and not listed obsolete. A sweep reads the
+  time before the version whose references it collects, so a blob it finds
+  was already too old for any commit that version does not contain.
+- **Long reads**: a read that has streamed a blob for `gc_grace / 3`
+  (10 min) writes a pin object next to its chunks, and rewrites it as
+  often. Before deleting an obsolete blob, GC reads its pin; if the pin is
+  fresh (younger than two intervals plus twice the clock error bound), the
+  blob stays, an orphan again, for a later sweep. A blob is deleted at least `gc_grace`
+  after it stops being referenced, so a read that pins in time keeps its
+  blob however long it runs. A read by id of a blob already listed obsolete
+  pins it before reading anything. A read that cannot pin (the store is
+  unreachable) may fail with a retryable `503`; it never returns wrong
+  bytes.
 - **Deleted databases**: deletion marks the DB in the system DB. After
   `db_delete_grace` (10 min, longer than metadata cache TTLs), a reaper on
-  the system-DB lease holder deletes every object under `dbs/{id}/`, then
-  once more after another grace period (catching objects a lagging listing
-  missed) before removing the record.
-- GC compares timestamps from different clocks (object `last_modified`,
-  blob-id creation times, `since` stamps of other nodes), so its safety
-  assumes clock skew far below the grace periods (minutes to hours). Lease
-  safety does not (§5.7).
-- A read that outlives `gc_grace` after its blob was dereferenced fails
-  with a retryable `503`; a retry reads a newer snapshot.
+  the system database's routing target deletes every object under
+  `dbs/{id}/`, a listing page at a time, then once more after another grace
+  period (catching objects a lagging listing missed) before removing the
+  record. Each pass is recorded against the pass count it started from, so
+  concurrent reapers count it once.
 
 ### 5.9 Consistency of reads
 
@@ -454,11 +558,21 @@ response is standard base64 instead.
 
 ## 7. Cluster
 
+- **Cluster time.** Timestamps that one node writes and another compares
+  (heartbeats, session expiry, deadlines, deletion times) use the store's
+  clock as each node measured it (§5.8), so node clock skew does not affect
+  them; a node uses its own clock only until its first measurement.
 - **Membership** is stored in the `nodes` table of the system DB. Each node
-  upserts `{id, addr, started_at, heartbeat_at}` every `heartbeat_interval`
-  (10 s) and reads the table on the same cadence. A node is live if
-  `heartbeat_at > now − 3 × interval`. Rows dead for more than 1 h are
-  removed.
+  rewrites `{id, addr, started_at, heartbeat_at}` every `heartbeat_ms`
+  (120 s) and re-reads the table every `members_refresh_ms` (30 s). A node is
+  live if `heartbeat_at > now − 3 × heartbeat_ms`. Crashes are detected by
+  requests rather than heartbeats: a forward that certainly never arrived
+  makes its target a suspect, which stays out of routing until the table
+  shows a newer heartbeat from it, or for a backoff that starts at 10 s and
+  doubles with each further failure, up to the liveness window. A node that
+  shuts down gracefully deletes its row. Rows dead for more than 1 h are
+  removed. An idle node costs about 30 PUTs and 120–140 validating GETs an
+  hour (about $0.15 a month).
 - **Routing**: for a request on DB `d`, the target is the lease holder if a
   valid lease is known, otherwise the live node maximizing
   `hash(node_id ‖ d)` (rendezvous hashing). If the target is another node, the
@@ -476,9 +590,9 @@ response is standard base64 instead.
   its previous run with a not-applied `503`. GET and HEAD are not
   deduplicated.
 - **Deadlines travel with forwards.** `x-baserunna-deadline-ms` carries the
-  first node's commit deadline (wall clock). The receiver caps it at its
+  first node's commit deadline in cluster time. The receiver caps it at its
   own `commit_timeout_ms`, so a delayed forward cannot commit later than
-  the client expects, and skew can only shorten it.
+  the client expects, and clock errors can only shorten it.
 - **Internal endpoints** (`/internal/v1/…`, used to run system-DB
   transactions on its owner) always require `x-baserunna-cluster-key`. Its
   value is the configured `BASERUNNA_CLUSTER_SECRET` or, by default, a key
@@ -502,13 +616,18 @@ Tables in DB `sys`, all defined through the table layer (dogfooding):
 | `sessions`          | `token_hash` | user_id, created_at, expires_at                                    | (user_id)                         |
 | `api_keys`          | `id`         | user_id, name, secret_hash, db_id?, read_only, created_at          | (user_id)                         |
 | `databases`         | `id`         | owner_id, name, created_at                                         | unique(owner_id, name)            |
+| `db_counts`         | `owner_id`   | count                                                              |                                   |
 | `deleted_databases` | `id`         | owner_id, name, deleted_at, purge_passes                           |                                   |
 | `nodes`             | `id`         | addr, started_at, heartbeat_at                                     |                                   |
 | `config`            | `key`        | value                                                              |                                   |
 
 `config` stores generated secrets (`cookie_key`) and the bootstrap flags. A
 DB's manifest is created lazily on first access (`If-None-Match: *`), so
-creating a DB is a single system-DB transaction.
+creating a DB is a single system-DB transaction. It reads one row: the
+owner's `db_counts` row enforces `max_dbs_per_user`, and the unique
+`(owner_id, name)` index rejects duplicate names. Deleting a database
+decrements the count (a count of zero deletes the row). Concurrent creates
+by one user conflict on the counter and are retried server-side.
 
 Auth lookups (session, API key, DB name resolution) are snapshot reads of
 `sys` with `max_staleness` of 2 s, cached per node for at most 30 s. A
@@ -577,7 +696,7 @@ Errors are returned as
 | 409    | `conflict` (retryable), `already_exists`                                   |
 | 412    | `precondition_failed` (includes the failing op index)                      |
 | 413    | `too_large`                                                                |
-| 503    | `unavailable` (retryable, `Retry-After`; may include `outcome: "unknown"`) |
+| 503    | `unavailable` (retryable, `Retry-After`; may include `outcome: "unknown"`; also a query on an index still being built) |
 | 500    | `internal`                                                                 |
 
 Routes (see the OpenAPI document for bodies):
@@ -656,10 +775,14 @@ POST forms carry a CSRF token. All output is HTML-escaped.
 | `BASERUNNA_GOOGLE_CLIENT_ID` / `_SECRET` | none                       | enables Google sign-in                                       |
 | `BASERUNNA_PUBLIC_URL`                   | advertise                  | OAuth redirect base, cookie `Secure`                         |
 | `BASERUNNA_CACHE_MB`                     | 512                        | block cache budget                                           |
-| `BASERUNNA_LEASE_MS`                     | 15000                      | lease duration                                               |
+| `BASERUNNA_DISK_CACHE_DIR`               | none                       | directory of the local tier (§5.3); off if unset             |
+| `BASERUNNA_DISK_CACHE_MB`                | 10240                      | local tier budget                                            |
+| `BASERUNNA_LEASE_MS`                     | 5000                       | lease renewed by commits; leases renewed for reads last 3×   |
 
-`fs:` is for single-node development only. Cross-process CAS on a local
-filesystem is not guaranteed.
+`fs:` is for single-node development only. Compare-and-swap is serialized
+within one process, so the store takes an exclusive lock on `<dir>/.lock`,
+and a second process (or a second store in the same process) fails to open
+the directory.
 
 ---
 
@@ -688,16 +811,18 @@ filesystem is not guaranteed.
   failures (applied, response lost), PUTs that land after their caller
   crashed, **stalls** longer than a lease, and **listings** that lag behind
   creates and deletes.
-- **SimCluster**: N nodes, each with its own `Node`, clock and task
-  registry. Faults: **crashes** (all tasks and memory lost) and restarts,
+- **SimCluster**: N nodes, each with its own `Node`, clock, task registry
+  and local tier (§5.3), which survives the node's crashes like a disk.
+  Faults: **crashes** (all tasks and memory lost) and restarts,
   two-way and **one-way partitions**, nodes **cut off from the store**,
   **duplicated and delayed forwards**, **clock skew and jumps**, and latency
   spikes. Clients call random nodes through the full router, which
   exercises forwarding.
 - **Configurations**: `basic` (one node, no faults), `faulty` (store and
   network faults, skew within the lease margin) and `hostile` (every fault,
-  with skew and jumps ten times the margin). Safety must hold under all
-  three; only availability may degrade.
+  with skew and jumps ten times the margin; an hour for
+  `blob_gc_race_hostile`, whose grace periods are about a second). Safety
+  must hold under all three; only availability may degrade.
 - **SimOAuth**: a fake Google with an RSA key generated in-process and a
   JWKS, so the full OIDC verification path runs.
 
@@ -711,11 +836,11 @@ filesystem is not guaranteed.
 | `tables`       | Schema changes and row ops against a model. At quiescence indexes match a recomputation from rows, unique constraints hold, and dropped tables and indexes leave nothing behind.  |
 | `schema_race`  | Row writes on every path and at both isolation levels race schema changes. Indexes must match rows, nothing may be orphaned, and each writer's rows must match its model.         |
 | `blobs`        | Uploads of random sizes on every path, range reads, overwrites and deletes, checked by SHA-256. A final GC keeps every referenced object and removes every unreferenced one.      |
-| `blob_gc_race` | Blob reads race overwrites, deletes and GC, with grace periods shorter than a download. A read may fail cleanly but never return wrong bytes.                                     |
+| `blob_gc_race` | Blob reads race overwrites, deletes and GC, with grace periods shorter than a download (and, hostile, node clocks an hour apart). A read may fail cleanly but never return wrong bytes. |
 | `abandoned`    | Interactive transactions abandoned, aborted or committed late while leases move. No update is lost, abandoned transactions never commit, and open transactions drain.             |
-| `db_churn`     | Databases created, used, deleted and recreated under a tiny cache and fast handle eviction. Each matches its model, deleted names answer 404, and handles and cache stay bounded. |
+| `db_churn`     | Databases created, used, deleted and recreated under a tiny cache and fast handle eviction. Each matches its model, deleted names answer 404, handles and cache stay bounded, and per-owner database counts match. |
 | `auth`         | Signup, login, sessions, API keys (scoped, read-only), logout, revocation, Google OAuth, and who can access which DB.                                                             |
-| `lifecycle`    | Create, use, delete, and recreate DBs under crashes. Deleted data is never visible and is eventually purged.                                                                      |
+| `lifecycle`    | Create, use, delete, and recreate DBs under crashes. Deleted data is never visible and is eventually purged, and per-owner database counts match.                                 |
 | `console`      | Browser-style console flows: cookies, forms, CSRF rejection, HTML escaping of hostile input.                                                                                      |
 | `api_tour`     | The remaining endpoints (schema drops, aborts, commit status by idempotency key, metadata) with result checks.                                                                    |
 | `chaos`        | Several workloads at once with crashes, partitions, and store faults.                                                                                                             |
@@ -729,11 +854,11 @@ every referenced segment and blob exists.
 - **Unit tests** in each module.
 - **Property tests**, using an in-crate generator and shrinker with seeded
   reproduction. Properties: codec round trips; tuple encoding preserves order;
-  segment build/read equals the input; an LSM with random
+  segment build/read equals the input, compressed or not; an LSM with random
   flush/compaction/purge equals a model; base64/varint/bloom laws.
-- **Fuzz tests**: every decoder (manifest, segment, tuple, row, blob ref,
-  cursors) gets arbitrary and mutated inputs and must return `Err`, never
-  panic. The router gets random JSON bodies and paths and must never answer
+- **Fuzz tests**: every decoder (manifest, segment and compressed blocks,
+  tuple, row, blob ref, cursors) gets arbitrary and mutated inputs and must
+  return `Err`, never panic. The router gets random JSON bodies and paths and must never answer
   500 or panic. These run in `cargo test` with fixed seeds. The same
   functions are exposed as optional `cargo fuzz` targets in `fuzz/`.
 - **Transaction-op fuzzing** (`sim/txn_fuzz.rs`) checks the op language's
@@ -755,28 +880,35 @@ every referenced segment and blob exists.
   segments and blob chunks, and foreign bytes in blob reads.
 - **Mutation testing** (`scripts/mutants.sh`) checks that the suites catch
   bugs injected into the engine, the table layer, the op language and the
-  checkers. They catch 1058 of 1083 viable mutants; the 25 survivors are
-  equivalent (off-by-one changes to timestamp comparisons and to length
-  checks that decoding repeats, guards a later check backs, and
-  performance heuristics). The script also kills mutated tests that
-  allocate without bound, which cargo-mutants' timeout cannot stop in time.
+  checkers. Over the whole configuration, before the storage-engine
+  follow-up, they caught 1058 of 1083 viable mutants. Over the lines that
+  follow-up changed (`--in-diff`, 693 mutants), every viable mutant is
+  caught or hangs the suite, except 21 equivalent ones: off-by-one changes
+  to timestamp, size and tie-break comparisons, the compression
+  heuristic's thresholds, and checks that decoding repeats. The survivors
+  in both runs are of these kinds, plus performance heuristics. The script
+  also kills mutated tests that allocate without bound, which
+  cargo-mutants' timeout cannot stop in time.
 - **Cost**: object-store requests dominate cost (goal 2), so `sim::cost`
   counts them per operation on production-configured nodes (20 ms per
   request, virtual time), and `tests/cost.rs` budgets them. Current counts:
 
-  | operation                               | requests                         |
-  | --------------------------------------- | -------------------------------- |
-  | commit (lease holder)                   | 1 PUT                            |
-  | 64 concurrent commits                   | 1 PUT in total                   |
-  | strong read, lease holder               | 0                                |
-  | strong read, engine on a non-holder     | 1 GET (304)                      |
-  | strong read through the API, no lease   | 1 GET                            |
-  | snapshot read within staleness          | 0                                |
-  | cold open + point read, 2 segments      | 4 GET (80 ms)                    |
-  | blob upload / download                  | 0.25 PUT / 0.125 GET per MiB     |
-  | steady writes, with flush/compaction/GC | 1.001 PUT, 0.002 GET per commit  |
-  | idle database                           | 0 per hour                       |
-  | node overhead (heartbeats, membership)  | 360 PUT + up to 240 GET per hour |
+  | operation                                     | requests                        |
+  | --------------------------------------------- | ------------------------------- |
+  | commit (lease holder)                         | 1 PUT                           |
+  | 64 concurrent commits                         | 1 PUT in total                  |
+  | strong read, lease holder                     | 0                               |
+  | strong read, engine on a non-holder           | 1 GET (304)                     |
+  | strong read through the API, no lease         | 1 GET                           |
+  | snapshot read within staleness                | 0                               |
+  | read-heavy database (10 strong reads/s)       | 276 PUT + 54 GET per hour       |
+  | cold open + point read, 2 segments            | 2 GET (40 ms)                   |
+  | cold full scan, 128 values of 16 KiB          | 1 GET                           |
+  | open + full scan after a restart (local tier) | 1 GET (the manifest)            |
+  | blob upload / download                        | 0.25 PUT / 0.125 GET per MiB    |
+  | steady writes, with flush/compaction/GC       | 1.001 PUT, 0.001 GET per commit |
+  | idle database                                 | 0 per hour                      |
+  | node overhead (heartbeats, membership)        | 31 PUT + up to 140 GET per hour |
 
   `cost_model` prices these with S3 Standard list prices for workload
   profiles (idle, light, typical, heavy); the typical profile (100k reads
@@ -791,6 +923,7 @@ cargo run --release --example sim_tool -- campaign all 3000  # very long campaig
 cargo run --release --example sim_tool -- trace <scenario> <seed>
 SIM_SEED=12345 cargo test --test sim sim_chaos -- --nocapture # reproduce one seed
 cargo run --release --example cost_model                     # requests per operation, $/DB/month
+cargo run --release --example amplification                  # compaction's write/space/read amplification
 cargo bench --bench throughput                               # wall-clock throughput, thousands of DBs
 scripts/mutants.sh                                           # mutation testing (several hours)
 ```
@@ -851,9 +984,22 @@ Bugs the DST suite found, each now covered by the regular suite:
     copy, and deleted the database the client had since recreated.
     Forwards are now addressed to one process (§7).
 
-The cost measurements (§13.4) found two more: a read-heavy database whose
+17. _Lease renewals that look alike._ Once leases could have different
+    durations, a 3 s commit renewal made 3 s into a 6 s read renewal had
+    the same expiry. Another node took it for the renewal it had already
+    seen, took over early, and the old holder served a stale lease read (a
+    database just created through one node was missing through another).
+    Renewals are now identified by the manifest write that made them.
+18. _Collection paused by slow clock probes._ A node whose store-clock
+    probes were too slow twice in a row skipped every sweep, so garbage
+    outlived a full collection cycle. Probes are now retried, and every node
+    keeps its measurement fresh in the background.
+
+The cost measurements (§13.4) found three more: a read-heavy database whose
 lease had lapsed never acquired it again (paying a validating GET per read
-forever), and a strong read without a lease validated the manifest twice.
+forever), a strong read without a lease validated the manifest twice, and
+shortening the lease doubled read-only renewals (they now take the longer
+read lease, §5.7).
 
 A review alongside the simulator also found that internal endpoints were
 open when no cluster secret was configured. Clusters now always generate
@@ -881,26 +1027,27 @@ it over real HTTP, and prints what it is doing:
    mid-flight, and failover without data loss.
 
 Tools: `sim_tool` runs simulation campaigns and prints traces.
-`gen_openapi` regenerates `openapi.json`.
+`cost_model` prints object-store requests per operation and the cost per
+database-month, and `amplification` compaction's write, space and read
+amplification. `gen_openapi` regenerates `openapi.json`.
 
 ---
 
 ## 15. Known limitations (v1)
 
-- Compaction and the orphan sweep materialize the merged entries of a
-  database in memory. This is fine for the target sizes (10s of MB), but
-  100s-of-MB databases need a streaming merge.
-- An index can only be added to tables of up to 100k rows in one
-  transaction (backfill is transactional).
-- The `fs:` store gives compare-and-swap only within one process.
-  Multi-node deployments need an object store with conditional writes
-  (S3, GCS, Azure, R2, MinIO).
+- `delete_range`, and dropping a table or an index, expand to one tombstone
+  per live key, built in the committing node's memory and the manifest
+  tail. Very large tables would need range tombstones.
+- Every commit rewrites the manifest, whose segment list grows with the
+  database: about 100 bytes per 2 MiB segment, 25 KB at 500 MB.
+- Multi-node deployments need an object store with conditional writes
+  (S3, GCS, Azure, R2, MinIO); `fs:` is for one process (§12).
 - After a node crash, writes to the databases it leased wait for the lease
-  (15 s, counted from when the new writer first saw it; §5.7) to expire.
-  Reads continue immediately.
-- Blob downloads must finish within `gc_grace` (30 min) of the blob being
-  dereferenced; later ones fail with a retryable error.
-- GC safety assumes clock skew far below the grace periods (§5.8).
+  to expire: at most 11 s for a database whose last renewal was a commit,
+  31 s for one kept leased by reads alone (§5.7). Reads continue
+  immediately.
+- Garbage collection relies on the store's `last_modified` timestamps
+  coming from one coherent clock, as they do on the major providers.
 - Login has no rate limiting yet. Deploy behind a proxy that limits it.
 - `CloudStore` (S3/GCS/Azure through `object_store`) is exercised only by
   compile-time checks here; the simulator tests the same semantics through
@@ -908,6 +1055,5 @@ Tools: `sim_tool` runs simulation campaigns and prints traces.
 
 ## 16. Future work
 
-Compression (zstd/lz4) of segments; local disk cache tier; online index
-backfill for large tables; TTLs; change feeds; point-in-time restore (keep
-old manifests); per-user quotas and rate limits; multi-user organizations.
+Range tombstones; TTLs; change feeds; point-in-time restore (keep old
+manifests); per-user quotas and rate limits; multi-user organizations.

@@ -27,7 +27,7 @@ async fn delete_prefix(db: &Arc<Db>, p: &str) -> Seq {
 }
 
 async fn live_keys(v: &Version, p: &str) -> usize {
-    v.scan(&KeyRange::prefix(p.as_bytes()), false, usize::MAX, false).await.unwrap().len()
+    v.scan(&KeyRange::prefix(p.as_bytes()), false, usize::MAX, v.read_time()).await.unwrap().len()
 }
 
 async fn settle() {
@@ -61,9 +61,9 @@ fn large_range_deletes_take_one_entry_and_retire() {
         assert_eq!(v.m.range_deletes[0].seq, seq);
         assert!(v.m.tail.iter().all(|e| !e.key.starts_with(b"t/")), "no point tombstones");
         assert_eq!(live_keys(&v, "t/").await, 0);
-        assert_eq!(v.get(&key(17)).await.unwrap(), None);
+        assert_eq!(v.get(&key(17), v.read_time()).await.unwrap(), None);
         assert_eq!(v.get_entry(&key(17)).await.unwrap().map(|e| (e.seq, e.value)), Some((seq, Value::Tombstone)));
-        assert!(v.get(b"u/after").await.unwrap().is_some());
+        assert!(v.get(b"u/after", v.read_time()).await.unwrap().is_some());
         settle().await;
         let v = db.read_version(Consistency::Strong).await.unwrap();
         let a = eng.shared.counters.get();
@@ -72,14 +72,14 @@ fn large_range_deletes_take_one_entry_and_retire() {
         assert!(v.m.segments.iter().all(|s| !v.m.range_deletes[0].dirties(s)), "cleaned up");
         assert_eq!(v.m.range_deletes.len(), 1, "kept for transactions that might read from before it");
         assert_eq!(live_keys(&before, "t/").await, 300);
-        assert!(before.get(&key(299)).await.unwrap().is_some());
+        assert!(before.get(&key(299), before.read_time()).await.unwrap().is_some());
         outlive_transactions(&db).await;
         let v = db.read_version(Consistency::Strong).await.unwrap();
         assert!(v.m.range_deletes.is_empty(), "retired");
         assert!(v.m.tombstone_horizon >= seq);
         assert_eq!(eng.shared.counters.get().range_tombstones_retired, 1);
         assert_eq!(live_keys(&v, "t/").await, 0);
-        assert!(v.get(b"u/after").await.unwrap().is_some());
+        assert!(v.get(b"u/after", v.read_time()).await.unwrap().is_some());
         tokio::time::sleep(Duration::from_millis(eng.shared.cfg.gc_grace_ms)).await;
         put(&db, "other", "y").await;
         settle().await;
@@ -123,7 +123,7 @@ fn a_range_delete_spares_its_own_transactions_writes() {
         assert_eq!(b, a + 1);
         let v = db.read_version(Consistency::Strong).await.unwrap();
         assert_eq!(v.m.range_deletes.len(), 1);
-        let got = v.scan(&KeyRange::prefix(b"t/"), false, 100, false).await.unwrap();
+        let got = v.scan(&KeyRange::prefix(b"t/"), false, 100, v.read_time()).await.unwrap();
         let got: Vec<(Bytes, Seq)> = got.into_iter().map(|e| (e.key, e.seq)).collect();
         assert_eq!(got, vec![(key(2), b)]);
     });
@@ -177,7 +177,7 @@ fn partly_deleted_segments_are_rewritten() {
         let v = db.read_version(Consistency::Strong).await.unwrap();
         assert!(v.m.segments.iter().all(|s| !v.m.range_deletes[0].dirties(s)));
         let got: Vec<Bytes> = v
-            .scan(&KeyRange::prefix(b"t/"), false, usize::MAX, false)
+            .scan(&KeyRange::prefix(b"t/"), false, usize::MAX, v.read_time())
             .await
             .unwrap()
             .into_iter()

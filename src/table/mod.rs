@@ -5,7 +5,9 @@
 pub mod schema;
 pub mod tuple;
 
-use crate::engine::{BlobRef, Consistency, Db, Isolation, KeyRange, ReadValue, Seq, Txn, Value, blob};
+use crate::engine::{
+    BlobRef, Change, ChangePos, Consistency, Db, Isolation, KeyRange, ReadValue, Seq, Ttl, Txn, Value, blob,
+};
 use crate::error::{Error, Result};
 use crate::util::b64;
 use bytes::Bytes;
@@ -385,7 +387,7 @@ async fn backfill_batch(txn: &mut Txn, table: &str, idx: &IndexDef, opts: Backfi
             return Err(Error::AlreadyExists(format!("duplicate values for unique index {:?}", idx.name)));
         }
         bytes += k.len() + v.len();
-        txn.put(k, Value::Inline(v))?;
+        txn.put_expiring(k, Value::Inline(v), it.ttl)?;
         last = Some(it.key.clone());
         written += 1;
         if bytes >= opts.batch_bytes {
@@ -546,8 +548,11 @@ fn fill_defaults(s: &TableSchema, row: &mut Row) -> Result<()> {
     Ok(())
 }
 
+/// A stored row (with its blob columns) and when it expires.
+type Stored = (Row, Option<Ttl>);
+
 /// Read a stored row (with blob columns) by primary key.
-async fn load_row(txn: &mut Txn, s: &TableSchema, pk: &[Key]) -> Result<Option<Row>> {
+async fn load_row(txn: &mut Txn, s: &TableSchema, pk: &[Key]) -> Result<Option<Stored>> {
     let Some(it) = txn.get(&row_key(s.id, pk)).await? else {
         return Ok(None);
     };
@@ -558,6 +563,11 @@ async fn load_row(txn: &mut Txn, s: &TableSchema, pk: &[Key]) -> Result<Option<R
     // only look up the schema's columns.
     let mut row = schema::decode_row(data)?;
     fill_defaults(s, &mut row)?;
+    load_blob_columns(txn, s, pk, &mut row).await?;
+    Ok(Some((row, it.ttl)))
+}
+
+async fn load_blob_columns(txn: &mut Txn, s: &TableSchema, pk: &[Key], row: &mut Row) -> Result<()> {
     for c in &s.columns {
         if c.ty == ColType::Blob {
             let d = match txn.get(&blob_side_key(s.id, pk, c.id)).await? {
@@ -567,45 +577,58 @@ async fn load_row(txn: &mut Txn, s: &TableSchema, pk: &[Key]) -> Result<Option<R
             row.insert(c.id, d);
         }
     }
-    Ok(Some(row))
+    Ok(())
 }
 
-fn write_row(txn: &mut Txn, s: &TableSchema, pk: &[Key], row: &Row, old: Option<&Row>) -> Result<()> {
-    txn.put(row_key(s.id, pk), Value::Inline(Bytes::from(schema::encode_row(row))))?;
+/// Write a row and its blob columns, all to expire as `ttl` says, over the
+/// stored row `old` (if any).
+fn write_row(
+    txn: &mut Txn,
+    s: &TableSchema,
+    pk: &[Key],
+    row: &Row,
+    ttl: Option<Ttl>,
+    old: Option<&Stored>,
+) -> Result<()> {
+    txn.put_expiring(row_key(s.id, pk), Value::Inline(Bytes::from(schema::encode_row(row))), ttl)?;
     for c in &s.columns {
         if c.ty != ColType::Blob {
             continue;
         }
         let new = row.get(&c.id);
-        let prev = old.and_then(|o| o.get(&c.id));
-        if new == prev {
+        let prev = old.and_then(|(o, _)| o.get(&c.id));
+        if new == prev && old.is_some_and(|(_, t)| *t == ttl) {
             continue;
         }
         match new {
-            Some(Datum::Blob(b)) => txn.put(blob_side_key(s.id, pk, c.id), Value::Blob(b.clone()))?,
+            Some(Datum::Blob(b)) => txn.put_expiring(blob_side_key(s.id, pk, c.id), Value::Blob(b.clone()), ttl)?,
             _ => txn.delete(blob_side_key(s.id, pk, c.id))?,
         }
     }
     Ok(())
 }
 
+/// Move a row's index entries from those of `old` to those of `new`. An
+/// index entry expires with its row.
 async fn update_indexes(
     txn: &mut Txn,
     s: &TableSchema,
     pk: &[Key],
-    old: Option<&Row>,
-    new: Option<&Row>,
+    old: Option<(&Row, Option<Ttl>)>,
+    new: Option<(&Row, Option<Ttl>)>,
 ) -> Result<()> {
     for idx in &s.indexes {
-        let o = old.map(|r| index_entry(s, idx, r, pk)).transpose()?;
-        let n = new.map(|r| index_entry(s, idx, r, pk)).transpose()?;
+        let entry = |r: Option<(&Row, Option<Ttl>)>| -> Result<Option<(Bytes, Bytes, Option<Ttl>)>> {
+            r.map(|(r, e)| index_entry(s, idx, r, pk).map(|(k, v)| (k, v, e))).transpose()
+        };
+        let (o, n) = (entry(old)?, entry(new)?);
         if o == n {
             continue;
         }
-        if let Some((ok, _)) = &o {
+        if let Some((ok, _, _)) = &o {
             txn.delete(ok.clone())?;
         }
-        if let Some((nk, nv)) = n {
+        if let Some((nk, nv, ne)) = n {
             if idx.unique
                 && !nv.is_empty()
                 && let Some(existing) = txn.get(&nk).await?
@@ -615,7 +638,7 @@ async fn update_indexes(
                     return Err(Error::AlreadyExists(format!("unique index {:?} already has this value", idx.name)));
                 }
             }
-            txn.put(nk, Value::Inline(nv))?;
+            txn.put_expiring(nk, Value::Inline(nv), ne)?;
         }
     }
     Ok(())
@@ -627,7 +650,37 @@ pub enum InsertMode {
     Upsert,
 }
 
+/// What a row update does to the row's expiry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expiry {
+    Keep,
+    Set(Option<Ttl>),
+}
+
+impl Expiry {
+    /// The time to live of a row that had `old`.
+    fn of(self, old: Option<Ttl>) -> Option<Ttl> {
+        match self {
+            Expiry::Keep => old,
+            Expiry::Set(t) => t,
+        }
+    }
+}
+
+/// Insert (or with `Upsert`, replace) a row.
 pub async fn insert(txn: &mut Txn, blobs: &BlobResolver<'_>, table: &str, obj: &Json, mode: InsertMode) -> Result<()> {
+    insert_expiring(txn, blobs, table, obj, mode, None).await
+}
+
+/// [`insert`] a row that expires as `ttl` says.
+pub async fn insert_expiring(
+    txn: &mut Txn,
+    blobs: &BlobResolver<'_>,
+    table: &str,
+    obj: &Json,
+    mode: InsertMode,
+    ttl: Option<Ttl>,
+) -> Result<()> {
     let s = get_schema(txn, table).await?;
     let row = row_from_json(&s, obj, blobs, None).await?;
     let pk = pk_keys_of_row(&s, &row)?;
@@ -635,11 +688,24 @@ pub async fn insert(txn: &mut Txn, blobs: &BlobResolver<'_>, table: &str, obj: &
     if old.is_some() && mode == InsertMode::Insert {
         return Err(Error::AlreadyExists(format!("row with this primary key already exists in {table:?}")));
     }
-    update_indexes(txn, &s, &pk, old.as_ref(), Some(&row)).await?;
-    write_row(txn, &s, &pk, &row, old.as_ref())
+    update_indexes(txn, &s, &pk, old.as_ref().map(|(r, t)| (r, *t)), Some((&row, ttl))).await?;
+    write_row(txn, &s, &pk, &row, ttl, old.as_ref())
 }
 
+/// Set some columns of a row, if it exists.
 pub async fn update(txn: &mut Txn, blobs: &BlobResolver<'_>, table: &str, pk: &Json, set: &Json) -> Result<bool> {
+    update_expiring(txn, blobs, table, pk, set, Expiry::Keep).await
+}
+
+/// [`update`], also changing when the row expires.
+pub async fn update_expiring(
+    txn: &mut Txn,
+    blobs: &BlobResolver<'_>,
+    table: &str,
+    pk: &Json,
+    set: &Json,
+    expiry: Expiry,
+) -> Result<bool> {
     let s = get_schema(txn, table).await?;
     let pk = parse_pk(&s, pk)?;
     let Some(old) = load_row(txn, &s, &pk).await? else {
@@ -652,10 +718,23 @@ pub async fn update(txn: &mut Txn, blobs: &BlobResolver<'_>, table: &str, pk: &J
             }
         }
     }
-    let row = row_from_json(&s, set, blobs, Some(&old)).await?;
-    update_indexes(txn, &s, &pk, Some(&old), Some(&row)).await?;
-    write_row(txn, &s, &pk, &row, Some(&old))?;
+    update_stored(txn, blobs, &s, &pk, old, set, expiry).await?;
     Ok(true)
+}
+
+async fn update_stored(
+    txn: &mut Txn,
+    blobs: &BlobResolver<'_>,
+    s: &TableSchema,
+    pk: &[Key],
+    old: Stored,
+    set: &Json,
+    expiry: Expiry,
+) -> Result<()> {
+    let row = row_from_json(s, set, blobs, Some(&old.0)).await?;
+    let ttl = expiry.of(old.1);
+    update_indexes(txn, s, pk, Some((&old.0, old.1)), Some((&row, ttl))).await?;
+    write_row(txn, s, pk, &row, ttl, Some(&old))
 }
 
 pub async fn delete(txn: &mut Txn, table: &str, pk: &Json) -> Result<bool> {
@@ -664,12 +743,103 @@ pub async fn delete(txn: &mut Txn, table: &str, pk: &Json) -> Result<bool> {
     let Some(old) = load_row(txn, &s, &pk).await? else {
         return Ok(false);
     };
-    update_indexes(txn, &s, &pk, Some(&old), None).await?;
-    txn.delete(row_key(s.id, &pk))?;
-    if s.columns.iter().any(|c| c.ty == ColType::Blob) {
-        txn.delete_range(KeyRange::prefix(&blob_side_prefix(s.id, &pk)))?;
-    }
+    delete_stored(txn, &s, &pk, &old).await?;
     Ok(true)
+}
+
+async fn delete_stored(txn: &mut Txn, s: &TableSchema, pk: &[Key], old: &Stored) -> Result<()> {
+    update_indexes(txn, s, pk, Some((&old.0, old.1)), None).await?;
+    txn.delete(row_key(s.id, pk))?;
+    if s.columns.iter().any(|c| c.ty == ColType::Blob) {
+        txn.delete_range(KeyRange::prefix(&blob_side_prefix(s.id, pk)))?;
+    }
+    Ok(())
+}
+
+/// Update every row `sel` selects (at most `limit`), with `set` applied as
+/// by [`update`]. Returns how many rows were updated. The transaction's
+/// write limit bounds how many rows one call may change.
+pub async fn update_where(
+    txn: &mut Txn,
+    blobs: &BlobResolver<'_>,
+    table: &str,
+    sel: &Selection,
+    set: &Json,
+    expiry: Expiry,
+    limit: Option<usize>,
+) -> Result<usize> {
+    let s = get_schema(txn, table).await?;
+    check_set(&s, set)?;
+    let rows = select(txn, &s, sel, limit).await?;
+    for (pk, old) in &rows {
+        update_stored(txn, blobs, &s, pk, old.clone(), set, expiry).await?;
+    }
+    Ok(rows.len())
+}
+
+/// Delete every row `sel` selects (at most `limit`). Returns how many.
+pub async fn delete_where(txn: &mut Txn, table: &str, sel: &Selection, limit: Option<usize>) -> Result<usize> {
+    let s = get_schema(txn, table).await?;
+    let rows = select(txn, &s, sel, limit).await?;
+    for (pk, old) in &rows {
+        delete_stored(txn, &s, pk, old).await?;
+    }
+    Ok(rows.len())
+}
+
+/// `set` must be an object of columns other than the primary key's, each
+/// with a value of the column's type.
+fn check_set(s: &TableSchema, set: &Json) -> Result<()> {
+    let obj = set.as_object().ok_or_else(|| Error::invalid("set must be a JSON object"))?;
+    for (k, v) in obj {
+        let c = s.column(k).ok_or_else(|| Error::invalid(format!("unknown column {k:?}")))?;
+        if s.primary_key.contains(k) {
+            return Err(Error::invalid("primary key columns cannot be updated"));
+        }
+        if v.is_null() && !c.nullable {
+            return Err(Error::invalid(format!("column {k:?} must not be null")));
+        }
+        datum_from_json(c.ty, v, k)?;
+    }
+    Ok(())
+}
+
+/// The rows `sel` selects, in its access path's order, at most `limit`.
+/// All are read before any is written, so writes cannot move a row into
+/// the part of an index still to be read.
+async fn select(
+    txn: &mut Txn,
+    s: &TableSchema,
+    sel: &Selection,
+    limit: Option<usize>,
+) -> Result<Vec<(Vec<Key>, Stored)>> {
+    let path = access_path(s, sel)?;
+    let mut out = Vec::new();
+    let Some(range) = path.range.clone() else { return Ok(out) };
+    if limit == Some(0) {
+        return Ok(out);
+    }
+    // Every selected row costs a write of at least its key.
+    let mut budget = txn.write_budget();
+    let mut pages = Pages::new(range);
+    while let Some(page) = pages.next(txn).await? {
+        for it in &page {
+            let (pk, row) = path.row(txn, s, it).await?;
+            let Some(row) = row else { continue };
+            if sel.filter.as_ref().is_some_and(|f| !eval_filter(s, f, &row.0)) {
+                continue;
+            }
+            let cost = row_key(s.id, &pk).len() + 8;
+            budget = budget.checked_sub(cost).ok_or_else(|| {
+                Error::TooLarge("the selected rows exceed the transaction's write limit; use limit".into())
+            })?;
+            out.push((pk, row));
+            if limit.is_some_and(|l| out.len() >= l) {
+                return Ok(out);
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn row_to_json(s: &TableSchema, row: &Row) -> Json {
@@ -680,10 +850,24 @@ pub fn row_to_json(s: &TableSchema, row: &Row) -> Json {
     Json::Object(m)
 }
 
+/// A row by primary key.
 pub async fn get(txn: &mut Txn, table: &str, pk: &Json) -> Result<Option<Json>> {
+    Ok(get_expiring(txn, table, pk).await?.map(|(r, _)| r))
+}
+
+/// A row by primary key, and when it expires.
+pub async fn get_expiring(txn: &mut Txn, table: &str, pk: &Json) -> Result<Option<(Json, Option<u64>)>> {
     let s = get_schema(txn, table).await?;
     let pk = parse_pk(&s, pk)?;
-    Ok(load_row(txn, &s, &pk).await?.map(|r| row_to_json(&s, &r)))
+    Ok(load_row(txn, &s, &pk).await?.map(|(r, t)| {
+        (
+            row_to_json(&s, &r),
+            t.and_then(|t| match t {
+                Ttl::Until(e) => Some(e),
+                Ttl::For(_) => None,
+            }),
+        )
+    }))
 }
 
 /// Reads a key range a page at a time, so that memory stays bounded however
@@ -725,15 +909,15 @@ fn decode_stored_row(s: &TableSchema, prefix: &[u8], it: &ReadValue) -> Result<(
     Ok((pk, row))
 }
 
-/// Every row of a table by row key, with defaults applied.
-async fn all_rows(txn: &mut Txn, s: &TableSchema) -> Result<Vec<(Bytes, Vec<Key>, Row)>> {
+/// Every row of a table by row key, with defaults applied, and its expiry.
+async fn all_rows(txn: &mut Txn, s: &TableSchema) -> Result<Vec<(Bytes, Vec<Key>, Row, Option<u64>)>> {
     let prefix = table_prefix(SPACE_ROWS, s.id);
     let mut out = Vec::new();
     let mut pages = Pages::new(KeyRange::prefix(&prefix));
     while let Some(page) = pages.next(txn).await? {
         for it in &page {
             let (pk, row) = decode_stored_row(s, &prefix, it)?;
-            out.push((it.key.clone(), pk, row));
+            out.push((it.key.clone(), pk, row, it.expires()));
         }
     }
     Ok(out)
@@ -909,17 +1093,56 @@ fn eval_filter(s: &TableSchema, f: &Filter, row: &Row) -> bool {
     }
 }
 
-pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult> {
-    let s = get_schema(txn, table).await?;
-    let limit = q.limit.unwrap_or(100);
-    if limit == 0 || limit > 1000 {
-        return Err(Error::invalid("limit must be in 1..=1000"));
+/// Which rows to read or change: an access path (the primary key, or an
+/// index), equality on a prefix of its columns with an optional range on
+/// the next one, and a residual filter.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Selection {
+    #[serde(default)]
+    pub index: Option<String>,
+    #[serde(default)]
+    pub eq: Vec<Json>,
+    #[serde(default)]
+    pub range: Option<RangeSpec>,
+    #[serde(default)]
+    pub filter: Option<Filter>,
+}
+
+/// The stored keys a selection reads.
+struct AccessPath {
+    /// Prefix of the path's keys: the table's rows or one index.
+    base: Vec<u8>,
+    index: Option<IndexDef>,
+    /// `None` if the selection is empty.
+    range: Option<KeyRange>,
+}
+
+impl AccessPath {
+    /// The row a key of this path stands for, unless it has gone.
+    async fn row(&self, txn: &mut Txn, s: &TableSchema, it: &ReadValue) -> Result<(Vec<Key>, Option<Stored>)> {
+        let rest = &it.key[self.base.len()..];
+        let pk = match &self.index {
+            None => tuple::decode_all(rest)?,
+            Some(idx) => {
+                let (_, used) = tuple::decode_n(rest, idx.columns.len())?;
+                let pk_bytes: &[u8] = match &it.value {
+                    Value::Inline(v) if !v.is_empty() => v,
+                    _ => &rest[used..],
+                };
+                tuple::decode_all(pk_bytes)?
+            }
+        };
+        let row = load_row(txn, s, &pk).await?;
+        Ok((pk, row))
     }
-    if let Some(f) = &q.filter {
-        validate_filter(&s, f, 0)?;
+}
+
+fn access_path(s: &TableSchema, sel: &Selection) -> Result<AccessPath> {
+    if let Some(f) = &sel.filter {
+        validate_filter(s, f, 0)?;
     }
-    // Columns of the access path.
-    let (base, cols, index): (Vec<u8>, Vec<String>, Option<IndexDef>) = match &q.index {
+    let (base, cols, index): (Vec<u8>, Vec<String>, Option<IndexDef>) = match &sel.index {
         None => (table_prefix(SPACE_ROWS, s.id), s.primary_key.clone(), None),
         Some(name) => {
             let idx = s.index(name).cloned().ok_or_else(|| Error::not_found(format!("index {name:?} not found")))?;
@@ -933,11 +1156,11 @@ pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult>
             (index_prefix(s.id, idx.id), idx.columns.clone(), Some(idx))
         }
     };
-    if q.eq.len() > cols.len() {
+    if sel.eq.len() > cols.len() {
         return Err(Error::invalid("more equality values than key columns"));
     }
     let mut prefix = base.clone();
-    for (v, c) in q.eq.iter().zip(&cols) {
+    for (v, c) in sel.eq.iter().zip(&cols) {
         let col = s.column(c).ok_or_else(|| Error::internal("column missing"))?;
         let k = if v.is_null() { Key::Null } else { key_from_json(col.ty, v, c)? };
         tuple::encode_one(&mut prefix, &k);
@@ -945,9 +1168,10 @@ pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult>
     let pfx_end = crate::util::prefix_end(&prefix).map(Bytes::from);
     let mut start = Bound::Included(Bytes::from(prefix.clone()));
     let mut end = pfx_end.clone().map(Bound::Excluded).unwrap_or(Bound::Unbounded);
-    if let Some(r) = &q.range {
-        let c =
-            cols.get(q.eq.len()).ok_or_else(|| Error::invalid("range needs a key column after the equality values"))?;
+    if let Some(r) = &sel.range {
+        let c = cols
+            .get(sel.eq.len())
+            .ok_or_else(|| Error::invalid("range needs a key column after the equality values"))?;
         let col = s.column(c).ok_or_else(|| Error::internal("column missing"))?;
         let enc = |v: &Json| -> Result<Vec<u8>> {
             let mut p = prefix.clone();
@@ -961,10 +1185,9 @@ pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult>
             start = Bound::Included(Bytes::from(enc(v)?));
         }
         if let Some(v) = &r.gt {
-            let e = enc(v)?;
-            start = match crate::util::prefix_end(&e) {
+            start = match crate::util::prefix_end(&enc(v)?) {
                 Some(x) => Bound::Included(Bytes::from(x)),
-                None => return Ok(QueryResult { rows: vec![], next_cursor: None }),
+                None => return Ok(AccessPath { base, index, range: None }),
             };
         }
         if let Some(v) = &r.lt {
@@ -974,19 +1197,30 @@ pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult>
             end = crate::util::prefix_end(&enc(v)?).map(|x| Bound::Excluded(Bytes::from(x))).unwrap_or(end);
         }
     }
+    Ok(AccessPath { base, index, range: Some(KeyRange::new(start, end)) })
+}
+
+pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult> {
+    let s = get_schema(txn, table).await?;
+    let limit = q.limit.unwrap_or(100);
+    if limit == 0 || limit > 1000 {
+        return Err(Error::invalid("limit must be in 1..=1000"));
+    }
+    let sel = Selection { index: q.index.clone(), eq: q.eq.clone(), range: q.range.clone(), filter: q.filter.clone() };
+    let path = access_path(&s, &sel)?;
+    let Some(mut range) = path.range.clone() else {
+        return Ok(QueryResult { rows: vec![], next_cursor: None });
+    };
     if let Some(c) = &q.cursor {
         let ck = Bytes::from(b64::decode_url(c).ok_or_else(|| Error::invalid("bad cursor"))?);
-        let range = KeyRange::new(start.clone(), end.clone());
         if !range.contains(&ck) {
             return Err(Error::invalid("cursor does not belong to this query"));
         }
-        if q.reverse {
-            end = Bound::Excluded(ck);
-        } else {
-            start = Bound::Excluded(ck);
-        }
+        range = match q.reverse {
+            true => KeyRange::new(range.start, Bound::Excluded(ck)),
+            false => KeyRange::new(Bound::Excluded(ck), range.end),
+        };
     }
-    let mut range = KeyRange::new(start, end);
     let mut rows = Vec::new();
     let mut examined = 0usize;
     let page_size = (limit * 2).clamp(16, 1000);
@@ -995,26 +1229,7 @@ pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult>
         let full = page.len() == page_size;
         for (pos, it) in page.iter().enumerate() {
             examined += 1;
-            let (pk, row) = match &index {
-                None => {
-                    let pk = tuple::decode_all(&it.key[base.len()..])?;
-                    let row = load_row(txn, &s, &pk).await?;
-                    (pk, row)
-                }
-                Some(idx) => {
-                    let rest = &it.key[base.len()..];
-                    let (_, used) = tuple::decode_n(rest, idx.columns.len())?;
-                    let pk_bytes: &[u8] = match &it.value {
-                        Value::Inline(v) if !v.is_empty() => v,
-                        _ => &rest[used..],
-                    };
-                    let pk = tuple::decode_all(pk_bytes)?;
-                    let row = load_row(txn, &s, &pk).await?;
-                    (pk, row)
-                }
-            };
-            let _ = &pk;
-            if let Some(row) = row
+            if let (_, Some((row, _))) = path.row(txn, &s, it).await?
                 && q.filter.as_ref().is_none_or(|f| eval_filter(&s, f, &row))
             {
                 rows.push(row_to_json(&s, &row));
@@ -1038,6 +1253,55 @@ pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult>
     }
 }
 
+/// A page of a table's row changes (see [`row_changes`]).
+pub struct RowChanges {
+    pub changes: Vec<Json>,
+    pub more: bool,
+    /// Where the next page starts.
+    pub next: ChangePos,
+}
+
+/// The changes to `table`'s rows after `after`, at the transaction's
+/// snapshot: for each row changed since, its state then, `{"version",
+/// "pk", "row", "expires_at"?}` or `{"version", "pk", "deleted": true}`.
+pub async fn row_changes(txn: &mut Txn, table: &str, after: &ChangePos, limit: usize) -> Result<RowChanges> {
+    let s = get_schema(txn, table).await?;
+    let prefix = table_prefix(SPACE_ROWS, s.id);
+    let snapshot = txn.snapshot.clone();
+    let page = snapshot.changes(&KeyRange::prefix(&prefix), after, limit).await?;
+    let mut changes = Vec::with_capacity(page.changes.len());
+    for c in &page.changes {
+        let (version, e) = match c {
+            Change::Entry(e) => (e.seq, e.clone().at(txn.read_time)),
+            // Rows are only ever deleted one by one while their table exists.
+            Change::DeleteRange(t) => {
+                changes.push(serde_json::json!({"version": t.seq, "deleted_range": true}));
+                continue;
+            }
+        };
+        let pk = tuple::decode_all(&e.key[prefix.len()..])?;
+        let pk_json = Json::Array(pk.iter().cloned().map(|k| Datum::from_key(k).to_json()).collect());
+        if e.value.is_tombstone() {
+            changes.push(serde_json::json!({"version": version, "pk": pk_json, "deleted": true}));
+            continue;
+        }
+        let rv =
+            ReadValue { key: e.key.clone(), value: e.value.clone(), seq: Some(e.seq), ttl: e.expires.map(Ttl::Until) };
+        let (_, mut row) = decode_stored_row(&s, &prefix, &rv)?;
+        load_blob_columns(txn, &s, &pk, &mut row).await?;
+        let mut j = serde_json::json!({"version": version, "pk": pk_json, "row": row_to_json(&s, &row)});
+        if let Some(x) = e.expires {
+            j["expires_at"] = serde_json::json!(x);
+        }
+        changes.push(j);
+    }
+    let next = match (page.more, page.changes.last()) {
+        (true, Some(c)) => c.pos(),
+        _ => after.clone().max(ChangePos::after_version(snapshot.version())),
+    };
+    Ok(RowChanges { changes, more: page.more, next })
+}
+
 /// Recompute every index of a table from its rows and compare with the
 /// stored index entries (consistency checker used by tests and the DST).
 /// A building index must hold the entries of every row its backfill has
@@ -1048,11 +1312,14 @@ pub async fn check_indexes(txn: &mut Txn, table: &str) -> Result<()> {
     let rows = all_rows(txn, &s).await?;
     for idx in &s.indexes {
         let stored = txn.scan(&KeyRange::prefix(&index_prefix(s.id, idx.id)), false, usize::MAX).await?;
-        let got: BTreeMap<Bytes, Bytes> = stored
+        let got: BTreeMap<Bytes, (Bytes, Option<u64>)> = stored
             .into_iter()
-            .map(|it| match it.value {
-                Value::Inline(v) => (it.key, v),
-                _ => (it.key, Bytes::new()),
+            .map(|it| {
+                let expires = it.expires();
+                match it.value {
+                    Value::Inline(v) => (it.key, (v, expires)),
+                    _ => (it.key, (Bytes::new(), expires)),
+                }
             })
             .collect();
         if idx.state == IndexState::Building {
@@ -1061,8 +1328,9 @@ pub async fn check_indexes(txn: &mut Txn, table: &str) -> Result<()> {
                 _ => return Err(Error::internal(format!("building index {} has no backfill cursor", idx.name))),
             };
             let mut all = BTreeSet::new();
-            for (key, pk, row) in &rows {
-                let entry = index_entry(&s, idx, row, pk)?;
+            for (key, pk, row, expires) in &rows {
+                let (k, v) = index_entry(&s, idx, row, pk)?;
+                let entry = (k, (v, *expires));
                 if key <= &cursor && got.get(&entry.0) != Some(&entry.1) {
                     return Err(Error::internal(format!(
                         "building index {}.{} misses a backfilled row",
@@ -1082,9 +1350,9 @@ pub async fn check_indexes(txn: &mut Txn, table: &str) -> Result<()> {
             continue;
         }
         let mut want = BTreeMap::new();
-        for (_, pk, row) in &rows {
+        for (_, pk, row, expires) in &rows {
             let (k, v) = index_entry(&s, idx, row, pk)?;
-            if want.insert(k, v).is_some() {
+            if want.insert(k, (v, *expires)).is_some() {
                 return Err(Error::internal(format!("unique index {} violated", idx.name)));
             }
         }

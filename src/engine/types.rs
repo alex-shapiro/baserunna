@@ -38,6 +38,27 @@ impl BlobRef {
     }
 }
 
+/// The keyspace of commit records, above every keyspace of the layers on
+/// top of the engine: `COMMIT_SPACE ++ commit id (u64, big-endian)`, with
+/// the commit's version as the entry's seq and an empty value. Each commit
+/// writes its record in the same manifest write as its data, so finding the
+/// record tells whether a commit applied (SPEC §5.5). Records are kept for
+/// `commit_retention_ms`, by the age of their version. Nothing overwrites a
+/// record, so one past its retention shadows nothing and is dropped
+/// without a tombstone.
+pub const COMMIT_SPACE: u8 = 0xFF;
+
+pub fn commit_key(id: u64) -> Bytes {
+    let mut k = Vec::with_capacity(9);
+    k.push(COMMIT_SPACE);
+    k.extend_from_slice(&id.to_be_bytes());
+    Bytes::from(k)
+}
+
+pub fn is_commit_key(k: &[u8]) -> bool {
+    k.first() == Some(&COMMIT_SPACE)
+}
+
 /// Object ids (segments, blobs) are 32 lowercase hex characters.
 pub fn valid_object_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -94,7 +115,13 @@ impl Value {
     /// `src` must be the buffer the reader was created over: inline values
     /// share it without copying.
     pub fn decode(r: &mut Reader<'_>, src: &Bytes) -> DResult<Value> {
-        match r.u8()? {
+        let kind = r.u8()?;
+        Value::decode_kind(r, src, kind)
+    }
+
+    /// Decodes the rest of a value of kind `kind` (its first byte).
+    fn decode_kind(r: &mut Reader<'_>, src: &Bytes, kind: u8) -> DResult<Value> {
+        match kind {
             0 => Ok(Value::Inline(src.slice_ref(r.bytes()?))),
             1 => Ok(Value::Blob(BlobRef::decode(r)?)),
             2 => Ok(Value::Tombstone),
@@ -108,17 +135,55 @@ pub struct Entry {
     pub key: Bytes,
     pub seq: Seq,
     pub value: Value,
+    /// Store time (ms) at which the value expires. An expired entry reads
+    /// like a tombstone with the same `seq`: it still hides older values of
+    /// its key. Tombstones never expire.
+    pub expires: Option<u64>,
 }
 
+/// An entry's value kind byte carries this flag when an expiry follows it.
+const EXPIRES_FLAG: u8 = 0x10;
+
 impl Entry {
+    pub fn new(key: Bytes, seq: Seq, value: Value) -> Entry {
+        Entry { key, seq, value, expires: None }
+    }
+
+    pub fn tombstone(key: Bytes, seq: Seq) -> Entry {
+        Entry::new(key, seq, Value::Tombstone)
+    }
+
     pub fn size(&self) -> usize {
-        self.key.len() + self.value.size() + 10
+        self.key.len() + self.value.size() + 10 + if self.expires.is_some() { 8 } else { 0 }
+    }
+
+    /// Whether the entry is a tombstone or has expired at `at` (store ms).
+    pub fn is_dead(&self, at: u64) -> bool {
+        self.value.is_tombstone() || self.expired(at)
+    }
+
+    pub fn expired(&self, at: u64) -> bool {
+        self.expires.is_some_and(|e| e <= at)
+    }
+
+    /// The entry as it reads at `at`: a tombstone with the same seq once
+    /// expired.
+    pub fn at(self, at: u64) -> Entry {
+        match self.expired(at) {
+            true => Entry::tombstone(self.key, self.seq),
+            false => self,
+        }
     }
 
     pub fn encode(&self, w: &mut Writer) {
         w.bytes(&self.key);
         w.varint(self.seq);
+        let start = w.len();
         self.value.encode(w);
+        if let Some(e) = self.expires {
+            w.buf[start] |= EXPIRES_FLAG;
+            w.varint(e);
+        }
     }
 
     /// `src` must be the buffer the reader was created over (see
@@ -130,8 +195,14 @@ impl Entry {
         }
         let key = src.slice_ref(k);
         let seq = r.varint()?;
-        let value = Value::decode(r, src)?;
-        Ok(Entry { key, seq, value })
+        let kind = r.u8()?;
+        let value = Value::decode_kind(r, src, kind & !EXPIRES_FLAG)?;
+        let expires = match kind & EXPIRES_FLAG {
+            0 => None,
+            _ if value.is_tombstone() => return Err(DecodeError("expiring tombstone")),
+            _ => Some(r.varint()?),
+        };
+        Ok(Entry { key, seq, value, expires })
     }
 }
 
@@ -177,7 +248,7 @@ mod tests {
     fn decoding_bounds_key_length() {
         for (len, ok) in [(4096 + 64, true), (4096 + 65, false)] {
             let mut w = Writer::new();
-            Entry { key: Bytes::from(vec![b'k'; len]), seq: 1, value: Value::Tombstone }.encode(&mut w);
+            Entry::tombstone(Bytes::from(vec![b'k'; len]), 1).encode(&mut w);
             let src = Bytes::from(w.into_inner());
             assert_eq!(Entry::decode(&mut Reader::new(&src), &src).is_ok(), ok, "key of {len} bytes");
         }
@@ -186,17 +257,34 @@ mod tests {
     #[test]
     fn entry_roundtrip() {
         let es = vec![
-            Entry { key: Bytes::from_static(b"a"), seq: 5, value: Value::Inline(Bytes::from_static(b"hello")) },
-            Entry { key: Bytes::from_static(b"b"), seq: 1 << 40, value: Value::Tombstone },
-            Entry {
-                key: Bytes::from_static(b"c"),
-                seq: 0,
-                value: Value::Blob(BlobRef {
+            Entry::new(Bytes::from_static(b"a"), 5, Value::Inline(Bytes::from_static(b"hello"))),
+            Entry::tombstone(Bytes::from_static(b"b"), 1 << 40),
+            Entry::new(
+                Bytes::from_static(b"c"),
+                0,
+                Value::Blob(BlobRef {
                     id: make_blob_id(1, &[1; 10]),
                     size: 10,
                     sha256: [3; 32],
                     content_type: "image/png".into(),
                 }),
+            ),
+            Entry {
+                expires: Some(1_700_000_000_000),
+                ..Entry::new(Bytes::from_static(b"d"), 7, Value::Inline(Bytes::new()))
+            },
+            Entry {
+                expires: Some(0),
+                ..Entry::new(
+                    Bytes::from_static(b"e"),
+                    8,
+                    Value::Blob(BlobRef {
+                        id: make_blob_id(2, &[2; 10]),
+                        size: 1,
+                        sha256: [4; 32],
+                        content_type: "".into(),
+                    }),
+                )
             },
         ];
         let mut w = Writer::new();
@@ -210,10 +298,33 @@ mod tests {
             let d = Entry::decode(&mut r, &src).unwrap();
             assert_eq!(&d, e);
             assert!(within(&d.key), "keys are decoded without copying");
-            if let Value::Inline(v) = &d.value {
+            if let Value::Inline(v) = &d.value
+                && !v.is_empty()
+            {
                 assert!(within(v), "values are decoded without copying");
             }
         }
         assert!(r.is_empty());
+    }
+
+    /// An expired entry reads as a tombstone of the same seq; a tombstone
+    /// cannot carry an expiry.
+    #[test]
+    fn expiry() {
+        let e = Entry { expires: Some(100), ..Entry::new(Bytes::from_static(b"k"), 3, Value::Inline(Bytes::new())) };
+        assert!(!e.is_dead(99) && e.is_dead(100) && e.is_dead(101));
+        assert_eq!(e.clone().at(99), e);
+        assert_eq!(e.clone().at(100), Entry::tombstone(Bytes::from_static(b"k"), 3));
+        assert!(Entry::tombstone(Bytes::new(), 1).is_dead(0));
+        let mut w = Writer::new();
+        Entry::tombstone(Bytes::from_static(b"k"), 3).encode(&mut w);
+        let mut buf = w.into_inner();
+        // The value kind byte follows the key and the seq.
+        buf[3] |= EXPIRES_FLAG;
+        buf.push(5);
+        let src = Bytes::from(buf);
+        assert!(Entry::decode(&mut Reader::new(&src), &src).is_err(), "an expiring tombstone is corrupt");
+        assert!(e.size() >= Entry::new(e.key.clone(), 3, e.value.clone()).size() + 8, "expiries are accounted");
+        assert!(is_commit_key(&commit_key(7)) && !is_commit_key(b"\x01k") && commit_key(1) < commit_key(256));
     }
 }

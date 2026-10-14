@@ -144,11 +144,7 @@ mod tests {
     fn block(n: usize) -> CacheVal {
         CacheVal::Block(Arc::new(
             (0..n)
-                .map(|i| Entry {
-                    key: Bytes::from(format!("{i:08}")),
-                    seq: 1,
-                    value: Value::Inline(Bytes::from(vec![0u8; 100])),
-                })
+                .map(|i| Entry::new(Bytes::from(format!("{i:08}")), 1, Value::Inline(Bytes::from(vec![0u8; 100]))))
                 .collect(),
         ))
     }

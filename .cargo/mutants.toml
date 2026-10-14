@@ -35,7 +35,7 @@ examine_re = [
     '^src/(engine|table)/',
     '^src/ops\.rs',
     '^src/sim/storage_check\.rs',
-    '^src/sim/workloads/\w+\.rs:.* in (check|audit|check_body|check_value|check_version|TxnSim::\w+)$',
+    '^src/sim/workloads/\w+\.rs:.* in (check|audit|check_body|check_value|check_version|check_read|check_locks|explained|TxnSim::\w+)$',
 ]
 exclude_re = [
     # Diagnostics: tracing and formatting cannot change results.

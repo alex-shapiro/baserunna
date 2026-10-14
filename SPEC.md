@@ -96,9 +96,10 @@ src/
   env.rs            Env: clock, RNG, task spawning
   util/             crc32c, varint codec, base64, hex, PRNG, bloom filter
   store/            ObjectStore trait; MemStore, FsStore, CloudStore(feature)
-  engine/           segments, manifest and levels objects, versions, reads, commits (with
-                    read/write sets and validation), range tombstones, leveled compaction,
-                    local tier, store clock, GC, blobs, size quotas
+  engine/           segments, manifest and levels objects, versions, reads (with expiry),
+                    commits (read/write sets, validation, commit records), change feeds,
+                    range tombstones, leveled compaction, local tier, store clock, GC, blobs,
+                    size quotas
   ops.rs            the JSON transaction-op language
   table/            tuple encoding, schema, rows, indexes, queries
   cluster.rs        membership, rendezvous routing, forwarding, leases policy
@@ -127,6 +128,7 @@ fuzz/               optional cargo-fuzz targets, share code with tests
   - tombstone, for deletes
 - Each committed entry carries a `seq`, the DB version that wrote it.
   The `seq` is reported to a client as the key's `version`.
+- A value may expire (§4.5).
 
 ### 4.2 Internal keyspaces
 
@@ -139,6 +141,7 @@ Use a prefix byte to avoid collisions between keyspaces.
 | `0x02` | table rows: `0x02 ++ table_id(u32 BE) ++ tuple(pk)`                                 |
 | `0x03` | index entries: `0x03 ++ table_id ++ index_id(u32 BE) ++ tuple(cols) [++ tuple(pk)]` |
 | `0x04` | row blob columns: `0x04 ++ table_id ++ tuple(pk) ++ column_id(u32 BE)`              |
+| `0xFF` | commit records (the engine's own, §5.5): `0xFF ++ commit_id(u64 BE)`                |
 
 ### 4.3 Blobs
 
@@ -196,6 +199,49 @@ key of one or more columns, and secondary indexes.
   equality on an index prefix with an optional range on the next column;
   optional residual `filter` (and/or/not, eq/ne/lt/le/gt/ge/in/prefix/is_null)
   evaluated server-side; `limit`, `reverse`, and an opaque `cursor`.
+- Batch updates and deletes change every row a selection (the same access
+  path, `eq`, `range` and `filter` as a query) picks, at most `limit`, in
+  one transaction. All the selected rows are read before any is written, so
+  an update that moves rows within the index it selects through changes
+  each once. The transaction's write limit bounds how many rows one request
+  may change; `limit` lets a client work through more in several.
+
+### 4.5 Times to live
+
+A value or row written with `ttl_ms` expires that long after the time of
+the version that commits it: its **version time** (§5.2), a store-clock
+time. An expired value reads as deleted, and like a tombstone it hides any
+older value of its key. A row expires together with its index entries and
+blob columns, so a unique value is free again once its row has expired. An
+update of a row, or an `increment`, keeps the expiry unless it sets one.
+Reads report a committed value's expiry as `expires_at` (cluster time,
+ms).
+
+Expiry is consistent with transactions:
+
+- Every snapshot reads at one time: the store time at which its version was
+  known to be the latest (now, for a lease holder), never earlier than the
+  version's own time. A transaction evaluates every expiry at its snapshot's
+  time.
+- Version times never decrease, and a version's time is never earlier than
+  the read time of any transaction it commits, so readers agree with every
+  committed transaction about what had expired.
+- A serializable transaction that read a value fails to commit with a
+  retryable `409 conflict` once that value has expired by the commit's time:
+  its view no longer holds. Snapshot isolation does not validate reads, here
+  as elsewhere.
+
+Expiry is as precise as the nodes' measurements of the store's clock
+(§5.8), whose error is at most `clock_sync_max_error_ms`: for that long
+around an expiry, reads may disagree whether a value has expired. Outside
+that window, a strong read sees a value until its expiry and never after; a
+`snapshot` read sees values as of when its cached version was validated, at
+most its staleness bound earlier. A node reads a version holding expiring
+values only with a recent clock measurement, and answers `503` while it
+cannot take one.
+
+Expired values take space until the next manifest write (in the tail) or
+compaction (in segments) reduces them to tombstones (§5.6).
 
 ## 5. Storage engine
 
@@ -222,6 +268,7 @@ magic "BRMF", format u16
 db_id
 version: u64                                  data version = seq of the last commit
 write_seq: u64                                incremented by every manifest write
+time_ms: u64                                  version time: store time of the latest write, never decreasing
 lease: Option<{node_id, expires_at_ms, duration_ms}>
 segments: [SegmentMeta]                       by level: level 0 newest first, deeper levels in key order
 levels: Option<id>                            the levels object holding the segments below level 0
@@ -229,15 +276,15 @@ compaction_seq: u64                           incremented by every compaction in
 tail: [Entry]                                 sorted by key, newest value per key (the inline write log)
 range_deletes: [(start, end?, seq)]           range tombstones (§5.5)
 tombstone_horizon: u64                        tombstones with seq <= horizon may have been purged
-recent_commits: [(commit_id u128, version)]   bounded ring for idempotence / ambiguity resolution
 version_times: [(version, store_ms)]          sparse samples (≥30 s apart) for time-based policies
 obsolete: [(kind, id, since_store_ms)]        segments, levels objects and blobs awaiting deletion
 blob_bytes: {bound, swept, swept_at}          blob bytes for the size quota (§5.10)
 ```
 
-Each `SegmentMeta` records its level, size, key and seq ranges, and
-`deletes_applied`: the version through which range tombstones had been
-applied when it was written.
+Each `SegmentMeta` records its level, size, key and seq ranges,
+`deletes_applied` (the version through which range tombstones had been
+applied when it was written), and how many of its entries expire and the
+latest of their expiries.
 
 Every commit rewrites the manifest, so its size is a cost on every write.
 Level 0 changes with every flush and stays inline. The deeper levels change
@@ -304,9 +351,11 @@ invalidation.
   check is a binary search. A point lookup of a deleted key reports a
   tombstone with the range tombstone's seq, even when nothing it deleted
   is left in storage; conflict checks rely on that (§6.1).
-- Snapshot isolation comes for free: a transaction keeps its `Arc<Version>`.
-  Objects referenced by any version younger than `txn_max_lifetime` are never
-  deleted (§5.8).
+- An entry that has expired by the read's time reads as a tombstone of the
+  same seq (§4.5).
+- Snapshot isolation comes for free: a transaction keeps its `Arc<Version>`
+  and its read time. Objects referenced by any version younger than
+  `txn_max_lifetime` are never deleted (§5.8).
 
 ### 5.5 Commits (group commit + CAS)
 
@@ -314,11 +363,14 @@ Each open DB has a per-node commit queue. One committer task drains it
 (spawned on demand; it exits when the queue is empty):
 
 1. Take the batch of pending transactions. Base = the latest Version known
-   to this node.
+   to this node. The batch's version time is the latest of the base's time,
+   the store's clock and the read times of its transactions (§4.5).
 2. Lease check: if `base.lease` belongs to another node and is still valid
    from this node's viewpoint (§5.7), fail the batch with `not_owner` (the
    API layer forwards or returns 503).
-3. For each transaction in order, validate it (§6.1) against all writes with
+3. For each transaction in order: if its commit record exists, in the base
+   or earlier in this batch, it already committed; report that version
+   (`replayed`). Otherwise validate it (§6.1) against all writes with
    `seq > txn.read_version` in base and in transactions already accepted in
    this batch. Rejected transactions get `409 conflict`. Transactions past
    their **commit deadline** (arrival at the first node + `commit_timeout_ms`,
@@ -334,12 +386,16 @@ Each open DB has a per-node commit queue. One committer task drains it
    older entry in the range: it drops the tail's entries there and replaces
    any range tombstone it contains. Dropping a table or an index of any
    size costs a few manifest entries. Writes of the same transaction carry
-   the same seq, so they survive their own range delete.
-4. If the new tail exceeds `tail_max_bytes` (256 KiB), write it to a new
-   level 0 segment (unconditional PUT to a fresh random id) and clear the
-   tail.
-5. Renew the lease (`node_id = self`, `lease_ms`, §5.7). Append the commit
-   ids to `recent_commits` and maybe sample `version_times`.
+   the same seq, so they survive their own range delete. A write with a time
+   to live gets its expiry from the batch's version time. Each accepted
+   transaction also writes its **commit record**.
+4. Entries of the tail that have expired by the version time become
+   tombstones, and commit records past their retention go. If the tail then
+   exceeds `tail_max_bytes` (256 KiB), write it to new level 0 segments
+   (unconditional PUTs to fresh random ids; data and commit records in
+   separate segments) and clear the tail.
+5. Renew the lease (`node_id = self`, `lease_ms`, §5.7) and maybe sample
+   `version_times`.
 6. `PUT manifest If-Match: base.etag`:
    - **ok**: install the new Version and acknowledge the accepted
      transactions with `version = base.version + 1`.
@@ -347,8 +403,8 @@ Each open DB has a per-node commit queue. One committer task drains it
      another node now holds a valid lease, fail with `not_owner`. Otherwise
      go back to 3. Transactions validated earlier are revalidated against the
      new base.
-   - **error/timeout (ambiguous)**: reload the manifest. If our commit ids
-     are in `recent_commits`, it succeeded. If not, go back to 3. This is safe
+   - **error/timeout (ambiguous)**: reload the manifest and go back to 3,
+     which finds the commit records of an attempt that landed. This is safe
      because any delayed copy of our PUT carries the same `If-Match` as the
      retry, so at most one of them applies. After `commit_retry_max`
      ambiguous attempts, fail with `503 unavailable`, `outcome: "unknown"`.
@@ -364,6 +420,21 @@ serving the older cached version would let reads go backwards in time.
 A crash at any point leaves either the old manifest or the new one. A segment
 written in step 4 without a successful manifest PUT is an orphan, and orphan
 GC removes it (§5.8).
+
+**Commit records** make commits idempotent and their outcomes knowable. A
+commit's record is an entry in the engine's own keyspace (`0xFF ++ commit
+id`, §4.2) with the commit's version as its seq, written in the same
+manifest write as the commit's data, so a commit applied if and only if its
+record exists. Records ride the LSM like data: small and in the tail at
+first, then in segments, found by bloom-filtered point lookups. Records are
+kept for `commit_retention_ms` (10 minutes), measured by the age of their
+version (`version_times`), and nothing ever overwrites one, so records past
+it are dropped without a tombstone: from the tail at a manifest write, and
+in compaction, which drops whole segments of them unread. Flushes and
+compactions keep records out of data segments, and level 0 compacts data
+and records separately, so neither drags the other into its merges.
+Records do not count toward the size quota. Commit ids are 64 bits: among
+the records of ten minutes, collisions are negligible.
 
 ### 5.6 Compaction
 
@@ -401,9 +472,11 @@ version at least `txn_max_lifetime` old. The manifest then records
 `read_version < tombstone_horizon` fails validation conservatively with a
 retryable `409 conflict`.
 
-Every merge also drops the entries its manifest's range tombstones
-delete. Before any other compaction, the picker removes what range
-tombstones deleted, so the space returns soon after a large delete:
+A merge reads at its manifest's version time: entries expired by then
+become tombstones (purged as above), and commit records past their
+retention go. Every merge also drops the entries its manifest's range
+tombstones delete. Before any other compaction, the picker removes what
+range tombstones deleted, so the space returns soon after a large delete:
 
 - a segment whose entries a range tombstone all deletes (its key range
   inside the tombstone's, its `max_seq` below the tombstone's) is removed
@@ -421,13 +494,18 @@ tombstones applied). Once no segment may, and the tombstone is older than
 `purge_seq`, the next manifest write retires it and raises
 `tombstone_horizon` to its seq, exactly like a purged point tombstone.
 
+Expired data is reclaimed the same way: segments of commit records past
+their retention are removed unread, and a segment below level 0 at least
+half of whose entries have all expired is rewritten on its level, keeping
+only tombstones of them.
+
 Leveled compaction replaced size-tiered compaction after measuring both
 (`sim::amp`, `cargo run --release --example amplification`): five workloads
 on a database of about 10 MB with production sizes and compression off, to
 isolate the policy. Write amplification is segment bytes written per
 logical byte; space amplification is stored per live bytes, after garbage
 collection (settled) and at worst during the run; read amplification is
-segments a point lookup may consult.
+segments a point lookup may consult, at the end of the run.
 
 | workload                | write, tiered → leveled | space settled | space worst | read      |
 | ----------------------- | ----------------------- | ------------- | ----------- | --------- |
@@ -441,7 +519,10 @@ The trade favors cost: PUTs are priced per request, not per byte, so
 rewriting 2 MiB segments a few more times costs little, while stored bytes
 are billed every month. With compression on, the stored bytes are about a
 fifth of the above. `tests/cost.rs` budgets these numbers for small
-databases.
+databases, with read amplification averaged over the run (sampled after
+every commit), which unlike the end of a run does not depend on where in a
+compaction cycle it falls. Commit records (§5.5) add no measurable write
+or space amplification.
 
 ### 5.7 Leases
 
@@ -542,7 +623,8 @@ which keeps them linearizable at the cost of one GET.
 
 Each database may store at most `db_max_bytes` (`BASERUNNA_DB_MAX_MB`,
 10 GiB by default; the system database is exempt). Its size is what its
-manifest accounts for: segment sizes, the tail, and blob bytes. Commits
+manifest accounts for: segment sizes, the tail, and blob bytes, but not
+commit records (§5.5). Commits
 add the size of each blob they bind to `blob_bytes.bound`; a sweep finds
 the distinct blobs the database still references and records their bytes
 (`swept`) with the `bound` total of the version it read (`swept_at`). Blob
@@ -584,7 +666,9 @@ overhead its commits did not count.
   - validation fails if any entry, including tombstones, in the current
     state with `seq > read_version` intersects the read set. A range
     tombstone newer than `read_version` that intersects the read set fails
-    it too, even where it deleted nothing (conservative).
+    it too, even where it deleted nothing (conservative). So does a value
+    the transaction read that has expired by the commit's version time
+    (§4.5).
 - `snapshot` isolation validates only the write set (first-committer-wins).
   Write skew is possible, as documented. Reads that writes are derived from
   are validated anyway: a row write commits only against the table schema
@@ -602,9 +686,10 @@ overhead its commits did not count.
 
 1. **One-shot** (`POST /v1/dbs/{db}/txn`): a list of ops executed atomically
    in one request. Supports `check` ops (preconditions) and an optional
-   `idempotency_key`. Retrying with the same key never applies twice while
-   the key is in `recent_commits` (the last 1024 commits). A retry that finds
-   the earlier attempt applied returns `replayed: true` with `results: null`.
+   `idempotency_key`. Retrying with the same key never applies twice within
+   `commit_retention_ms` (10 minutes) of the first attempt, nor when two
+   attempts reach the committer together. A retry that finds the earlier
+   attempt applied returns `replayed: true` with `results: null`.
    A retried idempotent request that fails a precondition checks the
    commit status (fenced) before answering 412, because an earlier attempt
    may have applied the write that now makes the check fail. Conflicts are
@@ -619,29 +704,62 @@ response, means a commit may or may not have applied. The client waits
 until the request's commit deadline has certainly passed (about 15 s), then
 calls `GET /commits/{commit_id}` (or `key:<idempotency key>`). That call
 first performs a manifest write, fencing any in-flight attempt, and then
-answers definitively: `committed` (with its version) or `not_committed`.
+answers definitively from the commit records (§5.5): `committed` (with its
+version) or `not_committed`. Commit ids are 16 hex characters; the answer
+is definitive within `commit_retention_ms` (10 minutes) of the commit.
 
 ### 6.3 Ops
 
-| op             | fields                                                                    | result                                         |
-| -------------- | ------------------------------------------------------------------------- | ---------------------------------------------- |
-| `get`          | key                                                                       | `{found, value? \| blob?, version?}`           |
-| `scan`         | `prefix` or `start`/`end`, `limit` (≤1000), `reverse`, `keys_only`        | `{items, next_cursor?}`                        |
-| `put`          | key, `value` or `blob_id`                                                 | `{}`                                           |
-| `delete`       | key                                                                       | `{}`                                           |
-| `delete_range` | `prefix` or `start`/`end`                                                 | `{}` (expanded at commit)                      |
-| `check`        | key + one of `exists`, `version`, `value`                                 | fails txn with 412 if false                    |
-| `increment`    | key, `by` (i64)                                                           | `{value}`. Value is ASCII decimal; missing = 0 |
-| `get_row`      | table, `pk` (array or scalar)                                             | `{found, row?}`                                |
-| `insert_row`   | table, `row`                                                              | `{}`. 409 if pk exists                         |
-| `upsert_row`   | table, `row`                                                              | `{}`                                           |
-| `update_row`   | table, `pk`, `set`                                                        | `{found}`. Partial update                      |
-| `delete_row`   | table, `pk`                                                               | `{found}`                                      |
-| `query_rows`   | table, `index?`, `eq?`, `range?`, `filter?`, `limit`, `reverse`, `cursor` | `{rows, next_cursor?}`                         |
+| op             | fields                                                                     | result                                                  |
+| -------------- | -------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `get`          | key                                                                        | `{found, value? \| blob?, version?, expires_at?}`       |
+| `scan`         | `prefix` or `start`/`end`, `limit` (≤1000), `reverse`, `keys_only`         | `{items, next_cursor?}`                                 |
+| `put`          | key, `value` or `blob_id`, `ttl_ms?`                                       | `{}`                                                    |
+| `delete`       | key                                                                        | `{}`                                                    |
+| `delete_range` | `prefix` or `start`/`end`                                                  | `{}` (expanded at commit)                               |
+| `check`        | key + one of `exists`, `version`, `value`                                  | fails txn with 412 if false                             |
+| `increment`    | key, `by` (i64), `ttl_ms?`                                                 | `{value}`. Value is ASCII decimal; missing = 0          |
+| `get_row`      | table, `pk` (array or scalar)                                              | `{found, row?, expires_at?}`                            |
+| `insert_row`   | table, `row`, `ttl_ms?`                                                    | `{}`. 409 if pk exists                                  |
+| `upsert_row`   | table, `row`, `ttl_ms?`                                                    | `{}`                                                    |
+| `update_row`   | table, `pk`, `set`, `ttl_ms?`                                              | `{found}`. Partial update                               |
+| `delete_row`   | table, `pk`                                                                | `{found}`                                               |
+| `query_rows`   | table, `index?`, `eq?`, `range?`, `filter?`, `limit`, `reverse`, `cursor`  | `{rows, next_cursor?}`                                  |
+| `update_rows`  | table, `where` (`index?`, `eq?`, `range?`, `filter?`), `set`, `ttl_ms?`, `limit?` | `{count}`                                        |
+| `delete_rows`  | table, `where`, `limit?`                                                   | `{count}`                                               |
+
+`ttl_ms` (1 ms to 10 years) makes a value or row expire that long after the
+write commits (§4.5); `update_row`, `update_rows` and `increment` keep an
+existing expiry unless they set one.
 
 Keys and values in JSON are UTF-8 strings by default. With
 `"encoding": "base64"` on the request, every key and value in the request and
 response is standard base64 instead.
+
+### 6.4 Change feeds
+
+`GET /v1/dbs/{db}/changes?after=…` follows the changes to keys (optionally
+of a `prefix` or a `start`/`end` range); `GET /v1/dbs/{db}/tables/{t}/changes`
+those to a table's rows. A page reports, for every key changed after
+`after`, its state as of the page's snapshot: its value (and `expires_at`),
+`deleted` (also once its value expired), or for a large range delete one
+`deleted_range`. Intermediate values a key had in between are not reported.
+Changes are ordered by version, and within a version range deletions come
+first; a page holds at most `limit` of them and carries a `next_cursor` to
+pass as the next `after`, at once while `more` is true. With `wait_ms` (up
+to 20 s), a request that finds no change waits for one: on the lease holder, it
+returns as soon as a commit installs, elsewhere it re-reads the manifest
+every `watch_poll_ms` (1 s). Applying the pages in order to the state at
+`after` yields the current state.
+
+The engine finds the keys changed after a version by merging only the
+sources holding entries that new (`Version::changes`): the tail and the
+segments whose `max_seq` is past it, so a recent cursor reads little.
+Deletions are kept at least `txn_max_lifetime` (§5.6), so a cursor stays
+valid at least that long after the request that caught up to it. An older
+one may have missed purged deletions: the request fails with `410
+cursor_expired`, and the client reads the current state and follows on from
+its `version`.
 
 ---
 
@@ -806,6 +924,7 @@ Errors are returned as
 | 404    | `not_found`, `txn_not_found`                                               |
 | 409    | `conflict` (retryable), `already_exists`                                   |
 | 412    | `precondition_failed` (includes the failing op index)                      |
+| 410    | `cursor_expired` (a change feed cursor older than the deletions kept, §6.4) |
 | 413    | `too_large`                                                                |
 | 429    | `rate_limited` (retryable, `Retry-After`; not applied)                     |
 | 507    | `quota_exceeded` (the database is at its size quota, §5.10)                |
@@ -824,6 +943,7 @@ GET    /v1/api-keys          POST /v1/api-keys     DELETE /v1/api-keys/{id}
 GET    /v1/dbs               POST /v1/dbs
 GET    /v1/dbs/{db}          DELETE /v1/dbs/{db}
 GET    /v1/dbs/{db}/kv                             scan (query params)
+GET    /v1/dbs/{db}/changes                        change feed of keys (§6.4)
 GET|PUT|DELETE /v1/dbs/{db}/kv/{*key}              raw bytes; Range, If-Match, If-None-Match
 POST   /v1/dbs/{db}/blobs                          stage a blob (streamed body)
 GET    /v1/dbs/{db}/blobs/{blob_id}                read a blob (Range)
@@ -839,22 +959,23 @@ POST   /v1/dbs/{db}/tables/{t}/columns      DELETE /v1/dbs/{db}/tables/{t}/colum
 POST   /v1/dbs/{db}/tables/{t}/indexes      DELETE /v1/dbs/{db}/tables/{t}/indexes/{i}
 POST   /v1/dbs/{db}/tables/{t}/rows                insert (one or many; `upsert` flag)
 POST   /v1/dbs/{db}/tables/{t}/rows/get            by pk
-POST   /v1/dbs/{db}/tables/{t}/rows/update
-POST   /v1/dbs/{db}/tables/{t}/rows/delete
+POST   /v1/dbs/{db}/tables/{t}/rows/update        by `pk`, or many by `where`
+POST   /v1/dbs/{db}/tables/{t}/rows/delete        by `pk`, or many by `where`
 POST   /v1/dbs/{db}/tables/{t}/rows/query
+GET    /v1/dbs/{db}/tables/{t}/changes             change feed of rows (§6.4)
 GET    /v1/admin/users   GET /v1/admin/nodes   POST /v1/admin/users/{id}/disable
 ```
 
 Raw KV semantics:
 
 - `GET` returns the value with `ETag: "<version>"` and
-  `x-baserunna-version`. Blob values are streamed and support
-  `Range: bytes=…` (206). The query parameter `consistency` takes
-  `strong` or `snapshot`.
+  `x-baserunna-version`, and `x-baserunna-expires-at` if it expires. Blob
+  values are streamed and support `Range: bytes=…` (206). The query
+  parameter `consistency` takes `strong` or `snapshot`.
 - `PUT` takes the body as the value; bodies above `value_inline_max` become
   blobs automatically. `If-Match: "<v>"` makes the write conditional on the
-  key's version. `If-None-Match: *` makes it create-only.
-  `Content-Type` is kept for blob values.
+  key's version. `If-None-Match: *` makes it create-only. `?ttl_ms=` makes
+  the value expire (§4.5). `Content-Type` is kept for blob values.
 
 ---
 
@@ -959,11 +1080,13 @@ the directory.
 
 | workload       | checks                                                                                                                                                                            |
 | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kv_model`     | Random KV ops through every API form under faults, each response compared with a model. Ambiguous commits are resolved through `/commits/{id}`. Bulk writes and prefix deletes make range tombstones over segment data, and a final phase outlives every transaction so they retire. A small size quota refuses writes now and then: refused writes leave no trace, deletes are never refused, and the size stays near the quota. |
+| `kv_model`     | Random KV ops through every API form under faults, each response compared with a model. Ambiguous commits are resolved through `/commits/{id}`. Bulk writes and prefix deletes make range tombstones over segment data, and a final phase outlives every transaction so they retire. A small size quota refuses writes now and then: refused writes leave no trace, deletes are never refused, and the size stays near the quota. A follower of the change feed checks every change against the model and must rebuild the model's state, starting over when its cursor expires. |
 | `bank`         | Concurrent transfers across nodes. The total never changes and no balance goes negative, checked during the run and at the end.                                                   |
 | `register`     | Concurrent writers and strong readers on a few keys, checked for real-time linearizability.                                                                                       |
-| `tables`       | Schema changes and row ops against a model. At quiescence indexes match a recomputation from rows, unique constraints hold, and dropped tables and indexes (large enough to take range tombstones) leave nothing behind. |
-| `schema_race`  | Row writes on every path and at both isolation levels race schema changes. Indexes must match rows, nothing may be orphaned, and each writer's rows must match its model.         |
+| `tables`       | Schema changes and row ops against a model, including updates and deletes by selection that must change exactly the rows the model selects. A follower of the table's change feed must rebuild the model's rows. At quiescence indexes match a recomputation from rows, unique constraints hold, and dropped tables and indexes (large enough to take range tombstones) leave nothing behind. |
+| `schema_race`  | Row writes on every path (batch updates and deletes included) and at both isolation levels race schema changes. Indexes must match rows, nothing may be orphaned, and each writer's rows must match its model. |
+| `ttl`          | Values and rows with times to live. Each read must see a value until its expiry window (the commit request's span plus the TTL, widened by the clock error bound) and never after, nor a value it replaced; a unique value is free exactly when its row expired. Clients take and renew a lock held by an expiring value: by version, each acquisition commits no earlier than the previous lock expired and each renewal before the lock it read did, which the locks' own expiries tell exactly. |
+| `watch`        | A writer commits puts (some expiring), deletes and range deletes while a watcher follows the change feed with long polls through random nodes. Every change received must be what the writer wrote at that version, cursors expire no sooner than a transaction lifetime after they caught up, and the watcher's state must end up equal to the database's. |
 | `blobs`        | Uploads of random sizes on every path, range reads, overwrites and deletes, checked by SHA-256. A final GC keeps every referenced object and removes every unreferenced one.      |
 | `blob_gc_race` | Blob reads race overwrites, deletes and GC, with grace periods shorter than a download (and, hostile, node clocks an hour apart). A read may fail cleanly but never return wrong bytes. |
 | `abandoned`    | Interactive transactions abandoned, aborted or committed late while leases move. No update is lost, abandoned transactions never commit, and open transactions drain.             |
@@ -988,13 +1111,18 @@ blob exists.
 - **Property tests**, using an in-crate generator and shrinker with seeded
   reproduction. Properties: codec round trips; tuple encoding preserves order;
   segment build/read equals the input, compressed or not; an LSM with random
-  writes, point and range deletes, bulk loads, flushes, compactions, purges
-  and time jumps equals a model, with snapshots taken along the way still
-  reading their state a transaction lifetime later, and with the deeper
-  levels inline or in levels objects; range tombstone fragments match a
-  brute-force check; base64/varint/bloom laws.
+  writes (some expiring), point and range deletes, bulk loads, flushes,
+  compactions, purges and time jumps equals a model at every read's time,
+  with snapshots taken along the way still reading their state a
+  transaction lifetime later, with the deeper levels inline or in levels
+  objects, and with the change feed from any earlier version, applied in
+  pages to that version's state, giving the current state; a table with
+  random row writes, queries and batch updates and deletes through its
+  indexes equals a model; range tombstone fragments match a brute-force
+  check; base64/varint/bloom laws.
 - **Fuzz tests**: every decoder (manifest, levels object, range tombstone,
-  segment and compressed blocks, tuple, row, blob ref, cursors) gets
+  segment and compressed blocks, entries with expiries, tuple, row, blob
+  ref, query and change feed cursors) gets
   arbitrary and mutated inputs and must
   return `Err`, never panic. The router gets random JSON bodies and paths and must never answer
   500 or panic. These run in `cargo test` with fixed seeds. The same
@@ -1003,9 +1131,10 @@ blob exists.
   semantics, not just robustness. Fuzzer bytes choose one-shot and
   interactive transactions, some malformed, and an exact model predicts
   every response: results, versions, cursors, failing op indexes, unique
-  violations, replays and OCC conflicts. Rejected requests must leave no
-  trace. The model parses ops with its own copy of their types, so it
-  cannot share a parsing bug with the service.
+  violations, replays, OCC conflicts, the rows batch operations select, and
+  which values report an expiry. Rejected requests must leave no trace. The
+  model parses ops with its own copy of their types, so it cannot share a
+  parsing bug with the service.
 - **OpenAPI conformance**: every response in the DST is validated against
   `openapi.json` with an in-crate JSON-Schema subset checker. Every route in
   the router appears in the document, and every documented route exists.
@@ -1014,13 +1143,18 @@ blob exists.
   documented operation was never exercised by the simulator, or if one of
   the storage paths only some data shapes reach never ran: range
   tombstones written and retired, segments dropped and rewritten for
-  them, levels objects written, and commits refused for the quota. Nodes
+  them, levels objects written, commits refused for the quota, and expired
+  entries and segments reclaimed. Nodes
   count these (`engine::Activity`), and the simulator sums them over a run,
   crashed nodes included.
 - **Checker self-tests**: a checker that cannot fail proves nothing, so
   each one is fed known-bad input: non-linearizable register histories,
   broken ledgers, missing or stale index entries, orphaned rows, missing
-  segments and blob chunks, and foreign bytes in blob reads.
+  segments and blob chunks, foreign bytes in blob reads, reads outside
+  expiry windows, overlapping lock holders, and feed changes no write
+  explains. Disabling expiry validation, the version time's floor at read
+  times, range deletions in the feed, or index maintenance in batch updates
+  each fails campaigns of the `ttl`, `watch` and `tables` workloads.
 - **Mutation testing** (`scripts/mutants.sh`) checks that the suites catch
   bugs injected into the engine, the table layer, the op language and the
   checkers. Over the whole configuration, before the storage-engine
@@ -1045,7 +1179,7 @@ blob exists.
   | strong read through the API, no lease         | 1 GET                           |
   | snapshot read within staleness                | 0                               |
   | read-heavy database (10 strong reads/s)       | 276 PUT + 54 GET per hour       |
-  | cold open + point read, 2 segments            | 2 GET (40 ms)                   |
+  | cold open + point read, 3 segments            | 2 GET (40 ms)                   |
   | cold full scan, 128 values of 16 KiB          | 1 GET                           |
   | open + full scan after a restart (local tier) | 1 GET (the manifest)            |
   | blob upload / download                        | 0.25 PUT / 0.125 GET per MiB    |
@@ -1179,8 +1313,15 @@ amplification. `gen_openapi` regenerates `openapi.json`.
 
 ## 15. Known limitations (v1)
 
-- Every commit rewrites the manifest, and with it the commit ring
-  (`commit_ring_max`, 1024 ids, about 20 KB once full) and level 0.
+- Every commit rewrites the manifest, and with it the tail and level 0.
+- Commits are remembered for 10 minutes: an idempotent retry or a commit
+  status query must come within that (§6.2).
+- TTL expiry is as precise as the nodes' store-clock measurements (§4.5),
+  and expired data takes space until a manifest write or compaction reclaims
+  it.
+- Change feeds report each key's latest state, not every intermediate
+  value, and a cursor more than a transaction lifetime behind may have to
+  start over from the current state (§6.4).
 - Rate limits and sign-in backoff are kept per node (§9): a cluster of N
   nodes admits up to N times each rate, and a restart forgets them.
 - Size quotas are one setting for every database; there are no per-user
@@ -1199,6 +1340,6 @@ amplification. `gen_openapi` regenerates `openapi.json`.
 
 ## 16. Future work
 
-TTLs; change feeds; point-in-time restore (keep old manifests); quotas
-and rate limits per user or database, shared across nodes; multi-user
-organizations.
+Point-in-time restore (keep old manifests); change feeds that keep
+deletions longer, or every intermediate value; quotas and rate limits per
+user or database, shared across nodes; multi-user organizations.

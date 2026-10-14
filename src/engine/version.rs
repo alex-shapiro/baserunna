@@ -1,16 +1,16 @@
 //! Immutable snapshots of a database (a decoded manifest) and the read path:
-//! point lookups, merged range scans and conflict checks.
+//! point lookups, merged range scans, change feeds and conflict checks.
 
 use super::cache::{CacheKey, CacheVal};
 use super::manifest::{Levels, MAX_LEVEL, Manifest, SegmentMeta};
-use super::range_delete::RangeDeletes;
+use super::range_delete::{RangeDeletes, RangeTombstone};
 use super::segment::{self, Block, FOOTER_LEN, Footer, SegmentIndex};
-use super::types::{Entry, Seq, Value};
+use super::types::{COMMIT_SPACE, Entry, Seq};
 use super::{Shared, levels_key, seg_key};
 use crate::error::{Error, Result};
 use crate::store::GetOpts;
 use bytes::Bytes;
-use std::collections::VecDeque;
+use std::collections::{BinaryHeap, VecDeque};
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -21,6 +21,9 @@ pub struct Version {
     pub(crate) shared: Arc<Shared>,
     /// `m.range_deletes`, indexed for lookups.
     deletes: Arc<RangeDeletes>,
+    /// Whether any stored value expires, so that what reads see depends on
+    /// the time they read at.
+    pub(crate) expiring: bool,
 }
 
 /// Owned key range.
@@ -33,6 +36,12 @@ pub struct KeyRange {
 impl KeyRange {
     pub fn all() -> KeyRange {
         KeyRange { start: Bound::Unbounded, end: Bound::Unbounded }
+    }
+
+    /// Every key below the engine's commit records: all the data the
+    /// layers above store.
+    pub fn data() -> KeyRange {
+        KeyRange { start: Bound::Unbounded, end: Bound::Excluded(Bytes::from_static(&[COMMIT_SPACE])) }
     }
 
     pub fn new(start: Bound<Bytes>, end: Bound<Bytes>) -> KeyRange {
@@ -97,6 +106,30 @@ impl KeyRange {
     fn after_start_or_eq_max(&self, max: &[u8]) -> bool {
         // Some key <= max is >= start.
         self.after_start(max)
+    }
+
+    /// The keys in both ranges.
+    pub fn intersect(&self, other: &KeyRange) -> KeyRange {
+        use std::cmp::Ordering::*;
+        let start = match (&self.start, &other.start) {
+            (Bound::Unbounded, b) | (b, Bound::Unbounded) => b.clone(),
+            (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y)) => match x.cmp(y) {
+                Less => other.start.clone(),
+                Greater => self.start.clone(),
+                Equal if matches!(self.start, Bound::Excluded(_)) => self.start.clone(),
+                Equal => other.start.clone(),
+            },
+        };
+        let end = match (&self.end, &other.end) {
+            (Bound::Unbounded, b) | (b, Bound::Unbounded) => b.clone(),
+            (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y)) => match x.cmp(y) {
+                Less => self.end.clone(),
+                Greater => other.end.clone(),
+                Equal if matches!(self.end, Bound::Excluded(_)) => self.end.clone(),
+                Equal => other.end.clone(),
+            },
+        };
+        KeyRange { start, end }
     }
 
     pub fn intersects(&self, other: &KeyRange) -> bool {
@@ -429,6 +462,8 @@ pub(crate) struct IterSpec {
     pub mode: ReadMode,
     /// Range tombstones to filter out covered entries.
     pub deletes: Option<Arc<RangeDeletes>>,
+    /// Entries that have expired at this store time read as tombstones.
+    pub expire_at: Option<u64>,
 }
 
 /// A merged iteration over a database's sources (or a subset of them, for
@@ -443,6 +478,7 @@ pub struct MergeIter {
     include_tombstones: bool,
     mode: ReadMode,
     deletes: Option<Arc<RangeDeletes>>,
+    expire_at: Option<u64>,
     cursors: Vec<Cursor>,
     heads: Option<Vec<Option<Entry>>>,
 }
@@ -456,7 +492,7 @@ impl MergeIter {
         runs: Vec<Vec<SegmentMeta>>,
         spec: IterSpec,
     ) -> MergeIter {
-        let IterSpec { range, reverse, include_tombstones, mode, deletes } = spec;
+        let IterSpec { range, reverse, include_tombstones, mode, deletes, expire_at } = spec;
         let deletes = deletes.filter(|d| !d.is_empty());
         debug_assert!(!(reverse && mode == ReadMode::Bulk));
         let mut cursors = Vec::with_capacity(runs.len() + 1);
@@ -490,6 +526,7 @@ impl MergeIter {
             include_tombstones,
             mode,
             deletes,
+            expire_at,
             cursors,
             heads: None,
         }
@@ -640,6 +677,10 @@ impl MergeIter {
             if self.deletes.as_ref().is_some_and(|d| d.seq_at(&winner.key) > winner.seq) {
                 continue;
             }
+            let winner = match self.expire_at {
+                Some(t) => winner.at(t),
+                None => winner,
+            };
             if self.include_tombstones || !winner.value.is_tombstone() {
                 break Some(winner);
             }
@@ -652,7 +693,8 @@ impl MergeIter {
 impl Version {
     pub fn new(m: Manifest, etag: String, shared: Arc<Shared>) -> Version {
         let deletes = Arc::new(RangeDeletes::new(&m.range_deletes));
-        Version { m, etag, shared, deletes }
+        let expiring = m.tail.iter().any(|e| e.expires.is_some()) || m.segments.iter().any(|s| s.expiring > 0);
+        Version { m, etag, shared, deletes, expiring }
     }
 
     pub fn version(&self) -> Seq {
@@ -666,9 +708,7 @@ impl Version {
         let deleted_at = self.deletes.seq_at(key);
         Ok(match found {
             Some(e) if e.seq >= deleted_at => Some(e),
-            _ if deleted_at > 0 => {
-                Some(Entry { key: Bytes::copy_from_slice(key), seq: deleted_at, value: Value::Tombstone })
-            }
+            _ if deleted_at > 0 => Some(Entry::tombstone(Bytes::copy_from_slice(key), deleted_at)),
             none => none,
         })
     }
@@ -711,9 +751,16 @@ impl Version {
         self.candidates(key).count()
     }
 
-    /// Live (non-tombstone) entry for `key`.
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Entry>> {
-        Ok(self.get_entry(key).await?.filter(|e| !e.value.is_tombstone()))
+    /// The entry for `key` if it is live at store time `at`: neither
+    /// deleted nor expired.
+    pub async fn get(&self, key: &[u8], at: u64) -> Result<Option<Entry>> {
+        Ok(self.get_entry(key).await?.filter(|e| !e.is_dead(at)))
+    }
+
+    /// The earliest store time reads of this version may use now: the
+    /// version's own time, or the store's clock if it is later.
+    pub fn read_time(&self) -> u64 {
+        self.m.time_ms.max(self.shared.store_now_ms().unwrap_or(0))
     }
 
     /// The sorted runs of this version: each level 0 segment alone, then
@@ -732,18 +779,21 @@ impl Version {
 
     /// Returns the newest entry of each key in `range`, in order. Keys covered
     /// by a range tombstone are skipped, even with `include_tombstones`.
-    pub fn iter(&self, range: &KeyRange, reverse: bool, include_tombstones: bool) -> MergeIter {
+    /// With `at`, entries expired by then read as tombstones.
+    pub fn iter(&self, range: &KeyRange, reverse: bool, include_tombstones: bool, at: Option<u64>) -> MergeIter {
         let spec = IterSpec {
             range: range.clone(),
             reverse,
             include_tombstones,
             mode: ReadMode::Cached,
             deletes: Some(self.deletes.clone()),
+            expire_at: at,
         };
         MergeIter::new(self.shared.clone(), &self.m.db_id, &self.m.tail, self.runs(|_| true), spec)
     }
 
-    /// Every entry, read in bulk without filling the caches (sweeps).
+    /// Every stored entry, expired or not, read in bulk without filling the
+    /// caches (sweeps).
     pub(crate) fn iter_bulk(&self, include_tombstones: bool) -> MergeIter {
         let spec = IterSpec {
             range: KeyRange::all(),
@@ -751,24 +801,18 @@ impl Version {
             include_tombstones,
             mode: ReadMode::Bulk,
             deletes: Some(self.deletes.clone()),
+            expire_at: None,
         };
         MergeIter::new(self.shared.clone(), &self.m.db_id, &self.m.tail, self.runs(|_| true), spec)
     }
 
-    /// Merged scan. Returns at most `limit` entries; tombstones are skipped
-    /// unless `include_tombstones` (but see [`Version::iter`]).
-    pub async fn scan(
-        &self,
-        range: &KeyRange,
-        reverse: bool,
-        limit: usize,
-        include_tombstones: bool,
-    ) -> Result<Vec<Entry>> {
+    /// At most `limit` entries of `range` live at store time `at`, in order.
+    pub async fn scan(&self, range: &KeyRange, reverse: bool, limit: usize, at: u64) -> Result<Vec<Entry>> {
         let mut out = Vec::new();
         if limit == 0 || range.is_empty() {
             return Ok(out);
         }
-        let mut it = self.iter(range, reverse, include_tombstones);
+        let mut it = self.iter(range, reverse, false, Some(at));
         while let Some(e) = it.next().await? {
             out.push(e);
             if out.len() >= limit {
@@ -798,6 +842,7 @@ impl Version {
                 include_tombstones: true,
                 mode: ReadMode::Cached,
                 deletes: None,
+                expire_at: None,
             };
             let mut it = MergeIter::new(self.shared.clone(), &self.m.db_id, &[], vec![run], spec);
             while let Some(e) = it.next().await? {
@@ -809,15 +854,208 @@ impl Version {
         Ok(false)
     }
 
-    /// Every newest entry (tests and checks).
+    /// The newest stored entry of every key below the commit keyspace,
+    /// expired or not (tests and checks).
     pub async fn all_entries(&self, include_tombstones: bool) -> Result<Vec<Entry>> {
-        self.scan(&KeyRange::all(), false, usize::MAX, include_tombstones).await
+        let mut out = Vec::new();
+        let mut it = self.iter(&KeyRange::data(), false, include_tombstones, None);
+        while let Some(e) = it.next().await? {
+            out.push(e);
+        }
+        Ok(out)
     }
 
     /// Point version of [`Version::changed_since`].
     pub async fn key_changed_since(&self, key: &[u8], after: Seq) -> Result<bool> {
         Ok(self.get_entry(key).await?.is_some_and(|e| e.seq > after))
     }
+
+    /// The changes in `range` that come after `after`, in feed order, at
+    /// most `limit` of them: for every key whose newest entry is past
+    /// `after`, that entry (a value, possibly expired, or a deletion), and
+    /// every range tombstone past `after`, clipped to `range`. Intermediate
+    /// values a key had are not reported. Fails with `CursorExpired` if a
+    /// deletion past `after` may have been purged. The commit keyspace is
+    /// never reported (its records are dropped without a trace).
+    pub async fn changes(&self, range: &KeyRange, after: &ChangePos, limit: usize) -> Result<ChangePage> {
+        if !after.retained_by(self.m.tombstone_horizon) {
+            return Err(Error::CursorExpired(format!(
+                "deletions up to version {} may have been purged; resynchronize",
+                self.m.tombstone_horizon
+            )));
+        }
+        // The first `limit` changes, and one more to tell whether any follow.
+        let mut best: BinaryHeap<Change> = BinaryHeap::new();
+        let mut offer = |c: Change| {
+            if c.pos() > *after {
+                best.push(c);
+                if best.len() > limit + 1 {
+                    best.pop();
+                }
+            }
+        };
+        // Tombstones of one commit may overlap once clipped: report their
+        // union, so that no two changes share a position.
+        let mut clipped: Vec<RangeTombstone> = self
+            .m
+            .range_deletes
+            .iter()
+            .filter_map(|t| RangeTombstone::new(&t.range().intersect(range), t.seq))
+            .collect();
+        clipped.sort_by(|a, b| (a.seq, &a.start).cmp(&(b.seq, &b.start)));
+        let mut merged: Vec<RangeTombstone> = Vec::with_capacity(clipped.len());
+        for t in clipped {
+            match merged.last_mut() {
+                Some(p) if p.seq == t.seq && p.end.as_ref().is_none_or(|e| *e >= t.start) => {
+                    p.end = match (&p.end, &t.end) {
+                        (Some(a), Some(b)) => Some(a.max(b).clone()),
+                        _ => None,
+                    };
+                }
+                _ => merged.push(t),
+            }
+        }
+        for t in merged {
+            offer(Change::DeleteRange(t));
+        }
+        let spec = IterSpec {
+            range: range.clone(),
+            reverse: false,
+            include_tombstones: true,
+            mode: ReadMode::Cached,
+            deletes: Some(self.deletes.clone()),
+            expire_at: None,
+        };
+        // A key's newest entry is past `after` only in a source holding an
+        // entry that new, so older sources need not be read.
+        let runs = self.runs(|s| s.max_seq >= after.seq);
+        let mut it = MergeIter::new(self.shared.clone(), &self.m.db_id, &self.m.tail, runs, spec);
+        while let Some(e) = it.next().await? {
+            if e.seq >= after.seq {
+                offer(Change::Entry(e));
+            }
+        }
+        let mut changes = best.into_sorted_vec();
+        let more = changes.len() > limit;
+        changes.truncate(limit);
+        Ok(ChangePage { changes, more })
+    }
+}
+
+/// A version read at a moment: what has expired by `time_ms` reads as
+/// deleted.
+#[derive(Clone)]
+pub struct Snapshot {
+    pub version: Arc<Version>,
+    /// Store time of the read, never before the version's own time.
+    pub time_ms: u64,
+}
+
+impl Snapshot {
+    pub fn version(&self) -> Seq {
+        self.version.m.version
+    }
+
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Entry>> {
+        self.version.get(key, self.time_ms).await
+    }
+
+    pub async fn scan(&self, range: &KeyRange, reverse: bool, limit: usize) -> Result<Vec<Entry>> {
+        self.version.scan(range, reverse, limit, self.time_ms).await
+    }
+}
+
+/// A position in a change feed. Changes are ordered by version, and within
+/// one by kind (range deletions apply first) and key, so a position after
+/// every change of version `seq` is `ChangePos::after_version(seq)`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ChangePos {
+    pub seq: Seq,
+    /// 0 for range deletions, 1 for keys, 2 for the end of the version.
+    pub kind: u8,
+    pub key: Bytes,
+}
+
+impl ChangePos {
+    pub const RANGE: u8 = 0;
+    pub const KEY: u8 = 1;
+    pub const END: u8 = 2;
+
+    pub fn after_version(seq: Seq) -> ChangePos {
+        ChangePos { seq, kind: ChangePos::END, key: Bytes::new() }
+    }
+
+    /// Whether every deletion after this position is still stored, given
+    /// that those up to `horizon` may have been purged.
+    pub fn retained_by(&self, horizon: Seq) -> bool {
+        self.seq > horizon || (self.seq == horizon && self.kind == ChangePos::END)
+    }
+
+    /// An opaque, URL-safe encoding (see [`ChangePos::decode`]).
+    pub fn encode(&self) -> String {
+        match self.kind {
+            ChangePos::END => self.seq.to_string(),
+            k => format!("{}.{k}.{}", self.seq, crate::util::b64::encode_url(&self.key)),
+        }
+    }
+
+    pub fn decode(s: &str) -> Option<ChangePos> {
+        let mut parts = s.splitn(3, '.');
+        let seq = parts.next()?.parse().ok()?;
+        match (parts.next(), parts.next()) {
+            (None, _) => Some(ChangePos::after_version(seq)),
+            (Some(k), Some(key)) => {
+                let kind = k.parse().ok().filter(|k| *k < ChangePos::END)?;
+                Some(ChangePos { seq, kind, key: Bytes::from(crate::util::b64::decode_url(key)?) })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// One change reported by [`Version::changes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// A key's newest entry: its value, or a tombstone if it was deleted.
+    Entry(Entry),
+    /// Every key in the range was deleted (by entries older than `seq`).
+    DeleteRange(RangeTombstone),
+}
+
+impl Change {
+    pub fn seq(&self) -> Seq {
+        match self {
+            Change::Entry(e) => e.seq,
+            Change::DeleteRange(t) => t.seq,
+        }
+    }
+
+    pub fn pos(&self) -> ChangePos {
+        match self {
+            Change::Entry(e) => ChangePos { seq: e.seq, kind: ChangePos::KEY, key: e.key.clone() },
+            Change::DeleteRange(t) => ChangePos { seq: t.seq, kind: ChangePos::RANGE, key: t.start.clone() },
+        }
+    }
+}
+
+impl PartialOrd for Change {
+    fn partial_cmp(&self, o: &Change) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Ord for Change {
+    fn cmp(&self, o: &Change) -> std::cmp::Ordering {
+        self.pos().cmp(&o.pos())
+    }
+}
+
+/// A page of a change feed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangePage {
+    pub changes: Vec<Change>,
+    /// More changes follow the last one.
+    pub more: bool,
 }
 
 #[cfg(test)]
@@ -845,5 +1083,39 @@ mod tests {
         assert!(KeyRange::half_open(b("b"), Some(b("b"))).is_empty());
         assert!(KeyRange::prefix(b"ab").contains(b"ab\x00"));
         assert!(!KeyRange::prefix(b"ab").contains(b"ac"));
+    }
+
+    #[test]
+    fn intersections_contain_exactly_the_keys_of_both() {
+        let keys: Vec<Bytes> = ["", "a", "b", "b\0", "c", "d"].iter().map(|k| b(k)).collect();
+        let bounds = |k: &Bytes| [Bound::Included(k.clone()), Bound::Excluded(k.clone()), Bound::Unbounded];
+        for s1 in keys.iter().flat_map(bounds) {
+            for e1 in keys.iter().flat_map(bounds) {
+                let r1 = KeyRange::new(s1.clone(), e1);
+                for s2 in keys.iter().flat_map(bounds) {
+                    for e2 in keys.iter().flat_map(bounds) {
+                        let r2 = KeyRange::new(s2.clone(), e2);
+                        let both = r1.intersect(&r2);
+                        for k in &keys {
+                            assert_eq!(both.contains(k), r1.contains(k) && r2.contains(k), "{r1:?} ∩ {r2:?} at {k:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cursors decode without panicking, and decoded ones round-trip.
+    #[test]
+    fn fuzz_change_cursors() {
+        let mut r = crate::util::rng::Rng::new(9);
+        let pieces =
+            ["", ".", "0", "1", "2", "3", "18446744073709551615", "18446744073709551616", "-1", "AA", "_-", "=", "é"];
+        for _ in 0..20_000 {
+            let s: String = (0..r.usize(6)).map(|_| pieces[r.usize(pieces.len())]).collect();
+            if let Some(p) = ChangePos::decode(&s) {
+                assert_eq!(ChangePos::decode(&p.encode()), Some(p), "{s:?}");
+            }
+        }
     }
 }

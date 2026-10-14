@@ -74,8 +74,16 @@ fn query(name: &str, schema: Value, desc: &str) -> Value {
     json!({"name": name, "in": "query", "required": false, "schema": schema, "description": desc})
 }
 
+fn query_required(name: &str, schema: Value, desc: &str) -> Value {
+    json!({"name": name, "in": "query", "required": true, "schema": schema, "description": desc})
+}
+
 fn header(name: &str, desc: &str) -> Value {
     json!({"name": name, "in": "header", "required": false, "schema": s(), "description": desc})
+}
+
+fn ttl() -> Value {
+    json!({"type": "integer", "minimum": 1, "maximum": crate::ops::MAX_TTL_MS})
 }
 
 fn enum_of(values: &[&str]) -> Value {
@@ -146,7 +154,7 @@ fn schemas() -> Value {
             "error": obj(json!({
                 "code": enum_of(&["invalid_argument", "unauthenticated", "permission_denied", "not_found",
                     "txn_not_found", "conflict", "already_exists", "precondition_failed", "too_large",
-                    "quota_exceeded", "rate_limited", "unavailable", "internal"]),
+                    "cursor_expired", "quota_exceeded", "rate_limited", "unavailable", "internal"]),
                 "message": s(),
                 "retryable": b(),
                 "details": obj(json!({
@@ -194,17 +202,18 @@ fn schemas() -> Value {
             &["blob_id", "size", "sha256", "content_type"], "An out-of-band blob."),
         "KvItem": obj_desc(json!({
             "key": s(), "key_b64": s(), "value": s(), "value_b64": s(), "blob": r("BlobMeta"),
-            "version": nullable("integer"),
+            "version": nullable("integer"), "expires_at": i(),
         }), &["version"], "A key and its value. Keys/values that are not valid UTF-8 in utf8 mode are \
             returned in `key_b64` / `value_b64`. Values stored as blobs larger than the inline JSON limit \
-            only carry `blob`."),
+            only carry `blob`. A value written with a time to live has `expires_at` (cluster time, ms), \
+            unless the transaction reading it wrote it itself."),
         "ScanResult": obj(json!({"items": arr(r("KvItem")), "next_cursor": nullable("string"), "version": i()}),
             &["items", "next_cursor"]),
         "OpResult": obj_desc(json!({
             "found": b(), "value": {"type": ["string", "integer"]}, "value_b64": s(),
             "blob": r("BlobMeta"), "version": nullable("integer"),
             "items": arr(r("KvItem")), "next_cursor": nullable("string"),
-            "row": r("Row"), "rows": arr(r("Row")),
+            "row": r("Row"), "rows": arr(r("Row")), "expires_at": i(), "count": i(),
         }), &[], "Result of one op; the fields present depend on the op (see Op)."),
         "Op": {
             "oneOf": [
@@ -212,21 +221,30 @@ fn schemas() -> Value {
                 obj(json!({"op": {"const": "scan"}, "prefix": s(), "start": s(), "end": s(),
                     "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
                     "reverse": b(), "keys_only": b(), "cursor": s()}), &["op"]),
-                obj(json!({"op": {"const": "put"}, "key": s(), "value": s(), "blob_id": s()}), &["op", "key"]),
+                obj(json!({"op": {"const": "put"}, "key": s(), "value": s(), "blob_id": s(), "ttl_ms": ttl()}), &["op", "key"]),
                 obj(json!({"op": {"const": "delete"}, "key": s()}), &["op", "key"]),
                 obj(json!({"op": {"const": "delete_range"}, "prefix": s(), "start": s(), "end": s()}), &["op"]),
                 obj(json!({"op": {"const": "check"}, "key": s(), "exists": b(), "version": i(), "value": s()}), &["op", "key"]),
-                obj(json!({"op": {"const": "increment"}, "key": s(), "by": i()}), &["op", "key"]),
+                obj(json!({"op": {"const": "increment"}, "key": s(), "by": i(), "ttl_ms": ttl()}), &["op", "key"]),
                 obj(json!({"op": {"const": "get_row"}, "table": s(), "pk": any()}), &["op", "table", "pk"]),
-                obj(json!({"op": {"const": "insert_row"}, "table": s(), "row": r("Row")}), &["op", "table", "row"]),
-                obj(json!({"op": {"const": "upsert_row"}, "table": s(), "row": r("Row")}), &["op", "table", "row"]),
-                obj(json!({"op": {"const": "update_row"}, "table": s(), "pk": any(), "set": r("Row")}),
+                obj(json!({"op": {"const": "insert_row"}, "table": s(), "row": r("Row"), "ttl_ms": ttl()}),
+                    &["op", "table", "row"]),
+                obj(json!({"op": {"const": "upsert_row"}, "table": s(), "row": r("Row"), "ttl_ms": ttl()}),
+                    &["op", "table", "row"]),
+                obj(json!({"op": {"const": "update_row"}, "table": s(), "pk": any(), "set": r("Row"), "ttl_ms": ttl()}),
                     &["op", "table", "pk", "set"]),
                 obj(json!({"op": {"const": "delete_row"}, "table": s(), "pk": any()}), &["op", "table", "pk"]),
+                obj(json!({"op": {"const": "update_rows"}, "table": s(), "where": r("Selection"), "set": r("Row"),
+                    "ttl_ms": ttl(), "limit": {"type": "integer", "minimum": 1}}), &["op", "table", "where", "set"]),
+                obj(json!({"op": {"const": "delete_rows"}, "table": s(), "where": r("Selection"),
+                    "limit": {"type": "integer", "minimum": 1}}), &["op", "table", "where"]),
                 {"type": "object", "properties": {"op": {"const": "query_rows"}, "table": s()},
                  "required": ["op", "table"], "allOf": [r("Query")], "additionalProperties": true},
             ],
-            "description": "One operation. Keys and values are UTF-8 strings unless the request sets `encoding: base64`.",
+            "description": "One operation. Keys and values are UTF-8 strings unless the request sets `encoding: base64`. \
+                `ttl_ms` makes a value or row expire that long after the write commits; an update keeps a row's \
+                expiry unless it sets one. `update_rows` and `delete_rows` change every row `where` selects \
+                (at most `limit`), all within the transaction's write limit, and return `count`.",
         },
         "TxnRequest": obj(json!({
             "ops": arr(r("Op")),
@@ -278,12 +296,40 @@ fn schemas() -> Value {
             "max_staleness_ms": i(),
         }), &[], "Scan the primary key (default) or a secondary index: equality on a prefix of its columns \
             (`eq`), an optional range on the next column, a residual filter, and pagination via `cursor`."),
-        "InsertRows": obj(json!({"row": r("Row"), "rows": arr(r("Row")), "upsert": b()}), &[]),
+        "Selection": obj_desc(json!({
+            "index": s(), "eq": arr(any()),
+            "range": obj(json!({"gt": any(), "gte": any(), "lt": any(), "lte": any()}), &[]),
+            "filter": r("Filter"),
+        }), &[], "Rows to change, selected like a query: the primary key or an index (`index`), equality on a \
+            prefix of its columns (`eq`), a range on the next column and a residual filter. `{}` selects every row."),
+        "InsertRows": obj(json!({"row": r("Row"), "rows": arr(r("Row")), "upsert": b(), "ttl_ms": ttl()}), &[]),
         "RowCount": obj(json!({"count": i(), "version": i()}), &["count", "version"]),
         "PkRequest": obj(json!({"pk": any(), "consistency": s(), "max_staleness_ms": i()}), &["pk"]),
-        "UpdateRow": obj(json!({"pk": any(), "set": r("Row")}), &["pk", "set"]),
-        "RowResult": obj(json!({"found": b(), "row": r("Row"), "version": i()}), &["found", "version"]),
+        "UpdateRows": obj_desc(json!({"pk": any(), "where": r("Selection"), "limit": {"type": "integer", "minimum": 1},
+            "set": r("Row"), "ttl_ms": ttl()}), &["set"],
+            "Exactly one of `pk` (one row; answers `found`) or `where` (every row it selects, at most `limit`; \
+            answers `count`). A row keeps its expiry unless `ttl_ms` sets one."),
+        "DeleteRows": obj_desc(json!({"pk": any(), "where": r("Selection"), "limit": {"type": "integer", "minimum": 1}}),
+            &[], "Exactly one of `pk` (one row; answers `found`) or `where` (every row it selects, at most \
+            `limit`; answers `count`)."),
+        "RowResult": obj(json!({"found": b(), "row": r("Row"), "expires_at": i(), "version": i()}), &["found", "version"]),
         "Found": obj(json!({"found": b(), "version": i()}), &["found", "version"]),
+        "FoundOrCount": {"oneOf": [r("Found"), r("RowCount")]},
+        "KvChange": obj_desc(json!({
+            "version": i(), "key": s(), "key_b64": s(), "value": s(), "value_b64": s(), "blob": r("BlobMeta"),
+            "expires_at": i(), "deleted": {"const": true},
+            "deleted_range": obj(json!({"start": s(), "start_b64": s(), "end": nullable("string"), "end_b64": s()}), &[]),
+        }), &["version"], "A key's value as of the feed's snapshot (with `expires_at` if it expires), a key \
+            deleted (`deleted`, also once its value expired), or every key in `[start, end)` deleted \
+            (`deleted_range`; `end: null` is the end of the keyspace)."),
+        "KvChanges": obj(json!({"changes": arr(r("KvChange")), "more": b(), "next_cursor": s(), "version": i()}),
+            &["changes", "more", "next_cursor", "version"]),
+        "RowChange": obj_desc(json!({
+            "version": i(), "pk": arr(any()), "row": r("Row"), "expires_at": i(), "deleted": {"const": true},
+            "deleted_range": {"const": true},
+        }), &["version"], "A row as of the feed's snapshot, or its primary key and `deleted`."),
+        "RowChanges": obj(json!({"changes": arr(r("RowChange")), "more": b(), "next_cursor": s(), "version": i()}),
+            &["changes", "more", "next_cursor", "version"]),
         "QueryResult": obj(json!({"rows": arr(r("Row")), "next_cursor": nullable("string"), "version": i()}),
             &["rows", "next_cursor", "version"]),
     })
@@ -514,7 +560,8 @@ fn paths() -> Value {
                     (
                         "200",
                         json!({"description": "The value", "content": octet(), "headers": {
-            "ETag": {"schema": s(), "description": "\"<version>\""}, "x-baserunna-version": {"schema": i()}}}),
+            "ETag": {"schema": s(), "description": "\"<version>\""}, "x-baserunna-version": {"schema": i()},
+            "x-baserunna-expires-at": {"schema": i(), "description": "When the value expires (cluster time, ms), if it does"}}}),
                     ),
                     ("206", bytes_resp("Partial content (Range)")),
                 ],
@@ -531,6 +578,7 @@ fn paths() -> Value {
                 key(),
                 header("If-Match", "\"<version>\": write only if unchanged"),
                 header("If-None-Match", "*: create only"),
+                query("ttl_ms", ttl(), "Expire the value this long after the write commits"),
             ],
             desc: Some("Large bodies are streamed into an out-of-band blob. Content-Type is preserved for blobs."),
             ..op("Write a value from raw bytes", "kv", vec![("200", resp("Written", r("Version")))])
@@ -626,10 +674,11 @@ fn paths() -> Value {
         "/v1/dbs/{db}/commits/{id}",
         "get",
         Op {
-            params: vec![db(), path_param("id", "commit_id (hex) or key:<idempotency key>")],
+            params: vec![db(), path_param("id", "commit_id (16 hex characters) or key:<idempotency key>")],
             desc: Some(
                 "Fences in-flight attempts first, so the answer is final for commits whose request has ended \
-            (wait at least the commit deadline, about 15 s, after an ambiguous failure).",
+            (wait at least the commit deadline, about 15 s, after an ambiguous failure). Commits are \
+            remembered for 10 minutes; ask within that.",
             ),
             ..op(
                 "Resolve an ambiguous commit",
@@ -748,18 +797,18 @@ fn paths() -> Value {
         "/v1/dbs/{db}/tables/{t}/rows/update",
         "post",
         Op {
-            body: Some(json_body(r("UpdateRow"))),
+            body: Some(json_body(r("UpdateRows"))),
             params: vec![db(), table()],
-            ..op("Update columns of a row", "tables", vec![("200", resp("Updated", r("Found")))])
+            ..op("Update columns of a row, or of many", "tables", vec![("200", resp("Updated", r("FoundOrCount")))])
         },
     );
     add(
         "/v1/dbs/{db}/tables/{t}/rows/delete",
         "post",
         Op {
-            body: Some(json_body(r("PkRequest"))),
+            body: Some(json_body(r("DeleteRows"))),
             params: vec![db(), table()],
-            ..op("Delete a row", "tables", vec![("200", resp("Deleted", r("Found")))])
+            ..op("Delete a row, or many", "tables", vec![("200", resp("Deleted", r("FoundOrCount")))])
         },
     );
     add(
@@ -769,6 +818,49 @@ fn paths() -> Value {
             body: Some(json_body(r("Query"))),
             params: vec![db(), table()],
             ..op("Query rows", "tables", vec![("200", resp("Rows", r("QueryResult")))])
+        },
+    );
+    let feed = |extra: Vec<Value>| {
+        let mut v = vec![
+            query_required("after", s(), "Report changes after this: a version, or a previous `next_cursor`"),
+            query("limit", i(), "1..=1000 (default 100)"),
+            query("wait_ms", i(), "0..=20000: wait this long for a change if there is none yet"),
+        ];
+        v.extend(extra);
+        v.extend(consistency());
+        v
+    };
+    let feed_desc = "For each key changed after `after`, its state as of the feed's snapshot (intermediate values \
+        are not reported), ordered by version. Continue from `next_cursor`, at once while `more` is true. With \
+        `wait_ms`, the request waits for a change if there is none. Deletions are kept at least a transaction \
+        lifetime (5 minutes); a cursor older than the deletions still kept gets `410 cursor_expired`, and the \
+        client should read the current state again and follow on from its `version`.";
+    let mut kv_feed = vec![db()];
+    kv_feed.extend(feed(vec![
+        query("prefix", s(), "Key prefix"),
+        query("start", s(), "Inclusive start"),
+        query("end", s(), "Exclusive end"),
+        query("keys_only", b(), "Omit values"),
+        query("encoding", enum_of(&["utf8", "base64"]), "Key/value encoding"),
+    ]));
+    add(
+        "/v1/dbs/{db}/changes",
+        "get",
+        Op {
+            params: kv_feed,
+            desc: Some(feed_desc),
+            ..op("Follow changes to keys", "kv", vec![("200", resp("A page of changes", r("KvChanges")))])
+        },
+    );
+    let mut row_feed = vec![db(), table()];
+    row_feed.extend(feed(vec![]));
+    add(
+        "/v1/dbs/{db}/tables/{t}/changes",
+        "get",
+        Op {
+            params: row_feed,
+            desc: Some(feed_desc),
+            ..op("Follow changes to rows", "tables", vec![("200", resp("A page of changes", r("RowChanges")))])
         },
     );
     Value::Object(p)

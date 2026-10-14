@@ -113,7 +113,41 @@ async fn writer(c: Client, w: i64, steps: usize) -> Result<BTreeMap<i64, Row>, S
         };
         let isolation = if rng.chance(0.5) { "snapshot" } else { "serializable" };
         let ctx = format!("writer {w} step {step}");
-        match rng.below(6) {
+        match rng.below(8) {
+            6 | 7 => {
+                // Many of this writer's rows at once, by selection.
+                let mine = json!({"gte": w * 100, "lt": w * 100 + 100});
+                let pivot = rng.below(9) as i64;
+                let (op, hit): (Json, Vec<i64>) = match rng.chance(0.6) {
+                    true => (
+                        json!({"op": "update_rows", "table": "items",
+                            "where": {"range": mine, "filter": {"col": "n", "op": "lt", "value": pivot}},
+                            "set": {"n": row.n, "tag": format!("t{}", row.n % 3)}}),
+                        model.iter().filter(|(_, m)| m.n < pivot).map(|(i, _)| *i).collect(),
+                    ),
+                    false => (
+                        json!({"op": "delete_rows", "table": "items",
+                            "where": {"range": mine, "filter": {"col": "n", "op": "gt", "value": pivot}}}),
+                        model.iter().filter(|(_, m)| m.n > pivot).map(|(i, _)| *i).collect(),
+                    ),
+                };
+                let delete = op["op"] == "delete_rows";
+                let body = json!({"ops": [op], "isolation": isolation, "idempotency_key": format!("w{w}-{step}")});
+                if let Applied::Yes = one_shot(&c, body, ROW_REJECTIONS).await.map_err(|e| format!("{ctx}: {e}"))? {
+                    for i in hit {
+                        match delete {
+                            true => {
+                                model.remove(&i);
+                            }
+                            false => {
+                                if let Some(m) = model.get_mut(&i) {
+                                    m.n = row.n;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             0 => {
                 let body = json!({"row": row_json(id, &row), "upsert": true});
                 let path = format!("{BASE}/tables/items/rows");

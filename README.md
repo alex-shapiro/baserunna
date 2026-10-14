@@ -5,7 +5,10 @@ Baserunna is a web service that hosts small databases on object storage.
 - Serializable transactions with strict serializability and snapshot isolation.
 - Key Value API
 - Large binary blobs stored out of band as chunked objects.
-- Tables with schemas, primary keys, indexes, and schemas.
+- Tables with schemas, primary keys and secondary indexes, with updates and
+  deletes of many rows by query in one transaction.
+- Values and rows with times to live, expired lazily on read and by compaction.
+- Change feeds of keys and rows, with long polls.
 - Stateless nodes: kill any node at any time.
 - Verification with deterministic simulation testing
 
@@ -41,6 +44,10 @@ curl -s localhost:8080/v1/dbs/app/txn -H "$H" -d '{
   "idempotency_key": "request-123"
 }'
 
+# A value that expires in an hour, and the changes since version 0 (waiting up to 5 s for one).
+curl -s -X PUT "localhost:8080/v1/dbs/app/kv/session?ttl_ms=3600000" -H "$H" --data-binary 'token'
+curl -s "localhost:8080/v1/dbs/app/changes?after=0&wait_ms=5000" -H "$H"
+
 # Tables with a secondary index.
 curl -s localhost:8080/v1/dbs/app/tables -H "$H" -d '{
   "name": "users", "primary_key": ["id"],
@@ -48,6 +55,7 @@ curl -s localhost:8080/v1/dbs/app/tables -H "$H" -d '{
   "indexes": [{"name":"by_email","columns":["email"],"unique":true}]}'
 curl -s localhost:8080/v1/dbs/app/tables/users/rows -H "$H" -d '{"row":{"id":1,"email":"a@b.co"}}'
 curl -s localhost:8080/v1/dbs/app/tables/users/rows/query -H "$H" -d '{"index":"by_email","eq":["a@b.co"]}'
+curl -s localhost:8080/v1/dbs/app/tables/users/rows/delete -H "$H" -d '{"where":{"filter":{"col":"email","op":"prefix","value":"a@"}}}'
 ```
 
 ## Configuration
@@ -88,11 +96,11 @@ Each example starts real nodes on localhost and talks to them over HTTP:
 
 | example                             | shows                                                                                         |
 | ----------------------------------- | --------------------------------------------------------------------------------------------- |
-| `cargo run --example todo_app`      | a multi-user app with tables, secondary indexes, filters, pagination, schema evolution        |
+| `cargo run --example todo_app`      | a multi-user app with tables, secondary indexes, filters, pagination, schema evolution, batch updates and deletes |
 | `cargo run --example bank_ledger`   | concurrent interactive serializable transfers, conflict retries, idempotency, compare-and-set |
 | `cargo run --example asset_store`   | large media files as streamed blobs, blob columns, HTTP range seeks                           |
 | `cargo run --example saas_tenants`  | one database per tenant, scoped and read-only API keys, offboarding                           |
-| `cargo run --example feature_flags` | a read-heavy config store, lease-served reads, `If-Match` compare-and-set                     |
+| `cargo run --example feature_flags` | a read-heavy config store, lease-served reads, `If-Match` compare-and-set, expiring overrides, a change feed watcher |
 | `cargo run --example multi_node`    | three nodes, forwarding, killing a node mid-flight, failover without data loss                |
 
 ## Testing
@@ -113,8 +121,9 @@ scripts/mutants.sh                                                 # mutation te
 ## Layout
 
 ```
-src/engine   storage engine: compressed segments, manifest, versions, group commit, leases,
-             range tombstones, leveled compaction, local disk tier, store clock, GC, blobs, quotas
+src/engine   storage engine: compressed segments, manifest, versions, group commit, commit records,
+             leases, expiry, change feeds, range tombstones, leveled compaction, local disk tier,
+             store clock, GC, blobs, quotas
 src/table    tuple encoding, schemas, rows, indexes, queries
 src/ops.rs   the JSON transaction-op language
 src/meta.rs  system database schema and metadata commands (dogfooded on the table layer)

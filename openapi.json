@@ -382,6 +382,22 @@
         ],
         "type": "object"
       },
+      "DeleteRows": {
+        "additionalProperties": false,
+        "description": "Exactly one of `pk` (one row; answers `found`) or `where` (every row it selects, at most `limit`; answers `count`).",
+        "properties": {
+          "limit": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "pk": {},
+          "where": {
+            "$ref": "#/components/schemas/Selection"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
       "Empty": {
         "additionalProperties": false,
         "properties": {},
@@ -405,6 +421,7 @@
                   "already_exists",
                   "precondition_failed",
                   "too_large",
+                  "cursor_expired",
                   "quota_exceeded",
                   "rate_limited",
                   "unavailable",
@@ -476,6 +493,16 @@
         ],
         "type": "object"
       },
+      "FoundOrCount": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/Found"
+          },
+          {
+            "$ref": "#/components/schemas/RowCount"
+          }
+        ]
+      },
       "Index": {
         "additionalProperties": false,
         "properties": {
@@ -542,6 +569,11 @@
             },
             "type": "array"
           },
+          "ttl_ms": {
+            "maximum": 315360000000,
+            "minimum": 1,
+            "type": "integer"
+          },
           "upsert": {
             "type": "boolean"
           }
@@ -549,12 +581,98 @@
         "required": [],
         "type": "object"
       },
-      "KvItem": {
+      "KvChange": {
         "additionalProperties": false,
-        "description": "A key and its value. Keys/values that are not valid UTF-8 in utf8 mode are returned in `key_b64` / `value_b64`. Values stored as blobs larger than the inline JSON limit only carry `blob`.",
+        "description": "A key's value as of the feed's snapshot (with `expires_at` if it expires), a key deleted (`deleted`, also once its value expired), or every key in `[start, end)` deleted (`deleted_range`; `end: null` is the end of the keyspace).",
         "properties": {
           "blob": {
             "$ref": "#/components/schemas/BlobMeta"
+          },
+          "deleted": {
+            "const": true
+          },
+          "deleted_range": {
+            "additionalProperties": false,
+            "properties": {
+              "end": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "end_b64": {
+                "type": "string"
+              },
+              "start": {
+                "type": "string"
+              },
+              "start_b64": {
+                "type": "string"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "expires_at": {
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          },
+          "key_b64": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          },
+          "value_b64": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "type": "object"
+      },
+      "KvChanges": {
+        "additionalProperties": false,
+        "properties": {
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/KvChange"
+            },
+            "type": "array"
+          },
+          "more": {
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "changes",
+          "more",
+          "next_cursor",
+          "version"
+        ],
+        "type": "object"
+      },
+      "KvItem": {
+        "additionalProperties": false,
+        "description": "A key and its value. Keys/values that are not valid UTF-8 in utf8 mode are returned in `key_b64` / `value_b64`. Values stored as blobs larger than the inline JSON limit only carry `blob`. A value written with a time to live has `expires_at` (cluster time, ms), unless the transaction reading it wrote it itself.",
+        "properties": {
+          "blob": {
+            "$ref": "#/components/schemas/BlobMeta"
+          },
+          "expires_at": {
+            "type": "integer"
           },
           "key": {
             "type": "string"
@@ -656,7 +774,7 @@
         "type": "object"
       },
       "Op": {
-        "description": "One operation. Keys and values are UTF-8 strings unless the request sets `encoding: base64`.",
+        "description": "One operation. Keys and values are UTF-8 strings unless the request sets `encoding: base64`. `ttl_ms` makes a value or row expire that long after the write commits; an update keeps a row's expiry unless it sets one. `update_rows` and `delete_rows` change every row `where` selects (at most `limit`), all within the transaction's write limit, and return `count`.",
         "oneOf": [
           {
             "additionalProperties": false,
@@ -720,6 +838,11 @@
               },
               "op": {
                 "const": "put"
+              },
+              "ttl_ms": {
+                "maximum": 315360000000,
+                "minimum": 1,
+                "type": "integer"
               },
               "value": {
                 "type": "string"
@@ -804,6 +927,11 @@
               },
               "op": {
                 "const": "increment"
+              },
+              "ttl_ms": {
+                "maximum": 315360000000,
+                "minimum": 1,
+                "type": "integer"
               }
             },
             "required": [
@@ -841,6 +969,11 @@
               },
               "table": {
                 "type": "string"
+              },
+              "ttl_ms": {
+                "maximum": 315360000000,
+                "minimum": 1,
+                "type": "integer"
               }
             },
             "required": [
@@ -861,6 +994,11 @@
               },
               "table": {
                 "type": "string"
+              },
+              "ttl_ms": {
+                "maximum": 315360000000,
+                "minimum": 1,
+                "type": "integer"
               }
             },
             "required": [
@@ -882,6 +1020,11 @@
               },
               "table": {
                 "type": "string"
+              },
+              "ttl_ms": {
+                "maximum": 315360000000,
+                "minimum": 1,
+                "type": "integer"
               }
             },
             "required": [
@@ -907,6 +1050,63 @@
               "op",
               "table",
               "pk"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "limit": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "op": {
+                "const": "update_rows"
+              },
+              "set": {
+                "$ref": "#/components/schemas/Row"
+              },
+              "table": {
+                "type": "string"
+              },
+              "ttl_ms": {
+                "maximum": 315360000000,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "where": {
+                "$ref": "#/components/schemas/Selection"
+              }
+            },
+            "required": [
+              "op",
+              "table",
+              "where",
+              "set"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "limit": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "op": {
+                "const": "delete_rows"
+              },
+              "table": {
+                "type": "string"
+              },
+              "where": {
+                "$ref": "#/components/schemas/Selection"
+              }
+            },
+            "required": [
+              "op",
+              "table",
+              "where"
             ],
             "type": "object"
           },
@@ -939,6 +1139,12 @@
         "properties": {
           "blob": {
             "$ref": "#/components/schemas/BlobMeta"
+          },
+          "count": {
+            "type": "integer"
+          },
+          "expires_at": {
+            "type": "integer"
           },
           "found": {
             "type": "boolean"
@@ -1110,6 +1316,62 @@
         "description": "Column name to value. `bytes` are base64; `blob` columns take a staged `blob_id` on write and return BlobMeta on read.",
         "type": "object"
       },
+      "RowChange": {
+        "additionalProperties": false,
+        "description": "A row as of the feed's snapshot, or its primary key and `deleted`.",
+        "properties": {
+          "deleted": {
+            "const": true
+          },
+          "deleted_range": {
+            "const": true
+          },
+          "expires_at": {
+            "type": "integer"
+          },
+          "pk": {
+            "items": {},
+            "type": "array"
+          },
+          "row": {
+            "$ref": "#/components/schemas/Row"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "type": "object"
+      },
+      "RowChanges": {
+        "additionalProperties": false,
+        "properties": {
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/RowChange"
+            },
+            "type": "array"
+          },
+          "more": {
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "changes",
+          "more",
+          "next_cursor",
+          "version"
+        ],
+        "type": "object"
+      },
       "RowCount": {
         "additionalProperties": false,
         "properties": {
@@ -1129,6 +1391,9 @@
       "RowResult": {
         "additionalProperties": false,
         "properties": {
+          "expires_at": {
+            "type": "integer"
+          },
           "found": {
             "type": "boolean"
           },
@@ -1168,6 +1433,35 @@
           "items",
           "next_cursor"
         ],
+        "type": "object"
+      },
+      "Selection": {
+        "additionalProperties": false,
+        "description": "Rows to change, selected like a query: the primary key or an index (`index`), equality on a prefix of its columns (`eq`), a range on the next column and a residual filter. `{}` selects every row.",
+        "properties": {
+          "eq": {
+            "items": {},
+            "type": "array"
+          },
+          "filter": {
+            "$ref": "#/components/schemas/Filter"
+          },
+          "index": {
+            "type": "string"
+          },
+          "range": {
+            "additionalProperties": false,
+            "properties": {
+              "gt": {},
+              "gte": {},
+              "lt": {},
+              "lte": {}
+            },
+            "required": [],
+            "type": "object"
+          }
+        },
+        "required": [],
         "type": "object"
       },
       "Session": {
@@ -1300,16 +1594,28 @@
         ],
         "type": "object"
       },
-      "UpdateRow": {
+      "UpdateRows": {
         "additionalProperties": false,
+        "description": "Exactly one of `pk` (one row; answers `found`) or `where` (every row it selects, at most `limit`; answers `count`). A row keeps its expiry unless `ttl_ms` sets one.",
         "properties": {
+          "limit": {
+            "minimum": 1,
+            "type": "integer"
+          },
           "pk": {},
           "set": {
             "$ref": "#/components/schemas/Row"
+          },
+          "ttl_ms": {
+            "maximum": 315360000000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "where": {
+            "$ref": "#/components/schemas/Selection"
           }
         },
         "required": [
-          "pk",
           "set"
         ],
         "type": "object"
@@ -2069,9 +2375,9 @@
         ]
       }
     },
-    "/v1/dbs/{db}/commits/{id}": {
+    "/v1/dbs/{db}/changes": {
       "get": {
-        "description": "Fences in-flight attempts first, so the answer is final for commits whose request has ended (wait at least the commit deadline, about 15 s, after an ambiguous failure).",
+        "description": "For each key changed after `after`, its state as of the feed's snapshot (intermediate values are not reported), ordered by version. Continue from `next_cursor`, at once while `more` is true. With `wait_ms`, the request waits for a change if there is none. Deletions are kept at least a transaction lifetime (5 minutes); a cursor older than the deletions still kept gets `410 cursor_expired`, and the client should read the current state again and follow on from its `version`.",
         "parameters": [
           {
             "description": "Database name (or `id:<db_id>` for administrators).",
@@ -2083,7 +2389,140 @@
             }
           },
           {
-            "description": "commit_id (hex) or key:<idempotency key>",
+            "description": "Report changes after this: a version, or a previous `next_cursor`",
+            "in": "query",
+            "name": "after",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "1..=1000 (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "0..=20000: wait this long for a change if there is none yet",
+            "in": "query",
+            "name": "wait_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Key prefix",
+            "in": "query",
+            "name": "prefix",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Inclusive start",
+            "in": "query",
+            "name": "start",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exclusive end",
+            "in": "query",
+            "name": "end",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Omit values",
+            "in": "query",
+            "name": "keys_only",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Key/value encoding",
+            "in": "query",
+            "name": "encoding",
+            "required": false,
+            "schema": {
+              "enum": [
+                "utf8",
+                "base64"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KvChanges"
+                }
+              }
+            },
+            "description": "A page of changes"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Follow changes to keys",
+        "tags": [
+          "kv"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/commits/{id}": {
+      "get": {
+        "description": "Fences in-flight attempts first, so the answer is final for commits whose request has ended (wait at least the commit deadline, about 15 s, after an ambiguous failure). Commits are remembered for 10 minutes; ask within that.",
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "commit_id (16 hex characters) or key:<idempotency key>",
             "in": "path",
             "name": "id",
             "required": true,
@@ -2366,6 +2805,12 @@
                   "type": "string"
                 }
               },
+              "x-baserunna-expires-at": {
+                "description": "When the value expires (cluster time, ms), if it does",
+                "schema": {
+                  "type": "integer"
+                }
+              },
               "x-baserunna-version": {
                 "schema": {
                   "type": "integer"
@@ -2430,6 +2875,17 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Expire the value this long after the write commits",
+            "in": "query",
+            "name": "ttl_ms",
+            "required": false,
+            "schema": {
+              "maximum": 315360000000,
+              "minimum": 1,
+              "type": "integer"
             }
           }
         ],
@@ -2680,6 +3136,99 @@
           }
         },
         "summary": "Describe a table",
+        "tags": [
+          "tables"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/tables/{t}/changes": {
+      "get": {
+        "description": "For each key changed after `after`, its state as of the feed's snapshot (intermediate values are not reported), ordered by version. Continue from `next_cursor`, at once while `more` is true. With `wait_ms`, the request waits for a change if there is none. Deletions are kept at least a transaction lifetime (5 minutes); a cursor older than the deletions still kept gets `410 cursor_expired`, and the client should read the current state again and follow on from its `version`.",
+        "parameters": [
+          {
+            "description": "Database name (or `id:<db_id>` for administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Report changes after this: a version, or a previous `next_cursor`",
+            "in": "query",
+            "name": "after",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "1..=1000 (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "0..=20000: wait this long for a change if there is none yet",
+            "in": "query",
+            "name": "wait_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RowChanges"
+                }
+              }
+            },
+            "description": "A page of changes"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Follow changes to rows",
         "tags": [
           "tables"
         ]
@@ -2985,7 +3534,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/PkRequest"
+                "$ref": "#/components/schemas/DeleteRows"
               }
             }
           },
@@ -2996,7 +3545,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Found"
+                  "$ref": "#/components/schemas/FoundOrCount"
                 }
               }
             },
@@ -3006,7 +3555,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Delete a row",
+        "summary": "Delete a row, or many",
         "tags": [
           "tables"
         ]
@@ -3144,7 +3693,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/UpdateRow"
+                "$ref": "#/components/schemas/UpdateRows"
               }
             }
           },
@@ -3155,7 +3704,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Found"
+                  "$ref": "#/components/schemas/FoundOrCount"
                 }
               }
             },
@@ -3165,7 +3714,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Update columns of a row",
+        "summary": "Update columns of a row, or of many",
         "tags": [
           "tables"
         ]

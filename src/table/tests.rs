@@ -25,6 +25,11 @@ enum Op {
     Get(i64),
     QueryTag(Option<String>, i64, usize, bool),
     QueryPk(i64, i64, usize),
+    /// Set the score (or the name) of the rows with a tag and at least a
+    /// score, at most `limit` of them, through the index on both.
+    UpdateWhere(Option<String>, i64, Result<i64, Option<String>>, Option<usize>),
+    /// Delete the rows in a primary key range that are red or unnamed.
+    DeleteWhere(i64, i64, Option<usize>),
     Commit,
 }
 
@@ -47,6 +52,12 @@ fn gen_ops(r: &mut Rng) -> Vec<Op> {
             11 => Op::Get(r.below(30) as i64),
             12..=13 => Op::QueryTag(tag(r), r.below(10) as i64, 1 + r.usize(5), r.chance(0.5)),
             14 => Op::QueryPk(r.below(30) as i64, r.below(30) as i64, 1 + r.usize(10)),
+            15 => {
+                let set = if r.chance(0.7) { Ok(r.below(10) as i64) } else { Err(name(r)) };
+                let limit = r.chance(0.3).then(|| 1 + r.usize(4));
+                Op::UpdateWhere(tag(r), r.below(10) as i64, set, limit)
+            }
+            16 => Op::DeleteWhere(r.below(30) as i64, r.below(30) as i64, r.chance(0.3).then(|| 1 + r.usize(4))),
             _ => Op::Commit,
         })
         .collect()
@@ -197,6 +208,64 @@ async fn run(seed: u64, ops: &[Op]) -> Result<(), String> {
                     let got: Vec<Json> = r.rows.iter().map(strip).collect();
                     if got != want {
                         return Err(Error::internal(format!("query pk {a}..{b}: {got:?} vs {want:?}")));
+                    }
+                }
+                Op::UpdateWhere(g, min, set, limit) => {
+                    let sel: Selection =
+                        serde_json::from_value(json!({"index": "by_tag_score", "eq": [g], "range": {"gte": min}}))
+                            .unwrap();
+                    let set_json = match set {
+                        Ok(score) => json!({"score": score}),
+                        Err(n) => json!({"name": n}),
+                    };
+                    let r = update_where(&mut t, &blobs, "t", &sel, &set_json, Expiry::Keep, *limit).await;
+                    let mut chosen: Vec<(i64, i64)> = work
+                        .iter()
+                        .filter(|(_, m)| m.tag == *g && m.score >= *min)
+                        .map(|(id, m)| (m.score, *id))
+                        .collect();
+                    chosen.sort();
+                    chosen.truncate(limit.unwrap_or(usize::MAX));
+                    let mut after = work.clone();
+                    let mut dup = false;
+                    for (_, id) in &chosen {
+                        match set {
+                            Ok(score) => after.get_mut(id).unwrap().score = *score,
+                            Err(n) => {
+                                dup |= n.is_some() && after.iter().any(|(k, v)| k != id && v.name == *n);
+                                after.get_mut(id).unwrap().name = n.clone();
+                            }
+                        }
+                    }
+                    match r {
+                        Ok(n) if !dup && n == chosen.len() => work = after,
+                        Err(Error::AlreadyExists(_)) if dup => return Err(Error::AlreadyExists("expected".into())),
+                        other => {
+                            return Err(Error::internal(format!(
+                                "{op:?}: {other:?}, want {} rows (dup={dup})",
+                                chosen.len()
+                            )));
+                        }
+                    }
+                }
+                Op::DeleteWhere(a, b, limit) => {
+                    let sel: Selection = serde_json::from_value(json!({
+                        "range": {"gte": a, "lt": b},
+                        "filter": {"or": [{"col": "tag", "op": "eq", "value": "red"}, {"col": "name", "op": "is_null"}]}
+                    }))
+                    .unwrap();
+                    let n = delete_where(&mut t, "t", &sel, *limit).await?;
+                    let doomed: Vec<i64> = work
+                        .range(*a..(*b).max(*a))
+                        .filter(|(_, m)| m.tag.as_deref() == Some("red") || m.name.is_none())
+                        .map(|(id, _)| *id)
+                        .take(limit.unwrap_or(usize::MAX))
+                        .collect();
+                    if n != doomed.len() {
+                        return Err(Error::internal(format!("{op:?}: deleted {n}, want {}", doomed.len())));
+                    }
+                    for id in doomed {
+                        work.remove(&id);
                     }
                 }
                 Op::Commit => {
@@ -1160,5 +1229,241 @@ fn building_index_checker_rejects_corruption() {
         let mut t = begin(&db).await;
         t.delete(backfill_key(s.id, idx.id)).unwrap();
         assert!(check_indexes(&mut t, "p").await.is_err(), "missing cursor not detected");
+    });
+}
+
+/// `people`: unique `by_email`, and `by_age`.
+fn members_table() -> CreateTable {
+    table_def(json!({
+        "name": "people",
+        "columns": [
+            {"name": "id", "type": "int", "nullable": false},
+            {"name": "email", "type": "string"},
+            {"name": "age", "type": "int"}
+        ],
+        "primary_key": ["id"],
+        "indexes": [{"name": "by_email", "columns": ["email"], "unique": true}, {"name": "by_age", "columns": ["age"]}]
+    }))
+}
+
+/// Rows written with a time to live expire, at their commit's time plus
+/// the TTL, together with their index entries and blob columns: a unique
+/// value is free again once its row expired, and an expired row's newer
+/// version never brings an older one back. Updates keep a row's expiry
+/// unless they set one, and the batch operations see only live rows.
+#[test]
+fn rows_expire_with_their_index_entries() {
+    rt().block_on(async {
+        let (eng, _store, _env) = engine(3, EngineConfig::small_for_tests());
+        let db = eng.db("ttl");
+        db.open(true).await.unwrap();
+        eng.shared.store_time_ms().await.unwrap();
+        let blobs = BlobResolver { db: &db };
+        let ttl = |ms| Some(crate::engine::Ttl::For(ms));
+        let mut t = begin(&db).await;
+        create_table(&mut t, &members_table()).await.unwrap();
+        insert(&mut t, &blobs, "people", &json!({"id": 1, "email": "old@x", "age": 1}), InsertMode::Insert)
+            .await
+            .unwrap();
+        db.commit(t.into_request()).await.unwrap();
+        // Replace row 1 with a version that expires, and add a second.
+        let mut t = begin(&db).await;
+        let up = InsertMode::Upsert;
+        insert_expiring(&mut t, &blobs, "people", &json!({"id": 1, "email": "a@x", "age": 2}), up, ttl(10_000))
+            .await
+            .unwrap();
+        insert_expiring(&mut t, &blobs, "people", &json!({"id": 2, "email": "b@x", "age": 3}), up, ttl(10_000))
+            .await
+            .unwrap();
+        // A partial update in the same transaction keeps the TTL.
+        assert!(update(&mut t, &blobs, "people", &json!(2), &json!({"age": 4})).await.unwrap());
+        let c = db.commit_detailed(t.into_request()).await.unwrap();
+        let expires = c.time_ms + 10_000;
+        let mut t = begin(&db).await;
+        assert_eq!(
+            get_expiring(&mut t, "people", &json!(2)).await.unwrap().map(|(r, e)| (r["age"].clone(), e)),
+            Some((json!(4), Some(expires)))
+        );
+        check_indexes(&mut t, "people").await.unwrap();
+        // Extend row 2's life; row 1 keeps its expiry through an update.
+        let mut t = begin(&db).await;
+        assert!(update(&mut t, &blobs, "people", &json!(1), &json!({"age": 5})).await.unwrap());
+        assert!(
+            update_expiring(&mut t, &blobs, "people", &json!(2), &json!({}), Expiry::Set(ttl(60_000))).await.unwrap()
+        );
+        db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        assert_eq!(get_expiring(&mut t, "people", &json!(1)).await.unwrap().and_then(|(_, e)| e), Some(expires));
+        let dup =
+            insert(&mut t, &blobs, "people", &json!({"id": 3, "email": "a@x", "age": 1}), InsertMode::Insert).await;
+        assert!(matches!(dup, Err(Error::AlreadyExists(_))), "the unique value is taken until the row expires");
+        tokio::time::sleep(std::time::Duration::from_millis(10_001)).await;
+        let mut t = begin(&db).await;
+        assert_eq!(get(&mut t, "people", &json!(1)).await.unwrap(), None, "expired, and the older row stays gone");
+        assert!(get(&mut t, "people", &json!(2)).await.unwrap().is_some());
+        let q: Query = serde_json::from_value(json!({"index": "by_email"})).unwrap();
+        let rows = query(&mut t, "people", &q).await.unwrap().rows;
+        assert_eq!(rows.iter().map(|r| r["id"].clone()).collect::<Vec<_>>(), vec![json!(2)]);
+        check_indexes(&mut t, "people").await.unwrap();
+        insert(&mut t, &blobs, "people", &json!({"id": 3, "email": "a@x", "age": 1}), InsertMode::Insert)
+            .await
+            .unwrap();
+        let all = Selection::default();
+        assert_eq!(
+            update_where(&mut t, &blobs, "people", &all, &json!({"age": 9}), Expiry::Keep, None).await.unwrap(),
+            2
+        );
+        db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        check_indexes(&mut t, "people").await.unwrap();
+        assert_eq!(delete_where(&mut t, "people", &all, None).await.unwrap(), 2);
+        db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        check_indexes(&mut t, "people").await.unwrap();
+        assert!(query(&mut t, "people", &q).await.unwrap().rows.is_empty());
+    });
+}
+
+/// Batch operations check what they would write before selecting, select
+/// before writing, and stay within the transaction's write limit.
+#[test]
+fn batch_row_operations() {
+    rt().block_on(async {
+        let (eng, _store, _env) =
+            engine(4, EngineConfig { txn_max_write_bytes: 1_000, ..EngineConfig::small_for_tests() });
+        let db = eng.db("batch");
+        db.open(true).await.unwrap();
+        let blobs = BlobResolver { db: &db };
+        let mut t = begin(&db).await;
+        create_table(&mut t, &members_table()).await.unwrap();
+        db.commit(t.into_request()).await.unwrap();
+        for ids in [0..5, 5..10, 10..15, 15..20] {
+            let mut t = begin(&db).await;
+            for id in ids {
+                let row = json!({"id": id, "email": format!("e{id}"), "age": id % 4});
+                insert(&mut t, &blobs, "people", &row, InsertMode::Insert).await.unwrap();
+            }
+            db.commit(t.into_request()).await.unwrap();
+        }
+        let sel = |v: Json| -> Selection { serde_json::from_value(v).unwrap() };
+        let mut t = begin(&db).await;
+        for (set, why) in [
+            (json!({"id": 1}), "the primary key"),
+            (json!({"nope": 1}), "an unknown column"),
+            (json!({"age": "x"}), "a value of the wrong type"),
+            (json!([1]), "not an object"),
+        ] {
+            let r = update_where(&mut t, &blobs, "people", &sel(json!({"eq": [-1]})), &set, Expiry::Keep, None).await;
+            assert!(matches!(r, Err(Error::InvalidArgument(_))), "{why}: {r:?}");
+        }
+        let r = update_where(&mut t, &blobs, "people", &sel(json!({"index": "nope"})), &json!({}), Expiry::Keep, None)
+            .await;
+        assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
+        // Raising every age by moving rows forward in the index they are
+        // selected through updates each row once.
+        let by_age = sel(json!({"index": "by_age", "range": {"gte": 1}}));
+        let n =
+            update_where(&mut t, &blobs, "people", &by_age, &json!({"age": 7}), Expiry::Keep, Some(6)).await.unwrap();
+        assert_eq!(n, 6);
+        db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        assert_eq!(
+            update_where(&mut t, &blobs, "people", &by_age, &json!({"age": 8}), Expiry::Keep, Some(3)).await.unwrap(),
+            3
+        );
+        db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        let ages: Vec<i64> = query(&mut t, "people", &serde_json::from_value(json!({"limit": 100})).unwrap())
+            .await
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r["age"].as_i64().unwrap())
+            .collect();
+        // By (age, id): the five of age 1 and the first of age 2 got 7, then
+        // the next three of age 2 got 8.
+        assert_eq!(ages.iter().filter(|a| **a == 7).count(), 6, "{ages:?}");
+        assert_eq!(ages.iter().filter(|a| **a == 8).count(), 3, "{ages:?}");
+        let dup = update_where(
+            &mut t,
+            &blobs,
+            "people",
+            &sel(json!({"range": {"lt": 2}})),
+            &json!({"email": "same"}),
+            Expiry::Keep,
+            None,
+        )
+        .await;
+        assert!(matches!(dup, Err(Error::AlreadyExists(_))), "{dup:?}");
+        let mut t = begin(&db).await;
+        let big =
+            update_where(&mut t, &blobs, "people", &Selection::default(), &json!({"age": 1}), Expiry::Keep, None).await;
+        assert!(matches!(big, Err(Error::TooLarge(_))), "{big:?}");
+        let mut t = begin(&db).await;
+        assert_eq!(
+            delete_where(&mut t, "people", &sel(json!({"filter": {"col": "age", "op": "eq", "value": 0}})), None)
+                .await
+                .unwrap(),
+            5
+        );
+        db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        check_indexes(&mut t, "people").await.unwrap();
+        assert!(get(&mut t, "people", &json!(4)).await.unwrap().is_none());
+        assert!(get(&mut t, "people", &json!(5)).await.unwrap().is_some());
+    });
+}
+
+/// The row feed reports each changed row's state, or its deletion, in
+/// version order, and pages through them.
+#[test]
+fn row_changes_follow_writes() {
+    rt().block_on(async {
+        let (eng, _store, _env) = engine(5, EngineConfig::small_for_tests());
+        let db = eng.db("feed");
+        db.open(true).await.unwrap();
+        let blobs = BlobResolver { db: &db };
+        let mut t = begin(&db).await;
+        create_table(&mut t, &members_table()).await.unwrap();
+        let start = db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        for id in 0..3 {
+            insert(
+                &mut t,
+                &blobs,
+                "people",
+                &json!({"id": id, "email": format!("e{id}"), "age": 1}),
+                InsertMode::Insert,
+            )
+            .await
+            .unwrap();
+        }
+        let first = db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        delete(&mut t, "people", &json!(1)).await.unwrap();
+        update(&mut t, &blobs, "people", &json!(2), &json!({"age": 5})).await.unwrap();
+        let second = db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(&db).await;
+        let mut got = Vec::new();
+        let mut after = ChangePos::after_version(start);
+        loop {
+            let page = row_changes(&mut t, "people", &after, 2).await.unwrap();
+            got.extend(page.changes);
+            after = page.next;
+            if !page.more {
+                break;
+            }
+        }
+        let summary: Vec<(u64, Json, bool)> =
+            got.iter().map(|c| (c["version"].as_u64().unwrap(), c["pk"].clone(), c["deleted"] == true)).collect();
+        assert_eq!(
+            summary,
+            vec![(first, json!([0]), false), (second, json!([1]), true), (second, json!([2]), false)],
+            "{got:?}"
+        );
+        assert_eq!(got[2]["row"]["age"], json!(5));
+        assert_eq!(after, ChangePos::after_version(second));
+        let page = row_changes(&mut t, "people", &after, 10).await.unwrap();
+        assert!(page.changes.is_empty() && !page.more && page.next == after);
     });
 }

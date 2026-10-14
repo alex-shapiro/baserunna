@@ -90,7 +90,7 @@ fn request_costs_stay_within_budget() {
 /// (SPEC §5.6).
 const AMPLIFICATION_BUDGETS: &[(&str, f64, f64, f64)] = &[
     ("uniform_update", 3.5, 1.4, 3.0),
-    ("skewed_update", 3.0, 1.3, 2.0),
+    ("skewed_update", 3.0, 1.3, 2.5),
     ("append", 2.2, 1.1, 1.0),
     ("queue", 3.0, 2.2, 3.0),
     ("mixed", 2.5, 1.4, 3.0),

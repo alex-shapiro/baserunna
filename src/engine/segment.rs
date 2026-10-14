@@ -51,6 +51,9 @@ pub struct SegmentStats {
     pub max_key: Bytes,
     pub min_seq: Seq,
     pub max_seq: Seq,
+    /// Entries with an expiry, and the latest expiry (0 if none).
+    pub expiring: u64,
+    pub expires_max: u64,
 }
 
 /// Builds a segment in memory from entries added in key order.
@@ -66,6 +69,8 @@ pub struct SegmentBuilder {
     tombstones: u64,
     min_seq: Seq,
     max_seq: Seq,
+    expiring: u64,
+    expires_max: u64,
     first_key: Option<Bytes>,
     last_key: Vec<u8>,
 }
@@ -84,6 +89,8 @@ impl SegmentBuilder {
             tombstones: 0,
             min_seq: Seq::MAX,
             max_seq: 0,
+            expiring: 0,
+            expires_max: 0,
             first_key: None,
             last_key: Vec::new(),
         }
@@ -123,6 +130,10 @@ impl SegmentBuilder {
         }
         self.min_seq = self.min_seq.min(e.seq);
         self.max_seq = self.max_seq.max(e.seq);
+        if let Some(x) = e.expires {
+            self.expiring += 1;
+            self.expires_max = self.expires_max.max(x);
+        }
         if self.first_key.is_none() {
             self.first_key = Some(Bytes::copy_from_slice(&e.key));
         }
@@ -221,6 +232,8 @@ impl SegmentBuilder {
             max_key: if self.entries == 0 { Bytes::new() } else { Bytes::from(self.last_key) },
             min_seq,
             max_seq: self.max_seq,
+            expiring: self.expiring,
+            expires_max: self.expires_max,
         };
         (Bytes::from(self.out), stats)
     }
@@ -451,15 +464,21 @@ mod tests {
         keys.sort();
         keys.dedup();
         keys.into_iter()
-            .map(|k| Entry {
-                key: Bytes::from(k),
-                seq: r.below(1000),
-                value: if r.chance(0.2) {
-                    Value::Tombstone
-                } else {
-                    let len = r.usize(200);
-                    Value::Inline(Bytes::from(r.bytes(len)))
-                },
+            .map(|k| {
+                let e = Entry::new(
+                    Bytes::from(k),
+                    r.below(1000),
+                    if r.chance(0.2) {
+                        Value::Tombstone
+                    } else {
+                        let len = r.usize(200);
+                        Value::Inline(Bytes::from(r.bytes(len)))
+                    },
+                );
+                match !e.value.is_tombstone() && r.chance(0.3) {
+                    true => Entry { expires: Some(r.below(1 << 45)), ..e },
+                    false => e,
+                }
             })
             .collect()
     }
@@ -469,11 +488,7 @@ mod tests {
     #[test]
     fn rejects_inconsistent_layouts_with_valid_checksums() {
         let entries: Vec<Entry> = (0..60u64)
-            .map(|i| Entry {
-                key: Bytes::from(format!("k{i:04}")),
-                seq: i,
-                value: Value::Inline(Bytes::from(vec![7u8; 40])),
-            })
+            .map(|i| Entry::new(Bytes::from(format!("k{i:04}")), i, Value::Inline(Bytes::from(vec![7u8; 40]))))
             .collect();
         let (data, _) = build(&entries, 256, Compression::None);
         assert_eq!(read_all(&data).unwrap(), entries);
@@ -526,11 +541,7 @@ mod tests {
     #[test]
     fn rejects_block_indexes_that_do_not_tile_the_data() {
         let entries: Vec<Entry> = (0..60u64)
-            .map(|i| Entry {
-                key: Bytes::from(format!("k{i:04}")),
-                seq: i,
-                value: Value::Inline(Bytes::from(vec![7u8; 40])),
-            })
+            .map(|i| Entry::new(Bytes::from(format!("k{i:04}")), i, Value::Inline(Bytes::from(vec![7u8; 40]))))
             .collect();
         let (data, _) = build(&entries, 256, Compression::None);
         let blocks = SegmentIndex::decode_whole(&data).unwrap().blocks;
@@ -568,8 +579,7 @@ mod tests {
     #[test]
     fn rejects_bad_compressed_blocks() {
         let mut raw = Writer::new();
-        Entry { key: Bytes::from_static(b"k"), seq: 1, value: Value::Inline(Bytes::from(vec![b'x'; 300])) }
-            .encode(&mut raw);
+        Entry::new(Bytes::from_static(b"k"), 1, Value::Inline(Bytes::from(vec![b'x'; 300]))).encode(&mut raw);
         raw.u32(1);
         let z = zstd::bulk::compress(&raw.buf, 3).unwrap();
         let block = |codec: u8, n: u64, payload: &[u8]| {
@@ -600,14 +610,13 @@ mod tests {
         let mut r = Rng::new(3);
         let entries = |random: bool, r: &mut Rng| -> Vec<Entry> {
             (0..500u64)
-                .map(|i| Entry {
-                    key: Bytes::from(format!("row/{i:06}")),
-                    seq: i,
-                    value: Value::Inline(Bytes::from(if random {
+                .map(|i| {
+                    let v = if random {
                         r.bytes(100)
                     } else {
                         format!("{{\"id\":{i},\"name\":\"user number {i}\",\"active\":true}}").into_bytes()
-                    })),
+                    };
+                    Entry::new(Bytes::from(format!("row/{i:06}")), i, Value::Inline(Bytes::from(v)))
                 })
                 .collect()
         };
@@ -648,6 +657,8 @@ mod tests {
                     max_key: entries.last().map(|e| e.key.clone()).unwrap_or_default(),
                     min_seq: entries.iter().map(|e| e.seq).min().unwrap_or(0),
                     max_seq: entries.iter().map(|e| e.seq).max().unwrap_or(0),
+                    expiring: entries.iter().filter(|e| e.expires.is_some()).count() as u64,
+                    expires_max: entries.iter().filter_map(|e| e.expires).max().unwrap_or(0),
                 };
                 if stats != want {
                     return Err(format!("stats {stats:?}, want {want:?}"));
@@ -700,7 +711,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "strictly increasing")]
     fn keys_out_of_order_are_refused() {
-        let e = |k: &'static [u8]| Entry { key: Bytes::from_static(k), seq: 1, value: Value::Tombstone };
+        let e = |k: &'static [u8]| Entry::tombstone(Bytes::from_static(k), 1);
         let mut b = SegmentBuilder::new(256, Compression::None);
         b.add(&e(b"b"));
         b.add(&e(b"c"));

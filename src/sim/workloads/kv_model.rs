@@ -171,13 +171,18 @@ pub struct KvModel {
     model: Model,
     rng: Rng,
     step: u64,
+    feed: Option<Follower>,
 }
+
+/// A follower of a database's change feed: where it is, and the state it
+/// has built from the feed (each value as the feed rendered it).
+type Follower = (String, BTreeMap<Key, (Json, u64)>);
 
 impl KvModel {
     pub async fn new(sim: &Arc<Sim>, user: &str, db: &str) -> Result<KvModel, String> {
         let c = Client::signup(sim, user, &format!("{user}@kv.test"), "password-123").await?;
         c.create_db(db).await?;
-        Ok(KvModel { rng: sim.fork_rng(), c, db: db.to_string(), model: Model::default(), step: 0 })
+        Ok(KvModel { rng: sim.fork_rng(), c, db: db.to_string(), model: Model::default(), step: 0, feed: None })
     }
 
     fn path(&self, rest: &str) -> String {
@@ -188,17 +193,18 @@ impl KvModel {
     /// in-flight attempt can land afterwards.
     async fn fence(&self) {
         self.c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
-        let id = format!("{:032x}", self.step as u128 + (1u128 << 100));
+        let id = format!("{:016x}", self.step + (1u64 << 62));
         let r = self.c.call_retry("GET", &self.path(&format!("/commits/{id}")), None).await;
         assert_eq!(r.json["status"], "not_committed");
     }
 
     pub async fn step(&mut self) -> Result<(), String> {
         self.step += 1;
-        match self.rng.below(10) {
+        match self.rng.below(12) {
             0..=4 => self.one_shot().await,
             5..=6 => self.interactive().await,
             7..=8 => self.raw().await,
+            9 | 10 => self.follow().await,
             _ => self.full_check().await,
         }
     }
@@ -630,6 +636,67 @@ impl KvModel {
                 }
             }
         }
+    }
+
+    /// Read the change feed from where the follower is, and check it: with
+    /// this client the only writer, every change reports the model's
+    /// current state of its key, and applying them all yields the model.
+    /// A cursor too old for the feed restarts from a full read.
+    async fn follow(&mut self) -> Result<(), String> {
+        let (mut cursor, mut mirror) = match self.feed.take() {
+            Some(f) => f,
+            None => {
+                // Start from the current state, at the version of a read of it.
+                let r = self.c.call_retry("GET", &self.path("/kv?limit=1"), None).await;
+                let v = r.json["version"].as_u64().ok_or("no version")?;
+                let mirror = self.model.data.iter().map(|(k, (_, ver))| (k.clone(), (Json::Null, *ver))).collect();
+                (v.to_string(), mirror)
+            }
+        };
+        loop {
+            let limit = 1 + self.rng.usize(6);
+            let wait = if self.rng.chance(0.2) { 50 + self.rng.below(300) } else { 0 };
+            let p = self.path(&format!("/changes?after={cursor}&limit={limit}&wait_ms={wait}"));
+            let r = self.c.call_retry("GET", &p, None).await;
+            match r.status {
+                200 => {}
+                410 if r.code() == "cursor_expired" => return Ok(()),
+                _ => return Err(format!("step {}: feed: {} {}", self.step, r.status, r.json)),
+            }
+            let changes = r.json["changes"].as_array().ok_or("no changes")?;
+            for ch in changes {
+                let version = ch["version"].as_u64().ok_or("change without a version")?;
+                let ctx = format!("step {} feed change {ch}", self.step);
+                if let Some(range) = ch.get("deleted_range") {
+                    let start = range["start"].as_str().ok_or("no start")?.as_bytes().to_vec();
+                    let end = range["end"].as_str().map(|e| e.as_bytes().to_vec());
+                    mirror.retain(|k, _| !in_range(k, &(start.clone(), end.clone())));
+                    continue;
+                }
+                let k = ch["key"].as_str().ok_or("no key")?.as_bytes().to_vec();
+                match (ch["deleted"] == true, self.model.data.get(&k)) {
+                    (true, None) => {
+                        mirror.remove(&k);
+                    }
+                    (false, Some((v, ver))) if *ver == version => {
+                        check_value(ch, v, &ctx)?;
+                        mirror.insert(k, (ch.clone(), version));
+                    }
+                    (_, m) => return Err(format!("{ctx}: the model has {:?}", m.map(|(_, v)| v))),
+                }
+            }
+            cursor = r.json["next_cursor"].as_str().ok_or("no next_cursor")?.to_string();
+            if r.json["more"] != true {
+                break;
+            }
+        }
+        let got: Vec<(&Key, u64)> = mirror.iter().map(|(k, (_, v))| (k, *v)).collect();
+        let want: Vec<(&Key, u64)> = self.model.data.iter().map(|(k, (_, v))| (k, *v)).collect();
+        if got != want {
+            return Err(format!("step {}: the feed's state {got:?} differs from the model {want:?}", self.step));
+        }
+        self.feed = Some((cursor, mirror));
+        Ok(())
     }
 
     /// Runs a paginated full scan against the model and validates storage quota bounds.

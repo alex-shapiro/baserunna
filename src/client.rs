@@ -195,6 +195,14 @@ impl Client {
         }
     }
 
+    /// A page of the changes to `db`'s keys after `after` (a version or a
+    /// previous `next_cursor`), waiting up to `wait_ms` for one. Follow on
+    /// from the page's `next_cursor`; a `410 cursor_expired` means the
+    /// current state must be read again.
+    pub async fn changes(&self, db: &str, after: &str, wait_ms: u64) -> Result<Value, ApiError> {
+        self.get(&format!("/v1/dbs/{}/changes?after={}&wait_ms={wait_ms}", seg(db), seg(after))).await
+    }
+
     pub async fn stage_blob(&self, db: &str, data: Bytes, content_type: &str) -> Result<Value, ApiError> {
         let (st, _, out) =
             self.raw("POST", &format!("/v1/dbs/{}/blobs", seg(db)), &[("content-type", content_type)], data).await?;

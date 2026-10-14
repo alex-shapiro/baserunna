@@ -1,6 +1,9 @@
 //! `tables`: schema changes and row operations through the HTTP API against
-//! a model, plus concurrent unique-index contention. At quiescence every
-//! index is recomputed from the rows and must match exactly.
+//! a model, plus concurrent unique-index contention. Updates and deletes of
+//! many rows by selection must change exactly the rows the model selects,
+//! and a follower of the table's change feed must reproduce the model's
+//! rows. At quiescence every index is recomputed from the rows and must
+//! match exactly.
 
 use super::super::Sim;
 use super::super::client::Client;
@@ -27,6 +30,78 @@ fn strip(v: &Json) -> Json {
 async fn retry(c: &Client, path: &str, body: Json) -> Result<super::super::client::Resp, String> {
     // Only used for idempotent requests (reads, upserts, definitive ops).
     Ok(c.call_settled("POST", path, Some(body)).await)
+}
+
+/// The model's rows (ids below 1000) that a selection by team and minimum
+/// score through `by_team_score` picks, in the index's order, at most
+/// `limit`.
+fn select(model: &BTreeMap<i64, Row>, team: &str, min: i64, limit: Option<usize>) -> Vec<i64> {
+    let mut hits: Vec<(i64, i64)> =
+        model.iter().filter(|(_, m)| m.team == team && m.score >= min).map(|(i, m)| (m.score, *i)).collect();
+    hits.sort();
+    hits.into_iter().map(|(_, i)| i).take(limit.unwrap_or(usize::MAX)).collect()
+}
+
+/// Run one-shot `ops` with an idempotency key until definitive. Returns
+/// the results, or `None` if a retry found them applied (a replay).
+async fn once(c: &Client, ops: Json, key: &str) -> Result<Option<Json>, String> {
+    let body = json!({"ops": ops, "idempotency_key": key});
+    loop {
+        match c.call("POST", "/v1/dbs/tdb/txn", Some(body.clone())).await {
+            Ok(r) if r.status == 200 => return Ok((r.json["replayed"] != true).then(|| r.json["results"].clone())),
+            Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => c.pause(50).await,
+            Ok(r) if r.status != 503 && r.status != 429 => return Err(format!("{key}: {} {}", r.status, r.json)),
+            _ => c.pause(super::super::client::ZOMBIE_WAIT_MS).await,
+        }
+    }
+}
+
+/// A follower of the players table's change feed, and the rows it built.
+struct Follower {
+    cursor: String,
+    rows: BTreeMap<i64, Json>,
+}
+
+impl Follower {
+    /// Read the feed until caught up, then check the rows below id 1000
+    /// (the single writer's) against the model. A cursor too old starts
+    /// over from a read of every row, at that read's version.
+    async fn follow(&mut self, c: &Client, model: &BTreeMap<i64, Row>) -> Result<(), String> {
+        loop {
+            let p = format!("/v1/dbs/tdb/tables/players/changes?after={}&limit={}", self.cursor, 1 + c.rng().below(6));
+            let r = c.call_retry("GET", &p, None).await;
+            match r.status {
+                200 => {}
+                410 => {
+                    let q = c
+                        .call_retry("POST", "/v1/dbs/tdb/tables/players/rows/query", Some(json!({"limit": 1000})))
+                        .await;
+                    self.cursor = q.json["version"].as_u64().ok_or("no version")?.to_string();
+                    let rows = q.json["rows"].as_array().cloned().unwrap_or_default();
+                    self.rows = rows.iter().filter_map(|r| Some((r["id"].as_i64()?, strip(r)))).collect();
+                    continue;
+                }
+                _ => return Err(format!("row feed: {} {}", r.status, r.json)),
+            }
+            for ch in r.json["changes"].as_array().into_iter().flatten() {
+                let id = ch["pk"][0].as_i64().ok_or("change without a pk")?;
+                match ch["deleted"] == true {
+                    true => self.rows.remove(&id),
+                    false => self.rows.insert(id, strip(&ch["row"])),
+                };
+            }
+            self.cursor = r.json["next_cursor"].as_str().ok_or("no next_cursor")?.to_string();
+            if r.json["more"] != true {
+                break;
+            }
+        }
+        let got: Vec<&Json> = self.rows.range(..1000).map(|(_, r)| r).collect();
+        let want: Vec<Json> = model.iter().map(|(i, m)| row_json(*i, m)).collect();
+        if got.len() != want.len() || got.iter().zip(&want).any(|(g, w)| *g != w) {
+            return Err(format!("the row feed's rows differ:\n got {got:?}\nwant {want:?}"));
+        }
+        Ok(())
+    }
 }
 
 /// Check every table's indexes directly in storage (via a node's engine),
@@ -113,12 +188,75 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
     // A model-checked single writer on its own key range (ids < 100).
     let mut model: BTreeMap<i64, Row> = BTreeMap::new();
     let mut rng = sim.fork_rng();
+    let mut follower = Follower { cursor: "0".into(), rows: BTreeMap::new() };
     for step in 0..steps {
         let id = rng.below(40) as i64;
         let email = if rng.chance(0.3) { None } else { Some(format!("u{}@m.io", rng.below(15))) };
         let team = ["red", "blue"][rng.usize(2)].to_string();
         let score = rng.below(10) as i64;
-        match rng.below(6) {
+        match rng.below(9) {
+            6 => {
+                // Move rows to another team and score, through the index
+                // that selects them.
+                let limit = rng.chance(0.4).then(|| 1 + rng.usize(3));
+                let (to_team, to_score) = (["red", "blue"][rng.usize(2)], rng.below(10) as i64);
+                let mut op = json!({"op": "update_rows", "table": "players",
+                    "where": {"index": "by_team_score", "eq": [team], "range": {"gte": score}},
+                    "set": {"team": to_team, "score": to_score}});
+                if let Some(l) = limit {
+                    op["limit"] = json!(l);
+                }
+                let ids = select(&model, &team, score, limit);
+                if let Some(res) = once(&c, json!([op]), &format!("upd-{step}")).await?
+                    && res[0]["count"] != ids.len()
+                {
+                    return Err(format!("step {step}: update_rows changed {}, want {}", res[0]["count"], ids.len()));
+                }
+                for i in ids {
+                    let m = model.get_mut(&i).ok_or("selected a missing row")?;
+                    (m.team, m.score) = (to_team.to_string(), to_score);
+                }
+            }
+            7 => {
+                // Delete low scores among this writer's rows.
+                let limit = rng.chance(0.4).then(|| 1 + rng.usize(3));
+                let mut op = json!({"op": "delete_rows", "table": "players",
+                    "where": {"range": {"lt": 1000}, "filter": {"col": "score", "op": "lt", "value": score / 2}}});
+                if let Some(l) = limit {
+                    op["limit"] = json!(l);
+                }
+                let ids: Vec<i64> = model
+                    .iter()
+                    .filter(|(_, m)| m.score < score / 2)
+                    .map(|(i, _)| *i)
+                    .take(limit.unwrap_or(usize::MAX))
+                    .collect();
+                if let Some(res) = once(&c, json!([op]), &format!("del-{step}")).await?
+                    && res[0]["count"] != ids.len()
+                {
+                    return Err(format!("step {step}: delete_rows removed {}, want {}", res[0]["count"], ids.len()));
+                }
+                for i in ids {
+                    model.remove(&i);
+                }
+            }
+            8 => {
+                // The same through the rows endpoint: setting a constant is
+                // idempotent, so retries are safe.
+                let r = retry(
+                    &c,
+                    &format!("{base}/tables/players/rows/update"),
+                    json!({"where": {"index": "by_team_score", "eq": [team], "range": {"gte": score}}, "set": {"score": 9}}),
+                )
+                .await?;
+                if r.status != 200 || r.json["count"].as_u64().is_none() {
+                    return Err(format!("step {step}: update by selection: {} {}", r.status, r.json));
+                }
+                for i in select(&model, &team, score, None) {
+                    model.get_mut(&i).ok_or("selected a missing row")?.score = 9;
+                }
+                follower.follow(&c, &model).await?;
+            }
             0 | 1 => {
                 // Upsert is idempotent, so retries are safe.
                 let dup = email.is_some() && model.iter().any(|(k, v)| *k != id && v.email == email);
@@ -198,6 +336,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
         }
     }
     let mut winners: BTreeMap<String, i64> = BTreeMap::new();
+
     for h in hs {
         for id in h.await.map_err(|e| e.to_string())?? {
             let e = (id - 1000) % 100;
@@ -252,6 +391,12 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
     let info = c.call_retry("GET", base, None).await;
     let db_id = info.json["id"].as_str().ok_or("no db id")?.to_string();
     check_all_indexes(&sim, &db_id).await?;
+    follower.follow(&c, &model).await?;
+    let contested: BTreeMap<String, i64> =
+        follower.rows.range(1000..).map(|(i, r)| (r["email"].as_str().unwrap_or_default().to_string(), *i)).collect();
+    if contested != winners {
+        return Err(format!("the row feed's contested rows {contested:?} are not the winners {winners:?}"));
+    }
     let r = c
         .call_retry(
             "POST",

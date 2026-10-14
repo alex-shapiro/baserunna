@@ -49,6 +49,10 @@ pub struct NodeConfig {
     pub db_idle_evict_ms: u64,
     pub secure_cookies: bool,
     pub txn_retries: u32,
+    /// While a change feed request waits for changes on a node that may
+    /// not see commits as they happen (another node holds the lease), it
+    /// re-reads the manifest this often.
+    pub watch_poll_ms: u64,
     pub limits: LimitConfig,
     pub engine: EngineConfig,
 }
@@ -79,6 +83,7 @@ impl Default for NodeConfig {
             db_idle_evict_ms: 5 * 60_000,
             secure_cookies: false,
             txn_retries: 4,
+            watch_poll_ms: 1_000,
             limits: LimitConfig::default(),
             engine: EngineConfig { db_max_bytes: 10 << 30, ..EngineConfig::default() },
         }

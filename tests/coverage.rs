@@ -24,6 +24,8 @@ fn simulation_exercises_every_documented_operation_and_engine_path() {
         segments_rewritten,
         levels_objects_written,
         quota_refusals,
+        expired_entries,
+        segments_expired,
     } = engine;
     for (path, n) in [
         ("range tombstones written", range_tombstones_written),
@@ -32,6 +34,8 @@ fn simulation_exercises_every_documented_operation_and_engine_path() {
         ("segments rewritten for range tombstones", segments_rewritten),
         ("levels objects written", levels_objects_written),
         ("commits refused for the quota", quota_refusals),
+        ("expired entries dropped or reduced to tombstones", expired_entries),
+        ("segments rewritten or dropped for expired entries", segments_expired),
     ] {
         assert!(n > 0, "the simulator never exercised: {path} ({engine:?})");
     }

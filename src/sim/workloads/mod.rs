@@ -14,6 +14,8 @@ pub mod limits;
 pub mod register;
 pub mod schema_race;
 pub mod tables;
+pub mod ttl;
+pub mod watch;
 
 use super::Sim;
 use std::sync::Arc;
@@ -133,7 +135,7 @@ fn faulty3() -> super::SimConfig {
 
 /// Applies small storage quotas to exercise quota limits in kv_model workloads.
 fn with_quota(mut c: super::SimConfig) -> super::SimConfig {
-    c.engine.db_max_bytes = 36 * 1024;
+    c.engine.db_max_bytes = 24 * 1024;
     c.engine.quota_sweep_interval_ms = 10_000;
     c
 }
@@ -216,6 +218,8 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario { name: "abandoned", config: faulty3, run: |s| Box::pin(abandoned::run(s, 4, 12, true)) },
         Scenario { name: "blob_gc_race", config: blob_gc_cfg, run: |s| Box::pin(blob_gc_race::run(s, 2, 3, 30, true)) },
         Scenario { name: "db_churn", config: churn_cfg, run: |s| Box::pin(db_churn::run(s, 4, 10, 60, true)) },
+        Scenario { name: "ttl", config: faulty3, run: |s| Box::pin(ttl::run(s, 2, 60, true)) },
+        Scenario { name: "watch", config: faulty3, run: |s| Box::pin(watch::run(s, 120, true)) },
         Scenario { name: "kv_hostile", config: kv_hostile3, run: |s| Box::pin(kv_model::run(s, 2, 60, true)) },
         Scenario { name: "bank_hostile", config: hostile3, run: |s| Box::pin(bank::run(s, 6, 4, 12, true)) },
         Scenario { name: "register_hostile", config: hostile3, run: |s| Box::pin(register::run(s, 3, 3, 30, true)) },
@@ -235,6 +239,8 @@ pub fn scenarios() -> Vec<Scenario> {
             run: |s| Box::pin(db_churn::run(s, 4, 10, 60, true)),
         },
         Scenario { name: "chaos_hostile", config: hostile4, run: |s| Box::pin(chaos_mix(s, 2)) },
+        Scenario { name: "ttl_hostile", config: hostile3, run: |s| Box::pin(ttl::run(s, 2, 60, true)) },
+        Scenario { name: "watch_hostile", config: hostile3, run: |s| Box::pin(watch::run(s, 120, true)) },
     ]
 }
 

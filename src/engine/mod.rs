@@ -25,9 +25,9 @@ use tokio::sync::Semaphore;
 
 pub use config::EngineConfig;
 pub use db::{Committed, Consistency, Db};
-pub use txn::{CommitRequest, Isolation, ReadItem, ReadValue, Txn};
+pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
 pub use types::{BlobRef, Entry, Seq, Value};
-pub use version::{KeyRange, Version};
+pub use version::{Change, ChangePage, ChangePos, KeyRange, Snapshot, Version};
 
 /// Cumulative storage engine activity metrics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -40,6 +40,10 @@ pub struct Activity {
     pub segments_rewritten: u64,
     pub levels_objects_written: u64,
     pub quota_refusals: u64,
+    /// Entries dropped or reduced to tombstones because they expired.
+    pub expired_entries: u64,
+    /// Segments rewritten or dropped because their entries expired.
+    pub segments_expired: u64,
 }
 
 impl Activity {
@@ -50,12 +54,14 @@ impl Activity {
         self.segments_rewritten += o.segments_rewritten;
         self.levels_objects_written += o.levels_objects_written;
         self.quota_refusals += o.quota_refusals;
+        self.expired_entries += o.expired_entries;
+        self.segments_expired += o.segments_expired;
     }
 }
 
 /// Thread-safe counters for tracking [`Activity`] metrics.
 #[derive(Default)]
-pub struct Counters([AtomicU64; 6]);
+pub struct Counters([AtomicU64; 8]);
 
 impl Counters {
     pub fn add(&self, a: &Activity) {
@@ -66,6 +72,8 @@ impl Counters {
             a.segments_rewritten,
             a.levels_objects_written,
             a.quota_refusals,
+            a.expired_entries,
+            a.segments_expired,
         ];
         for (c, d) in self.0.iter().zip(deltas) {
             if d > 0 {
@@ -83,6 +91,8 @@ impl Counters {
             segments_rewritten: v[3],
             levels_objects_written: v[4],
             quota_refusals: v[5],
+            expired_entries: v[6],
+            segments_expired: v[7],
         }
     }
 }

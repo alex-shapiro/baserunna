@@ -91,7 +91,8 @@ pub struct Amplification {
     /// Every stored object of the database per live byte once garbage
     /// collection has caught up.
     pub space_amp_settled: f64,
-    /// Segments a point lookup of a random live key may consult (mean).
+    /// Segments a point lookup of a random live key may consult, sampled
+    /// after every commit (mean).
     pub read_amp: f64,
     pub segments: usize,
 }
@@ -191,6 +192,7 @@ pub async fn measure(w: Workload, scale: f64, cfg: EngineConfig) -> Amplificatio
     let mut live: BTreeMap<u64, u64> = BTreeMap::new();
     let mut logical = 0u64;
     let (mut amp_sum, mut amp_max, mut samples) = (0.0, 0.0f64, 0u64);
+    let (mut lookups, mut consulted) = (0u64, 0u64);
     for batch in writes(w, scale, &mut rng) {
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.expect("begin");
         for (k, v) in batch {
@@ -219,6 +221,11 @@ pub async fn measure(w: Workload, scale: f64, cfg: EngineConfig) -> Amplificatio
             amp_sum += a;
             amp_max = amp_max.max(a);
             samples += 1;
+            let keys: Vec<u64> = live.keys().copied().collect();
+            for _ in 0..20 {
+                consulted += v.segments_for_key(&key(*rng.pick(&keys))) as u64;
+                lookups += 1;
+            }
         }
     }
     // Let compaction finish, then garbage collection catch up.
@@ -229,14 +236,6 @@ pub async fn measure(w: Workload, scale: f64, cfg: EngineConfig) -> Amplificatio
     let v = db.current().expect("current");
     let live_bytes: u64 = live.values().sum::<u64>().max(1);
     let stored: u64 = mem.keys().iter().filter_map(|k| mem.get_sync(k, &GetOpts::default()).ok()).map(|g| g.size).sum();
-    let mut lookups = 0u64;
-    let mut consulted = 0u64;
-    let keys: Vec<u64> = live.keys().copied().collect();
-    for _ in 0..1000.min(keys.len()) {
-        let k = key(*rng.pick(&keys));
-        consulted += v.segments_for_key(&k) as u64;
-        lookups += 1;
-    }
     eng.env().shutdown();
     Amplification {
         workload: w,

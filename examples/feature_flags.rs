@@ -4,7 +4,9 @@
 //! (no object-store requests), writes use compare-and-set so two admins
 //! editing the same flag cannot silently overwrite each other, and
 //! `snapshot` reads trade a bounded staleness for even cheaper reads on
-//! any node.
+//! any node. Temporary overrides expire on their own, and application
+//! servers follow flag changes through the change feed instead of polling
+//! every flag.
 //!
 //! Run: `cargo run --example feature_flags`
 
@@ -79,6 +81,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for it in r["results"][0]["items"].as_array().unwrap() {
         println!("    {} = {} (v{})", it["key"].as_str().unwrap(), it["value"].as_str().unwrap(), it["version"]);
     }
+
+    step(7, "A temporary override that expires by itself");
+    let path = "/v1/dbs/flags/kv/override%2Fsearch.semantic";
+    let (st, _, _) = admin
+        .raw("PUT", &format!("{path}?ttl_ms=1500"), &[], Bytes::from(json!({"enabled": true}).to_string()))
+        .await?;
+    let (_, headers, _) = admin.raw("GET", path, &[], Bytes::new()).await?;
+    println!(
+        "    override written (HTTP {st}), expires at {:?} (cluster time, ms)",
+        headers.get("x-baserunna-expires-at")
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1_600)).await;
+    let gone = app.get_bytes("flags", "override/search.semantic", None).await?;
+    println!(
+        "    after 1.6 s: {}",
+        if gone.is_none() { "expired, the flag's own value applies again" } else { "still there?!" }
+    );
+
+    step(8, "App servers follow flag changes with a long poll");
+    let info = admin.get("/v1/dbs/flags").await?;
+    let since = info["stats"]["version"].to_string();
+    let watcher = {
+        let app = app.clone();
+        tokio::spawn(async move { app.changes("flags", &since, 10_000).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    admin
+        .put_bytes("flags", "ui.dark_mode", Bytes::from(json!({"enabled": false}).to_string()), "application/json")
+        .await?;
+    let page = watcher.await??;
+    for ch in page["changes"].as_array().unwrap() {
+        println!(
+            "    v{}: {} = {}",
+            ch["version"],
+            ch["key"].as_str().unwrap(),
+            ch["value"].as_str().unwrap_or("(deleted)")
+        );
+    }
+    println!("    continue from cursor {}", page["next_cursor"]);
 
     server.stop().await;
     println!("\ndone.");

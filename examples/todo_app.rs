@@ -1,8 +1,9 @@
 //! Real-world example: a multi-user todo service.
 //!
 //! Every user gets their own database with a `todos` table, a secondary
-//! index for "open tasks by due date", JSON tags, filters and pagination.
-//! Users are isolated from each other by construction.
+//! index for "open tasks by due date", JSON tags, filters and pagination,
+//! and updates and deletes of many tasks at once. Users are isolated from
+//! each other by construction.
 //!
 //! Run: `cargo run --example todo_app`
 
@@ -104,6 +105,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ada.post("/v1/dbs/todos/tables/todos/rows/update", json!({"pk": 7, "set": {"priority": 1}})).await?;
     let r = ada.post("/v1/dbs/todos/tables/todos/rows/query", json!({"index": "by_priority", "eq": [1]})).await?;
     println!("    high priority: {}", r["rows"][0]["title"]);
+
+    step(8, "Finish every open home task due before the 20th, in one transaction");
+    let r = ada
+        .post(
+            "/v1/dbs/todos/tables/todos/rows/update",
+            json!({"where": {"index": "open_by_due", "eq": [false], "range": {"lt": 20261020},
+                             "filter": {"col": "tags", "op": "eq", "value": ["home"]}},
+                   "set": {"done": true}}),
+        )
+        .await?;
+    println!("    {} task(s) done at version {}", r["count"], r["version"]);
+
+    step(9, "Clear out finished tasks");
+    let r = ada
+        .post("/v1/dbs/todos/tables/todos/rows/delete", json!({"where": {"index": "open_by_due", "eq": [true]}}))
+        .await?;
+    println!("    deleted {} finished task(s)", r["count"]);
 
     server.stop().await;
     println!("\ndone.");

@@ -81,6 +81,7 @@ pub fn error_from_json(status: u16, j: &Json) -> Error {
             Error::PreconditionFailed { message: m, op_index: e["details"]["op_index"].as_u64().map(|i| i as usize) }
         }
         "too_large" => Error::TooLarge(m),
+        "cursor_expired" => Error::CursorExpired(m),
         "quota_exceeded" => Error::QuotaExceeded(m),
         "rate_limited" => {
             Error::RateLimited { message: m, retry_after_ms: e["details"]["retry_after_ms"].as_u64().unwrap_or(1_000) }

@@ -547,6 +547,10 @@ async fn single_node(w: &World, out: &mut Vec<Measurement>) {
 
 /// One write a second for an hour over 1000 keys with 256-byte values:
 /// commits, tail flushes, compaction, the hourly sweep and GC deletes.
+/// Commits once a second to a set of 1000 keys for an hour. Returns the
+/// stored bytes per live byte, averaged over the hour's second half: the
+/// tail and level 0 fill and empty in cycles, so a single sample would
+/// depend on where in a cycle it falls.
 async fn steady_writes(w: &World, out: &mut Vec<Measurement>) -> f64 {
     let t = w.signup(0, "steady@cost.test").await;
     let id = w.create_db(0, &t, "steady").await;
@@ -554,16 +558,20 @@ async fn steady_writes(w: &World, out: &mut Vec<Measurement>) -> f64 {
     let mut rng = crate::util::rng::Rng::new(7);
     let r = Recorder::start(&w.store, &id);
     let n = 3600;
+    let (mut amp_sum, mut samples) = (0.0, 0);
     for i in 0..n {
         let k = rng.usize(1000);
         let resp = w.call(0, "PUT", &format!("/v1/dbs/steady/kv/w{k:04}"), &t, value(256, i)).await;
         assert_eq!(resp.status, 200);
         live.insert(k, 5 + 256);
         tokio::time::sleep(Duration::from_secs(1)).await;
+        if i >= n / 2 && i % 10 == 0 {
+            amp_sum += w.stored_bytes(&id) as f64 / live.values().sum::<usize>() as f64;
+            samples += 1;
+        }
     }
     out.push(r.stop("steady_write", "commit", n as f64, false));
-    let logical: usize = live.values().sum();
-    w.stored_bytes(&id) as f64 / logical as f64
+    amp_sum / samples as f64
 }
 
 /// System-database traffic of an otherwise idle cluster, per node-hour.
@@ -592,11 +600,11 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     let r = Recorder::start(&w.store, &id);
     let v = db.read_version(Consistency::Strong).await.expect("cold open");
     let segs = v.m.segments.len();
-    assert!(v.get(&key).await.expect("read").is_some());
+    assert!(v.get(&key, v.read_time()).await.expect("read").is_some());
     out.push(r.stop("cold_open_point_read", "open", 1.0, true));
 
     let r = Recorder::start(&w.store, &id);
-    let all = v.scan(&crate::engine::KeyRange::all(), false, usize::MAX, false).await.expect("scan");
+    let all = v.scan(&crate::engine::KeyRange::data(), false, usize::MAX, v.read_time()).await.expect("scan");
     assert_eq!(all.len(), 128);
     out.push(r.stop("cold_full_scan", "scan", 1.0, true));
 
@@ -606,14 +614,14 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     let r = Recorder::start(&w.store, &id);
     for _ in 0..10 {
         let v = db.read_version(Consistency::Strong).await.expect("read");
-        v.get(&key).await.expect("get");
+        v.get(&key, v.read_time()).await.expect("get");
     }
     out.push(r.stop("strong_read_validated", "read", 10.0, true));
 
     let r = Recorder::start(&w.store, &id);
     for _ in 0..10 {
         let v = db.read_version(Consistency::Snapshot { max_staleness_ms: 5_000 }).await.expect("read");
-        v.get(&key).await.expect("get");
+        v.get(&key, v.read_time()).await.expect("get");
     }
     out.push(r.stop("snapshot_read", "read", 10.0, true));
 
@@ -622,8 +630,8 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     let db = w.node(other).engine.db(&id);
     let r = Recorder::start(&w.store, &id);
     let v = db.read_version(Consistency::Strong).await.expect("open after restart");
-    assert!(v.get(&key).await.expect("read").is_some());
-    let all = v.scan(&crate::engine::KeyRange::all(), false, usize::MAX, false).await.expect("scan");
+    assert!(v.get(&key, v.read_time()).await.expect("read").is_some());
+    let all = v.scan(&crate::engine::KeyRange::data(), false, usize::MAX, v.read_time()).await.expect("scan");
     assert_eq!(all.len(), 128);
     out.push(r.stop("restart_open_and_scan", "open", 1.0, true));
     segs

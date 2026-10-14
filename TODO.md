@@ -24,7 +24,8 @@ the design context for several of these.
       open DB handles; compaction and GC activity; forwarded requests; rate
       limit refusals. Cost is a primary goal, so object-store request counts
       matter most. `engine::Activity` already counts range tombstones,
-      segment drops and rewrites, levels objects and quota refusals.
+      segment drops and rewrites, levels objects, quota refusals and
+      expired entries and segments.
 - [ ] **Structured logging and request IDs.** Propagate a request ID
       across forwarded hops, and log in a JSON format.
 - [ ] **Account self-service.** `MetaCmd::SetPassword` exists, but no API
@@ -33,19 +34,8 @@ the design context for several of these.
       console. Optionally add email verification and password reset, which
       need an outbound email dependency.
 
-## Storage engine
-
-- [ ] **Smaller commit rings.** Every manifest carries the ids of the last
-      1024 commits (`recent_commits`), about 20 KB once full: more than the
-      rest of a typical manifest, rewritten by every commit. Shorter ids
-      (64 bits keep collisions negligible at this size), or older entries
-      in immutable objects like the levels objects, would shrink it.
-
 ## Features
 
-- [ ] **TTLs** on keys and rows, expired lazily on read and by compaction.
-- [ ] **Change feeds / watch.** Stream commits after a version. The
-      `version_times` and `changed_since` machinery is a starting point.
 - [ ] **Point-in-time restore and backups.** Keep old manifests and delay
       GC of segments they reference. Add DB snapshot/clone (copy-on-write
       at the manifest level is cheap) and export/import.
@@ -53,8 +43,11 @@ the design context for several of these.
 - [ ] **Organizations / teams.** Multiple users per DB with roles (SPEC §16).
 - [ ] **Richer queries.** OR/IN filters, ordering by non-index columns with limits,
       projections, and aggregates (count, sum) evaluated server-side.
-- [ ] **Batch row operations.** Allow multi-row update and delete by query within
-      one transaction, bounded by the transaction size limit.
+- [ ] **Longer change feed retention.** Feed cursors stay valid for a transaction
+      lifetime (5 minutes), the time tombstones are kept. A per-database
+      retention would let consumers resume after longer outages, at the cost
+      of tombstones kept longer. Streaming responses (SSE) would save the
+      long poll's request per batch.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`. Publish the Rust `client` module as its own crate.
 - [ ] **Console improvements.** Blob upload and download, table schema

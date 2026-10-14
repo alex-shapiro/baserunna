@@ -31,15 +31,35 @@ pub(crate) fn engine(seed: u64, cfg: EngineConfig) -> (Arc<Engine>, Arc<MemStore
 
 #[derive(Clone, Debug)]
 enum Op {
-    Put(Vec<u8>, Vec<u8>),
+    /// A put, with a time to live.
+    Put(Vec<u8>, Vec<u8>, Option<u64>),
     Delete(Vec<u8>),
     DeleteRange(Vec<u8>, Vec<u8>),
-    Bulk(u8, u8),
+    Bulk(u8, u8, Option<u64>),
     Commit,
     Snapshot,
     Settle,
     Advance(u64),
     Sweep,
+    /// Replay the change feed from a past version onto that version's state.
+    Feed(usize, usize),
+}
+
+/// A key outside the commit record keyspace.
+fn data_key(r: &mut Rng, max_len: usize) -> Vec<u8> {
+    let mut k = prop::small_key(r, max_len);
+    if k[0] == types::COMMIT_SPACE {
+        k[0] -= 1;
+    }
+    k
+}
+
+fn gen_ttl(r: &mut Rng) -> Option<u64> {
+    match r.below(10) {
+        0..=6 => None,
+        7 | 8 => Some(r.range(1, 5_000)),
+        _ => Some(r.range(100_000, 3_000_000)),
+    }
 }
 
 fn gen_ops(r: &mut Rng) -> Vec<Op> {
@@ -48,19 +68,20 @@ fn gen_ops(r: &mut Rng) -> Vec<Op> {
         .map(|_| match r.below(100) {
             0..=44 => {
                 let len = if r.chance(0.1) { 600 + r.usize(2000) } else { r.usize(60) };
-                Op::Put(prop::small_key(r, 4), r.bytes(len))
+                Op::Put(data_key(r, 4), r.bytes(len), gen_ttl(r))
             }
-            45..=59 => Op::Delete(prop::small_key(r, 4)),
-            60..=63 => {
+            45..=56 => Op::Delete(data_key(r, 4)),
+            57..=60 => {
                 let a = prop::small_key(r, 3);
                 let b = prop::small_key(r, 3);
                 if a <= b { Op::DeleteRange(a, b) } else { Op::DeleteRange(b, a) }
             }
-            64..=67 => Op::Bulk(b'a' + r.below(4) as u8, 5 + r.below(40) as u8),
-            68..=69 => Op::Snapshot,
-            70..=89 => Op::Commit,
-            90..=94 => Op::Settle,
-            95..=97 => Op::Advance(r.range(1, 3_000_000)),
+            61..=65 => Op::Bulk(b'a' + r.below(4) as u8, 5 + r.below(40) as u8, gen_ttl(r)),
+            66..=67 => Op::Snapshot,
+            68..=85 => Op::Commit,
+            86..=89 => Op::Settle,
+            90..=93 => Op::Advance(if r.chance(0.5) { r.range(1, 6_000) } else { r.range(1, 3_000_000) }),
+            94..=96 => Op::Feed(r.usize(1000), 1 + r.usize(20)),
             _ => Op::Sweep,
         })
         .collect()
@@ -74,19 +95,28 @@ async fn value_bytes(db: &Db, v: &Value) -> Vec<u8> {
     }
 }
 
-async fn check_against_model(db: &Arc<Db>, model: &BTreeMap<Vec<u8>, Vec<u8>>, r: &mut Rng) -> Result<(), String> {
-    let v = db.read_version(Consistency::Strong).await.map_err(|e| e.to_string())?;
-    let all = v.scan(&KeyRange::all(), false, usize::MAX, false).await.map_err(|e| e.to_string())?;
+/// Stored values and when they expire.
+type Model = BTreeMap<Vec<u8>, (Vec<u8>, Option<u64>)>;
+
+/// The values of `m` that have not expired at `at`.
+fn live(m: &Model, at: u64) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    m.iter().filter(|(_, (_, e))| e.is_none_or(|e| e > at)).map(|(k, (v, _))| (k.clone(), v.clone())).collect()
+}
+
+async fn check_against_model(db: &Arc<Db>, model: &Model, r: &mut Rng) -> Result<(), String> {
+    let snap = db.snapshot(Consistency::Strong).await.map_err(|e| e.to_string())?;
+    let model = live(model, snap.time_ms);
+    let all = snap.scan(&KeyRange::data(), false, usize::MAX).await.map_err(|e| e.to_string())?;
     let mut got = BTreeMap::new();
     for e in &all {
         got.insert(e.key.to_vec(), value_bytes(db, &e.value).await);
     }
-    if &got != model {
-        return Err(format!("full scan mismatch: got {} keys, want {}", got.len(), model.len()));
+    if got != model {
+        return Err(format!("full scan mismatch at {}: got {} keys, want {}", snap.time_ms, got.len(), model.len()));
     }
     for _ in 0..10 {
-        let k = prop::small_key(r, 4);
-        let g = v.get(&k).await.map_err(|e| e.to_string())?;
+        let k = data_key(r, 4);
+        let g = snap.get(&k).await.map_err(|e| e.to_string())?;
         let gv = match g {
             Some(e) => Some(value_bytes(db, &e.value).await),
             None => None,
@@ -94,12 +124,12 @@ async fn check_against_model(db: &Arc<Db>, model: &BTreeMap<Vec<u8>, Vec<u8>>, r
         if gv.as_ref() != model.get(&k) {
             return Err(format!("point get mismatch for {k:?}"));
         }
-        let a = prop::small_key(r, 3);
+        let a = data_key(r, 3);
         let reverse = r.chance(0.5);
         let limit = 1 + r.usize(8);
-        let range = KeyRange::half_open(Bytes::from(a.clone()), None);
-        let got: Vec<Vec<u8>> = v
-            .scan(&range, reverse, limit, false)
+        let range = KeyRange::half_open(Bytes::from(a.clone()), Some(types::commit_key(0).slice(..1)));
+        let got: Vec<Vec<u8>> = snap
+            .scan(&range, reverse, limit)
             .await
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -117,34 +147,81 @@ async fn check_against_model(db: &Arc<Db>, model: &BTreeMap<Vec<u8>, Vec<u8>>, r
     Ok(())
 }
 
+/// The change feed after `version`, read `limit` changes at a time and
+/// applied to the state at `version`, must give the current state; or the
+/// cursor is behind the purge horizon.
+async fn check_feed(db: &Arc<Db>, version: Seq, then: &Model, now: &Model, limit: usize) -> Result<(), String> {
+    let snap = db.snapshot(Consistency::Strong).await.map_err(|e| e.to_string())?;
+    let v = &snap.version;
+    let mut mirror = then.clone();
+    let mut cursor = ChangePos::after_version(version);
+    loop {
+        let page = match v.changes(&KeyRange::data(), &cursor, limit).await {
+            Err(Error::CursorExpired(_)) if version < v.m.tombstone_horizon => return Ok(()),
+            Err(e) => return Err(format!("feed after v{version} (horizon {}): {e}", v.m.tombstone_horizon)),
+            Ok(p) => p,
+        };
+        if page.changes.len() > limit || (page.more && page.changes.len() < limit) {
+            return Err("feed page size".into());
+        }
+        for c in &page.changes {
+            if c.pos() <= cursor || c.seq() <= version || c.seq() > v.m.version {
+                return Err(format!("feed out of order: {c:?} after {cursor:?}"));
+            }
+            cursor = c.pos();
+            match c {
+                Change::Entry(e) if e.value.is_tombstone() => {
+                    mirror.remove(e.key.as_ref());
+                }
+                Change::Entry(e) => {
+                    mirror.insert(e.key.to_vec(), (value_bytes(db, &e.value).await, e.expires));
+                }
+                Change::DeleteRange(t) => mirror.retain(|k, _| !t.contains_key(k)),
+            }
+        }
+        if !page.more {
+            break;
+        }
+    }
+    if live(&mirror, snap.time_ms) != live(now, snap.time_ms) {
+        return Err(format!("feed after v{version} does not lead to v{}", v.m.version));
+    }
+    Ok(())
+}
+
 async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
     // Half the seeds keep the deeper levels in levels objects.
     let levels_inline_max = if seed.is_multiple_of(2) { 0 } else { 16 };
     let (eng, store, env) = engine(seed, EngineConfig { levels_inline_max, ..EngineConfig::small_for_tests() });
     let db = eng.db("t1");
     db.open(true).await.map_err(|e| e.to_string())?;
-    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-    let mut pending: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-    let mut pending_ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    eng.shared.store_time_ms().await.map_err(|e| e.to_string())?;
+    let mut model = Model::new();
+    // Values with their times to live, which count from the commit's time.
+    type Pending = BTreeMap<Vec<u8>, Option<(Vec<u8>, Option<u64>)>>;
+    let mut pending = Pending::new();
+    let mut pending_ranges: Vec<KeyRange> = Vec::new();
     let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await.map_err(|e| e.to_string())?;
     let mut rng = Rng::new(seed ^ 0xabc);
-    type Snapshot = (Instant, Arc<Version>, BTreeMap<Vec<u8>, Vec<u8>>);
-    let mut snapshots: Vec<Snapshot> = Vec::new();
+    type Remembered = (Instant, Snapshot, Model);
+    let mut snapshots: Vec<Remembered> = Vec::new();
+    // The state after each commit, by version.
+    let mut history: Vec<(Seq, Model)> = vec![(0, Model::new())];
     for op in ops {
         match op {
-            Op::Bulk(p, n) => {
+            Op::Bulk(p, n, ttl) => {
                 for i in 0..*n {
                     let (k, v) = (vec![*p, i], vec![i; 100]);
-                    txn.put(Bytes::from(k.clone()), Value::Inline(Bytes::from(v.clone())))
+                    txn.put_expiring(Bytes::from(k.clone()), Value::Inline(Bytes::from(v.clone())), ttl.map(Ttl::For))
                         .map_err(|e| e.to_string())?;
-                    pending.insert(k, Some(v));
+                    pending.insert(k, Some((v, *ttl)));
                 }
             }
             Op::Snapshot => {
-                let v = db.read_version(Consistency::Strong).await.map_err(|e| e.to_string())?;
-                snapshots.push((Instant::now(), v, model.clone()));
+                let s = db.snapshot(Consistency::Strong).await.map_err(|e| e.to_string())?;
+                snapshots.push((Instant::now(), s, model.clone()));
             }
-            Op::Put(k, v) => {
+            Op::Put(k, v, ttl) => {
                 let value = if v.len() > eng.shared.cfg.value_inline_max {
                     Value::Blob(
                         blob::write_blob(&eng.shared, "t1", v, "application/octet-stream")
@@ -154,41 +231,46 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
                 } else {
                     Value::Inline(Bytes::from(v.clone()))
                 };
-                txn.put(Bytes::from(k.clone()), value).map_err(|e| e.to_string())?;
-                pending.insert(k.clone(), Some(v.clone()));
+                txn.put_expiring(Bytes::from(k.clone()), value, ttl.map(Ttl::For)).map_err(|e| e.to_string())?;
+                pending.insert(k.clone(), Some((v.clone(), *ttl)));
             }
             Op::Delete(k) => {
                 txn.delete(Bytes::from(k.clone())).map_err(|e| e.to_string())?;
                 pending.insert(k.clone(), None);
             }
             Op::DeleteRange(a, b) => {
-                txn.delete_range(KeyRange::half_open(Bytes::from(a.clone()), Some(Bytes::from(b.clone()))))
-                    .map_err(|e| e.to_string())?;
-                pending.retain(|k, _| !(k >= a && k < b));
-                pending_ranges.push((a.clone(), b.clone()));
+                let r = KeyRange::half_open(Bytes::from(a.clone()), Some(Bytes::from(b.clone())));
+                txn.delete_range(r.clone()).map_err(|e| e.to_string())?;
+                pending.retain(|k, _| !r.contains(k));
+                pending_ranges.push(r);
             }
             Op::Commit => {
                 let t = std::mem::replace(
                     &mut txn,
                     db.begin(Isolation::Serializable, Consistency::Strong).await.map_err(|e| e.to_string())?,
                 );
-                match db.commit(t.into_request()).await {
-                    Ok(_) => {}
+                let committed = match db.commit_detailed(t.into_request()).await {
+                    Ok(c) => Some(c),
                     // Staged blobs older than the stage TTL are rejected.
                     Err(e) if e.message().contains("staged blob expired") => {
                         pending.clear();
                         pending_ranges.clear();
+                        None
                     }
                     Err(e) => return Err(e.to_string()),
+                };
+                for r in pending_ranges.drain(..) {
+                    model.retain(|k, _| !r.contains(k));
                 }
-                for (a, b) in pending_ranges.drain(..) {
-                    model.retain(|k, _| !(k >= &a && k < &b));
-                }
+                let time = committed.map_or(0, |c| c.time_ms);
                 for (k, v) in std::mem::take(&mut pending) {
                     match v {
-                        Some(v) => model.insert(k, v),
+                        Some((v, ttl)) => model.insert(k, (v, ttl.map(|t| time + t))),
                         None => model.remove(&k),
                     };
+                }
+                if let Some(c) = committed.filter(|c| c.version > history.last().map_or(0, |h| h.0)) {
+                    history.push((c.version, model.clone()));
                 }
                 // The new txn began before this commit was applied; restart it.
                 txn = db.begin(Isolation::Serializable, Consistency::Strong).await.map_err(|e| e.to_string())?;
@@ -199,26 +281,35 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
                 check_against_model(&db, &model, &mut rng).await?;
                 let life = Duration::from_millis(eng.shared.cfg.txn_max_lifetime_ms);
                 snapshots.retain(|(t, _, _)| t.elapsed() < life);
-                for (_, v, m) in &snapshots {
-                    let all = v.all_entries(false).await.map_err(|e| format!("old snapshot: {e}"))?;
+                for (_, s, m) in &snapshots {
+                    let all =
+                        s.scan(&KeyRange::data(), false, usize::MAX).await.map_err(|e| format!("old snapshot: {e}"))?;
                     let mut got = BTreeMap::new();
                     for e in &all {
                         got.insert(e.key.to_vec(), value_bytes(&db, &e.value).await);
                     }
-                    if &got != m {
-                        return Err(format!("snapshot v{} changed: {} keys, want {}", v.m.version, got.len(), m.len()));
+                    if got != live(m, s.time_ms) {
+                        return Err(format!("snapshot v{} changed: {} keys, want {}", s.version(), got.len(), m.len()));
                     }
                 }
             }
             Op::Advance(ms) => {
                 tokio::time::sleep(Duration::from_millis(*ms)).await;
                 db.maintenance_now().await.map_err(|e| e.to_string())?;
+                // The open transaction reads at a time now long past.
+                txn = db.begin(Isolation::Serializable, Consistency::Strong).await.map_err(|e| e.to_string())?;
+                pending.clear();
+                pending_ranges.clear();
             }
             Op::Sweep => {
                 db.sweep_now().await.map_err(|e| e.to_string())?;
                 // let the GC delete task run
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 check_against_model(&db, &model, &mut rng).await?;
+            }
+            Op::Feed(i, limit) => {
+                let (version, then) = &history[i % history.len()];
+                check_feed(&db, *version, then, &model, *limit).await?;
             }
         }
     }
@@ -324,7 +415,7 @@ fn serializable_conflicts_and_snapshots() {
         let mut w = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         w.put(k.clone(), Value::Inline(Bytes::from_static(b"new"))).unwrap();
         db.commit(w.into_request()).await.unwrap();
-        let e = old.snapshot.get(b"k").await.unwrap().unwrap();
+        let e = old.snapshot.get(b"k", old.read_time).await.unwrap().unwrap();
         assert_eq!(e.value, Value::Inline(Bytes::from_static(b"a")));
 
         // Idempotent replays return the original version.
@@ -368,7 +459,7 @@ fn group_commit_batches_concurrent_commits() {
         assert!(writes < 20, "expected batching, got {writes} manifest writes");
         assert_eq!(objects(), before);
         let v = db.read_version(Consistency::Strong).await.unwrap();
-        assert_eq!(v.scan(&KeyRange::all(), false, 100, false).await.unwrap().len(), 20);
+        assert_eq!(v.scan(&KeyRange::data(), false, 100, v.read_time()).await.unwrap().len(), 20);
     });
 }
 
@@ -791,13 +882,23 @@ fn collection_ignores_node_clock_skew() {
             put_many(&db, &format!("r{i}"), 5, 500).await;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let obsolete: Vec<String> = db.current().unwrap().m.obsolete.iter().map(|o| o.id.clone()).collect();
+        let obsolete: Vec<String> = db
+            .current()
+            .unwrap()
+            .m
+            .obsolete
+            .iter()
+            .map(|o| match o.kind {
+                manifest::ObjKind::Levels => levels_key("d", &o.id),
+                _ => seg_key("d", &o.id),
+            })
+            .collect();
         assert!(!obsolete.is_empty(), "setup: compaction obsoleted nothing");
         tokio::time::sleep(Duration::from_millis(cfg.gc_grace_ms / 2)).await;
         db.maintenance_now().await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
-        for id in &obsolete {
-            assert!(mem.keys().contains(&seg_key("d", id)), "segment {id} deleted within gc_grace");
+        for key in &obsolete {
+            assert!(mem.keys().contains(key), "{key} deleted within gc_grace");
         }
     });
 }
@@ -939,9 +1040,9 @@ fn scans_see_through_own_deletes() {
         for i in (0..60).chain(65..99) {
             t.delete(Bytes::from(format!("k{i:03}"))).unwrap();
         }
-        assert_eq!(keys(t.scan(&KeyRange::all(), false, 4).await.unwrap()), names(60..64));
+        assert_eq!(keys(t.scan(&KeyRange::data(), false, 4).await.unwrap()), names(60..64));
         let want_rev: Vec<String> = ["k099", "k064", "k063", "k062"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(keys(t.scan(&KeyRange::all(), true, 4).await.unwrap()), want_rev);
+        assert_eq!(keys(t.scan(&KeyRange::data(), true, 4).await.unwrap()), want_rev);
         let inclusive = KeyRange::new(
             std::ops::Bound::Included(Bytes::from_static(b"k000")),
             std::ops::Bound::Included(Bytes::from_static(b"k099")),
@@ -952,11 +1053,11 @@ fn scans_see_through_own_deletes() {
         t.delete_range(KeyRange::half_open(Bytes::from_static(b"k005"), Some(Bytes::from_static(b"k095")))).unwrap();
         let mut fwd = names(0..5);
         fwd.extend(names(95..98));
-        assert_eq!(keys(t.scan(&KeyRange::all(), false, 8).await.unwrap()), fwd);
+        assert_eq!(keys(t.scan(&KeyRange::data(), false, 8).await.unwrap()), fwd);
         let mut back = names(2..5);
         back.extend(names(95..100));
         back.reverse();
-        assert_eq!(keys(t.scan(&KeyRange::all(), true, 8).await.unwrap()), back);
+        assert_eq!(keys(t.scan(&KeyRange::data(), true, 8).await.unwrap()), back);
     });
 }
 
@@ -1101,7 +1202,7 @@ pub(super) async fn put_many(db: &Arc<Db>, prefix: &str, n: usize, len: usize) -
 }
 
 pub(super) async fn strong_get(db: &Arc<Db>, k: &str) -> Option<Value> {
-    db.read_version(Consistency::Strong).await.unwrap().get(k.as_bytes()).await.unwrap().map(|e| e.value)
+    db.snapshot(Consistency::Strong).await.unwrap().get(k.as_bytes()).await.unwrap().map(|e| e.value)
 }
 
 /// Another node's lease blocks commits until it would expire from this
@@ -1274,33 +1375,75 @@ fn deleting_a_database_is_idempotent() {
     });
 }
 
-/// The commit ring keeps the newest `commit_ring_max` commit ids, however
-/// many commits one manifest write carries.
+/// Every commit leaves a record of its id: committing the same id again,
+/// in a later batch or in the same one, reports the first commit instead
+/// of applying it twice. Records live for `commit_retention_ms`, through
+/// flushes and compactions, and are then dropped without a trace.
 #[test]
-fn commit_ring_keeps_the_newest_ids() {
+fn commit_records_make_commits_idempotent_until_they_expire() {
     rt().block_on(async {
-        let (eng, _store) =
-            delayed_engine_with("a", EngineConfig { commit_ring_max: 4, ..EngineConfig::small_for_tests() });
+        let cfg = EngineConfig { commit_retention_ms: 60_000, ..EngineConfig::small_for_tests() };
+        let (eng, _store) = delayed_engine_with("a", cfg);
         let db = opened(&eng, "d").await;
-        let mut reqs = Vec::new();
-        for i in 0..10 {
-            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-            t.put(Bytes::from(format!("k{i}")), inline("v")).unwrap();
-            reqs.push(t.into_request());
+        let request = |i: u64, id: u64| {
+            let db = db.clone();
+            async move {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                t.put(Bytes::from(format!("k{i}")), inline("v")).unwrap();
+                let mut r = t.into_request();
+                r.commit_id = id;
+                r
+            }
+        };
+        // The same id twice in one batch: the second is a replay.
+        let (a, b) = (request(1, 7).await, request(2, 7).await);
+        let (ra, rb) = tokio::join!(db.commit_detailed(a), db.commit_detailed(b));
+        let (ra, rb) = (ra.unwrap(), rb.unwrap());
+        assert!(!ra.replayed && rb.replayed && rb.version == ra.version, "{ra:?} {rb:?}");
+        assert!(strong_get(&db, "k2").await.is_none(), "a replay applies nothing");
+        // Many commits later, with the tail flushed and compacted.
+        let mut ids = Vec::new();
+        for i in 0..60u64 {
+            let id = 1000 + i;
+            ids.push((id, db.commit(request(10 + i, id).await).await.unwrap()));
+            put_many(&db, &format!("f{i}/"), 1, 300).await;
         }
-        let handles: Vec<_> = reqs
-            .into_iter()
-            .map(|r| {
-                let db = db.clone();
-                tokio::spawn(async move { (r.commit_id, db.commit(r).await.unwrap()) })
-            })
-            .collect();
-        let mut done = Vec::new();
-        for h in handles {
-            done.push(h.await.unwrap());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let v = db.read_version(Consistency::Strong).await.unwrap();
+        assert!(v.m.segments.len() > 1 && v.m.segments.iter().any(|s| s.level > 0), "flushed and compacted");
+        let again = db.commit_detailed(request(99, 7).await).await.unwrap();
+        assert_eq!((again.version, again.replayed), (ra.version, true), "an old commit is still known");
+        for (id, version) in &ids {
+            assert_eq!(db.commit_status(*id).await.unwrap(), Some(*version));
         }
-        done.sort_by_key(|(_, v)| *v);
-        assert_eq!(db.current().unwrap().m.recent_commits, done[done.len() - 4..]);
+        assert_eq!(db.commit_status(424242).await.unwrap(), None);
+        // Records go once a version sampled after them is a retention old:
+        // committing an old id then applies it.
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_millis(61_000)).await;
+            for i in 0..20 {
+                put_many(&db, &format!("g{i}/"), 1, 300).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(db.commit_status(1000).await.unwrap(), None, "expired records are gone");
+        let fresh = db.commit_detailed(request(98, 7).await).await.unwrap();
+        assert!(!fresh.replayed && fresh.version > again.version);
+        let a = eng.shared.counters.get();
+        assert!(a.expired_entries >= 60, "{a:?}");
+        let v = db.read_version(Consistency::Strong).await.unwrap();
+        let records = v
+            .iter(
+                &KeyRange::new(std::ops::Bound::Included(types::commit_key(0)), std::ops::Bound::Unbounded),
+                false,
+                true,
+                None,
+            )
+            .next()
+            .await
+            .unwrap();
+        assert!(records.is_some_and(|e| !e.value.is_tombstone() && e.expires.is_none()), "no tombstones of records");
+        assert!(v.all_entries(true).await.unwrap().iter().all(|e| !types::is_commit_key(&e.key)), "data excludes them");
     });
 }
 
@@ -1413,7 +1556,7 @@ fn stats_describe_the_current_version() {
         let db = opened(&eng, "d").await;
         let v = put(&db, "k", "v").await;
         let s = db.stats().unwrap();
-        assert_eq!((s.version, s.segments, s.tail_entries), (v, 0, 1));
+        assert_eq!((s.version, s.segments, s.tail_entries), (v, 0, 2), "the value and its commit record");
         assert_eq!(s.lease_holder.as_deref(), Some("a"));
         assert_eq!(s.lease_expires_ms, Some(eng.shared.env.now_ms() + eng.shared.cfg.lease_ms));
     });
@@ -1471,7 +1614,7 @@ fn validation_sees_flushed_writes_and_not_the_snapshot_itself() {
         assert_eq!(db.commit(stale.into_request()).await.unwrap_err().code(), "conflict");
         db.commit(fine.into_request()).await.expect("data as old as the snapshot conflicted");
         let v = db.read_version(Consistency::Strong).await.unwrap();
-        assert!(v.scan(&KeyRange::all(), false, 0, false).await.unwrap().is_empty());
+        assert!(v.scan(&KeyRange::data(), false, 0, v.read_time()).await.unwrap().is_empty());
     });
 }
 
@@ -1510,12 +1653,12 @@ fn stored_segment(store: &MemStore, id: char, level: u8, entries: &[Entry]) -> m
 fn merges_purge_only_tombstones_nothing_needs() {
     rt().block_on(async {
         let (eng, store, _env) = engine(1, EngineConfig::small_for_tests());
-        let e = |k: &str, seq, value| Entry { key: Bytes::from(k.to_string()), seq, value };
+        let e = |k: &str, seq, value| Entry::new(Bytes::from(k.to_string()), seq, value);
         let v = || inline("v");
         let t = Value::Tombstone;
         let newer = stored_segment(&store, 'a', 5, &[e("a", 5, t.clone()), e("b", 9, t.clone()), e("d", 4, t.clone())]);
         let older = stored_segment(&store, 'b', 6, &[e("a", 1, v()), e("b", 2, v()), e("c", 3, v())]);
-        let mut m = manifest::Manifest::new("d", 0);
+        let mut m = manifest::Manifest::new("d", 0, None);
         m.segments = vec![newer.clone(), older.clone()];
         let read = |segs: &[manifest::SegmentMeta]| {
             assert_eq!(segs.len(), 1);
@@ -1597,19 +1740,15 @@ fn long_scans_read_ahead() {
         let cfg = eng.shared.cfg.clone();
         let mut r = Rng::new(3);
         let entries: Vec<Entry> = (0..400u64)
-            .map(|i| Entry {
-                key: Bytes::from(format!("k{i:05}")),
-                seq: 1,
-                value: Value::Inline(Bytes::from(r.bytes(100))),
-            })
+            .map(|i| Entry::new(Bytes::from(format!("k{i:05}")), 1, Value::Inline(Bytes::from(r.bytes(100)))))
             .collect();
         let seg = stored_segment(&store.mem, 'a', 6, &entries);
         assert!(seg.size > 8 * cfg.bulk_read_bytes, "setup: a {}-byte segment", seg.size);
-        let mut m = manifest::Manifest::new("d", 0);
+        let mut m = manifest::Manifest::new("d", 0, None);
         m.segments = vec![seg.clone()];
         let v = Version::new(m, String::new(), eng.shared.clone());
         let gets = || store.seg_get_bytes.lock().unwrap().len();
-        v.scan(&KeyRange::all(), false, 3, false).await.unwrap();
+        v.scan(&KeyRange::data(), false, 3, v.read_time()).await.unwrap();
         let short = gets();
         assert!(short <= 3, "a short scan made {short} requests (index and one block)");
         let largest_block = eng.shared.seg_index("d", &seg).await.unwrap().blocks.iter().map(|b| b.2).max().unwrap();
@@ -1618,16 +1757,16 @@ fn long_scans_read_ahead() {
         // Reverse scans read block by block, cold or not.
         let cold = second_node(&eng, &store, "b");
         let v2 = Version::new(v.m.clone(), String::new(), cold.shared.clone());
-        let back: Vec<Entry> = v2.scan(&KeyRange::all(), true, usize::MAX, false).await.unwrap();
+        let back: Vec<Entry> = v2.scan(&KeyRange::data(), true, usize::MAX, v2.read_time()).await.unwrap();
         assert!(back.iter().rev().eq(entries.iter()), "a cold reverse scan");
         let before = gets();
-        assert_eq!(v.scan(&KeyRange::all(), false, usize::MAX, false).await.unwrap().len(), 400);
+        assert_eq!(v.scan(&KeyRange::data(), false, usize::MAX, v.read_time()).await.unwrap().len(), 400);
         let blocks = eng.shared.seg_index("d", &seg).await.unwrap().blocks.len();
         let full = gets() - before;
         // Reads of `bulk_read_bytes` hold three of these blocks.
         assert!(full <= 2 + blocks.div_ceil(3), "{full} requests for {blocks} blocks");
         let before = gets();
-        v.scan(&KeyRange::all(), false, usize::MAX, false).await.unwrap();
+        v.scan(&KeyRange::data(), false, usize::MAX, v.read_time()).await.unwrap();
         assert_eq!(gets(), before, "blocks read ahead were cached");
     });
 }
@@ -1710,14 +1849,14 @@ fn restarted_nodes_read_what_they_wrote_locally() {
 fn bulk_reads_take_whole_blocks() {
     let mut r = Rng::new(9);
     let entries: Vec<Entry> = (0..100u64)
-        .map(|i| Entry { key: Bytes::from(format!("k{i:04}")), seq: 1, value: Value::Inline(Bytes::from(r.bytes(80))) })
+        .map(|i| Entry::new(Bytes::from(format!("k{i:04}")), 1, Value::Inline(Bytes::from(r.bytes(80)))))
         .collect();
     for window in [1, 1_600] {
         rt().block_on(async {
             let cfg = EngineConfig { bulk_read_bytes: window, ..EngineConfig::small_for_tests() };
             let (eng, store) = delayed_engine_with("a", cfg);
             let seg = stored_segment(&store.mem, 'a', 6, &entries);
-            let mut m = manifest::Manifest::new("d", 0);
+            let mut m = manifest::Manifest::new("d", 0, None);
             m.segments = vec![seg];
             let v = Version::new(m, String::new(), eng.shared.clone());
             let idx = eng.shared.seg_index("d", &v.m.segments[0]).await.unwrap();
@@ -1758,8 +1897,10 @@ fn lookups_consult_one_segment_per_level() {
         min_seq: 0,
         max_seq: 0,
         deletes_applied: 0,
+        expiring: 0,
+        expires_max: 0,
     };
-    let mut m = manifest::Manifest::new("d", 0);
+    let mut m = manifest::Manifest::new("d", 0, None);
     m.segments = vec![
         seg('a', 0, "a", "z"),
         seg('b', 0, "m", "p"),
@@ -1780,9 +1921,9 @@ fn lookups_consult_one_segment_per_level() {
 fn changes_are_entries_newer_than_the_snapshot() {
     rt().block_on(async {
         let (eng, store, _env) = engine(1, EngineConfig::small_for_tests());
-        let e = |k: &str, seq| Entry { key: Bytes::from(k.to_string()), seq, value: inline("v") };
+        let e = |k: &str, seq| Entry::new(Bytes::from(k.to_string()), seq, inline("v"));
         let seg = stored_segment(&store, 'a', 6, &[e("a", 3), e("c", 7)]);
-        let mut m = manifest::Manifest::new("d", 0);
+        let mut m = manifest::Manifest::new("d", 0, None);
         m.segments = vec![seg];
         m.tail = vec![e("b", 5)];
         let v = Version::new(m, String::new(), eng.shared.clone());
@@ -1861,11 +2002,11 @@ fn compaction_output_is_split_into_bounded_segments() {
             .map(|i| {
                 let len = r.usize(90);
                 let value = Value::Inline(Bytes::from(r.bytes(len)));
-                Entry { key: Bytes::from(format!("k{i:05}")), seq: i + 1, value }
+                Entry::new(Bytes::from(format!("k{i:05}")), i + 1, value)
             })
             .collect();
         let input = stored_segment(&store, 'a', 0, &entries);
-        let mut m = manifest::Manifest::new("d", 0);
+        let mut m = manifest::Manifest::new("d", 0, None);
         m.segments = vec![input.clone()];
         let plan = compaction::Plan { inputs: vec![input], kind: compaction::Kind::Merge { level: 6 } };
         let out = compaction::run(&eng.shared, &m, &plan, 0).await.unwrap();
@@ -1879,6 +2020,133 @@ fn compaction_output_is_split_into_bounded_segments() {
         assert_eq!(v.all_entries(true).await.unwrap(), entries);
         for e in &entries {
             assert_eq!(v.get_entry(&e.key).await.unwrap().as_ref(), Some(e));
+        }
+    });
+}
+
+async fn put_ttl(db: &Arc<Db>, k: &str, v: &str, ttl_ms: u64) -> Committed {
+    let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+    t.put_expiring(Bytes::from(k.to_string()), inline(v), Some(Ttl::For(ttl_ms))).unwrap();
+    db.commit_detailed(t.into_request()).await.unwrap()
+}
+
+/// A value expires its time to live after the time of the version that
+/// committed it. Until then reads see it; afterwards they do not, and the
+/// value it replaced does not come back.
+#[test]
+fn values_expire_a_ttl_after_their_commit() {
+    rt().block_on(async {
+        let (eng, _store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        eng.shared.store_time_ms().await.unwrap();
+        put(&db, "k", "old").await;
+        let c = put_ttl(&db, "k", "new", 1_000).await;
+        let snap = db.snapshot(Consistency::Strong).await.unwrap();
+        assert!(snap.time_ms >= c.time_ms, "reads never go back before a commit's time");
+        let e = snap.get(b"k").await.unwrap().unwrap();
+        assert_eq!((e.value, e.expires), (inline("new"), Some(c.time_ms + 1_000)));
+        tokio::time::sleep(Duration::from_millis(999)).await;
+        assert!(strong_get(&db, "k").await.is_some());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(strong_get(&db, "k").await, None, "expired, and the older value stays shadowed");
+        assert_eq!(snap.get(b"k").await.unwrap().map(|e| e.value), Some(inline("new")), "a snapshot reads at its time");
+        assert!(db.snapshot(Consistency::Strong).await.unwrap().version.get_entry(b"k").await.unwrap().is_some());
+    });
+}
+
+/// A serializable transaction that read a value fails to commit once that
+/// value expired: its view no longer holds at the commit's time. Snapshot
+/// isolation does not validate reads, and versions never get older than
+/// the read times of the transactions they commit.
+#[test]
+fn reads_of_values_that_expire_before_the_commit_conflict() {
+    rt().block_on(async {
+        let (eng, _store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        eng.shared.store_time_ms().await.unwrap();
+        put_ttl(&db, "lock", "held", 1_000).await;
+        let mut stale = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let mut si = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
+        let mut fresh = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        for t in [&mut stale, &mut si, &mut fresh] {
+            assert!(t.get(b"lock").await.unwrap().is_some());
+        }
+        stale.put(Bytes::from_static(b"w1"), inline("1")).unwrap();
+        si.put(Bytes::from_static(b"w2"), inline("1")).unwrap();
+        fresh.put(Bytes::from_static(b"w3"), inline("1")).unwrap();
+        db.commit(fresh.into_request()).await.expect("still held at the commit");
+        tokio::time::sleep(Duration::from_millis(1_001)).await;
+        let r = db.commit(stale.into_request()).await;
+        assert!(matches!(r, Err(Error::Conflict(_))), "{r:?}");
+        db.commit(si.into_request()).await.expect("snapshot isolation does not validate reads");
+        // A transaction reading at a time ahead of the committer's clock
+        // commits a version no older than that time.
+        let mut ahead = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        ahead.read_time += 60_000;
+        ahead.put(Bytes::from_static(b"w4"), inline("1")).unwrap();
+        let req = ahead.into_request();
+        let read_time = req.read_time;
+        let c = db.commit_detailed(req).await.unwrap();
+        assert!(c.time_ms >= read_time);
+        assert!(db.snapshot(Consistency::Strong).await.unwrap().time_ms >= read_time);
+    });
+}
+
+/// Snapshot reads served from a validated cache read at the time it was
+/// validated: a value that expired since is still there, as it was then.
+#[test]
+fn cached_snapshots_read_at_their_validation_time() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        eng.shared.store_time_ms().await.unwrap();
+        put_ttl(&db, "k", "v", 1_000).await;
+        // Another node reads, validating at about t.
+        let b = second_node(&eng, &store, "b");
+        b.shared.store_time_ms().await.unwrap();
+        let other = opened(&b, "d").await;
+        let validated = other.snapshot(Consistency::Strong).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let stale = Consistency::Snapshot { max_staleness_ms: 5_000 };
+        let s = other.snapshot(stale).await.unwrap();
+        assert_eq!(s.time_ms, validated.time_ms, "the cached version is as of its validation");
+        assert!(s.get(b"k").await.unwrap().is_some());
+        assert!(other.snapshot(Consistency::Strong).await.unwrap().get(b"k").await.unwrap().is_none());
+    });
+}
+
+/// The change feed refuses cursors older than the deletions still kept.
+#[test]
+fn change_feed_cursors_expire_with_purged_deletions() {
+    rt().block_on(async {
+        let (eng, _store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        let cfg = eng.shared.cfg.clone();
+        let first = put(&db, "a", "1").await;
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        t.delete(Bytes::from_static(b"a")).unwrap();
+        let deleted = db.commit(t.into_request()).await.unwrap();
+        let v = db.read_version(Consistency::Strong).await.unwrap();
+        let page = v.changes(&KeyRange::data(), &ChangePos::after_version(first), 10).await.unwrap();
+        assert_eq!(page.changes, vec![Change::Entry(Entry::tombstone(Bytes::from_static(b"a"), deleted))]);
+        // Without segments, the tombstone is purged a transaction lifetime later.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(cfg.txn_max_lifetime_ms.max(cfg.version_sample_ms))).await;
+            put(&db, "b", "x").await;
+        }
+        let v = db.read_version(Consistency::Strong).await.unwrap();
+        assert!(v.m.tombstone_horizon >= deleted, "setup: purged");
+        let r = v.changes(&KeyRange::data(), &ChangePos::after_version(first), 10).await;
+        assert!(matches!(r, Err(Error::CursorExpired(_))), "{r:?}");
+        let fresh = v.changes(&KeyRange::data(), &ChangePos::after_version(v.m.tombstone_horizon), 10).await;
+        assert!(fresh.is_ok(), "{fresh:?}");
+        let mid = ChangePos { seq: v.m.tombstone_horizon, kind: ChangePos::KEY, key: Bytes::from_static(b"a") };
+        assert!(matches!(v.changes(&KeyRange::data(), &mid, 10).await, Err(Error::CursorExpired(_))));
+        for pos in [ChangePos::after_version(7), mid] {
+            assert_eq!(ChangePos::decode(&pos.encode()), Some(pos));
+        }
+        for bad in ["", "x", "1.", "1.2.AA", "1.0.!!", "1.1"] {
+            assert_eq!(ChangePos::decode(bad), None, "{bad}");
         }
     });
 }

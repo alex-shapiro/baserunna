@@ -66,11 +66,14 @@ impl<'a> Choices<'a> {
 // ------------------------------------------------------------------ model
 
 const ANY: &str = "\u{1}any";
+const ANY_NUMBER: &str = "\u{1}number";
 
-/// `want` equals `got`, where the string [`ANY`] matches any string.
+/// `want` equals `got`, where the string [`ANY`] matches any string and
+/// [`ANY_NUMBER`] any number.
 fn matches(want: &Json, got: &Json) -> bool {
     match (want, got) {
         (Json::String(w), Json::String(_)) if w == ANY => true,
+        (Json::String(w), Json::Number(_)) if w == ANY_NUMBER => true,
         (Json::Object(a), Json::Object(b)) => {
             a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).is_some_and(|g| matches(v, g)))
         }
@@ -86,10 +89,31 @@ struct BlobMeta {
     content_type: String,
 }
 
+/// Whether a value expires: not at all, a time to live after the commit
+/// that is to write it, or at a time it was committed with (the run never
+/// lasts until then).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum Expiry {
+    #[default]
+    Never,
+    Pending,
+    At,
+}
+
+impl Expiry {
+    fn committed(self) -> Expiry {
+        match self {
+            Expiry::Pending => Expiry::At,
+            e => e,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct MVal {
     data: Vec<u8>,
     blob: Option<BlobMeta>,
+    expiry: Expiry,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -97,6 +121,7 @@ struct MRow {
     name: Option<String>,
     grp: Option<i64>,
     doc: Option<Json>,
+    expiry: Expiry,
 }
 
 #[derive(Clone, Default)]
@@ -143,6 +168,8 @@ enum Op {
         value: Option<String>,
         #[serde(default)]
         blob_id: Option<String>,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     Delete {
         key: String,
@@ -168,6 +195,8 @@ enum Op {
         key: String,
         #[serde(default = "one")]
         by: i64,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     GetRow {
         table: String,
@@ -176,19 +205,42 @@ enum Op {
     InsertRow {
         table: String,
         row: Json,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     UpsertRow {
         table: String,
         row: Json,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     UpdateRow {
         table: String,
         pk: Json,
         set: Json,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     DeleteRow {
         table: String,
         pk: Json,
+    },
+    UpdateRows {
+        table: String,
+        #[serde(rename = "where")]
+        selection: Selection,
+        set: Json,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    DeleteRows {
+        table: String,
+        #[serde(rename = "where")]
+        selection: Selection,
+        #[serde(default)]
+        limit: Option<usize>,
     },
     QueryRows {
         table: String,
@@ -213,6 +265,33 @@ fn one() -> i64 {
     1
 }
 
+/// The model's own copy of `table::Selection`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Selection {
+    #[serde(default)]
+    index: Option<String>,
+    #[serde(default)]
+    eq: Vec<Json>,
+    #[serde(default)]
+    range: Option<RangeSpec>,
+    #[serde(default)]
+    filter: Option<Filter>,
+}
+
+/// TTLs at least this long never run out within a fuzz run.
+const TTL_BEYOND_RUN_MS: u64 = 1_000_000_000;
+
+/// `ttl_ms` as the service checks it.
+fn ttl(ttl_ms: Option<u64>) -> MResult<Expiry> {
+    match ttl_ms {
+        None => Ok(Expiry::Never),
+        Some(t) if (TTL_BEYOND_RUN_MS..=crate::ops::MAX_TTL_MS).contains(&t) => Ok(Expiry::Pending),
+        Some(t) if (1..=crate::ops::MAX_TTL_MS).contains(&t) => Err(Fail::Unmodeled),
+        Some(_) => Err(Fail::Invalid),
+    }
+}
+
 impl Op {
     fn is_write(&self) -> bool {
         matches!(
@@ -225,6 +304,8 @@ impl Op {
                 | Op::UpsertRow { .. }
                 | Op::UpdateRow { .. }
                 | Op::DeleteRow { .. }
+                | Op::UpdateRows { .. }
+                | Op::DeleteRows { .. }
         )
     }
 }
@@ -275,6 +356,9 @@ enum Fail {
     NotFound,
     Exists,
     Precondition,
+    /// A valid request whose effects the model cannot predict: a value
+    /// that expires within the run, at a time the model does not know.
+    Unmodeled,
 }
 
 impl Fail {
@@ -284,6 +368,7 @@ impl Fail {
             Fail::NotFound => (404, "not_found"),
             Fail::Exists => (409, "already_exists"),
             Fail::Precondition => (412, "precondition_failed"),
+            Fail::Unmodeled => (200, ""),
         }
     }
 }
@@ -713,6 +798,9 @@ impl World {
                 m.insert("found".into(), json!(true));
                 self.value_json(enc, &v, &mut m);
                 m.insert("version".into(), json!(s));
+                if v.expiry == Expiry::At {
+                    m.insert("expires_at".into(), json!(ANY_NUMBER));
+                }
             }
         }
         Json::Object(m)
@@ -721,7 +809,7 @@ impl World {
     fn make_value(&self, data: Vec<u8>) -> MVal {
         let blob = (data.len() > self.inline_max)
             .then(|| BlobMeta { id: None, content_type: "application/octet-stream".into() });
-        MVal { data, blob }
+        MVal { data, blob, expiry: Expiry::Never }
     }
 
     fn scan_items(&self, enc: Encoding, items: &[(Vec<u8>, MVal, Option<u64>)], keys_only: bool) -> Vec<Json> {
@@ -736,6 +824,9 @@ impl World {
                     m.insert("blob".into(), blob_json(v, b));
                 }
                 m.insert("version".into(), json!(s));
+                if v.expiry == Expiry::At {
+                    m.insert("expires_at".into(), json!(ANY_NUMBER));
+                }
                 Json::Object(m)
             })
             .collect()
@@ -767,8 +858,9 @@ impl World {
                 let shown = &items[..items.len().min(limit)];
                 Ok(json!({"items": self.scan_items(enc, shown, *keys_only), "next_cursor": next}).into())
             }
-            Op::Put { key, value, blob_id } => {
+            Op::Put { key, value, blob_id, ttl_ms } => {
                 let k = user_key(decode(enc, key)?)?;
+                let expiry = ttl(*ttl_ms)?;
                 let v = match (value, blob_id) {
                     (Some(v), None) => self.make_value(decode(enc, v)?),
                     (None, Some(id)) => {
@@ -779,11 +871,12 @@ impl World {
                         MVal {
                             data: data.clone(),
                             blob: Some(BlobMeta { id: Some(id.clone()), content_type: ct.clone() }),
+                            expiry: Expiry::Never,
                         }
                     }
                     _ => return Err(Fail::Invalid),
                 };
-                t.put(k, v);
+                t.put(k, MVal { expiry, ..v });
                 Ok(json!({}).into())
             }
             Op::Delete { key } => {
@@ -821,39 +914,49 @@ impl World {
                 }
                 Ok(json!({}).into())
             }
-            Op::Increment { key, by } => {
+            Op::Increment { key, by, ttl_ms } => {
                 let k = user_key(decode(enc, key)?)?;
-                let cur = match t.get(&k) {
-                    None => 0,
-                    Some((v, _)) => std::str::from_utf8(&v.data)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<i64>().ok())
-                        .ok_or(Fail::Invalid)?,
+                let set = ttl(*ttl_ms)?;
+                let (cur, kept) = match t.get(&k) {
+                    None => (0, Expiry::Never),
+                    Some((v, _)) => (
+                        std::str::from_utf8(&v.data)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<i64>().ok())
+                            .ok_or(Fail::Invalid)?,
+                        v.expiry,
+                    ),
                 };
                 let n = cur.checked_add(*by).ok_or(Fail::Invalid)?;
-                t.put(k, MVal { data: n.to_string().into_bytes(), blob: None });
+                let expiry = if set == Expiry::Never { kept } else { set };
+                t.put(k, MVal { data: n.to_string().into_bytes(), blob: None, expiry });
                 Ok(json!({"value": n}).into())
             }
             Op::GetRow { table, pk } => {
                 schema(t, table)?;
                 let pk = parse_pk(pk)?;
                 Ok(match t.row(pk) {
+                    Some(r) if r.expiry == Expiry::At => {
+                        json!({"found": true, "row": row_json(pk, &r), "expires_at": ANY_NUMBER})
+                    }
                     Some(r) => json!({"found": true, "row": row_json(pk, &r)}),
                     None => json!({"found": false}),
                 }
                 .into())
             }
-            Op::InsertRow { table, row } | Op::UpsertRow { table, row } => {
+            Op::InsertRow { table, row, ttl_ms } | Op::UpsertRow { table, row, ttl_ms } => {
+                let expiry = ttl(*ttl_ms)?;
                 schema(t, table)?;
                 let (pk, new) = row_from_json(row, None)?;
                 if matches!(op, Op::InsertRow { .. }) && t.row(pk).is_some() {
                     return Err(Fail::Exists);
                 }
                 check_unique(t, pk, &new)?;
-                t.row_writes.insert(pk, Some(new));
+                t.row_writes.insert(pk, Some(MRow { expiry, ..new }));
                 Ok(json!({}).into())
             }
-            Op::UpdateRow { table, pk, set } => {
+            Op::UpdateRow { table, pk, set, ttl_ms } => {
+                let expiry = ttl(*ttl_ms)?;
                 schema(t, table)?;
                 let pk = parse_pk(pk)?;
                 let Some(old) = t.row(pk) else { return Ok(json!({"found": false}).into()) };
@@ -862,8 +965,37 @@ impl World {
                 }
                 let (_, new) = row_from_json(set, Some((pk, &old)))?;
                 check_unique(t, pk, &new)?;
-                t.row_writes.insert(pk, Some(new));
+                let expiry = if expiry == Expiry::Never { old.expiry } else { expiry };
+                t.row_writes.insert(pk, Some(MRow { expiry, ..new }));
                 Ok(json!({"found": true}).into())
+            }
+            Op::UpdateRows { table, selection, set, ttl_ms, limit } => {
+                let expiry = ttl(*ttl_ms)?;
+                if *limit == Some(0) {
+                    return Err(Fail::Invalid);
+                }
+                schema(t, table)?;
+                check_set(set)?;
+                let pks = self.select(t, selection, *limit)?;
+                for pk in &pks {
+                    let old = t.row(*pk).ok_or(Fail::NotFound)?;
+                    let (_, new) = row_from_json(set, Some((*pk, &old)))?;
+                    check_unique(t, *pk, &new)?;
+                    let expiry = if expiry == Expiry::Never { old.expiry } else { expiry };
+                    t.row_writes.insert(*pk, Some(MRow { expiry, ..new }));
+                }
+                Ok(json!({"count": pks.len()}).into())
+            }
+            Op::DeleteRows { table, selection, limit } => {
+                if *limit == Some(0) {
+                    return Err(Fail::Invalid);
+                }
+                schema(t, table)?;
+                let pks = self.select(t, selection, *limit)?;
+                for pk in &pks {
+                    t.row_writes.insert(*pk, None);
+                }
+                Ok(json!({"count": pks.len()}).into())
             }
             Op::DeleteRow { table, pk } => {
                 schema(t, table)?;
@@ -884,28 +1016,34 @@ impl World {
         }
     }
 
-    fn query(&self, t: &TxnView, q: &QueryArgs) -> MResult<(Vec<Json>, Option<Vec<TKey>>)> {
-        let limit = q.limit.unwrap_or(100);
-        if limit == 0 || limit > 1000 {
-            return Err(Fail::Invalid);
-        }
-        if let Some(f) = q.filter {
+    /// The rows `sel` selects, by their access path's entries, in order
+    /// (after `cursor`, if any): the planning both queries and batch
+    /// operations do.
+    fn plan(
+        &self,
+        t: &TxnView,
+        sel: (&Option<String>, &[Json], &Option<RangeSpec>, &Option<Filter>),
+        cursor: &Option<String>,
+        reverse: bool,
+    ) -> MResult<Vec<(Vec<TKey>, i64)>> {
+        let (index, eq, range, filter) = sel;
+        if let Some(f) = filter {
             validate_filter(f, 0)?;
         }
-        let ct = match q.index.as_deref() {
+        let ct = match index.as_deref() {
             None => Ct::Int,
             Some("by_name") => Ct::Str,
             Some("by_grp") => Ct::Int,
             Some(_) => return Err(Fail::NotFound),
         };
-        if q.eq.len() > 1 {
+        if eq.len() > 1 {
             return Err(Fail::Invalid);
         }
-        let eqk = q.eq.first().map(|v| if v.is_null() { Ok(TKey::Null) } else { key_from_json(ct, v) }).transpose()?;
+        let eqk = eq.first().map(|v| if v.is_null() { Ok(TKey::Null) } else { key_from_json(ct, v) }).transpose()?;
         let mut lo: Option<(TKey, bool)> = None;
         let mut hi: Option<(TKey, bool)> = None;
-        if let Some(r) = q.range {
-            if !q.eq.is_empty() {
+        if let Some(r) = range {
+            if !eq.is_empty() {
                 return Err(Fail::Invalid);
             }
             if r.gt.is_some() && r.gte.is_some() || r.lt.is_some() && r.lte.is_some() {
@@ -938,10 +1076,10 @@ impl World {
                     Ordering::Greater => false,
                 })
         };
-        let cursor = match q.cursor {
+        let cursor = match cursor {
             None => None,
             Some(c) => match self.query_cursors.get(c) {
-                Some((ix, v)) if ix == q.index && in_region(v) => Some(v.clone()),
+                Some((ix, v)) if ix == index && in_region(v) => Some(v.clone()),
                 // Unknown cursors are never inside a query's key range:
                 // the generator only produces strings whose decoded first
                 // byte is not a row or index keyspace byte.
@@ -951,18 +1089,28 @@ impl World {
         let rows = t.rows();
         let mut entries: Vec<(Vec<TKey>, i64)> = rows
             .iter()
-            .map(|(pk, r)| (entry_vec(q.index.as_deref(), *pk, r), *pk))
+            .map(|(pk, r)| (entry_vec(index.as_deref(), *pk, r), *pk))
             .filter(|(v, _)| in_region(v))
             .filter(|(v, _)| match &cursor {
                 None => true,
-                Some(c) if q.reverse => cmp_vec(v, c) == Ordering::Less,
+                Some(c) if reverse => cmp_vec(v, c) == Ordering::Less,
                 Some(c) => cmp_vec(v, c) == Ordering::Greater,
             })
             .collect();
         entries.sort_by(|a, b| cmp_vec(&a.0, &b.0));
-        if q.reverse {
+        if reverse {
             entries.reverse();
         }
+        Ok(entries)
+    }
+
+    fn query(&self, t: &TxnView, q: &QueryArgs) -> MResult<(Vec<Json>, Option<Vec<TKey>>)> {
+        let limit = q.limit.unwrap_or(100);
+        if limit == 0 || limit > 1000 {
+            return Err(Fail::Invalid);
+        }
+        let entries = self.plan(t, (q.index, q.eq, q.range, q.filter), q.cursor, q.reverse)?;
+        let rows = t.rows();
         let page = (limit * 2).clamp(16, 1000);
         let mut out = Vec::new();
         for chunk in entries.chunks(page) {
@@ -981,6 +1129,18 @@ impl World {
             }
         }
         Ok((out, None))
+    }
+
+    /// The primary keys of the rows a batch operation changes.
+    fn select(&self, t: &TxnView, sel: &Selection, limit: Option<usize>) -> MResult<Vec<i64>> {
+        let entries = self.plan(t, (&sel.index, &sel.eq, &sel.range, &sel.filter), &None, false)?;
+        let rows = t.rows();
+        Ok(entries
+            .iter()
+            .filter(|(_, pk)| sel.filter.as_ref().is_none_or(|f| eval_filter(f, *pk, &rows[pk])))
+            .map(|(_, pk)| *pk)
+            .take(limit.unwrap_or(usize::MAX))
+            .collect())
     }
 
     /// Whether committing `t` now conflicts (`None`: not modeled exactly).
@@ -1018,13 +1178,13 @@ impl World {
         for (k, w) in t.writes {
             self.last_write.insert(k.clone(), version);
             match w {
-                Some(v) => self.snap.kv.insert(k, (v, version)),
+                Some(v) => self.snap.kv.insert(k, (MVal { expiry: v.expiry.committed(), ..v }, version)),
                 None => self.snap.kv.remove(&k),
             };
         }
         for (pk, w) in t.row_writes {
             match w {
-                Some(r) => self.snap.rows.insert(pk, r),
+                Some(r) => self.snap.rows.insert(pk, MRow { expiry: r.expiry.committed(), ..r }),
                 None => self.snap.rows.remove(&pk),
             };
         }
@@ -1084,7 +1244,21 @@ fn row_from_json(obj: &Json, base: Option<(i64, &MRow)>) -> MResult<(i64, MRow)>
         Some(_) => None,
         None => base.and_then(|b| b.1.doc.clone()),
     };
-    Ok((id, MRow { name, grp, doc }))
+    Ok((id, MRow { name, grp, doc, expiry: Expiry::Never }))
+}
+
+/// `table::check_set`: an object of non-key columns with values of their
+/// types (every non-key column is nullable).
+fn check_set(set: &Json) -> MResult<()> {
+    let o = set.as_object().ok_or(Fail::Invalid)?;
+    for (k, v) in o {
+        match col_type(k) {
+            None => return Err(Fail::Invalid),
+            Some(_) if k == "id" => return Err(Fail::Invalid),
+            Some(ct) => datum_from_json(ct, v).map(|_| ())?,
+        }
+    }
+    Ok(())
 }
 
 fn check_unique(t: &TxnView, pk: i64, new: &MRow) -> MResult<()> {
@@ -1372,6 +1546,47 @@ impl Gen<'_, '_> {
         }
     }
 
+    /// Maybe a `ttl_ms` for a write: mostly a valid one far longer than any
+    /// run, sometimes out of range.
+    fn ttl(&mut self, o: &mut Json) {
+        if self.u.chance(80) {
+            o["ttl_ms"] = self.u.pick(&[
+                json!(3_600_000_000u64),
+                json!(3_600_000_000u64),
+                json!(0),
+                json!(crate::ops::MAX_TTL_MS + 1),
+            ]);
+        }
+    }
+
+    /// The `where` of a batch row operation, and maybe a `limit`.
+    fn selection(&mut self, o: &mut Json) {
+        let index = self.u.pick(&[None, None, Some("by_name"), Some("by_grp"), Some("nope")]);
+        let mut w = json!({});
+        if let Some(i) = index {
+            w["index"] = json!(i);
+        }
+        let bound = |g: &mut Self| -> Json {
+            match (index, g.u.below(8)) {
+                (_, 0) => Json::Null,
+                (Some("by_name"), _) => json!(g.u.pick(NAMES)),
+                _ => json!(g.u.below(7) as i64),
+            }
+        };
+        match self.u.below(5) {
+            0 => w["eq"] = json!([bound(self)]),
+            1 | 2 => w["range"] = json!({"gte": bound(self)}),
+            _ => {}
+        }
+        if self.u.chance(128) {
+            w["filter"] = self.filter(0);
+        }
+        o["where"] = w;
+        if self.u.chance(64) {
+            o["limit"] = json!(self.u.below(4));
+        }
+    }
+
     fn query(&mut self) -> Json {
         let index = self.u.pick(&[None, None, None, Some("by_name"), Some("by_grp"), Some("by_grp"), Some("nope")]);
         let mut o = json!({"op": "query_rows", "table": self.table()});
@@ -1421,7 +1636,7 @@ impl Gen<'_, '_> {
     }
 
     fn op(&mut self, enc: Encoding) -> Json {
-        let mut o = match self.u.below(17) {
+        let mut o = match self.u.below(19) {
             0 | 1 => json!({"op": "get", "key": self.key(enc)}),
             2 => self.scan(enc),
             3 | 4 => {
@@ -1443,6 +1658,7 @@ impl Gen<'_, '_> {
                     }
                     _ => o["value"] = json!(self.value(enc)),
                 }
+                self.ttl(&mut o);
                 o
             }
             5 => json!({"op": "delete", "key": self.key(enc)}),
@@ -1467,13 +1683,34 @@ impl Gen<'_, '_> {
                     2 => o["by"] = json!(i64::MIN),
                     _ => o["by"] = json!(self.u.below(9) as i64 - 4),
                 }
+                self.ttl(&mut o);
                 o
             }
             9 => json!({"op": "get_row", "table": self.table(), "pk": self.pk()}),
-            10 => json!({"op": "insert_row", "table": self.table(), "row": self.row_fields(true)}),
-            11 => json!({"op": "upsert_row", "table": self.table(), "row": self.row_fields(true)}),
-            12 => json!({"op": "update_row", "table": self.table(), "pk": self.pk(), "set": self.row_fields(false)}),
+            10 | 11 => {
+                let op = if self.u.chance(128) { "insert_row" } else { "upsert_row" };
+                let mut o = json!({"op": op, "table": self.table(), "row": self.row_fields(true)});
+                self.ttl(&mut o);
+                o
+            }
+            12 => {
+                let mut o =
+                    json!({"op": "update_row", "table": self.table(), "pk": self.pk(), "set": self.row_fields(false)});
+                self.ttl(&mut o);
+                o
+            }
             13 => json!({"op": "delete_row", "table": self.table(), "pk": self.pk()}),
+            14 => {
+                let mut o = json!({"op": "update_rows", "table": self.table(), "set": self.row_fields(false)});
+                self.selection(&mut o);
+                self.ttl(&mut o);
+                o
+            }
+            15 => {
+                let mut o = json!({"op": "delete_rows", "table": self.table()});
+                self.selection(&mut o);
+                o
+            }
             _ => self.query(),
         };
         if self.u.chance(6) {
@@ -1502,6 +1739,7 @@ enum Expect {
     Ok(u16, Json),
     Err(Fail, Option<usize>),
     Any4xx,
+    Unchecked,
 }
 
 struct Session<'a> {
@@ -1513,6 +1751,8 @@ struct Session<'a> {
     txns: Vec<OpenTxn>,
     scan_cursors: Vec<String>,
     step: usize,
+    /// A request had effects the model cannot predict: stop checking.
+    lost: bool,
     /// Responses by route kind and status.
     hist: RefCell<BTreeMap<String, u64>>,
 }
@@ -1582,12 +1822,14 @@ impl<'a> Session<'a> {
                     && idx.is_none_or(|i| r.json["error"]["details"]["op_index"] == i)
             }
             Expect::Any4xx => (400..500).contains(&r.status),
+            Expect::Unchecked => r.status < 500,
         };
         if !ok {
             let want = match want {
                 Expect::Ok(st, j) => format!("{st} {j}"),
                 Expect::Err(f, i) => format!("{:?} (op {i:?})", f.status()),
                 Expect::Any4xx => "any 4xx".into(),
+                Expect::Unchecked => "anything but a 5xx".into(),
             };
             return Err(format!(
                 "step {}: {method} {path}\nrequest: {}\nexpected: {}\ngot: {} {}",
@@ -1697,6 +1939,11 @@ impl<'a> Session<'a> {
         for (i, op) in req.ops.iter().enumerate() {
             match self.w.exec(&mut t, req.encoding, op) {
                 Ok(o) => outs.push(o),
+                Err(Fail::Unmodeled) => {
+                    self.lost = true;
+                    self.expect("POST", &path, bytes, &Expect::Unchecked).await?;
+                    return Ok(());
+                }
                 Err(f) => {
                     let idx = (f == Fail::Precondition).then_some(i);
                     self.expect("POST", &path, bytes, &Expect::Err(f, idx)).await?;
@@ -1795,6 +2042,11 @@ impl<'a> Session<'a> {
         for (i, op) in req.ops.iter().enumerate() {
             match self.w.exec(&mut t, enc, op) {
                 Ok(o) => outs.push(o),
+                Err(Fail::Unmodeled) => {
+                    self.lost = true;
+                    self.expect("POST", &path, bytes, &Expect::Unchecked).await?;
+                    return Ok(());
+                }
                 Err(f) => {
                     self.txns[ti].alive = false;
                     let idx = (f == Fail::Precondition).then_some(i);
@@ -1952,7 +2204,7 @@ impl<'a> Session<'a> {
 
     async fn run(&mut self) -> Result<(), String> {
         self.setup().await?;
-        while !self.u.exhausted() && self.step < 48 {
+        while !self.u.exhausted() && self.step < 48 && !self.lost {
             self.step += 1;
             let alive = self.txns.iter().filter(|t| t.alive).count();
             match self.u.below(20) {
@@ -1966,7 +2218,9 @@ impl<'a> Session<'a> {
                 _ => self.full_check().await?,
             }
         }
-        self.full_check().await?;
+        if !self.lost {
+            self.full_check().await?;
+        }
         let r = self.call("DELETE", &self.path(""), &[], Vec::new()).await?;
         if r.status != 200 {
             return Err(format!("delete database: {} {}", r.status, r.json));
@@ -2029,6 +2283,7 @@ impl Harness {
             txns: Vec::new(),
             scan_cursors: Vec::new(),
             step: 0,
+            lost: false,
             hist: RefCell::new(BTreeMap::new()),
         };
         let r = self.rt.block_on(s.run());

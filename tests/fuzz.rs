@@ -83,6 +83,10 @@ fn rand_json(r: &mut Rng, depth: u32) -> Value {
                 "and",
                 "or",
                 "not",
+                "ttl_ms",
+                "where",
+                "after",
+                "wait_ms",
             ];
             let mut m = serde_json::Map::new();
             for _ in 0..r.usize(5) {
@@ -117,7 +121,22 @@ fn seeds() -> Vec<(&'static str, &'static str, Value)> {
         ),
         ("POST", "/v1/dbs/fz/tables/t/rows", json!({"rows": [{"id": 1, "name": "x", "n": 2}], "upsert": true})),
         ("POST", "/v1/dbs/fz/tables/t/rows/query", json!({"index": "by_name", "eq": ["x"], "limit": 2})),
-        ("POST", "/v1/dbs/fz/tables/t/rows/update", json!({"pk": 1, "set": {"n": 3}})),
+        ("POST", "/v1/dbs/fz/tables/t/rows/update", json!({"pk": 1, "set": {"n": 3}, "ttl_ms": 60_000})),
+        (
+            "POST",
+            "/v1/dbs/fz/tables/t/rows/update",
+            json!({"where": {"index": "by_name", "eq": ["x"], "filter": {"col": "n", "op": "gt", "value": 1}},
+            "set": {"n": 4}, "limit": 2}),
+        ),
+        ("POST", "/v1/dbs/fz/tables/t/rows/delete", json!({"where": {"range": {"gte": 5}}, "limit": 1})),
+        (
+            "POST",
+            "/v1/dbs/fz/txn",
+            json!({"ops": [{"op": "put", "key": "e", "value": "1", "ttl_ms": 1000},
+            {"op": "upsert_row", "table": "t", "row": {"id": 9, "name": "z"}, "ttl_ms": 5000},
+            {"op": "update_rows", "table": "t", "where": {"index": "by_name", "range": {"gte": "a"}}, "set": {"n": 1}},
+            {"op": "delete_rows", "table": "t", "where": {"filter": {"col": "n", "op": "is_null"}}, "limit": 3}]}),
+        ),
         ("POST", "/v1/dbs/fz/tables/t/rows/get", json!({"pk": [1]})),
         ("POST", "/v1/dbs/fz/transactions", json!({"isolation": "snapshot"})),
         ("POST", "/v1/dbs", json!({"name": "other"})),
@@ -189,6 +208,8 @@ fn fuzz_http_api() {
         let paths = [
             "/v1/dbs/fz/kv/",
             "/v1/dbs/fz/kv",
+            "/v1/dbs/fz/changes?after=",
+            "/v1/dbs/fz/tables/t/changes?wait_ms=1&after=",
             "/v1/dbs/fz/txn",
             "/v1/dbs/fz/tables/t/rows/query",
             "/v1/dbs/fz/transactions/",

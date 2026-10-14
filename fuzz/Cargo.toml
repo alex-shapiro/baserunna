@@ -51,3 +51,10 @@ path = "fuzz_targets/http_txn.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "change_pos"
+path = "fuzz_targets/change_pos.rs"
+test = false
+doc = false
+bench = false

@@ -218,6 +218,8 @@ mod tests {
             min_seq,
             max_seq,
             deletes_applied: applied,
+            expiring: 0,
+            expires_max: 0,
         };
         let t = rt("c", Some("f"), 10);
         assert!(t.covers(&seg("c", "ez", 1, 9, 0)));

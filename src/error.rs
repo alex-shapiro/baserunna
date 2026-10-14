@@ -19,6 +19,9 @@ pub enum Error {
         op_index: Option<usize>,
     },
     TooLarge(String),
+    /// A change feed cursor is older than the deletions the database still
+    /// keeps: the client must read the current state again.
+    CursorExpired(String),
     /// Database storage quota exceeded.
     QuotaExceeded(String),
     /// Request rate limit exceeded.
@@ -70,6 +73,7 @@ impl Error {
             Error::AlreadyExists(_) => "already_exists",
             Error::PreconditionFailed { .. } => "precondition_failed",
             Error::TooLarge(_) => "too_large",
+            Error::CursorExpired(_) => "cursor_expired",
             Error::QuotaExceeded(_) => "quota_exceeded",
             Error::RateLimited { .. } => "rate_limited",
             Error::NotOwner { .. } | Error::Unavailable { .. } => "unavailable",
@@ -86,6 +90,7 @@ impl Error {
             Error::Conflict(_) | Error::AlreadyExists(_) => 409,
             Error::PreconditionFailed { .. } => 412,
             Error::TooLarge(_) => 413,
+            Error::CursorExpired(_) => 410,
             Error::QuotaExceeded(_) => 507,
             Error::RateLimited { .. } => 429,
             Error::NotOwner { .. } | Error::Unavailable { .. } => 503,
@@ -113,6 +118,7 @@ impl Error {
             | Error::Conflict(m)
             | Error::AlreadyExists(m)
             | Error::TooLarge(m)
+            | Error::CursorExpired(m)
             | Error::QuotaExceeded(m)
             | Error::Internal(m) => m.clone(),
             Error::RateLimited { message, .. } => message.clone(),

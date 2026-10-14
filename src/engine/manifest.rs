@@ -7,7 +7,7 @@
 //! during compaction, avoiding rewriting them on regular commits.
 
 use super::range_delete::RangeTombstone;
-use super::types::{Entry, Seq, valid_object_id};
+use super::types::{Entry, Seq, is_commit_key, valid_object_id};
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
 use crate::util::crc32c::crc32c;
 use bytes::Bytes;
@@ -16,9 +16,9 @@ const MAGIC: &[u8; 4] = b"BRMF";
 
 /// The database was deleted: every read and commit fails with not-found.
 pub const FLAG_DELETED: u64 = 1;
-const FORMAT: u16 = 3;
+const FORMAT: u16 = 4;
 const LEVELS_MAGIC: &[u8; 4] = b"BRLV";
-const LEVELS_FORMAT: u16 = 1;
+const LEVELS_FORMAT: u16 = 2;
 
 /// Deepest segment level. Level 0 holds flushed tails, newest first, which
 /// may overlap; each level from 1 to `MAX_LEVEL` is one sorted run of
@@ -52,6 +52,10 @@ pub struct SegmentMeta {
     pub max_seq: Seq,
     /// Sequence number through which all committed range deletions have been applied to this segment.
     pub deletes_applied: Seq,
+    /// Entries with an expiry, and the latest of their expiries: once that
+    /// has passed, all of them read as tombstones.
+    pub expiring: u64,
+    pub expires_max: u64,
 }
 
 impl SegmentMeta {
@@ -66,6 +70,8 @@ impl SegmentMeta {
         w.varint(self.min_seq);
         w.varint(self.max_seq);
         w.varint(self.deletes_applied);
+        w.varint(self.expiring);
+        w.varint(self.expires_max);
     }
 
     fn decode(r: &mut Reader<'_>) -> DResult<SegmentMeta> {
@@ -80,6 +86,8 @@ impl SegmentMeta {
             min_seq: r.varint()?,
             max_seq: r.varint()?,
             deletes_applied: r.varint()?,
+            expiring: r.varint()?,
+            expires_max: r.varint()?,
         };
         if !valid_object_id(&s.id) {
             return Err(DecodeError("bad segment id"));
@@ -128,6 +136,11 @@ pub struct Manifest {
     /// Incremented on every manifest write (including lease-only writes);
     /// orders manifests that share a data version.
     pub write_seq: u64,
+    /// Store time (ms) of the latest manifest write, never decreasing: no
+    /// earlier than the read time of any transaction it committed. Readers
+    /// evaluate expiries at this time or later, so they agree with every
+    /// commit's view of what had expired (SPEC §6.1).
+    pub time_ms: u64,
     pub created_ms: u64,
     /// Bit flags; see [`FLAG_DELETED`].
     pub flags: u64,
@@ -148,8 +161,6 @@ pub struct Manifest {
     pub range_deletes: Vec<RangeTombstone>,
     /// Tombstones (point and range) with seq <= horizon may have been purged.
     pub tombstone_horizon: Seq,
-    /// Oldest first: (commit id, version).
-    pub recent_commits: Vec<(u128, Seq)>,
     /// Oldest first: (version, wall ms) samples.
     pub version_times: Vec<(Seq, u64)>,
     pub obsolete: Vec<Obsolete>,
@@ -158,10 +169,13 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn new(db_id: &str, now_ms: u64) -> Manifest {
+    /// A new, empty manifest. `store_ms` is the store time if known, which
+    /// becomes the first version time (0 if unknown).
+    pub fn new(db_id: &str, now_ms: u64, store_ms: Option<u64>) -> Manifest {
         Manifest {
             db_id: db_id.to_string(),
             created_ms: now_ms,
+            time_ms: store_ms.unwrap_or(0),
             last_sweep_ms: now_ms,
             version_times: vec![(0, now_ms)],
             ..Default::default()
@@ -176,9 +190,12 @@ impl Manifest {
         self.tail.iter().map(|e| e.size()).sum()
     }
 
-    /// Total stored bytes tracked against quotas (segments, tail, and referenced blobs).
+    /// Total stored bytes tracked against quotas: segments, tail, and
+    /// referenced blobs, but not the commit records the engine keeps.
     pub fn stored_bytes(&self) -> u64 {
-        self.segments.iter().map(|s| s.size).sum::<u64>() + self.tail_bytes() as u64 + self.blob_bytes.total()
+        let segments: u64 = self.segments.iter().filter(|s| !is_commit_key(&s.min_key)).map(|s| s.size).sum();
+        let tail: usize = self.tail.iter().filter(|e| !is_commit_key(&e.key)).map(|e| e.size()).sum();
+        segments + tail as u64 + self.blob_bytes.total()
     }
 
     pub fn encode(&self) -> Bytes {
@@ -188,6 +205,7 @@ impl Manifest {
         w.str(&self.db_id);
         w.u64(self.version);
         w.u64(self.write_seq);
+        w.varint(self.time_ms);
         w.u64(self.created_ms);
         w.varint(self.flags);
         match &self.lease {
@@ -224,11 +242,6 @@ impl Manifest {
             t.encode(&mut w);
         }
         w.varint(self.tombstone_horizon);
-        w.varint(self.recent_commits.len() as u64);
-        for (id, v) in &self.recent_commits {
-            w.u128(*id);
-            w.varint(*v);
-        }
         w.varint(self.version_times.len() as u64);
         for (v, t) in &self.version_times {
             w.varint(*v);
@@ -268,6 +281,7 @@ impl Manifest {
         let db_id = r.string()?;
         let version = r.u64()?;
         let write_seq = r.u64()?;
+        let time_ms = r.varint()?;
         let created_ms = r.u64()?;
         let flags = r.varint()?;
         let lease = match r.u8()? {
@@ -314,11 +328,6 @@ impl Manifest {
         }
         let tombstone_horizon = r.varint()?;
         let n = r.len(r.remaining())?;
-        let mut recent_commits = Vec::with_capacity(n.min(4096));
-        for _ in 0..n {
-            recent_commits.push((r.u128()?, r.varint()?));
-        }
-        let n = r.len(r.remaining())?;
         let mut version_times = Vec::with_capacity(n.min(4096));
         for _ in 0..n {
             version_times.push((r.varint()?, r.varint()?));
@@ -347,6 +356,7 @@ impl Manifest {
             db_id,
             version,
             write_seq,
+            time_ms,
             created_ms,
             flags,
             lease,
@@ -356,7 +366,6 @@ impl Manifest {
             tail,
             range_deletes,
             tombstone_horizon,
-            recent_commits,
             version_times,
             obsolete,
             last_sweep_ms,
@@ -427,10 +436,6 @@ impl Manifest {
         let cutoff = now_ms.saturating_sub(age_ms);
         self.version_times.iter().filter(|(_, t)| *t <= cutoff).map(|(v, _)| *v).max().unwrap_or(0)
     }
-
-    pub fn commit_version(&self, id: u128) -> Option<Seq> {
-        self.recent_commits.iter().rev().find(|(c, _)| *c == id).map(|(_, v)| *v)
-    }
 }
 
 /// Immutable levels object storing segment metadata below level 0 (`dbs/{db}/levels/{id}`).
@@ -497,9 +502,10 @@ mod tests {
     use crate::util::rng::Rng;
 
     fn sample() -> Manifest {
-        let mut m = Manifest::new("db1", 123);
+        let mut m = Manifest::new("db1", 123, Some(456));
         m.version = 42;
         m.write_seq = 50;
+        m.time_ms = 1_700_000_000_000;
         m.flags = FLAG_DELETED;
         m.lease = Some(Lease { node: "n1".into(), expires_ms: 999, ms: 5_000 });
         m.compaction_seq = 9;
@@ -514,13 +520,18 @@ mod tests {
             min_seq: 1,
             max_seq: 40,
             deletes_applied: 30,
+            expiring: 2,
+            expires_max: 1_700_000_000_500,
         });
-        m.tail.push(Entry { key: Bytes::from_static(b"k1"), seq: 41, value: Value::Inline(Bytes::from_static(b"v")) });
-        m.tail.push(Entry { key: Bytes::from_static(b"k2"), seq: 42, value: Value::Tombstone });
+        m.tail.push(Entry::new(Bytes::from_static(b"k1"), 41, Value::Inline(Bytes::from_static(b"v"))));
+        m.tail.push(Entry::tombstone(Bytes::from_static(b"k2"), 42));
         m.tail.push(Entry {
-            key: Bytes::from_static(b"k3"),
-            seq: 42,
-            value: Value::Blob(BlobRef { id: "a".repeat(32), size: 5, sha256: [1; 32], content_type: "x/y".into() }),
+            expires: Some(1_700_000_001_000),
+            ..Entry::new(
+                Bytes::from_static(b"k3"),
+                42,
+                Value::Blob(BlobRef { id: "a".repeat(32), size: 5, sha256: [1; 32], content_type: "x/y".into() }),
+            )
         });
         m.range_deletes = vec![
             RangeTombstone { start: Bytes::from_static(b"m"), end: Some(Bytes::from_static(b"n")), seq: 38 },
@@ -528,7 +539,6 @@ mod tests {
         ];
         m.tombstone_horizon = 7;
         m.blob_bytes = BlobBytes { bound: 500, swept: 200, swept_at: 400 };
-        m.recent_commits = vec![(1, 41), (u128::MAX, 42)];
         m.version_times = vec![(0, 100), (40, 200)];
         m.obsolete = vec![
             Obsolete { kind: ObjKind::Blob, id: "b".repeat(32), since_ms: 5 },
@@ -542,7 +552,6 @@ mod tests {
         let m = sample();
         let enc = m.encode();
         assert_eq!(Manifest::decode(&enc).unwrap(), m);
-        assert_eq!(m.commit_version(u128::MAX), Some(42));
         assert_eq!(m.version_at_least_age(250, 100), 0);
         assert_eq!(m.version_at_least_age(400, 100), 40);
         assert_eq!(m.blob_bytes.total(), 300, "swept, plus bound since");
@@ -587,12 +596,14 @@ mod tests {
             min_seq: 0,
             max_seq: 0,
             deletes_applied: 0,
+            expiring: 0,
+            expires_max: 0,
         }
     }
 
     #[test]
     fn levels() {
-        let mut m = Manifest::new("d", 0);
+        let mut m = Manifest::new("d", 0, None);
         m.segments = vec![seg('a', 0, "a", "z"), seg('b', 0, "b", "c"), seg('c', 2, "m", "p"), seg('d', 2, "a", "c")];
         assert!(m.check_levels().is_err(), "level 2 out of key order");
         m.sort_segments();

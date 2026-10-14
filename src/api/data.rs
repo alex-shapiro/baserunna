@@ -3,12 +3,12 @@
 use super::body::{BlobBody, Upload, parse_range, read_upload};
 use super::{Auth, DbCtx, JsonBody, Params, consistency_of, percent_decode, with_read, with_txn};
 use crate::engine::manifest::ObjKind;
-use crate::engine::{Consistency, Isolation, Value, blob};
+use crate::engine::{Change, ChangePos, Consistency, Isolation, Value, blob};
 use crate::error::{Error, Result};
 use crate::meta::{self, MetaCmd};
 use crate::node::{Node, OpenTxn};
 use crate::ops::{self, Encoding, Op, OpCtx, exec_ops, user_key};
-use crate::table::{self, BlobResolver, ColumnSpec, CreateTable, IndexSpec, InsertMode, Query};
+use crate::table::{self, BlobResolver, ColumnSpec, CreateTable, IndexSpec, InsertMode, Query, Selection};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Extension, Path, Request, State};
@@ -28,6 +28,7 @@ pub fn routes() -> Router<Arc<Node>> {
     Router::new()
         .route("/v1/dbs/{db}", get(get_db).delete(delete_db))
         .route("/v1/dbs/{db}/kv", get(scan_kv))
+        .route("/v1/dbs/{db}/changes", get(kv_changes))
         .route("/v1/dbs/{db}/kv/{*key}", get(get_kv).put(put_kv).delete(delete_kv))
         .route("/v1/dbs/{db}/blobs", post(stage_blob))
         .route("/v1/dbs/{db}/blobs/{blob_id}", get(get_blob))
@@ -48,6 +49,7 @@ pub fn routes() -> Router<Arc<Node>> {
         .route("/v1/dbs/{db}/tables/{t}/rows/update", post(update_row))
         .route("/v1/dbs/{db}/tables/{t}/rows/delete", post(delete_row))
         .route("/v1/dbs/{db}/tables/{t}/rows/query", post(query_rows))
+        .route("/v1/dbs/{db}/tables/{t}/changes", get(row_changes))
 }
 
 type PathMap = Path<HashMap<String, String>>;
@@ -196,7 +198,7 @@ fn etag_version(h: &HeaderMap, name: http::HeaderName) -> Option<String> {
 async fn get_kv(Extension(ctx): Extension<DbCtx>, q: Params, req: Request) -> Result<Response> {
     let key = user_key(&raw_key(req.uri().path())?)?;
     let c = consistency_of(&q)?;
-    let snap = ctx.db.read_version(c).await?;
+    let snap = ctx.db.snapshot(c).await?;
     let Some(e) = snap.get(&key).await? else {
         return Err(Error::not_found("key not found"));
     };
@@ -239,12 +241,16 @@ async fn get_kv(Extension(ctx): Extension<DbCtx>, q: Params, req: Request) -> Re
         h.insert(http::header::ETAG, v);
     }
     h.insert("x-baserunna-version", HeaderValue::from(e.seq));
+    if let Some(x) = e.expires {
+        h.insert("x-baserunna-expires-at", HeaderValue::from(x));
+    }
     Ok(resp)
 }
 
-async fn put_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, req: Request) -> Result<J> {
+async fn put_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, q: Params, req: Request) -> Result<J> {
     ctx.principal.require_writable()?;
     let key = user_key(&raw_key(req.uri().path())?)?;
+    let ttl_ms = q.get("ttl_ms").map(|v| v.parse::<u64>().map_err(|_| Error::invalid("bad ttl_ms"))).transpose()?;
     let if_match = etag_version(req.headers(), http::header::IF_MATCH);
     let if_none = etag_version(req.headers(), http::header::IF_NONE_MATCH);
     if if_none.as_deref().is_some_and(|v| v != "*") {
@@ -279,7 +285,7 @@ async fn put_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>,
                 return Err(Error::PreconditionFailed { message: "version mismatch".into(), op_index: None });
             }
         }
-        t.put(key.clone(), value.clone())
+        t.put_expiring(key.clone(), value.clone(), ops::expiry(ttl_ms)?)
     });
     Ok(axum::Json(json!({"version": v})))
 }
@@ -406,19 +412,19 @@ fn consistency_from(c: Option<&str>, staleness: Option<u64>) -> Result<Consisten
     consistency_of(&m)
 }
 
-fn commit_id_for_key(db_id: &str, key: &str) -> u128 {
+fn commit_id_for_key(db_id: &str, key: &str) -> u64 {
     let mut d = Vec::with_capacity(db_id.len() + key.len() + 1);
     d.extend_from_slice(db_id.as_bytes());
     d.push(0);
     d.extend_from_slice(key.as_bytes());
     let h = crate::util::sha256(&d);
-    let mut a = [0u8; 16];
-    a.copy_from_slice(&h[..16]);
-    u128::from_be_bytes(a)
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&h[..8]);
+    u64::from_be_bytes(a)
 }
 
-fn commit_hex(id: u128) -> String {
-    format!("{id:032x}")
+fn commit_hex(id: u64) -> String {
+    format!("{id:016x}")
 }
 
 async fn one_shot(
@@ -437,7 +443,7 @@ async fn one_shot(
     }
     let commit_id = match &req.idempotency_key {
         Some(k) => commit_id_for_key(&ctx.rec.id, k),
-        None => node.env.random_u128(),
+        None => node.env.random_u64(),
     };
     if req.idempotency_key.is_some()
         && let Some(v) = ctx.db.commit_status(commit_id).await?
@@ -647,16 +653,158 @@ async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
 
 async fn commit_status(Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
     let id = param(&p, "id")?;
-    let cid = if let Some(k) = id.strip_prefix("key:") {
-        commit_id_for_key(&ctx.rec.id, k)
-    } else {
-        u128::from_str_radix(id, 16)
-            .map_err(|_| Error::invalid("commit id must be 32 hex characters or key:<idempotency key>"))?
+    let cid = match id.strip_prefix("key:") {
+        Some(k) => commit_id_for_key(&ctx.rec.id, k),
+        None if id.len() == 16 => u64::from_str_radix(id, 16).map_err(|_| bad_commit_id())?,
+        None => return Err(bad_commit_id()),
     };
     Ok(axum::Json(match ctx.db.commit_status_fenced(cid).await? {
         Some(v) => json!({"status": "committed", "version": v, "commit_id": commit_hex(cid)}),
         None => json!({"status": "not_committed", "commit_id": commit_hex(cid)}),
     }))
+}
+
+fn bad_commit_id() -> Error {
+    Error::invalid("commit id must be 16 hex characters or key:<idempotency key>")
+}
+
+// ---------------------------------------------------------- change feeds
+
+/// The longest a change feed request waits for a change.
+const WATCH_WAIT_MAX_MS: u64 = 20_000;
+
+/// The common parameters of change feeds: where to start (`after`, a
+/// version or a `next_cursor`), `limit` and `wait_ms`.
+fn feed_params(q: &Params) -> Result<(ChangePos, usize, Duration)> {
+    let after = q.get("after").ok_or_else(|| Error::invalid("after is required (a version or a next_cursor)"))?;
+    let after = ChangePos::decode(after).ok_or_else(|| Error::invalid("bad after"))?;
+    let limit = match q.get("limit") {
+        None => 100,
+        Some(l) => l
+            .parse()
+            .ok()
+            .filter(|l| (1..=ops::MAX_SCAN_LIMIT).contains(l))
+            .ok_or_else(|| Error::invalid(format!("limit must be in 1..={}", ops::MAX_SCAN_LIMIT)))?,
+    };
+    let wait = match q.get("wait_ms") {
+        None => 0,
+        Some(w) => w
+            .parse()
+            .ok()
+            .filter(|w| *w <= WATCH_WAIT_MAX_MS)
+            .ok_or_else(|| Error::invalid(format!("wait_ms must be in 0..={WATCH_WAIT_MAX_MS}")))?,
+    };
+    Ok((after, limit, Duration::from_millis(wait)))
+}
+
+/// Run `$read` (with `$t: &mut Txn`, evaluating to `Result<(page, more)>`)
+/// on a snapshot until it finds a change or `$wait` passes. Between tries
+/// it waits for this node to install a newer version, re-reading the
+/// manifest every `watch_poll_ms` in case another node commits.
+macro_rules! watch {
+    ($node:expr, $db:expr, $c:expr, $wait:expr, |$t:ident| $read:expr) => {{
+        let until_ = Instant::now() + $wait;
+        loop {
+            let (out_, v_) = with_read!($db, $c, |$t| $read);
+            let left_ = until_.saturating_duration_since(Instant::now());
+            if out_.found() || left_.is_zero() {
+                break (out_, v_);
+            }
+            let poll_ = Duration::from_millis($node.cfg.watch_poll_ms);
+            $db.wait_for_change(v_, left_.min(poll_)).await;
+        }
+    }};
+}
+
+/// A page of a feed and whether it holds any change.
+trait Found {
+    fn found(&self) -> bool;
+}
+
+impl Found for (Vec<Json>, bool, ChangePos) {
+    fn found(&self) -> bool {
+        !self.0.is_empty()
+    }
+}
+
+async fn kv_changes(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, q: Params) -> Result<J> {
+    let enc = encoding_param(&q)?;
+    let keys_only = bool_param(&q, "keys_only")?;
+    let range = ops::user_range(
+        enc,
+        q.get("prefix").map(|s| s.as_str()),
+        q.get("start").map(|s| s.as_str()),
+        q.get("end").map(|s| s.as_str()),
+    )?;
+    let (after, limit, wait) = feed_params(&q)?;
+    let c = consistency_of(&q)?;
+    let octx = op_ctx(&node, &ctx, enc);
+    let ((changes, more, next), v) = watch!(node, ctx.db, c, wait, |t| {
+        let page = t.snapshot.changes(&range, &after, limit).await?;
+        let mut out = Vec::with_capacity(page.changes.len());
+        for ch in &page.changes {
+            out.push(kv_change_json(&octx, ch, t.read_time, keys_only).await?);
+        }
+        let next = match (page.more, page.changes.last()) {
+            (true, Some(c)) => c.pos(),
+            _ => after.clone().max(ChangePos::after_version(t.read_version())),
+        };
+        Ok::<_, Error>((out, page.more, next))
+    });
+    Ok(axum::Json(json!({"changes": changes, "more": more, "next_cursor": next.encode(), "version": v})))
+}
+
+/// A change to user keys as JSON: `{"version", "key", value fields,
+/// "expires_at"?}`, `{"version", "key", "deleted": true}` (also for a value
+/// expired at `at`), or `{"version", "deleted_range": {"start", "end"}}`.
+async fn kv_change_json(ctx: &OpCtx<'_>, ch: &Change, at: u64, keys_only: bool) -> Result<Json> {
+    let mut m = serde_json::Map::new();
+    m.insert("version".into(), json!(ch.seq()));
+    match ch {
+        Change::Entry(e) => {
+            let e = e.clone().at(at);
+            ops::put_key(ctx.encoding, "key", &e.key[1..], &mut m);
+            match &e.value {
+                Value::Tombstone => {
+                    m.insert("deleted".into(), json!(true));
+                }
+                Value::Blob(r) if keys_only => {
+                    m.insert("blob".into(), ops::blob_meta(r));
+                }
+                _ if keys_only => {}
+                v => ops::value_json(ctx, v, &mut m).await?,
+            }
+            ops::put_expiry(e.expires, &mut m);
+        }
+        Change::DeleteRange(t) => {
+            let mut r = serde_json::Map::new();
+            ops::put_key(ctx.encoding, "start", &t.start[1..], &mut r);
+            match &t.end {
+                Some(e) if e.first() == Some(&table::SPACE_KV) => ops::put_key(ctx.encoding, "end", &e[1..], &mut r),
+                _ => {
+                    r.insert("end".into(), Json::Null);
+                }
+            }
+            m.insert("deleted_range".into(), Json::Object(r));
+        }
+    }
+    Ok(Json::Object(m))
+}
+
+async fn row_changes(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+    q: Params,
+) -> Result<J> {
+    let name = param(&p, "t")?.to_string();
+    let (after, limit, wait) = feed_params(&q)?;
+    let c = consistency_of(&q)?;
+    let ((changes, more, next), v) = watch!(node, ctx.db, c, wait, |t| {
+        let r = table::row_changes(t, &name, &after, limit).await?;
+        Ok::<_, Error>((r.changes, r.more, r.next))
+    });
+    Ok(axum::Json(json!({"changes": changes, "more": more, "next_cursor": next.encode(), "version": v})))
 }
 
 // --------------------------------------------------------------- tables
@@ -747,6 +895,8 @@ struct InsertBody {
     rows: Option<Vec<Json>>,
     #[serde(default)]
     upsert: bool,
+    #[serde(default)]
+    ttl_ms: Option<u64>,
 }
 
 async fn insert_rows(
@@ -768,8 +918,9 @@ async fn insert_rows(
     let db = ctx.db.clone();
     let (n, v) = with_txn!(node, ctx, |t| {
         let blobs = BlobResolver { db: &db };
+        let ttl = ops::expiry(b.ttl_ms)?;
         for r in &rows {
-            table::insert(t, &blobs, &name, r, mode).await?;
+            table::insert_expiring(t, &blobs, &name, r, mode, ttl).await?;
         }
         Ok::<usize, Error>(rows.len())
     });
@@ -792,18 +943,43 @@ async fn get_row(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, JsonBody(b)
     let name = param(&p, "t")?.to_string();
     let (b, c) = split_consistency(b)?;
     let pk = b.get("pk").cloned().ok_or_else(|| Error::invalid("missing pk"))?;
-    let (row, v) = with_read!(ctx.db, c, |t| table::get(t, &name, &pk).await);
+    let (row, v) = with_read!(ctx.db, c, |t| table::get_expiring(t, &name, &pk).await);
     Ok(axum::Json(match row {
-        Some(r) => json!({"found": true, "row": r, "version": v}),
+        Some((r, Some(e))) => json!({"found": true, "row": r, "expires_at": e, "version": v}),
+        Some((r, None)) => json!({"found": true, "row": r, "version": v}),
         None => json!({"found": false, "version": v}),
     }))
+}
+
+/// Rows to change: one by primary key, or every row a selection matches
+/// (at most `limit`).
+enum Rows<'a> {
+    One(&'a Json),
+    Where(&'a Selection, Option<usize>),
+}
+
+fn target<'a>(pk: &'a Option<Json>, selection: &'a Option<Selection>, limit: Option<usize>) -> Result<Rows<'a>> {
+    match (pk, selection) {
+        (Some(pk), None) if limit.is_none() => Ok(Rows::One(pk)),
+        (Some(_), None) => Err(Error::invalid("limit applies to where only")),
+        (None, Some(_)) if limit == Some(0) => Err(Error::invalid("limit must be at least 1")),
+        (None, Some(s)) => Ok(Rows::Where(s, limit)),
+        _ => Err(Error::invalid("provide exactly one of pk or where")),
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateBody {
-    pk: Json,
+    #[serde(default)]
+    pk: Option<Json>,
+    #[serde(default, rename = "where")]
+    selection: Option<Selection>,
+    #[serde(default)]
+    limit: Option<usize>,
     set: Json,
+    #[serde(default)]
+    ttl_ms: Option<u64>,
 }
 
 async fn update_row(
@@ -814,25 +990,51 @@ async fn update_row(
 ) -> Result<J> {
     let name = param(&p, "t")?.to_string();
     let db = ctx.db.clone();
-    let (found, v) = with_txn!(node, ctx, |t| table::update(t, &BlobResolver { db: &db }, &name, &b.pk, &b.set).await);
-    Ok(axum::Json(json!({"found": found, "version": v})))
+    let rows = target(&b.pk, &b.selection, b.limit)?;
+    let (out, v) = with_txn!(node, ctx, |t| {
+        let blobs = BlobResolver { db: &db };
+        let e = ops::row_expiry(b.ttl_ms)?;
+        match rows {
+            Rows::One(pk) => {
+                table::update_expiring(t, &blobs, &name, pk, &b.set, e).await.map(|found| json!({"found": found}))
+            }
+            Rows::Where(sel, limit) => {
+                table::update_where(t, &blobs, &name, sel, &b.set, e, limit).await.map(|n| json!({"count": n}))
+            }
+        }
+    });
+    Ok(axum::Json(with_version(out, v)))
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PkBody {
-    pk: Json,
+struct DeleteBody {
+    #[serde(default)]
+    pk: Option<Json>,
+    #[serde(default, rename = "where")]
+    selection: Option<Selection>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 async fn delete_row(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
-    JsonBody(b): JsonBody<PkBody>,
+    JsonBody(b): JsonBody<DeleteBody>,
 ) -> Result<J> {
     let name = param(&p, "t")?.to_string();
-    let (found, v) = with_txn!(node, ctx, |t| table::delete(t, &name, &b.pk).await);
-    Ok(axum::Json(json!({"found": found, "version": v})))
+    let rows = target(&b.pk, &b.selection, b.limit)?;
+    let (out, v) = with_txn!(node, ctx, |t| match rows {
+        Rows::One(pk) => table::delete(t, &name, pk).await.map(|found| json!({"found": found})),
+        Rows::Where(sel, limit) => table::delete_where(t, &name, sel, limit).await.map(|n| json!({"count": n})),
+    });
+    Ok(axum::Json(with_version(out, v)))
+}
+
+fn with_version(mut out: Json, v: u64) -> Json {
+    out["version"] = json!(v);
+    out
 }
 
 async fn query_rows(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, JsonBody(b): JsonBody<Json>) -> Result<J> {

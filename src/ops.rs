@@ -1,9 +1,9 @@
 //! The JSON transaction-op language shared by one-shot transactions,
 //! interactive transactions and the console. See SPEC §6.3.
 
-use crate::engine::{BlobRef, Db, KeyRange, ReadValue, Txn, Value, blob};
+use crate::engine::{BlobRef, Db, KeyRange, ReadValue, Ttl, Txn, Value, blob};
 use crate::error::{Error, Result};
-use crate::table::{self, BlobResolver, InsertMode, Query, SPACE_KV, schema::blob_json};
+use crate::table::{self, BlobResolver, Expiry, InsertMode, Query, SPACE_KV, Selection, schema::blob_json};
 use crate::util::b64;
 use bytes::Bytes;
 use serde::Deserialize;
@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 pub const MAX_USER_KEY: usize = 4096;
 pub const MAX_SCAN_LIMIT: usize = 1000;
+/// The longest time to live a value may have: ten years.
+pub const MAX_TTL_MS: u64 = 10 * 365 * 24 * 3_600_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -71,6 +73,8 @@ pub enum Op {
         value: Option<String>,
         #[serde(default)]
         blob_id: Option<String>,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     Delete {
         key: String,
@@ -96,6 +100,8 @@ pub enum Op {
         key: String,
         #[serde(default = "one")]
         by: i64,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     GetRow {
         table: String,
@@ -104,19 +110,42 @@ pub enum Op {
     InsertRow {
         table: String,
         row: Json,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     UpsertRow {
         table: String,
         row: Json,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     UpdateRow {
         table: String,
         pk: Json,
         set: Json,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     DeleteRow {
         table: String,
         pk: Json,
+    },
+    UpdateRows {
+        table: String,
+        #[serde(rename = "where")]
+        selection: Selection,
+        set: Json,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    DeleteRows {
+        table: String,
+        #[serde(rename = "where")]
+        selection: Selection,
+        #[serde(default)]
+        limit: Option<usize>,
     },
     QueryRows {
         table: String,
@@ -153,7 +182,26 @@ impl Op {
                 | Op::UpsertRow { .. }
                 | Op::UpdateRow { .. }
                 | Op::DeleteRow { .. }
+                | Op::UpdateRows { .. }
+                | Op::DeleteRows { .. }
         )
+    }
+}
+
+/// The time to live `ttl_ms` asks for: that long after the write commits.
+pub fn expiry(ttl_ms: Option<u64>) -> Result<Option<Ttl>> {
+    match ttl_ms {
+        None => Ok(None),
+        Some(t) if (1..=MAX_TTL_MS).contains(&t) => Ok(Some(Ttl::For(t))),
+        Some(_) => Err(Error::invalid(format!("ttl_ms must be in 1..={MAX_TTL_MS}"))),
+    }
+}
+
+/// `limit` of a batch row operation, if any: at least 1.
+fn batch_limit(limit: Option<usize>) -> Result<Option<usize>> {
+    match limit {
+        Some(0) => Err(Error::invalid("limit must be at least 1")),
+        l => Ok(l),
     }
 }
 
@@ -225,6 +273,12 @@ pub async fn value_json(ctx: &OpCtx<'_>, v: &Value, out: &mut serde_json::Map<St
     Ok(())
 }
 
+/// Bytes as JSON field `field`, or `{field}_b64` if they are not UTF-8 in
+/// the utf8 encoding.
+pub fn put_key(enc: Encoding, field: &str, b: &[u8], out: &mut serde_json::Map<String, Json>) {
+    put_bytes(enc, field, b, out)
+}
+
 fn put_bytes(enc: Encoding, field: &str, b: &[u8], out: &mut serde_json::Map<String, Json>) {
     match enc.encode(b) {
         Json::Null => {
@@ -246,9 +300,17 @@ async fn read_json(ctx: &OpCtx<'_>, r: Option<ReadValue>) -> Result<Json> {
             m.insert("found".into(), json!(true));
             value_json(ctx, &rv.value, &mut m).await?;
             m.insert("version".into(), json!(rv.seq));
+            put_expiry(rv.expires(), &mut m);
         }
     }
     Ok(Json::Object(m))
+}
+
+/// `expires_at` (store ms) of a value that expires.
+pub fn put_expiry(expires: Option<u64>, out: &mut serde_json::Map<String, Json>) {
+    if let Some(e) = expires {
+        out.insert("expires_at".into(), json!(e));
+    }
 }
 
 /// Store bytes as a value, moving large values out of band.
@@ -326,19 +388,21 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op) -> Result<Json> {
                     m.insert("blob".into(), blob_json(r));
                 }
                 m.insert("version".into(), json!(it.seq));
+                put_expiry(it.expires(), &mut m);
                 out.push(Json::Object(m));
             }
             let next = if more { items.get(limit - 1).map(|it| json!(b64::encode_url(&it.key[1..]))) } else { None };
             Ok(json!({"items": out, "next_cursor": next}))
         }
-        Op::Put { key, value, blob_id } => {
+        Op::Put { key, value, blob_id, ttl_ms } => {
             let k = user_key(&enc.decode(key, "key")?)?;
+            let ttl = expiry(*ttl_ms)?;
             let v = match (value, blob_id) {
                 (Some(v), None) => make_value(ctx.db, &enc.decode(v, "value")?, "application/octet-stream").await?,
                 (None, Some(id)) => Value::Blob(blob::load_staged(ctx.db.shared(), &ctx.db.id, id).await?),
                 _ => return Err(Error::invalid("put needs exactly one of value or blob_id")),
             };
-            txn.put(k, v)?;
+            txn.put_expiring(k, v, ttl)?;
             Ok(json!({}))
         }
         Op::Delete { key } => {
@@ -387,44 +451,63 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op) -> Result<Json> {
             }
             Ok(json!({}))
         }
-        Op::Increment { key, by } => {
+        Op::Increment { key, by, ttl_ms } => {
             let k = user_key(&enc.decode(key, "key")?)?;
-            let cur = match txn.get(&k).await? {
-                None => 0i64,
+            let set = expiry(*ttl_ms)?;
+            let (cur, kept) = match txn.get(&k).await? {
+                None => (0i64, None),
                 Some(rv) => {
                     let b = value_bytes(ctx.db, &rv.value).await?;
-                    std::str::from_utf8(&b)
+                    let n = std::str::from_utf8(&b)
                         .ok()
                         .and_then(|s| s.trim().parse::<i64>().ok())
-                        .ok_or_else(|| Error::invalid(format!("value of {key} is not a decimal integer")))?
+                        .ok_or_else(|| Error::invalid(format!("value of {key} is not a decimal integer")))?;
+                    (n, rv.ttl)
                 }
             };
             let n = cur.checked_add(*by).ok_or_else(|| Error::invalid("increment overflows i64"))?;
-            txn.put(k, Value::Inline(Bytes::from(n.to_string())))?;
+            // A counter keeps its expiry unless the increment sets one.
+            txn.put_expiring(k, Value::Inline(Bytes::from(n.to_string())), set.or(kept))?;
             Ok(json!({"value": n}))
         }
         Op::GetRow { table, pk } => {
-            let row = table::get(txn, table, pk).await?;
+            let row = table::get_expiring(txn, table, pk).await?;
             Ok(match row {
-                Some(r) => json!({"found": true, "row": r}),
+                Some((r, expires)) => {
+                    let mut m = serde_json::Map::new();
+                    m.insert("found".into(), json!(true));
+                    m.insert("row".into(), r);
+                    put_expiry(expires, &mut m);
+                    Json::Object(m)
+                }
                 None => json!({"found": false}),
             })
         }
-        Op::InsertRow { table, row } => {
-            table::insert(txn, &blobs, table, row, InsertMode::Insert).await?;
+        Op::InsertRow { table, row, ttl_ms } => {
+            table::insert_expiring(txn, &blobs, table, row, InsertMode::Insert, expiry(*ttl_ms)?).await?;
             Ok(json!({}))
         }
-        Op::UpsertRow { table, row } => {
-            table::insert(txn, &blobs, table, row, InsertMode::Upsert).await?;
+        Op::UpsertRow { table, row, ttl_ms } => {
+            table::insert_expiring(txn, &blobs, table, row, InsertMode::Upsert, expiry(*ttl_ms)?).await?;
             Ok(json!({}))
         }
-        Op::UpdateRow { table, pk, set } => {
-            let found = table::update(txn, &blobs, table, pk, set).await?;
+        Op::UpdateRow { table, pk, set, ttl_ms } => {
+            let e = row_expiry(*ttl_ms)?;
+            let found = table::update_expiring(txn, &blobs, table, pk, set, e).await?;
             Ok(json!({"found": found}))
         }
         Op::DeleteRow { table, pk } => {
             let found = table::delete(txn, table, pk).await?;
             Ok(json!({"found": found}))
+        }
+        Op::UpdateRows { table, selection, set, ttl_ms, limit } => {
+            let e = row_expiry(*ttl_ms)?;
+            let n = table::update_where(txn, &blobs, table, selection, set, e, batch_limit(*limit)?).await?;
+            Ok(json!({"count": n}))
+        }
+        Op::DeleteRows { table, selection, limit } => {
+            let n = table::delete_where(txn, table, selection, batch_limit(*limit)?).await?;
+            Ok(json!({"count": n}))
         }
         Op::QueryRows { table, index, eq, range, filter, limit, reverse, cursor } => {
             let query = Query {
@@ -440,6 +523,15 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op) -> Result<Json> {
             Ok(json!({"rows": r.rows, "next_cursor": r.next_cursor}))
         }
     }
+}
+
+/// What an update with `ttl_ms` does to a row's expiry: the row keeps its
+/// expiry unless `ttl_ms` is given.
+pub fn row_expiry(ttl_ms: Option<u64>) -> Result<Expiry> {
+    Ok(match expiry(ttl_ms)? {
+        Some(t) => Expiry::Set(Some(t)),
+        None => Expiry::Keep,
+    })
 }
 
 /// Blob ref to JSON (re-export for API handlers).

@@ -153,6 +153,9 @@ impl SimConfig {
             clock_sync_max_error_ms: 100,
             levels_inline_max: 1,
             version_sample_ms: 5_000,
+            // Short enough for records to expire within a run, long enough
+            // for clients to resolve ambiguous commits (about 30 s).
+            commit_retention_ms: 120_000,
             ..EngineConfig::small_for_tests()
         };
         SimConfig {

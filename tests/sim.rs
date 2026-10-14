@@ -86,6 +86,16 @@ fn sim_many_db_churn() {
     run_scenario("db_churn", 15, 1);
 }
 
+#[test]
+fn sim_ttl_expiry() {
+    run_scenario("ttl", 18, 2);
+}
+
+#[test]
+fn sim_watch_change_feeds() {
+    run_scenario("watch", 19, 2);
+}
+
 /// Every workload again under [`SimConfig::hostile`].
 #[test]
 fn sim_hostile() {
@@ -101,6 +111,8 @@ fn sim_hostile() {
         "blob_gc_race_hostile",
         "db_churn_hostile",
         "chaos_hostile",
+        "ttl_hostile",
+        "watch_hostile",
     ] {
         run_scenario(name, 16, 1);
     }

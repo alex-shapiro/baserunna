@@ -13,7 +13,7 @@ use super::config::EngineConfig;
 use super::manifest::{MAX_LEVEL, Manifest, SegmentMeta};
 use super::range_delete::RangeDeletes;
 use super::segment::SegmentBuilder;
-use super::types::Seq;
+use super::types::{Entry, Seq, is_commit_key};
 use super::version::{IterSpec, KeyRange, MergeIter, ReadMode};
 use super::{seg_key, segment};
 use crate::error::Result;
@@ -38,6 +38,12 @@ pub enum Kind {
     Drop,
     /// Rewrite segments in-place on their current level to purge range-deleted entries.
     Rewrite,
+    /// Drop segments of commit records all past their retention, unread:
+    /// records shadow nothing.
+    DropExpired,
+    /// Rewrite segments in place whose entries have mostly expired,
+    /// keeping only tombstones of them.
+    Expire,
 }
 
 /// Maximum number of segments replaced in a single rewrite compaction.
@@ -76,17 +82,34 @@ pub fn pick(m: &Manifest, cfg: &EngineConfig) -> Option<Plan> {
     if !covered.is_empty() {
         return Some(Plan { inputs: covered, kind: Kind::Drop });
     }
+    let records_horizon = records_horizon(m, cfg);
+    let lapsed: Vec<SegmentMeta> =
+        m.segments.iter().filter(|s| holds_records(s) && s.max_seq <= records_horizon).cloned().collect();
+    if !lapsed.is_empty() {
+        return Some(Plan { inputs: lapsed, kind: Kind::DropExpired });
+    }
     // Drain levels above the base level downward before merging L0.
     let above_base = (1..base).any(|l| !m.level(l).is_empty());
-    let l0 = m.level(0);
-    if !above_base && let Some(newest) = l0.iter().position(|s| dirty(&s)) {
-        return Some(l0_merge(m, base, (l0.len() - newest).min(cfg.l0_compaction_max_inputs.max(1))));
+    // Data and commit records are flushed to separate level 0 segments,
+    // which compact separately, so neither drags the other's segments into
+    // its merges.
+    let (records_l0, data_l0): (Vec<&SegmentMeta>, Vec<&SegmentMeta>) =
+        m.level(0).iter().partition(|s| holds_records(s));
+    let max_inputs = cfg.l0_compaction_max_inputs.max(1);
+    if !above_base && let Some(newest) = data_l0.iter().position(&dirty) {
+        return Some(l0_merge(m, base, &data_l0, (data_l0.len() - newest).min(max_inputs)));
     }
     let rewrite: Vec<SegmentMeta> = m.deep_segments().iter().filter(dirty).take(REWRITE_MAX_INPUTS).cloned().collect();
     if !rewrite.is_empty() {
         return Some(Plan { inputs: rewrite, kind: Kind::Rewrite });
     }
+    let expire: Vec<SegmentMeta> =
+        m.deep_segments().iter().filter(|s| mostly_expired(s, m.time_ms)).take(REWRITE_MAX_INPUTS).cloned().collect();
+    if !expire.is_empty() {
+        return Some(Plan { inputs: expire, kind: Kind::Expire });
+    }
     let mut best: Option<(f64, u8)> = None;
+    let l0 = if data_l0.len() >= records_l0.len() { &data_l0 } else { &records_l0 };
     if l0.len() >= cfg.l0_compaction_trigger.max(1) {
         best = Some((l0.len() as f64 / cfg.l0_compaction_trigger.max(1) as f64, 0));
     }
@@ -102,7 +125,7 @@ pub fn pick(m: &Manifest, cfg: &EngineConfig) -> Option<Plan> {
     }
     let (_, level) = best?;
     if level == 0 {
-        return Some(l0_merge(m, base, l0.len().min(cfg.l0_compaction_max_inputs.max(1))));
+        return Some(l0_merge(m, base, l0, l0.len().min(max_inputs)));
     }
     // The segment that overlaps least of the next level, relative to its
     // size: the cheapest to push down.
@@ -119,10 +142,27 @@ pub fn pick(m: &Manifest, cfg: &EngineConfig) -> Option<Plan> {
     Some(Plan { inputs, kind })
 }
 
-/// Plans a merge of the oldest `take` level 0 segments with overlapping base-level segments.
-fn l0_merge(m: &Manifest, base: u8, take: usize) -> Plan {
-    let l0 = m.level(0);
-    let mut inputs: Vec<SegmentMeta> = l0[l0.len() - take.min(l0.len())..].to_vec();
+/// Whether a segment holds commit records (and, as every segment is cut
+/// where they begin, nothing else).
+pub(crate) fn holds_records(s: &SegmentMeta) -> bool {
+    is_commit_key(&s.min_key)
+}
+
+/// Commit records up to this version are past their retention, by the
+/// manifest's time.
+pub(crate) fn records_horizon(m: &Manifest, cfg: &EngineConfig) -> Seq {
+    m.version_at_least_age(m.time_ms, cfg.commit_retention_ms)
+}
+
+/// A segment at least half of whose entries have expired by `now`.
+fn mostly_expired(s: &SegmentMeta, now: u64) -> bool {
+    s.expiring > 0 && s.expires_max <= now && 2 * s.expiring >= s.entries
+}
+
+/// Plans a merge of the oldest `take` of the level 0 segments `l0` (newest
+/// first) with the base-level segments they overlap.
+fn l0_merge(m: &Manifest, base: u8, l0: &[&SegmentMeta], take: usize) -> Plan {
+    let mut inputs: Vec<SegmentMeta> = l0[l0.len() - take.min(l0.len())..].iter().map(|s| (*s).clone()).collect();
     let min = inputs.iter().map(|s| s.min_key.clone()).min().unwrap_or_default();
     let max = inputs.iter().map(|s| s.max_key.clone()).max().unwrap_or_default();
     inputs.extend_from_slice(overlapping(m, base, &min, &max));
@@ -133,6 +173,8 @@ pub struct Output {
     pub segments: Vec<SegmentMeta>,
     /// Highest seq of a purged tombstone (0 if none).
     pub purged_max_seq: Seq,
+    /// Entries dropped or reduced to tombstones because they had expired.
+    pub expired: u64,
 }
 
 /// True if a segment of a level deeper than `level` covers `key`, so a
@@ -144,17 +186,17 @@ fn covered_below(m: &Manifest, level: u8, key: &[u8]) -> bool {
 /// Executes a compaction plan, writing output segments and purging obsolete entries.
 pub async fn run(shared: &Arc<Shared>, m: &Manifest, plan: &Plan, purge_seq: Seq) -> Result<Output> {
     let deletes = Arc::new(RangeDeletes::new(&m.range_deletes));
-    let mut out = Output { segments: Vec::new(), purged_max_seq: 0 };
+    let mut out = Output { segments: Vec::new(), purged_max_seq: 0, expired: 0 };
     match plan.kind {
         Kind::Merge { level } => {
             merge(shared, m, sorted_runs(&plan.inputs), level, &deletes, purge_seq, &mut out).await?
         }
-        Kind::Rewrite => {
+        Kind::Rewrite | Kind::Expire => {
             for s in &plan.inputs {
                 merge(shared, m, vec![vec![s.clone()]], s.level, &deletes, purge_seq, &mut out).await?;
             }
         }
-        Kind::Move { .. } | Kind::Drop => {}
+        Kind::Move { .. } | Kind::Drop | Kind::DropExpired => {}
     }
     Ok(out)
 }
@@ -175,18 +217,36 @@ async fn merge(
         include_tombstones: true,
         mode: ReadMode::Bulk,
         deletes: Some(deletes.clone()),
+        expire_at: None,
     };
     let mut it = MergeIter::new(shared.clone(), &m.db_id, &[], runs, spec);
     let mut b = SegmentBuilder::new(cfg.block_target, cfg.compression);
+    let mut records = false;
+    let records_horizon = records_horizon(m, cfg);
     while let Some(e) = it.next().await? {
+        if is_commit_key(&e.key) && e.seq <= records_horizon {
+            out.expired += 1;
+            continue;
+        }
+        // Every reader of the manifest the output joins reads at its time
+        // or later, when these entries have expired.
+        let e = match e.expired(m.time_ms) {
+            false => e,
+            true => {
+                out.expired += 1;
+                Entry::tombstone(e.key, e.seq)
+            }
+        };
         if e.value.is_tombstone() && e.seq <= purge_seq && !covered_below(m, level, &e.key) {
             out.purged_max_seq = out.purged_max_seq.max(e.seq);
             continue;
         }
-        if b.size_estimate() >= cfg.segment_target_bytes {
+        // Cut where commit records begin, so that no segment holds both.
+        if b.size_estimate() >= cfg.segment_target_bytes || (is_commit_key(&e.key) && !b.is_empty() && !records) {
             let full = std::mem::replace(&mut b, SegmentBuilder::new(cfg.block_target, cfg.compression));
             out.segments.push(write(shared, &m.db_id, full, level, m.version).await?);
         }
+        records = is_commit_key(&e.key);
         b.add(&e);
     }
     if !b.is_empty() {
@@ -246,6 +306,8 @@ pub(crate) fn seg_meta(id: String, level: u8, s: &segment::SegmentStats, deletes
         min_seq: s.min_seq,
         max_seq: s.max_seq,
         deletes_applied,
+        expiring: s.expiring,
+        expires_max: s.expires_max,
     }
 }
 
@@ -266,6 +328,8 @@ mod tests {
             min_seq: 0,
             max_seq: 0,
             deletes_applied: 0,
+            expiring: 0,
+            expires_max: 0,
         }
     }
 
@@ -288,7 +352,7 @@ mod tests {
     }
 
     fn manifest(segs: Vec<SegmentMeta>) -> Manifest {
-        let mut m = Manifest::new("d", 0);
+        let mut m = Manifest::new("d", 0, None);
         m.segments = segs;
         m.sort_segments();
         m.check_levels().unwrap();

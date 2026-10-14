@@ -56,7 +56,9 @@ pub struct EngineConfig {
     pub clock_sync_max_age_ms: u64,
     /// Measurements less precise than this are discarded.
     pub clock_sync_max_error_ms: u64,
-    pub commit_ring_max: usize,
+    /// How long a commit's record stays, for idempotent retries and for
+    /// resolving ambiguous outcomes.
+    pub commit_retention_ms: u64,
     pub compaction_concurrency: usize,
     pub commit_retry_max: u32,
     /// Maximum time a commit may wait in the committer before it is
@@ -105,7 +107,7 @@ impl Default for EngineConfig {
             clock_sync_interval_ms: 10 * 60_000,
             clock_sync_max_age_ms: 3_600_000,
             clock_sync_max_error_ms: 10_000,
-            commit_ring_max: 1024,
+            commit_retention_ms: 10 * 60_000,
             compaction_concurrency: 2,
             commit_retry_max: 8,
             commit_timeout_ms: 10_000,
@@ -134,6 +136,10 @@ impl EngineConfig {
                 "clock_sync_interval_ms must be below clock_sync_max_age_ms",
             ),
             (self.level_size_ratio >= 2, "level_size_ratio must be at least 2"),
+            (
+                self.commit_retention_ms >= 2 * self.commit_timeout_ms,
+                "commit_retention_ms must leave time to resolve commits after commit_timeout_ms",
+            ),
         ];
         match rules.iter().find(|(ok, _)| !ok) {
             Some((_, why)) => Err((*why).to_string()),

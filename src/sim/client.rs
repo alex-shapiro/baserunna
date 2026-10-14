@@ -21,6 +21,10 @@ pub struct Client {
     pub pin: Option<usize>,
     rng: Mutex<Rng>,
     pub name: String,
+    /// Client IP address sent in `X-Forwarded-For`.
+    pub addr: String,
+    /// Whether to wait out `Retry-After` and retry 429 rate-limited responses.
+    pub retry_rate_limited: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +67,16 @@ pub fn url_escape(b: &[u8]) -> String {
 
 impl Client {
     pub fn new(sim: &Arc<Sim>, name: &str) -> Client {
-        Client { rng: Mutex::new(sim.fork_rng()), sim: sim.clone(), token: None, pin: None, name: name.to_string() }
+        let h = crate::util::sha256(name.as_bytes());
+        Client {
+            rng: Mutex::new(sim.fork_rng()),
+            sim: sim.clone(),
+            token: None,
+            pin: None,
+            name: name.to_string(),
+            addr: format!("10.{}.{}.{}", h[0], h[1], h[2]),
+            retry_rate_limited: true,
+        }
     }
 
     pub fn with_token(sim: &Arc<Sim>, name: &str, token: &str) -> Client {
@@ -91,11 +104,30 @@ impl Client {
         headers: &[(&str, String)],
         body: Bytes,
     ) -> Result<SimResponse, NetError> {
+        loop {
+            let r = self.send_once(method, path, headers, body.clone()).await;
+            match &r {
+                Ok(resp) if resp.status == 429 && self.retry_rate_limited => {
+                    let secs = resp.headers.get("retry-after").and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+                    self.sim.sleep(1_000 * secs.unwrap_or(1).clamp(1, 60)).await;
+                }
+                _ => return r,
+            }
+        }
+    }
+
+    async fn send_once(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, String)],
+        body: Bytes,
+    ) -> Result<SimResponse, NetError> {
         let Some(i) = self.pick() else {
             self.sim.sleep(100).await;
             return Err(NetError::Refused);
         };
-        let mut b = Request::builder().method(method).uri(path);
+        let mut b = Request::builder().method(method).uri(path).header("x-forwarded-for", self.addr.as_str());
         if let Some(t) = &self.token {
             b = b.header("authorization", format!("Bearer {t}"));
         }

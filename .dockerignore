@@ -1,0 +1,7 @@
+target
+data
+fuzz
+mutants.out*
+.git
+.claude
+.cargo

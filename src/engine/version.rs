@@ -2,10 +2,11 @@
 //! point lookups, merged range scans and conflict checks.
 
 use super::cache::{CacheKey, CacheVal};
-use super::manifest::{MAX_LEVEL, Manifest, SegmentMeta};
+use super::manifest::{Levels, MAX_LEVEL, Manifest, SegmentMeta};
+use super::range_delete::RangeDeletes;
 use super::segment::{self, Block, FOOTER_LEN, Footer, SegmentIndex};
-use super::types::{Entry, Seq};
-use super::{Shared, seg_key};
+use super::types::{Entry, Seq, Value};
+use super::{Shared, levels_key, seg_key};
 use crate::error::{Error, Result};
 use crate::store::GetOpts;
 use bytes::Bytes;
@@ -18,6 +19,8 @@ pub struct Version {
     pub m: Manifest,
     pub etag: String,
     pub(crate) shared: Arc<Shared>,
+    /// `m.range_deletes`, indexed for lookups.
+    deletes: Arc<RangeDeletes>,
 }
 
 /// Owned key range.
@@ -117,6 +120,69 @@ impl KeyRange {
 }
 
 impl Shared {
+    /// Decodes a stored manifest, fetching deeper levels from its levels
+    /// object if not already present in `current`.
+    pub(crate) async fn load_manifest(&self, db: &str, data: &Bytes, current: Option<&Version>) -> Result<Manifest> {
+        let mut m = Manifest::decode(data)?;
+        if m.db_id != db {
+            return Err(Error::internal("manifest belongs to another database"));
+        }
+        let Some(id) = m.levels.clone() else { return Ok(m) };
+        if let Some(c) = current.filter(|c| c.m.levels.as_deref() == Some(id.as_str())) {
+            m.segments.extend_from_slice(c.m.deep_segments());
+            m.check_levels().map_err(Error::internal)?;
+            return Ok(m);
+        }
+        m.attach_levels(&*self.levels(db, &id).await?)?;
+        Ok(m)
+    }
+
+    async fn levels(&self, db: &str, id: &str) -> Result<Arc<Levels>> {
+        let key = levels_key(db, id);
+        let ck = CacheKey { seg_path: Arc::from(key.as_str()), block: 0 };
+        if let Some(CacheVal::Levels(l)) = self.cache.get(&ck) {
+            return Ok(l);
+        }
+        let tier = self.cfg.local_tier.as_ref();
+        let local = match tier {
+            Some(t) => t.0.get(&key).await.and_then(|d| Levels::decode(&d).ok()),
+            None => None,
+        };
+        let l = match local {
+            Some(l) => l,
+            None => {
+                let g = self.retry.run(|| self.store.get(&key, GetOpts::default())).await?;
+                let l = Levels::decode(&g.data)?;
+                if let Some(t) = tier.cloned() {
+                    let k = key.clone();
+                    self.env.spawn(async move { t.0.put(&k, g.data).await });
+                }
+                l
+            }
+        };
+        if l.db_id != db || l.id != id {
+            return Err(Error::internal("levels object belongs to another database"));
+        }
+        let l = Arc::new(l);
+        self.cache.insert(ck, CacheVal::Levels(l.clone()));
+        Ok(l)
+    }
+
+    /// Writes a new levels object under a random ID and populates local caches.
+    pub(crate) async fn write_levels(&self, db: &str, segments: Vec<SegmentMeta>) -> Result<String> {
+        let id = self.env.random_hex(16);
+        let l = Levels { db_id: db.to_string(), id: id.clone(), segments };
+        let data = l.encode();
+        let key = levels_key(db, &id);
+        self.retry.run(|| self.store.put(&key, data.clone(), crate::store::PutMode::Overwrite)).await?;
+        self.counters.add(&super::Activity { levels_objects_written: 1, ..Default::default() });
+        self.cache.insert(CacheKey { seg_path: Arc::from(key.as_str()), block: 0 }, CacheVal::Levels(Arc::new(l)));
+        if let Some(t) = self.cfg.local_tier.clone() {
+            self.env.spawn(async move { t.0.put(&key, data).await });
+        }
+        Ok(id)
+    }
+
     fn cache_key(&self, db: &str, seg: &str, block: u32) -> CacheKey {
         CacheKey { seg_path: Arc::from(seg_key(db, seg).as_str()), block }
     }
@@ -361,6 +427,8 @@ pub(crate) struct IterSpec {
     pub reverse: bool,
     pub include_tombstones: bool,
     pub mode: ReadMode,
+    /// Range tombstones to filter out covered entries.
+    pub deletes: Option<Arc<RangeDeletes>>,
 }
 
 /// A merged iteration over a database's sources (or a subset of them, for
@@ -374,6 +442,7 @@ pub struct MergeIter {
     reverse: bool,
     include_tombstones: bool,
     mode: ReadMode,
+    deletes: Option<Arc<RangeDeletes>>,
     cursors: Vec<Cursor>,
     heads: Option<Vec<Option<Entry>>>,
 }
@@ -387,7 +456,8 @@ impl MergeIter {
         runs: Vec<Vec<SegmentMeta>>,
         spec: IterSpec,
     ) -> MergeIter {
-        let IterSpec { range, reverse, include_tombstones, mode } = spec;
+        let IterSpec { range, reverse, include_tombstones, mode, deletes } = spec;
+        let deletes = deletes.filter(|d| !d.is_empty());
         debug_assert!(!(reverse && mode == ReadMode::Bulk));
         let mut cursors = Vec::with_capacity(runs.len() + 1);
         let mut entries: Vec<Entry> = tail.iter().filter(|e| range.contains(&e.key)).cloned().collect();
@@ -412,7 +482,17 @@ impl MergeIter {
                 })));
             }
         }
-        MergeIter { shared, db: db.to_string(), range, reverse, include_tombstones, mode, cursors, heads: None }
+        MergeIter {
+            shared,
+            db: db.to_string(),
+            range,
+            reverse,
+            include_tombstones,
+            mode,
+            deletes,
+            cursors,
+            heads: None,
+        }
     }
 
     async fn peek(&self, c: &mut Cursor) -> Result<Option<Entry>> {
@@ -557,6 +637,9 @@ impl MergeIter {
                     heads[i] = self.peek(c).await?;
                 }
             }
+            if self.deletes.as_ref().is_some_and(|d| d.seq_at(&winner.key) > winner.seq) {
+                continue;
+            }
             if self.include_tombstones || !winner.value.is_tombstone() {
                 break Some(winner);
             }
@@ -567,12 +650,31 @@ impl MergeIter {
 }
 
 impl Version {
+    pub fn new(m: Manifest, etag: String, shared: Arc<Shared>) -> Version {
+        let deletes = Arc::new(RangeDeletes::new(&m.range_deletes));
+        Version { m, etag, shared, deletes }
+    }
+
     pub fn version(&self) -> Seq {
         self.m.version
     }
 
-    /// Newest entry for `key`, including tombstones.
+    /// Returns the newest entry for `key`, including tombstones. If covered by
+    /// a range tombstone, returns a tombstone with that sequence number.
     pub async fn get_entry(&self, key: &[u8]) -> Result<Option<Entry>> {
+        let found = self.stored_entry(key).await?;
+        let deleted_at = self.deletes.seq_at(key);
+        Ok(match found {
+            Some(e) if e.seq >= deleted_at => Some(e),
+            _ if deleted_at > 0 => {
+                Some(Entry { key: Bytes::copy_from_slice(key), seq: deleted_at, value: Value::Tombstone })
+            }
+            none => none,
+        })
+    }
+
+    /// Returns the newest stored entry for `key`, ignoring range tombstones.
+    async fn stored_entry(&self, key: &[u8]) -> Result<Option<Entry>> {
         if let Ok(i) = self.m.tail.binary_search_by(|e| e.key.as_ref().cmp(key)) {
             return Ok(Some(self.m.tail[i].clone()));
         }
@@ -628,20 +730,33 @@ impl Version {
         runs
     }
 
-    /// The newest entry of each key in `range`, in order.
+    /// Returns the newest entry of each key in `range`, in order. Keys covered
+    /// by a range tombstone are skipped, even with `include_tombstones`.
     pub fn iter(&self, range: &KeyRange, reverse: bool, include_tombstones: bool) -> MergeIter {
-        let spec = IterSpec { range: range.clone(), reverse, include_tombstones, mode: ReadMode::Cached };
+        let spec = IterSpec {
+            range: range.clone(),
+            reverse,
+            include_tombstones,
+            mode: ReadMode::Cached,
+            deletes: Some(self.deletes.clone()),
+        };
         MergeIter::new(self.shared.clone(), &self.m.db_id, &self.m.tail, self.runs(|_| true), spec)
     }
 
     /// Every entry, read in bulk without filling the caches (sweeps).
     pub(crate) fn iter_bulk(&self, include_tombstones: bool) -> MergeIter {
-        let spec = IterSpec { range: KeyRange::all(), reverse: false, include_tombstones, mode: ReadMode::Bulk };
+        let spec = IterSpec {
+            range: KeyRange::all(),
+            reverse: false,
+            include_tombstones,
+            mode: ReadMode::Bulk,
+            deletes: Some(self.deletes.clone()),
+        };
         MergeIter::new(self.shared.clone(), &self.m.db_id, &self.m.tail, self.runs(|_| true), spec)
     }
 
     /// Merged scan. Returns at most `limit` entries; tombstones are skipped
-    /// unless `include_tombstones`.
+    /// unless `include_tombstones` (but see [`Version::iter`]).
     pub async fn scan(
         &self,
         range: &KeyRange,
@@ -663,19 +778,27 @@ impl Version {
         Ok(out)
     }
 
-    /// True if any entry (including tombstones and shadowed versions) in
+    /// Returns whether any entry (including tombstones) or range tombstone in
     /// `range` has `seq > after`.
     pub async fn changed_since(&self, range: &KeyRange, after: Seq) -> Result<bool> {
         if range.is_empty() {
             return Ok(false);
+        }
+        if self.deletes.changed_since(range, after) {
+            return Ok(true);
         }
         if self.m.tail.iter().any(|e| e.seq > after && range.contains(&e.key)) {
             return Ok(true);
         }
         // Each source alone: a newer entry anywhere is a change.
         for run in self.runs(|s| s.max_seq > after) {
-            let spec =
-                IterSpec { range: range.clone(), reverse: false, include_tombstones: true, mode: ReadMode::Cached };
+            let spec = IterSpec {
+                range: range.clone(),
+                reverse: false,
+                include_tombstones: true,
+                mode: ReadMode::Cached,
+                deletes: None,
+            };
             let mut it = MergeIter::new(self.shared.clone(), &self.m.db_id, &[], vec![run], spec);
             while let Some(e) = it.next().await? {
                 if e.seq > after {

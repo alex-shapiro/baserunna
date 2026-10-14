@@ -68,11 +68,19 @@ All configuration is through environment variables (see SPEC §12):
 | `BASERUNNA_DISK_CACHE_DIR`               | none                      | local disk tier for segment data, kept across restarts                     |
 | `BASERUNNA_DISK_CACHE_MB`                | 10240                     | local disk tier budget                                                     |
 | `BASERUNNA_LEASE_MS`                     | 5000                      | write-failover time bound (leases renewed for reads last 3×)               |
+| `BASERUNNA_DB_MAX_MB`                    | 10240                     | size quota of each database, blobs included; 0 for none                    |
+| `BASERUNNA_USER_RPS` / `_API_KEY_RPS`    | 500 / 500                 | requests per second per user and per API key, on each node                 |
+| `BASERUNNA_AUTH_RPS_PER_CLIENT`          | 1                         | sign-ins and sign-ups per client address (failed sign-ins also back off)   |
+| `BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT`  | 20                        | accounts created per client address                                        |
+| `BASERUNNA_TRUSTED_PROXY_HOPS`           | 0                         | proxies that append the client address to `X-Forwarded-For`                |
+| `BASERUNNA_HASH_CONCURRENCY`             | CPU count                 | password hashes computed at once                                           |
+| `BASERUNNA_DRAIN_DELAY_MS`               | 0                         | on SIGTERM/SIGINT, fail health checks this long before stopping            |
+| `BASERUNNA_SHUTDOWN_TIMEOUT_MS`          | 20000                     | longest wait for in-flight requests when stopping                          |
 | `BASERUNNA_LOG`                          | `warn`                    | `error` / `warn` / `info` / `debug`                                        |
 
 For a cluster, run any number of nodes against the same bucket behind any
-load balancer. S3 credentials come from the standard `AWS_*` variables;
-S3-compatible stores need `AWS_ENDPOINT`.
+load balancer. [`DEPLOYING.md`](DEPLOYING.md) covers TLS, load balancers, the
+container image, bucket permissions and lifecycle rules.
 
 ## Examples
 
@@ -106,11 +114,11 @@ scripts/mutants.sh                                                 # mutation te
 
 ```
 src/engine   storage engine: compressed segments, manifest, versions, group commit, leases,
-             leveled compaction, local disk tier, store clock, GC, blobs
+             range tombstones, leveled compaction, local disk tier, store clock, GC, blobs, quotas
 src/table    tuple encoding, schemas, rows, indexes, queries
 src/ops.rs   the JSON transaction-op language
 src/meta.rs  system database schema and metadata commands (dogfooded on the table layer)
-src/node.rs  a service node: routing, auth, background work
+src/node.rs  a service node: routing, auth, background work;   src/limits.rs  rate limits
 src/api      axum HTTP API and the OpenAPI document;   src/console  admin console
 src/sim      deterministic simulator, workloads and checkers
 src/store    object stores: memory, filesystem, cloud (object_store)

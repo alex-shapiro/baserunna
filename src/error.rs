@@ -19,6 +19,13 @@ pub enum Error {
         op_index: Option<usize>,
     },
     TooLarge(String),
+    /// Database storage quota exceeded.
+    QuotaExceeded(String),
+    /// Request rate limit exceeded.
+    RateLimited {
+        message: String,
+        retry_after_ms: u64,
+    },
     /// Another node holds this database's lease.
     NotOwner {
         holder: String,
@@ -63,6 +70,8 @@ impl Error {
             Error::AlreadyExists(_) => "already_exists",
             Error::PreconditionFailed { .. } => "precondition_failed",
             Error::TooLarge(_) => "too_large",
+            Error::QuotaExceeded(_) => "quota_exceeded",
+            Error::RateLimited { .. } => "rate_limited",
             Error::NotOwner { .. } | Error::Unavailable { .. } => "unavailable",
             Error::Internal(_) => "internal",
         }
@@ -77,13 +86,22 @@ impl Error {
             Error::Conflict(_) | Error::AlreadyExists(_) => 409,
             Error::PreconditionFailed { .. } => 412,
             Error::TooLarge(_) => 413,
+            Error::QuotaExceeded(_) => 507,
+            Error::RateLimited { .. } => 429,
             Error::NotOwner { .. } | Error::Unavailable { .. } => 503,
             Error::Internal(_) => 500,
         }
     }
 
     pub fn retryable(&self) -> bool {
-        matches!(self, Error::Conflict(_) | Error::TxnNotFound | Error::NotOwner { .. } | Error::Unavailable { .. })
+        matches!(
+            self,
+            Error::Conflict(_)
+                | Error::TxnNotFound
+                | Error::NotOwner { .. }
+                | Error::Unavailable { .. }
+                | Error::RateLimited { .. }
+        )
     }
 
     pub fn message(&self) -> String {
@@ -95,7 +113,9 @@ impl Error {
             | Error::Conflict(m)
             | Error::AlreadyExists(m)
             | Error::TooLarge(m)
+            | Error::QuotaExceeded(m)
             | Error::Internal(m) => m.clone(),
+            Error::RateLimited { message, .. } => message.clone(),
             Error::TxnNotFound => "transaction not found (expired, aborted, or its node changed)".into(),
             Error::PreconditionFailed { message, .. } => message.clone(),
             Error::NotOwner { holder, .. } => format!("database is leased by node {holder}"),

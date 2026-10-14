@@ -75,6 +75,8 @@ pub struct ApiKey {
     pub secret_hash: String,
     pub db_id: Option<String>,
     pub read_only: bool,
+    /// Optional request rate limit in requests per second. Defaults to the node rate limit if None.
+    pub rate_limit: Option<u32>,
     pub created_at: i64,
 }
 
@@ -85,6 +87,7 @@ impl ApiKey {
             "name": self.name,
             "db": db_name,
             "read_only": self.read_only,
+            "rate_limit": self.rate_limit,
             "created_at": self.created_at,
         })
     }
@@ -152,6 +155,7 @@ fn tables() -> Vec<Json> {
             {"name": "secret_hash", "type": "string", "nullable": false},
             {"name": "db_id", "type": "string"},
             {"name": "read_only", "type": "bool", "nullable": false, "default": false},
+            {"name": "rate_limit", "type": "int"},
             {"name": "created_at", "type": "int", "nullable": false}
         ], "indexes": [{"name": "by_user", "columns": ["user_id"]}]}),
         json!({"name": "databases", "primary_key": ["id"], "columns": [

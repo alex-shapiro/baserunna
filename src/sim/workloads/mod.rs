@@ -10,6 +10,7 @@ pub mod console;
 pub mod db_churn;
 pub mod kv_model;
 pub mod lifecycle;
+pub mod limits;
 pub mod register;
 pub mod schema_race;
 pub mod tables;
@@ -130,6 +131,25 @@ fn faulty3() -> super::SimConfig {
     super::SimConfig::faulty(3)
 }
 
+/// Applies small storage quotas to exercise quota limits in kv_model workloads.
+fn with_quota(mut c: super::SimConfig) -> super::SimConfig {
+    c.engine.db_max_bytes = 36 * 1024;
+    c.engine.quota_sweep_interval_ms = 10_000;
+    c
+}
+
+fn kv_basic() -> super::SimConfig {
+    with_quota(super::SimConfig::basic())
+}
+
+fn kv_faulty3() -> super::SimConfig {
+    with_quota(super::SimConfig::faulty(3))
+}
+
+fn kv_hostile3() -> super::SimConfig {
+    with_quota(super::SimConfig::hostile(3))
+}
+
 fn faulty2() -> super::SimConfig {
     super::SimConfig::faulty(2)
 }
@@ -180,12 +200,8 @@ fn console_cfg() -> super::SimConfig {
 /// `sim_tool` example).
 pub fn scenarios() -> Vec<Scenario> {
     vec![
-        Scenario {
-            name: "kv_single_node",
-            config: super::SimConfig::basic,
-            run: |s| Box::pin(kv_model::run(s, 1, 120, false)),
-        },
-        Scenario { name: "kv_faulty_cluster", config: faulty3, run: |s| Box::pin(kv_model::run(s, 2, 60, true)) },
+        Scenario { name: "kv_single_node", config: kv_basic, run: |s| Box::pin(kv_model::run(s, 1, 120, false)) },
+        Scenario { name: "kv_faulty_cluster", config: kv_faulty3, run: |s| Box::pin(kv_model::run(s, 2, 60, true)) },
         Scenario { name: "bank", config: faulty3, run: |s| Box::pin(bank::run(s, 6, 4, 12, true)) },
         Scenario { name: "register", config: faulty3, run: |s| Box::pin(register::run(s, 3, 3, 30, true)) },
         Scenario { name: "tables", config: faulty3, run: |s| Box::pin(tables::run(s, 80, 3, true)) },
@@ -194,12 +210,13 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario { name: "lifecycle", config: faulty3, run: |s| Box::pin(lifecycle::run(s, 4, true)) },
         Scenario { name: "console", config: console_cfg, run: |s| Box::pin(console::run(s)) },
         Scenario { name: "chaos", config: faulty4, run: |s| Box::pin(chaos_mix(s, 2)) },
+        Scenario { name: "limits", config: limits::config, run: |s| Box::pin(limits::run(s)) },
         Scenario { name: "api_tour", config: faulty3, run: |s| Box::pin(api_tour::run(s)) },
         Scenario { name: "schema_race", config: faulty3, run: |s| Box::pin(schema_race::run(s, 3, 40, true)) },
         Scenario { name: "abandoned", config: faulty3, run: |s| Box::pin(abandoned::run(s, 4, 12, true)) },
         Scenario { name: "blob_gc_race", config: blob_gc_cfg, run: |s| Box::pin(blob_gc_race::run(s, 2, 3, 30, true)) },
         Scenario { name: "db_churn", config: churn_cfg, run: |s| Box::pin(db_churn::run(s, 4, 10, 60, true)) },
-        Scenario { name: "kv_hostile", config: hostile3, run: |s| Box::pin(kv_model::run(s, 2, 60, true)) },
+        Scenario { name: "kv_hostile", config: kv_hostile3, run: |s| Box::pin(kv_model::run(s, 2, 60, true)) },
         Scenario { name: "bank_hostile", config: hostile3, run: |s| Box::pin(bank::run(s, 6, 4, 12, true)) },
         Scenario { name: "register_hostile", config: hostile3, run: |s| Box::pin(register::run(s, 3, 3, 30, true)) },
         Scenario { name: "tables_hostile", config: hostile3, run: |s| Box::pin(tables::run(s, 80, 3, true)) },

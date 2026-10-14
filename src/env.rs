@@ -142,6 +142,17 @@ impl Env {
         t.spawn(fut);
     }
 
+    /// Runs a blocking closure off the async worker threads, or inline under simulation.
+    pub async fn run_blocking<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> T {
+        match self.clock {
+            Clock::Sim { .. } => f(),
+            Clock::Real => match tokio::task::spawn_blocking(f).await {
+                Ok(v) => v,
+                Err(e) => std::panic::resume_unwind(e.into_panic()),
+            },
+        }
+    }
+
     /// Abort every task spawned through this environment.
     pub fn shutdown(&self) {
         let mut t = self.tasks.lock().unwrap_or_else(|e| e.into_inner());

@@ -3,7 +3,7 @@
 //! router with the signed-in user's session, so the console has exactly
 //! the API's semantics (routing, authorization, validation). See SPEC §11.
 
-use crate::api::{SESSION_COOKIE, cookie};
+use crate::api::{ClientAddr, SESSION_COOKIE, cookie};
 use crate::auth;
 use crate::node::Node;
 use crate::util::{b64, hmac_sha256};
@@ -131,6 +131,8 @@ async fn nav(node: &Arc<Node>, headers: &HeaderMap) -> Result<Nav, Response> {
         Ok(p) if p.is_session() => {
             Ok(Nav { csrf: csrf_for(node, &token), email: p.user.email.clone(), is_admin: p.user.is_admin, token })
         }
+        // Propagate retryable errors (e.g. rate limits) rather than redirecting to login.
+        Err(e) if e.retryable() => Err(e.into_response()),
         _ => Err(Redirect::to("/console/login").into_response()),
     }
 }
@@ -232,21 +234,29 @@ fn session_redirect(node: &Node, token: &str) -> Response {
     r
 }
 
-async fn login_post(State(node): State<Arc<Node>>, Form(f): F) -> Response {
-    let body = json!({"email": f.get("email"), "password": f.get("password")});
-    let (st, j) = api(&node, "", "POST", "/v1/auth/login", Some(body)).await;
-    match (st, j["token"].as_str()) {
-        (200, Some(t)) => session_redirect(&node, t),
-        _ => back("/console/login", &err_msg(&j), false),
+fn field<'a>(f: &'a BTreeMap<String, String>, k: &str) -> &'a str {
+    f.get(k).map_or("", |v| v.as_str())
+}
+
+async fn login_post(State(node): State<Arc<Node>>, client: ClientAddr, Form(f): F) -> Response {
+    let session = async {
+        let user = node.password_login(&client.0, field(&f, "email"), field(&f, "password")).await?;
+        node.create_session(&user.id).await
+    };
+    match session.await {
+        Ok(t) => session_redirect(&node, &t),
+        Err(e) => back("/console/login", &e.message(), false),
     }
 }
 
-async fn signup_post(State(node): State<Arc<Node>>, Form(f): F) -> Response {
-    let body = json!({"email": f.get("email"), "password": f.get("password")});
-    let (st, j) = api(&node, "", "POST", "/v1/auth/signup", Some(body)).await;
-    match (st, j["token"].as_str()) {
-        (201, Some(t)) => session_redirect(&node, t),
-        _ => back("/console/login", &err_msg(&j), false),
+async fn signup_post(State(node): State<Arc<Node>>, client: ClientAddr, Form(f): F) -> Response {
+    let session = async {
+        let (_, r) = node.password_signup(&client.0, field(&f, "email"), field(&f, "password")).await?;
+        node.create_session(r["user_id"].as_str().unwrap_or_default()).await
+    };
+    match session.await {
+        Ok(t) => session_redirect(&node, &t),
+        Err(e) => back("/console/login", &e.message(), false),
     }
 }
 

@@ -2,8 +2,11 @@
 //!
 //! It is the only mutable object of a database and is only ever written with
 //! a conditional PUT. Small writes are kept inline in `tail`, which makes the
-//! manifest the write-ahead log as well.
+//! manifest the write-ahead log as well. When a database has many segments below
+//! level 0, their metadata moves to an immutable levels object updated only
+//! during compaction, avoiding rewriting them on regular commits.
 
+use super::range_delete::RangeTombstone;
 use super::types::{Entry, Seq, valid_object_id};
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
 use crate::util::crc32c::crc32c;
@@ -13,7 +16,9 @@ const MAGIC: &[u8; 4] = b"BRMF";
 
 /// The database was deleted: every read and commit fails with not-found.
 pub const FLAG_DELETED: u64 = 1;
-const FORMAT: u16 = 2;
+const FORMAT: u16 = 3;
+const LEVELS_MAGIC: &[u8; 4] = b"BRLV";
+const LEVELS_FORMAT: u16 = 1;
 
 /// Deepest segment level. Level 0 holds flushed tails, newest first, which
 /// may overlap; each level from 1 to `MAX_LEVEL` is one sorted run of
@@ -45,12 +50,68 @@ pub struct SegmentMeta {
     pub max_key: Bytes,
     pub min_seq: Seq,
     pub max_seq: Seq,
+    /// Sequence number through which all committed range deletions have been applied to this segment.
+    pub deletes_applied: Seq,
+}
+
+impl SegmentMeta {
+    fn encode(&self, w: &mut Writer) {
+        w.str(&self.id);
+        w.u8(self.level);
+        w.varint(self.size);
+        w.varint(self.entries);
+        w.varint(self.tombstones);
+        w.bytes(&self.min_key);
+        w.bytes(&self.max_key);
+        w.varint(self.min_seq);
+        w.varint(self.max_seq);
+        w.varint(self.deletes_applied);
+    }
+
+    fn decode(r: &mut Reader<'_>) -> DResult<SegmentMeta> {
+        let s = SegmentMeta {
+            id: r.string()?,
+            level: r.u8()?,
+            size: r.varint()?,
+            entries: r.varint()?,
+            tombstones: r.varint()?,
+            min_key: Bytes::copy_from_slice(r.bytes()?),
+            max_key: Bytes::copy_from_slice(r.bytes()?),
+            min_seq: r.varint()?,
+            max_seq: r.varint()?,
+            deletes_applied: r.varint()?,
+        };
+        if !valid_object_id(&s.id) {
+            return Err(DecodeError("bad segment id"));
+        }
+        Ok(s)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ObjKind {
     Segment = 0,
     Blob = 1,
+    /// A levels object (see [`Manifest::levels`]).
+    Levels = 2,
+}
+
+/// Tracks referenced blob bytes for size quotas, updated incrementally on commit and reconciled by sweeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct BlobBytes {
+    /// Total bytes of all blobs bound by commits since inception.
+    pub bound: u64,
+    /// Total bytes of distinct referenced blobs discovered during the last sweep.
+    pub swept: u64,
+    /// Value of `bound` at the time of the last sweep.
+    pub swept_at: u64,
+}
+
+impl BlobBytes {
+    /// Estimated total bytes of referenced blobs, combining the last sweep total with subsequent bindings.
+    pub fn total(&self) -> u64 {
+        self.swept + self.bound.saturating_sub(self.swept_at)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,12 +136,17 @@ pub struct Manifest {
     /// order. For any key, a shallower segment holds a newer entry than a
     /// deeper one.
     pub segments: Vec<SegmentMeta>,
+    /// ID of the external levels object holding segments below L0, if not stored inline.
+    pub levels: Option<String>,
     /// Incremented by every compaction install. A compaction installs only
     /// onto the manifest it was planned from (flushes aside), so two
     /// compactions can never interleave.
     pub compaction_seq: u64,
-    /// Sorted by key; newest entry per key.
+    /// Sorted by key; newest entry per key. Does not contain entries deleted by range tombstones.
     pub tail: Vec<Entry>,
+    /// Active range tombstones in commit order.
+    pub range_deletes: Vec<RangeTombstone>,
+    /// Tombstones (point and range) with seq <= horizon may have been purged.
     pub tombstone_horizon: Seq,
     /// Oldest first: (commit id, version).
     pub recent_commits: Vec<(u128, Seq)>,
@@ -88,6 +154,7 @@ pub struct Manifest {
     pub version_times: Vec<(Seq, u64)>,
     pub obsolete: Vec<Obsolete>,
     pub last_sweep_ms: u64,
+    pub blob_bytes: BlobBytes,
 }
 
 impl Manifest {
@@ -109,6 +176,11 @@ impl Manifest {
         self.tail.iter().map(|e| e.size()).sum()
     }
 
+    /// Total stored bytes tracked against quotas (segments, tail, and referenced blobs).
+    pub fn stored_bytes(&self) -> u64 {
+        self.segments.iter().map(|s| s.size).sum::<u64>() + self.tail_bytes() as u64 + self.blob_bytes.total()
+    }
+
     pub fn encode(&self) -> Bytes {
         let mut w = Writer::with_capacity(256 + self.tail_bytes());
         w.raw(MAGIC);
@@ -127,22 +199,29 @@ impl Manifest {
                 w.varint(l.ms);
             }
         }
-        w.varint(self.segments.len() as u64);
-        for s in &self.segments {
-            w.str(&s.id);
-            w.u8(s.level);
-            w.varint(s.size);
-            w.varint(s.entries);
-            w.varint(s.tombstones);
-            w.bytes(&s.min_key);
-            w.bytes(&s.max_key);
-            w.varint(s.min_seq);
-            w.varint(s.max_seq);
+        let inline = match &self.levels {
+            Some(_) => self.level(0),
+            None => &self.segments[..],
+        };
+        w.varint(inline.len() as u64);
+        for s in inline {
+            s.encode(&mut w);
+        }
+        match &self.levels {
+            None => w.u8(0),
+            Some(id) => {
+                w.u8(1);
+                w.str(id);
+            }
         }
         w.varint(self.compaction_seq);
         w.varint(self.tail.len() as u64);
         for e in &self.tail {
             e.encode(&mut w);
+        }
+        w.varint(self.range_deletes.len() as u64);
+        for t in &self.range_deletes {
+            t.encode(&mut w);
         }
         w.varint(self.tombstone_horizon);
         w.varint(self.recent_commits.len() as u64);
@@ -162,6 +241,9 @@ impl Manifest {
             w.varint(o.since_ms);
         }
         w.varint(self.last_sweep_ms);
+        w.varint(self.blob_bytes.bound);
+        w.varint(self.blob_bytes.swept);
+        w.varint(self.blob_bytes.swept_at);
         let crc = crc32c(&w.buf);
         w.u32(crc);
         Bytes::from(w.into_inner())
@@ -197,22 +279,22 @@ impl Manifest {
         let n = r.len(max)?;
         let mut segments = Vec::with_capacity(n.min(1024));
         for _ in 0..n {
-            let s = SegmentMeta {
-                id: r.string()?,
-                level: r.u8()?,
-                size: r.varint()?,
-                entries: r.varint()?,
-                tombstones: r.varint()?,
-                min_key: Bytes::copy_from_slice(r.bytes()?),
-                max_key: Bytes::copy_from_slice(r.bytes()?),
-                min_seq: r.varint()?,
-                max_seq: r.varint()?,
-            };
-            if !valid_object_id(&s.id) {
-                return Err(DecodeError("bad segment id"));
-            }
-            segments.push(s);
+            segments.push(SegmentMeta::decode(&mut r)?);
         }
+        let levels = match r.u8()? {
+            0 => None,
+            1 => {
+                let id = r.string()?;
+                if !valid_object_id(&id) {
+                    return Err(DecodeError("bad levels id"));
+                }
+                if segments.iter().any(|s| s.level > 0) {
+                    return Err(DecodeError("deep segments inline and in a levels object"));
+                }
+                Some(id)
+            }
+            _ => return Err(DecodeError("bad levels tag")),
+        };
         let compaction_seq = r.varint()?;
         let n = r.len(r.remaining())?;
         let mut tail: Vec<Entry> = Vec::with_capacity(n.min(65536));
@@ -224,6 +306,11 @@ impl Manifest {
                 return Err(DecodeError("tail not sorted"));
             }
             tail.push(e);
+        }
+        let n = r.len(r.remaining())?;
+        let mut range_deletes = Vec::with_capacity(n.min(4096));
+        for _ in 0..n {
+            range_deletes.push(RangeTombstone::decode(&mut r)?);
         }
         let tombstone_horizon = r.varint()?;
         let n = r.len(r.remaining())?;
@@ -242,6 +329,7 @@ impl Manifest {
             let kind = match r.u8()? {
                 0 => ObjKind::Segment,
                 1 => ObjKind::Blob,
+                2 => ObjKind::Levels,
                 _ => return Err(DecodeError("bad obsolete kind")),
             };
             let id = r.string()?;
@@ -251,6 +339,7 @@ impl Manifest {
             obsolete.push(Obsolete { kind, id, since_ms: r.varint()? });
         }
         let last_sweep_ms = r.varint()?;
+        let blob_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
         if !r.is_empty() {
             return Err(DecodeError("manifest trailing data"));
         }
@@ -262,16 +351,36 @@ impl Manifest {
             flags,
             lease,
             segments,
+            levels,
             compaction_seq,
             tail,
+            range_deletes,
             tombstone_horizon,
             recent_commits,
             version_times,
             obsolete,
             last_sweep_ms,
+            blob_bytes,
         };
         m.check_levels().map_err(DecodeError)?;
         Ok(m)
+    }
+
+    /// The segments below level 0.
+    pub fn deep_segments(&self) -> &[SegmentMeta] {
+        &self.segments[self.level(0).len()..]
+    }
+
+    /// Attaches segments from an external levels object to a decoded manifest.
+    pub fn attach_levels(&mut self, levels: &Levels) -> DResult<()> {
+        if self.levels.as_deref() != Some(levels.id.as_str()) || levels.db_id != self.db_id {
+            return Err(DecodeError("levels object belongs to another manifest"));
+        }
+        if !self.deep_segments().is_empty() {
+            return Err(DecodeError("levels already attached"));
+        }
+        self.segments.extend(levels.segments.iter().cloned());
+        self.check_levels().map_err(DecodeError)
     }
 
     /// The segments of `level`.
@@ -324,6 +433,63 @@ impl Manifest {
     }
 }
 
+/// Immutable levels object storing segment metadata below level 0 (`dbs/{db}/levels/{id}`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Levels {
+    pub db_id: String,
+    pub id: String,
+    pub segments: Vec<SegmentMeta>,
+}
+
+impl Levels {
+    pub fn encode(&self) -> Bytes {
+        let mut w = Writer::with_capacity(64 + 100 * self.segments.len());
+        w.raw(LEVELS_MAGIC);
+        w.u16(LEVELS_FORMAT);
+        w.str(&self.db_id);
+        w.str(&self.id);
+        w.varint(self.segments.len() as u64);
+        for s in &self.segments {
+            s.encode(&mut w);
+        }
+        let crc = crc32c(&w.buf);
+        w.u32(crc);
+        Bytes::from(w.into_inner())
+    }
+
+    pub fn decode(data: &[u8]) -> DResult<Levels> {
+        if data.len() < 10 {
+            return Err(DecodeError("levels object too short"));
+        }
+        let (body, c) = data.split_at(data.len() - 4);
+        if crc32c(body) != u32::from_le_bytes([c[0], c[1], c[2], c[3]]) {
+            return Err(DecodeError("levels checksum mismatch"));
+        }
+        let mut r = Reader::new(body);
+        if r.take(4)? != LEVELS_MAGIC {
+            return Err(DecodeError("bad levels magic"));
+        }
+        if r.u16()? != LEVELS_FORMAT {
+            return Err(DecodeError("unsupported levels format"));
+        }
+        let db_id = r.string()?;
+        let id = r.string()?;
+        let n = r.len(r.remaining())?;
+        let mut segments = Vec::with_capacity(n.min(4096));
+        for _ in 0..n {
+            let s = SegmentMeta::decode(&mut r)?;
+            if s.level == 0 {
+                return Err(DecodeError("level 0 segment in a levels object"));
+            }
+            segments.push(s);
+        }
+        if !r.is_empty() {
+            return Err(DecodeError("levels trailing data"));
+        }
+        Ok(Levels { db_id, id, segments })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +513,7 @@ mod tests {
             max_key: Bytes::from_static(b"z"),
             min_seq: 1,
             max_seq: 40,
+            deletes_applied: 30,
         });
         m.tail.push(Entry { key: Bytes::from_static(b"k1"), seq: 41, value: Value::Inline(Bytes::from_static(b"v")) });
         m.tail.push(Entry { key: Bytes::from_static(b"k2"), seq: 42, value: Value::Tombstone });
@@ -355,10 +522,18 @@ mod tests {
             seq: 42,
             value: Value::Blob(BlobRef { id: "a".repeat(32), size: 5, sha256: [1; 32], content_type: "x/y".into() }),
         });
+        m.range_deletes = vec![
+            RangeTombstone { start: Bytes::from_static(b"m"), end: Some(Bytes::from_static(b"n")), seq: 38 },
+            RangeTombstone { start: Bytes::new(), end: None, seq: 39 },
+        ];
         m.tombstone_horizon = 7;
+        m.blob_bytes = BlobBytes { bound: 500, swept: 200, swept_at: 400 };
         m.recent_commits = vec![(1, 41), (u128::MAX, 42)];
         m.version_times = vec![(0, 100), (40, 200)];
-        m.obsolete = vec![Obsolete { kind: ObjKind::Blob, id: "b".repeat(32), since_ms: 5 }];
+        m.obsolete = vec![
+            Obsolete { kind: ObjKind::Blob, id: "b".repeat(32), since_ms: 5 },
+            Obsolete { kind: ObjKind::Levels, id: "c".repeat(32), since_ms: 6 },
+        ];
         m
     }
 
@@ -370,6 +545,34 @@ mod tests {
         assert_eq!(m.commit_version(u128::MAX), Some(42));
         assert_eq!(m.version_at_least_age(250, 100), 0);
         assert_eq!(m.version_at_least_age(400, 100), 40);
+        assert_eq!(m.blob_bytes.total(), 300, "swept, plus bound since");
+    }
+
+    #[test]
+    fn deeper_levels_in_an_object() {
+        let mut m = sample();
+        m.segments.extend([seg('c', 3, "a", "c"), seg('d', 5, "a", "z")]);
+        m.sort_segments();
+        let inline = m.encode();
+        m.levels = Some("e".repeat(32));
+        let out_of_line = m.encode();
+        assert!(out_of_line.len() < inline.len());
+        let mut d = Manifest::decode(&out_of_line).unwrap();
+        assert_eq!(d.segments.len(), 1, "level 0 only, until attached");
+        let levels = Levels { db_id: m.db_id.clone(), id: "e".repeat(32), segments: m.deep_segments().to_vec() };
+        let enc = levels.encode();
+        assert_eq!(Levels::decode(&enc).unwrap(), levels);
+        let other = Levels { id: "f".repeat(32), ..levels.clone() };
+        assert!(d.clone().attach_levels(&other).is_err(), "another manifest's object");
+        d.attach_levels(&levels).unwrap();
+        assert_eq!(d, m);
+        assert!(d.attach_levels(&levels).is_err(), "attached twice");
+        let mut bad = levels.clone();
+        bad.segments.push(seg('g', 0, "a", "b"));
+        assert!(Levels::decode(&bad.encode()).is_err(), "level 0 belongs inline");
+        for n in 0..enc.len() {
+            assert!(Levels::decode(&enc[..n]).is_err());
+        }
     }
 
     fn seg(id: char, level: u8, min: &str, max: &str) -> SegmentMeta {
@@ -383,6 +586,7 @@ mod tests {
             max_key: Bytes::copy_from_slice(max.as_bytes()),
             min_seq: 0,
             max_seq: 0,
+            deletes_applied: 0,
         }
     }
 
@@ -411,14 +615,21 @@ mod tests {
 
     #[test]
     fn fuzz_decode_never_panics() {
-        let good = sample().encode().to_vec();
+        let mut out_of_line = sample();
+        out_of_line.levels = Some("e".repeat(32));
+        let levels = Levels {
+            db_id: "db1".into(),
+            id: "e".repeat(32),
+            segments: vec![seg('c', 3, "a", "c"), seg('d', 5, "d", "z")],
+        };
+        let goods = [sample().encode().to_vec(), out_of_line.encode().to_vec(), levels.encode().to_vec()];
         let mut r = Rng::new(5);
-        for i in 0..5000 {
+        for i in 0..8000 {
             let mut d = if i % 3 == 0 {
                 let n = r.usize(200);
                 r.bytes(n)
             } else {
-                good.clone()
+                goods[i % goods.len()].clone()
             };
             if !d.is_empty() {
                 for _ in 0..1 + r.usize(3) {
@@ -434,6 +645,9 @@ mod tests {
                 let n = d.len() - 4;
                 let c = crc32c(&d[..n]).to_le_bytes();
                 d[n..].copy_from_slice(&c);
+            }
+            if let Ok(l) = Levels::decode(&d) {
+                let _ = out_of_line.clone().attach_levels(&l);
             }
             let _ = Manifest::decode(&Bytes::from(d));
         }

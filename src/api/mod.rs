@@ -45,6 +45,10 @@ impl IntoResponse for Error {
                 err["details"] = json!({"outcome": if *outcome_unknown { "unknown" } else { "not_applied" }});
                 retry_after = *retry_after_ms;
             }
+            Error::RateLimited { retry_after_ms, .. } => {
+                err["details"] = json!({"retry_after_ms": retry_after_ms});
+                retry_after = Some(*retry_after_ms);
+            }
             _ => {}
         }
         if let Error::Internal(m) = &self {
@@ -77,6 +81,10 @@ pub fn error_from_json(status: u16, j: &Json) -> Error {
             Error::PreconditionFailed { message: m, op_index: e["details"]["op_index"].as_u64().map(|i| i as usize) }
         }
         "too_large" => Error::TooLarge(m),
+        "quota_exceeded" => Error::QuotaExceeded(m),
+        "rate_limited" => {
+            Error::RateLimited { message: m, retry_after_ms: e["details"]["retry_after_ms"].as_u64().unwrap_or(1_000) }
+        }
         "unavailable" => Error::Unavailable {
             message: m,
             retry_after_ms: Some(500),
@@ -139,6 +147,47 @@ impl FromRequestParts<Arc<Node>> for Auth {
         let t = credential(&parts.headers).ok_or_else(|| Error::Unauthenticated("missing credentials".into()))?;
         Ok(Auth(node.authenticate(&t).await?))
     }
+}
+
+/// The client address for a request, extracted from connection info or forwarded headers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientAddr(pub String);
+
+impl<S: Send + Sync> FromRequestParts<S> for ClientAddr {
+    type Rejection = Error;
+
+    async fn from_request_parts(parts: &mut http::request::Parts, _: &S) -> Result<Self> {
+        Ok(parts.extensions.get::<ClientAddr>().cloned().unwrap_or_else(|| ClientAddr("unknown".into())))
+    }
+}
+
+/// Resolves the client IP, extracting the address `hops` positions from the end of
+/// `X-Forwarded-For` if behind trusted proxies, or falling back to the peer socket.
+fn client_addr(headers: &HeaderMap, peer: Option<std::net::SocketAddr>, hops: usize) -> String {
+    if hops > 0 {
+        let forwarded: Vec<&str> = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .collect();
+        // Ignore client-supplied headers before the trusted proxy hops.
+        if let Some(a) = forwarded.len().checked_sub(hops).and_then(|i| forwarded.get(i)) {
+            return a.to_string();
+        }
+    }
+    peer.map_or_else(|| "unknown".into(), |p| p.ip().to_string())
+}
+
+async fn tag_client(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
+    if req.extensions().get::<ClientAddr>().is_none() {
+        let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
+        let addr = client_addr(req.headers(), peer, node.cfg.limits.trusted_proxy_hops);
+        req.extensions_mut().insert(ClientAddr(addr));
+    }
+    next.run(req).await
 }
 
 /// Context for database-scoped routes, inserted by the routing middleware.
@@ -473,6 +522,9 @@ macro_rules! with_read {
 pub(crate) use with_read;
 
 async fn healthz(State(node): State<Arc<Node>>) -> Response {
+    if node.draining() {
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"ok": false, "draining": true}))).into_response();
+    }
     axum::Json(json!({"ok": true, "node": node.status_json()})).into_response()
 }
 
@@ -500,6 +552,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .merge(crate::console::routes())
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(node.clone(), dedup_forwarded))
+        .layer(middleware::from_fn_with_state(node.clone(), tag_client))
         .layer(DefaultBodyLimit::max(node.cfg.max_json_body))
         .with_state(node.clone());
     node.set_router(r.clone());
@@ -507,4 +560,24 @@ pub fn router(node: Arc<Node>) -> Router {
 }
 
 pub(crate) use axum::extract::Query as QueryParams;
+
 pub(crate) type Params = QueryParams<std::collections::BTreeMap<String, String>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_addresses_come_from_trusted_proxies_only() {
+        let peer: std::net::SocketAddr = "10.0.0.9:443".parse().unwrap();
+        let mut h = HeaderMap::new();
+        assert_eq!(client_addr(&h, Some(peer), 1), "10.0.0.9", "no header: the peer");
+        h.append("x-forwarded-for", HeaderValue::from_static("6.6.6.6, 1.2.3.4"));
+        assert_eq!(client_addr(&h, Some(peer), 0), "10.0.0.9", "no trusted proxies: the header is ignored");
+        assert_eq!(client_addr(&h, Some(peer), 1), "1.2.3.4", "appended by the proxy");
+        h.append("x-forwarded-for", HeaderValue::from_static("5.5.5.5"));
+        assert_eq!(client_addr(&h, Some(peer), 2), "1.2.3.4", "two proxies");
+        assert_eq!(client_addr(&h, Some(peer), 4), "10.0.0.9", "fewer entries than proxies");
+        assert_eq!(client_addr(&HeaderMap::new(), None, 0), "unknown");
+    }
+}

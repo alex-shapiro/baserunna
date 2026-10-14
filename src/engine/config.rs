@@ -64,6 +64,14 @@ pub struct EngineConfig {
     pub commit_timeout_ms: u64,
     pub commit_batch_max: usize,
     pub version_sample_ms: u64,
+    /// Maximum stored entries in a deleted range before converting to a range tombstone.
+    pub range_delete_points_max: usize,
+    /// Maximum segments below L0 stored inline in the manifest before offloading to a levels object.
+    pub levels_inline_max: usize,
+    /// Maximum storage size allowed per database (segments, tail, and blobs), or 0 for unlimited.
+    pub db_max_bytes: u64,
+    /// Minimum interval before triggering a blob-recounting sweep after a quota refusal.
+    pub quota_sweep_interval_ms: u64,
 }
 
 impl Default for EngineConfig {
@@ -103,6 +111,10 @@ impl Default for EngineConfig {
             commit_timeout_ms: 10_000,
             commit_batch_max: 256,
             version_sample_ms: 30_000,
+            range_delete_points_max: 256,
+            levels_inline_max: 16,
+            db_max_bytes: 0,
+            quota_sweep_interval_ms: 60_000,
         }
     }
 }
@@ -144,6 +156,8 @@ impl EngineConfig {
             blob_chunk_size: 1024,
             blob_max: 1024 * 1024,
             cache_bytes: 256 * 1024,
+            range_delete_points_max: 4,
+            levels_inline_max: 2,
             ..EngineConfig::default()
         }
     }

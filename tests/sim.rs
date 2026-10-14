@@ -57,6 +57,11 @@ fn sim_console() {
 }
 
 #[test]
+fn sim_rate_limits() {
+    run_scenario("limits", 17, 2);
+}
+
+#[test]
 fn sim_chaos_mix() {
     run_scenario("chaos", 9, 1);
 }

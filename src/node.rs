@@ -5,6 +5,7 @@ use crate::cluster::{self, CLUSTER_KEY_HEADER, Transport};
 use crate::engine::{Consistency, Db, Engine, EngineConfig, Isolation, Txn};
 use crate::env::Env;
 use crate::error::{Error, Result};
+use crate::limits::{LimitConfig, Limiter, Rate};
 use crate::meta::{self, ApiKey, DbRecord, MetaCmd, NodeRecord, SYS_DB, SignupPolicy, User};
 use crate::store::DynStore;
 use crate::table::BlobResolver;
@@ -48,6 +49,7 @@ pub struct NodeConfig {
     pub db_idle_evict_ms: u64,
     pub secure_cookies: bool,
     pub txn_retries: u32,
+    pub limits: LimitConfig,
     pub engine: EngineConfig,
 }
 
@@ -77,7 +79,8 @@ impl Default for NodeConfig {
             db_idle_evict_ms: 5 * 60_000,
             secure_cookies: false,
             txn_retries: 4,
-            engine: EngineConfig::default(),
+            limits: LimitConfig::default(),
+            engine: EngineConfig { db_max_bytes: 10 << 30, ..EngineConfig::default() },
         }
     }
 }
@@ -85,7 +88,7 @@ impl Default for NodeConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Credential {
     Session { token_hash: String },
-    ApiKey { id: String, db_id: Option<String>, read_only: bool },
+    ApiKey { id: String, db_id: Option<String>, read_only: bool, rate_limit: Option<u32> },
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +172,10 @@ pub struct Node {
     pub forwards: cluster::ForwardDedup,
     pub started_ms: u64,
     router: OnceLock<axum::Router>,
+    pub limiter: Limiter,
+    /// Limits concurrent password hashing operations.
+    hash_slots: tokio::sync::Semaphore,
+    draining: std::sync::atomic::AtomicBool,
 }
 
 /// A peer that a forwarded request certainly did not reach.
@@ -202,6 +209,7 @@ impl Node {
         cfg.engine.validate().map_err(|e| Error::invalid(format!("engine configuration: {e}")))?;
         let id = format!("{}-{}", cfg.name, env.random_hex(4));
         let engine = Engine::new(store, env.clone(), cfg.engine.clone(), id.clone());
+        engine.exempt_from_quota(SYS_DB);
         let node = Arc::new(Node {
             id,
             started_ms: engine.shared.time_ms(),
@@ -218,6 +226,9 @@ impl Node {
             cluster_key: Mutex::new(None),
             forwards: cluster::ForwardDedup::new(Duration::from_secs(60)),
             router: OnceLock::new(),
+            limiter: Limiter::default(),
+            hash_slots: tokio::sync::Semaphore::new(cfg.limits.hash_concurrency.max(1)),
+            draining: std::sync::atomic::AtomicBool::new(false),
             cfg,
         });
         node.bootstrap().await?;
@@ -260,7 +271,7 @@ impl Node {
             let email = auth::normalize_email(e)?;
             let mut t = self.sys_read().await?;
             if meta::user_by_email(&mut t, &email).await?.is_none() {
-                let hash = auth::hash_password(&self.env, p, self.cfg.pbkdf2_iterations);
+                let hash = self.hash_password(p).await?;
                 retry_unavailable(|| {
                     self.run_meta(MetaCmd::Signup {
                         id: self.env.random_hex(8),
@@ -331,6 +342,16 @@ impl Node {
 
     pub fn cookie_key(&self) -> Vec<u8> {
         lock(&self.cookie_key).clone()
+    }
+
+    /// Start failing health checks ahead of a shutdown, so load balancers
+    /// stop sending requests here; requests are still served.
+    pub fn drain(&self) {
+        self.draining.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Give up leases, leave the membership table and stop background work.
@@ -545,8 +566,22 @@ impl Node {
 
     // ------------------------------------------------------------- auth
 
-    /// Authenticate a bearer token or session cookie value.
+    /// Authenticates a bearer token or session cookie value and checks rate limits.
     pub async fn authenticate(&self, token: &str) -> Result<Principal> {
+        let p = self.principal(token).await?;
+        let user_key = format!("user:{}", p.user.id);
+        let lim = &self.cfg.limits;
+        match &p.cred {
+            Credential::ApiKey { id, rate_limit, .. } => {
+                let key_rate = rate_limit.map_or(lim.api_key, |r| Rate::per_sec(r as f64));
+                self.limiter.take(&[(&format!("key:{id}"), key_rate), (&user_key, lim.user)], "requests")?;
+            }
+            Credential::Session { .. } => self.limiter.take(&[(&user_key, lim.user)], "requests")?,
+        }
+        Ok(p)
+    }
+
+    async fn principal(&self, token: &str) -> Result<Principal> {
         let cache_key = auth::secret_hash(token);
         if let Some((t, p)) = lock(&self.auth_cache).get(&cache_key)
             && t.elapsed() < Duration::from_millis(self.cfg.auth_cache_ms)
@@ -577,7 +612,9 @@ impl Node {
                 return Err(unauth());
             }
             let user = meta::get_user(&mut t, &k.user_id).await?.ok_or_else(unauth)?;
-            Principal { user, cred: Credential::ApiKey { id: k.id, db_id: k.db_id, read_only: k.read_only } }
+            let cred =
+                Credential::ApiKey { id: k.id, db_id: k.db_id, read_only: k.read_only, rate_limit: k.rate_limit };
+            Principal { user, cred }
         } else if token.starts_with(auth::SESSION_PREFIX) {
             let s = meta::get_session(&mut t, cache_key).await?.ok_or_else(unauth)?;
             if s.expires_at < self.now_ms() as i64 {
@@ -604,6 +641,85 @@ impl Node {
 
     pub fn forget_credential(&self, token: &str) {
         lock(&self.auth_cache).remove(&auth::secret_hash(token));
+    }
+
+    /// Computes a PBKDF2 password hash within bounded concurrency slots.
+    pub async fn hash_password(&self, password: &str) -> Result<String> {
+        let (env, password, iters) = (self.env.clone(), password.to_string(), self.cfg.pbkdf2_iterations);
+        self.hashing(move || auth::hash_password(&env, &password, iters)).await
+    }
+
+    /// Executes a password hashing operation within an acquired semaphore slot.
+    async fn hashing<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+        let wait = Duration::from_millis(self.cfg.limits.hash_wait_ms);
+        let busy = || Error::Unavailable {
+            message: "too many sign-ins in progress; retry".into(),
+            retry_after_ms: Some(1_000),
+            outcome_unknown: false,
+        };
+        let _slot = match tokio::time::timeout(wait, self.hash_slots.acquire()).await {
+            Ok(Ok(slot)) => slot,
+            _ => return Err(busy()),
+        };
+        Ok(self.env.run_blocking(f).await)
+    }
+
+    /// Authenticates an email and password against rate limits and failure backoff.
+    pub async fn password_login(&self, client: &str, email: &str, password: &str) -> Result<User> {
+        let lim = &self.cfg.limits;
+        self.limiter.take(&[(&format!("auth:{client}"), lim.auth_per_client)], "sign-in attempts")?;
+        let bad = || Error::Unauthenticated("invalid email or password".into());
+        let email = auth::normalize_email(email).map_err(|_| bad())?;
+        let (account, from) = (format!("login:{email}"), format!("login-from:{client}"));
+        self.limiter.check_backoff(&[&account, &from], "failed sign-ins")?;
+        let mut t = self.sys_read().await?;
+        let mut user = meta::user_by_email(&mut t, &email).await?;
+        if user.is_none() {
+            // Read-your-writes for an account created moments ago elsewhere.
+            let mut t = self.sys_read_strong().await?;
+            user = meta::user_by_email(&mut t, &email).await?;
+        }
+        let ok = match user.as_ref().and_then(|u| u.password_hash.clone()) {
+            Some(h) => {
+                let password = password.to_string();
+                self.hashing(move || auth::verify_password(&password, &h)).await?
+            }
+            None => {
+                // Equalize timing for unknown accounts.
+                self.hash_password(password).await?;
+                false
+            }
+        };
+        let Some(user) = user.filter(|_| ok) else {
+            self.limiter.failed(&account, lim.account_free_failures, lim);
+            self.limiter.failed(&from, lim.client_free_failures, lim);
+            return Err(bad());
+        };
+        self.limiter.succeeded(&account);
+        if user.disabled {
+            return Err(Error::PermissionDenied("this account is disabled".into()));
+        }
+        Ok(user)
+    }
+
+    /// Registers a new user with email and password under the configured signup policy.
+    pub async fn password_signup(&self, client: &str, email: &str, password: &str) -> Result<(String, Json)> {
+        let lim = &self.cfg.limits;
+        let (auth_key, signup_key) = (format!("auth:{client}"), format!("signup:{client}"));
+        self.limiter.take(&[(&auth_key, lim.auth_per_client), (&signup_key, lim.signup_per_client)], "sign-ups")?;
+        let email = auth::normalize_email(email)?;
+        auth::validate_password(password)?;
+        let hash = self.hash_password(password).await?;
+        let r = self
+            .run_meta(MetaCmd::Signup {
+                id: self.env.random_hex(8),
+                email: email.clone(),
+                password_hash: Some(hash),
+                policy: self.cfg.signup,
+                bootstrap_admin: false,
+            })
+            .await?;
+        Ok((email, r))
     }
 
     /// Create a session for a user, returning the token.
@@ -709,6 +825,7 @@ impl Node {
         lock(&self.auth_cache).retain(|_, (t, _)| t.elapsed() < ttl);
         lock(&self.name_cache).retain(|_, (t, _)| t.elapsed() < ttl);
         self.forwards.expire();
+        self.limiter.prune(&self.cfg.limits);
     }
 
     /// Purge deleted databases whose grace period has passed. Runs on the
@@ -793,6 +910,28 @@ where
 mod tests {
     use crate::sim::cost::{World, run_paused};
     use std::time::Duration;
+
+    #[test]
+    fn password_hashing_is_bounded() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let n = w.node(0).clone();
+            let slots = n.cfg.limits.hash_concurrency;
+            let held = n.hash_slots.acquire_many(slots as u32).await.unwrap();
+            let e = n.hash_password("password-1").await.unwrap_err();
+            assert!(matches!(e, crate::error::Error::Unavailable { outcome_unknown: false, .. }), "{e:?}");
+            let r = n.password_login("1.2.3.4", "nobody@x.io", "password-1").await.unwrap_err();
+            assert!(matches!(r, crate::error::Error::Unavailable { .. }), "{r:?}");
+            let (tx, waiting) = tokio::sync::oneshot::channel();
+            let n2 = n.clone();
+            n.env.spawn(async move {
+                let _ = tx.send(n2.hash_password("password-1").await);
+            });
+            tokio::time::sleep(Duration::from_millis(n.cfg.limits.hash_wait_ms / 2)).await;
+            drop(held);
+            assert!(waiting.await.unwrap().unwrap().starts_with("pbkdf2-sha256$"), "a slot freed in time");
+        });
+    }
 
     /// A peer that a forward failed to reach leaves routing until it
     /// heartbeats again, or for a backoff that grows with each failure;

@@ -1,11 +1,8 @@
-//! The local tier: immutable segment data kept on a node's own disk, below
-//! the memory cache. Segments never change, so entries never need
-//! invalidation; a restarted node (or one that gets a database back after a
-//! failover) reads them locally instead of from object storage.
+//! Node-local disk cache for immutable segment data below the memory cache.
 //!
-//! Entries are whole small segments, the bloom/index/footer region of large
-//! ones, and single blocks, all as stored, so every read is verified by the
-//! segment checksums as well as the tier's own.
+//! Entries store whole small segments, the bloom/index/footer region of large
+//! segments, and individual blocks, each verified by both segment and cache
+//! checksums.
 
 use crate::store::BoxFut;
 use crate::util::DetHashMap;
@@ -31,7 +28,7 @@ pub struct LocalStats {
     pub misses: u64,
 }
 
-/// A shared handle to a local store (part of the engine configuration).
+/// Shared handle to a node-local cache store.
 #[derive(Clone)]
 pub struct LocalTier(pub Arc<dyn LocalStore>);
 
@@ -101,8 +98,7 @@ impl Lru {
     }
 }
 
-/// An in-memory local store, for tests and the simulator (where it outlives
-/// a node's crash, as a disk would).
+/// In-memory [`LocalStore`] for tests and simulation.
 pub struct MemLocal {
     budget: u64,
     inner: Mutex<(Lru, DetHashMap<String, Bytes>)>,
@@ -137,18 +133,16 @@ impl LocalStore for MemLocal {
     }
 }
 
-/// A local store in a directory: one file per entry holding the data and
-/// its CRC32C. Files are written to a temporary name and renamed, and the
-/// directory is indexed at startup, oldest first, so the cache survives
-/// restarts.
+/// Directory-backed [`LocalStore`] that persists entries across restarts as
+/// checksummed files written via atomic rename.
 pub struct DiskCache {
     dir: PathBuf,
     budget: u64,
     lru: Arc<Mutex<Lru>>,
 }
 
-/// A file name for `key`, distinct for distinct keys: other bytes than
-/// letters and digits become `_` and two hex digits.
+/// Encodes `key` into a collision-free ASCII filename by hex-escaping
+/// non-alphanumeric bytes as `_XX`.
 fn file_name(key: &str) -> String {
     let mut out = String::with_capacity(key.len());
     for b in key.bytes() {
@@ -162,7 +156,7 @@ fn file_name(key: &str) -> String {
 }
 
 impl DiskCache {
-    /// Open (creating) the cache directory and index what it holds.
+    /// Opens or creates the cache directory and indexes existing files.
     pub fn open(dir: impl Into<PathBuf>, budget: u64) -> std::io::Result<DiskCache> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
@@ -277,7 +271,6 @@ mod tests {
             t.put("huge", Bytes::from(vec![0u8; 400])).await;
             assert!(t.get("huge").await.is_none(), "an entry over budget is not kept");
             assert!(t.stats().bytes <= 300);
-            // Reads refresh entries in the order they happen.
             let t = MemLocal::new(300);
             for k in ["a", "b", "c"] {
                 t.put(k, Bytes::from(vec![0u8; 100])).await;

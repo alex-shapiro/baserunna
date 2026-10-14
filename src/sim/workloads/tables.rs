@@ -28,13 +28,11 @@ fn strip(v: &Json) -> Json {
 }
 
 async fn retry(c: &Client, path: &str, body: Json) -> Result<super::super::client::Resp, String> {
-    // Only used for idempotent requests (reads, upserts, definitive ops).
     Ok(c.call_settled("POST", path, Some(body)).await)
 }
 
-/// The model's rows (ids below 1000) that a selection by team and minimum
-/// score through `by_team_score` picks, in the index's order, at most
-/// `limit`.
+/// Returns up to `limit` row IDs in `model` matching `team` and `score >= min`,
+/// ordered by `(score, id)` to match `by_team_score`.
 fn select(model: &BTreeMap<i64, Row>, team: &str, min: i64, limit: Option<usize>) -> Vec<i64> {
     let mut hits: Vec<(i64, i64)> =
         model.iter().filter(|(_, m)| m.team == team && m.score >= min).map(|(i, m)| (m.score, *i)).collect();
@@ -42,8 +40,8 @@ fn select(model: &BTreeMap<i64, Row>, team: &str, min: i64, limit: Option<usize>
     hits.into_iter().map(|(_, i)| i).take(limit.unwrap_or(usize::MAX)).collect()
 }
 
-/// Run one-shot `ops` with an idempotency key until definitive. Returns
-/// the results, or `None` if a retry found them applied (a replay).
+/// Runs one-shot `ops` with an idempotency key until definitive, returning
+/// `None` if replayed.
 async fn once(c: &Client, ops: Json, key: &str) -> Result<Option<Json>, String> {
     let body = json!({"ops": ops, "idempotency_key": key});
     loop {
@@ -56,16 +54,14 @@ async fn once(c: &Client, ops: Json, key: &str) -> Result<Option<Json>, String> 
     }
 }
 
-/// A follower of the players table's change feed, and the rows it built.
 struct Follower {
     cursor: String,
     rows: BTreeMap<i64, Json>,
 }
 
 impl Follower {
-    /// Read the feed until caught up, then check the rows below id 1000
-    /// (the single writer's) against the model. A cursor too old starts
-    /// over from a read of every row, at that read's version.
+    /// Reads the change feed until caught up and verifies rows with ID < 1000
+    /// against `model`. Resets from a full table query if the cursor expires.
     async fn follow(&mut self, c: &Client, model: &BTreeMap<i64, Row>) -> Result<(), String> {
         loop {
             let p = format!("/v1/dbs/tdb/tables/players/changes?after={}&limit={}", self.cursor, 1 + c.rng().below(6));
@@ -104,8 +100,8 @@ impl Follower {
     }
 }
 
-/// Check every table's indexes directly in storage (via a node's engine),
-/// and that nothing remains of dropped tables and indexes.
+/// Verifies all table indexes and checks that no orphaned data remains from
+/// dropped tables or indexes.
 pub async fn check_all_indexes(sim: &Arc<Sim>, db_id: &str) -> Result<(), String> {
     let n = sim.up_nodes().first().copied().ok_or("no node up")?;
     let node = sim.node(n).ok_or("node gone")?.node.clone();
@@ -166,8 +162,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
                         Ok(r) if r.status == 409 && r.code() == "already_exists" => break,
                         Ok(r) if r.status == 409 || r.retryable_not_applied() => {}
                         Ok(r) if r.status != 503 => return Err(format!("contender: {} {}", r.status, r.json)),
-                        // Ambiguous: check if our row exists after waiting
-                        // out zombies.
+                        // Ambiguous: check if our row exists after waiting out zombies.
                         _ => {
                             cc.pause(super::super::client::ZOMBIE_WAIT_MS).await;
                             let g = cc
@@ -185,7 +180,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
             Ok::<Vec<i64>, String>(won)
         }));
     }
-    // A model-checked single writer on its own key range (ids < 100).
     let mut model: BTreeMap<i64, Row> = BTreeMap::new();
     let mut rng = sim.fork_rng();
     let mut follower = Follower { cursor: "0".into(), rows: BTreeMap::new() };
@@ -196,8 +190,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
         let score = rng.below(10) as i64;
         match rng.below(9) {
             6 => {
-                // Move rows to another team and score, through the index
-                // that selects them.
                 let limit = rng.chance(0.4).then(|| 1 + rng.usize(3));
                 let (to_team, to_score) = (["red", "blue"][rng.usize(2)], rng.below(10) as i64);
                 let mut op = json!({"op": "update_rows", "table": "players",
@@ -218,7 +210,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
                 }
             }
             7 => {
-                // Delete low scores among this writer's rows.
                 let limit = rng.chance(0.4).then(|| 1 + rng.usize(3));
                 let mut op = json!({"op": "delete_rows", "table": "players",
                     "where": {"range": {"lt": 1000}, "filter": {"col": "score", "op": "lt", "value": score / 2}}});
@@ -241,8 +232,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
                 }
             }
             8 => {
-                // The same through the rows endpoint: setting a constant is
-                // idempotent, so retries are safe.
+                // Setting a constant score is idempotent, so retries without an idempotency key are safe.
                 let r = retry(
                     &c,
                     &format!("{base}/tables/players/rows/update"),
@@ -258,7 +248,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
                 follower.follow(&c, &model).await?;
             }
             0 | 1 => {
-                // Upsert is idempotent, so retries are safe.
                 let dup = email.is_some() && model.iter().any(|(k, v)| *k != id && v.email == email);
                 let row = Row { email: email.clone(), team: team.clone(), score };
                 let r = retry(
@@ -291,8 +280,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
             }
             3 => {
                 let r = retry(&c, &format!("{base}/tables/players/rows/delete"), json!({"pk": id})).await?;
-                // A retried delete may report found=false for a row an
-                // earlier attempt removed.
+                // A retried delete may report found=false for a row an earlier attempt removed.
                 if r.json["found"] == true && !model.contains_key(&id) {
                     return Err(format!("delete found a row the model lacks: {id}"));
                 }
@@ -349,7 +337,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
         h.abort();
     }
     super::recover(&sim).await;
-    // Every contested email must have exactly one row, and it is a winner.
     let r = c
         .call_retry(
             "POST",
@@ -367,7 +354,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
             return Err(format!("contested row {row} is not the acknowledged winner"));
         }
     }
-    // Schema change after the fact: add a column with a default and index it.
     let r = c
         .call_retry(
             "POST",

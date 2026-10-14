@@ -1,9 +1,4 @@
-//! Write, space and read amplification of the storage engine on realistic
-//! workloads (SPEC §5.6).
-//!
-//! Each workload drives one database through the engine on an in-memory
-//! store in virtual time, with production sizes, and counts the bytes that
-//! flushes and compactions write.
+//! Storage engine write, space, and read amplification benchmarks.
 
 use crate::engine::{Consistency, Engine, EngineConfig, Isolation};
 use crate::env::Env;
@@ -15,7 +10,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Counts bytes written to segment objects.
 struct SegmentMeter {
     inner: DynStore,
     seg_put_bytes: AtomicU64,
@@ -48,15 +42,15 @@ impl ObjectStore for SegmentMeter {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Workload {
-    /// Load a key set, then overwrite random keys (twice the data).
+    /// Load a key set, then overwrite random keys.
     UniformUpdate,
-    /// Like `UniformUpdate`, with most updates going to few keys.
+    /// Like `UniformUpdate`, with most updates going to a few keys.
     SkewedUpdate,
-    /// Inserts with increasing keys (logs, time series).
+    /// Sequential inserts with increasing keys.
     Append,
-    /// A sliding window: insert at the head, delete at the tail.
+    /// Sliding window: insert at the head, delete at the tail.
     Queue,
-    /// Inserts, updates and deletes of random keys.
+    /// Inserts, updates, and deletes of random keys.
     Mixed,
 }
 
@@ -80,25 +74,21 @@ pub struct Amplification {
     pub workload: Workload,
     /// Key and value bytes of every committed write.
     pub logical_written: u64,
-    /// Key and value bytes of the live data at the end.
+    /// Key and value bytes of live data at the end of the run.
     pub live_bytes: u64,
-    /// Segment bytes written (flushes and compactions) per logical byte.
+    /// Segment bytes written per logical byte.
     pub write_amp: f64,
-    /// Bytes referenced by the manifest (segments and tail) per live byte,
-    /// sampled after every commit: the mean and the worst.
+    /// Mean manifest-referenced bytes per live byte across commits.
     pub space_amp_mean: f64,
+    /// Peak manifest-referenced bytes per live byte across commits.
     pub space_amp_max: f64,
-    /// Every stored object of the database per live byte once garbage
-    /// collection has caught up.
+    /// Total stored bytes per live byte after compaction and GC.
     pub space_amp_settled: f64,
-    /// Segments a point lookup of a random live key may consult, sampled
-    /// after every commit (mean).
+    /// Mean candidate segments per point lookup of a live key.
     pub read_amp: f64,
     pub segments: usize,
 }
 
-/// A row-like value (field names, numbers, words), compressible like
-/// typical application data.
 fn value(rng: &mut Rng, i: u64) -> Vec<u8> {
     const WORDS: &[&str] = &["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india"];
     let mut s = format!("{{\"id\":{i},\"owner\":\"user-{}\",\"tags\":[", rng.below(500));
@@ -118,11 +108,9 @@ fn key(i: u64) -> Bytes {
     Bytes::from(format!("\x01row/{i:010}"))
 }
 
-/// One write of a workload: `Some(value)` puts, `None` deletes.
 type Write = (u64, Option<Vec<u8>>);
 
-/// The writes of `w`, in commit-sized batches. `scale` 1.0 is a database of
-/// roughly 10 MB.
+/// Generates commit batches for `w`. Scale 1.0 corresponds to ~10 MB.
 fn writes(w: Workload, scale: f64, rng: &mut Rng) -> Vec<Vec<Write>> {
     let n = ((50_000.0 * scale) as u64).max(100);
     let mut ops: Vec<Write> = Vec::new();
@@ -178,7 +166,6 @@ fn writes(w: Workload, scale: f64, rng: &mut Rng) -> Vec<Vec<Write>> {
     ops.chunks(50).map(|c| c.to_vec()).collect()
 }
 
-/// Run `w` with `cfg` (production sizes unless the caller changes them).
 pub async fn measure(w: Workload, scale: f64, cfg: EngineConfig) -> Amplification {
     let origin = tokio::time::Instant::now();
     let env = Arc::new(Env::sim(42, 1_750_000_000_000, origin, 0));
@@ -211,7 +198,6 @@ pub async fn measure(w: Workload, scale: f64, cfg: EngineConfig) -> Amplificatio
             }
         }
         db.commit(t.into_request()).await.expect("commit");
-        // Let background compaction keep pace, as it would between commits.
         tokio::time::sleep(Duration::from_millis(100)).await;
         let v = db.current().expect("current");
         let live_bytes: u64 = live.values().sum();
@@ -228,7 +214,6 @@ pub async fn measure(w: Workload, scale: f64, cfg: EngineConfig) -> Amplificatio
             }
         }
     }
-    // Let compaction finish, then garbage collection catch up.
     tokio::time::sleep(Duration::from_secs(60)).await;
     tokio::time::sleep(Duration::from_millis(cfg.gc_grace_ms + 1_000)).await;
     db.maintenance_now().await.expect("gc");
@@ -250,7 +235,6 @@ pub async fn measure(w: Workload, scale: f64, cfg: EngineConfig) -> Amplificatio
     }
 }
 
-/// Every workload at `scale` with `cfg`.
 pub fn measure_all(scale: f64, cfg: &EngineConfig) -> Vec<Amplification> {
     super::cost::run_paused(async {
         let mut out = Vec::new();

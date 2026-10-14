@@ -2,6 +2,7 @@
 
 use super::super::client::{Client, Resp};
 use super::super::{Sim, SimConfig};
+use super::expect;
 use crate::limits::{LimitConfig, Rate};
 use serde_json::{Value as Json, json};
 use std::sync::Arc;
@@ -21,10 +22,6 @@ pub fn config() -> SimConfig {
         ..c.node.limits
     };
     c
-}
-
-fn expect(cond: bool, msg: impl Into<String>) -> Result<(), String> {
-    if cond { Ok(()) } else { Err(msg.into()) }
 }
 
 /// Creates a client pinned to node 0 with automatic 429 retry disabled.

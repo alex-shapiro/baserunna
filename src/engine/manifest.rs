@@ -31,17 +31,16 @@ pub struct Lease {
     /// The holder's wall-clock expiry: identifies a renewal and hints at
     /// routing, but is never compared with another clock.
     pub expires_ms: u64,
-    /// The lease's duration, which other nodes wait out (plus a margin)
-    /// from when they first see this renewal.
+    /// Lease duration in milliseconds, waited out plus a margin by other nodes
+    /// from when they first observe this renewal.
     pub ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SegmentMeta {
-    /// 32 hex chars, unique.
+    /// 32-character hex identifier.
     pub id: String,
-    /// Not stored in the segment: moving a segment to another level is a
-    /// manifest change.
+    /// Level in the LSM tree, updated in the manifest on compaction moves.
     pub level: u8,
     pub size: u64,
     pub entries: u64,
@@ -52,8 +51,7 @@ pub struct SegmentMeta {
     pub max_seq: Seq,
     /// Sequence number through which all committed range deletions have been applied to this segment.
     pub deletes_applied: Seq,
-    /// Entries with an expiry, and the latest of their expiries: once that
-    /// has passed, all of them read as tombstones.
+    /// Number of entries with an expiry, and the latest expiry among them.
     pub expiring: u64,
     pub expires_max: u64,
 }
@@ -100,7 +98,7 @@ impl SegmentMeta {
 pub enum ObjKind {
     Segment = 0,
     Blob = 1,
-    /// A levels object (see [`Manifest::levels`]).
+    /// External levels object; see [`Manifest::levels`].
     Levels = 2,
 }
 
@@ -133,13 +131,10 @@ pub struct Obsolete {
 pub struct Manifest {
     pub db_id: String,
     pub version: Seq,
-    /// Incremented on every manifest write (including lease-only writes);
-    /// orders manifests that share a data version.
+    /// Incremented on every manifest write, ordering manifests that share a data version.
     pub write_seq: u64,
-    /// Store time (ms) of the latest manifest write, never decreasing: no
-    /// earlier than the read time of any transaction it committed. Readers
-    /// evaluate expiries at this time or later, so they agree with every
-    /// commit's view of what had expired (SPEC §6.1).
+    /// Non-decreasing store time in milliseconds of the latest manifest write,
+    /// used by readers to evaluate expiries (SPEC §6.1).
     pub time_ms: u64,
     pub created_ms: u64,
     /// Bit flags; see [`FLAG_DELETED`].
@@ -151,17 +146,15 @@ pub struct Manifest {
     pub segments: Vec<SegmentMeta>,
     /// ID of the external levels object holding segments below L0, if not stored inline.
     pub levels: Option<String>,
-    /// Incremented by every compaction install. A compaction installs only
-    /// onto the manifest it was planned from (flushes aside), so two
-    /// compactions can never interleave.
+    /// Incremented by every compaction install so concurrent compactions cannot interleave.
     pub compaction_seq: u64,
     /// Sorted by key; newest entry per key. Does not contain entries deleted by range tombstones.
     pub tail: Vec<Entry>,
     /// Active range tombstones in commit order.
     pub range_deletes: Vec<RangeTombstone>,
-    /// Tombstones (point and range) with seq <= horizon may have been purged.
+    /// Sequence number at or below which point and range tombstones may have been purged.
     pub tombstone_horizon: Seq,
-    /// Oldest first: (version, wall ms) samples.
+    /// `(version, time_ms)` samples, oldest first.
     pub version_times: Vec<(Seq, u64)>,
     pub obsolete: Vec<Obsolete>,
     pub last_sweep_ms: u64,
@@ -169,8 +162,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// A new, empty manifest. `store_ms` is the store time if known, which
-    /// becomes the first version time (0 if unknown).
+    /// Creates an empty manifest with `store_ms` as the initial version time, or 0 if unknown.
     pub fn new(db_id: &str, now_ms: u64, store_ms: Option<u64>) -> Manifest {
         Manifest {
             db_id: db_id.to_string(),
@@ -191,7 +183,7 @@ impl Manifest {
     }
 
     /// Total stored bytes tracked against quotas: segments, tail, and
-    /// referenced blobs, but not the commit records the engine keeps.
+    /// referenced blobs, excluding internal commit records.
     pub fn stored_bytes(&self) -> u64 {
         let segments: u64 = self.segments.iter().filter(|s| !is_commit_key(&s.min_key)).map(|s| s.size).sum();
         let tail: usize = self.tail.iter().filter(|e| !is_commit_key(&e.key)).map(|e| e.size()).sum();
@@ -403,8 +395,8 @@ impl Manifest {
         self.level(level).iter().map(|s| s.size).sum()
     }
 
-    /// Restore the segment order after changes: by level, level 0 keeping
-    /// its relative (recency) order, deeper levels by key.
+    /// Sorts segments by level, preserving recency order in level 0 and sorting
+    /// deeper levels by key.
     pub fn sort_segments(&mut self) {
         self.segments.sort_by(|a, b| {
             a.level
@@ -430,15 +422,14 @@ impl Manifest {
         Ok(())
     }
 
-    /// Newest sampled version that is at least `age_ms` old at `now_ms`
-    /// (0 if none).
+    /// Newest sampled version at least `age_ms` old at `now_ms`, or 0 if none.
     pub fn version_at_least_age(&self, now_ms: u64, age_ms: u64) -> Seq {
         let cutoff = now_ms.saturating_sub(age_ms);
         self.version_times.iter().filter(|(_, t)| *t <= cutoff).map(|(v, _)| *v).max().unwrap_or(0)
     }
 }
 
-/// Immutable levels object storing segment metadata below level 0 (`dbs/{db}/levels/{id}`).
+/// Immutable levels object storing segment metadata below level 0.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Levels {
     pub db_id: String,

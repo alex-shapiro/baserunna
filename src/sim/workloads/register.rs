@@ -1,6 +1,5 @@
 //! `register`: concurrent writers and strong readers on a few keys, with a
-//! real-time linearizability check over the recorded history (virtual
-//! time is global, so "completed before started" is exact).
+//! real-time linearizability check over the recorded history.
 
 use super::super::Sim;
 use super::super::client::Client;
@@ -105,7 +104,6 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, ops: usize, chao
 }
 
 fn check(h: &[Op]) -> Result<(), String> {
-    // Value written at each known version, and all values ever written.
     let mut by_version: BTreeMap<(usize, u64), &str> = BTreeMap::new();
     let mut written: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
     for w in h.iter().filter(|o| o.write) {
@@ -133,7 +131,7 @@ fn check(h: &[Op]) -> Result<(), String> {
                 _ => {}
             }
         }
-        // Real time: writes completed before the read started are visible.
+        // Writes completed before the read started must be visible.
         for w in h.iter().filter(|o| o.write && o.key == r.key) {
             if let Some(wv) = w.version
                 && w.end < r.start
@@ -145,7 +143,6 @@ fn check(h: &[Op]) -> Result<(), String> {
                 ));
             }
         }
-        // Reads never go back in time.
         for r2 in &reads {
             if r2.key == r.key && r2.end < r.start && r2.version.unwrap_or(0) > rv {
                 return Err(format!(
@@ -178,10 +175,9 @@ mod tests {
         let h =
             [w(0, 0, 10, 1, "a"), r(0, 5, 8, 0, ""), r(0, 20, 30, 1, "a"), w(0, 25, 40, 2, "b"), r(0, 30, 35, 1, "a")];
         check(&h).unwrap();
-        // Concurrent reads may see either side of a concurrent write.
         check(&[w(0, 0, 100, 1, "a"), r(0, 10, 20, 1, "a"), r(1, 30, 40, 0, "")]).unwrap();
-        // Equal timestamps do not order operations: a read starting the
-        // moment a write (or another read) ends is concurrent with it.
+        // Equal timestamps do not order operations: a read starting when a
+        // write or another read ends is concurrent with it.
         check(&[w(0, 0, 10, 1, "a"), r(0, 10, 20, 0, "")]).unwrap();
         check(&[w(0, 0, 100, 1, "a"), r(0, 5, 10, 1, "a"), r(0, 10, 20, 0, "")]).unwrap();
     }
@@ -200,7 +196,6 @@ mod tests {
         assert!(check(&wrong).unwrap_err().contains("that version wrote"));
         let invented = [w(0, 0, 10, 1, "a"), r(0, 20, 30, 7, "zzz")];
         assert!(check(&invented).unwrap_err().contains("never written"));
-        // Keys are independent.
         let other_key = [w(1, 0, 10, 1, "a"), r(0, 20, 30, 0, "")];
         check(&other_key).unwrap();
     }

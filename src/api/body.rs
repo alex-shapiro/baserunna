@@ -1,4 +1,4 @@
-//! Streaming request/response bodies for blobs, and HTTP Range parsing.
+//! Streaming blob request/response bodies and HTTP Range parsing.
 
 use crate::engine::blob::{self, BlobWriter, chunk_plan, read_chunk};
 use crate::engine::{BlobRef, Shared};
@@ -16,8 +16,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// Streams a byte range of a blob chunk by chunk. A long read pins the
-/// blob (see [`blob::pin`]), so garbage collection cannot remove it midway.
+/// Streams a byte range of a blob chunk by chunk, periodically pinning the
+/// blob so garbage collection cannot remove it during a long read.
 pub struct BlobBody {
     shared: Arc<Shared>,
     db: String,
@@ -25,7 +25,6 @@ pub struct BlobBody {
     plan: VecDeque<(u64, Range<u64>)>,
     remaining: u64,
     fut: Option<BoxFut<'static, Result<Bytes>>>,
-    /// When the read started, or when it last pinned the blob.
     pinned_at: Instant,
     pin_now: bool,
 }
@@ -45,8 +44,7 @@ impl BlobBody {
         }
     }
 
-    /// Pin the blob before reading anything: for a blob already found
-    /// unreferenced, whose collection may be near.
+    /// Pins the blob before reading the first chunk, for blobs already marked obsolete.
     pub fn pinned_first(mut self) -> BlobBody {
         self.pin_now = true;
         self
@@ -106,14 +104,14 @@ impl http_body::Body for BlobBody {
     }
 }
 
-/// Read a request body into a blob or (if small) into memory.
+/// Uploaded request body, buffered in memory when small or written as a blob.
 pub enum Upload {
     Small(Bytes),
     Blob(BlobRef),
 }
 
-/// Stream `body` into storage. Bodies up to `inline_max` stay in memory
-/// (unless `force_blob`); larger ones are written as a blob as they arrive.
+/// Reads `body`, buffering up to `inline_max` bytes in memory unless `force_blob`
+/// is set, and streaming larger payloads into a blob.
 pub async fn read_upload<F: std::future::Future<Output = BlobWriter>>(
     body: Body,
     inline_max: usize,
@@ -149,17 +147,16 @@ pub async fn read_upload<F: std::future::Future<Output = BlobWriter>>(
     }
 }
 
-/// The requested range cannot be served (HTTP 416).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unsatisfiable;
 
-/// Parse a single-range `Range` header against an object of `size` bytes.
-/// `Ok(None)` = no (usable) range header.
+/// Parses a single-range `Range` header against an object of `size` bytes.
+/// Returns `Ok(None)` when no single-range header is present.
 pub fn parse_range(h: Option<&str>, size: u64) -> std::result::Result<Option<Range<u64>>, Unsatisfiable> {
     let Some(h) = h else { return Ok(None) };
     let Some(spec) = h.trim().strip_prefix("bytes=") else { return Ok(None) };
     if spec.contains(',') {
-        return Ok(None); // multi-range: serve the whole object
+        return Ok(None);
     }
     let (a, b) = spec.split_once('-').ok_or(Unsatisfiable)?;
     let (a, b) = (a.trim(), b.trim());

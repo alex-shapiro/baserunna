@@ -1,15 +1,5 @@
-//! The environment: every source of time, randomness and concurrency used by
-//! the service goes through [`Env`] so that the deterministic simulator can
-//! control it.
-//!
-//! * Monotonic time and sleeping use `tokio::time`, which the simulator runs
-//!   with paused (virtual) time on a current-thread runtime.
-//! * Wall-clock time comes from [`Env::now_ms`]; in simulation it is derived
-//!   from virtual time plus a per-node skew.
-//! * Randomness comes from the OS CSPRNG in production and from a seeded PRNG
-//!   in simulation.
-//! * Background tasks are spawned through [`Env::spawn`] so that a simulated
-//!   crash can abort every task belonging to a node.
+//! Execution environment abstracting time, randomness, and task spawning for
+//! deterministic simulation.
 
 use crate::util::rng::Rng;
 use std::future::Future;
@@ -33,14 +23,12 @@ pub struct Env {
 }
 
 impl Env {
-    /// Production environment: system clock, OS randomness.
+    /// Creates a production environment backed by the system clock and OS CSPRNG.
     pub fn real() -> Env {
         Env { clock: Clock::Real, rng: Mutex::new(None), tasks: Mutex::new(JoinSet::new()), tracer: Mutex::new(None) }
     }
 
-    /// Simulated environment. `origin` is the shared virtual instant that
-    /// corresponds to wall-clock `base_ms`; `skew_ms` offsets this node's
-    /// wall clock.
+    /// Creates a simulated environment with virtual time starting at `origin` (`base_ms`) and clock offset `skew_ms`.
     pub fn sim(seed: u64, base_ms: u64, origin: Instant, skew_ms: i64) -> Env {
         Env {
             clock: Clock::Sim { base_ms, origin, skew_ms: AtomicI64::new(skew_ms) },
@@ -50,7 +38,7 @@ impl Env {
         }
     }
 
-    /// Install a trace sink (simulation): engine events are reported to it.
+    /// Installs a trace callback for engine events.
     pub fn set_tracer(&self, t: Tracer) {
         *self.tracer.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
     }
@@ -59,7 +47,7 @@ impl Env {
         self.tracer.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
-    /// Report a trace event (no-op unless a tracer is installed).
+    /// Emits a trace event if a tracer is installed.
     pub fn trace(&self, f: impl FnOnce() -> String) {
         let t = self.tracer.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(t) = t {
@@ -85,8 +73,7 @@ impl Env {
         }
     }
 
-    /// Step this node's wall clock by `delta_ms` (simulation only; the
-    /// production clock is the system's).
+    /// Advances the simulated wall-clock skew by `delta_ms`.
     pub fn step_clock(&self, delta_ms: i64) {
         if let Clock::Sim { skew_ms, .. } = &self.clock {
             skew_ms.fetch_add(delta_ms, Ordering::SeqCst);
@@ -121,18 +108,17 @@ impl Env {
         u128::from_le_bytes(b)
     }
 
-    /// Uniform in `[0, n)` (n > 0). Slight modulo bias is acceptable here:
-    /// it is only used for jitter and sampling.
+    /// Returns a random integer in `0..n`.
     pub fn random_below(&self, n: u64) -> u64 {
         self.random_u64() % n.max(1)
     }
 
-    /// A random lowercase-hex identifier of `nbytes` bytes.
+    /// Generates `nbytes` random bytes encoded as lowercase hex.
     pub fn random_hex(&self, nbytes: usize) -> String {
         crate::util::b64::hex(&self.random_bytes(nbytes))
     }
 
-    /// Spawn a task owned by this environment (aborted by [`Env::shutdown`]).
+    /// Spawns a background task aborted on [`Env::shutdown`].
     pub fn spawn<F>(&self, fut: F)
     where
         F: Future<Output = ()> + Send + 'static,
@@ -153,7 +139,7 @@ impl Env {
         }
     }
 
-    /// Abort every task spawned through this environment.
+    /// Aborts all tasks spawned in this environment.
     pub fn shutdown(&self) {
         let mut t = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         t.abort_all();

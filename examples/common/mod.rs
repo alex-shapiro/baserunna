@@ -4,7 +4,7 @@
 use baserunna::cluster::HttpTransport;
 use baserunna::env::Env;
 use baserunna::meta::SignupPolicy;
-use baserunna::node::{Node, NodeConfig};
+use baserunna::node::{Node, NodeConfig, Services};
 use baserunna::store::{DynStore, MemStore};
 use std::sync::Arc;
 
@@ -15,13 +15,13 @@ pub struct Server {
 }
 
 impl Server {
-    /// Stop serving and release leases (graceful).
+    /// Gracefully stops the server and releases leases.
     pub async fn stop(self) {
         self.node.shutdown().await;
         self.task.abort();
     }
 
-    /// Simulate a crash: stop without releasing anything.
+    /// Abruptly stops the server without releasing leases.
     pub fn kill(self) {
         self.node.env.shutdown();
         self.task.abort();
@@ -32,8 +32,7 @@ pub fn shared_store() -> DynStore {
     Arc::new(MemStore::with_system_clock())
 }
 
-/// Start a node on a random localhost port, sharing `store` with any
-/// other nodes started from it.
+/// Starts a node on a random localhost port backed by `store`.
 pub async fn start(store: DynStore, name: &str, signup: SignupPolicy) -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("addr"));
@@ -42,16 +41,17 @@ pub async fn start(store: DynStore, name: &str, signup: SignupPolicy) -> Server 
         addr: url.clone(),
         public_url: url.clone(),
         signup,
-        // Fast hashing for demos; production uses 600k iterations.
         pbkdf2_iterations: 10_000,
-        // Disable rate limiting for demo workloads.
         limits: baserunna::limits::LimitConfig::unlimited(),
         heartbeat_ms: 5_000,
         members_refresh_ms: 1_000,
         ..NodeConfig::default()
     };
-    let node =
-        Node::start(cfg, Arc::new(Env::real()), store, Arc::new(HttpTransport::new()), None).await.expect("node start");
+    if std::env::var("BASERUNNA_LOG").is_err() {
+        baserunna::log::set_level(Some(baserunna::log::Level::Warn));
+    }
+    let services = Services { transport: Arc::new(HttpTransport::new()), oidc: None, mailer: None };
+    let node = Node::start(cfg, Arc::new(Env::real()), store, services).await.expect("node start");
     let app = baserunna::api::router(node.clone());
     let task = tokio::spawn(async move {
         let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -60,8 +60,8 @@ pub async fn start(store: DynStore, name: &str, signup: SignupPolicy) -> Server 
     Server { url, node, task }
 }
 
-/// A node running in its own runtime on its own thread, so that `kill`
-/// is a faithful crash: every task and socket of the node disappears.
+/// A node running on a dedicated thread and runtime so [`Isolated::kill`]
+/// immediately drops all tasks and sockets.
 pub struct Isolated {
     pub url: String,
     pub id: String,

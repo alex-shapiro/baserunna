@@ -1,9 +1,4 @@
 //! Object storage abstraction.
-//!
-//! The engine only needs a handful of primitives, all of which S3, GCS,
-//! Azure Blob and R2 provide with strong consistency:
-//! ranged/conditional GET, conditional PUT (create-only or compare-and-swap
-//! on an opaque etag), idempotent DELETE and ordered LIST.
 
 mod fs;
 mod mem;
@@ -30,13 +25,13 @@ pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
     NotFound,
-    /// Conditional put failed (etag mismatch, or object exists for create-only).
+    /// Conditional put failed.
     PreconditionFailed,
-    /// Conditional get: the object still has the given etag.
+    /// Conditional get matched `if_none_match`.
     NotModified,
-    /// Possibly transient failure; the operation may or may not have applied.
+    /// Transient failure; the operation may or may not have applied.
     Unavailable(String),
-    /// Permanent failure (bad configuration, permissions, ...).
+    /// Permanent failure.
     Fatal(String),
 }
 
@@ -76,7 +71,7 @@ pub struct GetOpts {
 pub struct GetResult {
     pub data: Bytes,
     pub etag: String,
-    /// Full object size (not the range length).
+    /// Total object size in bytes.
     pub size: u64,
     pub last_modified_ms: u64,
 }
@@ -105,8 +100,7 @@ pub trait ObjectStore: Send + Sync + 'static {
     /// Objects with the given prefix and key > `start_after`, in key order.
     fn list<'a>(&'a self, prefix: &'a str, start_after: Option<&'a str>, limit: usize)
     -> BoxFut<'a, SResult<ListPage>>;
-    /// How coarsely `last_modified_ms` is truncated (S3 and HTTP dates:
-    /// whole seconds).
+    /// Granularity of `last_modified_ms` in milliseconds.
     fn time_precision_ms(&self) -> u64 {
         1_000
     }
@@ -114,9 +108,7 @@ pub trait ObjectStore: Send + Sync + 'static {
 
 pub type DynStore = Arc<dyn ObjectStore>;
 
-/// Retry policy for idempotent operations (reads, deletes, lists and puts of
-/// immutable, uniquely named objects). Conditional manifest updates are NOT
-/// retried here; the engine resolves their ambiguity itself.
+/// Exponential-backoff retry policy for idempotent store operations.
 #[derive(Clone, Debug)]
 pub struct Retry {
     pub attempts: u32,
@@ -152,7 +144,7 @@ impl Retry {
     }
 }
 
-/// List every object under `prefix` (all pages).
+/// List all objects under `prefix`.
 pub async fn list_all(store: &dyn ObjectStore, prefix: &str, retry: &Retry) -> SResult<Vec<ObjectMeta>> {
     let mut out = Vec::new();
     let mut after: Option<String> = None;
@@ -166,9 +158,7 @@ pub async fn list_all(store: &dyn ObjectStore, prefix: &str, retry: &Retry) -> S
     }
 }
 
-/// Clamp a requested range to an object of `size` bytes (S3 semantics:
-/// a range starting past the end is an error; an end past the end is
-/// truncated).
+/// Clamp `range` to `[0, size)`, failing if `start` is past the end.
 pub(crate) fn clamp_range(range: &Option<Range<u64>>, size: u64) -> SResult<Range<u64>> {
     match range {
         None => Ok(0..size),

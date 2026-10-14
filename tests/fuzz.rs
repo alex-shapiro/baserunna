@@ -87,6 +87,11 @@ fn rand_json(r: &mut Rng, depth: u32) -> Value {
                 "where",
                 "after",
                 "wait_ms",
+                "org",
+                "role",
+                "token",
+                "current_password",
+                "new_password",
             ];
             let mut m = serde_json::Map::new();
             for _ in 0..r.usize(5) {
@@ -143,6 +148,15 @@ fn seeds() -> Vec<(&'static str, &'static str, Value)> {
         ("POST", "/v1/api-keys", json!({"name": "k", "db": "fz", "read_only": true})),
         ("POST", "/v1/auth/login", json!({"email": "f@z.io", "password": "password-fz"})),
         ("POST", "/v1/dbs/fz/tables/t/columns", json!({"name": "c", "type": "json"})),
+        ("POST", "/v1/orgs", json!({"name": "fz-other"})),
+        ("POST", "/v1/orgs/fz-org/members", json!({"email": "nobody@z.io", "role": "writer"})),
+        ("POST", "/v1/orgs/fz-org/members/nobody", json!({"role": "admin"})),
+        ("POST", "/v1/dbs", json!({"name": "d2", "org": "fz-org"})),
+        ("POST", "/v1/dbs/fz-org.d/txn", json!({"ops": [{"op": "put", "key": "a", "value": "1"}]})),
+        ("POST", "/v1/me/password", json!({"current_password": "not-the-password", "new_password": "password-new"})),
+        ("POST", "/v1/auth/password-reset", json!({"email": "f@z.io"})),
+        ("POST", "/v1/auth/password-reset/confirm", json!({"token": "AAAA", "password": "password-new"})),
+        ("POST", "/v1/auth/verify-email", json!({"token": "cmVzZXQ6dTE6eA"})),
     ]
 }
 
@@ -201,6 +215,8 @@ fn fuzz_http_api() {
             "indexes": [{"name": "by_name", "columns": ["name"]}]})),
         )
         .await;
+        baserunna::sim::workloads::steps::create_org(&c, "fz-org").await?;
+        c.create_db_owned(Some("fz-org"), "d").await?;
         let token = c.token.clone().unwrap_or_default();
         let mut r = Rng::new(seed);
         let mut hist: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
@@ -219,6 +235,11 @@ fn fuzz_http_api() {
             "/v1/api-keys/",
             "/v1/admin/users/",
             "/v1/me",
+            "/v1/me/sessions/",
+            "/v1/orgs/",
+            "/v1/orgs/fz-org/members/",
+            "/v1/dbs/fz-org.",
+            "/v1/dbs?org=",
             "/v1/auth/google/callback?state=",
             "/v1/dbs/fz/tables/",
             "/console/dbs/fz",
@@ -283,12 +304,11 @@ fn fuzz_http_api() {
         if std::env::var("FUZZ_VERBOSE").is_ok() {
             eprintln!("status histogram: {hist:?}");
         }
-        // Enough requests must get past validation to exercise handlers.
+        // Ensure enough requests pass validation to exercise handlers.
         let ok = hist.iter().filter(|(s, _)| **s < 300).map(|(_, n)| n).sum::<usize>();
         if ok * 10 < iters {
             return Err(format!("too few successful fuzz requests: {hist:?}"));
         }
-        // The service still works afterwards.
         let r = c.call_retry("POST", "/v1/dbs/fz/txn", Some(json!({"ops": [{"op": "get", "key": "a"}]}))).await;
         if r.status != 200 {
             return Err(format!("service broken after fuzzing: {}", r.json));
@@ -299,8 +319,8 @@ fn fuzz_http_api() {
 }
 
 /// Structure-aware fuzzing of the transaction-op language against an exact
-/// model (`sim::txn_fuzz`). Scale with `FUZZ_ITERS`; `FUZZ_VERBOSE` prints
-/// response counts per route and status (`FUZZ_DEBUG` adds error messages).
+/// model. Scale with `FUZZ_ITERS`; `FUZZ_VERBOSE` prints response counts per
+/// route and status, and `FUZZ_DEBUG` includes error messages.
 #[test]
 fn fuzz_txn_ops_against_model() {
     let iters = baserunna::util::prop::env_u64("FUZZ_ITERS").unwrap_or(400);

@@ -26,21 +26,18 @@ the design context for several of these.
       matter most. `engine::Activity` already counts range tombstones,
       segment drops and rewrites, levels objects, quota refusals and
       expired entries and segments.
-- [ ] **Structured logging and request IDs.** Propagate a request ID
-      across forwarded hops, and log in a JSON format.
-- [ ] **Account self-service.** `MetaCmd::SetPassword` exists, but no API
-      or console route calls it. Add password change, account deletion,
-      session listing and revocation, and an admin "re-enable user" in the
-      console. Optionally add email verification and password reset, which
-      need an outbound email dependency.
 
 ## Features
 
 - [ ] **Point-in-time restore and backups.** Keep old manifests and delay
       GC of segments they reference. Add DB snapshot/clone (copy-on-write
       at the manifest level is cheap) and export/import.
-- [ ] **Database rename and transfer** between users.
-- [ ] **Organizations / teams.** Multiple users per DB with roles (SPEC §16).
+- [ ] **Database rename and transfer** between users and organizations.
+- [ ] **Organization follow-ups.** Per-database grants within an
+      organization, service accounts (API keys owned by an organization),
+      and invitations by email for people without an account yet.
+- [ ] **Deliver mail through SMTP** directly, not only an HTTP webhook, and
+      queue it durably (today a node that stops drops its pending mail).
 - [ ] **Richer queries.** OR/IN filters, ordering by non-index columns with limits,
       projections, and aggregates (count, sum) evaluated server-side.
 - [ ] **Longer change feed retention.** Feed cursors stay valid for a transaction
@@ -50,8 +47,6 @@ the design context for several of these.
       long poll's request per batch.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`. Publish the Rust `client` module as its own crate.
-- [ ] **Console improvements.** Blob upload and download, table schema
-      editing, a DB metrics panel, and pagination on every listing.
 
 ## Testing
 

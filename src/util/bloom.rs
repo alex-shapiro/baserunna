@@ -1,4 +1,4 @@
-//! Simple bloom filter using double hashing over a 64-bit FNV-1a-derived hash.
+//! Bloom filter.
 
 use super::codec::{DResult, DecodeError, Reader, Writer};
 
@@ -8,7 +8,7 @@ pub struct Bloom {
     k: u8,
 }
 
-/// The hash a filter uses for `key` (see [`Bloom::insert_hash`]).
+/// Hash `key` for [`Bloom::insert_hash`].
 pub fn key_hash(key: &[u8]) -> u64 {
     // FNV-1a followed by a SplitMix finalizer for better bit dispersion.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -40,7 +40,7 @@ impl Bloom {
         self.insert_hash(key_hash(key));
     }
 
-    /// Insert a key by its [`key_hash`], so builders need not keep keys.
+    /// Insert a precomputed [`key_hash`].
     pub fn insert_hash(&mut self, h: u64) {
         let (mut a, b) = (h, h.rotate_left(32) | 1);
         let nbits = self.nbits();

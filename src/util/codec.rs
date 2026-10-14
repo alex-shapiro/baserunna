@@ -1,5 +1,4 @@
-//! Minimal binary encoding helpers: LEB128 varints, length-prefixed bytes
-//! and a bounds-checked reader that never panics on malformed input.
+//! Binary encoding and decoding primitives.
 
 use std::fmt;
 
@@ -177,7 +176,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// A varint that must fit in `usize` and not exceed `max`.
+    /// Read a varint length no greater than `max`.
     pub fn len(&mut self, max: usize) -> DResult<usize> {
         let v = self.varint()?;
         if v > max as u64 {

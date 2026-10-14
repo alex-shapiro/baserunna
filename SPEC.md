@@ -103,9 +103,12 @@ src/
   ops.rs            the JSON transaction-op language
   table/            tuple encoding, schema, rows, indexes, queries
   cluster.rs        membership, rendezvous routing, forwarding, leases policy
-  meta.rs           system DB schema + repository (users, sessions, keys, dbs, nodes)
-  auth.rs           password hashing, sessions, API keys, Google OIDC
+  meta/             system DB schema + commands (users, sessions, keys, organizations and roles,
+                    dbs, nodes) and their invariants
+  auth.rs           password hashing, sessions, API keys, mailed-link tokens, Google OIDC
+  mail.rs           outbound email (verification links, password resets)
   limits.rs         rate limits and sign-in backoff
+  log.rs            structured (JSON) logs with request ids
   api/              axum routes (JSON API), errors, extractors
   console/          server-rendered admin console
   api/openapi.rs    OpenAPI 3.1 document
@@ -796,6 +799,12 @@ its `version`.
   (`x-baserunna-forward-to`), and a restarted node refuses copies meant for
   its previous run with a not-applied `503`. GET and HEAD are not
   deduplicated.
+- **Request ids travel with forwards.** Every request gets an id: the
+  client's `x-request-id` if it is 1-64 characters of `[A-Za-z0-9._:-]`,
+  otherwise a new one. Forwards (including metadata commands sent to the
+  system database's lease holder) carry it in the same header, every
+  response echoes it, and each node logs the requests it serves, and
+  anything it logs while serving them, under it (§12).
 - **Deadlines travel with forwards.** `x-baserunna-deadline-ms` carries the
   first node's commit deadline in cluster time. The receiver caps it at its
   own `commit_timeout_ms`, so a delayed forward cannot commit later than
@@ -817,40 +826,71 @@ its `version`.
 
 Tables in DB `sys`, all defined through the table layer (dogfooding):
 
-| table               | pk           | columns                                                            | indexes                           |
-| ------------------- | ------------ | ------------------------------------------------------------------ | --------------------------------- |
-| `users`             | `id`         | email, password_hash?, google_sub?, is_admin, disabled, created_at | unique(email), unique(google_sub) |
-| `sessions`          | `token_hash` | user_id, created_at, expires_at                                    | (user_id)                         |
-| `api_keys`          | `id`         | user_id, name, secret_hash, db_id?, read_only, rate_limit?, created_at | (user_id)                     |
-| `databases`         | `id`         | owner_id, name, created_at                                         | unique(owner_id, name)            |
-| `db_counts`         | `owner_id`   | count                                                              |                                   |
-| `deleted_databases` | `id`         | owner_id, name, deleted_at, purge_passes                           |                                   |
-| `nodes`             | `id`         | addr, started_at, heartbeat_at                                     |                                   |
-| `config`            | `key`        | value                                                              |                                   |
+| table               | pk                  | columns                                                                            | indexes                                         |
+| ------------------- | ------------------- | ---------------------------------------------------------------------------------- | ----------------------------------------------- |
+| `users`             | `id`                | email, password_hash?, google_sub?, is_admin, disabled, email_verified, created_at | unique(email), unique(google_sub), (is_admin)   |
+| `sessions`          | `token_hash`        | id, user_id, created_at, expires_at, client?, method                               | unique(id), (user_id), (expires_at)             |
+| `api_keys`          | `id`                | user_id, name, secret_hash, db_id?, read_only, rate_limit?, created_at             | (user_id)                                       |
+| `orgs`              | `id`                | name, created_at                                                                   | unique(name)                                    |
+| `org_members`       | `(org_id, user_id)` | role, added_at                                                                     | (user_id)                                       |
+| `databases`         | `id`                | owner_id, name, created_at                                                         | unique(owner_id, name)                          |
+| `counts`            | `(kind, key)`       | count                                                                              |                                                 |
+| `deleted_databases` | `id`                | owner_id, name, deleted_at, purge_passes                                           |                                                 |
+| `nodes`             | `id`                | addr, started_at, heartbeat_at                                                     |                                                 |
+| `config`            | `key`               | value                                                                              |                                                 |
 
-`config` stores generated secrets (`cookie_key`) and the bootstrap flags. A
-DB's manifest is created lazily on first access (`If-None-Match: *`), so
-creating a DB is a single system-DB transaction. It reads one row: the
-owner's `db_counts` row enforces `max_dbs_per_user`, and the unique
-`(owner_id, name)` index rejects duplicate names. Deleting a database
-decrements the count (a count of zero deletes the row). Concurrent creates
-by one user conflict on the counter and are retried server-side.
+A database's `owner_id` is a user id or an organization id (`org-…`).
+`config` stores generated secrets (`cookie_key`) and the bootstrap flags.
 
-Auth lookups (session, API key, DB name resolution) are snapshot reads of
-`sys` with `max_staleness` of 2 s, cached per node for at most 30 s. A
-revocation takes effect at once on the node that performed it and within
-30 s everywhere else. A snapshot **miss** (unknown token, database name, or
-email) is retried with a strong read before answering. User-facing listings
-(databases, API keys, users) always read strongly. Together these ensure
-clients always see their own metadata writes, even across nodes.
+`counts` keeps the numbers that limits and invariants need in one row
+each: databases per owner (`max_dbs_per_owner`), members and owners per
+organization (`max_members_per_org`, and the rule that an organization
+keeps an owner), and organizations per user (`max_orgs_per_user`). A
+counter at zero has no row. Commands that change what a counter counts
+update it in the same transaction, so two concurrent changes conflict on
+it and are retried server-side: two owners demoting each other at once
+cannot both succeed. `meta::check_integrity` checks every counter against
+the rows it counts, that every organization has an owner, and that no
+database, membership, session or API key belongs to a missing user or
+organization; the `lifecycle`, `db_churn`, `orgs` and `accounts`
+workloads end with it.
+
+A DB's manifest is created lazily on first access (`If-None-Match: *`), so
+creating a DB is a single system-DB transaction that reads the owner's
+counter and, for an organization, the creator's membership; the unique
+`(owner_id, name)` index rejects duplicate names.
+
+Metadata commands that act for a user (creating databases and
+organizations, changing members, disabling users, creating sessions and
+keys) check that user's rights inside their own transaction: whether
+the user still exists and is enabled, and their role. Authorization of
+metadata changes is therefore serializable with the changes themselves.
+
+Listings of users, sessions, API keys, organizations, members and
+databases are paginated (`limit`, default 100 and at most 1000, and
+`cursor`): they are table queries, whose cursors only resume inside the
+listing that issued them.
+
+Auth lookups (session, API key, DB and organization name resolution,
+membership roles) are snapshot reads of `sys` with `max_staleness` of
+2 s, cached per node for at most 30 s. A revocation (of a session, a key,
+an account, or a role) takes effect at once on the node that performed it
+and within 32 s everywhere else. Only memberships are cached, never their
+absence, so a member added is recognized at once everywhere. A snapshot
+**miss** (unknown token, database name, or email) is retried with a strong
+read before answering. User-facing listings and reads (databases,
+organizations, members, sessions, API keys, users) always read strongly.
+Together these ensure clients always see their own metadata writes, even
+across nodes.
 
 Name resolution is protected against staleness. If a cached name maps to
 a database whose manifest is marked deleted, the name is re-resolved
 strongly and the request continues against the new database. If metadata
 still maps the name to the deleted database, the deletion was interrupted
 halfway, and the node completes it. Creating a database whose name belongs
-to such a half-deleted database also completes the deletion first. A manifest is created lazily only after
-a strong check confirms the database exists, so a stale cache can never
+to such a half-deleted database also completes the deletion first. A
+manifest is created lazily only after a strong check confirms the database
+exists, so a stale cache can never
 resurrect a purged database.
 
 ---
@@ -871,11 +911,36 @@ resurrect a purged database.
   token endpoint, and verifies the ID token. The checks are the RS256
   signature against Google's JWKS (cached), `iss`, `aud == client_id`, `exp`,
   and `email_verified`. A user is matched by `google_sub`, then by verified
-  email, and is created if allowed by the signup policy.
+  email, and is created if allowed by the signup policy. Matching by email
+  links Google to the existing account only if that account has no
+  password or has verified its address: otherwise whoever signed up with
+  someone else's address could set a password, wait for its owner to sign
+  in with Google, and share their account.
 - **Sessions**: a 32-byte random token, `brs_<base64url>`. Only its SHA-256
-  is stored. Default TTL is 30 days. The console uses an `HttpOnly`,
-  `SameSite=Lax` cookie (`Secure` when `public_url` is https). The API uses
-  `Authorization: Bearer`.
+  is stored, with a public id, the client address that signed in and how
+  (`signup`, `password`, `google`, `reset`). Default TTL is 30 days. The
+  console uses an `HttpOnly`, `SameSite=Lax` cookie (`Secure` when
+  `public_url` is https). The API uses `Authorization: Bearer`. Users list
+  their sessions and revoke one, or all but the current one.
+- **Account self-service** (signed-in sessions only, not API keys):
+  changing the password confirms the current one (failures count toward
+  the account's sign-in backoff) and ends every other session; the new
+  hash is written only if the stored one is still the one checked, so two
+  concurrent changes cannot both succeed. Deleting an account confirms the
+  password and removes, in one system-DB transaction, the user, their
+  sessions, API keys and memberships, and their databases (whose manifests
+  are then flagged deleted and later purged, as for `DELETE /v1/dbs/{db}`).
+  It is refused for the last enabled administrator and for the only owner
+  of an organization. Administrators disable and re-enable accounts.
+- **Mailed links** (when the node has a mailer, §12): sign-up and
+  `POST /v1/me/verify-email` mail a link that verifies the address;
+  `POST /v1/auth/password-reset` mails a link that sets a new password,
+  answering the same whether or not the account exists. Links carry a
+  token signed with the cluster's `cookie_key`: its purpose, the user id
+  and a fingerprint of the address (verification, 7 days) or of the
+  current password hash (reset, 1 hour). A reset therefore works once,
+  verifies the address, and ends every session. No token is stored. Mail
+  per address is rate limited (6 an hour, burst 3).
 - **API keys**: `brk_<id>_<secret>`. Only the secret's SHA-256 is stored. A
   key can be scoped to one DB and/or read-only. It is shown once at creation.
 - **Rate limits** (`limits.rs`): token buckets, kept per node, so a cluster
@@ -900,9 +965,32 @@ resurrect a purged database.
   `BASERUNNA_TRUSTED_PROXY_HOPS` proxies the entry that many places from
   the end of `X-Forwarded-For` (entries further left are the client's to
   forge).
-- **Authorization**: users access their own DBs, and admins access all DBs.
-  API-key scope restrictions apply on top. Console forms are protected
-  against CSRF with a per-session token: HMAC(cookie_key, session token hash).
+- **Organizations** hold databases that several users share. Members have
+  one role each:
+
+  | role     | read data | write data and schemas | create and delete databases | manage members         | delete the organization |
+  | -------- | --------- | ---------------------- | --------------------------- | ---------------------- | ----------------------- |
+  | `reader` | yes       |                        |                             |                        |                         |
+  | `writer` | yes       | yes                    |                             |                        |                         |
+  | `admin`  | yes       | yes                    | yes                         | readers through admins |                         |
+  | `owner`  | yes       | yes                    | yes                         | everyone               | yes                     |
+
+  An organization always keeps an owner: the last one cannot leave or be
+  demoted. Members are added by the email of an existing account, and
+  leave by removing themselves. An organization is deleted only once it has
+  no databases, so no database outlives its owner. Organization names are
+  1-39 characters of `[a-z0-9_-]`, starting with a letter or digit; its
+  databases are addressed as
+  `org.name`. To anyone outside an organization, it and its databases do
+  not exist (404).
+- **Authorization**: each request on a database resolves the caller's role
+  there: owner of their own databases, their membership role in an
+  organization's, owner everywhere for (enabled) site administrators. A
+  read-only API key caps it at reader, and a key scoped to one database
+  reaches no other (it lists only that database, and no organization's).
+  Deleting a database checks the role without caches.
+  Console forms are protected against CSRF with a per-session token:
+  HMAC(cookie_key, session token hash).
 
 ---
 
@@ -910,8 +998,9 @@ resurrect a purged database.
 
 The API is JSON over HTTP. All routes are under `/v1`. The full schema is in
 `openapi.json` (OpenAPI 3.1, generated by `src/api/openapi.rs`), served at `GET /v1/openapi.json`. DB-scoped
-routes take `{db}`, the DB _name_ owned by the caller. Admins may use
-`id:<db_id>`.
+routes take `{db}`, a reference: `name` (a database of the caller's),
+`org.name` (an organization's), or `id:<db_id>` (administrators).
+Responses carry `x-request-id` (§7).
 
 Errors are returned as
 `{"error": {"code", "message", "retryable", "details"?}}`:
@@ -938,9 +1027,18 @@ GET    /healthz                                   liveness (503 while shutting d
 GET    /v1/openapi.json
 POST   /v1/auth/signup | /v1/auth/login | /v1/auth/logout
 GET    /v1/auth/google/start | /v1/auth/google/callback
-GET    /v1/me
+POST   /v1/auth/verify-email                       a mailed verification token
+POST   /v1/auth/password-reset | /v1/auth/password-reset/confirm
+GET    /v1/me                DELETE /v1/me         delete the account (password)
+POST   /v1/me/password                             change it; ends other sessions
+POST   /v1/me/verify-email                         mail a verification link
+GET    /v1/me/sessions       DELETE /v1/me/sessions (all others)   DELETE /v1/me/sessions/{id}
 GET    /v1/api-keys          POST /v1/api-keys     DELETE /v1/api-keys/{id}
-GET    /v1/dbs               POST /v1/dbs
+GET    /v1/orgs              POST /v1/orgs
+GET    /v1/orgs/{org}        DELETE /v1/orgs/{org}
+GET    /v1/orgs/{org}/members                      POST /v1/orgs/{org}/members (email, role)
+POST   /v1/orgs/{org}/members/{user}  (role)       DELETE /v1/orgs/{org}/members/{user}
+GET    /v1/dbs (?org=)       POST /v1/dbs (name, org?)
 GET    /v1/dbs/{db}          DELETE /v1/dbs/{db}
 GET    /v1/dbs/{db}/kv                             scan (query params)
 GET    /v1/dbs/{db}/changes                        change feed of keys (§6.4)
@@ -966,12 +1064,18 @@ GET    /v1/dbs/{db}/tables/{t}/changes             change feed of rows (§6.4)
 GET    /v1/admin/users   GET /v1/admin/nodes   POST /v1/admin/users/{id}/disable
 ```
 
+Listings take `limit` and `cursor` and answer `next_cursor` (§8).
+
 Raw KV semantics:
 
 - `GET` returns the value with `ETag: "<version>"` and
   `x-baserunna-version`, and `x-baserunna-expires-at` if it expires. Blob
   values are streamed and support `Range: bytes=…` (206). The query
-  parameter `consistency` takes `strong` or `snapshot`.
+  parameter `consistency` takes `strong` or `snapshot`. Stored bytes never
+  run as a page of the service's origin, where an HTML value written by
+  one member of an organization would act with the session of another who
+  opens it: they are served with `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: sandbox`.
 - `PUT` takes the body as the value; bodies above `value_inline_max` become
   blobs automatically. `If-Match: "<v>"` makes the write conditional on the
   key's version. `If-None-Match: *` makes it create-only. `?ttl_ms=` makes
@@ -984,44 +1088,66 @@ Raw KV semantics:
 Server-rendered HTML from the same axum app under `/console`. It uses no
 JavaScript framework and no external assets. Pages:
 
-- sign in (password and "Sign in with Google") and sign out;
-- databases: list, create, delete; per-DB page with stats, key browser
-  (prefix scan, view and delete values, upload), tables (schema, rows with
-  pagination), and a transaction runner (JSON);
+- sign in (password and "Sign in with Google"), sign out, forgotten
+  password and reset, email verification;
+- databases: list, create, delete; per-DB page with a metrics panel (size
+  against the quota, levels, tail, pending garbage, lease), key browser
+  (prefix scan, view, delete, put, file upload, download), tables (create,
+  drop; add and drop columns and indexes; rows), and a transaction runner
+  (JSON);
+- organizations: list, create, delete; members (add by email, change
+  role, remove, leave) and the organization's databases;
+- account: verification status, password change, sessions (revoke one or
+  all others), account deletion;
 - API keys: list, create (secret shown once), revoke;
-- admin only: users (disable), cluster nodes (liveness, address).
+- admin only: users (disable, re-enable), cluster nodes (liveness,
+  address).
 
-POST forms carry a CSRF token. All output is HTML-escaped.
+Every listing is paginated. POST forms carry a CSRF token. All output is
+HTML-escaped. Downloads are attachments with `nosniff` and a sandboxing
+content security policy.
 
 ---
 
 ## 12. Configuration (environment)
 
-| var                                      | default                    | meaning                                                      |
-| ---------------------------------------- | -------------------------- | ------------------------------------------------------------ |
-| `BASERUNNA_LISTEN`                       | `0.0.0.0:8080`             | bind address                                                 |
-| `BASERUNNA_ADVERTISE`                    | `http://<listen>`          | address peers use to forward                                 |
-| `BASERUNNA_NODE_ID`                      | random                     | stable id optional                                           |
-| `BASERUNNA_STORE`                        | `fs:./data`                | `fs:<dir>`, `mem:`, `s3://bucket/prefix`, `gs://…`, `az://…` |
-| `BASERUNNA_CLUSTER_SECRET`               | none (required if >1 node) | internal endpoint auth                                       |
-| `BASERUNNA_SIGNUP`                       | `first_user_only`          | `open` / `first_user_only` / `closed`                        |
-| `BASERUNNA_ADMIN_EMAIL` / `_PASSWORD`    | none                       | bootstrap admin                                              |
-| `BASERUNNA_GOOGLE_CLIENT_ID` / `_SECRET` | none                       | enables Google sign-in                                       |
-| `BASERUNNA_PUBLIC_URL`                   | advertise                  | OAuth redirect base, cookie `Secure`                         |
-| `BASERUNNA_CACHE_MB`                     | 512                        | block cache budget                                           |
-| `BASERUNNA_DISK_CACHE_DIR`               | none                       | directory of the local tier (§5.3); off if unset             |
-| `BASERUNNA_DISK_CACHE_MB`                | 10240                      | local tier budget                                            |
-| `BASERUNNA_LEASE_MS`                     | 5000                       | lease renewed by commits; leases renewed for reads last 3×   |
-| `BASERUNNA_DB_MAX_MB`                    | 10240                      | size quota of each database (§5.10); 0 for none              |
-| `BASERUNNA_USER_RPS`                     | 500                        | requests per second per user, per node; 0 for no limit       |
-| `BASERUNNA_API_KEY_RPS`                  | 500                        | requests per second per API key without its own `rate_limit` |
-| `BASERUNNA_AUTH_RPS_PER_CLIENT`          | 1                          | sign-ins and sign-ups per second per client address          |
-| `BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT`  | 20                         | accounts created per hour per client address                 |
-| `BASERUNNA_TRUSTED_PROXY_HOPS`           | 0                          | proxies appending to `X-Forwarded-For` (§9)                  |
-| `BASERUNNA_HASH_CONCURRENCY`             | CPU count                  | password hashes computed at once                             |
-| `BASERUNNA_PBKDF2_ITERATIONS`            | 600000                     | password hashing cost for new hashes                         |
-| `BASERUNNA_DRAIN_DELAY_MS`               | 0                          | on SIGTERM/SIGINT, fail health checks this long first        |
-| `BASERUNNA_SHUTDOWN_TIMEOUT_MS`          | 20000                      | then let in-flight requests finish for at most this long     |
+| var                                      | default                         | meaning                                                      |
+| ---------------------------------------- | ------------------------------- | ------------------------------------------------------------ |
+| `BASERUNNA_LISTEN`                       | `0.0.0.0:8080`                  | bind address                                                 |
+| `BASERUNNA_ADVERTISE`                    | `http://127.0.0.1:<port>`       | address peers use to forward                                 |
+| `BASERUNNA_NODE_ID`                      | random                          | stable id optional                                           |
+| `BASERUNNA_STORE`                        | `fs:./data`                     | `fs:<dir>`, `mem:`, `s3://bucket/prefix`, `gs://…`, `az://…` |
+| `BASERUNNA_CLUSTER_SECRET`               | none (required if >1 node)      | internal endpoint auth                                       |
+| `BASERUNNA_SIGNUP`                       | `first_user_only`               | `open` / `first_user_only` / `closed`                        |
+| `BASERUNNA_ADMIN_EMAIL` / `_PASSWORD`    | none                            | bootstrap admin                                              |
+| `BASERUNNA_GOOGLE_CLIENT_ID` / `_SECRET` | none                            | enables Google sign-in                                       |
+| `BASERUNNA_PUBLIC_URL`                   | advertise                       | OAuth redirect base, cookie `Secure`                         |
+| `BASERUNNA_CACHE_MB`                     | 512                             | block cache budget                                           |
+| `BASERUNNA_DISK_CACHE_DIR`               | none                            | directory of the local tier (§5.3); off if unset             |
+| `BASERUNNA_DISK_CACHE_MB`                | 10240                           | local tier budget                                            |
+| `BASERUNNA_LEASE_MS`                     | 5000                            | lease renewed by commits; leases renewed for reads last 3×   |
+| `BASERUNNA_DB_MAX_MB`                    | 10240                           | size quota of each database (§5.10); 0 for none              |
+| `BASERUNNA_USER_RPS`                     | 500                             | requests per second per user, per node; 0 for no limit       |
+| `BASERUNNA_API_KEY_RPS`                  | 500                             | requests per second per API key without its own `rate_limit` |
+| `BASERUNNA_AUTH_RPS_PER_CLIENT`          | 1                               | sign-ins and sign-ups per second per client address          |
+| `BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT`  | 20                              | accounts created per hour per client address                 |
+| `BASERUNNA_TRUSTED_PROXY_HOPS`           | 0                               | proxies appending to `X-Forwarded-For` (§9)                  |
+| `BASERUNNA_HASH_CONCURRENCY`             | CPU count                       | password hashes computed at once                             |
+| `BASERUNNA_PBKDF2_ITERATIONS`            | 600000                          | password hashing cost for new hashes                         |
+| `BASERUNNA_DRAIN_DELAY_MS`               | 0                               | on SIGTERM/SIGINT, fail health checks this long first        |
+| `BASERUNNA_SHUTDOWN_TIMEOUT_MS`          | 20000                           | then let in-flight requests finish for at most this long     |
+| `BASERUNNA_LOG`                          | `info`                          | `error` / `warn` / `info` (every request) / `debug` / `off`  |
+| `BASERUNNA_LOG_FORMAT`                   | `json`                          | `json` (one object per line) or `text`                       |
+| `BASERUNNA_MAIL_WEBHOOK_URL`             | none                            | enables mail: each message is POSTed there as JSON           |
+| `BASERUNNA_MAIL_WEBHOOK_TOKEN`           | none                            | bearer token for the mail webhook                            |
+| `BASERUNNA_MAIL_FROM`                    | `Baserunna <noreply@localhost>` | sender passed to the webhook                                 |
+
+Logs go to stderr, one JSON object per line:
+`{"ts", "level", "node", "request_id", "msg", ...}`. At `info` every
+request is logged once on each node it reaches, under its request id
+(§7): `method`, `route` (the route template, never the path, which may
+hold keys), `status`, `ms`, `hops`, and `forwarded_to` when another node
+answered. The mail webhook receives `{"from", "to", "subject", "text"}`.
 
 On SIGTERM or SIGINT a node drains (failing `/healthz`), stops accepting
 connections, waits for in-flight requests, then releases its leases and
@@ -1091,10 +1217,12 @@ the directory.
 | `blob_gc_race` | Blob reads race overwrites, deletes and GC, with grace periods shorter than a download (and, hostile, node clocks an hour apart). A read may fail cleanly but never return wrong bytes. |
 | `abandoned`    | Interactive transactions abandoned, aborted or committed late while leases move. No update is lost, abandoned transactions never commit, and open transactions drain.             |
 | `db_churn`     | Databases created, used, deleted and recreated under a tiny cache and fast handle eviction. Each matches its model, deleted names answer 404, handles and cache stay bounded, and per-owner database counts match. |
-| `auth`         | Signup, login, sessions, API keys (scoped, read-only), logout, revocation, Google OAuth, and who can access which DB.                                                             |
+| `auth`         | Signup, login, sessions, API keys (scoped, read-only), logout, revocation, Google OAuth (never into an unverified password account), and who can access which DB.                |
+| `orgs`         | Each role does exactly what §9 allows; while roles change, every write's answer is explained by a role held within the cache lag, and owner and deletion races keep an owner and leave no orphaned database. |
+| `accounts`     | Password changes, session revocation, mailed verification and reset links, and account deletion take effect everywhere within the cache lag, and leave the metadata consistent. |
 | `limits`       | Per-key, per-user and per-address rate limits and sign-in backoff: refused requests get 429 with `Retry-After` and are never applied, a limit leaves other keys, users, accounts and addresses alone, and a sign-in works again once its backoff passes. |
 | `lifecycle`    | Create, use, delete, and recreate DBs under crashes. Deleted data is never visible and is eventually purged, and per-owner database counts match.                                 |
-| `console`      | Browser-style console flows: cookies, forms, CSRF rejection, HTML escaping of hostile input.                                                                                      |
+| `console`      | Browser-style console flows: cookies, forms (multipart uploads included), CSRF rejection, HTML escaping of hostile input, file upload and byte-exact download, schema editing, pagination, account, organization and admin pages, password reset and verification through the mailbox. |
 | `api_tour`     | The remaining endpoints (schema drops, aborts, commit status by idempotency key, metadata) with result checks.                                                                    |
 | `chaos`        | Several workloads at once with crashes, partitions, and store faults.                                                                                                             |
 
@@ -1119,10 +1247,16 @@ blob exists.
   pages to that version's state, giving the current state; a table with
   random row writes, queries and batch updates and deletes through its
   indexes equals a model; range tombstone fragments match a brute-force
-  check; base64/varint/bloom laws.
+  check; base64/varint/bloom laws; random organization, membership,
+  database and account commands from random actors (administrators,
+  every role, outsiders, disabled and deleted users) succeed or fail
+  exactly as an independent model of §9's rules predicts and leave the
+  model's state, with the metadata invariants checked after every step;
+  database references and log records round-trip.
 - **Fuzz tests**: every decoder (manifest, levels object, range tombstone,
   segment and compressed blocks, entries with expiries, tuple, row, blob
-  ref, query and change feed cursors) gets
+  ref, query and change feed cursors, database references, mailed-link
+  tokens, multipart form bodies) gets
   arbitrary and mutated inputs and must
   return `Err`, never panic. The router gets random JSON bodies and paths and must never answer
   500 or panic. These run in `cargo test` with fixed seeds. The same
@@ -1147,14 +1281,20 @@ blob exists.
   entries and segments reclaimed. Nodes
   count these (`engine::Activity`), and the simulator sums them over a run,
   crashed nodes included.
+- **Request ids**: a two-node simulation captures every node's log records
+  and checks that responses echo valid ids (replacing invalid ones), that a
+  forwarded request is logged under its id on both nodes, and that
+  metadata commands forwarded to the system database's lease holder carry
+  their request's id.
 - **Checker self-tests**: a checker that cannot fail proves nothing, so
   each one is fed known-bad input: non-linearizable register histories,
   broken ledgers, missing or stale index entries, orphaned rows, missing
   segments and blob chunks, foreign bytes in blob reads, reads outside
-  expiry windows, overlapping lock holders, and feed changes no write
-  explains. Disabling expiry validation, the version time's floor at read
-  times, range deletions in the feed, or index maintenance in batch updates
-  each fails campaigns of the `ttl`, `watch` and `tables` workloads.
+  expiry windows, overlapping lock holders, feed changes no write
+  explains, and write answers no role in their window explains.
+  Disabling expiry validation, the version time's floor at read times,
+  range deletions in the feed, or index maintenance in batch updates each
+  fails campaigns of the `ttl`, `watch` and `tables` workloads.
 - **Mutation testing** (`scripts/mutants.sh`) checks that the suites catch
   bugs injected into the engine, the table layer, the op language and the
   checkers. Over the whole configuration, before the storage-engine
@@ -1272,6 +1412,20 @@ Bugs the DST suite found, each now covered by the regular suite:
     outlived a full collection cycle. Probes are now retried, and every node
     keeps its measurement fresh in the background.
 
+19. _Sessions that outlived a password change._ Changing a password and
+    ending the other sessions were two steps; a crash between them left
+    the old sessions working. Sessions now carry a fingerprint of the
+    password hash they were made under, so the change ends them in its own
+    transaction (§9).
+20. _Repairs that claimed success._ Finishing an interrupted database
+    deletion answered 404 even when its metadata command failed, so the
+    client believed a database gone that its organization still counted
+    (and could not be deleted). A failed repair now answers a retryable
+    503.
+21. _Transient errors as invalid links._ A verification or reset link
+    checked while the system database was unreachable was reported as
+    invalid (401) instead of retryable.
+
 The cost measurements (§13.4) found four more: a read-heavy database whose
 lease had lapsed never acquired it again (paying a validating GET per read
 forever), a strong read without a lease validated the manifest twice,
@@ -1326,6 +1480,9 @@ amplification. `gen_openapi` regenerates `openapi.json`.
   nodes admits up to N times each rate, and a restart forgets them.
 - Size quotas are one setting for every database; there are no per-user
   or per-database overrides.
+- Roles are per organization: a user cannot be granted one database of
+  an organization only.
+- Mail is sent only through an HTTP webhook (§12).
 - Multi-node deployments need an object store with conditional writes
   (S3, GCS, Azure, R2, MinIO); `fs:` is for one process (§12).
 - After a node crash, writes to the databases it leased wait for the lease
@@ -1342,4 +1499,5 @@ amplification. `gen_openapi` regenerates `openapi.json`.
 
 Point-in-time restore (keep old manifests); change feeds that keep
 deletions longer, or every intermediate value; quotas and rate limits per
-user or database, shared across nodes; multi-user organizations.
+user or database, shared across nodes; per-database grants within an
+organization; service accounts (API keys that belong to an organization).

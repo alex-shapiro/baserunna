@@ -1,5 +1,4 @@
-//! A small async Rust client for the Baserunna HTTP API (used by the
-//! examples; usable as a minimal SDK).
+//! Async Rust client for the Baserunna HTTP API.
 
 use axum::body::Body;
 use bytes::Bytes;
@@ -47,7 +46,7 @@ fn retry_after(h: &http::HeaderMap, body: &Bytes) -> std::time::Duration {
     std::time::Duration::from_millis(ms.unwrap_or(1000).max(1))
 }
 
-/// Percent-encode one path segment (e.g. a key).
+/// Percent-encodes a URL path segment.
 pub fn seg(s: &str) -> String {
     s.bytes()
         .map(|b| {
@@ -70,8 +69,7 @@ impl Client {
         }
     }
 
-    /// A copy of this client that authenticates with `token` (a session
-    /// token or an API key).
+    /// Returns a copy of the client that authenticates with `token`.
     pub fn with_token(&self, token: &str) -> Client {
         Client { token: Some(token.to_string()), ..self.clone() }
     }
@@ -126,7 +124,7 @@ impl Client {
         Ok((status, headers, bytes))
     }
 
-    /// JSON request; non-2xx responses become [`ApiError`].
+    /// Sends a JSON request, returning an [`ApiError`] on non-2xx responses.
     pub async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, ApiError> {
         let bytes = body.map(|b| Bytes::from(b.to_string())).unwrap_or_default();
         let (status, _, out) = self.raw(method, path, &[("content-type", "application/json")], bytes).await?;
@@ -155,8 +153,6 @@ impl Client {
         self.call("DELETE", path, None).await
     }
 
-    // ---- convenience wrappers
-
     pub async fn signup(&self, email: &str, password: &str) -> Result<Client, ApiError> {
         let r = self.post("/v1/auth/signup", json!({"email": email, "password": password})).await?;
         Ok(self.with_token(r["token"].as_str().unwrap_or_default()))
@@ -171,7 +167,7 @@ impl Client {
         self.post("/v1/dbs", json!({"name": name})).await
     }
 
-    /// One-shot transaction.
+    /// Runs a one-shot transaction.
     pub async fn txn(&self, db: &str, ops: Value) -> Result<Value, ApiError> {
         self.post(&format!("/v1/dbs/{}/txn", seg(db)), json!({"ops": ops})).await
     }
@@ -184,7 +180,7 @@ impl Client {
         if st == 200 { Ok(v["version"].as_u64().unwrap_or(0)) } else { Err(api_err(st, v)) }
     }
 
-    /// Raw bytes of a key (optionally a `Range` like `bytes=0-99`).
+    /// Reads the raw bytes of `key`, or `None` if not found.
     pub async fn get_bytes(&self, db: &str, key: &str, range: Option<&str>) -> Result<Option<Bytes>, ApiError> {
         let h: Vec<(&str, &str)> = range.map(|r| vec![("range", r)]).unwrap_or_default();
         let (st, _, out) = self.raw("GET", &format!("/v1/dbs/{}/kv/{}", seg(db), seg(key)), &h, Bytes::new()).await?;
@@ -195,10 +191,7 @@ impl Client {
         }
     }
 
-    /// A page of the changes to `db`'s keys after `after` (a version or a
-    /// previous `next_cursor`), waiting up to `wait_ms` for one. Follow on
-    /// from the page's `next_cursor`; a `410 cursor_expired` means the
-    /// current state must be read again.
+    /// Reads a page of KV changes after `after`, waiting up to `wait_ms` for new changes.
     pub async fn changes(&self, db: &str, after: &str, wait_ms: u64) -> Result<Value, ApiError> {
         self.get(&format!("/v1/dbs/{}/changes?after={}&wait_ms={wait_ms}", seg(db), seg(after))).await
     }

@@ -1,6 +1,4 @@
-//! Typed tables with primary keys and secondary indexes, layered on the KV
-//! engine inside the caller's transaction (so every table operation is
-//! serializable with everything else in the transaction). See SPEC §4.4.
+//! Typed tables with primary keys and secondary indexes layered on the KV engine.
 
 pub mod schema;
 pub mod tuple;
@@ -34,9 +32,8 @@ fn catalog_key(name: &str) -> Bytes {
     Bytes::from(k)
 }
 
-/// The progress of a building index: the key of the last row backfilled
-/// (empty before the first batch). Kept out of the schema, which every row
-/// write pins, so that backfill batches do not conflict with row writes.
+/// Backfill cursor key for a building index, stored outside the schema so
+/// backfill batches do not conflict with row writes.
 fn backfill_key(tid: u32, iid: u32) -> Bytes {
     let mut k = vec![SPACE_CATALOG];
     k.extend_from_slice(b"b/");
@@ -81,8 +78,6 @@ fn blob_side_key(tid: u32, pk: &[Key], col: u32) -> Bytes {
     Bytes::from(k)
 }
 
-// ---------------------------------------------------------------- catalog
-
 pub async fn list_tables(txn: &mut Txn) -> Result<Vec<TableSchema>> {
     let mut prefix = vec![SPACE_CATALOG];
     prefix.extend_from_slice(b"t/");
@@ -97,8 +92,7 @@ fn decode_schema(it: &ReadValue) -> Result<TableSchema> {
     }
 }
 
-/// A table's schema. Pinned: every write derived from it must commit
-/// against the schema it was derived from, whatever the isolation level.
+/// Read `name`'s schema and pin its key so the transaction conflicts if the schema changes.
 pub async fn get_schema(txn: &mut Txn, name: &str) -> Result<TableSchema> {
     match txn.get_pinned(&catalog_key(name)).await? {
         Some(it) => decode_schema(&it),
@@ -252,13 +246,12 @@ pub async fn drop_column(txn: &mut Txn, table: &str, name: &str) -> Result<Table
     Ok(s)
 }
 
-/// Batch sizes of an index backfill (see [`add_index`]).
+/// Batch limits for [`add_index`].
 #[derive(Clone, Copy, Debug)]
 pub struct Backfill {
     /// Rows read per batch transaction.
     pub batch_rows: usize,
-    /// Index bytes written per batch transaction (a batch stops early once
-    /// it has written this much).
+    /// Maximum index bytes written per batch transaction.
     pub batch_bytes: usize,
 }
 
@@ -268,12 +261,9 @@ impl Default for Backfill {
     }
 }
 
-/// Conflicts a backfill transaction retries before giving up.
 const BACKFILL_RETRIES: u32 = 50;
 
-/// Run `$body` (with `$t: &mut Txn`) in a serializable transaction on
-/// `$db`, retrying conflicts. Evaluates to `(T, Seq)`; returns errors from
-/// the enclosing function.
+/// Run `$body` in a serializable transaction on `$db`, retrying on conflict.
 macro_rules! retrying_txn {
     ($db:expr, |$t:ident| $body:expr) => {{
         let mut attempt_ = 0u32;
@@ -296,18 +286,11 @@ macro_rules! retrying_txn {
     }};
 }
 
-/// Add an index to a table without blocking writes to it.
+/// Add an index to `table` in batched background transactions without blocking row writes.
 ///
-/// The index is first added in the `building` state, in which every row
-/// write maintains it but queries cannot use it yet. It is then backfilled
-/// from the table's rows in batches of separate transactions, the last of
-/// which marks it ready. Returns the schema and the version of that last
-/// transaction.
-///
-/// If the build is interrupted (a crash, a lost connection), the index
-/// stays `building`; calling `add_index` again with the same definition
-/// resumes it. A unique index whose rows turn out to hold duplicate values
-/// is removed again, and the call fails with `AlreadyExists`.
+/// Resumes an interrupted build if an identical `building` index already exists.
+/// If a unique index encounters duplicate values during backfill, the index is
+/// removed and `AlreadyExists` is returned.
 pub async fn add_index(db: &Arc<Db>, table: &str, spec: &IndexSpec, opts: Backfill) -> Result<(TableSchema, Seq)> {
     let (idx, _) = retrying_txn!(db, |t| begin_index(t, table, spec).await);
     match backfill(db, table, &idx, opts).await {
@@ -319,8 +302,6 @@ pub async fn add_index(db: &Arc<Db>, table: &str, spec: &IndexSpec, opts: Backfi
     }
 }
 
-/// Add `spec` to the table as a building index, or find the building
-/// index with the same definition to resume.
 async fn begin_index(txn: &mut Txn, table: &str, spec: &IndexSpec) -> Result<IndexDef> {
     let mut s = get_schema(txn, table).await?;
     if let Some(i) = s.index(&spec.name) {
@@ -352,8 +333,6 @@ async fn backfill(db: &Arc<Db>, table: &str, idx: &IndexDef, opts: Backfill) -> 
     }
 }
 
-/// Backfill the next batch of rows into `idx`. Returns the schema once the
-/// index is ready.
 async fn backfill_batch(txn: &mut Txn, table: &str, idx: &IndexDef, opts: Backfill) -> Result<Option<TableSchema>> {
     let mut s = get_schema(txn, table).await?;
     let state = s.indexes.iter().find(|i| i.id == idx.id).map(|i| i.state);
@@ -394,7 +373,6 @@ async fn backfill_batch(txn: &mut Txn, table: &str, idx: &IndexDef, opts: Backfi
             break;
         }
     }
-    // A short page read to its end leaves no rows behind it.
     let done = written == page.len() && page.len() < batch;
     if !done {
         let last = last.ok_or_else(|| Error::internal("empty backfill batch"))?;
@@ -409,7 +387,6 @@ async fn backfill_batch(txn: &mut Txn, table: &str, idx: &IndexDef, opts: Backfi
     Ok(Some(s))
 }
 
-/// Remove a building index and everything written for it.
 async fn abandon_index(txn: &mut Txn, table: &str, idx: &IndexDef) -> Result<()> {
     let mut s = get_schema(txn, table).await?;
     if s.indexes.iter().any(|i| i.id == idx.id && i.state == IndexState::Building) {
@@ -433,10 +410,6 @@ pub async fn drop_index(txn: &mut Txn, table: &str, name: &str) -> Result<TableS
     Ok(s)
 }
 
-// ---------------------------------------------------------------- rows
-
-/// The key of a row from [`row_from_json`], which has already rejected
-/// missing and null key columns.
 fn pk_keys_of_row(s: &TableSchema, row: &Row) -> Result<Vec<Key>> {
     s.primary_key
         .iter()
@@ -449,7 +422,7 @@ fn pk_keys_of_row(s: &TableSchema, row: &Row) -> Result<Vec<Key>> {
         .collect()
 }
 
-/// Parse a primary key given as a scalar (single-column keys) or an array.
+/// Parse a primary key from a JSON scalar or array.
 pub fn parse_pk(s: &TableSchema, pk: &Json) -> Result<Vec<Key>> {
     let vals = match pk {
         Json::Array(a) => a.as_slice(),
@@ -489,7 +462,6 @@ fn index_entry(s: &TableSchema, idx: &IndexDef, row: &Row, pk: &[Key]) -> Result
     }
 }
 
-/// Resolves staged blob ids for blob columns.
 pub struct BlobResolver<'a> {
     pub db: &'a Arc<Db>,
 }
@@ -500,7 +472,6 @@ impl BlobResolver<'_> {
     }
 }
 
-/// Build a full row from JSON (applying defaults), resolving blob ids.
 async fn row_from_json(s: &TableSchema, obj: &Json, blobs: &BlobResolver<'_>, base: Option<&Row>) -> Result<Row> {
     let obj = obj.as_object().ok_or_else(|| Error::invalid("row must be a JSON object"))?;
     for k in obj.keys() {
@@ -534,7 +505,6 @@ async fn row_from_json(s: &TableSchema, obj: &Json, blobs: &BlobResolver<'_>, ba
     Ok(row)
 }
 
-/// Fill in defaults (or null) for columns missing from a stored row.
 fn fill_defaults(s: &TableSchema, row: &mut Row) -> Result<()> {
     for c in &s.columns {
         if !row.contains_key(&c.id) && c.ty != ColType::Blob {
@@ -548,10 +518,8 @@ fn fill_defaults(s: &TableSchema, row: &mut Row) -> Result<()> {
     Ok(())
 }
 
-/// A stored row (with its blob columns) and when it expires.
 type Stored = (Row, Option<Ttl>);
 
-/// Read a stored row (with blob columns) by primary key.
 async fn load_row(txn: &mut Txn, s: &TableSchema, pk: &[Key]) -> Result<Option<Stored>> {
     let Some(it) = txn.get(&row_key(s.id, pk)).await? else {
         return Ok(None);
@@ -580,8 +548,6 @@ async fn load_blob_columns(txn: &mut Txn, s: &TableSchema, pk: &[Key], row: &mut
     Ok(())
 }
 
-/// Write a row and its blob columns, all to expire as `ttl` says, over the
-/// stored row `old` (if any).
 fn write_row(
     txn: &mut Txn,
     s: &TableSchema,
@@ -608,8 +574,6 @@ fn write_row(
     Ok(())
 }
 
-/// Move a row's index entries from those of `old` to those of `new`. An
-/// index entry expires with its row.
 async fn update_indexes(
     txn: &mut Txn,
     s: &TableSchema,
@@ -650,7 +614,6 @@ pub enum InsertMode {
     Upsert,
 }
 
-/// What a row update does to the row's expiry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Expiry {
     Keep,
@@ -658,7 +621,6 @@ pub enum Expiry {
 }
 
 impl Expiry {
-    /// The time to live of a row that had `old`.
     fn of(self, old: Option<Ttl>) -> Option<Ttl> {
         match self {
             Expiry::Keep => old,
@@ -667,12 +629,10 @@ impl Expiry {
     }
 }
 
-/// Insert (or with `Upsert`, replace) a row.
 pub async fn insert(txn: &mut Txn, blobs: &BlobResolver<'_>, table: &str, obj: &Json, mode: InsertMode) -> Result<()> {
     insert_expiring(txn, blobs, table, obj, mode, None).await
 }
 
-/// [`insert`] a row that expires as `ttl` says.
 pub async fn insert_expiring(
     txn: &mut Txn,
     blobs: &BlobResolver<'_>,
@@ -692,12 +652,10 @@ pub async fn insert_expiring(
     write_row(txn, &s, &pk, &row, ttl, old.as_ref())
 }
 
-/// Set some columns of a row, if it exists.
 pub async fn update(txn: &mut Txn, blobs: &BlobResolver<'_>, table: &str, pk: &Json, set: &Json) -> Result<bool> {
     update_expiring(txn, blobs, table, pk, set, Expiry::Keep).await
 }
 
-/// [`update`], also changing when the row expires.
 pub async fn update_expiring(
     txn: &mut Txn,
     blobs: &BlobResolver<'_>,
@@ -756,9 +714,7 @@ async fn delete_stored(txn: &mut Txn, s: &TableSchema, pk: &[Key], old: &Stored)
     Ok(())
 }
 
-/// Update every row `sel` selects (at most `limit`), with `set` applied as
-/// by [`update`]. Returns how many rows were updated. The transaction's
-/// write limit bounds how many rows one call may change.
+/// Update up to `limit` rows matching `sel` and return the number of updated rows.
 pub async fn update_where(
     txn: &mut Txn,
     blobs: &BlobResolver<'_>,
@@ -777,7 +733,7 @@ pub async fn update_where(
     Ok(rows.len())
 }
 
-/// Delete every row `sel` selects (at most `limit`). Returns how many.
+/// Delete up to `limit` rows matching `sel` and return the number of deleted rows.
 pub async fn delete_where(txn: &mut Txn, table: &str, sel: &Selection, limit: Option<usize>) -> Result<usize> {
     let s = get_schema(txn, table).await?;
     let rows = select(txn, &s, sel, limit).await?;
@@ -787,8 +743,6 @@ pub async fn delete_where(txn: &mut Txn, table: &str, sel: &Selection, limit: Op
     Ok(rows.len())
 }
 
-/// `set` must be an object of columns other than the primary key's, each
-/// with a value of the column's type.
 fn check_set(s: &TableSchema, set: &Json) -> Result<()> {
     let obj = set.as_object().ok_or_else(|| Error::invalid("set must be a JSON object"))?;
     for (k, v) in obj {
@@ -804,9 +758,8 @@ fn check_set(s: &TableSchema, set: &Json) -> Result<()> {
     Ok(())
 }
 
-/// The rows `sel` selects, in its access path's order, at most `limit`.
-/// All are read before any is written, so writes cannot move a row into
-/// the part of an index still to be read.
+/// Collect up to `limit` rows matching `sel` before any writes occur, preventing
+/// index updates from moving a row into the remaining scan range.
 async fn select(
     txn: &mut Txn,
     s: &TableSchema,
@@ -819,7 +772,6 @@ async fn select(
     if limit == Some(0) {
         return Ok(out);
     }
-    // Every selected row costs a write of at least its key.
     let mut budget = txn.write_budget();
     let mut pages = Pages::new(range);
     while let Some(page) = pages.next(txn).await? {
@@ -850,12 +802,10 @@ pub fn row_to_json(s: &TableSchema, row: &Row) -> Json {
     Json::Object(m)
 }
 
-/// A row by primary key.
 pub async fn get(txn: &mut Txn, table: &str, pk: &Json) -> Result<Option<Json>> {
     Ok(get_expiring(txn, table, pk).await?.map(|(r, _)| r))
 }
 
-/// A row by primary key, and when it expires.
 pub async fn get_expiring(txn: &mut Txn, table: &str, pk: &Json) -> Result<Option<(Json, Option<u64>)>> {
     let s = get_schema(txn, table).await?;
     let pk = parse_pk(&s, pk)?;
@@ -870,8 +820,6 @@ pub async fn get_expiring(txn: &mut Txn, table: &str, pk: &Json) -> Result<Optio
     }))
 }
 
-/// Reads a key range a page at a time, so that memory stays bounded however
-/// large the range.
 struct Pages {
     rest: Option<KeyRange>,
 }
@@ -897,8 +845,6 @@ impl Pages {
     }
 }
 
-/// A row as stored under `prefix` (the table's row space), with defaults
-/// applied and without its blob columns.
 fn decode_stored_row(s: &TableSchema, prefix: &[u8], it: &ReadValue) -> Result<(Vec<Key>, Row)> {
     let pk = tuple::decode_all(&it.key[prefix.len()..])?;
     let Value::Inline(d) = &it.value else {
@@ -909,7 +855,6 @@ fn decode_stored_row(s: &TableSchema, prefix: &[u8], it: &ReadValue) -> Result<(
     Ok((pk, row))
 }
 
-/// Every row of a table by row key, with defaults applied, and its expiry.
 async fn all_rows(txn: &mut Txn, s: &TableSchema) -> Result<Vec<(Bytes, Vec<Key>, Row, Option<u64>)>> {
     let prefix = table_prefix(SPACE_ROWS, s.id);
     let mut out = Vec::new();
@@ -922,8 +867,6 @@ async fn all_rows(txn: &mut Txn, s: &TableSchema) -> Result<Vec<(Bytes, Vec<Key>
     }
     Ok(out)
 }
-
-// ---------------------------------------------------------------- queries
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -1093,9 +1036,7 @@ fn eval_filter(s: &TableSchema, f: &Filter, row: &Row) -> bool {
     }
 }
 
-/// Which rows to read or change: an access path (the primary key, or an
-/// index), equality on a prefix of its columns with an optional range on
-/// the next one, and a residual filter.
+/// Row selection criteria over the primary key or a secondary index.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Selection {
@@ -1109,17 +1050,13 @@ pub struct Selection {
     pub filter: Option<Filter>,
 }
 
-/// The stored keys a selection reads.
 struct AccessPath {
-    /// Prefix of the path's keys: the table's rows or one index.
     base: Vec<u8>,
     index: Option<IndexDef>,
-    /// `None` if the selection is empty.
     range: Option<KeyRange>,
 }
 
 impl AccessPath {
-    /// The row a key of this path stands for, unless it has gone.
     async fn row(&self, txn: &mut Txn, s: &TableSchema, it: &ReadValue) -> Result<(Vec<Key>, Option<Stored>)> {
         let rest = &it.key[self.base.len()..];
         let pk = match &self.index {
@@ -1253,17 +1190,13 @@ pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult>
     }
 }
 
-/// A page of a table's row changes (see [`row_changes`]).
 pub struct RowChanges {
     pub changes: Vec<Json>,
     pub more: bool,
-    /// Where the next page starts.
     pub next: ChangePos,
 }
 
-/// The changes to `table`'s rows after `after`, at the transaction's
-/// snapshot: for each row changed since, its state then, `{"version",
-/// "pk", "row", "expires_at"?}` or `{"version", "pk", "deleted": true}`.
+/// Return a page of row changes in `table` after `after` as of the transaction's snapshot.
 pub async fn row_changes(txn: &mut Txn, table: &str, after: &ChangePos, limit: usize) -> Result<RowChanges> {
     let s = get_schema(txn, table).await?;
     let prefix = table_prefix(SPACE_ROWS, s.id);
@@ -1302,10 +1235,7 @@ pub async fn row_changes(txn: &mut Txn, table: &str, after: &ChangePos, limit: u
     Ok(RowChanges { changes, more: page.more, next })
 }
 
-/// Recompute every index of a table from its rows and compare with the
-/// stored index entries (consistency checker used by tests and the DST).
-/// A building index must hold the entries of every row its backfill has
-/// passed, and no entry that matches no row.
+/// Verify that all stored index entries in `table` match its rows.
 pub async fn check_indexes(txn: &mut Txn, table: &str) -> Result<()> {
     use std::collections::BTreeMap;
     let s = get_schema(txn, table).await?;
@@ -1369,9 +1299,8 @@ pub async fn check_indexes(txn: &mut Txn, table: &str) -> Result<()> {
     Ok(())
 }
 
-/// Every row and index entry must belong to a live table and index, and
-/// every row blob to a live row and blob column: dropping any of them must
-/// leave nothing behind, even when racing writes.
+/// Verify that no rows, index entries, blob entries, or backfill cursors belong
+/// to dropped tables, indexes, or columns.
 pub async fn check_no_orphans(txn: &mut Txn) -> Result<()> {
     let tables = list_tables(txn).await?;
     let live: BTreeSet<u32> = tables.iter().map(|s| s.id).collect();
@@ -1396,7 +1325,6 @@ pub async fn check_no_orphans(txn: &mut Txn) -> Result<()> {
         let orphan = match (k[0], id_at(k, 1)) {
             (SPACE_INDEX, Some(t)) => id_at(k, 5).is_none_or(|i| !live_idx.contains(&(t, i))),
             (SPACE_ROW_BLOBS, Some(t)) => {
-                // The key is the row's key (in the row-blob space) and the column id.
                 let (row, col) = k.split_at(k.len() - 4);
                 let mut row = row.to_vec();
                 row[0] = SPACE_ROWS;

@@ -21,7 +21,8 @@ exclude_globs = [
     "src/api/**",
     "src/store/**",
     "src/main.rs",
-    "src/meta.rs",
+    "src/meta/mod.rs",
+    "src/meta/tests.rs",
     "src/client.rs",
     "src/engine/config.rs",
     "src/sim/mod.rs",
@@ -29,13 +30,15 @@ exclude_globs = [
     "src/sim/store.rs",
     "src/sim/google.rs",
 ]
-# The storage engine, tables and ops entirely; of the simulator, only the
-# checkers (a weakened checker must be caught by its self-tests).
+# The storage engine, tables, ops and organization rules entirely; of the
+# simulator, only the checkers (a weakened checker must be caught by its
+# self-tests).
 examine_re = [
     '^src/(engine|table)/',
     '^src/ops\.rs',
+    '^src/meta/org\.rs',
     '^src/sim/storage_check\.rs',
-    '^src/sim/workloads/\w+\.rs:.* in (check|audit|check_body|check_value|check_version|check_read|check_locks|explained|TxnSim::\w+)$',
+    '^src/sim/workloads/\w+\.rs:.* in (check|audit|check_body|check_value|check_version|check_read|check_locks|explained|TxnSim::\w+|check_attempts|History::some_role)$',
 ]
 exclude_re = [
     # Diagnostics: tracing and formatting cannot change results.

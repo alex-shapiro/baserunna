@@ -1,6 +1,5 @@
-//! Node-wide LRU cache for immutable segment data (indexes and decoded
-//! blocks), bounded by a byte budget. Segments are immutable, so entries
-//! never need invalidation, only eviction.
+//! Node-wide byte-bounded LRU cache for immutable segment indexes, decoded
+//! blocks, and levels objects.
 
 use super::manifest::Levels;
 use super::segment::{Block, SegmentIndex};
@@ -116,8 +115,7 @@ impl Cache {
         }
     }
 
-    /// Drop everything cached for one segment path prefix (used when a
-    /// database is deleted, purely to free memory early).
+    /// Evicts all cached entries matching `prefix`.
     pub fn evict_prefix(&self, prefix: &str) {
         let mut g = self.lock();
         let keys: Vec<CacheKey> = g.map.keys().filter(|k| k.seg_path.starts_with(prefix)).cloned().collect();
@@ -155,7 +153,6 @@ mod tests {
         let key = |i: u32| CacheKey { seg_path: Arc::from("s"), block: i };
         for i in 0..20 {
             c.insert(key(i), block(10));
-            // keep block 0 hot
             assert!(c.get(&key(0)).is_some());
         }
         let s = c.stats();

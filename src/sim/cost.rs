@@ -1,9 +1,4 @@
-//! Object-store requests per operation, the dominant cost of an active
-//! database, and what they cost per month.
-//!
-//! [`measure_all`] runs real nodes against a metered store in virtual time,
-//! so the counts are exact and serve as regression budgets
-//! (`tests/cost.rs`). [`monthly_cost`] prices them for a [`Profile`].
+//! Object-store request accounting and monthly cost estimation.
 
 use crate::api;
 use crate::cluster::{Transport, TransportError};
@@ -25,22 +20,16 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tower::ServiceExt;
 
-// ------------------------------------------------------------- prices
-
-/// S3 Standard list prices (us-east-1).
+/// S3 Standard us-east-1 list prices in USD.
 pub mod prices {
-    /// PUT, COPY, POST and LIST requests, per request.
     pub const PUT: f64 = 0.005 / 1000.0;
     pub const LIST: f64 = 0.005 / 1000.0;
-    /// GET and all other requests, per request.
     pub const GET: f64 = 0.0004 / 1000.0;
     pub const DELETE: f64 = 0.0;
     pub const STORAGE_GB_MONTH: f64 = 0.023;
 }
 
-// -------------------------------------------------------------- meter
-
-/// Request counts (or per-unit averages of them).
+/// Object-store request and byte counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Counts {
     pub gets: f64,
@@ -90,14 +79,12 @@ impl Counts {
     }
 }
 
-/// Which database a store key belongs to: `"sys"`, a user database id, or
-/// `""` for keys outside `dbs/`. List requests are attributed by prefix.
+/// Returns the database ID for a store key, `"sys"`, or `""` for keys outside `dbs/`.
 pub fn scope_of(key: &str) -> &str {
     key.strip_prefix("dbs/").and_then(|r| r.split('/').next()).unwrap_or("")
 }
 
-/// An object store that counts requests per database and adds a fixed
-/// latency to each.
+/// Object store wrapper that counts requests per database and injects fixed latency.
 pub struct MeteredStore {
     inner: DynStore,
     latency_ms: AtomicU64,
@@ -125,7 +112,6 @@ impl MeteredStore {
         }
     }
 
-    /// Counts for one scope (see [`scope_of`]).
     pub fn scope(&self, scope: &str) -> Counts {
         self.counts.lock().unwrap_or_else(|e| e.into_inner()).get(scope).copied().unwrap_or_default()
     }
@@ -182,8 +168,6 @@ impl ObjectStore for MeteredStore {
     }
 }
 
-// -------------------------------------------------------------- world
-
 type Peers = Arc<Mutex<BTreeMap<String, axum::Router>>>;
 
 struct PeerTransport {
@@ -204,7 +188,6 @@ impl Transport for PeerTransport {
     }
 }
 
-/// A response collected in full.
 pub struct Resp {
     pub status: u16,
     pub body: Bytes,
@@ -216,8 +199,7 @@ impl Resp {
     }
 }
 
-/// Production defaults, except for cheap password hashing and no
-/// per-user database limit.
+/// Production defaults with fast password hashing and unlimited databases/rates.
 pub fn node_config(name: &str, addr: &str) -> NodeConfig {
     NodeConfig {
         name: name.into(),
@@ -225,19 +207,18 @@ pub fn node_config(name: &str, addr: &str) -> NodeConfig {
         public_url: addr.into(),
         pbkdf2_iterations: 10,
         signup: SignupPolicy::Open,
-        max_dbs_per_user: 1_000_000,
+        max_dbs_per_owner: 1_000_000,
         limits: crate::limits::LimitConfig::unlimited(),
         engine: EngineConfig::default(),
         ..NodeConfig::default()
     }
 }
 
-/// Nodes sharing a metered store, called in-process through their routers.
+/// Simulated cluster backed by a [`MeteredStore`].
 pub struct World {
     pub store: Arc<MeteredStore>,
     pub mem: Arc<MemStore>,
     nodes: Vec<Arc<Node>>,
-    /// Each node's local disk tier, kept across restarts.
     disks: Vec<LocalTier>,
     peers: Peers,
     origin: Instant,
@@ -245,7 +226,6 @@ pub struct World {
 }
 
 impl World {
-    /// Start `n` nodes on a paused-time runtime (see [`run_paused`]).
     pub async fn new(n: usize, latency_ms: u64) -> World {
         let origin = Instant::now();
         let base_ms = 1_750_000_000_000;
@@ -268,8 +248,7 @@ impl World {
         i
     }
 
-    /// Restart node `i` as a new process on the same machine: memory is
-    /// lost, its local disk tier is not.
+    /// Restarts node `i`, clearing memory while preserving its local disk tier.
     pub async fn restart_node(&mut self, i: usize) {
         self.nodes[i].env.shutdown();
         self.nodes[i] = self.boot(i).await;
@@ -282,7 +261,8 @@ impl World {
         let transport = Arc::new(PeerTransport { peers: self.peers.clone() });
         let mut cfg = node_config(&format!("n{i}"), &addr);
         cfg.engine.local_tier = Some(self.disks[i].clone());
-        let node = Node::start(cfg, env, store, transport, None).await.expect("node starts");
+        let services = crate::node::Services { transport, oidc: None, mailer: None };
+        let node = Node::start(cfg, env, store, services).await.expect("node starts");
         let router = api::router(node.clone());
         self.peers.lock().unwrap_or_else(|e| e.into_inner()).insert(addr, router);
         node
@@ -308,13 +288,11 @@ impl World {
         self.call(i, method, path, token, Bytes::from(body.to_string())).await.json()
     }
 
-    /// Sign up a user through node `i` and return its session token.
     pub async fn signup(&self, i: usize, email: &str) -> String {
         let r = self.json(i, "POST", "/v1/auth/signup", "", json!({"email": email, "password": "password-123"})).await;
         r["token"].as_str().expect("signup token").to_string()
     }
 
-    /// Create a database and return its id.
     pub async fn create_db(&self, i: usize, token: &str, name: &str) -> String {
         let r = self.json(i, "POST", "/v1/dbs", token, json!({"name": name})).await;
         r["id"].as_str().unwrap_or_else(|| panic!("create db: {r}")).to_string()
@@ -354,36 +332,29 @@ pub async fn call_router(router: &axum::Router, method: &str, path: &str, token:
 
 pub fn run_paused<F: Future>(f: F) -> F::Output {
     let lvl = crate::log::level();
-    crate::log::set_level(crate::log::ERROR);
+    crate::log::set_level(Some(crate::log::Level::Error));
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
     let out = rt.block_on(f);
     crate::log::set_level(lvl);
     out
 }
 
-// ------------------------------------------------------- measurements
-
-/// Per-request store latency, typical of S3.
 pub const LATENCY_MS: u64 = 20;
 
-/// One measured quantity: requests per `unit`, attributed to the database
-/// under test (system-database traffic is measured separately).
+/// Per-unit store request counts and latency for a benchmarked operation.
 #[derive(Clone, Debug)]
 pub struct Measurement {
     pub name: &'static str,
     pub unit: &'static str,
     pub per_unit: Counts,
-    /// Virtual time of one unit with [`LATENCY_MS`] per request.
     pub latency_ms: Option<f64>,
 }
 
-/// Every measurement, plus derived figures the cost model needs.
 #[derive(Clone, Debug)]
 pub struct Report {
     pub measurements: Vec<Measurement>,
-    /// Stored bytes / live logical bytes after the steady write workload.
+    /// Ratio of stored bytes to live logical bytes after steady writes.
     pub space_amplification: f64,
-    /// Segments in the database used for the cold-open measurement.
     pub cold_open_segments: usize,
 }
 
@@ -438,13 +409,11 @@ impl<'a> Recorder<'a> {
     }
 }
 
-/// `n` random lowercase letters: compressible like text, not more.
 fn value(n: usize, seed: usize) -> Bytes {
     let mut r = crate::util::rng::Rng::new(seed as u64);
     Bytes::from((0..n).map(|_| b'a' + r.below(26) as u8).collect::<Vec<u8>>())
 }
 
-/// Run every measurement (deterministic; a few seconds of wall time).
 pub fn measure_all() -> Report {
     run_paused(async {
         let mut out = Vec::new();
@@ -471,7 +440,6 @@ async fn single_node(w: &World, out: &mut Vec<Measurement>) {
     let kv = |k: &str| format!("/v1/dbs/c/kv/{k}");
     w.call(0, "PUT", &kv("warm"), &t, value(100, 0)).await;
 
-    // Writes on the lease holder: one manifest CAS each.
     let r = Recorder::start(s, &id);
     for i in 0..20 {
         let resp = w.call(0, "PUT", &kv(&format!("k{i}")), &t, value(100, i)).await;
@@ -485,7 +453,6 @@ async fn single_node(w: &World, out: &mut Vec<Measurement>) {
     }
     out.push(r.stop("strong_read_leased", "read", 100.0, true));
 
-    // Group commit: concurrent writers share manifest writes.
     let n = 64;
     let r = Recorder::start(s, &id);
     let router = w.node(0).router().expect("router");
@@ -503,7 +470,6 @@ async fn single_node(w: &World, out: &mut Vec<Measurement>) {
     }
     out.push(r.stop("group_commit_64", "commit", n as f64, false));
 
-    // Blobs: 16 MiB through the raw KV endpoint (8 MiB chunks).
     let mib = 16usize;
     let data = value(mib << 20, 1);
     let r = Recorder::start(s, &id);
@@ -514,7 +480,6 @@ async fn single_node(w: &World, out: &mut Vec<Measurement>) {
     assert_eq!(g.body.len(), mib << 20);
     out.push(r.stop("blob_download", "MiB", mib as f64, false));
 
-    // Strong reads without a lease: one read a minute for an hour.
     w.call(0, "PUT", &kv("cold"), &t, value(100, 2)).await;
     tokio::time::sleep(Duration::from_secs(60)).await;
     let r = Recorder::start(s, &id);
@@ -526,7 +491,6 @@ async fn single_node(w: &World, out: &mut Vec<Measurement>) {
     m.latency_ms = None;
     out.push(m);
 
-    // A read-heavy database takes and renews a lease instead.
     let r = Recorder::start(s, &id);
     for _ in 0..HOT_READS_PER_HOUR / 6 {
         w.call(0, "GET", &kv("cold"), &t, Bytes::new()).await;
@@ -536,7 +500,6 @@ async fn single_node(w: &World, out: &mut Vec<Measurement>) {
     m.per_unit = m.per_unit.per(1.0 / 6.0);
     out.push(m);
 
-    // An untouched database costs nothing.
     let idle = w.create_db(0, &t, "idle").await;
     w.call(0, "PUT", "/v1/dbs/idle/kv/x", &t, value(100, 3)).await;
     tokio::time::sleep(Duration::from_secs(60)).await;
@@ -545,12 +508,8 @@ async fn single_node(w: &World, out: &mut Vec<Measurement>) {
     out.push(r.stop("idle_db", "hour", 1.0, false));
 }
 
-/// One write a second for an hour over 1000 keys with 256-byte values:
-/// commits, tail flushes, compaction, the hourly sweep and GC deletes.
-/// Commits once a second to a set of 1000 keys for an hour. Returns the
-/// stored bytes per live byte, averaged over the hour's second half: the
-/// tail and level 0 fill and empty in cycles, so a single sample would
-/// depend on where in a cycle it falls.
+/// Runs 1 commit/s over 1,000 keys for an hour and returns mean space
+/// amplification over the second half.
 async fn steady_writes(w: &World, out: &mut Vec<Measurement>) -> f64 {
     let t = w.signup(0, "steady@cost.test").await;
     let id = w.create_db(0, &t, "steady").await;
@@ -574,7 +533,6 @@ async fn steady_writes(w: &World, out: &mut Vec<Measurement>) -> f64 {
     amp_sum / samples as f64
 }
 
-/// System-database traffic of an otherwise idle cluster, per node-hour.
 async fn overhead(w: &World, out: &mut Vec<Measurement>, name: &'static str) {
     tokio::time::sleep(Duration::from_secs(120)).await;
     let r = Recorder::start(&w.store, "sys");
@@ -582,12 +540,9 @@ async fn overhead(w: &World, out: &mut Vec<Measurement>, name: &'static str) {
     out.push(r.stop(name, "node-hour", w.len() as f64, false));
 }
 
-/// Reads on a node that does not hold the lease, and a cold open on a
-/// freshly started node. Returns the segment count of the opened database.
 async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     let t = w.signup(0, "multi@cost.test").await;
     let id = w.create_db(0, &t, "big").await;
-    // 2 MiB of 16 KiB values: several tail flushes, then compaction.
     for i in 0..128 {
         let r = w.call(0, "PUT", &format!("/v1/dbs/big/kv/b{i:03}"), &t, value(16 << 10, i)).await;
         assert_eq!(r.status, 200);
@@ -608,7 +563,6 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     assert_eq!(all.len(), 128);
     out.push(r.stop("cold_full_scan", "scan", 1.0, true));
 
-    // The original node keeps the lease by writing; the new node validates.
     w.call(0, "PUT", "/v1/dbs/big/kv/b000", &t, value(16, 0)).await;
     assert_ne!(w.holder(&id), Some(other));
     let r = Recorder::start(&w.store, &id);
@@ -625,7 +579,6 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     }
     out.push(r.stop("snapshot_read", "read", 10.0, true));
 
-    // A restarted node reads what it fetched before from its local tier.
     w.restart_node(other).await;
     let db = w.node(other).engine.db(&id);
     let r = Recorder::start(&w.store, &id);
@@ -637,10 +590,7 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     segs
 }
 
-// ---------------------------------------------------------- cost model
-
-/// A database workload. Reads and writes are spread evenly over
-/// `active_hours` per day.
+/// Workload parameters for monthly cost estimation.
 #[derive(Clone, Debug)]
 pub struct Profile {
     pub name: &'static str,
@@ -701,7 +651,7 @@ pub fn profiles() -> Vec<Profile> {
     ]
 }
 
-/// Monthly cost of one database, by component.
+/// Monthly USD cost breakdown for a database.
 #[derive(Clone, Debug, Default)]
 pub struct Bill {
     pub writes: f64,
@@ -716,16 +666,9 @@ impl Bill {
     }
 }
 
-/// Strong reads per hour in the `hot_reads_10_per_s` measurement.
 pub const HOT_READS_PER_HOUR: u64 = 36_000;
 
-/// Dollars per database per month (30 days), as an upper bound: every write
-/// is its own commit, and reads never use a lease that writes renewed.
-///
-/// A strong read costs one validating GET, unless a lease period sees
-/// `lease_read_threshold` of them; such reads are priced like
-/// `hot_reads_10_per_s`, whose PUTs and LISTs (renewals) scale with time
-/// and GETs with reads.
+/// Estimates the 30-day USD cost of `p` from benchmark report `r`.
 pub fn monthly_cost(r: &Report, p: &Profile) -> Bill {
     let cfg = EngineConfig::default();
     let days = 30.0;
@@ -754,7 +697,6 @@ pub fn monthly_cost(r: &Report, p: &Profile) -> Bill {
     Bill { writes, reads, blobs, storage }
 }
 
-/// The per-profile cost table, plus the fixed per-node cost.
 pub fn cost_table(r: &Report) -> String {
     let mut s = format!(
         "{:<9} {:>10} {:>10} {:>7} {:>9} {:>9} {:>9} {:>9} {:>10}\n",

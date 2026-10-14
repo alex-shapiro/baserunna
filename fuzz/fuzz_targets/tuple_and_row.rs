@@ -1,6 +1,6 @@
 #![no_main]
-//! Tuple and row decoders must never panic; decoded tuples re-encode to
-//! the same bytes (canonical encoding).
+//! Tuple and row decoders must never panic, and decoded tuples must re-encode
+//! to the same canonical bytes.
 use baserunna::table::{schema, tuple};
 use libfuzzer_sys::fuzz_target;
 

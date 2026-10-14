@@ -1,20 +1,24 @@
-//! HTTP API (axum). See SPEC §10 and `openapi.json`.
+//! HTTP API router, extractors, and request middleware.
 
 mod account;
 pub mod body;
 mod data;
 pub mod openapi;
+mod orgs;
+
+pub use account::session_cookie;
 
 use crate::cluster::{
     CLUSTER_KEY_HEADER, DEADLINE_HEADER, Delivery, FORWARD_ID_HEADER, FORWARD_TO_HEADER, HOPS_HEADER, ReplayedResponse,
 };
 use crate::engine::{Consistency, Db};
 use crate::error::{Error, Result};
-use crate::meta::DbRecord;
+use crate::log::{self, REQUEST_ID_HEADER};
+use crate::meta::{Access, DbRecord};
 use crate::node::{Node, Principal};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -65,7 +69,7 @@ impl IntoResponse for Error {
     }
 }
 
-/// Rebuild an [`Error`] from an error response (used when forwarding).
+/// Reconstructs an [`Error`] from a JSON error response.
 pub fn error_from_json(status: u16, j: &Json) -> Error {
     let e = &j["error"];
     let m = e["message"].as_str().unwrap_or("request failed").to_string();
@@ -111,7 +115,7 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for JsonBody<T> {
     }
 }
 
-/// Bearer token or session cookie.
+/// Extracts a bearer token or session cookie from `headers`.
 pub fn credential(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())
         && let Some(t) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer "))
@@ -191,20 +195,27 @@ async fn tag_client(State(node): State<Arc<Node>>, mut req: Request, next: Next)
     next.run(req).await
 }
 
-/// Context for database-scoped routes, inserted by the routing middleware.
+/// Context for database-scoped routes.
 #[derive(Clone)]
 pub struct DbCtx {
     pub principal: Principal,
     pub rec: DbRecord,
+    pub access: Access,
     pub db: Arc<Db>,
     pub deadline: tokio::time::Instant,
 }
 
-/// The commit deadline of a request: `commit_timeout_ms` after it arrived,
-/// or the earlier deadline a forwarding node passed along. The passed
-/// deadline is in cluster time ([`Node::now_ms`]) and capped at
-/// `commit_timeout_ms` from now, so clock errors can shorten it, never
-/// extend it.
+impl DbCtx {
+    pub fn require_write(&self) -> Result<()> {
+        self.access.require_write()
+    }
+}
+
+/// Response extension recording the peer node that handled a forwarded request.
+#[derive(Clone)]
+struct ForwardedTo(String);
+
+/// Computes the request commit deadline, capped at `commit_timeout_ms` from now.
 fn request_deadline(node: &Node, headers: &HeaderMap) -> tokio::time::Instant {
     let timeout = node.cfg.engine.commit_timeout_ms;
     let remaining = headers
@@ -253,9 +264,7 @@ fn clone_parts(req: &Request) -> http::request::Builder {
 
 const BUFFER_FORWARD_MAX: u64 = 1024 * 1024;
 
-/// Middleware for `/v1/dbs/{db}/…`: authenticate, resolve the database,
-/// then either forward the request to the database's owner node or handle
-/// it here.
+/// Authenticates database-scoped requests and forwards them to the lease holder or handles them locally.
 async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
     let arrived = tokio::time::Instant::now();
     let res: Result<Response> = crate::engine::db::invoked_at(arrived, async {
@@ -263,9 +272,8 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         let name = db_name_from_path(req.uri().path()).ok_or_else(|| Error::not_found("no such route"))?;
         let token = credential(req.headers()).ok_or_else(|| Error::Unauthenticated("missing credentials".into()))?;
         let principal = node.authenticate(&token).await?;
-        let mut rec = node.resolve_db(&principal, &name).await?;
-        let hops: u32 =
-            req.headers().get(HOPS_HEADER).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let (mut rec, mut access) = node.resolve_db(&principal, &name).await?;
+        let hops = hops(req.headers());
         if hops < 2
             && let Some((target, addr)) = node.route(&rec.id).await
         {
@@ -292,8 +300,8 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 fwd.headers_mut().insert(HOPS_HEADER, HeaderValue::from(hops + 1));
                 tag_forward(&node, &mut fwd, &target, deadline);
                 let idempotent = parts.method == http::Method::GET || parts.method == http::Method::HEAD;
-                match node.transport.call(&addr, fwd).await {
-                    Ok(resp) => return Ok(resp),
+                match node.services.transport.call(&addr, fwd).await {
+                    Ok(resp) => return Ok(forwarded(resp, target)),
                     Err(te) if te.maybe_delivered && !idempotent => {
                         return Err(Error::Unavailable {
                             message: format!("forwarding to {target} failed: {}", te.message),
@@ -302,8 +310,6 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                         });
                     }
                     Err(_) => {
-                        // Never delivered: handle it here, keeping the
-                        // original parts (and routing extensions).
                         node.mark_suspect(&target);
                         req = Request::from_parts(parts, Body::from(bytes));
                     }
@@ -314,8 +320,8 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                     .map_err(|e| Error::internal(e.to_string()))?;
                 fwd.headers_mut().insert(HOPS_HEADER, HeaderValue::from(hops + 1));
                 tag_forward(&node, &mut fwd, &target, deadline);
-                return match node.transport.call(&addr, fwd).await {
-                    Ok(resp) => Ok(resp),
+                return match node.services.transport.call(&addr, fwd).await {
+                    Ok(resp) => Ok(forwarded(resp, target)),
                     Err(te) => {
                         node.mark_suspect(&target);
                         Err(Error::Unavailable {
@@ -327,8 +333,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 };
             }
         }
-        // A cached name may point at a database deleted (and possibly
-        // purged or recreated) since: verify, and re-resolve once if so.
+        // Re-resolve strongly if the cached database name points to a deleted or recreated database.
         let opened = match node.open_db(&rec).await {
             Ok(db) => match db.read_version(Consistency::Strong).await {
                 Err(Error::NotFound(m)) => Err(m),
@@ -342,30 +347,34 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
             Ok(db) => db,
             Err(m) if name.starts_with("id:") => return Err(Error::NotFound(m)),
             Err(m) => {
-                let fresh = node.resolve_db_strong(&principal, &name).await?;
+                let (fresh, fresh_access) = node.resolve_db_strong(&principal, &name).await?;
                 if fresh.id == rec.id {
-                    // Deleted in storage but still named in metadata: a
-                    // delete that was interrupted halfway. Finish it.
-                    if node.run_meta(crate::meta::MetaCmd::DeleteDb { id: rec.id.clone() }).await.is_ok() {
-                        node.forget_db_name(&rec.owner_id, &rec.name);
+                    // Finish any interrupted deletion where the manifest was marked deleted before metadata removal.
+                    match node.run_meta(crate::meta::MetaCmd::DeleteDb { id: rec.id.clone() }).await {
+                        Ok(_) | Err(Error::NotFound(_)) => node.forget_db_name(&rec.owner_id, &rec.name),
+                        Err(e) => return Err(e),
                     }
                     return Err(Error::NotFound(m));
                 }
-                rec = fresh;
+                (rec, access) = (fresh, fresh_access);
                 node.open_db(&rec).await?
             }
         };
         req.extensions_mut().insert(principal.clone());
-        req.extensions_mut().insert(DbCtx { principal, rec: rec.clone(), db, deadline });
+        req.extensions_mut().insert(DbCtx { principal, rec: rec.clone(), access, db, deadline });
         let resp = next.run(req).await;
         if resp.status() == StatusCode::NOT_FOUND {
-            // A stale name mapping can point at a deleted database.
             node.forget_db_name(&rec.owner_id, &rec.name);
         }
         Ok(resp)
     })
     .await;
     res.unwrap_or_else(|e| e.into_response())
+}
+
+fn forwarded(mut resp: Response, target: String) -> Response {
+    resp.extensions_mut().insert(ForwardedTo(target));
+    resp
 }
 
 fn tag_forward(node: &Node, req: &mut http::Request<Body>, target: &str, deadline: tokio::time::Instant) {
@@ -379,10 +388,48 @@ fn tag_forward(node: &Node, req: &mut http::Request<Body>, target: &str, deadlin
     req.headers_mut().insert(DEADLINE_HEADER, HeaderValue::from(node.now_ms() + remaining));
 }
 
-/// Execute each forwarded request once, however often the network
-/// delivers it: duplicates get the first copy's response, and copies
-/// addressed to an earlier run of this node are refused. Reads are harmless
-/// to repeat and may stream large bodies, so they run as usual.
+fn hops(h: &HeaderMap) -> u32 {
+    h.get(HOPS_HEADER).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// Assigns an `x-request-id` header, runs the request in a scoped log context, and logs completion.
+async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
+    let given = req.headers().get(REQUEST_ID_HEADER).filter(|v| v.to_str().is_ok_and(log::valid_request_id));
+    let header = match given {
+        Some(v) => v.clone(),
+        None => HeaderValue::from_str(&node.env.random_hex(8)).unwrap_or(HeaderValue::from_static("0")),
+    };
+    req.headers_mut().insert(REQUEST_ID_HEADER, header.clone());
+    let rid = header.to_str().unwrap_or_default();
+    let ctx = log::Context { node: node.id.as_str().into(), request_id: rid.into() };
+    let mut resp = log::scoped(ctx, async move {
+        if !log::enabled(log::Level::Info) {
+            return next.run(req).await;
+        }
+        let started = tokio::time::Instant::now();
+        let method = req.method().to_string();
+        let route = req.extensions().get::<MatchedPath>().map_or("unmatched", |m| m.as_str()).to_string();
+        let hops = hops(req.headers());
+        let resp = next.run(req).await;
+        let mut fields = vec![
+            ("method", json!(method)),
+            ("route", json!(route)),
+            ("status", json!(resp.status().as_u16())),
+            ("ms", json!(started.elapsed().as_millis() as u64)),
+            ("hops", json!(hops)),
+        ];
+        if let Some(ForwardedTo(t)) = resp.extensions().get::<ForwardedTo>() {
+            fields.push(("forwarded_to", json!(t)));
+        }
+        log::event(log::Level::Info, "request", &fields);
+        resp
+    })
+    .await;
+    resp.headers_mut().insert(REQUEST_ID_HEADER, header);
+    resp
+}
+
+/// Deduplicates forwarded write requests and rejects requests addressed to a previous node instance.
 async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next) -> Response {
     let Some(id) = req.headers().get(FORWARD_ID_HEADER).and_then(|v| v.to_str().ok()) else {
         return next.run(req).await;
@@ -398,8 +445,7 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
         }
         .into_response();
     }
-    // Scope ids to the caller's credentials and the request target, so a
-    // client cannot be served someone else's response.
+    // Scope deduplication keys to caller credentials and request target.
     let mut scope = Vec::new();
     for h in [http::header::AUTHORIZATION, http::header::COOKIE] {
         for v in req.headers().get_all(h) {
@@ -444,8 +490,7 @@ fn unknown_outcome(message: String) -> Response {
     Error::Unavailable { message, retry_after_ms: Some(1000), outcome_unknown: true }.into_response()
 }
 
-/// Internal endpoints always require the cluster key (configured, or
-/// generated per cluster and kept in the system database).
+/// Requires a valid cluster key header on internal endpoints.
 async fn internal_auth(State(node): State<Arc<Node>>, req: Request, next: Next) -> Response {
     let ok = match node.cluster_key() {
         None => false,
@@ -461,7 +506,6 @@ async fn internal_auth(State(node): State<Arc<Node>>, req: Request, next: Next) 
     next.run(req).await
 }
 
-/// Parse `consistency` / `max_staleness_ms` query parameters.
 pub fn consistency_of(q: &std::collections::BTreeMap<String, String>) -> Result<Consistency> {
     match q.get("consistency").map(|s| s.as_str()) {
         None | Some("strong") => Ok(Consistency::Strong),
@@ -476,12 +520,10 @@ pub fn consistency_of(q: &std::collections::BTreeMap<String, String>) -> Result<
     }
 }
 
-/// Run `$body` (with `$t: &mut Txn`) in a transaction and commit,
-/// retrying optimistic-concurrency conflicts. Evaluates to `(T, Seq)`;
-/// errors return from the enclosing handler.
+/// Runs `$body` in a serializable transaction and commits, retrying on conflict.
 macro_rules! with_txn {
     ($node:expr, $ctx:expr, |$t:ident| $body:expr) => {{
-        $ctx.principal.require_writable()?;
+        $ctx.require_write()?;
         let mut attempt_ = 0u32;
         let deadline_ = $ctx.deadline;
         loop {
@@ -507,8 +549,7 @@ macro_rules! with_txn {
 }
 pub(crate) use with_txn;
 
-/// Run `$body` (with `$t: &mut Txn`) on a read snapshot. Evaluates to
-/// `(T, Seq)`.
+/// Runs `$body` on a read snapshot and returns `(output, read_version)`.
 macro_rules! with_read {
     ($db:expr, $c:expr, |$t:ident| $body:expr) => {{
         let mut txn_ = $db.begin(crate::engine::Isolation::Serializable, $c).await?;
@@ -537,7 +578,7 @@ async fn not_found() -> Error {
     Error::not_found("no such route")
 }
 
-/// Build the full router (API, internal endpoints, console).
+/// Builds the HTTP router for the node.
 pub fn router(node: Arc<Node>) -> Router {
     let db_routes = data::routes().route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
     let internal = Router::new()
@@ -547,6 +588,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/healthz", get(healthz))
         .route("/v1/openapi.json", get(openapi))
         .merge(account::routes())
+        .merge(orgs::routes())
         .route("/v1/dbs", get(data::list_dbs).post(data::create_db))
         .merge(db_routes)
         .merge(internal)
@@ -555,6 +597,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .layer(middleware::from_fn_with_state(node.clone(), dedup_forwarded))
         .layer(middleware::from_fn_with_state(node.clone(), tag_client))
         .layer(DefaultBodyLimit::max(node.cfg.max_json_body))
+        .layer(middleware::from_fn_with_state(node.clone(), request_context))
         .with_state(node.clone());
     node.set_router(r.clone());
     r
@@ -563,6 +606,15 @@ pub fn router(node: Arc<Node>) -> Router {
 pub(crate) use axum::extract::Query as QueryParams;
 
 pub(crate) type Params = QueryParams<std::collections::BTreeMap<String, String>>;
+
+/// Extracts `limit` and `cursor` pagination parameters.
+pub(crate) fn paging(q: &Params) -> Result<(usize, Option<String>)> {
+    let limit = match q.get("limit") {
+        None => crate::meta::PAGE_DEFAULT,
+        Some(l) => l.parse().map_err(|_| Error::invalid("limit must be a number"))?,
+    };
+    Ok((limit, q.get("cursor").filter(|c| !c.is_empty()).cloned()))
+}
 
 #[cfg(test)]
 mod tests {

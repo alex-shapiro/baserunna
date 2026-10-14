@@ -1,15 +1,12 @@
-//! `api_tour`: exercises the less common endpoints (schema drops, aborts,
-//! commit status by idempotency key, metadata endpoints) with result
-//! checks, so that every documented operation runs under simulation.
+//! Exercises less common endpoints such as schema drops, transaction aborts,
+//! commit status by idempotency key, and metadata endpoints so every documented
+//! operation runs under simulation.
 
 use super::super::Sim;
 use super::super::client::Client;
+use super::expect;
 use serde_json::json;
 use std::sync::Arc;
-
-fn expect(cond: bool, msg: impl Into<String>) -> Result<(), String> {
-    if cond { Ok(()) } else { Err(msg.into()) }
-}
 
 pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     let anon = Client::new(&sim, "tourist");
@@ -28,7 +25,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     c.create_db("tour").await?;
     let base = "/v1/dbs/tour";
 
-    // Tables: create, describe, list, evolve, drop pieces, drop.
     let r = c
         .call_settled(
             "POST",
@@ -67,7 +63,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     let r = c.call_retry("GET", &format!("{base}/tables/items"), None).await;
     expect(r.status == 404, "dropped table still described")?;
 
-    // Interactive transaction aborted: nothing is written.
     let t = c.call_retry("POST", &format!("{base}/transactions"), Some(json!({"isolation": "snapshot"}))).await;
     expect(t.status == 201, format!("begin: {}", t.json))?;
     let id = t.json["txn_id"].as_str().unwrap_or_default().to_string();
@@ -85,7 +80,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     let r = c.call_retry("POST", &format!("{base}/txn"), Some(json!({"ops": [{"op": "get", "key": "aborted"}]}))).await;
     expect(r.json["results"][0]["found"] == false, "aborted write visible")?;
 
-    // Commit status by idempotency key.
     let body = json!({"ops": [{"op": "increment", "key": "n", "by": 7}], "idempotency_key": "tour-1"});
     let r = c.call_settled("POST", &format!("{base}/txn"), Some(body)).await;
     expect(r.status == 200, format!("idempotent txn: {}", r.json))?;
@@ -94,7 +88,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     let st = c.call_retry("GET", &format!("{base}/commits/key:never-used"), None).await;
     expect(st.json["status"] == "not_committed", format!("status of unknown key: {}", st.json))?;
 
-    // Admin endpoints (the first user is an admin only if signed up first).
     let r = c.call_retry("GET", "/v1/admin/nodes", None).await;
     expect(r.status == 200 || r.status == 403, "admin nodes")?;
     let r = c.call_retry("GET", "/v1/admin/users", None).await;

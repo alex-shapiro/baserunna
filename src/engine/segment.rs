@@ -425,8 +425,8 @@ pub fn decode_block(raw: Bytes) -> DResult<Block> {
     Ok(Arc::new(out))
 }
 
-/// Decode the blocks `first..` of a segment from `data`, the segment's bytes
-/// starting at block `first`'s offset (a bulk read of consecutive blocks).
+/// Decode the blocks `first..` of a segment from `data`, starting at block
+/// `first`'s offset.
 pub fn decode_blocks(idx: &SegmentIndex, first: usize, data: &Bytes) -> DResult<Vec<Block>> {
     let base = idx.blocks.get(first).ok_or(DecodeError("block out of range"))?.1;
     let mut out = Vec::new();
@@ -440,7 +440,7 @@ pub fn decode_blocks(idx: &SegmentIndex, first: usize, data: &Bytes) -> DResult<
     Ok(out)
 }
 
-/// Read every entry of a fully-loaded segment (tests, checks).
+/// Decodes all entries from a complete segment buffer.
 pub fn read_all(data: &Bytes) -> DResult<Vec<Entry>> {
     let idx = SegmentIndex::decode_whole(data)?;
     let mut out = Vec::with_capacity(idx.footer.entries as usize);
@@ -483,8 +483,6 @@ mod tests {
             .collect()
     }
 
-    /// A footer with a valid checksum but sections out of place must be
-    /// rejected, not trusted (or panicked on).
     #[test]
     fn rejects_inconsistent_layouts_with_valid_checksums() {
         let entries: Vec<Entry> = (0..60u64)
@@ -511,8 +509,8 @@ mod tests {
         }
     }
 
-    /// `data` with its block index replaced by `blocks`, followed by
-    /// `trailing` bytes, with valid checksums throughout.
+    /// Replaces `data`'s block index with `blocks` followed by `trailing` bytes,
+    /// recomputing checksums.
     fn with_index(data: &Bytes, blocks: &[(Bytes, u64, u32)], trailing: &[u8]) -> Bytes {
         let fo = data.len() - FOOTER_LEN;
         let footer = Footer::decode(&data[fo..], data.len() as u64).unwrap();
@@ -536,8 +534,6 @@ mod tests {
         Bytes::from(out)
     }
 
-    /// The block index must tile the data section exactly, with blocks
-    /// large enough for their count and checksum.
     #[test]
     fn rejects_block_indexes_that_do_not_tile_the_data() {
         let entries: Vec<Entry> = (0..60u64)
@@ -574,8 +570,6 @@ mod tests {
         }
     }
 
-    /// Compressed blocks with valid checksums but a wrong declared length,
-    /// a length past the limit, garbage, or an unknown codec are rejected.
     #[test]
     fn rejects_bad_compressed_blocks() {
         let mut raw = Writer::new();
@@ -594,7 +588,6 @@ mod tests {
             ("short length", block(CODEC_ZSTD, raw.len() as u64 - 1, &z)),
             ("long length", block(CODEC_ZSTD, raw.len() as u64 + 1, &z)),
             ("over the limit", block(CODEC_ZSTD, MAX_BLOCK_RAW + 1, &z)),
-            // Rejected before anything is allocated for it.
             ("a terabyte", block(CODEC_ZSTD, 1 << 40, &z)),
             ("garbage", block(CODEC_ZSTD, raw.len() as u64, &z[..z.len() / 2])),
             ("unknown codec", block(7, raw.len() as u64, &z)),
@@ -603,8 +596,6 @@ mod tests {
         }
     }
 
-    /// Compressible data shrinks; incompressible data is stored raw and
-    /// costs one byte per block.
     #[test]
     fn compression_pays_or_is_skipped() {
         let mut r = Rng::new(3);
@@ -687,8 +678,6 @@ mod tests {
         );
     }
 
-    /// The size estimate that cuts compaction output is the size of the
-    /// finished segment, at every point of building it (uncompressed).
     #[test]
     fn size_estimates_track_the_finished_size() {
         let mut r = Rng::new(8);

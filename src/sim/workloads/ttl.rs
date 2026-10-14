@@ -21,8 +21,8 @@ use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-/// A value as the model knows it: its data, the version that wrote it, and
-/// the window its expiry lies in (sim ms), if it expires.
+/// Expected state of a value: its data, commit version, and expiry window in
+/// simulation milliseconds.
 #[derive(Clone, Debug)]
 struct Val {
     data: String,
@@ -37,7 +37,7 @@ enum Seen {
     Either,
 }
 
-/// What a read between `r0` and `r1` (sim ms) may see of `v`.
+/// Expected visibility of `v` for a read spanning `[r0, r1]`.
 fn expect(v: Option<&Val>, r0: u64, r1: u64, eps: u64) -> Seen {
     match v.map(|v| v.expires) {
         None => Seen::Absent,
@@ -48,7 +48,6 @@ fn expect(v: Option<&Val>, r0: u64, r1: u64, eps: u64) -> Seen {
     }
 }
 
-/// Check one read result (`found`, data, version, expiry) against the model.
 fn check_read(
     ctx: &str,
     v: Option<&Val>,
@@ -99,8 +98,8 @@ impl Owner {
         (!self.rng.chance(0.3)).then(|| 200 + self.rng.below(4_000))
     }
 
-    /// Commit `ops` once, resolving ambiguity with the idempotency key.
-    /// Returns the response (200 or 4xx) and when the attempts started.
+    /// Commits `ops` with an idempotency key and returns the response along
+    /// with the timestamp when the first attempt started.
     async fn commit(&mut self, ops: Json) -> Result<(super::super::client::Resp, u64), String> {
         self.step += 1;
         let body = json!({"ops": ops, "idempotency_key": format!("{}-{}", self.c.name, self.step)});
@@ -142,7 +141,6 @@ impl Owner {
         Ok(())
     }
 
-    /// A one-shot read; `None` while it fails.
     async fn read(&self, ops: Json) -> Result<Option<(Json, u64, u64)>, String> {
         let r0 = self.c.sim.now_ms();
         match self.c.call("POST", &self.path("/txn"), Some(json!({"ops": ops}))).await {
@@ -195,8 +193,8 @@ impl Owner {
         check_read(&format!("raw get {k}"), self.model.get(k), got, r0, r1, self.eps)
     }
 
-    /// Insert a row whose token is unique: refused exactly while another
-    /// live row holds the token.
+    /// Inserts a row with a unique token, verifying it is rejected only while
+    /// another live row holds that token.
     async fn insert_row(&mut self) -> Result<(), String> {
         let id = self.step as i64;
         let token = TOKENS[self.rng.usize(TOKENS.len())].to_string();
@@ -205,7 +203,6 @@ impl Owner {
         let op = json!({"op": "insert_row", "table": "sess", "row": {"id": id, "token": token}, "ttl_ms": ttl});
         let (r, t0) = self.commit(json!([op])).await?;
         let t1 = self.c.sim.now_ms();
-        // The uniqueness check reads the token's index entry during the request.
         let seen = expect(holder.as_ref().map(|h| &h.1), t0, t1, self.eps);
         match (r.status, seen) {
             (200, Seen::Absent | Seen::Either) => {
@@ -235,8 +232,7 @@ impl Owner {
         check_read(&format!("row {id}"), row, got, r0, r1, self.eps)
     }
 
-    /// Values that expire in bulk, a little after compaction has moved
-    /// them below level 0, so that whole segments of them expire there.
+    /// Writes a batch of expiring values so whole compacted segments expire below level 0.
     async fn bulk(&mut self) -> Result<(), String> {
         let ttl = 3_000 + self.rng.below(5_000);
         let ops: Vec<Json> = (0..30)
@@ -265,7 +261,6 @@ impl Owner {
         Ok(())
     }
 
-    /// Once everything has certainly expired, nothing that expires is left.
     async fn settle(&mut self) -> Result<(), String> {
         let last =
             self.model.values().chain(self.rows.values().map(|(_, v)| v)).filter_map(|v| v.expires).map(|e| e.1).max();
@@ -286,7 +281,7 @@ impl Owner {
         if q.json["rows"].as_array().is_none_or(|r| !r.is_empty()) {
             return Err(format!("expired rows still read: {}", q.json));
         }
-        // More writes make compaction run over the expired data.
+        // Trigger compaction over the expired data.
         for _ in 0..8 {
             self.bulk().await?;
             self.c.pause(2_000).await;
@@ -295,9 +290,8 @@ impl Owner {
     }
 }
 
-/// A committed write of the lock: its version, when that lock expires (if
-/// read back), and whether it renewed a lock (with that lock's expiry, if
-/// the response told: a replayed one does not).
+/// Recorded lock acquisition or renewal: commit version, expiry timestamp, and
+/// for renewals, the expiry of the previous lock if the response was not replayed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct LockWrite {
     version: u64,
@@ -307,8 +301,6 @@ struct LockWrite {
 
 const LOCK_TTL_MS: u64 = 1_500;
 
-/// Commit `ops` on the lock database until one attempt is definitive:
-/// `Some(version)` if it applied, `None` if a check failed.
 async fn lock_txn(c: &Client, ops: Json, key: &str) -> Result<Option<(u64, Json)>, String> {
     let body = json!({"ops": ops, "idempotency_key": key});
     loop {
@@ -322,7 +314,6 @@ async fn lock_txn(c: &Client, ops: Json, key: &str) -> Result<Option<(u64, Json)
     }
 }
 
-/// When the lock written as `version` expires, if it is still the lock.
 async fn lock_expiry(c: &Client, version: u64) -> Option<u64> {
     let r = c.call("POST", "/v1/dbs/locks/txn", Some(json!({"ops": [{"op": "get", "key": "lock"}]}))).await;
     match r {
@@ -333,9 +324,7 @@ async fn lock_expiry(c: &Client, version: u64) -> Option<u64> {
     }
 }
 
-/// Take the lock if it is free, then try to renew it about when it
-/// expires: a renewal reads the lock, checks it still holds it and writes
-/// it again, which must not commit once the lock it read has expired.
+/// Acquires the lock if free and attempts to renew it near its expiry.
 async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Result<(), String> {
     let acquire = json!([
         {"op": "check", "key": "lock", "exists": false},
@@ -360,9 +349,9 @@ async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Re
     Ok(())
 }
 
-/// In version order, the lock has one holder at a time: an acquisition
-/// commits no earlier than the lock before it expired, and a renewal
-/// before the lock it read expired, having read the latest lock.
+/// Verifies that in version order, each acquisition commits no earlier than
+/// the previous lock's expiry, and each renewal commits before the lock it read
+/// expired.
 fn check_locks(writes: &[LockWrite]) -> Result<(), String> {
     let mut sorted = writes.to_vec();
     sorted.sort();

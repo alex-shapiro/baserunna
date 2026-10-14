@@ -1,18 +1,16 @@
-//! Budgets for object-store requests per operation, for the typical
-//! database's monthly cost (SPEC §13.4) and for compaction's amplification
-//! (SPEC §5.6). The measurements are deterministic, so any failure is a real
-//! change.
+//! Budgets for object-store requests per operation, typical monthly database
+//! cost, and compaction amplification. The measurements are deterministic, so
+//! any failure reflects a real change.
 //!
-//! To accept a change, update its budget and the SPEC section;
-//! `cargo run --release --example cost_model` and `--example amplification`
-//! print the current numbers.
+//! Run `cargo run --release --example cost_model` and `--example amplification`
+//! to print the current numbers.
 
 use baserunna::engine::EngineConfig;
 use baserunna::engine::segment::Compression;
 use baserunna::sim::amp::{self, measure_all as measure_amplification};
 use baserunna::sim::cost::{Counts, measure_all, monthly_cost, profiles};
 
-/// Upper bounds per unit: (measurement, GET, PUT, LIST, DELETE).
+/// Upper bounds per unit: `(measurement, GET, PUT, LIST, DELETE)`.
 const BUDGETS: &[(&str, f64, f64, f64, f64)] = &[
     ("commit", 0.0, 1.0, 0.0, 0.0),
     ("strong_read_leased", 0.0, 0.0, 0.0, 0.0),
@@ -33,7 +31,7 @@ const BUDGETS: &[(&str, f64, f64, f64, f64)] = &[
     ("restart_open_and_scan", 1.0, 0.0, 0.0, 0.0),
 ];
 
-/// Dollars per month for the `typical` profile.
+/// Monthly budget in USD for the `typical` profile.
 const TYPICAL_MONTHLY_BUDGET: f64 = 4.5;
 
 /// Stored bytes per live logical byte after steady overwrites.
@@ -85,9 +83,8 @@ fn request_costs_stay_within_budget() {
     );
 }
 
-/// Upper bounds per workload on write, settled space and read amplification
-/// of the compaction policy alone (no compression), for small databases
-/// (SPEC §5.6).
+/// Upper bounds per workload on write, settled space, and read amplification
+/// of the compaction policy without compression.
 const AMPLIFICATION_BUDGETS: &[(&str, f64, f64, f64)] = &[
     ("uniform_update", 3.5, 1.4, 3.0),
     ("skewed_update", 3.0, 1.3, 2.5),

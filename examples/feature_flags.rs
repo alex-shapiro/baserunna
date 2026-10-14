@@ -1,12 +1,10 @@
-//! Real-world example: a read-heavy feature-flag / configuration store.
+//! Read-heavy feature-flag and configuration store example.
 //!
-//! Many reads, few writes: reads are served from the lease holder's memory
-//! (no object-store requests), writes use compare-and-set so two admins
-//! editing the same flag cannot silently overwrite each other, and
-//! `snapshot` reads trade a bounded staleness for even cheaper reads on
-//! any node. Temporary overrides expire on their own, and application
-//! servers follow flag changes through the change feed instead of polling
-//! every flag.
+//! Strong reads are served from the lease holder's memory without object-store
+//! requests, compare-and-set prevents concurrent admins from overwriting each
+//! other, and `snapshot` reads trade bounded staleness for local reads on any
+//! node. Temporary overrides expire automatically via TTLs, and application
+//! servers follow flag updates through the change feed.
 //!
 //! Run: `cargo run --example feature_flags`
 

@@ -1,10 +1,8 @@
-//! Real-world example: a media library with large binary assets.
+//! Media library example with large binary assets.
 //!
-//! Large files are streamed into out-of-band blobs (chunked objects in the
-//! object store), referenced from table rows alongside searchable metadata,
-//! and served back with HTTP range requests (e.g. for video seeking or
-//! resumable downloads). Overwritten and deleted assets are garbage
-//! collected automatically.
+//! Large files are streamed into out-of-band chunked blobs, referenced from
+//! table rows alongside searchable metadata, and served with HTTP range
+//! requests. Overwritten and deleted assets are garbage collected automatically.
 //!
 //! Run: `cargo run --example asset_store`
 
@@ -19,7 +17,6 @@ use common::step;
 use serde_json::json;
 
 fn fake_image(seed: u8, len: usize) -> Bytes {
-    // A deterministic stand-in for real file contents.
     let mut x: u32 = (seed as u32).wrapping_mul(2654435761);
     Bytes::from(
         (0..len)
@@ -66,7 +63,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(blob["sha256"], json!(b64::hex(&sha256(&data))));
         rows.push(json!({"id": title, "title": title, "kind": kind, "width": 1920, "file": blob["blob_id"]}));
     }
-    // All three rows appear atomically, or none do.
     me.post("/v1/dbs/media/tables/assets/rows", json!({"rows": rows})).await?;
 
     step(2, "Search metadata through the index; blobs come back as references");

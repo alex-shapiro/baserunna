@@ -46,6 +46,8 @@ pub struct LimitConfig {
     pub auth_per_client: Rate,
     /// Account creation rate per client IP.
     pub signup_per_client: Rate,
+    /// Outbound email rate per recipient address.
+    pub mail_per_account: Rate,
     /// Failed authentication attempts allowed per account before backoff begins.
     pub account_free_failures: u32,
     /// Failed authentication attempts allowed per client IP before backoff begins.
@@ -69,6 +71,7 @@ impl Default for LimitConfig {
             api_key: Rate::per_sec(500.0),
             auth_per_client: Rate { per_sec: 1.0, burst: 20.0 },
             signup_per_client: Rate::per_hour(20.0, 5.0),
+            mail_per_account: Rate::per_hour(6.0, 3.0),
             account_free_failures: 5,
             client_free_failures: 20,
             failure_backoff_ms: 1_000,
@@ -88,6 +91,7 @@ impl LimitConfig {
             api_key: Rate::OFF,
             auth_per_client: Rate::OFF,
             signup_per_client: Rate::OFF,
+            mail_per_account: Rate::OFF,
             account_free_failures: u32::MAX,
             client_free_failures: u32::MAX,
             ..LimitConfig::default()

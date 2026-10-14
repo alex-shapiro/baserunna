@@ -1,5 +1,4 @@
-//! CRC-32C (Castagnoli), table driven (slicing-by-1). Used to checksum
-//! manifests and segment blocks.
+//! CRC-32C (Castagnoli) checksum.
 
 const POLY: u32 = 0x82F6_3B78;
 
@@ -23,7 +22,7 @@ pub fn crc32c(data: &[u8]) -> u32 {
     extend(0, data)
 }
 
-/// Continue a CRC over more data (`crc` is a previous result).
+/// Extend a running CRC-32C checksum with `data`.
 pub fn extend(crc: u32, data: &[u8]) -> u32 {
     let mut c = !crc;
     for &b in data {

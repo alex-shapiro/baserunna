@@ -1,9 +1,5 @@
-//! `abandoned`: interactive transactions abandoned, aborted or committed
-//! late while leases move between nodes. Each increments a shared counter
-//! and writes a marker key. The counter must equal the number of commits,
-//! markers must exist exactly for committed transactions, abandoned ones
-//! must resolve as not committed, and every node's open transactions must
-//! drain.
+//! Interactive transactions abandoned, aborted, or committed late while leases
+//! move between nodes.
 
 use super::super::Sim;
 use super::super::client::{Client, ZOMBIE_WAIT_MS};
@@ -40,7 +36,6 @@ async fn one(c: &Client, marker: &str, isolation: &str, fate: Fate, tally: &mut 
     let read = c.call("POST", &ops_path, Some(json!({"ops": [{"op": "get", "key": "ctr"}]}))).await;
     let n: i64 = match read {
         Ok(r) if r.ok() => r.json["results"][0]["value"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0),
-        // The transaction is gone already; nothing to commit.
         _ => return Ok(()),
     };
     let write = json!({"ops": [
@@ -49,13 +44,11 @@ async fn one(c: &Client, marker: &str, isolation: &str, fate: Fate, tally: &mut 
     ]});
     let fate = match c.call("POST", &ops_path, Some(write)).await {
         Ok(r) if r.ok() => fate,
-        // The transaction is gone: nothing was or will be committed.
         Ok(_) => {
             tally.dropped.push((marker.to_string(), cid));
             return Ok(());
         }
-        // Whether the writes joined the transaction is unknown, so
-        // committing would apply an unknown set of ops: abandon it.
+        // Uncertain whether writes joined the transaction; abandon rather than commit unknown ops.
         Err(_) => Fate::Abandon,
     };
     let wait = match fate {
@@ -130,7 +123,6 @@ pub async fn run(sim: Arc<Sim>, clients: usize, txns: usize, chaos: bool) -> Res
         h.abort();
     }
     super::recover(&sim).await;
-    // Every open transaction idles out (housekeeping runs every 5 s).
     sim.sleep(sim.cfg.node.txn_idle_ms + 10_000).await;
     for i in sim.up_nodes() {
         let open = sim.node(i).map(|n| n.node.open_txn_count()).unwrap_or(0);

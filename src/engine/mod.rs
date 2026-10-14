@@ -24,7 +24,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 pub use config::EngineConfig;
-pub use db::{Committed, Consistency, Db};
+pub use db::{Committed, Consistency, Db, DbStats, LevelStats};
 pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
 pub use types::{BlobRef, Entry, Seq, Value};
 pub use version::{Change, ChangePage, ChangePos, KeyRange, Snapshot, Version};
@@ -103,16 +103,14 @@ pub struct Shared {
     pub env: Arc<Env>,
     pub cfg: EngineConfig,
     pub cache: cache::Cache,
-    /// Lease identity of this process (unique per start).
+    /// Unique lease identity of this node process.
     pub node_id: String,
     pub retry: Retry,
     pub compaction_slots: Semaphore,
     /// The store's clock, which every garbage collection timestamp uses.
     pub clock: clock::StoreClock,
-    /// Per database, the newest foreign lease renewal this node has seen
-    /// (holder, manifest `write_seq`) and when it first saw it. Kept beyond
-    /// the lifetime of database handles, so a lease is never mistaken for a
-    /// new one.
+    /// Newest foreign lease sighting `(holder, write_seq, first_seen)` per
+    /// database, retained across `Db` handle evictions.
     pub(crate) lease_sightings: Mutex<DetHashMap<String, (String, u64, tokio::time::Instant)>>,
     /// Databases exempt from size quota limits.
     quota_exempt: Mutex<std::collections::BTreeSet<String>>,
@@ -130,8 +128,7 @@ impl Shared {
         self.clock.now_ms(Duration::from_millis(self.cfg.clock_sync_max_age_ms))
     }
 
-    /// Store time if known, else the local wall clock: for timestamps that
-    /// only inform (creation times, blob ids).
+    /// Store time if known, or the local wall clock otherwise.
     pub fn time_ms(&self) -> u64 {
         self.store_now_ms().unwrap_or_else(|| self.env.now_ms())
     }
@@ -159,10 +156,8 @@ impl Shared {
         }
     }
 
-    /// When this node first saw the lease renewal made by the manifest
-    /// write `write_seq` of database `db`. Every manifest write renews its
-    /// writer's lease, so the write identifies the renewal; `expires_ms`
-    /// does not, as renewals of different durations can share it.
+    /// Returns the instant when this node first observed the lease renewal at
+    /// `write_seq` for `db`.
     pub(crate) fn lease_seen(&self, db: &str, lease: &manifest::Lease, write_seq: u64) -> tokio::time::Instant {
         let now = tokio::time::Instant::now();
         let mut g = self.lease_sightings.lock().unwrap_or_else(|e| e.into_inner());
@@ -173,7 +168,6 @@ impl Shared {
             return *seen;
         }
         if g.len() >= 100_000 {
-            // Long-expired sightings: a lease renewed since has a new id.
             let old = std::time::Duration::from_millis(100 * (self.cfg.read_lease_ms + self.cfg.lease_margin_ms));
             g.retain(|_, (_, _, t)| now.duration_since(*t) < old);
         }
@@ -205,9 +199,9 @@ pub fn blob_chunk_key(db: &str, blob: &str, idx: u64) -> String {
     format!("dbs/{db}/blob/{blob}/{idx:08}")
 }
 
-/// Marks a blob as being read (see [`blob::pin`]). It lives with the
-/// blob's chunks, so a pinned blob looks recently written to sweeps, and
-/// deleting the blob deletes it.
+/// Storage key for a blob read pin; see [`blob::pin`]. Stored under the blob's
+/// prefix so sweeps treat a pinned blob as recently modified and deleting the
+/// blob removes its pin.
 pub fn pin_key(db: &str, blob: &str) -> String {
     format!("{}pin", blob_prefix(db, blob))
 }
@@ -249,7 +243,7 @@ impl Engine {
         self.shared.quota_exempt.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string());
     }
 
-    /// Handle for a database (not loaded until first use).
+    /// Returns the handle for database `id`, creating an unloaded handle if not already open.
     pub fn db(&self, id: &str) -> Arc<Db> {
         let mut g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
         g.entry(id.to_string()).or_insert_with(|| Db::new(id.to_string(), self.shared.clone())).clone()
@@ -259,7 +253,7 @@ impl Engine {
         self.dbs.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Handles currently open (for lease release, metrics).
+    /// Currently open database handles, sorted by ID.
     pub fn open_dbs(&self) -> Vec<Arc<Db>> {
         let g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
         let mut v: Vec<Arc<Db>> = g.values().cloned().collect();
@@ -273,7 +267,7 @@ impl Engine {
         g.retain(|_, db| Arc::strong_count(db) > 1 || !db.idle_for(idle_ms));
     }
 
-    /// Forget a database (after deletion).
+    /// Removes the handle and cached entries for database `id`.
     pub fn forget(&self, id: &str) {
         self.dbs.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
         self.shared.cache.evict_prefix(&db_prefix(id));

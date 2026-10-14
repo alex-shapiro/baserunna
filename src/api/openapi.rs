@@ -1,5 +1,4 @@
-//! The OpenAPI 3.1 document for the HTTP API, served at
-//! `GET /v1/openapi.json` and checked in as `openapi.json`.
+//! OpenAPI 3.1 specification for the HTTP API.
 
 use serde_json::{Map, Value, json};
 use std::sync::OnceLock;
@@ -130,7 +129,33 @@ fn op<'a>(summary: &'a str, tag: &'a str, responses: Vec<(&'a str, Value)>) -> O
 }
 
 fn db() -> Value {
-    path_param("db", "Database name (or `id:<db_id>` for administrators).")
+    path_param(
+        "db",
+        "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` \
+         (administrators).",
+    )
+}
+
+fn org() -> Value {
+    path_param("org", "Organization name.")
+}
+
+fn paging() -> Vec<Value> {
+    vec![
+        query(
+            "limit",
+            json!({"type": "integer", "minimum": 1, "maximum": crate::meta::PAGE_MAX}),
+            &format!("Page size (default {})", crate::meta::PAGE_DEFAULT),
+        ),
+        query("cursor", s(), "From a previous next_cursor"),
+    ]
+}
+
+fn page_of(field: &str, items: Value) -> Value {
+    let mut props = Map::new();
+    props.insert(field.to_string(), arr(items));
+    props.insert("next_cursor".into(), nullable("string"));
+    obj(Value::Object(props), &[field, "next_cursor"])
 }
 
 fn table() -> Value {
@@ -166,9 +191,21 @@ fn schemas() -> Value {
             }), &["code", "message", "retryable"]),
         }), &["error"]),
         "UserPublic": obj(json!({
-            "id": s(), "email": s(), "is_admin": b(), "disabled": b(), "has_password": b(),
+            "id": s(), "email": s(), "email_verified": b(), "is_admin": b(), "disabled": b(), "has_password": b(),
             "google_linked": b(), "created_at": i(),
-        }), &["id", "email", "is_admin"]),
+        }), &["id", "email", "email_verified", "is_admin", "disabled", "has_password", "google_linked", "created_at"]),
+        "SessionInfo": obj_desc(json!({
+            "id": s(), "created_at": i(), "expires_at": i(), "client": nullable("string"),
+            "method": enum_of(&["signup", "password", "google", "reset"]), "current": b(),
+        }), &["id", "created_at", "expires_at", "client", "method", "current"],
+            "A signed-in session: `client` is the address that signed in, `current` the session making the request."),
+        "PasswordChange": obj_desc(json!({"current_password": s(), "new_password": {"type": "string", "minLength": 8}}),
+            &["new_password"], "`current_password` is required for accounts that have a password."),
+        "Role": enum_of(&["reader", "writer", "admin", "owner"]),
+        "Org": obj(json!({"id": s(), "name": s(), "role": r("Role"), "created_at": i()}),
+            &["id", "name", "role", "created_at"]),
+        "Member": obj(json!({"user_id": s(), "email": s(), "role": r("Role"), "added_at": i()}),
+            &["user_id", "email", "role", "added_at"]),
         "Session": obj(json!({"token": s(), "user": r("UserPublic")}), &["token", "user"]),
         "Credentials": obj(json!({"email": s(), "password": {"type": "string", "minLength": 8}}), &["email", "password"]),
         "Me": obj(json!({
@@ -189,15 +226,23 @@ fn schemas() -> Value {
             node's per-key limit)."),
         "Node": obj(json!({"id": s(), "addr": s(), "started_at": i(), "heartbeat_at": i(), "live": b()}),
             &["id", "addr", "started_at", "heartbeat_at", "live"]),
-        "DbSummary": obj(json!({"id": s(), "name": s(), "created_at": i()}), &["id", "name", "created_at"]),
-        "DbInfo": obj(json!({
-            "id": s(), "name": s(), "created_at": i(),
-            "stats": obj(json!({
-                "version": i(), "segments": nullable("integer"), "segment_bytes": nullable("integer"),
-                "tail_bytes": nullable("integer"), "lease_holder": nullable("string"),
-                "size_bytes": nullable("integer"), "quota_bytes": nullable("integer"),
-            }), &["version"]),
-        }), &["id", "name", "created_at", "stats"]),
+        "DbSummary": obj_desc(json!({"id": s(), "name": s(), "org": nullable("string"), "created_at": i()}),
+            &["id", "name", "org", "created_at"], "`org` is the owning organization (null for your own databases)."),
+        "LevelStats": obj(json!({"level": i(), "segments": i(), "bytes": i(), "entries": i()}),
+            &["level", "segments", "bytes", "entries"]),
+        "DbStats": obj_desc(json!({
+            "version": i(), "levels": arr(r("LevelStats")), "tail_entries": i(), "tail_bytes": i(),
+            "range_tombstones": i(), "blob_bytes": i(), "pending_gc_objects": i(), "lease_holder": nullable("string"),
+            "lease_expires_at": nullable("integer"), "updated_at": i(), "size_bytes": i(),
+            "quota_bytes": nullable("integer"),
+        }), &["version", "levels", "tail_entries", "tail_bytes", "range_tombstones", "blob_bytes", "pending_gc_objects",
+            "lease_holder", "lease_expires_at", "updated_at", "size_bytes", "quota_bytes"],
+            "The database at the version read (at most 5 s stale). `levels` lists segments by level, shallowest \
+            first; `size_bytes` (blobs included) counts against `quota_bytes`."),
+        "DbInfo": obj_desc(json!({
+            "id": s(), "name": s(), "org": nullable("string"), "role": r("Role"), "created_at": i(), "stats": r("DbStats"),
+        }), &["id", "name", "org", "role", "created_at", "stats"], "`role` is what you may do here: readers read, \
+            writers also write, admins also delete the database."),
         "BlobMeta": obj_desc(json!({"blob_id": s(), "size": i(), "sha256": s(), "content_type": s()}),
             &["blob_id", "size", "sha256", "content_type"], "An out-of-band blob."),
         "KvItem": obj_desc(json!({
@@ -422,15 +467,114 @@ fn paths() -> Value {
             ..op("Google OAuth callback", "auth", vec![("302", resp_plain("Signed in; redirect to return_to"))])
         },
     );
+    add(
+        "/v1/auth/verify-email",
+        "post",
+        Op {
+            public: true,
+            body: Some(json_body(obj(json!({"token": s()}), &["token"]))),
+            desc: Some("The token comes from the link mailed by `POST /v1/me/verify-email` or at sign-up."),
+            ..op("Verify an email address", "auth", vec![("200", resp("Verified", r("Empty")))])
+        },
+    );
+    add(
+        "/v1/auth/password-reset",
+        "post",
+        Op {
+            public: true,
+            body: Some(json_body(obj(json!({"email": s()}), &["email"]))),
+            desc: Some(
+                "Mails a reset link valid for an hour if an account has this email. The answer does not say \
+                 whether one does. 404 if the server cannot send mail.",
+            ),
+            ..op("Request a password reset", "auth", vec![("200", resp("Requested", r("Empty")))])
+        },
+    );
+    add(
+        "/v1/auth/password-reset/confirm",
+        "post",
+        Op {
+            public: true,
+            body: Some(json_body(obj(
+                json!({"token": s(), "password": {"type": "string", "minLength": 8}}),
+                &["token", "password"],
+            ))),
+            desc: Some("Sets the password, verifies the email address and ends every session. The link works once."),
+            ..op("Reset a password", "auth", vec![("200", resp("A new session", r("Session")))])
+        },
+    );
     add("/v1/me", "get", op("The authenticated principal", "auth", vec![("200", resp("Me", r("Me")))]));
+    add(
+        "/v1/me",
+        "delete",
+        Op {
+            body: Some(json!({"required": false, "content": {"application/json": {"schema":
+                obj(json!({"password": s()}), &[])}}})),
+            desc: Some(
+                "Deletes the account with its sessions, API keys, memberships and databases (purged after a grace \
+                 period). Accounts with a password confirm it. Refused for the last administrator and for the only \
+                 owner of an organization. Requires a session.",
+            ),
+            ..op("Delete your account", "auth", vec![("200", resp("Deleted", r("Empty")))])
+        },
+    );
+    add(
+        "/v1/me/password",
+        "post",
+        Op {
+            body: Some(json_body(r("PasswordChange"))),
+            desc: Some("Ends every other session. Requires a session."),
+            ..op("Change your password", "auth", vec![("200", resp("Changed", r("Empty")))])
+        },
+    );
+    add(
+        "/v1/me/verify-email",
+        "post",
+        Op {
+            desc: Some("Mails a verification link (valid 7 days). 404 if the server cannot send mail."),
+            ..op("Send an email verification link", "auth", vec![("200", resp("Sent", r("Empty")))])
+        },
+    );
+    add(
+        "/v1/me/sessions",
+        "get",
+        Op {
+            params: paging(),
+            desc: Some("Requires a session."),
+            ..op("List your sessions", "auth", vec![("200", resp("Sessions", page_of("sessions", r("SessionInfo"))))])
+        },
+    );
+    add(
+        "/v1/me/sessions",
+        "delete",
+        Op {
+            desc: Some("Requires a session."),
+            ..op(
+                "Sign out everywhere else",
+                "auth",
+                vec![("200", resp("Revoked", obj(json!({"revoked": i()}), &["revoked"])))],
+            )
+        },
+    );
+    add(
+        "/v1/me/sessions/{id}",
+        "delete",
+        Op {
+            params: vec![path_param("id", "Session id")],
+            desc: Some(
+                "`current` says whether it was the session making the request, which is then signed out \
+                (its cookie cleared). Requires a session.",
+            ),
+            ..op("Revoke a session", "auth", vec![("200", resp("Revoked", obj(json!({"current": b()}), &["current"])))])
+        },
+    );
     add(
         "/v1/api-keys",
         "get",
-        op(
-            "List API keys",
-            "auth",
-            vec![("200", resp("Keys", obj(json!({"api_keys": arr(r("ApiKey"))}), &["api_keys"])))],
-        ),
+        Op {
+            params: paging(),
+            ..op("List API keys", "auth", vec![("200", resp("Keys", page_of("api_keys", r("ApiKey"))))])
+        },
     );
     add(
         "/v1/api-keys",
@@ -462,11 +606,10 @@ fn paths() -> Value {
     add(
         "/v1/admin/users",
         "get",
-        op(
-            "List users (admin)",
-            "admin",
-            vec![("200", resp("Users", obj(json!({"users": arr(r("UserPublic"))}), &["users"])))],
-        ),
+        Op {
+            params: paging(),
+            ..op("List users (admin)", "admin", vec![("200", resp("Users", page_of("users", r("UserPublic"))))])
+        },
     );
     add(
         "/v1/admin/users/{id}/disable",
@@ -490,22 +633,113 @@ fn paths() -> Value {
         ),
     );
     add(
+        "/v1/orgs",
+        "get",
+        Op {
+            params: paging(),
+            ..op("List your organizations", "orgs", vec![("200", resp("Organizations", page_of("orgs", r("Org"))))])
+        },
+    );
+    add(
+        "/v1/orgs",
+        "post",
+        Op {
+            body: Some(json_body(obj(
+                json!({"name": {"type": "string",
+                    "pattern": format!("^[a-z0-9][a-z0-9_-]{{0,{}}}$", crate::meta::ORG_NAME_MAX - 1)}}),
+                &["name"],
+            ))),
+            desc: Some("You become its owner. Requires a session."),
+            ..op("Create an organization", "orgs", vec![("201", resp("Created", r("Org")))])
+        },
+    );
+    add(
+        "/v1/orgs/{org}",
+        "get",
+        Op { params: vec![org()], ..op("An organization and your role", "orgs", vec![("200", resp("Org", r("Org")))]) },
+    );
+    add(
+        "/v1/orgs/{org}",
+        "delete",
+        Op {
+            params: vec![org()],
+            desc: Some("Owners only, once the organization has no databases."),
+            ..op("Delete an organization", "orgs", vec![("200", resp("Deleted", r("Empty")))])
+        },
+    );
+    let mut member_list = vec![org()];
+    member_list.extend(paging());
+    add(
+        "/v1/orgs/{org}/members",
+        "get",
+        Op {
+            params: member_list,
+            ..op("List members", "orgs", vec![("200", resp("Members", page_of("members", r("Member"))))])
+        },
+    );
+    add(
+        "/v1/orgs/{org}/members",
+        "post",
+        Op {
+            params: vec![org()],
+            body: Some(json_body(obj(json!({"email": s(), "role": r("Role")}), &["email", "role"]))),
+            desc: Some("Admins add readers, writers and admins; owners also add owners. The account must exist."),
+            ..op("Add a member", "orgs", vec![("201", resp("Added", r("Member")))])
+        },
+    );
+    let member = || vec![org(), path_param("user", "The member's user id")];
+    add(
+        "/v1/orgs/{org}/members/{user}",
+        "post",
+        Op {
+            params: member(),
+            body: Some(json_body(obj(json!({"role": r("Role")}), &["role"]))),
+            desc: Some("Changes that involve the owner role are for owners. The last owner keeps the role."),
+            ..op("Change a member's role", "orgs", vec![("200", resp("Changed", r("Member")))])
+        },
+    );
+    add(
+        "/v1/orgs/{org}/members/{user}",
+        "delete",
+        Op {
+            params: member(),
+            desc: Some(
+                "Admins remove non-owners, owners anyone; members remove themselves to leave. The last \
+                owner cannot leave.",
+            ),
+            ..op("Remove a member", "orgs", vec![("200", resp("Removed", r("Empty")))])
+        },
+    );
+    let mut list_params = vec![query("org", s(), "An organization you belong to (default: your own databases)")];
+    list_params.extend(paging());
+    add(
         "/v1/dbs",
         "get",
-        op(
-            "List your databases",
-            "databases",
-            vec![("200", resp("Databases", obj(json!({"databases": arr(r("DbSummary"))}), &["databases"])))],
-        ),
+        Op {
+            params: list_params,
+            desc: Some(
+                "An API key limited to one database lists just that database, and cannot list an \
+                organization's.",
+            ),
+            ..op(
+                "List your or an organization's databases",
+                "databases",
+                vec![("200", resp("Databases", page_of("databases", r("DbSummary"))))],
+            )
+        },
     );
     add(
         "/v1/dbs",
         "post",
         Op {
             body: Some(json_body(obj(
-                json!({"name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$"}}),
+                json!({"name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$"}, "org": s()}),
                 &["name"],
             ))),
+            desc: Some(
+                "With `org`, the database belongs to that organization (you must be one of its admins); address \
+                 it as `org.name`.",
+            ),
             ..op("Create a database", "databases", vec![("201", resp("Created", r("DbSummary")))])
         },
     );
@@ -523,7 +757,8 @@ fn paths() -> Value {
         Op {
             params: vec![db()],
             desc: Some(
-                "Immediately invisible everywhere; storage is purged after a grace period. The name can be reused at once.",
+                "Immediately invisible everywhere; storage is purged after a grace period. The name can be reused at \
+                 once. In an organization, admins and owners may delete databases.",
             ),
             ..op("Delete a database", "databases", vec![("200", resp("Deleted", r("Empty")))])
         },
@@ -866,11 +1101,11 @@ fn paths() -> Value {
     Value::Object(p)
 }
 
-/// The OpenAPI document.
+/// Returns the OpenAPI specification as a JSON value.
 pub fn document() -> &'static Value {
     static DOC: OnceLock<Value> = OnceLock::new();
     DOC.get_or_init(|| {
-        let tags: Vec<Value> = ["auth", "databases", "kv", "transactions", "tables", "admin", "ops"]
+        let tags: Vec<Value> = ["auth", "orgs", "databases", "kv", "transactions", "tables", "admin", "ops"]
             .iter()
             .map(|n| json!({"name": n}))
             .collect();
@@ -883,7 +1118,9 @@ pub fn document() -> &'static Value {
                     `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the \
                     Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for \
                     writes). Requests over a rate limit get 429 `rate_limited` with `Retry-After` and were not \
-                    applied; writes that would take a database past its size quota get 507 `quota_exceeded`.",
+                    applied; writes that would take a database past its size quota get 507 `quota_exceeded`. Every response \
+                    carries an `x-request-id` header: the client's own (1-64 characters of `[A-Za-z0-9._:-]`) or a \
+                    new one, which the server's logs record on every node the request reaches.",
             },
             "servers": [{"url": "/"}],
             "security": [{"bearer": []}],
@@ -898,7 +1135,7 @@ pub fn document() -> &'static Value {
     })
 }
 
-/// The document as pretty-printed JSON (what `openapi.json` contains).
+/// Returns the OpenAPI specification as pretty-printed JSON.
 pub fn document_json() -> &'static str {
     static TEXT: OnceLock<String> = OnceLock::new();
     TEXT.get_or_init(|| {

@@ -9,6 +9,11 @@ Baserunna is a web service that hosts small databases on object storage.
   deletes of many rows by query in one transaction.
 - Values and rows with times to live, expired lazily on read and by compaction.
 - Change feeds of keys and rows, with long polls.
+- Organizations: databases shared by members with roles (reader, writer,
+  admin, owner).
+- Account self-service: password changes, sessions, account deletion,
+  email verification and password resets.
+- JSON logs with request ids that follow requests across nodes.
 - Stateless nodes: kill any node at any time.
 - Verification with deterministic simulation testing
 
@@ -48,6 +53,12 @@ curl -s localhost:8080/v1/dbs/app/txn -H "$H" -d '{
 curl -s -X PUT "localhost:8080/v1/dbs/app/kv/session?ttl_ms=3600000" -H "$H" --data-binary 'token'
 curl -s "localhost:8080/v1/dbs/app/changes?after=0&wait_ms=5000" -H "$H"
 
+# An organization whose members share databases, addressed as org.name.
+curl -s localhost:8080/v1/orgs -H "$H" -d '{"name":"acme"}'
+curl -s localhost:8080/v1/orgs/acme/members -H "$H" -d '{"email":"ann@example.com","role":"writer"}'
+curl -s localhost:8080/v1/dbs -H "$H" -d '{"name":"shared","org":"acme"}'
+curl -s -X PUT localhost:8080/v1/dbs/acme.shared/kv/hello -H "$H" --data-binary 'team'
+
 # Tables with a secondary index.
 curl -s localhost:8080/v1/dbs/app/tables -H "$H" -d '{
   "name": "users", "primary_key": ["id"],
@@ -60,31 +71,22 @@ curl -s localhost:8080/v1/dbs/app/tables/users/rows/delete -H "$H" -d '{"where":
 
 ## Configuration
 
-All configuration is through environment variables (see SPEC §12):
+All configuration is through environment variables. The main ones are
+below; [`SPEC.md`](SPEC.md) §12 lists every one (caches, leases, quotas,
+rate limits, shutdown, logging, mail):
 
 | variable                                 | default                   |                                                                            |
 | ---------------------------------------- | ------------------------- | -------------------------------------------------------------------------- |
 | `BASERUNNA_STORE`                        | `fs:./data`               | `fs:<dir>` (single node), `mem:`, `s3://bucket/prefix`, `gs://…`, `az://…` |
 | `BASERUNNA_LISTEN`                       | `0.0.0.0:8080`            |                                                                            |
 | `BASERUNNA_ADVERTISE`                    | `http://127.0.0.1:<port>` | URL that peers use to reach this node                                      |
-| `BASERUNNA_PUBLIC_URL`                   | advertise URL             | browser-facing URL (OAuth redirect, `Secure` cookies)                      |
+| `BASERUNNA_PUBLIC_URL`                   | advertise URL             | browser-facing URL (OAuth redirect, mailed links, `Secure` cookies)        |
 | `BASERUNNA_CLUSTER_SECRET`               | none                      | protects internal endpoints. **Set it for multi-node.**                    |
 | `BASERUNNA_SIGNUP`                       | `first_user_only`         | `open`, `first_user_only`, or `closed`                                     |
 | `BASERUNNA_ADMIN_EMAIL` / `_PASSWORD`    | none                      | bootstrap an admin account                                                 |
 | `BASERUNNA_GOOGLE_CLIENT_ID` / `_SECRET` | none                      | enables "Sign in with Google"                                              |
-| `BASERUNNA_CACHE_MB`                     | 512                       | block cache budget                                                         |
-| `BASERUNNA_DISK_CACHE_DIR`               | none                      | local disk tier for segment data, kept across restarts                     |
-| `BASERUNNA_DISK_CACHE_MB`                | 10240                     | local disk tier budget                                                     |
-| `BASERUNNA_LEASE_MS`                     | 5000                      | write-failover time bound (leases renewed for reads last 3×)               |
-| `BASERUNNA_DB_MAX_MB`                    | 10240                     | size quota of each database, blobs included; 0 for none                    |
-| `BASERUNNA_USER_RPS` / `_API_KEY_RPS`    | 500 / 500                 | requests per second per user and per API key, on each node                 |
-| `BASERUNNA_AUTH_RPS_PER_CLIENT`          | 1                         | sign-ins and sign-ups per client address (failed sign-ins also back off)   |
-| `BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT`  | 20                        | accounts created per client address                                        |
-| `BASERUNNA_TRUSTED_PROXY_HOPS`           | 0                         | proxies that append the client address to `X-Forwarded-For`                |
-| `BASERUNNA_HASH_CONCURRENCY`             | CPU count                 | password hashes computed at once                                           |
-| `BASERUNNA_DRAIN_DELAY_MS`               | 0                         | on SIGTERM/SIGINT, fail health checks this long before stopping            |
-| `BASERUNNA_SHUTDOWN_TIMEOUT_MS`          | 20000                     | longest wait for in-flight requests when stopping                          |
-| `BASERUNNA_LOG`                          | `warn`                    | `error` / `warn` / `info` / `debug`                                        |
+| `BASERUNNA_MAIL_WEBHOOK_URL`             | none                      | enables verification and password reset mail                               |
+| `BASERUNNA_LOG`                          | `info`                    | `error` / `warn` / `info` (logs every request) / `debug` / `off`           |
 
 For a cluster, run any number of nodes against the same bucket behind any
 load balancer. [`DEPLOYING.md`](DEPLOYING.md) covers TLS, load balancers, the
@@ -126,8 +128,9 @@ src/engine   storage engine: compressed segments, manifest, versions, group comm
              store clock, GC, blobs, quotas
 src/table    tuple encoding, schemas, rows, indexes, queries
 src/ops.rs   the JSON transaction-op language
-src/meta.rs  system database schema and metadata commands (dogfooded on the table layer)
-src/node.rs  a service node: routing, auth, background work;   src/limits.rs  rate limits
+src/meta     system database schema, metadata commands, organizations and roles (dogfooded on the table layer)
+src/node.rs  a service node: routing, auth, accounts, background work;   src/limits.rs  rate limits
+src/log.rs   JSON logs with request ids;   src/mail.rs  outbound mail
 src/api      axum HTTP API and the OpenAPI document;   src/console  admin console
 src/sim      deterministic simulator, workloads and checkers
 src/store    object stores: memory, filesystem, cloud (object_store)

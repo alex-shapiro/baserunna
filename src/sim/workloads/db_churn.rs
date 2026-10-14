@@ -1,8 +1,8 @@
-//! `db_churn`: databases created, used, deleted and recreated under a tiny
+//! `db_churn`: creates, uses, deletes, and recreates databases under a tiny
 //! cache and fast handle eviction. Every read must match the database's
-//! model, deleted names must answer 404, recreated databases must start
-//! empty, and at quiescence idle handles must be released and caches
-//! within budget.
+//! model, deleted names must return 404, recreated databases must start
+//! empty, and at quiescence idle handles must be released and caches must
+//! stay within budget.
 
 use super::super::client::{Client, ZOMBIE_WAIT_MS};
 use super::super::{Sim, SimConfig};
@@ -10,7 +10,6 @@ use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// A tiny cache and short idle eviction, so handles and blocks churn.
 pub fn config(base: SimConfig) -> SimConfig {
     let mut c = base;
     c.engine.cache_bytes = 16 * 1024;
@@ -22,8 +21,7 @@ pub fn config(base: SimConfig) -> SimConfig {
 /// `None`: the database does not exist.
 type Model = BTreeMap<String, Option<BTreeMap<String, String>>>;
 
-/// Run a one-shot transaction to a definitive answer (idempotency key
-/// supplied by the caller for writes).
+/// Runs a one-shot transaction to a definitive response.
 async fn txn(c: &Client, db: &str, body: Json) -> Result<super::super::client::Resp, String> {
     let path = format!("/v1/dbs/{db}/txn");
     loop {
@@ -142,20 +140,19 @@ pub async fn run(sim: Arc<Sim>, clients: usize, dbs: usize, steps: usize, chaos:
         return Err(e);
     }
     super::recover(&sim).await;
-    super::check_db_counts(&sim).await?;
+    super::check_integrity(&sim).await?;
     for (model, c) in &done {
         for (db, want) in model {
             check_db(c, db, want, "final").await?;
         }
     }
-    // Idle handles are released and the cache stays within its budget.
     sim.sleep(sim.cfg.node.db_idle_evict_ms + 10_000).await;
     for i in sim.up_nodes() {
         let Some(n) = sim.node(i) else { continue };
         let open = n.node.engine.open_count();
         let cache = n.node.engine.shared.cache.stats();
-        // The system database stays open (heartbeats), as may the handle
-        // of a database a background task still holds.
+        // Heartbeats keep the system database open, and background tasks may
+        // still hold a user database handle.
         if open > 3 {
             return Err(format!("n{i} keeps {open} database handles open while idle"));
         }

@@ -263,7 +263,7 @@ fn quotas_refuse_growth_but_never_deletes() {
         let v = db.read_version(Consistency::Strong).await.unwrap();
         assert!(v.m.stored_bytes() < 5_000, "{} bytes left after deleting", v.m.stored_bytes());
         try_put(&db, key(0), Value::Inline(Bytes::from(vec![b'q'; 400]))).await.unwrap();
-        let stats = db.stats().unwrap();
+        let stats = db.stats(&db.current().unwrap());
         assert_eq!(stats.quota_bytes, Some(30_000));
         assert_eq!(stats.size_bytes, db.current().unwrap().m.stored_bytes());
     });

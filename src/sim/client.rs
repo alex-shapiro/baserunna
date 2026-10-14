@@ -1,6 +1,4 @@
-//! HTTP client used by simulation workloads. Requests go through the full
-//! axum router of a (randomly chosen or pinned) node; responses are traced
-//! and checked against the OpenAPI document.
+//! HTTP client for simulation workloads.
 
 use super::{NetError, Sim, SimResponse};
 use crate::util::rng::Rng;
@@ -11,8 +9,7 @@ use serde_json::{Value as Json, json};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Longer than any server-side request can linger (commit deadline plus
-/// store latency).
+/// Upper bound on how long an in-flight server request can remain active.
 pub const ZOMBIE_WAIT_MS: u64 = 30_000;
 
 pub struct Client {
@@ -23,7 +20,7 @@ pub struct Client {
     pub name: String,
     /// Client IP address sent in `X-Forwarded-For`.
     pub addr: String,
-    /// Whether to wait out `Retry-After` and retry 429 rate-limited responses.
+    /// Whether to automatically retry 429 responses after `Retry-After`.
     pub retry_rate_limited: bool,
 }
 
@@ -43,7 +40,7 @@ impl Resp {
         self.json["error"]["code"].as_str().unwrap_or("")
     }
 
-    /// 503 whose outcome is known not to have been applied.
+    /// Returns true if the request failed with 503 and was definitely not applied.
     pub fn retryable_not_applied(&self) -> bool {
         self.status == 503 && self.json["error"]["details"]["outcome"] != "unknown"
     }
@@ -180,9 +177,7 @@ impl Client {
         Ok(Resp { status: raw.status, json, raw })
     }
 
-    /// Call until the network delivers a definitive answer (retrying
-    /// refused connections and retryable errors known not to be applied).
-    /// Only for idempotent requests.
+    /// Retries an idempotent request across network failures, 503s, and conflicts.
     pub async fn call_retry(&self, method: &str, path: &str, body: Option<Json>) -> Resp {
         let mut delay = 50;
         for _ in 0..400 {
@@ -197,32 +192,48 @@ impl Client {
         panic!("{}: {method} {path} never succeeded", self.name);
     }
 
-    /// Like [`Client::call_retry`], but if any attempt had an ambiguous
-    /// outcome, wait for zombie requests to expire and repeat the request
-    /// so that the returned answer reflects the final state. Only for
-    /// idempotent requests.
-    pub async fn call_settled(&self, method: &str, path: &str, body: Option<Json>) -> Resp {
+    /// Retries a request until it receives a definitive response, waiting out
+    /// in-flight attempts after any ambiguous failure. The boolean indicates
+    /// whether an earlier attempt may have already taken effect.
+    pub async fn settle(&self, method: &str, path: &str, body: Option<Json>) -> Result<(Resp, bool), String> {
         let mut ambiguous = false;
         for _ in 0..400 {
             match self.call(method, path, body.clone()).await {
                 Ok(r) if r.outcome_unknown() => ambiguous = true,
                 Ok(r) if r.status == 503 || (r.status == 409 && r.code() == "conflict") => {}
-                Ok(r) if ambiguous => {
-                    ambiguous = false;
-                    let _ = r;
-                    self.sim.sleep(ZOMBIE_WAIT_MS).await;
-                    continue;
-                }
-                Ok(r) => return r,
+                Ok(r) => return Ok((r, ambiguous)),
                 Err(_) => ambiguous = true,
             }
-            if ambiguous {
-                self.sim.sleep(ZOMBIE_WAIT_MS).await;
-            } else {
-                self.sim.sleep(100).await;
+            self.sim.sleep(if ambiguous { ZOMBIE_WAIT_MS } else { 100 }).await;
+        }
+        Err(format!("{}: {method} {path} never settled", self.name))
+    }
+
+    /// Like [`Client::settle`], discarding the ambiguity flag for idempotent requests.
+    pub async fn call_settled(&self, method: &str, path: &str, body: Option<Json>) -> Resp {
+        match self.settle(method, path, body).await {
+            Ok((r, _)) => r,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Collects all items in `field` across `next_cursor` pages of `path`.
+    pub async fn paginate(&self, path: &str, field: &str) -> Result<Vec<Json>, String> {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let mut out = Vec::new();
+        let mut page = path.to_string();
+        for _ in 0..1000 {
+            let r = self.call_retry("GET", &page, None).await;
+            if r.status != 200 {
+                return Err(format!("{}: GET {page}: {} {}", self.name, r.status, r.json));
+            }
+            out.extend(r.json[field].as_array().cloned().ok_or(format!("GET {page}: no {field}: {}", r.json))?);
+            match r.json["next_cursor"].as_str() {
+                Some(c) => page = format!("{path}{sep}cursor={}", url_escape(c.as_bytes())),
+                None => return Ok(out),
             }
         }
-        panic!("{}: {method} {path} never settled", self.name);
+        Err(format!("{}: listing {path} never ended", self.name))
     }
 
     pub async fn get(&self, path: &str) -> Result<Resp, NetError> {
@@ -233,8 +244,7 @@ impl Client {
         self.call("POST", path, Some(body)).await
     }
 
-    /// Sign up (retrying transient failures) and return a client holding
-    /// the session token.
+    /// Signs up a user and returns an authenticated client.
     pub async fn signup(sim: &Arc<Sim>, name: &str, email: &str, password: &str) -> Result<Client, String> {
         let c = Client::new(sim, name);
         let body = json!({"email": email, "password": password});
@@ -271,19 +281,26 @@ impl Client {
         Err("login never succeeded".into())
     }
 
-    /// Create a database (idempotent from the caller's point of view).
     pub async fn create_db(&self, name: &str) -> Result<(), String> {
+        self.create_db_owned(None, name).await
+    }
+
+    pub async fn create_db_owned(&self, org: Option<&str>, name: &str) -> Result<(), String> {
+        let body = match org {
+            Some(o) => json!({"name": name, "org": o}),
+            None => json!({"name": name}),
+        };
         for _ in 0..200 {
-            match self.post("/v1/dbs", json!({"name": name})).await {
+            match self.post("/v1/dbs", body.clone()).await {
                 Ok(r) if r.status == 201 => return Ok(()),
                 Ok(r) if r.status == 409 && r.code() == "already_exists" => return Ok(()),
                 Ok(r) if r.status == 503 || r.status == 409 => {}
-                Ok(r) => return Err(format!("create db failed: {} {}", r.status, r.json)),
+                Ok(r) => return Err(format!("create db {body}: {} {}", r.status, r.json)),
                 Err(_) => {}
             }
             self.sim.sleep(200).await;
         }
-        Err("create db never succeeded".into())
+        Err(format!("create db {body} never succeeded"))
     }
 
     pub async fn pause(&self, ms: u64) {

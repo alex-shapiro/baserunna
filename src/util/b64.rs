@@ -1,4 +1,4 @@
-//! Base64 (RFC 4648) standard and URL-safe alphabets, plus lowercase hex.
+//! Base64 and hex encoding.
 
 const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -159,7 +159,7 @@ mod tests {
     fn rejects_garbage() {
         assert!(decode("Zg=").is_none());
         assert!(decode("Z").is_none());
-        assert!(decode("Zh==").is_none()); // non-canonical
+        assert!(decode("Zh==").is_none());
         assert!(decode("ab$d").is_none());
         assert!(decode_url("ab+d").is_none());
         assert!(unhex("abc").is_none());

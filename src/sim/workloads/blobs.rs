@@ -1,7 +1,6 @@
-//! `blobs`: large values stored out-of-band through every path (raw PUT,
-//! staged upload + transactional bind, blob table columns), verified with
-//! full and ranged reads; then a full GC cycle must remove every
-//! unreferenced object and keep every referenced one.
+//! Out-of-band blob storage via raw PUT, staged upload with transactional bind,
+//! and blob table columns, verified with full and ranged reads and followed by
+//! a full GC cycle.
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
@@ -14,8 +13,8 @@ use std::sync::Arc;
 
 type IdSets = (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>);
 
-/// Referenced blob ids, listed-obsolete ids, and live segment ids of a
-/// database, read straight from the store.
+/// Returns referenced blob IDs, manifest-listed obsolete IDs, and live segment IDs
+/// read directly from the store.
 pub fn db_objects(sim: &Sim, db_id: &str) -> Result<IdSets, String> {
     let g = sim.mem.get_sync(&crate::engine::manifest_key(db_id), &Default::default()).map_err(|e| e.to_string())?;
     let m = Manifest::decode(&g.data).map_err(|e| e.to_string())?;
@@ -27,7 +26,6 @@ pub fn db_objects(sim: &Sim, db_id: &str) -> Result<IdSets, String> {
         entries.extend(segment::read_all(&d.data).map_err(|e| e.to_string())?);
         segs.insert(s.id.clone());
     }
-    // Newest version per key wins.
     let mut newest: BTreeMap<bytes::Bytes, (u64, Value)> = BTreeMap::new();
     for e in entries {
         let keep = newest.get(&e.key).is_none_or(|(s, _)| e.seq > *s);

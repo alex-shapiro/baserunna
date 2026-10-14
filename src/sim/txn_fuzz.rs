@@ -1,12 +1,4 @@
-//! Structure-aware HTTP fuzzing of the transaction-op language.
-//!
-//! [`run_input`] turns fuzzer bytes into requests against a fresh database
-//! on a fault-free simulated node: one-shot and interactive transactions,
-//! blob staging and read-backs, occasionally malformed at any level of the
-//! JSON. An exact model of the database checks each response: valid
-//! requests must return the modeled results, invalid ones the modeled 4xx
-//! with no effect, and nothing may return a 5xx or break the OpenAPI
-//! document.
+//! Structure-aware HTTP fuzzing of the transaction API against a reference model.
 
 use super::{Sim, SimConfig, SimResponse, openapi_check};
 use crate::engine::KeyRange;
@@ -44,7 +36,6 @@ impl<'a> Choices<'a> {
         b
     }
 
-    /// Uniform-ish in `[0, n)`.
     fn below(&mut self, n: usize) -> usize {
         match n {
             0 | 1 => 0,
@@ -53,7 +44,6 @@ impl<'a> Choices<'a> {
         }
     }
 
-    /// True with probability `n/256` (false once exhausted).
     fn chance(&mut self, n: u8) -> bool {
         self.byte() > 255 - n
     }
@@ -63,13 +53,9 @@ impl<'a> Choices<'a> {
     }
 }
 
-// ------------------------------------------------------------------ model
-
 const ANY: &str = "\u{1}any";
 const ANY_NUMBER: &str = "\u{1}number";
 
-/// `want` equals `got`, where the string [`ANY`] matches any string and
-/// [`ANY_NUMBER`] any number.
 fn matches(want: &Json, got: &Json) -> bool {
     match (want, got) {
         (Json::String(w), Json::String(_)) if w == ANY => true,
@@ -84,14 +70,11 @@ fn matches(want: &Json, got: &Json) -> bool {
 
 #[derive(Clone, Debug, PartialEq)]
 struct BlobMeta {
-    /// `None` for blobs the service created implicitly (id unknown).
+    /// `None` for implicitly created blobs whose ID is unknown.
     id: Option<String>,
     content_type: String,
 }
 
-/// Whether a value expires: not at all, a time to live after the commit
-/// that is to write it, or at a time it was committed with (the run never
-/// lasts until then).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum Expiry {
     #[default]
@@ -138,8 +121,7 @@ enum Iso {
     Snapshot,
 }
 
-/// The model's own copy of `ops::Op`, so a wrong default or write
-/// classification in the service is a mismatch rather than shared.
+/// Independent copy of `ops::Op` so default or classification bugs are caught.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Op {
@@ -265,7 +247,6 @@ fn one() -> i64 {
     1
 }
 
-/// The model's own copy of `table::Selection`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Selection {
@@ -279,10 +260,8 @@ struct Selection {
     filter: Option<Filter>,
 }
 
-/// TTLs at least this long never run out within a fuzz run.
 const TTL_BEYOND_RUN_MS: u64 = 1_000_000_000;
 
-/// `ttl_ms` as the service checks it.
 fn ttl(ttl_ms: Option<u64>) -> MResult<Expiry> {
     match ttl_ms {
         None => Ok(Expiry::Never),
@@ -310,7 +289,6 @@ impl Op {
     }
 }
 
-/// Mirrors of the service's request bodies (`api/data.rs`).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OneShotBody {
@@ -344,7 +322,6 @@ struct OpsBody {
     ops: Vec<Op>,
 }
 
-/// Parse a body the way the service's JSON extractor does.
 fn parse_body<T: serde::de::DeserializeOwned>(b: &[u8]) -> Option<T> {
     let b: &[u8] = if b.iter().all(|c| c.is_ascii_whitespace()) { b"{}" } else { b };
     serde_json::from_slice(b).ok()
@@ -356,8 +333,7 @@ enum Fail {
     NotFound,
     Exists,
     Precondition,
-    /// A valid request whose effects the model cannot predict: a value
-    /// that expires within the run, at a time the model does not know.
+    /// Valid request with an in-run TTL whose exact expiry is not modeled.
     Unmodeled,
 }
 
@@ -381,7 +357,6 @@ enum ReadItem {
     Range(KeyRange),
 }
 
-/// A transaction against a snapshot of the model, with read-your-writes.
 #[derive(Clone)]
 struct TxnView {
     base: Snapshot,
@@ -390,7 +365,6 @@ struct TxnView {
     ranges: Vec<KeyRange>,
     row_writes: BTreeMap<i64, Option<MRow>>,
     reads: Vec<ReadItem>,
-    /// Table ops ran: the read set is not modeled exactly.
     table_ops: bool,
 }
 
@@ -437,7 +411,6 @@ impl TxnView {
         m.into_iter().map(|(k, (v, s))| (k, v, s)).collect()
     }
 
-    /// `Txn::scan` with `n` results, recording the interval it covered.
     fn scan(&mut self, r: &KeyRange, reverse: bool, n: usize) -> Vec<(Vec<u8>, MVal, Option<u64>)> {
         if r.is_empty() {
             return Vec::new();
@@ -662,8 +635,7 @@ fn cmp_vec(a: &[TKey], b: &[TKey]) -> Ordering {
     a.len().cmp(&b.len())
 }
 
-/// The position of a row's entry in an access path (the tuple the stored
-/// key encodes). Unique entries with a value carry no primary key.
+/// Returns a row's sort key in `index`, omitting the primary key for non-null unique entries.
 fn entry_vec(index: Option<&str>, pk: i64, r: &MRow) -> Vec<TKey> {
     match index {
         Some("by_name") => match &r.name {
@@ -675,8 +647,6 @@ fn entry_vec(index: Option<&str>, pk: i64, r: &MRow) -> Vec<TKey> {
     }
 }
 
-/// An op's modeled result, plus the position a query stopped at (to
-/// interpret the cursor the service returns).
 struct Out {
     json: Json,
     cursor: Option<(Option<String>, Vec<TKey>)>,
@@ -698,15 +668,12 @@ struct QueryArgs<'q> {
     cursor: &'q Option<String>,
 }
 
-/// Committed state of the database and everything the model remembers.
 struct World {
     snap: Snapshot,
     version: u64,
-    /// Version of the last write (including tombstones) per user key.
     last_write: BTreeMap<Vec<u8>, u64>,
     idem: BTreeMap<String, u64>,
     staged: BTreeMap<String, (Vec<u8>, String)>,
-    /// Query cursors seen in responses: index and the stop position.
     query_cursors: BTreeMap<String, (Option<String>, Vec<TKey>)>,
     inline_max: usize,
     json_max: u64,
@@ -748,8 +715,6 @@ fn user_key(k: Vec<u8>) -> MResult<Vec<u8>> {
     if k.is_empty() || k.len() > crate::ops::MAX_USER_KEY { Err(Fail::Invalid) } else { Ok(k) }
 }
 
-/// A user-key range (keys without the keyspace byte; the end of the user
-/// keyspace is `Unbounded`).
 fn user_range(
     enc: Encoding,
     prefix: &Option<String>,
@@ -1016,9 +981,6 @@ impl World {
         }
     }
 
-    /// The rows `sel` selects, by their access path's entries, in order
-    /// (after `cursor`, if any): the planning both queries and batch
-    /// operations do.
     fn plan(
         &self,
         t: &TxnView,
@@ -1080,9 +1042,7 @@ impl World {
             None => None,
             Some(c) => match self.query_cursors.get(c) {
                 Some((ix, v)) if ix == index && in_region(v) => Some(v.clone()),
-                // Unknown cursors are never inside a query's key range:
-                // the generator only produces strings whose decoded first
-                // byte is not a row or index keyspace byte.
+                // Generated strings never decode to a valid row or index keyspace prefix.
                 _ => return Err(Fail::Invalid),
             },
         };
@@ -1131,7 +1091,6 @@ impl World {
         Ok((out, None))
     }
 
-    /// The primary keys of the rows a batch operation changes.
     fn select(&self, t: &TxnView, sel: &Selection, limit: Option<usize>) -> MResult<Vec<i64>> {
         let entries = self.plan(t, (&sel.index, &sel.eq, &sel.range, &sel.filter), &None, false)?;
         let rows = t.rows();
@@ -1143,7 +1102,6 @@ impl World {
             .collect())
     }
 
-    /// Whether committing `t` now conflicts (`None`: not modeled exactly).
     fn conflicts(&self, t: &TxnView, iso: Iso) -> Option<bool> {
         if self.version == t.rv {
             return Some(false);
@@ -1247,8 +1205,6 @@ fn row_from_json(obj: &Json, base: Option<(i64, &MRow)>) -> MResult<(i64, MRow)>
     Ok((id, MRow { name, grp, doc, expiry: Expiry::Never }))
 }
 
-/// `table::check_set`: an object of non-key columns with values of their
-/// types (every non-key column is nullable).
 fn check_set(set: &Json) -> MResult<()> {
     let o = set.as_object().ok_or(Fail::Invalid)?;
     for (k, v) in o {
@@ -1268,13 +1224,9 @@ fn check_unique(t: &TxnView, pk: i64, new: &MRow) -> MResult<()> {
     }
 }
 
-// -------------------------------------------------------------- generator
-
 const NAMES: &[&str] = &["ann", "bob", "cy", "é", ""];
 
-/// Strings for arbitrary JSON. None of them decodes (as URL-safe base64)
-/// to bytes starting with a row or index keyspace byte, so a random string
-/// used as a query cursor is always outside the query's range.
+/// Generates strings that never decode as URL-safe base64 to a row or index keyspace prefix.
 fn rand_string(u: &mut Choices) -> String {
     const POOL: &[&str] = &["", "a", "t", "u", "id", "name", "grp", "doc", "by_name", "by_grp", "x/y", "é", "null"];
     match u.below(4) {
@@ -1308,7 +1260,6 @@ fn rand_json(u: &mut Choices, depth: u32) -> Json {
     }
 }
 
-/// Replace, drop or add a field somewhere inside `v`.
 fn mutate(u: &mut Choices, v: &mut Json, depth: u32) {
     match v {
         Json::Object(m) if !m.is_empty() && depth < 5 && u.chance(200) => {
@@ -1369,7 +1320,6 @@ impl Gen<'_, '_> {
         }
     }
 
-    /// An encoded key (occasionally invalid base64).
     fn key(&mut self, enc: Encoding) -> String {
         if enc == Encoding::Base64 && self.u.chance(3) {
             return "!!".into();
@@ -1537,7 +1487,6 @@ impl Gen<'_, '_> {
         }
     }
 
-    /// A filter operand of the column's type.
     fn cmp_value(&mut self, col: &str) -> Json {
         match col {
             "name" => json!(self.u.pick(&["ann", "bob", "cy", "é", "", "a", "an", "bo"])),
@@ -1546,8 +1495,6 @@ impl Gen<'_, '_> {
         }
     }
 
-    /// Maybe a `ttl_ms` for a write: mostly a valid one far longer than any
-    /// run, sometimes out of range.
     fn ttl(&mut self, o: &mut Json) {
         if self.u.chance(80) {
             o["ttl_ms"] = self.u.pick(&[
@@ -1559,7 +1506,6 @@ impl Gen<'_, '_> {
         }
     }
 
-    /// The `where` of a batch row operation, and maybe a `limit`.
     fn selection(&mut self, o: &mut Json) {
         let index = self.u.pick(&[None, None, Some("by_name"), Some("by_grp"), Some("nope")]);
         let mut w = json!({});
@@ -1724,8 +1670,6 @@ impl Gen<'_, '_> {
     }
 }
 
-// ---------------------------------------------------------------- session
-
 struct OpenTxn {
     id: String,
     view: TxnView,
@@ -1734,7 +1678,6 @@ struct OpenTxn {
     alive: bool,
 }
 
-/// What a request should produce.
 enum Expect {
     Ok(u16, Json),
     Err(Fail, Option<usize>),
@@ -1751,9 +1694,7 @@ struct Session<'a> {
     txns: Vec<OpenTxn>,
     scan_cursors: Vec<String>,
     step: usize,
-    /// A request had effects the model cannot predict: stop checking.
     lost: bool,
-    /// Responses by route kind and status.
     hist: RefCell<BTreeMap<String, u64>>,
 }
 
@@ -1767,8 +1708,6 @@ fn trunc(s: &str) -> String {
 }
 
 impl<'a> Session<'a> {
-    /// Run a generator and advance this session's choice position past
-    /// what it consumed.
     fn with_gen<T>(&mut self, f: impl FnOnce(&mut Gen<'a, '_>) -> T) -> T {
         let mut g =
             Gen { u: Choices { data: self.u.data, pos: self.u.pos }, w: &self.w, scan_cursors: &self.scan_cursors };
@@ -1847,7 +1786,6 @@ impl<'a> Session<'a> {
         format!("/v1/dbs/{}{rest}", self.db)
     }
 
-    /// Serialize `body`, sometimes damaging the bytes themselves.
     fn body_bytes(&mut self, body: &Json) -> Vec<u8> {
         let s = body.to_string();
         match self.u.below(128) {
@@ -1858,8 +1796,6 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Record the cursors a response returned for queries, keyed to the
-    /// positions the model predicted.
     fn learn_cursors(&mut self, outs: &[Out], results: &Json) {
         for (i, o) in outs.iter().enumerate() {
             let next = results[i]["next_cursor"].as_str().map(|s| s.to_string());
@@ -1901,7 +1837,6 @@ impl<'a> Session<'a> {
         self.submit_one_shot(&body).await
     }
 
-    /// Send a one-shot transaction and check the response against the model.
     async fn submit_one_shot(&mut self, body: &Json) -> Result<(), String> {
         let bytes = self.body_bytes(body);
         let path = self.path("/txn");
@@ -2143,7 +2078,6 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    /// Compare every KV pair and row with the model.
     async fn full_check(&mut self) -> Result<(), String> {
         let mut t = TxnView::new(self.w.snap.clone(), self.w.version);
         let items = t.scan(&KeyRange::all(), false, usize::MAX);
@@ -2186,7 +2120,6 @@ impl<'a> Session<'a> {
         self.seed_rows().await
     }
 
-    /// Start most inputs with a few rows for queries and filters to select.
     async fn seed_rows(&mut self) -> Result<(), String> {
         let ops: Vec<Json> = (0..self.u.below(NAMES.len() + 1) as i64)
             .map(|id| {
@@ -2229,8 +2162,7 @@ impl<'a> Session<'a> {
     }
 }
 
-/// A simulated single node (no faults) reused across inputs; each input
-/// runs against its own fresh database.
+/// Single-node fuzz harness reused across inputs.
 pub struct Harness {
     rt: tokio::runtime::Runtime,
     sim: Arc<Sim>,
@@ -2242,7 +2174,7 @@ pub struct Harness {
 impl Harness {
     pub fn new(seed: u64) -> Harness {
         if std::env::var("BASERUNNA_LOG").is_err() {
-            crate::log::set_level(crate::log::ERROR);
+            crate::log::set_level(Some(crate::log::Level::Error));
         }
         let rt =
             tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
@@ -2288,10 +2220,7 @@ impl Harness {
         };
         let r = self.rt.block_on(s.run());
         if self.inputs.is_multiple_of(256) {
-            // Let the reaper purge the deleted databases of earlier inputs
-            // (two passes after the deletion grace), bounding memory.
-            let ms = 2 * cfg.node.db_delete_grace_ms + 180_000;
-            self.rt.block_on(self.sim.sleep(ms));
+            self.rt.block_on(self.sim.sleep(super::purge_wait_ms(cfg)));
         }
         for (k, n) in s.hist.into_inner() {
             *self.hist.entry(k).or_default() += n;
@@ -2299,7 +2228,6 @@ impl Harness {
         r
     }
 
-    /// Responses so far, by route kind and status.
     pub fn stats(&self) -> &BTreeMap<String, u64> {
         &self.hist
     }
@@ -2309,12 +2237,10 @@ thread_local! {
     static HARNESS: RefCell<Option<Harness>> = const { RefCell::new(None) };
 }
 
-/// Run one fuzz input on this thread's persistent harness.
 pub fn run_input(data: &[u8]) -> Result<(), String> {
     HARNESS.with(|h| h.borrow_mut().get_or_insert_with(|| Harness::new(1)).run(data))
 }
 
-/// Response statistics of this thread's harness (see [`Harness::stats`]).
 pub fn stats() -> BTreeMap<String, u64> {
     HARNESS.with(|h| h.borrow().as_ref().map(|h| h.stats().clone()).unwrap_or_default())
 }

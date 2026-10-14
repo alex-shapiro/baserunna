@@ -1,11 +1,8 @@
 //! Local filesystem object store for single-node development.
 //!
-//! Each object is a file whose first 16 bytes are a random etag. Writes go to
-//! a temporary file that is renamed into place; conditional writes are
-//! serialized by a mutex owned by the store. That makes compare-and-swap
-//! atomic only within one `FsStore`, so the store takes an exclusive lock on
-//! its directory and a second store on the same directory (in this process
-//! or another) fails to open.
+//! Each object is a file prefixed with a 16-byte random etag. Writes rename a
+//! temporary file into place under a store-owned mutex, and the store holds an
+//! exclusive lock on its root directory so no second `FsStore` can open it.
 
 use super::*;
 use std::path::{Path, PathBuf};
@@ -17,13 +14,11 @@ const LOCK_FILE: &str = ".lock";
 pub struct FsStore {
     root: PathBuf,
     cas_lock: Arc<Mutex<()>>,
-    /// Holds the exclusive lock on the directory for the store's lifetime.
     _dir_lock: std::fs::File,
 }
 
 impl FsStore {
-    /// Open (creating if needed) a store in `root`. Fails if another
-    /// `FsStore`, in this process or another, has the directory open.
+    /// Open or create a store in `root`. Fails if another `FsStore` holds the directory lock.
     pub fn new(root: impl Into<PathBuf>) -> std::io::Result<FsStore> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;

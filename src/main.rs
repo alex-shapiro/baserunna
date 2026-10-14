@@ -1,12 +1,11 @@
-//! Production entry point. Configuration comes from environment variables
-//! (SPEC §12).
+//! Server binary entry point and environment configuration.
 
 use baserunna::cluster::{HttpTransport, Transport};
 use baserunna::engine::local::{DiskCache, LocalTier};
 use baserunna::env::Env;
 use baserunna::limits::Rate;
 use baserunna::meta::SignupPolicy;
-use baserunna::node::{Node, NodeConfig};
+use baserunna::node::{Node, NodeConfig, Services};
 use baserunna::store::{DynStore, FsStore, MemStore};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -105,7 +104,7 @@ async fn stop_signal() {
                 either.await;
                 return;
             }
-            _ => eprintln!("baserunna: cannot install signal handlers; stopping on Ctrl-C only"),
+            _ => baserunna::warn!("cannot install signal handlers; stopping on Ctrl-C only"),
         }
     }
     let _ = tokio::signal::ctrl_c().await;
@@ -113,9 +112,12 @@ async fn stop_signal() {
 
 #[tokio::main]
 async fn main() {
-    baserunna::log::init_from_env();
-    if let Err(e) = run().await {
+    if let Err(e) = baserunna::log::init_from_env() {
         eprintln!("baserunna: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = run().await {
+        baserunna::error!("{e}");
         std::process::exit(1);
     }
 }
@@ -129,25 +131,37 @@ async fn run() -> Result<(), String> {
             (Some(id), Some(secret)) => Some(Arc::new(baserunna::auth::GoogleOidc::new(id, secret))),
             _ => None,
         };
+    let mailer: Option<Arc<dyn baserunna::mail::Mailer>> = match var("BASERUNNA_MAIL_WEBHOOK_URL") {
+        #[cfg(feature = "cloud")]
+        Some(url) => Some(Arc::new(baserunna::mail::WebhookMailer::new(
+            url,
+            var("BASERUNNA_MAIL_WEBHOOK_TOKEN"),
+            var("BASERUNNA_MAIL_FROM").unwrap_or_else(|| "Baserunna <noreply@localhost>".into()),
+        ))),
+        #[cfg(not(feature = "cloud"))]
+        Some(_) => return Err("BASERUNNA_MAIL_WEBHOOK_URL needs the `cloud` feature".into()),
+        None => None,
+    };
     let transport: Arc<dyn Transport> = Arc::new(HttpTransport::new());
     let env = Arc::new(Env::real());
-    let node =
-        Node::start(cfg, env.clone(), store, transport, oidc).await.map_err(|e| format!("startup failed: {e}"))?;
+    let services = Services { transport, oidc, mailer };
+    let node = Node::start(cfg, env.clone(), store, services).await.map_err(|e| format!("startup failed: {e}"))?;
+    baserunna::log::set_process_node(&node.id);
     let app = baserunna::api::router(node.clone());
     let listener =
         tokio::net::TcpListener::bind(&listen).await.map_err(|e| format!("cannot listen on {listen}: {e}"))?;
-    eprintln!("baserunna node {} listening on {listen} (store {store_url})", node.id);
+    baserunna::info!("listening on {listen} (store {store_url})");
     let n2 = node.clone();
     let stopping = async move {
         stop_signal().await;
-        eprintln!("shutting down: draining for {:?}", shutdown.drain_delay);
+        baserunna::info!("shutting down: draining for {:?}", shutdown.drain_delay);
         n2.drain();
         tokio::time::sleep(shutdown.drain_delay).await;
         // Allow in-flight requests up to `timeout` to complete before forcing lease release.
         let n3 = n2.clone();
         env.spawn(async move {
             tokio::time::sleep(shutdown.timeout).await;
-            eprintln!("shutting down: requests still in flight after {:?}", shutdown.timeout);
+            baserunna::warn!("shutting down: requests still in flight after {:?}", shutdown.timeout);
             n3.shutdown().await;
             std::process::exit(0);
         });
@@ -156,7 +170,7 @@ async fn run() -> Result<(), String> {
         .with_graceful_shutdown(stopping)
         .await
         .map_err(|e| e.to_string())?;
-    eprintln!("shutting down: releasing leases");
+    baserunna::info!("shutting down: releasing leases");
     node.shutdown().await;
     Ok(())
 }

@@ -25,10 +25,7 @@ enum Op {
     Get(i64),
     QueryTag(Option<String>, i64, usize, bool),
     QueryPk(i64, i64, usize),
-    /// Set the score (or the name) of the rows with a tag and at least a
-    /// score, at most `limit` of them, through the index on both.
     UpdateWhere(Option<String>, i64, Result<i64, Option<String>>, Option<usize>),
-    /// Delete the rows in a primary key range that are red or unnamed.
     DeleteWhere(i64, i64, Option<usize>),
     Commit,
 }
@@ -344,7 +341,6 @@ fn schema_changes_and_blobs() {
         let row = get(&mut t, "docs", &json!(["a", 0])).await.unwrap().unwrap();
         assert_eq!(row["body"]["size"], json!(10));
         assert!(get(&mut t, "docs", &json!(0)).await.is_err());
-        // Add a column with a default, then index it (backfill uses default).
         add_column(&mut t, "docs", &serde_json::from_value(json!({"name": "rank", "type": "int", "nullable": false, "default": 5})).unwrap()).await.unwrap();
         db.commit(t.into_request()).await.unwrap();
         add_index(&db, "docs", &index_spec(json!({"name": "by_rank", "columns": ["rank", "title"]})), small()).await.unwrap();
@@ -353,7 +349,6 @@ fn schema_changes_and_blobs() {
         check_indexes(&mut t, "docs").await.unwrap();
         let q: Query = serde_json::from_value(json!({"index": "by_rank", "eq": [5, "t1"]})).unwrap();
         assert_eq!(query(&mut t, "docs", &q).await.unwrap().rows.len(), 2);
-        // Unique index over duplicate data fails.
         let e = add_index(&db, "docs", &index_spec(json!({"name": "u", "columns": ["title"], "unique": true})), small()).await;
         assert!(matches!(e, Err(Error::AlreadyExists(_))));
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
@@ -371,13 +366,10 @@ fn schema_changes_and_blobs() {
         drop_table(&mut t, "docs").await.unwrap();
         db.commit(t.into_request()).await.unwrap();
         let v = db.read_version(Consistency::Strong).await.unwrap();
-        // Only the table-id counter remains.
         assert_eq!(v.all_entries(false).await.unwrap().len(), 1);
     });
 }
 
-/// The consistency checkers used by the simulator must reject corrupted
-/// state, or a bug they exist to catch would go unnoticed.
 #[test]
 fn checkers_reject_corruption() {
     rt().block_on(async {
@@ -415,25 +407,21 @@ fn checkers_reject_corruption() {
         let entries = t.scan(&KeyRange::prefix(&index_prefix(s.id, by_n)), false, 100).await.unwrap();
         assert_eq!(entries.len(), 4);
 
-        // A missing index entry.
         let mut t = fresh().await;
         t.delete(entries[0].key.clone()).unwrap();
         assert!(check_indexes(&mut t, "t").await.is_err(), "missing index entry not detected");
 
-        // A stale index entry.
         let mut t = fresh().await;
         let mut stale = entries[0].key.to_vec();
         stale.push(0);
         t.put(Bytes::from(stale), Value::Inline(Bytes::new())).unwrap();
         assert!(check_indexes(&mut t, "t").await.is_err(), "stale index entry not detected");
 
-        // Two rows with the same unique email (the second copied raw).
         let mut t = fresh().await;
         let r0 = t.get(&row_key(s.id, &[Key::Int(0)])).await.unwrap().unwrap();
         t.put(row_key(s.id, &[Key::Int(9)]), r0.value).unwrap();
         assert!(check_indexes(&mut t, "t").await.is_err(), "unique violation not detected");
 
-        // Leftovers of a dropped table and of a dropped index.
         let mut t = fresh().await;
         t.put(row_key(s.id + 7, &[Key::Int(1)]), Value::Inline(Bytes::new())).unwrap();
         assert!(check_no_orphans(&mut t).await.is_err(), "row of a dropped table not detected");
@@ -460,7 +448,6 @@ fn index_spec(v: Json) -> IndexSpec {
     serde_json::from_value(v).unwrap()
 }
 
-/// Backfill batches small enough for tests to span many of them.
 fn small() -> Backfill {
     Backfill { batch_rows: 7, ..Backfill::default() }
 }
@@ -469,7 +456,6 @@ fn column(v: Json) -> ColumnSpec {
     serde_json::from_value(v).unwrap()
 }
 
-/// A filter as the oracle sees it.
 #[derive(Clone, Debug)]
 enum F {
     And(Vec<F>),
@@ -489,7 +475,6 @@ impl F {
     }
 }
 
-/// A row of the filter test table: one column per filterable type.
 #[derive(Clone, Debug)]
 struct FRow {
     i: Option<i64>,
@@ -520,7 +505,6 @@ fn gen_frow(r: &mut Rng) -> FRow {
     }
 }
 
-/// An operand for `col`, always of an accepted type (ints for floats too).
 fn gen_operand(r: &mut Rng, col: &str) -> Json {
     match col {
         "i" => json!(r.below(5) as i64 - 2),
@@ -555,10 +539,6 @@ fn gen_filter(r: &mut Rng, depth: u32) -> F {
     }
 }
 
-/// Filter semantics, independent of the service: values of the column's
-/// type order naturally (numbers numerically, strings and bytes bytewise,
-/// false before true); JSON values are only equal or incomparable; null
-/// matches nothing but `is_null`.
 fn oracle(f: &F, row: &FRow) -> bool {
     use std::cmp::Ordering::{self, *};
     let cmp = |col: &str, v: &Json| -> Option<Ordering> {
@@ -597,7 +577,6 @@ fn oracle(f: &F, row: &FRow) -> bool {
     }
 }
 
-/// Query filters over every filterable column type agree with the oracle.
 #[test]
 fn filters_match_oracle() {
     rt().block_on(async {
@@ -639,7 +618,6 @@ fn filters_match_oracle() {
     });
 }
 
-/// Filters are validated before any row is read.
 #[test]
 fn filter_validation() {
     rt().block_on(async {
@@ -692,8 +670,6 @@ fn filter_validation() {
     });
 }
 
-/// Schemas are bounded: 1..=256 columns, 1..=8 key columns and 1..=8
-/// columns per index; defaults must fit their column.
 #[test]
 fn schema_limits() {
     rt().block_on(async {
@@ -734,8 +710,6 @@ fn schema_limits() {
     });
 }
 
-/// Key columns are never nullable, other columns only when declared so;
-/// omitted columns take their defaults.
 #[test]
 fn nullability_and_defaults() {
     rt().block_on(async {
@@ -763,8 +737,6 @@ fn nullability_and_defaults() {
     });
 }
 
-/// Column ids are never reused: values of a dropped column do not reappear
-/// in a column added later, and updates stop storing them.
 #[test]
 fn columns_come_and_go() {
     rt().block_on(async {
@@ -787,7 +759,6 @@ fn columns_come_and_go() {
         add_column(&mut t, "c", &column(json!({"name": "p", "type": "int"}))).await.unwrap();
         add_column(&mut t, "c", &column(json!({"name": "q", "type": "string", "default": "d"}))).await.unwrap();
         update(&mut t, &blobs, "c", &json!(1), &json!({"p": 20})).await.unwrap();
-        // Only `x` is indexed, so `a` can be dropped.
         drop_column(&mut t, "c", "a").await.unwrap();
         add_column(&mut t, "c", &column(json!({"name": "r", "type": "int"}))).await.unwrap();
         let row = get(&mut t, "c", &json!(1)).await.unwrap().unwrap();
@@ -802,8 +773,6 @@ fn columns_come_and_go() {
     });
 }
 
-/// Dropping a blob column removes its values from every row, past the
-/// first page of them; the orphan checker notices any it leaves behind.
 #[test]
 fn dropping_blob_columns() {
     rt().block_on(async {
@@ -829,8 +798,6 @@ fn dropping_blob_columns() {
         let s = get_schema(&mut t, "d").await.unwrap();
         let (x, y) = (s.column("x").unwrap().id, s.column("y").unwrap().id);
 
-        // Leftover values of a dropped column, of a deleted row and of a
-        // dropped table are orphans.
         let mut c = begin(&db).await;
         c.delete(row_key(s.id, &[Key::Int(5)])).unwrap();
         assert!(check_no_orphans(&mut c).await.is_err(), "blob of a deleted row not detected");
@@ -849,7 +816,6 @@ fn dropping_blob_columns() {
     });
 }
 
-/// Write `n` rows `{id, g: id % 2}` directly, without per-row checks.
 async fn put_rows(t: &mut Txn, table: &str, ids: std::ops::Range<i64>) {
     let s = get_schema(t, table).await.unwrap();
     let (id, g) = (s.column("id").unwrap().id, s.column("g").unwrap().id);
@@ -867,8 +833,6 @@ fn rg_table() -> CreateTable {
     }))
 }
 
-/// A query reads at most `MAX_EXAMINED_PER_QUERY` entries, then returns a
-/// cursor to continue from, even with no matching rows yet.
 #[test]
 fn queries_examine_a_bounded_number_of_rows() {
     rt().block_on(async {
@@ -888,7 +852,6 @@ fn queries_examine_a_bounded_number_of_rows() {
     });
 }
 
-/// Index backfill reads every row, in batches bounded by rows and by bytes.
 #[test]
 fn index_backfill_reads_every_row() {
     rt().block_on(async {
@@ -899,8 +862,6 @@ fn index_backfill_reads_every_row() {
         create_table(&mut t, &rg_table()).await.unwrap();
         put_rows(&mut t, "r", 0..1001).await;
         db.commit(t.into_request()).await.unwrap();
-        // Commits a byte-bounded build of 1001 entries makes: the one that
-        // adds the index, then a batch each time `batch_bytes` fill.
         let byte_batches = |entry: &dyn Fn(i64) -> usize| {
             let (mut batches, mut bytes) = (1, 0);
             for i in 0..1001 {
@@ -913,8 +874,7 @@ fn index_backfill_reads_every_row() {
             1 + batches
         };
         let int = |i: i64| tuple::encode(&[Key::Int(i)]).len();
-        // Index keys are a 9-byte prefix and the indexed tuple; a unique
-        // index stores the primary key as the value, others append it.
+        // 9-byte index prefix plus encoded key and primary key tuples.
         let plain = byte_batches(&|i| 9 + int(i % 2) + int(i));
         let unique = byte_batches(&|i| 9 + int(i) + int(i));
         for (name, columns, is_unique, opts, commits) in [
@@ -973,7 +933,6 @@ async fn people(seed: u64, n: i64) -> Arc<Db> {
     db
 }
 
-/// Start building `spec` without backfilling anything yet.
 async fn start_build(db: &Arc<Db>, spec: &IndexSpec) -> IndexDef {
     let mut t = begin(db).await;
     let idx = begin_index(&mut t, "p", spec).await.unwrap();
@@ -981,7 +940,6 @@ async fn start_build(db: &Arc<Db>, spec: &IndexSpec) -> IndexDef {
     idx
 }
 
-/// Run one backfill batch; `Some` once the index is ready.
 async fn build_step(db: &Arc<Db>, idx: &IndexDef) -> Result<Option<TableSchema>> {
     let mut t = begin(db).await;
     let r = backfill_batch(&mut t, "p", idx, small()).await?;
@@ -995,8 +953,6 @@ async fn check(db: &Arc<Db>) {
     check_no_orphans(&mut t).await.unwrap();
 }
 
-/// Row inserts, updates and deletes between and during backfill batches,
-/// ahead of and behind its cursor, leave a complete index.
 #[test]
 fn backfill_races_row_writes() {
     rt().block_on(async {
@@ -1030,8 +986,6 @@ fn backfill_races_row_writes() {
                         Err(Error::AlreadyExists(_)) if unique => continue,
                         Err(e) => panic!("row write failed: {e}"),
                     }
-                    // Some writes overlap a batch: they begin before it
-                    // and commit after it (or conflict with it).
                     if r.chance(0.3) {
                         let done = build_step(&db, &idx).await.unwrap();
                         match db.commit(t.into_request()).await {
@@ -1062,8 +1016,6 @@ fn backfill_races_row_writes() {
     });
 }
 
-/// Abandoning a build removes only an index still building: one that
-/// another driver finished meanwhile stays.
 #[test]
 fn abandoning_leaves_finished_indexes_alone() {
     rt().block_on(async {
@@ -1097,8 +1049,6 @@ fn abandoning_leaves_finished_indexes_alone() {
     });
 }
 
-/// A unique index over duplicate values is removed again, whether the
-/// duplicates predate the build or are written behind its cursor.
 #[test]
 fn unique_violations_abandon_the_build() {
     rt().block_on(async {
@@ -1115,8 +1065,6 @@ fn unique_violations_abandon_the_build() {
         drop(t);
         check(&db).await;
 
-        // Behind the cursor, a write that duplicates a backfilled value is
-        // refused like on a ready index.
         let mut t = begin(&db).await;
         delete(&mut t, "p", &json!(100)).await.unwrap();
         db.commit(t.into_request()).await.unwrap();
@@ -1125,7 +1073,6 @@ fn unique_violations_abandon_the_build() {
         let mut t = begin(&db).await;
         let e = insert(&mut t, &blobs, "p", &json!({"id": 101, "email": "e0"}), InsertMode::Insert).await;
         assert!(matches!(e, Err(Error::AlreadyExists(_))), "{e:?}");
-        // Ahead of it, the duplicate is found by the backfill.
         insert(&mut t, &blobs, "p", &json!({"id": 102, "email": "e39"}), InsertMode::Insert).await.unwrap();
         db.commit(t.into_request()).await.unwrap();
         check(&db).await;
@@ -1135,8 +1082,6 @@ fn unique_violations_abandon_the_build() {
     });
 }
 
-/// An interrupted build is resumed by adding the same index again; a
-/// different index of the same name is refused meanwhile.
 #[test]
 fn interrupted_builds_resume() {
     rt().block_on(async {
@@ -1152,7 +1097,6 @@ fn interrupted_builds_resume() {
         let i = s.index("by_g").unwrap();
         assert_eq!((i.id, i.state), (idx.id, IndexState::Ready), "the same index was finished");
         check(&db).await;
-        // A second driver of the same build finds it finished.
         assert_eq!(
             build_step(&db, &idx).await.unwrap().map(|s| s.index("by_g").unwrap().state),
             Some(IndexState::Ready)
@@ -1161,8 +1105,6 @@ fn interrupted_builds_resume() {
     });
 }
 
-/// Dropping a building index (or its table) stops the build and leaves
-/// nothing behind.
 #[test]
 fn dropping_a_building_index_stops_its_build() {
     rt().block_on(async {
@@ -1187,7 +1129,6 @@ fn dropping_a_building_index_stops_its_build() {
     });
 }
 
-/// Queries cannot use an index before its backfill finishes.
 #[test]
 fn building_indexes_cannot_be_queried() {
     rt().block_on(async {
@@ -1206,8 +1147,6 @@ fn building_indexes_cannot_be_queried() {
     });
 }
 
-/// The checker for building indexes rejects entries missing behind the
-/// cursor and stale entries anywhere.
 #[test]
 fn building_index_checker_rejects_corruption() {
     rt().block_on(async {
@@ -1232,7 +1171,6 @@ fn building_index_checker_rejects_corruption() {
     });
 }
 
-/// `people`: unique `by_email`, and `by_age`.
 fn members_table() -> CreateTable {
     table_def(json!({
         "name": "people",
@@ -1246,11 +1184,6 @@ fn members_table() -> CreateTable {
     }))
 }
 
-/// Rows written with a time to live expire, at their commit's time plus
-/// the TTL, together with their index entries and blob columns: a unique
-/// value is free again once its row expired, and an expired row's newer
-/// version never brings an older one back. Updates keep a row's expiry
-/// unless they set one, and the batch operations see only live rows.
 #[test]
 fn rows_expire_with_their_index_entries() {
     rt().block_on(async {
@@ -1266,7 +1199,6 @@ fn rows_expire_with_their_index_entries() {
             .await
             .unwrap();
         db.commit(t.into_request()).await.unwrap();
-        // Replace row 1 with a version that expires, and add a second.
         let mut t = begin(&db).await;
         let up = InsertMode::Upsert;
         insert_expiring(&mut t, &blobs, "people", &json!({"id": 1, "email": "a@x", "age": 2}), up, ttl(10_000))
@@ -1275,7 +1207,6 @@ fn rows_expire_with_their_index_entries() {
         insert_expiring(&mut t, &blobs, "people", &json!({"id": 2, "email": "b@x", "age": 3}), up, ttl(10_000))
             .await
             .unwrap();
-        // A partial update in the same transaction keeps the TTL.
         assert!(update(&mut t, &blobs, "people", &json!(2), &json!({"age": 4})).await.unwrap());
         let c = db.commit_detailed(t.into_request()).await.unwrap();
         let expires = c.time_ms + 10_000;
@@ -1285,7 +1216,6 @@ fn rows_expire_with_their_index_entries() {
             Some((json!(4), Some(expires)))
         );
         check_indexes(&mut t, "people").await.unwrap();
-        // Extend row 2's life; row 1 keeps its expiry through an update.
         let mut t = begin(&db).await;
         assert!(update(&mut t, &blobs, "people", &json!(1), &json!({"age": 5})).await.unwrap());
         assert!(
@@ -1324,8 +1254,6 @@ fn rows_expire_with_their_index_entries() {
     });
 }
 
-/// Batch operations check what they would write before selecting, select
-/// before writing, and stay within the transaction's write limit.
 #[test]
 fn batch_row_operations() {
     rt().block_on(async {
@@ -1359,8 +1287,6 @@ fn batch_row_operations() {
         let r = update_where(&mut t, &blobs, "people", &sel(json!({"index": "nope"})), &json!({}), Expiry::Keep, None)
             .await;
         assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
-        // Raising every age by moving rows forward in the index they are
-        // selected through updates each row once.
         let by_age = sel(json!({"index": "by_age", "range": {"gte": 1}}));
         let n =
             update_where(&mut t, &blobs, "people", &by_age, &json!({"age": 7}), Expiry::Keep, Some(6)).await.unwrap();
@@ -1380,8 +1306,6 @@ fn batch_row_operations() {
             .iter()
             .map(|r| r["age"].as_i64().unwrap())
             .collect();
-        // By (age, id): the five of age 1 and the first of age 2 got 7, then
-        // the next three of age 2 got 8.
         assert_eq!(ages.iter().filter(|a| **a == 7).count(), 6, "{ages:?}");
         assert_eq!(ages.iter().filter(|a| **a == 8).count(), 3, "{ages:?}");
         let dup = update_where(
@@ -1414,8 +1338,6 @@ fn batch_row_operations() {
     });
 }
 
-/// The row feed reports each changed row's state, or its deletion, in
-/// version order, and pages through them.
 #[test]
 fn row_changes_follow_writes() {
     rt().block_on(async {

@@ -1,9 +1,4 @@
-//! A small JSON-Schema (subset) validator used to check every simulated
-//! response against `openapi.json`, plus route-coverage helpers.
-//!
-//! Supported keywords: `$ref` (local), `type` (string or array),
-//! `properties`, `required`, `additionalProperties` (bool or schema),
-//! `items`, `enum`, `oneOf`, `anyOf`, `nullable`-style `type: [.., "null"]`.
+//! OpenAPI response validator and route coverage tracker.
 
 use super::SimResponse;
 use serde_json::Value as Json;
@@ -99,7 +94,6 @@ pub fn validate(root: &Json, schema: &Json, v: &Json, path: &str) -> Result<(), 
 static COVERAGE: std::sync::Mutex<std::collections::BTreeSet<(String, String)>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// Record that a documented operation was exercised (process-wide).
 pub fn record_coverage(method: &str, path: &str) {
     if let Some((tpl, item)) = match_path(doc(), path) {
         let m = method.to_ascii_lowercase();
@@ -109,12 +103,11 @@ pub fn record_coverage(method: &str, path: &str) {
     }
 }
 
-/// Documented operations exercised so far in this process.
 pub fn coverage() -> std::collections::BTreeSet<(String, String)> {
     COVERAGE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Every documented (path template, method).
+/// Returns all `(path_template, method)` pairs in the OpenAPI document.
 pub fn documented_operations() -> std::collections::BTreeSet<(String, String)> {
     let mut out = std::collections::BTreeSet::new();
     for (p, item) in doc()["paths"].as_object().into_iter().flatten() {
@@ -125,7 +118,6 @@ pub fn documented_operations() -> std::collections::BTreeSet<(String, String)> {
     out
 }
 
-/// Match a concrete path against the document's path templates.
 pub fn match_path<'a>(root: &'a Json, path: &str) -> Option<(&'a str, &'a Json)> {
     let path = path.split('?').next().unwrap_or(path);
     let segs: Vec<&str> = path.trim_end_matches('/').split('/').collect();
@@ -154,9 +146,7 @@ pub fn match_path<'a>(root: &'a Json, path: &str) -> Option<(&'a str, &'a Json)>
     best.map(|(t, i, _)| (t, i))
 }
 
-/// Validate a JSON response against the documented schema for its route,
-/// method and status code. Non-JSON responses and undocumented paths that
-/// are not part of the API (console, internal) are skipped.
+/// Validates a `/v1/` JSON response against the OpenAPI schema for its route, method, and status.
 pub fn check_response(method: &str, path: &str, resp: &SimResponse) -> Result<(), String> {
     let p = path.split('?').next().unwrap_or(path);
     if !p.starts_with("/v1/") {

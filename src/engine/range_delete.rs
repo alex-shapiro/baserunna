@@ -8,7 +8,7 @@ use bytes::Bytes;
 use std::collections::BTreeSet;
 use std::ops::Bound;
 
-/// Represents a range deletion for keys in `[start, end)` (`None` for unbounded) at sequence `seq`.
+/// A range deletion for keys in `[start, end)`, or `[start, ∞)` when `end` is `None`, at sequence `seq`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangeTombstone {
     pub start: Bytes,

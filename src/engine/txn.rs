@@ -91,20 +91,17 @@ impl WriteSet {
 #[derive(Clone, Debug)]
 pub struct CommitRequest {
     pub commit_id: u64,
-    /// The committer refuses (without applying) after this instant, which
-    /// bounds how long a request can linger server-side. `None` = the
-    /// engine's `commit_timeout_ms` after enqueueing.
+    /// Instant after which the committer rejects this request without applying it.
+    /// Defaults to `commit_timeout_ms` after enqueueing when `None`.
     pub deadline: Option<tokio::time::Instant>,
     pub read_version: Seq,
-    /// The store time the transaction read at: its view of what had
-    /// expired. The commit's version time is never earlier.
+    /// Store time at which the transaction evaluated expiries.
     pub read_time: u64,
-    /// The earliest expiry among values the transaction read that
-    /// validation covers: the commit fails if that has passed by its time.
+    /// Earliest expiry among values read by the transaction that validation covers.
     pub read_expiry: Option<u64>,
     pub isolation: Isolation,
     pub reads: Vec<ReadItem>,
-    /// Reads validated under every isolation level (see [`Txn::get_pinned`]).
+    /// Reads validated under every isolation level; see [`Txn::get_pinned`].
     pub pinned_reads: Vec<Bytes>,
     pub writes: WriteSet,
 }
@@ -114,15 +111,14 @@ pub struct CommitRequest {
 pub struct ReadValue {
     pub key: Bytes,
     pub value: Value,
-    /// `None` if the value was written by this (uncommitted) transaction.
+    /// `None` if the value was written by this transaction.
     pub seq: Option<Seq>,
-    /// When the value expires: at a store time once committed, or as the
-    /// transaction's own write asked.
+    /// Expiration policy of the value.
     pub ttl: Option<Ttl>,
 }
 
 impl ReadValue {
-    /// When the value expires (store ms), if it does and that is known.
+    /// Absolute expiration timestamp in store milliseconds, if known.
     pub fn expires(&self) -> Option<u64> {
         match self.ttl {
             Some(Ttl::Until(e)) => Some(e),
@@ -138,8 +134,7 @@ pub struct Txn {
     pub isolation: Isolation,
     pub reads: Vec<ReadItem>,
     pinned_reads: Vec<Bytes>,
-    /// Earliest expiry among the stored values read, all reads and pinned
-    /// reads alone.
+    /// Earliest expiry among all stored values read, and among pinned reads alone.
     read_expiry: Option<u64>,
     pinned_expiry: Option<u64>,
     pub writes: WriteSet,
@@ -184,17 +179,15 @@ impl Txn {
         self.writes.range_deletes.iter().any(|r| r.contains(k))
     }
 
-    /// A value the transaction wrote.
     fn own(key: &[u8], p: &Option<Put>) -> Option<ReadValue> {
         p.clone().map(|p| ReadValue { key: Bytes::copy_from_slice(key), value: p.value, seq: None, ttl: p.ttl })
     }
 
-    /// A value read from the snapshot.
     fn stored(e: super::types::Entry) -> ReadValue {
         ReadValue { key: e.key, value: e.value, seq: Some(e.seq), ttl: e.expires.map(Ttl::Until) }
     }
 
-    /// Point read (records the read).
+    /// Reads `key`, recording it in the transaction's read set.
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<ReadValue>> {
         if let Some(p) = self.writes.puts.get(key) {
             return Ok(Txn::own(key, p));
@@ -210,9 +203,7 @@ impl Txn {
         Ok(found.map(Txn::stored))
     }
 
-    /// Point read that the commit validates even under snapshot isolation:
-    /// for data the transaction's writes are derived from, such as a table
-    /// schema that decides which index entries a row write maintains.
+    /// Reads `key` and validates it at commit time under all isolation levels.
     pub async fn get_pinned(&mut self, key: &[u8]) -> Result<Option<ReadValue>> {
         self.pinned_reads.push(Bytes::copy_from_slice(key));
         let r = self.get(key).await?;
@@ -222,8 +213,7 @@ impl Txn {
         Ok(r)
     }
 
-    /// Range read with read-your-writes. Records the interval actually
-    /// covered (up to the last returned key when `limit` is hit).
+    /// Scans `range` with read-your-writes, recording the scanned interval in the read set.
     pub async fn scan(&mut self, range: &KeyRange, reverse: bool, limit: usize) -> Result<Vec<ReadValue>> {
         let mut out: Vec<ReadValue> = Vec::new();
         if limit == 0 || range.is_empty() {
@@ -233,7 +223,6 @@ impl Txn {
         let mut window = range.clone();
         loop {
             let snap = self.snapshot.scan(&window, reverse, batch, self.read_time).await?;
-            // Where this round stopped, unless it exhausted the window.
             let last = snap.last().filter(|_| snap.len() == batch).map(|e| e.key.clone());
             let examined = match &last {
                 None => window.clone(),
@@ -282,7 +271,6 @@ impl Txn {
                 self.reads.push(ReadItem::Range(range.clone()));
                 return Ok(out);
             };
-            // Continue after the examined part.
             window = if reverse {
                 KeyRange::new(window.start.clone(), Bound::Excluded(k))
             } else {
@@ -296,7 +284,6 @@ impl Txn {
         self.max_write_bytes.saturating_sub(self.write_bytes)
     }
 
-    /// Keys of commit records are the engine's own.
     fn writable(key: &[u8]) -> Result<()> {
         match is_commit_key(key) {
             true => Err(Error::internal("writes to the commit record keyspace")),
@@ -316,7 +303,7 @@ impl Txn {
         self.put_expiring(key, value, None)
     }
 
-    /// Write `value`, to expire as `ttl` says.
+    /// Writes `value` with an optional expiration policy `ttl`.
     pub fn put_expiring(&mut self, key: Bytes, value: Value, ttl: Option<Ttl>) -> Result<()> {
         Txn::writable(&key)?;
         self.account(key.len() + value.size() + if ttl.is_some() { 8 } else { 0 })?;
@@ -331,7 +318,7 @@ impl Txn {
         Ok(())
     }
 
-    /// Delete every key in `range` (commit records aside).
+    /// Deletes all user keys in `range`.
     pub fn delete_range(&mut self, range: KeyRange) -> Result<()> {
         let range = range.intersect(&KeyRange::data());
         if range.is_empty() {

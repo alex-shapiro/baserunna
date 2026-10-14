@@ -1,5 +1,4 @@
-//! Credentials: password hashing, opaque tokens, and Google OpenID Connect
-//! ID-token verification. See SPEC §9.
+//! Password hashing, opaque tokens, and Google OpenID Connect ID-token verification.
 
 use crate::env::Env;
 use crate::error::{Error, Result};
@@ -11,7 +10,7 @@ use std::num::NonZeroU32;
 pub const SESSION_PREFIX: &str = "brs_";
 pub const API_KEY_PREFIX: &str = "brk_";
 
-/// `pbkdf2-sha256$<iters>$<salt b64>$<hash b64>`.
+/// Hashes `password` as `pbkdf2-sha256$<iters>$<salt b64>$<hash b64>`.
 pub fn hash_password(env: &Env, password: &str, iterations: u32) -> String {
     let salt = env.random_bytes(16);
     let iters = NonZeroU32::new(iterations.max(1)).unwrap_or(NonZeroU32::MIN);
@@ -52,19 +51,19 @@ pub fn normalize_email(e: &str) -> Result<String> {
     Ok(e)
 }
 
-/// SHA-256 of a secret, hex encoded (what we store).
+/// Hex-encoded SHA-256 digest of `secret`.
 pub fn secret_hash(secret: &str) -> String {
     b64::hex(&sha256(secret.as_bytes()))
 }
 
-/// A new session token and its stored hash.
+/// Generates a session token and its hex-encoded SHA-256 hash.
 pub fn new_session_token(env: &Env) -> (String, String) {
     let t = format!("{SESSION_PREFIX}{}", b64::encode_url(&env.random_bytes(32)));
     let h = secret_hash(&t);
     (t, h)
 }
 
-/// A new API key: (full key, id, secret hash).
+/// Generates an API key, returning `(full_key, id, secret_hash)`.
 pub fn new_api_key(env: &Env) -> (String, String, String) {
     let id = env.random_hex(8);
     let secret = b64::encode_url(&env.random_bytes(32));
@@ -72,7 +71,7 @@ pub fn new_api_key(env: &Env) -> (String, String, String) {
     (full, id, secret_hash(&secret))
 }
 
-/// Split `brk_<id>_<secret>`.
+/// Splits an API key of the form `brk_<id>_<secret>` into `(id, secret)`.
 pub fn parse_api_key(k: &str) -> Option<(&str, &str)> {
     let rest = k.strip_prefix(API_KEY_PREFIX)?;
     let (id, secret) = rest.split_once('_')?;
@@ -86,7 +85,7 @@ pub fn verify_api_secret(secret: &str, stored_hash: &str) -> bool {
     ct_eq(secret_hash(secret).as_bytes(), stored_hash.as_bytes())
 }
 
-/// Signed, expiring value: `<payload>.<expiry ms>.<hmac b64url>`.
+/// Signs `payload` with an expiration timestamp as `<payload>.<expiry ms>.<hmac b64url>`.
 pub fn sign_value(key: &[u8], payload: &str, expires_ms: u64) -> String {
     let msg = format!("{payload}.{expires_ms}");
     let mac = hmac_sha256(key, msg.as_bytes());
@@ -105,7 +104,42 @@ pub fn verify_signed(key: &[u8], signed: &str, now_ms: u64) -> Option<String> {
     Some(payload.to_string())
 }
 
-// ------------------------------------------------------------------ OIDC
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenPurpose {
+    Verify,
+    Reset,
+}
+
+impl TokenPurpose {
+    fn tag(self) -> &'static str {
+        match self {
+            TokenPurpose::Verify => "verify",
+            TokenPurpose::Reset => "reset",
+        }
+    }
+}
+
+/// Computes a short digest binding a token to a mutable value such as an email or password hash.
+pub fn fingerprint(s: &str) -> String {
+    b64::hex(&sha256(format!("fp:{s}").as_bytes())[..8])
+}
+
+/// Creates a signed, URL-safe token for `purpose` bound to `subject` and `fp`.
+pub fn sign_token(key: &[u8], purpose: TokenPurpose, subject: &str, fp: &str, expires_ms: u64) -> String {
+    b64::encode_url(sign_value(key, &format!("{}:{subject}:{fp}", purpose.tag()), expires_ms).as_bytes())
+}
+
+/// Verifies `token` for `purpose` at `now_ms`, returning `(subject, fingerprint)`.
+pub fn open_token(key: &[u8], purpose: TokenPurpose, token: &str, now_ms: u64) -> Option<(String, String)> {
+    let signed = String::from_utf8(b64::decode_url(token)?).ok()?;
+    let payload = verify_signed(key, &signed, now_ms)?;
+    let mut parts = payload.splitn(3, ':');
+    if parts.next()? != purpose.tag() {
+        return None;
+    }
+    let (subject, fp) = (parts.next()?, parts.next()?);
+    (!subject.is_empty()).then(|| (subject.to_string(), fp.to_string()))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdClaims {
@@ -114,15 +148,13 @@ pub struct IdClaims {
     pub email_verified: bool,
 }
 
-/// Provider abstraction so the simulator can stand in for Google.
+/// OpenID Connect provider interface.
 pub trait OidcProvider: Send + Sync + 'static {
     fn client_id(&self) -> &str;
     fn issuers(&self) -> &[String];
-    /// Authorization URL to redirect the browser to.
     fn authorize_url(&self, state: &str, redirect_uri: &str) -> String;
-    /// Exchange an authorization code for an ID token (JWT).
+    /// Exchanges an authorization code for a signed ID token.
     fn exchange_code<'a>(&'a self, code: &'a str, redirect_uri: &'a str) -> BoxFut<'a, Result<String>>;
-    /// Current JWKS document.
     fn jwks(&self) -> BoxFut<'_, Result<Json>>;
 }
 
@@ -131,7 +163,7 @@ fn jwt_part(s: &str) -> Result<Json> {
     serde_json::from_slice(&b).map_err(|_| Error::Unauthenticated("malformed ID token".into()))
 }
 
-/// Verify an RS256 ID token against a JWKS document.
+/// Verifies an RS256 ID token against `jwks`.
 pub fn verify_id_token(token: &str, jwks: &Json, client_id: &str, issuers: &[String], now_ms: u64) -> Result<IdClaims> {
     let unauth = |m: &str| Error::Unauthenticated(format!("ID token rejected: {m}"));
     let parts: Vec<&str> = token.split('.').collect();
@@ -186,7 +218,7 @@ pub fn verify_id_token(token: &str, jwks: &Json, client_id: &str, issuers: &[Str
     Ok(IdClaims { sub, email: normalize_email(email)?, email_verified })
 }
 
-/// Google as an OIDC provider (real network calls; requires `cloud`).
+/// Google OpenID Connect provider.
 #[cfg(feature = "cloud")]
 pub struct GoogleOidc {
     pub client_id: String,
@@ -331,5 +363,52 @@ mod tests {
         assert!(verify_signed(b"key", &s, 1001).is_none());
         assert!(verify_signed(b"other", &s, 0).is_none());
         assert!(verify_signed(b"key", "a.b", 0).is_none());
+    }
+
+    #[test]
+    fn mailed_link_tokens() {
+        let fp = fingerprint("pbkdf2-sha256$1$x$y");
+        let t = sign_token(b"key", TokenPurpose::Reset, "u1", &fp, 1000);
+        assert!(t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'), "URL-safe: {t}");
+        assert_eq!(open_token(b"key", TokenPurpose::Reset, &t, 1000), Some(("u1".into(), fp.clone())));
+        assert_eq!(open_token(b"key", TokenPurpose::Verify, &t, 0), None, "a reset token does not verify email");
+        assert_eq!(open_token(b"key", TokenPurpose::Reset, &t, 1001), None, "expired");
+        assert_eq!(open_token(b"other", TokenPurpose::Reset, &t, 0), None, "another server's key");
+        let mut forged = b64::decode_url(&t).unwrap();
+        forged[6] ^= 1;
+        assert_eq!(open_token(b"key", TokenPurpose::Reset, &b64::encode_url(&forged), 0), None, "tampered");
+        assert_ne!(fingerprint("a@b.co"), fingerprint("a@b.com"));
+    }
+
+    #[test]
+    fn fuzz_tokens() {
+        let mut r = crate::util::rng::Rng::new(11);
+        let valid: Vec<(String, (String, String))> = (0..8)
+            .map(|i| {
+                let (subject, fp) = (format!("user-{i}"), fingerprint(&format!("v{i}")));
+                let purpose = if i % 2 == 0 { TokenPurpose::Reset } else { TokenPurpose::Verify };
+                (sign_token(b"key", purpose, &subject, &fp, 10_000), (subject, fp))
+            })
+            .collect();
+        let pieces = ["", ".", ":", "reset", "verify", "AA", "_-", "=", "é", "\u{0}", "999999999999999999999"];
+        for _ in 0..20_000 {
+            let (input, want) = if r.chance(0.5) {
+                let (t, want) = &valid[r.usize(valid.len())];
+                let mut b = t.clone().into_bytes();
+                for _ in 0..1 + r.usize(3) {
+                    let i = r.usize(b.len());
+                    b[i] = b"ABCxyz019-_.:"[r.usize(13)];
+                }
+                (String::from_utf8_lossy(&b).into_owned(), Some(want.clone()))
+            } else {
+                ((0..r.usize(8)).map(|_| pieces[r.usize(pieces.len())]).collect(), None)
+            };
+            for purpose in [TokenPurpose::Reset, TokenPurpose::Verify] {
+                if let Some(opened) = open_token(b"key", purpose, &input, 0) {
+                    assert_eq!(Some(&opened), want.as_ref(), "{input:?} opened as {opened:?}");
+                }
+            }
+            let _ = verify_signed(b"key", &input, 0);
+        }
     }
 }

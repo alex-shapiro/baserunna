@@ -279,6 +279,7 @@
       },
       "DbInfo": {
         "additionalProperties": false,
+        "description": "`role` is what you may do here: readers read, writers also write, admins also delete the database.",
         "properties": {
           "created_at": {
             "type": "integer"
@@ -289,65 +290,101 @@
           "name": {
             "type": "string"
           },
+          "org": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
           "stats": {
-            "additionalProperties": false,
-            "properties": {
-              "lease_holder": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "quota_bytes": {
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "segment_bytes": {
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "segments": {
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "size_bytes": {
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "tail_bytes": {
-                "type": [
-                  "integer",
-                  "null"
-                ]
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": [
-              "version"
-            ],
-            "type": "object"
+            "$ref": "#/components/schemas/DbStats"
           }
         },
         "required": [
           "id",
           "name",
+          "org",
+          "role",
           "created_at",
           "stats"
         ],
         "type": "object"
       },
+      "DbStats": {
+        "additionalProperties": false,
+        "description": "The database at the version read (at most 5 s stale). `levels` lists segments by level, shallowest first; `size_bytes` (blobs included) counts against `quota_bytes`.",
+        "properties": {
+          "blob_bytes": {
+            "type": "integer"
+          },
+          "lease_expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "lease_holder": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "levels": {
+            "items": {
+              "$ref": "#/components/schemas/LevelStats"
+            },
+            "type": "array"
+          },
+          "pending_gc_objects": {
+            "type": "integer"
+          },
+          "quota_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "range_tombstones": {
+            "type": "integer"
+          },
+          "size_bytes": {
+            "type": "integer"
+          },
+          "tail_bytes": {
+            "type": "integer"
+          },
+          "tail_entries": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "type": "integer"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "levels",
+          "tail_entries",
+          "tail_bytes",
+          "range_tombstones",
+          "blob_bytes",
+          "pending_gc_objects",
+          "lease_holder",
+          "lease_expires_at",
+          "updated_at",
+          "size_bytes",
+          "quota_bytes"
+        ],
+        "type": "object"
+      },
       "DbSummary": {
         "additionalProperties": false,
+        "description": "`org` is the owning organization (null for your own databases).",
         "properties": {
           "created_at": {
             "type": "integer"
@@ -357,11 +394,18 @@
           },
           "name": {
             "type": "string"
+          },
+          "org": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "id",
           "name",
+          "org",
           "created_at"
         ],
         "type": "object"
@@ -698,6 +742,30 @@
         ],
         "type": "object"
       },
+      "LevelStats": {
+        "additionalProperties": false,
+        "properties": {
+          "bytes": {
+            "type": "integer"
+          },
+          "entries": {
+            "type": "integer"
+          },
+          "level": {
+            "type": "integer"
+          },
+          "segments": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "level",
+          "segments",
+          "bytes",
+          "entries"
+        ],
+        "type": "object"
+      },
       "Me": {
         "additionalProperties": false,
         "properties": {
@@ -742,6 +810,30 @@
         "required": [
           "user",
           "credential"
+        ],
+        "type": "object"
+      },
+      "Member": {
+        "additionalProperties": false,
+        "properties": {
+          "added_at": {
+            "type": "integer"
+          },
+          "email": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "user_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "email",
+          "role",
+          "added_at"
         ],
         "type": "object"
       },
@@ -1219,6 +1311,47 @@
         ],
         "type": "object"
       },
+      "Org": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "role",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "PasswordChange": {
+        "additionalProperties": false,
+        "description": "`current_password` is required for accounts that have a password.",
+        "properties": {
+          "current_password": {
+            "type": "string"
+          },
+          "new_password": {
+            "minLength": 8,
+            "type": "string"
+          }
+        },
+        "required": [
+          "new_password"
+        ],
+        "type": "object"
+      },
       "PkRequest": {
         "additionalProperties": false,
         "properties": {
@@ -1310,6 +1443,15 @@
           "version"
         ],
         "type": "object"
+      },
+      "Role": {
+        "enum": [
+          "reader",
+          "writer",
+          "admin",
+          "owner"
+        ],
+        "type": "string"
       },
       "Row": {
         "additionalProperties": true,
@@ -1480,6 +1622,48 @@
         ],
         "type": "object"
       },
+      "SessionInfo": {
+        "additionalProperties": false,
+        "description": "A signed-in session: `client` is the address that signed in, `current` the session making the request.",
+        "properties": {
+          "client": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "current": {
+            "type": "boolean"
+          },
+          "expires_at": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "method": {
+            "enum": [
+              "signup",
+              "password",
+              "google",
+              "reset"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "expires_at",
+          "client",
+          "method",
+          "current"
+        ],
+        "type": "object"
+      },
       "TableSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1632,6 +1816,9 @@
           "email": {
             "type": "string"
           },
+          "email_verified": {
+            "type": "boolean"
+          },
           "google_linked": {
             "type": "boolean"
           },
@@ -1648,7 +1835,12 @@
         "required": [
           "id",
           "email",
-          "is_admin"
+          "email_verified",
+          "is_admin",
+          "disabled",
+          "has_password",
+          "google_linked",
+          "created_at"
         ],
         "type": "object"
       },
@@ -1673,7 +1865,7 @@
     }
   },
   "info": {
-    "description": "Transactional key-value and table databases on object storage. Authenticate with `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for writes). Requests over a rate limit get 429 `rate_limited` with `Retry-After` and were not applied; writes that would take a database past its size quota get 507 `quota_exceeded`.",
+    "description": "Transactional key-value and table databases on object storage. Authenticate with `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for writes). Requests over a rate limit get 429 `rate_limited` with `Retry-After` and were not applied; writes that would take a database past its size quota get 507 `quota_exceeded`. Every response carries an `x-request-id` header: the client's own (1-64 characters of `[A-Za-z0-9._:-]`) or a new one, which the server's logs record on every node the request reaches.",
     "title": "Baserunna",
     "version": "0.1.0"
   },
@@ -1777,6 +1969,28 @@
     },
     "/v1/admin/users": {
       "get": {
+        "parameters": [
+          {
+            "description": "Page size (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -1784,6 +1998,12 @@
                 "schema": {
                   "additionalProperties": false,
                   "properties": {
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "users": {
                       "items": {
                         "$ref": "#/components/schemas/UserPublic"
@@ -1792,7 +2012,8 @@
                     }
                   },
                   "required": [
-                    "users"
+                    "users",
+                    "next_cursor"
                   ],
                   "type": "object"
                 }
@@ -1863,6 +2084,28 @@
     },
     "/v1/api-keys": {
       "get": {
+        "parameters": [
+          {
+            "description": "Page size (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -1875,10 +2118,17 @@
                         "$ref": "#/components/schemas/ApiKey"
                       },
                       "type": "array"
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
-                    "api_keys"
+                    "api_keys",
+                    "next_cursor"
                   ],
                   "type": "object"
                 }
@@ -2097,6 +2347,99 @@
         ]
       }
     },
+    "/v1/auth/password-reset": {
+      "post": {
+        "description": "Mails a reset link valid for an hour if an account has this email. The answer does not say whether one does. 404 if the server cannot send mail.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "email": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "email"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Empty"
+                }
+              }
+            },
+            "description": "Requested"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [],
+        "summary": "Request a password reset",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/password-reset/confirm": {
+      "post": {
+        "description": "Sets the password, verifies the email address and ends every session. The link works once.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "password": {
+                    "minLength": 8,
+                    "type": "string"
+                  },
+                  "token": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "token",
+                  "password"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "A new session"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [],
+        "summary": "Reset a password",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
     "/v1/auth/signup": {
       "post": {
         "description": "Subject to the server's sign-up policy. The first account becomes an administrator.",
@@ -2132,8 +2475,84 @@
         ]
       }
     },
+    "/v1/auth/verify-email": {
+      "post": {
+        "description": "The token comes from the link mailed by `POST /v1/me/verify-email` or at sign-up.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "token": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "token"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Empty"
+                }
+              }
+            },
+            "description": "Verified"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [],
+        "summary": "Verify an email address",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
     "/v1/dbs": {
       "get": {
+        "description": "An API key limited to one database lists just that database, and cannot list an organization's.",
+        "parameters": [
+          {
+            "description": "An organization you belong to (default: your own databases)",
+            "in": "query",
+            "name": "org",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -2146,10 +2565,17 @@
                         "$ref": "#/components/schemas/DbSummary"
                       },
                       "type": "array"
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
-                    "databases"
+                    "databases",
+                    "next_cursor"
                   ],
                   "type": "object"
                 }
@@ -2161,12 +2587,13 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "List your databases",
+        "summary": "List your or an organization's databases",
         "tags": [
           "databases"
         ]
       },
       "post": {
+        "description": "With `org`, the database belongs to that organization (you must be one of its admins); address it as `org.name`.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -2175,6 +2602,9 @@
                 "properties": {
                   "name": {
                     "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$",
+                    "type": "string"
+                  },
+                  "org": {
                     "type": "string"
                   }
                 },
@@ -2210,10 +2640,10 @@
     },
     "/v1/dbs/{db}": {
       "delete": {
-        "description": "Immediately invisible everywhere; storage is purged after a grace period. The name can be reused at once.",
+        "description": "Immediately invisible everywhere; storage is purged after a grace period. The name can be reused at once. In an organization, admins and owners may delete databases.",
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -2245,7 +2675,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -2279,7 +2709,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -2324,7 +2754,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -2380,7 +2810,7 @@
         "description": "For each key changed after `after`, its state as of the feed's snapshot (intermediate values are not reported), ordered by version. Continue from `next_cursor`, at once while `more` is true. With `wait_ms`, the request waits for a change if there is none. Deletions are kept at least a transaction lifetime (5 minutes); a cursor older than the deletions still kept gets `410 cursor_expired`, and the client should read the current state again and follow on from its `version`.",
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -2513,7 +2943,7 @@
         "description": "Fences in-flight attempts first, so the answer is final for commits whose request has ended (wait at least the commit deadline, about 15 s, after an ambiguous failure). Commits are remembered for 10 minutes; ask within that.",
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -2556,7 +2986,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -2688,7 +3118,7 @@
       "delete": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -2738,7 +3168,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -2842,7 +3272,7 @@
         "description": "Large bodies are streamed into an out-of-band blob. Content-Type is preserved for blobs.",
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -2925,7 +3355,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -2995,7 +3425,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3039,7 +3469,7 @@
       "delete": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3080,7 +3510,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3146,7 +3576,7 @@
         "description": "For each key changed after `after`, its state as of the feed's snapshot (intermediate values are not reported), ordered by version. Continue from `next_cursor`, at once while `more` is true. With `wait_ms`, the request waits for a change if there is none. Deletions are kept at least a transaction lifetime (5 minutes); a cursor older than the deletions still kept gets `410 cursor_expired`, and the client should read the current state again and follow on from its `version`.",
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3238,7 +3668,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3291,7 +3721,7 @@
       "delete": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3344,7 +3774,7 @@
         "description": "Adds the index in the `building` state, backfills it from the table's rows in batches of separate transactions while writes continue, and returns once it is `ready`. If the request fails midway, the index stays `building`; repeating the request resumes the backfill. A unique index over duplicate values is removed again and the request fails with `409 already_exists`.",
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3397,7 +3827,7 @@
       "delete": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3449,7 +3879,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3512,7 +3942,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3565,7 +3995,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3618,7 +4048,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3671,7 +4101,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3724,7 +4154,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3768,7 +4198,7 @@
       "delete": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3811,7 +4241,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3855,7 +4285,7 @@
         "description": "Any error aborts the transaction.",
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3909,7 +4339,7 @@
         "description": "Ops execute in order with read-your-writes, atomically. Serializable by default; conflicts are retried server-side. With `idempotency_key`, retries never apply twice (a replay returns `replayed: true` and null results).",
         "parameters": [
           {
-            "description": "Database name (or `id:<db_id>` for administrators).",
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3950,6 +4380,45 @@
       }
     },
     "/v1/me": {
+      "delete": {
+        "description": "Deletes the account with its sessions, API keys, memberships and databases (purged after a grace period). Accounts with a password confirm it. Refused for the last administrator and for the only owner of an organization. Requires a session.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "password": {
+                    "type": "string"
+                  }
+                },
+                "required": [],
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Empty"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Delete your account",
+        "tags": [
+          "auth"
+        ]
+      },
       "get": {
         "responses": {
           "200": {
@@ -3967,6 +4436,204 @@
           }
         },
         "summary": "The authenticated principal",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/me/password": {
+      "post": {
+        "description": "Ends every other session. Requires a session.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Empty"
+                }
+              }
+            },
+            "description": "Changed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Change your password",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/me/sessions": {
+      "delete": {
+        "description": "Requires a session.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "revoked": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "revoked"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Revoked"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Sign out everywhere else",
+        "tags": [
+          "auth"
+        ]
+      },
+      "get": {
+        "description": "Requires a session.",
+        "parameters": [
+          {
+            "description": "Page size (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "sessions": {
+                      "items": {
+                        "$ref": "#/components/schemas/SessionInfo"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "sessions",
+                    "next_cursor"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Sessions"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List your sessions",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/me/sessions/{id}": {
+      "delete": {
+        "description": "`current` says whether it was the session making the request, which is then signed out (its cookie cleared). Requires a session.",
+        "parameters": [
+          {
+            "description": "Session id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "current": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "current"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Revoked"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Revoke a session",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/me/verify-email": {
+      "post": {
+        "description": "Mails a verification link (valid 7 days). 404 if the server cannot send mail.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Empty"
+                }
+              }
+            },
+            "description": "Sent"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Send an email verification link",
         "tags": [
           "auth"
         ]
@@ -3993,6 +4660,413 @@
           "ops"
         ]
       }
+    },
+    "/v1/orgs": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Page size (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "orgs": {
+                      "items": {
+                        "$ref": "#/components/schemas/Org"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "orgs",
+                    "next_cursor"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Organizations"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List your organizations",
+        "tags": [
+          "orgs"
+        ]
+      },
+      "post": {
+        "description": "You become its owner. Requires a session.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "pattern": "^[a-z0-9][a-z0-9_-]{0,38}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Org"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Create an organization",
+        "tags": [
+          "orgs"
+        ]
+      }
+    },
+    "/v1/orgs/{org}": {
+      "delete": {
+        "description": "Owners only, once the organization has no databases.",
+        "parameters": [
+          {
+            "description": "Organization name.",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Empty"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Delete an organization",
+        "tags": [
+          "orgs"
+        ]
+      },
+      "get": {
+        "parameters": [
+          {
+            "description": "Organization name.",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Org"
+                }
+              }
+            },
+            "description": "Org"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "An organization and your role",
+        "tags": [
+          "orgs"
+        ]
+      }
+    },
+    "/v1/orgs/{org}/members": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Organization name.",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "members": {
+                      "items": {
+                        "$ref": "#/components/schemas/Member"
+                      },
+                      "type": "array"
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "members",
+                    "next_cursor"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Members"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List members",
+        "tags": [
+          "orgs"
+        ]
+      },
+      "post": {
+        "description": "Admins add readers, writers and admins; owners also add owners. The account must exist.",
+        "parameters": [
+          {
+            "description": "Organization name.",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "email": {
+                    "type": "string"
+                  },
+                  "role": {
+                    "$ref": "#/components/schemas/Role"
+                  }
+                },
+                "required": [
+                  "email",
+                  "role"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Member"
+                }
+              }
+            },
+            "description": "Added"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Add a member",
+        "tags": [
+          "orgs"
+        ]
+      }
+    },
+    "/v1/orgs/{org}/members/{user}": {
+      "delete": {
+        "description": "Admins remove non-owners, owners anyone; members remove themselves to leave. The last owner cannot leave.",
+        "parameters": [
+          {
+            "description": "Organization name.",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The member's user id",
+            "in": "path",
+            "name": "user",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Empty"
+                }
+              }
+            },
+            "description": "Removed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Remove a member",
+        "tags": [
+          "orgs"
+        ]
+      },
+      "post": {
+        "description": "Changes that involve the owner role are for owners. The last owner keeps the role.",
+        "parameters": [
+          {
+            "description": "Organization name.",
+            "in": "path",
+            "name": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The member's user id",
+            "in": "path",
+            "name": "user",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "role": {
+                    "$ref": "#/components/schemas/Role"
+                  }
+                },
+                "required": [
+                  "role"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Member"
+                }
+              }
+            },
+            "description": "Changed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Change a member's role",
+        "tags": [
+          "orgs"
+        ]
+      }
     }
   },
   "security": [
@@ -4008,6 +5082,9 @@
   "tags": [
     {
       "name": "auth"
+    },
+    {
+      "name": "orgs"
     },
     {
       "name": "databases"

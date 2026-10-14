@@ -1,8 +1,7 @@
-//! `blob_gc_race`: blob reads racing GC, with grace periods shorter than a
-//! download. Writers overwrite and delete blobs while readers stream them
-//! whole and in ranges, by key and by id. A read that loses the race must
-//! fail cleanly (a broken stream, 404 or 503), never with wrong bytes, and
-//! a final GC cycle must keep every referenced blob.
+//! Blob reads racing GC with grace periods shorter than a download. Writers
+//! overwrite and delete blobs while readers stream full and ranged reads by key
+//! and by ID. Reads that lose the race must fail with a broken stream, 404, or
+//! 503—never wrong bytes—and a final GC cycle must preserve every referenced blob.
 
 use super::super::client::{Client, ZOMBIE_WAIT_MS};
 use super::super::{Sim, SimConfig};
@@ -15,15 +14,12 @@ use std::sync::{Arc, Mutex};
 
 const BASE: &str = "/v1/dbs/gc";
 const KEYS: u64 = 3;
-/// Every blob under `f*` is at least this long, so readers can pick ranges
-/// blindly.
+/// Minimum size of `f*` blobs so readers can pick byte ranges without checking size first.
 const MIN_SIZE: usize = 20 * 1024;
-/// Blobs under `s*` are small enough to be returned inline in JSON results
-/// (out of band, but at most the simulator's `json_value_max`).
+/// Size bounds for `s*` blobs: large enough to store out-of-band, small enough to return inline in JSON results.
 const SMALL: (usize, usize) = (600, 4_000);
 
-/// Grace periods shorter than a download (sim chunks are 1 KiB, so a blob
-/// is 20-60 chunk GETs).
+/// Sets GC grace periods shorter than a multi-chunk download.
 pub fn config(base: SimConfig) -> SimConfig {
     let mut c = base;
     c.engine.txn_max_lifetime_ms = 1_000;
@@ -37,11 +33,11 @@ pub fn config(base: SimConfig) -> SimConfig {
 
 #[derive(Default)]
 struct Written {
-    /// Content by sha256 (hex).
+    /// Content indexed by hex SHA-256.
     by_sha: BTreeMap<String, Arc<Vec<u8>>>,
-    /// Content of acknowledged writes by (key, version).
+    /// Content of acknowledged writes by `(key, version)`.
     by_version: BTreeMap<(u64, u64), Arc<Vec<u8>>>,
-    /// Every content ever written to a key (for unacknowledged writes).
+    /// All content ever written to a key, including unacknowledged writes.
     by_key: BTreeMap<u64, Vec<Arc<Vec<u8>>>>,
 }
 
@@ -81,8 +77,7 @@ async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Resul
                 Ok(r) if r.status == 503 && !String::from_utf8_lossy(&r.body).contains("\"unknown\"") => {
                     c.pause(100).await;
                 }
-                // A store stall outlasted the (shrunken) stage TTL, so the
-                // commit refused the upload: not applied.
+                // Store stall exceeded the shortened stage TTL; commit rejected the expired upload.
                 Ok(r) if r.status == 400 && String::from_utf8_lossy(&r.body).contains("expired") => {}
                 Ok(r) if r.status != 503 => return Err(format!("put {path}: {}", r.status)),
                 // Ambiguous: retrying the same content is safe.
@@ -102,8 +97,7 @@ fn header<'a>(r: &'a super::super::SimResponse, name: &str) -> Option<&'a str> {
     r.headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-/// Check a 200/206 body against `candidates` (the content it must be a
-/// slice of) and the response's own Content-Range.
+/// Verifies a 200/206 response body against `candidates` and its `Content-Range` header.
 fn check_body(r: &super::super::SimResponse, candidates: &[Arc<Vec<u8>>], what: &str) -> Result<(), String> {
     let (start, end) = match header(r, "content-range") {
         Some(cr) => {
@@ -144,8 +138,8 @@ async fn reader(
         let hdr: Vec<(&str, String)> = range.iter().map(|(a, b)| ("range", format!("bytes={a}-{b}"))).collect();
         let by_id = rng.chance(0.4);
         let (path, what) = if by_id {
-            // Resolve the key's current blob, then read it by id: the blob
-            // may be dereferenced (and collected) in between.
+            // Resolve the key's current blob ID, then read by ID; the blob may
+            // be unreferenced and collected between the two requests.
             let r = c.get(&format!("{BASE}/kv?prefix=f{k}&keys_only=true&limit=1")).await;
             let Ok(r) = r else { continue };
             let Some(item) = r.json["items"].as_array().and_then(|a| a.first()).cloned() else { continue };
@@ -156,7 +150,7 @@ async fn reader(
         };
         let r = match c.send("GET", &path, &hdr, Bytes::new()).await {
             Ok(r) => r,
-            // A stream broken by a collected chunk, or a lost response.
+            // Stream broken by a collected chunk, or lost response.
             Err(_) => {
                 stats.broken.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -185,7 +179,6 @@ async fn reader(
     Ok(())
 }
 
-/// Read a small blob inline through a transaction `get`.
 async fn small_read(c: &Client, k: u64, written: &Mutex<Written>, stats: &Stats) -> Result<(), String> {
     let key = key_name(k);
     let body = json!({"ops": [{"op": "get", "key": b64::encode(key.as_bytes())}], "encoding": "base64"});
@@ -259,7 +252,6 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, rounds: usize, c
         );
     }
     super::recover(&sim).await;
-    // Let collection finish, then every remaining key must read back whole.
     let e = &sim.cfg.engine;
     sim.sleep(e.orphan_grace_ms + e.gc_grace_ms + 2 * e.sweep_interval_ms).await;
     let body = json!({"ops": [{"op": "put", "key": "touch", "value": "1"}], "idempotency_key": "gc-touch"});

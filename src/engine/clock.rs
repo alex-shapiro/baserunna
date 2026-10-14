@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// The object every node probes (overwritten each time, never deleted).
+/// Probe object key used to measure the object store's clock.
 pub const PROBE_KEY: &str = "clock";
 
 #[derive(Clone, Copy, Debug)]
@@ -57,14 +57,13 @@ impl StoreClock {
         Some((self.mono_ms(Instant::now()) + m.offset_ms).max(0) as u64)
     }
 
-    /// True if the last measurement is older than `interval` (or missing).
+    /// True if the last measurement is missing or older than `interval`.
     pub fn stale(&self, interval: Duration) -> bool {
         self.last().is_none_or(|m| m.at.elapsed() >= interval)
     }
 
-    /// Measure the offset unless a measurement younger than `interval`
-    /// exists. A slow probe gives a loose bound, so up to three are made;
-    /// the tightest is kept if it is within `max_error_ms`.
+    /// Measures the store clock offset if no measurement younger than `interval`
+    /// exists, probing up to three times to find a bound within `max_error_ms`.
     pub async fn sync(
         &self,
         store: &dyn ObjectStore,
@@ -124,7 +123,6 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
         rt.block_on(async {
             let origin = Instant::now();
-            // The store's clock runs 5 hours ahead of the virtual clock.
             let ahead = Arc::new(AtomicI64::new(5 * 3_600_000));
             let a = ahead.clone();
             let store = MemStore::new(Box::new(move || {
@@ -136,14 +134,11 @@ mod tests {
             assert!(c.stale(Duration::from_secs(1)));
             c.sync(&store, &Retry::default(), Duration::from_secs(60), 10_000).await.unwrap();
             let true_now = || 1_700_000_000_000 + origin.elapsed().as_millis() as i64 + 5 * 3_600_000;
-            // An exact store that replies at once is measured to the
-            // millisecond.
             let err = 1;
             tokio::time::sleep(Duration::from_secs(600)).await;
             let now = c.now_ms(day).unwrap() as i64;
             assert!((now - true_now()).abs() <= err, "{now} vs {}", true_now());
             assert_eq!(c.now_ms(Duration::from_secs(60)), None, "too old a measurement is not used");
-            // A fresh measurement is kept until it ages past `interval`.
             ahead.store(0, Ordering::SeqCst);
             c.sync(&store, &Retry::default(), Duration::from_secs(3_600), 10_000).await.unwrap();
             assert!((c.now_ms(day).unwrap() as i64 - true_now()).abs() <= err);
@@ -153,10 +148,8 @@ mod tests {
         });
     }
 
-    /// A store that answers GETs after these delays, in turn (the last one
-    /// repeats).
-    /// Also reports `last_modified` truncated to a multiple of its third
-    /// field, the precision it declares.
+    /// Test store that delays GETs by the configured durations and truncates
+    /// `last_modified` to the declared precision.
     struct Slow(MemStore, std::sync::Mutex<Vec<Duration>>, u64, std::sync::atomic::AtomicUsize);
 
     impl Slow {
@@ -217,9 +210,6 @@ mod tests {
         }
     }
 
-    /// A measurement is only as precise as the probe's round trip: a slow
-    /// store leaves the clock unmeasured, and so collection paused. Of
-    /// several probes, the tightest counts.
     #[test]
     fn slow_probes_are_not_trusted() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
@@ -237,12 +227,9 @@ mod tests {
             c.sync(&store, &Retry::default(), Duration::ZERO, 100).await.expect("the fast probe counts");
             assert!((c.now_ms(day).unwrap() as i64 - truth()).abs() <= 5);
             assert_eq!(store.probes(), 2, "it stopped after the fast probe");
-            // One precise probe is enough.
             let fast = Slow::new(MemStore::new(Box::new(clock)), &[10, 10]);
             c.sync(&fast, &Retry::default(), Duration::ZERO, 100).await.unwrap();
             assert_eq!(fast.probes(), 1, "one precise probe is enough");
-            // Timestamps truncated to seconds bound the error by half a
-            // second, however fast the probe.
             let mut coarse = Slow::new(MemStore::new(Box::new(clock)), &[10]);
             coarse.2 = 1_000;
             tokio::time::sleep(Duration::from_millis(1_700)).await;

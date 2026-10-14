@@ -1,6 +1,5 @@
-//! A tiny property-testing harness: seeded generation, greedy shrinking and
-//! reproducible failures. Set `PROP_SEED` to reproduce and `PROP_CASES` to
-//! scale the number of cases.
+//! Property-testing harness. Set `PROP_SEED` to reproduce a failure and
+//! `PROP_CASES` to override the case count.
 
 use super::rng::Rng;
 use std::fmt::Debug;
@@ -18,9 +17,7 @@ fn name_seed(name: &str) -> u64 {
     h
 }
 
-/// Run `prop` on `cases` generated inputs. On failure, shrink with `shrink`
-/// (which proposes smaller candidates) and panic with the seed and the
-/// minimal counterexample.
+/// Run `prop` on `cases` generated inputs, shrinking any failure with `shrink`.
 pub fn check<T, G, S, P>(name: &str, cases: usize, generate: G, shrink: S, prop: P)
 where
     T: Debug + Clone,
@@ -79,8 +76,7 @@ where
     (cur, err)
 }
 
-/// Standard shrinker for sequences: drop halves, quarters, ... then single
-/// elements.
+/// Shrink a slice by removing progressively smaller chunks.
 pub fn shrink_vec<T: Clone>(v: &[T]) -> Vec<Vec<T>> {
     let mut out = Vec::new();
     let n = v.len();

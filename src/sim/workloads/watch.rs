@@ -77,7 +77,7 @@ async fn writer(c: Client, log: Log, steps: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// A change the watcher received, and whether the writer's log explains it.
+/// Verifies that a change from the feed matches a write in `log`.
 fn explained(ch: &Json, log: &BTreeMap<u64, Vec<Write>>) -> Result<(), String> {
     let v = ch["version"].as_u64().ok_or("no version")?;
     let writes = log.get(&v).ok_or_else(|| format!("{ch}: no write committed as version {v}"))?;
@@ -102,10 +102,8 @@ fn explained(ch: &Json, log: &BTreeMap<u64, Vec<Write>>) -> Result<(), String> {
     }
 }
 
-/// Values by key, and when they expire.
 type State = BTreeMap<String, (String, Option<u64>)>;
 
-/// The database's state, read whole; and the version it is at.
 async fn read_all(c: &Client) -> (State, String) {
     let r = c.call_retry("GET", &format!("{BASE}/kv?limit=1000"), None).await;
     let items = r.json["items"].as_array().cloned().unwrap_or_default();
@@ -121,8 +119,8 @@ async fn read_all(c: &Client) -> (State, String) {
 struct Watcher {
     c: Client,
     cursor: String,
-    /// When the last request that caught up with the feed started (sim
-    /// ms): no deletion after `cursor` had committed before then.
+    /// Start time of the last request that caught up with the feed; no
+    /// deletion after `cursor` committed before this timestamp.
     cursor_at: u64,
     state: State,
     received: Vec<Json>,
@@ -145,14 +143,13 @@ impl Watcher {
         w
     }
 
-    /// Start over from the current state.
     async fn resync(&mut self) {
         self.cursor_at = self.c.sim.now_ms();
         (self.state, self.cursor) = read_all(&self.c).await;
     }
 
-    /// One poll. Returns whether it caught up with the feed (`None` if the
-    /// request failed).
+    /// Polls the change feed once, returning `Some(true)` if caught up or
+    /// `None` on transient error.
     async fn poll(&mut self, wait_ms: u64) -> Result<Option<bool>, String> {
         let at = self.c.sim.now_ms();
         let p = format!("{BASE}/changes?after={}&limit={}&wait_ms={wait_ms}", self.cursor, 1 + self.c.rng().below(8));
@@ -222,7 +219,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
             err = Some(e);
             break;
         }
-        // Now and then fall behind for longer than deletions are kept.
+        // Periodically pause longer than the tombstone retention window to exercise cursor expiry.
         if watcher.c.rng().chance(0.02) {
             watcher.c.pause(lifetime + 10_000).await;
         }
@@ -239,8 +236,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
         return Err(e);
     }
     super::recover(&sim).await;
-    // Every value written with a time to live has expired: neither the
-    // database nor the watcher, which knows their expiries, has them.
+    // Wait for all TTL entries to expire before comparing state.
     watcher.c.pause(4_000 + eps).await;
     while watcher.poll(0).await? != Some(true) {
         watcher.c.pause(100).await;

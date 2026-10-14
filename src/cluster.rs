@@ -1,6 +1,4 @@
-//! Cluster plumbing: node-to-node transport, membership and routing.
-//! Routing only affects performance (cache locality, lease stability);
-//! correctness rests on manifest CAS. See SPEC §7.
+//! Node-to-node transport, membership, and routing.
 
 use crate::meta::NodeRecord;
 use crate::store::BoxFut;
@@ -14,31 +12,27 @@ use tokio::time::Instant;
 
 pub const HOPS_HEADER: &str = "x-baserunna-hops";
 pub const CLUSTER_KEY_HEADER: &str = "x-baserunna-cluster-key";
-/// A random id the forwarding node gives each forwarded request, so the
-/// receiver can execute a request that the network delivers twice only once.
+/// Unique identifier attached to forwarded requests for deduplication.
 pub const FORWARD_ID_HEADER: &str = "x-baserunna-forward-id";
-/// The node id a forwarded request is meant for, so that a node restarted
-/// at the same address refuses copies it can no longer deduplicate.
+/// Target node identifier for a forwarded request.
 pub const FORWARD_TO_HEADER: &str = "x-baserunna-forward-to";
-/// The forwarded request's commit deadline (wall-clock ms since the epoch).
+/// Commit deadline for a forwarded request, in cluster milliseconds.
 pub const DEADLINE_HEADER: &str = "x-baserunna-deadline-ms";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportError {
     pub message: String,
-    /// False if the request certainly never reached the peer (connect
-    /// failure), so it is safe to handle it elsewhere.
+    /// False when the request failed before reaching the peer.
     pub maybe_delivered: bool,
 }
 
 /// Sends HTTP requests to peer nodes.
 pub trait Transport: Send + Sync + 'static {
-    /// `addr` is the peer's base URL (e.g. `http://10.0.0.5:8080`); the
-    /// request URI holds only the path and query.
+    /// Sends `req` (whose URI contains path and query) to the peer at `addr`.
     fn call(&self, addr: &str, req: Request<Body>) -> BoxFut<'static, Result<Response<Body>, TransportError>>;
 }
 
-/// Real HTTP/1.1 transport.
+/// HTTP/1.1 peer transport.
 pub struct HttpTransport {
     client: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
 }
@@ -80,7 +74,7 @@ impl Transport for HttpTransport {
     }
 }
 
-/// A transport for single-node deployments: every call fails undelivered.
+/// Single-node transport that fails all calls as undelivered.
 pub struct NoTransport;
 
 impl Transport for NoTransport {
@@ -89,7 +83,7 @@ impl Transport for NoTransport {
     }
 }
 
-/// A response kept for replay to duplicates of a forwarded request.
+/// Cached response replayed to duplicate forwarded requests.
 #[derive(Clone, Debug)]
 pub struct ReplayedResponse {
     pub status: http::StatusCode,
@@ -99,7 +93,7 @@ pub struct ReplayedResponse {
 
 #[derive(Default)]
 struct Slot {
-    /// `Some(None)`: finished without a replayable response.
+    /// `Some(None)` indicates completion without a replayable response.
     result: Mutex<Option<Option<ReplayedResponse>>>,
     done: tokio::sync::Notify,
 }
@@ -127,19 +121,14 @@ impl Slot {
     }
 }
 
-/// Exactly-once execution of forwarded requests on the receiving node.
-///
-/// The first copy of a forwarded request runs; later copies wait for it and
-/// get the same response. Ids are remembered for `retention`, far longer
-/// than any network delay.
+/// Deduplicates forwarded requests on the receiving node.
 pub struct ForwardDedup {
     slots: Mutex<DetHashMap<String, (Instant, Arc<Slot>)>>,
     retention: Duration,
 }
 
-/// Handle of the copy that executes a forwarded request. Dropping it
-/// without [`FirstCopy::finish`] (e.g. the handler was cancelled) tells
-/// waiting duplicates that the outcome is unknown.
+/// Guard for the first execution of a forwarded request. Dropping without
+/// calling [`FirstCopy::finish`] marks the outcome as unknown for waiters.
 pub struct FirstCopy(Arc<Slot>);
 
 impl FirstCopy {
@@ -156,8 +145,7 @@ impl Drop for FirstCopy {
 
 pub enum Delivery {
     First(FirstCopy),
-    /// Resolves to the first copy's response, or `None` if it has none to
-    /// share.
+    /// Resolves to the first execution's response, or `None` if its outcome is unknown.
     Duplicate(BoxFut<'static, Option<ReplayedResponse>>),
 }
 
@@ -181,7 +169,7 @@ impl ForwardDedup {
         Delivery::First(FirstCopy(s))
     }
 
-    /// Forget ids older than the retention period.
+    /// Removes entries older than the retention period.
     pub fn expire(&self) {
         let keep = self.retention;
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (t, _)| t.elapsed() < keep);
@@ -199,7 +187,7 @@ fn fnv(data: &[u8]) -> u64 {
     h ^ (h >> 29)
 }
 
-/// Rendezvous (highest random weight) hashing.
+/// Selects the owner node for `key` using rendezvous hashing.
 pub fn rendezvous<'a>(key: &str, nodes: &'a [NodeRecord]) -> Option<&'a NodeRecord> {
     nodes.iter().max_by_key(|n| {
         let mut b = Vec::with_capacity(n.id.len() + key.len() + 1);
@@ -210,7 +198,7 @@ pub fn rendezvous<'a>(key: &str, nodes: &'a [NodeRecord]) -> Option<&'a NodeReco
     })
 }
 
-/// Live members at `now_ms` given a heartbeat interval.
+/// Filters `nodes` to members with a heartbeat within `3 * heartbeat_ms` of `now_ms`.
 pub fn live(nodes: &[NodeRecord], now_ms: i64, heartbeat_ms: i64) -> Vec<NodeRecord> {
     let mut v: Vec<NodeRecord> =
         nodes.iter().filter(|n| n.heartbeat_at + 3 * heartbeat_ms >= now_ms).cloned().collect();
@@ -266,7 +254,6 @@ mod tests {
             );
             let Delivery::Duplicate(late) = d.deliver("a") else { panic!("a late copy must not run again") };
             assert!(late.await.is_some());
-            // A first copy that never finished leaves its duplicates unsure.
             let (Delivery::First(first), Delivery::Duplicate(dup)) = (d.deliver("b"), d.deliver("b")) else {
                 panic!("the first copy must run and the second wait");
             };

@@ -1,5 +1,5 @@
-//! Wall-clock throughput of one node serving thousands of active
-//! databases through its full HTTP router (in-process, no sockets).
+//! Wall-clock throughput benchmark for a single node serving thousands of
+//! active databases in-process through its HTTP router.
 //!
 //! ```text
 //! cargo bench --bench throughput
@@ -16,9 +16,8 @@
 //! | `BENCH_CACHE_MB`   | 64      | block cache budget                                   |
 //! | `BENCH_THREADS`    | 4       | runtime worker threads                               |
 
-use baserunna::cluster::NoTransport;
 use baserunna::env::Env;
-use baserunna::node::Node;
+use baserunna::node::{Node, Services};
 use baserunna::sim::cost::{MeteredStore, call_router, node_config};
 use baserunna::store::{DynStore, MemStore};
 use baserunna::util::rng::Rng;
@@ -46,17 +45,15 @@ async fn bench(threads: usize) {
     let secs = env("BENCH_SECS", 10);
     let write_pct = env("BENCH_WRITE_PCT", 10);
     let latency = env("BENCH_LATENCY_MS", 0);
-    baserunna::log::set_level(baserunna::log::ERROR);
+    baserunna::log::set_level(Some(baserunna::log::Level::Error));
 
     let store = Arc::new(MeteredStore::new(Arc::new(MemStore::with_system_clock()), 0));
     let mut cfg = node_config("bench", "http://127.0.0.1:0");
     cfg.engine.cache_bytes = env("BENCH_CACHE_MB", 64) as usize * 1024 * 1024;
     let dyn_store: DynStore = store.clone();
-    let node =
-        Node::start(cfg, Arc::new(Env::real()), dyn_store, Arc::new(NoTransport), None).await.expect("node starts");
+    let node = Node::start(cfg, Arc::new(Env::real()), dyn_store, Services::local()).await.expect("node starts");
     let router = baserunna::api::router(node.clone());
 
-    // Setup runs without store latency: it is not what is measured.
     let t0 = Instant::now();
     let mut tokens = Vec::new();
     for u in 0..dbs.div_ceil(DBS_PER_USER) {

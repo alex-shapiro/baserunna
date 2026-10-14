@@ -1,6 +1,6 @@
-//! Source lints that protect simulation determinism and safety (SPEC
-//! §13.1). Service code must route time, randomness and task spawning
-//! through `Env`, and must avoid tokio primitives with internal randomness.
+//! Source lints that protect simulation determinism and safety. Service code
+//! must route time, randomness, and task spawning through `Env`, and must
+//! avoid tokio primitives with internal randomness.
 
 use std::path::Path;
 
@@ -15,13 +15,16 @@ fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// (pattern, files where it is allowed, reason)
 const RULES: &[(&str, &[&str], &str)] = &[
     ("unsafe ", &[], "no unsafe code"),
     ("tokio::sync::watch", &[], "watch channels wake waiters in random order"),
     ("select!", &[], "select! polls branches in random order"),
     ("tokio::spawn(", &["src/sim/", "src/engine/tests.rs"], "spawn through Env so crashes abort tasks"),
-    ("SystemTime", &["src/env.rs", "src/store/", "src/main.rs"], "wall time comes from Env::now_ms"),
+    (
+        "SystemTime",
+        &["src/env.rs", "src/store/", "src/main.rs", "src/log.rs"],
+        "wall time comes from Env::now_ms (log timestamps aside)",
+    ),
     ("std::time::Instant", &["src/auth.rs"], "use tokio::time::Instant (virtual in simulation)"),
     ("aws_lc_rs::rand", &["src/env.rs", "src/store/fs.rs", "src/sim/google.rs"], "randomness comes from Env"),
     ("thread_rng", &[], "randomness comes from Env"),

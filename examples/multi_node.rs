@@ -1,9 +1,9 @@
-//! Real-world example: horizontal scaling and failover.
+//! Horizontal scaling and failover example.
 //!
-//! Three stateless nodes share one object store. Any node accepts any
-//! request and forwards it to the database's current owner. When a node is
-//! killed mid-flight, the others keep serving: reads immediately, writes as
-//! soon as the dead node's lease (15 s by default) expires. No data is lost.
+//! Three stateless nodes share an object store. Any node accepts any request
+//! and forwards it to the database's lease holder. When a node is killed, the
+//! remaining nodes continue serving reads immediately and resume writes once
+//! the dead node's lease expires.
 //!
 //! Run: `cargo run --example multi_node`
 

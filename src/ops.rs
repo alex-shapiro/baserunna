@@ -1,5 +1,4 @@
-//! The JSON transaction-op language shared by one-shot transactions,
-//! interactive transactions and the console. See SPEC §6.3.
+//! JSON transaction operations and execution.
 
 use crate::engine::{BlobRef, Db, KeyRange, ReadValue, Ttl, Txn, Value, blob};
 use crate::error::{Error, Result};
@@ -13,7 +12,6 @@ use std::sync::Arc;
 
 pub const MAX_USER_KEY: usize = 4096;
 pub const MAX_SCAN_LIMIT: usize = 1000;
-/// The longest time to live a value may have: ten years.
 pub const MAX_TTL_MS: u64 = 10 * 365 * 24 * 3_600_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -32,8 +30,7 @@ impl Encoding {
         }
     }
 
-    /// Encode bytes for JSON output. In utf8 mode, non-UTF-8 data is
-    /// reported with `None` (callers then include a base64 field).
+    /// Encodes `b` as JSON, returning `Json::Null` for non-UTF-8 bytes in `Utf8` mode.
     pub fn encode(&self, b: &[u8]) -> Json {
         match self {
             Encoding::Utf8 => match std::str::from_utf8(b) {
@@ -188,7 +185,7 @@ impl Op {
     }
 }
 
-/// The time to live `ttl_ms` asks for: that long after the write commits.
+/// Validates `ttl_ms` and converts it to a [`Ttl`].
 pub fn expiry(ttl_ms: Option<u64>) -> Result<Option<Ttl>> {
     match ttl_ms {
         None => Ok(None),
@@ -197,7 +194,6 @@ pub fn expiry(ttl_ms: Option<u64>) -> Result<Option<Ttl>> {
     }
 }
 
-/// `limit` of a batch row operation, if any: at least 1.
 fn batch_limit(limit: Option<usize>) -> Result<Option<usize>> {
     match limit {
         Some(0) => Err(Error::invalid("limit must be at least 1")),
@@ -209,7 +205,7 @@ fn batch_limit(limit: Option<usize>) -> Result<Option<usize>> {
 pub struct OpCtx<'a> {
     pub db: &'a Arc<Db>,
     pub encoding: Encoding,
-    pub read_only: bool,
+    pub access: crate::meta::Access,
     /// Blob values up to this size are returned inline in JSON.
     pub json_value_max: u64,
 }
@@ -227,7 +223,7 @@ pub fn user_key(k: &[u8]) -> Result<Bytes> {
     Ok(Bytes::from(v))
 }
 
-/// User-key range in the internal KV space.
+/// Builds an internal [`KeyRange`] in the user KV keyspace.
 pub fn user_range(enc: Encoding, prefix: Option<&str>, start: Option<&str>, end: Option<&str>) -> Result<KeyRange> {
     let space = [SPACE_KV];
     let space_end = Bytes::from_static(&[SPACE_KV + 1]);
@@ -257,7 +253,7 @@ pub fn user_range(enc: Encoding, prefix: Option<&str>, start: Option<&str>, end:
     Ok(KeyRange::new(s, e))
 }
 
-/// Render a value for a JSON result.
+/// Populates `out` with the JSON representation of `v`.
 pub async fn value_json(ctx: &OpCtx<'_>, v: &Value, out: &mut serde_json::Map<String, Json>) -> Result<()> {
     match v {
         Value::Inline(b) => put_bytes(ctx.encoding, "value", b, out),
@@ -273,8 +269,7 @@ pub async fn value_json(ctx: &OpCtx<'_>, v: &Value, out: &mut serde_json::Map<St
     Ok(())
 }
 
-/// Bytes as JSON field `field`, or `{field}_b64` if they are not UTF-8 in
-/// the utf8 encoding.
+/// Inserts `b` into `out` under `field`, falling back to `{field}_b64` for non-UTF-8 bytes.
 pub fn put_key(enc: Encoding, field: &str, b: &[u8], out: &mut serde_json::Map<String, Json>) {
     put_bytes(enc, field, b, out)
 }
@@ -306,14 +301,14 @@ async fn read_json(ctx: &OpCtx<'_>, r: Option<ReadValue>) -> Result<Json> {
     Ok(Json::Object(m))
 }
 
-/// `expires_at` (store ms) of a value that expires.
+/// Inserts `expires_at` into `out` when `expires` is `Some`.
 pub fn put_expiry(expires: Option<u64>, out: &mut serde_json::Map<String, Json>) {
     if let Some(e) = expires {
         out.insert("expires_at".into(), json!(e));
     }
 }
 
-/// Store bytes as a value, moving large values out of band.
+/// Stores `data` inline or as an out-of-band blob if it exceeds `value_inline_max`.
 pub async fn make_value(db: &Arc<Db>, data: &[u8], content_type: &str) -> Result<Value> {
     if data.len() > db.shared().cfg.value_inline_max {
         Ok(Value::Blob(blob::write_blob(db.shared(), &db.id, data, content_type).await?))
@@ -330,16 +325,15 @@ pub async fn value_bytes(db: &Db, v: &Value) -> Result<Bytes> {
     }
 }
 
-/// Execute ops in order inside `txn`. Returns one result per op. Any error
-/// aborts the request (the caller discards the transaction).
+/// Executes `ops` sequentially inside `txn`, returning one JSON result per operation.
 pub async fn exec_ops(ctx: &OpCtx<'_>, txn: &mut Txn, ops: &[Op]) -> Result<Vec<Json>> {
     if ops.len() > 10_000 {
         return Err(Error::invalid("too many ops (max 10000)"));
     }
     let mut results = Vec::with_capacity(ops.len());
     for (i, op) in ops.iter().enumerate() {
-        if ctx.read_only && op.is_write() {
-            return Err(Error::PermissionDenied("this credential is read-only".into()));
+        if op.is_write() {
+            ctx.access.require_write()?;
         }
         let r = exec_one(ctx, txn, op).await.map_err(|e| match e {
             Error::PreconditionFailed { message, .. } => Error::PreconditionFailed { message, op_index: Some(i) },
@@ -466,7 +460,6 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op) -> Result<Json> {
                 }
             };
             let n = cur.checked_add(*by).ok_or_else(|| Error::invalid("increment overflows i64"))?;
-            // A counter keeps its expiry unless the increment sets one.
             txn.put_expiring(k, Value::Inline(Bytes::from(n.to_string())), set.or(kept))?;
             Ok(json!({"value": n}))
         }
@@ -525,8 +518,7 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op) -> Result<Json> {
     }
 }
 
-/// What an update with `ttl_ms` does to a row's expiry: the row keeps its
-/// expiry unless `ttl_ms` is given.
+/// Converts an optional `ttl_ms` on an update into an [`Expiry`] policy.
 pub fn row_expiry(ttl_ms: Option<u64>) -> Result<Expiry> {
     Ok(match expiry(ttl_ms)? {
         Some(t) => Expiry::Set(Some(t)),
@@ -534,7 +526,7 @@ pub fn row_expiry(ttl_ms: Option<u64>) -> Result<Expiry> {
     })
 }
 
-/// Blob ref to JSON (re-export for API handlers).
+/// Formats `r` as a JSON blob metadata object.
 pub fn blob_meta(r: &BlobRef) -> Json {
     blob_json(r)
 }

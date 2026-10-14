@@ -70,6 +70,30 @@ forward database requests to the node holding the database's lease. Set up:
 - Optionally block `/internal/` at the load balancer; nodes reach those
   endpoints directly.
 
+## Logs
+
+Nodes log JSON lines to stderr (format in SPEC §12), and at the default
+level, `info`, every request on each node it reaches; `BASERUNNA_LOG=warn`
+keeps only problems. To follow a request through the cluster, filter on
+its `request_id`. To tie the nodes' logs to your proxy's, have the proxy
+send its request id as `x-request-id`: nodes keep ids of 1-64 characters
+of `[A-Za-z0-9._:-]` and replace any other with their own, so ids with
+other characters (an AWS ALB trace id's `=` and `;`, for example) need
+rewriting first.
+
+## Mail
+
+Email verification and password resets need outbound mail. Set
+`BASERUNNA_MAIL_WEBHOOK_URL` to an endpoint that accepts
+`POST {"from", "to", "subject", "text"}` (optionally with
+`BASERUNNA_MAIL_WEBHOOK_TOKEN` as a bearer token, and
+`BASERUNNA_MAIL_FROM` as the sender): a small relay to SMTP or a mail
+provider's HTTP API. Links point at `BASERUNNA_PUBLIC_URL`. Without a
+webhook, the reset and verification endpoints answer 404, and Google
+sign-in cannot link to existing password accounts (their addresses cannot
+be verified). Mail is sent in the background, a few retries apiece; a node
+that stops first drops it, and the user asks again.
+
 ## Shutdown
 
 On SIGTERM (or SIGINT) a node:

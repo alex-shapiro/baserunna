@@ -96,6 +96,16 @@ fn sim_watch_change_feeds() {
     run_scenario("watch", 19, 2);
 }
 
+#[test]
+fn sim_organization_roles() {
+    run_scenario("orgs", 20, 2);
+}
+
+#[test]
+fn sim_account_self_service() {
+    run_scenario("accounts", 21, 2);
+}
+
 /// Every workload again under [`SimConfig::hostile`].
 #[test]
 fn sim_hostile() {
@@ -113,6 +123,8 @@ fn sim_hostile() {
         "chaos_hostile",
         "ttl_hostile",
         "watch_hostile",
+        "orgs_hostile",
+        "accounts_hostile",
     ] {
         run_scenario(name, 16, 1);
     }
@@ -143,14 +155,14 @@ fn sim_api_tour() {
     run_scenario("api_tour", 11, 2);
 }
 
-/// The end-of-run storage invariants must notice lost data.
+/// Verifies that the end-of-run storage invariant check detects missing objects.
 #[test]
 fn storage_check_detects_missing_objects() {
     use baserunna::sim::client::Client;
     let out = run(5, SimConfig::basic(), |sim| async move {
         let c = Client::signup(&sim, "u", "u@chk.test", "password-123").await?;
         c.create_db("chk").await?;
-        // Enough out-of-band values to flush the tail to a segment.
+        // Write enough out-of-band values to flush the tail to a segment.
         for i in 0..40 {
             let r = c.send("PUT", &format!("/v1/dbs/chk/kv/k{i}"), &[], vec![b'x'; 600].into()).await;
             assert_eq!(r.map(|r| r.status).ok(), Some(200));
@@ -163,8 +175,8 @@ fn storage_check_detects_missing_objects() {
         let db = keys.iter().find(|k| k.contains(&format!("/blob/{old_id}/"))).ok_or("no blob")?;
         let db = &db[..db.find("/blob/").ok_or("odd key")?];
         let seg = keys.iter().find(|k| k.starts_with(&format!("{db}/seg/"))).ok_or("no segment written")?;
-        // Overwrite k0, whose old version is in a segment: the old blob is
-        // now shadowed and may be collected, but the new one must exist.
+        // Overwrite k0 so its old blob in the segment is shadowed and eligible
+        // for collection while the new blob must remain intact.
         let r = c.send("PUT", "/v1/dbs/chk/kv/k0", &[], vec![b'y'; 700].into()).await;
         assert_eq!(r.map(|r| r.status).ok(), Some(200));
         let after = sim.mem.keys();
@@ -188,8 +200,8 @@ fn storage_check_detects_missing_objects() {
     assert!(e.starts_with("storage invariant"), "{e}");
 }
 
-/// A copy of a forwarded write delivered after its target restarted is
-/// refused rather than run a second time.
+/// Verifies that a duplicate forwarded write delivered after its target node
+/// restarted is rejected rather than executed twice.
 #[test]
 fn forwards_to_a_restarted_node_are_refused() {
     use baserunna::cluster::{FORWARD_ID_HEADER, FORWARD_TO_HEADER};
@@ -212,7 +224,7 @@ fn forwards_to_a_restarted_node_are_refused() {
         let r = sim.call_node(0, put(&first, "a", "old")).await.map_err(|e| format!("{e:?}"))?;
         assert_eq!(r.status, 200);
         sim.restart(0).await;
-        // The restarted node first waits out its previous run's lease.
+        // Wait for the restarted node's previous lease to expire.
         let second = sim.node(0).ok_or("node 0 down")?.node.id.clone();
         for attempt in 0.. {
             let r =
@@ -230,4 +242,73 @@ fn forwards_to_a_restarted_node_are_refused() {
         Ok(())
     });
     out.result.unwrap();
+}
+
+#[test]
+fn request_ids_follow_forwarded_requests() {
+    use baserunna::log::{Level, REQUEST_ID_HEADER, capture};
+    use baserunna::sim::client::Client;
+    let cap = capture(Level::Info);
+    let mut cfg = SimConfig::basic();
+    cfg.nodes = 2;
+    let out = run(21, cfg, |sim| async move {
+        let c = Client::signup(&sim, "u", "u@rid.test", "password-123").await?;
+        c.create_db("rid").await?;
+        let mut sent = Vec::new();
+        for i in 0..12 {
+            let rid = format!("client-{i}");
+            let r = c
+                .send("PUT", &format!("/v1/dbs/rid/kv/k{i}"), &[(REQUEST_ID_HEADER, rid.clone())], "v".into())
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            let echoed = r.headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()).unwrap_or_default();
+            if echoed != rid {
+                return Err(format!("sent {rid}, echoed {echoed:?}"));
+            }
+            sent.push(rid);
+        }
+        let too_long = "x".repeat(baserunna::log::MAX_REQUEST_ID_LEN + 1);
+        for bad in ["has space", "é", &too_long] {
+            let r = c.send("GET", "/v1/me", &[(REQUEST_ID_HEADER, bad.to_string())], "".into()).await;
+            let r = r.map_err(|e| format!("{e:?}"))?;
+            let echoed = r.headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()).unwrap_or_default();
+            if echoed == bad || !baserunna::log::valid_request_id(echoed) {
+                return Err(format!("invalid id {bad:?} echoed as {echoed:?}"));
+            }
+        }
+        for i in 0..6 {
+            c.create_db(&format!("meta{i}")).await?;
+        }
+        Ok(())
+    });
+    out.result.unwrap();
+    let records = cap.records();
+    let requests: Vec<_> = records.iter().filter(|r| r["msg"] == "request").collect();
+    let ids = |rid: &str| requests.iter().filter(|r| r["request_id"] == rid).collect::<Vec<_>>();
+    let mut forwarded = 0;
+    for i in 0..12 {
+        let rid = format!("client-{i}");
+        let seen = ids(&rid);
+        assert!(!seen.is_empty(), "no log record for {rid}");
+        for r in seen.iter().filter(|r| r["forwarded_to"].is_string()) {
+            forwarded += 1;
+            assert!(
+                seen.iter().any(|t| t["node"] == r["forwarded_to"] && t["hops"] == 1 && t["status"] == r["status"]),
+                "the forward of {rid} was not logged under its id: {seen:?}"
+            );
+            assert_eq!(r["route"], "/v1/dbs/{db}/kv/{*key}");
+        }
+    }
+    assert!(forwarded > 0, "no request was forwarded: {requests:?}");
+    // Forwarded metadata commands on the system database's lease holder are logged under the caller's request ID.
+    let creates: Vec<_> = requests.iter().filter(|r| r["route"] == "/v1/dbs" && r["method"] == "POST").collect();
+    let relayed = creates
+        .iter()
+        .filter(|c| {
+            requests.iter().any(|r| {
+                r["route"] == "/internal/v1/meta" && r["request_id"] == c["request_id"] && r["node"] != c["node"]
+            })
+        })
+        .count();
+    assert!(relayed > 0, "no forwarded metadata command carried its request's id: {creates:?}");
 }

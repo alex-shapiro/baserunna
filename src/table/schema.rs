@@ -1,4 +1,4 @@
-//! Table schemas, typed values (datums) and row encoding.
+//! Table schemas, datums, and row encoding.
 
 use super::tuple::Key;
 use crate::engine::BlobRef;
@@ -22,6 +22,21 @@ pub enum ColType {
 }
 
 impl ColType {
+    pub const ALL: [ColType; 7] =
+        [ColType::String, ColType::Int, ColType::Float, ColType::Bool, ColType::Bytes, ColType::Json, ColType::Blob];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ColType::String => "string",
+            ColType::Int => "int",
+            ColType::Float => "float",
+            ColType::Bool => "bool",
+            ColType::Bytes => "bytes",
+            ColType::Json => "json",
+            ColType::Blob => "blob",
+        }
+    }
+
     pub fn indexable(self) -> bool {
         !matches!(self, ColType::Json | ColType::Blob)
     }
@@ -48,14 +63,14 @@ pub struct IndexDef {
     pub state: IndexState,
 }
 
-/// Every row write maintains an index in either state, but only a ready
-/// index is complete enough to answer queries.
+/// Every row write maintains an index in either state, but only a `Ready`
+/// index can serve queries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexState {
     #[default]
     Ready,
-    /// Being backfilled from the table's rows (see `table::add_index`).
+    /// Being backfilled from the table's rows.
     Building,
 }
 
@@ -70,7 +85,6 @@ pub struct TableSchema {
     pub next_index_id: u32,
 }
 
-/// A typed column value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Datum {
     Null,
@@ -134,8 +148,8 @@ pub fn blob_json(r: &BlobRef) -> Json {
     })
 }
 
-/// Convert a JSON value to a datum of `ty`. Blob columns accept a staged
-/// blob id (a string); the caller resolves it.
+/// Convert a JSON value to a datum of `ty`. Blob columns return the staged
+/// blob ID as `Datum::Str`.
 pub fn datum_from_json(ty: ColType, v: &Json, col: &str) -> Result<Datum> {
     if v.is_null() {
         return Ok(Datum::Null);
@@ -154,15 +168,11 @@ pub fn datum_from_json(ty: ColType, v: &Json, col: &str) -> Result<Datum> {
         ColType::Bool => Datum::Bool(v.as_bool().ok_or_else(bad)?),
         ColType::Bytes => Datum::Bytes(b64::decode(v.as_str().ok_or_else(bad)?).ok_or_else(bad)?),
         ColType::Json => Datum::Json(v.clone()),
-        ColType::Blob => {
-            // Resolved later by the caller; keep the id as a string marker.
-            Datum::Str(v.as_str().ok_or_else(bad)?.to_string())
-        }
+        ColType::Blob => Datum::Str(v.as_str().ok_or_else(bad)?.to_string()),
     })
 }
 
-/// Coerce a JSON value for comparing against a column (filters, query
-/// bounds). Ints are accepted for float columns.
+/// Convert a JSON value to an indexable [`Key`] for `ty`.
 pub fn key_from_json(ty: ColType, v: &Json, col: &str) -> Result<Key> {
     if !ty.indexable() {
         return Err(Error::invalid(format!("column {col:?} is not indexable")));
@@ -268,8 +278,7 @@ impl TableSchema {
     }
 }
 
-/// Stored row: column id -> datum (blob columns live in side entries and
-/// are not part of the encoded row).
+/// Map from column ID to datum. Blob columns are stored in separate KV entries.
 pub type Row = BTreeMap<u32, Datum>;
 
 const D_BOOL: u8 = 1;
@@ -282,7 +291,7 @@ const D_JSON: u8 = 6;
 pub fn encode_row(row: &Row) -> Vec<u8> {
     let mut w = Writer::new();
     let stored: Vec<(&u32, &Datum)> = row.iter().filter(|(_, d)| !matches!(d, Datum::Null | Datum::Blob(_))).collect();
-    w.u8(1); // format
+    w.u8(1);
     w.varint(stored.len() as u64);
     for (id, d) in stored {
         w.varint(*id as u64);
@@ -341,6 +350,18 @@ pub fn decode_row(data: &[u8]) -> DResult<Row> {
         return Err(DecodeError("row trailing data"));
     }
     Ok(row)
+}
+
+#[cfg(test)]
+mod col_type_tests {
+    use super::*;
+
+    #[test]
+    fn names_are_the_serialized_ones() {
+        for t in ColType::ALL {
+            assert_eq!(serde_json::to_value(t).unwrap(), Json::from(t.name()));
+        }
+    }
 }
 
 #[cfg(test)]

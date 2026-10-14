@@ -1,13 +1,10 @@
-//! Deterministic simulation of a Baserunna cluster (SPEC §13).
-//!
-//! Nodes, the object store, the network and Google all run on one
-//! current-thread runtime in virtual time, with every random choice drawn
-//! from one seed, so a seed always produces the same trace.
+//! Deterministic cluster simulation in virtual time.
 
 pub mod amp;
 pub mod client;
 pub mod cost;
 pub mod google;
+pub mod mail;
 pub mod openapi_check;
 mod storage_check;
 pub mod store;
@@ -22,7 +19,7 @@ use crate::engine::EngineConfig;
 use crate::engine::local::{LocalTier, MemLocal};
 use crate::env::Env;
 use crate::meta::SignupPolicy;
-use crate::node::{Node, NodeConfig};
+use crate::node::{Node, NodeConfig, Services};
 use crate::store::{
     BoxFut, DynStore, GetOpts, GetResult, ListPage, MemStore, ObjectStore, PutMode, SResult, StoreError,
 };
@@ -39,7 +36,7 @@ use store::{SimStore, StoreFaults};
 use tokio::time::Instant;
 use tower::ServiceExt;
 
-/// Running hash of everything observable in a simulation.
+/// Running FNV-1a hash and optional log of simulation events.
 pub struct Trace {
     state: Mutex<(u64, u64)>,
     log: Option<Mutex<Vec<String>>>,
@@ -83,11 +80,9 @@ pub struct NetFaults {
     pub latency_max_ms: u64,
     /// Probability that a response is lost after the request was processed.
     pub p_lose_response: f64,
-    /// Probability that a request forwarded between nodes is delivered a
-    /// second time, up to `forward_delay_max_ms` later (or earlier).
+    /// Probability that a peer-forwarded request is duplicated.
     pub p_forward_duplicate: f64,
-    /// Probability that a forwarded request is held back for up to
-    /// `forward_delay_max_ms`, letting later requests overtake it.
+    /// Probability that a peer-forwarded request is delayed by up to `forward_delay_max_ms`.
     pub p_forward_delay: f64,
     pub forward_delay_max_ms: u64,
 }
@@ -109,14 +104,14 @@ impl NetFaults {
     }
 }
 
-/// Which fault actions [`workloads::chaos_step`] may take.
+/// Faults enabled for [`workloads::chaos_step`].
 #[derive(Clone, Debug, Default)]
 pub struct ChaosFaults {
     /// Partitions that drop traffic in one direction only.
     pub one_way_partitions: bool,
-    /// Cutting a node off from the object store (it still reaches peers).
+    /// Isolate nodes from the object store while leaving peer traffic intact.
     pub store_isolation: bool,
-    /// Largest step of a node's wall clock (0 = clocks never jump).
+    /// Maximum wall-clock jump in milliseconds, or 0 to disable.
     pub clock_step_max_ms: u64,
 }
 
@@ -131,7 +126,6 @@ pub struct SimConfig {
     pub engine: EngineConfig,
     pub node: NodeConfig,
     pub keep_log: bool,
-    /// Report the whole trace in [`SimOutcome::trace_tail`], not just its end.
     pub full_trace: bool,
     pub request_timeout_ms: u64,
 }
@@ -153,8 +147,7 @@ impl SimConfig {
             clock_sync_max_error_ms: 100,
             levels_inline_max: 1,
             version_sample_ms: 5_000,
-            // Short enough for records to expire within a run, long enough
-            // for clients to resolve ambiguous commits (about 30 s).
+            // Short enough to expire within a run, long enough to resolve ambiguous commits.
             commit_retention_ms: 120_000,
             ..EngineConfig::small_for_tests()
         };
@@ -178,12 +171,12 @@ impl SimConfig {
                 json_value_max: 4096,
                 index_backfill_batch_rows: 8,
                 signup: SignupPolicy::Open,
-                // Rate limits calibrated for simulation workloads.
                 limits: crate::limits::LimitConfig {
                     user: crate::limits::Rate::per_sec(400.0),
                     api_key: crate::limits::Rate::per_sec(200.0),
                     auth_per_client: crate::limits::Rate { per_sec: 20.0, burst: 40.0 },
                     signup_per_client: crate::limits::Rate::per_hour(3_600.0, 20.0),
+                    mail_per_account: crate::limits::Rate::per_hour(600.0, 10.0),
                     account_free_failures: 5,
                     client_free_failures: 20,
                     failure_backoff_ms: 500,
@@ -214,8 +207,8 @@ impl SimConfig {
         }
     }
 
-    /// [`SimConfig::faulty`] plus every rarer fault, with clock skew far
-    /// beyond the lease margin. Only availability may suffer.
+    /// [`SimConfig::faulty`] plus store stalls, list lag, duplicate/reordered
+    /// forwarding, and extreme clock skew.
     pub fn hostile(nodes: usize) -> SimConfig {
         let base = SimConfig::faulty(nodes);
         let lease = base.engine.lease_ms;
@@ -273,18 +266,15 @@ pub struct Sim {
     pub store: Arc<SimStore>,
     pub trace: Arc<Trace>,
     pub google: Arc<google::FakeGoogle>,
+    pub mailbox: Arc<mail::Mailbox>,
     slots: Vec<Mutex<Option<Arc<SimNode>>>>,
-    /// Each node slot's local disk tier, which outlives crashes.
     disks: Vec<LocalTier>,
-    /// Blocked directions `(from, to)` between nodes.
     partitions: Mutex<BTreeSet<(usize, usize)>>,
-    /// Nodes that cannot reach the object store.
     store_isolated: Mutex<BTreeSet<usize>>,
     origin: Instant,
     base_ms: u64,
     starts: AtomicU64,
     pub crashes: AtomicU64,
-    /// Accumulated storage engine activity from terminated nodes.
     past_activity: Mutex<crate::engine::Activity>,
     me: Weak<Sim>,
 }
@@ -312,7 +302,6 @@ fn take_panic() -> Option<String> {
     PANIC.with(|p| p.borrow_mut().take())
 }
 
-/// A small local tier per node, so that it evicts.
 const LOCAL_TIER_BYTES: u64 = 64 * 1024;
 
 pub fn addr_of(i: usize) -> String {
@@ -387,7 +376,6 @@ impl Transport for SimTransport {
     }
 }
 
-/// A node's connection to the shared store, which a fault can cut.
 struct NodeStore {
     idx: usize,
     sim: Weak<Sim>,
@@ -395,7 +383,6 @@ struct NodeStore {
 }
 
 impl NodeStore {
-    /// Fail (after a connect-timeout-like delay) if the node is cut off.
     async fn reachable(&self, op: &str, key: &str) -> SResult<()> {
         let Some(sim) = self.sim.upgrade() else { return Ok(()) };
         if !sim.store_isolated(self.idx) {
@@ -469,6 +456,7 @@ impl Sim {
             store,
             trace,
             google,
+            mailbox: Arc::new(mail::Mailbox::default()),
             slots: (0..n).map(|_| Mutex::new(None)).collect(),
             disks: (0..n).map(|_| LocalTier(Arc::new(MemLocal::new(LOCAL_TIER_BYTES)))).collect(),
             partitions: Mutex::new(BTreeSet::new()),
@@ -515,8 +503,7 @@ impl Sim {
         (0..self.slots.len()).filter(|i| self.node(*i).is_some()).collect()
     }
 
-    /// Start (or restart) node `i`, as a fresh machine that can reach the
-    /// store. Retries while the store is flaky.
+    /// Starts or restarts node `i`.
     pub async fn start(&self, i: usize) {
         self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).remove(&i);
         let n = self.starts.fetch_add(1, Ordering::SeqCst);
@@ -544,8 +531,12 @@ impl Sim {
             }
             let transport = Arc::new(SimTransport { from: i, sim: self.me.clone() });
             let store: DynStore = Arc::new(NodeStore { idx: i, sim: self.me.clone(), inner: self.store.clone() });
-            let oidc: Arc<dyn crate::auth::OidcProvider> = self.google.clone();
-            match Node::start(cfg.clone(), env.clone(), store, transport, Some(oidc)).await {
+            let services = Services {
+                transport,
+                oidc: Some(self.google.clone() as Arc<dyn crate::auth::OidcProvider>),
+                mailer: Some(self.mailbox.clone() as Arc<dyn crate::mail::Mailer>),
+            };
+            match Node::start(cfg.clone(), env.clone(), store, services).await {
                 Ok(node) => {
                     let router = api::router(node.clone());
                     self.trace.event(&format!("start n{i} as {}", node.id));
@@ -563,7 +554,7 @@ impl Sim {
         panic!("node {i} could not start");
     }
 
-    /// Kill node `i`: abort all of its tasks and drop its memory.
+    /// Aborts node `i`'s tasks and drops its in-memory state.
     pub fn crash(&self, i: usize) {
         let n = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(n) = n {
@@ -601,20 +592,17 @@ impl Sim {
         self.trace.event(&format!("partition {a}-{b}"));
     }
 
-    /// Drop traffic from `from` to `to` only; replies to requests that
-    /// `to` sends to `from` are lost after `from` processed them.
+    /// Drops traffic from `from` to `to`, including responses to requests sent by `to`.
     pub fn partition_one_way(&self, from: usize, to: usize) {
         self.partitions.lock().unwrap_or_else(|e| e.into_inner()).insert((from, to));
         self.trace.event(&format!("partition {from}->{to}"));
     }
 
-    /// Cut node `i` off from the object store.
     pub fn isolate_from_store(&self, i: usize) {
         self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).insert(i);
         self.trace.event(&format!("isolate n{i} from store"));
     }
 
-    /// Heal every partition and store isolation.
     pub fn heal(&self) {
         self.partitions.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -629,7 +617,6 @@ impl Sim {
         self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).contains(&i)
     }
 
-    /// Step node `i`'s wall clock by `delta_ms`.
     pub fn step_clock(&self, i: usize, delta_ms: i64) {
         if let Some(n) = self.node(i) {
             n.node.env.step_clock(delta_ms);
@@ -643,8 +630,7 @@ impl Sim {
         tokio::time::sleep(Duration::from_millis(d)).await;
     }
 
-    /// Deliver a request to node `i` through its full router. The handler
-    /// runs as one of the node's tasks, so a crash aborts it.
+    /// Dispatches `req` to node `i` as a node task that is aborted if the node crashes.
     pub async fn call_node(&self, i: usize, req: Request<Body>) -> Result<SimResponse, NetError> {
         self.net_delay().await;
         let Some(n) = self.node(i) else {
@@ -661,8 +647,6 @@ impl Sim {
             let body = match http_body_util::BodyExt::collect(body).await {
                 Ok(b) => b.to_bytes(),
                 Err(e) => {
-                    // A failure while streaming the body is a broken
-                    // connection from the client's point of view.
                     let _ = tx.send(Err(format!("body error: {e}")));
                     return;
                 }
@@ -693,7 +677,6 @@ impl Sim {
         }
     }
 
-    /// Let simulated time pass.
     pub async fn sleep(&self, ms: u64) {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
@@ -711,12 +694,9 @@ pub struct SimOutcome {
     pub crashes: u64,
     pub storage: StorageReport,
     pub engine: crate::engine::Activity,
-    /// Last trace lines (when `keep_log`).
     pub trace_tail: Vec<String>,
 }
 
-/// Turns a panic while polling the workload into an error, so that the
-/// run still reports its trace and statistics.
 struct CatchPanic<F>(std::pin::Pin<Box<F>>);
 
 impl<F: Future> Future for CatchPanic<F> {
@@ -731,7 +711,6 @@ impl<F: Future> Future for CatchPanic<F> {
     }
 }
 
-/// Run one simulation to completion.
 pub fn run<F, Fut>(seed: u64, cfg: SimConfig, f: F) -> SimOutcome
 where
     F: FnOnce(Arc<Sim>) -> Fut,
@@ -739,7 +718,7 @@ where
 {
     let lvl = crate::log::level();
     if std::env::var("BASERUNNA_LOG").is_err() {
-        crate::log::set_level(crate::log::ERROR);
+        crate::log::set_level(Some(crate::log::Level::Error));
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
     let full_trace = cfg.full_trace;
@@ -752,7 +731,6 @@ where
         };
         let mut storage = StorageReport::default();
         if result.is_ok() {
-            // Quiesce: stop faults, let in-flight work settle.
             sim.store.set_faults_enabled(false);
             sim.sleep(5_000).await;
             match sim.check_storage().await {
@@ -790,8 +768,12 @@ where
     out
 }
 
-/// Seeds to run: `SIM_SEED` (one), else `SIM_SEEDS` (count) starting from
-/// `base`, else `default_count`.
+/// Time required for two reaper passes to purge all deleted databases.
+pub fn purge_wait_ms(cfg: &SimConfig) -> u64 {
+    2 * cfg.node.db_delete_grace_ms + 3 * crate::node::REAP_INTERVAL_MS
+}
+
+/// Returns the seed list from `SIM_SEED`, `SIM_SEEDS`, or `default_count` starting from `base`.
 pub fn seeds(base: u64, default_count: u64) -> Vec<u64> {
     if let Some(s) = crate::util::prop::env_u64("SIM_SEED") {
         return vec![s];
@@ -800,7 +782,6 @@ pub fn seeds(base: u64, default_count: u64) -> Vec<u64> {
     (0..n).map(|i| base.wrapping_mul(1_000_003).wrapping_add(i)).collect()
 }
 
-/// Run `f` for every seed, panicking with a reproduction hint on failure.
 pub fn run_seeds<F, Fut>(name: &str, base: u64, default_count: u64, cfg: impl Fn() -> SimConfig, f: F)
 where
     F: Fn(Arc<Sim>) -> Fut,

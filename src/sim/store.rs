@@ -1,8 +1,4 @@
-//! Simulated object store with S3 semantics and injected faults.
-//!
-//! A detached task applies each write, so a write sent before its caller
-//! crashed can still land later. Everything is strongly consistent except
-//! LIST, which may lag.
+//! Simulated object store with fault injection and optional list lag.
 
 use super::Trace;
 use crate::store::*;
@@ -18,18 +14,16 @@ use tokio::time::Instant;
 pub struct StoreFaults {
     pub latency_min_ms: u64,
     pub latency_max_ms: u64,
-    /// Probability of a slow request (10x latency).
+    /// Probability of 10x request latency.
     pub p_slow: f64,
-    /// Probability that a request stalls for a duration drawn from
-    /// `stall_ms` (typically longer than a lease) and then succeeds.
+    /// Probability that a request stalls for `stall_ms` before succeeding.
     pub p_stall: f64,
     pub stall_ms: (u64, u64),
     /// Probability that a request fails before being applied.
     pub p_fail_before: f64,
     /// Probability that a write is applied but its response is lost.
     pub p_fail_after: f64,
-    /// Listings are eventually consistent: a new object may stay invisible
-    /// to LIST, and a deleted one may keep appearing, for up to this long.
+    /// Maximum duration for which `list` may omit new objects or include deleted ones.
     pub list_lag_ms: u64,
 }
 
@@ -66,12 +60,11 @@ struct Draw {
     list_lag_ms: u64,
 }
 
-/// What LIST shows differently from the current contents.
 #[derive(Default)]
 struct ListView {
-    /// Objects created recently that LIST does not show yet.
+    /// Newly created objects hidden from `list` until the given instant.
     hidden_until: BTreeMap<String, Instant>,
-    /// Objects deleted recently that LIST still shows.
+    /// Deleted objects still returned by `list` until the given instant.
     ghosts: BTreeMap<String, (ObjectMeta, Instant)>,
 }
 
@@ -107,7 +100,6 @@ impl SimStore {
         }
     }
 
-    /// Turn fault injection on or off (latency stays).
     pub fn set_faults_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::SeqCst);
     }
@@ -140,8 +132,6 @@ impl SimStore {
         self.view.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// One page of a listing as an eventually consistent store would show
-    /// it: lagging creations hidden, lagging deletions still present.
     fn lagged_list(&self, prefix: &str, start_after: Option<&str>, limit: usize) -> ListPage {
         let now = Instant::now();
         let mut view = self.view();
@@ -212,7 +202,7 @@ impl ObjectStore for SimStore {
             let trace = self.trace.clone();
             let view = self.view.clone();
             let key2 = key.to_string();
-            // Detached: survives the caller being cancelled (crash).
+            // Detached so in-flight writes can still land if the caller crashes.
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(lat / 2 + 1)).await;
                 let existed = mem.get_sync(&key2, &GetOpts::default()).is_ok();

@@ -29,19 +29,17 @@ pub struct EngineConfig {
     pub blob_chunk_size: usize,
     pub blob_max: u64,
     pub cache_bytes: usize,
-    /// A node-local tier below the memory cache (local disk), if any.
+    /// Node-local cache tier below the memory cache.
     pub local_tier: Option<LocalTier>,
-    /// How long a lease that a commit renews lasts, measured on each node's
-    /// monotonic clock (SPEC §5.7). It bounds write failover.
+    /// Duration of a lease renewed by a commit, measured on each node's
+    /// monotonic clock (SPEC §5.7).
     pub lease_ms: u64,
-    /// How long a lease renewed for strong reads alone lasts. Longer than
-    /// `lease_ms`, so each renewal (a PUT) covers more reads.
+    /// Duration of a lease renewed for strong reads alone.
     pub read_lease_ms: u64,
-    /// The holder stops relying on its lease this much early, and others
-    /// wait this much longer, to absorb clock rate drift and scheduling.
+    /// Safety margin subtracted by the lease holder and added by other nodes
+    /// to absorb clock rate drift and scheduling delays.
     pub lease_margin_ms: u64,
-    /// Strong reads per `read_lease_ms` that justify renewing a lease for
-    /// reads alone (each renewal is a PUT).
+    /// Strong reads per `read_lease_ms` required to renew a lease for reads alone.
     pub lease_read_threshold: u32,
     pub txn_max_lifetime_ms: u64,
     pub txn_max_write_bytes: usize,
@@ -51,18 +49,16 @@ pub struct EngineConfig {
     pub sweep_interval_ms: u64,
     /// How often a node re-measures its offset from the store's clock.
     pub clock_sync_interval_ms: u64,
-    /// A store clock measurement is trusted for this long; without one, a
-    /// node does no garbage collection.
+    /// Maximum age of a store clock measurement before garbage collection pauses.
     pub clock_sync_max_age_ms: u64,
     /// Measurements less precise than this are discarded.
     pub clock_sync_max_error_ms: u64,
-    /// How long a commit's record stays, for idempotent retries and for
-    /// resolving ambiguous outcomes.
+    /// Retention period for commit records, used for idempotent retries and
+    /// resolving ambiguous commit outcomes.
     pub commit_retention_ms: u64,
     pub compaction_concurrency: usize,
     pub commit_retry_max: u32,
-    /// Maximum time a commit may wait in the committer before it is
-    /// refused (bounds server-side "zombie" requests).
+    /// Maximum time a commit may wait in the committer before it is rejected.
     pub commit_timeout_ms: u64,
     pub commit_batch_max: usize,
     pub version_sample_ms: u64,
@@ -70,9 +66,9 @@ pub struct EngineConfig {
     pub range_delete_points_max: usize,
     /// Maximum segments below L0 stored inline in the manifest before offloading to a levels object.
     pub levels_inline_max: usize,
-    /// Maximum storage size allowed per database (segments, tail, and blobs), or 0 for unlimited.
+    /// Maximum storage size in bytes per database, or 0 for unlimited.
     pub db_max_bytes: u64,
-    /// Minimum interval before triggering a blob-recounting sweep after a quota refusal.
+    /// Minimum interval before triggering a blob-recounting sweep after a quota rejection.
     pub quota_sweep_interval_ms: u64,
 }
 
@@ -147,7 +143,7 @@ impl EngineConfig {
         }
     }
 
-    /// Small sizes that exercise every code path quickly (simulation).
+    /// Small sizes that exercise every code path quickly in tests.
     pub fn small_for_tests() -> EngineConfig {
         EngineConfig {
             tail_max_bytes: 2 * 1024,

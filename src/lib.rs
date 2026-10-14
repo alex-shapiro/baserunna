@@ -15,6 +15,7 @@ pub mod env;
 pub mod error;
 pub mod limits;
 pub mod log;
+pub mod mail;
 pub mod meta;
 pub mod node;
 pub mod ops;

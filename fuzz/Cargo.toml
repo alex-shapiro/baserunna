@@ -58,3 +58,17 @@ path = "fuzz_targets/change_pos.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "names_and_tokens"
+path = "fuzz_targets/names_and_tokens.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multipart"
+path = "fuzz_targets/multipart.rs"
+test = false
+doc = false
+bench = false

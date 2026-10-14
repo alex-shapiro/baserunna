@@ -20,8 +20,7 @@ struct Model {
     data: BTreeMap<Key, (Vec<u8>, u64)>,
 }
 
-/// Transaction simulator over the model (read-your-writes semantics that
-/// mirror the engine).
+/// Transaction simulator over the model with read-your-writes semantics.
 struct TxnSim {
     base: Model,
     writes: BTreeMap<Key, Option<Vec<u8>>>,
@@ -139,7 +138,6 @@ fn s(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
-/// Check a JSON value/blob rendering against expected bytes.
 fn check_value(got: &Json, want: &[u8], ctx: &str) -> Result<(), String> {
     if want.len() > INLINE_MAX {
         let size = got["blob"]["size"].as_u64();
@@ -174,8 +172,7 @@ pub struct KvModel {
     feed: Option<Follower>,
 }
 
-/// A follower of a database's change feed: where it is, and the state it
-/// has built from the feed (each value as the feed rendered it).
+/// Cursor and state reconstructed by a follower of a database's change feed.
 type Follower = (String, BTreeMap<Key, (Json, u64)>);
 
 impl KvModel {
@@ -189,8 +186,8 @@ impl KvModel {
         format!("/v1/dbs/{}{rest}", self.db)
     }
 
-    /// Wait out any zombie request, then force a manifest write so no
-    /// in-flight attempt can land afterwards.
+    /// Waits out any zombie request, then forces a manifest write so no
+    /// in-flight attempt can commit afterwards.
     async fn fence(&self) {
         self.c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
         let id = format!("{:016x}", self.step + (1u64 << 62));
@@ -413,11 +410,10 @@ impl KvModel {
                     return Ok(());
                 }
                 503 | 409 => {
-                    // Retry the same request: safe thanks to the
-                    // idempotency key (409 = OCC conflict with a zombie).
+                    // Safe to retry with the same idempotency key (409 indicates an OCC conflict with a zombie).
                     self.c.pause(100).await;
                 }
-                // Rejected due to storage quota; unapplied write. Deletions are never rejected.
+                // Rejected due to storage quota; deletions are never rejected.
                 507 if sim.writes.values().any(|w| w.is_some()) => return Ok(()),
                 _ => return Err(format!("step {}: unexpected response {} {}", self.step, r.status, r.json)),
             }
@@ -466,8 +462,6 @@ impl KvModel {
                         }
                     }
                 }
-                // Lost or the txn's node changed: the transaction is gone
-                // or will be reaped; nothing was committed.
                 _ => {
                     let _ = self.c.call("DELETE", &self.path(&format!("/transactions/{id}")), None).await;
                     return Ok(());
@@ -638,15 +632,13 @@ impl KvModel {
         }
     }
 
-    /// Read the change feed from where the follower is, and check it: with
-    /// this client the only writer, every change reports the model's
-    /// current state of its key, and applying them all yields the model.
-    /// A cursor too old for the feed restarts from a full read.
+    /// Reads the change feed from the follower's cursor and verifies that
+    /// applying the changes reproduces the model. Resets from a full scan if
+    /// the cursor has expired.
     async fn follow(&mut self) -> Result<(), String> {
         let (mut cursor, mut mirror) = match self.feed.take() {
             Some(f) => f,
             None => {
-                // Start from the current state, at the version of a read of it.
                 let r = self.c.call_retry("GET", &self.path("/kv?limit=1"), None).await;
                 let v = r.json["version"].as_u64().ok_or("no version")?;
                 let mirror = self.model.data.iter().map(|(k, (_, ver))| (k.clone(), (Json::Null, *ver))).collect();
@@ -742,7 +734,6 @@ impl KvModel {
                 return Err(format!("full check {}: version {gv} want {ver}", s(k)));
             }
         }
-        // Also verify through a pinned base64 scan for binary-safe paths.
         let r = self.c.call_retry("GET", &self.path("/kv?encoding=base64&keys_only=true&limit=1000"), None).await;
         let n = r.json["items"].as_array().map(|a| a.len()).unwrap_or(0);
         if n != self.model.data.len() {
@@ -762,8 +753,6 @@ fn header_version(r: &Resp) -> u64 {
     r.raw.headers.get("x-baserunna-version").and_then(|h| h.to_str().ok()).and_then(|h| h.parse().ok()).unwrap_or(0)
 }
 
-/// Run the workload: `clients` independent client/database pairs, `steps`
-/// each, with chaos if enabled.
 pub async fn run(sim: Arc<Sim>, clients: usize, steps: usize, chaos: bool) -> Result<(), String> {
     let mut handles = Vec::new();
     for i in 0..clients {

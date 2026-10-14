@@ -1,5 +1,4 @@
-//! In-memory object store with S3 semantics. Used for tests, the simulator
-//! (wrapped by the fault-injecting `SimStore`) and `mem:` dev mode.
+//! In-memory object store.
 
 use super::*;
 use std::collections::BTreeMap;
@@ -22,7 +21,7 @@ struct Inner {
 }
 
 impl MemStore {
-    /// `clock` supplies last-modified timestamps (ms since epoch).
+    /// `clock` supplies last-modified timestamps in milliseconds since the Unix epoch.
     pub fn new(clock: Box<dyn Fn() -> u64 + Send + Sync>) -> MemStore {
         MemStore { inner: Mutex::new(Inner { objects: BTreeMap::new(), next_etag: 1 }), clock }
     }
@@ -39,9 +38,6 @@ impl MemStore {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
-
-    // Synchronous primitives (also used by the simulator to apply operations
-    // at a chosen virtual instant).
 
     pub fn get_sync(&self, key: &str, opts: &GetOpts) -> SResult<GetResult> {
         let g = self.lock();
@@ -109,7 +105,6 @@ impl MemStore {
         ListPage { objects, next }
     }
 
-    /// Every key currently stored (for invariant checks).
     pub fn keys(&self) -> Vec<String> {
         self.lock().objects.keys().cloned().collect()
     }

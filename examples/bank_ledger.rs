@@ -1,9 +1,8 @@
-//! Real-world example: a ledger with concurrent money transfers.
+//! Ledger example with concurrent money transfers.
 //!
-//! Shows interactive serializable transactions (read balances, decide,
-//! write), automatic conflict detection with client retries, idempotency
-//! keys that make retried requests safe, and an invariant check (money is
-//! never created or destroyed).
+//! Demonstrates interactive serializable transactions, automatic conflict
+//! detection with client retries, idempotency keys, and balance invariant
+//! verification.
 //!
 //! Run: `cargo run --example bank_ledger`
 
@@ -43,7 +42,7 @@ async fn transfer(
         let (a, b) = (bal(0), bal(1));
         if a < amount {
             c.delete(&base).await?;
-            return Ok(false); // insufficient funds
+            return Ok(false);
         }
         c.post(
             &format!("{base}/ops"),
@@ -56,8 +55,6 @@ async fn transfer(
         .await?;
         match c.post(&format!("{base}/commit"), json!({})).await {
             Ok(_) => return Ok(true),
-            // Another transfer touched the same accounts first: retry
-            // with fresh balances. (Serializable isolation detected it.)
             Err(e) if e.code == "conflict" => {
                 conflicts.fetch_add(1, Ordering::Relaxed);
             }

@@ -1,6 +1,6 @@
 #![no_main]
 //! Structure-aware HTTP fuzzing of the transaction-op language against an
-//! exact model of the database (see `baserunna::sim::txn_fuzz`).
+//! exact model of the database.
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

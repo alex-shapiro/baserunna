@@ -245,9 +245,8 @@ impl Shared {
         Ok(idx)
     }
 
-    /// Cache a segment this node just wrote, so it is never fetched back:
-    /// its index in memory (and, if `hot`, its blocks), everything in the
-    /// local tier.
+    /// Caches a newly written segment in the local tier and its index in memory,
+    /// also caching its decoded blocks in memory when `hot` is true.
     pub(crate) fn remember_segment(&self, db: &str, seg: &str, data: &Bytes, hot: bool) -> Result<()> {
         let idx = if hot {
             self.cache_whole(db, seg, data)?
@@ -271,7 +270,7 @@ impl Shared {
         self.cfg.segment_whole_fetch_max.max(FOOTER_LEN as u64)
     }
 
-    /// Load (or fetch from cache) the index of a segment.
+    /// Loads or returns the cached index of a segment.
     pub(crate) async fn seg_index(&self, db: &str, seg: &SegmentMeta) -> Result<Arc<SegmentIndex>> {
         let ck = self.cache_key(db, &seg.id, u32::MAX);
         if let Some(CacheVal::Index(i)) = self.cache.get(&ck) {
@@ -343,8 +342,6 @@ impl Shared {
         }
     }
 
-    /// A block that is not in the memory cache: from the local tier, or
-    /// else the store.
     async fn load_block(&self, db: &str, seg: &SegmentMeta, idx: &SegmentIndex, bi: usize) -> Result<Block> {
         match self.local_block(db, &seg.id, bi).await {
             Some(b) => Ok(b),
@@ -358,7 +355,6 @@ impl Shared {
         Some(b)
     }
 
-    /// A block from the store, kept in both caches.
     async fn fetch_block(&self, db: &str, seg: &SegmentMeta, idx: &SegmentIndex, bi: usize) -> Result<Block> {
         let ck = self.cache_key(db, &seg.id, bi as u32);
         let part = format!("b{bi}");
@@ -377,10 +373,8 @@ impl Shared {
         Ok(b)
     }
 
-    /// Blocks `blocks.start..` up to `blocks.end`, read with one request of
-    /// at most `bulk_read_bytes` (but at least one block). With `cache`, they
-    /// are kept like blocks read one by one; compaction and sweeps read
-    /// each block once and do not keep them.
+    /// Fetches consecutive blocks starting at `blocks.start` up to `blocks.end`
+    /// within `bulk_read_bytes` in a single request, optionally caching them.
     async fn seg_blocks_bulk(
         &self,
         db: &str,
@@ -427,10 +421,9 @@ impl Shared {
 /// How an iterator loads segment blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadMode {
-    /// Block by block through the caches (queries).
+    /// Block by block through the caches.
     Cached,
-    /// Consecutive blocks per request, bypassing the caches (compaction,
-    /// sweeps). Forward iteration only.
+    /// Consecutive blocks per request, bypassing the caches. Forward iteration only.
     Bulk,
 }
 
@@ -466,10 +459,8 @@ pub(crate) struct IterSpec {
     pub expire_at: Option<u64>,
 }
 
-/// A merged iteration over a database's sources (or a subset of them, for
-/// compaction): the newest entry of each key, in key order. Blocks load
-/// lazily, so memory is bounded by one block per source (one bulk read
-/// per source in bulk mode).
+/// Lazily merges entries across a database's sources in key order, yielding the
+/// newest entry for each key.
 pub struct MergeIter {
     shared: Arc<Shared>,
     db: String,
@@ -484,7 +475,6 @@ pub struct MergeIter {
 }
 
 impl MergeIter {
-    /// Iterate `tail` and the `runs` (each a sorted run of segments).
     pub(crate) fn new(
         shared: Arc<Shared>,
         db: &str,
@@ -634,7 +624,7 @@ impl MergeIter {
         }
     }
 
-    /// The next entry (the newest of its key), or `None` at the end.
+    /// Returns the newest entry for the next key, or `None` at the end.
     pub async fn next(&mut self) -> Result<Option<Entry>> {
         let mut cursors = std::mem::take(&mut self.cursors);
         let r = self.next_from(&mut cursors).await;
@@ -745,8 +735,7 @@ impl Version {
         l0.chain(deeper)
     }
 
-    /// Segments whose key range covers `key`: the bloom filters a point
-    /// lookup that misses the tail may have to check.
+    /// Number of segments whose key range covers `key`.
     pub fn segments_for_key(&self, key: &[u8]) -> usize {
         self.candidates(key).count()
     }
@@ -757,8 +746,8 @@ impl Version {
         Ok(self.get_entry(key).await?.filter(|e| !e.is_dead(at)))
     }
 
-    /// The earliest store time reads of this version may use now: the
-    /// version's own time, or the store's clock if it is later.
+    /// Earliest store time reads of this version may use: the version's own
+    /// time or the store's current clock, whichever is later.
     pub fn read_time(&self) -> u64 {
         self.m.time_ms.max(self.shared.store_now_ms().unwrap_or(0))
     }
@@ -792,8 +781,7 @@ impl Version {
         MergeIter::new(self.shared.clone(), &self.m.db_id, &self.m.tail, self.runs(|_| true), spec)
     }
 
-    /// Every stored entry, expired or not, read in bulk without filling the
-    /// caches (sweeps).
+    /// Iterates all stored entries in bulk mode, bypassing the caches.
     pub(crate) fn iter_bulk(&self, include_tombstones: bool) -> MergeIter {
         let spec = IterSpec {
             range: KeyRange::all(),
@@ -822,8 +810,7 @@ impl Version {
         Ok(out)
     }
 
-    /// Returns whether any entry (including tombstones) or range tombstone in
-    /// `range` has `seq > after`.
+    /// Returns whether any entry or range tombstone in `range` has `seq > after`.
     pub async fn changed_since(&self, range: &KeyRange, after: Seq) -> Result<bool> {
         if range.is_empty() {
             return Ok(false);
@@ -834,7 +821,6 @@ impl Version {
         if self.m.tail.iter().any(|e| e.seq > after && range.contains(&e.key)) {
             return Ok(true);
         }
-        // Each source alone: a newer entry anywhere is a change.
         for run in self.runs(|s| s.max_seq > after) {
             let spec = IterSpec {
                 range: range.clone(),
@@ -854,8 +840,7 @@ impl Version {
         Ok(false)
     }
 
-    /// The newest stored entry of every key below the commit keyspace,
-    /// expired or not (tests and checks).
+    /// Returns the newest stored entry for every user key.
     pub async fn all_entries(&self, include_tombstones: bool) -> Result<Vec<Entry>> {
         let mut out = Vec::new();
         let mut it = self.iter(&KeyRange::data(), false, include_tombstones, None);
@@ -870,13 +855,10 @@ impl Version {
         Ok(self.get_entry(key).await?.is_some_and(|e| e.seq > after))
     }
 
-    /// The changes in `range` that come after `after`, in feed order, at
-    /// most `limit` of them: for every key whose newest entry is past
-    /// `after`, that entry (a value, possibly expired, or a deletion), and
-    /// every range tombstone past `after`, clipped to `range`. Intermediate
-    /// values a key had are not reported. Fails with `CursorExpired` if a
-    /// deletion past `after` may have been purged. The commit keyspace is
-    /// never reported (its records are dropped without a trace).
+    /// Returns up to `limit` changes in `range` after `after` in feed order:
+    /// the newest entry for each modified key and any range tombstones clipped
+    /// to `range`. Fails with `CursorExpired` if tombstones after `after` may
+    /// have been purged.
     pub async fn changes(&self, range: &KeyRange, after: &ChangePos, limit: usize) -> Result<ChangePage> {
         if !after.retained_by(self.m.tombstone_horizon) {
             return Err(Error::CursorExpired(format!(
@@ -884,7 +866,6 @@ impl Version {
                 self.m.tombstone_horizon
             )));
         }
-        // The first `limit` changes, and one more to tell whether any follow.
         let mut best: BinaryHeap<Change> = BinaryHeap::new();
         let mut offer = |c: Change| {
             if c.pos() > *after {
@@ -926,8 +907,6 @@ impl Version {
             deletes: Some(self.deletes.clone()),
             expire_at: None,
         };
-        // A key's newest entry is past `after` only in a source holding an
-        // entry that new, so older sources need not be read.
         let runs = self.runs(|s| s.max_seq >= after.seq);
         let mut it = MergeIter::new(self.shared.clone(), &self.m.db_id, &self.m.tail, runs, spec);
         while let Some(e) = it.next().await? {
@@ -991,7 +970,7 @@ impl ChangePos {
         self.seq > horizon || (self.seq == horizon && self.kind == ChangePos::END)
     }
 
-    /// An opaque, URL-safe encoding (see [`ChangePos::decode`]).
+    /// Encodes the cursor as an opaque URL-safe string; see [`ChangePos::decode`].
     pub fn encode(&self) -> String {
         match self.kind {
             ChangePos::END => self.seq.to_string(),
@@ -1018,7 +997,7 @@ impl ChangePos {
 pub enum Change {
     /// A key's newest entry: its value, or a tombstone if it was deleted.
     Entry(Entry),
-    /// Every key in the range was deleted (by entries older than `seq`).
+    /// Range deletion covering entries older than `seq`.
     DeleteRange(RangeTombstone),
 }
 

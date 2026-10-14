@@ -1,16 +1,12 @@
-//! `auth`: sign-up, login, sessions, logout, API keys (scoped, read-only),
-//! revocation, admin powers and Google sign-in, across nodes, including
-//! negative cases (tampered ID tokens, wrong state, unverified email).
+//! Sign-up, login, sessions, logout, scoped and read-only API keys, revocation,
+//! admin privileges, and Google sign-in across nodes, including negative cases.
 
 use super::super::Sim;
 use super::super::client::Client;
 use super::super::google::{Identity, Tamper};
+use super::{cache_expiry, expect};
 use serde_json::json;
 use std::sync::Arc;
-
-fn expect(cond: bool, msg: impl Into<String>) -> Result<(), String> {
-    if cond { Ok(()) } else { Err(msg.into()) }
-}
 
 fn cookie_value(r: &super::super::SimResponse, name: &str) -> Option<String> {
     r.headers.get_all("set-cookie").iter().find_map(|v| {
@@ -21,14 +17,8 @@ fn cookie_value(r: &super::super::SimResponse, name: &str) -> Option<String> {
     })
 }
 
-/// Wait until every node's credential cache has expired.
-async fn cache_expiry(sim: &Arc<Sim>) {
-    sim.sleep(sim.cfg.node.auth_cache_ms + sim.cfg.node.sys_staleness_ms + 500).await;
-}
-
 pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     let anon = Client::new(&sim, "anon");
-    // The very first account becomes an administrator.
     let admin = Client::signup(&sim, "admin", "admin@auth.test", "admin-password").await?;
     let me = admin.call_retry("GET", "/v1/me", None).await;
     expect(me.json["user"]["is_admin"] == true, format!("first user should be admin: {}", me.json))?;
@@ -39,7 +29,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
         format!("alice: {}", me.json),
     )?;
 
-    // Internal endpoints are closed to clients (no cluster key).
     let forged = json!({"cmd": "signup", "id": "evil", "email": "evil@x.io", "password_hash": null,
                         "policy": "open", "bootstrap_admin": true});
     for _ in 0..3 {
@@ -48,7 +37,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
         }
     }
 
-    // Duplicate sign-up and bad input.
     let r = anon
         .call_retry("POST", "/v1/auth/signup", Some(json!({"email": "alice@auth.test", "password": "whatever-123"})))
         .await;
@@ -74,7 +62,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     let bogus = Client::with_token(&sim, "bogus", "brs_not-a-real-token");
     expect(bogus.call_retry("GET", "/v1/me", None).await.status == 401, "bogus token accepted")?;
 
-    // Databases are private to their owner.
     alice.create_db("private").await?;
     alice.create_db("shared").await?;
     let r = admin.call_retry("GET", "/v1/dbs/private/kv/x", None).await;
@@ -88,7 +75,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
         bob.call_retry("GET", "/v1/dbs", None).await.json["databases"].as_array().is_some_and(|a| a.is_empty()),
         "bob lists alice's dbs",
     )?;
-    // Admins can address any database by id.
     let info = alice.call_retry("GET", "/v1/dbs/private", None).await;
     let db_id = info.json["id"].as_str().unwrap_or_default().to_string();
     let r = admin.call_retry("GET", &format!("/v1/dbs/id:{db_id}/kv/secret"), None).await;
@@ -98,7 +84,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
         "non-admin by id",
     )?;
 
-    // API keys: read-only, scoped to one database.
     let r =
         alice.call_retry("POST", "/v1/api-keys", Some(json!({"name": "ro", "db": "private", "read_only": true}))).await;
     expect(r.status == 201, format!("create key: {}", r.json))?;
@@ -123,7 +108,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
         me.json["credential"]["type"] == "api_key" && me.json["credential"]["db"] == "private",
         format!("me as key: {}", me.json),
     )?;
-    // Unscoped read-write key.
     let r = alice.call_retry("POST", "/v1/api-keys", Some(json!({"name": "rw"}))).await;
     expect(r.status == 201, format!("create rw key: {} {}", r.status, r.json))?;
     let rw = Client::with_token(&sim, "rw-key", r.json["key"].as_str().unwrap_or_default());
@@ -138,9 +122,7 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     expect(names == ["ro".to_string(), "rw".to_string()].into(), format!("list keys: {}", keys.json))?;
     expect(!keys.json.to_string().contains("secret_hash"), "key listing leaks hashes")?;
 
-    // Revocation reaches every node within the cache TTL.
     let r = alice.call_settled("DELETE", &format!("/v1/api-keys/{ro_id}"), None).await;
-    // A retried revoke may find the key already gone.
     expect(r.status == 200 || r.status == 404, format!("revoke: {}", r.json))?;
     cache_expiry(&sim).await;
     for _ in 0..4 {
@@ -148,7 +130,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     }
 
     let r = alice2.call_retry("POST", "/v1/auth/logout", Some(json!({}))).await;
-    // A retried logout finds the session already gone.
     expect(r.status == 200 || r.status == 401, format!("logout: {} {}", r.status, r.json))?;
     cache_expiry(&sim).await;
     expect(alice2.call_retry("GET", "/v1/me", None).await.status == 401, "logged-out session works")?;
@@ -184,13 +165,18 @@ async fn google_flow(
     state_override: Option<&str>,
 ) -> Result<(u16, Option<String>), String> {
     let c = Client::new(sim, "browser");
-    let r = loop {
+    let mut start = None;
+    for _ in 0..50 {
         match c.send("GET", "/v1/auth/google/start?return_to=/console/dbs", &[], bytes::Bytes::new()).await {
-            Ok(r) if r.status == 302 => break r,
+            Ok(r) if r.status == 302 => {
+                start = Some(r);
+                break;
+            }
             Ok(r) => return Err(format!("start: {}", r.status)),
             Err(_) => {}
         }
-    };
+    }
+    let r = start.ok_or("google sign-in never started")?;
     let loc = r.headers.get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
     let state = loc.split("state=").nth(1).and_then(|s| s.split('&').next()).unwrap_or_default().to_string();
     let oauth = cookie_value(&r, "brs_oauth").ok_or("no state cookie")?;
@@ -216,6 +202,17 @@ async fn google_flow(
     }
 }
 
+/// Retries [`google_flow`] when a lost callback consumes the single-use code.
+async fn google_until(sim: &Arc<Sim>, id: Identity) -> Result<(u16, Option<String>), String> {
+    for _ in 0..50 {
+        match google_flow(sim, id.clone(), None).await? {
+            (0, _) => {}
+            done => return Ok(done),
+        }
+    }
+    Err(format!("google sign-in as {} never finished", id.email))
+}
+
 async fn google(sim: &Arc<Sim>) -> Result<(), String> {
     let ident = |sub: &str, email: &str, verified: bool| Identity {
         sub: sub.into(),
@@ -223,14 +220,9 @@ async fn google(sim: &Arc<Sim>) -> Result<(), String> {
         email_verified: verified,
         tamper: Tamper::None,
     };
-    let mut tries = 0;
-    let session = loop {
-        tries += 1;
-        match google_flow(sim, ident("g-1", "Gina@Gmail.test", true), None).await? {
-            (302, Some(s)) => break s,
-            (0, _) if tries < 50 => continue,
-            other => return Err(format!("google sign-in failed: {other:?}")),
-        }
+    let session = match google_until(sim, ident("g-1", "Gina@Gmail.test", true)).await? {
+        (302, Some(s)) => s,
+        other => return Err(format!("google sign-in failed: {other:?}")),
     };
     let g = Client::with_token(sim, "gina", &session);
     let me = g.call_retry("GET", "/v1/me", None).await;
@@ -238,30 +230,27 @@ async fn google(sim: &Arc<Sim>) -> Result<(), String> {
         me.json["user"]["email"] == "gina@gmail.test" && me.json["user"]["google_linked"] == true,
         format!("google me: {}", me.json),
     )?;
-    // Same Google account again: same user.
-    let s2 = loop {
-        match google_flow(sim, ident("g-1", "gina@gmail.test", true), None).await? {
-            (302, Some(s)) => break s,
-            (0, _) => continue,
-            other => return Err(format!("second google sign-in: {other:?}")),
-        }
+    let s2 = match google_until(sim, ident("g-1", "gina@gmail.test", true)).await? {
+        (302, Some(s)) => s,
+        other => return Err(format!("second google sign-in failed: {other:?}")),
     };
     let me2 = Client::with_token(sim, "gina2", &s2).call_retry("GET", "/v1/me", None).await;
     expect(me2.json["user"]["id"] == me.json["user"]["id"], "second google login made a new user")?;
-    // Verified email of a password account links it.
-    let s3 = loop {
-        match google_flow(sim, ident("g-bob", "bob@auth.test", true), None).await? {
-            (302, Some(s)) => break s,
-            (0, _) => continue,
-            other => return Err(format!("linking google sign-in: {other:?}")),
-        }
+    // Google must not link to an unverified password account, since whoever
+    // registered the password may not own the address.
+    let r = google_until(sim, ident("g-bob", "bob@auth.test", true)).await?;
+    expect(r.0 == 403, format!("google signed into an unverified password account: {r:?}"))?;
+    let bob = Client::login(sim, "bob", "bob@auth.test", "bob-password").await?;
+    super::steps::verify_email(sim, &bob, "bob@auth.test").await?;
+    let s3 = match google_until(sim, ident("g-bob", "bob@auth.test", true)).await? {
+        (302, Some(s)) => s,
+        other => return Err(format!("linking google sign-in failed: {other:?}")),
     };
     let me3 = Client::with_token(sim, "bob-g", &s3).call_retry("GET", "/v1/me", None).await;
     expect(
         me3.json["user"]["email"] == "bob@auth.test" && me3.json["user"]["has_password"] == true,
         format!("link: {}", me3.json),
     )?;
-    // Negative cases.
     for t in [Tamper::WrongAudience, Tamper::Expired, Tamper::BadSignature, Tamper::WrongIssuer] {
         let (st, s) = google_flow(sim, Identity { tamper: t, ..ident("g-evil", "evil@x.test", true) }, None).await?;
         expect(s.is_none() && (st == 401 || st == 0), format!("tampered token {t:?} accepted: {st}"))?;

@@ -1,9 +1,7 @@
-//! Real-world example: a SaaS backend with one database per tenant.
+//! Multi-tenant SaaS backend example with one database per tenant.
 //!
-//! The operator account creates a database per customer and hands each
-//! customer's service an API key scoped to its own database. A separate
-//! read-only key powers an analytics job. Isolation is enforced by the
-//! service, not by application code.
+//! The operator account provisions a database per customer with a database-scoped
+//! API key and a read-only analytics key.
 //!
 //! Run: `cargo run --example saas_tenants`
 
@@ -73,8 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_string();
     ops.delete(&format!("/v1/api-keys/{initech_key}")).await?;
     ops.delete("/v1/dbs/tenant-initech").await?;
-    // Revocation is immediate on the node that handled it and reaches every
-    // other node within the credential cache TTL (30 s by default).
+    // Revocation is immediate on the handling node and propagates to other
+    // nodes within the credential cache TTL.
     let err = keys[2].txn("tenant-initech", json!([{"op": "get", "key": "settings/plan"}])).await.unwrap_err();
     println!("    offboarded tenant's service: {err}");
     let dbs = ops.get("/v1/dbs").await?;

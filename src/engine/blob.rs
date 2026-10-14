@@ -122,7 +122,7 @@ pub fn blob_meta_key(db: &str, id: &str) -> String {
     format!("{}meta", super::blob_prefix(db, id))
 }
 
-/// Load the descriptor of a staged (or committed) blob by id.
+/// Load the descriptor of a blob by id.
 pub async fn load_staged(shared: &Shared, db: &str, id: &str) -> Result<BlobRef> {
     if !super::types::valid_object_id(id) {
         return Err(Error::invalid(format!("invalid blob id {id:?}")));
@@ -139,23 +139,19 @@ pub async fn load_staged(shared: &Shared, db: &str, id: &str) -> Result<BlobRef>
     Ok(r)
 }
 
-/// A read that has streamed a blob for this long pins it, and renews the
-/// pin as often.
+/// Interval at which long-running blob reads write and renew pins.
 pub fn pin_interval_ms(cfg: &EngineConfig) -> u64 {
     cfg.gc_grace_ms / 3
 }
 
-/// How long a pin protects its blob, in store time: two renewal intervals
+/// Duration a pin protects its blob in store time: two renewal intervals
 /// plus the clock error of the reader and the collector.
 pub fn pin_ttl_ms(cfg: &EngineConfig) -> u64 {
     2 * pin_interval_ms(cfg) + 2 * cfg.clock_sync_max_error_ms
 }
 
-/// Pin a blob that is being read: garbage collection does not delete a
-/// blob whose pin was written within [`pin_ttl_ms`]. A blob is collected
-/// at least `gc_grace` after it stops being referenced, so a read that pins
-/// within [`pin_interval_ms`] of starting, and renews as often, keeps its
-/// blob however long it takes.
+/// Pin a blob being read so garbage collection does not delete it while
+/// the pin is younger than [`pin_ttl_ms`].
 pub async fn pin(shared: &Shared, db: &str, id: &str) -> Result<()> {
     let key = pin_key(db, id);
     shared.retry.run(|| shared.store.put(&key, Bytes::new(), PutMode::Overwrite)).await?;
@@ -179,8 +175,7 @@ pub async fn write_blob(shared: &Arc<Shared>, db: &str, data: &[u8], content_typ
     w.finish().await
 }
 
-/// The chunk reads needed to serve `range` of a blob: (chunk index, range
-/// within the chunk).
+/// Returns the `(chunk_index, chunk_range)` pairs needed to read `range` of a blob.
 pub fn chunk_plan(chunk_size: u64, range: Range<u64>) -> Vec<(u64, Range<u64>)> {
     let mut out = Vec::new();
     let mut pos = range.start;
@@ -215,7 +210,7 @@ pub async fn read_chunk(shared: &Shared, db: &str, blob: &BlobRef, ci: u64, r: R
     Ok(g.data)
 }
 
-/// Read a byte range of a blob into memory (for small blobs / tests).
+/// Read a byte range of a blob into memory.
 pub async fn read_range(shared: &Shared, db: &str, blob: &BlobRef, range: Range<u64>) -> Result<Bytes> {
     if range.start > range.end || range.end > blob.size {
         return Err(Error::invalid("blob range out of bounds"));
@@ -231,8 +226,6 @@ pub async fn read_range(shared: &Shared, db: &str, blob: &BlobRef, range: Range<
 mod tests {
     use super::*;
 
-    /// A read pins its blob well before `gc_grace` runs out, and renews
-    /// the pin before it lapses.
     #[test]
     fn pins_are_written_in_time_and_renewed_before_they_lapse() {
         for cfg in [EngineConfig::default(), EngineConfig::small_for_tests()] {

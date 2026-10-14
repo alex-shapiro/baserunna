@@ -1,8 +1,4 @@
-//! Small deterministic PRNG (xoshiro256**) seeded via SplitMix64.
-//!
-//! Used for simulation, property tests and non-cryptographic choices
-//! (jitter, sampling). Cryptographic randomness in production comes from
-//! aws-lc-rs through [`crate::env::Env`].
+//! Deterministic xoshiro256** PRNG seeded via SplitMix64.
 
 #[derive(Clone, Debug)]
 pub struct Rng {
@@ -24,7 +20,7 @@ impl Rng {
         Rng { s }
     }
 
-    /// Derive an independent generator (e.g. one per simulated component).
+    /// Derive an independent generator.
     pub fn fork(&mut self) -> Rng {
         Rng::new(self.next_u64())
     }

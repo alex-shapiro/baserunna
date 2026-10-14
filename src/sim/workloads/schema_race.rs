@@ -23,14 +23,14 @@ fn row_json(id: i64, r: &Row) -> Json {
     json!({"id": id, "email": r.email, "n": r.n, "tag": format!("t{}", r.n % 3)})
 }
 
-/// Outcome of a write whose ambiguity has been resolved.
+/// Outcome of a write after resolving any ambiguity.
 enum Applied {
     Yes,
     No,
 }
 
-/// Settle a request: `Yes` if it took effect, `No` if it definitively did
-/// not (a 4xx the workload expects, given in `rejected`).
+/// Executes a request to completion, returning `Yes` if applied or `No` if
+/// rejected with a status and code in `rejected`.
 async fn settle(c: &Client, method: &str, path: &str, body: Json, rejected: &[(u16, &str)]) -> Result<Applied, String> {
     let r = c.call_settled(method, path, Some(body)).await;
     judge(&r, rejected)
@@ -46,8 +46,6 @@ fn judge(r: &Resp, rejected: &[(u16, &str)]) -> Result<Applied, String> {
     Err(format!("unexpected response {} {}", r.status, r.json))
 }
 
-/// A one-shot transaction with an idempotency key, retried until its
-/// outcome is known.
 async fn one_shot(c: &Client, body: Json, rejected: &[(u16, &str)]) -> Result<Applied, String> {
     let path = format!("{BASE}/txn");
     loop {
@@ -60,8 +58,7 @@ async fn one_shot(c: &Client, body: Json, rejected: &[(u16, &str)]) -> Result<Ap
     }
 }
 
-/// An interactive transaction of `ops`; ambiguity is resolved with a fenced
-/// commit-status query.
+/// Runs an interactive transaction, resolving commit ambiguity via the commit-status endpoint.
 async fn interactive(c: &Client, isolation: &str, ops: Json, rejected: &[(u16, &str)]) -> Result<Applied, String> {
     let r = c.call("POST", &format!("{BASE}/transactions"), Some(json!({"isolation": isolation}))).await;
     let Ok(r) = r else { return Ok(Applied::No) };
@@ -72,8 +69,6 @@ async fn interactive(c: &Client, isolation: &str, ops: Json, rejected: &[(u16, &
     let cid = r.json["commit_id"].as_str().unwrap_or_default().to_string();
     match c.call("POST", &format!("{BASE}/transactions/{id}/ops"), Some(json!({"ops": ops}))).await {
         Ok(r) if r.ok() => {}
-        // The transaction is gone (its node changed or an op failed):
-        // nothing was committed.
         Ok(r) if r.status == 404 || r.status == 503 => return Ok(Applied::No),
         Ok(r) => return judge(&r, rejected).map(|_| Applied::No),
         Err(_) => return Ok(Applied::No),
@@ -96,9 +91,8 @@ async fn interactive(c: &Client, isolation: &str, ops: Json, rejected: &[(u16, &
     }
 }
 
-/// Rejections a row write may legitimately get while the schema changes:
-/// a unique index rejects a duplicate email, the scratch table may not
-/// exist, and the `extra` column may not exist.
+/// Expected 4xx rejections during concurrent schema changes: duplicate email on
+/// a unique index, missing `scratch` table, or missing `extra` column.
 const ROW_REJECTIONS: &[(u16, &str)] = &[(409, "already_exists"), (404, "not_found"), (400, "invalid_argument")];
 
 async fn writer(c: Client, w: i64, steps: usize) -> Result<BTreeMap<i64, Row>, String> {
@@ -115,7 +109,6 @@ async fn writer(c: Client, w: i64, steps: usize) -> Result<BTreeMap<i64, Row>, S
         let ctx = format!("writer {w} step {step}");
         match rng.below(8) {
             6 | 7 => {
-                // Many of this writer's rows at once, by selection.
                 let mine = json!({"gte": w * 100, "lt": w * 100 + 100});
                 let pivot = rng.below(9) as i64;
                 let (op, hit): (Json, Vec<i64>) = match rng.chance(0.6) {
@@ -158,8 +151,7 @@ async fn writer(c: Client, w: i64, steps: usize) -> Result<BTreeMap<i64, Row>, S
                 }
             }
             1 | 2 => {
-                // The scratch insert may fail (table dropped), aborting the
-                // whole transaction.
+                // If `scratch` has been dropped, the insert fails and aborts the whole transaction.
                 let mut ops = vec![json!({"op": "upsert_row", "table": "items", "row": row_json(id, &row)})];
                 if rng.chance(0.4) {
                     ops.push(json!({"op": "upsert_row", "table": "scratch", "row": {"k": id, "v": step as i64}}));
@@ -178,7 +170,6 @@ async fn writer(c: Client, w: i64, steps: usize) -> Result<BTreeMap<i64, Row>, S
                 }
             }
             4 => {
-                // Partial update, sometimes of the column that comes and goes.
                 let set = if rng.chance(0.3) { json!({"extra": 1}) } else { json!({"n": row.n}) };
                 let body = json!({"pk": id, "set": set.clone()});
                 let r = c.call_settled("POST", &format!("{BASE}/tables/items/rows/update"), Some(body)).await;

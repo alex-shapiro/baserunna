@@ -32,9 +32,8 @@ tokio::task_local! {
     static INVOKED_AT: Instant;
 }
 
-/// Run `f` as one operation invoked at `at`: its strong reads may use a
-/// manifest validated at or after `at` (still linearizable), so several
-/// reads within one request pay for one validation.
+/// Runs `f` as a single operation invoked at `at` so strong reads within the
+/// scope can reuse a manifest validated at or after `at`.
 pub async fn invoked_at<F: std::future::Future>(at: Instant, f: F) -> F::Output {
     INVOKED_AT.scope(at, f).await
 }
@@ -107,14 +106,12 @@ impl Work {
 
 struct State {
     current: Option<Arc<Version>>,
-    /// `current` is known to equal the store's latest manifest unless
-    /// someone else wrote since (false after an ambiguous write).
+    /// False after an ambiguous write until the manifest is refreshed.
     trusted: bool,
     /// Start time of the most recent successful validation of `current`.
     verified_at: Option<Instant>,
     last_access: Instant,
-    /// Strong reads in the current read lease period (window) and the
-    /// previous one.
+    /// Strong reads in the current and previous read lease windows.
     window_start: Instant,
     reads_in_window: u32,
     reads_last_window: u32,
@@ -124,7 +121,7 @@ struct State {
     own_lease: Option<(u64, Instant)>,
     compacting: bool,
     sweeping: bool,
-    /// Indicates a write was refused due to quota, signaling an earlier sweep.
+    /// Indicates a write was rejected due to quota, signaling an earlier sweep.
     quota_pressure: bool,
 }
 
@@ -167,24 +164,40 @@ pub struct Committed {
     pub version: Seq,
     /// The commit id had already been applied by an earlier attempt.
     pub replayed: bool,
-    /// The version's store time, which a time to live counts from (0 for a
-    /// replay).
+    /// Store time of the committed version, or 0 for a replay.
     pub time_ms: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Database storage statistics at a single version.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DbStats {
     pub version: Seq,
-    pub segments: usize,
-    pub segment_bytes: u64,
+    /// Non-empty segment levels, shallowest first.
+    pub levels: Vec<LevelStats>,
     pub tail_entries: usize,
     pub tail_bytes: usize,
+    pub range_tombstones: usize,
+    /// Referenced blob bytes.
+    pub blob_bytes: u64,
+    /// Segments and blobs no longer referenced, awaiting collection.
+    pub pending_gc_objects: usize,
     pub lease_holder: Option<String>,
+    #[serde(rename = "lease_expires_at")]
     pub lease_expires_ms: Option<u64>,
+    /// Store time of the last commit or maintenance write.
+    #[serde(rename = "updated_at")]
+    pub updated_ms: u64,
     /// Total stored bytes tracked against the database quota.
     pub size_bytes: u64,
     pub quota_bytes: Option<u64>,
-    pub range_tombstones: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LevelStats {
+    pub level: u8,
+    pub segments: usize,
+    pub bytes: u64,
+    pub entries: u64,
 }
 
 impl Db {
@@ -250,8 +263,8 @@ impl Db {
     // wall clocks are. `expires_ms` in the manifest only identifies a
     // renewal and serves as a hint.
 
-    /// How long we may still rely on our lease in `m` (zero if `m` is not
-    /// the manifest write that last renewed it).
+    /// Remaining duration we may rely on our lease in `m`, or zero if `m` is
+    /// not the manifest write that last renewed it.
     fn own_lease_left(&self, st: &State, m: &Manifest) -> Duration {
         let ours = m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id);
         match st.own_lease {
@@ -284,20 +297,34 @@ impl Db {
         self.foreign_lease(&cur.m).map(|(l, _)| l.node.clone())
     }
 
-    pub fn stats(&self) -> Option<DbStats> {
-        let cur = self.current()?;
-        Some(DbStats {
-            version: cur.m.version,
-            segments: cur.m.segments.len(),
-            segment_bytes: cur.m.segments.iter().map(|s| s.size).sum(),
-            tail_entries: cur.m.tail.len(),
-            tail_bytes: cur.m.tail_bytes(),
-            lease_holder: cur.m.lease.as_ref().map(|l| l.node.clone()),
-            lease_expires_ms: cur.m.lease.as_ref().map(|l| l.expires_ms),
-            size_bytes: cur.m.stored_bytes(),
+    /// Storage statistics at version `v`.
+    pub fn stats(&self, v: &Version) -> DbStats {
+        let m = &v.m;
+        let mut levels: Vec<LevelStats> = Vec::new();
+        for s in &m.segments {
+            match levels.last_mut() {
+                Some(l) if l.level == s.level => {
+                    l.segments += 1;
+                    l.bytes += s.size;
+                    l.entries += s.entries;
+                }
+                _ => levels.push(LevelStats { level: s.level, segments: 1, bytes: s.size, entries: s.entries }),
+            }
+        }
+        DbStats {
+            version: m.version,
+            levels,
+            tail_entries: m.tail.len(),
+            tail_bytes: m.tail_bytes(),
+            range_tombstones: m.range_deletes.len(),
+            blob_bytes: m.blob_bytes.total(),
+            pending_gc_objects: m.obsolete.len(),
+            lease_holder: m.lease.as_ref().map(|l| l.node.clone()),
+            lease_expires_ms: m.lease.as_ref().map(|l| l.expires_ms),
+            updated_ms: m.time_ms,
+            size_bytes: m.stored_bytes(),
             quota_bytes: self.quota(),
-            range_tombstones: cur.m.range_deletes.len(),
-        })
+        }
     }
 
     /// Effective size quota for this database in bytes, or None if unlimited or exempt.
@@ -308,7 +335,6 @@ impl Db {
 
     fn staging(&self) -> std::sync::MutexGuard<'_, Staging> {
         let mut g = self.staging.lock().unwrap_or_else(|e| e.into_inner());
-        // Discard staging reservations for uploads exceeding the stage TTL.
         let ttl = Duration::from_millis(self.shared.cfg.blob_stage_ttl_ms);
         g.staged.retain(|_, (_, at)| at.elapsed() < ttl);
         g
@@ -367,14 +393,13 @@ impl Db {
         installed
     }
 
-    /// Fetch the latest manifest unless one fetched after `not_before` is
-    /// already known. Creates the database if `create` and it is missing.
+    /// Fetches the latest manifest unless one validated at or after `not_before`
+    /// is already cached. Creates the database if `create` is true and it is missing.
     pub async fn refresh(self: &Arc<Self>, not_before: Instant, create: bool) -> Result<Arc<Version>> {
         Ok(self.refresh_at(not_before, create).await?.0)
     }
 
-    /// [`Db::refresh`], with an instant no later than one at which the
-    /// version returned was the store's latest.
+    /// [`Db::refresh`], returning the instant at which the version was validated.
     async fn refresh_at(self: &Arc<Self>, not_before: Instant, create: bool) -> Result<(Arc<Version>, Instant)> {
         let _g = self.load_lock.lock().await;
         let (etag, cur) = {
@@ -439,9 +464,8 @@ impl Db {
         Ok(self.snapshot(c).await?.version)
     }
 
-    /// A version satisfying `c`, read at the latest store time at which it
-    /// is known to have been the latest version (or later, if that is
-    /// before the version's own time): a snapshot of one moment.
+    /// Returns a snapshot satisfying `c` paired with the store time at which
+    /// that version was current.
     pub async fn snapshot(self: &Arc<Self>, c: Consistency) -> Result<Snapshot> {
         if c == Consistency::Strong {
             // A write of ours that is in flight may already be visible to
@@ -483,9 +507,8 @@ impl Db {
         self.snapshot_at(check_live(v)?, current_at).await
     }
 
-    /// The cached version, if it satisfies `c` at `now`, with the instant
-    /// it is known to be the latest at. Counts the read, and renews a lease
-    /// that frequent reads keep about to lapse.
+    /// Returns the cached version and validation time if it satisfies `c` at
+    /// `now`, scheduling a background lease renewal when reads are frequent.
     fn cached(self: &Arc<Self>, c: Consistency, now: Instant) -> Option<(Arc<Version>, Instant)> {
         let cfg = &self.shared.cfg;
         let mut st = self.st();
@@ -509,8 +532,6 @@ impl Db {
                     || st.verified_at.is_some_and(|v| now.duration_since(v) <= Duration::from_millis(max_staleness_ms))
             }
         };
-        // Renew shortly before the lease runs out: often enough not to
-        // lapse, rarely enough that each renewal covers many reads.
         let want_lease = leased && hot && !st.lease_requested && lease_left < Duration::from_millis(cfg.lease_ms / 5);
         if want_lease {
             st.lease_requested = true;
@@ -532,10 +553,8 @@ impl Db {
         Some((cur, current_at))
     }
 
-    /// `v` read at the store time of `at`, or at the version's own time if
-    /// that is later. Without a measurement of the store's clock, the
-    /// version's time would hide expiries since: a version holding values
-    /// that expire is read only once the clock is measured.
+    /// Pairs `v` with the store time corresponding to `at`, syncing the store
+    /// clock first if `v` contains expiring entries and no measurement exists.
     async fn snapshot_at(&self, v: Arc<Version>, at: Instant) -> Result<Snapshot> {
         let store = match self.shared.store_now_ms() {
             Some(t) => t,
@@ -546,8 +565,7 @@ impl Db {
         Ok(Snapshot { time_ms: v.m.time_ms.max(store), version: v })
     }
 
-    /// Mark the database deleted (idempotent). Afterwards every read and
-    /// commit on any node fails with not-found.
+    /// Marks the database deleted so all subsequent reads and commits fail with not-found.
     pub async fn mark_deleted(self: &Arc<Self>) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.enqueue(Work::MarkDeleted { tx });
@@ -559,8 +577,7 @@ impl Db {
         Ok(Txn::new(snap, isolation, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes))
     }
 
-    /// A writer for a new staged blob. Its id records the store time, so the
-    /// clock is measured first if that is due.
+    /// Creates a writer for a new staged blob, syncing the store clock first if needed.
     pub async fn blob_writer(self: &Arc<Self>, content_type: &str) -> BlobWriter {
         if let Err(e) = self.shared.store_time_ms().await {
             crate::debug!("staging a blob without store time: {e}");
@@ -578,8 +595,7 @@ impl Db {
         Ok(self.commit_detailed(req).await?.version)
     }
 
-    /// Like [`Db::commit`], also reporting whether the commit id had already
-    /// been applied (an idempotent replay; nothing new was written).
+    /// Commits `req` and reports whether the commit ID was already applied.
     pub async fn commit_detailed(self: &Arc<Self>, mut req: CommitRequest) -> Result<Committed> {
         if req.writes.is_empty() {
             return Ok(Committed { version: req.read_version, replayed: false, time_ms: req.read_time });
@@ -588,8 +604,6 @@ impl Db {
             req.deadline = Some(Instant::now() + Duration::from_millis(self.shared.cfg.commit_timeout_ms));
         }
         if !req.writes.blob_ids().is_empty() || req.writes.has_relative_ttl() {
-            // Binding a staged blob is checked against store time, and a
-            // time to live counts from it.
             self.shared.store_time_ms().await?;
         }
         let (tx, rx) = oneshot::channel();
@@ -608,7 +622,7 @@ impl Db {
         rx.await.map_err(|_| Error::unavailable("lease request interrupted"))?
     }
 
-    /// Give up our lease (graceful shutdown) so others can take over at once.
+    /// Releases this node's lease so other nodes can take over immediately.
     pub async fn release_lease(self: &Arc<Self>) -> Result<()> {
         let held = self.current().is_some_and(|c| c.m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id));
         if !held {
@@ -619,17 +633,14 @@ impl Db {
         rx.await.map_err(|_| Error::unavailable("lease release interrupted"))?
     }
 
-    /// Whether a commit id is known to be applied, from a strong read
-    /// (cheap; an in-flight ambiguous attempt may still land later).
+    /// Checks whether commit `id` has been applied as of a strong read.
     pub async fn commit_status(self: &Arc<Self>, id: u64) -> Result<Option<Seq>> {
         let v = self.read_version(Consistency::Strong).await?;
         committed(&v, id).await
     }
 
-    /// Definitive commit status: writes the manifest first, fencing any
-    /// in-flight attempt of an earlier ambiguous commit, then looks for its
-    /// commit record. `None` means not committed, if the commit is younger
-    /// than `commit_retention_ms`.
+    /// Fences any in-flight commit attempts by writing the manifest, then
+    /// checks whether commit `id` was applied.
     pub async fn commit_status_fenced(self: &Arc<Self>, id: u64) -> Result<Option<Seq>> {
         self.acquire_lease().await?;
         self.commit_status(id).await
@@ -1307,20 +1318,19 @@ impl Db {
         rx.await.map_err(|_| Error::unavailable("sweep interrupted"))?
     }
 
-    /// Run a sweep now (tests and admin tooling).
+    /// Runs a garbage collection sweep immediately.
     pub async fn sweep_now(self: &Arc<Self>) -> Result<()> {
         self.clone().sweep().await
     }
 
-    /// Commit a no-op lease renewal that also performs due GC (tests).
+    /// Commits a lease renewal that also runs due garbage collection.
     pub async fn maintenance_now(self: &Arc<Self>) -> Result<()> {
         self.acquire_lease().await
     }
 }
 
-/// Clocks for one manifest write: the wall clock for hints (lease expiry),
-/// store time for everything garbage collection relies on (`None` if this
-/// node has no recent measurement, which pauses collection).
+/// Wall-clock and store-clock timestamps for a manifest write. When `store_ms`
+/// is `None`, garbage collection is paused.
 #[derive(Clone, Copy, Debug)]
 struct Now {
     wall_ms: u64,
@@ -1339,9 +1349,8 @@ fn bind_margin_ms(cfg: &super::EngineConfig) -> u64 {
     2 * cfg.clock_sync_max_error_ms
 }
 
-/// Whether `w` may bind the staged blobs it references: each must be
-/// younger than the stage TTL in store time, and not already found
-/// orphaned (the manifest write serializes binding with sweeps).
+/// Validates that all staged blobs referenced by `w` are within the stage TTL
+/// and have not been marked obsolete.
 fn bindable(w: &WriteSet, m: &Manifest, store_now: Option<u64>, cfg: &super::EngineConfig) -> Result<()> {
     let ids = w.blob_ids();
     if ids.is_empty() {
@@ -1406,7 +1415,7 @@ pub(crate) fn quota_exceeded(limit: u64) -> Error {
     Error::QuotaExceeded(format!("the database is at its size quota of {limit} bytes; delete data to make room"))
 }
 
-/// Calculates net storage addition (total added bytes, bound blob bytes) for a commit write set.
+/// Returns `(total_added_bytes, bound_blob_bytes)` for a commit write set.
 fn growth(w: &WriteSet) -> (u64, u64) {
     let mut added = 0;
     let mut blobs = 0;
@@ -1419,8 +1428,8 @@ fn growth(w: &WriteSet) -> (u64, u64) {
     (added + blobs, blobs)
 }
 
-/// Applies a range deletion to the manifest and tail. Small ranges (< points_max stored entries)
-/// emit individual point tombstones; larger ranges are stored as a single range tombstone.
+/// Applies a range deletion to the manifest and tail, emitting point tombstones
+/// when fewer than `points_max` stored entries are covered, or a range tombstone otherwise.
 async fn delete_range(
     base: &Version,
     m: &mut Manifest,
@@ -1481,8 +1490,7 @@ async fn delete_object(shared: &Shared, db: &str, o: &Obsolete) -> Result<()> {
         ObjKind::Blob => {
             let now = shared.store_now_ms().ok_or_else(|| Error::unavailable("store clock not synchronized"))?;
             if super::blob::pinned(shared, db, &o.id, now).await? {
-                // A long read still needs it. It is an orphan again, so a
-                // later sweep finds it once the read is over.
+                // Pinned by an active read; a later sweep will collect it.
                 return Ok(());
             }
             let objs = crate::store::list_all(&*shared.store, &blob_prefix(db, &o.id), &shared.retry).await?;
@@ -1500,7 +1508,6 @@ mod tests {
     use crate::engine::EngineConfig;
     use crate::engine::tests::{engine, rt};
 
-    /// A segment named `c` at `level` covering the keys `min..=max`.
     fn meta(c: char, level: u8, min: &str, max: &str) -> SegmentMeta {
         SegmentMeta {
             id: c.to_string().repeat(32),
@@ -1518,7 +1525,6 @@ mod tests {
         }
     }
 
-    // Helper to evaluate a batch against a test manifest.
     async fn plan(segments: &[SegmentMeta], obsolete: Vec<Obsolete>, batch: Vec<Work>) -> Plan {
         let (eng, _, _) = engine(1, EngineConfig::small_for_tests());
         let mut m =
@@ -1548,9 +1554,6 @@ mod tests {
         p.manifest.as_ref().map(|m| m.segments.iter().map(|s| format!("{}{}", &s.id[..1], s.level)).collect())
     }
 
-    /// A compaction installs only onto the manifest it was planned from,
-    /// with all of its inputs present and its outputs fitting their level;
-    /// installing it again is a no-op success.
     #[test]
     fn compaction_installs_check_their_inputs() {
         rt().block_on(async {
@@ -1572,7 +1575,6 @@ mod tests {
         });
     }
 
-    /// Without a store clock measurement nothing is collected or swept.
     #[test]
     fn collection_pauses_without_store_time() {
         rt().block_on(async {
@@ -1591,8 +1593,6 @@ mod tests {
         });
     }
 
-    /// A staged blob can be bound while it is young in store time and not
-    /// found orphaned; without store time, nothing is bound.
     #[test]
     fn binding_checks_age_and_the_obsolete_list() {
         let cfg = EngineConfig::small_for_tests();
@@ -1621,7 +1621,6 @@ mod tests {
         assert!(matches!(bindable(&writes(&id), &fresh, None, &cfg), Err(Error::Unavailable { .. })));
     }
 
-    /// A trivial move changes a segment's level without making it obsolete.
     #[test]
     fn trivial_moves_keep_their_segment() {
         rt().block_on(async {
@@ -1633,8 +1632,6 @@ mod tests {
         });
     }
 
-    /// A sweep's findings are recorded once each, and never for a live
-    /// segment.
     #[test]
     fn obsolete_objects_are_recorded_once_and_never_live_segments() {
         rt().block_on(async {

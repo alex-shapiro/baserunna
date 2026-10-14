@@ -1,11 +1,11 @@
 //! Database-scoped routes: databases, KV, blobs, transactions and tables.
 
 use super::body::{BlobBody, Upload, parse_range, read_upload};
-use super::{Auth, DbCtx, JsonBody, Params, consistency_of, percent_decode, with_read, with_txn};
+use super::{Auth, DbCtx, JsonBody, Params, consistency_of, paging, percent_decode, with_read, with_txn};
 use crate::engine::manifest::ObjKind;
-use crate::engine::{Change, ChangePos, Consistency, Isolation, Value, blob};
+use crate::engine::{Change, ChangePos, Consistency, Isolation, Txn, Value, blob};
 use crate::error::{Error, Result};
-use crate::meta::{self, MetaCmd};
+use crate::meta::{self, DbRecord, DbRef, MetaCmd};
 use crate::node::{Node, OpenTxn};
 use crate::ops::{self, Encoding, Op, OpCtx, exec_ops, user_key};
 use crate::table::{self, BlobResolver, ColumnSpec, CreateTable, IndexSpec, InsertMode, Query, Selection};
@@ -15,7 +15,7 @@ use axum::extract::{Extension, Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use http::{HeaderMap, HeaderValue, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,27 +59,75 @@ fn param<'a>(p: &'a HashMap<String, String>, k: &str) -> Result<&'a str> {
 }
 
 fn op_ctx<'a>(node: &Node, ctx: &'a DbCtx, enc: Encoding) -> OpCtx<'a> {
-    OpCtx { db: &ctx.db, encoding: enc, read_only: ctx.principal.read_only(), json_value_max: node.cfg.json_value_max }
+    OpCtx { db: &ctx.db, encoding: enc, access: ctx.access, json_value_max: node.cfg.json_value_max }
 }
 
-// ------------------------------------------------------------ databases
+#[derive(Serialize)]
+struct DbSummary<'a> {
+    id: &'a str,
+    name: &'a str,
+    org: Option<&'a str>,
+    created_at: i64,
+}
 
-pub async fn list_dbs(State(node): State<Arc<Node>>, Auth(p): Auth) -> Result<J> {
-    let mut t = node.sys_read_strong().await?;
-    let mut dbs = meta::list_dbs(&mut t, &p.user.id).await?;
-    if let Some(scope) = p.scoped_db() {
-        dbs.retain(|d| d.id == scope);
+impl<'a> DbSummary<'a> {
+    fn new(db: &'a DbRecord, org: Option<&'a str>) -> DbSummary<'a> {
+        DbSummary { id: &db.id, name: &db.name, org, created_at: db.created_at }
     }
-    let out: Vec<Json> = dbs.iter().map(|d| json!({"id": d.id, "name": d.name, "created_at": d.created_at})).collect();
-    Ok(axum::Json(json!({"databases": out})))
+}
+
+async fn org_name(t: &mut Txn, owner_id: &str) -> Result<Option<String>> {
+    if !meta::is_org_id(owner_id) {
+        return Ok(None);
+    }
+    let org = meta::get_org(t, owner_id).await?;
+    Ok(Some(org.ok_or_else(|| Error::internal(format!("database owner {owner_id} is missing")))?.name))
+}
+
+/// Formats the display reference for `d` (`name` or `org.name`).
+pub async fn db_ref(t: &mut Txn, d: &DbRecord) -> Result<String> {
+    Ok(DbRef::format(org_name(t, &d.owner_id).await?.as_deref(), &d.name))
+}
+
+/// Lists databases for the authenticated user or the specified `org`.
+pub async fn list_dbs(State(node): State<Arc<Node>>, Auth(p): Auth, q: Params) -> Result<J> {
+    let (limit, cursor) = paging(&q)?;
+    let org = q.get("org");
+    let mut t = node.sys_read_strong().await?;
+    let (dbs, next_cursor) = match (p.scoped_db(), org) {
+        (Some(_), Some(_)) => return Err(Error::PermissionDenied("this API key is limited to one database".into())),
+        (Some(scope), None) => (meta::get_db(&mut t, scope).await?.into_iter().collect(), None),
+        (None, Some(name)) => {
+            let owner = node.resolve_org(&p, name).await?.0.id;
+            let page = meta::dbs_page(&mut t, &owner, limit, cursor).await?;
+            (page.items, page.next_cursor)
+        }
+        (None, None) => {
+            let page = meta::dbs_page(&mut t, &p.user.id, limit, cursor).await?;
+            (page.items, page.next_cursor)
+        }
+    };
+    let mut out = Vec::with_capacity(dbs.len());
+    for db in &dbs {
+        let org = org_name(&mut t, &db.owner_id).await?;
+        out.push(to_json(&DbSummary::new(db, org.as_deref()))?);
+    }
+    Ok(axum::Json(json!({"databases": out, "next_cursor": next_cursor})))
+}
+
+fn to_json<T: Serialize>(v: &T) -> Result<Json> {
+    serde_json::to_value(v).map_err(|e| Error::internal(e.to_string()))
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateDb {
     name: String,
+    #[serde(default)]
+    org: Option<String>,
 }
 
+/// Creates a database owned by the authenticated user or the specified `org`.
 pub async fn create_db(
     State(node): State<Arc<Node>>,
     Auth(p): Auth,
@@ -87,64 +135,59 @@ pub async fn create_db(
 ) -> Result<Response> {
     p.require_writable()?;
     p.require_unscoped()?;
+    let owner_id = match &c.org {
+        Some(o) => node.resolve_org(&p, o).await?.0.id,
+        None => p.user.id.clone(),
+    };
     let create = MetaCmd::CreateDb {
         id: node.env.random_hex(10),
-        owner_id: p.user.id.clone(),
+        owner_id,
+        actor: p.user.id.clone(),
         name: c.name.clone(),
-        max_dbs: node.cfg.max_dbs_per_user,
+        max_dbs: node.cfg.max_dbs_per_owner,
     };
-    let r = match node.run_meta(create.clone()).await {
+    let db: DbRecord = match node.run_meta_as(create.clone()).await {
         Err(Error::AlreadyExists(m)) => {
-            // The name may belong to a database whose deletion stopped after
-            // flagging its manifest deleted: finish it, then create.
-            let existing = node.resolve_db_strong(&p, &c.name).await?;
+            // If a prior deletion stopped after marking the manifest deleted, finish it and retry.
+            let (existing, _) = node.resolve_db_strong(&p, &DbRef::format(c.org.as_deref(), &c.name)).await?;
             let db = node.open_db(&existing).await?;
             let deleted =
                 db.read_version(Consistency::Strong).await.is_err() && db.current().is_some_and(|v| v.m.is_deleted());
-            match deleted {
-                true => {
-                    node.run_meta(MetaCmd::DeleteDb { id: existing.id.clone() }).await?;
-                    node.forget_db_name(&p.user.id, &c.name);
-                    node.run_meta(create).await?
-                }
-                false => return Err(Error::AlreadyExists(m)),
+            if !deleted {
+                return Err(Error::AlreadyExists(m));
             }
+            node.run_meta(MetaCmd::DeleteDb { id: existing.id.clone() }).await?;
+            node.forget_db_name(&existing.owner_id, &c.name);
+            node.run_meta_as(create).await?
         }
         other => other?,
     };
-    Ok((StatusCode::CREATED, axum::Json(r)).into_response())
+    let summary = to_json(&DbSummary::new(&db, c.org.as_deref()))?;
+    Ok((StatusCode::CREATED, axum::Json(summary)).into_response())
 }
 
-async fn get_db(State(_node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>) -> Result<J> {
+async fn get_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>) -> Result<J> {
     let v = ctx.db.read_version(Consistency::Snapshot { max_staleness_ms: 5000 }).await?;
-    let st = ctx.db.stats();
+    let mut t = node.sys_read().await?;
     Ok(axum::Json(json!({
         "id": ctx.rec.id,
         "name": ctx.rec.name,
+        "org": org_name(&mut t, &ctx.rec.owner_id).await?,
+        "role": ctx.access.role,
         "created_at": ctx.rec.created_at,
-        "stats": {
-            "version": v.version(),
-            "segments": st.as_ref().map(|s| s.segments),
-            "segment_bytes": st.as_ref().map(|s| s.segment_bytes),
-            "tail_bytes": st.as_ref().map(|s| s.tail_bytes),
-            "lease_holder": st.as_ref().and_then(|s| s.lease_holder.clone()),
-            "size_bytes": st.as_ref().map(|s| s.size_bytes),
-            "quota_bytes": st.as_ref().and_then(|s| s.quota_bytes),
-        }
+        "stats": ctx.db.stats(&v),
     })))
 }
 
 async fn delete_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>) -> Result<J> {
-    ctx.principal.require_writable()?;
     ctx.principal.require_unscoped()?;
+    node.access_strong(&ctx.principal, &ctx.rec).await?.require_admin()?;
     ctx.db.mark_deleted().await?;
     node.run_meta(MetaCmd::DeleteDb { id: ctx.rec.id.clone() }).await?;
     node.forget_db_name(&ctx.rec.owner_id, &ctx.rec.name);
     node.engine.forget(&ctx.rec.id);
     Ok(axum::Json(json!({})))
 }
-
-// ------------------------------------------------------------------ kv
 
 fn encoding_param(q: &Params) -> Result<Encoding> {
     match q.get("encoding").map(|s| s.as_str()) {
@@ -181,7 +224,6 @@ async fn scan_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>
     Ok(axum::Json(out))
 }
 
-/// The raw key from `/v1/dbs/{db}/kv/{key...}` (percent-decoded bytes).
 fn raw_key(path: &str) -> Result<Vec<u8>> {
     let i = path.find("/kv/").ok_or_else(|| Error::invalid("missing key"))?;
     let k = percent_decode(&path[i + 4..]);
@@ -232,6 +274,7 @@ async fn get_kv(Extension(ctx): Extension<DbCtx>, q: Params, req: Request) -> Re
         }
     }
     let h = resp.headers_mut();
+    untrusted_content(h);
     h.insert(http::header::CONTENT_LENGTH, HeaderValue::from(r.end - r.start));
     h.insert(http::header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     if let Ok(v) = HeaderValue::from_str(&ct) {
@@ -248,7 +291,7 @@ async fn get_kv(Extension(ctx): Extension<DbCtx>, q: Params, req: Request) -> Re
 }
 
 async fn put_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, q: Params, req: Request) -> Result<J> {
-    ctx.principal.require_writable()?;
+    ctx.require_write()?;
     let key = user_key(&raw_key(req.uri().path())?)?;
     let ttl_ms = q.get("ttl_ms").map(|v| v.parse::<u64>().map_err(|_| Error::invalid("bad ttl_ms"))).transpose()?;
     let if_match = etag_version(req.headers(), http::header::IF_MATCH);
@@ -310,10 +353,14 @@ async fn delete_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
     Ok(axum::Json(json!({"version": v, "existed": existed})))
 }
 
-// ---------------------------------------------------------------- blobs
+/// Adds headers that prevent browsers from executing user-supplied content in the console's origin.
+pub fn untrusted_content(h: &mut HeaderMap) {
+    h.insert(http::header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(http::header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox; default-src 'none'"));
+}
 
 async fn stage_blob(Extension(ctx): Extension<DbCtx>, req: Request) -> Result<Response> {
-    ctx.principal.require_writable()?;
+    ctx.require_write()?;
     let ct = req
         .headers()
         .get(http::header::CONTENT_TYPE)
@@ -331,7 +378,7 @@ async fn stage_blob(Extension(ctx): Extension<DbCtx>, req: Request) -> Result<Re
 async fn get_blob(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, req: Request) -> Result<Response> {
     let id = param(&p, "blob_id")?;
     let r = blob::load_staged(ctx.db.shared(), &ctx.db.id, id).await?;
-    // A blob read by id may be unreferenced already, and collected soon.
+    // Pin obsolete blobs immediately so GC does not collect them during the read.
     let doomed = ctx
         .db
         .read_version(Consistency::Strong)
@@ -358,6 +405,7 @@ async fn get_blob(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, req: Reque
         }
     }
     let h = resp.headers_mut();
+    untrusted_content(h);
     h.insert(http::header::CONTENT_LENGTH, HeaderValue::from(rr.end - rr.start));
     h.insert(http::header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     if let Ok(v) = HeaderValue::from_str(&r.content_type) {
@@ -365,8 +413,6 @@ async fn get_blob(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, req: Reque
     }
     Ok(resp)
 }
-
-// --------------------------------------------------------- transactions
 
 #[derive(Deserialize, Clone, Copy, Default)]
 #[serde(rename_all = "lowercase")]
@@ -434,7 +480,7 @@ async fn one_shot(
 ) -> Result<J> {
     let writes = req.ops.iter().any(|o| o.is_write());
     if writes {
-        ctx.principal.require_writable()?;
+        ctx.require_write()?;
     }
     if let Some(k) = &req.idempotency_key
         && (k.is_empty() || k.len() > 200)
@@ -465,8 +511,7 @@ async fn one_shot(
         t.commit_id = commit_id;
         let results = match exec_ops(&octx, &mut t, &req.ops).await {
             Ok(r) => r,
-            // A retried idempotent request may fail a precondition because
-            // an earlier attempt already applied it: check (fenced).
+            // A retried idempotent request can fail a precondition if an earlier attempt already committed.
             Err(e @ Error::PreconditionFailed { .. }) if req.idempotency_key.is_some() => {
                 if let Some(v) = ctx.db.commit_status_fenced(commit_id).await? {
                     return Ok(axum::Json(json!({
@@ -561,7 +606,6 @@ fn get_open(node: &Node, ctx: &DbCtx, id: &str) -> Result<Arc<tokio::sync::Mutex
         .get(id)
         .cloned()
         .ok_or(Error::TxnNotFound)
-        // Ownership is checked by the caller under the entry lock.
         .inspect(|_| {
             let _ = ctx;
         })
@@ -623,7 +667,7 @@ async fn commit_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbC
     drop(g);
     remove_open(&node, &id);
     if !t.is_read_only() {
-        ctx.principal.require_writable()?;
+        ctx.require_write()?;
     }
     let cid = t.commit_id;
     let mut creq = t.into_request();
@@ -668,13 +712,8 @@ fn bad_commit_id() -> Error {
     Error::invalid("commit id must be 16 hex characters or key:<idempotency key>")
 }
 
-// ---------------------------------------------------------- change feeds
-
-/// The longest a change feed request waits for a change.
 const WATCH_WAIT_MAX_MS: u64 = 20_000;
 
-/// The common parameters of change feeds: where to start (`after`, a
-/// version or a `next_cursor`), `limit` and `wait_ms`.
 fn feed_params(q: &Params) -> Result<(ChangePos, usize, Duration)> {
     let after = q.get("after").ok_or_else(|| Error::invalid("after is required (a version or a next_cursor)"))?;
     let after = ChangePos::decode(after).ok_or_else(|| Error::invalid("bad after"))?;
@@ -697,10 +736,7 @@ fn feed_params(q: &Params) -> Result<(ChangePos, usize, Duration)> {
     Ok((after, limit, Duration::from_millis(wait)))
 }
 
-/// Run `$read` (with `$t: &mut Txn`, evaluating to `Result<(page, more)>`)
-/// on a snapshot until it finds a change or `$wait` passes. Between tries
-/// it waits for this node to install a newer version, re-reading the
-/// manifest every `watch_poll_ms` in case another node commits.
+/// Repeatedly runs `$read` on a snapshot until it returns changes or `$wait` elapses.
 macro_rules! watch {
     ($node:expr, $db:expr, $c:expr, $wait:expr, |$t:ident| $read:expr) => {{
         let until_ = Instant::now() + $wait;
@@ -716,7 +752,6 @@ macro_rules! watch {
     }};
 }
 
-/// A page of a feed and whether it holds any change.
 trait Found {
     fn found(&self) -> bool;
 }
@@ -754,9 +789,6 @@ async fn kv_changes(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbC
     Ok(axum::Json(json!({"changes": changes, "more": more, "next_cursor": next.encode(), "version": v})))
 }
 
-/// A change to user keys as JSON: `{"version", "key", value fields,
-/// "expires_at"?}`, `{"version", "key", "deleted": true}` (also for a value
-/// expired at `at`), or `{"version", "deleted_range": {"start", "end"}}`.
 async fn kv_change_json(ctx: &OpCtx<'_>, ch: &Change, at: u64, keys_only: bool) -> Result<Json> {
     let mut m = serde_json::Map::new();
     m.insert("version".into(), json!(ch.seq()));
@@ -806,8 +838,6 @@ async fn row_changes(
     });
     Ok(axum::Json(json!({"changes": changes, "more": more, "next_cursor": next.encode(), "version": v})))
 }
-
-// --------------------------------------------------------------- tables
 
 async fn list_tables(Extension(ctx): Extension<DbCtx>, q: Params) -> Result<J> {
     let c = consistency_of(&q)?;
@@ -868,7 +898,7 @@ async fn add_index(
     Path(p): PathMap,
     JsonBody(i): JsonBody<IndexSpec>,
 ) -> Result<J> {
-    ctx.principal.require_writable()?;
+    ctx.require_write()?;
     let name = param(&p, "t")?.to_string();
     let opts = table::Backfill { batch_rows: node.cfg.index_backfill_batch_rows, ..Default::default() };
     let (s, v) = table::add_index(&ctx.db, &name, &i, opts).await?;
@@ -951,8 +981,6 @@ async fn get_row(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, JsonBody(b)
     }))
 }
 
-/// Rows to change: one by primary key, or every row a selection matches
-/// (at most `limit`).
 enum Rows<'a> {
     One(&'a Json),
     Where(&'a Selection, Option<usize>),

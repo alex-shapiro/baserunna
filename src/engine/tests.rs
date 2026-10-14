@@ -1,5 +1,4 @@
-//! Engine model tests: random transactions against a `BTreeMap` model, with
-//! flushes, compactions, GC, snapshots and conflicts.
+//! Engine model and unit tests.
 
 use super::*;
 use crate::env::Env;
@@ -31,7 +30,6 @@ pub(crate) fn engine(seed: u64, cfg: EngineConfig) -> (Arc<Engine>, Arc<MemStore
 
 #[derive(Clone, Debug)]
 enum Op {
-    /// A put, with a time to live.
     Put(Vec<u8>, Vec<u8>, Option<u64>),
     Delete(Vec<u8>),
     DeleteRange(Vec<u8>, Vec<u8>),
@@ -41,11 +39,9 @@ enum Op {
     Settle,
     Advance(u64),
     Sweep,
-    /// Replay the change feed from a past version onto that version's state.
     Feed(usize, usize),
 }
 
-/// A key outside the commit record keyspace.
 fn data_key(r: &mut Rng, max_len: usize) -> Vec<u8> {
     let mut k = prop::small_key(r, max_len);
     if k[0] == types::COMMIT_SPACE {
@@ -95,10 +91,8 @@ async fn value_bytes(db: &Db, v: &Value) -> Vec<u8> {
     }
 }
 
-/// Stored values and when they expire.
 type Model = BTreeMap<Vec<u8>, (Vec<u8>, Option<u64>)>;
 
-/// The values of `m` that have not expired at `at`.
 fn live(m: &Model, at: u64) -> BTreeMap<Vec<u8>, Vec<u8>> {
     m.iter().filter(|(_, (_, e))| e.is_none_or(|e| e > at)).map(|(k, (v, _))| (k.clone(), v.clone())).collect()
 }
@@ -147,9 +141,6 @@ async fn check_against_model(db: &Arc<Db>, model: &Model, r: &mut Rng) -> Result
     Ok(())
 }
 
-/// The change feed after `version`, read `limit` changes at a time and
-/// applied to the state at `version`, must give the current state; or the
-/// cursor is behind the purge horizon.
 async fn check_feed(db: &Arc<Db>, version: Seq, then: &Model, now: &Model, limit: usize) -> Result<(), String> {
     let snap = db.snapshot(Consistency::Strong).await.map_err(|e| e.to_string())?;
     let v = &snap.version;
@@ -190,14 +181,12 @@ async fn check_feed(db: &Arc<Db>, version: Seq, then: &Model, now: &Model, limit
 }
 
 async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
-    // Half the seeds keep the deeper levels in levels objects.
     let levels_inline_max = if seed.is_multiple_of(2) { 0 } else { 16 };
     let (eng, store, env) = engine(seed, EngineConfig { levels_inline_max, ..EngineConfig::small_for_tests() });
     let db = eng.db("t1");
     db.open(true).await.map_err(|e| e.to_string())?;
     eng.shared.store_time_ms().await.map_err(|e| e.to_string())?;
     let mut model = Model::new();
-    // Values with their times to live, which count from the commit's time.
     type Pending = BTreeMap<Vec<u8>, Option<(Vec<u8>, Option<u64>)>>;
     let mut pending = Pending::new();
     let mut pending_ranges: Vec<KeyRange> = Vec::new();
@@ -205,7 +194,6 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
     let mut rng = Rng::new(seed ^ 0xabc);
     type Remembered = (Instant, Snapshot, Model);
     let mut snapshots: Vec<Remembered> = Vec::new();
-    // The state after each commit, by version.
     let mut history: Vec<(Seq, Model)> = vec![(0, Model::new())];
     for op in ops {
         match op {
@@ -251,7 +239,6 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
                 );
                 let committed = match db.commit_detailed(t.into_request()).await {
                     Ok(c) => Some(c),
-                    // Staged blobs older than the stage TTL are rejected.
                     Err(e) if e.message().contains("staged blob expired") => {
                         pending.clear();
                         pending_ranges.clear();
@@ -272,7 +259,6 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
                 if let Some(c) = committed.filter(|c| c.version > history.last().map_or(0, |h| h.0)) {
                     history.push((c.version, model.clone()));
                 }
-                // The new txn began before this commit was applied; restart it.
                 txn = db.begin(Isolation::Serializable, Consistency::Strong).await.map_err(|e| e.to_string())?;
                 check_against_model(&db, &model, &mut rng).await?;
             }
@@ -296,14 +282,12 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
             Op::Advance(ms) => {
                 tokio::time::sleep(Duration::from_millis(*ms)).await;
                 db.maintenance_now().await.map_err(|e| e.to_string())?;
-                // The open transaction reads at a time now long past.
                 txn = db.begin(Isolation::Serializable, Consistency::Strong).await.map_err(|e| e.to_string())?;
                 pending.clear();
                 pending_ranges.clear();
             }
             Op::Sweep => {
                 db.sweep_now().await.map_err(|e| e.to_string())?;
-                // let the GC delete task run
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 check_against_model(&db, &model, &mut rng).await?;
             }
@@ -313,7 +297,6 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
             }
         }
     }
-    // Storage invariant: every referenced object exists.
     let v = db.read_version(Consistency::Strong).await.map_err(|e| e.to_string())?;
     let keys: std::collections::BTreeSet<String> = store.keys().into_iter().collect();
     for s in &v.m.segments {
@@ -379,7 +362,6 @@ fn serializable_conflicts_and_snapshots() {
         t0.put(k.clone(), Value::Inline(Bytes::from_static(b"0"))).unwrap();
         let v0 = db.commit(t0.into_request()).await.unwrap();
 
-        // Two read-modify-write txns on the same key: second must conflict.
         let mut a = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         let mut b = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         assert!(a.get(&k).await.unwrap().is_some());
@@ -391,7 +373,6 @@ fn serializable_conflicts_and_snapshots() {
         let eb = db.commit(b.into_request()).await.unwrap_err();
         assert_eq!(eb.code(), "conflict");
 
-        // Phantom protection: a scan conflicts with a later insert in range.
         let mut s = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         let _ = s.scan(&KeyRange::prefix(b"p"), false, 10).await.unwrap();
         s.put(Bytes::from_static(b"other"), Value::Inline(Bytes::new())).unwrap();
@@ -400,7 +381,6 @@ fn serializable_conflicts_and_snapshots() {
         db.commit(ins.into_request()).await.unwrap();
         assert_eq!(db.commit(s.into_request()).await.unwrap_err().code(), "conflict");
 
-        // Snapshot isolation allows write skew on disjoint writes.
         let mut x = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
         let mut y = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
         x.get(b"k").await.unwrap();
@@ -410,7 +390,6 @@ fn serializable_conflicts_and_snapshots() {
         db.commit(x.into_request()).await.unwrap();
         db.commit(y.into_request()).await.unwrap();
 
-        // Old snapshots keep seeing old data.
         let old = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         let mut w = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         w.put(k.clone(), Value::Inline(Bytes::from_static(b"new"))).unwrap();
@@ -418,7 +397,6 @@ fn serializable_conflicts_and_snapshots() {
         let e = old.snapshot.get(b"k", old.read_time).await.unwrap().unwrap();
         assert_eq!(e.value, Value::Inline(Bytes::from_static(b"a")));
 
-        // Idempotent replays return the original version.
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         t.put(Bytes::from_static(b"idem"), Value::Inline(Bytes::new())).unwrap();
         let req = t.into_request();
@@ -452,9 +430,7 @@ fn group_commit_batches_concurrent_commits() {
         }
         versions.sort();
         versions.dedup();
-        // Every commit has its own version...
         assert_eq!(versions.len(), 20);
-        // ...but they share manifest writes.
         let writes = db.current().unwrap().m.write_seq - ws_before;
         assert!(writes < 20, "expected batching, got {writes} manifest writes");
         assert_eq!(objects(), before);
@@ -463,8 +439,6 @@ fn group_commit_batches_concurrent_commits() {
     });
 }
 
-/// A lease keeps its first sighting until it is renewed, and sightings are
-/// pruned only when the table is full and only once long expired.
 #[test]
 fn lease_sightings_outlive_handles_and_prune_when_full() {
     use super::manifest::Lease;
@@ -519,26 +493,18 @@ fn blob_limits_and_ranges() {
     });
 }
 
-/// A store that can delay responses after applying the operation, fail
-/// manifest requests, and record the GETs it serves.
 pub(super) struct DelayStore {
     pub(super) mem: Arc<MemStore>,
     get_reply_ms: AtomicU64,
     put_reply_ms: AtomicU64,
-    /// Manifest PUTs to refuse as lost races, then as outages, without
-    /// applying them.
     manifest_put_conflicts: AtomicU32,
     manifest_put_outages: AtomicU32,
-    /// Manifest GETs to fail as outages.
     manifest_get_outages: AtomicU32,
     manifest_puts: AtomicU32,
-    /// Every GET served: the key, and whether it was conditional.
     gets: Mutex<Vec<(String, bool)>>,
-    /// The size of every segment GET's response.
     seg_get_bytes: Mutex<Vec<usize>>,
 }
 
-/// Consumes one of `n` remaining faults.
 fn take_fault(n: &AtomicU32) -> bool {
     n.fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1)).is_ok()
 }
@@ -618,7 +584,6 @@ pub(super) fn delayed_engine_with(node: &str, cfg: EngineConfig) -> (Arc<Engine>
     (Engine::new(store.clone(), env, cfg, node.into()), store)
 }
 
-/// A second node sharing `a`'s store and clock.
 pub(super) fn second_node(a: &Arc<Engine>, store: &Arc<DelayStore>, node: &str) -> Arc<Engine> {
     let store: DynStore = store.clone();
     Engine::new(store, a.shared.env.clone(), a.shared.cfg.clone(), node.into())
@@ -636,8 +601,6 @@ pub(super) async fn put(db: &Arc<Db>, k: &str, v: &str) -> Seq {
     db.commit(t.into_request()).await.unwrap()
 }
 
-/// A manifest fetched before a commit but delivered after it must not
-/// replace the newer version.
 #[test]
 fn installed_versions_never_go_back() {
     rt().block_on(async {
@@ -658,8 +621,6 @@ fn installed_versions_never_go_back() {
     });
 }
 
-/// The lease holder's strong reads wait for its own manifest write in
-/// flight: others may already see it.
 #[test]
 fn strong_reads_wait_for_the_write_in_flight() {
     rt().block_on(async {
@@ -677,8 +638,6 @@ fn strong_reads_wait_for_the_write_in_flight() {
     });
 }
 
-/// The fenced commit-status query writes the manifest, so no earlier
-/// attempt with the old etag can land afterwards.
 #[test]
 fn fenced_status_writes_the_manifest() {
     rt().block_on(async {
@@ -693,8 +652,6 @@ fn fenced_status_writes_the_manifest() {
     });
 }
 
-/// Opening a database that does not exist, without `create`, must not
-/// create it (a stale cache could otherwise resurrect a purged database).
 #[test]
 fn opening_without_create_never_creates() {
     rt().block_on(async {
@@ -704,14 +661,11 @@ fn opening_without_create_never_creates() {
     });
 }
 
-/// Segments replaced by compaction stay readable by older snapshots for
-/// `gc_grace`, and are deleted after it.
 #[test]
 fn obsolete_segments_outlive_snapshots_then_go() {
     rt().block_on(async {
         let (a, store) = delayed_engine("a");
         let dbs: DynStore = store.clone();
-        // A second node with its own cache reads the old snapshot.
         let b = Engine::new(dbs, a.shared.env.clone(), EngineConfig::small_for_tests(), "b".into());
         let db = a.db("d");
         db.open(true).await.unwrap();
@@ -749,9 +703,6 @@ fn obsolete_segments_outlive_snapshots_then_go() {
     });
 }
 
-/// The orphan sweep collects old unreferenced objects, spares young ones
-/// (an in-flight commit or a bindable staged blob may own them) and ignores
-/// foreign names, whichever grace period is shorter.
 #[test]
 fn sweep_collects_only_old_orphans() {
     for (orphan_grace_ms, blob_stage_ttl_ms) in [(600_000, 1_800_000), (1_800_000, 600_000)] {
@@ -778,11 +729,8 @@ async fn sweep_case(cfg: EngineConfig) {
         |db: &Arc<Db>| -> Vec<String> { db.current().unwrap().m.obsolete.iter().map(|o| o.id.clone()).collect() };
     db.sweep_now().await.unwrap();
     assert!(listed(&db).is_empty(), "young orphans were collected: {:?}", listed(&db));
-    // Past the shorter grace only: the segment goes once it is an old
-    // orphan; the blob needs both.
     let first = cfg.orphan_grace_ms.min(cfg.blob_stage_ttl_ms) + 1;
     tokio::time::sleep(Duration::from_millis(first)).await;
-    // Only the lease holder sweeps.
     db.maintenance_now().await.unwrap();
     db.sweep_now().await.unwrap();
     let want: Vec<String> = if cfg.orphan_grace_ms < first { vec![seg.clone()] } else { vec![] };
@@ -791,7 +739,6 @@ async fn sweep_case(cfg: EngineConfig) {
     db.maintenance_now().await.unwrap();
     db.sweep_now().await.unwrap();
     let l = listed(&db);
-    // A segment listed earlier may already be gone.
     assert!(l.contains(&blob) && l.iter().all(|id| *id == seg || *id == blob), "old blob not collected: {l:?}");
     tokio::time::sleep(Duration::from_millis(cfg.gc_grace_ms + 1)).await;
     db.maintenance_now().await.unwrap();
@@ -801,8 +748,6 @@ async fn sweep_case(cfg: EngineConfig) {
     assert!(keys.contains(&foreign), "an object that is not ours was deleted");
 }
 
-/// A blob that a long read keeps pinned survives garbage collection, and
-/// is collected by a later sweep once the pin lapses.
 #[test]
 fn pinned_blobs_outlive_collection_until_the_pin_lapses() {
     rt().block_on(async {
@@ -828,7 +773,6 @@ fn pinned_blobs_outlive_collection_until_the_pin_lapses() {
         db.maintenance_now().await.unwrap();
         db.sweep_now().await.unwrap();
         assert!(listed(), "setup: the dereferenced blob was not found");
-        // A reader pins it and renews the pin past the grace period.
         let interval = blob::pin_interval_ms(&cfg);
         let mut waited = 0;
         while waited <= cfg.gc_grace_ms + interval {
@@ -841,7 +785,6 @@ fn pinned_blobs_outlive_collection_until_the_pin_lapses() {
         assert!(!listed(), "setup: collection did not run");
         assert!(has_blob(), "a pinned blob was deleted");
         assert_eq!(blob::read_range(&eng.shared, "d", &r, 0..3000).await.unwrap().len(), 3000);
-        // The read ends; once its pin lapses the blob is an orphan again.
         tokio::time::sleep(Duration::from_millis(blob::pin_ttl_ms(&cfg).max(cfg.orphan_grace_ms))).await;
         db.maintenance_now().await.unwrap();
         db.sweep_now().await.unwrap();
@@ -854,9 +797,6 @@ fn pinned_blobs_outlive_collection_until_the_pin_lapses() {
     });
 }
 
-/// Collection runs on the store's clock: a node whose wall clock is hours
-/// ahead neither takes young orphans for old ones nor deletes obsolete
-/// segments early.
 #[test]
 fn collection_ignores_node_clock_skew() {
     rt().block_on(async {
@@ -877,7 +817,6 @@ fn collection_ignores_node_clock_skew() {
         assert!(db.current().unwrap().m.obsolete.is_empty(), "young orphans looked old to a fast clock");
         let store_now = eng.shared.store_now_ms().unwrap();
         assert!(store_now.abs_diff(base + origin.elapsed().as_millis() as u64) < 100, "store time is the store's");
-        // Obsolete segments wait out the grace period in store time.
         for i in 0..8 {
             put_many(&db, &format!("r{i}"), 5, 500).await;
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -903,9 +842,6 @@ fn collection_ignores_node_clock_skew() {
     });
 }
 
-/// An orphaned blob becomes collectable exactly when it is both
-/// `orphan_grace` old by its objects and `blob_stage_ttl` plus the binding
-/// margin old by its id, whichever comes last.
 #[test]
 fn orphaned_blobs_wait_out_both_graces_exactly() {
     for (orphan_grace_ms, blob_stage_ttl_ms) in [(600_000, 300_000), (300_000, 600_000)] {
@@ -934,8 +870,6 @@ fn orphaned_blobs_wait_out_both_graces_exactly() {
     }
 }
 
-/// A blob is as old as its newest object: old chunks under a fresh pin are
-/// not collected.
 #[test]
 fn a_blob_is_as_old_as_its_newest_object() {
     rt().block_on(async {
@@ -957,9 +891,6 @@ fn a_blob_is_as_old_as_its_newest_object() {
     });
 }
 
-/// Transactions committed in one batch are validated against the writes
-/// of those accepted before them in the batch, for scans as well as point
-/// reads.
 #[test]
 fn batched_commits_validate_against_each_other() {
     rt().block_on(async {
@@ -968,7 +899,6 @@ fn batched_commits_validate_against_each_other() {
         db.open(true).await.unwrap();
         put(&db, "x", "0").await;
         let begin = || db.begin(Isolation::Serializable, Consistency::Strong);
-        // Keep the committer busy so that the next commits share a batch.
         store.put_reply_ms.store(50, std::sync::atomic::Ordering::SeqCst);
         let mut filler = begin().await.unwrap();
         filler.put(Bytes::from_static(b"x"), Value::Inline(Bytes::from_static(b"1"))).unwrap();
@@ -998,8 +928,6 @@ fn batched_commits_validate_against_each_other() {
     });
 }
 
-/// A staged blob older than `blob_stage_ttl` can no longer be bound: the
-/// orphan sweep may already be deleting it.
 #[test]
 fn expired_staged_blobs_cannot_be_bound() {
     rt().block_on(async {
@@ -1019,8 +947,6 @@ fn expired_staged_blobs_cannot_be_bound() {
     });
 }
 
-/// Scans skip what the transaction itself deleted, across as many internal
-/// batches as needed, in both directions.
 #[test]
 fn scans_see_through_own_deletes() {
     rt().block_on(async {
@@ -1061,8 +987,6 @@ fn scans_see_through_own_deletes() {
     });
 }
 
-/// Writes count against `txn_max_write_bytes` (keys, encoded values, and a
-/// fixed cost per delete); reaching the limit is fine, exceeding it is not.
 #[test]
 fn transaction_write_limit() {
     rt().block_on(async {
@@ -1078,9 +1002,6 @@ fn transaction_write_limit() {
     });
 }
 
-/// `KeyRange` predicates against brute force. A probe (over `a..=e`) lies
-/// between any two distinct bounds (over `b` and `c`), so enumerating the
-/// probes decides emptiness and overlap exactly.
 #[test]
 fn key_ranges_match_brute_force() {
     use std::ops::{Bound, RangeBounds};
@@ -1095,7 +1016,6 @@ fn key_ranges_match_brute_force() {
     }
     let probes = strings(b"abcde", 3);
     let mut bounds = vec![Bound::Unbounded];
-    // Engine keys always start with a keyspace byte, so no bound is empty.
     for s in strings(b"bc", 2).into_iter().skip(1) {
         bounds.push(Bound::Included(s.clone()));
         bounds.push(Bound::Excluded(s));
@@ -1103,7 +1023,6 @@ fn key_ranges_match_brute_force() {
     let ranges: Vec<KeyRange> =
         bounds.iter().flat_map(|s| bounds.iter().map(move |e| KeyRange::new(s.clone(), e.clone()))).collect();
     let has = |r: &KeyRange, k: &Bytes| (r.start.clone(), r.end.clone()).contains(k);
-    // Members of each range as a bitset over the probes.
     let members: Vec<Vec<bool>> = ranges.iter().map(|r| probes.iter().map(|k| has(r, k)).collect()).collect();
     for (r, m) in ranges.iter().zip(&members) {
         for k in &probes {
@@ -1119,8 +1038,6 @@ fn key_ranges_match_brute_force() {
     }
 }
 
-/// A handle is shared while in use, evicted once idle and unused, and
-/// dropped with its cached state when the database is purged.
 #[test]
 fn handles_are_shared_until_idle_and_gone_after_purge() {
     rt().block_on(async {
@@ -1153,7 +1070,6 @@ fn handles_are_shared_until_idle_and_gone_after_purge() {
     });
 }
 
-/// The op language's limits and defaults (SPEC §6.3).
 #[test]
 fn op_batches_limits_and_defaults() {
     use crate::ops::{Encoding, Op, OpCtx, exec_ops, make_value};
@@ -1169,21 +1085,27 @@ fn op_batches_limits_and_defaults() {
             serde_json::from_value(serde_json::Value::Array(vec![op; n])).unwrap()
         };
         let get = serde_json::json!({"op": "get", "key": "k"});
-        let run = |read_only: bool, ops: Vec<Op>| {
+        use crate::meta::{Access, Role};
+        let owner = Access { role: Role::Owner, read_only_key: false };
+        let run = |access: Access, ops: Vec<Op>| {
             let db = db.clone();
             async move {
-                let ctx = OpCtx { db: &db, encoding: Encoding::Utf8, read_only, json_value_max: 1 << 20 };
+                let ctx = OpCtx { db: &db, encoding: Encoding::Utf8, access, json_value_max: 1 << 20 };
                 let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
                 exec_ops(&ctx, &mut t, &ops).await
             }
         };
-        assert_eq!(run(false, ops(10_000, get.clone())).await.unwrap().len(), 10_000);
-        assert!(matches!(run(false, ops(10_001, get.clone())).await, Err(Error::InvalidArgument(_))));
+        assert_eq!(run(owner, ops(10_000, get.clone())).await.unwrap().len(), 10_000);
+        assert!(matches!(run(owner, ops(10_001, get.clone())).await, Err(Error::InvalidArgument(_))));
 
-        assert!(run(true, ops(1, get)).await.is_ok(), "read-only credentials must be able to read");
+        let read_only_key = Access { read_only_key: true, ..owner };
+        let reader = Access { role: Role::Reader, read_only_key: false };
         let incr = serde_json::json!({"op": "increment", "key": "n"});
-        assert!(matches!(run(true, ops(1, incr.clone())).await, Err(Error::PermissionDenied(_))));
-        assert_eq!(run(false, ops(1, incr)).await.unwrap(), [serde_json::json!({"value": 1})]);
+        for access in [read_only_key, reader] {
+            assert!(run(access, ops(1, get.clone())).await.is_ok(), "{access:?} must be able to read");
+            assert!(matches!(run(access, ops(1, incr.clone())).await, Err(Error::PermissionDenied(_))), "{access:?}");
+        }
+        assert_eq!(run(owner, ops(1, incr)).await.unwrap(), [serde_json::json!({"value": 1})]);
     });
 }
 
@@ -1191,8 +1113,6 @@ pub(super) fn inline(s: &str) -> Value {
     Value::Inline(Bytes::from(s.to_string()))
 }
 
-/// Commits `n` values of `len` bytes under `prefix`: with the test
-/// configuration, 5 values of 500 bytes flush the tail to a segment.
 pub(super) async fn put_many(db: &Arc<Db>, prefix: &str, n: usize, len: usize) -> Seq {
     let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
     for i in 0..n {
@@ -1205,8 +1125,6 @@ pub(super) async fn strong_get(db: &Arc<Db>, k: &str) -> Option<Value> {
     db.snapshot(Consistency::Strong).await.unwrap().get(k.as_bytes()).await.unwrap().map(|e| e.value)
 }
 
-/// Another node's lease blocks commits until it would expire from this
-/// node's viewpoint: `lease + margin` after this node first saw it.
 #[test]
 fn foreign_leases_block_commits_until_they_expire() {
     rt().block_on(async {
@@ -1229,8 +1147,6 @@ fn foreign_leases_block_commits_until_they_expire() {
     });
 }
 
-/// Releasing a lease lets another node write at once, and the former holder
-/// no longer serves strong reads from its cache.
 #[test]
 fn released_leases_hand_over_at_once() {
     rt().block_on(async {
@@ -1246,8 +1162,6 @@ fn released_leases_hand_over_at_once() {
     });
 }
 
-/// The holder relies on its lease only until `lease - margin` after it sent
-/// the write that renewed it.
 #[test]
 fn holders_stop_relying_on_their_lease_a_margin_early() {
     rt().block_on(async {
@@ -1267,8 +1181,6 @@ fn holders_stop_relying_on_their_lease_a_margin_early() {
     });
 }
 
-/// A database that is read often renews its lease before it runs out, so
-/// strong reads keep being served without a store request.
 #[test]
 fn hot_databases_renew_their_lease_in_time() {
     rt().block_on(async {
@@ -1285,8 +1197,6 @@ fn hot_databases_renew_their_lease_in_time() {
     });
 }
 
-/// A commit that keeps losing the manifest race gives up after
-/// `commit_retry_max` attempts, backing off exponentially in between.
 #[test]
 fn commits_give_up_after_bounded_backoff() {
     rt().block_on(async {
@@ -1303,15 +1213,11 @@ fn commits_give_up_after_bounded_backoff() {
         assert!(matches!(r, Err(Error::Unavailable { outcome_unknown: false, .. })), "{r:?}");
         let max = eng.shared.cfg.commit_retry_max;
         assert_eq!(store.manifest_puts.load(SeqCst) - puts, max);
-        // 10 ms doubling per attempt up to 320 ms, plus up to 9 ms of jitter.
         let backoff: u64 = (1..max).map(|a| 5u64 << a.min(6)).sum();
         assert!((backoff..backoff + 10 * u64::from(max)).contains(&took), "backed off for {took} ms");
     });
 }
 
-/// Failing to reload the manifest between attempts counts against the same
-/// budget: a reload that recovers lets the commit through, endless failures
-/// end it.
 #[test]
 fn commits_survive_a_failed_reload_but_not_endless_ones() {
     rt().block_on(async {
@@ -1334,8 +1240,6 @@ fn commits_survive_a_failed_reload_but_not_endless_ones() {
     });
 }
 
-/// A commit past its deadline fails without being applied; its outcome is
-/// unknown only if an earlier attempt may have been applied.
 #[test]
 fn commits_past_their_deadline() {
     rt().block_on(async {
@@ -1375,10 +1279,6 @@ fn deleting_a_database_is_idempotent() {
     });
 }
 
-/// Every commit leaves a record of its id: committing the same id again,
-/// in a later batch or in the same one, reports the first commit instead
-/// of applying it twice. Records live for `commit_retention_ms`, through
-/// flushes and compactions, and are then dropped without a trace.
 #[test]
 fn commit_records_make_commits_idempotent_until_they_expire() {
     rt().block_on(async {
@@ -1395,13 +1295,11 @@ fn commit_records_make_commits_idempotent_until_they_expire() {
                 r
             }
         };
-        // The same id twice in one batch: the second is a replay.
         let (a, b) = (request(1, 7).await, request(2, 7).await);
         let (ra, rb) = tokio::join!(db.commit_detailed(a), db.commit_detailed(b));
         let (ra, rb) = (ra.unwrap(), rb.unwrap());
         assert!(!ra.replayed && rb.replayed && rb.version == ra.version, "{ra:?} {rb:?}");
         assert!(strong_get(&db, "k2").await.is_none(), "a replay applies nothing");
-        // Many commits later, with the tail flushed and compacted.
         let mut ids = Vec::new();
         for i in 0..60u64 {
             let id = 1000 + i;
@@ -1417,8 +1315,6 @@ fn commit_records_make_commits_idempotent_until_they_expire() {
             assert_eq!(db.commit_status(*id).await.unwrap(), Some(*version));
         }
         assert_eq!(db.commit_status(424242).await.unwrap(), None);
-        // Records go once a version sampled after them is a retention old:
-        // committing an old id then applies it.
         for _ in 0..2 {
             tokio::time::sleep(Duration::from_millis(61_000)).await;
             for i in 0..20 {
@@ -1447,8 +1343,6 @@ fn commit_records_make_commits_idempotent_until_they_expire() {
     });
 }
 
-/// Commits sample (version, time) at most every `version_sample_ms`, and
-/// keep the sample a transaction lifetime back that purge horizons use.
 #[test]
 fn version_samples_are_spaced_and_reach_a_lifetime_back() {
     rt().block_on(async {
@@ -1462,7 +1356,6 @@ fn version_samples_are_spaced_and_reach_a_lifetime_back() {
             history.push((eng.shared.time_ms(), v));
         }
         let m = db.current().unwrap().m.clone();
-        // Samples are in store time.
         let now = eng.shared.store_now_ms().unwrap();
         let times: Vec<u64> = m.version_times.iter().map(|(_, t)| *t).collect();
         for w in times.windows(2) {
@@ -1470,7 +1363,6 @@ fn version_samples_are_spaced_and_reach_a_lifetime_back() {
             assert!((cfg.version_sample_ms..cfg.version_sample_ms + 10_000).contains(&gap), "samples at {times:?}");
         }
         assert!(now - times[times.len() - 1] < cfg.version_sample_ms, "samples stopped at {times:?}");
-        // The version current a lifetime ago, at most one sample interval stale.
         let at = |t: u64| history.iter().filter(|(ht, _)| *ht <= t).map(|(_, v)| *v).max().unwrap_or(0);
         let cutoff = now - cfg.txn_max_lifetime_ms;
         let got = m.version_at_least_age(now, cfg.txn_max_lifetime_ms);
@@ -1478,8 +1370,6 @@ fn version_samples_are_spaced_and_reach_a_lifetime_back() {
     });
 }
 
-/// Without segments a tail tombstone shadows nothing: it is dropped once no
-/// transaction can still be reading from before it, and not earlier.
 #[test]
 fn tail_tombstones_are_dropped_after_a_transaction_lifetime() {
     rt().block_on(async {
@@ -1504,8 +1394,6 @@ fn tail_tombstones_are_dropped_after_a_transaction_lifetime() {
     });
 }
 
-/// Returns the storage keys of all segments and levels objects referenced or
-/// marked obsolete by `m`.
 pub(super) fn known_objects(m: &manifest::Manifest) -> Vec<String> {
     let db = &m.db_id;
     m.segments
@@ -1519,14 +1407,11 @@ pub(super) fn known_objects(m: &manifest::Manifest) -> Vec<String> {
         .collect()
 }
 
-/// Background compaction keeps level 0 short and the levels well formed
-/// as flushes accumulate.
 #[test]
 fn flushes_are_compacted_in_the_background() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
-        // Slow writes, so compactions overlap later commits.
         store.put_reply_ms.store(4, SeqCst);
         for i in 0..40 {
             put_many(&db, &format!("r{i:02}-"), 5, 500).await;
@@ -1541,7 +1426,6 @@ fn flushes_are_compacted_in_the_background() {
         for l in 1..manifest::MAX_LEVEL {
             assert!(m.level_bytes(l) <= targets[l as usize], "level {l} over its target (base {base})");
         }
-        // One compaction at a time: none was planned twice and discarded.
         let known = known_objects(m);
         for k in store.mem.keys().iter().filter(|k| k.contains("/seg/")) {
             assert!(known.contains(k), "orphaned object {k}");
@@ -1555,14 +1439,13 @@ fn stats_describe_the_current_version() {
         let (eng, _store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
         let v = put(&db, "k", "v").await;
-        let s = db.stats().unwrap();
-        assert_eq!((s.version, s.segments, s.tail_entries), (v, 0, 2), "the value and its commit record");
+        let s = db.stats(&db.current().unwrap());
+        assert_eq!((s.version, s.levels.len(), s.tail_entries), (v, 0, 2), "the value and its commit record");
         assert_eq!(s.lease_holder.as_deref(), Some("a"));
         assert_eq!(s.lease_expires_ms, Some(eng.shared.env.now_ms() + eng.shared.cfg.lease_ms));
     });
 }
 
-/// Revalidating an unchanged manifest does not transfer it again.
 #[test]
 fn unchanged_manifests_are_revalidated_conditionally() {
     rt().block_on(async {
@@ -1581,7 +1464,6 @@ fn unchanged_manifests_are_revalidated_conditionally() {
     });
 }
 
-/// A segment up to `segment_whole_fetch_max` is loaded with one request.
 #[test]
 fn small_segments_load_with_one_request() {
     rt().block_on(async {
@@ -1595,8 +1477,6 @@ fn small_segments_load_with_one_request() {
     });
 }
 
-/// Validation finds a concurrent write whether it sits in the tail or was
-/// flushed to a segment, and data as old as the snapshot is no conflict.
 #[test]
 fn validation_sees_flushed_writes_and_not_the_snapshot_itself() {
     rt().block_on(async {
@@ -1618,8 +1498,6 @@ fn validation_sees_flushed_writes_and_not_the_snapshot_itself() {
     });
 }
 
-/// Writes of any size fill whole chunks, so byte ranges map onto chunk
-/// objects.
 #[test]
 fn streamed_blob_writes_fill_whole_chunks() {
     rt().block_on(async {
@@ -1646,9 +1524,6 @@ fn stored_segment(store: &MemStore, id: char, level: u8, entries: &[Entry]) -> m
     compaction::seg_meta(id, level, &s, 0)
 }
 
-/// A merge drops old tombstones unless a deeper level may still hold an
-/// entry they shadow, keeps newer ones, and writes nothing if nothing is
-/// left.
 #[test]
 fn merges_purge_only_tombstones_nothing_needs() {
     rt().block_on(async {
@@ -1672,7 +1547,6 @@ fn merges_purge_only_tombstones_nothing_needs() {
         let out = compaction::run(&eng.shared, &m, &plan(vec![newer.clone(), older.clone()], 6), 6).await.unwrap();
         assert_eq!(out.purged_max_seq, 5);
         assert_eq!(read(&out.segments), [e("b", 9, t.clone()), e("c", 3, v())]);
-        // Into level 5 with `older` below: tombstones over its keys stay.
         let out = compaction::run(&eng.shared, &m, &plan(vec![newer.clone()], 5), 9).await.unwrap();
         assert_eq!(out.purged_max_seq, 4);
         assert_eq!(read(&out.segments), [e("a", 5, t.clone()), e("b", 9, t.clone())]);
@@ -1683,9 +1557,6 @@ fn merges_purge_only_tombstones_nothing_needs() {
     });
 }
 
-/// Compaction streams: a database many times larger than a segment and
-/// than a read compacts with every store read bounded, every output
-/// segment near the target size, and nothing lost.
 #[test]
 fn large_databases_compact_in_bounded_requests() {
     rt().block_on(async {
@@ -1731,8 +1602,6 @@ fn large_databases_compact_in_bounded_requests() {
     });
 }
 
-/// A scan reading many blocks of a segment reads ahead in bulk requests,
-/// while a short scan reads only the blocks it needs.
 #[test]
 fn long_scans_read_ahead() {
     rt().block_on(async {
@@ -1754,7 +1623,6 @@ fn long_scans_read_ahead() {
         let largest_block = eng.shared.seg_index("d", &seg).await.unwrap().blocks.iter().map(|b| b.2).max().unwrap();
         let last_read = *store.seg_get_bytes.lock().unwrap().last().unwrap();
         assert!(last_read <= largest_block as usize, "a short scan read {last_read} bytes ahead");
-        // Reverse scans read block by block, cold or not.
         let cold = second_node(&eng, &store, "b");
         let v2 = Version::new(v.m.clone(), String::new(), cold.shared.clone());
         let back: Vec<Entry> = v2.scan(&KeyRange::data(), true, usize::MAX, v2.read_time()).await.unwrap();
@@ -1763,7 +1631,6 @@ fn long_scans_read_ahead() {
         assert_eq!(v.scan(&KeyRange::data(), false, usize::MAX, v.read_time()).await.unwrap().len(), 400);
         let blocks = eng.shared.seg_index("d", &seg).await.unwrap().blocks.len();
         let full = gets() - before;
-        // Reads of `bulk_read_bytes` hold three of these blocks.
         assert!(full <= 2 + blocks.div_ceil(3), "{full} requests for {blocks} blocks");
         let before = gets();
         v.scan(&KeyRange::data(), false, usize::MAX, v.read_time()).await.unwrap();
@@ -1771,8 +1638,6 @@ fn long_scans_read_ahead() {
     });
 }
 
-/// A node keeps the segments it writes: reading what it just flushed or
-/// compacted needs no request.
 #[test]
 fn written_segments_are_read_without_requests() {
     rt().block_on(async {
@@ -1787,8 +1652,6 @@ fn written_segments_are_read_without_requests() {
     });
 }
 
-/// Appended data moves down the levels without being rewritten: some
-/// segment keeps its id while it changes level, and compaction settles.
 #[test]
 fn appends_move_down_without_rewrites() {
     rt().block_on(async {
@@ -1812,8 +1675,6 @@ fn appends_move_down_without_rewrites() {
     });
 }
 
-/// Segments a node wrote, small or large, are read from its local tier
-/// after a restart, without store requests.
 #[test]
 fn restarted_nodes_read_what_they_wrote_locally() {
     rt().block_on(async {
@@ -1843,8 +1704,6 @@ fn restarted_nodes_read_what_they_wrote_locally() {
     });
 }
 
-/// Bulk reads fetch as many whole blocks as fit their window, and at least
-/// one however small the window.
 #[test]
 fn bulk_reads_take_whole_blocks() {
     let mut r = Rng::new(9);
@@ -1881,8 +1740,6 @@ fn bulk_reads_take_whole_blocks() {
     }
 }
 
-/// A point lookup consults every covering level 0 segment and at most one
-/// segment per deeper level.
 #[test]
 fn lookups_consult_one_segment_per_level() {
     let (eng, _store, _env) = engine(1, EngineConfig::small_for_tests());
@@ -1915,8 +1772,6 @@ fn lookups_consult_one_segment_per_level() {
     }
 }
 
-/// A range changed since `after` if an entry in it, in the tail or in a
-/// segment, is newer than `after`; entries as old as `after` are no change.
 #[test]
 fn changes_are_entries_newer_than_the_snapshot() {
     rt().block_on(async {
@@ -1942,14 +1797,11 @@ fn changes_are_entries_newer_than_the_snapshot() {
     });
 }
 
-/// A database runs one compaction at a time: commits that find one running
-/// do not start another, whose work would be discarded.
 #[test]
 fn one_compaction_at_a_time() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
-        // Slow writes: compactions run while later flushes commit.
         store.put_reply_ms.store(50, SeqCst);
         for i in 0..16 {
             put_many(&db, &format!("a{i:02}-"), 5, 500).await;
@@ -1963,7 +1815,6 @@ fn one_compaction_at_a_time() {
     });
 }
 
-/// A sweep pages through listings longer than a page.
 #[test]
 fn sweeps_page_through_long_listings() {
     rt().block_on(async {
@@ -1990,8 +1841,6 @@ fn sweeps_page_through_long_listings() {
     });
 }
 
-/// Compaction output is split into segments of about the target size, in
-/// key order, and later reads find every entry.
 #[test]
 fn compaction_output_is_split_into_bounded_segments() {
     rt().block_on(async {
@@ -2030,9 +1879,6 @@ async fn put_ttl(db: &Arc<Db>, k: &str, v: &str, ttl_ms: u64) -> Committed {
     db.commit_detailed(t.into_request()).await.unwrap()
 }
 
-/// A value expires its time to live after the time of the version that
-/// committed it. Until then reads see it; afterwards they do not, and the
-/// value it replaced does not come back.
 #[test]
 fn values_expire_a_ttl_after_their_commit() {
     rt().block_on(async {
@@ -2054,10 +1900,6 @@ fn values_expire_a_ttl_after_their_commit() {
     });
 }
 
-/// A serializable transaction that read a value fails to commit once that
-/// value expired: its view no longer holds at the commit's time. Snapshot
-/// isolation does not validate reads, and versions never get older than
-/// the read times of the transactions they commit.
 #[test]
 fn reads_of_values_that_expire_before_the_commit_conflict() {
     rt().block_on(async {
@@ -2079,8 +1921,6 @@ fn reads_of_values_that_expire_before_the_commit_conflict() {
         let r = db.commit(stale.into_request()).await;
         assert!(matches!(r, Err(Error::Conflict(_))), "{r:?}");
         db.commit(si.into_request()).await.expect("snapshot isolation does not validate reads");
-        // A transaction reading at a time ahead of the committer's clock
-        // commits a version no older than that time.
         let mut ahead = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         ahead.read_time += 60_000;
         ahead.put(Bytes::from_static(b"w4"), inline("1")).unwrap();
@@ -2092,8 +1932,6 @@ fn reads_of_values_that_expire_before_the_commit_conflict() {
     });
 }
 
-/// Snapshot reads served from a validated cache read at the time it was
-/// validated: a value that expired since is still there, as it was then.
 #[test]
 fn cached_snapshots_read_at_their_validation_time() {
     rt().block_on(async {
@@ -2101,7 +1939,6 @@ fn cached_snapshots_read_at_their_validation_time() {
         let db = opened(&eng, "d").await;
         eng.shared.store_time_ms().await.unwrap();
         put_ttl(&db, "k", "v", 1_000).await;
-        // Another node reads, validating at about t.
         let b = second_node(&eng, &store, "b");
         b.shared.store_time_ms().await.unwrap();
         let other = opened(&b, "d").await;
@@ -2115,7 +1952,6 @@ fn cached_snapshots_read_at_their_validation_time() {
     });
 }
 
-/// The change feed refuses cursors older than the deletions still kept.
 #[test]
 fn change_feed_cursors_expire_with_purged_deletions() {
     rt().block_on(async {
@@ -2129,7 +1965,6 @@ fn change_feed_cursors_expire_with_purged_deletions() {
         let v = db.read_version(Consistency::Strong).await.unwrap();
         let page = v.changes(&KeyRange::data(), &ChangePos::after_version(first), 10).await.unwrap();
         assert_eq!(page.changes, vec![Change::Entry(Entry::tombstone(Bytes::from_static(b"a"), deleted))]);
-        // Without segments, the tombstone is purged a transaction lifetime later.
         for _ in 0..3 {
             tokio::time::sleep(Duration::from_millis(cfg.txn_max_lifetime_ms.max(cfg.version_sample_ms))).await;
             put(&db, "b", "x").await;

@@ -1,7 +1,5 @@
-//! Order-preserving, self-delimiting tuple encoding for primary keys and
-//! index entries. `encode(a) < encode(b)` (bytewise) iff `a < b`
-//! element-wise, and the encoding of a tuple is a prefix of the encoding of
-//! any tuple that extends it.
+//! Order-preserving, prefix-preserving tuple encoding for primary keys and
+//! index entries.
 //!
 //! Type order: null < false < true < int < float < string < bytes.
 
@@ -124,7 +122,6 @@ fn unescape(data: &[u8], pos: &mut usize) -> DResult<Vec<u8>> {
     }
 }
 
-/// Decode one element starting at `*pos`.
 pub fn decode_one(data: &[u8], pos: &mut usize) -> DResult<Key> {
     let t = *data.get(*pos).ok_or(DecodeError("empty tuple element"))?;
     *pos += 1;
@@ -153,7 +150,7 @@ pub fn decode_one(data: &[u8], pos: &mut usize) -> DResult<Key> {
     })
 }
 
-/// Decode exactly `n` elements; returns them and the number of bytes used.
+/// Decode `n` elements and return them with the number of bytes consumed.
 pub fn decode_n(data: &[u8], n: usize) -> DResult<(Vec<Key>, usize)> {
     let mut pos = 0;
     let mut out = Vec::with_capacity(n);
@@ -163,7 +160,6 @@ pub fn decode_n(data: &[u8], n: usize) -> DResult<(Vec<Key>, usize)> {
     Ok((out, pos))
 }
 
-/// Decode a whole buffer.
 pub fn decode_all(data: &[u8]) -> DResult<Vec<Key>> {
     let mut pos = 0;
     let mut out = Vec::new();
@@ -208,8 +204,6 @@ mod tests {
         (0..r.usize(4)).map(|_| gen_key(r)).collect()
     }
 
-    /// The intended order, independent of the implementation: by type (in
-    /// the module's documented order), then numerically or bytewise.
     fn oracle(a: &Key, b: &Key) -> Ordering {
         let rank = |k: &Key| match k {
             Key::Null => 0,
@@ -261,7 +255,6 @@ mod tests {
                         return Err(format!("cmp_key {x:?} vs {y:?}"));
                     }
                 }
-                // Prefix property.
                 if !a.is_empty() {
                     let p = encode(&a[..a.len() - 1]);
                     if !ea.starts_with(&p) {

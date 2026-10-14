@@ -1,5 +1,4 @@
-//! Cloud object stores (S3 and S3-compatible, GCS, Azure Blob) via the
-//! `object_store` crate.
+//! Cloud object stores via the `object_store` crate.
 
 use super::*;
 use object_store::path::Path;
@@ -11,8 +10,7 @@ pub struct CloudStore {
     prefix: String,
 }
 
-/// Separator between etag and version in our opaque etag string (GCS
-/// conditional updates use the object generation, S3 uses the ETag).
+/// Separator between etag and version in the opaque etag string.
 const SEP: char = '\u{1f}';
 
 fn map_err(e: object_store::Error) -> StoreError {
@@ -42,11 +40,8 @@ fn split_tag(tag: &str) -> (Option<String>, Option<String>) {
 }
 
 impl CloudStore {
-    /// Parse `s3://bucket/prefix`, `gs://bucket/prefix` or
-    /// `az://container/prefix`. Credentials and endpoints come from the
-    /// standard environment variables of each provider (e.g.
-    /// `AWS_ACCESS_KEY_ID`, `AWS_ENDPOINT`, `GOOGLE_SERVICE_ACCOUNT`,
-    /// `AZURE_STORAGE_ACCOUNT_NAME`).
+    /// Parse `s3://bucket/prefix`, `gs://bucket/prefix`, or `az://container/prefix`.
+    /// Credentials and endpoints are read from each provider's standard environment variables.
     pub fn from_url(url: &str) -> Result<CloudStore, String> {
         let (scheme, rest) = url.split_once("://").ok_or("store url must be scheme://bucket[/prefix]")?;
         let (bucket, prefix) = match rest.split_once('/') {
@@ -184,7 +179,6 @@ impl ObjectStore for CloudStore {
                     last_modified_ms: m.last_modified.timestamp_millis().max(0) as u64,
                 });
             }
-            // Providers list in lexicographic order; enforce it regardless.
             objects.sort_by(|a, b| a.key.cmp(&b.key));
             Ok(ListPage { objects, next })
         })

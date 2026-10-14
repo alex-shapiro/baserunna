@@ -4,16 +4,16 @@ pub mod codec;
 pub mod crc32c;
 pub mod prop;
 pub mod rng;
+mod ttl;
+
+pub use ttl::TtlCache;
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, DefaultHasher};
 
-/// HashMap with a fixed (non-random) hasher, so iteration order is
-/// deterministic for a given insertion history. Use this instead of the
-/// std default wherever iteration order could influence behavior.
+/// `HashMap` with a deterministic hasher.
 pub type DetHashMap<K, V> = HashMap<K, V, BuildHasherDefault<DefaultHasher>>;
 
-/// SHA-256 digest.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let d = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data);
     let mut out = [0u8; 32];
@@ -21,7 +21,6 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Incremental SHA-256.
 pub struct Sha256(aws_lc_rs::digest::Context);
 
 impl Default for Sha256 {
@@ -53,7 +52,7 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Constant-time equality for secrets.
+/// Constant-time byte slice equality.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -65,8 +64,7 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Smallest byte string strictly greater than every string with this prefix,
-/// or `None` if the prefix is all 0xFF (unbounded).
+/// Smallest byte string strictly greater than all strings with `prefix`, or `None` if `prefix` is all `0xFF`.
 pub fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut p = prefix.to_vec();
     while let Some(last) = p.pop() {
@@ -78,7 +76,7 @@ pub fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// The immediate successor of `key` in byte order (key ++ 0x00).
+/// Immediate lexicographical successor of `key`.
 pub fn key_successor(key: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(key.len() + 1);
     k.extend_from_slice(key);

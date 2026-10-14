@@ -1,5 +1,4 @@
-//! Crate-wide error type. Every variant maps to one HTTP status and a
-//! stable machine-readable code (see SPEC §10).
+//! Crate-wide error type and HTTP status mapping.
 
 use crate::store::StoreError;
 use std::fmt;
@@ -19,8 +18,7 @@ pub enum Error {
         op_index: Option<usize>,
     },
     TooLarge(String),
-    /// A change feed cursor is older than the deletions the database still
-    /// keeps: the client must read the current state again.
+    /// Change feed cursor predates retained tombstones.
     CursorExpired(String),
     /// Database storage quota exceeded.
     QuotaExceeded(String),

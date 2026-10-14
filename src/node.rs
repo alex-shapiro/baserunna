@@ -1,17 +1,22 @@
 //! A service node: engine + metadata + auth + routing + background work.
 
 use crate::auth::{self, OidcProvider};
-use crate::cluster::{self, CLUSTER_KEY_HEADER, Transport};
+use crate::cluster::{self, CLUSTER_KEY_HEADER, NoTransport, Transport};
 use crate::engine::{Consistency, Db, Engine, EngineConfig, Isolation, Txn};
 use crate::env::Env;
 use crate::error::{Error, Result};
 use crate::limits::{LimitConfig, Limiter, Rate};
-use crate::meta::{self, ApiKey, DbRecord, MetaCmd, NodeRecord, SYS_DB, SignupPolicy, User};
+use crate::mail::{Mail, Mailer};
+use crate::meta::{
+    self, Access, ApiKey, Batch, DbRecord, DbRef, MetaCmd, NodeRecord, Org, Role, SYS_DB, SignInMethod, SignedUp,
+    SignupPolicy, User, UserDeletion,
+};
 use crate::store::DynStore;
 use crate::table::BlobResolver;
-use crate::util::DetHashMap;
+use crate::util::{DetHashMap, TtlCache};
 use axum::body::Body;
 use http::Request;
+use serde::de::DeserializeOwned;
 use serde_json::{Value as Json, json};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -23,7 +28,7 @@ pub struct NodeConfig {
     pub name: String,
     /// Base URL peers use to reach this node.
     pub addr: String,
-    /// Base URL browsers use (OAuth redirects, cookies).
+    /// External base URL for browser redirects and emailed links.
     pub public_url: String,
     pub cluster_secret: Option<String>,
     pub signup: SignupPolicy,
@@ -31,15 +36,18 @@ pub struct NodeConfig {
     pub admin_password: Option<String>,
     pub pbkdf2_iterations: u32,
     pub session_ttl_ms: u64,
-    /// How often a node rewrites its membership record. A node whose record
-    /// is older than three intervals is dead.
+    /// Interval between node membership heartbeats.
     pub heartbeat_ms: u64,
-    /// How often a node re-reads the membership table.
+    /// Interval between membership table refreshes.
     pub members_refresh_ms: u64,
     pub auth_cache_ms: u64,
     pub sys_staleness_ms: u64,
     pub db_delete_grace_ms: u64,
-    pub max_dbs_per_user: usize,
+    /// Maximum databases per user or organization.
+    pub max_dbs_per_owner: usize,
+    /// Maximum organizations a user may belong to.
+    pub max_orgs_per_user: usize,
+    pub max_members_per_org: usize,
     /// Rows per transaction when backfilling a new index.
     pub index_backfill_batch_rows: usize,
     pub json_value_max: u64,
@@ -49,9 +57,7 @@ pub struct NodeConfig {
     pub db_idle_evict_ms: u64,
     pub secure_cookies: bool,
     pub txn_retries: u32,
-    /// While a change feed request waits for changes on a node that may
-    /// not see commits as they happen (another node holds the lease), it
-    /// re-reads the manifest this often.
+    /// Manifest poll interval while waiting on a change feed.
     pub watch_poll_ms: u64,
     pub limits: LimitConfig,
     pub engine: EngineConfig,
@@ -74,7 +80,9 @@ impl Default for NodeConfig {
             auth_cache_ms: 30_000,
             sys_staleness_ms: 2_000,
             db_delete_grace_ms: 10 * 60_000,
-            max_dbs_per_user: 1000,
+            max_dbs_per_owner: 1000,
+            max_orgs_per_user: 100,
+            max_members_per_org: 1000,
             index_backfill_batch_rows: 1000,
             json_value_max: 1024 * 1024,
             max_json_body: 32 * 1024 * 1024,
@@ -133,10 +141,17 @@ impl Principal {
     }
 
     pub fn require_session(&self) -> Result<()> {
-        if !self.is_session() {
-            return Err(Error::PermissionDenied("this operation requires a signed-in session".into()));
+        self.session_hash().map(|_| ())
+    }
+
+    /// Returns the session's token hash, or `PermissionDenied` for API keys.
+    pub fn session_hash(&self) -> Result<&str> {
+        match &self.cred {
+            Credential::Session { token_hash } => Ok(token_hash),
+            Credential::ApiKey { .. } => {
+                Err(Error::PermissionDenied("this operation requires a signed-in session".into()))
+            }
         }
-        Ok(())
     }
 
     pub fn require_admin(&self) -> Result<()> {
@@ -147,7 +162,34 @@ impl Principal {
     }
 }
 
-/// An interactive transaction held on its database's owner node.
+/// External services used by a node.
+#[derive(Clone)]
+pub struct Services {
+    pub transport: Arc<dyn Transport>,
+    pub oidc: Option<Arc<dyn OidcProvider>>,
+    pub mailer: Option<Arc<dyn Mailer>>,
+}
+
+impl Services {
+    /// Returns a single-node configuration with no external services.
+    pub fn local() -> Services {
+        Services { transport: Arc::new(NoTransport), oidc: None, mailer: None }
+    }
+}
+
+struct LinkLife {
+    ms: u64,
+    words: &'static str,
+}
+
+const RESET_LINK: LinkLife = LinkLife { ms: 3_600_000, words: "an hour" };
+const VERIFY_LINK: LinkLife = LinkLife { ms: 7 * 24 * 3_600_000, words: "7 days" };
+
+pub const REAP_INTERVAL_MS: u64 = 60_000;
+
+const META_BATCH: usize = 500;
+
+/// Active interactive transaction state.
 pub struct OpenTxn {
     pub db_id: String,
     pub user_id: String,
@@ -162,55 +204,44 @@ pub struct Node {
     pub cfg: NodeConfig,
     pub env: Arc<Env>,
     pub engine: Arc<Engine>,
-    pub transport: Arc<dyn Transport>,
-    pub oidc: Option<Arc<dyn OidcProvider>>,
+    pub services: Services,
     members: Mutex<Vec<NodeRecord>>,
     suspects: Mutex<DetHashMap<String, Suspect>>,
-    auth_cache: Mutex<DetHashMap<String, (Instant, Principal)>>,
-    name_cache: Mutex<DetHashMap<(String, String), (Instant, DbRecord)>>,
+    auth_cache: TtlCache<String, Principal>,
+    name_cache: TtlCache<(String, String), DbRecord>,
+    org_cache: TtlCache<String, Org>,
+    /// Caches positive `(org_id, user_id)` role lookups; misses read strongly.
+    role_cache: TtlCache<(String, String), Role>,
     pub(crate) txns: Mutex<DetHashMap<String, Arc<tokio::sync::Mutex<OpenTxn>>>>,
     cookie_key: Mutex<Vec<u8>>,
-    /// Shared secret for internal endpoints: the configured
-    /// `cluster_secret`, else a key generated once per cluster and stored in
-    /// the system database (every node reads the same store).
     cluster_key: Mutex<Option<String>>,
     pub forwards: cluster::ForwardDedup,
     pub started_ms: u64,
     router: OnceLock<axum::Router>,
     pub limiter: Limiter,
-    /// Limits concurrent password hashing operations.
     hash_slots: tokio::sync::Semaphore,
     draining: std::sync::atomic::AtomicBool,
 }
 
-/// A peer that a forwarded request certainly did not reach.
+/// Tracks backoff state for a peer after an undelivered forward.
 struct Suspect {
-    /// Its membership record when it was last suspected.
     started_at: i64,
     heartbeat_at: i64,
     strikes: u32,
-    /// It stays out of routing until then, unless it heartbeats first.
     until: Instant,
 }
 
-/// Suspicion after a first failed forward; it doubles with each further
-/// failure, up to the membership liveness window.
 const SUSPECT_MIN: Duration = Duration::from_secs(10);
+
+const CACHE_MAX: usize = 100_000;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Node {
-    /// Start a node: bootstrap the system database, register, and spawn
-    /// background work.
-    pub async fn start(
-        cfg: NodeConfig,
-        env: Arc<Env>,
-        store: DynStore,
-        transport: Arc<dyn Transport>,
-        oidc: Option<Arc<dyn OidcProvider>>,
-    ) -> Result<Arc<Node>> {
+    /// Starts a node, bootstrapping the system database and background tasks.
+    pub async fn start(cfg: NodeConfig, env: Arc<Env>, store: DynStore, services: Services) -> Result<Arc<Node>> {
         cfg.engine.validate().map_err(|e| Error::invalid(format!("engine configuration: {e}")))?;
         let id = format!("{}-{}", cfg.name, env.random_hex(4));
         let engine = Engine::new(store, env.clone(), cfg.engine.clone(), id.clone());
@@ -220,12 +251,13 @@ impl Node {
             started_ms: engine.shared.time_ms(),
             env,
             engine,
-            transport,
-            oidc,
+            services,
             members: Mutex::new(Vec::new()),
             suspects: Mutex::new(DetHashMap::default()),
-            auth_cache: Mutex::new(DetHashMap::default()),
-            name_cache: Mutex::new(DetHashMap::default()),
+            auth_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
+            name_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
+            org_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
+            role_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
             txns: Mutex::new(DetHashMap::default()),
             cookie_key: Mutex::new(Vec::new()),
             cluster_key: Mutex::new(None),
@@ -247,8 +279,7 @@ impl Node {
         }
         let sys = self.engine.db(SYS_DB);
         retry_unavailable(|| sys.open(true)).await?;
-        // Members and the cluster key first, so that metadata commands can be
-        // forwarded to the system database's lease holder.
+        // Load members and cluster key before running metadata commands so they can be forwarded.
         let _ = self.refresh_members().await;
         if let Some(k) = &self.cfg.cluster_secret {
             *lock(&self.cluster_key) = Some(k.clone());
@@ -259,18 +290,12 @@ impl Node {
             *lock(&self.cluster_key) = Some(k);
         }
         retry_unavailable(|| self.run_meta(MetaCmd::Migrate)).await?;
+        let ensure = |key: &str| MetaCmd::EnsureConfig { key: key.into(), value: self.env.random_hex(32) };
         if self.cfg.cluster_secret.is_none() {
-            let k = retry_unavailable(|| {
-                self.run_meta(MetaCmd::EnsureConfig { key: "cluster_key".into(), value: self.env.random_hex(32) })
-            })
-            .await?;
-            *lock(&self.cluster_key) = k["value"].as_str().map(|s| s.to_string());
+            let k: String = retry_unavailable(|| self.run_meta_as(ensure("cluster_key"))).await?;
+            *lock(&self.cluster_key) = Some(k);
         }
-        let key = retry_unavailable(|| {
-            self.run_meta(MetaCmd::EnsureConfig { key: "cookie_key".into(), value: self.env.random_hex(32) })
-        })
-        .await?;
-        let key = key["value"].as_str().unwrap_or_default().to_string();
+        let key: String = retry_unavailable(|| self.run_meta_as(ensure("cookie_key"))).await?;
         *lock(&self.cookie_key) = crate::util::b64::unhex(&key).unwrap_or_else(|| key.into_bytes());
         if let (Some(e), Some(p)) = (&self.cfg.admin_email, &self.cfg.admin_password) {
             let email = auth::normalize_email(e)?;
@@ -322,7 +347,7 @@ impl Node {
         let me = Arc::downgrade(self);
         self.env.spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(60_000)).await;
+                tokio::time::sleep(Duration::from_millis(REAP_INTERVAL_MS)).await;
                 let Some(n) = me.upgrade() else { return };
                 if let Err(e) = n.reap_deleted().await {
                     crate::debug!("{}: reaper: {e}", n.id);
@@ -335,12 +360,12 @@ impl Node {
         let _ = self.router.set(r);
     }
 
-    /// The node's own API router (used by the console to call the API).
+    /// Returns the node's HTTP router.
     pub fn router(&self) -> Option<axum::Router> {
         self.router.get().cloned()
     }
 
-    /// The secret internal endpoints require (`None` until bootstrapped).
+    /// Returns the shared cluster secret for internal endpoints.
     pub fn cluster_key(&self) -> Option<String> {
         lock(&self.cluster_key).clone()
     }
@@ -349,8 +374,7 @@ impl Node {
         lock(&self.cookie_key).clone()
     }
 
-    /// Start failing health checks ahead of a shutdown, so load balancers
-    /// stop sending requests here; requests are still served.
+    /// Marks the node as draining so health checks return 503 while in-flight requests finish.
     pub fn drain(&self) {
         self.draining.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -359,7 +383,7 @@ impl Node {
         self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Give up leases, leave the membership table and stop background work.
+    /// Releases held database leases, leaves the cluster, and aborts background tasks.
     pub async fn shutdown(&self) {
         for db in self.engine.open_dbs() {
             let _ = tokio::time::timeout(Duration::from_secs(2), db.release_lease()).await;
@@ -369,14 +393,11 @@ impl Node {
         self.env.shutdown();
     }
 
-    // ------------------------------------------------------------ members
-
     pub fn members(&self) -> Vec<NodeRecord> {
         lock(&self.members).clone()
     }
 
-    /// Members with a recent heartbeat that no failed forward has made
-    /// suspect.
+    /// Returns non-suspect cluster members with a recent heartbeat.
     pub fn live_members(&self) -> Vec<NodeRecord> {
         let now = self.now_ms() as i64;
         cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
@@ -388,8 +409,7 @@ impl Node {
     pub async fn refresh_members(&self) -> Result<()> {
         let mut t = self.sys_read().await?;
         let nodes = meta::list_nodes(&mut t).await?;
-        // A suspect that heartbeated since (or restarted, or left) is
-        // forgiven.
+        // Clear suspicion for peers that have heartbeated, restarted, or left.
         lock(&self.suspects).retain(|id, s| {
             nodes.iter().any(|n| n.id == *id && n.started_at == s.started_at && n.heartbeat_at <= s.heartbeat_at)
         });
@@ -416,10 +436,7 @@ impl Node {
         lock(&self.members).iter().find(|n| n.id == node_id).map(|n| n.addr.clone())
     }
 
-    /// Keep `node_id` out of routing after a request certainly failed to
-    /// reach it: until membership shows a newer heartbeat from it, or a
-    /// backoff passes that starts at 10 s and doubles with every further
-    /// failure, up to the liveness window.
+    /// Excludes `node_id` from routing with exponential backoff after an undelivered forward.
     pub fn mark_suspect(&self, node_id: &str) {
         let rec = lock(&self.members).iter().find(|n| n.id == node_id).cloned();
         let (started_at, heartbeat_at) = rec.map(|n| (n.started_at, n.heartbeat_at)).unwrap_or((0, i64::MIN));
@@ -434,7 +451,7 @@ impl Node {
         lock(&self.suspects).get(node_id).is_some_and(|s| Instant::now() < s.until)
     }
 
-    /// Where requests for `db_id` should go: `None` = handle here.
+    /// Returns the `(node_id, addr)` of the peer that should handle `db_id`, or `None` to handle locally.
     pub async fn route(&self, db_id: &str) -> Option<(String, String)> {
         let db = self.engine.db(db_id);
         let _ = db.open(false).await;
@@ -455,23 +472,30 @@ impl Node {
         Some((target, addr))
     }
 
-    // ------------------------------------------------------- system db
-
-    /// A snapshot transaction on the system database.
+    /// Begins a snapshot read transaction on the system database.
     pub async fn sys_read(&self) -> Result<Txn> {
         let sys = self.engine.db(SYS_DB);
         sys.begin(Isolation::Serializable, Consistency::Snapshot { max_staleness_ms: self.cfg.sys_staleness_ms }).await
     }
 
-    /// A linearizable transaction on the system database (used after a
-    /// snapshot miss, so clients always see their own metadata writes).
+    /// Begins a linearizable transaction on the system database.
     pub async fn sys_read_strong(&self) -> Result<Txn> {
         let sys = self.engine.db(SYS_DB);
         sys.begin(Isolation::Serializable, Consistency::Strong).await
     }
 
-    /// Run a metadata command on the system database's lease holder.
-    pub async fn run_meta(&self, cmd: MetaCmd) -> Result<Json> {
+    /// Executes `cmd` on the system database.
+    pub async fn run_meta(&self, cmd: MetaCmd) -> Result<()> {
+        self.run_meta_json(cmd).await.map(|_| ())
+    }
+
+    /// Executes `cmd` on the system database and deserializes its result.
+    pub async fn run_meta_as<T: DeserializeOwned>(&self, cmd: MetaCmd) -> Result<T> {
+        let answer = self.run_meta_json(cmd).await?;
+        serde_json::from_value(answer).map_err(|e| Error::internal(format!("a metadata command's answer: {e}")))
+    }
+
+    async fn run_meta_json(&self, cmd: MetaCmd) -> Result<Json> {
         let sys = self.engine.db(SYS_DB);
         let mut last_err = Error::unavailable("system database unavailable");
         for attempt in 0..10u32 {
@@ -485,8 +509,7 @@ impl Node {
             {
                 match self.forward_meta(&holder, &addr, &cmd).await {
                     Ok(r) => return Ok(r),
-                    // A peer rejected our cluster key: it was created after
-                    // we started. Reload it and retry.
+                    // Reload the cluster key if it was initialized by another node after we started.
                     Err(Ok(Error::PermissionDenied(m))) if m.contains("cluster key") => {
                         if self.cfg.cluster_secret.is_none()
                             && let Ok(mut t) = self.sys_read_strong().await
@@ -497,7 +520,6 @@ impl Node {
                         last_err = Error::unavailable("cluster key mismatch");
                         continue;
                     }
-                    // Not applied there (e.g. the holder restarted): retry.
                     Err(Ok(e @ Error::Unavailable { outcome_unknown: false, .. })) => {
                         last_err = e;
                         continue;
@@ -528,7 +550,7 @@ impl Node {
         Err(last_err)
     }
 
-    /// Execute a metadata command here (no forwarding).
+    /// Executes `cmd` locally on this node.
     pub async fn run_meta_local(&self, cmd: &MetaCmd) -> Result<Json> {
         let sys = self.engine.db(SYS_DB);
         let mut t = sys.begin(Isolation::Serializable, Consistency::Strong).await?;
@@ -559,7 +581,12 @@ impl Node {
         if let Ok(v) = holder.parse() {
             req.headers_mut().insert(cluster::FORWARD_TO_HEADER, v);
         }
-        let resp = self.transport.call(addr, req).await.map_err(Err)?;
+        if let Some(rid) = crate::log::request_id()
+            && let Ok(v) = rid.parse()
+        {
+            req.headers_mut().insert(crate::log::REQUEST_ID_HEADER, v);
+        }
+        let resp = self.services.transport.call(addr, req).await.map_err(Err)?;
         let status = resp.status();
         let bytes = http_body_util::BodyExt::collect(resp.into_body())
             .await
@@ -568,8 +595,6 @@ impl Node {
         let j: Json = serde_json::from_slice(&bytes).unwrap_or(Json::Null);
         if status.is_success() { Ok(j) } else { Err(Ok(crate::api::error_from_json(status.as_u16(), &j))) }
     }
-
-    // ------------------------------------------------------------- auth
 
     /// Authenticates a bearer token or session cookie value and checks rate limits.
     pub async fn authenticate(&self, token: &str) -> Result<Principal> {
@@ -588,10 +613,8 @@ impl Node {
 
     async fn principal(&self, token: &str) -> Result<Principal> {
         let cache_key = auth::secret_hash(token);
-        if let Some((t, p)) = lock(&self.auth_cache).get(&cache_key)
-            && t.elapsed() < Duration::from_millis(self.cfg.auth_cache_ms)
-        {
-            return Ok(p.clone());
+        if let Some(p) = self.auth_cache.get(&cache_key) {
+            return Ok(p);
         }
         let p = match self.lookup_principal(token, &cache_key, false).await {
             Err(Error::Unauthenticated(_)) => self.lookup_principal(token, &cache_key, true).await?,
@@ -600,18 +623,14 @@ impl Node {
         if p.user.disabled {
             return Err(Error::PermissionDenied("this account is disabled".into()));
         }
-        let mut c = lock(&self.auth_cache);
-        if c.len() > 100_000 {
-            c.clear();
-        }
-        c.insert(cache_key, (Instant::now(), p.clone()));
+        self.auth_cache.store(cache_key, Some(p.clone()));
         Ok(p)
     }
 
     async fn lookup_principal(&self, token: &str, cache_key: &str, strong: bool) -> Result<Principal> {
         let unauth = || Error::Unauthenticated("invalid or expired credentials".into());
-        let mut t = if strong { self.sys_read_strong().await? } else { self.sys_read().await? };
-        let p = if let Some((id, secret)) = auth::parse_api_key(token) {
+        let mut t = self.sys_read_at(strong).await?;
+        if let Some((id, secret)) = auth::parse_api_key(token) {
             let k: ApiKey = meta::get_api_key(&mut t, id).await?.ok_or_else(unauth)?;
             if !auth::verify_api_secret(secret, &k.secret_hash) {
                 return Err(unauth());
@@ -619,33 +638,40 @@ impl Node {
             let user = meta::get_user(&mut t, &k.user_id).await?.ok_or_else(unauth)?;
             let cred =
                 Credential::ApiKey { id: k.id, db_id: k.db_id, read_only: k.read_only, rate_limit: k.rate_limit };
-            Principal { user, cred }
-        } else if token.starts_with(auth::SESSION_PREFIX) {
-            let s = meta::get_session(&mut t, cache_key).await?.ok_or_else(unauth)?;
-            if s.expires_at < self.now_ms() as i64 {
-                return Err(unauth());
-            }
-            let user = meta::get_user(&mut t, &s.user_id).await?.ok_or_else(unauth)?;
-            Principal { user, cred: Credential::Session { token_hash: cache_key.to_string() } }
-        } else {
+            return Ok(Principal { user, cred });
+        }
+        if !token.starts_with(auth::SESSION_PREFIX) {
             return Err(unauth());
-        };
-        Ok(p)
+        }
+        let s = meta::get_session(&mut t, cache_key).await?.ok_or_else(unauth)?;
+        let user = meta::get_user(&mut t, &s.user_id).await?.ok_or_else(unauth)?;
+        if !s.is_live(&user, self.now_ms() as i64) {
+            return Err(unauth());
+        }
+        Ok(Principal { user, cred: Credential::Session { token_hash: cache_key.to_string() } })
     }
 
-    /// Drop cached principals for an API key (revocation takes effect on
-    /// this node immediately; other nodes within the cache TTL).
+    /// Evicts cached principals for `key_id`.
     pub fn forget_api_key(&self, key_id: &str) {
-        lock(&self.auth_cache).retain(|_, (_, p)| !matches!(&p.cred, Credential::ApiKey { id, .. } if id == key_id));
+        self.auth_cache.retain(|_, p| !matches!(&p.cred, Credential::ApiKey { id, .. } if id == key_id));
     }
 
-    /// Drop cached principals of a user (e.g. after disabling them).
+    /// Evicts all cached credentials, roles, and database names for `user_id`.
     pub fn forget_user(&self, user_id: &str) {
-        lock(&self.auth_cache).retain(|_, (_, p)| p.user.id != user_id);
+        self.auth_cache.retain(|_, p| p.user.id != user_id);
+        self.role_cache.retain(|(_, u), _| u != user_id);
+        self.name_cache.retain(|(owner, _), _| owner != user_id);
     }
 
     pub fn forget_credential(&self, token: &str) {
-        lock(&self.auth_cache).remove(&auth::secret_hash(token));
+        self.auth_cache.remove(&auth::secret_hash(token));
+    }
+
+    fn forget_sessions(&self, user_id: &str, keep: Option<&str>) {
+        self.auth_cache.retain(|_, p| match &p.cred {
+            Credential::Session { token_hash } => p.user.id != user_id || Some(token_hash.as_str()) == keep,
+            Credential::ApiKey { .. } => true,
+        });
     }
 
     /// Computes a PBKDF2 password hash within bounded concurrency slots.
@@ -654,7 +680,6 @@ impl Node {
         self.hashing(move || auth::hash_password(&env, &password, iters)).await
     }
 
-    /// Executes a password hashing operation within an acquired semaphore slot.
     async fn hashing<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
         let wait = Duration::from_millis(self.cfg.limits.hash_wait_ms);
         let busy = || Error::Unavailable {
@@ -669,13 +694,21 @@ impl Node {
         Ok(self.env.run_blocking(f).await)
     }
 
+    fn limit_client(&self, client: &str, what: &str) -> Result<()> {
+        self.limiter.take(&[(&format!("auth:{client}"), self.cfg.limits.auth_per_client)], what)
+    }
+
+    fn failures_of(email: &str) -> String {
+        format!("login:{email}")
+    }
+
     /// Authenticates an email and password against rate limits and failure backoff.
     pub async fn password_login(&self, client: &str, email: &str, password: &str) -> Result<User> {
         let lim = &self.cfg.limits;
-        self.limiter.take(&[(&format!("auth:{client}"), lim.auth_per_client)], "sign-in attempts")?;
+        self.limit_client(client, "sign-in attempts")?;
         let bad = || Error::Unauthenticated("invalid email or password".into());
         let email = auth::normalize_email(email).map_err(|_| bad())?;
-        let (account, from) = (format!("login:{email}"), format!("login-from:{client}"));
+        let (account, from) = (Self::failures_of(&email), format!("login-from:{client}"));
         self.limiter.check_backoff(&[&account, &from], "failed sign-ins")?;
         let mut t = self.sys_read().await?;
         let mut user = meta::user_by_email(&mut t, &email).await?;
@@ -707,87 +740,389 @@ impl Node {
         Ok(user)
     }
 
-    /// Registers a new user with email and password under the configured signup policy.
-    pub async fn password_signup(&self, client: &str, email: &str, password: &str) -> Result<(String, Json)> {
+    /// Verifies `user`'s current password if one is set.
+    async fn reauthenticate(&self, user: &User, password: Option<&str>) -> Result<()> {
+        let Some(hash) = user.password_hash.clone() else { return Ok(()) };
+        let lim = &self.cfg.limits;
+        let account = Self::failures_of(&user.email);
+        self.limiter.check_backoff(&[&account], "failed sign-ins")?;
+        let password = password.ok_or_else(|| Error::invalid("confirm with your current password"))?.to_string();
+        if !self.hashing(move || auth::verify_password(&password, &hash)).await? {
+            self.limiter.failed(&account, lim.account_free_failures, lim);
+            return Err(Error::PermissionDenied("the current password is incorrect".into()));
+        }
+        self.limiter.succeeded(&account);
+        Ok(())
+    }
+
+    /// Registers a new user with email and password and sends a verification email if configured.
+    pub async fn password_signup(&self, client: &str, email: &str, password: &str) -> Result<User> {
         let lim = &self.cfg.limits;
         let (auth_key, signup_key) = (format!("auth:{client}"), format!("signup:{client}"));
         self.limiter.take(&[(&auth_key, lim.auth_per_client), (&signup_key, lim.signup_per_client)], "sign-ups")?;
         let email = auth::normalize_email(email)?;
         auth::validate_password(password)?;
         let hash = self.hash_password(password).await?;
-        let r = self
-            .run_meta(MetaCmd::Signup {
+        let r: SignedUp = self
+            .run_meta_as(MetaCmd::Signup {
                 id: self.env.random_hex(8),
-                email: email.clone(),
+                email,
                 password_hash: Some(hash),
                 policy: self.cfg.signup,
                 bootstrap_admin: false,
             })
             .await?;
-        Ok((email, r))
+        if let (true, Ok(mailer)) = (r.created, self.mailer()) {
+            self.mail_verification(mailer, &r.user);
+        }
+        Ok(r.user)
     }
 
-    /// Create a session for a user, returning the token.
-    pub async fn create_session(&self, user_id: &str) -> Result<String> {
+    /// Creates a session for `user_id` and returns its bearer token.
+    pub async fn create_session(&self, user_id: &str, client: Option<&str>, method: SignInMethod) -> Result<String> {
         let (token, hash) = auth::new_session_token(&self.env);
         self.run_meta(MetaCmd::CreateSession {
             token_hash: hash,
+            id: self.env.random_hex(8),
             user_id: user_id.to_string(),
             expires_at: (self.now_ms() + self.cfg.session_ttl_ms) as i64,
+            client: client.map(|c| c.to_string()),
+            method,
         })
         .await?;
         Ok(token)
     }
 
-    /// Resolve a database by name (or `id:<db_id>` for admins) for a
-    /// principal, enforcing ownership and API key scope.
-    pub async fn resolve_db(&self, p: &Principal, name: &str) -> Result<DbRecord> {
-        let rec = if let Some(id) = name.strip_prefix("id:") {
-            p.require_admin()?;
-            let mut t = self.sys_read_strong().await?;
-            meta::get_db(&mut t, id).await?.ok_or_else(|| Error::not_found("database not found"))?
-        } else {
-            let key = (p.user.id.clone(), name.to_string());
-            let cached = lock(&self.name_cache)
-                .get(&key)
-                .filter(|(t, _)| t.elapsed() < Duration::from_millis(self.cfg.auth_cache_ms))
-                .map(|(_, r)| r.clone());
-            match cached {
-                Some(r) => r,
-                None => {
-                    let mut t = self.sys_read().await?;
-                    let r = match meta::resolve_db(&mut t, &p.user.id, name).await? {
-                        Some(r) => r,
-                        None => {
-                            let mut t = self.sys_read_strong().await?;
-                            meta::resolve_db(&mut t, &p.user.id, name)
-                                .await?
-                                .ok_or_else(|| Error::not_found(format!("database {name:?} not found")))?
-                        }
-                    };
-                    lock(&self.name_cache).insert(key, (Instant::now(), r.clone()));
-                    r
+    /// Reads user `id` with strong consistency, returning `Unauthenticated` if not found.
+    pub async fn user_strong(&self, id: &str) -> Result<User> {
+        let mut t = self.sys_read_strong().await?;
+        meta::get_user(&mut t, id).await?.ok_or_else(|| Error::Unauthenticated("this account no longer exists".into()))
+    }
+
+    /// Updates the signed-in user's password and revokes all other sessions.
+    pub async fn change_password(&self, p: &Principal, current: Option<&str>, new: &str) -> Result<()> {
+        let token_hash = p.session_hash()?;
+        auth::validate_password(new)?;
+        let user = self.user_strong(&p.user.id).await?;
+        self.reauthenticate(&user, current).await?;
+        let hash = self.hash_password(new).await?;
+        self.run_meta(MetaCmd::SetPassword {
+            user_id: user.id.clone(),
+            password_hash: hash,
+            expected: user.password_hash.clone(),
+            keep_session: Some(token_hash.to_string()),
+            verify_email: false,
+        })
+        .await?;
+        self.delete_ended_sessions(&user.id, Some(token_hash)).await;
+        Ok(())
+    }
+
+    async fn delete_ended_sessions(&self, user_id: &str, keep: Option<&str>) {
+        if let Err(e) = self.revoke_sessions(user_id, keep).await {
+            crate::warn!("deleting sessions ended by a password change: {e}");
+        }
+    }
+
+    /// Revokes all sessions for `user_id` except `keep`, returning the number of revoked sessions.
+    pub async fn revoke_sessions(&self, user_id: &str, keep: Option<&str>) -> Result<usize> {
+        self.forget_sessions(user_id, keep);
+        let mut total = 0;
+        loop {
+            let cmd = MetaCmd::RevokeSessions {
+                user_id: user_id.to_string(),
+                except: keep.map(|k| k.to_string()),
+                limit: META_BATCH,
+            };
+            let b: Batch = self.run_meta_as(cmd).await?;
+            total += b.deleted;
+            if !b.more {
+                return Ok(total);
+            }
+        }
+    }
+
+    /// Revokes session `id` and returns whether it was the caller's current session.
+    pub async fn revoke_session(&self, p: &Principal, id: &str) -> Result<bool> {
+        let current = p.session_hash()?;
+        let cmd = MetaCmd::RevokeSession { user_id: p.user.id.clone(), id: id.to_string() };
+        let hash: String = self.run_meta_as(cmd).await?;
+        self.auth_cache.remove(&hash);
+        Ok(hash == current)
+    }
+
+    async fn delete_api_keys(&self, user_id: &str) -> Result<()> {
+        loop {
+            let cmd = MetaCmd::DeleteApiKeys { user_id: user_id.to_string(), limit: META_BATCH };
+            if !self.run_meta_as::<Batch>(cmd).await?.more {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Deletes the signed-in user's account, credentials, memberships, and personal databases.
+    pub async fn delete_account(&self, p: &Principal, password: Option<&str>) -> Result<()> {
+        p.require_session()?;
+        let user = self.user_strong(&p.user.id).await?;
+        self.reauthenticate(&user, password).await?;
+        let dbs = loop {
+            match self.run_meta_as(MetaCmd::DeleteUser { user_id: user.id.clone() }).await? {
+                UserDeletion::Deleted { dbs } => break dbs,
+                UserDeletion::TooManyCredentials => {
+                    self.revoke_sessions(&user.id, None).await?;
+                    self.delete_api_keys(&user.id).await?;
                 }
             }
         };
-        if rec.owner_id != p.user.id && !p.user.is_admin {
-            return Err(Error::not_found(format!("database {name:?} not found")));
+        // Mark each database manifest deleted so nodes with cached handles stop serving it immediately.
+        for id in dbs {
+            let db = self.engine.db(&id);
+            if db.open(false).await.is_ok()
+                && let Err(e) = db.mark_deleted().await
+            {
+                crate::warn!("flagging database {id} of a deleted account: {e}");
+            }
+            self.engine.forget(&id);
         }
+        self.forget_user(&user.id);
+        Ok(())
+    }
+
+    /// Formats an absolute public URL for `path`.
+    pub fn link(&self, path: &str) -> String {
+        format!("{}{path}", self.cfg.public_url.trim_end_matches('/'))
+    }
+
+    fn mailer(&self) -> Result<Arc<dyn Mailer>> {
+        self.services.mailer.clone().ok_or_else(|| Error::not_found("this server is not configured to send email"))
+    }
+
+    fn send_mail(&self, mailer: Arc<dyn Mailer>, mail: Mail) {
+        self.env.spawn(async move {
+            for attempt in 0..5u32 {
+                match mailer.send(&mail).await {
+                    Ok(()) => return,
+                    Err(e) => crate::warn!("sending mail (attempt {}): {e}", attempt + 1),
+                }
+                tokio::time::sleep(Duration::from_millis(1_000 << attempt)).await;
+            }
+        });
+    }
+
+    fn token_link(&self, path: &str, purpose: auth::TokenPurpose, user: &User, fp: &str, life: &LinkLife) -> String {
+        let token = auth::sign_token(&self.cookie_key(), purpose, &user.id, fp, self.now_ms() + life.ms);
+        self.link(&format!("{path}?token={token}"))
+    }
+
+    fn mail_verification(&self, mailer: Arc<dyn Mailer>, user: &User) {
+        let link = self.token_link(
+            "/console/verify",
+            auth::TokenPurpose::Verify,
+            user,
+            &auth::fingerprint(&user.email),
+            &VERIFY_LINK,
+        );
+        let text = format!(
+            "Confirm that this is your address by opening\n\n{link}\n\nThe link is valid for {}.",
+            VERIFY_LINK.words
+        );
+        let subject = "Verify your Baserunna email address".into();
+        self.send_mail(mailer, Mail { to: user.email.clone(), subject, text });
+    }
+
+    /// Sends an email verification link to the signed-in user.
+    pub async fn send_verification(&self, p: &Principal) -> Result<()> {
+        p.require_session()?;
+        let mailer = self.mailer()?;
+        let user = self.user_strong(&p.user.id).await?;
+        if user.email_verified {
+            return Err(Error::invalid("this email address is already verified"));
+        }
+        let mail_key = format!("mail:{}", user.email);
+        self.limiter.take(&[(&mail_key, self.cfg.limits.mail_per_account)], "emails")?;
+        self.mail_verification(mailer, &user);
+        Ok(())
+    }
+
+    async fn open_link(&self, client: &str, purpose: auth::TokenPurpose, token: &str) -> Result<(User, String)> {
+        self.limit_client(client, "attempts")?;
+        let bad = || Error::Unauthenticated("this link is invalid or has expired".into());
+        let (user_id, fp) = auth::open_token(&self.cookie_key(), purpose, token, self.now_ms()).ok_or_else(bad)?;
+        match self.user_strong(&user_id).await {
+            Ok(user) => Ok((user, fp)),
+            Err(e) if e.retryable() => Err(e),
+            Err(_) => Err(bad()),
+        }
+    }
+
+    /// Verifies an email address using a signed verification token.
+    pub async fn verify_email(&self, client: &str, token: &str) -> Result<()> {
+        let (user, fp) = self.open_link(client, auth::TokenPurpose::Verify, token).await?;
+        if auth::fingerprint(&user.email) != fp {
+            return Err(Error::Unauthenticated("this link is for an earlier email address".into()));
+        }
+        self.run_meta(MetaCmd::VerifyEmail { user_id: user.id.clone(), email: user.email }).await?;
+        self.forget_user(&user.id);
+        Ok(())
+    }
+
+    /// Sends a password reset email if an active account exists for `email`.
+    pub async fn request_password_reset(&self, client: &str, email: &str) -> Result<()> {
+        let mailer = self.mailer()?;
+        let lim = &self.cfg.limits;
+        self.limit_client(client, "attempts")?;
+        let email = auth::normalize_email(email)?;
+        self.limiter.take(&[(&format!("mail:{email}"), lim.mail_per_account)], "emails")?;
+        let mut t = self.sys_read_strong().await?;
+        let Some(user) = meta::user_by_email(&mut t, &email).await?.filter(|u| !u.disabled) else {
+            return Ok(());
+        };
+        let link =
+            self.token_link("/console/reset", auth::TokenPurpose::Reset, &user, &meta::password_fp(&user), &RESET_LINK);
+        let text = format!(
+            "Someone asked to reset the password of your Baserunna account. To choose a new one, open\n\n{link}\n\n\
+             The link is valid for {} and works once. If you did not ask for it, ignore this email.",
+            RESET_LINK.words
+        );
+        self.send_mail(mailer, Mail { to: email, subject: "Reset your Baserunna password".into(), text });
+        Ok(())
+    }
+
+    /// Resets a user's password using a single-use reset token, revokes existing sessions, and returns a new session.
+    pub async fn reset_password(&self, client: &str, token: &str, password: &str) -> Result<(User, String)> {
+        auth::validate_password(password)?;
+        let (user, fp) = self.open_link(client, auth::TokenPurpose::Reset, token).await?;
+        let used = || Error::Unauthenticated("this link has been used already".into());
+        if meta::password_fp(&user) != fp {
+            return Err(used());
+        }
+        if user.disabled {
+            return Err(Error::PermissionDenied("this account is disabled".into()));
+        }
+        let hash = self.hash_password(password).await?;
+        let set = MetaCmd::SetPassword {
+            user_id: user.id.clone(),
+            password_hash: hash,
+            expected: user.password_hash.clone(),
+            keep_session: None,
+            verify_email: true,
+        };
+        self.run_meta(set).await.map_err(|e| if matches!(e, Error::PreconditionFailed { .. }) { used() } else { e })?;
+        self.forget_user(&user.id);
+        self.delete_ended_sessions(&user.id, None).await;
+        self.limiter.succeeded(&Self::failures_of(&user.email));
+        let session = self.create_session(&user.id, Some(client), SignInMethod::Reset).await?;
+        Ok((self.user_strong(&user.id).await?, session))
+    }
+
+    /// Resolves a database reference (`name`, `org.name`, or `id:<db_id>`) and the caller's access.
+    pub async fn resolve_db(&self, p: &Principal, name: &str) -> Result<(DbRecord, Access)> {
+        match self.resolve_db_with(p, name, false).await {
+            // A miss may be a stale cache or snapshot: confirm strongly.
+            Err(Error::NotFound(_)) => self.resolve_db_with(p, name, true).await,
+            other => other,
+        }
+    }
+
+    /// Resolves a database reference with strong consistency, bypassing caches.
+    pub async fn resolve_db_strong(&self, p: &Principal, name: &str) -> Result<(DbRecord, Access)> {
+        self.resolve_db_with(p, name, true).await
+    }
+
+    async fn resolve_db_with(&self, p: &Principal, name: &str, strong: bool) -> Result<(DbRecord, Access)> {
+        let not_found = || Error::not_found(format!("database {name:?} not found"));
+        let rec = match DbRef::parse(name).ok_or_else(not_found)? {
+            DbRef::Id(id) => {
+                p.require_admin()?;
+                let mut t = self.sys_read_strong().await?;
+                meta::get_db(&mut t, &id).await?.ok_or_else(|| Error::not_found("database not found"))?
+            }
+            DbRef::Personal(n) => self.lookup_db(&p.user.id, &n, strong).await?.ok_or_else(not_found)?,
+            DbRef::Org { org, name: n } => {
+                let o = self.lookup_org(&org, strong).await?.ok_or_else(not_found)?;
+                self.lookup_db(&o.id, &n, strong).await?.ok_or_else(not_found)?
+            }
+        };
+        let role = self.role_for(&p.user, &rec.owner_id, strong).await?.ok_or_else(not_found)?;
         if let Some(scope) = p.scoped_db()
             && scope != rec.id
         {
             return Err(Error::PermissionDenied("this API key is limited to another database".into()));
         }
+        Ok((rec, Access { role, read_only_key: p.read_only() }))
+    }
+
+    /// Computes `p`'s access to `rec` with strong consistency, bypassing caches.
+    pub async fn access_strong(&self, p: &Principal, rec: &DbRecord) -> Result<Access> {
+        let user = self.user_strong(&p.user.id).await?;
+        let role = self.role_for(&user, &rec.owner_id, true).await?;
+        let role = role.ok_or_else(|| Error::not_found("database not found"))?;
+        Ok(Access { role, read_only_key: p.read_only() })
+    }
+
+    async fn role_for(&self, user: &User, owner_id: &str, strong: bool) -> Result<Option<Role>> {
+        if let Some(r) = Role::of_site_admin(user) {
+            return Ok(Some(r));
+        }
+        if !meta::is_org_id(owner_id) {
+            return Ok((owner_id == user.id).then_some(Role::Owner));
+        }
+        let key = (owner_id.to_string(), user.id.clone());
+        if !strong && let Some(r) = self.role_cache.get(&key) {
+            return Ok(Some(r));
+        }
+        let mut t = self.sys_read_at(strong).await?;
+        let role = meta::member_role(&mut t, owner_id, &user.id).await?;
+        self.role_cache.store(key, role);
+        Ok(role)
+    }
+
+    async fn sys_read_at(&self, strong: bool) -> Result<Txn> {
+        if strong { self.sys_read_strong().await } else { self.sys_read().await }
+    }
+
+    async fn lookup_db(&self, owner_id: &str, name: &str, strong: bool) -> Result<Option<DbRecord>> {
+        let key = (owner_id.to_string(), name.to_string());
+        if !strong && let Some(rec) = self.name_cache.get(&key) {
+            return Ok(Some(rec));
+        }
+        let mut t = self.sys_read_at(strong).await?;
+        let rec = meta::resolve_db(&mut t, owner_id, name).await?;
+        self.name_cache.store(key, rec.clone());
         Ok(rec)
     }
 
-    pub fn forget_db_name(&self, owner_id: &str, name: &str) {
-        lock(&self.name_cache).remove(&(owner_id.to_string(), name.to_string()));
+    async fn lookup_org(&self, name: &str, strong: bool) -> Result<Option<Org>> {
+        if !strong && let Some(o) = self.org_cache.get(&name.to_string()) {
+            return Ok(Some(o));
+        }
+        let mut t = self.sys_read_at(strong).await?;
+        let o = meta::org_by_name(&mut t, name).await?;
+        self.org_cache.store(name.to_string(), o.clone());
+        Ok(o)
     }
 
-    /// The engine handle for a user database. Its manifest is created
-    /// lazily, but only after confirming (strongly) that the database
-    /// exists, so stale caches can never resurrect a purged database.
+    /// Resolves organization `name` and `p`'s role with strong consistency.
+    pub async fn resolve_org(&self, p: &Principal, name: &str) -> Result<(Org, Role)> {
+        let not_found = || Error::not_found(format!("organization {name:?} not found"));
+        let o = self.lookup_org(name, true).await?.ok_or_else(not_found)?;
+        let role = self.role_for(&p.user, &o.id, true).await?.ok_or_else(not_found)?;
+        Ok((o, role))
+    }
+
+    pub fn forget_db_name(&self, owner_id: &str, name: &str) {
+        self.name_cache.remove(&(owner_id.to_string(), name.to_string()));
+    }
+
+    pub fn forget_org(&self, name: &str) {
+        self.org_cache.remove(&name.to_string());
+    }
+
+    pub fn forget_role(&self, org_id: &str, user_id: &str) {
+        self.role_cache.remove(&(org_id.to_string(), user_id.to_string()));
+    }
+
+    /// Opens the engine handle for `rec`, creating its manifest only after a strong existence check.
     pub async fn open_db(&self, rec: &DbRecord) -> Result<Arc<Db>> {
         let db = self.engine.db(&rec.id);
         match db.open(false).await {
@@ -804,19 +1139,6 @@ impl Node {
         }
     }
 
-    /// Resolve a database name bypassing caches (linearizable).
-    pub async fn resolve_db_strong(&self, p: &Principal, name: &str) -> Result<DbRecord> {
-        self.forget_db_name(&p.user.id, name);
-        let mut t = self.sys_read_strong().await?;
-        let rec = meta::resolve_db(&mut t, &p.user.id, name)
-            .await?
-            .ok_or_else(|| Error::not_found(format!("database {name:?} not found")))?;
-        lock(&self.name_cache).insert((p.user.id.clone(), name.to_string()), (Instant::now(), rec.clone()));
-        Ok(rec)
-    }
-
-    // ------------------------------------------------- background work
-
     fn housekeeping(&self) {
         self.engine.evict_idle(self.cfg.db_idle_evict_ms);
         self.engine.shared.refresh_clock();
@@ -826,16 +1148,15 @@ impl Node {
             Ok(t) => t.last_used.elapsed() < idle && t.created.elapsed() < max,
             Err(_) => true,
         });
-        let ttl = Duration::from_millis(self.cfg.auth_cache_ms);
-        lock(&self.auth_cache).retain(|_, (t, _)| t.elapsed() < ttl);
-        lock(&self.name_cache).retain(|_, (t, _)| t.elapsed() < ttl);
+        self.auth_cache.prune();
+        self.name_cache.prune();
+        self.org_cache.prune();
+        self.role_cache.prune();
         self.forwards.expire();
         self.limiter.prune(&self.cfg.limits);
     }
 
-    /// Purge deleted databases whose grace period has passed. Runs on the
-    /// node that requests for the system database go to, and only with a
-    /// store clock measurement (deletion times are store time).
+    /// Purges deleted databases past their grace period and sweeps expired sessions.
     pub async fn reap_deleted(&self) -> Result<usize> {
         if self.route(SYS_DB).await.is_some() {
             return Ok(0);
@@ -844,8 +1165,6 @@ impl Node {
             return Ok(0);
         };
         let now = self.now_ms() as i64;
-        // Minutes of staleness are harmless against a grace period of
-        // minutes, and membership refreshes keep this snapshot validated.
         let sys = self.engine.db(SYS_DB);
         let stale_ok = Consistency::Snapshot { max_staleness_ms: 2 * self.cfg.members_refresh_ms };
         let mut t = sys.begin(Isolation::Serializable, stale_ok).await?;
@@ -858,17 +1177,13 @@ impl Node {
             self.run_meta(MetaCmd::PurgePass { id: d.id.clone(), passes: d.purge_passes }).await?;
             n += 1;
         }
-        // Expired sessions (bounded work per pass).
         if meta::any_session_expired(&mut t, now).await? {
-            self.run_meta(MetaCmd::ExpireSessions { before_ms: now, limit: 500 }).await?;
+            self.run_meta_as::<Batch>(MetaCmd::ExpireSessions { before_ms: now, limit: META_BATCH }).await?;
         }
         Ok(n)
     }
 
-    /// Cluster time for metadata: the store's clock as this node measured
-    /// it, so that timestamps written by one node and compared by another
-    /// (heartbeats, session expiry, deadlines, deletions) do not depend on
-    /// node clock skew. This node's wall clock until the first measurement.
+    /// Returns cluster time in milliseconds derived from the object store clock.
     pub fn now_ms(&self) -> u64 {
         self.engine.shared.time_ms()
     }
@@ -892,7 +1207,7 @@ impl Node {
     }
 }
 
-/// Retry an operation while it reports a retryable error.
+/// Retries `f` with exponential backoff while it returns a retryable error.
 pub async fn retry_unavailable<T, F, Fut>(mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -938,9 +1253,6 @@ mod tests {
         });
     }
 
-    /// A peer that a forward failed to reach leaves routing until it
-    /// heartbeats again, or for a backoff that grows with each failure;
-    /// a node that shuts down leaves the membership table.
     #[test]
     fn suspects_come_back_and_leavers_go() {
         run_paused(async {
@@ -959,8 +1271,6 @@ mod tests {
             for _ in 0..8 {
                 a.mark_suspect(&b.id);
             }
-            // The backoff is now the liveness window, but b's next
-            // heartbeat ends it.
             tokio::time::sleep(Duration::from_millis(a.cfg.heartbeat_ms + 2 * a.cfg.members_refresh_ms)).await;
             assert!(live(&a).contains(&b.id), "a new heartbeat forgives a suspect");
             b.shutdown().await;

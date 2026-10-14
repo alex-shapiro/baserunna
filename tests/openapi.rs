@@ -59,8 +59,10 @@ fn document_is_well_formed() {
 fn router_routes() -> BTreeSet<(String, String)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut out = BTreeSet::new();
-    for f in ["src/api/mod.rs", "src/api/account.rs", "src/api/data.rs"] {
-        let text = std::fs::read_to_string(root.join(f)).unwrap();
+    let mut files: Vec<_> = std::fs::read_dir(root.join("src/api")).unwrap().map(|e| e.unwrap().path()).collect();
+    files.sort();
+    for f in files.iter().filter(|f| f.extension().is_some_and(|x| x == "rs")) {
+        let text = std::fs::read_to_string(f).unwrap();
         for chunk in text.split(".route(\"").skip(1) {
             let path = chunk.split('"').next().unwrap().replace("{*key}", "{key}");
             if path.starts_with("/internal") {
@@ -102,12 +104,16 @@ fn resp(status: u16, body: Value) -> SimResponse {
 
 #[test]
 fn validator_catches_drift() {
-    assert!(check_response("POST", "/v1/dbs", &resp(201, json!({"id": "a", "name": "b", "created_at": 1}))).is_ok());
-    assert!(check_response("POST", "/v1/dbs", &resp(201, json!({"id": 1, "name": "b", "created_at": 1}))).is_err());
-    assert!(
-        check_response("POST", "/v1/dbs", &resp(201, json!({"id": "a", "name": "b", "created_at": 1, "x": 1})))
-            .is_err()
-    );
+    let db = |id: Value, extra: Option<(&str, Value)>| {
+        let mut d = json!({"id": id, "name": "b", "org": null, "created_at": 1});
+        if let Some((k, v)) = extra {
+            d[k] = v;
+        }
+        resp(201, d)
+    };
+    assert!(check_response("POST", "/v1/dbs", &db(json!("a"), None)).is_ok());
+    assert!(check_response("POST", "/v1/dbs", &db(json!(1), None)).is_err(), "a mistyped field");
+    assert!(check_response("POST", "/v1/dbs", &db(json!("a"), Some(("x", json!(1))))).is_err(), "an extra field");
     let err = json!({"error": {"code": "not_found", "message": "m", "retryable": false}});
     assert!(check_response("GET", "/v1/dbs/x/kv/a%2Fb", &resp(404, err.clone())).is_ok());
     let bad = json!({"error": {"code": "nope", "message": "m", "retryable": false}});

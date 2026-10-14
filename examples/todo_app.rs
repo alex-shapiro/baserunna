@@ -1,9 +1,8 @@
-//! Real-world example: a multi-user todo service.
+//! Multi-user todo service example.
 //!
-//! Every user gets their own database with a `todos` table, a secondary
-//! index for "open tasks by due date", JSON tags, filters and pagination,
-//! and updates and deletes of many tasks at once. Users are isolated from
-//! each other by construction.
+//! Each user gets an isolated database with a `todos` table, a secondary index
+//! for open tasks by due date, JSON tags, filters, pagination, and bulk row
+//! updates and deletes.
 //!
 //! Run: `cargo run --example todo_app`
 

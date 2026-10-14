@@ -1,6 +1,4 @@
-//! A fake Google OpenID provider for the simulator. It signs real RS256 ID
-//! tokens with a fixed test key so the production verification path runs
-//! unchanged.
+//! Simulated Google OpenID Connect provider that signs RS256 ID tokens with a test key.
 
 use crate::auth::OidcProvider;
 use crate::error::{Error, Result};
@@ -22,7 +20,6 @@ pub struct Identity {
     pub sub: String,
     pub email: String,
     pub email_verified: bool,
-    /// Test hooks to produce invalid tokens.
     pub tamper: Tamper,
 }
 
@@ -55,7 +52,7 @@ impl FakeGoogle {
         }
     }
 
-    /// The user "consents": returns an authorization code for `id`.
+    /// Issues a single-use authorization code for `id`.
     pub fn issue_code(&self, id: Identity) -> String {
         let mut n = self.next.lock().unwrap_or_else(|e| e.into_inner());
         *n += 1;

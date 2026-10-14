@@ -38,14 +38,11 @@ impl BlobRef {
     }
 }
 
-/// The keyspace of commit records, above every keyspace of the layers on
-/// top of the engine: `COMMIT_SPACE ++ commit id (u64, big-endian)`, with
-/// the commit's version as the entry's seq and an empty value. Each commit
-/// writes its record in the same manifest write as its data, so finding the
-/// record tells whether a commit applied (SPEC §5.5). Records are kept for
-/// `commit_retention_ms`, by the age of their version. Nothing overwrites a
-/// record, so one past its retention shadows nothing and is dropped
-/// without a tombstone.
+/// Key prefix for commit records: `COMMIT_SPACE ++ commit_id (u64 BE)`.
+/// Each commit writes a record with its version as `seq` and an empty value
+/// so status checks can determine whether a commit applied (SPEC §5.5).
+/// Records are retained for `commit_retention_ms` and dropped without a
+/// tombstone once expired.
 pub const COMMIT_SPACE: u8 = 0xFF;
 
 pub fn commit_key(id: u64) -> Bytes {
@@ -59,7 +56,7 @@ pub fn is_commit_key(k: &[u8]) -> bool {
     k.first() == Some(&COMMIT_SPACE)
 }
 
-/// Object ids (segments, blobs) are 32 lowercase hex characters.
+/// Returns true if `id` is 32 lowercase ASCII hex characters.
 pub fn valid_object_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -119,7 +116,6 @@ impl Value {
         Value::decode_kind(r, src, kind)
     }
 
-    /// Decodes the rest of a value of kind `kind` (its first byte).
     fn decode_kind(r: &mut Reader<'_>, src: &Bytes, kind: u8) -> DResult<Value> {
         match kind {
             0 => Ok(Value::Inline(src.slice_ref(r.bytes()?))),
@@ -135,13 +131,12 @@ pub struct Entry {
     pub key: Bytes,
     pub seq: Seq,
     pub value: Value,
-    /// Store time (ms) at which the value expires. An expired entry reads
-    /// like a tombstone with the same `seq`: it still hides older values of
-    /// its key. Tombstones never expire.
+    /// Store time in milliseconds at which the value expires and reads as a
+    /// tombstone with the same `seq`. Tombstones never expire.
     pub expires: Option<u64>,
 }
 
-/// An entry's value kind byte carries this flag when an expiry follows it.
+/// Bit flag set on the encoded value kind byte when an expiry timestamp follows.
 const EXPIRES_FLAG: u8 = 0x10;
 
 impl Entry {
@@ -157,7 +152,7 @@ impl Entry {
         self.key.len() + self.value.size() + 10 + if self.expires.is_some() { 8 } else { 0 }
     }
 
-    /// Whether the entry is a tombstone or has expired at `at` (store ms).
+    /// Whether the entry is a tombstone or has expired at store time `at`.
     pub fn is_dead(&self, at: u64) -> bool {
         self.value.is_tombstone() || self.expired(at)
     }
@@ -186,8 +181,7 @@ impl Entry {
         }
     }
 
-    /// `src` must be the buffer the reader was created over (see
-    /// [`Value::decode`]).
+    /// Decodes an entry from `r`, zero-copying slices from `src`.
     pub fn decode(r: &mut Reader<'_>, src: &Bytes) -> DResult<Entry> {
         let k = r.bytes()?;
         if k.len() > MAX_KEY_LEN {
@@ -221,8 +215,6 @@ mod tests {
         assert!(!valid_object_id(&format!("{}g", &id[..31])), "not hex");
     }
 
-    /// The size estimate that write limits and the cache account with
-    /// covers the encoding, with little slack.
     #[test]
     fn value_size_bounds_the_encoding() {
         let blob = |size, ct: &str| {
@@ -307,8 +299,6 @@ mod tests {
         assert!(r.is_empty());
     }
 
-    /// An expired entry reads as a tombstone of the same seq; a tombstone
-    /// cannot carry an expiry.
     #[test]
     fn expiry() {
         let e = Entry { expires: Some(100), ..Entry::new(Bytes::from_static(b"k"), 3, Value::Inline(Bytes::new())) };

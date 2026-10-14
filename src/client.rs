@@ -36,6 +36,17 @@ pub struct Client {
     http: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
 }
 
+/// Extracts the retry duration from a 429 response using `details.retry_after_ms`
+/// or the `Retry-After` header.
+fn retry_after(h: &http::HeaderMap, body: &Bytes) -> std::time::Duration {
+    let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let ms = v["error"]["details"]["retry_after_ms"].as_u64().or_else(|| {
+        let secs = h.get(http::header::RETRY_AFTER)?.to_str().ok()?.parse::<u64>().ok()?;
+        Some(secs * 1000)
+    });
+    std::time::Duration::from_millis(ms.unwrap_or(1000).max(1))
+}
+
 /// Percent-encode one path segment (e.g. a key).
 pub fn seg(s: &str) -> String {
     s.bytes()
@@ -69,8 +80,31 @@ impl Client {
         self.token.as_deref()
     }
 
-    /// Send a request; returns status, headers and body bytes.
+    /// Sends a request and returns the status, headers, and body bytes.
+    /// Rate-limited (429) requests are automatically retried up to 60 seconds.
     pub async fn raw(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> Result<(u16, http::HeaderMap, Bytes), ApiError> {
+        let mut waited = std::time::Duration::ZERO;
+        loop {
+            let r = self.send(method, path, headers, body.clone()).await?;
+            let wait = match &r {
+                (429, h, b) => retry_after(h, b),
+                _ => return Ok(r),
+            };
+            if waited + wait > std::time::Duration::from_secs(60) {
+                return Ok(r);
+            }
+            tokio::time::sleep(wait).await;
+            waited += wait;
+        }
+    }
+
+    async fn send(
         &self,
         method: &str,
         path: &str,

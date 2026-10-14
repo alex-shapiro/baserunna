@@ -11,6 +11,7 @@
 use super::Shared;
 use super::config::EngineConfig;
 use super::manifest::{MAX_LEVEL, Manifest, SegmentMeta};
+use super::range_delete::RangeDeletes;
 use super::segment::SegmentBuilder;
 use super::types::Seq;
 use super::version::{IterSpec, KeyRange, MergeIter, ReadMode};
@@ -22,13 +23,25 @@ use std::sync::Arc;
 /// A compaction chosen by [`pick`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
-    /// Segments merged (and replaced) by the compaction.
+    /// Segments replaced by the compaction.
     pub inputs: Vec<SegmentMeta>,
-    pub output_level: u8,
-    /// The single input overlaps nothing in the output level, so it moves
-    /// there without being rewritten.
-    pub trivial: bool,
+    pub kind: Kind,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Merge overlapping segments from one level into the next target level.
+    Merge { level: u8 },
+    /// Move a segment directly into `level` without rewriting because it has no overlaps.
+    Move { level: u8 },
+    /// Drop segments whose entries are entirely deleted by range tombstones.
+    Drop,
+    /// Rewrite segments in-place on their current level to purge range-deleted entries.
+    Rewrite,
+}
+
+/// Maximum number of segments replaced in a single rewrite compaction.
+const REWRITE_MAX_INPUTS: usize = 8;
 
 /// The base level (where level 0 compacts into) and each level's target
 /// size. Levels above the base have target 0: they should be empty.
@@ -54,11 +67,26 @@ fn overlapping<'a>(m: &'a Manifest, level: u8, min: &[u8], max: &[u8]) -> &'a [S
     &segs[start..end.max(start)]
 }
 
-/// The most urgent compaction, if any level needs one.
+/// Selects the highest-priority compaction plan, prioritizing cleanup of range-deleted segments.
 pub fn pick(m: &Manifest, cfg: &EngineConfig) -> Option<Plan> {
     let (base, targets) = level_targets(m, cfg);
-    let mut best: Option<(f64, u8)> = None;
+    let dirty = |s: &&SegmentMeta| m.range_deletes.iter().any(|t| t.dirties(s));
+    let covered: Vec<SegmentMeta> =
+        m.segments.iter().filter(|s| m.range_deletes.iter().any(|t| t.covers(s))).cloned().collect();
+    if !covered.is_empty() {
+        return Some(Plan { inputs: covered, kind: Kind::Drop });
+    }
+    // Drain levels above the base level downward before merging L0.
+    let above_base = (1..base).any(|l| !m.level(l).is_empty());
     let l0 = m.level(0);
+    if !above_base && let Some(newest) = l0.iter().position(|s| dirty(&s)) {
+        return Some(l0_merge(m, base, (l0.len() - newest).min(cfg.l0_compaction_max_inputs.max(1))));
+    }
+    let rewrite: Vec<SegmentMeta> = m.deep_segments().iter().filter(dirty).take(REWRITE_MAX_INPUTS).cloned().collect();
+    if !rewrite.is_empty() {
+        return Some(Plan { inputs: rewrite, kind: Kind::Rewrite });
+    }
+    let mut best: Option<(f64, u8)> = None;
     if l0.len() >= cfg.l0_compaction_trigger.max(1) {
         best = Some((l0.len() as f64 / cfg.l0_compaction_trigger.max(1) as f64, 0));
     }
@@ -74,13 +102,7 @@ pub fn pick(m: &Manifest, cfg: &EngineConfig) -> Option<Plan> {
     }
     let (_, level) = best?;
     if level == 0 {
-        // The oldest level 0 segments, so the ones left stay newer.
-        let take = l0.len().min(cfg.l0_compaction_max_inputs.max(1));
-        let mut inputs: Vec<SegmentMeta> = l0[l0.len() - take..].to_vec();
-        let min = inputs.iter().map(|s| s.min_key.clone()).min().unwrap_or_default();
-        let max = inputs.iter().map(|s| s.max_key.clone()).max().unwrap_or_default();
-        inputs.extend_from_slice(overlapping(m, base, &min, &max));
-        return Some(Plan { inputs, output_level: base, trivial: false });
+        return Some(l0_merge(m, base, l0.len().min(cfg.l0_compaction_max_inputs.max(1))));
     }
     // The segment that overlaps least of the next level, relative to its
     // size: the cheapest to push down.
@@ -93,7 +115,18 @@ pub fn pick(m: &Manifest, cfg: &EngineConfig) -> Option<Plan> {
     let below = overlapping(m, next, &seg.min_key, &seg.max_key);
     let mut inputs = vec![seg.clone()];
     inputs.extend_from_slice(below);
-    Some(Plan { trivial: below.is_empty(), inputs, output_level: next })
+    let kind = if below.is_empty() { Kind::Move { level: next } } else { Kind::Merge { level: next } };
+    Some(Plan { inputs, kind })
+}
+
+/// Plans a merge of the oldest `take` level 0 segments with overlapping base-level segments.
+fn l0_merge(m: &Manifest, base: u8, take: usize) -> Plan {
+    let l0 = m.level(0);
+    let mut inputs: Vec<SegmentMeta> = l0[l0.len() - take.min(l0.len())..].to_vec();
+    let min = inputs.iter().map(|s| s.min_key.clone()).min().unwrap_or_default();
+    let max = inputs.iter().map(|s| s.max_key.clone()).max().unwrap_or_default();
+    inputs.extend_from_slice(overlapping(m, base, &min, &max));
+    Plan { inputs, kind: Kind::Merge { level: base } }
 }
 
 pub struct Output {
@@ -108,32 +141,58 @@ fn covered_below(m: &Manifest, level: u8, key: &[u8]) -> bool {
     (level + 1..=MAX_LEVEL).any(|l| !overlapping(m, l, key, key).is_empty())
 }
 
-/// Merge the inputs of `plan` (not a trivial move) into new segments of the
-/// output level, written to the store as they fill. Tombstones with
-/// `seq <= purge_seq` are dropped where no deeper level could hold an older
-/// entry for their key.
+/// Executes a compaction plan, writing output segments and purging obsolete entries.
 pub async fn run(shared: &Arc<Shared>, m: &Manifest, plan: &Plan, purge_seq: Seq) -> Result<Output> {
-    let cfg = &shared.cfg;
-    let runs = sorted_runs(&plan.inputs);
-    let spec = IterSpec { range: KeyRange::all(), reverse: false, include_tombstones: true, mode: ReadMode::Bulk };
-    let mut it = MergeIter::new(shared.clone(), &m.db_id, &[], runs, spec);
+    let deletes = Arc::new(RangeDeletes::new(&m.range_deletes));
     let mut out = Output { segments: Vec::new(), purged_max_seq: 0 };
+    match plan.kind {
+        Kind::Merge { level } => {
+            merge(shared, m, sorted_runs(&plan.inputs), level, &deletes, purge_seq, &mut out).await?
+        }
+        Kind::Rewrite => {
+            for s in &plan.inputs {
+                merge(shared, m, vec![vec![s.clone()]], s.level, &deletes, purge_seq, &mut out).await?;
+            }
+        }
+        Kind::Move { .. } | Kind::Drop => {}
+    }
+    Ok(out)
+}
+
+async fn merge(
+    shared: &Arc<Shared>,
+    m: &Manifest,
+    runs: Vec<Vec<SegmentMeta>>,
+    level: u8,
+    deletes: &Arc<RangeDeletes>,
+    purge_seq: Seq,
+    out: &mut Output,
+) -> Result<()> {
+    let cfg = &shared.cfg;
+    let spec = IterSpec {
+        range: KeyRange::all(),
+        reverse: false,
+        include_tombstones: true,
+        mode: ReadMode::Bulk,
+        deletes: Some(deletes.clone()),
+    };
+    let mut it = MergeIter::new(shared.clone(), &m.db_id, &[], runs, spec);
     let mut b = SegmentBuilder::new(cfg.block_target, cfg.compression);
     while let Some(e) = it.next().await? {
-        if e.value.is_tombstone() && e.seq <= purge_seq && !covered_below(m, plan.output_level, &e.key) {
+        if e.value.is_tombstone() && e.seq <= purge_seq && !covered_below(m, level, &e.key) {
             out.purged_max_seq = out.purged_max_seq.max(e.seq);
             continue;
         }
         if b.size_estimate() >= cfg.segment_target_bytes {
             let full = std::mem::replace(&mut b, SegmentBuilder::new(cfg.block_target, cfg.compression));
-            out.segments.push(write(shared, &m.db_id, full, plan.output_level).await?);
+            out.segments.push(write(shared, &m.db_id, full, level, m.version).await?);
         }
         b.add(&e);
     }
     if !b.is_empty() {
-        out.segments.push(write(shared, &m.db_id, b, plan.output_level).await?);
+        out.segments.push(write(shared, &m.db_id, b, level, m.version).await?);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// The sorted runs of `inputs` (in manifest order), each read by one
@@ -150,17 +209,32 @@ fn sorted_runs(inputs: &[SegmentMeta]) -> Vec<Vec<SegmentMeta>> {
     runs
 }
 
-/// Finish and store a new segment (unconditional PUT under a fresh id).
-pub(crate) async fn write(shared: &Shared, db: &str, b: SegmentBuilder, level: u8) -> Result<SegmentMeta> {
+/// The segments below level 0 once `inputs` are replaced by `outputs`.
+pub fn deep_after(m: &Manifest, inputs: &[String], outputs: &[SegmentMeta]) -> Vec<SegmentMeta> {
+    let mut deep: Vec<SegmentMeta> =
+        m.deep_segments().iter().filter(|s| !inputs.contains(&s.id)).chain(outputs).cloned().collect();
+    deep.sort_by(|a, b| a.level.cmp(&b.level).then_with(|| a.min_key.cmp(&b.min_key)));
+    deep
+}
+
+/// Finish and store a new segment (unconditional PUT under a fresh id),
+/// recording the sequence number through which range deletions were applied.
+pub(crate) async fn write(
+    shared: &Shared,
+    db: &str,
+    b: SegmentBuilder,
+    level: u8,
+    deletes_applied: Seq,
+) -> Result<SegmentMeta> {
     let (data, stats) = b.finish();
     let id = shared.env.random_hex(16);
     let key = seg_key(db, &id);
     shared.retry.run(|| shared.store.put(&key, data.clone(), PutMode::Overwrite)).await?;
     shared.remember_segment(db, &id, &data, level == 0)?;
-    Ok(seg_meta(id, level, &stats))
+    Ok(seg_meta(id, level, &stats, deletes_applied))
 }
 
-pub(crate) fn seg_meta(id: String, level: u8, s: &segment::SegmentStats) -> SegmentMeta {
+pub(crate) fn seg_meta(id: String, level: u8, s: &segment::SegmentStats, deletes_applied: Seq) -> SegmentMeta {
     SegmentMeta {
         id,
         level,
@@ -171,6 +245,7 @@ pub(crate) fn seg_meta(id: String, level: u8, s: &segment::SegmentStats) -> Segm
         max_key: s.max_key.clone(),
         min_seq: s.min_seq,
         max_seq: s.max_seq,
+        deletes_applied,
     }
 }
 
@@ -190,6 +265,15 @@ mod tests {
             max_key: Bytes::copy_from_slice(max.as_bytes()),
             min_seq: 0,
             max_seq: 0,
+            deletes_applied: 0,
+        }
+    }
+
+    fn target(p: &Plan) -> (u8, bool) {
+        match p.kind {
+            Kind::Merge { level } => (level, false),
+            Kind::Move { level } => (level, true),
+            k => panic!("{k:?}"),
         }
     }
 
@@ -238,7 +322,7 @@ mod tests {
             seg(12, MAX_LEVEL, 50, "e", "f"),
         ]);
         let p = pick(&manifest(segs), &c).unwrap();
-        assert_eq!((p.output_level, p.trivial), (MAX_LEVEL, false));
+        assert_eq!(target(&p), (MAX_LEVEL, false));
         assert_eq!(ids(&p), [2, 3, 4, 11], "the three oldest, and what they overlap below");
     }
 
@@ -256,12 +340,12 @@ mod tests {
         ];
         // Level `base` targets 900 bytes and holds 1200.
         let p = pick(&manifest(segs.clone()), &c).unwrap();
-        assert_eq!((ids(&p), p.output_level, p.trivial), (vec![2], MAX_LEVEL, true), "m..n overlaps nothing");
+        assert_eq!((ids(&p), target(&p)), (vec![2], (MAX_LEVEL, true)), "m..n overlaps nothing");
         let mut segs = segs;
         segs[1] = seg(2, base, 400, "d", "e");
         segs[3] = seg(10, MAX_LEVEL, 30, "a", "b");
         let p = pick(&manifest(segs), &c).unwrap();
-        assert_eq!((ids(&p), p.trivial), (vec![2, 11], false), "the least overlap relative to size");
+        assert_eq!((ids(&p), target(&p).1), (vec![2, 11], false), "the least overlap relative to size");
         // A small segment over a large overlap costs more per byte moved
         // than a large one over a moderate overlap.
         let segs = vec![
@@ -281,13 +365,13 @@ mod tests {
         // Level `base` targets 900 bytes; 1350 is 1.5 times that.
         let mut segs = vec![seg(1, base, 1_350, "a", "c"), seg(10, MAX_LEVEL, 9_000, "a", "z")];
         segs.extend((0..8).map(|i| seg(20 + i, 0, 10, "a", "b")));
-        assert_eq!(pick(&manifest(segs.clone()), &c).unwrap().output_level, base, "level 0, at twice its trigger");
+        assert_eq!(target(&pick(&manifest(segs.clone()), &c).unwrap()).0, base, "level 0, at twice its trigger");
         segs.truncate(2 + 5);
-        assert_eq!(pick(&manifest(segs), &c).unwrap().output_level, MAX_LEVEL, "level 0, at 1.25 times its trigger");
+        assert_eq!(target(&pick(&manifest(segs), &c).unwrap()).0, MAX_LEVEL, "level 0, at 1.25 times its trigger");
         // With 90 kB at the bottom, the levels above target 9 kB and 900 B.
         let deep = |l4: u64, l5: u64| {
             let segs = vec![seg(1, 4, l4, "a", "b"), seg(2, 5, l5, "a", "b"), seg(3, MAX_LEVEL, 90_000, "a", "z")];
-            pick(&manifest(segs), &c).unwrap().output_level
+            target(&pick(&manifest(segs), &c).unwrap()).0
         };
         assert_eq!(deep(2_700, 13_500), 5, "3x over beats 1.5x over");
         assert_eq!(deep(1_350, 27_000), MAX_LEVEL, "3x over beats 1.5x over");
@@ -312,7 +396,7 @@ mod tests {
     fn data_above_the_base_level_moves_down() {
         let c = cfg();
         let p = pick(&manifest(vec![seg(1, 2, 10, "a", "b"), seg(2, MAX_LEVEL, 100, "a", "z")]), &c).unwrap();
-        assert_eq!((ids(&p), p.output_level), (vec![1], 3));
+        assert_eq!((ids(&p), target(&p).0), (vec![1], 3));
     }
 
     #[test]

@@ -226,6 +226,7 @@ pub fn node_config(name: &str, addr: &str) -> NodeConfig {
         pbkdf2_iterations: 10,
         signup: SignupPolicy::Open,
         max_dbs_per_user: 1_000_000,
+        limits: crate::limits::LimitConfig::unlimited(),
         engine: EngineConfig::default(),
         ..NodeConfig::default()
     }

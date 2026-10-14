@@ -2,6 +2,7 @@
 //! blocks), bounded by a byte budget. Segments are immutable, so entries
 //! never need invalidation, only eviction.
 
+use super::manifest::Levels;
 use super::segment::{Block, SegmentIndex};
 use crate::util::DetHashMap;
 use std::collections::BTreeMap;
@@ -18,6 +19,7 @@ pub struct CacheKey {
 pub enum CacheVal {
     Index(Arc<SegmentIndex>),
     Block(Block),
+    Levels(Arc<Levels>),
 }
 
 impl CacheVal {
@@ -25,6 +27,9 @@ impl CacheVal {
         match self {
             CacheVal::Index(i) => i.mem_size(),
             CacheVal::Block(b) => b.iter().map(|e| e.size() + 48).sum::<usize>() + 64,
+            CacheVal::Levels(l) => {
+                l.segments.iter().map(|s| s.min_key.len() + s.max_key.len() + 128).sum::<usize>() + 64
+            }
         }
     }
 }

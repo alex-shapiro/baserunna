@@ -96,13 +96,15 @@ src/
   env.rs            Env: clock, RNG, task spawning
   util/             crc32c, varint codec, base64, hex, PRNG, bloom filter
   store/            ObjectStore trait; MemStore, FsStore, CloudStore(feature)
-  engine/           segments, manifest, versions, reads, commits (with read/write sets and
-                    validation), leveled compaction, local tier, store clock, GC, blobs
+  engine/           segments, manifest and levels objects, versions, reads, commits (with
+                    read/write sets and validation), range tombstones, leveled compaction,
+                    local tier, store clock, GC, blobs, size quotas
   ops.rs            the JSON transaction-op language
   table/            tuple encoding, schema, rows, indexes, queries
   cluster.rs        membership, rendezvous routing, forwarding, leases policy
   meta.rs           system DB schema + repository (users, sessions, keys, dbs, nodes)
   auth.rs           password hashing, sessions, API keys, Google OIDC
+  limits.rs         rate limits and sign-in backoff
   api/              axum routes (JSON API), errors, extractors
   console/          server-rendered admin console
   api/openapi.rs    OpenAPI 3.1 document
@@ -202,6 +204,7 @@ key of one or more columns, and secondary indexes.
 ```
 dbs/{db_id}/manifest                 mutable; updated only with If-Match / If-None-Match
 dbs/{db_id}/seg/{seg_id}             immutable sorted segment (SST)
+dbs/{db_id}/seg/{id}.levels          immutable list of the segments below level 0 (§5.2)
 dbs/{db_id}/blob/{blob_id}/{chunk}   immutable blob chunks
 dbs/{db_id}/blob/{blob_id}/meta      the blob's descriptor (BlobRef), for binding by id
 dbs/{db_id}/blob/{blob_id}/pin       rewritten by long reads (§5.8)
@@ -221,16 +224,35 @@ version: u64                                  data version = seq of the last com
 write_seq: u64                                incremented by every manifest write
 lease: Option<{node_id, expires_at_ms, duration_ms}>
 segments: [SegmentMeta]                       by level: level 0 newest first, deeper levels in key order
+levels: Option<id>                            the levels object holding the segments below level 0
 compaction_seq: u64                           incremented by every compaction install
 tail: [Entry]                                 sorted by key, newest value per key (the inline write log)
+range_deletes: [(start, end?, seq)]           range tombstones (§5.5)
 tombstone_horizon: u64                        tombstones with seq <= horizon may have been purged
 recent_commits: [(commit_id u128, version)]   bounded ring for idempotence / ambiguity resolution
 version_times: [(version, store_ms)]          sparse samples (≥30 s apart) for time-based policies
-obsolete: [(kind, id, since_store_ms)]        segments/blobs awaiting deletion after grace
+obsolete: [(kind, id, since_store_ms)]        segments, levels objects and blobs awaiting deletion
+blob_bytes: {bound, swept, swept_at}          blob bytes for the size quota (§5.10)
 ```
 
-A **Version** is an immutable, decoded manifest plus the store's etag. A
-reader holding a Version sees a consistent snapshot (§5.4).
+Each `SegmentMeta` records its level, size, key and seq ranges, and
+`deletes_applied`: the version through which range tombstones had been
+applied when it was written.
+
+Every commit rewrites the manifest, so its size is a cost on every write.
+Level 0 changes with every flush and stays inline. The deeper levels change
+only when compactions install, so once they hold more than
+`levels_inline_max` (16) segments, their list moves to an immutable
+**levels object** that each compaction replaces (writing it before its
+install, like its segments). A 500 MB database's manifest then carries
+about 1.5 KB of segment metadata instead of 25 KB. Small databases keep
+their levels inline, so opening one still takes one GET. Readers load a
+levels object once per compaction: nodes cache them like segment data, and
+a manifest whose levels object is unchanged reuses the current Version's
+copy.
+
+A **Version** is an immutable, decoded manifest (with its levels) plus the
+store's etag. A reader holding a Version sees a consistent snapshot (§5.4).
 
 ### 5.3 Segments
 
@@ -276,6 +298,12 @@ invalidation.
   deeper level (a level is one sorted run, read segment after segment). The
   entry with the highest seq wins per key, and tombstones are skipped.
   Blocks load lazily, so `limit` bounds the I/O.
+- Range tombstones apply on top: an entry is deleted if a range tombstone
+  covers its key with a higher seq. A Version cuts its range tombstones
+  into disjoint fragments, each with the newest seq covering it, so the
+  check is a binary search. A point lookup of a deleted key reports a
+  tombstone with the range tombstone's seq, even when nothing it deleted
+  is left in storage; conflict checks rely on that (§6.1).
 - Snapshot isolation comes for free: a transaction keeps its `Arc<Version>`.
   Objects referenced by any version younger than `txn_max_lifetime` are never
   deleted (§5.8).
@@ -299,8 +327,14 @@ Each open DB has a per-node commit queue. One committer task drains it
    can linger server-side after its client gave up. Each accepted
    transaction gets **its own sequence number** (`base.version + 1`,
    `+ 2`, …), so every committed state of a key has a unique version, even
-   though the whole batch costs one manifest write. `delete_range` expands
-   to point tombstones against the merged state at this moment.
+   though the whole batch costs one manifest write. A `delete_range`
+   covering at most `range_delete_points_max` (256) stored entries becomes
+   a point tombstone per live key, like single deletes. A larger one
+   becomes one **range tombstone** `[start, end) @ seq`, which deletes every
+   older entry in the range: it drops the tail's entries there and replaces
+   any range tombstone it contains. Dropping a table or an index of any
+   size costs a few manifest entries. Writes of the same transaction carry
+   the same seq, so they survive their own range delete.
 4. If the new tail exceeds `tail_max_bytes` (256 KiB), write it to a new
    level 0 segment (unconditional PUT to a fresh random id) and clear the
    tail.
@@ -366,6 +400,26 @@ version at least `txn_max_lifetime` old. The manifest then records
 `tombstone_horizon = max(horizon, max dropped seq)`. A transaction with
 `read_version < tombstone_horizon` fails validation conservatively with a
 retryable `409 conflict`.
+
+Every merge also drops the entries its manifest's range tombstones
+delete. Before any other compaction, the picker removes what range
+tombstones deleted, so the space returns soon after a large delete:
+
+- a segment whose entries a range tombstone all deletes (its key range
+  inside the tombstone's, its `max_seq` below the tombstone's) is removed
+  from the manifest without being read;
+- level 0 segments that may still hold deleted entries merge into the base
+  level;
+- deeper segments that may still hold deleted entries are rewritten on
+  their own level without them.
+
+A segment may hold entries a range tombstone deletes only if it overlaps
+the range, has entries older than the tombstone, and was written with a
+`deletes_applied` below the tombstone's seq (flushes and compaction
+outputs record the version through which their entries had range
+tombstones applied). Once no segment may, and the tombstone is older than
+`purge_seq`, the next manifest write retires it and raises
+`tombstone_horizon` to its seq, exactly like a purged point tombstone.
 
 Leveled compaction replaced size-tiered compaction after measuring both
 (`sim::amp`, `cargo run --release --example amplification`): five workloads
@@ -437,15 +491,16 @@ databases.
   therefore independent of node clock skew; the `blob_gc_race_hostile`
   scenario runs with node clocks an hour apart and grace periods of about a
   second.
-- **Obsolete segments**: compaction moves replaced segment ids into
-  `obsolete` with `since = now`. Any commit or compaction by the lease
+- **Obsolete segments**: compaction moves replaced segment and levels
+  object ids into `obsolete` with `since = now`. Any commit or compaction by the lease
   holder deletes entries older than `gc_grace` (30 min, which must exceed
   `txn_max_lifetime` by twice the clock error bound) and drops them from the
   list.
-- **Orphans**: segments or blobs in storage that are neither referenced nor
-  listed. A periodic per-DB sweep (lease holder, at most hourly, only for
-  DBs with activity) streams the database's entries to collect blob
-  references and pages through the `seg/` and `blob/` listings.
+- **Orphans**: segments, levels objects or blobs in storage that are
+  neither referenced nor listed. A periodic per-DB sweep (lease holder, at
+  most hourly, only for DBs with activity) streams the database's entries
+  to collect blob references and pages through the `seg/` (which holds the
+  levels objects too) and `blob/` listings.
   Unreferenced objects whose `last_modified` is older than `orphan_grace`
   (2 h) are moved into `obsolete` (not deleted directly). Unreferenced blobs
   must also be older, by their id's time, than `blob_stage_ttl` plus twice
@@ -483,6 +538,38 @@ transactions validate their reads at commit time. A validation that
 happened after a request arrived serves all of that request's strong reads,
 which keeps them linearizable at the cost of one GET.
 
+### 5.10 Size quotas
+
+Each database may store at most `db_max_bytes` (`BASERUNNA_DB_MAX_MB`,
+10 GiB by default; the system database is exempt). Its size is what its
+manifest accounts for: segment sizes, the tail, and blob bytes. Commits
+add the size of each blob they bind to `blob_bytes.bound`; a sweep finds
+the distinct blobs the database still references and records their bytes
+(`swept`) with the `bound` total of the version it read (`swept_at`). Blob
+bytes are `swept + bound − swept_at`: exact after a sweep, an upper bound
+until the next.
+
+- **Commits** that write anything other than deletes are refused with
+  `507 quota_exceeded` if their keys and values (blobs at full size)
+  would take the size past the quota. The committer checks each commit
+  against the size so far in its batch, so a refused commit leaves no
+  trace. Commits that only delete always pass, so a full database can
+  always be emptied.
+- **Uploads** count while they stream and while staged, on the node
+  serving them, and fail with `507` once the database's size, the uploads
+  in progress and the blobs staged but not yet bound would exceed the
+  quota. A staged blob counts until a commit binds it, or for
+  `blob_stage_ttl`.
+- Deleted data counts until compaction removes it, and overwritten blobs
+  until a sweep. After a commit is refused for the quota, the next sweep
+  comes after `quota_sweep_interval_ms` (1 min) instead of an hour.
+  Dropping a table or deleting a large range frees its segments with the
+  first compaction (§5.6).
+
+`GET /v1/dbs/{db}` reports `size_bytes` and `quota_bytes`. Flushes and
+compactions can grow a database a little past its quota, by the segment
+overhead its commits did not count.
+
 ---
 
 ## 6. Transactions
@@ -495,7 +582,9 @@ which keeps them linearizable at the cost of one GET.
     A scan that stopped at `limit` records only the interval it actually
     covered;
   - validation fails if any entry, including tombstones, in the current
-    state with `seq > read_version` intersects the read set.
+    state with `seq > read_version` intersects the read set. A range
+    tombstone newer than `read_version` that intersects the read set fails
+    it too, even where it deleted nothing (conservative).
 - `snapshot` isolation validates only the write set (first-committer-wins).
   Write skew is possible, as documented. Reads that writes are derived from
   are validated anyway: a row write commits only against the table schema
@@ -614,7 +703,7 @@ Tables in DB `sys`, all defined through the table layer (dogfooding):
 | ------------------- | ------------ | ------------------------------------------------------------------ | --------------------------------- |
 | `users`             | `id`         | email, password_hash?, google_sub?, is_admin, disabled, created_at | unique(email), unique(google_sub) |
 | `sessions`          | `token_hash` | user_id, created_at, expires_at                                    | (user_id)                         |
-| `api_keys`          | `id`         | user_id, name, secret_hash, db_id?, read_only, created_at          | (user_id)                         |
+| `api_keys`          | `id`         | user_id, name, secret_hash, db_id?, read_only, rate_limit?, created_at | (user_id)                     |
 | `databases`         | `id`         | owner_id, name, created_at                                         | unique(owner_id, name)            |
 | `db_counts`         | `owner_id`   | count                                                              |                                   |
 | `deleted_databases` | `id`         | owner_id, name, deleted_at, purge_passes                           |                                   |
@@ -671,6 +760,28 @@ resurrect a purged database.
   `Authorization: Bearer`.
 - **API keys**: `brk_<id>_<secret>`. Only the secret's SHA-256 is stored. A
   key can be scoped to one DB and/or read-only. It is shown once at creation.
+- **Rate limits** (`limits.rs`): token buckets, kept per node, so a cluster
+  of N nodes admits up to N times each rate. Every authenticated request
+  takes a token from its user's bucket (500/s, burst twice that) and, for
+  an API key, from the key's (500/s, or the `rate_limit` the key was
+  created with); both or neither. Sign-ins, sign-ups and Google sign-in
+  take from their client address's bucket (1/s, burst 20), and sign-ups
+  also from a second one (20 an hour, burst 5). A refused request gets
+  `429 rate_limited` with `Retry-After` and was not applied.
+- **Failed sign-ins** back off per account and per client address: after 5
+  failures to an account (20 from an address), each further attempt waits
+  1 s, doubling to 15 min, until a success (for the account) or an hour
+  without failures. During the wait every attempt is refused with `429`,
+  the correct password included. Unknown accounts count like known ones,
+  so the responses do not reveal which exist.
+- **Password hashing** (about a CPU-second at 600,000 iterations) runs on
+  blocking threads, at most `hash_concurrency` (the CPU count) at once.
+  A sign-in that waits more than 5 s for a slot fails with a retryable
+  `503`, so floods of sign-ins cannot exhaust a node.
+- **Client addresses**: the connection's peer, or behind
+  `BASERUNNA_TRUSTED_PROXY_HOPS` proxies the entry that many places from
+  the end of `X-Forwarded-For` (entries further left are the client's to
+  forge).
 - **Authorization**: users access their own DBs, and admins access all DBs.
   API-key scope restrictions apply on top. Console forms are protected
   against CSRF with a per-session token: HMAC(cookie_key, session token hash).
@@ -696,13 +807,15 @@ Errors are returned as
 | 409    | `conflict` (retryable), `already_exists`                                   |
 | 412    | `precondition_failed` (includes the failing op index)                      |
 | 413    | `too_large`                                                                |
+| 429    | `rate_limited` (retryable, `Retry-After`; not applied)                     |
+| 507    | `quota_exceeded` (the database is at its size quota, §5.10)                |
 | 503    | `unavailable` (retryable, `Retry-After`; may include `outcome: "unknown"`; also a query on an index still being built) |
 | 500    | `internal`                                                                 |
 
 Routes (see the OpenAPI document for bodies):
 
 ```
-GET    /healthz                                   liveness
+GET    /healthz                                   liveness (503 while shutting down)
 GET    /v1/openapi.json
 POST   /v1/auth/signup | /v1/auth/login | /v1/auth/logout
 GET    /v1/auth/google/start | /v1/auth/google/callback
@@ -778,6 +891,22 @@ POST forms carry a CSRF token. All output is HTML-escaped.
 | `BASERUNNA_DISK_CACHE_DIR`               | none                       | directory of the local tier (§5.3); off if unset             |
 | `BASERUNNA_DISK_CACHE_MB`                | 10240                      | local tier budget                                            |
 | `BASERUNNA_LEASE_MS`                     | 5000                       | lease renewed by commits; leases renewed for reads last 3×   |
+| `BASERUNNA_DB_MAX_MB`                    | 10240                      | size quota of each database (§5.10); 0 for none              |
+| `BASERUNNA_USER_RPS`                     | 500                        | requests per second per user, per node; 0 for no limit       |
+| `BASERUNNA_API_KEY_RPS`                  | 500                        | requests per second per API key without its own `rate_limit` |
+| `BASERUNNA_AUTH_RPS_PER_CLIENT`          | 1                          | sign-ins and sign-ups per second per client address          |
+| `BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT`  | 20                         | accounts created per hour per client address                 |
+| `BASERUNNA_TRUSTED_PROXY_HOPS`           | 0                          | proxies appending to `X-Forwarded-For` (§9)                  |
+| `BASERUNNA_HASH_CONCURRENCY`             | CPU count                  | password hashes computed at once                             |
+| `BASERUNNA_PBKDF2_ITERATIONS`            | 600000                     | password hashing cost for new hashes                         |
+| `BASERUNNA_DRAIN_DELAY_MS`               | 0                          | on SIGTERM/SIGINT, fail health checks this long first        |
+| `BASERUNNA_SHUTDOWN_TIMEOUT_MS`          | 20000                      | then let in-flight requests finish for at most this long     |
+
+On SIGTERM or SIGINT a node drains (failing `/healthz`), stops accepting
+connections, waits for in-flight requests, then releases its leases and
+leaves the membership table, so other nodes take over its databases at
+once. [`DEPLOYING.md`](DEPLOYING.md) covers TLS, load balancers, the
+container image and bucket setup.
 
 `fs:` is for single-node development only. Compare-and-swap is serialized
 within one process, so the store takes an exclusive lock on `<dir>/.lock`,
@@ -830,24 +959,28 @@ the directory.
 
 | workload       | checks                                                                                                                                                                            |
 | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kv_model`     | Random KV ops through every API form under faults, each response compared with a model. Ambiguous commits are resolved through `/commits/{id}`.                                   |
+| `kv_model`     | Random KV ops through every API form under faults, each response compared with a model. Ambiguous commits are resolved through `/commits/{id}`. Bulk writes and prefix deletes make range tombstones over segment data, and a final phase outlives every transaction so they retire. A small size quota refuses writes now and then: refused writes leave no trace, deletes are never refused, and the size stays near the quota. |
 | `bank`         | Concurrent transfers across nodes. The total never changes and no balance goes negative, checked during the run and at the end.                                                   |
 | `register`     | Concurrent writers and strong readers on a few keys, checked for real-time linearizability.                                                                                       |
-| `tables`       | Schema changes and row ops against a model. At quiescence indexes match a recomputation from rows, unique constraints hold, and dropped tables and indexes leave nothing behind.  |
+| `tables`       | Schema changes and row ops against a model. At quiescence indexes match a recomputation from rows, unique constraints hold, and dropped tables and indexes (large enough to take range tombstones) leave nothing behind. |
 | `schema_race`  | Row writes on every path and at both isolation levels race schema changes. Indexes must match rows, nothing may be orphaned, and each writer's rows must match its model.         |
 | `blobs`        | Uploads of random sizes on every path, range reads, overwrites and deletes, checked by SHA-256. A final GC keeps every referenced object and removes every unreferenced one.      |
 | `blob_gc_race` | Blob reads race overwrites, deletes and GC, with grace periods shorter than a download (and, hostile, node clocks an hour apart). A read may fail cleanly but never return wrong bytes. |
 | `abandoned`    | Interactive transactions abandoned, aborted or committed late while leases move. No update is lost, abandoned transactions never commit, and open transactions drain.             |
 | `db_churn`     | Databases created, used, deleted and recreated under a tiny cache and fast handle eviction. Each matches its model, deleted names answer 404, handles and cache stay bounded, and per-owner database counts match. |
 | `auth`         | Signup, login, sessions, API keys (scoped, read-only), logout, revocation, Google OAuth, and who can access which DB.                                                             |
+| `limits`       | Per-key, per-user and per-address rate limits and sign-in backoff: refused requests get 429 with `Retry-After` and are never applied, a limit leaves other keys, users, accounts and addresses alone, and a sign-in works again once its backoff passes. |
 | `lifecycle`    | Create, use, delete, and recreate DBs under crashes. Deleted data is never visible and is eventually purged, and per-owner database counts match.                                 |
 | `console`      | Browser-style console flows: cookies, forms, CSRF rejection, HTML escaping of hostile input.                                                                                      |
 | `api_tour`     | The remaining endpoints (schema drops, aborts, commit status by idempotency key, metadata) with result checks.                                                                    |
 | `chaos`        | Several workloads at once with crashes, partitions, and store faults.                                                                                                             |
 
-Most workloads also run under `hostile` (the `*_hostile` scenarios). Every
-run ends by checking **storage invariants**: each manifest decodes and
-every referenced segment and blob exists.
+Every node runs with rate limits that busy workloads reach now and then;
+simulated clients wait out a 429 and resend, as it was not applied. Most
+workloads also run under `hostile` (the `*_hostile` scenarios). Every
+run ends by checking **storage invariants**: each manifest decodes, its
+levels object exists and matches it, and every referenced segment and live
+blob exists.
 
 ### 13.4 Other test layers
 
@@ -855,9 +988,14 @@ every referenced segment and blob exists.
 - **Property tests**, using an in-crate generator and shrinker with seeded
   reproduction. Properties: codec round trips; tuple encoding preserves order;
   segment build/read equals the input, compressed or not; an LSM with random
-  flush/compaction/purge equals a model; base64/varint/bloom laws.
-- **Fuzz tests**: every decoder (manifest, segment and compressed blocks,
-  tuple, row, blob ref, cursors) gets arbitrary and mutated inputs and must
+  writes, point and range deletes, bulk loads, flushes, compactions, purges
+  and time jumps equals a model, with snapshots taken along the way still
+  reading their state a transaction lifetime later, and with the deeper
+  levels inline or in levels objects; range tombstone fragments match a
+  brute-force check; base64/varint/bloom laws.
+- **Fuzz tests**: every decoder (manifest, levels object, range tombstone,
+  segment and compressed blocks, tuple, row, blob ref, cursors) gets
+  arbitrary and mutated inputs and must
   return `Err`, never panic. The router gets random JSON bodies and paths and must never answer
   500 or panic. These run in `cargo test` with fixed seeds. The same
   functions are exposed as optional `cargo fuzz` targets in `fuzz/`.
@@ -873,7 +1011,12 @@ every referenced segment and blob exists.
   the router appears in the document, and every documented route exists.
   The checked-in `openapi.json` must equal the generated document.
 - **DST coverage**: `tests/coverage.rs` runs every scenario and fails if any
-  documented operation was never exercised by the simulator.
+  documented operation was never exercised by the simulator, or if one of
+  the storage paths only some data shapes reach never ran: range
+  tombstones written and retired, segments dropped and rewritten for
+  them, levels objects written, and commits refused for the quota. Nodes
+  count these (`engine::Activity`), and the simulator sums them over a run,
+  crashed nodes included.
 - **Checker self-tests**: a checker that cannot fail proves nothing, so
   each one is fed known-bad input: non-linearizable register histories,
   broken ledgers, missing or stale index entries, orphaned rows, missing
@@ -995,11 +1138,12 @@ Bugs the DST suite found, each now covered by the regular suite:
     outlived a full collection cycle. Probes are now retried, and every node
     keeps its measurement fresh in the background.
 
-The cost measurements (§13.4) found three more: a read-heavy database whose
+The cost measurements (§13.4) found four more: a read-heavy database whose
 lease had lapsed never acquired it again (paying a validating GET per read
-forever), a strong read without a lease validated the manifest twice, and
+forever), a strong read without a lease validated the manifest twice,
 shortening the lease doubled read-only renewals (they now take the longer
-read lease, §5.7).
+read lease, §5.7), and levels objects under their own prefix added a LIST
+to every sweep (they now share the segments' prefix).
 
 A review alongside the simulator also found that internal endpoints were
 open when no cluster secret was configured. Clusters now always generate
@@ -1035,11 +1179,12 @@ amplification. `gen_openapi` regenerates `openapi.json`.
 
 ## 15. Known limitations (v1)
 
-- `delete_range`, and dropping a table or an index, expand to one tombstone
-  per live key, built in the committing node's memory and the manifest
-  tail. Very large tables would need range tombstones.
-- Every commit rewrites the manifest, whose segment list grows with the
-  database: about 100 bytes per 2 MiB segment, 25 KB at 500 MB.
+- Every commit rewrites the manifest, and with it the commit ring
+  (`commit_ring_max`, 1024 ids, about 20 KB once full) and level 0.
+- Rate limits and sign-in backoff are kept per node (§9): a cluster of N
+  nodes admits up to N times each rate, and a restart forgets them.
+- Size quotas are one setting for every database; there are no per-user
+  or per-database overrides.
 - Multi-node deployments need an object store with conditional writes
   (S3, GCS, Azure, R2, MinIO); `fs:` is for one process (§12).
 - After a node crash, writes to the databases it leased wait for the lease
@@ -1048,12 +1193,12 @@ amplification. `gen_openapi` regenerates `openapi.json`.
   immediately.
 - Garbage collection relies on the store's `last_modified` timestamps
   coming from one coherent clock, as they do on the major providers.
-- Login has no rate limiting yet. Deploy behind a proxy that limits it.
 - `CloudStore` (S3/GCS/Azure through `object_store`) is exercised only by
   compile-time checks here; the simulator tests the same semantics through
   `SimStore`.
 
 ## 16. Future work
 
-Range tombstones; TTLs; change feeds; point-in-time restore (keep old
-manifests); per-user quotas and rate limits; multi-user organizations.
+TTLs; change feeds; point-in-time restore (keep old manifests); quotas
+and rate limits per user or database, shared across nodes; multi-user
+organizations.

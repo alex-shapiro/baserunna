@@ -2,14 +2,15 @@
 //! reads, leases, group commit with manifest CAS, compaction and GC
 //! scheduling. See SPEC §5.5–§5.9.
 
-use super::blob::BlobWriter;
-use super::compaction;
+use super::blob::{BlobWriter, StageGuard};
+use super::compaction::{self, Kind};
 use super::manifest::{Lease, Manifest, ObjKind, Obsolete, SegmentMeta};
+use super::range_delete::RangeTombstone;
 use super::segment::SegmentBuilder;
-use super::txn::{CommitRequest, Isolation, Txn, WriteSet, live_keys_in_range, validate};
+use super::txn::{CommitRequest, Isolation, Txn, WriteSet, validate};
 use super::types::{Entry, Seq, Value};
-use super::version::Version;
-use super::{Shared, blob_prefix, manifest_key, seg_key};
+use super::version::{KeyRange, Version};
+use super::{Shared, blob_prefix, levels_key, manifest_key, seg_key};
 use crate::error::{Error, Result};
 use crate::store::{GetOpts, PutMode, StoreError};
 use bytes::Bytes;
@@ -55,10 +56,16 @@ enum Work {
         purged_max_seq: Seq,
         /// The manifest's `compaction_seq` when the compaction was planned.
         compaction_seq: u64,
+        /// Segments below level 0 after compaction, and optional levels object ID if not stored inline.
+        deep: Vec<SegmentMeta>,
+        levels: Option<String>,
         tx: oneshot::Sender<Result<()>>,
     },
+    /// Sweep results for obsolete objects and referenced blob byte totals.
     Obsolete {
         items: Vec<Obsolete>,
+        /// Distinct referenced blob bytes from the swept version and its bound blob total.
+        blob_bytes: (u64, u64),
         tx: oneshot::Sender<Result<()>>,
     },
     MarkDeleted {
@@ -117,6 +124,8 @@ struct State {
     own_lease: Option<(u64, Instant)>,
     compacting: bool,
     sweeping: bool,
+    /// Indicates a write was refused due to quota, signaling an earlier sweep.
+    quota_pressure: bool,
 }
 
 impl State {
@@ -141,6 +150,14 @@ pub struct Db {
     /// may already be visible to others, so lease reads wait for it.
     writing: std::sync::atomic::AtomicBool,
     write_done: tokio::sync::Notify,
+    staging: Mutex<Staging>,
+}
+
+/// Tracks in-flight and completed uncommitted blob uploads against the database quota.
+#[derive(Default)]
+struct Staging {
+    uploading: u64,
+    staged: BTreeMap<String, (u64, Instant)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +176,10 @@ pub struct DbStats {
     pub tail_bytes: usize,
     pub lease_holder: Option<String>,
     pub lease_expires_ms: Option<u64>,
+    /// Total stored bytes tracked against the database quota.
+    pub size_bytes: u64,
+    pub quota_bytes: Option<u64>,
+    pub range_tombstones: usize,
 }
 
 impl Db {
@@ -179,11 +200,13 @@ impl Db {
                 own_lease: None,
                 compacting: false,
                 sweeping: false,
+                quota_pressure: false,
             }),
             q: Mutex::new(Queue { items: VecDeque::new(), running: false }),
             load_lock: tokio::sync::Mutex::new(()),
             writing: std::sync::atomic::AtomicBool::new(false),
             write_done: tokio::sync::Notify::new(),
+            staging: Mutex::new(Staging::default()),
         })
     }
 
@@ -265,7 +288,46 @@ impl Db {
             tail_bytes: cur.m.tail_bytes(),
             lease_holder: cur.m.lease.as_ref().map(|l| l.node.clone()),
             lease_expires_ms: cur.m.lease.as_ref().map(|l| l.expires_ms),
+            size_bytes: cur.m.stored_bytes(),
+            quota_bytes: self.quota(),
+            range_tombstones: cur.m.range_deletes.len(),
         })
+    }
+
+    /// Effective size quota for this database in bytes, or None if unlimited or exempt.
+    pub fn quota(&self) -> Option<u64> {
+        let limit = self.shared.cfg.db_max_bytes;
+        (limit > 0 && !self.shared.quota_exempt(&self.id)).then_some(limit)
+    }
+
+    fn staging(&self) -> std::sync::MutexGuard<'_, Staging> {
+        let mut g = self.staging.lock().unwrap_or_else(|e| e.into_inner());
+        // Discard staging reservations for uploads exceeding the stage TTL.
+        let ttl = Duration::from_millis(self.shared.cfg.blob_stage_ttl_ms);
+        g.staged.retain(|_, (_, at)| at.elapsed() < ttl);
+        g
+    }
+
+    /// Reserves `n` bytes for an in-flight upload against the database size quota.
+    pub(crate) fn reserve_staging(&self, n: u64) -> Result<()> {
+        let Some(limit) = self.quota() else { return Ok(()) };
+        let stored = self.current().map_or(0, |v| v.m.stored_bytes());
+        let mut g = self.staging();
+        let pending = g.uploading + g.staged.values().map(|(n, _)| n).sum::<u64>();
+        if stored + pending + n > limit {
+            return Err(quota_exceeded(limit));
+        }
+        g.uploading += n;
+        Ok(())
+    }
+
+    /// Finalizes or cancels a staging reservation.
+    pub(crate) fn end_staging(&self, reserved: u64, done: Option<(&str, u64)>) {
+        let mut g = self.staging();
+        g.uploading = g.uploading.saturating_sub(reserved);
+        if let Some((id, size)) = done {
+            g.staged.insert(id.to_string(), (size, Instant::now()));
+        }
     }
 
     fn install(&self, v: Arc<Version>, verified: Option<Instant>) -> Arc<Version> {
@@ -326,18 +388,15 @@ impl Db {
                     return Ok(self.install(c, Some(started)));
                 }
                 Ok(g) => {
-                    let m = Manifest::decode(&g.data)?;
-                    if m.db_id != self.id {
-                        return Err(Error::internal("manifest belongs to another database"));
-                    }
-                    let v = Arc::new(Version { m, etag: g.etag, shared: self.shared.clone() });
+                    let m = self.shared.load_manifest(&self.id, &g.data, cur.as_deref()).await?;
+                    let v = Arc::new(Version::new(m, g.etag, self.shared.clone()));
                     return Ok(self.install(v, Some(started)));
                 }
                 Err(StoreError::NotFound) if create => {
                     let m = Manifest::new(&self.id, self.shared.time_ms());
                     match self.shared.store.put(&key, m.encode(), PutMode::Create).await {
                         Ok(etag) => {
-                            let v = Arc::new(Version { m, etag, shared: self.shared.clone() });
+                            let v = Arc::new(Version::new(m, etag, self.shared.clone()));
                             return Ok(self.install(v, Some(started)));
                         }
                         // Created concurrently, or ambiguous: read it back.
@@ -463,11 +522,15 @@ impl Db {
 
     /// A writer for a new staged blob. Its id records the store time, so the
     /// clock is measured first if that is due.
-    pub async fn blob_writer(&self, content_type: &str) -> BlobWriter {
+    pub async fn blob_writer(self: &Arc<Self>, content_type: &str) -> BlobWriter {
         if let Err(e) = self.shared.store_time_ms().await {
             crate::debug!("staging a blob without store time: {e}");
         }
-        BlobWriter::new(self.shared.clone(), &self.id, content_type)
+        let w = BlobWriter::new(self.shared.clone(), &self.id, content_type);
+        match self.quota() {
+            Some(_) => w.with_quota(StageGuard::new(self.clone())),
+            None => w,
+        }
     }
 
     /// Commit a transaction's request. Read-only requests return their read
@@ -607,7 +670,12 @@ impl Db {
                     return;
                 }
             };
+            if plan.quota_refused {
+                self.st().quota_pressure = true;
+                self.shared.counters.add(&super::Activity { quota_refusals: 1, ..Default::default() });
+            }
             let Some(m) = plan.manifest else {
+                self.maybe_sweep(&base);
                 self.clear_lease_flag(&batch);
                 for (w, o) in batch.into_iter().zip(plan.outcomes) {
                     // Without a new manifest write, an earlier ambiguous
@@ -640,7 +708,8 @@ impl Db {
                             - Duration::from_millis(cfg.lease_margin_ms.min(l.ms));
                         self.st().own_lease = Some((m.write_seq, until));
                     }
-                    let v = Arc::new(Version { m, etag, shared: self.shared.clone() });
+                    self.shared.counters.add(&plan.activity);
+                    let v = Arc::new(Version::new(m, etag, self.shared.clone()));
                     let v = self.install(v, Some(started));
                     self.write_finished();
                     self.shared.env.trace(|| {
@@ -727,6 +796,9 @@ impl Db {
         let mut meta_changed = false;
         let mut release = false;
         let mut lease_ms = cfg.lease_ms;
+        let quota = self.quota();
+        let mut size = base.m.stored_bytes();
+        let mut quota_refused = false;
         if base.m.is_deleted() {
             let outcomes = batch
                 .iter()
@@ -735,7 +807,7 @@ impl Db {
                     _ => Outcome::Unit(Err(Error::not_found("database deleted"))),
                 })
                 .collect();
-            return Ok(Plan { manifest: None, outcomes, gc: Vec::new() });
+            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, activity: Default::default() });
         }
         for w in batch {
             match w {
@@ -760,19 +832,32 @@ impl Db {
                         outcomes.push(Outcome::Seq(Err(e)));
                         continue;
                     }
+                    let (added, blob_bytes) = growth(&req.writes);
+                    if let Some(limit) = quota
+                        && added > 0
+                        && size + added > limit
+                    {
+                        quota_refused = true;
+                        outcomes.push(Outcome::Seq(Err(quota_exceeded(limit))));
+                        continue;
+                    }
+                    size += added;
                     let new_seq = last_seq + 1;
                     for r in &req.writes.range_deletes {
-                        for k in live_keys_in_range(base, &tail, r).await? {
-                            if !req.writes.puts.contains_key(&k) {
-                                tail.insert(k.clone(), Entry { key: k, seq: new_seq, value: Value::Tombstone });
-                            }
-                        }
+                        delete_range(base, &mut m, &mut tail, r, new_seq, cfg.range_delete_points_max).await?;
                     }
                     for (k, v) in &req.writes.puts {
                         tail.insert(
                             k.clone(),
                             Entry { key: k.clone(), seq: new_seq, value: v.clone().unwrap_or(Value::Tombstone) },
                         );
+                    }
+                    if blob_bytes > 0 {
+                        m.blob_bytes.bound += blob_bytes;
+                        let mut g = self.staging();
+                        for id in req.writes.blob_ids() {
+                            g.staged.remove(&id);
+                        }
                     }
                     accepted.push(&req.writes);
                     m.recent_commits.push((req.commit_id, new_seq));
@@ -788,7 +873,7 @@ impl Db {
                     meta_changed = true;
                     outcomes.push(Outcome::Unit(Ok(())));
                 }
-                Work::Compaction { inputs, outputs, purged_max_seq, compaction_seq, .. } => {
+                Work::Compaction { inputs, outputs, purged_max_seq, compaction_seq, deep, levels, .. } => {
                     let Some(now_ms) = now.store_ms else {
                         outcomes.push(Outcome::Unit(Err(Error::unavailable("store clock not synchronized"))));
                         continue;
@@ -797,18 +882,28 @@ impl Db {
                     let installed = !outputs.is_empty()
                         && outputs.iter().all(|o| m.segments.iter().any(|s| s.id == o.id && s.level == o.level));
                     if m.compaction_seq == *compaction_seq && present {
+                        // Only compactions change the deeper levels, and none
+                        // installed since this one was planned.
+                        if compaction::deep_after(&m, inputs, outputs) != *deep {
+                            outcomes.push(Outcome::Unit(Err(Error::internal("compaction planned on other levels"))));
+                            continue;
+                        }
                         let mut segments: Vec<SegmentMeta> =
-                            m.segments.iter().filter(|s| !inputs.contains(&s.id)).cloned().collect();
-                        segments.extend(outputs.iter().cloned());
+                            m.level(0).iter().filter(|s| !inputs.contains(&s.id)).cloned().collect();
+                        segments.extend(deep.iter().cloned());
                         let before = std::mem::replace(&mut m.segments, segments);
-                        m.sort_segments();
-                        if m.check_levels().is_err() {
+                        if m.check_levels().is_err() || outputs.iter().any(|o| o.level == 0) {
                             m.segments = before;
                             outcomes.push(Outcome::Unit(Err(Error::internal("compaction output overlaps its level"))));
                             continue;
                         }
                         for id in inputs.iter().filter(|id| !outputs.iter().any(|o| o.id == **id)) {
                             m.obsolete.push(Obsolete { kind: ObjKind::Segment, id: id.clone(), since_ms: now_ms });
+                        }
+                        if m.levels != *levels
+                            && let Some(old) = std::mem::replace(&mut m.levels, levels.clone())
+                        {
+                            m.obsolete.push(Obsolete { kind: ObjKind::Levels, id: old, since_ms: now_ms });
                         }
                         m.tombstone_horizon = m.tombstone_horizon.max(*purged_max_seq);
                         m.compaction_seq += 1;
@@ -821,17 +916,25 @@ impl Db {
                         outcomes.push(Outcome::Unit(Err(Error::Conflict("compaction inputs changed".into()))));
                     }
                 }
-                Work::Obsolete { items, .. } => {
+                Work::Obsolete { items, blob_bytes: (swept, at), .. } => {
                     let Some(now_ms) = now.store_ms else {
                         outcomes.push(Outcome::Unit(Err(Error::unavailable("store clock not synchronized"))));
                         continue;
                     };
                     for it in items {
                         let listed = m.obsolete.iter().any(|o| o.kind == it.kind && o.id == it.id);
-                        let live_seg = it.kind == ObjKind::Segment && m.segments.iter().any(|s| s.id == it.id);
-                        if !listed && !live_seg {
+                        let live = match it.kind {
+                            ObjKind::Segment => m.segments.iter().any(|s| s.id == it.id),
+                            ObjKind::Levels => m.levels.as_deref() == Some(it.id.as_str()),
+                            ObjKind::Blob => false,
+                        };
+                        if !listed && !live {
                             m.obsolete.push(it.clone());
                         }
+                    }
+                    if *at >= m.blob_bytes.swept_at {
+                        m.blob_bytes.swept = *swept;
+                        m.blob_bytes.swept_at = *at;
                     }
                     m.last_sweep_ms = now_ms;
                     meta_changed = true;
@@ -846,34 +949,38 @@ impl Db {
             }
         }
         if !data_changed && !meta_changed {
-            return Ok(Plan { manifest: None, outcomes, gc: Vec::new() });
+            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, activity: Default::default() });
         }
         if data_changed {
             m.version = last_seq;
         }
         m.tail = tail.into_values().collect();
-        // Without segments, tail tombstones shadow nothing: purge old ones.
-        if m.segments.is_empty()
-            && let Some(now_ms) = now.store_ms
-        {
+        let mut gc = Vec::new();
+        let mut retired = 0;
+        if let Some(now_ms) = now.store_ms {
             let purge = m.version_at_least_age(now_ms, cfg.txn_max_lifetime_ms);
             let mut horizon = m.tombstone_horizon;
-            m.tail.retain(|e| {
-                if e.value.is_tombstone() && e.seq <= purge {
-                    horizon = horizon.max(e.seq);
-                    false
-                } else {
-                    true
+            // Without segments, tail tombstones shadow nothing: purge old ones.
+            if m.segments.is_empty() {
+                m.tail.retain(|e| {
+                    let purged = e.value.is_tombstone() && e.seq <= purge;
+                    if purged {
+                        horizon = horizon.max(e.seq);
+                    }
+                    !purged
+                });
+            }
+            // Retire range tombstones when no remaining segment overlaps and no active transaction can read them.
+            let segments = &m.segments;
+            m.range_deletes.retain(|t| {
+                let retire = t.seq <= purge && !segments.iter().any(|s| t.dirties(s));
+                if retire {
+                    horizon = horizon.max(t.seq);
+                    retired += 1;
                 }
+                !retire
             });
             m.tombstone_horizon = horizon;
-        }
-        if m.recent_commits.len() > cfg.commit_ring_max {
-            let n = m.recent_commits.len() - cfg.commit_ring_max;
-            m.recent_commits.drain(..n);
-        }
-        let mut gc = Vec::new();
-        if let Some(now_ms) = now.store_ms {
             if data_changed && m.version_times.last().is_none_or(|(_, t)| *t + cfg.version_sample_ms <= now_ms) {
                 m.version_times.push((m.version, now_ms));
             }
@@ -887,6 +994,10 @@ impl Db {
             (gc, keep) = m.obsolete.drain(..).partition(|o| o.since_ms + cfg.gc_grace_ms <= now_ms);
             m.obsolete = keep;
         }
+        if m.recent_commits.len() > cfg.commit_ring_max {
+            let n = m.recent_commits.len() - cfg.commit_ring_max;
+            m.recent_commits.drain(..n);
+        }
         m.lease = if release {
             None
         } else {
@@ -897,11 +1008,17 @@ impl Db {
             for e in &m.tail {
                 b.add(e);
             }
-            m.segments.insert(0, compaction::write(&self.shared, &self.id, b, 0).await?);
+            // Flushed tail segments have all range deletions applied through m.version.
+            m.segments.insert(0, compaction::write(&self.shared, &self.id, b, 0, m.version).await?);
             m.tail.clear();
         }
         m.write_seq += 1;
-        Ok(Plan { manifest: Some(m), outcomes, gc })
+        let activity = super::Activity {
+            range_tombstones_written: m.range_deletes.iter().filter(|t| t.seq > base.m.version).count() as u64,
+            range_tombstones_retired: retired,
+            ..Default::default()
+        };
+        Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, activity })
     }
 
     fn after_commit(self: &Arc<Self>, v: &Arc<Version>, gc: Vec<Obsolete>) {
@@ -918,28 +1035,40 @@ impl Db {
             });
         }
         self.shared.refresh_clock();
-        let store_now = self.shared.store_now_ms();
+        {
+            let mut st = self.st();
+            if !st.compacting && compaction::pick(&v.m, cfg).is_some() {
+                st.compacting = true;
+                let me = self.clone();
+                self.shared.env.spawn(async move {
+                    if let Err(e) = me.clone().compact().await {
+                        crate::debug!("compaction of {} stopped: {e}", me.id);
+                    }
+                    me.st().compacting = false;
+                });
+            }
+        }
+        self.maybe_sweep(v);
+    }
+
+    /// Triggers a garbage collection sweep if due, using a shorter interval if under quota pressure.
+    fn maybe_sweep(self: &Arc<Self>, v: &Version) {
+        let cfg = &self.shared.cfg;
+        let Some(now) = self.shared.store_now_ms() else { return };
         let mut st = self.st();
-        if !st.compacting && compaction::pick(&v.m, cfg).is_some() {
-            st.compacting = true;
-            let me = self.clone();
-            self.shared.env.spawn(async move {
-                if let Err(e) = me.clone().compact().await {
-                    crate::debug!("compaction of {} stopped: {e}", me.id);
-                }
-                me.st().compacting = false;
-            });
+        let interval = if st.quota_pressure { cfg.quota_sweep_interval_ms } else { cfg.sweep_interval_ms };
+        if st.sweeping || v.m.last_sweep_ms + interval > now {
+            return;
         }
-        if !st.sweeping && store_now.is_some_and(|now| v.m.last_sweep_ms + cfg.sweep_interval_ms <= now) {
-            st.sweeping = true;
-            let me = self.clone();
-            self.shared.env.spawn(async move {
-                if let Err(e) = me.clone().sweep().await {
-                    crate::debug!("sweep of {} stopped: {e}", me.id);
-                }
-                me.st().sweeping = false;
-            });
-        }
+        st.sweeping = true;
+        st.quota_pressure = false;
+        let me = self.clone();
+        self.shared.env.spawn(async move {
+            if let Err(e) = me.clone().sweep().await {
+                crate::debug!("sweep of {} stopped: {e}", me.id);
+            }
+            me.st().sweeping = false;
+        });
     }
 
     async fn compact(self: Arc<Self>) -> Result<()> {
@@ -955,23 +1084,38 @@ impl Db {
             let Some(plan) = compaction::pick(&v.m, &cfg) else {
                 return Ok(());
             };
-            let (outputs, purged_max_seq) = if plan.trivial {
-                let moved = SegmentMeta { level: plan.output_level, ..plan.inputs[0].clone() };
-                (vec![moved], 0)
-            } else {
-                let purge_seq = v.m.version_at_least_age(store_now, cfg.txn_max_lifetime_ms);
-                let out = compaction::run(&self.shared, &v.m, &plan, purge_seq).await?;
-                (out.segments, out.purged_max_seq)
+            let (outputs, purged_max_seq) = match plan.kind {
+                Kind::Move { level } => (vec![SegmentMeta { level, ..plan.inputs[0].clone() }], 0),
+                Kind::Drop => (Vec::new(), 0),
+                Kind::Merge { .. } | Kind::Rewrite => {
+                    let purge_seq = v.m.version_at_least_age(store_now, cfg.txn_max_lifetime_ms);
+                    let out = compaction::run(&self.shared, &v.m, &plan, purge_seq).await?;
+                    (out.segments, out.purged_max_seq)
+                }
+            };
+            let inputs: Vec<String> = plan.inputs.iter().map(|s| s.id.clone()).collect();
+            let deep = compaction::deep_after(&v.m, &inputs, &outputs);
+            let levels = match deep.len() > cfg.levels_inline_max {
+                true => Some(self.shared.write_levels(&self.id, deep.clone()).await?),
+                false => None,
             };
             let (tx, rx) = oneshot::channel();
             self.enqueue(Work::Compaction {
-                inputs: plan.inputs.iter().map(|s| s.id.clone()).collect(),
+                inputs,
                 outputs,
                 purged_max_seq,
                 compaction_seq: v.m.compaction_seq,
+                deep,
+                levels,
                 tx,
             });
             rx.await.map_err(|_| Error::unavailable("compaction install interrupted"))??;
+            let n = plan.inputs.len() as u64;
+            self.shared.counters.add(&match plan.kind {
+                Kind::Drop => super::Activity { segments_dropped: n, ..Default::default() },
+                Kind::Rewrite => super::Activity { segments_rewritten: n, ..Default::default() },
+                _ => Default::default(),
+            });
         }
     }
 
@@ -988,33 +1132,34 @@ impl Db {
         if !self.holds_lease(&self.st(), &v.m) {
             return Ok(());
         }
-        let mut referenced_segs: BTreeSet<&str> = v.m.segments.iter().map(|s| s.id.as_str()).collect();
-        let mut referenced_blobs: BTreeSet<String> = BTreeSet::new();
-        for o in &v.m.obsolete {
-            match o.kind {
-                ObjKind::Segment => {
-                    referenced_segs.insert(o.id.as_str());
-                }
-                ObjKind::Blob => {
-                    referenced_blobs.insert(o.id.clone());
-                }
-            }
-        }
+        let mut referenced: BTreeSet<(ObjKind, &str)> =
+            v.m.segments.iter().map(|s| (ObjKind::Segment, s.id.as_str())).collect();
+        referenced.extend(v.m.levels.iter().map(|id| (ObjKind::Levels, id.as_str())));
+        referenced.extend(v.m.obsolete.iter().filter(|o| o.kind != ObjKind::Blob).map(|o| (o.kind, o.id.as_str())));
+        let mut referenced_blobs: BTreeSet<String> =
+            v.m.obsolete.iter().filter(|o| o.kind == ObjKind::Blob).map(|o| o.id.clone()).collect();
+        // Aggregate live blob sizes for quota accounting.
+        let mut live_blobs: BTreeMap<String, u64> = BTreeMap::new();
         let mut it = v.iter_bulk(false);
         while let Some(e) = it.next().await? {
             if let Value::Blob(b) = e.value {
-                referenced_blobs.insert(b.id);
+                referenced_blobs.insert(b.id.clone());
+                live_blobs.insert(b.id, b.size);
             }
         }
         let mut items = Vec::new();
         let mut segs = Listing::new(format!("dbs/{}/seg/", self.id));
         while let Some(o) = segs.next(&self.shared).await? {
-            let id = o.key.rsplit('/').next().unwrap_or("");
+            let name = o.key.rsplit('/').next().unwrap_or("");
+            let (kind, id) = match name.strip_suffix(super::LEVELS_SUFFIX) {
+                Some(id) => (ObjKind::Levels, id),
+                None => (ObjKind::Segment, name),
+            };
             if super::types::valid_object_id(id)
-                && !referenced_segs.contains(id)
+                && !referenced.contains(&(kind, id))
                 && o.last_modified_ms + cfg.orphan_grace_ms <= now_ms
             {
-                items.push(Obsolete { kind: ObjKind::Segment, id: id.to_string(), since_ms: now_ms });
+                items.push(Obsolete { kind, id: id.to_string(), since_ms: now_ms });
             }
         }
         // A blob's objects are listed together; it is as old as its newest.
@@ -1045,8 +1190,9 @@ impl Db {
         if let Some((c, mtime)) = cur {
             found(c, mtime, &mut items);
         }
+        let blob_bytes = (live_blobs.values().sum(), v.m.blob_bytes.bound);
         let (tx, rx) = oneshot::channel();
-        self.enqueue(Work::Obsolete { items, tx });
+        self.enqueue(Work::Obsolete { items, blob_bytes, tx });
         rx.await.map_err(|_| Error::unavailable("sweep interrupted"))?
     }
 
@@ -1134,6 +1280,74 @@ struct Plan {
     manifest: Option<Manifest>,
     outcomes: Vec<Outcome>,
     gc: Vec<Obsolete>,
+    /// Indicates whether a commit in this batch was rejected due to quota.
+    quota_refused: bool,
+    /// Storage activity recorded upon successful manifest write.
+    activity: super::Activity,
+}
+
+pub(crate) fn quota_exceeded(limit: u64) -> Error {
+    Error::QuotaExceeded(format!("the database is at its size quota of {limit} bytes; delete data to make room"))
+}
+
+/// Calculates net storage addition (total added bytes, bound blob bytes) for a commit write set.
+fn growth(w: &WriteSet) -> (u64, u64) {
+    let mut added = 0;
+    let mut blobs = 0;
+    for (k, v) in &w.puts {
+        if let Some(v) = v {
+            added += (k.len() + v.size()) as u64;
+            if let Value::Blob(b) = v {
+                blobs += b.size;
+            }
+        }
+    }
+    (added + blobs, blobs)
+}
+
+/// Applies a range deletion to the manifest and tail. Small ranges (< points_max stored entries)
+/// emit individual point tombstones; larger ranges are stored as a single range tombstone.
+async fn delete_range(
+    base: &Version,
+    m: &mut Manifest,
+    tail: &mut BTreeMap<Bytes, Entry>,
+    r: &KeyRange,
+    seq: Seq,
+    points_max: usize,
+) -> Result<()> {
+    let Some(rt) = RangeTombstone::new(r, seq) else { return Ok(()) };
+    let bounds = (r.start.clone(), r.end.clone());
+    let in_tail: Vec<Bytes> = tail.range::<Bytes, _>(bounds).map(|(k, _)| k.clone()).collect();
+    let mut stored: BTreeMap<Bytes, bool> = BTreeMap::new();
+    let mut it = base.iter(r, false, true);
+    let mut few = true;
+    while let Some(e) = it.next().await? {
+        if stored.len() >= points_max {
+            few = false;
+            break;
+        }
+        stored.insert(e.key, !e.value.is_tombstone());
+    }
+    if few {
+        // Account for range deletions in earlier commits within the current batch.
+        let batch_deletes: Vec<&RangeTombstone> = m.range_deletes.iter().filter(|t| t.seq > base.m.version).collect();
+        let mut doomed: Vec<Bytes> = stored
+            .into_iter()
+            .filter(|(k, live)| *live && !tail.contains_key(k) && !batch_deletes.iter().any(|t| t.contains_key(k)))
+            .map(|(k, _)| k)
+            .collect();
+        doomed.extend(in_tail.into_iter().filter(|k| tail.get(k).is_some_and(|e| !e.value.is_tombstone())));
+        for k in doomed {
+            tail.insert(k.clone(), Entry { key: k, seq, value: Value::Tombstone });
+        }
+        return Ok(());
+    }
+    for k in in_tail {
+        tail.remove(&k);
+    }
+    m.range_deletes.retain(|t| !rt.contains_range(t));
+    m.range_deletes.push(rt);
+    Ok(())
 }
 
 fn unknown(e: Error) -> Error {
@@ -1146,8 +1360,8 @@ fn unknown(e: Error) -> Error {
 
 async fn delete_object(shared: &Shared, db: &str, o: &Obsolete) -> Result<()> {
     match o.kind {
-        ObjKind::Segment => {
-            let key = seg_key(db, &o.id);
+        ObjKind::Segment | ObjKind::Levels => {
+            let key = if o.kind == ObjKind::Segment { seg_key(db, &o.id) } else { levels_key(db, &o.id) };
             shared.retry.run(|| shared.store.delete(&key)).await?;
         }
         ObjKind::Blob => {
@@ -1184,28 +1398,29 @@ mod tests {
             max_key: Bytes::copy_from_slice(max.as_bytes()),
             min_seq: 0,
             max_seq: 0,
+            deletes_applied: 0,
         }
     }
 
-    /// The plan for `batch` on a manifest with `segments` and `obsolete`
-    /// objects, two compactions after its creation.
+    // Helper to evaluate a batch against a test manifest.
     async fn plan(segments: &[SegmentMeta], obsolete: Vec<Obsolete>, batch: Vec<Work>) -> Plan {
         let (eng, _, _) = engine(1, EngineConfig::small_for_tests());
         let mut m = Manifest { segments: segments.to_vec(), obsolete, compaction_seq: 2, ..Manifest::new("d", 0) };
         m.sort_segments();
-        let base = Version { m, etag: String::new(), shared: eng.shared.clone() };
+        let mut batch = batch;
+        for w in &mut batch {
+            if let Work::Compaction { inputs, outputs, deep, .. } = w {
+                *deep = compaction::deep_after(&m, inputs, outputs);
+            }
+        }
+        let base = Version::new(m, String::new(), eng.shared.clone());
         eng.db("d").build(&base, &batch, Now { wall_ms: 1_000, store_ms: Some(1_000) }).await.unwrap()
     }
 
     fn compaction(inputs: &str, outputs: Vec<SegmentMeta>, compaction_seq: u64) -> Work {
         let (tx, _) = oneshot::channel();
-        Work::Compaction {
-            inputs: inputs.chars().map(|c| c.to_string().repeat(32)).collect(),
-            outputs,
-            purged_max_seq: 0,
-            compaction_seq,
-            tx,
-        }
+        let inputs: Vec<String> = inputs.chars().map(|c| c.to_string().repeat(32)).collect();
+        Work::Compaction { inputs, outputs, purged_max_seq: 0, compaction_seq, deep: Vec::new(), levels: None, tx }
     }
 
     fn succeeded(p: &Plan) -> bool {
@@ -1247,9 +1462,9 @@ mod tests {
             let (eng, _, _) = engine(1, EngineConfig::small_for_tests());
             let ob = |c: char| Obsolete { kind: ObjKind::Segment, id: c.to_string().repeat(32), since_ms: 0 };
             let m = Manifest { obsolete: vec![ob('a'), ob('b')], ..Manifest::new("d", 0) };
-            let base = Version { m, etag: String::new(), shared: eng.shared.clone() };
+            let base = Version::new(m, String::new(), eng.shared.clone());
             let (tx, _) = oneshot::channel();
-            let sweep = Work::Obsolete { items: vec![ob('c')], tx };
+            let sweep = Work::Obsolete { items: vec![ob('c')], blob_bytes: (0, 0), tx };
             let lease = Work::Lease { release: false, for_reads: true, tx: None };
             let db = eng.db("d");
             let p = db.build(&base, &[lease, sweep], Now { wall_ms: 10_000_000, store_ms: None }).await.unwrap();
@@ -1310,9 +1525,12 @@ mod tests {
             let (seg, blob) = (ObjKind::Segment, ObjKind::Blob);
             let (tx, _) = oneshot::channel();
             let items = vec![ob(seg, 'a'), ob(seg, 'b'), ob(seg, 'c'), ob(blob, 'a'), ob(blob, 'd')];
-            let p =
-                plan(&[meta('a', 0, "a", "b")], vec![ob(seg, 'b'), ob(blob, 'd')], vec![Work::Obsolete { items, tx }])
-                    .await;
+            let p = plan(
+                &[meta('a', 0, "a", "b")],
+                vec![ob(seg, 'b'), ob(blob, 'd')],
+                vec![Work::Obsolete { items, blob_bytes: (0, 0), tx }],
+            )
+            .await;
             let got: Vec<(ObjKind, char)> =
                 p.manifest.unwrap().obsolete.iter().map(|o| (o.kind, o.id.chars().next().unwrap())).collect();
             assert_eq!(got, [(seg, 'b'), (blob, 'd'), (seg, 'c'), (blob, 'a')]);

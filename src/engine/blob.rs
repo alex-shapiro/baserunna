@@ -1,6 +1,7 @@
 //! Out-of-band blobs: immutable byte sequences stored as fixed-size chunk
 //! objects under `dbs/{db}/blob/{id}/`.
 
+use super::db::Db;
 use super::types::{BlobRef, make_blob_id};
 use super::{EngineConfig, Shared, blob_chunk_key, pin_key};
 use crate::error::{Error, Result};
@@ -19,6 +20,31 @@ pub struct BlobWriter {
     size: u64,
     sha: Sha256,
     content_type: String,
+    quota: Option<StageGuard>,
+}
+
+/// Tracks reserved quota for an in-flight blob upload, releasing uncommitted bytes if dropped.
+pub struct StageGuard {
+    db: Arc<Db>,
+    reserved: u64,
+}
+
+impl StageGuard {
+    pub(crate) fn new(db: Arc<Db>) -> StageGuard {
+        StageGuard { db, reserved: 0 }
+    }
+
+    fn finish(mut self, r: &BlobRef) {
+        self.db.end_staging(std::mem::take(&mut self.reserved), Some((&r.id, r.size)));
+    }
+}
+
+impl Drop for StageGuard {
+    fn drop(&mut self) {
+        if self.reserved > 0 {
+            self.db.end_staging(self.reserved, None);
+        }
+    }
 }
 
 impl BlobWriter {
@@ -33,7 +59,14 @@ impl BlobWriter {
             size: 0,
             sha: Sha256::new(),
             content_type: content_type.to_string(),
+            quota: None,
         }
+    }
+
+    /// Enforces database size quota limits during blob staging.
+    pub fn with_quota(mut self, g: StageGuard) -> BlobWriter {
+        self.quota = Some(g);
+        self
     }
 
     async fn flush_chunk(&mut self, data: Bytes) -> Result<()> {
@@ -47,6 +80,10 @@ impl BlobWriter {
         self.size += data.len() as u64;
         if self.size > self.shared.cfg.blob_max {
             return Err(Error::TooLarge(format!("blob exceeds {} bytes", self.shared.cfg.blob_max)));
+        }
+        if let Some(g) = &mut self.quota {
+            g.db.reserve_staging(data.len() as u64)?;
+            g.reserved += data.len() as u64;
         }
         self.sha.update(data);
         let cs = self.shared.cfg.blob_chunk_size;
@@ -74,6 +111,9 @@ impl BlobWriter {
         let meta = Bytes::from(w.into_inner());
         let key = blob_meta_key(&self.db, &r.id);
         self.shared.retry.run(|| self.shared.store.put(&key, meta.clone(), PutMode::Overwrite)).await?;
+        if let Some(g) = self.quota.take() {
+            g.finish(&r);
+        }
         Ok(r)
     }
 }

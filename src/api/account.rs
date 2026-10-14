@@ -1,6 +1,6 @@
 //! Authentication, account, API key, admin and internal routes.
 
-use super::{Auth, JsonBody, Params, SESSION_COOKIE, cookie, credential};
+use super::{Auth, ClientAddr, JsonBody, Params, SESSION_COOKIE, cookie, credential};
 use crate::auth;
 use crate::error::{Error, Result};
 use crate::meta::{self, ApiKey, MetaCmd};
@@ -49,19 +49,12 @@ pub struct Credentials {
     password: String,
 }
 
-async fn signup(State(node): State<Arc<Node>>, JsonBody(c): JsonBody<Credentials>) -> Result<Response> {
-    let email = auth::normalize_email(&c.email)?;
-    auth::validate_password(&c.password)?;
-    let hash = auth::hash_password(&node.env, &c.password, node.cfg.pbkdf2_iterations);
-    let r = node
-        .run_meta(MetaCmd::Signup {
-            id: node.env.random_hex(8),
-            email: email.clone(),
-            password_hash: Some(hash),
-            policy: node.cfg.signup,
-            bootstrap_admin: false,
-        })
-        .await?;
+async fn signup(
+    State(node): State<Arc<Node>>,
+    client: ClientAddr,
+    JsonBody(c): JsonBody<Credentials>,
+) -> Result<Response> {
+    let (email, r) = node.password_signup(&client.0, &c.email, &c.password).await?;
     let user_id = r["user_id"].as_str().unwrap_or_default().to_string();
     let token = node.create_session(&user_id).await?;
     let body = json!({
@@ -72,31 +65,12 @@ async fn signup(State(node): State<Arc<Node>>, JsonBody(c): JsonBody<Credentials
     Ok(with_cookie((StatusCode::CREATED, axum::Json(body)).into_response(), session_cookie(&node, &token, ttl)))
 }
 
-async fn login(State(node): State<Arc<Node>>, JsonBody(c): JsonBody<Credentials>) -> Result<Response> {
-    let bad = || Error::Unauthenticated("invalid email or password".into());
-    let email = auth::normalize_email(&c.email).map_err(|_| bad())?;
-    let mut t = node.sys_read().await?;
-    let mut user = meta::user_by_email(&mut t, &email).await?;
-    if user.is_none() {
-        // Read-your-writes for an account created moments ago elsewhere.
-        let mut t = node.sys_read_strong().await?;
-        user = meta::user_by_email(&mut t, &email).await?;
-    }
-    let ok = match user.as_ref().and_then(|u| u.password_hash.as_deref()) {
-        Some(h) => auth::verify_password(&c.password, h),
-        None => {
-            // Equalize timing for unknown accounts.
-            let _ = auth::hash_password(&node.env, &c.password, node.cfg.pbkdf2_iterations);
-            false
-        }
-    };
-    let user = match (ok, user) {
-        (true, Some(u)) => u,
-        _ => return Err(bad()),
-    };
-    if user.disabled {
-        return Err(Error::PermissionDenied("this account is disabled".into()));
-    }
+async fn login(
+    State(node): State<Arc<Node>>,
+    client: ClientAddr,
+    JsonBody(c): JsonBody<Credentials>,
+) -> Result<Response> {
+    let user = node.password_login(&client.0, &c.email, &c.password).await?;
     let token = node.create_session(&user.id).await?;
     let ttl = node.cfg.session_ttl_ms / 1000;
     Ok(with_cookie(
@@ -129,8 +103,10 @@ fn redirect_uri(node: &Node) -> String {
     format!("{}/v1/auth/google/callback", node.cfg.public_url.trim_end_matches('/'))
 }
 
-async fn google_start(State(node): State<Arc<Node>>, q: Params) -> Result<Response> {
+async fn google_start(State(node): State<Arc<Node>>, client: ClientAddr, q: Params) -> Result<Response> {
     let oidc = node.oidc.clone().ok_or_else(|| Error::not_found("Google sign-in is not configured"))?;
+    let auth_key = format!("auth:{}", client.0);
+    node.limiter.take(&[(&auth_key, node.cfg.limits.auth_per_client)], "sign-in attempts")?;
     let state = node.env.random_hex(16);
     let ret = safe_return_to(q.get("return_to"));
     let signed = auth::sign_value(&node.cookie_key(), &format!("{state}|{ret}"), node.now_ms() + 600_000);
@@ -145,8 +121,15 @@ async fn google_start(State(node): State<Arc<Node>>, q: Params) -> Result<Respon
     Ok(r)
 }
 
-async fn google_callback(State(node): State<Arc<Node>>, headers: HeaderMap, q: Params) -> Result<Response> {
+async fn google_callback(
+    State(node): State<Arc<Node>>,
+    client: ClientAddr,
+    headers: HeaderMap,
+    q: Params,
+) -> Result<Response> {
     let oidc = node.oidc.clone().ok_or_else(|| Error::not_found("Google sign-in is not configured"))?;
+    let auth_key = format!("auth:{}", client.0);
+    node.limiter.take(&[(&auth_key, node.cfg.limits.auth_per_client)], "sign-in attempts")?;
     let bad = |m: &str| Error::Unauthenticated(format!("Google sign-in failed: {m}"));
     if let Some(e) = q.get("error") {
         return Err(bad(e));
@@ -188,7 +171,7 @@ async fn google_callback(State(node): State<Arc<Node>>, headers: HeaderMap, q: P
 async fn me(State(node): State<Arc<Node>>, Auth(p): Auth) -> Result<axum::Json<Json>> {
     let cred = match &p.cred {
         Credential::Session { .. } => json!({"type": "session"}),
-        Credential::ApiKey { id, db_id, read_only } => {
+        Credential::ApiKey { id, db_id, read_only, rate_limit } => {
             let db = match db_id {
                 Some(d) => {
                     let mut t = node.sys_read().await?;
@@ -196,7 +179,7 @@ async fn me(State(node): State<Arc<Node>>, Auth(p): Auth) -> Result<axum::Json<J
                 }
                 None => None,
             };
-            json!({"type": "api_key", "id": id, "db": db, "read_only": read_only})
+            json!({"type": "api_key", "id": id, "db": db, "read_only": read_only, "rate_limit": rate_limit})
         }
     };
     Ok(axum::Json(json!({"user": p.user.public_json(), "credential": cred})))
@@ -225,6 +208,8 @@ struct CreateKey {
     db: Option<String>,
     #[serde(default)]
     read_only: bool,
+    #[serde(default)]
+    rate_limit: Option<u32>,
 }
 
 async fn create_key(
@@ -235,6 +220,9 @@ async fn create_key(
     p.require_session()?;
     if c.name.trim().is_empty() || c.name.len() > 100 {
         return Err(Error::invalid("key names are 1-100 characters"));
+    }
+    if c.rate_limit.is_some_and(|r| !(1..=1_000_000).contains(&r)) {
+        return Err(Error::invalid("rate_limit is 1 to 1000000 requests per second"));
     }
     let db_id = match &c.db {
         Some(name) => Some(node.resolve_db(&p, name).await?.id),
@@ -248,6 +236,7 @@ async fn create_key(
         secret_hash,
         db_id,
         read_only: c.read_only,
+        rate_limit: c.rate_limit,
         created_at: node.now_ms() as i64,
     };
     node.run_meta(MetaCmd::CreateApiKey { key: key.clone() }).await?;

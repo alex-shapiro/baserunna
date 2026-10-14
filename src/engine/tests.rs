@@ -34,8 +34,9 @@ enum Op {
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
     DeleteRange(Vec<u8>, Vec<u8>),
+    Bulk(u8, u8),
     Commit,
-    /// Let background compaction and garbage collection run.
+    Snapshot,
     Settle,
     Advance(u64),
     Sweep,
@@ -55,7 +56,9 @@ fn gen_ops(r: &mut Rng) -> Vec<Op> {
                 let b = prop::small_key(r, 3);
                 if a <= b { Op::DeleteRange(a, b) } else { Op::DeleteRange(b, a) }
             }
-            64..=89 => Op::Commit,
+            64..=67 => Op::Bulk(b'a' + r.below(4) as u8, 5 + r.below(40) as u8),
+            68..=69 => Op::Snapshot,
+            70..=89 => Op::Commit,
             90..=94 => Op::Settle,
             95..=97 => Op::Advance(r.range(1, 3_000_000)),
             _ => Op::Sweep,
@@ -115,7 +118,9 @@ async fn check_against_model(db: &Arc<Db>, model: &BTreeMap<Vec<u8>, Vec<u8>>, r
 }
 
 async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
-    let (eng, store, env) = engine(seed, EngineConfig::small_for_tests());
+    // Half the seeds keep the deeper levels in levels objects.
+    let levels_inline_max = if seed.is_multiple_of(2) { 0 } else { 16 };
+    let (eng, store, env) = engine(seed, EngineConfig { levels_inline_max, ..EngineConfig::small_for_tests() });
     let db = eng.db("t1");
     db.open(true).await.map_err(|e| e.to_string())?;
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -123,8 +128,22 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
     let mut pending_ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await.map_err(|e| e.to_string())?;
     let mut rng = Rng::new(seed ^ 0xabc);
+    type Snapshot = (Instant, Arc<Version>, BTreeMap<Vec<u8>, Vec<u8>>);
+    let mut snapshots: Vec<Snapshot> = Vec::new();
     for op in ops {
         match op {
+            Op::Bulk(p, n) => {
+                for i in 0..*n {
+                    let (k, v) = (vec![*p, i], vec![i; 100]);
+                    txn.put(Bytes::from(k.clone()), Value::Inline(Bytes::from(v.clone())))
+                        .map_err(|e| e.to_string())?;
+                    pending.insert(k, Some(v));
+                }
+            }
+            Op::Snapshot => {
+                let v = db.read_version(Consistency::Strong).await.map_err(|e| e.to_string())?;
+                snapshots.push((Instant::now(), v, model.clone()));
+            }
             Op::Put(k, v) => {
                 let value = if v.len() > eng.shared.cfg.value_inline_max {
                     Value::Blob(
@@ -178,6 +197,18 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
             Op::Settle => {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 check_against_model(&db, &model, &mut rng).await?;
+                let life = Duration::from_millis(eng.shared.cfg.txn_max_lifetime_ms);
+                snapshots.retain(|(t, _, _)| t.elapsed() < life);
+                for (_, v, m) in &snapshots {
+                    let all = v.all_entries(false).await.map_err(|e| format!("old snapshot: {e}"))?;
+                    let mut got = BTreeMap::new();
+                    for e in &all {
+                        got.insert(e.key.to_vec(), value_bytes(&db, &e.value).await);
+                    }
+                    if &got != m {
+                        return Err(format!("snapshot v{} changed: {} keys, want {}", v.m.version, got.len(), m.len()));
+                    }
+                }
             }
             Op::Advance(ms) => {
                 tokio::time::sleep(Duration::from_millis(*ms)).await;
@@ -199,6 +230,14 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
             return Err(format!("referenced segment {} missing", s.id));
         }
     }
+    if let Some(id) = &v.m.levels {
+        let g =
+            store.get_sync(&levels_key("t1", id), &GetOpts::default()).map_err(|e| format!("levels object: {e}"))?;
+        let l = manifest::Levels::decode(&g.data).map_err(|e| e.to_string())?;
+        if l.segments != v.m.deep_segments() {
+            return Err("the levels object differs from the manifest's levels".into());
+        }
+    }
     for e in v.all_entries(false).await.map_err(|e| e.to_string())? {
         if let Value::Blob(b) = &e.value {
             let n = b.size.div_ceil(eng.shared.cfg.blob_chunk_size as u64);
@@ -211,14 +250,15 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
     }
     if std::env::var("ENGINE_STATS").is_ok() {
         eprintln!(
-            "seed {seed}: ops={} version={} segments={} tail={} obsolete={} horizon={} objects={}",
+            "seed {seed}: ops={} version={} segments={} tail={} obsolete={} horizon={} objects={} {:?}",
             ops.len(),
             v.m.version,
             v.m.segments.len(),
             v.m.tail.len(),
             v.m.obsolete.len(),
             v.m.tombstone_horizon,
-            store.len()
+            store.len(),
+            eng.shared.counters.get()
         );
     }
     let _ = env;
@@ -390,8 +430,8 @@ fn blob_limits_and_ranges() {
 
 /// A store that can delay responses after applying the operation, fail
 /// manifest requests, and record the GETs it serves.
-struct DelayStore {
-    mem: Arc<MemStore>,
+pub(super) struct DelayStore {
+    pub(super) mem: Arc<MemStore>,
     get_reply_ms: AtomicU64,
     put_reply_ms: AtomicU64,
     /// Manifest PUTs to refuse as lost races, then as outages, without
@@ -464,11 +504,11 @@ impl ObjectStore for DelayStore {
     }
 }
 
-fn delayed_engine(node: &str) -> (Arc<Engine>, Arc<DelayStore>) {
+pub(super) fn delayed_engine(node: &str) -> (Arc<Engine>, Arc<DelayStore>) {
     delayed_engine_with(node, EngineConfig::small_for_tests())
 }
 
-fn delayed_engine_with(node: &str, cfg: EngineConfig) -> (Arc<Engine>, Arc<DelayStore>) {
+pub(super) fn delayed_engine_with(node: &str, cfg: EngineConfig) -> (Arc<Engine>, Arc<DelayStore>) {
     let origin = tokio::time::Instant::now();
     let env = Arc::new(Env::sim(9, 1_700_000_000_000, origin, 0));
     let env2 = env.clone();
@@ -488,18 +528,18 @@ fn delayed_engine_with(node: &str, cfg: EngineConfig) -> (Arc<Engine>, Arc<Delay
 }
 
 /// A second node sharing `a`'s store and clock.
-fn second_node(a: &Arc<Engine>, store: &Arc<DelayStore>, node: &str) -> Arc<Engine> {
+pub(super) fn second_node(a: &Arc<Engine>, store: &Arc<DelayStore>, node: &str) -> Arc<Engine> {
     let store: DynStore = store.clone();
     Engine::new(store, a.shared.env.clone(), a.shared.cfg.clone(), node.into())
 }
 
-async fn opened(eng: &Arc<Engine>, id: &str) -> Arc<Db> {
+pub(super) async fn opened(eng: &Arc<Engine>, id: &str) -> Arc<Db> {
     let db = eng.db(id);
     db.open(true).await.unwrap();
     db
 }
 
-async fn put(db: &Arc<Db>, k: &str, v: &str) -> Seq {
+pub(super) async fn put(db: &Arc<Db>, k: &str, v: &str) -> Seq {
     let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
     t.put(Bytes::from(k.to_string()), Value::Inline(Bytes::from(v.to_string()))).unwrap();
     db.commit(t.into_request()).await.unwrap()
@@ -1046,13 +1086,13 @@ fn op_batches_limits_and_defaults() {
     });
 }
 
-fn inline(s: &str) -> Value {
+pub(super) fn inline(s: &str) -> Value {
     Value::Inline(Bytes::from(s.to_string()))
 }
 
 /// Commits `n` values of `len` bytes under `prefix`: with the test
 /// configuration, 5 values of 500 bytes flush the tail to a segment.
-async fn put_many(db: &Arc<Db>, prefix: &str, n: usize, len: usize) -> Seq {
+pub(super) async fn put_many(db: &Arc<Db>, prefix: &str, n: usize, len: usize) -> Seq {
     let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
     for i in 0..n {
         t.put(Bytes::from(format!("{prefix}{i:02}")), Value::Inline(Bytes::from(vec![b'v'; len]))).unwrap();
@@ -1060,7 +1100,7 @@ async fn put_many(db: &Arc<Db>, prefix: &str, n: usize, len: usize) -> Seq {
     db.commit(t.into_request()).await.unwrap()
 }
 
-async fn strong_get(db: &Arc<Db>, k: &str) -> Option<Value> {
+pub(super) async fn strong_get(db: &Arc<Db>, k: &str) -> Option<Value> {
     db.read_version(Consistency::Strong).await.unwrap().get(k.as_bytes()).await.unwrap().map(|e| e.value)
 }
 
@@ -1321,6 +1361,21 @@ fn tail_tombstones_are_dropped_after_a_transaction_lifetime() {
     });
 }
 
+/// Returns the storage keys of all segments and levels objects referenced or
+/// marked obsolete by `m`.
+pub(super) fn known_objects(m: &manifest::Manifest) -> Vec<String> {
+    let db = &m.db_id;
+    m.segments
+        .iter()
+        .map(|s| seg_key(db, &s.id))
+        .chain(m.levels.iter().map(|id| levels_key(db, id)))
+        .chain(m.obsolete.iter().map(|o| match o.kind {
+            manifest::ObjKind::Levels => levels_key(db, &o.id),
+            _ => seg_key(db, &o.id),
+        }))
+        .collect()
+}
+
 /// Background compaction keeps level 0 short and the levels well formed
 /// as flushes accumulate.
 #[test]
@@ -1334,6 +1389,7 @@ fn flushes_are_compacted_in_the_background() {
             put_many(&db, &format!("r{i:02}-"), 5, 500).await;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let m = &db.current().unwrap().m;
         m.check_levels().unwrap();
         assert!(m.compaction_seq > 0);
@@ -1343,10 +1399,9 @@ fn flushes_are_compacted_in_the_background() {
             assert!(m.level_bytes(l) <= targets[l as usize], "level {l} over its target (base {base})");
         }
         // One compaction at a time: none was planned twice and discarded.
-        let known: Vec<&str> =
-            m.segments.iter().map(|s| s.id.as_str()).chain(m.obsolete.iter().map(|o| o.id.as_str())).collect();
+        let known = known_objects(m);
         for k in store.mem.keys().iter().filter(|k| k.contains("/seg/")) {
-            assert!(known.iter().any(|id| k.ends_with(id)), "orphaned segment {k}");
+            assert!(known.contains(k), "orphaned object {k}");
         }
     });
 }
@@ -1445,7 +1500,7 @@ fn stored_segment(store: &MemStore, id: char, level: u8, entries: &[Entry]) -> m
     let (data, s) = segment::build(entries, 512, segment::Compression::Zstd(1));
     let id = id.to_string().repeat(32);
     store.put_sync(&seg_key("d", &id), data, &PutMode::Overwrite).unwrap();
-    compaction::seg_meta(id, level, &s)
+    compaction::seg_meta(id, level, &s, 0)
 }
 
 /// A merge drops old tombstones unless a deeper level may still hold an
@@ -1467,10 +1522,9 @@ fn merges_purge_only_tombstones_nothing_needs() {
             let k = seg_key("d", &segs[0].id);
             segment::read_all(&store.get_sync(&k, &GetOpts::default()).unwrap().data).unwrap()
         };
-        let plan = |inputs: Vec<manifest::SegmentMeta>, output_level| compaction::Plan {
+        let plan = |inputs: Vec<manifest::SegmentMeta>, level| compaction::Plan {
             inputs,
-            output_level,
-            trivial: false,
+            kind: compaction::Kind::Merge { level },
         };
         let out = compaction::run(&eng.shared, &m, &plan(vec![newer.clone(), older.clone()], 6), 6).await.unwrap();
         assert_eq!(out.purged_max_seq, 5);
@@ -1553,7 +1607,7 @@ fn long_scans_read_ahead() {
         assert!(seg.size > 8 * cfg.bulk_read_bytes, "setup: a {}-byte segment", seg.size);
         let mut m = manifest::Manifest::new("d", 0);
         m.segments = vec![seg.clone()];
-        let v = Version { m, etag: String::new(), shared: eng.shared.clone() };
+        let v = Version::new(m, String::new(), eng.shared.clone());
         let gets = || store.seg_get_bytes.lock().unwrap().len();
         v.scan(&KeyRange::all(), false, 3, false).await.unwrap();
         let short = gets();
@@ -1563,7 +1617,7 @@ fn long_scans_read_ahead() {
         assert!(last_read <= largest_block as usize, "a short scan read {last_read} bytes ahead");
         // Reverse scans read block by block, cold or not.
         let cold = second_node(&eng, &store, "b");
-        let v2 = Version { m: v.m.clone(), etag: String::new(), shared: cold.shared.clone() };
+        let v2 = Version::new(v.m.clone(), String::new(), cold.shared.clone());
         let back: Vec<Entry> = v2.scan(&KeyRange::all(), true, usize::MAX, false).await.unwrap();
         assert!(back.iter().rev().eq(entries.iter()), "a cold reverse scan");
         let before = gets();
@@ -1665,7 +1719,7 @@ fn bulk_reads_take_whole_blocks() {
             let seg = stored_segment(&store.mem, 'a', 6, &entries);
             let mut m = manifest::Manifest::new("d", 0);
             m.segments = vec![seg];
-            let v = Version { m, etag: String::new(), shared: eng.shared.clone() };
+            let v = Version::new(m, String::new(), eng.shared.clone());
             let idx = eng.shared.seg_index("d", &v.m.segments[0]).await.unwrap();
             let largest = idx.blocks.iter().map(|b| b.2 as u64).max().unwrap();
             assert!(window == 1 || window >= 2 * largest, "setup: blocks of up to {largest} bytes");
@@ -1703,6 +1757,7 @@ fn lookups_consult_one_segment_per_level() {
         max_key: Bytes::copy_from_slice(max.as_bytes()),
         min_seq: 0,
         max_seq: 0,
+        deletes_applied: 0,
     };
     let mut m = manifest::Manifest::new("d", 0);
     m.segments = vec![
@@ -1713,7 +1768,7 @@ fn lookups_consult_one_segment_per_level() {
         seg('e', 6, "a", "k"),
         seg('f', 6, "l", "z"),
     ];
-    let v = Version { m, etag: String::new(), shared: eng.shared.clone() };
+    let v = Version::new(m, String::new(), eng.shared.clone());
     for (key, want) in [("b", 3), ("n", 4), ("h", 3), ("q", 2), ("0", 0)] {
         assert_eq!(v.segments_for_key(key.as_bytes()), want, "{key}");
     }
@@ -1730,7 +1785,7 @@ fn changes_are_entries_newer_than_the_snapshot() {
         let mut m = manifest::Manifest::new("d", 0);
         m.segments = vec![seg];
         m.tail = vec![e("b", 5)];
-        let v = Version { m, etag: String::new(), shared: eng.shared.clone() };
+        let v = Version::new(m, String::new(), eng.shared.clone());
         let range =
             |a: &str, b: &str| KeyRange::half_open(Bytes::from(a.to_string()), Some(Bytes::from(b.to_string())));
         for (r, after, changed) in [
@@ -1760,10 +1815,9 @@ fn one_compaction_at_a_time() {
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
         let m = db.current().unwrap().m.clone();
-        let known: Vec<&str> =
-            m.segments.iter().map(|s| s.id.as_str()).chain(m.obsolete.iter().map(|o| o.id.as_str())).collect();
+        let known = known_objects(&m);
         for k in store.mem.keys().iter().filter(|k| k.contains("/seg/")) {
-            assert!(known.iter().any(|id| k.ends_with(id)), "orphaned segment {k}: a compaction was discarded");
+            assert!(known.contains(k), "orphaned object {k}: a compaction was discarded");
         }
     });
 }
@@ -1813,7 +1867,7 @@ fn compaction_output_is_split_into_bounded_segments() {
         let input = stored_segment(&store, 'a', 0, &entries);
         let mut m = manifest::Manifest::new("d", 0);
         m.segments = vec![input.clone()];
-        let plan = compaction::Plan { inputs: vec![input], output_level: 6, trivial: false };
+        let plan = compaction::Plan { inputs: vec![input], kind: compaction::Kind::Merge { level: 6 } };
         let out = compaction::run(&eng.shared, &m, &plan, 0).await.unwrap();
         assert!(out.segments.len() >= 3, "{} segments", out.segments.len());
         for s in &out.segments {
@@ -1821,7 +1875,7 @@ fn compaction_output_is_split_into_bounded_segments() {
         }
         m.segments = out.segments;
         m.check_levels().unwrap();
-        let v = Version { m, etag: String::new(), shared: eng.shared.clone() };
+        let v = Version::new(m, String::new(), eng.shared.clone());
         assert_eq!(v.all_entries(true).await.unwrap(), entries);
         for e in &entries {
             assert_eq!(v.get_entry(&e.key).await.unwrap().as_ref(), Some(e));

@@ -31,6 +31,12 @@
           "name": {
             "type": "string"
           },
+          "rate_limit": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "read_only": {
             "type": "boolean"
           }
@@ -191,6 +197,7 @@
       },
       "CreateApiKey": {
         "additionalProperties": false,
+        "description": "`rate_limit`: requests per second this key may make on each node (default: the node's per-key limit).",
         "properties": {
           "db": {
             "type": [
@@ -200,6 +207,14 @@
           },
           "name": {
             "type": "string"
+          },
+          "rate_limit": {
+            "maximum": 1000000,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "read_only": {
             "type": "boolean"
@@ -283,6 +298,12 @@
                   "null"
                 ]
               },
+              "quota_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "segment_bytes": {
                 "type": [
                   "integer",
@@ -290,6 +311,12 @@
                 ]
               },
               "segments": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "size_bytes": {
                 "type": [
                   "integer",
                   "null"
@@ -378,6 +405,8 @@
                   "already_exists",
                   "precondition_failed",
                   "too_large",
+                  "quota_exceeded",
+                  "rate_limited",
                   "unavailable",
                   "internal"
                 ],
@@ -398,6 +427,9 @@
                       "not_applied"
                     ],
                     "type": "string"
+                  },
+                  "retry_after_ms": {
+                    "type": "integer"
                   }
                 },
                 "required": [],
@@ -562,6 +594,12 @@
               },
               "id": {
                 "type": "string"
+              },
+              "rate_limit": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
               },
               "read_only": {
                 "type": "boolean"
@@ -1329,7 +1367,7 @@
     }
   },
   "info": {
-    "description": "Transactional key-value and table databases on object storage. Authenticate with `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for writes).",
+    "description": "Transactional key-value and table databases on object storage. Authenticate with `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for writes). Requests over a rate limit get 429 `rate_limited` with `Retry-After` and were not applied; writes that would take a database past its size quota get 507 `quota_exceeded`.",
     "title": "Baserunna",
     "version": "0.1.0"
   },
@@ -1337,6 +1375,7 @@
   "paths": {
     "/healthz": {
       "get": {
+        "description": "503 once the node is shutting down, so load balancers stop sending it requests.",
         "responses": {
           "200": {
             "content": {
@@ -1358,6 +1397,27 @@
               }
             },
             "description": "OK"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "draining": {
+                      "type": "boolean"
+                    },
+                    "ok": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "ok"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Draining before shutdown"
           },
           "default": {
             "$ref": "#/components/responses/Error"

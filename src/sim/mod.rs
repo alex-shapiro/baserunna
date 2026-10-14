@@ -151,6 +151,8 @@ impl SimConfig {
             clock_sync_interval_ms: 30_000,
             clock_sync_max_age_ms: 120_000,
             clock_sync_max_error_ms: 100,
+            levels_inline_max: 1,
+            version_sample_ms: 5_000,
             ..EngineConfig::small_for_tests()
         };
         SimConfig {
@@ -173,6 +175,20 @@ impl SimConfig {
                 json_value_max: 4096,
                 index_backfill_batch_rows: 8,
                 signup: SignupPolicy::Open,
+                // Rate limits calibrated for simulation workloads.
+                limits: crate::limits::LimitConfig {
+                    user: crate::limits::Rate::per_sec(400.0),
+                    api_key: crate::limits::Rate::per_sec(200.0),
+                    auth_per_client: crate::limits::Rate { per_sec: 20.0, burst: 40.0 },
+                    signup_per_client: crate::limits::Rate::per_hour(3_600.0, 20.0),
+                    account_free_failures: 5,
+                    client_free_failures: 20,
+                    failure_backoff_ms: 500,
+                    failure_backoff_max_ms: 10_000,
+                    hash_concurrency: 2,
+                    hash_wait_ms: 5_000,
+                    trusted_proxy_hops: 1,
+                },
                 engine: engine.clone(),
                 ..NodeConfig::default()
             },
@@ -265,6 +281,8 @@ pub struct Sim {
     base_ms: u64,
     starts: AtomicU64,
     pub crashes: AtomicU64,
+    /// Accumulated storage engine activity from terminated nodes.
+    past_activity: Mutex<crate::engine::Activity>,
     me: Weak<Sim>,
 }
 
@@ -456,6 +474,7 @@ impl Sim {
             base_ms,
             starts: AtomicU64::new(0),
             crashes: AtomicU64::new(0),
+            past_activity: Mutex::new(Default::default()),
             cfg,
             me: me.clone(),
         });
@@ -548,7 +567,23 @@ impl Sim {
             self.crashes.fetch_add(1, Ordering::SeqCst);
             self.trace.event(&format!("crash n{i} ({})", n.node.id));
             n.node.env.shutdown();
+            self.retire_activity(&n);
         }
+    }
+
+    fn retire_activity(&self, n: &SimNode) {
+        self.past_activity.lock().unwrap_or_else(|e| e.into_inner()).add(&n.node.engine.shared.counters.get());
+    }
+
+    /// Returns total storage engine activity across all running and terminated nodes.
+    pub fn engine_activity(&self) -> crate::engine::Activity {
+        let mut a = *self.past_activity.lock().unwrap_or_else(|e| e.into_inner());
+        for i in self.up_nodes() {
+            if let Some(n) = self.node(i) {
+                a.add(&n.node.engine.shared.counters.get());
+            }
+        }
+        a
     }
 
     pub async fn restart(&self, i: usize) {
@@ -647,8 +682,10 @@ impl Sim {
 
     pub fn shutdown_all(&self) {
         for i in 0..self.slots.len() {
-            if let Some(n) = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let n = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(n) = n {
                 n.node.env.shutdown();
+                self.retire_activity(&n);
             }
         }
     }
@@ -670,6 +707,7 @@ pub struct SimOutcome {
     pub injected_faults: u64,
     pub crashes: u64,
     pub storage: StorageReport,
+    pub engine: crate::engine::Activity,
     /// Last trace lines (when `keep_log`).
     pub trace_tail: Vec<String>,
 }
@@ -724,6 +762,7 @@ where
         }
         let virtual_ms = start.elapsed().as_millis() as u64;
         sim.shutdown_all();
+        let engine = sim.engine_activity();
         let dump = sim.trace.dump();
         let keep = if full_trace { dump.len() } else { 400 };
         let trace_tail = dump[dump.len().saturating_sub(keep)..].to_vec();
@@ -740,6 +779,7 @@ where
             injected_faults: sim.store.stats.injected_failures.load(Ordering::Relaxed),
             crashes: sim.crashes.load(Ordering::Relaxed),
             storage,
+            engine,
             trace_tail,
         }
     });
@@ -767,14 +807,15 @@ where
         let out = run(seed, cfg(), &f);
         if std::env::var("SIM_VERBOSE").is_ok() {
             eprintln!(
-                "{name} seed={seed} ok={} events={} virtual={}s store_ops={} faults={} crashes={} storage={:?}",
+                "{name} seed={seed} ok={} events={} virtual={}s store_ops={} faults={} crashes={} storage={:?} engine={:?}",
                 out.result.is_ok(),
                 out.events,
                 out.virtual_ms / 1000,
                 out.store_ops,
                 out.injected_faults,
                 out.crashes,
-                out.storage
+                out.storage,
+                out.engine
             );
         }
         if let Err(e) = out.result {

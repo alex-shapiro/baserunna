@@ -44,6 +44,8 @@ pub async fn start(store: DynStore, name: &str, signup: SignupPolicy) -> Server 
         signup,
         // Fast hashing for demos; production uses 600k iterations.
         pbkdf2_iterations: 10_000,
+        // Disable rate limiting for demo workloads.
+        limits: baserunna::limits::LimitConfig::unlimited(),
         heartbeat_ms: 5_000,
         members_refresh_ms: 1_000,
         ..NodeConfig::default()
@@ -52,6 +54,7 @@ pub async fn start(store: DynStore, name: &str, signup: SignupPolicy) -> Server 
         Node::start(cfg, Arc::new(Env::real()), store, Arc::new(HttpTransport::new()), None).await.expect("node start");
     let app = baserunna::api::router(node.clone());
     let task = tokio::spawn(async move {
+        let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
         let _ = axum::serve(listener, app).await;
     });
     Server { url, node, task }

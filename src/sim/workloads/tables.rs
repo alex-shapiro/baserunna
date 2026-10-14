@@ -264,5 +264,56 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
     if got != want {
         return Err(format!("final rows differ:\n got {got:?}\nwant {want:?}"));
     }
-    Ok(())
+    drop_a_large_table(&sim, &c, base, &db_id).await
+}
+
+/// Tests large table and index drops that trigger range tombstones.
+async fn drop_a_large_table(sim: &Arc<Sim>, c: &Client, base: &str, db_id: &str) -> Result<(), String> {
+    let t = format!("{base}/tables/archive");
+    let create = json!({
+        "name": "archive", "if_not_exists": true,
+        "columns": [
+            {"name": "id", "type": "int", "nullable": false},
+            {"name": "tag", "type": "string", "nullable": false}
+        ],
+        "primary_key": ["id"],
+        "indexes": [{"name": "by_tag", "columns": ["tag"]}]
+    });
+    let r = c.call_settled("POST", &format!("{base}/tables"), Some(create.clone())).await;
+    if r.status != 201 {
+        return Err(format!("create archive: {} {}", r.status, r.json));
+    }
+    for b in 0..4 {
+        let rows: Vec<Json> = (0..40).map(|i| json!({"id": b * 40 + i, "tag": format!("tag-{}", i % 7)})).collect();
+        let r = c.call_settled("POST", &format!("{t}/rows"), Some(json!({"rows": rows, "upsert": true}))).await;
+        if r.status != 200 {
+            return Err(format!("fill archive: {} {}", r.status, r.json));
+        }
+    }
+    let count = |r: &super::super::client::Resp| r.json["rows"].as_array().map_or(0, |a| a.len());
+    let r = c.call_settled("POST", &format!("{t}/rows/query"), Some(json!({"limit": 1000}))).await;
+    if count(&r) != 160 {
+        return Err(format!("archive holds {} rows, want 160", count(&r)));
+    }
+    for path in [format!("{t}/indexes/by_tag"), t.clone()] {
+        let r = c.call_settled("DELETE", &path, None).await;
+        // Ignore 404 if a previous attempt dropped it under fault injection.
+        if r.status != 200 && r.status != 404 {
+            return Err(format!("DELETE {path}: {} {}", r.status, r.json));
+        }
+        check_all_indexes(sim, db_id).await?;
+    }
+    let r = c.call_settled("GET", &t, None).await;
+    if r.status != 404 {
+        return Err(format!("dropped table still there: {} {}", r.status, r.json));
+    }
+    let r = c.call_settled("POST", &format!("{base}/tables"), Some(create)).await;
+    if r.status != 201 {
+        return Err(format!("recreate archive: {} {}", r.status, r.json));
+    }
+    let r = c.call_settled("POST", &format!("{t}/rows/query"), Some(json!({"index": "by_tag", "limit": 1000}))).await;
+    if r.status != 200 || count(&r) != 0 {
+        return Err(format!("recreated table not empty: {} {}", r.status, r.json));
+    }
+    check_all_indexes(sim, db_id).await
 }

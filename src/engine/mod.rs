@@ -9,6 +9,7 @@ mod config;
 pub mod db;
 pub mod local;
 pub mod manifest;
+pub mod range_delete;
 pub mod segment;
 pub mod txn;
 pub mod types;
@@ -17,6 +18,7 @@ pub mod version;
 use crate::env::Env;
 use crate::store::{DynStore, Retry};
 use crate::util::DetHashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -26,6 +28,64 @@ pub use db::{Committed, Consistency, Db};
 pub use txn::{CommitRequest, Isolation, ReadItem, ReadValue, Txn};
 pub use types::{BlobRef, Entry, Seq, Value};
 pub use version::{KeyRange, Version};
+
+/// Cumulative storage engine activity metrics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Activity {
+    pub range_tombstones_written: u64,
+    pub range_tombstones_retired: u64,
+    /// Segments dropped entirely because all entries were covered by range tombstones.
+    pub segments_dropped: u64,
+    /// Segments rewritten during compaction to purge range-deleted entries.
+    pub segments_rewritten: u64,
+    pub levels_objects_written: u64,
+    pub quota_refusals: u64,
+}
+
+impl Activity {
+    pub fn add(&mut self, o: &Activity) {
+        self.range_tombstones_written += o.range_tombstones_written;
+        self.range_tombstones_retired += o.range_tombstones_retired;
+        self.segments_dropped += o.segments_dropped;
+        self.segments_rewritten += o.segments_rewritten;
+        self.levels_objects_written += o.levels_objects_written;
+        self.quota_refusals += o.quota_refusals;
+    }
+}
+
+/// Thread-safe counters for tracking [`Activity`] metrics.
+#[derive(Default)]
+pub struct Counters([AtomicU64; 6]);
+
+impl Counters {
+    pub fn add(&self, a: &Activity) {
+        let deltas = [
+            a.range_tombstones_written,
+            a.range_tombstones_retired,
+            a.segments_dropped,
+            a.segments_rewritten,
+            a.levels_objects_written,
+            a.quota_refusals,
+        ];
+        for (c, d) in self.0.iter().zip(deltas) {
+            if d > 0 {
+                c.fetch_add(d, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn get(&self) -> Activity {
+        let v: Vec<u64> = self.0.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        Activity {
+            range_tombstones_written: v[0],
+            range_tombstones_retired: v[1],
+            segments_dropped: v[2],
+            segments_rewritten: v[3],
+            levels_objects_written: v[4],
+            quota_refusals: v[5],
+        }
+    }
+}
 
 /// State shared by every database handle on a node.
 pub struct Shared {
@@ -44,9 +104,16 @@ pub struct Shared {
     /// the lifetime of database handles, so a lease is never mistaken for a
     /// new one.
     pub(crate) lease_sightings: Mutex<DetHashMap<String, (String, u64, tokio::time::Instant)>>,
+    /// Databases exempt from size quota limits.
+    quota_exempt: Mutex<std::collections::BTreeSet<String>>,
+    pub counters: Counters,
 }
 
 impl Shared {
+    pub(crate) fn quota_exempt(&self, db: &str) -> bool {
+        self.quota_exempt.lock().unwrap_or_else(|e| e.into_inner()).contains(db)
+    }
+
     /// The store's current time, if this node measured its offset from the
     /// store recently enough for garbage collection to rely on it.
     pub fn store_now_ms(&self) -> Option<u64> {
@@ -113,6 +180,13 @@ pub fn seg_key(db: &str, seg: &str) -> String {
     format!("dbs/{db}/seg/{seg}")
 }
 
+/// Returns the storage key for an external levels object.
+pub fn levels_key(db: &str, id: &str) -> String {
+    format!("dbs/{db}/seg/{id}{LEVELS_SUFFIX}")
+}
+
+pub const LEVELS_SUFFIX: &str = ".levels";
+
 pub fn blob_prefix(db: &str, blob: &str) -> String {
     format!("dbs/{db}/blob/{blob}/")
 }
@@ -150,12 +224,19 @@ impl Engine {
             retry: Retry::default(),
             clock: clock::StoreClock::new(),
             lease_sightings: Mutex::new(DetHashMap::default()),
+            quota_exempt: Mutex::new(Default::default()),
+            counters: Counters::default(),
         });
         Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) })
     }
 
     pub fn env(&self) -> &Arc<Env> {
         &self.shared.env
+    }
+
+    /// Exempts a database from size quota enforcement.
+    pub fn exempt_from_quota(&self, id: &str) {
+        self.shared.quota_exempt.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string());
     }
 
     /// Handle for a database (not loaded until first use).
@@ -206,5 +287,7 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
+mod range_tests;
 #[cfg(test)]
 pub(crate) mod tests;

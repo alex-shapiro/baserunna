@@ -121,6 +121,11 @@ fn gen_key(r: &mut Rng, space: &str) -> Key {
     k
 }
 
+/// Generates keys in the `d/` keyspace to exercise range tombstones on prefix deletion.
+fn bulk_key(r: &mut Rng) -> Key {
+    format!("d/{}{:02}", ["p", "q", "r"][r.usize(3)], r.usize(80)).into_bytes()
+}
+
 fn gen_value(r: &mut Rng) -> Vec<u8> {
     let n = match r.below(20) {
         0 => 600 + r.usize(800),
@@ -209,9 +214,12 @@ impl KvModel {
                 break;
             }
             let ctx = format!("step {} op {i}", self.step);
-            match self.rng.below(9) {
+            match self.rng.below(11) {
                 0 | 1 => {
-                    let k = pick_key(&mut self.rng, &["a", "b", "c"]);
+                    let k = match self.rng.chance(0.3) {
+                        true => bulk_key(&mut self.rng),
+                        false => pick_key(&mut self.rng, &["a", "b", "c"]),
+                    };
                     ops.push(json!({"op": "get", "key": s(&k)}));
                     let want = sim.get(&k);
                     expect.push(Box::new(move |g| {
@@ -243,7 +251,7 @@ impl KvModel {
                     expect.push(Box::new(|_| Ok(())));
                 }
                 5 => {
-                    let p = ["a/x", "b/", "c/", "a/", "b/y"][self.rng.usize(5)];
+                    let p = ["a/x", "b/", "c/", "a/", "b/y", "d/", "d/q"][self.rng.usize(7)];
                     let reverse = self.rng.chance(0.3);
                     let limit = 1 + self.rng.usize(5);
                     ops.push(json!({"op": "scan", "prefix": p, "limit": limit, "reverse": reverse}));
@@ -273,6 +281,23 @@ impl KvModel {
                 }
                 6 => {
                     let p = ["a/x", "b/", "c/z", "a/y"][self.rng.usize(4)];
+                    ops.push(json!({"op": "delete_range", "prefix": p}));
+                    sim.delete_range(prefix_range(p.as_bytes()));
+                    expect.push(Box::new(|_| Ok(())));
+                }
+                9 => {
+                    let n = 5 + self.rng.usize(40);
+                    for _ in 0..n {
+                        let k = bulk_key(&mut self.rng);
+                        let v: Vec<u8> =
+                            (0..40 + self.rng.usize(160)).map(|_| b'a' + self.rng.below(26) as u8).collect();
+                        ops.push(json!({"op": "put", "key": s(&k), "value": s(&v)}));
+                        sim.put(k, v);
+                        expect.push(Box::new(|_| Ok(())));
+                    }
+                }
+                10 => {
+                    let p = ["d/", "d/p", "d/q", "d/r", "d/q1"][self.rng.usize(5)];
                     ops.push(json!({"op": "delete_range", "prefix": p}));
                     sim.delete_range(prefix_range(p.as_bytes()));
                     expect.push(Box::new(|_| Ok(())));
@@ -314,7 +339,7 @@ impl KvModel {
                     };
                     ops.push(op);
                     if !holds {
-                        fail_at = Some(i);
+                        fail_at = Some(ops.len() - 1);
                     }
                     expect.push(Box::new(|_| Ok(())));
                 }
@@ -386,6 +411,8 @@ impl KvModel {
                     // idempotency key (409 = OCC conflict with a zombie).
                     self.c.pause(100).await;
                 }
+                // Rejected due to storage quota; unapplied write. Deletions are never rejected.
+                507 if sim.writes.values().any(|w| w.is_some()) => return Ok(()),
                 _ => return Err(format!("step {}: unexpected response {} {}", self.step, r.status, r.json)),
             }
         }
@@ -444,7 +471,7 @@ impl KvModel {
         let r = self.c.call("POST", &self.path(&format!("/transactions/{id}/commit")), Some(json!({}))).await;
         let committed_version = match r {
             Ok(r) if r.status == 200 => Some(r.json["version"].as_u64().ok_or("no version")?),
-            Ok(r) if r.status == 404 || r.retryable_not_applied() => None,
+            Ok(r) if r.status == 404 || r.status == 507 || r.retryable_not_applied() => None,
             Ok(r) if r.status == 409 => return Err(format!("single-client interactive txn conflicted: {}", r.json)),
             Ok(r) if !r.outcome_unknown() && r.status != 503 => return Err(format!("commit: {} {}", r.status, r.json)),
             _ => {
@@ -507,6 +534,7 @@ impl KvModel {
                             }
                             return Ok(());
                         }
+                        Ok(r) if r.status == 507 => return Ok(()),
                         Ok(r) if r.status == 503 && !String::from_utf8_lossy(&r.body).contains("\"unknown\"") => {
                             continue;
                         }
@@ -604,9 +632,17 @@ impl KvModel {
         }
     }
 
-    /// Paginated full scan through the GET /kv endpoint, compared with the
-    /// model.
+    /// Runs a paginated full scan against the model and validates storage quota bounds.
     pub async fn full_check(&mut self) -> Result<(), String> {
+        let info = self.c.call_retry("GET", &self.path(""), None).await;
+        if let (Some(size), Some(quota)) =
+            (info.json["stats"]["size_bytes"].as_u64(), info.json["stats"]["quota_bytes"].as_u64())
+        {
+            // Allow headroom for segment formatting and compaction overhead beyond the raw quota.
+            if size > quota + quota / 4 + 8 * 1024 {
+                return Err(format!("step {}: {size} bytes stored with a quota of {quota}", self.step));
+            }
+        }
         let mut got: BTreeMap<Key, (Json, u64)> = BTreeMap::new();
         let mut cursor: Option<String> = None;
         loop {
@@ -699,8 +735,18 @@ pub async fn run(sim: Arc<Sim>, clients: usize, steps: usize, chaos: bool) -> Re
         return Err(e);
     }
     super::recover(&sim).await;
-    for mut w in models {
+    for w in &mut models {
         w.full_check().await?;
+    }
+    // Wait for transaction horizons to expire so range tombstones retire during subsequent writes.
+    for _ in 0..2 {
+        sim.sleep(sim.cfg.engine.txn_max_lifetime_ms + sim.cfg.engine.version_sample_ms).await;
+        for w in &mut models {
+            for _ in 0..10 {
+                w.step().await?;
+            }
+            w.full_check().await?;
+        }
     }
     Ok(())
 }

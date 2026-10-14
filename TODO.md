@@ -18,20 +18,13 @@ the design context for several of these.
 - [ ] **Test Google sign-in against real Google.** Only `FakeGoogle` has
       exercised it. Also add an OIDC `nonce` and PKCE (`code_verifier`) to
       the authorization-code flow. Today only `state` is used.
-- [ ] **Rate-limit login and signup.** Add per-IP and per-account
-      throttling, with backoff after failed attempts. PBKDF2 at 600k
-      iterations also makes login a CPU DoS vector, so put a bounded
-      semaphore around password hashing.
-- [ ] **Per-database size quotas.** Count bytes per DB (segments plus
-      blobs) and enforce a limit at commit and blob upload. Today only
-      `max_dbs_per_user`, `blob_max` and `txn_max_write_bytes` are
-      enforced.
-- [ ] **Per-user and per-key request rate limits** (SPEC §16).
 - [ ] **Metrics.** Add a Prometheus-style `/metrics` endpoint: object-store
       requests, bytes and errors by operation; commit latency and batch
       size; CAS conflicts; lease acquisitions and steals; cache hit rate;
-      open DB handles; compaction and GC activity; forwarded requests.
-      Cost is a primary goal, so object-store request counts matter most.
+      open DB handles; compaction and GC activity; forwarded requests; rate
+      limit refusals. Cost is a primary goal, so object-store request counts
+      matter most. `engine::Activity` already counts range tombstones,
+      segment drops and rewrites, levels objects and quota refusals.
 - [ ] **Structured logging and request IDs.** Propagate a request ID
       across forwarded hops, and log in a JSON format.
 - [ ] **Account self-service.** `MetaCmd::SetPassword` exists, but no API
@@ -39,22 +32,14 @@ the design context for several of these.
       session listing and revocation, and an admin "re-enable user" in the
       console. Optionally add email verification and password reset, which
       need an outbound email dependency.
-- [ ] **Graceful shutdown on SIGTERM.** `main.rs` releases leases only on
-      Ctrl-C (SIGINT). Container orchestrators send SIGTERM.
-- [ ] **Deployment docs.** Cover TLS termination, load-balancer setup, a
-      Dockerfile, the required bucket permissions, and recommended bucket
-      lifecycle rules (for example, aborting incomplete multipart uploads).
 
 ## Storage engine
 
-- [ ] **Range tombstones.** `delete_range`, and dropping a table or an
-      index, expand to one tombstone per live key, built in the committing
-      node's memory and the manifest tail (SPEC §15). Store deleted ranges
-      instead, so dropping a large table costs one entry.
-- [ ] **Smaller manifests for large databases.** Every commit rewrites the
-      segment list, about 100 bytes per 2 MiB segment (25 KB at 500 MB).
-      Keep the deeper levels' lists in immutable objects that the manifest
-      references, rewritten only by compactions.
+- [ ] **Smaller commit rings.** Every manifest carries the ids of the last
+      1024 commits (`recent_commits`), about 20 KB once full: more than the
+      rest of a typical manifest, rewritten by every commit. Shorter ids
+      (64 bits keep collisions negligible at this size), or older entries
+      in immutable objects like the levels objects, would shrink it.
 
 ## Features
 

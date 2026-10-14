@@ -146,11 +146,12 @@ fn schemas() -> Value {
             "error": obj(json!({
                 "code": enum_of(&["invalid_argument", "unauthenticated", "permission_denied", "not_found",
                     "txn_not_found", "conflict", "already_exists", "precondition_failed", "too_large",
-                    "unavailable", "internal"]),
+                    "quota_exceeded", "rate_limited", "unavailable", "internal"]),
                 "message": s(),
                 "retryable": b(),
                 "details": obj(json!({
                     "op_index": i(),
+                    "retry_after_ms": i(),
                     "lease_holder": s(),
                     "outcome": enum_of(&["unknown", "not_applied"]),
                 }), &[]),
@@ -166,11 +167,18 @@ fn schemas() -> Value {
             "user": r("UserPublic"),
             "credential": obj(json!({
                 "type": enum_of(&["session", "api_key"]), "id": s(), "db": nullable("string"), "read_only": b(),
+                "rate_limit": nullable("integer"),
             }), &["type"]),
         }), &["user", "credential"]),
-        "ApiKey": obj(json!({"id": s(), "name": s(), "db": nullable("string"), "read_only": b(), "created_at": i()}),
-            &["id", "name", "db", "read_only", "created_at"]),
-        "CreateApiKey": obj(json!({"name": s(), "db": nullable("string"), "read_only": b()}), &["name"]),
+        "ApiKey": obj(json!({
+            "id": s(), "name": s(), "db": nullable("string"), "read_only": b(), "rate_limit": nullable("integer"),
+            "created_at": i(),
+        }), &["id", "name", "db", "read_only", "created_at"]),
+        "CreateApiKey": obj_desc(json!({
+            "name": s(), "db": nullable("string"), "read_only": b(),
+            "rate_limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 1_000_000},
+        }), &["name"], "`rate_limit`: requests per second this key may make on each node (default: the \
+            node's per-key limit)."),
         "Node": obj(json!({"id": s(), "addr": s(), "started_at": i(), "heartbeat_at": i(), "live": b()}),
             &["id", "addr", "started_at", "heartbeat_at", "live"]),
         "DbSummary": obj(json!({"id": s(), "name": s(), "created_at": i()}), &["id", "name", "created_at"]),
@@ -179,6 +187,7 @@ fn schemas() -> Value {
             "stats": obj(json!({
                 "version": i(), "segments": nullable("integer"), "segment_bytes": nullable("integer"),
                 "tail_bytes": nullable("integer"), "lease_holder": nullable("string"),
+                "size_bytes": nullable("integer"), "quota_bytes": nullable("integer"),
             }), &["version"]),
         }), &["id", "name", "created_at", "stats"]),
         "BlobMeta": obj_desc(json!({"blob_id": s(), "size": i(), "sha256": s(), "content_type": s()}),
@@ -293,16 +302,26 @@ fn paths() -> Value {
         "get",
         Op {
             public: true,
+            desc: Some("503 once the node is shutting down, so load balancers stop sending it requests."),
             ..op(
                 "Liveness and node status",
                 "ops",
-                vec![(
-                    "200",
-                    resp(
-                        "OK",
-                        json!({"type": "object", "properties": {"ok": b(), "node": {"type": "object"}}, "required": ["ok"]}),
+                vec![
+                    (
+                        "200",
+                        resp(
+                            "OK",
+                            json!({"type": "object", "properties": {"ok": b(), "node": {"type": "object"}}, "required": ["ok"]}),
+                        ),
                     ),
-                )],
+                    (
+                        "503",
+                        resp(
+                            "Draining before shutdown",
+                            json!({"type": "object", "properties": {"ok": b(), "draining": b()}, "required": ["ok"]}),
+                        ),
+                    ),
+                ],
             )
         },
     );
@@ -771,7 +790,8 @@ pub fn document() -> &'static Value {
                 "description": "Transactional key-value and table databases on object storage. Authenticate with \
                     `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the \
                     Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for \
-                    writes).",
+                    writes). Requests over a rate limit get 429 `rate_limited` with `Retry-After` and were not \
+                    applied; writes that would take a database past its size quota get 507 `quota_exceeded`.",
             },
             "servers": [{"url": "/"}],
             "security": [{"bearer": []}],

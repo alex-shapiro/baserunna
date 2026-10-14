@@ -126,6 +126,8 @@ async fn get_db(State(_node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>
             "segment_bytes": st.as_ref().map(|s| s.segment_bytes),
             "tail_bytes": st.as_ref().map(|s| s.tail_bytes),
             "lease_holder": st.as_ref().and_then(|s| s.lease_holder.clone()),
+            "size_bytes": st.as_ref().map(|s| s.size_bytes),
+            "quota_bytes": st.as_ref().and_then(|s| s.quota_bytes),
         }
     })))
 }

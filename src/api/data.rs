@@ -1,9 +1,12 @@
 //! Database-scoped routes: databases, KV, blobs, transactions and tables.
 
 use super::body::{BlobBody, Upload, parse_range, read_upload};
-use super::{Auth, DbCtx, JsonBody, Params, consistency_of, paging, percent_decode, with_read, with_txn};
+use super::{
+    Auth, DbCtx, Found, JsonBody, Params, Ran, consistency_of, naming_commit, paging, percent_decode, run_txn, watch,
+    with_read, with_txn,
+};
 use crate::engine::manifest::ObjKind;
-use crate::engine::{Change, ChangePos, Consistency, Isolation, Txn, Value, blob};
+use crate::engine::{Change, ChangePos, Committed, Consistency, Isolation, Txn, Value, blob};
 use crate::error::{Error, Result};
 use crate::meta::{self, DbRecord, DbRef, MetaCmd};
 use crate::node::{Node, OpenTxn};
@@ -52,9 +55,9 @@ pub fn routes() -> Router<Arc<Node>> {
         .route("/v1/dbs/{db}/tables/{t}/changes", get(row_changes))
 }
 
-type PathMap = Path<HashMap<String, String>>;
+pub(super) type PathMap = Path<HashMap<String, String>>;
 
-fn param<'a>(p: &'a HashMap<String, String>, k: &str) -> Result<&'a str> {
+pub(super) fn param<'a>(p: &'a HashMap<String, String>, k: &str) -> Result<&'a str> {
     p.get(k).map(|s| s.as_str()).ok_or_else(|| Error::invalid(format!("missing path parameter {k}")))
 }
 
@@ -189,7 +192,7 @@ async fn delete_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
     Ok(axum::Json(json!({})))
 }
 
-fn encoding_param(q: &Params) -> Result<Encoding> {
+pub(super) fn encoding_param(q: &Params) -> Result<Encoding> {
     match q.get("encoding").map(|s| s.as_str()) {
         None | Some("utf8") => Ok(Encoding::Utf8),
         Some("base64") => Ok(Encoding::Base64),
@@ -197,7 +200,7 @@ fn encoding_param(q: &Params) -> Result<Encoding> {
     }
 }
 
-fn bool_param(q: &Params, k: &str) -> Result<bool> {
+pub(super) fn bool_param(q: &Params, k: &str) -> Result<bool> {
     match q.get(k).map(|s| s.as_str()) {
         None | Some("false") | Some("0") => Ok(false),
         Some("true") | Some("1") | Some("") => Ok(true),
@@ -458,7 +461,7 @@ fn consistency_from(c: Option<&str>, staleness: Option<u64>) -> Result<Consisten
     consistency_of(&m)
 }
 
-fn commit_id_for_key(db_id: &str, key: &str) -> u64 {
+pub(super) fn commit_id_for_key(db_id: &str, key: &str) -> u64 {
     let mut d = Vec::with_capacity(db_id.len() + key.len() + 1);
     d.extend_from_slice(db_id.as_bytes());
     d.push(0);
@@ -469,7 +472,7 @@ fn commit_id_for_key(db_id: &str, key: &str) -> u64 {
     u64::from_be_bytes(a)
 }
 
-fn commit_hex(id: u64) -> String {
+pub(super) fn commit_hex(id: u64) -> String {
     format!("{id:016x}")
 }
 
@@ -482,80 +485,32 @@ async fn one_shot(
     if writes {
         ctx.require_write()?;
     }
-    if let Some(k) = &req.idempotency_key
-        && (k.is_empty() || k.len() > 200)
-    {
-        return Err(Error::invalid("idempotency_key must be 1-200 characters"));
-    }
-    let commit_id = match &req.idempotency_key {
-        Some(k) => commit_id_for_key(&ctx.rec.id, k),
-        None => node.env.random_u64(),
-    };
-    if req.idempotency_key.is_some()
-        && let Some(v) = ctx.db.commit_status(commit_id).await?
-    {
-        return Ok(axum::Json(json!({
-            "version": v, "committed": true, "replayed": true,
-            "commit_id": commit_hex(commit_id), "results": Json::Null,
-        })));
-    }
-    let deadline = ctx.deadline;
     let c = consistency_from(req.consistency.as_deref(), req.max_staleness_ms)?;
     if writes && c != Consistency::Strong {
         return Err(Error::invalid("transactions with writes must use strong consistency"));
     }
     let octx = op_ctx(&node, &ctx, req.encoding);
-    let mut attempt = 0;
-    loop {
-        let mut t = ctx.db.begin(req.isolation.into(), c).await?;
-        t.commit_id = commit_id;
-        let results = match exec_ops(&octx, &mut t, &req.ops).await {
-            Ok(r) => r,
-            // A retried idempotent request can fail a precondition if an earlier attempt already committed.
-            Err(e @ Error::PreconditionFailed { .. }) if req.idempotency_key.is_some() => {
-                if let Some(v) = ctx.db.commit_status_fenced(commit_id).await? {
-                    return Ok(axum::Json(json!({
-                        "version": v, "committed": true, "replayed": true,
-                        "commit_id": commit_hex(commit_id), "results": Json::Null,
-                    })));
-                }
-                return Err(e);
-            }
-            Err(e) => return Err(e),
-        };
-        if t.is_read_only() {
-            return Ok(axum::Json(json!({
-                "version": t.read_version(), "committed": false, "results": results,
-            })));
+    let key = req.idempotency_key.as_deref();
+    let (commit_id, ran) = run_txn!(node, ctx, req.isolation.into(), c, key, |t| exec_ops(&octx, t, &req.ops).await);
+    Ok(axum::Json(match ran {
+        Ran::Read { out, version } => json!({"version": version, "committed": false, "results": out}),
+        Ran::Committed { mut out, commit } => {
+            ops::fill_appends(&req.ops, &mut out, &commit.appends);
+            json!({
+                "version": commit.version, "committed": true, "commit_id": commit_hex(commit_id),
+                "results": out, "appends": first_seqs(&commit),
+            })
         }
-        let mut creq = t.into_request();
-        creq.deadline = Some(deadline);
-        match ctx.db.commit_detailed(creq).await {
-            Ok(c) if c.replayed => {
-                return Ok(axum::Json(json!({
-                    "version": c.version, "committed": true, "replayed": true,
-                    "commit_id": commit_hex(commit_id), "results": Json::Null,
-                })));
-            }
-            Ok(c) => {
-                return Ok(axum::Json(json!({
-                    "version": c.version, "committed": true, "commit_id": commit_hex(commit_id), "results": results,
-                })));
-            }
-            Err(Error::Conflict(_)) if attempt < node.cfg.txn_retries => {
-                attempt += 1;
-                tokio::time::sleep(Duration::from_millis(5 * (1 << attempt) + node.env.random_below(10))).await;
-            }
-            Err(Error::Unavailable { message, retry_after_ms, outcome_unknown: true }) => {
-                return Err(Error::Unavailable {
-                    message: format!("{message} (commit_id {})", commit_hex(commit_id)),
-                    retry_after_ms,
-                    outcome_unknown: true,
-                });
-            }
-            Err(e) => return Err(e),
-        }
-    }
+        Ran::Replayed(c) => json!({
+            "version": c.version, "committed": true, "replayed": true,
+            "commit_id": commit_hex(commit_id), "results": Json::Null, "appends": first_seqs(&c),
+        }),
+    }))
+}
+
+/// The first seq each of a commit's appends received.
+fn first_seqs(c: &Committed) -> Vec<u64> {
+    c.appends.iter().map(|a| a.first_seq).collect()
 }
 
 #[derive(Deserialize, Default)]
@@ -600,15 +555,9 @@ async fn begin_txn(
 }
 
 fn get_open(node: &Node, ctx: &DbCtx, id: &str) -> Result<Arc<tokio::sync::Mutex<OpenTxn>>> {
-    node.txns
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(id)
-        .cloned()
-        .ok_or(Error::TxnNotFound)
-        .inspect(|_| {
-            let _ = ctx;
-        })
+    node.txns.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned().ok_or(Error::TxnNotFound).inspect(|_| {
+        let _ = ctx;
+    })
 }
 
 fn remove_open(node: &Node, id: &str) {
@@ -672,15 +621,8 @@ async fn commit_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbC
     let cid = t.commit_id;
     let mut creq = t.into_request();
     creq.deadline = Some(ctx.deadline);
-    let v = ctx.db.commit(creq).await.map_err(|e| match e {
-        Error::Unavailable { message, retry_after_ms, outcome_unknown: true } => Error::Unavailable {
-            message: format!("{message} (commit_id {})", commit_hex(cid)),
-            retry_after_ms,
-            outcome_unknown: true,
-        },
-        other => other,
-    })?;
-    Ok(axum::Json(json!({"version": v, "commit_id": commit_hex(cid)})))
+    let c = ctx.db.commit_detailed(creq).await.map_err(|e| naming_commit(e, cid))?;
+    Ok(axum::Json(json!({"version": c.version, "commit_id": commit_hex(cid), "appends": first_seqs(&c)})))
 }
 
 async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
@@ -695,7 +637,7 @@ async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
     Ok(axum::Json(json!({})))
 }
 
-async fn commit_status(Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
+async fn commit_status(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
     let id = param(&p, "id")?;
     let cid = match id.strip_prefix("key:") {
         Some(k) => commit_id_for_key(&ctx.rec.id, k),
@@ -703,8 +645,14 @@ async fn commit_status(Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Re
         None => return Err(bad_commit_id()),
     };
     Ok(axum::Json(match ctx.db.commit_status_fenced(cid).await? {
-        Some(v) => json!({"status": "committed", "version": v, "commit_id": commit_hex(cid)}),
-        None => json!({"status": "not_committed", "commit_id": commit_hex(cid)}),
+        Some(c) => {
+            json!({"status": "committed", "version": c.version, "commit_id": commit_hex(cid), "appends": first_seqs(&c)})
+        }
+        None => json!({
+            "status": "not_committed",
+            "commit_id": commit_hex(cid),
+            "retention_ms": node.cfg.engine.commit_retention_ms,
+        }),
     }))
 }
 
@@ -734,26 +682,6 @@ fn feed_params(q: &Params) -> Result<(ChangePos, usize, Duration)> {
             .ok_or_else(|| Error::invalid(format!("wait_ms must be in 0..={WATCH_WAIT_MAX_MS}")))?,
     };
     Ok((after, limit, Duration::from_millis(wait)))
-}
-
-/// Repeatedly runs `$read` on a snapshot until it returns changes or `$wait` elapses.
-macro_rules! watch {
-    ($node:expr, $db:expr, $c:expr, $wait:expr, |$t:ident| $read:expr) => {{
-        let until_ = Instant::now() + $wait;
-        loop {
-            let (out_, v_) = with_read!($db, $c, |$t| $read);
-            let left_ = until_.saturating_duration_since(Instant::now());
-            if out_.found() || left_.is_zero() {
-                break (out_, v_);
-            }
-            let poll_ = Duration::from_millis($node.cfg.watch_poll_ms);
-            $db.wait_for_change(v_, left_.min(poll_)).await;
-        }
-    }};
-}
-
-trait Found {
-    fn found(&self) -> bool;
 }
 
 impl Found for (Vec<Json>, bool, ChangePos) {
@@ -958,7 +886,7 @@ async fn insert_rows(
     Ok((status, axum::Json(json!({"count": n, "version": v}))).into_response())
 }
 
-fn split_consistency(mut body: Json) -> Result<(Json, Consistency)> {
+pub(super) fn split_consistency(mut body: Json) -> Result<(Json, Consistency)> {
     let (c, s) = match body.as_object_mut() {
         Some(o) => (
             o.remove("consistency").and_then(|v| v.as_str().map(|s| s.to_string())),

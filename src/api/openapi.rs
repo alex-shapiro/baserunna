@@ -89,6 +89,26 @@ fn enum_of(values: &[&str]) -> Value {
     json!({"type": "string", "enum": values})
 }
 
+/// A filter (SPEC §4.7) named `name`: `and`, `or` or `not` of filters, or
+/// one of `comparisons`.
+fn filter_schema(name: &str, comparisons: Vec<Value>, desc: &str) -> Value {
+    let mut nodes = vec![
+        obj(json!({"and": arr(r(name))}), &["and"]),
+        obj(json!({"or": arr(r(name))}), &["or"]),
+        obj(json!({"not": r(name)}), &["not"]),
+    ];
+    nodes.extend(comparisons);
+    let semantics = "A missing or null operand fails every comparison, `ne` included; `exists` tests for one. \
+        Numbers compare by value.";
+    json!({"oneOf": nodes, "description": format!("{desc} {semantics}")})
+}
+
+/// A filter comparison of the operand named by `key`.
+fn comparison(key: &str, operand: Value) -> Value {
+    let value = json!({"description": "Absent for `exists`, an array of at most 1000 for `in`, otherwise not null."});
+    obj(json!({(key): operand, "op": enum_of(&crate::filter::OPS), "value": value}), &[key, "op"])
+}
+
 #[derive(Default)]
 struct Op<'a> {
     summary: &'a str,
@@ -259,7 +279,10 @@ fn schemas() -> Value {
             "blob": r("BlobMeta"), "version": nullable("integer"),
             "items": arr(r("KvItem")), "next_cursor": nullable("string"),
             "row": r("Row"), "rows": arr(r("Row")), "expires_at": i(), "count": i(),
-        }), &[], "Result of one op; the fields present depend on the op (see Op)."),
+            "records": arr(r("StreamRecord")), "first_seq": i(), "next_seq": i(), "done": b(), "seq": i(),
+            "bytes": i(), "first_time": i(), "last_time": i(),
+        }), &[], "Result of one op; the fields present depend on the op (see Op). An `append` reports \
+            `first_seq` once the transaction commits."),
         "Op": {
             "oneOf": [
                 obj(json!({"op": {"const": "get"}, "key": s()}), &["op", "key"]),
@@ -285,11 +308,26 @@ fn schemas() -> Value {
                     "limit": {"type": "integer", "minimum": 1}}), &["op", "table", "where"]),
                 {"type": "object", "properties": {"op": {"const": "query_rows"}, "table": s()},
                  "required": ["op", "table"], "allOf": [r("Query")], "additionalProperties": true},
+                obj(json!({"op": {"const": "append"}, "stream": s(), "records": arr(r("NewRecord")),
+                    "expect_seq": i(), "create": b()}), &["op", "stream", "records"]),
+                {"type": "object", "properties": {"op": {"const": "read_stream"}, "stream": s()},
+                 "required": ["op", "stream"], "allOf": [r("StreamRead")], "additionalProperties": true},
+                obj(json!({"op": {"const": "stream_info"}, "stream": s()}), &["op", "stream"]),
+                obj(json!({"op": {"const": "trim_stream"}, "stream": s(), "before_seq": i(), "before_time": i()}),
+                    &["op", "stream"]),
+                obj(json!({"op": {"const": "get_consumer"}, "stream": s(), "consumer": s()}),
+                    &["op", "stream", "consumer"]),
+                obj(json!({"op": {"const": "set_consumer"}, "stream": s(), "consumer": s(), "seq": i()}),
+                    &["op", "stream", "consumer", "seq"]),
             ],
             "description": "One operation. Keys and values are UTF-8 strings unless the request sets `encoding: base64`. \
                 `ttl_ms` makes a value or row expire that long after the write commits; an update keeps a row's \
                 expiry unless it sets one. `update_rows` and `delete_rows` change every row `where` selects \
-                (at most `limit`), all within the transaction's write limit, and return `count`.",
+                (at most `limit`), all within the transaction's write limit, and return `count`. Stream ops: \
+                `append` gets its seqs at commit (`expect_seq` fails the transaction with 412 unless the stream's \
+                next seq is still that); `read_stream` conflicts with appends only if it reached the stream's \
+                end, and sees the transaction's own trims but not its appends; `stream_info` conflicts with \
+                every append; `set_consumer` takes a seq at most the stream's next.",
         },
         "TxnRequest": obj(json!({
             "ops": arr(r("Op")),
@@ -299,19 +337,20 @@ fn schemas() -> Value {
             "consistency": enum_of(&["strong", "snapshot"]),
             "max_staleness_ms": i(),
         }), &["ops"]),
-        "TxnResult": obj(json!({
+        "TxnResult": obj_desc(json!({
             "version": i(), "committed": b(), "replayed": b(), "commit_id": s(),
             "results": {"oneOf": [arr(r("OpResult")), {"type": "null"}]},
-        }), &["version", "committed", "results"]),
+            "appends": arr(i()),
+        }), &["version", "committed", "results"], "`appends`: the first seq each append received, in order."),
         "BeginRequest": obj(json!({"isolation": enum_of(&["serializable", "snapshot"]),
             "encoding": enum_of(&["utf8", "base64"])}), &[]),
         "Begin": obj(json!({"txn_id": s(), "commit_id": s(), "read_version": i(), "expires_at": i(),
             "idle_timeout_ms": i()}), &["txn_id", "commit_id", "read_version", "expires_at", "idle_timeout_ms"]),
         "OpsRequest": obj(json!({"ops": arr(r("Op"))}), &["ops"]),
         "OpsResult": obj(json!({"results": arr(r("OpResult"))}), &["results"]),
-        "Committed": obj(json!({"version": i(), "commit_id": s()}), &["version", "commit_id"]),
+        "Committed": obj(json!({"version": i(), "commit_id": s(), "appends": arr(i())}), &["version", "commit_id"]),
         "CommitStatus": obj(json!({"status": enum_of(&["committed", "not_committed"]), "version": i(),
-            "commit_id": s()}), &["status", "commit_id"]),
+            "commit_id": s(), "appends": arr(i()), "retention_ms": i()}), &["status", "commit_id"]),
         "Version": obj(json!({"version": i()}), &["version"]),
         "DeleteResult": obj(json!({"version": i(), "existed": b()}), &["version", "existed"]),
         "Empty": obj(json!({}), &[]),
@@ -328,9 +367,8 @@ fn schemas() -> Value {
         "Row": {"type": "object", "additionalProperties": true,
             "description": "Column name to value. `bytes` are base64; `blob` columns take a staged `blob_id` \
                 on write and return BlobMeta on read."},
-        "Filter": {"type": "object", "additionalProperties": true,
-            "description": "`{\"and\": [...]}`, `{\"or\": [...]}`, `{\"not\": f}` or \
-                `{\"col\": name, \"op\": eq|ne|lt|le|gt|ge|in|prefix|is_null, \"value\": v}`."},
+        "Filter": filter_schema("Filter", vec![comparison("col", s())],
+            "A row filter: `and`, `or` or `not` of filters, or a comparison of the column `col`."),
         "Query": obj_desc(json!({
             "index": s(), "eq": arr(any()),
             "range": obj(json!({"gt": any(), "gte": any(), "lt": any(), "lte": any()}), &[]),
@@ -377,6 +415,71 @@ fn schemas() -> Value {
             &["changes", "more", "next_cursor", "version"]),
         "QueryResult": obj(json!({"rows": arr(r("Row")), "next_cursor": nullable("string"), "version": i()}),
             &["rows", "next_cursor", "version"]),
+        "Headers": {"type": "object", "additionalProperties": s(),
+            "description": "Header names (1-128 bytes) to values (at most 4 KiB); at most 64."},
+        "NewRecord": obj_desc(json!({"value": s(), "json": any(), "headers": r("Headers")}), &[],
+            "Exactly one of `value` (a string in the request's encoding) and `json` (any JSON value). A record \
+            takes at most 1 MiB."),
+        "StreamRecord": obj_desc(json!({
+            "seq": i(), "time": i(), "headers": r("Headers"), "value": s(), "value_b64": s(), "json": any(),
+        }), &["seq", "time"], "`seq` is the record's position; `time` (cluster time, ms) is when its append \
+            committed. Its body is `json`, or `value` (`value_b64` if not UTF-8 in utf8 mode)."),
+        "Consumer": obj_desc(json!({"name": s(), "seq": i(), "lag": i(), "updated_at": i(), "version": i()}),
+            &["name", "seq", "lag", "updated_at"], "A consumer's cursor: the seq it reads from next, and how many \
+            records it has yet to read."),
+        "Stream": obj_desc(json!({
+            "name": s(), "created_at": i(), "retention_ms": nullable("integer"), "max_bytes": nullable("integer"),
+            "first_seq": i(), "next_seq": i(), "bytes": i(), "first_time": i(), "last_time": i(),
+            "consumers": arr(r("Consumer")), "consumers_next_cursor": nullable("string"), "version": i(),
+        }), &["name", "created_at", "retention_ms", "max_bytes", "first_seq", "next_seq", "bytes"],
+            "Records `first_seq` to `next_seq` (exclusive) are kept: `bytes` of bodies and headers, appended \
+            from `first_time` to `last_time`. Stream info lists the first 100 consumers; \
+            `consumers_next_cursor` continues the listing on the consumers route."),
+        "CreateStream": obj_desc(json!({
+            "name": s(), "retention_ms": {"type": "integer", "minimum": 1}, "max_bytes": {"type": "integer", "minimum": 1},
+        }), &["name"], "Names are 1-128 characters of `[A-Za-z0-9_.:-]`. Records older than `retention_ms`, \
+            or beyond the newest `max_bytes`, may be trimmed; trims run once a stream is a sixteenth past a \
+            limit, and take it back to the limit."),
+        "StreamConfig": obj_desc(json!({"retention_ms": nullable("integer"), "max_bytes": nullable("integer")}), &[],
+            "Fields left out keep their value; `null` removes a limit."),
+        "AppendRequest": obj(json!({
+            "records": arr(r("NewRecord")), "expect_seq": i(), "create": b(), "idempotency_key": s(),
+            "encoding": enum_of(&["utf8", "base64"]),
+        }), &["records"]),
+        "Appended": obj_desc(json!({
+            "first_seq": i(), "next_seq": i(), "count": i(), "time": i(), "version": i(), "commit_id": s(),
+            "replayed": b(),
+        }), &["first_seq", "next_seq", "count", "time", "version", "commit_id", "replayed"],
+            "The records took seqs `first_seq` to `next_seq` (exclusive), at `time`. A replay (`replayed`) of \
+            an earlier attempt with the same idempotency key reports that attempt's records."),
+        "StreamFilter": filter_schema("StreamFilter", vec![
+            comparison("field", json!({"type": "string", "minLength": 1, "maxLength": 256})),
+            comparison("header", json!({"type": "string", "minLength": 1, "maxLength": 128})),
+            obj(json!({"op": {"const": "contains"}, "value": s()}), &["op", "value"]),
+        ], "A record filter: `and`, `or` or `not` of filters, or a comparison of a JSON body `field` (a dotted \
+            path; numeric segments index arrays), a `header`, or, naming neither, the body's text, which only \
+            `contains` tests."),
+        "StreamRead": obj_desc(json!({
+            "from_seq": i(), "from_time": i(), "tail": i(), "consumer": s(), "until_seq": i(), "until_time": i(),
+            "reverse": b(), "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 16 << 20}, "filter": r("StreamFilter"),
+            "scan_limit": {"type": "integer", "minimum": 1, "maximum": 100_000},
+            "encoding": enum_of(&["utf8", "base64"]), "consistency": enum_of(&["strong", "snapshot"]),
+            "max_staleness_ms": i(),
+        }), &[], "Records from at most one of `from_seq`, `from_time` (the first record at or after it), \
+            `tail` (the last N) and `consumer` (its cursor; a new consumer starts at the beginning), up to \
+            `until_seq` or `until_time` (exclusive), oldest first or with `reverse` newest first; at most \
+            `limit` (default 100) records and about `max_bytes` (default 4 MiB, at most 16 MiB). With \
+            `filter`, at most `scan_limit` records (default 10,000) are examined."),
+        "StreamRecords": obj_desc(json!({
+            "records": arr(r("StreamRecord")), "next_seq": i(), "first_seq": i(), "tail_seq": i(), "done": b(),
+            "version": i(),
+        }), &["records", "next_seq", "first_seq", "tail_seq", "done", "version"],
+            "`next_seq` continues the read: the next `from_seq` of a forward read, the next `until_seq` of a \
+            reverse one. `done`: the read reached its end. `first_seq` and `tail_seq` are the stream's first \
+            and next seqs."),
+        "Trim": obj(json!({"before_seq": i(), "before_time": i()}), &[]),
+        "SetConsumer": obj_desc(json!({"seq": i()}), &["seq"], "At most the stream's next seq."),
     })
 }
 
@@ -1098,6 +1201,213 @@ fn paths() -> Value {
             ..op("Follow changes to rows", "tables", vec![("200", resp("A page of changes", r("RowChanges")))])
         },
     );
+    let stream = || path_param("s", "Stream name.");
+    let mut ls = vec![db(), query("prefix", s(), "Names starting with this")];
+    ls.extend(paging());
+    ls.extend(consistency());
+    add(
+        "/v1/dbs/{db}/streams",
+        "get",
+        Op {
+            params: ls,
+            ..op(
+                "List streams",
+                "streams",
+                vec![(
+                    "200",
+                    resp(
+                        "Streams",
+                        obj(
+                            json!({"streams": arr(r("Stream")), "next_cursor": nullable("string"), "version": i()}),
+                            &["streams", "next_cursor", "version"],
+                        ),
+                    ),
+                )],
+            )
+        },
+    );
+    add(
+        "/v1/dbs/{db}/streams",
+        "post",
+        Op {
+            body: Some(json_body(r("CreateStream"))),
+            params: vec![db()],
+            ..op("Create a stream", "streams", vec![("201", resp("Created", r("Stream")))])
+        },
+    );
+    let mut gs = vec![db(), stream()];
+    gs.extend(consistency());
+    add(
+        "/v1/dbs/{db}/streams/{s}",
+        "get",
+        Op {
+            params: gs.clone(),
+            ..op("Describe a stream and its consumers", "streams", vec![("200", resp("Stream", r("Stream")))])
+        },
+    );
+    add(
+        "/v1/dbs/{db}/streams/{s}",
+        "patch",
+        Op {
+            body: Some(json_body(r("StreamConfig"))),
+            params: vec![db(), stream()],
+            ..op("Change a stream's retention", "streams", vec![("200", resp("Stream", r("Stream")))])
+        },
+    );
+    add(
+        "/v1/dbs/{db}/streams/{s}",
+        "delete",
+        Op {
+            params: vec![db(), stream()],
+            ..op("Delete a stream and its records", "streams", vec![("200", resp("Deleted", r("Version")))])
+        },
+    );
+    add(
+        "/v1/dbs/{db}/streams/{s}/records",
+        "post",
+        Op {
+            body: Some(json!({"required": true, "content": {
+                "application/json": {"schema": r("AppendRequest")},
+                "application/x-ndjson": {"schema": {"type": "string", "description": "A JSON record per line"}},
+                "text/plain": {"schema": {"type": "string", "description": "A text record per line"}},
+            }})),
+            params: vec![
+                db(),
+                stream(),
+                query("expect_seq", i(), "Append only if the stream's next seq is this (else 412)"),
+                query("create", b(), "Create the stream if it does not exist"),
+                query("encoding", enum_of(&["utf8", "base64"]), "Encoding of JSON `value`s"),
+                header("Idempotency-Key", "Retries with the same key apply once (within 10 minutes)"),
+            ],
+            desc: Some(
+                "Appends records atomically at the stream's next seqs; concurrent appends never conflict. \
+                 Empty lines of NDJSON and text bodies are skipped, as is a leading byte order mark; a body \
+                 without records appends none (`count` 0). Send NDJSON and text with their content type: \
+                 curl's `--data-binary` alone sends `application/x-www-form-urlencoded`, which is refused.",
+            ),
+            ..op("Append records", "streams", vec![("200", resp("Appended", r("Appended")))])
+        },
+    );
+    let mut rd = vec![
+        db(),
+        stream(),
+        query("from_seq", i(), "Start at this seq"),
+        query("from_time", i(), "Start at the first record at or after this time (ms)"),
+        query("tail", i(), "Start at the last N records"),
+        query("consumer", s(), "Start at this consumer's cursor"),
+        query("until_seq", i(), "Stop before this seq"),
+        query("until_time", i(), "Stop before the first record at or after this time"),
+        query("reverse", b(), "Newest first"),
+        query("limit", i(), "1..=1000 records (default 100)"),
+        query("max_bytes", i(), "Stop after about this many body bytes (default 4 MiB, at most 16 MiB)"),
+        query(
+            "wait_ms",
+            i(),
+            "Wait this long for an append if the read is caught up: 0..=20000, or up to 300000 for events",
+        ),
+        query("format", enum_of(&["json", "ndjson", "sse"]), "Response format (default: from Accept, else json)"),
+        query("encoding", enum_of(&["utf8", "base64"]), "Encoding of `value`s"),
+        header("Last-Event-ID", "Server-sent events: resume after this seq"),
+    ];
+    rd.extend(consistency());
+    add(
+        "/v1/dbs/{db}/streams/{s}/records",
+        "get",
+        Op {
+            params: rd,
+            desc: Some(
+                "As JSON, a page of records. As NDJSON, a record per line, with the page's `next_seq`, \
+                 `first_seq`, `tail_seq` and `done` in `x-baserunna-*` headers. As server-sent events (forward \
+                 reads only), each record as `id: <seq>` and `data: <record>`, then each later append for up \
+                 to `wait_ms`, with a comment every 15 s while idle; the stream ends at `limit` records, at \
+                 `until_seq` or `until_time`, after `wait_ms`, or when the node shuts down, and resumes after \
+                 `Last-Event-ID`. A read that fails before its first record answers with an error status.",
+            ),
+            ..op(
+                "Read records",
+                "streams",
+                vec![(
+                    "200",
+                    json!({"description": "Records", "content": {
+                        "application/json": {"schema": r("StreamRecords")},
+                        "application/x-ndjson": {"schema": {"type": "string"}},
+                        "text/event-stream": {"schema": {"type": "string"}},
+                    }}),
+                )],
+            )
+        },
+    );
+    add(
+        "/v1/dbs/{db}/streams/{s}/records/query",
+        "post",
+        Op {
+            body: Some(json_body(r("StreamRead"))),
+            params: vec![db(), stream()],
+            desc: Some("A read with a filter; continue from `next_seq` until `done`."),
+            ..op("Query records", "streams", vec![("200", resp("Records", r("StreamRecords")))])
+        },
+    );
+    add(
+        "/v1/dbs/{db}/streams/{s}/trim",
+        "post",
+        Op {
+            body: Some(json_body(r("Trim"))),
+            params: vec![db(), stream()],
+            desc: Some(
+                "Removes the records before `before_seq`, or before the first record at or after `before_time`.",
+            ),
+            ..op("Trim a stream", "streams", vec![("200", resp("Trimmed", r("Version")))])
+        },
+    );
+    let mut lc = vec![db(), stream()];
+    lc.extend(paging());
+    lc.extend(consistency());
+    add(
+        "/v1/dbs/{db}/streams/{s}/consumers",
+        "get",
+        Op {
+            params: lc,
+            ..op(
+                "List a stream's consumers",
+                "streams",
+                vec![(
+                    "200",
+                    resp(
+                        "Consumers",
+                        obj(
+                            json!({"consumers": arr(r("Consumer")), "next_cursor": nullable("string"), "version": i()}),
+                            &["consumers", "next_cursor", "version"],
+                        ),
+                    ),
+                )],
+            )
+        },
+    );
+    let consumer = || path_param("c", "Consumer name.");
+    let mut gc = vec![db(), stream(), consumer()];
+    gc.extend(consistency());
+    add(
+        "/v1/dbs/{db}/streams/{s}/consumers/{c}",
+        "get",
+        Op { params: gc, ..op("Get a consumer's cursor", "streams", vec![("200", resp("Consumer", r("Consumer")))]) },
+    );
+    add(
+        "/v1/dbs/{db}/streams/{s}/consumers/{c}",
+        "put",
+        Op {
+            body: Some(json_body(r("SetConsumer"))),
+            params: vec![db(), stream(), consumer()],
+            ..op("Set a consumer's cursor", "streams", vec![("200", resp("Set", r("Version")))])
+        },
+    );
+    add(
+        "/v1/dbs/{db}/streams/{s}/consumers/{c}",
+        "delete",
+        Op {
+            params: vec![db(), stream(), consumer()],
+            ..op("Delete a consumer", "streams", vec![("200", resp("Deleted", r("DeleteResult")))])
+        },
+    );
     Value::Object(p)
 }
 
@@ -1105,7 +1415,7 @@ fn paths() -> Value {
 pub fn document() -> &'static Value {
     static DOC: OnceLock<Value> = OnceLock::new();
     DOC.get_or_init(|| {
-        let tags: Vec<Value> = ["auth", "orgs", "databases", "kv", "transactions", "tables", "admin", "ops"]
+        let tags: Vec<Value> = ["auth", "orgs", "databases", "kv", "transactions", "tables", "streams", "admin", "ops"]
             .iter()
             .map(|n| json!({"name": n}))
             .collect();
@@ -1114,7 +1424,7 @@ pub fn document() -> &'static Value {
             "info": {
                 "title": "Baserunna",
                 "version": env!("CARGO_PKG_VERSION"),
-                "description": "Transactional key-value and table databases on object storage. Authenticate with \
+                "description": "Transactional key-value, table and stream databases on object storage. Authenticate with \
                     `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the \
                     Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for \
                     writes). Requests over a rate limit get 429 `rate_limited` with `Retry-After` and were not \

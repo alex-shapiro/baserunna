@@ -70,6 +70,13 @@ pub struct EngineConfig {
     pub db_max_bytes: u64,
     /// Minimum interval before triggering a blob-recounting sweep after a quota rejection.
     pub quota_sweep_interval_ms: u64,
+    /// Runs of one stream's records at least this large are sealed into a
+    /// chunk as a flush or a compaction writes them (SPEC §5.11).
+    pub stream_seal_min_bytes: usize,
+    /// Sealed chunks are cut at this size.
+    pub stream_chunk_bytes: usize,
+    /// Largest stream record payload.
+    pub stream_record_max: usize,
 }
 
 impl Default for EngineConfig {
@@ -113,6 +120,9 @@ impl Default for EngineConfig {
             levels_inline_max: 16,
             db_max_bytes: 0,
             quota_sweep_interval_ms: 60_000,
+            stream_seal_min_bytes: 64 * 1024,
+            stream_chunk_bytes: 2 * 1024 * 1024,
+            stream_record_max: 1024 * 1024,
         }
     }
 }
@@ -135,6 +145,10 @@ impl EngineConfig {
             (
                 self.commit_retention_ms >= 2 * self.commit_timeout_ms,
                 "commit_retention_ms must leave time to resolve commits after commit_timeout_ms",
+            ),
+            (
+                self.stream_seal_min_bytes <= self.stream_chunk_bytes,
+                "stream_seal_min_bytes must not exceed stream_chunk_bytes",
             ),
         ];
         match rules.iter().find(|(ok, _)| !ok) {
@@ -160,6 +174,9 @@ impl EngineConfig {
             cache_bytes: 256 * 1024,
             range_delete_points_max: 4,
             levels_inline_max: 2,
+            stream_seal_min_bytes: 1024,
+            stream_chunk_bytes: 4 * 1024,
+            stream_record_max: 8 * 1024,
             ..EngineConfig::default()
         }
     }

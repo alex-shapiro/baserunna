@@ -43,7 +43,7 @@ pub(super) fn db_path(db: &str) -> String {
     format!("/console/dbs/{}", url_seg(db))
 }
 
-fn api_db(db: &str) -> String {
+pub(super) fn api_db(db: &str) -> String {
     format!("/v1/dbs/{}", url_seg(db))
 }
 
@@ -339,6 +339,7 @@ async fn render_db(s: &Session, db: &str, q: &Fields, forms: Forms, flash: Optio
     let info: DbInfo = s.get(&api_db(db)).await.map_err(|e| back("/console/dbs", &e, false))?;
     let keys = keys_section(s, db, &info, q).await.map_err(|e| s.fail(db, &e))?;
     let tables = tables_section(s, db, &info, forms.table_def.as_deref()).await.map_err(|e| s.fail(db, &e))?;
+    let streams = super::streams::streams_section(s, db, info.role.can_write(), q).await.map_err(|e| s.fail(db, &e))?;
     let txn = txn_section(s, db, forms.txn.as_deref(), forms.result.as_deref());
     let danger = if info.role.can_administer() {
         format!(
@@ -355,7 +356,7 @@ async fn render_db(s: &Session, db: &str, q: &Fields, forms: Forms, flash: Optio
         Some(s),
         flash.as_ref(),
         &format!(
-            r#"<h1>{dbn}</h1><p class="muted">id <code>{id}</code></p>{metrics}{keys}{tables}{txn}{danger}"#,
+            r#"<h1>{dbn}</h1><p class="muted">id <code>{id}</code></p>{metrics}{keys}{tables}{streams}{txn}{danger}"#,
             dbn = esc(db),
             id = esc(&info.id),
             metrics = metrics(&info),

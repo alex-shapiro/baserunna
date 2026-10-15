@@ -7,6 +7,10 @@ Baserunna is a web service that hosts small databases on object storage.
 - Large binary blobs stored out of band as chunked objects.
 - Tables with schemas, primary keys and secondary indexes, with updates and
   deletes of many rows by query in one transaction.
+- Streams: append-only logs for application logs, chat and sync feeds, with
+  appends that commit atomically with everything else, reads by seq, time
+  or tail, filtered queries, long polls and server-sent events, retention,
+  and consumer cursors for exactly-once processing.
 - Values and rows with times to live, expired lazily on read and by compaction.
 - Change feeds of keys and rows, with long polls.
 - Organizations: databases shared by members with roles (reader, writer,
@@ -67,6 +71,13 @@ curl -s localhost:8080/v1/dbs/app/tables -H "$H" -d '{
 curl -s localhost:8080/v1/dbs/app/tables/users/rows -H "$H" -d '{"row":{"id":1,"email":"a@b.co"}}'
 curl -s localhost:8080/v1/dbs/app/tables/users/rows/query -H "$H" -d '{"index":"by_email","eq":["a@b.co"]}'
 curl -s localhost:8080/v1/dbs/app/tables/users/rows/delete -H "$H" -d '{"where":{"filter":{"col":"email","op":"prefix","value":"a@"}}}'
+
+# A stream of JSON log lines kept for a day: ship a file, query, follow.
+curl -s localhost:8080/v1/dbs/app/streams -H "$H" -d '{"name":"logs","retention_ms":86400000}'
+curl -s localhost:8080/v1/dbs/app/streams/logs/records -H "$H" -H 'content-type: application/x-ndjson' --data-binary @app.log
+curl -s localhost:8080/v1/dbs/app/streams/logs/records/query -H "$H" -d '{
+  "reverse": true, "limit": 20, "filter": {"field": "level", "op": "eq", "value": "error"}}'
+curl -sN "localhost:8080/v1/dbs/app/streams/logs/records?tail=10&format=sse&wait_ms=300000" -H "$H"
 ```
 
 ## Configuration
@@ -104,6 +115,8 @@ Each example starts real nodes on localhost and talks to them over HTTP:
 | `cargo run --example saas_tenants`  | one database per tenant, scoped and read-only API keys, offboarding                           |
 | `cargo run --example feature_flags` | a read-heavy config store, lease-served reads, `If-Match` compare-and-set, expiring overrides, a change feed watcher |
 | `cargo run --example multi_node`    | three nodes, forwarding, killing a node mid-flight, failover without data loss                |
+| `cargo run --example app_logs`      | NDJSON log shipping, retention, newest-first filtered queries, `tail -f`, an exactly-once shipper |
+| `cargo run --example chat_rooms`    | a stream per room, messages committed with counters, waiting for messages, `expect_seq`, unread counts |
 
 ## Testing
 
@@ -115,7 +128,7 @@ cargo run --release --example sim_tool -- trace bank 101863        # print a run
 SIM_SEED=4242 cargo test --test sim sim_bank -- --nocapture        # reproduce one seed
 cd fuzz && cargo +nightly fuzz run http_txn -- -rss_limit_mb=1500  # coverage-guided fuzzing (optional)
 cargo run --release --example cost_model                           # store requests per operation, $/DB/month
-cargo run --release --example amplification                        # compaction's write/space/read amplification
+cargo run --release --example amplification                        # write/space/read amplification of compaction and streams
 cargo bench --bench throughput                                     # one node, thousands of active databases
 scripts/mutants.sh                                                 # mutation testing (several hours)
 ```
@@ -125,8 +138,9 @@ scripts/mutants.sh                                                 # mutation te
 ```
 src/engine   storage engine: compressed segments, manifest, versions, group commit, commit records,
              leases, expiry, change feeds, range tombstones, leveled compaction, local disk tier,
-             store clock, GC, blobs, quotas
+             store clock, GC, blobs, quotas, stream records and sealed chunks
 src/table    tuple encoding, schemas, rows, indexes, queries
+src/stream   streams: catalog, record bodies, reads and filters, consumers
 src/ops.rs   the JSON transaction-op language
 src/meta     system database schema, metadata commands, organizations and roles (dogfooded on the table layer)
 src/node.rs  a service node: routing, auth, accounts, background work;   src/limits.rs  rate limits

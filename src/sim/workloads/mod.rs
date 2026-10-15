@@ -16,6 +16,7 @@ pub mod orgs;
 pub mod register;
 pub mod schema_race;
 pub mod steps;
+pub mod streams;
 pub mod tables;
 pub mod ttl;
 pub mod watch;
@@ -246,6 +247,7 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario { name: "db_churn", config: churn_cfg, run: |s| Box::pin(db_churn::run(s, 4, 10, 60, true)) },
         Scenario { name: "ttl", config: faulty3, run: |s| Box::pin(ttl::run(s, 2, 60, true)) },
         Scenario { name: "watch", config: faulty3, run: |s| Box::pin(watch::run(s, 120, true)) },
+        Scenario { name: "streams", config: faulty3, run: |s| Box::pin(streams::run(s, 60, true)) },
         Scenario { name: "orgs", config: faulty3, run: |s| Box::pin(orgs::run(s)) },
         Scenario { name: "accounts", config: faulty3, run: |s| Box::pin(accounts::run(s)) },
         Scenario { name: "kv_hostile", config: kv_hostile3, run: |s| Box::pin(kv_model::run(s, 2, 60, true)) },
@@ -269,6 +271,7 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario { name: "chaos_hostile", config: hostile4, run: |s| Box::pin(chaos_mix(s, 2)) },
         Scenario { name: "ttl_hostile", config: hostile3, run: |s| Box::pin(ttl::run(s, 2, 60, true)) },
         Scenario { name: "watch_hostile", config: hostile3, run: |s| Box::pin(watch::run(s, 120, true)) },
+        Scenario { name: "streams_hostile", config: hostile3, run: |s| Box::pin(streams::run(s, 60, true)) },
         Scenario { name: "orgs_hostile", config: hostile3, run: |s| Box::pin(orgs::run(s)) },
         Scenario { name: "accounts_hostile", config: hostile3, run: |s| Box::pin(accounts::run(s)) },
     ]

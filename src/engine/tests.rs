@@ -249,7 +249,7 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
                 for r in pending_ranges.drain(..) {
                     model.retain(|k, _| !r.contains(k));
                 }
-                let time = committed.map_or(0, |c| c.time_ms);
+                let time = committed.as_ref().map_or(0, |c| c.time_ms);
                 for (k, v) in std::mem::take(&mut pending) {
                     match v {
                         Some((v, ttl)) => model.insert(k, (v, ttl.map(|t| time + t))),
@@ -499,6 +499,8 @@ pub(super) struct DelayStore {
     put_reply_ms: AtomicU64,
     manifest_put_conflicts: AtomicU32,
     manifest_put_outages: AtomicU32,
+    /// Manifest writes that apply, but whose reply is lost.
+    manifest_put_lost: AtomicU32,
     manifest_get_outages: AtomicU32,
     manifest_puts: AtomicU32,
     gets: Mutex<Vec<(String, bool)>>,
@@ -542,9 +544,13 @@ impl ObjectStore for DelayStore {
                     return Err(StoreError::Unavailable("injected".into()));
                 }
             }
+            let lost = key.ends_with("/manifest") && take_fault(&self.manifest_put_lost);
             let r = self.mem.put_sync(key, data, &mode);
             tokio::time::sleep(Duration::from_millis(self.put_reply_ms.load(SeqCst))).await;
-            r
+            match lost {
+                true => Err(StoreError::Unavailable("reply lost".into())),
+                false => r,
+            }
         })
     }
 
@@ -576,6 +582,7 @@ pub(super) fn delayed_engine_with(node: &str, cfg: EngineConfig) -> (Arc<Engine>
         put_reply_ms: 0.into(),
         manifest_put_conflicts: 0.into(),
         manifest_put_outages: 0.into(),
+        manifest_put_lost: 0.into(),
         manifest_get_outages: 0.into(),
         manifest_puts: 0.into(),
         gets: Mutex::default(),
@@ -1148,6 +1155,32 @@ fn foreign_leases_block_commits_until_they_expire() {
 }
 
 #[test]
+fn a_lease_lost_after_an_ambiguous_write_leaves_the_outcome_unknown() {
+    rt().block_on(async {
+        let (b, store) = delayed_engine("b");
+        let db = opened(&b, "d").await;
+        put(&db, "k", "b").await;
+        let a = second_node(&b, &store, "a");
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        t.put(Bytes::from_static(b"k"), inline("lost")).unwrap();
+        // The write lands at once; its reply comes after the lease it renews ran out, and is lost.
+        let lease = b.shared.cfg.lease_ms + b.shared.cfg.lease_margin_ms;
+        store.manifest_put_lost.store(1, SeqCst);
+        store.put_reply_ms.store(3 * lease, SeqCst);
+        let commit = tokio::spawn(async move { db.commit(t.into_request()).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        store.put_reply_ms.store(0, SeqCst);
+        let other = opened(&a, "d").await;
+        tokio::time::sleep(Duration::from_millis(lease + 100)).await;
+        put(&other, "k", "a").await;
+        match commit.await.unwrap() {
+            Err(Error::Unavailable { outcome_unknown: true, .. }) => {}
+            other => panic!("the write landed, so its outcome is unknown, not {other:?}"),
+        }
+    });
+}
+
+#[test]
 fn released_leases_hand_over_at_once() {
     rt().block_on(async {
         let (a, store) = delayed_engine("a");
@@ -1312,7 +1345,7 @@ fn commit_records_make_commits_idempotent_until_they_expire() {
         let again = db.commit_detailed(request(99, 7).await).await.unwrap();
         assert_eq!((again.version, again.replayed), (ra.version, true), "an old commit is still known");
         for (id, version) in &ids {
-            assert_eq!(db.commit_status(*id).await.unwrap(), Some(*version));
+            assert_eq!(db.commit_status(*id).await.unwrap().map(|s| s.version), Some(*version));
         }
         assert_eq!(db.commit_status(424242).await.unwrap(), None);
         for _ in 0..2 {

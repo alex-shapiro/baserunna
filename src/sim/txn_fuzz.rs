@@ -3,8 +3,8 @@
 use super::{Sim, SimConfig, SimResponse, openapi_check};
 use crate::engine::KeyRange;
 use crate::ops::Encoding;
+use crate::table::RangeSpec;
 use crate::table::tuple::Key as TKey;
-use crate::table::{CmpOp, Filter, RangeSpec};
 use crate::util::{b64, sha256};
 use bytes::Bytes;
 use serde::Deserialize;
@@ -107,10 +107,77 @@ struct MRow {
     expiry: Expiry,
 }
 
+/// A stream record: its body bytes, whether they are JSON, and headers.
+#[derive(Clone, Debug, PartialEq)]
+struct MRecord {
+    data: Vec<u8>,
+    json: Option<Json>,
+    headers: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MStream {
+    records: Vec<MRecord>,
+    first: u64,
+    consumers: BTreeMap<String, u64>,
+}
+
+impl MStream {
+    fn next(&self) -> u64 {
+        self.records.len() as u64
+    }
+}
+
 #[derive(Clone, Default)]
 struct Snapshot {
     kv: BTreeMap<Vec<u8>, (MVal, u64)>,
     rows: BTreeMap<i64, MRow>,
+    streams: BTreeMap<String, MStream>,
+}
+
+/// Versions of the commits that changed a stream, for predicting conflicts.
+#[derive(Clone, Debug, Default)]
+struct StreamLog {
+    catalog: u64,
+    state: u64,
+    /// Version, first seq and count of each append.
+    appends: Vec<(u64, u64, u64)>,
+    /// Version and new first seq of each trim.
+    trims: Vec<(u64, u64)>,
+    consumers: BTreeMap<String, u64>,
+}
+
+/// A stream read of a transaction, as the validation that commits it sees.
+#[derive(Clone, Debug)]
+enum StreamRead {
+    Catalog(String),
+    State(String),
+    Range(String, u64, Option<u64>),
+    Consumer(String, String),
+}
+
+/// A stream change of a transaction, applied at commit in order.
+#[derive(Clone, Debug)]
+enum StreamWrite {
+    Create(String),
+    Append { stream: String, records: Vec<MRecord>, expect: Option<u64>, op_index: usize },
+    Trim(String, u64),
+}
+
+/// Independent copy of `stream::NewRecord`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewRecord {
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default, deserialize_with = "some_json")]
+    json: Option<Json>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+fn some_json<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Json>, D::Error> {
+    Json::deserialize(d).map(Some)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
@@ -233,13 +300,65 @@ enum Op {
         #[serde(default)]
         range: Option<RangeSpec>,
         #[serde(default)]
-        filter: Option<Filter>,
+        filter: Option<Json>,
         #[serde(default)]
         limit: Option<usize>,
         #[serde(default)]
         reverse: bool,
         #[serde(default)]
         cursor: Option<String>,
+    },
+    Append {
+        stream: String,
+        records: Vec<NewRecord>,
+        #[serde(default)]
+        expect_seq: Option<u64>,
+        #[serde(default)]
+        create: bool,
+    },
+    ReadStream {
+        stream: String,
+        #[serde(default)]
+        from_seq: Option<u64>,
+        #[serde(default)]
+        from_time: Option<u64>,
+        #[serde(default)]
+        tail: Option<u64>,
+        #[serde(default)]
+        consumer: Option<String>,
+        #[serde(default)]
+        until_seq: Option<u64>,
+        #[serde(default)]
+        until_time: Option<u64>,
+        #[serde(default)]
+        reverse: bool,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        max_bytes: Option<usize>,
+        #[serde(default)]
+        filter: Option<Json>,
+        #[serde(default)]
+        scan_limit: Option<usize>,
+    },
+    StreamInfo {
+        stream: String,
+    },
+    TrimStream {
+        stream: String,
+        #[serde(default)]
+        before_seq: Option<u64>,
+        #[serde(default)]
+        before_time: Option<u64>,
+    },
+    GetConsumer {
+        stream: String,
+        consumer: String,
+    },
+    SetConsumer {
+        stream: String,
+        consumer: String,
+        seq: u64,
     },
 }
 
@@ -257,7 +376,7 @@ struct Selection {
     #[serde(default)]
     range: Option<RangeSpec>,
     #[serde(default)]
-    filter: Option<Filter>,
+    filter: Option<Json>,
 }
 
 const TTL_BEYOND_RUN_MS: u64 = 1_000_000_000;
@@ -285,7 +404,22 @@ impl Op {
                 | Op::DeleteRow { .. }
                 | Op::UpdateRows { .. }
                 | Op::DeleteRows { .. }
+                | Op::Append { .. }
+                | Op::TrimStream { .. }
+                | Op::SetConsumer { .. }
         )
+    }
+
+    /// Whether the op's filter would fail to parse, failing the request
+    /// before any op runs.
+    fn unparseable(&self) -> bool {
+        match self {
+            Op::ReadStream { filter: Some(f), .. } => !filter_parses(f, stream_operand),
+            Op::QueryRows { filter: Some(f), .. }
+            | Op::UpdateRows { selection: Selection { filter: Some(f), .. }, .. }
+            | Op::DeleteRows { selection: Selection { filter: Some(f), .. }, .. } => !filter_parses(f, table_operand),
+            _ => false,
+        }
     }
 }
 
@@ -333,6 +467,7 @@ enum Fail {
     NotFound,
     Exists,
     Precondition,
+    TooLarge,
     /// Valid request with an in-run TTL whose exact expiry is not modeled.
     Unmodeled,
 }
@@ -344,6 +479,7 @@ impl Fail {
             Fail::NotFound => (404, "not_found"),
             Fail::Exists => (409, "already_exists"),
             Fail::Precondition => (412, "precondition_failed"),
+            Fail::TooLarge => (413, "too_large"),
             Fail::Unmodeled => (200, ""),
         }
     }
@@ -366,6 +502,13 @@ struct TxnView {
     row_writes: BTreeMap<i64, Option<MRow>>,
     reads: Vec<ReadItem>,
     table_ops: bool,
+    stream_reads: Vec<StreamRead>,
+    /// Pinned reads and written keys of streams, validated at every isolation level.
+    stream_keys: Vec<StreamRead>,
+    stream_writes: Vec<StreamWrite>,
+    consumer_writes: BTreeMap<(String, String), u64>,
+    /// The index of the op being executed within its request.
+    op_index: usize,
 }
 
 impl TxnView {
@@ -378,7 +521,35 @@ impl TxnView {
             row_writes: BTreeMap::new(),
             reads: Vec::new(),
             table_ops: false,
+            stream_reads: Vec::new(),
+            stream_keys: Vec::new(),
+            stream_writes: Vec::new(),
+            consumer_writes: BTreeMap::new(),
+            op_index: 0,
         }
+    }
+
+    fn created(&self, name: &str) -> bool {
+        self.stream_writes.iter().any(|w| matches!(w, StreamWrite::Create(n) if n == name))
+    }
+
+    /// The stream as of the snapshot, or empty if the transaction created it.
+    /// Stream `name` as the transaction sees it: as of its snapshot, less
+    /// the records it trims itself.
+    fn stream(&self, name: &str) -> Option<MStream> {
+        let mut st = match self.base.streams.get(name) {
+            Some(s) => s.clone(),
+            None if self.created(name) => MStream::default(),
+            None => return None,
+        };
+        for w in &self.stream_writes {
+            if let StreamWrite::Trim(n, before) = w
+                && n == name
+            {
+                st.first = (*before).clamp(st.first, st.next());
+            }
+        }
+        Some(st)
     }
 
     fn masked(&self, k: &[u8]) -> bool {
@@ -465,7 +636,11 @@ impl TxnView {
     }
 
     fn is_write(&self) -> bool {
-        !self.writes.is_empty() || !self.ranges.is_empty() || !self.row_writes.is_empty()
+        !self.writes.is_empty()
+            || !self.ranges.is_empty()
+            || !self.row_writes.is_empty()
+            || !self.stream_writes.is_empty()
+            || !self.consumer_writes.is_empty()
     }
 }
 
@@ -515,13 +690,6 @@ fn datum_from_json(ct: Ct, v: &Json) -> MResult<Datum> {
     }
 }
 
-fn cmp_value(ct: Ct, v: &Json) -> MResult<Datum> {
-    match ct {
-        Ct::Json => Ok(Datum::Json(v.clone())),
-        _ => datum_from_json(ct, v),
-    }
-}
-
 fn key_from_json(ct: Ct, v: &Json) -> MResult<TKey> {
     if ct == Ct::Json {
         return Err(Fail::Invalid);
@@ -529,24 +697,12 @@ fn key_from_json(ct: Ct, v: &Json) -> MResult<TKey> {
     datum_from_json(ct, v)?.key().ok_or(Fail::Invalid)
 }
 
-fn datum_cmp(a: &Datum, b: &Datum) -> Option<Ordering> {
-    if let (Datum::Json(x), Datum::Json(y)) = (a, b) {
-        return (x == y).then_some(Ordering::Equal);
-    }
-    let (ka, kb) = (a.key()?, b.key()?);
-    if std::mem::discriminant(&ka) != std::mem::discriminant(&kb) {
-        return None;
-    }
-    Some(ka.cmp_key(&kb))
-}
-
-fn row_datum(pk: i64, r: &MRow, col: &str) -> Datum {
+fn row_value(pk: i64, r: &MRow, col: &str) -> Option<Json> {
     match col {
-        "id" => Datum::Int(pk),
-        "name" => r.name.clone().map(Datum::Str).unwrap_or(Datum::Null),
-        "grp" => r.grp.map(Datum::Int).unwrap_or(Datum::Null),
-        "doc" => r.doc.clone().map(Datum::Json).unwrap_or(Datum::Null),
-        _ => Datum::Null,
+        "id" => Some(json!(pk)),
+        "name" => r.name.clone().map(Json::String),
+        "grp" => r.grp.map(|g| json!(g)),
+        _ => r.doc.clone(),
     }
 }
 
@@ -554,75 +710,35 @@ fn row_json(pk: i64, r: &MRow) -> Json {
     json!({"id": pk, "name": r.name, "grp": r.grp, "doc": r.doc.clone().unwrap_or(Json::Null)})
 }
 
-fn validate_filter(f: &Filter, depth: usize) -> MResult<()> {
-    if depth > 16 {
-        return Err(Fail::Invalid);
-    }
-    match f {
-        Filter::And { and: v } | Filter::Or { or: v } => v.iter().try_for_each(|x| validate_filter(x, depth + 1)),
-        Filter::Not { not } => validate_filter(not, depth + 1),
-        Filter::Cmp { col, op, value } => {
-            let ct = col_type(col).ok_or(Fail::Invalid)?;
-            match op {
-                CmpOp::IsNull => Ok(()),
-                CmpOp::In => {
-                    let arr = value.as_array().ok_or(Fail::Invalid)?;
-                    if arr.len() > 1000 {
-                        return Err(Fail::Invalid);
-                    }
-                    arr.iter().try_for_each(|v| cmp_value(ct, v).map(|_| ()))
-                }
-                CmpOp::Prefix => {
-                    if ct != Ct::Str {
-                        return Err(Fail::Invalid);
-                    }
-                    cmp_value(ct, value).map(|_| ())
-                }
-                _ => cmp_value(ct, value).map(|_| ()),
+/// Whether a parsed table filter fits the table: every column exists, takes
+/// its op, and every value has its type.
+fn filter_binds(v: &Json) -> bool {
+    match filter_shape(v) {
+        FilterShape::And(fs) | FilterShape::Or(fs) => fs.iter().all(filter_binds),
+        FilterShape::Not(f) => filter_binds(f),
+        FilterShape::Cmp(o) => {
+            let Some(ct) = o.get("col").and_then(Json::as_str).and_then(col_type) else { return false };
+            let fits = |v: &Json| match ct {
+                Ct::Int => v.is_i64(),
+                Ct::Str => v.is_string(),
+                Ct::Json => true,
+            };
+            match (o["op"].as_str(), o.get("value")) {
+                (Some("exists"), _) => true,
+                (Some("prefix" | "contains"), _) if ct == Ct::Int => false,
+                (Some("in"), Some(Json::Array(a))) => a.iter().all(fits),
+                (_, Some(v)) => fits(v),
+                _ => false,
             }
         }
     }
 }
 
-fn eval_filter(f: &Filter, pk: i64, r: &MRow) -> bool {
-    use Ordering::*;
-    match f {
-        Filter::And { and } => and.iter().all(|x| eval_filter(x, pk, r)),
-        Filter::Or { or } => or.iter().any(|x| eval_filter(x, pk, r)),
-        Filter::Not { not } => !eval_filter(not, pk, r),
-        Filter::Cmp { col, op, value } => {
-            let Some(ct) = col_type(col) else { return false };
-            let d = row_datum(pk, r, col);
-            if *op == CmpOp::IsNull {
-                return d == Datum::Null;
-            }
-            if d == Datum::Null {
-                return false;
-            }
-            match op {
-                CmpOp::In => value.as_array().is_some_and(|arr| {
-                    arr.iter().filter_map(|v| cmp_value(ct, v).ok()).any(|v| datum_cmp(&d, &v) == Some(Equal))
-                }),
-                CmpOp::Prefix => match (&d, cmp_value(ct, value)) {
-                    (Datum::Str(x), Ok(Datum::Str(p))) => x.starts_with(&p),
-                    _ => false,
-                },
-                _ => {
-                    let Ok(v) = cmp_value(ct, value) else { return false };
-                    let o = datum_cmp(&d, &v);
-                    match op {
-                        CmpOp::Eq => o == Some(Equal),
-                        CmpOp::Ne => o.is_some_and(|o| o != Equal),
-                        CmpOp::Lt => o == Some(Less),
-                        CmpOp::Le => matches!(o, Some(Less | Equal)),
-                        CmpOp::Gt => o == Some(Greater),
-                        CmpOp::Ge => matches!(o, Some(Greater | Equal)),
-                        _ => false,
-                    }
-                }
-            }
-        }
-    }
+fn row_matches(f: &Json, pk: i64, r: &MRow) -> bool {
+    filter_eval(f, &|o: &Map<String, Json>| {
+        let col = o["col"].as_str().unwrap_or("");
+        cmp_holds(o, row_value(pk, r, col).as_ref())
+    })
 }
 
 fn cmp_vec(a: &[TKey], b: &[TKey]) -> Ordering {
@@ -647,6 +763,203 @@ fn entry_vec(index: Option<&str>, pk: i64, r: &MRow) -> Vec<TKey> {
     }
 }
 
+fn valid_stream_name(s: &str) -> bool {
+    (1..=128).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+}
+
+fn varint_len(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+/// The bytes a record counts as: its body, headers and their framing.
+fn record_size(r: &MRecord) -> usize {
+    let headers: usize = r
+        .headers
+        .iter()
+        .map(|(k, v)| varint_len(k.len() as u64) + k.len() + varint_len(v.len() as u64) + v.len())
+        .sum();
+    1 + varint_len(r.headers.len() as u64) + headers + r.data.len()
+}
+
+fn new_record(enc: Encoding, r: &NewRecord) -> MResult<MRecord> {
+    let (data, json) = match (&r.value, &r.json) {
+        (Some(v), None) => (decode(enc, v)?, None),
+        (None, Some(j)) => (j.to_string().into_bytes(), Some(j.clone())),
+        _ => return Err(Fail::Invalid),
+    };
+    if r.headers.len() > 64 || r.headers.iter().any(|(k, v)| k.is_empty() || k.len() > 128 || v.len() > 4096) {
+        return Err(Fail::Invalid);
+    }
+    Ok(MRecord { data, json, headers: r.headers.clone() })
+}
+
+fn stream_record_json(enc: Encoding, seq: u64, r: &MRecord) -> Json {
+    let mut m = Map::new();
+    m.insert("seq".into(), json!(seq));
+    m.insert("time".into(), json!(ANY_NUMBER));
+    if !r.headers.is_empty() {
+        m.insert("headers".into(), json!(r.headers));
+    }
+    match &r.json {
+        Some(j) => {
+            m.insert("json".into(), j.clone());
+        }
+        None => put_bytes(enc, "value", &r.data, &mut m),
+    }
+    Json::Object(m)
+}
+
+const FILTER_OPS: [&str; 10] = ["eq", "ne", "lt", "le", "gt", "ge", "in", "prefix", "contains", "exists"];
+
+/// A node of a filter that parses: exactly one of `and`, `or`, `not`, else
+/// a comparison.
+enum FilterShape<'a> {
+    And(&'a [Json]),
+    Or(&'a [Json]),
+    Not(&'a Json),
+    Cmp(&'a Map<String, Json>),
+}
+
+fn filter_shape(v: &Json) -> FilterShape<'_> {
+    let o = v.as_object().expect("a parsed filter is an object");
+    match (o.get("and"), o.get("or"), o.get("not")) {
+        (Some(Json::Array(a)), ..) => FilterShape::And(a),
+        (_, Some(Json::Array(a)), _) => FilterShape::Or(a),
+        (.., Some(n)) => FilterShape::Not(n),
+        _ => FilterShape::Cmp(o),
+    }
+}
+
+/// Whether a comparison's keys name an operand of a layer, given its op and value.
+type OperandOk = fn(&Map<String, Json>, &str, Option<&Json>) -> bool;
+
+fn table_operand(o: &Map<String, Json>, _: &str, _: Option<&Json>) -> bool {
+    o.get("col").is_some_and(Json::is_string) && o.keys().all(|k| ["col", "op", "value"].contains(&k.as_str()))
+}
+
+fn stream_operand(o: &Map<String, Json>, op: &str, value: Option<&Json>) -> bool {
+    let name = |k: &str, max: usize| o.get(k).map(|v| v.as_str().is_some_and(|s| (1..=max).contains(&s.len())));
+    let known = o.keys().all(|k| ["field", "header", "op", "value"].contains(&k.as_str()));
+    known
+        && match (name("field", 256), name("header", 128)) {
+            (Some(false), _) | (_, Some(false)) | (Some(_), Some(_)) => false,
+            (None, None) => op == "contains" && value.is_some_and(Json::is_string),
+            _ => true,
+        }
+}
+
+fn filter_parses(v: &Json, operand_ok: OperandOk) -> bool {
+    fn node(v: &Json, ok: OperandOk, depth: usize, nodes: &mut usize) -> bool {
+        *nodes += 1;
+        let Some(o) = v.as_object().filter(|_| depth <= 16 && *nodes <= 256) else { return false };
+        if ["and", "or", "not"].iter().any(|k| o.contains_key(*k)) {
+            return o.len() == 1
+                && match (o.get("and").or(o.get("or")), o.get("not")) {
+                    (Some(Json::Array(fs)), _) => fs.iter().all(|f| node(f, ok, depth + 1, nodes)),
+                    (_, Some(f)) => node(f, ok, depth + 1, nodes),
+                    _ => false,
+                };
+        }
+        let Some(op) = o.get("op").and_then(Json::as_str).filter(|op| FILTER_OPS.contains(op)) else { return false };
+        let value = o.get("value");
+        let value_ok = match (op, value) {
+            ("exists", v) => v.is_none(),
+            (_, None | Some(Json::Null)) => false,
+            ("in", Some(v)) => v.as_array().is_some_and(|a| a.len() <= 1000 && a.iter().all(|x| !x.is_null())),
+            ("prefix", Some(v)) => v.is_string(),
+            ("lt" | "le" | "gt" | "ge", Some(v)) => v.is_number() || v.is_string() || v.is_boolean(),
+            _ => true,
+        };
+        value_ok && ok(o, op, value)
+    }
+    node(v, operand_ok, 0, &mut 0)
+}
+
+/// Evaluates a filter that parses, deciding each comparison with `cmp`.
+fn filter_eval(v: &Json, cmp: &dyn Fn(&Map<String, Json>) -> bool) -> bool {
+    match filter_shape(v) {
+        FilterShape::And(fs) => fs.iter().all(|f| filter_eval(f, cmp)),
+        FilterShape::Or(fs) => fs.iter().any(|f| filter_eval(f, cmp)),
+        FilterShape::Not(f) => !filter_eval(f, cmp),
+        FilterShape::Cmp(o) => cmp(o),
+    }
+}
+
+fn numbers_cmp(a: &serde_json::Number, b: &serde_json::Number) -> Option<Ordering> {
+    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+        return Some(x.cmp(&y));
+    }
+    if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
+        return Some(x.cmp(&y));
+    }
+    a.as_f64()?.partial_cmp(&b.as_f64()?)
+}
+
+fn same(a: &Json, b: &Json) -> bool {
+    match (a, b) {
+        (Json::Number(x), Json::Number(y)) => numbers_cmp(x, y) == Some(Ordering::Equal),
+        (Json::Array(x), Json::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same(a, b)),
+        (Json::Object(x), Json::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, a)| y.get(k).is_some_and(|b| same(a, b)))
+        }
+        _ => a == b,
+    }
+}
+
+/// Whether comparison `o` holds of a value. A missing or null value fails
+/// every comparison.
+fn cmp_holds(o: &Map<String, Json>, target: Option<&Json>) -> bool {
+    let Some(t) = target.filter(|t| !t.is_null()) else { return false };
+    let value = o.get("value").unwrap_or(&Json::Null);
+    let order = || match (t, value) {
+        (Json::Number(x), Json::Number(y)) => numbers_cmp(x, y),
+        (Json::String(x), Json::String(y)) => Some(x.cmp(y)),
+        (Json::Bool(x), Json::Bool(y)) => Some(x.cmp(y)),
+        _ => None,
+    };
+    match o["op"].as_str().unwrap_or("") {
+        "eq" => same(t, value),
+        "ne" => !same(t, value),
+        "lt" => order() == Some(Ordering::Less),
+        "le" => matches!(order(), Some(Ordering::Less | Ordering::Equal)),
+        "gt" => order() == Some(Ordering::Greater),
+        "ge" => matches!(order(), Some(Ordering::Greater | Ordering::Equal)),
+        "in" => value.as_array().is_some_and(|a| a.iter().any(|x| same(t, x))),
+        "prefix" => matches!((t, value), (Json::String(x), Json::String(p)) if x.starts_with(p.as_str())),
+        "contains" => match (t, value) {
+            (Json::String(x), Json::String(p)) => x.contains(p.as_str()),
+            (Json::Array(a), x) => a.iter().any(|e| same(e, x)),
+            _ => false,
+        },
+        _ => true,
+    }
+}
+
+fn record_matches(f: &Json, r: &MRecord) -> bool {
+    filter_eval(f, &|o: &Map<String, Json>| match (o.get("field"), o.get("header")) {
+        (Some(f), _) => {
+            let found = r.json.as_ref().and_then(|d| {
+                f.as_str().unwrap_or("").split('.').try_fold(d, |cur, seg| match cur {
+                    Json::Object(o) => o.get(seg),
+                    Json::Array(a) => seg.parse::<usize>().ok().and_then(|i| a.get(i)),
+                    _ => None,
+                })
+            });
+            cmp_holds(o, found)
+        }
+        (_, Some(h)) => cmp_holds(o, r.headers.get(h.as_str().unwrap_or("")).map(|v| json!(v)).as_ref()),
+        _ => {
+            let needle = o["value"].as_str().unwrap_or("").as_bytes();
+            needle.is_empty() || r.data.windows(needle.len()).any(|w| w == needle)
+        }
+    })
+}
+
 struct Out {
     json: Json,
     cursor: Option<(Option<String>, Vec<TKey>)>,
@@ -662,7 +975,7 @@ struct QueryArgs<'q> {
     index: &'q Option<String>,
     eq: &'q [Json],
     range: &'q Option<RangeSpec>,
-    filter: &'q Option<Filter>,
+    filter: &'q Option<Json>,
     limit: Option<usize>,
     reverse: bool,
     cursor: &'q Option<String>,
@@ -672,11 +985,13 @@ struct World {
     snap: Snapshot,
     version: u64,
     last_write: BTreeMap<Vec<u8>, u64>,
-    idem: BTreeMap<String, u64>,
+    idem: BTreeMap<String, (u64, Vec<u64>)>,
     staged: BTreeMap<String, (Vec<u8>, String)>,
     query_cursors: BTreeMap<String, (Option<String>, Vec<TKey>)>,
     inline_max: usize,
     json_max: u64,
+    record_max: usize,
+    stream_log: BTreeMap<String, StreamLog>,
 }
 
 fn put_bytes(enc: Encoding, field: &str, b: &[u8], m: &mut Map<String, Json>) {
@@ -978,19 +1293,217 @@ impl World {
                 let next = stop.as_ref().map(|_| ANY);
                 Ok(Out { json: json!({"rows": rows, "next_cursor": next}), cursor: stop.map(|v| (index.clone(), v)) })
             }
+            Op::Append { stream, records, expect_seq, create } => {
+                let records = records.iter().map(|r| new_record(enc, r)).collect::<MResult<Vec<_>>>()?;
+                let sizes: Vec<usize> = records.iter().map(record_size).collect();
+                if sizes.iter().any(|n| *n > self.record_max) {
+                    return Err(Fail::TooLarge);
+                }
+                if !valid_stream_name(stream) {
+                    return Err(Fail::Invalid);
+                }
+                t.stream_keys.push(StreamRead::Catalog(stream.clone()));
+                if t.stream(stream).is_none() {
+                    if !create {
+                        return Err(Fail::NotFound);
+                    }
+                    t.stream_writes.push(StreamWrite::Create(stream.clone()));
+                }
+                let n = records.len();
+                t.stream_writes.push(StreamWrite::Append {
+                    stream: stream.clone(),
+                    records,
+                    expect: *expect_seq,
+                    op_index: t.op_index,
+                });
+                Ok(json!({"count": n}).into())
+            }
+            Op::ReadStream {
+                stream,
+                from_seq,
+                from_time,
+                tail,
+                consumer,
+                until_seq,
+                until_time,
+                reverse,
+                limit,
+                max_bytes,
+                filter,
+                scan_limit,
+            } => {
+                let starts = [from_seq.is_some(), from_time.is_some(), tail.is_some(), consumer.is_some()];
+                if starts.iter().filter(|x| **x).count() > 1
+                    || until_seq.is_some() && until_time.is_some()
+                    || limit.is_some_and(|l| !(1..=1000).contains(&l))
+                    || max_bytes.is_some_and(|b| !(1..=16 << 20).contains(&b))
+                    || scan_limit.is_some_and(|l| !(1..=100_000).contains(&l))
+                    || consumer.as_ref().is_some_and(|c| !valid_stream_name(c))
+                    || !valid_stream_name(stream)
+                {
+                    return Err(Fail::Invalid);
+                }
+                t.stream_keys.push(StreamRead::Catalog(stream.clone()));
+                let st = t.stream(stream).ok_or(Fail::NotFound)?;
+                if from_time.is_some() || until_time.is_some() {
+                    return Err(Fail::Unmodeled);
+                }
+                let lo = match (from_seq, tail, consumer) {
+                    (Some(s), ..) => *s,
+                    (_, Some(n), _) => {
+                        t.stream_reads.push(StreamRead::State(stream.clone()));
+                        st.next().saturating_sub(*n)
+                    }
+                    (_, _, Some(c)) => {
+                        t.stream_reads.push(StreamRead::Consumer(stream.clone(), c.clone()));
+                        let own = t.consumer_writes.get(&(stream.clone(), c.clone()));
+                        own.or(st.consumers.get(c)).copied().unwrap_or(0)
+                    }
+                    _ => 0,
+                }
+                .max(st.first);
+                let hi = until_seq.unwrap_or(u64::MAX).min(st.next());
+                let mut seqs: Vec<u64> = (lo..hi.max(lo)).collect();
+                if *reverse {
+                    seqs.reverse();
+                }
+                let (limit, scan) = (limit.unwrap_or(100), scan_limit.unwrap_or(10_000));
+                let max_bytes = max_bytes.unwrap_or(4 << 20);
+                let (mut out, mut bytes, mut scanned, mut last) = (Vec::new(), 0, 0, None);
+                let mut it = seqs.into_iter();
+                let exhausted = loop {
+                    if out.len() >= limit || bytes >= max_bytes || scanned >= scan {
+                        break false;
+                    }
+                    let Some(seq) = it.next() else { break true };
+                    scanned += 1;
+                    last = Some(seq);
+                    let r = &st.records[seq as usize];
+                    if filter.as_ref().is_none_or(|f| record_matches(f, r)) {
+                        bytes += record_size(r);
+                        out.push(stream_record_json(enc, seq, r));
+                    }
+                };
+                let next_seq = match (*reverse, exhausted, last) {
+                    (false, false, Some(l)) => l + 1,
+                    (false, _, _) => hi.max(lo),
+                    (true, false, Some(l)) => l,
+                    (true, _, _) => lo.min(hi),
+                };
+                let (rlo, rhi) = match (*reverse, exhausted) {
+                    (false, true) => (lo, *until_seq),
+                    (false, false) => (lo, Some(next_seq)),
+                    (true, true) => (lo, *until_seq),
+                    (true, false) => (next_seq, *until_seq),
+                };
+                t.stream_reads.push(StreamRead::Range(stream.clone(), rlo, rhi));
+                Ok(json!({"records": out, "next_seq": next_seq, "done": exhausted}).into())
+            }
+            Op::StreamInfo { stream } => {
+                if !valid_stream_name(stream) {
+                    return Err(Fail::Invalid);
+                }
+                t.stream_keys.push(StreamRead::Catalog(stream.clone()));
+                let st = t.stream(stream).ok_or(Fail::NotFound)?;
+                t.stream_reads.push(StreamRead::State(stream.clone()));
+                let mut m = json!({"first_seq": st.first, "next_seq": st.next(), "bytes": ANY_NUMBER});
+                if st.next() > st.first {
+                    m["first_time"] = json!(ANY_NUMBER);
+                    m["last_time"] = json!(ANY_NUMBER);
+                }
+                Ok(m.into())
+            }
+            Op::TrimStream { stream, before_seq, before_time } => {
+                if !valid_stream_name(stream) {
+                    return Err(Fail::Invalid);
+                }
+                t.stream_keys.push(StreamRead::Catalog(stream.clone()));
+                t.stream(stream).ok_or(Fail::NotFound)?;
+                let before = match (before_seq, before_time) {
+                    (Some(b), None) => *b,
+                    (None, Some(_)) => return Err(Fail::Unmodeled),
+                    _ => return Err(Fail::Invalid),
+                };
+                t.stream_writes.push(StreamWrite::Trim(stream.clone(), before));
+                Ok(json!({}).into())
+            }
+            Op::GetConsumer { stream, consumer } => {
+                if !valid_stream_name(stream) {
+                    return Err(Fail::Invalid);
+                }
+                t.stream_keys.push(StreamRead::Catalog(stream.clone()));
+                let st = t.stream(stream).ok_or(Fail::NotFound)?;
+                if !valid_stream_name(consumer) {
+                    return Err(Fail::Invalid);
+                }
+                t.stream_reads.push(StreamRead::Consumer(stream.clone(), consumer.clone()));
+                let own = t.consumer_writes.get(&(stream.clone(), consumer.clone()));
+                Ok(match own.or(st.consumers.get(consumer)) {
+                    Some(seq) => json!({"found": true, "seq": seq}),
+                    None => json!({"found": false}),
+                }
+                .into())
+            }
+            Op::SetConsumer { stream, consumer, seq } => {
+                if !valid_stream_name(consumer) || !valid_stream_name(stream) {
+                    return Err(Fail::Invalid);
+                }
+                t.stream_keys.push(StreamRead::Catalog(stream.clone()));
+                if *seq > t.stream(stream).ok_or(Fail::NotFound)?.next() {
+                    return Err(Fail::Invalid);
+                }
+                t.consumer_writes.insert((stream.clone(), consumer.clone()), *seq);
+                Ok(json!({}).into())
+            }
+        }
+    }
+
+    /// The first seq each append of `t` receives if it commits now, or why
+    /// it fails: an expected seq that no longer holds.
+    fn stream_outcome(&self, t: &TxnView) -> std::result::Result<Vec<u64>, usize> {
+        let mut next: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut firsts = Vec::new();
+        for w in &t.stream_writes {
+            if let StreamWrite::Append { stream, records, expect, op_index } = w {
+                let n = next.entry(stream).or_insert_with(|| self.snap.streams.get(stream).map_or(0, |s| s.next()));
+                if expect.is_some_and(|x| x != *n) {
+                    return Err(*op_index);
+                }
+                firsts.push(*n);
+                *n += records.len() as u64;
+            }
+        }
+        Ok(firsts)
+    }
+
+    fn stream_changed(&self, r: &StreamRead, rv: u64) -> bool {
+        let empty = StreamLog::default();
+        let name = match r {
+            StreamRead::Catalog(n) | StreamRead::State(n) | StreamRead::Range(n, ..) | StreamRead::Consumer(n, _) => n,
+        };
+        let log = self.stream_log.get(name).unwrap_or(&empty);
+        match r {
+            StreamRead::Catalog(_) => log.catalog > rv,
+            StreamRead::State(_) => log.state > rv,
+            StreamRead::Range(_, lo, hi) => {
+                let below_hi = |s: u64| hi.is_none_or(|h| s < h);
+                log.appends.iter().any(|(v, f, c)| *v > rv && *c > 0 && f + c > *lo && below_hi(*f))
+                    || log.trims.iter().any(|(v, target)| *v > rv && *target > *lo && below_hi(*lo))
+            }
+            StreamRead::Consumer(_, c) => log.consumers.get(c).is_some_and(|v| *v > rv),
         }
     }
 
     fn plan(
         &self,
         t: &TxnView,
-        sel: (&Option<String>, &[Json], &Option<RangeSpec>, &Option<Filter>),
+        sel: (&Option<String>, &[Json], &Option<RangeSpec>, &Option<Json>),
         cursor: &Option<String>,
         reverse: bool,
     ) -> MResult<Vec<(Vec<TKey>, i64)>> {
         let (index, eq, range, filter) = sel;
-        if let Some(f) = filter {
-            validate_filter(f, 0)?;
+        if filter.as_ref().is_some_and(|f| !filter_binds(f)) {
+            return Err(Fail::Invalid);
         }
         let ct = match index.as_deref() {
             None => Ct::Int,
@@ -1076,7 +1589,7 @@ impl World {
         for chunk in entries.chunks(page) {
             for (pos, (v, pk)) in chunk.iter().enumerate() {
                 let r = &rows[pk];
-                if q.filter.as_ref().is_none_or(|f| eval_filter(f, *pk, r)) {
+                if q.filter.as_ref().is_none_or(|f| row_matches(f, *pk, r)) {
                     out.push(row_json(*pk, r));
                 }
                 if out.len() >= limit {
@@ -1096,7 +1609,7 @@ impl World {
         let rows = t.rows();
         Ok(entries
             .iter()
-            .filter(|(_, pk)| sel.filter.as_ref().is_none_or(|f| eval_filter(f, *pk, &rows[pk])))
+            .filter(|(_, pk)| sel.filter.as_ref().is_none_or(|f| row_matches(f, *pk, &rows[pk])))
             .map(|(_, pk)| *pk)
             .take(limit.unwrap_or(usize::MAX))
             .collect())
@@ -1118,10 +1631,20 @@ impl World {
             }
         };
         let changed = |k: &[u8]| self.last_write.get(k).is_some_and(|v| *v > t.rv);
-        Some(items.iter().any(|it| match it {
+        let kv = items.iter().any(|it| match it {
             ReadItem::Key(k) => changed(k),
             ReadItem::Range(r) => self.last_write.iter().any(|(k, v)| *v > t.rv && r.contains(k)),
-        }))
+        });
+        // Catalog entries a stream op reads are pinned: validated at every isolation level.
+        let pinned = t.stream_keys.iter().any(|r| self.stream_changed(r, t.rv));
+        let streams = match iso {
+            Iso::Serializable => t.stream_reads.iter().any(|r| self.stream_changed(r, t.rv)),
+            Iso::Snapshot => t
+                .consumer_writes
+                .keys()
+                .any(|(s, c)| self.stream_changed(&StreamRead::Consumer(s.clone(), c.clone()), t.rv)),
+        };
+        Some(kv || pinned || streams)
     }
 
     fn apply(&mut self, t: TxnView, version: u64) -> Result<(), String> {
@@ -1145,6 +1668,32 @@ impl World {
                 Some(r) => self.snap.rows.insert(pk, MRow { expiry: r.expiry.committed(), ..r }),
                 None => self.snap.rows.remove(&pk),
             };
+        }
+        for w in t.stream_writes {
+            let name = match &w {
+                StreamWrite::Create(n) | StreamWrite::Append { stream: n, .. } | StreamWrite::Trim(n, _) => n.clone(),
+            };
+            let log = self.stream_log.entry(name.clone()).or_default();
+            log.state = version;
+            let st = self.snap.streams.entry(name).or_default();
+            match w {
+                StreamWrite::Create(_) => log.catalog = version,
+                StreamWrite::Append { records, .. } => {
+                    log.appends.push((version, st.next(), records.len() as u64));
+                    st.records.extend(records);
+                }
+                StreamWrite::Trim(_, before) => {
+                    let target = before.clamp(st.first, st.next());
+                    if target > st.first {
+                        st.first = target;
+                        log.trims.push((version, target));
+                    }
+                }
+            }
+        }
+        for ((name, c), seq) in t.consumer_writes {
+            self.stream_log.entry(name.clone()).or_default().consumers.insert(c.clone(), version);
+            self.snap.streams.entry(name).or_default().consumers.insert(c, seq);
         }
         self.version = version;
         let mut names = std::collections::BTreeSet::new();
@@ -1464,25 +2013,36 @@ impl Gen<'_, '_> {
     }
 
     fn filter(&mut self, depth: u32) -> Json {
-        match self.u.below(if depth > 1 { 1 } else { 5 }) {
+        match self.u.below(if depth > 1 { 1 } else { 6 }) {
             0 => {
                 let col = if self.u.chance(8) { "nope" } else { self.u.pick(&["name", "grp", "id", "doc"]) };
-                let op = self.u.pick(&["eq", "ne", "lt", "le", "gt", "ge", "in", "prefix", "is_null"]);
+                let op = self.u.pick(&FILTER_OPS);
                 let value = if self.u.chance(24) {
-                    self.u.pick(&[Json::Null, json!("bob"), json!(1), json!([0, 1, "bob", null])])
+                    Some(self.u.pick(&[Json::Null, json!("bob"), json!(1), json!([0, 1, "bob", null])]))
+                } else if op == "exists" {
+                    None
                 } else if op == "in" {
-                    let mut vals = Vec::new();
-                    for _ in 0..self.u.below(4) {
-                        vals.push(self.cmp_value(col));
-                    }
-                    Json::Array(vals)
+                    Some(Json::Array((0..self.u.below(4)).map(|_| self.cmp_value(col)).collect()))
                 } else {
-                    self.cmp_value(col)
+                    Some(self.cmp_value(col))
                 };
-                json!({"col": col, "op": op, "value": value})
+                let mut f = json!({"col": col, "op": op});
+                if let Some(v) = value {
+                    f["value"] = v;
+                }
+                f
             }
             1 => json!({"and": [self.filter(depth + 1), self.filter(depth + 1)]}),
             2 => json!({"or": [self.filter(depth + 1), self.filter(depth + 1)]}),
+            3 if self.u.chance(16) => {
+                let a = self.filter(depth + 1);
+                self.u.pick(&[
+                    json!({"and": [a], "or": [a]}),
+                    json!({"not": a, "col": "name", "op": "exists"}),
+                    json!({"and": [], "bogus": 1}),
+                    json!({"col": "name", "op": "exists", "value": 1}),
+                ])
+            }
             _ => json!({"not": self.filter(depth + 1)}),
         }
     }
@@ -1490,7 +2050,7 @@ impl Gen<'_, '_> {
     fn cmp_value(&mut self, col: &str) -> Json {
         match col {
             "name" => json!(self.u.pick(&["ann", "bob", "cy", "é", "", "a", "an", "bo"])),
-            "doc" => self.u.pick(&[json!({"k": true}), json!("s"), json!(7)]),
+            "doc" => self.u.pick(&[json!({"k": true}), json!("s"), json!(7), json!(7.0), json!("y"), json!(1)]),
             _ => json!(self.u.below(5) as i64 - 1),
         }
     }
@@ -1581,8 +2141,119 @@ impl Gen<'_, '_> {
         o
     }
 
+    fn stream(&mut self) -> &'static str {
+        self.u.pick(&["s1", "s2", "s1", "s2", "s3", "bad/name"])
+    }
+
+    fn new_record(&mut self, enc: Encoding) -> Json {
+        let mut r = match self.u.below(16) {
+            0..=6 => json!({"value": self.value(enc)}),
+            7..=12 => json!({"json": self.u.pick(&[json!({"a": 1, "k": "v"}), json!({"a": 2}), json!("x"),
+                json!([1, "a"]), Json::Null, json!({"a": 1.5, "n": {"x": true}}), json!({"a": null, "k": "w"})])}),
+            13 => json!({"value": "v", "json": 1}),
+            14 => json!({}),
+            _ => json!({"value": enc_str(enc, &vec![b'z'; 9_000])}),
+        };
+        if self.u.chance(60) {
+            r["headers"] = json!({"h": self.u.pick(&["v", "w", ""])});
+        }
+        r
+    }
+
+    fn stream_filter(&mut self) -> Json {
+        match self.u.below(12) {
+            0 => {
+                json!({"field": "a", "op": self.u.pick(&["eq", "ne", "lt", "ge", "in"]), "value": self.u.pick(&[json!(1), json!(1.5), json!([1, 2]), json!("x")])})
+            }
+            1 => json!({"field": "n.x", "op": "exists"}),
+            2 => json!({"header": "h", "op": self.u.pick(&["eq", "ne"]), "value": self.u.pick(&["v", "w"])}),
+            3 => json!({"op": "contains", "value": self.u.pick(&["v", "a\"", "1"])}),
+            4 => json!({"not": {"field": "k", "op": "prefix", "value": "v"}}),
+            5 => json!({"and": [{"field": "a", "op": "gt", "value": 0}, {"header": "h", "op": "ne", "value": "w"}]}),
+            6 => json!({"field": "a", "header": "h", "op": "eq", "value": 1}),
+            7 => json!({"op": "eq", "value": 1}),
+            8 => json!({"and": [{"field": "a", "op": "exists"}], "or": [{"header": "h", "op": "exists"}]}),
+            9 => json!({"not": {"field": "a", "op": "exists"}, "field": "b", "op": "exists"}),
+            10 => json!({"and": [], "bogus": 1}),
+            _ => json!({"bogus": 1}),
+        }
+    }
+
+    fn stream_op(&mut self, enc: Encoding) -> Json {
+        let stream = self.stream();
+        let next = self.w.snap.streams.get(stream).map_or(0, |s| s.next());
+        match self.u.below(8) {
+            0..=2 => {
+                let n = self.u.below(4).max(if self.u.chance(240) { 1 } else { 0 });
+                let records: Vec<Json> = (0..n).map(|_| self.new_record(enc)).collect();
+                let mut o = json!({"op": "append", "stream": stream, "records": records});
+                if self.u.chance(60) {
+                    o["expect_seq"] = json!(next + self.u.pick(&[0, 0, 0, 1]));
+                }
+                if self.u.chance(40) {
+                    o["create"] = json!(true);
+                }
+                o
+            }
+            3 | 4 => {
+                let mut o = json!({"op": "read_stream", "stream": stream});
+                match self.u.below(8) {
+                    0 | 1 => o["from_seq"] = json!(self.u.below(8)),
+                    2 => o["tail"] = json!(self.u.below(5)),
+                    3 => o["consumer"] = json!(self.u.pick(&["c1", "c2"])),
+                    4 if self.u.chance(16) => {
+                        o["from_seq"] = json!(1);
+                        o["tail"] = json!(1);
+                    }
+                    _ => {}
+                }
+                if self.u.chance(50) {
+                    o["until_seq"] = json!(self.u.below(8));
+                }
+                if self.u.chance(80) {
+                    o["reverse"] = json!(true);
+                }
+                if let Some(l) = self.limit() {
+                    o["limit"] = l;
+                }
+                if self.u.chance(40) {
+                    o["max_bytes"] = json!(self.u.pick(&[0, 1, 40, 200]));
+                }
+                if self.u.chance(60) {
+                    o["filter"] = self.stream_filter();
+                }
+                if self.u.chance(40) {
+                    o["scan_limit"] = json!(self.u.pick(&[0, 1, 3, 100_001]));
+                }
+                o
+            }
+            5 => json!({"op": "stream_info", "stream": stream}),
+            6 => {
+                let mut o = json!({"op": "trim_stream", "stream": stream});
+                match self.u.below(8) {
+                    0 => {}
+                    1 => {
+                        o["before_seq"] = json!(1);
+                        o["before_time"] = json!(1);
+                    }
+                    _ => o["before_seq"] = json!(next.saturating_sub(self.u.below(4) as u64)),
+                }
+                o
+            }
+            _ => {
+                let consumer = self.u.pick(&["c1", "c2", "bad/c"]);
+                match self.u.chance(128) {
+                    true => json!({"op": "get_consumer", "stream": stream, "consumer": consumer}),
+                    false => {
+                        json!({"op": "set_consumer", "stream": stream, "consumer": consumer, "seq": self.u.below(6)})
+                    }
+                }
+            }
+        }
+    }
+
     fn op(&mut self, enc: Encoding) -> Json {
-        let mut o = match self.u.below(19) {
+        let mut o = match self.u.below(24) {
             0 | 1 => json!({"op": "get", "key": self.key(enc)}),
             2 => self.scan(enc),
             3 | 4 => {
@@ -1657,6 +2328,7 @@ impl Gen<'_, '_> {
                 self.selection(&mut o);
                 o
             }
+            19..=23 => self.stream_op(enc),
             _ => self.query(),
         };
         if self.u.chance(6) {
@@ -1840,23 +2512,11 @@ impl<'a> Session<'a> {
     async fn submit_one_shot(&mut self, body: &Json) -> Result<(), String> {
         let bytes = self.body_bytes(body);
         let path = self.path("/txn");
-        let Some(req) = parse_body::<OneShotBody>(&bytes) else {
+        let Some(req) = parse_body::<OneShotBody>(&bytes).filter(|r| !r.ops.iter().any(Op::unparseable)) else {
             self.expect("POST", &path, bytes, &Expect::Any4xx).await?;
             return Ok(());
         };
         let writes = req.ops.iter().any(|o| o.is_write());
-        if let Some(k) = &req.idempotency_key {
-            if k.is_empty() || k.len() > 200 {
-                self.expect("POST", &path, bytes, &Expect::Err(Fail::Invalid, None)).await?;
-                return Ok(());
-            }
-            if let Some(v) = self.w.idem.get(k) {
-                let want =
-                    json!({"version": v, "committed": true, "replayed": true, "commit_id": ANY, "results": null});
-                self.expect("POST", &path, bytes, &Expect::Ok(200, want)).await?;
-                return Ok(());
-            }
-        }
         let snapshot = match req.consistency.as_deref() {
             None | Some("strong") => false,
             Some("snapshot") => true,
@@ -1869,9 +2529,22 @@ impl<'a> Session<'a> {
             self.expect("POST", &path, bytes, &Expect::Err(Fail::Invalid, None)).await?;
             return Ok(());
         }
+        if let Some(k) = &req.idempotency_key {
+            if k.is_empty() || k.len() > 200 {
+                self.expect("POST", &path, bytes, &Expect::Err(Fail::Invalid, None)).await?;
+                return Ok(());
+            }
+            if let Some((v, appends)) = self.w.idem.get(k) {
+                let want = json!({"version": v, "committed": true, "replayed": true, "commit_id": ANY,
+                    "results": null, "appends": appends});
+                self.expect("POST", &path, bytes, &Expect::Ok(200, want)).await?;
+                return Ok(());
+            }
+        }
         let mut t = TxnView::new(self.w.snap.clone(), self.w.version);
         let mut outs = Vec::new();
         for (i, op) in req.ops.iter().enumerate() {
+            t.op_index = i;
             match self.w.exec(&mut t, req.encoding, op) {
                 Ok(o) => outs.push(o),
                 Err(Fail::Unmodeled) => {
@@ -1886,17 +2559,29 @@ impl<'a> Session<'a> {
                 }
             }
         }
-        let results: Vec<Json> = outs.iter().map(|o| o.json.clone()).collect();
+        let mut results: Vec<Json> = outs.iter().map(|o| o.json.clone()).collect();
         let r = if !t.is_write() {
             let want = json!({"version": self.w.version, "committed": false, "results": results});
             self.expect("POST", &path, bytes, &Expect::Ok(200, want)).await?
         } else {
+            let firsts = match self.w.stream_outcome(&t) {
+                Ok(f) => f,
+                Err(i) => {
+                    self.expect("POST", &path, bytes, &Expect::Err(Fail::Precondition, Some(i))).await?;
+                    return Ok(());
+                }
+            };
+            let appended = req.ops.iter().zip(results.iter_mut()).filter(|(o, _)| matches!(o, Op::Append { .. }));
+            for ((_, r), f) in appended.zip(&firsts) {
+                r["first_seq"] = json!(f);
+            }
             let v = self.w.version + 1;
-            let want = json!({"version": v, "committed": true, "commit_id": ANY, "results": results});
+            let want =
+                json!({"version": v, "committed": true, "commit_id": ANY, "results": results, "appends": firsts});
             let r = self.expect("POST", &path, bytes, &Expect::Ok(200, want)).await?;
             self.w.apply(t, v).map_err(|e| format!("step {}: {e}", self.step))?;
             if let Some(k) = req.idempotency_key {
-                self.w.idem.insert(k, v);
+                self.w.idem.insert(k, (v, firsts));
             }
             r
         };
@@ -1964,7 +2649,7 @@ impl<'a> Session<'a> {
         let bytes = self.body_bytes(&body);
         let id = ti.map(|i| self.txns[i].id.clone()).unwrap_or_else(|| "0123456789abcdef0123456789abcdef".into());
         let path = self.path(&format!("/transactions/{id}/ops"));
-        let Some(req) = parse_body::<OpsBody>(&bytes) else {
+        let Some(req) = parse_body::<OpsBody>(&bytes).filter(|r| !r.ops.iter().any(Op::unparseable)) else {
             self.expect("POST", &path, bytes, &Expect::Any4xx).await?;
             return Ok(());
         };
@@ -1975,6 +2660,7 @@ impl<'a> Session<'a> {
         let mut t = self.txns[ti].view.clone();
         let mut outs = Vec::new();
         for (i, op) in req.ops.iter().enumerate() {
+            t.op_index = i;
             match self.w.exec(&mut t, enc, op) {
                 Ok(o) => outs.push(o),
                 Err(Fail::Unmodeled) => {
@@ -2018,14 +2704,20 @@ impl<'a> Session<'a> {
         let t = self.txns[ti].view.clone();
         let iso = self.txns[ti].iso;
         if !t.is_write() {
-            self.expect("POST", &path, b"{}".to_vec(), &Expect::Ok(200, json!({"version": t.rv, "commit_id": ANY})))
-                .await?;
+            let want = json!({"version": t.rv, "commit_id": ANY, "appends": []});
+            self.expect("POST", &path, b"{}".to_vec(), &Expect::Ok(200, want)).await?;
             return Ok(());
         }
         let v = self.w.version + 1;
-        let committed = json!({"version": v, "commit_id": ANY});
+        let outcome = self.w.stream_outcome(&t);
+        let committed = json!({"version": v, "commit_id": ANY, "appends": outcome.clone().unwrap_or_default()});
         match self.w.conflicts(&t, iso) {
             Some(false) => {
+                if let Err(i) = outcome {
+                    let want = Expect::Err(Fail::Precondition, Some(i));
+                    self.expect("POST", &path, b"{}".to_vec(), &want).await?;
+                    return Ok(());
+                }
                 self.expect("POST", &path, b"{}".to_vec(), &Expect::Ok(200, committed)).await?;
             }
             Some(true) => {
@@ -2038,6 +2730,15 @@ impl<'a> Session<'a> {
             None => {
                 let r = self.call("POST", &path, &[], b"{}".to_vec()).await?;
                 if r.status == 409 && r.json["error"]["code"] == "conflict" {
+                    return Ok(());
+                }
+                if let Err(i) = outcome {
+                    if r.status != 412 || r.json["error"]["details"]["op_index"] != i {
+                        return Err(format!(
+                            "step {}: commit: expected 412 at op {i}, got {} {}",
+                            self.step, r.status, r.json
+                        ));
+                    }
                     return Ok(());
                 }
                 if r.status != 200 || !matches(&committed, &r.json) {
@@ -2088,6 +2789,21 @@ impl<'a> Session<'a> {
         if r.status != 200 || !matches(&want, &r.json) {
             return Err(format!("step {}: full KV check:\nwant {want}\n got {} {}", self.step, r.status, r.json));
         }
+        for (name, st) in &self.w.snap.streams {
+            let records: Vec<Json> = (st.first..st.next())
+                .map(|seq| stream_record_json(Encoding::Base64, seq, &st.records[seq as usize]))
+                .collect();
+            let want = json!({"records": records, "next_seq": st.next(), "first_seq": st.first, "tail_seq": st.next(),
+                "done": true, "version": self.w.version});
+            let path = self.path(&format!("/streams/{name}/records?limit=1000&encoding=base64"));
+            let r = self.call("GET", &path, &[], Vec::new()).await?;
+            if r.status != 200 || !matches(&want, &r.json) {
+                return Err(format!(
+                    "step {}: full {name} check:\nwant {want}\n got {} {}",
+                    self.step, r.status, r.json
+                ));
+            }
+        }
         let rows: Vec<Json> = self.w.snap.rows.iter().map(|(pk, r)| row_json(*pk, r)).collect();
         let want = json!({"rows": rows, "next_cursor": null, "version": self.w.version});
         let path = self.path("/tables/t/rows/query");
@@ -2117,6 +2833,17 @@ impl<'a> Session<'a> {
             return Err(format!("create table: {} {}", r.status, r.json));
         }
         self.w.version = r.json["version"].as_u64().ok_or("create table: no version")?;
+        for name in ["s1", "s2"] {
+            let r =
+                self.call("POST", &self.path("/streams"), &[], json!({"name": name}).to_string().into_bytes()).await?;
+            if r.status != 201 {
+                return Err(format!("create stream: {} {}", r.status, r.json));
+            }
+            self.w.version = r.json["version"].as_u64().ok_or("create stream: no version")?;
+            self.w.snap.streams.insert(name.into(), MStream::default());
+            let log = self.w.stream_log.entry(name.into()).or_default();
+            (log.catalog, log.state) = (self.w.version, self.w.version);
+        }
         self.seed_rows().await
     }
 
@@ -2205,6 +2932,8 @@ impl Harness {
             query_cursors: BTreeMap::new(),
             inline_max: cfg.engine.value_inline_max,
             json_max: cfg.node.json_value_max,
+            record_max: cfg.engine.stream_record_max,
+            stream_log: BTreeMap::new(),
         };
         let mut s = Session {
             sim: self.sim.clone(),

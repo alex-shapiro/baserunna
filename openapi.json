@@ -50,6 +50,74 @@
         ],
         "type": "object"
       },
+      "AppendRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "create": {
+            "type": "boolean"
+          },
+          "encoding": {
+            "enum": [
+              "utf8",
+              "base64"
+            ],
+            "type": "string"
+          },
+          "expect_seq": {
+            "type": "integer"
+          },
+          "idempotency_key": {
+            "type": "string"
+          },
+          "records": {
+            "items": {
+              "$ref": "#/components/schemas/NewRecord"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "records"
+        ],
+        "type": "object"
+      },
+      "Appended": {
+        "additionalProperties": false,
+        "description": "The records took seqs `first_seq` to `next_seq` (exclusive), at `time`. A replay (`replayed`) of an earlier attempt with the same idempotency key reports that attempt's records.",
+        "properties": {
+          "commit_id": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer"
+          },
+          "first_seq": {
+            "type": "integer"
+          },
+          "next_seq": {
+            "type": "integer"
+          },
+          "replayed": {
+            "type": "boolean"
+          },
+          "time": {
+            "type": "integer"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "first_seq",
+          "next_seq",
+          "count",
+          "time",
+          "version",
+          "commit_id",
+          "replayed"
+        ],
+        "type": "object"
+      },
       "Begin": {
         "additionalProperties": false,
         "properties": {
@@ -159,8 +227,17 @@
       "CommitStatus": {
         "additionalProperties": false,
         "properties": {
+          "appends": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
           "commit_id": {
             "type": "string"
+          },
+          "retention_ms": {
+            "type": "integer"
           },
           "status": {
             "enum": [
@@ -182,6 +259,12 @@
       "Committed": {
         "additionalProperties": false,
         "properties": {
+          "appends": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
           "commit_id": {
             "type": "string"
           },
@@ -192,6 +275,34 @@
         "required": [
           "version",
           "commit_id"
+        ],
+        "type": "object"
+      },
+      "Consumer": {
+        "additionalProperties": false,
+        "description": "A consumer's cursor: the seq it reads from next, and how many records it has yet to read.",
+        "properties": {
+          "lag": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "seq": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "type": "integer"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "seq",
+          "lag",
+          "updated_at"
         ],
         "type": "object"
       },
@@ -218,6 +329,27 @@
           },
           "read_only": {
             "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "CreateStream": {
+        "additionalProperties": false,
+        "description": "Names are 1-128 characters of `[A-Za-z0-9_.:-]`. Records older than `retention_ms`, or beyond the newest `max_bytes`, may be trimmed; trims run once a stream is a sixteenth past a limit, and take it back to the limit.",
+        "properties": {
+          "max_bytes": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "retention_ms": {
+            "minimum": 1,
+            "type": "integer"
           }
         },
         "required": [
@@ -517,9 +649,82 @@
         "type": "object"
       },
       "Filter": {
-        "additionalProperties": true,
-        "description": "`{\"and\": [...]}`, `{\"or\": [...]}`, `{\"not\": f}` or `{\"col\": name, \"op\": eq|ne|lt|le|gt|ge|in|prefix|is_null, \"value\": v}`.",
-        "type": "object"
+        "description": "A row filter: `and`, `or` or `not` of filters, or a comparison of the column `col`. A missing or null operand fails every comparison, `ne` included; `exists` tests for one. Numbers compare by value.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "and": {
+                "items": {
+                  "$ref": "#/components/schemas/Filter"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "and"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "or": {
+                "items": {
+                  "$ref": "#/components/schemas/Filter"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "or"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "not": {
+                "$ref": "#/components/schemas/Filter"
+              }
+            },
+            "required": [
+              "not"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "col": {
+                "type": "string"
+              },
+              "op": {
+                "enum": [
+                  "eq",
+                  "ne",
+                  "lt",
+                  "le",
+                  "gt",
+                  "ge",
+                  "in",
+                  "prefix",
+                  "contains",
+                  "exists"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "description": "Absent for `exists`, an array of at most 1000 for `in`, otherwise not null."
+              }
+            },
+            "required": [
+              "col",
+              "op"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "Found": {
         "additionalProperties": false,
@@ -546,6 +751,13 @@
             "$ref": "#/components/schemas/RowCount"
           }
         ]
+      },
+      "Headers": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "description": "Header names (1-128 bytes) to values (at most 4 KiB); at most 64.",
+        "type": "object"
       },
       "Index": {
         "additionalProperties": false,
@@ -837,6 +1049,21 @@
         ],
         "type": "object"
       },
+      "NewRecord": {
+        "additionalProperties": false,
+        "description": "Exactly one of `value` (a string in the request's encoding) and `json` (any JSON value). A record takes at most 1 MiB.",
+        "properties": {
+          "headers": {
+            "$ref": "#/components/schemas/Headers"
+          },
+          "json": {},
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
       "Node": {
         "additionalProperties": false,
         "properties": {
@@ -866,7 +1093,7 @@
         "type": "object"
       },
       "Op": {
-        "description": "One operation. Keys and values are UTF-8 strings unless the request sets `encoding: base64`. `ttl_ms` makes a value or row expire that long after the write commits; an update keeps a row's expiry unless it sets one. `update_rows` and `delete_rows` change every row `where` selects (at most `limit`), all within the transaction's write limit, and return `count`.",
+        "description": "One operation. Keys and values are UTF-8 strings unless the request sets `encoding: base64`. `ttl_ms` makes a value or row expire that long after the write commits; an update keeps a row's expiry unless it sets one. `update_rows` and `delete_rows` change every row `where` selects (at most `limit`), all within the transaction's write limit, and return `count`. Stream ops: `append` gets its seqs at commit (`expect_seq` fails the transaction with 412 unless the stream's next seq is still that); `read_stream` conflicts with appends only if it reached the stream's end, and sees the transaction's own trims but not its appends; `stream_info` conflicts with every append; `set_consumer` takes a seq at most the stream's next.",
         "oneOf": [
           {
             "additionalProperties": false,
@@ -1222,20 +1449,164 @@
               "table"
             ],
             "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "create": {
+                "type": "boolean"
+              },
+              "expect_seq": {
+                "type": "integer"
+              },
+              "op": {
+                "const": "append"
+              },
+              "records": {
+                "items": {
+                  "$ref": "#/components/schemas/NewRecord"
+                },
+                "type": "array"
+              },
+              "stream": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "stream",
+              "records"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StreamRead"
+              }
+            ],
+            "properties": {
+              "op": {
+                "const": "read_stream"
+              },
+              "stream": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "stream"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "op": {
+                "const": "stream_info"
+              },
+              "stream": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "stream"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "before_seq": {
+                "type": "integer"
+              },
+              "before_time": {
+                "type": "integer"
+              },
+              "op": {
+                "const": "trim_stream"
+              },
+              "stream": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "stream"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "consumer": {
+                "type": "string"
+              },
+              "op": {
+                "const": "get_consumer"
+              },
+              "stream": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "stream",
+              "consumer"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "consumer": {
+                "type": "string"
+              },
+              "op": {
+                "const": "set_consumer"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "stream": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "stream",
+              "consumer",
+              "seq"
+            ],
+            "type": "object"
           }
         ]
       },
       "OpResult": {
         "additionalProperties": false,
-        "description": "Result of one op; the fields present depend on the op (see Op).",
+        "description": "Result of one op; the fields present depend on the op (see Op). An `append` reports `first_seq` once the transaction commits.",
         "properties": {
           "blob": {
             "$ref": "#/components/schemas/BlobMeta"
           },
+          "bytes": {
+            "type": "integer"
+          },
           "count": {
             "type": "integer"
           },
+          "done": {
+            "type": "boolean"
+          },
           "expires_at": {
+            "type": "integer"
+          },
+          "first_seq": {
+            "type": "integer"
+          },
+          "first_time": {
             "type": "integer"
           },
           "found": {
@@ -1247,11 +1618,23 @@
             },
             "type": "array"
           },
+          "last_time": {
+            "type": "integer"
+          },
           "next_cursor": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "next_seq": {
+            "type": "integer"
+          },
+          "records": {
+            "items": {
+              "$ref": "#/components/schemas/StreamRecord"
+            },
+            "type": "array"
           },
           "row": {
             "$ref": "#/components/schemas/Row"
@@ -1261,6 +1644,9 @@
               "$ref": "#/components/schemas/Row"
             },
             "type": "array"
+          },
+          "seq": {
+            "type": "integer"
           },
           "value": {
             "type": [
@@ -1664,6 +2050,359 @@
         ],
         "type": "object"
       },
+      "SetConsumer": {
+        "additionalProperties": false,
+        "description": "At most the stream's next seq.",
+        "properties": {
+          "seq": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "seq"
+        ],
+        "type": "object"
+      },
+      "Stream": {
+        "additionalProperties": false,
+        "description": "Records `first_seq` to `next_seq` (exclusive) are kept: `bytes` of bodies and headers, appended from `first_time` to `last_time`. Stream info lists the first 100 consumers; `consumers_next_cursor` continues the listing on the consumers route.",
+        "properties": {
+          "bytes": {
+            "type": "integer"
+          },
+          "consumers": {
+            "items": {
+              "$ref": "#/components/schemas/Consumer"
+            },
+            "type": "array"
+          },
+          "consumers_next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "first_seq": {
+            "type": "integer"
+          },
+          "first_time": {
+            "type": "integer"
+          },
+          "last_time": {
+            "type": "integer"
+          },
+          "max_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "next_seq": {
+            "type": "integer"
+          },
+          "retention_ms": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "created_at",
+          "retention_ms",
+          "max_bytes",
+          "first_seq",
+          "next_seq",
+          "bytes"
+        ],
+        "type": "object"
+      },
+      "StreamConfig": {
+        "additionalProperties": false,
+        "description": "Fields left out keep their value; `null` removes a limit.",
+        "properties": {
+          "max_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retention_ms": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "StreamFilter": {
+        "description": "A record filter: `and`, `or` or `not` of filters, or a comparison of a JSON body `field` (a dotted path; numeric segments index arrays), a `header`, or, naming neither, the body's text, which only `contains` tests. A missing or null operand fails every comparison, `ne` included; `exists` tests for one. Numbers compare by value.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "and": {
+                "items": {
+                  "$ref": "#/components/schemas/StreamFilter"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "and"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "or": {
+                "items": {
+                  "$ref": "#/components/schemas/StreamFilter"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "or"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "not": {
+                "$ref": "#/components/schemas/StreamFilter"
+              }
+            },
+            "required": [
+              "not"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "field": {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              "op": {
+                "enum": [
+                  "eq",
+                  "ne",
+                  "lt",
+                  "le",
+                  "gt",
+                  "ge",
+                  "in",
+                  "prefix",
+                  "contains",
+                  "exists"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "description": "Absent for `exists`, an array of at most 1000 for `in`, otherwise not null."
+              }
+            },
+            "required": [
+              "field",
+              "op"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "header": {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "op": {
+                "enum": [
+                  "eq",
+                  "ne",
+                  "lt",
+                  "le",
+                  "gt",
+                  "ge",
+                  "in",
+                  "prefix",
+                  "contains",
+                  "exists"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "description": "Absent for `exists`, an array of at most 1000 for `in`, otherwise not null."
+              }
+            },
+            "required": [
+              "header",
+              "op"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "op": {
+                "const": "contains"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "StreamRead": {
+        "additionalProperties": false,
+        "description": "Records from at most one of `from_seq`, `from_time` (the first record at or after it), `tail` (the last N) and `consumer` (its cursor; a new consumer starts at the beginning), up to `until_seq` or `until_time` (exclusive), oldest first or with `reverse` newest first; at most `limit` (default 100) records and about `max_bytes` (default 4 MiB, at most 16 MiB). With `filter`, at most `scan_limit` records (default 10,000) are examined.",
+        "properties": {
+          "consistency": {
+            "enum": [
+              "strong",
+              "snapshot"
+            ],
+            "type": "string"
+          },
+          "consumer": {
+            "type": "string"
+          },
+          "encoding": {
+            "enum": [
+              "utf8",
+              "base64"
+            ],
+            "type": "string"
+          },
+          "filter": {
+            "$ref": "#/components/schemas/StreamFilter"
+          },
+          "from_seq": {
+            "type": "integer"
+          },
+          "from_time": {
+            "type": "integer"
+          },
+          "limit": {
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_bytes": {
+            "maximum": 16777216,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_staleness_ms": {
+            "type": "integer"
+          },
+          "reverse": {
+            "type": "boolean"
+          },
+          "scan_limit": {
+            "maximum": 100000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "tail": {
+            "type": "integer"
+          },
+          "until_seq": {
+            "type": "integer"
+          },
+          "until_time": {
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "StreamRecord": {
+        "additionalProperties": false,
+        "description": "`seq` is the record's position; `time` (cluster time, ms) is when its append committed. Its body is `json`, or `value` (`value_b64` if not UTF-8 in utf8 mode).",
+        "properties": {
+          "headers": {
+            "$ref": "#/components/schemas/Headers"
+          },
+          "json": {},
+          "seq": {
+            "type": "integer"
+          },
+          "time": {
+            "type": "integer"
+          },
+          "value": {
+            "type": "string"
+          },
+          "value_b64": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "seq",
+          "time"
+        ],
+        "type": "object"
+      },
+      "StreamRecords": {
+        "additionalProperties": false,
+        "description": "`next_seq` continues the read: the next `from_seq` of a forward read, the next `until_seq` of a reverse one. `done`: the read reached its end. `first_seq` and `tail_seq` are the stream's first and next seqs.",
+        "properties": {
+          "done": {
+            "type": "boolean"
+          },
+          "first_seq": {
+            "type": "integer"
+          },
+          "next_seq": {
+            "type": "integer"
+          },
+          "records": {
+            "items": {
+              "$ref": "#/components/schemas/StreamRecord"
+            },
+            "type": "array"
+          },
+          "tail_seq": {
+            "type": "integer"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "records",
+          "next_seq",
+          "first_seq",
+          "tail_seq",
+          "done",
+          "version"
+        ],
+        "type": "object"
+      },
       "TableSchema": {
         "additionalProperties": false,
         "properties": {
@@ -1698,6 +2437,19 @@
           "primary_key",
           "indexes"
         ],
+        "type": "object"
+      },
+      "Trim": {
+        "additionalProperties": false,
+        "properties": {
+          "before_seq": {
+            "type": "integer"
+          },
+          "before_time": {
+            "type": "integer"
+          }
+        },
+        "required": [],
         "type": "object"
       },
       "TxnRequest": {
@@ -1744,7 +2496,14 @@
       },
       "TxnResult": {
         "additionalProperties": false,
+        "description": "`appends`: the first seq each append received, in order.",
         "properties": {
+          "appends": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
           "commit_id": {
             "type": "string"
           },
@@ -1865,7 +2624,7 @@
     }
   },
   "info": {
-    "description": "Transactional key-value and table databases on object storage. Authenticate with `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for writes). Requests over a rate limit get 429 `rate_limited` with `Retry-After` and were not applied; writes that would take a database past its size quota get 507 `quota_exceeded`. Every response carries an `x-request-id` header: the client's own (1-64 characters of `[A-Za-z0-9._:-]`) or a new one, which the server's logs record on every node the request reaches.",
+    "description": "Transactional key-value, table and stream databases on object storage. Authenticate with `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for writes). Requests over a rate limit get 429 `rate_limited` with `Retry-After` and were not applied; writes that would take a database past its size quota get 507 `quota_exceeded`. Every response carries an `x-request-id` header: the client's own (1-64 characters of `[A-Za-z0-9._:-]`) or a new one, which the server's logs record on every node the request reaches.",
     "title": "Baserunna",
     "version": "0.1.0"
   },
@@ -3348,6 +4107,1019 @@
         "summary": "Write a value from raw bytes",
         "tags": [
           "kv"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/streams": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Names starting with this",
+            "in": "query",
+            "name": "prefix",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "streams": {
+                      "items": {
+                        "$ref": "#/components/schemas/Stream"
+                      },
+                      "type": "array"
+                    },
+                    "version": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "streams",
+                    "next_cursor",
+                    "version"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Streams"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List streams",
+        "tags": [
+          "streams"
+        ]
+      },
+      "post": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateStream"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stream"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Create a stream",
+        "tags": [
+          "streams"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/streams/{s}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stream name.",
+            "in": "path",
+            "name": "s",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Version"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Delete a stream and its records",
+        "tags": [
+          "streams"
+        ]
+      },
+      "get": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stream name.",
+            "in": "path",
+            "name": "s",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stream"
+                }
+              }
+            },
+            "description": "Stream"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Describe a stream and its consumers",
+        "tags": [
+          "streams"
+        ]
+      },
+      "patch": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stream name.",
+            "in": "path",
+            "name": "s",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StreamConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stream"
+                }
+              }
+            },
+            "description": "Stream"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Change a stream's retention",
+        "tags": [
+          "streams"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/streams/{s}/consumers": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stream name.",
+            "in": "path",
+            "name": "s",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "consumers": {
+                      "items": {
+                        "$ref": "#/components/schemas/Consumer"
+                      },
+                      "type": "array"
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "version": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "consumers",
+                    "next_cursor",
+                    "version"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Consumers"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List a stream's consumers",
+        "tags": [
+          "streams"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/streams/{s}/consumers/{c}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stream name.",
+            "in": "path",
+            "name": "s",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Consumer name.",
+            "in": "path",
+            "name": "c",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResult"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Delete a consumer",
+        "tags": [
+          "streams"
+        ]
+      },
+      "get": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stream name.",
+            "in": "path",
+            "name": "s",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Consumer name.",
+            "in": "path",
+            "name": "c",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Consumer"
+                }
+              }
+            },
+            "description": "Consumer"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a consumer's cursor",
+        "tags": [
+          "streams"
+        ]
+      },
+      "put": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stream name.",
+            "in": "path",
+            "name": "s",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Consumer name.",
+            "in": "path",
+            "name": "c",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetConsumer"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Version"
+                }
+              }
+            },
+            "description": "Set"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Set a consumer's cursor",
+        "tags": [
+          "streams"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/streams/{s}/records": {
+      "get": {
+        "description": "As JSON, a page of records. As NDJSON, a record per line, with the page's `next_seq`, `first_seq`, `tail_seq` and `done` in `x-baserunna-*` headers. As server-sent events (forward reads only), each record as `id: <seq>` and `data: <record>`, then each later append for up to `wait_ms`, with a comment every 15 s while idle; the stream ends at `limit` records, at `until_seq` or `until_time`, after `wait_ms`, or when the node shuts down, and resumes after `Last-Event-ID`. A read that fails before its first record answers with an error status.",
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stream name.",
+            "in": "path",
+            "name": "s",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Start at this seq",
+            "in": "query",
+            "name": "from_seq",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Start at the first record at or after this time (ms)",
+            "in": "query",
+            "name": "from_time",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Start at the last N records",
+            "in": "query",
+            "name": "tail",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Start at this consumer's cursor",
+            "in": "query",
+            "name": "consumer",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stop before this seq",
+            "in": "query",
+            "name": "until_seq",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Stop before the first record at or after this time",
+            "in": "query",
+            "name": "until_time",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Newest first",
+            "in": "query",
+            "name": "reverse",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "1..=1000 records (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Stop after about this many body bytes (default 4 MiB, at most 16 MiB)",
+            "in": "query",
+            "name": "max_bytes",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Wait this long for an append if the read is caught up: 0..=20000, or up to 300000 for events",
+            "in": "query",
+            "name": "wait_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Response format (default: from Accept, else json)",
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "enum": [
+                "json",
+                "ndjson",
+                "sse"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Encoding of `value`s",
+            "in": "query",
+            "name": "encoding",
+            "required": false,
+            "schema": {
+              "enum": [
+                "utf8",
+                "base64"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Server-sent events: resume after this seq",
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamRecords"
+                }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Records"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read records",
+        "tags": [
+          "streams"
+        ]
+      },
+      "post": {
+        "description": "Appends records atomically at the stream's next seqs; concurrent appends never conflict. Empty lines of NDJSON and text bodies are skipped, as is a leading byte order mark; a body without records appends none (`count` 0). Send NDJSON and text with their content type: curl's `--data-binary` alone sends `application/x-www-form-urlencoded`, which is refused.",
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stream name.",
+            "in": "path",
+            "name": "s",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Append only if the stream's next seq is this (else 412)",
+            "in": "query",
+            "name": "expect_seq",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Create the stream if it does not exist",
+            "in": "query",
+            "name": "create",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Encoding of JSON `value`s",
+            "in": "query",
+            "name": "encoding",
+            "required": false,
+            "schema": {
+              "enum": [
+                "utf8",
+                "base64"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Retries with the same key apply once (within 10 minutes)",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppendRequest"
+              }
+            },
+            "application/x-ndjson": {
+              "schema": {
+                "description": "A JSON record per line",
+                "type": "string"
+              }
+            },
+            "text/plain": {
+              "schema": {
+                "description": "A text record per line",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Appended"
+                }
+              }
+            },
+            "description": "Appended"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Append records",
+        "tags": [
+          "streams"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/streams/{s}/records/query": {
+      "post": {
+        "description": "A read with a filter; continue from `next_seq` until `done`.",
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stream name.",
+            "in": "path",
+            "name": "s",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StreamRead"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamRecords"
+                }
+              }
+            },
+            "description": "Records"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Query records",
+        "tags": [
+          "streams"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/streams/{s}/trim": {
+      "post": {
+        "description": "Removes the records before `before_seq`, or before the first record at or after `before_time`.",
+        "parameters": [
+          {
+            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stream name.",
+            "in": "path",
+            "name": "s",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Trim"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Version"
+                }
+              }
+            },
+            "description": "Trimmed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Trim a stream",
+        "tags": [
+          "streams"
         ]
       }
     },
@@ -5097,6 +6869,9 @@
     },
     {
       "name": "tables"
+    },
+    {
+      "name": "streams"
     },
     {
       "name": "admin"

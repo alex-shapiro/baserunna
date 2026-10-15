@@ -7,6 +7,7 @@ use crate::engine::{
     BlobRef, Change, ChangePos, Consistency, Db, Isolation, KeyRange, ReadValue, Seq, Ttl, Txn, Value, blob,
 };
 use crate::error::{Error, Result};
+use crate::filter::{self, Target, Test};
 use crate::util::b64;
 use bytes::Bytes;
 use schema::{ColType, Column, Datum, IndexDef, IndexState, Row, TableSchema, datum_from_json, key_from_json};
@@ -778,7 +779,7 @@ async fn select(
         for it in &page {
             let (pk, row) = path.row(txn, s, it).await?;
             let Some(row) = row else { continue };
-            if sel.filter.as_ref().is_some_and(|f| !eval_filter(s, f, &row.0)) {
+            if path.filter.as_ref().is_some_and(|f| !row_matches(f, &row.0)) {
                 continue;
             }
             let cost = row_key(s.id, &pk).len() + 8;
@@ -877,38 +878,20 @@ pub struct RangeSpec {
     pub lte: Option<Json>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum Filter {
-    And {
-        and: Vec<Filter>,
-    },
-    Or {
-        or: Vec<Filter>,
-    },
-    Not {
-        not: Box<Filter>,
-    },
-    Cmp {
-        col: String,
-        op: CmpOp,
-        #[serde(default)]
-        value: Json,
-    },
-}
+/// A row filter (SPEC §4.7) whose comparisons name columns: `{"col": name, "op": ..}`.
+pub type Filter = filter::Filter<Col>;
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CmpOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    In,
-    Prefix,
-    IsNull,
+/// A column a row filter names.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Col(pub String);
+
+impl filter::Operand for Col {
+    fn parse(keys: &mut Map<String, Json>) -> Result<Col> {
+        match keys.remove("col") {
+            Some(Json::String(c)) => Ok(Col(c)),
+            _ => Err(Error::invalid("a row comparison names a column with col")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -935,103 +918,63 @@ pub struct QueryResult {
     pub next_cursor: Option<String>,
 }
 
-fn validate_filter(s: &TableSchema, f: &Filter, depth: usize) -> Result<()> {
-    if depth > 16 {
-        return Err(Error::invalid("filter nested too deeply"));
-    }
-    match f {
-        Filter::And { and: v } | Filter::Or { or: v } => {
-            for x in v {
-                validate_filter(s, x, depth + 1)?;
-            }
-            Ok(())
+/// A row filter bound to a table's schema: comparisons name column ids and
+/// hold arguments of their column's type.
+type RowFilter = filter::Filter<u32, Datum>;
+
+fn bind_filter(s: &TableSchema, f: &Filter) -> Result<RowFilter> {
+    f.bind(&mut |Col(name), test| {
+        let c = s.column(name).ok_or_else(|| Error::invalid(format!("unknown column {name:?}")))?;
+        let fits = match (test, c.ty) {
+            (Test::Exists, _) => true,
+            (_, ColType::Blob) => false,
+            (Test::Prefix(_) | Test::Contains(_), ty) => matches!(ty, ColType::String | ColType::Bytes | ColType::Json),
+            _ => true,
+        };
+        if !fits {
+            return Err(Error::invalid(format!("{} does not apply to {} column {name:?}", test.name(), c.ty.name())));
         }
-        Filter::Not { not } => validate_filter(s, not, depth + 1),
-        Filter::Cmp { col, op, value } => {
-            let c = s.column(col).ok_or_else(|| Error::invalid(format!("unknown column {col:?}")))?;
-            match op {
-                CmpOp::IsNull => Ok(()),
-                CmpOp::In => {
-                    let arr = value.as_array().ok_or_else(|| Error::invalid("'in' needs an array"))?;
-                    if arr.len() > 1000 {
-                        return Err(Error::invalid("'in' list too long"));
-                    }
-                    for v in arr {
-                        cmp_value(c, v)?;
-                    }
-                    Ok(())
-                }
-                CmpOp::Prefix => {
-                    if !matches!(c.ty, ColType::String | ColType::Bytes) {
-                        return Err(Error::invalid("'prefix' needs a string or bytes column"));
-                    }
-                    cmp_value(c, value).map(|_| ())
-                }
-                _ => cmp_value(c, value).map(|_| ()),
-            }
-        }
-    }
+        Ok((c.id, test.try_map(|v| datum_from_json(c.ty, v, name))?))
+    })
 }
 
-fn cmp_value(c: &Column, v: &Json) -> Result<Datum> {
-    match c.ty {
-        ColType::Json => Ok(Datum::Json(v.clone())),
-        ColType::Blob => Err(Error::invalid("blob columns cannot be filtered (use is_null)")),
-        ty => datum_from_json(ty, v, &c.name),
-    }
+fn row_matches(f: &RowFilter, row: &Row) -> bool {
+    f.eval(&mut |id| row.get(id).filter(|d| !matches!(d, Datum::Null | Datum::Json(Json::Null))))
 }
 
-fn datum_cmp(a: &Datum, b: &Datum) -> Option<std::cmp::Ordering> {
-    match (a, b) {
-        (Datum::Json(x), Datum::Json(y)) => (x == y).then_some(std::cmp::Ordering::Equal),
-        _ => {
-            let (ka, kb) = (a.to_key()?, b.to_key()?);
-            if std::mem::discriminant(&ka) != std::mem::discriminant(&kb) {
-                return None;
-            }
-            Some(ka.cmp_key(&kb))
+/// Typed columns compare within their type, byte strings by their bytes;
+/// JSON columns compare as JSON.
+impl Target<Datum> for &Datum {
+    fn equals(&self, arg: &Datum) -> bool {
+        match (self, arg) {
+            (Datum::Json(x), Datum::Json(y)) => Target::equals(&x, y),
+            _ => Target::order(self, arg) == Some(std::cmp::Ordering::Equal),
         }
     }
-}
 
-fn eval_filter(s: &TableSchema, f: &Filter, row: &Row) -> bool {
-    use std::cmp::Ordering::*;
-    match f {
-        Filter::And { and } => and.iter().all(|x| eval_filter(s, x, row)),
-        Filter::Or { or } => or.iter().any(|x| eval_filter(s, x, row)),
-        Filter::Not { not } => !eval_filter(s, not, row),
-        Filter::Cmp { col, op, value } => {
-            let Some(c) = s.column(col) else { return false };
-            let d = row.get(&c.id).cloned().unwrap_or(Datum::Null);
-            if *op == CmpOp::IsNull {
-                return d.is_null();
-            }
-            if d.is_null() {
-                return false;
-            }
-            match op {
-                CmpOp::In => value.as_array().is_some_and(|arr| {
-                    arr.iter().filter_map(|v| cmp_value(c, v).ok()).any(|v| datum_cmp(&d, &v) == Some(Equal))
-                }),
-                CmpOp::Prefix => match (&d, cmp_value(c, value)) {
-                    (Datum::Str(x), Ok(Datum::Str(p))) => x.starts_with(&p),
-                    (Datum::Bytes(x), Ok(Datum::Bytes(p))) => x.starts_with(&p),
-                    _ => false,
-                },
-                _ => {
-                    let Ok(v) = cmp_value(c, value) else { return false };
-                    let o = datum_cmp(&d, &v);
-                    match op {
-                        CmpOp::Eq => o == Some(Equal),
-                        CmpOp::Ne => o.is_some_and(|o| o != Equal),
-                        CmpOp::Lt => o == Some(Less),
-                        CmpOp::Le => matches!(o, Some(Less | Equal)),
-                        CmpOp::Gt => o == Some(Greater),
-                        CmpOp::Ge => matches!(o, Some(Greater | Equal)),
-                        _ => false,
-                    }
-                }
-            }
+    fn order(&self, arg: &Datum) -> Option<std::cmp::Ordering> {
+        if let (Datum::Json(x), Datum::Json(y)) = (self, arg) {
+            return Target::order(&x, y);
+        }
+        let (a, b) = (self.to_key()?, arg.to_key()?);
+        (std::mem::discriminant(&a) == std::mem::discriminant(&b)).then(|| a.cmp_key(&b))
+    }
+
+    fn starts_with(&self, arg: &Datum) -> bool {
+        match (self, arg) {
+            (Datum::Str(x), Datum::Str(p)) => x.starts_with(p.as_str()),
+            (Datum::Bytes(x), Datum::Bytes(p)) => x.starts_with(p),
+            (Datum::Json(x), Datum::Json(p)) => Target::starts_with(&x, p),
+            _ => false,
+        }
+    }
+
+    fn contains(&self, arg: &Datum) -> bool {
+        match (self, arg) {
+            (Datum::Str(x), Datum::Str(p)) => x.contains(p.as_str()),
+            (Datum::Bytes(x), Datum::Bytes(p)) => filter::contains_bytes(x, p),
+            (Datum::Json(x), Datum::Json(p)) => Target::contains(&x, p),
+            _ => false,
         }
     }
 }
@@ -1054,6 +997,7 @@ struct AccessPath {
     base: Vec<u8>,
     index: Option<IndexDef>,
     range: Option<KeyRange>,
+    filter: Option<RowFilter>,
 }
 
 impl AccessPath {
@@ -1076,9 +1020,7 @@ impl AccessPath {
 }
 
 fn access_path(s: &TableSchema, sel: &Selection) -> Result<AccessPath> {
-    if let Some(f) = &sel.filter {
-        validate_filter(s, f, 0)?;
-    }
+    let filter = sel.filter.as_ref().map(|f| bind_filter(s, f)).transpose()?;
     let (base, cols, index): (Vec<u8>, Vec<String>, Option<IndexDef>) = match &sel.index {
         None => (table_prefix(SPACE_ROWS, s.id), s.primary_key.clone(), None),
         Some(name) => {
@@ -1124,7 +1066,7 @@ fn access_path(s: &TableSchema, sel: &Selection) -> Result<AccessPath> {
         if let Some(v) = &r.gt {
             start = match crate::util::prefix_end(&enc(v)?) {
                 Some(x) => Bound::Included(Bytes::from(x)),
-                None => return Ok(AccessPath { base, index, range: None }),
+                None => return Ok(AccessPath { base, index, range: None, filter }),
             };
         }
         if let Some(v) = &r.lt {
@@ -1134,7 +1076,7 @@ fn access_path(s: &TableSchema, sel: &Selection) -> Result<AccessPath> {
             end = crate::util::prefix_end(&enc(v)?).map(|x| Bound::Excluded(Bytes::from(x))).unwrap_or(end);
         }
     }
-    Ok(AccessPath { base, index, range: Some(KeyRange::new(start, end)) })
+    Ok(AccessPath { base, index, range: Some(KeyRange::new(start, end)), filter })
 }
 
 pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult> {
@@ -1167,7 +1109,7 @@ pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult>
         for (pos, it) in page.iter().enumerate() {
             examined += 1;
             if let (_, Some((row, _))) = path.row(txn, &s, it).await?
-                && q.filter.as_ref().is_none_or(|f| eval_filter(&s, f, &row))
+                && path.filter.as_ref().is_none_or(|f| row_matches(f, &row))
             {
                 rows.push(row_to_json(&s, &row));
             }

@@ -11,6 +11,7 @@ pub mod local;
 pub mod manifest;
 pub mod range_delete;
 pub mod segment;
+pub mod stream;
 pub mod txn;
 pub mod types;
 pub mod version;
@@ -25,76 +26,64 @@ use tokio::sync::Semaphore;
 
 pub use config::EngineConfig;
 pub use db::{Committed, Consistency, Db, DbStats, LevelStats};
+pub use stream::{Appended, Record, Retention, Seek, StreamOp, StreamState};
 pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
 pub use types::{BlobRef, Entry, Seq, Value};
 pub use version::{Change, ChangePage, ChangePos, KeyRange, Snapshot, Version};
 
-/// Cumulative storage engine activity metrics.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Activity {
-    pub range_tombstones_written: u64,
-    pub range_tombstones_retired: u64,
-    /// Segments dropped entirely because all entries were covered by range tombstones.
-    pub segments_dropped: u64,
-    /// Segments rewritten during compaction to purge range-deleted entries.
-    pub segments_rewritten: u64,
-    pub levels_objects_written: u64,
-    pub quota_refusals: u64,
-    /// Entries dropped or reduced to tombstones because they expired.
-    pub expired_entries: u64,
-    /// Segments rewritten or dropped because their entries expired.
-    pub segments_expired: u64,
-}
+macro_rules! activity {
+    ($($(#[$doc:meta])* $field:ident),* $(,)?) => {
+        /// Cumulative storage engine activity metrics.
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub struct Activity {
+            $($(#[$doc])* pub $field: u64,)*
+        }
 
-impl Activity {
-    pub fn add(&mut self, o: &Activity) {
-        self.range_tombstones_written += o.range_tombstones_written;
-        self.range_tombstones_retired += o.range_tombstones_retired;
-        self.segments_dropped += o.segments_dropped;
-        self.segments_rewritten += o.segments_rewritten;
-        self.levels_objects_written += o.levels_objects_written;
-        self.quota_refusals += o.quota_refusals;
-        self.expired_entries += o.expired_entries;
-        self.segments_expired += o.segments_expired;
-    }
-}
-
-/// Thread-safe counters for tracking [`Activity`] metrics.
-#[derive(Default)]
-pub struct Counters([AtomicU64; 8]);
-
-impl Counters {
-    pub fn add(&self, a: &Activity) {
-        let deltas = [
-            a.range_tombstones_written,
-            a.range_tombstones_retired,
-            a.segments_dropped,
-            a.segments_rewritten,
-            a.levels_objects_written,
-            a.quota_refusals,
-            a.expired_entries,
-            a.segments_expired,
-        ];
-        for (c, d) in self.0.iter().zip(deltas) {
-            if d > 0 {
-                c.fetch_add(d, Ordering::Relaxed);
+        impl Activity {
+            pub fn add(&mut self, o: &Activity) {
+                $(self.$field += o.$field;)*
             }
         }
-    }
 
-    pub fn get(&self) -> Activity {
-        let v: Vec<u64> = self.0.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-        Activity {
-            range_tombstones_written: v[0],
-            range_tombstones_retired: v[1],
-            segments_dropped: v[2],
-            segments_rewritten: v[3],
-            levels_objects_written: v[4],
-            quota_refusals: v[5],
-            expired_entries: v[6],
-            segments_expired: v[7],
+        /// Thread-safe counters for tracking [`Activity`] metrics.
+        #[derive(Default)]
+        pub struct Counters {
+            $($field: AtomicU64,)*
         }
-    }
+
+        impl Counters {
+            pub fn add(&self, a: &Activity) {
+                $(if a.$field > 0 {
+                    self.$field.fetch_add(a.$field, Ordering::Relaxed);
+                })*
+            }
+
+            pub fn get(&self) -> Activity {
+                Activity { $($field: self.$field.load(Ordering::Relaxed),)* }
+            }
+        }
+    };
+}
+
+activity! {
+    range_tombstones_written,
+    range_tombstones_retired,
+    /// Segments dropped entirely because all entries were covered by range tombstones.
+    segments_dropped,
+    /// Segments rewritten during compaction to purge range-deleted entries.
+    segments_rewritten,
+    levels_objects_written,
+    quota_refusals,
+    /// Entries dropped or reduced to tombstones because they expired.
+    expired_entries,
+    /// Segments rewritten or dropped because their entries expired.
+    segments_expired,
+    /// Stream chunks sealed as a flush wrote their records.
+    chunks_sealed_at_flush,
+    /// Stream chunks sealed as a compaction merged their records.
+    chunks_sealed_in_compaction,
+    /// Trims committed for stream retention.
+    retention_trims,
 }
 
 /// State shared by every database handle on a node.

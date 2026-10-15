@@ -423,6 +423,7 @@ pub fn measure_all() -> Report {
             let amp = steady_writes(&w, &mut out).await;
             overhead(&w, &mut out, "node_overhead_1_node").await;
             let segs = multi_node(&mut w, &mut out).await;
+            streams(&mut w, &mut out).await;
             w.shutdown();
             (amp, segs)
         };
@@ -588,6 +589,80 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     assert_eq!(all.len(), 128);
     out.push(r.stop("restart_open_and_scan", "open", 1.0, true));
     segs
+}
+
+/// Appends, tail reads, steady log ingestion, and a cold node reading a
+/// sealed log (SPEC §5.11).
+async fn streams(w: &mut World, out: &mut Vec<Measurement>) {
+    let t = w.signup(0, "streams@cost.test").await;
+    let id = w.create_db(0, &t, "logs").await;
+    let s = &*w.store;
+    let records = "/v1/dbs/logs/streams/app/records";
+    w.json(0, "POST", "/v1/dbs/logs/streams", &t, json!({"name": "app"})).await;
+    let append = |n: usize, i: usize| {
+        let line = |j: usize| {
+            format!("{{\"level\":\"info\",\"i\":{i},\"j\":{j},\"msg\":\"{}\"}}\n", value(150, i + j).escape_ascii())
+        };
+        Bytes::from((0..n).map(line).collect::<String>())
+    };
+    let router = w.node(0).router().expect("router");
+    let ndjson = |body: Bytes| post_ndjson(&router, &t, records, body);
+    assert_eq!(ndjson(append(1, 0)).await, 200);
+
+    let r = Recorder::start(s, &id);
+    for i in 0..20 {
+        assert_eq!(ndjson(append(1, i)).await, 200);
+    }
+    out.push(r.stop("stream_append", "append", 20.0, true));
+
+    let r = Recorder::start(s, &id);
+    for _ in 0..100 {
+        let got = w.json(0, "GET", &format!("{records}?tail=5"), &t, Json::Null).await;
+        assert_eq!(got["records"].as_array().map(Vec::len), Some(5));
+    }
+    out.push(r.stop("stream_tail_read_leased", "read", 100.0, true));
+
+    // Steady ingestion: a request of 100 log lines (about 20 KB) a second.
+    let r = Recorder::start(s, &id);
+    let requests = 1200;
+    for i in 0..requests {
+        assert_eq!(ndjson(append(100, i)).await, 200);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let mib = (requests * append(100, 0).len()) as f64 / (1 << 20) as f64;
+    out.push(r.stop("log_ingest", "MiB", mib, false));
+    tokio::time::sleep(Duration::from_secs(60)).await;
+
+    let other = w.start_node().await;
+    let db = w.node(other).engine.db(&id);
+    let r = Recorder::start(&w.store, &id);
+    let v = db.read_version(Consistency::Strong).await.expect("cold open");
+    let mut t = crate::engine::Txn::new(
+        crate::engine::Snapshot { time_ms: v.read_time(), version: v.clone() },
+        crate::engine::Isolation::Serializable,
+        0,
+        usize::MAX,
+    );
+    let (c, st) = crate::stream::info(&mut t, "app").await.expect("info");
+    let mut it = v.stream_iter(c.id, st.first_seq, st.next_seq, false);
+    let mut bytes = 0;
+    while let Some(rec) = it.next().await.expect("read") {
+        bytes += rec.payload.len();
+    }
+    assert_eq!(st.records(), 21 + 100 * requests as u64);
+    out.push(r.stop("cold_stream_read", "MiB", bytes as f64 / (1 << 20) as f64, true));
+}
+
+async fn post_ndjson(router: &axum::Router, token: &str, path: &str, body: Bytes) -> u16 {
+    let req = Request::post(path)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from(body))
+        .expect("request");
+    match router.clone().oneshot(req).await {
+        Ok(r) => r.status().as_u16(),
+        Err(e) => match e {},
+    }
 }
 
 /// Workload parameters for monthly cost estimation.

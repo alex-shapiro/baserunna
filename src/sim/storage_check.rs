@@ -3,6 +3,7 @@
 use super::Sim;
 use crate::engine::manifest::{Levels, Manifest};
 use crate::engine::range_delete::RangeDeletes;
+use crate::engine::stream::{self, Stored};
 use crate::engine::{Value, segment};
 use bytes::Bytes;
 use std::collections::BTreeSet;
@@ -59,7 +60,23 @@ impl Sim {
                     newest.insert(e.key.clone(), e);
                 }
             }
-            for e in newest.values().filter(|e| deletes.seq_at(&e.key) <= e.seq) {
+            // The end of the last record or chunk seen of each stream.
+            let mut covered: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+            for e in newest.values().filter(|e| deletes.seq_at(&e.key) <= e.seq && !e.value.is_tombstone()) {
+                if let Some((id, s)) = stream::stored(e) {
+                    let (lo, hi) = match &s {
+                        Stored::Record(r) => (r.seq, r.seq),
+                        Stored::Chunk(c) => {
+                            check_chunk(&self.mem, db, id, c)?;
+                            rep.chunks += 1;
+                            (c.first_seq, c.last_seq)
+                        }
+                    };
+                    if covered.get(&id).is_some_and(|end| *end >= lo) {
+                        return Err(format!("db {db}: stream {id} stores seq {lo} twice"));
+                    }
+                    covered.insert(id, hi);
+                }
                 if let Value::Blob(b) = &e.value {
                     let n = b.size.div_ceil(chunk);
                     for c in 0..n {
@@ -77,11 +94,33 @@ impl Sim {
     }
 }
 
+/// A chunk exists and holds exactly the records its reference claims.
+fn check_chunk(mem: &crate::store::MemStore, db: &str, id: u64, c: &stream::ChunkRef) -> Result<(), String> {
+    let k = crate::engine::seg_key(db, &c.id);
+    let g = mem.get_sync(&k, &Default::default()).map_err(|e| format!("db {db}: chunk {} missing: {e}", c.id))?;
+    let entries = segment::read_all(&g.data).map_err(|e| format!("chunk {k}: {e}"))?;
+    let mut seq = c.first_seq;
+    let mut bytes = 0;
+    for e in &entries {
+        match stream::stored(e) {
+            Some((i, Stored::Record(r))) if i == id && r.seq == seq => bytes += r.payload.len() as u64,
+            _ => return Err(format!("chunk {k}: unexpected entry at {seq}")),
+        }
+        seq += 1;
+    }
+    if seq != c.last_seq + 1 || bytes != c.bytes || g.data.len() as u64 != c.size {
+        return Err(format!("chunk {k} holds seqs {}..{seq} ({bytes} bytes) but claims {c:?}", c.first_seq));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct StorageReport {
     pub databases: usize,
     pub segments: usize,
     pub levels_objects: usize,
     pub blobs: usize,
+    /// Live sealed stream chunks.
+    pub chunks: usize,
     pub objects: usize,
 }

@@ -7,7 +7,7 @@
 
 use baserunna::engine::EngineConfig;
 use baserunna::engine::segment::Compression;
-use baserunna::sim::amp::{self, measure_all as measure_amplification};
+use baserunna::sim::amp::{self, measure_all as measure_amplification, measure_streams};
 use baserunna::sim::cost::{Counts, measure_all, monthly_cost, profiles};
 
 /// Upper bounds per unit: `(measurement, GET, PUT, LIST, DELETE)`.
@@ -29,6 +29,11 @@ const BUDGETS: &[(&str, f64, f64, f64, f64)] = &[
     ("strong_read_validated", 1.0, 0.0, 0.0, 0.0),
     ("snapshot_read", 0.0, 0.0, 0.0, 0.0),
     ("restart_open_and_scan", 1.0, 0.0, 0.0, 0.0),
+    ("stream_append", 0.0, 1.0, 0.0, 0.0),
+    ("stream_tail_read_leased", 0.0, 0.0, 0.0, 0.0),
+    // A commit per request of about 20 KB, plus the chunks the tail is sealed into.
+    ("log_ingest", 0.5, 62.0, 0.1, 0.1),
+    ("cold_stream_read", 5.5, 0.0, 0.0, 0.0),
 ];
 
 /// Monthly budget in USD for the `typical` profile.
@@ -115,6 +120,35 @@ fn amplification_stays_within_budget() {
     assert!(
         failures.is_empty(),
         "amplification regressions (if intentional, update the budgets in tests/cost.rs and SPEC §5.6):\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// Upper bounds per stream workload on write amplification without
+/// compression, and lower bounds on the share of records sealed (SPEC §5.11).
+const STREAM_BUDGETS: &[(&str, f64, f64)] = &[("log", 1.3, 0.85), ("feeds", 3.0, 0.5), ("chat", 3.0, 0.0)];
+
+#[test]
+fn stream_amplification_stays_within_budget() {
+    let cfg = EngineConfig { compression: Compression::None, ..EngineConfig::default() };
+    let rows = measure_streams(0.25, &cfg);
+    println!("{}", amp::stream_table(&rows));
+    let mut failures = Vec::new();
+    for a in &rows {
+        let &(_, write, sealed) = STREAM_BUDGETS.iter().find(|b| b.0 == a.workload.name()).expect("a budget");
+        if a.write_amp > write || a.sealed < sealed {
+            failures.push(format!(
+                "{}: write {:.2}x (budget {write}), {:.0}% sealed (at least {:.0}%)",
+                a.workload.name(),
+                a.write_amp,
+                100.0 * a.sealed,
+                100.0 * sealed
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "stream amplification regressions (if intentional, update the budgets in tests/cost.rs and SPEC §5.11):\n  {}",
         failures.join("\n  ")
     );
 }

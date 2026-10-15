@@ -140,7 +140,7 @@ fn seeds() -> Vec<(&'static str, &'static str, Value)> {
             json!({"ops": [{"op": "put", "key": "e", "value": "1", "ttl_ms": 1000},
             {"op": "upsert_row", "table": "t", "row": {"id": 9, "name": "z"}, "ttl_ms": 5000},
             {"op": "update_rows", "table": "t", "where": {"index": "by_name", "range": {"gte": "a"}}, "set": {"n": 1}},
-            {"op": "delete_rows", "table": "t", "where": {"filter": {"col": "n", "op": "is_null"}}, "limit": 3}]}),
+            {"op": "delete_rows", "table": "t", "where": {"filter": {"not": {"col": "n", "op": "exists"}}}, "limit": 3}]}),
         ),
         ("POST", "/v1/dbs/fz/tables/t/rows/get", json!({"pk": [1]})),
         ("POST", "/v1/dbs/fz/transactions", json!({"isolation": "snapshot"})),
@@ -157,6 +157,32 @@ fn seeds() -> Vec<(&'static str, &'static str, Value)> {
         ("POST", "/v1/auth/password-reset", json!({"email": "f@z.io"})),
         ("POST", "/v1/auth/password-reset/confirm", json!({"token": "AAAA", "password": "password-new"})),
         ("POST", "/v1/auth/verify-email", json!({"token": "cmVzZXQ6dTE6eA"})),
+        ("POST", "/v1/dbs/fz/streams", json!({"name": "s2", "retention_ms": 60_000, "max_bytes": 10_000})),
+        (
+            "POST",
+            "/v1/dbs/fz/streams/s/records",
+            json!({"records": [{"json": {"lvl": "error", "n": 3}, "headers": {"h": "v"}}, {"value": "x"}],
+            "expect_seq": 0, "create": true, "idempotency_key": "k", "encoding": "utf8"}),
+        ),
+        (
+            "POST",
+            "/v1/dbs/fz/streams/s/records/query",
+            json!({"from_seq": 0, "until_seq": 9, "reverse": true, "limit": 5, "scan_limit": 10, "max_bytes": 100,
+            "filter": {"and": [{"field": "lvl", "op": "eq", "value": "error"}, {"not": {"header": "h", "op": "exists"}},
+                {"op": "contains", "value": "x"}]}}),
+        ),
+        ("POST", "/v1/dbs/fz/streams/s/trim", json!({"before_seq": 1})),
+        ("PUT", "/v1/dbs/fz/streams/s/consumers/c", json!({"seq": 2})),
+        ("PATCH", "/v1/dbs/fz/streams/s", json!({"retention_ms": null, "max_bytes": 5})),
+        (
+            "POST",
+            "/v1/dbs/fz/txn",
+            json!({"ops": [{"op": "append", "stream": "s", "records": [{"value": "y"}], "expect_seq": 1},
+            {"op": "read_stream", "stream": "s", "tail": 3, "filter": {"field": "n", "op": "gt", "value": 1}},
+            {"op": "stream_info", "stream": "s"}, {"op": "trim_stream", "stream": "s", "before_seq": 1},
+            {"op": "set_consumer", "stream": "s", "consumer": "c", "seq": 1},
+            {"op": "get_consumer", "stream": "s", "consumer": "c"}]}),
+        ),
     ]
 }
 
@@ -215,6 +241,7 @@ fn fuzz_http_api() {
             "indexes": [{"name": "by_name", "columns": ["name"]}]})),
         )
         .await;
+        c.call_retry("POST", "/v1/dbs/fz/streams", Some(json!({"name": "s"}))).await;
         baserunna::sim::workloads::steps::create_org(&c, "fz-org").await?;
         c.create_db_owned(Some("fz-org"), "d").await?;
         let token = c.token.clone().unwrap_or_default();
@@ -242,7 +269,13 @@ fn fuzz_http_api() {
             "/v1/dbs?org=",
             "/v1/auth/google/callback?state=",
             "/v1/dbs/fz/tables/",
+            "/v1/dbs/fz/streams/",
+            "/v1/dbs/fz/streams/s/records?from_seq=",
+            "/v1/dbs/fz/streams/s/records?format=sse&wait_ms=20&tail=",
+            "/v1/dbs/fz/streams/s/records?format=ndjson&reverse=true&until_seq=",
+            "/v1/dbs/fz/streams/s/consumers/",
             "/console/dbs/fz",
+            "/console/dbs/fz/streams/",
             "/internal/v1/meta",
         ];
         for i in 0..iters {
@@ -277,6 +310,13 @@ fn fuzz_http_api() {
             }
             if r.chance(0.1) {
                 b = b.header("if-match", "\"abc\"");
+            }
+            if r.chance(0.15) {
+                let ct = ["application/x-ndjson", "text/plain", "application/json", "image/png"][r.usize(4)];
+                b = b.header("content-type", ct);
+            }
+            if r.chance(0.05) {
+                b = b.header("last-event-id", ["0", "x", "18446744073709551615"][r.usize(3)]);
             }
             let Ok(req) = b.body(axum::body::Body::from(body.clone())) else { continue };
             let resp = sim.call_node(0, req).await.map_err(|e| format!("network error {e:?}"))?;

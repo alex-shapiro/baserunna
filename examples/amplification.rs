@@ -1,5 +1,6 @@
 //! Write, space and read amplification of the storage engine on realistic
-//! workloads (SPEC §5.6), with production sizes, compressed and not.
+//! workloads (SPEC §5.6), with production sizes, compressed and not, and of
+//! streams with and without sealing (SPEC §5.11).
 //!
 //! ```text
 //! cargo run --release --example amplification [scale]
@@ -7,7 +8,7 @@
 
 use baserunna::engine::EngineConfig;
 use baserunna::engine::segment::Compression;
-use baserunna::sim::amp::{measure_all, table};
+use baserunna::sim::amp::{measure_all, measure_streams, stream_table, table};
 
 fn main() {
     let scale: f64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1.0);
@@ -17,4 +18,9 @@ fn main() {
     let plain = EngineConfig { compression: Compression::None, ..EngineConfig::default() };
     println!("Without compression (compaction policy alone):\n");
     println!("{}", table(&measure_all(scale, &plain)));
+    println!("Streams, without compression, sealing runs into chunks (SPEC §5.11):\n");
+    println!("{}", stream_table(&measure_streams(scale, &plain)));
+    let unsealed = EngineConfig { stream_seal_min_bytes: usize::MAX / 2, stream_chunk_bytes: usize::MAX / 2, ..plain };
+    println!("Streams with sealing turned off, as records in the LSM alone:\n");
+    println!("{}", stream_table(&measure_streams(scale, &unsealed)));
 }

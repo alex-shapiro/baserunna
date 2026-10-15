@@ -16,7 +16,7 @@ const MAGIC: &[u8; 4] = b"BRMF";
 
 /// The database was deleted: every read and commit fails with not-found.
 pub const FLAG_DELETED: u64 = 1;
-const FORMAT: u16 = 4;
+const FORMAT: u16 = 5;
 const LEVELS_MAGIC: &[u8; 4] = b"BRLV";
 const LEVELS_FORMAT: u16 = 2;
 
@@ -159,6 +159,8 @@ pub struct Manifest {
     pub obsolete: Vec<Obsolete>,
     pub last_sweep_ms: u64,
     pub blob_bytes: BlobBytes,
+    /// Bytes of sealed stream chunks, accounted like blob bytes.
+    pub chunk_bytes: BlobBytes,
 }
 
 impl Manifest {
@@ -182,12 +184,13 @@ impl Manifest {
         self.tail.iter().map(|e| e.size()).sum()
     }
 
-    /// Total stored bytes tracked against quotas: segments, tail, and
-    /// referenced blobs, excluding internal commit records.
+    /// Total stored bytes tracked against quotas: segments, tail,
+    /// referenced blobs and sealed stream chunks, excluding internal commit
+    /// records.
     pub fn stored_bytes(&self) -> u64 {
         let segments: u64 = self.segments.iter().filter(|s| !is_commit_key(&s.min_key)).map(|s| s.size).sum();
         let tail: usize = self.tail.iter().filter(|e| !is_commit_key(&e.key)).map(|e| e.size()).sum();
-        segments + tail as u64 + self.blob_bytes.total()
+        segments + tail as u64 + self.blob_bytes.total() + self.chunk_bytes.total()
     }
 
     pub fn encode(&self) -> Bytes {
@@ -246,9 +249,11 @@ impl Manifest {
             w.varint(o.since_ms);
         }
         w.varint(self.last_sweep_ms);
-        w.varint(self.blob_bytes.bound);
-        w.varint(self.blob_bytes.swept);
-        w.varint(self.blob_bytes.swept_at);
+        for b in [&self.blob_bytes, &self.chunk_bytes] {
+            w.varint(b.bound);
+            w.varint(b.swept);
+            w.varint(b.swept_at);
+        }
         let crc = crc32c(&w.buf);
         w.u32(crc);
         Bytes::from(w.into_inner())
@@ -341,6 +346,7 @@ impl Manifest {
         }
         let last_sweep_ms = r.varint()?;
         let blob_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
+        let chunk_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
         if !r.is_empty() {
             return Err(DecodeError("manifest trailing data"));
         }
@@ -362,6 +368,7 @@ impl Manifest {
             obsolete,
             last_sweep_ms,
             blob_bytes,
+            chunk_bytes,
         };
         m.check_levels().map_err(DecodeError)?;
         Ok(m)
@@ -530,6 +537,7 @@ mod tests {
         ];
         m.tombstone_horizon = 7;
         m.blob_bytes = BlobBytes { bound: 500, swept: 200, swept_at: 400 };
+        m.chunk_bytes = BlobBytes { bound: 70, swept: 60, swept_at: 50 };
         m.version_times = vec![(0, 100), (40, 200)];
         m.obsolete = vec![
             Obsolete { kind: ObjKind::Blob, id: "b".repeat(32), since_ms: 5 },

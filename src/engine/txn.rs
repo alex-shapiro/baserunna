@@ -2,6 +2,7 @@
 //! read set, and a buffered write set. Reads see the transaction's own
 //! writes.
 
+use super::stream::{self, StreamOp, StreamState};
 use super::types::{Seq, Value, is_commit_key};
 use super::version::{KeyRange, Snapshot, Version};
 use crate::error::{Error, Result};
@@ -56,11 +57,14 @@ pub struct WriteSet {
     pub puts: BTreeMap<Bytes, Option<Put>>,
     /// Range deletes, applied to committed state before `puts`.
     pub range_deletes: Vec<KeyRange>,
+    /// Changes to streams, applied after `puts` by the committer, which
+    /// gives appends their seqs (SPEC §5.11).
+    pub streams: Vec<StreamOp>,
 }
 
 impl WriteSet {
     pub fn is_empty(&self) -> bool {
-        self.puts.is_empty() && self.range_deletes.is_empty()
+        self.puts.is_empty() && self.range_deletes.is_empty() && self.streams.is_empty()
     }
 
     pub fn touches_key(&self, k: &[u8]) -> bool {
@@ -71,10 +75,11 @@ impl WriteSet {
         self.puts.keys().any(|k| r.contains(k)) || self.range_deletes.iter().any(|d| d.intersects(r))
     }
 
-    /// Whether a value expires relative to the commit's time, which needs
-    /// the store's clock.
-    pub fn has_relative_ttl(&self) -> bool {
+    /// Whether the commit needs the store's clock: for a value that expires
+    /// relative to the commit's time, or to give appended records theirs.
+    pub fn needs_clock(&self) -> bool {
         self.puts.values().any(|p| matches!(p, Some(Put { ttl: Some(Ttl::For(_)), .. })))
+            || self.streams.iter().any(|s| matches!(s, StreamOp::Append { .. }))
     }
 
     pub fn blob_ids(&self) -> Vec<String> {
@@ -141,6 +146,7 @@ pub struct Txn {
     pub commit_id: u64,
     write_bytes: usize,
     max_write_bytes: usize,
+    appended: usize,
 }
 
 fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -164,6 +170,7 @@ impl Txn {
             commit_id,
             write_bytes: 0,
             max_write_bytes,
+            appended: 0,
         }
     }
 
@@ -333,6 +340,62 @@ impl Txn {
         Ok(())
     }
 
+    /// Appends records with `payloads` to stream `id` at commit; with
+    /// `expect`, only if the stream's next seq is then `expect`.
+    pub fn append(
+        &mut self,
+        id: u64,
+        payloads: Vec<Bytes>,
+        expect: Option<u64>,
+        op_index: Option<usize>,
+    ) -> Result<()> {
+        self.appended += payloads.len();
+        if self.appended > stream::APPEND_MAX_RECORDS {
+            return Err(Error::TooLarge(format!(
+                "a transaction appends at most {} records",
+                stream::APPEND_MAX_RECORDS
+            )));
+        }
+        self.account(payloads.iter().map(|p| p.len() + 24).sum())?;
+        self.writes.streams.push(StreamOp::Append { id, payloads, expect, op_index });
+        Ok(())
+    }
+
+    /// Creates, configures or trims a stream at commit.
+    pub fn stream_op(&mut self, op: StreamOp) -> Result<()> {
+        self.account(32)?;
+        self.writes.streams.push(op);
+        Ok(())
+    }
+
+    /// Reads the state of stream `id`, recording it in the read set, so the
+    /// transaction conflicts with every append and trim committed after
+    /// its snapshot.
+    pub async fn stream_state(&mut self, id: u64) -> Result<Option<StreamState>> {
+        match self.get(&stream::state_key(id)).await? {
+            Some(ReadValue { value: Value::Inline(b), .. }) => {
+                Ok(Some(StreamState::decode(&b).map_err(|_| Error::internal("corrupt stream state"))?))
+            }
+            Some(_) => Err(Error::internal("corrupt stream state")),
+            None => Ok(None),
+        }
+    }
+
+    /// The seq before which this transaction trims stream `id`, if it does.
+    pub fn pending_trim(&self, id: u64) -> Option<u64> {
+        let trims = self.writes.streams.iter().filter_map(|op| match op {
+            StreamOp::Trim { id: i, before, .. } if *i == id => Some(*before),
+            _ => None,
+        });
+        trims.max()
+    }
+
+    /// Records a read of stream `id`'s records with seqs in `[lo, hi)`, or
+    /// from `lo` on, in the read set.
+    pub fn note_stream_read(&mut self, id: u64, lo: u64, hi: Option<u64>) {
+        self.reads.push(ReadItem::Range(stream::records_between(id, lo, hi)));
+    }
+
     pub fn into_request(self) -> CommitRequest {
         let read_expiry = match self.isolation {
             Isolation::Serializable => self.read_expiry,
@@ -353,10 +416,17 @@ impl Txn {
 }
 
 /// Validate a commit request against `base` and the writes of
-/// transactions accepted earlier in the same batch, to commit at store time
-/// `time`: whatever the transaction read must not have changed since its
-/// snapshot, nor expired by `time`.
-pub async fn validate(req: &CommitRequest, base: &Version, earlier: &[&WriteSet], time: u64) -> Result<()> {
+/// transactions accepted earlier in the same batch (`earlier`, and the keys
+/// their stream ops wrote, `touched`), to commit at store time `time`:
+/// whatever the transaction read must not have changed since its snapshot,
+/// nor expired by `time`.
+pub async fn validate(
+    req: &CommitRequest,
+    base: &Version,
+    earlier: &[&WriteSet],
+    touched: &[KeyRange],
+    time: u64,
+) -> Result<()> {
     if req.read_expiry.is_some_and(|e| e <= time) {
         return Err(Error::Conflict("a value the transaction read has expired".into()));
     }
@@ -377,11 +447,17 @@ pub async fn validate(req: &CommitRequest, base: &Version, earlier: &[&WriteSet]
         return Err(Error::Conflict("transaction snapshot is older than the tombstone purge horizon".into()));
     }
     for it in &items {
-        let (changed, touched) = match it {
-            ReadItem::Key(k) => (base.key_changed_since(k, rv).await?, earlier.iter().any(|w| w.touches_key(k))),
-            ReadItem::Range(r) => (base.changed_since(r, rv).await?, earlier.iter().any(|w| w.touches_range(r))),
+        let (changed, overlapped) = match it {
+            ReadItem::Key(k) => (
+                base.key_changed_since(k, rv).await?,
+                earlier.iter().any(|w| w.touches_key(k)) || touched.iter().any(|t| t.contains(k)),
+            ),
+            ReadItem::Range(r) => (
+                base.changed_since(r, rv).await?,
+                earlier.iter().any(|w| w.touches_range(r)) || touched.iter().any(|t| t.intersects(r)),
+            ),
         };
-        if changed || touched {
+        if changed || overlapped {
             return Err(Error::Conflict("transaction conflicts with a concurrent commit".into()));
         }
     }

@@ -5,13 +5,14 @@ pub mod body;
 mod data;
 pub mod openapi;
 mod orgs;
+mod streams;
 
 pub use account::session_cookie;
 
 use crate::cluster::{
     CLUSTER_KEY_HEADER, DEADLINE_HEADER, Delivery, FORWARD_ID_HEADER, FORWARD_TO_HEADER, HOPS_HEADER, ReplayedResponse,
 };
-use crate::engine::{Consistency, Db};
+use crate::engine::{Committed, Consistency, Db, Txn};
 use crate::error::{Error, Result};
 use crate::log::{self, REQUEST_ID_HEADER};
 use crate::meta::{Access, DbRecord};
@@ -520,29 +521,148 @@ pub fn consistency_of(q: &std::collections::BTreeMap<String, String>) -> Result<
     }
 }
 
-/// Runs `$body` in a serializable transaction and commits, retrying on conflict.
+/// How [`run_txn!`] ended.
+pub(crate) enum Ran<T> {
+    /// The transaction wrote nothing; it read at `version`.
+    Read {
+        out: T,
+        version: u64,
+    },
+    Committed {
+        out: T,
+        commit: Committed,
+    },
+    /// An earlier attempt with the same idempotency key had committed.
+    /// Never without a key.
+    Replayed(Committed),
+}
+
+/// Runs `$body` in fresh transactions until what it wrote commits,
+/// retrying conflicts; evaluates to `(commit_id, Ran)`. With an idempotency
+/// key (`$key`, an `Option<&str>`) the commit id derives from the key, and a
+/// commit an earlier attempt applied is reported rather than applied again
+/// (SPEC §6.2).
+macro_rules! run_txn {
+    ($node:expr, $ctx:expr, $isolation:expr, $consistency:expr, $key:expr, |$t:ident| $body:expr) => {{
+        let (node_, ctx_, key_): (&crate::node::Node, &crate::api::DbCtx, Option<&str>) = (&$node, &$ctx, $key);
+        let commit_id_ = crate::api::commit_id_for(node_, ctx_, key_)?;
+        let ran_ = match crate::api::earlier_attempt(ctx_, commit_id_, key_).await? {
+            Some(c) => crate::api::Ran::Replayed(c),
+            None => {
+                let mut attempt_ = 0u32;
+                loop {
+                    let mut txn_ = ctx_.db.begin($isolation, $consistency).await?;
+                    txn_.commit_id = commit_id_;
+                    let out_ = {
+                        let $t: &mut crate::engine::Txn = &mut txn_;
+                        async { $body }.await
+                    };
+                    let out_ = match out_ {
+                        Ok(o) => o,
+                        Err(e) => break crate::api::failed(ctx_, commit_id_, key_, e).await?,
+                    };
+                    if let Some(ran) = crate::api::finish(node_, ctx_, txn_, out_, key_, &mut attempt_).await? {
+                        break ran;
+                    }
+                }
+            }
+        };
+        (commit_id_, ran_)
+    }};
+}
+pub(crate) use run_txn;
+
+pub(crate) fn commit_id_for(node: &Node, ctx: &DbCtx, key: Option<&str>) -> Result<u64> {
+    match key {
+        Some(k) if k.is_empty() || k.len() > 200 => Err(Error::invalid("idempotency keys are 1-200 characters")),
+        Some(k) => Ok(data::commit_id_for_key(&ctx.rec.id, k)),
+        None => Ok(node.env.random_u64()),
+    }
+}
+
+/// The commit of an earlier attempt with the idempotency key, if one applied.
+pub(crate) async fn earlier_attempt(ctx: &DbCtx, commit_id: u64, key: Option<&str>) -> Result<Option<Committed>> {
+    match key {
+        Some(_) => ctx.db.commit_status(commit_id).await,
+        None => Ok(None),
+    }
+}
+
+/// Commits `t`, which produced `out`; `None` if it conflicted and is to be
+/// run again.
+pub(crate) async fn finish<T>(
+    node: &Node,
+    ctx: &DbCtx,
+    t: Txn,
+    out: T,
+    key: Option<&str>,
+    attempt: &mut u32,
+) -> Result<Option<Ran<T>>> {
+    if t.is_read_only() {
+        return Ok(Some(Ran::Read { out, version: t.read_version() }));
+    }
+    let commit_id = t.commit_id;
+    let mut req = t.into_request();
+    req.deadline = Some(ctx.deadline);
+    match ctx.db.commit_detailed(req).await {
+        // Without a key, only this attempt's own commit, landed by an
+        // ambiguous manifest write the committer retried, can replay.
+        Ok(c) if c.replayed && key.is_some() => Ok(Some(Ran::Replayed(c))),
+        Ok(commit) => Ok(Some(Ran::Committed { out, commit })),
+        Err(Error::Conflict(_)) if *attempt < node.cfg.txn_retries => {
+            *attempt += 1;
+            let backoff = 5 * (1 << *attempt) + node.env.random_below(10);
+            tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+            Ok(None)
+        }
+        Err(e) => failed(ctx, commit_id, key, e).await.map(Some),
+    }
+}
+
+/// Answers a failed transaction. A retried idempotent request can fail a
+/// precondition, or an append its expected seq, because an earlier attempt
+/// applied: a fenced status check tells.
+pub(crate) async fn failed<T>(ctx: &DbCtx, commit_id: u64, key: Option<&str>, e: Error) -> Result<Ran<T>> {
+    match e {
+        Error::PreconditionFailed { .. } if key.is_some() => match ctx.db.commit_status_fenced(commit_id).await? {
+            Some(c) => Ok(Ran::Replayed(c)),
+            None => Err(e),
+        },
+        e => Err(naming_commit(e, commit_id)),
+    }
+}
+
+/// Names the commit in an error that leaves its outcome unknown, so that
+/// the client can resolve it (SPEC §6.2).
+pub(crate) fn naming_commit(e: Error, commit_id: u64) -> Error {
+    match e {
+        Error::Unavailable { message, retry_after_ms, outcome_unknown: true } => Error::Unavailable {
+            message: format!("{message} (commit_id {})", data::commit_hex(commit_id)),
+            retry_after_ms,
+            outcome_unknown: true,
+        },
+        other => other,
+    }
+}
+
+/// Runs `$body` in a serializable transaction and commits, retrying on
+/// conflict; evaluates to `(output, version)`.
 macro_rules! with_txn {
     ($node:expr, $ctx:expr, |$t:ident| $body:expr) => {{
         $ctx.require_write()?;
-        let mut attempt_ = 0u32;
-        let deadline_ = $ctx.deadline;
-        loop {
-            let mut txn_ =
-                $ctx.db.begin(crate::engine::Isolation::Serializable, crate::engine::Consistency::Strong).await?;
-            let out_ = {
-                let $t: &mut crate::engine::Txn = &mut txn_;
-                $body
-            }?;
-            let mut req_ = txn_.into_request();
-            req_.deadline = Some(deadline_);
-            match $ctx.db.commit(req_).await {
-                Ok(v) => break (out_, v),
-                Err(crate::error::Error::Conflict(_)) if attempt_ < $node.cfg.txn_retries => {
-                    attempt_ += 1;
-                    let d = 5 * (1u64 << attempt_) + $node.env.random_below(10);
-                    tokio::time::sleep(std::time::Duration::from_millis(d)).await;
-                }
-                Err(e) => return Err(e),
+        let (_, ran_) = crate::api::run_txn!(
+            $node,
+            $ctx,
+            crate::engine::Isolation::Serializable,
+            crate::engine::Consistency::Strong,
+            None,
+            |$t| $body
+        );
+        match ran_ {
+            crate::api::Ran::Read { out, version } => (out, version),
+            crate::api::Ran::Committed { out, commit } => (out, commit.version),
+            crate::api::Ran::Replayed(_) => {
+                return Err(crate::error::Error::internal("a transaction without an idempotency key replayed"));
             }
         }
     }};
@@ -563,6 +683,29 @@ macro_rules! with_read {
 }
 pub(crate) use with_read;
 
+/// What a long poll reads: whether it found what the poll waits for.
+pub(crate) trait Found {
+    fn found(&self) -> bool;
+}
+
+/// Runs `$read` on fresh snapshots until what it reads is [`Found`] or
+/// `$wait` elapses; evaluates to `(output, read_version)`.
+macro_rules! watch {
+    ($node:expr, $db:expr, $c:expr, $wait:expr, |$t:ident| $read:expr) => {{
+        let until_ = tokio::time::Instant::now() + $wait;
+        loop {
+            let (out_, v_) = crate::api::with_read!($db, $c, |$t| $read);
+            let left_ = until_.saturating_duration_since(tokio::time::Instant::now());
+            if crate::api::Found::found(&out_) || left_.is_zero() {
+                break (out_, v_);
+            }
+            let poll_ = std::time::Duration::from_millis($node.cfg.watch_poll_ms);
+            $db.wait_for_change(v_, left_.min(poll_)).await;
+        }
+    }};
+}
+pub(crate) use watch;
+
 async fn healthz(State(node): State<Arc<Node>>) -> Response {
     if node.draining() {
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"ok": false, "draining": true}))).into_response();
@@ -580,7 +723,8 @@ async fn not_found() -> Error {
 
 /// Builds the HTTP router for the node.
 pub fn router(node: Arc<Node>) -> Router {
-    let db_routes = data::routes().route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
+    let db_routes =
+        data::routes().merge(streams::routes()).route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
     let internal = Router::new()
         .route("/internal/v1/meta", post(account::internal_meta))
         .route_layer(middleware::from_fn_with_state(node.clone(), internal_auth));

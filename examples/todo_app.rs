@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .post(
             "/v1/dbs/todos/tables/todos/rows/query",
             json!({"index": "open_by_due", "eq": [false], "range": {"lt": 20261015},
-                   "filter": {"col": "tags", "op": "eq", "value": ["home"]}}),
+                   "filter": {"col": "tags", "op": "contains", "value": "home"}}),
         )
         .await?;
     for t in r["rows"].as_array().unwrap() {
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .post(
             "/v1/dbs/todos/tables/todos/rows/update",
             json!({"where": {"index": "open_by_due", "eq": [false], "range": {"lt": 20261020},
-                             "filter": {"col": "tags", "op": "eq", "value": ["home"]}},
+                             "filter": {"col": "tags", "op": "contains", "value": "home"}},
                    "set": {"done": true}}),
         )
         .await?;

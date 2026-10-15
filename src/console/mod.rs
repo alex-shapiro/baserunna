@@ -7,6 +7,7 @@ mod account;
 mod db;
 pub mod multipart;
 mod orgs;
+mod streams;
 
 use crate::api::{ClientAddr, SESSION_COOKIE, cookie};
 use crate::auth;
@@ -39,6 +40,7 @@ pub fn routes() -> Router<Arc<Node>> {
         .route("/console/reset", get(reset_page).post(reset_post))
         .route("/console/verify", get(verify_page).post(verify_post))
         .merge(db::routes())
+        .merge(streams::routes())
         .merge(orgs::routes())
         .merge(account::routes())
 }

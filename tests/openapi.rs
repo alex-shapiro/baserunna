@@ -69,7 +69,7 @@ fn router_routes() -> BTreeSet<(String, String)> {
                 continue;
             }
             let rest: String = chunk.split('"').nth(1).unwrap_or("").chars().take_while(|c| *c != '\n').collect();
-            for m in ["get", "post", "put", "delete"] {
+            for m in ["get", "post", "put", "patch", "delete"] {
                 if rest.contains(&format!("{m}(")) {
                     out.insert((path.clone(), m.to_string()));
                 }

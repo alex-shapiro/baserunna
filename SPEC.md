@@ -1,8 +1,8 @@
 # Baserunna Specification
 
 Baserunna is a web service that hosts small databases on object storage.
-Each database supports serializable transactions, KV APIs, and tables.
-Service metadata is itself stored in a Baserunna database.
+Each database supports serializable transactions, KV APIs, tables, and
+streams. Service metadata is itself stored in a Baserunna database.
 
 Status: v1 specification. Sections marked **(future)** are explicitly out of
 scope for v1.
@@ -99,9 +99,11 @@ src/
   engine/           segments, manifest and levels objects, versions, reads (with expiry),
                     commits (read/write sets, validation, commit records), change feeds,
                     range tombstones, leveled compaction, local tier, store clock, GC, blobs,
-                    size quotas
+                    size quotas, stream records and sealed chunks
   ops.rs            the JSON transaction-op language
+  filter.rs         the filter language tables and streams share
   table/            tuple encoding, schema, rows, indexes, queries
+  stream/           stream catalog, record bodies, reads and filters, consumers
   cluster.rs        membership, rendezvous routing, forwarding, leases policy
   meta/             system DB schema + commands (users, sessions, keys, organizations and roles,
                     dbs, nodes) and their invariants
@@ -144,6 +146,10 @@ Use a prefix byte to avoid collisions between keyspaces.
 | `0x02` | table rows: `0x02 ++ table_id(u32 BE) ++ tuple(pk)`                                 |
 | `0x03` | index entries: `0x03 ++ table_id ++ index_id(u32 BE) ++ tuple(cols) [++ tuple(pk)]` |
 | `0x04` | row blob columns: `0x04 ++ table_id ++ tuple(pk) ++ column_id(u32 BE)`              |
+| `0x05` | stream catalog: `0x05 ++ name`                                                      |
+| `0x06` | stream records and chunk references: `0x06 ++ stream_id(u64 BE) ++ seq(u64 BE)`      |
+| `0x07` | stream state (the engine's own, §5.11): `0x07 ++ stream_id`                         |
+| `0x08` | consumer cursors: `0x08 ++ stream_id ++ consumer`                                   |
 | `0xFF` | commit records (the engine's own, §5.5): `0xFF ++ commit_id(u64 BE)`                |
 
 ### 4.3 Blobs
@@ -200,7 +206,7 @@ key of one or more columns, and secondary indexes.
   request fails with `409 already_exists`.
 - Queries: lookup by primary key; range or prefix scan by primary key;
   equality on an index prefix with an optional range on the next column;
-  optional residual `filter` (and/or/not, eq/ne/lt/le/gt/ge/in/prefix/is_null)
+  optional residual `filter` (§4.7) whose comparisons name a column (`col`),
   evaluated server-side; `limit`, `reverse`, and an opaque `cursor`.
 - Batch updates and deletes change every row a selection (the same access
   path, `eq`, `range` and `filter` as a query) picks, at most `limit`, in
@@ -246,13 +252,87 @@ cannot take one.
 Expired values take space until the next manifest write (in the tail) or
 compaction (in segments) reduces them to tombstones (§5.6).
 
+### 4.6 Streams
+
+A stream is a named, append-only log of records in a database: application
+logs, chat conversations, sync feeds, an outbox. Appends are transactional,
+so a record appended with a row update commits atomically with it.
+
+- **Records** have a body of at most 1 MiB, either bytes or a JSON value,
+  optional string headers, a `seq` and a `time`. Seqs are dense: a stream's
+  first record is 0 and each append takes the next ones. A record's `time`
+  is the version time (§5.2) of the commit that appended it, so times never
+  decrease along a stream, and the records of one commit share one. Times
+  are as precise as the nodes' measurements of the store's clock (§4.5): a
+  record appended just after a read may carry a time slightly before it.
+- **Names** are 1-128 characters of `[A-Za-z0-9_.:-]`. Streams are created
+  explicitly or by an append with `create`. Deleting a stream deletes its
+  records at once, and a stream created again under the name starts at 0.
+- **Appends** are blind writes: the committer assigns seqs, so concurrent
+  appends to a stream never conflict. An append with `expect_seq` commits
+  only if the stream's next seq is still that number; otherwise its
+  transaction fails with `412` (optimistic concurrency, as event sourcing
+  needs). An append retried with its idempotency key applies once and
+  reports the seqs and time the first attempt received. An append of no
+  records commits nothing to the stream but still checks `expect_seq`.
+- **Reads** start at a seq, a time, the last N records (`tail`) or a
+  consumer's cursor, run forward or in reverse, and stop at a limit (at
+  most 1,000 records and 16 MiB) or at an end seq or time. A forward read
+  that reaches the end can wait for the next append (`wait_ms`), or stay
+  open and deliver records as server-sent events.
+- **Filters** (§4.7) select records by a JSON body field (`field`, a dotted
+  path whose numeric segments index arrays), a header (`header`) or, naming
+  neither, the body's text, which only `contains` tests. A filtered read
+  examines at most `scan_limit` records (10,000 by default) and says where
+  to continue, so its cost is bounded however few records match.
+- **In transactions** reads are serializable like any other: a read
+  conflicts with a concurrent append only if it reached the end of the
+  stream (or an end time no record has reached), and with a trim only if
+  the trim removed records it read. Reads see the transaction's own trims,
+  but not its appends, whose seqs are assigned at commit.
+- **Trims** remove a stream's oldest records: explicitly (`before_seq`), or
+  by retention, `retention_ms` (records older than that) and `max_bytes`
+  (the oldest records beyond that many body and header bytes). Retention
+  keeps at least what it promises, and trims in steps: once a stream is a
+  sixteenth past a limit, the lease holder trims it back to the limit,
+  shortly after an append or during a sweep (§5.11). A stream may so hold
+  up to a sixteenth more than its limits, and briefly more.
+- **Consumers** are named cursors stored with a stream, at most at its next
+  seq. A consumer that advances its cursor in the transaction that writes
+  what it made of the records processes each record exactly once. Stream
+  info reports the lag of its first 100 consumers; the consumers route pages
+  through all of them.
+
+### 4.7 Filters
+
+Table queries and selections and stream reads filter with one language,
+evaluated server-side. A filter is exactly one of `{"and": [f, ...]}`,
+`{"or": [f, ...]}`, `{"not": f}` or a comparison: the operand's keys (a
+column, a field, a header), `op`, and a `value`. Any other key, or keys of
+two of these forms in one object, makes the request `400`.
+
+- **Comparisons**: `eq`, `ne`, `lt`, `le`, `gt`, `ge` (a number, string or
+  boolean), `in` (an array of at most 1000 values), `prefix` (a string),
+  `contains` (a substring, or an element of an array) and `exists`, which
+  alone takes no value. Values are never null.
+- **Missing and null are one**: a comparison of a missing or null operand
+  is false, `ne` included, so `ne` means "present and different". Only
+  `exists` tells such an operand apart, and `not exists` selects it.
+- **Values compare within their type**. A column compares with values of
+  its type (bytes as base64, by their bytes); only string, bytes and JSON
+  columns take `prefix` and `contains`, and blob columns only `exists`. JSON (JSON columns, body fields, headers as strings) compares
+  numbers by value (`1` equals `1.0`), strings by their bytes and booleans
+  with false first; arrays and objects only equal. A comparison across
+  types is false.
+- **Limits**: a filter nests at most 16 deep and has at most 256 terms.
+
 ## 5. Storage engine
 
 ### 5.1 Object layout (per DB)
 
 ```
 dbs/{db_id}/manifest                 mutable; updated only with If-Match / If-None-Match
-dbs/{db_id}/seg/{seg_id}             immutable sorted segment (SST)
+dbs/{db_id}/seg/{seg_id}             immutable sorted segment (SST), or a sealed stream chunk (§5.11)
 dbs/{db_id}/seg/{id}.levels          immutable list of the segments below level 0 (§5.2)
 dbs/{db_id}/blob/{blob_id}/{chunk}   immutable blob chunks
 dbs/{db_id}/blob/{blob_id}/meta      the blob's descriptor (BlobRef), for binding by id
@@ -282,6 +362,7 @@ tombstone_horizon: u64                        tombstones with seq <= horizon may
 version_times: [(version, store_ms)]          sparse samples (≥30 s apart) for time-based policies
 obsolete: [(kind, id, since_store_ms)]        segments, levels objects and blobs awaiting deletion
 blob_bytes: {bound, swept, swept_at}          blob bytes for the size quota (§5.10)
+chunk_bytes: {bound, swept, swept_at}         sealed stream chunk bytes, likewise (§5.11)
 ```
 
 Each `SegmentMeta` records its level, size, key and seq ranges,
@@ -626,17 +707,17 @@ which keeps them linearizable at the cost of one GET.
 
 Each database may store at most `db_max_bytes` (`BASERUNNA_DB_MAX_MB`,
 10 GiB by default; the system database is exempt). Its size is what its
-manifest accounts for: segment sizes, the tail, and blob bytes, but not
-commit records (§5.5). Commits
+manifest accounts for: segment sizes, the tail, blob bytes and sealed chunk
+bytes (§5.11), but not commit records (§5.5). Commits
 add the size of each blob they bind to `blob_bytes.bound`; a sweep finds
 the distinct blobs the database still references and records their bytes
 (`swept`) with the `bound` total of the version it read (`swept_at`). Blob
 bytes are `swept + bound − swept_at`: exact after a sweep, an upper bound
 until the next.
 
-- **Commits** that write anything other than deletes are refused with
-  `507 quota_exceeded` if their keys and values (blobs at full size)
-  would take the size past the quota. The committer checks each commit
+- **Commits** that write anything other than deletes and trims are refused
+  with `507 quota_exceeded` if their keys and values (blobs at full size)
+  and appended records would take the size past the quota. The committer checks each commit
   against the size so far in its batch, so a refused commit leaves no
   trace. Commits that only delete always pass, so a full database can
   always be emptied.
@@ -655,6 +736,80 @@ until the next.
 compactions can grow a database a little past its quota, by the segment
 overhead its commits did not count.
 
+### 5.11 Streams
+
+Stream records take the same path as every other write, and leave it once
+there are enough of them to store like a log.
+
+- **Records** are entries `0x06 ++ stream_id ++ seq` whose value holds the
+  record's time, its position (the body and header bytes the stream held
+  before it) and its body. The committer gives each appended record its seq
+  and time, writes it to the tail, and rewrites the stream's **state**
+  (`0x07 ++ stream_id`: next seq and position; first seq, position and
+  time; last time; retention), all in the batch's one manifest write. An
+  append costs no request of its own.
+- **Small streams stay in the LSM.** Thousands of conversations taking a
+  message a minute each share every flush, and compaction groups their
+  records by stream. A log object per stream could not do that without a
+  PUT per stream per flush, or rewriting the small objects.
+- **Bulky runs are sealed.** When a flush or a compaction writes a run of
+  consecutive records of one stream of at least `stream_seal_min_bytes`
+  (64 KiB), it writes the run to a **sealed chunk** instead: a segment
+  (§5.3) holding only that run, without a bloom filter, cut at
+  `stream_chunk_bytes` (2 MiB). In the run's place goes one **chunk
+  reference**, keyed by the run's last seq, with the chunk's id and size,
+  its first seq and position, its bytes and time range. A chunk is never
+  rewritten. A busy log's records fill the tail, so a flush seals them
+  straight from it; if what is left fits in half the tail, it stays there,
+  and the flush costs one PUT. A log is written to object storage once,
+  and its LSM is chunk references, a few thousandths of its size. Records
+  of quieter streams flush to level 0 with everything else, and are sealed
+  once compaction has gathered enough of them.
+- **Reads** scan the stream's keys: records come from the LSM, and a chunk
+  reference expands into its chunk's records, read like any segment (block
+  cache, local tier, read-ahead). Keyed by its last seq, the reference to
+  the chunk holding a seq is the first entry at or after it, so a forward
+  read from any seq is one scan. Only runs of consecutive seqs are sealed
+  and each record is written once, so chunks never overlap each other or
+  records left in the LSM. A seq of a given time or position is found by
+  binary search over seqs; a chunk reference settles a probe from its range
+  without reading the chunk.
+- **Trims** move the state's first seq and write a range tombstone over
+  `[0x06 ++ id ++ 0, 0x06 ++ id ++ first)`, which replaces the stream's
+  previous one, so that the transactions that read the records trimmed
+  conflict (§6.1). Compaction then drops the records and chunk references
+  it covers (§5.6). A chunk holding the new first seq stays until it is
+  wholly trimmed, and reads skip its trimmed records.
+- **Retention.** After a commit, the lease holder looks at the state of each
+  stream the commit appended to; if its oldest record is a sixteenth of
+  `retention_ms` past it, or it holds a sixteenth more than `max_bytes`, a
+  background task finds the trim point of the exact limits by binary search
+  and commits the trim. The slack makes each trim remove a share of the
+  stream: without it, every append to a stream at its limit would cost a
+  second commit. The trim names the retention it was computed for, and
+  does nothing if the stream's retention changed before it committed.
+  Sweeps (§5.8) do the same for streams no longer appended to.
+- **Garbage collection.** Chunks are stored under `seg/` but referenced
+  from LSM entries, as blobs are from values: a sweep collects the chunk
+  references it streams past, and unreferenced chunks become orphans
+  (§5.8). Their bytes count toward the size quota like blob bytes, added
+  when a chunk is sealed and recounted by every sweep (§5.10).
+
+`sim::amp` measures streams as it measures compaction (§5.6): about 10 MB
+of 200-byte records appended without compression, with sealing and
+without it. Write amplification is segment and chunk bytes written per
+body byte:
+
+| workload                                   | write, sealed → LSM only | records sealed |
+| ------------------------------------------ | ------------------------ | -------------- |
+| one log, 50 records a commit               | 1.18 → 3.94              | 100%           |
+| 20 feeds of 500 KB, appended in turn       | 2.90 → 7.30              | 88%            |
+| 200 conversations of 50 KB, 25 per commit  | 7.11 → 7.11              | 1%             |
+
+The log is written once, its records and their encoding; conversations
+too small to seal stay in the LSM, where they cost what any small rows
+cost. `tests/cost.rs` budgets these, and the requests of ingestion (§13.4).
+
 ---
 
 ## 6. Transactions
@@ -671,7 +826,12 @@ overhead its commits did not count.
     tombstone newer than `read_version` that intersects the read set fails
     it too, even where it deleted nothing (conservative). So does a value
     the transaction read that has expired by the commit's version time
-    (§4.5).
+    (§4.5);
+  - a stream read records the range of record keys it covered, through the
+    end of the stream if it reached it, so an append after it fails it only
+    if the read reached the end, and a trim only if it removed records the
+    read returned (§5.11). Against earlier transactions of its batch, a
+    transaction is checked with the seqs their appends were given.
 - `snapshot` isolation validates only the write set (first-committer-wins).
   Write skew is possible, as documented. Reads that writes are derived from
   are validated anyway: a row write commits only against the table schema
@@ -679,11 +839,11 @@ overhead its commits did not count.
   dropped column or table) makes it fail with a retryable `409 conflict`
   rather than miss index maintenance.
 - Read-only transactions always succeed and serialize at `read_version`.
-- Blind-write transactions never conflict.
-- Reads within a transaction see its own earlier writes.
+- Blind-write transactions never conflict, appends included.
+- Reads within a transaction see its own earlier writes, except appends.
 - Limits: `txn_max_ops` 10,000; `txn_max_write_bytes` 16 MiB, where blobs
-  count only their descriptor; `txn_idle_timeout` 30 s;
-  `txn_max_lifetime` 5 min.
+  count only their descriptor; 100,000 appended records; `txn_idle_timeout`
+  30 s; `txn_max_lifetime` 5 min.
 
 ### 6.2 Forms
 
@@ -692,7 +852,9 @@ overhead its commits did not count.
    `idempotency_key`. Retrying with the same key never applies twice within
    `commit_retention_ms` (10 minutes) of the first attempt, nor when two
    attempts reach the committer together. A retry that finds the earlier
-   attempt applied returns `replayed: true` with `results: null`.
+   attempt applied returns `replayed: true` with `results: null`, and the
+   seqs its appends received (`appends`): the commit record keeps the
+   commit's time and the first seq and count of each append.
    A retried idempotent request that fails a precondition checks the
    commit status (fenced) before answering 412, because an earlier attempt
    may have applied the write that now makes the check fail. Conflicts are
@@ -700,16 +862,20 @@ overhead its commits did not count.
 2. **Interactive** (`/v1/dbs/{db}/transactions…`): begin, ops, commit,
    abort. State lives on the owner node. If the owner changes or crashes, the
    transaction is lost (`404 txn_not_found`, retryable) and nothing was
-   committed. `begin` returns the transaction's `commit_id` up front.
+   committed. `begin` returns the transaction's `commit_id` up front, and
+   `commit` the seqs its appends received.
 
 **Resolving ambiguity.** A `503` with `outcome: "unknown"`, or a lost
 response, means a commit may or may not have applied. The client waits
 until the request's commit deadline has certainly passed (about 15 s), then
 calls `GET /commits/{commit_id}` (or `key:<idempotency key>`). That call
 first performs a manifest write, fencing any in-flight attempt, and then
-answers definitively from the commit records (§5.5): `committed` (with its
-version) or `not_committed`. Commit ids are 16 hex characters; the answer
-is definitive within `commit_retention_ms` (10 minutes) of the commit.
+answers from the commit records (§5.5): `committed` (with its version and
+`appends`) or `not_committed` (with `retention_ms`). Commit ids are 16 hex
+characters. `not_committed` is definitive only if the first attempt began
+less than `retention_ms` ago: an older commit's record may be gone. Past
+that, the outcome is unknowable from the server, and a client that must not
+apply twice (an append, an increment) resolves it from the data instead.
 
 ### 6.3 Ops
 
@@ -730,10 +896,22 @@ is definitive within `commit_retention_ms` (10 minutes) of the commit.
 | `query_rows`   | table, `index?`, `eq?`, `range?`, `filter?`, `limit`, `reverse`, `cursor`  | `{rows, next_cursor?}`                                  |
 | `update_rows`  | table, `where` (`index?`, `eq?`, `range?`, `filter?`), `set`, `ttl_ms?`, `limit?` | `{count}`                                        |
 | `delete_rows`  | table, `where`, `limit?`                                                   | `{count}`                                               |
+| `append`       | stream, `records` (`value` or `json`, `headers?`), `expect_seq?`, `create?` | `{count, first_seq?}` (`first_seq` once committed)     |
+| `read_stream`  | stream, `from_seq`, `from_time`, `tail` or `consumer`, `until_seq?`, `until_time?`, `reverse`, `limit`, `max_bytes?`, `filter?`, `scan_limit?` | `{records, next_seq, done}`                  |
+| `stream_info`  | stream                                                                     | `{first_seq, next_seq, bytes, first_time?, last_time?}` |
+| `trim_stream`  | stream, `before_seq`                                                       | `{}`                                                    |
+| `get_consumer` | stream, consumer                                                           | `{found, seq?}`                                         |
+| `set_consumer` | stream, consumer, `seq`                                                    | `{}`                                                    |
 
 `ttl_ms` (1 ms to 10 years) makes a value or row expire that long after the
 write commits (§4.5); `update_row`, `update_rows` and `increment` keep an
 existing expiry unless they set one.
+
+A record's body is `value` (a string, in the request's encoding) or `json`
+(any JSON value); reads return each record as `{seq, time, headers?, value
+| json}`. A read's `next_seq` is where the next page starts: the next
+`from_seq` of a forward read, the next `until_seq` of a reverse one. `done`
+says the read reached its end seq or time, or the end of the stream.
 
 Keys and values in JSON are UTF-8 strings by default. With
 `"encoding": "base64"` on the request, every key and value in the request and
@@ -1012,7 +1190,7 @@ Errors are returned as
 | 403    | `permission_denied`                                                        |
 | 404    | `not_found`, `txn_not_found`                                               |
 | 409    | `conflict` (retryable), `already_exists`                                   |
-| 412    | `precondition_failed` (includes the failing op index)                      |
+| 412    | `precondition_failed` (includes the failing op index; also an append whose `expect_seq` no longer holds) |
 | 410    | `cursor_expired` (a change feed cursor older than the deletions kept, §6.4) |
 | 413    | `too_large`                                                                |
 | 429    | `rate_limited` (retryable, `Retry-After`; not applied)                     |
@@ -1061,6 +1239,14 @@ POST   /v1/dbs/{db}/tables/{t}/rows/update        by `pk`, or many by `where`
 POST   /v1/dbs/{db}/tables/{t}/rows/delete        by `pk`, or many by `where`
 POST   /v1/dbs/{db}/tables/{t}/rows/query
 GET    /v1/dbs/{db}/tables/{t}/changes             change feed of rows (§6.4)
+GET    /v1/dbs/{db}/streams  POST /v1/dbs/{db}/streams (name, retention_ms?, max_bytes?)
+GET    /v1/dbs/{db}/streams/{s}   PATCH /v1/dbs/{db}/streams/{s} (retention)   DELETE /v1/dbs/{db}/streams/{s}
+POST   /v1/dbs/{db}/streams/{s}/records            append: JSON, NDJSON or lines of text
+GET    /v1/dbs/{db}/streams/{s}/records            read: JSON, NDJSON or server-sent events; long poll
+POST   /v1/dbs/{db}/streams/{s}/records/query      filtered read
+POST   /v1/dbs/{db}/streams/{s}/trim               before_seq
+GET    /v1/dbs/{db}/streams/{s}/consumers           limit, cursor
+GET|PUT|DELETE /v1/dbs/{db}/streams/{s}/consumers/{c}
 GET    /v1/admin/users   GET /v1/admin/nodes   POST /v1/admin/users/{id}/disable
 ```
 
@@ -1081,6 +1267,28 @@ Raw KV semantics:
   key's version. `If-None-Match: *` makes it create-only. `?ttl_ms=` makes
   the value expire (§4.5). `Content-Type` is kept for blob values.
 
+Streams over HTTP:
+
+- Appending takes `application/json` (`{records, expect_seq?, create?,
+  idempotency_key?}`), `application/x-ndjson` (a JSON record per line) or
+  `text/plain` (a text record per line); empty lines and a leading byte
+  order mark are skipped, so `curl --data-binary @app.log -H
+  'content-type: text/plain'` ingests a log file. Query parameters
+  `create`, `expect_seq` and an `Idempotency-Key` header (visible ASCII)
+  apply to every format. The answer is `{first_seq, next_seq, count, time,
+  version, commit_id, replayed}`; a key used by a request other than an
+  append is refused.
+- Reading answers `application/json` (`{records, next_seq, first_seq,
+  tail_seq, done, version}`), or per the `Accept` header or `format`
+  parameter `application/x-ndjson` (a record per line, with `next_seq`,
+  `first_seq`, `tail_seq` and `done` in `x-baserunna-*` headers) or
+  `text/event-stream`. An event stream reads forward: it sends each record
+  as `id: <seq>` and `data: <record>`, waits up to `wait_ms` (at most 5
+  minutes) for appends, sending a comment every 15 s while idle, and ends at
+  `limit` records, at the read's end seq or time, after `wait_ms`, or when
+  the node shuts down; the client resumes after `Last-Event-ID`. A read that
+  fails before the stream starts answers with its error status.
+
 ---
 
 ## 11. Admin console
@@ -1093,8 +1301,9 @@ JavaScript framework and no external assets. Pages:
 - databases: list, create, delete; per-DB page with a metrics panel (size
   against the quota, levels, tail, pending garbage, lease), key browser
   (prefix scan, view, delete, put, file upload, download), tables (create,
-  drop; add and drop columns and indexes; rows), and a transaction runner
-  (JSON);
+  drop; add and drop columns and indexes; rows), streams (create, delete,
+  retention; newest records first, older pages, appending a record;
+  consumers), and a transaction runner (JSON);
 - organizations: list, create, delete; members (add by email, change
   role, remove, leave) and the organization's databases;
 - account: verification status, password change, sessions (revoke one or
@@ -1213,6 +1422,7 @@ the directory.
 | `schema_race`  | Row writes on every path (batch updates and deletes included) and at both isolation levels race schema changes. Indexes must match rows, nothing may be orphaned, and each writer's rows must match its model. |
 | `ttl`          | Values and rows with times to live. Each read must see a value until its expiry window (the commit request's span plus the TTL, widened by the clock error bound) and never after, nor a value it replaced; a unique value is free exactly when its row expired. Clients take and renew a lock held by an expiring value: by version, each acquisition commits no earlier than the previous lock expired and each renewal before the lock it read did, which the locks' own expiries tell exactly. |
 | `watch`        | A writer commits puts (some expiring), deletes and range deletes while a watcher follows the change feed with long polls through random nodes. Every change received must be what the writer wrote at that version, cursors expire no sooner than a transaction lifetime after they caught up, and the watcher's state must end up equal to the database's. |
+| `streams`      | Appenders (some with `expect_seq`, some appending in a transaction that also increments a counter, all with idempotency keys), followers on long polls and event streams, readers by seq, time, tail, consumer, in reverse and with filters, explicit and retention trims, and a stream deleted and recreated, through random nodes under faults. Every record read must be the one appended at its seq, seqs dense and times never decreasing and within their append's window; a strong read must see every append acknowledged before it began and no trim undone; `expect_seq` lets exactly one of the appends expecting a seq through; a counter and its stream must agree; followers receive every record once, in order; retention leaves each stream within its limits; and every stream must end equal to its model. Enough data flows to seal chunks at flush and in compaction. |
 | `blobs`        | Uploads of random sizes on every path, range reads, overwrites and deletes, checked by SHA-256. A final GC keeps every referenced object and removes every unreferenced one.      |
 | `blob_gc_race` | Blob reads race overwrites, deletes and GC, with grace periods shorter than a download (and, hostile, node clocks an hour apart). A read may fail cleanly but never return wrong bytes. |
 | `abandoned`    | Interactive transactions abandoned, aborted or committed late while leases move. No update is lost, abandoned transactions never commit, and open transactions drain.             |
@@ -1230,8 +1440,9 @@ Every node runs with rate limits that busy workloads reach now and then;
 simulated clients wait out a 429 and resend, as it was not applied. Most
 workloads also run under `hostile` (the `*_hostile` scenarios). Every
 run ends by checking **storage invariants**: each manifest decodes, its
-levels object exists and matches it, and every referenced segment and live
-blob exists.
+levels object exists and matches it, every referenced segment and live
+blob exists, and every live chunk reference names a chunk that holds
+exactly the records it claims, with no overlap within a stream.
 
 ### 13.4 Other test layers
 
@@ -1244,7 +1455,13 @@ blob exists.
   with snapshots taken along the way still reading their state a
   transaction lifetime later, with the deeper levels inline or in levels
   objects, and with the change feed from any earlier version, applied in
-  pages to that version's state, giving the current state; a table with
+  pages to that version's state, giving the current state; streams with
+  random appends (some large enough to seal at once), trims, retention
+  changes, deletions and recreations, among KV writes, flushes, compactions
+  (which seal), sweeps and time jumps, equal a model when read from random
+  seqs, times and positions in both directions, now and from snapshots
+  taken earlier, with no two chunks or records of a stream overlapping; a
+  stream filter evaluates like an independent model of it; a table with
   random row writes, queries and batch updates and deletes through its
   indexes equals a model; range tombstone fragments match a brute-force
   check; base64/varint/bloom laws; random organization, membership,
@@ -1256,7 +1473,8 @@ blob exists.
 - **Fuzz tests**: every decoder (manifest, levels object, range tombstone,
   segment and compressed blocks, entries with expiries, tuple, row, blob
   ref, query and change feed cursors, database references, mailed-link
-  tokens, multipart form bodies) gets
+  tokens, multipart form bodies, stream records, chunk references, stream
+  state and record bodies) gets
   arbitrary and mutated inputs and must
   return `Err`, never panic. The router gets random JSON bodies and paths and must never answer
   500 or panic. These run in `cargo test` with fixed seeds. The same
@@ -1265,8 +1483,9 @@ blob exists.
   semantics, not just robustness. Fuzzer bytes choose one-shot and
   interactive transactions, some malformed, and an exact model predicts
   every response: results, versions, cursors, failing op indexes, unique
-  violations, replays, OCC conflicts, the rows batch operations select, and
-  which values report an expiry. Rejected requests must leave no trace. The
+  violations, replays, OCC conflicts, the rows batch operations select,
+  which values report an expiry, and stream appends (with `expect_seq`),
+  reads, trims and consumers. Rejected requests must leave no trace. The
   model parses ops with its own copy of their types, so it cannot share a
   parsing bug with the service.
 - **OpenAPI conformance**: every response in the DST is validated against
@@ -1277,8 +1496,9 @@ blob exists.
   documented operation was never exercised by the simulator, or if one of
   the storage paths only some data shapes reach never ran: range
   tombstones written and retired, segments dropped and rewritten for
-  them, levels objects written, commits refused for the quota, and expired
-  entries and segments reclaimed. Nodes
+  them, levels objects written, commits refused for the quota, expired
+  entries and segments reclaimed, chunks sealed at flush and in compaction,
+  and streams trimmed for retention. Nodes
   count these (`engine::Activity`), and the simulator sums them over a run,
   crashed nodes included.
 - **Request ids**: a two-node simulation captures every node's log records
@@ -1291,7 +1511,9 @@ blob exists.
   broken ledgers, missing or stale index entries, orphaned rows, missing
   segments and blob chunks, foreign bytes in blob reads, reads outside
   expiry windows, overlapping lock holders, feed changes no write
-  explains, and write answers no role in their window explains.
+  explains, write answers no role in their window explains, and stream
+  reads with gaps, foreign or reordered records, a lost append or an
+  undone trim.
   Disabling expiry validation, the version time's floor at read times,
   range deletions in the feed, or index maintenance in batch updates each
   fails campaigns of the `ttl`, `watch` and `tables` workloads.
@@ -1326,6 +1548,10 @@ blob exists.
   | steady writes, with flush/compaction/GC       | 1.001 PUT, 0.001 GET per commit |
   | idle database                                 | 0 per hour                      |
   | node overhead (heartbeats, membership)        | 31 PUT + up to 140 GET per hour |
+  | stream append                                 | 1 PUT                           |
+  | stream tail read, lease holder                | 0                               |
+  | log ingestion, 20 KB NDJSON appends           | 1 PUT per append + 5 PUT per MiB, 0 GET |
+  | cold read of a sealed log                     | 5 GET per MiB                   |
 
   `cost_model` prices these with S3 Standard list prices for workload
   profiles (idle, light, typical, heavy); the typical profile (100k reads
@@ -1426,12 +1652,35 @@ Bugs the DST suite found, each now covered by the regular suite:
     checked while the system database was unreachable was reported as
     invalid (401) instead of retryable.
 
-The cost measurements (§13.4) found four more: a read-heavy database whose
+22. _Lease loss after an ambiguous write._ A commit whose manifest write
+    timed out, but had landed, reloaded the manifest, found another node's
+    lease and failed with `not_owner`, which clients take for not applied.
+    A metadata command retried on that answer created a session twice.
+    Such a failure now reports an unknown outcome (§5.5).
+
+23. _Retention left to a node that doubted its lease._ The node whose
+    commit called for a retention trim checked its own lease first; after
+    an ambiguous write it did not know it held one, and the trim waited
+    for the next commit. Trims now commit like any write, fenced by the
+    manifest, and replays of a commit schedule its trims too (§5.11).
+
+24. _Status checks past commit retention._ An append whose response was
+    lost through a partition and a crash was checked for 131 s, longer
+    than commit records were kept; `not_committed` then sent the client
+    to append again. The answer now carries `retention_ms`, past which it
+    is not definitive (§6.2), and the workload resolves such appends from
+    the records it reads.
+
+The cost measurements (§13.4) found five more: a read-heavy database whose
 lease had lapsed never acquired it again (paying a validating GET per read
 forever), a strong read without a lease validated the manifest twice,
 shortening the lease doubled read-only renewals (they now take the longer
-read lease, §5.7), and levels objects under their own prefix added a LIST
-to every sweep (they now share the segments' prefix).
+read lease, §5.7), levels objects under their own prefix added a LIST
+to every sweep (they now share the segments' prefix), and every flush of
+a busy log wrote two more small segments, for commit records and stream
+state, which compaction then merged: what sealing leaves of a flush now
+stays in the tail (§5.11), and ingestion costs 5 PUTs per MiB beyond its
+commits instead of 18, and no GETs.
 
 A review alongside the simulator also found that internal endpoints were
 open when no cluster secret was configured. Clusters now always generate
@@ -1457,11 +1706,20 @@ it over real HTTP, and prints what it is doing:
    compare-and-set updates.
 6. `multi_node`: three nodes on one store, forwarding, a node killed
    mid-flight, and failover without data loss.
+7. `app_logs`: JSON log lines shipped as NDJSON into a stream with
+   retention, the latest errors found newest first by bounded filtered
+   scans, `tail -f` with a long poll, and a shipper that forwards each line
+   exactly once by advancing its consumer in its transaction.
+8. `chat_rooms`: a stream per room created by its first message, a
+   message and a counter committed together, members waiting for new
+   messages, `expect_seq` for posting only after the latest message, and
+   unread counts from consumer cursors.
 
 Tools: `sim_tool` runs simulation campaigns and prints traces.
 `cost_model` prints object-store requests per operation and the cost per
-database-month, and `amplification` compaction's write, space and read
-amplification. `gen_openapi` regenerates `openapi.json`.
+database-month, and `amplification` the write, space and read
+amplification of compaction and of streams. `gen_openapi` regenerates
+`openapi.json`.
 
 ---
 
@@ -1494,10 +1752,21 @@ amplification. `gen_openapi` regenerates `openapi.json`.
 - `CloudStore` (S3/GCS/Azure through `object_store`) is exercised only by
   compile-time checks here; the simulator tests the same semantics through
   `SimStore`.
+- Stream retention runs on the lease holder, so a database with no activity
+  at all keeps records past their retention until it is used again
+  (§5.11). Trimmed chunks and their quota bytes are reclaimed by sweeps,
+  hours later, as overwritten blobs are.
+- Stream filters scan records; there is no index on record contents, so a
+  query finds needles at the rate it can scan (`scan_limit` records a
+  request).
 
 ## 16. Future work
 
 Point-in-time restore (keep old manifests); change feeds that keep
 deletions longer, or every intermediate value; quotas and rate limits per
 user or database, shared across nodes; per-database grants within an
-organization; service accounts (API keys that belong to an organization).
+organization; service accounts (API keys that belong to an organization);
+stream consumer groups that share a stream's records among workers, with
+acknowledgements and redelivery; per-block summaries of stream records
+(bloom filters of field values) so that filters skip blocks; merging small
+sealed chunks.

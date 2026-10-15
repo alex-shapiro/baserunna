@@ -64,6 +64,7 @@ pub struct SegmentBuilder {
     block_target: usize,
     compression: Compression,
     index: Vec<(Bytes, u64, u32)>,
+    bloom: bool,
     hashes: Vec<u64>,
     entries: u64,
     tombstones: u64,
@@ -84,6 +85,7 @@ impl SegmentBuilder {
             block_target: block_target.max(256),
             compression,
             index: Vec::new(),
+            bloom: true,
             hashes: Vec::new(),
             entries: 0,
             tombstones: 0,
@@ -94,6 +96,13 @@ impl SegmentBuilder {
             first_key: None,
             last_key: Vec::new(),
         }
+    }
+
+    /// A segment that is only ever scanned, never probed by key: its bloom
+    /// filter is left empty.
+    pub fn without_bloom(mut self) -> SegmentBuilder {
+        self.bloom = false;
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -139,7 +148,9 @@ impl SegmentBuilder {
         }
         self.last_key.clear();
         self.last_key.extend_from_slice(&e.key);
-        self.hashes.push(key_hash(&e.key));
+        if self.bloom {
+            self.hashes.push(key_hash(&e.key));
+        }
         if self.block.len() >= self.block_target {
             self.finish_block();
         }

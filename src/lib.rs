@@ -13,6 +13,7 @@ pub mod console;
 pub mod engine;
 pub mod env;
 pub mod error;
+pub mod filter;
 pub mod limits;
 pub mod log;
 pub mod mail;
@@ -21,6 +22,7 @@ pub mod node;
 pub mod ops;
 pub mod sim;
 pub mod store;
+pub mod stream;
 pub mod table;
 pub mod util;
 

@@ -195,6 +195,7 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     expect(admin.contains("ui@console.test") && this_node, "the admin page lacks users or this node")?;
 
     pagination(&mut b).await?;
+    streams(&mut b, evil).await?;
     files(&sim, &mut b).await?;
     schema(&mut b).await?;
     organizations(&sim, &mut b).await?;
@@ -275,6 +276,50 @@ async fn pagination(b: &mut Browser) -> Result<(), String> {
         }
     }
     expect(seen == existing + 3, format!("paging API keys two at a time found {seen} of {}", existing + 3))
+}
+
+/// Verifies stream pages: creation, appends of text and JSON, escaping,
+/// newest-first paging, retention, trims and deletion.
+async fn streams(b: &mut Browser, evil: &str) -> Result<(), String> {
+    let r = b.req("POST", "/console/dbs/webdb/streams", Some(form(&[("name", "x")]))).await?;
+    expect(r.status == 403, format!("creating a stream without a CSRF token answered {}", r.status))?;
+    let sp = "/console/dbs/webdb/streams/events";
+    let to = b
+        .submit_ok("/console/dbs/webdb", "/console/dbs/webdb/streams", &[("name", "events"), ("max_bytes", "100000")])
+        .await?;
+    expect(to.starts_with(sp), format!("creating a stream led to {to}"))?;
+    b.submit_err("/console/dbs/webdb", "/console/dbs/webdb/streams", &[("name", "events")]).await?;
+    b.submit_ok(sp, &format!("{sp}/records"), &[("value", evil)]).await?;
+    b.submit_ok(sp, &format!("{sp}/records"), &[("value", r#"{"tag": "<b>bold</b>"}"#), ("json", "1")]).await?;
+    b.submit_err(sp, &format!("{sp}/records"), &[("value", "{nope"), ("json", "1")]).await?;
+    let page = b.page(sp).await?;
+    expect(!page.contains(evil) && page.contains("&lt;script&gt;"), "the console does not escape stream records")?;
+    expect(!page.contains("<b>bold") && page.contains("&lt;b&gt;bold"), "the console does not escape JSON records")?;
+    let records: Vec<_> = (0..60).map(|i| json!({"value": format!("r{i:02}")})).collect();
+    let body = json!({"records": records, "idempotency_key": "console-streams"});
+    let r = b.api("streams").call_settled("POST", "/v1/dbs/webdb/streams/events/records", Some(body)).await;
+    expect(r.status == 200, format!("appending 60 records: {} {}", r.status, r.json))?;
+    let newest = b.page(sp).await?;
+    // The first two records precede r00, at seq 2.
+    let (r59, r10) = (newest.find("r59"), newest.find("r10"));
+    expect(r59.is_some() && r10.is_some() && r59 < r10, "the newest records are not shown first")?;
+    expect(!newest.contains("r09"), "the first page shows more than 50 records")?;
+    let older = link(&newest, "Older →").ok_or("no link to older records")?;
+    let page = b.page(&older).await?;
+    expect(
+        page.contains("r09") && page.contains("&lt;script&gt;") && !page.contains("r10"),
+        format!("{older} is wrong"),
+    )?;
+    expect(link(&page, "Newest").is_some() && link(&page, "Older →").is_none(), "the oldest page's pager is wrong")?;
+    b.submit_ok(sp, &format!("{sp}/retention"), &[("retention_ms", "3600000"), ("max_bytes", "")]).await?;
+    expect(b.page(sp).await?.contains("keeps 3600 s"), "the retention is not shown")?;
+    b.submit_err(sp, &format!("{sp}/retention"), &[("retention_ms", "soon")]).await?;
+    b.submit_ok(sp, &format!("{sp}/trim"), &[("before_seq", "10")]).await?;
+    expect(b.page(sp).await?.contains("<span>Records</span>10–61"), "the trim is not shown")?;
+    b.submit_err(sp, &format!("{sp}/delete"), &[("confirm", "nope")]).await?;
+    b.submit_ok(sp, &format!("{sp}/delete"), &[("confirm", "events")]).await?;
+    let db = b.page("/console/dbs/webdb").await?;
+    expect(!db.contains("streams/events"), "a deleted stream is still listed")
 }
 
 /// Verifies multipart file uploads and attachment download headers.

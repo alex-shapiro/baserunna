@@ -6,6 +6,7 @@ Baserunna is a web service that hosts small databases on object storage.
 - Key Value API
 - Large binary blobs stored out of band as chunked objects.
 - Tables with schemas, primary keys, indexes, and schemas.
+- Streams: append-only logs with retention and consumers.
 - Stateless nodes: kill any node at any time.
 - Verification with deterministic simulation testing
 

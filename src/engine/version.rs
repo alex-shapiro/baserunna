@@ -752,9 +752,14 @@ impl Version {
         self.m.time_ms.max(self.shared.store_now_ms().unwrap_or(0))
     }
 
+    /// This version's range tombstones, indexed for lookups.
+    pub(crate) fn deletes(&self) -> Arc<RangeDeletes> {
+        self.deletes.clone()
+    }
+
     /// The sorted runs of this version: each level 0 segment alone, then
     /// each deeper level.
-    fn runs(&self, keep: impl Fn(&SegmentMeta) -> bool) -> Vec<Vec<SegmentMeta>> {
+    pub(crate) fn runs(&self, keep: impl Fn(&SegmentMeta) -> bool) -> Vec<Vec<SegmentMeta>> {
         let mut runs: Vec<Vec<SegmentMeta>> =
             self.m.level(0).iter().filter(|s| keep(s)).map(|s| vec![s.clone()]).collect();
         for l in 1..=MAX_LEVEL {

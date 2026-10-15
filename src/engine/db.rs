@@ -7,14 +7,16 @@ use super::compaction::{self, Kind};
 use super::manifest::{Lease, Manifest, ObjKind, Obsolete, SegmentMeta};
 use super::range_delete::RangeTombstone;
 use super::segment::SegmentBuilder;
+use super::stream::{self, Appended, Pending, Sealer, Seek, StreamOp};
 use super::txn::{CommitRequest, Isolation, Txn, WriteSet, validate};
-use super::types::{Entry, Seq, Value, commit_key, is_commit_key};
+use super::types::{Entry, Seq, Value, commit_key, decode_commit_record, encode_commit_record, is_commit_key};
 use super::version::{KeyRange, Snapshot, Version};
 use super::{Shared, blob_prefix, levels_key, manifest_key, seg_key};
 use crate::error::{Error, Result};
 use crate::store::{GetOpts, PutMode, StoreError};
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -53,6 +55,8 @@ enum Work {
         inputs: Vec<String>,
         outputs: Vec<SegmentMeta>,
         purged_max_seq: Seq,
+        /// Bytes of the stream chunks its merges sealed.
+        sealed_bytes: u64,
         /// The manifest's `compaction_seq` when the compaction was planned.
         compaction_seq: u64,
         /// Segments below level 0 after compaction, and optional levels object ID if not stored inline.
@@ -65,6 +69,8 @@ enum Work {
         items: Vec<Obsolete>,
         /// Distinct referenced blob bytes from the swept version and its bound blob total.
         blob_bytes: (u64, u64),
+        /// Referenced chunk bytes from the swept version and its bound chunk total.
+        chunk_bytes: (u64, u64),
         tx: oneshot::Sender<Result<()>>,
     },
     MarkDeleted {
@@ -84,7 +90,7 @@ impl Work {
                 let _ = tx.send(r);
             }
             (Work::Commit { tx, .. }, Outcome::Unit(r)) => {
-                let _ = tx.send(r.map(|_| Committed { version: 0, replayed: false, time_ms: 0 }));
+                let _ = tx.send(r.map(|_| Committed { version: 0, replayed: false, time_ms: 0, appends: Vec::new() }));
             }
             (Work::Lease { tx: Some(tx), .. }, o)
             | (Work::Compaction { tx, .. }, o)
@@ -123,6 +129,10 @@ struct State {
     sweeping: bool,
     /// Indicates a write was rejected due to quota, signaling an earlier sweep.
     quota_pressure: bool,
+    /// Streams whose retention may call for a trim, and whether a task is
+    /// trimming them.
+    trim_queue: BTreeSet<u64>,
+    trimming: bool,
 }
 
 impl State {
@@ -159,13 +169,15 @@ struct Staging {
     staged: BTreeMap<String, (u64, Instant)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Committed {
     pub version: Seq,
     /// The commit id had already been applied by an earlier attempt.
     pub replayed: bool,
-    /// Store time of the committed version, or 0 for a replay.
+    /// Store time of the committed version.
     pub time_ms: u64,
+    /// The records each append received, in the order of the appends.
+    pub appends: Vec<Appended>,
 }
 
 /// Database storage statistics at a single version.
@@ -219,6 +231,8 @@ impl Db {
                 compacting: false,
                 sweeping: false,
                 quota_pressure: false,
+                trim_queue: BTreeSet::new(),
+                trimming: false,
             }),
             q: Mutex::new(Queue { items: VecDeque::new(), running: false }),
             load_lock: tokio::sync::Mutex::new(()),
@@ -245,6 +259,14 @@ impl Db {
         self.st().current.clone()
     }
 
+    /// Whether background work (commits, compaction, sweeps, retention
+    /// trims) is running or queued.
+    pub fn busy(&self) -> bool {
+        let st = self.st();
+        let q = self.queue();
+        q.running || !q.items.is_empty() || st.compacting || st.sweeping || st.trimming
+    }
+
     pub(crate) fn idle_for(&self, ms: u64) -> bool {
         let st = self.st();
         let q = self.queue();
@@ -252,6 +274,7 @@ impl Db {
             && q.items.is_empty()
             && !st.compacting
             && !st.sweeping
+            && !st.trimming
             && st.last_access.elapsed() >= Duration::from_millis(ms)
     }
 
@@ -598,12 +621,17 @@ impl Db {
     /// Commits `req` and reports whether the commit ID was already applied.
     pub async fn commit_detailed(self: &Arc<Self>, mut req: CommitRequest) -> Result<Committed> {
         if req.writes.is_empty() {
-            return Ok(Committed { version: req.read_version, replayed: false, time_ms: req.read_time });
+            return Ok(Committed {
+                version: req.read_version,
+                replayed: false,
+                time_ms: req.read_time,
+                appends: Vec::new(),
+            });
         }
         if req.deadline.is_none() {
             req.deadline = Some(Instant::now() + Duration::from_millis(self.shared.cfg.commit_timeout_ms));
         }
-        if !req.writes.blob_ids().is_empty() || req.writes.has_relative_ttl() {
+        if !req.writes.blob_ids().is_empty() || req.writes.needs_clock() {
             self.shared.store_time_ms().await?;
         }
         let (tx, rx) = oneshot::channel();
@@ -633,15 +661,16 @@ impl Db {
         rx.await.map_err(|_| Error::unavailable("lease release interrupted"))?
     }
 
-    /// Checks whether commit `id` has been applied as of a strong read.
-    pub async fn commit_status(self: &Arc<Self>, id: u64) -> Result<Option<Seq>> {
+    /// Checks whether commit `id` has been applied as of a strong read, and
+    /// how, as a replay of it would report.
+    pub async fn commit_status(self: &Arc<Self>, id: u64) -> Result<Option<Committed>> {
         let v = self.read_version(Consistency::Strong).await?;
         committed(&v, id).await
     }
 
     /// Fences any in-flight commit attempts by writing the manifest, then
     /// checks whether commit `id` was applied.
-    pub async fn commit_status_fenced(self: &Arc<Self>, id: u64) -> Result<Option<Seq>> {
+    pub async fn commit_status_fenced(self: &Arc<Self>, id: u64) -> Result<Option<Committed>> {
         self.acquire_lease().await?;
         self.commit_status(id).await
     }
@@ -723,6 +752,8 @@ impl Db {
             let foreign = self.foreign_lease(&base.m).map(|(l, left)| (l.node.clone(), left));
             if let Some((holder, left)) = foreign {
                 let e = Error::NotOwner { holder, retry_after_ms: left.as_millis() as u64 };
+                // An earlier attempt may have landed before the lease moved.
+                let e = if maybe_applied { unknown(e) } else { e };
                 self.finish_failed(batch, e);
                 return;
             }
@@ -740,6 +771,7 @@ impl Db {
             }
             let Some(m) = plan.manifest else {
                 self.maybe_sweep(&base);
+                self.schedule_trims(plan.due);
                 self.clear_lease_flag(&batch);
                 for (w, o) in batch.into_iter().zip(plan.outcomes) {
                     // Without a new manifest write, an earlier ambiguous
@@ -783,7 +815,7 @@ impl Db {
                     for (w, o) in batch.into_iter().zip(plan.outcomes) {
                         w.deliver(o);
                     }
-                    self.after_commit(&v, plan.gc);
+                    self.after_commit(&v, plan.gc, plan.due);
                     return;
                 }
                 Err(StoreError::PreconditionFailed) => {}
@@ -869,6 +901,9 @@ impl Db {
         let mut last_seq = base.m.version;
         let mut outcomes = Vec::with_capacity(batch.len());
         let mut accepted: Vec<&WriteSet> = Vec::new();
+        // Keys the accepted transactions' stream ops wrote.
+        let mut touched: Vec<KeyRange> = Vec::new();
+        let mut due: BTreeSet<u64> = BTreeSet::new();
         let mut data_changed = false;
         let mut meta_changed = false;
         let mut release = false;
@@ -884,7 +919,14 @@ impl Db {
                     _ => Outcome::Unit(Err(Error::not_found("database deleted"))),
                 })
                 .collect();
-            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, activity: Default::default() });
+            return Ok(Plan {
+                manifest: None,
+                outcomes,
+                gc: Vec::new(),
+                quota_refused,
+                activity: Default::default(),
+                due,
+            });
         }
         for w in batch {
             match w {
@@ -892,11 +934,19 @@ impl Db {
                     // Earlier in this batch, or in the base.
                     let record = commit_key(req.commit_id);
                     let applied = match tail.get(&record) {
-                        Some(e) => Some(e.seq),
+                        Some(e) => Some(applied_commit(e)?),
                         None => committed(base, req.commit_id).await?,
                     };
-                    if let Some(v) = applied {
-                        outcomes.push(Outcome::Seq(Ok(Committed { version: v, replayed: true, time_ms: 0 })));
+                    if let Some(c) = applied {
+                        // The attempt that applied it may not have lived to
+                        // schedule the trims its retention calls for.
+                        let at = pending(base, &m, &tail);
+                        for id in req.writes.streams.iter().map(StreamOp::id) {
+                            if at.state(id).await?.is_some_and(|s| s.trim_due(time)) {
+                                due.insert(id);
+                            }
+                        }
+                        outcomes.push(Outcome::Seq(Ok(c)));
                         continue;
                     }
                     if req.deadline.is_some_and(|d| Instant::now() > d) {
@@ -907,7 +957,7 @@ impl Db {
                         })));
                         continue;
                     }
-                    if let Err(e) = validate(req, base, &accepted, time).await {
+                    if let Err(e) = validate(req, base, &accepted, &touched, time).await {
                         outcomes.push(Outcome::Seq(Err(e)));
                         continue;
                     }
@@ -915,7 +965,7 @@ impl Db {
                         outcomes.push(Outcome::Seq(Err(e)));
                         continue;
                     }
-                    if req.writes.has_relative_ttl() && now.store_ms.is_none() {
+                    if req.writes.needs_clock() && now.store_ms.is_none() {
                         outcomes.push(Outcome::Seq(Err(Error::unavailable("store clock not synchronized"))));
                         continue;
                     }
@@ -928,8 +978,25 @@ impl Db {
                         outcomes.push(Outcome::Seq(Err(quota_exceeded(limit))));
                         continue;
                     }
-                    size += added;
                     let new_seq = last_seq + 1;
+                    let fx = match req.writes.streams.is_empty() {
+                        true => stream::Effects::default(),
+                        false => {
+                            match stream::plan(&req.writes.streams, &pending(base, &m, &tail), new_seq, time).await {
+                                Ok(fx) => fx,
+                                Err(
+                                    e @ (Error::NotFound(_)
+                                    | Error::AlreadyExists(_)
+                                    | Error::PreconditionFailed { .. }),
+                                ) => {
+                                    outcomes.push(Outcome::Seq(Err(e)));
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    };
+                    size += added;
                     for r in &req.writes.range_deletes {
                         delete_range(base, &mut m, &mut tail, r, new_seq, cfg.range_delete_points_max).await?;
                     }
@@ -945,7 +1012,14 @@ impl Db {
                         };
                         tail.insert(k.clone(), e);
                     }
-                    tail.insert(record.clone(), Entry::new(record, new_seq, Value::Inline(Bytes::new())));
+                    for e in fx.entries {
+                        tail.insert(e.key.clone(), e);
+                    }
+                    for rt in fx.trims.iter().filter_map(|r| RangeTombstone::new(r, new_seq)) {
+                        put_range_tombstone(&mut m, &mut tail, rt);
+                    }
+                    let value = encode_commit_record(time, &fx.appends);
+                    tail.insert(record.clone(), Entry::new(record, new_seq, Value::Inline(value)));
                     if blob_bytes > 0 {
                         m.blob_bytes.bound += blob_bytes;
                         let mut g = self.staging();
@@ -954,9 +1028,16 @@ impl Db {
                         }
                     }
                     accepted.push(&req.writes);
+                    touched.extend(fx.touched);
+                    due.extend(fx.states.iter().filter(|(_, s)| s.trim_due(time)).map(|(id, _)| *id));
                     last_seq = new_seq;
                     data_changed = true;
-                    outcomes.push(Outcome::Seq(Ok(Committed { version: new_seq, replayed: false, time_ms: time })));
+                    outcomes.push(Outcome::Seq(Ok(Committed {
+                        version: new_seq,
+                        replayed: false,
+                        time_ms: time,
+                        appends: fx.appends,
+                    })));
                 }
                 Work::Lease { release: r, for_reads, .. } => {
                     release |= *r;
@@ -966,7 +1047,16 @@ impl Db {
                     meta_changed = true;
                     outcomes.push(Outcome::Unit(Ok(())));
                 }
-                Work::Compaction { inputs, outputs, purged_max_seq, compaction_seq, deep, levels, .. } => {
+                Work::Compaction {
+                    inputs,
+                    outputs,
+                    purged_max_seq,
+                    sealed_bytes,
+                    compaction_seq,
+                    deep,
+                    levels,
+                    ..
+                } => {
                     let Some(now_ms) = now.store_ms else {
                         outcomes.push(Outcome::Unit(Err(Error::unavailable("store clock not synchronized"))));
                         continue;
@@ -999,6 +1089,7 @@ impl Db {
                             m.obsolete.push(Obsolete { kind: ObjKind::Levels, id: old, since_ms: now_ms });
                         }
                         m.tombstone_horizon = m.tombstone_horizon.max(*purged_max_seq);
+                        m.chunk_bytes.bound += *sealed_bytes;
                         m.compaction_seq += 1;
                         meta_changed = true;
                         outcomes.push(Outcome::Unit(Ok(())));
@@ -1009,7 +1100,7 @@ impl Db {
                         outcomes.push(Outcome::Unit(Err(Error::Conflict("compaction inputs changed".into()))));
                     }
                 }
-                Work::Obsolete { items, blob_bytes: (swept, at), .. } => {
+                Work::Obsolete { items, blob_bytes: (swept, at), chunk_bytes: (chunks_swept, chunks_at), .. } => {
                     let Some(now_ms) = now.store_ms else {
                         outcomes.push(Outcome::Unit(Err(Error::unavailable("store clock not synchronized"))));
                         continue;
@@ -1029,6 +1120,10 @@ impl Db {
                         m.blob_bytes.swept = *swept;
                         m.blob_bytes.swept_at = *at;
                     }
+                    if *chunks_at >= m.chunk_bytes.swept_at {
+                        m.chunk_bytes.swept = *chunks_swept;
+                        m.chunk_bytes.swept_at = *chunks_at;
+                    }
                     m.last_sweep_ms = now_ms;
                     meta_changed = true;
                     outcomes.push(Outcome::Unit(Ok(())));
@@ -1042,7 +1137,14 @@ impl Db {
             }
         }
         if !data_changed && !meta_changed {
-            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, activity: Default::default() });
+            return Ok(Plan {
+                manifest: None,
+                outcomes,
+                gc: Vec::new(),
+                quota_refused,
+                activity: Default::default(),
+                due,
+            });
         }
         if data_changed {
             m.version = last_seq;
@@ -1112,34 +1214,52 @@ impl Db {
         } else {
             Some(Lease { node: self.shared.node_id.clone(), expires_ms: now.wall_ms + lease_ms, ms: lease_ms })
         };
+        let mut sealed = 0;
         if m.tail_bytes() > cfg.tail_max_bytes {
             // Data and commit records go to separate segments (see
             // `compaction::pick`), each with every range deletion applied
-            // through `m.version`.
-            let split = m.tail.partition_point(|e| !is_commit_key(&e.key));
-            for part in [&m.tail[split..], &m.tail[..split]] {
-                if part.is_empty() {
-                    continue;
-                }
-                let mut b = SegmentBuilder::new(cfg.block_target, cfg.compression);
-                for e in part {
-                    b.add(e);
-                }
-                m.segments.insert(0, compaction::write(&self.shared, &self.id, b, 0, m.version).await?);
+            // through `m.version`. Long runs of stream records are sealed
+            // instead (SPEC §5.11).
+            let flushed = std::mem::take(&mut m.tail);
+            let split = flushed.partition_point(|e| !is_commit_key(&e.key));
+            let mut sealer = Sealer::new(cfg.stream_seal_min_bytes, cfg.stream_chunk_bytes);
+            let mut data = Vec::with_capacity(split);
+            for e in flushed[..split].iter().cloned() {
+                sealer.push(&self.shared, &self.id, e, &mut data).await?;
             }
-            m.tail.clear();
+            sealer.finish(&self.shared, &self.id, &mut data).await?;
+            m.chunk_bytes.bound += sealer.sealed_bytes;
+            sealed = sealer.chunks;
+            let commit_records = &flushed[split..];
+            let rest: usize = data.iter().chain(commit_records).map(Entry::size).sum();
+            if sealed > 0 && rest <= cfg.tail_max_bytes / 2 {
+                // Sealing alone made room: what is left stays inline.
+                m.tail = data.into_iter().chain(commit_records.iter().cloned()).collect();
+            } else {
+                for part in [commit_records, &data[..]] {
+                    if part.is_empty() {
+                        continue;
+                    }
+                    let mut b = SegmentBuilder::new(cfg.block_target, cfg.compression);
+                    for e in part {
+                        b.add(e);
+                    }
+                    m.segments.insert(0, compaction::write(&self.shared, &self.id, b, 0, m.version).await?);
+                }
+            }
         }
         m.write_seq += 1;
         let activity = super::Activity {
             range_tombstones_written: m.range_deletes.iter().filter(|t| t.seq > base.m.version).count() as u64,
             range_tombstones_retired: retired,
             expired_entries: expired,
+            chunks_sealed_at_flush: sealed,
             ..Default::default()
         };
-        Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, activity })
+        Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, activity, due })
     }
 
-    fn after_commit(self: &Arc<Self>, v: &Arc<Version>, gc: Vec<Obsolete>) {
+    fn after_commit(self: &Arc<Self>, v: &Arc<Version>, gc: Vec<Obsolete>, due: BTreeSet<u64>) {
         let cfg = &self.shared.cfg;
         if !gc.is_empty() {
             let shared = self.shared.clone();
@@ -1167,6 +1287,88 @@ impl Db {
             }
         }
         self.maybe_sweep(v);
+        self.schedule_trims(due);
+    }
+
+    /// Queues streams whose retention may call for a trim, starting a task
+    /// that trims them unless one is running.
+    fn schedule_trims(self: &Arc<Self>, ids: BTreeSet<u64>) {
+        let start = {
+            let mut st = self.st();
+            st.trim_queue.extend(ids);
+            let start = !st.trimming && !st.trim_queue.is_empty();
+            st.trimming |= start;
+            start
+        };
+        if start {
+            let me = self.clone();
+            self.shared.env.spawn(async move {
+                if let Err(e) = me.clone().trim_queued().await {
+                    crate::debug!("retention trims of {} stopped: {e}", me.id);
+                    let mut st = me.st();
+                    st.trim_queue.clear();
+                    st.trimming = false;
+                }
+            });
+        }
+    }
+
+    async fn trim_queued(self: Arc<Self>) -> Result<()> {
+        loop {
+            let id = {
+                let mut st = self.st();
+                match st.trim_queue.pop_first() {
+                    Some(id) => id,
+                    None => {
+                        st.trimming = false;
+                        return Ok(());
+                    }
+                }
+            };
+            self.trim_for_retention(id).await?;
+        }
+    }
+
+    /// Commits the trim that stream `id`'s retention calls for, if any. The
+    /// commit is refused if another node holds the lease, which then trims.
+    async fn trim_for_retention(self: &Arc<Self>, id: u64) -> Result<()> {
+        let Some(now) = self.shared.store_now_ms() else { return Ok(()) };
+        let Some(v) = self.current() else { return Ok(()) };
+        let Some(st) = v.stream_state(id).await? else { return Ok(()) };
+        if !st.trim_due(now) {
+            return Ok(());
+        }
+        let mut before = st.first_seq;
+        if let Some(r) = st.retention.retention_ms {
+            before = before.max(v.stream_seek(id, &st, Seek::Time(now.saturating_sub(r))).await?);
+        }
+        if let Some(b) = st.retention.max_bytes {
+            before = before.max(v.stream_seek(id, &st, Seek::Pos(st.next_pos.saturating_sub(b))).await?);
+        }
+        if before == st.first_seq {
+            return Ok(());
+        }
+        let mut writes = WriteSet::default();
+        writes.streams.push(StreamOp::Trim { id, before, retention: Some(st.retention) });
+        let req = CommitRequest {
+            commit_id: self.shared.env.random_u64(),
+            deadline: None,
+            read_version: v.m.version,
+            read_time: v.m.time_ms,
+            read_expiry: None,
+            isolation: Isolation::Serializable,
+            reads: Vec::new(),
+            pinned_reads: Vec::new(),
+            writes,
+        };
+        match self.commit(req).await {
+            Ok(_) => {
+                self.shared.counters.add(&super::Activity { retention_trims: 1, ..Default::default() });
+                Ok(())
+            }
+            Err(Error::NotFound(_) | Error::NotOwner { .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Triggers a garbage collection sweep if due, using a shorter interval if under quota pressure.
@@ -1202,14 +1404,14 @@ impl Db {
             let Some(plan) = compaction::pick(&v.m, &cfg) else {
                 return Ok(());
             };
-            let (outputs, purged_max_seq, expired) = match plan.kind {
-                Kind::Move { level } => (vec![SegmentMeta { level, ..plan.inputs[0].clone() }], 0, 0),
-                Kind::Drop => (Vec::new(), 0, 0),
-                Kind::DropExpired => (Vec::new(), 0, plan.inputs.iter().map(|s| s.entries).sum()),
+            let (outputs, purged_max_seq, expired, (chunks, sealed_bytes)) = match plan.kind {
+                Kind::Move { level } => (vec![SegmentMeta { level, ..plan.inputs[0].clone() }], 0, 0, (0, 0)),
+                Kind::Drop => (Vec::new(), 0, 0, (0, 0)),
+                Kind::DropExpired => (Vec::new(), 0, plan.inputs.iter().map(|s| s.entries).sum(), (0, 0)),
                 Kind::Merge { .. } | Kind::Rewrite | Kind::Expire => {
                     let purge_seq = v.m.version_at_least_age(store_now, cfg.txn_max_lifetime_ms);
                     let out = compaction::run(&self.shared, &v.m, &plan, purge_seq).await?;
-                    (out.segments, out.purged_max_seq, out.expired)
+                    (out.segments, out.purged_max_seq, out.expired, (out.chunks, out.sealed_bytes))
                 }
             };
             let inputs: Vec<String> = plan.inputs.iter().map(|s| s.id.clone()).collect();
@@ -1223,6 +1425,7 @@ impl Db {
                 inputs,
                 outputs,
                 purged_max_seq,
+                sealed_bytes,
                 compaction_seq: v.m.compaction_seq,
                 deep,
                 levels,
@@ -1237,6 +1440,7 @@ impl Db {
                 _ => Default::default(),
             };
             a.expired_entries = expired;
+            a.chunks_sealed_in_compaction = chunks;
             self.shared.counters.add(&a);
         }
     }
@@ -1254,17 +1458,27 @@ impl Db {
         if !self.holds_lease(&self.st(), &v.m) {
             return Ok(());
         }
-        let mut referenced: BTreeSet<(ObjKind, &str)> =
-            v.m.segments.iter().map(|s| (ObjKind::Segment, s.id.as_str())).collect();
-        referenced.extend(v.m.levels.iter().map(|id| (ObjKind::Levels, id.as_str())));
-        referenced.extend(v.m.obsolete.iter().filter(|o| o.kind != ObjKind::Blob).map(|o| (o.kind, o.id.as_str())));
+        let mut referenced: BTreeSet<(ObjKind, String)> =
+            v.m.segments.iter().map(|s| (ObjKind::Segment, s.id.clone())).collect();
+        referenced.extend(v.m.levels.iter().map(|id| (ObjKind::Levels, id.clone())));
+        referenced.extend(v.m.obsolete.iter().filter(|o| o.kind != ObjKind::Blob).map(|o| (o.kind, o.id.clone())));
         let mut referenced_blobs: BTreeSet<String> =
             v.m.obsolete.iter().filter(|o| o.kind == ObjKind::Blob).map(|o| o.id.clone()).collect();
-        // Aggregate live blob sizes for quota accounting.
+        // Live blob and chunk sizes for quota accounting, and the streams
+        // whose retention calls for a trim.
         let mut live_blobs: BTreeMap<String, u64> = BTreeMap::new();
+        let mut live_chunks: BTreeMap<String, u64> = BTreeMap::new();
+        let mut due = BTreeSet::new();
         let mut it = v.iter_bulk(false);
         while let Some(e) = it.next().await? {
-            if let Value::Blob(b) = e.value {
+            if let Some((_, stream::Stored::Chunk(c))) = stream::stored(&e) {
+                referenced.insert((ObjKind::Segment, c.id.clone()));
+                live_chunks.insert(c.id, c.size);
+            } else if let Some((id, st)) = stream::state_of(&e) {
+                if st.trim_due(now_ms) {
+                    due.insert(id);
+                }
+            } else if let Value::Blob(b) = e.value {
                 referenced_blobs.insert(b.id.clone());
                 live_blobs.insert(b.id, b.size);
             }
@@ -1278,7 +1492,7 @@ impl Db {
                 None => (ObjKind::Segment, name),
             };
             if super::types::valid_object_id(id)
-                && !referenced.contains(&(kind, id))
+                && !referenced.contains(&(kind, id.to_string()))
                 && o.last_modified_ms + cfg.orphan_grace_ms <= now_ms
             {
                 items.push(Obsolete { kind, id: id.to_string(), since_ms: now_ms });
@@ -1313,8 +1527,10 @@ impl Db {
             found(c, mtime, &mut items);
         }
         let blob_bytes = (live_blobs.values().sum(), v.m.blob_bytes.bound);
+        let chunk_bytes = (live_chunks.values().sum(), v.m.chunk_bytes.bound);
+        self.schedule_trims(due);
         let (tx, rx) = oneshot::channel();
-        self.enqueue(Work::Obsolete { items, blob_bytes, tx });
+        self.enqueue(Work::Obsolete { items, blob_bytes, chunk_bytes, tx });
         rx.await.map_err(|_| Error::unavailable("sweep interrupted"))?
     }
 
@@ -1337,9 +1553,29 @@ struct Now {
     store_ms: Option<u64>,
 }
 
-/// The version a commit applied at, if `v` holds its commit record.
-async fn committed(v: &Version, id: u64) -> Result<Option<Seq>> {
-    Ok(v.get_entry(&commit_key(id)).await?.filter(|e| !e.value.is_tombstone()).map(|e| e.seq))
+/// How a commit applied, if `v` holds its commit record.
+async fn committed(v: &Version, id: u64) -> Result<Option<Committed>> {
+    match v.get_entry(&commit_key(id)).await? {
+        Some(e) if !e.value.is_tombstone() => Ok(Some(applied_commit(&e)?)),
+        _ => Ok(None),
+    }
+}
+
+/// The commit a commit record tells of, as a replay of it reports.
+fn applied_commit(record: &Entry) -> Result<Committed> {
+    let decoded = match &record.value {
+        Value::Inline(b) => decode_commit_record(b).ok(),
+        _ => None,
+    };
+    let (time_ms, appends) = decoded.ok_or_else(|| Error::internal("corrupt commit record"))?;
+    Ok(Committed { version: record.seq, replayed: true, time_ms, appends })
+}
+
+/// Committed state partway through building a batch: the base version, the
+/// batch's tail so far, and the range deletions of its earlier commits.
+fn pending<'a>(base: &'a Version, m: &Manifest, tail: &'a BTreeMap<Bytes, Entry>) -> Pending<'a> {
+    let batch_deletes = m.range_deletes.iter().filter(|t| t.seq > base.m.version).cloned().collect();
+    Pending { base, tail, batch_deletes }
 }
 
 /// Measurement errors on the committing and sweeping nodes together stay
@@ -1409,6 +1645,8 @@ struct Plan {
     quota_refused: bool,
     /// Storage activity recorded upon successful manifest write.
     activity: super::Activity,
+    /// Streams whose retention may call for a trim after this write.
+    due: BTreeSet<u64>,
 }
 
 pub(crate) fn quota_exceeded(limit: u64) -> Error {
@@ -1417,7 +1655,7 @@ pub(crate) fn quota_exceeded(limit: u64) -> Error {
 
 /// Returns `(total_added_bytes, bound_blob_bytes)` for a commit write set.
 fn growth(w: &WriteSet) -> (u64, u64) {
-    let mut added = 0;
+    let mut added: u64 = w.streams.iter().map(StreamOp::appended_bytes).sum();
     let mut blobs = 0;
     for (k, p) in w.puts.iter().filter_map(|(k, p)| Some((k, p.as_ref()?))) {
         added += (k.len() + p.value.size()) as u64;
@@ -1439,38 +1677,41 @@ async fn delete_range(
     points_max: usize,
 ) -> Result<()> {
     let Some(rt) = RangeTombstone::new(r, seq) else { return Ok(()) };
-    let bounds = (r.start.clone(), r.end.clone());
-    let in_tail: Vec<Bytes> = tail.range::<Bytes, _>(bounds).map(|(k, _)| k.clone()).collect();
     let mut stored: BTreeMap<Bytes, bool> = BTreeMap::new();
     let mut it = base.iter(r, false, true, None);
-    let mut few = true;
     while let Some(e) = it.next().await? {
         if stored.len() >= points_max {
-            few = false;
-            break;
+            put_range_tombstone(m, tail, rt);
+            return Ok(());
         }
         stored.insert(e.key, !e.value.is_tombstone());
     }
-    if few {
-        // Account for range deletions in earlier commits within the current batch.
-        let batch_deletes: Vec<&RangeTombstone> = m.range_deletes.iter().filter(|t| t.seq > base.m.version).collect();
-        let mut doomed: Vec<Bytes> = stored
-            .into_iter()
-            .filter(|(k, live)| *live && !tail.contains_key(k) && !batch_deletes.iter().any(|t| t.contains_key(k)))
-            .map(|(k, _)| k)
-            .collect();
-        doomed.extend(in_tail.into_iter().filter(|k| tail.get(k).is_some_and(|e| !e.value.is_tombstone())));
-        for k in doomed {
-            tail.insert(k.clone(), Entry::tombstone(k, seq));
-        }
-        return Ok(());
+    // Account for range deletions in earlier commits within the current batch.
+    let batch_deletes: Vec<&RangeTombstone> = m.range_deletes.iter().filter(|t| t.seq > base.m.version).collect();
+    let mut doomed: Vec<Bytes> = stored
+        .into_iter()
+        .filter(|(k, live)| *live && !tail.contains_key(k) && !batch_deletes.iter().any(|t| t.contains_key(k)))
+        .map(|(k, _)| k)
+        .collect();
+    let bounds = (r.start.clone(), r.end.clone());
+    doomed.extend(tail.range::<Bytes, _>(bounds).filter(|(_, e)| !e.value.is_tombstone()).map(|(k, _)| k.clone()));
+    for k in doomed {
+        tail.insert(k.clone(), Entry::tombstone(k, seq));
     }
+    Ok(())
+}
+
+/// Writes range tombstone `rt`, which replaces the range tombstones it
+/// covers and the tail's entries in its range.
+fn put_range_tombstone(m: &mut Manifest, tail: &mut BTreeMap<Bytes, Entry>, rt: RangeTombstone) {
+    let end = rt.end.clone().map_or(Bound::Unbounded, Bound::Excluded);
+    let in_tail: Vec<Bytes> =
+        tail.range::<Bytes, _>((Bound::Included(rt.start.clone()), end)).map(|(k, _)| k.clone()).collect();
     for k in in_tail {
         tail.remove(&k);
     }
     m.range_deletes.retain(|t| !rt.contains_range(t));
     m.range_deletes.push(rt);
-    Ok(())
 }
 
 fn unknown(e: Error) -> Error {
@@ -1543,7 +1784,16 @@ mod tests {
     fn compaction(inputs: &str, outputs: Vec<SegmentMeta>, compaction_seq: u64) -> Work {
         let (tx, _) = oneshot::channel();
         let inputs: Vec<String> = inputs.chars().map(|c| c.to_string().repeat(32)).collect();
-        Work::Compaction { inputs, outputs, purged_max_seq: 0, compaction_seq, deep: Vec::new(), levels: None, tx }
+        Work::Compaction {
+            inputs,
+            outputs,
+            purged_max_seq: 0,
+            sealed_bytes: 0,
+            compaction_seq,
+            deep: Vec::new(),
+            levels: None,
+            tx,
+        }
     }
 
     fn succeeded(p: &Plan) -> bool {
@@ -1583,7 +1833,7 @@ mod tests {
             let m = Manifest { obsolete: vec![ob('a'), ob('b')], ..Manifest::new("d", 0, None) };
             let base = Version::new(m, String::new(), eng.shared.clone());
             let (tx, _) = oneshot::channel();
-            let sweep = Work::Obsolete { items: vec![ob('c')], blob_bytes: (0, 0), tx };
+            let sweep = Work::Obsolete { items: vec![ob('c')], blob_bytes: (0, 0), chunk_bytes: (0, 0), tx };
             let lease = Work::Lease { release: false, for_reads: true, tx: None };
             let db = eng.db("d");
             let p = db.build(&base, &[lease, sweep], Now { wall_ms: 10_000_000, store_ms: None }).await.unwrap();
@@ -1642,7 +1892,7 @@ mod tests {
             let p = plan(
                 &[meta('a', 0, "a", "b")],
                 vec![ob(seg, 'b'), ob(blob, 'd')],
-                vec![Work::Obsolete { items, blob_bytes: (0, 0), tx }],
+                vec![Work::Obsolete { items, blob_bytes: (0, 0), chunk_bytes: (0, 0), tx }],
             )
             .await;
             let got: Vec<(ObjKind, char)> =

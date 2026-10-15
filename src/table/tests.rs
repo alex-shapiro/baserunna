@@ -192,7 +192,7 @@ async fn run(seed: u64, ops: &[Op]) -> Result<(), String> {
                 Op::QueryPk(a, b, limit) => {
                     let q: Query = serde_json::from_value(json!({
                         "range": {"gte": a, "lt": b}, "limit": limit,
-                        "filter": {"or": [{"col": "tag", "op": "eq", "value": "red"}, {"col": "name", "op": "is_null"}]}
+                        "filter": {"or": [{"col": "tag", "op": "eq", "value": "red"}, {"not": {"col": "name", "op": "exists"}}]}
                     }))
                     .unwrap();
                     let r = query(&mut t, "t", &q).await?;
@@ -248,7 +248,7 @@ async fn run(seed: u64, ops: &[Op]) -> Result<(), String> {
                 Op::DeleteWhere(a, b, limit) => {
                     let sel: Selection = serde_json::from_value(json!({
                         "range": {"gte": a, "lt": b},
-                        "filter": {"or": [{"col": "tag", "op": "eq", "value": "red"}, {"col": "name", "op": "is_null"}]}
+                        "filter": {"or": [{"col": "tag", "op": "eq", "value": "red"}, {"not": {"col": "name", "op": "exists"}}]}
                     }))
                     .unwrap();
                     let n = delete_where(&mut t, "t", &sel, *limit).await?;
@@ -470,6 +470,7 @@ impl F {
             F::And(v) => json!({"and": v.iter().map(F::json).collect::<Vec<_>>()}),
             F::Or(v) => json!({"or": v.iter().map(F::json).collect::<Vec<_>>()}),
             F::Not(f) => json!({"not": f.json()}),
+            F::Cmp(col, "exists", _) => json!({"col": col, "op": "exists"}),
             F::Cmp(col, op, value) => json!({"col": col, "op": op, "value": value}),
         }
     }
@@ -505,7 +506,7 @@ fn gen_frow(r: &mut Rng) -> FRow {
     }
 }
 
-fn gen_operand(r: &mut Rng, col: &str) -> Json {
+fn gen_operand(r: &mut Rng, col: &str, op: &str) -> Json {
     match col {
         "i" => json!(r.below(5) as i64 - 2),
         "f" if r.chance(0.3) => json!(r.below(3) as i64 - 1),
@@ -513,7 +514,12 @@ fn gen_operand(r: &mut Rng, col: &str) -> Json {
         "s" => json!(F_STRS[r.usize(F_STRS.len())]),
         "b" => json!(b64::encode(F_BYTES[r.usize(F_BYTES.len())])),
         "bo" => json!(r.chance(0.5)),
-        _ => f_json(r),
+        _ => match op {
+            "prefix" => json!(["", "s", "x"][r.usize(3)]),
+            "lt" | "le" | "gt" | "ge" => [json!("s"), json!("t"), json!(1), json!(2.0)][r.usize(4)].clone(),
+            _ if r.chance(0.3) => [json!(1), json!(2.0), json!("x")][r.usize(3)].clone(),
+            _ => f_json(r),
+        },
     }
 }
 
@@ -522,14 +528,14 @@ fn gen_filter(r: &mut Rng, depth: u32) -> F {
         0..=2 => {
             let col = ["i", "f", "s", "b", "bo", "j"][r.usize(6)];
             let ops: &[&'static str] = match col {
-                "s" | "b" => &["eq", "ne", "lt", "le", "gt", "ge", "in", "prefix", "is_null"],
-                _ => &["eq", "ne", "lt", "le", "gt", "ge", "in", "is_null"],
+                "s" | "b" | "j" => &["eq", "ne", "lt", "le", "gt", "ge", "in", "prefix", "contains", "exists"],
+                _ => &["eq", "ne", "lt", "le", "gt", "ge", "in", "exists"],
             };
             let op = ops[r.usize(ops.len())];
             let value = match op {
-                "in" => Json::Array((0..r.usize(4)).map(|_| gen_operand(r, col)).collect()),
-                "is_null" => Json::Null,
-                _ => gen_operand(r, col),
+                "in" => Json::Array((0..r.usize(4)).map(|_| gen_operand(r, col, op)).collect()),
+                "exists" => Json::Null,
+                _ => gen_operand(r, col, op),
             };
             F::Cmp(col, op, value)
         }
@@ -539,8 +545,24 @@ fn gen_filter(r: &mut Rng, depth: u32) -> F {
     }
 }
 
+/// Every comparison of a null column fails; JSON compares numbers by value
+/// and orders only numbers and strings.
 fn oracle(f: &F, row: &FRow) -> bool {
     use std::cmp::Ordering::{self, *};
+    let present = |col: &str| match col {
+        "i" => row.i.is_some(),
+        "f" => row.f.is_some(),
+        "s" => row.s.is_some(),
+        "b" => row.b.is_some(),
+        "bo" => row.bo.is_some(),
+        _ => row.j.is_some(),
+    };
+    let json_cmp = |a: &Json, b: &Json| match (a, b) {
+        (Json::Number(x), Json::Number(y)) => x.as_f64()?.partial_cmp(&y.as_f64()?),
+        (Json::String(x), Json::String(y)) => Some(x.cmp(y)),
+        _ => None,
+    };
+    let json_eq = |a: &Json, b: &Json| a == b || json_cmp(a, b) == Some(Equal);
     let cmp = |col: &str, v: &Json| -> Option<Ordering> {
         match col {
             "i" => Some(row.i?.cmp(&v.as_i64()?)),
@@ -548,27 +570,39 @@ fn oracle(f: &F, row: &FRow) -> bool {
             "s" => Some(row.s.as_ref()?.as_bytes().cmp(v.as_str()?.as_bytes())),
             "b" => Some(row.b.as_deref()?.cmp(b64::decode(v.as_str()?)?.as_slice())),
             "bo" => Some(row.bo?.cmp(&v.as_bool()?)),
-            _ => (row.j.as_ref()? == v).then_some(Equal),
+            _ => json_cmp(row.j.as_ref()?, v),
         }
+    };
+    let eq = |col: &str, v: &Json| match col {
+        "j" => row.j.as_ref().is_some_and(|j| json_eq(j, v)),
+        _ => cmp(col, v) == Some(Equal),
     };
     match f {
         F::And(v) => v.iter().all(|x| oracle(x, row)),
         F::Or(v) => v.iter().any(|x| oracle(x, row)),
         F::Not(x) => !oracle(x, row),
         F::Cmp(col, op, v) => match *op {
-            "is_null" => match *col {
-                "i" => row.i.is_none(),
-                "f" => row.f.is_none(),
-                "s" => row.s.is_none(),
-                "b" => row.b.is_none(),
-                "bo" => row.bo.is_none(),
-                _ => row.j.is_none(),
-            },
-            "in" => v.as_array().unwrap().iter().any(|x| cmp(col, x) == Some(Equal)),
-            "prefix" if *col == "s" => row.s.as_ref().is_some_and(|s| s.starts_with(v.as_str().unwrap())),
-            "prefix" => row.b.as_ref().is_some_and(|b| b.starts_with(&b64::decode(v.as_str().unwrap()).unwrap())),
-            "eq" => cmp(col, v) == Some(Equal),
-            "ne" => cmp(col, v).is_some_and(|o| o != Equal),
+            "exists" => present(col),
+            "in" => v.as_array().unwrap().iter().any(|x| eq(col, x)),
+            "prefix" | "contains" => {
+                let p = v.as_str().map(|p| if *col == "b" { b64::decode(p).unwrap() } else { p.as_bytes().to_vec() });
+                let hay: Option<&[u8]> = match (*col, &row.j) {
+                    ("s", _) => row.s.as_ref().map(|s| s.as_bytes()),
+                    ("b", _) => row.b.as_deref(),
+                    ("j", Some(Json::String(s))) => Some(s.as_bytes()),
+                    _ => None,
+                };
+                match (*op, hay, p) {
+                    ("prefix", Some(h), Some(p)) => h.starts_with(&p),
+                    ("contains", Some(h), Some(p)) => p.is_empty() || h.windows(p.len()).any(|w| w == p.as_slice()),
+                    ("contains", None, _) if *col == "j" => {
+                        matches!(&row.j, Some(Json::Array(a)) if a.iter().any(|x| json_eq(x, v)))
+                    }
+                    _ => false,
+                }
+            }
+            "eq" => eq(col, v),
+            "ne" => present(col) && !eq(col, v),
             "lt" => cmp(col, v) == Some(Less),
             "le" => matches!(cmp(col, v), Some(Less | Equal)),
             "gt" => cmp(col, v) == Some(Greater),
@@ -657,10 +691,28 @@ fn filter_validation() {
             (json!({"col": "f", "op": "gt", "value": "1"}), false),
             (json!({"col": "nope", "op": "eq", "value": 1}), false),
             (json!({"col": "body", "op": "eq", "value": "x"}), false),
-            (json!({"col": "body", "op": "is_null"}), true),
+            (json!({"col": "body", "op": "exists"}), true),
+            (json!({"col": "body", "op": "exists", "value": null}), false),
+            (json!({"col": "s", "op": "contains", "value": "a"}), true),
+            (json!({"col": "b", "op": "contains", "value": "AA=="}), true),
+            (json!({"col": "f", "op": "contains", "value": 1}), false),
+            (json!({"col": "s", "op": "eq", "value": null}), false),
+            (json!({"col": "s", "op": "eq", "value": 1}), false),
+            (json!({"col": "s", "op": "in", "value": ["a", null]}), false),
+            (json!({"and": [{"col": "s", "op": "exists"}], "or": [{"col": "b", "op": "exists"}]}), false),
+            (json!({"not": {"col": "s", "op": "exists"}, "col": "b", "op": "exists"}), false),
+            (json!({"and": [], "bogus": 1}), false),
+            (json!({"col": "s", "field": "b", "op": "exists"}), false),
+            (json!({"field": "s", "op": "exists"}), false),
         ];
         for (filter, ok) in cases {
-            let q: Query = serde_json::from_value(json!({"filter": filter})).unwrap();
+            let q: Query = match serde_json::from_value(json!({"filter": filter})) {
+                Ok(q) => q,
+                Err(e) => {
+                    assert!(!ok, "{filter} unparsed: {e}");
+                    continue;
+                }
+            };
             match query(&mut t, "v", &q).await {
                 Ok(_) => assert!(ok, "{filter} accepted"),
                 Err(Error::InvalidArgument(e)) => assert!(!ok, "{filter} rejected: {e}"),

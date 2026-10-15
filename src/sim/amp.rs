@@ -266,3 +266,144 @@ pub fn table(rows: &[Amplification]) -> String {
     }
     s
 }
+
+/// Stream workloads (SPEC §5.11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamWorkload {
+    /// One busy stream of log lines, appended in batches.
+    Log,
+    /// Twenty feeds, appended to in turn.
+    Feeds,
+    /// Two hundred streams of messages, a few at a time on random streams.
+    Chat,
+}
+
+impl StreamWorkload {
+    pub const ALL: [StreamWorkload; 3] = [StreamWorkload::Log, StreamWorkload::Feeds, StreamWorkload::Chat];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            StreamWorkload::Log => "log",
+            StreamWorkload::Feeds => "feeds",
+            StreamWorkload::Chat => "chat",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StreamAmplification {
+    pub workload: StreamWorkload,
+    /// Body bytes appended.
+    pub logical_written: u64,
+    /// Segment and chunk bytes written per body byte.
+    pub write_amp: f64,
+    /// Stored bytes per body byte after compaction and GC.
+    pub space_amp_settled: f64,
+    /// The share of records stored in sealed chunks at the end.
+    pub sealed: f64,
+    pub chunks: usize,
+    pub segments: usize,
+}
+
+pub async fn measure_stream(w: StreamWorkload, scale: f64, cfg: EngineConfig) -> StreamAmplification {
+    use crate::engine::stream::{self as es, Stored};
+    let origin = tokio::time::Instant::now();
+    let env = Arc::new(Env::sim(43, 1_750_000_000_000, origin, 0));
+    let env2 = env.clone();
+    let mem = Arc::new(MemStore::new(Box::new(move || env2.now_ms())));
+    let meter = Arc::new(SegmentMeter { inner: mem.clone(), seg_put_bytes: AtomicU64::new(0) });
+    let eng = Engine::new(meter.clone(), env.clone(), cfg.clone(), "amp".into());
+    let db = eng.db("amp");
+    db.open(true).await.expect("open");
+    eng.shared.store_time_ms().await.expect("clock");
+    let streams = match w {
+        StreamWorkload::Log => 1,
+        StreamWorkload::Feeds => 20,
+        StreamWorkload::Chat => 200,
+    };
+    let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.expect("begin");
+    for s in 0..streams {
+        let r = crate::engine::Retention::default();
+        crate::stream::create(&mut t, &format!("s{s}"), r, 1 + s as u64, 0).await.expect("create");
+    }
+    db.commit(t.into_request()).await.expect("create streams");
+    let mut rng = Rng::new(11);
+    let records = ((50_000.0 * scale) as usize).max(500);
+    let per_commit = match w {
+        StreamWorkload::Log => 50,
+        StreamWorkload::Feeds | StreamWorkload::Chat => 25,
+    };
+    let mut logical = 0u64;
+    for _ in 0..records / per_commit {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.expect("begin");
+        for _ in 0..per_commit {
+            let s = rng.usize(streams);
+            let body = crate::stream::Body::text(value(&mut rng, s as u64));
+            let payload = body.encode();
+            logical += payload.len() as u64;
+            t.append(1 + s as u64, vec![payload], None, None).expect("append");
+        }
+        db.commit(t.into_request()).await.expect("commit");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    tokio::time::sleep(Duration::from_millis(cfg.gc_grace_ms + cfg.orphan_grace_ms + 1_000)).await;
+    db.maintenance_now().await.expect("gc");
+    db.sweep_now().await.expect("sweep");
+    tokio::time::sleep(Duration::from_millis(cfg.gc_grace_ms + 1_000)).await;
+    db.maintenance_now().await.expect("gc");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let v = db.current().expect("current");
+    let mut it = v.iter(&crate::engine::KeyRange::prefix(&[es::RECORDS]), false, false, None);
+    let (mut sealed, mut loose, mut chunks) = (0u64, 0u64, 0);
+    while let Some(e) = it.next().await.expect("scan") {
+        match es::stored(&e).map(|(_, s)| s) {
+            Some(Stored::Chunk(c)) => {
+                sealed += c.last_seq - c.first_seq + 1;
+                chunks += 1;
+            }
+            _ => loose += 1,
+        }
+    }
+    let stored: u64 = mem.keys().iter().filter_map(|k| mem.get_sync(k, &GetOpts::default()).ok()).map(|g| g.size).sum();
+    eng.env().shutdown();
+    StreamAmplification {
+        workload: w,
+        logical_written: logical,
+        write_amp: meter.seg_put_bytes.load(Ordering::Relaxed) as f64 / logical.max(1) as f64,
+        space_amp_settled: stored as f64 / logical.max(1) as f64,
+        sealed: sealed as f64 / (sealed + loose).max(1) as f64,
+        chunks,
+        segments: v.m.segments.len(),
+    }
+}
+
+pub fn measure_streams(scale: f64, cfg: &EngineConfig) -> Vec<StreamAmplification> {
+    super::cost::run_paused(async {
+        let mut out = Vec::new();
+        for w in StreamWorkload::ALL {
+            out.push(measure_stream(w, scale, cfg.clone()).await);
+        }
+        out
+    })
+}
+
+pub fn stream_table(rows: &[StreamAmplification]) -> String {
+    let mut s = format!(
+        "{:<8} {:>9} {:>7} {:>13} {:>7} {:>7} {:>5}\n",
+        "workload", "written", "write", "space settled", "sealed", "chunks", "segs"
+    );
+    for a in rows {
+        s.push_str(&format!(
+            "{:<8} {:>7.1}MB {:>6.2}x {:>12.2}x {:>6.0}% {:>7} {:>5}\n",
+            a.workload.name(),
+            a.logical_written as f64 / 1e6,
+            a.write_amp,
+            a.space_amp_settled,
+            100.0 * a.sealed,
+            a.chunks,
+            a.segments,
+        ));
+    }
+    s
+}

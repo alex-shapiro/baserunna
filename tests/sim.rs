@@ -97,6 +97,11 @@ fn sim_watch_change_feeds() {
 }
 
 #[test]
+fn sim_streams() {
+    run_scenario("streams", 22, 2);
+}
+
+#[test]
 fn sim_organization_roles() {
     run_scenario("orgs", 20, 2);
 }
@@ -123,6 +128,7 @@ fn sim_hostile() {
         "chaos_hostile",
         "ttl_hostile",
         "watch_hostile",
+        "streams_hostile",
         "orgs_hostile",
         "accounts_hostile",
     ] {

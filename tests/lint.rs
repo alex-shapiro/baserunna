@@ -19,7 +19,11 @@ const RULES: &[(&str, &[&str], &str)] = &[
     ("unsafe ", &[], "no unsafe code"),
     ("tokio::sync::watch", &[], "watch channels wake waiters in random order"),
     ("select!", &[], "select! polls branches in random order"),
-    ("tokio::spawn(", &["src/sim/", "src/engine/tests.rs"], "spawn through Env so crashes abort tasks"),
+    (
+        "tokio::spawn(",
+        &["src/sim/", "src/engine/tests.rs", "src/stream/tests.rs"],
+        "spawn through Env so crashes abort tasks",
+    ),
     (
         "SystemTime",
         &["src/env.rs", "src/store/", "src/main.rs", "src/log.rs"],

@@ -196,6 +196,49 @@ impl Client {
         self.get(&format!("/v1/dbs/{}/changes?after={}&wait_ms={wait_ms}", seg(db), seg(after))).await
     }
 
+    /// Creates stream `name`, with optional retention (`{"retention_ms", "max_bytes"}`).
+    pub async fn create_stream(&self, db: &str, name: &str, retention: Value) -> Result<Value, ApiError> {
+        let mut body = retention;
+        body["name"] = json!(name);
+        self.post(&format!("/v1/dbs/{}/streams", seg(db)), body).await
+    }
+
+    /// Appends records (`[{"json": ..} | {"value": ..}, "headers"?]`) to a
+    /// stream, retried safely with `idempotency_key`; returns `{first_seq, next_seq, ..}`.
+    pub async fn append(
+        &self,
+        db: &str,
+        stream: &str,
+        records: Value,
+        idempotency_key: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        let mut body = json!({"records": records});
+        if let Some(k) = idempotency_key {
+            body["idempotency_key"] = json!(k);
+        }
+        self.post(&format!("/v1/dbs/{}/streams/{}/records", seg(db), seg(stream)), body).await
+    }
+
+    /// Appends one record per line of `lines`: JSON lines with `json`, text otherwise.
+    pub async fn append_lines(&self, db: &str, stream: &str, lines: Bytes, json: bool) -> Result<Value, ApiError> {
+        let ct = if json { "application/x-ndjson" } else { "text/plain" };
+        let path = format!("/v1/dbs/{}/streams/{}/records", seg(db), seg(stream));
+        let (st, _, out) = self.raw("POST", &path, &[("content-type", ct)], lines).await?;
+        let v: Value = serde_json::from_slice(&out).unwrap_or(Value::Null);
+        if st == 200 { Ok(v) } else { Err(api_err(st, v)) }
+    }
+
+    /// Reads a stream with query parameters such as `from_seq=10&limit=50`
+    /// or `tail=20&reverse=true`; with `wait_ms`, waits for appends.
+    pub async fn read_stream(&self, db: &str, stream: &str, query: &str) -> Result<Value, ApiError> {
+        self.get(&format!("/v1/dbs/{}/streams/{}/records?{query}", seg(db), seg(stream))).await
+    }
+
+    /// Reads a stream with a filter and the other options of `StreamRead`.
+    pub async fn query_stream(&self, db: &str, stream: &str, query: Value) -> Result<Value, ApiError> {
+        self.post(&format!("/v1/dbs/{}/streams/{}/records/query", seg(db), seg(stream)), query).await
+    }
+
     pub async fn stage_blob(&self, db: &str, data: Bytes, content_type: &str) -> Result<Value, ApiError> {
         let (st, _, out) =
             self.raw("POST", &format!("/v1/dbs/{}/blobs", seg(db)), &[("content-type", content_type)], data).await?;

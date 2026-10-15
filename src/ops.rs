@@ -1,7 +1,8 @@
 //! JSON transaction operations and execution.
 
-use crate::engine::{BlobRef, Db, KeyRange, ReadValue, Ttl, Txn, Value, blob};
+use crate::engine::{Appended, BlobRef, Db, KeyRange, ReadValue, Ttl, Txn, Value, blob};
 use crate::error::{Error, Result};
+use crate::stream::{self, AppendTo, NewRecord, ReadSpec};
 use crate::table::{self, BlobResolver, Expiry, InsertMode, Query, SPACE_KV, Selection, schema::blob_json};
 use crate::util::b64;
 use bytes::Bytes;
@@ -161,6 +162,53 @@ pub enum Op {
         #[serde(default)]
         cursor: Option<String>,
     },
+    Append {
+        stream: String,
+        records: Vec<NewRecord>,
+        #[serde(default)]
+        expect_seq: Option<u64>,
+        #[serde(default)]
+        create: bool,
+    },
+    ReadStream(StreamRead),
+    StreamInfo {
+        stream: String,
+    },
+    TrimStream {
+        stream: String,
+        #[serde(default)]
+        before_seq: Option<u64>,
+        #[serde(default)]
+        before_time: Option<u64>,
+    },
+    GetConsumer {
+        stream: String,
+        consumer: String,
+    },
+    SetConsumer {
+        stream: String,
+        consumer: String,
+        seq: u64,
+    },
+}
+
+/// A `read_stream` op: a stream and a [`ReadSpec`] beside it.
+#[derive(Debug, Clone)]
+pub struct StreamRead {
+    pub stream: String,
+    pub spec: ReadSpec,
+}
+
+impl<'de> Deserialize<'de> for StreamRead {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<StreamRead, D::Error> {
+        use serde::de::Error as _;
+        let mut fields = serde_json::Map::deserialize(d)?;
+        let stream = fields.remove("stream").ok_or_else(|| D::Error::missing_field("stream"))?;
+        Ok(StreamRead {
+            stream: serde_json::from_value(stream).map_err(D::Error::custom)?,
+            spec: serde_json::from_value(Json::Object(fields)).map_err(D::Error::custom)?,
+        })
+    }
 }
 
 fn one() -> i64 {
@@ -181,6 +229,9 @@ impl Op {
                 | Op::DeleteRow { .. }
                 | Op::UpdateRows { .. }
                 | Op::DeleteRows { .. }
+                | Op::Append { .. }
+                | Op::TrimStream { .. }
+                | Op::SetConsumer { .. }
         )
     }
 }
@@ -335,7 +386,7 @@ pub async fn exec_ops(ctx: &OpCtx<'_>, txn: &mut Txn, ops: &[Op]) -> Result<Vec<
         if op.is_write() {
             ctx.access.require_write()?;
         }
-        let r = exec_one(ctx, txn, op).await.map_err(|e| match e {
+        let r = exec_one(ctx, txn, op, i).await.map_err(|e| match e {
             Error::PreconditionFailed { message, .. } => Error::PreconditionFailed { message, op_index: Some(i) },
             other => other,
         })?;
@@ -344,7 +395,7 @@ pub async fn exec_ops(ctx: &OpCtx<'_>, txn: &mut Txn, ops: &[Op]) -> Result<Vec<
     Ok(results)
 }
 
-async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op) -> Result<Json> {
+async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Result<Json> {
     let enc = ctx.encoding;
     let blobs = BlobResolver { db: ctx.db };
     match op {
@@ -515,6 +566,48 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op) -> Result<Json> {
             let r = table::query(txn, table, &query).await?;
             Ok(json!({"rows": r.rows, "next_cursor": r.next_cursor}))
         }
+        Op::Append { stream: name, records, expect_seq, create } => {
+            let bodies = records.iter().cloned().map(|r| r.into_body(enc)).collect::<Result<Vec<_>>>()?;
+            let shared = ctx.db.shared();
+            let to = AppendTo {
+                name,
+                create: create.then(|| (shared.env.random_u64(), shared.time_ms())),
+                expect: *expect_seq,
+                op_index: Some(index),
+                record_max: shared.cfg.stream_record_max,
+            };
+            stream::append(txn, &to, &bodies).await?;
+            Ok(json!({"count": bodies.len()}))
+        }
+        Op::ReadStream(StreamRead { stream: name, spec }) => {
+            let out = stream::read(txn, name, spec).await?;
+            let records: Vec<Json> = out.records.iter().map(|(r, b)| stream::record_json(r, b, enc)).collect();
+            Ok(json!({"records": records, "next_seq": out.next_seq, "done": out.done}))
+        }
+        Op::StreamInfo { stream: name } => {
+            let (_, st) = stream::info(txn, name).await?;
+            Ok(Json::Object(stream::state_json(&st)))
+        }
+        Op::TrimStream { stream: name, before_seq, before_time } => {
+            stream::trim(txn, name, *before_seq, *before_time).await?;
+            Ok(json!({}))
+        }
+        Op::GetConsumer { stream: name, consumer } => Ok(match stream::consumer(txn, name, consumer).await? {
+            Some(c) => json!({"found": true, "seq": c.seq}),
+            None => json!({"found": false}),
+        }),
+        Op::SetConsumer { stream: name, consumer, seq } => {
+            stream::set_consumer(txn, name, consumer, *seq, ctx.db.shared().time_ms()).await?;
+            Ok(json!({}))
+        }
+    }
+}
+
+/// Adds the first seq each append received to the results of its op.
+pub fn fill_appends(ops: &[Op], results: &mut [Json], appends: &[Appended]) {
+    let appended = ops.iter().zip(results.iter_mut()).filter(|(o, _)| matches!(o, Op::Append { .. }));
+    for ((_, r), a) in appended.zip(appends) {
+        r["first_seq"] = json!(a.first_seq);
     }
 }
 

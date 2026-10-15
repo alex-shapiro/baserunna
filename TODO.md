@@ -45,6 +45,11 @@ the design context for several of these.
       retention would let consumers resume after longer outages, at the cost
       of tombstones kept longer. Streaming responses (SSE) would save the
       long poll's request per batch.
+- [ ] **Stream follow-ups.** Consumer groups that share a stream's records
+      among workers, with acknowledgements and redelivery; read-ahead
+      across chunks for long cold reads; per-block summaries of record
+      fields so filters skip blocks; merging small sealed chunks; waking
+      idle databases whose streams are past their retention.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`. Publish the Rust `client` module as its own crate.
 
@@ -58,3 +63,7 @@ the design context for several of these.
 - [ ] **Run mutation testing in CI**, e.g. `scripts/mutants.sh --in-diff` on every PR and the
       full configuration weekly.
 - [ ] **Run the cost guard and throughput benchmark in CI** and track the numbers over time.
+- [ ] **Bound status checks by commit retention in every workload.** `kv_model`, `bank`,
+      `abandoned` and `schema_race` take `not_committed` as definitive however long ago the
+      first attempt began; like the streams workload, they should treat answers past
+      `retention_ms` as unknown and resolve them from the data.

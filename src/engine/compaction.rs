@@ -12,6 +12,7 @@ use super::config::EngineConfig;
 use super::manifest::{MAX_LEVEL, Manifest, SegmentMeta};
 use super::range_delete::RangeDeletes;
 use super::segment::SegmentBuilder;
+use super::stream::Sealer;
 use super::types::{Entry, Seq, is_commit_key};
 use super::version::{IterSpec, KeyRange, MergeIter, ReadMode};
 use super::{seg_key, segment};
@@ -168,6 +169,9 @@ pub struct Output {
     pub purged_max_seq: Seq,
     /// Entries dropped or reduced to tombstones because they had expired.
     pub expired: u64,
+    /// Stream chunks sealed from the merged records, and their bytes.
+    pub chunks: u64,
+    pub sealed_bytes: u64,
 }
 
 /// True if a segment of a level deeper than `level` covers `key`, so a
@@ -179,7 +183,7 @@ fn covered_below(m: &Manifest, level: u8, key: &[u8]) -> bool {
 /// Executes a compaction plan, writing output segments and purging obsolete entries.
 pub async fn run(shared: &Arc<Shared>, m: &Manifest, plan: &Plan, purge_seq: Seq) -> Result<Output> {
     let deletes = Arc::new(RangeDeletes::new(&m.range_deletes));
-    let mut out = Output { segments: Vec::new(), purged_max_seq: 0, expired: 0 };
+    let mut out = Output { segments: Vec::new(), purged_max_seq: 0, expired: 0, chunks: 0, sealed_bytes: 0 };
     match plan.kind {
         Kind::Merge { level } => {
             merge(shared, m, sorted_runs(&plan.inputs), level, &deletes, purge_seq, &mut out).await?
@@ -213,8 +217,9 @@ async fn merge(
         expire_at: None,
     };
     let mut it = MergeIter::new(shared.clone(), &m.db_id, &[], runs, spec);
-    let mut b = SegmentBuilder::new(cfg.block_target, cfg.compression);
-    let mut records = false;
+    let mut w = Outputs { b: SegmentBuilder::new(cfg.block_target, cfg.compression), records: false, level };
+    let mut sealer = Sealer::new(cfg.stream_seal_min_bytes, cfg.stream_chunk_bytes);
+    let mut ready = Vec::new();
     let records_horizon = records_horizon(m, cfg);
     while let Some(e) = it.next().await? {
         if is_commit_key(&e.key) && e.seq <= records_horizon {
@@ -234,18 +239,44 @@ async fn merge(
             out.purged_max_seq = out.purged_max_seq.max(e.seq);
             continue;
         }
-        // Cut where commit records begin, so that no segment holds both.
-        if b.size_estimate() >= cfg.segment_target_bytes || (is_commit_key(&e.key) && !b.is_empty() && !records) {
-            let full = std::mem::replace(&mut b, SegmentBuilder::new(cfg.block_target, cfg.compression));
-            out.segments.push(write(shared, &m.db_id, full, level, m.version).await?);
+        sealer.push(shared, &m.db_id, e, &mut ready).await?;
+        for e in ready.drain(..) {
+            w.add(shared, m, e, out).await?;
         }
-        records = is_commit_key(&e.key);
-        b.add(&e);
     }
-    if !b.is_empty() {
-        out.segments.push(write(shared, &m.db_id, b, level, m.version).await?);
+    sealer.finish(shared, &m.db_id, &mut ready).await?;
+    for e in ready.drain(..) {
+        w.add(shared, m, e, out).await?;
     }
+    if !w.b.is_empty() {
+        out.segments.push(write(shared, &m.db_id, w.b, level, m.version).await?);
+    }
+    out.chunks += sealer.chunks;
+    out.sealed_bytes += sealer.sealed_bytes;
     Ok(())
+}
+
+/// The output segments of a merge, cut at the target size.
+struct Outputs {
+    b: SegmentBuilder,
+    /// Whether the segment being built holds commit records.
+    records: bool,
+    level: u8,
+}
+
+impl Outputs {
+    async fn add(&mut self, shared: &Arc<Shared>, m: &Manifest, e: Entry, out: &mut Output) -> Result<()> {
+        let cfg = &shared.cfg;
+        // Cut where commit records begin, so that no segment holds both.
+        let starts_records = is_commit_key(&e.key) && !self.b.is_empty() && !self.records;
+        if self.b.size_estimate() >= cfg.segment_target_bytes || starts_records {
+            let full = std::mem::replace(&mut self.b, SegmentBuilder::new(cfg.block_target, cfg.compression));
+            out.segments.push(write(shared, &m.db_id, full, self.level, m.version).await?);
+        }
+        self.records = is_commit_key(&e.key);
+        self.b.add(&e);
+        Ok(())
+    }
 }
 
 /// Groups `inputs` into sorted runs: each level 0 segment is its own run,

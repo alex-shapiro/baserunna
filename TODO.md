@@ -26,6 +26,13 @@ the design context for several of these.
       matter most. `engine::Activity` already counts range tombstones,
       segment drops and rewrites, levels objects, quota refusals and
       expired entries and segments.
+- [ ] **Check caches on bulk reads (`ReadMode::Bulk`).** Compaction and GC
+      sweeps read segments in `ReadMode::Bulk` to avoid polluting the
+      in-memory block cache on misses, but `MergeIter::peek` currently skips
+      looking up already-cached blocks in memory and on local disk and goes
+      straight to object storage. Checking the caches first (without
+      populating them on misses) avoids re-fetching segments that the node
+      already has locally, such as L0 segments it just flushed.
 
 ## Features
 

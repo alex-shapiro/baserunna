@@ -8,7 +8,7 @@ Baserunna is a web service that hosts small databases on object storage.
 - Tables with schemas, primary keys and secondary indexes, with updates and
   deletes of many rows by query in one transaction.
 - Streams: append-only logs for application logs, chat and sync feeds, with
-  appends that commit atomically with everything else, reads by seq, time
+  appends that are committed atomically with everything else, reads by seq, time
   or tail, filtered queries, long polls and server-sent events, retention,
   and consumer cursors for exactly-once processing.
 - Values and rows with times to live, expired lazily on read and by compaction.

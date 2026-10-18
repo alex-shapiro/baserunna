@@ -703,7 +703,7 @@ async fn kv_changes(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbC
     let c = consistency_of(&q)?;
     let octx = op_ctx(&node, &ctx, enc);
     let ((changes, more, next), v) = watch!(node, ctx.db, c, wait, |t| {
-        let page = t.snapshot.changes(&range, &after, limit).await?;
+        let page = t.snapshot().changes(&range, &after, limit).await?;
         let mut out = Vec::with_capacity(page.changes.len());
         for ch in &page.changes {
             out.push(kv_change_json(&octx, ch, t.read_time, keys_only).await?);

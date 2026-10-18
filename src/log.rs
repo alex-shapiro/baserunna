@@ -3,8 +3,10 @@
 use serde_json::Value as Json;
 use std::cell::RefCell;
 use std::future::Future;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -46,7 +48,87 @@ pub enum Format {
 
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 static TEXT: AtomicBool = AtomicBool::new(false);
-static PROCESS_NODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static PROCESS_NODE: OnceLock<String> = OnceLock::new();
+static WRITER: OnceLock<Writer> = OnceLock::new();
+
+/// Maximum queued log lines before new lines are dropped.
+const QUEUE_CAPACITY: usize = 64 * 1024;
+
+enum LogMsg {
+    Line(String),
+    Flush(SyncSender<()>),
+}
+
+struct Writer {
+    tx: SyncSender<LogMsg>,
+    dropped: AtomicU64,
+}
+
+/// Spawns a background thread that buffers and writes log lines to stderr,
+/// dropping new lines if the queue is full. Call [`flush`] before exiting.
+pub fn start_background_writer() {
+    WRITER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("log-writer".into())
+            .spawn(move || write_lines(rx))
+            .expect("failed to spawn log writer thread");
+        Writer { tx, dropped: AtomicU64::new(0) }
+    });
+}
+
+fn write_lines(rx: Receiver<LogMsg>) {
+    let mut out = std::io::BufWriter::new(std::io::stderr());
+    while let Ok(first) = rx.recv() {
+        let mut acks = Vec::new();
+        for msg in std::iter::once(first).chain(rx.try_iter()) {
+            match msg {
+                LogMsg::Line(line) => {
+                    let _ = writeln!(out, "{line}");
+                }
+                LogMsg::Flush(ack) => acks.push(ack),
+            }
+        }
+        if let Some(n) = WRITER.get().map(|w| w.dropped.swap(0, Ordering::Relaxed)).filter(|n| *n > 0) {
+            let node = PROCESS_NODE.get().map(|n| n.as_str());
+            let msg = format!("dropped {n} log lines (log queue full)");
+            let line = match TEXT.load(Ordering::Relaxed) {
+                false => json_line(now_ms(), Level::Warn, node, None, &msg, &[]),
+                true => text_line(Level::Warn, node, None, &msg, &[]),
+            };
+            let _ = writeln!(out, "{line}");
+        }
+        let _ = out.flush();
+        for ack in acks {
+            let _ = ack.send(());
+        }
+    }
+}
+
+/// Blocks until all queued log lines have been flushed to stderr.
+pub fn flush() {
+    if let Some(w) = WRITER.get() {
+        let (ack, done) = std::sync::mpsc::sync_channel(1);
+        if w.tx.send(LogMsg::Flush(ack)).is_ok() {
+            let _ = done.recv();
+        }
+    }
+}
+
+fn write_line(line: String) {
+    let Some(w) = WRITER.get() else {
+        eprintln!("{line}");
+        return;
+    };
+    match w.tx.try_send(LogMsg::Line(line)) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            w.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TrySendError::Disconnected(LogMsg::Line(line))) => eprintln!("{line}"),
+        Err(TrySendError::Disconnected(_)) => {}
+    }
+}
 
 pub fn set_level(l: Option<Level>) {
     LEVEL.store(l.map_or(0, |l| l as u8), Ordering::Relaxed);
@@ -180,7 +262,7 @@ pub fn event(l: Level, msg: &str, fields: &[(&str, Json)]) {
             false => json_line(now_ms(), l, node, rid, msg, fields),
             true => text_line(l, node, rid, msg, fields),
         };
-        eprintln!("{line}");
+        write_line(line);
     }
 }
 

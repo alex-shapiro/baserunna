@@ -84,6 +84,12 @@ activity! {
     chunks_sealed_in_compaction,
     /// Trims committed for stream retention.
     retention_trims,
+    /// Foreign leases determined to have expired via the store clock.
+    expired_leases,
+    /// Transactions started while a manifest write was in flight on this node.
+    optimistic_begins,
+    /// Optimistic transactions re-executed after failing revalidation against a strong snapshot.
+    optimistic_reruns,
 }
 
 /// State shared by every database handle on a node.
@@ -115,6 +121,11 @@ impl Shared {
     /// store recently enough for garbage collection to rely on it.
     pub fn store_now_ms(&self) -> Option<u64> {
         self.clock.now_ms(Duration::from_millis(self.cfg.clock_sync_max_age_ms))
+    }
+
+    /// Lower bound on the store's current time, if measured within the max sync age.
+    pub fn store_earliest_now_ms(&self) -> Option<u64> {
+        self.clock.earliest_now_ms(Duration::from_millis(self.cfg.clock_sync_max_age_ms))
     }
 
     /// Store time if known, or the local wall clock otherwise.
@@ -199,6 +210,46 @@ pub fn db_prefix(db: &str) -> String {
     format!("dbs/{db}/")
 }
 
+/// Object category in storage, derived from the object key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectClass {
+    Manifest,
+    Segment,
+    Levels,
+    Blob,
+    Other,
+}
+
+impl ObjectClass {
+    pub const ALL: [ObjectClass; 5] =
+        [ObjectClass::Manifest, ObjectClass::Segment, ObjectClass::Levels, ObjectClass::Blob, ObjectClass::Other];
+
+    pub fn from_key(key: &str) -> ObjectClass {
+        let Some((_, rest)) = key.strip_prefix("dbs/").and_then(|k| k.split_once('/')) else {
+            return ObjectClass::Other;
+        };
+        if rest == "manifest" {
+            ObjectClass::Manifest
+        } else if let Some(seg) = rest.strip_prefix("seg/") {
+            if seg.ends_with(LEVELS_SUFFIX) { ObjectClass::Levels } else { ObjectClass::Segment }
+        } else if rest.starts_with("blob/") {
+            ObjectClass::Blob
+        } else {
+            ObjectClass::Other
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ObjectClass::Manifest => "manifest",
+            ObjectClass::Segment => "segment",
+            ObjectClass::Levels => "levels",
+            ObjectClass::Blob => "blob",
+            ObjectClass::Other => "other",
+        }
+    }
+}
+
 /// Registry of open database handles on a node.
 pub struct Engine {
     pub shared: Arc<Shared>,
@@ -208,7 +259,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(store: DynStore, env: Arc<Env>, cfg: EngineConfig, node_id: String) -> Arc<Engine> {
         let shared = Arc::new(Shared {
-            store,
+            store: Arc::new(crate::timing::TimedStore(store)),
             cache: cache::Cache::new(cfg.cache_bytes),
             compaction_slots: Semaphore::new(cfg.compaction_concurrency.max(1)),
             cfg,

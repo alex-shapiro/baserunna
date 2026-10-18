@@ -133,7 +133,7 @@ impl ReadValue {
 }
 
 pub struct Txn {
-    pub snapshot: Arc<Version>,
+    snapshot: Arc<Version>,
     /// The store time every read evaluates expiries at.
     pub read_time: u64,
     pub isolation: Isolation,
@@ -147,6 +147,8 @@ pub struct Txn {
     write_bytes: usize,
     max_write_bytes: usize,
     appended: usize,
+    optimistic: bool,
+    has_untracked_reads: bool,
 }
 
 fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -171,7 +173,39 @@ impl Txn {
             write_bytes: 0,
             max_write_bytes,
             appended: 0,
+            optimistic: false,
+            has_untracked_reads: false,
         }
+    }
+
+    /// Returns true if this transaction began during an in-flight manifest
+    /// write and cannot rely on commit validation (either because it will not
+    /// commit or because it performed untracked snapshot reads).
+    pub fn needs_revalidation(&self, will_commit: bool) -> bool {
+        self.optimistic && (!will_commit || self.has_untracked_reads)
+    }
+
+    pub(crate) fn mark_optimistic(&mut self) {
+        self.optimistic = true;
+    }
+
+    pub(crate) fn has_untracked_reads(&self) -> bool {
+        self.has_untracked_reads
+    }
+
+    /// Returns the underlying version snapshot. Reads performed directly on
+    /// [`Version`] are not added to the transaction's read set; use
+    /// [`Txn::untracked_snapshot`] if the transaction's output depends on them.
+    pub fn snapshot(&self) -> &Arc<Version> {
+        &self.snapshot
+    }
+
+    /// Returns the underlying version snapshot and marks the transaction as
+    /// having performed untracked reads, forcing [`super::Db::revalidate`] to
+    /// re-run the transaction if a manifest write was in flight when it began.
+    pub fn untracked_snapshot(&mut self) -> &Arc<Version> {
+        self.has_untracked_reads = true;
+        &self.snapshot
     }
 
     pub fn read_version(&self) -> Seq {

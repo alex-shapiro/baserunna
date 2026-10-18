@@ -116,8 +116,13 @@ async fn main() {
         eprintln!("baserunna: {e}");
         std::process::exit(1);
     }
-    if let Err(e) = run().await {
+    baserunna::log::start_background_writer();
+    let result = run().await;
+    if let Err(e) = &result {
         baserunna::error!("{e}");
+    }
+    baserunna::log::flush();
+    if result.is_err() {
         std::process::exit(1);
     }
 }
@@ -163,6 +168,7 @@ async fn run() -> Result<(), String> {
             tokio::time::sleep(shutdown.timeout).await;
             baserunna::warn!("shutting down: requests still in flight after {:?}", shutdown.timeout);
             n3.shutdown().await;
+            baserunna::log::flush();
             std::process::exit(0);
         });
     };

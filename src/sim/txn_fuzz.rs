@@ -1458,8 +1458,8 @@ impl World {
         }
     }
 
-    /// The first seq each append of `t` receives if it commits now, or why
-    /// it fails: an expected seq that no longer holds.
+    /// Returns the starting sequence number for each append in `t` if committed
+    /// now, or the index of the first append whose `expect_seq` precondition fails.
     fn stream_outcome(&self, t: &TxnView) -> std::result::Result<Vec<u64>, usize> {
         let mut next: BTreeMap<&str, u64> = BTreeMap::new();
         let mut firsts = Vec::new();
@@ -1555,7 +1555,7 @@ impl World {
             None => None,
             Some(c) => match self.query_cursors.get(c) {
                 Some((ix, v)) if ix == index && in_region(v) => Some(v.clone()),
-                // Generated strings never decode to a valid row or index keyspace prefix.
+                // Strings from rand_string never base64-decode to a valid row or index prefix.
                 _ => return Err(Fail::Invalid),
             },
         };
@@ -1635,7 +1635,7 @@ impl World {
             ReadItem::Key(k) => changed(k),
             ReadItem::Range(r) => self.last_write.iter().any(|(k, v)| *v > t.rv && r.contains(k)),
         });
-        // Catalog entries a stream op reads are pinned: validated at every isolation level.
+        // Stream catalog entries read by a stream op are checked at both isolation levels.
         let pinned = t.stream_keys.iter().any(|r| self.stream_changed(r, t.rv));
         let streams = match iso {
             Iso::Serializable => t.stream_reads.iter().any(|r| self.stream_changed(r, t.rv)),
@@ -1775,7 +1775,7 @@ fn check_unique(t: &TxnView, pk: i64, new: &MRow) -> MResult<()> {
 
 const NAMES: &[&str] = &["ann", "bob", "cy", "é", ""];
 
-/// Generates strings that never decode as URL-safe base64 to a row or index keyspace prefix.
+/// Picks a test string that never base64-decodes to a valid row or index key prefix.
 fn rand_string(u: &mut Choices) -> String {
     const POOL: &[&str] = &["", "a", "t", "u", "id", "name", "grp", "doc", "by_name", "by_grp", "x/y", "é", "null"];
     match u.below(4) {

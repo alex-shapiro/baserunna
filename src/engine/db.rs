@@ -14,6 +14,7 @@ use super::version::{KeyRange, Snapshot, Version};
 use super::{Shared, blob_prefix, levels_key, manifest_key, seg_key};
 use crate::error::{Error, Result};
 use crate::store::{GetOpts, PutMode, StoreError};
+use crate::timing::{self, StoreOp, Tally};
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
@@ -143,8 +144,14 @@ impl State {
 }
 
 struct Queue {
-    items: VecDeque<Work>,
+    items: VecDeque<QueuedWork>,
     running: bool,
+}
+
+struct QueuedWork {
+    work: Work,
+    enqueued_at: Instant,
+    request_id: Option<Arc<str>>,
 }
 
 pub struct Db {
@@ -153,9 +160,9 @@ pub struct Db {
     st: Mutex<State>,
     q: Mutex<Queue>,
     load_lock: tokio::sync::Mutex<()>,
-    /// True while a manifest write by this node is in flight. Its result
-    /// may already be visible to others, so lease reads wait for it.
-    writing: std::sync::atomic::AtomicBool,
+    /// A manifest write is in flight if `writes_finished < writes_started`.
+    writes_started: std::sync::atomic::AtomicU64,
+    writes_finished: std::sync::atomic::AtomicU64,
     write_done: tokio::sync::Notify,
     /// Notified whenever a newer version is installed.
     installed: tokio::sync::Notify,
@@ -236,7 +243,8 @@ impl Db {
             }),
             q: Mutex::new(Queue { items: VecDeque::new(), running: false }),
             load_lock: tokio::sync::Mutex::new(()),
-            writing: std::sync::atomic::AtomicBool::new(false),
+            writes_started: 0.into(),
+            writes_finished: 0.into(),
             write_done: tokio::sync::Notify::new(),
             installed: tokio::sync::Notify::new(),
             staging: Mutex::new(Staging::default()),
@@ -300,14 +308,31 @@ impl Db {
         !self.own_lease_left(st, m).is_zero()
     }
 
-    /// A lease in `m` held by another node, with how long it may still be
-    /// valid from our viewpoint.
-    fn foreign_lease<'a>(&self, m: &'a Manifest) -> Option<(&'a Lease, Duration)> {
+    /// Returns another node's lease in `v` and its remaining duration
+    /// on this node's clock, or `None` if no foreign lease is active.
+    fn foreign_lease<'a>(&self, v: &'a Version) -> Option<(&'a Lease, Duration)> {
+        let m = &v.m;
         let l = m.lease.as_ref().filter(|l| l.node != self.shared.node_id)?;
+        if self.lease_expired_on_store(v, l) {
+            return None;
+        }
         let valid_for = Duration::from_millis(l.ms + self.shared.cfg.lease_margin_ms);
         let seen = self.shared.lease_seen(&self.id, l, m.write_seq);
         let left = (seen + valid_for).saturating_duration_since(Instant::now());
         (!left.is_zero()).then_some((l, left))
+    }
+
+    /// Checks whether the store's clock shows that `l` has already expired (SPEC §5.7).
+    fn lease_expired_on_store(&self, v: &Version, l: &Lease) -> bool {
+        let (Some(last_modified_ms), Some(now_ms)) = (v.stored_ms, self.shared.store_earliest_now_ms()) else {
+            return false;
+        };
+        let precision_ms = self.shared.store.time_precision_ms();
+        let expired = now_ms > last_modified_ms + precision_ms + 2 * l.ms + self.shared.cfg.lease_margin_ms;
+        if expired {
+            self.shared.counters.add(&super::Activity { expired_leases: 1, ..Default::default() });
+        }
+        expired
     }
 
     /// The node holding a valid lease on this database, if known.
@@ -317,7 +342,7 @@ impl Db {
         if self.holds_lease(&st, &cur.m) {
             return Some(self.shared.node_id.clone());
         }
-        self.foreign_lease(&cur.m).map(|(l, _)| l.node.clone())
+        self.foreign_lease(&cur).map(|(l, _)| l.node.clone())
     }
 
     /// Storage statistics at version `v`.
@@ -450,7 +475,9 @@ impl Db {
                 }
                 Ok(g) => {
                     let m = self.shared.load_manifest(&self.id, &g.data, cur.as_deref()).await?;
-                    let v = Arc::new(Version::new(m, g.etag, self.shared.clone()));
+                    let mut v = Version::new(m, g.etag, self.shared.clone());
+                    v.stored_ms = Some(g.last_modified_ms);
+                    let v = Arc::new(v);
                     return Ok((self.install(v, Some(started)), started));
                 }
                 Err(StoreError::NotFound) if create => {
@@ -491,19 +518,46 @@ impl Db {
     /// that version was current.
     pub async fn snapshot(self: &Arc<Self>, c: Consistency) -> Result<Snapshot> {
         if c == Consistency::Strong {
-            // A write of ours that is in flight may already be visible to
-            // readers elsewhere; serving the cached version now could go
-            // back in time relative to them.
-            loop {
-                let notified = self.write_done.notified();
-                let mut notified = std::pin::pin!(notified);
-                notified.as_mut().enable();
-                if !self.writing.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
-                }
-                notified.await;
-            }
+            self.wait_for_in_flight_write().await;
         }
+        self.resolve_snapshot(c).await
+    }
+
+    /// Resolves a strong snapshot without waiting for an in-flight manifest
+    /// write on this node. The boolean is true if a manifest write was in flight.
+    pub async fn latest_snapshot(self: &Arc<Self>) -> Result<(Snapshot, bool)> {
+        let write_in_flight = self.has_in_flight_write();
+        Ok((self.resolve_snapshot(Consistency::Strong).await?, write_in_flight))
+    }
+
+    fn has_in_flight_write(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.writes_finished.load(SeqCst) < self.writes_started.load(SeqCst)
+    }
+
+    /// Waits for any manifest write currently in flight on this node, ignoring
+    /// writes that start after this call begins.
+    async fn wait_for_in_flight_write(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let target = self.writes_started.load(SeqCst);
+        let mut waited_since = None;
+        loop {
+            let notified = self.write_done.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            if self.writes_finished.load(SeqCst) >= target {
+                break;
+            }
+            waited_since.get_or_insert_with(Instant::now);
+            notified.await;
+        }
+        if let Some(t) = waited_since {
+            timing::record_read_wait(t.elapsed());
+        }
+    }
+
+    /// Returns a snapshot from cache if it satisfies `c`, or refreshes the manifest from storage.
+    async fn resolve_snapshot(self: &Arc<Self>, c: Consistency) -> Result<Snapshot> {
         let now = Instant::now();
         if let Some((cur, current_at)) = self.cached(c, now) {
             return self.snapshot_at(check_live(cur)?, current_at).await;
@@ -517,7 +571,7 @@ impl Db {
         let hot = {
             let mut st = self.st();
             let hot = st.hot(self.shared.cfg.lease_read_threshold) && !st.lease_requested;
-            if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v.m).is_none() {
+            if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v).is_none() {
                 st.lease_requested = true;
                 true
             } else {
@@ -600,6 +654,41 @@ impl Db {
         Ok(Txn::new(snap, isolation, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes))
     }
 
+    /// Begins a strong serializable transaction without waiting for an
+    /// in-flight manifest write on this node. If [`Txn::needs_revalidation`]
+    /// is true when the transaction finishes, pass it to [`Db::revalidate`]
+    /// before returning a result.
+    pub async fn begin_optimistic(self: &Arc<Self>) -> Result<Txn> {
+        let (snap, write_in_flight) = self.latest_snapshot().await?;
+        let mut t =
+            Txn::new(snap, Isolation::Serializable, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes);
+        if write_in_flight {
+            t.mark_optimistic();
+            self.shared.counters.add(&super::Activity { optimistic_begins: 1, ..Default::default() });
+        }
+        Ok(t)
+    }
+
+    /// Waits for a strong snapshot and validates `t`'s read set against it.
+    /// Returns the snapshot version if all reads remain valid, or `None` if `t`
+    /// conflicted (or performed untracked reads) and must be re-executed.
+    pub async fn revalidate(self: &Arc<Self>, t: Txn) -> Result<Option<Seq>> {
+        if t.has_untracked_reads() {
+            self.shared.counters.add(&super::Activity { optimistic_reruns: 1, ..Default::default() });
+            return Ok(None);
+        }
+        let snap = self.snapshot(Consistency::Strong).await?;
+        let req = t.into_request();
+        match validate(&req, &snap.version, &[], &[], snap.time_ms).await {
+            Ok(()) => Ok(Some(snap.version.m.version)),
+            Err(Error::Conflict(_)) => {
+                self.shared.counters.add(&super::Activity { optimistic_reruns: 1, ..Default::default() });
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Creates a writer for a new staged blob, syncing the store clock first if needed.
     pub async fn blob_writer(self: &Arc<Self>, content_type: &str) -> BlobWriter {
         if let Err(e) = self.shared.store_time_ms().await {
@@ -635,8 +724,11 @@ impl Db {
             self.shared.store_time_ms().await?;
         }
         let (tx, rx) = oneshot::channel();
+        let enqueued = Instant::now();
         self.enqueue(Work::Commit { req, tx });
-        rx.await.map_err(|_| Error::Unavailable {
+        let r = rx.await;
+        timing::record_commit_wait(enqueued.elapsed());
+        r.map_err(|_| Error::Unavailable {
             message: "commit interrupted".into(),
             retry_after_ms: None,
             outcome_unknown: true,
@@ -691,7 +783,11 @@ impl Db {
     fn enqueue(self: &Arc<Self>, w: Work) {
         let spawn = {
             let mut q = self.queue();
-            q.items.push_back(w);
+            q.items.push_back(QueuedWork {
+                work: w,
+                enqueued_at: Instant::now(),
+                request_id: crate::log::request_id(),
+            });
             if q.running {
                 false
             } else {
@@ -707,7 +803,7 @@ impl Db {
 
     async fn committer(self: Arc<Self>) {
         loop {
-            let batch: Vec<Work> = {
+            let queued: Vec<QueuedWork> = {
                 let mut q = self.queue();
                 if q.items.is_empty() {
                     q.running = false;
@@ -716,8 +812,39 @@ impl Db {
                 let n = q.items.len().min(self.shared.cfg.commit_batch_max);
                 q.items.drain(..n).collect()
             };
-            self.process(batch).await;
+            let started = Instant::now();
+            let tally = Arc::new(Tally::default());
+            let (enqueued, batch): (Vec<_>, Vec<_>) =
+                queued.into_iter().map(|q| ((q.enqueued_at, q.request_id), q.work)).unzip();
+            let txn_count = batch.iter().filter(|w| matches!(w, Work::Commit { .. })).count();
+            timing::scoped(tally.clone(), self.process(batch)).await;
+            self.log_batch(&enqueued, txn_count, started, &tally);
         }
+    }
+
+    fn log_batch(&self, enqueued: &[(Instant, Option<Arc<str>>)], txn_count: usize, started: Instant, tally: &Tally) {
+        use crate::log::{self, Level};
+        use serde_json::json;
+        if tally.store_calls(super::ObjectClass::Manifest, StoreOp::Put) == 0 || !log::enabled(Level::Info) {
+            return;
+        }
+        let oldest = enqueued.iter().map(|(at, _)| *at).min().unwrap_or(started);
+        let mut fields = vec![
+            ("db", json!(self.id)),
+            ("txns", json!(txn_count)),
+            ("work", json!(enqueued.len())),
+            ("queued_ms", json!((started - oldest).as_millis() as u64)),
+            ("build_ms", json!(tally.build_ms())),
+            ("ms", json!(started.elapsed().as_millis() as u64)),
+        ];
+        if let Some(store) = tally.store_json() {
+            fields.push(("store", store));
+        }
+        let ids: Vec<&str> = enqueued.iter().filter_map(|(_, id)| id.as_deref()).collect();
+        if !ids.is_empty() {
+            fields.push(("request_ids", json!(ids)));
+        }
+        log::event(Level::Info, "commit", &fields);
     }
 
     async fn base_for_commit(self: &Arc<Self>) -> Result<Arc<Version>> {
@@ -749,7 +876,7 @@ impl Db {
             attempt += 1;
             let attempt_started = Instant::now();
             let now = Now { wall_ms: self.shared.env.now_ms(), store_ms: self.shared.store_now_ms() };
-            let foreign = self.foreign_lease(&base.m).map(|(l, left)| (l.node.clone(), left));
+            let foreign = self.foreign_lease(&base).map(|(l, left)| (l.node.clone(), left));
             if let Some((holder, left)) = foreign {
                 let e = Error::NotOwner { holder, retry_after_ms: left.as_millis() as u64 };
                 // An earlier attempt may have landed before the lease moved.
@@ -757,7 +884,10 @@ impl Db {
                 self.finish_failed(batch, e);
                 return;
             }
-            let plan = match self.build(&base, &batch, now).await {
+            let build_started = Instant::now();
+            let plan = self.build(&base, &batch, now).await;
+            timing::record_build_time(build_started.elapsed());
+            let plan = match plan {
                 Ok(p) => p,
                 Err(e) => {
                     let e = if maybe_applied { unknown(e) } else { e };
@@ -787,7 +917,7 @@ impl Db {
                 return;
             };
             let started = Instant::now();
-            self.writing.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let res =
                 self.shared.store.put(&manifest_key(&self.id), m.encode(), PutMode::IfMatch(base.etag.clone())).await;
             if !res.is_ok() {
@@ -862,7 +992,7 @@ impl Db {
     }
 
     fn write_finished(&self) {
-        self.writing.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.writes_finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.write_done.notify_waiters();
     }
 

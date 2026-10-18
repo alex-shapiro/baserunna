@@ -155,7 +155,7 @@ pub struct Entry {
     pub key: Bytes,
     pub seq: Seq,
     pub value: Value,
-    /// Store time in milliseconds at which the value expires and reads as a
+    /// Store time in milliseconds at which the value expires and is read as a
     /// tombstone with the same `seq`. Tombstones never expire.
     pub expires: Option<u64>,
 }

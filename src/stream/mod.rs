@@ -293,7 +293,7 @@ pub async fn create(txn: &mut Txn, name: &str, retention: Retention, id: u64, no
     if lookup(txn, name).await?.is_some() {
         return Err(Error::AlreadyExists(format!("stream {name:?} already exists")));
     }
-    if txn.snapshot.stream_state(id).await?.is_some() {
+    if txn.stream_state(id).await?.is_some() {
         return Err(Error::Conflict("stream id in use".into()));
     }
     let c = Catalog { id, created_at: now, retention_ms: retention.retention_ms, max_bytes: retention.max_bytes };
@@ -352,7 +352,7 @@ pub async fn trim(txn: &mut Txn, name: &str, before_seq: Option<u64>, before_tim
         (Some(s), None) => s,
         (None, Some(t)) => {
             let st = state(txn, &c, false).await?;
-            txn.snapshot.stream_seek(c.id, &st, Seek::Time(t)).await?
+            txn.untracked_snapshot().stream_seek(c.id, &st, Seek::Time(t)).await?
         }
         _ => return Err(Error::invalid("trim needs exactly one of before_seq and before_time")),
     };
@@ -368,7 +368,7 @@ pub async fn trim(txn: &mut Txn, name: &str, before_seq: Option<u64>, before_tim
 async fn state(txn: &mut Txn, c: &Catalog, recorded: bool) -> Result<StreamState> {
     let st = match recorded {
         true => txn.stream_state(c.id).await?,
-        false => txn.snapshot.stream_state(c.id).await?,
+        false => txn.snapshot().stream_state(c.id).await?,
     };
     let mut st = st.unwrap_or(StreamState::new(c.retention()));
     let target = txn.pending_trim(c.id).unwrap_or(0).clamp(st.first_seq, st.next_seq);
@@ -376,7 +376,7 @@ async fn state(txn: &mut Txn, c: &Catalog, recorded: bool) -> Result<StreamState
         (st.first_pos, st.first_time) = match target == st.next_seq {
             true => (st.next_pos, st.last_time),
             false => {
-                let r = txn.snapshot.stream_record(c.id, target).await?;
+                let r = txn.snapshot().stream_record(c.id, target).await?;
                 r.map(|r| (r.pos, r.time_ms)).ok_or_else(|| Error::internal("stream record missing"))?
             }
         };
@@ -516,7 +516,7 @@ pub struct ReadOut {
 pub async fn read(txn: &mut Txn, name: &str, spec: &ReadSpec) -> Result<ReadOut> {
     spec.validate()?;
     let c = open(txn, name).await?;
-    let v = txn.snapshot.clone();
+    let v = txn.snapshot().clone();
     let mut st = state(txn, &c, false).await?;
     let lo = match (spec.from_seq, spec.from_time, spec.tail, &spec.consumer) {
         (Some(s), ..) => s,
@@ -591,9 +591,15 @@ pub async fn consumer(txn: &mut Txn, stream: &str, name: &str) -> Result<Option<
 pub async fn set_consumer(txn: &mut Txn, stream: &str, name: &str, seq: u64, now: u64) -> Result<()> {
     check_name(name, "consumer")?;
     let c = open(txn, stream).await?;
-    // Seqs only grow, so a cursor valid at the snapshot stays valid: no
-    // need to conflict with appends by recording the state.
-    let next = state(txn, &c, false).await?.next_seq;
+    // Sequence numbers are monotonic, so a cursor valid at the snapshot remains
+    // valid without adding the stream state to the read set (which would conflict
+    // with concurrent appends). If the cursor is ahead of the snapshot, re-read
+    // and record the state so an optimistic transaction revalidates against any
+    // in-flight append.
+    let mut next = state(txn, &c, false).await?.next_seq;
+    if seq > next {
+        next = state(txn, &c, true).await?.next_seq;
+    }
     if seq > next {
         return Err(Error::invalid(format!("seq {seq} is past the stream's next seq {next}")));
     }
@@ -641,7 +647,7 @@ pub async fn check_integrity(txn: &mut Txn) -> Result<()> {
             return fail(format!("stream {name} shares its id"));
         }
     }
-    let v = txn.snapshot.clone();
+    let v = txn.snapshot().clone();
     let mut it = v.iter(
         &KeyRange::half_open(Bytes::from_static(&[es::RECORDS]), Some(Bytes::from_static(&[es::STATE + 1]))),
         false,

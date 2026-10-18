@@ -1142,7 +1142,7 @@ pub struct RowChanges {
 pub async fn row_changes(txn: &mut Txn, table: &str, after: &ChangePos, limit: usize) -> Result<RowChanges> {
     let s = get_schema(txn, table).await?;
     let prefix = table_prefix(SPACE_ROWS, s.id);
-    let snapshot = txn.snapshot.clone();
+    let snapshot = txn.snapshot().clone();
     let page = snapshot.changes(&KeyRange::prefix(&prefix), after, limit).await?;
     let mut changes = Vec::with_capacity(page.changes.len());
     for c in &page.changes {
@@ -1260,7 +1260,7 @@ pub async fn check_no_orphans(txn: &mut Txn) -> Result<()> {
     }
     let all = KeyRange::half_open(Bytes::from_static(&[SPACE_ROWS]), Some(Bytes::from_static(&[SPACE_ROW_BLOBS + 1])));
     let id_at = |k: &[u8], at: usize| k.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-    // Rows sort before their blobs (SPACE_ROWS < SPACE_ROW_BLOBS).
+    // Rows are sorted before their blobs (SPACE_ROWS < SPACE_ROW_BLOBS).
     let mut rows = BTreeSet::new();
     for it in txn.scan(&all, false, usize::MAX).await? {
         let k = &it.key;

@@ -150,6 +150,47 @@ pub async fn read_upload<F: std::future::Future<Output = BlobWriter>>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unsatisfiable;
 
+/// Request body wrapper that records whether the stream has been fully consumed.
+pub struct TrackedBody {
+    inner: Body,
+    consumed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TrackedBody {
+    pub fn new(inner: Body) -> (TrackedBody, Arc<std::sync::atomic::AtomicBool>) {
+        let consumed = Arc::new(std::sync::atomic::AtomicBool::new(http_body::Body::is_end_stream(&inner)));
+        (TrackedBody { inner, consumed: consumed.clone() }, consumed)
+    }
+}
+
+impl http_body::Body for TrackedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let polled = Pin::new(&mut self.inner).poll_frame(cx);
+        // Hyper stops polling as soon as `is_end_stream()` is true,
+        // without waiting for `Poll::Ready(None)`.
+        let ended = match &polled {
+            Poll::Ready(None) => true,
+            Poll::Ready(Some(Ok(_))) => self.inner.is_end_stream(),
+            _ => false,
+        };
+        if ended {
+            self.consumed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// Parses a single-range `Range` header against an object of `size` bytes.
 /// Returns `Ok(None)` when no single-range header is present.
 pub fn parse_range(h: Option<&str>, size: u64) -> std::result::Result<Option<Range<u64>>, Unsatisfiable> {

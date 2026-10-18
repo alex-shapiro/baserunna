@@ -29,6 +29,9 @@ fn simulation_exercises_every_documented_operation_and_engine_path() {
         chunks_sealed_at_flush,
         chunks_sealed_in_compaction,
         retention_trims,
+        expired_leases,
+        optimistic_begins,
+        optimistic_reruns,
     } = engine;
     for (path, n) in [
         ("range tombstones written", range_tombstones_written),
@@ -42,6 +45,9 @@ fn simulation_exercises_every_documented_operation_and_engine_path() {
         ("stream chunks sealed at flush", chunks_sealed_at_flush),
         ("stream chunks sealed in compaction", chunks_sealed_in_compaction),
         ("streams trimmed for retention", retention_trims),
+        ("leases expired according to the store clock", expired_leases),
+        ("optimistic transactions begun during an in-flight commit", optimistic_begins),
+        ("optimistic transactions rerun after revalidation", optimistic_reruns),
     ] {
         assert!(n > 0, "the simulator never exercised: {path} ({engine:?})");
     }

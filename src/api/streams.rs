@@ -133,7 +133,7 @@ async fn configure(
             max_bytes: max_bytes.unwrap_or(cur.max_bytes),
         };
         let c = stream::configure(t, &name, r).await?;
-        let st = t.snapshot.stream_state(c.id).await?.unwrap_or(StreamState::new(r));
+        let st = t.untracked_snapshot().stream_state(c.id).await?.unwrap_or(StreamState::new(r));
         Ok::<_, Error>((c, StreamState { retention: r, ..st }))
     });
     let mut out = stream::stream_json(&name, &c, &st);
@@ -320,8 +320,8 @@ async fn read(
         if let Some(l) = last {
             spec = ReadSpec { from_seq: Some(l.saturating_add(1)), ..starting_anywhere(spec) };
         }
-        // The first read answers errors with their status, before the
-        // response commits to an event stream.
+        // Perform the initial read before starting the SSE stream so any error is
+        // returned as a normal HTTP status code.
         let first = read_once(&ctx.db, c, &name, &spec).await?;
         let follow = Follow { db: ctx.db.clone(), c, name, enc, wait: Duration::from_millis(wait) };
         return Ok(events(node, follow, spec, first));

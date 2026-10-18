@@ -9,7 +9,7 @@ use bytes::Bytes;
 use std::collections::BTreeSet;
 
 impl Sim {
-    /// Verifies quiescence storage invariants: manifests decode, referenced levels
+    /// Verifies quiescence storage invariants: manifests can be decoded, referenced levels
     /// and segments exist and decode, and all live blob chunks are present.
     pub async fn check_storage(&self) -> Result<StorageReport, String> {
         let keys: BTreeSet<String> = self.mem.keys().into_iter().collect();

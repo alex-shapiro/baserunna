@@ -18,7 +18,14 @@ struct Op {
     client: String,
 }
 
-pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, ops: usize, chaos: bool) -> Result<(), String> {
+pub async fn run(
+    sim: Arc<Sim>,
+    writers: usize,
+    readers: usize,
+    ops: usize,
+    max_pause_ms: u64,
+    chaos: bool,
+) -> Result<(), String> {
     let owner = Client::signup(&sim, "reg", "reg@reg.test", "password-123").await?;
     let db = "reg";
     owner.create_db(db).await?;
@@ -34,7 +41,7 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, ops: usize, chao
         let write = w < writers;
         hs.push(tokio::spawn(async move {
             for n in 0..ops {
-                let d = c.rng().below(500);
+                let d = c.rng().below(max_pause_ms);
                 c.pause(d).await;
                 let key = c.rng().usize(keys);
                 let path = format!("/v1/dbs/{db}/kv/r{key}");
@@ -59,35 +66,31 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, ops: usize, chao
                         client: c.name.clone(),
                     });
                 } else {
-                    let r = c.send("GET", &path, &[], bytes::Bytes::new()).await;
-                    let end = sim2.now_ms();
-                    if let Ok(r) = r {
-                        if r.status == 200 {
-                            let version = r
-                                .headers
-                                .get("x-baserunna-version")
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|v| v.parse().ok());
+                    // Consecutive reads through different nodes must not observe stale state.
+                    let kinds = match c.rng().below(6) {
+                        0 => vec![ReadKind::Get],
+                        1 => vec![ReadKind::LocalGet],
+                        2 => vec![ReadKind::ReadOnlyTxn],
+                        3 => vec![ReadKind::ReadWriteTxn],
+                        4 => vec![ReadKind::LocalGet, ReadKind::Get],
+                        _ => vec![ReadKind::LocalGet, ReadKind::ReadOnlyTxn],
+                    };
+                    let mut start = start;
+                    for kind in kinds {
+                        let read = read_once(&c, db, key, kind).await;
+                        let end = sim2.now_ms();
+                        if let Some((version, value)) = read {
                             hist.lock().unwrap_or_else(|e| e.into_inner()).push(Op {
                                 key,
                                 start,
                                 end,
-                                version,
-                                value: String::from_utf8_lossy(&r.body).into_owned(),
-                                write: false,
-                                client: c.name.clone(),
-                            });
-                        } else if r.status == 404 {
-                            hist.lock().unwrap_or_else(|e| e.into_inner()).push(Op {
-                                key,
-                                start,
-                                end,
-                                version: Some(0),
-                                value: String::new(),
+                                version: Some(version),
+                                value,
                                 write: false,
                                 client: c.name.clone(),
                             });
                         }
+                        start = sim2.now_ms();
                     }
                 }
             }
@@ -101,6 +104,50 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, ops: usize, chao
     }
     super::recover(&sim).await;
     check(&hist.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+#[derive(Clone, Copy)]
+enum ReadKind {
+    Get,
+    LocalGet,
+    ReadOnlyTxn,
+    ReadWriteTxn,
+}
+
+/// Reads `r{key}` via `kind` and returns `(version, value)` (or `(0, "")` if not found).
+async fn read_once(c: &Client, db: &str, key: usize, kind: ReadKind) -> Option<(u64, String)> {
+    match kind {
+        ReadKind::Get | ReadKind::LocalGet => {
+            let headers = match kind {
+                ReadKind::LocalGet => vec![("x-baserunna-hops", "2".to_string())],
+                _ => vec![],
+            };
+            let r = c.send("GET", &format!("/v1/dbs/{db}/kv/r{key}"), &headers, bytes::Bytes::new()).await.ok()?;
+            match r.status {
+                200 => {
+                    let version = r.headers.get("x-baserunna-version")?.to_str().ok()?.parse().ok()?;
+                    Some((version, String::from_utf8_lossy(&r.body).into_owned()))
+                }
+                404 => Some((0, String::new())),
+                _ => None,
+            }
+        }
+        ReadKind::ReadOnlyTxn | ReadKind::ReadWriteTxn => {
+            let mut ops = vec![serde_json::json!({"op": "get", "key": format!("r{key}")})];
+            if matches!(kind, ReadKind::ReadWriteTxn) {
+                ops.push(serde_json::json!({"op": "put", "key": format!("scratch-{}", c.name), "value": "x"}));
+            }
+            let r = c.call("POST", &format!("/v1/dbs/{db}/txn"), Some(serde_json::json!({ "ops": ops }))).await.ok()?;
+            if r.status != 200 {
+                return None;
+            }
+            let got = &r.json["results"][0];
+            match got["found"].as_bool()? {
+                true => Some((got["version"].as_u64()?, got["value"].as_str()?.to_string())),
+                false => Some((0, String::new())),
+            }
+        }
+    }
 }
 
 fn check(h: &[Op]) -> Result<(), String> {

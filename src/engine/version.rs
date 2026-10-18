@@ -18,6 +18,8 @@ use std::sync::Arc;
 pub struct Version {
     pub m: Manifest,
     pub etag: String,
+    /// Object-store `last_modified` timestamp (in ms) when this manifest was loaded from storage.
+    pub stored_ms: Option<u64>,
     pub(crate) shared: Arc<Shared>,
     /// `m.range_deletes`, indexed for lookups.
     deletes: Arc<RangeDeletes>,
@@ -684,7 +686,7 @@ impl Version {
     pub fn new(m: Manifest, etag: String, shared: Arc<Shared>) -> Version {
         let deletes = Arc::new(RangeDeletes::new(&m.range_deletes));
         let expiring = m.tail.iter().any(|e| e.expires.is_some()) || m.segments.iter().any(|s| s.expiring > 0);
-        Version { m, etag, shared, deletes, expiring }
+        Version { m, etag, stored_ms: None, shared, deletes, expiring }
     }
 
     pub fn version(&self) -> Seq {
@@ -950,7 +952,7 @@ impl Snapshot {
 }
 
 /// A position in a change feed. Changes are ordered by version, and within
-/// one by kind (range deletions apply first) and key, so a position after
+/// one by kind (range deletions are applied first) and key, so a position after
 /// every change of version `seq` is `ChangePos::after_version(seq)`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ChangePos {
@@ -1089,7 +1091,7 @@ mod tests {
         }
     }
 
-    /// Cursors decode without panicking, and decoded ones round-trip.
+    /// Decoding a cursor never panics, and decoded cursors survive a round trip.
     #[test]
     fn fuzz_change_cursors() {
         let mut r = crate::util::rng::Rng::new(9);

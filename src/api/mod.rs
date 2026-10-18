@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::log::{self, REQUEST_ID_HEADER};
 use crate::meta::{Access, DbRecord};
 use crate::node::{Node, Principal};
+use crate::timing;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, Request, State};
@@ -336,7 +337,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         }
         // Re-resolve strongly if the cached database name points to a deleted or recreated database.
         let opened = match node.open_db(&rec).await {
-            Ok(db) => match db.read_version(Consistency::Strong).await {
+            Ok(db) => match db.latest_snapshot().await {
                 Err(Error::NotFound(m)) => Err(m),
                 Err(e) => return Err(e),
                 Ok(_) => Ok(db),
@@ -411,7 +412,8 @@ async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: 
         let method = req.method().to_string();
         let route = req.extensions().get::<MatchedPath>().map_or("unmatched", |m| m.as_str()).to_string();
         let hops = hops(req.headers());
-        let resp = next.run(req).await;
+        let tally = Arc::new(timing::Tally::default());
+        let resp = timing::scoped(tally.clone(), next.run(req)).await;
         let mut fields = vec![
             ("method", json!(method)),
             ("route", json!(route)),
@@ -421,6 +423,17 @@ async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: 
         ];
         if let Some(ForwardedTo(t)) = resp.extensions().get::<ForwardedTo>() {
             fields.push(("forwarded_to", json!(t)));
+        }
+        if let Some(store) = tally.store_json() {
+            fields.push(("store_ms", json!(tally.store_ms())));
+            fields.push(("store", store));
+        }
+        if let (n @ 1.., wait) = tally.commits() {
+            fields.push(("commits", json!(n)));
+            fields.push(("commit_ms", json!(wait)));
+        }
+        if tally.read_wait_ms() > 0 {
+            fields.push(("read_wait_ms", json!(tally.read_wait_ms())));
         }
         log::event(log::Level::Info, "request", &fields);
         resp
@@ -537,11 +550,11 @@ pub(crate) enum Ran<T> {
     Replayed(Committed),
 }
 
-/// Runs `$body` in fresh transactions until what it wrote commits,
-/// retrying conflicts; evaluates to `(commit_id, Ran)`. With an idempotency
-/// key (`$key`, an `Option<&str>`) the commit id derives from the key, and a
-/// commit an earlier attempt applied is reported rather than applied again
-/// (SPEC §6.2).
+/// Executes `$body` in a transaction, retrying on conflict until it is
+/// committed, and evaluates to `(commit_id, Ran)`. If an idempotency key
+/// (`$key`, an `Option<&str>`) is provided, the commit ID is derived from the
+/// key and any previously committed result for that key is replayed without
+/// re-executing (SPEC §6.2).
 macro_rules! run_txn {
     ($node:expr, $ctx:expr, $isolation:expr, $consistency:expr, $key:expr, |$t:ident| $body:expr) => {{
         let (node_, ctx_, key_): (&crate::node::Node, &crate::api::DbCtx, Option<&str>) = (&$node, &$ctx, $key);
@@ -550,12 +563,26 @@ macro_rules! run_txn {
             Some(c) => crate::api::Ran::Replayed(c),
             None => {
                 let mut attempt_ = 0u32;
+                let mut optimistic_ = true;
                 loop {
-                    let mut txn_ = ctx_.db.begin($isolation, $consistency).await?;
+                    let mut txn_ = crate::api::begin_txn(ctx_, $isolation, $consistency, optimistic_).await?;
                     txn_.commit_id = commit_id_;
                     let out_ = {
                         let $t: &mut crate::engine::Txn = &mut txn_;
                         async { $body }.await
+                    };
+                    let txn_ = match txn_ {
+                        t if !t.needs_revalidation(out_.is_ok() && !t.is_read_only()) => t,
+                        t => match ctx_.db.revalidate(t).await? {
+                            Some(version) => match out_ {
+                                Ok(out) => break crate::api::Ran::Read { out, version },
+                                Err(e) => break crate::api::failed(ctx_, commit_id_, key_, e).await?,
+                            },
+                            None => {
+                                optimistic_ = false;
+                                continue;
+                            }
+                        },
                     };
                     let out_ = match out_ {
                         Ok(o) => o,
@@ -571,6 +598,21 @@ macro_rules! run_txn {
     }};
 }
 pub(crate) use run_txn;
+
+/// Begins a transaction for [`run_txn!`], starting optimistically for strong
+/// serializable transactions when `optimistic` is true.
+pub(crate) async fn begin_txn(
+    ctx: &DbCtx,
+    isolation: crate::engine::Isolation,
+    c: Consistency,
+    optimistic: bool,
+) -> Result<Txn> {
+    if optimistic && c == Consistency::Strong && isolation == crate::engine::Isolation::Serializable {
+        ctx.db.begin_optimistic().await
+    } else {
+        ctx.db.begin(isolation, c).await
+    }
+}
 
 pub(crate) fn commit_id_for(node: &Node, ctx: &DbCtx, key: Option<&str>) -> Result<u64> {
     match key {
@@ -605,8 +647,8 @@ pub(crate) async fn finish<T>(
     let mut req = t.into_request();
     req.deadline = Some(ctx.deadline);
     match ctx.db.commit_detailed(req).await {
-        // Without a key, only this attempt's own commit, landed by an
-        // ambiguous manifest write the committer retried, can replay.
+        // Without an idempotency key, `replayed` is true only if the committer
+        // retried an ambiguous manifest PUT that had already succeeded.
         Ok(c) if c.replayed && key.is_some() => Ok(Some(Ran::Replayed(c))),
         Ok(commit) => Ok(Some(Ran::Committed { out, commit })),
         Err(Error::Conflict(_)) if *attempt < node.cfg.txn_retries => {
@@ -706,6 +748,18 @@ macro_rules! watch {
 }
 pub(crate) use watch;
 
+/// Sets `Connection: close` if the handler returned without consuming the
+/// request body, avoiding reuse of a connection that hyper will close.
+async fn close_if_body_unread(req: Request, next: Next) -> Response {
+    let (parts, body) = req.into_parts();
+    let (body, consumed) = body::TrackedBody::new(body);
+    let mut resp = next.run(Request::from_parts(parts, Body::new(body))).await;
+    if !consumed.load(std::sync::atomic::Ordering::SeqCst) {
+        resp.headers_mut().insert(http::header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    resp
+}
+
 async fn healthz(State(node): State<Arc<Node>>) -> Response {
     if node.draining() {
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"ok": false, "draining": true}))).into_response();
@@ -742,6 +796,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .layer(middleware::from_fn_with_state(node.clone(), tag_client))
         .layer(DefaultBodyLimit::max(node.cfg.max_json_body))
         .layer(middleware::from_fn_with_state(node.clone(), request_context))
+        .layer(middleware::from_fn(close_if_body_unread))
         .with_state(node.clone());
     node.set_router(r.clone());
     r
@@ -763,6 +818,38 @@ pub(crate) fn paging(q: &Params) -> Result<(usize, Option<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
+
+    #[test]
+    fn unread_body_sets_connection_close() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            // Use constants so tests/openapi.rs does not treat these as public routes.
+            const IGNORE: &str = "/ignore";
+            const READ: &str = "/read";
+            const FIRST_FRAME: &str = "/first-frame";
+            let first_frame = |mut b: Body| async move {
+                use http_body_util::BodyExt;
+                let n = b.frame().await.and_then(|f| f.ok()?.into_data().ok()).map_or(0, |d| d.len());
+                assert!(http_body::Body::is_end_stream(&b));
+                n.to_string()
+            };
+            let app = Router::new()
+                .route(IGNORE, axum::routing::any(|| async { StatusCode::TOO_MANY_REQUESTS }))
+                .route(READ, axum::routing::post(|b: Bytes| async move { b.len().to_string() }))
+                .route(FIRST_FRAME, axum::routing::post(first_frame))
+                .layer(middleware::from_fn(close_if_body_unread));
+            let conn_header = |method: &str, path: &str, body: &'static str| {
+                let req = http::Request::builder().method(method).uri(path).body(Body::from(body)).unwrap();
+                let app = app.clone();
+                async move { app.oneshot(req).await.unwrap().headers().get(http::header::CONNECTION).cloned() }
+            };
+            assert_eq!(conn_header("POST", "/ignore", "unread").await, Some(HeaderValue::from_static("close")));
+            assert_eq!(conn_header("POST", "/read", "read").await, None);
+            assert_eq!(conn_header("POST", "/first-frame", "read").await, None);
+            assert_eq!(conn_header("GET", "/ignore", "").await, None);
+        });
+    }
 
     #[test]
     fn client_addresses_come_from_trusted_proxies_only() {

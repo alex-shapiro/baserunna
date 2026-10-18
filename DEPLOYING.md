@@ -63,6 +63,14 @@ a private advertise address and a cluster secret. Background work (garbage
 collection, TTL expiry, stream retention) runs only while the machine is
 up.
 
+Use a `performance` machine for sustained load. A `shared-cpu-1x` machine
+serves ~3,900 cached GETs/s until its CPU credits are exhausted after a few
+minutes, then drops to ~300 GETs/s.
+
+Each manifest commit takes ~75 ms (~13 sequential writes/s). Concurrent
+writes are batched into a single commit, reaching a few hundred writes/s per
+database.
+
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) deploys
 every push to `main`, building on Fly's remote builder. It needs a
 `FLY_API_TOKEN` repository secret (`fly tokens create deploy --app
@@ -220,16 +228,13 @@ S3 lifecycle configuration with the rule above:
 
 ## Limits
 
-Defaults suit a shared service; adjust them to your clients:
+Rate limits are enforced per node, so an N-node cluster allows up to N times the configured rate. Setting a limit to 0 disables it.
 
-| variable                                 | default | limits                                         |
-| ---------------------------------------- | ------- | ---------------------------------------------- |
-| `BASERUNNA_DB_MAX_MB`                    | 10240   | size of each database (segments and blobs)     |
-| `BASERUNNA_USER_RPS`                     | 500     | requests per second per user                   |
-| `BASERUNNA_API_KEY_RPS`                  | 500     | requests per second per API key (or its own)   |
-| `BASERUNNA_AUTH_RPS_PER_CLIENT`          | 1       | sign-ins and sign-ups per client address       |
-| `BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT`  | 20      | accounts created per client address            |
-| `BASERUNNA_HASH_CONCURRENCY`             | CPUs    | password hashes computed at once               |
-
-Rate limits are kept per node, so a cluster of N nodes admits up to N
-times each rate. 0 turns a limit off.
+| variable                                | default | limits                                       |
+| --------------------------------------- | ------- | -------------------------------------------- |
+| `BASERUNNA_DB_MAX_MB`                   | 10240   | size of each database (segments and blobs)   |
+| `BASERUNNA_USER_RPS`                    | 500     | requests per second per user                 |
+| `BASERUNNA_API_KEY_RPS`                 | 500     | requests per second per API key (or its own) |
+| `BASERUNNA_AUTH_RPS_PER_CLIENT`         | 1       | sign-ins and sign-ups per client address     |
+| `BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT` | 20      | accounts created per client address          |
+| `BASERUNNA_HASH_CONCURRENCY`            | CPUs    | password hashes computed at once             |

@@ -341,6 +341,18 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
 }
 
 #[test]
+fn object_class_from_key() {
+    assert_eq!(ObjectClass::from_key(&manifest_key("a1")), ObjectClass::Manifest);
+    assert_eq!(ObjectClass::from_key(&seg_key("a1", "0123")), ObjectClass::Segment);
+    assert_eq!(ObjectClass::from_key(&levels_key("a1", "0123")), ObjectClass::Levels);
+    assert_eq!(ObjectClass::from_key(&blob_chunk_key("a1", "b", 1)), ObjectClass::Blob);
+    assert_eq!(ObjectClass::from_key(&pin_key("a1", "b")), ObjectClass::Blob);
+    assert_eq!(ObjectClass::from_key(&seg_key("a1", "")), ObjectClass::Segment);
+    assert_eq!(ObjectClass::from_key("clock"), ObjectClass::Other);
+    assert_eq!(ObjectClass::from_key("dbs/a1"), ObjectClass::Other);
+}
+
+#[test]
 fn prop_engine_matches_model() {
     prop::check(
         "engine-model",
@@ -394,7 +406,7 @@ fn serializable_conflicts_and_snapshots() {
         let mut w = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         w.put(k.clone(), Value::Inline(Bytes::from_static(b"new"))).unwrap();
         db.commit(w.into_request()).await.unwrap();
-        let e = old.snapshot.get(b"k", old.read_time).await.unwrap().unwrap();
+        let e = old.snapshot().get(b"k", old.read_time).await.unwrap().unwrap();
         assert_eq!(e.value, Value::Inline(Bytes::from_static(b"a")));
 
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
@@ -499,7 +511,7 @@ pub(super) struct DelayStore {
     put_reply_ms: AtomicU64,
     manifest_put_conflicts: AtomicU32,
     manifest_put_outages: AtomicU32,
-    /// Manifest writes that apply, but whose reply is lost.
+    /// Manifest writes that are applied, but whose reply is lost.
     manifest_put_lost: AtomicU32,
     manifest_get_outages: AtomicU32,
     manifest_puts: AtomicU32,
@@ -690,7 +702,7 @@ fn obsolete_segments_outlive_snapshots_then_go() {
             }
         }
         let mut old = old.unwrap();
-        let old_segs: Vec<String> = old.snapshot.m.segments.iter().map(|s| s.id.clone()).collect();
+        let old_segs: Vec<String> = old.snapshot().m.segments.iter().map(|s| s.id.clone()).collect();
         tokio::time::sleep(Duration::from_millis(10)).await;
         let live: Vec<String> = db.current().unwrap().m.segments.iter().map(|s| s.id.clone()).collect();
         assert!(old_segs.iter().any(|s| !live.contains(s)), "setup: compaction replaced nothing");
@@ -1154,30 +1166,45 @@ fn foreign_leases_block_commits_until_they_expire() {
     });
 }
 
-#[test]
-fn a_lease_lost_after_an_ambiguous_write_leaves_the_outcome_unknown() {
+/// Node B commits a write whose response is delayed by `reply_delay_leases`
+/// lease durations while node A takes over the lease and commits its own write.
+fn commit_with_lost_reply_after_takeover(reply_delay_leases: u64) -> crate::error::Result<Seq> {
     rt().block_on(async {
-        let (b, store) = delayed_engine("b");
-        let db = opened(&b, "d").await;
-        put(&db, "k", "b").await;
-        let a = second_node(&b, &store, "a");
-        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let (node_b, store) = delayed_engine("b");
+        let db_b = opened(&node_b, "d").await;
+        put(&db_b, "k", "b").await;
+        let node_a = second_node(&node_b, &store, "a");
+        let mut t = db_b.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         t.put(Bytes::from_static(b"k"), inline("lost")).unwrap();
-        // The write lands at once; its reply comes after the lease it renews ran out, and is lost.
-        let lease = b.shared.cfg.lease_ms + b.shared.cfg.lease_margin_ms;
+        let lease_ms = node_b.shared.cfg.lease_ms + node_b.shared.cfg.lease_margin_ms;
         store.manifest_put_lost.store(1, SeqCst);
-        store.put_reply_ms.store(3 * lease, SeqCst);
-        let commit = tokio::spawn(async move { db.commit(t.into_request()).await });
+        store.put_reply_ms.store(reply_delay_leases * lease_ms, SeqCst);
+        let commit = tokio::spawn(async move { db_b.commit(t.into_request()).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
         store.put_reply_ms.store(0, SeqCst);
-        let other = opened(&a, "d").await;
-        tokio::time::sleep(Duration::from_millis(lease + 100)).await;
-        put(&other, "k", "a").await;
-        match commit.await.unwrap() {
-            Err(Error::Unavailable { outcome_unknown: true, .. }) => {}
-            other => panic!("the write landed, so its outcome is unknown, not {other:?}"),
-        }
-    });
+        let db_a = opened(&node_a, "d").await;
+        tokio::time::sleep(Duration::from_millis(lease_ms + 100)).await;
+        put(&db_a, "k", "a").await;
+        commit.await.unwrap()
+    })
+}
+
+#[test]
+fn ambiguous_commit_during_active_lease() {
+    // Node B retries while node A's lease is still active.
+    match commit_with_lost_reply_after_takeover(2) {
+        Err(Error::Unavailable { outcome_unknown: true, .. }) => {}
+        other => panic!("expected unknown outcome for applied write, got {other:?}"),
+    }
+}
+
+#[test]
+fn ambiguous_commit_after_lease_expires() {
+    // Node B retries after the store clock shows node A's lease has expired.
+    match commit_with_lost_reply_after_takeover(4) {
+        Ok(2) => {}
+        other => panic!("expected write to resolve at version 2, got {other:?}"),
+    }
 }
 
 #[test]

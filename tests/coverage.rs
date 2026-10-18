@@ -32,6 +32,7 @@ fn simulation_exercises_every_documented_operation_and_engine_path() {
         expired_leases,
         optimistic_begins,
         optimistic_reruns,
+        manifest_puts_hedged,
     } = engine;
     for (path, n) in [
         ("range tombstones written", range_tombstones_written),
@@ -48,6 +49,7 @@ fn simulation_exercises_every_documented_operation_and_engine_path() {
         ("leases expired according to the store clock", expired_leases),
         ("optimistic transactions begun during an in-flight commit", optimistic_begins),
         ("optimistic transactions rerun after revalidation", optimistic_reruns),
+        ("manifest writes hedged after a slow store response", manifest_puts_hedged),
     ] {
         assert!(n > 0, "the simulator never exercised: {path} ({engine:?})");
     }

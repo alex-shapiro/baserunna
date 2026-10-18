@@ -352,10 +352,15 @@ clock                                every node's store-clock probe (§5.8)
 
 ### 5.2 Manifest
 
-The manifest is a binary, CRC32C-checksummed document (`engine/manifest.rs`):
+The manifest is a binary, CRC32C-checksummed document (`engine/manifest.rs`).
+After its magic and format comes a codec byte: the rest of the body is
+stored raw, or compressed with zstd (level 1) when that saves at least an
+eighth. Every commit uploads the whole manifest, tail included, so its size
+sets commit latency: on Tigris a 200 KB tail of text-like values took the
+median commit from 54 ms to 123 ms before compression.
 
 ```
-magic "BRMF", format u16
+magic "BRMF", format u16, codec u8
 db_id
 version: u64                                          data version = seq of the last commit
 write_seq: u64                                        incremented by every manifest write
@@ -480,7 +485,7 @@ Each open database has a per-node commit queue drained by a single committer tas
 
 While a manifest `PUT` is in flight, strong reads on the committing node wait for that `PUT` to finish, since another node may already observe the new manifest in object storage. A read waits only for the `PUT` that was in flight when the read arrived, so back-to-back commits cannot starve readers.
 
-Single-request serializable transactions begin immediately on the node's latest cached version without waiting for an in-flight manifest `PUT`, so concurrent writes are batched into the next commit. If the transaction writes, commit validation checks its read set against the in-flight commit. If the transaction is read-only or fails before committing, the node waits for the in-flight `PUT` to finish, validates the read set against a strong snapshot, and re-executes the transaction on conflict. Interactive and snapshot-isolation transactions always wait for a strong snapshot before starting.
+Single-request serializable transactions begin immediately on the node's latest cached version without waiting for an in-flight manifest `PUT`, so concurrent writes are batched into the next commit. If the transaction writes, commit validation checks its read set against the in-flight commit. If the transaction is read-only or fails before committing, the node waits for the in-flight `PUT` to finish, validates the read set against a strong snapshot, and re-executes the transaction on conflict. Interactive serializable transactions begin the same way; their reads are already returned, so a read-only commit that fails this validation answers `409 conflict` instead of re-executing. Snapshot-isolation transactions wait for a strong snapshot before starting.
 
 #### Range Deletes
 
@@ -498,6 +503,18 @@ If a conditional `PUT` on the manifest does not succeed on the first attempt:
 
 - On `412 Precondition Failed`, another node updated the manifest. The committer reloads the manifest. If another node now holds a valid lease, the batch fails with `not_owner`; otherwise the committer re-runs validation and applies the batch against the new `base`.
 - On a timeout or network error, it is unknown whether the `PUT` landed. The committer reloads the manifest and retries against the new `base`. If the earlier `PUT` succeeded, step 4 finds the batch's commit records in the reloaded manifest and returns their committed versions without re-applying the writes. If a delayed copy of the first `PUT` is still in flight, it carries the same `If-Match` etag as the retry so at most one can succeed. After exhausting retries, the committer returns `503 unavailable` with `outcome: "unknown"`, which the client can resolve via `GET /commits/{id}` or by retrying with the same idempotency key.
+
+#### Hedged Manifest Writes
+
+A store occasionally holds a write's response for seconds after applying it.
+If the manifest `PUT` has not answered within `manifest_put_hedge_ms` (250
+ms), the committer sends an identical second `PUT` with the same
+`If-Match`, so at most one of the two can apply. The first success decides
+the attempt. A refusal of either copy is treated like a timeout: the other
+copy may have applied, so the committer reloads the manifest and finds its
+commit records as above, without waiting for the slow copy. Objects the
+attempt would have deleted from `obsolete` are deleted in either case:
+they were past their grace period when the attempt was planned.
 
 #### Commit Records
 
@@ -745,7 +762,12 @@ Simulated benchmarks (`sim::amp`) measure segment and chunk bytes written per re
    may have applied the write that now makes the check fail. Conflicts are
    retried server-side.
 2. **Interactive** (`/v1/dbs/{db}/transactions…`): begin, ops, commit,
-   abort. Transaction state is stored on a database's owner node. If the
+   abort. `begin` and `commit` also take ops, so a client reads in its
+   first request and writes in its second. Reads are guaranteed once the
+   transaction commits: a serializable transaction may begin on a snapshot
+   that a commit in flight is replacing, and its commit then fails with a
+   retryable `409 conflict`. A client that acts on reads without writing
+   commits the read-only transaction to validate them. Transaction state is stored on a database's owner node. If the
    owner changes or crashes, the transaction is lost (`404 txn_not_found`)
    with no data committed. `begin` returns the transaction's `commit_id` up
    front, and `commit` the seqs its appends received.
@@ -847,7 +869,10 @@ its `version`.
   hour (about $0.15 a month).
 - **Routing**: for a request on DB `d`, the target is the lease holder if a
   valid lease is known, otherwise the live node maximizing
-  `hash(node_id ‖ d)` (rendezvous hashing). If the target is another node, the
+  `hash(node_id ‖ d)` (rendezvous hashing). A member at the node's own address
+  is an earlier run of that node and is never a target: after a crash, the
+  restarted node serves those requests itself, and writes wait out the
+  earlier run's leases. If the target is another node, the
   request is proxied, streaming large bodies, with `x-baserunna-hops`
   incremented; a request already forwarded twice is handled where it is. If
   forwarding certainly failed (the request never left), the receiving node
@@ -1006,8 +1031,9 @@ resurrect a purged database.
 - **API keys**: `brk_<id>_<secret>`. Only the secret's SHA-256 is stored. A
   key can be scoped to one DB and/or read-only. It is shown once at creation.
 - **Rate limits** (`limits.rs`): token buckets, kept per node, so a cluster
-  of N nodes admits up to N times each rate. Every authenticated request
-  takes a token from its user's bucket (500/s, burst twice that) and, for
+  of N nodes admits up to N times each rate. Every authenticated request,
+  except committing or aborting an interactive transaction (its `begin` was
+  counted), takes a token from its user's bucket (500/s, burst twice that) and, for
   an API key, from the key's (500/s, or the `rate_limit` the key was
   created with); both or neither. Sign-ins, sign-ups and Google sign-in
   take from their client address's bucket (1/s, burst 20), and sign-ups
@@ -1133,6 +1159,7 @@ POST /v1/dbs/{db}/streams/{s}/trim before_seq
 GET /v1/dbs/{db}/streams/{s}/consumers limit, cursor
 GET|PUT|DELETE /v1/dbs/{db}/streams/{s}/consumers/{c}
 GET /v1/admin/users GET /v1/admin/nodes POST /v1/admin/users/{id}/disable
+GET /v1/admin/metrics latency histograms of the serving node (?reset=true clears them)
 ```
 
 Listings take `limit` and `cursor` and answer `next_cursor` (§8).
@@ -1220,6 +1247,7 @@ content security policy.
 | `BASERUNNA_DISK_CACHE_DIR`               | none                            | directory of the local tier (§5.3); off if unset             |
 | `BASERUNNA_DISK_CACHE_MB`                | 10240                           | local tier budget                                            |
 | `BASERUNNA_LEASE_MS`                     | 5000                            | lease renewed by commits; leases renewed for reads last 3×   |
+| `BASERUNNA_PUT_HEDGE_MS`                 | 250                             | resend a manifest write unanswered this long (§5.5); 0 off   |
 | `BASERUNNA_DB_MAX_MB`                    | 10240                           | size quota of each database (§5.10); 0 for none              |
 | `BASERUNNA_USER_RPS`                     | 500                             | requests per second per user, per node; 0 for no limit       |
 | `BASERUNNA_API_KEY_RPS`                  | 500                             | requests per second per API key without its own `rate_limit` |
@@ -1244,10 +1272,21 @@ thread; if stderr falls behind, excess lines are dropped with a warning. At
 which may contain user keys), `status`, `ms`, `hops`, `forwarded_to` (when
 forwarded to another node), and latency breakdowns for object-store calls
 (`store`, `store_ms`), commit waits (`commits`, `commit_ms`), and in-flight
-manifest waits (`read_wait_ms`). Each commit batch that writes a manifest
-logs a `msg: "commit"` event with queue wait (`queued_ms`), batch build time
-(`build_ms`), store calls (`store`), and participating `request_ids`. The
-mail webhook receives `{"from", "to", "subject", "text"}`.
+manifest waits (`read_wait_ms`). Every response also carries these totals in
+a `Server-Timing` header (`total`, `store` with the call count, `commit`,
+`wait`, in ms), so clients can tell server time from network time. Each
+commit batch that writes a manifest logs a `msg: "commit"` event with queue
+wait (`queued_ms`), batch build time (`build_ms`), store calls (`store`), and
+participating `request_ids`. The mail webhook receives `{"from", "to",
+"subject", "text"}`.
+
+`GET /v1/admin/metrics` returns the serving node's latency histograms since
+it started or was last reset: object-store calls by object class and
+operation, with error counts; commit batches that wrote a manifest, with
+transactions per batch; requests by method and route; and how late a
+periodic 100 ms timer fires, which shows when the node had work it could not
+run. It also reports cumulative process CPU and host steal time where `/proc`
+provides them. Quantiles are accurate to 25%.
 
 On SIGTERM or SIGINT a node drains (failing `/healthz`), stops accepting
 connections, waits for in-flight requests, then releases its leases and
@@ -1563,6 +1602,29 @@ Bugs the DST suite found, each now covered by the regular suite:
     to append again. The answer now carries `retention_ms`, past which it
     is not definitive (§6.2), and the workload resolves such appends from
     the records it reads.
+
+25. _Garbage kept by ambiguous writes._ A commit batch deletes the
+    obsolete objects it drops from the manifest only after its write
+    succeeds. When the write timed out but had landed, the retry found the
+    batch applied, and the objects were left in storage until the next
+    orphan sweep. Hedged manifest writes made this common. Such objects are
+    now deleted whatever the write's outcome, as they are past their grace
+    period either way (§5.5).
+
+26. _Restarted nodes forwarding to themselves._ Found by load testing a
+    deployment. A node killed and restarted at the same address saw its
+    earlier run as a live member, holding leases and owning databases by
+    rendezvous hashing. It forwarded their requests to that address, reached
+    itself, and refused them as addressed to a node no longer running: for
+    the leases' lifetime, and up to the membership's 6-minute liveness
+    window for databases hashed to the earlier run.
+
+One campaign failure came from the simulator itself: a forward the
+network had duplicated, whose original copy then met a crashed target, was
+reported as certainly undelivered. The receiving node fell back to serving
+it locally and answered `404 txn_not_found` for a commit whose duplicate had
+applied. A refused copy now counts as possibly delivered once a duplicate
+was sent, as a real transport that resends knows it did.
 
 The cost measurements (§13.4) found five more: a read-heavy database whose
 lease had lapsed never acquired it again (paying a validating GET per read

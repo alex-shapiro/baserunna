@@ -397,12 +397,14 @@ impl Node {
         lock(&self.members).clone()
     }
 
-    /// Returns non-suspect cluster members with a recent heartbeat.
+    /// Returns non-suspect cluster members with a recent heartbeat. A
+    /// member at this node's own address is an earlier run of this node,
+    /// which can no longer be reached there.
     pub fn live_members(&self) -> Vec<NodeRecord> {
         let now = self.now_ms() as i64;
         cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
             .into_iter()
-            .filter(|n| n.id == self.id || !self.is_suspect(&n.id))
+            .filter(|n| n.id == self.id || (!self.is_suspect(&n.id) && n.addr != self.cfg.addr))
             .collect()
     }
 
@@ -469,6 +471,11 @@ impl Node {
             return None;
         }
         let addr = self.addr_of(&target)?;
+        // A lease held by an earlier run of this node: writes wait for it to
+        // expire, but forwarding would only reach this node again.
+        if addr == self.cfg.addr {
+            return None;
+        }
         Some((target, addr))
     }
 
@@ -598,7 +605,15 @@ impl Node {
 
     /// Authenticates a bearer token or session cookie value and checks rate limits.
     pub async fn authenticate(&self, token: &str) -> Result<Principal> {
+        self.authenticate_metered(token, true).await
+    }
+
+    /// [`Node::authenticate`], taking a rate-limit token only if `metered`.
+    pub async fn authenticate_metered(&self, token: &str, metered: bool) -> Result<Principal> {
         let p = self.principal(token).await?;
+        if !metered {
+            return Ok(p);
+        }
         let user_key = format!("user:{}", p.user.id);
         let lim = &self.cfg.limits;
         match &p.cred {
@@ -1250,6 +1265,29 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(n.cfg.limits.hash_wait_ms / 2)).await;
             drop(held);
             assert!(waiting.await.unwrap().unwrap().starts_with("pbkdf2-sha256$"), "a slot freed in time");
+        });
+    }
+
+    #[test]
+    fn earlier_runs_at_this_address_are_not_routed_to() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let a = w.node(0).clone();
+            let ghost = super::NodeRecord {
+                id: "earlier-run".into(),
+                addr: a.cfg.addr.clone(),
+                started_at: 1,
+                heartbeat_at: a.now_ms() as i64,
+            };
+            a.run_meta(super::MetaCmd::Heartbeat { node: ghost.clone(), dead_after_ms: 3_600_000 }).await.unwrap();
+            a.refresh_members().await.unwrap();
+            assert!(a.members().iter().any(|m| m.id == ghost.id), "setup: the earlier run looks live");
+            assert!(a.live_members().iter().all(|m| m.id != ghost.id));
+            let both = [a.members().into_iter().find(|m| m.id == a.id).unwrap(), ghost];
+            let homed = (0..)
+                .map(|i| format!("db{i}"))
+                .find(|d| super::cluster::rendezvous(d, &both).unwrap().id == "earlier-run");
+            assert_eq!(a.route(&homed.unwrap()).await, None, "served here, not forwarded to itself");
         });
     }
 

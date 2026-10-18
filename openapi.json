@@ -133,6 +133,12 @@
           "read_version": {
             "type": "integer"
           },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/OpResult"
+            },
+            "type": "array"
+          },
           "txn_id": {
             "type": "string"
           }
@@ -142,12 +148,14 @@
           "commit_id",
           "read_version",
           "expires_at",
-          "idle_timeout_ms"
+          "idle_timeout_ms",
+          "results"
         ],
         "type": "object"
       },
       "BeginRequest": {
         "additionalProperties": false,
+        "description": "`ops` run in the new transaction before it is returned.",
         "properties": {
           "encoding": {
             "enum": [
@@ -162,6 +170,12 @@
               "snapshot"
             ],
             "type": "string"
+          },
+          "ops": {
+            "items": {
+              "$ref": "#/components/schemas/Op"
+            },
+            "type": "array"
           }
         },
         "required": [],
@@ -224,6 +238,20 @@
         ],
         "type": "string"
       },
+      "CommitRequest": {
+        "additionalProperties": false,
+        "description": "`ops` run in the transaction just before it commits.",
+        "properties": {
+          "ops": {
+            "items": {
+              "$ref": "#/components/schemas/Op"
+            },
+            "type": "array"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
       "CommitStatus": {
         "additionalProperties": false,
         "properties": {
@@ -267,6 +295,12 @@
           },
           "commit_id": {
             "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/OpResult"
+            },
+            "type": "array"
           },
           "version": {
             "type": "integer"
@@ -1046,6 +1080,38 @@
           "email",
           "role",
           "added_at"
+        ],
+        "type": "object"
+      },
+      "Metrics": {
+        "additionalProperties": false,
+        "properties": {
+          "commits": {
+            "type": "object"
+          },
+          "cpu": {
+            "type": "object"
+          },
+          "lag": {
+            "type": "object"
+          },
+          "node": {
+            "type": "string"
+          },
+          "routes": {
+            "type": "object"
+          },
+          "store": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "node",
+          "store",
+          "commits",
+          "routes",
+          "lag",
+          "cpu"
         ],
         "type": "object"
       },
@@ -2684,6 +2750,41 @@
         "summary": "Liveness and node status",
         "tags": [
           "ops"
+        ]
+      }
+    },
+    "/v1/admin/metrics": {
+      "get": {
+        "description": "Latency histograms of this node since it started or was last reset: object-store calls by object class and operation, commit batches that wrote a manifest, requests by route, and how late a periodic timer fires (`lag`). `cpu` holds cumulative process CPU and host steal time in ms where the OS reports them. Quantiles are accurate to 25%.",
+        "parameters": [
+          {
+            "description": "Clear the histograms after reading them.",
+            "in": "query",
+            "name": "reset",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Metrics"
+                }
+              }
+            },
+            "description": "Metrics"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Latency metrics of the serving node (admin)",
+        "tags": [
+          "admin"
         ]
       }
     },
@@ -6011,6 +6112,7 @@
     },
     "/v1/dbs/{db}/transactions/{id}/commit": {
       "post": {
+        "description": "Any error in `ops` aborts the transaction.",
         "parameters": [
           {
             "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
@@ -6031,6 +6133,16 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommitRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {

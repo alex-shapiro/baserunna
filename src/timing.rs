@@ -6,6 +6,7 @@
 //! is not attributed to the caller's tally.
 
 use crate::engine::ObjectClass;
+use crate::metrics::Metrics;
 use crate::store::{BoxFut, DynStore, GetOpts, GetResult, ListPage, ObjectStore, PutMode, SResult, StoreError};
 use bytes::Bytes;
 use serde_json::{Map, Value as Json, json};
@@ -24,9 +25,9 @@ pub enum StoreOp {
 }
 
 impl StoreOp {
-    const ALL: [StoreOp; 4] = [StoreOp::Get, StoreOp::Put, StoreOp::List, StoreOp::Delete];
+    pub const ALL: [StoreOp; 4] = [StoreOp::Get, StoreOp::Put, StoreOp::List, StoreOp::Delete];
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             StoreOp::Get => "get",
             StoreOp::Put => "put",
@@ -105,6 +106,26 @@ impl Tally {
         to_ms(self.read_wait_us.load(Relaxed))
     }
 
+    /// A `Server-Timing` header value for a request that took `total`: its store calls (`store`, with
+    /// their count), commit waits (`commit`) and in-flight manifest write waits (`wait`), in ms.
+    pub fn server_timing(&self, total: Duration) -> String {
+        let ms = |us: u64| us as f64 / 1000.0;
+        let calls: u64 = self.store.iter().flatten().map(|s| s.count.load(Relaxed)).sum();
+        let store_us: u64 = self.store.iter().flatten().map(|s| s.micros.load(Relaxed)).sum();
+        let mut v = format!("total;dur={:.1}", ms(to_micros(total)));
+        if calls > 0 {
+            v += &format!(", store;dur={:.1};desc={calls}", ms(store_us));
+        }
+        if self.commits.load(Relaxed) > 0 {
+            v += &format!(", commit;dur={:.1}", ms(self.commit_us.load(Relaxed)));
+        }
+        let wait = self.read_wait_us.load(Relaxed);
+        if wait > 0 {
+            v += &format!(", wait;dur={:.1}", ms(wait));
+        }
+        v
+    }
+
     /// Milliseconds spent building commit batches, including segment flushes.
     pub fn build_ms(&self) -> u64 {
         to_ms(self.build_us.load(Relaxed))
@@ -147,29 +168,38 @@ pub fn record_build_time(d: Duration) {
     });
 }
 
-fn record_store_call<T>(class: ObjectClass, op: StoreOp, started: Instant, bytes: u64, res: &SResult<T>) {
-    let elapsed = started.elapsed();
-    with_current(|t| {
-        let s = t.stats(class, op);
-        s.count.fetch_add(1, Relaxed);
-        s.micros.fetch_add(to_micros(elapsed), Relaxed);
-        s.bytes.fetch_add(bytes, Relaxed);
-        if matches!(res, Err(e) if !matches!(e, StoreError::NotFound | StoreError::NotModified)) {
-            s.errors.fetch_add(1, Relaxed);
-        }
-    });
+/// Object-store wrapper that records each operation in the task-local [`Tally`] and in the
+/// node's [`Metrics`].
+pub struct TimedStore {
+    pub inner: DynStore,
+    pub metrics: Arc<Metrics>,
 }
 
-/// Object-store wrapper that records each operation in the task-local [`Tally`].
-pub struct TimedStore(pub DynStore);
+impl TimedStore {
+    fn record<T>(&self, key: &str, op: StoreOp, started: Instant, bytes: u64, res: &SResult<T>) {
+        let class = ObjectClass::from_key(key);
+        let elapsed = started.elapsed();
+        let failed = matches!(res, Err(e) if !matches!(e, StoreError::NotFound | StoreError::NotModified));
+        self.metrics.store_call(class, op, elapsed, failed);
+        with_current(|t| {
+            let s = t.stats(class, op);
+            s.count.fetch_add(1, Relaxed);
+            s.micros.fetch_add(to_micros(elapsed), Relaxed);
+            s.bytes.fetch_add(bytes, Relaxed);
+            if failed {
+                s.errors.fetch_add(1, Relaxed);
+            }
+        });
+    }
+}
 
 impl ObjectStore for TimedStore {
     fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
         Box::pin(async move {
             let started = Instant::now();
-            let res = self.0.get(key, opts).await;
+            let res = self.inner.get(key, opts).await;
             let bytes = res.as_ref().map_or(0, |g| g.data.len() as u64);
-            record_store_call(ObjectClass::from_key(key), StoreOp::Get, started, bytes, &res);
+            self.record(key, StoreOp::Get, started, bytes, &res);
             res
         })
     }
@@ -178,8 +208,8 @@ impl ObjectStore for TimedStore {
         Box::pin(async move {
             let started = Instant::now();
             let bytes = data.len() as u64;
-            let res = self.0.put(key, data, mode).await;
-            record_store_call(ObjectClass::from_key(key), StoreOp::Put, started, bytes, &res);
+            let res = self.inner.put(key, data, mode).await;
+            self.record(key, StoreOp::Put, started, bytes, &res);
             res
         })
     }
@@ -187,8 +217,8 @@ impl ObjectStore for TimedStore {
     fn delete<'a>(&'a self, key: &'a str) -> BoxFut<'a, SResult<()>> {
         Box::pin(async move {
             let started = Instant::now();
-            let res = self.0.delete(key).await;
-            record_store_call(ObjectClass::from_key(key), StoreOp::Delete, started, 0, &res);
+            let res = self.inner.delete(key).await;
+            self.record(key, StoreOp::Delete, started, 0, &res);
             res
         })
     }
@@ -201,14 +231,14 @@ impl ObjectStore for TimedStore {
     ) -> BoxFut<'a, SResult<ListPage>> {
         Box::pin(async move {
             let started = Instant::now();
-            let res = self.0.list(prefix, start_after, limit).await;
-            record_store_call(ObjectClass::from_key(prefix), StoreOp::List, started, 0, &res);
+            let res = self.inner.list(prefix, start_after, limit).await;
+            self.record(prefix, StoreOp::List, started, 0, &res);
             res
         })
     }
 
     fn time_precision_ms(&self) -> u64 {
-        self.0.time_precision_ms()
+        self.inner.time_precision_ms()
     }
 }
 
@@ -221,7 +251,7 @@ mod tests {
     fn tally_scoping() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
         rt.block_on(async {
-            let store = TimedStore(Arc::new(MemStore::with_system_clock()));
+            let store = TimedStore { inner: Arc::new(MemStore::with_system_clock()), metrics: Arc::default() };
             let tally = Arc::new(Tally::default());
             scoped(tally.clone(), async {
                 store.put("dbs/a/manifest", Bytes::from_static(b"abc"), PutMode::Create).await.unwrap();

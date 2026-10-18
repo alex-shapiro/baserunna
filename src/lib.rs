@@ -18,6 +18,7 @@ pub mod limits;
 pub mod log;
 pub mod mail;
 pub mod meta;
+pub mod metrics;
 pub mod node;
 pub mod ops;
 pub mod sim;

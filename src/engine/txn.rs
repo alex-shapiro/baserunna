@@ -189,7 +189,7 @@ impl Txn {
         self.optimistic = true;
     }
 
-    pub(crate) fn has_untracked_reads(&self) -> bool {
+    pub fn has_untracked_reads(&self) -> bool {
         self.has_untracked_reads
     }
 

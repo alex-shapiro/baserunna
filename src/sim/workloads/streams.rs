@@ -998,14 +998,23 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     if sorted != cas_log {
         return Err(format!("appends expecting seqs won {sorted:?}, the stream holds {cas_log:?}"));
     }
-    let info = c.call_retry("GET", &format!("{DB}/streams/ret"), None).await;
-    let bytes = info.json["bytes"].as_u64().unwrap_or(u64::MAX);
-    let first_time = info.json["first_time"].as_u64().unwrap_or(0);
+    // The checker's append calls for a trim; store stalls under faults can
+    // delay it past any fixed pause, so wait for it with a deadline.
     let eps = 2 * sim.cfg.engine.clock_sync_max_error_ms;
     let due = crate::engine::Retention { retention_ms: Some(RET_MS), max_bytes: Some(RET_BYTES) }.due_at();
     let (due_ms, due_bytes) = (due.retention_ms.unwrap_or(RET_MS), due.max_bytes.unwrap_or(RET_BYTES));
-    if bytes > due_bytes || first_time + due_ms + 5_000 + eps < c.sim.now_ms() {
-        return Err(format!("ret is past its retention: {}", info.json));
+    let deadline = c.sim.now_ms() + 60_000;
+    loop {
+        let info = c.call_retry("GET", &format!("{DB}/streams/ret"), None).await;
+        let bytes = info.json["bytes"].as_u64().unwrap_or(u64::MAX);
+        let first_time = info.json["first_time"].as_u64().unwrap_or(0);
+        if bytes <= due_bytes && first_time + due_ms + 5_000 + eps >= c.sim.now_ms() {
+            break;
+        }
+        if c.sim.now_ms() > deadline {
+            return Err(format!("ret is past its retention: {}", info.json));
+        }
+        c.pause(1_000).await;
     }
     let n = c.call_retry("GET", &format!("{DB}/kv/proc%2Fcount"), None).await;
     let processed: u64 = String::from_utf8_lossy(&n.raw.body).parse().unwrap_or(0);

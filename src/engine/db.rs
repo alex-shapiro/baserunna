@@ -677,9 +677,15 @@ impl Db {
             self.shared.counters.add(&super::Activity { optimistic_reruns: 1, ..Default::default() });
             return Ok(None);
         }
+        self.validate_strong(&t.into_request()).await
+    }
+
+    /// Waits for a strong snapshot and validates `req`'s read set against
+    /// it, as [`Db::revalidate`] does for a transaction without untracked
+    /// reads, leaving `req` to be committed.
+    pub async fn validate_strong(self: &Arc<Self>, req: &CommitRequest) -> Result<Option<Seq>> {
         let snap = self.snapshot(Consistency::Strong).await?;
-        let req = t.into_request();
-        match validate(&req, &snap.version, &[], &[], snap.time_ms).await {
+        match validate(req, &snap.version, &[], &[], snap.time_ms).await {
             Ok(()) => Ok(Some(snap.version.m.version)),
             Err(Error::Conflict(_)) => {
                 self.shared.counters.add(&super::Activity { optimistic_reruns: 1, ..Default::default() });
@@ -818,6 +824,9 @@ impl Db {
                 queued.into_iter().map(|q| ((q.enqueued_at, q.request_id), q.work)).unzip();
             let txn_count = batch.iter().filter(|w| matches!(w, Work::Commit { .. })).count();
             timing::scoped(tally.clone(), self.process(batch)).await;
+            if tally.store_calls(super::ObjectClass::Manifest, StoreOp::Put) > 0 {
+                self.shared.metrics.commit_batch(started.elapsed(), txn_count);
+            }
             self.log_batch(&enqueued, txn_count, started, &tally);
         }
     }
@@ -918,8 +927,7 @@ impl Db {
             };
             let started = Instant::now();
             self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let res =
-                self.shared.store.put(&manifest_key(&self.id), m.encode(), PutMode::IfMatch(base.etag.clone())).await;
+            let res = self.put_manifest(m.encode(), &base.etag).await;
             if !res.is_ok() {
                 // Success clears the flag after installing (below).
                 if matches!(res, Err(StoreError::Unavailable(_))) {
@@ -952,6 +960,11 @@ impl Db {
                 Err(StoreError::Unavailable(_)) => {
                     maybe_applied = true;
                     self.st().trusted = false;
+                    // If this write applied, it dropped these objects from
+                    // `obsolete`, and no later write would delete them. They
+                    // are past their grace period, so deleting them is safe
+                    // either way.
+                    self.delete_obsolete(plan.gc);
                 }
                 Err(e) => {
                     let e: Error = e.into();
@@ -988,6 +1001,41 @@ impl Db {
                     }
                 }
             }
+        }
+    }
+
+    /// Writes the manifest if its etag is still `etag`. When the store has
+    /// not answered within `manifest_put_hedge_ms`, a second copy is sent;
+    /// both carry the same precondition, so at most one applies. A refused
+    /// copy is reported as ambiguous, at once if the other is still
+    /// unanswered, and the caller learns the outcome from the commit records
+    /// of the manifest it reloads.
+    async fn put_manifest(&self, data: Bytes, etag: &str) -> crate::store::SResult<String> {
+        let key = manifest_key(&self.id);
+        let put = || self.shared.store.put(&key, data.clone(), PutMode::IfMatch(etag.to_string()));
+        let hedge_ms = self.shared.cfg.manifest_put_hedge_ms;
+        let first = put();
+        if hedge_ms == 0 {
+            return first.await;
+        }
+        let first = match race(first, Box::pin(tokio::time::sleep(Duration::from_millis(hedge_ms)))).await {
+            Either::Left((r, _)) => return r,
+            Either::Right(((), first)) => first,
+        };
+        self.shared.counters.add(&super::Activity { manifest_puts_hedged: 1, ..Default::default() });
+        // With two copies sent, a refusal of either may be due to the other
+        // having applied, so every refusal is reported as ambiguous.
+        let ambiguous = |r: crate::store::SResult<String>| match r {
+            Err(StoreError::PreconditionFailed) => {
+                Err(StoreError::Unavailable("hedged manifest write refused; the other copy may have applied".into()))
+            }
+            other => other,
+        };
+        match race(first, put()).await {
+            Either::Left((Ok(etag), _)) | Either::Right((Ok(etag), _)) => Ok(etag),
+            Either::Right((Err(StoreError::PreconditionFailed), _)) => ambiguous(Err(StoreError::PreconditionFailed)),
+            Either::Left((Err(_), hedge)) => ambiguous(hedge.await),
+            Either::Right((Err(_), first)) => ambiguous(first.await),
         }
     }
 
@@ -1389,19 +1437,25 @@ impl Db {
         Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, activity, due })
     }
 
+    /// Deletes obsolete objects past their grace period, in the background.
+    fn delete_obsolete(&self, gc: Vec<Obsolete>) {
+        if gc.is_empty() {
+            return;
+        }
+        let shared = self.shared.clone();
+        let db = self.id.clone();
+        self.shared.env.spawn(async move {
+            for o in gc {
+                if let Err(e) = delete_object(&shared, &db, &o).await {
+                    crate::warn!("gc delete {}/{} failed: {e}", db, o.id);
+                }
+            }
+        });
+    }
+
     fn after_commit(self: &Arc<Self>, v: &Arc<Version>, gc: Vec<Obsolete>, due: BTreeSet<u64>) {
         let cfg = &self.shared.cfg;
-        if !gc.is_empty() {
-            let shared = self.shared.clone();
-            let db = self.id.clone();
-            self.shared.env.spawn(async move {
-                for o in gc {
-                    if let Err(e) = delete_object(&shared, &db, &o).await {
-                        crate::warn!("gc delete {}/{} failed: {e}", db, o.id);
-                    }
-                }
-            });
-        }
+        self.delete_obsolete(gc);
         self.shared.refresh_clock();
         {
             let mut st = self.st();
@@ -2029,5 +2083,30 @@ mod tests {
                 p.manifest.unwrap().obsolete.iter().map(|o| (o.kind, o.id.chars().next().unwrap())).collect();
             assert_eq!(got, [(seg, 'b'), (blob, 'd'), (seg, 'c'), (blob, 'a')]);
         });
+    }
+}
+
+enum Either<A, B> {
+    Left(A),
+    Right(B),
+}
+
+/// Runs `a` and `b` together and returns whichever finishes first, with
+/// the other, still unfinished. Polls `a` first, so ties are deterministic.
+async fn race<A: Future + Unpin, B: Future + Unpin>(mut a: A, mut b: B) -> Either<(A::Output, B), (B::Output, A)> {
+    use std::task::Poll;
+    let out = std::future::poll_fn(|cx| {
+        if let Poll::Ready(x) = std::pin::Pin::new(&mut a).poll(cx) {
+            return Poll::Ready(Either::Left(x));
+        }
+        if let Poll::Ready(y) = std::pin::Pin::new(&mut b).poll(cx) {
+            return Poll::Ready(Either::Right(y));
+        }
+        Poll::Pending
+    })
+    .await;
+    match out {
+        Either::Left(x) => Either::Left((x, b)),
+        Either::Right(y) => Either::Right((y, a)),
     }
 }

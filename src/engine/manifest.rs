@@ -16,7 +16,14 @@ const MAGIC: &[u8; 4] = b"BRMF";
 
 /// The database was deleted: every read and commit fails with not-found.
 pub const FLAG_DELETED: u64 = 1;
-const FORMAT: u16 = 5;
+/// A codec byte follows the format: the body is raw or zstd-compressed.
+/// Format 5 manifests have no codec byte and a raw body.
+const FORMAT: u16 = 6;
+const FORMAT_RAW: u16 = 5;
+/// zstd level for manifest bodies: commits wait on it, so it favors speed.
+const ZSTD_LEVEL: i32 = 1;
+/// Largest manifest body a decoder inflates, so a corrupt length cannot exhaust memory.
+const MAX_BODY: u64 = 64 << 20;
 const LEVELS_MAGIC: &[u8; 4] = b"BRLV";
 const LEVELS_FORMAT: u16 = 2;
 
@@ -193,10 +200,32 @@ impl Manifest {
         segments + tail as u64 + self.blob_bytes.total() + self.chunk_bytes.total()
     }
 
+    /// Encodes the manifest, compressing its body when that saves at least
+    /// an eighth, as for segment blocks. Every commit uploads the whole
+    /// manifest, tail included, so its size sets the commit's latency.
     pub fn encode(&self) -> Bytes {
-        let mut w = Writer::with_capacity(256 + self.tail_bytes());
+        let body = self.encode_body();
+        let mut w = Writer::with_capacity(16 + body.len());
         w.raw(MAGIC);
         w.u16(FORMAT);
+        match zstd::bulk::compress(&body, ZSTD_LEVEL).ok().filter(|c| c.len() + 10 < body.len() - body.len() / 8) {
+            Some(c) => {
+                w.u8(1);
+                w.varint(body.len() as u64);
+                w.raw(&c);
+            }
+            None => {
+                w.u8(0);
+                w.raw(&body);
+            }
+        }
+        let crc = crc32c(&w.buf);
+        w.u32(crc);
+        Bytes::from(w.into_inner())
+    }
+
+    pub(super) fn encode_body(&self) -> Vec<u8> {
+        let mut w = Writer::with_capacity(256 + self.tail_bytes());
         w.str(&self.db_id);
         w.u64(self.version);
         w.u64(self.write_seq);
@@ -254,9 +283,7 @@ impl Manifest {
             w.varint(b.swept);
             w.varint(b.swept_at);
         }
-        let crc = crc32c(&w.buf);
-        w.u32(crc);
-        Bytes::from(w.into_inner())
+        w.into_inner()
     }
 
     pub fn decode(data: &Bytes) -> DResult<Manifest> {
@@ -272,9 +299,25 @@ impl Manifest {
         if r.take(4)? != MAGIC {
             return Err(DecodeError("bad manifest magic"));
         }
-        if r.u16()? != FORMAT {
-            return Err(DecodeError("unsupported manifest format"));
-        }
+        let src = match (r.u16()?, r.u8()) {
+            (FORMAT_RAW, _) => src.slice(6..),
+            (FORMAT, Ok(0)) => src.slice(7..),
+            (FORMAT, Ok(1)) => {
+                let n = r.varint()?;
+                if n > MAX_BODY {
+                    return Err(DecodeError("manifest body too large"));
+                }
+                let rest = r.take(r.remaining())?;
+                let inflated =
+                    zstd::bulk::decompress(rest, n as usize).map_err(|_| DecodeError("bad compressed manifest"))?;
+                if inflated.len() as u64 != n {
+                    return Err(DecodeError("manifest body length mismatch"));
+                }
+                Bytes::from(inflated)
+            }
+            _ => return Err(DecodeError("unsupported manifest format")),
+        };
+        let mut r = Reader::new(&src);
         let db_id = r.string()?;
         let version = r.u64()?;
         let write_seq = r.u64()?;
@@ -554,6 +597,34 @@ mod tests {
         assert_eq!(m.version_at_least_age(250, 100), 0);
         assert_eq!(m.version_at_least_age(400, 100), 40);
         assert_eq!(m.blob_bytes.total(), 300, "swept, plus bound since");
+    }
+
+    #[test]
+    fn compressible_tails_are_stored_compressed() {
+        let mut m = sample();
+        m.tail = (0..200u64)
+            .map(|i| {
+                let value =
+                    format!("lesson {i}: a vector space over a field is a set with two operations. ").repeat(10);
+                Entry::new(Bytes::from(format!("k{i:04}")), i, Value::Inline(Bytes::from(value)))
+            })
+            .collect();
+        let enc = m.encode();
+        assert_eq!(enc[6], 1, "zstd codec");
+        assert!(enc.len() * 4 < m.encode_body().len(), "{} of {} bytes", enc.len(), m.encode_body().len());
+        assert_eq!(Manifest::decode(&enc).unwrap(), m);
+    }
+
+    #[test]
+    fn format_5_manifests_are_read() {
+        let m = sample();
+        let mut w = Writer::with_capacity(1024);
+        w.raw(MAGIC);
+        w.u16(FORMAT_RAW);
+        w.raw(&m.encode_body());
+        let crc = crc32c(&w.buf);
+        w.u32(crc);
+        assert_eq!(Manifest::decode(&Bytes::from(w.into_inner())).unwrap(), m);
     }
 
     #[test]

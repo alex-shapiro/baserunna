@@ -67,12 +67,14 @@ pub async fn run(
                     });
                 } else {
                     // Consecutive reads through different nodes must not observe stale state.
-                    let kinds = match c.rng().below(6) {
+                    let kinds = match c.rng().below(8) {
                         0 => vec![ReadKind::Get],
                         1 => vec![ReadKind::LocalGet],
                         2 => vec![ReadKind::ReadOnlyTxn],
                         3 => vec![ReadKind::ReadWriteTxn],
                         4 => vec![ReadKind::LocalGet, ReadKind::Get],
+                        5 => vec![ReadKind::Interactive { write: false }],
+                        6 => vec![ReadKind::LocalGet, ReadKind::Interactive { write: true }],
                         _ => vec![ReadKind::LocalGet, ReadKind::ReadOnlyTxn],
                     };
                     let mut start = start;
@@ -112,6 +114,11 @@ enum ReadKind {
     LocalGet,
     ReadOnlyTxn,
     ReadWriteTxn,
+    /// Read in `begin`, then commit, with a write or read-only. The read
+    /// counts only once the commit succeeds.
+    Interactive {
+        write: bool,
+    },
 }
 
 /// Reads `r{key}` via `kind` and returns `(version, value)` (or `(0, "")` if not found).
@@ -130,6 +137,32 @@ async fn read_once(c: &Client, db: &str, key: usize, kind: ReadKind) -> Option<(
                 }
                 404 => Some((0, String::new())),
                 _ => None,
+            }
+        }
+        ReadKind::Interactive { write } => {
+            let get = serde_json::json!({"op": "get", "key": format!("r{key}")});
+            let r = c
+                .call("POST", &format!("/v1/dbs/{db}/transactions"), Some(serde_json::json!({"ops": [get]})))
+                .await
+                .ok()?;
+            if r.status != 201 {
+                return None;
+            }
+            let id = r.json["txn_id"].as_str()?;
+            let ops = if write {
+                vec![serde_json::json!({"op": "put", "key": format!("scratch-{}", c.name), "value": "x"})]
+            } else {
+                vec![]
+            };
+            let path = format!("/v1/dbs/{db}/transactions/{id}/commit");
+            let committed = c.call("POST", &path, Some(serde_json::json!({ "ops": ops }))).await.ok()?;
+            if committed.status != 200 {
+                return None;
+            }
+            let got = &r.json["results"][0];
+            match got["found"].as_bool()? {
+                true => Some((got["version"].as_u64()?, got["value"].as_str()?.to_string())),
+                false => Some((0, String::new())),
             }
         }
         ReadKind::ReadOnlyTxn | ReadKind::ReadWriteTxn => {

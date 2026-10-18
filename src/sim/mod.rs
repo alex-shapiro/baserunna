@@ -340,7 +340,8 @@ impl Transport for SimTransport {
                 r
             };
             let net = &sim.cfg.net;
-            if sim.chance(net.p_forward_duplicate) {
+            let duplicated = sim.chance(net.p_forward_duplicate);
+            if duplicated {
                 let delay = sim.rand_below(net.forward_delay_max_ms + 1);
                 sim.trace.event(&format!("forward n{from}->n{to} {} duplicated (+{delay}ms)", parts.uri.path()));
                 let (sim2, dup) = (sim.clone(), copy());
@@ -369,6 +370,11 @@ impl Transport for SimTransport {
                     *resp.headers_mut() = r.headers;
                     Ok(resp)
                 }
+                // A duplicate may have arrived even though this copy was refused.
+                Err(NetError::Refused) if duplicated => Err(TransportError {
+                    message: "connection refused after a duplicate".into(),
+                    maybe_delivered: true,
+                }),
                 Err(NetError::Refused) => Err(undelivered("connection refused")),
                 Err(e) => Err(TransportError { message: format!("{e:?}"), maybe_delivered: true }),
             }

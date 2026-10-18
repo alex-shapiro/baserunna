@@ -342,13 +342,20 @@ fn schemas() -> Value {
             "results": {"oneOf": [arr(r("OpResult")), {"type": "null"}]},
             "appends": arr(i()),
         }), &["version", "committed", "results"], "`appends`: the first seq each append received, in order."),
-        "BeginRequest": obj(json!({"isolation": enum_of(&["serializable", "snapshot"]),
-            "encoding": enum_of(&["utf8", "base64"])}), &[]),
+        "BeginRequest": obj_desc(json!({"isolation": enum_of(&["serializable", "snapshot"]),
+            "encoding": enum_of(&["utf8", "base64"]), "ops": arr(r("Op"))}), &[],
+            "`ops` run in the new transaction before it is returned."),
         "Begin": obj(json!({"txn_id": s(), "commit_id": s(), "read_version": i(), "expires_at": i(),
-            "idle_timeout_ms": i()}), &["txn_id", "commit_id", "read_version", "expires_at", "idle_timeout_ms"]),
+            "idle_timeout_ms": i(), "results": arr(r("OpResult"))}),
+            &["txn_id", "commit_id", "read_version", "expires_at", "idle_timeout_ms", "results"]),
+        "CommitRequest": obj_desc(json!({"ops": arr(r("Op"))}), &[], "`ops` run in the transaction just before it commits."),
         "OpsRequest": obj(json!({"ops": arr(r("Op"))}), &["ops"]),
         "OpsResult": obj(json!({"results": arr(r("OpResult"))}), &["results"]),
-        "Committed": obj(json!({"version": i(), "commit_id": s(), "appends": arr(i())}), &["version", "commit_id"]),
+        "Committed": obj(json!({"version": i(), "commit_id": s(), "appends": arr(i()), "results": arr(r("OpResult"))}),
+            &["version", "commit_id"]),
+        "Metrics": obj(json!({"node": s(), "store": {"type": "object"}, "commits": {"type": "object"},
+            "routes": {"type": "object"}, "lag": {"type": "object"}, "cpu": {"type": "object"}}),
+            &["node", "store", "commits", "routes", "lag", "cpu"]),
         "CommitStatus": obj(json!({"status": enum_of(&["committed", "not_committed"]), "version": i(),
             "commit_id": s(), "appends": arr(i()), "retention_ms": i()}), &["status", "commit_id"]),
         "Version": obj(json!({"version": i()}), &["version"]),
@@ -724,6 +731,20 @@ fn paths() -> Value {
         },
     );
     add(
+        "/v1/admin/metrics",
+        "get",
+        Op {
+            params: vec![query("reset", b(), "Clear the histograms after reading them.")],
+            desc: Some(
+                "Latency histograms of this node since it started or was last reset: object-store calls by \
+                 object class and operation, commit batches that wrote a manifest, requests by route, and how \
+                 late a periodic timer fires (`lag`). `cpu` holds cumulative process CPU and host steal time in \
+                 ms where the OS reports them. Quantiles are accurate to 25%.",
+            ),
+            ..op("Latency metrics of the serving node (admin)", "admin", vec![("200", resp("Metrics", r("Metrics")))])
+        },
+    );
+    add(
         "/v1/admin/nodes",
         "get",
         op(
@@ -1004,7 +1025,9 @@ fn paths() -> Value {
         "/v1/dbs/{db}/transactions/{id}/commit",
         "post",
         Op {
+            body: Some(json_body(r("CommitRequest"))),
             params: vec![db(), txn_id()],
+            desc: Some("Any error in `ops` aborts the transaction."),
             ..op("Commit", "transactions", vec![("200", resp("Committed", r("Committed")))])
         },
     );

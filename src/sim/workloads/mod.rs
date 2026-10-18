@@ -190,14 +190,20 @@ fn faulty4() -> super::SimConfig {
     super::SimConfig::faulty(4)
 }
 
-/// [`faulty3`] where writes often reply late, so a manifest write stays in
-/// flight long after the store applied it, while other nodes can already
-/// read it.
-fn contended3() -> super::SimConfig {
-    let mut c = super::SimConfig::faulty(3);
+/// `c` where writes often reply late, so a manifest write stays in flight
+/// long after the store applied it, while other nodes can already read it.
+fn late_replies(mut c: super::SimConfig) -> super::SimConfig {
     c.store.p_late_reply = 0.3;
     c.store.late_reply_ms = (50, 1_000);
     c
+}
+
+fn contended3() -> super::SimConfig {
+    late_replies(super::SimConfig::faulty(3))
+}
+
+fn contended_hostile3() -> super::SimConfig {
+    late_replies(super::SimConfig::hostile(3))
 }
 
 fn hostile3() -> super::SimConfig {
@@ -274,7 +280,7 @@ pub fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             name: "register_contended_hostile",
-            config: hostile3,
+            config: contended_hostile3,
             run: |s| Box::pin(register::run(s, 6, 6, 60, 20, true)),
         },
         Scenario { name: "tables_hostile", config: hostile3, run: |s| Box::pin(tables::run(s, 80, 3, true)) },

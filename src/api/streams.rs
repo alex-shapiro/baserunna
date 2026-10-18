@@ -133,7 +133,7 @@ async fn configure(
             max_bytes: max_bytes.unwrap_or(cur.max_bytes),
         };
         let c = stream::configure(t, &name, r).await?;
-        let st = t.snapshot.stream_state(c.id).await?.unwrap_or(StreamState::new(r));
+        let st = t.untracked().stream_state(c.id).await?.unwrap_or(StreamState::new(r));
         Ok::<_, Error>((c, StreamState { retention: r, ..st }))
     });
     let mut out = stream::stream_json(&name, &c, &st);

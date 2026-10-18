@@ -133,7 +133,7 @@ impl ReadValue {
 }
 
 pub struct Txn {
-    pub snapshot: Arc<Version>,
+    snapshot: Arc<Version>,
     /// The store time every read evaluates expiries at.
     pub read_time: u64,
     pub isolation: Isolation,
@@ -148,6 +148,7 @@ pub struct Txn {
     max_write_bytes: usize,
     appended: usize,
     settled: bool,
+    untracked: bool,
 }
 
 fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -173,18 +174,44 @@ impl Txn {
             max_write_bytes,
             appended: 0,
             settled: true,
+            untracked: false,
         }
     }
 
-    /// False if the transaction began while a manifest write was in flight on
-    /// this node: its reads are then strongly consistent only if it commits.
-    /// See [`super::Db::begin_write`].
-    pub fn settled(&self) -> bool {
-        self.settled
+    /// Whether the transaction must pass [`super::Db::recheck`] before it
+    /// answers, given whether it `commits`. Only one begun while a manifest
+    /// write was in flight on this node ([`super::Db::begin_write`]) may:
+    /// its reads are strongly consistent only once validated, and a commit
+    /// validates just those in its read set.
+    pub fn needs_recheck(&self, commits: bool) -> bool {
+        !self.settled && (!commits || self.untracked)
     }
 
     pub(crate) fn unsettle(&mut self) {
         self.settled = false;
+    }
+
+    /// Whether the transaction read through [`Txn::untracked`].
+    pub(crate) fn read_untracked(&self) -> bool {
+        self.untracked
+    }
+
+    /// The snapshot, for reads the read set does not record, so that
+    /// neither commit validation nor [`super::Db::recheck`] checks them. The
+    /// caller must record what its answer depends on, as a stream read
+    /// records the range of records it covered, or read through
+    /// [`Txn::untracked`] instead.
+    pub fn snapshot(&self) -> &Arc<Version> {
+        &self.snapshot
+    }
+
+    /// The snapshot, for unrecorded reads an answer depends on. They are
+    /// consistent as of the snapshot only, so a transaction that makes them
+    /// is never answered from a snapshot begun during an in-flight write:
+    /// [`super::Db::recheck`] has it run again instead.
+    pub fn untracked(&mut self) -> &Arc<Version> {
+        self.untracked = true;
+        &self.snapshot
     }
 
     pub fn read_version(&self) -> Seq {

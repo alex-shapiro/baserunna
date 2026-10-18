@@ -170,7 +170,14 @@ impl http_body::Body for Tracked {
 
     fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
         let polled = Pin::new(&mut self.inner).poll_frame(cx);
-        if let Poll::Ready(None) = polled {
+        // Readers such as hyper's client stop at `is_end_stream` after the
+        // last frame instead of polling for the end.
+        let ended = match &polled {
+            Poll::Ready(None) => true,
+            Poll::Ready(Some(Ok(_))) => self.inner.is_end_stream(),
+            _ => false,
+        };
+        if ended {
             self.read.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         polled

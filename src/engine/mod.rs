@@ -88,7 +88,8 @@ activity! {
     lapsed_leases,
     /// Write transactions begun while a manifest write was in flight.
     unsettled_begins,
-    /// Unsettled transactions run again because a recheck found their reads changed.
+    /// Unsettled transactions run again: a recheck found their reads changed,
+    /// or they read outside their read set.
     unsettled_reruns,
 }
 
@@ -208,6 +209,46 @@ pub fn pin_key(db: &str, blob: &str) -> String {
 
 pub fn db_prefix(db: &str) -> String {
     format!("dbs/{db}/")
+}
+
+/// The kind of object a store key names, by the layout above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectClass {
+    Manifest,
+    Segment,
+    Levels,
+    Blob,
+    Other,
+}
+
+impl ObjectClass {
+    pub const ALL: [ObjectClass; 5] =
+        [ObjectClass::Manifest, ObjectClass::Segment, ObjectClass::Levels, ObjectClass::Blob, ObjectClass::Other];
+
+    pub fn of(key: &str) -> ObjectClass {
+        let Some((_, rest)) = key.strip_prefix("dbs/").and_then(|k| k.split_once('/')) else {
+            return ObjectClass::Other;
+        };
+        if rest == "manifest" {
+            ObjectClass::Manifest
+        } else if let Some(seg) = rest.strip_prefix("seg/") {
+            if seg.ends_with(LEVELS_SUFFIX) { ObjectClass::Levels } else { ObjectClass::Segment }
+        } else if rest.starts_with("blob/") {
+            ObjectClass::Blob
+        } else {
+            ObjectClass::Other
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ObjectClass::Manifest => "manifest",
+            ObjectClass::Segment => "segment",
+            ObjectClass::Levels => "levels",
+            ObjectClass::Blob => "blob",
+            ObjectClass::Other => "other",
+        }
+    }
 }
 
 /// Registry of open database handles on a node.

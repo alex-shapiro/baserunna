@@ -1142,7 +1142,7 @@ pub struct RowChanges {
 pub async fn row_changes(txn: &mut Txn, table: &str, after: &ChangePos, limit: usize) -> Result<RowChanges> {
     let s = get_schema(txn, table).await?;
     let prefix = table_prefix(SPACE_ROWS, s.id);
-    let snapshot = txn.snapshot.clone();
+    let snapshot = txn.snapshot().clone();
     let page = snapshot.changes(&KeyRange::prefix(&prefix), after, limit).await?;
     let mut changes = Vec::with_capacity(page.changes.len());
     for c in &page.changes {

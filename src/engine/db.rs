@@ -14,7 +14,7 @@ use super::version::{KeyRange, Snapshot, Version};
 use super::{Shared, blob_prefix, levels_key, manifest_key, seg_key};
 use crate::error::{Error, Result};
 use crate::store::{GetOpts, PutMode, StoreError};
-use crate::timing::{self, Class, StoreOp, Tally};
+use crate::timing::{self, StoreOp, Tally};
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
@@ -679,9 +679,9 @@ impl Db {
     ///
     /// A transaction that commits is strictly serializable as usual: commit
     /// validation checks its reads against every later write, the in-flight
-    /// one included. One that ends without committing answers from reads no
-    /// commit checks: unless [`Txn::settled`], pass it to [`Db::recheck`]
-    /// before answering.
+    /// one included. One that ends without committing, or that read through
+    /// [`Txn::untracked`], answers from reads no commit checks: if
+    /// [`Txn::needs_recheck`], pass it to [`Db::recheck`] before answering.
     pub async fn begin_write(self: &Arc<Self>) -> Result<Txn> {
         let (snap, settled) = self.latest().await?;
         let mut t =
@@ -693,12 +693,16 @@ impl Db {
         Ok(t)
     }
 
-    /// Checks the reads of `t`, begun by [`Db::begin_write`] while a write was
-    /// in flight, that ends without committing. Waits for a strong snapshot
-    /// and validates the reads against it, as a commit would. Returns the
-    /// version at which they are current, or `None` if a later write changed
-    /// them and `t` must run again.
+    /// Checks the reads of `t`, which [`Txn::needs_recheck`]. Waits for a
+    /// strong snapshot and validates the reads against it, as a commit would.
+    /// Returns the version at which they are current, or `None` if `t` must
+    /// run again: a later write changed them, or `t` read through
+    /// [`Txn::untracked`], which no validation can check.
     pub async fn recheck(self: &Arc<Self>, t: Txn) -> Result<Option<Seq>> {
+        if t.read_untracked() {
+            self.shared.counters.add(&super::Activity { unsettled_reruns: 1, ..Default::default() });
+            return Ok(None);
+        }
         let snap = self.snapshot(Consistency::Strong).await?;
         let req = t.into_request();
         match validate(&req, &snap.version, &[], &[], snap.time_ms).await {
@@ -844,7 +848,7 @@ impl Db {
     fn log_batch(&self, queued: &[(Instant, Option<Arc<str>>)], txns: usize, started: Instant, tally: &Tally) {
         use crate::log::{self, Level};
         use serde_json::json;
-        if tally.store_calls(Class::Manifest, StoreOp::Put) == 0 || !log::enabled(Level::Info) {
+        if tally.store_calls(super::ObjectClass::Manifest, StoreOp::Put) == 0 || !log::enabled(Level::Info) {
             return;
         }
         let oldest = queued.iter().map(|(at, _)| *at).min().unwrap_or(started);

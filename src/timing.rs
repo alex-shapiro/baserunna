@@ -6,7 +6,7 @@
 //! Work on other tasks, such as the committer or background compaction, is
 //! not attributed to the request that triggered it.
 
-use crate::engine::LEVELS_SUFFIX;
+use crate::engine::ObjectClass as Class;
 use crate::store::{BoxFut, DynStore, GetOpts, GetResult, ListPage, ObjectStore, PutMode, SResult, StoreError};
 use bytes::Bytes;
 use serde_json::{Map, Value as Json, json};
@@ -15,45 +15,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 use tokio::time::Instant;
-
-/// The kind of object a store key names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Class {
-    Manifest,
-    Segment,
-    Levels,
-    Blob,
-    Other,
-}
-
-impl Class {
-    const ALL: [Class; 5] = [Class::Manifest, Class::Segment, Class::Levels, Class::Blob, Class::Other];
-
-    pub fn of(key: &str) -> Class {
-        let Some((_, rest)) = key.strip_prefix("dbs/").and_then(|k| k.split_once('/')) else {
-            return Class::Other;
-        };
-        if rest == "manifest" {
-            Class::Manifest
-        } else if rest.starts_with("seg/") {
-            if rest.ends_with(LEVELS_SUFFIX) { Class::Levels } else { Class::Segment }
-        } else if rest.starts_with("blob/") {
-            Class::Blob
-        } else {
-            Class::Other
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Class::Manifest => "manifest",
-            Class::Segment => "segment",
-            Class::Levels => "levels",
-            Class::Blob => "blob",
-            Class::Other => "other",
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreOp {
@@ -87,7 +48,7 @@ struct Calls {
 /// Time spent by one request or commit batch, by cause.
 #[derive(Default)]
 pub struct Tally {
-    store: [[Calls; 4]; 5],
+    store: [[Calls; StoreOp::ALL.len()]; Class::ALL.len()],
     commits: AtomicU64,
     commit_us: AtomicU64,
     read_wait_us: AtomicU64,
@@ -256,17 +217,6 @@ impl ObjectStore for TimedStore {
 mod tests {
     use super::*;
     use crate::store::MemStore;
-
-    #[test]
-    fn classes_follow_the_key_layout() {
-        assert_eq!(Class::of("dbs/a1/manifest"), Class::Manifest);
-        assert_eq!(Class::of("dbs/a1/seg/0123"), Class::Segment);
-        assert_eq!(Class::of(&format!("dbs/a1/seg/0123{LEVELS_SUFFIX}")), Class::Levels);
-        assert_eq!(Class::of("dbs/a1/blob/b/00000001"), Class::Blob);
-        assert_eq!(Class::of("dbs/a1/seg/"), Class::Segment);
-        assert_eq!(Class::of("clock"), Class::Other);
-        assert_eq!(Class::of("dbs/a1"), Class::Other);
-    }
 
     #[test]
     fn store_calls_count_toward_the_enclosing_scope_only() {

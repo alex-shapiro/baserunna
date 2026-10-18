@@ -574,10 +574,8 @@ macro_rules! run_txn {
                         let $t: &mut crate::engine::Txn = &mut txn_;
                         async { $body }.await
                     };
-                    // An attempt that will not commit answers from reads no
-                    // commit validates: check them if a write was in flight.
                     let txn_ = match txn_ {
-                        t if t.settled() || (out_.is_ok() && !t.is_read_only()) => t,
+                        t if !t.needs_recheck(out_.is_ok() && !t.is_read_only()) => t,
                         t => match ctx_.db.recheck(t).await? {
                             Some(version) => match out_ {
                                 Ok(out) => break crate::api::Ran::Read { out, version },
@@ -837,9 +835,18 @@ mod tests {
             // Constants keep these out of the documented-routes scan (tests/openapi.rs).
             const IGNORE: &str = "/ignore";
             const READ: &str = "/read";
+            const FIRST_FRAME: &str = "/first-frame";
+            // Reads as hyper's client forwards a body: up to `is_end_stream`.
+            let first_frame = |mut b: Body| async move {
+                use http_body_util::BodyExt;
+                let n = b.frame().await.and_then(|f| f.ok()?.into_data().ok()).map_or(0, |d| d.len());
+                assert!(http_body::Body::is_end_stream(&b));
+                n.to_string()
+            };
             let app = Router::new()
                 .route(IGNORE, axum::routing::any(|| async { StatusCode::TOO_MANY_REQUESTS }))
                 .route(READ, axum::routing::post(|b: Bytes| async move { b.len().to_string() }))
+                .route(FIRST_FRAME, axum::routing::post(first_frame))
                 .layer(middleware::from_fn(close_if_body_unread));
             let close = |method: &str, path: &str, body: &'static str| {
                 let req = http::Request::builder().method(method).uri(path).body(Body::from(body)).unwrap();
@@ -848,6 +855,7 @@ mod tests {
             };
             assert_eq!(close("POST", "/ignore", "unread").await, Some(HeaderValue::from_static("close")));
             assert_eq!(close("POST", "/read", "read").await, None);
+            assert_eq!(close("POST", "/first-frame", "read").await, None);
             assert_eq!(close("GET", "/ignore", "").await, None);
         });
     }

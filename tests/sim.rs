@@ -334,6 +334,83 @@ fn leaseholder_answers_include_a_write_another_node_served() {
     out.result.unwrap();
 }
 
+/// Like [`leaseholder_answers_include_a_write_another_node_served`], for
+/// stream state that transactions read without recording it in their read
+/// set: once another node served an append whose manifest write is still in
+/// flight, the leaseholder must accept a consumer cursor past it and report
+/// it when reconfiguring the stream.
+#[test]
+fn leaseholder_stream_answers_include_an_append_another_node_served() {
+    use baserunna::sim::client::Client;
+    use serde_json::json;
+    let mut cfg = SimConfig::basic();
+    cfg.nodes = 2;
+    let out = run(25, cfg, |sim| async move {
+        let owner = Client::signup(&sim, "u", "u@held-stream.test", "password-123").await?;
+        owner.create_db("t").await?;
+        let token = owner.token.clone().unwrap_or_default();
+        let at = |node: usize, name: &str| {
+            let mut c = Client::with_token(&sim, name, &token);
+            c.pin = Some(node);
+            c
+        };
+        let net = |e| format!("{e:?}");
+        let records = json!({"records": [{"json": {"n": 1}}]});
+        let created = owner.call_settled("POST", "/v1/dbs/t/streams", Some(json!({"name": "s"}))).await;
+        if created.status != 201 && created.status != 200 {
+            return Err(format!("stream create failed: {} {}", created.status, created.json));
+        }
+        let first = owner.call_settled("POST", "/v1/dbs/t/streams/s/records", Some(records.clone())).await;
+        if first.status != 200 {
+            return Err(format!("first append failed: {} {}", first.status, first.json));
+        }
+        let holder_id = owner.call_settled("GET", "/v1/dbs/t", None).await.json["stats"]["lease_holder"].clone();
+        let holder = (0..2).find(|&i| sim.node(i).is_some_and(|n| holder_id == n.node.id.as_str()));
+        let holder = holder.ok_or(format!("no lease holder: {holder_id}"))?;
+        let other = 1 - holder;
+
+        sim.store.hold_replies("/manifest");
+        let appender = at(holder, "appender");
+        let append =
+            tokio::spawn(async move { appender.call("POST", "/v1/dbs/t/streams/s/records", Some(records)).await });
+        sim.sleep(500).await;
+        // Requests that have been forwarded twice are answered where they land.
+        let here = [("x-baserunna-hops", "2".to_string())];
+        let seen =
+            at(other, "other").send("GET", "/v1/dbs/t/streams/s", &here, Default::default()).await.map_err(net)?;
+        let seen: serde_json::Value = serde_json::from_slice(&seen.body).map_err(|e| e.to_string())?;
+        if seen["next_seq"] != 2 {
+            return Err(format!("the other node should serve the applied append, got {seen}"));
+        }
+
+        let cursor = at(holder, "cursor");
+        let put = tokio::spawn(async move {
+            cursor.call("PUT", "/v1/dbs/t/streams/s/consumers/c", Some(json!({"seq": 2}))).await
+        });
+        let configurer = at(holder, "configurer");
+        let patch = tokio::spawn(async move {
+            configurer.call("PATCH", "/v1/dbs/t/streams/s", Some(json!({"retention_ms": 7_200_000}))).await
+        });
+        sim.sleep(500).await;
+        sim.store.release_replies();
+
+        let a = append.await.map_err(|e| e.to_string())?.map_err(net)?;
+        if a.status != 200 {
+            return Err(format!("held append failed: {} {}", a.status, a.json));
+        }
+        let p = put.await.map_err(|e| e.to_string())?.map_err(net)?;
+        if p.status != 200 {
+            return Err(format!("a cursor at the served append was refused: {} {}", p.status, p.json));
+        }
+        let c = patch.await.map_err(|e| e.to_string())?.map_err(net)?;
+        if c.status != 200 || c.json["next_seq"] != 2 {
+            return Err(format!("reconfiguring missed the served append: {} {}", c.status, c.json));
+        }
+        Ok(())
+    });
+    out.result.unwrap();
+}
+
 /// A lease left by a node that crashed is judged by the store's clock: one
 /// granted long before another node first sees it costs no wait, while a
 /// recent one still blocks writes until it may have run out (SPEC §5.7).

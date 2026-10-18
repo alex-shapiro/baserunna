@@ -341,6 +341,18 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
 }
 
 #[test]
+fn object_classes_follow_the_key_layout() {
+    assert_eq!(ObjectClass::of(&manifest_key("a1")), ObjectClass::Manifest);
+    assert_eq!(ObjectClass::of(&seg_key("a1", "0123")), ObjectClass::Segment);
+    assert_eq!(ObjectClass::of(&levels_key("a1", "0123")), ObjectClass::Levels);
+    assert_eq!(ObjectClass::of(&blob_chunk_key("a1", "b", 1)), ObjectClass::Blob);
+    assert_eq!(ObjectClass::of(&pin_key("a1", "b")), ObjectClass::Blob);
+    assert_eq!(ObjectClass::of(&seg_key("a1", "")), ObjectClass::Segment);
+    assert_eq!(ObjectClass::of("clock"), ObjectClass::Other);
+    assert_eq!(ObjectClass::of("dbs/a1"), ObjectClass::Other);
+}
+
+#[test]
 fn prop_engine_matches_model() {
     prop::check(
         "engine-model",
@@ -394,7 +406,7 @@ fn serializable_conflicts_and_snapshots() {
         let mut w = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         w.put(k.clone(), Value::Inline(Bytes::from_static(b"new"))).unwrap();
         db.commit(w.into_request()).await.unwrap();
-        let e = old.snapshot.get(b"k", old.read_time).await.unwrap().unwrap();
+        let e = old.snapshot().get(b"k", old.read_time).await.unwrap().unwrap();
         assert_eq!(e.value, Value::Inline(Bytes::from_static(b"a")));
 
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
@@ -690,7 +702,7 @@ fn obsolete_segments_outlive_snapshots_then_go() {
             }
         }
         let mut old = old.unwrap();
-        let old_segs: Vec<String> = old.snapshot.m.segments.iter().map(|s| s.id.clone()).collect();
+        let old_segs: Vec<String> = old.snapshot().m.segments.iter().map(|s| s.id.clone()).collect();
         tokio::time::sleep(Duration::from_millis(10)).await;
         let live: Vec<String> = db.current().unwrap().m.segments.iter().map(|s| s.id.clone()).collect();
         assert!(old_segs.iter().any(|s| !live.contains(s)), "setup: compaction replaced nothing");

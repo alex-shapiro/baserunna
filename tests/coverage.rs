@@ -29,6 +29,7 @@ fn simulation_exercises_every_documented_operation_and_engine_path() {
         chunks_sealed_at_flush,
         chunks_sealed_in_compaction,
         retention_trims,
+        lapsed_leases,
         unsettled_begins,
         unsettled_reruns,
     } = engine;
@@ -44,6 +45,7 @@ fn simulation_exercises_every_documented_operation_and_engine_path() {
         ("stream chunks sealed at flush", chunks_sealed_at_flush),
         ("stream chunks sealed in compaction", chunks_sealed_in_compaction),
         ("streams trimmed for retention", retention_trims),
+        ("leases found lapsed by the store clock", lapsed_leases),
         ("write transactions begun during an in-flight commit", unsettled_begins),
         ("unsettled transactions run again after a recheck", unsettled_reruns),
     ] {

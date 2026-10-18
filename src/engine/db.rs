@@ -308,14 +308,37 @@ impl Db {
         !self.own_lease_left(st, m).is_zero()
     }
 
-    /// A lease in `m` held by another node, with how long it may still be
+    /// A lease in `v` held by another node, with how long it may still be
     /// valid from our viewpoint.
-    fn foreign_lease<'a>(&self, m: &'a Manifest) -> Option<(&'a Lease, Duration)> {
+    fn foreign_lease<'a>(&self, v: &'a Version) -> Option<(&'a Lease, Duration)> {
+        let m = &v.m;
         let l = m.lease.as_ref().filter(|l| l.node != self.shared.node_id)?;
+        if self.lapsed(v, l) {
+            return None;
+        }
         let valid_for = Duration::from_millis(l.ms + self.shared.cfg.lease_margin_ms);
         let seen = self.shared.lease_seen(&self.id, l, m.write_seq);
         let left = (seen + valid_for).saturating_duration_since(Instant::now());
         (!left.is_zero()).then_some((l, left))
+    }
+
+    /// Whether the store's clock shows that `l`, which the manifest write
+    /// behind `v` granted, has lapsed, however late we first saw it. The
+    /// holder relies on a lease for less than its duration from before it
+    /// sent the write, and the store stamped the write after that (to its
+    /// precision). A lease left by a node that stopped or crashed long ago
+    /// then costs no wait. Allowing twice the duration and the margin
+    /// absorbs clock drift and skew between the store's servers.
+    fn lapsed(&self, v: &Version, l: &Lease) -> bool {
+        let (Some(stamped), Some(now)) = (v.stored_ms, self.shared.store_earliest_now_ms()) else {
+            return false;
+        };
+        let precision = self.shared.store.time_precision_ms();
+        let lapsed = now > stamped + precision + 2 * l.ms + self.shared.cfg.lease_margin_ms;
+        if lapsed {
+            self.shared.counters.add(&super::Activity { lapsed_leases: 1, ..Default::default() });
+        }
+        lapsed
     }
 
     /// The node holding a valid lease on this database, if known.
@@ -325,7 +348,7 @@ impl Db {
         if self.holds_lease(&st, &cur.m) {
             return Some(self.shared.node_id.clone());
         }
-        self.foreign_lease(&cur.m).map(|(l, _)| l.node.clone())
+        self.foreign_lease(&cur).map(|(l, _)| l.node.clone())
     }
 
     /// Storage statistics at version `v`.
@@ -458,7 +481,9 @@ impl Db {
                 }
                 Ok(g) => {
                     let m = self.shared.load_manifest(&self.id, &g.data, cur.as_deref()).await?;
-                    let v = Arc::new(Version::new(m, g.etag, self.shared.clone()));
+                    let mut v = Version::new(m, g.etag, self.shared.clone());
+                    v.stored_ms = Some(g.last_modified_ms);
+                    let v = Arc::new(v);
                     return Ok((self.install(v, Some(started)), started));
                 }
                 Err(StoreError::NotFound) if create => {
@@ -549,7 +574,7 @@ impl Db {
         let hot = {
             let mut st = self.st();
             let hot = st.hot(self.shared.cfg.lease_read_threshold) && !st.lease_requested;
-            if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v.m).is_none() {
+            if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v).is_none() {
                 st.lease_requested = true;
                 true
             } else {
@@ -856,7 +881,7 @@ impl Db {
             attempt += 1;
             let attempt_started = Instant::now();
             let now = Now { wall_ms: self.shared.env.now_ms(), store_ms: self.shared.store_now_ms() };
-            let foreign = self.foreign_lease(&base.m).map(|(l, left)| (l.node.clone(), left));
+            let foreign = self.foreign_lease(&base).map(|(l, left)| (l.node.clone(), left));
             if let Some((holder, left)) = foreign {
                 let e = Error::NotOwner { holder, retry_after_ms: left.as_millis() as u64 };
                 // An earlier attempt may have landed before the lease moved.

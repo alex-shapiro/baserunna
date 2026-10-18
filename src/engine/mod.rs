@@ -84,6 +84,8 @@ activity! {
     chunks_sealed_in_compaction,
     /// Trims committed for stream retention.
     retention_trims,
+    /// Checks that found a lease another node left in a manifest lapsed by the store clock.
+    lapsed_leases,
     /// Write transactions begun while a manifest write was in flight.
     unsettled_begins,
     /// Unsettled transactions run again because a recheck found their reads changed.
@@ -119,6 +121,11 @@ impl Shared {
     /// store recently enough for garbage collection to rely on it.
     pub fn store_now_ms(&self) -> Option<u64> {
         self.clock.now_ms(Duration::from_millis(self.cfg.clock_sync_max_age_ms))
+    }
+
+    /// The earliest the store's current time can be, if measured recently.
+    pub fn store_earliest_now_ms(&self) -> Option<u64> {
+        self.clock.earliest_now_ms(Duration::from_millis(self.cfg.clock_sync_max_age_ms))
     }
 
     /// Store time if known, or the local wall clock otherwise.

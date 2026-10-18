@@ -593,12 +593,13 @@ Each node tracks lease timing on its own monotonic clock, with a 0.5 second marg
 
 - The lease holder considers its lease valid until `duration - 0.5 s` after it started sending the manifest `PUT` that renewed the lease.
 - Every other node considers that lease valid until `duration + 0.5 s` after it first observed that renewal. First-sighting timestamps are retained even if an idle database handle is evicted from memory.
+- A node that read the manifest from the store also judges the lease by the store's clock (§5.8): the holder started relying on it before the store stamped the manifest's `last_modified`, so once the earliest the store's time can be (the node's measurement minus its error) passes `last_modified + precision + 2 × duration + 0.5 s`, the lease has lapsed, however recently the node first saw it. The extra duration absorbs clock drift and skew between the store's servers. A lease left by a node that stopped or crashed long ago, or that evicted the database's handle without releasing it, then costs no wait.
 
 Each commit renews the lease for 5 seconds. On a read-heavy database where at least 16 strong reads occured within the current or previous lease window, the holder issues a lease-only manifest CAS about 1 s before expiry to renew the lease for 15 seconds. At ~$0.005 per 1,000 `PUT` versus ~$0.0004 per 1,000 `GET`s, a read-lease renewal pays for itself if it saves 12 conditional `GET` requests.
 
 Because other nodes refuse to commit while a lease is valid, the holder's cached `Version` is guaranteed to be current, allowing it to serve strong reads directly from memory.
 
-If a lease holder crashes, database writes pause until `duration + 0.5 s` after another node first observes the dead holder's last renewal. If another node checks the manifest just before the lease would have expired, failover takes at most `2 * duration + 0.5 s`: up to 11 s after a commit renewal or 31 s after a read renewal. Strong reads remain available on all nodes during failover via conditional `GET` validation (§5.9).
+If a lease holder crashes, database writes pause until `duration + 0.5 s` after another node first observes the dead holder's last renewal, or until the store clock shows the renewal lapsed, whichever comes first. If another node checks the manifest just before the lease would have expired, failover takes at most `2 * duration + 0.5 s`: up to 11 s after a commit renewal or 31 s after a read renewal. Strong reads remain available on all nodes during failover via conditional `GET` validation (§5.9).
 
 ### 5.8 Garbage Collection
 

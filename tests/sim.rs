@@ -334,6 +334,58 @@ fn leaseholder_answers_include_a_write_another_node_served() {
     out.result.unwrap();
 }
 
+/// A lease left by a node that crashed is judged by the store's clock: one
+/// granted long before another node first sees it costs no wait, while a
+/// recent one still blocks writes until it may have run out (SPEC §5.7).
+#[test]
+fn leases_left_long_ago_cost_no_wait() {
+    use baserunna::sim::client::Client;
+    let mut cfg = SimConfig::basic();
+    cfg.nodes = 2;
+    let out = run(24, cfg, |sim| async move {
+        let owner = Client::signup(&sim, "u", "u@lapsed.test", "password-123").await?;
+        let token = owner.token.clone().unwrap_or_default();
+        let at = |node: usize, name: &str| {
+            let mut c = Client::with_token(&sim, name, &token);
+            c.pin = Some(node);
+            c
+        };
+        let net = |e| format!("{e:?}");
+        // Requests that have been forwarded twice are answered where they land.
+        let here = [("x-baserunna-hops", "2".to_string())];
+        let put = |c: Client, db: &'static str| {
+            let here = here.clone();
+            async move { c.send("PUT", &format!("/v1/dbs/{db}/kv/k"), &here, "v".into()).await.map(|r| r.status) }
+        };
+        for db in ["old", "recent"] {
+            owner.create_db(db).await?;
+        }
+        let lapsed_before = sim.engine_activity().lapsed_leases;
+        if put(at(0, "a"), "old").await.map_err(net)? != 200 {
+            return Err("first write to old failed".into());
+        }
+        let lease_ms = sim.cfg.engine.lease_ms;
+        sim.sleep(3 * lease_ms + 2_000).await;
+        if put(at(0, "b"), "recent").await.map_err(net)? != 200 {
+            return Err("first write to recent failed".into());
+        }
+        sim.crash(0);
+        let recent = put(at(1, "c"), "recent").await.map_err(net)?;
+        if recent != 503 {
+            return Err(format!("a lease granted just now was ignored: {recent}"));
+        }
+        let old = put(at(1, "d"), "old").await.map_err(net)?;
+        if old != 200 {
+            return Err(format!("a lease granted {}ms ago blocked the write: {old}", 3 * lease_ms + 2_000));
+        }
+        if sim.engine_activity().lapsed_leases == lapsed_before {
+            return Err("no lease was found lapsed".into());
+        }
+        Ok(())
+    });
+    out.result.unwrap();
+}
+
 #[test]
 fn request_and_commit_logs_account_for_time() {
     use baserunna::log::{Level, REQUEST_ID_HEADER, capture};

@@ -57,6 +57,13 @@ impl StoreClock {
         Some((self.mono_ms(Instant::now()) + m.offset_ms).max(0) as u64)
     }
 
+    /// The earliest the store's current time can be, from a measurement at
+    /// most `max_age` old.
+    pub fn earliest_now_ms(&self, max_age: Duration) -> Option<u64> {
+        let m = self.last().filter(|m| m.at.elapsed() <= max_age)?;
+        Some((self.mono_ms(Instant::now()) + m.offset_ms - m.error_ms as i64).max(0) as u64)
+    }
+
     /// True if the last measurement is missing or older than `interval`.
     pub fn stale(&self, interval: Duration) -> bool {
         self.last().is_none_or(|m| m.at.elapsed() >= interval)

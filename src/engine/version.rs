@@ -18,6 +18,9 @@ use std::sync::Arc;
 pub struct Version {
     pub m: Manifest,
     pub etag: String,
+    /// The store's last-modified time of the manifest, if it was read from
+    /// the store rather than written by this node.
+    pub stored_ms: Option<u64>,
     pub(crate) shared: Arc<Shared>,
     /// `m.range_deletes`, indexed for lookups.
     deletes: Arc<RangeDeletes>,
@@ -684,7 +687,7 @@ impl Version {
     pub fn new(m: Manifest, etag: String, shared: Arc<Shared>) -> Version {
         let deletes = Arc::new(RangeDeletes::new(&m.range_deletes));
         let expiring = m.tail.iter().any(|e| e.expires.is_some()) || m.segments.iter().any(|s| s.expiring > 0);
-        Version { m, etag, shared, deletes, expiring }
+        Version { m, etag, stored_ms: None, shared, deletes, expiring }
     }
 
     pub fn version(&self) -> Seq {

@@ -1154,8 +1154,11 @@ fn foreign_leases_block_commits_until_they_expire() {
     });
 }
 
-#[test]
-fn a_lease_lost_after_an_ambiguous_write_leaves_the_outcome_unknown() {
+/// Node `b` commits a write that lands at once, but whose reply comes
+/// `reply_leases` lease durations later and is lost; meanwhile node `a`
+/// takes over once `b`'s lease runs out and writes once. Returns `b`'s
+/// commit result.
+fn commit_with_lost_reply_after_takeover(reply_leases: u64) -> crate::error::Result<Seq> {
     rt().block_on(async {
         let (b, store) = delayed_engine("b");
         let db = opened(&b, "d").await;
@@ -1163,21 +1166,36 @@ fn a_lease_lost_after_an_ambiguous_write_leaves_the_outcome_unknown() {
         let a = second_node(&b, &store, "a");
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         t.put(Bytes::from_static(b"k"), inline("lost")).unwrap();
-        // The write lands at once; its reply comes after the lease it renews ran out, and is lost.
         let lease = b.shared.cfg.lease_ms + b.shared.cfg.lease_margin_ms;
         store.manifest_put_lost.store(1, SeqCst);
-        store.put_reply_ms.store(3 * lease, SeqCst);
+        store.put_reply_ms.store(reply_leases * lease, SeqCst);
         let commit = tokio::spawn(async move { db.commit(t.into_request()).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
         store.put_reply_ms.store(0, SeqCst);
         let other = opened(&a, "d").await;
         tokio::time::sleep(Duration::from_millis(lease + 100)).await;
         put(&other, "k", "a").await;
-        match commit.await.unwrap() {
-            Err(Error::Unavailable { outcome_unknown: true, .. }) => {}
-            other => panic!("the write landed, so its outcome is unknown, not {other:?}"),
-        }
-    });
+        commit.await.unwrap()
+    })
+}
+
+#[test]
+fn a_lease_lost_after_an_ambiguous_write_leaves_the_outcome_unknown() {
+    // `b` retries while `a`'s lease is valid, so it cannot check whether its write landed.
+    match commit_with_lost_reply_after_takeover(2) {
+        Err(Error::Unavailable { outcome_unknown: true, .. }) => {}
+        other => panic!("the write landed, so its outcome is unknown, not {other:?}"),
+    }
+}
+
+#[test]
+fn an_ambiguous_write_resolves_once_the_next_lease_lapses() {
+    // By the time `b` retries, the store clock shows `a`'s lease lapsed: `b`
+    // reloads the manifest and finds its commit record.
+    match commit_with_lost_reply_after_takeover(4) {
+        Ok(2) => {}
+        other => panic!("the write landed at version 2, not {other:?}"),
+    }
 }
 
 #[test]

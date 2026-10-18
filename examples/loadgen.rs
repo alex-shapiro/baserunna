@@ -266,11 +266,21 @@ fn report(step: usize, concurrency: usize, stats: &mut Stats, elapsed: Duration,
     }
 }
 
+/// Sends `req` until it succeeds (or answers one of `also`), waiting out
+/// retryable errors such as a lease left by a stopped node, for up to a minute.
 async fn expect_ok(cfg: &Config, what: &str, req: reqwest::RequestBuilder, also: &[u16]) {
-    match send(cfg, req).await {
-        Ok(o) if (200..300).contains(&o.status) || also.contains(&o.status) => {}
-        Ok(o) => panic!("{what}: HTTP {} {}", o.status, o.body),
-        Err(e) => panic!("{what}: {e}"),
+    let t = Instant::now();
+    loop {
+        let attempt = req.try_clone().expect("setup requests have buffered bodies");
+        match send(cfg, attempt).await {
+            Ok(o) if (200..300).contains(&o.status) || also.contains(&o.status) => return,
+            Ok(o) if o.body["error"]["retryable"] == true && t.elapsed() < Duration::from_secs(60) => {
+                let ms = o.body["error"]["details"]["retry_after_ms"].as_u64().unwrap_or(500);
+                tokio::time::sleep(Duration::from_millis(ms.clamp(100, 5_000))).await;
+            }
+            Ok(o) => panic!("{what}: HTTP {} {}", o.status, o.body),
+            Err(e) => panic!("{what}: {e}"),
+        }
     }
 }
 

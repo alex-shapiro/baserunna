@@ -84,6 +84,10 @@ activity! {
     chunks_sealed_in_compaction,
     /// Trims committed for stream retention.
     retention_trims,
+    /// Write transactions begun while a manifest write was in flight.
+    unsettled_begins,
+    /// Unsettled transactions run again because a recheck found their reads changed.
+    unsettled_reruns,
 }
 
 /// State shared by every database handle on a node.

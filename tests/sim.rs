@@ -31,6 +31,13 @@ fn sim_register_linearizability() {
     run_scenario("register", 4, 2);
 }
 
+/// Writers and readers with short pauses, so requests keep arriving while a
+/// commit is in flight: write transactions begin without waiting for it.
+#[test]
+fn sim_register_linearizability_under_contention() {
+    run_scenario("register_contended", 22, 4);
+}
+
 #[test]
 fn sim_tables_and_indexes() {
     run_scenario("tables", 5, 2);
@@ -118,6 +125,7 @@ fn sim_hostile() {
         "kv_hostile",
         "bank_hostile",
         "register_hostile",
+        "register_contended_hostile",
         "tables_hostile",
         "blobs_hostile",
         "lifecycle_hostile",
@@ -245,6 +253,82 @@ fn forwards_to_a_restarted_node_are_refused() {
         assert_eq!(r.status, 503, "a copy addressed to the previous run was executed");
         let r = c.get("/v1/dbs/fwd/kv/k").await.map_err(|e| format!("{e:?}"))?;
         assert_eq!(&r.raw.body[..], b"new");
+        Ok(())
+    });
+    out.result.unwrap();
+}
+
+/// While the leaseholder's manifest write has applied but not yet replied,
+/// another node can serve the write from the store. Answers the leaseholder
+/// gives after that, from a read-only transaction or a failed precondition,
+/// must include it, though its write transactions begin without waiting for
+/// the write (SPEC §5.5).
+#[test]
+fn leaseholder_answers_include_a_write_another_node_served() {
+    use baserunna::sim::client::Client;
+    use serde_json::json;
+    let mut cfg = SimConfig::basic();
+    cfg.nodes = 2;
+    let out = run(23, cfg, |sim| async move {
+        let owner = Client::signup(&sim, "u", "u@held.test", "password-123").await?;
+        owner.create_db("t").await?;
+        let token = owner.token.clone().unwrap_or_default();
+        let at = |node: usize, name: &str| {
+            let mut c = Client::with_token(&sim, name, &token);
+            c.pin = Some(node);
+            c
+        };
+        let net = |e| format!("{e:?}");
+        // Requests that have been forwarded twice are answered where they land.
+        let here = || vec![("x-baserunna-hops", "2".to_string())];
+        let first = owner.send("PUT", "/v1/dbs/t/kv/k", &[], "a".into()).await.map_err(net)?;
+        if first.status != 200 {
+            return Err(format!("first write failed: {}", first.status));
+        }
+        let holder_id = owner.call_settled("GET", "/v1/dbs/t", None).await.json["stats"]["lease_holder"].clone();
+        let holder = (0..2).find(|&i| sim.node(i).is_some_and(|n| holder_id == n.node.id.as_str()));
+        let holder = holder.ok_or(format!("no lease holder: {holder_id}"))?;
+        let other = 1 - holder;
+
+        sim.store.hold_replies("/manifest");
+        let writer = at(holder, "writer");
+        let write = tokio::spawn(async move { writer.send("PUT", "/v1/dbs/t/kv/k", &here(), "b".into()).await });
+        sim.sleep(500).await;
+        let seen = at(other, "other").send("GET", "/v1/dbs/t/kv/k", &here(), Default::default()).await.map_err(net)?;
+        if &seen.body[..] != b"b" {
+            return Err(format!("the other node should serve the applied write, got {:?}", seen.body));
+        }
+        let version: String = seen.headers["x-baserunna-version"].to_str().map_err(|e| e.to_string())?.into();
+
+        let reader = at(holder, "reader");
+        let read = tokio::spawn(async move {
+            reader.call("POST", "/v1/dbs/t/txn", Some(json!({"ops": [{"op": "get", "key": "k"}]}))).await
+        });
+        let conditional = at(holder, "conditional");
+        let put = tokio::spawn(async move {
+            let mut h = here();
+            h.push(("if-match", format!("\"{version}\"")));
+            conditional.send("PUT", "/v1/dbs/t/kv/k", &h, "c".into()).await
+        });
+        sim.sleep(500).await;
+        sim.store.release_replies();
+
+        let w = write.await.map_err(|e| e.to_string())?.map_err(net)?;
+        if w.status != 200 {
+            return Err(format!("held write failed: {}", w.status));
+        }
+        let r = read.await.map_err(|e| e.to_string())?.map_err(net)?;
+        if r.json["results"][0]["value"] != "b" {
+            return Err(format!("read-only transaction missed the served write: {}", r.json));
+        }
+        let p = put.await.map_err(|e| e.to_string())?.map_err(net)?;
+        if p.status != 200 {
+            return Err(format!(
+                "If-Match on the served version failed: {} {}",
+                p.status,
+                String::from_utf8_lossy(&p.body)
+            ));
+        }
         Ok(())
     });
     out.result.unwrap();

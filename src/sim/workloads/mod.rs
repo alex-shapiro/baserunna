@@ -133,7 +133,7 @@ pub async fn chaos_mix(sim: Arc<Sim>, scale: usize) -> Result<(), String> {
     let chaos = spawn_chaos(&sim);
     let a = tokio::spawn(kv_model::run(sim.clone(), 2, 20 * scale, false));
     let b = tokio::spawn(bank::run(sim.clone(), 5, 3, 6 * scale, false));
-    let c = tokio::spawn(register::run(sim.clone(), 2, 2, 10 * scale, false));
+    let c = tokio::spawn(register::run(sim.clone(), 2, 2, 10 * scale, 500, false));
     let mut errs = Vec::new();
     for h in [a, b, c] {
         match h.await {
@@ -190,6 +190,16 @@ fn faulty4() -> super::SimConfig {
     super::SimConfig::faulty(4)
 }
 
+/// [`faulty3`] where writes often reply late, so a manifest write stays in
+/// flight long after the store applied it, while other nodes can already
+/// read it.
+fn contended3() -> super::SimConfig {
+    let mut c = super::SimConfig::faulty(3);
+    c.store.p_late_reply = 0.3;
+    c.store.late_reply_ms = (50, 1_000);
+    c
+}
+
 fn hostile3() -> super::SimConfig {
     super::SimConfig::hostile(3)
 }
@@ -232,7 +242,12 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario { name: "kv_single_node", config: kv_basic, run: |s| Box::pin(kv_model::run(s, 1, 120, false)) },
         Scenario { name: "kv_faulty_cluster", config: kv_faulty3, run: |s| Box::pin(kv_model::run(s, 2, 60, true)) },
         Scenario { name: "bank", config: faulty3, run: |s| Box::pin(bank::run(s, 6, 4, 12, true)) },
-        Scenario { name: "register", config: faulty3, run: |s| Box::pin(register::run(s, 3, 3, 30, true)) },
+        Scenario { name: "register", config: faulty3, run: |s| Box::pin(register::run(s, 3, 3, 30, 500, true)) },
+        Scenario {
+            name: "register_contended",
+            config: contended3,
+            run: |s| Box::pin(register::run(s, 6, 6, 60, 20, true)),
+        },
         Scenario { name: "tables", config: faulty3, run: |s| Box::pin(tables::run(s, 80, 3, true)) },
         Scenario { name: "blobs", config: faulty2, run: |s| Box::pin(blobs::run(s, 40, true)) },
         Scenario { name: "auth", config: faulty3, run: |s| Box::pin(auth::run(s)) },
@@ -252,7 +267,16 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario { name: "accounts", config: faulty3, run: |s| Box::pin(accounts::run(s)) },
         Scenario { name: "kv_hostile", config: kv_hostile3, run: |s| Box::pin(kv_model::run(s, 2, 60, true)) },
         Scenario { name: "bank_hostile", config: hostile3, run: |s| Box::pin(bank::run(s, 6, 4, 12, true)) },
-        Scenario { name: "register_hostile", config: hostile3, run: |s| Box::pin(register::run(s, 3, 3, 30, true)) },
+        Scenario {
+            name: "register_hostile",
+            config: hostile3,
+            run: |s| Box::pin(register::run(s, 3, 3, 30, 500, true)),
+        },
+        Scenario {
+            name: "register_contended_hostile",
+            config: hostile3,
+            run: |s| Box::pin(register::run(s, 6, 6, 60, 20, true)),
+        },
         Scenario { name: "tables_hostile", config: hostile3, run: |s| Box::pin(tables::run(s, 80, 3, true)) },
         Scenario { name: "blobs_hostile", config: hostile3, run: |s| Box::pin(blobs::run(s, 40, true)) },
         Scenario { name: "lifecycle_hostile", config: hostile3, run: |s| Box::pin(lifecycle::run(s, 4, true)) },

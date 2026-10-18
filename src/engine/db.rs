@@ -502,21 +502,40 @@ impl Db {
             // A write of ours that is in flight may already be visible to
             // readers elsewhere; serving the cached version now could go
             // back in time relative to them.
-            let mut waited_since = None;
-            loop {
-                let notified = self.write_done.notified();
-                let mut notified = std::pin::pin!(notified);
-                notified.as_mut().enable();
-                if !self.writing.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
-                }
-                waited_since.get_or_insert_with(Instant::now);
-                notified.await;
-            }
-            if let Some(t) = waited_since {
-                timing::read_waited(t.elapsed());
-            }
+            self.wait_for_write().await;
         }
+        self.resolve(c).await
+    }
+
+    /// The newest version this node can vouch for, as of a strong snapshot,
+    /// but without waiting for this node's in-flight manifest write. Also
+    /// returns whether the version is settled: no write of ours was in
+    /// flight, so the snapshot is as strong as [`Db::snapshot`]'s. An
+    /// unsettled one may predate a write that other nodes can already read.
+    pub async fn latest(self: &Arc<Self>) -> Result<(Snapshot, bool)> {
+        let settled = !self.writing.load(std::sync::atomic::Ordering::SeqCst);
+        Ok((self.resolve(Consistency::Strong).await?, settled))
+    }
+
+    async fn wait_for_write(&self) {
+        let mut waited_since = None;
+        loop {
+            let notified = self.write_done.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            if !self.writing.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            waited_since.get_or_insert_with(Instant::now);
+            notified.await;
+        }
+        if let Some(t) = waited_since {
+            timing::read_waited(t.elapsed());
+        }
+    }
+
+    /// The cached version if it satisfies `c`, otherwise the manifest from the store.
+    async fn resolve(self: &Arc<Self>, c: Consistency) -> Result<Snapshot> {
         let now = Instant::now();
         if let Some((cur, current_at)) = self.cached(c, now) {
             return self.snapshot_at(check_live(cur)?, current_at).await;
@@ -611,6 +630,46 @@ impl Db {
     pub async fn begin(self: &Arc<Self>, isolation: Isolation, c: Consistency) -> Result<Txn> {
         let snap = self.snapshot(c).await?;
         Ok(Txn::new(snap, isolation, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes))
+    }
+
+    /// Begins a serializable transaction that is expected to write, on
+    /// [`Db::latest`]. Unlike a strong [`Db::begin`], it does not wait for
+    /// this node's in-flight manifest write, so concurrent writers reach the
+    /// commit queue while it is in flight and commit together in the next
+    /// batch.
+    ///
+    /// A transaction that commits is strictly serializable as usual: commit
+    /// validation checks its reads against every later write, the in-flight
+    /// one included. One that ends without committing answers from reads no
+    /// commit checks: unless [`Txn::settled`], pass it to [`Db::recheck`]
+    /// before answering.
+    pub async fn begin_write(self: &Arc<Self>) -> Result<Txn> {
+        let (snap, settled) = self.latest().await?;
+        let mut t =
+            Txn::new(snap, Isolation::Serializable, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes);
+        if !settled {
+            t.unsettle();
+            self.shared.counters.add(&super::Activity { unsettled_begins: 1, ..Default::default() });
+        }
+        Ok(t)
+    }
+
+    /// Checks the reads of `t`, begun by [`Db::begin_write`] while a write was
+    /// in flight, that ends without committing. Waits for a strong snapshot
+    /// and validates the reads against it, as a commit would. Returns the
+    /// version at which they are current, or `None` if a later write changed
+    /// them and `t` must run again.
+    pub async fn recheck(self: &Arc<Self>, t: Txn) -> Result<Option<Seq>> {
+        let snap = self.snapshot(Consistency::Strong).await?;
+        let req = t.into_request();
+        match validate(&req, &snap.version, &[], &[], snap.time_ms).await {
+            Ok(()) => Ok(Some(snap.version.m.version)),
+            Err(Error::Conflict(_)) => {
+                self.shared.counters.add(&super::Activity { unsettled_reruns: 1, ..Default::default() });
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Creates a writer for a new staged blob, syncing the store clock first if needed.

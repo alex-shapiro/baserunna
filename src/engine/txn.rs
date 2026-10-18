@@ -147,6 +147,7 @@ pub struct Txn {
     write_bytes: usize,
     max_write_bytes: usize,
     appended: usize,
+    settled: bool,
 }
 
 fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -171,7 +172,19 @@ impl Txn {
             write_bytes: 0,
             max_write_bytes,
             appended: 0,
+            settled: true,
         }
+    }
+
+    /// False if the transaction began while a manifest write was in flight on
+    /// this node: its reads are then strongly consistent only if it commits.
+    /// See [`super::Db::begin_write`].
+    pub fn settled(&self) -> bool {
+        self.settled
+    }
+
+    pub(crate) fn unsettle(&mut self) {
+        self.settled = false;
     }
 
     pub fn read_version(&self) -> Seq {

@@ -1,5 +1,10 @@
 //! `register`: concurrent writers and strong readers on a few keys, with a
 //! real-time linearizability check over the recorded history.
+//!
+//! Readers read through every strongly consistent path: a GET, a GET the
+//! receiving node must answer itself (so nodes without the lease read the
+//! store directly), a read-only one-shot transaction, and a one-shot
+//! transaction that also writes, whose read is validated at commit.
 
 use super::super::Sim;
 use super::super::client::Client;
@@ -18,7 +23,17 @@ struct Op {
     client: String,
 }
 
-pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, ops: usize, chaos: bool) -> Result<(), String> {
+/// Runs `writers` and `readers` clients for `ops` operations each, pausing up
+/// to `max_pause_ms` before each one; short pauses keep commits in flight
+/// while other requests arrive.
+pub async fn run(
+    sim: Arc<Sim>,
+    writers: usize,
+    readers: usize,
+    ops: usize,
+    max_pause_ms: u64,
+    chaos: bool,
+) -> Result<(), String> {
     let owner = Client::signup(&sim, "reg", "reg@reg.test", "password-123").await?;
     let db = "reg";
     owner.create_db(db).await?;
@@ -34,7 +49,7 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, ops: usize, chao
         let write = w < writers;
         hs.push(tokio::spawn(async move {
             for n in 0..ops {
-                let d = c.rng().below(500);
+                let d = c.rng().below(max_pause_ms);
                 c.pause(d).await;
                 let key = c.rng().usize(keys);
                 let path = format!("/v1/dbs/{db}/kv/r{key}");
@@ -59,35 +74,28 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, ops: usize, chao
                         client: c.name.clone(),
                     });
                 } else {
-                    let r = c.send("GET", &path, &[], bytes::Bytes::new()).await;
-                    let end = sim2.now_ms();
-                    if let Ok(r) = r {
-                        if r.status == 200 {
-                            let version = r
-                                .headers
-                                .get("x-baserunna-version")
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|v| v.parse().ok());
+                    // A client that reads through one node and then another
+                    // must not see the value go back in time.
+                    let kinds = match c.rng().below(5) {
+                        4 => vec![1, 2],
+                        k => vec![k],
+                    };
+                    let mut start = start;
+                    for kind in kinds {
+                        let read = read_once(&c, db, key, kind).await;
+                        let end = sim2.now_ms();
+                        if let Some((version, value)) = read {
                             hist.lock().unwrap_or_else(|e| e.into_inner()).push(Op {
                                 key,
                                 start,
                                 end,
-                                version,
-                                value: String::from_utf8_lossy(&r.body).into_owned(),
-                                write: false,
-                                client: c.name.clone(),
-                            });
-                        } else if r.status == 404 {
-                            hist.lock().unwrap_or_else(|e| e.into_inner()).push(Op {
-                                key,
-                                start,
-                                end,
-                                version: Some(0),
-                                value: String::new(),
+                                version: Some(version),
+                                value,
                                 write: false,
                                 client: c.name.clone(),
                             });
                         }
+                        start = sim2.now_ms();
                     }
                 }
             }
@@ -101,6 +109,41 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, ops: usize, chao
     }
     super::recover(&sim).await;
     check(&hist.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Reads `r{key}` through one of the strongly consistent read paths: a GET
+/// (0), a GET answered by the node it reaches (1), a read-only transaction
+/// (2), or a transaction that also writes (3). Returns the value's version
+/// (0 if missing) and the value, or `None` if the read failed.
+async fn read_once(c: &Client, db: &str, key: usize, path_kind: u64) -> Option<(u64, String)> {
+    let get = |hops: &str| {
+        let headers = if hops.is_empty() { vec![] } else { vec![("x-baserunna-hops", hops.to_string())] };
+        async move { c.send("GET", &format!("/v1/dbs/{db}/kv/r{key}"), &headers, bytes::Bytes::new()).await }
+    };
+    if path_kind < 2 {
+        let r = get(if path_kind == 0 { "" } else { "2" }).await.ok()?;
+        return match r.status {
+            200 => {
+                let version = r.headers.get("x-baserunna-version")?.to_str().ok()?.parse().ok()?;
+                Some((version, String::from_utf8_lossy(&r.body).into_owned()))
+            }
+            404 => Some((0, String::new())),
+            _ => None,
+        };
+    }
+    let mut ops = vec![serde_json::json!({"op": "get", "key": format!("r{key}")})];
+    if path_kind == 3 {
+        ops.push(serde_json::json!({"op": "put", "key": format!("scratch-{}", c.name), "value": "x"}));
+    }
+    let r = c.call("POST", &format!("/v1/dbs/{db}/txn"), Some(serde_json::json!({ "ops": ops }))).await.ok()?;
+    if r.status != 200 {
+        return None;
+    }
+    let got = &r.json["results"][0];
+    match got["found"].as_bool()? {
+        true => Some((got["version"].as_u64()?, got["value"].as_str()?.to_string())),
+        false => Some((0, String::new())),
+    }
 }
 
 fn check(h: &[Op]) -> Result<(), String> {

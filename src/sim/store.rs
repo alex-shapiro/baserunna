@@ -25,6 +25,10 @@ pub struct StoreFaults {
     pub p_fail_after: f64,
     /// Maximum duration for which `list` may omit new objects or include deleted ones.
     pub list_lag_ms: u64,
+    /// Probability that a write's reply comes `late_reply_ms` after it was
+    /// applied: readers already see the write while its writer still waits.
+    pub p_late_reply: f64,
+    pub late_reply_ms: (u64, u64),
 }
 
 impl StoreFaults {
@@ -38,6 +42,8 @@ impl StoreFaults {
             p_fail_before: 0.0,
             p_fail_after: 0.0,
             list_lag_ms: 0,
+            p_late_reply: 0.0,
+            late_reply_ms: (0, 0),
         }
     }
 
@@ -55,6 +61,7 @@ impl StoreFaults {
 
 struct Draw {
     latency_ms: u64,
+    late_reply_ms: u64,
     fail_before: bool,
     fail_after: bool,
     list_lag_ms: u64,
@@ -84,7 +91,31 @@ pub struct SimStore {
     enabled: AtomicBool,
     trace: Arc<Trace>,
     view: Arc<Mutex<ListView>>,
+    replies: Arc<HeldReplies>,
     pub stats: StoreStats,
+}
+
+/// Writes whose replies are held back after they apply; see
+/// [`SimStore::hold_replies`].
+#[derive(Default)]
+struct HeldReplies {
+    suffix: Mutex<Option<String>>,
+    released: tokio::sync::Notify,
+}
+
+impl HeldReplies {
+    async fn wait(&self, key: &str) {
+        loop {
+            let released = self.released.notified();
+            let mut released = std::pin::pin!(released);
+            released.as_mut().enable();
+            let held = self.suffix.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| key.ends_with(s));
+            if !held {
+                return;
+            }
+            released.await;
+        }
+    }
 }
 
 impl SimStore {
@@ -96,6 +127,7 @@ impl SimStore {
             enabled: AtomicBool::new(true),
             trace,
             view: Arc::new(Mutex::new(ListView::default())),
+            replies: Arc::new(HeldReplies::default()),
             stats: StoreStats::default(),
         }
     }
@@ -106,6 +138,17 @@ impl SimStore {
 
     pub fn set_faults(&self, f: StoreFaults) {
         *self.faults.lock().unwrap_or_else(|e| e.into_inner()) = f;
+    }
+
+    /// Until [`SimStore::release_replies`], writes to keys ending in `suffix`
+    /// apply as usual, but their writers get no reply.
+    pub fn hold_replies(&self, suffix: &str) {
+        *self.replies.suffix.lock().unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
+    }
+
+    pub fn release_replies(&self) {
+        *self.replies.suffix.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.replies.released.notify_waiters();
     }
 
     fn draw(&self) -> Draw {
@@ -120,8 +163,16 @@ impl SimStore {
             latency_ms = r.range(f.stall_ms.0, f.stall_ms.1.max(f.stall_ms.0) + 1);
             self.trace.event(&format!("store stall {latency_ms}ms"));
         }
+        // Checked first so configurations without late replies keep their
+        // random streams, and every existing seed reproduces as before.
+        let late_reply_ms = if on && f.p_late_reply > 0.0 && r.chance(f.p_late_reply) {
+            r.range(f.late_reply_ms.0, f.late_reply_ms.1.max(f.late_reply_ms.0) + 1)
+        } else {
+            0
+        };
         Draw {
             latency_ms,
+            late_reply_ms,
             fail_before: on && r.chance(f.p_fail_before),
             fail_after: on && r.chance(f.p_fail_after),
             list_lag_ms: if on && f.list_lag_ms > 0 { r.below(f.list_lag_ms + 1) } else { 0 },
@@ -196,7 +247,9 @@ impl ObjectStore for SimStore {
     fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
         Box::pin(async move {
             self.stats.puts.fetch_add(1, Ordering::Relaxed);
-            let Draw { latency_ms: lat, fail_before: before, fail_after: after, list_lag_ms } = self.draw();
+            let Draw { latency_ms: lat, late_reply_ms, fail_before: before, fail_after: after, list_lag_ms } =
+                self.draw();
+            let replies = self.replies.clone();
             let (tx, rx) = tokio::sync::oneshot::channel();
             let mem = self.mem.clone();
             let trace = self.trace.clone();
@@ -223,6 +276,11 @@ impl ObjectStore for SimStore {
                     }
                 ));
                 tokio::time::sleep(Duration::from_millis(lat / 2 + 1)).await;
+                if r.is_ok() && late_reply_ms > 0 {
+                    trace.event(&format!("store put {key2} reply delayed {late_reply_ms}ms"));
+                    tokio::time::sleep(Duration::from_millis(late_reply_ms)).await;
+                }
+                replies.wait(&key2).await;
                 let r = match r {
                     Ok(_) if after => Err(unavailable("injected: response lost")),
                     other => other,

@@ -335,9 +335,12 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 };
             }
         }
-        // Re-resolve strongly if the cached database name points to a deleted or recreated database.
+        // Re-resolve strongly if the cached database name points to a deleted
+        // or recreated database. A deletion still in flight is not waited
+        // for: the request's own strong reads or commit then fail with not
+        // found, and no database can take the name before it finishes.
         let opened = match node.open_db(&rec).await {
-            Ok(db) => match db.read_version(Consistency::Strong).await {
+            Ok(db) => match db.latest().await {
                 Err(Error::NotFound(m)) => Err(m),
                 Err(e) => return Err(e),
                 Ok(_) => Ok(db),
@@ -563,12 +566,28 @@ macro_rules! run_txn {
             Some(c) => crate::api::Ran::Replayed(c),
             None => {
                 let mut attempt_ = 0u32;
+                let mut settle_ = false;
                 loop {
-                    let mut txn_ = ctx_.db.begin($isolation, $consistency).await?;
+                    let mut txn_ = crate::api::begin_attempt(ctx_, $isolation, $consistency, settle_).await?;
                     txn_.commit_id = commit_id_;
                     let out_ = {
                         let $t: &mut crate::engine::Txn = &mut txn_;
                         async { $body }.await
+                    };
+                    // An attempt that will not commit answers from reads no
+                    // commit validates: check them if a write was in flight.
+                    let txn_ = match txn_ {
+                        t if t.settled() || (out_.is_ok() && !t.is_read_only()) => t,
+                        t => match ctx_.db.recheck(t).await? {
+                            Some(version) => match out_ {
+                                Ok(out) => break crate::api::Ran::Read { out, version },
+                                Err(e) => break crate::api::failed(ctx_, commit_id_, key_, e).await?,
+                            },
+                            None => {
+                                settle_ = true;
+                                continue;
+                            }
+                        },
                     };
                     let out_ = match out_ {
                         Ok(o) => o,
@@ -584,6 +603,23 @@ macro_rules! run_txn {
     }};
 }
 pub(crate) use run_txn;
+
+/// Begins an attempt of a `run_txn!` transaction. A strong serializable
+/// one starts without waiting for an in-flight commit ([`Db::begin_write`])
+/// unless `settle`: after a recheck found its reads changed, the next
+/// attempt waits, so attempts cannot keep chasing new writes.
+pub(crate) async fn begin_attempt(
+    ctx: &DbCtx,
+    isolation: crate::engine::Isolation,
+    c: Consistency,
+    settle: bool,
+) -> Result<Txn> {
+    if c == Consistency::Strong && isolation == crate::engine::Isolation::Serializable && !settle {
+        ctx.db.begin_write().await
+    } else {
+        ctx.db.begin(isolation, c).await
+    }
+}
 
 pub(crate) fn commit_id_for(node: &Node, ctx: &DbCtx, key: Option<&str>) -> Result<u64> {
     match key {

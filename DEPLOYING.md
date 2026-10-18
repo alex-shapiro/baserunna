@@ -63,6 +63,17 @@ a private advertise address and a cluster secret. Background work (garbage
 collection, TTL expiry, stream retention) runs only while the machine is
 up.
 
+Size the machine for sustained load. A `shared-cpu-1x` machine is
+guaranteed 1/16 of a core and bursts above that only while it has CPU
+credit, which it earns while idle. In a load test it served about 3,900
+cached GETs/s, or 900 operations/s of a mixed read and write workload,
+at 80% CPU, but that drained its credit in minutes. Sustained, it serves
+roughly a twelfth of that. Steady traffic beyond that needs a
+`performance` machine. A commit waits for one manifest `PUT` to Tigris
+(about 75 ms), and writes that arrive meanwhile share the next one, so a
+single client writes about 13 times a second while many clients
+together can write a few hundred times a second to one database.
+
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) deploys
 every push to `main`, building on Fly's remote builder. It needs a
 `FLY_API_TOKEN` repository secret (`fly tokens create deploy --app

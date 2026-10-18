@@ -1,0 +1,47 @@
+# One Baserunna node on Fly.io with a Tigris bucket. Setup steps are in
+# DEPLOYING.md.
+#
+# Secrets:
+#
+# BASERUNNA_STORE           s3://<bucket>
+# BASERUNNA_ADMIN_EMAIL
+# BASERUNNA_ADMIN_PASSWORD
+# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3, AWS_REGION
+#                           (set by `fly storage create`)
+
+app = 'baserunna'
+primary_region = 'ewr'
+kill_signal = 'SIGTERM'
+kill_timeout = '30s'
+
+[build]
+
+[env]
+BASERUNNA_PUBLIC_URL = 'https://baserunna.fly.dev'
+BASERUNNA_TRUSTED_PROXY_HOPS = '1'
+BASERUNNA_CACHE_MB = '128'
+
+[http_service]
+internal_port = 8080
+force_https = true
+auto_stop_machines = 'stop'
+auto_start_machines = true
+min_machines_running = 0
+processes = ['app']
+
+[http_service.concurrency]
+type = 'requests'
+soft_limit = 200
+hard_limit = 250
+
+[[http_service.checks]]
+interval = '15s'
+timeout = '5s'
+grace_period = '30s'
+method = 'GET'
+path = '/healthz'
+
+[[vm]]
+cpu_kind = 'shared'
+cpus = 1
+memory = '512mb'

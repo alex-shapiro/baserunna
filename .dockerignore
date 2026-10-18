@@ -5,3 +5,5 @@ mutants.out*
 .git
 .claude
 .cargo
+.github
+fly.toml

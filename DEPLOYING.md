@@ -38,6 +38,36 @@ Every node of a cluster needs:
 
 `fs:` stores are for a single development process only (SPEC §12).
 
+## Fly.io (single node)
+
+[`fly.toml`](fly.toml) runs one node on a Fly machine against a
+[Tigris](https://fly.io/docs/tigris/) bucket, which supports the
+conditional writes Baserunna needs. Fly's proxy terminates TLS, and the
+machine stops when idle and starts on the next request. One-time setup,
+with [`flyctl`](https://fly.io/docs/flyctl/install/):
+
+```sh
+fly apps create baserunna
+fly storage create --app baserunna --name <bucket>   # sets the AWS_* secrets
+fly secrets set --app baserunna --stage \
+  BASERUNNA_STORE=s3://<bucket> \
+  BASERUNNA_ADMIN_EMAIL=you@example.com \
+  BASERUNNA_ADMIN_PASSWORD=$(openssl rand -base64 24)
+fly deploy --ha=false
+```
+
+Set the admin secrets before the first deploy: under the default
+`first_user_only` sign-up policy, whoever signs up first otherwise becomes
+admin. Keep the app at one machine (`--ha=false`); a second one would need
+a private advertise address and a cluster secret. Background work (garbage
+collection, TTL expiry, stream retention) runs only while the machine is
+up.
+
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) deploys
+every push to `main`, building on Fly's remote builder. It needs a
+`FLY_API_TOKEN` repository secret (`fly tokens create deploy --app
+baserunna`).
+
 ## TLS
 
 Terminate TLS at the load balancer or ingress. Nodes speak plain HTTP, to

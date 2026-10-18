@@ -76,8 +76,9 @@ pub async fn run(
                 } else {
                     // A client that reads through one node and then another
                     // must not see the value go back in time.
-                    let kinds = match c.rng().below(5) {
-                        4 => vec![1, 2],
+                    let kinds = match c.rng().below(6) {
+                        4 => vec![1, 0],
+                        5 => vec![1, 2],
                         k => vec![k],
                     };
                     let mut start = start;

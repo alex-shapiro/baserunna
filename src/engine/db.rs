@@ -161,9 +161,11 @@ pub struct Db {
     st: Mutex<State>,
     q: Mutex<Queue>,
     load_lock: tokio::sync::Mutex<()>,
-    /// True while a manifest write by this node is in flight. Its result
-    /// may already be visible to others, so lease reads wait for it.
-    writing: std::sync::atomic::AtomicBool,
+    /// Manifest writes by this node started and finished; one is in flight
+    /// while they differ. Its result may already be visible to others, so
+    /// strong reads that arrive meanwhile wait for it.
+    writes_started: std::sync::atomic::AtomicU64,
+    writes_finished: std::sync::atomic::AtomicU64,
     write_done: tokio::sync::Notify,
     /// Notified whenever a newer version is installed.
     installed: tokio::sync::Notify,
@@ -244,7 +246,8 @@ impl Db {
             }),
             q: Mutex::new(Queue { items: VecDeque::new(), running: false }),
             load_lock: tokio::sync::Mutex::new(()),
-            writing: std::sync::atomic::AtomicBool::new(false),
+            writes_started: 0.into(),
+            writes_finished: 0.into(),
             write_done: tokio::sync::Notify::new(),
             installed: tokio::sync::Notify::new(),
             staging: Mutex::new(Staging::default()),
@@ -538,17 +541,28 @@ impl Db {
     /// flight, so the snapshot is as strong as [`Db::snapshot`]'s. An
     /// unsettled one may predate a write that other nodes can already read.
     pub async fn latest(self: &Arc<Self>) -> Result<(Snapshot, bool)> {
-        let settled = !self.writing.load(std::sync::atomic::Ordering::SeqCst);
+        let settled = !self.writing();
         Ok((self.resolve(Consistency::Strong).await?, settled))
     }
 
+    fn writing(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.writes_finished.load(SeqCst) < self.writes_started.load(SeqCst)
+    }
+
+    /// Waits for the manifest write in flight when called, if any. Writes
+    /// started later are not waited for: nobody can have seen their result
+    /// before the caller arrived, so it is ordered before them, and readers
+    /// are not starved while commits follow one another.
     async fn wait_for_write(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let started = self.writes_started.load(SeqCst);
         let mut waited_since = None;
         loop {
             let notified = self.write_done.notified();
             let mut notified = std::pin::pin!(notified);
             notified.as_mut().enable();
-            if !self.writing.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.writes_finished.load(SeqCst) >= started {
                 break;
             }
             waited_since.get_or_insert_with(Instant::now);
@@ -922,7 +936,7 @@ impl Db {
                 return;
             };
             let started = Instant::now();
-            self.writing.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let res =
                 self.shared.store.put(&manifest_key(&self.id), m.encode(), PutMode::IfMatch(base.etag.clone())).await;
             if !res.is_ok() {
@@ -997,7 +1011,7 @@ impl Db {
     }
 
     fn write_finished(&self) {
-        self.writing.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.writes_finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.write_done.notify_waiters();
     }
 

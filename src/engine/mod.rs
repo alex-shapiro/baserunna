@@ -208,7 +208,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(store: DynStore, env: Arc<Env>, cfg: EngineConfig, node_id: String) -> Arc<Engine> {
         let shared = Arc::new(Shared {
-            store,
+            store: Arc::new(crate::timing::TimedStore(store)),
             cache: cache::Cache::new(cfg.cache_bytes),
             compaction_slots: Semaphore::new(cfg.compaction_concurrency.max(1)),
             cfg,

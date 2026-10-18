@@ -1238,7 +1238,18 @@ Logs go to stderr, one JSON object per line:
 request is logged once on each node it reaches, under its request id
 (§7): `method`, `route` (the route template, never the path, which may
 hold keys), `status`, `ms`, `hops`, and `forwarded_to` when another node
-answered. The mail webhook receives `{"from", "to", "subject", "text"}`.
+answered. Where the time went is added when nonzero: `store_ms` and
+`store`, the request's own object-store calls by object class and
+operation (`{"manifest.get": {"n", "ms", "bytes", "errors"?}, …}`);
+`commits` and `commit_ms`, time from enqueueing its commits to their
+acknowledgement; and `read_wait_ms`, time strong reads waited for an
+in-flight manifest write (§5.5). Each commit batch that writes a manifest
+is logged as `msg: "commit"` with `db`, `txns`, `work` (all queued items,
+including lease renewals and compactions), `queued_ms` (the oldest item's
+wait), `build_ms` (validation, merging and tail flushes), `ms`, `store`,
+and the `request_ids` of its items, so a slow request's `commit_ms` can
+be split into queueing, building and the manifest `PUT`. The mail webhook
+receives `{"from", "to", "subject", "text"}`.
 
 On SIGTERM or SIGINT a node drains (failing `/healthz`), stops accepting
 connections, waits for in-flight requests, then releases its leases and

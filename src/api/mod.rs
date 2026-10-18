@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::log::{self, REQUEST_ID_HEADER};
 use crate::meta::{Access, DbRecord};
 use crate::node::{Node, Principal};
+use crate::timing;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, Request, State};
@@ -411,7 +412,8 @@ async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: 
         let method = req.method().to_string();
         let route = req.extensions().get::<MatchedPath>().map_or("unmatched", |m| m.as_str()).to_string();
         let hops = hops(req.headers());
-        let resp = next.run(req).await;
+        let tally = Arc::new(timing::Tally::default());
+        let resp = timing::scoped(tally.clone(), next.run(req)).await;
         let mut fields = vec![
             ("method", json!(method)),
             ("route", json!(route)),
@@ -421,6 +423,17 @@ async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: 
         ];
         if let Some(ForwardedTo(t)) = resp.extensions().get::<ForwardedTo>() {
             fields.push(("forwarded_to", json!(t)));
+        }
+        if let Some(store) = tally.store_json() {
+            fields.push(("store_ms", json!(tally.store_ms())));
+            fields.push(("store", store));
+        }
+        if let (n @ 1.., wait) = tally.commits() {
+            fields.push(("commits", json!(n)));
+            fields.push(("commit_ms", json!(wait)));
+        }
+        if tally.read_wait_ms() > 0 {
+            fields.push(("read_wait_ms", json!(tally.read_wait_ms())));
         }
         log::event(log::Level::Info, "request", &fields);
         resp

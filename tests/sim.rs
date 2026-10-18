@@ -251,6 +251,37 @@ fn forwards_to_a_restarted_node_are_refused() {
 }
 
 #[test]
+fn request_and_commit_logs_account_for_time() {
+    use baserunna::log::{Level, REQUEST_ID_HEADER, capture};
+    use baserunna::sim::client::Client;
+    let cap = capture(Level::Info);
+    let out = run(22, SimConfig::basic(), |sim| async move {
+        let c = Client::signup(&sim, "u", "u@timing.test", "password-123").await?;
+        c.create_db("t").await?;
+        let rid = [(REQUEST_ID_HEADER, "put-1".to_string())];
+        c.send("PUT", "/v1/dbs/t/kv/k", &rid, "v".into()).await.map_err(|e| format!("{e:?}"))?;
+        Ok(())
+    });
+    out.result.unwrap();
+    let records = cap.records();
+    let put = records.iter().find(|r| r["msg"] == "request" && r["request_id"] == "put-1").expect("request record");
+    assert_eq!(put["commits"], 1, "{put}");
+    assert!(put["commit_ms"].is_u64(), "{put}");
+    let commit = records
+        .iter()
+        .find(|r| {
+            r["msg"] == "commit" && r["request_ids"].as_array().is_some_and(|ids| ids.iter().any(|i| i == "put-1"))
+        })
+        .expect("commit record naming the request");
+    assert!(commit["txns"].as_u64() >= Some(1), "{commit}");
+    assert!(commit["store"]["manifest.put"]["n"].as_u64() >= Some(1), "{commit}");
+    assert!(commit["store"]["manifest.put"]["bytes"].as_u64() > Some(0), "{commit}");
+    for field in ["queued_ms", "build_ms", "ms"] {
+        assert!(commit[field].is_u64(), "{field} missing: {commit}");
+    }
+}
+
+#[test]
 fn request_ids_follow_forwarded_requests() {
     use baserunna::log::{Level, REQUEST_ID_HEADER, capture};
     use baserunna::sim::client::Client;

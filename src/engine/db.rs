@@ -14,6 +14,7 @@ use super::version::{KeyRange, Snapshot, Version};
 use super::{Shared, blob_prefix, levels_key, manifest_key, seg_key};
 use crate::error::{Error, Result};
 use crate::store::{GetOpts, PutMode, StoreError};
+use crate::timing::{self, Class, StoreOp, Tally};
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
@@ -143,8 +144,15 @@ impl State {
 }
 
 struct Queue {
-    items: VecDeque<Work>,
+    items: VecDeque<Queued>,
     running: bool,
+}
+
+struct Queued {
+    work: Work,
+    at: Instant,
+    /// The request that enqueued the work, if any.
+    request_id: Option<Arc<str>>,
 }
 
 pub struct Db {
@@ -494,6 +502,7 @@ impl Db {
             // A write of ours that is in flight may already be visible to
             // readers elsewhere; serving the cached version now could go
             // back in time relative to them.
+            let mut waited_since = None;
             loop {
                 let notified = self.write_done.notified();
                 let mut notified = std::pin::pin!(notified);
@@ -501,7 +510,11 @@ impl Db {
                 if !self.writing.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
+                waited_since.get_or_insert_with(Instant::now);
                 notified.await;
+            }
+            if let Some(t) = waited_since {
+                timing::read_waited(t.elapsed());
             }
         }
         let now = Instant::now();
@@ -635,8 +648,11 @@ impl Db {
             self.shared.store_time_ms().await?;
         }
         let (tx, rx) = oneshot::channel();
+        let enqueued = Instant::now();
         self.enqueue(Work::Commit { req, tx });
-        rx.await.map_err(|_| Error::Unavailable {
+        let r = rx.await;
+        timing::commit_waited(enqueued.elapsed());
+        r.map_err(|_| Error::Unavailable {
             message: "commit interrupted".into(),
             retry_after_ms: None,
             outcome_unknown: true,
@@ -691,7 +707,7 @@ impl Db {
     fn enqueue(self: &Arc<Self>, w: Work) {
         let spawn = {
             let mut q = self.queue();
-            q.items.push_back(w);
+            q.items.push_back(Queued { work: w, at: Instant::now(), request_id: crate::log::request_id() });
             if q.running {
                 false
             } else {
@@ -707,7 +723,7 @@ impl Db {
 
     async fn committer(self: Arc<Self>) {
         loop {
-            let batch: Vec<Work> = {
+            let queued: Vec<Queued> = {
                 let mut q = self.queue();
                 if q.items.is_empty() {
                     q.running = false;
@@ -716,8 +732,40 @@ impl Db {
                 let n = q.items.len().min(self.shared.cfg.commit_batch_max);
                 q.items.drain(..n).collect()
             };
-            self.process(batch).await;
+            let started = Instant::now();
+            let tally = Arc::new(Tally::default());
+            let (meta, batch): (Vec<_>, Vec<_>) = queued.into_iter().map(|q| ((q.at, q.request_id), q.work)).unzip();
+            let txns = batch.iter().filter(|w| matches!(w, Work::Commit { .. })).count();
+            timing::scoped(tally.clone(), self.process(batch)).await;
+            self.log_batch(&meta, txns, started, &tally);
         }
+    }
+
+    /// Logs a batch that wrote the manifest: how long its oldest work waited
+    /// in the queue, and where the batch spent its time.
+    fn log_batch(&self, queued: &[(Instant, Option<Arc<str>>)], txns: usize, started: Instant, tally: &Tally) {
+        use crate::log::{self, Level};
+        use serde_json::json;
+        if tally.store_calls(Class::Manifest, StoreOp::Put) == 0 || !log::enabled(Level::Info) {
+            return;
+        }
+        let oldest = queued.iter().map(|(at, _)| *at).min().unwrap_or(started);
+        let mut fields = vec![
+            ("db", json!(self.id)),
+            ("txns", json!(txns)),
+            ("work", json!(queued.len())),
+            ("queued_ms", json!((started - oldest).as_millis() as u64)),
+            ("build_ms", json!(tally.build_ms())),
+            ("ms", json!(started.elapsed().as_millis() as u64)),
+        ];
+        if let Some(store) = tally.store_json() {
+            fields.push(("store", store));
+        }
+        let ids: Vec<&str> = queued.iter().filter_map(|(_, id)| id.as_deref()).collect();
+        if !ids.is_empty() {
+            fields.push(("request_ids", json!(ids)));
+        }
+        log::event(Level::Info, "commit", &fields);
     }
 
     async fn base_for_commit(self: &Arc<Self>) -> Result<Arc<Version>> {
@@ -757,7 +805,10 @@ impl Db {
                 self.finish_failed(batch, e);
                 return;
             }
-            let plan = match self.build(&base, &batch, now).await {
+            let build_started = Instant::now();
+            let plan = self.build(&base, &batch, now).await;
+            timing::built(build_started.elapsed());
+            let plan = match plan {
                 Ok(p) => p,
                 Err(e) => {
                     let e = if maybe_applied { unknown(e) } else { e };

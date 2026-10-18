@@ -24,6 +24,7 @@ pub mod sim;
 pub mod store;
 pub mod stream;
 pub mod table;
+pub mod timing;
 pub mod util;
 
 pub use error::{Error, Result};

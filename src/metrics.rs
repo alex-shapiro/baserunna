@@ -1,12 +1,12 @@
 //! Latency histograms of a node's object-store calls, commit batches and API
-//! requests, served by `GET /v1/admin/metrics`.
+//! requests, served by `/v1/admin/metrics`.
 
 use crate::engine::ObjectClass;
 use crate::timing::StoreOp;
 use serde_json::{Map, Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// Bucket `i` holds durations up to `FIRST_US * GROWTH^i` µs: 10 µs to
@@ -101,22 +101,19 @@ impl Histogram {
     }
 }
 
-/// One node's latency histograms.
+/// Latency histograms of a node's object-store calls and commit batches,
+/// kept by its engine.
 #[derive(Default)]
-pub struct Metrics {
+pub struct StoreMetrics {
     store: [[Histogram; StoreOp::ALL.len()]; ObjectClass::ALL.len()],
     store_errors: [[AtomicU64; StoreOp::ALL.len()]; ObjectClass::ALL.len()],
     /// Commit batches that wrote a manifest, from dequeue to acknowledgement.
     commits: Histogram,
     batch_txns: AtomicU64,
     batch_txns_max: AtomicU64,
-    /// How late a periodic 100 ms timer fires: time the node had work it
-    /// could not run, because its CPU was busy or taken away.
-    lag: Histogram,
-    routes: Mutex<BTreeMap<String, Arc<Histogram>>>,
 }
 
-impl Metrics {
+impl StoreMetrics {
     pub fn store_call(&self, class: ObjectClass, op: StoreOp, d: Duration, failed: bool) {
         self.store[class as usize][op as usize].record(d);
         if failed {
@@ -130,21 +127,8 @@ impl Metrics {
         self.batch_txns_max.fetch_max(txns as u64, Relaxed);
     }
 
-    /// Records how late the scheduler-lag probe's timer fired.
-    pub fn lag(&self, late: Duration) {
-        self.lag.record(late);
-    }
-
-    /// Records a request to `route` (method and route template).
-    pub fn request(&self, route: &str, d: Duration) {
-        let h = {
-            let mut m = self.routes.lock().unwrap_or_else(|e| e.into_inner());
-            m.entry(route.to_string()).or_default().clone()
-        };
-        h.record(d);
-    }
-
-    pub fn json(&self) -> Json {
+    /// Adds `store` and `commits` fields to `out`.
+    pub fn json_into(&self, out: &mut Map<String, Json>) {
         let mut store = Map::new();
         for class in ObjectClass::ALL {
             for op in StoreOp::ALL {
@@ -157,23 +141,70 @@ impl Metrics {
                 store.insert(format!("{}.{}", class.name(), op.name()), v);
             }
         }
-        let routes: Map<String, Json> =
-            self.routes.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, h)| (k.clone(), h.json())).collect();
         let mut commits = self.commits.json();
         let batches = self.commits.count().max(1) as f64;
         commits["txns_per_batch"] = json!((self.batch_txns.load(Relaxed) as f64 / batches * 10.0).round() / 10.0);
         commits["max_txns_per_batch"] = json!(self.batch_txns_max.load(Relaxed));
-        json!({"store": store, "commits": commits, "routes": routes, "lag": self.lag.json(), "cpu": cpu_json()})
+        out.insert("store".into(), Json::Object(store));
+        out.insert("commits".into(), commits);
     }
 
     pub fn reset(&self) {
         self.store.iter().flatten().for_each(Histogram::reset);
         self.store_errors.iter().flatten().for_each(|e| e.store(0, Relaxed));
         self.commits.reset();
-        self.lag.reset();
         self.batch_txns.store(0, Relaxed);
         self.batch_txns_max.store(0, Relaxed);
-        self.routes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+/// Methods requests are counted under; any other method counts as `OTHER`.
+const METHODS: [&str; 8] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "OTHER"];
+
+/// Latency histograms of a node's API requests and scheduling delays.
+#[derive(Default)]
+pub struct ServerMetrics {
+    /// Per method in [`METHODS`], keyed by route template.
+    routes: RwLock<[BTreeMap<String, Arc<Histogram>>; METHODS.len()]>,
+    /// How late a periodic 100 ms timer fires: time the node had work it
+    /// could not run, because its CPU was busy or taken away.
+    lag: Histogram,
+}
+
+impl ServerMetrics {
+    /// Records a request with `method` to the route template `route`, or to
+    /// no route.
+    pub fn request(&self, method: &str, route: Option<&str>, d: Duration) {
+        let m = METHODS.iter().position(|x| *x == method).unwrap_or(METHODS.len() - 1);
+        let route = route.unwrap_or("unmatched");
+        if let Some(h) = self.routes.read().unwrap_or_else(|e| e.into_inner())[m].get(route) {
+            return h.record(d);
+        }
+        let mut routes = self.routes.write().unwrap_or_else(|e| e.into_inner());
+        routes[m].entry(route.to_string()).or_default().record(d);
+    }
+
+    /// Records how late the scheduler-lag probe's timer fired.
+    pub fn lag(&self, late: Duration) {
+        self.lag.record(late);
+    }
+
+    /// Adds `routes`, `lag` and `cpu` fields to `out`.
+    pub fn json_into(&self, out: &mut Map<String, Json>) {
+        let routes = self.routes.read().unwrap_or_else(|e| e.into_inner());
+        let routes: Map<String, Json> = METHODS
+            .iter()
+            .zip(routes.iter())
+            .flat_map(|(m, by_route)| by_route.iter().map(move |(r, h)| (format!("{m} {r}"), h.json())))
+            .collect();
+        out.insert("routes".into(), Json::Object(routes));
+        out.insert("lag".into(), self.lag.json());
+        out.insert("cpu".into(), cpu_json());
+    }
+
+    pub fn reset(&self) {
+        self.routes.write().unwrap_or_else(|e| e.into_inner()).iter_mut().for_each(BTreeMap::clear);
+        self.lag.reset();
     }
 }
 
@@ -217,5 +248,26 @@ mod tests {
         assert_eq!(j["max_ms"], 100.0);
         h.reset();
         assert_eq!(h.json()["count"], 0);
+    }
+
+    #[test]
+    fn routes_are_bounded_by_method_and_template() {
+        let m = ServerMetrics::default();
+        for method in ["GET", "GET", "BREW", "QQ1"] {
+            m.request(method, Some("/v1/dbs/{db}"), Duration::from_millis(1));
+        }
+        m.request("ZZ", None, Duration::from_millis(1));
+        let mut out = Map::new();
+        m.json_into(&mut out);
+        let routes: Vec<_> =
+            out["routes"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v["count"].clone())).collect();
+        assert_eq!(
+            routes,
+            [
+                ("GET /v1/dbs/{db}".into(), json!(2)),
+                ("OTHER /v1/dbs/{db}".into(), json!(2)),
+                ("OTHER unmatched".into(), json!(1))
+            ]
+        );
     }
 }

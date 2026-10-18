@@ -4,7 +4,7 @@
 use baserunna::sim::SimResponse;
 use baserunna::sim::openapi_check::{check_response, doc, match_path, validate};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 fn refs(v: &Value, out: &mut Vec<String>) {
@@ -63,12 +63,25 @@ fn router_routes() -> BTreeSet<(String, String)> {
     files.sort();
     for f in files.iter().filter(|f| f.extension().is_some_and(|x| x == "rs")) {
         let text = std::fs::read_to_string(f).unwrap();
-        for chunk in text.split(".route(\"").skip(1) {
-            let path = chunk.split('"').next().unwrap().replace("{*key}", "{key}");
+        let text = text.split("\n#[cfg(test)]").next().unwrap();
+        let consts: HashMap<&str, &str> = text
+            .lines()
+            .filter_map(|l| l.split_once("const ")?.1.split_once(": &str = \""))
+            .map(|(name, v)| (name, v.trim_end_matches("\";")))
+            .collect();
+        for chunk in text.split(".route(").skip(1) {
+            let (arg, rest) = chunk.split_once(',').unwrap_or((chunk, ""));
+            let arg = arg.trim();
+            let Some(path) =
+                arg.strip_prefix('"').map(|a| a.trim_end_matches('"')).or_else(|| consts.get(arg).copied())
+            else {
+                continue;
+            };
+            let path = path.replace("{*key}", "{key}");
             if path.starts_with("/internal") {
                 continue;
             }
-            let rest: String = chunk.split('"').nth(1).unwrap_or("").chars().take_while(|c| *c != '\n').collect();
+            let rest: String = rest.chars().take_while(|c| *c != '\n').collect();
             for m in ["get", "post", "put", "patch", "delete"] {
                 if rest.contains(&format!("{m}(")) {
                     out.insert((path.clone(), m.to_string()));

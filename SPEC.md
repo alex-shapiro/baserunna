@@ -356,8 +356,7 @@ The manifest is a binary, CRC32C-checksummed document (`engine/manifest.rs`).
 After its magic and format comes a codec byte: the rest of the body is
 stored raw, or compressed with zstd (level 1) when that saves at least an
 eighth. Every commit uploads the whole manifest, tail included, so its size
-sets commit latency: on Tigris a 200 KB tail of text-like values took the
-median commit from 54 ms to 123 ms before compression.
+sets commit latency.
 
 ```
 magic "BRMF", format u16, codec u8
@@ -509,12 +508,14 @@ If a conditional `PUT` on the manifest does not succeed on the first attempt:
 A store occasionally holds a write's response for seconds after applying it.
 If the manifest `PUT` has not answered within `manifest_put_hedge_ms` (250
 ms), the committer sends an identical second `PUT` with the same
-`If-Match`, so at most one of the two can apply. The first success decides
-the attempt. A refusal of either copy is treated like a timeout: the other
-copy may have applied, so the committer reloads the manifest and finds its
-commit records as above, without waiting for the slow copy. Objects the
-attempt would have deleted from `obsolete` are deleted in either case:
-they were past their grace period when the attempt was planned.
+`If-Match`, so at most one of the two can apply. Either success decides the
+attempt. A refusal of the second copy while the first is unanswered is
+treated like a timeout, since the first may have applied: the committer
+reloads the manifest and finds its commit records as above, without waiting
+for the slow copy. Any other failure waits for the other copy, and is
+treated like a timeout if either copy's outcome is unknown. Objects the
+attempt would have deleted from `obsolete` are deleted after an unknown
+outcome too: they were past their grace period when the attempt was planned.
 
 #### Commit Records
 
@@ -960,7 +961,7 @@ listing that issued them.
 
 Auth lookups (session, API key, DB and organization name resolution,
 membership roles) are snapshot reads of `sys` with `max_staleness` of
-2 s, cached per node for at most 30 s. A revocation (of a session, a key,
+2 s, cached per node for at most 30 s from when the read began. A revocation (of a session, a key,
 an account, or a role) takes effect at once on the node that performed it
 and within 32 s everywhere else. Only memberships are cached, never their
 absence, so a member added is recognized at once everywhere. A snapshot
@@ -1031,11 +1032,12 @@ resurrect a purged database.
 - **API keys**: `brk_<id>_<secret>`. Only the secret's SHA-256 is stored. A
   key can be scoped to one DB and/or read-only. It is shown once at creation.
 - **Rate limits** (`limits.rs`): token buckets, kept per node, so a cluster
-  of N nodes admits up to N times each rate. Every authenticated request,
-  except committing or aborting an interactive transaction (its `begin` was
-  counted), takes a token from its user's bucket (500/s, burst twice that) and, for
+  of N nodes admits up to N times each rate. Every authenticated request
+  takes a token from its user's bucket (500/s, burst twice that) and, for
   an API key, from the key's (500/s, or the `rate_limit` the key was
-  created with); both or neither. Sign-ins, sign-ups and Google sign-in
+  created with); both or neither. Committing or aborting an interactive
+  transaction may overdraw the buckets by up to one burst, since refusing it
+  would waste its admitted `begin`; later requests wait to repay the debt. Sign-ins, sign-ups and Google sign-in
   take from their client address's bucket (1/s, burst 20), and sign-ups
   also from a second one (20 an hour, burst 5). A refused request gets
   `429 rate_limited` with `Retry-After` and was not applied.
@@ -1159,7 +1161,7 @@ POST /v1/dbs/{db}/streams/{s}/trim before_seq
 GET /v1/dbs/{db}/streams/{s}/consumers limit, cursor
 GET|PUT|DELETE /v1/dbs/{db}/streams/{s}/consumers/{c}
 GET /v1/admin/users GET /v1/admin/nodes POST /v1/admin/users/{id}/disable
-GET /v1/admin/metrics latency histograms of the serving node (?reset=true clears them)
+GET|DELETE /v1/admin/metrics latency histograms of the serving node (DELETE also clears them)
 ```
 
 Listings take `limit` and `cursor` and answer `next_cursor` (§8).
@@ -1281,7 +1283,7 @@ participating `request_ids`. The mail webhook receives `{"from", "to",
 "subject", "text"}`.
 
 `GET /v1/admin/metrics` returns the serving node's latency histograms since
-it started or was last reset: object-store calls by object class and
+it started or was last cleared by `DELETE`: object-store calls by object class and
 operation, with error counts; commit batches that wrote a manifest, with
 transactions per batch; requests by method and route; and how late a
 periodic 100 ms timer fires, which shows when the node had work it could not
@@ -1619,12 +1621,28 @@ Bugs the DST suite found, each now covered by the regular suite:
     the leases' lifetime, and up to the membership's 6-minute liveness
     window for databases hashed to the earlier run.
 
-One campaign failure came from the simulator itself: a forward the
+27. _Leases forgotten after ambiguous writes._ A node records its lease
+    only when a manifest write succeeds. When a write's outcome was unknown
+    and the retry found it applied, the node held the lease that write
+    renewed without knowing it, so orphan sweeps, which run only on the
+    holder, skipped every cycle until a write succeeded outright. Hedged
+    manifest writes made this common. A write found applied now renews the
+    lease as of when it was sent (§5.5).
+
+28. _Stale authorization cached after a slow read._ A role lookup that
+    began before a membership change, and read the system database slowly,
+    cached the old role after the change had cleared it, and kept it for a
+    full cache lifetime from then. Cached entries now expire a lifetime
+    after their read began (§9).
+
+Two campaign failures came from the simulator itself. One: a forward the
 network had duplicated, whose original copy then met a crashed target, was
 reported as certainly undelivered. The receiving node fell back to serving
 it locally and answered `404 txn_not_found` for a commit whose duplicate had
 applied. A refused copy now counts as possibly delivered once a duplicate
-was sent, as a real transport that resends knows it did.
+was sent, as a real transport that resends knows it did. Another came from
+the `tables` workload, which gave up on a unique email when every claim to
+it had an unknown outcome and none had applied; it now claims again.
 
 The cost measurements (§13.4) found five more: a read-heavy database whose
 lease had lapsed never acquired it again (paying a validating GET per read

@@ -152,13 +152,13 @@ async fn run() -> Result<(), String> {
     let env = Arc::new(Env::real());
     let services = Services { transport, oidc, mailer };
     let node = Node::start(cfg, env.clone(), store, services).await.map_err(|e| format!("startup failed: {e}"))?;
-    let metrics = node.engine.shared.metrics.clone();
+    let n = node.clone();
     env.spawn(async move {
         const PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
         loop {
             let started = tokio::time::Instant::now();
             tokio::time::sleep(PERIOD).await;
-            metrics.lag(started.elapsed().saturating_sub(PERIOD));
+            n.metrics.lag(started.elapsed().saturating_sub(PERIOD));
         }
     });
     baserunna::log::set_process_node(&node.id);

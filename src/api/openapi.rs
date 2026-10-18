@@ -734,15 +734,19 @@ fn paths() -> Value {
         "/v1/admin/metrics",
         "get",
         Op {
-            params: vec![query("reset", b(), "Clear the histograms after reading them.")],
             desc: Some(
                 "Latency histograms of this node since it started or was last reset: object-store calls by \
-                 object class and operation, commit batches that wrote a manifest, requests by route, and how \
-                 late a periodic timer fires (`lag`). `cpu` holds cumulative process CPU and host steal time in \
-                 ms where the OS reports them. Quantiles are accurate to 25%.",
+                 object class and operation, commit batches that wrote a manifest, requests by method and \
+                 route, and how late a periodic timer fires (`lag`). `cpu` holds cumulative process CPU and \
+                 host steal time in ms where the OS reports them. Quantiles are accurate to 25%.",
             ),
             ..op("Latency metrics of the serving node (admin)", "admin", vec![("200", resp("Metrics", r("Metrics")))])
         },
+    );
+    add(
+        "/v1/admin/metrics",
+        "delete",
+        op("Read and reset the serving node's metrics (admin)", "admin", vec![("200", resp("Metrics", r("Metrics")))]),
     );
     add(
         "/v1/admin/nodes",

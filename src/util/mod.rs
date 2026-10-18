@@ -14,6 +14,25 @@ use std::hash::{BuildHasherDefault, DefaultHasher};
 /// `HashMap` with a deterministic hasher.
 pub type DetHashMap<K, V> = HashMap<K, V, BuildHasherDefault<DefaultHasher>>;
 
+pub enum Either<A, B> {
+    Left(A),
+    Right(B),
+}
+
+/// Polls `a` and `b` until one finishes and returns its output, leaving the
+/// other to be awaited or dropped. `a` is polled first, so the result is
+/// deterministic, unlike `select!`'s.
+pub async fn race<A: Future + Unpin, B: Future + Unpin>(a: &mut A, b: &mut B) -> Either<A::Output, B::Output> {
+    use std::task::Poll;
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(x) = std::pin::Pin::new(&mut *a).poll(cx) {
+            return Poll::Ready(Either::Left(x));
+        }
+        std::pin::Pin::new(&mut *b).poll(cx).map(Either::Right)
+    })
+    .await
+}
+
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let d = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data);
     let mut out = [0u8; 32];

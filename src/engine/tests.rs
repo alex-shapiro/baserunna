@@ -512,7 +512,7 @@ pub(super) struct DelayStore {
     manifest_put_conflicts: AtomicU32,
     manifest_put_outages: AtomicU32,
     /// Manifest writes that are applied, but whose reply is lost.
-    manifest_put_lost: AtomicU32,
+    pub(super) manifest_put_lost: AtomicU32,
     manifest_get_outages: AtomicU32,
     manifest_puts: AtomicU32,
     gets: Mutex<Vec<(String, bool)>>,

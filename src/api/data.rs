@@ -27,6 +27,11 @@ use tokio::time::Instant;
 
 type J = axum::Json<Json>;
 
+/// The route that aborts an interactive transaction.
+pub(super) const TXN_ROUTE: &str = "/v1/dbs/{db}/transactions/{id}";
+/// The route that commits an interactive transaction.
+pub(super) const COMMIT_ROUTE: &str = "/v1/dbs/{db}/transactions/{id}/commit";
+
 pub fn routes() -> Router<Arc<Node>> {
     Router::new()
         .route("/v1/dbs/{db}", get(get_db).delete(delete_db))
@@ -37,9 +42,9 @@ pub fn routes() -> Router<Arc<Node>> {
         .route("/v1/dbs/{db}/blobs/{blob_id}", get(get_blob))
         .route("/v1/dbs/{db}/txn", post(one_shot))
         .route("/v1/dbs/{db}/transactions", post(begin_txn))
-        .route("/v1/dbs/{db}/transactions/{id}", delete(abort_txn))
+        .route(TXN_ROUTE, delete(abort_txn))
         .route("/v1/dbs/{db}/transactions/{id}/ops", post(txn_ops))
-        .route("/v1/dbs/{db}/transactions/{id}/commit", post(commit_txn))
+        .route(COMMIT_ROUTE, post(commit_txn))
         .route("/v1/dbs/{db}/commits/{id}", get(commit_status))
         .route("/v1/dbs/{db}/tables", get(list_tables).post(create_table))
         .route("/v1/dbs/{db}/tables/{t}", get(get_table).delete(drop_table))
@@ -643,26 +648,16 @@ async fn commit_txn(
         ctx.require_write()?;
     }
     let cid = t.commit_id;
-    let read_only = t.is_read_only();
-    let revalidate = t.needs_revalidation(!read_only);
-    let untracked = t.has_untracked_reads();
+    if t.needs_revalidation(!t.is_read_only()) {
+        let Some(version) = ctx.db.revalidate(t).await? else {
+            return Err(Error::Conflict("the transaction read data a concurrent commit changed".into()));
+        };
+        return Ok(axum::Json(json!({
+            "version": version, "commit_id": commit_hex(cid), "appends": [], "results": results,
+        })));
+    }
     let mut creq = t.into_request();
     creq.deadline = Some(ctx.deadline);
-    if revalidate {
-        let conflict = || Error::Conflict("the transaction read data a concurrent commit changed".into());
-        if untracked {
-            return Err(conflict());
-        }
-        match ctx.db.validate_strong(&creq).await? {
-            None => return Err(conflict()),
-            Some(version) if read_only => {
-                return Ok(axum::Json(json!({
-                    "version": version, "commit_id": commit_hex(cid), "appends": [], "results": results,
-                })));
-            }
-            Some(_) => {}
-        }
-    }
     let c = ctx.db.commit_detailed(creq).await.map_err(|e| naming_commit(e, cid))?;
     let own_appends = b.ops.iter().filter(|o| matches!(o, Op::Append { .. })).count();
     ops::fill_appends(&b.ops, &mut results, &c.appends[c.appends.len().saturating_sub(own_appends)..]);

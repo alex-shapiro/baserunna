@@ -219,6 +219,7 @@ pub struct Node {
     pub started_ms: u64,
     router: OnceLock<axum::Router>,
     pub limiter: Limiter,
+    pub metrics: crate::metrics::ServerMetrics,
     hash_slots: tokio::sync::Semaphore,
     draining: std::sync::atomic::AtomicBool,
 }
@@ -264,6 +265,7 @@ impl Node {
             forwards: cluster::ForwardDedup::new(Duration::from_secs(60)),
             router: OnceLock::new(),
             limiter: Limiter::default(),
+            metrics: Default::default(),
             hash_slots: tokio::sync::Semaphore::new(cfg.limits.hash_concurrency.max(1)),
             draining: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -605,23 +607,26 @@ impl Node {
 
     /// Authenticates a bearer token or session cookie value and checks rate limits.
     pub async fn authenticate(&self, token: &str) -> Result<Principal> {
-        self.authenticate_metered(token, true).await
+        self.authenticate_metered(token, false).await
     }
 
-    /// [`Node::authenticate`], taking a rate-limit token only if `metered`.
-    pub async fn authenticate_metered(&self, token: &str, metered: bool) -> Result<Principal> {
+    /// [`Node::authenticate`], letting the request overdraw its rate limits
+    /// (see [`Limiter::borrow`]) if `may_borrow`.
+    pub async fn authenticate_metered(&self, token: &str, may_borrow: bool) -> Result<Principal> {
         let p = self.principal(token).await?;
-        if !metered {
-            return Ok(p);
-        }
         let user_key = format!("user:{}", p.user.id);
         let lim = &self.cfg.limits;
-        match &p.cred {
+        let key;
+        let keys: &[(&str, Rate)] = match &p.cred {
             Credential::ApiKey { id, rate_limit, .. } => {
-                let key_rate = rate_limit.map_or(lim.api_key, |r| Rate::per_sec(r as f64));
-                self.limiter.take(&[(&format!("key:{id}"), key_rate), (&user_key, lim.user)], "requests")?;
+                key = format!("key:{id}");
+                &[(&key, rate_limit.map_or(lim.api_key, |r| Rate::per_sec(r as f64))), (&user_key, lim.user)]
             }
-            Credential::Session { .. } => self.limiter.take(&[(&user_key, lim.user)], "requests")?,
+            Credential::Session { .. } => &[(&user_key, lim.user)],
+        };
+        match may_borrow {
+            true => self.limiter.borrow(keys, "requests")?,
+            false => self.limiter.take(keys, "requests")?,
         }
         Ok(p)
     }
@@ -631,6 +636,7 @@ impl Node {
         if let Some(p) = self.auth_cache.get(&cache_key) {
             return Ok(p);
         }
+        let read_at = Instant::now();
         let p = match self.lookup_principal(token, &cache_key, false).await {
             Err(Error::Unauthenticated(_)) => self.lookup_principal(token, &cache_key, true).await?,
             other => other?,
@@ -638,7 +644,7 @@ impl Node {
         if p.user.disabled {
             return Err(Error::PermissionDenied("this account is disabled".into()));
         }
-        self.auth_cache.store(cache_key, Some(p.clone()));
+        self.auth_cache.store(cache_key, Some(p.clone()), read_at);
         Ok(p)
     }
 
@@ -1086,9 +1092,10 @@ impl Node {
         if !strong && let Some(r) = self.role_cache.get(&key) {
             return Ok(Some(r));
         }
+        let read_at = Instant::now();
         let mut t = self.sys_read_at(strong).await?;
         let role = meta::member_role(&mut t, owner_id, &user.id).await?;
-        self.role_cache.store(key, role);
+        self.role_cache.store(key, role, read_at);
         Ok(role)
     }
 
@@ -1101,9 +1108,10 @@ impl Node {
         if !strong && let Some(rec) = self.name_cache.get(&key) {
             return Ok(Some(rec));
         }
+        let read_at = Instant::now();
         let mut t = self.sys_read_at(strong).await?;
         let rec = meta::resolve_db(&mut t, owner_id, name).await?;
-        self.name_cache.store(key, rec.clone());
+        self.name_cache.store(key, rec.clone(), read_at);
         Ok(rec)
     }
 
@@ -1111,9 +1119,10 @@ impl Node {
         if !strong && let Some(o) = self.org_cache.get(&name.to_string()) {
             return Ok(Some(o));
         }
+        let read_at = Instant::now();
         let mut t = self.sys_read_at(strong).await?;
         let o = meta::org_by_name(&mut t, name).await?;
-        self.org_cache.store(name.to_string(), o.clone());
+        self.org_cache.store(name.to_string(), o.clone(), read_at);
         Ok(o)
     }
 

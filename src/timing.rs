@@ -6,7 +6,7 @@
 //! is not attributed to the caller's tally.
 
 use crate::engine::ObjectClass;
-use crate::metrics::Metrics;
+use crate::metrics::StoreMetrics;
 use crate::store::{BoxFut, DynStore, GetOpts, GetResult, ListPage, ObjectStore, PutMode, SResult, StoreError};
 use bytes::Bytes;
 use serde_json::{Map, Value as Json, json};
@@ -169,56 +169,77 @@ pub fn record_build_time(d: Duration) {
 }
 
 /// Object-store wrapper that records each operation in the task-local [`Tally`] and in the
-/// node's [`Metrics`].
+/// node's [`StoreMetrics`]. An operation dropped before it finishes, such as the slower copy of
+/// a hedged write, is recorded with the time it ran.
 pub struct TimedStore {
     pub inner: DynStore,
-    pub metrics: Arc<Metrics>,
+    pub metrics: Arc<StoreMetrics>,
 }
 
-impl TimedStore {
-    fn record<T>(&self, key: &str, op: StoreOp, started: Instant, bytes: u64, res: &SResult<T>) {
-        let class = ObjectClass::from_key(key);
-        let elapsed = started.elapsed();
-        let failed = matches!(res, Err(e) if !matches!(e, StoreError::NotFound | StoreError::NotModified));
-        self.metrics.store_call(class, op, elapsed, failed);
+/// Records one store operation when dropped.
+struct Call<'a> {
+    store: &'a TimedStore,
+    key: &'a str,
+    op: StoreOp,
+    started: Instant,
+    bytes: u64,
+    failed: bool,
+}
+
+impl Call<'_> {
+    fn finish<T>(&mut self, res: &SResult<T>, bytes: impl FnOnce(&T) -> u64) {
+        self.failed = matches!(res, Err(e) if !matches!(e, StoreError::NotFound | StoreError::NotModified));
+        self.bytes += res.as_ref().map_or(0, bytes);
+    }
+}
+
+impl Drop for Call<'_> {
+    fn drop(&mut self) {
+        let class = ObjectClass::from_key(self.key);
+        let elapsed = self.started.elapsed();
+        self.store.metrics.store_call(class, self.op, elapsed, self.failed);
         with_current(|t| {
-            let s = t.stats(class, op);
+            let s = t.stats(class, self.op);
             s.count.fetch_add(1, Relaxed);
             s.micros.fetch_add(to_micros(elapsed), Relaxed);
-            s.bytes.fetch_add(bytes, Relaxed);
-            if failed {
+            s.bytes.fetch_add(self.bytes, Relaxed);
+            if self.failed {
                 s.errors.fetch_add(1, Relaxed);
             }
         });
     }
 }
 
+impl TimedStore {
+    fn call<'a>(&'a self, key: &'a str, op: StoreOp, bytes: u64) -> Call<'a> {
+        Call { store: self, key, op, started: Instant::now(), bytes, failed: false }
+    }
+}
+
 impl ObjectStore for TimedStore {
     fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
         Box::pin(async move {
-            let started = Instant::now();
+            let mut call = self.call(key, StoreOp::Get, 0);
             let res = self.inner.get(key, opts).await;
-            let bytes = res.as_ref().map_or(0, |g| g.data.len() as u64);
-            self.record(key, StoreOp::Get, started, bytes, &res);
+            call.finish(&res, |g| g.data.len() as u64);
             res
         })
     }
 
     fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
         Box::pin(async move {
-            let started = Instant::now();
-            let bytes = data.len() as u64;
+            let mut call = self.call(key, StoreOp::Put, data.len() as u64);
             let res = self.inner.put(key, data, mode).await;
-            self.record(key, StoreOp::Put, started, bytes, &res);
+            call.finish(&res, |_| 0);
             res
         })
     }
 
     fn delete<'a>(&'a self, key: &'a str) -> BoxFut<'a, SResult<()>> {
         Box::pin(async move {
-            let started = Instant::now();
+            let mut call = self.call(key, StoreOp::Delete, 0);
             let res = self.inner.delete(key).await;
-            self.record(key, StoreOp::Delete, started, 0, &res);
+            call.finish(&res, |_| 0);
             res
         })
     }
@@ -230,9 +251,9 @@ impl ObjectStore for TimedStore {
         limit: usize,
     ) -> BoxFut<'a, SResult<ListPage>> {
         Box::pin(async move {
-            let started = Instant::now();
+            let mut call = self.call(prefix, StoreOp::List, 0);
             let res = self.inner.list(prefix, start_after, limit).await;
-            self.record(prefix, StoreOp::List, started, 0, &res);
+            call.finish(&res, |_| 0);
             res
         })
     }
@@ -271,6 +292,42 @@ mod tests {
                 }))
             );
             assert_eq!(tally.commits(), (1, 3));
+        });
+    }
+
+    /// A store whose calls never finish.
+    struct Hung;
+
+    impl ObjectStore for Hung {
+        fn get<'a>(&'a self, _: &'a str, _: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
+            Box::pin(std::future::pending())
+        }
+        fn put<'a>(&'a self, _: &'a str, _: Bytes, _: PutMode) -> BoxFut<'a, SResult<String>> {
+            Box::pin(std::future::pending())
+        }
+        fn delete<'a>(&'a self, _: &'a str) -> BoxFut<'a, SResult<()>> {
+            Box::pin(std::future::pending())
+        }
+        fn list<'a>(&'a self, _: &'a str, _: Option<&'a str>, _: usize) -> BoxFut<'a, SResult<ListPage>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[test]
+    fn abandoned_calls_are_recorded() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
+        rt.block_on(async {
+            let store = TimedStore { inner: Arc::new(Hung), metrics: Arc::default() };
+            let tally = Arc::new(Tally::default());
+            scoped(tally.clone(), async {
+                let put = store.put("dbs/a/manifest", Bytes::from_static(b"abc"), PutMode::Create);
+                assert!(tokio::time::timeout(Duration::from_millis(400), put).await.is_err());
+            })
+            .await;
+            assert_eq!(tally.store_json(), Some(json!({"manifest.put": {"n": 1, "ms": 400, "bytes": 3}})));
+            let mut out = serde_json::Map::new();
+            store.metrics.json_into(&mut out);
+            assert_eq!(out["store"]["manifest.put"]["max_ms"], 400.0);
         });
     }
 }

@@ -112,11 +112,11 @@ impl Bucket {
         self.at = now;
     }
 
-    /// Returns the duration until a token is available, or zero if available.
-    fn wait(&self) -> Duration {
-        match self.tokens >= 1.0 {
+    /// Returns the duration until the bucket holds `need` tokens, or zero if it does.
+    fn wait(&self, need: f64) -> Duration {
+        match self.tokens >= need {
             true => Duration::ZERO,
-            false => Duration::from_secs_f64((1.0 - self.tokens) / self.rate.per_sec),
+            false => Duration::from_secs_f64((need - self.tokens) / self.rate.per_sec),
         }
     }
 }
@@ -147,6 +147,16 @@ impl Limiter {
     /// Attempts to acquire one token from each of `keys`. If any bucket is
     /// exhausted, none are decremented and an error is returned.
     pub fn take(&self, keys: &[(&str, Rate)], what: &str) -> Result<(), Error> {
+        self.take_inner(keys, what, false)
+    }
+
+    /// Like [`Limiter::take`], but an exhausted bucket lends its token, down
+    /// to a debt of one burst, which later takes wait to repay.
+    pub fn borrow(&self, keys: &[(&str, Rate)], what: &str) -> Result<(), Error> {
+        self.take_inner(keys, what, true)
+    }
+
+    fn take_inner(&self, keys: &[(&str, Rate)], what: &str, borrow: bool) -> Result<(), Error> {
         let now = Instant::now();
         let mut g = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         if g.len() >= MAX_KEYS {
@@ -157,7 +167,7 @@ impl Limiter {
             let b = g.entry(k.to_string()).or_insert(Bucket { tokens: rate.burst, at: now, rate: *rate });
             b.rate = *rate;
             b.refill(now);
-            wait = wait.max(b.wait());
+            wait = wait.max(b.wait(if borrow { 1.0 - rate.burst } else { 1.0 }));
         }
         if !wait.is_zero() {
             return Err(limited(what, wait));
@@ -285,6 +295,22 @@ mod tests {
                 l.take(&[("user", user)], "requests").unwrap();
             }
             assert!(l.take(&[("user", user)], "requests").is_err(), "the refused take used no user token");
+        });
+    }
+
+    #[test]
+    fn borrowing_overdraws_by_at_most_a_burst() {
+        rt().block_on(async {
+            let l = Limiter::default();
+            let rate = Rate { per_sec: 1.0, burst: 2.0 };
+            l.take(&[("user", rate)], "requests").unwrap();
+            l.take(&[("user", rate)], "requests").unwrap();
+            assert!(l.take(&[("user", rate)], "requests").is_err());
+            l.borrow(&[("user", rate)], "requests").unwrap();
+            l.borrow(&[("user", rate)], "requests").unwrap();
+            assert!(l.borrow(&[("user", rate)], "requests").is_err(), "a burst of debt");
+            tokio::time::sleep(Duration::from_millis(2_000)).await;
+            assert_eq!(wait_ms(l.take(&[("user", rate)], "requests")), 1_000, "the debt is repaid first");
         });
     }
 

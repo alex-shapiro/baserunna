@@ -2754,19 +2754,29 @@
       }
     },
     "/v1/admin/metrics": {
-      "get": {
-        "description": "Latency histograms of this node since it started or was last reset: object-store calls by object class and operation, commit batches that wrote a manifest, requests by route, and how late a periodic timer fires (`lag`). `cpu` holds cumulative process CPU and host steal time in ms where the OS reports them. Quantiles are accurate to 25%.",
-        "parameters": [
-          {
-            "description": "Clear the histograms after reading them.",
-            "in": "query",
-            "name": "reset",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
+      "delete": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Metrics"
+                }
+              }
+            },
+            "description": "Metrics"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
           }
-        ],
+        },
+        "summary": "Read and reset the serving node's metrics (admin)",
+        "tags": [
+          "admin"
+        ]
+      },
+      "get": {
+        "description": "Latency histograms of this node since it started or was last reset: object-store calls by object class and operation, commit batches that wrote a manifest, requests by method and route, and how late a periodic timer fires (`lag`). `cpu` holds cumulative process CPU and host steal time in ms where the OS reports them. Quantiles are accurate to 25%.",
         "responses": {
           "200": {
             "content": {

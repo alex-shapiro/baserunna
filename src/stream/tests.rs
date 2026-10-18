@@ -1193,3 +1193,24 @@ fn prop_filters_match_model() {
         },
     );
 }
+
+#[test]
+fn trims_by_time_conflict_only_with_appends_they_could_have_trimmed() {
+    rt().block_on(async {
+        let (eng, _, _) = engine(4, EngineConfig::small_for_tests());
+        let db = opened(&eng, "d").await;
+        create_stream(&db, "s", Retention::default()).await;
+        append_texts(&db, "s", &["0", "1"]).await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let late = append_texts(&db, "s", &["2"]).await;
+        let mut found = begin(&db).await;
+        trim(&mut found, "s", None, Some(late.time_ms)).await.unwrap();
+        let mut past_end = begin(&db).await;
+        trim(&mut past_end, "s", None, Some(u64::MAX / 2)).await.unwrap();
+        assert!(!found.has_untracked_reads() && !past_end.has_untracked_reads());
+        append_texts(&db, "s", &["3"]).await;
+        commit(&db, found).await.unwrap();
+        assert!(matches!(commit(&db, past_end).await, Err(Error::Conflict(_))), "the append was before its time");
+        assert_eq!(texts(&read_all(&db, "s", ReadSpec::default()).await), ["2", "3"]);
+    });
+}

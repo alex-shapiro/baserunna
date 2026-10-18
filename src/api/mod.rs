@@ -266,14 +266,17 @@ fn clone_parts(req: &Request) -> http::request::Builder {
 
 const BUFFER_FORWARD_MAX: u64 = 1024 * 1024;
 
-/// Committing or aborting an interactive transaction is not rate limited:
-/// its `begin` was, and refusing to finish it would waste that work and
-/// leave the transaction open until it idles out.
+/// Whether `req` commits or aborts an interactive transaction. Its `begin`
+/// was admitted, and refusing to finish it would waste that work and leave
+/// the transaction open until it idles out, so such requests may overdraw
+/// the rate limit (§9).
 fn finishes_txn(req: &Request) -> bool {
-    let path = req.uri().path();
-    let in_txn = path.split('/').nth(4) == Some("transactions") && path.split('/').count() >= 6;
-    in_txn
-        && (req.method() == http::Method::DELETE || (req.method() == http::Method::POST && path.ends_with("/commit")))
+    let route = req.extensions().get::<MatchedPath>().map(MatchedPath::as_str);
+    match *req.method() {
+        http::Method::POST => route == Some(data::COMMIT_ROUTE),
+        http::Method::DELETE => route == Some(data::TXN_ROUTE),
+        _ => false,
+    }
 }
 
 /// Authenticates database-scoped requests and forwards them to the lease holder or handles them locally.
@@ -283,7 +286,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         let deadline = request_deadline(&node, req.headers());
         let name = db_name_from_path(req.uri().path()).ok_or_else(|| Error::not_found("no such route"))?;
         let token = credential(req.headers()).ok_or_else(|| Error::Unauthenticated("missing credentials".into()))?;
-        let principal = node.authenticate_metered(&token, !finishes_txn(&req)).await?;
+        let principal = node.authenticate_metered(&token, finishes_txn(&req)).await?;
         let (mut rec, mut access) = node.resolve_db(&principal, &name).await?;
         let hops = hops(req.headers());
         if hops < 2
@@ -420,19 +423,19 @@ async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: 
     let ctx = log::Context { node: node.id.as_str().into(), request_id: rid.into() };
     let started = tokio::time::Instant::now();
     let tally = Arc::new(timing::Tally::default());
-    let metrics = node.engine.shared.metrics.clone();
     let mut resp = log::scoped(ctx, {
         let tally = tally.clone();
+        let node = node.clone();
         async move {
-            let method = req.method().to_string();
-            let route = req.extensions().get::<MatchedPath>().map_or("unmatched", |m| m.as_str()).to_string();
+            let method = req.method().clone();
+            let route = req.extensions().get::<MatchedPath>().cloned();
             let hops = hops(req.headers());
             let resp = timing::scoped(tally.clone(), next.run(req)).await;
-            metrics.request(&format!("{method} {route}"), started.elapsed());
+            node.metrics.request(method.as_str(), route.as_ref().map(MatchedPath::as_str), started.elapsed());
             if log::enabled(log::Level::Info) {
                 let mut fields = vec![
-                    ("method", json!(method)),
-                    ("route", json!(route)),
+                    ("method", json!(method.as_str())),
+                    ("route", json!(route.as_ref().map_or("unmatched", MatchedPath::as_str))),
                     ("status", json!(resp.status().as_u16())),
                     ("ms", json!(started.elapsed().as_millis() as u64)),
                     ("hops", json!(hops)),
@@ -844,21 +847,41 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
-    fn only_finishing_a_transaction_is_free_of_rate_limits() {
-        let req = |m: &str, p: &str| http::Request::builder().method(m).uri(p).body(Body::empty()).unwrap();
-        assert!(super::finishes_txn(&req("POST", "/v1/dbs/app/transactions/abc/commit")));
-        assert!(super::finishes_txn(&req("DELETE", "/v1/dbs/acme.app/transactions/abc")));
-        assert!(!super::finishes_txn(&req("POST", "/v1/dbs/app/transactions")), "begin is metered");
-        assert!(!super::finishes_txn(&req("POST", "/v1/dbs/app/transactions/abc/ops")), "ops are metered");
-        assert!(!super::finishes_txn(&req("DELETE", "/v1/dbs/app/kv/transactions")), "a key named transactions");
-        assert!(!super::finishes_txn(&req("POST", "/v1/dbs/app/txn")));
+    fn only_routes_finishing_a_transaction_may_overdraw() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let app = axum::Router::new()
+                .route("/v1/dbs/{db}/transactions", post(|| async {}))
+                .route(data::TXN_ROUTE, axum::routing::delete(|| async {}))
+                .route("/v1/dbs/{db}/transactions/{id}/ops", post(|| async {}))
+                .route(data::COMMIT_ROUTE, post(|| async {}))
+                .route("/v1/dbs/{db}/kv/{*key}", axum::routing::delete(|| async {}))
+                .route_layer(middleware::from_fn(|req: Request, _: Next| async move {
+                    super::finishes_txn(&req).to_string().into_response()
+                }));
+            let finishes = |m: &str, p: &str| {
+                let app = app.clone();
+                let req = http::Request::builder().method(m).uri(p).body(Body::empty()).unwrap();
+                async move {
+                    let resp = app.oneshot(req).await.unwrap();
+                    let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+                    body.as_ref() == b"true"
+                }
+            };
+            assert!(finishes("POST", "/v1/dbs/app/transactions/abc/commit").await);
+            assert!(finishes("DELETE", "/v1/dbs/acme.app/transactions/abc").await);
+            assert!(!finishes("POST", "/v1/dbs/app/transactions").await, "begin");
+            assert!(!finishes("POST", "/v1/dbs/app/transactions/abc/ops").await, "ops");
+            assert!(!finishes("DELETE", "/v1/dbs/app/kv/transactions").await, "a key named transactions");
+            assert!(!finishes("POST", "/v1/dbs/app/transactions/x/y/z/commit").await, "no such route");
+            assert!(!finishes("DELETE", "/v1/dbs/app/transactions/x/y").await, "no such route");
+        });
     }
 
     #[test]
     fn unread_body_sets_connection_close() {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(async {
-            // Use constants so tests/openapi.rs does not treat these as public routes.
             const IGNORE: &str = "/ignore";
             const READ: &str = "/read";
             const FIRST_FRAME: &str = "/first-frame";

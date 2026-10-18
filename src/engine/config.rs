@@ -58,8 +58,8 @@ pub struct EngineConfig {
     pub commit_retention_ms: u64,
     pub compaction_concurrency: usize,
     pub commit_retry_max: u32,
-    /// A manifest write unanswered for this long is sent a second time, and
-    /// whichever copy answers first decides the attempt; 0 disables it.
+    /// A manifest write unanswered for this long is sent a second time (see
+    /// SPEC §5.5); 0 disables it.
     pub manifest_put_hedge_ms: u64,
     /// Maximum time a commit may wait in the committer before it is rejected.
     pub commit_timeout_ms: u64,

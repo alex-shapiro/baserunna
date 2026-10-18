@@ -26,15 +26,17 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
         self.map().get(k).filter(|(at, _)| at.elapsed() < self.ttl).map(|(_, v)| v.clone())
     }
 
-    /// Insert `v` under `k`, or remove `k` if `v` is `None`.
-    pub fn store(&self, k: K, v: Option<V>) {
+    /// Insert `v`, read at `read_at`, under `k`, or remove `k` if `v` is
+    /// `None`. The entry expires `ttl` after `read_at`, so a slow read
+    /// cannot keep a value that was stale when stored.
+    pub fn store(&self, k: K, v: Option<V>, read_at: Instant) {
         let mut m = self.map();
         match v {
             Some(v) => {
                 if m.len() >= self.max {
                     m.clear();
                 }
-                m.insert(k, (Instant::now(), v));
+                m.insert(k, (read_at, v));
             }
             None => {
                 m.remove(&k);
@@ -74,19 +76,21 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
         rt.block_on(async {
             let c: TtlCache<u32, &str> = TtlCache::new(Duration::from_secs(10), 3);
-            c.store(1, Some("a"));
+            c.store(1, Some("a"), Instant::now());
             assert_eq!(c.get(&1), Some("a"));
+            c.store(2, Some("b"), Instant::now() - Duration::from_secs(10));
+            assert_eq!(c.get(&2), None, "read too long ago");
             tokio::time::sleep(Duration::from_secs(10)).await;
             assert_eq!(c.get(&1), None, "expired");
-            assert_eq!(c.len(), 1, "until pruned");
+            assert_eq!(c.len(), 2, "until pruned");
             c.prune();
             assert!(c.is_empty());
             for k in 0..3 {
-                c.store(k, Some("x"));
+                c.store(k, Some("x"), Instant::now());
             }
-            c.store(9, Some("y"));
+            c.store(9, Some("y"), Instant::now());
             assert_eq!((c.len(), c.get(&9)), (1, Some("y")), "storing past the bound forgets the rest");
-            c.store(9, None);
+            c.store(9, None, Instant::now());
             assert_eq!(c.get(&9), None);
         });
     }

@@ -80,6 +80,10 @@ every push to `main`, building on Fly's remote builder. It needs a
 `FLY_API_TOKEN` repository secret (`fly tokens create deploy --app
 baserunna`).
 
+A binary refuses manifests in a format newer than it knows, so rolling back
+to a release before a manifest format change leaves every database written
+since unreadable.
+
 ## TLS
 
 Terminate TLS at the load balancer or ingress. Nodes speak plain HTTP, to

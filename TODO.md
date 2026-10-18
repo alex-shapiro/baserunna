@@ -18,14 +18,18 @@ the design context for several of these.
 - [ ] **Test Google sign-in against real Google.** Only `FakeGoogle` has
       exercised it. Also add an OIDC `nonce` and PKCE (`code_verifier`) to
       the authorization-code flow. Today only `state` is used.
-- [ ] **Metrics.** Add a Prometheus-style `/metrics` endpoint: object-store
-      requests, bytes and errors by operation; commit latency and batch
-      size; CAS conflicts; lease acquisitions and steals; cache hit rate;
-      open DB handles; compaction and GC activity; forwarded requests; rate
-      limit refusals. Cost is a primary goal, so object-store request counts
-      matter most. `engine::Activity` already counts range tombstones,
-      segment drops and rewrites, levels objects, quota refusals and
-      expired entries and segments.
+- [ ] **Metrics.** `GET /v1/admin/metrics` reports latency histograms of
+      object-store calls, commit batches and API routes, scheduler lag and
+      CPU time as JSON. Add a Prometheus-style `/metrics` endpoint with
+      those and: object-store bytes; CAS conflicts; lease acquisitions and
+      steals; cache hit rate; open DB handles; compaction and GC activity;
+      forwarded requests; rate limit refusals. Cost is a primary goal, so
+      object-store request counts matter most. `engine::Activity` already
+      counts range tombstones, segment drops and rewrites, levels objects,
+      quota refusals and expired entries and segments.
+- [ ] **Publish release binaries and a container image.** Apps that test
+      against a local node (mathtutor's test suite does) need one in CI, and
+      the repo is private.
 - [ ] **Check caches on bulk reads (`ReadMode::Bulk`).** Compaction and GC
       sweeps read segments in `ReadMode::Bulk` to avoid polluting the
       in-memory block cache on misses, but `MergeIter::peek` currently skips
@@ -33,6 +37,29 @@ the design context for several of these.
       straight to object storage. Checking the caches first (without
       populating them on misses) avoids re-fetching segments that the node
       already has locally, such as L0 segments it just flushed.
+
+## Performance
+
+Load testing mathtutor on fly.io (DEPLOYING.md) left these open.
+
+- [ ] **Resolve ambiguous commits without waiting.** A client must wait
+      about 15 s, past the commit deadline, before `GET /commits/{id}` can
+      answer (SPEC §6.2), so a proxy 502 during a commit stalls the user for
+      15 s. If the status call's fencing manifest write also recorded the
+      commit id as refused, a later attempt would be rejected and the call
+      could answer at once.
+- [ ] **Cut CPU per request.** On one dedicated core, throughput levels off
+      around 340 commits/s with the core about 80% busy. Profiles show the
+      time going to memory allocation, building `serde_json` maps for
+      responses, key comparisons in segment lookups, and zstd compression of
+      the manifest.
+- [ ] **Remove the remaining block-cache lock contention.** Cache shards
+      still take an exclusive lock on every hit to update LRU order. A
+      CLOCK-style cache would let hits take a shared lock.
+- [ ] **Tune the inline WAL tail limit.** Every commit uploads the manifest
+      with the tail inline: commits take 36 ms at the median with an empty
+      tail and 84 ms with a full 256 KiB one on Tigris. A lower limit trades
+      commit latency for more frequent flushes.
 
 ## Features
 

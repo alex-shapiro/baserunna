@@ -1458,7 +1458,7 @@ impl World {
         }
     }
 
-    /// The first seq each append of `t` receives if it commits now, or why
+    /// The first seq each append of `t` receives if it is committed now, or why
     /// it fails: an expected seq that no longer holds.
     fn stream_outcome(&self, t: &TxnView) -> std::result::Result<Vec<u64>, usize> {
         let mut next: BTreeMap<&str, u64> = BTreeMap::new();
@@ -1555,7 +1555,7 @@ impl World {
             None => None,
             Some(c) => match self.query_cursors.get(c) {
                 Some((ix, v)) if ix == index && in_region(v) => Some(v.clone()),
-                // Generated strings never decode to a valid row or index keyspace prefix.
+                // Generated strings, decoded, are never a valid row or index keyspace prefix.
                 _ => return Err(Fail::Invalid),
             },
         };
@@ -1775,7 +1775,7 @@ fn check_unique(t: &TxnView, pk: i64, new: &MRow) -> MResult<()> {
 
 const NAMES: &[&str] = &["ann", "bob", "cy", "é", ""];
 
-/// Generates strings that never decode as URL-safe base64 to a row or index keyspace prefix.
+/// Generates strings that, decoded as URL-safe base64, are never a row or index keyspace prefix.
 fn rand_string(u: &mut Choices) -> String {
     const POOL: &[&str] = &["", "a", "t", "u", "id", "name", "grp", "doc", "by_name", "by_grp", "x/y", "é", "null"];
     match u.below(4) {

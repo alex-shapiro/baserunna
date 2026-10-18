@@ -31,8 +31,6 @@ fn sim_register_linearizability() {
     run_scenario("register", 4, 2);
 }
 
-/// Writers and readers with short pauses, so requests keep arriving while a
-/// commit is in flight: write transactions begin without waiting for it.
 #[test]
 fn sim_register_linearizability_under_contention() {
     run_scenario("register_contended", 22, 4);
@@ -258,11 +256,8 @@ fn forwards_to_a_restarted_node_are_refused() {
     out.result.unwrap();
 }
 
-/// While the leaseholder's manifest write has applied but not yet replied,
-/// another node can serve the write from the store. Answers the leaseholder
-/// gives after that, from a read-only transaction or a failed precondition,
-/// must include it, though its write transactions begin without waiting for
-/// the write (SPEC §5.5).
+/// Leaseholder answers include a write another node served before its
+/// reply arrived (SPEC §5.5).
 #[test]
 fn leaseholder_answers_include_a_write_another_node_served() {
     use baserunna::sim::client::Client;
@@ -334,11 +329,7 @@ fn leaseholder_answers_include_a_write_another_node_served() {
     out.result.unwrap();
 }
 
-/// Like [`leaseholder_answers_include_a_write_another_node_served`], for
-/// stream state that transactions read without recording it in their read
-/// set: once another node served an append whose manifest write is still in
-/// flight, the leaseholder must accept a consumer cursor past it and report
-/// it when reconfiguring the stream.
+/// The same, for stream state read outside the read set.
 #[test]
 fn leaseholder_stream_answers_include_an_append_another_node_served() {
     use baserunna::sim::client::Client;
@@ -411,9 +402,8 @@ fn leaseholder_stream_answers_include_an_append_another_node_served() {
     out.result.unwrap();
 }
 
-/// A lease left by a node that crashed is judged by the store's clock: one
-/// granted long before another node first sees it costs no wait, while a
-/// recent one still blocks writes until it may have run out (SPEC §5.7).
+/// Old leases left by a crashed node cost no wait; recent ones still block
+/// (SPEC §5.7).
 #[test]
 fn leases_left_long_ago_cost_no_wait() {
     use baserunna::sim::client::Client;

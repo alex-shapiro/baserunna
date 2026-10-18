@@ -593,7 +593,7 @@ pub async fn set_consumer(txn: &mut Txn, stream: &str, name: &str, seq: u64, now
     let c = open(txn, stream).await?;
     // Seqs only grow, so a cursor valid at the snapshot stays valid: no
     // need to conflict with appends by recording the state. A refusal
-    // records it, since a later snapshot may accept the cursor.
+    // records it, since a newer snapshot may accept the cursor.
     let mut next = state(txn, &c, false).await?.next_seq;
     if seq > next {
         next = state(txn, &c, true).await?.next_seq;

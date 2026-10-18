@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// Bounded cache whose entries expire after `ttl` and clear when `max` is exceeded.
+/// Bounded cache whose entries expire after `ttl` and are cleared when `max` is exceeded.
 pub struct TtlCache<K, V> {
     ttl: Duration,
     max: usize,

@@ -335,10 +335,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 };
             }
         }
-        // Re-resolve strongly if the cached database name points to a deleted
-        // or recreated database. A deletion still in flight is not waited
-        // for: the request's own strong reads or commit then fail with not
-        // found, and no database can take the name before it finishes.
+        // Re-resolve strongly if the cached database name points to a deleted or recreated database.
         let opened = match node.open_db(&rec).await {
             Ok(db) => match db.latest().await {
                 Err(Error::NotFound(m)) => Err(m),
@@ -553,7 +550,7 @@ pub(crate) enum Ran<T> {
     Replayed(Committed),
 }
 
-/// Runs `$body` in fresh transactions until what it wrote commits,
+/// Runs `$body` in fresh transactions until what it wrote is committed,
 /// retrying conflicts; evaluates to `(commit_id, Ran)`. With an idempotency
 /// key (`$key`, an `Option<&str>`) the commit id derives from the key, and a
 /// commit an earlier attempt applied is reported rather than applied again
@@ -602,10 +599,7 @@ macro_rules! run_txn {
 }
 pub(crate) use run_txn;
 
-/// Begins an attempt of a `run_txn!` transaction. A strong serializable
-/// one starts without waiting for an in-flight commit ([`Db::begin_write`])
-/// unless `settle`: after a recheck found its reads changed, the next
-/// attempt waits, so attempts cannot keep chasing new writes.
+/// Uses [`Db::begin_write`] for strong serializable attempts unless `settle`.
 pub(crate) async fn begin_attempt(
     ctx: &DbCtx,
     isolation: crate::engine::Isolation,
@@ -653,7 +647,7 @@ pub(crate) async fn finish<T>(
     req.deadline = Some(ctx.deadline);
     match ctx.db.commit_detailed(req).await {
         // Without a key, only this attempt's own commit, landed by an
-        // ambiguous manifest write the committer retried, can replay.
+        // ambiguous manifest write the committer retried, can be replayed.
         Ok(c) if c.replayed && key.is_some() => Ok(Some(Ran::Replayed(c))),
         Ok(commit) => Ok(Some(Ran::Committed { out, commit })),
         Err(Error::Conflict(_)) if *attempt < node.cfg.txn_retries => {
@@ -753,11 +747,8 @@ macro_rules! watch {
 }
 pub(crate) use watch;
 
-/// Marks a response `Connection: close` if the handler answered without
-/// reading the request body to its end, as for a request refused early. The
-/// server closes such a connection after the response; saying so keeps a
-/// proxy from sending another request on it, which would fail (on Fly.io,
-/// with a 502 to an unrelated client).
+/// Adds `Connection: close` if the request body went unread, so a proxy
+/// doesn't reuse a connection hyper is about to close.
 async fn close_if_body_unread(req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
     let (tracked, read) = body::Tracked::new(body);
@@ -836,7 +827,6 @@ mod tests {
             const IGNORE: &str = "/ignore";
             const READ: &str = "/read";
             const FIRST_FRAME: &str = "/first-frame";
-            // Reads as hyper's client forwards a body: up to `is_end_stream`.
             let first_frame = |mut b: Body| async move {
                 use http_body_util::BodyExt;
                 let n = b.frame().await.and_then(|f| f.ok()?.into_data().ok()).map_or(0, |d| d.len());

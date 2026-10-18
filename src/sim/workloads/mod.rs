@@ -190,8 +190,6 @@ fn faulty4() -> super::SimConfig {
     super::SimConfig::faulty(4)
 }
 
-/// `c` where writes often reply late, so a manifest write stays in flight
-/// long after the store applied it, while other nodes can already read it.
 fn late_replies(mut c: super::SimConfig) -> super::SimConfig {
     c.store.p_late_reply = 0.3;
     c.store.late_reply_ms = (50, 1_000);

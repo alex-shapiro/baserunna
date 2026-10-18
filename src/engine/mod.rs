@@ -84,12 +84,11 @@ activity! {
     chunks_sealed_in_compaction,
     /// Trims committed for stream retention.
     retention_trims,
-    /// Checks that found a lease another node left in a manifest lapsed by the store clock.
+    /// Leases found expired by the store clock.
     lapsed_leases,
-    /// Write transactions begun while a manifest write was in flight.
+    /// Write transactions begun during an in-flight manifest write.
     unsettled_begins,
-    /// Unsettled transactions run again: a recheck found their reads changed,
-    /// or they read outside their read set.
+    /// Transactions a recheck sent to run again.
     unsettled_reruns,
 }
 
@@ -211,7 +210,7 @@ pub fn db_prefix(db: &str) -> String {
     format!("dbs/{db}/")
 }
 
-/// The kind of object a store key names, by the layout above.
+/// The kind of object a store key names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectClass {
     Manifest,

@@ -18,8 +18,7 @@ use std::sync::Arc;
 pub struct Version {
     pub m: Manifest,
     pub etag: String,
-    /// The store's last-modified time of the manifest, if it was read from
-    /// the store rather than written by this node.
+    /// The manifest's last-modified time, if read from the store.
     pub stored_ms: Option<u64>,
     pub(crate) shared: Arc<Shared>,
     /// `m.range_deletes`, indexed for lookups.
@@ -953,7 +952,7 @@ impl Snapshot {
 }
 
 /// A position in a change feed. Changes are ordered by version, and within
-/// one by kind (range deletions apply first) and key, so a position after
+/// one by kind (range deletions are applied first) and key, so a position after
 /// every change of version `seq` is `ChangePos::after_version(seq)`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ChangePos {
@@ -1092,7 +1091,7 @@ mod tests {
         }
     }
 
-    /// Cursors decode without panicking, and decoded ones round-trip.
+    /// Decoding a cursor never panics, and decoded cursors survive a round trip.
     #[test]
     fn fuzz_change_cursors() {
         let mut r = crate::util::rng::Rng::new(9);

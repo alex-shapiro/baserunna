@@ -321,7 +321,7 @@ async fn read(
             spec = ReadSpec { from_seq: Some(l.saturating_add(1)), ..starting_anywhere(spec) };
         }
         // The first read answers errors with their status, before the
-        // response commits to an event stream.
+        // response is committed to an event stream.
         let first = read_once(&ctx.db, c, &name, &spec).await?;
         let follow = Follow { db: ctx.db.clone(), c, name, enc, wait: Duration::from_millis(wait) };
         return Ok(events(node, follow, spec, first));

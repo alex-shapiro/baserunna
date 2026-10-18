@@ -94,7 +94,7 @@ enum Settled {
 
 /// Sends a request with idempotency key `key` until it is answered. After
 /// an ambiguous failure, it waits out any attempt still in flight and asks
-/// whether one committed, which commit records tell only so long after the
+/// whether one was committed, which commit records tell only so long after the
 /// first attempt.
 async fn settle_call(
     c: &Client,

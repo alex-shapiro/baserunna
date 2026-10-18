@@ -511,7 +511,7 @@ pub(super) struct DelayStore {
     put_reply_ms: AtomicU64,
     manifest_put_conflicts: AtomicU32,
     manifest_put_outages: AtomicU32,
-    /// Manifest writes that apply, but whose reply is lost.
+    /// Manifest writes that are applied, but whose reply is lost.
     manifest_put_lost: AtomicU32,
     manifest_get_outages: AtomicU32,
     manifest_puts: AtomicU32,
@@ -1166,10 +1166,8 @@ fn foreign_leases_block_commits_until_they_expire() {
     });
 }
 
-/// Node `b` commits a write that lands at once, but whose reply comes
-/// `reply_leases` lease durations later and is lost; meanwhile node `a`
-/// takes over once `b`'s lease runs out and writes once. Returns `b`'s
-/// commit result.
+/// `b` commits a write whose reply is lost `reply_leases` leases later,
+/// after `a` took over and wrote.
 fn commit_with_lost_reply_after_takeover(reply_leases: u64) -> crate::error::Result<Seq> {
     rt().block_on(async {
         let (b, store) = delayed_engine("b");
@@ -1193,7 +1191,7 @@ fn commit_with_lost_reply_after_takeover(reply_leases: u64) -> crate::error::Res
 
 #[test]
 fn a_lease_lost_after_an_ambiguous_write_leaves_the_outcome_unknown() {
-    // `b` retries while `a`'s lease is valid, so it cannot check whether its write landed.
+    // `b` retries while `a`'s lease is valid.
     match commit_with_lost_reply_after_takeover(2) {
         Err(Error::Unavailable { outcome_unknown: true, .. }) => {}
         other => panic!("the write landed, so its outcome is unknown, not {other:?}"),
@@ -1201,9 +1199,8 @@ fn a_lease_lost_after_an_ambiguous_write_leaves_the_outcome_unknown() {
 }
 
 #[test]
-fn an_ambiguous_write_resolves_once_the_next_lease_lapses() {
-    // By the time `b` retries, the store clock shows `a`'s lease lapsed: `b`
-    // reloads the manifest and finds its commit record.
+fn an_ambiguous_write_is_resolved_once_the_next_lease_lapses() {
+    // `b` retries once the store clock shows `a`'s lease expired.
     match commit_with_lost_reply_after_takeover(4) {
         Ok(2) => {}
         other => panic!("the write landed at version 2, not {other:?}"),

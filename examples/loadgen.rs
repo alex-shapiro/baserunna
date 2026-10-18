@@ -1,11 +1,6 @@
-//! HTTP load generator for a deployed Baserunna server.
-//!
-//! Runs a weighted mix of KV, transaction and stream requests against a few
-//! databases at each concurrency level in `LOAD_STEPS`, and prints throughput
-//! and per-operation latency for each level. Workers are closed-loop: each
-//! sends its next request when the previous one answers. Requests carry the
-//! ID `lg-<step>-<worker>-<n>` (step 0 is the warmup), and each step prints
-//! its UTC start and end, to find it in the server's logs and metrics.
+//! Load generator for a deployed Baserunna server. Prints throughput and
+//! latency per operation at each concurrency level. Request IDs are
+//! `lg-<step>-<worker>-<n>`; step 0 is the warmup.
 //!
 //! ```text
 //! LOAD_TOKEN=<api key> cargo run --release --example loadgen
@@ -24,10 +19,6 @@
 //! | `LOAD_SECS`        | 20                          | measured duration of each step                     |
 //! | `LOAD_WARMUP_SECS` | 5                           | unmeasured load before the first step              |
 //! | `LOAD_CLEANUP`     | 0                           | 1 deletes the databases afterwards                 |
-//!
-//! Rate limits apply per user and per API key (`BASERUNNA_USER_RPS`,
-//! `BASERUNNA_API_KEY_RPS`, 500 by default); throttled requests are counted
-//! separately and the worker waits out the server's `retry_after_ms`.
 
 use baserunna::util::rng::Rng;
 use serde_json::{Value, json};
@@ -198,8 +189,6 @@ async fn worker(http: reqwest::Client, cfg: Config, step: usize, w: usize, until
     stats
 }
 
-/// Runs `concurrency` workers for `secs`. Their requests carry the ID
-/// `lg-<step>-<worker>-<n>`, so server logs can be matched to a step.
 async fn run_step(
     http: &reqwest::Client,
     cfg: &Config,
@@ -223,7 +212,6 @@ fn pct(sorted: &[u32], p: f64) -> f64 {
     sorted[i] as f64 / 1000.0
 }
 
-/// The current UTC time of day, to line steps up with server logs and metrics.
 fn utc_now() -> String {
     let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() % 86_400;
     format!("{:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60)
@@ -266,8 +254,7 @@ fn report(step: usize, concurrency: usize, stats: &mut Stats, elapsed: Duration,
     }
 }
 
-/// Sends `req` until it succeeds (or answers one of `also`), waiting out
-/// retryable errors such as a lease left by a stopped node, for up to a minute.
+/// Retries retryable errors for up to a minute.
 async fn expect_ok(cfg: &Config, what: &str, req: reqwest::RequestBuilder, also: &[u16]) {
     let t = Instant::now();
     loop {
@@ -284,7 +271,6 @@ async fn expect_ok(cfg: &Config, what: &str, req: reqwest::RequestBuilder, also:
     }
 }
 
-/// Creates the databases and stream if missing and writes every key once.
 async fn setup(http: &reqwest::Client, cfg: &Config) {
     let mut rng = Rng::new(0);
     for i in 0..cfg.dbs {

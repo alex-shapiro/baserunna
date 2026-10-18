@@ -1,4 +1,4 @@
-//! The OpenAPI document is well formed, every reference resolves, and the
+//! The OpenAPI document is well formed, every reference can be resolved, and the
 //! documented routes are exactly the router's public routes.
 
 use baserunna::sim::SimResponse;

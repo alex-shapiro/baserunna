@@ -25,8 +25,7 @@ pub struct StoreFaults {
     pub p_fail_after: f64,
     /// Maximum duration for which `list` may omit new objects or include deleted ones.
     pub list_lag_ms: u64,
-    /// Probability that a write's reply comes `late_reply_ms` after it was
-    /// applied: readers already see the write while its writer still waits.
+    /// Probability that a write's reply arrives `late_reply_ms` after it applied.
     pub p_late_reply: f64,
     pub late_reply_ms: (u64, u64),
 }
@@ -95,8 +94,6 @@ pub struct SimStore {
     pub stats: StoreStats,
 }
 
-/// Writes whose replies are held back after they apply; see
-/// [`SimStore::hold_replies`].
 #[derive(Default)]
 struct HeldReplies {
     suffix: Mutex<Option<String>>,
@@ -140,8 +137,7 @@ impl SimStore {
         *self.faults.lock().unwrap_or_else(|e| e.into_inner()) = f;
     }
 
-    /// Until [`SimStore::release_replies`], writes to keys ending in `suffix`
-    /// apply as usual, but their writers get no reply.
+    /// Holds replies to writes of keys ending in `suffix` until [`SimStore::release_replies`].
     pub fn hold_replies(&self, suffix: &str) {
         *self.replies.suffix.lock().unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
     }
@@ -163,8 +159,7 @@ impl SimStore {
             latency_ms = r.range(f.stall_ms.0, f.stall_ms.1.max(f.stall_ms.0) + 1);
             self.trace.event(&format!("store stall {latency_ms}ms"));
         }
-        // Checked first so configurations without late replies keep their
-        // random streams, and every existing seed reproduces as before.
+        // Skip the draw when off, so existing seeds reproduce.
         let late_reply_ms = if on && f.p_late_reply > 0.0 && r.chance(f.p_late_reply) {
             r.range(f.late_reply_ms.0, f.late_reply_ms.1.max(f.late_reply_ms.0) + 1)
         } else {

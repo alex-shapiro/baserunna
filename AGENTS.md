@@ -34,3 +34,4 @@ If you see an approach that is subpar, prefer to rip it out wholesale and replac
 - LLM written docs often turn into factslop over time. If you find that a doc seems to contain
   a lot of facts but fails to communicate the key intent of a paragraph or section within the first
   sentence, restructure it to explain exactly what you were looking for, concisely.
+- Never use middle voice. Instead of "writes commit together", use "writes are committed together".

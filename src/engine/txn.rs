@@ -178,11 +178,7 @@ impl Txn {
         }
     }
 
-    /// Whether the transaction must pass [`super::Db::recheck`] before it
-    /// answers, given whether it `commits`. Only one begun while a manifest
-    /// write was in flight on this node ([`super::Db::begin_write`]) may:
-    /// its reads are strongly consistent only once validated, and a commit
-    /// validates just those in its read set.
+    /// Whether [`super::Db::recheck`] must check the transaction before it answers.
     pub fn needs_recheck(&self, commits: bool) -> bool {
         !self.settled && (!commits || self.untracked)
     }
@@ -191,24 +187,18 @@ impl Txn {
         self.settled = false;
     }
 
-    /// Whether the transaction read through [`Txn::untracked`].
     pub(crate) fn read_untracked(&self) -> bool {
         self.untracked
     }
 
-    /// The snapshot, for reads the read set does not record, so that
-    /// neither commit validation nor [`super::Db::recheck`] checks them. The
-    /// caller must record what its answer depends on, as a stream read
-    /// records the range of records it covered, or read through
-    /// [`Txn::untracked`] instead.
+    /// Reads through the snapshot skip the read set. Record what the answer
+    /// depends on, or use [`Txn::untracked`].
     pub fn snapshot(&self) -> &Arc<Version> {
         &self.snapshot
     }
 
-    /// The snapshot, for unrecorded reads an answer depends on. They are
-    /// consistent as of the snapshot only, so a transaction that makes them
-    /// is never answered from a snapshot begun during an in-flight write:
-    /// [`super::Db::recheck`] has it run again instead.
+    /// Like [`Txn::snapshot`], but [`super::Db::recheck`] then runs the
+    /// transaction again.
     pub fn untracked(&mut self) -> &Arc<Version> {
         self.untracked = true;
         &self.snapshot

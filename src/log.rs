@@ -59,17 +59,13 @@ enum Line {
     Flush(SyncSender<()>),
 }
 
-/// Writes log lines to stderr on a thread of its own; see [`write_in_background`].
 struct Writer {
     tx: SyncSender<Line>,
     dropped: AtomicU64,
 }
 
-/// Writes log lines to stderr from a dedicated thread instead of the thread
-/// that logs, so requests never wait on stderr (a pipe to a log shipper may
-/// be slow) or on the lock serializing writes to it. If the writer falls
-/// more than 65,536 lines behind, lines are dropped and later counted in a
-/// warning. Call [`flush`] before the process exits.
+/// Writes log lines from a dedicated thread, dropping them while its queue
+/// is full. Call [`flush`] before exiting.
 pub fn write_in_background() {
     WRITER.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel(WRITER_QUEUE);

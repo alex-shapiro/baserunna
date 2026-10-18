@@ -1,5 +1,4 @@
-//! Streaming blob request/response bodies, request body tracking, and HTTP
-//! Range parsing.
+//! Streaming blob request/response bodies and HTTP Range parsing.
 
 use crate::engine::blob::{self, BlobWriter, chunk_plan, read_chunk};
 use crate::engine::{BlobRef, Shared};
@@ -170,8 +169,7 @@ impl http_body::Body for Tracked {
 
     fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
         let polled = Pin::new(&mut self.inner).poll_frame(cx);
-        // Readers such as hyper's client stop at `is_end_stream` after the
-        // last frame instead of polling for the end.
+        // hyper's client stops reading once `is_end_stream` is true.
         let ended = match &polled {
             Poll::Ready(None) => true,
             Poll::Ready(Some(Ok(_))) => self.inner.is_end_stream(),

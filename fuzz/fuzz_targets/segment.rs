@@ -8,7 +8,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = segment::read_all(&b);
     let _ = segment::decode_block(b.clone());
     if let Ok(entries) = segment::read_all(&b) {
-        // Anything that decodes must have strictly increasing keys.
+        // Anything that can be decoded must have strictly increasing keys.
         assert!(entries.windows(2).all(|w| w[0].key < w[1].key));
     }
 });

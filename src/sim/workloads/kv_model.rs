@@ -187,7 +187,7 @@ impl KvModel {
     }
 
     /// Waits out any zombie request, then forces a manifest write so no
-    /// in-flight attempt can commit afterwards.
+    /// in-flight attempt can be committed afterwards.
     async fn fence(&self) {
         self.c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
         let id = format!("{:016x}", self.step + (1u64 << 62));

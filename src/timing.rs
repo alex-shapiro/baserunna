@@ -1,10 +1,7 @@
 //! Per-operation time accounting for diagnosing latency.
 //!
-//! A request or a commit batch runs inside [`scoped`] with its own [`Tally`].
-//! Object-store calls (through [`TimedStore`]), commit waits and read waits
-//! made on the same task add to that tally, and the scope's owner logs it.
-//! Work on other tasks, such as the committer or background compaction, is
-//! not attributed to the request that triggered it.
+//! Store calls, commit waits and read waits add to the [`Tally`] of the
+//! task's [`scoped`] call. Work on other tasks isn't counted.
 
 use crate::engine::ObjectClass as Class;
 use crate::store::{BoxFut, DynStore, GetOpts, GetResult, ListPage, ObjectStore, PutMode, SResult, StoreError};

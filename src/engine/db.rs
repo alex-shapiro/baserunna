@@ -151,7 +151,6 @@ struct Queue {
 struct Queued {
     work: Work,
     at: Instant,
-    /// The request that enqueued the work, if any.
     request_id: Option<Arc<str>>,
 }
 
@@ -161,9 +160,7 @@ pub struct Db {
     st: Mutex<State>,
     q: Mutex<Queue>,
     load_lock: tokio::sync::Mutex<()>,
-    /// Manifest writes by this node started and finished; one is in flight
-    /// while they differ. Its result may already be visible to others, so
-    /// strong reads that arrive meanwhile wait for it.
+    /// A manifest write is in flight while these differ.
     writes_started: std::sync::atomic::AtomicU64,
     writes_finished: std::sync::atomic::AtomicU64,
     write_done: tokio::sync::Notify,
@@ -325,13 +322,7 @@ impl Db {
         (!left.is_zero()).then_some((l, left))
     }
 
-    /// Whether the store's clock shows that `l`, which the manifest write
-    /// behind `v` granted, has lapsed, however late we first saw it. The
-    /// holder relies on a lease for less than its duration from before it
-    /// sent the write, and the store stamped the write after that (to its
-    /// precision). A lease left by a node that stopped or crashed long ago
-    /// then costs no wait. Allowing twice the duration and the margin
-    /// absorbs clock drift and skew between the store's servers.
+    /// Whether the store's clock shows `l` expired (SPEC §5.7).
     fn lapsed(&self, v: &Version, l: &Lease) -> bool {
         let (Some(stamped), Some(now)) = (v.stored_ms, self.shared.store_earliest_now_ms()) else {
             return false;
@@ -535,11 +526,8 @@ impl Db {
         self.resolve(c).await
     }
 
-    /// The newest version this node can vouch for, as of a strong snapshot,
-    /// but without waiting for this node's in-flight manifest write. Also
-    /// returns whether the version is settled: no write of ours was in
-    /// flight, so the snapshot is as strong as [`Db::snapshot`]'s. An
-    /// unsettled one may predate a write that other nodes can already read.
+    /// A strong snapshot that skips waiting for this node's in-flight
+    /// manifest write, and whether none was in flight.
     pub async fn latest(self: &Arc<Self>) -> Result<(Snapshot, bool)> {
         let settled = !self.writing();
         Ok((self.resolve(Consistency::Strong).await?, settled))
@@ -550,10 +538,7 @@ impl Db {
         self.writes_finished.load(SeqCst) < self.writes_started.load(SeqCst)
     }
 
-    /// Waits for the manifest write in flight when called, if any. Writes
-    /// started later are not waited for: nobody can have seen their result
-    /// before the caller arrived, so it is ordered before them, and readers
-    /// are not starved while commits follow one another.
+    /// Waits for the manifest write in flight, if any, but not later ones.
     async fn wait_for_write(&self) {
         use std::sync::atomic::Ordering::SeqCst;
         let started = self.writes_started.load(SeqCst);
@@ -671,17 +656,8 @@ impl Db {
         Ok(Txn::new(snap, isolation, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes))
     }
 
-    /// Begins a serializable transaction that is expected to write, on
-    /// [`Db::latest`]. Unlike a strong [`Db::begin`], it does not wait for
-    /// this node's in-flight manifest write, so concurrent writers reach the
-    /// commit queue while it is in flight and commit together in the next
-    /// batch.
-    ///
-    /// A transaction that commits is strictly serializable as usual: commit
-    /// validation checks its reads against every later write, the in-flight
-    /// one included. One that ends without committing, or that read through
-    /// [`Txn::untracked`], answers from reads no commit checks: if
-    /// [`Txn::needs_recheck`], pass it to [`Db::recheck`] before answering.
+    /// Begins a strong serializable transaction on [`Db::latest`]. Pass it to
+    /// [`Db::recheck`] if it [`Txn::needs_recheck`].
     pub async fn begin_write(self: &Arc<Self>) -> Result<Txn> {
         let (snap, settled) = self.latest().await?;
         let mut t =
@@ -693,11 +669,8 @@ impl Db {
         Ok(t)
     }
 
-    /// Checks the reads of `t`, which [`Txn::needs_recheck`]. Waits for a
-    /// strong snapshot and validates the reads against it, as a commit would.
-    /// Returns the version at which they are current, or `None` if `t` must
-    /// run again: a later write changed them, or `t` read through
-    /// [`Txn::untracked`], which no validation can check.
+    /// Validates `t`'s reads against a strong snapshot. Returns the version
+    /// they are current at, or `None` if `t` must run again.
     pub async fn recheck(self: &Arc<Self>, t: Txn) -> Result<Option<Seq>> {
         if t.read_untracked() {
             self.shared.counters.add(&super::Activity { unsettled_reruns: 1, ..Default::default() });
@@ -843,8 +816,6 @@ impl Db {
         }
     }
 
-    /// Logs a batch that wrote the manifest: how long its oldest work waited
-    /// in the queue, and where the batch spent its time.
     fn log_batch(&self, queued: &[(Instant, Option<Arc<str>>)], txns: usize, started: Instant, tally: &Tally) {
         use crate::log::{self, Level};
         use serde_json::json;

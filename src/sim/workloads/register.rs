@@ -1,10 +1,5 @@
 //! `register`: concurrent writers and strong readers on a few keys, with a
 //! real-time linearizability check over the recorded history.
-//!
-//! Readers read through every strongly consistent path: a GET, a GET the
-//! receiving node must answer itself (so nodes without the lease read the
-//! store directly), a read-only one-shot transaction, and a one-shot
-//! transaction that also writes, whose read is validated at commit.
 
 use super::super::Sim;
 use super::super::client::Client;
@@ -23,9 +18,6 @@ struct Op {
     client: String,
 }
 
-/// Runs `writers` and `readers` clients for `ops` operations each, pausing up
-/// to `max_pause_ms` before each one; short pauses keep commits in flight
-/// while other requests arrive.
 pub async fn run(
     sim: Arc<Sim>,
     writers: usize,
@@ -74,8 +66,7 @@ pub async fn run(
                         client: c.name.clone(),
                     });
                 } else {
-                    // A client that reads through one node and then another
-                    // must not see the value go back in time.
+                    // Consecutive reads through different nodes must not go back in time.
                     let kinds = match c.rng().below(6) {
                         4 => vec![1, 0],
                         5 => vec![1, 2],
@@ -112,10 +103,8 @@ pub async fn run(
     check(&hist.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Reads `r{key}` through one of the strongly consistent read paths: a GET
-/// (0), a GET answered by the node it reaches (1), a read-only transaction
-/// (2), or a transaction that also writes (3). Returns the value's version
-/// (0 if missing) and the value, or `None` if the read failed.
+/// Reads `r{key}` by GET (0), unforwarded GET (1), read-only `/txn` (2) or
+/// read-write `/txn` (3). Returns `(version, value)`, version 0 if missing.
 async fn read_once(c: &Client, db: &str, key: usize, path_kind: u64) -> Option<(u64, String)> {
     let get = |hops: &str| {
         let headers = if hops.is_empty() { vec![] } else { vec![("x-baserunna-hops", hops.to_string())] };

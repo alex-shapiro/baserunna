@@ -755,6 +755,21 @@ macro_rules! watch {
 }
 pub(crate) use watch;
 
+/// Marks a response `Connection: close` if the handler answered without
+/// reading the request body to its end, as for a request refused early. The
+/// server closes such a connection after the response; saying so keeps a
+/// proxy from sending another request on it, which would fail (on Fly.io,
+/// with a 502 to an unrelated client).
+async fn close_if_body_unread(req: Request, next: Next) -> Response {
+    let (parts, body) = req.into_parts();
+    let (tracked, read) = body::Tracked::new(body);
+    let mut resp = next.run(Request::from_parts(parts, Body::new(tracked))).await;
+    if !read.load(std::sync::atomic::Ordering::SeqCst) {
+        resp.headers_mut().insert(http::header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    resp
+}
+
 async fn healthz(State(node): State<Arc<Node>>) -> Response {
     if node.draining() {
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"ok": false, "draining": true}))).into_response();
@@ -791,6 +806,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .layer(middleware::from_fn_with_state(node.clone(), tag_client))
         .layer(DefaultBodyLimit::max(node.cfg.max_json_body))
         .layer(middleware::from_fn_with_state(node.clone(), request_context))
+        .layer(middleware::from_fn(close_if_body_unread))
         .with_state(node.clone());
     node.set_router(r.clone());
     r
@@ -812,6 +828,29 @@ pub(crate) fn paging(q: &Params) -> Result<(usize, Option<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
+
+    #[test]
+    fn responses_close_connections_whose_request_body_went_unread() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            // Constants keep these out of the documented-routes scan (tests/openapi.rs).
+            const IGNORE: &str = "/ignore";
+            const READ: &str = "/read";
+            let app = Router::new()
+                .route(IGNORE, axum::routing::any(|| async { StatusCode::TOO_MANY_REQUESTS }))
+                .route(READ, axum::routing::post(|b: Bytes| async move { b.len().to_string() }))
+                .layer(middleware::from_fn(close_if_body_unread));
+            let close = |method: &str, path: &str, body: &'static str| {
+                let req = http::Request::builder().method(method).uri(path).body(Body::from(body)).unwrap();
+                let app = app.clone();
+                async move { app.oneshot(req).await.unwrap().headers().get(http::header::CONNECTION).cloned() }
+            };
+            assert_eq!(close("POST", "/ignore", "unread").await, Some(HeaderValue::from_static("close")));
+            assert_eq!(close("POST", "/read", "read").await, None);
+            assert_eq!(close("GET", "/ignore", "").await, None);
+        });
+    }
 
     #[test]
     fn client_addresses_come_from_trusted_proxies_only() {

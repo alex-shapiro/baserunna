@@ -1,4 +1,5 @@
-//! Streaming blob request/response bodies and HTTP Range parsing.
+//! Streaming blob request/response bodies, request body tracking, and HTTP
+//! Range parsing.
 
 use crate::engine::blob::{self, BlobWriter, chunk_plan, read_chunk};
 use crate::engine::{BlobRef, Shared};
@@ -149,6 +150,40 @@ pub async fn read_upload<F: std::future::Future<Output = BlobWriter>>(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unsatisfiable;
+
+/// A request body that records in `read` whether it was read to its end.
+pub struct Tracked {
+    inner: Body,
+    read: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Tracked {
+    pub fn new(inner: Body) -> (Tracked, Arc<std::sync::atomic::AtomicBool>) {
+        let read = Arc::new(std::sync::atomic::AtomicBool::new(http_body::Body::is_end_stream(&inner)));
+        (Tracked { inner, read: read.clone() }, read)
+    }
+}
+
+impl http_body::Body for Tracked {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let polled = Pin::new(&mut self.inner).poll_frame(cx);
+        if let Poll::Ready(None) = polled {
+            self.read.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 /// Parses a single-range `Range` header against an object of `size` bytes.
 /// Returns `Ok(None)` when no single-range header is present.

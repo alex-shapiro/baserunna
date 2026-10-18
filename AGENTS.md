@@ -35,3 +35,4 @@ If you see an approach that is subpar, prefer to rip it out wholesale and replac
   a lot of facts but fails to communicate the key intent of a paragraph or section within the first
   sentence, restructure it to explain exactly what you were looking for, concisely.
 - Never use middle voice. Instead of "writes commit together", use "writes are committed together".
+- Never write factslop. by default, docs should focus on the concrete being solved over lists of symbols and intricate implementation details that are already present in the code.

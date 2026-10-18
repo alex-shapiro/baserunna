@@ -63,13 +63,13 @@ a private advertise address and a cluster secret. Background work (garbage
 collection, TTL expiry, stream retention) runs only while the machine is
 up.
 
-Use a `performance` machine for steady load. A `shared-cpu-1x` machine
-keeps up only briefly: in a load test it serves about 3,900 cached GETs/s
-until its credit ran out within minutes, then about a twelfth of that.
+Use a `performance` machine for sustained load. A `shared-cpu-1x` machine
+serves ~3,900 cached GETs/s until its CPU credits are exhausted after a few
+minutes, then drops to ~300 GETs/s.
 
-A write takes about 75 ms to commit, so a client that sends writes one at
-a time gets about 13 per second. Writes sent at the same time are
-committed together, so a database can handle a few hundred per second.
+Each manifest commit takes ~75 ms (~13 sequential writes/s). Concurrent
+writes are batched into a single commit, reaching a few hundred writes/s per
+database.
 
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) deploys
 every push to `main`, building on Fly's remote builder. It needs a
@@ -228,7 +228,7 @@ S3 lifecycle configuration with the rule above:
 
 ## Limits
 
-Rate limits are kept per node, so a cluster of N nodes admits up to N times each rate. 0 turns a limit off.
+Rate limits are enforced per node, so an N-node cluster allows up to N times the configured rate. Setting a limit to 0 disables it.
 
 | variable                                | default | limits                                       |
 | --------------------------------------- | ------- | -------------------------------------------- |

@@ -1,37 +1,37 @@
-//! Load generator for a deployed Baserunna server. Prints throughput and
-//! latency per operation at each concurrency level. Request IDs are
-//! `lg-<step>-<worker>-<n>`; step 0 is the warmup.
+//! HTTP load generator for a deployed Baserunna server. Prints throughput and
+//! latency percentiles per operation at each concurrency step. Request IDs use
+//! the format `lg-<step>-<worker>-<n>`; step 0 is the warmup phase.
 //!
 //! ```text
 //! LOAD_TOKEN=<api key> cargo run --release --example loadgen
 //! LOAD_TOKEN=... LOAD_STEPS=8,32,128 LOAD_MIX=put=100 cargo run --release --example loadgen
 //! ```
 //!
-//! | variable           | default                     | meaning                                            |
-//! | ------------------ | --------------------------- | -------------------------------------------------- |
-//! | `LOAD_URL`         | `https://baserunna.fly.dev` | server                                             |
-//! | `LOAD_TOKEN`       | required                    | API key or session token of the account under test |
-//! | `LOAD_DBS`         | 8                           | databases (`loadtest-<i>`, created if missing)     |
-//! | `LOAD_KEYS`        | 1000                        | keys per database, written before the run          |
-//! | `LOAD_VALUE_BYTES` | 256                         | size of written values                             |
-//! | `LOAD_MIX`         | `get=80,put=15,txn=4,append=1` | relative weights of get, put, scan, txn, append |
-//! | `LOAD_STEPS`       | `4,16,64`                   | concurrency levels, run in order                   |
-//! | `LOAD_SECS`        | 20                          | measured duration of each step                     |
-//! | `LOAD_WARMUP_SECS` | 5                           | unmeasured load before the first step              |
-//! | `LOAD_CLEANUP`     | 0                           | 1 deletes the databases afterwards                 |
+//! | variable           | default                        | description                                           |
+//! | ------------------ | ------------------------------ | ----------------------------------------------------- |
+//! | `LOAD_URL`         | `https://baserunna.fly.dev`    | target server URL                                     |
+//! | `LOAD_TOKEN`       | required                       | API key or session token for the test account         |
+//! | `LOAD_DBS`         | 8                              | database count (`loadtest-<i>`, created if missing)   |
+//! | `LOAD_KEYS`        | 1000                           | keys preloaded per database before the run            |
+//! | `LOAD_VALUE_BYTES` | 256                            | byte length of written values                         |
+//! | `LOAD_MIX`         | `get=80,put=15,txn=4,append=1` | relative weights of `get`, `put`, `scan`, `txn`, `append` |
+//! | `LOAD_STEPS`       | `4,16,64`                      | concurrency levels executed in order                  |
+//! | `LOAD_SECS`        | 20                             | duration in seconds of each measured step             |
+//! | `LOAD_WARMUP_SECS` | 5                              | warmup duration in seconds before the first step      |
+//! | `LOAD_CLEANUP`     | 0                              | set to `1` to delete the test databases after the run |
 
 use baserunna::util::rng::Rng;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-fn var(name: &str, default: &str) -> String {
+fn env_str(name: &str, default: &str) -> String {
     std::env::var(name).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string())
 }
 
-fn num(name: &str, default: u64) -> u64 {
-    let v = var(name, &default.to_string());
-    v.parse().unwrap_or_else(|_| panic!("{name} must be a number, not {v:?}"))
+fn env_u64(name: &str, default: u64) -> u64 {
+    let v = env_str(name, &default.to_string());
+    v.parse().unwrap_or_else(|_| panic!("{name} must be a number, got {v:?}"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,7 +51,7 @@ impl Op {
             "scan" => Op::Scan,
             "txn" => Op::Txn,
             "append" => Op::Append,
-            _ => panic!("unknown op {s:?} in LOAD_MIX (get, put, scan, txn, append)"),
+            _ => panic!("unknown op {s:?} in LOAD_MIX (expected get, put, scan, txn, or append)"),
         }
     }
 
@@ -70,14 +70,14 @@ impl Op {
 struct Config {
     url: String,
     token: String,
-    dbs: usize,
-    keys: u64,
+    db_count: usize,
+    keys_per_db: u64,
     value_bytes: usize,
     mix: Vec<(Op, u64)>,
 }
 
 impl Config {
-    fn db(&self, i: usize) -> String {
+    fn db_name(&self, i: usize) -> String {
         format!("loadtest-{i}")
     }
 
@@ -97,88 +97,88 @@ impl Config {
 #[derive(Default)]
 struct Stats {
     /// Latencies of successful requests, in microseconds.
-    latencies: BTreeMap<Op, Vec<u32>>,
-    /// Failed requests by operation and status (`0` for transport errors).
+    latencies_us: BTreeMap<Op, Vec<u32>>,
+    /// Failed requests by operation and HTTP status (`0` for transport errors).
     failures: BTreeMap<(Op, u16), u64>,
     throttled: u64,
     first_error: Option<String>,
 }
 
 impl Stats {
-    fn merge(&mut self, o: Stats) {
-        for (op, mut l) in o.latencies {
-            self.latencies.entry(op).or_default().append(&mut l);
+    fn merge(&mut self, other: Stats) {
+        for (op, mut samples) in other.latencies_us {
+            self.latencies_us.entry(op).or_default().append(&mut samples);
         }
-        for (k, n) in o.failures {
+        for (k, n) in other.failures {
             *self.failures.entry(k).or_default() += n;
         }
-        self.throttled += o.throttled;
+        self.throttled += other.throttled;
         if self.first_error.is_none() {
-            self.first_error = o.first_error;
+            self.first_error = other.first_error;
         }
     }
 }
 
-struct Outcome {
+struct Response {
     status: u16,
     body: Value,
 }
 
-async fn send(cfg: &Config, req: reqwest::RequestBuilder) -> Result<Outcome, String> {
+async fn send(cfg: &Config, req: reqwest::RequestBuilder) -> Result<Response, String> {
     let resp = req.bearer_auth(&cfg.token).send().await.map_err(|e| e.to_string())?;
     let status = resp.status().as_u16();
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-    Ok(Outcome { status, body: serde_json::from_slice(&bytes).unwrap_or(Value::Null) })
+    Ok(Response { status, body: serde_json::from_slice(&bytes).unwrap_or(Value::Null) })
 }
 
-fn request(http: &reqwest::Client, cfg: &Config, rng: &mut Rng, op: Op) -> reqwest::RequestBuilder {
-    let db = cfg.db(rng.usize(cfg.dbs));
+fn build_request(http: &reqwest::Client, cfg: &Config, rng: &mut Rng, op: Op) -> reqwest::RequestBuilder {
+    let db = cfg.db_name(rng.usize(cfg.db_count));
     let base = format!("{}/v1/dbs/{db}", cfg.url);
-    let key = |rng: &mut Rng| format!("k{:06}", rng.below(cfg.keys));
-    let value = |rng: &mut Rng| value_string(rng, cfg.value_bytes);
+    let random_key = |rng: &mut Rng| format!("k{:06}", rng.below(cfg.keys_per_db));
+    let val = |rng: &mut Rng| random_value(rng, cfg.value_bytes);
     match op {
-        Op::Get => http.get(format!("{base}/kv/{}", key(rng))),
-        Op::Put => http.put(format!("{base}/kv/{}", key(rng))).body(value(rng)),
-        Op::Scan => http.get(format!("{base}/kv?prefix={}&limit=20", &key(rng)[..5])),
+        Op::Get => http.get(format!("{base}/kv/{}", random_key(rng))),
+        Op::Put => http.put(format!("{base}/kv/{}", random_key(rng))).body(val(rng)),
+        Op::Scan => http.get(format!("{base}/kv?prefix={}&limit=20", &random_key(rng)[..5])),
         Op::Txn => http.post(format!("{base}/txn")).json(&json!({"ops": [
-            {"op": "get", "key": key(rng)},
+            {"op": "get", "key": random_key(rng)},
             {"op": "increment", "key": "counter", "by": 1},
-            {"op": "put", "key": key(rng), "value": value(rng)},
+            {"op": "put", "key": random_key(rng), "value": val(rng)},
         ]})),
         Op::Append => http
             .post(format!("{base}/streams/events/records"))
-            .json(&json!({"records": [{"json": {"level": "info", "msg": value(rng)}}]})),
+            .json(&json!({"records": [{"json": {"level": "info", "msg": val(rng)}}]})),
     }
 }
 
-fn value_string(rng: &mut Rng, n: usize) -> String {
+fn random_value(rng: &mut Rng, len: usize) -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    (0..n).map(|_| *rng.pick(ALPHABET) as char).collect()
+    (0..len).map(|_| *rng.pick(ALPHABET) as char).collect()
 }
 
-async fn worker(http: reqwest::Client, cfg: Config, step: usize, w: usize, until: Instant) -> Stats {
-    let mut rng = Rng::new((step * 1_000_003 + w) as u64);
+async fn run_worker(http: reqwest::Client, cfg: Config, step: usize, worker_id: usize, deadline: Instant) -> Stats {
+    let mut rng = Rng::new((step * 1_000_003 + worker_id) as u64);
     let mut stats = Stats::default();
     for n in 0.. {
-        if Instant::now() >= until {
+        if Instant::now() >= deadline {
             break;
         }
         let op = cfg.pick_op(&mut rng);
-        let req = request(&http, &cfg, &mut rng, op).header("x-request-id", format!("lg-{step}-{w}-{n}"));
-        let t = Instant::now();
+        let req = build_request(&http, &cfg, &mut rng, op).header("x-request-id", format!("lg-{step}-{worker_id}-{n}"));
+        let started = Instant::now();
         match send(&cfg, req).await {
-            Ok(o) if (200..300).contains(&o.status) || (op == Op::Get && o.status == 404) => {
-                let us = t.elapsed().as_micros().min(u32::MAX as u128) as u32;
-                stats.latencies.entry(op).or_default().push(us);
+            Ok(r) if (200..300).contains(&r.status) || (op == Op::Get && r.status == 404) => {
+                let us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                stats.latencies_us.entry(op).or_default().push(us);
             }
-            Ok(o) if o.status == 429 => {
+            Ok(r) if r.status == 429 => {
                 stats.throttled += 1;
-                let ms = o.body["error"]["details"]["retry_after_ms"].as_u64().unwrap_or(1000);
+                let ms = r.body["error"]["details"]["retry_after_ms"].as_u64().unwrap_or(1000);
                 tokio::time::sleep(Duration::from_millis(ms.max(1))).await;
             }
-            Ok(o) => {
-                *stats.failures.entry((op, o.status)).or_default() += 1;
-                stats.first_error.get_or_insert_with(|| format!("{} {}: {}", op.name(), o.status, o.body));
+            Ok(r) => {
+                *stats.failures.entry((op, r.status)).or_default() += 1;
+                stats.first_error.get_or_insert_with(|| format!("{} {}: {}", op.name(), r.status, r.body));
             }
             Err(e) => {
                 *stats.failures.entry((op, 0)).or_default() += 1;
@@ -196,20 +196,20 @@ async fn run_step(
     secs: u64,
     step: usize,
 ) -> (Stats, Duration) {
-    let t = Instant::now();
-    let until = t + Duration::from_secs(secs);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(secs);
     let tasks: Vec<_> =
-        (0..concurrency).map(|w| tokio::spawn(worker(http.clone(), cfg.clone(), step, w, until))).collect();
+        (0..concurrency).map(|w| tokio::spawn(run_worker(http.clone(), cfg.clone(), step, w, deadline))).collect();
     let mut stats = Stats::default();
     for t in tasks {
-        stats.merge(t.await.expect("worker"));
+        stats.merge(t.await.expect("worker panicked"));
     }
-    (stats, t.elapsed())
+    (stats, started.elapsed())
 }
 
-fn pct(sorted: &[u32], p: f64) -> f64 {
-    let i = ((sorted.len() as f64 * p).ceil() as usize).clamp(1, sorted.len()) - 1;
-    sorted[i] as f64 / 1000.0
+fn percentile_ms(sorted_us: &[u32], p: f64) -> f64 {
+    let i = ((sorted_us.len() as f64 * p).ceil() as usize).clamp(1, sorted_us.len()) - 1;
+    sorted_us[i] as f64 / 1000.0
 }
 
 fn utc_now() -> String {
@@ -217,12 +217,12 @@ fn utc_now() -> String {
     format!("{:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60)
 }
 
-fn report(step: usize, concurrency: usize, stats: &mut Stats, elapsed: Duration, from: &str, to: &str) {
+fn report(step: usize, concurrency: usize, stats: &mut Stats, elapsed: Duration, start_time: &str, end_time: &str) {
     let secs = elapsed.as_secs_f64();
-    let ok: usize = stats.latencies.values().map(Vec::len).sum();
+    let ok: usize = stats.latencies_us.values().map(Vec::len).sum();
     let failed: u64 = stats.failures.values().sum();
     println!(
-        "\nstep {step} (lg-{step}-*, {from} to {to}), concurrency {concurrency}: {:.0} ok/s, {failed} failed, {} throttled",
+        "\nstep {step} (lg-{step}-*, {start_time} to {end_time}), concurrency {concurrency}: {:.0} ok/s, {failed} failed, {} throttled",
         ok as f64 / secs,
         stats.throttled,
     );
@@ -230,17 +230,17 @@ fn report(step: usize, concurrency: usize, stats: &mut Stats, elapsed: Duration,
         "  {:<7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
         "op", "ok/s", "p50 ms", "p90 ms", "p99 ms", "max ms", "failed"
     );
-    for (op, l) in stats.latencies.iter_mut() {
-        l.sort_unstable();
+    for (op, samples) in stats.latencies_us.iter_mut() {
+        samples.sort_unstable();
         let failed: u64 = stats.failures.iter().filter(|((o, _), _)| o == op).map(|(_, n)| n).sum();
         println!(
             "  {:<7} {:>8.0} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8}",
             op.name(),
-            l.len() as f64 / secs,
-            pct(l, 0.50),
-            pct(l, 0.90),
-            pct(l, 0.99),
-            pct(l, 1.0),
+            samples.len() as f64 / secs,
+            percentile_ms(samples, 0.50),
+            percentile_ms(samples, 0.90),
+            percentile_ms(samples, 0.99),
+            percentile_ms(samples, 1.0),
             failed
         );
     }
@@ -254,45 +254,45 @@ fn report(step: usize, concurrency: usize, stats: &mut Stats, elapsed: Duration,
     }
 }
 
-/// Retries retryable errors for up to a minute.
-async fn expect_ok(cfg: &Config, what: &str, req: reqwest::RequestBuilder, also: &[u16]) {
-    let t = Instant::now();
+/// Sends `req`, retrying retryable errors for up to 60 seconds.
+async fn send_with_retry(cfg: &Config, action: &str, req: reqwest::RequestBuilder, allowed_statuses: &[u16]) {
+    let started = Instant::now();
     loop {
-        let attempt = req.try_clone().expect("setup requests have buffered bodies");
+        let attempt = req.try_clone().expect("setup requests must have cloneable bodies");
         match send(cfg, attempt).await {
-            Ok(o) if (200..300).contains(&o.status) || also.contains(&o.status) => return,
-            Ok(o) if o.body["error"]["retryable"] == true && t.elapsed() < Duration::from_secs(60) => {
-                let ms = o.body["error"]["details"]["retry_after_ms"].as_u64().unwrap_or(500);
+            Ok(r) if (200..300).contains(&r.status) || allowed_statuses.contains(&r.status) => return,
+            Ok(r) if r.body["error"]["retryable"] == true && started.elapsed() < Duration::from_secs(60) => {
+                let ms = r.body["error"]["details"]["retry_after_ms"].as_u64().unwrap_or(500);
                 tokio::time::sleep(Duration::from_millis(ms.clamp(100, 5_000))).await;
             }
-            Ok(o) => panic!("{what}: HTTP {} {}", o.status, o.body),
-            Err(e) => panic!("{what}: {e}"),
+            Ok(r) => panic!("{action}: HTTP {} {}", r.status, r.body),
+            Err(e) => panic!("{action}: {e}"),
         }
     }
 }
 
 async fn setup(http: &reqwest::Client, cfg: &Config) {
     let mut rng = Rng::new(0);
-    for i in 0..cfg.dbs {
-        let db = cfg.db(i);
+    for i in 0..cfg.db_count {
+        let db = cfg.db_name(i);
         let base = format!("{}/v1/dbs/{db}", cfg.url);
         let create = http.post(format!("{}/v1/dbs", cfg.url)).json(&json!({"name": db}));
-        expect_ok(cfg, &format!("create {db}"), create, &[409]).await;
+        send_with_retry(cfg, &format!("create {db}"), create, &[409]).await;
         let stream = http.post(format!("{base}/streams")).json(&json!({"name": "events", "retention_ms": 3_600_000}));
-        expect_ok(cfg, &format!("create {db} stream"), stream, &[409]).await;
-        for chunk in (0..cfg.keys).collect::<Vec<_>>().chunks(500) {
+        send_with_retry(cfg, &format!("create {db} stream"), stream, &[409]).await;
+        for chunk in (0..cfg.keys_per_db).collect::<Vec<_>>().chunks(500) {
             let ops: Vec<Value> = chunk
                 .iter()
-                .map(|k| json!({"op": "put", "key": format!("k{k:06}"), "value": value_string(&mut rng, cfg.value_bytes)}))
+                .map(|k| json!({"op": "put", "key": format!("k{k:06}"), "value": random_value(&mut rng, cfg.value_bytes)}))
                 .collect();
             let txn = http.post(format!("{base}/txn")).json(&json!({ "ops": ops }));
-            expect_ok(cfg, &format!("preload {db}"), txn, &[]).await;
+            send_with_retry(cfg, &format!("preload {db}"), txn, &[]).await;
         }
     }
 }
 
 async fn wait_healthy(http: &reqwest::Client, url: &str) -> Value {
-    let t = Instant::now();
+    let started = Instant::now();
     loop {
         if let Ok(r) = http.get(format!("{url}/healthz")).send().await
             && r.status().is_success()
@@ -300,8 +300,8 @@ async fn wait_healthy(http: &reqwest::Client, url: &str) -> Value {
         {
             return v;
         }
-        if t.elapsed() > Duration::from_secs(60) {
-            panic!("{url}/healthz did not answer 200 within 60 s");
+        if started.elapsed() > Duration::from_secs(60) {
+            panic!("{url}/healthz did not return 200 within 60s");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -310,25 +310,28 @@ async fn wait_healthy(http: &reqwest::Client, url: &str) -> Value {
 #[tokio::main]
 async fn main() {
     let cfg = Config {
-        url: var("LOAD_URL", "https://baserunna.fly.dev").trim_end_matches('/').to_string(),
+        url: env_str("LOAD_URL", "https://baserunna.fly.dev").trim_end_matches('/').to_string(),
         token: std::env::var("LOAD_TOKEN").expect("set LOAD_TOKEN to an API key or session token"),
-        dbs: num("LOAD_DBS", 8) as usize,
-        keys: num("LOAD_KEYS", 1000).max(1),
-        value_bytes: num("LOAD_VALUE_BYTES", 256) as usize,
-        mix: var("LOAD_MIX", "get=80,put=15,txn=4,append=1")
+        db_count: env_u64("LOAD_DBS", 8) as usize,
+        keys_per_db: env_u64("LOAD_KEYS", 1000).max(1),
+        value_bytes: env_u64("LOAD_VALUE_BYTES", 256) as usize,
+        mix: env_str("LOAD_MIX", "get=80,put=15,txn=4,append=1")
             .split(',')
             .map(|kv| {
-                let (k, w) = kv.split_once('=').unwrap_or_else(|| panic!("LOAD_MIX entries are op=weight, not {kv:?}"));
-                (Op::parse(k.trim()), w.trim().parse().expect("LOAD_MIX weights are numbers"))
+                let (k, w) =
+                    kv.split_once('=').unwrap_or_else(|| panic!("LOAD_MIX entries must be op=weight, got {kv:?}"));
+                (Op::parse(k.trim()), w.trim().parse().expect("LOAD_MIX weights must be numbers"))
             })
             .filter(|&(_, w)| w > 0)
             .collect(),
     };
     assert!(!cfg.mix.is_empty(), "LOAD_MIX has no positive weights");
-    let steps: Vec<usize> =
-        var("LOAD_STEPS", "4,16,64").split(',').map(|s| s.trim().parse().expect("LOAD_STEPS are numbers")).collect();
-    let secs = num("LOAD_SECS", 20);
-    let warmup = num("LOAD_WARMUP_SECS", 5);
+    let steps: Vec<usize> = env_str("LOAD_STEPS", "4,16,64")
+        .split(',')
+        .map(|s| s.trim().parse().expect("LOAD_STEPS must be numbers"))
+        .collect();
+    let secs = env_u64("LOAD_SECS", 20);
+    let warmup = env_u64("LOAD_WARMUP_SECS", 5);
     let max_conc = steps.iter().copied().max().unwrap_or(1);
     let http = reqwest::Client::builder()
         .pool_max_idle_per_host(max_conc)
@@ -338,17 +341,17 @@ async fn main() {
 
     let before = wait_healthy(&http, &cfg.url).await;
     println!("{}: node {}", cfg.url, before["node"]["node_id"]);
-    let t = Instant::now();
+    let started = Instant::now();
     setup(&http, &cfg).await;
-    println!("setup: {} databases x {} keys in {:.1}s", cfg.dbs, cfg.keys, t.elapsed().as_secs_f64());
+    println!("setup: {} databases x {} keys in {:.1}s", cfg.db_count, cfg.keys_per_db, started.elapsed().as_secs_f64());
 
     if warmup > 0 {
         run_step(&http, &cfg, steps[0], warmup, 0).await;
     }
-    for (i, &c) in steps.iter().enumerate() {
-        let from = utc_now();
-        let (mut stats, elapsed) = run_step(&http, &cfg, c, secs, i + 1).await;
-        report(i + 1, c, &mut stats, elapsed, &from, &utc_now());
+    for (i, &concurrency) in steps.iter().enumerate() {
+        let start_time = utc_now();
+        let (mut stats, elapsed) = run_step(&http, &cfg, concurrency, secs, i + 1).await;
+        report(i + 1, concurrency, &mut stats, elapsed, &start_time, &utc_now());
     }
 
     let after = wait_healthy(&http, &cfg.url).await;
@@ -358,11 +361,12 @@ async fn main() {
     }
     println!("\nnode cache: {} bytes, {} hits, {} misses", cache["bytes"], cache["hits"], cache["misses"]);
 
-    if num("LOAD_CLEANUP", 0) == 1 {
-        for i in 0..cfg.dbs {
-            let db = cfg.db(i);
-            expect_ok(&cfg, &format!("delete {db}"), http.delete(format!("{}/v1/dbs/{db}", cfg.url)), &[404]).await;
+    if env_u64("LOAD_CLEANUP", 0) == 1 {
+        for i in 0..cfg.db_count {
+            let db = cfg.db_name(i);
+            send_with_retry(&cfg, &format!("delete {db}"), http.delete(format!("{}/v1/dbs/{db}", cfg.url)), &[404])
+                .await;
         }
-        println!("deleted {} databases", cfg.dbs);
+        println!("deleted {} databases", cfg.db_count);
     }
 }

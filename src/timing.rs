@@ -1,9 +1,11 @@
-//! Per-operation time accounting for diagnosing latency.
+//! Task-local latency and object-store operation tracking.
 //!
-//! Store calls, commit waits and read waits add to the [`Tally`] of the
-//! task's [`scoped`] call. Work on other tasks isn't counted.
+//! Wrapping a future in [`scoped`] attaches a [`Tally`] to the task so that
+//! object-store operations (via [`TimedStore`]), commit waits, and manifest
+//! write waits on that task are recorded. Work spawned onto background tasks
+//! is not attributed to the caller's tally.
 
-use crate::engine::ObjectClass as Class;
+use crate::engine::ObjectClass;
 use crate::store::{BoxFut, DynStore, GetOpts, GetResult, ListPage, ObjectStore, PutMode, SResult, StoreError};
 use bytes::Bytes;
 use serde_json::{Map, Value as Json, json};
@@ -35,50 +37,50 @@ impl StoreOp {
 }
 
 #[derive(Default)]
-struct Calls {
-    n: AtomicU64,
+struct OpStats {
+    count: AtomicU64,
     errors: AtomicU64,
-    us: AtomicU64,
+    micros: AtomicU64,
     bytes: AtomicU64,
 }
 
-/// Time spent by one request or commit batch, by cause.
+/// Latency and object-store call counters for a single request or commit batch.
 #[derive(Default)]
 pub struct Tally {
-    store: [[Calls; StoreOp::ALL.len()]; Class::ALL.len()],
+    store: [[OpStats; StoreOp::ALL.len()]; ObjectClass::ALL.len()],
     commits: AtomicU64,
     commit_us: AtomicU64,
     read_wait_us: AtomicU64,
     build_us: AtomicU64,
 }
 
-fn ms(us: u64) -> u64 {
+fn to_ms(us: u64) -> u64 {
     us / 1000
 }
 
 impl Tally {
-    fn calls(&self, class: Class, op: StoreOp) -> &Calls {
+    fn stats(&self, class: ObjectClass, op: StoreOp) -> &OpStats {
         &self.store[class as usize][op as usize]
     }
 
-    /// Number of store calls of `op` on objects of `class`.
-    pub fn store_calls(&self, class: Class, op: StoreOp) -> u64 {
-        self.calls(class, op).n.load(Relaxed)
+    /// Number of `op` store calls on objects of `class`.
+    pub fn store_calls(&self, class: ObjectClass, op: StoreOp) -> u64 {
+        self.stats(class, op).count.load(Relaxed)
     }
 
-    /// Store calls as `{"manifest.put": {"n", "ms", "bytes", "errors"}, ..}`,
-    /// or `None` if there were none.
+    /// Formats recorded store operations as a JSON map keyed by `"<class>.<op>"`,
+    /// or returns `None` if no store calls were made.
     pub fn store_json(&self) -> Option<Json> {
         let mut m = Map::new();
-        for class in Class::ALL {
+        for class in ObjectClass::ALL {
             for op in StoreOp::ALL {
-                let c = self.calls(class, op);
-                let n = c.n.load(Relaxed);
+                let s = self.stats(class, op);
+                let n = s.count.load(Relaxed);
                 if n == 0 {
                     continue;
                 }
-                let mut v = json!({"n": n, "ms": ms(c.us.load(Relaxed)), "bytes": c.bytes.load(Relaxed)});
-                let errors = c.errors.load(Relaxed);
+                let mut v = json!({"n": n, "ms": to_ms(s.micros.load(Relaxed)), "bytes": s.bytes.load(Relaxed)});
+                let errors = s.errors.load(Relaxed);
                 if errors > 0 {
                     v["errors"] = json!(errors);
                 }
@@ -88,24 +90,24 @@ impl Tally {
         (!m.is_empty()).then_some(Json::Object(m))
     }
 
-    /// Total milliseconds spent in store calls.
+    /// Total milliseconds spent in object-store calls.
     pub fn store_ms(&self) -> u64 {
-        ms(self.store.iter().flatten().map(|c| c.us.load(Relaxed)).sum())
+        to_ms(self.store.iter().flatten().map(|s| s.micros.load(Relaxed)).sum())
     }
 
-    /// Commits awaited and the total milliseconds spent waiting for them.
+    /// Returns the number of commits awaited and total wait time in milliseconds.
     pub fn commits(&self) -> (u64, u64) {
-        (self.commits.load(Relaxed), ms(self.commit_us.load(Relaxed)))
+        (self.commits.load(Relaxed), to_ms(self.commit_us.load(Relaxed)))
     }
 
-    /// Milliseconds strong reads waited for an in-flight manifest write.
+    /// Total milliseconds spent waiting for an in-flight manifest write before serving a strong read.
     pub fn read_wait_ms(&self) -> u64 {
-        ms(self.read_wait_us.load(Relaxed))
+        to_ms(self.read_wait_us.load(Relaxed))
     }
 
     /// Milliseconds spent building commit batches, including segment flushes.
     pub fn build_ms(&self) -> u64 {
-        ms(self.build_us.load(Relaxed))
+        to_ms(self.build_us.load(Relaxed))
     }
 }
 
@@ -113,81 +115,81 @@ tokio::task_local! {
     static TALLY: Arc<Tally>;
 }
 
-/// Runs `f` with `tally` collecting the time spent on its task.
+/// Runs `f` with `tally` attached to the current task.
 pub async fn scoped<F: Future>(tally: Arc<Tally>, f: F) -> F::Output {
     TALLY.scope(tally, f).await
 }
 
-fn add(f: impl FnOnce(&Tally)) {
+fn with_current(f: impl FnOnce(&Tally)) {
     let _ = TALLY.try_with(|t| f(t));
 }
 
-fn micros(d: Duration) -> u64 {
+fn to_micros(d: Duration) -> u64 {
     d.as_micros().min(u64::MAX as u128) as u64
 }
 
-pub fn commit_waited(d: Duration) {
-    add(|t| {
+pub fn record_commit_wait(d: Duration) {
+    with_current(|t| {
         t.commits.fetch_add(1, Relaxed);
-        t.commit_us.fetch_add(micros(d), Relaxed);
+        t.commit_us.fetch_add(to_micros(d), Relaxed);
     });
 }
 
-pub fn read_waited(d: Duration) {
-    add(|t| {
-        t.read_wait_us.fetch_add(micros(d), Relaxed);
+pub fn record_read_wait(d: Duration) {
+    with_current(|t| {
+        t.read_wait_us.fetch_add(to_micros(d), Relaxed);
     });
 }
 
-pub fn built(d: Duration) {
-    add(|t| {
-        t.build_us.fetch_add(micros(d), Relaxed);
+pub fn record_build_time(d: Duration) {
+    with_current(|t| {
+        t.build_us.fetch_add(to_micros(d), Relaxed);
     });
 }
 
-fn store_call<T>(class: Class, op: StoreOp, started: Instant, bytes: u64, r: &SResult<T>) {
+fn record_store_call<T>(class: ObjectClass, op: StoreOp, started: Instant, bytes: u64, res: &SResult<T>) {
     let elapsed = started.elapsed();
-    add(|t| {
-        let c = t.calls(class, op);
-        c.n.fetch_add(1, Relaxed);
-        c.us.fetch_add(micros(elapsed), Relaxed);
-        c.bytes.fetch_add(bytes, Relaxed);
-        if matches!(r, Err(e) if !matches!(e, StoreError::NotFound | StoreError::NotModified)) {
-            c.errors.fetch_add(1, Relaxed);
+    with_current(|t| {
+        let s = t.stats(class, op);
+        s.count.fetch_add(1, Relaxed);
+        s.micros.fetch_add(to_micros(elapsed), Relaxed);
+        s.bytes.fetch_add(bytes, Relaxed);
+        if matches!(res, Err(e) if !matches!(e, StoreError::NotFound | StoreError::NotModified)) {
+            s.errors.fetch_add(1, Relaxed);
         }
     });
 }
 
-/// An object store that records each call in the current [`Tally`].
+/// Object-store wrapper that records each operation in the task-local [`Tally`].
 pub struct TimedStore(pub DynStore);
 
 impl ObjectStore for TimedStore {
     fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
         Box::pin(async move {
-            let t = Instant::now();
-            let r = self.0.get(key, opts).await;
-            let bytes = r.as_ref().map_or(0, |g| g.data.len() as u64);
-            store_call(Class::of(key), StoreOp::Get, t, bytes, &r);
-            r
+            let started = Instant::now();
+            let res = self.0.get(key, opts).await;
+            let bytes = res.as_ref().map_or(0, |g| g.data.len() as u64);
+            record_store_call(ObjectClass::from_key(key), StoreOp::Get, started, bytes, &res);
+            res
         })
     }
 
     fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
         Box::pin(async move {
-            let t = Instant::now();
+            let started = Instant::now();
             let bytes = data.len() as u64;
-            let r = self.0.put(key, data, mode).await;
-            store_call(Class::of(key), StoreOp::Put, t, bytes, &r);
-            r
+            let res = self.0.put(key, data, mode).await;
+            record_store_call(ObjectClass::from_key(key), StoreOp::Put, started, bytes, &res);
+            res
         })
     }
 
     fn delete<'a>(&'a self, key: &'a str) -> BoxFut<'a, SResult<()>> {
         Box::pin(async move {
-            let t = Instant::now();
-            let r = self.0.delete(key).await;
-            store_call(Class::of(key), StoreOp::Delete, t, 0, &r);
-            r
+            let started = Instant::now();
+            let res = self.0.delete(key).await;
+            record_store_call(ObjectClass::from_key(key), StoreOp::Delete, started, 0, &res);
+            res
         })
     }
 
@@ -198,10 +200,10 @@ impl ObjectStore for TimedStore {
         limit: usize,
     ) -> BoxFut<'a, SResult<ListPage>> {
         Box::pin(async move {
-            let t = Instant::now();
-            let r = self.0.list(prefix, start_after, limit).await;
-            store_call(Class::of(prefix), StoreOp::List, t, 0, &r);
-            r
+            let started = Instant::now();
+            let res = self.0.list(prefix, start_after, limit).await;
+            record_store_call(ObjectClass::from_key(prefix), StoreOp::List, started, 0, &res);
+            res
         })
     }
 
@@ -216,7 +218,7 @@ mod tests {
     use crate::store::MemStore;
 
     #[test]
-    fn store_calls_count_toward_the_enclosing_scope_only() {
+    fn tally_scoping() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
         rt.block_on(async {
             let store = TimedStore(Arc::new(MemStore::with_system_clock()));
@@ -226,11 +228,11 @@ mod tests {
                 let again = store.put("dbs/a/manifest", Bytes::from_static(b"de"), PutMode::Create).await;
                 assert_eq!(again, Err(StoreError::PreconditionFailed));
                 assert_eq!(store.get("dbs/a/seg/x", GetOpts::default()).await.err(), Some(StoreError::NotFound));
-                commit_waited(Duration::from_millis(3));
+                record_commit_wait(Duration::from_millis(3));
             })
             .await;
             store.put("dbs/a/manifest", Bytes::from_static(b"outside"), PutMode::Overwrite).await.unwrap();
-            assert_eq!(tally.store_calls(Class::Manifest, StoreOp::Put), 2);
+            assert_eq!(tally.store_calls(ObjectClass::Manifest, StoreOp::Put), 2);
             assert_eq!(
                 tally.store_json(),
                 Some(json!({

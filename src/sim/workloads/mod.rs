@@ -190,18 +190,18 @@ fn faulty4() -> super::SimConfig {
     super::SimConfig::faulty(4)
 }
 
-fn late_replies(mut c: super::SimConfig) -> super::SimConfig {
+fn with_late_replies(mut c: super::SimConfig) -> super::SimConfig {
     c.store.p_late_reply = 0.3;
     c.store.late_reply_ms = (50, 1_000);
     c
 }
 
 fn contended3() -> super::SimConfig {
-    late_replies(super::SimConfig::faulty(3))
+    with_late_replies(super::SimConfig::faulty(3))
 }
 
 fn contended_hostile3() -> super::SimConfig {
-    late_replies(super::SimConfig::hostile(3))
+    with_late_replies(super::SimConfig::hostile(3))
 }
 
 fn hostile3() -> super::SimConfig {

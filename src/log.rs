@@ -51,47 +51,47 @@ static TEXT: AtomicBool = AtomicBool::new(false);
 static PROCESS_NODE: OnceLock<String> = OnceLock::new();
 static WRITER: OnceLock<Writer> = OnceLock::new();
 
-/// Lines queued for the writer thread before new ones are dropped.
-const WRITER_QUEUE: usize = 64 * 1024;
+/// Maximum queued log lines before new lines are dropped.
+const QUEUE_CAPACITY: usize = 64 * 1024;
 
-enum Line {
-    Text(String),
+enum LogMsg {
+    Line(String),
     Flush(SyncSender<()>),
 }
 
 struct Writer {
-    tx: SyncSender<Line>,
+    tx: SyncSender<LogMsg>,
     dropped: AtomicU64,
 }
 
-/// Writes log lines from a dedicated thread, dropping them while its queue
-/// is full. Call [`flush`] before exiting.
-pub fn write_in_background() {
+/// Spawns a background thread that buffers and writes log lines to stderr,
+/// dropping new lines if the queue is full. Call [`flush`] before exiting.
+pub fn start_background_writer() {
     WRITER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(WRITER_QUEUE);
+        let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("log-writer".into())
             .spawn(move || write_lines(rx))
-            .expect("start the log writer thread");
+            .expect("failed to spawn log writer thread");
         Writer { tx, dropped: AtomicU64::new(0) }
     });
 }
 
-fn write_lines(rx: Receiver<Line>) {
+fn write_lines(rx: Receiver<LogMsg>) {
     let mut out = std::io::BufWriter::new(std::io::stderr());
     while let Ok(first) = rx.recv() {
         let mut acks = Vec::new();
-        for line in std::iter::once(first).chain(rx.try_iter()) {
-            match line {
-                Line::Text(t) => {
-                    let _ = writeln!(out, "{t}");
+        for msg in std::iter::once(first).chain(rx.try_iter()) {
+            match msg {
+                LogMsg::Line(line) => {
+                    let _ = writeln!(out, "{line}");
                 }
-                Line::Flush(ack) => acks.push(ack),
+                LogMsg::Flush(ack) => acks.push(ack),
             }
         }
         if let Some(n) = WRITER.get().map(|w| w.dropped.swap(0, Ordering::Relaxed)).filter(|n| *n > 0) {
             let node = PROCESS_NODE.get().map(|n| n.as_str());
-            let msg = format!("dropped {n} log lines: stderr was not keeping up");
+            let msg = format!("dropped {n} log lines (log queue full)");
             let line = match TEXT.load(Ordering::Relaxed) {
                 false => json_line(now_ms(), Level::Warn, node, None, &msg, &[]),
                 true => text_line(Level::Warn, node, None, &msg, &[]),
@@ -105,11 +105,11 @@ fn write_lines(rx: Receiver<Line>) {
     }
 }
 
-/// Waits until every line logged so far has been written.
+/// Blocks until all queued log lines have been flushed to stderr.
 pub fn flush() {
     if let Some(w) = WRITER.get() {
         let (ack, done) = std::sync::mpsc::sync_channel(1);
-        if w.tx.send(Line::Flush(ack)).is_ok() {
+        if w.tx.send(LogMsg::Flush(ack)).is_ok() {
             let _ = done.recv();
         }
     }
@@ -120,12 +120,12 @@ fn write_line(line: String) {
         eprintln!("{line}");
         return;
     };
-    match w.tx.try_send(Line::Text(line)) {
+    match w.tx.try_send(LogMsg::Line(line)) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             w.dropped.fetch_add(1, Ordering::Relaxed);
         }
-        Err(TrySendError::Disconnected(Line::Text(line))) => eprintln!("{line}"),
+        Err(TrySendError::Disconnected(LogMsg::Line(line))) => eprintln!("{line}"),
         Err(TrySendError::Disconnected(_)) => {}
     }
 }

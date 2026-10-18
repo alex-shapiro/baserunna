@@ -116,7 +116,7 @@ async fn main() {
         eprintln!("baserunna: {e}");
         std::process::exit(1);
     }
-    baserunna::log::write_in_background();
+    baserunna::log::start_background_writer();
     let result = run().await;
     if let Err(e) = &result {
         baserunna::error!("{e}");

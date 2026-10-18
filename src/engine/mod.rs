@@ -84,12 +84,12 @@ activity! {
     chunks_sealed_in_compaction,
     /// Trims committed for stream retention.
     retention_trims,
-    /// Leases found expired by the store clock.
-    lapsed_leases,
-    /// Write transactions begun during an in-flight manifest write.
-    unsettled_begins,
-    /// Transactions a recheck sent to run again.
-    unsettled_reruns,
+    /// Foreign leases determined to have expired via the store clock.
+    expired_leases,
+    /// Transactions started while a manifest write was in flight on this node.
+    optimistic_begins,
+    /// Optimistic transactions re-executed after failing revalidation against a strong snapshot.
+    optimistic_reruns,
 }
 
 /// State shared by every database handle on a node.
@@ -123,7 +123,7 @@ impl Shared {
         self.clock.now_ms(Duration::from_millis(self.cfg.clock_sync_max_age_ms))
     }
 
-    /// The earliest the store's current time can be, if measured recently.
+    /// Lower bound on the store's current time, if measured within the max sync age.
     pub fn store_earliest_now_ms(&self) -> Option<u64> {
         self.clock.earliest_now_ms(Duration::from_millis(self.cfg.clock_sync_max_age_ms))
     }
@@ -210,7 +210,7 @@ pub fn db_prefix(db: &str) -> String {
     format!("dbs/{db}/")
 }
 
-/// The kind of object a store key names.
+/// Object category in storage, derived from the object key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectClass {
     Manifest,
@@ -224,7 +224,7 @@ impl ObjectClass {
     pub const ALL: [ObjectClass; 5] =
         [ObjectClass::Manifest, ObjectClass::Segment, ObjectClass::Levels, ObjectClass::Blob, ObjectClass::Other];
 
-    pub fn of(key: &str) -> ObjectClass {
+    pub fn from_key(key: &str) -> ObjectClass {
         let Some((_, rest)) = key.strip_prefix("dbs/").and_then(|k| k.split_once('/')) else {
             return ObjectClass::Other;
         };

@@ -150,33 +150,34 @@ pub async fn read_upload<F: std::future::Future<Output = BlobWriter>>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unsatisfiable;
 
-/// A request body that records in `read` whether it was read to its end.
-pub struct Tracked {
+/// Request body wrapper that records whether the stream has been fully consumed.
+pub struct TrackedBody {
     inner: Body,
-    read: Arc<std::sync::atomic::AtomicBool>,
+    consumed: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl Tracked {
-    pub fn new(inner: Body) -> (Tracked, Arc<std::sync::atomic::AtomicBool>) {
-        let read = Arc::new(std::sync::atomic::AtomicBool::new(http_body::Body::is_end_stream(&inner)));
-        (Tracked { inner, read: read.clone() }, read)
+impl TrackedBody {
+    pub fn new(inner: Body) -> (TrackedBody, Arc<std::sync::atomic::AtomicBool>) {
+        let consumed = Arc::new(std::sync::atomic::AtomicBool::new(http_body::Body::is_end_stream(&inner)));
+        (TrackedBody { inner, consumed: consumed.clone() }, consumed)
     }
 }
 
-impl http_body::Body for Tracked {
+impl http_body::Body for TrackedBody {
     type Data = Bytes;
     type Error = axum::Error;
 
     fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
         let polled = Pin::new(&mut self.inner).poll_frame(cx);
-        // hyper's client stops reading once `is_end_stream` is true.
+        // Hyper stops polling as soon as `is_end_stream()` is true,
+        // without waiting for `Poll::Ready(None)`.
         let ended = match &polled {
             Poll::Ready(None) => true,
             Poll::Ready(Some(Ok(_))) => self.inner.is_end_stream(),
             _ => false,
         };
         if ended {
-            self.read.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.consumed.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         polled
     }

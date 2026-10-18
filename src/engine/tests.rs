@@ -341,15 +341,15 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
 }
 
 #[test]
-fn object_classes_follow_the_key_layout() {
-    assert_eq!(ObjectClass::of(&manifest_key("a1")), ObjectClass::Manifest);
-    assert_eq!(ObjectClass::of(&seg_key("a1", "0123")), ObjectClass::Segment);
-    assert_eq!(ObjectClass::of(&levels_key("a1", "0123")), ObjectClass::Levels);
-    assert_eq!(ObjectClass::of(&blob_chunk_key("a1", "b", 1)), ObjectClass::Blob);
-    assert_eq!(ObjectClass::of(&pin_key("a1", "b")), ObjectClass::Blob);
-    assert_eq!(ObjectClass::of(&seg_key("a1", "")), ObjectClass::Segment);
-    assert_eq!(ObjectClass::of("clock"), ObjectClass::Other);
-    assert_eq!(ObjectClass::of("dbs/a1"), ObjectClass::Other);
+fn object_class_from_key() {
+    assert_eq!(ObjectClass::from_key(&manifest_key("a1")), ObjectClass::Manifest);
+    assert_eq!(ObjectClass::from_key(&seg_key("a1", "0123")), ObjectClass::Segment);
+    assert_eq!(ObjectClass::from_key(&levels_key("a1", "0123")), ObjectClass::Levels);
+    assert_eq!(ObjectClass::from_key(&blob_chunk_key("a1", "b", 1)), ObjectClass::Blob);
+    assert_eq!(ObjectClass::from_key(&pin_key("a1", "b")), ObjectClass::Blob);
+    assert_eq!(ObjectClass::from_key(&seg_key("a1", "")), ObjectClass::Segment);
+    assert_eq!(ObjectClass::from_key("clock"), ObjectClass::Other);
+    assert_eq!(ObjectClass::from_key("dbs/a1"), ObjectClass::Other);
 }
 
 #[test]
@@ -1166,44 +1166,44 @@ fn foreign_leases_block_commits_until_they_expire() {
     });
 }
 
-/// `b` commits a write whose reply is lost `reply_leases` leases later,
-/// after `a` took over and wrote.
-fn commit_with_lost_reply_after_takeover(reply_leases: u64) -> crate::error::Result<Seq> {
+/// Node B commits a write whose response is delayed by `reply_delay_leases`
+/// lease durations while node A takes over the lease and commits its own write.
+fn commit_with_lost_reply_after_takeover(reply_delay_leases: u64) -> crate::error::Result<Seq> {
     rt().block_on(async {
-        let (b, store) = delayed_engine("b");
-        let db = opened(&b, "d").await;
-        put(&db, "k", "b").await;
-        let a = second_node(&b, &store, "a");
-        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let (node_b, store) = delayed_engine("b");
+        let db_b = opened(&node_b, "d").await;
+        put(&db_b, "k", "b").await;
+        let node_a = second_node(&node_b, &store, "a");
+        let mut t = db_b.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         t.put(Bytes::from_static(b"k"), inline("lost")).unwrap();
-        let lease = b.shared.cfg.lease_ms + b.shared.cfg.lease_margin_ms;
+        let lease_ms = node_b.shared.cfg.lease_ms + node_b.shared.cfg.lease_margin_ms;
         store.manifest_put_lost.store(1, SeqCst);
-        store.put_reply_ms.store(reply_leases * lease, SeqCst);
-        let commit = tokio::spawn(async move { db.commit(t.into_request()).await });
+        store.put_reply_ms.store(reply_delay_leases * lease_ms, SeqCst);
+        let commit = tokio::spawn(async move { db_b.commit(t.into_request()).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
         store.put_reply_ms.store(0, SeqCst);
-        let other = opened(&a, "d").await;
-        tokio::time::sleep(Duration::from_millis(lease + 100)).await;
-        put(&other, "k", "a").await;
+        let db_a = opened(&node_a, "d").await;
+        tokio::time::sleep(Duration::from_millis(lease_ms + 100)).await;
+        put(&db_a, "k", "a").await;
         commit.await.unwrap()
     })
 }
 
 #[test]
-fn a_lease_lost_after_an_ambiguous_write_leaves_the_outcome_unknown() {
-    // `b` retries while `a`'s lease is valid.
+fn ambiguous_commit_during_active_lease() {
+    // Node B retries while node A's lease is still active.
     match commit_with_lost_reply_after_takeover(2) {
         Err(Error::Unavailable { outcome_unknown: true, .. }) => {}
-        other => panic!("the write landed, so its outcome is unknown, not {other:?}"),
+        other => panic!("expected unknown outcome for applied write, got {other:?}"),
     }
 }
 
 #[test]
-fn an_ambiguous_write_is_resolved_once_the_next_lease_lapses() {
-    // `b` retries once the store clock shows `a`'s lease expired.
+fn ambiguous_commit_after_lease_expires() {
+    // Node B retries after the store clock shows node A's lease has expired.
     match commit_with_lost_reply_after_takeover(4) {
         Ok(2) => {}
-        other => panic!("the write landed at version 2, not {other:?}"),
+        other => panic!("expected write to resolve at version 2, got {other:?}"),
     }
 }
 

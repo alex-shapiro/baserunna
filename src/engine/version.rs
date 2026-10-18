@@ -18,7 +18,7 @@ use std::sync::Arc;
 pub struct Version {
     pub m: Manifest,
     pub etag: String,
-    /// The manifest's last-modified time, if read from the store.
+    /// Object-store `last_modified` timestamp (in ms) when this manifest was loaded from storage.
     pub stored_ms: Option<u64>,
     pub(crate) shared: Arc<Shared>,
     /// `m.range_deletes`, indexed for lookups.

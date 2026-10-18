@@ -352,7 +352,7 @@ pub async fn trim(txn: &mut Txn, name: &str, before_seq: Option<u64>, before_tim
         (Some(s), None) => s,
         (None, Some(t)) => {
             let st = state(txn, &c, false).await?;
-            txn.untracked().stream_seek(c.id, &st, Seek::Time(t)).await?
+            txn.untracked_snapshot().stream_seek(c.id, &st, Seek::Time(t)).await?
         }
         _ => return Err(Error::invalid("trim needs exactly one of before_seq and before_time")),
     };
@@ -591,9 +591,11 @@ pub async fn consumer(txn: &mut Txn, stream: &str, name: &str) -> Result<Option<
 pub async fn set_consumer(txn: &mut Txn, stream: &str, name: &str, seq: u64, now: u64) -> Result<()> {
     check_name(name, "consumer")?;
     let c = open(txn, stream).await?;
-    // Seqs only grow, so a cursor valid at the snapshot stays valid: no
-    // need to conflict with appends by recording the state. A refusal
-    // records it, since a newer snapshot may accept the cursor.
+    // Sequence numbers are monotonic, so a cursor valid at the snapshot remains
+    // valid without adding the stream state to the read set (which would conflict
+    // with concurrent appends). If the cursor is ahead of the snapshot, re-read
+    // and record the state so an optimistic transaction revalidates against any
+    // in-flight append.
     let mut next = state(txn, &c, false).await?.next_seq;
     if seq > next {
         next = state(txn, &c, true).await?.next_seq;

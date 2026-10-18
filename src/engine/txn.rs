@@ -147,8 +147,8 @@ pub struct Txn {
     write_bytes: usize,
     max_write_bytes: usize,
     appended: usize,
-    settled: bool,
-    untracked: bool,
+    optimistic: bool,
+    has_untracked_reads: bool,
 }
 
 fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -173,34 +173,38 @@ impl Txn {
             write_bytes: 0,
             max_write_bytes,
             appended: 0,
-            settled: true,
-            untracked: false,
+            optimistic: false,
+            has_untracked_reads: false,
         }
     }
 
-    /// Whether [`super::Db::recheck`] must check the transaction before it answers.
-    pub fn needs_recheck(&self, commits: bool) -> bool {
-        !self.settled && (!commits || self.untracked)
+    /// Returns true if this transaction began during an in-flight manifest
+    /// write and cannot rely on commit validation (either because it will not
+    /// commit or because it performed untracked snapshot reads).
+    pub fn needs_revalidation(&self, will_commit: bool) -> bool {
+        self.optimistic && (!will_commit || self.has_untracked_reads)
     }
 
-    pub(crate) fn unsettle(&mut self) {
-        self.settled = false;
+    pub(crate) fn mark_optimistic(&mut self) {
+        self.optimistic = true;
     }
 
-    pub(crate) fn read_untracked(&self) -> bool {
-        self.untracked
+    pub(crate) fn has_untracked_reads(&self) -> bool {
+        self.has_untracked_reads
     }
 
-    /// Reads through the snapshot skip the read set. Record what the answer
-    /// depends on, or use [`Txn::untracked`].
+    /// Returns the underlying version snapshot. Reads performed directly on
+    /// [`Version`] are not added to the transaction's read set; use
+    /// [`Txn::untracked_snapshot`] if the transaction's output depends on them.
     pub fn snapshot(&self) -> &Arc<Version> {
         &self.snapshot
     }
 
-    /// Like [`Txn::snapshot`], but [`super::Db::recheck`] then runs the
-    /// transaction again.
-    pub fn untracked(&mut self) -> &Arc<Version> {
-        self.untracked = true;
+    /// Returns the underlying version snapshot and marks the transaction as
+    /// having performed untracked reads, forcing [`super::Db::revalidate`] to
+    /// re-run the transaction if a manifest write was in flight when it began.
+    pub fn untracked_snapshot(&mut self) -> &Arc<Version> {
+        self.has_untracked_reads = true;
         &self.snapshot
     }
 

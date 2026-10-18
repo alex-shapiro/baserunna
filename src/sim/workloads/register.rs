@@ -66,11 +66,14 @@ pub async fn run(
                         client: c.name.clone(),
                     });
                 } else {
-                    // Consecutive reads through different nodes must not go back in time.
+                    // Consecutive reads through different nodes must not observe stale state.
                     let kinds = match c.rng().below(6) {
-                        4 => vec![1, 0],
-                        5 => vec![1, 2],
-                        k => vec![k],
+                        0 => vec![ReadKind::Get],
+                        1 => vec![ReadKind::LocalGet],
+                        2 => vec![ReadKind::ReadOnlyTxn],
+                        3 => vec![ReadKind::ReadWriteTxn],
+                        4 => vec![ReadKind::LocalGet, ReadKind::Get],
+                        _ => vec![ReadKind::LocalGet, ReadKind::ReadOnlyTxn],
                     };
                     let mut start = start;
                     for kind in kinds {
@@ -103,36 +106,47 @@ pub async fn run(
     check(&hist.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Reads `r{key}` by GET (0), unforwarded GET (1), read-only `/txn` (2) or
-/// read-write `/txn` (3). Returns `(version, value)`, version 0 if missing.
-async fn read_once(c: &Client, db: &str, key: usize, path_kind: u64) -> Option<(u64, String)> {
-    let get = |hops: &str| {
-        let headers = if hops.is_empty() { vec![] } else { vec![("x-baserunna-hops", hops.to_string())] };
-        async move { c.send("GET", &format!("/v1/dbs/{db}/kv/r{key}"), &headers, bytes::Bytes::new()).await }
-    };
-    if path_kind < 2 {
-        let r = get(if path_kind == 0 { "" } else { "2" }).await.ok()?;
-        return match r.status {
-            200 => {
-                let version = r.headers.get("x-baserunna-version")?.to_str().ok()?.parse().ok()?;
-                Some((version, String::from_utf8_lossy(&r.body).into_owned()))
+#[derive(Clone, Copy)]
+enum ReadKind {
+    Get,
+    LocalGet,
+    ReadOnlyTxn,
+    ReadWriteTxn,
+}
+
+/// Reads `r{key}` via `kind` and returns `(version, value)` (or `(0, "")` if not found).
+async fn read_once(c: &Client, db: &str, key: usize, kind: ReadKind) -> Option<(u64, String)> {
+    match kind {
+        ReadKind::Get | ReadKind::LocalGet => {
+            let headers = match kind {
+                ReadKind::LocalGet => vec![("x-baserunna-hops", "2".to_string())],
+                _ => vec![],
+            };
+            let r = c.send("GET", &format!("/v1/dbs/{db}/kv/r{key}"), &headers, bytes::Bytes::new()).await.ok()?;
+            match r.status {
+                200 => {
+                    let version = r.headers.get("x-baserunna-version")?.to_str().ok()?.parse().ok()?;
+                    Some((version, String::from_utf8_lossy(&r.body).into_owned()))
+                }
+                404 => Some((0, String::new())),
+                _ => None,
             }
-            404 => Some((0, String::new())),
-            _ => None,
-        };
-    }
-    let mut ops = vec![serde_json::json!({"op": "get", "key": format!("r{key}")})];
-    if path_kind == 3 {
-        ops.push(serde_json::json!({"op": "put", "key": format!("scratch-{}", c.name), "value": "x"}));
-    }
-    let r = c.call("POST", &format!("/v1/dbs/{db}/txn"), Some(serde_json::json!({ "ops": ops }))).await.ok()?;
-    if r.status != 200 {
-        return None;
-    }
-    let got = &r.json["results"][0];
-    match got["found"].as_bool()? {
-        true => Some((got["version"].as_u64()?, got["value"].as_str()?.to_string())),
-        false => Some((0, String::new())),
+        }
+        ReadKind::ReadOnlyTxn | ReadKind::ReadWriteTxn => {
+            let mut ops = vec![serde_json::json!({"op": "get", "key": format!("r{key}")})];
+            if matches!(kind, ReadKind::ReadWriteTxn) {
+                ops.push(serde_json::json!({"op": "put", "key": format!("scratch-{}", c.name), "value": "x"}));
+            }
+            let r = c.call("POST", &format!("/v1/dbs/{db}/txn"), Some(serde_json::json!({ "ops": ops }))).await.ok()?;
+            if r.status != 200 {
+                return None;
+            }
+            let got = &r.json["results"][0];
+            match got["found"].as_bool()? {
+                true => Some((got["version"].as_u64()?, got["value"].as_str()?.to_string())),
+                false => Some((0, String::new())),
+            }
+        }
     }
 }
 

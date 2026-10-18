@@ -25,7 +25,7 @@ pub struct StoreFaults {
     pub p_fail_after: f64,
     /// Maximum duration for which `list` may omit new objects or include deleted ones.
     pub list_lag_ms: u64,
-    /// Probability that a write's reply arrives `late_reply_ms` after it applied.
+    /// Probability that a write response is delayed by `late_reply_ms` after the write is applied.
     pub p_late_reply: f64,
     pub late_reply_ms: (u64, u64),
 }
@@ -90,7 +90,7 @@ pub struct SimStore {
     enabled: AtomicBool,
     trace: Arc<Trace>,
     view: Arc<Mutex<ListView>>,
-    replies: Arc<HeldReplies>,
+    held_replies: Arc<HeldReplies>,
     pub stats: StoreStats,
 }
 
@@ -124,7 +124,7 @@ impl SimStore {
             enabled: AtomicBool::new(true),
             trace,
             view: Arc::new(Mutex::new(ListView::default())),
-            replies: Arc::new(HeldReplies::default()),
+            held_replies: Arc::new(HeldReplies::default()),
             stats: StoreStats::default(),
         }
     }
@@ -137,14 +137,14 @@ impl SimStore {
         *self.faults.lock().unwrap_or_else(|e| e.into_inner()) = f;
     }
 
-    /// Holds replies to writes of keys ending in `suffix` until [`SimStore::release_replies`].
+    /// Blocks write responses for keys ending in `suffix` until [`SimStore::release_replies`] is called.
     pub fn hold_replies(&self, suffix: &str) {
-        *self.replies.suffix.lock().unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
+        *self.held_replies.suffix.lock().unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
     }
 
     pub fn release_replies(&self) {
-        *self.replies.suffix.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        self.replies.released.notify_waiters();
+        *self.held_replies.suffix.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.held_replies.released.notify_waiters();
     }
 
     fn draw(&self) -> Draw {
@@ -159,7 +159,7 @@ impl SimStore {
             latency_ms = r.range(f.stall_ms.0, f.stall_ms.1.max(f.stall_ms.0) + 1);
             self.trace.event(&format!("store stall {latency_ms}ms"));
         }
-        // Skip the draw when off, so existing seeds reproduce.
+        // Avoid advancing the RNG when disabled so existing seeds remain reproducible.
         let late_reply_ms = if on && f.p_late_reply > 0.0 && r.chance(f.p_late_reply) {
             r.range(f.late_reply_ms.0, f.late_reply_ms.1.max(f.late_reply_ms.0) + 1)
         } else {
@@ -244,7 +244,7 @@ impl ObjectStore for SimStore {
             self.stats.puts.fetch_add(1, Ordering::Relaxed);
             let Draw { latency_ms: lat, late_reply_ms, fail_before: before, fail_after: after, list_lag_ms } =
                 self.draw();
-            let replies = self.replies.clone();
+            let held_replies = self.held_replies.clone();
             let (tx, rx) = tokio::sync::oneshot::channel();
             let mem = self.mem.clone();
             let trace = self.trace.clone();
@@ -275,7 +275,7 @@ impl ObjectStore for SimStore {
                     trace.event(&format!("store put {key2} reply delayed {late_reply_ms}ms"));
                     tokio::time::sleep(Duration::from_millis(late_reply_ms)).await;
                 }
-                replies.wait(&key2).await;
+                held_replies.wait(&key2).await;
                 let r = match r {
                     Ok(_) if after => Err(unavailable("injected: response lost")),
                     other => other,

@@ -32,7 +32,7 @@ fn sim_register_linearizability() {
 }
 
 #[test]
-fn sim_register_linearizability_under_contention() {
+fn sim_register_contended() {
     run_scenario("register_contended", 22, 4);
 }
 
@@ -256,10 +256,11 @@ fn forwards_to_a_restarted_node_are_refused() {
     out.result.unwrap();
 }
 
-/// Leaseholder answers include a write another node served before its
-/// reply arrived (SPEC §5.5).
+/// If a second node serves a write before the leaseholder receives its
+/// manifest `PUT` reply, subsequent transactions on the leaseholder observe
+/// that write (SPEC §5.5).
 #[test]
-fn leaseholder_answers_include_a_write_another_node_served() {
+fn optimistic_txn_revalidation() {
     use baserunna::sim::client::Client;
     use serde_json::json;
     let mut cfg = SimConfig::basic();
@@ -268,70 +269,58 @@ fn leaseholder_answers_include_a_write_another_node_served() {
         let owner = Client::signup(&sim, "u", "u@held.test", "password-123").await?;
         owner.create_db("t").await?;
         let token = owner.token.clone().unwrap_or_default();
-        let at = |node: usize, name: &str| {
+        let client_on = |node: usize, name: &str| {
             let mut c = Client::with_token(&sim, name, &token);
             c.pin = Some(node);
             c
         };
-        let net = |e| format!("{e:?}");
-        // Requests that have been forwarded twice are answered where they land.
-        let here = || vec![("x-baserunna-hops", "2".to_string())];
-        let first = owner.send("PUT", "/v1/dbs/t/kv/k", &[], "a".into()).await.map_err(net)?;
-        if first.status != 200 {
-            return Err(format!("first write failed: {}", first.status));
-        }
+        // Setting x-baserunna-hops to 2 prevents the receiving node from forwarding.
+        let no_forward = || vec![("x-baserunna-hops", "2".to_string())];
+        let first = owner.send("PUT", "/v1/dbs/t/kv/k", &[], "a".into()).await.unwrap();
+        assert_eq!(first.status, 200);
         let holder_id = owner.call_settled("GET", "/v1/dbs/t", None).await.json["stats"]["lease_holder"].clone();
-        let holder = (0..2).find(|&i| sim.node(i).is_some_and(|n| holder_id == n.node.id.as_str()));
-        let holder = holder.ok_or(format!("no lease holder: {holder_id}"))?;
+        let holder = (0..2).find(|&i| sim.node(i).is_some_and(|n| holder_id == n.node.id.as_str())).unwrap();
         let other = 1 - holder;
 
         sim.store.hold_replies("/manifest");
-        let writer = at(holder, "writer");
-        let write = tokio::spawn(async move { writer.send("PUT", "/v1/dbs/t/kv/k", &here(), "b".into()).await });
+        let writer = client_on(holder, "writer");
+        let write_task =
+            tokio::spawn(async move { writer.send("PUT", "/v1/dbs/t/kv/k", &no_forward(), "b".into()).await });
         sim.sleep(500).await;
-        let seen = at(other, "other").send("GET", "/v1/dbs/t/kv/k", &here(), Default::default()).await.map_err(net)?;
-        if &seen.body[..] != b"b" {
-            return Err(format!("the other node should serve the applied write, got {:?}", seen.body));
-        }
-        let version: String = seen.headers["x-baserunna-version"].to_str().map_err(|e| e.to_string())?.into();
+        let seen =
+            client_on(other, "other").send("GET", "/v1/dbs/t/kv/k", &no_forward(), Default::default()).await.unwrap();
+        assert_eq!(&seen.body[..], b"b");
+        let version = seen.headers["x-baserunna-version"].to_str().unwrap().to_string();
 
-        let reader = at(holder, "reader");
-        let read = tokio::spawn(async move {
+        let reader = client_on(holder, "reader");
+        let read_task = tokio::spawn(async move {
             reader.call("POST", "/v1/dbs/t/txn", Some(json!({"ops": [{"op": "get", "key": "k"}]}))).await
         });
-        let conditional = at(holder, "conditional");
-        let put = tokio::spawn(async move {
-            let mut h = here();
-            h.push(("if-match", format!("\"{version}\"")));
-            conditional.send("PUT", "/v1/dbs/t/kv/k", &h, "c".into()).await
+        let cas_client = client_on(holder, "cas");
+        let cas_task = tokio::spawn(async move {
+            let mut headers = no_forward();
+            headers.push(("if-match", format!("\"{version}\"")));
+            cas_client.send("PUT", "/v1/dbs/t/kv/k", &headers, "c".into()).await
         });
         sim.sleep(500).await;
         sim.store.release_replies();
 
-        let w = write.await.map_err(|e| e.to_string())?.map_err(net)?;
-        if w.status != 200 {
-            return Err(format!("held write failed: {}", w.status));
-        }
-        let r = read.await.map_err(|e| e.to_string())?.map_err(net)?;
-        if r.json["results"][0]["value"] != "b" {
-            return Err(format!("read-only transaction missed the served write: {}", r.json));
-        }
-        let p = put.await.map_err(|e| e.to_string())?.map_err(net)?;
-        if p.status != 200 {
-            return Err(format!(
-                "If-Match on the served version failed: {} {}",
-                p.status,
-                String::from_utf8_lossy(&p.body)
-            ));
-        }
+        let write_res = write_task.await.unwrap().unwrap();
+        assert_eq!(write_res.status, 200);
+        let read_res = read_task.await.unwrap().unwrap();
+        assert_eq!(read_res.json["results"][0]["value"], "b", "{}", read_res.json);
+        let cas_res = cas_task.await.unwrap().unwrap();
+        assert_eq!(cas_res.status, 200, "{}", String::from_utf8_lossy(&cas_res.body));
         Ok(())
     });
     out.result.unwrap();
 }
 
-/// The same, for stream state read outside the read set.
+/// If a second node serves a stream append before the leaseholder receives its
+/// manifest `PUT` reply, stream operations on the leaseholder that read outside
+/// the key-value read set still observe that append (SPEC §5.5).
 #[test]
-fn leaseholder_stream_answers_include_an_append_another_node_served() {
+fn optimistic_stream_revalidation() {
     use baserunna::sim::client::Client;
     use serde_json::json;
     let mut cfg = SimConfig::basic();
@@ -340,121 +329,97 @@ fn leaseholder_stream_answers_include_an_append_another_node_served() {
         let owner = Client::signup(&sim, "u", "u@held-stream.test", "password-123").await?;
         owner.create_db("t").await?;
         let token = owner.token.clone().unwrap_or_default();
-        let at = |node: usize, name: &str| {
+        let client_on = |node: usize, name: &str| {
             let mut c = Client::with_token(&sim, name, &token);
             c.pin = Some(node);
             c
         };
-        let net = |e| format!("{e:?}");
         let records = json!({"records": [{"json": {"n": 1}}]});
         let created = owner.call_settled("POST", "/v1/dbs/t/streams", Some(json!({"name": "s"}))).await;
-        if created.status != 201 && created.status != 200 {
-            return Err(format!("stream create failed: {} {}", created.status, created.json));
-        }
+        assert!(created.status == 200 || created.status == 201, "{} {}", created.status, created.json);
         let first = owner.call_settled("POST", "/v1/dbs/t/streams/s/records", Some(records.clone())).await;
-        if first.status != 200 {
-            return Err(format!("first append failed: {} {}", first.status, first.json));
-        }
+        assert_eq!(first.status, 200, "{}", first.json);
         let holder_id = owner.call_settled("GET", "/v1/dbs/t", None).await.json["stats"]["lease_holder"].clone();
-        let holder = (0..2).find(|&i| sim.node(i).is_some_and(|n| holder_id == n.node.id.as_str()));
-        let holder = holder.ok_or(format!("no lease holder: {holder_id}"))?;
+        let holder = (0..2).find(|&i| sim.node(i).is_some_and(|n| holder_id == n.node.id.as_str())).unwrap();
         let other = 1 - holder;
 
         sim.store.hold_replies("/manifest");
-        let appender = at(holder, "appender");
-        let append =
+        let appender = client_on(holder, "appender");
+        let append_task =
             tokio::spawn(async move { appender.call("POST", "/v1/dbs/t/streams/s/records", Some(records)).await });
         sim.sleep(500).await;
-        // Requests that have been forwarded twice are answered where they land.
-        let here = [("x-baserunna-hops", "2".to_string())];
-        let seen =
-            at(other, "other").send("GET", "/v1/dbs/t/streams/s", &here, Default::default()).await.map_err(net)?;
-        let seen: serde_json::Value = serde_json::from_slice(&seen.body).map_err(|e| e.to_string())?;
-        if seen["next_seq"] != 2 {
-            return Err(format!("the other node should serve the applied append, got {seen}"));
-        }
+        // Setting x-baserunna-hops to 2 prevents the receiving node from forwarding.
+        let no_forward = [("x-baserunna-hops", "2".to_string())];
+        let seen = client_on(other, "other")
+            .send("GET", "/v1/dbs/t/streams/s", &no_forward, Default::default())
+            .await
+            .unwrap();
+        let seen: serde_json::Value = serde_json::from_slice(&seen.body).unwrap();
+        assert_eq!(seen["next_seq"], 2, "{seen}");
 
-        let cursor = at(holder, "cursor");
-        let put = tokio::spawn(async move {
-            cursor.call("PUT", "/v1/dbs/t/streams/s/consumers/c", Some(json!({"seq": 2}))).await
+        let consumer = client_on(holder, "consumer");
+        let consumer_task = tokio::spawn(async move {
+            consumer.call("PUT", "/v1/dbs/t/streams/s/consumers/c", Some(json!({"seq": 2}))).await
         });
-        let configurer = at(holder, "configurer");
-        let patch = tokio::spawn(async move {
-            configurer.call("PATCH", "/v1/dbs/t/streams/s", Some(json!({"retention_ms": 7_200_000}))).await
+        let patcher = client_on(holder, "patcher");
+        let patch_task = tokio::spawn(async move {
+            patcher.call("PATCH", "/v1/dbs/t/streams/s", Some(json!({"retention_ms": 7_200_000}))).await
         });
         sim.sleep(500).await;
         sim.store.release_replies();
 
-        let a = append.await.map_err(|e| e.to_string())?.map_err(net)?;
-        if a.status != 200 {
-            return Err(format!("held append failed: {} {}", a.status, a.json));
-        }
-        let p = put.await.map_err(|e| e.to_string())?.map_err(net)?;
-        if p.status != 200 {
-            return Err(format!("a cursor at the served append was refused: {} {}", p.status, p.json));
-        }
-        let c = patch.await.map_err(|e| e.to_string())?.map_err(net)?;
-        if c.status != 200 || c.json["next_seq"] != 2 {
-            return Err(format!("reconfiguring missed the served append: {} {}", c.status, c.json));
-        }
+        let append_res = append_task.await.unwrap().unwrap();
+        assert_eq!(append_res.status, 200, "{}", append_res.json);
+        let consumer_res = consumer_task.await.unwrap().unwrap();
+        assert_eq!(consumer_res.status, 200, "{}", consumer_res.json);
+        let patch_res = patch_task.await.unwrap().unwrap();
+        assert_eq!(patch_res.status, 200, "{}", patch_res.json);
+        assert_eq!(patch_res.json["next_seq"], 2, "{}", patch_res.json);
         Ok(())
     });
     out.result.unwrap();
 }
 
-/// Old leases left by a crashed node cost no wait; recent ones still block
-/// (SPEC §5.7).
+/// Leases expired according to the object store clock can be taken over
+/// immediately, whereas recently written leases still require waiting (SPEC §5.7).
 #[test]
-fn leases_left_long_ago_cost_no_wait() {
+fn store_clock_lease_expiry() {
     use baserunna::sim::client::Client;
     let mut cfg = SimConfig::basic();
     cfg.nodes = 2;
     let out = run(24, cfg, |sim| async move {
-        let owner = Client::signup(&sim, "u", "u@lapsed.test", "password-123").await?;
+        let owner = Client::signup(&sim, "u", "u@expired.test", "password-123").await?;
         let token = owner.token.clone().unwrap_or_default();
-        let at = |node: usize, name: &str| {
+        let client_on = |node: usize, name: &str| {
             let mut c = Client::with_token(&sim, name, &token);
             c.pin = Some(node);
             c
         };
-        let net = |e| format!("{e:?}");
-        // Requests that have been forwarded twice are answered where they land.
-        let here = [("x-baserunna-hops", "2".to_string())];
+        // Setting x-baserunna-hops to 2 prevents the receiving node from forwarding.
+        let no_forward = [("x-baserunna-hops", "2".to_string())];
         let put = |c: Client, db: &'static str| {
-            let here = here.clone();
-            async move { c.send("PUT", &format!("/v1/dbs/{db}/kv/k"), &here, "v".into()).await.map(|r| r.status) }
+            let no_forward = no_forward.clone();
+            async move { c.send("PUT", &format!("/v1/dbs/{db}/kv/k"), &no_forward, "v".into()).await.unwrap().status }
         };
         for db in ["old", "recent"] {
             owner.create_db(db).await?;
         }
-        let lapsed_before = sim.engine_activity().lapsed_leases;
-        if put(at(0, "a"), "old").await.map_err(net)? != 200 {
-            return Err("first write to old failed".into());
-        }
+        let expired_before = sim.engine_activity().expired_leases;
+        assert_eq!(put(client_on(0, "a"), "old").await, 200);
         let lease_ms = sim.cfg.engine.lease_ms;
         sim.sleep(3 * lease_ms + 2_000).await;
-        if put(at(0, "b"), "recent").await.map_err(net)? != 200 {
-            return Err("first write to recent failed".into());
-        }
+        assert_eq!(put(client_on(0, "b"), "recent").await, 200);
         sim.crash(0);
-        let recent = put(at(1, "c"), "recent").await.map_err(net)?;
-        if recent != 503 {
-            return Err(format!("a lease granted just now was ignored: {recent}"));
-        }
-        let old = put(at(1, "d"), "old").await.map_err(net)?;
-        if old != 200 {
-            return Err(format!("a lease granted {}ms ago blocked the write: {old}", 3 * lease_ms + 2_000));
-        }
-        if sim.engine_activity().lapsed_leases == lapsed_before {
-            return Err("no lease was found lapsed".into());
-        }
+        assert_eq!(put(client_on(1, "c"), "recent").await, 503);
+        assert_eq!(put(client_on(1, "d"), "old").await, 200);
+        assert!(sim.engine_activity().expired_leases > expired_before);
         Ok(())
     });
     out.result.unwrap();
 }
 
 #[test]
-fn request_and_commit_logs_account_for_time() {
+fn request_and_commit_log_timing() {
     use baserunna::log::{Level, REQUEST_ID_HEADER, capture};
     use baserunna::sim::client::Client;
     let cap = capture(Level::Info);

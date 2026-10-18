@@ -144,13 +144,13 @@ impl State {
 }
 
 struct Queue {
-    items: VecDeque<Queued>,
+    items: VecDeque<QueuedWork>,
     running: bool,
 }
 
-struct Queued {
+struct QueuedWork {
     work: Work,
-    at: Instant,
+    enqueued_at: Instant,
     request_id: Option<Arc<str>>,
 }
 
@@ -160,7 +160,7 @@ pub struct Db {
     st: Mutex<State>,
     q: Mutex<Queue>,
     load_lock: tokio::sync::Mutex<()>,
-    /// A manifest write is in flight while these differ.
+    /// A manifest write is in flight if `writes_finished < writes_started`.
     writes_started: std::sync::atomic::AtomicU64,
     writes_finished: std::sync::atomic::AtomicU64,
     write_done: tokio::sync::Notify,
@@ -308,12 +308,12 @@ impl Db {
         !self.own_lease_left(st, m).is_zero()
     }
 
-    /// A lease in `v` held by another node, with how long it may still be
-    /// valid from our viewpoint.
+    /// Returns another node's lease in `v` and its remaining duration
+    /// on this node's clock, or `None` if no foreign lease is active.
     fn foreign_lease<'a>(&self, v: &'a Version) -> Option<(&'a Lease, Duration)> {
         let m = &v.m;
         let l = m.lease.as_ref().filter(|l| l.node != self.shared.node_id)?;
-        if self.lapsed(v, l) {
+        if self.lease_expired_on_store(v, l) {
             return None;
         }
         let valid_for = Duration::from_millis(l.ms + self.shared.cfg.lease_margin_ms);
@@ -322,17 +322,17 @@ impl Db {
         (!left.is_zero()).then_some((l, left))
     }
 
-    /// Whether the store's clock shows `l` expired (SPEC §5.7).
-    fn lapsed(&self, v: &Version, l: &Lease) -> bool {
-        let (Some(stamped), Some(now)) = (v.stored_ms, self.shared.store_earliest_now_ms()) else {
+    /// Checks whether the store's clock shows that `l` has already expired (SPEC §5.7).
+    fn lease_expired_on_store(&self, v: &Version, l: &Lease) -> bool {
+        let (Some(last_modified_ms), Some(now_ms)) = (v.stored_ms, self.shared.store_earliest_now_ms()) else {
             return false;
         };
-        let precision = self.shared.store.time_precision_ms();
-        let lapsed = now > stamped + precision + 2 * l.ms + self.shared.cfg.lease_margin_ms;
-        if lapsed {
-            self.shared.counters.add(&super::Activity { lapsed_leases: 1, ..Default::default() });
+        let precision_ms = self.shared.store.time_precision_ms();
+        let expired = now_ms > last_modified_ms + precision_ms + 2 * l.ms + self.shared.cfg.lease_margin_ms;
+        if expired {
+            self.shared.counters.add(&super::Activity { expired_leases: 1, ..Default::default() });
         }
-        lapsed
+        expired
     }
 
     /// The node holding a valid lease on this database, if known.
@@ -518,48 +518,46 @@ impl Db {
     /// that version was current.
     pub async fn snapshot(self: &Arc<Self>, c: Consistency) -> Result<Snapshot> {
         if c == Consistency::Strong {
-            // A write of ours that is in flight may already be visible to
-            // readers elsewhere; serving the cached version now could go
-            // back in time relative to them.
-            self.wait_for_write().await;
+            self.wait_for_in_flight_write().await;
         }
-        self.resolve(c).await
+        self.resolve_snapshot(c).await
     }
 
-    /// A strong snapshot that skips waiting for this node's in-flight
-    /// manifest write, and whether none was in flight.
-    pub async fn latest(self: &Arc<Self>) -> Result<(Snapshot, bool)> {
-        let settled = !self.writing();
-        Ok((self.resolve(Consistency::Strong).await?, settled))
+    /// Resolves a strong snapshot without waiting for an in-flight manifest
+    /// write on this node. The boolean is true if a manifest write was in flight.
+    pub async fn latest_snapshot(self: &Arc<Self>) -> Result<(Snapshot, bool)> {
+        let write_in_flight = self.has_in_flight_write();
+        Ok((self.resolve_snapshot(Consistency::Strong).await?, write_in_flight))
     }
 
-    fn writing(&self) -> bool {
+    fn has_in_flight_write(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         self.writes_finished.load(SeqCst) < self.writes_started.load(SeqCst)
     }
 
-    /// Waits for the manifest write in flight, if any, but not later ones.
-    async fn wait_for_write(&self) {
+    /// Waits for any manifest write currently in flight on this node, ignoring
+    /// writes that start after this call begins.
+    async fn wait_for_in_flight_write(&self) {
         use std::sync::atomic::Ordering::SeqCst;
-        let started = self.writes_started.load(SeqCst);
+        let target = self.writes_started.load(SeqCst);
         let mut waited_since = None;
         loop {
             let notified = self.write_done.notified();
             let mut notified = std::pin::pin!(notified);
             notified.as_mut().enable();
-            if self.writes_finished.load(SeqCst) >= started {
+            if self.writes_finished.load(SeqCst) >= target {
                 break;
             }
             waited_since.get_or_insert_with(Instant::now);
             notified.await;
         }
         if let Some(t) = waited_since {
-            timing::read_waited(t.elapsed());
+            timing::record_read_wait(t.elapsed());
         }
     }
 
-    /// The cached version if it satisfies `c`, otherwise the manifest from the store.
-    async fn resolve(self: &Arc<Self>, c: Consistency) -> Result<Snapshot> {
+    /// Returns a snapshot from cache if it satisfies `c`, or refreshes the manifest from storage.
+    async fn resolve_snapshot(self: &Arc<Self>, c: Consistency) -> Result<Snapshot> {
         let now = Instant::now();
         if let Some((cur, current_at)) = self.cached(c, now) {
             return self.snapshot_at(check_live(cur)?, current_at).await;
@@ -656,24 +654,27 @@ impl Db {
         Ok(Txn::new(snap, isolation, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes))
     }
 
-    /// Begins a strong serializable transaction on [`Db::latest`]. Pass it to
-    /// [`Db::recheck`] if it [`Txn::needs_recheck`].
-    pub async fn begin_write(self: &Arc<Self>) -> Result<Txn> {
-        let (snap, settled) = self.latest().await?;
+    /// Begins a strong serializable transaction without waiting for an
+    /// in-flight manifest write on this node. If [`Txn::needs_revalidation`]
+    /// is true when the transaction finishes, pass it to [`Db::revalidate`]
+    /// before returning a result.
+    pub async fn begin_optimistic(self: &Arc<Self>) -> Result<Txn> {
+        let (snap, write_in_flight) = self.latest_snapshot().await?;
         let mut t =
             Txn::new(snap, Isolation::Serializable, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes);
-        if !settled {
-            t.unsettle();
-            self.shared.counters.add(&super::Activity { unsettled_begins: 1, ..Default::default() });
+        if write_in_flight {
+            t.mark_optimistic();
+            self.shared.counters.add(&super::Activity { optimistic_begins: 1, ..Default::default() });
         }
         Ok(t)
     }
 
-    /// Validates `t`'s reads against a strong snapshot. Returns the version
-    /// they are current at, or `None` if `t` must run again.
-    pub async fn recheck(self: &Arc<Self>, t: Txn) -> Result<Option<Seq>> {
-        if t.read_untracked() {
-            self.shared.counters.add(&super::Activity { unsettled_reruns: 1, ..Default::default() });
+    /// Waits for a strong snapshot and validates `t`'s read set against it.
+    /// Returns the snapshot version if all reads remain valid, or `None` if `t`
+    /// conflicted (or performed untracked reads) and must be re-executed.
+    pub async fn revalidate(self: &Arc<Self>, t: Txn) -> Result<Option<Seq>> {
+        if t.has_untracked_reads() {
+            self.shared.counters.add(&super::Activity { optimistic_reruns: 1, ..Default::default() });
             return Ok(None);
         }
         let snap = self.snapshot(Consistency::Strong).await?;
@@ -681,7 +682,7 @@ impl Db {
         match validate(&req, &snap.version, &[], &[], snap.time_ms).await {
             Ok(()) => Ok(Some(snap.version.m.version)),
             Err(Error::Conflict(_)) => {
-                self.shared.counters.add(&super::Activity { unsettled_reruns: 1, ..Default::default() });
+                self.shared.counters.add(&super::Activity { optimistic_reruns: 1, ..Default::default() });
                 Ok(None)
             }
             Err(e) => Err(e),
@@ -726,7 +727,7 @@ impl Db {
         let enqueued = Instant::now();
         self.enqueue(Work::Commit { req, tx });
         let r = rx.await;
-        timing::commit_waited(enqueued.elapsed());
+        timing::record_commit_wait(enqueued.elapsed());
         r.map_err(|_| Error::Unavailable {
             message: "commit interrupted".into(),
             retry_after_ms: None,
@@ -782,7 +783,11 @@ impl Db {
     fn enqueue(self: &Arc<Self>, w: Work) {
         let spawn = {
             let mut q = self.queue();
-            q.items.push_back(Queued { work: w, at: Instant::now(), request_id: crate::log::request_id() });
+            q.items.push_back(QueuedWork {
+                work: w,
+                enqueued_at: Instant::now(),
+                request_id: crate::log::request_id(),
+            });
             if q.running {
                 false
             } else {
@@ -798,7 +803,7 @@ impl Db {
 
     async fn committer(self: Arc<Self>) {
         loop {
-            let queued: Vec<Queued> = {
+            let queued: Vec<QueuedWork> = {
                 let mut q = self.queue();
                 if q.items.is_empty() {
                     q.running = false;
@@ -809,24 +814,25 @@ impl Db {
             };
             let started = Instant::now();
             let tally = Arc::new(Tally::default());
-            let (meta, batch): (Vec<_>, Vec<_>) = queued.into_iter().map(|q| ((q.at, q.request_id), q.work)).unzip();
-            let txns = batch.iter().filter(|w| matches!(w, Work::Commit { .. })).count();
+            let (enqueued, batch): (Vec<_>, Vec<_>) =
+                queued.into_iter().map(|q| ((q.enqueued_at, q.request_id), q.work)).unzip();
+            let txn_count = batch.iter().filter(|w| matches!(w, Work::Commit { .. })).count();
             timing::scoped(tally.clone(), self.process(batch)).await;
-            self.log_batch(&meta, txns, started, &tally);
+            self.log_batch(&enqueued, txn_count, started, &tally);
         }
     }
 
-    fn log_batch(&self, queued: &[(Instant, Option<Arc<str>>)], txns: usize, started: Instant, tally: &Tally) {
+    fn log_batch(&self, enqueued: &[(Instant, Option<Arc<str>>)], txn_count: usize, started: Instant, tally: &Tally) {
         use crate::log::{self, Level};
         use serde_json::json;
         if tally.store_calls(super::ObjectClass::Manifest, StoreOp::Put) == 0 || !log::enabled(Level::Info) {
             return;
         }
-        let oldest = queued.iter().map(|(at, _)| *at).min().unwrap_or(started);
+        let oldest = enqueued.iter().map(|(at, _)| *at).min().unwrap_or(started);
         let mut fields = vec![
             ("db", json!(self.id)),
-            ("txns", json!(txns)),
-            ("work", json!(queued.len())),
+            ("txns", json!(txn_count)),
+            ("work", json!(enqueued.len())),
             ("queued_ms", json!((started - oldest).as_millis() as u64)),
             ("build_ms", json!(tally.build_ms())),
             ("ms", json!(started.elapsed().as_millis() as u64)),
@@ -834,7 +840,7 @@ impl Db {
         if let Some(store) = tally.store_json() {
             fields.push(("store", store));
         }
-        let ids: Vec<&str> = queued.iter().filter_map(|(_, id)| id.as_deref()).collect();
+        let ids: Vec<&str> = enqueued.iter().filter_map(|(_, id)| id.as_deref()).collect();
         if !ids.is_empty() {
             fields.push(("request_ids", json!(ids)));
         }
@@ -880,7 +886,7 @@ impl Db {
             }
             let build_started = Instant::now();
             let plan = self.build(&base, &batch, now).await;
-            timing::built(build_started.elapsed());
+            timing::record_build_time(build_started.elapsed());
             let plan = match plan {
                 Ok(p) => p,
                 Err(e) => {

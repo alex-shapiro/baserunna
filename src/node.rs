@@ -206,6 +206,8 @@ pub struct Node {
     pub engine: Arc<Engine>,
     pub services: Services,
     members: Mutex<Vec<NodeRecord>>,
+    /// When a request last refreshed the members because it met a peer they lack.
+    members_refreshed_on_demand: Mutex<Option<Instant>>,
     suspects: Mutex<DetHashMap<String, Suspect>>,
     auth_cache: TtlCache<String, Principal>,
     name_cache: TtlCache<(String, String), DbRecord>,
@@ -232,6 +234,9 @@ struct Suspect {
     until: Instant,
 }
 
+/// Least time between member refreshes that requests trigger.
+const MEMBERS_REFRESH_ON_DEMAND_MIN: Duration = Duration::from_secs(1);
+
 const SUSPECT_MIN: Duration = Duration::from_secs(10);
 
 const CACHE_MAX: usize = 100_000;
@@ -254,6 +259,7 @@ impl Node {
             engine,
             services,
             members: Mutex::new(Vec::new()),
+            members_refreshed_on_demand: Mutex::new(None),
             suspects: Mutex::new(DetHashMap::default()),
             auth_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
             name_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
@@ -410,7 +416,11 @@ impl Node {
     }
 
     pub async fn refresh_members(&self) -> Result<()> {
-        let mut t = self.sys_read().await?;
+        self.refresh_members_at(false).await
+    }
+
+    async fn refresh_members_at(&self, strong: bool) -> Result<()> {
+        let mut t = self.sys_read_at(strong).await?;
         let nodes = meta::list_nodes(&mut t).await?;
         // Clear suspicion for peers that have heartbeated, restarted, or left.
         lock(&self.suspects).retain(|id, s| {
@@ -437,6 +447,28 @@ impl Node {
 
     pub fn addr_of(&self, node_id: &str) -> Option<String> {
         lock(&self.members).iter().find(|n| n.id == node_id).map(|n| n.addr.clone())
+    }
+
+    /// The address of `node_id`, refreshing the members strongly first if
+    /// they lack it: a lease holder that started since the last refresh is
+    /// not among them yet. Refreshes this way at most once a second.
+    async fn addr_of_or_refresh(&self, node_id: &str) -> Option<String> {
+        if let Some(a) = self.addr_of(node_id) {
+            return Some(a);
+        }
+        let due = {
+            let mut last = lock(&self.members_refreshed_on_demand);
+            let due = last.is_none_or(|t| t.elapsed() >= MEMBERS_REFRESH_ON_DEMAND_MIN);
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        };
+        if due {
+            crate::probe::hit(crate::probe::Probe::MembersRefreshedForUnknownPeer);
+            let _ = self.refresh_members_at(true).await;
+        }
+        self.addr_of(node_id)
     }
 
     /// Excludes `node_id` from routing with exponential backoff after an undelivered forward.
@@ -470,9 +502,13 @@ impl Node {
             return None;
         }
         if self.is_suspect(&target) {
+            self.env.trace(|| format!("{db_id}: {target} is suspect, handling locally"));
             return None;
         }
-        let addr = self.addr_of(&target)?;
+        let Some(addr) = self.addr_of_or_refresh(&target).await else {
+            self.env.trace(|| format!("{db_id}: no address for {target}, handling locally"));
+            return None;
+        };
         // Do not forward to a previous process that ran at this node's address.
         if addr == self.cfg.addr {
             crate::probe::hit(crate::probe::Probe::OwnAddressIgnored);
@@ -1014,11 +1050,20 @@ impl Node {
         auth::validate_password(password)?;
         let (user, fp) = self.open_link(client, auth::TokenPurpose::Reset, token).await?;
         let used = || Error::Unauthenticated("this link has been used already".into());
-        if meta::password_fp(&user) != fp {
-            return Err(used());
-        }
         if user.disabled {
             return Err(Error::PermissionDenied("this account is disabled".into()));
+        }
+        if meta::password_fp(&user) != fp {
+            // An earlier attempt with this link may have set this very
+            // password and failed afterwards: finish it, as a retry expects.
+            let Some(h) = user.password_hash.clone() else { return Err(used()) };
+            let pw = password.to_string();
+            if !self.hashing(move || auth::verify_password(&pw, &h)).await? {
+                return Err(used());
+            }
+            crate::probe::hit(crate::probe::Probe::PasswordResetFinished);
+            let session = self.create_session(&user.id, Some(client), SignInMethod::Reset).await?;
+            return Ok((user, session));
         }
         let hash = self.hash_password(password).await?;
         let set = MetaCmd::SetPassword {

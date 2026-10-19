@@ -13,7 +13,7 @@ use baserunna::sim::{SimOutcome, run};
 
 fn run_one(name: &str, seed: u64, keep_log: bool) -> (SimOutcome, Vec<String>) {
     let s = scenario(name).unwrap_or_else(|| panic!("unknown scenario {name}"));
-    let mut cfg = (s.config)();
+    let mut cfg = s.config_for(seed);
     cfg.keep_log = keep_log;
     cfg.full_trace = keep_log;
     let out = run(seed, cfg, s.run);
@@ -50,14 +50,15 @@ fn main() {
             if std::env::var("SIM_COVERAGE").is_ok() {
                 print!("{}", report.coverage_table());
             }
+            let unreached: Vec<&str> = report.unreached().iter().map(|p| p.name()).collect();
             println!(
-                "{} runs in {:?} wall, {}s simulated, {} failed, {} probes never reached: {:?}",
+                "{} runs in {:?} wall, {}s simulated, {} failed, {} probes never reached{}",
                 report.runs,
                 t.elapsed(),
                 report.virtual_ms / 1000,
                 report.failures.len(),
-                report.unreached().len(),
-                report.unreached().iter().map(|p| p.name()).collect::<Vec<_>>()
+                unreached.len(),
+                if unreached.len() <= 10 { format!(": {}", unreached.join(" ")) } else { String::new() }
             );
             std::process::exit(if report.failures.is_empty() { 0 } else { 1 });
         }
@@ -67,6 +68,8 @@ fn main() {
             for l in log {
                 println!("{l}");
             }
+            let knobs: Vec<String> = o.knobs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            println!("knobs: {}", knobs.join(" "));
             println!("{:?}", o.result);
         }
         "determinism" => {

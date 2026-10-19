@@ -5,7 +5,6 @@
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, url_escape};
-use super::chaos_step;
 use crate::util::b64;
 use crate::util::rng::Rng;
 use serde_json::{Value as Json, json};
@@ -765,16 +764,7 @@ pub async fn run(sim: Arc<Sim>, clients: usize, steps: usize, chaos: bool) -> Re
             Ok::<KvModel, String>(w)
         }));
     }
-    let chaos_task = if chaos {
-        let sim = sim.clone();
-        Some(tokio::spawn(async move {
-            loop {
-                chaos_step(&sim).await;
-            }
-        }))
-    } else {
-        None
-    };
+    let chaos_task = chaos.then(|| super::spawn_chaos(&sim));
     let mut models = Vec::new();
     let mut err = None;
     for h in handles {

@@ -148,6 +148,8 @@ probes! {
     ForwardAmbiguous,
     /// A membership entry with this node's own address was ignored.
     OwnAddressIgnored,
+    /// A request met a lease holder missing from the members and refreshed them.
+    MembersRefreshedForUnknownPeer,
     /// A peer was marked suspect after an undelivered forward.
     PeerSuspected,
     /// A request found its database's manifest deleted and finished the deletion.
@@ -162,6 +164,8 @@ probes! {
     PreconditionExplainedByReplay,
     /// An interactive transaction was not found on the node asked to continue it.
     InteractiveTxnLost,
+    /// A retried password reset found its new password already set and finished.
+    PasswordResetFinished,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

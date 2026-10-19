@@ -9,6 +9,7 @@ pub mod blob_gc_race;
 pub mod blobs;
 pub mod console;
 pub mod db_churn;
+pub mod history;
 pub mod kv_model;
 pub mod lifecycle;
 pub mod limits;
@@ -21,51 +22,51 @@ pub mod tables;
 pub mod ttl;
 pub mod watch;
 
-use super::Sim;
+use super::swarm::{Knobs, Profile, Skew, world};
+use super::{Sim, SimConfig};
 use std::sync::Arc;
 
-/// Injects one random fault action after a random pause.
+/// Injects one random fault action, chosen by the weights in
+/// [`super::SimConfig::chaos`], after a random pause.
 pub async fn chaos_step(sim: &Arc<Sim>) {
-    sim.sleep(500 + sim.rand_below(4_000)).await;
+    let c = sim.cfg.chaos.clone();
+    sim.sleep(100 + sim.rand_below(c.pause_ms)).await;
     let n = sim.node_count();
     let up = sim.up_nodes();
-    let extra = &sim.cfg.chaos;
-    match sim.rand_below(16) {
-        0 | 1 if up.len() > 1 || n == 1 => {
-            let i = up[sim.rand_below(up.len() as u64) as usize];
-            if n == 1 {
-                sim.restart(i).await;
-            } else {
-                sim.crash(i);
-            }
-        }
-        2 | 3 => {
+    let weights =
+        [c.crash, c.start, c.partition, c.one_way_partition, c.store_isolation, c.clock_step, c.heal, c.quiet];
+    let mut r = sim.fork_rng();
+    let Some(action) = super::swarm::weighted(&mut r, &weights) else {
+        return;
+    };
+    let pick_up = |r: &mut crate::util::rng::Rng| up[r.usize(up.len())];
+    let pair = |r: &mut crate::util::rng::Rng| {
+        let a = r.usize(n);
+        (a, (a + 1 + r.usize(n - 1)) % n)
+    };
+    match action {
+        0 if n == 1 => sim.restart(pick_up(&mut r)).await,
+        0 if up.len() > 1 => sim.crash(pick_up(&mut r)),
+        1 => {
             if let Some(i) = (0..n).find(|i| !up.contains(i)) {
                 sim.start(i).await;
             }
         }
-        4 if n > 1 => {
-            let a = sim.rand_below(n as u64) as usize;
-            let b = (a + 1 + sim.rand_below(n as u64 - 1) as usize) % n;
+        2 if n > 1 => {
+            let (a, b) = pair(&mut r);
             sim.partition(a, b);
         }
-        5 | 7 | 8 => sim.heal(),
-        6 => {
-            sim.sleep(sim.rand_below(20_000)).await;
-        }
-        9 if n > 1 && extra.one_way_partitions => {
-            let a = sim.rand_below(n as u64) as usize;
-            let b = (a + 1 + sim.rand_below(n as u64 - 1) as usize) % n;
+        3 if n > 1 => {
+            let (a, b) = pair(&mut r);
             sim.partition_one_way(a, b);
         }
-        10 if extra.store_isolation && !up.is_empty() => {
-            sim.isolate_from_store(up[sim.rand_below(up.len() as u64) as usize]);
+        4 if !up.is_empty() => sim.isolate_from_store(pick_up(&mut r)),
+        5 if c.clock_step_max_ms > 0 && !up.is_empty() => {
+            let m = c.clock_step_max_ms;
+            sim.step_clock(pick_up(&mut r), r.below(2 * m + 1) as i64 - m as i64);
         }
-        11 if extra.clock_step_max_ms > 0 && !up.is_empty() => {
-            let i = up[sim.rand_below(up.len() as u64) as usize];
-            let m = extra.clock_step_max_ms;
-            sim.step_clock(i, sim.rand_below(2 * m + 1) as i64 - m as i64);
-        }
+        6 => sim.heal(),
+        7 => sim.sleep(r.below(20_000)).await,
         _ => {}
     }
 }
@@ -118,10 +119,14 @@ pub async fn cache_expiry(sim: &Arc<Sim>) {
     sim.sleep(cache_lag(sim)).await;
 }
 
-/// Spawns a background chaos loop; abort the returned handle to stop it.
+/// Spawns a background chaos loop, idle unless the world enables chaos;
+/// abort the returned handle to stop it.
 pub fn spawn_chaos(sim: &Arc<Sim>) -> tokio::task::JoinHandle<()> {
     let sim = sim.clone();
     tokio::spawn(async move {
+        if !sim.cfg.chaos.enabled {
+            return;
+        }
         loop {
             chaos_step(&sim).await;
         }
@@ -152,156 +157,171 @@ pub async fn chaos_mix(sim: Arc<Sim>, scale: usize) -> Result<(), String> {
 
 pub type Runner = fn(Arc<Sim>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>;
 
-/// A named simulation scenario pairing a cluster configuration with a workload.
+/// A named simulation scenario: a workload and the worlds it runs in.
 pub struct Scenario {
     pub name: &'static str,
-    pub config: fn() -> super::SimConfig,
+    /// Draws the world for a run from its knobs.
+    pub config: fn(&Knobs) -> SimConfig,
     pub run: Runner,
 }
 
-fn faulty3() -> super::SimConfig {
-    super::SimConfig::faulty(3)
+impl Scenario {
+    /// The world of this scenario's run with `seed`.
+    pub fn config_for(&self, seed: u64) -> SimConfig {
+        let knobs = Arc::new(Knobs::new(seed));
+        SimConfig { knobs: Some(knobs.clone()), ..(self.config)(&knobs) }
+    }
 }
 
-/// Applies small storage quotas to exercise quota limits in kv_model workloads.
-fn with_quota(mut c: super::SimConfig) -> super::SimConfig {
-    c.engine.db_max_bytes = 24 * 1024;
-    c.engine.quota_sweep_interval_ms = 10_000;
-    c
+fn faulty(nodes: (usize, usize)) -> Profile {
+    Profile { nodes, ..Profile::FAULTY }
 }
 
-fn kv_basic() -> super::SimConfig {
-    with_quota(super::SimConfig::basic())
-}
-
-fn kv_faulty3() -> super::SimConfig {
-    with_quota(super::SimConfig::faulty(3))
-}
-
-fn kv_hostile3() -> super::SimConfig {
-    with_quota(super::SimConfig::hostile(3))
-}
-
-fn faulty2() -> super::SimConfig {
-    super::SimConfig::faulty(2)
-}
-
-fn faulty4() -> super::SimConfig {
-    super::SimConfig::faulty(4)
-}
-
-fn with_late_replies(mut c: super::SimConfig) -> super::SimConfig {
-    c.store.p_late_reply = 0.3;
-    c.store.late_reply_ms = (50, 1_000);
-    c
-}
-
-fn contended3() -> super::SimConfig {
-    with_late_replies(super::SimConfig::faulty(3))
-}
-
-fn contended_hostile3() -> super::SimConfig {
-    with_late_replies(super::SimConfig::hostile(3))
-}
-
-fn hostile3() -> super::SimConfig {
-    super::SimConfig::hostile(3)
-}
-
-fn hostile4() -> super::SimConfig {
-    super::SimConfig::hostile(4)
-}
-
-fn blob_gc_cfg() -> super::SimConfig {
-    blob_gc_race::config(super::SimConfig::faulty(3))
-}
-
-/// Configures a hostile cluster with node clocks skewed by up to an hour.
-/// Garbage collection uses the store's clock, so short grace periods must still hold.
-fn blob_gc_hostile_cfg() -> super::SimConfig {
-    let mut c = blob_gc_race::config(super::SimConfig::hostile(3));
-    c.max_skew_ms = 3_600_000;
-    c.chaos.clock_step_max_ms = 3_600_000;
-    c
-}
-
-fn churn_cfg() -> super::SimConfig {
-    db_churn::config(super::SimConfig::faulty(3))
-}
-
-fn churn_hostile_cfg() -> super::SimConfig {
-    db_churn::config(super::SimConfig::hostile(3))
-}
-
-fn console_cfg() -> super::SimConfig {
-    // Form posts are not idempotent, so run without fault injection across two nodes to exercise forwarding.
-    let mut c = super::SimConfig::basic();
-    c.nodes = 2;
+/// Applies a size quota to some worlds, exercising quota refusals.
+fn maybe_quota(k: &Knobs, mut c: SimConfig) -> SimConfig {
+    if k.chance("kv_model.quota", 0.5) {
+        c.engine.db_max_bytes = k.log_range("kv_model.quota_bytes", 8 * 1024, 64 * 1024);
+        c.engine.quota_sweep_interval_ms = 10_000;
+    }
     c
 }
 
 /// Returns all scenarios in the deterministic simulation suite.
 pub fn scenarios() -> Vec<Scenario> {
     vec![
-        Scenario { name: "kv_single_node", config: kv_basic, run: |s| Box::pin(kv_model::run(s, 1, 120, false)) },
-        Scenario { name: "kv_faulty_cluster", config: kv_faulty3, run: |s| Box::pin(kv_model::run(s, 2, 60, true)) },
-        Scenario { name: "bank", config: faulty3, run: |s| Box::pin(bank::run(s, 6, 4, 12, true)) },
-        Scenario { name: "register", config: faulty3, run: |s| Box::pin(register::run(s, 3, 3, 30, 500, true)) },
         Scenario {
-            name: "register_contended",
-            config: contended3,
-            run: |s| Box::pin(register::run(s, 6, 6, 60, 20, true)),
+            name: "kv_model",
+            config: |k| maybe_quota(k, world(k, faulty((1, 4)))),
+            run: |s| {
+                let k = &s.knobs;
+                let (clients, steps) = (k.range("kv_model.clients", 1, 3), k.range("kv_model.steps", 30, 120));
+                Box::pin(kv_model::run(s.clone(), clients as usize, steps as usize, true))
+            },
         },
-        Scenario { name: "tables", config: faulty3, run: |s| Box::pin(tables::run(s, 80, 3, true)) },
-        Scenario { name: "blobs", config: faulty2, run: |s| Box::pin(blobs::run(s, 40, true)) },
-        Scenario { name: "auth", config: faulty3, run: |s| Box::pin(auth::run(s)) },
-        Scenario { name: "lifecycle", config: faulty3, run: |s| Box::pin(lifecycle::run(s, 4, true)) },
-        Scenario { name: "console", config: console_cfg, run: |s| Box::pin(console::run(s)) },
-        Scenario { name: "chaos", config: faulty4, run: |s| Box::pin(chaos_mix(s, 2)) },
+        Scenario {
+            name: "history",
+            config: |k| world(k, faulty((1, 5))),
+            run: |s| Box::pin(history::run(s.clone(), history::Shape::draw(&s.knobs), true)),
+        },
+        Scenario {
+            name: "bank",
+            config: |k| world(k, faulty((2, 5))),
+            run: |s| {
+                let k = &s.knobs;
+                let accounts = k.range("bank.accounts", 2, 12) as usize;
+                let clients = k.range("bank.clients", 1, 8) as usize;
+                let transfers = k.range("bank.transfers", 4, 16) as usize;
+                Box::pin(bank::run(s.clone(), accounts, clients, transfers, true))
+            },
+        },
+        Scenario {
+            name: "register",
+            config: |k| world(k, faulty((2, 5))),
+            run: |s| {
+                let k = &s.knobs;
+                let writers = k.range("register.writers", 1, 6) as usize;
+                let readers = k.range("register.readers", 1, 6) as usize;
+                let ops = k.range("register.ops", 20, 60) as usize;
+                let pause = k.pick("register.max_pause_ms", &[20, 100, 500]);
+                Box::pin(register::run(s.clone(), writers, readers, ops, pause, true))
+            },
+        },
+        Scenario {
+            name: "tables",
+            config: |k| world(k, faulty((1, 4))),
+            run: |s| {
+                let k = &s.knobs;
+                let (steps, contenders) = (k.range("tables.steps", 40, 100), k.range("tables.contenders", 1, 4));
+                Box::pin(tables::run(s.clone(), steps as usize, contenders as usize, true))
+            },
+        },
+        Scenario {
+            name: "blobs",
+            config: |k| world(k, faulty((1, 3))),
+            run: |s| Box::pin(blobs::run(s.clone(), s.knobs.range("blobs.rounds", 20, 50) as usize, true)),
+        },
+        Scenario { name: "auth", config: |k| world(k, faulty((1, 3))), run: |s| Box::pin(auth::run(s)) },
+        Scenario {
+            name: "lifecycle",
+            config: |k| world(k, faulty((1, 4))),
+            run: |s| Box::pin(lifecycle::run(s.clone(), s.knobs.range("lifecycle.cycles", 2, 6) as usize, true)),
+        },
+        Scenario {
+            // Form posts are not idempotent, so the console runs without faults.
+            name: "console",
+            config: |k| world(k, Profile { nodes: (1, 3), faults: false, skew: Skew::None }),
+            run: |s| Box::pin(console::run(s)),
+        },
+        Scenario {
+            name: "chaos",
+            config: |k| world(k, faulty((2, 5))),
+            run: |s| Box::pin(chaos_mix(s.clone(), s.knobs.range("chaos.scale", 1, 3) as usize)),
+        },
         Scenario { name: "limits", config: limits::config, run: |s| Box::pin(limits::run(s)) },
-        Scenario { name: "api_tour", config: faulty3, run: |s| Box::pin(api_tour::run(s)) },
-        Scenario { name: "schema_race", config: faulty3, run: |s| Box::pin(schema_race::run(s, 3, 40, true)) },
-        Scenario { name: "abandoned", config: faulty3, run: |s| Box::pin(abandoned::run(s, 4, 12, true)) },
-        Scenario { name: "blob_gc_race", config: blob_gc_cfg, run: |s| Box::pin(blob_gc_race::run(s, 2, 3, 30, true)) },
-        Scenario { name: "db_churn", config: churn_cfg, run: |s| Box::pin(db_churn::run(s, 4, 10, 60, true)) },
-        Scenario { name: "ttl", config: faulty3, run: |s| Box::pin(ttl::run(s, 2, 60, true)) },
-        Scenario { name: "watch", config: faulty3, run: |s| Box::pin(watch::run(s, 120, true)) },
-        Scenario { name: "streams", config: faulty3, run: |s| Box::pin(streams::run(s, 60, true)) },
-        Scenario { name: "orgs", config: faulty3, run: |s| Box::pin(orgs::run(s)) },
-        Scenario { name: "accounts", config: faulty3, run: |s| Box::pin(accounts::run(s)) },
-        Scenario { name: "kv_hostile", config: kv_hostile3, run: |s| Box::pin(kv_model::run(s, 2, 60, true)) },
-        Scenario { name: "bank_hostile", config: hostile3, run: |s| Box::pin(bank::run(s, 6, 4, 12, true)) },
+        Scenario { name: "api_tour", config: |k| world(k, faulty((1, 3))), run: |s| Box::pin(api_tour::run(s)) },
         Scenario {
-            name: "register_hostile",
-            config: hostile3,
-            run: |s| Box::pin(register::run(s, 3, 3, 30, 500, true)),
+            name: "schema_race",
+            config: |k| world(k, faulty((1, 4))),
+            run: |s| {
+                let k = &s.knobs;
+                let (writers, steps) = (k.range("schema_race.writers", 1, 5), k.range("schema_race.steps", 20, 60));
+                Box::pin(schema_race::run(s.clone(), writers as usize, steps as usize, true))
+            },
         },
         Scenario {
-            name: "register_contended_hostile",
-            config: contended_hostile3,
-            run: |s| Box::pin(register::run(s, 6, 6, 60, 20, true)),
-        },
-        Scenario { name: "tables_hostile", config: hostile3, run: |s| Box::pin(tables::run(s, 80, 3, true)) },
-        Scenario { name: "blobs_hostile", config: hostile3, run: |s| Box::pin(blobs::run(s, 40, true)) },
-        Scenario { name: "lifecycle_hostile", config: hostile3, run: |s| Box::pin(lifecycle::run(s, 4, true)) },
-        Scenario { name: "schema_race_hostile", config: hostile3, run: |s| Box::pin(schema_race::run(s, 3, 40, true)) },
-        Scenario { name: "abandoned_hostile", config: hostile3, run: |s| Box::pin(abandoned::run(s, 4, 12, true)) },
-        Scenario {
-            name: "blob_gc_race_hostile",
-            config: blob_gc_hostile_cfg,
-            run: |s| Box::pin(blob_gc_race::run(s, 2, 3, 30, true)),
+            name: "abandoned",
+            config: |k| world(k, faulty((2, 4))),
+            run: |s| {
+                let k = &s.knobs;
+                let (clients, txns) = (k.range("abandoned.clients", 2, 6), k.range("abandoned.txns", 6, 16));
+                Box::pin(abandoned::run(s.clone(), clients as usize, txns as usize, true))
+            },
         },
         Scenario {
-            name: "db_churn_hostile",
-            config: churn_hostile_cfg,
-            run: |s| Box::pin(db_churn::run(s, 4, 10, 60, true)),
+            // Garbage collection uses the store's clock, so short grace
+            // periods must hold even with node clocks an hour apart.
+            name: "blob_gc_race",
+            config: |k| blob_gc_race::config(world(k, Profile { skew: Skew::Hour, ..faulty((1, 4)) })),
+            run: |s| {
+                let k = &s.knobs;
+                let writers = k.range("blob_gc_race.writers", 1, 3) as usize;
+                let readers = k.range("blob_gc_race.readers", 1, 4) as usize;
+                let rounds = k.range("blob_gc_race.rounds", 15, 40) as usize;
+                Box::pin(blob_gc_race::run(s.clone(), writers, readers, rounds, true))
+            },
         },
-        Scenario { name: "chaos_hostile", config: hostile4, run: |s| Box::pin(chaos_mix(s, 2)) },
-        Scenario { name: "ttl_hostile", config: hostile3, run: |s| Box::pin(ttl::run(s, 2, 60, true)) },
-        Scenario { name: "watch_hostile", config: hostile3, run: |s| Box::pin(watch::run(s, 120, true)) },
-        Scenario { name: "streams_hostile", config: hostile3, run: |s| Box::pin(streams::run(s, 60, true)) },
-        Scenario { name: "orgs_hostile", config: hostile3, run: |s| Box::pin(orgs::run(s)) },
-        Scenario { name: "accounts_hostile", config: hostile3, run: |s| Box::pin(accounts::run(s)) },
+        Scenario {
+            name: "db_churn",
+            config: |k| db_churn::config(world(k, faulty((1, 4)))),
+            run: |s| {
+                let k = &s.knobs;
+                let clients = k.range("db_churn.clients", 1, 5) as usize;
+                let dbs = k.range("db_churn.dbs", 2, 12) as usize;
+                let steps = k.range("db_churn.steps", 30, 80) as usize;
+                Box::pin(db_churn::run(s.clone(), clients, dbs, steps, true))
+            },
+        },
+        Scenario {
+            name: "ttl",
+            config: |k| world(k, faulty((1, 4))),
+            run: |s| {
+                let k = &s.knobs;
+                let (owners, steps) = (k.range("ttl.owners", 1, 3), k.range("ttl.steps", 30, 90));
+                Box::pin(ttl::run(s.clone(), owners as usize, steps as usize, true))
+            },
+        },
+        Scenario {
+            name: "watch",
+            config: |k| world(k, faulty((1, 4))),
+            run: |s| Box::pin(watch::run(s.clone(), s.knobs.range("watch.steps", 60, 150) as usize, true)),
+        },
+        Scenario {
+            name: "streams",
+            config: |k| world(k, faulty((1, 4))),
+            run: |s| Box::pin(streams::run(s.clone(), s.knobs.range("streams.steps", 30, 80) as usize, true)),
+        },
+        Scenario { name: "orgs", config: |k| world(k, faulty((1, 4))), run: |s| Box::pin(orgs::run(s)) },
+        Scenario { name: "accounts", config: |k| world(k, faulty((1, 4))), run: |s| Box::pin(accounts::run(s)) },
     ]
 }
 

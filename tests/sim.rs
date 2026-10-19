@@ -4,168 +4,63 @@
 //! with `cargo run --release --example sim_tool -- trace <scenario> <seed>`.
 
 use baserunna::probe::{self, Probe};
-use baserunna::sim::workloads::{chaos_mix, scenario};
+use baserunna::sim::workloads::scenario;
 use baserunna::sim::{SimConfig, run, run_seeds};
 
-fn run_scenario(name: &str, base: u64, seeds: u64) {
-    let s = scenario(name).expect("scenario exists");
-    run_seeds(name, base, seeds, s.config, s.run);
+/// One test per scenario, each running a few seeds of its swarm.
+macro_rules! scenario_tests {
+    ($($test:ident: $name:literal, $base:literal, $seeds:literal;)*) => {
+        $(
+            #[test]
+            fn $test() {
+                run_seeds(&scenario($name).expect("scenario exists"), $base, $seeds);
+            }
+        )*
+
+        #[test]
+        fn every_scenario_has_a_test() {
+            let tested = [$($name),*];
+            for s in baserunna::sim::workloads::scenarios() {
+                assert!(tested.contains(&s.name), "scenario {} has no test", s.name);
+            }
+        }
+    };
 }
 
-#[test]
-fn sim_kv_model_single_node() {
-    run_scenario("kv_single_node", 1, 2);
-}
-
-#[test]
-fn sim_kv_model_faulty_cluster() {
-    run_scenario("kv_faulty_cluster", 2, 2);
-}
-
-#[test]
-fn sim_bank_serializability() {
-    run_scenario("bank", 3, 2);
-}
-
-#[test]
-fn sim_register_linearizability() {
-    run_scenario("register", 4, 2);
-}
-
-#[test]
-fn sim_register_contended() {
-    run_scenario("register_contended", 22, 4);
-}
-
-#[test]
-fn sim_tables_and_indexes() {
-    run_scenario("tables", 5, 2);
-}
-
-#[test]
-fn sim_blobs_and_gc() {
-    run_scenario("blobs", 6, 2);
-}
-
-#[test]
-fn sim_auth() {
-    run_scenario("auth", 7, 2);
-}
-
-#[test]
-fn sim_lifecycle() {
-    run_scenario("lifecycle", 8, 2);
-}
-
-#[test]
-fn sim_console() {
-    run_scenario("console", 10, 2);
-}
-
-#[test]
-fn sim_rate_limits() {
-    run_scenario("limits", 17, 2);
-}
-
-#[test]
-fn sim_chaos_mix() {
-    run_scenario("chaos", 9, 1);
-}
-
-#[test]
-fn sim_schema_changes_race_row_writes() {
-    run_scenario("schema_race", 12, 2);
-}
-
-#[test]
-fn sim_abandoned_interactive_transactions() {
-    run_scenario("abandoned", 13, 2);
-}
-
-#[test]
-fn sim_blob_reads_race_gc() {
-    run_scenario("blob_gc_race", 14, 2);
-}
-
-#[test]
-fn sim_many_db_churn() {
-    run_scenario("db_churn", 15, 1);
-}
-
-#[test]
-fn sim_ttl_expiry() {
-    run_scenario("ttl", 18, 2);
-}
-
-#[test]
-fn sim_watch_change_feeds() {
-    run_scenario("watch", 19, 2);
-}
-
-#[test]
-fn sim_streams() {
-    run_scenario("streams", 22, 2);
-}
-
-#[test]
-fn sim_organization_roles() {
-    run_scenario("orgs", 20, 2);
-}
-
-#[test]
-fn sim_account_self_service() {
-    run_scenario("accounts", 21, 2);
-}
-
-/// Every workload again under [`SimConfig::hostile`].
-#[test]
-fn sim_hostile() {
-    for name in [
-        "kv_hostile",
-        "bank_hostile",
-        "register_hostile",
-        "register_contended_hostile",
-        "tables_hostile",
-        "blobs_hostile",
-        "lifecycle_hostile",
-        "schema_race_hostile",
-        "abandoned_hostile",
-        "blob_gc_race_hostile",
-        "db_churn_hostile",
-        "chaos_hostile",
-        "ttl_hostile",
-        "watch_hostile",
-        "streams_hostile",
-        "orgs_hostile",
-        "accounts_hostile",
-    ] {
-        run_scenario(name, 16, 1);
-    }
-}
-
-#[test]
-fn sim_hostile_is_deterministic() {
-    let s = scenario("chaos_hostile").expect("scenario exists");
-    let a = run(4243, (s.config)(), s.run);
-    let b = run(4243, (s.config)(), s.run);
-    assert!(a.result.is_ok(), "{:?}", a.result);
-    assert_eq!((a.trace_hash, a.events), (b.trace_hash, b.events), "same seed, different trace");
+scenario_tests! {
+    sim_kv_model: "kv_model", 1, 4;
+    sim_history: "history", 23, 4;
+    sim_bank: "bank", 3, 4;
+    sim_register: "register", 4, 4;
+    sim_tables: "tables", 5, 3;
+    sim_blobs: "blobs", 6, 3;
+    sim_auth: "auth", 7, 2;
+    sim_lifecycle: "lifecycle", 8, 3;
+    sim_console: "console", 10, 2;
+    sim_chaos: "chaos", 9, 2;
+    sim_limits: "limits", 17, 2;
+    sim_api_tour: "api_tour", 11, 2;
+    sim_schema_race: "schema_race", 12, 3;
+    sim_abandoned: "abandoned", 13, 3;
+    sim_blob_gc_race: "blob_gc_race", 14, 2;
+    sim_db_churn: "db_churn", 15, 2;
+    sim_ttl: "ttl", 18, 3;
+    sim_watch: "watch", 19, 3;
+    sim_streams: "streams", 22, 3;
+    sim_orgs: "orgs", 20, 2;
+    sim_accounts: "accounts", 21, 2;
 }
 
 #[test]
 fn sim_is_deterministic() {
+    let s = scenario("chaos").expect("scenario exists");
     let seed = baserunna::util::prop::env_u64("SIM_SEED").unwrap_or(4242);
-    let a = run(seed, SimConfig::faulty(3), |sim| chaos_mix(sim, 1));
-    let b = run(seed, SimConfig::faulty(3), |sim| chaos_mix(sim, 1));
+    let a = run(seed, s.config_for(seed), s.run);
+    let b = run(seed, s.config_for(seed), s.run);
     assert!(a.result.is_ok(), "{:?}", a.result);
     assert_eq!((a.trace_hash, a.events), (b.trace_hash, b.events), "same seed, different trace");
-    let c = run(seed + 1, SimConfig::faulty(3), |sim| chaos_mix(sim, 1));
+    let c = run(seed + 1, s.config_for(seed + 1), s.run);
     assert_ne!(a.trace_hash, c.trace_hash, "different seeds should diverge");
-}
-
-#[test]
-fn sim_api_tour() {
-    run_scenario("api_tour", 11, 2);
 }
 
 /// Verifies that the end-of-run storage invariant check detects missing objects.

@@ -114,11 +114,12 @@ async fn reset(sim: &Arc<Sim>, admin: &Client) -> Result<(), String> {
     expect(r.status == 401, format!("a tampered reset token: {}", r.status))?;
     let r = anon.call_retry("POST", "/v1/auth/password-reset/confirm", Some(confirm(&token, "short"))).await;
     expect(r.status == 400, format!("a short password: {}", r.status))?;
-    let (r, ambiguous) = anon.settle("POST", "/v1/auth/password-reset/confirm", Some(confirm(&token, new))).await?;
-    expect(r.status == 200 || (ambiguous && r.status == 401), format!("reset: {} {}", r.status, r.json))?;
-    if r.status == 200 {
-        expect(r.json["user"]["email_verified"] == true, "a reset left the address unverified")?;
-    }
+    // A retry after any failure finishes the reset, applied or not.
+    let (r, _) = anon.settle("POST", "/v1/auth/password-reset/confirm", Some(confirm(&token, new))).await?;
+    expect(r.status == 200, format!("reset: {} {}", r.status, r.json))?;
+    expect(r.json["user"]["email_verified"] == true, "a reset left the address unverified")?;
+    let r = anon.call_retry("POST", "/v1/auth/password-reset/confirm", Some(confirm(&token, new))).await;
+    expect(r.status == 200, format!("a repeated reset: {} {}", r.status, r.json))?;
     let r = anon.call_retry("POST", "/v1/auth/password-reset/confirm", Some(confirm(&token, "third-password"))).await;
     expect(r.status == 401, format!("a reset link worked twice: {}", r.status))?;
     cache_expiry(sim).await;

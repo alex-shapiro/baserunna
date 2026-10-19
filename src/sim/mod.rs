@@ -9,6 +9,7 @@ pub mod mail;
 pub mod openapi_check;
 mod storage_check;
 pub mod store;
+pub mod swarm;
 pub mod txn_fuzz;
 pub mod workloads;
 
@@ -105,15 +106,43 @@ impl NetFaults {
     }
 }
 
-/// Faults enabled for [`workloads::chaos_step`].
+/// The chaos actions [`workloads::chaos_step`] takes, by weight.
 #[derive(Clone, Debug, Default)]
 pub struct ChaosFaults {
+    /// Whether workloads that inject chaos do so.
+    pub enabled: bool,
+    /// The longest pause between actions; each pause is drawn up to it.
+    pub pause_ms: u64,
+    pub crash: u64,
+    /// Start a crashed node.
+    pub start: u64,
+    pub partition: u64,
     /// Partitions that drop traffic in one direction only.
-    pub one_way_partitions: bool,
-    /// Isolate nodes from the object store while leaving peer traffic intact.
-    pub store_isolation: bool,
-    /// Maximum wall-clock jump in milliseconds, or 0 to disable.
+    pub one_way_partition: u64,
+    /// Cut a node off from the object store while leaving peer traffic intact.
+    pub store_isolation: u64,
+    /// Step a node's wall clock by up to `clock_step_max_ms` either way.
+    pub clock_step: u64,
+    pub heal: u64,
+    /// Pause longer, letting the cluster settle.
+    pub quiet: u64,
     pub clock_step_max_ms: u64,
+}
+
+impl ChaosFaults {
+    /// Crashes, restarts, two-way partitions and heals.
+    pub fn moderate() -> ChaosFaults {
+        ChaosFaults {
+            enabled: true,
+            pause_ms: 4_500,
+            crash: 2,
+            start: 2,
+            partition: 1,
+            heal: 3,
+            quiet: 1,
+            ..ChaosFaults::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +158,8 @@ pub struct SimConfig {
     pub keep_log: bool,
     pub full_trace: bool,
     pub request_timeout_ms: u64,
+    /// The knobs this configuration was drawn from, if it was (see [`swarm`]).
+    pub knobs: Option<Arc<swarm::Knobs>>,
 }
 
 impl SimConfig {
@@ -193,46 +224,20 @@ impl SimConfig {
             keep_log: std::env::var("SIM_LOG").is_ok(),
             full_trace: std::env::var("SIM_LOG").as_deref() == Ok("all"),
             request_timeout_ms: 30_000,
+            knobs: None,
         }
     }
 
-    /// Multi-node with store and network faults and clock skew within the
-    /// lease margin.
+    /// Multi-node with store and network faults, chaos and clock skew within
+    /// the lease margin.
     pub fn faulty(nodes: usize) -> SimConfig {
         SimConfig {
             nodes,
             store: StoreFaults::moderate(),
             net: NetFaults::moderate(),
             max_skew_ms: 150,
+            chaos: ChaosFaults::moderate(),
             ..SimConfig::basic()
-        }
-    }
-
-    /// [`SimConfig::faulty`] plus store stalls, list lag, duplicate/reordered
-    /// forwarding, and extreme clock skew.
-    pub fn hostile(nodes: usize) -> SimConfig {
-        let base = SimConfig::faulty(nodes);
-        let lease = base.engine.lease_ms;
-        SimConfig {
-            store: StoreFaults {
-                p_stall: 0.004,
-                stall_ms: (lease, 3 * lease),
-                list_lag_ms: 5_000,
-                ..StoreFaults::moderate()
-            },
-            net: NetFaults {
-                p_forward_duplicate: 0.03,
-                p_forward_delay: 0.05,
-                forward_delay_max_ms: 2_000,
-                ..NetFaults::moderate()
-            },
-            max_skew_ms: 10 * base.engine.lease_margin_ms,
-            chaos: ChaosFaults {
-                one_way_partitions: true,
-                store_isolation: true,
-                clock_step_max_ms: 10 * base.engine.lease_margin_ms,
-            },
-            ..base
         }
     }
 }
@@ -278,6 +283,7 @@ pub struct Sim {
     pub crashes: AtomicU64,
     /// The first violation a global oracle found.
     violation: Mutex<Option<String>>,
+    pub knobs: Arc<swarm::Knobs>,
     me: Weak<Sim>,
 }
 
@@ -475,6 +481,7 @@ impl Sim {
             starts: AtomicU64::new(0),
             crashes: AtomicU64::new(0),
             violation: Mutex::new(None),
+            knobs: cfg.knobs.clone().unwrap_or_else(|| Arc::new(swarm::Knobs::new(seed))),
             cfg,
             me: me.clone(),
         });
@@ -732,6 +739,8 @@ pub struct SimOutcome {
     pub crashes: u64,
     pub storage: StorageReport,
     pub probes: crate::probe::Hits,
+    /// The knob values the run drew, by name.
+    pub knobs: Vec<(&'static str, String)>,
     pub trace_tail: Vec<String>,
 }
 
@@ -806,6 +815,7 @@ where
             crashes: sim.crashes.load(Ordering::Relaxed),
             storage,
             probes: crate::probe::Hits::default(),
+            knobs: sim.knobs.drawn(),
             trace_tail,
         }
     });
@@ -826,13 +836,12 @@ pub fn seeds(base: u64, default_count: u64) -> Vec<u64> {
     (0..n).map(|i| base.wrapping_mul(1_000_003).wrapping_add(i)).collect()
 }
 
-pub fn run_seeds<F, Fut>(name: &str, base: u64, default_count: u64, cfg: impl Fn() -> SimConfig, f: F)
-where
-    F: Fn(Arc<Sim>) -> Fut,
-    Fut: Future<Output = Result<(), String>>,
-{
+/// Runs `scenario` with the seeds from [`seeds`], panicking with a
+/// reproduction command on the first failure.
+pub fn run_seeds(scenario: &workloads::Scenario, base: u64, default_count: u64) {
+    let name = scenario.name;
     for seed in seeds(base, default_count) {
-        let out = run(seed, cfg(), &f);
+        let out = run(seed, scenario.config_for(seed), scenario.run);
         if std::env::var("SIM_VERBOSE").is_ok() {
             eprintln!(
                 "{name} seed={seed} ok={} events={} virtual={}s store_ops={} faults={} crashes={} storage={:?} probes={}",
@@ -850,7 +859,11 @@ where
             for l in &out.trace_tail {
                 eprintln!("  | {l}");
             }
-            panic!("simulation {name} failed: {e}\nreproduce with: SIM_SEED={seed} cargo test {name} -- --nocapture");
+            let knobs: Vec<String> = out.knobs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            panic!(
+                "simulation {name} failed: {e}\nknobs: {}\nreproduce with: SIM_SEED={seed} cargo test sim_{name} -- --nocapture",
+                knobs.join(" ")
+            );
         }
     }
 }

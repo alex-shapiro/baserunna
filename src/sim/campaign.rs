@@ -87,7 +87,7 @@ pub fn campaign(
                     let j = next.fetch_add(1, Ordering::SeqCst);
                     let Some(&(i, seed)) = jobs.get(j) else { return };
                     let s = &scenarios[i];
-                    let out = run(seed, (s.config)(), s.run);
+                    let out = run(seed, s.config_for(seed), s.run);
                     progress(s.name, &out);
                     report.lock().unwrap_or_else(|e| e.into_inner()).add(s.name, &out);
                 }

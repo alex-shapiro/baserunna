@@ -19,7 +19,6 @@ pub mod version;
 use crate::env::Env;
 use crate::store::{DynStore, Retry};
 use crate::util::DetHashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -30,68 +29,6 @@ pub use stream::{Appended, Record, Retention, Seek, StreamOp, StreamState};
 pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
 pub use types::{BlobRef, Entry, Seq, Value};
 pub use version::{Change, ChangePage, ChangePos, KeyRange, Snapshot, Version};
-
-macro_rules! activity {
-    ($($(#[$doc:meta])* $field:ident),* $(,)?) => {
-        /// Cumulative storage engine activity metrics.
-        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-        pub struct Activity {
-            $($(#[$doc])* pub $field: u64,)*
-        }
-
-        impl Activity {
-            pub fn add(&mut self, o: &Activity) {
-                $(self.$field += o.$field;)*
-            }
-        }
-
-        /// Thread-safe counters for tracking [`Activity`] metrics.
-        #[derive(Default)]
-        pub struct Counters {
-            $($field: AtomicU64,)*
-        }
-
-        impl Counters {
-            pub fn add(&self, a: &Activity) {
-                $(if a.$field > 0 {
-                    self.$field.fetch_add(a.$field, Ordering::Relaxed);
-                })*
-            }
-
-            pub fn get(&self) -> Activity {
-                Activity { $($field: self.$field.load(Ordering::Relaxed),)* }
-            }
-        }
-    };
-}
-
-activity! {
-    range_tombstones_written,
-    range_tombstones_retired,
-    /// Segments dropped entirely because all entries were covered by range tombstones.
-    segments_dropped,
-    /// Segments rewritten during compaction to purge range-deleted entries.
-    segments_rewritten,
-    levels_objects_written,
-    quota_refusals,
-    /// Entries dropped or reduced to tombstones because they expired.
-    expired_entries,
-    /// Segments rewritten or dropped because their entries expired.
-    segments_expired,
-    /// Stream chunks sealed as a flush wrote their records.
-    chunks_sealed_at_flush,
-    /// Stream chunks sealed as a compaction merged their records.
-    chunks_sealed_in_compaction,
-    /// Trims committed for stream retention.
-    retention_trims,
-    /// Foreign leases determined to have expired via the store clock.
-    expired_leases,
-    /// Transactions started while a manifest write was in flight on this node.
-    optimistic_begins,
-    /// Optimistic transactions re-executed after failing revalidation against a strong snapshot.
-    optimistic_reruns,
-    manifest_puts_hedged,
-}
 
 /// State shared by every database handle on a node.
 pub struct Shared {
@@ -110,7 +47,6 @@ pub struct Shared {
     pub(crate) lease_sightings: Mutex<DetHashMap<String, (String, u64, tokio::time::Instant)>>,
     /// Databases exempt from size quota limits.
     quota_exempt: Mutex<std::collections::BTreeSet<String>>,
-    pub counters: Counters,
     pub metrics: Arc<crate::metrics::StoreMetrics>,
 }
 
@@ -273,7 +209,6 @@ impl Engine {
             clock: clock::StoreClock::new(),
             lease_sightings: Mutex::new(DetHashMap::default()),
             quota_exempt: Mutex::new(Default::default()),
-            counters: Counters::default(),
         });
         Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) })
     }

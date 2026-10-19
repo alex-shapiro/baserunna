@@ -114,9 +114,7 @@ enum ReadKind {
     LocalGet,
     ReadOnlyTxn,
     ReadWriteTxn,
-    Interactive {
-        write: bool,
-    },
+    Interactive { write: bool },
 }
 
 /// Reads `r{key}` via `kind` and returns `(version, value)` (or `(0, "")` if not found).

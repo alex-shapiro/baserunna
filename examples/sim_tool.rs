@@ -2,11 +2,12 @@
 //!
 //! ```text
 //! cargo run --release --example sim_tool -- list
-//! cargo run --release --example sim_tool -- campaign <scenario|all> <seeds> [first_seed]
+//! cargo run --release --example sim_tool -- campaign <scenario|all> <seeds> [first_seed]   # SIM_THREADS, SIM_COVERAGE=1
 //! cargo run --release --example sim_tool -- trace <scenario> <seed>      # full trace
 //! cargo run --release --example sim_tool -- determinism <scenario> <seed>
 //! ```
 
+use baserunna::sim::campaign::{campaign, default_threads};
 use baserunna::sim::workloads::{scenario, scenarios};
 use baserunna::sim::{SimOutcome, run};
 
@@ -30,25 +31,35 @@ fn main() {
             }
         }
         "campaign" => {
-            let names: Vec<String> =
-                if arg(1) == "all" { scenarios().iter().map(|s| s.name.to_string()).collect() } else { vec![arg(1)] };
+            let all = scenarios();
+            let chosen: Vec<_> = all.into_iter().filter(|s| arg(1) == "all" || s.name == arg(1)).collect();
+            if chosen.is_empty() {
+                panic!("unknown scenario {}", arg(1));
+            }
             let n: u64 = arg(2).parse().unwrap_or(100);
             let first: u64 = arg(3).parse().unwrap_or(1);
-            let mut failures = 0;
-            for name in names {
-                let t = std::time::Instant::now();
-                let mut virt = 0;
-                for seed in first..first + n {
-                    let (o, _) = run_one(&name, seed, false);
-                    virt += o.virtual_ms;
-                    if let Err(e) = o.result {
-                        failures += 1;
-                        println!("FAIL {name} seed={seed}: {e}");
-                    }
+            let threads =
+                std::env::var("SIM_THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or_else(default_threads);
+            let seeds: Vec<u64> = (first..first + n).collect();
+            let t = std::time::Instant::now();
+            let report = campaign(&chosen, &seeds, threads, |name, out| {
+                if let Err(e) = &out.result {
+                    println!("FAIL {name} seed={}: {e}", out.seed);
                 }
-                println!("{name}: {n} seeds in {:?} wall, {}s simulated", t.elapsed(), virt / 1000);
+            });
+            if std::env::var("SIM_COVERAGE").is_ok() {
+                print!("{}", report.coverage_table());
             }
-            std::process::exit(if failures > 0 { 1 } else { 0 });
+            println!(
+                "{} runs in {:?} wall, {}s simulated, {} failed, {} probes never reached: {:?}",
+                report.runs,
+                t.elapsed(),
+                report.virtual_ms / 1000,
+                report.failures.len(),
+                report.unreached().len(),
+                report.unreached().iter().map(|p| p.name()).collect::<Vec<_>>()
+            );
+            std::process::exit(if report.failures.is_empty() { 0 } else { 1 });
         }
         "trace" => {
             let seed = arg(2).parse().unwrap_or(1);

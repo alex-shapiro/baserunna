@@ -5,6 +5,7 @@
 use super::*;
 use crate::engine::tests::{engine, rt};
 use crate::engine::{Appended, Committed, Consistency, Db, Engine, EngineConfig, Isolation, Snapshot};
+use crate::probe::{self, Probe};
 use crate::util::prop;
 use crate::util::rng::Rng;
 use std::sync::Arc;
@@ -851,8 +852,7 @@ fn bulky_runs_are_sealed_and_read_across_chunks() {
             }
         }
         settle(&db).await;
-        let a = eng.shared.counters.get();
-        assert!(a.chunks_sealed_at_flush > 0 && a.chunks_sealed_in_compaction > 0, "{a:?}");
+        assert!(probe::count(Probe::ChunkSealedAtFlush) > 0 && probe::count(Probe::ChunkSealedInCompaction) > 0);
         let v = db.read_version(Consistency::Strong).await.unwrap();
         let (big, _) = info(&mut begin(&db).await, "big").await.unwrap();
         let mut it = v.iter(&es::records(big.id), false, false, None);
@@ -922,7 +922,7 @@ fn retention_trims_in_the_background() {
         let kept: u64 = b.records.iter().map(|(r, _)| r.payload.len() as u64).sum();
         assert!(kept <= 106 && kept + 30 > 100, "kept {kept} bytes: {:?}", texts(&b));
         assert_eq!(texts(&read_all(&db, "age", ReadSpec::default()).await), ["new"]);
-        assert!(eng.shared.counters.get().retention_trims >= 2);
+        assert!(probe::count(Probe::RetentionTrimmed) >= 2);
         // A stream no longer appended to is trimmed by a sweep.
         tokio::time::sleep(Duration::from_millis(20_000)).await;
         db.maintenance_now().await.unwrap();
@@ -942,7 +942,7 @@ fn retention_trims_a_share_of_a_stream_at_a_time() {
         // these, and every second of those.
         create_stream(&db, "bytes", Retention { retention_ms: None, max_bytes: Some(16_000) }).await;
         create_stream(&db, "age", Retention { retention_ms: Some(16_000), max_bytes: None }).await;
-        let trims = || eng.shared.counters.get().retention_trims;
+        let trims = || probe::count(Probe::RetentionTrimmed);
         let line = |i: usize| format!("{i:04}{}", "y".repeat(21));
         for i in 0..800 {
             append_texts(&db, "bytes", &[&line(i)]).await;

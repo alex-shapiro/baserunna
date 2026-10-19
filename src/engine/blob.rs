@@ -154,6 +154,7 @@ pub fn pin_ttl_ms(cfg: &EngineConfig) -> u64 {
 /// the pin is younger than [`pin_ttl_ms`].
 pub async fn pin(shared: &Shared, db: &str, id: &str) -> Result<()> {
     let key = pin_key(db, id);
+    crate::probe::hit(crate::probe::Probe::BlobPinWritten);
     shared.retry.run(|| shared.store.put(&key, Bytes::new(), PutMode::Overwrite)).await?;
     Ok(())
 }

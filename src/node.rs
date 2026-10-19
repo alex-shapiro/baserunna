@@ -447,6 +447,7 @@ impl Node {
         let strikes = g.get(node_id).map_or(1, |s| s.strikes.saturating_add(1));
         let max = Duration::from_millis(3 * self.cfg.heartbeat_ms).max(SUSPECT_MIN);
         let backoff = SUSPECT_MIN.saturating_mul(1u32 << (strikes - 1).min(16)).min(max);
+        crate::probe::hit(crate::probe::Probe::PeerSuspected);
         g.insert(node_id.to_string(), Suspect { started_at, heartbeat_at, strikes, until: Instant::now() + backoff });
     }
 
@@ -474,6 +475,7 @@ impl Node {
         let addr = self.addr_of(&target)?;
         // Do not forward to a previous process that ran at this node's address.
         if addr == self.cfg.addr {
+            crate::probe::hit(crate::probe::Probe::OwnAddressIgnored);
             return None;
         }
         Some((target, addr))
@@ -514,6 +516,7 @@ impl Node {
                 && holder != self.id
                 && let Some(addr) = self.addr_of(&holder)
             {
+                crate::probe::hit(crate::probe::Probe::MetaForwarded);
                 match self.forward_meta(&holder, &addr, &cmd).await {
                     Ok(r) => return Ok(r),
                     // Reload the cluster key if it was initialized by another node after we started.

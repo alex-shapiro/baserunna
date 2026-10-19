@@ -1,6 +1,7 @@
 //! Deterministic cluster simulation in virtual time.
 
 pub mod amp;
+pub mod campaign;
 pub mod client;
 pub mod cost;
 pub mod google;
@@ -27,7 +28,7 @@ use crate::util::rng::Rng;
 use axum::body::Body;
 use bytes::Bytes;
 use http::{Request, Response};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -275,7 +276,8 @@ pub struct Sim {
     base_ms: u64,
     starts: AtomicU64,
     pub crashes: AtomicU64,
-    past_activity: Mutex<crate::engine::Activity>,
+    /// The first violation a global oracle found.
+    violation: Mutex<Option<String>>,
     me: Weak<Sim>,
 }
 
@@ -303,6 +305,9 @@ fn take_panic() -> Option<String> {
 }
 
 const LOCAL_TIER_BYTES: u64 = 64 * 1024;
+
+/// How often the global oracles check the cluster, in virtual time.
+const ORACLE_INTERVAL_MS: u64 = 20;
 
 pub fn addr_of(i: usize) -> String {
     format!("sim://n{i}")
@@ -370,10 +375,9 @@ impl Transport for SimTransport {
                     *resp.headers_mut() = r.headers;
                     Ok(resp)
                 }
-                Err(NetError::Refused) if duplicated => Err(TransportError {
-                    message: "connection refused after duplicate".into(),
-                    maybe_delivered: true,
-                }),
+                Err(NetError::Refused) if duplicated => {
+                    Err(TransportError { message: "connection refused after duplicate".into(), maybe_delivered: true })
+                }
                 Err(NetError::Refused) => Err(undelivered("connection refused")),
                 Err(e) => Err(TransportError { message: format!("{e:?}"), maybe_delivered: true }),
             }
@@ -470,7 +474,7 @@ impl Sim {
             base_ms,
             starts: AtomicU64::new(0),
             crashes: AtomicU64::new(0),
-            past_activity: Mutex::new(Default::default()),
+            violation: Mutex::new(None),
             cfg,
             me: me.clone(),
         });
@@ -566,23 +570,53 @@ impl Sim {
             self.crashes.fetch_add(1, Ordering::SeqCst);
             self.trace.event(&format!("crash n{i} ({})", n.node.id));
             n.node.env.shutdown();
-            self.retire_activity(&n);
         }
     }
 
-    fn retire_activity(&self, n: &SimNode) {
-        self.past_activity.lock().unwrap_or_else(|e| e.into_inner()).add(&n.node.engine.shared.counters.get());
-    }
-
-    /// Returns total storage engine activity across all running and terminated nodes.
-    pub fn engine_activity(&self) -> crate::engine::Activity {
-        let mut a = *self.past_activity.lock().unwrap_or_else(|e| e.into_inner());
+    /// Checks the global invariants no single node can see: at most one node
+    /// relies on a lease on each database, and a node that relies on its
+    /// lease, with no manifest write in flight, serves the manifest the store
+    /// holds.
+    fn check_oracles(&self) -> Result<(), String> {
+        let mut holders: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for i in self.up_nodes() {
-            if let Some(n) = self.node(i) {
-                a.add(&n.node.engine.shared.counters.get());
+            let Some(n) = self.node(i) else { continue };
+            for db in n.node.engine.open_dbs() {
+                let Some((write_seq, etag, in_flight)) = db.leased_view() else { continue };
+                holders.entry(db.id.clone()).or_default().push(i);
+                if in_flight {
+                    continue;
+                }
+                let stored = self.mem.get_sync(&crate::engine::manifest_key(&db.id), &GetOpts::default());
+                if let Ok(g) = stored
+                    && g.etag != etag
+                {
+                    let ws = crate::engine::manifest::Manifest::decode(&g.data).map_or(0, |m| m.write_seq);
+                    return Err(format!(
+                        "n{i} relies on its lease on {} at write {write_seq}, but the store holds write {ws}",
+                        db.id
+                    ));
+                }
             }
         }
-        a
+        match holders.into_iter().find(|(_, ns)| ns.len() > 1) {
+            Some((db, ns)) => Err(format!("nodes {ns:?} all rely on a lease on {db}")),
+            None => Ok(()),
+        }
+    }
+
+    fn spawn_oracles(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let sim = self.clone();
+        tokio::spawn(async move {
+            loop {
+                sim.sleep(ORACLE_INTERVAL_MS).await;
+                if let Err(e) = sim.check_oracles() {
+                    sim.trace.event(&format!("oracle: {e}"));
+                    sim.violation.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+                    return;
+                }
+            }
+        })
     }
 
     pub async fn restart(&self, i: usize) {
@@ -677,7 +711,6 @@ impl Sim {
             let n = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some(n) = n {
                 n.node.env.shutdown();
-                self.retire_activity(&n);
             }
         }
     }
@@ -698,7 +731,7 @@ pub struct SimOutcome {
     pub injected_faults: u64,
     pub crashes: u64,
     pub storage: StorageReport,
-    pub engine: crate::engine::Activity,
+    pub probes: crate::probe::Hits,
     pub trace_tail: Vec<String>,
 }
 
@@ -721,19 +754,27 @@ where
     F: FnOnce(Arc<Sim>) -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
-    let lvl = crate::log::level();
+    // Simulated nodes log only errors unless asked otherwise. The level is
+    // process-wide, so it is not restored: campaigns run simulations on many
+    // threads at once.
     if std::env::var("BASERUNNA_LOG").is_err() {
         crate::log::set_level(Some(crate::log::Level::Error));
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
     let full_trace = cfg.full_trace;
+    crate::probe::record();
     let out = rt.block_on(async move {
         let start = Instant::now();
         let sim = Sim::new(seed, cfg).await;
+        let oracles = sim.spawn_oracles();
         let mut result = match CatchPanic(Box::pin(f(sim.clone()))).await {
             Ok(r) => r,
             Err(()) => Err("workload panicked".into()),
         };
+        oracles.abort();
+        if let Some(v) = sim.violation.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            result = Err(format!("oracle: {v}"));
+        }
         let mut storage = StorageReport::default();
         if result.is_ok() {
             sim.store.set_faults_enabled(false);
@@ -748,7 +789,6 @@ where
         }
         let virtual_ms = start.elapsed().as_millis() as u64;
         sim.shutdown_all();
-        let engine = sim.engine_activity();
         let dump = sim.trace.dump();
         let keep = if full_trace { dump.len() } else { 400 };
         let trace_tail = dump[dump.len().saturating_sub(keep)..].to_vec();
@@ -765,12 +805,11 @@ where
             injected_faults: sim.store.stats.injected_failures.load(Ordering::Relaxed),
             crashes: sim.crashes.load(Ordering::Relaxed),
             storage,
-            engine,
+            probes: crate::probe::Hits::default(),
             trace_tail,
         }
     });
-    crate::log::set_level(lvl);
-    out
+    SimOutcome { probes: crate::probe::finish(), ..out }
 }
 
 /// Time required for two reaper passes to purge all deleted databases.
@@ -796,7 +835,7 @@ where
         let out = run(seed, cfg(), &f);
         if std::env::var("SIM_VERBOSE").is_ok() {
             eprintln!(
-                "{name} seed={seed} ok={} events={} virtual={}s store_ops={} faults={} crashes={} storage={:?} engine={:?}",
+                "{name} seed={seed} ok={} events={} virtual={}s store_ops={} faults={} crashes={} storage={:?} probes={}",
                 out.result.is_ok(),
                 out.events,
                 out.virtual_ms / 1000,
@@ -804,7 +843,7 @@ where
                 out.injected_faults,
                 out.crashes,
                 out.storage,
-                out.engine
+                out.probes.hit().count()
             );
         }
         if let Err(e) = out.result {

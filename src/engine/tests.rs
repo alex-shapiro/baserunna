@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
+/// A paused-clock runtime for one test, which also starts a probe recording.
 pub(crate) fn rt() -> tokio::runtime::Runtime {
+    crate::probe::record();
     tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap()
 }
 
@@ -332,7 +334,11 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
             v.m.obsolete.len(),
             v.m.tombstone_horizon,
             store.len(),
-            eng.shared.counters.get()
+            crate::probe::Probe::ALL
+                .iter()
+                .map(|p| (p.name(), crate::probe::count(*p)))
+                .filter(|(_, n)| *n > 0)
+                .collect::<Vec<_>>()
         );
     }
     let _ = env;
@@ -520,7 +526,7 @@ pub(super) struct DelayStore {
 }
 
 fn take_fault(n: &AtomicU32) -> bool {
-    n.fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1)).is_ok()
+    n.try_update(SeqCst, SeqCst, |n| n.checked_sub(1)).is_ok()
 }
 
 impl DelayStore {
@@ -1394,8 +1400,8 @@ fn commit_records_make_commits_idempotent_until_they_expire() {
         assert_eq!(db.commit_status(1000).await.unwrap(), None, "expired records are gone");
         let fresh = db.commit_detailed(request(98, 7).await).await.unwrap();
         assert!(!fresh.replayed && fresh.version > again.version);
-        let a = eng.shared.counters.get();
-        assert!(a.expired_entries >= 60, "{a:?}");
+        let expired = crate::probe::count(crate::probe::Probe::EntriesExpired);
+        assert!(expired >= 60, "{expired}");
         let v = db.read_version(Consistency::Strong).await.unwrap();
         let records = v
             .iter(

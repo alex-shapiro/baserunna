@@ -564,9 +564,11 @@ async fn begin_txn(
         .into_response())
 }
 
-fn get_open(node: &Node, ctx: &DbCtx, id: &str) -> Result<Arc<tokio::sync::Mutex<OpenTxn>>> {
-    node.txns.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned().ok_or(Error::TxnNotFound).inspect(|_| {
-        let _ = ctx;
+fn get_open(node: &Node, id: &str) -> Result<Arc<tokio::sync::Mutex<OpenTxn>>> {
+    let open = node.txns.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned();
+    open.ok_or_else(|| {
+        crate::probe::hit(crate::probe::Probe::InteractiveTxnLost);
+        Error::TxnNotFound
     })
 }
 
@@ -587,7 +589,7 @@ async fn txn_ops(
     JsonBody(b): JsonBody<OpsBody>,
 ) -> Result<J> {
     let id = param(&p, "id")?.to_string();
-    let entry = get_open(&node, &ctx, &id)?;
+    let entry = get_open(&node, &id)?;
     let mut g = entry.lock().await;
     if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
         return Err(Error::TxnNotFound);
@@ -629,7 +631,7 @@ async fn commit_txn(
     JsonBody(b): JsonBody<Option<CommitBody>>,
 ) -> Result<J> {
     let id = param(&p, "id")?.to_string();
-    let entry = get_open(&node, &ctx, &id)?;
+    let entry = get_open(&node, &id)?;
     let mut g = entry.lock().await;
     if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
         return Err(Error::TxnNotFound);
@@ -664,7 +666,7 @@ async fn commit_txn(
 
 async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
     let id = param(&p, "id")?.to_string();
-    let entry = get_open(&node, &ctx, &id)?;
+    let entry = get_open(&node, &id)?;
     let g = entry.lock().await;
     if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
         return Err(Error::TxnNotFound);

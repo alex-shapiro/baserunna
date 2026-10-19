@@ -13,6 +13,7 @@ use super::types::{Entry, Seq, Value, commit_key, decode_commit_record, encode_c
 use super::version::{KeyRange, Snapshot, Version};
 use super::{Shared, blob_prefix, levels_key, manifest_key, seg_key};
 use crate::error::{Error, Result};
+use crate::probe::{self, Probe};
 use crate::store::{GetOpts, PutMode, StoreError};
 use crate::timing::{self, StoreOp, Tally};
 use crate::util::{Either, race};
@@ -338,9 +339,19 @@ impl Db {
         let precision_ms = self.shared.store.time_precision_ms();
         let expired = now_ms > last_modified_ms + precision_ms + 2 * l.ms + self.shared.cfg.lease_margin_ms;
         if expired {
-            self.shared.counters.add(&super::Activity { expired_leases: 1, ..Default::default() });
+            probe::hit(Probe::ExpiredLeaseByStoreClock);
         }
         expired
+    }
+
+    /// The manifest this node serves strong reads from without validating it,
+    /// relying on its lease: its write sequence and etag, and whether a
+    /// manifest write of this node is in flight.
+    pub fn leased_view(&self) -> Option<(u64, String, bool)> {
+        let st = self.st();
+        let cur = st.current.as_ref()?;
+        (st.trusted && self.holds_lease(&st, &cur.m))
+            .then(|| (cur.m.write_seq, cur.etag.clone(), self.has_in_flight_write()))
     }
 
     /// The node holding a valid lease on this database, if known.
@@ -430,7 +441,12 @@ impl Db {
             )
         });
         let installed = match &st.current {
-            Some(c) if c.m.write_seq >= v.m.write_seq => c.clone(),
+            Some(c) if c.m.write_seq >= v.m.write_seq => {
+                if c.m.write_seq > v.m.write_seq {
+                    probe::hit(Probe::StaleVersionIgnored);
+                }
+                c.clone()
+            }
             _ => {
                 st.current = Some(v.clone());
                 self.installed.notify_waiters();
@@ -497,6 +513,7 @@ impl Db {
                         }
                         // Created concurrently, or ambiguous: read it back.
                         Err(StoreError::PreconditionFailed) | Err(StoreError::Unavailable(_)) => {
+                            probe::hit(Probe::ManifestCreateRaced);
                             tokio::time::sleep(Duration::from_millis(5)).await;
                             continue;
                         }
@@ -555,6 +572,9 @@ impl Db {
             notified.as_mut().enable();
             if self.writes_finished.load(SeqCst) >= target {
                 break;
+            }
+            if waited_since.is_none() {
+                probe::hit(Probe::StrongReadWaitedForWrite);
             }
             waited_since.get_or_insert_with(Instant::now);
             notified.await;
@@ -672,7 +692,7 @@ impl Db {
             Txn::new(snap, Isolation::Serializable, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes);
         if write_in_flight {
             t.mark_optimistic();
-            self.shared.counters.add(&super::Activity { optimistic_begins: 1, ..Default::default() });
+            probe::hit(Probe::OptimisticBegin);
         }
         Ok(t)
     }
@@ -682,14 +702,14 @@ impl Db {
     /// conflicted (or performed untracked reads) and must be re-executed.
     pub async fn revalidate(self: &Arc<Self>, t: Txn) -> Result<Option<Seq>> {
         if t.has_untracked_reads() {
-            self.shared.counters.add(&super::Activity { optimistic_reruns: 1, ..Default::default() });
+            probe::hit(Probe::OptimisticRerun);
             return Ok(None);
         }
         let snap = self.snapshot(Consistency::Strong).await?;
         match validate(&t.into_request(), &snap.version, &[], &[], snap.time_ms).await {
             Ok(()) => Ok(Some(snap.version.m.version)),
             Err(Error::Conflict(_)) => {
-                self.shared.counters.add(&super::Activity { optimistic_reruns: 1, ..Default::default() });
+                probe::hit(Probe::OptimisticRerun);
                 Ok(None)
             }
             Err(e) => Err(e),
@@ -890,6 +910,7 @@ impl Db {
             let foreign = self.foreign_lease(&base).map(|(l, left)| (l.node.clone(), left));
             if let Some((holder, left)) = foreign {
                 let e = Error::NotOwner { holder, retry_after_ms: left.as_millis() as u64 };
+                probe::hit(if maybe_applied { Probe::CommitUnknownAfterLeaseMoved } else { Probe::CommitNotOwner });
                 // An earlier attempt may have landed before the lease moved.
                 let e = if maybe_applied { unknown(e) } else { e };
                 self.finish_failed(batch, e);
@@ -908,7 +929,7 @@ impl Db {
             };
             if plan.quota_refused {
                 self.st().quota_pressure = true;
-                self.shared.counters.add(&super::Activity { quota_refusals: 1, ..Default::default() });
+                probe::hit(Probe::QuotaRefused);
             }
             let Some(m) = plan.manifest else {
                 self.maybe_sweep(&base);
@@ -940,7 +961,9 @@ impl Db {
             match res {
                 Ok(etag) => {
                     self.note_own_lease(&m, attempt_started);
-                    self.shared.counters.add(&plan.activity);
+                    for (p, n) in plan.probes {
+                        probe::hit_n(p, n);
+                    }
                     let v = Arc::new(Version::new(m, etag, self.shared.clone()));
                     let v = self.install(v, Some(started));
                     self.write_finished();
@@ -954,8 +977,12 @@ impl Db {
                     self.after_commit(&v, plan.gc, plan.due);
                     return;
                 }
-                Err(StoreError::PreconditionFailed) => {}
+                Err(StoreError::PreconditionFailed) => probe::hit(Probe::ManifestCasLost),
                 Err(StoreError::Unavailable(_)) => {
+                    probe::hit(Probe::ManifestWriteAmbiguous);
+                    if !plan.gc.is_empty() {
+                        probe::hit(Probe::ObsoleteDeletedAfterAmbiguousWrite);
+                    }
                     maybe_applied = true;
                     unknown_writes.push((m.write_seq, attempt_started));
                     self.st().trusted = false;
@@ -972,6 +999,7 @@ impl Db {
                 }
             }
             if attempt >= cfg.commit_retry_max {
+                probe::hit(Probe::CommitRetriesExhausted);
                 let e = Error::Unavailable {
                     message: "could not commit after retries".into(),
                     retry_after_ms: Some(100),
@@ -987,6 +1015,7 @@ impl Db {
                     Ok(v) => {
                         let sent = unknown_writes.iter().filter(|(ws, _)| *ws == v.m.write_seq).map(|(_, s)| *s).min();
                         if let Some(sent) = sent {
+                            probe::hit(Probe::AmbiguousWriteLanded);
                             self.note_own_lease(&v.m, sent);
                         }
                         base = v;
@@ -1023,7 +1052,7 @@ impl Db {
         {
             return r;
         }
-        self.shared.counters.add(&super::Activity { manifest_puts_hedged: 1, ..Default::default() });
+        probe::hit(Probe::ManifestPutHedged);
         let ambiguous =
             || StoreError::Unavailable("hedged manifest write rejected; the first write may have been applied".into());
         let mut hedge = put();
@@ -1032,8 +1061,16 @@ impl Db {
             Either::Right(r) => (r, true),
         };
         let e = match r {
-            Ok(etag) => return Ok(etag),
-            Err(StoreError::PreconditionFailed) if hedge_won => return Err(ambiguous()),
+            Ok(etag) => {
+                if hedge_won {
+                    probe::hit(Probe::HedgeWon);
+                }
+                return Ok(etag);
+            }
+            Err(StoreError::PreconditionFailed) if hedge_won => {
+                probe::hit(Probe::HedgeRejectedFirstInFlight);
+                return Err(ambiguous());
+            }
             Err(e) => e,
         };
         match (e, if hedge_won { first.await } else { hedge.await }) {
@@ -1094,6 +1131,7 @@ impl Db {
         let mut size = base.m.stored_bytes();
         let mut quota_refused = false;
         if base.m.is_deleted() {
+            probe::hit(Probe::DeletedDatabaseWrite);
             let outcomes = batch
                 .iter()
                 .map(|w| match w {
@@ -1101,14 +1139,7 @@ impl Db {
                     _ => Outcome::Unit(Err(Error::not_found("database deleted"))),
                 })
                 .collect();
-            return Ok(Plan {
-                manifest: None,
-                outcomes,
-                gc: Vec::new(),
-                quota_refused,
-                activity: Default::default(),
-                due,
-            });
+            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: Vec::new(), due });
         }
         for w in batch {
             match w {
@@ -1120,6 +1151,7 @@ impl Db {
                         None => committed(base, req.commit_id).await?,
                     };
                     if let Some(c) = applied {
+                        probe::hit(Probe::CommitReplayed);
                         // The attempt that applied it may not have lived to
                         // schedule the trims its retention calls for.
                         let at = pending(base, &m, &tail);
@@ -1132,6 +1164,7 @@ impl Db {
                         continue;
                     }
                     if req.deadline.is_some_and(|d| Instant::now() > d) {
+                        probe::hit(Probe::CommitDeadlinePassed);
                         outcomes.push(Outcome::Seq(Err(Error::Unavailable {
                             message: "commit deadline exceeded".into(),
                             retry_after_ms: Some(100),
@@ -1140,10 +1173,17 @@ impl Db {
                         continue;
                     }
                     if let Err(e) = validate(req, base, &accepted, &touched, time).await {
+                        if matches!(e, Error::Conflict(_)) {
+                            probe::hit(Probe::CommitConflict);
+                            if !accepted.is_empty() && validate(req, base, &[], &[], time).await.is_ok() {
+                                probe::hit(Probe::CommitConflictInBatch);
+                            }
+                        }
                         outcomes.push(Outcome::Seq(Err(e)));
                         continue;
                     }
                     if let Err(e) = bindable(&req.writes, &m, now.store_ms, cfg) {
+                        probe::hit(Probe::StagedBlobUnbindable);
                         outcomes.push(Outcome::Seq(Err(e)));
                         continue;
                     }
@@ -1277,8 +1317,10 @@ impl Db {
                         outcomes.push(Outcome::Unit(Ok(())));
                     } else if installed {
                         // An earlier, ambiguous attempt of this install landed.
+                        probe::hit(Probe::CompactionInstallReplayed);
                         outcomes.push(Outcome::Unit(Ok(())));
                     } else {
+                        probe::hit(Probe::CompactionInputsChanged);
                         outcomes.push(Outcome::Unit(Err(Error::Conflict("compaction inputs changed".into()))));
                     }
                 }
@@ -1319,14 +1361,7 @@ impl Db {
             }
         }
         if !data_changed && !meta_changed {
-            return Ok(Plan {
-                manifest: None,
-                outcomes,
-                gc: Vec::new(),
-                quota_refused,
-                activity: Default::default(),
-                due,
-            });
+            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: Vec::new(), due });
         }
         if data_changed {
             m.version = last_seq;
@@ -1352,6 +1387,7 @@ impl Db {
         m.tail = tail.into_values().collect();
         let mut gc = Vec::new();
         let mut retired = 0;
+        let mut purged_tombstones = 0;
         if let Some(now_ms) = now.store_ms {
             let purge = m.version_at_least_age(now_ms, cfg.txn_max_lifetime_ms);
             let mut horizon = m.tombstone_horizon;
@@ -1362,6 +1398,7 @@ impl Db {
                     let purged = e.value.is_tombstone() && e.seq <= purge;
                     if purged {
                         horizon = horizon.max(e.seq);
+                        purged_tombstones += 1;
                     }
                     !purged
                 });
@@ -1391,12 +1428,14 @@ impl Db {
             (gc, keep) = m.obsolete.drain(..).partition(|o| o.since_ms + cfg.gc_grace_ms <= now_ms);
             m.obsolete = keep;
         }
+        let takeover = !release && base.m.lease.as_ref().is_some_and(|l| l.node != self.shared.node_id);
         m.lease = if release {
             None
         } else {
             Some(Lease { node: self.shared.node_id.clone(), expires_ms: now.wall_ms + lease_ms, ms: lease_ms })
         };
         let mut sealed = 0;
+        let (mut flushed_tail, mut sealed_in_place) = (false, false);
         if m.tail_bytes() > cfg.tail_max_bytes {
             // Data and commit records go to separate segments (see
             // `compaction::pick`), each with every range deletion applied
@@ -1417,7 +1456,9 @@ impl Db {
             if sealed > 0 && rest <= cfg.tail_max_bytes / 2 {
                 // Sealing alone made room: what is left stays inline.
                 m.tail = data.into_iter().chain(commit_records.iter().cloned()).collect();
+                sealed_in_place = true;
             } else {
+                flushed_tail = true;
                 for part in [commit_records, &data[..]] {
                     if part.is_empty() {
                         continue;
@@ -1431,14 +1472,20 @@ impl Db {
             }
         }
         m.write_seq += 1;
-        let activity = super::Activity {
-            range_tombstones_written: m.range_deletes.iter().filter(|t| t.seq > base.m.version).count() as u64,
-            range_tombstones_retired: retired,
-            expired_entries: expired,
-            chunks_sealed_at_flush: sealed,
-            ..Default::default()
-        };
-        Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, activity, due })
+        let probes = vec![
+            (Probe::RangeTombstoneWritten, m.range_deletes.iter().filter(|t| t.seq > base.m.version).count() as u64),
+            (Probe::RangeTombstoneRetired, retired),
+            (Probe::EntriesExpired, expired),
+            (Probe::ChunkSealedAtFlush, sealed),
+            (Probe::TailFlushed, flushed_tail as u64),
+            (Probe::TailSealedInPlace, sealed_in_place as u64),
+            (Probe::TailTombstonesPurged, purged_tombstones),
+            (Probe::CommitBatched, (accepted.len() >= 2) as u64),
+            (Probe::LeaseTakeover, takeover as u64),
+            (Probe::ReadLeaseRenewed, (meta_changed && !data_changed && lease_ms > cfg.lease_ms) as u64),
+            (Probe::LeaseReleased, release as u64),
+        ];
+        Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, probes, due })
     }
 
     fn delete_obsolete(&self, gc: Vec<Obsolete>) {
@@ -1550,10 +1597,14 @@ impl Db {
         };
         match self.commit(req).await {
             Ok(_) => {
-                self.shared.counters.add(&super::Activity { retention_trims: 1, ..Default::default() });
+                probe::hit(Probe::RetentionTrimmed);
                 Ok(())
             }
-            Err(Error::NotFound(_) | Error::NotOwner { .. }) => Ok(()),
+            Err(Error::NotOwner { .. }) => {
+                probe::hit(Probe::RetentionTrimLeftToOwner);
+                Ok(())
+            }
+            Err(Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -1586,6 +1637,7 @@ impl Db {
             let store_now = self.shared.store_time_ms().await?;
             let Some(v) = self.current() else { return Ok(()) };
             if !self.holds_lease(&self.st(), &v.m) {
+                probe::hit(Probe::CompactionLostLease);
                 return Ok(());
             }
             let Some(plan) = compaction::pick(&v.m, &cfg) else {
@@ -1620,15 +1672,16 @@ impl Db {
             });
             rx.await.map_err(|_| Error::unavailable("compaction install interrupted"))??;
             let n = plan.inputs.len() as u64;
-            let mut a = match plan.kind {
-                Kind::Drop => super::Activity { segments_dropped: n, ..Default::default() },
-                Kind::Rewrite => super::Activity { segments_rewritten: n, ..Default::default() },
-                Kind::DropExpired | Kind::Expire => super::Activity { segments_expired: n, ..Default::default() },
-                _ => Default::default(),
-            };
-            a.expired_entries = expired;
-            a.chunks_sealed_in_compaction = chunks;
-            self.shared.counters.add(&a);
+            match plan.kind {
+                Kind::Drop => probe::hit_n(Probe::SegmentDropped, n),
+                Kind::Rewrite => probe::hit_n(Probe::SegmentRewritten, n),
+                Kind::DropExpired | Kind::Expire => probe::hit_n(Probe::SegmentExpired, n),
+                Kind::Move { .. } => probe::hit(Probe::CompactionMoved),
+                Kind::Merge { .. } => {}
+            }
+            probe::hit(Probe::CompactionInstalled);
+            probe::hit_n(Probe::EntriesExpired, expired);
+            probe::hit_n(Probe::ChunkSealedInCompaction, chunks);
         }
     }
 
@@ -1716,6 +1769,9 @@ impl Db {
         let blob_bytes = (live_blobs.values().sum(), v.m.blob_bytes.bound);
         let chunk_bytes = (live_chunks.values().sum(), v.m.chunk_bytes.bound);
         self.schedule_trims(due);
+        if !items.is_empty() {
+            probe::hit(Probe::OrphansMarked);
+        }
         let (tx, rx) = oneshot::channel();
         self.enqueue(Work::Obsolete { items, blob_bytes, chunk_bytes, tx });
         rx.await.map_err(|_| Error::unavailable("sweep interrupted"))?
@@ -1830,8 +1886,8 @@ struct Plan {
     gc: Vec<Obsolete>,
     /// Indicates whether a commit in this batch was rejected due to quota.
     quota_refused: bool,
-    /// Storage activity recorded upon successful manifest write.
-    activity: super::Activity,
+    /// Probes hit once the manifest write succeeds.
+    probes: Vec<(Probe, u64)>,
     /// Streams whose retention may call for a trim after this write.
     due: BTreeSet<u64>,
 }
@@ -1919,6 +1975,7 @@ async fn delete_object(shared: &Shared, db: &str, o: &Obsolete) -> Result<()> {
             let now = shared.store_now_ms().ok_or_else(|| Error::unavailable("store clock not synchronized"))?;
             if super::blob::pinned(shared, db, &o.id, now).await? {
                 // Pinned by an active read; a later sweep will collect it.
+                probe::hit(Probe::BlobPinnedAtCollection);
                 return Ok(());
             }
             let objs = crate::store::list_all(&*shared.store, &blob_prefix(db, &o.id), &shared.retry).await?;

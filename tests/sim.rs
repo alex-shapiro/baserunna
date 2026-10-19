@@ -3,6 +3,7 @@
 //! reproduce with `SIM_SEED=<seed> cargo test --test sim <name>`, and debug
 //! with `cargo run --release --example sim_tool -- trace <scenario> <seed>`.
 
+use baserunna::probe::{self, Probe};
 use baserunna::sim::workloads::{chaos_mix, scenario};
 use baserunna::sim::{SimConfig, run, run_seeds};
 
@@ -404,7 +405,7 @@ fn store_clock_lease_expiry() {
         for db in ["old", "recent"] {
             owner.create_db(db).await?;
         }
-        let expired_before = sim.engine_activity().expired_leases;
+        let expired_before = probe::count(Probe::ExpiredLeaseByStoreClock);
         assert_eq!(put(client_on(0, "a"), "old").await, 200);
         let lease_ms = sim.cfg.engine.lease_ms;
         sim.sleep(3 * lease_ms + 2_000).await;
@@ -412,7 +413,7 @@ fn store_clock_lease_expiry() {
         sim.crash(0);
         assert_eq!(put(client_on(1, "c"), "recent").await, 503);
         assert_eq!(put(client_on(1, "d"), "old").await, 200);
-        assert!(sim.engine_activity().expired_leases > expired_before);
+        assert!(probe::count(Probe::ExpiredLeaseByStoreClock) > expired_before);
         Ok(())
     });
     out.result.unwrap();

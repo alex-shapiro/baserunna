@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::log::{self, REQUEST_ID_HEADER};
 use crate::meta::{Access, DbRecord};
 use crate::node::{Node, Principal};
+use crate::probe::{self, Probe};
 use crate::timing;
 use axum::Router;
 use axum::body::Body;
@@ -314,6 +315,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 match node.services.transport.call(&addr, fwd).await {
                     Ok(resp) => return Ok(forwarded(resp, target)),
                     Err(te) if te.maybe_delivered && !idempotent => {
+                        probe::hit(Probe::ForwardAmbiguous);
                         return Err(Error::Unavailable {
                             message: format!("forwarding to {target} failed: {}", te.message),
                             retry_after_ms: Some(1000),
@@ -321,6 +323,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                         });
                     }
                     Err(_) => {
+                        probe::hit(Probe::ForwardFailedHandledLocally);
                         node.mark_suspect(&target);
                         req = Request::from_parts(parts, Body::from(bytes));
                     }
@@ -334,6 +337,9 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 return match node.services.transport.call(&addr, fwd).await {
                     Ok(resp) => Ok(forwarded(resp, target)),
                     Err(te) => {
+                        if te.maybe_delivered {
+                            probe::hit(Probe::ForwardAmbiguous);
+                        }
                         node.mark_suspect(&target);
                         Err(Error::Unavailable {
                             message: format!("forwarding to {target} failed: {}", te.message),
@@ -361,12 +367,14 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 let (fresh, fresh_access) = node.resolve_db_strong(&principal, &name).await?;
                 if fresh.id == rec.id {
                     // Finish any interrupted deletion where the manifest was marked deleted before metadata removal.
+                    probe::hit(Probe::DeletionRepaired);
                     match node.run_meta(crate::meta::MetaCmd::DeleteDb { id: rec.id.clone() }).await {
                         Ok(_) | Err(Error::NotFound(_)) => node.forget_db_name(&rec.owner_id, &rec.name),
                         Err(e) => return Err(e),
                     }
                     return Err(Error::NotFound(m));
                 }
+                probe::hit(Probe::NameResolvedAgain);
                 (rec, access) = (fresh, fresh_access);
                 node.open_db(&rec).await?
             }
@@ -472,6 +480,7 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
         return next.run(req).await;
     }
     if req.headers().get(FORWARD_TO_HEADER).and_then(|v| v.to_str().ok()) != Some(node.id.as_str()) {
+        probe::hit(Probe::ForwardToPreviousProcess);
         return Error::Unavailable {
             message: "forwarded to a node that is no longer running".into(),
             retry_after_ms: Some(100),
@@ -507,8 +516,14 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
             }
         }
         Delivery::Duplicate(wait) => match wait.await {
-            Some(r) => replay(r),
-            None => unknown_outcome("duplicate of a forwarded request with an unknown outcome".into()),
+            Some(r) => {
+                probe::hit(Probe::ForwardDuplicateReplayed);
+                replay(r)
+            }
+            None => {
+                probe::hit(Probe::ForwardDuplicateUnknown);
+                unknown_outcome("duplicate of a forwarded request with an unknown outcome".into())
+            }
         },
     }
 }
@@ -672,6 +687,7 @@ pub(crate) async fn finish<T>(
         Ok(c) if c.replayed && key.is_some() => Ok(Some(Ran::Replayed(c))),
         Ok(commit) => Ok(Some(Ran::Committed { out, commit })),
         Err(Error::Conflict(_)) if *attempt < node.cfg.txn_retries => {
+            probe::hit(Probe::TxnRetriedOnConflict);
             *attempt += 1;
             let backoff = 5 * (1 << *attempt) + node.env.random_below(10);
             tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
@@ -687,7 +703,10 @@ pub(crate) async fn finish<T>(
 pub(crate) async fn failed<T>(ctx: &DbCtx, commit_id: u64, key: Option<&str>, e: Error) -> Result<Ran<T>> {
     match e {
         Error::PreconditionFailed { .. } if key.is_some() => match ctx.db.commit_status_fenced(commit_id).await? {
-            Some(c) => Ok(Ran::Replayed(c)),
+            Some(c) => {
+                probe::hit(Probe::PreconditionExplainedByReplay);
+                Ok(Ran::Replayed(c))
+            }
             None => Err(e),
         },
         e => Err(naming_commit(e, commit_id)),

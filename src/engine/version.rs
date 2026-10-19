@@ -210,7 +210,7 @@ impl Shared {
         let data = l.encode();
         let key = levels_key(db, &id);
         self.retry.run(|| self.store.put(&key, data.clone(), crate::store::PutMode::Overwrite)).await?;
-        self.counters.add(&super::Activity { levels_objects_written: 1, ..Default::default() });
+        crate::probe::hit(crate::probe::Probe::LevelsObjectWritten);
         self.cache.insert(CacheKey { seg_path: Arc::from(key.as_str()), block: 0 }, CacheVal::Levels(Arc::new(l)));
         if let Some(t) = self.cfg.local_tier.clone() {
             self.env.spawn(async move { t.0.put(&key, data).await });

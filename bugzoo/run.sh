@@ -52,7 +52,7 @@ for p in $patches; do
   rm -f "bugzoo/.build-$name.log"
   revert
   out=$("$bin" "$@" 2>&1)
-  seeds=$(sed -n 's/^\([0-9][0-9]*\) runs in .*/\1/p' <<< "$out" | awk '{s += $1} END {print s + 0}')
+  seeds=$(sed -n -e 's/^\([0-9][0-9]*\) runs in .*/\1/p' -e 's/^explored \([0-9][0-9]*\) runs.*/\1/p' <<< "$out" | awk '{s += $1} END {print s + 0}')
   failed=$(grep -c '^FAIL ' <<< "$out")
   first=$(grep -m1 '^FAIL ' <<< "$out" | cut -c1-200)
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$*" "$seeds" "$failed" "$((seeds - failed))" "${first:--}" | tee -a "$results"

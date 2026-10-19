@@ -106,8 +106,8 @@ impl Tally {
         to_ms(self.read_wait_us.load(Relaxed))
     }
 
-    /// A `Server-Timing` header value for a request that took `total`: its store calls (`store`, with
-    /// their count), commit waits (`commit`) and in-flight manifest write waits (`wait`), in ms.
+    /// Formats a `Server-Timing` header value with durations in milliseconds for total request time (`total`),
+    /// object-store operations (`store`), commit waits (`commit`), and in-flight manifest waits (`wait`).
     pub fn server_timing(&self, total: Duration) -> String {
         let ms = |us: u64| us as f64 / 1000.0;
         let calls: u64 = self.store.iter().flatten().map(|s| s.count.load(Relaxed)).sum();
@@ -168,15 +168,14 @@ pub fn record_build_time(d: Duration) {
     });
 }
 
-/// Object-store wrapper that records each operation in the task-local [`Tally`] and in the
-/// node's [`StoreMetrics`]. An operation dropped before it finishes, such as the slower copy of
-/// a hedged write, is recorded with the time it ran.
+/// Object-store wrapper that records each operation in the task-local [`Tally`] and in
+/// [`StoreMetrics`]. Operations that are dropped before completion are recorded with their
+/// elapsed duration when dropped.
 pub struct TimedStore {
     pub inner: DynStore,
     pub metrics: Arc<StoreMetrics>,
 }
 
-/// Records one store operation when dropped.
 struct Call<'a> {
     store: &'a TimedStore,
     key: &'a str,
@@ -295,7 +294,6 @@ mod tests {
         });
     }
 
-    /// A store whose calls never finish.
     struct Hung;
 
     impl ObjectStore for Hung {

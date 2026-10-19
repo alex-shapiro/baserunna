@@ -16,13 +16,9 @@ const MAGIC: &[u8; 4] = b"BRMF";
 
 /// The database was deleted: every read and commit fails with not-found.
 pub const FLAG_DELETED: u64 = 1;
-/// A codec byte follows the format: the body is raw or zstd-compressed.
-/// Format 5 manifests have no codec byte and a raw body.
 const FORMAT: u16 = 6;
 const FORMAT_RAW: u16 = 5;
-/// zstd level for manifest bodies: commits wait on it, so it favors speed.
 const ZSTD_LEVEL: i32 = 1;
-/// Largest manifest body a decoder inflates, so a corrupt length cannot exhaust memory.
 const MAX_BODY: u64 = 64 << 20;
 const LEVELS_MAGIC: &[u8; 4] = b"BRLV";
 const LEVELS_FORMAT: u16 = 2;
@@ -200,9 +196,6 @@ impl Manifest {
         segments + tail as u64 + self.blob_bytes.total() + self.chunk_bytes.total()
     }
 
-    /// Encodes the manifest, compressing its body when that saves at least
-    /// an eighth, as for segment blocks. Every commit uploads the whole
-    /// manifest, tail included, so its size sets the commit's latency.
     pub fn encode(&self) -> Bytes {
         let body = self.encode_body();
         let mut w = Writer::with_capacity(16 + body.len());

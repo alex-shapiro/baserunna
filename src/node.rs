@@ -399,9 +399,8 @@ impl Node {
         lock(&self.members).clone()
     }
 
-    /// Returns non-suspect cluster members with a recent heartbeat. A
-    /// member at this node's own address is an earlier run of this node,
-    /// which can no longer be reached there.
+    /// Returns non-suspect cluster members with a recent heartbeat, excluding any previous
+    /// member entry that shares this node's address.
     pub fn live_members(&self) -> Vec<NodeRecord> {
         let now = self.now_ms() as i64;
         cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
@@ -473,8 +472,7 @@ impl Node {
             return None;
         }
         let addr = self.addr_of(&target)?;
-        // A lease held by an earlier run of this node: writes wait for it to
-        // expire, but forwarding would only reach this node again.
+        // Do not forward to a previous process that ran at this node's address.
         if addr == self.cfg.addr {
             return None;
         }
@@ -610,8 +608,7 @@ impl Node {
         self.authenticate_metered(token, false).await
     }
 
-    /// [`Node::authenticate`], letting the request overdraw its rate limits
-    /// (see [`Limiter::borrow`]) if `may_borrow`.
+    /// Authenticates `token` and checks rate limits, using [`Limiter::borrow`] when `may_borrow` is true.
     pub async fn authenticate_metered(&self, token: &str, may_borrow: bool) -> Result<Principal> {
         let p = self.principal(token).await?;
         let user_key = format!("user:{}", p.user.id);
@@ -1290,13 +1287,13 @@ mod tests {
             };
             a.run_meta(super::MetaCmd::Heartbeat { node: ghost.clone(), dead_after_ms: 3_600_000 }).await.unwrap();
             a.refresh_members().await.unwrap();
-            assert!(a.members().iter().any(|m| m.id == ghost.id), "setup: the earlier run looks live");
+            assert!(a.members().iter().any(|m| m.id == ghost.id));
             assert!(a.live_members().iter().all(|m| m.id != ghost.id));
             let both = [a.members().into_iter().find(|m| m.id == a.id).unwrap(), ghost];
             let homed = (0..)
                 .map(|i| format!("db{i}"))
                 .find(|d| super::cluster::rendezvous(d, &both).unwrap().id == "earlier-run");
-            assert_eq!(a.route(&homed.unwrap()).await, None, "served here, not forwarded to itself");
+            assert_eq!(a.route(&homed.unwrap()).await, None);
         });
     }
 

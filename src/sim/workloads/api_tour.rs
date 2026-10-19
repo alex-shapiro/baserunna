@@ -97,7 +97,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
         expect(r.json["routes"].is_object() && r.json["store"].is_object(), format!("metrics: {}", r.json))?;
         let again = c.call_retry("GET", "/v1/admin/metrics", None).await;
         if again.json["node"] == r.json["node"] {
-            // The tour made one-shot transactions before the reset and none since.
             let txns = &again.json["routes"]["POST /v1/dbs/{db}/txn"];
             expect(txns.is_null(), format!("metrics after a reset: {}", again.json))?;
         }

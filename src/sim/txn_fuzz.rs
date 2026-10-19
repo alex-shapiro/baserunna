@@ -2598,8 +2598,8 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    /// Runs `ops` in `t` against the model. `Ok(None)` means the request fails (or is unmodeled) and
-    /// its response was checked.
+    /// Executes `ops` against the model `t`. Returns `Ok(None)` if an operation failed and the
+    /// HTTP error response was already verified.
     async fn exec_ops(
         &mut self,
         t: &mut TxnView,

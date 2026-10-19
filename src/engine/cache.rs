@@ -32,10 +32,7 @@ impl CacheVal {
     }
 }
 
-/// Sentinel for "no slot" in a shard's linked list.
 const NIL: u32 = u32::MAX;
-
-/// Budget below which a cache keeps a single shard, and so an exact LRU.
 const SHARD_MIN_BYTES: usize = 4 << 20;
 const SHARDS_MAX: usize = 64;
 
@@ -47,9 +44,6 @@ struct Slot {
     next: u32,
 }
 
-/// One independently locked part of the cache: an LRU list threaded
-/// through a slab, most recently used first, so a hit costs a lookup and
-/// relinking one slot.
 struct Shard {
     budget: usize,
     map: DetHashMap<CacheKey, u32>,
@@ -156,9 +150,6 @@ impl Shard {
     }
 }
 
-/// A node-wide byte-bounded cache, split into shards that lock
-/// independently, so reads in different databases and threads do not wait
-/// on one another.
 pub struct Cache {
     shards: Vec<Mutex<Shard>>,
 }
@@ -265,8 +256,8 @@ mod tests {
         }
         let s = c.stats();
         assert!(s.bytes <= 16 * SHARD_MIN_BYTES, "{s:?}");
-        assert!(s.entries as u32 > n / 3, "most of the budget is used: {s:?}");
-        assert!(c.get(&key(n - 1)).is_some(), "the newest entry is cached");
+        assert!(s.entries as u32 > n / 3, "{s:?}");
+        assert!(c.get(&key(n - 1)).is_some());
         c.evict_prefix("seg");
         assert_eq!(c.stats().bytes, 0);
     }

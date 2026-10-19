@@ -1,5 +1,4 @@
-//! Latency histograms of a node's object-store calls, commit batches and API
-//! requests, served by `/v1/admin/metrics`.
+//! Latency histograms for object-store operations, commit batches, HTTP routes, and scheduler lag.
 
 use crate::engine::ObjectClass;
 use crate::timing::StoreOp;
@@ -9,8 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-/// Bucket `i` holds durations up to `FIRST_US * GROWTH^i` µs: 10 µs to
-/// about 30 minutes with 25% resolution.
 const BUCKETS: usize = 86;
 const FIRST_US: f64 = 10.0;
 const GROWTH: f64 = 1.25;
@@ -26,7 +23,6 @@ fn upper_us(i: usize) -> f64 {
     FIRST_US * GROWTH.powi(i as i32)
 }
 
-/// A latency histogram with lock-free recording.
 pub struct Histogram {
     buckets: [AtomicU64; BUCKETS],
     count: AtomicU64,
@@ -58,7 +54,6 @@ impl Histogram {
         self.count.load(Relaxed)
     }
 
-    /// The upper bound of the bucket holding quantile `q`, in ms.
     fn quantile_ms(&self, counts: &[u64], total: u64, q: f64) -> f64 {
         let rank = ((total as f64) * q).ceil().max(1.0) as u64;
         let mut seen = 0;
@@ -72,7 +67,6 @@ impl Histogram {
         0.0
     }
 
-    /// Count, mean, quantiles (accurate to a bucket, 25%) and max, in ms.
     pub fn json(&self) -> Json {
         let counts: Vec<u64> = self.buckets.iter().map(|b| b.load(Relaxed)).collect();
         let total: u64 = counts.iter().sum();
@@ -101,13 +95,10 @@ impl Histogram {
     }
 }
 
-/// Latency histograms of a node's object-store calls and commit batches,
-/// kept by its engine.
 #[derive(Default)]
 pub struct StoreMetrics {
     store: [[Histogram; StoreOp::ALL.len()]; ObjectClass::ALL.len()],
     store_errors: [[AtomicU64; StoreOp::ALL.len()]; ObjectClass::ALL.len()],
-    /// Commit batches that wrote a manifest, from dequeue to acknowledgement.
     commits: Histogram,
     batch_txns: AtomicU64,
     batch_txns_max: AtomicU64,
@@ -127,7 +118,6 @@ impl StoreMetrics {
         self.batch_txns_max.fetch_max(txns as u64, Relaxed);
     }
 
-    /// Adds `store` and `commits` fields to `out`.
     pub fn json_into(&self, out: &mut Map<String, Json>) {
         let mut store = Map::new();
         for class in ObjectClass::ALL {
@@ -158,22 +148,15 @@ impl StoreMetrics {
     }
 }
 
-/// Methods requests are counted under; any other method counts as `OTHER`.
 const METHODS: [&str; 8] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "OTHER"];
 
-/// Latency histograms of a node's API requests and scheduling delays.
 #[derive(Default)]
 pub struct ServerMetrics {
-    /// Per method in [`METHODS`], keyed by route template.
     routes: RwLock<[BTreeMap<String, Arc<Histogram>>; METHODS.len()]>,
-    /// How late a periodic 100 ms timer fires: time the node had work it
-    /// could not run, because its CPU was busy or taken away.
     lag: Histogram,
 }
 
 impl ServerMetrics {
-    /// Records a request with `method` to the route template `route`, or to
-    /// no route.
     pub fn request(&self, method: &str, route: Option<&str>, d: Duration) {
         let m = METHODS.iter().position(|x| *x == method).unwrap_or(METHODS.len() - 1);
         let route = route.unwrap_or("unmatched");
@@ -184,12 +167,10 @@ impl ServerMetrics {
         routes[m].entry(route.to_string()).or_default().record(d);
     }
 
-    /// Records how late the scheduler-lag probe's timer fired.
     pub fn lag(&self, late: Duration) {
         self.lag.record(late);
     }
 
-    /// Adds `routes`, `lag` and `cpu` fields to `out`.
     pub fn json_into(&self, out: &mut Map<String, Json>) {
         let routes = self.routes.read().unwrap_or_else(|e| e.into_inner());
         let routes: Map<String, Json> = METHODS
@@ -208,14 +189,10 @@ impl ServerMetrics {
     }
 }
 
-/// Cumulative CPU time of this process and the host's steal time (time the
-/// hypervisor ran something else), in ms, where `/proc` reports them.
 fn cpu_json() -> Json {
-    // Linux reports both in clock ticks, which are 10 ms on every platform it runs on here.
     const TICK_MS: u64 = 10;
     let process = std::fs::read_to_string("/proc/self/stat").ok().and_then(|s| {
-        // After the parenthesized command name come the state, then utime and
-        // stime as the 12th and 13th fields; some fields between can be -1.
+        // In /proc/self/stat, fields 11 and 12 after "(comm)" are utime and stime.
         let f: Vec<&str> = s.rsplit_once(')')?.1.split_whitespace().collect();
         Some((f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?) * TICK_MS)
     });

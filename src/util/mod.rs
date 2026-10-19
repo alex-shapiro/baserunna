@@ -19,9 +19,7 @@ pub enum Either<A, B> {
     Right(B),
 }
 
-/// Polls `a` and `b` until one finishes and returns its output, leaving the
-/// other to be awaited or dropped. `a` is polled first, so the result is
-/// deterministic, unlike `select!`'s.
+/// Polls `a` and `b` until the first future completes, polling `a` before `b` on each wakeup.
 pub async fn race<A: Future + Unpin, B: Future + Unpin>(a: &mut A, b: &mut B) -> Either<A::Output, B::Output> {
     use std::task::Poll;
     std::future::poll_fn(|cx| {

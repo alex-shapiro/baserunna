@@ -46,7 +46,6 @@ async fn transfer(c: &Client, db: &str, a: usize, b: usize, amt: i64) -> Result<
     while c.sim.now_ms() < deadline {
         let d = c.rng().below(50);
         c.pause(d).await;
-        // Half the transfers read in `begin` and write in `commit`; the rest use separate `ops` calls.
         let compact = c.rng().below(2) == 0;
         let reads = json!([{"op": "get", "key": acct(a)}, {"op": "get", "key": acct(b)}]);
         let begin = if compact { json!({"ops": reads}) } else { json!({}) };

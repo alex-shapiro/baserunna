@@ -1210,7 +1210,7 @@ fn trims_by_time_conflict_only_with_appends_they_could_have_trimmed() {
         assert!(!found.has_untracked_reads() && !past_end.has_untracked_reads());
         append_texts(&db, "s", &["3"]).await;
         commit(&db, found).await.unwrap();
-        assert!(matches!(commit(&db, past_end).await, Err(Error::Conflict(_))), "the append was before its time");
+        assert!(matches!(commit(&db, past_end).await, Err(Error::Conflict(_))));
         assert_eq!(texts(&read_all(&db, "s", ReadSpec::default()).await), ["2", "3"]);
     });
 }

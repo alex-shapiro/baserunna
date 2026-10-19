@@ -112,7 +112,7 @@ impl Bucket {
         self.at = now;
     }
 
-    /// Returns the duration until the bucket holds `need` tokens, or zero if it does.
+    /// Returns the duration until the bucket has at least `need` tokens.
     fn wait(&self, need: f64) -> Duration {
         match self.tokens >= need {
             true => Duration::ZERO,
@@ -150,8 +150,7 @@ impl Limiter {
         self.take_inner(keys, what, false)
     }
 
-    /// Like [`Limiter::take`], but an exhausted bucket lends its token, down
-    /// to a debt of one burst, which later takes wait to repay.
+    /// Acquires a token from each bucket in `keys`, allowing buckets to go negative by up to `rate.burst`.
     pub fn borrow(&self, keys: &[(&str, Rate)], what: &str) -> Result<(), Error> {
         self.take_inner(keys, what, true)
     }
@@ -308,9 +307,9 @@ mod tests {
             assert!(l.take(&[("user", rate)], "requests").is_err());
             l.borrow(&[("user", rate)], "requests").unwrap();
             l.borrow(&[("user", rate)], "requests").unwrap();
-            assert!(l.borrow(&[("user", rate)], "requests").is_err(), "a burst of debt");
+            assert!(l.borrow(&[("user", rate)], "requests").is_err());
             tokio::time::sleep(Duration::from_millis(2_000)).await;
-            assert_eq!(wait_ms(l.take(&[("user", rate)], "requests")), 1_000, "the debt is repaid first");
+            assert_eq!(wait_ms(l.take(&[("user", rate)], "requests")), 1_000);
         });
     }
 

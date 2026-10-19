@@ -26,9 +26,7 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
         self.map().get(k).filter(|(at, _)| at.elapsed() < self.ttl).map(|(_, v)| v.clone())
     }
 
-    /// Insert `v`, read at `read_at`, under `k`, or remove `k` if `v` is
-    /// `None`. The entry expires `ttl` after `read_at`, so a slow read
-    /// cannot keep a value that was stale when stored.
+    /// Inserts `v` under `k` with expiration `read_at + ttl`, or removes `k` if `v` is `None`.
     pub fn store(&self, k: K, v: Option<V>, read_at: Instant) {
         let mut m = self.map();
         match v {
@@ -79,17 +77,17 @@ mod tests {
             c.store(1, Some("a"), Instant::now());
             assert_eq!(c.get(&1), Some("a"));
             c.store(2, Some("b"), Instant::now() - Duration::from_secs(10));
-            assert_eq!(c.get(&2), None, "read too long ago");
+            assert_eq!(c.get(&2), None);
             tokio::time::sleep(Duration::from_secs(10)).await;
-            assert_eq!(c.get(&1), None, "expired");
-            assert_eq!(c.len(), 2, "until pruned");
+            assert_eq!(c.get(&1), None);
+            assert_eq!(c.len(), 2);
             c.prune();
             assert!(c.is_empty());
             for k in 0..3 {
                 c.store(k, Some("x"), Instant::now());
             }
             c.store(9, Some("y"), Instant::now());
-            assert_eq!((c.len(), c.get(&9)), (1, Some("y")), "storing past the bound forgets the rest");
+            assert_eq!((c.len(), c.get(&9)), (1, Some("y")));
             c.store(9, None, Instant::now());
             assert_eq!(c.get(&9), None);
         });

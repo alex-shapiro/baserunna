@@ -402,7 +402,6 @@ async fn admin_metrics(State(node): State<Arc<Node>>, Auth(p): Auth) -> Result<a
     Ok(axum::Json(Json::Object(out)))
 }
 
-/// Returns the metrics, as `GET` does, and clears them.
 async fn reset_metrics(State(node): State<Arc<Node>>, auth: Auth) -> Result<axum::Json<Json>> {
     let out = admin_metrics(State(node.clone()), auth).await?;
     node.engine.shared.metrics.reset();

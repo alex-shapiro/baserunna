@@ -370,9 +370,8 @@ impl Transport for SimTransport {
                     *resp.headers_mut() = r.headers;
                     Ok(resp)
                 }
-                // A duplicate may have arrived even though this copy was refused.
                 Err(NetError::Refused) if duplicated => Err(TransportError {
-                    message: "connection refused after a duplicate".into(),
+                    message: "connection refused after duplicate".into(),
                     maybe_delivered: true,
                 }),
                 Err(NetError::Refused) => Err(undelivered("connection refused")),

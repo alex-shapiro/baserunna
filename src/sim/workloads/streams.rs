@@ -998,8 +998,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     if sorted != cas_log {
         return Err(format!("appends expecting seqs won {sorted:?}, the stream holds {cas_log:?}"));
     }
-    // The checker's append calls for a trim; store stalls under faults can
-    // delay it past any fixed pause, so wait for it with a deadline.
     let eps = 2 * sim.cfg.engine.clock_sync_max_error_ms;
     let due = crate::engine::Retention { retention_ms: Some(RET_MS), max_bytes: Some(RET_BYTES) }.due_at();
     let (due_ms, due_bytes) = (due.retention_ms.unwrap_or(RET_MS), due.max_bytes.unwrap_or(RET_BYTES));

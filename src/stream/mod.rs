@@ -353,8 +353,8 @@ pub async fn trim(txn: &mut Txn, name: &str, before_seq: Option<u64>, before_tim
         (None, Some(t)) => {
             let st = state(txn, &c, false).await?;
             let before = txn.snapshot().stream_seek(c.id, &st, Seek::Time(t)).await?;
-            // The seek read the records up to the one found; with none found,
-            // a later append could be before `t` too.
+            // If all existing records are earlier than `t` (`before == st.next_seq`), leave the
+            // read range unbounded above so that a concurrent append with a timestamp `< t` conflicts.
             txn.note_stream_read(c.id, st.first_seq, (before < st.next_seq).then_some(before + 1));
             before
         }

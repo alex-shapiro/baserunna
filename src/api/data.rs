@@ -27,9 +27,7 @@ use tokio::time::Instant;
 
 type J = axum::Json<Json>;
 
-/// The route that aborts an interactive transaction.
 pub(super) const TXN_ROUTE: &str = "/v1/dbs/{db}/transactions/{id}";
-/// The route that commits an interactive transaction.
 pub(super) const COMMIT_ROUTE: &str = "/v1/dbs/{db}/transactions/{id}/commit";
 
 pub fn routes() -> Router<Arc<Node>> {
@@ -534,8 +532,6 @@ async fn begin_txn(
     Extension(ctx): Extension<DbCtx>,
     JsonBody(b): JsonBody<Begin>,
 ) -> Result<Response> {
-    // A serializable transaction starts without waiting for a manifest write
-    // in flight; its commit validates what it read (SPEC §6.2).
     let mut t = match b.isolation.into() {
         crate::engine::Isolation::Serializable => ctx.db.begin_optimistic().await?,
         iso => ctx.db.begin(iso, Consistency::Strong).await?,
@@ -650,7 +646,7 @@ async fn commit_txn(
     let cid = t.commit_id;
     if t.needs_revalidation(!t.is_read_only()) {
         let Some(version) = ctx.db.revalidate(t).await? else {
-            return Err(Error::Conflict("the transaction read data a concurrent commit changed".into()));
+            return Err(Error::Conflict("transaction conflicts with a concurrent commit".into()));
         };
         return Ok(axum::Json(json!({
             "version": version, "commit_id": commit_hex(cid), "appends": [], "results": results,

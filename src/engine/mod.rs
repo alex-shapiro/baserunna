@@ -90,7 +90,6 @@ activity! {
     optimistic_begins,
     /// Optimistic transactions re-executed after failing revalidation against a strong snapshot.
     optimistic_reruns,
-    /// Manifest writes sent a second time because the store was slow to answer.
     manifest_puts_hedged,
 }
 

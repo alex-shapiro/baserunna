@@ -266,10 +266,6 @@ fn clone_parts(req: &Request) -> http::request::Builder {
 
 const BUFFER_FORWARD_MAX: u64 = 1024 * 1024;
 
-/// Whether `req` commits or aborts an interactive transaction. Its `begin`
-/// was admitted, and refusing to finish it would waste that work and leave
-/// the transaction open until it idles out, so such requests may overdraw
-/// the rate limit (§9).
 fn finishes_txn(req: &Request) -> bool {
     let route = req.extensions().get::<MatchedPath>().map(MatchedPath::as_str);
     match *req.method() {
@@ -409,9 +405,7 @@ fn hops(h: &HeaderMap) -> u32 {
 
 const SERVER_TIMING_HEADER: &str = "server-timing";
 
-/// Assigns an `x-request-id` header, runs the request in a scoped log context, logs completion, and
-/// reports where the time went in a `Server-Timing` header. A forwarded request's header comes from
-/// the node that served it.
+/// Assigns an `x-request-id` header, attaches `Server-Timing`, and logs request completion.
 async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
     let given = req.headers().get(REQUEST_ID_HEADER).filter(|v| v.to_str().is_ok_and(log::valid_request_id));
     let header = match given {
@@ -870,11 +864,11 @@ mod tests {
             };
             assert!(finishes("POST", "/v1/dbs/app/transactions/abc/commit").await);
             assert!(finishes("DELETE", "/v1/dbs/acme.app/transactions/abc").await);
-            assert!(!finishes("POST", "/v1/dbs/app/transactions").await, "begin");
-            assert!(!finishes("POST", "/v1/dbs/app/transactions/abc/ops").await, "ops");
-            assert!(!finishes("DELETE", "/v1/dbs/app/kv/transactions").await, "a key named transactions");
-            assert!(!finishes("POST", "/v1/dbs/app/transactions/x/y/z/commit").await, "no such route");
-            assert!(!finishes("DELETE", "/v1/dbs/app/transactions/x/y").await, "no such route");
+            assert!(!finishes("POST", "/v1/dbs/app/transactions").await);
+            assert!(!finishes("POST", "/v1/dbs/app/transactions/abc/ops").await);
+            assert!(!finishes("DELETE", "/v1/dbs/app/kv/transactions").await);
+            assert!(!finishes("POST", "/v1/dbs/app/transactions/x/y/z/commit").await);
+            assert!(!finishes("DELETE", "/v1/dbs/app/transactions/x/y").await);
         });
     }
 

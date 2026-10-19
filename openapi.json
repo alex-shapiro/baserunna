@@ -155,7 +155,7 @@
       },
       "BeginRequest": {
         "additionalProperties": false,
-        "description": "`ops` run in the new transaction before it is returned.",
+        "description": "Optional operations to execute in the new transaction.",
         "properties": {
           "encoding": {
             "enum": [
@@ -240,7 +240,7 @@
       },
       "CommitRequest": {
         "additionalProperties": false,
-        "description": "`ops` run in the transaction just before it commits.",
+        "description": "Optional operations to execute before the transaction is committed.",
         "properties": {
           "ops": {
             "items": {
@@ -2770,13 +2770,13 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Read and reset the serving node's metrics (admin)",
+        "summary": "Read and reset node latency metrics (admin)",
         "tags": [
           "admin"
         ]
       },
       "get": {
-        "description": "Latency histograms of this node since it started or was last reset: object-store calls by object class and operation, commit batches that wrote a manifest, requests by method and route, and how late a periodic timer fires (`lag`). `cpu` holds cumulative process CPU and host steal time in ms where the OS reports them. Quantiles are accurate to 25%.",
+        "description": "Returns latency histograms for object-store operations, commit batches, HTTP routes, and scheduler lag, along with cumulative process CPU time and host steal time.",
         "responses": {
           "200": {
             "content": {
@@ -2792,7 +2792,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Latency metrics of the serving node (admin)",
+        "summary": "Read node latency metrics (admin)",
         "tags": [
           "admin"
         ]
@@ -6122,7 +6122,7 @@
     },
     "/v1/dbs/{db}/transactions/{id}/commit": {
       "post": {
-        "description": "Any error in `ops` aborts the transaction.",
+        "description": "If any operation in `ops` fails, the transaction is aborted.",
         "parameters": [
           {
             "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",

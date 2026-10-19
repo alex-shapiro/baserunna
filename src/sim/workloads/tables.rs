@@ -162,8 +162,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
                         Ok(r) if r.status == 409 && r.code() == "already_exists" => break,
                         Ok(r) if r.status == 409 || r.retryable_not_applied() => {}
                         Ok(r) if r.status != 503 => return Err(format!("contender: {} {}", r.status, r.json)),
-                        // Ambiguous: check if our row exists after waiting out zombies,
-                        // and claim again if it does not, as no copy can land any more.
+                        // Ambiguous: check if our row exists after waiting out zombies.
                         _ => {
                             cc.pause(super::super::client::ZOMBIE_WAIT_MS).await;
                             let g = cc

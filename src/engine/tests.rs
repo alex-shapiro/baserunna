@@ -1204,17 +1204,15 @@ fn ambiguous_commit_after_lease_expires() {
     // Node B retries after the store clock shows node A's lease has expired.
     match commit_with_lost_reply_after_takeover(4, 0) {
         Ok(2) => {}
-        other => panic!("expected write to resolve at version 2, got {other:?}"),
+        other => panic!("expected version 2, got {other:?}"),
     }
 }
 
 #[test]
 fn hedged_commit_resolves_before_a_takeover() {
-    // The hedge is refused because the first copy applied, so node B reloads
-    // the manifest and finds its commit long before node A could take over.
     match commit_with_lost_reply_after_takeover(2, 250) {
         Ok(2) => {}
-        other => panic!("expected the hedged write to resolve at version 2, got {other:?}"),
+        other => panic!("expected version 2, got {other:?}"),
     }
 }
 

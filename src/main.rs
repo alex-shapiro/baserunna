@@ -182,7 +182,6 @@ async fn run() -> Result<(), String> {
             std::process::exit(0);
         });
     };
-    // Send responses as soon as they are written, without Nagle's delay.
     let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
         let _ = tcp.set_nodelay(true);
     });

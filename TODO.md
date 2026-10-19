@@ -18,18 +18,14 @@ the design context for several of these.
 - [ ] **Test Google sign-in against real Google.** Only `FakeGoogle` has
       exercised it. Also add an OIDC `nonce` and PKCE (`code_verifier`) to
       the authorization-code flow. Today only `state` is used.
-- [ ] **Metrics.** `GET /v1/admin/metrics` reports latency histograms of
-      object-store calls, commit batches and API routes, scheduler lag and
-      CPU time as JSON. Add a Prometheus-style `/metrics` endpoint with
-      those and: object-store bytes; CAS conflicts; lease acquisitions and
-      steals; cache hit rate; open DB handles; compaction and GC activity;
-      forwarded requests; rate limit refusals. Cost is a primary goal, so
-      object-store request counts matter most. `engine::Activity` already
-      counts range tombstones, segment drops and rewrites, levels objects,
-      quota refusals and expired entries and segments.
-- [ ] **Publish release binaries and a container image.** Apps that test
-      against a local node (mathtutor's test suite does) need one in CI, and
-      the repo is private.
+- [ ] **Prometheus metrics.** Expose a `/metrics` endpoint in Prometheus
+      format that includes the histograms from `/v1/admin/metrics` along
+      with object-store byte counts, CAS conflicts, lease acquisitions and
+      steals, cache hit rates, open DB handles, compaction and GC activity,
+      forwarded requests, and rate-limit rejections.
+- [ ] **Publish release binaries and a container image.** Publish prebuilt
+      binaries and a container image so external test suites can run a local
+      node in CI.
 - [ ] **Check caches on bulk reads (`ReadMode::Bulk`).** Compaction and GC
       sweeps read segments in `ReadMode::Bulk` to avoid polluting the
       in-memory block cache on misses, but `MergeIter::peek` currently skips
@@ -40,26 +36,22 @@ the design context for several of these.
 
 ## Performance
 
-Load testing mathtutor on fly.io (DEPLOYING.md) left these open.
-
-- [ ] **Resolve ambiguous commits without waiting.** A client must wait
-      about 15 s, past the commit deadline, before `GET /commits/{id}` can
-      answer (SPEC §6.2), so a proxy 502 during a commit stalls the user for
-      15 s. If the status call's fencing manifest write also recorded the
-      commit id as refused, a later attempt would be rejected and the call
-      could answer at once.
-- [ ] **Cut CPU per request.** On one dedicated core, throughput levels off
-      around 340 commits/s with the core about 80% busy. Profiles show the
-      time going to memory allocation, building `serde_json` maps for
-      responses, key comparisons in segment lookups, and zstd compression of
-      the manifest.
-- [ ] **Remove the remaining block-cache lock contention.** Cache shards
-      still take an exclusive lock on every hit to update LRU order. A
-      CLOCK-style cache would let hits take a shared lock.
-- [ ] **Tune the inline WAL tail limit.** Every commit uploads the manifest
-      with the tail inline: commits take 36 ms at the median with an empty
-      tail and 84 ms with a full 256 KiB one on Tigris. A lower limit trades
-      commit latency for more frequent flushes.
+- [ ] **Resolve ambiguous commits without waiting.** A client must currently
+      wait for the 15 s commit deadline to pass before calling
+      `GET /commits/{id}` (SPEC §6.2). Record the commit ID as aborted
+      during the status check's fencing manifest write so that late commit
+      attempts are rejected and the status check can return immediately.
+- [ ] **Reduce CPU usage per request.** Profiles at 340 commits/s on a
+      single core show hotspots in memory allocation, `serde_json` response
+      serialization, segment key comparisons, and manifest zstd compression.
+- [ ] **Replace the sharded LRU block cache with a CLOCK cache.** On a cache
+      hit, a thread currently acquires an exclusive shard lock to update the
+      LRU list. With a CLOCK eviction policy, cache hits can be served under a
+      shared lock.
+- [ ] **Tune the inline WAL tail limit.** Median commit latency on Tigris
+      increases from 36 ms with an empty tail to 84 ms with a full 256 KiB
+      tail. Lowering the tail limit reduces commit latency at the cost of
+      more frequent L0 flushes.
 
 ## Features
 

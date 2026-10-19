@@ -114,8 +114,6 @@ enum ReadKind {
     LocalGet,
     ReadOnlyTxn,
     ReadWriteTxn,
-    /// Read in `begin`, then commit, with a write or read-only. The read
-    /// counts only once the commit succeeds.
     Interactive {
         write: bool,
     },

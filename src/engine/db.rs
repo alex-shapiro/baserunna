@@ -309,8 +309,6 @@ impl Db {
         !self.own_lease_left(st, m).is_zero()
     }
 
-    /// Records the lease in `m`, if it is ours, as renewed by a manifest
-    /// write sent at `sent`.
     fn note_own_lease(&self, m: &Manifest, sent: Instant) {
         if let Some(l) = m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
             let margin = self.shared.cfg.lease_margin_ms.min(l.ms);
@@ -873,7 +871,6 @@ impl Db {
     async fn process(self: &Arc<Self>, batch: Vec<Work>) {
         let cfg = self.shared.cfg.clone();
         let mut maybe_applied = false;
-        // The write seq and send time of each manifest write that may have applied.
         let mut unknown_writes: Vec<(u64, Instant)> = Vec::new();
         let mut attempt = 0u32;
         let mut base = match self.base_for_commit().await {
@@ -962,10 +959,9 @@ impl Db {
                     maybe_applied = true;
                     unknown_writes.push((m.write_seq, attempt_started));
                     self.st().trusted = false;
-                    // If this write applied, it dropped these objects from
-                    // `obsolete`, and no later write would delete them. They
-                    // are past their grace period, so deleting them is safe
-                    // either way.
+                    // If the write was applied, `plan.gc` was removed from `obsolete` in the manifest.
+                    // These objects have already passed their grace period, so they can be deleted safely
+                    // even if the write failed.
                     self.delete_obsolete(plan.gc);
                 }
                 Err(e) => {
@@ -989,8 +985,6 @@ impl Db {
             loop {
                 match self.refresh(Instant::now(), false).await {
                     Ok(v) => {
-                        // A write of ours that applied renewed our lease as
-                        // of when it was sent; the earliest send is safe.
                         let sent = unknown_writes.iter().filter(|(ws, _)| *ws == v.m.write_seq).map(|(_, s)| *s).min();
                         if let Some(sent) = sent {
                             self.note_own_lease(&v.m, sent);
@@ -1012,14 +1006,10 @@ impl Db {
         }
     }
 
-    /// Writes the manifest if its etag is still `etag`. When the store has
-    /// not answered within `manifest_put_hedge_ms`, a second copy is sent;
-    /// both carry the same precondition, so at most one applies. Either
-    /// success decides the attempt. If the second copy is refused first, the
-    /// result is ambiguous at once: the slow first copy may have applied, and
-    /// the caller learns the outcome from the commit records of the manifest
-    /// it reloads. Otherwise a failure waits for the other copy, and is
-    /// ambiguous if either copy's outcome is unknown.
+    /// Writes the manifest with `If-Match: etag`, sending a duplicate `PUT` if the first does not
+    /// complete within `manifest_put_hedge_ms`. If the duplicate fails with `PreconditionFailed`
+    /// while the first `PUT` is still in flight, returns `StoreError::Unavailable` immediately
+    /// because the first `PUT` may have been applied.
     async fn put_manifest(&self, data: Bytes, etag: &str) -> crate::store::SResult<String> {
         let key = manifest_key(&self.id);
         let put = || self.shared.store.put(&key, data.clone(), PutMode::IfMatch(etag.to_string()));
@@ -1035,7 +1025,7 @@ impl Db {
         }
         self.shared.counters.add(&super::Activity { manifest_puts_hedged: 1, ..Default::default() });
         let ambiguous =
-            || StoreError::Unavailable("hedged manifest write refused; the other copy may have applied".into());
+            || StoreError::Unavailable("hedged manifest write rejected; the first write may have been applied".into());
         let mut hedge = put();
         let (r, hedge_won) = match race(&mut first, &mut hedge).await {
             Either::Left(r) => (r, false),
@@ -1451,7 +1441,6 @@ impl Db {
         Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, activity, due })
     }
 
-    /// Deletes obsolete objects past their grace period, in the background.
     fn delete_obsolete(&self, gc: Vec<Obsolete>) {
         if gc.is_empty() {
             return;
@@ -1996,7 +1985,6 @@ mod tests {
 
     use crate::store::{BoxFut, GetResult, ListPage, ObjectStore};
 
-    /// A store whose puts answer from a script of `(delay_ms, result)`.
     struct Scripted(std::sync::Mutex<VecDeque<(u64, crate::store::SResult<String>)>>);
 
     impl ObjectStore for Scripted {
@@ -2004,7 +1992,7 @@ mod tests {
             Box::pin(async { Err(StoreError::NotFound) })
         }
         fn put<'a>(&'a self, _: &'a str, _: Bytes, _: PutMode) -> BoxFut<'a, crate::store::SResult<String>> {
-            let (ms, r) = self.0.lock().unwrap().pop_front().expect("an unscripted put");
+            let (ms, r) = self.0.lock().unwrap().pop_front().expect("unexpected put");
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
                 r
@@ -2030,7 +2018,7 @@ mod tests {
             store.manifest_put_lost.store(1, SeqCst);
             put(&db, "k", "2").await;
             let cur = db.current().unwrap();
-            assert!(db.holds_lease(&db.st(), &cur.m), "the lease the lost write renewed is held");
+            assert!(db.holds_lease(&db.st(), &cur.m));
         });
     }
 
@@ -2040,7 +2028,6 @@ mod tests {
         let ok = || Ok::<_, StoreError>("e2".to_string());
         let down = || Unavailable("timeout".into());
         let fatal = || Fatal("403".into());
-        // (first copy, hedge sent at 250 ms) -> (result, ms until it is known)
         let cases = [
             ((100, ok()), None, Ok(()), 100),
             ((1_000, ok()), Some((10, Err(Refused))), Err(down()), 260),

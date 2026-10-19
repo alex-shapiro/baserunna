@@ -17,7 +17,6 @@ pub type Tracer = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct Env {
     clock: Clock,
-    /// The simulation's seeded generator; real environments use OS randomness, which needs no lock.
     rng: Option<Mutex<Rng>>,
     tasks: Mutex<JoinSet<()>>,
     tracer: Mutex<Option<Tracer>>,

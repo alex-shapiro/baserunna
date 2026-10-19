@@ -1,6 +1,5 @@
-//! Baserunna: a horizontally scalable service hosting many small,
-//! transactional key-value and table databases on object storage.
-//! See `SPEC.md` for the design.
+//! Object storage database host with stateless compute nodes.
+//! See `SPEC.md` for full design.
 
 #![forbid(unsafe_code)]
 #![recursion_limit = "512"]

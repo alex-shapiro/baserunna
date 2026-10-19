@@ -2,12 +2,11 @@
 name = "baserunna"
 version = "0.1.0"
 edition = "2024"
-description = "Horizontally scalable, object-storage-backed transactional KV, table and stream databases"
-license = "MIT OR Apache-2.0"
+description = "object storage database host"
+license = "AGPLv3"
 
 [features]
 default = ["cloud"]
-# Real cloud object stores (S3, GCS, Azure) and outbound HTTPS for Google OAuth.
 cloud = ["dep:object_store", "dep:reqwest"]
 
 [dependencies]

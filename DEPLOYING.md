@@ -234,3 +234,20 @@ Rate limits are enforced per node, so an N-node cluster allows up to N times the
 | `BASERUNNA_AUTH_RPS_PER_CLIENT`         | 1       | sign-ins and sign-ups per client address     |
 | `BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT` | 20      | accounts created per client address          |
 | `BASERUNNA_HASH_CONCURRENCY`            | CPUs    | password hashes computed at once             |
+
+## Configuration
+
+Each node is configured through environment variables. The main ones are below; [`SPEC.md`](SPEC.md) §12 contains the full list:
+
+| variable                                 | default                   |                                                                     |
+| ---------------------------------------- | ------------------------- | ------------------------------------------------------------------- |
+| `BASERUNNA_STORE`                        | `fs:./data`               | `fs:<dir>`, `mem:`, `s3://bucket/prefix`, `gs://…`, `az://…`        |
+| `BASERUNNA_LISTEN`                       | `0.0.0.0:8080`            |                                                                     |
+| `BASERUNNA_ADVERTISE`                    | `http://127.0.0.1:<port>` | URL that peers use to reach this node                               |
+| `BASERUNNA_PUBLIC_URL`                   | advertise URL             | browser-facing URL (OAuth redirect, mailed links, `Secure` cookies) |
+| `BASERUNNA_CLUSTER_SECRET`               | none                      | protects internal endpoints in multi-node clusters                  |
+| `BASERUNNA_SIGNUP`                       | `first_user_only`         | `open`, `first_user_only`, or `closed`                              |
+| `BASERUNNA_ADMIN_EMAIL` / `_PASSWORD`    | none                      | bootstrap an admin account                                          |
+| `BASERUNNA_GOOGLE_CLIENT_ID` / `_SECRET` | none                      | enables "Sign in with Google"                                       |
+| `BASERUNNA_MAIL_WEBHOOK_URL`             | none                      | enables verification and password reset mail                        |
+| `BASERUNNA_LOG`                          | `info`                    | `error` / `warn` / `info` (logs every request) / `debug` / `off`    |

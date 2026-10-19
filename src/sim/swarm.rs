@@ -216,9 +216,10 @@ fn engine_knobs(k: &Knobs, c: &mut SimConfig) {
     e.l0_compaction_max_inputs = k.range("engine.l0_compaction_max_inputs", 2, 12) as usize;
     e.level_size_ratio = k.range("engine.level_size_ratio", 2, 10);
     e.level_base_bytes = k.log_range("engine.level_base_bytes", 2 * 1024, 64 * 1024);
-    // A cache smaller than a few blocks misses on every read, so a large
-    // request outlasts its commit deadline on each retry.
-    e.cache_bytes = (k.log_range("engine.cache_bytes", 4 * 1024, 4 * 1024 * 1024) as usize).max(8 * e.block_target);
+    // A cache that cannot hold a few blocks and segment indexes misses on
+    // every read, so a large request outlasts its commit deadline on each
+    // retry; no real node runs so.
+    e.cache_bytes = (k.log_range("engine.cache_bytes", 64 * 1024, 4 * 1024 * 1024) as usize).max(8 * e.block_target);
     e.range_delete_points_max = k.log_range("engine.range_delete_points_max", 1, 300) as usize;
     e.levels_inline_max = k.range("engine.levels_inline_max", 1, 16) as usize;
     e.stream_seal_min_bytes = k.log_range("engine.stream_seal_min_bytes", 256, 16 * 1024) as usize;

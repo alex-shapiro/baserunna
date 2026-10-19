@@ -303,7 +303,9 @@ async fn role_changes(sim: &Arc<Sim>, owner: &User, others: &[User; 3]) -> Resul
     }
     let granted = attempts.iter().filter(|a| a.status == 200).count();
     let refused = attempts.iter().filter(|a| a.status == 403 || a.status == 404).count();
-    expect(granted > 0 && refused > 0, format!("too few decisions to check: {granted} granted, {refused} refused"))
+    // Which decisions a run sees depends on its world (a long role cache can
+    // refuse every write); it must see some.
+    expect(granted + refused > 0, format!("no decisions to check: {granted} granted, {refused} refused"))
 }
 
 /// Verifies that each write response matches a role held within `lag` before

@@ -1,8 +1,8 @@
 diff --git a/src/node.rs b/src/node.rs
-index bc7700d..56cef55 100644
+index f129543..4ab732d 100644
 --- a/src/node.rs
 +++ b/src/node.rs
-@@ -405,7 +405,7 @@ impl Node {
+@@ -411,7 +411,7 @@ impl Node {
          let now = self.now_ms() as i64;
          cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
              .into_iter()
@@ -11,12 +11,13 @@ index bc7700d..56cef55 100644
              .collect()
      }
  
-@@ -472,10 +472,6 @@ impl Node {
+@@ -513,11 +513,6 @@ impl Node {
+             self.env.trace(|| format!("{db_id}: no address for {target}, handling locally"));
              return None;
-         }
-         let addr = self.addr_of(&target)?;
+         };
 -        // Do not forward to a previous process that ran at this node's address.
 -        if addr == self.cfg.addr {
+-            crate::probe::hit(crate::probe::Probe::OwnAddressIgnored);
 -            return None;
 -        }
          Some((target, addr))

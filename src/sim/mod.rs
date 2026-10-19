@@ -575,7 +575,9 @@ impl Sim {
         for attempt in 0..50u64 {
             let env = Arc::new(Env::sim(self.seed ^ (n * 7919 + attempt + 1), self.base_ms, self.origin, skew));
             let me = self.me.clone();
-            env.set_crash_hook(Arc::new(move |why: &str| me.upgrade().is_some_and(|sim| sim.crash_at_point(i, n, why))));
+            env.set_crash_hook(Arc::new(move |why: &str| {
+                me.upgrade().is_some_and(|sim| sim.crash_at_point(i, n, why))
+            }));
             if self.cfg.keep_log {
                 let trace = self.trace.clone();
                 let base = self.base_ms;
@@ -744,6 +746,15 @@ impl Sim {
             n.node.env.resume();
             sim.trace.event(&format!("resume n{i}"));
         });
+    }
+
+    /// Resumes every paused node.
+    pub fn resume_all(&self) {
+        for i in self.up_nodes() {
+            if let Some(n) = self.node(i) {
+                n.node.env.resume();
+            }
+        }
     }
 
     pub fn step_clock(&self, i: usize, delta_ms: i64) {

@@ -35,6 +35,8 @@ struct State {
     p_active: f64,
     faults: bool,
     crashes: bool,
+    /// Whether faults and crashes may fire now (see [`quiesce`]).
+    quiet: bool,
     sites: BTreeMap<(&'static str, u32, u32), Site>,
 }
 
@@ -60,7 +62,18 @@ pub fn enable(seed: u64, c: Config) {
     let (rng, order) = (Rng::new(seed), Rng::new(seed ^ 0x5eed));
     let Config { p_active, faults, crashes, p_reorder } = c;
     STATE.with(|s| {
-        *s.borrow_mut() = Some(State { rng, order, p_reorder, p_active, faults, crashes, sites: BTreeMap::new() })
+        let sites = BTreeMap::new();
+        *s.borrow_mut() = Some(State { rng, order, p_reorder, p_active, faults, crashes, quiet: false, sites })
+    });
+}
+
+/// Stops fault sites and crash points from firing while `quiet`, as while a
+/// simulation checks a cluster that should have recovered.
+pub fn quiesce(quiet: bool) {
+    STATE.with(|s| {
+        if let Some(st) = s.borrow_mut().as_mut() {
+            st.quiet = quiet;
+        }
     });
 }
 
@@ -89,7 +102,7 @@ fn fire_at(loc: &'static Location<'static>, p: f64, kind: Kind) -> bool {
     STATE.with(|s| {
         let mut g = s.borrow_mut();
         let Some(st) = g.as_mut() else { return false };
-        if (kind == Kind::Fault && !st.faults) || (kind == Kind::Crash && !st.crashes) {
+        if (kind == Kind::Fault && (!st.faults || st.quiet)) || (kind == Kind::Crash && (!st.crashes || st.quiet)) {
             return false;
         }
         let key = (loc.file(), loc.line(), loc.column());

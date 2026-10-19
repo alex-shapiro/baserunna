@@ -1,11 +1,11 @@
 diff --git a/src/engine/db.rs b/src/engine/db.rs
-index 3a4eb24..812ee81 100644
+index 0e2dd5a..7581cf5 100644
 --- a/src/engine/db.rs
 +++ b/src/engine/db.rs
-@@ -1120,14 +1120,6 @@ impl Db {
-                         None => committed(base, req.commit_id).await?,
+@@ -1190,14 +1190,6 @@ impl Db {
                      };
                      if let Some(c) = applied {
+                         probe::hit(Probe::CommitReplayed);
 -                        // The attempt that applied it may not have lived to
 -                        // schedule the trims its retention calls for.
 -                        let at = pending(base, &m, &tail);
@@ -17,7 +17,7 @@ index 3a4eb24..812ee81 100644
                          outcomes.push(Outcome::Seq(Ok(c)));
                          continue;
                      }
-@@ -1521,6 +1513,9 @@ impl Db {
+@@ -1613,6 +1605,9 @@ impl Db {
      async fn trim_for_retention(self: &Arc<Self>, id: u64) -> Result<()> {
          let Some(now) = self.shared.store_now_ms() else { return Ok(()) };
          let Some(v) = self.current() else { return Ok(()) };

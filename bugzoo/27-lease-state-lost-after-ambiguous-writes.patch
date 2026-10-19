@@ -1,13 +1,14 @@
 diff --git a/src/engine/db.rs b/src/engine/db.rs
-index 3a4eb24..179a161 100644
+index 0e2dd5a..1306528 100644
 --- a/src/engine/db.rs
 +++ b/src/engine/db.rs
-@@ -985,10 +985,6 @@ impl Db {
+@@ -1048,11 +1048,6 @@ impl Db {
              loop {
                  match self.refresh(Instant::now(), false).await {
                      Ok(v) => {
 -                        let sent = unknown_writes.iter().filter(|(ws, _)| *ws == v.m.write_seq).map(|(_, s)| *s).min();
 -                        if let Some(sent) = sent {
+-                            probe::hit(Probe::AmbiguousWriteLanded);
 -                            self.note_own_lease(&v.m, sent);
 -                        }
                          base = v;

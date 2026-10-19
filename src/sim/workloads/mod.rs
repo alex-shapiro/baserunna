@@ -34,8 +34,17 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
     sim.sleep(100 + sim.rand_below(c.pause_ms)).await;
     let n = sim.node_count();
     let up = sim.up_nodes();
-    let weights =
-        [c.crash, c.start, c.partition, c.one_way_partition, c.store_isolation, c.clock_step, c.heal, c.quiet, c.pause_node];
+    let weights = [
+        c.crash,
+        c.start,
+        c.partition,
+        c.one_way_partition,
+        c.store_isolation,
+        c.clock_step,
+        c.heal,
+        c.quiet,
+        c.pause_node,
+    ];
     let mut r = sim.fork_rng();
     let Some(action) = super::swarm::weighted(&mut r, &weights) else {
         return;
@@ -91,9 +100,10 @@ pub async fn admin(sim: &Arc<Sim>) -> Result<Client, String> {
 pub const ADMIN_EMAIL: &str = "root@sim.test";
 pub const ADMIN_PASSWORD: &str = "root-password";
 
-/// Heals network partitions and restarts all crashed nodes.
+/// Heals network partitions, resumes paused nodes and restarts crashed ones.
 pub async fn recover(sim: &Arc<Sim>) {
     sim.heal();
+    sim.resume_all();
     for i in 0..sim.node_count() {
         if sim.node(i).is_none() {
             sim.start(i).await;
@@ -186,6 +196,7 @@ pub fn chaos_phase(sim: &Arc<Sim>) -> ChaosPhase {
     let mut st = sim.chaos.lock().unwrap_or_else(|e| e.into_inner());
     st.active += 1;
     if st.task.is_none() {
+        crate::buggify::quiesce(false);
         st.task = Some(spawn_chaos(sim));
     }
     ChaosPhase { sim: sim.clone(), open: true }
@@ -204,6 +215,7 @@ impl ChaosPhase {
         if let Some(t) = st.task.take() {
             t.abort();
         }
+        crate::buggify::quiesce(true);
         Some(st.ended)
     }
 

@@ -1,5 +1,5 @@
 diff --git a/src/api/data.rs b/src/api/data.rs
-index 6f92d1e..64ccb3c 100644
+index 943737b..fd10bf6 100644
 --- a/src/api/data.rs
 +++ b/src/api/data.rs
 @@ -152,22 +152,7 @@ pub async fn create_db(
@@ -27,18 +27,19 @@ index 6f92d1e..64ccb3c 100644
      Ok((StatusCode::CREATED, axum::Json(summary)).into_response())
  }
 diff --git a/src/api/mod.rs b/src/api/mod.rs
-index 0983090..97e38c0 100644
+index 0b6bed6..05a9c21 100644
 --- a/src/api/mod.rs
 +++ b/src/api/mod.rs
-@@ -360,11 +360,6 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
+@@ -366,12 +366,6 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
              Err(m) => {
                  let (fresh, fresh_access) = node.resolve_db_strong(&principal, &name).await?;
                  if fresh.id == rec.id {
 -                    // Finish any interrupted deletion where the manifest was marked deleted before metadata removal.
+-                    probe::hit(Probe::DeletionRepaired);
 -                    match node.run_meta(crate::meta::MetaCmd::DeleteDb { id: rec.id.clone() }).await {
 -                        Ok(_) | Err(Error::NotFound(_)) => node.forget_db_name(&rec.owner_id, &rec.name),
 -                        Err(e) => return Err(e),
 -                    }
                      return Err(Error::NotFound(m));
                  }
-                 (rec, access) = (fresh, fresh_access);
+                 probe::hit(Probe::NameResolvedAgain);

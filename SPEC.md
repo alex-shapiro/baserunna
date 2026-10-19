@@ -1378,7 +1378,8 @@ Each workload checks what its clients saw against a model, and ends its
 checks after a **chaos phase**: workloads running together share one chaos
 loop, which runs while any of them is in its phase, and ending a phase
 waits for every other phase to end and for the cluster to recover, so
-final checks run without faults. The `mix` scenario runs a random subset
+final checks run without chaos, crash points or buggify faults; store and
+network faults keep their rates, which clients ride out with retries. The `mix` scenario runs a random subset
 of at least two workloads in one cluster; workloads that need an
 administrator share the first account. A run that takes over six hours of
 virtual time fails: some workload stopped making progress.
@@ -1437,7 +1438,7 @@ the records it claims, with no overlap within a stream.
 - **Campaigns** (`sim_tool campaign`) run seeds of every scenario on every
   core and report each probe's share of runs and the scenarios that reach
   it. CI runs the test suite and a ten-minute campaign of fresh seeds on
-  every push; at night it runs five hours, which must reach the rare
+  pull requests and pushes to main; at night it runs five hours, which must reach the rare
   probes too, and an hour of exploration. A failure prints its
   reproduction command.
 - **Guided exploration** (`sim_tool explore`, `sim::explore`) spends half
@@ -1453,9 +1454,9 @@ the records it claims, with no overlap within a stream.
   runs. Campaigns and exploration complement each other.
 - **Bug zoo** (`bugzoo/`): a patch per historic bug in §13.6 reintroduces
   it, and `bugzoo/run.sh` measures how many runs of a strategy find each.
-  Given about 2,800 runs per bug, the simulator before this section's
-  design rediscovered 14 of 27 bugs, the current campaigns 17, and
-  campaigns with exploration 20.
+  Given about 2,800 campaign runs per bug, the simulator before this
+  section's design rediscovered 14 of 27 bugs and the current campaigns
+  17; 2,000 more runs of exploration raised that to 20.
 
 ### 13.5 Other test layers
 
@@ -1761,7 +1762,7 @@ Bugs the DST suite found, each now covered by the regular suite:
     if it names the row. Found with one-row backfill batches racing row
     deletes, in a mix of workloads.
 
-The cost measurements (§13.4) found five more: a read-heavy database whose
+The cost measurements (§13.5) found five more: a read-heavy database whose
 lease had lapsed never acquired it again (paying a validating GET per read
 forever), a strong read without a lease validated the manifest twice,
 shortening the lease doubled read-only renewals (they now take the longer

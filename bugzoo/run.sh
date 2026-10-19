@@ -24,7 +24,7 @@ if [ $# -eq 0 ]; then
   exit 2
 fi
 cd "$(git rev-parse --show-toplevel)" || exit 1
-if ! git diff --quiet -- . ':!bugzoo'; then
+if ! git diff --quiet HEAD -- . ':!bugzoo'; then
   echo "the working tree has uncommitted changes; commit or stash them first" >&2
   exit 1
 fi

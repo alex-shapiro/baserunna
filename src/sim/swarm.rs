@@ -31,7 +31,8 @@ impl Knobs {
         for b in name.bytes() {
             h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3);
         }
-        Rng::new(self.seed ^ h)
+        // A branched run keeps its parent's knobs, whenever it draws them.
+        Rng::unbranched(self.seed ^ h)
     }
 
     fn note<T: Debug>(&self, name: &'static str, v: T) -> T {
@@ -135,7 +136,8 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
     engine_knobs(k, &mut c);
     node_knobs(k, &mut c);
     // Some worlds are calm: no faults at all, so throughput is high.
-    if p.faults && !k.chance("world.calm", 0.1) {
+    let faulty = p.faults && !k.chance("world.calm", 0.1);
+    if faulty {
         let lease = c.engine.lease_ms;
         let stalls = k.rate("store.p_stall", 0.004);
         c.store = StoreFaults {
@@ -195,9 +197,9 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
     c.reorder = k.pick("sched.reorder", &[0.0, 0.05, 0.2, 0.5]);
     c.disk = DiskFaults {
         bytes: k.pick("disk.bytes", &[0, 4 * 1024, 64 * 1024, 1024 * 1024]),
-        p_lose: if p.faults { k.rate("disk.p_lose", 0.02) } else { 0.0 },
-        p_drop_write: if p.faults { k.rate("disk.p_drop_write", 0.02) } else { 0.0 },
-        p_corrupt: if p.faults { k.rate("disk.p_corrupt", 0.002) } else { 0.0 },
+        p_lose: if faulty { k.rate("disk.p_lose", 0.02) } else { 0.0 },
+        p_drop_write: if faulty { k.rate("disk.p_drop_write", 0.02) } else { 0.0 },
+        p_corrupt: if faulty { k.rate("disk.p_corrupt", 0.002) } else { 0.0 },
     };
     c
 }

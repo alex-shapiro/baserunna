@@ -33,6 +33,8 @@ fn branch_salt() -> u64 {
 #[derive(Clone, Debug)]
 pub struct Rng {
     s: [u64; 4],
+    /// Whether branch points change this generator's draws.
+    branched: bool,
 }
 
 fn splitmix64(state: &mut u64) -> u64 {
@@ -47,7 +49,13 @@ impl Rng {
     pub fn new(seed: u64) -> Rng {
         let mut st = seed;
         let s = [splitmix64(&mut st), splitmix64(&mut st), splitmix64(&mut st), splitmix64(&mut st)];
-        Rng { s }
+        Rng { s, branched: true }
+    }
+
+    /// A generator whose draws no branch point changes, for what must stay
+    /// the same along every branch of a run.
+    pub fn unbranched(seed: u64) -> Rng {
+        Rng { branched: false, ..Rng::new(seed) }
     }
 
     /// Derive an independent generator.
@@ -64,7 +72,7 @@ impl Rng {
         self.s[0] ^= self.s[3];
         self.s[2] ^= t;
         self.s[3] = self.s[3].rotate_left(45);
-        match branch_salt() {
+        match if self.branched { branch_salt() } else { 0 } {
             0 => result,
             salt => {
                 let mut x = result ^ salt;

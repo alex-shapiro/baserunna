@@ -566,6 +566,11 @@ impl Node {
     }
 
     async fn run_meta_json(&self, cmd: MetaCmd) -> Result<Json> {
+        // Every attempt, local or forwarded, shares one deadline.
+        with_deadline(self.meta_deadline(), self.run_meta_attempts(cmd)).await
+    }
+
+    async fn run_meta_attempts(&self, cmd: MetaCmd) -> Result<Json> {
         let sys = self.engine.db(SYS_DB);
         let deadline = self.meta_deadline();
         let mut last_err = Error::unavailable("system database unavailable");
@@ -1085,7 +1090,7 @@ impl Node {
             self.token_link("/console/reset", auth::TokenPurpose::Reset, &user, &meta::password_fp(&user), &RESET_LINK);
         let text = format!(
             "Someone asked to reset the password of your Baserunna account. To choose a new one, open\n\n{link}\n\n\
-             The link is valid for {} and works once. If you did not ask for it, ignore this email.",
+             The link is valid for {} and sets one password. If you did not ask for it, ignore this email.",
             RESET_LINK.words
         );
         self.send_mail(mailer, Mail { to: email, subject: "Reset your Baserunna password".into(), text });
@@ -1102,15 +1107,19 @@ impl Node {
         }
         if meta::password_fp(&user) != fp {
             // An earlier attempt with this link may have set this very
-            // password and failed afterwards: finish it, as a retry expects.
+            // password and failed afterwards: a retry finishes it. Checking
+            // the password makes a used link a sign-in, so it takes the
+            // account's sign-in backoff.
+            let (lim, account) = (&self.cfg.limits, Self::failures_of(&user.email));
+            self.limiter.check_backoff(&[&account], "failed sign-ins")?;
             let Some(h) = user.password_hash.clone() else { return Err(used()) };
             let pw = password.to_string();
             if !self.hashing(move || auth::verify_password(&pw, &h)).await? {
+                self.limiter.failed(&account, lim.account_free_failures, lim);
                 return Err(used());
             }
             crate::probe::hit(crate::probe::Probe::PasswordResetFinished);
-            let session = self.create_session(&user.id, Some(client), SignInMethod::Reset).await?;
-            return Ok((user, session));
+            return self.finish_reset(client, &user).await;
         }
         let hash = self.hash_password(password).await?;
         let set = MetaCmd::SetPassword {
@@ -1122,6 +1131,12 @@ impl Node {
         };
         self.run_meta(set).await.map_err(|e| if matches!(e, Error::PreconditionFailed { .. }) { used() } else { e })?;
         self.env.crash_point().await;
+        self.finish_reset(client, &user).await
+    }
+
+    /// What follows setting a reset password: other sessions end, failed
+    /// sign-ins are forgiven, and the client gets a session.
+    async fn finish_reset(&self, client: &str, user: &User) -> Result<(User, String)> {
         self.forget_user(&user.id);
         self.delete_ended_sessions(&user.id, None).await;
         self.limiter.succeeded(&Self::failures_of(&user.email));

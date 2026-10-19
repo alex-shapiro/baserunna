@@ -172,6 +172,16 @@ mod tests {
     }
 
     #[test]
+    fn crash_points_are_sites_of_their_own() {
+        let env = crate::env::Env::sim(1, 0, tokio::time::Instant::now(), 0);
+        env.set_crash_hook(std::sync::Arc::new(|_| false));
+        enable(1, Config { p_active: 1.0, crashes: true, ..Config::default() });
+        drop(env.crash_point());
+        drop(env.crash_point());
+        assert_eq!(disable().sites.len(), 2);
+    }
+
+    #[test]
     fn activation_is_decided_once_per_site() {
         let mut seen = std::collections::BTreeSet::new();
         for seed in 0..50 {

@@ -51,6 +51,27 @@ scenario_tests! {
     sim_accounts: "accounts", 21, 2;
 }
 
+/// A branched run repeats its parent up to its branch point and differs
+/// after it, the same way every time (SPEC §13.1).
+#[test]
+fn branched_runs_repeat_their_parent_until_the_branch_point() {
+    let s = scenario("history").expect("scenario exists");
+    let run_at = |branches: Vec<(u64, u64)>| {
+        let mut cfg = s.config_for(7);
+        cfg.branches = branches;
+        let out = run(7, cfg, s.run);
+        assert!(out.result.is_ok(), "{:?}", out.result);
+        (out.trace_hash, out.knobs)
+    };
+    let (parent, knobs) = run_at(vec![]);
+    let (late, _) = run_at(vec![(u64::MAX / 2, 0xabc)]);
+    assert_eq!(late, parent, "a branch point past the run's end changes nothing");
+    let (early, early_knobs) = run_at(vec![(1_000, 0xabc)]);
+    assert_ne!(early, parent, "an early branch point changes the run");
+    assert_eq!(early_knobs, knobs, "a branch keeps its parent's knobs");
+    assert_eq!(run_at(vec![(1_000, 0xabc)]).0, early, "a branched run is deterministic");
+}
+
 #[test]
 fn sim_is_deterministic() {
     let s = scenario("mix").expect("scenario exists");

@@ -123,21 +123,19 @@ impl Owner {
         self.step += 1;
         let body = json!({"ops": ops, "idempotency_key": format!("{}-{}", self.c.name, self.step)});
         let t0 = self.c.sim.now_ms();
-        let e = &self.c.sim.cfg.engine;
-        let dedup_until = t0 + e.commit_retention_ms - 2 * e.clock_sync_max_error_ms;
         let mut ambiguous = false;
         loop {
+            if ambiguous && !self.c.dedups(t0) {
+                return Ok(None);
+            }
             match self.c.call("POST", &self.path("/txn"), Some(body.clone())).await {
-                Ok(r) if r.code() == "conflict" || (r.retryable_not_applied() && !ambiguous) => self.c.pause(50).await,
+                Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => self.c.pause(50).await,
                 Ok(r) if r.status == 200 || (400..500).contains(&r.status) && r.status != 429 => {
                     return Ok(Some((r, t0)));
                 }
                 _ => {
                     ambiguous = true;
                     self.c.pause(ZOMBIE_WAIT_MS).await;
-                    if self.c.sim.now_ms() >= dedup_until {
-                        return Ok(None);
-                    }
                 }
             }
         }
@@ -240,7 +238,10 @@ impl Owner {
             self.rows.iter().filter(|(_, (t, _))| *t == token).map(|(id, (_, v))| (*id, v.clone())).collect();
         let op = json!({"op": "insert_row", "table": "sess", "row": {"id": id, "token": token}, "ttl_ms": ttl});
         let Some((r, t0)) = self.commit(json!([op])).await? else {
-            self.rows.insert(id, (token, Val::uncertain()));
+            // No attempt applies once the commit gives up, so the row is
+            // gone a TTL later at the latest.
+            let gone = self.c.sim.now_ms() + ttl + self.eps;
+            self.rows.insert(id, (token, Val { expires: Some((0, gone)), ..Val::uncertain() }));
             return Ok(());
         };
         let t1 = self.c.sim.now_ms();
@@ -315,7 +316,6 @@ impl Owner {
             let wait = hi.saturating_sub(self.c.sim.now_ms()) + 2 * self.eps;
             self.c.pause(wait).await;
         }
-        let uncertain_rows = self.rows.values().any(|(_, v)| v.uncertain);
         self.model.retain(|_, v| v.expires.is_none());
         self.rows.clear();
         let r = self.c.call_retry("GET", &self.path("/kv?prefix=k/&limit=100"), None).await;
@@ -327,7 +327,7 @@ impl Owner {
             return Err(format!("after every expiry: keys {keys:?}, want {sure:?}"));
         }
         let q = self.c.call_retry("POST", &self.path("/tables/sess/rows/query"), Some(json!({}))).await;
-        if !uncertain_rows && q.json["rows"].as_array().is_none_or(|r| !r.is_empty()) {
+        if q.json["rows"].as_array().is_none_or(|r| !r.is_empty()) {
             return Err(format!("expired rows still read: {}", q.json));
         }
         // Trigger compaction over the expired data.

@@ -492,6 +492,9 @@ pub async fn validate(
             ),
         };
         if changed || overlapped {
+            if !changed {
+                crate::probe::hit(crate::probe::Probe::CommitConflictInBatch);
+            }
             return Err(Error::Conflict("transaction conflicts with a concurrent commit".into()));
         }
     }

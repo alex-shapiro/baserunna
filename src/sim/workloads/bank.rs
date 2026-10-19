@@ -3,7 +3,7 @@
 //! strong and snapshot reads, and final balances match committed transfers.
 
 use super::super::Sim;
-use super::super::client::{Client, Status};
+use super::super::client::Client;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -105,21 +105,10 @@ async fn transfer(c: &Client, db: &str, a: usize, b: usize, amt: i64, id: &str) 
             }
             Ok(r) if r.status != 503 => return Err(format!("commit: {} {}", r.status, r.json)),
             _ => {
-                // Ambiguous: wait out zombies, then query fenced commit status.
+                // Ambiguous: wait out zombies, then resolve it.
                 c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
-                match c.commit_status(db, &cid, began).await? {
-                    Status::Committed(_) => return Ok(true),
-                    Status::NotCommitted => continue,
-                    // The commit record may be gone: the marker tells.
-                    Status::Unknown => {
-                        let path = format!("{base}/kv/{}", super::super::client::url_escape(marker.as_bytes()));
-                        let m = c.call_retry("GET", &path, None).await;
-                        match m.status {
-                            200 => return Ok(true),
-                            404 => continue,
-                            s => return Err(format!("marker {marker}: {s} {}", m.json)),
-                        }
-                    }
+                if c.resolve(db, &cid, began, &marker).await? {
+                    return Ok(true);
                 }
             }
         }

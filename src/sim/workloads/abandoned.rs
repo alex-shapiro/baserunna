@@ -2,7 +2,7 @@
 //! move between nodes.
 
 use super::super::Sim;
-use super::super::client::{Client, Status, ZOMBIE_WAIT_MS};
+use super::super::client::{Client, ZOMBIE_WAIT_MS};
 use serde_json::{Value as Json, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -72,15 +72,7 @@ async fn one(c: &Client, marker: &str, isolation: &str, fate: Fate, tally: &mut 
         Ok(r) if !r.outcome_unknown() => return Err(format!("commit: {} {}", r.status, r.json)),
         _ => {
             c.pause(ZOMBIE_WAIT_MS).await;
-            match c.commit_status("limbo", &cid, began).await? {
-                Status::Committed(_) => true,
-                Status::NotCommitted => false,
-                // The commit record may be gone: the marker tells.
-                Status::Unknown => {
-                    let path = format!("{BASE}/kv/{}", super::super::client::url_escape(marker.as_bytes()));
-                    c.call_retry("GET", &path, None).await.status == 200
-                }
-            }
+            c.resolve("limbo", &cid, began, marker).await?
         }
     };
     if committed {

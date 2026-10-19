@@ -62,37 +62,13 @@ shows the patch's symptom.
 | 27 | lease state lost after ambiguous writes | 0 · 1 | 0 · 0 · 2 |
 | 28 | stale authorization after a slow read | 0 · 0 | 0 · 0 · 0 |
 
-Over about 2,800 runs per bug, the old simulator rediscovered 14 of the 27
-bugs, the new simulator's campaigns 17, and its campaigns with guided
-exploration 20. Exploration alone found 22, 23 and 27 in round 2, which
-no campaign of either simulator did. Bugs 09, 10, 13, 16, 24, 26 and 28
-escaped every strategy; unit tests catch 16 and 26.
-
-## Unit tests
-
-At the commit that added the zoo (before SPEC §13's rewrite, whose tests
-these names refer to), `cargo test --release --lib --test sim` passed. With a
-patch applied, these tests fail:
-
-| patch | failing tests |
-| ----- | ------------- |
-| 01 | 18 tests in `tests/sim.rs`, among them `sim_lifecycle`, `sim_many_db_churn`, `sim_hostile` |
-| 02 | `sim_blobs_and_gc`, `sim_blob_reads_race_gc`, `sim_schema_changes_race_row_writes`, `sim_streams`, `sim_hostile` |
-| 03 | `group_commit_batches_concurrent_commits`, `a_range_delete_spares_its_own_transactions_writes`, `sim_register_linearizability`, `sim_register_contended`, `sim_hostile` |
-| 04 | `strong_reads_wait_for_the_write_in_flight`, `optimistic_txn_revalidation`, `optimistic_stream_revalidation`, `sim_register_contended`, `sim_hostile` |
-| 07 | `commits_past_their_deadline` |
-| 08 | `sim_console` |
-| 11, 12 | `sim_hostile` |
-| 16 | `forwards_to_a_restarted_node_are_refused` |
-| 17 | `lease_sightings_outlive_handles_and_prune_when_full` |
-| 18 | `slow_probes_are_not_trusted` |
-| 22 | `ambiguous_commit_during_active_lease` |
-| 26 | `earlier_runs_at_this_address_are_not_routed_to` |
-| 27 | `a_write_found_applied_after_an_unknown_outcome_renews_the_lease` |
-| 06, 09, 10, 13, 14, 15, 19, 20, 21, 23, 24, 25, 28 | none |
-
-For 07, 17, 26 and 27, `tests/sim.rs` did not run because the unit tests
-failed first.
+Over both rounds, with about 2,800 campaign runs per bug, the old
+simulator rediscovered 14 of the 27 bugs and the new simulator's
+campaigns 17; 2,000 more runs of guided exploration raised the new
+simulator's count to 20. Exploration alone found 22, 23 and 27, which no
+campaign of either simulator did. Bugs 09, 10, 13, 16, 24, 26 and 28
+escaped every strategy; the tests `forwards_to_a_restarted_node_are_refused`
+and `earlier_runs_at_this_address_are_not_routed_to` catch 16 and 26.
 
 ## What each patch reverts
 
@@ -159,8 +135,9 @@ when the patch stops applying.
 - **24** The `not_committed` commit status (src/api/data.rs) reports
   `retention_ms: u64::MAX` instead of the real commit retention. This
   restores the pre-fix contract, in which `not_committed` was always
-  definitive; the client side of the fix lives in the streams workload,
-  which patches here do not touch.
+  definitive. The simulator's client (`Client::commit_status`) treats a
+  status older than the reported retention as unknown, so with the patch
+  its workloads trust every `not_committed`.
 - **25** `Db::process` no longer deletes the batch's past-grace obsolete
   objects (`plan.gc`) when the manifest write's outcome is unknown.
 - **26** `Node::live_members` and `Node::route` no longer ignore member

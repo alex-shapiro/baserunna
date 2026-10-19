@@ -8,7 +8,9 @@
 //!   serializable transaction read the state just before its commit, a
 //!   read-only one the state at its version, a snapshot-isolated one the
 //!   state at some earlier version. Interactive transactions, committed or
-//!   not, read the state at their read version.
+//!   not, read the state at their read version. A check reported failed
+//!   must fail at some state the transaction may have read, and a final
+//!   read of every key must match the replayed state.
 //! - Real-time order: a transaction that began after another one finished
 //!   is serialized after it (strict serializability).
 //! - First committer wins: no transaction committed a write to a key that a
@@ -115,6 +117,10 @@ pub struct Txn {
     pub ops: Vec<Op>,
     /// Results of the operations whose responses arrived, in order.
     pub results: Vec<Observed>,
+    /// The operation a 412 reported failing its check. Left unset for an
+    /// interactive begin: its read version is unknown, and need not follow
+    /// transactions that finished before it.
+    pub failed: Option<usize>,
     pub outcome: Outcome,
 }
 
@@ -222,30 +228,28 @@ impl View<'_> {
 }
 
 /// Replays `t`'s operations at `pos` and compares them with what it observed.
-/// `exact_more` says whether scans' `more` flags are comparable: a scan's
-/// validation covers only the interval it returned, so whether more keys
-/// followed may change between its snapshot and its commit.
-fn replay(model: &Model, t: &Txn, pos: u64, exact_more: bool) -> Result<BTreeMap<usize, Option<String>>, String> {
+fn replay(model: &Model, t: &Txn, pos: u64) -> Result<BTreeMap<usize, Option<String>>, String> {
     let mut view = View { model, pos, own: BTreeMap::new() };
     // An uncommitted transaction failed after the last result it received.
-    let n = match t.outcome {
-        Outcome::NotCommitted | Outcome::Unknown => t.results.len(),
+    let n = match (t.failed, t.outcome) {
+        (Some(i), _) => i + 1,
+        (None, Outcome::NotCommitted | Outcome::Unknown) => t.results.len(),
         _ => t.ops.len(),
     };
     for (i, op) in t.ops[..n].iter().enumerate() {
-        let want = view.apply(op).map_err(|e| format!("op {i}: {e}"))?;
-        let Some(got) = t.results.get(i) else { continue };
-        let same = match (&want, got) {
-            (Observed::Scan { items: a, more: m1 }, Observed::Scan { items: b, more: m2 }) => {
-                a == b && (!exact_more || m1 == m2)
-            }
-            _ => want == *got,
+        let want = match view.apply(op) {
+            Err(_) if t.failed == Some(i) => return Ok(view.own),
+            r => r.map_err(|e| format!("op {i}: {e}"))?,
         };
-        if !same {
+        let Some(got) = t.results.get(i) else { continue };
+        if want != *got {
             return Err(format!("op {i} {op:?} observed {got:?}, but the state at {pos} gives {want:?}"));
         }
     }
-    Ok(view.own)
+    match t.failed {
+        Some(i) => Err(format!("op {i} {:?} failed, but holds at {pos}", t.ops[i])),
+        None => Ok(view.own),
+    }
 }
 
 /// Checks a complete history (see the module documentation).
@@ -262,7 +266,7 @@ pub fn check(history: &[Txn]) -> Result<(), String> {
         return Err(format!("{} and {} both committed at version {}", w[0].1.client, w[1].1.client, w[0].0));
     }
     let mut model = Model::default();
-    let mut write_sets: Vec<(u64, Vec<usize>)> = Vec::new();
+    let mut write_sets: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
     for (v, t) in &writers {
         // A serializable transaction read the state just before its commit.
         // Snapshot-isolated ones are checked below; their writes are the
@@ -274,13 +278,13 @@ pub fn check(history: &[Txn]) -> Result<(), String> {
             ops_only.results.clear();
             ops_only.ops.retain(|o| !matches!(o, Op::Check { .. }));
         }
-        let own = replay(&model, &ops_only, v - 1, false)
+        let own = replay(&model, &ops_only, v - 1)
             .map_err(|e| format!("{} committed at {v}: {e}\n  {:?}", t.client, t.ops))?;
         // Only effective writes count: deleting a missing key changes
         // nothing, and the engine may not even write it.
         let own: Vec<(usize, Option<String>)> =
             own.into_iter().filter(|(k, val)| val.is_some() || model.at(*k, v - 1).is_some()).collect();
-        write_sets.push((*v, own.iter().map(|(k, _)| *k).collect()));
+        write_sets.insert(*v, own.iter().map(|(k, _)| *k).collect());
         for (k, val) in own {
             model.keys.entry(k).or_default().push((*v, val));
         }
@@ -320,30 +324,26 @@ pub fn check(history: &[Txn]) -> Result<(), String> {
             if rv < lo && t.isolation == Isolation::Snapshot {
                 return Err(format!("{} began at read version {rv}, before version {lo} that finished first", who()));
             }
-            replay(&model, t, rv, true).map_err(|e| format!("{} at its read version {rv}: {e}", who()))?;
+            replay(&model, t, rv).map_err(|e| format!("{} at its read version {rv}: {e}", who()))?;
         }
         match (t.outcome, t.isolation) {
             (Outcome::Read(r), _) => {
-                // A revalidated read-only transaction reports the later
-                // version its reads were validated at.
-                let exact = t.read_version.is_none_or(|rv| rv == r);
-                replay(&model, t, r, exact).map_err(|e| format!("{}: {e}", who()))?;
-            }
-            (Outcome::Committed(v), Isolation::Serializable) => {
-                replay(&model, t, v - 1, false).map_err(|e| format!("{}: {e}", who()))?;
+                replay(&model, t, r).map_err(|e| format!("{}: {e}", who()))?;
             }
             (Outcome::Committed(v), Isolation::Snapshot) => {
                 let snap = match t.read_version {
                     Some(rv) => rv,
                     None => (lo..v)
                         .rev()
-                        .find(|r| replay(&model, t, *r, false).is_ok())
+                        .find(|r| replay(&model, t, *r).is_ok())
                         .ok_or_else(|| format!("{}: no snapshot in [{lo}, {v}) explains its reads", who()))?,
                 };
-                let mine: Vec<usize> =
-                    write_sets.iter().find(|(w, _)| *w == v).map(|(_, k)| k.clone()).unwrap_or_default();
-                for (w, keys) in &write_sets {
-                    if *w > snap && *w < v && keys.iter().any(|k| mine.contains(k)) {
+                if snap >= v {
+                    return Err(format!("{}: committed at or before its snapshot {snap}", who()));
+                }
+                let mine = &write_sets[&v];
+                for (w, keys) in write_sets.range(snap + 1..v) {
+                    if keys.iter().any(|k| mine.contains(k)) {
                         return Err(format!(
                             "{}: committed over version {w}, which wrote one of its keys after its snapshot {snap}",
                             who()
@@ -351,7 +351,13 @@ pub fn check(history: &[Txn]) -> Result<(), String> {
                     }
                 }
             }
-            (Outcome::NotCommitted | Outcome::Unknown, _) => {}
+            (Outcome::NotCommitted, _) if t.failed.is_some() && t.read_version.is_none() => {
+                let last = writers.last().map_or(0, |(v, _)| *v);
+                if !(lo..=last).any(|r| replay(&model, t, r).is_ok()) {
+                    return Err(format!("{}: no state in [{lo}, {last}] fails op {:?}", who(), t.failed));
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -518,7 +524,7 @@ async fn resolve(c: &Client, db: &str, id: &str, t: &Txn, resolve: bool) -> Resu
     }
     c.pause(ZOMBIE_WAIT_MS).await;
     Ok(match c.commit_status(db, id, t.start).await? {
-        Status::Committed(v) => Outcome::Committed(v),
+        s @ Status::Committed(_) => Outcome::Committed(s.version().ok_or("committed without a version")?),
         Status::NotCommitted => Outcome::NotCommitted,
         Status::Unknown => Outcome::Unknown,
     })
@@ -545,8 +551,6 @@ async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String, settle: bool, 
     if writes {
         body["idempotency_key"] = json!(key);
     }
-    let e = &c.sim.cfg.engine;
-    let dedup_until = t.start + e.commit_retention_ms - 2 * e.clock_sync_max_error_ms;
     let (mut ambiguous, mut raced) = (false, false);
     loop {
         let r = c.call("POST", &format!("/v1/dbs/{db}/txn"), Some(body.clone())).await;
@@ -562,7 +566,7 @@ async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String, settle: bool, 
             if !raced {
                 c.pause(ZOMBIE_WAIT_MS).await;
             }
-            if retry && c.sim.now_ms() < dedup_until {
+            if retry && c.dedups(t.start) {
                 ambiguous = true;
                 continue;
             }
@@ -580,7 +584,10 @@ async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String, settle: bool, 
             // A retry is deduplicated by the earlier attempt's commit record,
             // which no attempt can add once the zombie wait is over: its
             // definite failure is the transaction's.
-            Ok(r) if definite_failure(r.status, &r) => Outcome::NotCommitted,
+            Ok(r) if definite_failure(r.status, &r) => {
+                t.failed = r.failed_op();
+                Outcome::NotCommitted
+            }
             Ok(r) if !writes && r.status == 503 => Outcome::NotCommitted,
             Err(_) => Outcome::NotCommitted,
             Ok(r) => return Err(format!("{}: one-shot {}: {}", c.name, r.status, r.json)),
@@ -615,7 +622,10 @@ async fn interactive(c: &Client, db: &str, t: &mut Txn, rng: &mut Rng, settle: b
         match r {
             Ok(r) if r.status == 200 => t.results.extend(parse_results(&t.ops[a..b], &r.json["results"])?),
             // A failed call ends the transaction.
-            _ => return Ok(()),
+            r => {
+                t.failed = r.ok().and_then(|r| Some(a + r.failed_op()?));
+                return Ok(());
+            }
         }
     }
     if rng.chance(0.1) {
@@ -631,13 +641,42 @@ async fn interactive(c: &Client, db: &str, t: &mut Txn, rng: &mut Rng, settle: b
             t.results.extend(rest);
             if t.writes() { Outcome::Committed(v) } else { Outcome::Read(v) }
         }
-        Ok(r) if definite_failure(r.status, &r) || r.status == 400 => Outcome::NotCommitted,
+        Ok(r) if definite_failure(r.status, &r) || r.status == 400 => {
+            t.failed = r.failed_op().map(|i| b + i);
+            Outcome::NotCommitted
+        }
         Ok(r) if r.outcome_unknown() => resolve(c, db, &cid, t, settle).await?,
         Err(super::super::NetError::Refused) => Outcome::NotCommitted,
         Err(_) => resolve(c, db, &cid, t, settle).await?,
         Ok(r) => return Err(format!("{}: commit {}: {}", c.name, r.status, r.json)),
     };
     Ok(())
+}
+
+/// A strong read of every key after all other transactions ended, so that
+/// the check also covers the final state: a write lost after every other
+/// read would otherwise go unseen. Retries until it succeeds, since the
+/// service must serve reads once chaos is over.
+async fn final_read(sim: &Sim, c: &Client, db: &str, keys: usize) -> Result<Txn, String> {
+    let mut t = Txn {
+        client: "final".into(),
+        marker: String::new(),
+        start: sim.now_ms(),
+        end: 0,
+        isolation: Isolation::Serializable,
+        stale_ms: None,
+        read_version: None,
+        ops: vec![Op::Scan { start: 0, end: keys + 1, limit: keys + 1, reverse: false }],
+        results: Vec::new(),
+        failed: None,
+        outcome: Outcome::NotCommitted,
+    };
+    while !matches!(t.outcome, Outcome::Read(_)) {
+        c.pause(100).await;
+        one_shot(c, db, &mut t, String::new(), false, false).await?;
+    }
+    t.end = sim.now_ms();
+    Ok(t)
 }
 
 pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String> {
@@ -675,6 +714,7 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
                     read_version: None,
                     ops: g.ops(read_only),
                     results: Vec::new(),
+                    failed: None,
                     outcome: Outcome::NotCommitted,
                 };
                 let mut rng = g.rng.fork();
@@ -703,13 +743,14 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
         return Err(e);
     }
     super::settle(&sim, phase).await;
+    let mut h = history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    h.push(final_read(&sim, &owner, db, shape.keys).await?);
     let markers = owner.paginate(&format!("/v1/dbs/{db}/kv?prefix=m/&limit=100"), "items").await?;
     let mut markers: BTreeMap<String, u64> = markers
         .iter()
         .map(|m| Some((m["key"].as_str()?.to_string(), m["version"].as_u64()?)))
         .collect::<Option<_>>()
         .ok_or("odd marker")?;
-    let mut h = history.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for t in h.iter_mut().filter(|t| t.writes()) {
         let applied = markers.remove(&t.marker);
         t.outcome = match (t.outcome, applied) {
@@ -745,6 +786,7 @@ mod tests {
             read_version: None,
             ops,
             results,
+            failed: None,
             outcome,
         }
     }
@@ -809,6 +851,11 @@ mod tests {
         let mut opaque = txn(11, 30, vec![get(1)], vec![Observed::Get(None)], Outcome::NotCommitted);
         opaque.read_version = Some(1);
         assert!(check(&[w1.clone(), opaque]).unwrap_err().contains("read version 1"));
+        let mut failed = txn(11, 12, vec![Op::Check { key: 1, exists: false }], vec![], Outcome::NotCommitted);
+        failed.failed = Some(0);
+        check(&[w1.clone(), failed.clone()]).unwrap();
+        failed.ops = vec![Op::Check { key: 1, exists: true }];
+        assert!(check(&[w1.clone(), failed]).unwrap_err().contains("fails op"));
         let mut skew_ok = si;
         skew_ok.ops = vec![get(2), put(3, "x")];
         skew_ok.results = vec![Observed::Get(None), Observed::Done];

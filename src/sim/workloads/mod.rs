@@ -231,9 +231,7 @@ impl ChaosPhase {
         over.as_mut().enable();
         let seen = sim.chaos.lock().unwrap_or_else(|e| e.into_inner()).ended;
         if self.leave().is_some() {
-            recover(&sim).await;
-            sim.chaos.lock().unwrap_or_else(|e| e.into_inner()).ended += 1;
-            sim.chaos_over.notify_waiters();
+            recover_and_release(sim.clone()).await;
             return;
         }
         loop {
@@ -249,13 +247,20 @@ impl ChaosPhase {
 
 impl Drop for ChaosPhase {
     fn drop(&mut self) {
-        // A workload that fails leaves its phase without waiting; the others
-        // must not wait for it.
+        // A workload that fails leaves its phase without waiting, but the
+        // others still check a recovered cluster.
         if self.open && self.leave().is_some() {
-            self.sim.chaos.lock().unwrap_or_else(|e| e.into_inner()).ended += 1;
-            self.sim.chaos_over.notify_waiters();
+            tokio::spawn(recover_and_release(self.sim.clone()));
         }
     }
+}
+
+/// Recovers the cluster after the last chaos phase ended, then releases the
+/// workloads waiting for it.
+async fn recover_and_release(sim: Arc<Sim>) {
+    recover(&sim).await;
+    sim.chaos.lock().unwrap_or_else(|e| e.into_inner()).ended += 1;
+    sim.chaos_over.notify_waiters();
 }
 
 /// Ends `phase` if there is one, and recovers the cluster either way.
@@ -312,29 +317,27 @@ pub async fn mix(sim: Arc<Sim>) -> Result<(), String> {
 
 type Run = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>;
 
-/// Polls every run to completion on this task and returns the first error.
+/// Polls every run to completion on this task and returns the error that
+/// came first: a later one may only follow from it.
 async fn join_all(mut runs: Vec<(&str, Run)>) -> Result<(), String> {
-    let mut done: Vec<Option<Result<(), String>>> = runs.iter().map(|_| None).collect();
+    let mut done = vec![false; runs.len()];
+    let mut first: Option<String> = None;
     std::future::poll_fn(|cx| {
-        for ((_, f), d) in runs.iter_mut().zip(done.iter_mut()) {
-            if d.is_none()
-                && let std::task::Poll::Ready(r) = f.as_mut().poll(cx)
-            {
-                *d = Some(r);
+        for ((name, f), d) in runs.iter_mut().zip(done.iter_mut()) {
+            if !*d && let std::task::Poll::Ready(r) = f.as_mut().poll(cx) {
+                *d = true;
+                if let Err(e) = r {
+                    first.get_or_insert(format!("{name}: {e}"));
+                }
             }
         }
-        match done.iter().all(Option::is_some) {
+        match done.iter().all(|d| *d) {
             true => std::task::Poll::Ready(()),
             false => std::task::Poll::Pending,
         }
     })
     .await;
-    for ((name, _), d) in runs.iter().zip(done) {
-        if let Some(Err(e)) = d {
-            return Err(format!("{name}: {e}"));
-        }
-    }
-    Ok(())
+    first.map_or(Ok(()), Err)
 }
 
 pub type Runner = fn(Arc<Sim>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>;

@@ -609,7 +609,9 @@ fn paths() -> Value {
                 json!({"token": s(), "password": {"type": "string", "minLength": 8}}),
                 &["token", "password"],
             ))),
-            desc: Some("Sets the password, verifies the email address and ends every session. The link works once."),
+            desc: Some(
+                "Sets the password, verifies the email address and ends every session. The link sets one password: repeating the request with the same password finishes it again, any other is refused.",
+            ),
             ..op("Reset a password", "auth", vec![("200", resp("A new session", r("Session")))])
         },
     );

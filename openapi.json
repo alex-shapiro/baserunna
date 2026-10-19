@@ -3263,7 +3263,7 @@
     },
     "/v1/auth/password-reset/confirm": {
       "post": {
-        "description": "Sets the password, verifies the email address and ends every session. The link works once.",
+        "description": "Sets the password, verifies the email address and ends every session. The link sets one password: repeating the request with the same password finishes it again, any other is refused.",
         "requestBody": {
           "content": {
             "application/json": {

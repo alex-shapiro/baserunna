@@ -199,11 +199,12 @@ pub fn rendezvous<'a>(key: &str, nodes: &'a [NodeRecord]) -> Option<&'a NodeReco
 }
 
 /// Filters `nodes` to members with a heartbeat within `3 * heartbeat_ms` of
-/// `now_ms`, leaving out a process that a later one at its address replaced.
+/// `now_ms`, leaving out a process that a later live one at its address
+/// replaced.
 pub fn live(nodes: &[NodeRecord], now_ms: i64, heartbeat_ms: i64) -> Vec<NodeRecord> {
-    let replaced = |n: &NodeRecord| nodes.iter().any(|m| m.addr == n.addr && m.started_at > n.started_at);
-    let mut v: Vec<NodeRecord> =
-        nodes.iter().filter(|n| n.heartbeat_at + 3 * heartbeat_ms >= now_ms && !replaced(n)).cloned().collect();
+    let fresh = |n: &NodeRecord| n.heartbeat_at + 3 * heartbeat_ms >= now_ms;
+    let replaced = |n: &NodeRecord| nodes.iter().any(|m| m.addr == n.addr && fresh(m) && m.started_at > n.started_at);
+    let mut v: Vec<NodeRecord> = nodes.iter().filter(|n| fresh(n) && !replaced(n)).cloned().collect();
     v.sort_by(|a, b| a.id.cmp(&b.id));
     v
 }
@@ -274,5 +275,9 @@ mod tests {
         let restarted = NodeRecord { id: "b2".into(), started_at: 50, ..b.clone() };
         let ids: Vec<String> = live(&[b, restarted], 100, 10).into_iter().map(|n| n.id).collect();
         assert_eq!(ids, ["b2"], "a restart replaces the process at its address");
+        let dead_later = NodeRecord { id: "b0".into(), started_at: 80, heartbeat_at: 0, ..n("b") };
+        let restarted = NodeRecord { id: "b2".into(), started_at: 50, ..n("b") };
+        let ids: Vec<String> = live(&[dead_later, restarted], 100, 10).into_iter().map(|n| n.id).collect();
+        assert_eq!(ids, ["b2"], "a dead process replaces nothing, whatever its clock said");
     }
 }

@@ -15,7 +15,7 @@
 //! equal to its model.
 
 use super::super::Sim;
-use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
+use super::super::client::{Client, Resp, Status, ZOMBIE_WAIT_MS};
 use bytes::Bytes;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -123,18 +123,10 @@ async fn settle_call(
             continue;
         }
         c.pause(ZOMBIE_WAIT_MS).await;
-        let s = c.call_retry("GET", &format!("{DB}/commits/key:{key}"), None).await;
-        match s.json["status"].as_str() {
-            Some("committed") => return Ok(Settled::Applied(s.json)),
-            Some("not_committed") => {
-                let kept =
-                    s.json["retention_ms"].as_u64().ok_or_else(|| format!("status without retention: {}", s.json))?;
-                let slack = 2 * c.sim.cfg.engine.clock_sync_max_error_ms;
-                if c.sim.now_ms() - first + slack >= kept {
-                    return Ok(Settled::Unknown);
-                }
-            }
-            _ => return Err(format!("commit status of {key}: {} {}", s.status, s.json)),
+        match c.commit_status("streams", &format!("key:{key}"), first).await? {
+            Status::Committed(j) => return Ok(Settled::Applied(j)),
+            Status::NotCommitted => {}
+            Status::Unknown => return Ok(Settled::Unknown),
         }
     }
     Err(format!("{}: {method} {path} never settled", c.name))
@@ -522,13 +514,10 @@ async fn consumer(c: Client, w: Shared, done: Arc<AtomicBool>) -> Result<(), Str
             Ok(r) if r.status == 200 || r.status == 409 || r.status == 404 => {}
             Ok(r) if r.retryable_not_applied() || r.status == 429 => {}
             _ => {
-                // The commit may have applied: resolve it before going on.
+                // The commit may have applied: wait until it cannot apply
+                // any more before going on.
                 c.pause(ZOMBIE_WAIT_MS).await;
-                let cid = cid.as_str().unwrap_or_default();
-                let s = c.call_retry("GET", &format!("{DB}/commits/{cid}"), None).await;
-                if s.status != 200 {
-                    return Err(format!("commit status: {} {}", s.status, s.json));
-                }
+                c.commit_status("streams", cid.as_str().unwrap_or_default(), c.sim.now_ms()).await?;
             }
         }
     }

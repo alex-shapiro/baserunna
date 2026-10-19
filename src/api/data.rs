@@ -190,12 +190,14 @@ async fn delete_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
     node.access_strong(&ctx.principal, &ctx.rec).await?.require_admin()?;
     ctx.db.mark_deleted().await?;
     node.env.crash_point().await;
-    // The flagged manifest already deleted the database; a retry finishes removing its record.
-    node.run_meta(MetaCmd::DeleteDb { id: ctx.rec.id.clone() }).await.map_err(|e| Error::Unavailable {
-        message: e.message(),
-        retry_after_ms: None,
-        outcome_unknown: true,
-    })?;
+    // The flagged manifest already deleted the database: a concurrent repair
+    // may have removed its record, and otherwise a retry finishes it.
+    match node.run_meta(MetaCmd::DeleteDb { id: ctx.rec.id.clone() }).await {
+        Ok(_) | Err(Error::NotFound(_)) => {}
+        Err(e) => {
+            return Err(Error::Unavailable { message: e.message(), retry_after_ms: None, outcome_unknown: true });
+        }
+    }
     node.forget_db_name(&ctx.rec.owner_id, &ctx.rec.name);
     node.engine.forget(&ctx.rec.id);
     Ok(axum::Json(json!({})))

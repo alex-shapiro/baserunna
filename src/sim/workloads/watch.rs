@@ -44,7 +44,9 @@ async fn commit(c: &Client, ops: Json, key: &str) -> Result<(u64, bool), String>
                 let v = r.json["version"].as_u64().ok_or("no version")?;
                 let slack = 2 * c.sim.cfg.engine.clock_sync_max_error_ms;
                 let expired = c.sim.now_ms() - first + slack >= c.sim.cfg.engine.commit_retention_ms;
-                return Ok((v, ambiguous && expired && r.json["replayed"] != true));
+                // Even a replay may follow an attempt that applied a second
+                // time after the first one's record expired.
+                return Ok((v, ambiguous && expired));
             }
             Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => c.pause(50).await,
             Ok(r) if r.status != 503 && r.status != 429 => return Err(format!("write: {} {}", r.status, r.json)),

@@ -4,7 +4,7 @@
 //! must leave nothing behind, and each writer's rows must match its model.
 
 use super::super::Sim;
-use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
+use super::super::client::{Client, Resp, Status, ZOMBIE_WAIT_MS};
 use crate::util::rng::Rng;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
@@ -91,13 +91,11 @@ async fn interactive(
         Ok(r) if !r.outcome_unknown() => judge(&r, rejected),
         _ => {
             c.pause(ZOMBIE_WAIT_MS).await;
-            let st = c.call_retry("GET", &format!("{BASE}/commits/{cid}"), None).await;
-            let kept = st.json["retention_ms"].as_u64().unwrap_or(0);
-            let slack = 2 * c.sim.cfg.engine.clock_sync_max_error_ms;
-            match st.json["status"].as_str() {
-                Some("committed") => Ok(Applied::Yes),
-                Some("not_committed") if c.sim.now_ms() - committing + slack < kept => Ok(Applied::No),
-                Some("not_committed") => {
+            match c.commit_status("race", &cid, committing).await? {
+                Status::Committed(_) => Ok(Applied::Yes),
+                Status::NotCommitted => Ok(Applied::No),
+                // The row tells: this writer alone writes it, and whole.
+                Status::Unknown => {
                     let path = format!("{BASE}/tables/items/rows/get");
                     let r = c.call_retry("POST", &path, Some(json!({"pk": pk}))).await;
                     let got = &r.json["row"];
@@ -106,7 +104,6 @@ async fn interactive(
                         && got["n"].as_i64() == Some(row.n);
                     Ok(if held { Applied::Yes } else { Applied::No })
                 }
-                _ => Err(format!("commit status: {}", st.json)),
             }
         }
     }

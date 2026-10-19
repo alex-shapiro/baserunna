@@ -1,5 +1,5 @@
 //! Object-store requests per operation and the resulting cost per database
-//! per month (SPEC §13.4).
+//! per month (SPEC §13.5).
 //!
 //! ```text
 //! cargo run --release --example cost_model

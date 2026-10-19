@@ -1003,7 +1003,7 @@ impl Db {
             match res {
                 Ok(etag) => {
                     self.note_own_lease(&m, attempt_started);
-                    for (p, n) in plan.probes {
+                    for (p, n) in plan.probes.into_iter().flatten() {
                         probe::hit_n(p, n);
                     }
                     self.shared.env.crash_point().await;
@@ -1185,7 +1185,7 @@ impl Db {
                     _ => Outcome::Unit(Err(Error::not_found("database deleted"))),
                 })
                 .collect();
-            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: Vec::new(), due });
+            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: None, due });
         }
         for w in batch {
             match w {
@@ -1221,9 +1221,6 @@ impl Db {
                     if let Err(e) = validate(req, base, &accepted, &touched, time).await {
                         if matches!(e, Error::Conflict(_)) {
                             probe::hit(Probe::CommitConflict);
-                            if !accepted.is_empty() && validate(req, base, &[], &[], time).await.is_ok() {
-                                probe::hit(Probe::CommitConflictInBatch);
-                            }
                         }
                         outcomes.push(Outcome::Seq(Err(e)));
                         continue;
@@ -1414,7 +1411,7 @@ impl Db {
             }
         }
         if !data_changed && !meta_changed {
-            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: Vec::new(), due });
+            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: None, due });
         }
         if data_changed {
             m.version = last_seq;
@@ -1525,7 +1522,7 @@ impl Db {
             }
         }
         m.write_seq += 1;
-        let probes = vec![
+        let probes: [(Probe, u64); 11] = [
             (Probe::RangeTombstoneWritten, m.range_deletes.iter().filter(|t| t.seq > base.m.version).count() as u64),
             (Probe::RangeTombstoneRetired, retired),
             (Probe::EntriesExpired, expired),
@@ -1538,7 +1535,7 @@ impl Db {
             (Probe::ReadLeaseRenewed, (meta_changed && !data_changed && lease_ms > cfg.lease_ms) as u64),
             (Probe::LeaseReleased, release as u64),
         ];
-        Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, probes, due })
+        Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, probes: Some(probes), due })
     }
 
     fn delete_obsolete(&self, gc: Vec<Obsolete>) {
@@ -1943,7 +1940,7 @@ struct Plan {
     /// Indicates whether a commit in this batch was rejected due to quota.
     quota_refused: bool,
     /// Probes hit once the manifest write succeeds.
-    probes: Vec<(Probe, u64)>,
+    probes: Option<[(Probe, u64); 11]>,
     /// Streams whose retention may call for a trim after this write.
     due: BTreeSet<u64>,
 }

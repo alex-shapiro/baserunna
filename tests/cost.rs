@@ -83,7 +83,7 @@ fn request_costs_stay_within_budget() {
     }
     assert!(
         failures.is_empty(),
-        "cost regressions (if intentional, update the budgets in tests/cost.rs and SPEC §13.4):\n  {}",
+        "cost regressions (if intentional, update the budgets in tests/cost.rs and SPEC §13.5):\n  {}",
         failures.join("\n  ")
     );
 }

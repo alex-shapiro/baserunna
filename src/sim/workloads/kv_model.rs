@@ -355,23 +355,25 @@ impl KvModel {
             body["idempotency_key"] = json!(key);
         }
         let path = self.path("/txn");
-        let mut began = self.c.sim.now_ms();
+        let (mut began, mut ambiguous) = (self.c.sim.now_ms(), false);
         loop {
+            // A retry with the same idempotency key is safe while the first
+            // attempt's commit record would deduplicate it; past that, the
+            // data tells whether an attempt applied.
+            if ambiguous && writes && !self.c.dedups(began) {
+                if let Some(v) = self.reconcile(&sim).await? {
+                    sim.apply(&mut self.model, v);
+                    return Ok(());
+                }
+                (began, ambiguous) = (self.c.sim.now_ms(), false);
+            }
             let r = self.c.call("POST", &path, Some(body.clone())).await;
             let r = match r {
                 Ok(r) if !r.outcome_unknown() => r,
                 _ => {
-                    // Retry with the same idempotency key once any zombie
-                    // attempt has expired, unless its commit record may be
-                    // gone: then the data tells whether it applied.
+                    // Retry once any zombie attempt has expired.
                     self.c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
-                    if writes && !self.dedups(began) {
-                        if let Some(v) = self.reconcile(&sim).await? {
-                            sim.apply(&mut self.model, v);
-                            return Ok(());
-                        }
-                        began = self.c.sim.now_ms();
-                    }
+                    ambiguous = true;
                     continue;
                 }
             };
@@ -424,13 +426,6 @@ impl KvModel {
                 _ => return Err(format!("step {}: unexpected response {} {}", self.step, r.status, r.json)),
             }
         }
-    }
-
-    /// Whether a retry of a request first sent at `began` is still
-    /// deduplicated by its commit record.
-    fn dedups(&self, began: u64) -> bool {
-        let e = &self.c.sim.cfg.engine;
-        self.c.sim.now_ms() + 2 * e.clock_sync_max_error_ms < began + e.commit_retention_ms
     }
 
     /// Whether `txn` applied, and at which version, judged from the data:
@@ -541,7 +536,7 @@ impl KvModel {
                 // data once the commit record may be gone.
                 self.c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
                 match self.c.commit_status(&self.db, &commit_id, began).await? {
-                    Status::Committed(v) => Some(v),
+                    s @ Status::Committed(_) => s.version(),
                     Status::NotCommitted => None,
                     Status::Unknown => self.reconcile(&sim).await?,
                 }

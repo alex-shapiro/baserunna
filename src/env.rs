@@ -95,8 +95,10 @@ impl Env {
     #[track_caller]
     pub fn crash_point(&self) -> impl Future<Output = ()> + use<> {
         let loc = std::panic::Location::caller();
-        let hook = self.crash_hook.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let crash = hook.filter(|_| crate::buggify::crash_fires(0.01));
+        let crash = match crate::buggify::crash_fires(0.01) {
+            true => self.crash_hook.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            false => None,
+        };
         async move {
             if let Some(h) = crash
                 && h(&format!("crash point {}:{}", loc.file(), loc.line()))

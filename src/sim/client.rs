@@ -25,12 +25,23 @@ pub struct Client {
 }
 
 /// What a commit status query tells of a commit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Status {
-    Committed(u64),
+    /// The commit applied; the status response tells its version and appends.
+    Committed(Json),
     NotCommitted,
     /// The commit record may have expired, so the status cannot tell.
     Unknown,
+}
+
+impl Status {
+    /// The version a committed commit applied at.
+    pub fn version(&self) -> Option<u64> {
+        match self {
+            Status::Committed(j) => j["version"].as_u64(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +67,11 @@ impl Resp {
 
     pub fn outcome_unknown(&self) -> bool {
         self.status == 503 && self.json["error"]["details"]["outcome"] == "unknown"
+    }
+
+    /// The index of the operation whose precondition a 412 reports failed.
+    pub fn failed_op(&self) -> Option<usize> {
+        (self.status == 412).then(|| self.json["error"]["details"]["op_index"].as_u64())?.map(|i| i as usize)
     }
 }
 
@@ -237,17 +253,46 @@ impl Client {
     pub async fn commit_status(&self, db: &str, id: &str, began: u64) -> Result<Status, String> {
         let r = self.call_retry("GET", &format!("/v1/dbs/{db}/commits/{id}"), None).await;
         match r.json["status"].as_str() {
-            Some("committed") => Ok(Status::Committed(r.json["version"].as_u64().ok_or(format!("{}", r.json))?)),
+            Some("committed") if r.json["version"].is_u64() => Ok(Status::Committed(r.json)),
             Some("not_committed") => {
                 let kept = r.json["retention_ms"].as_u64().ok_or(format!("no retention: {}", r.json))?;
                 let slack = 2 * self.sim.cfg.engine.clock_sync_max_error_ms;
-                match self.sim.now_ms() + slack < began + kept {
+                match self.sim.now_ms() + slack < began.saturating_add(kept) {
                     true => Ok(Status::NotCommitted),
                     false => Ok(Status::Unknown),
                 }
             }
             _ => Err(format!("{}: commit status {id}: {} {}", self.name, r.status, r.json)),
         }
+    }
+
+    /// Whether commit `id` in `db`, first attempted at `began` and possibly
+    /// ambiguous, applied, once no attempt of it can still apply: by its
+    /// fenced status, or past commit retention by `marker`, a key that only
+    /// this commit writes.
+    pub async fn resolve(&self, db: &str, id: &str, began: u64, marker: &str) -> Result<bool, String> {
+        match self.commit_status(db, id, began).await? {
+            Status::Committed(_) => Ok(true),
+            Status::NotCommitted => Ok(false),
+            Status::Unknown => {
+                let r =
+                    self.call_retry("GET", &format!("/v1/dbs/{db}/kv/{}", url_escape(marker.as_bytes())), None).await;
+                match r.status {
+                    200 => Ok(true),
+                    404 => Ok(false),
+                    s => Err(format!("{}: marker {marker}: {s} {}", self.name, r.json)),
+                }
+            }
+        }
+    }
+
+    /// Whether a retry of a request first sent at `began` would still be
+    /// deduplicated by its commit record. The server checks the record
+    /// when the retry reaches it, which may be as late as a request can
+    /// live ([`ZOMBIE_WAIT_MS`]).
+    pub fn dedups(&self, began: u64) -> bool {
+        let e = &self.sim.cfg.engine;
+        self.sim.now_ms() + ZOMBIE_WAIT_MS + 2 * e.clock_sync_max_error_ms < began.saturating_add(e.commit_retention_ms)
     }
 
     /// Collects all items in `field` across `next_cursor` pages of `path`.

@@ -101,10 +101,6 @@ impl NetFaults {
             forward_delay_max_ms: 0,
         }
     }
-
-    pub fn moderate() -> NetFaults {
-        NetFaults { latency_min_ms: 1, latency_max_ms: 10, p_lose_response: 0.01, ..NetFaults::none() }
-    }
 }
 
 /// The chaos actions [`workloads::chaos_step`] takes, by weight.
@@ -135,23 +131,6 @@ pub struct ChaosFaults {
     /// Pause a node's process for up to three lease durations.
     pub pause_node: u64,
     pub clock_step_max_ms: u64,
-}
-
-impl ChaosFaults {
-    /// Crashes, restarts, two-way partitions and heals.
-    pub fn moderate() -> ChaosFaults {
-        ChaosFaults {
-            enabled: true,
-            pause_ms: 4_500,
-            storm_ms: u64::MAX,
-            crash: 2,
-            start: 2,
-            partition: 1,
-            heal: 3,
-            quiet: 1,
-            ..ChaosFaults::default()
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -251,19 +230,6 @@ impl SimConfig {
             reorder: 0.0,
             disk: DiskFaults { bytes: 64 * 1024, ..DiskFaults::default() },
             branches: Vec::new(),
-        }
-    }
-
-    /// Multi-node with store and network faults, chaos and clock skew within
-    /// the lease margin.
-    pub fn faulty(nodes: usize) -> SimConfig {
-        SimConfig {
-            nodes,
-            store: StoreFaults::moderate(),
-            net: NetFaults::moderate(),
-            max_skew_ms: 150,
-            chaos: ChaosFaults::moderate(),
-            ..SimConfig::basic()
         }
     }
 }

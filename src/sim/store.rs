@@ -45,17 +45,6 @@ impl StoreFaults {
             late_reply_ms: (0, 0),
         }
     }
-
-    pub fn moderate() -> StoreFaults {
-        StoreFaults {
-            latency_min_ms: 2,
-            latency_max_ms: 40,
-            p_slow: 0.02,
-            p_fail_before: 0.02,
-            p_fail_after: 0.02,
-            ..StoreFaults::none()
-        }
-    }
 }
 
 struct Draw {

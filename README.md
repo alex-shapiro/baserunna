@@ -31,7 +31,21 @@ For more information on deployment, see [DEPLOYING.md](DEPLOYING.md).
 Baserunna is built to run fully inside a deterministic simulator with fault injection. To run most tests, call:
 
 ```sh
+<<<<<<< HEAD
 cargo test
+=======
+cargo test                                   # unit, property, fuzz, lint, OpenAPI, cost and simulation tests
+SIM_SEEDS=500 cargo test --release --test sim                      # longer simulation campaigns
+cargo run --release --example sim_tool -- campaign all 3000        # very long campaigns
+cargo run --release --example sim_tool -- explore all 1            # guided exploration
+cargo run --release --example sim_tool -- trace bank 101863        # print a run's full trace
+SIM_SEED=4242 cargo test --test sim sim_bank -- --nocapture        # reproduce one seed
+cd fuzz && cargo +nightly fuzz run http_txn -- -rss_limit_mb=1500  # coverage-guided fuzzing (optional)
+cargo run --release --example cost_model                           # store requests per operation, $/DB/month
+cargo run --release --example amplification                        # write/space/read amplification of compaction and streams
+cargo bench --bench throughput                                     # one node, thousands of active databases
+scripts/mutants.sh                                                 # mutation testing (several hours)
+>>>>>>> 627278a (Rewrite SPEC §13 for the new simulator, resolve ttl writes past commit retention)
 ```
 
 Run fuzz tests in the `fuzz/` directory:

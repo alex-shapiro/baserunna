@@ -81,15 +81,12 @@ the design context for several of these.
 
 ## Testing
 
-- [ ] **Run simulation campaigns continuously in CI.**
-      For example, run nightly with fresh seeds, keep failing seeds as regression tests,
-      and run the `sim_tool determinism` check on every PR (include a `*_hostile` scenario).
 - [ ] **Run libFuzzer targets in CI** for a time budget, with a corpus. Include the
       structure-aware `http_txn` target, which checks results against a model.
 - [ ] **Run mutation testing in CI**, e.g. `scripts/mutants.sh --in-diff` on every PR and the
       full configuration weekly.
 - [ ] **Run the cost guard and throughput benchmark in CI** and track the numbers over time.
-- [ ] **Bound status checks by commit retention in every workload.** `kv_model`, `bank`,
-      `abandoned` and `schema_race` take `not_committed` as definitive however long ago the
-      first attempt began; like the streams workload, they should treat answers past
-      `retention_ms` as unknown and resolve them from the data.
+- [ ] **Make guided exploration beat plain campaigns.** At equal runs it reaches about as many
+      probe features as a swarm campaign (SPEC §13.4); its value so far is in reaching
+      combinations of rare probes. Better features (orderings of rare probes, buggify sites
+      fired) or energy schedules could change that.

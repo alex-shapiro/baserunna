@@ -24,12 +24,22 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 /// Expected state of a value: its data, commit version, and expiry window in
-/// simulation milliseconds.
+/// simulation milliseconds, unless a write of it may or may not have applied.
 #[derive(Clone, Debug)]
 struct Val {
     data: String,
     version: u64,
     expires: Option<(u64, u64)>,
+    /// A write's outcome could not be learned: its commit record expired
+    /// before its retries ended, and the value may have expired since.
+    /// Any read is explained until the next write whose outcome is known.
+    uncertain: bool,
+}
+
+impl Val {
+    fn uncertain() -> Val {
+        Val { data: String::new(), version: 0, expires: None, uncertain: true }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -42,6 +52,7 @@ enum Seen {
 /// Expected visibility of `v` for a read spanning `[r0, r1]`.
 fn expect(v: Option<&Val>, r0: u64, r1: u64, eps: u64) -> Seen {
     match v.map(|v| v.expires) {
+        _ if v.is_some_and(|v| v.uncertain) => Seen::Either,
         None => Seen::Absent,
         Some(None) => Seen::Present,
         Some(Some((lo, _))) if r1 + eps < lo => Seen::Present,
@@ -58,6 +69,9 @@ fn check_read(
     r1: u64,
     eps: u64,
 ) -> Result<(), String> {
+    if v.is_some_and(|v| v.uncertain) {
+        return Ok(());
+    }
     let seen = expect(v, r0, r1, eps);
     match (got, v) {
         (None, _) if seen != Seen::Present => Ok(()),
@@ -101,16 +115,30 @@ impl Owner {
     }
 
     /// Commits `ops` with an idempotency key and returns the response along
-    /// with the timestamp when the first attempt started.
-    async fn commit(&mut self, ops: Json) -> Result<(super::super::client::Resp, u64), String> {
+    /// with the timestamp when the first attempt started, or `None` if the
+    /// outcome cannot be learned: retries are deduplicated only while the
+    /// first attempt's commit record lives (SPEC §6.2), and past that a
+    /// retry could apply the write twice.
+    async fn commit(&mut self, ops: Json) -> Result<Option<(super::super::client::Resp, u64)>, String> {
         self.step += 1;
         let body = json!({"ops": ops, "idempotency_key": format!("{}-{}", self.c.name, self.step)});
         let t0 = self.c.sim.now_ms();
+        let e = &self.c.sim.cfg.engine;
+        let dedup_until = t0 + e.commit_retention_ms - 2 * e.clock_sync_max_error_ms;
+        let mut ambiguous = false;
         loop {
             match self.c.call("POST", &self.path("/txn"), Some(body.clone())).await {
-                Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => self.c.pause(50).await,
-                Ok(r) if r.status == 200 || (400..500).contains(&r.status) && r.status != 429 => return Ok((r, t0)),
-                _ => self.c.pause(ZOMBIE_WAIT_MS).await,
+                Ok(r) if r.code() == "conflict" || (r.retryable_not_applied() && !ambiguous) => self.c.pause(50).await,
+                Ok(r) if r.status == 200 || (400..500).contains(&r.status) && r.status != 429 => {
+                    return Ok(Some((r, t0)));
+                }
+                _ => {
+                    ambiguous = true;
+                    self.c.pause(ZOMBIE_WAIT_MS).await;
+                    if self.c.sim.now_ms() >= dedup_until {
+                        return Ok(None);
+                    }
+                }
             }
         }
     }
@@ -123,19 +151,25 @@ impl Owner {
         if let Some(t) = ttl {
             op["ttl_ms"] = json!(t);
         }
-        let (r, t0) = self.commit(json!([op])).await?;
+        let Some((r, t0)) = self.commit(json!([op])).await? else {
+            self.model.insert(k, Val::uncertain());
+            return Ok(());
+        };
         if r.status != 200 {
             return Err(format!("put: {} {}", r.status, r.json));
         }
         let (t1, version) = (self.c.sim.now_ms(), r.json["version"].as_u64().ok_or("no version")?);
         let expires = ttl.map(|t| (t0 + t - self.eps, t1 + t + self.eps));
-        self.model.insert(k, Val { data, version, expires });
+        self.model.insert(k, Val { data, version, expires, uncertain: false });
         Ok(())
     }
 
     async fn delete(&mut self) -> Result<(), String> {
         let k = KEYS[self.rng.usize(KEYS.len())].to_string();
-        let (r, _) = self.commit(json!([{"op": "delete", "key": k}])).await?;
+        let Some((r, _)) = self.commit(json!([{"op": "delete", "key": k}])).await? else {
+            self.model.insert(k, Val::uncertain());
+            return Ok(());
+        };
         if r.status != 200 {
             return Err(format!("delete: {} {}", r.status, r.json));
         }
@@ -203,7 +237,10 @@ impl Owner {
         let ttl = 200 + self.rng.below(3_000);
         let holder = self.rows.iter().find(|(_, (t, _))| *t == token).map(|(id, (_, v))| (*id, v.clone()));
         let op = json!({"op": "insert_row", "table": "sess", "row": {"id": id, "token": token}, "ttl_ms": ttl});
-        let (r, t0) = self.commit(json!([op])).await?;
+        let Some((r, t0)) = self.commit(json!([op])).await? else {
+            self.rows.insert(id, (token, Val::uncertain()));
+            return Ok(());
+        };
         let t1 = self.c.sim.now_ms();
         let seen = expect(holder.as_ref().map(|h| &h.1), t0, t1, self.eps);
         match (r.status, seen) {
@@ -212,8 +249,12 @@ impl Owner {
                     self.rows.remove(&old);
                 }
                 let version = r.json["version"].as_u64().ok_or("no version")?;
-                let val =
-                    Val { data: token.clone(), version, expires: Some((t0 + ttl - self.eps, t1 + ttl + self.eps)) };
+                let val = Val {
+                    data: token.clone(),
+                    version,
+                    expires: Some((t0 + ttl - self.eps, t1 + ttl + self.eps)),
+                    uncertain: false,
+                };
                 self.rows.insert(id, (token, val));
                 Ok(())
             }
@@ -240,11 +281,10 @@ impl Owner {
         let ops: Vec<Json> = (0..30)
             .map(|i| json!({"op": "put", "key": format!("b/{}/{i:02}", self.step), "value": "x".repeat(150), "ttl_ms": ttl}))
             .collect();
-        let (r, _) = self.commit(Json::Array(ops)).await?;
-        if r.status != 200 {
-            return Err(format!("bulk: {} {}", r.status, r.json));
+        match self.commit(Json::Array(ops)).await? {
+            Some((r, _)) if r.status != 200 => Err(format!("bulk: {} {}", r.status, r.json)),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     async fn step(&mut self) -> Result<(), String> {
@@ -270,17 +310,19 @@ impl Owner {
             let wait = hi.saturating_sub(self.c.sim.now_ms()) + 2 * self.eps;
             self.c.pause(wait).await;
         }
+        let uncertain_rows = self.rows.values().any(|(_, v)| v.uncertain);
         self.model.retain(|_, v| v.expires.is_none());
         self.rows.clear();
         let r = self.c.call_retry("GET", &self.path("/kv?prefix=k/&limit=100"), None).await;
         let keys: Vec<&str> =
             r.json["items"].as_array().into_iter().flatten().filter_map(|it| it["key"].as_str()).collect();
-        let want: Vec<&str> = self.model.keys().map(|k| k.as_str()).collect();
-        if keys != want {
-            return Err(format!("after every expiry: keys {keys:?}, want {want:?}"));
+        let sure: Vec<&str> = self.model.iter().filter(|(_, v)| !v.uncertain).map(|(k, _)| k.as_str()).collect();
+        let explained = |k: &&str| self.model.contains_key(*k);
+        if !sure.iter().all(|k| keys.contains(k)) || !keys.iter().all(explained) {
+            return Err(format!("after every expiry: keys {keys:?}, want {sure:?}"));
         }
         let q = self.c.call_retry("POST", &self.path("/tables/sess/rows/query"), Some(json!({}))).await;
-        if q.json["rows"].as_array().is_none_or(|r| !r.is_empty()) {
+        if !uncertain_rows && q.json["rows"].as_array().is_none_or(|r| !r.is_empty()) {
             return Err(format!("expired rows still read: {}", q.json));
         }
         // Trigger compaction over the expired data.
@@ -487,7 +529,7 @@ mod tests {
     use super::*;
 
     fn val(expires: Option<(u64, u64)>) -> Val {
-        Val { data: "d".into(), version: 3, expires }
+        Val { data: "d".into(), version: 3, expires, uncertain: false }
     }
 
     #[test]

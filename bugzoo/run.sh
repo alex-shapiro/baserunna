@@ -7,7 +7,8 @@
 #
 # For each patch: apply it, build sim_tool in release, run `sim_tool <args>`,
 # record seeds run, failing seeds and the first failure, then revert the
-# patch. Results are appended to $RESULTS (default bugzoo/results.tsv).
+# patch. Results are appended to $RESULTS (default bugzoo/results.tsv), and
+# each run's full output is kept in $OUT_DIR if set.
 # The working tree must be clean outside bugzoo/.
 #
 # Each patch rebuilds the crate (about 7 minutes with the default release
@@ -52,6 +53,9 @@ for p in $patches; do
   rm -f "bugzoo/.build-$name.log"
   revert
   out=$("$bin" "$@" 2>&1)
+  if [ -n "${OUT_DIR:-}" ]; then
+    mkdir -p "$OUT_DIR" && printf '%s\n' "$out" > "$OUT_DIR/$name.out"
+  fi
   seeds=$(sed -n -e 's/^\([0-9][0-9]*\) runs in .*/\1/p' -e 's/^explored \([0-9][0-9]*\) runs.*/\1/p' <<< "$out" | awk '{s += $1} END {print s + 0}')
   failed=$(grep -c '^FAIL ' <<< "$out")
   first=$(grep -m1 '^FAIL ' <<< "$out" | cut -c1-200)

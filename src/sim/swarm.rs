@@ -171,6 +171,7 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
             clock_step: if p.skew >= Skew::Hostile { k.weight("chaos.clock_step") } else { 0 },
             heal: 1 + k.weight("chaos.heal"),
             quiet: k.weight("chaos.quiet"),
+            pause_node: k.weight("chaos.pause_node"),
             clock_step_max_ms: 0,
         };
     }
@@ -189,6 +190,9 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
     };
     c.max_skew_ms = skew;
     c.chaos.clock_step_max_ms = step;
+    c.buggify = k.pick("buggify.p_active", &[0.0, 0.1, 0.25, 0.5]);
+    c.crash_points = c.chaos.enabled && k.chance("buggify.crash_points", 0.5);
+    c.reorder = k.pick("sched.reorder", &[0.0, 0.05, 0.2, 0.5]);
     c
 }
 

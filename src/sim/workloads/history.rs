@@ -375,6 +375,9 @@ pub struct Shape {
     /// Share of ambiguous commits resolved through the commit status rather
     /// than only from the markers.
     pub settle: f64,
+    /// Share of ambiguous one-shot transactions retried with their
+    /// idempotency key rather than resolved.
+    pub retry: f64,
 }
 
 impl Shape {
@@ -402,6 +405,7 @@ impl Shape {
             stale_reads: k.pick("history.stale_reads", &[0.0, 0.2]),
             hot: k.pick("history.hot", &[0.0, 0.3, 0.8]),
             settle: k.pick("history.settle", &[0.0, 0.5, 1.0]),
+            retry: k.pick("history.retry", &[0.0, 0.5, 1.0]),
         }
     }
 }
@@ -524,7 +528,10 @@ fn definite_failure(status: u16, r: &super::super::client::Resp) -> bool {
     matches!(status, 404 | 409 | 412 | 429) || r.retryable_not_applied()
 }
 
-async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String, settle: bool) -> Result<(), String> {
+/// Runs `t` in one request. After an ambiguous failure, `retry` resends it
+/// with the same idempotency key while its commit record would still
+/// deduplicate it; otherwise, or past that, the outcome is resolved.
+async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String, settle: bool, retry: bool) -> Result<(), String> {
     let writes = t.writes();
     let mut body = json!({"ops": request_ops(t, &t.ops, true)});
     if t.isolation == Isolation::Snapshot {
@@ -537,24 +544,42 @@ async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String, settle: bool) 
     if writes {
         body["idempotency_key"] = json!(key);
     }
-    let r = c.call("POST", &format!("/v1/dbs/{db}/txn"), Some(body)).await;
-    t.outcome = match r {
-        Ok(r) if r.status == 200 => {
-            let v = r.json["version"].as_u64().ok_or(format!("no version: {}", r.json))?;
-            if r.json["replayed"] != true {
-                t.results = parse_sent(t, &t.ops, &r.json["results"], true)?;
+    let e = &c.sim.cfg.engine;
+    let dedup_until = t.start + e.commit_retention_ms - 2 * e.clock_sync_max_error_ms;
+    let mut ambiguous = false;
+    loop {
+        let r = c.call("POST", &format!("/v1/dbs/{db}/txn"), Some(body.clone())).await;
+        let unknown = match &r {
+            Ok(r) => r.outcome_unknown() || (ambiguous && r.status == 503),
+            Err(e) => *e != super::super::NetError::Refused || ambiguous,
+        };
+        if writes && unknown {
+            c.pause(ZOMBIE_WAIT_MS).await;
+            if retry && c.sim.now_ms() < dedup_until {
+                ambiguous = true;
+                continue;
             }
-            if writes { Outcome::Committed(v) } else { Outcome::Read(v) }
+            t.outcome = resolve(c, db, &format!("key:{key}"), t, settle).await?;
+            return Ok(());
         }
-        Ok(r) if definite_failure(r.status, &r) => Outcome::NotCommitted,
-        Ok(r) if !writes && r.status == 503 => Outcome::NotCommitted,
-        Ok(r) if r.outcome_unknown() => resolve(c, db, &format!("key:{key}"), t, settle).await?,
-        Err(super::super::NetError::Refused) => Outcome::NotCommitted,
-        Err(_) if writes => resolve(c, db, &format!("key:{key}"), t, settle).await?,
-        Err(_) => Outcome::NotCommitted,
-        Ok(r) => return Err(format!("{}: one-shot {}: {}", c.name, r.status, r.json)),
-    };
-    Ok(())
+        t.outcome = match r {
+            Ok(r) if r.status == 200 => {
+                let v = r.json["version"].as_u64().ok_or(format!("no version: {}", r.json))?;
+                if r.json["replayed"] != true {
+                    t.results = parse_sent(t, &t.ops, &r.json["results"], true)?;
+                }
+                if writes { Outcome::Committed(v) } else { Outcome::Read(v) }
+            }
+            // A retry is deduplicated by the earlier attempt's commit record,
+            // which no attempt can add once the zombie wait is over: its
+            // definite failure is the transaction's.
+            Ok(r) if definite_failure(r.status, &r) => Outcome::NotCommitted,
+            Ok(r) if !writes && r.status == 503 => Outcome::NotCommitted,
+            Err(_) => Outcome::NotCommitted,
+            Ok(r) => return Err(format!("{}: one-shot {}: {}", c.name, r.status, r.json)),
+        };
+        return Ok(());
+    }
 }
 
 async fn interactive(c: &Client, db: &str, t: &mut Txn, rng: &mut Rng, settle: bool) -> Result<(), String> {
@@ -649,7 +674,10 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
                 let settle = rng.chance(shape.settle);
                 match interactive_txn {
                     true => interactive(&c, db, &mut t, &mut rng, settle).await?,
-                    false => one_shot(&c, db, &mut t, format!("{}-{n}", c.name), settle).await?,
+                    false => {
+                        let retry = rng.chance(shape.retry);
+                        one_shot(&c, db, &mut t, format!("{}-{n}", c.name), settle, retry).await?
+                    }
                 }
                 t.end = sim.now_ms();
                 sim.trace.event(&format!("history {t:?}"));

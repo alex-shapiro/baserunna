@@ -126,6 +126,12 @@ probes! {
     CompactionInstallReplayed,
     /// A compaction stopped because its node no longer held the lease.
     CompactionLostLease,
+    /// A compaction ran so long that a sweep may have taken its outputs for
+    /// orphans, and its install was refused.
+    CompactionOutlivedOrphanGrace,
+    /// A read found a segment that garbage collection removed after the
+    /// read's version was replaced.
+    SegmentCollectedUnderRead,
     /// A sweep marked unreferenced objects obsolete.
     OrphansMarked,
     /// Obsolete objects were deleted after a manifest write with an unknown outcome.

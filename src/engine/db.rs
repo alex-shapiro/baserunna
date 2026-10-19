@@ -13,6 +13,7 @@ use super::types::{Entry, Seq, Value, commit_key, decode_commit_record, encode_c
 use super::version::{KeyRange, Snapshot, Version};
 use super::{Shared, blob_prefix, levels_key, manifest_key, seg_key};
 use crate::error::{Error, Result};
+use crate::buggify::buggify;
 use crate::probe::{self, Probe};
 use crate::store::{GetOpts, PutMode, StoreError};
 use crate::timing::{self, StoreOp, Tally};
@@ -62,6 +63,8 @@ enum Work {
         sealed_bytes: u64,
         /// The manifest's `compaction_seq` when the compaction was planned.
         compaction_seq: u64,
+        /// Store time before any output was written.
+        started_ms: u64,
         /// Segments below level 0 after compaction, and optional levels object ID if not stored inline.
         deep: Vec<SegmentMeta>,
         levels: Option<String>,
@@ -645,6 +648,9 @@ impl Db {
         st.reads_in_window += 1;
         let hot = st.hot(cfg.lease_read_threshold);
         let cur = st.current.clone()?;
+        if buggify() {
+            return None;
+        }
         let lease_left = if st.trusted { self.own_lease_left(&st, &cur.m) } else { Duration::ZERO };
         let leased = !lease_left.is_zero();
         let fresh = match c {
@@ -707,7 +713,7 @@ impl Db {
         let (snap, write_in_flight) = self.latest_snapshot().await?;
         let mut t =
             Txn::new(snap, Isolation::Serializable, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes);
-        if write_in_flight {
+        if write_in_flight || buggify() {
             t.mark_optimistic();
             probe::hit(Probe::OptimisticBegin);
         }
@@ -853,7 +859,10 @@ impl Db {
                     q.running = false;
                     return;
                 }
-                let n = q.items.len().min(self.shared.cfg.commit_batch_max);
+                let mut n = q.items.len().min(self.shared.cfg.commit_batch_max);
+                if buggify() {
+                    n = 1 + crate::buggify::below(n as u64) as usize;
+                }
                 q.items.drain(..n).collect()
             };
             let started = Instant::now();
@@ -965,6 +974,13 @@ impl Db {
                 }
                 return;
             };
+            if crate::buggify::fires(0.02) {
+                // A pause between planning a write and sending it, as a slow
+                // or descheduled process takes, can outlast the lease.
+                let ms = crate::buggify::below(cfg.lease_ms);
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            self.shared.env.crash_point().await;
             let started = Instant::now();
             self.limit_own_lease(&m, attempt_started);
             self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -982,6 +998,7 @@ impl Db {
                     for (p, n) in plan.probes {
                         probe::hit_n(p, n);
                     }
+                    self.shared.env.crash_point().await;
                     let v = Arc::new(Version::new(m, etag, self.shared.clone()));
                     let v = self.install(v, Some(started));
                     self.write_finished();
@@ -1060,7 +1077,10 @@ impl Db {
     async fn put_manifest(&self, data: Bytes, etag: &str) -> crate::store::SResult<String> {
         let key = manifest_key(&self.id);
         let put = || self.shared.store.put(&key, data.clone(), PutMode::IfMatch(etag.to_string()));
-        let hedge_ms = self.shared.cfg.manifest_put_hedge_ms;
+        let mut hedge_ms = self.shared.cfg.manifest_put_hedge_ms;
+        if hedge_ms > 0 && buggify() {
+            hedge_ms = 1;
+        }
         let mut first = put();
         if hedge_ms == 0 {
             return first.await;
@@ -1293,6 +1313,7 @@ impl Db {
                     purged_max_seq,
                     sealed_bytes,
                     compaction_seq,
+                    started_ms,
                     deep,
                     levels,
                     ..
@@ -1301,6 +1322,12 @@ impl Db {
                         outcomes.push(Outcome::Unit(Err(Error::unavailable("store clock not synchronized"))));
                         continue;
                     };
+                    // A sweep may already have marked outputs this old as orphans.
+                    if *started_ms + cfg.orphan_grace_ms <= now_ms + bind_margin_ms(cfg) + cfg.clock_sync_max_error_ms {
+                        probe::hit(Probe::CompactionOutlivedOrphanGrace);
+                        outcomes.push(Outcome::Unit(Err(Error::unavailable("compaction outlived the orphan grace"))));
+                        continue;
+                    }
                     let present = inputs.iter().all(|id| m.segments.iter().any(|s| s.id == *id));
                     let installed = !outputs.is_empty()
                         && outputs.iter().all(|o| m.segments.iter().any(|s| s.id == o.id && s.level == o.level));
@@ -1454,7 +1481,7 @@ impl Db {
         };
         let mut sealed = 0;
         let (mut flushed_tail, mut sealed_in_place) = (false, false);
-        if m.tail_bytes() > cfg.tail_max_bytes {
+        if m.tail_bytes() > cfg.tail_max_bytes || (!m.tail.is_empty() && crate::buggify::fires(0.05)) {
             // Data and commit records go to separate segments (see
             // `compaction::pick`), each with every range deletion applied
             // through `m.version`. Long runs of stream records are sealed
@@ -1633,7 +1660,7 @@ impl Db {
         let Some(now) = self.shared.store_now_ms() else { return };
         let mut st = self.st();
         let interval = if st.quota_pressure { cfg.quota_sweep_interval_ms } else { cfg.sweep_interval_ms };
-        if st.sweeping || v.m.last_sweep_ms + interval > now {
+        if st.sweeping || (v.m.last_sweep_ms + interval > now && !crate::buggify::fires(0.02)) {
             return;
         }
         st.sweeping = true;
@@ -1677,6 +1704,7 @@ impl Db {
                 true => Some(self.shared.write_levels(&self.id, deep.clone()).await?),
                 false => None,
             };
+            self.shared.env.crash_point().await;
             let (tx, rx) = oneshot::channel();
             self.enqueue(Work::Compaction {
                 inputs,
@@ -1684,6 +1712,7 @@ impl Db {
                 purged_max_seq,
                 sealed_bytes,
                 compaction_seq: v.m.compaction_seq,
+                started_ms: store_now,
                 deep,
                 levels,
                 tx,
@@ -1789,6 +1818,7 @@ impl Db {
         self.schedule_trims(due);
         if !items.is_empty() {
             probe::hit(Probe::OrphansMarked);
+            self.shared.env.crash_point().await;
         }
         let (tx, rx) = oneshot::channel();
         self.enqueue(Work::Obsolete { items, blob_bytes, chunk_bytes, tx });
@@ -2052,6 +2082,7 @@ mod tests {
             purged_max_seq: 0,
             sealed_bytes: 0,
             compaction_seq,
+            started_ms: 1_000,
             deep: Vec::new(),
             levels: None,
             tx,

@@ -3,7 +3,7 @@
 
 use crate::util::rng::Rng;
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -15,17 +15,61 @@ enum Clock {
 
 pub type Tracer = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Crashes the node at a crash point, given why; false if it declined.
+pub type CrashHook = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 pub struct Env {
     clock: Clock,
     rng: Option<Mutex<Rng>>,
     tasks: Mutex<JoinSet<()>>,
     tracer: Mutex<Option<Tracer>>,
+    /// Crashes this node: installed by a simulation (see [`Env::crash_point`]).
+    crash_hook: Mutex<Option<CrashHook>>,
+    gate: Arc<Gate>,
+}
+
+/// Holds a simulated node's tasks while the node is paused.
+#[derive(Default)]
+struct Gate {
+    paused: std::sync::atomic::AtomicBool,
+    waiting: Mutex<Vec<std::task::Waker>>,
+}
+
+/// A task of a simulated node. Before each poll it may yield, so that tasks
+/// woken together run in varying orders, and it stays pending while its
+/// node is paused.
+struct SimTask<F> {
+    inner: std::pin::Pin<Box<F>>,
+    gate: Arc<Gate>,
+}
+
+impl<F: Future<Output = ()>> Future for SimTask<F> {
+    type Output = ();
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.gate.paused.load(Ordering::SeqCst) {
+            self.gate.waiting.lock().unwrap_or_else(|e| e.into_inner()).push(cx.waker().clone());
+            return std::task::Poll::Pending;
+        }
+        if crate::buggify::reorder() {
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        self.inner.as_mut().poll(cx)
+    }
 }
 
 impl Env {
     /// Creates a production environment backed by the system clock and OS CSPRNG.
     pub fn real() -> Env {
-        Env { clock: Clock::Real, rng: None, tasks: Mutex::new(JoinSet::new()), tracer: Mutex::new(None) }
+        Env {
+            clock: Clock::Real,
+            rng: None,
+            tasks: Mutex::new(JoinSet::new()),
+            tracer: Mutex::new(None),
+            crash_hook: Mutex::new(None),
+            gate: Arc::default(),
+        }
     }
 
     /// Creates a simulated environment with virtual time starting at `origin` (`base_ms`) and clock offset `skew_ms`.
@@ -35,6 +79,30 @@ impl Env {
             rng: Some(Mutex::new(Rng::new(seed))),
             tasks: Mutex::new(JoinSet::new()),
             tracer: Mutex::new(None),
+            crash_hook: Mutex::new(None),
+            gate: Arc::default(),
+        }
+    }
+
+    /// Installs the callback that crashes this node at a crash point.
+    pub fn set_crash_hook(&self, h: CrashHook) {
+        *self.crash_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+    }
+
+    /// A crash point: where a simulation may crash this node between two
+    /// steps that the service must survive being separated. If the point
+    /// fires, the node crashes and the calling task never resumes.
+    #[track_caller]
+    pub fn crash_point(&self) -> impl Future<Output = ()> + use<> {
+        let loc = std::panic::Location::caller();
+        let hook = self.crash_hook.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let crash = hook.filter(|_| crate::buggify::crash_fires(0.01));
+        async move {
+            if let Some(h) = crash
+                && h(&format!("crash point {}:{}", loc.file(), loc.line()))
+            {
+                std::future::pending::<()>().await;
+            }
         }
     }
 
@@ -122,7 +190,24 @@ impl Env {
     {
         let mut t = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         while t.try_join_next().is_some() {}
-        t.spawn(fut);
+        match self.clock {
+            Clock::Sim { .. } => t.spawn(SimTask { inner: Box::pin(fut), gate: self.gate.clone() }),
+            Clock::Real => t.spawn(fut),
+        };
+    }
+
+    /// Stops polling this simulated node's tasks until [`Env::resume`], as
+    /// when its process is descheduled: time passes, its timers expire, and
+    /// nothing it does happens.
+    pub fn pause(&self) {
+        self.gate.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.gate.paused.store(false, Ordering::SeqCst);
+        for w in self.gate.waiting.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            w.wake();
+        }
     }
 
     /// Runs a blocking closure off the async worker threads, or inline under simulation.

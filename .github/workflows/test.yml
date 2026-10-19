@@ -1,0 +1,45 @@
+# Tests and simulation campaigns (SPEC §13.4). Every pull request and push
+# runs the test suite and a time-boxed campaign of fresh seeds; the nightly
+# run explores much longer. A failing seed prints its reproduction command.
+name: Test
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Campaign minutes
+        default: "60"
+jobs:
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
+  campaign:
+    name: Simulation campaign
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --example sim_tool
+      - name: Campaign of fresh seeds
+        env:
+          # Ten minutes on pull requests and pushes, hours at night.
+          SIM_MINUTES: ${{ github.event_name == 'schedule' && '300' || github.event.inputs.minutes || '10' }}
+          SIM_COVERAGE: "1"
+        # Seeds start at the run's id, so every run explores new ones.
+        run: target/release/examples/sim_tool campaign all 1000000 ${{ github.run_id }}
+      - name: Guided exploration
+        if: github.event_name == 'schedule'
+        env:
+          SIM_MINUTES: "60"
+        run: target/release/examples/sim_tool explore all ${{ github.run_id }}

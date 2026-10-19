@@ -489,6 +489,10 @@ impl Node {
 
     /// Returns the `(node_id, addr)` of the peer that should handle `db_id`, or `None` to handle locally.
     pub async fn route(&self, db_id: &str) -> Option<(String, String)> {
+        // As when a forward certainly failed: the request is handled here.
+        if crate::buggify::fault(0.02) {
+            return None;
+        }
         let db = self.engine.db(db_id);
         let _ = db.open(false).await;
         let target = match db.lease_holder() {
@@ -548,9 +552,11 @@ impl Node {
                 let d = 10 * (1u64 << attempt.min(7)) + self.env.random_below(20);
                 tokio::time::sleep(Duration::from_millis(d)).await;
             }
+            // A holder at this node's own address is a previous process,
+            // which no forward can reach.
             if let Some(holder) = sys.lease_holder()
                 && holder != self.id
-                && let Some(addr) = self.addr_of(&holder)
+                && let Some(addr) = self.addr_of(&holder).filter(|a| *a != self.cfg.addr)
             {
                 crate::probe::hit(crate::probe::Probe::MetaForwarded);
                 match self.forward_meta(&holder, &addr, &cmd).await {
@@ -669,7 +675,7 @@ impl Node {
 
     async fn principal(&self, token: &str) -> Result<Principal> {
         let cache_key = auth::secret_hash(token);
-        if let Some(p) = self.auth_cache.get(&cache_key) {
+        if let Some(p) = self.auth_cache.get(&cache_key).filter(|_| !crate::buggify::fires(0.1)) {
             return Ok(p);
         }
         let read_at = Instant::now();
@@ -829,6 +835,7 @@ impl Node {
                 bootstrap_admin: false,
             })
             .await?;
+        self.env.crash_point().await;
         if let (true, Ok(mailer)) = (r.created, self.mailer()) {
             self.mail_verification(mailer, &r.user);
         }
@@ -871,6 +878,7 @@ impl Node {
             verify_email: false,
         })
         .await?;
+        self.env.crash_point().await;
         self.delete_ended_sessions(&user.id, Some(token_hash)).await;
         Ok(())
     }
@@ -1074,6 +1082,7 @@ impl Node {
             verify_email: true,
         };
         self.run_meta(set).await.map_err(|e| if matches!(e, Error::PreconditionFailed { .. }) { used() } else { e })?;
+        self.env.crash_point().await;
         self.forget_user(&user.id);
         self.delete_ended_sessions(&user.id, None).await;
         self.limiter.succeeded(&Self::failures_of(&user.email));
@@ -1243,6 +1252,7 @@ impl Node {
                 continue;
             }
             self.engine.purge(&d.id).await?;
+            self.env.crash_point().await;
             self.run_meta(MetaCmd::PurgePass { id: d.id.clone(), passes: d.purge_passes }).await?;
             n += 1;
         }

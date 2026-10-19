@@ -243,6 +243,7 @@ impl Engine {
     /// Drop handles that are idle for `idle_ms` and not in use.
     pub fn evict_idle(&self, idle_ms: u64) {
         let mut g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
+        let idle_ms = if crate::buggify::buggify() { 0 } else { idle_ms };
         g.retain(|_, db| Arc::strong_count(db) > 1 || !db.idle_for(idle_ms));
     }
 

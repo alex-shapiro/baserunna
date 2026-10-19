@@ -148,9 +148,13 @@ impl Client {
             self.name,
             match &r {
                 Ok(r) => format!(
-                    "{} {}{}",
+                    "{} {}{}{}",
                     r.status,
                     crate::util::b64::hex(&crate::util::sha256(&r.body)[..6]),
+                    match r.status >= 400 {
+                        true => format!(" {}", String::from_utf8_lossy(&r.body[..r.body.len().min(160)])),
+                        false => String::new(),
+                    },
                     r.headers
                         .get("x-baserunna-version")
                         .and_then(|v| v.to_str().ok())

@@ -35,7 +35,7 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
     let n = sim.node_count();
     let up = sim.up_nodes();
     let weights =
-        [c.crash, c.start, c.partition, c.one_way_partition, c.store_isolation, c.clock_step, c.heal, c.quiet];
+        [c.crash, c.start, c.partition, c.one_way_partition, c.store_isolation, c.clock_step, c.heal, c.quiet, c.pause_node];
     let mut r = sim.fork_rng();
     let Some(action) = super::swarm::weighted(&mut r, &weights) else {
         return;
@@ -46,7 +46,7 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
         (a, (a + 1 + r.usize(n - 1)) % n)
     };
     match action {
-        0 if n == 1 => sim.restart(pick_up(&mut r)).await,
+        0 if n == 1 && !up.is_empty() => sim.restart(pick_up(&mut r)).await,
         0 if up.len() > 1 => sim.crash(pick_up(&mut r)),
         1 => {
             if let Some(i) = (0..n).find(|i| !up.contains(i)) {
@@ -68,6 +68,10 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
         }
         6 => sim.heal(),
         7 => sim.sleep(r.below(20_000)).await,
+        8 if !up.is_empty() => {
+            let ms = r.below(3 * sim.cfg.engine.read_lease_ms);
+            sim.pause_node(pick_up(&mut r), ms);
+        }
         _ => {}
     }
 }

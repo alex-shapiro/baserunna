@@ -180,6 +180,9 @@ impl Cache {
     }
 
     pub fn get(&self, k: &CacheKey) -> Option<CacheVal> {
+        if crate::buggify::fires(0.05) {
+            return None;
+        }
         self.shard(k).get(k)
     }
 

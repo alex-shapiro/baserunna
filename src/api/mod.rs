@@ -503,7 +503,12 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
     match node.forwards.deliver(&key) {
         Delivery::First(slot) => {
             let (parts, body) = next.run(req).await.into_parts();
-            match http_body_util::BodyExt::collect(body).await {
+            // A response can fail while it streams back.
+            match http_body_util::BodyExt::collect(body).await.map_err(|e| e.to_string()) {
+                Ok(_) if crate::buggify::fault(0.01) => {
+                    slot.finish(None);
+                    unknown_outcome("response failed: buggified".into())
+                }
                 Ok(b) => {
                     let r = ReplayedResponse { status: parts.status, headers: parts.headers, body: b.to_bytes() };
                     slot.finish(Some(r.clone()));

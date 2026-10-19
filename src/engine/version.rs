@@ -6,9 +6,9 @@ use super::manifest::{Levels, MAX_LEVEL, Manifest, SegmentMeta};
 use super::range_delete::{RangeDeletes, RangeTombstone};
 use super::segment::{self, Block, FOOTER_LEN, Footer, SegmentIndex};
 use super::types::{COMMIT_SPACE, Entry, Seq};
-use super::{Shared, levels_key, seg_key};
+use super::{Shared, levels_key, manifest_key, seg_key};
 use crate::error::{Error, Result};
-use crate::store::GetOpts;
+use crate::store::{GetOpts, GetResult, StoreError};
 use bytes::Bytes;
 use std::collections::{BinaryHeap, VecDeque};
 use std::ops::Bound;
@@ -278,14 +278,13 @@ impl Shared {
         if let Some(CacheVal::Index(i)) = self.cache.get(&ck) {
             return Ok(i);
         }
-        let key = seg_key(db, &seg.id);
         if seg.size <= self.whole_fetch_max() {
             if let Some(d) = self.local_get(db, &seg.id, "all").await
                 && let Ok(idx) = self.cache_whole(db, &seg.id, &d)
             {
                 return Ok(idx);
             }
-            let g = self.retry.run(|| self.store.get(&key, GetOpts::default())).await?;
+            let g = self.seg_get(db, &seg.id, GetOpts::default()).await?;
             let idx = self.cache_whole(db, &seg.id, &g.data)?;
             self.local_put(db, &seg.id, "all", g.data);
             return Ok(idx);
@@ -314,13 +313,11 @@ impl Shared {
             return Ok(idx);
         }
         let g = self
-            .retry
-            .run(|| self.store.get(&key, GetOpts { range: Some(size - FOOTER_LEN as u64..size), ..Default::default() }))
+            .seg_get(db, &seg.id, GetOpts { range: Some(size - FOOTER_LEN as u64..size), ..Default::default() })
             .await?;
         let footer = Footer::decode(&g.data, size)?;
         let start = footer.bloom_off;
-        let g =
-            self.retry.run(|| self.store.get(&key, GetOpts { range: Some(start..size), ..Default::default() })).await?;
+        let g = self.seg_get(db, &seg.id, GetOpts { range: Some(start..size), ..Default::default() }).await?;
         if g.data.len() as u64 != size - start {
             return Err(Error::internal("short segment read"));
         }
@@ -328,6 +325,34 @@ impl Shared {
         self.cache.insert(ck, CacheVal::Index(idx.clone()));
         self.local_put(db, &seg.id, "meta", g.data);
         Ok(idx)
+    }
+
+    /// Reads from segment `seg` of `db`. A segment that garbage collection
+    /// removed after the reading version was replaced fails the read with a
+    /// retryable error; one the current version still lists is reported lost.
+    async fn seg_get(&self, db: &str, seg: &str, opts: GetOpts) -> Result<GetResult> {
+        let key = seg_key(db, seg);
+        match self.retry.run(|| self.store.get(&key, opts.clone())).await {
+            Err(StoreError::NotFound) => Err(self.missing(db, seg).await),
+            r => Ok(r?),
+        }
+    }
+
+    async fn missing(&self, db: &str, seg: &str) -> Error {
+        let key = manifest_key(db);
+        let m = match self.retry.run(|| self.store.get(&key, GetOpts::default())).await {
+            Ok(g) => self.load_manifest(db, &g.data, None).await,
+            Err(StoreError::NotFound) => return Error::not_found("database not found"),
+            Err(e) => return e.into(),
+        };
+        match m {
+            Ok(m) if m.segments.iter().any(|s| s.id == seg) => Error::internal(format!("segment {seg} is missing")),
+            Ok(_) => {
+                crate::probe::hit(crate::probe::Probe::SegmentCollectedUnderRead);
+                Error::unavailable("garbage collection removed a segment this read needed; retry")
+            }
+            Err(e) => e,
+        }
     }
 
     fn cached_block(&self, db: &str, seg: &str, bi: usize) -> Option<Block> {
@@ -361,11 +386,7 @@ impl Shared {
         let ck = self.cache_key(db, &seg.id, bi as u32);
         let part = format!("b{bi}");
         let (_, off, len) = idx.blocks[bi];
-        let key = seg_key(db, &seg.id);
-        let g = self
-            .retry
-            .run(|| self.store.get(&key, GetOpts { range: Some(off..off + len as u64), ..Default::default() }))
-            .await?;
+        let g = self.seg_get(db, &seg.id, GetOpts { range: Some(off..off + len as u64), ..Default::default() }).await?;
         if g.data.len() != len as usize {
             return Err(Error::internal("short block read"));
         }
@@ -395,11 +416,7 @@ impl Shared {
             end += 1;
         }
         let span = idx.span(first..end);
-        let key = seg_key(db, &seg.id);
-        let g = self
-            .retry
-            .run(|| self.store.get(&key, GetOpts { range: Some(span.clone()), ..Default::default() }))
-            .await?;
+        let g = self.seg_get(db, &seg.id, GetOpts { range: Some(span.clone()), ..Default::default() }).await?;
         if g.data.len() as u64 != span.end - span.start {
             return Err(Error::internal("short segment read"));
         }

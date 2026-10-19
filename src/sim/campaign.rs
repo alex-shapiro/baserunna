@@ -69,12 +69,14 @@ impl Report {
     }
 }
 
-/// Runs every `(scenario, seed)` pair on `threads` threads. `progress` sees
-/// each outcome as it completes.
+/// Runs every `(scenario, seed)` pair on `threads` threads, seed by seed,
+/// starting no run after `deadline`. `progress` sees each outcome as it
+/// completes.
 pub fn campaign(
     scenarios: &[Scenario],
     seeds: &[u64],
     threads: usize,
+    deadline: Option<std::time::Instant>,
     progress: impl Fn(&'static str, &SimOutcome) + Sync,
 ) -> Report {
     let jobs: Vec<(usize, u64)> = seeds.iter().flat_map(|s| (0..scenarios.len()).map(move |i| (i, *s))).collect();
@@ -84,6 +86,9 @@ pub fn campaign(
         for _ in 0..threads.max(1) {
             scope.spawn(|| {
                 loop {
+                    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                        return;
+                    }
                     let j = next.fetch_add(1, Ordering::SeqCst);
                     let Some(&(i, seed)) = jobs.get(j) else { return };
                     let s = &scenarios[i];

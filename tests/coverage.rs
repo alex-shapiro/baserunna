@@ -7,7 +7,7 @@ use baserunna::sim::workloads::scenarios;
 
 #[test]
 fn simulation_exercises_every_documented_operation_and_probe() {
-    let report = campaign(&scenarios(), &[1, 2], default_threads(), |_, _| {});
+    let report = campaign(&scenarios(), &[1, 2], default_threads(), None, |_, _| {});
     if let Some(f) = report.failures.first() {
         panic!("scenario {} seed {} failed: {}", f.scenario, f.seed, f.error);
     }

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run --release --example sim_tool -- list
-//! cargo run --release --example sim_tool -- campaign <scenario|all> <seeds> [first_seed]   # SIM_THREADS, SIM_COVERAGE=1
+//! cargo run --release --example sim_tool -- campaign <scenario|all> <seeds> [first_seed]   # SIM_THREADS, SIM_MINUTES, SIM_COVERAGE=1
 //! cargo run --release --example sim_tool -- trace <scenario> <seed>      # full trace
 //! cargo run --release --example sim_tool -- determinism <scenario> <seed>
 //! ```
@@ -42,9 +42,15 @@ fn main() {
                 std::env::var("SIM_THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or_else(default_threads);
             let seeds: Vec<u64> = (first..first + n).collect();
             let t = std::time::Instant::now();
-            let report = campaign(&chosen, &seeds, threads, |name, out| {
+            // SIM_MINUTES bounds a campaign's wall time instead of its seeds.
+            let deadline = std::env::var("SIM_MINUTES")
+                .ok()
+                .and_then(|m| m.parse::<u64>().ok())
+                .map(|m| t + std::time::Duration::from_secs(60 * m));
+            let report = campaign(&chosen, &seeds, threads, deadline, |name, out| {
                 if let Err(e) = &out.result {
                     println!("FAIL {name} seed={}: {e}", out.seed);
+                    println!("  reproduce: cargo run --release --example sim_tool -- trace {name} {}", out.seed);
                 }
             });
             if std::env::var("SIM_COVERAGE").is_ok() {

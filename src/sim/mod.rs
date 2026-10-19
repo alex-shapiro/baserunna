@@ -131,6 +131,8 @@ pub struct ChaosFaults {
     pub heal: u64,
     /// Pause longer, letting the cluster settle.
     pub quiet: u64,
+    /// Pause a node's process for up to three lease durations.
+    pub pause_node: u64,
     pub clock_step_max_ms: u64,
 }
 
@@ -166,6 +168,13 @@ pub struct SimConfig {
     pub request_timeout_ms: u64,
     /// The knobs this configuration was drawn from, if it was (see [`swarm`]).
     pub knobs: Option<Arc<swarm::Knobs>>,
+    /// The share of buggify sites active in a run (see [`crate::buggify`]).
+    pub buggify: f64,
+    /// Whether crash points may crash nodes.
+    pub crash_points: bool,
+    /// How often a node's task yields before a poll, varying the order of
+    /// tasks that are ready together.
+    pub reorder: f64,
 }
 
 impl SimConfig {
@@ -231,6 +240,9 @@ impl SimConfig {
             full_trace: std::env::var("SIM_LOG").as_deref() == Ok("all"),
             request_timeout_ms: 30_000,
             knobs: None,
+            buggify: 0.0,
+            crash_points: false,
+            reorder: 0.0,
         }
     }
 
@@ -250,6 +262,8 @@ impl SimConfig {
 
 pub struct SimNode {
     pub idx: usize,
+    /// Which start of the simulation this process was.
+    pub start: u64,
     pub node: Arc<Node>,
     pub router: axum::Router,
 }
@@ -290,6 +304,8 @@ pub struct Sim {
     /// The first violation a global oracle found.
     violation: Mutex<Option<String>>,
     pub knobs: Arc<swarm::Knobs>,
+    /// When a crash point last crashed a node.
+    last_point_crash: Mutex<Option<Instant>>,
     /// Workloads in their chaos phase, and the chaos loop they share.
     pub(crate) chaos: Mutex<workloads::ChaosState>,
     /// Notified when the last chaos phase ends and the cluster has recovered.
@@ -323,6 +339,9 @@ fn take_panic() -> Option<String> {
 }
 
 const LOCAL_TIER_BYTES: u64 = 64 * 1024;
+
+/// Least virtual time between two crashes at crash points.
+const POINT_CRASH_SPACING_MS: u64 = 30_000;
 
 /// Virtual time a run may take: longer means a workload made no progress.
 const MAX_VIRTUAL_MS: u64 = 6 * 3_600_000;
@@ -497,6 +516,7 @@ impl Sim {
             crashes: AtomicU64::new(0),
             violation: Mutex::new(None),
             knobs: cfg.knobs.clone().unwrap_or_else(|| Arc::new(swarm::Knobs::new(seed))),
+            last_point_crash: Mutex::new(None),
             chaos: Mutex::new(Default::default()),
             chaos_over: tokio::sync::Notify::new(),
             admin: tokio::sync::Mutex::new(None),
@@ -554,6 +574,8 @@ impl Sim {
         cfg.engine.local_tier = Some(self.disks[i].clone());
         for attempt in 0..50u64 {
             let env = Arc::new(Env::sim(self.seed ^ (n * 7919 + attempt + 1), self.base_ms, self.origin, skew));
+            let me = self.me.clone();
+            env.set_crash_hook(Arc::new(move |why: &str| me.upgrade().is_some_and(|sim| sim.crash_at_point(i, n, why))));
             if self.cfg.keep_log {
                 let trace = self.trace.clone();
                 let base = self.base_ms;
@@ -575,7 +597,7 @@ impl Sim {
                     let router = api::router(node.clone());
                     self.trace.event(&format!("start n{i} as {}", node.id));
                     *self.slots[i].lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(Arc::new(SimNode { idx: i, node, router }));
+                        Some(Arc::new(SimNode { idx: i, start: n, node, router }));
                     return;
                 }
                 Err(e) => {
@@ -586,6 +608,35 @@ impl Sim {
             }
         }
         panic!("node {i} could not start");
+    }
+
+    /// Crashes node `i` at a crash point, if it is still the `n`th process
+    /// started, and starts it again a little later.
+    fn crash_at_point(self: &Arc<Self>, i: usize, n: u64, why: &str) -> bool {
+        let current = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.start);
+        if current != Some(n) {
+            return false;
+        }
+        // Crashes at crash points are spaced out, so that a node that keeps
+        // reaching one does not crash on every start.
+        {
+            let mut last = self.last_point_crash.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|t| t.elapsed() < Duration::from_millis(POINT_CRASH_SPACING_MS)) {
+                return false;
+            }
+            *last = Some(Instant::now());
+        }
+        self.trace.event(&format!("n{i}: {why}"));
+        self.crash(i);
+        let sim = self.clone();
+        let delay = 100 + self.rand_below(5_000);
+        tokio::spawn(async move {
+            sim.sleep(delay).await;
+            if sim.node(i).is_none() {
+                sim.start(i).await;
+            }
+        });
+        true
     }
 
     /// Aborts node `i`'s tasks and drops its in-memory state.
@@ -681,6 +732,20 @@ impl Sim {
         self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).contains(&i)
     }
 
+    /// Pauses node `i` for `ms`, as a stop-the-world pause or a frozen VM
+    /// would: no task of it runs meanwhile.
+    pub fn pause_node(self: &Arc<Self>, i: usize, ms: u64) {
+        let Some(n) = self.node(i) else { return };
+        self.trace.event(&format!("pause n{i} for {ms}ms"));
+        n.node.env.pause();
+        let sim = self.clone();
+        tokio::spawn(async move {
+            sim.sleep(ms).await;
+            n.node.env.resume();
+            sim.trace.event(&format!("resume n{i}"));
+        });
+    }
+
     pub fn step_clock(&self, i: usize, delta_ms: i64) {
         if let Some(n) = self.node(i) {
             n.node.env.step_clock(delta_ms);
@@ -757,6 +822,7 @@ pub struct SimOutcome {
     pub crashes: u64,
     pub storage: StorageReport,
     pub probes: crate::probe::Hits,
+    pub buggify: crate::buggify::Report,
     /// The knob values the run drew, by name.
     pub knobs: Vec<(&'static str, String)>,
     pub trace_tail: Vec<String>,
@@ -790,6 +856,13 @@ where
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
     let full_trace = cfg.full_trace;
     crate::probe::record();
+    let b = crate::buggify::Config {
+        p_active: cfg.buggify,
+        faults: cfg.chaos.enabled,
+        crashes: cfg.crash_points,
+        p_reorder: cfg.reorder,
+    };
+    crate::buggify::enable(seed ^ 0xb066_1f1e, b);
     let out = rt.block_on(async move {
         let start = Instant::now();
         let sim = Sim::new(seed, cfg).await;
@@ -847,11 +920,12 @@ where
             crashes: sim.crashes.load(Ordering::Relaxed),
             storage,
             probes: crate::probe::Hits::default(),
+            buggify: Default::default(),
             knobs: sim.knobs.drawn(),
             trace_tail,
         }
     });
-    SimOutcome { probes: crate::probe::finish(), ..out }
+    SimOutcome { probes: crate::probe::finish(), buggify: crate::buggify::disable(), ..out }
 }
 
 /// Time required for two reaper passes to purge all deleted databases.

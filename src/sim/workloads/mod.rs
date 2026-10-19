@@ -46,7 +46,7 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
         c.pause_node,
     ];
     let mut r = sim.fork_rng();
-    let Some(action) = super::swarm::weighted(&mut r, &weights) else {
+    let Some(action) = r.weighted(&weights.map(|w| w as f64)) else {
         return;
     };
     let pick_up = |r: &mut crate::util::rng::Rng| up[r.usize(up.len())];

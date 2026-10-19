@@ -17,6 +17,7 @@ use baserunna::sim::campaign::{Job, RARE, Report, campaign, default_threads, par
 use baserunna::sim::explore::{Budget, explore};
 use baserunna::sim::workloads::{Scenario, scenario, scenarios};
 use baserunna::sim::{SimOutcome, run};
+use baserunna::util::prop::env_u64;
 use std::time::{Duration, Instant};
 
 /// Runs explored when neither `SIM_RUNS` nor `SIM_MINUTES` bounds them.
@@ -29,10 +30,6 @@ fn run_one(name: &str, seed: u64, branches: &str, keep_log: bool) -> SimOutcome 
     cfg.keep_log = keep_log;
     cfg.full_trace = keep_log;
     run(seed, cfg, s.run)
-}
-
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
 /// The scenarios a command names: one, or `all`.
@@ -54,19 +51,28 @@ fn deadline(start: Instant) -> Option<Instant> {
 fn report_failure(scenarios: &[Scenario]) -> impl Fn(&Job, &SimOutcome) + Sync + '_ {
     move |job, out| {
         if let Err(e) = &out.result {
-            println!("FAIL {}: {e}", job.args(scenarios));
-            println!("  reproduce: cargo run --release --example sim_tool -- trace {}", job.args(scenarios));
+            let args = job.args(scenarios);
+            println!("FAIL {args}: {e}\n  reproduce: cargo run --release --example sim_tool -- trace {args}");
         }
     }
 }
 
-/// Prints failures grouped by their message with digits blanked, so that
-/// repeats of one failure count once.
+/// Prints failures grouped by their message with numbers and ids blanked,
+/// so that repeats of one failure count once.
 fn print_distinct(report: &Report) {
     let mut by: std::collections::BTreeMap<String, usize> = Default::default();
     for (_, e) in &report.failures {
         let first = e.lines().next().unwrap_or("");
-        let shape: String = first.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).take(160).collect();
+        let shape: String = first
+            .split_inclusive(|c: char| !c.is_ascii_alphanumeric())
+            .map(|w| match w.contains(|c: char| c.is_ascii_digit()) {
+                true => format!("#{}", w.trim_start_matches(|c: char| c.is_ascii_alphanumeric())),
+                false => w.to_string(),
+            })
+            .collect::<String>()
+            .chars()
+            .take(160)
+            .collect();
         *by.entry(shape).or_default() += 1;
     }
     let mut v: Vec<(usize, String)> = by.into_iter().map(|(k, n)| (n, k)).collect();
@@ -145,15 +151,11 @@ fn main() {
                     base.probes().len(),
                     base.failures.len()
                 );
-                let only: Vec<String> = r
-                    .features
-                    .keys()
-                    .filter(|f| !base.features.contains_key(f))
-                    .map(|(p, b)| format!("{}#{b}", p.name()))
-                    .collect();
+                let only: Vec<String> =
+                    r.features.keys().filter(|f| !base.features.contains_key(f)).map(|f| f.to_string()).collect();
                 println!("features only exploration reached: {}", only.join(" "));
-                // How often each method put a run into the situations a plain
-                // campaign rarely reaches.
+                // How often each method's runs reached, by themselves, the
+                // situations a plain campaign rarely reaches.
                 let n = |r: &Report, p: Probe| r.runs_hitting.get(p as usize).copied().unwrap_or(0);
                 let rare: Vec<String> = Probe::ALL
                     .iter()

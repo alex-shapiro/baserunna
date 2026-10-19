@@ -1017,8 +1017,9 @@ resurrect a purged database.
   answering the same whether or not the account exists. Links carry a
   token signed with the cluster's `cookie_key`: its purpose, the user id
   and a fingerprint of the address (verification, 7 days) or of the
-  current password hash (reset, 1 hour). A reset therefore works once,
-  verifies the address, and ends every session. No token is stored. Mail
+  current password hash (reset, 1 hour). A reset link therefore sets one
+  password (repeating it with that password finishes the reset), verifies
+  the address, and ends every session. No token is stored. Mail
   per address is rate limited (6 an hour, burst 3).
 - **API keys**: `brk_<id>_<secret>`. Only the secret's SHA-256 is stored. A
   key can be scoped to one DB and/or read-only. It is shown once at creation.
@@ -1384,7 +1385,7 @@ of at least two workloads in one cluster; workloads that need an
 administrator share the first account. A run that takes over six hours of
 virtual time fails: some workload stopped making progress.
 
-Clients resolve ambiguous outcomes as SPEC §6.2 requires: a fenced
+Clients resolve ambiguous outcomes as §6.2 requires: a fenced
 commit status is definitive only within commit retention, and past it,
 outcomes come from the data: markers written with each attempt, or the
 state of a single-writer database.
@@ -1394,7 +1395,7 @@ state of a single-writer database.
 | `history`      | Concurrent clients run random multi-key transactions (one-shot and interactive, serializable and snapshot-isolated, strong and stale reads, retried with their idempotency key or not) on a few keys, with no model of their own. Every write also writes a marker, so the markers left at the end tell which transactions committed and at which version, and each outcome reported to a client must agree. Committed writes replayed in version order must explain every value and version every read observed; a transaction that began after another finished is serialized after it; and no transaction commits over a write to its keys after its snapshot (first committer wins). |
 | `kv_model`     | Random KV ops through every API form under faults, each response compared with a model. Ambiguous commits are resolved through `/commits/{id}`, or from the database's state past commit retention. Bulk writes and prefix deletes make range tombstones over segment data, and a final phase outlives every transaction so they retire. A small size quota refuses writes now and then: refused writes leave no trace, deletes are never refused, and the size stays near the quota. A follower of the change feed checks every change against the model and must rebuild the model's state, starting over when its cursor expires.                                                                                                                                                                                                                                                                                                           |
 | `bank`         | Concurrent transfers across nodes. The total never changes and no balance goes negative, checked during the run and at the end. Each attempt writes a marker, which settles an ambiguous transfer that its commit status no longer can.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `register`     | Concurrent writers and strong readers on a few keys, checked for real-time linearizability. Readers exercise `GET`, unforwarded `GET`, and read-only and read-write transactions. `register_contended` adds short pauses and delayed store responses.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `register`     | Concurrent writers and strong readers on a few keys, checked for real-time linearizability. Readers exercise `GET`, unforwarded `GET`, and read-only and read-write transactions.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `tables`       | Schema changes and row ops against a model, including updates and deletes by selection that must change exactly the rows the model selects. A follower of the table's change feed must rebuild the model's rows. At quiescence indexes match a recomputation from rows, unique constraints hold, and dropped tables and indexes (large enough to take range tombstones) leave nothing behind.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `schema_race`  | Row writes on every path (batch updates and deletes included) and at both isolation levels race schema changes. Indexes must match rows, nothing may be orphaned, and each writer's rows must match its model.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `ttl`          | Values and rows with times to live. Each read must see a value until its expiry window (the commit request's span plus the TTL, widened by the clock error bound) and never after, nor a value it replaced; a unique value is free exactly when its row expired. Clients take and renew a lock held by an expiring value: in version order, each acquisition is committed no earlier than the previous lock's expiry and each renewal is committed before the lock it read expired.                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -1447,16 +1448,17 @@ the records it claims, with no overlap within a stream.
   of reaching them again, as Antithesis restarts tests from its
   assertions' checkpoints. Runs that show a new feature (a probe and the
   magnitude of its count, or two rare probes in one run) join the corpus.
-  Exploration trades breadth for depth: over 2,100 runs it reached 433
-  features to a campaign's 480, but put 4 to 22 times as many runs into
-  the rarest situations (a segment collected under a read: 72 runs to 5; a
-  duplicate forward of unknown outcome: 111 to 5), and found more failing
-  runs. Campaigns and exploration complement each other.
-- **Bug zoo** (`bugzoo/`): a patch per historic bug in §13.6 reintroduces
-  it, and `bugzoo/run.sh` measures how many runs of a strategy find each.
-  Given about 2,800 campaign runs per bug, the simulator before this
-  section's design rediscovered 14 of 27 bugs and the current campaigns
-  17; 2,000 more runs of exploration raised that to 20.
+  Exploration trades breadth for depth: over 2,100 runs it reached 434
+  features to a campaign's 461, but counting only what branched runs
+  reached after their last branch point, it put up to 9 times as many runs
+  into the rarest situations (a segment collected under a read: 45 runs to
+  5; a commit out of retries: 99 to 35) and reached two probes the campaign
+  never did. Campaigns and exploration complement each other.
+- **Bug zoo** (`bugzoo/`): patches reintroduce the bugs of §13.6 found
+  before this section's design, and `bugzoo/run.sh` measures how many runs
+  of a strategy find each. With 780 to 2,800 runs per bug, the earlier
+  simulator rediscovered 14 of 27 bugs, the current campaigns 17, and
+  campaigns with exploration 20.
 
 ### 13.5 Other test layers
 

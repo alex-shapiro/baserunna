@@ -120,6 +120,23 @@ impl Rng {
         self.unit() < p
     }
 
+    /// Picks an index with probability proportional to its weight, or
+    /// `None` if every weight is zero.
+    pub fn weighted(&mut self, weights: &[f64]) -> Option<usize> {
+        let total: f64 = weights.iter().sum();
+        if total <= 0.0 {
+            return None;
+        }
+        let mut x = self.unit() * total;
+        for (i, w) in weights.iter().enumerate() {
+            if x < *w {
+                return Some(i);
+            }
+            x -= w;
+        }
+        weights.iter().rposition(|w| *w > 0.0)
+    }
+
     /// Uniform float in `[0, 1)`.
     pub fn unit(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)

@@ -208,6 +208,9 @@ pub struct Hits {
     pub counts: Vec<u64>,
     /// Milliseconds from the start of the recording to each probe's first hit.
     pub first_ms: Vec<Option<u64>>,
+    /// Hit counts from [`own_from`] on: in a branched run, the hits it made
+    /// itself rather than by repeating its parent.
+    pub own: Vec<u64>,
 }
 
 impl Hits {
@@ -224,12 +227,21 @@ impl Hits {
         Probe::ALL.iter().copied().filter(|p| self.count(*p) > 0)
     }
 
+    /// The probes hit at least once from [`own_from`] on.
+    pub fn hit_own(&self) -> impl Iterator<Item = Probe> + '_ {
+        Probe::ALL.iter().copied().filter(|p| self.own.get(*p as usize).is_some_and(|n| *n > 0))
+    }
+
     pub fn add(&mut self, o: &Hits) {
         let n = Probe::ALL.len();
         self.counts.resize(n, 0);
         self.first_ms.resize(n, None);
+        self.own.resize(n, 0);
         for (i, c) in o.counts.iter().enumerate() {
             self.counts[i] += c;
+        }
+        for (i, c) in o.own.iter().enumerate() {
+            self.own[i] += c;
         }
         for (i, t) in o.first_ms.iter().enumerate() {
             self.first_ms[i] = match (self.first_ms[i], *t) {
@@ -242,6 +254,7 @@ impl Hits {
 
 struct Recording {
     origin: Instant,
+    own_from_ms: u64,
     hits: Hits,
 }
 
@@ -261,10 +274,13 @@ pub fn hit_n(p: Probe, n: u64) {
     }
     RECORDING.with(|r| {
         if let Some(r) = r.borrow_mut().as_mut() {
-            let i = p as usize;
+            let (i, ms) = (p as usize, r.origin.elapsed().as_millis() as u64);
             r.hits.counts[i] += n;
+            if ms >= r.own_from_ms {
+                r.hits.own[i] += n;
+            }
             if r.hits.first_ms[i].is_none() {
-                r.hits.first_ms[i] = Some(r.origin.elapsed().as_millis() as u64);
+                r.hits.first_ms[i] = Some(ms);
             }
         }
     });
@@ -273,8 +289,18 @@ pub fn hit_n(p: Probe, n: u64) {
 /// Starts a new recording on this thread, discarding any current one.
 pub fn record() {
     let n = Probe::ALL.len();
-    let hits = Hits { counts: vec![0; n], first_ms: vec![None; n] };
-    RECORDING.with(|r| *r.borrow_mut() = Some(Recording { origin: Instant::now(), hits }));
+    let hits = Hits { counts: vec![0; n], first_ms: vec![None; n], own: vec![0; n] };
+    RECORDING.with(|r| *r.borrow_mut() = Some(Recording { origin: Instant::now(), own_from_ms: 0, hits }));
+}
+
+/// Counts hits from `ms` after the start of this thread's recording as the
+/// run's own ([`Hits::own`]).
+pub fn own_from(ms: u64) {
+    RECORDING.with(|r| {
+        if let Some(r) = r.borrow_mut().as_mut() {
+            r.own_from_ms = ms;
+        }
+    });
 }
 
 /// Ends this thread's recording and returns its hits.
@@ -302,6 +328,12 @@ mod tests {
         assert_eq!((h.count(Probe::CommitBatched), h.count(Probe::TailFlushed)), (1, 3));
         assert_eq!(h.hit().collect::<Vec<_>>(), [Probe::CommitBatched, Probe::TailFlushed]);
         assert_eq!(count(Probe::CommitBatched), 0);
+        record();
+        hit(Probe::CommitBatched);
+        own_from(u64::MAX);
+        hit(Probe::TailFlushed);
+        let h = finish();
+        assert_eq!(h.hit_own().collect::<Vec<_>>(), [Probe::CommitBatched], "hits before own_from's time");
         assert!(Probe::ALL.iter().all(|p| !p.doc().is_empty()), "every probe says what it marks");
     }
 }

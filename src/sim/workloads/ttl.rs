@@ -31,8 +31,8 @@ struct Val {
     version: u64,
     expires: Option<(u64, u64)>,
     /// A write's outcome could not be learned: its commit record expired
-    /// before its retries ended, and the value may have expired since.
-    /// Any read is explained until the next write whose outcome is known.
+    /// before its retries ended. Any read is explained until the next write
+    /// whose outcome is known, or until `expires` bounds it.
     uncertain: bool,
 }
 
@@ -52,11 +52,11 @@ enum Seen {
 /// Expected visibility of `v` for a read spanning `[r0, r1]`.
 fn expect(v: Option<&Val>, r0: u64, r1: u64, eps: u64) -> Seen {
     match v.map(|v| v.expires) {
+        Some(Some((_, hi))) if r0.saturating_sub(eps) >= hi => Seen::Absent,
         _ if v.is_some_and(|v| v.uncertain) => Seen::Either,
         None => Seen::Absent,
         Some(None) => Seen::Present,
         Some(Some((lo, _))) if r1 + eps < lo => Seen::Present,
-        Some(Some((_, hi))) if r0.saturating_sub(eps) >= hi => Seen::Absent,
         Some(Some(_)) => Seen::Either,
     }
 }
@@ -69,10 +69,10 @@ fn check_read(
     r1: u64,
     eps: u64,
 ) -> Result<(), String> {
-    if v.is_some_and(|v| v.uncertain) {
+    let seen = expect(v, r0, r1, eps);
+    if v.is_some_and(|v| v.uncertain) && seen == Seen::Either {
         return Ok(());
     }
-    let seen = expect(v, r0, r1, eps);
     match (got, v) {
         (None, _) if seen != Seen::Present => Ok(()),
         (Some((data, version, expires)), Some(m)) if seen != Seen::Absent => {
@@ -557,6 +557,13 @@ mod tests {
         assert!(check_read("t", Some(&val(None)), Some(("d", 3, None)), 0, 1, 10).is_ok());
         assert!(check_read("t", Some(&val(None)), Some(("d", 3, Some(5))), 0, 1, 10).is_err());
         assert!(check_read("t", None, Some(("d", 3, None)), 0, 1, 10).is_err(), "a deleted value");
+        let unsure = Val { expires: Some((0, 1_000)), ..Val::uncertain() };
+        assert!(check_read("t", Some(&unsure), Some(("t1", 0, Some(990))), 900, 950, 10).is_ok());
+        assert!(check_read("t", Some(&unsure), None, 900, 950, 10).is_ok());
+        assert!(
+            check_read("t", Some(&unsure), Some(("t1", 0, Some(990))), 5_000, 5_100, 10).is_err(),
+            "past its bound"
+        );
     }
 
     #[test]

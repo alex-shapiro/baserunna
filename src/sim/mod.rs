@@ -917,75 +917,94 @@ where
     };
     crate::buggify::enable(seed ^ 0xb066_1f1e, b);
     let branches = cfg.branches.clone();
-    let out = rt.block_on(async move {
-        // Probes' first hits and branch points are in virtual time from here.
-        crate::probe::record();
-        let start = Instant::now();
-        crate::util::rng::branch(
-            branches.iter().map(|(ms, salt)| (start + Duration::from_millis(*ms), *salt)).collect(),
-        );
-        let sim = Sim::new(seed, cfg).await;
-        // A violation ends the run at once: what follows it only obscures it.
-        let mut oracles = sim.spawn_oracles();
-        let mut workload = CatchPanic(Box::pin(f(sim.clone())));
-        let mut oracles_or_deadline = Box::pin(async {
-            let deadline = tokio::time::sleep(Duration::from_millis(MAX_VIRTUAL_MS));
-            match crate::util::race(&mut oracles, &mut Box::pin(deadline)).await {
-                crate::util::Either::Left(_) => Ok(()),
-                crate::util::Either::Right(()) => {
-                    Err(format!("the workload did not finish within {} s of virtual time", MAX_VIRTUAL_MS / 1000))
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(async move {
+            // Probes' first hits and branch points are in virtual time from here.
+            crate::probe::record();
+            crate::probe::own_from(branches.last().map_or(0, |(ms, _)| *ms));
+            let start = Instant::now();
+            crate::util::rng::branch(
+                branches.iter().map(|(ms, salt)| (start + Duration::from_millis(*ms), *salt)).collect(),
+            );
+            let sim = Sim::new(seed, cfg).await;
+            // A violation ends the run at once: what follows it only obscures it.
+            let mut oracles = sim.spawn_oracles();
+            let mut workload = CatchPanic(Box::pin(f(sim.clone())));
+            let mut oracles_or_deadline = Box::pin(async {
+                let deadline = tokio::time::sleep(Duration::from_millis(MAX_VIRTUAL_MS));
+                match crate::util::race(&mut oracles, &mut Box::pin(deadline)).await {
+                    crate::util::Either::Left(_) => Ok(()),
+                    crate::util::Either::Right(()) => {
+                        Err(format!("the workload did not finish within {} s of virtual time", MAX_VIRTUAL_MS / 1000))
+                    }
+                }
+            });
+            let mut result = match crate::util::race(&mut workload, &mut oracles_or_deadline).await {
+                crate::util::Either::Left(Ok(r)) => r,
+                crate::util::Either::Left(Err(())) => Err("workload panicked".into()),
+                crate::util::Either::Right(r) => r,
+            };
+            drop(oracles_or_deadline);
+            drop(workload);
+            oracles.abort();
+            if let Some(v) = sim.violation.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                result = Err(format!("oracle: {v}"));
+            }
+            let mut storage = StorageReport::default();
+            if result.is_ok() {
+                sim.store.set_faults_enabled(false);
+                sim.sleep(5_000).await;
+                match sim.check_storage().await {
+                    Ok(r) => storage = r,
+                    Err(e) => result = Err(format!("storage invariant: {e}")),
                 }
             }
-        });
-        let mut result = match crate::util::race(&mut workload, &mut oracles_or_deadline).await {
-            crate::util::Either::Left(Ok(r)) => r,
-            crate::util::Either::Left(Err(())) => Err("workload panicked".into()),
-            crate::util::Either::Right(r) => r,
-        };
-        drop(oracles_or_deadline);
-        drop(workload);
-        oracles.abort();
-        if let Some(v) = sim.violation.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            result = Err(format!("oracle: {v}"));
-        }
-        let mut storage = StorageReport::default();
-        if result.is_ok() {
-            sim.store.set_faults_enabled(false);
-            sim.sleep(5_000).await;
-            match sim.check_storage().await {
-                Ok(r) => storage = r,
-                Err(e) => result = Err(format!("storage invariant: {e}")),
+            if let Some(p) = take_panic() {
+                result = Err(format!("panic in simulation: {p}"));
             }
-        }
-        if let Some(p) = take_panic() {
-            result = Err(format!("panic in simulation: {p}"));
-        }
-        let virtual_ms = start.elapsed().as_millis() as u64;
-        sim.shutdown_all();
-        let dump = sim.trace.dump();
-        let keep = if full_trace { dump.len() } else { 400 };
-        let trace_tail = dump[dump.len().saturating_sub(keep)..].to_vec();
-        SimOutcome {
-            seed,
-            result,
-            trace_hash: sim.trace.hash(),
-            events: sim.trace.events(),
-            virtual_ms,
-            store_ops: sim.store.stats.gets.load(Ordering::Relaxed)
-                + sim.store.stats.puts.load(Ordering::Relaxed)
-                + sim.store.stats.lists.load(Ordering::Relaxed)
-                + sim.store.stats.deletes.load(Ordering::Relaxed),
-            injected_faults: sim.store.stats.injected_failures.load(Ordering::Relaxed),
-            crashes: sim.crashes.load(Ordering::Relaxed),
-            storage,
-            probes: crate::probe::Hits::default(),
-            buggify: Default::default(),
-            knobs: sim.knobs.drawn(),
-            trace_tail,
-        }
-    });
+            let virtual_ms = start.elapsed().as_millis() as u64;
+            sim.shutdown_all();
+            let dump = sim.trace.dump();
+            let keep = if full_trace { dump.len() } else { 400 };
+            let trace_tail = dump[dump.len().saturating_sub(keep)..].to_vec();
+            SimOutcome {
+                seed,
+                result,
+                trace_hash: sim.trace.hash(),
+                events: sim.trace.events(),
+                virtual_ms,
+                store_ops: sim.store.stats.gets.load(Ordering::Relaxed)
+                    + sim.store.stats.puts.load(Ordering::Relaxed)
+                    + sim.store.stats.lists.load(Ordering::Relaxed)
+                    + sim.store.stats.deletes.load(Ordering::Relaxed),
+                injected_faults: sim.store.stats.injected_failures.load(Ordering::Relaxed),
+                crashes: sim.crashes.load(Ordering::Relaxed),
+                storage,
+                probes: crate::probe::Hits::default(),
+                buggify: Default::default(),
+                knobs: sim.knobs.drawn(),
+                trace_tail,
+            }
+        })
+    }));
     crate::util::rng::branch(Vec::new());
-    SimOutcome { probes: crate::probe::finish(), buggify: crate::buggify::disable(), ..out }
+    let (probes, buggify) = (crate::probe::finish(), crate::buggify::disable());
+    let out = out.unwrap_or_else(|_| SimOutcome {
+        seed,
+        result: Err(format!("panic outside the workload: {}", take_panic().unwrap_or_default())),
+        trace_hash: 0,
+        events: 0,
+        virtual_ms: 0,
+        store_ops: 0,
+        injected_faults: 0,
+        crashes: 0,
+        storage: StorageReport::default(),
+        probes: Default::default(),
+        buggify: Default::default(),
+        knobs: Vec::new(),
+        trace_tail: Vec::new(),
+    });
+    SimOutcome { probes, buggify, ..out }
 }
 
 /// Time required for two reaper passes to purge all deleted databases.

@@ -2,8 +2,8 @@
 # Runs a sim_tool command against every bug in the zoo.
 #
 #   bugzoo/run.sh campaign all 50
-#   bugzoo/run.sh campaign register_hostile 300 1
-#   PATCHES="bugzoo/03-*.patch bugzoo/04-*.patch" bugzoo/run.sh campaign register_hostile 100
+#   bugzoo/run.sh campaign register 300 1
+#   PATCHES="bugzoo/03-*.patch bugzoo/04-*.patch" bugzoo/run.sh campaign register 100
 #
 # For each patch: apply it, build sim_tool in release, run `sim_tool <args>`,
 # record seeds run, failing seeds and the first failure, then revert the
@@ -57,6 +57,10 @@ for p in $patches; do
     mkdir -p "$OUT_DIR" && printf '%s\n' "$out" > "$OUT_DIR/$name.out"
   fi
   seeds=$(sed -n -e 's/^\([0-9][0-9]*\) runs in .*/\1/p' -e 's/^explored \([0-9][0-9]*\) runs.*/\1/p' <<< "$out" | awk '{s += $1} END {print s + 0}')
+  if [ "$seeds" -eq 0 ]; then
+    echo "sim_tool $* ran nothing: $(tail -n 1 <<< "$out")" >&2
+    exit 1
+  fi
   failed=$(grep -c '^FAIL ' <<< "$out")
   first=$(grep -m1 '^FAIL ' <<< "$out" | cut -c1-200)
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$*" "$seeds" "$failed" "$((seeds - failed))" "${first:--}" | tee -a "$results"

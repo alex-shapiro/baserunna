@@ -17,13 +17,31 @@ use crate::util::rng::Rng;
 use std::sync::Mutex;
 use std::time::Instant;
 
-/// Runs chosen together, before their outcomes join the corpus. Fixed, so
-/// that an exploration does not depend on the machine's core count.
+/// Runs chosen together, before their outcomes join the corpus, and so the
+/// most threads an exploration keeps busy. Fixed, so that an exploration
+/// does not depend on the machine's core count.
 const ROUND: usize = 32;
+
+/// Latest a branch point falls after the probe it follows.
+const BRANCH_WINDOW_MS: u64 = 2_000;
 
 struct Entry {
     job: Job,
     probes: Hits,
+    /// How long the run lasted: a branch point after that changes nothing.
+    end_ms: u64,
+}
+
+impl Entry {
+    /// The earliest branch point after each probe that leaves the run time
+    /// to go another way.
+    fn starts(&self) -> impl Iterator<Item = (Probe, u64)> + '_ {
+        let last = self.job.branches.last().map_or(0, |(ms, _)| *ms);
+        self.probes.hit().filter_map(move |p| {
+            let at = self.probes.first_ms(p)?.max(last) + 1;
+            (at < self.end_ms).then_some((p, at))
+        })
+    }
 }
 
 /// How an exploration spends its runs.
@@ -68,13 +86,14 @@ pub fn explore(
         let n = ROUND.min((budget.runs - report.runs) as usize);
         let mut jobs = Vec::with_capacity(n);
         for _ in 0..n {
-            if corpus.is_empty() || rng.chance(budget.fresh) {
-                let len = scenarios.len() as u64;
-                jobs.push(Job { scenario: (fresh % len) as usize, seed: first_seed + fresh / len, branches: vec![] });
+            let branched = match rng.chance(budget.fresh) {
+                true => None,
+                false => branch(&mut rng, &corpus, &report),
+            };
+            jobs.push(branched.unwrap_or_else(|| {
                 fresh += 1;
-            } else {
-                jobs.push(branch(&mut rng, &corpus, &report));
-            }
+                Job::fresh(scenarios.len(), first_seed, fresh - 1)
+            }));
         }
         let outs: Mutex<Vec<Option<SimOutcome>>> = Mutex::new(jobs.iter().map(|_| None).collect());
         run_jobs(
@@ -92,36 +111,22 @@ pub fn explore(
             // Runs the deadline kept from starting are left out.
             let Some(out) = out else { continue };
             if report.add(scenarios, &job, &out) {
-                corpus.push(Entry { job, probes: out.probes });
+                corpus.push(Entry { job, probes: out.probes, end_ms: out.virtual_ms });
             }
         }
     }
     Exploration { corpus: corpus.len(), report }
 }
 
-/// A branch of a corpus entry: after a probe of it, chosen by rarity.
-fn branch(rng: &mut Rng, corpus: &[Entry], report: &Report) -> Job {
-    let rarity = |p: &Probe| 1.0 / report.runs_hitting.get(*p as usize).copied().unwrap_or(1).max(1) as f64;
-    let weights: Vec<f64> = corpus.iter().map(|e| e.probes.hit().map(|p| rarity(&p)).sum()).collect();
-    let e = &corpus[pick(rng, &weights)];
-    let ps: Vec<Probe> = e.probes.hit().collect();
-    let p = ps[pick(rng, &ps.iter().map(rarity).collect::<Vec<_>>())];
-    let after = e.probes.first_ms(p).unwrap_or(0);
-    let last = e.job.branches.last().map_or(0, |(ms, _)| *ms);
-    let at = after.max(last) + 1 + rng.below(2_000);
+/// A branch of a corpus entry after a probe of it, both chosen by rarity,
+/// or `None` if no entry has a probe to branch after.
+fn branch(rng: &mut Rng, corpus: &[Entry], report: &Report) -> Option<Job> {
+    let rarity = |p| 1.0 / report.runs_hitting.get(p as usize).copied().unwrap_or(0).max(1) as f64;
+    let weights: Vec<f64> = corpus.iter().map(|e| e.starts().map(|(p, _)| rarity(p)).sum()).collect();
+    let e = &corpus[rng.weighted(&weights)?];
+    let options: Vec<(Probe, u64)> = e.starts().collect();
+    let (_, at) = options[rng.weighted(&options.iter().map(|(p, _)| rarity(*p)).collect::<Vec<_>>())?];
     let mut job = e.job.clone();
-    job.branches.push((at, rng.next_u64() | 1));
-    job
-}
-
-fn pick(rng: &mut Rng, weights: &[f64]) -> usize {
-    let total: f64 = weights.iter().sum();
-    let mut x = rng.unit() * total;
-    for (i, w) in weights.iter().enumerate() {
-        if x < *w {
-            return i;
-        }
-        x -= w;
-    }
-    weights.len() - 1
+    job.branches.push((at + rng.below(BRANCH_WINDOW_MS.min(e.end_ms - at)), rng.next_u64() | 1));
+    Some(job)
 }

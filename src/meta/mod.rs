@@ -174,6 +174,8 @@ pub struct DeletedDb {
 pub struct NodeRecord {
     pub id: String,
     pub addr: String,
+    /// When the process started. Each process at an address starts later
+    /// than every earlier one there.
     pub started_at: i64,
     pub heartbeat_at: i64,
 }
@@ -1070,8 +1072,16 @@ async fn expire_sessions(txn: &mut Txn, before_ms: i64, limit: usize) -> Result<
 }
 
 async fn heartbeat(w: &mut Write<'_, '_>, node: &NodeRecord, dead_after_ms: i64) -> Result<()> {
-    table::insert(w.txn, w.blobs, "nodes", &to_row(node), InsertMode::Upsert).await?;
-    for n in list_nodes(w.txn).await? {
+    let nodes = list_nodes(w.txn).await?;
+    // A process starts after every earlier one at its address, whatever its
+    // clock read when it started.
+    let started_at = match nodes.iter().find(|n| n.id == node.id) {
+        Some(n) => n.started_at,
+        None => nodes.iter().filter(|n| n.addr == node.addr).map(|n| n.started_at + 1).fold(node.started_at, i64::max),
+    };
+    let rec = NodeRecord { started_at, ..node.clone() };
+    table::insert(w.txn, w.blobs, "nodes", &to_row(&rec), InsertMode::Upsert).await?;
+    for n in nodes {
         if n.id != node.id && n.heartbeat_at + dead_after_ms < w.now_ms {
             table::delete(w.txn, "nodes", &json!(n.id)).await?;
         }

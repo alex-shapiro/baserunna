@@ -66,10 +66,11 @@ fn branched_runs_repeat_their_parent_until_the_branch_point() {
     let (parent, knobs) = run_at(vec![]);
     let (late, _) = run_at(vec![(u64::MAX / 2, 0xabc)]);
     assert_eq!(late, parent, "a branch point past the run's end changes nothing");
-    let (early, early_knobs) = run_at(vec![(1_000, 0xabc)]);
+    // Before the workload draws its knobs.
+    let (early, early_knobs) = run_at(vec![(1, 0xabc)]);
     assert_ne!(early, parent, "an early branch point changes the run");
     assert_eq!(early_knobs, knobs, "a branch keeps its parent's knobs");
-    assert_eq!(run_at(vec![(1_000, 0xabc)]).0, early, "a branched run is deterministic");
+    assert_eq!(run_at(vec![(1, 0xabc)]).0, early, "a branched run is deterministic");
 }
 
 #[test]

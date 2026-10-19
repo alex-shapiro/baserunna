@@ -112,14 +112,13 @@ pub struct Txn {
     pub isolation: Isolation,
     /// Bounded staleness of a read-only transaction's snapshot, if not strong.
     pub stale_ms: Option<u64>,
+    pub interactive: bool,
     /// The read version an interactive transaction began at.
     pub read_version: Option<u64>,
     pub ops: Vec<Op>,
     /// Results of the operations whose responses arrived, in order.
     pub results: Vec<Observed>,
-    /// The operation a 412 reported failing its check. Left unset for an
-    /// interactive begin: its read version is unknown, and need not follow
-    /// transactions that finished before it.
+    /// The operation a 412 reported failing its check.
     pub failed: Option<usize>,
     pub outcome: Outcome,
 }
@@ -306,6 +305,24 @@ pub fn check(history: &[Txn]) -> Result<(), String> {
         let n = done.partition_point(|(end, _, _)| *end < before);
         done[..n].iter().filter(|(_, _, stale)| !(strong_only && *stale)).map(|(_, p, _)| *p).max().unwrap_or(0)
     };
+    // The latest state a transaction that ended at `end` may have read: no
+    // later than what strong transactions that began after it read, and
+    // before what they wrote.
+    let mut begun: Vec<(u64, u64)> = history
+        .iter()
+        .filter(|t| t.stale_ms.is_none())
+        .filter_map(|t| match t.outcome {
+            Outcome::Committed(v) => Some((t.start, v - 1)),
+            Outcome::Read(v) => Some((t.start, v)),
+            _ => None,
+        })
+        .collect();
+    begun.sort();
+    let last = writers.last().map_or(0, |(v, _)| *v);
+    let ceiling = |end: u64| {
+        let n = begun.partition_point(|(start, _)| *start <= end);
+        begun[n..].iter().map(|(_, p)| *p).fold(last, u64::min)
+    };
     for t in history {
         let lo = match t.stale_ms {
             Some(s) => floor(t.start.saturating_sub(s), true),
@@ -352,9 +369,15 @@ pub fn check(history: &[Txn]) -> Result<(), String> {
                 }
             }
             (Outcome::NotCommitted, _) if t.failed.is_some() && t.read_version.is_none() => {
-                let last = writers.last().map_or(0, |(v, _)| *v);
-                if !(lo..=last).any(|r| replay(&model, t, r).is_ok()) {
-                    return Err(format!("{}: no state in [{lo}, {last}] fails op {:?}", who(), t.failed));
+                // An interactive serializable begin need not follow what
+                // finished before it, as above.
+                let from = match t.interactive && t.isolation == Isolation::Serializable {
+                    true => 0,
+                    false => lo,
+                };
+                let to = ceiling(t.end);
+                if !(from..=to).any(|r| replay(&model, t, r).is_ok()) {
+                    return Err(format!("{}: no state in [{from}, {to}] fails op {:?}", who(), t.failed));
                 }
             }
             _ => {}
@@ -445,7 +468,7 @@ impl Gen<'_> {
             }
         }
         (0..n)
-            .map(|i| match super::super::swarm::weighted(&mut self.rng, &w).unwrap_or(0) {
+            .map(|i| match self.rng.weighted(&w.map(|x| x as f64)).unwrap_or(0) {
                 0 => Op::Get { key: self.key() },
                 1 => Op::Put { key: self.key(), value: format!("{}", self.uid * 64 + i as u64) },
                 2 => Op::Delete { key: self.key() },
@@ -516,13 +539,13 @@ fn parse_sent(t: &Txn, ops: &[Op], r: &Json, last: bool) -> Result<Vec<Observed>
     parse_results(ops, &r)
 }
 
-/// Resolves an ambiguous commit through the fenced commit status, if
-/// `resolve`; the markers settle what it cannot.
+/// Resolves an ambiguous commit, once no attempt of it can still apply,
+/// through the fenced commit status, if `resolve`; the markers settle what
+/// it cannot.
 async fn resolve(c: &Client, db: &str, id: &str, t: &Txn, resolve: bool) -> Result<Outcome, String> {
     if !resolve {
         return Ok(Outcome::Unknown);
     }
-    c.pause(ZOMBIE_WAIT_MS).await;
     Ok(match c.commit_status(db, id, t.start).await? {
         s @ Status::Committed(_) => Outcome::Committed(s.version().ok_or("committed without a version")?),
         Status::NotCommitted => Outcome::NotCommitted,
@@ -570,6 +593,9 @@ async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String, settle: bool, 
                 ambiguous = true;
                 continue;
             }
+            if raced {
+                c.pause(ZOMBIE_WAIT_MS).await;
+            }
             t.outcome = resolve(c, db, &format!("key:{key}"), t, settle).await?;
             return Ok(());
         }
@@ -609,7 +635,10 @@ async fn interactive(c: &Client, db: &str, t: &mut Txn, rng: &mut Rng, settle: b
     t.outcome = Outcome::NotCommitted;
     let r = match c.call("POST", &base, Some(begin)).await {
         Ok(r) if r.status == 201 => r,
-        Ok(r) if definite_failure(r.status, &r) || r.status == 503 || r.status == 400 => return Ok(()),
+        Ok(r) if definite_failure(r.status, &r) || r.status == 503 || r.status == 400 => {
+            t.failed = r.failed_op();
+            return Ok(());
+        }
         Ok(r) => return Err(format!("{}: begin {}: {}", c.name, r.status, r.json)),
         Err(_) => return Ok(()),
     };
@@ -634,6 +663,11 @@ async fn interactive(c: &Client, db: &str, t: &mut Txn, rng: &mut Rng, settle: b
     }
     let r =
         c.call("POST", &format!("{base}/{id}/commit"), Some(json!({"ops": request_ops(t, &t.ops[b..], true)}))).await;
+    if matches!(&r, Ok(r) if r.outcome_unknown()) || matches!(&r, Err(e) if *e != super::super::NetError::Refused) {
+        c.pause(ZOMBIE_WAIT_MS).await;
+        t.outcome = resolve(c, db, &cid, t, settle).await?;
+        return Ok(());
+    }
     t.outcome = match r {
         Ok(r) if r.status == 200 => {
             let v = r.json["version"].as_u64().ok_or(format!("no version: {}", r.json))?;
@@ -645,9 +679,7 @@ async fn interactive(c: &Client, db: &str, t: &mut Txn, rng: &mut Rng, settle: b
             t.failed = r.failed_op().map(|i| b + i);
             Outcome::NotCommitted
         }
-        Ok(r) if r.outcome_unknown() => resolve(c, db, &cid, t, settle).await?,
-        Err(super::super::NetError::Refused) => Outcome::NotCommitted,
-        Err(_) => resolve(c, db, &cid, t, settle).await?,
+        Err(_) => Outcome::NotCommitted,
         Ok(r) => return Err(format!("{}: commit {}: {}", c.name, r.status, r.json)),
     };
     Ok(())
@@ -665,6 +697,7 @@ async fn final_read(sim: &Sim, c: &Client, db: &str, keys: usize) -> Result<Txn,
         end: 0,
         isolation: Isolation::Serializable,
         stale_ms: None,
+        interactive: false,
         read_version: None,
         ops: vec![Op::Scan { start: 0, end: keys + 1, limit: keys + 1, reverse: false }],
         results: Vec::new(),
@@ -711,6 +744,7 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
                     end: 0,
                     isolation,
                     stale_ms: stale.then(|| 50 + g.rng.below(2_000)),
+                    interactive: interactive_txn,
                     read_version: None,
                     ops: g.ops(read_only),
                     results: Vec::new(),
@@ -783,6 +817,7 @@ mod tests {
             end,
             isolation: Isolation::Serializable,
             stale_ms: None,
+            interactive: false,
             read_version: None,
             ops,
             results,
@@ -855,7 +890,12 @@ mod tests {
         failed.failed = Some(0);
         check(&[w1.clone(), failed.clone()]).unwrap();
         failed.ops = vec![Op::Check { key: 1, exists: true }];
-        assert!(check(&[w1.clone(), failed]).unwrap_err().contains("fails op"));
+        assert!(check(&[w1.clone(), failed.clone()]).unwrap_err().contains("fails op"));
+        let later_delete = txn(20, 21, vec![Op::Delete { key: 1 }], vec![], Outcome::Committed(2));
+        assert!(
+            check(&[w1.clone(), failed.clone(), later_delete]).unwrap_err().contains("fails op"),
+            "explained only by a state written after it ended"
+        );
         let mut skew_ok = si;
         skew_ok.ops = vec![get(2), put(3, "x")];
         skew_ok.results = vec![Observed::Get(None), Observed::Done];

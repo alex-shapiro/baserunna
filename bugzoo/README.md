@@ -1,7 +1,7 @@
 # Bug zoo
 
 Each patch here puts back one bug that the deterministic simulator found
-(SPEC.md §13.6, numbered as there). The zoo measures how quickly a
+before SPEC §13's rewrite (SPEC.md §13.6, numbered as there). The zoo measures how quickly a
 simulation strategy rediscovers known bugs: apply a patch, run the
 strategy, and count the seeds until the first failure.
 
@@ -25,7 +25,8 @@ How many runs failed with each bug, for the simulator before SPEC §13's
 rewrite (39 fixed scenarios) and after it (21 swarm scenarios). Round 1
 gave each strategy about 780 runs per patch (old: seeds 1–20 of every
 scenario, `campaign all 20 1`; new: `campaign all 37 1`). Round 2 gave the
-bugs that round 1 caught at most once about 2,000 more runs each, at
+bugs that the two simulators together caught at most once in round 1
+about 2,000 more runs each, at
 other seeds (old: `campaign all 52 1000`; new: `campaign all 96 1000`, and
 `explore all 1000` with `SIM_RUNS=2016`). Cells read round 1 · round 2
 campaign · round 2 exploration. Runs are deterministic, so a failure
@@ -62,9 +63,8 @@ shows the patch's symptom.
 | 27 | lease state lost after ambiguous writes | 0 · 1 | 0 · 0 · 2 |
 | 28 | stale authorization after a slow read | 0 · 0 | 0 · 0 · 0 |
 
-Over both rounds, with about 2,800 campaign runs per bug, the old
-simulator rediscovered 14 of the 27 bugs and the new simulator's
-campaigns 17; 2,000 more runs of guided exploration raised the new
+Over both rounds, the old simulator rediscovered 14 of the 27 bugs and
+the new simulator's campaigns 17; guided exploration raised the new
 simulator's count to 20. Exploration alone found 22, 23 and 27, which no
 campaign of either simulator did. Bugs 09, 10, 13, 16, 24, 26 and 28
 escaped every strategy; the tests `forwards_to_a_restarted_node_are_refused`

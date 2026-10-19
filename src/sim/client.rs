@@ -266,6 +266,12 @@ impl Client {
         }
     }
 
+    /// Fences commit `id` in `db`: once this returns, no attempt of it
+    /// applies (SPEC §6.2).
+    pub async fn fence(&self, db: &str, id: &str) -> Result<(), String> {
+        self.commit_status(db, id, 0).await.map(|_| ())
+    }
+
     /// Whether commit `id` in `db`, first attempted at `began` and possibly
     /// ambiguous, applied, once no attempt of it can still apply: by its
     /// fenced status, or past commit retention by `marker`, a key that only

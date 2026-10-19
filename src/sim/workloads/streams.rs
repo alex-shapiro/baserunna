@@ -517,7 +517,7 @@ async fn consumer(c: Client, w: Shared, done: Arc<AtomicBool>) -> Result<(), Str
                 // The commit may have applied: wait until it cannot apply
                 // any more before going on.
                 c.pause(ZOMBIE_WAIT_MS).await;
-                c.commit_status("streams", cid.as_str().unwrap_or_default(), c.sim.now_ms()).await?;
+                c.fence("streams", cid.as_str().unwrap_or_default()).await?;
             }
         }
     }

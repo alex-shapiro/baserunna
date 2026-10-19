@@ -48,8 +48,9 @@ impl Knobs {
 
     /// Log-uniform in `lo..=hi`: small values are as likely as large ones.
     pub fn log_range(&self, name: &'static str, lo: u64, hi: u64) -> u64 {
-        let (l, h) = ((lo.max(1) as f64).ln(), (hi.max(lo).max(1) as f64).ln());
-        let v = (l + self.rng(name).unit() * (h - l)).exp().round() as u64;
+        // Shifted by one, so that `lo` may be 0.
+        let (l, h) = (((lo + 1) as f64).ln(), ((hi.max(lo) + 1) as f64).ln());
+        let v = (l + self.rng(name).unit() * (h - l)).exp().round() as u64 - 1;
         self.note(name, v.clamp(lo, hi.max(lo)))
     }
 
@@ -84,23 +85,6 @@ impl Knobs {
     pub fn drawn(&self) -> Vec<(&'static str, String)> {
         self.drawn.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (*k, v.clone())).collect()
     }
-}
-
-/// Picks among `weights` with probability proportional to each weight, or
-/// `None` if they are all zero.
-pub fn weighted(r: &mut Rng, weights: &[u64]) -> Option<usize> {
-    let total: u64 = weights.iter().sum();
-    if total == 0 {
-        return None;
-    }
-    let mut x = r.below(total);
-    for (i, w) in weights.iter().enumerate() {
-        if x < *w {
-            return Some(i);
-        }
-        x -= w;
-    }
-    None
 }
 
 /// How far apart node clocks may be in a scenario's worlds.
@@ -284,7 +268,7 @@ mod tests {
     #[test]
     fn weighted_choices_skip_zero_weights() {
         let mut r = Rng::new(1);
-        assert_eq!(weighted(&mut r, &[0, 0]), None);
-        assert!((0..100).all(|_| weighted(&mut r, &[0, 3, 0, 1]).is_some_and(|i| i == 1 || i == 3)));
+        assert_eq!(r.weighted(&[0.0, 0.0]), None);
+        assert!((0..100).all(|_| r.weighted(&[0.0, 3.0, 0.0, 1.0]).is_some_and(|i| i == 1 || i == 3)));
     }
 }

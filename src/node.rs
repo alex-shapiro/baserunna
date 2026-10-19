@@ -1097,29 +1097,16 @@ impl Node {
         Ok(())
     }
 
-    /// Resets a user's password using a single-use reset token, revokes existing sessions, and returns a new session.
+    /// Resets a user's password with a reset link, revokes existing sessions, and returns a new
+    /// session. The link sets one password: repeating it with that password finishes the reset.
     pub async fn reset_password(&self, client: &str, token: &str, password: &str) -> Result<(User, String)> {
         auth::validate_password(password)?;
         let (user, fp) = self.open_link(client, auth::TokenPurpose::Reset, token).await?;
-        let used = || Error::Unauthenticated("this link has been used already".into());
         if user.disabled {
             return Err(Error::PermissionDenied("this account is disabled".into()));
         }
         if meta::password_fp(&user) != fp {
-            // An earlier attempt with this link may have set this very
-            // password and failed afterwards: a retry finishes it. Checking
-            // the password makes a used link a sign-in, so it takes the
-            // account's sign-in backoff.
-            let (lim, account) = (&self.cfg.limits, Self::failures_of(&user.email));
-            self.limiter.check_backoff(&[&account], "failed sign-ins")?;
-            let Some(h) = user.password_hash.clone() else { return Err(used()) };
-            let pw = password.to_string();
-            if !self.hashing(move || auth::verify_password(&pw, &h)).await? {
-                self.limiter.failed(&account, lim.account_free_failures, lim);
-                return Err(used());
-            }
-            crate::probe::hit(crate::probe::Probe::PasswordResetFinished);
-            return self.finish_reset(client, &user).await;
+            return self.reset_again(client, &user, password).await;
         }
         let hash = self.hash_password(password).await?;
         let set = MetaCmd::SetPassword {
@@ -1129,9 +1116,35 @@ impl Node {
             keep_session: None,
             verify_email: true,
         };
-        self.run_meta(set).await.map_err(|e| if matches!(e, Error::PreconditionFailed { .. }) { used() } else { e })?;
+        match self.run_meta(set).await {
+            Ok(_) => {}
+            // A concurrent attempt with this link set a password first.
+            Err(Error::PreconditionFailed { .. }) => {
+                let user = self.user_strong(&user.id).await?;
+                return self.reset_again(client, &user, password).await;
+            }
+            Err(e) => return Err(e),
+        }
         self.env.crash_point().await;
         self.finish_reset(client, &user).await
+    }
+
+    /// Repeats a reset whose link already set `user`'s password: an earlier
+    /// attempt may have set this very password and failed afterwards, or
+    /// raced this one. Checking the password makes a used link a sign-in, so
+    /// it takes the account's sign-in backoff.
+    async fn reset_again(&self, client: &str, user: &User, password: &str) -> Result<(User, String)> {
+        let used = || Error::Unauthenticated("this link has been used already".into());
+        let (lim, account) = (&self.cfg.limits, Self::failures_of(&user.email));
+        self.limiter.check_backoff(&[&account], "failed sign-ins")?;
+        let Some(h) = user.password_hash.clone() else { return Err(used()) };
+        let pw = password.to_string();
+        if !self.hashing(move || auth::verify_password(&pw, &h)).await? {
+            self.limiter.failed(&account, lim.account_free_failures, lim);
+            return Err(used());
+        }
+        crate::probe::hit(crate::probe::Probe::PasswordResetFinished);
+        self.finish_reset(client, user).await
     }
 
     /// What follows setting a reset password: other sessions end, failed
@@ -1417,6 +1430,50 @@ mod tests {
                 .map(|i| format!("db{i}"))
                 .find(|d| super::cluster::rendezvous(d, &both).unwrap().id == "earlier-run");
             assert_eq!(a.route(&homed.unwrap()).await, None);
+        });
+    }
+
+    #[test]
+    fn a_reset_link_sets_one_password_however_often_it_is_sent() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let n = w.node(0).clone();
+            let user = n.password_signup("c", "reset@x.io", "password-1").await.unwrap();
+            let fp = super::meta::password_fp(&user);
+            let token = super::auth::sign_token(
+                &n.cookie_key(),
+                super::auth::TokenPurpose::Reset,
+                &user.id,
+                &fp,
+                n.now_ms() + 60_000,
+            );
+            let (a, b) =
+                tokio::join!(n.reset_password("c", &token, "password-2"), n.reset_password("c", &token, "password-2"));
+            assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
+            assert!(n.reset_password("c", &token, "password-3").await.is_err(), "a second password");
+        });
+    }
+
+    #[test]
+    fn a_restart_replaces_its_predecessor_whatever_its_clock() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let a = w.node(0).clone();
+            let now = a.now_ms() as i64;
+            let at = |id: &str, started_at| super::NodeRecord {
+                id: id.into(),
+                addr: "http://elsewhere".into(),
+                started_at,
+                heartbeat_at: now,
+            };
+            for rec in [at("before", now + 3_600_000), at("after", now)] {
+                a.run_meta(super::MetaCmd::Heartbeat { node: rec, dead_after_ms: 3_600_000 }).await.unwrap();
+            }
+            a.refresh_members().await.unwrap();
+            let live = super::cluster::live(&a.members(), now, a.cfg.heartbeat_ms as i64);
+            let there: Vec<&str> =
+                live.iter().filter(|m| m.addr == "http://elsewhere").map(|m| m.id.as_str()).collect();
+            assert_eq!(there, ["after"]);
         });
     }
 

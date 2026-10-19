@@ -56,4 +56,5 @@ jobs:
       - name: Exploration from fresh seeds
         env:
           SIM_MINUTES: "60"
-        run: target/release/examples/sim_tool explore all ${{ github.run_id }}
+        # Far from the campaign's seeds, which also start at the run's id.
+        run: target/release/examples/sim_tool explore all $(( ${{ github.run_id }} + (1 << 40) ))

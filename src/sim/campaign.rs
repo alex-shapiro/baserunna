@@ -21,6 +21,13 @@ pub struct Job {
 }
 
 impl Job {
+    /// The `i`th run of a plain campaign from `first_seed` over `scenarios`
+    /// scenarios: every scenario in turn, a seed at a time.
+    pub fn fresh(scenarios: usize, first_seed: u64, i: u64) -> Job {
+        let n = scenarios as u64;
+        Job { scenario: (i % n) as usize, seed: first_seed + i / n, branches: vec![] }
+    }
+
     /// The `sim_tool trace` arguments that repeat this run.
     pub fn args(&self, scenarios: &[Scenario]) -> String {
         let path: Vec<String> = self.branches.iter().map(|(ms, salt)| format!("{ms}:{salt:x}")).collect();
@@ -49,9 +56,23 @@ pub fn parse_branches(s: &str) -> Option<Vec<(u64, u64)>> {
     points.windows(2).all(|w| w[0].0 < w[1].0).then_some(points)
 }
 
-/// A probe and the magnitude of its hit count in one run, or (with a
-/// second probe in place of the magnitude) two rare probes reached together.
-pub type Feature = (Probe, u8);
+/// Something a run showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Feature {
+    /// A probe, and the magnitude of its hit count.
+    Count(Probe, u8),
+    /// Two rare probes reached in one run.
+    Pair(Probe, Probe),
+}
+
+impl std::fmt::Display for Feature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Feature::Count(p, b) => write!(f, "{}#{b}", p.name()),
+            Feature::Pair(a, b) => write!(f, "{}+{}", a.name(), b.name()),
+        }
+    }
+}
 
 /// Probes reached in fewer runs than this share count as rare.
 pub const RARE: f64 = 0.05;
@@ -79,7 +100,8 @@ pub struct Report {
     pub failures: Vec<(Job, String)>,
     /// Probe hits summed over every run of each scenario.
     pub hits: BTreeMap<&'static str, Hits>,
-    /// Runs that reached each probe, indexed like [`Probe::ALL`].
+    /// Runs that reached each probe themselves rather than by repeating
+    /// their parent ([`Hits::own`]), indexed like [`Probe::ALL`].
     pub runs_hitting: Vec<u64>,
     /// Runs that showed each feature.
     pub features: BTreeMap<Feature, u64>,
@@ -94,7 +116,7 @@ impl Report {
         self.virtual_ms += out.virtual_ms;
         self.hits.entry(scenarios[job.scenario].name).or_default().add(&out.probes);
         self.runs_hitting.resize(Probe::ALL.len(), 0);
-        for p in out.probes.hit() {
+        for p in out.probes.hit_own() {
             self.runs_hitting[p as usize] += 1;
         }
         if let Err(e) = &out.result {
@@ -111,13 +133,11 @@ impl Report {
 
     /// The features of a run with probe hits `h`.
     fn features_of(&self, h: &Hits) -> Vec<Feature> {
-        let mut out: Vec<Feature> = h.hit().map(|p| (p, bucket(h.count(p)))).collect();
-        // The second probe's index stands in for the magnitude, past every
-        // magnitude.
+        let mut out: Vec<Feature> = h.hit().map(|p| Feature::Count(p, bucket(h.count(p)))).collect();
         let rare: Vec<Probe> = h.hit().filter(|p| self.share(*p) < RARE).collect();
         for (i, a) in rare.iter().enumerate() {
             for b in &rare[i + 1..] {
-                out.push((*a, 8 + (*b as usize).min(247) as u8));
+                out.push(Feature::Pair(*a, *b));
             }
         }
         out
@@ -194,12 +214,8 @@ pub fn campaign(
     deadline: Option<Instant>,
     progress: impl Fn(&Job, &SimOutcome) + Sync,
 ) -> Report {
-    let n = scenarios.len() as u64;
     let report = Mutex::new(Report::default());
-    let job = |i: usize| {
-        let seed = seeds.start + i as u64 / n;
-        (seed < seeds.end).then(|| Job { scenario: (i as u64 % n) as usize, seed, branches: vec![] })
-    };
+    let job = |i: usize| Some(Job::fresh(scenarios.len(), seeds.start, i as u64)).filter(|j| j.seed < seeds.end);
     run_jobs(scenarios, threads, deadline, job, |_, j, out| {
         progress(j, &out);
         report.lock().unwrap_or_else(|e| e.into_inner()).add(scenarios, j, &out);

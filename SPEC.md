@@ -1453,6 +1453,9 @@ the records it claims, with no overlap within a stream.
   runs. Campaigns and exploration complement each other.
 - **Bug zoo** (`bugzoo/`): a patch per historic bug in §13.6 reintroduces
   it, and `bugzoo/run.sh` measures how many runs of a strategy find each.
+  Given about 2,800 runs per bug, the simulator before this section's
+  design rediscovered 14 of 27 bugs, the current campaigns 17, and
+  campaigns with exploration 20.
 
 ### 13.5 Other test layers
 

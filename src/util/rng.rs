@@ -1,20 +1,14 @@
 //! Deterministic xoshiro256** PRNG seeded via SplitMix64.
-//!
-//! A simulation can branch every generator on its thread at chosen virtual
-//! times ([`branch`]): draws before the first branch point are those of the
-//! unbranched run, and draws after it differ.
 
 use std::cell::RefCell;
 use tokio::time::Instant;
 
 thread_local! {
-    /// Branch points of the running simulation: from each instant on, draws
-    /// are mixed with its salt.
     static BRANCHES: RefCell<Vec<(Instant, u64)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Branches every generator on this thread at each `(instant, salt)`
-/// (sorted by instant), or stops branching if `points` is empty.
+/// Configures virtual-time branch points `(instant, salt)` on the current thread,
+/// sorted by instant. Pass an empty vector to clear branch points.
 pub fn branch(points: Vec<(Instant, u64)>) {
     BRANCHES.with(|b| *b.borrow_mut() = points);
 }
@@ -33,7 +27,6 @@ fn branch_salt() -> u64 {
 #[derive(Clone, Debug)]
 pub struct Rng {
     s: [u64; 4],
-    /// Whether branch points change this generator's draws.
     branched: bool,
 }
 
@@ -52,8 +45,7 @@ impl Rng {
         Rng { s, branched: true }
     }
 
-    /// A generator whose draws no branch point changes, for what must stay
-    /// the same along every branch of a run.
+    /// Creates a generator that ignores thread-local branch points.
     pub fn unbranched(seed: u64) -> Rng {
         Rng { branched: false, ..Rng::new(seed) }
     }
@@ -120,8 +112,8 @@ impl Rng {
         self.unit() < p
     }
 
-    /// Picks an index with probability proportional to its weight, or
-    /// `None` if every weight is zero.
+    /// Selects an index with probability proportional to its weight, or
+    /// returns `None` if the total weight is not positive.
     pub fn weighted(&mut self, weights: &[f64]) -> Option<usize> {
         let total: f64 = weights.iter().sum();
         if total <= 0.0 {

@@ -40,11 +40,11 @@ pub struct Shared {
     pub node_id: String,
     pub retry: Retry,
     pub compaction_slots: Semaphore,
-    /// The store's clock, which every garbage collection timestamp uses.
+    /// Store clock used to generate garbage collection timestamps.
     pub clock: clock::StoreClock,
-    /// Newest foreign lease sighting `(holder, write_seq, first_seen)` per
+    /// Latest observed foreign lease `(holder, write_seq, first_seen)` per
     /// database, retained across `Db` handle evictions.
-    pub(crate) lease_sightings: Mutex<DetHashMap<String, (String, u64, tokio::time::Instant)>>,
+    pub(crate) observed_leases: Mutex<DetHashMap<String, (String, u64, tokio::time::Instant)>>,
     /// Databases exempt from size quota limits.
     quota_exempt: Mutex<std::collections::BTreeSet<String>>,
     pub metrics: Arc<crate::metrics::StoreMetrics>,
@@ -55,23 +55,22 @@ impl Shared {
         self.quota_exempt.lock().unwrap_or_else(|e| e.into_inner()).contains(db)
     }
 
-    /// The store's current time, if this node measured its offset from the
-    /// store recently enough for garbage collection to rely on it.
+    /// Returns the current store time if the clock offset was synchronized within `clock_sync_max_age_ms`.
     pub fn store_now_ms(&self) -> Option<u64> {
         self.clock.now_ms(Duration::from_millis(self.cfg.clock_sync_max_age_ms))
     }
 
-    /// Lower bound on the store's current time, if measured within the max sync age.
+    /// Returns the lower bound on the current store time if synchronized within `clock_sync_max_age_ms`.
     pub fn store_earliest_now_ms(&self) -> Option<u64> {
         self.clock.earliest_now_ms(Duration::from_millis(self.cfg.clock_sync_max_age_ms))
     }
 
-    /// Store time if known, or the local wall clock otherwise.
+    /// Returns the synchronized store time if available, or the local wall clock time.
     pub fn time_ms(&self) -> u64 {
         self.store_now_ms().unwrap_or_else(|| self.env.now_ms())
     }
 
-    /// The store's current time, measuring the offset first if it is due.
+    /// Synchronizes the store clock if stale and returns the current store time.
     pub async fn store_time_ms(&self) -> crate::error::Result<u64> {
         self.sync_clock().await?;
         self.store_now_ms().ok_or_else(|| crate::error::Error::unavailable("store clock not synchronized"))
@@ -82,7 +81,7 @@ impl Shared {
         self.clock.sync(&*self.store, &self.retry, interval, self.cfg.clock_sync_max_error_ms).await
     }
 
-    /// Re-measure the store clock in the background if it is due.
+    /// Spawns a background clock synchronization task if the store clock is stale.
     pub(crate) fn refresh_clock(self: &Arc<Self>) {
         if self.clock.stale(Duration::from_millis(self.cfg.clock_sync_interval_ms)) {
             let me = self.clone();
@@ -94,11 +93,11 @@ impl Shared {
         }
     }
 
-    /// Returns the instant when this node first observed the lease renewal at
+    /// Returns the local instant when this node first observed the lease renewal at
     /// `write_seq` for `db`.
     pub(crate) fn lease_seen(&self, db: &str, lease: &manifest::Lease, write_seq: u64) -> tokio::time::Instant {
         let now = tokio::time::Instant::now();
-        let mut g = self.lease_sightings.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.observed_leases.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((node, ws, seen)) = g.get(db)
             && *node == lease.node
             && *ws == write_seq
@@ -137,9 +136,9 @@ pub fn blob_chunk_key(db: &str, blob: &str, idx: u64) -> String {
     format!("dbs/{db}/blob/{blob}/{idx:08}")
 }
 
-/// Storage key for a blob read pin; see [`blob::pin`]. Stored under the blob's
-/// prefix so sweeps treat a pinned blob as recently modified and deleting the
-/// blob removes its pin.
+/// Returns the storage key for a blob read pin (see [`blob::pin`]).
+/// The pin is stored under the blob prefix so that garbage collection treats a pinned blob
+/// as recently modified and deleting the blob also deletes its pin.
 pub fn pin_key(db: &str, blob: &str) -> String {
     format!("{}pin", blob_prefix(db, blob))
 }
@@ -207,7 +206,7 @@ impl Engine {
             node_id,
             retry: Retry::default(),
             clock: clock::StoreClock::new(),
-            lease_sightings: Mutex::new(DetHashMap::default()),
+            observed_leases: Mutex::new(DetHashMap::default()),
             quota_exempt: Mutex::new(Default::default()),
         });
         Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) })
@@ -232,7 +231,7 @@ impl Engine {
         self.dbs.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Currently open database handles, sorted by ID.
+    /// Returns currently open database handles sorted by ID.
     pub fn open_dbs(&self) -> Vec<Arc<Db>> {
         let g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
         let mut v: Vec<Arc<Db>> = g.values().cloned().collect();
@@ -240,7 +239,7 @@ impl Engine {
         v
     }
 
-    /// Drop handles that are idle for `idle_ms` and not in use.
+    /// Drops unreferenced handles that have been idle for `idle_ms`.
     pub fn evict_idle(&self, idle_ms: u64) {
         let mut g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
         let idle_ms = if crate::buggify::buggify() { 0 } else { idle_ms };
@@ -253,7 +252,7 @@ impl Engine {
         self.shared.cache.evict_prefix(&db_prefix(id));
     }
 
-    /// Delete every object of a database, a page of the listing at a time.
+    /// Deletes all objects belonging to database `id` from storage.
     pub async fn purge(&self, id: &str) -> crate::error::Result<()> {
         self.forget(id);
         let (store, retry, prefix) = (&self.shared.store, &self.shared.retry, db_prefix(id));

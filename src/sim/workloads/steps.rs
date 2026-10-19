@@ -45,7 +45,7 @@ pub async fn members(c: &Client, org: &str) -> Result<BTreeMap<String, Role>, St
 pub async fn create_key(sim: &Arc<Sim>, c: &Client, name: &str, body: Json) -> Result<(Client, Json), String> {
     let (r, _) = c.settle("POST", "/v1/api-keys", Some(body)).await?;
     expect(r.status == 201, format!("create key {name}: {} {}", r.status, r.json))?;
-    let key = r.json["key"].as_str().ok_or(format!("no key: {}", r.json))?;
+    let key = r.json["key"].as_str().ok_or(format!("missing key: {}", r.json))?;
     Ok((Client::with_token(sim, name, key), r.json["api_key"].clone()))
 }
 
@@ -65,8 +65,7 @@ pub async fn mailed_token(sim: &Arc<Sim>, to: &str, path: &str, seen: usize) -> 
     None
 }
 
-/// Sends `req` repeatedly until an email with a link to `link` arrives for `to`,
-/// since a node that crashes before its background task runs never sends the email.
+/// Sends `req` repeatedly until an email with a link to `link` arrives for `to`.
 pub async fn request_mail(c: &Client, req: (&str, &str, Option<Json>), to: &str, link: &str) -> Result<String, String> {
     for _ in 0..20 {
         let seen = c.sim.mailbox.count(to);
@@ -76,7 +75,7 @@ pub async fn request_mail(c: &Client, req: (&str, &str, Option<Json>), to: &str,
             return Ok(t);
         }
     }
-    Err(format!("no mail to {to} with a link to {link}"))
+    Err(format!("missing mail to {to} with link {link}"))
 }
 
 pub async fn verify_email(sim: &Arc<Sim>, c: &Client, email: &str) -> Result<(), String> {

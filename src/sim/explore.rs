@@ -1,13 +1,9 @@
-//! Guided exploration (SPEC §13.4). A run that reaches a rare situation is
-//! branched just after it reached it, so that later runs start from that
-//! state instead of having to reach it again, as Antithesis restarts tests
-//! from the checkpoints its assertions mark. A branched run replays its
-//! parent exactly up to the branch point and then draws other random
-//! numbers (see [`crate::util::rng::branch`]).
+//! Coverage-guided simulation exploration (SPEC §13.4).
 //!
-//! Runs that show a feature no earlier run showed ([`Report::add`]) join
-//! the corpus; parents are chosen, and branched after their rarest probes,
-//! in proportion to how rare those are.
+//! Runs that discover new probe features are added to a corpus and branched
+//! immediately after their rarest probes. A branched run replays its parent
+//! deterministically up to the branch timestamp and then diverges with a new
+//! PRNG salt.
 
 use super::SimOutcome;
 use super::campaign::{Job, Report, default_threads, run_jobs};
@@ -17,24 +13,21 @@ use crate::util::rng::Rng;
 use std::sync::Mutex;
 use std::time::Instant;
 
-/// Runs chosen together, before their outcomes join the corpus, and so the
-/// most threads an exploration keeps busy. Fixed, so that an exploration
-/// does not depend on the machine's core count.
+/// Number of jobs scheduled per batch before updating the corpus. Kept
+/// constant so exploration is independent of the host CPU core count.
 const ROUND: usize = 32;
 
-/// Latest a branch point falls after the probe it follows.
+/// Maximum virtual time offset after a probe hit at which a branch point is placed.
 const BRANCH_WINDOW_MS: u64 = 2_000;
 
 struct Entry {
     job: Job,
     probes: Hits,
-    /// How long the run lasted: a branch point after that changes nothing.
     end_ms: u64,
 }
 
 impl Entry {
-    /// The earliest branch point after each probe that leaves the run time
-    /// to go another way.
+    /// Returns the earliest valid branch timestamp after each probe hit in this run.
     fn starts(&self) -> impl Iterator<Item = (Probe, u64)> + '_ {
         let last = self.job.branches.last().map_or(0, |(ms, _)| *ms);
         self.probes.hit().filter_map(move |p| {
@@ -44,13 +37,12 @@ impl Entry {
     }
 }
 
-/// How an exploration spends its runs.
+/// Resource limits for an exploration run.
 pub struct Budget {
     pub runs: u64,
-    /// Starts no run after this.
     pub deadline: Option<Instant>,
     pub threads: usize,
-    /// Share of runs from fresh seeds rather than branched from the corpus.
+    /// Probability of running a fresh seed instead of branching from the corpus.
     pub fresh: f64,
 }
 
@@ -60,16 +52,14 @@ impl Budget {
     }
 }
 
-/// What an exploration found: the campaign report of its runs, and the
-/// size of its corpus.
+/// Aggregated report and final corpus size from a guided exploration.
 pub struct Exploration {
     pub report: Report,
     pub corpus: usize,
 }
 
-/// Explores `scenarios` from `first_seed` on. The choice of runs depends
-/// only on `first_seed` and the outcomes, so an exploration bounded by runs
-/// rather than by a deadline is deterministic. `progress` sees each run.
+/// Explores `scenarios` starting from `first_seed` within `budget`.
+/// When `budget.deadline` is `None`, the sequence of jobs is deterministic.
 pub fn explore(
     scenarios: &[Scenario],
     first_seed: u64,
@@ -79,8 +69,6 @@ pub fn explore(
     let mut rng = Rng::new(first_seed ^ 0xe8_9107e);
     let mut report = Report::default();
     let mut corpus: Vec<Entry> = Vec::new();
-    // Fresh runs take every scenario in turn, a seed at a time, as a
-    // campaign does.
     let mut fresh: u64 = 0;
     while report.runs < budget.runs && budget.deadline.is_none_or(|d| Instant::now() < d) {
         let n = ROUND.min((budget.runs - report.runs) as usize);
@@ -108,7 +96,6 @@ pub fn explore(
         );
         let outs = outs.into_inner().unwrap_or_else(|e| e.into_inner());
         for (job, out) in jobs.into_iter().zip(outs) {
-            // Runs the deadline kept from starting are left out.
             let Some(out) = out else { continue };
             if report.add(scenarios, &job, &out) {
                 corpus.push(Entry { job, probes: out.probes, end_ms: out.virtual_ms });
@@ -118,8 +105,8 @@ pub fn explore(
     Exploration { corpus: corpus.len(), report }
 }
 
-/// A branch of a corpus entry after a probe of it, both chosen by rarity,
-/// or `None` if no entry has a probe to branch after.
+/// Selects a parent corpus entry and a probe within that entry weighted by
+/// inverse hit frequency, and returns a new branched [`Job`].
 fn branch(rng: &mut Rng, corpus: &[Entry], report: &Report) -> Option<Job> {
     let rarity = |p| 1.0 / report.runs_hitting.get(p as usize).copied().unwrap_or(0).max(1) as f64;
     let weights: Vec<f64> = corpus.iter().map(|e| e.starts().map(|(p, _)| rarity(p)).sum()).collect();

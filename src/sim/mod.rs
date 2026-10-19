@@ -103,32 +103,27 @@ impl NetFaults {
     }
 }
 
-/// The chaos actions [`workloads::chaos_step`] takes, by weight.
+/// Weights and timing parameters for cluster fault injection.
 #[derive(Clone, Debug, Default)]
 pub struct ChaosFaults {
-    /// Whether workloads that inject chaos do so.
     pub enabled: bool,
-    /// The longest pause between actions; each pause is drawn up to it.
+    /// Maximum pause duration between fault actions.
     pub pause_ms: u64,
-    /// How long a storm of actions lasts.
+    /// Duration of an active fault storm.
     pub storm_ms: u64,
-    /// The longest calm after a storm, which begins by healing the cluster;
-    /// 0 for none.
+    /// Maximum recovery period after a storm, during which the cluster is healed.
     pub calm_ms: u64,
     pub crash: u64,
-    /// Start a crashed node.
     pub start: u64,
     pub partition: u64,
-    /// Partitions that drop traffic in one direction only.
     pub one_way_partition: u64,
-    /// Cut a node off from the object store while leaving peer traffic intact.
+    /// Isolates a node from the object store while keeping peer network links intact.
     pub store_isolation: u64,
-    /// Step a node's wall clock by up to `clock_step_max_ms` either way.
+    /// Steps a node's wall clock by up to `clock_step_max_ms` in either direction.
     pub clock_step: u64,
     pub heal: u64,
-    /// Pause longer, letting the cluster settle.
     pub quiet: u64,
-    /// Pause a node's process for up to three lease durations.
+    /// Freezes a node's execution for up to three lease durations.
     pub pause_node: u64,
     pub clock_step_max_ms: u64,
 }
@@ -138,7 +133,7 @@ pub struct SimConfig {
     pub nodes: usize,
     pub store: StoreFaults,
     pub net: NetFaults,
-    /// Maximum absolute wall-clock skew per node at start.
+    /// Maximum initial wall-clock skew per node.
     pub max_skew_ms: u64,
     pub chaos: ChaosFaults,
     pub engine: EngineConfig,
@@ -146,24 +141,19 @@ pub struct SimConfig {
     pub keep_log: bool,
     pub full_trace: bool,
     pub request_timeout_ms: u64,
-    /// The knobs this configuration was drawn from, if it was (see [`swarm`]).
     pub knobs: Option<Arc<swarm::Knobs>>,
-    /// The share of buggify sites active in a run (see [`crate::buggify`]).
+    /// Fraction of buggify sites enabled in a simulation run.
     pub buggify: f64,
-    /// Whether crash points may crash nodes.
     pub crash_points: bool,
-    /// How often a node's task yields before a poll, varying the order of
-    /// tasks that are ready together.
+    /// Probability that a node task yields before being polled.
     pub reorder: f64,
     pub disk: DiskFaults,
-    /// Branch points of this run: `(virtual ms, salt)`, sorted (see
-    /// [`crate::util::rng::branch`]). A run with branch points repeats the
-    /// unbranched run up to the first, then explores another future.
+    /// Sorted `(virtual_ms, salt)` branch points for deterministic replay and divergence.
     pub branches: Vec<(u64, u64)>,
 }
 
 impl SimConfig {
-    /// Fast, fault-free single node.
+    /// Returns a fast, fault-free single-node configuration.
     pub fn basic() -> SimConfig {
         let engine = EngineConfig {
             lease_ms: 3_000,
@@ -179,7 +169,6 @@ impl SimConfig {
             clock_sync_max_error_ms: 100,
             levels_inline_max: 1,
             version_sample_ms: 5_000,
-            // Short enough to expire within a run, long enough to resolve ambiguous commits.
             commit_retention_ms: 120_000,
             ..EngineConfig::small_for_tests()
         };
@@ -236,7 +225,6 @@ impl SimConfig {
 
 pub struct SimNode {
     pub idx: usize,
-    /// Which start of the simulation this process was.
     pub start: u64,
     pub node: Arc<Node>,
     pub router: axum::Router,
@@ -244,9 +232,9 @@ pub struct SimNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetError {
-    /// Never reached the node.
+    /// Request did not reach the node.
     Refused,
-    /// May have been processed.
+    /// Request may have been processed before the response was lost.
     Lost,
     Timeout,
 }
@@ -268,7 +256,7 @@ pub struct Sim {
     pub google: Arc<google::FakeGoogle>,
     pub mailbox: Arc<mail::Mailbox>,
     slots: Vec<Mutex<Option<Arc<SimNode>>>>,
-    /// Held while node `i` starts, so that concurrent starts yield one process.
+    /// Serializes startup for each node slot so concurrent starts do not spawn duplicate instances.
     starting: Vec<tokio::sync::Mutex<()>>,
     disks: Vec<Option<LocalTier>>,
     partitions: Mutex<BTreeSet<(usize, usize)>>,
@@ -277,16 +265,11 @@ pub struct Sim {
     base_ms: u64,
     starts: AtomicU64,
     pub crashes: AtomicU64,
-    /// The first violation a global oracle found.
     violation: Mutex<Option<String>>,
     pub knobs: Arc<swarm::Knobs>,
-    /// When a crash point last crashed a node.
     last_point_crash: Mutex<Option<Instant>>,
-    /// Workloads in their chaos phase, and the chaos loop they share.
     pub(crate) chaos: Mutex<workloads::ChaosState>,
-    /// Notified when the last chaos phase ends and the cluster has recovered.
     pub(crate) chaos_over: tokio::sync::Notify,
-    /// The administrator's session token, once [`workloads::admin`] created it.
     pub(crate) admin: tokio::sync::Mutex<Option<String>>,
     me: Weak<Sim>,
 }
@@ -314,8 +297,7 @@ fn take_panic() -> Option<String> {
     PANIC.with(|p| p.borrow_mut().take())
 }
 
-/// A node's local disk: its cache tier, which outlives the node's crashes,
-/// and loses or corrupts entries at the rates of [`DiskFaults`].
+/// Simulated local disk cache that persists across node restarts and injects read/write faults.
 struct SimDisk {
     inner: MemLocal,
     rng: Mutex<Rng>,
@@ -323,16 +305,16 @@ struct SimDisk {
     trace: Arc<Trace>,
 }
 
-/// Faults of nodes' local disks.
+/// Fault injection parameters for simulated local disks.
 #[derive(Clone, Debug, Default)]
 pub struct DiskFaults {
-    /// Bytes each node's local cache tier holds, or 0 for no tier.
+    /// Capacity of each node's local cache tier in bytes, or 0 to disable local caching.
     pub bytes: u64,
-    /// Probability that a read finds its entry gone.
+    /// Probability that a cached read misses as if the entry were evicted.
     pub p_lose: f64,
-    /// Probability that a write never reaches the disk.
+    /// Probability that a cache write is silently dropped.
     pub p_drop_write: f64,
-    /// Probability that a read returns its entry with one bit flipped.
+    /// Probability that a cached read flips a random bit in the returned bytes.
     pub p_corrupt: f64,
 }
 
@@ -370,13 +352,13 @@ impl crate::engine::local::LocalStore for SimDisk {
     }
 }
 
-/// Least virtual time between two crashes at crash points.
+/// Minimum virtual time between two crash-point crashes.
 const POINT_CRASH_SPACING_MS: u64 = 30_000;
 
-/// Virtual time a run may take: longer means a workload made no progress.
+/// Maximum virtual time allowed for a simulation run before timing out.
 const MAX_VIRTUAL_MS: u64 = 6 * 3_600_000;
 
-/// How often the global oracles check the cluster, in virtual time.
+/// Virtual time interval between global invariant checks.
 const ORACLE_INTERVAL_MS: u64 = 20;
 
 pub fn addr_of(i: usize) -> String {
@@ -655,15 +637,13 @@ impl Sim {
         panic!("node {i} could not start");
     }
 
-    /// Crashes node `i` at a crash point, if it is still the `n`th process
-    /// started, and starts it again a little later.
+    /// Crashes node `i` at a crash point if it is still running instance `n`,
+    /// and schedules a restart after a random delay.
     fn crash_at_point(self: &Arc<Self>, i: usize, n: u64, why: &str) -> bool {
         let current = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.start);
         if current != Some(n) {
             return false;
         }
-        // Crashes at crash points are spaced out, so that a node that keeps
-        // reaching one does not crash on every start.
         {
             let mut last = self.last_point_crash.lock().unwrap_or_else(|e| e.into_inner());
             if last.is_some_and(|t| t.elapsed() < Duration::from_millis(POINT_CRASH_SPACING_MS)) {
@@ -694,10 +674,9 @@ impl Sim {
         }
     }
 
-    /// Checks the global invariants no single node can see: at most one node
-    /// relies on a lease on each database, and a node that relies on its
-    /// lease, with no manifest write in flight, serves the manifest the store
-    /// holds.
+    /// Verifies cluster-wide lease invariants: at most one node holds an active
+    /// lease per database, and any leased node without an in-flight manifest write
+    /// matches the latest manifest in object storage.
     fn check_oracles(&self) -> Result<(), String> {
         let mut holders: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for i in self.up_nodes() {
@@ -714,14 +693,14 @@ impl Sim {
                 {
                     let ws = crate::engine::manifest::Manifest::decode(&g.data).map_or(0, |m| m.write_seq);
                     return Err(format!(
-                        "n{i} relies on its lease on {} at write {write_seq}, but the store holds write {ws}",
+                        "n{i} holds lease on {} at write {write_seq}, but store has write {ws}",
                         db.id
                     ));
                 }
             }
         }
         match holders.into_iter().find(|(_, ns)| ns.len() > 1) {
-            Some((db, ns)) => Err(format!("nodes {ns:?} all rely on a lease on {db}")),
+            Some((db, ns)) => Err(format!("multiple nodes {ns:?} hold an active lease on {db}")),
             None => Ok(()),
         }
     }
@@ -777,8 +756,7 @@ impl Sim {
         self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).contains(&i)
     }
 
-    /// Pauses node `i` for `ms`, as a stop-the-world pause or a frozen VM
-    /// would: no task of it runs meanwhile.
+    /// Suspends all task execution on node `i` for `ms` milliseconds.
     pub fn pause_node(self: &Arc<Self>, i: usize, ms: u64) {
         let Some(n) = self.node(i) else { return };
         self.trace.event(&format!("pause n{i} for {ms}ms"));
@@ -791,7 +769,7 @@ impl Sim {
         });
     }
 
-    /// Resumes every paused node.
+    /// Resumes all paused nodes.
     pub fn resume_all(&self) {
         for i in self.up_nodes() {
             if let Some(n) = self.node(i) {
@@ -877,7 +855,6 @@ pub struct SimOutcome {
     pub storage: StorageReport,
     pub probes: crate::probe::Hits,
     pub buggify: crate::buggify::Report,
-    /// The knob values the run drew, by name.
     pub knobs: Vec<(&'static str, String)>,
     pub trace_tail: Vec<String>,
 }
@@ -901,9 +878,6 @@ where
     F: FnOnce(Arc<Sim>) -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
-    // Simulated nodes log only errors unless asked otherwise. The level is
-    // process-wide, so it is not restored: campaigns run simulations on many
-    // threads at once.
     if std::env::var("BASERUNNA_LOG").is_err() {
         crate::log::set_level(Some(crate::log::Level::Error));
     }
@@ -919,15 +893,13 @@ where
     let branches = cfg.branches.clone();
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.block_on(async move {
-            // Probes' first hits and branch points are in virtual time from here.
             crate::probe::record();
-            crate::probe::own_from(branches.last().map_or(0, |(ms, _)| *ms));
+            crate::probe::set_branch_time(branches.last().map_or(0, |(ms, _)| *ms));
             let start = Instant::now();
             crate::util::rng::branch(
                 branches.iter().map(|(ms, salt)| (start + Duration::from_millis(*ms), *salt)).collect(),
             );
             let sim = Sim::new(seed, cfg).await;
-            // A violation ends the run at once: what follows it only obscures it.
             let mut oracles = sim.spawn_oracles();
             let mut workload = CatchPanic(Box::pin(f(sim.clone())));
             let mut oracles_or_deadline = Box::pin(async {
@@ -935,7 +907,7 @@ where
                 match crate::util::race(&mut oracles, &mut Box::pin(deadline)).await {
                     crate::util::Either::Left(_) => Ok(()),
                     crate::util::Either::Right(()) => {
-                        Err(format!("the workload did not finish within {} s of virtual time", MAX_VIRTUAL_MS / 1000))
+                        Err(format!("workload timed out after {} s of virtual time", MAX_VIRTUAL_MS / 1000))
                     }
                 }
             });

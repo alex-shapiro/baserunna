@@ -1,9 +1,5 @@
-//! `tables`: schema changes and row operations through the HTTP API against
-//! a model, plus concurrent unique-index contention. Updates and deletes of
-//! many rows by selection must change exactly the rows the model selects,
-//! and a follower of the table's change feed must reproduce the model's
-//! rows. At quiescence every index is recomputed from the rows and must
-//! match exactly.
+//! `tables`: verifies table schema operations, row mutations, unique index
+//! contention, and table change feeds against a reference model.
 
 use super::super::Sim;
 use super::super::client::Client;
@@ -72,7 +68,7 @@ impl Follower {
                     let q = c
                         .call_retry("POST", "/v1/dbs/tdb/tables/players/rows/query", Some(json!({"limit": 1000})))
                         .await;
-                    self.cursor = q.json["version"].as_u64().ok_or("no version")?.to_string();
+                    self.cursor = q.json["version"].as_u64().ok_or("missing version")?.to_string();
                     let rows = q.json["rows"].as_array().cloned().unwrap_or_default();
                     self.rows = rows.iter().filter_map(|r| Some((r["id"].as_i64()?, strip(r)))).collect();
                     continue;
@@ -86,7 +82,7 @@ impl Follower {
                     false => self.rows.insert(id, strip(&ch["row"])),
                 };
             }
-            self.cursor = r.json["next_cursor"].as_str().ok_or("no next_cursor")?.to_string();
+            self.cursor = r.json["next_cursor"].as_str().ok_or("missing next_cursor")?.to_string();
             if r.json["more"] != true {
                 break;
             }
@@ -103,8 +99,8 @@ impl Follower {
 /// Verifies all table indexes and checks that no orphaned data remains from
 /// dropped tables or indexes.
 pub async fn check_all_indexes(sim: &Arc<Sim>, db_id: &str) -> Result<(), String> {
-    let n = sim.up_nodes().first().copied().ok_or("no node up")?;
-    let node = sim.node(n).ok_or("node gone")?.node.clone();
+    let n = sim.up_nodes().first().copied().ok_or("all nodes are down")?;
+    let node = sim.node(n).ok_or("node is down")?.node.clone();
     let db = node.engine.db(db_id);
     let mut t = crate::node::retry_unavailable(|| db.begin(Isolation::Serializable, Consistency::Strong))
         .await
@@ -372,7 +368,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
         return Err(format!("add index: {} {}", r.status, r.json));
     }
     let info = c.call_retry("GET", base, None).await;
-    let db_id = info.json["id"].as_str().ok_or("no db id")?.to_string();
+    let db_id = info.json["id"].as_str().ok_or("missing db id")?.to_string();
     check_all_indexes(&sim, &db_id).await?;
     follower.follow(&c, &model).await?;
     let contested: BTreeMap<String, i64> =
@@ -392,11 +388,11 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
     if got != want {
         return Err(format!("final rows differ:\n got {got:?}\nwant {want:?}"));
     }
-    drop_a_large_table(&sim, &c, base, &db_id).await
+    drop_large_table(&sim, &c, base, &db_id).await
 }
 
 /// Tests large table and index drops that trigger range tombstones.
-async fn drop_a_large_table(sim: &Arc<Sim>, c: &Client, base: &str, db_id: &str) -> Result<(), String> {
+async fn drop_large_table(sim: &Arc<Sim>, c: &Client, base: &str, db_id: &str) -> Result<(), String> {
     let t = format!("{base}/tables/archive");
     let create = json!({
         "name": "archive", "if_not_exists": true,

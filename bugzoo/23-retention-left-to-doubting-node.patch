@@ -2,12 +2,10 @@ diff --git a/src/engine/db.rs b/src/engine/db.rs
 index 0e2dd5a..7581cf5 100644
 --- a/src/engine/db.rs
 +++ b/src/engine/db.rs
-@@ -1190,14 +1190,6 @@ impl Db {
+@@ -1175,12 +1175,6 @@ impl Db {
                      };
                      if let Some(c) = applied {
                          probe::hit(Probe::CommitReplayed);
--                        // The attempt that applied it may not have lived to
--                        // schedule the trims its retention calls for.
 -                        let at = pending(base, &m, &tail);
 -                        for id in req.writes.streams.iter().map(StreamOp::id) {
 -                            if at.state(id).await?.is_some_and(|s| s.trim_due(time)) {
@@ -17,7 +15,7 @@ index 0e2dd5a..7581cf5 100644
                          outcomes.push(Outcome::Seq(Ok(c)));
                          continue;
                      }
-@@ -1613,6 +1605,9 @@ impl Db {
+@@ -1600,6 +1594,9 @@ impl Db {
      async fn trim_for_retention(self: &Arc<Self>, id: u64) -> Result<()> {
          let Some(now) = self.shared.store_now_ms() else { return Ok(()) };
          let Some(v) = self.current() else { return Ok(()) };

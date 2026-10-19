@@ -23,7 +23,7 @@ pub struct StoreFaults {
     pub p_fail_before: f64,
     /// Probability that a write is applied but its response is lost.
     pub p_fail_after: f64,
-    /// Maximum duration for which `list` may omit new objects or include deleted ones.
+    /// Maximum duration for which `list` may omit new objects or include deleted objects.
     pub list_lag_ms: u64,
     /// Probability that a write response is delayed by `late_reply_ms` after the write is applied.
     pub p_late_reply: f64,

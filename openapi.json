@@ -83,7 +83,7 @@
       },
       "Appended": {
         "additionalProperties": false,
-        "description": "The records took seqs `first_seq` to `next_seq` (exclusive), at `time`. A replay (`replayed`) of an earlier attempt with the same idempotency key reports that attempt's records.",
+        "description": "Appended records were assigned sequence numbers `[first_seq, next_seq)` at commit timestamp `time`. When `replayed` is true, the response returns the result of an earlier append with the same `idempotency_key`.",
         "properties": {
           "commit_id": {
             "type": "string"
@@ -183,7 +183,7 @@
       },
       "BlobMeta": {
         "additionalProperties": false,
-        "description": "An out-of-band blob.",
+        "description": "Out-of-band blob metadata.",
         "properties": {
           "blob_id": {
             "type": "string"
@@ -314,7 +314,7 @@
       },
       "Consumer": {
         "additionalProperties": false,
-        "description": "A consumer's cursor: the seq it reads from next, and how many records it has yet to read.",
+        "description": "Consumer cursor state: `seq` is the next sequence number to read, and `lag` is the number of unread records (`next_seq - seq`).",
         "properties": {
           "lag": {
             "type": "integer"
@@ -342,7 +342,7 @@
       },
       "CreateApiKey": {
         "additionalProperties": false,
-        "description": "`rate_limit`: requests per second this key may make on each node (default: the node's per-key limit).",
+        "description": "`rate_limit`: maximum requests per second allowed for this key on each node (defaults to the node per-key limit).",
         "properties": {
           "db": {
             "type": [
@@ -372,7 +372,7 @@
       },
       "CreateStream": {
         "additionalProperties": false,
-        "description": "Names are 1-128 characters of `[A-Za-z0-9_.:-]`. Records older than `retention_ms`, or beyond the newest `max_bytes`, may be trimmed; trims run once a stream is a sixteenth past a limit, and take it back to the limit.",
+        "description": "Stream names must be 1-128 characters matching `[A-Za-z0-9_.:-]`. Records older than `retention_ms` or exceeding `max_bytes` are eligible for automatic trimming.",
         "properties": {
           "max_bytes": {
             "minimum": 1,
@@ -445,7 +445,7 @@
       },
       "DbInfo": {
         "additionalProperties": false,
-        "description": "`role` is what you may do here: readers read, writers also write, admins also delete the database.",
+        "description": "`role` specifies the caller's permissions: `reader` allows reads, `writer` adds writes, and `admin` or `owner` adds database deletion.",
         "properties": {
           "created_at": {
             "type": "integer"
@@ -481,7 +481,7 @@
       },
       "DbStats": {
         "additionalProperties": false,
-        "description": "The database at the version read (at most 5 s stale). `levels` lists segments by level, shallowest first; `size_bytes` (blobs included) counts against `quota_bytes`.",
+        "description": "Database statistics at the read version (at most 5 s stale). `levels` lists segments by level from shallowest to deepest; `size_bytes` (including blobs) is counted against `quota_bytes`.",
         "properties": {
           "blob_bytes": {
             "type": "integer"
@@ -550,7 +550,7 @@
       },
       "DbSummary": {
         "additionalProperties": false,
-        "description": "`org` is the owning organization (null for your own databases).",
+        "description": "`org` is the owning organization, or `null` for personal databases.",
         "properties": {
           "created_at": {
             "type": "integer"
@@ -594,7 +594,7 @@
       },
       "DeleteRows": {
         "additionalProperties": false,
-        "description": "Exactly one of `pk` (one row; answers `found`) or `where` (every row it selects, at most `limit`; answers `count`).",
+        "description": "Specify either `pk` (deletes a single row and returns `found`) or `where` (deletes matching rows up to `limit` and returns `count`).",
         "properties": {
           "limit": {
             "minimum": 1,
@@ -683,7 +683,7 @@
         "type": "object"
       },
       "Filter": {
-        "description": "A row filter: `and`, `or` or `not` of filters, or a comparison of the column `col`. A missing or null operand fails every comparison, `ne` included; `exists` tests for one. Numbers compare by value.",
+        "description": "Row filter expression composed of `and`, `or`, `not`, or a comparison on column `col`. A missing or null operand evaluates to false for all comparison operators, including `ne`; use `exists` to test for presence. Numeric values are compared by numeric value.",
         "oneOf": [
           {
             "additionalProperties": false,
@@ -749,7 +749,7 @@
                 "type": "string"
               },
               "value": {
-                "description": "Absent for `exists`, an array of at most 1000 for `in`, otherwise not null."
+                "description": "Omitted for `exists`, an array of at most 1000 elements for `in`, or a non-null scalar."
               }
             },
             "required": [
@@ -790,7 +790,7 @@
         "additionalProperties": {
           "type": "string"
         },
-        "description": "Header names (1-128 bytes) to values (at most 4 KiB); at most 64.",
+        "description": "Map of header names (1-128 bytes) to values (at most 4 KiB), with at most 64 entries.",
         "type": "object"
       },
       "Index": {
@@ -873,7 +873,7 @@
       },
       "KvChange": {
         "additionalProperties": false,
-        "description": "A key's value as of the feed's snapshot (with `expires_at` if it expires), a key deleted (`deleted`, also once its value expired), or every key in `[start, end)` deleted (`deleted_range`; `end: null` is the end of the keyspace).",
+        "description": "Key change entry as of the feed snapshot: either a live key-value entry (with `expires_at` if set), a point deletion (`deleted: true`, including expired keys), or a range deletion over `[start, end)` (`deleted_range`, where `end: null` denotes the end of the keyspace).",
         "properties": {
           "blob": {
             "$ref": "#/components/schemas/BlobMeta"
@@ -956,7 +956,7 @@
       },
       "KvItem": {
         "additionalProperties": false,
-        "description": "A key and its value. Keys/values that are not valid UTF-8 in utf8 mode are returned in `key_b64` / `value_b64`. Values stored as blobs larger than the inline JSON limit only carry `blob`. A value written with a time to live has `expires_at` (cluster time, ms), unless the transaction reading it wrote it itself.",
+        "description": "Key-value entry. Keys and values that are not valid UTF-8 in `utf8` mode are returned in `key_b64` and `value_b64`. Values stored as blobs larger than the inline JSON limit include only `blob`. An entry with a TTL includes `expires_at` (cluster time in ms) once committed.",
         "properties": {
           "blob": {
             "$ref": "#/components/schemas/BlobMeta"
@@ -1117,7 +1117,7 @@
       },
       "NewRecord": {
         "additionalProperties": false,
-        "description": "Exactly one of `value` (a string in the request's encoding) and `json` (any JSON value). A record takes at most 1 MiB.",
+        "description": "Specify either `value` (encoded according to `encoding`) or `json` (any JSON value). Maximum record size is 1 MiB.",
         "properties": {
           "headers": {
             "$ref": "#/components/schemas/Headers"
@@ -1159,7 +1159,7 @@
         "type": "object"
       },
       "Op": {
-        "description": "One operation. Keys and values are UTF-8 strings unless the request sets `encoding: base64`. `ttl_ms` makes a value or row expire that long after the write commits; an update keeps a row's expiry unless it sets one. `update_rows` and `delete_rows` change every row `where` selects (at most `limit`), all within the transaction's write limit, and return `count`. Stream ops: `append` gets its seqs at commit (`expect_seq` fails the transaction with 412 unless the stream's next seq is still that); `read_stream` conflicts with appends only if it reached the stream's end, and sees the transaction's own trims but not its appends; `stream_info` conflicts with every append; `set_consumer` takes a seq at most the stream's next.",
+        "description": "Transaction operation. Keys and values are UTF-8 strings unless `encoding: base64` is set. `ttl_ms` sets the entry or row expiration relative to the commit timestamp; row updates preserve existing expiration unless `ttl_ms` is specified. `update_rows` and `delete_rows` modify all rows matching `where` (up to `limit`) within the transaction write limit and return `count`. For stream operations: `append` assigns sequence numbers at commit (`expect_seq` aborts the transaction with 412 if the stream's next sequence number does not match); `read_stream` conflicts with concurrent appends only when the read reaches the end of the stream, and observes earlier trims in the same transaction but not uncommitted appends; `stream_info` conflicts with concurrent appends; `set_consumer` requires `seq` to be at most the stream's `next_seq`.",
         "oneOf": [
           {
             "additionalProperties": false,
@@ -1652,7 +1652,7 @@
       },
       "OpResult": {
         "additionalProperties": false,
-        "description": "Result of one op; the fields present depend on the op (see Op). An `append` reports `first_seq` once the transaction commits.",
+        "description": "Result of a transaction operation; populated fields depend on the operation type (see `Op`). An `append` operation reports `first_seq` when the transaction is committed.",
         "properties": {
           "blob": {
             "$ref": "#/components/schemas/BlobMeta"
@@ -1822,7 +1822,7 @@
       },
       "Query": {
         "additionalProperties": false,
-        "description": "Scan the primary key (default) or a secondary index: equality on a prefix of its columns (`eq`), an optional range on the next column, a residual filter, and pagination via `cursor`.",
+        "description": "Scans the primary key (default) or a secondary index (`index`) using an equality prefix (`eq`), an optional range bound on the next column, a residual `filter`, and pagination via `cursor`.",
         "properties": {
           "consistency": {
             "enum": [
@@ -1907,12 +1907,12 @@
       },
       "Row": {
         "additionalProperties": true,
-        "description": "Column name to value. `bytes` are base64; `blob` columns take a staged `blob_id` on write and return BlobMeta on read.",
+        "description": "Map of column names to values. `bytes` columns use base64; `blob` columns accept a staged `blob_id` on write and return `BlobMeta` on read.",
         "type": "object"
       },
       "RowChange": {
         "additionalProperties": false,
-        "description": "A row as of the feed's snapshot, or its primary key and `deleted`.",
+        "description": "Row change entry as of the feed snapshot: either a live row, a deleted primary key (`deleted: true`), or a table truncation (`deleted_range: true`).",
         "properties": {
           "deleted": {
             "const": true
@@ -2031,7 +2031,7 @@
       },
       "Selection": {
         "additionalProperties": false,
-        "description": "Rows to change, selected like a query: the primary key or an index (`index`), equality on a prefix of its columns (`eq`), a range on the next column and a residual filter. `{}` selects every row.",
+        "description": "Selects rows to modify using the primary key or a secondary index (`index`), an equality prefix (`eq`), a range bound on the next column, and a residual `filter`. `{}` selects all rows.",
         "properties": {
           "eq": {
             "items": {},
@@ -2076,7 +2076,7 @@
       },
       "SessionInfo": {
         "additionalProperties": false,
-        "description": "A signed-in session: `client` is the address that signed in, `current` the session making the request.",
+        "description": "Authenticated session: `client` is the client address at sign-in, and `current` is true for the calling session.",
         "properties": {
           "client": {
             "type": [
@@ -2118,7 +2118,7 @@
       },
       "SetConsumer": {
         "additionalProperties": false,
-        "description": "At most the stream's next seq.",
+        "description": "Must be at most the stream's `next_seq`.",
         "properties": {
           "seq": {
             "type": "integer"
@@ -2131,7 +2131,7 @@
       },
       "Stream": {
         "additionalProperties": false,
-        "description": "Records `first_seq` to `next_seq` (exclusive) are kept: `bytes` of bodies and headers, appended from `first_time` to `last_time`. Stream info lists the first 100 consumers; `consumers_next_cursor` continues the listing on the consumers route.",
+        "description": "Stream metadata and state. Retained records span `[first_seq, next_seq)` with total payload and header size `bytes` and timestamps from `first_time` to `last_time`. `consumers` includes up to 100 consumers, continued via `consumers_next_cursor`.",
         "properties": {
           "bytes": {
             "type": "integer"
@@ -2195,7 +2195,7 @@
       },
       "StreamConfig": {
         "additionalProperties": false,
-        "description": "Fields left out keep their value; `null` removes a limit.",
+        "description": "Omitted fields keep their current setting; `null` removes a retention limit.",
         "properties": {
           "max_bytes": {
             "type": [
@@ -2214,7 +2214,7 @@
         "type": "object"
       },
       "StreamFilter": {
-        "description": "A record filter: `and`, `or` or `not` of filters, or a comparison of a JSON body `field` (a dotted path; numeric segments index arrays), a `header`, or, naming neither, the body's text, which only `contains` tests. A missing or null operand fails every comparison, `ne` included; `exists` tests for one. Numbers compare by value.",
+        "description": "Stream record filter composed of `and`, `or`, `not`, a comparison on a JSON body `field` (dot-separated path where numeric segments index arrays) or `header`, or a `{ \"op\": \"contains\", \"value\": \"...\" }` substring match on the raw record body. A missing or null operand evaluates to false for all comparison operators, including `ne`; use `exists` to test for presence. Numeric values are compared by numeric value.",
         "oneOf": [
           {
             "additionalProperties": false,
@@ -2282,7 +2282,7 @@
                 "type": "string"
               },
               "value": {
-                "description": "Absent for `exists`, an array of at most 1000 for `in`, otherwise not null."
+                "description": "Omitted for `exists`, an array of at most 1000 elements for `in`, or a non-null scalar."
               }
             },
             "required": [
@@ -2315,7 +2315,7 @@
                 "type": "string"
               },
               "value": {
-                "description": "Absent for `exists`, an array of at most 1000 for `in`, otherwise not null."
+                "description": "Omitted for `exists`, an array of at most 1000 elements for `in`, or a non-null scalar."
               }
             },
             "required": [
@@ -2344,7 +2344,7 @@
       },
       "StreamRead": {
         "additionalProperties": false,
-        "description": "Records from at most one of `from_seq`, `from_time` (the first record at or after it), `tail` (the last N) and `consumer` (its cursor; a new consumer starts at the beginning), up to `until_seq` or `until_time` (exclusive), oldest first or with `reverse` newest first; at most `limit` (default 100) records and about `max_bytes` (default 4 MiB, at most 16 MiB). With `filter`, at most `scan_limit` records (default 10,000) are examined.",
+        "description": "Reads records starting from at most one of `from_seq`, `from_time` (first record at or after the timestamp), `tail` (last N records), or `consumer` (consumer cursor, starting at `first_seq` if unset), up to `until_seq` or `until_time` (exclusive). Returns records oldest-first (or newest-first when `reverse` is true), bounded by `limit` (default 100) and `max_bytes` (default 4 MiB, max 16 MiB). When `filter` is set, at most `scan_limit` records (default 10,000) are scanned.",
         "properties": {
           "consistency": {
             "enum": [
@@ -2408,7 +2408,7 @@
       },
       "StreamRecord": {
         "additionalProperties": false,
-        "description": "`seq` is the record's position; `time` (cluster time, ms) is when its append committed. Its body is `json`, or `value` (`value_b64` if not UTF-8 in utf8 mode).",
+        "description": "`seq` is the record sequence number; `time` (cluster time in ms) is the commit timestamp of the append. The payload is returned in `json`, `value`, or `value_b64`.",
         "properties": {
           "headers": {
             "$ref": "#/components/schemas/Headers"
@@ -2435,7 +2435,7 @@
       },
       "StreamRecords": {
         "additionalProperties": false,
-        "description": "`next_seq` continues the read: the next `from_seq` of a forward read, the next `until_seq` of a reverse one. `done`: the read reached its end. `first_seq` and `tail_seq` are the stream's first and next seqs.",
+        "description": "`next_seq` is the cursor for the next page (`from_seq` for forward reads, or `until_seq` for reverse reads). `done` is true when the read reached the end of the requested range. `first_seq` and `tail_seq` are the stream's current `first_seq` and `next_seq`.",
         "properties": {
           "done": {
             "type": "boolean"
@@ -2562,7 +2562,7 @@
       },
       "TxnResult": {
         "additionalProperties": false,
-        "description": "`appends`: the first seq each append received, in order.",
+        "description": "`appends` lists the starting sequence number assigned to each `append` operation in order.",
         "properties": {
           "appends": {
             "items": {
@@ -2605,7 +2605,7 @@
       },
       "UpdateRows": {
         "additionalProperties": false,
-        "description": "Exactly one of `pk` (one row; answers `found`) or `where` (every row it selects, at most `limit`; answers `count`). A row keeps its expiry unless `ttl_ms` sets one.",
+        "description": "Specify either `pk` (updates a single row and returns `found`) or `where` (updates matching rows up to `limit` and returns `count`). Existing row expiration is preserved unless `ttl_ms` is set.",
         "properties": {
           "limit": {
             "minimum": 1,
@@ -2690,7 +2690,7 @@
     }
   },
   "info": {
-    "description": "Transactional key-value, table and stream databases on object storage. Authenticate with `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for writes). Requests over a rate limit get 429 `rate_limited` with `Retry-After` and were not applied; writes that would take a database past its size quota get 507 `quota_exceeded`. Every response carries an `x-request-id` header: the client's own (1-64 characters of `[A-Za-z0-9._:-]`) or a new one, which the server's logs record on every node the request reaches.",
+    "description": "Transactional key-value, table, and stream databases on object storage. Authenticate with `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for writes). Requests over a rate limit return 429 `rate_limited` with `Retry-After` and are not applied; writes that would exceed a database's size quota return 507 `quota_exceeded`. Every response includes an `x-request-id` header containing the client-supplied value (1-64 characters of `[A-Za-z0-9._:-]`) or a generated ID recorded in server logs.",
     "title": "Baserunna",
     "version": "0.1.0"
   },
@@ -3016,7 +3016,7 @@
         ]
       },
       "post": {
-        "description": "Keys may be limited to one database (`db`) and/or be read-only. Requires a session.",
+        "description": "Keys may be scoped to a single database (`db`) and/or marked read-only. Requires a session.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3219,7 +3219,7 @@
     },
     "/v1/auth/password-reset": {
       "post": {
-        "description": "Mails a reset link valid for an hour if an account has this email. The answer does not say whether one does. 404 if the server cannot send mail.",
+        "description": "Mails a reset link valid for an hour if an account has this email. The response does not indicate whether an account exists. Returns 404 if the server cannot send mail.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3263,7 +3263,7 @@
     },
     "/v1/auth/password-reset/confirm": {
       "post": {
-        "description": "Sets the password, verifies the email address and ends every session. The link sets one password: repeating the request with the same password finishes it again, any other is refused.",
+        "description": "Sets the password, verifies the email address, and revokes all existing sessions. Repeating the request with the same password succeeds idempotently; any other password is rejected.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -3391,7 +3391,7 @@
     },
     "/v1/dbs": {
       "get": {
-        "description": "An API key limited to one database lists just that database, and cannot list an organization's.",
+        "description": "An API key scoped to a single database lists only that database and cannot list organization databases.",
         "parameters": [
           {
             "description": "An organization you belong to (default: your own databases)",
@@ -3513,7 +3513,7 @@
         "description": "Immediately invisible everywhere; storage is purged after a grace period. The name can be reused at once. In an organization, admins and owners may delete databases.",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3545,7 +3545,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3579,7 +3579,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3624,7 +3624,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3677,10 +3677,10 @@
     },
     "/v1/dbs/{db}/changes": {
       "get": {
-        "description": "For each key changed after `after`, its state as of the feed's snapshot (intermediate values are not reported), ordered by version. Continue from `next_cursor`, at once while `more` is true. With `wait_ms`, the request waits for a change if there is none. Deletions are kept at least a transaction lifetime (5 minutes); a cursor older than the deletions still kept gets `410 cursor_expired`, and the client should read the current state again and follow on from its `version`.",
+        "description": "Returns the latest state as of the feed's snapshot for each key modified after `after` (intermediate states are omitted), ordered by version. Continue from `next_cursor` while `more` is true. If `wait_ms` is set, waits up to `wait_ms` for new changes. Tombstones are retained for at least the transaction lifetime (5 minutes); cursors older than the tombstone horizon fail with `410 cursor_expired`.",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3689,7 +3689,7 @@
             }
           },
           {
-            "description": "Report changes after this: a version, or a previous `next_cursor`",
+            "description": "Report changes after this version or `next_cursor`",
             "in": "query",
             "name": "after",
             "required": true,
@@ -3707,7 +3707,7 @@
             }
           },
           {
-            "description": "0..=20000: wait this long for a change if there is none yet",
+            "description": "0..=20000: wait up to this duration for a change",
             "in": "query",
             "name": "wait_ms",
             "required": false,
@@ -3810,10 +3810,10 @@
     },
     "/v1/dbs/{db}/commits/{id}": {
       "get": {
-        "description": "Fences in-flight attempts first, so the answer is final for commits whose request has ended (wait at least the commit deadline, about 15 s, after an ambiguous failure). Commits are remembered for 10 minutes; ask within that.",
+        "description": "Fences in-flight attempts first, so the status is definitive for commits whose request has finished (wait at least the commit deadline, about 15 s, after an ambiguous failure). Commit records are retained for 10 minutes.",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3856,7 +3856,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -3988,7 +3988,7 @@
       "delete": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -4038,7 +4038,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -4106,7 +4106,7 @@
                 }
               },
               "x-baserunna-expires-at": {
-                "description": "When the value expires (cluster time, ms), if it does",
+                "description": "Expiration timestamp (cluster time in ms), if set",
                 "schema": {
                   "type": "integer"
                 }
@@ -4142,7 +4142,7 @@
         "description": "Large bodies are streamed into an out-of-band blob. Content-Type is preserved for blobs.",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -4178,7 +4178,7 @@
             }
           },
           {
-            "description": "Expire the value this long after the write commits",
+            "description": "Expire the value after this duration once the write is committed",
             "in": "query",
             "name": "ttl_ms",
             "required": false,
@@ -4225,7 +4225,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -4331,7 +4331,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -4375,7 +4375,7 @@
       "delete": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -4416,7 +4416,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -4479,7 +4479,7 @@
       "patch": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -4532,7 +4532,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -4640,7 +4640,7 @@
       "delete": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -4690,7 +4690,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -4762,7 +4762,7 @@
       "put": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -4822,10 +4822,10 @@
     },
     "/v1/dbs/{db}/streams/{s}/records": {
       "get": {
-        "description": "As JSON, a page of records. As NDJSON, a record per line, with the page's `next_seq`, `first_seq`, `tail_seq` and `done` in `x-baserunna-*` headers. As server-sent events (forward reads only), each record as `id: <seq>` and `data: <record>`, then each later append for up to `wait_ms`, with a comment every 15 s while idle; the stream ends at `limit` records, at `until_seq` or `until_time`, after `wait_ms`, or when the node shuts down, and resumes after `Last-Event-ID`. A read that fails before its first record answers with an error status.",
+        "description": "Returns a page of records as JSON, one record per line as NDJSON (with `next_seq`, `first_seq`, `tail_seq`, and `done` in `x-baserunna-*` headers), or a server-sent event stream (forward reads only) emitting `id: <seq>` and `data: <record>` for up to `wait_ms` with a keepalive comment every 15 s. SSE streams end at `limit`, `until_seq`, `until_time`, `wait_ms`, or node shutdown, and resume after `Last-Event-ID`.",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5022,10 +5022,10 @@
         ]
       },
       "post": {
-        "description": "Appends records atomically at the stream's next seqs; concurrent appends never conflict. Empty lines of NDJSON and text bodies are skipped, as is a leading byte order mark; a body without records appends none (`count` 0). Send NDJSON and text with their content type: curl's `--data-binary` alone sends `application/x-www-form-urlencoded`, which is refused.",
+        "description": "Appends records atomically at the stream's next sequence numbers; concurrent appends do not conflict. Empty lines in NDJSON and text bodies and any leading UTF-8 BOM are skipped; an empty body appends zero records (`count` 0). Send NDJSON and text requests with their matching `Content-Type`.",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5074,7 +5074,7 @@
             }
           },
           {
-            "description": "Retries with the same key apply once (within 10 minutes)",
+            "description": "Retries with the same key are applied once (within 10 minutes)",
             "in": "header",
             "name": "Idempotency-Key",
             "required": false,
@@ -5128,10 +5128,10 @@
     },
     "/v1/dbs/{db}/streams/{s}/records/query": {
       "post": {
-        "description": "A read with a filter; continue from `next_seq` until `done`.",
+        "description": "Reads records matching a filter; continue from `next_seq` until `done` is true.",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5185,7 +5185,7 @@
         "description": "Removes the records before `before_seq`, or before the first record at or after `before_time`.",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5238,7 +5238,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5308,7 +5308,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5352,7 +5352,7 @@
       "delete": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5393,7 +5393,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5456,10 +5456,10 @@
     },
     "/v1/dbs/{db}/tables/{t}/changes": {
       "get": {
-        "description": "For each key changed after `after`, its state as of the feed's snapshot (intermediate values are not reported), ordered by version. Continue from `next_cursor`, at once while `more` is true. With `wait_ms`, the request waits for a change if there is none. Deletions are kept at least a transaction lifetime (5 minutes); a cursor older than the deletions still kept gets `410 cursor_expired`, and the client should read the current state again and follow on from its `version`.",
+        "description": "Returns the latest state as of the feed's snapshot for each key modified after `after` (intermediate states are omitted), ordered by version. Continue from `next_cursor` while `more` is true. If `wait_ms` is set, waits up to `wait_ms` for new changes. Tombstones are retained for at least the transaction lifetime (5 minutes); cursors older than the tombstone horizon fail with `410 cursor_expired`.",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5477,7 +5477,7 @@
             }
           },
           {
-            "description": "Report changes after this: a version, or a previous `next_cursor`",
+            "description": "Report changes after this version or `next_cursor`",
             "in": "query",
             "name": "after",
             "required": true,
@@ -5495,7 +5495,7 @@
             }
           },
           {
-            "description": "0..=20000: wait this long for a change if there is none yet",
+            "description": "0..=20000: wait up to this duration for a change",
             "in": "query",
             "name": "wait_ms",
             "required": false,
@@ -5551,7 +5551,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5604,7 +5604,7 @@
       "delete": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5657,7 +5657,7 @@
         "description": "Adds the index in the `building` state, backfills it from the table's rows in batches of separate transactions while writes continue, and returns once it is `ready`. If the request fails midway, the index stays `building`; repeating the request resumes the backfill. A unique index over duplicate values is removed again and the request fails with `409 already_exists`.",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5710,7 +5710,7 @@
       "delete": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5762,7 +5762,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5825,7 +5825,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5868,7 +5868,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Delete a row, or many",
+        "summary": "Delete one or more rows",
         "tags": [
           "tables"
         ]
@@ -5878,7 +5878,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5931,7 +5931,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -5984,7 +5984,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -6027,7 +6027,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Update columns of a row, or of many",
+        "summary": "Update columns of one or more rows",
         "tags": [
           "tables"
         ]
@@ -6037,7 +6037,7 @@
       "post": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -6081,7 +6081,7 @@
       "delete": {
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -6125,7 +6125,7 @@
         "description": "If any operation in `ops` fails, the transaction is aborted.",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -6179,7 +6179,7 @@
         "description": "Any error aborts the transaction.",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -6230,10 +6230,10 @@
     },
     "/v1/dbs/{db}/txn": {
       "post": {
-        "description": "Ops execute in order with read-your-writes, atomically. Serializable by default; conflicts are retried server-side. With `idempotency_key`, retries never apply twice (a replay returns `replayed: true` and null results).",
+        "description": "Operations execute in order with read-your-writes, atomically. Serializable by default; conflicts are retried server-side. With `idempotency_key`, retries are never applied twice (a replay returns `replayed: true` and null results).",
         "parameters": [
           {
-            "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
             "in": "path",
             "name": "db",
             "required": true,
@@ -6275,7 +6275,7 @@
     },
     "/v1/me": {
       "delete": {
-        "description": "Deletes the account with its sessions, API keys, memberships and databases (purged after a grace period). Accounts with a password confirm it. Refused for the last administrator and for the only owner of an organization. Requires a session.",
+        "description": "Deletes the account along with its sessions, API keys, memberships, and databases (purged after a grace period). Password-authenticated accounts must confirm their password. Rejected for the last administrator or the sole owner of an organization. Requires a session.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -6337,7 +6337,7 @@
     },
     "/v1/me/password": {
       "post": {
-        "description": "Ends every other session. Requires a session.",
+        "description": "Revokes all other sessions. Requires a session.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -6467,7 +6467,7 @@
     },
     "/v1/me/sessions/{id}": {
       "delete": {
-        "description": "`current` says whether it was the session making the request, which is then signed out (its cookie cleared). Requires a session.",
+        "description": "`current` indicates whether the revoked session was the caller's session (which clears its cookie). Requires a session.",
         "parameters": [
           {
             "description": "Session id",
@@ -6663,7 +6663,7 @@
     },
     "/v1/orgs/{org}": {
       "delete": {
-        "description": "Owners only, once the organization has no databases.",
+        "description": "Requires the owner role and an organization with zero databases.",
         "parameters": [
           {
             "description": "Organization name.",
@@ -6859,7 +6859,7 @@
     },
     "/v1/orgs/{org}/members/{user}": {
       "delete": {
-        "description": "Admins remove non-owners, owners anyone; members remove themselves to leave. The last owner cannot leave.",
+        "description": "Admins remove non-owners, owners remove any member, and members can remove themselves. The last owner cannot leave.",
         "parameters": [
           {
             "description": "Organization name.",
@@ -6901,7 +6901,7 @@
         ]
       },
       "post": {
-        "description": "Changes that involve the owner role are for owners. The last owner keeps the role.",
+        "description": "Changes that involve the owner role require an owner. The last owner cannot be demoted.",
         "parameters": [
           {
             "description": "Organization name.",

@@ -38,13 +38,10 @@ fn audit(b: &[i64], accounts: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Transfers `amt` from account `a` to `b` unless `a` lacks it. Each attempt
-/// also writes a marker of its own, which tells whether an attempt with an
-/// ambiguous outcome applied once its commit status no longer can.
+/// Transfers `amt` from account `a` to `b` if `a` has sufficient balance.
+/// Writes a per-attempt marker key to resolve ambiguous commit outcomes.
 async fn transfer(c: &Client, db: &str, a: usize, b: usize, amt: i64, id: &str) -> Result<bool, String> {
     let base = format!("/v1/dbs/{db}");
-    // Writes fail while the lease holder is partitioned from reachable nodes;
-    // retry across a long virtual deadline.
     let deadline = c.sim.now_ms() + 30 * 60_000;
     let mut attempt = 0;
     while c.sim.now_ms() < deadline {
@@ -105,7 +102,6 @@ async fn transfer(c: &Client, db: &str, a: usize, b: usize, amt: i64, id: &str) 
             }
             Ok(r) if r.status != 503 => return Err(format!("commit: {} {}", r.status, r.json)),
             _ => {
-                // Ambiguous: wait out zombies, then resolve it.
                 c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
                 if c.resolve(db, &cid, began, &marker).await? {
                     return Ok(true);
@@ -113,7 +109,7 @@ async fn transfer(c: &Client, db: &str, a: usize, b: usize, amt: i64, id: &str) 
             }
         }
     }
-    Err("transfer never completed".into())
+    Err("transfer timed out".into())
 }
 
 pub async fn run(sim: Arc<Sim>, accounts: usize, clients: usize, transfers: usize, chaos: bool) -> Result<(), String> {

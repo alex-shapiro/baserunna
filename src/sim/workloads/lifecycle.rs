@@ -38,7 +38,6 @@ pub async fn run(sim: Arc<Sim>, cycles: usize, chaos: bool) -> Result<(), String
         for i in sim.up_nodes() {
             let mut cc = Client::with_token(&sim, "probe", c.token.as_deref().unwrap_or_default());
             cc.pin = Some(i);
-            // A node that crashes mid-probe serves nothing, and chaos may never restart it.
             while sim.node(i).is_some() {
                 match cc.call("GET", "/v1/dbs/temp/kv/k0", None).await {
                     Ok(r) if r.status == 404 => break,

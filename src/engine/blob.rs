@@ -144,14 +144,14 @@ pub fn pin_interval_ms(cfg: &EngineConfig) -> u64 {
     cfg.gc_grace_ms / 3
 }
 
-/// Duration a pin protects its blob in store time: two renewal intervals
-/// plus the clock error of the reader and the collector.
+/// Duration for which a pin prevents garbage collection in store time
+/// (two renewal intervals plus maximum clock error on the reader and collector).
 pub fn pin_ttl_ms(cfg: &EngineConfig) -> u64 {
     2 * pin_interval_ms(cfg) + 2 * cfg.clock_sync_max_error_ms
 }
 
-/// Pin a blob being read so garbage collection does not delete it while
-/// the pin is younger than [`pin_ttl_ms`].
+/// Writes a pin object so garbage collection does not delete `id` while
+/// the pin age is within [`pin_ttl_ms`].
 pub async fn pin(shared: &Shared, db: &str, id: &str) -> Result<()> {
     let key = pin_key(db, id);
     crate::probe::hit(crate::probe::Probe::BlobPinWritten);
@@ -159,7 +159,7 @@ pub async fn pin(shared: &Shared, db: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether a fresh pin protects blob `id` at store time `now_ms`.
+/// Returns true if an unexpired pin protects blob `id` at store time `now_ms`.
 pub async fn pinned(shared: &Shared, db: &str, id: &str, now_ms: u64) -> Result<bool> {
     let key = pin_key(db, id);
     match shared.retry.run(|| shared.store.get(&key, GetOpts::default())).await {
@@ -169,7 +169,7 @@ pub async fn pinned(shared: &Shared, db: &str, id: &str, now_ms: u64) -> Result<
     }
 }
 
-/// Write a whole in-memory value as a blob.
+/// Writes an in-memory byte slice as a blob.
 pub async fn write_blob(shared: &Arc<Shared>, db: &str, data: &[u8], content_type: &str) -> Result<BlobRef> {
     let mut w = BlobWriter::new(shared.clone(), db, content_type);
     w.write(data).await?;
@@ -190,7 +190,7 @@ pub fn chunk_plan(chunk_size: u64, range: Range<u64>) -> Vec<(u64, Range<u64>)> 
     out
 }
 
-/// Read one planned chunk piece.
+/// Reads a byte range from chunk `ci` of `blob`.
 pub async fn read_chunk(shared: &Shared, db: &str, blob: &BlobRef, ci: u64, r: Range<u64>) -> Result<Bytes> {
     let key = blob_chunk_key(db, &blob.id, ci);
     let g = shared
@@ -198,8 +198,6 @@ pub async fn read_chunk(shared: &Shared, db: &str, blob: &BlobRef, ci: u64, r: R
         .run(|| shared.store.get(&key, GetOpts { range: Some(r.clone()), ..Default::default() }))
         .await
         .map_err(|e| match e {
-            // The snapshot outlived the blob: it was dereferenced and then
-            // collected after `gc_grace`. A retry reads a newer snapshot.
             crate::store::StoreError::NotFound => {
                 Error::unavailable(format!("blob {} was garbage collected during the read; retry", blob.id))
             }
@@ -211,7 +209,7 @@ pub async fn read_chunk(shared: &Shared, db: &str, blob: &BlobRef, ci: u64, r: R
     Ok(g.data)
 }
 
-/// Read a byte range of a blob into memory.
+/// Reads a byte range of `blob` into memory.
 pub async fn read_range(shared: &Shared, db: &str, blob: &BlobRef, range: Range<u64>) -> Result<Bytes> {
     if range.start > range.end || range.end > blob.size {
         return Err(Error::invalid("blob range out of bounds"));
@@ -228,11 +226,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pins_are_written_in_time_and_renewed_before_they_lapse() {
+    fn pins_are_written_in_time_and_renewed_before_expiry() {
         for cfg in [EngineConfig::default(), EngineConfig::small_for_tests()] {
             let (interval, ttl) = (pin_interval_ms(&cfg), pin_ttl_ms(&cfg));
             assert!(interval > 0 && 2 * interval < cfg.gc_grace_ms, "{interval} ms against {}", cfg.gc_grace_ms);
-            assert_eq!(ttl, 2 * interval + 2 * cfg.clock_sync_max_error_ms, "two renewals and the clock errors");
+            assert_eq!(ttl, 2 * interval + 2 * cfg.clock_sync_max_error_ms);
         }
     }
 

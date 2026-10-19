@@ -93,7 +93,7 @@ fn decode_schema(it: &ReadValue) -> Result<TableSchema> {
     }
 }
 
-/// Read `name`'s schema and pin its key so the transaction conflicts if the schema changes.
+/// Reads the schema for `name` and pins its catalog key so that concurrent schema changes cause a conflict.
 pub async fn get_schema(txn: &mut Txn, name: &str) -> Result<TableSchema> {
     match txn.get_pinned(&catalog_key(name)).await? {
         Some(it) => decode_schema(&it),
@@ -591,9 +591,8 @@ async fn update_indexes(
             continue;
         }
         if let Some((ok, ov, _)) = &o {
-            // Until its backfill checks every row, a unique index may hold this
-            // value for another row, whose entry this write must keep. The read
-            // is pinned because skipping the delete gives up its write conflict.
+            // While a unique index is still building, another row may hold `ok`. Read `ok` with
+            // `get_pinned` to preserve conflict detection if the delete is skipped.
             let ours = !idx.unique
                 || ov.is_empty()
                 || idx.state == IndexState::Ready
@@ -887,10 +886,9 @@ pub struct RangeSpec {
     pub lte: Option<Json>,
 }
 
-/// A row filter (SPEC §4.7) whose comparisons name columns: `{"col": name, "op": ..}`.
+/// Row filter (SPEC §4.7) over table columns (`{"col": name, "op": ..}`).
 pub type Filter = filter::Filter<Col>;
 
-/// A column a row filter names.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Col(pub String);
 
@@ -927,8 +925,6 @@ pub struct QueryResult {
     pub next_cursor: Option<String>,
 }
 
-/// A row filter bound to a table's schema: comparisons name column ids and
-/// hold arguments of their column's type.
 type RowFilter = filter::Filter<u32, Datum>;
 
 fn bind_filter(s: &TableSchema, f: &Filter) -> Result<RowFilter> {
@@ -951,8 +947,6 @@ fn row_matches(f: &RowFilter, row: &Row) -> bool {
     f.eval(&mut |id| row.get(id).filter(|d| !matches!(d, Datum::Null | Datum::Json(Json::Null))))
 }
 
-/// Typed columns compare within their type, byte strings by their bytes;
-/// JSON columns compare as JSON.
 impl Target<Datum> for &Datum {
     fn equals(&self, arg: &Datum) -> bool {
         match (self, arg) {

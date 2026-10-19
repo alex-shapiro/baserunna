@@ -1,6 +1,5 @@
-//! Verifies that the simulator reaches every documented API operation and
-//! every probe but the rare ones (SPEC §13.4) across a short campaign of
-//! every scenario.
+//! Verifies that a short campaign exercises all documented API operations
+//! and all non-rare probes (SPEC §13.4).
 
 use baserunna::sim::campaign::{campaign, default_threads};
 use baserunna::sim::openapi_check::{coverage, documented_operations};
@@ -15,7 +14,7 @@ fn simulation_exercises_every_documented_operation_and_probe() {
     }
     let covered = coverage();
     let missing: Vec<_> = documented_operations().difference(&covered).cloned().collect();
-    assert!(missing.is_empty(), "documented operations never exercised by the simulator: {missing:?}");
+    assert!(missing.is_empty(), "documented operations were not exercised: {missing:?}");
     let unreached: Vec<String> = report
         .unreached()
         .iter()
@@ -24,7 +23,7 @@ fn simulation_exercises_every_documented_operation_and_probe() {
         .collect();
     assert!(
         unreached.is_empty(),
-        "the simulator never reached:\n{}\n{}",
+        "unreached probes:\n{}\n{}",
         unreached.join("\n"),
         report.coverage_table()
     );

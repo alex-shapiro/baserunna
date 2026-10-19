@@ -15,7 +15,7 @@ enum Clock {
 
 pub type Tracer = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
-/// Crashes the node at a crash point, given why; false if it declined.
+/// Callback invoked at a simulated crash point. Returns true if the node crashed.
 pub type CrashHook = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 pub struct Env {
@@ -23,21 +23,17 @@ pub struct Env {
     rng: Option<Mutex<Rng>>,
     tasks: Mutex<JoinSet<()>>,
     tracer: Mutex<Option<Tracer>>,
-    /// Crashes this node: installed by a simulation (see [`Env::crash_point`]).
     crash_hook: Mutex<Option<CrashHook>>,
     gate: Arc<Gate>,
 }
 
-/// Holds a simulated node's tasks while the node is paused.
 #[derive(Default)]
 struct Gate {
     paused: std::sync::atomic::AtomicBool,
     waiting: Mutex<Vec<std::task::Waker>>,
 }
 
-/// A task of a simulated node. Before each poll it may yield, so that tasks
-/// woken together run in varying orders, and it stays pending while its
-/// node is paused.
+/// Wraps a simulated node task to support node pauses and task reordering.
 struct SimTask<F> {
     inner: std::pin::Pin<Box<F>>,
     gate: Arc<Gate>,
@@ -84,14 +80,12 @@ impl Env {
         }
     }
 
-    /// Installs the callback that crashes this node at a crash point.
     pub fn set_crash_hook(&self, h: CrashHook) {
         *self.crash_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
     }
 
-    /// A crash point: where a simulation may crash this node between two
-    /// steps that the service must survive being separated. If the point
-    /// fires, the node crashes and the calling task never resumes.
+    /// Simulates a crash point between operations. If triggered, the node crashes
+    /// and the calling task never resumes.
     #[track_caller]
     pub fn crash_point(&self) -> impl Future<Output = ()> + use<> {
         let loc = std::panic::Location::caller();
@@ -198,9 +192,7 @@ impl Env {
         };
     }
 
-    /// Stops polling this simulated node's tasks until [`Env::resume`], as
-    /// when its process is descheduled: time passes, its timers expire, and
-    /// nothing it does happens.
+    /// Pauses all tasks on this simulated node until [`Env::resume`] is called.
     pub fn pause(&self) {
         self.gate.paused.store(true, Ordering::SeqCst);
     }

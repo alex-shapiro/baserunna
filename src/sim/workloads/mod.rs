@@ -27,8 +27,7 @@ use super::swarm::{Knobs, Profile, Skew, world};
 use super::{Sim, SimConfig};
 use std::sync::Arc;
 
-/// Injects one random fault action, chosen by the weights in
-/// [`super::SimConfig::chaos`], after a random pause.
+/// Injects a random fault action selected according to [`super::SimConfig::chaos`].
 pub async fn chaos_step(sim: &Arc<Sim>) {
     let c = sim.cfg.chaos.clone();
     sim.sleep(100 + sim.rand_below(c.pause_ms)).await;
@@ -85,8 +84,7 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
     }
 }
 
-/// The cluster's administrator: the first account, which the first call
-/// signs up. Workloads that need an administrator share this one.
+/// Returns a client authenticated as the cluster administrator, creating the account on first call.
 pub async fn admin(sim: &Arc<Sim>) -> Result<Client, String> {
     let mut g = sim.admin.lock().await;
     if let Some(t) = g.as_ref() {
@@ -100,7 +98,7 @@ pub async fn admin(sim: &Arc<Sim>) -> Result<Client, String> {
 pub const ADMIN_EMAIL: &str = "root@sim.test";
 pub const ADMIN_PASSWORD: &str = "root-password";
 
-/// Heals network partitions, resumes paused nodes and restarts crashed ones.
+/// Heals network partitions, resumes paused nodes, and restarts crashed nodes.
 pub async fn recover(sim: &Arc<Sim>) {
     sim.heal();
     sim.resume_all();
@@ -114,8 +112,8 @@ pub async fn recover(sim: &Arc<Sim>) {
 
 /// Verifies that the system database's metadata invariants hold.
 pub async fn check_integrity(sim: &Arc<Sim>) -> Result<(), String> {
-    let n = sim.up_nodes().first().copied().ok_or("no node up")?;
-    let node = sim.node(n).ok_or("node gone")?.node.clone();
+    let n = sim.up_nodes().first().copied().ok_or("all nodes are down")?;
+    let node = sim.node(n).ok_or("node is down")?.node.clone();
     let mut t = crate::node::retry_unavailable(|| node.sys_read_strong()).await.map_err(|e| e.to_string())?;
     crate::meta::check_integrity(&mut t).await.map_err(|e| e.to_string())
 }
@@ -149,8 +147,7 @@ pub async fn cache_expiry(sim: &Arc<Sim>) {
     sim.sleep(cache_lag(sim)).await;
 }
 
-/// Spawns a background chaos loop, idle unless the world enables chaos;
-/// abort the returned handle to stop it.
+/// Spawns a background chaos loop when fault injection is enabled.
 pub fn spawn_chaos(sim: &Arc<Sim>) -> tokio::task::JoinHandle<()> {
     let sim = sim.clone();
     tokio::spawn(async move {
@@ -158,8 +155,7 @@ pub fn spawn_chaos(sim: &Arc<Sim>) -> tokio::task::JoinHandle<()> {
         if !c.enabled {
             return;
         }
-        // Storms of faults alternate with calms, so that even the harshest
-        // worlds leave the cluster time to make progress.
+        // Alternate fault storms with recovery periods so the cluster can make progress.
         loop {
             let until = sim.now_ms().saturating_add(c.storm_ms);
             while sim.now_ms() < until {
@@ -173,42 +169,32 @@ pub fn spawn_chaos(sim: &Arc<Sim>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// Workloads in their chaos phase and the loop that injects their faults.
+/// Tracks active chaos phases and the shared fault-injection task.
 #[derive(Default)]
 pub struct ChaosState {
     active: usize,
-    /// The chaos loop, kept once aborted so that a phase started while the
-    /// last one recovers does not spawn another.
     task: Option<tokio::task::JoinHandle<()>>,
-    /// Incremented each time the last phase ends.
     ended: u64,
 }
 
-/// A workload's chaos phase. Workloads running together share one chaos
-/// loop, which runs while any of them is in its phase. Ending a phase waits
-/// until every phase has ended and the cluster has recovered, so checks
-/// after it run without faults.
+/// Guard for a workload's fault-injection phase.
 pub struct ChaosPhase {
     sim: Arc<Sim>,
     open: bool,
 }
 
-/// Starts a chaos phase for the calling workload. A phase started after
-/// chaos has ended runs without faults, since other workloads' checks may
-/// be running.
+/// Starts a chaos phase for the calling workload.
 pub fn chaos_phase(sim: &Arc<Sim>) -> ChaosPhase {
     let mut st = sim.chaos.lock().unwrap_or_else(|e| e.into_inner());
     st.active += 1;
     if st.task.is_none() {
-        crate::buggify::quiesce(false);
+        crate::buggify::set_quiet(false);
         st.task = Some(spawn_chaos(sim));
     }
     ChaosPhase { sim: sim.clone(), open: true }
 }
 
 impl ChaosPhase {
-    /// Leaves the phase, returning `Some` if it was the last one, after
-    /// stopping chaos.
     fn leave(&mut self) -> Option<u64> {
         self.open = false;
         let mut st = self.sim.chaos.lock().unwrap_or_else(|e| e.into_inner());
@@ -219,11 +205,11 @@ impl ChaosPhase {
         if let Some(t) = &st.task {
             t.abort();
         }
-        crate::buggify::quiesce(true);
+        crate::buggify::set_quiet(true);
         Some(st.ended)
     }
 
-    /// Ends the phase, waiting for the others and for recovery.
+    /// Ends the chaos phase and waits until all active phases finish and the cluster recovers.
     pub async fn end(mut self) {
         let sim = self.sim.clone();
         let over = sim.chaos_over.notified();
@@ -247,23 +233,19 @@ impl ChaosPhase {
 
 impl Drop for ChaosPhase {
     fn drop(&mut self) {
-        // A workload that fails leaves its phase without waiting, but the
-        // others still check a recovered cluster.
         if self.open && self.leave().is_some() {
             tokio::spawn(recover_and_release(self.sim.clone()));
         }
     }
 }
 
-/// Recovers the cluster after the last chaos phase ended, then releases the
-/// workloads waiting for it.
 async fn recover_and_release(sim: Arc<Sim>) {
     recover(&sim).await;
     sim.chaos.lock().unwrap_or_else(|e| e.into_inner()).ended += 1;
     sim.chaos_over.notify_waiters();
 }
 
-/// Ends `phase` if there is one, and recovers the cluster either way.
+/// Ends `phase` if present and recovers the cluster.
 pub async fn settle(sim: &Arc<Sim>, phase: Option<ChaosPhase>) {
     match phase {
         Some(p) => p.end().await,
@@ -271,9 +253,7 @@ pub async fn settle(sim: &Arc<Sim>, phase: Option<ChaosPhase>) {
     }
 }
 
-/// Workloads that `mix` may run together, with the knob that includes each.
-/// Those that need a world of their own (no faults, or grace periods and
-/// cache budgets of their own) are left out.
+/// Workloads eligible for concurrent execution in [`mix`].
 const MIX: &[(&str, &str)] = &[
     ("kv_model", "mix.kv_model"),
     ("history", "mix.history"),
@@ -293,9 +273,7 @@ const MIX: &[(&str, &str)] = &[
     ("accounts", "mix.accounts"),
 ];
 
-/// Runs a random subset of at least two workloads at once, sharing one
-/// cluster and one chaos loop: every workload's checks run once all of
-/// them have finished their chaos phases.
+/// Runs a random subset of at least two workloads concurrently on a shared cluster.
 pub async fn mix(sim: Arc<Sim>) -> Result<(), String> {
     let k = &sim.knobs;
     let mut chosen: Vec<&str> = MIX.iter().filter(|(_, knob)| k.chance(knob, 0.3)).map(|(n, _)| *n).collect();
@@ -308,7 +286,6 @@ pub async fn mix(sim: Arc<Sim>) -> Result<(), String> {
         }
     }
     sim.trace.event(&format!("mix of {chosen:?}"));
-    // The first account is the administrator some workloads expect.
     admin(&sim).await?;
     let runs: Vec<_> =
         chosen.iter().map(|n| (*n, (scenario(n).expect("mixed workloads are scenarios").run)(sim.clone()))).collect();
@@ -317,8 +294,7 @@ pub async fn mix(sim: Arc<Sim>) -> Result<(), String> {
 
 type Run = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>;
 
-/// Polls every run to completion on this task and returns the error that
-/// came first: a later one may only follow from it.
+/// Polls all futures to completion and returns the first error.
 async fn join_all(mut runs: Vec<(&str, Run)>) -> Result<(), String> {
     let mut done = vec![false; runs.len()];
     let mut first: Option<String> = None;
@@ -342,16 +318,14 @@ async fn join_all(mut runs: Vec<(&str, Run)>) -> Result<(), String> {
 
 pub type Runner = fn(Arc<Sim>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>;
 
-/// A named simulation scenario: a workload and the worlds it runs in.
+/// Simulation scenario definition.
 pub struct Scenario {
     pub name: &'static str,
-    /// Draws the world for a run from its knobs.
     pub config: fn(&Knobs) -> SimConfig,
     pub run: Runner,
 }
 
 impl Scenario {
-    /// The world of this scenario's run with `seed`.
     pub fn config_for(&self, seed: u64) -> SimConfig {
         let knobs = Arc::new(Knobs::new(seed));
         SimConfig { knobs: Some(knobs.clone()), ..(self.config)(&knobs) }
@@ -362,7 +336,6 @@ fn faulty(nodes: (usize, usize)) -> Profile {
     Profile { nodes, ..Profile::FAULTY }
 }
 
-/// Applies a size quota to some worlds, exercising quota refusals.
 fn maybe_quota(k: &Knobs, mut c: SimConfig) -> SimConfig {
     if k.chance("kv_model.quota", 0.5) {
         c.engine.db_max_bytes = k.log_range("kv_model.quota_bytes", 8 * 1024, 64 * 1024);
@@ -432,7 +405,7 @@ pub fn scenarios() -> Vec<Scenario> {
             run: |s| Box::pin(lifecycle::run(s.clone(), s.knobs.range("lifecycle.cycles", 2, 6) as usize, true)),
         },
         Scenario {
-            // Form posts are not idempotent, so the console runs without faults.
+            // Form submissions are not idempotent, so the console scenario runs without fault injection.
             name: "console",
             config: |k| world(k, Profile { nodes: (1, 3), faults: false, skew: Skew::None }),
             run: |s| Box::pin(console::run(s)),
@@ -459,8 +432,7 @@ pub fn scenarios() -> Vec<Scenario> {
             },
         },
         Scenario {
-            // Garbage collection uses the store's clock, so short grace
-            // periods must hold even with node clocks an hour apart.
+            // Garbage collection uses the object store clock and must tolerate large node clock skew.
             name: "blob_gc_race",
             config: |k| blob_gc_race::config(world(k, Profile { skew: Skew::Hour, ..faulty((1, 4)) })),
             run: |s| {

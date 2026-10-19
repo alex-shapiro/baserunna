@@ -7,7 +7,7 @@ use baserunna::probe::{self, Probe};
 use baserunna::sim::workloads::scenario;
 use baserunna::sim::{SimConfig, run, run_seeds};
 
-/// One test per scenario, each running a few seeds of its swarm.
+/// Generates a test function per scenario and verifies that all scenarios are covered.
 macro_rules! scenario_tests {
     ($($test:ident: $name:literal, $base:literal, $seeds:literal;)*) => {
         $(
@@ -21,7 +21,7 @@ macro_rules! scenario_tests {
         fn every_scenario_has_a_test() {
             let tested = [$($name),*];
             for s in baserunna::sim::workloads::scenarios() {
-                assert!(tested.contains(&s.name), "scenario {} has no test", s.name);
+                assert!(tested.contains(&s.name), "scenario {} is not tested", s.name);
             }
         }
     };
@@ -51,8 +51,8 @@ scenario_tests! {
     sim_accounts: "accounts", 21, 2;
 }
 
-/// A branched run repeats its parent up to its branch point and differs
-/// after it, the same way every time (SPEC §13.1).
+/// Verifies that a branched run matches its parent up to the branch point and
+/// diverges deterministically afterward (SPEC §13.1).
 #[test]
 fn branched_runs_repeat_their_parent_until_the_branch_point() {
     let s = scenario("history").expect("scenario exists");
@@ -65,12 +65,11 @@ fn branched_runs_repeat_their_parent_until_the_branch_point() {
     };
     let (parent, knobs) = run_at(vec![]);
     let (late, _) = run_at(vec![(u64::MAX / 2, 0xabc)]);
-    assert_eq!(late, parent, "a branch point past the run's end changes nothing");
-    // Before the workload draws its knobs.
+    assert_eq!(late, parent);
     let (early, early_knobs) = run_at(vec![(1, 0xabc)]);
-    assert_ne!(early, parent, "an early branch point changes the run");
-    assert_eq!(early_knobs, knobs, "a branch keeps its parent's knobs");
-    assert_eq!(run_at(vec![(1, 0xabc)]).0, early, "a branched run is deterministic");
+    assert_ne!(early, parent);
+    assert_eq!(early_knobs, knobs);
+    assert_eq!(run_at(vec![(1, 0xabc)]).0, early);
 }
 
 #[test]
@@ -358,7 +357,7 @@ fn request_and_commit_log_timing() {
         .find(|r| {
             r["msg"] == "commit" && r["request_ids"].as_array().is_some_and(|ids| ids.iter().any(|i| i == "put-1"))
         })
-        .expect("commit record naming the request");
+        .expect("commit record for put-1");
     assert!(commit["txns"].as_u64() >= Some(1), "{commit}");
     assert!(commit["store"]["manifest.put"]["n"].as_u64() >= Some(1), "{commit}");
     assert!(commit["store"]["manifest.put"]["bytes"].as_u64() > Some(0), "{commit}");
@@ -412,18 +411,17 @@ fn request_ids_follow_forwarded_requests() {
     for i in 0..12 {
         let rid = format!("client-{i}");
         let seen = ids(&rid);
-        assert!(!seen.is_empty(), "no log record for {rid}");
+        assert!(!seen.is_empty(), "{rid}");
         for r in seen.iter().filter(|r| r["forwarded_to"].is_string()) {
             forwarded += 1;
             assert!(
                 seen.iter().any(|t| t["node"] == r["forwarded_to"] && t["hops"] == 1 && t["status"] == r["status"]),
-                "the forward of {rid} was not logged under its id: {seen:?}"
+                "{rid}: {seen:?}"
             );
             assert_eq!(r["route"], "/v1/dbs/{db}/kv/{*key}");
         }
     }
-    assert!(forwarded > 0, "no request was forwarded: {requests:?}");
-    // Forwarded metadata commands on the system database's lease holder are logged under the caller's request ID.
+    assert!(forwarded > 0, "{requests:?}");
     let creates: Vec<_> = requests.iter().filter(|r| r["route"] == "/v1/dbs" && r["method"] == "POST").collect();
     let relayed = creates
         .iter()
@@ -433,5 +431,5 @@ fn request_ids_follow_forwarded_requests() {
             })
         })
         .count();
-    assert!(relayed > 0, "no forwarded metadata command carried its request's id: {creates:?}");
+    assert!(relayed > 0, "{creates:?}");
 }

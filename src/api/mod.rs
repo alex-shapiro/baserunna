@@ -283,8 +283,8 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         let deadline = request_deadline(&node, req.headers());
         let name = db_name_from_path(req.uri().path()).ok_or_else(|| Error::not_found("no such route"))?;
         let token = credential(req.headers()).ok_or_else(|| Error::Unauthenticated("missing credentials".into()))?;
-        let meter = match (from_peer(&node, req.headers()), finishes_txn(&req)) {
-            (true, _) => Meter::Charged,
+        let meter = match (is_from_peer(&node, req.headers()), finishes_txn(&req)) {
+            (true, _) => Meter::Exempt,
             (false, true) => Meter::Borrow,
             (false, false) => Meter::Take,
         };
@@ -512,7 +512,6 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
     match node.forwards.deliver(&key) {
         Delivery::First(slot) => {
             let (parts, body) = next.run(req).await.into_parts();
-            // A response can fail while it streams back.
             match http_body_util::BodyExt::collect(body).await.map_err(|e| e.to_string()) {
                 Ok(_) if crate::buggify::fault(0.01) => {
                     slot.finish(None);
@@ -553,8 +552,8 @@ fn unknown_outcome(message: String) -> Response {
     Error::Unavailable { message, retry_after_ms: Some(1000), outcome_unknown: true }.into_response()
 }
 
-/// Whether `headers` carry the cluster key, which only peers know.
-fn from_peer(node: &Node, headers: &HeaderMap) -> bool {
+/// Returns true if `headers` contain a valid cluster key.
+fn is_from_peer(node: &Node, headers: &HeaderMap) -> bool {
     let given = headers.get(CLUSTER_KEY_HEADER).and_then(|v| v.to_str().ok());
     match (node.cluster_key(), given) {
         (Some(k), Some(v)) => crate::util::ct_eq(v.as_bytes(), k.as_bytes()),
@@ -564,7 +563,7 @@ fn from_peer(node: &Node, headers: &HeaderMap) -> bool {
 
 /// Requires a valid cluster key header on internal endpoints.
 async fn internal_auth(State(node): State<Arc<Node>>, req: Request, next: Next) -> Response {
-    if !from_peer(&node, req.headers()) {
+    if !is_from_peer(&node, req.headers()) {
         return Error::PermissionDenied("bad cluster key".into()).into_response();
     }
     next.run(req).await
@@ -584,19 +583,9 @@ pub fn consistency_of(q: &std::collections::BTreeMap<String, String>) -> Result<
     }
 }
 
-/// How [`run_txn!`] ended.
 pub(crate) enum Ran<T> {
-    /// The transaction wrote nothing; it read at `version`.
-    Read {
-        out: T,
-        version: u64,
-    },
-    Committed {
-        out: T,
-        commit: Committed,
-    },
-    /// An earlier attempt with the same idempotency key had committed.
-    /// Never without a key.
+    Read { out: T, version: u64 },
+    Committed { out: T, commit: Committed },
     Replayed(Committed),
 }
 
@@ -612,7 +601,6 @@ macro_rules! run_txn {
         let ran_ = match crate::api::earlier_attempt(ctx_, commit_id_, key_).await? {
             Some(c) => crate::api::Ran::Replayed(c),
             None => {
-                // An earlier attempt may commit right after the check.
                 if crate::buggify::fires(0.2) {
                     let ms = crate::buggify::below(200);
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
@@ -677,7 +665,6 @@ pub(crate) fn commit_id_for(node: &Node, ctx: &DbCtx, key: Option<&str>) -> Resu
     }
 }
 
-/// The commit of an earlier attempt with the idempotency key, if one applied.
 pub(crate) async fn earlier_attempt(ctx: &DbCtx, commit_id: u64, key: Option<&str>) -> Result<Option<Committed>> {
     match key {
         Some(_) => ctx.db.commit_status(commit_id).await,
@@ -685,8 +672,7 @@ pub(crate) async fn earlier_attempt(ctx: &DbCtx, commit_id: u64, key: Option<&st
     }
 }
 
-/// Commits `t`, which produced `out`; `None` if it conflicted and is to be
-/// run again.
+/// Commits `t` with output `out`, or returns `Ok(None)` when `t` must be retried after a conflict.
 pub(crate) async fn finish<T>(
     node: &Node,
     ctx: &DbCtx,
@@ -717,9 +703,8 @@ pub(crate) async fn finish<T>(
     }
 }
 
-/// Answers a failed transaction. A retried idempotent request can fail a
-/// precondition, or an append its expected seq, because an earlier attempt
-/// applied: a fenced status check tells.
+/// Resolves a failed transaction. If an idempotent request failed a precondition because a prior
+/// attempt was already committed, returns `Ran::Replayed` after a fenced commit-status check.
 pub(crate) async fn failed<T>(ctx: &DbCtx, commit_id: u64, key: Option<&str>, e: Error) -> Result<Ran<T>> {
     match e {
         Error::PreconditionFailed { .. } if key.is_some() => match ctx.db.commit_status_fenced(commit_id).await? {
@@ -733,8 +718,7 @@ pub(crate) async fn failed<T>(ctx: &DbCtx, commit_id: u64, key: Option<&str>, e:
     }
 }
 
-/// Names the commit in an error that leaves its outcome unknown, so that
-/// the client can resolve it (SPEC §6.2).
+/// Attaches `commit_id` to an error with an unknown commit outcome (SPEC §6.2).
 pub(crate) fn naming_commit(e: Error, commit_id: u64) -> Error {
     match e {
         Error::Unavailable { message, retry_after_ms, outcome_unknown: true } => Error::Unavailable {
@@ -784,13 +768,11 @@ macro_rules! with_read {
 }
 pub(crate) use with_read;
 
-/// What a long poll reads: whether it found what the poll waits for.
 pub(crate) trait Found {
     fn found(&self) -> bool;
 }
 
-/// Runs `$read` on fresh snapshots until what it reads is [`Found`] or
-/// `$wait` elapses; evaluates to `(output, read_version)`.
+/// Polls `$read` on fresh snapshots until [`Found::found`] is true or `$wait` elapses.
 macro_rules! watch {
     ($node:expr, $db:expr, $c:expr, $wait:expr, |$t:ident| $read:expr) => {{
         let until_ = tokio::time::Instant::now() + $wait;

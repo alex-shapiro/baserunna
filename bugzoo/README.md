@@ -1,13 +1,14 @@
 # Bug zoo
 
-Each patch here puts back one bug that the deterministic simulator found
-before SPEC §13's rewrite (SPEC.md §13.6, numbered as there). The zoo measures how quickly a
-simulation strategy rediscovers known bugs: apply a patch, run the
-strategy, and count the seeds until the first failure.
+Each patch in this directory reintroduces a historical bug found by the
+deterministic simulator (see [`SPEC.md`](../SPEC.md) §13.6 for the numbered
+list). The suite measures how quickly a simulation strategy detects known bugs:
+apply a patch, run the simulator, and record how many seeds execute before the
+first failure.
 
-Patches touch production code only, apply to the branch's head
+All patches modify production code only, apply cleanly to `HEAD`
 (`git apply bugzoo/NN-*.patch`), and compile. `run.sh` applies each patch
-in turn, builds `sim_tool`, runs the `sim_tool` command it is given, and
+sequentially, builds `sim_tool`, runs the specified `sim_tool` command, and
 records the results:
 
 ```sh
@@ -15,23 +16,21 @@ bugzoo/run.sh campaign all 50
 PATCHES="bugzoo/03-*.patch" OUT_DIR=zoo-out bugzoo/run.sh campaign register 300
 ```
 
-Bug 5 has no patch. It was nondeterminism (`tokio::sync::watch` wakes
-waiters in random order). A campaign cannot observe it, and a lint now
-forbids `watch` in the crate.
+Bug 05 is omitted because it was a nondeterminism bug (`tokio::sync::watch`
+wakes waiters in random order) rather than a safety violation, and a source
+lint now forbids `tokio::sync::watch`.
 
-## Detection by the old and the new simulator
+## Detection comparison
 
-How many runs failed with each bug, for the simulator before SPEC §13's
-rewrite (39 fixed scenarios) and after it (21 swarm scenarios). Round 1
-gave each strategy about 780 runs per patch (old: seeds 1–20 of every
-scenario, `campaign all 20 1`; new: `campaign all 37 1`). Round 2 gave the
-bugs that the two simulators together caught at most once in round 1
-about 2,000 more runs each, at
-other seeds (old: `campaign all 52 1000`; new: `campaign all 96 1000`, and
-`explore all 1000` with `SIM_RUNS=2016`). Cells read round 1 · round 2
-campaign · round 2 exploration. Runs are deterministic, so a failure
-counts only at a seed that passes without the patch, and only when it
-shows the patch's symptom.
+The table below shows the number of failing runs per patch for the simulator
+before the SPEC §13 rewrite (39 fixed scenarios) and after it (21 swarm
+scenarios). Round 1 ran ~780 seeds per patch (old: `campaign all 20 1`; new:
+`campaign all 37 1`). Round 2 ran ~2,000 additional seeds for patches that had
+at most 1 failure in Round 1 (old: `campaign all 52 1000`; new:
+`campaign all 96 1000`, plus `explore all 1000` with `SIM_RUNS=2016`). Table
+cells are formatted as `round 1` or `round 1 · round 2 campaign · round 2 exploration`.
+A failure is counted only if the seed passes without the patch and fails with
+the symptom introduced by the patch.
 
 | patch | bug | old | new |
 | ----- | --- | --- | --- |
@@ -63,87 +62,77 @@ shows the patch's symptom.
 | 27 | lease state lost after ambiguous writes | 0 · 1 | 0 · 0 · 2 |
 | 28 | stale authorization after a slow read | 0 · 0 | 0 · 0 · 0 |
 
-Over both rounds, the old simulator rediscovered 14 of the 27 bugs and
-the new simulator's campaigns 17; guided exploration raised the new
-simulator's count to 20. Exploration alone found 22, 23 and 27, which no
-campaign of either simulator did. Bugs 09, 10, 13, 16, 24, 26 and 28
-escaped every strategy; the tests `forwards_to_a_restarted_node_are_refused`
-and `earlier_runs_at_this_address_are_not_routed_to` catch 16 and 26.
+Across both rounds, the old simulator detected 14 of the 27 bugs, the new
+campaign runner detected 17, and guided exploration increased total detection
+to 20 (uniquely finding 22, 23, and 27). Bugs 09, 10, 13, 16, 24, 26, and 28
+were not triggered by the random campaigns; dedicated deterministic tests
+(`forwards_to_a_restarted_node_are_refused` and
+`earlier_runs_at_this_address_are_not_routed_to`) cover 16 and 26.
 
-## What each patch reverts
+## Patch descriptions
 
-Each description says what the patch changes, so it can be redone by hand
-when the patch stops applying.
-
-- **01** `Node::resolve_db` (src/node.rs) returns the cached or snapshot
-  lookup's `NotFound` as is, instead of retrying it with a strong read
+- **01** `Node::resolve_db` (`src/node.rs`) returns `NotFound` from a cached
+  or snapshot lookup without retrying with a strong read
   (`resolve_db_with(.., true)`).
-- **02** When `db_routing` (src/api/mod.rs) handles a buffered request
-  locally after a forward certainly failed, it rebuilds the request from
-  method, URI, version and headers instead of `Request::from_parts(parts,
-  ..)`, so axum's extensions (path parameters, matched path) are lost.
-- **03** `Db::build` (src/engine/db.rs) gives every accepted transaction
-  of a batch the version `base.m.version + 1` instead of `last_seq + 1`.
-- **04** `Db::snapshot` no longer calls `wait_for_in_flight_write` for
-  strong reads.
-- **06** `db_routing` no longer runs `MetaCmd::DeleteDb` when a strong
-  re-resolution maps the name to the same deleted database, and
-  `create_db` (src/api/data.rs) returns `AlreadyExists` without finishing
-  a half-deleted database.
-- **07** `Db::build` no longer rejects a transaction whose commit deadline
-  has passed.
-- **08** `list_keys` (src/api/account.rs) reads with `sys_read` (bounded
-  staleness) instead of `sys_read_strong`.
-- **09** In `db_routing`, `NotFound` from `open_db` (the manifest is gone)
-  is returned as 404 instead of triggering strong re-resolution; only a
-  manifest flagged deleted still re-resolves.
-- **10** `create_db`'s half-deletion check calls a database deleted when a
-  strong read of its handle fails with `NotFound`, which includes a
-  database whose manifest has not been created yet. The fix opened the
-  database with `open_db` (creating the manifest) and required the deleted
-  flag.
-- **11** `dedup_forwarded` (src/api/mod.rs) passes forwarded writes on
-  without `ForwardDedup`; the forward-to check stays.
-- **12** `Db::foreign_lease` computes the remaining lease as `expires_ms +
-  lease_margin_ms - env.now_ms()` (this node's wall clock) instead of from
-  the monotonic instant of the first sighting.
-- **13** `Engine::evict_idle` (src/engine/mod.rs) also drops the lease
-  sightings of the handles it evicts.
-- **14** `table::get_schema` (src/table/mod.rs) reads the catalog entry
+- **02** When `db_routing` (`src/api/mod.rs`) executes a buffered request
+  locally after a forward fails prior to execution, it reconstructs the request
+  from method, URI, version, and headers instead of calling
+  `Request::from_parts(parts, ..)`, discarding axum extensions.
+- **03** `Db::build` (`src/engine/db.rs`) assigns version `base.m.version + 1`
+  to all transactions in a group-commit batch instead of `last_seq + 1`.
+- **04** `Db::snapshot` skips `wait_for_in_flight_write` on strong reads.
+- **06** `db_routing` skips `MetaCmd::DeleteDb` when strong re-resolution maps
+  a name to the same deleted database, and `create_db` (`src/api/data.rs`)
+  returns `AlreadyExists` without completing a partial database deletion.
+- **07** `Db::build` does not reject transactions whose commit deadline has
+  expired.
+- **08** `list_keys` (`src/api/account.rs`) reads from the system database with
+  bounded staleness (`sys_read`) instead of strong consistency (`sys_read_strong`).
+- **09** In `db_routing`, `NotFound` from `open_db` (when the manifest has
+  already been purged) is returned as HTTP 404 instead of triggering strong
+  re-resolution in the system database.
+- **10** `create_db` treats `NotFound` from a strong read of the database
+  handle as evidence that the database was deleted, even when the manifest for
+  a newly created database has not yet been written.
+- **11** `dedup_forwarded` (`src/api/mod.rs`) executes forwarded writes without
+  deduplicating via `ForwardDedup`.
+- **12** `Db::foreign_lease` computes the remaining lease duration using the
+  local wall clock (`expires_ms + lease_margin_ms - env.now_ms()`) instead of
+  the monotonic instant when the lease was first observed.
+- **13** `Engine::evict_idle` (`src/engine/mod.rs`) clears the observed foreign
+  lease state when evicting an idle `Db` handle.
+- **14** `table::get_schema` (`src/table/mod.rs`) reads the table catalog entry
   with `txn.get` instead of `txn.get_pinned`.
-- **15** `blob::read_chunk` (src/engine/blob.rs) converts a missing chunk
-  with the generic `StoreError` conversion (500) instead of a retryable
-  `unavailable`.
-- **16** `dedup_forwarded` no longer refuses forwards whose
-  `x-baserunna-forward-to` names another process.
-- **17** `Shared::lease_seen` identifies a renewal by `lease.expires_ms`
-  instead of the manifest's `write_seq`.
-- **18** `StoreClock::sync` (src/engine/clock.rs) probes once instead of
-  up to three times, and `Node::housekeeping` no longer calls
+- **15** `blob::read_chunk` (`src/engine/blob.rs`) maps a missing blob chunk to
+  HTTP 500 instead of a retryable `503 Unavailable` error.
+- **16** `dedup_forwarded` does not reject forwarded requests whose
+  `x-baserunna-forward-to` header specifies a different node ID.
+- **17** `Shared::lease_seen` identifies a lease renewal by `lease.expires_ms`
+  instead of the manifest `write_seq`.
+- **18** `StoreClock::sync` (`src/engine/clock.rs`) performs only a single
+  probe instead of up to 3 probes, and `Node::housekeeping` does not call
   `refresh_clock`.
-- **19** `Session::is_live` (src/meta/mod.rs) ignores `password_fp`.
-- **20** `db_routing`'s half-deletion repair ignores a failed `DeleteDb`
-  and answers 404 instead of returning the error.
-- **21** `Node::open_link` maps every error from reading the user,
-  retryable ones included, to 401.
-- **22** In `Db::process`, a batch that finds another node's lease fails
-  with plain `NotOwner` even after an ambiguous attempt, instead of an
+- **19** `Session::is_live` (`src/meta/mod.rs`) does not check `password_fp`.
+- **20** The partial-deletion repair in `db_routing` ignores errors from
+  `DeleteDb` and returns HTTP 404.
+- **21** `Node::open_link` maps all errors from reading the user record,
+  including retryable storage errors, to HTTP 401.
+- **22** In `Db::process`, a batch that encounters a foreign lease returns
+  `NotOwner` (`not_applied`) even after a prior manifest `PUT` failed with an
   unknown outcome.
-- **23** `Db::trim_for_retention` returns unless this node holds the
-  lease, and `Db::build` no longer schedules the trims due on the streams
-  of a commit it finds already applied.
-- **24** The `not_committed` commit status (src/api/data.rs) reports
-  `retention_ms: u64::MAX` instead of the real commit retention. This
-  restores the pre-fix contract, in which `not_committed` was always
-  definitive. The simulator's client (`Client::commit_status`) treats a
-  status older than the reported retention as unknown, so with the patch
-  its workloads trust every `not_committed`.
-- **25** `Db::process` no longer deletes the batch's past-grace obsolete
-  objects (`plan.gc`) when the manifest write's outcome is unknown.
-- **26** `Node::live_members` and `Node::route` no longer ignore member
-  entries that share this node's address.
-- **27** After an ambiguous manifest write, the reload in `Db::process` no
-  longer records this node's lease when the reloaded manifest is that
-  write.
-- **28** `Node::role_for` stores a role in the cache with the time the
-  read finished instead of the time it started.
+- **23** `Db::trim_for_retention` exits unless the local node holds the lease,
+  and `Db::build` does not schedule retention trims when replaying an
+  already-committed transaction.
+- **24** The `not_committed` response in `src/api/data.rs` reports
+  `retention_ms: u64::MAX` instead of the configured commit retention window,
+  causing `Client::commit_status` to treat `not_committed` as definitive even
+  after commit records have expired.
+- **25** `Db::process` skips deleting expired obsolete objects (`plan.gc`) when
+  the manifest `PUT` returns an unknown outcome.
+- **26** `Node::live_members` and `Node::route` do not filter out peer records
+  that have the local node's advertise address.
+- **27** After a manifest `PUT` fails with an unknown outcome, the manifest
+  reload in `Db::process` does not record the local node's lease when the
+  reloaded manifest matches that write.
+- **28** `Node::role_for` caches the resolved role using the timestamp when the
+  read completed rather than the timestamp before the read started.

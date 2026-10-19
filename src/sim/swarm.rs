@@ -1,10 +1,9 @@
-//! Swarm testing (SPEC §13.2): every seed draws its own world, with its own
-//! cluster size, faults and their rates, engine and node settings, and its
-//! own workload shape. A campaign then covers many configurations, each
-//! with some features switched off, instead of a few hand-tuned presets.
+//! Swarm configuration generator (SPEC §13.2).
 //!
-//! A knob's value depends only on the seed and the knob's name, so adding a
-//! knob leaves every other knob's draw unchanged.
+//! Each simulation seed derives randomized cluster topology, fault rates, and
+//! engine parameters so that campaigns test a wide variety of configurations.
+//! Each parameter value is hashed independently from `(seed, name)` so that
+//! adding a parameter does not alter other parameters.
 
 use super::store::StoreFaults;
 use super::{ChaosFaults, DiskFaults, NetFaults, SimConfig};
@@ -14,7 +13,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Mutex;
 
-/// The knobs of one run: values drawn from the run's seed.
+/// Parameter generator seeded by the simulation run seed.
 #[derive(Debug)]
 pub struct Knobs {
     seed: u64,
@@ -31,7 +30,7 @@ impl Knobs {
         for b in name.bytes() {
             h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3);
         }
-        // A branched run keeps its parent's knobs, whenever it draws them.
+        // Use an unbranched RNG so that branched runs retain the same configuration as their parent.
         Rng::unbranched(self.seed ^ h)
     }
 
@@ -40,15 +39,14 @@ impl Knobs {
         v
     }
 
-    /// Uniform in `lo..=hi`.
+    /// Samples uniformly from `lo..=hi`.
     pub fn range(&self, name: &'static str, lo: u64, hi: u64) -> u64 {
         let v = if hi <= lo { lo } else { self.rng(name).range(lo, hi + 1) };
         self.note(name, v)
     }
 
-    /// Log-uniform in `lo..=hi`: small values are as likely as large ones.
+    /// Samples log-uniformly from `lo..=hi`.
     pub fn log_range(&self, name: &'static str, lo: u64, hi: u64) -> u64 {
-        // Shifted by one, so that `lo` may be 0.
         let (l, h) = (((lo + 1) as f64).ln(), ((hi.max(lo) + 1) as f64).ln());
         let v = (l + self.rng(name).unit() * (h - l)).exp().round() as u64 - 1;
         self.note(name, v.clamp(lo, hi.max(lo)))
@@ -59,53 +57,50 @@ impl Knobs {
         self.note(name, v)
     }
 
-    /// True with probability `p`.
+    /// Returns `true` with probability `p`.
     pub fn chance(&self, name: &'static str, p: f64) -> bool {
         let v = self.rng(name).chance(p);
         self.note(name, v)
     }
 
-    /// A fault rate around `typical`: zero (the fault is off) in a third of
-    /// runs, otherwise anywhere from a tenth to four times `typical`.
+    /// Samples a fault probability around `typical`: returns `0.0` with probability 1/3,
+    /// or log-uniformly in `[0.1 * typical, 4.0 * typical]`.
     pub fn rate(&self, name: &'static str, typical: f64) -> f64 {
         let mut r = self.rng(name);
         let v = if r.chance(1.0 / 3.0) { 0.0 } else { typical * (0.1f64.ln() + r.unit() * 40f64.ln()).exp() };
         self.note(name, v)
     }
 
-    /// The weight of one choice among several: zero (the choice is off) in a
-    /// quarter of runs, otherwise 1 to 10.
+    /// Samples an action weight: returns `0` with probability 0.25, or uniformly in `1..=10`.
     pub fn weight(&self, name: &'static str) -> u64 {
         let mut r = self.rng(name);
         let v = if r.chance(0.25) { 0 } else { 1 + r.below(10) };
         self.note(name, v)
     }
 
-    /// The values drawn so far, by knob name.
+    /// Returns all sampled `(name, value)` pairs sorted by name.
     pub fn drawn(&self) -> Vec<(&'static str, String)> {
         self.drawn.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (*k, v.clone())).collect()
     }
 }
 
-/// How far apart node clocks may be in a scenario's worlds.
+/// Maximum clock skew and clock step magnitude allowed in a scenario.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Skew {
     None,
     /// Within the lease margin.
     Margin,
-    /// Up to ten times the lease margin, with jumps as large.
+    /// Up to 10x the lease margin.
     Hostile,
-    /// Up to an hour, with jumps as large.
+    /// Up to 1 hour.
     Hour,
 }
 
-/// What a scenario's workload tolerates.
+/// Fault and topology bounds for a scenario.
 #[derive(Clone, Copy, Debug)]
 pub struct Profile {
     pub nodes: (usize, usize),
-    /// Store and network faults and chaos actions.
     pub faults: bool,
-    /// The largest clock skew the workload's checks allow for.
     pub skew: Skew,
 }
 
@@ -113,13 +108,12 @@ impl Profile {
     pub const FAULTY: Profile = Profile { nodes: (1, 5), faults: true, skew: Skew::Hostile };
 }
 
-/// Draws a world within `p` from the run's knobs.
+/// Generates a randomized [`SimConfig`] within the bounds of `p`.
 pub fn world(k: &Knobs, p: Profile) -> SimConfig {
     let mut c = SimConfig::basic();
     c.nodes = k.range("world.nodes", p.nodes.0 as u64, p.nodes.1 as u64) as usize;
     engine_knobs(k, &mut c);
     node_knobs(k, &mut c);
-    // Some worlds are calm: no faults at all, so throughput is high.
     let faulty = p.faults && !k.chance("world.calm", 0.1);
     if faulty {
         let lease = c.engine.lease_ms;
@@ -188,8 +182,6 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
     c
 }
 
-/// Engine sizes and timings: small enough that every storage path runs in a
-/// short simulation, and different in every run.
 fn engine_knobs(k: &Knobs, c: &mut SimConfig) {
     let e = &mut c.engine;
     e.tail_max_bytes = k.log_range("engine.tail_max_bytes", 512, 32 * 1024) as usize;
@@ -202,9 +194,6 @@ fn engine_knobs(k: &Knobs, c: &mut SimConfig) {
     e.l0_compaction_max_inputs = k.range("engine.l0_compaction_max_inputs", 2, 12) as usize;
     e.level_size_ratio = k.range("engine.level_size_ratio", 2, 10);
     e.level_base_bytes = k.log_range("engine.level_base_bytes", 2 * 1024, 64 * 1024);
-    // A cache that cannot hold a few blocks and segment indexes misses on
-    // every read, so a large request outlasts its commit deadline on each
-    // retry; no real node runs so.
     e.cache_bytes = (k.log_range("engine.cache_bytes", 64 * 1024, 4 * 1024 * 1024) as usize).max(8 * e.block_target);
     e.range_delete_points_max = k.log_range("engine.range_delete_points_max", 1, 300) as usize;
     e.levels_inline_max = k.range("engine.levels_inline_max", 1, 16) as usize;
@@ -242,7 +231,7 @@ mod tests {
         let x = a.range("x", 0, 1_000_000);
         let _ = a.range("y", 0, 10);
         let b = Knobs::new(7);
-        assert_eq!(b.range("x", 0, 1_000_000), x, "drawing another knob first changes nothing");
+        assert_eq!(b.range("x", 0, 1_000_000), x);
         assert_ne!(
             (0..20).map(|s| Knobs::new(s).range("x", 0, 1_000_000)).collect::<std::collections::BTreeSet<_>>().len(),
             1
@@ -262,7 +251,7 @@ mod tests {
             assert!(c.engine.lease_margin_ms < c.engine.lease_ms);
         }
         assert_eq!(nodes.len(), 5);
-        assert!((30..120).contains(&off), "faults are off in about a third of worlds: {off}");
+        assert!((30..120).contains(&off), "unexpected zero-fault count: {off}");
     }
 
     #[test]

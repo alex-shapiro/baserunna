@@ -177,18 +177,14 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
             c.call_settled("POST", "/v1/dbs/media/txn", Some(body)).await;
         }
     };
-    // Completeness is checked without store faults, under which a failed
-    // sweep waits for a later cycle.
     sim.store.set_faults_enabled(false);
     let (referenced0, _, _) = db_objects(&sim, &db_id)?;
     let garbage_before = stored_ids(&sim, &db_id, "blob").difference(&referenced0).count();
     sim.sleep(e.orphan_grace_ms.max(e.blob_stage_ttl_ms) + e.sweep_interval_ms + 1_000).await;
-    touch(1).await; // triggers the orphan sweep
+    touch(1).await;
     sim.sleep(10_000).await;
     sim.sleep(e.gc_grace_ms + 1_000).await;
-    touch(2).await; // deletes expired obsolete objects, in the background
-    // Expired obsolete objects are deleted one by one in the background, so
-    // garbage is checked once that task has had time to finish.
+    touch(2).await;
     let unlisted_garbage = || -> Result<Option<String>, String> {
         let (referenced, listed, segs) = db_objects(&sim, &db_id)?;
         let blob = stored_ids(&sim, &db_id, "blob")
@@ -229,8 +225,7 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
     verify(&c, base, &kv, &rows, &mut rng).await
 }
 
-/// Stage `data` and bind it with the request `bind` builds from the staging
-/// response, staging again if retries outlast the staged blob's TTL.
+/// Stages `data` and binds it using `bind`, re-staging if retries exceed the staging TTL.
 async fn stage_and_bind(
     c: &Client,
     base: &str,

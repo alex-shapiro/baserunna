@@ -2,12 +2,11 @@ diff --git a/src/node.rs b/src/node.rs
 index bc7700d..da63a60 100644
 --- a/src/node.rs
 +++ b/src/node.rs
-@@ -1035,11 +1035,7 @@ impl Node {
+@@ -1145,10 +1145,7 @@ impl Node {
  
      /// Resolves a database reference (`name`, `org.name`, or `id:<db_id>`) and the caller's access.
      pub async fn resolve_db(&self, p: &Principal, name: &str) -> Result<(DbRecord, Access)> {
 -        match self.resolve_db_with(p, name, false).await {
--            // A miss may be a stale cache or snapshot: confirm strongly.
 -            Err(Error::NotFound(_)) => self.resolve_db_with(p, name, true).await,
 -            other => other,
 -        }

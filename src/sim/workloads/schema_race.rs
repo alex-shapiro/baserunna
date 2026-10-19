@@ -1,7 +1,8 @@
-//! `schema_race`: row writes on every path and at both isolation levels
-//! race the creation and dropping of indexes, a column and a table. At
-//! quiescence every index must match its rows, dropped tables and indexes
-//! must leave nothing behind, and each writer's rows must match its model.
+//! Simulation workload for concurrent row writes and schema changes.
+//!
+//! Row writes at serializable and snapshot isolation levels race against index, column, and
+//! table additions and removals. At quiescence, all indexes and row states are verified against
+//! per-writer reference models.
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, Status, ZOMBIE_WAIT_MS};
@@ -94,7 +95,7 @@ async fn interactive(
             match c.commit_status("race", &cid, committing).await? {
                 Status::Committed(_) => Ok(Applied::Yes),
                 Status::NotCommitted => Ok(Applied::No),
-                // The row tells: this writer alone writes it, and whole.
+                // This writer is the sole modifier of this primary key.
                 Status::Unknown => {
                     let path = format!("{BASE}/tables/items/rows/get");
                     let r = c.call_retry("POST", &path, Some(json!({"pk": pk}))).await;
@@ -289,7 +290,7 @@ pub async fn run(sim: Arc<Sim>, writers: usize, steps: usize, chaos: bool) -> Re
     }
     super::settle(&sim, phase).await;
     let info = owner.call_retry("GET", BASE, None).await;
-    let db_id = info.json["id"].as_str().ok_or("no db id")?.to_string();
+    let db_id = info.json["id"].as_str().ok_or("missing db id")?.to_string();
     super::tables::check_all_indexes(&sim, &db_id).await?;
     let r = owner.call_retry("POST", &format!("{BASE}/tables/items/rows/query"), Some(json!({"limit": 1000}))).await;
     let rows = r.json["rows"].as_array().cloned().unwrap_or_default();

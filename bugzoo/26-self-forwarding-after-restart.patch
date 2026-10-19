@@ -11,11 +11,11 @@ index f129543..4ab732d 100644
              .collect()
      }
  
-@@ -513,11 +513,6 @@ impl Node {
-             self.env.trace(|| format!("{db_id}: no address for {target}, handling locally"));
+@@ -528,11 +528,6 @@ impl Node {
+             self.env.trace(|| format!("{db_id}: address for {target} is missing, handling locally"));
              return None;
          };
--        // Do not forward to a previous process that ran at this node's address.
+-        // Ignore a previous process that ran at this node's address.
 -        if addr == self.cfg.addr {
 -            crate::probe::hit(crate::probe::Probe::OwnAddressIgnored);
 -            return None;

@@ -1,20 +1,15 @@
-//! `ttl`: values and rows with times to live, under faults.
+//! `ttl`: verifies key-value and row TTL expiration and distributed lock
+//! renewal under faults.
 //!
-//! Each client owns a database and knows when every value it wrote
-//! expires, to within the uncertainty of its commit's time: between the
-//! request's start and its response, widened by the error the nodes'
-//! measurements of the store's clock may have. Reads must see a value
-//! until then and never after, and never a value it replaced. Rows behave
-//! the same way, and a unique value is taken exactly while its row lives.
+//! Each client tracks the expiration window `[t0 + ttl - eps, t1 + ttl + eps]`
+//! for every value and row it writes, where `[t0, t1]` is the commit request
+//! interval and `eps` bounds clock error. Reads must observe a value before
+//! its window and must not observe it after.
 //!
-//! Clients also take turns holding a lock: an expiring value that a
-//! serializable transaction writes only if it finds none, and that its
-//! holder renews just before it expires. An acquisition also writes a marker
-//! of its own, so that a retry outliving its commit's record (SPEC §6.2)
-//! finds it applied instead of applying again. Ordered by version, every
-//! acquisition must have committed no earlier than the previous lock
-//! expired, and every renewal before the lock it read did, which the
-//! lock's own expiries tell exactly.
+//! Clients also contend on a TTL-backed lock key, renewing it before expiration.
+//! In version order, each acquisition must be committed at or after the previous
+//! lock's expiration, and each renewal must be committed before the lock it read
+//! expired.
 
 use super::super::Sim;
 use super::super::client::{Client, ZOMBIE_WAIT_MS, url_escape};
@@ -23,16 +18,15 @@ use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-/// Expected state of a value: its data, commit version, and expiry window in
-/// simulation milliseconds, unless a write of it may or may not have applied.
+/// Expected state of a value: data, commit version, and expiration window in
+/// simulation milliseconds.
 #[derive(Clone, Debug)]
 struct Val {
     data: String,
     version: u64,
     expires: Option<(u64, u64)>,
-    /// A write's outcome could not be learned: its commit record expired
-    /// before its retries ended. Any read is explained until the next write
-    /// whose outcome is known, or until `expires` bounds it.
+    /// True when the commit record expired before retries finished, leaving
+    /// the write outcome unknown until the next definitive write or `expires`.
     uncertain: bool,
 }
 
@@ -114,11 +108,9 @@ impl Owner {
         (!self.rng.chance(0.3)).then(|| 200 + self.rng.below(4_000))
     }
 
-    /// Commits `ops` with an idempotency key and returns the response along
-    /// with the timestamp when the first attempt started, or `None` if the
-    /// outcome cannot be learned: retries are deduplicated only while the
-    /// first attempt's commit record lives (SPEC §6.2), and past that a
-    /// retry could apply the write twice.
+    /// Commits `ops` with an idempotency key and returns the response and start
+    /// timestamp, or `None` if the commit retention window elapsed before a
+    /// definitive response was received.
     async fn commit(&mut self, ops: Json) -> Result<Option<(super::super::client::Resp, u64)>, String> {
         self.step += 1;
         let body = json!({"ops": ops, "idempotency_key": format!("{}-{}", self.c.name, self.step)});
@@ -156,7 +148,7 @@ impl Owner {
         if r.status != 200 {
             return Err(format!("put: {} {}", r.status, r.json));
         }
-        let (t1, version) = (self.c.sim.now_ms(), r.json["version"].as_u64().ok_or("no version")?);
+        let (t1, version) = (self.c.sim.now_ms(), r.json["version"].as_u64().ok_or("missing version")?);
         let expires = ttl.map(|t| (t0 + t - self.eps, t1 + t + self.eps));
         self.model.insert(k, Val { data, version, expires, uncertain: false });
         Ok(())
@@ -197,7 +189,7 @@ impl Owner {
 
     async fn scan(&mut self) -> Result<(), String> {
         let Some((j, r0, r1)) = self.read(json!([{"op": "scan", "prefix": "k/"}])).await? else { return Ok(()) };
-        let items = j["results"][0]["items"].as_array().ok_or("no items")?;
+        let items = j["results"][0]["items"].as_array().ok_or("missing items")?;
         let got: BTreeMap<&str, &Json> = items.iter().map(|it| (it["key"].as_str().unwrap_or_default(), it)).collect();
         for k in KEYS {
             let it = got.get(k).map(|g| {
@@ -227,9 +219,8 @@ impl Owner {
         check_read(&format!("raw get {k}"), self.model.get(k), got, r0, r1, self.eps)
     }
 
-    /// Inserts a row with a unique token, verifying it is rejected only while
-    /// another live row holds that token. Besides its last known holder, a
-    /// token may be held by rows whose inserts had unknown outcomes.
+    /// Inserts a row with a unique token and verifies that it is rejected only
+    /// while another non-expired row holds that token.
     async fn insert_row(&mut self) -> Result<(), String> {
         let id = self.step as i64;
         let token = TOKENS[self.rng.usize(TOKENS.len())].to_string();
@@ -238,10 +229,8 @@ impl Owner {
             self.rows.iter().filter(|(_, (t, _))| *t == token).map(|(id, (_, v))| (*id, v.clone())).collect();
         let op = json!({"op": "insert_row", "table": "sess", "row": {"id": id, "token": token}, "ttl_ms": ttl});
         let Some((r, t0)) = self.commit(json!([op])).await? else {
-            // No attempt applies once the commit gives up, so the row is
-            // gone a TTL later at the latest.
-            let gone = self.c.sim.now_ms() + ttl + self.eps;
-            self.rows.insert(id, (token, Val { expires: Some((0, gone)), ..Val::uncertain() }));
+            let max_expiry = self.c.sim.now_ms() + ttl + self.eps;
+            self.rows.insert(id, (token, Val { expires: Some((0, max_expiry)), ..Val::uncertain() }));
             return Ok(());
         };
         let t1 = self.c.sim.now_ms();
@@ -254,7 +243,7 @@ impl Owner {
         match (r.status, seen) {
             (200, Seen::Absent | Seen::Either) => {
                 self.rows.retain(|_, (t, _)| *t != token);
-                let version = r.json["version"].as_u64().ok_or("no version")?;
+                let version = r.json["version"].as_u64().ok_or("missing version")?;
                 let val = Val {
                     data: token.clone(),
                     version,
@@ -350,13 +339,13 @@ struct LockWrite {
 
 const LOCK_TTL_MS: u64 = 1_500;
 
-/// Commits `ops` with idempotency key `key`, retrying until it commits
-/// (its version and response) or fails a check (`Err` with the check's op index).
+/// Commits `ops` with idempotency key `key`, retrying until it is committed
+/// or fails a check (`Err` with the check's op index).
 async fn lock_txn(c: &Client, ops: Json, key: &str) -> Result<Result<(u64, Json), u64>, String> {
     let body = json!({"ops": ops, "idempotency_key": key});
     loop {
         match c.call("POST", "/v1/dbs/locks/txn", Some(body.clone())).await {
-            Ok(r) if r.status == 200 => return Ok(Ok((r.json["version"].as_u64().ok_or("no version")?, r.json))),
+            Ok(r) if r.status == 200 => return Ok(Ok((r.json["version"].as_u64().ok_or("missing version")?, r.json))),
             Ok(r) if r.status == 412 => {
                 return Ok(Err(r.json["error"]["details"]["op_index"].as_u64().unwrap_or(u64::MAX)));
             }
@@ -412,7 +401,7 @@ async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Re
     Ok(())
 }
 
-/// Verifies that in version order, each acquisition commits no earlier than
+/// Verifies that in version order, each acquisition is committed at or after
 /// the previous lock's expiry, and each renewal is committed before the lock it read
 /// expired.
 fn check_locks(writes: &[LockWrite]) -> Result<(), String> {
@@ -541,29 +530,20 @@ mod tests {
     fn reads_are_checked_against_expiry_windows() {
         let v = val(Some((1_000, 1_100)));
         assert!(check_read("t", Some(&v), Some(("d", 3, Some(1_050))), 800, 850, 10).is_ok());
-        assert!(check_read("t", Some(&v), None, 800, 850, 10).is_err(), "gone before it could expire");
-        assert!(
-            check_read("t", Some(&v), Some(("d", 3, Some(1_050))), 1_200, 1_250, 10).is_err(),
-            "seen after it expired"
-        );
+        assert!(check_read("t", Some(&v), None, 800, 850, 10).is_err());
+        assert!(check_read("t", Some(&v), Some(("d", 3, Some(1_050))), 1_200, 1_250, 10).is_err());
         assert!(check_read("t", Some(&v), None, 1_200, 1_250, 10).is_ok());
-        assert!(check_read("t", Some(&v), None, 1_000, 1_050, 10).is_ok(), "uncertain");
-        assert!(check_read("t", Some(&v), Some(("d", 3, Some(1_050))), 1_000, 1_050, 10).is_ok(), "uncertain");
-        assert!(check_read("t", Some(&v), Some(("old", 2, None)), 800, 850, 10).is_err(), "an older value");
-        assert!(
-            check_read("t", Some(&v), Some(("d", 3, Some(1_500))), 800, 850, 10).is_err(),
-            "expiry out of its window"
-        );
+        assert!(check_read("t", Some(&v), None, 1_000, 1_050, 10).is_ok());
+        assert!(check_read("t", Some(&v), Some(("d", 3, Some(1_050))), 1_000, 1_050, 10).is_ok());
+        assert!(check_read("t", Some(&v), Some(("old", 2, None)), 800, 850, 10).is_err());
+        assert!(check_read("t", Some(&v), Some(("d", 3, Some(1_500))), 800, 850, 10).is_err());
         assert!(check_read("t", Some(&val(None)), Some(("d", 3, None)), 0, 1, 10).is_ok());
         assert!(check_read("t", Some(&val(None)), Some(("d", 3, Some(5))), 0, 1, 10).is_err());
-        assert!(check_read("t", None, Some(("d", 3, None)), 0, 1, 10).is_err(), "a deleted value");
+        assert!(check_read("t", None, Some(("d", 3, None)), 0, 1, 10).is_err());
         let unsure = Val { expires: Some((0, 1_000)), ..Val::uncertain() };
         assert!(check_read("t", Some(&unsure), Some(("t1", 0, Some(990))), 900, 950, 10).is_ok());
         assert!(check_read("t", Some(&unsure), None, 900, 950, 10).is_ok());
-        assert!(
-            check_read("t", Some(&unsure), Some(("t1", 0, Some(990))), 5_000, 5_100, 10).is_err(),
-            "past its bound"
-        );
+        assert!(check_read("t", Some(&unsure), Some(("t1", 0, Some(990))), 5_000, 5_100, 10).is_err());
     }
 
     #[test]
@@ -577,14 +557,14 @@ mod tests {
             w(12, None, None),
         ];
         check_locks(&good).unwrap();
-        assert!(check_locks(&[w(5, Some(10_000), None), w(9, Some(11_499), None)]).is_err(), "taken before it expired");
-        assert!(check_locks(&[w(9, Some(11_000), None), w(5, Some(10_000), None)]).is_err(), "by version, not arrival");
+        assert!(check_locks(&[w(5, Some(10_000), None), w(9, Some(11_499), None)]).is_err());
+        assert!(check_locks(&[w(9, Some(11_000), None), w(5, Some(10_000), None)]).is_err());
         assert!(check_locks(&[w(5, None, None), w(5, None, None)]).is_err());
         let late = [w(5, Some(10_000), None), w(7, Some(11_500), Some(Some(10_000)))];
-        assert!(check_locks(&late).is_err(), "renewed after it expired");
+        assert!(check_locks(&late).is_err());
         let replayed = [w(5, Some(10_000), None), w(7, Some(11_500), Some(None))];
-        assert!(check_locks(&replayed).is_err(), "a replayed renewal after it expired");
+        assert!(check_locks(&replayed).is_err());
         let stale = [w(5, Some(10_000), None), w(6, Some(10_500), None), w(7, Some(11_000), Some(Some(10_000)))];
-        assert!(check_locks(&stale).is_err(), "renewed an older lock");
+        assert!(check_locks(&stale).is_err());
     }
 }

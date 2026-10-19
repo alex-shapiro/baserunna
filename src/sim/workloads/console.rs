@@ -1,6 +1,6 @@
-//! `console`: drives the admin console through every page and verifies
-//! escaping of hostile input, download headers, pagination, account
-//! self-service, organizations, and administration.
+//! `console`: exercises all web console pages and verifies HTML escaping,
+//! attachment download headers, pagination, account self-service,
+//! organization management, and admin actions.
 
 use super::super::client::{Client, url_escape};
 use super::super::{Sim, SimResponse};
@@ -29,7 +29,7 @@ impl Browser {
         Browser { c: Client::new(sim, name), cookie: None }
     }
 
-    /// An API client signed in with this browser's session.
+    /// Returns an API client authenticated with this browser's session.
     fn api(&self, name: &str) -> Client {
         Client::with_token(&self.c.sim, name, self.cookie.as_deref().unwrap_or_default())
     }
@@ -60,7 +60,7 @@ impl Browser {
             }
             self.c.pause(200).await;
         }
-        Err(format!("{method} {path}: never answered"))
+        Err(format!("{method} {path}: request timed out"))
     }
 
     async fn req(&mut self, method: &str, path: &str, body: Option<String>) -> Result<SimResponse, String> {
@@ -70,7 +70,7 @@ impl Browser {
 
     async fn page(&mut self, path: &str) -> Result<String, String> {
         let r = self.req("GET", path, None).await?;
-        expect(r.status == 200, format!("GET {path} answered {} (location {})", r.status, header(&r, "location")))?;
+        expect(r.status == 200, format!("GET {path} returned {} (location {})", r.status, header(&r, "location")))?;
         Ok(String::from_utf8_lossy(&r.body).into_owned())
     }
 
@@ -87,7 +87,7 @@ impl Browser {
         let r = self.post(from, action, pairs).await?;
         expect(
             (300..400).contains(&r.status),
-            format!("POST {action} answered {} instead of a redirect: {}", r.status, String::from_utf8_lossy(&r.body)),
+            format!("POST {action} returned {} instead of a redirect: {}", r.status, String::from_utf8_lossy(&r.body)),
         )?;
         Ok(header(&r, "location"))
     }
@@ -117,14 +117,14 @@ fn after<'a>(html: &'a str, needle: &str) -> Option<&'a str> {
 }
 
 fn csrf(html: &str) -> Result<String, String> {
-    let rest = after(html, "name=\"csrf\" value=\"").ok_or("no csrf token on the page")?;
+    let rest = after(html, "name=\"csrf\" value=\"").ok_or("missing csrf token on the page")?;
     Ok(rest[..rest.find('"').ok_or("unterminated csrf token")?].to_string())
 }
 
-/// The action of the first form after `marker` on a page.
+/// Returns the `action` attribute of the first form after `marker`.
 fn form_after(html: &str, marker: &str) -> Result<String, String> {
     let rest = after(html, marker).ok_or(format!("{marker:?} is not on the page"))?;
-    let action = after(rest, "action=\"").ok_or(format!("no form after {marker:?}"))?;
+    let action = after(rest, "action=\"").ok_or(format!("missing form after {marker:?}"))?;
     Ok(action[..action.find('"').unwrap_or(0)].replace("&amp;", "&"))
 }
 
@@ -136,7 +136,7 @@ fn unescape_url(s: &str) -> String {
     String::from_utf8_lossy(&crate::api::percent_decode(s)).into_owned()
 }
 
-/// The target of the link labelled `text`.
+/// Returns the `href` attribute of the link labelled `text`.
 fn link(html: &str, text: &str) -> Option<String> {
     let end = html.find(&format!(">{text}</a>"))?;
     let needle = "href=\"";
@@ -181,7 +181,7 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
         ("/console/account/delete", "confirm"),
     ] {
         let r = b.req("POST", action, Some(form(&[(field, "nope-nope")]))).await?;
-        expect(r.status == 403, format!("POST {action} without a CSRF token answered {}", r.status))?;
+        expect(r.status == 403, format!("POST {action} without a CSRF token returned {}", r.status))?;
     }
     b.submit_ok("/console/dbs", "/console/dbs", &[("name", "webdb")]).await?;
     let evil = "<script>alert(1)</script>";
@@ -214,7 +214,7 @@ async fn transactions(b: &mut Browser) -> Result<(), String> {
     let txn = r#"{"ops":[{"op":"increment","key":"hits","by":3}]}"#;
     let r = b.post("/console/dbs/webdb", "/console/dbs/webdb/txn", &[("body", txn)]).await?;
     let page = String::from_utf8_lossy(&r.body);
-    expect(r.status == 200, format!("running a transaction answered {}", r.status))?;
+    expect(r.status == 200, format!("running a transaction returned {}", r.status))?;
     let result = after(&page, "<h2>Result</h2><pre>").unwrap_or("");
     expect(result.contains("&quot;value&quot;: 3"), format!("the transaction's result is not shown: {result:.300}"))?;
     let r = b.post("/console/dbs/webdb", "/console/dbs/webdb/txn", &[("body", "{not json")]).await?;
@@ -231,7 +231,7 @@ async fn keys(b: &mut Browser, evil: &str) -> Result<(), String> {
     let page = String::from_utf8_lossy(&r.body);
     expect(
         r.status == 200 && header(&r, "location").is_empty(),
-        "creating a key redirected (the secret would travel)",
+        "creating a key redirected (the secret would be exposed in the URL)",
     )?;
     expect(header(&r, "cache-control") == "no-store", "the page with a key's secret may be cached")?;
     let secret = after(&page, "New key (shown once): <code>").and_then(|s| s.split('<').next()).unwrap_or("");
@@ -254,7 +254,7 @@ async fn pagination(b: &mut Browser) -> Result<(), String> {
         shown == 50 && first.contains("p/049") && !first.contains("p/050"),
         format!("the first page shows {shown} keys, not p/000 to p/049"),
     )?;
-    let next = link(&first, "Next page →").ok_or("the first page has no next page link")?;
+    let next = link(&first, "Next page →").ok_or("missing next page link on the first page")?;
     let second = b.page(&next).await?;
     expect(second.contains("p/054") && !second.contains("p/049"), format!("the second page ({next}) is wrong"))?;
     expect(
@@ -282,7 +282,7 @@ async fn pagination(b: &mut Browser) -> Result<(), String> {
 /// newest-first paging, retention, trims and deletion.
 async fn streams(b: &mut Browser, evil: &str) -> Result<(), String> {
     let r = b.req("POST", "/console/dbs/webdb/streams", Some(form(&[("name", "x")]))).await?;
-    expect(r.status == 403, format!("creating a stream without a CSRF token answered {}", r.status))?;
+    expect(r.status == 403, format!("creating a stream without a CSRF token returned {}", r.status))?;
     let sp = "/console/dbs/webdb/streams/events";
     let to = b
         .submit_ok("/console/dbs/webdb", "/console/dbs/webdb/streams", &[("name", "events"), ("max_bytes", "100000")])
@@ -304,7 +304,7 @@ async fn streams(b: &mut Browser, evil: &str) -> Result<(), String> {
     let (r59, r10) = (newest.find("r59"), newest.find("r10"));
     expect(r59.is_some() && r10.is_some() && r59 < r10, "the newest records are not shown first")?;
     expect(!newest.contains("r09"), "the first page shows more than 50 records")?;
-    let older = link(&newest, "Older →").ok_or("no link to older records")?;
+    let older = link(&newest, "Older →").ok_or("missing link to older records")?;
     let page = b.page(&older).await?;
     expect(
         page.contains("r09") && page.contains("&lt;script&gt;") && !page.contains("r10"),
@@ -351,9 +351,9 @@ async fn files(sim: &Arc<Sim>, b: &mut Browser) -> Result<(), String> {
     };
     let upload = "/console/dbs/webdb/kv/upload";
     let r = b.send("POST", upload, Some(&ct), body("forged", "x", b"x", "text/plain")).await?;
-    expect(r.status == 403, format!("an upload with a forged CSRF token answered {}", r.status))?;
+    expect(r.status == 403, format!("an upload with a forged CSRF token returned {}", r.status))?;
     let r = b.send("POST", upload, Some(&ct), b"not multipart".to_vec()).await?;
-    expect(r.status == 400, format!("a malformed upload answered {}", r.status))?;
+    expect(r.status == 400, format!("a malformed upload returned {}", r.status))?;
     let token = csrf(&b.page("/console/dbs/webdb").await?)?;
     for (key, data) in [("files/big.html", &data[..]), ("files/small.txt", &b"<b>hi</b>"[..])] {
         let r = b.send("POST", upload, Some(&ct), body(&token, key, data, "text/html")).await?;
@@ -392,9 +392,9 @@ async fn files(sim: &Arc<Sim>, b: &mut Browser) -> Result<(), String> {
         api.call_retry("POST", "/v1/dbs/webdb/tables/media/rows", Some(json!({"row": {"id": 1, "file": id}}))).await;
     expect(r.status == 201, format!("inserting the media row: {}", r.json))?;
     let t = b.page("/console/dbs/webdb/tables/media").await?;
-    let href = link(&t, "blob").ok_or("the blob cell has no link")?;
+    let href = link(&t, "blob").ok_or("missing link in the blob cell")?;
     let r = b.req("GET", &href, None).await?;
-    expect(r.status == 200 && r.body[..] == data[..], format!("downloading the blob answered {}", r.status))?;
+    expect(r.status == 200 && r.body[..] == data[..], format!("downloading the blob returned {}", r.status))?;
     expect(header(&r, "content-disposition").starts_with("attachment"), "the blob download is not an attachment")
 }
 
@@ -462,7 +462,7 @@ async fn organizations(sim: &Arc<Sim>, owner: &mut Browser) -> Result<(), String
     expect(e.contains("cannot write"), format!("a reader's write was refused for another reason: {e}"))?;
     let member_id = m.api("member-api").call_retry("GET", "/v1/me", None).await.json["user"]["id"]
         .as_str()
-        .ok_or("the member has no id")?
+        .ok_or("missing member id")?
         .to_string();
     owner.submit_ok(o, &format!("{o}/members/{member_id}"), &[("role", "writer")]).await?;
     cache_expiry(sim).await;
@@ -509,7 +509,7 @@ async fn account(sim: &Arc<Sim>) -> Result<(), String> {
         .as_array()
         .and_then(|a| a.iter().find(|s| s["current"] == true))
         .and_then(|s| s["id"].as_str())
-        .ok_or(format!("no current session in {}", s.json))?
+        .ok_or(format!("missing current session in {}", s.json))?
         .to_string();
     expect(a.page(acct).await?.contains(&b2_id), "another session is not listed")?;
     a.submit_ok(acct, &format!("/console/account/sessions/{b2_id}/revoke"), &[]).await?;
@@ -547,7 +547,7 @@ async fn mailed_links(sim: &Arc<Sim>) -> Result<(), String> {
     let mut old = login(sim, "mail-old", email, pass).await?;
     u.submit_ok("/console/account", "/console/account/verify", &[]).await?;
     sim.sleep(500).await;
-    let token = sim.mailbox.latest_token(email, "/console/verify").ok_or("no verification mail was sent")?;
+    let token = sim.mailbox.latest_token(email, "/console/verify").ok_or("missing verification mail")?;
     let p = u.page(&format!("/console/verify?token={token}")).await?;
     expect(
         p.contains("Verify my address") && p.contains(&format!("value=\"{token}\"")),
@@ -567,11 +567,11 @@ async fn mailed_links(sim: &Arc<Sim>) -> Result<(), String> {
     let r = anon.req("POST", "/console/forgot", Some(form(&[("email", email)]))).await?;
     expect(header(&r, "location").starts_with("/console/login?ok="), "requesting a reset was refused")?;
     let r = anon.req("POST", "/console/forgot", Some(form(&[("email", "ghost@console.test")]))).await?;
-    expect(header(&r, "location").starts_with("/console/login?ok="), "unknown accounts answer differently")?;
+    expect(header(&r, "location").starts_with("/console/login?ok="), "unknown accounts return a different response")?;
     sim.sleep(500).await;
-    expect(sim.mailbox.count(email) == before + 1, "not exactly one reset mail was sent")?;
-    let token = sim.mailbox.latest_token(email, "/console/reset").ok_or("no reset mail was sent")?;
-    expect(anon.page(&format!("/console/reset?token={token}")).await?.contains("new password"), "no reset form")?;
+    expect(sim.mailbox.count(email) == before + 1, "not exactly 1 reset mail was sent")?;
+    let token = sim.mailbox.latest_token(email, "/console/reset").ok_or("missing reset mail")?;
+    expect(anon.page(&format!("/console/reset?token={token}")).await?.contains("new password"), "missing reset form")?;
     let r = anon.req("POST", "/console/reset", Some(form(&[("token", &token), ("password", "mail-pass-2")]))).await?;
     let to = unescape_url(&header(&r, "location"));
     expect(anon.cookie.is_some() && to == "/console/dbs", format!("resetting went to {to}"))?;

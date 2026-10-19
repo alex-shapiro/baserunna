@@ -4,7 +4,7 @@ index 85e9574..5777e8c 100644
 +++ b/src/table/mod.rs
 @@ -95,7 +95,7 @@ fn decode_schema(it: &ReadValue) -> Result<TableSchema> {
  
- /// Read `name`'s schema and pin its key so the transaction conflicts if the schema changes.
+ /// Reads the schema for `name` and pins its catalog key so that concurrent schema changes cause a conflict.
  pub async fn get_schema(txn: &mut Txn, name: &str) -> Result<TableSchema> {
 -    match txn.get_pinned(&catalog_key(name)).await? {
 +    match txn.get(&catalog_key(name)).await? {

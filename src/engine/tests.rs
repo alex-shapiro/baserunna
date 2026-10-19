@@ -466,12 +466,12 @@ fn lease_sightings_outlive_handles_and_prune_when_full() {
         let lease = |node: &str| Lease { node: node.into(), expires_ms: 7, ms: 5_000 };
         let first = sh.lease_seen("a", &lease("x"), 5);
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        assert_eq!(sh.lease_seen("a", &lease("x"), 5), first, "the same renewal must keep its first sighting");
-        assert!(sh.lease_seen("a", &lease("x"), 6) > first, "a renewal is a new sighting, whatever its expiry");
-        assert!(sh.lease_seen("a", &lease("y"), 6) > first, "another holder is a new sighting");
+        assert_eq!(sh.lease_seen("a", &lease("x"), 5), first);
+        assert!(sh.lease_seen("a", &lease("x"), 6) > first);
+        assert!(sh.lease_seen("a", &lease("y"), 6) > first);
         let a_seen = sh.lease_seen("a", &lease("y"), 6);
         let v = sh.cfg.read_lease_ms + sh.cfg.lease_margin_ms;
-        let present = |id: &str| sh.lease_sightings.lock().unwrap().contains_key(id);
+        let present = |id: &str| sh.observed_leases.lock().unwrap().contains_key(id);
         let age_to = |x: u64| async move {
             let now = tokio::time::Instant::now();
             tokio::time::advance((a_seen + std::time::Duration::from_millis(x * v / 100)) - now).await;
@@ -480,13 +480,13 @@ fn lease_sightings_outlive_handles_and_prune_when_full() {
         for i in 0..100_000 {
             sh.lease_seen(&format!("d{i}"), &lease("x"), 1);
         }
-        assert!(present("a"), "a sighting 50 leases old must survive pruning");
+        assert!(present("a"));
         age_to(9_500).await;
         sh.lease_seen("b", &lease("x"), 1);
-        assert!(present("a"), "a sighting 95 leases old must survive pruning");
+        assert!(present("a"));
         age_to(10_500).await;
         sh.lease_seen("c", &lease("x"), 1);
-        assert!(!present("a") && present("c"), "a full table must drop sightings over 100 leases old");
+        assert!(!present("a") && present("c"));
     });
 }
 
@@ -1963,14 +1963,14 @@ fn values_expire_a_ttl_after_their_commit() {
         put(&db, "k", "old").await;
         let c = put_ttl(&db, "k", "new", 1_000).await;
         let snap = db.snapshot(Consistency::Strong).await.unwrap();
-        assert!(snap.time_ms >= c.time_ms, "reads never go back before a commit's time");
+        assert!(snap.time_ms >= c.time_ms);
         let e = snap.get(b"k").await.unwrap().unwrap();
         assert_eq!((e.value, e.expires), (inline("new"), Some(c.time_ms + 1_000)));
         tokio::time::sleep(Duration::from_millis(999)).await;
         assert!(strong_get(&db, "k").await.is_some());
         tokio::time::sleep(Duration::from_millis(2)).await;
-        assert_eq!(strong_get(&db, "k").await, None, "expired, and the older value stays shadowed");
-        assert_eq!(snap.get(b"k").await.unwrap().map(|e| e.value), Some(inline("new")), "a snapshot reads at its time");
+        assert_eq!(strong_get(&db, "k").await, None);
+        assert_eq!(snap.get(b"k").await.unwrap().map(|e| e.value), Some(inline("new")));
         assert!(db.snapshot(Consistency::Strong).await.unwrap().version.get_entry(b"k").await.unwrap().is_some());
     });
 }
@@ -1991,11 +1991,11 @@ fn reads_of_values_that_expire_before_the_commit_conflict() {
         stale.put(Bytes::from_static(b"w1"), inline("1")).unwrap();
         si.put(Bytes::from_static(b"w2"), inline("1")).unwrap();
         fresh.put(Bytes::from_static(b"w3"), inline("1")).unwrap();
-        db.commit(fresh.into_request()).await.expect("still held at the commit");
+        db.commit(fresh.into_request()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1_001)).await;
         let r = db.commit(stale.into_request()).await;
         assert!(matches!(r, Err(Error::Conflict(_))), "{r:?}");
-        db.commit(si.into_request()).await.expect("snapshot isolation does not validate reads");
+        db.commit(si.into_request()).await.unwrap();
         let mut ahead = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         ahead.read_time += 60_000;
         ahead.put(Bytes::from_static(b"w4"), inline("1")).unwrap();
@@ -2021,7 +2021,7 @@ fn cached_snapshots_read_at_their_validation_time() {
         tokio::time::sleep(Duration::from_millis(1_500)).await;
         let stale = Consistency::Snapshot { max_staleness_ms: 5_000 };
         let s = other.snapshot(stale).await.unwrap();
-        assert_eq!(s.time_ms, validated.time_ms, "the cached version is as of its validation");
+        assert_eq!(s.time_ms, validated.time_ms);
         assert!(s.get(b"k").await.unwrap().is_some());
         assert!(other.snapshot(Consistency::Strong).await.unwrap().get(b"k").await.unwrap().is_none());
     });

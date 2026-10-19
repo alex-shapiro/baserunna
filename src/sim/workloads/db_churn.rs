@@ -38,7 +38,7 @@ async fn check_db(c: &Client, db: &str, want: &Option<BTreeMap<String, String>>,
     let r = c.call_retry("GET", &format!("/v1/dbs/{db}/kv?limit=1000"), None).await;
     match want {
         None if r.status == 404 => Ok(()),
-        None => Err(format!("{ctx}: deleted database {db} answers {} {}", r.status, r.json)),
+        None => Err(format!("{ctx}: deleted database {db} returned {} {}", r.status, r.json)),
         Some(m) => {
             let items = r.json["items"].as_array().ok_or(format!("{ctx}: scan of {db}: {} {}", r.status, r.json))?;
             let got: BTreeMap<String, String> = items

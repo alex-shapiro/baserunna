@@ -1,15 +1,14 @@
-//! Probes mark rare situations in service code that the simulator must reach
-//! (SPEC §13.4). A probe counts its hits on the current thread while a
-//! recording is active (every simulation run starts one) and does nothing
-//! otherwise. The simulator fails a campaign that never reaches a probe, so
-//! each one names a situation worth testing, not a line of code.
+//! Execution probes for rare states in service code (SPEC §13.4).
+//!
+//! When recording is active on the current thread, each probe counts how many
+//! times it is hit and records the timestamp of the first hit.
 
 use std::cell::RefCell;
 use tokio::time::Instant;
 
 macro_rules! probes {
     ($($(#[doc = $doc:literal])* $name:ident,)*) => {
-        /// A rare situation the simulator must reach.
+        /// An instrumented state in service code.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub enum Probe {
             $($(#[doc = $doc])* $name,)*
@@ -24,7 +23,6 @@ macro_rules! probes {
                 }
             }
 
-            /// What the probe's situation is.
             pub fn doc(self) -> &'static str {
                 match self {
                     $(Probe::$name => concat!($($doc),*).trim_ascii(),)*
@@ -35,152 +33,144 @@ macro_rules! probes {
 }
 
 probes! {
-    // Storage engine: commits.
-    /// A commit batch accepted two or more transactions.
+    /// Two or more transactions were committed in a single batch.
     CommitBatched,
-    /// A commit found its commit record already applied by an earlier attempt.
+    /// A commit was deduplicated by an existing commit record.
     CommitReplayed,
-    /// A transaction reached the committer after its commit deadline.
+    /// A transaction was rejected because its commit deadline had passed.
     CommitDeadlinePassed,
-    /// Commit validation found a conflict.
+    /// A transaction was rejected due to a read-write conflict.
     CommitConflict,
-    /// A transaction conflicted with an earlier transaction of its own batch.
+    /// A transaction conflicted with an earlier transaction in the same batch.
     CommitConflictInBatch,
-    /// A conditional manifest write lost to another writer (412).
+    /// A conditional manifest write was rejected with HTTP 412.
     ManifestCasLost,
-    /// A manifest write timed out or failed with an unknown outcome.
+    /// A manifest write failed with an ambiguous outcome.
     ManifestWriteAmbiguous,
-    /// A manifest reloaded after an ambiguous write was that write: it had landed.
+    /// A manifest reload confirmed that a previous ambiguous write was applied.
     AmbiguousWriteLanded,
-    /// A commit found another node's valid lease and failed with `not_owner`.
+    /// A commit was rejected because another node held an active lease.
     CommitNotOwner,
-    /// A commit found a foreign lease after an earlier attempt of its batch may have landed.
+    /// A commit batch encountered a foreign lease after an ambiguous write attempt.
     CommitUnknownAfterLeaseMoved,
-    /// A batch exhausted its commit retries.
+    /// A commit batch exhausted its retry limit.
     CommitRetriesExhausted,
-    /// A commit took over a database whose previous lease had expired.
+    /// A node acquired a lease after the previous lease expired.
     LeaseTakeover,
-    /// Another node's lease was found expired by the store clock.
+    /// A foreign lease was treated as expired based on the object-store clock.
     ExpiredLeaseByStoreClock,
-    /// A lease was renewed for strong reads alone.
+    /// A lease was renewed to serve strong reads.
     ReadLeaseRenewed,
     /// A node released its lease.
     LeaseReleased,
-    /// A manifest write that shortens or releases this node's lease was sent,
-    /// so the node stopped relying on its longer lease.
+    /// A node reduced its local lease validity when sending a manifest write.
     LeaseShortenedInFlight,
-    /// A strong read waited for this node's in-flight manifest write.
+    /// A strong read waited for an in-flight manifest write on the same node.
     StrongReadWaitedForWrite,
-    /// A version older than the installed one arrived and was ignored.
+    /// An older manifest version was ignored because a newer version was already installed.
     StaleVersionIgnored,
-    /// Creating a manifest raced another creator or an ambiguous create.
+    /// Initial manifest creation raced with a concurrent write.
     ManifestCreateRaced,
-    /// A commit or lease request reached a database marked deleted.
+    /// A write or lease request targeted a deleted database.
     DeletedDatabaseWrite,
-    /// A manifest write was hedged after a slow store response.
+    /// A duplicate manifest write was sent after the primary request exceeded the hedge delay.
     ManifestPutHedged,
-    /// The hedged duplicate of a manifest write was the one that succeeded.
+    /// A hedged manifest write completed before the primary request.
     HedgeWon,
-    /// A hedged duplicate was rejected while the first write was still in flight.
+    /// A hedged manifest write was rejected with HTTP 412 while the primary request was in flight.
     HedgeRejectedFirstInFlight,
-    /// A transaction began while a manifest write was in flight on this node.
+    /// A serializable transaction started while a manifest write was in flight.
     OptimisticBegin,
-    /// An optimistic transaction was re-executed after failing revalidation.
+    /// An optimistic transaction was re-executed after failing strong snapshot validation.
     OptimisticRerun,
-    /// A commit was refused for the size quota.
+    /// A commit was rejected because the database exceeded its size quota.
     QuotaRefused,
-    /// A commit bound a staged blob that had expired or been collected.
+    /// A commit was rejected because a staged blob had expired or was garbage-collected.
     StagedBlobUnbindable,
-    // Storage engine: tail, segments, compaction and GC.
-    /// The tail was flushed to level 0 segments.
+    /// In-memory tail entries were flushed to level-0 segments.
     TailFlushed,
-    /// Sealing stream chunks alone made room in the tail.
+    /// Sealing stream chunks freed enough space to keep remaining entries in the tail.
     TailSealedInPlace,
-    /// Old tombstones were purged from the tail.
+    /// Expired tombstones were removed from the tail.
     TailTombstonesPurged,
-    /// A range tombstone was written.
+    /// A range tombstone was added to the manifest.
     RangeTombstoneWritten,
-    /// A range tombstone was retired.
+    /// An expired range tombstone was removed from the manifest.
     RangeTombstoneRetired,
-    /// A segment fully covered by a range tombstone was dropped.
+    /// A segment covered by a range tombstone was dropped without rewrite.
     SegmentDropped,
-    /// A segment was rewritten to purge range-deleted entries.
+    /// A segment was rewritten to remove entries covered by a range tombstone.
     SegmentRewritten,
-    /// A levels object was written.
+    /// Deep level metadata was written to an external levels object.
     LevelsObjectWritten,
-    /// Entries were dropped or reduced to tombstones because they expired.
+    /// Expired entries were removed or converted to tombstones.
     EntriesExpired,
     /// A segment was rewritten or dropped because its entries expired.
     SegmentExpired,
-    /// A stream chunk was sealed by a flush.
+    /// Stream records were sealed into a chunk during a tail flush.
     ChunkSealedAtFlush,
-    /// A stream chunk was sealed by a compaction.
+    /// Stream records were sealed into a chunk during compaction.
     ChunkSealedInCompaction,
-    /// A compaction was installed.
+    /// Compaction output segments were installed in the manifest.
     CompactionInstalled,
-    /// A compaction moved a segment without rewriting it.
+    /// A segment was moved to the next level without rewrite.
     CompactionMoved,
-    /// A compaction install found its inputs changed.
+    /// A compaction result was discarded because its input segments were already compacted.
     CompactionInputsChanged,
-    /// A compaction install found that an earlier, ambiguous attempt of it had landed.
+    /// A retried compaction install found that its output segments were already installed.
     CompactionInstallReplayed,
-    /// A compaction stopped because its node no longer held the lease.
+    /// A compaction task stopped because the node lost the database lease.
     CompactionLostLease,
-    /// A compaction ran so long that a sweep may have taken its outputs for
-    /// orphans, and its install was refused.
+    /// A compaction result was discarded because the task exceeded the orphan grace period.
     CompactionOutlivedOrphanGrace,
-    /// A read found a segment that garbage collection removed after the
-    /// read's version was replaced.
+    /// A read failed with a retryable error after garbage collection deleted a segment.
     SegmentCollectedUnderRead,
-    /// A sweep marked unreferenced objects obsolete.
+    /// A garbage collection sweep marked unreferenced objects as obsolete.
     OrphansMarked,
-    /// Obsolete objects were deleted after a manifest write with an unknown outcome.
+    /// Obsolete objects past their grace period were deleted after an ambiguous manifest write.
     ObsoleteDeletedAfterAmbiguousWrite,
-    /// Garbage collection found a blob pinned by a long read and kept it.
+    /// Garbage collection skipped an obsolete blob that was pinned by an active read.
     BlobPinnedAtCollection,
-    /// A long blob read wrote a pin.
+    /// A long-running blob read wrote a pin object.
     BlobPinWritten,
-    /// A stream retention trim was committed.
+    /// A stream was trimmed to enforce retention limits.
     RetentionTrimmed,
-    /// A retention trim was left to another node holding the lease.
+    /// A background retention trim exited because another node held the lease.
     RetentionTrimLeftToOwner,
-    // Cluster and API.
-    /// A duplicate forwarded request was answered with the first copy's response.
+    /// A duplicate forwarded request was answered from the deduplication cache.
     ForwardDuplicateReplayed,
-    /// A duplicate forwarded request arrived while the first copy's outcome was unknown.
+    /// A duplicate forwarded request failed because the first attempt had an ambiguous outcome.
     ForwardDuplicateUnknown,
-    /// A forwarded request addressed to a previous process at this address was refused.
+    /// A forwarded request was rejected because it targeted a previous process at the same address.
     ForwardToPreviousProcess,
-    /// A forward certainly failed and the request was handled locally.
+    /// A request was handled locally after forwarding failed before delivery.
     ForwardFailedHandledLocally,
-    /// A forwarded write may have been delivered, leaving its outcome unknown.
+    /// A forwarded write failed after possible delivery to the target node.
     ForwardAmbiguous,
-    /// A membership entry with this node's own address was ignored.
+    /// A cluster membership record with the local node's address was ignored during routing.
     OwnAddressIgnored,
-    /// A request met a lease holder missing from the members and refreshed them.
+    /// A node refreshed cluster membership after observing a lease held by an unknown peer.
     MembersRefreshedForUnknownPeer,
-    /// A peer was marked suspect after an undelivered forward.
+    /// A peer node was marked suspect after a failed forward.
     PeerSuspected,
-    /// A request found its database's manifest deleted and finished the deletion.
+    /// An interrupted database deletion was completed during routing.
     DeletionRepaired,
-    /// A cached database name pointed at a deleted database and was resolved again.
+    /// A cached database name was resolved again after its target database was deleted.
     NameResolvedAgain,
-    /// A metadata command was forwarded to the system database's lease holder.
+    /// A metadata command was forwarded to the system database lease holder.
     MetaForwarded,
-    /// A transaction was retried server-side after a conflict.
+    /// A one-shot transaction was retried on the server after a conflict.
     TxnRetriedOnConflict,
-    /// A retried idempotent request that failed a precondition was found already applied.
+    /// A retried idempotent transaction that failed a precondition check was resolved as already committed.
     PreconditionExplainedByReplay,
-    /// An interactive transaction was not found on the node asked to continue it.
+    /// An interactive transaction handle was not found.
     InteractiveTxnLost,
-    /// A retried password reset found its new password already set and finished.
+    /// A retried password reset with the same password completed the reset.
     PasswordResetFinished,
 }
 
 impl Probe {
-    /// Probes that only long campaigns reach, in a few runs of a thousand:
-    /// the coverage test does not require them, but a nightly campaign
-    /// that misses any fails.
+    /// Probes excluded from short coverage tests and required only in long campaigns.
     pub const RARE: &[Probe] = &[
         Probe::CommitRetriesExhausted,
         Probe::StaleVersionIgnored,
@@ -204,13 +194,12 @@ impl Probe {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Hits {
-    /// Hit counts, indexed like [`Probe::ALL`].
+    /// Total hit counts, indexed by [`Probe`].
     pub counts: Vec<u64>,
-    /// Milliseconds from the start of the recording to each probe's first hit.
+    /// Elapsed milliseconds from the start of recording to the first hit of each probe.
     pub first_ms: Vec<Option<u64>>,
-    /// Hit counts from [`own_from`] on: in a branched run, the hits it made
-    /// itself rather than by repeating its parent.
-    pub own: Vec<u64>,
+    /// Hit counts recorded at or after the branch timestamp set by [`set_branch_time`].
+    pub after_branch: Vec<u64>,
 }
 
 impl Hits {
@@ -222,26 +211,26 @@ impl Hits {
         self.first_ms.get(p as usize).copied().flatten()
     }
 
-    /// The probes hit at least once.
+    /// Returns all probes that were hit at least once.
     pub fn hit(&self) -> impl Iterator<Item = Probe> + '_ {
         Probe::ALL.iter().copied().filter(|p| self.count(*p) > 0)
     }
 
-    /// The probes hit at least once from [`own_from`] on.
-    pub fn hit_own(&self) -> impl Iterator<Item = Probe> + '_ {
-        Probe::ALL.iter().copied().filter(|p| self.own.get(*p as usize).is_some_and(|n| *n > 0))
+    /// Returns all probes that were hit at least once at or after the branch timestamp.
+    pub fn hit_after_branch(&self) -> impl Iterator<Item = Probe> + '_ {
+        Probe::ALL.iter().copied().filter(|p| self.after_branch.get(*p as usize).is_some_and(|n| *n > 0))
     }
 
     pub fn add(&mut self, o: &Hits) {
         let n = Probe::ALL.len();
         self.counts.resize(n, 0);
         self.first_ms.resize(n, None);
-        self.own.resize(n, 0);
+        self.after_branch.resize(n, 0);
         for (i, c) in o.counts.iter().enumerate() {
             self.counts[i] += c;
         }
-        for (i, c) in o.own.iter().enumerate() {
-            self.own[i] += c;
+        for (i, c) in o.after_branch.iter().enumerate() {
+            self.after_branch[i] += c;
         }
         for (i, t) in o.first_ms.iter().enumerate() {
             self.first_ms[i] = match (self.first_ms[i], *t) {
@@ -254,7 +243,7 @@ impl Hits {
 
 struct Recording {
     origin: Instant,
-    own_from_ms: u64,
+    branch_ms: u64,
     hits: Hits,
 }
 
@@ -262,12 +251,12 @@ thread_local! {
     static RECORDING: RefCell<Option<Recording>> = const { RefCell::new(None) };
 }
 
-/// Counts a hit of `p` in the current recording.
+/// Records a single hit for `p`.
 pub fn hit(p: Probe) {
     hit_n(p, 1);
 }
 
-/// Counts `n` hits of `p` in the current recording.
+/// Records `n` hits for `p`.
 pub fn hit_n(p: Probe, n: u64) {
     if n == 0 {
         return;
@@ -276,8 +265,8 @@ pub fn hit_n(p: Probe, n: u64) {
         if let Some(r) = r.borrow_mut().as_mut() {
             let (i, ms) = (p as usize, r.origin.elapsed().as_millis() as u64);
             r.hits.counts[i] += n;
-            if ms >= r.own_from_ms {
-                r.hits.own[i] += n;
+            if ms >= r.branch_ms {
+                r.hits.after_branch[i] += n;
             }
             if r.hits.first_ms[i].is_none() {
                 r.hits.first_ms[i] = Some(ms);
@@ -286,29 +275,28 @@ pub fn hit_n(p: Probe, n: u64) {
     });
 }
 
-/// Starts a new recording on this thread, discarding any current one.
+/// Starts a new probe recording on the current thread.
 pub fn record() {
     let n = Probe::ALL.len();
-    let hits = Hits { counts: vec![0; n], first_ms: vec![None; n], own: vec![0; n] };
-    RECORDING.with(|r| *r.borrow_mut() = Some(Recording { origin: Instant::now(), own_from_ms: 0, hits }));
+    let hits = Hits { counts: vec![0; n], first_ms: vec![None; n], after_branch: vec![0; n] };
+    RECORDING.with(|r| *r.borrow_mut() = Some(Recording { origin: Instant::now(), branch_ms: 0, hits }));
 }
 
-/// Counts hits from `ms` after the start of this thread's recording as the
-/// run's own ([`Hits::own`]).
-pub fn own_from(ms: u64) {
+/// Sets the branch timestamp in milliseconds from the start of recording.
+pub fn set_branch_time(ms: u64) {
     RECORDING.with(|r| {
         if let Some(r) = r.borrow_mut().as_mut() {
-            r.own_from_ms = ms;
+            r.branch_ms = ms;
         }
     });
 }
 
-/// Ends this thread's recording and returns its hits.
+/// Stops recording on the current thread and returns the collected hits.
 pub fn finish() -> Hits {
     RECORDING.with(|r| r.borrow_mut().take().map(|r| r.hits).unwrap_or_default())
 }
 
-/// Hits of `p` in this thread's recording so far.
+/// Returns the current hit count of `p` on the current thread.
 pub fn count(p: Probe) -> u64 {
     RECORDING.with(|r| r.borrow().as_ref().map_or(0, |r| r.hits.count(p)))
 }
@@ -330,10 +318,10 @@ mod tests {
         assert_eq!(count(Probe::CommitBatched), 0);
         record();
         hit(Probe::CommitBatched);
-        own_from(u64::MAX);
+        set_branch_time(u64::MAX);
         hit(Probe::TailFlushed);
         let h = finish();
-        assert_eq!(h.hit_own().collect::<Vec<_>>(), [Probe::CommitBatched], "hits before own_from's time");
-        assert!(Probe::ALL.iter().all(|p| !p.doc().is_empty()), "every probe says what it marks");
+        assert_eq!(h.hit_after_branch().collect::<Vec<_>>(), [Probe::CommitBatched]);
+        assert!(Probe::ALL.iter().all(|p| !p.doc().is_empty()));
     }
 }

@@ -1,7 +1,8 @@
-//! `kv_model`: one client per database issues random KV operations through
-//! every API form under faults, and every response must match an exact
-//! model. Ambiguous outcomes are resolved as a careful client would: with
-//! idempotency keys, fenced commit-status queries or fenced read-backs.
+//! Simulation workload for single-writer key-value operations against a reference model.
+//!
+//! Each client owns a dedicated database and executes random one-shot transactions,
+//! interactive transactions, raw HTTP operations, change feed queries, and full scans
+//! under fault injection.
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, Status, url_escape};
@@ -186,8 +187,7 @@ impl KvModel {
         format!("/v1/dbs/{}{rest}", self.db)
     }
 
-    /// Waits out any zombie request, then forces a manifest write so no
-    /// in-flight attempt can be committed afterwards.
+    /// Waits out any zombie request and forces a manifest write so earlier in-flight attempts cannot commit.
     async fn fence(&self) {
         self.c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
         let id = format!("{:016x}", self.step + (1u64 << 62));
@@ -260,7 +260,7 @@ impl KvModel {
                     ops.push(json!({"op": "scan", "prefix": p, "limit": limit, "reverse": reverse}));
                     let all = sim.scan(&prefix_range(p.as_bytes()), reverse);
                     expect.push(Box::new(move |g| {
-                        let items = g["items"].as_array().ok_or(format!("{ctx}: no items"))?;
+                        let items = g["items"].as_array().ok_or(format!("{ctx}: missing items"))?;
                         if items.len() != all.len().min(limit) {
                             return Err(format!(
                                 "{ctx}: scan {p} got {} items want {}",
@@ -357,9 +357,8 @@ impl KvModel {
         let path = self.path("/txn");
         let (mut began, mut ambiguous) = (self.c.sim.now_ms(), false);
         loop {
-            // A retry with the same idempotency key is safe while the first
-            // attempt's commit record would deduplicate it; past that, the
-            // data tells whether an attempt applied.
+            // Retry with the same idempotency key while the commit record is still retained;
+            // otherwise reconcile the outcome from the database state.
             if ambiguous && writes && !self.c.dedups(began) {
                 if let Some(v) = self.reconcile(&sim).await? {
                     sim.apply(&mut self.model, v);
@@ -371,7 +370,6 @@ impl KvModel {
             let r = match r {
                 Ok(r) if !r.outcome_unknown() => r,
                 _ => {
-                    // Retry once any zombie attempt has expired.
                     self.c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
                     ambiguous = true;
                     continue;
@@ -385,13 +383,13 @@ impl KvModel {
                             self.step, r.json
                         ));
                     }
-                    let version = r.json["version"].as_u64().ok_or("no version")?;
+                    let version = r.json["version"].as_u64().ok_or("missing version")?;
                     if r.json["replayed"] == true {
                         if !writes {
                             return Err("read-only replay".into());
                         }
                     } else {
-                        let results = r.json["results"].as_array().ok_or("no results")?;
+                        let results = r.json["results"].as_array().ok_or("missing results")?;
                         if results.len() != expect.len() {
                             return Err("result count mismatch".into());
                         }
@@ -428,9 +426,7 @@ impl KvModel {
         }
     }
 
-    /// Whether `txn` applied, and at which version, judged from the data:
-    /// this client is its database's only writer, so the database holds
-    /// either the model's state or the model's state with `txn` applied.
+    /// Determines whether `txn` committed by comparing the database state against the model.
     async fn reconcile(&mut self, txn: &TxnSim) -> Result<Option<u64>, String> {
         let (got, version) = self.read_all().await?;
         let matches = |m: &Model, versions: bool| {
@@ -450,7 +446,7 @@ impl KvModel {
         }
     }
 
-    /// Every key's item and version, and the database's version, read strongly.
+    /// Performs a strong full scan and returns all entries with the latest database version.
     async fn read_all(&self) -> Result<(BTreeMap<Key, (Json, u64)>, u64), String> {
         let mut got = BTreeMap::new();
         let mut cursor: Option<String> = None;
@@ -464,9 +460,9 @@ impl KvModel {
             if r.status != 200 {
                 return Err(format!("scan failed: {} {}", r.status, r.json));
             }
-            version = version.max(r.json["version"].as_u64().ok_or("no version")?);
-            for it in r.json["items"].as_array().ok_or("no items")? {
-                let k = it["key"].as_str().ok_or("no key")?.as_bytes().to_vec();
+            version = version.max(r.json["version"].as_u64().ok_or("missing version")?);
+            for it in r.json["items"].as_array().ok_or("missing items")? {
+                let k = it["key"].as_str().ok_or("missing key")?.as_bytes().to_vec();
                 got.insert(k, (it.clone(), it["version"].as_u64().unwrap_or(0)));
             }
             match r.json["next_cursor"].as_str() {
@@ -501,7 +497,6 @@ impl KvModel {
                 {"op": "get", "key": s(&k2)},
             ]});
             sim.put(k.clone(), v.clone());
-            // The read of k2 happens after the put of k.
             let want = if k2 == k { Some((v.clone(), None)) } else { want };
             let r = self.c.call("POST", &self.path(&format!("/transactions/{id}/ops")), Some(ops)).await;
             match r {
@@ -527,13 +522,12 @@ impl KvModel {
         }
         let r = self.c.call("POST", &self.path(&format!("/transactions/{id}/commit")), Some(json!({}))).await;
         let committed_version = match r {
-            Ok(r) if r.status == 200 => Some(r.json["version"].as_u64().ok_or("no version")?),
+            Ok(r) if r.status == 200 => Some(r.json["version"].as_u64().ok_or("missing version")?),
             Ok(r) if r.status == 404 || r.status == 507 || r.retryable_not_applied() => None,
             Ok(r) if r.status == 409 => return Err(format!("single-client interactive txn conflicted: {}", r.json)),
             Ok(r) if !r.outcome_unknown() && r.status != 503 => return Err(format!("commit: {} {}", r.status, r.json)),
             _ => {
-                // Ambiguous: resolve with a fenced status query, or from the
-                // data once the commit record may be gone.
+                // Resolve ambiguous commits via the commit-status endpoint or by reading the database.
                 self.c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
                 match self.c.commit_status(&self.db, &commit_id, began).await? {
                     s @ Status::Committed(_) => s.version(),
@@ -581,7 +575,7 @@ impl KvModel {
                                 return Err(format!("conditional put should have failed: {k:?}"));
                             }
                             let j: Json = serde_json::from_slice(&r.body).unwrap_or(Json::Null);
-                            let ver = j["version"].as_u64().ok_or("no version")?;
+                            let ver = j["version"].as_u64().ok_or("missing version")?;
                             self.model.data.insert(k, (v, ver));
                             return Ok(());
                         }
@@ -596,7 +590,6 @@ impl KvModel {
                             continue;
                         }
                         _ => {
-                            // Ambiguous: fence, then read back.
                             self.fence().await;
                             let g = self.c.call_retry("GET", &kpath, None).await;
                             let now =
@@ -689,15 +682,14 @@ impl KvModel {
         }
     }
 
-    /// Reads the change feed from the follower's cursor and verifies that
-    /// applying the changes reproduces the model. Resets from a full scan if
-    /// the cursor has expired.
+    /// Reads the change feed from the follower cursor and verifies that applying
+    /// the changes reproduces the model.
     async fn follow(&mut self) -> Result<(), String> {
         let (mut cursor, mut mirror) = match self.feed.take() {
             Some(f) => f,
             None => {
                 let r = self.c.call_retry("GET", &self.path("/kv?limit=1"), None).await;
-                let v = r.json["version"].as_u64().ok_or("no version")?;
+                let v = r.json["version"].as_u64().ok_or("missing version")?;
                 let mirror = self.model.data.iter().map(|(k, (_, ver))| (k.clone(), (Json::Null, *ver))).collect();
                 (v.to_string(), mirror)
             }
@@ -712,17 +704,17 @@ impl KvModel {
                 410 if r.code() == "cursor_expired" => return Ok(()),
                 _ => return Err(format!("step {}: feed: {} {}", self.step, r.status, r.json)),
             }
-            let changes = r.json["changes"].as_array().ok_or("no changes")?;
+            let changes = r.json["changes"].as_array().ok_or("missing changes")?;
             for ch in changes {
                 let version = ch["version"].as_u64().ok_or("change without a version")?;
                 let ctx = format!("step {} feed change {ch}", self.step);
                 if let Some(range) = ch.get("deleted_range") {
-                    let start = range["start"].as_str().ok_or("no start")?.as_bytes().to_vec();
+                    let start = range["start"].as_str().ok_or("missing start")?.as_bytes().to_vec();
                     let end = range["end"].as_str().map(|e| e.as_bytes().to_vec());
                     mirror.retain(|k, _| !in_range(k, &(start.clone(), end.clone())));
                     continue;
                 }
-                let k = ch["key"].as_str().ok_or("no key")?.as_bytes().to_vec();
+                let k = ch["key"].as_str().ok_or("missing key")?.as_bytes().to_vec();
                 match (ch["deleted"] == true, self.model.data.get(&k)) {
                     (true, None) => {
                         mirror.remove(&k);
@@ -734,7 +726,7 @@ impl KvModel {
                     (_, m) => return Err(format!("{ctx}: the model has {:?}", m.map(|(_, v)| v))),
                 }
             }
-            cursor = r.json["next_cursor"].as_str().ok_or("no next_cursor")?.to_string();
+            cursor = r.json["next_cursor"].as_str().ok_or("missing next_cursor")?.to_string();
             if r.json["more"] != true {
                 break;
             }
@@ -770,8 +762,8 @@ impl KvModel {
             if r.status != 200 {
                 return Err(format!("scan failed: {} {}", r.status, r.json));
             }
-            for it in r.json["items"].as_array().ok_or("no items")? {
-                let k = it["key"].as_str().ok_or("no key")?.as_bytes().to_vec();
+            for it in r.json["items"].as_array().ok_or("missing items")? {
+                let k = it["key"].as_str().ok_or("missing key")?.as_bytes().to_vec();
                 got.insert(k, (it.clone(), it["version"].as_u64().unwrap_or(0)));
             }
             match r.json["next_cursor"].as_str() {
@@ -839,7 +831,7 @@ pub async fn run(sim: Arc<Sim>, clients: usize, steps: usize, chaos: bool) -> Re
     for w in &mut models {
         w.full_check().await?;
     }
-    // Wait for transaction horizons to expire so range tombstones retire during subsequent writes.
+    // Wait for transaction horizons to expire so range tombstones are retired during subsequent writes.
     for _ in 0..2 {
         sim.sleep(sim.cfg.engine.txn_max_lifetime_ms + sim.cfg.engine.version_sample_ms).await;
         for w in &mut models {

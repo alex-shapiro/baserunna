@@ -1,4 +1,4 @@
-//! Simulation tool for long campaigns and debugging.
+//! Simulation runner for multi-seed campaigns, guided exploration, and trace debugging.
 //!
 //! ```text
 //! cargo run --release --example sim_tool -- list
@@ -8,9 +8,9 @@
 //! cargo run --release --example sim_tool -- determinism <scenario> <seed> [branches]
 //! ```
 //!
-//! Campaigns and explorations use every core unless `SIM_THREADS` says
-//! otherwise, and stop starting runs after `SIM_MINUTES`. A campaign also
-//! fails if `SIM_REQUIRE_PROBES` is set and some probe was never reached.
+//! Campaigns and explorations use all available CPU cores unless `SIM_THREADS` is set,
+//! and stop starting new runs after `SIM_MINUTES`. When `SIM_REQUIRE_PROBES` is set,
+//! a campaign exits with a non-zero status if any probe was not reached.
 
 use baserunna::probe::Probe;
 use baserunna::sim::campaign::{Job, RARE, Report, campaign, default_threads, parse_branches};
@@ -20,7 +20,7 @@ use baserunna::sim::{SimOutcome, run};
 use baserunna::util::prop::env_u64;
 use std::time::{Duration, Instant};
 
-/// Runs explored when neither `SIM_RUNS` nor `SIM_MINUTES` bounds them.
+/// Default run limit when neither `SIM_RUNS` nor `SIM_MINUTES` is set.
 const DEFAULT_EXPLORE_RUNS: u64 = 2_000;
 
 fn run_one(name: &str, seed: u64, branches: &str, keep_log: bool) -> SimOutcome {
@@ -32,7 +32,7 @@ fn run_one(name: &str, seed: u64, branches: &str, keep_log: bool) -> SimOutcome 
     run(seed, cfg, s.run)
 }
 
-/// The scenarios a command names: one, or `all`.
+/// Resolves a scenario name or `"all"` to the matching list of scenarios.
 fn chosen(name: &str) -> Vec<Scenario> {
     let chosen: Vec<Scenario> = scenarios().into_iter().filter(|s| name == "all" || s.name == name).collect();
     assert!(!chosen.is_empty(), "unknown scenario {name}");
@@ -47,7 +47,7 @@ fn deadline(start: Instant) -> Option<Instant> {
     env_u64("SIM_MINUTES").map(|m| start + Duration::from_secs(60 * m))
 }
 
-/// Prints a failed run with the command that repeats it.
+/// Prints a failed run and the command to reproduce it.
 fn report_failure(scenarios: &[Scenario]) -> impl Fn(&Job, &SimOutcome) + Sync + '_ {
     move |job, out| {
         if let Err(e) = &out.result {
@@ -57,8 +57,7 @@ fn report_failure(scenarios: &[Scenario]) -> impl Fn(&Job, &SimOutcome) + Sync +
     }
 }
 
-/// Prints failures grouped by their message with numbers and ids blanked,
-/// so that repeats of one failure count once.
+/// Prints failure counts grouped by normalized error message (with numbers and IDs masked).
 fn print_distinct(report: &Report) {
     let mut by: std::collections::BTreeMap<String, usize> = Default::default();
     for (_, e) in &report.failures {
@@ -141,7 +140,6 @@ fn main() {
             );
             print_distinct(r);
             if std::env::var("SIM_COMPARE").is_ok() {
-                // As many runs from fresh seeds: a plain campaign of the same size.
                 let plain = Budget { fresh: 1.0, threads: threads(), ..Budget::runs(r.runs) };
                 let base = explore(&chosen, first, &plain, |_, _| {}).report;
                 println!(
@@ -154,8 +152,6 @@ fn main() {
                 let only: Vec<String> =
                     r.features.keys().filter(|f| !base.features.contains_key(f)).map(|f| f.to_string()).collect();
                 println!("features only exploration reached: {}", only.join(" "));
-                // How often each method's runs reached, by themselves, the
-                // situations a plain campaign rarely reaches.
                 let n = |r: &Report, p: Probe| r.runs_hitting.get(p as usize).copied().unwrap_or(0);
                 let rare: Vec<String> = Probe::ALL
                     .iter()

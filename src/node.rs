@@ -104,15 +104,15 @@ pub enum Credential {
     ApiKey { id: String, db_id: Option<String>, read_only: bool, rate_limit: Option<u32> },
 }
 
-/// How a request is charged to its rate limits (§9).
+/// Rate-limit accounting mode for a request (§9).
 #[derive(Clone, Copy, Debug)]
 pub enum Meter {
-    /// Takes a token, refusing the request if a bucket is empty.
+    /// Consumes a token and rejects the request if a bucket is empty.
     Take,
-    /// Takes a token, overdrawing a bucket by up to its burst.
+    /// Consumes a token and allows overdrawing a bucket by up to its burst.
     Borrow,
-    /// Charges nothing: the peer that forwarded the request charged it.
-    Charged,
+    /// Does not consume tokens because the forwarding peer already charged the request.
+    Exempt,
 }
 
 #[derive(Clone, Debug)]
@@ -182,7 +182,6 @@ pub struct Services {
 }
 
 impl Services {
-    /// Returns a single-node configuration with no external services.
     pub fn local() -> Services {
         Services { transport: Arc::new(NoTransport), oidc: None, mailer: None }
     }
@@ -214,8 +213,7 @@ tokio::task_local! {
     static REQUEST_DEADLINE: Instant;
 }
 
-/// Runs `f` as the handling of a request whose commits must happen before
-/// `deadline`; metadata commands made within it never commit later.
+/// Runs `f` with `deadline` as the commit deadline for all metadata commands inside `f`.
 pub async fn with_deadline<F: std::future::Future>(deadline: Instant, f: F) -> F::Output {
     REQUEST_DEADLINE.scope(deadline, f).await
 }
@@ -227,7 +225,6 @@ pub struct Node {
     pub engine: Arc<Engine>,
     pub services: Services,
     members: Mutex<Vec<NodeRecord>>,
-    /// When a request last refreshed the members because it met a peer they lack.
     members_refreshed_on_demand: Mutex<Option<Instant>>,
     suspects: Mutex<DetHashMap<String, Suspect>>,
     auth_cache: TtlCache<String, Principal>,
@@ -255,7 +252,6 @@ struct Suspect {
     until: Instant,
 }
 
-/// Least time between member refreshes that requests trigger.
 const MEMBERS_REFRESH_ON_DEMAND_MIN: Duration = Duration::from_secs(1);
 
 const SUSPECT_MIN: Duration = Duration::from_secs(10);
@@ -470,9 +466,8 @@ impl Node {
         lock(&self.members).iter().find(|n| n.id == node_id).map(|n| n.addr.clone())
     }
 
-    /// The address of `node_id`, refreshing the members strongly first if
-    /// they lack it: a lease holder that started since the last refresh is
-    /// not among them yet. Refreshes this way at most once a second.
+    /// Returns the address of `node_id`. If `node_id` is not in the cached membership list,
+    /// performs a rate-limited strong refresh of the membership table first.
     async fn addr_of_or_refresh(&self, node_id: &str) -> Option<String> {
         if let Some(a) = self.addr_of(node_id) {
             return Some(a);
@@ -510,7 +505,6 @@ impl Node {
 
     /// Returns the `(node_id, addr)` of the peer that should handle `db_id`, or `None` to handle locally.
     pub async fn route(&self, db_id: &str) -> Option<(String, String)> {
-        // As when a forward certainly failed: the request is handled here.
         if crate::buggify::fault(0.02) {
             return None;
         }
@@ -531,10 +525,10 @@ impl Node {
             return None;
         }
         let Some(addr) = self.addr_of_or_refresh(&target).await else {
-            self.env.trace(|| format!("{db_id}: no address for {target}, handling locally"));
+            self.env.trace(|| format!("{db_id}: address for {target} is missing, handling locally"));
             return None;
         };
-        // Do not forward to a previous process that ran at this node's address.
+        // Ignore a previous process that ran at this node's address.
         if addr == self.cfg.addr {
             crate::probe::hit(crate::probe::Probe::OwnAddressIgnored);
             return None;
@@ -566,7 +560,6 @@ impl Node {
     }
 
     async fn run_meta_json(&self, cmd: MetaCmd) -> Result<Json> {
-        // Every attempt, local or forwarded, shares one deadline.
         with_deadline(self.meta_deadline(), self.run_meta_attempts(cmd)).await
     }
 
@@ -582,8 +575,7 @@ impl Node {
                     break;
                 }
             }
-            // A holder at this node's own address is a previous process,
-            // which no forward can reach.
+            // Do not forward to a previous process that ran at this node's address.
             if let Some(holder) = sys.lease_holder()
                 && holder != self.id
                 && let Some(addr) = self.addr_of(&holder).filter(|a| *a != self.cfg.addr)
@@ -643,8 +635,6 @@ impl Node {
         Ok(r)
     }
 
-    /// The commit deadline of the request being handled, or
-    /// `commit_timeout_ms` from now outside of one.
     fn meta_deadline(&self) -> Instant {
         REQUEST_DEADLINE
             .try_with(|d| *d)
@@ -696,7 +686,7 @@ impl Node {
         self.authenticate_metered(token, Meter::Take).await
     }
 
-    /// Authenticates `token` and charges the request to its rate limits as `meter` says.
+    /// Authenticates `token` and applies rate limits according to `meter`.
     pub async fn authenticate_metered(&self, token: &str, meter: Meter) -> Result<Principal> {
         let p = self.principal(token).await?;
         let user_key = format!("user:{}", p.user.id);
@@ -712,7 +702,7 @@ impl Node {
         match meter {
             Meter::Take => self.limiter.take(keys, "requests")?,
             Meter::Borrow => self.limiter.borrow(keys, "requests")?,
-            Meter::Charged => {}
+            Meter::Exempt => {}
         }
         Ok(p)
     }
@@ -1097,8 +1087,8 @@ impl Node {
         Ok(())
     }
 
-    /// Resets a user's password with a reset link, revokes existing sessions, and returns a new
-    /// session. The link sets one password: repeating it with that password finishes the reset.
+    /// Resets a user's password with a reset token, revokes existing sessions, and returns a new
+    /// session. Repeating the reset with the same password succeeds idempotently.
     pub async fn reset_password(&self, client: &str, token: &str, password: &str) -> Result<(User, String)> {
         auth::validate_password(password)?;
         let (user, fp) = self.open_link(client, auth::TokenPurpose::Reset, token).await?;
@@ -1106,7 +1096,7 @@ impl Node {
             return Err(Error::PermissionDenied("this account is disabled".into()));
         }
         if meta::password_fp(&user) != fp {
-            return self.reset_again(client, &user, password).await;
+            return self.retry_password_reset(client, &user, password).await;
         }
         let hash = self.hash_password(password).await?;
         let set = MetaCmd::SetPassword {
@@ -1118,10 +1108,9 @@ impl Node {
         };
         match self.run_meta(set).await {
             Ok(_) => {}
-            // A concurrent attempt with this link set a password first.
             Err(Error::PreconditionFailed { .. }) => {
                 let user = self.user_strong(&user.id).await?;
-                return self.reset_again(client, &user, password).await;
+                return self.retry_password_reset(client, &user, password).await;
             }
             Err(e) => return Err(e),
         }
@@ -1129,11 +1118,9 @@ impl Node {
         self.finish_reset(client, &user).await
     }
 
-    /// Repeats a reset whose link already set `user`'s password: an earlier
-    /// attempt may have set this very password and failed afterwards, or
-    /// raced this one. Checking the password makes a used link a sign-in, so
-    /// it takes the account's sign-in backoff.
-    async fn reset_again(&self, client: &str, user: &User, password: &str) -> Result<(User, String)> {
+    /// Completes a retried password reset when the reset token was already applied with `password`.
+    /// Enforces sign-in failure backoff before verifying `password`.
+    async fn retry_password_reset(&self, client: &str, user: &User, password: &str) -> Result<(User, String)> {
         let used = || Error::Unauthenticated("this link has been used already".into());
         let (lim, account) = (&self.cfg.limits, Self::failures_of(&user.email));
         self.limiter.check_backoff(&[&account], "failed sign-ins")?;
@@ -1147,8 +1134,6 @@ impl Node {
         self.finish_reset(client, user).await
     }
 
-    /// What follows setting a reset password: other sessions end, failed
-    /// sign-ins are forgiven, and the client gets a session.
     async fn finish_reset(&self, client: &str, user: &User) -> Result<(User, String)> {
         self.forget_user(&user.id);
         self.delete_ended_sessions(&user.id, None).await;
@@ -1160,7 +1145,6 @@ impl Node {
     /// Resolves a database reference (`name`, `org.name`, or `id:<db_id>`) and the caller's access.
     pub async fn resolve_db(&self, p: &Principal, name: &str) -> Result<(DbRecord, Access)> {
         match self.resolve_db_with(p, name, false).await {
-            // A miss may be a stale cache or snapshot: confirm strongly.
             Err(Error::NotFound(_)) => self.resolve_db_with(p, name, true).await,
             other => other,
         }
@@ -1338,9 +1322,8 @@ impl Node {
         lock(&self.txns).len()
     }
 
-    /// Open interactive transactions on database `db_id`, waiting for those
-    /// in use by a request.
-    pub async fn open_txns_on(&self, db_id: &str) -> usize {
+    /// Returns the number of open interactive transactions for `db_id`.
+    pub async fn open_txn_count_for_db(&self, db_id: &str) -> usize {
         let txns: Vec<_> = lock(&self.txns).values().cloned().collect();
         let mut n = 0;
         for t in txns {
@@ -1406,7 +1389,7 @@ mod tests {
             });
             tokio::time::sleep(Duration::from_millis(n.cfg.limits.hash_wait_ms / 2)).await;
             drop(held);
-            assert!(waiting.await.unwrap().unwrap().starts_with("pbkdf2-sha256$"), "a slot freed in time");
+            assert!(waiting.await.unwrap().unwrap().starts_with("pbkdf2-sha256$"));
         });
     }
 
@@ -1434,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_link_sets_one_password_however_often_it_is_sent() {
+    fn reset_link_is_idempotent_for_same_password_only() {
         run_paused(async {
             let w = World::new(1, 1).await;
             let n = w.node(0).clone();
@@ -1450,12 +1433,12 @@ mod tests {
             let (a, b) =
                 tokio::join!(n.reset_password("c", &token, "password-2"), n.reset_password("c", &token, "password-2"));
             assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
-            assert!(n.reset_password("c", &token, "password-3").await.is_err(), "a second password");
+            assert!(n.reset_password("c", &token, "password-3").await.is_err());
         });
     }
 
     #[test]
-    fn a_restart_replaces_its_predecessor_whatever_its_clock() {
+    fn restart_replaces_predecessor_with_skewed_clock() {
         run_paused(async {
             let w = World::new(1, 1).await;
             let a = w.node(0).clone();
@@ -1478,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn suspects_come_back_and_leavers_go() {
+    fn suspects_recover_and_shutdown_nodes_leave() {
         run_paused(async {
             let w = World::new(2, 1).await;
             let (a, b) = (w.node(0).clone(), w.node(1).clone());
@@ -1486,20 +1469,20 @@ mod tests {
             let live = |n: &super::Node| n.live_members().into_iter().map(|m| m.id).collect::<Vec<_>>();
             assert!(live(&a).contains(&b.id));
             a.mark_suspect(&b.id);
-            assert!(!live(&a).contains(&b.id), "a suspect is not routed to");
+            assert!(!live(&a).contains(&b.id));
             tokio::time::sleep(Duration::from_secs(11)).await;
-            assert!(live(&a).contains(&b.id), "the first suspicion lasts 10 s");
+            assert!(live(&a).contains(&b.id));
             a.mark_suspect(&b.id);
             tokio::time::sleep(Duration::from_secs(11)).await;
-            assert!(!live(&a).contains(&b.id), "repeated failures back off longer");
+            assert!(!live(&a).contains(&b.id));
             for _ in 0..8 {
                 a.mark_suspect(&b.id);
             }
             tokio::time::sleep(Duration::from_millis(a.cfg.heartbeat_ms + 2 * a.cfg.members_refresh_ms)).await;
-            assert!(live(&a).contains(&b.id), "a new heartbeat forgives a suspect");
+            assert!(live(&a).contains(&b.id));
             b.shutdown().await;
             a.refresh_members().await.unwrap();
-            assert!(a.members().iter().all(|m| m.id != b.id), "a node that shut down left the membership");
+            assert!(a.members().iter().all(|m| m.id != b.id));
         });
     }
 }

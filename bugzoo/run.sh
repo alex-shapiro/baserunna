@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
-# Runs a sim_tool command against every bug in the zoo.
+# Evaluates a sim_tool command against each patch in bugzoo/.
 #
 #   bugzoo/run.sh campaign all 50
 #   bugzoo/run.sh campaign register 300 1
 #   PATCHES="bugzoo/03-*.patch bugzoo/04-*.patch" bugzoo/run.sh campaign register 100
 #
-# For each patch: apply it, build sim_tool in release, run `sim_tool <args>`,
-# record seeds run, failing seeds and the first failure, then revert the
-# patch. Results are appended to $RESULTS (default bugzoo/results.tsv), and
-# each run's full output is kept in $OUT_DIR if set.
-# The working tree must be clean outside bugzoo/.
+# For each patch, this script applies the patch, builds sim_tool in release mode,
+# runs `sim_tool <args>`, records the run count and first failure to $RESULTS
+# (default: bugzoo/results.tsv), and reverts the patch. If $OUT_DIR is set, full
+# command output is written to $OUT_DIR/<patch>.out.
+# The working tree outside bugzoo/ must be clean.
 #
-# Each patch rebuilds the crate (about 7 minutes with the default release
-# profile). An incremental profile in a separate target directory cuts that
-# to under 2 minutes without changing what is compiled:
+# Use an incremental release profile in a separate target directory for faster builds:
 #
 #   CARGO_TARGET_DIR=target/zoo CARGO_PROFILE_RELEASE_INCREMENTAL=true \
 #   CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 bugzoo/run.sh campaign all 50

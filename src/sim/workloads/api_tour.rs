@@ -1,6 +1,5 @@
-//! Exercises less common endpoints such as schema drops, transaction aborts,
-//! commit status by idempotency key, and metadata endpoints so every documented
-//! operation runs under simulation.
+//! `api_tour`: exercises schema drop endpoints, interactive transaction aborts,
+//! commit status lookup by idempotency key, and admin metadata endpoints.
 
 use super::super::Sim;
 use super::super::client::Client;

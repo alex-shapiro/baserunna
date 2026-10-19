@@ -16,26 +16,26 @@ fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 }
 
 const RULES: &[(&str, &[&str], &str)] = &[
-    ("unsafe ", &[], "no unsafe code"),
-    ("tokio::sync::watch", &[], "watch channels wake waiters in random order"),
-    ("select!", &[], "select! polls branches in random order"),
+    ("unsafe ", &[], "unsafe code is forbidden"),
+    ("tokio::sync::watch", &[], "watch channels wake waiters in non-deterministic order"),
+    ("select!", &[], "select! polls branches in non-deterministic order"),
     (
         "tokio::spawn(",
         &["src/sim/", "src/engine/tests.rs", "src/stream/tests.rs"],
-        "spawn through Env so crashes abort tasks",
+        "spawn tasks through Env so node crashes abort them",
     ),
     (
         "SystemTime",
         &["src/env.rs", "src/store/", "src/main.rs", "src/log.rs"],
-        "wall time comes from Env::now_ms (log timestamps aside)",
+        "read wall time from Env::now_ms",
     ),
     (
         "std::time::Instant",
         &["src/auth.rs", "src/sim/campaign.rs", "src/sim/explore.rs"],
-        "use tokio::time::Instant (virtual in simulation); campaigns budget wall time",
+        "use tokio::time::Instant for virtual time",
     ),
-    ("aws_lc_rs::rand", &["src/env.rs", "src/store/fs.rs", "src/sim/google.rs"], "randomness comes from Env"),
-    ("thread_rng", &[], "randomness comes from Env"),
+    ("aws_lc_rs::rand", &["src/env.rs", "src/store/fs.rs", "src/sim/google.rs"], "obtain randomness from Env"),
+    ("thread_rng", &[], "obtain randomness from Env"),
 ];
 
 #[test]

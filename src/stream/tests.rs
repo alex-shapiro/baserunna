@@ -857,9 +857,7 @@ fn bulky_runs_are_sealed_and_read_across_chunks() {
         let (big, _) = info(&mut begin(&db).await, "big").await.unwrap();
         let mut it = v.iter(&es::records(big.id), false, false, None);
         let in_tail = |k: &Bytes| v.m.tail.binary_search_by(|e| e.key.cmp(k)).is_ok();
-        // Flushes and compactions seal every run of records that reaches
-        // `stream_seal_min_bytes`: what they leave unsealed are shorter runs
-        // between chunks.
+        // Flushes and compactions seal every run of records reaching `stream_seal_min_bytes`.
         let (mut sealed, mut run, min) = (0, 0, eng.shared.cfg.stream_seal_min_bytes);
         while let Some(e) = it.next().await.unwrap() {
             match es::stored(&e).unwrap().1 {
@@ -923,7 +921,6 @@ fn retention_trims_in_the_background() {
         assert!(kept <= 106 && kept + 30 > 100, "kept {kept} bytes: {:?}", texts(&b));
         assert_eq!(texts(&read_all(&db, "age", ReadSpec::default()).await), ["new"]);
         assert!(probe::count(Probe::RetentionTrimmed) >= 2);
-        // A stream no longer appended to is trimmed by a sweep.
         tokio::time::sleep(Duration::from_millis(20_000)).await;
         db.maintenance_now().await.unwrap();
         db.sweep_now().await.unwrap();
@@ -934,12 +931,10 @@ fn retention_trims_in_the_background() {
 }
 
 #[test]
-fn retention_trims_a_share_of_a_stream_at_a_time() {
+fn retention_trims_are_batched() {
     rt().block_on(async {
         let (eng, _, _) = engine(9, EngineConfig::small_for_tests());
         let db = opened(&eng, "d").await;
-        // Trims are due a sixteenth past each limit: every 1,000 bytes of
-        // these, and every second of those.
         create_stream(&db, "bytes", Retention { retention_ms: None, max_bytes: Some(16_000) }).await;
         create_stream(&db, "age", Retention { retention_ms: Some(16_000), max_bytes: None }).await;
         let trims = || probe::count(Probe::RetentionTrimmed);
@@ -1006,11 +1001,7 @@ fn consumers_read_from_their_cursor() {
         create_stream(&db, "s", Retention::default()).await;
         append_texts(&db, "s", &["a", "b", "c"]).await;
         let spec = ReadSpec { consumer: Some("w".into()), ..Default::default() };
-        assert_eq!(
-            texts(&read_all(&db, "s", spec.clone()).await),
-            ["a", "b", "c"],
-            "a new consumer starts at the beginning"
-        );
+        assert_eq!(texts(&read_all(&db, "s", spec.clone()).await), ["a", "b", "c"]);
         let mut t = begin(&db).await;
         let out = read(&mut t, "s", &ReadSpec { limit: Some(2), ..spec.clone() }).await.unwrap();
         set_consumer(&mut t, "s", "w", out.next_seq, 5).await.unwrap();
@@ -1033,7 +1024,7 @@ fn bodies_and_lines() {
     assert_eq!(b.header("b"), Some(""));
     let mut bad = b.clone();
     bad.headers.reverse();
-    assert!(Body::decode(&bad.encode()).is_err(), "headers out of order");
+    assert!(Body::decode(&bad.encode()).is_err());
     let lines = parse_lines(&Bytes::from_static(b"{\"a\":1}\r\n\n  \n[2]\n"), true).unwrap();
     assert_eq!(lines.iter().map(|b| &b.data[..]).collect::<Vec<_>>(), [&b"{\"a\":1}"[..], b"[2]"]);
     assert!(parse_lines(&Bytes::from_static(b"{}\nnope\n"), true).is_err());
@@ -1119,8 +1110,6 @@ fn gen_body(r: &mut Rng) -> Body {
     b
 }
 
-/// An independent model of a stream filter: missing and null values fail
-/// every comparison, and numbers compare by value.
 fn model_matches(f: &Json, b: &Body) -> bool {
     fn canon(v: &Json) -> Json {
         match v {

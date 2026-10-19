@@ -1,5 +1,5 @@
-//! Interactive transactions abandoned, aborted, or committed late while leases
-//! move between nodes.
+//! Interactive transactions that are abandoned, aborted, or committed after a
+//! delay while leases move between nodes.
 
 use super::super::Sim;
 use super::super::client::{Client, ZOMBIE_WAIT_MS};
@@ -12,9 +12,9 @@ const BASE: &str = "/v1/dbs/limbo";
 #[derive(Default)]
 struct Tally {
     committed: BTreeSet<String>,
-    /// Markers of abandoned or aborted transactions, with their commit ids.
+    /// Marker keys and commit IDs of abandoned or aborted transactions.
     dropped: Vec<(String, String)>,
-    /// Ids of transactions left open.
+    /// Transaction IDs left open without committing or aborting.
     abandoned_ids: Vec<String>,
 }
 
@@ -49,7 +49,7 @@ async fn one(c: &Client, marker: &str, isolation: &str, fate: Fate, tally: &mut 
             tally.dropped.push((marker.to_string(), cid));
             return Ok(());
         }
-        // Uncertain whether writes joined the transaction; abandon rather than commit unknown ops.
+        // Abandon the transaction if the network call fails so partially applied ops are not committed.
         Err(_) => Fate::Abandon,
     };
     let wait = match fate {
@@ -93,8 +93,6 @@ async fn client(c: Client, k: usize, txns: usize) -> Result<Tally, String> {
         let fate = match rng.below(6) {
             0 | 1 => Fate::Abandon,
             2 => Fate::Abort,
-            // Mostly prompt; otherwise up to twice the idle timeout, so some
-            // commits find their transaction reaped or its owner changed.
             _ if rng.chance(0.6) => Fate::CommitAfter(rng.below(500)),
             _ => Fate::CommitAfter(rng.below(2 * idle)),
         };
@@ -120,9 +118,8 @@ pub async fn run(sim: Arc<Sim>, clients: usize, txns: usize, chaos: bool) -> Res
     let info = owner.call_retry("GET", BASE, None).await;
     let id = info.json["id"].as_str().ok_or(format!("db info: {}", info.json))?.to_string();
     for i in sim.up_nodes() {
-        // Workloads running alongside may hold transactions of their own.
         let Some(n) = sim.node(i) else { continue };
-        let open = n.node.open_txns_on(&id).await;
+        let open = n.node.open_txn_count_for_db(&id).await;
         if open != 0 {
             return Err(format!("n{i} still holds {open} open transactions"));
         }
@@ -151,13 +148,13 @@ pub async fn run(sim: Arc<Sim>, clients: usize, txns: usize, chaos: bool) -> Res
         for (marker, cid) in &t.dropped {
             let st = owner.call_retry("GET", &format!("{BASE}/commits/{cid}"), None).await;
             if st.json["status"] != "not_committed" {
-                return Err(format!("{marker}: dropped transaction resolves as {}", st.json));
+                return Err(format!("{marker}: dropped transaction status is {}", st.json));
             }
         }
         for id in &t.abandoned_ids {
             let r = owner.call_retry("POST", &format!("{BASE}/transactions/{id}/commit"), Some(Json::Null)).await;
             if r.status != 404 {
-                return Err(format!("abandoned transaction {id} still usable: {} {}", r.status, r.json));
+                return Err(format!("abandoned transaction {id} is still active: {} {}", r.status, r.json));
             }
         }
     }

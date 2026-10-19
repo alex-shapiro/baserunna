@@ -190,8 +190,7 @@ async fn delete_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
     node.access_strong(&ctx.principal, &ctx.rec).await?.require_admin()?;
     ctx.db.mark_deleted().await?;
     node.env.crash_point().await;
-    // The flagged manifest already deleted the database: a concurrent repair
-    // may have removed its record, and otherwise a retry finishes it.
+    // Ignore `NotFound` if a concurrent repair already removed the metadata record after the manifest was marked deleted.
     match node.run_meta(MetaCmd::DeleteDb { id: ctx.rec.id.clone() }).await {
         Ok(_) | Err(Error::NotFound(_)) => {}
         Err(e) => {
@@ -520,7 +519,6 @@ async fn one_shot(
     }))
 }
 
-/// The first seq each of a commit's appends received.
 fn first_seqs(c: &Committed) -> Vec<u64> {
     c.appends.iter().map(|a| a.first_seq).collect()
 }
@@ -574,7 +572,6 @@ async fn begin_txn(
 }
 
 fn get_open(node: &Node, id: &str) -> Result<Arc<tokio::sync::Mutex<OpenTxn>>> {
-    // An open transaction may be lost at any time, as when its node restarts.
     if crate::buggify::fault(0.01) {
         remove_open(node, id);
     }

@@ -1,7 +1,4 @@
-//! Simulation campaigns: runs of scenarios on every core, and a report of
-//! their failures and of how often each probe was reached. A plain campaign
-//! runs every scenario seed by seed; guided exploration ([`super::explore`])
-//! chooses its runs as it goes.
+//! Parallel simulation runner and probe coverage reporter.
 
 use super::workloads::Scenario;
 use super::{SimOutcome, run};
@@ -11,8 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-/// A run: a scenario, a seed, and the branch points of its path (see
-/// [`crate::util::rng::branch`]).
+/// Parameters for a single simulation run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Job {
     pub scenario: usize,
@@ -21,14 +17,13 @@ pub struct Job {
 }
 
 impl Job {
-    /// The `i`th run of a plain campaign from `first_seed` over `scenarios`
-    /// scenarios: every scenario in turn, a seed at a time.
+    /// Returns the `i`-th unbranched job across `scenarios` starting at `first_seed`.
     pub fn fresh(scenarios: usize, first_seed: u64, i: u64) -> Job {
         let n = scenarios as u64;
         Job { scenario: (i % n) as usize, seed: first_seed + i / n, branches: vec![] }
     }
 
-    /// The `sim_tool trace` arguments that repeat this run.
+    /// Formats the `sim_tool trace` arguments that reproduce this job.
     pub fn args(&self, scenarios: &[Scenario]) -> String {
         let path: Vec<String> = self.branches.iter().map(|(ms, salt)| format!("{ms}:{salt:x}")).collect();
         format!("{} {} {}", scenarios[self.scenario].name, self.seed, path.join(",")).trim().to_string()
@@ -42,8 +37,7 @@ impl Job {
     }
 }
 
-/// Parses branch points as [`Job::args`] writes them; `None` unless they
-/// are well formed and in increasing order of time.
+/// Parses comma-separated `ms:salt` branch points in strictly increasing timestamp order.
 pub fn parse_branches(s: &str) -> Option<Vec<(u64, u64)>> {
     let points: Vec<(u64, u64)> = s
         .split(',')
@@ -56,12 +50,12 @@ pub fn parse_branches(s: &str) -> Option<Vec<(u64, u64)>> {
     points.windows(2).all(|w| w[0].0 < w[1].0).then_some(points)
 }
 
-/// Something a run showed.
+/// Coverage feature observed during a simulation run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Feature {
-    /// A probe, and the magnitude of its hit count.
+    /// A probe and its log-bucketed hit count.
     Count(Probe, u8),
-    /// Two rare probes reached in one run.
+    /// Two rare probes reached in the same run.
     Pair(Probe, Probe),
 }
 
@@ -74,7 +68,7 @@ impl std::fmt::Display for Feature {
     }
 }
 
-/// Probes reached in fewer runs than this share count as rare.
+/// Maximum run fraction at which a probe is classified as rare.
 pub const RARE: f64 = 0.05;
 
 fn bucket(n: u64) -> u8 {
@@ -90,33 +84,28 @@ fn bucket(n: u64) -> u8 {
     }
 }
 
-/// What a campaign found.
+/// Aggregated results and probe coverage from a simulation campaign.
 #[derive(Default)]
 pub struct Report {
     pub runs: u64,
-    /// Runs with branch points.
     pub branched: u64,
     pub virtual_ms: u64,
     pub failures: Vec<(Job, String)>,
-    /// Probe hits summed over every run of each scenario.
     pub hits: BTreeMap<&'static str, Hits>,
-    /// Runs that reached each probe themselves rather than by repeating
-    /// their parent ([`Hits::own`]), indexed like [`Probe::ALL`].
+    /// Number of runs that reached each probe after their last branch point, indexed by [`Probe`].
     pub runs_hitting: Vec<u64>,
-    /// Runs that showed each feature.
     pub features: BTreeMap<Feature, u64>,
 }
 
 impl Report {
-    /// Counts `out`, the outcome of `job`, and returns whether it showed a
-    /// feature no earlier run did.
+    /// Records `out` for `job` and returns `true` if a new [`Feature`] was discovered.
     pub fn add(&mut self, scenarios: &[Scenario], job: &Job, out: &SimOutcome) -> bool {
         self.runs += 1;
         self.branched += !job.branches.is_empty() as u64;
         self.virtual_ms += out.virtual_ms;
         self.hits.entry(scenarios[job.scenario].name).or_default().add(&out.probes);
         self.runs_hitting.resize(Probe::ALL.len(), 0);
-        for p in out.probes.hit_own() {
+        for p in out.probes.hit_after_branch() {
             self.runs_hitting[p as usize] += 1;
         }
         if let Err(e) = &out.result {
@@ -131,7 +120,6 @@ impl Report {
         new
     }
 
-    /// The features of a run with probe hits `h`.
     fn features_of(&self, h: &Hits) -> Vec<Feature> {
         let mut out: Vec<Feature> = h.hit().map(|p| Feature::Count(p, bucket(h.count(p)))).collect();
         let rare: Vec<Probe> = h.hit().filter(|p| self.share(*p) < RARE).collect();
@@ -143,23 +131,22 @@ impl Report {
         out
     }
 
-    /// The share of runs that reached `p`.
+    /// Fraction of runs that reached `p`.
     pub fn share(&self, p: Probe) -> f64 {
         self.runs_hitting.get(p as usize).copied().unwrap_or(0) as f64 / self.runs.max(1) as f64
     }
 
-    /// Probes no run reached.
+    /// Returns all probes that were not reached by any run.
     pub fn unreached(&self) -> Vec<Probe> {
         Probe::ALL.iter().copied().filter(|p| self.share(*p) == 0.0).collect()
     }
 
-    /// Probes some run reached.
+    /// Returns all probes that were reached by at least one run.
     pub fn probes(&self) -> BTreeSet<Probe> {
         Probe::ALL.iter().copied().filter(|p| self.share(*p) > 0.0).collect()
     }
 
-    /// A table of every probe: the share of runs that reached it and the
-    /// scenarios that reached it most.
+    /// Formats a summary table of probe hit rates and top scenarios.
     pub fn coverage_table(&self) -> String {
         let mut out = String::new();
         for p in Probe::ALL {
@@ -180,9 +167,8 @@ impl Report {
     }
 }
 
-/// Runs `job(0)`, `job(1)`, … on `threads` threads until `job` returns
-/// `None`, starting no run after `deadline`. `done` sees each run's index,
-/// job and outcome as it completes.
+/// Executes jobs produced by `job` across `threads` worker threads until `job`
+/// returns `None` or `deadline` is reached.
 pub fn run_jobs(
     scenarios: &[Scenario],
     threads: usize,
@@ -205,8 +191,7 @@ pub fn run_jobs(
     });
 }
 
-/// Runs every scenario with each of `seeds`, seed by seed, on `threads`
-/// threads, starting no run after `deadline`. `progress` sees each run.
+/// Runs all `scenarios` across `seeds` using `threads` worker threads until `deadline`.
 pub fn campaign(
     scenarios: &[Scenario],
     seeds: std::ops::Range<u64>,
@@ -225,7 +210,6 @@ pub fn campaign(
     r
 }
 
-/// Threads to use by default: every core.
 pub fn default_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
@@ -248,6 +232,6 @@ mod tests {
         let path = args.split(' ').nth(2).unwrap();
         assert_eq!(parse_branches(path), Some(job.branches));
         assert_eq!(parse_branches(""), Some(vec![]));
-        assert_eq!(parse_branches("9000:1,1500:2"), None, "points out of order");
+        assert_eq!(parse_branches("9000:1,1500:2"), None);
     }
 }

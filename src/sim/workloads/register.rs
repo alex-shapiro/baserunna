@@ -1,5 +1,4 @@
-//! `register`: concurrent writers and strong readers on a few keys, with a
-//! real-time linearizability check over the recorded history.
+//! Simulation workload for single-key linearizability with concurrent writers and strong readers.
 
 use super::super::Sim;
 use super::super::client::Client;
@@ -11,7 +10,6 @@ struct Op {
     key: usize,
     start: u64,
     end: u64,
-    /// For writes: the committed version if known.
     version: Option<u64>,
     value: String,
     write: bool,
@@ -249,8 +247,7 @@ mod tests {
             [w(0, 0, 10, 1, "a"), r(0, 5, 8, 0, ""), r(0, 20, 30, 1, "a"), w(0, 25, 40, 2, "b"), r(0, 30, 35, 1, "a")];
         check(&h).unwrap();
         check(&[w(0, 0, 100, 1, "a"), r(0, 10, 20, 1, "a"), r(1, 30, 40, 0, "")]).unwrap();
-        // Equal timestamps do not order operations: a read starting when a
-        // write or another read ends is concurrent with it.
+        // Operations with equal start and end timestamps are concurrent.
         check(&[w(0, 0, 10, 1, "a"), r(0, 10, 20, 0, "")]).unwrap();
         check(&[w(0, 0, 100, 1, "a"), r(0, 5, 10, 1, "a"), r(0, 10, 20, 0, "")]).unwrap();
     }

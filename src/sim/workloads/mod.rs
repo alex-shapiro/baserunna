@@ -177,6 +177,8 @@ pub fn spawn_chaos(sim: &Arc<Sim>) -> tokio::task::JoinHandle<()> {
 #[derive(Default)]
 pub struct ChaosState {
     active: usize,
+    /// The chaos loop, kept once aborted so that a phase started while the
+    /// last one recovers does not spawn another.
     task: Option<tokio::task::JoinHandle<()>>,
     /// Incremented each time the last phase ends.
     ended: u64,
@@ -197,7 +199,7 @@ pub struct ChaosPhase {
 pub fn chaos_phase(sim: &Arc<Sim>) -> ChaosPhase {
     let mut st = sim.chaos.lock().unwrap_or_else(|e| e.into_inner());
     st.active += 1;
-    if st.task.is_none() && st.ended == 0 {
+    if st.task.is_none() {
         crate::buggify::quiesce(false);
         st.task = Some(spawn_chaos(sim));
     }
@@ -214,7 +216,7 @@ impl ChaosPhase {
         if st.active > 0 {
             return None;
         }
-        if let Some(t) = st.task.take() {
+        if let Some(t) = &st.task {
             t.abort();
         }
         crate::buggify::quiesce(true);

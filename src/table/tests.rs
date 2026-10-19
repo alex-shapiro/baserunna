@@ -1006,6 +1006,38 @@ async fn check(db: &Arc<Db>) {
 }
 
 #[test]
+fn building_unique_index_keeps_entries_of_other_rows() {
+    rt().block_on(async {
+        for change in [json!(null), json!({"email": "z"}), json!({"g": 9})] {
+            let db = people(37, 20).await;
+            let blobs = BlobResolver { db: &db };
+            let mut t = begin(&db).await;
+            update(&mut t, &blobs, "p", &json!(15), &json!({"email": "e0"})).await.unwrap();
+            db.commit(t.into_request()).await.unwrap();
+            let idx = start_build(&db, &index_spec(json!({"name": "ix", "columns": ["email"], "unique": true}))).await;
+            assert!(build_step(&db, &idx).await.unwrap().is_none());
+            let mut t = begin(&db).await;
+            match &change {
+                Json::Null => delete(&mut t, "p", &json!(15)).await.map(|_| ()).unwrap(),
+                set => update(&mut t, &blobs, "p", &json!(15), set).await.map(|_| ()).unwrap(),
+            }
+            db.commit(t.into_request()).await.unwrap();
+            let mut done = None;
+            while done.is_none() {
+                done = match build_step(&db, &idx).await {
+                    Err(Error::AlreadyExists(_)) => {
+                        assert_eq!(change, json!({"g": 9}), "only a remaining duplicate fails the build");
+                        break;
+                    }
+                    r => r.unwrap(),
+                };
+            }
+            check(&db).await;
+        }
+    });
+}
+
+#[test]
 fn backfill_races_row_writes() {
     rt().block_on(async {
         for unique in [false, true] {

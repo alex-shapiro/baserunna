@@ -172,6 +172,8 @@ async fn google_flow(
 ) -> Result<(u16, Option<String>), String> {
     let c = Client::new(sim, "browser");
     let mut start = None;
+    // A node crashed by the lost callback may take seconds to come back.
+    let mut delay = 50;
     for _ in 0..50 {
         match c.send("GET", "/v1/auth/google/start?return_to=/console/dbs", &[], bytes::Bytes::new()).await {
             Ok(r) if r.status == 302 => {
@@ -179,7 +181,10 @@ async fn google_flow(
                 break;
             }
             Ok(r) => return Err(format!("start: {}", r.status)),
-            Err(_) => {}
+            Err(_) => {
+                sim.sleep(delay).await;
+                delay = (delay * 2).min(2_000);
+            }
         }
     }
     let r = start.ok_or("google sign-in never started")?;

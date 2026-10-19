@@ -590,8 +590,17 @@ async fn update_indexes(
         if o == n {
             continue;
         }
-        if let Some((ok, _, _)) = &o {
-            txn.delete(ok.clone())?;
+        if let Some((ok, ov, _)) = &o {
+            // Until its backfill checks every row, a unique index may hold this
+            // value for another row, whose entry this write must keep. The read
+            // is pinned because skipping the delete gives up its write conflict.
+            let ours = !idx.unique
+                || ov.is_empty()
+                || idx.state == IndexState::Ready
+                || matches!(txn.get_pinned(ok).await?, Some(ReadValue { value: Value::Inline(b), .. }) if b == ov);
+            if ours {
+                txn.delete(ok.clone())?;
+            }
         }
         if let Some((nk, nv, ne)) = n {
             if idx.unique

@@ -187,11 +187,21 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
     sim.sleep(10_000).await;
     sim.sleep(e.gc_grace_ms + 1_000).await;
     touch(2).await; // deletes expired obsolete objects, in the background
+    // Expired obsolete objects are deleted one by one in the background, so
+    // garbage is checked once that task has had time to finish.
     let unlisted_garbage = || -> Result<Option<String>, String> {
-        let (referenced, listed, _) = db_objects(&sim, &db_id)?;
-        Ok(stored_ids(&sim, &db_id, "blob")
+        let (referenced, listed, segs) = db_objects(&sim, &db_id)?;
+        let blob = stored_ids(&sim, &db_id, "blob")
             .into_iter()
-            .find(|b| !referenced.contains(b) && !listed.contains(&format!("blob:{b}"))))
+            .find(|b| !referenced.contains(b) && !listed.contains(&format!("blob:{b}")))
+            .map(|b| format!("blob {b}"));
+        let seg = || {
+            stored_ids(&sim, &db_id, "seg")
+                .into_iter()
+                .find(|s| !segs.contains(s) && !listed.contains(&format!("seg:{s}")))
+                .map(|s| format!("segment {s}"))
+        };
+        Ok(blob.or_else(seg))
     };
     for _ in 0..120 {
         sim.sleep(1_000).await;
@@ -199,10 +209,10 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
             break;
         }
     }
-    if let Some(b) = unlisted_garbage()? {
-        return Err(format!("garbage blob {b} survived a full GC cycle"));
+    if let Some(g) = unlisted_garbage()? {
+        return Err(format!("garbage {g} survived a full GC cycle"));
     }
-    let (referenced, listed, segs) = db_objects(&sim, &db_id)?;
+    let (referenced, _, _) = db_objects(&sim, &db_id)?;
     let stored_blobs = stored_ids(&sim, &db_id, "blob");
     for b in &referenced {
         if !stored_blobs.contains(b) {
@@ -215,11 +225,6 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
             "blob gc: garbage blobs before={garbage_before} after={garbage_after} referenced={}",
             referenced.len()
         );
-    }
-    for s in stored_ids(&sim, &db_id, "seg") {
-        if !segs.contains(&s) && !listed.contains(&format!("seg:{s}")) {
-            return Err(format!("garbage segment {s} survived a full GC cycle"));
-        }
     }
     verify(&c, base, &kv, &rows, &mut rng).await
 }

@@ -1753,6 +1753,13 @@ Bugs the DST suite found, each now covered by the regular suite:
     never called the holder were limited there. Forwards now carry the
     cluster key, and their receiver authenticates them without charging.
     Found once worlds made a node other than the first the lease holder.
+40. _Unique entries lost during index builds (data integrity)._ While a
+    unique index was being built, two rows could still hold one value;
+    deleting or changing one of them deleted the index entry the backfill
+    had written for the other, and the index became ready without it.
+    Maintenance of a building unique index now deletes an old entry only
+    if it names the row. Found with one-row backfill batches racing row
+    deletes, in a mix of workloads.
 
 The cost measurements (§13.4) found five more: a read-heavy database whose
 lease had lapsed never acquired it again (paying a validating GET per read

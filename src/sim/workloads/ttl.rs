@@ -230,24 +230,29 @@ impl Owner {
     }
 
     /// Inserts a row with a unique token, verifying it is rejected only while
-    /// another live row holds that token.
+    /// another live row holds that token. Besides its last known holder, a
+    /// token may be held by rows whose inserts had unknown outcomes.
     async fn insert_row(&mut self) -> Result<(), String> {
         let id = self.step as i64;
         let token = TOKENS[self.rng.usize(TOKENS.len())].to_string();
         let ttl = 200 + self.rng.below(3_000);
-        let holder = self.rows.iter().find(|(_, (t, _))| *t == token).map(|(id, (_, v))| (*id, v.clone()));
+        let holders: Vec<(i64, Val)> =
+            self.rows.iter().filter(|(_, (t, _))| *t == token).map(|(id, (_, v))| (*id, v.clone())).collect();
         let op = json!({"op": "insert_row", "table": "sess", "row": {"id": id, "token": token}, "ttl_ms": ttl});
         let Some((r, t0)) = self.commit(json!([op])).await? else {
             self.rows.insert(id, (token, Val::uncertain()));
             return Ok(());
         };
         let t1 = self.c.sim.now_ms();
-        let seen = expect(holder.as_ref().map(|h| &h.1), t0, t1, self.eps);
+        let seen =
+            holders.iter().map(|(_, v)| expect(Some(v), t0, t1, self.eps)).fold(Seen::Absent, |a, b| match (a, b) {
+                (Seen::Present, _) | (_, Seen::Present) => Seen::Present,
+                (Seen::Either, _) | (_, Seen::Either) => Seen::Either,
+                _ => Seen::Absent,
+            });
         match (r.status, seen) {
             (200, Seen::Absent | Seen::Either) => {
-                if let Some((old, _)) = holder {
-                    self.rows.remove(&old);
-                }
+                self.rows.retain(|_, (t, _)| *t != token);
                 let version = r.json["version"].as_u64().ok_or("no version")?;
                 let val = Val {
                     data: token.clone(),
@@ -259,7 +264,7 @@ impl Owner {
                 Ok(())
             }
             (409, Seen::Present | Seen::Either) => Ok(()),
-            (s, seen) => Err(format!("insert {token}: {s} {}, holder {holder:?} ({seen:?})", r.json)),
+            (s, seen) => Err(format!("insert {token}: {s} {}, holders {holders:?} ({seen:?})", r.json)),
         }
     }
 

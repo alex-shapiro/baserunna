@@ -847,7 +847,8 @@ its `version`.
 - **Membership** is stored in the `nodes` table of the system DB. Each node
   rewrites `{id, addr, started_at, heartbeat_at}` every `heartbeat_ms`
   (120 s) and re-reads the table every `members_refresh_ms` (30 s). A node is
-  live if `heartbeat_at > now − 3 × heartbeat_ms`. Crashes are detected by
+  live if `heartbeat_at > now − 3 × heartbeat_ms` and no later process
+  registered at its address. Crashes are detected by
   requests rather than heartbeats: a forward that certainly never arrived
   makes its target a suspect, which stays out of routing until the table
   shows a newer heartbeat from it, or for a backoff that starts at 10 s and
@@ -1443,6 +1444,11 @@ the records it claims, with no overlap within a stream.
   of reaching them again, as Antithesis restarts tests from its
   assertions' checkpoints. Runs that show a new feature (a probe and the
   magnitude of its count, or two rare probes in one run) join the corpus.
+  Exploration trades breadth for depth: over 2,100 runs it reached 433
+  features to a campaign's 480, but put 4 to 22 times as many runs into
+  the rarest situations (a segment collected under a read: 72 runs to 5; a
+  duplicate forward of unknown outcome: 111 to 5), and found more failing
+  runs. Campaigns and exploration complement each other.
 - **Bug zoo** (`bugzoo/`): a patch per historic bug in §13.6 reintroduces
   it, and `bugzoo/run.sh` measures how many runs of a strategy find each.
 
@@ -1727,6 +1733,16 @@ Bugs the DST suite found, each now covered by the regular suite:
     behind a paused node committed a minute after its client gave up, and
     recreated a database the client had deleted meanwhile. Metadata
     commits now carry their request's deadline, also when forwarded (§7).
+37. _Leases their holder forgot._ A lease holder that evicted an idle
+    handle forgot its own lease and routed to another node, while every
+    other node routed to it; nobody ran the system database's reaper, and
+    deleted databases outlived their purge by ten minutes. A node now
+    routes to itself while others would see its lease as valid. Found
+    with handle eviction under a second, in a mix of workloads.
+38. _Members replaced by a restart._ For three heartbeat intervals after a
+    restart, nodes still forwarded to the previous process at the restarted
+    node's address, which refused every forward. A member record replaced
+    by a later process at its address is no longer live (§7).
 
 The cost measurements (§13.4) found five more: a read-heavy database whose
 lease had lapsed never acquired it again (paying a validating GET per read

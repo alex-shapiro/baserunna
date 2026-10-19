@@ -86,7 +86,8 @@ the design context for several of these.
 - [ ] **Run mutation testing in CI**, e.g. `scripts/mutants.sh --in-diff` on every PR and the
       full configuration weekly.
 - [ ] **Run the cost guard and throughput benchmark in CI** and track the numbers over time.
-- [ ] **Make guided exploration beat plain campaigns.** At equal runs it reaches about as many
-      probe features as a swarm campaign (SPEC §13.4); its value so far is in reaching
-      combinations of rare probes. Better features (orderings of rare probes, buggify sites
-      fired) or energy schedules could change that.
+- [ ] **Broaden guided exploration.** At equal runs it puts many times more runs into rare
+      states than a campaign but reaches fewer distinct features (SPEC §13.4), and its failures
+      cluster in a few worlds. Deduplicating failures by message, weighting fresh worlds by
+      their novelty, and richer features (orderings of rare probes, buggify sites that fired)
+      could keep the depth without the loss of breadth.

@@ -340,8 +340,14 @@ impl Db {
     /// Returns another node's lease in `v` and its remaining duration
     /// on this node's clock, or `None` if no foreign lease is active.
     fn foreign_lease<'a>(&self, v: &'a Version) -> Option<(&'a Lease, Duration)> {
+        self.sighted_lease(v).filter(|(l, _)| l.node != self.shared.node_id)
+    }
+
+    /// The lease in `v` as other nodes see it: valid until its duration
+    /// plus the margin has passed since this node first saw it.
+    fn sighted_lease<'a>(&self, v: &'a Version) -> Option<(&'a Lease, Duration)> {
         let m = &v.m;
-        let l = m.lease.as_ref().filter(|l| l.node != self.shared.node_id)?;
+        let l = m.lease.as_ref()?;
         if self.lease_expired_on_store(v, l) {
             return None;
         }
@@ -381,7 +387,9 @@ impl Db {
         if self.holds_lease(&st, &cur.m) {
             return Some(self.shared.node_id.clone());
         }
-        self.foreign_lease(&cur).map(|(l, _)| l.node.clone())
+        // A lease of ours that this node no longer tracks, as after evicting
+        // the database, still routes other nodes here.
+        self.sighted_lease(&cur).map(|(l, _)| l.node.clone())
     }
 
     /// Storage statistics at version `v`.

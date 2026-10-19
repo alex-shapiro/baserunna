@@ -1298,10 +1298,15 @@ impl Node {
         lock(&self.txns).len()
     }
 
-    /// Open interactive transactions on database `db_id`; one in use right
-    /// now counts as open.
-    pub fn open_txns_on(&self, db_id: &str) -> usize {
-        lock(&self.txns).values().filter(|t| t.try_lock().map_or(true, |t| t.db_id == db_id)).count()
+    /// Open interactive transactions on database `db_id`, waiting for those
+    /// in use by a request.
+    pub async fn open_txns_on(&self, db_id: &str) -> usize {
+        let txns: Vec<_> = lock(&self.txns).values().cloned().collect();
+        let mut n = 0;
+        for t in txns {
+            n += usize::from(t.lock().await.db_id == db_id);
+        }
+        n
     }
 
     pub fn status_json(&self) -> Json {

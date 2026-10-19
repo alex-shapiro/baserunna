@@ -191,11 +191,13 @@ pub struct ChaosPhase {
     open: bool,
 }
 
-/// Starts a chaos phase for the calling workload.
+/// Starts a chaos phase for the calling workload. A phase started after
+/// chaos has ended runs without faults, since other workloads' checks may
+/// be running.
 pub fn chaos_phase(sim: &Arc<Sim>) -> ChaosPhase {
     let mut st = sim.chaos.lock().unwrap_or_else(|e| e.into_inner());
     st.active += 1;
-    if st.task.is_none() {
+    if st.task.is_none() && st.ended == 0 {
         crate::buggify::quiesce(false);
         st.task = Some(spawn_chaos(sim));
     }

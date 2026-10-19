@@ -203,7 +203,8 @@ fn deeper_levels_move_to_levels_objects() {
         assert!(deep > 4, "setup: {deep} deep segments");
         let id = v.m.levels.clone().expect("a levels object");
         let stored = store.mem.get_sync(&manifest_key("d"), &Default::default()).unwrap().data;
-        let inline = manifest::Manifest { levels: None, ..v.m.clone() }.encode();
+        let stored = manifest::Manifest::decode(&stored).unwrap().encode_body();
+        let inline = manifest::Manifest { levels: None, ..v.m.clone() }.encode_body();
         assert!(stored.len() + 50 * deep < inline.len(), "{} bytes, inline {}", stored.len(), inline.len());
         assert!(eng.shared.counters.get().levels_objects_written > 1);
         let b = second_node(&eng, &store, "b");

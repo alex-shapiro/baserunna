@@ -17,7 +17,7 @@ pub type Tracer = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct Env {
     clock: Clock,
-    rng: Mutex<Option<Rng>>,
+    rng: Option<Mutex<Rng>>,
     tasks: Mutex<JoinSet<()>>,
     tracer: Mutex<Option<Tracer>>,
 }
@@ -25,14 +25,14 @@ pub struct Env {
 impl Env {
     /// Creates a production environment backed by the system clock and OS CSPRNG.
     pub fn real() -> Env {
-        Env { clock: Clock::Real, rng: Mutex::new(None), tasks: Mutex::new(JoinSet::new()), tracer: Mutex::new(None) }
+        Env { clock: Clock::Real, rng: None, tasks: Mutex::new(JoinSet::new()), tracer: Mutex::new(None) }
     }
 
     /// Creates a simulated environment with virtual time starting at `origin` (`base_ms`) and clock offset `skew_ms`.
     pub fn sim(seed: u64, base_ms: u64, origin: Instant, skew_ms: i64) -> Env {
         Env {
             clock: Clock::Sim { base_ms, origin, skew_ms: AtomicI64::new(skew_ms) },
-            rng: Mutex::new(Some(Rng::new(seed))),
+            rng: Some(Mutex::new(Rng::new(seed))),
             tasks: Mutex::new(JoinSet::new()),
             tracer: Mutex::new(None),
         }
@@ -81,12 +81,9 @@ impl Env {
     }
 
     pub fn fill_random(&self, out: &mut [u8]) {
-        let mut g = self.rng.lock().unwrap_or_else(|e| e.into_inner());
-        match g.as_mut() {
-            Some(r) => r.fill(out),
-            None => {
-                aws_lc_rs::rand::fill(out).expect("OS randomness unavailable");
-            }
+        match &self.rng {
+            Some(r) => r.lock().unwrap_or_else(|e| e.into_inner()).fill(out),
+            None => aws_lc_rs::rand::fill(out).expect("OS randomness unavailable"),
         }
     }
 

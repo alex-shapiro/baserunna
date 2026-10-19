@@ -46,18 +46,25 @@ async fn transfer(c: &Client, db: &str, a: usize, b: usize, amt: i64) -> Result<
     while c.sim.now_ms() < deadline {
         let d = c.rng().below(50);
         c.pause(d).await;
-        let Ok(r) = c.post(&format!("{base}/transactions"), json!({})).await else { continue };
+        let compact = c.rng().below(2) == 0;
+        let reads = json!([{"op": "get", "key": acct(a)}, {"op": "get", "key": acct(b)}]);
+        let begin = if compact { json!({"ops": reads}) } else { json!({}) };
+        let Ok(r) = c.post(&format!("{base}/transactions"), begin).await else { continue };
         if r.status != 201 {
             c.pause(100).await;
             continue;
         }
         let id = r.json["txn_id"].as_str().unwrap_or_default().to_string();
         let cid = r.json["commit_id"].as_str().unwrap_or_default().to_string();
-        let ops = json!({"ops": [{"op": "get", "key": acct(a)}, {"op": "get", "key": acct(b)}]});
-        let Ok(r) = c.post(&format!("{base}/transactions/{id}/ops"), ops).await else { continue };
-        if r.status != 200 {
-            continue;
-        }
+        let r = if compact {
+            r
+        } else {
+            let Ok(r) = c.post(&format!("{base}/transactions/{id}/ops"), json!({"ops": reads})).await else { continue };
+            if r.status != 200 {
+                continue;
+            }
+            r
+        };
         let bal = |i: usize| r.json["results"][i]["value"].as_str().and_then(|v| v.parse::<i64>().ok());
         let (Some(ba), Some(bb)) = (bal(0), bal(1)) else {
             return Err(format!("missing balance: {}", r.json));
@@ -66,15 +73,22 @@ async fn transfer(c: &Client, db: &str, a: usize, b: usize, amt: i64) -> Result<
             let _ = c.call("DELETE", &format!("{base}/transactions/{id}"), None).await;
             return Ok(false);
         }
-        let ops = json!({"ops": [
+        let writes = json!([
             {"op": "put", "key": acct(a), "value": (ba - amt).to_string()},
             {"op": "put", "key": acct(b), "value": (bb + amt).to_string()},
-        ]});
-        let Ok(r) = c.post(&format!("{base}/transactions/{id}/ops"), ops).await else { continue };
-        if r.status != 200 {
-            continue;
-        }
-        match c.post(&format!("{base}/transactions/{id}/commit"), json!({})).await {
+        ]);
+        let commit = if compact {
+            json!({"ops": writes})
+        } else {
+            let Ok(r) = c.post(&format!("{base}/transactions/{id}/ops"), json!({"ops": writes})).await else {
+                continue;
+            };
+            if r.status != 200 {
+                continue;
+            }
+            json!({})
+        };
+        match c.post(&format!("{base}/transactions/{id}/commit"), commit).await {
             Ok(r) if r.status == 200 => return Ok(true),
             Ok(r) if r.status == 409 || r.status == 404 || r.retryable_not_applied() => {
                 let d = c.rng().below(200) + 10;

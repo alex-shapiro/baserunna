@@ -35,6 +35,7 @@ pub fn routes() -> Router<Arc<Node>> {
         .route("/v1/admin/users", get(admin_users))
         .route("/v1/admin/users/{id}/disable", post(admin_disable))
         .route("/v1/admin/nodes", get(admin_nodes))
+        .route("/v1/admin/metrics", get(admin_metrics).delete(reset_metrics))
 }
 
 /// Formats the `Set-Cookie` header value for a session cookie.
@@ -389,6 +390,23 @@ async fn admin_disable(
     node.run_meta(MetaCmd::SetDisabled { actor: p.user.id.clone(), user_id: id.clone(), disabled: d.disabled }).await?;
     node.forget_user(&id);
     Ok(axum::Json(json!({})))
+}
+
+async fn admin_metrics(State(node): State<Arc<Node>>, Auth(p): Auth) -> Result<axum::Json<Json>> {
+    p.require_admin()?;
+    p.require_unscoped()?;
+    let mut out = serde_json::Map::new();
+    out.insert("node".into(), json!(node.id));
+    node.engine.shared.metrics.json_into(&mut out);
+    node.metrics.json_into(&mut out);
+    Ok(axum::Json(Json::Object(out)))
+}
+
+async fn reset_metrics(State(node): State<Arc<Node>>, auth: Auth) -> Result<axum::Json<Json>> {
+    let out = admin_metrics(State(node.clone()), auth).await?;
+    node.engine.shared.metrics.reset();
+    node.metrics.reset();
+    Ok(out)
 }
 
 async fn admin_nodes(State(node): State<Arc<Node>>, Auth(p): Auth) -> Result<axum::Json<Json>> {

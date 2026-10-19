@@ -170,8 +170,8 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
                                 .await;
                             if g.json["found"] == true {
                                 won.push(id);
+                                break;
                             }
-                            break;
                         }
                     }
                     cc.pause(50).await;

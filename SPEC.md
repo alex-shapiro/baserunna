@@ -352,10 +352,10 @@ clock                                every node's store-clock probe (§5.8)
 
 ### 5.2 Manifest
 
-The manifest is a binary, CRC32C-checksummed document (`engine/manifest.rs`):
+The manifest is a binary, CRC32C-checksummed document (`engine/manifest.rs`). The body is compressed with zstd (level 1) if compression reduces its size by at least 12.5%:
 
 ```
-magic "BRMF", format u16
+magic "BRMF", format u16, codec u8
 db_id
 version: u64                                          data version = seq of the last commit
 write_seq: u64                                        incremented by every manifest write
@@ -480,7 +480,7 @@ Each open database has a per-node commit queue drained by a single committer tas
 
 While a manifest `PUT` is in flight, strong reads on the committing node wait for that `PUT` to finish, since another node may already observe the new manifest in object storage. A read waits only for the `PUT` that was in flight when the read arrived, so back-to-back commits cannot starve readers.
 
-Single-request serializable transactions begin immediately on the node's latest cached version without waiting for an in-flight manifest `PUT`, so concurrent writes are batched into the next commit. If the transaction writes, commit validation checks its read set against the in-flight commit. If the transaction is read-only or fails before committing, the node waits for the in-flight `PUT` to finish, validates the read set against a strong snapshot, and re-executes the transaction on conflict. Interactive and snapshot-isolation transactions always wait for a strong snapshot before starting.
+Single-request serializable transactions begin immediately on the node's latest cached version without waiting for an in-flight manifest `PUT`, so concurrent writes are batched into the next commit. If the transaction contains writes, commit validation checks its read set against the in-flight commit. If the transaction is read-only or fails before committing, the node waits for the in-flight `PUT` to finish, validates the read set against a strong snapshot, and re-executes the transaction on conflict. Interactive serializable transactions also begin on the latest cached version. Because their read results have already been returned to the client, a read-only commit that fails validation returns `409 conflict` instead of re-executing. Snapshot-isolation transactions wait for a strong snapshot before starting.
 
 #### Range Deletes
 
@@ -498,6 +498,10 @@ If a conditional `PUT` on the manifest does not succeed on the first attempt:
 
 - On `412 Precondition Failed`, another node updated the manifest. The committer reloads the manifest. If another node now holds a valid lease, the batch fails with `not_owner`; otherwise the committer re-runs validation and applies the batch against the new `base`.
 - On a timeout or network error, it is unknown whether the `PUT` landed. The committer reloads the manifest and retries against the new `base`. If the earlier `PUT` succeeded, step 4 finds the batch's commit records in the reloaded manifest and returns their committed versions without re-applying the writes. If a delayed copy of the first `PUT` is still in flight, it carries the same `If-Match` etag as the retry so at most one can succeed. After exhausting retries, the committer returns `503 unavailable` with `outcome: "unknown"`, which the client can resolve via `GET /commits/{id}` or by retrying with the same idempotency key.
+
+#### Hedged Manifest Writes
+
+If a manifest `PUT` does not complete within `manifest_put_hedge_ms` (250 ms), the committer sends a duplicate `PUT` with the same `If-Match` precondition. Because both requests use the same precondition, at most one is applied. The attempt succeeds as soon as either request succeeds. If the duplicate fails with `412 Precondition Failed` while the first request is still in flight, the first request may have already been applied, so the committer treats the attempt as a timeout and reloads the manifest immediately. On any other error, the committer waits for both requests to finish. Objects removed from `obsolete` by the planned manifest have already passed their grace period, so they are deleted even if the outcome of the `PUT` is unknown.
 
 #### Commit Records
 
@@ -745,7 +749,10 @@ Simulated benchmarks (`sim::amp`) measure segment and chunk bytes written per re
    may have applied the write that now makes the check fail. Conflicts are
    retried server-side.
 2. **Interactive** (`/v1/dbs/{db}/transactions…`): begin, ops, commit,
-   abort. Transaction state is stored on a database's owner node. If the
+   abort. `begin` and `commit` also accept `ops`, so a read-write transaction
+   can be executed in two requests. Because a serializable transaction can begin
+   while a commit is in flight (§5.5), a read-only transaction must be
+   committed to validate its read set. Transaction state is stored on a database's owner node. If the
    owner changes or crashes, the transaction is lost (`404 txn_not_found`)
    with no data committed. `begin` returns the transaction's `commit_id` up
    front, and `commit` the seqs its appends received.
@@ -847,7 +854,8 @@ its `version`.
   hour (about $0.15 a month).
 - **Routing**: for a request on DB `d`, the target is the lease holder if a
   valid lease is known, otherwise the live node maximizing
-  `hash(node_id ‖ d)` (rendezvous hashing). If the target is another node, the
+  `hash(node_id ‖ d)` (rendezvous hashing). A member entry with the node's own
+  address belongs to a previous process and is ignored during routing. If the target is another node, the
   request is proxied, streaming large bodies, with `x-baserunna-hops`
   incremented; a request already forwarded twice is handled where it is. If
   forwarding certainly failed (the request never left), the receiving node
@@ -935,7 +943,7 @@ listing that issued them.
 
 Auth lookups (session, API key, DB and organization name resolution,
 membership roles) are snapshot reads of `sys` with `max_staleness` of
-2 s, cached per node for at most 30 s. A revocation (of a session, a key,
+2 s, cached per node for at most 30 s from the start of the read. A revocation (of a session, a key,
 an account, or a role) takes effect at once on the node that performed it
 and within 32 s everywhere else. Only memberships are cached, never their
 absence, so a member added is recognized at once everywhere. A snapshot
@@ -1009,7 +1017,9 @@ resurrect a purged database.
   of N nodes admits up to N times each rate. Every authenticated request
   takes a token from its user's bucket (500/s, burst twice that) and, for
   an API key, from the key's (500/s, or the `rate_limit` the key was
-  created with); both or neither. Sign-ins, sign-ups and Google sign-in
+  created with); both or neither. Requests that commit or abort an interactive
+  transaction can overdraw a bucket by up to its burst capacity, and subsequent
+  requests must wait for the bucket to refill. Sign-ins, sign-ups and Google sign-in
   take from their client address's bucket (1/s, burst 20), and sign-ups
   also from a second one (20 an hour, burst 5). A refused request gets
   `429 rate_limited` with `Retry-After` and was not applied.
@@ -1133,6 +1143,7 @@ POST /v1/dbs/{db}/streams/{s}/trim before_seq
 GET /v1/dbs/{db}/streams/{s}/consumers limit, cursor
 GET|PUT|DELETE /v1/dbs/{db}/streams/{s}/consumers/{c}
 GET /v1/admin/users GET /v1/admin/nodes POST /v1/admin/users/{id}/disable
+GET|DELETE /v1/admin/metrics read (and on DELETE, reset) node latency metrics
 ```
 
 Listings take `limit` and `cursor` and answer `next_cursor` (§8).
@@ -1220,6 +1231,7 @@ content security policy.
 | `BASERUNNA_DISK_CACHE_DIR`               | none                            | directory of the local tier (§5.3); off if unset             |
 | `BASERUNNA_DISK_CACHE_MB`                | 10240                           | local tier budget                                            |
 | `BASERUNNA_LEASE_MS`                     | 5000                            | lease renewed by commits; leases renewed for reads last 3×   |
+| `BASERUNNA_PUT_HEDGE_MS`                 | 250                             | manifest `PUT` hedge delay in ms (§5.5); 0 disables hedging  |
 | `BASERUNNA_DB_MAX_MB`                    | 10240                           | size quota of each database (§5.10); 0 for none              |
 | `BASERUNNA_USER_RPS`                     | 500                             | requests per second per user, per node; 0 for no limit       |
 | `BASERUNNA_API_KEY_RPS`                  | 500                             | requests per second per API key without its own `rate_limit` |
@@ -1244,10 +1256,17 @@ thread; if stderr falls behind, excess lines are dropped with a warning. At
 which may contain user keys), `status`, `ms`, `hops`, `forwarded_to` (when
 forwarded to another node), and latency breakdowns for object-store calls
 (`store`, `store_ms`), commit waits (`commits`, `commit_ms`), and in-flight
-manifest waits (`read_wait_ms`). Each commit batch that writes a manifest
-logs a `msg: "commit"` event with queue wait (`queued_ms`), batch build time
-(`build_ms`), store calls (`store`), and participating `request_ids`. The
-mail webhook receives `{"from", "to", "subject", "text"}`.
+manifest waits (`read_wait_ms`). Responses include these totals in the
+`Server-Timing` header (`total`, `store`, `commit`, and `wait`, in ms). After a
+commit batch writes a manifest, the node logs a `msg: "commit"` event with queue
+wait (`queued_ms`), batch build time (`build_ms`), store calls (`store`), and
+participating `request_ids`. The mail webhook receives `{"from", "to",
+"subject", "text"}`.
+
+`GET /v1/admin/metrics` returns latency histograms for object-store
+operations, commit batches, HTTP routes, and tokio scheduler lag, along with
+process CPU time and host steal time on Linux. `DELETE /v1/admin/metrics`
+returns and resets the histograms.
 
 On SIGTERM or SIGINT a node drains (failing `/healthz`), stops accepting
 connections, waits for in-flight requests, then releases its leases and
@@ -1312,7 +1331,7 @@ the directory.
 | `register`     | Concurrent writers and strong readers on a few keys, checked for real-time linearizability. Readers exercise `GET`, unforwarded `GET`, and read-only and read-write transactions. `register_contended` adds short pauses and delayed store responses.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `tables`       | Schema changes and row ops against a model, including updates and deletes by selection that must change exactly the rows the model selects. A follower of the table's change feed must rebuild the model's rows. At quiescence indexes match a recomputation from rows, unique constraints hold, and dropped tables and indexes (large enough to take range tombstones) leave nothing behind.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `schema_race`  | Row writes on every path (batch updates and deletes included) and at both isolation levels race schema changes. Indexes must match rows, nothing may be orphaned, and each writer's rows must match its model.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `ttl`          | Values and rows with times to live. Each read must see a value until its expiry window (the commit request's span plus the TTL, widened by the clock error bound) and never after, nor a value it replaced; a unique value is free exactly when its row expired. Clients take and renew a lock held by an expiring value: in version order, each acquisition is committed no earlier than the previous lock's expiry and each renewal is committed before the lock it read expired.                                                                                                                                                                                                                                                                                                                                                                                              |
+| `ttl`          | Values and rows with times to live. Each read must see a value until its expiry window (the commit request's span plus the TTL, widened by the clock error bound) and never after, nor a value it replaced; a unique value is free exactly when its row expired. Clients take and renew a lock held by an expiring value: in version order, each acquisition is committed no earlier than the previous lock's expiry and each renewal is committed before the lock it read expired.                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `watch`        | A writer commits puts (some expiring), deletes and range deletes while a watcher follows the change feed with long polls through random nodes. Every change received must be what the writer wrote at that version, cursors expire no sooner than a transaction lifetime after they caught up, and the watcher's state must end up equal to the database's.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `streams`      | Appenders (some with `expect_seq`, some appending in a transaction that also increments a counter, all with idempotency keys), followers on long polls and event streams, readers by seq, time, tail, consumer, in reverse and with filters, explicit and retention trims, and a stream deleted and recreated, through random nodes under faults. Every record read must be the one appended at its seq, seqs dense and times never decreasing and within their append's window; a strong read must see every append acknowledged before it began and no trim undone; `expect_seq` lets exactly one of the appends expecting a seq through; a counter and its stream must agree; followers receive every record once, in order; retention leaves each stream within its limits; and every stream must end equal to its model. Enough data flows to seal chunks at flush and in compaction. |
 | `blobs`        | Uploads of random sizes on every path, range reads, overwrites and deletes, checked by SHA-256. A final GC keeps every referenced object and removes every unreferenced one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -1563,6 +1582,32 @@ Bugs the DST suite found, each now covered by the regular suite:
     to append again. The answer now carries `retention_ms`, past which it
     is not definitive (§6.2), and the workload resolves such appends from
     the records it reads.
+
+25. _Garbage retained after ambiguous writes._ Obsolete objects removed from
+    the manifest were deleted only after a manifest write returned success.
+    If a manifest write timed out after being applied, the retry found the
+    commit already applied and never deleted those objects. Obsolete objects
+    past their grace period are now deleted even when the manifest write
+    outcome is unknown (§5.5).
+
+26. _Self-forwarding after a restart._ When a node restarted at the same
+    address, it treated its previous node ID as a live peer and forwarded
+    requests to its own address. The restarted node then rejected those
+    forwarded requests because they targeted the previous node ID. Nodes now
+    ignore membership entries that use their own address (§7).
+
+27. _Lease state lost after ambiguous writes._ A node recorded its own lease
+    only when a manifest write returned success. If a manifest write timed
+    out after being applied and a retry observed the committed manifest, the
+    node did not know that it held the lease and skipped orphan sweeps. When
+    a node reloads a manifest written by an ambiguous write from that node, it
+    now records the lease from the time that write was sent (§5.5).
+
+28. _Stale authorization cached after a slow read._ If a role lookup began
+    before a membership change and finished after the change was committed,
+    the node cached the stale role for a full TTL after the read completed.
+    Cache entries now expire after the configured TTL from the start of the
+    read (§8).
 
 The cost measurements (§13.4) found five more: a read-heavy database whose
 lease had lapsed never acquired it again (paying a validating GET per read

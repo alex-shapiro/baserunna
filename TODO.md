@@ -18,14 +18,14 @@ the design context for several of these.
 - [ ] **Test Google sign-in against real Google.** Only `FakeGoogle` has
       exercised it. Also add an OIDC `nonce` and PKCE (`code_verifier`) to
       the authorization-code flow. Today only `state` is used.
-- [ ] **Metrics.** Add a Prometheus-style `/metrics` endpoint: object-store
-      requests, bytes and errors by operation; commit latency and batch
-      size; CAS conflicts; lease acquisitions and steals; cache hit rate;
-      open DB handles; compaction and GC activity; forwarded requests; rate
-      limit refusals. Cost is a primary goal, so object-store request counts
-      matter most. `engine::Activity` already counts range tombstones,
-      segment drops and rewrites, levels objects, quota refusals and
-      expired entries and segments.
+- [ ] **Prometheus metrics.** Expose a `/metrics` endpoint in Prometheus
+      format that includes the histograms from `/v1/admin/metrics` along
+      with object-store byte counts, CAS conflicts, lease acquisitions and
+      steals, cache hit rates, open DB handles, compaction and GC activity,
+      forwarded requests, and rate-limit rejections.
+- [ ] **Publish release binaries and a container image.** Publish prebuilt
+      binaries and a container image so external test suites can run a local
+      node in CI.
 - [ ] **Check caches on bulk reads (`ReadMode::Bulk`).** Compaction and GC
       sweeps read segments in `ReadMode::Bulk` to avoid polluting the
       in-memory block cache on misses, but `MergeIter::peek` currently skips
@@ -33,6 +33,25 @@ the design context for several of these.
       straight to object storage. Checking the caches first (without
       populating them on misses) avoids re-fetching segments that the node
       already has locally, such as L0 segments it just flushed.
+
+## Performance
+
+- [ ] **Resolve ambiguous commits without waiting.** A client must currently
+      wait for the 15 s commit deadline to pass before calling
+      `GET /commits/{id}` (SPEC §6.2). Record the commit ID as aborted
+      during the status check's fencing manifest write so that late commit
+      attempts are rejected and the status check can return immediately.
+- [ ] **Reduce CPU usage per request.** Profiles at 340 commits/s on a
+      single core show hotspots in memory allocation, `serde_json` response
+      serialization, segment key comparisons, and manifest zstd compression.
+- [ ] **Replace the sharded LRU block cache with a CLOCK cache.** On a cache
+      hit, a thread currently acquires an exclusive shard lock to update the
+      LRU list. With a CLOCK eviction policy, cache hits can be served under a
+      shared lock.
+- [ ] **Tune the inline WAL tail limit.** Median commit latency on Tigris
+      increases from 36 ms with an empty tail to 84 ms with a full 256 KiB
+      tail. Lowering the tail limit reduces commit latency at the cost of
+      more frequent L0 flushes.
 
 ## Features
 

@@ -512,7 +512,7 @@ pub(super) struct DelayStore {
     manifest_put_conflicts: AtomicU32,
     manifest_put_outages: AtomicU32,
     /// Manifest writes that are applied, but whose reply is lost.
-    manifest_put_lost: AtomicU32,
+    pub(super) manifest_put_lost: AtomicU32,
     manifest_get_outages: AtomicU32,
     manifest_puts: AtomicU32,
     gets: Mutex<Vec<(String, bool)>>,
@@ -1168,9 +1168,10 @@ fn foreign_leases_block_commits_until_they_expire() {
 
 /// Node B commits a write whose response is delayed by `reply_delay_leases`
 /// lease durations while node A takes over the lease and commits its own write.
-fn commit_with_lost_reply_after_takeover(reply_delay_leases: u64) -> crate::error::Result<Seq> {
+fn commit_with_lost_reply_after_takeover(reply_delay_leases: u64, hedge_ms: u64) -> crate::error::Result<Seq> {
     rt().block_on(async {
-        let (node_b, store) = delayed_engine("b");
+        let cfg = EngineConfig { manifest_put_hedge_ms: hedge_ms, ..EngineConfig::small_for_tests() };
+        let (node_b, store) = delayed_engine_with("b", cfg);
         let db_b = opened(&node_b, "d").await;
         put(&db_b, "k", "b").await;
         let node_a = second_node(&node_b, &store, "a");
@@ -1192,7 +1193,7 @@ fn commit_with_lost_reply_after_takeover(reply_delay_leases: u64) -> crate::erro
 #[test]
 fn ambiguous_commit_during_active_lease() {
     // Node B retries while node A's lease is still active.
-    match commit_with_lost_reply_after_takeover(2) {
+    match commit_with_lost_reply_after_takeover(2, 0) {
         Err(Error::Unavailable { outcome_unknown: true, .. }) => {}
         other => panic!("expected unknown outcome for applied write, got {other:?}"),
     }
@@ -1201,9 +1202,17 @@ fn ambiguous_commit_during_active_lease() {
 #[test]
 fn ambiguous_commit_after_lease_expires() {
     // Node B retries after the store clock shows node A's lease has expired.
-    match commit_with_lost_reply_after_takeover(4) {
+    match commit_with_lost_reply_after_takeover(4, 0) {
         Ok(2) => {}
-        other => panic!("expected write to resolve at version 2, got {other:?}"),
+        other => panic!("expected version 2, got {other:?}"),
+    }
+}
+
+#[test]
+fn hedged_commit_resolves_before_a_takeover() {
+    match commit_with_lost_reply_after_takeover(2, 250) {
+        Ok(2) => {}
+        other => panic!("expected version 2, got {other:?}"),
     }
 }
 

@@ -27,6 +27,9 @@ use tokio::time::Instant;
 
 type J = axum::Json<Json>;
 
+pub(super) const TXN_ROUTE: &str = "/v1/dbs/{db}/transactions/{id}";
+pub(super) const COMMIT_ROUTE: &str = "/v1/dbs/{db}/transactions/{id}/commit";
+
 pub fn routes() -> Router<Arc<Node>> {
     Router::new()
         .route("/v1/dbs/{db}", get(get_db).delete(delete_db))
@@ -37,9 +40,9 @@ pub fn routes() -> Router<Arc<Node>> {
         .route("/v1/dbs/{db}/blobs/{blob_id}", get(get_blob))
         .route("/v1/dbs/{db}/txn", post(one_shot))
         .route("/v1/dbs/{db}/transactions", post(begin_txn))
-        .route("/v1/dbs/{db}/transactions/{id}", delete(abort_txn))
+        .route(TXN_ROUTE, delete(abort_txn))
         .route("/v1/dbs/{db}/transactions/{id}/ops", post(txn_ops))
-        .route("/v1/dbs/{db}/transactions/{id}/commit", post(commit_txn))
+        .route(COMMIT_ROUTE, post(commit_txn))
         .route("/v1/dbs/{db}/commits/{id}", get(commit_status))
         .route("/v1/dbs/{db}/tables", get(list_tables).post(create_table))
         .route("/v1/dbs/{db}/tables/{t}", get(get_table).delete(drop_table))
@@ -520,6 +523,8 @@ struct Begin {
     isolation: IsolationParam,
     #[serde(default)]
     encoding: Encoding,
+    #[serde(default)]
+    ops: Vec<Op>,
 }
 
 async fn begin_txn(
@@ -527,7 +532,11 @@ async fn begin_txn(
     Extension(ctx): Extension<DbCtx>,
     JsonBody(b): JsonBody<Begin>,
 ) -> Result<Response> {
-    let t = ctx.db.begin(b.isolation.into(), Consistency::Strong).await?;
+    let mut t = match b.isolation.into() {
+        crate::engine::Isolation::Serializable => ctx.db.begin_optimistic().await?,
+        iso => ctx.db.begin(iso, Consistency::Strong).await?,
+    };
+    let results = exec_ops(&op_ctx(&node, &ctx, b.encoding), &mut t, &b.ops).await?;
     let id = node.env.random_hex(16);
     let rv = t.read_version();
     let cid = t.commit_id;
@@ -549,6 +558,7 @@ async fn begin_txn(
             "read_version": rv,
             "expires_at": node.now_ms() + node.cfg.txn_max_ms,
             "idle_timeout_ms": node.cfg.txn_idle_ms,
+            "results": results,
         })),
     )
         .into_response())
@@ -605,24 +615,51 @@ async fn txn_ops(
     }
 }
 
-async fn commit_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct CommitBody {
+    #[serde(default)]
+    ops: Vec<Op>,
+}
+
+async fn commit_txn(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+    JsonBody(b): JsonBody<Option<CommitBody>>,
+) -> Result<J> {
     let id = param(&p, "id")?.to_string();
     let entry = get_open(&node, &ctx, &id)?;
     let mut g = entry.lock().await;
     if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
         return Err(Error::TxnNotFound);
     }
-    let t = g.txn.take().ok_or(Error::TxnNotFound)?;
+    let mut t = g.txn.take().ok_or(Error::TxnNotFound)?;
+    let enc = g.encoding;
     drop(g);
     remove_open(&node, &id);
+    let b = b.unwrap_or_default();
+    let mut results = exec_ops(&op_ctx(&node, &ctx, enc), &mut t, &b.ops).await?;
     if !t.is_read_only() {
         ctx.require_write()?;
     }
     let cid = t.commit_id;
+    if t.needs_revalidation(!t.is_read_only()) {
+        let Some(version) = ctx.db.revalidate(t).await? else {
+            return Err(Error::Conflict("transaction conflicts with a concurrent commit".into()));
+        };
+        return Ok(axum::Json(json!({
+            "version": version, "commit_id": commit_hex(cid), "appends": [], "results": results,
+        })));
+    }
     let mut creq = t.into_request();
     creq.deadline = Some(ctx.deadline);
     let c = ctx.db.commit_detailed(creq).await.map_err(|e| naming_commit(e, cid))?;
-    Ok(axum::Json(json!({"version": c.version, "commit_id": commit_hex(cid), "appends": first_seqs(&c)})))
+    let own_appends = b.ops.iter().filter(|o| matches!(o, Op::Append { .. })).count();
+    ops::fill_appends(&b.ops, &mut results, &c.appends[c.appends.len().saturating_sub(own_appends)..]);
+    Ok(axum::Json(json!({
+        "version": c.version, "commit_id": commit_hex(cid), "appends": first_seqs(&c), "results": results,
+    })))
 }
 
 async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {

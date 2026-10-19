@@ -90,6 +90,7 @@ activity! {
     optimistic_begins,
     /// Optimistic transactions re-executed after failing revalidation against a strong snapshot.
     optimistic_reruns,
+    manifest_puts_hedged,
 }
 
 /// State shared by every database handle on a node.
@@ -110,6 +111,7 @@ pub struct Shared {
     /// Databases exempt from size quota limits.
     quota_exempt: Mutex<std::collections::BTreeSet<String>>,
     pub counters: Counters,
+    pub metrics: Arc<crate::metrics::StoreMetrics>,
 }
 
 impl Shared {
@@ -258,8 +260,10 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(store: DynStore, env: Arc<Env>, cfg: EngineConfig, node_id: String) -> Arc<Engine> {
+        let metrics = Arc::new(crate::metrics::StoreMetrics::default());
         let shared = Arc::new(Shared {
-            store: Arc::new(crate::timing::TimedStore(store)),
+            store: Arc::new(crate::timing::TimedStore { inner: store, metrics: metrics.clone() }),
+            metrics,
             cache: cache::Cache::new(cfg.cache_bytes),
             compaction_slots: Semaphore::new(cfg.compaction_concurrency.max(1)),
             cfg,

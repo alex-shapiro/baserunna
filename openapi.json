@@ -133,6 +133,12 @@
           "read_version": {
             "type": "integer"
           },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/OpResult"
+            },
+            "type": "array"
+          },
           "txn_id": {
             "type": "string"
           }
@@ -142,12 +148,14 @@
           "commit_id",
           "read_version",
           "expires_at",
-          "idle_timeout_ms"
+          "idle_timeout_ms",
+          "results"
         ],
         "type": "object"
       },
       "BeginRequest": {
         "additionalProperties": false,
+        "description": "Optional operations to execute in the new transaction.",
         "properties": {
           "encoding": {
             "enum": [
@@ -162,6 +170,12 @@
               "snapshot"
             ],
             "type": "string"
+          },
+          "ops": {
+            "items": {
+              "$ref": "#/components/schemas/Op"
+            },
+            "type": "array"
           }
         },
         "required": [],
@@ -224,6 +238,20 @@
         ],
         "type": "string"
       },
+      "CommitRequest": {
+        "additionalProperties": false,
+        "description": "Optional operations to execute before the transaction is committed.",
+        "properties": {
+          "ops": {
+            "items": {
+              "$ref": "#/components/schemas/Op"
+            },
+            "type": "array"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
       "CommitStatus": {
         "additionalProperties": false,
         "properties": {
@@ -267,6 +295,12 @@
           },
           "commit_id": {
             "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/OpResult"
+            },
+            "type": "array"
           },
           "version": {
             "type": "integer"
@@ -1046,6 +1080,38 @@
           "email",
           "role",
           "added_at"
+        ],
+        "type": "object"
+      },
+      "Metrics": {
+        "additionalProperties": false,
+        "properties": {
+          "commits": {
+            "type": "object"
+          },
+          "cpu": {
+            "type": "object"
+          },
+          "lag": {
+            "type": "object"
+          },
+          "node": {
+            "type": "string"
+          },
+          "routes": {
+            "type": "object"
+          },
+          "store": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "node",
+          "store",
+          "commits",
+          "routes",
+          "lag",
+          "cpu"
         ],
         "type": "object"
       },
@@ -2684,6 +2750,51 @@
         "summary": "Liveness and node status",
         "tags": [
           "ops"
+        ]
+      }
+    },
+    "/v1/admin/metrics": {
+      "delete": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Metrics"
+                }
+              }
+            },
+            "description": "Metrics"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read and reset node latency metrics (admin)",
+        "tags": [
+          "admin"
+        ]
+      },
+      "get": {
+        "description": "Returns latency histograms for object-store operations, commit batches, HTTP routes, and scheduler lag, along with cumulative process CPU time and host steal time.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Metrics"
+                }
+              }
+            },
+            "description": "Metrics"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read node latency metrics (admin)",
+        "tags": [
+          "admin"
         ]
       }
     },
@@ -6011,6 +6122,7 @@
     },
     "/v1/dbs/{db}/transactions/{id}/commit": {
       "post": {
+        "description": "If any operation in `ops` fails, the transaction is aborted.",
         "parameters": [
           {
             "description": "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` (administrators).",
@@ -6031,6 +6143,16 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommitRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {

@@ -92,5 +92,16 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     expect(r.status == 200 || r.status == 403, "admin nodes")?;
     let r = c.call_retry("GET", "/v1/admin/users", None).await;
     expect(r.status == 200 || r.status == 403, "admin users")?;
+    let r = c.call_retry("DELETE", "/v1/admin/metrics", None).await;
+    if r.status == 200 {
+        expect(r.json["routes"].is_object() && r.json["store"].is_object(), format!("metrics: {}", r.json))?;
+        let again = c.call_retry("GET", "/v1/admin/metrics", None).await;
+        if again.json["node"] == r.json["node"] {
+            let txns = &again.json["routes"]["POST /v1/dbs/{db}/txn"];
+            expect(txns.is_null(), format!("metrics after a reset: {}", again.json))?;
+        }
+    } else {
+        expect(r.status == 403, format!("admin metrics: {} {}", r.status, r.json))?;
+    }
     Ok(())
 }

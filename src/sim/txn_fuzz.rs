@@ -448,6 +448,15 @@ struct BeginBody {
     isolation: Iso,
     #[serde(default)]
     encoding: Encoding,
+    #[serde(default)]
+    ops: Vec<Op>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct CommitBody {
+    #[serde(default)]
+    ops: Vec<Op>,
 }
 
 #[derive(Deserialize)]
@@ -2589,37 +2598,71 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// Executes `ops` against the model `t`. Returns `Ok(None)` if an operation failed and the
+    /// HTTP error response was already verified.
+    async fn exec_ops(
+        &mut self,
+        t: &mut TxnView,
+        enc: Encoding,
+        ops: &[Op],
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<Option<Vec<Out>>, String> {
+        let mut outs = Vec::new();
+        for (i, op) in ops.iter().enumerate() {
+            t.op_index = i;
+            match self.w.exec(t, enc, op) {
+                Ok(o) => outs.push(o),
+                Err(Fail::Unmodeled) => {
+                    self.lost = true;
+                    self.expect("POST", path, bytes.to_vec(), &Expect::Unchecked).await?;
+                    return Ok(None);
+                }
+                Err(f) => {
+                    let idx = (f == Fail::Precondition).then_some(i);
+                    self.expect("POST", path, bytes.to_vec(), &Expect::Err(f, idx)).await?;
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(outs))
+    }
+
     async fn begin(&mut self) -> Result<(), String> {
         let mut body = json!({});
         if self.u.chance(100) {
             body["isolation"] = json!(if self.u.chance(128) { "snapshot" } else { "serializable" });
         }
-        if self.u.chance(80) {
+        let enc = if self.u.chance(80) {
             body["encoding"] = json!("base64");
+            Encoding::Base64
+        } else {
+            Encoding::Utf8
+        };
+        if self.u.chance(3) {
+            body["ops"] = json!(self.with_gen(|g| g.ops(enc)));
         }
         if self.u.chance(10) {
             mutate(&mut self.u, &mut body, 0);
         }
         let bytes = self.body_bytes(&body);
         let path = self.path("/transactions");
-        let Some(b) = parse_body::<BeginBody>(&bytes) else {
+        let Some(b) = parse_body::<BeginBody>(&bytes).filter(|b| !b.ops.iter().any(Op::unparseable)) else {
             self.expect("POST", &path, bytes, &Expect::Any4xx).await?;
             return Ok(());
         };
-        let r = self.call("POST", &path, &[("content-type", "application/json")], bytes).await?;
-        let ok = r.status == 201
-            && r.json["read_version"] == self.w.version
-            && r.json["txn_id"].is_string()
-            && r.json["commit_id"].is_string();
-        if !ok {
-            return Err(format!(
-                "step {}: begin: expected 201 at version {}, got {} {}",
-                self.step, self.w.version, r.status, r.json
-            ));
-        }
+        let mut view = TxnView::new(self.w.snap.clone(), self.w.version);
+        let Some(outs) = self.exec_ops(&mut view, b.encoding, &b.ops, &path, &bytes).await? else {
+            return Ok(());
+        };
+        let results: Vec<Json> = outs.iter().map(|o| o.json.clone()).collect();
+        let want = json!({"txn_id": ANY, "commit_id": ANY, "read_version": self.w.version,
+            "expires_at": ANY_NUMBER, "idle_timeout_ms": ANY_NUMBER, "results": results});
+        let r = self.expect("POST", &path, bytes, &Expect::Ok(201, want)).await?;
+        self.learn_cursors(&outs, &r.json["results"]);
         self.txns.push(OpenTxn {
             id: r.json["txn_id"].as_str().unwrap_or_default().to_string(),
-            view: TxnView::new(self.w.snap.clone(), self.w.version),
+            view,
             iso: b.isolation,
             enc: b.encoding,
             alive: true,
@@ -2697,38 +2740,65 @@ impl<'a> Session<'a> {
     async fn commit(&mut self) -> Result<(), String> {
         let Some(ti) = self.pick_txn() else { return Ok(()) };
         let path = self.path(&format!("/transactions/{}/commit", self.txns[ti].id));
+        let enc = self.txns[ti].enc;
+        let mut body = json!({});
+        if self.u.chance(3) {
+            body["ops"] = json!(self.with_gen(|g| g.ops(enc)));
+        }
+        if self.u.chance(10) {
+            mutate(&mut self.u, &mut body, 0);
+        }
+        let bytes = self.body_bytes(&body);
+        let parsed =
+            if bytes.trim_ascii() == b"null" { Some(CommitBody::default()) } else { parse_body::<CommitBody>(&bytes) };
+        let Some(req) = parsed.filter(|b| !b.ops.iter().any(Op::unparseable)) else {
+            self.expect("POST", &path, bytes, &Expect::Any4xx).await?;
+            return Ok(());
+        };
         if !self.txns[ti].alive {
-            return self.call_txn_not_found("POST", &path, b"{}".to_vec()).await;
+            return self.call_txn_not_found("POST", &path, bytes).await;
         }
         self.txns[ti].alive = false;
-        let t = self.txns[ti].view.clone();
+        let mut t = self.txns[ti].view.clone();
         let iso = self.txns[ti].iso;
+        let Some(outs) = self.exec_ops(&mut t, enc, &req.ops, &path, &bytes).await? else {
+            return Ok(());
+        };
+        let mut results: Vec<Json> = outs.iter().map(|o| o.json.clone()).collect();
         if !t.is_write() {
-            let want = json!({"version": t.rv, "commit_id": ANY, "appends": []});
-            self.expect("POST", &path, b"{}".to_vec(), &Expect::Ok(200, want)).await?;
+            let want = json!({"version": t.rv, "commit_id": ANY, "appends": [], "results": results});
+            let r = self.expect("POST", &path, bytes, &Expect::Ok(200, want)).await?;
+            self.learn_cursors(&outs, &r.json["results"]);
             return Ok(());
         }
         let v = self.w.version + 1;
         let outcome = self.w.stream_outcome(&t);
-        let committed = json!({"version": v, "commit_id": ANY, "appends": outcome.clone().unwrap_or_default()});
+        let firsts = outcome.clone().unwrap_or_default();
+        let own = req.ops.iter().filter(|o| matches!(o, Op::Append { .. })).count();
+        let appended = req.ops.iter().zip(results.iter_mut()).filter(|(o, _)| matches!(o, Op::Append { .. }));
+        for ((_, r), f) in appended.zip(&firsts[firsts.len().saturating_sub(own)..]) {
+            r["first_seq"] = json!(f);
+        }
+        let committed = json!({"version": v, "commit_id": ANY, "appends": firsts, "results": results});
         match self.w.conflicts(&t, iso) {
             Some(false) => {
                 if let Err(i) = outcome {
                     let want = Expect::Err(Fail::Precondition, Some(i));
-                    self.expect("POST", &path, b"{}".to_vec(), &want).await?;
+                    self.expect("POST", &path, bytes, &want).await?;
                     return Ok(());
                 }
-                self.expect("POST", &path, b"{}".to_vec(), &Expect::Ok(200, committed)).await?;
+                let r = self.expect("POST", &path, bytes, &Expect::Ok(200, committed)).await?;
+                self.learn_cursors(&outs, &r.json["results"]);
             }
             Some(true) => {
-                let r = self.call("POST", &path, &[], b"{}".to_vec()).await?;
+                let r = self.call("POST", &path, &[], bytes).await?;
                 if r.status != 409 || r.json["error"]["code"] != "conflict" {
                     return Err(format!("step {}: commit should conflict, got {} {}", self.step, r.status, r.json));
                 }
                 return Ok(());
             }
             None => {
-                let r = self.call("POST", &path, &[], b"{}".to_vec()).await?;
+                let r = self.call("POST", &path, &[], bytes).await?;
                 if r.status == 409 && r.json["error"]["code"] == "conflict" {
                     return Ok(());
                 }

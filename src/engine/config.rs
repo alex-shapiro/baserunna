@@ -58,6 +58,8 @@ pub struct EngineConfig {
     pub commit_retention_ms: u64,
     pub compaction_concurrency: usize,
     pub commit_retry_max: u32,
+    /// Delay in milliseconds before sending a duplicate manifest `PUT` (SPEC §5.5), or 0 to disable hedging.
+    pub manifest_put_hedge_ms: u64,
     /// Maximum time a commit may wait in the committer before it is rejected.
     pub commit_timeout_ms: u64,
     pub commit_batch_max: usize,
@@ -118,6 +120,7 @@ impl Default for EngineConfig {
             version_sample_ms: 30_000,
             range_delete_points_max: 256,
             levels_inline_max: 16,
+            manifest_put_hedge_ms: 250,
             db_max_bytes: 0,
             quota_sweep_interval_ms: 60_000,
             stream_seal_min_bytes: 64 * 1024,

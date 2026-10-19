@@ -266,6 +266,15 @@ fn clone_parts(req: &Request) -> http::request::Builder {
 
 const BUFFER_FORWARD_MAX: u64 = 1024 * 1024;
 
+fn finishes_txn(req: &Request) -> bool {
+    let route = req.extensions().get::<MatchedPath>().map(MatchedPath::as_str);
+    match *req.method() {
+        http::Method::POST => route == Some(data::COMMIT_ROUTE),
+        http::Method::DELETE => route == Some(data::TXN_ROUTE),
+        _ => false,
+    }
+}
+
 /// Authenticates database-scoped requests and forwards them to the lease holder or handles them locally.
 async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
     let arrived = tokio::time::Instant::now();
@@ -273,7 +282,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         let deadline = request_deadline(&node, req.headers());
         let name = db_name_from_path(req.uri().path()).ok_or_else(|| Error::not_found("no such route"))?;
         let token = credential(req.headers()).ok_or_else(|| Error::Unauthenticated("missing credentials".into()))?;
-        let principal = node.authenticate(&token).await?;
+        let principal = node.authenticate_metered(&token, finishes_txn(&req)).await?;
         let (mut rec, mut access) = node.resolve_db(&principal, &name).await?;
         let hops = hops(req.headers());
         if hops < 2
@@ -394,7 +403,9 @@ fn hops(h: &HeaderMap) -> u32 {
     h.get(HOPS_HEADER).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
-/// Assigns an `x-request-id` header, runs the request in a scoped log context, and logs completion.
+const SERVER_TIMING_HEADER: &str = "server-timing";
+
+/// Assigns an `x-request-id` header, attaches `Server-Timing`, and logs request completion.
 async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
     let given = req.headers().get(REQUEST_ID_HEADER).filter(|v| v.to_str().is_ok_and(log::valid_request_id));
     let header = match given {
@@ -404,41 +415,50 @@ async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: 
     req.headers_mut().insert(REQUEST_ID_HEADER, header.clone());
     let rid = header.to_str().unwrap_or_default();
     let ctx = log::Context { node: node.id.as_str().into(), request_id: rid.into() };
-    let mut resp = log::scoped(ctx, async move {
-        if !log::enabled(log::Level::Info) {
-            return next.run(req).await;
+    let started = tokio::time::Instant::now();
+    let tally = Arc::new(timing::Tally::default());
+    let mut resp = log::scoped(ctx, {
+        let tally = tally.clone();
+        let node = node.clone();
+        async move {
+            let method = req.method().clone();
+            let route = req.extensions().get::<MatchedPath>().cloned();
+            let hops = hops(req.headers());
+            let resp = timing::scoped(tally.clone(), next.run(req)).await;
+            node.metrics.request(method.as_str(), route.as_ref().map(MatchedPath::as_str), started.elapsed());
+            if log::enabled(log::Level::Info) {
+                let mut fields = vec![
+                    ("method", json!(method.as_str())),
+                    ("route", json!(route.as_ref().map_or("unmatched", MatchedPath::as_str))),
+                    ("status", json!(resp.status().as_u16())),
+                    ("ms", json!(started.elapsed().as_millis() as u64)),
+                    ("hops", json!(hops)),
+                ];
+                if let Some(ForwardedTo(t)) = resp.extensions().get::<ForwardedTo>() {
+                    fields.push(("forwarded_to", json!(t)));
+                }
+                if let Some(store) = tally.store_json() {
+                    fields.push(("store_ms", json!(tally.store_ms())));
+                    fields.push(("store", store));
+                }
+                if let (n @ 1.., wait) = tally.commits() {
+                    fields.push(("commits", json!(n)));
+                    fields.push(("commit_ms", json!(wait)));
+                }
+                if tally.read_wait_ms() > 0 {
+                    fields.push(("read_wait_ms", json!(tally.read_wait_ms())));
+                }
+                log::event(log::Level::Info, "request", &fields);
+            }
+            resp
         }
-        let started = tokio::time::Instant::now();
-        let method = req.method().to_string();
-        let route = req.extensions().get::<MatchedPath>().map_or("unmatched", |m| m.as_str()).to_string();
-        let hops = hops(req.headers());
-        let tally = Arc::new(timing::Tally::default());
-        let resp = timing::scoped(tally.clone(), next.run(req)).await;
-        let mut fields = vec![
-            ("method", json!(method)),
-            ("route", json!(route)),
-            ("status", json!(resp.status().as_u16())),
-            ("ms", json!(started.elapsed().as_millis() as u64)),
-            ("hops", json!(hops)),
-        ];
-        if let Some(ForwardedTo(t)) = resp.extensions().get::<ForwardedTo>() {
-            fields.push(("forwarded_to", json!(t)));
-        }
-        if let Some(store) = tally.store_json() {
-            fields.push(("store_ms", json!(tally.store_ms())));
-            fields.push(("store", store));
-        }
-        if let (n @ 1.., wait) = tally.commits() {
-            fields.push(("commits", json!(n)));
-            fields.push(("commit_ms", json!(wait)));
-        }
-        if tally.read_wait_ms() > 0 {
-            fields.push(("read_wait_ms", json!(tally.read_wait_ms())));
-        }
-        log::event(log::Level::Info, "request", &fields);
-        resp
     })
     .await;
+    if !resp.headers().contains_key(SERVER_TIMING_HEADER)
+        && let Ok(v) = HeaderValue::from_str(&tally.server_timing(started.elapsed()))
+    {
+        resp.headers_mut().insert(SERVER_TIMING_HEADER, v);
+    }
     resp.headers_mut().insert(REQUEST_ID_HEADER, header);
     resp
 }
@@ -821,10 +841,41 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn only_routes_finishing_a_transaction_may_overdraw() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let app = axum::Router::new()
+                .route("/v1/dbs/{db}/transactions", post(|| async {}))
+                .route(data::TXN_ROUTE, axum::routing::delete(|| async {}))
+                .route("/v1/dbs/{db}/transactions/{id}/ops", post(|| async {}))
+                .route(data::COMMIT_ROUTE, post(|| async {}))
+                .route("/v1/dbs/{db}/kv/{*key}", axum::routing::delete(|| async {}))
+                .route_layer(middleware::from_fn(|req: Request, _: Next| async move {
+                    super::finishes_txn(&req).to_string().into_response()
+                }));
+            let finishes = |m: &str, p: &str| {
+                let app = app.clone();
+                let req = http::Request::builder().method(m).uri(p).body(Body::empty()).unwrap();
+                async move {
+                    let resp = app.oneshot(req).await.unwrap();
+                    let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+                    body.as_ref() == b"true"
+                }
+            };
+            assert!(finishes("POST", "/v1/dbs/app/transactions/abc/commit").await);
+            assert!(finishes("DELETE", "/v1/dbs/acme.app/transactions/abc").await);
+            assert!(!finishes("POST", "/v1/dbs/app/transactions").await);
+            assert!(!finishes("POST", "/v1/dbs/app/transactions/abc/ops").await);
+            assert!(!finishes("DELETE", "/v1/dbs/app/kv/transactions").await);
+            assert!(!finishes("POST", "/v1/dbs/app/transactions/x/y/z/commit").await);
+            assert!(!finishes("DELETE", "/v1/dbs/app/transactions/x/y").await);
+        });
+    }
+
+    #[test]
     fn unread_body_sets_connection_close() {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(async {
-            // Use constants so tests/openapi.rs does not treat these as public routes.
             const IGNORE: &str = "/ignore";
             const READ: &str = "/read";
             const FIRST_FRAME: &str = "/first-frame";

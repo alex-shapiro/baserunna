@@ -15,6 +15,7 @@ use super::{Shared, blob_prefix, levels_key, manifest_key, seg_key};
 use crate::error::{Error, Result};
 use crate::store::{GetOpts, PutMode, StoreError};
 use crate::timing::{self, StoreOp, Tally};
+use crate::util::{Either, race};
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
@@ -306,6 +307,13 @@ impl Db {
 
     fn holds_lease(&self, st: &State, m: &Manifest) -> bool {
         !self.own_lease_left(st, m).is_zero()
+    }
+
+    fn note_own_lease(&self, m: &Manifest, sent: Instant) {
+        if let Some(l) = m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
+            let margin = self.shared.cfg.lease_margin_ms.min(l.ms);
+            self.st().own_lease = Some((m.write_seq, sent + Duration::from_millis(l.ms - margin)));
+        }
     }
 
     /// Returns another node's lease in `v` and its remaining duration
@@ -678,8 +686,7 @@ impl Db {
             return Ok(None);
         }
         let snap = self.snapshot(Consistency::Strong).await?;
-        let req = t.into_request();
-        match validate(&req, &snap.version, &[], &[], snap.time_ms).await {
+        match validate(&t.into_request(), &snap.version, &[], &[], snap.time_ms).await {
             Ok(()) => Ok(Some(snap.version.m.version)),
             Err(Error::Conflict(_)) => {
                 self.shared.counters.add(&super::Activity { optimistic_reruns: 1, ..Default::default() });
@@ -818,6 +825,9 @@ impl Db {
                 queued.into_iter().map(|q| ((q.enqueued_at, q.request_id), q.work)).unzip();
             let txn_count = batch.iter().filter(|w| matches!(w, Work::Commit { .. })).count();
             timing::scoped(tally.clone(), self.process(batch)).await;
+            if tally.store_calls(super::ObjectClass::Manifest, StoreOp::Put) > 0 {
+                self.shared.metrics.commit_batch(started.elapsed(), txn_count);
+            }
             self.log_batch(&enqueued, txn_count, started, &tally);
         }
     }
@@ -861,6 +871,7 @@ impl Db {
     async fn process(self: &Arc<Self>, batch: Vec<Work>) {
         let cfg = self.shared.cfg.clone();
         let mut maybe_applied = false;
+        let mut unknown_writes: Vec<(u64, Instant)> = Vec::new();
         let mut attempt = 0u32;
         let mut base = match self.base_for_commit().await {
             Ok(v) => v,
@@ -918,8 +929,7 @@ impl Db {
             };
             let started = Instant::now();
             self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let res =
-                self.shared.store.put(&manifest_key(&self.id), m.encode(), PutMode::IfMatch(base.etag.clone())).await;
+            let res = self.put_manifest(m.encode(), &base.etag).await;
             if !res.is_ok() {
                 // Success clears the flag after installing (below).
                 if matches!(res, Err(StoreError::Unavailable(_))) {
@@ -929,11 +939,7 @@ impl Db {
             }
             match res {
                 Ok(etag) => {
-                    if let Some(l) = m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
-                        let until = attempt_started + Duration::from_millis(l.ms)
-                            - Duration::from_millis(cfg.lease_margin_ms.min(l.ms));
-                        self.st().own_lease = Some((m.write_seq, until));
-                    }
+                    self.note_own_lease(&m, attempt_started);
                     self.shared.counters.add(&plan.activity);
                     let v = Arc::new(Version::new(m, etag, self.shared.clone()));
                     let v = self.install(v, Some(started));
@@ -951,7 +957,12 @@ impl Db {
                 Err(StoreError::PreconditionFailed) => {}
                 Err(StoreError::Unavailable(_)) => {
                     maybe_applied = true;
+                    unknown_writes.push((m.write_seq, attempt_started));
                     self.st().trusted = false;
+                    // If the write was applied, `plan.gc` was removed from `obsolete` in the manifest.
+                    // These objects have already passed their grace period, so they can be deleted safely
+                    // even if the write failed.
+                    self.delete_obsolete(plan.gc);
                 }
                 Err(e) => {
                     let e: Error = e.into();
@@ -974,6 +985,10 @@ impl Db {
             loop {
                 match self.refresh(Instant::now(), false).await {
                     Ok(v) => {
+                        let sent = unknown_writes.iter().filter(|(ws, _)| *ws == v.m.write_seq).map(|(_, s)| *s).min();
+                        if let Some(sent) = sent {
+                            self.note_own_lease(&v.m, sent);
+                        }
                         base = v;
                         break;
                     }
@@ -988,6 +1003,43 @@ impl Db {
                     }
                 }
             }
+        }
+    }
+
+    /// Writes the manifest with `If-Match: etag`, sending a duplicate `PUT` if the first does not
+    /// complete within `manifest_put_hedge_ms`. If the duplicate fails with `PreconditionFailed`
+    /// while the first `PUT` is still in flight, returns `StoreError::Unavailable` immediately
+    /// because the first `PUT` may have been applied.
+    async fn put_manifest(&self, data: Bytes, etag: &str) -> crate::store::SResult<String> {
+        let key = manifest_key(&self.id);
+        let put = || self.shared.store.put(&key, data.clone(), PutMode::IfMatch(etag.to_string()));
+        let hedge_ms = self.shared.cfg.manifest_put_hedge_ms;
+        let mut first = put();
+        if hedge_ms == 0 {
+            return first.await;
+        }
+        if let Either::Left(r) =
+            race(&mut first, &mut Box::pin(tokio::time::sleep(Duration::from_millis(hedge_ms)))).await
+        {
+            return r;
+        }
+        self.shared.counters.add(&super::Activity { manifest_puts_hedged: 1, ..Default::default() });
+        let ambiguous =
+            || StoreError::Unavailable("hedged manifest write rejected; the first write may have been applied".into());
+        let mut hedge = put();
+        let (r, hedge_won) = match race(&mut first, &mut hedge).await {
+            Either::Left(r) => (r, false),
+            Either::Right(r) => (r, true),
+        };
+        let e = match r {
+            Ok(etag) => return Ok(etag),
+            Err(StoreError::PreconditionFailed) if hedge_won => return Err(ambiguous()),
+            Err(e) => e,
+        };
+        match (e, if hedge_won { first.await } else { hedge.await }) {
+            (_, Ok(etag)) => Ok(etag),
+            (StoreError::Unavailable(_), _) | (_, Err(StoreError::Unavailable(_))) => Err(ambiguous()),
+            (e, Err(_)) => Err(e),
         }
     }
 
@@ -1389,19 +1441,24 @@ impl Db {
         Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, activity, due })
     }
 
+    fn delete_obsolete(&self, gc: Vec<Obsolete>) {
+        if gc.is_empty() {
+            return;
+        }
+        let shared = self.shared.clone();
+        let db = self.id.clone();
+        self.shared.env.spawn(async move {
+            for o in gc {
+                if let Err(e) = delete_object(&shared, &db, &o).await {
+                    crate::warn!("gc delete {}/{} failed: {e}", db, o.id);
+                }
+            }
+        });
+    }
+
     fn after_commit(self: &Arc<Self>, v: &Arc<Version>, gc: Vec<Obsolete>, due: BTreeSet<u64>) {
         let cfg = &self.shared.cfg;
-        if !gc.is_empty() {
-            let shared = self.shared.clone();
-            let db = self.id.clone();
-            self.shared.env.spawn(async move {
-                for o in gc {
-                    if let Err(e) = delete_object(&shared, &db, &o).await {
-                        crate::warn!("gc delete {}/{} failed: {e}", db, o.id);
-                    }
-                }
-            });
-        }
+        self.delete_obsolete(gc);
         self.shared.refresh_clock();
         {
             let mut st = self.st();
@@ -1923,6 +1980,80 @@ mod tests {
             deep: Vec::new(),
             levels: None,
             tx,
+        }
+    }
+
+    use crate::store::{BoxFut, GetResult, ListPage, ObjectStore};
+
+    struct Scripted(std::sync::Mutex<VecDeque<(u64, crate::store::SResult<String>)>>);
+
+    impl ObjectStore for Scripted {
+        fn get<'a>(&'a self, _: &'a str, _: GetOpts) -> BoxFut<'a, crate::store::SResult<GetResult>> {
+            Box::pin(async { Err(StoreError::NotFound) })
+        }
+        fn put<'a>(&'a self, _: &'a str, _: Bytes, _: PutMode) -> BoxFut<'a, crate::store::SResult<String>> {
+            let (ms, r) = self.0.lock().unwrap().pop_front().expect("unexpected put");
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                r
+            })
+        }
+        fn delete<'a>(&'a self, _: &'a str) -> BoxFut<'a, crate::store::SResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn list<'a>(&'a self, _: &'a str, _: Option<&'a str>, _: usize) -> BoxFut<'a, crate::store::SResult<ListPage>> {
+            Box::pin(async { Ok(ListPage::default()) })
+        }
+    }
+
+    #[test]
+    fn a_write_found_applied_after_an_unknown_outcome_renews_the_lease() {
+        use crate::engine::tests::{delayed_engine_with, opened, put};
+        use std::sync::atomic::Ordering::SeqCst;
+        rt().block_on(async {
+            let cfg = EngineConfig { manifest_put_hedge_ms: 0, ..EngineConfig::small_for_tests() };
+            let (eng, store) = delayed_engine_with("a", cfg);
+            let db = opened(&eng, "d").await;
+            put(&db, "k", "1").await;
+            store.manifest_put_lost.store(1, SeqCst);
+            put(&db, "k", "2").await;
+            let cur = db.current().unwrap();
+            assert!(db.holds_lease(&db.st(), &cur.m));
+        });
+    }
+
+    #[test]
+    fn hedged_writes_are_definite_only_when_neither_copy_may_have_applied() {
+        use StoreError::{Fatal, PreconditionFailed as Refused, Unavailable};
+        let ok = || Ok::<_, StoreError>("e2".to_string());
+        let down = || Unavailable("timeout".into());
+        let fatal = || Fatal("403".into());
+        let cases = [
+            ((100, ok()), None, Ok(()), 100),
+            ((1_000, ok()), Some((10, Err(Refused))), Err(down()), 260),
+            ((300, Err(Refused)), Some((500, ok())), Ok(()), 750),
+            ((300, Err(down())), Some((100, Err(fatal()))), Err(down()), 350),
+            ((300, Err(Refused)), Some((200, Err(Refused))), Err(Refused), 450),
+            ((300, Err(fatal())), Some((100, Err(Refused))), Err(fatal()), 350),
+            ((1_000, Err(down())), Some((100, Err(fatal()))), Err(down()), 1_000),
+        ];
+        for (first, hedge, want, ms) in cases {
+            rt().block_on(async {
+                let script = Scripted(std::sync::Mutex::new(
+                    [Some(first.clone()), hedge.clone()].into_iter().flatten().collect(),
+                ));
+                let origin = tokio::time::Instant::now();
+                let env = Arc::new(crate::env::Env::sim(1, 1_700_000_000_000, origin, 0));
+                let cfg = EngineConfig { manifest_put_hedge_ms: 250, ..EngineConfig::small_for_tests() };
+                let eng = crate::engine::Engine::new(Arc::new(script), env, cfg, "n".into());
+                let got = eng.db("d").put_manifest(Bytes::from_static(b"m"), "e1").await.map(drop);
+                let case = format!("first {first:?}, hedge {hedge:?}");
+                match (&got, &want) {
+                    (Err(Unavailable(_)), Err(Unavailable(_))) => {}
+                    _ => assert_eq!(got, want, "{case}"),
+                }
+                assert_eq!(origin.elapsed().as_millis() as u64, ms, "{case}");
+            });
         }
     }
 

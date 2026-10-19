@@ -67,10 +67,6 @@ Use a `performance` machine for sustained load. A `shared-cpu-1x` machine
 serves ~3,900 cached GETs/s until its CPU credits are exhausted after a few
 minutes, then drops to ~300 GETs/s.
 
-Each manifest commit takes ~75 ms (~13 sequential writes/s). Concurrent
-writes are batched into a single commit, reaching a few hundred writes/s per
-database.
-
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) deploys
 every push to `main`, building on Fly's remote builder. It needs a
 `FLY_API_TOKEN` repository secret (`fly tokens create deploy --app

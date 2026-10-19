@@ -74,6 +74,7 @@ fn config() -> Result<(NodeConfig, String, String, Shutdown), String> {
     }
     cfg.engine.lease_ms = parse("BASERUNNA_LEASE_MS", 5_000u64)?;
     cfg.engine.read_lease_ms = 3 * cfg.engine.lease_ms;
+    cfg.engine.manifest_put_hedge_ms = parse("BASERUNNA_PUT_HEDGE_MS", 250u64)?;
     cfg.engine.db_max_bytes = parse("BASERUNNA_DB_MAX_MB", 10_240u64)? * 1024 * 1024;
     let l = &mut cfg.limits;
     l.user = Rate::per_sec(parse("BASERUNNA_USER_RPS", 500.0)?);
@@ -151,6 +152,15 @@ async fn run() -> Result<(), String> {
     let env = Arc::new(Env::real());
     let services = Services { transport, oidc, mailer };
     let node = Node::start(cfg, env.clone(), store, services).await.map_err(|e| format!("startup failed: {e}"))?;
+    let n = node.clone();
+    env.spawn(async move {
+        const PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
+        loop {
+            let started = tokio::time::Instant::now();
+            tokio::time::sleep(PERIOD).await;
+            n.metrics.lag(started.elapsed().saturating_sub(PERIOD));
+        }
+    });
     baserunna::log::set_process_node(&node.id);
     let app = baserunna::api::router(node.clone());
     let listener =
@@ -172,6 +182,9 @@ async fn run() -> Result<(), String> {
             std::process::exit(0);
         });
     };
+    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(stopping)
         .await

@@ -219,6 +219,7 @@ pub struct Node {
     pub started_ms: u64,
     router: OnceLock<axum::Router>,
     pub limiter: Limiter,
+    pub metrics: crate::metrics::ServerMetrics,
     hash_slots: tokio::sync::Semaphore,
     draining: std::sync::atomic::AtomicBool,
 }
@@ -264,6 +265,7 @@ impl Node {
             forwards: cluster::ForwardDedup::new(Duration::from_secs(60)),
             router: OnceLock::new(),
             limiter: Limiter::default(),
+            metrics: Default::default(),
             hash_slots: tokio::sync::Semaphore::new(cfg.limits.hash_concurrency.max(1)),
             draining: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -397,12 +399,13 @@ impl Node {
         lock(&self.members).clone()
     }
 
-    /// Returns non-suspect cluster members with a recent heartbeat.
+    /// Returns non-suspect cluster members with a recent heartbeat, excluding any previous
+    /// member entry that shares this node's address.
     pub fn live_members(&self) -> Vec<NodeRecord> {
         let now = self.now_ms() as i64;
         cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
             .into_iter()
-            .filter(|n| n.id == self.id || !self.is_suspect(&n.id))
+            .filter(|n| n.id == self.id || (!self.is_suspect(&n.id) && n.addr != self.cfg.addr))
             .collect()
     }
 
@@ -469,6 +472,10 @@ impl Node {
             return None;
         }
         let addr = self.addr_of(&target)?;
+        // Do not forward to a previous process that ran at this node's address.
+        if addr == self.cfg.addr {
+            return None;
+        }
         Some((target, addr))
     }
 
@@ -598,15 +605,25 @@ impl Node {
 
     /// Authenticates a bearer token or session cookie value and checks rate limits.
     pub async fn authenticate(&self, token: &str) -> Result<Principal> {
+        self.authenticate_metered(token, false).await
+    }
+
+    /// Authenticates `token` and checks rate limits, using [`Limiter::borrow`] when `may_borrow` is true.
+    pub async fn authenticate_metered(&self, token: &str, may_borrow: bool) -> Result<Principal> {
         let p = self.principal(token).await?;
         let user_key = format!("user:{}", p.user.id);
         let lim = &self.cfg.limits;
-        match &p.cred {
+        let key;
+        let keys: &[(&str, Rate)] = match &p.cred {
             Credential::ApiKey { id, rate_limit, .. } => {
-                let key_rate = rate_limit.map_or(lim.api_key, |r| Rate::per_sec(r as f64));
-                self.limiter.take(&[(&format!("key:{id}"), key_rate), (&user_key, lim.user)], "requests")?;
+                key = format!("key:{id}");
+                &[(&key, rate_limit.map_or(lim.api_key, |r| Rate::per_sec(r as f64))), (&user_key, lim.user)]
             }
-            Credential::Session { .. } => self.limiter.take(&[(&user_key, lim.user)], "requests")?,
+            Credential::Session { .. } => &[(&user_key, lim.user)],
+        };
+        match may_borrow {
+            true => self.limiter.borrow(keys, "requests")?,
+            false => self.limiter.take(keys, "requests")?,
         }
         Ok(p)
     }
@@ -616,6 +633,7 @@ impl Node {
         if let Some(p) = self.auth_cache.get(&cache_key) {
             return Ok(p);
         }
+        let read_at = Instant::now();
         let p = match self.lookup_principal(token, &cache_key, false).await {
             Err(Error::Unauthenticated(_)) => self.lookup_principal(token, &cache_key, true).await?,
             other => other?,
@@ -623,7 +641,7 @@ impl Node {
         if p.user.disabled {
             return Err(Error::PermissionDenied("this account is disabled".into()));
         }
-        self.auth_cache.store(cache_key, Some(p.clone()));
+        self.auth_cache.store(cache_key, Some(p.clone()), read_at);
         Ok(p)
     }
 
@@ -1071,9 +1089,10 @@ impl Node {
         if !strong && let Some(r) = self.role_cache.get(&key) {
             return Ok(Some(r));
         }
+        let read_at = Instant::now();
         let mut t = self.sys_read_at(strong).await?;
         let role = meta::member_role(&mut t, owner_id, &user.id).await?;
-        self.role_cache.store(key, role);
+        self.role_cache.store(key, role, read_at);
         Ok(role)
     }
 
@@ -1086,9 +1105,10 @@ impl Node {
         if !strong && let Some(rec) = self.name_cache.get(&key) {
             return Ok(Some(rec));
         }
+        let read_at = Instant::now();
         let mut t = self.sys_read_at(strong).await?;
         let rec = meta::resolve_db(&mut t, owner_id, name).await?;
-        self.name_cache.store(key, rec.clone());
+        self.name_cache.store(key, rec.clone(), read_at);
         Ok(rec)
     }
 
@@ -1096,9 +1116,10 @@ impl Node {
         if !strong && let Some(o) = self.org_cache.get(&name.to_string()) {
             return Ok(Some(o));
         }
+        let read_at = Instant::now();
         let mut t = self.sys_read_at(strong).await?;
         let o = meta::org_by_name(&mut t, name).await?;
-        self.org_cache.store(name.to_string(), o.clone());
+        self.org_cache.store(name.to_string(), o.clone(), read_at);
         Ok(o)
     }
 
@@ -1250,6 +1271,29 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(n.cfg.limits.hash_wait_ms / 2)).await;
             drop(held);
             assert!(waiting.await.unwrap().unwrap().starts_with("pbkdf2-sha256$"), "a slot freed in time");
+        });
+    }
+
+    #[test]
+    fn earlier_runs_at_this_address_are_not_routed_to() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let a = w.node(0).clone();
+            let ghost = super::NodeRecord {
+                id: "earlier-run".into(),
+                addr: a.cfg.addr.clone(),
+                started_at: 1,
+                heartbeat_at: a.now_ms() as i64,
+            };
+            a.run_meta(super::MetaCmd::Heartbeat { node: ghost.clone(), dead_after_ms: 3_600_000 }).await.unwrap();
+            a.refresh_members().await.unwrap();
+            assert!(a.members().iter().any(|m| m.id == ghost.id));
+            assert!(a.live_members().iter().all(|m| m.id != ghost.id));
+            let both = [a.members().into_iter().find(|m| m.id == a.id).unwrap(), ghost];
+            let homed = (0..)
+                .map(|i| format!("db{i}"))
+                .find(|d| super::cluster::rendezvous(d, &both).unwrap().id == "earlier-run");
+            assert_eq!(a.route(&homed.unwrap()).await, None);
         });
     }
 

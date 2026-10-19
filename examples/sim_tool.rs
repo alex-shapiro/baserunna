@@ -24,6 +24,29 @@ fn run_one(name: &str, seed: u64, branches: &str, keep_log: bool) -> (SimOutcome
     (out, log)
 }
 
+/// Groups failures by their message with digits blanked, so that
+/// repeats of one failure count once.
+fn distinct_failures<'a>(errors: impl Iterator<Item = &'a str>) -> Vec<(usize, String)> {
+    let mut by: std::collections::BTreeMap<String, usize> = Default::default();
+    for e in errors {
+        let first = e.lines().next().unwrap_or("");
+        let shape: String = first.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+        *by.entry(shape.chars().take(160).collect()).or_default() += 1;
+    }
+    let mut v: Vec<(usize, String)> = by.into_iter().map(|(k, n)| (n, k)).collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v
+}
+
+fn print_distinct(failures: Vec<(usize, String)>) {
+    if !failures.is_empty() {
+        println!("{} distinct failures:", failures.len());
+        for (n, f) in failures {
+            println!("  {n:>4} x {f}");
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
@@ -69,6 +92,7 @@ fn main() {
                 unreached.len(),
                 if unreached.len() <= 10 { format!(": {}", unreached.join(" ")) } else { String::new() }
             );
+            print_distinct(distinct_failures(report.failures.iter().map(|f| f.error.as_str())));
             // SIM_REQUIRE_PROBES makes a campaign that missed a probe fail.
             let missed = std::env::var("SIM_REQUIRE_PROBES").is_ok_and(|v| !v.is_empty()) && !unreached.is_empty();
             std::process::exit(if report.failures.is_empty() && !missed { 0 } else { 1 });
@@ -105,6 +129,7 @@ fn main() {
                 report.corpus,
                 report.failures.len()
             );
+            print_distinct(distinct_failures(report.failures.iter().map(|(_, e)| e.as_str())));
             if std::env::var("SIM_COMPARE").is_ok() {
                 // The same number of runs as a plain campaign, from the same seeds.
                 let mut plain = Budget::runs(report.runs);

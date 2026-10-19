@@ -4,6 +4,7 @@ pub mod amp;
 pub mod campaign;
 pub mod client;
 pub mod cost;
+pub mod explore;
 pub mod google;
 pub mod mail;
 pub mod openapi_check;
@@ -175,6 +176,11 @@ pub struct SimConfig {
     /// How often a node's task yields before a poll, varying the order of
     /// tasks that are ready together.
     pub reorder: f64,
+    pub disk: DiskFaults,
+    /// Branch points of this run: `(virtual ms, salt)`, sorted (see
+    /// [`crate::util::rng::branch`]). A run with branch points repeats the
+    /// unbranched run up to the first, then explores another future.
+    pub branches: Vec<(u64, u64)>,
 }
 
 impl SimConfig {
@@ -243,6 +249,8 @@ impl SimConfig {
             buggify: 0.0,
             crash_points: false,
             reorder: 0.0,
+            disk: DiskFaults { bytes: 64 * 1024, ..DiskFaults::default() },
+            branches: Vec::new(),
         }
     }
 
@@ -294,7 +302,9 @@ pub struct Sim {
     pub google: Arc<google::FakeGoogle>,
     pub mailbox: Arc<mail::Mailbox>,
     slots: Vec<Mutex<Option<Arc<SimNode>>>>,
-    disks: Vec<LocalTier>,
+    /// Held while node `i` starts, so that concurrent starts yield one process.
+    starting: Vec<tokio::sync::Mutex<()>>,
+    disks: Vec<Option<LocalTier>>,
     partitions: Mutex<BTreeSet<(usize, usize)>>,
     store_isolated: Mutex<BTreeSet<usize>>,
     origin: Instant,
@@ -338,7 +348,61 @@ fn take_panic() -> Option<String> {
     PANIC.with(|p| p.borrow_mut().take())
 }
 
-const LOCAL_TIER_BYTES: u64 = 64 * 1024;
+/// A node's local disk: its cache tier, which outlives the node's crashes,
+/// and loses or corrupts entries at the rates of [`DiskFaults`].
+struct SimDisk {
+    inner: MemLocal,
+    rng: Mutex<Rng>,
+    faults: DiskFaults,
+    trace: Arc<Trace>,
+}
+
+/// Faults of nodes' local disks.
+#[derive(Clone, Debug, Default)]
+pub struct DiskFaults {
+    /// Bytes each node's local cache tier holds, or 0 for no tier.
+    pub bytes: u64,
+    /// Probability that a read finds its entry gone.
+    pub p_lose: f64,
+    /// Probability that a write never reaches the disk.
+    pub p_drop_write: f64,
+    /// Probability that a read returns its entry with one bit flipped.
+    pub p_corrupt: f64,
+}
+
+impl crate::engine::local::LocalStore for SimDisk {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, Option<Bytes>> {
+        Box::pin(async move {
+            let got = self.inner.get(key).await?;
+            let mut r = self.rng.lock().unwrap_or_else(|e| e.into_inner());
+            if r.chance(self.faults.p_lose) {
+                self.trace.event(&format!("disk lost {key}"));
+                return None;
+            }
+            if !got.is_empty() && r.chance(self.faults.p_corrupt) {
+                self.trace.event(&format!("disk corrupted {key}"));
+                let mut b = got.to_vec();
+                let i = r.usize(b.len());
+                b[i] ^= 1 << r.below(8);
+                return Some(Bytes::from(b));
+            }
+            Some(got)
+        })
+    }
+
+    fn put<'a>(&'a self, key: &'a str, data: Bytes) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            if self.rng.lock().unwrap_or_else(|e| e.into_inner()).chance(self.faults.p_drop_write) {
+                return;
+            }
+            self.inner.put(key, data).await
+        })
+    }
+
+    fn stats(&self) -> crate::engine::local::LocalStats {
+        self.inner.stats()
+    }
+}
 
 /// Least virtual time between two crashes at crash points.
 const POINT_CRASH_SPACING_MS: u64 = 30_000;
@@ -498,6 +562,14 @@ impl Sim {
             base_ms + Instant::now().saturating_duration_since(clock_origin).as_millis() as u64
         })));
         let n = cfg.nodes;
+        let disks = (0..n)
+            .map(|_| {
+                let d = cfg.disk.clone();
+                let rng = Mutex::new(root.fork());
+                let disk = SimDisk { inner: MemLocal::new(d.bytes), rng, faults: d, trace: trace.clone() };
+                (cfg.disk.bytes > 0).then(|| LocalTier(Arc::new(disk)))
+            })
+            .collect();
         let sim = Arc::new_cyclic(|me| Sim {
             seed,
             rng: Mutex::new(root.fork()),
@@ -507,7 +579,8 @@ impl Sim {
             google,
             mailbox: Arc::new(mail::Mailbox::default()),
             slots: (0..n).map(|_| Mutex::new(None)).collect(),
-            disks: (0..n).map(|_| LocalTier(Arc::new(MemLocal::new(LOCAL_TIER_BYTES)))).collect(),
+            starting: (0..n).map(|_| tokio::sync::Mutex::new(())).collect(),
+            disks,
             partitions: Mutex::new(BTreeSet::new()),
             store_isolated: Mutex::new(BTreeSet::new()),
             origin,
@@ -557,8 +630,12 @@ impl Sim {
         (0..self.slots.len()).filter(|i| self.node(*i).is_some()).collect()
     }
 
-    /// Starts or restarts node `i`.
+    /// Starts node `i` unless it is up.
     pub async fn start(&self, i: usize) {
+        let _starting = self.starting[i].lock().await;
+        if self.node(i).is_some() {
+            return;
+        }
         self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).remove(&i);
         let n = self.starts.fetch_add(1, Ordering::SeqCst);
         let skew = if self.cfg.max_skew_ms == 0 {
@@ -571,7 +648,7 @@ impl Sim {
         cfg.addr = addr_of(i);
         cfg.public_url = "https://baserunna.test".into();
         cfg.engine = self.cfg.engine.clone();
-        cfg.engine.local_tier = Some(self.disks[i].clone());
+        cfg.engine.local_tier = self.disks[i].clone();
         for attempt in 0..50u64 {
             let env = Arc::new(Env::sim(self.seed ^ (n * 7919 + attempt + 1), self.base_ms, self.origin, skew));
             let me = self.me.clone();
@@ -866,7 +943,6 @@ where
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
     let full_trace = cfg.full_trace;
-    crate::probe::record();
     let b = crate::buggify::Config {
         p_active: cfg.buggify,
         faults: cfg.chaos.enabled,
@@ -874,8 +950,14 @@ where
         p_reorder: cfg.reorder,
     };
     crate::buggify::enable(seed ^ 0xb066_1f1e, b);
+    let branches = cfg.branches.clone();
     let out = rt.block_on(async move {
+        // Probes' first hits and branch points are in virtual time from here.
+        crate::probe::record();
         let start = Instant::now();
+        crate::util::rng::branch(
+            branches.iter().map(|(ms, salt)| (start + Duration::from_millis(*ms), *salt)).collect(),
+        );
         let sim = Sim::new(seed, cfg).await;
         // A violation ends the run at once: what follows it only obscures it.
         let mut oracles = sim.spawn_oracles();
@@ -936,6 +1018,7 @@ where
             trace_tail,
         }
     });
+    crate::util::rng::branch(Vec::new());
     SimOutcome { probes: crate::probe::finish(), buggify: crate::buggify::disable(), ..out }
 }
 

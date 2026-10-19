@@ -3,17 +3,20 @@
 //! ```text
 //! cargo run --release --example sim_tool -- list
 //! cargo run --release --example sim_tool -- campaign <scenario|all> <seeds> [first_seed]   # SIM_THREADS, SIM_MINUTES, SIM_COVERAGE=1
-//! cargo run --release --example sim_tool -- trace <scenario> <seed>      # full trace
+//! cargo run --release --example sim_tool -- explore <scenario|all> [first_seed]          # SIM_RUNS, SIM_MINUTES, SIM_COMPARE=1
+//! cargo run --release --example sim_tool -- trace <scenario> <seed> [branches]      # full trace
 //! cargo run --release --example sim_tool -- determinism <scenario> <seed>
 //! ```
 
 use baserunna::sim::campaign::{campaign, default_threads};
+use baserunna::sim::explore::{Budget, explore, parse_branches};
 use baserunna::sim::workloads::{scenario, scenarios};
 use baserunna::sim::{SimOutcome, run};
 
-fn run_one(name: &str, seed: u64, keep_log: bool) -> (SimOutcome, Vec<String>) {
+fn run_one(name: &str, seed: u64, branches: &str, keep_log: bool) -> (SimOutcome, Vec<String>) {
     let s = scenario(name).unwrap_or_else(|| panic!("unknown scenario {name}"));
     let mut cfg = s.config_for(seed);
+    cfg.branches = parse_branches(branches).unwrap_or_else(|| panic!("bad branch points {branches}"));
     cfg.keep_log = keep_log;
     cfg.full_trace = keep_log;
     let out = run(seed, cfg, s.run);
@@ -66,11 +69,80 @@ fn main() {
                 unreached.len(),
                 if unreached.len() <= 10 { format!(": {}", unreached.join(" ")) } else { String::new() }
             );
+            // SIM_REQUIRE_PROBES makes a campaign that missed a probe fail.
+            let missed = std::env::var("SIM_REQUIRE_PROBES").is_ok_and(|v| !v.is_empty()) && !unreached.is_empty();
+            std::process::exit(if report.failures.is_empty() && !missed { 0 } else { 1 });
+        }
+        "explore" => {
+            let all = scenarios();
+            let chosen: Vec<_> = all.into_iter().filter(|s| arg(1) == "all" || s.name == arg(1)).collect();
+            if chosen.is_empty() {
+                panic!("unknown scenario {}", arg(1));
+            }
+            let first: u64 = arg(2).parse().unwrap_or(1);
+            let runs: u64 = std::env::var("SIM_RUNS").ok().and_then(|r| r.parse().ok()).unwrap_or(u64::MAX);
+            let t = std::time::Instant::now();
+            let mut budget = Budget::runs(runs);
+            budget.threads =
+                std::env::var("SIM_THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or_else(default_threads);
+            budget.deadline = std::env::var("SIM_MINUTES")
+                .ok()
+                .and_then(|m| m.parse::<u64>().ok())
+                .map(|m| t + std::time::Duration::from_secs(60 * m));
+            let report = explore(&chosen, first, &budget, |job, out| {
+                if let Err(e) = &out.result {
+                    println!("FAIL {}: {e}", job.args(&chosen));
+                    println!("  reproduce: cargo run --release --example sim_tool -- trace {}", job.args(&chosen));
+                }
+            });
+            println!(
+                "explored {} runs ({} branched) in {:?}: {} features, {} probes, corpus {}, {} failed",
+                report.runs,
+                report.branched,
+                t.elapsed(),
+                report.features.len(),
+                report.probes().len(),
+                report.corpus,
+                report.failures.len()
+            );
+            if std::env::var("SIM_COMPARE").is_ok() {
+                // The same number of runs as a plain campaign, from the same seeds.
+                let mut plain = Budget::runs(report.runs);
+                plain.threads = budget.threads;
+                plain.fresh = 1.0;
+                let base = explore(&chosen, first, &plain, |_, _| {});
+                println!(
+                    "a campaign of {} runs: {} features, {} probes, {} failed",
+                    base.runs,
+                    base.features.len(),
+                    base.probes().len(),
+                    base.failures.len()
+                );
+                let only: Vec<String> = report
+                    .features
+                    .keys()
+                    .filter(|f| !base.features.contains_key(f))
+                    .map(|(p, b)| format!("{}#{b}", p.name()))
+                    .collect();
+                println!("features only exploration reached: {}", only.join(" "));
+                // How often each method put a run into the situations a plain
+                // campaign rarely reaches.
+                let rare: Vec<String> = baserunna::probe::Probe::ALL
+                    .iter()
+                    .filter(|p| base.share(**p) < 0.05)
+                    .map(|p| {
+                        let n =
+                            |r: &baserunna::sim::explore::Report| r.runs_hitting.get(*p as usize).copied().unwrap_or(0);
+                        format!("{} {}/{}", p.name(), n(&report), n(&base))
+                    })
+                    .collect();
+                println!("runs reaching rare probes (exploration/campaign): {}", rare.join(", "));
+            }
             std::process::exit(if report.failures.is_empty() { 0 } else { 1 });
         }
         "trace" => {
             let seed = arg(2).parse().unwrap_or(1);
-            let (o, log) = run_one(&arg(1), seed, true);
+            let (o, log) = run_one(&arg(1), seed, &arg(3), true);
             for l in log {
                 println!("{l}");
             }
@@ -80,8 +152,8 @@ fn main() {
         }
         "determinism" => {
             let seed = arg(2).parse().unwrap_or(1);
-            let (_, a) = run_one(&arg(1), seed, true);
-            let (_, b) = run_one(&arg(1), seed, true);
+            let (_, a) = run_one(&arg(1), seed, &arg(3), true);
+            let (_, b) = run_one(&arg(1), seed, &arg(3), true);
             match a.iter().zip(&b).position(|(x, y)| x != y) {
                 None if a.len() == b.len() => println!("deterministic ({} events)", a.len()),
                 None => println!("traces differ in length: {} vs {}", a.len(), b.len()),
@@ -94,7 +166,7 @@ fn main() {
             }
         }
         _ => eprintln!(
-            "usage: sim_tool list | campaign <scenario|all> <seeds> [first] | trace <scenario> <seed> | determinism <scenario> <seed>"
+            "usage: sim_tool list | campaign <scenario|all> <seeds> [first] | explore <scenario|all> [first] | trace <scenario> <seed> [branches] | determinism <scenario> <seed> [branches]"
         ),
     }
 }

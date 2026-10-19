@@ -177,6 +177,31 @@ probes! {
     PasswordResetFinished,
 }
 
+impl Probe {
+    /// Probes that only long campaigns reach, in a few runs of a thousand:
+    /// the coverage test does not require them, but a nightly campaign
+    /// that misses any fails.
+    pub const RARE: &[Probe] = &[
+        Probe::CommitRetriesExhausted,
+        Probe::StaleVersionIgnored,
+        Probe::QuotaRefused,
+        Probe::StagedBlobUnbindable,
+        Probe::TailSealedInPlace,
+        Probe::SegmentDropped,
+        Probe::CompactionMoved,
+        Probe::CompactionLostLease,
+        Probe::CompactionOutlivedOrphanGrace,
+        Probe::SegmentCollectedUnderRead,
+        Probe::BlobPinnedAtCollection,
+        Probe::RetentionTrimLeftToOwner,
+        Probe::ForwardDuplicateUnknown,
+        Probe::MembersRefreshedForUnknownPeer,
+        Probe::DeletionRepaired,
+        Probe::NameResolvedAgain,
+        Probe::PreconditionExplainedByReplay,
+    ];
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Hits {
     /// Hit counts, indexed like [`Probe::ALL`].

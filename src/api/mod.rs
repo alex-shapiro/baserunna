@@ -432,7 +432,8 @@ async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: 
             let method = req.method().clone();
             let route = req.extensions().get::<MatchedPath>().cloned();
             let hops = hops(req.headers());
-            let resp = timing::scoped(tally.clone(), next.run(req)).await;
+            let deadline = request_deadline(&node, req.headers());
+            let resp = crate::node::with_deadline(deadline, timing::scoped(tally.clone(), next.run(req))).await;
             node.metrics.request(method.as_str(), route.as_ref().map(MatchedPath::as_str), started.elapsed());
             if log::enabled(log::Level::Info) {
                 let mut fields = vec![

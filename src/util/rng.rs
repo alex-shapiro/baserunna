@@ -1,4 +1,34 @@
 //! Deterministic xoshiro256** PRNG seeded via SplitMix64.
+//!
+//! A simulation can branch every generator on its thread at chosen virtual
+//! times ([`branch`]): draws before the first branch point are those of the
+//! unbranched run, and draws after it differ.
+
+use std::cell::RefCell;
+use tokio::time::Instant;
+
+thread_local! {
+    /// Branch points of the running simulation: from each instant on, draws
+    /// are mixed with its salt.
+    static BRANCHES: RefCell<Vec<(Instant, u64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Branches every generator on this thread at each `(instant, salt)`
+/// (sorted by instant), or stops branching if `points` is empty.
+pub fn branch(points: Vec<(Instant, u64)>) {
+    BRANCHES.with(|b| *b.borrow_mut() = points);
+}
+
+fn branch_salt() -> u64 {
+    BRANCHES.with(|b| {
+        let b = b.borrow();
+        if b.is_empty() {
+            return 0;
+        }
+        let now = Instant::now();
+        b.iter().take_while(|(at, _)| *at <= now).fold(0, |acc, (_, salt)| acc ^ salt)
+    })
+}
 
 #[derive(Clone, Debug)]
 pub struct Rng {
@@ -34,7 +64,13 @@ impl Rng {
         self.s[0] ^= self.s[3];
         self.s[2] ^= t;
         self.s[3] = self.s[3].rotate_left(45);
-        result
+        match branch_salt() {
+            0 => result,
+            salt => {
+                let mut x = result ^ salt;
+                splitmix64(&mut x)
+            }
+        }
     }
 
     pub fn next_u32(&mut self) -> u32 {

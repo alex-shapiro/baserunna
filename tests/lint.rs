@@ -29,7 +29,11 @@ const RULES: &[(&str, &[&str], &str)] = &[
         &["src/env.rs", "src/store/", "src/main.rs", "src/log.rs"],
         "wall time comes from Env::now_ms (log timestamps aside)",
     ),
-    ("std::time::Instant", &["src/auth.rs"], "use tokio::time::Instant (virtual in simulation)"),
+    (
+        "std::time::Instant",
+        &["src/auth.rs", "src/sim/campaign.rs", "src/sim/explore.rs"],
+        "use tokio::time::Instant (virtual in simulation); campaigns budget wall time",
+    ),
     ("aws_lc_rs::rand", &["src/env.rs", "src/store/fs.rs", "src/sim/google.rs"], "randomness comes from Env"),
     ("thread_rng", &[], "randomness comes from Env"),
 ];

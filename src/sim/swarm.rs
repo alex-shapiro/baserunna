@@ -7,7 +7,7 @@
 //! knob leaves every other knob's draw unchanged.
 
 use super::store::StoreFaults;
-use super::{ChaosFaults, NetFaults, SimConfig};
+use super::{ChaosFaults, DiskFaults, NetFaults, SimConfig};
 use crate::engine::segment::Compression;
 use crate::util::rng::Rng;
 use std::collections::BTreeMap;
@@ -193,6 +193,12 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
     c.buggify = k.pick("buggify.p_active", &[0.0, 0.1, 0.25, 0.5]);
     c.crash_points = c.chaos.enabled && k.chance("buggify.crash_points", 0.5);
     c.reorder = k.pick("sched.reorder", &[0.0, 0.05, 0.2, 0.5]);
+    c.disk = DiskFaults {
+        bytes: k.pick("disk.bytes", &[0, 4 * 1024, 64 * 1024, 1024 * 1024]),
+        p_lose: if p.faults { k.rate("disk.p_lose", 0.02) } else { 0.0 },
+        p_drop_write: if p.faults { k.rate("disk.p_drop_write", 0.02) } else { 0.0 },
+        p_corrupt: if p.faults { k.rate("disk.p_corrupt", 0.002) } else { 0.0 },
+    };
     c
 }
 

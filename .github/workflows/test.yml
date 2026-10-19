@@ -36,6 +36,8 @@ jobs:
           # Ten minutes on pull requests and pushes, hours at night.
           SIM_MINUTES: ${{ github.event_name == 'schedule' && '300' || github.event.inputs.minutes || '10' }}
           SIM_COVERAGE: "1"
+          # The nightly campaign must also reach the rare probes.
+          SIM_REQUIRE_PROBES: ${{ github.event_name == 'schedule' && '1' || '' }}
         # Seeds start at the run's id, so every run explores new ones.
         run: target/release/examples/sim_tool campaign all 1000000 ${{ github.run_id }}
       - name: Guided exploration

@@ -1,7 +1,7 @@
 //! A service node: engine + metadata + auth + routing + background work.
 
 use crate::auth::{self, OidcProvider};
-use crate::cluster::{self, CLUSTER_KEY_HEADER, NoTransport, Transport};
+use crate::cluster::{self, CLUSTER_KEY_HEADER, DEADLINE_HEADER, NoTransport, Transport};
 use crate::engine::{Consistency, Db, Engine, EngineConfig, Isolation, Txn};
 use crate::env::Env;
 use crate::error::{Error, Result};
@@ -197,6 +197,16 @@ pub struct OpenTxn {
     pub created: Instant,
     pub last_used: Instant,
     pub encoding: crate::ops::Encoding,
+}
+
+tokio::task_local! {
+    static REQUEST_DEADLINE: Instant;
+}
+
+/// Runs `f` as the handling of a request whose commits must happen before
+/// `deadline`; metadata commands made within it never commit later.
+pub async fn with_deadline<F: std::future::Future>(deadline: Instant, f: F) -> F::Output {
+    REQUEST_DEADLINE.scope(deadline, f).await
 }
 
 pub struct Node {
@@ -546,11 +556,15 @@ impl Node {
 
     async fn run_meta_json(&self, cmd: MetaCmd) -> Result<Json> {
         let sys = self.engine.db(SYS_DB);
+        let deadline = self.meta_deadline();
         let mut last_err = Error::unavailable("system database unavailable");
         for attempt in 0..10u32 {
             if attempt > 0 {
                 let d = 10 * (1u64 << attempt.min(7)) + self.env.random_below(20);
                 tokio::time::sleep(Duration::from_millis(d)).await;
+                if Instant::now() >= deadline {
+                    break;
+                }
             }
             // A holder at this node's own address is a previous process,
             // which no forward can reach.
@@ -559,7 +573,7 @@ impl Node {
                 && let Some(addr) = self.addr_of(&holder).filter(|a| *a != self.cfg.addr)
             {
                 crate::probe::hit(crate::probe::Probe::MetaForwarded);
-                match self.forward_meta(&holder, &addr, &cmd).await {
+                match self.forward_meta(&holder, &addr, &cmd, deadline).await {
                     Ok(r) => return Ok(r),
                     // Reload the cluster key if it was initialized by another node after we started.
                     Err(Ok(Error::PermissionDenied(m))) if m.contains("cluster key") => {
@@ -607,8 +621,18 @@ impl Node {
         let sys = self.engine.db(SYS_DB);
         let mut t = sys.begin(Isolation::Serializable, Consistency::Strong).await?;
         let r = meta::apply(&mut t, &BlobResolver { db: &sys }, cmd, self.now_ms() as i64).await?;
-        sys.commit(t.into_request()).await?;
+        let mut req = t.into_request();
+        req.deadline = Some(self.meta_deadline());
+        sys.commit(req).await?;
         Ok(r)
+    }
+
+    /// The commit deadline of the request being handled, or
+    /// `commit_timeout_ms` from now outside of one.
+    fn meta_deadline(&self) -> Instant {
+        REQUEST_DEADLINE
+            .try_with(|d| *d)
+            .unwrap_or_else(|_| Instant::now() + Duration::from_millis(self.cfg.engine.commit_timeout_ms))
     }
 
     async fn forward_meta(
@@ -616,6 +640,7 @@ impl Node {
         holder: &str,
         addr: &str,
         cmd: &MetaCmd,
+        deadline: Instant,
     ) -> std::result::Result<Json, std::result::Result<Error, cluster::TransportError>> {
         let body = serde_json::to_vec(cmd).map_err(|e| Ok(Error::internal(e.to_string())))?;
         let mut req = Request::post("/internal/v1/meta")
@@ -633,6 +658,8 @@ impl Node {
         if let Ok(v) = holder.parse() {
             req.headers_mut().insert(cluster::FORWARD_TO_HEADER, v);
         }
+        let remaining = deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
+        req.headers_mut().insert(DEADLINE_HEADER, (self.now_ms() + remaining).into());
         if let Some(rid) = crate::log::request_id()
             && let Ok(v) = rid.parse()
         {

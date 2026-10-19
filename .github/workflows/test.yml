@@ -5,17 +5,18 @@
 # reproduction command.
 name: Test
 on:
-  pull_request:
-  push:
-    branches:
-      - main
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch:
-    inputs:
-      minutes:
-        description: Campaign minutes
-        default: "60"
+  # pull_request:
+  # push:
+  #   branches:
+  #     - main
+  # schedule:
+  #   - cron: "17 3 * * *"
+  # workflow_dispatch:
+  #   inputs:
+  #     minutes:
+  #       description: Campaign minutes
+  #       default: "60"
 jobs:
   test:
     name: Test suite

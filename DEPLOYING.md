@@ -67,22 +67,10 @@ Use a `performance` machine for sustained load. A `shared-cpu-1x` machine
 serves ~3,900 cached GETs/s until its CPU credits are exhausted after a few
 minutes, then drops to ~300 GETs/s.
 
-A commit costs one manifest `PUT` to Tigris: about 75 ms at the median,
-150 ms at p90 and 230 ms at p99, so a database takes ~13 sequential writes/s.
-Concurrent writes are batched into a single commit, reaching a few hundred
-writes/s per database. A manifest write unanswered after 250 ms is sent
-again (`BASERUNNA_PUT_HEDGE_MS`), which cuts the multi-second stalls a store
-occasionally produces. `GET /v1/admin/metrics` reports these latencies for
-the serving node.
-
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) deploys
 every push to `main`, building on Fly's remote builder. It needs a
 `FLY_API_TOKEN` repository secret (`fly tokens create deploy --app
 baserunna`).
-
-A binary refuses manifests in a format newer than it knows, so rolling back
-to a release before a manifest format change leaves every database written
-since unreadable.
 
 ## TLS
 

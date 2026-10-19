@@ -868,6 +868,8 @@ its `version`.
   handles the request itself. It can serve reads, and it can write only if
   no other node holds a valid lease (otherwise `503 unavailable` with
   `Retry-After`).
+- **Forwards carry the cluster key** (`x-baserunna-cluster-key`), so the
+  receiver does not charge a request to its rate limits a second time.
 - **Forwarded requests execute at most once.** Each forward carries a random
   `x-baserunna-forward-id`; the receiver runs the first copy and answers
   duplicates (for a minute) with its response. That memory dies with the
@@ -1022,9 +1024,9 @@ resurrect a purged database.
   key can be scoped to one DB and/or read-only. It is shown once at creation.
 - **Rate limits** (`limits.rs`): token buckets, kept per node, so a cluster
   of N nodes admits up to N times each rate. Every authenticated request
-  takes a token from its user's bucket (500/s, burst twice that) and, for
-  an API key, from the key's (500/s, or the `rate_limit` the key was
-  created with); both or neither. Requests that commit or abort an interactive
+  takes a token, on the node the client sent it to, from its user's bucket
+  (500/s, burst twice that) and, for an API key, from the key's (500/s, or
+  the `rate_limit` the key was created with); both or neither. Requests that commit or abort an interactive
   transaction can overdraw a bucket by up to its burst capacity, and subsequent
   requests must wait for the bucket to refill. Sign-ins, sign-ups and Google sign-in
   take from their client address's bucket (1/s, burst 20), and sign-ups
@@ -1743,6 +1745,11 @@ Bugs the DST suite found, each now covered by the regular suite:
     restart, nodes still forwarded to the previous process at the restarted
     node's address, which refused every forward. A member record replaced
     by a later process at its address is no longer live (§7).
+39. _Forwards charged twice._ A request forwarded to a database's lease
+    holder was charged to the rate limits on both nodes, so clients that
+    never called the holder were limited there. Forwards now carry the
+    cluster key, and their receiver authenticates them without charging.
+    Found once worlds made a node other than the first the lease holder.
 
 The cost measurements (§13.4) found five more: a read-heavy database whose
 lease had lapsed never acquired it again (paying a validating GET per read

@@ -77,8 +77,9 @@ async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Resul
                 Ok(r) if r.status == 503 && !String::from_utf8_lossy(&r.body).contains("\"unknown\"") => {
                     c.pause(100).await;
                 }
-                // Store stall exceeded the shortened stage TTL; commit rejected the expired upload.
-                Ok(r) if r.status == 400 && String::from_utf8_lossy(&r.body).contains("expired") => {}
+                // The upload outlasted the shortened stage TTL and was not applied. In a slow
+                // world every retry of a large upload would, so the write is given up.
+                Ok(r) if r.status == 400 && String::from_utf8_lossy(&r.body).contains("expired") => break,
                 Ok(r) if r.status != 503 => return Err(format!("put {path}: {}", r.status)),
                 // Ambiguous: retrying the same content is safe.
                 _ => c.pause(ZOMBIE_WAIT_MS).await,

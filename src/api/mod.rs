@@ -16,7 +16,7 @@ use crate::engine::{Committed, Consistency, Db, Txn};
 use crate::error::{Error, Result};
 use crate::log::{self, REQUEST_ID_HEADER};
 use crate::meta::{Access, DbRecord};
-use crate::node::{Node, Principal};
+use crate::node::{Meter, Node, Principal};
 use crate::probe::{self, Probe};
 use crate::timing;
 use axum::Router;
@@ -283,7 +283,12 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         let deadline = request_deadline(&node, req.headers());
         let name = db_name_from_path(req.uri().path()).ok_or_else(|| Error::not_found("no such route"))?;
         let token = credential(req.headers()).ok_or_else(|| Error::Unauthenticated("missing credentials".into()))?;
-        let principal = node.authenticate_metered(&token, finishes_txn(&req)).await?;
+        let meter = match (from_peer(&node, req.headers()), finishes_txn(&req)) {
+            (true, _) => Meter::Charged,
+            (false, true) => Meter::Borrow,
+            (false, false) => Meter::Take,
+        };
+        let principal = node.authenticate_metered(&token, meter).await?;
         let (mut rec, mut access) = node.resolve_db(&principal, &name).await?;
         let hops = hops(req.headers());
         if hops < 2
@@ -397,6 +402,9 @@ fn forwarded(mut resp: Response, target: String) -> Response {
 }
 
 fn tag_forward(node: &Node, req: &mut http::Request<Body>, target: &str, deadline: tokio::time::Instant) {
+    if let Some(v) = node.cluster_key().and_then(|k| HeaderValue::from_str(&k).ok()) {
+        req.headers_mut().insert(CLUSTER_KEY_HEADER, v);
+    }
     if let Ok(v) = HeaderValue::from_str(&node.env.random_hex(16)) {
         req.headers_mut().insert(FORWARD_ID_HEADER, v);
     }
@@ -545,17 +553,18 @@ fn unknown_outcome(message: String) -> Response {
     Error::Unavailable { message, retry_after_ms: Some(1000), outcome_unknown: true }.into_response()
 }
 
+/// Whether `headers` carry the cluster key, which only peers know.
+fn from_peer(node: &Node, headers: &HeaderMap) -> bool {
+    let given = headers.get(CLUSTER_KEY_HEADER).and_then(|v| v.to_str().ok());
+    match (node.cluster_key(), given) {
+        (Some(k), Some(v)) => crate::util::ct_eq(v.as_bytes(), k.as_bytes()),
+        _ => false,
+    }
+}
+
 /// Requires a valid cluster key header on internal endpoints.
 async fn internal_auth(State(node): State<Arc<Node>>, req: Request, next: Next) -> Response {
-    let ok = match node.cluster_key() {
-        None => false,
-        Some(k) => req
-            .headers()
-            .get(CLUSTER_KEY_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| crate::util::ct_eq(v.as_bytes(), k.as_bytes())),
-    };
-    if !ok {
+    if !from_peer(&node, req.headers()) {
         return Error::PermissionDenied("bad cluster key".into()).into_response();
     }
     next.run(req).await

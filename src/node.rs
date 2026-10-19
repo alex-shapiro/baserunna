@@ -104,6 +104,17 @@ pub enum Credential {
     ApiKey { id: String, db_id: Option<String>, read_only: bool, rate_limit: Option<u32> },
 }
 
+/// How a request is charged to its rate limits (§9).
+#[derive(Clone, Copy, Debug)]
+pub enum Meter {
+    /// Takes a token, refusing the request if a bucket is empty.
+    Take,
+    /// Takes a token, overdrawing a bucket by up to its burst.
+    Borrow,
+    /// Charges nothing: the peer that forwarded the request charged it.
+    Charged,
+}
+
 #[derive(Clone, Debug)]
 pub struct Principal {
     pub user: User,
@@ -677,11 +688,11 @@ impl Node {
 
     /// Authenticates a bearer token or session cookie value and checks rate limits.
     pub async fn authenticate(&self, token: &str) -> Result<Principal> {
-        self.authenticate_metered(token, false).await
+        self.authenticate_metered(token, Meter::Take).await
     }
 
-    /// Authenticates `token` and checks rate limits, using [`Limiter::borrow`] when `may_borrow` is true.
-    pub async fn authenticate_metered(&self, token: &str, may_borrow: bool) -> Result<Principal> {
+    /// Authenticates `token` and charges the request to its rate limits as `meter` says.
+    pub async fn authenticate_metered(&self, token: &str, meter: Meter) -> Result<Principal> {
         let p = self.principal(token).await?;
         let user_key = format!("user:{}", p.user.id);
         let lim = &self.cfg.limits;
@@ -693,9 +704,10 @@ impl Node {
             }
             Credential::Session { .. } => &[(&user_key, lim.user)],
         };
-        match may_borrow {
-            true => self.limiter.borrow(keys, "requests")?,
-            false => self.limiter.take(keys, "requests")?,
+        match meter {
+            Meter::Take => self.limiter.take(keys, "requests")?,
+            Meter::Borrow => self.limiter.borrow(keys, "requests")?,
+            Meter::Charged => {}
         }
         Ok(p)
     }

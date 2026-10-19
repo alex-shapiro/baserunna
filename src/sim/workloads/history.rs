@@ -530,7 +530,8 @@ fn definite_failure(status: u16, r: &super::super::client::Resp) -> bool {
 
 /// Runs `t` in one request. After an ambiguous failure, `retry` resends it
 /// with the same idempotency key while its commit record would still
-/// deduplicate it; otherwise, or past that, the outcome is resolved.
+/// deduplicate it, first at once, racing the earlier attempt, then after
+/// waiting it out; otherwise, or past that, the outcome is resolved.
 async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String, settle: bool, retry: bool) -> Result<(), String> {
     let writes = t.writes();
     let mut body = json!({"ops": request_ops(t, &t.ops, true)});
@@ -546,15 +547,21 @@ async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String, settle: bool, 
     }
     let e = &c.sim.cfg.engine;
     let dedup_until = t.start + e.commit_retention_ms - 2 * e.clock_sync_max_error_ms;
-    let mut ambiguous = false;
+    let (mut ambiguous, mut raced) = (false, false);
     loop {
         let r = c.call("POST", &format!("/v1/dbs/{db}/txn"), Some(body.clone())).await;
+        // A retry that raced the earlier attempt can conflict with it; a
+        // failed precondition is definite even then, because the server
+        // fences the earlier attempt before answering 412 (SPEC §6.2).
         let unknown = match &r {
-            Ok(r) => r.outcome_unknown() || (ambiguous && r.status == 503),
+            Ok(r) => r.outcome_unknown() || (ambiguous && r.status == 503) || (raced && r.status == 409),
             Err(e) => *e != super::super::NetError::Refused || ambiguous,
         };
         if writes && unknown {
-            c.pause(ZOMBIE_WAIT_MS).await;
+            raced = retry && !ambiguous;
+            if !raced {
+                c.pause(ZOMBIE_WAIT_MS).await;
+            }
             if retry && c.sim.now_ms() < dedup_until {
                 ambiguous = true;
                 continue;

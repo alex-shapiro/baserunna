@@ -603,6 +603,11 @@ macro_rules! run_txn {
         let ran_ = match crate::api::earlier_attempt(ctx_, commit_id_, key_).await? {
             Some(c) => crate::api::Ran::Replayed(c),
             None => {
+                // An earlier attempt may commit right after the check.
+                if crate::buggify::fires(0.2) {
+                    let ms = crate::buggify::below(200);
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
                 let mut attempt_ = 0u32;
                 let mut optimistic_ = true;
                 loop {

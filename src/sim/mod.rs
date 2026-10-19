@@ -284,6 +284,12 @@ pub struct Sim {
     /// The first violation a global oracle found.
     violation: Mutex<Option<String>>,
     pub knobs: Arc<swarm::Knobs>,
+    /// Workloads in their chaos phase, and the chaos loop they share.
+    pub(crate) chaos: Mutex<workloads::ChaosState>,
+    /// Notified when the last chaos phase ends and the cluster has recovered.
+    pub(crate) chaos_over: tokio::sync::Notify,
+    /// The administrator's session token, once [`workloads::admin`] created it.
+    pub(crate) admin: tokio::sync::Mutex<Option<String>>,
     me: Weak<Sim>,
 }
 
@@ -482,6 +488,9 @@ impl Sim {
             crashes: AtomicU64::new(0),
             violation: Mutex::new(None),
             knobs: cfg.knobs.clone().unwrap_or_else(|| Arc::new(swarm::Knobs::new(seed))),
+            chaos: Mutex::new(Default::default()),
+            chaos_over: tokio::sync::Notify::new(),
+            admin: tokio::sync::Mutex::new(None),
             cfg,
             me: me.clone(),
         });

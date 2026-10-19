@@ -119,7 +119,7 @@ async fn client(c: Client, k: usize, dbs: usize, steps: usize) -> Result<(Model,
 }
 
 pub async fn run(sim: Arc<Sim>, clients: usize, dbs: usize, steps: usize, chaos: bool) -> Result<(), String> {
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut hs = Vec::new();
     for k in 0..clients {
         let c = Client::signup(&sim, &format!("churn{k}"), &format!("churn{k}@churn.test"), "password-123").await?;
@@ -133,13 +133,10 @@ pub async fn run(sim: Arc<Sim>, clients: usize, dbs: usize, steps: usize, chaos:
             Err(e) => err = err.or(Some(e)),
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
     if let Some(e) = err {
         return Err(e);
     }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     super::check_integrity(&sim).await?;
     for (model, c) in &done {
         for (db, want) in model {

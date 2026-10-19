@@ -3,7 +3,7 @@
 //! strong and snapshot reads, and final balances match committed transfers.
 
 use super::super::Sim;
-use super::super::client::Client;
+use super::super::client::{Client, Status};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -38,12 +38,19 @@ fn audit(b: &[i64], accounts: usize) -> Result<(), String> {
     Ok(())
 }
 
-async fn transfer(c: &Client, db: &str, a: usize, b: usize, amt: i64) -> Result<bool, String> {
+/// Transfers `amt` from account `a` to `b` unless `a` lacks it. Each attempt
+/// also writes a marker of its own, which tells whether an attempt with an
+/// ambiguous outcome applied once its commit status no longer can.
+async fn transfer(c: &Client, db: &str, a: usize, b: usize, amt: i64, id: &str) -> Result<bool, String> {
     let base = format!("/v1/dbs/{db}");
     // Writes fail while the lease holder is partitioned from reachable nodes;
     // retry across a long virtual deadline.
     let deadline = c.sim.now_ms() + 30 * 60_000;
+    let mut attempt = 0;
     while c.sim.now_ms() < deadline {
+        attempt += 1;
+        let marker = format!("xfer/{id}/{attempt}");
+        let began = c.sim.now_ms();
         let d = c.rng().below(50);
         c.pause(d).await;
         let compact = c.rng().below(2) == 0;
@@ -76,6 +83,7 @@ async fn transfer(c: &Client, db: &str, a: usize, b: usize, amt: i64) -> Result<
         let writes = json!([
             {"op": "put", "key": acct(a), "value": (ba - amt).to_string()},
             {"op": "put", "key": acct(b), "value": (bb + amt).to_string()},
+            {"op": "put", "key": marker, "value": "1"},
         ]);
         let commit = if compact {
             json!({"ops": writes})
@@ -99,11 +107,19 @@ async fn transfer(c: &Client, db: &str, a: usize, b: usize, amt: i64) -> Result<
             _ => {
                 // Ambiguous: wait out zombies, then query fenced commit status.
                 c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
-                let st = c.call_retry("GET", &format!("{base}/commits/{cid}"), None).await;
-                match st.json["status"].as_str() {
-                    Some("committed") => return Ok(true),
-                    Some("not_committed") => continue,
-                    _ => return Err(format!("status: {}", st.json)),
+                match c.commit_status(db, &cid, began).await? {
+                    Status::Committed(_) => return Ok(true),
+                    Status::NotCommitted => continue,
+                    // The commit record may be gone: the marker tells.
+                    Status::Unknown => {
+                        let path = format!("{base}/kv/{}", super::super::client::url_escape(marker.as_bytes()));
+                        let m = c.call_retry("GET", &path, None).await;
+                        match m.status {
+                            200 => return Ok(true),
+                            404 => continue,
+                            s => return Err(format!("marker {marker}: {s} {}", m.json)),
+                        }
+                    }
                 }
             }
         }
@@ -125,7 +141,7 @@ pub async fn run(sim: Arc<Sim>, accounts: usize, clients: usize, transfers: usiz
         return Err(format!("init failed: {}", r.json));
     }
     let applied: Arc<Mutex<Vec<(usize, usize, i64)>>> = Arc::new(Mutex::new(Vec::new()));
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let auditor = {
         let c = Client::with_token(&sim, "auditor", &token);
@@ -150,14 +166,14 @@ pub async fn run(sim: Arc<Sim>, accounts: usize, clients: usize, transfers: usiz
         let c = Client::with_token(&sim, &format!("teller{ci}"), &token);
         let applied = applied.clone();
         hs.push(tokio::spawn(async move {
-            for _ in 0..transfers {
+            for n in 0..transfers {
                 let (a, b, amt) = {
                     let mut r = c.rng();
                     let a = r.usize(accounts);
                     let b = (a + 1 + r.usize(accounts - 1)) % accounts;
                     (a, b, 1 + r.below(40) as i64)
                 };
-                if transfer(&c, db, a, b, amt).await? {
+                if transfer(&c, db, a, b, amt, &format!("{}/{n}", c.name)).await? {
                     applied.lock().unwrap_or_else(|e| e.into_inner()).push((a, b, amt));
                 }
             }
@@ -170,15 +186,12 @@ pub async fn run(sim: Arc<Sim>, accounts: usize, clients: usize, transfers: usiz
             err = err.or(Some(e));
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
     done.store(true, std::sync::atomic::Ordering::SeqCst);
     let audits = auditor.await.map_err(|e| e.to_string())??;
     if let Some(e) = err {
         return Err(e);
     }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     let mut want = vec![INITIAL; accounts];
     for (a, b, amt) in applied.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         want[*a] -= amt;

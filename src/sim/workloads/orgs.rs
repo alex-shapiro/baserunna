@@ -72,7 +72,7 @@ async fn set_role(by: &Client, org: &str, u: &User, role: Option<Role>) -> Resul
 
 pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     // The first account is a site administrator; keep it out of the way.
-    Client::signup(&sim, "root", "root@orgs.test", "root-password").await?;
+    super::admin(&sim).await?;
     let owner = user(&sim, "owner").await?;
     let others = [user(&sim, "ann").await?, user(&sim, "bob").await?, user(&sim, "cat").await?];
     create_org(&owner.c, "acme").await?;
@@ -90,16 +90,15 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     let listed = pairs(others[2].c.paginate("/v1/orgs", "orgs").await?);
     expect(listed == vec![(json!("beta"), json!("reader"))], format!("a reader's organizations are {listed:?}"))?;
     permissions(&sim, &owner, &others[0], &others[1]).await?;
-    let chaos = super::spawn_chaos(&sim);
+    let phase = Some(super::chaos_phase(&sim));
     let r = async {
         role_changes(&sim, &owner, &others).await?;
         owner_races(&sim, &owner, &others[0]).await?;
         delete_races(&sim, &owner, &others[1]).await
     }
     .await;
-    chaos.abort();
     r?;
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     super::check_integrity(&sim).await
 }
 

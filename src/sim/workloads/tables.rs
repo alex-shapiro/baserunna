@@ -143,7 +143,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
     if r.status != 201 {
         return Err(format!("create table: {} {}", r.status, r.json));
     }
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     // Contenders race to claim the same unique emails.
     let mut hs = Vec::new();
     for k in 0..contenders {
@@ -333,10 +333,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) ->
             }
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     let r = c
         .call_retry(
             "POST",

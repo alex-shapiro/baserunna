@@ -214,7 +214,7 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, rounds: usize, c
     let written = Arc::new(Mutex::new(Written::default()));
     let stats = Arc::new(Stats::default());
     let done = Arc::new(AtomicBool::new(false));
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let rs: Vec<_> = (0..readers)
         .map(|i| {
             let c = Client::with_token(&sim, &format!("gcreader{i}"), &token);
@@ -238,9 +238,6 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, rounds: usize, c
             err = err.or(Some(e));
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
     if let Some(e) = err {
         return Err(e);
     }
@@ -251,7 +248,7 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, rounds: usize, c
             stats.broken.load(Ordering::Relaxed)
         );
     }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     let e = &sim.cfg.engine;
     sim.sleep(e.orphan_grace_ms + e.gc_grace_ms + 2 * e.sweep_interval_ms).await;
     let body = json!({"ops": [{"op": "put", "key": "touch", "value": "1"}], "idempotency_key": "gc-touch"});

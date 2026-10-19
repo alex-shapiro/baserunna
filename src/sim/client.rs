@@ -24,6 +24,15 @@ pub struct Client {
     pub retry_rate_limited: bool,
 }
 
+/// What a commit status query tells of a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Committed(u64),
+    NotCommitted,
+    /// The commit record may have expired, so the status cannot tell.
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub struct Resp {
     pub status: u16,
@@ -217,6 +226,26 @@ impl Client {
         }
     }
 
+    /// Asks for the fenced status of commit `id` (a commit id, or `key:` and
+    /// an idempotency key) in `db`, first attempted at `began` (SPEC §6.2).
+    /// `not_committed` is definitive only while the commit record would
+    /// still exist; past that, the outcome must come from the data.
+    pub async fn commit_status(&self, db: &str, id: &str, began: u64) -> Result<Status, String> {
+        let r = self.call_retry("GET", &format!("/v1/dbs/{db}/commits/{id}"), None).await;
+        match r.json["status"].as_str() {
+            Some("committed") => Ok(Status::Committed(r.json["version"].as_u64().ok_or(format!("{}", r.json))?)),
+            Some("not_committed") => {
+                let kept = r.json["retention_ms"].as_u64().ok_or(format!("no retention: {}", r.json))?;
+                let slack = 2 * self.sim.cfg.engine.clock_sync_max_error_ms;
+                match self.sim.now_ms() + slack < began + kept {
+                    true => Ok(Status::NotCommitted),
+                    false => Ok(Status::Unknown),
+                }
+            }
+            _ => Err(format!("{}: commit status {id}: {} {}", self.name, r.status, r.json)),
+        }
+    }
+
     /// Collects all items in `field` across `next_cursor` pages of `path`.
     pub async fn paginate(&self, path: &str, field: &str) -> Result<Vec<Json>, String> {
         let sep = if path.contains('?') { '&' } else { '?' };
@@ -254,7 +283,9 @@ impl Client {
                     return Ok(Client::with_token(sim, name, r.json["token"].as_str().unwrap_or_default()));
                 }
                 // An earlier attempt may have succeeded.
-                Ok(r) if r.status == 409 => return Client::login(sim, name, email, password).await,
+                Ok(r) if r.status == 409 && r.code() == "already_exists" => {
+                    return Client::login(sim, name, email, password).await;
+                }
                 Ok(r) if r.status == 503 || r.status == 409 => {}
                 Ok(r) => return Err(format!("signup failed: {} {}", r.status, r.json)),
                 Err(_) => {}

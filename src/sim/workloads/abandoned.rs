@@ -2,7 +2,7 @@
 //! move between nodes.
 
 use super::super::Sim;
-use super::super::client::{Client, ZOMBIE_WAIT_MS};
+use super::super::client::{Client, Status, ZOMBIE_WAIT_MS};
 use serde_json::{Value as Json, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -25,6 +25,7 @@ enum Fate {
 }
 
 async fn one(c: &Client, marker: &str, isolation: &str, fate: Fate, tally: &mut Tally) -> Result<(), String> {
+    let began = c.sim.now_ms();
     let r = c.call("POST", &format!("{BASE}/transactions"), Some(json!({"isolation": isolation}))).await;
     let Ok(r) = r else { return Ok(()) };
     if r.status != 201 {
@@ -71,11 +72,14 @@ async fn one(c: &Client, marker: &str, isolation: &str, fate: Fate, tally: &mut 
         Ok(r) if !r.outcome_unknown() => return Err(format!("commit: {} {}", r.status, r.json)),
         _ => {
             c.pause(ZOMBIE_WAIT_MS).await;
-            let st = c.call_retry("GET", &format!("{BASE}/commits/{cid}"), None).await;
-            match st.json["status"].as_str() {
-                Some("committed") => true,
-                Some("not_committed") => false,
-                _ => return Err(format!("commit status: {}", st.json)),
+            match c.commit_status("limbo", &cid, began).await? {
+                Status::Committed(_) => true,
+                Status::NotCommitted => false,
+                // The commit record may be gone: the marker tells.
+                Status::Unknown => {
+                    let path = format!("{BASE}/kv/{}", super::super::client::url_escape(marker.as_bytes()));
+                    c.call_retry("GET", &path, None).await.status == 200
+                }
             }
         }
     };
@@ -111,7 +115,7 @@ pub async fn run(sim: Arc<Sim>, clients: usize, txns: usize, chaos: bool) -> Res
     let owner = Client::signup(&sim, "limbo", "limbo@limbo.test", "password-123").await?;
     owner.create_db("limbo").await?;
     let token = owner.token.clone().unwrap_or_default();
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let hs: Vec<_> = (0..clients)
         .map(|k| tokio::spawn(client(Client::with_token(&sim, &format!("limbo{k}"), &token), k, txns)))
         .collect();
@@ -119,13 +123,13 @@ pub async fn run(sim: Arc<Sim>, clients: usize, txns: usize, chaos: bool) -> Res
     for h in hs {
         tallies.push(h.await.map_err(|e| e.to_string())??);
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     sim.sleep(sim.cfg.node.txn_idle_ms + 10_000).await;
+    let info = owner.call_retry("GET", BASE, None).await;
+    let id = info.json["id"].as_str().ok_or(format!("db info: {}", info.json))?.to_string();
     for i in sim.up_nodes() {
-        let open = sim.node(i).map(|n| n.node.open_txn_count()).unwrap_or(0);
+        // Workloads running alongside may hold transactions of their own.
+        let open = sim.node(i).map(|n| n.node.open_txns_on(&id)).unwrap_or(0);
         if open != 0 {
             return Err(format!("n{i} still holds {open} open transactions"));
         }

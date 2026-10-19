@@ -1261,6 +1261,12 @@ impl Node {
         lock(&self.txns).len()
     }
 
+    /// Open interactive transactions on database `db_id`; one in use right
+    /// now counts as open.
+    pub fn open_txns_on(&self, db_id: &str) -> usize {
+        lock(&self.txns).values().filter(|t| t.try_lock().map_or(true, |t| t.db_id == db_id)).count()
+    }
+
     pub fn status_json(&self) -> Json {
         json!({
             "node_id": self.id,

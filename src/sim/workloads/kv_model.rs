@@ -4,7 +4,7 @@
 //! idempotency keys, fenced commit-status queries or fenced read-backs.
 
 use super::super::Sim;
-use super::super::client::{Client, Resp, url_escape};
+use super::super::client::{Client, Resp, Status, url_escape};
 use crate::util::b64;
 use crate::util::rng::Rng;
 use serde_json::{Value as Json, json};
@@ -20,6 +20,7 @@ struct Model {
 }
 
 /// Transaction simulator over the model with read-your-writes semantics.
+#[derive(Clone)]
 struct TxnSim {
     base: Model,
     writes: BTreeMap<Key, Option<Vec<u8>>>,
@@ -354,17 +355,23 @@ impl KvModel {
             body["idempotency_key"] = json!(key);
         }
         let path = self.path("/txn");
+        let mut began = self.c.sim.now_ms();
         loop {
             let r = self.c.call("POST", &path, Some(body.clone())).await;
             let r = match r {
-                Ok(r) if r.outcome_unknown() => {
+                Ok(r) if !r.outcome_unknown() => r,
+                _ => {
+                    // Retry with the same idempotency key once any zombie
+                    // attempt has expired, unless its commit record may be
+                    // gone: then the data tells whether it applied.
                     self.c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
-                    continue;
-                }
-                Ok(r) => r,
-                Err(_) => {
-                    // Idempotent retry once any zombie attempt has expired.
-                    self.c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
+                    if writes && !self.dedups(began) {
+                        if let Some(v) = self.reconcile(&sim).await? {
+                            sim.apply(&mut self.model, v);
+                            return Ok(());
+                        }
+                        began = self.c.sim.now_ms();
+                    }
                     continue;
                 }
             };
@@ -419,7 +426,63 @@ impl KvModel {
         }
     }
 
+    /// Whether a retry of a request first sent at `began` is still
+    /// deduplicated by its commit record.
+    fn dedups(&self, began: u64) -> bool {
+        let e = &self.c.sim.cfg.engine;
+        self.c.sim.now_ms() + 2 * e.clock_sync_max_error_ms < began + e.commit_retention_ms
+    }
+
+    /// Whether `txn` applied, and at which version, judged from the data:
+    /// this client is its database's only writer, so the database holds
+    /// either the model's state or the model's state with `txn` applied.
+    async fn reconcile(&mut self, txn: &TxnSim) -> Result<Option<u64>, String> {
+        let (got, version) = self.read_all().await?;
+        let matches = |m: &Model, versions: bool| {
+            got.len() == m.data.len()
+                && m.data.iter().all(|(k, (v, ver))| {
+                    got.get(k).is_some_and(|(j, gv)| check_value(j, v, "").is_ok() && (!versions || gv == ver))
+                })
+        };
+        if matches(&self.model, true) {
+            return Ok(None);
+        }
+        let mut after = self.model.clone();
+        txn.clone().apply(&mut after, version);
+        match matches(&after, false) {
+            true => Ok(Some(version)),
+            false => Err(format!("step {}: the database matches neither outcome of a transaction", self.step)),
+        }
+    }
+
+    /// Every key's item and version, and the database's version, read strongly.
+    async fn read_all(&self) -> Result<(BTreeMap<Key, (Json, u64)>, u64), String> {
+        let mut got = BTreeMap::new();
+        let mut cursor: Option<String> = None;
+        let mut version = 0;
+        loop {
+            let mut p = self.path("/kv?limit=50");
+            if let Some(c) = &cursor {
+                p.push_str(&format!("&cursor={c}"));
+            }
+            let r = self.c.call_retry("GET", &p, None).await;
+            if r.status != 200 {
+                return Err(format!("scan failed: {} {}", r.status, r.json));
+            }
+            version = version.max(r.json["version"].as_u64().ok_or("no version")?);
+            for it in r.json["items"].as_array().ok_or("no items")? {
+                let k = it["key"].as_str().ok_or("no key")?.as_bytes().to_vec();
+                got.insert(k, (it.clone(), it["version"].as_u64().unwrap_or(0)));
+            }
+            match r.json["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => return Ok((got, version)),
+            }
+        }
+    }
+
     async fn interactive(&mut self) -> Result<(), String> {
+        let began = self.c.sim.now_ms();
         let begin = self.c.call("POST", &self.path("/transactions"), Some(json!({}))).await;
         let Ok(begin) = begin else { return Ok(()) };
         if begin.status != 201 {
@@ -474,13 +537,13 @@ impl KvModel {
             Ok(r) if r.status == 409 => return Err(format!("single-client interactive txn conflicted: {}", r.json)),
             Ok(r) if !r.outcome_unknown() && r.status != 503 => return Err(format!("commit: {} {}", r.status, r.json)),
             _ => {
-                // Ambiguous: resolve with a fenced status query.
+                // Ambiguous: resolve with a fenced status query, or from the
+                // data once the commit record may be gone.
                 self.c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
-                let st = self.c.call_retry("GET", &self.path(&format!("/commits/{commit_id}")), None).await;
-                match st.json["status"].as_str() {
-                    Some("committed") => st.json["version"].as_u64(),
-                    Some("not_committed") => None,
-                    _ => return Err(format!("bad status {}", st.json)),
+                match self.c.commit_status(&self.db, &commit_id, began).await? {
+                    Status::Committed(v) => Some(v),
+                    Status::NotCommitted => None,
+                    Status::Unknown => self.reconcile(&sim).await?,
                 }
             }
         };
@@ -764,7 +827,7 @@ pub async fn run(sim: Arc<Sim>, clients: usize, steps: usize, chaos: bool) -> Re
             Ok::<KvModel, String>(w)
         }));
     }
-    let chaos_task = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut models = Vec::new();
     let mut err = None;
     for h in handles {
@@ -774,13 +837,10 @@ pub async fn run(sim: Arc<Sim>, clients: usize, steps: usize, chaos: bool) -> Re
             Err(e) => err = err.or(Some(format!("client task panicked: {e}"))),
         }
     }
-    if let Some(t) = chaos_task {
-        t.abort();
-    }
     if let Some(e) = err {
         return Err(e);
     }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     for w in &mut models {
         w.full_check().await?;
     }

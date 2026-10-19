@@ -4,7 +4,7 @@
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
-use crate::engine::manifest::{Manifest, ObjKind};
+use crate::engine::manifest::{Levels, Manifest, ObjKind};
 use crate::engine::{Value, segment};
 use crate::util::{b64, sha256};
 use serde_json::json;
@@ -17,9 +17,15 @@ type IdSets = (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>);
 /// read directly from the store.
 pub fn db_objects(sim: &Sim, db_id: &str) -> Result<IdSets, String> {
     let g = sim.mem.get_sync(&crate::engine::manifest_key(db_id), &Default::default()).map_err(|e| e.to_string())?;
-    let m = Manifest::decode(&g.data).map_err(|e| e.to_string())?;
-    let mut entries = m.tail.clone();
+    let mut m = Manifest::decode(&g.data).map_err(|e| e.to_string())?;
     let mut segs = BTreeSet::new();
+    if let Some(id) = m.levels.clone() {
+        let l =
+            sim.mem.get_sync(&crate::engine::levels_key(db_id, &id), &Default::default()).map_err(|e| e.to_string())?;
+        m.attach_levels(&Levels::decode(&l.data).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        segs.insert(format!("{id}{}", crate::engine::LEVELS_SUFFIX));
+    }
+    let mut entries = m.tail.clone();
     for s in &m.segments {
         let d =
             sim.mem.get_sync(&crate::engine::seg_key(db_id, &s.id), &Default::default()).map_err(|e| e.to_string())?;
@@ -43,7 +49,11 @@ pub fn db_objects(sim: &Sim, db_id: &str) -> Result<IdSets, String> {
     let listed = m
         .obsolete
         .iter()
-        .map(|o| format!("{}:{}", if o.kind == ObjKind::Blob { "blob" } else { "seg" }, o.id))
+        .map(|o| match o.kind {
+            ObjKind::Blob => format!("blob:{}", o.id),
+            ObjKind::Segment => format!("seg:{}", o.id),
+            ObjKind::Levels => format!("seg:{}{}", o.id, crate::engine::LEVELS_SUFFIX),
+        })
         .collect();
     Ok((referenced, listed, segs))
 }
@@ -74,7 +84,7 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
     if r.status != 201 {
         return Err(format!("create table: {}", r.json));
     }
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut kv: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut rows: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut rng = sim.fork_rng();
@@ -155,10 +165,7 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
         }
         verify(&c, base, &kv, &rows, &mut rng).await?;
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     verify(&c, base, &kv, &rows, &mut rng).await?;
 
     let db_id = c.call_retry("GET", base, None).await.json["id"].as_str().unwrap_or_default().to_string();

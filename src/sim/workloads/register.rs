@@ -32,7 +32,7 @@ pub async fn run(
     let token = owner.token.clone().unwrap_or_default();
     let keys = 2;
     let hist: Arc<Mutex<Vec<Op>>> = Arc::new(Mutex::new(Vec::new()));
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut hs = Vec::new();
     for w in 0..writers + readers {
         let c = Client::with_token(&sim, &format!("{}{w}", if w < writers { "writer" } else { "reader" }), &token);
@@ -101,10 +101,7 @@ pub async fn run(
     for h in hs {
         h.await.map_err(|e| e.to_string())?;
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     check(&hist.lock().unwrap_or_else(|e| e.into_inner()))
 }
 

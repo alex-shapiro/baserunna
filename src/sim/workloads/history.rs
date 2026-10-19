@@ -14,11 +14,14 @@
 //! - First committer wins: no transaction committed a write to a key that a
 //!   snapshot-isolated transaction wrote between its snapshot and its commit.
 //!
-//! Every outcome is known: ambiguous commits are resolved through the fenced
-//! commit status (SPEC §6.2).
+//! Every outcome is known from the data: each write transaction also writes
+//! a marker key of its own, so the markers left at the end tell which
+//! transactions committed, and at which version. Outcomes reported to
+//! clients must agree with them, including those of ambiguous commits
+//! resolved through the fenced commit status (SPEC §6.2).
 
 use super::super::Sim;
-use super::super::client::{Client, ZOMBIE_WAIT_MS};
+use super::super::client::{Client, Status, ZOMBIE_WAIT_MS};
 use crate::util::rng::Rng;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
@@ -93,11 +96,15 @@ pub enum Outcome {
     /// A read-only transaction, serialized at this version.
     Read(u64),
     NotCommitted,
+    /// A write transaction whose outcome its client could not learn.
+    Unknown,
 }
 
 #[derive(Clone, Debug)]
 pub struct Txn {
     pub client: String,
+    /// The marker key a write transaction also writes.
+    pub marker: String,
     pub start: u64,
     pub end: u64,
     pub isolation: Isolation,
@@ -222,7 +229,7 @@ fn replay(model: &Model, t: &Txn, pos: u64, exact_more: bool) -> Result<BTreeMap
     let mut view = View { model, pos, own: BTreeMap::new() };
     // An uncommitted transaction failed after the last result it received.
     let n = match t.outcome {
-        Outcome::NotCommitted => t.results.len(),
+        Outcome::NotCommitted | Outcome::Unknown => t.results.len(),
         _ => t.ops.len(),
     };
     for (i, op) in t.ops[..n].iter().enumerate() {
@@ -282,7 +289,7 @@ pub fn check(history: &[Txn]) -> Result<(), String> {
     // that finished before it began.
     let pos = |t: &Txn| match t.outcome {
         Outcome::Committed(v) | Outcome::Read(v) => Some(v),
-        Outcome::NotCommitted => None,
+        Outcome::NotCommitted | Outcome::Unknown => None,
     };
     // Versions only grow, so whatever a finished transaction saw, even a
     // stale read, bounds what strong ones that began later see. A stale read
@@ -344,7 +351,7 @@ pub fn check(history: &[Txn]) -> Result<(), String> {
                     }
                 }
             }
-            (Outcome::NotCommitted, _) => {}
+            (Outcome::NotCommitted | Outcome::Unknown, _) => {}
         }
     }
     Ok(())
@@ -365,6 +372,9 @@ pub struct Shape {
     pub stale_reads: f64,
     /// Share of operations on the first key, which is then hot.
     pub hot: f64,
+    /// Share of ambiguous commits resolved through the commit status rather
+    /// than only from the markers.
+    pub settle: f64,
 }
 
 impl Shape {
@@ -391,6 +401,7 @@ impl Shape {
             snapshot_isolation: k.pick("history.snapshot_isolation", &[0.0, 0.3, 0.8]),
             stale_reads: k.pick("history.stale_reads", &[0.0, 0.2]),
             hot: k.pick("history.hot", &[0.0, 0.3, 0.8]),
+            settle: k.pick("history.settle", &[0.0, 0.5, 1.0]),
         }
     }
 }
@@ -475,24 +486,47 @@ fn ops_json(ops: &[Op]) -> Json {
     Json::Array(ops.iter().map(Op::json).collect())
 }
 
-/// Resolves an ambiguous commit through the fenced commit status.
-async fn resolve(c: &Client, db: &str, id: &str) -> Result<Outcome, String> {
-    c.pause(ZOMBIE_WAIT_MS).await;
-    let r = c.call_retry("GET", &format!("/v1/dbs/{db}/commits/{id}"), None).await;
-    match r.json["status"].as_str() {
-        Some("committed") => Ok(Outcome::Committed(r.json["version"].as_u64().ok_or("no version")?)),
-        Some("not_committed") => Ok(Outcome::NotCommitted),
-        _ => Err(format!("commit status {id}: {} {}", r.status, r.json)),
+/// `ops` as a request sends them, followed by `t`'s marker if `last` is
+/// the request that commits a write transaction.
+fn request_ops(t: &Txn, ops: &[Op], last: bool) -> Json {
+    let mut j = ops_json(ops);
+    if last && t.writes() {
+        j.as_array_mut().into_iter().for_each(|a| a.push(json!({"op": "put", "key": t.marker, "value": "1"})));
     }
+    j
+}
+
+/// Parses the results of `ops`, ignoring a trailing marker's.
+fn parse_sent(t: &Txn, ops: &[Op], r: &Json, last: bool) -> Result<Vec<Observed>, String> {
+    let mut r = r.clone();
+    if last && t.writes() {
+        let missing = format!("no results: {r}");
+        r.as_array_mut().ok_or(missing)?.pop();
+    }
+    parse_results(ops, &r)
+}
+
+/// Resolves an ambiguous commit through the fenced commit status, if
+/// `resolve`; the markers settle what it cannot.
+async fn resolve(c: &Client, db: &str, id: &str, t: &Txn, resolve: bool) -> Result<Outcome, String> {
+    if !resolve {
+        return Ok(Outcome::Unknown);
+    }
+    c.pause(ZOMBIE_WAIT_MS).await;
+    Ok(match c.commit_status(db, id, t.start).await? {
+        Status::Committed(v) => Outcome::Committed(v),
+        Status::NotCommitted => Outcome::NotCommitted,
+        Status::Unknown => Outcome::Unknown,
+    })
 }
 
 fn definite_failure(status: u16, r: &super::super::client::Resp) -> bool {
     matches!(status, 404 | 409 | 412 | 429) || r.retryable_not_applied()
 }
 
-async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String) -> Result<(), String> {
+async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String, settle: bool) -> Result<(), String> {
     let writes = t.writes();
-    let mut body = json!({"ops": ops_json(&t.ops)});
+    let mut body = json!({"ops": request_ops(t, &t.ops, true)});
     if t.isolation == Isolation::Snapshot {
         body["isolation"] = json!("snapshot");
     }
@@ -508,22 +542,22 @@ async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String) -> Result<(), 
         Ok(r) if r.status == 200 => {
             let v = r.json["version"].as_u64().ok_or(format!("no version: {}", r.json))?;
             if r.json["replayed"] != true {
-                t.results = parse_results(&t.ops, &r.json["results"])?;
+                t.results = parse_sent(t, &t.ops, &r.json["results"], true)?;
             }
             if writes { Outcome::Committed(v) } else { Outcome::Read(v) }
         }
         Ok(r) if definite_failure(r.status, &r) => Outcome::NotCommitted,
         Ok(r) if !writes && r.status == 503 => Outcome::NotCommitted,
-        Ok(r) if r.outcome_unknown() => resolve(c, db, &format!("key:{key}")).await?,
+        Ok(r) if r.outcome_unknown() => resolve(c, db, &format!("key:{key}"), t, settle).await?,
         Err(super::super::NetError::Refused) => Outcome::NotCommitted,
-        Err(_) if writes => resolve(c, db, &format!("key:{key}")).await?,
+        Err(_) if writes => resolve(c, db, &format!("key:{key}"), t, settle).await?,
         Err(_) => Outcome::NotCommitted,
         Ok(r) => return Err(format!("{}: one-shot {}: {}", c.name, r.status, r.json)),
     };
     Ok(())
 }
 
-async fn interactive(c: &Client, db: &str, t: &mut Txn, rng: &mut Rng) -> Result<(), String> {
+async fn interactive(c: &Client, db: &str, t: &mut Txn, rng: &mut Rng, settle: bool) -> Result<(), String> {
     let base = format!("/v1/dbs/{db}/transactions");
     // The operations go out in up to three calls: with begin, alone, and with commit.
     let n = t.ops.len();
@@ -556,17 +590,19 @@ async fn interactive(c: &Client, db: &str, t: &mut Txn, rng: &mut Rng) -> Result
         let _ = c.call("DELETE", &format!("{base}/{id}"), None).await;
         return Ok(());
     }
-    let r = c.call("POST", &format!("{base}/{id}/commit"), Some(json!({"ops": ops_json(&t.ops[b..])}))).await;
+    let r =
+        c.call("POST", &format!("{base}/{id}/commit"), Some(json!({"ops": request_ops(t, &t.ops[b..], true)}))).await;
     t.outcome = match r {
         Ok(r) if r.status == 200 => {
             let v = r.json["version"].as_u64().ok_or(format!("no version: {}", r.json))?;
-            t.results.extend(parse_results(&t.ops[b..], &r.json["results"])?);
+            let rest = parse_sent(t, &t.ops[b..], &r.json["results"], true)?;
+            t.results.extend(rest);
             if t.writes() { Outcome::Committed(v) } else { Outcome::Read(v) }
         }
         Ok(r) if definite_failure(r.status, &r) || r.status == 400 => Outcome::NotCommitted,
-        Ok(r) if r.outcome_unknown() => resolve(c, db, &cid).await?,
+        Ok(r) if r.outcome_unknown() => resolve(c, db, &cid, t, settle).await?,
         Err(super::super::NetError::Refused) => Outcome::NotCommitted,
-        Err(_) => resolve(c, db, &cid).await?,
+        Err(_) => resolve(c, db, &cid, t, settle).await?,
         Ok(r) => return Err(format!("{}: commit {}: {}", c.name, r.status, r.json)),
     };
     Ok(())
@@ -578,7 +614,7 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
     owner.create_db(db).await?;
     let token = owner.token.clone().unwrap_or_default();
     let history: Arc<Mutex<Vec<Txn>>> = Arc::new(Mutex::new(Vec::new()));
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut hs = Vec::new();
     for ci in 0..shape.clients {
         let c = Client::with_token(&sim, &format!("hist{ci}"), &token);
@@ -599,6 +635,7 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
                 };
                 let mut t = Txn {
                     client: format!("{}#{n}", c.name),
+                    marker: format!("m/{ci}/{n}"),
                     start: sim.now_ms(),
                     end: 0,
                     isolation,
@@ -609,9 +646,10 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
                     outcome: Outcome::NotCommitted,
                 };
                 let mut rng = g.rng.fork();
+                let settle = rng.chance(shape.settle);
                 match interactive_txn {
-                    true => interactive(&c, db, &mut t, &mut rng).await?,
-                    false => one_shot(&c, db, &mut t, format!("{}-{n}", c.name)).await?,
+                    true => interactive(&c, db, &mut t, &mut rng, settle).await?,
+                    false => one_shot(&c, db, &mut t, format!("{}-{n}", c.name), settle).await?,
                 }
                 t.end = sim.now_ms();
                 sim.trace.event(&format!("history {t:?}"));
@@ -626,14 +664,34 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
             err = err.or(Some(e));
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
     if let Some(e) = err {
         return Err(e);
     }
-    super::recover(&sim).await;
-    let h = history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    super::settle(&sim, phase).await;
+    let markers = owner.paginate(&format!("/v1/dbs/{db}/kv?prefix=m/&limit=100"), "items").await?;
+    let mut markers: BTreeMap<String, u64> = markers
+        .iter()
+        .map(|m| Some((m["key"].as_str()?.to_string(), m["version"].as_u64()?)))
+        .collect::<Option<_>>()
+        .ok_or("odd marker")?;
+    let mut h = history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for t in h.iter_mut().filter(|t| t.writes()) {
+        let applied = markers.remove(&t.marker);
+        t.outcome = match (t.outcome, applied) {
+            (Outcome::Committed(v), Some(m)) if v == m => t.outcome,
+            (Outcome::NotCommitted, None) | (Outcome::Unknown, None) => Outcome::NotCommitted,
+            (Outcome::Unknown, Some(m)) => {
+                // It may have committed after its client gave up on it, so
+                // it orders nothing that began later.
+                t.end = u64::MAX;
+                Outcome::Committed(m)
+            }
+            (o, m) => return Err(format!("{} was reported {o:?} but its marker shows {m:?}", t.client)),
+        };
+    }
+    if let Some(m) = markers.keys().next() {
+        return Err(format!("marker {m} of no write transaction"));
+    }
     check(&h).map_err(|e| format!("history of {} transactions: {e}", h.len()))
 }
 
@@ -644,6 +702,7 @@ mod tests {
     fn txn(start: u64, end: u64, ops: Vec<Op>, results: Vec<Observed>, outcome: Outcome) -> Txn {
         Txn {
             client: format!("c@{start}"),
+            marker: format!("m/{start}"),
             start,
             end,
             isolation: Isolation::Serializable,

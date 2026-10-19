@@ -37,7 +37,7 @@ scenario_tests! {
     sim_auth: "auth", 7, 2;
     sim_lifecycle: "lifecycle", 8, 3;
     sim_console: "console", 10, 2;
-    sim_chaos: "chaos", 9, 2;
+    sim_mix: "mix", 9, 4;
     sim_limits: "limits", 17, 2;
     sim_api_tour: "api_tour", 11, 2;
     sim_schema_race: "schema_race", 12, 3;
@@ -53,7 +53,7 @@ scenario_tests! {
 
 #[test]
 fn sim_is_deterministic() {
-    let s = scenario("chaos").expect("scenario exists");
+    let s = scenario("mix").expect("scenario exists");
     let seed = baserunna::util::prop::env_u64("SIM_SEED").unwrap_or(4242);
     let a = run(seed, s.config_for(seed), s.run);
     let b = run(seed, s.config_for(seed), s.run);

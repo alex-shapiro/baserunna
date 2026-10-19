@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 pub async fn run(sim: Arc<Sim>, cycles: usize, chaos: bool) -> Result<(), String> {
     let c = Client::signup(&sim, "life", "life@cycle.test", "password-123").await?;
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut old_ids = Vec::new();
     for cycle in 0..cycles {
         c.create_db("temp").await?;
@@ -38,17 +38,20 @@ pub async fn run(sim: Arc<Sim>, cycles: usize, chaos: bool) -> Result<(), String
         for i in sim.up_nodes() {
             let mut cc = Client::with_token(&sim, "probe", c.token.as_deref().unwrap_or_default());
             cc.pin = Some(i);
-            let r = cc.call_retry("GET", "/v1/dbs/temp/kv/k0", None).await;
-            if r.status != 404 {
-                return Err(format!("deleted db readable via n{i}: {} {}", r.status, r.json));
+            // A node that crashes mid-probe serves nothing, and chaos may never restart it.
+            while sim.node(i).is_some() {
+                match cc.call("GET", "/v1/dbs/temp/kv/k0", None).await {
+                    Ok(r) if r.status == 404 => break,
+                    Ok(r) if r.status != 503 => {
+                        return Err(format!("deleted db readable via n{i}: {} {}", r.status, r.json));
+                    }
+                    _ => sim.sleep(200).await,
+                }
             }
         }
         old_ids.push(id);
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     super::check_integrity(&sim).await?;
     super::check_purged(&sim, &old_ids).await?;
     let r = c.call_retry("GET", "/v1/dbs", None).await;

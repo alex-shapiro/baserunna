@@ -30,20 +30,34 @@ enum Write {
 /// Committed writes by version.
 type Log = Arc<Mutex<BTreeMap<u64, Vec<Write>>>>;
 
-/// Commit `ops` (with an idempotency key) until the outcome is definitive.
-async fn commit(c: &Client, ops: Json, key: &str) -> Result<u64, String> {
+/// Commits `ops` (with an idempotency key) until the outcome is definitive.
+/// Returns the version it committed at and whether an earlier attempt may
+/// have applied too: one whose outcome was lost, when its commit record may
+/// have expired before the retry that succeeded.
+async fn commit(c: &Client, ops: Json, key: &str) -> Result<(u64, bool), String> {
     let body = json!({"ops": ops, "idempotency_key": key});
+    let first = c.sim.now_ms();
+    let mut ambiguous = false;
     loop {
         match c.call("POST", &format!("{BASE}/txn"), Some(body.clone())).await {
-            Ok(r) if r.status == 200 => return r.json["version"].as_u64().ok_or_else(|| "no version".into()),
+            Ok(r) if r.status == 200 => {
+                let v = r.json["version"].as_u64().ok_or("no version")?;
+                let slack = 2 * c.sim.cfg.engine.clock_sync_max_error_ms;
+                let expired = c.sim.now_ms() - first + slack >= c.sim.cfg.engine.commit_retention_ms;
+                return Ok((v, ambiguous && expired && r.json["replayed"] != true));
+            }
             Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => c.pause(50).await,
             Ok(r) if r.status != 503 && r.status != 429 => return Err(format!("write: {} {}", r.status, r.json)),
-            _ => c.pause(ZOMBIE_WAIT_MS).await,
+            r => {
+                ambiguous |= r.as_ref().map_or(true, |r| r.outcome_unknown());
+                c.pause(ZOMBIE_WAIT_MS).await
+            }
         }
     }
 }
 
 async fn writer(c: Client, log: Log, steps: usize) -> Result<(), String> {
+    let mut prev = 0;
     for step in 0..steps {
         let k = format!("k/{}", c.rng().below(6));
         let roll = c.rng().below(10);
@@ -69,8 +83,18 @@ async fn writer(c: Client, log: Log, steps: usize) -> Result<(), String> {
             }
             _ => (json!([{"op": "delete_range", "prefix": "r/"}]), vec![Write::DeleteRange("r/".into())]),
         };
-        let v = commit(&c, ops, &format!("w{step}")).await?;
-        log.lock().unwrap_or_else(|e| e.into_inner()).entry(v).or_insert(writes);
+        let (v, maybe_twice) = commit(&c, ops, &format!("w{step}")).await?;
+        // The writer is the database's only writer, so an earlier application
+        // of this step is the only thing that can commit between its previous
+        // step's version and this one.
+        let from = if maybe_twice { prev + 1 } else { v };
+        {
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            for u in from..=v {
+                l.entry(u).or_insert_with(|| writes.clone());
+            }
+        }
+        prev = v;
         let d = c.rng().below(400);
         c.pause(d).await;
     }
@@ -211,7 +235,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     let lifetime = sim.cfg.engine.txn_max_lifetime_ms;
     let eps = 2 * sim.cfg.engine.clock_sync_max_error_ms;
     let mut watcher = Watcher::start(Client::with_token(&sim, "watcher", &token), lifetime, eps).await;
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut err = None;
     while !done.load(Ordering::SeqCst) {
         let wait = watcher.c.rng().below(3_000);
@@ -224,9 +248,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
             watcher.c.pause(lifetime + 10_000).await;
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
     match w.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => err = err.or(Some(e)),
@@ -235,7 +256,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     if let Some(e) = err {
         return Err(e);
     }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     // Wait for all TTL entries to expire before comparing state.
     watcher.c.pause(4_000 + eps).await;
     while watcher.poll(0).await? != Some(true) {

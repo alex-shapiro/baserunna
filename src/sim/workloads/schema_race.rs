@@ -58,8 +58,17 @@ async fn one_shot(c: &Client, body: Json, rejected: &[(u16, &str)]) -> Result<Ap
     }
 }
 
-/// Runs an interactive transaction, resolving commit ambiguity via the commit-status endpoint.
-async fn interactive(c: &Client, isolation: &str, ops: Json, rejected: &[(u16, &str)]) -> Result<Applied, String> {
+/// Upserts `row` in an interactive transaction, resolving commit ambiguity via
+/// the commit-status endpoint, or from the row itself once the commit record
+/// may have outlived its retention.
+async fn interactive(
+    c: &Client,
+    isolation: &str,
+    pk: i64,
+    row: &Row,
+    rejected: &[(u16, &str)],
+) -> Result<Applied, String> {
+    let ops = json!([{"op": "upsert_row", "table": "items", "row": row_json(pk, row)}]);
     let r = c.call("POST", &format!("{BASE}/transactions"), Some(json!({"isolation": isolation}))).await;
     let Ok(r) = r else { return Ok(Applied::No) };
     if r.status != 201 {
@@ -73,6 +82,7 @@ async fn interactive(c: &Client, isolation: &str, ops: Json, rejected: &[(u16, &
         Ok(r) => return judge(&r, rejected).map(|_| Applied::No),
         Err(_) => return Ok(Applied::No),
     }
+    let committing = c.sim.now_ms();
     match c.call("POST", &format!("{BASE}/transactions/{id}/commit"), Some(json!({}))).await {
         Ok(r) if r.ok() => Ok(Applied::Yes),
         Ok(r) if r.status == 404 || r.retryable_not_applied() || (r.status == 409 && r.code() == "conflict") => {
@@ -82,9 +92,20 @@ async fn interactive(c: &Client, isolation: &str, ops: Json, rejected: &[(u16, &
         _ => {
             c.pause(ZOMBIE_WAIT_MS).await;
             let st = c.call_retry("GET", &format!("{BASE}/commits/{cid}"), None).await;
+            let kept = st.json["retention_ms"].as_u64().unwrap_or(0);
+            let slack = 2 * c.sim.cfg.engine.clock_sync_max_error_ms;
             match st.json["status"].as_str() {
                 Some("committed") => Ok(Applied::Yes),
-                Some("not_committed") => Ok(Applied::No),
+                Some("not_committed") if c.sim.now_ms() - committing + slack < kept => Ok(Applied::No),
+                Some("not_committed") => {
+                    let path = format!("{BASE}/tables/items/rows/get");
+                    let r = c.call_retry("POST", &path, Some(json!({"pk": pk}))).await;
+                    let got = &r.json["row"];
+                    let held = r.json["found"] == true
+                        && got["email"].as_str() == row.email.as_deref()
+                        && got["n"].as_i64() == Some(row.n);
+                    Ok(if held { Applied::Yes } else { Applied::No })
+                }
                 _ => Err(format!("commit status: {}", st.json)),
             }
         }
@@ -162,9 +183,8 @@ async fn writer(c: Client, w: i64, steps: usize) -> Result<BTreeMap<i64, Row>, S
                 }
             }
             3 => {
-                let ops = json!([{"op": "upsert_row", "table": "items", "row": row_json(id, &row)}]);
                 if let Applied::Yes =
-                    interactive(&c, isolation, ops, ROW_REJECTIONS).await.map_err(|e| format!("{ctx}: {e}"))?
+                    interactive(&c, isolation, id, &row, ROW_REJECTIONS).await.map_err(|e| format!("{ctx}: {e}"))?
                 {
                     model.insert(id, row);
                 }
@@ -254,7 +274,7 @@ pub async fn run(sim: Arc<Sim>, writers: usize, steps: usize, chaos: bool) -> Re
         return Err(format!("create table: {} {}", r.status, r.json));
     }
     let token = owner.token.clone().unwrap_or_default();
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let changer = tokio::spawn(schema_changer(Client::with_token(&sim, "schema", &token), steps / 2));
     let hs: Vec<_> = (0..writers)
         .map(|w| tokio::spawn(writer(Client::with_token(&sim, &format!("writer{w}"), &token), w as i64, steps)))
@@ -267,13 +287,10 @@ pub async fn run(sim: Arc<Sim>, writers: usize, steps: usize, chaos: bool) -> Re
             Err(e) => err = err.or(Some(e)),
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
     if let Some(e) = err {
         return Err(e);
     }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     let info = owner.call_retry("GET", BASE, None).await;
     let db_id = info.json["id"].as_str().ok_or("no db id")?.to_string();
     super::tables::check_all_indexes(&sim, &db_id).await?;

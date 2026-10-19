@@ -19,7 +19,7 @@ fn cookie_value(r: &super::super::SimResponse, name: &str) -> Option<String> {
 
 pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     let anon = Client::new(&sim, "anon");
-    let admin = Client::signup(&sim, "admin", "admin@auth.test", "admin-password").await?;
+    let admin = super::admin(&sim).await?;
     let me = admin.call_retry("GET", "/v1/me", None).await;
     expect(me.json["user"]["is_admin"] == true, format!("first user should be admin: {}", me.json))?;
     let alice = Client::signup(&sim, "alice", "Alice@Auth.test", "alice-password").await?;
@@ -137,7 +137,13 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
 
     expect(alice.call_retry("GET", "/v1/admin/users", None).await.status == 403, "non-admin listed users")?;
     let users = admin.call_retry("GET", "/v1/admin/users", None).await;
-    expect(users.json["users"].as_array().map(|a| a.len()) == Some(3), format!("users: {}", users.json))?;
+    // Workloads running alongside this one have users of their own.
+    let ours = users.json["users"].as_array().map(|a| {
+        a.iter()
+            .filter(|u| u["email"].as_str().is_some_and(|e| e.ends_with("@auth.test") || e == super::ADMIN_EMAIL))
+            .count()
+    });
+    expect(ours == Some(3), format!("users: {}", users.json))?;
     expect(!users.json.to_string().contains("pbkdf2"), "user listing leaks password hashes")?;
     let nodes = admin.call_retry("GET", "/v1/admin/nodes", None).await;
     expect(nodes.status == 200 && nodes.json["nodes"].as_array().is_some_and(|a| !a.is_empty()), "nodes")?;

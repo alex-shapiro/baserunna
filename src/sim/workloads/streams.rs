@@ -887,7 +887,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     let client = |name: &str| Client::with_token(&sim, name, &token);
     let w: Shared = Arc::default();
     let done = Arc::new(AtomicBool::new(false));
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut writers = Vec::new();
     let streams = vec!["log".to_string(), "log".to_string(), "chat:0".to_string(), "chat:1".to_string()];
     for i in 0..3 {
@@ -912,10 +912,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
             Err(e) => err = err.or(Some(format!("writer panicked: {e}"))),
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     done.store(true, Ordering::SeqCst);
     for h in readers {
         match h.await {

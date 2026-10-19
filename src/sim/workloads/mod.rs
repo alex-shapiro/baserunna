@@ -22,6 +22,7 @@ pub mod tables;
 pub mod ttl;
 pub mod watch;
 
+use super::client::Client;
 use super::swarm::{Knobs, Profile, Skew, world};
 use super::{Sim, SimConfig};
 use std::sync::Arc;
@@ -70,6 +71,21 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
         _ => {}
     }
 }
+
+/// The cluster's administrator: the first account, which the first call
+/// signs up. Workloads that need an administrator share this one.
+pub async fn admin(sim: &Arc<Sim>) -> Result<Client, String> {
+    let mut g = sim.admin.lock().await;
+    if let Some(t) = g.as_ref() {
+        return Ok(Client::with_token(sim, "root", t));
+    }
+    let c = Client::signup(sim, "root", ADMIN_EMAIL, ADMIN_PASSWORD).await?;
+    *g = c.token.clone();
+    Ok(c)
+}
+
+pub const ADMIN_EMAIL: &str = "root@sim.test";
+pub const ADMIN_PASSWORD: &str = "root-password";
 
 /// Heals network partitions and restarts all crashed nodes.
 pub async fn recover(sim: &Arc<Sim>) {
@@ -133,25 +149,161 @@ pub fn spawn_chaos(sim: &Arc<Sim>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// Runs KV, bank, and register workloads concurrently under faults.
-pub async fn chaos_mix(sim: Arc<Sim>, scale: usize) -> Result<(), String> {
-    let chaos = spawn_chaos(&sim);
-    let a = tokio::spawn(kv_model::run(sim.clone(), 2, 20 * scale, false));
-    let b = tokio::spawn(bank::run(sim.clone(), 5, 3, 6 * scale, false));
-    let c = tokio::spawn(register::run(sim.clone(), 2, 2, 10 * scale, 500, false));
-    let mut errs = Vec::new();
-    for h in [a, b, c] {
-        match h.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => errs.push(e),
-            Err(e) => errs.push(format!("panicked: {e}")),
+/// Workloads in their chaos phase and the loop that injects their faults.
+#[derive(Default)]
+pub struct ChaosState {
+    active: usize,
+    task: Option<tokio::task::JoinHandle<()>>,
+    /// Incremented each time the last phase ends.
+    ended: u64,
+}
+
+/// A workload's chaos phase. Workloads running together share one chaos
+/// loop, which runs while any of them is in its phase. Ending a phase waits
+/// until every phase has ended and the cluster has recovered, so checks
+/// after it run without faults.
+pub struct ChaosPhase {
+    sim: Arc<Sim>,
+    open: bool,
+}
+
+/// Starts a chaos phase for the calling workload.
+pub fn chaos_phase(sim: &Arc<Sim>) -> ChaosPhase {
+    let mut st = sim.chaos.lock().unwrap_or_else(|e| e.into_inner());
+    st.active += 1;
+    if st.task.is_none() {
+        st.task = Some(spawn_chaos(sim));
+    }
+    ChaosPhase { sim: sim.clone(), open: true }
+}
+
+impl ChaosPhase {
+    /// Leaves the phase, returning `Some` if it was the last one, after
+    /// stopping chaos.
+    fn leave(&mut self) -> Option<u64> {
+        self.open = false;
+        let mut st = self.sim.chaos.lock().unwrap_or_else(|e| e.into_inner());
+        st.active -= 1;
+        if st.active > 0 {
+            return None;
+        }
+        if let Some(t) = st.task.take() {
+            t.abort();
+        }
+        Some(st.ended)
+    }
+
+    /// Ends the phase, waiting for the others and for recovery.
+    pub async fn end(mut self) {
+        let sim = self.sim.clone();
+        let over = sim.chaos_over.notified();
+        let mut over = std::pin::pin!(over);
+        over.as_mut().enable();
+        let seen = sim.chaos.lock().unwrap_or_else(|e| e.into_inner()).ended;
+        if self.leave().is_some() {
+            recover(&sim).await;
+            sim.chaos.lock().unwrap_or_else(|e| e.into_inner()).ended += 1;
+            sim.chaos_over.notify_waiters();
+            return;
+        }
+        loop {
+            if sim.chaos.lock().unwrap_or_else(|e| e.into_inner()).ended > seen {
+                return;
+            }
+            over.as_mut().await;
+            over.set(sim.chaos_over.notified());
+            over.as_mut().enable();
         }
     }
-    chaos.abort();
-    if let Some(e) = errs.into_iter().next() {
-        return Err(e);
+}
+
+impl Drop for ChaosPhase {
+    fn drop(&mut self) {
+        // A workload that fails leaves its phase without waiting; the others
+        // must not wait for it.
+        if self.open && self.leave().is_some() {
+            self.sim.chaos.lock().unwrap_or_else(|e| e.into_inner()).ended += 1;
+            self.sim.chaos_over.notify_waiters();
+        }
     }
-    recover(&sim).await;
+}
+
+/// Ends `phase` if there is one, and recovers the cluster either way.
+pub async fn settle(sim: &Arc<Sim>, phase: Option<ChaosPhase>) {
+    match phase {
+        Some(p) => p.end().await,
+        None => recover(sim).await,
+    }
+}
+
+/// Workloads that `mix` may run together, with the knob that includes each.
+/// Those that need a world of their own (no faults, or grace periods and
+/// cache budgets of their own) are left out.
+const MIX: &[(&str, &str)] = &[
+    ("kv_model", "mix.kv_model"),
+    ("history", "mix.history"),
+    ("bank", "mix.bank"),
+    ("register", "mix.register"),
+    ("tables", "mix.tables"),
+    ("blobs", "mix.blobs"),
+    ("auth", "mix.auth"),
+    ("lifecycle", "mix.lifecycle"),
+    ("api_tour", "mix.api_tour"),
+    ("schema_race", "mix.schema_race"),
+    ("abandoned", "mix.abandoned"),
+    ("ttl", "mix.ttl"),
+    ("watch", "mix.watch"),
+    ("streams", "mix.streams"),
+    ("orgs", "mix.orgs"),
+    ("accounts", "mix.accounts"),
+];
+
+/// Runs a random subset of at least two workloads at once, sharing one
+/// cluster and one chaos loop: every workload's checks run once all of
+/// them have finished their chaos phases.
+pub async fn mix(sim: Arc<Sim>) -> Result<(), String> {
+    let k = &sim.knobs;
+    let mut chosen: Vec<&str> = MIX.iter().filter(|(_, knob)| k.chance(knob, 0.3)).map(|(n, _)| *n).collect();
+    for (n, _) in MIX.iter().cycle().skip(k.range("mix.first", 0, MIX.len() as u64 - 1) as usize) {
+        if chosen.len() >= 2 {
+            break;
+        }
+        if !chosen.contains(n) {
+            chosen.push(n);
+        }
+    }
+    sim.trace.event(&format!("mix of {chosen:?}"));
+    // The first account is the administrator some workloads expect.
+    admin(&sim).await?;
+    let runs: Vec<_> =
+        chosen.iter().map(|n| (*n, (scenario(n).expect("mixed workloads are scenarios").run)(sim.clone()))).collect();
+    join_all(runs).await
+}
+
+type Run = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>;
+
+/// Polls every run to completion on this task and returns the first error.
+async fn join_all(mut runs: Vec<(&str, Run)>) -> Result<(), String> {
+    let mut done: Vec<Option<Result<(), String>>> = runs.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        for ((_, f), d) in runs.iter_mut().zip(done.iter_mut()) {
+            if d.is_none()
+                && let std::task::Poll::Ready(r) = f.as_mut().poll(cx)
+            {
+                *d = Some(r);
+            }
+        }
+        match done.iter().all(Option::is_some) {
+            true => std::task::Poll::Ready(()),
+            false => std::task::Poll::Pending,
+        }
+    })
+    .await;
+    for ((name, _), d) in runs.iter().zip(done) {
+        if let Some(Err(e)) = d {
+            return Err(format!("{name}: {e}"));
+        }
+    }
     Ok(())
 }
 
@@ -252,11 +404,7 @@ pub fn scenarios() -> Vec<Scenario> {
             config: |k| world(k, Profile { nodes: (1, 3), faults: false, skew: Skew::None }),
             run: |s| Box::pin(console::run(s)),
         },
-        Scenario {
-            name: "chaos",
-            config: |k| world(k, faulty((2, 5))),
-            run: |s| Box::pin(chaos_mix(s.clone(), s.knobs.range("chaos.scale", 1, 3) as usize)),
-        },
+        Scenario { name: "mix", config: |k| world(k, faulty((2, 5))), run: |s| Box::pin(mix(s)) },
         Scenario { name: "limits", config: limits::config, run: |s| Box::pin(limits::run(s)) },
         Scenario { name: "api_tour", config: |k| world(k, faulty((1, 3))), run: |s| Box::pin(api_tour::run(s)) },
         Scenario {

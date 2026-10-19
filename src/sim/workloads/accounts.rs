@@ -10,8 +10,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
-    let admin = Client::signup(&sim, "root", "root@acct.test", "root-password").await?;
-    let chaos = super::spawn_chaos(&sim);
+    let admin = super::admin(&sim).await?;
+    let phase = Some(super::chaos_phase(&sim));
     let r = async {
         password_change(&sim).await?;
         sessions(&sim).await?;
@@ -20,9 +20,8 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
         deletion(&sim, &admin).await
     }
     .await;
-    chaos.abort();
     let deleted = r?;
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     super::check_integrity(&sim).await?;
     super::check_purged(&sim, &deleted).await
 }
@@ -191,7 +190,7 @@ async fn deletion(sim: &Arc<Sim>, admin: &Client) -> Result<Vec<String>, String>
     create_org(&d, "solo-org").await?;
     let r = d.call_retry("DELETE", "/v1/me", Some(json!({"password": password}))).await;
     expect(r.status == 403, format!("the only owner of an organization deleted their account: {}", r.status))?;
-    let r = admin.call_retry("DELETE", "/v1/me", Some(json!({"password": "root-password"}))).await;
+    let r = admin.call_retry("DELETE", "/v1/me", Some(json!({"password": super::ADMIN_PASSWORD}))).await;
     expect(r.status == 403, format!("the last administrator deleted their account: {}", r.status))?;
     let r = d.call_retry("DELETE", "/v1/me", Some(json!({"password": "wrong-password"}))).await;
     expect(r.status == 403, format!("deletion with a wrong password: {}", r.status))?;

@@ -9,7 +9,9 @@
 //!
 //! Clients also take turns holding a lock: an expiring value that a
 //! serializable transaction writes only if it finds none, and that its
-//! holder renews just before it expires. Ordered by version, every
+//! holder renews just before it expires. An acquisition also writes a marker
+//! of its own, so that a retry outliving its commit's record (SPEC §6.2)
+//! finds it applied instead of applying again. Ordered by version, every
 //! acquisition must have committed no earlier than the previous lock
 //! expired, and every renewal before the lock it read did, which the
 //! lock's own expiries tell exactly.
@@ -301,12 +303,16 @@ struct LockWrite {
 
 const LOCK_TTL_MS: u64 = 1_500;
 
-async fn lock_txn(c: &Client, ops: Json, key: &str) -> Result<Option<(u64, Json)>, String> {
+/// Commits `ops` with idempotency key `key`, retrying until it commits
+/// (its version and response) or fails a check (`Err` with the check's op index).
+async fn lock_txn(c: &Client, ops: Json, key: &str) -> Result<Result<(u64, Json), u64>, String> {
     let body = json!({"ops": ops, "idempotency_key": key});
     loop {
         match c.call("POST", "/v1/dbs/locks/txn", Some(body.clone())).await {
-            Ok(r) if r.status == 200 => return Ok(Some((r.json["version"].as_u64().ok_or("no version")?, r.json))),
-            Ok(r) if r.status == 412 => return Ok(None),
+            Ok(r) if r.status == 200 => return Ok(Ok((r.json["version"].as_u64().ok_or("no version")?, r.json))),
+            Ok(r) if r.status == 412 => {
+                return Ok(Err(r.json["error"]["details"]["op_index"].as_u64().unwrap_or(u64::MAX)));
+            }
             Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => c.pause(30).await,
             Ok(r) if r.status != 503 && r.status != 429 => return Err(format!("lock: {} {}", r.status, r.json)),
             _ => c.pause(ZOMBIE_WAIT_MS).await,
@@ -326,12 +332,22 @@ async fn lock_expiry(c: &Client, version: u64) -> Option<u64> {
 
 /// Acquires the lock if free and attempts to renew it near its expiry.
 async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Result<(), String> {
+    let held = format!("held/{me}");
     let acquire = json!([
+        {"op": "check", "key": held, "exists": false},
         {"op": "check", "key": "lock", "exists": false},
         {"op": "put", "key": "lock", "value": me, "ttl_ms": LOCK_TTL_MS},
+        {"op": "put", "key": held, "value": ""},
         {"op": "increment", "key": "taken"},
     ]);
-    let Some((version, _)) = lock_txn(c, acquire, me).await? else { return Ok(()) };
+    let version = match lock_txn(c, acquire, me).await? {
+        Ok((version, _)) => version,
+        Err(0) => {
+            let r = c.call_retry("POST", "/v1/dbs/locks/txn", Some(json!({"ops": [{"op": "get", "key": held}]}))).await;
+            r.json["results"][0]["version"].as_u64().ok_or_else(|| format!("{held}: {}", r.json))?
+        }
+        Err(_) => return Ok(()),
+    };
     let expires = lock_expiry(c, version).await;
     out.lock().unwrap_or_else(|e| e.into_inner()).push(LockWrite { version, expires, renewal: None });
     let d = LOCK_TTL_MS - 400 + c.rng().below(500);
@@ -341,7 +357,7 @@ async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Re
         {"op": "check", "key": "lock", "value": me},
         {"op": "put", "key": "lock", "value": me, "ttl_ms": LOCK_TTL_MS},
     ]);
-    if let Some((version, r)) = lock_txn(c, renew, &format!("{me}/renew")).await? {
+    if let Ok((version, r)) = lock_txn(c, renew, &format!("{me}/renew")).await? {
         let seen = r["results"].get(0).and_then(|g| g["expires_at"].as_u64());
         let expires = lock_expiry(c, version).await;
         out.lock().unwrap_or_else(|e| e.into_inner()).push(LockWrite { version, expires, renewal: Some(seen) });
@@ -430,7 +446,7 @@ pub async fn run(sim: Arc<Sim>, owners: usize, steps: usize, chaos: bool) -> Res
             Ok::<(), String>(())
         }));
     }
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut owners_done = Vec::new();
     let mut err = None;
     for h in handles {
@@ -447,13 +463,10 @@ pub async fn run(sim: Arc<Sim>, owners: usize, steps: usize, chaos: bool) -> Res
             Err(e) => err = err.or(Some(format!("locker panicked: {e}"))),
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
     if let Some(e) = err {
         return Err(e);
     }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     let writes = lock_writes.lock().unwrap_or_else(|e| e.into_inner()).clone();
     check_locks(&writes)?;
     let acquired = writes.iter().filter(|w| w.renewal.is_none()).count();

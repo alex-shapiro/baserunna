@@ -66,6 +66,9 @@ probes! {
     ReadLeaseRenewed,
     /// A node released its lease.
     LeaseReleased,
+    /// A manifest write that shortens or releases this node's lease was sent,
+    /// so the node stopped relying on its longer lease.
+    LeaseShortenedInFlight,
     /// A strong read waited for this node's in-flight manifest write.
     StrongReadWaitedForWrite,
     /// A version older than the installed one arrived and was ignored.

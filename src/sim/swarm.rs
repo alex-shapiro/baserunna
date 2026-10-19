@@ -161,6 +161,8 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
         c.chaos = ChaosFaults {
             enabled: k.chance("chaos.enabled", 0.85),
             pause_ms: k.log_range("chaos.pause_ms", 200, 8_000),
+            storm_ms: k.log_range("chaos.storm_ms", 2_000, 120_000),
+            calm_ms: k.log_range("chaos.calm_ms", 1_000, 30_000),
             crash: k.weight("chaos.crash"),
             start: k.weight("chaos.start"),
             partition: k.weight("chaos.partition"),

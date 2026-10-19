@@ -113,6 +113,11 @@ pub struct ChaosFaults {
     pub enabled: bool,
     /// The longest pause between actions; each pause is drawn up to it.
     pub pause_ms: u64,
+    /// How long a storm of actions lasts.
+    pub storm_ms: u64,
+    /// The longest calm after a storm, which begins by healing the cluster;
+    /// 0 for none.
+    pub calm_ms: u64,
     pub crash: u64,
     /// Start a crashed node.
     pub start: u64,
@@ -135,6 +140,7 @@ impl ChaosFaults {
         ChaosFaults {
             enabled: true,
             pause_ms: 4_500,
+            storm_ms: u64::MAX,
             crash: 2,
             start: 2,
             partition: 1,
@@ -317,6 +323,9 @@ fn take_panic() -> Option<String> {
 }
 
 const LOCAL_TIER_BYTES: u64 = 64 * 1024;
+
+/// Virtual time a run may take: longer means a workload made no progress.
+const MAX_VIRTUAL_MS: u64 = 6 * 3_600_000;
 
 /// How often the global oracles check the cluster, in virtual time.
 const ORACLE_INTERVAL_MS: u64 = 20;
@@ -784,11 +793,25 @@ where
     let out = rt.block_on(async move {
         let start = Instant::now();
         let sim = Sim::new(seed, cfg).await;
-        let oracles = sim.spawn_oracles();
-        let mut result = match CatchPanic(Box::pin(f(sim.clone()))).await {
-            Ok(r) => r,
-            Err(()) => Err("workload panicked".into()),
+        // A violation ends the run at once: what follows it only obscures it.
+        let mut oracles = sim.spawn_oracles();
+        let mut workload = CatchPanic(Box::pin(f(sim.clone())));
+        let mut oracles_or_deadline = Box::pin(async {
+            let deadline = tokio::time::sleep(Duration::from_millis(MAX_VIRTUAL_MS));
+            match crate::util::race(&mut oracles, &mut Box::pin(deadline)).await {
+                crate::util::Either::Left(_) => Ok(()),
+                crate::util::Either::Right(()) => {
+                    Err(format!("the workload did not finish within {} s of virtual time", MAX_VIRTUAL_MS / 1000))
+                }
+            }
+        });
+        let mut result = match crate::util::race(&mut workload, &mut oracles_or_deadline).await {
+            crate::util::Either::Left(Ok(r)) => r,
+            crate::util::Either::Left(Err(())) => Err("workload panicked".into()),
+            crate::util::Either::Right(r) => r,
         };
+        drop(oracles_or_deadline);
+        drop(workload);
         oracles.abort();
         if let Some(v) = sim.violation.lock().unwrap_or_else(|e| e.into_inner()).take() {
             result = Err(format!("oracle: {v}"));

@@ -317,6 +317,23 @@ impl Db {
         }
     }
 
+    /// Stops relying on our lease past what `m`, about to be written at
+    /// `sent`, grants: other nodes may see `m` as soon as it is sent, and its
+    /// lease may be shorter than the one we hold (a commit after a read lease)
+    /// or released.
+    fn limit_own_lease(&self, m: &Manifest, sent: Instant) {
+        let mut st = self.st();
+        let Some((ws, until)) = st.own_lease else { return };
+        let granted = match m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
+            Some(l) => sent + Duration::from_millis(l.ms - self.shared.cfg.lease_margin_ms.min(l.ms)),
+            None => sent,
+        };
+        if granted < until {
+            probe::hit(Probe::LeaseShortenedInFlight);
+            st.own_lease = Some((ws, granted));
+        }
+    }
+
     /// Returns another node's lease in `v` and its remaining duration
     /// on this node's clock, or `None` if no foreign lease is active.
     fn foreign_lease<'a>(&self, v: &'a Version) -> Option<(&'a Lease, Duration)> {
@@ -949,6 +966,7 @@ impl Db {
                 return;
             };
             let started = Instant::now();
+            self.limit_own_lease(&m, attempt_started);
             self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let res = self.put_manifest(m.encode(), &base.etag).await;
             if !res.is_ok() {

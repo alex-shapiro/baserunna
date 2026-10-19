@@ -140,11 +140,21 @@ pub async fn cache_expiry(sim: &Arc<Sim>) {
 pub fn spawn_chaos(sim: &Arc<Sim>) -> tokio::task::JoinHandle<()> {
     let sim = sim.clone();
     tokio::spawn(async move {
-        if !sim.cfg.chaos.enabled {
+        let c = sim.cfg.chaos.clone();
+        if !c.enabled {
             return;
         }
+        // Storms of faults alternate with calms, so that even the harshest
+        // worlds leave the cluster time to make progress.
         loop {
-            chaos_step(&sim).await;
+            let until = sim.now_ms().saturating_add(c.storm_ms);
+            while sim.now_ms() < until {
+                chaos_step(&sim).await;
+            }
+            if c.calm_ms > 0 {
+                recover(&sim).await;
+                sim.sleep(sim.rand_below(c.calm_ms)).await;
+            }
         }
     })
 }

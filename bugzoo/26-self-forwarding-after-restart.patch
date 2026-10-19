@@ -1,0 +1,24 @@
+diff --git a/src/node.rs b/src/node.rs
+index bc7700d..56cef55 100644
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -405,7 +405,7 @@ impl Node {
+         let now = self.now_ms() as i64;
+         cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
+             .into_iter()
+-            .filter(|n| n.id == self.id || (!self.is_suspect(&n.id) && n.addr != self.cfg.addr))
++            .filter(|n| n.id == self.id || !self.is_suspect(&n.id))
+             .collect()
+     }
+ 
+@@ -472,10 +472,6 @@ impl Node {
+             return None;
+         }
+         let addr = self.addr_of(&target)?;
+-        // Do not forward to a previous process that ran at this node's address.
+-        if addr == self.cfg.addr {
+-            return None;
+-        }
+         Some((target, addr))
+     }
+ 

@@ -1,0 +1,16 @@
+diff --git a/src/node.rs b/src/node.rs
+index bc7700d..16d3e54 100644
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -1089,10 +1089,9 @@ impl Node {
+         if !strong && let Some(r) = self.role_cache.get(&key) {
+             return Ok(Some(r));
+         }
+-        let read_at = Instant::now();
+         let mut t = self.sys_read_at(strong).await?;
+         let role = meta::member_role(&mut t, owner_id, &user.id).await?;
+-        self.role_cache.store(key, role, read_at);
++        self.role_cache.store(key, role, Instant::now());
+         Ok(role)
+     }
+ 

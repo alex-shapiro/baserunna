@@ -1,0 +1,17 @@
+diff --git a/src/api/mod.rs b/src/api/mod.rs
+index 0983090..44910fa 100644
+--- a/src/api/mod.rs
++++ b/src/api/mod.rs
+@@ -322,7 +322,11 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
+                     }
+                     Err(_) => {
+                         node.mark_suspect(&target);
+-                        req = Request::from_parts(parts, Body::from(bytes));
++                        let mut b = http::Request::builder().method(parts.method).uri(parts.uri).version(parts.version);
++                        if let Some(h) = b.headers_mut() {
++                            *h = parts.headers;
++                        }
++                        req = b.body(Body::from(bytes)).map_err(|e| Error::internal(e.to_string()))?;
+                     }
+                 }
+             } else {

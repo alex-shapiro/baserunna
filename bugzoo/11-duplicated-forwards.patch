@@ -1,0 +1,14 @@
+diff --git a/src/api/mod.rs b/src/api/mod.rs
+index 0983090..90b7065 100644
+--- a/src/api/mod.rs
++++ b/src/api/mod.rs
+@@ -479,6 +479,9 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
+         }
+         .into_response();
+     }
++    if !id.is_empty() {
++        return next.run(req).await;
++    }
+     // Scope deduplication keys to caller credentials and request target.
+     let mut scope = Vec::new();
+     for h in [http::header::AUTHORIZATION, http::header::COOKIE] {

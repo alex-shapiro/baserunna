@@ -1,0 +1,13 @@
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 480f3f1..4af1237 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -309,6 +309,8 @@ impl Engine {
+     pub fn evict_idle(&self, idle_ms: u64) {
+         let mut g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
+         g.retain(|_, db| Arc::strong_count(db) > 1 || !db.idle_for(idle_ms));
++        let mut seen = self.shared.lease_sightings.lock().unwrap_or_else(|e| e.into_inner());
++        seen.retain(|id, _| g.contains_key(id));
+     }
+ 
+     /// Removes the handle and cached entries for database `id`.

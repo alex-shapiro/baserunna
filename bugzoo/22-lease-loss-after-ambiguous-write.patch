@@ -1,0 +1,13 @@
+diff --git a/src/engine/db.rs b/src/engine/db.rs
+index 3a4eb24..615ae5b 100644
+--- a/src/engine/db.rs
++++ b/src/engine/db.rs
+@@ -890,8 +890,6 @@ impl Db {
+             let foreign = self.foreign_lease(&base).map(|(l, left)| (l.node.clone(), left));
+             if let Some((holder, left)) = foreign {
+                 let e = Error::NotOwner { holder, retry_after_ms: left.as_millis() as u64 };
+-                // An earlier attempt may have landed before the lease moved.
+-                let e = if maybe_applied { unknown(e) } else { e };
+                 self.finish_failed(batch, e);
+                 return;
+             }

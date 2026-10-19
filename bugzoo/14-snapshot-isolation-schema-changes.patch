@@ -1,0 +1,13 @@
+diff --git a/src/table/mod.rs b/src/table/mod.rs
+index 85e9574..5777e8c 100644
+--- a/src/table/mod.rs
++++ b/src/table/mod.rs
+@@ -95,7 +95,7 @@ fn decode_schema(it: &ReadValue) -> Result<TableSchema> {
+ 
+ /// Read `name`'s schema and pin its key so the transaction conflicts if the schema changes.
+ pub async fn get_schema(txn: &mut Txn, name: &str) -> Result<TableSchema> {
+-    match txn.get_pinned(&catalog_key(name)).await? {
++    match txn.get(&catalog_key(name)).await? {
+         Some(it) => decode_schema(&it),
+         None => Err(Error::not_found(format!("table {name:?} not found"))),
+     }

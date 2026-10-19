@@ -1,0 +1,13 @@
+diff --git a/src/api/account.rs b/src/api/account.rs
+index 72c8c02..0ca8532 100644
+--- a/src/api/account.rs
++++ b/src/api/account.rs
+@@ -296,7 +296,7 @@ async fn revoke_session(State(node): State<Arc<Node>>, Auth(p): Auth, Path(id):
+ async fn list_keys(State(node): State<Arc<Node>>, Auth(p): Auth, q: Params) -> Result<axum::Json<Json>> {
+     p.require_session()?;
+     let (limit, cursor) = paging(&q)?;
+-    let mut t = node.sys_read_strong().await?;
++    let mut t = node.sys_read().await?;
+     let page = meta::api_keys_page(&mut t, &p.user.id, limit, cursor).await?;
+     let mut out = Vec::new();
+     for k in page.items {

@@ -1,0 +1,19 @@
+diff --git a/src/api/mod.rs b/src/api/mod.rs
+index 0983090..1e0b764 100644
+--- a/src/api/mod.rs
++++ b/src/api/mod.rs
+@@ -471,14 +471,6 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
+     if req.method() == http::Method::GET || req.method() == http::Method::HEAD {
+         return next.run(req).await;
+     }
+-    if req.headers().get(FORWARD_TO_HEADER).and_then(|v| v.to_str().ok()) != Some(node.id.as_str()) {
+-        return Error::Unavailable {
+-            message: "forwarded to a node that is no longer running".into(),
+-            retry_after_ms: Some(100),
+-            outcome_unknown: false,
+-        }
+-        .into_response();
+-    }
+     // Scope deduplication keys to caller credentials and request target.
+     let mut scope = Vec::new();
+     for h in [http::header::AUTHORIZATION, http::header::COOKIE] {

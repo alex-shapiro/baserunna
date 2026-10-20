@@ -2,11 +2,11 @@ diff --git a/src/engine/db.rs b/src/engine/db.rs
 index 0e2dd5a..42d81e7 100644
 --- a/src/engine/db.rs
 +++ b/src/engine/db.rs
-@@ -934,7 +934,6 @@ impl Db {
+@@ -984,7 +984,6 @@ impl Db {
              if let Some((holder, left)) = foreign {
                  let e = Error::NotOwner { holder, retry_after_ms: left.as_millis() as u64 };
                  probe::hit(if maybe_applied { Probe::CommitUnknownAfterLeaseMoved } else { Probe::CommitNotOwner });
 -                let e = if maybe_applied { unknown(e) } else { e };
-                 self.finish_failed(batch, e);
+                 self.fail_batch(&base, batch, e).await;
                  return;
              }

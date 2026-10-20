@@ -13,6 +13,7 @@ cloud = ["dep:object_store", "dep:reqwest"]
 aws-lc-rs = "1.18"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "form", "tokio", "matched-path", "original-uri"] }
 bytes = "1"
+crc32c = "0.6"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
@@ -26,6 +27,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", 
 tower = { version = "0.5", default-features = false, features = ["util"] }
 object_store = { version = "0.14", default-features = false, features = ["aws", "gcp", "azure"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"], optional = true }
+
+[dev-dependencies]
+libc = "0.2"
 
 [[bench]]
 name = "throughput"

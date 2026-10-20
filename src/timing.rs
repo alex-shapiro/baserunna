@@ -194,6 +194,9 @@ impl Call<'_> {
 
 impl Drop for Call<'_> {
     fn drop(&mut self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
         let class = ObjectClass::from_key(self.key);
         let elapsed = self.started.elapsed();
         self.store.metrics.store_call(class, self.op, elapsed, self.failed);

@@ -43,6 +43,7 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
         c.heal,
         c.quiet,
         c.pause_node,
+        c.stop,
     ];
     let mut r = sim.fork_rng();
     let Some(action) = r.weighted(&weights.map(|w| w as f64)) else {
@@ -58,7 +59,8 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
         0 if up.len() > 1 => sim.crash(pick_up(&mut r)),
         1 => {
             if let Some(i) = (0..n).find(|i| !up.contains(i)) {
-                sim.start(i).await;
+                let sim = sim.clone();
+                tokio::spawn(async move { sim.start(i).await });
             }
         }
         2 if n > 1 => {
@@ -79,6 +81,10 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
         8 if !up.is_empty() => {
             let ms = r.below(3 * sim.cfg.engine.read_lease_ms);
             sim.pause_node(pick_up(&mut r), ms);
+        }
+        9 if up.len() > 1 => {
+            let (sim, i) = (sim.clone(), pick_up(&mut r));
+            tokio::spawn(async move { sim.stop(i).await });
         }
         _ => {}
     }

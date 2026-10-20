@@ -278,8 +278,6 @@ async fn pagination(b: &mut Browser) -> Result<(), String> {
     expect(seen == existing + 3, format!("paging API keys two at a time found {seen} of {}", existing + 3))
 }
 
-/// Verifies stream pages: creation, appends of text and JSON, escaping,
-/// newest-first paging, retention, trims and deletion.
 async fn streams(b: &mut Browser, evil: &str) -> Result<(), String> {
     let r = b.req("POST", "/console/dbs/webdb/streams", Some(form(&[("name", "x")]))).await?;
     expect(r.status == 403, format!("creating a stream without a CSRF token returned {}", r.status))?;
@@ -300,14 +298,14 @@ async fn streams(b: &mut Browser, evil: &str) -> Result<(), String> {
     let r = b.api("streams").call_settled("POST", "/v1/dbs/webdb/streams/events/records", Some(body)).await;
     expect(r.status == 200, format!("appending 60 records: {} {}", r.status, r.json))?;
     let newest = b.page(sp).await?;
-    // The first two records precede r00, at seq 2.
-    let (r59, r10) = (newest.find("r59"), newest.find("r10"));
+    let cell = |v: &str| format!("<td>{v}</td>");
+    let (r59, r10) = (newest.find(&cell("r59")), newest.find(&cell("r10")));
     expect(r59.is_some() && r10.is_some() && r59 < r10, "the newest records are not shown first")?;
-    expect(!newest.contains("r09"), "the first page shows more than 50 records")?;
+    expect(!newest.contains(&cell("r09")), "the first page shows more than 50 records")?;
     let older = link(&newest, "Older →").ok_or("missing link to older records")?;
     let page = b.page(&older).await?;
     expect(
-        page.contains("r09") && page.contains("&lt;script&gt;") && !page.contains("r10"),
+        page.contains(&cell("r09")) && page.contains("&lt;script&gt;") && !page.contains(&cell("r10")),
         format!("{older} is wrong"),
     )?;
     expect(link(&page, "Newest").is_some() && link(&page, "Older →").is_none(), "the oldest page's pager is wrong")?;

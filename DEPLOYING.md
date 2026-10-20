@@ -136,8 +136,8 @@ On SIGTERM (or SIGINT) a node:
    still serving, so the load balancer stops sending it requests;
 2. stops accepting connections and lets in-flight requests finish, for at
    most `BASERUNNA_SHUTDOWN_TIMEOUT_MS` (default 20 s);
-3. releases its database leases and leaves the membership table, so other
-   nodes take over writes at once instead of after the lease expires.
+3. leaves the membership table and releases its database leases so that other
+   nodes can take over writes immediately.
 
 Set the drain delay to at least the load balancer's health check interval
 times its unhealthy threshold, and give the orchestrator a grace period
@@ -146,6 +146,12 @@ longer than both settings together (on Kubernetes,
 stopping node are lost (`404 txn_not_found`, nothing committed). A killed
 node loses nothing either; its databases just wait out their leases
 (SPEC §5.7).
+
+## Upgrades
+
+If a new release changes the storage format, older nodes cannot read manifests
+written by newer nodes. To upgrade a cluster across a format change, stop all
+nodes before starting the new version.
 
 ## Bucket
 

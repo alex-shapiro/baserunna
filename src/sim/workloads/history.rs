@@ -285,7 +285,8 @@ pub fn check(history: &[Txn]) -> Result<(), String> {
         })
         .collect();
     begun.sort();
-    let last = writers.last().map_or(0, |(v, _)| *v);
+    // Include versions allocated by commit status checks.
+    let last = history.iter().filter_map(pos).chain(writers.last().map(|(v, _)| *v)).max().unwrap_or(0);
     let ceiling = |end: u64| {
         let n = begun.partition_point(|(start, _)| *start <= end);
         begun[n..].iter().map(|(_, p)| *p).fold(last, u64::min)
@@ -534,15 +535,12 @@ async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String, settle: bool, 
         };
         if writes && unknown {
             raced = retry && !ambiguous;
-            if !raced {
-                c.pause(ZOMBIE_WAIT_MS).await;
-            }
             if retry && c.dedups(t.start) {
+                if !raced {
+                    c.pause(ZOMBIE_WAIT_MS).await;
+                }
                 ambiguous = true;
                 continue;
-            }
-            if raced {
-                c.pause(ZOMBIE_WAIT_MS).await;
             }
             t.outcome = resolve(c, db, &format!("key:{key}"), t, settle).await?;
             return Ok(());
@@ -607,7 +605,6 @@ async fn interactive(c: &Client, db: &str, t: &mut Txn, rng: &mut Rng, settle: b
     let r =
         c.call("POST", &format!("{base}/{id}/commit"), Some(json!({"ops": request_ops(t, &t.ops[b..], true)}))).await;
     if matches!(&r, Ok(r) if r.outcome_unknown()) || matches!(&r, Err(e) if *e != super::super::NetError::Refused) {
-        c.pause(ZOMBIE_WAIT_MS).await;
         t.outcome = resolve(c, db, &cid, t, settle).await?;
         return Ok(());
     }

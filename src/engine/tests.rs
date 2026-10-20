@@ -1,6 +1,7 @@
 //! Engine model and unit tests.
 
 use super::*;
+use crate::engine::types::commit_key;
 use crate::env::Env;
 use crate::error::Error;
 use crate::store::StoreError;
@@ -15,7 +16,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// A paused-clock runtime for one test, which also starts a probe recording.
 pub(crate) fn rt() -> tokio::runtime::Runtime {
     crate::probe::record();
     tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap()
@@ -517,9 +517,9 @@ pub(super) struct DelayStore {
     put_reply_ms: AtomicU64,
     manifest_put_conflicts: AtomicU32,
     manifest_put_outages: AtomicU32,
-    /// Manifest writes that are applied, but whose reply is lost.
     pub(super) manifest_put_lost: AtomicU32,
     manifest_get_outages: AtomicU32,
+    stale_manifest: Mutex<Option<Bytes>>,
     manifest_puts: AtomicU32,
     gets: Mutex<Vec<(String, bool)>>,
     seg_get_bytes: Mutex<Vec<usize>>,
@@ -541,6 +541,12 @@ impl ObjectStore for DelayStore {
             self.gets.lock().unwrap().push((key.to_string(), opts.if_none_match.is_some()));
             if key.ends_with("/manifest") && take_fault(&self.manifest_get_outages) {
                 return Err(StoreError::Unavailable("injected".into()));
+            }
+            if key.ends_with("/manifest")
+                && let Some(data) = self.stale_manifest.lock().unwrap().take()
+            {
+                let size = data.len() as u64;
+                return Ok(GetResult { data, etag: "stale".into(), size, last_modified_ms: 0 });
             }
             let r = self.mem.get_sync(key, &opts);
             if let (true, Ok(g)) = (key.contains("/seg/"), &r) {
@@ -602,6 +608,7 @@ pub(super) fn delayed_engine_with(node: &str, cfg: EngineConfig) -> (Arc<Engine>
         manifest_put_outages: 0.into(),
         manifest_put_lost: 0.into(),
         manifest_get_outages: 0.into(),
+        stale_manifest: Mutex::default(),
         manifest_puts: 0.into(),
         gets: Mutex::default(),
         seg_get_bytes: Mutex::default(),
@@ -664,16 +671,52 @@ fn strong_reads_wait_for_the_write_in_flight() {
 }
 
 #[test]
-fn fenced_status_writes_the_manifest() {
+fn resolving_a_commit_aborts_it() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
-        let db = eng.db("d");
-        db.open(true).await.unwrap();
+        let db = opened(&eng, "d").await;
         put(&db, "k", "1").await;
+        let request = |id: u64| {
+            let db = db.clone();
+            async move {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                t.put(Bytes::from(format!("k{id}")), inline("v")).unwrap();
+                let mut r = t.into_request();
+                r.commit_id = id;
+                r
+            }
+        };
         let etag = || store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().etag;
+        let (stale, stale_again) = (request(42).await, request(42).await);
         let before = etag();
-        assert_eq!(db.commit_status_fenced(42).await.unwrap(), None);
-        assert_ne!(etag(), before, "the fence did not write the manifest");
+        assert_eq!(db.resolve_commit(42).await.unwrap(), None);
+        assert_ne!(etag(), before, "resolving an unknown commit did not write the manifest");
+        assert_eq!(db.commit_status(42).await.unwrap(), Some(CommitState::Aborted));
+        assert!(matches!(db.commit_detailed(stale).await, Err(Error::Aborted(_))), "an attempt older than the abort");
+        assert!(matches!(db.commit_detailed(request(42).await).await, Err(Error::Aborted(_))), "a new attempt");
+        let before = etag();
+        assert_eq!(db.resolve_commit(42).await.unwrap(), None);
+        assert_eq!(etag(), before, "resolving an aborted commit again wrote the manifest");
+
+        let late = request(43).await;
+        let (resolved, attempt) = tokio::join!(db.resolve_commit(43), db.commit_detailed(late));
+        assert_eq!(resolved.unwrap(), None);
+        assert!(matches!(attempt, Err(Error::Aborted(_))), "an attempt batched after the abort applied");
+        assert!(strong_get(&db, "k43").await.is_none());
+
+        let early = request(44).await;
+        let (attempt, resolved) = tokio::join!(db.commit_detailed(early), db.resolve_commit(44));
+        let version = attempt.unwrap().version;
+        assert_eq!(resolved.unwrap().map(|c| c.version), Some(version));
+        let before = etag();
+        assert_eq!(db.resolve_commit(44).await.unwrap().map(|c| c.version), Some(version));
+        assert_eq!(etag(), before, "resolving an applied commit wrote the manifest");
+
+        put_many(&db, "f", 20, 300).await;
+        flushed(&db).await;
+        assert!(db.current().unwrap().m.tail.iter().all(|e| e.key != commit_key(42)), "setup: flushed");
+        assert!(matches!(db.commit_detailed(stale_again).await, Err(Error::Aborted(_))), "aborted from a segment");
+        assert!(matches!(db.commit_detailed(request(42).await).await, Err(Error::Aborted(_))));
     });
 }
 
@@ -864,6 +907,45 @@ fn collection_ignores_node_clock_skew() {
         for key in &obsolete {
             assert!(mem.keys().contains(key), "{key} deleted within gc_grace");
         }
+    });
+}
+
+#[test]
+fn a_manifest_whose_levels_object_was_collected_is_read_again() {
+    rt().block_on(async {
+        let cfg = EngineConfig { levels_inline_max: 0, ..EngineConfig::small_for_tests() };
+        let (a, store) = delayed_engine_with("a", cfg);
+        let db = opened(&a, "d").await;
+        let levels = || db.current().unwrap().m.levels.clone();
+        let mut round = 0;
+        let mut write_until = async |done: &dyn Fn(Option<String>) -> bool| {
+            while !done(levels()) {
+                assert!(round < 200, "setup: the levels object never changed");
+                put_many(&db, &format!("r{round:03}-"), 5, 500).await;
+                db.maintenance_now().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                round += 1;
+            }
+        };
+        write_until(&|l| l.is_some()).await;
+        let old = levels().unwrap();
+        let stale = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().data;
+        write_until(&|l| l.is_some_and(|l| l != old)).await;
+        store.mem.delete(&levels_key("d", &old)).await.unwrap();
+
+        let b = second_node(&a, &store, "b");
+        *store.stale_manifest.lock().unwrap() = Some(stale.clone());
+        let before = crate::probe::count(crate::probe::Probe::LevelsCollectedUnderRead);
+        let v = b.db("d").refresh(Instant::now(), false).await.unwrap();
+        assert_eq!(v.m.levels, levels(), "read the replacing manifest");
+        assert_eq!(crate::probe::count(crate::probe::Probe::LevelsCollectedUnderRead), before + 1);
+
+        let c = second_node(&a, &store, "c");
+        let current = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().data;
+        store.mem.delete(&levels_key("d", levels().as_deref().unwrap())).await.unwrap();
+        *store.stale_manifest.lock().unwrap() = Some(current);
+        let r = c.db("d").refresh(Instant::now(), false).await;
+        assert!(matches!(r, Err(Error::Internal(_))), "{:?}", r.err());
     });
 }
 
@@ -1146,6 +1228,16 @@ pub(super) async fn put_many(db: &Arc<Db>, prefix: &str, n: usize, len: usize) -
     db.commit(t.into_request()).await.unwrap()
 }
 
+pub(super) async fn flushed(db: &Arc<Db>) {
+    for _ in 0..500 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if !db.busy() {
+            return;
+        }
+    }
+    panic!("background work never settled");
+}
+
 pub(super) async fn strong_get(db: &Arc<Db>, k: &str) -> Option<Value> {
     db.snapshot(Consistency::Strong).await.unwrap().get(k.as_bytes()).await.unwrap().map(|e| e.value)
 }
@@ -1198,16 +1290,14 @@ fn commit_with_lost_reply_after_takeover(reply_delay_leases: u64, hedge_ms: u64)
 
 #[test]
 fn ambiguous_commit_during_active_lease() {
-    // Node B retries while node A's lease is still active.
     match commit_with_lost_reply_after_takeover(2, 0) {
-        Err(Error::Unavailable { outcome_unknown: true, .. }) => {}
-        other => panic!("expected unknown outcome for applied write, got {other:?}"),
+        Ok(2) => {}
+        other => panic!("expected the applied write's version 2, got {other:?}"),
     }
 }
 
 #[test]
 fn ambiguous_commit_after_lease_expires() {
-    // Node B retries after the store clock shows node A's lease has expired.
     match commit_with_lost_reply_after_takeover(4, 0) {
         Ok(2) => {}
         other => panic!("expected version 2, got {other:?}"),
@@ -1223,7 +1313,7 @@ fn hedged_commit_resolves_before_a_takeover() {
 }
 
 #[test]
-fn released_leases_hand_over_at_once() {
+fn released_leases_hand_over_immediately() {
     rt().block_on(async {
         let (a, store) = delayed_engine("a");
         let da = opened(&a, "d").await;
@@ -1234,6 +1324,53 @@ fn released_leases_hand_over_at_once() {
         tokio::time::sleep(Duration::from_millis(1)).await;
         put(&db, "k", "b").await;
         assert_eq!(strong_get(&da, "k").await, Some(inline("b")));
+    });
+}
+
+#[test]
+fn decided_commits_are_answered_on_write_failure() {
+    rt().block_on(async {
+        let cfg = EngineConfig { manifest_put_hedge_ms: 0, commit_retry_max: 2, ..EngineConfig::small_for_tests() };
+        let (eng, store) = delayed_engine_with("a", cfg);
+        let db = opened(&eng, "d").await;
+        let request = |id: u64| {
+            let db = db.clone();
+            async move {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                t.put(Bytes::from_static(b"k"), inline("v")).unwrap();
+                let mut r = t.into_request();
+                r.commit_id = id;
+                r
+            }
+        };
+        let first = db.commit_detailed(request(77).await).await.unwrap();
+        assert_eq!(db.resolve_commit(88).await.unwrap(), None);
+        let (retry, aborted) = (request(77).await, request(88).await);
+        store.manifest_put_lost.store(10, SeqCst);
+        let (lease, replay, late) =
+            tokio::join!(db.acquire_lease(), db.commit_detailed(retry), db.commit_detailed(aborted));
+        assert!(lease.is_err(), "setup: the lease renewal's writes were not ambiguous");
+        let replay = replay.expect("a commit recorded in a stored manifest was reported failed");
+        assert_eq!((replay.version, replay.replayed), (first.version, true));
+        assert!(matches!(late, Err(Error::Aborted(_))), "an aborted commit was reported {late:?}");
+    });
+}
+
+#[test]
+fn background_work_does_not_take_back_a_released_lease() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        let before = crate::probe::count(crate::probe::Probe::BackgroundInstallUnleased);
+        put_many(&db, "k", 5, 500).await;
+        assert!(db.busy(), "setup: flush did not start");
+        db.release_lease().await.unwrap();
+        flushed(&db).await;
+        let stored = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().data;
+        let m = manifest::Manifest::decode(&stored).unwrap();
+        assert_eq!(m.lease, None, "the flush took the released lease back");
+        assert!(!m.tail.is_empty(), "the flush was installed without the lease");
+        assert!(crate::probe::count(crate::probe::Probe::BackgroundInstallUnleased) > before);
     });
 }
 
@@ -1387,7 +1524,11 @@ fn commit_records_make_commits_idempotent_until_they_expire() {
         let again = db.commit_detailed(request(99, 7).await).await.unwrap();
         assert_eq!((again.version, again.replayed), (ra.version, true), "an old commit is still known");
         for (id, version) in &ids {
-            assert_eq!(db.commit_status(*id).await.unwrap().map(|s| s.version), Some(*version));
+            let applied = |s| match s {
+                CommitState::Applied(c) => Some(c.version),
+                CommitState::Aborted => None,
+            };
+            assert_eq!(db.commit_status(*id).await.unwrap().and_then(applied), Some(*version));
         }
         assert_eq!(db.commit_status(424242).await.unwrap(), None);
         for _ in 0..2 {
@@ -1413,8 +1554,8 @@ fn commit_records_make_commits_idempotent_until_they_expire() {
             .next()
             .await
             .unwrap();
-        assert!(records.is_some_and(|e| !e.value.is_tombstone() && e.expires.is_none()), "no tombstones of records");
-        assert!(v.all_entries(true).await.unwrap().iter().all(|e| !types::is_commit_key(&e.key)), "data excludes them");
+        assert!(records.is_some_and(|e| !e.value.is_tombstone() && e.expires.is_none()));
+        assert!(v.all_entries(true).await.unwrap().iter().all(|e| !types::is_commit_key(&e.key)));
     });
 }
 
@@ -1459,7 +1600,7 @@ fn tail_tombstones_are_dropped_after_a_transaction_lifetime() {
         db.commit(t.into_request()).await.unwrap();
         let tombstone =
             || db.current().unwrap().m.tail.iter().any(|e| e.key.as_ref() == b"k" && e.value.is_tombstone());
-        assert!(tombstone(), "dropped at once");
+        assert!(tombstone());
         tokio::time::sleep_until(start + Duration::from_millis(life - 1)).await;
         put(&db, "x", "1").await;
         assert!(tombstone(), "dropped within a transaction lifetime");
@@ -1495,7 +1636,12 @@ fn flushes_are_compacted_in_the_background() {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let m = &db.current().unwrap().m;
         m.check_levels().unwrap();
-        assert!(m.compaction_seq > 0);
+        assert!(
+            m.compaction_seq > 0,
+            "tail {} segments {:?}",
+            m.tail_bytes(),
+            m.segments.iter().map(|s| (s.level, s.size)).collect::<Vec<_>>()
+        );
         assert!(m.level(0).len() < eng.shared.cfg.l0_compaction_trigger, "{} level 0 segments", m.level(0).len());
         let (base, targets) = compaction::level_targets(m, &eng.shared.cfg);
         for l in 1..manifest::MAX_LEVEL {
@@ -1543,7 +1689,9 @@ fn unchanged_manifests_are_revalidated_conditionally() {
 fn small_segments_load_with_one_request() {
     rt().block_on(async {
         let (a, store) = delayed_engine("a");
-        put_many(&opened(&a, "d").await, "k", 5, 500).await;
+        let db = opened(&a, "d").await;
+        put_many(&db, "k", 5, 500).await;
+        flushed(&db).await;
         let seg_gets = || store.gets_matching(|k| k.contains("/seg/"));
         let before = seg_gets();
         let db = second_node(&a, &store, "b").db("d");
@@ -1565,6 +1713,7 @@ fn validation_sees_flushed_writes_and_not_the_snapshot_itself() {
         fine.scan(&KeyRange::prefix(b"b"), false, 10).await.unwrap();
         fine.put(Bytes::from_static(b"y"), inline("1")).unwrap();
         put_many(&db, "a", 5, 500).await;
+        flushed(&db).await;
         assert!(db.current().unwrap().m.tail.is_empty(), "setup: the concurrent write was not flushed");
         assert_eq!(db.commit(stale.into_request()).await.unwrap_err().code(), "conflict");
         db.commit(fine.into_request()).await.expect("data as old as the snapshot conflicted");
@@ -1600,7 +1749,7 @@ fn stored_segment(store: &MemStore, id: char, level: u8, entries: &[Entry]) -> m
 }
 
 #[test]
-fn merges_purge_only_tombstones_nothing_needs() {
+fn merges_purge_expired_tombstones() {
     rt().block_on(async {
         let (eng, store, _env) = engine(1, EngineConfig::small_for_tests());
         let e = |k: &str, seq, value| Entry::new(Bytes::from(k.to_string()), seq, value);
@@ -1719,7 +1868,8 @@ fn written_segments_are_read_without_requests() {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
         put_many(&db, "k", 5, 500).await;
-        assert!(db.current().unwrap().m.tail.is_empty(), "setup: no flush");
+        flushed(&db).await;
+        assert!(db.current().unwrap().m.tail.is_empty());
         let gets = || store.seg_get_bytes.lock().unwrap().len();
         let before = gets();
         assert!(strong_get(&db, "k03").await.is_some());
@@ -1743,7 +1893,8 @@ fn appends_move_down_without_rewrites() {
                 levels.entry(s.id.clone()).or_default().insert(s.level);
             }
         }
-        assert!(levels.values().any(|l| l.len() > 1 && !l.contains(&0)), "no segment moved down a level as it was");
+        assert!(levels.values().any(|l| l.len() > 1 && !l.contains(&0)));
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
         let writes = store.manifest_puts.load(SeqCst);
         tokio::time::sleep(Duration::from_millis(1_000)).await;
         assert_eq!(store.manifest_puts.load(SeqCst), writes, "compaction kept writing the manifest");
@@ -1776,6 +1927,63 @@ fn restarted_nodes_read_what_they_wrote_locally() {
         let v = restarted.db("d").read_version(Consistency::Strong).await.unwrap();
         assert_eq!(v.all_entries(false).await.unwrap().len(), 300);
         assert_eq!(gets(), before, "segment requests after a restart");
+    });
+}
+
+#[test]
+fn bulk_reads_use_the_caches_without_filling_them() {
+    rt().block_on(async {
+        let tier = local::LocalTier(Arc::new(local::MemLocal::new(64 << 20)));
+        let cfg = EngineConfig { local_tier: Some(tier), ..EngineConfig::small_for_tests() };
+        let (a, store) = delayed_engine_with("a", cfg.clone());
+        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        let db = opened(&a, "d").await;
+        let mut r = Rng::new(5);
+        for i in 0..80 {
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            for j in 0..5 {
+                t.put(Bytes::from(format!("k{:03}{j}", (i * 7) % 61)), Value::Inline(Bytes::from(r.bytes(120))))
+                    .unwrap();
+            }
+            db.commit(t.into_request()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let m = db.current().unwrap().m.clone();
+        let whole = |s: &manifest::SegmentMeta| s.size <= cfg.segment_whole_fetch_max;
+        assert!(m.segments.iter().any(whole) && !m.segments.iter().all(whole), "setup: segment sizes");
+        assert_eq!(gets(), 0, "segments this node wrote were fetched back");
+
+        let bulk = |e: &Arc<Engine>| {
+            let v = Version::new(m.clone(), String::new(), e.shared.clone());
+            async move {
+                let mut it = v.iter_bulk(true);
+                let mut got = Vec::new();
+                while let Some(e) = it.next().await.unwrap() {
+                    got.push(e);
+                }
+                got
+            }
+        };
+        let want = bulk(&a).await;
+        assert_eq!(gets(), 0);
+        let restarted = Engine::new(store.clone(), a.shared.env.clone(), cfg.clone(), "a2".into());
+        assert_eq!(bulk(&restarted).await, want);
+        assert_eq!(gets(), 0, "a restarted node read its local tier");
+        assert_eq!(restarted.shared.cache.stats().entries, 0, "bulk reads cached what they read");
+
+        let cold = Engine::new(
+            store.clone(),
+            a.shared.env.clone(),
+            EngineConfig { local_tier: None, ..cfg.clone() },
+            "b".into(),
+        );
+        assert_eq!(bulk(&cold).await, want);
+        let small = m.segments.iter().filter(|s| whole(s)).count();
+        let large: Vec<&manifest::SegmentMeta> = m.segments.iter().filter(|s| !whole(s)).collect();
+        let most = small + large.iter().map(|s| 2 + (s.size / cfg.bulk_read_bytes) as usize + 1).sum::<usize>();
+        assert!(gets() <= most, "{} requests for {small} small and {} large segments", gets(), large.len());
+        assert_eq!(cold.shared.cache.stats().entries, 0, "bulk reads cached what they fetched");
     });
 }
 
@@ -1875,7 +2083,8 @@ fn changes_are_entries_newer_than_the_snapshot() {
 #[test]
 fn one_compaction_at_a_time() {
     rt().block_on(async {
-        let (eng, store) = delayed_engine("a");
+        let cfg = EngineConfig { tail_max_bytes: 8 * 1024, ..EngineConfig::small_for_tests() };
+        let (eng, store) = delayed_engine_with("a", cfg);
         let db = opened(&eng, "d").await;
         store.put_reply_ms.store(50, SeqCst);
         for i in 0..16 {

@@ -14,6 +14,8 @@ use tokio::time::Instant;
 pub struct StoreFaults {
     pub latency_min_ms: u64,
     pub latency_max_ms: u64,
+    /// Simulated transfer latency per MiB for `GET` and `PUT` payloads.
+    pub ms_per_mib: u64,
     /// Probability of 10x request latency.
     pub p_slow: f64,
     /// Probability that a request stalls for `stall_ms` before succeeding.
@@ -35,6 +37,7 @@ impl StoreFaults {
         StoreFaults {
             latency_min_ms: 1,
             latency_max_ms: 5,
+            ms_per_mib: 0,
             p_slow: 0.0,
             p_stall: 0.0,
             stall_ms: (0, 0),
@@ -148,7 +151,6 @@ impl SimStore {
             latency_ms = r.range(f.stall_ms.0, f.stall_ms.1.max(f.stall_ms.0) + 1);
             self.trace.event(&format!("store stall {latency_ms}ms"));
         }
-        // Avoid advancing the RNG when disabled so existing seeds remain reproducible.
         let late_reply_ms = if on && f.p_late_reply > 0.0 && r.chance(f.p_late_reply) {
             r.range(f.late_reply_ms.0, f.late_reply_ms.1.max(f.late_reply_ms.0) + 1)
         } else {
@@ -161,6 +163,11 @@ impl SimStore {
             fail_after: on && r.chance(f.p_fail_after),
             list_lag_ms: if on && f.list_lag_ms > 0 { r.below(f.list_lag_ms + 1) } else { 0 },
         }
+    }
+
+    fn transfer_time(&self, bytes: usize) -> Duration {
+        let ms_per_mib = self.faults.lock().unwrap_or_else(|e| e.into_inner()).ms_per_mib;
+        Duration::from_millis((bytes as u64 * ms_per_mib) >> 20)
     }
 
     fn view(&self) -> std::sync::MutexGuard<'_, ListView> {
@@ -217,6 +224,9 @@ impl ObjectStore for SimStore {
                 return Err(unavailable("injected get failure"));
             }
             let r = self.mem.get_sync(key, &opts);
+            if let Ok(g) = &r {
+                tokio::time::sleep(self.transfer_time(g.data.len())).await;
+            }
             self.trace.event(&format!(
                 "store get {key} -> {}",
                 match &r {
@@ -233,6 +243,7 @@ impl ObjectStore for SimStore {
             self.stats.puts.fetch_add(1, Ordering::Relaxed);
             let Draw { latency_ms: lat, late_reply_ms, fail_before: before, fail_after: after, list_lag_ms } =
                 self.draw();
+            let lat = lat + self.transfer_time(data.len()).as_millis() as u64;
             let held_replies = self.held_replies.clone();
             let (tx, rx) = tokio::sync::oneshot::channel();
             let mem = self.mem.clone();

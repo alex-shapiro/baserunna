@@ -1,5 +1,4 @@
-//! The storage engine: many small LSM databases on object storage, each
-//! rooted at a CAS-updated manifest. See SPEC §5.
+//! LSM storage engine backed by object storage.
 
 pub mod blob;
 pub mod cache;
@@ -24,7 +23,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 pub use config::EngineConfig;
-pub use db::{Committed, Consistency, Db, DbStats, LevelStats};
+pub use db::{CommitState, Committed, Consistency, Db, DbStats, LevelStats};
 pub use stream::{Appended, Record, Retention, Seek, StreamOp, StreamState};
 pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
 pub use types::{BlobRef, Entry, Seq, Value};
@@ -48,9 +47,15 @@ pub struct Shared {
     /// Databases exempt from size quota limits.
     quota_exempt: Mutex<std::collections::BTreeSet<String>>,
     pub metrics: Arc<crate::metrics::StoreMetrics>,
+    /// True once the node begins releasing leases for shutdown.
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
+    pub(crate) fn stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub(crate) fn quota_exempt(&self, db: &str) -> bool {
         self.quota_exempt.lock().unwrap_or_else(|e| e.into_inner()).contains(db)
     }
@@ -208,6 +213,7 @@ impl Engine {
             clock: clock::StoreClock::new(),
             observed_leases: Mutex::new(DetHashMap::default()),
             quota_exempt: Mutex::new(Default::default()),
+            stopping: false.into(),
         });
         Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) })
     }
@@ -239,6 +245,20 @@ impl Engine {
         v
     }
 
+    /// Releases leases for all open databases with a timeout of `per_db` per database, and
+    /// prevents this node from acquiring new leases. Returns the IDs of databases whose leases
+    /// were released.
+    pub async fn release_leases(&self, per_db: Duration) -> Vec<String> {
+        self.shared.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut released = Vec::new();
+        for db in self.open_dbs() {
+            if let Ok(Ok(true)) = tokio::time::timeout(per_db, db.release_lease()).await {
+                released.push(db.id.clone());
+            }
+        }
+        released
+    }
+
     /// Drops unreferenced handles that have been idle for `idle_ms`.
     pub fn evict_idle(&self, idle_ms: u64) {
         let mut g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
@@ -249,7 +269,7 @@ impl Engine {
     /// Removes the handle and cached entries for database `id`.
     pub fn forget(&self, id: &str) {
         self.dbs.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
-        self.shared.cache.evict_prefix(&db_prefix(id));
+        self.shared.cache.evict_db(id);
     }
 
     /// Deletes all objects belonging to database `id` from storage.

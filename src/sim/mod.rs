@@ -114,6 +114,8 @@ pub struct ChaosFaults {
     /// Maximum recovery period after a storm, during which the cluster is healed.
     pub calm_ms: u64,
     pub crash: u64,
+    /// Gracefully shuts down a node.
+    pub stop: u64,
     pub start: u64,
     pub partition: u64,
     pub one_way_partition: u64,
@@ -347,6 +349,10 @@ impl crate::engine::local::LocalStore for SimDisk {
         })
     }
 
+    fn contains(&self, key: &str) -> bool {
+        self.inner.contains(key)
+    }
+
     fn stats(&self) -> crate::engine::local::LocalStats {
         self.inner.stats()
     }
@@ -578,7 +584,7 @@ impl Sim {
         (0..self.slots.len()).filter(|i| self.node(*i).is_some()).collect()
     }
 
-    /// Starts node `i` unless it is up.
+    /// Starts node `i` if it is not running.
     pub async fn start(&self, i: usize) {
         let _starting = self.starting[i].lock().await;
         if self.node(i).is_some() {
@@ -597,7 +603,8 @@ impl Sim {
         cfg.public_url = "https://baserunna.test".into();
         cfg.engine = self.cfg.engine.clone();
         cfg.engine.local_tier = self.disks[i].clone();
-        for attempt in 0..50u64 {
+        let mut failures = 0u64;
+        for attempt in 0u64.. {
             let env = Arc::new(Env::sim(self.seed ^ (n * 7919 + attempt + 1), self.base_ms, self.origin, skew));
             let me = self.me.clone();
             env.set_crash_hook(Arc::new(move |why: &str| {
@@ -630,11 +637,16 @@ impl Sim {
                 Err(e) => {
                     env.shutdown();
                     self.trace.event(&format!("start n{i} failed: {e}"));
-                    tokio::time::sleep(Duration::from_millis(200 + 100 * attempt)).await;
+                    if !self.is_isolated(i) {
+                        failures += 1;
+                        if failures == 50 {
+                            panic!("node {i} could not start");
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200 + 100 * attempt.min(50))).await;
                 }
             }
         }
-        panic!("node {i} could not start");
     }
 
     /// Crashes node `i` at a crash point if it is still running instance `n`,
@@ -662,6 +674,24 @@ impl Sim {
             }
         });
         true
+    }
+
+    /// Gracefully shuts down node `i` and verifies that its released leases are cleared in object storage.
+    pub async fn stop(&self, i: usize) {
+        let _starting = self.starting[i].lock().await;
+        let Some(n) = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        self.trace.event(&format!("stop n{i} ({})", n.node.id));
+        let released = n.node.shutdown().await;
+        for db in released {
+            let Ok(g) = self.mem.get_sync(&crate::engine::manifest_key(&db), &GetOpts::default()) else { continue };
+            let lease = crate::engine::manifest::Manifest::decode(&g.data).ok().and_then(|m| m.lease);
+            if lease.is_some_and(|l| l.node == n.node.id) {
+                let e = format!("n{i} released its lease on {db} as it stopped, but storage names it again");
+                self.trace.event(&format!("oracle: {e}"));
+                self.violation.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+            }
+        }
+        self.trace.event(&format!("stopped n{i}"));
     }
 
     /// Aborts node `i`'s tasks and drops its in-memory state.
@@ -750,6 +780,11 @@ impl Sim {
 
     fn partitioned(&self, from: usize, to: usize) -> bool {
         self.partitions.lock().unwrap_or_else(|e| e.into_inner()).contains(&(from, to))
+    }
+
+    fn is_isolated(&self, i: usize) -> bool {
+        self.store_isolated(i)
+            || self.partitions.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| a == i || b == i)
     }
 
     fn store_isolated(&self, i: usize) -> bool {

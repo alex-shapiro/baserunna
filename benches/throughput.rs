@@ -4,17 +4,23 @@
 //! ```text
 //! cargo bench --bench throughput
 //! BENCH_DBS=5000 BENCH_LATENCY_MS=20 BENCH_SECS=20 cargo bench --bench throughput
+//! # CPU cost of commits against full manifest tails:
+//! BENCH_THREADS=1 BENCH_DBS=8 BENCH_KEYS=1000 BENCH_VALUE_BYTES=256 BENCH_WRITE_PCT=100 \
+//!   BENCH_LATENCY_MS=30 BENCH_CLIENTS=256 cargo bench --bench throughput
 //! ```
 //!
 //! | variable           | default | meaning                                              |
 //! | ------------------ | ------- | ---------------------------------------------------- |
-//! | `BENCH_DBS`        | 2000    | active databases (one key each, spread over users)   |
+//! | `BENCH_DBS`        | 2000    | active databases                                     |
 //! | `BENCH_CLIENTS`    | 64      | concurrent clients                                   |
 //! | `BENCH_SECS`       | 10      | measured duration                                    |
 //! | `BENCH_WRITE_PCT`  | 10      | percentage of requests that are writes               |
 //! | `BENCH_LATENCY_MS` | 0       | added per object-store request (20 emulates S3)      |
 //! | `BENCH_CACHE_MB`   | 64      | block cache budget                                   |
 //! | `BENCH_THREADS`    | 4       | runtime worker threads                               |
+//! | `BENCH_KEYS`       | 1       | keys per database, preloaded and then written        |
+//! | `BENCH_VALUE_BYTES`| 8       | bytes per written value                              |
+//! | `BENCH_TAIL_KB`    | default | manifest tail limit (`tail_max_bytes`) in KiB        |
 
 use baserunna::env::Env;
 use baserunna::node::{Node, Services};
@@ -33,6 +39,21 @@ fn env(name: &str, default: u64) -> u64 {
 
 const DBS_PER_USER: usize = 200;
 
+fn cpu_secs() -> f64 {
+    let mut u = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage initializes the rusage struct.
+    let u = unsafe {
+        libc::getrusage(libc::RUSAGE_SELF, u.as_mut_ptr());
+        u.assume_init()
+    };
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    secs(u.ru_utime) + secs(u.ru_stime)
+}
+
+fn value(seed: u64, len: usize) -> Bytes {
+    Bytes::from(Rng::new(seed).text(len.max(1)))
+}
+
 fn main() {
     let threads = env("BENCH_THREADS", 4) as usize;
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(threads).enable_all().build().expect("runtime");
@@ -45,11 +66,14 @@ async fn bench(threads: usize) {
     let secs = env("BENCH_SECS", 10);
     let write_pct = env("BENCH_WRITE_PCT", 10);
     let latency = env("BENCH_LATENCY_MS", 0);
+    let keys = env("BENCH_KEYS", 1).max(1);
+    let value_bytes = env("BENCH_VALUE_BYTES", 8) as usize;
     baserunna::log::set_level(Some(baserunna::log::Level::Error));
 
     let store = Arc::new(MeteredStore::new(Arc::new(MemStore::with_system_clock()), 0));
     let mut cfg = node_config("bench", "http://127.0.0.1:0");
     cfg.engine.cache_bytes = env("BENCH_CACHE_MB", 64) as usize * 1024 * 1024;
+    cfg.engine.tail_max_bytes = env("BENCH_TAIL_KB", cfg.engine.tail_max_bytes as u64 / 1024) as usize * 1024;
     let dyn_store: DynStore = store.clone();
     let node = Node::start(cfg, Arc::new(Env::real()), dyn_store, Services::local()).await.expect("node starts");
     let router = baserunna::api::router(node.clone());
@@ -67,13 +91,17 @@ async fn bench(threads: usize) {
         let body = Bytes::from(json!({"name": format!("d{d}")}).to_string());
         let r = call_router(&router, "POST", "/v1/dbs", t, body).await;
         assert_eq!(r.status, 201, "create db d{d}");
-        let r = call_router(&router, "PUT", &format!("/v1/dbs/d{d}/kv/k"), t, Bytes::from_static(b"0")).await;
-        assert_eq!(r.status, 200, "seed d{d}");
+        for k in 0..keys {
+            let path = format!("/v1/dbs/d{d}/kv/k{k}");
+            let r = call_router(&router, "PUT", &path, t, value(k, value_bytes)).await;
+            assert_eq!(r.status, 200, "seed d{d}");
+        }
     }
     eprintln!("setup: {dbs} databases in {:.1}s", t0.elapsed().as_secs_f64());
 
     store.set_latency_ms(latency);
     let before = store.total();
+    let cpu_before = cpu_secs();
     let stop = Arc::new(AtomicBool::new(false));
     let start = Instant::now();
     let mut hs = Vec::new();
@@ -86,10 +114,10 @@ async fn bench(threads: usize) {
             while !stop.load(Ordering::Relaxed) {
                 let d = rng.usize(dbs);
                 let t = &tokens[d / DBS_PER_USER];
-                let path = format!("/v1/dbs/d{d}/kv/k");
+                let path = format!("/v1/dbs/d{d}/kv/k{}", rng.below(keys));
                 let t1 = Instant::now();
                 let r = if rng.below(100) < write_pct {
-                    call_router(&router, "PUT", &path, t, Bytes::from(rng.next_u64().to_string())).await
+                    call_router(&router, "PUT", &path, t, value(rng.next_u64(), value_bytes)).await
                 } else {
                     call_router(&router, "GET", &path, t, Bytes::new()).await
                 };
@@ -111,13 +139,15 @@ async fn bench(threads: usize) {
         errors += e;
     }
     let elapsed = start.elapsed().as_secs_f64();
+    let cpu = cpu_secs() - cpu_before;
     let reqs = store.total().total() - before.total();
     lat.sort_unstable();
     let pct = |p: f64| lat.get(((lat.len() as f64 * p) as usize).min(lat.len().saturating_sub(1))).copied();
     let ms = |v: Option<u32>| v.map(|v| v as f64 / 1000.0).unwrap_or(0.0);
     let cache = node.engine.shared.cache.stats();
     println!(
-        "throughput: {dbs} dbs, {clients} clients, {threads} threads, {write_pct}% writes, {latency} ms store latency"
+        "throughput: {dbs} dbs × {keys} keys of {value_bytes} B, {clients} clients, {threads} threads, \
+         {write_pct}% writes, {latency} ms store latency"
     );
     println!(
         "  ops/s            {:.0} ({} ops in {elapsed:.1}s, {errors} errors)",
@@ -129,6 +159,11 @@ async fn bench(threads: usize) {
         ms(pct(0.5)),
         ms(pct(0.99)),
         ms(lat.last().copied())
+    );
+    println!(
+        "  cpu              {:.1} µs per op ({:.0}% of one core)",
+        cpu * 1e6 / lat.len().max(1) as f64,
+        cpu * 100.0 / elapsed
     );
     println!("  store requests   {:.3} per op", reqs / lat.len().max(1) as f64);
     println!("  open handles     {}", node.engine.open_count());

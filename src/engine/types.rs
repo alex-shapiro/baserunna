@@ -1,4 +1,4 @@
-//! Core engine types: entries, values and blob references.
+//! Core engine types: entries, values, commit records, and blob references.
 
 use super::stream::Appended;
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
@@ -39,14 +39,16 @@ impl BlobRef {
     }
 }
 
-/// Key prefix for commit records: `COMMIT_SPACE ++ commit_id (u64 BE)`.
-/// Each commit writes a record with its version as `seq` and, as its value,
-/// its store time and the records each of its stream appends received
-/// ([`encode_commit_record`]), so status checks can tell whether and how a
-/// commit applied (SPEC §5.5).
-/// Records are retained for `commit_retention_ms` and dropped without a
-/// tombstone once expired.
+/// Key prefix for commit records (`COMMIT_SPACE ++ commit_id_be`).
 pub const COMMIT_SPACE: u8 = 0xFF;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitRecord {
+    Applied { time_ms: u64, appends: Vec<Appended> },
+    Aborted,
+}
+
+pub const ABORT_RECORD: Bytes = Bytes::new();
 
 pub fn encode_commit_record(time_ms: u64, appends: &[Appended]) -> Bytes {
     let mut w = Writer::with_capacity(8 + 8 * appends.len());
@@ -58,15 +60,17 @@ pub fn encode_commit_record(time_ms: u64, appends: &[Appended]) -> Bytes {
     Bytes::from(w.into_inner())
 }
 
-/// A commit record's store time and appends.
-pub fn decode_commit_record(b: &[u8]) -> DResult<(u64, Vec<Appended>)> {
+pub fn decode_commit_record(b: &[u8]) -> DResult<CommitRecord> {
+    if b.is_empty() {
+        return Ok(CommitRecord::Aborted);
+    }
     let mut r = Reader::new(b);
     let time_ms = r.varint()?;
     let mut appends = Vec::new();
     while !r.is_empty() {
         appends.push(Appended { first_seq: r.varint()?, count: r.varint()? });
     }
-    Ok((time_ms, appends))
+    Ok(CommitRecord::Applied { time_ms, appends })
 }
 
 pub fn commit_key(id: u64) -> Bytes {
@@ -133,8 +137,7 @@ impl Value {
         }
     }
 
-    /// `src` must be the buffer the reader was created over: inline values
-    /// share it without copying.
+    /// Decodes a value from `r`, slicing inline bytes directly from `src`.
     pub fn decode(r: &mut Reader<'_>, src: &Bytes) -> DResult<Value> {
         let kind = r.u8()?;
         Value::decode_kind(r, src, kind)
@@ -155,12 +158,11 @@ pub struct Entry {
     pub key: Bytes,
     pub seq: Seq,
     pub value: Value,
-    /// Store time in milliseconds at which the value expires and is read as a
-    /// tombstone with the same `seq`. Tombstones never expire.
+    /// Store expiration timestamp in milliseconds.
     pub expires: Option<u64>,
 }
 
-/// Bit flag set on the encoded value kind byte when an expiry timestamp follows.
+/// Bit flag set on the encoded value kind byte if an expiry timestamp follows.
 const EXPIRES_FLAG: u8 = 0x10;
 
 impl Entry {
@@ -176,7 +178,6 @@ impl Entry {
         self.key.len() + self.value.size() + 10 + if self.expires.is_some() { 8 } else { 0 }
     }
 
-    /// Whether the entry is a tombstone or has expired at store time `at`.
     pub fn is_dead(&self, at: u64) -> bool {
         self.value.is_tombstone() || self.expired(at)
     }
@@ -185,8 +186,6 @@ impl Entry {
         self.expires.is_some_and(|e| e <= at)
     }
 
-    /// The entry as it reads at `at`: a tombstone with the same seq once
-    /// expired.
     pub fn at(self, at: u64) -> Entry {
         match self.expired(at) {
             true => Entry::tombstone(self.key, self.seq),
@@ -231,9 +230,11 @@ mod tests {
     #[test]
     fn commit_records_roundtrip() {
         let appends = [Appended { first_seq: 0, count: 3 }, Appended { first_seq: u64::MAX, count: 0 }];
-        assert_eq!(decode_commit_record(&encode_commit_record(17, &appends)).unwrap(), (17, appends.to_vec()));
-        assert_eq!(decode_commit_record(&encode_commit_record(5, &[])).unwrap(), (5, Vec::new()));
-        assert!(decode_commit_record(&[]).is_err());
+        let applied = |time_ms, appends: &[Appended]| CommitRecord::Applied { time_ms, appends: appends.to_vec() };
+        assert_eq!(decode_commit_record(&encode_commit_record(17, &appends)).unwrap(), applied(17, &appends));
+        assert_eq!(decode_commit_record(&encode_commit_record(5, &[])).unwrap(), applied(5, &[]));
+        assert_eq!(decode_commit_record(&ABORT_RECORD).unwrap(), CommitRecord::Aborted);
+        assert!(decode_commit_record(&[0x80]).is_err());
     }
 
     #[test]

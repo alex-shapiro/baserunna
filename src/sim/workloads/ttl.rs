@@ -25,8 +25,7 @@ struct Val {
     data: String,
     version: u64,
     expires: Option<(u64, u64)>,
-    /// True when the commit record expired before retries finished, leaving
-    /// the write outcome unknown until the next definitive write or `expires`.
+    /// `true` if the commit retention window expired before the write outcome was determined.
     uncertain: bool,
 }
 
@@ -338,16 +337,20 @@ struct LockWrite {
 }
 
 const LOCK_TTL_MS: u64 = 1_500;
+const OUTCOME_UNKNOWN: u64 = u64::MAX - 1;
 
-/// Commits `ops` with idempotency key `key`, retrying until it is committed
-/// or fails a check (`Err` with the check's op index).
+/// Commits `ops` with `key`, returning the version and response or the failed operation index.
 async fn lock_txn(c: &Client, ops: Json, key: &str) -> Result<Result<(u64, Json), u64>, String> {
     let body = json!({"ops": ops, "idempotency_key": key});
+    let began = c.sim.now_ms();
     loop {
         match c.call("POST", "/v1/dbs/locks/txn", Some(body.clone())).await {
             Ok(r) if r.status == 200 => return Ok(Ok((r.json["version"].as_u64().ok_or("missing version")?, r.json))),
             Ok(r) if r.status == 412 => {
                 return Ok(Err(r.json["error"]["details"]["op_index"].as_u64().unwrap_or(u64::MAX)));
+            }
+            Ok(r) if r.code() == "aborted" => {
+                return Ok(Err(if c.is_commit_retained(began) { u64::MAX } else { OUTCOME_UNKNOWN }));
             }
             Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => c.pause(30).await,
             Ok(r) if r.status != 503 && r.status != 429 => return Err(format!("lock: {} {}", r.status, r.json)),
@@ -378,9 +381,13 @@ async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Re
     ]);
     let version = match lock_txn(c, acquire, me).await? {
         Ok((version, _)) => version,
-        Err(0) => {
+        Err(i @ (0 | OUTCOME_UNKNOWN)) => {
             let r = c.call_retry("POST", "/v1/dbs/locks/txn", Some(json!({"ops": [{"op": "get", "key": held}]}))).await;
-            r.json["results"][0]["version"].as_u64().ok_or_else(|| format!("{held}: {}", r.json))?
+            match r.json["results"][0]["version"].as_u64() {
+                Some(v) => v,
+                None if i == OUTCOME_UNKNOWN => return Ok(()),
+                None => return Err(format!("{held}: {}", r.json)),
+            }
         }
         Err(_) => return Ok(()),
     };

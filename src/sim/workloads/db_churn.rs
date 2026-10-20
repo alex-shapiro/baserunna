@@ -143,13 +143,22 @@ pub async fn run(sim: Arc<Sim>, clients: usize, dbs: usize, steps: usize, chaos:
             check_db(c, db, want, "final").await?;
         }
     }
-    sim.sleep(sim.cfg.node.db_idle_evict_ms + 10_000).await;
+    let deadline = sim.now_ms() + sim.cfg.node.db_idle_evict_ms + 10_000 + 2 * sim.cfg.store.stall_ms.1;
+    loop {
+        sim.sleep(1_000).await;
+        let r = idle_resources(&sim);
+        if r.is_ok() || sim.now_ms() >= deadline {
+            return r;
+        }
+    }
+}
+
+/// Checks that every node closed its idle database handles and keeps its cache within budget.
+fn idle_resources(sim: &Sim) -> Result<(), String> {
     for i in sim.up_nodes() {
         let Some(n) = sim.node(i) else { continue };
         let open = n.node.engine.open_count();
         let cache = n.node.engine.shared.cache.stats();
-        // Heartbeats keep the system database open, and background tasks may
-        // still hold a user database handle.
         if open > 3 {
             return Err(format!("n{i} keeps {open} database handles open while idle"));
         }

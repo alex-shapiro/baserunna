@@ -1,12 +1,4 @@
-//! Streams in the engine (SPEC §5.11): the keys and encodings of stream
-//! records and state, the committer's appends and trims, sealing runs of
-//! records into chunks, and reads by seq, time and position.
-//!
-//! A stream's records are entries `RECORDS ++ id ++ seq`. Each value is a
-//! record, or a reference to a sealed chunk keyed by the chunk's last seq.
-//! A chunk is a segment holding one run of consecutive records, written
-//! once and never rewritten. The engine owns each stream's state entry
-//! (`STATE ++ id`); the layer above owns everything else about a stream.
+//! Stream storage, record sealing, and queries by sequence number, timestamp, or byte offset.
 
 use super::Shared;
 use super::manifest::SegmentMeta;
@@ -20,11 +12,11 @@ use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// Key space of stream records and chunk references.
+/// Key prefix for stream records and chunk references.
 pub const RECORDS: u8 = 0x06;
-/// Key space of the engine's per-stream state.
+/// Key prefix for per-stream state.
 pub const STATE: u8 = 0x07;
-/// Most records one transaction may append.
+/// Maximum number of records appended in a single transaction.
 pub const APPEND_MAX_RECORDS: usize = 100_000;
 
 pub fn record_key(id: u64, seq: u64) -> Bytes {
@@ -35,7 +27,6 @@ pub fn record_key(id: u64, seq: u64) -> Bytes {
     Bytes::from(k)
 }
 
-/// The stream and seq of a record key.
 pub fn parse_record_key(k: &[u8]) -> Option<(u64, u64)> {
     if k.len() != 17 || k[0] != RECORDS {
         return None;
@@ -52,12 +43,10 @@ fn prefix(space: u8, id: u64) -> Vec<u8> {
     p
 }
 
-/// Every record key of stream `id`.
 pub fn records(id: u64) -> KeyRange {
     KeyRange::prefix(&prefix(RECORDS, id))
 }
 
-/// Record keys of stream `id` with seqs in `[lo, hi)`, or from `lo` on.
 pub fn records_between(id: u64, lo: u64, hi: Option<u64>) -> KeyRange {
     match hi {
         Some(hi) => KeyRange::half_open(record_key(id, lo), Some(record_key(id, hi))),
@@ -80,15 +69,12 @@ const TAG_RECORD: u8 = 0;
 const TAG_CHUNK: u8 = 1;
 const STATE_FORMAT: u8 = 1;
 
-/// A stream record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub seq: u64,
-    /// The version time of the commit that appended it (SPEC §4.6).
     pub time_ms: u64,
-    /// Payload bytes the stream held before this record.
+    /// Cumulative payload byte offset before this record.
     pub pos: u64,
-    /// The bytes the layer above stores; their length is the record's size.
     pub payload: Bytes,
 }
 
@@ -103,17 +89,14 @@ impl Record {
     }
 }
 
-/// A sealed chunk, as its reference in the LSM describes it.
+/// Reference to a sealed chunk object stored at `seg/{id}`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkRef {
-    /// The chunk's segment id; the chunk is stored at `seg/{id}`.
     pub id: String,
-    /// Stored size of the chunk object.
     pub size: u64,
     pub first_seq: u64,
     pub last_seq: u64,
     pub first_pos: u64,
-    /// Payload bytes of its records.
     pub bytes: u64,
     pub min_time: u64,
     pub max_time: u64,
@@ -133,7 +116,6 @@ impl ChunkRef {
         Bytes::from(w.into_inner())
     }
 
-    /// The chunk as a segment of stream `stream`'s records, for reading.
     pub fn meta(&self, stream: u64) -> SegmentMeta {
         SegmentMeta {
             id: self.id.clone(),
@@ -152,7 +134,6 @@ impl ChunkRef {
     }
 }
 
-/// What a record key holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stored {
     Record(Record),
@@ -160,7 +141,6 @@ pub enum Stored {
 }
 
 impl Stored {
-    /// Decodes the value of the record key with seq `seq`.
     pub fn decode(seq: u64, value: &Bytes) -> DResult<Stored> {
         let mut r = Reader::new(value);
         match r.u8()? {
@@ -202,7 +182,6 @@ impl Stored {
     }
 }
 
-/// The stream and contents of a live entry in the records space, if `e` is one.
 pub fn stored(e: &Entry) -> Option<(u64, Stored)> {
     let (id, seq) = parse_record_key(&e.key)?;
     match &e.value {
@@ -219,36 +198,27 @@ fn decode_entry(e: &Entry) -> Result<(u64, Stored)> {
     stored(e).ok_or_else(corrupt)
 }
 
-/// How long a stream keeps its records.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Retention {
-    /// Records older than this may be trimmed.
     pub retention_ms: Option<u64>,
-    /// The oldest records beyond this many bytes may be trimmed.
     pub max_bytes: Option<u64>,
 }
 
 impl Retention {
-    /// The limits past which a trim is due: a sixteenth beyond these, so
-    /// that each trim removes a share of the stream rather than the record
-    /// or two each append pushes past them. Trims go back to these.
+    /// Returns the threshold (1/16th above the configured limit) at which a background trim is triggered.
     pub fn due_at(&self) -> Retention {
         let slack = |limit: u64| limit.saturating_add(limit / 16);
         Retention { retention_ms: self.retention_ms.map(slack), max_bytes: self.max_bytes.map(slack) }
     }
 }
 
-/// Where a stream begins and ends; maintained by the committer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamState {
     pub next_seq: u64,
     pub next_pos: u64,
-    /// The oldest seq not trimmed.
     pub first_seq: u64,
     pub first_pos: u64,
-    /// The time of the record at `first_seq`, if there is one.
     pub first_time: u64,
-    /// The time of the newest record.
     pub last_time: u64,
     pub retention: Retention,
 }
@@ -258,7 +228,6 @@ impl StreamState {
         StreamState { next_seq: 0, next_pos: 0, first_seq: 0, first_pos: 0, first_time: 0, last_time: 0, retention }
     }
 
-    /// Payload bytes of the records not trimmed.
     pub fn bytes(&self) -> u64 {
         self.next_pos - self.first_pos
     }
@@ -267,8 +236,6 @@ impl StreamState {
         self.next_seq - self.first_seq
     }
 
-    /// Whether retention calls for a trim at store time `now` (see
-    /// [`Retention::due_at`]).
     pub fn trim_due(&self, now: u64) -> bool {
         let due = self.retention.due_at();
         let old = due.retention_ms.is_some_and(|r| self.records() > 0 && self.first_time.saturating_add(r) < now);
@@ -321,7 +288,6 @@ impl StreamState {
     }
 }
 
-/// The stream and its state, if `e` is a live state entry.
 pub fn state_of(e: &Entry) -> Option<(u64, StreamState)> {
     let id = parse_state_key(&e.key)?;
     match &e.value {
@@ -330,8 +296,6 @@ pub fn state_of(e: &Entry) -> Option<(u64, StreamState)> {
     }
 }
 
-/// A change to a stream that only the committer can make, because it
-/// depends on the stream's state at commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamOp {
     Create {
@@ -342,18 +306,14 @@ pub enum StreamOp {
         id: u64,
         retention: Retention,
     },
-    /// Appends records with these payloads at the stream's next seqs; with
-    /// `expect`, only if the next seq is that.
     Append {
         id: u64,
         payloads: Vec<Bytes>,
         expect: Option<u64>,
-        /// Reported with a failed `expect`.
         op_index: Option<usize>,
     },
-    /// Trims the records before `before`, or all of them. A trim for
-    /// retention names the retention it was computed for, and does nothing
-    /// if the stream's retention has changed since.
+    /// Trims records with sequence numbers below `before`. If `retention` is set, the trim is
+    /// skipped if the stream's retention policy has changed.
     Trim {
         id: u64,
         before: u64,
@@ -371,7 +331,6 @@ impl StreamOp {
         }
     }
 
-    /// Approximate bytes an append adds to the database.
     pub fn appended_bytes(&self) -> u64 {
         match self {
             StreamOp::Append { payloads, .. } => payloads.iter().map(|p| p.len() as u64 + 32).sum(),
@@ -380,30 +339,21 @@ impl StreamOp {
     }
 }
 
-/// The records one append of a commit received.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Appended {
     pub first_seq: u64,
     pub count: u64,
 }
 
-/// What one transaction's stream ops do, planned against the state before
-/// it so that a transaction that fails changes nothing.
 #[derive(Debug, Default)]
 pub(crate) struct Effects {
-    /// New records and states.
     pub entries: Vec<Entry>,
-    /// Ranges trims delete, each with a range tombstone.
     pub trims: Vec<KeyRange>,
-    /// The records each append received.
     pub appends: Vec<Appended>,
-    /// Everything written, to validate later transactions of the batch.
     pub touched: Vec<KeyRange>,
     pub states: BTreeMap<u64, StreamState>,
 }
 
-/// Committed state as the committer sees it partway through a batch: the
-/// base version, the batch's tail so far and its range deletions.
 pub(crate) struct Pending<'a> {
     pub base: &'a Version,
     pub tail: &'a BTreeMap<Bytes, Entry>,
@@ -429,7 +379,6 @@ impl Pending<'_> {
         }
     }
 
-    /// The record at `seq` of stream `id`, which must exist.
     async fn record(&self, id: u64, seq: u64) -> Result<Record> {
         let k = record_key(id, seq);
         if let Some(e) = self.tail.get(&k)
@@ -441,7 +390,6 @@ impl Pending<'_> {
     }
 }
 
-/// Plans `ops` to commit at `version`, store time `time`.
 pub(crate) async fn plan(ops: &[StreamOp], at: &Pending<'_>, version: Seq, time: u64) -> Result<Effects> {
     let mut states: BTreeMap<u64, Option<StreamState>> = BTreeMap::new();
     let mut appended: BTreeMap<Bytes, Entry> = BTreeMap::new();
@@ -528,17 +476,15 @@ pub(crate) async fn plan(ops: &[StreamOp], at: &Pending<'_>, version: Seq, time:
     Ok(fx)
 }
 
-/// Seals runs of consecutive records of one stream into chunks as entries
-/// stream past in key order, writing everything else through unchanged.
-/// Runs of at least `min_bytes` are sealed, cut at `max_bytes`.
+/// Seals runs of consecutive records for a stream into chunk objects if a run reaches
+/// `min_bytes`, splitting chunks at `max_bytes`.
 pub(crate) struct Sealer {
     min_bytes: usize,
     max_bytes: usize,
     run: Vec<(Entry, Record)>,
     run_bytes: usize,
     run_id: u64,
-    /// Chunks written, and their stored bytes.
-    pub chunks: u64,
+    pub chunk_ids: Vec<String>,
     pub sealed_bytes: u64,
 }
 
@@ -550,12 +496,11 @@ impl Sealer {
             run: Vec::new(),
             run_bytes: 0,
             run_id: 0,
-            chunks: 0,
+            chunk_ids: Vec::new(),
             sealed_bytes: 0,
         }
     }
 
-    /// Takes the next entry in key order, adding what to write to `out`.
     pub async fn push(&mut self, shared: &Shared, db: &str, e: Entry, out: &mut Vec<Entry>) -> Result<()> {
         let record = match stored(&e) {
             Some((id, Stored::Record(r))) => Some((id, r)),
@@ -579,7 +524,6 @@ impl Sealer {
         Ok(())
     }
 
-    /// Ends the current run: sealed if long enough, written through if not.
     pub async fn finish(&mut self, shared: &Shared, db: &str, out: &mut Vec<Entry>) -> Result<()> {
         if self.run_bytes >= self.min_bytes {
             return self.seal(shared, db, out).await;
@@ -613,16 +557,14 @@ impl Sealer {
             min_time: first.time_ms,
             max_time: last.time_ms,
         };
-        self.chunks += 1;
         self.sealed_bytes += c.size;
+        self.chunk_ids.push(c.id.clone());
         let version = run.iter().map(|(e, _)| e.seq).max().unwrap_or(first_e.seq);
         out.push(Entry::new(last_e.key.clone(), version, Value::Inline(c.encode_value())));
         Ok(())
     }
 }
 
-/// What a binary search over a stream's seqs looks for: the first record
-/// at or after a time, or at or after a position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Seek {
     Time(u64),
@@ -637,8 +579,8 @@ impl Seek {
         }
     }
 
-    /// Whether the search target holds for every record of `c`, for none,
-    /// or for some (`None`).
+    /// Returns `Some(true)` if all records in `c` satisfy `self`, `Some(false)` if none of the
+    /// records satisfy `self`, or `None` if the boundary lies within `c`.
     fn classify(self, c: &ChunkRef) -> Option<bool> {
         match self {
             Seek::Time(t) if c.min_time >= t => Some(true),
@@ -650,7 +592,6 @@ impl Seek {
     }
 }
 
-/// Iterates a stream's records with seqs in `[lo, hi)`, in either direction.
 pub struct StreamIter {
     shared: Arc<Shared>,
     db: String,
@@ -658,7 +599,7 @@ pub struct StreamIter {
     lo: u64,
     hi: u64,
     reverse: bool,
-    /// Finds the chunk that holds the seq before `hi`, for a reverse read.
+    /// Forward iterator starting at `hi` used on reverse scans to locate a chunk that straddles `hi`.
     probe: Option<MergeIter>,
     lsm: MergeIter,
     chunk: Option<MergeIter>,
@@ -732,7 +673,6 @@ impl Version {
         MergeIter::new(self.shared.clone(), &self.m.db_id, &self.m.tail, self.runs(|_| true), spec)
     }
 
-    /// The state of stream `id`.
     pub async fn stream_state(&self, id: u64) -> Result<Option<StreamState>> {
         match self.get_entry(&state_key(id)).await? {
             Some(e) if !e.value.is_tombstone() => Ok(Some(state_of(&e).ok_or_else(corrupt)?.1)),
@@ -740,8 +680,6 @@ impl Version {
         }
     }
 
-    /// Records of stream `id` with seqs in `[lo, hi)`: oldest first, or
-    /// newest first with `reverse`.
     pub fn stream_iter(&self, id: u64, lo: u64, hi: u64, reverse: bool) -> StreamIter {
         let (lsm, probe) = match reverse {
             false => (self.stream_lsm(records_between(id, lo, None), false), None),
@@ -764,7 +702,6 @@ impl Version {
         }
     }
 
-    /// What holds seq `seq` of stream `id`: its record, or its chunk.
     async fn stream_holder(&self, id: u64, seq: u64) -> Result<Option<Stored>> {
         let mut it = self.stream_lsm(records_between(id, seq, None), false);
         match it.next().await? {
@@ -776,7 +713,6 @@ impl Version {
         }
     }
 
-    /// The record at `seq` of stream `id`, if stored.
     pub async fn stream_record(&self, id: u64, seq: u64) -> Result<Option<Record>> {
         match self.stream_holder(id, seq).await? {
             Some(Stored::Record(r)) => Ok(Some(r)),
@@ -785,10 +721,8 @@ impl Version {
         }
     }
 
-    /// The first seq of the stream whose record satisfies `seek`, or its
-    /// next seq if none does. Times and positions never decrease along a
-    /// stream, so this is a binary search; a chunk settles a probe from its
-    /// range unless the answer lies inside it.
+    /// Returns the first sequence number in stream `id` whose record satisfies `seek`, or
+    /// `st.next_seq` if none of the records match.
     pub async fn stream_seek(&self, id: u64, st: &StreamState, seek: Seek) -> Result<u64> {
         let (mut lo, mut hi) = (st.first_seq, st.next_seq);
         while lo < hi {
@@ -809,7 +743,6 @@ impl Version {
                                 break;
                             }
                         }
-                        // Records past the chunk all hold, and those before it none.
                         return Ok(end);
                     }
                 },

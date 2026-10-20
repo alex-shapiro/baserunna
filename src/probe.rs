@@ -39,6 +39,24 @@ probes! {
     CommitReplayed,
     /// A transaction was rejected because its commit deadline had passed.
     CommitDeadlinePassed,
+    /// A commit batch flushed the tail inline because background flushes fell behind.
+    TailFlushedInCommit,
+    /// A background tail flush was installed.
+    TailFlushedInBackground,
+    /// A background tail flush was discarded because the tail changed incompatibly.
+    FlushSuperseded,
+    /// A retried tail flush found that its output segments were already installed.
+    FlushInstallReplayed,
+    /// A manifest reload observed a newer etag and resolved an earlier ambiguous write.
+    AmbiguousWriteSettled,
+    /// A retention trim that failed with a retryable error was retried.
+    RetentionTrimRetried,
+    /// A failed commit batch returned the recorded outcome for a commit that was already decided in the manifest.
+    DecidedCommitAnswered,
+    /// A commit status check aborted an unapplied commit ID.
+    CommitAborted,
+    /// A commit was rejected because its commit ID was previously aborted.
+    AbortedCommitRejected,
     /// A transaction was rejected due to a read-write conflict.
     CommitConflict,
     /// A transaction conflicted with an earlier transaction in the same batch.
@@ -121,10 +139,14 @@ probes! {
     CompactionInstallReplayed,
     /// A compaction task stopped because the node lost the database lease.
     CompactionLostLease,
+    /// A background task skipped installing its result because its lease had expired.
+    BackgroundInstallUnleased,
     /// A compaction result was discarded because the task exceeded the orphan grace period.
     CompactionOutlivedOrphanGrace,
     /// A read failed with a retryable error after garbage collection deleted a segment.
     SegmentCollectedUnderRead,
+    /// A manifest fetch found its levels object deleted by garbage collection and fetched the manifest again.
+    LevelsCollectedUnderRead,
     /// A garbage collection sweep marked unreferenced objects as obsolete.
     OrphansMarked,
     /// Obsolete objects past their grace period were deleted after an ambiguous manifest write.
@@ -167,6 +189,8 @@ probes! {
     InteractiveTxnLost,
     /// A retried password reset with the same password completed the reset.
     PasswordResetFinished,
+    /// A simulated workload resynchronized its model from the database after an unresolved ambiguous write.
+    ModelAdoptedFromDatabase,
 }
 
 impl Probe {
@@ -180,8 +204,10 @@ impl Probe {
         Probe::SegmentDropped,
         Probe::CompactionMoved,
         Probe::CompactionLostLease,
+        Probe::BackgroundInstallUnleased,
         Probe::CompactionOutlivedOrphanGrace,
         Probe::SegmentCollectedUnderRead,
+        Probe::LevelsCollectedUnderRead,
         Probe::BlobPinnedAtCollection,
         Probe::RetentionTrimLeftToOwner,
         Probe::ForwardDuplicateUnknown,
@@ -189,6 +215,10 @@ impl Probe {
         Probe::DeletionRepaired,
         Probe::NameResolvedAgain,
         Probe::PreconditionExplainedByReplay,
+        Probe::RetentionTrimRetried,
+        Probe::CommitUnknownAfterLeaseMoved,
+        Probe::DecidedCommitAnswered,
+        Probe::ModelAdoptedFromDatabase,
     ];
 }
 

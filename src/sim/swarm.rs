@@ -121,6 +121,7 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
         c.store = StoreFaults {
             latency_min_ms: k.range("store.latency_min_ms", 0, 5),
             latency_max_ms: k.log_range("store.latency_max_ms", 5, 120),
+            ms_per_mib: k.pick("store.ms_per_mib", &[0, 50, 150, 400]),
             p_slow: k.rate("store.p_slow", 0.02),
             p_stall: stalls,
             stall_ms: (lease, 3 * lease),
@@ -144,6 +145,7 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
             storm_ms: k.log_range("chaos.storm_ms", 2_000, 120_000),
             calm_ms: k.log_range("chaos.calm_ms", 1_000, 30_000),
             crash: k.weight("chaos.crash"),
+            stop: k.weight("chaos.stop"),
             start: k.weight("chaos.start"),
             partition: k.weight("chaos.partition"),
             one_way_partition: k.weight("chaos.one_way_partition"),

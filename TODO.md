@@ -25,30 +25,44 @@ design context.
 - [ ] **Publish release binaries and a container image.** Build and publish
       release binaries and a container image so external test suites can run
       a local node in CI.
-- [ ] **Check local caches during bulk reads (`ReadMode::Bulk`).** Compaction
-      and GC sweeps use `ReadMode::Bulk` to avoid polluting the in-memory
-      block cache on misses, but `MergeIter::peek` currently bypasses the
-      in-memory and local-disk caches and fetches directly from object storage.
-      Checking the caches first without populating them on misses avoids
-      re-fetching segments that are already cached locally.
+- [ ] **Time out store-clock probes.** A stalled probe holds the node-wide
+      `StoreClock::sync` lock until the store request times out, blocking
+      callers of `store_time_ms`. Because probes slower than
+      `2 × clock_sync_max_error_ms` are discarded as imprecise, probes should
+      time out at that bound.
+- [ ] **Reschedule retention trims if the store clock is unknown.**
+      `trim_for_retention` returns early if the node lacks a store-clock
+      measurement, delaying retention trimming until the next append or sweep.
+- [ ] **Measure local lease duration from the manifest `PUT` start time.** The
+      committer currently starts its local lease timer at the beginning of the
+      commit attempt rather than at the start of the manifest `PUT`, subtracting
+      synchronous pre-`PUT` work (such as synchronous tail flushes) from the
+      local lease duration.
+- [ ] **Bound memory used by open database handles.** Each open handle retains
+      its current manifest and cached compressed tail pages, and handle count
+      is currently bounded only by idle eviction (`db_idle_evict_ms`). Enforce
+      a byte budget across open handles with LRU eviction.
+- [ ] **Release database leases concurrently on shutdown.**
+      `Engine::release_leases` currently releases leases sequentially with a
+      2 s timeout per database.
+- [ ] **Await in-flight hedged manifest `PUT`s before returning an unknown
+      outcome.** If a hedged duplicate `PUT` fails with `412` while the primary
+      `PUT` is still in flight and retries are exhausted, awaiting the primary
+      `PUT` can resolve the commit outcome instead of returning
+      `outcome: "unknown"`.
 
 ## Performance
 
-- [ ] **Resolve ambiguous commits without waiting for the commit deadline.**
-      Clients must currently wait for the 15 s commit deadline before calling
-      `GET /commits/{id}` (SPEC §6.2). Record the commit ID as aborted during
-      the status check's fencing manifest write so that late commit attempts
-      are rejected and the status check can return immediately.
-- [ ] **Reduce CPU overhead per request.** Profiles at 340 commits/s on a
-      single core show hotspots in memory allocation, `serde_json` response
-      serialization, segment key comparisons, and manifest zstd compression.
-- [ ] **Replace the sharded LRU block cache with a CLOCK cache.** Cache hits
-      currently acquire an exclusive shard lock to update the LRU list. A
-      CLOCK eviction policy allows cache hits to use a shared lock.
-- [ ] **Tune the inline WAL tail limit.** Median commit latency on Tigris
-      increases from 36 ms with an empty tail to 84 ms with a full 256 KiB
-      tail. Lowering the tail limit reduces commit latency at the cost of
-      more frequent L0 flushes.
+- [ ] **Immediately delete output segments of rejected compactions.** Rejected
+      compactions currently leave their output segments for the orphan sweep to
+      delete after `orphan_grace_ms` (2 hours).
+- [ ] **Flush idle database tails to reduce next-commit manifest size.**
+      Flushing a non-empty tail after a database becomes idle reduces the size
+      of the next manifest `PUT` at the cost of an extra segment `PUT`.
+- [ ] **Keep the manifest tail as a sorted vector across a batch.** Commit
+      batches currently move the manifest tail into a `BTreeMap` and back into
+      a `Vec` on every commit. Merging sorted batch writes into the sorted tail
+      vector makes CPU cost proportional to batch size instead of tail size.
 
 ## Features
 
@@ -80,6 +94,11 @@ design context.
       `openapi.json`, and publish the Rust `client` module as a standalone
       crate.
 
+- [ ] **Support idempotency keys for raw KV writes.** Accept an
+      `Idempotency-Key` header on `PUT` and `DELETE /v1/dbs/{db}/kv/{key}` and
+      return the commit ID in a response header so clients can resolve
+      ambiguous writes via `GET /commits/{id}`.
+
 ## Testing
 
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the
@@ -87,6 +106,14 @@ design context.
 - [ ] **Run mutation testing in CI**, running `scripts/mutants.sh --in-diff` on
       pull requests and the full suite weekly.
 - [ ] **Track cost and throughput benchmarks in CI** across commits.
+- [ ] **Derive simulation settlement timeouts from fault parameters and
+      separate liveness from safety failures.** Fixed settlement timeouts can
+      fail if a simulated store stall exceeds the wait duration.
+- [ ] **Add targeted simulation tests for all rare probes.** Ensure every probe
+      in `Probe::RARE` is reached in CI.
+- [ ] **Log scenario-overridden knob values in simulation traces.** Scenarios
+      that override swarm configuration after generation currently log the
+      pre-override values.
 - [ ] **Improve guided exploration breadth.** At equal run counts, guided
       exploration reaches rare probes more frequently than a random campaign
       but covers fewer distinct features (SPEC §13.4), and failures cluster in

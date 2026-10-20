@@ -500,7 +500,8 @@ async fn one_shot(
         return Err(Error::invalid("transactions with writes must use strong consistency"));
     }
     let octx = op_ctx(&node, &ctx, req.encoding);
-    let key = req.idempotency_key.as_deref();
+    // Ignore idempotency keys on read-only requests so a failed check cannot abort a write key without write permission.
+    let key = req.idempotency_key.as_deref().filter(|_| writes);
     let (commit_id, ran) = run_txn!(node, ctx, req.isolation.into(), c, key, |t| exec_ops(&octx, t, &req.ops).await);
     node.env.crash_point().await;
     Ok(axum::Json(match ran {
@@ -687,13 +688,14 @@ async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
 }
 
 async fn commit_status(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
+    ctx.require_write()?;
     let id = param(&p, "id")?;
     let cid = match id.strip_prefix("key:") {
         Some(k) => commit_id_for_key(&ctx.rec.id, k),
         None if id.len() == 16 => u64::from_str_radix(id, 16).map_err(|_| bad_commit_id())?,
         None => return Err(bad_commit_id()),
     };
-    Ok(axum::Json(match ctx.db.commit_status_fenced(cid).await? {
+    Ok(axum::Json(match ctx.db.resolve_commit(cid).await? {
         Some(c) => {
             json!({"status": "committed", "version": c.version, "commit_id": commit_hex(cid), "appends": first_seqs(&c)})
         }

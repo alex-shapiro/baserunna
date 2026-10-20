@@ -1,8 +1,4 @@
-//! Node-local disk cache for immutable segment data below the memory cache.
-//!
-//! Entries store whole small segments, the bloom/index/footer region of large
-//! segments, and individual blocks, each verified by both segment and cache
-//! checksums.
+//! Node-local disk and memory cache for immutable segment data.
 
 use crate::store::BoxFut;
 use crate::util::DetHashMap;
@@ -12,11 +8,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// A byte-budgeted key-value cache on node-local storage.
+/// Byte-budgeted key-value cache on node-local storage.
 pub trait LocalStore: Send + Sync + 'static {
     fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, Option<Bytes>>;
-    /// Best effort: failures are not reported.
+    /// Best-effort write; failures are ignored.
     fn put<'a>(&'a self, key: &'a str, data: Bytes) -> BoxFut<'a, ()>;
+    /// Returns true if `key` is indexed in the cache without updating its recency.
+    fn contains(&self, key: &str) -> bool;
     fn stats(&self) -> LocalStats;
 }
 
@@ -28,7 +26,6 @@ pub struct LocalStats {
     pub misses: u64,
 }
 
-/// Shared handle to a node-local cache store.
 #[derive(Clone)]
 pub struct LocalTier(pub Arc<dyn LocalStore>);
 
@@ -38,7 +35,6 @@ impl std::fmt::Debug for LocalTier {
     }
 }
 
-/// Least-recently-used bookkeeping by size.
 #[derive(Default)]
 struct Lru {
     entries: DetHashMap<String, (u64, u64)>,
@@ -68,7 +64,6 @@ impl Lru {
         }
     }
 
-    /// Record `key`, returning the keys evicted to stay within `budget`.
     fn insert(&mut self, key: &str, size: u64, budget: u64) -> Vec<String> {
         self.remove(key);
         self.tick += 1;
@@ -128,6 +123,10 @@ impl LocalStore for MemLocal {
         Box::pin(async {})
     }
 
+    fn contains(&self, key: &str) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).0.entries.contains_key(key)
+    }
+
     fn stats(&self) -> LocalStats {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).0.stats()
     }
@@ -156,7 +155,6 @@ fn file_name(key: &str) -> String {
 }
 
 impl DiskCache {
-    /// Opens or creates the cache directory and indexes existing files.
     pub fn open(dir: impl Into<PathBuf>, budget: u64) -> std::io::Result<DiskCache> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
@@ -238,6 +236,10 @@ impl LocalStore for DiskCache {
         })
     }
 
+    fn contains(&self, key: &str) -> bool {
+        self.lru().entries.contains_key(&file_name(key))
+    }
+
     fn stats(&self) -> LocalStats {
         self.lru().stats()
     }
@@ -266,10 +268,10 @@ mod tests {
             }
             assert!(t.get("a").await.is_some());
             t.put("d", Bytes::from(vec![0u8; 100])).await;
-            assert!(t.get("b").await.is_none(), "b was the least recently used");
+            assert!(t.get("b").await.is_none());
             assert!(t.get("a").await.is_some() && t.get("d").await.is_some());
             t.put("huge", Bytes::from(vec![0u8; 400])).await;
-            assert!(t.get("huge").await.is_none(), "an entry over budget is not kept");
+            assert!(t.get("huge").await.is_none());
             assert!(t.stats().bytes <= 300);
             let t = MemLocal::new(300);
             for k in ["a", "b", "c"] {
@@ -277,14 +279,14 @@ mod tests {
             }
             assert!(t.get("a").await.is_some() && t.get("b").await.is_some());
             t.put("d", Bytes::from(vec![0u8; 100])).await;
-            assert!(t.get("c").await.is_none(), "c was the least recently used");
+            assert!(t.get("c").await.is_none());
             assert!(t.get("a").await.is_some() && t.get("b").await.is_some() && t.get("d").await.is_some());
             let s = t.stats();
             assert_eq!((s.hits, s.misses, s.entries, s.bytes), (5, 1, 3, 300));
             t.put("a", Bytes::from(vec![0u8; 40])).await;
-            assert_eq!((t.stats().entries, t.stats().bytes), (3, 240), "a replaced entry is counted once");
+            assert_eq!((t.stats().entries, t.stats().bytes), (3, 240));
             t.put("e", Bytes::from(vec![0u8; 60])).await;
-            assert_eq!(t.stats().entries, 4, "nothing needed evicting");
+            assert_eq!(t.stats().entries, 4);
         });
     }
 
@@ -299,19 +301,19 @@ mod tests {
             t.put("dbs/x/seg/2#b0", Bytes::from_static(b"block")).await;
             assert_eq!(t.get("dbs/x/seg/1#all").await.as_deref(), Some(&b"segment"[..]));
             let bytes = t.stats().bytes;
-            assert_eq!(bytes, 7 + 5 + 2 * 4, "data and checksums");
+            assert_eq!(bytes, 7 + 5 + 2 * 4);
             drop(t);
             let t = DiskCache::open(&dir, 10_000).unwrap();
-            assert_eq!((t.stats().entries, t.stats().bytes), (2, bytes), "reopening counts the same files");
+            assert_eq!((t.stats().entries, t.stats().bytes), (2, bytes));
             assert_eq!(t.get("dbs/x/seg/2#b0").await.as_deref(), Some(&b"block"[..]));
             let path = dir.join(file_name("dbs/x/seg/1#all"));
             let mut d = std::fs::read(&path).unwrap();
             d[0] ^= 1;
             std::fs::write(&path, d).unwrap();
-            assert!(t.get("dbs/x/seg/1#all").await.is_none(), "a corrupt file is a miss");
-            assert!(!path.exists(), "and is removed");
+            assert!(t.get("dbs/x/seg/1#all").await.is_none());
+            assert!(!path.exists());
             let t = DiskCache::open(&dir, 8).unwrap();
-            assert_eq!(t.stats().entries, 0, "reopening with a smaller budget evicts");
+            assert_eq!(t.stats().entries, 0);
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

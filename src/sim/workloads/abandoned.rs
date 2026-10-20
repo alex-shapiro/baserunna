@@ -2,7 +2,7 @@
 //! delay while leases move between nodes.
 
 use super::super::Sim;
-use super::super::client::{Client, ZOMBIE_WAIT_MS};
+use super::super::client::{Client, Status};
 use serde_json::{Value as Json, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -22,9 +22,10 @@ enum Fate {
     Abandon,
     Abort,
     CommitAfter(u64),
+    ResolveThenCommit,
 }
 
-async fn one(c: &Client, marker: &str, isolation: &str, fate: Fate, tally: &mut Tally) -> Result<(), String> {
+async fn run_txn(c: &Client, marker: &str, isolation: &str, fate: Fate, tally: &mut Tally) -> Result<(), String> {
     let began = c.sim.now_ms();
     let r = c.call("POST", &format!("{BASE}/transactions"), Some(json!({"isolation": isolation}))).await;
     let Ok(r) = r else { return Ok(()) };
@@ -64,16 +65,27 @@ async fn one(c: &Client, marker: &str, isolation: &str, fate: Fate, tally: &mut 
             return Ok(());
         }
         Fate::CommitAfter(ms) => ms,
+        Fate::ResolveThenCommit => {
+            if !matches!(c.commit_status("limbo", &cid, began).await?, Status::NotCommitted | Status::Unknown) {
+                return Err(format!("{marker}: an uncommitted transaction resolved as committed"));
+            }
+            match c.call("POST", &format!("{BASE}/transactions/{id}/commit"), Some(json!({}))).await {
+                Ok(r) if r.ok() => return Err(format!("{marker}: a commit applied after its status check aborted it")),
+                Ok(r) if r.status == 409 && r.code() == "aborted" => {}
+                Ok(r) if r.status == 404 || r.retryable_not_applied() || r.outcome_unknown() => {}
+                Ok(r) => return Err(format!("commit after abort: {} {}", r.status, r.json)),
+                Err(_) => {}
+            }
+            tally.dropped.push((marker.to_string(), cid));
+            return Ok(());
+        }
     };
     c.pause(wait).await;
     let committed = match c.call("POST", &format!("{BASE}/transactions/{id}/commit"), Some(json!({}))).await {
         Ok(r) if r.ok() => true,
         Ok(r) if r.status == 404 || r.retryable_not_applied() || (r.status == 409 && r.code() == "conflict") => false,
         Ok(r) if !r.outcome_unknown() => return Err(format!("commit: {} {}", r.status, r.json)),
-        _ => {
-            c.pause(ZOMBIE_WAIT_MS).await;
-            c.resolve("limbo", &cid, began, marker).await?
-        }
+        _ => c.resolve("limbo", &cid, began, marker).await?,
     };
     if committed {
         tally.committed.insert(marker.to_string());
@@ -90,13 +102,14 @@ async fn client(c: Client, k: usize, txns: usize) -> Result<Tally, String> {
     for i in 0..txns {
         c.pause(rng.below(400)).await;
         let isolation = if rng.chance(0.5) { "snapshot" } else { "serializable" };
-        let fate = match rng.below(6) {
+        let fate = match rng.below(7) {
             0 | 1 => Fate::Abandon,
             2 => Fate::Abort,
+            3 => Fate::ResolveThenCommit,
             _ if rng.chance(0.6) => Fate::CommitAfter(rng.below(500)),
             _ => Fate::CommitAfter(rng.below(2 * idle)),
         };
-        one(&c, &format!("m/{k}/{i}"), isolation, fate, &mut tally).await?;
+        run_txn(&c, &format!("m/{k}/{i}"), isolation, fate, &mut tally).await?;
     }
     Ok(tally)
 }

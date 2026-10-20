@@ -165,7 +165,7 @@ impl SegmentBuilder {
         let off = self.out.len();
         let compressed = match self.compression {
             Compression::Zstd(level) if raw.len() >= 64 => {
-                zstd::bulk::compress(&raw.buf, level).ok().filter(|c| c.len() + 10 < raw.len() - raw.len() / 8)
+                crate::util::zstd::compress(&raw.buf, level).ok().filter(|c| c.len() + 10 < raw.len() - raw.len() / 8)
             }
             _ => None,
         };
@@ -404,7 +404,7 @@ pub fn decode_block(raw: Bytes) -> DResult<Block> {
                 return Err(DecodeError("block too large"));
             }
             let c = &payload[payload.len() - r.remaining()..];
-            let d = zstd::bulk::decompress(c, n as usize).map_err(|_| DecodeError("bad compressed block"))?;
+            let d = crate::util::zstd::decompress(c, n as usize).map_err(|_| DecodeError("bad compressed block"))?;
             if d.len() as u64 != n {
                 return Err(DecodeError("compressed block length mismatch"));
             }

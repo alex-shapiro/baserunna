@@ -197,6 +197,8 @@ const VERIFY_LINK: LinkLife = LinkLife { ms: 7 * 24 * 3_600_000, words: "7 days"
 
 pub const REAP_INTERVAL_MS: u64 = 60_000;
 
+const REAPER_KEY: &str = "reaper";
+
 const META_BATCH: usize = 500;
 
 /// Active interactive transaction state.
@@ -408,28 +410,37 @@ impl Node {
         self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Releases held database leases, leaves the cluster, and aborts background tasks.
-    pub async fn shutdown(&self) {
-        for db in self.engine.open_dbs() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), db.release_lease()).await;
-        }
+    /// Leaves the cluster, releases held database leases, and stops background tasks.
+    /// Returns the database IDs whose leases were released.
+    pub async fn shutdown(&self) -> Vec<String> {
+        self.drain();
         let leave = self.run_meta(MetaCmd::Leave { id: self.id.clone() });
         let _ = tokio::time::timeout(Duration::from_secs(2), leave).await;
+        let released = self.engine.release_leases(Duration::from_secs(2)).await;
         self.env.shutdown();
+        released
     }
 
     pub fn members(&self) -> Vec<NodeRecord> {
         lock(&self.members).clone()
     }
 
-    /// Returns non-suspect cluster members with a recent heartbeat, excluding any previous
-    /// member entry that shares this node's address.
+    /// Returns live non-suspect peers with distinct addresses, plus this node if it is not draining.
     pub fn live_members(&self) -> Vec<NodeRecord> {
         let now = self.now_ms() as i64;
-        cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
+        let mut live: Vec<NodeRecord> = cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
             .into_iter()
-            .filter(|n| n.id == self.id || (!self.is_suspect(&n.id) && n.addr != self.cfg.addr))
-            .collect()
+            .filter(|n| n.id != self.id && !self.is_suspect(&n.id) && n.addr != self.cfg.addr)
+            .collect();
+        if !self.draining() {
+            live.push(NodeRecord {
+                id: self.id.clone(),
+                addr: self.cfg.addr.clone(),
+                started_at: 0,
+                heartbeat_at: now,
+            });
+        }
+        live
     }
 
     pub async fn refresh_members(&self) -> Result<()> {
@@ -528,7 +539,6 @@ impl Node {
             self.env.trace(|| format!("{db_id}: address for {target} is missing, handling locally"));
             return None;
         };
-        // Ignore a previous process that ran at this node's address.
         if addr == self.cfg.addr {
             crate::probe::hit(crate::probe::Probe::OwnAddressIgnored);
             return None;
@@ -575,7 +585,6 @@ impl Node {
                     break;
                 }
             }
-            // Do not forward to a previous process that ran at this node's address.
             if let Some(holder) = sys.lease_holder()
                 && holder != self.id
                 && let Some(addr) = self.addr_of(&holder).filter(|a| *a != self.cfg.addr)
@@ -1285,9 +1294,10 @@ impl Node {
         self.limiter.prune(&self.cfg.limits);
     }
 
-    /// Purges deleted databases past their grace period and sweeps expired sessions.
+    /// Purges deleted databases past their grace period and deletes expired sessions
+    /// if this node is selected by rendezvous hashing on `REAPER_KEY`.
     pub async fn reap_deleted(&self) -> Result<usize> {
-        if self.route(SYS_DB).await.is_some() {
+        if cluster::rendezvous(REAPER_KEY, &self.live_members()).is_some_and(|n| n.id != self.id) {
             return Ok(0);
         }
         let Some(store_now) = self.engine.shared.store_now_ms() else {

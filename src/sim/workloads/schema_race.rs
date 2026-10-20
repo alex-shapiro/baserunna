@@ -28,6 +28,8 @@ fn row_json(id: i64, r: &Row) -> Json {
 enum Applied {
     Yes,
     No,
+    /// An attempt was ambiguous and the commit retention window expired.
+    Unknown,
 }
 
 /// Executes a request to completion, returning `Yes` if applied or `No` if
@@ -49,14 +51,37 @@ fn judge(r: &Resp, rejected: &[(u16, &str)]) -> Result<Applied, String> {
 
 async fn one_shot(c: &Client, body: Json, rejected: &[(u16, &str)]) -> Result<Applied, String> {
     let path = format!("{BASE}/txn");
+    let (began, mut ambiguous) = (c.sim.now_ms(), false);
     loop {
+        if ambiguous && !c.dedups(began) {
+            return Ok(Applied::Unknown);
+        }
         match c.call("POST", &path, Some(body.clone())).await {
-            Ok(r) if r.outcome_unknown() => c.pause(ZOMBIE_WAIT_MS).await,
-            Ok(r) if r.status == 503 || (r.status == 409 && r.code() == "conflict") => c.pause(100).await,
-            Ok(r) => return judge(&r, rejected),
-            Err(_) => c.pause(ZOMBIE_WAIT_MS).await,
+            Ok(r) if r.status == 503 && !r.outcome_unknown() || (r.status == 409 && r.code() == "conflict") => {
+                c.pause(100).await;
+            }
+            Ok(r) if !r.outcome_unknown() => return judge(&r, rejected),
+            _ => {
+                ambiguous = true;
+                c.pause(ZOMBIE_WAIT_MS).await;
+            }
         }
     }
+}
+
+/// Queries all rows in writer `w`'s key range to resynchronize its model.
+async fn query_writer_rows(c: &Client, w: i64) -> Result<BTreeMap<i64, Row>, String> {
+    crate::probe::hit(crate::probe::Probe::ModelAdoptedFromDatabase);
+    let body = json!({"range": {"gte": w * 100, "lt": w * 100 + 100}, "limit": 1000});
+    let r = c.call_retry("POST", &format!("{BASE}/tables/items/rows/query"), Some(body)).await;
+    let rows = r.json["rows"].as_array().ok_or(format!("rows of writer {w}: {} {}", r.status, r.json))?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let email = row["email"].as_str().map(|s| s.to_string());
+            Some((row["id"].as_i64()?, Row { email, n: row["n"].as_i64().unwrap_or(-1) }))
+        })
+        .collect())
 }
 
 /// Upserts `row` in an interactive transaction, resolving commit ambiguity via
@@ -91,7 +116,6 @@ async fn interactive(
         }
         Ok(r) if !r.outcome_unknown() => judge(&r, rejected),
         _ => {
-            c.pause(ZOMBIE_WAIT_MS).await;
             match c.commit_status("race", &cid, committing).await? {
                 Status::Committed(_) => Ok(Applied::Yes),
                 Status::NotCommitted => Ok(Applied::No),
@@ -145,7 +169,11 @@ async fn writer(c: Client, w: i64, steps: usize) -> Result<BTreeMap<i64, Row>, S
                 };
                 let delete = op["op"] == "delete_rows";
                 let body = json!({"ops": [op], "isolation": isolation, "idempotency_key": format!("w{w}-{step}")});
-                if let Applied::Yes = one_shot(&c, body, ROW_REJECTIONS).await.map_err(|e| format!("{ctx}: {e}"))? {
+                let applied = one_shot(&c, body, ROW_REJECTIONS).await.map_err(|e| format!("{ctx}: {e}"))?;
+                if let Applied::Unknown = applied {
+                    model = query_writer_rows(&c, w).await?;
+                }
+                if let Applied::Yes = applied {
                     for i in hit {
                         match delete {
                             true => {
@@ -176,8 +204,12 @@ async fn writer(c: Client, w: i64, steps: usize) -> Result<BTreeMap<i64, Row>, S
                     ops.push(json!({"op": "upsert_row", "table": "scratch", "row": {"k": id, "v": step as i64}}));
                 }
                 let body = json!({"ops": ops, "isolation": isolation, "idempotency_key": format!("w{w}-{step}")});
-                if let Applied::Yes = one_shot(&c, body, ROW_REJECTIONS).await.map_err(|e| format!("{ctx}: {e}"))? {
-                    model.insert(id, row);
+                match one_shot(&c, body, ROW_REJECTIONS).await.map_err(|e| format!("{ctx}: {e}"))? {
+                    Applied::Yes => {
+                        model.insert(id, row);
+                    }
+                    Applied::Unknown => model = query_writer_rows(&c, w).await?,
+                    Applied::No => {}
                 }
             }
             3 => {

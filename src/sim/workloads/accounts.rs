@@ -2,7 +2,7 @@
 //! revocation, email verification, password reset, and account deletion.
 
 use super::super::Sim;
-use super::super::client::Client;
+use super::super::client::{Client, ZOMBIE_WAIT_MS};
 use super::steps::{MAIL_WAIT_MS, add_member, create_key, create_org, mailed_token, members, request_mail, status};
 use super::{cache_expiry, expect};
 use serde_json::{Value as Json, json};
@@ -60,6 +60,7 @@ async fn sessions(sim: &Arc<Sim>) -> Result<(), String> {
     let a = Client::signup(sim, "sess-a", email, "sess-password").await?;
     let b = Client::login(sim, "sess-b", email, "sess-password").await?;
     let c = Client::login(sim, "sess-c", email, "sess-password").await?;
+    sim.sleep(ZOMBIE_WAIT_MS).await;
     let all = session_ids(&a, 100).await?;
     let paged = session_ids(&a, 1).await?;
     let ids = |v: &[Json]| v.iter().filter_map(|s| s["id"].as_str().map(|s| s.to_string())).collect::<BTreeSet<_>>();

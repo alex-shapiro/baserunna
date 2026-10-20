@@ -309,6 +309,13 @@ impl Client {
         }
     }
 
+    /// Returns `true` if the record of a commit first attempted at `began` is
+    /// still retained, so a status check or retry answers for it.
+    pub fn retained(&self, began: u64) -> bool {
+        let e = &self.sim.cfg.engine;
+        self.sim.now_ms() + 2 * e.clock_sync_max_error_ms < began.saturating_add(e.commit_retention_ms)
+    }
+
     /// Returns `true` if a retry of a request started at `began` is guaranteed
     /// to fall within the server's commit retention window.
     pub fn dedups(&self, began: u64) -> bool {
@@ -395,9 +402,12 @@ impl Client {
             match self.post("/v1/dbs", body.clone()).await {
                 Ok(r) if r.status == 201 => return Ok(()),
                 Ok(r) if r.status == 409 && r.code() == "already_exists" => return Ok(()),
+                Ok(r) if r.outcome_unknown() => self.sim.sleep(ZOMBIE_WAIT_MS).await,
                 Ok(r) if r.status == 503 || r.status == 409 => {}
                 Ok(r) => return Err(format!("create db {body}: {} {}", r.status, r.json)),
-                Err(_) => {}
+                // Wait out the lost attempt, which could otherwise create the database again
+                // after the caller deletes it.
+                Err(_) => self.sim.sleep(ZOMBIE_WAIT_MS).await,
             }
         }
         Err(format!("create db {body} never succeeded"))

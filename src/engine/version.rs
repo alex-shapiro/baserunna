@@ -147,27 +147,35 @@ impl KeyRange {
 
 impl Shared {
     /// Decodes a stored manifest and attaches deep-level segment metadata from `current`
-    /// or from the external levels object.
-    pub(crate) async fn load_manifest(&self, db: &str, data: &Bytes, current: Option<&Version>) -> Result<Manifest> {
+    /// or from the external levels object. Returns `None` if the levels object is gone,
+    /// which happens once garbage collection removes it after a newer manifest replaced it.
+    pub(crate) async fn load_manifest(
+        &self,
+        db: &str,
+        data: &Bytes,
+        current: Option<&Version>,
+    ) -> Result<Option<Manifest>> {
         let mut m = Manifest::decode(data)?;
         if m.db_id != db {
             return Err(Error::internal("manifest belongs to another database"));
         }
-        let Some(id) = m.levels.clone() else { return Ok(m) };
+        let Some(id) = m.levels.clone() else { return Ok(Some(m)) };
         if let Some(c) = current.filter(|c| c.m.levels.as_deref() == Some(id.as_str())) {
             m.segments.extend_from_slice(c.m.deep_segments());
             m.check_levels().map_err(Error::internal)?;
-            return Ok(m);
+            return Ok(Some(m));
         }
-        m.attach_levels(&*self.levels(db, &id).await?)?;
-        Ok(m)
+        let Some(l) = self.levels(db, &id).await? else { return Ok(None) };
+        m.attach_levels(&l)?;
+        Ok(Some(m))
     }
 
-    async fn levels(&self, db: &str, id: &str) -> Result<Arc<Levels>> {
+    /// Levels object `id` of `db`, or `None` if it does not exist.
+    async fn levels(&self, db: &str, id: &str) -> Result<Option<Arc<Levels>>> {
         let key = levels_key(db, id);
         let ck = CacheKey::levels(db, id);
         if let Some(CacheVal::Levels(l)) = self.cache.get(&ck) {
-            return Ok(l);
+            return Ok(Some(l));
         }
         let tier = self.cfg.local_tier.as_ref();
         let local = match tier {
@@ -177,7 +185,10 @@ impl Shared {
         let l = match local {
             Some(l) => l,
             None => {
-                let g = self.retry.run(|| self.store.get(&key, GetOpts::default())).await?;
+                let g = match self.retry.run(|| self.store.get(&key, GetOpts::default())).await {
+                    Err(StoreError::NotFound) => return Ok(None),
+                    g => g?,
+                };
                 let l = Levels::decode(&g.data)?;
                 if let Some(t) = tier.cloned() {
                     let k = key.clone();
@@ -191,7 +202,7 @@ impl Shared {
         }
         let l = Arc::new(l);
         self.cache.insert(ck, CacheVal::Levels(l.clone()));
-        Ok(l)
+        Ok(Some(l))
     }
 
     /// Writes a new levels object under a random ID and populates local caches.
@@ -380,7 +391,9 @@ impl Shared {
             Err(e) => return e.into(),
         };
         match m {
-            Ok(m) if m.segments.iter().any(|s| s.id == seg) => Error::internal(format!("segment {seg} is missing")),
+            Ok(Some(m)) if m.segments.iter().any(|s| s.id == seg) => {
+                Error::internal(format!("segment {seg} is missing"))
+            }
             Ok(_) => {
                 crate::probe::hit(crate::probe::Probe::SegmentCollectedUnderRead);
                 Error::unavailable("garbage collection removed a segment this read needed; retry")

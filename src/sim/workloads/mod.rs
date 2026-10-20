@@ -56,9 +56,11 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
     match action {
         0 if n == 1 && !up.is_empty() => sim.restart(pick_up(&mut r)).await,
         0 if up.len() > 1 => sim.crash(pick_up(&mut r)),
+        // A start can take as long as the faults that block it, so it must not hold up the next fault.
         1 => {
             if let Some(i) = (0..n).find(|i| !up.contains(i)) {
-                sim.start(i).await;
+                let sim = sim.clone();
+                tokio::spawn(async move { sim.start(i).await });
             }
         }
         2 if n > 1 => {

@@ -601,7 +601,10 @@ impl Sim {
         cfg.public_url = "https://baserunna.test".into();
         cfg.engine = self.cfg.engine.clone();
         cfg.engine.local_tier = self.disks[i].clone();
-        for attempt in 0..50u64 {
+        // Failures count toward giving up only while no fault cuts node `i` off;
+        // a partition that outlasts the storm can keep a node down until `recover` heals it.
+        let mut failures = 0u64;
+        for attempt in 0u64.. {
             let env = Arc::new(Env::sim(self.seed ^ (n * 7919 + attempt + 1), self.base_ms, self.origin, skew));
             let me = self.me.clone();
             env.set_crash_hook(Arc::new(move |why: &str| {
@@ -634,11 +637,16 @@ impl Sim {
                 Err(e) => {
                     env.shutdown();
                     self.trace.event(&format!("start n{i} failed: {e}"));
-                    tokio::time::sleep(Duration::from_millis(200 + 100 * attempt)).await;
+                    if !self.cut_off(i) {
+                        failures += 1;
+                        if failures == 50 {
+                            panic!("node {i} could not start");
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200 + 100 * attempt.min(50))).await;
                 }
             }
         }
-        panic!("node {i} could not start");
     }
 
     /// Crashes node `i` at a crash point if it is still running instance `n`,
@@ -754,6 +762,12 @@ impl Sim {
 
     fn partitioned(&self, from: usize, to: usize) -> bool {
         self.partitions.lock().unwrap_or_else(|e| e.into_inner()).contains(&(from, to))
+    }
+
+    /// Reports whether a partition or store isolation affects node `i`.
+    fn cut_off(&self, i: usize) -> bool {
+        self.store_isolated(i)
+            || self.partitions.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| a == i || b == i)
     }
 
     fn store_isolated(&self, i: usize) -> bool {

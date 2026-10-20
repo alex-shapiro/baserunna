@@ -557,6 +557,7 @@ impl Db {
             (st.current.as_ref().map(|c| c.etag.clone()), st.current.clone())
         };
         let key = manifest_key(&self.id);
+        let mut levels_missing_at: Option<String> = None;
         loop {
             let started = Instant::now();
             let res = self
@@ -570,7 +571,15 @@ impl Db {
                     return Ok((self.install(c, Some(started)), started));
                 }
                 Ok(g) => {
-                    let m = self.shared.load_manifest(&self.id, &g.data, cur.as_deref()).await?;
+                    let Some(m) = self.shared.load_manifest(&self.id, &g.data, cur.as_deref()).await? else {
+                        // A newer manifest replaced this one, unless the same one comes back.
+                        if levels_missing_at.as_deref() == Some(g.etag.as_str()) {
+                            return Err(Error::internal("the manifest's levels object is missing"));
+                        }
+                        probe::hit(Probe::LevelsCollectedUnderRead);
+                        levels_missing_at = Some(g.etag);
+                        continue;
+                    };
                     let mut v = Version::new(m, g.etag, self.shared.clone());
                     v.stored_ms = Some(g.last_modified_ms);
                     let v = Arc::new(v);

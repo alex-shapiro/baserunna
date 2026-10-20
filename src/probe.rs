@@ -142,6 +142,8 @@ probes! {
     CompactionOutlivedOrphanGrace,
     /// A read failed with a retryable error after garbage collection deleted a segment.
     SegmentCollectedUnderRead,
+    /// A manifest fetch found its levels object deleted by garbage collection and fetched the manifest again.
+    LevelsCollectedUnderRead,
     /// A garbage collection sweep marked unreferenced objects as obsolete.
     OrphansMarked,
     /// Obsolete objects past their grace period were deleted after an ambiguous manifest write.
@@ -199,6 +201,7 @@ impl Probe {
         Probe::CompactionLostLease,
         Probe::CompactionOutlivedOrphanGrace,
         Probe::SegmentCollectedUnderRead,
+        Probe::LevelsCollectedUnderRead,
         Probe::BlobPinnedAtCollection,
         Probe::RetentionTrimLeftToOwner,
         Probe::ForwardDuplicateUnknown,

@@ -521,6 +521,8 @@ pub(super) struct DelayStore {
     /// Manifest writes that are applied, but whose reply is lost.
     pub(super) manifest_put_lost: AtomicU32,
     manifest_get_outages: AtomicU32,
+    /// A manifest the next manifest read returns, as if read before newer writes.
+    stale_manifest: Mutex<Option<Bytes>>,
     manifest_puts: AtomicU32,
     gets: Mutex<Vec<(String, bool)>>,
     seg_get_bytes: Mutex<Vec<usize>>,
@@ -542,6 +544,12 @@ impl ObjectStore for DelayStore {
             self.gets.lock().unwrap().push((key.to_string(), opts.if_none_match.is_some()));
             if key.ends_with("/manifest") && take_fault(&self.manifest_get_outages) {
                 return Err(StoreError::Unavailable("injected".into()));
+            }
+            if key.ends_with("/manifest")
+                && let Some(data) = self.stale_manifest.lock().unwrap().take()
+            {
+                let size = data.len() as u64;
+                return Ok(GetResult { data, etag: "stale".into(), size, last_modified_ms: 0 });
             }
             let r = self.mem.get_sync(key, &opts);
             if let (true, Ok(g)) = (key.contains("/seg/"), &r) {
@@ -603,6 +611,7 @@ pub(super) fn delayed_engine_with(node: &str, cfg: EngineConfig) -> (Arc<Engine>
         manifest_put_outages: 0.into(),
         manifest_put_lost: 0.into(),
         manifest_get_outages: 0.into(),
+        stale_manifest: Mutex::default(),
         manifest_puts: 0.into(),
         gets: Mutex::default(),
         seg_get_bytes: Mutex::default(),
@@ -901,6 +910,46 @@ fn collection_ignores_node_clock_skew() {
         for key in &obsolete {
             assert!(mem.keys().contains(key), "{key} deleted within gc_grace");
         }
+    });
+}
+
+#[test]
+fn a_manifest_whose_levels_object_was_collected_is_read_again() {
+    rt().block_on(async {
+        let cfg = EngineConfig { levels_inline_max: 0, ..EngineConfig::small_for_tests() };
+        let (a, store) = delayed_engine_with("a", cfg);
+        let db = opened(&a, "d").await;
+        let levels = || db.current().unwrap().m.levels.clone();
+        let mut round = 0;
+        let mut write_until = async |done: &dyn Fn(Option<String>) -> bool| {
+            while !done(levels()) {
+                assert!(round < 200, "setup: the levels object never changed");
+                put_many(&db, &format!("r{round:03}-"), 5, 500).await;
+                db.maintenance_now().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                round += 1;
+            }
+        };
+        write_until(&|l| l.is_some()).await;
+        let old = levels().unwrap();
+        let stale = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().data;
+        write_until(&|l| l.is_some_and(|l| l != old)).await;
+        store.mem.delete(&levels_key("d", &old)).await.unwrap();
+
+        let b = second_node(&a, &store, "b");
+        *store.stale_manifest.lock().unwrap() = Some(stale.clone());
+        let before = crate::probe::count(crate::probe::Probe::LevelsCollectedUnderRead);
+        let v = b.db("d").refresh(Instant::now(), false).await.unwrap();
+        assert_eq!(v.m.levels, levels(), "read the replacing manifest");
+        assert_eq!(crate::probe::count(crate::probe::Probe::LevelsCollectedUnderRead), before + 1);
+
+        // The same manifest twice means the levels object of the current manifest is missing.
+        let c = second_node(&a, &store, "c");
+        let current = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().data;
+        store.mem.delete(&levels_key("d", levels().as_deref().unwrap())).await.unwrap();
+        *store.stale_manifest.lock().unwrap() = Some(current);
+        let r = c.db("d").refresh(Instant::now(), false).await;
+        assert!(matches!(r, Err(Error::Internal(_))), "{:?}", r.err());
     });
 }
 

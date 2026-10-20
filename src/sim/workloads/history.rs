@@ -338,11 +338,7 @@ pub fn check(history: &[Txn]) -> Result<(), String> {
                 };
                 let to = ceiling(t.end);
                 if !(from..=to).any(|r| replay(&model, t, r).is_ok()) {
-                    return Err(format!(
-                        "{}: op {:?} does not fail in any state in [{from}, {to}]",
-                        who(),
-                        t.failed
-                    ));
+                    return Err(format!("{}: op {:?} does not fail in any state in [{from}, {to}]", who(), t.failed));
                 }
             }
             _ => {}

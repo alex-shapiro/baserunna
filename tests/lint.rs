@@ -24,11 +24,7 @@ const RULES: &[(&str, &[&str], &str)] = &[
         &["src/sim/", "src/engine/tests.rs", "src/stream/tests.rs"],
         "spawn tasks through Env so node crashes abort them",
     ),
-    (
-        "SystemTime",
-        &["src/env.rs", "src/store/", "src/main.rs", "src/log.rs"],
-        "read wall time from Env::now_ms",
-    ),
+    ("SystemTime", &["src/env.rs", "src/store/", "src/main.rs", "src/log.rs"], "read wall time from Env::now_ms"),
     (
         "std::time::Instant",
         &["src/auth.rs", "src/sim/campaign.rs", "src/sim/explore.rs"],

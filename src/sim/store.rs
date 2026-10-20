@@ -14,8 +14,7 @@ use tokio::time::Instant;
 pub struct StoreFaults {
     pub latency_min_ms: u64,
     pub latency_max_ms: u64,
-    /// Transfer time added per MiB of a `PUT` body or `GET` response, as on
-    /// real stores, where a large manifest takes measurably longer to write.
+    /// Simulated transfer latency per MiB for `GET` and `PUT` payloads.
     pub ms_per_mib: u64,
     /// Probability of 10x request latency.
     pub p_slow: f64,
@@ -152,7 +151,6 @@ impl SimStore {
             latency_ms = r.range(f.stall_ms.0, f.stall_ms.1.max(f.stall_ms.0) + 1);
             self.trace.event(&format!("store stall {latency_ms}ms"));
         }
-        // Avoid advancing the RNG when disabled so existing seeds remain reproducible.
         let late_reply_ms = if on && f.p_late_reply > 0.0 && r.chance(f.p_late_reply) {
             r.range(f.late_reply_ms.0, f.late_reply_ms.1.max(f.late_reply_ms.0) + 1)
         } else {

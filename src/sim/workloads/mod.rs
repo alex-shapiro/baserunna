@@ -57,7 +57,6 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
     match action {
         0 if n == 1 && !up.is_empty() => sim.restart(pick_up(&mut r)).await,
         0 if up.len() > 1 => sim.crash(pick_up(&mut r)),
-        // A start can take as long as the faults that block it, so it must not hold up the next fault.
         1 => {
             if let Some(i) = (0..n).find(|i| !up.contains(i)) {
                 let sim = sim.clone();
@@ -83,7 +82,6 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
             let ms = r.below(3 * sim.cfg.engine.read_lease_ms);
             sim.pause_node(pick_up(&mut r), ms);
         }
-        // A graceful stop takes as long as releasing the node's leases, which faults can draw out.
         9 if up.len() > 1 => {
             let (sim, i) = (sim.clone(), pick_up(&mut r));
             tokio::spawn(async move { sim.stop(i).await });

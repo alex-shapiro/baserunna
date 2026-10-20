@@ -665,8 +665,7 @@ pub(crate) fn commit_id_for(node: &Node, ctx: &DbCtx, key: Option<&str>) -> Resu
     }
 }
 
-/// Returns how an earlier attempt of an idempotent request applied, failing
-/// if a status check aborted its key.
+/// Checks whether an idempotent request was already committed or aborted.
 pub(crate) async fn earlier_attempt(ctx: &DbCtx, commit_id: u64, key: Option<&str>) -> Result<Option<Committed>> {
     if key.is_none() {
         return Ok(None);
@@ -709,9 +708,8 @@ pub(crate) async fn finish<T>(
     }
 }
 
-/// Resolves a failed transaction. If an idempotent request failed a precondition because an
-/// earlier attempt had already applied, returns `Ran::Replayed`; otherwise resolves the commit
-/// as not applied, so that no earlier attempt still in flight applies it after the answer.
+/// Resolves a failed transaction. If an idempotent request failed a precondition, resolves
+/// the commit to return `Ran::Replayed` if a prior attempt succeeded or to abort any in-flight attempt.
 pub(crate) async fn failed<T>(ctx: &DbCtx, commit_id: u64, key: Option<&str>, e: Error) -> Result<Ran<T>> {
     match e {
         Error::PreconditionFailed { .. } if key.is_some() => match ctx.db.resolve_commit(commit_id).await? {

@@ -1,7 +1,5 @@
-//! Commit latency against a real object store for a range of manifest tail
-//! limits (`tail_max_bytes`), and raw `PUT` latency by object size. Runs the
-//! engine in-process under a fresh key prefix of the store, which it deletes
-//! afterwards.
+//! Measures commit latency across manifest tail limits (`tail_max_bytes`) and
+//! raw object-store `PUT`/`GET` latency by object size.
 //!
 //! ```text
 //! BASERUNNA_STORE=s3://bucket cargo run --release --example commit_latency
@@ -10,14 +8,14 @@
 //!
 //! | variable           | default            | meaning                                               |
 //! | ------------------ | ------------------ | ----------------------------------------------------- |
-//! | `BASERUNNA_STORE`  | required           | store URL (`mem:` for a dry run); the run uses `<url>/bench-<random>` |
-//! | `LAT_TAILS_KB`     | `16,32,64,128,256` | tail limits to measure, in KiB                        |
-//! | `LAT_WRITERS`      | `1,8`              | concurrent writers to measure with                    |
+//! | `BASERUNNA_STORE`  | required           | store URL (`mem:` for a dry run); uses `<url>/bench-<random>` |
+//! | `LAT_TAILS_KB`     | `16,32,64,128,256` | tail limits in KiB                                    |
+//! | `LAT_WRITERS`      | `1,8`              | concurrent writers                                    |
 //! | `LAT_VALUE_BYTES`  | 256                | bytes per written value                               |
 //! | `LAT_KEYS`         | 2000               | distinct keys written                                 |
-//! | `LAT_CYCLES`       | 3                  | tail limits' worth of data written per measurement    |
-//! | `LAT_RAW_BYTES`    | `1024,16384,…`     | object sizes for the raw `PUT` and `GET` measurement  |
-//! | `LAT_RAW_COUNT`    | 20                 | requests per size in the raw measurement              |
+//! | `LAT_CYCLES`       | 3                  | multiples of the tail limit written per run           |
+//! | `LAT_RAW_BYTES`    | `1024,16384,…`     | object sizes for raw `PUT` and `GET` measurements     |
+//! | `LAT_RAW_COUNT`    | 20                 | requests per size in raw measurements                 |
 
 use baserunna::engine::{Consistency, Engine, EngineConfig, Isolation, Value};
 use baserunna::env::Env;
@@ -161,7 +159,6 @@ async fn run() {
     println!("\ndeleted {deleted} objects under {prefix}");
 }
 
-/// Runs `futs` concurrently on this task.
 async fn futures_join_all<F: std::future::Future<Output = ()>>(futs: Vec<F>) {
     let mut futs: Vec<std::pin::Pin<Box<F>>> = futs.into_iter().map(Box::pin).collect();
     std::future::poll_fn(|cx| {

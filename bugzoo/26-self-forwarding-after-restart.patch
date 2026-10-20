@@ -2,20 +2,19 @@ diff --git a/src/node.rs b/src/node.rs
 index 0bbaa62..ba6297b 100644
 --- a/src/node.rs
 +++ b/src/node.rs
-@@ -432,7 +432,7 @@ impl Node {
+@@ -430,7 +430,7 @@ impl Node {
          let now = self.now_ms() as i64;
          let mut live: Vec<NodeRecord> = cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
              .into_iter()
 -            .filter(|n| n.id != self.id && !self.is_suspect(&n.id) && n.addr != self.cfg.addr)
 +            .filter(|n| n.id != self.id && !self.is_suspect(&n.id))
              .collect();
-         live.push(NodeRecord { id: self.id.clone(), addr: self.cfg.addr.clone(), started_at: 0, heartbeat_at: now });
-         live
-@@ -534,11 +534,6 @@ impl Node {
+         if !self.draining() {
+             live.push(NodeRecord {
+@@ -539,10 +539,6 @@ impl Node {
              self.env.trace(|| format!("{db_id}: address for {target} is missing, handling locally"));
              return None;
          };
--        // Ignore a previous process that ran at this node's address.
 -        if addr == self.cfg.addr {
 -            crate::probe::hit(crate::probe::Probe::OwnAddressIgnored);
 -            return None;

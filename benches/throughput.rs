@@ -4,14 +4,14 @@
 //! ```text
 //! cargo bench --bench throughput
 //! BENCH_DBS=5000 BENCH_LATENCY_MS=20 BENCH_SECS=20 cargo bench --bench throughput
-//! # CPU cost of commits against full manifest tails, on one core:
+//! # CPU cost of commits against full manifest tails:
 //! BENCH_THREADS=1 BENCH_DBS=8 BENCH_KEYS=1000 BENCH_VALUE_BYTES=256 BENCH_WRITE_PCT=100 \
 //!   BENCH_LATENCY_MS=30 BENCH_CLIENTS=256 cargo bench --bench throughput
 //! ```
 //!
 //! | variable           | default | meaning                                              |
 //! | ------------------ | ------- | ---------------------------------------------------- |
-//! | `BENCH_DBS`        | 2000    | active databases (one key each, spread over users)   |
+//! | `BENCH_DBS`        | 2000    | active databases                                     |
 //! | `BENCH_CLIENTS`    | 64      | concurrent clients                                   |
 //! | `BENCH_SECS`       | 10      | measured duration                                    |
 //! | `BENCH_WRITE_PCT`  | 10      | percentage of requests that are writes               |
@@ -39,10 +39,9 @@ fn env(name: &str, default: u64) -> u64 {
 
 const DBS_PER_USER: usize = 200;
 
-/// User and system CPU time consumed by this process.
 fn cpu_secs() -> f64 {
     let mut u = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-    // SAFETY: getrusage fills the struct it is given.
+    // SAFETY: getrusage initializes the rusage struct.
     let u = unsafe {
         libc::getrusage(libc::RUSAGE_SELF, u.as_mut_ptr());
         u.assume_init()
@@ -51,7 +50,6 @@ fn cpu_secs() -> f64 {
     secs(u.ru_utime) + secs(u.ru_stime)
 }
 
-/// A `len`-byte value, at least one byte, that compresses like typical data.
 fn value(seed: u64, len: usize) -> Bytes {
     Bytes::from(Rng::new(seed).text(len.max(1)))
 }

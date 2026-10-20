@@ -75,11 +75,8 @@ enum Settled {
     Unknown,
 }
 
-/// Retries a request with idempotency key `key` (in `headers` or in a JSON
-/// `body`) until it receives a definitive response. On an ambiguous failure,
-/// resolves the commit at once; a status check aborts an unapplied commit for
-/// good, so the request is retried under a new key, as it is if an earlier
-/// attempt's failed precondition resolved the key.
+/// Retries an idempotent request until it receives a definitive response, rotating
+/// the idempotency key if an unapplied attempt is aborted.
 async fn settle_call(
     c: &Client,
     method: &str,
@@ -554,7 +551,6 @@ async fn lifecycle(c: Client, rounds: usize) -> Result<(), String> {
             let path = format!("{DB}/streams/tmp/records");
             let mut attempt = 0;
             let first = loop {
-                // A status check left the key of an attempt of unknown outcome aborted.
                 let key = format!("tmp-{round}-{i}-{attempt}");
                 attempt += 1;
                 let body = json!({"records": [{"value": format!("{round}.{i}")}], "idempotency_key": key});

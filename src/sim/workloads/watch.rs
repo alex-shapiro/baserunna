@@ -168,7 +168,6 @@ impl Watcher {
     /// `None` on transient error.
     async fn poll(&mut self, wait_ms: u64) -> Result<Option<bool>, String> {
         let p = format!("{BASE}/changes?after={}&limit={}&wait_ms={wait_ms}", self.cursor, 1 + self.c.rng().below(8));
-        // The server read the feed, and checked the cursor, between `sent` and `at`.
         let sent = self.c.sim.now_ms();
         let Ok(r): Result<Resp, _> = self.c.call("GET", &p, None).await else { return Ok(None) };
         let at = self.c.sim.now_ms();
@@ -251,8 +250,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
         return Err(e);
     }
     super::settle(&sim, phase).await;
-    // Faults could have lost every poll while the writer ran, so the feed must also deliver a
-    // write made once they have healed.
     while watcher.poll(0).await? != Some(true) {
         watcher.c.pause(100).await;
     }

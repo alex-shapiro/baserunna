@@ -12,8 +12,6 @@ use std::time::Duration;
 /// Upper bound on how long an in-flight server request can remain active.
 pub const ZOMBIE_WAIT_MS: u64 = 30_000;
 
-/// Delays between retries of a request: doubling from 50 ms to 2 s, for
-/// about 13 minutes in all, so retries outlast node restarts under chaos.
 struct Backoff {
     attempts: u32,
     delay: u64,
@@ -24,7 +22,6 @@ impl Backoff {
         Backoff { attempts: 0, delay: 50 }
     }
 
-    /// Waits before every attempt but the first; false once retries are exhausted.
     async fn wait(&mut self, sim: &Sim) -> bool {
         if self.attempts > 0 {
             sim.sleep(self.delay).await;
@@ -309,9 +306,8 @@ impl Client {
         }
     }
 
-    /// Returns `true` if the record of a commit first attempted at `began` is
-    /// still retained, so a status check or retry answers for it.
-    pub fn retained(&self, began: u64) -> bool {
+    /// Returns `true` if a commit started at `began` is still within the server's commit retention window.
+    pub fn is_commit_retained(&self, began: u64) -> bool {
         let e = &self.sim.cfg.engine;
         self.sim.now_ms() + 2 * e.clock_sync_max_error_ms < began.saturating_add(e.commit_retention_ms)
     }
@@ -405,8 +401,6 @@ impl Client {
                 Ok(r) if r.outcome_unknown() => self.sim.sleep(ZOMBIE_WAIT_MS).await,
                 Ok(r) if r.status == 503 || r.status == 409 => {}
                 Ok(r) => return Err(format!("create db {body}: {} {}", r.status, r.json)),
-                // Wait out the lost attempt, which could otherwise create the database again
-                // after the caller deletes it.
                 Err(_) => self.sim.sleep(ZOMBIE_WAIT_MS).await,
             }
         }

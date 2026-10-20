@@ -91,7 +91,6 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     expect(r.status == 200 || r.status == 403, "admin nodes")?;
     let r = c.call_retry("GET", "/v1/admin/users", None).await;
     expect(r.status == 200 || r.status == 403, "admin users")?;
-    // Let delayed and duplicated forwards of earlier requests arrive before the reset.
     c.pause(c.sim.cfg.net.forward_delay_max_ms + 1_000).await;
     let r = c.call_retry("DELETE", "/v1/admin/metrics", None).await;
     if r.status == 200 {

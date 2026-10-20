@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// A paused-clock runtime for one test, which also starts a probe recording.
 pub(crate) fn rt() -> tokio::runtime::Runtime {
     crate::probe::record();
     tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap()
@@ -518,10 +517,8 @@ pub(super) struct DelayStore {
     put_reply_ms: AtomicU64,
     manifest_put_conflicts: AtomicU32,
     manifest_put_outages: AtomicU32,
-    /// Manifest writes that are applied, but whose reply is lost.
     pub(super) manifest_put_lost: AtomicU32,
     manifest_get_outages: AtomicU32,
-    /// A manifest the next manifest read returns, as if read before newer writes.
     stale_manifest: Mutex<Option<Bytes>>,
     manifest_puts: AtomicU32,
     gets: Mutex<Vec<(String, bool)>>,
@@ -674,7 +671,7 @@ fn strong_reads_wait_for_the_write_in_flight() {
 }
 
 #[test]
-fn resolving_a_commit_aborts_it_for_good() {
+fn resolving_a_commit_aborts_it() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
@@ -943,7 +940,6 @@ fn a_manifest_whose_levels_object_was_collected_is_read_again() {
         assert_eq!(v.m.levels, levels(), "read the replacing manifest");
         assert_eq!(crate::probe::count(crate::probe::Probe::LevelsCollectedUnderRead), before + 1);
 
-        // A manifest read again that still references the levels object means it is missing.
         let c = second_node(&a, &store, "c");
         let current = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().data;
         store.mem.delete(&levels_key("d", levels().as_deref().unwrap())).await.unwrap();
@@ -1232,7 +1228,6 @@ pub(super) async fn put_many(db: &Arc<Db>, prefix: &str, n: usize, len: usize) -
     db.commit(t.into_request()).await.unwrap()
 }
 
-/// Waits for background work, such as a flush of the tail, to finish.
 pub(super) async fn flushed(db: &Arc<Db>) {
     for _ in 0..500 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1295,8 +1290,6 @@ fn commit_with_lost_reply_after_takeover(reply_delay_leases: u64, hedge_ms: u64)
 
 #[test]
 fn ambiguous_commit_during_active_lease() {
-    // Node B cannot retry while node A's lease is still active, but the manifest it read back
-    // records the commit, so the outcome is known.
     match commit_with_lost_reply_after_takeover(2, 0) {
         Ok(2) => {}
         other => panic!("expected the applied write's version 2, got {other:?}"),
@@ -1305,7 +1298,6 @@ fn ambiguous_commit_during_active_lease() {
 
 #[test]
 fn ambiguous_commit_after_lease_expires() {
-    // Node B retries after the store clock shows node A's lease has expired.
     match commit_with_lost_reply_after_takeover(4, 0) {
         Ok(2) => {}
         other => panic!("expected version 2, got {other:?}"),
@@ -1321,7 +1313,7 @@ fn hedged_commit_resolves_before_a_takeover() {
 }
 
 #[test]
-fn released_leases_hand_over_at_once() {
+fn released_leases_hand_over_immediately() {
     rt().block_on(async {
         let (a, store) = delayed_engine("a");
         let da = opened(&a, "d").await;
@@ -1336,7 +1328,7 @@ fn released_leases_hand_over_at_once() {
 }
 
 #[test]
-fn decided_commits_are_answered_whatever_becomes_of_the_write() {
+fn decided_commits_are_answered_on_write_failure() {
     rt().block_on(async {
         let cfg = EngineConfig { manifest_put_hedge_ms: 0, commit_retry_max: 2, ..EngineConfig::small_for_tests() };
         let (eng, store) = delayed_engine_with("a", cfg);
@@ -1354,7 +1346,6 @@ fn decided_commits_are_answered_whatever_becomes_of_the_write() {
         let first = db.commit_detailed(request(77).await).await.unwrap();
         assert_eq!(db.resolve_commit(88).await.unwrap(), None);
         let (retry, aborted) = (request(77).await, request(88).await);
-        // Every manifest write of the batch applies, but its reply is lost.
         store.manifest_put_lost.store(10, SeqCst);
         let (lease, replay, late) =
             tokio::join!(db.acquire_lease(), db.commit_detailed(retry), db.commit_detailed(aborted));
@@ -1372,7 +1363,7 @@ fn background_work_does_not_take_back_a_released_lease() {
         let db = opened(&eng, "d").await;
         let before = crate::probe::count(crate::probe::Probe::BackgroundInstallUnleased);
         put_many(&db, "k", 5, 500).await;
-        assert!(db.busy(), "setup: no flush started");
+        assert!(db.busy(), "setup: flush did not start");
         db.release_lease().await.unwrap();
         flushed(&db).await;
         let stored = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().data;
@@ -1563,8 +1554,8 @@ fn commit_records_make_commits_idempotent_until_they_expire() {
             .next()
             .await
             .unwrap();
-        assert!(records.is_some_and(|e| !e.value.is_tombstone() && e.expires.is_none()), "no tombstones of records");
-        assert!(v.all_entries(true).await.unwrap().iter().all(|e| !types::is_commit_key(&e.key)), "data excludes them");
+        assert!(records.is_some_and(|e| !e.value.is_tombstone() && e.expires.is_none()));
+        assert!(v.all_entries(true).await.unwrap().iter().all(|e| !types::is_commit_key(&e.key)));
     });
 }
 
@@ -1609,7 +1600,7 @@ fn tail_tombstones_are_dropped_after_a_transaction_lifetime() {
         db.commit(t.into_request()).await.unwrap();
         let tombstone =
             || db.current().unwrap().m.tail.iter().any(|e| e.key.as_ref() == b"k" && e.value.is_tombstone());
-        assert!(tombstone(), "dropped at once");
+        assert!(tombstone());
         tokio::time::sleep_until(start + Duration::from_millis(life - 1)).await;
         put(&db, "x", "1").await;
         assert!(tombstone(), "dropped within a transaction lifetime");
@@ -1758,7 +1749,7 @@ fn stored_segment(store: &MemStore, id: char, level: u8, entries: &[Entry]) -> m
 }
 
 #[test]
-fn merges_purge_only_tombstones_nothing_needs() {
+fn merges_purge_expired_tombstones() {
     rt().block_on(async {
         let (eng, store, _env) = engine(1, EngineConfig::small_for_tests());
         let e = |k: &str, seq, value| Entry::new(Bytes::from(k.to_string()), seq, value);
@@ -1878,7 +1869,7 @@ fn written_segments_are_read_without_requests() {
         let db = opened(&eng, "d").await;
         put_many(&db, "k", 5, 500).await;
         flushed(&db).await;
-        assert!(db.current().unwrap().m.tail.is_empty(), "setup: no flush");
+        assert!(db.current().unwrap().m.tail.is_empty());
         let gets = || store.seg_get_bytes.lock().unwrap().len();
         let before = gets();
         assert!(strong_get(&db, "k03").await.is_some());
@@ -1902,8 +1893,7 @@ fn appends_move_down_without_rewrites() {
                 levels.entry(s.id.clone()).or_default().insert(s.level);
             }
         }
-        assert!(levels.values().any(|l| l.len() > 1 && !l.contains(&0)), "no segment moved down a level as it was");
-        // The last flush is installed once no commit comes to share its manifest write.
+        assert!(levels.values().any(|l| l.len() > 1 && !l.contains(&0)));
         tokio::time::sleep(Duration::from_millis(3_000)).await;
         let writes = store.manifest_puts.load(SeqCst);
         tokio::time::sleep(Duration::from_millis(1_000)).await;
@@ -2093,7 +2083,6 @@ fn changes_are_entries_newer_than_the_snapshot() {
 #[test]
 fn one_compaction_at_a_time() {
     rt().block_on(async {
-        // A tail that holds a few commits, so that flushes keep up with them.
         let cfg = EngineConfig { tail_max_bytes: 8 * 1024, ..EngineConfig::small_for_tests() };
         let (eng, store) = delayed_engine_with("a", cfg);
         let db = opened(&eng, "d").await;

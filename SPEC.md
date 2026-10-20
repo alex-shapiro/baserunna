@@ -134,7 +134,7 @@ A committed transaction is assigned a monotonically increasing `seq` number. Eac
 
 #### Segments and Levels
 
-Once the inline `tail` grows past `tail_max_bytes` (256 KiB), the lease holder writes its entries to a new immutable **segment** in the background and removes them from the tail (§5.5). Each segment is an SSTable (Sorted String Table) designed for random and sequential reads over object storage (§5.3):
+If the inline `tail` exceeds `tail_max_bytes` (256 KiB), the lease holder flushes the tail entries in the background to a new immutable **segment** (§5.5). Each segment is an SSTable (Sorted String Table) designed for random and sequential reads over object storage (§5.3):
 
 - Segment entries are sorted by key, with at most one entry per key
 - A segment is divided into 64 KiB data blocks, each compressed independently with zstd and checksummed with CRC32C.
@@ -352,7 +352,7 @@ clock                                every node's store-clock probe (§5.8)
 
 ### 5.2 Manifest
 
-The manifest is a binary, CRC32C-checksummed document (`engine/manifest.rs`). The body is compressed with zstd (level 1) if compression reduces its size by at least 12.5%. The tail is compressed in pages of about 32 entries, each a zstd frame of its own (consecutive frames decompress as one stream). A page ends after a key whose hash has its low five bits clear, so a write changes only the page it lands in, and the committer reuses the compressed frames of unchanged pages, matched by the SHA-256 of their bytes: a commit compresses the pages it changed rather than the whole tail.
+The manifest is a binary, CRC32C-checksummed document (`engine/manifest.rs`). The body is compressed with zstd (level 1) if compression reduces its size by at least 12.5%. To avoid recompressing the entire tail on every commit, the tail is split at content-defined key boundaries into ~32-entry pages. Each page is compressed as an independent zstd frame and cached by its SHA-256 digest so that commits only compress modified pages.
 
 ```
 magic "BRMF", format u16, codec u8
@@ -371,7 +371,7 @@ version_times: [(version, store_ms)]                  sparse samples (≥30 s ap
 obsolete: [(kind, id, since_store_ms)]                segments, levels objects and blobs awaiting deletion
 blob_bytes: {bound, swept, swept_at}                  blob bytes for the size quota (§5.10)
 chunk_bytes: {bound, swept, swept_at}                 sealed stream chunk bytes, likewise (§5.11)
-flushes: u64                                          incremented by every flush of the tail (§5.5)
+flush_seq: u64                                        incremented by every tail flush (§5.5)
 ```
 
 Each `SegmentMeta` records its level, size, key and seq ranges,
@@ -432,13 +432,13 @@ Large segments (> 1 MiB) are loaded lazily:
 1. On an index miss, the node fetches the 64-byte footer to learn `bloom_off`, then fetches the bloom filter and block index together in a ranged `GET`. Both are cached locally.
 2. A point lookup checks the cached bloom filter first. If it matches, it binary-searches the block index and issues a ranged `GET` for the matching data block.
 
-During a forward range scan, blocks are initially fetched one at a time. If a scan has already fetched 2 blocks of the same segment from object storage, it switches to bulk read-ahead, coalescing the consecutive uncached blocks the scan needs next (up to 1 MiB) into a single ranged `GET`. Compactions and garbage-collection sweeps read every block once, so they use whatever the memory and disk caches hold but cache nothing they fetch, and background merges do not evict the hot working set: a small segment is fetched whole, and a larger one's uncached blocks in bulk requests.
+During a forward range scan, the first 2 block reads of a segment fetch individual blocks. After fetching 2 blocks of the same segment from object storage, the scan switches to bulk read-ahead and coalesces consecutive uncached blocks in the scan range (up to 1 MiB) into a single ranged `GET`. Compactions and garbage-collection sweeps read existing entries from the memory and disk caches without populating the caches on misses, so background merges do not evict the working set.
 
 #### Local Caching
 
-Each node caches reads and writes in memory, up to 512 MiB: decoded blocks, segment indexes, and `.levels` objects. Any segment that a node writes is pre-cached. The cache evicts with the CLOCK algorithm, sharded by key: a hit only sets its entry's reference bit under a shared lock, and an insertion advances the clock hand past referenced entries, clearing their bits, to evict the first unreferenced one. An entry read once, as by a scan, is evicted before entries read repeatedly.
+Each node caches decoded blocks, segment indexes, and `.levels` objects in a sharded in-memory CLOCK cache (up to 512 MiB). Written segments are pre-cached. Cache hits set an atomic reference bit under a shared lock, and insertions evict the first unreferenced entry under an exclusive lock.
 
-Each node also caches reads and writes on its local disk, up to 10 GiB. Small (≤ 1 MiB) segments are cached as a single file, `#all`, from which a block evicted from memory is read back. Larger segments cache their metadata tail as `#meta` and individual compressed blocks as separate files `#b0`, `#b1`, …. Each file is written atomically and is checksummed by a trailing CRC32C.
+Each node also caches up to 10 GiB on local disk. Small segments (≤ 1 MiB) are stored as a single file (`#all`). Larger segments store their metadata tail as `#meta` and individual compressed blocks as `#b0`, `#b1`, …. Each file is written atomically with a trailing CRC32C checksum.
 
 Segments are immutable, so cached segment data is never invalidated.
 
@@ -470,11 +470,11 @@ Each open database has a per-node commit queue drained by a single committer tas
 2. Verify that `base.lease` is not held by another node (§5.7). If another node holds a valid lease, fail the batch with `not_owner` so the HTTP layer can forward or return `503`.
 3. Compute the batch's `version_time` as `max(base.time_ms, store_now, max(txn.read_time))` (§4.5).
 4. For each transaction in the batch:
-   - Skip and return the recorded version if its commit record already exists in `base` or earlier in the batch, or reject it with `409 aborted` if a status check aborted its commit ID (§6.2).
+   - Skip and return the recorded version if its commit record already exists in `base` or earlier in the batch, or reject it with `409 aborted` if its commit record is an abort record (§6.2).
    - Reject it if its 10 second commit deadline has passed.
    - Validate its read set (§6.1) against all writes with `seq > txn.read_version` in `base` and in earlier accepted transactions in the batch, rejecting conflicts with `409 conflict`.
    - Assign the accepted transaction the next sequence number (`base.version + 1`, `+ 2`, …), merge its writes into `tail`, and write its commit record.
-5. Expire old `tail` entries. If a background flush of the tail is ready, install it; if the tail has outgrown four times `tail_max_bytes` regardless, flush it in this commit (§5.5).
+5. Expire old `tail` entries. Install any completed background tail flush, or flush the tail synchronously if it exceeds `4 × tail_max_bytes` (§5.5).
 6. Renew `manifest.lease` for 5 s (§5.7).
 7. Write the updated manifest with `PUT manifest If-Match: base.etag`, install the new `Version` in memory, and acknowledge the accepted transactions.
 8. Schedule background compaction if needed (§5.6).
@@ -491,28 +491,26 @@ A `delete_range` with size ≤ 256 is committed as individual point tombstones. 
 
 Before writing the manifest, any `tail` entries with `expires_at <= version_time` are converted into tombstones, and commit records older than 10 min are removed.
 
-The tail is flushed in the background, so that no commit waits for a segment `PUT`. Once a commit leaves `tail` larger than `tail_max_bytes` (256 KiB), the lease holder writes the entries of that version's tail to new Level 0 segments, user data and commit records in separate segments, and queues their install. The install removes from `tail` every entry as old as the flushed version and adds the segments to Level 0, in the manifest write of the next commit, or after a second if none comes. Entries committed meanwhile stay in `tail`.
+If `tail` exceeds `tail_max_bytes` (256 KiB), the lease holder flushes that version's tail entries in the background to new Level 0 segments, writing user data and commit records to separate segments. The flush is installed on the next commit (or after 1 s if the database is idle) by adding the new segments to Level 0, removing tail entries with `seq <= flushed_version`, and incrementing `flush_seq`. If background flushes fall behind and `tail` exceeds `4 × tail_max_bytes`, the committer flushes `tail` synchronously before writing the manifest.
 
-An install is rejected, and its objects deleted, if the manifest's `flushes` counter moved since the flushed version (another flush, on this or another node, wrote some of the same entries, and a second copy in a newer segment would shadow the chunks compactions seal from the first), if a tombstone newer than the flushed version was purged meanwhile, if the flush outlived the orphan grace (§5.8), or if the node's lease ended, as when it released the lease on shutdown: background work never takes a lease. If a commit finds the tail at four times `tail_max_bytes`, as when flushes cannot keep up, it flushes the tail itself before its manifest write. Segments of a flush interrupted by a crash are cleaned up later as orphans (§5.8).
-
-The tail limit trades the size of every manifest `PUT` against flushes, each a segment `PUT` and later compaction work. A smaller limit buys little latency: on Tigris, a `PUT` of 1.1 KiB already takes about 70 ms (p50), against 107 ms at 256 KiB and 26 ms below 1,000 bytes, while it raises the cost of steady writes, stream ingestion (runs of a stream rarely reach the sealing size within one flush), cold reads, and space amplification.
+A background flush install is rejected and its output objects are deleted if `flush_seq` changed since the flushed version, if tombstones newer than the flushed version were purged, if the flush exceeded the orphan grace period (§5.8), or if the node does not hold the lease.
 
 #### CAS Conflicts and Retries
 
 If a conditional `PUT` on the manifest does not succeed on the first attempt:
 
 - On `412 Precondition Failed`, another node updated the manifest. The committer reloads the manifest. If another node now holds a valid lease, the batch fails with `not_owner`; otherwise the committer re-runs validation and applies the batch against the new `base`.
-- On a timeout or network error, it is unknown whether the `PUT` landed. The committer reloads the manifest and retries against the new `base`. If the earlier `PUT` succeeded, step 4 finds the batch's commit records in the reloaded manifest and returns their committed versions without re-applying the writes. If a delayed copy of the first `PUT` is still in flight, it carries the same `If-Match` etag as the retry so at most one can succeed. Once the reloaded manifest has moved past every etag the batch's ambiguous `PUT`s named, and holds none of its commit records, none of them applied or ever will, and the batch's outcome is known again. Otherwise, after exhausting retries or losing the lease, the committer returns `503 unavailable` with `outcome: "unknown"`, which the client can resolve via `GET /commits/{id}` or by retrying with the same idempotency key. A failing batch first answers each commit that the last manifest it read records as applied or aborted: those outcomes are known, whatever became of the batch's own writes.
+- On a timeout or network error, it is unknown whether the `PUT` succeeded. The committer reloads the manifest and retries against the new `base`. If an earlier `PUT` succeeded, step 4 finds the batch's commit records in the reloaded manifest and returns their committed versions without re-applying the writes. If the reloaded manifest's etag differs from all etags targeted by the batch's ambiguous `PUT`s and contains none of the batch's commit records, none of the ambiguous `PUT`s can succeed, so the batch outcome is settled. If retries are exhausted or the lease is lost while the outcome remains ambiguous, the committer returns `503 unavailable` with `outcome: "unknown"` for undecided transactions, while returning the recorded outcome for any transaction in the batch whose commit record is already present in the latest manifest.
 
 #### Hedged Manifest Writes
 
-If a manifest `PUT` does not complete within `manifest_put_hedge_ms` (250 ms), the committer sends a duplicate `PUT` with the same `If-Match` precondition. Because both requests use the same precondition, at most one is applied. The attempt succeeds as soon as either request succeeds. If the duplicate fails with `412 Precondition Failed` while the first request is still in flight, the first request may have already been applied, so the committer treats the attempt as a timeout and reloads the manifest immediately. Until the first request completes, the node serves no read from its lease: the manifest it holds may be replaced in storage at any moment, so strong reads read the manifest from storage instead. On any other error, the committer waits for both requests to finish. Objects removed from `obsolete` by the planned manifest have already passed their grace period, so they are deleted even if the outcome of the `PUT` is unknown.
+If a manifest `PUT` does not complete within `manifest_put_hedge_ms` (250 ms), the committer sends a duplicate `PUT` with the same `If-Match` precondition. Because both requests use the same precondition, storage applies at most 1 of them. The attempt succeeds as soon as either request succeeds. If the duplicate fails with `412 Precondition Failed` while the first request is still in flight, the first request may have already been applied, so the committer treats the attempt as a timeout and reloads the manifest immediately. While the first request remains in flight after a rejected duplicate, strong reads bypass the local lease and validate the manifest from storage. On any other error, the committer waits for both requests to finish. Objects removed from `obsolete` by the planned manifest have already passed their grace period, so they are deleted even if the outcome of the `PUT` is unknown.
 
 #### Commit Records
 
-Commit records make retries idempotent and let clients check the outcome of ambiguous commits. If a transaction is accepted, the committer writes an entry in the system keyspace (`0xFF ++ commit_id`, §4.2) with the transaction's committed version as its `seq` in the same manifest update as its data writes. A transaction committed if and only if its commit record exists and is not an abort record.
+Commit records make retries idempotent and let clients check the outcome of ambiguous commits. If a transaction is accepted, the committer writes an entry in the system keyspace (`0xFF ++ commit_id`, §4.2) with the transaction's committed version as its `seq` in the same manifest update as its data writes. A transaction was committed if and only if its commit record exists and is not an abort record.
 
-A commit status check runs in the committer's batch like a commit: if it finds no record of the commit ID, it writes an empty one, an **abort record**, in a version of its own. Every later manifest builds on that write, so every later attempt of the commit ID, on any node, finds the abort record and fails with `409 aborted` instead of applying. The check is therefore definitive at once, with no wait for in-flight attempts to time out. An abort is final while the record is retained, as it must be: a request may have reached a node before the check and not yet begun its transaction, so attempts cannot be told apart by when they began.
+A commit status check runs through the committer queue. If the commit ID does not have a commit record, the committer writes an empty **abort record** in a new manifest version. Any subsequent commit attempt for that commit ID sees the abort record and fails with `409 aborted`, allowing status checks to return immediately without waiting for in-flight attempts to expire.
 
 Commit records are stored in the LSM tree alongside regular keys, starting in `tail` and flushing to bloom-filtered segments. Checking a commit ID is a standard point lookup. Commit records are retained for 10 min and do not count toward the database size quota. Because commit records are never overwritten, expired records are dropped without writing tombstones. Flushes and Level 0 compactions keep commit records in dedicated segments separate from user data so commit-record churn does not amplify data compaction.
 
@@ -556,7 +554,7 @@ Whenever a commit or compaction finishes, the picker evaluates candidate work in
 
 #### Streaming
 
-Compaction never loads entire segments into memory. Instead, it streams through each input segment, reading blocks the node has cached and fetching the rest in 1 MiB ranged `GET`s without caching them (§5.3), and writes out new 2 MiB segments as they are filled. Memory usage remains bounded to one 1 MiB read buffer per input run and one 2 MiB output buffer, regardless of database size.
+Compaction never loads entire segments into memory. Instead, it streams through each input segment, reading cached blocks and fetching uncached blocks in 1 MiB ranged `GET`s without populating the cache (§5.3), and writes out new 2 MiB segments as they are filled. Memory usage remains bounded to a 1 MiB read buffer per input run and a 2 MiB output buffer, regardless of database size.
 
 #### Deleting Tombstones
 
@@ -625,7 +623,7 @@ Every 10 minutes, each node overwrites a shared `clock` object and reads back it
 
 #### Obsolete Segments
 
-If compaction replaces segments or a `.levels` object, it adds their IDs to `manifest.obsolete` with the current store time. When subsequent commits or compactions are applied, the lease holder deletes any object in `obsolete` that has been listed for at least 30 min and removes it from the manifest. Transactions time out after 5 min, so only a read whose store request stalls past the grace period can encounter a deleted segment: if the current manifest no longer lists the segment, the read fails with a retryable `503`; if the manifest still lists it, the segment is missing and the read fails with `500`. A manifest read that stalls the same way may find its levels object gone; the node then reads the manifest again, and only if that one still references the levels object is it missing (`500`).
+If compaction replaces segments or a `.levels` object, it adds their IDs to `manifest.obsolete` with the current store time. During subsequent commits or compactions, the lease holder deletes any object in `obsolete` that has been listed for at least 30 min and removes it from the manifest. Transactions time out after 5 min, so only a read whose store request stalls past the grace period can encounter a deleted segment: if the current manifest does not list the segment, the read fails with a retryable `503`; if the manifest still lists it, the segment is missing and the read fails with `500`. Similarly, if a manifest read encounters a deleted `.levels` object, the node reloads the manifest and returns `500` only if the latest manifest still references the missing object.
 
 #### Orphans
 
@@ -646,7 +644,7 @@ Before deleting an obsolete blob, GC checks its `pin` object. If the pin was upd
 
 #### Deleted Databases
 
-Deleting a database marks its record as deleted in the system database. After a 10 min grace period (exceeding node metadata cache TTLs), a reaper lists and deletes all objects under `dbs/{db_id}/`. The reaper runs on the live member, counting itself, that rendezvous hashing picks: however nodes' views of the members differ, the node that hashes highest among all of them picks itself. It then waits another 10 min and runs a second pass to catch any objects written by lagging requests before removing the database record.
+Deleting a database marks its record as deleted in the system database. After a 10 min grace period (exceeding node metadata cache TTLs), the live cluster member selected by rendezvous hashing lists and deletes all objects under `dbs/{db_id}/`. It then waits another 10 min and runs a second pass to catch any objects written by lagging requests before removing the database record.
 
 ### 5.9 Read Consistency
 
@@ -687,7 +685,7 @@ Low-volume streams stay in the LSM tree. Thousands of quiet streams share a sing
 
 When a flush or compaction encounters at least 64 KiB of consecutive records for a single stream, it writes those records to one or more dedicated segment objects called sealed chunks. Each sealed chunk is up to 2 MiB and omits the bloom filter (§5.3). In the LSM tree, the run of records is replaced by a single chunk reference keyed by the run's last `seq` (`0x06 ++ stream_id ++ last_seq`), storing the chunk's segment ID, byte size, first `seq`, byte range, and timestamp range.
 
-Sealed chunks are never rewritten by future compactions. When a busy stream fills `tail` on its own, a flush seals its records directly from `tail` into a chunk object. If the remaining unsealed `tail` entries fit in half the tail limit, they stay in `tail`, and the flush costs only the chunk's `PUT`.
+Sealed chunks are never rewritten by future compactions. When a busy stream fills `tail` on its own, a flush seals its records directly from `tail` into a chunk object. If the remaining unsealed `tail` entries fit in half the tail limit, they stay in `tail` and the flush costs a single `PUT`.
 
 #### Reads, Trims, and Retention
 
@@ -754,12 +752,12 @@ Simulated benchmarks (`sim::amp`) measure segment and chunk bytes written per re
    attempt applied returns `replayed: true` with `results: null`, and the
    seqs its appends received (`appends`): the commit record keeps the
    commit's time and the first seq and count of each append.
-   A retried idempotent request that fails a precondition resolves its
-   commit (as a status check does) before answering 412, because an earlier
-   attempt may have applied the write that now makes the check fail, and
-   one still in flight must not apply after the answer; the key is then
-   spent, as after a status check. A request without writes commits
-   nothing and ignores its key. Conflicts are retried server-side.
+   If an idempotent write request fails a precondition, the server resolves the
+   commit (§5.5) before returning 412: if a prior attempt was already
+   committed, the server returns the replayed result; otherwise it writes an
+   abort record so that any in-flight attempt cannot be applied later.
+   Read-only requests ignore idempotency keys. Conflicts are retried
+   server-side.
 2. **Interactive** (`/v1/dbs/{db}/transactions…`): begin, ops, commit,
    abort. `begin` and `commit` also accept `ops`, so a read-write transaction
    can be executed in two requests. Because a serializable transaction can begin
@@ -769,18 +767,17 @@ Simulated benchmarks (`sim::amp`) measure segment and chunk bytes written per re
    with no data committed. `begin` returns the transaction's `commit_id` up
    front, and `commit` the seqs its appends received.
 
-**Resolving ambiguity.** A `503` with `outcome: "unknown"`, or a lost
-response, means a commit may or may not have applied. The client calls
-`GET /commits/{commit_id}` (or `key:<idempotency key>`) right away; as it
-may abort the commit, it requires write access. It answers from the commit records (§5.5): `committed` (with its version and
-`appends`), or `not_committed` (with `retention_ms`) after aborting the
-commit ID, so that no attempt in flight, or delayed in the network, or
-sent later, applies it: each fails with `409 aborted`. A client that still
-wants the write retries it under a new idempotency key, or in a new
-interactive transaction. Commit ids are 16 hex characters. `not_committed` is definitive only if the first attempt
-began less than `retention_ms` ago: an older commit's record may be gone.
-Past that, the outcome is unknowable from the server, and a client that must
-not apply twice (an append, an increment) resolves it from the data instead.
+**Resolving ambiguity.** A `503` response with `outcome: "unknown"`, or a lost
+response, indicates that a commit may or may not have been applied. To resolve
+the outcome, the client calls `GET /commits/{commit_id}` (or
+`key:<idempotency key>`), which requires write access. If the commit record
+exists, the server returns `committed` (with its version and `appends`).
+Otherwise, the server writes an abort record (§5.5) and returns `not_committed`
+(with `retention_ms`); any subsequent attempt with the same commit ID fails with
+`409 aborted`, so retries must use a new idempotency key or transaction. Commit
+IDs are 16 hex characters. A `not_committed` result is definitive only if the
+first attempt began less than `retention_ms` ago, after which the commit record
+may have expired.
 
 ### 6.3 Ops
 
@@ -858,7 +855,7 @@ its `version`.
   rewrites `{id, addr, started_at, heartbeat_at}` every `heartbeat_ms`
   (120 s) and re-reads the table every `members_refresh_ms` (30 s). A node is
   live if `heartbeat_at > now − 3 × heartbeat_ms` and a newer process has not
-  registered at its address; a node counts itself live unless it is draining. Crashes are detected by
+  registered at its address. Each node includes itself in the live set unless it is draining. Crashes are detected by
   requests rather than heartbeats: a forward that certainly never arrived
   makes its target a suspect, which stays out of routing until the table
   shows a newer heartbeat from it, or for a backoff that starts at 10 s and
@@ -1103,7 +1100,7 @@ Errors are returned as
 | 401    | `unauthenticated`                                                                                                      |
 | 403    | `permission_denied`                                                                                                    |
 | 404    | `not_found`, `txn_not_found`                                                                                           |
-| 409    | `conflict` (retryable), `already_exists`, `aborted` (a status check aborted the commit ID, §6.2)                      |
+| 409    | `conflict` (retryable), `already_exists`, `aborted` (§6.2)                                                             |
 | 412    | `precondition_failed` (includes the failing op index; also an append whose `expect_seq` no longer holds)               |
 | 410    | `cursor_expired` (a change feed cursor older than the deletions kept, §6.4)                                            |
 | 413    | `too_large`                                                                                                            |
@@ -1287,11 +1284,9 @@ operations, commit batches, HTTP routes, and tokio scheduler lag, along with
 process CPU time and host steal time on Linux. `DELETE /v1/admin/metrics`
 returns and resets the histograms.
 
-On SIGTERM or SIGINT a node drains (failing `/healthz`), stops accepting
-connections, waits for in-flight requests, then leaves the membership table
-and releases its leases, so other nodes take over its databases at once.
-From the first release on, the node takes no lease, by request or background
-work, so none is left to expire after it stops. [`DEPLOYING.md`](DEPLOYING.md) covers TLS, load balancers, the
+On SIGTERM or SIGINT, a node drains (failing `/healthz`), stops accepting
+connections, waits for in-flight requests, leaves the membership table, and
+releases its database leases without acquiring new leases. [`DEPLOYING.md`](DEPLOYING.md) covers TLS, load balancers, the
 container image and bucket setup.
 
 `fs:` is for single-node development only. Compare-and-swap is serialized
@@ -1317,9 +1312,9 @@ The simulator executes a multi-node cluster on a single thread in virtual time, 
 Each simulation parameter is drawn independently from a hash of the run seed and the parameter name (`sim::swarm`). Each scenario specifies bounds on node count, fault injection, and clock skew, and each fault category is disabled in a subset of runs (with 10% of runs disabling all faults).
 
 - **Cluster and configuration**: 1–5 nodes; randomized engine and node parameters (memtable, block, and segment sizes, compaction triggers, cache budgets, commit batch limits, hedging delays, lease durations, range-delete thresholds, inline level limits, stream chunk sizes, heartbeat and refresh intervals, cache TTLs, and index backfill batch limits).
-- **Object store** (`SimStore`): variable latency plus a transfer time per MiB (real stores take measurably longer to write a larger manifest), transient errors before application, ambiguous errors after application (where the write is applied in storage while the caller receives an error), stalls exceeding lease durations, delayed responses, and eventually consistent `LIST` results.
+- **Object store** (`SimStore`): variable latency and per-MiB transfer time, transient errors before application, ambiguous errors after application (where the write is applied in storage while the caller receives an error), stalls exceeding lease durations, delayed responses, and eventually consistent `LIST` results.
 - **Network**: variable latency, dropped responses, duplicated and delayed forwarded requests, bidirectional and unidirectional network partitions, and per-node storage isolation.
-- **Nodes**: process crashes and restarts, graceful shutdowns as in a deploy, clock skew and step changes, and process pauses (simulating GC pauses or VM preemption). The local disk cache persists across node restarts and injects read/write errors and data corruption.
+- **Nodes**: process crashes and restarts, graceful shutdowns, clock skew and step changes, and process pauses (simulating GC pauses or VM preemption). The local disk cache persists across node restarts and injects read/write errors and data corruption.
 - **Chaos**: fault storms (crashes, restarts, partitions, storage isolation, clock jumps, and pauses) alternate with recovery periods so that workloads can make progress under heavy fault injection.
 - **Buggify** (`src/buggify.rs`): deterministic fault-injection points in production code trigger rare execution paths (small commit batches, forced revalidation, cache misses, early flushes and sweeps, delays before manifest writes, idle handle eviction, dropped interactive transactions, and local request handling). Each call site is enabled or disabled for the entire run. Crash points terminate a node between internal steps of commits, compactions, sweeps, deletions, and auth operations. Client-visible fault sites and crash points are disabled during the post-chaos settlement phase.
 - **Task scheduling**: tasks randomly yield before being polled, varying the execution order of concurrently ready tasks.
@@ -1329,35 +1324,35 @@ Each simulation parameter is drawn independently from a hash of the run seed and
 
 Workloads run concurrently with a shared chaos loop (`ChaosPhase`). When all active workloads finish their chaos phase, fault injection stops, the cluster heals, and each workload runs its final consistency and invariant checks. The `mix` scenario runs a random subset of at least two workloads concurrently in the same cluster. Any run that exceeds 6 hours of virtual time fails as a liveness violation.
 
-| workload       | verification                                                                                                                                                                                                                                                                                                                                                                                        |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `history`      | Concurrent clients execute random multi-key transactions (one-shot and interactive, serializable and snapshot-isolated, strong and snapshot reads, with and without idempotency keys). Each write records a unique marker key. At the end of the run, committed transactions are ordered by version and replayed to verify strict serializability, snapshot isolation, and read-your-writes.       |
-| `kv_model`     | Exercises all KV endpoints under faults and compares every response against a reference model. Ambiguous commits are resolved via `/commits/{id}` or database state inspection. Verifies range tombstones, size quota enforcement, and KV change feed reconstruction.                                                                                                                               |
-| `bank`         | Concurrent account transfers across nodes. Verifies conservation of total balance and non-negative balances throughout the run and at completion.                                                                                                                                                                                                                                                   |
-| `register`     | Concurrent writers and strong readers on a small key set, verified for real-time linearizability across `GET`, unforwarded `GET`, and read-only and read-write transactions.                                                                                                                                                                                                                        |
-| `tables`       | Verifies table schema changes, point and range row mutations, unique index contention, table change feeds, and index integrity against a reference model.                                                                                                                                                                                                                                           |
-| `schema_race`  | Concurrent row writes (including batch updates and deletes at both isolation levels) racing with online column and index additions and drops. Verifies row state and index consistency.                                                                                                                                                                                                             |
-| `ttl`          | Verifies KV and row TTL expiration windows and distributed lock acquisition and renewal order under clock skew and faults.                                                                                                                                                                                                                                                                          |
-| `watch`        | Concurrent puts, TTL expirations, point deletes, and range deletes while a watcher polls `/changes`. Verifies that every change matches a committed write, cursors do not expire within the transaction lifetime, and the reconstructed state matches the final database state.                                                                                                                    |
-| `streams`      | Concurrent stream appends (with `expect_seq`, idempotency keys, and transactional counters), long-poll and SSE followers, forward/reverse/filtered/time-based reads, consumer cursors, explicit and retention trims, and stream recreation. Verifies dense sequence numbers, monotonic timestamps, and exact state reconstruction.                                                                   |
-| `blobs`        | Concurrent blob uploads, range reads, overwrites, and deletes verified by SHA-256, followed by garbage collection verification.                                                                                                                                                                                                                                                                     |
-| `blob_gc_race` | Concurrent long-running blob reads racing with overwrites, deletes, and short-grace-period garbage collection under clock skew.                                                                                                                                                                                                                                                                     |
-| `abandoned`    | Interactive transactions abandoned, aborted, or committed late across lease transitions. Verifies that committed updates are preserved, abandoned transactions are not committed, and open transaction handles are drained.                                                                                                                                                                                    |
-| `db_churn`     | Rapid database creation, mutation, deletion, and recreation with small caches and aggressive handle eviction.                                                                                                                                                                                                                                                                                       |
-| `auth`         | Verifies signup, login, session management, scoped and read-only API keys, Google OAuth account linking rules, and database access control.                                                                                                                                                                                                                                                         |
-| `orgs`         | Concurrent organization creation, membership role transitions, and deletion races. Verifies role permissions within cache staleness bounds and organization ownership invariants.                                                                                                                                                                                                                   |
-| `accounts`     | Verifies password changes, session revocation, email verification and password reset links, and account deletion across nodes.                                                                                                                                                                                                                                                                      |
-| `limits`       | Verifies per-key, per-user, and per-IP rate limiting and authentication failure backoff.                                                                                                                                                                                                                                                                                                            |
-| `lifecycle`    | Database creation, mutation, deletion, and recreation across node crashes, verifying background storage purge and per-owner database counters.                                                                                                                                                                                                                                                      |
-| `console`      | Exercises all web console pages, verifying CSRF protection, HTML escaping, multipart uploads, safe attachment headers, pagination, and account/org/admin flows.                                                                                                                                                                                                                                     |
-| `api_tour`     | Exercises schema drop endpoints, transaction aborts, commit status lookup by idempotency key, and admin metrics endpoints.                                                                                                                                                                                                                                                                          |
-| `mix`          | Runs a random combination of at least two workloads concurrently in a shared cluster and chaos loop.                                                                                                                                                                                                                                                                                                |
+| workload       | verification                                                                                                                                                                                                                                                                                                                                                                                 |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `history`      | Concurrent clients execute random multi-key transactions (single-request and interactive, serializable and snapshot-isolated, strong and snapshot reads, with and without idempotency keys). Each write records a unique marker key. At the end of the run, committed transactions are ordered by version and replayed to verify strict serializability, snapshot isolation, and read-your-writes. |
+| `kv_model`     | Exercises all KV endpoints under faults and compares every response against a reference model. Ambiguous commits are resolved via `/commits/{id}` or database state inspection. Verifies range tombstones, size quota enforcement, and KV change feed reconstruction.                                                                                                                        |
+| `bank`         | Concurrent account transfers across nodes. Verifies conservation of total balance and non-negative balances throughout the run and at completion.                                                                                                                                                                                                                                            |
+| `register`     | Concurrent writers and strong readers on a small key set, verified for real-time linearizability across `GET`, unforwarded `GET`, and read-only and read-write transactions.                                                                                                                                                                                                                 |
+| `tables`       | Verifies table schema changes, point and range row mutations, unique index contention, table change feeds, and index integrity against a reference model.                                                                                                                                                                                                                                    |
+| `schema_race`  | Concurrent row writes (including batch updates and deletes at both isolation levels) racing with online column and index additions and drops. Verifies row state and index consistency.                                                                                                                                                                                                      |
+| `ttl`          | Verifies KV and row TTL expiration windows and distributed lock acquisition and renewal order under clock skew and faults.                                                                                                                                                                                                                                                                   |
+| `watch`        | Concurrent puts, TTL expirations, point deletes, and range deletes while a watcher polls `/changes`. Verifies that every change matches a committed write, cursors do not expire within the transaction lifetime, and the reconstructed state matches the final database state.                                                                                                              |
+| `streams`      | Concurrent stream appends (with `expect_seq`, idempotency keys, and transactional counters), long-poll and SSE followers, forward/reverse/filtered/time-based reads, consumer cursors, explicit and retention trims, and stream recreation. Verifies dense sequence numbers, monotonic timestamps, and exact state reconstruction.                                                           |
+| `blobs`        | Concurrent blob uploads, range reads, overwrites, and deletes verified by SHA-256, followed by garbage collection verification.                                                                                                                                                                                                                                                              |
+| `blob_gc_race` | Concurrent long-running blob reads racing with overwrites, deletes, and short-grace-period garbage collection under clock skew.                                                                                                                                                                                                                                                              |
+| `abandoned`    | Interactive transactions abandoned, aborted, or committed late across lease transitions. Verifies that committed updates are preserved, abandoned transactions are not committed, and open transaction handles are drained.                                                                                                                                                                  |
+| `db_churn`     | Rapid database creation, mutation, deletion, and recreation with small caches and aggressive handle eviction.                                                                                                                                                                                                                                                                                |
+| `auth`         | Verifies signup, login, session management, scoped and read-only API keys, Google OAuth account linking rules, and database access control.                                                                                                                                                                                                                                                  |
+| `orgs`         | Concurrent organization creation, membership role transitions, and deletion races. Verifies role permissions within cache staleness bounds and organization ownership invariants.                                                                                                                                                                                                            |
+| `accounts`     | Verifies password changes, session revocation, email verification and password reset links, and account deletion across nodes.                                                                                                                                                                                                                                                               |
+| `limits`       | Verifies per-key, per-user, and per-IP rate limiting and authentication failure backoff.                                                                                                                                                                                                                                                                                                     |
+| `lifecycle`    | Database creation, mutation, deletion, and recreation across node crashes, verifying background storage purge and per-owner database counters.                                                                                                                                                                                                                                               |
+| `console`      | Exercises all web console pages, verifying CSRF protection, HTML escaping, multipart uploads, safe attachment headers, pagination, and account/org/admin flows.                                                                                                                                                                                                                              |
+| `api_tour`     | Exercises schema drop endpoints, transaction aborts, commit status lookup by idempotency key, and admin metrics endpoints.                                                                                                                                                                                                                                                                   |
+| `mix`          | Runs a random combination of at least two workloads concurrently in a shared cluster and chaos loop.                                                                                                                                                                                                                                                                                         |
 
-Every 20 ms of virtual time, global oracles verify that at most one node relies on a lease for any database and that any node relying on a lease without an in-flight manifest write holds the latest manifest version in the store. At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, and stream chunks are intact and consistent. When a node shuts down gracefully, no lease it released may name it in storage afterwards.
+Every 20 ms of virtual time, global oracles verify that at most 1 node relies on a lease for any database and that any node relying on a lease without an in-flight manifest write holds the latest manifest version in the store. At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, and stream chunks are intact and consistent. After a node shuts down gracefully, the simulator verifies that none of the released databases in storage have a lease held by that node.
 
 ### 13.4 Coverage, campaigns, and exploration
 
-- **Probes** (`src/probe.rs`): instrumentation points in production code record when rare execution paths are reached (such as replayed commits, ambiguous manifest writes that succeeded, lease takeovers, duplicate forwards, and rejected compactions). `tests/coverage.rs` runs 8 seeds of each scenario and asserts that all documented API operations and all non-rare probes are reached.
+- **Probes** (`src/probe.rs`): instrumentation points in production code record rare execution paths (such as replayed commits, ambiguous manifest writes that succeeded, lease takeovers, duplicate forwards, and rejected compactions). `tests/coverage.rs` runs 8 seeds of each scenario and asserts that all documented API operations and all non-rare probes are reached.
 - **Campaigns** (`sim_tool campaign`): executes scenarios across seeds on all available CPU cores and reports failure reproduction commands and probe hit rates.
 - **Guided exploration** (`sim_tool explore`, `sim::explore`): alternates between fresh seeds and branched runs that fork from existing runs immediately after a rare probe is hit. Runs that discover a new coverage feature (a probe hit-count bucket or a pair of rare probes in the same run) are added to the exploration corpus.
 - **Bug zoo** (`bugzoo/`): 27 patches reintroduce historical concurrency and fault-handling bugs (§13.6), and `bugzoo/run.sh` measures how many simulation runs are required to detect each defect.
@@ -1367,7 +1362,7 @@ Every 20 ms of virtual time, global oracles verify that at most one node relies 
 - **Unit tests** in each module.
 - **Property tests** using the in-crate generator and shrinker (`src/util/prop.rs`): verifies codec round trips, tuple ordering, segment building and reading, LSM-tree operations and change feeds against a reference model, stream operations and filters, table and index operations, range tombstone fragmentation, base64/varint/bloom filters, and metadata access-control state machines.
 - **Fuzz tests**: feeds arbitrary and mutated byte inputs to all binary and text decoders and random JSON requests to the HTTP router, verifying that arbitrary inputs do not cause panics or `500` responses.
-- **Transaction-op fuzzing** (`sim/txn_fuzz.rs`): generates random one-shot and interactive transactions (including malformed operations) and compares every response against an independent transaction model.
+- **Transaction-op fuzzing** (`sim/txn_fuzz.rs`): generates random single-request and interactive transactions (including malformed operations) and compares every response against an independent transaction model.
 - **OpenAPI conformance**: validates every simulated HTTP response against `openapi.json` and verifies that `openapi.json` matches the router and generated specification.
 - **Request IDs**: verifies in a multi-node simulation that `x-request-id` headers are validated, echoed in responses, propagated across forwarded requests and metadata commands, and recorded in server logs.
 - **Checker self-tests**: unit tests feed synthetic invalid histories and corrupted states to each simulation checker to verify that every checker detects violations.
@@ -1453,14 +1448,14 @@ scripts/mutants.sh                                               # run mutation 
 38. _Stale member records after restart._ After a node restarted at the same address with a new node ID, peers continued routing to the old node ID until its heartbeat expired. Membership resolution now keeps only the latest registration for each network address (§7).
 39. _Rate limits charged on both forwarding and receiving nodes._ Forwarded requests were charged against rate limits on both the entry node and the lease holder. Forwarded requests now authenticate with the cluster key and are rate-limited only on the entry node (§7).
 40. _Unique index entries lost during online index backfill._ Updating or deleting a row while a unique index was in the `Building` state unconditionally deleted the old key from the index, removing the entry written by the backfill for another row with the same value. Unique index maintenance during `Building` now deletes an entry only if its primary key matches the modified row.
-41. _Deleted databases never purged._ The reaper ran on the system database's lease holder, as each node judged it, and nodes disagree about that for a moment around each expiry: the holder lets its lease go before the others do. A reaper whose period kept it in that moment never ran anywhere. The reaper now runs on the live member that rendezvous hashing picks (§5.8), and a node counts itself live even when its clock makes its own heartbeat look stale.
-42. _Retention trims lost to transient failures._ A retention trim that failed, as when a store stall outlasted its commit deadline, was dropped until the next append or sweep. Retryable failures are now retried.
-43. _Compactions missed after a final write._ A write installed just as the compaction loop found nothing to do saw it still running and did not start another, leaving level 0 over its trigger. Background work now rechecks, as it finishes, whether it is due again.
-44. _Duplicate flushes shadowing sealed chunks._ While background tail flushes were developed, a flush installed after another flush of the same entries left two copies of them; once a compaction sealed one copy into a chunk keyed by the run's last record, the other copy's record of that key shadowed the chunk, hiding the run. Installs now require the manifest's `flushes` counter to be unchanged (§5.5).
-45. _Live chunks deleted after an ambiguous install._ A flush whose install was retried after an ambiguous write, and found superseded by its own install, deleted the chunks that install referenced. Superseded installs after an ambiguous write now report an unknown outcome and delete nothing.
-46. _Answers overtaken by earlier attempts._ A retried idempotent request that failed a precondition answered `412` while its earlier attempt was still in flight, which then applied. Precondition failures now resolve the commit (§6.2). While abort records were developed, aborting only the attempts that began before the check let a request that had reached a node, but not yet begun its transaction, apply after the check answered `not_committed`; aborts are final.
-47. _Leased reads beside a hedged write._ When a hedged manifest write's duplicate was refused while the first was in flight, the node counted the write as finished, reloaded the manifest it was replacing, and served leased reads from it while the first write landed. The node now serves no read from its lease until the first request completes (§5.5), and once a write that may have landed is behind it, trusts its manifest again only after a read that began later: a concurrent read that began earlier had re-trusted the manifest the write replaced.
-48. _Levels objects garbage-collected during manifest reads._ A node whose manifest read was followed by a store stall longer than the grace period found the manifest's levels object deleted and failed the request with `500`. The node now reads the manifest again (§5.8).
+41. _Deleted databases never purged._ The database reaper previously ran only on the system database lease holder, which could leave the reaper stopped during lease handoffs. The reaper now runs on the live member selected by rendezvous hashing (§5.8).
+42. _Retention trims dropped on transient errors._ Failed stream retention trims were dropped until the next append or sweep. Transient trim failures are now retried with backoff.
+43. _Missed compaction wakeup._ If a commit was installed while a finishing compaction task still held the compacting flag, the node did not schedule a follow-up compaction. Background tasks now recheck whether additional work is needed before clearing their active flag.
+44. _Duplicate background flushes shadowing sealed stream chunks._ Installing a stale background flush after another flush of the same entries produced duplicate stream records that shadowed sealed stream chunks. Flush installs now verify that `flush_seq` is unchanged (§5.5).
+45. _Referenced stream chunks deleted after ambiguous flush install._ Retrying a flush install after an ambiguous manifest write treated the already-installed flush as superseded and deleted its chunks. Superseded flushes after an ambiguous write now preserve their output objects.
+46. _Precondition failure overtaken by in-flight attempt._ If a retried idempotent request failed a precondition while an earlier attempt was still in flight, the earlier attempt could still be committed after the `412` response. Precondition failures now write an abort record before returning (§6.2).
+47. _Stale leased reads during hedged manifest writes._ If a hedged duplicate `PUT` failed with `412` while the primary `PUT` was still in flight, the node reloaded the prior manifest and served leased reads before the primary `PUT` completed. Nodes now disable leased reads while a hedged `PUT` remains in flight and require a manifest read started after the ambiguous write before restoring trust (§5.5).
+48. _Levels object garbage-collected during stalled manifest read._ If a manifest read stalled past the GC grace period, its `.levels` object could be deleted before being fetched, causing a `500` error. The node now reloads the manifest if a `.levels` object is not found (§5.8).
 
 Cost model tests (§13.5) also identified five efficiency defects: lapsed leases on read-heavy databases were never re-acquired, unleased strong reads validated the manifest twice, read-only renewals used the shorter write-lease duration, `.levels` objects under a separate prefix required an extra `LIST` call per sweep, and stream flushes wrote separate small segments for commit records and stream state instead of retaining unsealed entries in `tail`.
 
@@ -1487,7 +1482,7 @@ Tools:
 - `sim_tool` runs simulation campaigns and prints traces.
 - `cost_model` prints object-store requests per operation and the cost per database-month
 - `amplification` the write, space and read amplification of compaction and of streams
-- `commit_latency` commit latency against a real object store for a range of tail limits, and raw `PUT` and `GET` latency by object size (§5.5)
+- `commit_latency` measures commit and object-store request latency across manifest tail limits
 - `gen_openapi` regenerates `openapi.json`
 
 ---
@@ -1495,7 +1490,7 @@ Tools:
 ## 15. Known limitations (v1)
 
 - The manifest is rewritten on every commit, and with it the WAL and L0.
-- Commits are remembered for 10 minutes: an idempotent retry or a commit status query must come within that (§6.2). An idempotency key whose commit a status check aborted cannot be used again for that long.
+- Commits are remembered for 10 minutes: an idempotent retry or a commit status query must come within that (§6.2).
 - TTL expiry is as precise as node store-clock measurements (§4.5), and expired data takes space until a manifest write or compaction reclaims it.
 - Change feeds report each key's latest state, not every intermediate value, and a cursor more than a transaction lifetime behind may have to start over from the current state (§6.4).
 - Rate limits and sign-in backoff are kept per node (§9): a cluster of N nodes admits up to N times each rate, and a restart forgets them.

@@ -143,8 +143,6 @@ pub async fn run(sim: Arc<Sim>, clients: usize, dbs: usize, steps: usize, chaos:
             check_db(c, db, want, "final").await?;
         }
     }
-    // Background work a final read started, such as a sweep, keeps its handle open until it ends,
-    // and a store stall can hold it up: allow for two stalls on top of eviction and housekeeping.
     let deadline = sim.now_ms() + sim.cfg.node.db_idle_evict_ms + 10_000 + 2 * sim.cfg.store.stall_ms.1;
     loop {
         sim.sleep(1_000).await;
@@ -161,8 +159,6 @@ fn idle_resources(sim: &Sim) -> Result<(), String> {
         let Some(n) = sim.node(i) else { continue };
         let open = n.node.engine.open_count();
         let cache = n.node.engine.shared.cache.stats();
-        // Heartbeats keep the system database open, and background tasks may
-        // still hold a user database handle.
         if open > 3 {
             return Err(format!("n{i} keeps {open} database handles open while idle"));
         }

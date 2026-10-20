@@ -13,7 +13,7 @@ pub enum Error {
     /// Optimistic concurrency conflict; retrying the transaction may succeed.
     Conflict(String),
     AlreadyExists(String),
-    /// A commit status check aborted this commit id; it never applies.
+    /// The commit ID was marked as aborted by a commit status check.
     Aborted(String),
     PreconditionFailed {
         message: String,

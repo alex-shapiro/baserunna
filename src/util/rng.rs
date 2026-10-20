@@ -147,8 +147,7 @@ impl Rng {
         v
     }
 
-    /// `len` bytes of JSON-like text of words from a small vocabulary, which
-    /// compresses about as well as typical application data.
+    /// Generates `len` bytes of compressible JSON-like text.
     pub fn text(&mut self, len: usize) -> String {
         const WORDS: [&str; 16] = [
             "alpha", "bravo", "user", "active", "pending", "id", "name", "email", "created", "status", "true", "false",

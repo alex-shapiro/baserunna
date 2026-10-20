@@ -136,8 +136,8 @@ On SIGTERM (or SIGINT) a node:
    still serving, so the load balancer stops sending it requests;
 2. stops accepting connections and lets in-flight requests finish, for at
    most `BASERUNNA_SHUTDOWN_TIMEOUT_MS` (default 20 s);
-3. leaves the membership table and releases its database leases, so other
-   nodes take over writes at once instead of after the lease expires.
+3. leaves the membership table and releases its database leases so that other
+   nodes can take over writes immediately.
 
 Set the drain delay to at least the load balancer's health check interval
 times its unhealthy threshold, and give the orchestrator a grace period
@@ -149,12 +149,9 @@ node loses nothing either; its databases just wait out their leases
 
 ## Upgrades
 
-Nodes of different versions cannot share a bucket when the newer version
-changes a storage format: the older nodes fail with `unsupported manifest
-format` on every database the newer ones write. Unless a release says
-otherwise, stop every node, then start the new version, instead of rolling
-the upgrade node by node. The release that counts tail flushes in the
-manifest (manifest format 7) and records aborted commits is such a release.
+If a new release changes the storage format, older nodes cannot read manifests
+written by newer nodes. To upgrade a cluster across a format change, stop all
+nodes before starting the new version.
 
 ## Bucket
 

@@ -278,8 +278,6 @@ async fn pagination(b: &mut Browser) -> Result<(), String> {
     expect(seen == existing + 3, format!("paging API keys two at a time found {seen} of {}", existing + 3))
 }
 
-/// Verifies stream pages: creation, appends of text and JSON, escaping,
-/// newest-first paging, retention, trims and deletion.
 async fn streams(b: &mut Browser, evil: &str) -> Result<(), String> {
     let r = b.req("POST", "/console/dbs/webdb/streams", Some(form(&[("name", "x")]))).await?;
     expect(r.status == 403, format!("creating a stream without a CSRF token returned {}", r.status))?;
@@ -300,9 +298,7 @@ async fn streams(b: &mut Browser, evil: &str) -> Result<(), String> {
     let r = b.api("streams").call_settled("POST", "/v1/dbs/webdb/streams/events/records", Some(body)).await;
     expect(r.status == 200, format!("appending 60 records: {} {}", r.status, r.json))?;
     let newest = b.page(sp).await?;
-    // Match whole cells: a token elsewhere on the page may contain "r10".
     let cell = |v: &str| format!("<td>{v}</td>");
-    // The first two records precede r00, at seq 2.
     let (r59, r10) = (newest.find(&cell("r59")), newest.find(&cell("r10")));
     expect(r59.is_some() && r10.is_some() && r59 < r10, "the newest records are not shown first")?;
     expect(!newest.contains(&cell("r09")), "the first page shows more than 50 records")?;

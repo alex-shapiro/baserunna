@@ -107,7 +107,6 @@ struct MRow {
     expiry: Expiry,
 }
 
-/// A stream record: its body bytes, whether they are JSON, and headers.
 #[derive(Clone, Debug, PartialEq)]
 struct MRecord {
     data: Vec<u8>,
@@ -135,19 +134,18 @@ struct Snapshot {
     streams: BTreeMap<String, MStream>,
 }
 
-/// Versions of the commits that changed a stream, for predicting conflicts.
+/// Commit versions of stream modifications used for conflict detection.
 #[derive(Clone, Debug, Default)]
 struct StreamLog {
     catalog: u64,
     state: u64,
-    /// Version, first seq and count of each append.
+    /// `(version, first_seq, count)` for each append.
     appends: Vec<(u64, u64, u64)>,
-    /// Version and new first seq of each trim.
+    /// `(version, first_seq)` for each trim.
     trims: Vec<(u64, u64)>,
     consumers: BTreeMap<String, u64>,
 }
 
-/// A stream read of a transaction, as the validation that commits it sees.
 #[derive(Clone, Debug)]
 enum StreamRead {
     Catalog(String),
@@ -156,7 +154,6 @@ enum StreamRead {
     Consumer(String, String),
 }
 
-/// A stream change of a transaction, applied at commit in order.
 #[derive(Clone, Debug)]
 enum StreamWrite {
     Create(String),
@@ -164,7 +161,6 @@ enum StreamWrite {
     Trim(String, u64),
 }
 
-/// Independent copy of `stream::NewRecord`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewRecord {
@@ -410,8 +406,7 @@ impl Op {
         )
     }
 
-    /// Whether the op's filter would fail to parse, failing the request
-    /// before any op runs.
+    /// Returns `true` if the operation contains an invalid filter expression.
     fn unparseable(&self) -> bool {
         match self {
             Op::ReadStream { filter: Some(f), .. } => !filter_parses(f, stream_operand),
@@ -515,11 +510,9 @@ struct TxnView {
     reads: Vec<ReadItem>,
     table_ops: bool,
     stream_reads: Vec<StreamRead>,
-    /// Pinned reads and written keys of streams, validated at every isolation level.
     stream_keys: Vec<StreamRead>,
     stream_writes: Vec<StreamWrite>,
     consumer_writes: BTreeMap<(String, String), u64>,
-    /// The index of the op being executed within its request.
     op_index: usize,
 }
 
@@ -545,9 +538,6 @@ impl TxnView {
         self.stream_writes.iter().any(|w| matches!(w, StreamWrite::Create(n) if n == name))
     }
 
-    /// The stream as of the snapshot, or empty if the transaction created it.
-    /// Stream `name` as the transaction sees it: as of its snapshot, less
-    /// the records it trims itself.
     fn stream(&self, name: &str) -> Option<MStream> {
         let mut st = match self.base.streams.get(name) {
             Some(s) => s.clone(),
@@ -722,8 +712,7 @@ fn row_json(pk: i64, r: &MRow) -> Json {
     json!({"id": pk, "name": r.name, "grp": r.grp, "doc": r.doc.clone().unwrap_or(Json::Null)})
 }
 
-/// Whether a parsed table filter fits the table: every column exists, takes
-/// its op, and every value has its type.
+/// Returns `true` if a parsed filter is valid for the table schema.
 fn filter_binds(v: &Json) -> bool {
     match filter_shape(v) {
         FilterShape::And(fs) | FilterShape::Or(fs) => fs.iter().all(filter_binds),
@@ -788,7 +777,6 @@ fn varint_len(mut v: u64) -> usize {
     n
 }
 
-/// The bytes a record counts as: its body, headers and their framing.
 fn record_size(r: &MRecord) -> usize {
     let headers: usize = r
         .headers
@@ -828,8 +816,6 @@ fn stream_record_json(enc: Encoding, seq: u64, r: &MRecord) -> Json {
 
 const FILTER_OPS: [&str; 10] = ["eq", "ne", "lt", "le", "gt", "ge", "in", "prefix", "contains", "exists"];
 
-/// A node of a filter that parses: exactly one of `and`, `or`, `not`, else
-/// a comparison.
 enum FilterShape<'a> {
     And(&'a [Json]),
     Or(&'a [Json]),
@@ -847,7 +833,6 @@ fn filter_shape(v: &Json) -> FilterShape<'_> {
     }
 }
 
-/// Whether a comparison's keys name an operand of a layer, given its op and value.
 type OperandOk = fn(&Map<String, Json>, &str, Option<&Json>) -> bool;
 
 fn table_operand(o: &Map<String, Json>, _: &str, _: Option<&Json>) -> bool {
@@ -892,7 +877,6 @@ fn filter_parses(v: &Json, operand_ok: OperandOk) -> bool {
     node(v, operand_ok, 0, &mut 0)
 }
 
-/// Evaluates a filter that parses, deciding each comparison with `cmp`.
 fn filter_eval(v: &Json, cmp: &dyn Fn(&Map<String, Json>) -> bool) -> bool {
     match filter_shape(v) {
         FilterShape::And(fs) => fs.iter().all(|f| filter_eval(f, cmp)),
@@ -923,8 +907,6 @@ fn same(a: &Json, b: &Json) -> bool {
     }
 }
 
-/// Whether comparison `o` holds of a value. A missing or null value fails
-/// every comparison.
 fn cmp_holds(o: &Map<String, Json>, target: Option<&Json>) -> bool {
     let Some(t) = target.filter(|t| !t.is_null()) else { return false };
     let value = o.get("value").unwrap_or(&Json::Null);
@@ -1649,7 +1631,6 @@ impl World {
             ReadItem::Key(k) => changed(k),
             ReadItem::Range(r) => self.last_write.iter().any(|(k, v)| *v > t.rv && r.contains(k)),
         });
-        // Stream catalog entries read by a stream op are checked at both isolation levels.
         let pinned = t.stream_keys.iter().any(|r| self.stream_changed(r, t.rv));
         let streams = match iso {
             Iso::Serializable => t.stream_reads.iter().any(|r| self.stream_changed(r, t.rv)),
@@ -1661,8 +1642,6 @@ impl World {
         Some(kv || pinned || streams)
     }
 
-    /// Models the resolution of an idempotent request that failed a
-    /// precondition: its key is aborted, in a version of its own.
     fn abort(&mut self, key: Option<&str>) {
         if let Some(k) = key
             && self.aborted.insert(k.to_string())

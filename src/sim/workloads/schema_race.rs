@@ -28,8 +28,7 @@ fn row_json(id: i64, r: &Row) -> Json {
 enum Applied {
     Yes,
     No,
-    /// An attempt was ambiguous and the commit record that would settle a
-    /// retry has expired.
+    /// An attempt was ambiguous and the commit retention window expired.
     Unknown,
 }
 
@@ -54,7 +53,6 @@ async fn one_shot(c: &Client, body: Json, rejected: &[(u16, &str)]) -> Result<Ap
     let path = format!("{BASE}/txn");
     let (began, mut ambiguous) = (c.sim.now_ms(), false);
     loop {
-        // A retry under the same key settles an ambiguous attempt only while its record is kept.
         if ambiguous && !c.dedups(began) {
             return Ok(Applied::Unknown);
         }
@@ -71,9 +69,8 @@ async fn one_shot(c: &Client, body: Json, rejected: &[(u16, &str)]) -> Result<Ap
     }
 }
 
-/// The rows of writer `w`'s range, which no other client writes, to replace the writer's model
-/// after a write whose outcome could not be settled.
-async fn rows_of(c: &Client, w: i64) -> Result<BTreeMap<i64, Row>, String> {
+/// Queries all rows in writer `w`'s key range to resynchronize its model.
+async fn query_writer_rows(c: &Client, w: i64) -> Result<BTreeMap<i64, Row>, String> {
     crate::probe::hit(crate::probe::Probe::ModelAdoptedFromDatabase);
     let body = json!({"range": {"gte": w * 100, "lt": w * 100 + 100}, "limit": 1000});
     let r = c.call_retry("POST", &format!("{BASE}/tables/items/rows/query"), Some(body)).await;
@@ -174,7 +171,7 @@ async fn writer(c: Client, w: i64, steps: usize) -> Result<BTreeMap<i64, Row>, S
                 let body = json!({"ops": [op], "isolation": isolation, "idempotency_key": format!("w{w}-{step}")});
                 let applied = one_shot(&c, body, ROW_REJECTIONS).await.map_err(|e| format!("{ctx}: {e}"))?;
                 if let Applied::Unknown = applied {
-                    model = rows_of(&c, w).await?;
+                    model = query_writer_rows(&c, w).await?;
                 }
                 if let Applied::Yes = applied {
                     for i in hit {
@@ -211,7 +208,7 @@ async fn writer(c: Client, w: i64, steps: usize) -> Result<BTreeMap<i64, Row>, S
                     Applied::Yes => {
                         model.insert(id, row);
                     }
-                    Applied::Unknown => model = rows_of(&c, w).await?,
+                    Applied::Unknown => model = query_writer_rows(&c, w).await?,
                     Applied::No => {}
                 }
             }

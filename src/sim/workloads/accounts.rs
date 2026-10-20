@@ -60,8 +60,6 @@ async fn sessions(sim: &Arc<Sim>) -> Result<(), String> {
     let a = Client::signup(sim, "sess-a", email, "sess-password").await?;
     let b = Client::login(sim, "sess-b", email, "sess-password").await?;
     let c = Client::login(sim, "sess-c", email, "sess-password").await?;
-    // A login whose response was lost may still create a session until its
-    // commit deadline passes, as between two listings or after a revocation.
     sim.sleep(ZOMBIE_WAIT_MS).await;
     let all = session_ids(&a, 100).await?;
     let paged = session_ids(&a, 1).await?;

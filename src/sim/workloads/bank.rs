@@ -132,7 +132,6 @@ pub async fn run(sim: Arc<Sim>, accounts: usize, clients: usize, transfers: usiz
         let done = done.clone();
         tokio::spawn(async move {
             let mut checks = 0;
-            // Tellers can finish before the first check; audit at least once regardless.
             while !done.load(std::sync::atomic::Ordering::SeqCst) || checks == 0 {
                 let d = 300 + c.rng().below(700);
                 c.pause(d).await;

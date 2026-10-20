@@ -1,5 +1,4 @@
-//! CRC-32C (Castagnoli) checksum, computed with the CPU's CRC instructions
-//! where it has them.
+//! CRC-32C (Castagnoli) checksums.
 
 pub fn crc32c(data: &[u8]) -> u32 {
     ::crc32c::crc32c(data)

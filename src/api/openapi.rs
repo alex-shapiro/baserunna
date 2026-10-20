@@ -989,9 +989,9 @@ fn paths() -> Value {
             desc: Some(
                 "Operations execute in order with read-your-writes, atomically. Serializable by default; conflicts are \
             retried server-side. With `idempotency_key`, retries are never applied twice (a replay returns \
-            `replayed: true` and null results); a transaction without writes ignores the key. Once a commit \
-            status check, or a failed precondition, has resolved a key as not applied, attempts under it fail \
-            with `409 aborted`.",
+            `replayed: true` and null results). Read-only transactions ignore `idempotency_key`. If a commit status \
+            check or failed precondition resolves an `idempotency_key` as not committed, subsequent attempts with \
+            that key fail with `409 aborted`.",
             ),
             ..op(
                 "Run a one-shot transaction",
@@ -1040,9 +1040,9 @@ fn paths() -> Value {
         Op {
             params: vec![db(), path_param("id", "commit_id (16 hex characters) or key:<idempotency key>")],
             desc: Some(
-                "Definitive at once: a commit not yet applied is aborted, so no attempt of it, in flight or sent \
-            later, applies (each fails with `409 aborted`); retry the write under a new idempotency key. Requires \
-            write access, as aborting is a write. Commit records are retained for 10 minutes.",
+                "Returns `committed` if the commit was applied, or writes an abort record and returns `not_committed` \
+            so that any subsequent attempt with the same commit ID fails with `409 aborted`. Requires write access. \
+            Commit records are retained for 10 minutes.",
             ),
             ..op(
                 "Resolve an ambiguous commit",

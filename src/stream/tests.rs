@@ -1,6 +1,4 @@
-//! Stream layer tests: a model of streams under every kind of write and
-//! storage maintenance, and the transactional semantics of appends, reads
-//! and trims.
+//! Stream model and unit tests.
 
 use super::*;
 use crate::engine::tests::{engine, rt};
@@ -76,12 +74,10 @@ async fn opened(eng: &Arc<Engine>, id: &str) -> Arc<Db> {
 
 #[derive(Clone, Debug)]
 struct MStream {
-    /// Every record ever appended, by seq: its time and body.
     records: Vec<(u64, Body)>,
     first: u64,
     retention: Retention,
-    /// The furthest first seq a retention trim in flight may have reached:
-    /// trims run in the background, with the retention of their moment.
+    /// Maximum `first_seq` reachable by an in-flight background retention trim.
     allowed: u64,
 }
 
@@ -94,28 +90,22 @@ impl MStream {
         self.records[..seq as usize].iter().map(|(_, b)| b.encode().len() as u64).sum()
     }
 
-    /// The first live seq whose record satisfies `f`, or the next seq.
     fn first_where(&self, f: impl Fn(u64, &(u64, Body)) -> bool) -> u64 {
         (self.first..self.next()).find(|s| f(*s, &self.records[*s as usize])).unwrap_or(self.next())
     }
 
-    /// Notes what retention allows after a change to the stream at `now`.
     fn changed(&mut self, now: u64) {
         self.allowed = self.allowed.max(self.retention_bound(now + 1_000));
     }
 
-    /// The furthest first seq a read at `now` may find.
     fn upper(&self, now: u64) -> u64 {
         self.allowed.max(self.retention_bound(now))
     }
 
-    /// The furthest first seq retention allows at store time `now`.
     fn retention_bound(&self, now: u64) -> u64 {
         self.bound(self.retention, now)
     }
 
-    /// The first seq retention must have reached by store time `now`, once
-    /// trims are done: trims are due only past [`Retention::due_at`].
     fn due_bound(&self, now: u64) -> u64 {
         self.bound(self.retention.due_at(), now)
     }
@@ -237,7 +227,6 @@ fn body(r: &mut Rng, size: usize, json: bool, i: usize) -> Body {
     Body { json, headers, data }
 }
 
-/// What a read of `m` should return, mirroring `read`'s rules.
 fn expected(m: &MStream, spec: &ReadSpec, first: u64, filter: Option<u8>) -> (Vec<u64>, u64, bool) {
     let next = m.next();
     let time_seek = |t: u64| (first..next).find(|s| m.records[*s as usize].0 >= t).unwrap_or(next);
@@ -462,7 +451,6 @@ async fn run(seed: u64, ops: &[Op]) -> Result<(), String> {
                             filter: None,
                             scan: None,
                         };
-                        // A snapshot's own retention trims are part of it.
                         let mut m = m.clone();
                         let st = snap.version.stream_state(info(&mut t, NAMES[*s]).await.map_err(e)?.0.id).await;
                         m.first = st.map_err(e)?.map_or(m.first, |st| st.first_seq);
@@ -538,8 +526,6 @@ async fn run(seed: u64, ops: &[Op]) -> Result<(), String> {
     check_chunks(&db, &store).await
 }
 
-/// Every live chunk reference names a stored chunk holding exactly its
-/// records, and no two of a stream's chunks or records overlap.
 async fn check_chunks(db: &Arc<Db>, store: &crate::store::MemStore) -> Result<(), String> {
     let v = db.read_version(Consistency::Strong).await.map_err(|e| e.to_string())?;
     let range = KeyRange::prefix(&[es::RECORDS]);
@@ -648,7 +634,6 @@ fn concurrent_appends_share_a_commit_and_never_conflict() {
     });
 }
 
-/// A transaction that read `name` from `from`, at most `limit` records, and wrote a key.
 async fn reader(db: &Arc<Db>, name: &str, from: u64, limit: usize) -> Txn {
     let mut t = begin(db).await;
     read(&mut t, name, &ReadSpec { from_seq: Some(from), limit: Some(limit), ..Default::default() }).await.unwrap();
@@ -858,7 +843,6 @@ fn bulky_runs_are_sealed_and_read_across_chunks() {
         let (big, _) = info(&mut begin(&db).await, "big").await.unwrap();
         let mut it = v.iter(&es::records(big.id), false, false, None);
         let in_tail = |k: &Bytes| v.m.tail.binary_search_by(|e| e.key.cmp(k)).is_ok();
-        // Flushes and compactions seal every run of records reaching `stream_seal_min_bytes`.
         let (mut sealed, mut run, min) = (0, 0, eng.shared.cfg.stream_seal_min_bytes);
         while let Some(e) = it.next().await.unwrap() {
             match es::stored(&e).unwrap().1 {
@@ -961,7 +945,6 @@ fn retention_trims_are_batched() {
             tokio::time::sleep(Duration::from_millis(100)).await;
             settle(&db).await;
         }
-        // Trims wait for the stream to age a sixteenth of its retention past it: a second.
         let secs = started.elapsed().as_secs();
         assert!(trims() - before <= secs + 1, "{} trims for 30 appends over {secs} s", trims() - before);
         let b = read_all(&db, "bytes", ReadSpec { reverse: true, limit: Some(1000), ..Default::default() }).await;

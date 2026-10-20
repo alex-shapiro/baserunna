@@ -285,8 +285,7 @@ pub fn check(history: &[Txn]) -> Result<(), String> {
         })
         .collect();
     begun.sort();
-    // Versions are not all written by these transactions: a commit status
-    // check aborts the commit it checks in a version of its own.
+    // Include versions allocated by commit status checks.
     let last = history.iter().filter_map(pos).chain(writers.last().map(|(v, _)| *v)).max().unwrap_or(0);
     let ceiling = |end: u64| {
         let n = begun.partition_point(|(start, _)| *start <= end);

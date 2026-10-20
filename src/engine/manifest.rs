@@ -18,11 +18,8 @@ const MAGIC: &[u8; 4] = b"BRMF";
 /// The database was deleted: every read and commit fails with not-found.
 pub const FLAG_DELETED: u64 = 1;
 const FORMAT: u16 = 7;
-/// Format 7 without the `flushes` count. Binaries that write it reject format 7, so a cluster
-/// cannot run both: all nodes are upgraded at once.
-const FORMAT_UNCOUNTED: u16 = 6;
-/// Format 6 without its codec byte, uncompressed.
-const FORMAT_RAW: u16 = 5;
+const FORMAT_V6: u16 = 6;
+const FORMAT_V5: u16 = 5;
 const ZSTD_LEVEL: i32 = 1;
 const MAX_BODY: u64 = 64 << 20;
 const LEVELS_MAGIC: &[u8; 4] = b"BRLV";
@@ -135,22 +132,16 @@ pub struct Obsolete {
     pub since_ms: u64,
 }
 
-/// A tail page ends after a key whose hash has these bits clear: about 32 entries.
 const PAGE_KEY_MASK: u64 = 31;
-/// A tail page also ends once it holds this many bytes.
 const PAGE_MAX_BYTES: usize = 16 * 1024;
 
-/// The compressed tail pages of the last manifest a database encoded, by
-/// the SHA-256 of their uncompressed bytes.
+/// Caches compressed zstd frames for manifest tail pages keyed by their uncompressed SHA-256 digest.
 #[derive(Default)]
 pub struct PageCache {
     frames: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
 }
 
 impl PageCache {
-    /// Compresses `prefix`, the tail pages and `suffix` as consecutive zstd
-    /// frames, which decompress as one, reusing the cached frame of each
-    /// page whose bytes are unchanged. Keeps the frames of these pages only.
     fn compress(&mut self, prefix: &[u8], tail: &[Vec<u8>], suffix: &[u8]) -> Option<Vec<u8>> {
         let compress = |b: &[u8]| crate::util::zstd::compress(b, ZSTD_LEVEL).ok();
         let mut out = compress(prefix)?;
@@ -204,9 +195,8 @@ pub struct Manifest {
     pub blob_bytes: BlobBytes,
     /// Bytes of sealed stream chunks, accounted like blob bytes.
     pub chunk_bytes: BlobBytes,
-    /// Incremented by every flush of the tail, so that a background flush
-    /// is installed only over the tail it flushed.
-    pub flushes: u64,
+    /// Incremented by every tail flush install so stale background flushes are rejected.
+    pub flush_seq: u64,
 }
 
 impl Manifest {
@@ -243,10 +233,7 @@ impl Manifest {
         self.encode_with(&mut PageCache::default())
     }
 
-    /// Encodes the manifest, compressing each page of the tail as a zstd frame
-    /// of its own and reusing the frames `pages` holds for pages unchanged since
-    /// the last encoding. A commit changes few pages of a large tail, so most of
-    /// the tail is not compressed again.
+    /// Encodes the manifest, reusing cached compressed tail pages from `pages`.
     pub fn encode_with(&self, pages: &mut PageCache) -> Bytes {
         let (prefix, tail, suffix) = self.encode_parts();
         let len = prefix.len() + tail.iter().map(Vec::len).sum::<usize>() + suffix.len();
@@ -278,10 +265,6 @@ impl Manifest {
         [vec![prefix], tail, vec![suffix]].concat().concat()
     }
 
-    /// The encoded body: what precedes the tail's entries, the entries in
-    /// pages, and what follows them. Pages end after keys whose hash has the
-    /// `PAGE_KEY_MASK` bits clear, so a write changes only the pages up to the
-    /// next such key.
     fn encode_parts(&self) -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
         let mut w = Writer::with_capacity(1024);
         w.str(&self.db_id);
@@ -352,7 +335,7 @@ impl Manifest {
             w.varint(b.swept);
             w.varint(b.swept_at);
         }
-        w.varint(self.flushes);
+        w.varint(self.flush_seq);
         (prefix, pages, w.into_inner())
     }
 
@@ -371,9 +354,9 @@ impl Manifest {
         }
         let format = r.u16()?;
         let src = match (format, r.u8()) {
-            (FORMAT_RAW, _) => src.slice(6..),
-            (FORMAT | FORMAT_UNCOUNTED, Ok(0)) => src.slice(7..),
-            (FORMAT | FORMAT_UNCOUNTED, Ok(1)) => {
+            (FORMAT_V5, _) => src.slice(6..),
+            (FORMAT | FORMAT_V6, Ok(0)) => src.slice(7..),
+            (FORMAT | FORMAT_V6, Ok(1)) => {
                 let n = r.varint()?;
                 if n > MAX_BODY {
                     return Err(DecodeError("manifest body too large"));
@@ -461,7 +444,7 @@ impl Manifest {
         let last_sweep_ms = r.varint()?;
         let blob_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
         let chunk_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
-        let flushes = if format == FORMAT { r.varint()? } else { 0 };
+        let flush_seq = if format == FORMAT { r.varint()? } else { 0 };
         if !r.is_empty() {
             return Err(DecodeError("manifest trailing data"));
         }
@@ -484,7 +467,7 @@ impl Manifest {
             last_sweep_ms,
             blob_bytes,
             chunk_bytes,
-            flushes,
+            flush_seq,
         };
         m.check_levels().map_err(DecodeError)?;
         Ok(m)
@@ -619,7 +602,7 @@ mod tests {
         let mut m = Manifest::new("db1", 123, Some(456));
         m.version = 42;
         m.write_seq = 50;
-        m.flushes = 300;
+        m.flush_seq = 300;
         m.time_ms = 1_700_000_000_000;
         m.flags = FLAG_DELETED;
         m.lease = Some(Lease { node: "n1".into(), expires_ms: 999, ms: 5_000 });
@@ -717,13 +700,12 @@ mod tests {
         assert!(kept + 6 >= frames.len(), "{kept} of {} pages kept their frames", frames.len());
     }
 
-    /// `m` encoded in an earlier format, whose body has no `flushes` count.
-    fn uncounted(m: &Manifest, format: u16) -> Bytes {
-        let body = Manifest { flushes: 0, ..m.clone() }.encode_body();
+    fn encode_legacy_format(m: &Manifest, format: u16) -> Bytes {
+        let body = Manifest { flush_seq: 0, ..m.clone() }.encode_body();
         let mut w = Writer::with_capacity(1024);
         w.raw(MAGIC);
         w.u16(format);
-        if format == FORMAT_UNCOUNTED {
+        if format == FORMAT_V6 {
             w.u8(0);
         }
         w.raw(&body[..body.len() - 1]);
@@ -733,10 +715,10 @@ mod tests {
     }
 
     #[test]
-    fn earlier_formats_are_read_without_a_flush_count() {
-        let m = Manifest { flushes: 0, ..sample() };
-        for format in [FORMAT_RAW, FORMAT_UNCOUNTED] {
-            assert_eq!(Manifest::decode(&uncounted(&m, format)).unwrap(), m, "format {format}");
+    fn decodes_legacy_manifest_formats() {
+        let m = Manifest { flush_seq: 0, ..sample() };
+        for format in [FORMAT_V5, FORMAT_V6] {
+            assert_eq!(Manifest::decode(&encode_legacy_format(&m, format)).unwrap(), m, "format {format}");
         }
     }
 

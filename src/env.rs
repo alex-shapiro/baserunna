@@ -240,10 +240,7 @@ pub async fn sleep_ms(ms: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
 }
 
-/// Fills `out` from the system's cryptographic generator. Each call into it
-/// reseeds from the kernel, which costs more than the rest of a small request,
-/// so small reads are served from a per-thread pool of its output. Bytes are
-/// zeroed in the pool once handed out.
+/// Fills `out` with random bytes from the OS CSPRNG, using a thread-local buffer for small reads.
 fn os_random(out: &mut [u8]) {
     const POOL: usize = 512;
     thread_local! {

@@ -47,8 +47,6 @@ struct Stats {
     broken: AtomicU64,
 }
 
-/// Virtual time after which writers start no more writes, nor retries of a
-/// write: under long fault storms an upload of many chunks may rarely complete.
 const WRITE_BUDGET_MS: u64 = 30 * 60_000;
 
 async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Result<(), String> {

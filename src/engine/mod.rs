@@ -1,5 +1,4 @@
-//! The storage engine: many small LSM databases on object storage, each
-//! rooted at a CAS-updated manifest. See SPEC §5.
+//! LSM storage engine backed by object storage.
 
 pub mod blob;
 pub mod cache;
@@ -48,12 +47,11 @@ pub struct Shared {
     /// Databases exempt from size quota limits.
     quota_exempt: Mutex<std::collections::BTreeSet<String>>,
     pub metrics: Arc<crate::metrics::StoreMetrics>,
-    /// Set once the node starts releasing its leases to shut down: it takes no lease after.
+    /// True once the node begins releasing leases for shutdown.
     stopping: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
-    /// Whether this node has started releasing its leases to shut down, and takes no lease.
     pub(crate) fn stopping(&self) -> bool {
         self.stopping.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -247,10 +245,9 @@ impl Engine {
         v
     }
 
-    /// Releases the leases of all open databases, giving each `per_db` to do so, so that other
-    /// nodes take over at once. From the start, this node takes no lease, by request or
-    /// background work, so that none is left to expire after it stops. Returns the databases
-    /// whose leases it released.
+    /// Releases leases for all open databases with a timeout of `per_db` per database, and
+    /// prevents this node from acquiring new leases. Returns the IDs of databases whose leases
+    /// were released.
     pub async fn release_leases(&self, per_db: Duration) -> Vec<String> {
         self.shared.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut released = Vec::new();

@@ -1,6 +1,4 @@
-//! zstd compression with a context per thread and level. Creating a context
-//! allocates and clears its tables, which costs more than compressing a
-//! small manifest or block.
+//! Zstd compression with thread-local contexts.
 
 use std::cell::RefCell;
 use std::io;

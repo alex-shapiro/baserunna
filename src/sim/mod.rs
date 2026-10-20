@@ -114,7 +114,7 @@ pub struct ChaosFaults {
     /// Maximum recovery period after a storm, during which the cluster is healed.
     pub calm_ms: u64,
     pub crash: u64,
-    /// Shuts a node down gracefully, as a deploy does.
+    /// Gracefully shuts down a node.
     pub stop: u64,
     pub start: u64,
     pub partition: u64,
@@ -584,7 +584,7 @@ impl Sim {
         (0..self.slots.len()).filter(|i| self.node(*i).is_some()).collect()
     }
 
-    /// Starts node `i` unless it is up.
+    /// Starts node `i` if it is not running.
     pub async fn start(&self, i: usize) {
         let _starting = self.starting[i].lock().await;
         if self.node(i).is_some() {
@@ -603,8 +603,6 @@ impl Sim {
         cfg.public_url = "https://baserunna.test".into();
         cfg.engine = self.cfg.engine.clone();
         cfg.engine.local_tier = self.disks[i].clone();
-        // Failures count toward giving up only while no fault cuts node `i` off;
-        // a partition that outlasts the storm can keep a node down until `recover` heals it.
         let mut failures = 0u64;
         for attempt in 0u64.. {
             let env = Arc::new(Env::sim(self.seed ^ (n * 7919 + attempt + 1), self.base_ms, self.origin, skew));
@@ -639,7 +637,7 @@ impl Sim {
                 Err(e) => {
                     env.shutdown();
                     self.trace.event(&format!("start n{i} failed: {e}"));
-                    if !self.cut_off(i) {
+                    if !self.is_isolated(i) {
                         failures += 1;
                         if failures == 50 {
                             panic!("node {i} could not start");
@@ -678,10 +676,7 @@ impl Sim {
         true
     }
 
-    /// Shuts node `i` down as a deploy does: it stops taking requests, and then leaves the
-    /// cluster and releases its leases (`Node::shutdown`). A lease it released must not name it
-    /// in storage afterwards, or other nodes would wait for it to expire. Node `i` does not
-    /// start again until the shutdown ends.
+    /// Gracefully shuts down node `i` and verifies that its released leases are cleared in object storage.
     pub async fn stop(&self, i: usize) {
         let _starting = self.starting[i].lock().await;
         let Some(n) = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
@@ -787,8 +782,7 @@ impl Sim {
         self.partitions.lock().unwrap_or_else(|e| e.into_inner()).contains(&(from, to))
     }
 
-    /// Reports whether a partition or store isolation affects node `i`.
-    fn cut_off(&self, i: usize) -> bool {
+    fn is_isolated(&self, i: usize) -> bool {
         self.store_isolated(i)
             || self.partitions.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| a == i || b == i)
     }

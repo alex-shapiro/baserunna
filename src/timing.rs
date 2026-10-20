@@ -194,8 +194,6 @@ impl Call<'_> {
 
 impl Drop for Call<'_> {
     fn drop(&mut self) {
-        // A call dropped while its runtime is torn down has nothing to record, and
-        // reading the runtime's clock then would panic.
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }

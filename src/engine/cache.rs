@@ -1,11 +1,5 @@
-//! Node-wide byte-bounded cache for immutable segment indexes, decoded
+//! Node-wide sharded CLOCK cache for immutable segment indexes, decoded
 //! blocks, and levels objects.
-//!
-//! The cache is sharded by key, and each shard evicts with the CLOCK
-//! algorithm: a hit only sets its entry's reference bit, so lookups share
-//! the shard's lock and never reorder anything. Insertions take the shard
-//! exclusively and sweep the clock hand past referenced entries (clearing
-//! their bits) until an unreferenced one can be evicted.
 
 use super::manifest::Levels;
 use super::segment::{Block, SegmentIndex};
@@ -14,8 +8,6 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-/// Identifies one cached part of an immutable object: a block, the index
-/// of a segment, or a levels object. Building a key does not allocate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     db: u64,
@@ -27,24 +19,20 @@ const PART_INDEX: u32 = u32::MAX;
 const PART_LEVELS: u32 = u32::MAX - 1;
 
 impl CacheKey {
-    /// Data block `block` of segment `seg`.
     pub fn block(db: &str, seg: &str, block: usize) -> CacheKey {
         CacheKey { db: hash_str(db), object: object_id(seg), part: block as u32 }
     }
 
-    /// The bloom filter and block index of segment `seg`.
     pub fn index(db: &str, seg: &str) -> CacheKey {
         CacheKey { db: hash_str(db), object: object_id(seg), part: PART_INDEX }
     }
 
-    /// The levels object `id`.
     pub fn levels(db: &str, id: &str) -> CacheKey {
         CacheKey { db: hash_str(db), object: object_id(id), part: PART_LEVELS }
     }
 }
 
-/// Object ids are 32 random hex characters, so the parsed id is the key.
-/// Anything else (hand-written test ids) is hashed instead.
+/// Parses 32-character hex object IDs directly, or hashes non-hex test IDs.
 fn object_id(id: &str) -> u128 {
     match id.len() == 32 {
         true => u128::from_str_radix(id, 16).unwrap_or_else(|_| hash_wide(id)),
@@ -67,8 +55,6 @@ fn hash_seeded(s: &str, seed: u64) -> u64 {
     h.finish()
 }
 
-/// A fast deterministic hasher for cache keys, whose object ids are already
-/// uniformly random.
 #[derive(Default)]
 struct KeyHasher(u64);
 
@@ -159,8 +145,7 @@ impl Shard {
             return None;
         };
         let slot = &self.slots[i as usize];
-        // Skip the store when the bit is already set so hot entries do not
-        // bounce their cache line between readers.
+        // Avoid dirtying the cache line if the reference bit is already set.
         if !slot.referenced.load(Relaxed) {
             slot.referenced.store(true, Relaxed);
         }
@@ -183,8 +168,6 @@ impl Shard {
         if size > self.budget {
             return;
         }
-        // Every pass of the hand over an occupied slot either clears its
-        // bit or evicts it, so this ends within two rotations.
         while self.bytes + size > self.budget {
             let i = self.hand;
             self.hand = (self.hand + 1) % self.slots.len();
@@ -247,8 +230,7 @@ impl Cache {
         Self::read(self.shard_of(k)).get(k)
     }
 
-    /// Looks up `k` without marking it referenced or counting the lookup,
-    /// for reads that should not keep entries cached.
+    /// Returns the cached value for `k` without setting its reference bit or updating hit counters.
     pub fn peek(&self, k: &CacheKey) -> Option<CacheVal> {
         let g = Self::read(self.shard_of(k));
         let i = *g.map.get(k)?;
@@ -264,7 +246,6 @@ impl Cache {
         Self::write(self.shard_of(&k)).insert(k, v, size);
     }
 
-    /// Evicts every cached entry of database `db`.
     pub fn evict_db(&self, db: &str) {
         let db = hash_str(db);
         for s in &self.shards {
@@ -309,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn referenced_entries_survive_a_pass_of_the_hand() {
+    fn clock_evicts_unreferenced_entries() {
         let size = block(10).size();
         let c = Cache::new(4 * size);
         for i in 0..4 {
@@ -317,19 +298,19 @@ mod tests {
         }
         assert!(c.get(&key(0)).is_some());
         c.insert(key(4), block(10));
-        assert!(c.get(&key(0)).is_some(), "a referenced entry gets a second chance");
-        assert!(c.get(&key(1)).is_none(), "the first unreferenced entry is evicted");
+        assert!(c.get(&key(0)).is_some());
+        assert!(c.get(&key(1)).is_none());
         assert!(c.get(&key(4)).is_some());
         for i in 5..40 {
             c.insert(key(i), block(10));
-            assert!(c.get(&key(0)).is_some(), "an entry hit between insertions is never evicted");
+            assert!(c.get(&key(0)).is_some());
         }
         let s = c.stats();
         assert_eq!((s.bytes, s.entries), (4 * size, 4));
     }
 
     #[test]
-    fn a_scan_does_not_flush_the_working_set() {
+    fn scan_does_not_evict_hot_entries() {
         let size = block(10).size();
         let c = Cache::new(8 * size);
         let hot: Vec<CacheKey> = (0..4).map(|i| CacheKey::levels("db", &format!("{i:032x}"))).collect();

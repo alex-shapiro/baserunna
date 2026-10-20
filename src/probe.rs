@@ -39,25 +39,23 @@ probes! {
     CommitReplayed,
     /// A transaction was rejected because its commit deadline had passed.
     CommitDeadlinePassed,
-    /// A commit flushed the tail itself, as background flushes fell behind.
+    /// A commit batch flushed the tail inline because background flushes fell behind.
     TailFlushedInCommit,
-    /// A background flush of the tail was installed.
+    /// A background tail flush was installed.
     TailFlushedInBackground,
-    /// A background flush was rejected because the tail moved on in a way it cannot follow.
+    /// A background tail flush was discarded because the tail changed incompatibly.
     FlushSuperseded,
-    /// A background flush was found installed by an earlier ambiguous write.
+    /// A retried tail flush found that its output segments were already installed.
     FlushInstallReplayed,
-    /// After an ambiguous manifest write, the manifest moved past the etag the write
-    /// named, settling whether the batch applied.
+    /// A manifest reload observed a newer etag and resolved an earlier ambiguous write.
     AmbiguousWriteSettled,
     /// A retention trim that failed with a retryable error was retried.
     RetentionTrimRetried,
-    /// A batch that failed answered a commit that the last manifest it read records as applied
-    /// or aborted, rather than report it failed.
+    /// A failed commit batch returned the recorded outcome for a commit that was already decided in the manifest.
     DecidedCommitAnswered,
-    /// A commit status check found no record of a commit and aborted it.
+    /// A commit status check aborted an unapplied commit ID.
     CommitAborted,
-    /// An attempt of a commit that a status check had aborted was rejected.
+    /// A commit was rejected because its commit ID was previously aborted.
     AbortedCommitRejected,
     /// A transaction was rejected due to a read-write conflict.
     CommitConflict,
@@ -141,8 +139,7 @@ probes! {
     CompactionInstallReplayed,
     /// A compaction task stopped because the node lost the database lease.
     CompactionLostLease,
-    /// A compaction, flush or sweep was not installed because the lease it was planned under had
-    /// ended, rather than take the lease again.
+    /// A background task skipped installing its result because its lease had expired.
     BackgroundInstallUnleased,
     /// A compaction result was discarded because the task exceeded the orphan grace period.
     CompactionOutlivedOrphanGrace,
@@ -192,8 +189,7 @@ probes! {
     InteractiveTxnLost,
     /// A retried password reset with the same password completed the reset.
     PasswordResetFinished,
-    /// A simulated workload replaced its model with the database's state, because a write's
-    /// outcome could not be settled; the model checks nothing that write could have done.
+    /// A simulated workload resynchronized its model from the database after an unresolved ambiguous write.
     ModelAdoptedFromDatabase,
 }
 

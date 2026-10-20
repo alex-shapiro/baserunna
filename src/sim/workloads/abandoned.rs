@@ -22,11 +22,10 @@ enum Fate {
     Abandon,
     Abort,
     CommitAfter(u64),
-    /// Checks the commit's status, which aborts it, and then tries to commit.
     ResolveThenCommit,
 }
 
-async fn one(c: &Client, marker: &str, isolation: &str, fate: Fate, tally: &mut Tally) -> Result<(), String> {
+async fn run_txn(c: &Client, marker: &str, isolation: &str, fate: Fate, tally: &mut Tally) -> Result<(), String> {
     let began = c.sim.now_ms();
     let r = c.call("POST", &format!("{BASE}/transactions"), Some(json!({"isolation": isolation}))).await;
     let Ok(r) = r else { return Ok(()) };
@@ -110,7 +109,7 @@ async fn client(c: Client, k: usize, txns: usize) -> Result<Tally, String> {
             _ if rng.chance(0.6) => Fate::CommitAfter(rng.below(500)),
             _ => Fate::CommitAfter(rng.below(2 * idle)),
         };
-        one(&c, &format!("m/{k}/{i}"), isolation, fate, &mut tally).await?;
+        run_txn(&c, &format!("m/{k}/{i}"), isolation, fate, &mut tally).await?;
     }
     Ok(tally)
 }

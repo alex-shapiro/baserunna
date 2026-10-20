@@ -197,7 +197,6 @@ const VERIFY_LINK: LinkLife = LinkLife { ms: 7 * 24 * 3_600_000, words: "7 days"
 
 pub const REAP_INTERVAL_MS: u64 = 60_000;
 
-/// The rendezvous key that picks the node running the reaper.
 const REAPER_KEY: &str = "reaper";
 
 const META_BATCH: usize = 500;
@@ -411,9 +410,8 @@ impl Node {
         self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Leaves the cluster, releases held database leases, and aborts background tasks. Leaving
-    /// writes the system database, so it comes first: once the node releases its leases, it
-    /// takes none again. Returns the databases whose leases it released.
+    /// Leaves the cluster, releases held database leases, and stops background tasks.
+    /// Returns the database IDs whose leases were released.
     pub async fn shutdown(&self) -> Vec<String> {
         self.drain();
         let leave = self.run_meta(MetaCmd::Leave { id: self.id.clone() });
@@ -427,10 +425,7 @@ impl Node {
         lock(&self.members).clone()
     }
 
-    /// Returns this node, unless it is draining, and the non-suspect cluster members with a
-    /// recent heartbeat, excluding any previous member entry that shares this node's address.
-    /// This node counts even before its heartbeat is seen, or while its clock makes it look
-    /// stale; a draining node takes on no new databases.
+    /// Returns live non-suspect peers with distinct addresses, plus this node if it is not draining.
     pub fn live_members(&self) -> Vec<NodeRecord> {
         let now = self.now_ms() as i64;
         let mut live: Vec<NodeRecord> = cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
@@ -544,7 +539,6 @@ impl Node {
             self.env.trace(|| format!("{db_id}: address for {target} is missing, handling locally"));
             return None;
         };
-        // Ignore a previous process that ran at this node's address.
         if addr == self.cfg.addr {
             crate::probe::hit(crate::probe::Probe::OwnAddressIgnored);
             return None;
@@ -591,7 +585,6 @@ impl Node {
                     break;
                 }
             }
-            // Do not forward to a previous process that ran at this node's address.
             if let Some(holder) = sys.lease_holder()
                 && holder != self.id
                 && let Some(addr) = self.addr_of(&holder).filter(|a| *a != self.cfg.addr)
@@ -1301,14 +1294,8 @@ impl Node {
         self.limiter.prune(&self.cfg.limits);
     }
 
-    /// Purges deleted databases past their grace period and sweeps expired
-    /// sessions, if this node is the reaper: the live member, counting itself,
-    /// that rendezvous hashing picks. However the nodes' views of the members
-    /// differ, the node that hashes highest of all of them picks itself, so
-    /// some node reaps. The system database's lease holder would not do, as
-    /// nodes disagree about it around each expiry of its lease: the holder
-    /// lets it go before the others do, and a reaper that always ran in that
-    /// moment would never run anywhere.
+    /// Purges deleted databases past their grace period and deletes expired sessions
+    /// if this node is selected by rendezvous hashing on `REAPER_KEY`.
     pub async fn reap_deleted(&self) -> Result<usize> {
         if cluster::rendezvous(REAPER_KEY, &self.live_members()).is_some_and(|n| n.id != self.id) {
             return Ok(0);

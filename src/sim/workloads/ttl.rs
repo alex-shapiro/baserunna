@@ -25,8 +25,7 @@ struct Val {
     data: String,
     version: u64,
     expires: Option<(u64, u64)>,
-    /// True when the commit record expired before retries finished, leaving
-    /// the write outcome unknown until the next definitive write or `expires`.
+    /// `true` if the commit retention window expired before the write outcome was determined.
     uncertain: bool,
 }
 
@@ -338,14 +337,9 @@ struct LockWrite {
 }
 
 const LOCK_TTL_MS: u64 = 1_500;
-
-/// `lock_txn`'s answer when the commit record outlived its retention, so
-/// whether an earlier attempt applied is unknown.
 const OUTCOME_UNKNOWN: u64 = u64::MAX - 1;
 
-/// Commits `ops` with idempotency key `key`, retrying until it is committed
-/// or fails a check (`Err` with the check's op index, `u64::MAX` if it did not
-/// apply, or `OUTCOME_UNKNOWN`).
+/// Commits `ops` with `key`, returning the version and response or the failed operation index.
 async fn lock_txn(c: &Client, ops: Json, key: &str) -> Result<Result<(u64, Json), u64>, String> {
     let body = json!({"ops": ops, "idempotency_key": key});
     let began = c.sim.now_ms();
@@ -355,10 +349,8 @@ async fn lock_txn(c: &Client, ops: Json, key: &str) -> Result<Result<(u64, Json)
             Ok(r) if r.status == 412 => {
                 return Ok(Err(r.json["error"]["details"]["op_index"].as_u64().unwrap_or(u64::MAX)));
             }
-            // An earlier attempt failed a check, which resolved the key as not applied,
-            // unless the record of an applied attempt had already expired.
             Ok(r) if r.code() == "aborted" => {
-                return Ok(Err(if c.retained(began) { u64::MAX } else { OUTCOME_UNKNOWN }));
+                return Ok(Err(if c.is_commit_retained(began) { u64::MAX } else { OUTCOME_UNKNOWN }));
             }
             Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => c.pause(30).await,
             Ok(r) if r.status != 503 && r.status != 429 => return Err(format!("lock: {} {}", r.status, r.json)),
@@ -389,7 +381,6 @@ async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Re
     ]);
     let version = match lock_txn(c, acquire, me).await? {
         Ok((version, _)) => version,
-        // `held` exists only if an earlier attempt applied.
         Err(i @ (0 | OUTCOME_UNKNOWN)) => {
             let r = c.call_retry("POST", "/v1/dbs/locks/txn", Some(json!({"ops": [{"op": "get", "key": held}]}))).await;
             match r.json["results"][0]["version"].as_u64() {

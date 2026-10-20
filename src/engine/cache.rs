@@ -53,12 +53,17 @@ fn object_id(id: &str) -> u128 {
 }
 
 fn hash_wide(s: &str) -> u128 {
-    ((hash_str(s) as u128) << 64) | hash_str(&s.chars().rev().collect::<String>()) as u128
+    ((hash_seeded(s, 0) as u128) << 64) | hash_seeded(s, K) as u128
 }
 
 fn hash_str(s: &str) -> u64 {
-    let mut h = KeyHasher::default();
+    hash_seeded(s, 0)
+}
+
+fn hash_seeded(s: &str, seed: u64) -> u64 {
+    let mut h = KeyHasher(seed);
     h.write(s.as_bytes());
+    h.write_u64(s.len() as u64);
     h.finish()
 }
 

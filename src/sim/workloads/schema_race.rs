@@ -71,8 +71,10 @@ async fn one_shot(c: &Client, body: Json, rejected: &[(u16, &str)]) -> Result<Ap
     }
 }
 
-/// The rows of writer `w`'s range, which no other client writes.
+/// The rows of writer `w`'s range, which no other client writes, to replace the writer's model
+/// after a write whose outcome could not be settled.
 async fn rows_of(c: &Client, w: i64) -> Result<BTreeMap<i64, Row>, String> {
+    crate::probe::hit(crate::probe::Probe::ModelAdoptedFromDatabase);
     let body = json!({"range": {"gte": w * 100, "lt": w * 100 + 100}, "limit": 1000});
     let r = c.call_retry("POST", &format!("{BASE}/tables/items/rows/query"), Some(body)).await;
     let rows = r.json["rows"].as_array().ok_or(format!("rows of writer {w}: {} {}", r.status, r.json))?;

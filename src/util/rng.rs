@@ -147,6 +147,22 @@ impl Rng {
         v
     }
 
+    /// `len` bytes of JSON-like text of words from a small vocabulary, which
+    /// compresses about as well as typical application data.
+    pub fn text(&mut self, len: usize) -> String {
+        const WORDS: [&str; 16] = [
+            "alpha", "bravo", "user", "active", "pending", "id", "name", "email", "created", "status", "true", "false",
+            "count", "2026", "items", "note",
+        ];
+        let mut out = format!("{{\"n\":{},\"text\":\"", self.below(1_000_000));
+        while out.len() < len {
+            out.push_str(self.pick(&WORDS));
+            out.push(if self.chance(0.2) { char::from(b'a' + self.below(26) as u8) } else { ' ' });
+        }
+        out.truncate(len);
+        out
+    }
+
     pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[self.usize(items.len())]
     }

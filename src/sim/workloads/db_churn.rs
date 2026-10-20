@@ -143,7 +143,20 @@ pub async fn run(sim: Arc<Sim>, clients: usize, dbs: usize, steps: usize, chaos:
             check_db(c, db, want, "final").await?;
         }
     }
-    sim.sleep(sim.cfg.node.db_idle_evict_ms + 10_000).await;
+    // Background work a final read started, such as a sweep, keeps its handle open until it ends,
+    // and a store stall can hold it up: allow for two stalls on top of eviction and housekeeping.
+    let deadline = sim.now_ms() + sim.cfg.node.db_idle_evict_ms + 10_000 + 2 * sim.cfg.store.stall_ms.1;
+    loop {
+        sim.sleep(1_000).await;
+        let r = idle_resources(&sim);
+        if r.is_ok() || sim.now_ms() >= deadline {
+            return r;
+        }
+    }
+}
+
+/// Checks that every node closed its idle database handles and keeps its cache within budget.
+fn idle_resources(sim: &Sim) -> Result<(), String> {
     for i in sim.up_nodes() {
         let Some(n) = sim.node(i) else { continue };
         let open = n.node.engine.open_count();

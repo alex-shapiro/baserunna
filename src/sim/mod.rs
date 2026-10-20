@@ -114,6 +114,8 @@ pub struct ChaosFaults {
     /// Maximum recovery period after a storm, during which the cluster is healed.
     pub calm_ms: u64,
     pub crash: u64,
+    /// Shuts a node down gracefully, as a deploy does.
+    pub stop: u64,
     pub start: u64,
     pub partition: u64,
     pub one_way_partition: u64,
@@ -674,6 +676,27 @@ impl Sim {
             }
         });
         true
+    }
+
+    /// Shuts node `i` down as a deploy does: it stops taking requests, and then leaves the
+    /// cluster and releases its leases (`Node::shutdown`). A lease it released must not name it
+    /// in storage afterwards, or other nodes would wait for it to expire. Node `i` does not
+    /// start again until the shutdown ends.
+    pub async fn stop(&self, i: usize) {
+        let _starting = self.starting[i].lock().await;
+        let Some(n) = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        self.trace.event(&format!("stop n{i} ({})", n.node.id));
+        let released = n.node.shutdown().await;
+        for db in released {
+            let Ok(g) = self.mem.get_sync(&crate::engine::manifest_key(&db), &GetOpts::default()) else { continue };
+            let lease = crate::engine::manifest::Manifest::decode(&g.data).ok().and_then(|m| m.lease);
+            if lease.is_some_and(|l| l.node == n.node.id) {
+                let e = format!("n{i} released its lease on {db} as it stopped, but storage names it again");
+                self.trace.event(&format!("oracle: {e}"));
+                self.violation.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+            }
+        }
+        self.trace.event(&format!("stopped n{i}"));
     }
 
     /// Aborts node `i`'s tasks and drops its in-memory state.

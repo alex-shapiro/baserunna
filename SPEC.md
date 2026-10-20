@@ -493,20 +493,20 @@ Before writing the manifest, any `tail` entries with `expires_at <= version_time
 
 The tail is flushed in the background, so that no commit waits for a segment `PUT`. Once a commit leaves `tail` larger than `tail_max_bytes` (256 KiB), the lease holder writes the entries of that version's tail to new Level 0 segments, user data and commit records in separate segments, and queues their install. The install removes from `tail` every entry as old as the flushed version and adds the segments to Level 0, in the manifest write of the next commit, or after a second if none comes. Entries committed meanwhile stay in `tail`.
 
-An install is rejected, and its objects deleted, if the manifest's `flushes` counter moved since the flushed version (another flush, on this or another node, wrote some of the same entries, and a second copy in a newer segment would shadow the chunks compactions seal from the first), if a tombstone newer than the flushed version was purged meanwhile, or if the flush outlived the orphan grace (§5.8). If a commit finds the tail at four times `tail_max_bytes`, as when flushes cannot keep up, it flushes the tail itself before its manifest write. Segments of a flush interrupted by a crash are cleaned up later as orphans (§5.8).
+An install is rejected, and its objects deleted, if the manifest's `flushes` counter moved since the flushed version (another flush, on this or another node, wrote some of the same entries, and a second copy in a newer segment would shadow the chunks compactions seal from the first), if a tombstone newer than the flushed version was purged meanwhile, if the flush outlived the orphan grace (§5.8), or if the node's lease ended, as when it released the lease on shutdown: background work never takes a lease. If a commit finds the tail at four times `tail_max_bytes`, as when flushes cannot keep up, it flushes the tail itself before its manifest write. Segments of a flush interrupted by a crash are cleaned up later as orphans (§5.8).
 
-The tail limit trades the size of every manifest `PUT` against flushes, each a segment `PUT` and later compaction work. Measured from a Fly.io machine, a Tigris `PUT` takes about 26 ms up to 1,000 bytes, about 70 ms from 1.1 KiB to 32 KiB, 81 ms at 64 KiB, and 107 ms at 256 KiB (p50): almost any tail costs the step past 1,000 bytes, while a smaller limit saves little more. Limits of 64 and 128 KiB raise the cost of steady writes, stream ingestion (runs of a stream rarely reach the sealing size within one flush), cold reads and space amplification, so the limit stays at 256 KiB.
+The tail limit trades the size of every manifest `PUT` against flushes, each a segment `PUT` and later compaction work. A smaller limit buys little latency: on Tigris, a `PUT` of 1.1 KiB already takes about 70 ms (p50), against 107 ms at 256 KiB and 26 ms below 1,000 bytes, while it raises the cost of steady writes, stream ingestion (runs of a stream rarely reach the sealing size within one flush), cold reads, and space amplification.
 
 #### CAS Conflicts and Retries
 
 If a conditional `PUT` on the manifest does not succeed on the first attempt:
 
 - On `412 Precondition Failed`, another node updated the manifest. The committer reloads the manifest. If another node now holds a valid lease, the batch fails with `not_owner`; otherwise the committer re-runs validation and applies the batch against the new `base`.
-- On a timeout or network error, it is unknown whether the `PUT` landed. The committer reloads the manifest and retries against the new `base`. If the earlier `PUT` succeeded, step 4 finds the batch's commit records in the reloaded manifest and returns their committed versions without re-applying the writes. If a delayed copy of the first `PUT` is still in flight, it carries the same `If-Match` etag as the retry so at most one can succeed. Once the reloaded manifest has moved past every etag the batch's ambiguous `PUT`s named, and holds none of its commit records, none of them applied or ever will, and the batch's outcome is known again. Otherwise, after exhausting retries or losing the lease, the committer returns `503 unavailable` with `outcome: "unknown"`, which the client can resolve via `GET /commits/{id}` or by retrying with the same idempotency key.
+- On a timeout or network error, it is unknown whether the `PUT` landed. The committer reloads the manifest and retries against the new `base`. If the earlier `PUT` succeeded, step 4 finds the batch's commit records in the reloaded manifest and returns their committed versions without re-applying the writes. If a delayed copy of the first `PUT` is still in flight, it carries the same `If-Match` etag as the retry so at most one can succeed. Once the reloaded manifest has moved past every etag the batch's ambiguous `PUT`s named, and holds none of its commit records, none of them applied or ever will, and the batch's outcome is known again. Otherwise, after exhausting retries or losing the lease, the committer returns `503 unavailable` with `outcome: "unknown"`, which the client can resolve via `GET /commits/{id}` or by retrying with the same idempotency key. A failing batch first answers each commit that the last manifest it read records as applied or aborted: those outcomes are known, whatever became of the batch's own writes.
 
 #### Hedged Manifest Writes
 
-If a manifest `PUT` does not complete within `manifest_put_hedge_ms` (250 ms), the committer sends a duplicate `PUT` with the same `If-Match` precondition. Because both requests use the same precondition, at most one is applied. The attempt succeeds as soon as either request succeeds. If the duplicate fails with `412 Precondition Failed` while the first request is still in flight, the first request may have already been applied, so the committer treats the attempt as a timeout and reloads the manifest immediately; the write counts as in flight until the first request completes, so that strong reads on the node wait for it rather than trust a reloaded manifest it may already have replaced. On any other error, the committer waits for both requests to finish. Objects removed from `obsolete` by the planned manifest have already passed their grace period, so they are deleted even if the outcome of the `PUT` is unknown.
+If a manifest `PUT` does not complete within `manifest_put_hedge_ms` (250 ms), the committer sends a duplicate `PUT` with the same `If-Match` precondition. Because both requests use the same precondition, at most one is applied. The attempt succeeds as soon as either request succeeds. If the duplicate fails with `412 Precondition Failed` while the first request is still in flight, the first request may have already been applied, so the committer treats the attempt as a timeout and reloads the manifest immediately. Until the first request completes, the node serves no read from its lease: the manifest it holds may be replaced in storage at any moment, so strong reads read the manifest from storage instead. On any other error, the committer waits for both requests to finish. Objects removed from `obsolete` by the planned manifest have already passed their grace period, so they are deleted even if the outcome of the `PUT` is unknown.
 
 #### Commit Records
 
@@ -625,7 +625,7 @@ Every 10 minutes, each node overwrites a shared `clock` object and reads back it
 
 #### Obsolete Segments
 
-If compaction replaces segments or a `.levels` object, it adds their IDs to `manifest.obsolete` with the current store time. When subsequent commits or compactions are applied, the lease holder deletes any object in `obsolete` that has been listed for at least 30 min and removes it from the manifest. Transactions time out after 5 min, so only a read whose store request stalls past the grace period can encounter a deleted segment: if the current manifest no longer lists the segment, the read fails with a retryable `503`; if the manifest still lists it, the segment is missing and the read fails with `500`. A manifest read that stalls the same way may find its levels object gone; the node then reads the manifest again, and only if the same manifest comes back is the levels object missing (`500`).
+If compaction replaces segments or a `.levels` object, it adds their IDs to `manifest.obsolete` with the current store time. When subsequent commits or compactions are applied, the lease holder deletes any object in `obsolete` that has been listed for at least 30 min and removes it from the manifest. Transactions time out after 5 min, so only a read whose store request stalls past the grace period can encounter a deleted segment: if the current manifest no longer lists the segment, the read fails with a retryable `503`; if the manifest still lists it, the segment is missing and the read fails with `500`. A manifest read that stalls the same way may find its levels object gone; the node then reads the manifest again, and only if that one still references the levels object is it missing (`500`).
 
 #### Orphans
 
@@ -758,7 +758,8 @@ Simulated benchmarks (`sim::amp`) measure segment and chunk bytes written per re
    commit (as a status check does) before answering 412, because an earlier
    attempt may have applied the write that now makes the check fail, and
    one still in flight must not apply after the answer; the key is then
-   spent, as after a status check. Conflicts are retried server-side.
+   spent, as after a status check. A request without writes commits
+   nothing and ignores its key. Conflicts are retried server-side.
 2. **Interactive** (`/v1/dbs/{db}/transactions…`): begin, ops, commit,
    abort. `begin` and `commit` also accept `ops`, so a read-write transaction
    can be executed in two requests. Because a serializable transaction can begin
@@ -770,8 +771,8 @@ Simulated benchmarks (`sim::amp`) measure segment and chunk bytes written per re
 
 **Resolving ambiguity.** A `503` with `outcome: "unknown"`, or a lost
 response, means a commit may or may not have applied. The client calls
-`GET /commits/{commit_id}` (or `key:<idempotency key>`) right away. It
-answers from the commit records (§5.5): `committed` (with its version and
+`GET /commits/{commit_id}` (or `key:<idempotency key>`) right away; as it
+may abort the commit, it requires write access. It answers from the commit records (§5.5): `committed` (with its version and
 `appends`), or `not_committed` (with `retention_ms`) after aborting the
 commit ID, so that no attempt in flight, or delayed in the network, or
 sent later, applies it: each fails with `409 aborted`. A client that still
@@ -857,7 +858,7 @@ its `version`.
   rewrites `{id, addr, started_at, heartbeat_at}` every `heartbeat_ms`
   (120 s) and re-reads the table every `members_refresh_ms` (30 s). A node is
   live if `heartbeat_at > now − 3 × heartbeat_ms` and a newer process has not
-  registered at its address; a node always counts itself live. Crashes are detected by
+  registered at its address; a node counts itself live unless it is draining. Crashes are detected by
   requests rather than heartbeats: a forward that certainly never arrived
   makes its target a suspect, which stays out of routing until the table
   shows a newer heartbeat from it, or for a backoff that starts at 10 s and
@@ -1287,9 +1288,10 @@ process CPU time and host steal time on Linux. `DELETE /v1/admin/metrics`
 returns and resets the histograms.
 
 On SIGTERM or SIGINT a node drains (failing `/healthz`), stops accepting
-connections, waits for in-flight requests, then releases its leases and
-leaves the membership table, so other nodes take over its databases at
-once. [`DEPLOYING.md`](DEPLOYING.md) covers TLS, load balancers, the
+connections, waits for in-flight requests, then leaves the membership table
+and releases its leases, so other nodes take over its databases at once.
+From the first release on, the node takes no lease, by request or background
+work, so none is left to expire after it stops. [`DEPLOYING.md`](DEPLOYING.md) covers TLS, load balancers, the
 container image and bucket setup.
 
 `fs:` is for single-node development only. Compare-and-swap is serialized
@@ -1317,7 +1319,7 @@ Each simulation parameter is drawn independently from a hash of the run seed and
 - **Cluster and configuration**: 1–5 nodes; randomized engine and node parameters (memtable, block, and segment sizes, compaction triggers, cache budgets, commit batch limits, hedging delays, lease durations, range-delete thresholds, inline level limits, stream chunk sizes, heartbeat and refresh intervals, cache TTLs, and index backfill batch limits).
 - **Object store** (`SimStore`): variable latency plus a transfer time per MiB (real stores take measurably longer to write a larger manifest), transient errors before application, ambiguous errors after application (where the write is applied in storage while the caller receives an error), stalls exceeding lease durations, delayed responses, and eventually consistent `LIST` results.
 - **Network**: variable latency, dropped responses, duplicated and delayed forwarded requests, bidirectional and unidirectional network partitions, and per-node storage isolation.
-- **Nodes**: process crashes and restarts, clock skew and step changes, and process pauses (simulating GC pauses or VM preemption). The local disk cache persists across node restarts and injects read/write errors and data corruption.
+- **Nodes**: process crashes and restarts, graceful shutdowns as in a deploy, clock skew and step changes, and process pauses (simulating GC pauses or VM preemption). The local disk cache persists across node restarts and injects read/write errors and data corruption.
 - **Chaos**: fault storms (crashes, restarts, partitions, storage isolation, clock jumps, and pauses) alternate with recovery periods so that workloads can make progress under heavy fault injection.
 - **Buggify** (`src/buggify.rs`): deterministic fault-injection points in production code trigger rare execution paths (small commit batches, forced revalidation, cache misses, early flushes and sweeps, delays before manifest writes, idle handle eviction, dropped interactive transactions, and local request handling). Each call site is enabled or disabled for the entire run. Crash points terminate a node between internal steps of commits, compactions, sweeps, deletions, and auth operations. Client-visible fault sites and crash points are disabled during the post-chaos settlement phase.
 - **Task scheduling**: tasks randomly yield before being polled, varying the execution order of concurrently ready tasks.
@@ -1351,7 +1353,7 @@ Workloads run concurrently with a shared chaos loop (`ChaosPhase`). When all act
 | `api_tour`     | Exercises schema drop endpoints, transaction aborts, commit status lookup by idempotency key, and admin metrics endpoints.                                                                                                                                                                                                                                                                          |
 | `mix`          | Runs a random combination of at least two workloads concurrently in a shared cluster and chaos loop.                                                                                                                                                                                                                                                                                                |
 
-Every 20 ms of virtual time, global oracles verify that at most one node relies on a lease for any database and that any node relying on a lease without an in-flight manifest write holds the latest manifest version in the store. At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, and stream chunks are intact and consistent.
+Every 20 ms of virtual time, global oracles verify that at most one node relies on a lease for any database and that any node relying on a lease without an in-flight manifest write holds the latest manifest version in the store. At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, and stream chunks are intact and consistent. When a node shuts down gracefully, no lease it released may name it in storage afterwards.
 
 ### 13.4 Coverage, campaigns, and exploration
 
@@ -1457,7 +1459,7 @@ scripts/mutants.sh                                               # run mutation 
 44. _Duplicate flushes shadowing sealed chunks._ While background tail flushes were developed, a flush installed after another flush of the same entries left two copies of them; once a compaction sealed one copy into a chunk keyed by the run's last record, the other copy's record of that key shadowed the chunk, hiding the run. Installs now require the manifest's `flushes` counter to be unchanged (§5.5).
 45. _Live chunks deleted after an ambiguous install._ A flush whose install was retried after an ambiguous write, and found superseded by its own install, deleted the chunks that install referenced. Superseded installs after an ambiguous write now report an unknown outcome and delete nothing.
 46. _Answers overtaken by earlier attempts._ A retried idempotent request that failed a precondition answered `412` while its earlier attempt was still in flight, which then applied. Precondition failures now resolve the commit (§6.2). While abort records were developed, aborting only the attempts that began before the check let a request that had reached a node, but not yet begun its transaction, apply after the check answered `not_committed`; aborts are final.
-47. _Leased reads beside a hedged write._ When a hedged manifest write's duplicate was refused while the first was in flight, the node counted the write as finished, reloaded the manifest it was replacing, and served leased reads from it while the first write landed. The write now stays in flight until the first request completes (§5.5).
+47. _Leased reads beside a hedged write._ When a hedged manifest write's duplicate was refused while the first was in flight, the node counted the write as finished, reloaded the manifest it was replacing, and served leased reads from it while the first write landed. The node now serves no read from its lease until the first request completes (§5.5), and once a write that may have landed is behind it, trusts its manifest again only after a read that began later: a concurrent read that began earlier had re-trusted the manifest the write replaced.
 48. _Levels objects garbage-collected during manifest reads._ A node whose manifest read was followed by a store stall longer than the grace period found the manifest's levels object deleted and failed the request with `500`. The node now reads the manifest again (§5.8).
 
 Cost model tests (§13.5) also identified five efficiency defects: lapsed leases on read-heavy databases were never re-acquired, unleased strong reads validated the manifest twice, read-only renewals used the shorter write-lease duration, `.levels` objects under a separate prefix required an extra `LIST` call per sweep, and stream flushes wrote separate small segments for commit records and stream state instead of retaining unsealed entries in `tail`.

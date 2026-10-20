@@ -52,6 +52,9 @@ probes! {
     AmbiguousWriteSettled,
     /// A retention trim that failed with a retryable error was retried.
     RetentionTrimRetried,
+    /// A batch that failed answered a commit that the last manifest it read records as applied
+    /// or aborted, rather than report it failed.
+    DecidedCommitAnswered,
     /// A commit status check found no record of a commit and aborted it.
     CommitAborted,
     /// An attempt of a commit that a status check had aborted was rejected.
@@ -138,6 +141,9 @@ probes! {
     CompactionInstallReplayed,
     /// A compaction task stopped because the node lost the database lease.
     CompactionLostLease,
+    /// A compaction, flush or sweep was not installed because the lease it was planned under had
+    /// ended, rather than take the lease again.
+    BackgroundInstallUnleased,
     /// A compaction result was discarded because the task exceeded the orphan grace period.
     CompactionOutlivedOrphanGrace,
     /// A read failed with a retryable error after garbage collection deleted a segment.
@@ -186,6 +192,9 @@ probes! {
     InteractiveTxnLost,
     /// A retried password reset with the same password completed the reset.
     PasswordResetFinished,
+    /// A simulated workload replaced its model with the database's state, because a write's
+    /// outcome could not be settled; the model checks nothing that write could have done.
+    ModelAdoptedFromDatabase,
 }
 
 impl Probe {
@@ -199,6 +208,7 @@ impl Probe {
         Probe::SegmentDropped,
         Probe::CompactionMoved,
         Probe::CompactionLostLease,
+        Probe::BackgroundInstallUnleased,
         Probe::CompactionOutlivedOrphanGrace,
         Probe::SegmentCollectedUnderRead,
         Probe::LevelsCollectedUnderRead,
@@ -211,6 +221,8 @@ impl Probe {
         Probe::PreconditionExplainedByReplay,
         Probe::RetentionTrimRetried,
         Probe::CommitUnknownAfterLeaseMoved,
+        Probe::DecidedCommitAnswered,
+        Probe::ModelAdoptedFromDatabase,
     ];
 }
 

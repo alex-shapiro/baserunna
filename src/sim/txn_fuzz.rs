@@ -2553,7 +2553,9 @@ impl<'a> Session<'a> {
             self.expect("POST", &path, bytes, &Expect::Err(Fail::Invalid, None)).await?;
             return Ok(());
         }
-        if let Some(k) = &req.idempotency_key {
+        // A transaction without writes ignores its idempotency key.
+        let key = req.idempotency_key.as_deref().filter(|_| writes);
+        if let Some(k) = key {
             if k.is_empty() || k.len() > 200 {
                 self.expect("POST", &path, bytes, &Expect::Err(Fail::Invalid, None)).await?;
                 return Ok(());
@@ -2584,7 +2586,7 @@ impl<'a> Session<'a> {
                     let idx = (f == Fail::Precondition).then_some(i);
                     self.expect("POST", &path, bytes, &Expect::Err(f, idx)).await?;
                     if f == Fail::Precondition {
-                        self.w.abort(req.idempotency_key.as_deref());
+                        self.w.abort(key);
                     }
                     return Ok(());
                 }
@@ -2599,7 +2601,7 @@ impl<'a> Session<'a> {
                 Ok(f) => f,
                 Err(i) => {
                     self.expect("POST", &path, bytes, &Expect::Err(Fail::Precondition, Some(i))).await?;
-                    self.w.abort(req.idempotency_key.as_deref());
+                    self.w.abort(key);
                     return Ok(());
                 }
             };

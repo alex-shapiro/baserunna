@@ -42,19 +42,6 @@ fn pct(sorted: &[Duration], p: f64) -> f64 {
     sorted.get(i).map_or(0.0, |d| d.as_secs_f64() * 1e3)
 }
 
-/// A JSON-like value of `len` bytes that compresses about as well as typical data.
-fn value(rng: &mut Rng, len: usize) -> Bytes {
-    const WORDS: [&str; 12] =
-        ["user", "active", "pending", "id", "name", "email", "created", "status", "true", "count", "items", "note"];
-    let mut s = format!("{{\"n\":{},\"text\":\"", rng.next_u64());
-    while s.len() < len {
-        s.push_str(WORDS[rng.usize(WORDS.len())]);
-        s.push(if rng.chance(0.2) { char::from(b'a' + rng.below(26) as u8) } else { ' ' });
-    }
-    s.truncate(len);
-    Bytes::from(s)
-}
-
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("runtime");
     rt.block_on(run());
@@ -62,7 +49,7 @@ fn main() {
 
 async fn run() {
     let url = std::env::var("BASERUNNA_STORE").expect("BASERUNNA_STORE is required");
-    let mut rng = Rng::new(Instant::now().elapsed().as_nanos() as u64 ^ std::process::id() as u64);
+    let mut rng = Rng::new(Env::real().random_u64());
     let prefix = format!("bench-{:016x}", rng.next_u64());
     let cloud: DynStore = match url.as_str() {
         "mem:" => Arc::new(MemStore::with_system_clock()),
@@ -130,7 +117,7 @@ async fn run() {
                         let t = Instant::now();
                         let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await.expect("begin");
                         let key = Bytes::from(format!("k{:06}", rng.below(keys)));
-                        txn.put(key, Value::Inline(value(&mut rng, value_bytes))).expect("put");
+                        txn.put(key, Value::Inline(Bytes::from(rng.text(value_bytes)))).expect("put");
                         db.commit(txn.into_request()).await.expect("commit");
                         if i >= warmup {
                             lat.lock().unwrap().push(t.elapsed());

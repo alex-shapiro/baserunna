@@ -51,21 +51,9 @@ fn cpu_secs() -> f64 {
     secs(u.ru_utime) + secs(u.ru_stime)
 }
 
-/// A `len`-byte JSON-like value of words drawn from a small vocabulary, so
-/// it compresses about as well as typical application data.
-fn value(seed: u64, len: usize) -> Vec<u8> {
-    const WORDS: [&str; 16] = [
-        "alpha", "bravo", "user", "active", "pending", "id", "name", "email", "created", "status", "true", "false",
-        "count", "2026", "items", "note",
-    ];
-    let mut rng = Rng::new(seed);
-    let mut out = format!("{{\"n\":{seed},\"text\":\"");
-    while out.len() < len {
-        out.push_str(WORDS[rng.usize(WORDS.len())]);
-        out.push(if rng.chance(0.2) { char::from(b'a' + rng.below(26) as u8) } else { ' ' });
-    }
-    out.truncate(len.max(1));
-    out.into_bytes()
+/// A `len`-byte value, at least one byte, that compresses like typical data.
+fn value(seed: u64, len: usize) -> Bytes {
+    Bytes::from(Rng::new(seed).text(len.max(1)))
 }
 
 fn main() {
@@ -107,7 +95,7 @@ async fn bench(threads: usize) {
         assert_eq!(r.status, 201, "create db d{d}");
         for k in 0..keys {
             let path = format!("/v1/dbs/d{d}/kv/k{k}");
-            let r = call_router(&router, "PUT", &path, t, Bytes::from(value(k, value_bytes))).await;
+            let r = call_router(&router, "PUT", &path, t, value(k, value_bytes)).await;
             assert_eq!(r.status, 200, "seed d{d}");
         }
     }
@@ -131,7 +119,7 @@ async fn bench(threads: usize) {
                 let path = format!("/v1/dbs/d{d}/kv/k{}", rng.below(keys));
                 let t1 = Instant::now();
                 let r = if rng.below(100) < write_pct {
-                    call_router(&router, "PUT", &path, t, Bytes::from(value(rng.next_u64(), value_bytes))).await
+                    call_router(&router, "PUT", &path, t, value(rng.next_u64(), value_bytes)).await
                 } else {
                     call_router(&router, "GET", &path, t, Bytes::new()).await
                 };

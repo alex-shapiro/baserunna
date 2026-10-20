@@ -943,7 +943,7 @@ fn a_manifest_whose_levels_object_was_collected_is_read_again() {
         assert_eq!(v.m.levels, levels(), "read the replacing manifest");
         assert_eq!(crate::probe::count(crate::probe::Probe::LevelsCollectedUnderRead), before + 1);
 
-        // The same manifest twice means the levels object of the current manifest is missing.
+        // A manifest read again that still references the levels object means it is missing.
         let c = second_node(&a, &store, "c");
         let current = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().data;
         store.mem.delete(&levels_key("d", levels().as_deref().unwrap())).await.unwrap();
@@ -1295,10 +1295,11 @@ fn commit_with_lost_reply_after_takeover(reply_delay_leases: u64, hedge_ms: u64)
 
 #[test]
 fn ambiguous_commit_during_active_lease() {
-    // Node B retries while node A's lease is still active.
+    // Node B cannot retry while node A's lease is still active, but the manifest it read back
+    // records the commit, so the outcome is known.
     match commit_with_lost_reply_after_takeover(2, 0) {
-        Err(Error::Unavailable { outcome_unknown: true, .. }) => {}
-        other => panic!("expected unknown outcome for applied write, got {other:?}"),
+        Ok(2) => {}
+        other => panic!("expected the applied write's version 2, got {other:?}"),
     }
 }
 
@@ -1331,6 +1332,54 @@ fn released_leases_hand_over_at_once() {
         tokio::time::sleep(Duration::from_millis(1)).await;
         put(&db, "k", "b").await;
         assert_eq!(strong_get(&da, "k").await, Some(inline("b")));
+    });
+}
+
+#[test]
+fn decided_commits_are_answered_whatever_becomes_of_the_write() {
+    rt().block_on(async {
+        let cfg = EngineConfig { manifest_put_hedge_ms: 0, commit_retry_max: 2, ..EngineConfig::small_for_tests() };
+        let (eng, store) = delayed_engine_with("a", cfg);
+        let db = opened(&eng, "d").await;
+        let request = |id: u64| {
+            let db = db.clone();
+            async move {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                t.put(Bytes::from_static(b"k"), inline("v")).unwrap();
+                let mut r = t.into_request();
+                r.commit_id = id;
+                r
+            }
+        };
+        let first = db.commit_detailed(request(77).await).await.unwrap();
+        assert_eq!(db.resolve_commit(88).await.unwrap(), None);
+        let (retry, aborted) = (request(77).await, request(88).await);
+        // Every manifest write of the batch applies, but its reply is lost.
+        store.manifest_put_lost.store(10, SeqCst);
+        let (lease, replay, late) =
+            tokio::join!(db.acquire_lease(), db.commit_detailed(retry), db.commit_detailed(aborted));
+        assert!(lease.is_err(), "setup: the lease renewal's writes were not ambiguous");
+        let replay = replay.expect("a commit recorded in a stored manifest was reported failed");
+        assert_eq!((replay.version, replay.replayed), (first.version, true));
+        assert!(matches!(late, Err(Error::Aborted(_))), "an aborted commit was reported {late:?}");
+    });
+}
+
+#[test]
+fn background_work_does_not_take_back_a_released_lease() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        let before = crate::probe::count(crate::probe::Probe::BackgroundInstallUnleased);
+        put_many(&db, "k", 5, 500).await;
+        assert!(db.busy(), "setup: no flush started");
+        db.release_lease().await.unwrap();
+        flushed(&db).await;
+        let stored = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().data;
+        let m = manifest::Manifest::decode(&stored).unwrap();
+        assert_eq!(m.lease, None, "the flush took the released lease back");
+        assert!(!m.tail.is_empty(), "the flush was installed without the lease");
+        assert!(crate::probe::count(crate::probe::Probe::BackgroundInstallUnleased) > before);
     });
 }
 

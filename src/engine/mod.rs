@@ -48,9 +48,16 @@ pub struct Shared {
     /// Databases exempt from size quota limits.
     quota_exempt: Mutex<std::collections::BTreeSet<String>>,
     pub metrics: Arc<crate::metrics::StoreMetrics>,
+    /// Set once the node starts releasing its leases to shut down: it takes no lease after.
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
+    /// Whether this node has started releasing its leases to shut down, and takes no lease.
+    pub(crate) fn stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub(crate) fn quota_exempt(&self, db: &str) -> bool {
         self.quota_exempt.lock().unwrap_or_else(|e| e.into_inner()).contains(db)
     }
@@ -208,6 +215,7 @@ impl Engine {
             clock: clock::StoreClock::new(),
             observed_leases: Mutex::new(DetHashMap::default()),
             quota_exempt: Mutex::new(Default::default()),
+            stopping: false.into(),
         });
         Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) })
     }
@@ -237,6 +245,21 @@ impl Engine {
         let mut v: Vec<Arc<Db>> = g.values().cloned().collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
         v
+    }
+
+    /// Releases the leases of all open databases, giving each `per_db` to do so, so that other
+    /// nodes take over at once. From the start, this node takes no lease, by request or
+    /// background work, so that none is left to expire after it stops. Returns the databases
+    /// whose leases it released.
+    pub async fn release_leases(&self, per_db: Duration) -> Vec<String> {
+        self.shared.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut released = Vec::new();
+        for db in self.open_dbs() {
+            if let Ok(Ok(true)) = tokio::time::timeout(per_db, db.release_lease()).await {
+                released.push(db.id.clone());
+            }
+        }
+        released
     }
 
     /// Drops unreferenced handles that have been idle for `idle_ms`.

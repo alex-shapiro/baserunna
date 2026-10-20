@@ -147,27 +147,28 @@ impl KeyRange {
 
 impl Shared {
     /// Decodes a stored manifest and attaches deep-level segment metadata from `current`
-    /// or from the external levels object. Returns `None` if the levels object is gone,
-    /// which happens once garbage collection removes it after a newer manifest replaced it.
+    /// or from the external levels object. Fails with [`LevelsMissing`] if the levels
+    /// object is gone, as it is once garbage collection removes it after a newer manifest
+    /// replaced it.
     pub(crate) async fn load_manifest(
         &self,
         db: &str,
         data: &Bytes,
         current: Option<&Version>,
-    ) -> Result<Option<Manifest>> {
+    ) -> Result<std::result::Result<Manifest, LevelsMissing>> {
         let mut m = Manifest::decode(data)?;
         if m.db_id != db {
             return Err(Error::internal("manifest belongs to another database"));
         }
-        let Some(id) = m.levels.clone() else { return Ok(Some(m)) };
+        let Some(id) = m.levels.clone() else { return Ok(Ok(m)) };
         if let Some(c) = current.filter(|c| c.m.levels.as_deref() == Some(id.as_str())) {
             m.segments.extend_from_slice(c.m.deep_segments());
             m.check_levels().map_err(Error::internal)?;
-            return Ok(Some(m));
+            return Ok(Ok(m));
         }
-        let Some(l) = self.levels(db, &id).await? else { return Ok(None) };
+        let Some(l) = self.levels(db, &id).await? else { return Ok(Err(LevelsMissing(id))) };
         m.attach_levels(&l)?;
-        Ok(Some(m))
+        Ok(Ok(m))
     }
 
     /// Levels object `id` of `db`, or `None` if it does not exist.
@@ -271,6 +272,12 @@ impl Shared {
         Ok(())
     }
 
+    /// Whether `seg` is small enough to be fetched, and kept in the local
+    /// tier, whole.
+    fn read_whole(&self, seg: &SegmentMeta) -> bool {
+        seg.size <= self.whole_fetch_max()
+    }
+
     fn whole_fetch_max(&self) -> u64 {
         self.cfg.segment_whole_fetch_max.max(FOOTER_LEN as u64)
     }
@@ -294,7 +301,7 @@ impl Shared {
         if let Some(CacheVal::Index(i)) = cached {
             return Ok((i, None));
         }
-        if seg.size <= self.whole_fetch_max() {
+        if self.read_whole(seg) {
             if mode == ReadMode::Bulk {
                 return self.whole_segment(db, seg).await.map(|(i, b)| (i, Some(b)));
             }
@@ -391,9 +398,7 @@ impl Shared {
             Err(e) => return e.into(),
         };
         match m {
-            Ok(Some(m)) if m.segments.iter().any(|s| s.id == seg) => {
-                Error::internal(format!("segment {seg} is missing"))
-            }
+            Ok(Ok(m)) if m.segments.iter().any(|s| s.id == seg) => Error::internal(format!("segment {seg} is missing")),
             Ok(_) => {
                 crate::probe::hit(crate::probe::Probe::SegmentCollectedUnderRead);
                 Error::unavailable("garbage collection removed a segment this read needed; retry")
@@ -418,8 +423,17 @@ impl Shared {
     }
 
     /// Whether block `bi` of `seg` is cached in memory or in the local tier.
-    fn block_cached(&self, db: &str, seg: &str, bi: usize) -> bool {
-        self.cache.contains(&CacheKey::block(db, seg, bi)) || self.local_has(db, seg, &format!("b{bi}"))
+    fn block_cached(&self, db: &str, seg: &SegmentMeta, bi: usize) -> bool {
+        let part = if self.read_whole(seg) { "all".to_string() } else { format!("b{bi}") };
+        self.cache.contains(&CacheKey::block(db, &seg.id, bi)) || self.local_has(db, &seg.id, &part)
+    }
+
+    /// Keeps block `bi` of `seg` in the local tier, unless `seg` is small
+    /// enough to be kept there only whole.
+    fn local_put_block(&self, db: &str, seg: &SegmentMeta, bi: usize, data: Bytes) {
+        if !self.read_whole(seg) {
+            self.local_put(db, &seg.id, &format!("b{bi}"), data);
+        }
     }
 
     pub(crate) async fn seg_block(&self, db: &str, seg: &SegmentMeta, idx: &SegmentIndex, bi: usize) -> Result<Block> {
@@ -436,7 +450,7 @@ impl Shared {
     /// `keep`. A small segment is cached locally whole, so all its blocks
     /// are cached again with it.
     async fn local_block(&self, db: &str, seg: &SegmentMeta, bi: usize, keep: bool) -> Option<Block> {
-        if seg.size <= self.whole_fetch_max() {
+        if self.read_whole(seg) {
             let data = self.local_get(db, &seg.id, "all").await?;
             if keep {
                 return self.cache_whole(db, &seg.id, &data).ok()?.1.into_iter().nth(bi);
@@ -460,7 +474,7 @@ impl Shared {
         }
         let b = segment::decode_block(g.data.clone())?;
         self.cache.insert(CacheKey::block(db, &seg.id, bi), CacheVal::Block(b.clone()));
-        self.local_put(db, &seg.id, &format!("b{bi}"), g.data);
+        self.local_put_block(db, seg, bi, g.data);
         Ok(b)
     }
 
@@ -489,12 +503,15 @@ impl Shared {
                 self.cache.insert(CacheKey::block(db, &seg.id, bi), CacheVal::Block(b.clone()));
                 let (_, off, len) = idx.blocks[bi];
                 let at = (off - span.start) as usize;
-                self.local_put(db, &seg.id, &format!("b{bi}"), g.data.slice(at..at + len as usize));
+                self.local_put_block(db, seg, bi, g.data.slice(at..at + len as usize));
             }
         }
         Ok(decoded)
     }
 }
+
+/// The id of a manifest's levels object that does not exist.
+pub(crate) struct LevelsMissing(pub String);
 
 /// A segment's index and, when it was just read whole, its decoded blocks.
 type Opened = (Arc<SegmentIndex>, Option<Vec<Block>>);
@@ -700,7 +717,7 @@ impl MergeIter {
             r.cur = Some(b.clone());
         } else if let Some(b) = self.shared.peek_block(&self.db, &meta.id, bi) {
             r.cur = Some(b);
-        } else if meta.size <= self.shared.whole_fetch_max() {
+        } else if self.shared.read_whole(meta) {
             let blocks = self.shared.whole_segment(&self.db, meta).await?.1;
             r.cur = Some(blocks.get(bi).cloned().ok_or(Error::internal("short segment"))?);
             r.whole = Some(blocks);
@@ -721,7 +738,7 @@ impl MergeIter {
             let span = idx.span(bi..next + 1);
             if next != end
                 || span.end - span.start > self.shared.cfg.bulk_read_bytes
-                || self.shared.block_cached(&self.db, &meta.id, next)
+                || self.shared.block_cached(&self.db, meta, next)
             {
                 break;
             }

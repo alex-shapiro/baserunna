@@ -3811,7 +3811,7 @@
     },
     "/v1/dbs/{db}/commits/{id}": {
       "get": {
-        "description": "Definitive at once: a commit not yet applied is aborted, so no attempt of it, in flight or sent later, applies (each fails with `409 aborted`); retry the write under a new idempotency key. Commit records are retained for 10 minutes.",
+        "description": "Definitive at once: a commit not yet applied is aborted, so no attempt of it, in flight or sent later, applies (each fails with `409 aborted`); retry the write under a new idempotency key. Requires write access, as aborting is a write. Commit records are retained for 10 minutes.",
         "parameters": [
           {
             "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
@@ -6231,7 +6231,7 @@
     },
     "/v1/dbs/{db}/txn": {
       "post": {
-        "description": "Operations execute in order with read-your-writes, atomically. Serializable by default; conflicts are retried server-side. With `idempotency_key`, retries are never applied twice (a replay returns `replayed: true` and null results). Once a commit status check, or a failed precondition, has resolved a key as not applied, attempts under it fail with `409 aborted`.",
+        "description": "Operations execute in order with read-your-writes, atomically. Serializable by default; conflicts are retried server-side. With `idempotency_key`, retries are never applied twice (a replay returns `replayed: true` and null results); a transaction without writes ignores the key. Once a commit status check, or a failed precondition, has resolved a key as not applied, attempts under it fail with `409 aborted`.",
         "parameters": [
           {
             "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",

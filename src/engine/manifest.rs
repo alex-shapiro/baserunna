@@ -17,7 +17,11 @@ const MAGIC: &[u8; 4] = b"BRMF";
 
 /// The database was deleted: every read and commit fails with not-found.
 pub const FLAG_DELETED: u64 = 1;
-const FORMAT: u16 = 6;
+const FORMAT: u16 = 7;
+/// Format 7 without the `flushes` count. Binaries that write it reject format 7, so a cluster
+/// cannot run both: all nodes are upgraded at once.
+const FORMAT_UNCOUNTED: u16 = 6;
+/// Format 6 without its codec byte, uncompressed.
 const FORMAT_RAW: u16 = 5;
 const ZSTD_LEVEL: i32 = 1;
 const MAX_BODY: u64 = 64 << 20;
@@ -275,8 +279,9 @@ impl Manifest {
     }
 
     /// The encoded body: what precedes the tail's entries, the entries in
-    /// pages, and what follows them. A page ends after a key whose hash ends
-    /// in `PAGE_KEY_BITS` zero bits, so inserting a key changes only its page.
+    /// pages, and what follows them. Pages end after keys whose hash has the
+    /// `PAGE_KEY_MASK` bits clear, so a write changes only the pages up to the
+    /// next such key.
     fn encode_parts(&self) -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
         let mut w = Writer::with_capacity(1024);
         w.str(&self.db_id);
@@ -364,10 +369,11 @@ impl Manifest {
         if r.take(4)? != MAGIC {
             return Err(DecodeError("bad manifest magic"));
         }
-        let src = match (r.u16()?, r.u8()) {
+        let format = r.u16()?;
+        let src = match (format, r.u8()) {
             (FORMAT_RAW, _) => src.slice(6..),
-            (FORMAT, Ok(0)) => src.slice(7..),
-            (FORMAT, Ok(1)) => {
+            (FORMAT | FORMAT_UNCOUNTED, Ok(0)) => src.slice(7..),
+            (FORMAT | FORMAT_UNCOUNTED, Ok(1)) => {
                 let n = r.varint()?;
                 if n > MAX_BODY {
                     return Err(DecodeError("manifest body too large"));
@@ -455,8 +461,7 @@ impl Manifest {
         let last_sweep_ms = r.varint()?;
         let blob_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
         let chunk_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
-        // Manifests written before flushes were counted end here.
-        let flushes = if r.is_empty() { 0 } else { r.varint()? };
+        let flushes = if format == FORMAT { r.varint()? } else { 0 };
         if !r.is_empty() {
             return Err(DecodeError("manifest trailing data"));
         }
@@ -687,13 +692,9 @@ mod tests {
     #[test]
     fn tail_pages_are_compressed_once() {
         let mut r = Rng::new(4);
-        let words = ["user", "active", "pending", "name", "email", "created", "status", "count"];
         let mut m = sample();
         m.tail = (0..2000u64)
-            .map(|i| {
-                let text: Vec<&str> = (0..40).map(|_| words[r.usize(words.len())]).collect();
-                Entry::new(Bytes::from(format!("k{i:05}")), i, Value::Inline(Bytes::from(text.join(" "))))
-            })
+            .map(|i| Entry::new(Bytes::from(format!("k{i:05}")), i, Value::Inline(Bytes::from(r.text(250)))))
             .collect();
         let mut pages = PageCache::default();
         let first = m.encode_with(&mut pages);
@@ -716,30 +717,27 @@ mod tests {
         assert!(kept + 6 >= frames.len(), "{kept} of {} pages kept their frames", frames.len());
     }
 
-    #[test]
-    fn format_5_manifests_are_read() {
-        let m = sample();
+    /// `m` encoded in an earlier format, whose body has no `flushes` count.
+    fn uncounted(m: &Manifest, format: u16) -> Bytes {
+        let body = Manifest { flushes: 0, ..m.clone() }.encode_body();
         let mut w = Writer::with_capacity(1024);
         w.raw(MAGIC);
-        w.u16(FORMAT_RAW);
-        w.raw(&m.encode_body());
-        let crc = crc32c(&w.buf);
-        w.u32(crc);
-        assert_eq!(Manifest::decode(&Bytes::from(w.into_inner())).unwrap(), m);
-    }
-
-    #[test]
-    fn manifests_without_a_flush_count_are_read() {
-        let m = Manifest { flushes: 0, ..sample() };
-        let body = m.encode_body();
-        let mut w = Writer::with_capacity(1024);
-        w.raw(MAGIC);
-        w.u16(FORMAT);
-        w.u8(0);
+        w.u16(format);
+        if format == FORMAT_UNCOUNTED {
+            w.u8(0);
+        }
         w.raw(&body[..body.len() - 1]);
         let crc = crc32c(&w.buf);
         w.u32(crc);
-        assert_eq!(Manifest::decode(&Bytes::from(w.into_inner())).unwrap(), m);
+        Bytes::from(w.into_inner())
+    }
+
+    #[test]
+    fn earlier_formats_are_read_without_a_flush_count() {
+        let m = Manifest { flushes: 0, ..sample() };
+        for format in [FORMAT_RAW, FORMAT_UNCOUNTED] {
+            assert_eq!(Manifest::decode(&uncounted(&m, format)).unwrap(), m, "format {format}");
+        }
     }
 
     #[test]

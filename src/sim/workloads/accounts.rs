@@ -60,6 +60,9 @@ async fn sessions(sim: &Arc<Sim>) -> Result<(), String> {
     let a = Client::signup(sim, "sess-a", email, "sess-password").await?;
     let b = Client::login(sim, "sess-b", email, "sess-password").await?;
     let c = Client::login(sim, "sess-c", email, "sess-password").await?;
+    // A login whose response was lost may still create a session until its
+    // commit deadline passes, as between two listings or after a revocation.
+    sim.sleep(ZOMBIE_WAIT_MS).await;
     let all = session_ids(&a, 100).await?;
     let paged = session_ids(&a, 1).await?;
     let ids = |v: &[Json]| v.iter().filter_map(|s| s["id"].as_str().map(|s| s.to_string())).collect::<BTreeSet<_>>();
@@ -80,9 +83,6 @@ async fn sessions(sim: &Arc<Sim>) -> Result<(), String> {
     cache_expiry(sim).await;
     expect(status(&b, "/v1/me").await == 401, "revoked session remained valid")?;
     expect(status(&c, "/v1/me").await == 200, "revoking session b terminated session c")?;
-    // A login whose response was lost may still create a session until its
-    // commit deadline passes, after a revocation of all other sessions.
-    sim.sleep(ZOMBIE_WAIT_MS).await;
     let r = a.call_settled("DELETE", "/v1/me/sessions", None).await;
     expect(r.status == 200, format!("revoke other sessions: {} {}", r.status, r.json))?;
     cache_expiry(sim).await;

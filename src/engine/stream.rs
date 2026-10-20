@@ -537,11 +537,9 @@ pub(crate) struct Sealer {
     run: Vec<(Entry, Record)>,
     run_bytes: usize,
     run_id: u64,
-    /// Chunks written, and their stored bytes.
-    pub chunks: u64,
-    pub sealed_bytes: u64,
-    /// The ids of the chunks written.
+    /// The ids of the chunks written, and their stored bytes.
     pub chunk_ids: Vec<String>,
+    pub sealed_bytes: u64,
 }
 
 impl Sealer {
@@ -552,9 +550,8 @@ impl Sealer {
             run: Vec::new(),
             run_bytes: 0,
             run_id: 0,
-            chunks: 0,
-            sealed_bytes: 0,
             chunk_ids: Vec::new(),
+            sealed_bytes: 0,
         }
     }
 
@@ -616,7 +613,6 @@ impl Sealer {
             min_time: first.time_ms,
             max_time: last.time_ms,
         };
-        self.chunks += 1;
         self.sealed_bytes += c.size;
         self.chunk_ids.push(c.id.clone());
         let version = run.iter().map(|(e, _)| e.seq).max().unwrap_or(first_e.seq);

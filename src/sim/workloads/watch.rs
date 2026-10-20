@@ -168,8 +168,9 @@ impl Watcher {
     /// `None` on transient error.
     async fn poll(&mut self, wait_ms: u64) -> Result<Option<bool>, String> {
         let p = format!("{BASE}/changes?after={}&limit={}&wait_ms={wait_ms}", self.cursor, 1 + self.c.rng().below(8));
+        // The server read the feed, and checked the cursor, between `sent` and `at`.
+        let sent = self.c.sim.now_ms();
         let Ok(r): Result<Resp, _> = self.c.call("GET", &p, None).await else { return Ok(None) };
-        // The server checked the cursor at some time before it answered.
         let at = self.c.sim.now_ms();
         match r.status {
             200 => {}
@@ -205,7 +206,7 @@ impl Watcher {
         self.cursor = r.json["next_cursor"].as_str().ok_or("missing next_cursor")?.to_string();
         let more = r.json["more"] == true;
         if !more {
-            self.cursor_at = at;
+            self.cursor_at = sent;
         }
         Ok(Some(changes.is_empty() && !more))
     }
@@ -250,6 +251,14 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
         return Err(e);
     }
     super::settle(&sim, phase).await;
+    // Faults could have lost every poll while the writer ran, so the feed must also deliver a
+    // write made once they have healed.
+    while watcher.poll(0).await? != Some(true) {
+        watcher.c.pause(100).await;
+    }
+    let last = Write::Put { key: "last".into(), value: "last".into(), ttl: false };
+    let (last_version, _) = commit(&watcher.c, json!([{"op": "put", "key": "last", "value": "last"}]), "last").await?;
+    log.lock().unwrap_or_else(|e| e.into_inner()).insert(last_version, vec![last]);
     // Wait for all TTL entries to expire before comparing state.
     watcher.c.pause(4_000 + eps).await;
     while watcher.poll(0).await? != Some(true) {
@@ -264,8 +273,8 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     for ch in &watcher.received {
         explained(ch, &log)?;
     }
-    if watcher.received.is_empty() {
-        return Err("the watcher received nothing".into());
+    if !watcher.received.iter().any(|ch| ch["version"].as_u64() == Some(last_version)) {
+        return Err(format!("the watcher did not receive the last write, at version {last_version}"));
     }
     Ok(())
 }

@@ -251,7 +251,7 @@ async fn merge(
     if !w.b.is_empty() {
         out.segments.push(write(shared, &m.db_id, w.b, level, m.version).await?);
     }
-    out.chunks += sealer.chunks;
+    out.chunks += sealer.chunk_ids.len() as u64;
     out.sealed_bytes += sealer.sealed_bytes;
     Ok(())
 }

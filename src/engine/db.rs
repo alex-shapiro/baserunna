@@ -13,7 +13,7 @@ use super::types::{
     ABORT_RECORD, CommitRecord, Entry, Seq, Value, commit_key, decode_commit_record, encode_commit_record,
     is_commit_key,
 };
-use super::version::{KeyRange, Snapshot, Version};
+use super::version::{KeyRange, LevelsMissing, Snapshot, Version};
 use super::{Shared, blob_prefix, levels_key, manifest_key, seg_key};
 use crate::buggify::buggify;
 use crate::error::{Error, Result};
@@ -156,8 +156,11 @@ impl Work {
 
 struct State {
     current: Option<Arc<Version>>,
-    /// False after an ambiguous write until the manifest is refreshed.
+    /// False after an ambiguous write until the manifest is read again by a read that began
+    /// after it ([`State::distrust`]).
     trusted: bool,
+    /// When `trusted` was last cleared.
+    distrusted_at: Option<Instant>,
     /// Start time of the most recent successful validation of `current`.
     verified_at: Option<Instant>,
     last_access: Instant,
@@ -169,6 +172,10 @@ struct State {
     /// Our lease, as of the manifest write (`write_seq`) that last renewed
     /// it, and the monotonic instant until which we may rely on it.
     own_lease: Option<(u64, Instant)>,
+    /// Manifest `PUT`s of this node that the committer stopped waiting for, which may still
+    /// land. Until they have, the node serves no read from its lease: the manifest it holds may
+    /// already be replaced in storage, and only a read from storage is current.
+    stray_puts: u32,
     compacting: bool,
     flushing: bool,
     sweeping: bool,
@@ -181,6 +188,13 @@ struct State {
 }
 
 impl State {
+    /// Stops trusting `current`, as after a manifest write that may have landed unseen, until a
+    /// read that begins from now installs a version.
+    fn distrust(&mut self) {
+        self.trusted = false;
+        self.distrusted_at = Some(Instant::now());
+    }
+
     /// Whether reads are frequent enough to pay for lease renewals.
     fn hot(&self, threshold: u32) -> bool {
         self.reads_in_window.max(self.reads_last_window) >= threshold
@@ -285,6 +299,7 @@ impl Db {
             st: Mutex::new(State {
                 current: None,
                 trusted: false,
+                distrusted_at: None,
                 verified_at: None,
                 last_access: now,
                 window_start: now,
@@ -292,6 +307,7 @@ impl Db {
                 reads_last_window: 0,
                 lease_requested: false,
                 own_lease: None,
+                stray_puts: 0,
                 compacting: false,
                 flushing: false,
                 sweeping: false,
@@ -422,7 +438,7 @@ impl Db {
     pub fn leased_view(&self) -> Option<(u64, String, bool)> {
         let st = self.st();
         let cur = st.current.as_ref()?;
-        (st.trusted && self.holds_lease(&st, &cur.m))
+        (st.trusted && st.stray_puts == 0 && self.holds_lease(&st, &cur.m))
             .then(|| (cur.m.write_seq, cur.etag.clone(), self.has_in_flight_write()))
     }
 
@@ -501,7 +517,11 @@ impl Db {
         }
     }
 
-    fn install(&self, v: Arc<Version>, verified: Option<Instant>) -> Arc<Version> {
+    /// Installs `v`, read from storage or written by this node at `verified`, unless a newer
+    /// version is installed. The installed version is trusted again only if `verified` is no
+    /// earlier than when trust was last lost: a read that began before an ambiguous write could
+    /// have missed it.
+    fn install(&self, v: Arc<Version>, verified: Instant) -> Arc<Version> {
         let mut st = self.st();
         self.shared.env.trace(|| {
             format!(
@@ -528,11 +548,11 @@ impl Db {
         if let Some(l) = installed.m.lease.as_ref().filter(|l| l.node != self.shared.node_id) {
             self.shared.lease_seen(&self.id, l, installed.m.write_seq);
         }
-        st.trusted = true;
-        if let Some(t) = verified
-            && st.verified_at.is_none_or(|old| t > old)
-        {
-            st.verified_at = Some(t);
+        if st.distrusted_at.is_none_or(|d| verified >= d) {
+            st.trusted = true;
+            if st.verified_at.is_none_or(|old| verified > old) {
+                st.verified_at = Some(verified);
+            }
         }
         installed
     }
@@ -557,7 +577,7 @@ impl Db {
             (st.current.as_ref().map(|c| c.etag.clone()), st.current.clone())
         };
         let key = manifest_key(&self.id);
-        let mut levels_missing_at: Option<String> = None;
+        let mut levels_missing: Option<String> = None;
         loop {
             let started = Instant::now();
             let res = self
@@ -568,29 +588,33 @@ impl Db {
             match res {
                 Err(StoreError::NotModified) => {
                     let c = cur.clone().ok_or_else(|| Error::internal("not modified without current"))?;
-                    return Ok((self.install(c, Some(started)), started));
+                    return Ok((self.install(c, started), started));
                 }
                 Ok(g) => {
-                    let Some(m) = self.shared.load_manifest(&self.id, &g.data, cur.as_deref()).await? else {
-                        // A newer manifest replaced this one, unless the same one comes back.
-                        if levels_missing_at.as_deref() == Some(g.etag.as_str()) {
-                            return Err(Error::internal("the manifest's levels object is missing"));
+                    let m = match self.shared.load_manifest(&self.id, &g.data, cur.as_deref()).await? {
+                        Ok(m) => m,
+                        // Collected after a newer manifest replaced this one, unless that one
+                        // references it too.
+                        Err(LevelsMissing(id)) if levels_missing.as_ref() != Some(&id) => {
+                            probe::hit(Probe::LevelsCollectedUnderRead);
+                            levels_missing = Some(id);
+                            continue;
                         }
-                        probe::hit(Probe::LevelsCollectedUnderRead);
-                        levels_missing_at = Some(g.etag);
-                        continue;
+                        Err(LevelsMissing(id)) => {
+                            return Err(Error::internal(format!("levels object {id} is missing")));
+                        }
                     };
                     let mut v = Version::new(m, g.etag, self.shared.clone());
                     v.stored_ms = Some(g.last_modified_ms);
                     let v = Arc::new(v);
-                    return Ok((self.install(v, Some(started)), started));
+                    return Ok((self.install(v, started), started));
                 }
                 Err(StoreError::NotFound) if create => {
                     let m = Manifest::new(&self.id, self.shared.time_ms(), self.shared.store_now_ms());
                     match self.shared.store.put(&key, m.encode(), PutMode::Create).await {
                         Ok(etag) => {
                             let v = Arc::new(Version::new(m, etag, self.shared.clone()));
-                            return Ok((self.install(v, Some(started)), started));
+                            return Ok((self.install(v, started), started));
                         }
                         // Created concurrently, or ambiguous: read it back.
                         Err(StoreError::PreconditionFailed) | Err(StoreError::Unavailable(_)) => {
@@ -712,7 +736,10 @@ impl Db {
         if buggify() {
             return None;
         }
-        let lease_left = if st.trusted { self.own_lease_left(&st, &cur.m) } else { Duration::ZERO };
+        let lease_left = match st.trusted && st.stray_puts == 0 {
+            true => self.own_lease_left(&st, &cur.m),
+            false => Duration::ZERO,
+        };
         let leased = !lease_left.is_zero();
         let fresh = match c {
             Consistency::Strong => leased,
@@ -853,15 +880,16 @@ impl Db {
         rx.await.map_err(|_| Error::unavailable("lease request interrupted"))?
     }
 
-    /// Releases this node's lease so other nodes can take over immediately.
-    pub async fn release_lease(self: &Arc<Self>) -> Result<()> {
+    /// Releases this node's lease so other nodes can take over immediately. Returns whether
+    /// this node held the lease, and released it.
+    pub async fn release_lease(self: &Arc<Self>) -> Result<bool> {
         let held = self.current().is_some_and(|c| c.m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id));
         if !held {
-            return Ok(());
+            return Ok(false);
         }
         let (tx, rx) = oneshot::channel();
         self.enqueue(Work::Lease { release: true, for_reads: false, tx: Some(tx) });
-        rx.await.map_err(|_| Error::unavailable("lease release interrupted"))?
+        rx.await.map_err(|_| Error::unavailable("lease release interrupted"))?.map(|()| true)
     }
 
     /// Reads the record of commit `id` as of a strong read: how it applied,
@@ -1009,7 +1037,13 @@ impl Db {
                 let e = Error::NotOwner { holder, retry_after_ms: left.as_millis() as u64 };
                 probe::hit(if maybe_applied { Probe::CommitUnknownAfterLeaseMoved } else { Probe::CommitNotOwner });
                 let e = if maybe_applied { unknown(e) } else { e };
-                self.finish_failed(batch, e);
+                self.fail_batch(&base, batch, e).await;
+                return;
+            }
+            if self.shared.stopping() && !base.m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id) {
+                let e = Error::unavailable("this node is shutting down");
+                let e = if maybe_applied { unknown(e) } else { e };
+                self.fail_batch(&base, batch, e).await;
                 return;
             }
             let build_started = Instant::now();
@@ -1019,7 +1053,7 @@ impl Db {
                 Ok(p) => p,
                 Err(e) => {
                     let e = if maybe_applied { unknown(e) } else { e };
-                    self.finish_failed(batch, e);
+                    self.fail_batch(&base, batch, e).await;
                     return;
                 }
             };
@@ -1052,14 +1086,12 @@ impl Db {
             self.limit_own_lease(&m, attempt_started);
             self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let data = m.encode_with(&mut self.pages.lock().unwrap_or_else(|e| e.into_inner()));
-            let (res, still_in_flight) = self.put_manifest(data, &base.etag).await;
+            let res = self.put_manifest(data, &base.etag).await;
             if !res.is_ok() {
                 if matches!(res, Err(StoreError::Unavailable(_))) {
-                    self.st().trusted = false;
+                    self.st().distrust();
                 }
-                if !still_in_flight {
-                    self.write_finished();
-                }
+                self.write_finished();
             }
             match res {
                 Ok(etag) => {
@@ -1069,7 +1101,7 @@ impl Db {
                     }
                     self.shared.env.crash_point().await;
                     let v = Arc::new(Version::new(m, etag, self.shared.clone()));
-                    let v = self.install(v, Some(started));
+                    let v = self.install(v, started);
                     self.write_finished();
                     self.shared.env.trace(|| {
                         format!("{} committed v{} ws{} lease={:?}", self.id, v.m.version, v.m.write_seq, v.m.lease)
@@ -1090,7 +1122,7 @@ impl Db {
                     }
                     maybe_applied = true;
                     unknown_writes.push((m.write_seq, attempt_started, base.etag.clone()));
-                    self.st().trusted = false;
+                    self.st().distrust();
                     // If the write was applied, `plan.gc` was removed from `obsolete` in the manifest.
                     // These objects have already passed their grace period, so they can be deleted safely
                     // even if the write failed.
@@ -1099,7 +1131,7 @@ impl Db {
                 Err(e) => {
                     let e: Error = e.into();
                     let e = if maybe_applied { unknown(e) } else { e };
-                    self.finish_failed(batch, e);
+                    self.fail_batch(&base, batch, e).await;
                     return;
                 }
             }
@@ -1110,7 +1142,7 @@ impl Db {
                     retry_after_ms: Some(100),
                     outcome_unknown: maybe_applied,
                 };
-                self.finish_failed(batch, e);
+                self.fail_batch(&base, batch, e).await;
                 return;
             }
             let delay = 5 * (1u64 << attempt.min(6)) + self.shared.env.random_below(10);
@@ -1140,7 +1172,7 @@ impl Db {
                         attempt += 1;
                         if attempt >= cfg.commit_retry_max {
                             let e = if maybe_applied { unknown(e) } else { e };
-                            self.finish_failed(batch, e);
+                            self.fail_batch(&base, batch, e).await;
                             return;
                         }
                         tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -1148,6 +1180,33 @@ impl Db {
                 }
             }
         }
+    }
+
+    /// Fails `batch` with `e`, but first answers each commit that `base`, the last manifest the
+    /// batch read, decides: a commit it records as applied or aborted is settled whatever becomes
+    /// of the batch's own writes, and must not be reported failed, or its outcome unknown.
+    async fn fail_batch(self: &Arc<Self>, base: &Version, batch: Vec<Work>, e: Error) {
+        let mut rest = Vec::with_capacity(batch.len());
+        for w in batch {
+            let decided = match &w {
+                Work::Commit { req, .. } => commit_state(base, None, req.commit_id).await.ok().flatten(),
+                _ => None,
+            };
+            match (decided, &w) {
+                (Some(CommitState::Applied(c)), Work::Commit { req, .. }) => {
+                    probe::hit(Probe::DecidedCommitAnswered);
+                    self.schedule_trims(req.writes.streams.iter().map(StreamOp::id).collect());
+                    w.deliver(Outcome::Seq(Ok(c)));
+                }
+                (Some(CommitState::Aborted), Work::Commit { req, .. }) => {
+                    probe::hit(Probe::DecidedCommitAnswered);
+                    let id = req.commit_id;
+                    w.deliver(Outcome::Seq(Err(aborted(id))));
+                }
+                _ => rest.push(w),
+            }
+        }
+        self.finish_failed(rest, e);
     }
 
     /// Whether `v` may hold the effects of `batch`: records of the commit of
@@ -1171,9 +1230,9 @@ impl Db {
     /// Writes the manifest with `If-Match: etag`, sending a duplicate `PUT` if the first does not
     /// complete within `manifest_put_hedge_ms`. If the duplicate fails with `PreconditionFailed`
     /// while the first `PUT` is still in flight, returns `StoreError::Unavailable` immediately
-    /// because the first `PUT` may have been applied, and leaves the write in flight (see
-    /// [`Db::write_finished`]) until the first `PUT` completes: its outcome then reports `true`.
-    async fn put_manifest(self: &Arc<Self>, data: Bytes, etag: &str) -> (crate::store::SResult<String>, bool) {
+    /// because the first `PUT` may have been applied, and counts the first `PUT` as a stray
+    /// (`State::stray_puts`) until it completes.
+    async fn put_manifest(self: &Arc<Self>, data: Bytes, etag: &str) -> crate::store::SResult<String> {
         let (store, key, etag) = (self.shared.store.clone(), manifest_key(&self.id), etag.to_string());
         let put = || -> crate::store::BoxFut<'static, crate::store::SResult<String>> {
             let (store, key, data, etag) = (store.clone(), key.clone(), data.clone(), etag.clone());
@@ -1185,12 +1244,12 @@ impl Db {
         }
         let mut first = put();
         if hedge_ms == 0 {
-            return (first.await, false);
+            return first.await;
         }
         if let Either::Left(r) =
             race(&mut first, &mut Box::pin(tokio::time::sleep(Duration::from_millis(hedge_ms)))).await
         {
-            return (r, false);
+            return r;
         }
         probe::hit(Probe::ManifestPutHedged);
         let ambiguous =
@@ -1205,27 +1264,30 @@ impl Db {
                 if hedge_won {
                     probe::hit(Probe::HedgeWon);
                 }
-                return (Ok(etag), false);
+                return Ok(etag);
             }
             Err(StoreError::PreconditionFailed) if hedge_won => {
                 probe::hit(Probe::HedgeRejectedFirstInFlight);
-                // Until the first write lands or fails, other nodes may see it while this one
-                // could serve reads from the manifest it replaces.
+                self.st().stray_puts += 1;
                 let me = self.clone();
                 self.shared.env.spawn(async move {
-                    let _ = first.await;
-                    me.write_finished();
+                    let landed = !matches!(first.await, Err(StoreError::PreconditionFailed));
+                    let mut st = me.st();
+                    st.stray_puts -= 1;
+                    // The manifest this node holds may have been read before the write replaced it.
+                    if landed {
+                        st.distrust();
+                    }
                 });
-                return (Err(ambiguous()), true);
+                return Err(ambiguous());
             }
             Err(e) => e,
         };
-        let r = match (e, if hedge_won { first.await } else { hedge.await }) {
+        match (e, if hedge_won { first.await } else { hedge.await }) {
             (_, Ok(etag)) => Ok(etag),
             (StoreError::Unavailable(_), _) | (_, Err(StoreError::Unavailable(_))) => Err(ambiguous()),
             (e, Err(_)) => Err(e),
-        };
-        (r, false)
+        }
     }
 
     fn write_finished(&self) {
@@ -1268,7 +1330,7 @@ impl Db {
         let mut data_changed = false;
         let mut meta_changed = false;
         let mut release = false;
-        let (mut sealed, mut flushed_tail, mut sealed_in_place) = (0, false, false);
+        let mut flush_tally = FlushTally::default();
         let mut lease_ms = cfg.lease_ms;
         let quota = self.quota();
         let mut size = base.m.stored_bytes();
@@ -1284,7 +1346,15 @@ impl Db {
                 .collect();
             return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: None, due });
         }
+        // Background work is planned under this node's lease, and must not take back a lease the
+        // node released, as on shutdown, or one that lapsed.
+        let leased = base.m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id);
         for w in batch {
+            if !leased && matches!(w, Work::Compaction { .. } | Work::Flush { .. } | Work::Obsolete { .. }) {
+                probe::hit(Probe::BackgroundInstallUnleased);
+                outcomes.push(Outcome::Unit(Err(Error::Conflict("the lease it was planned under ended".into()))));
+                continue;
+            }
             match w {
                 Work::Commit { req, .. } => {
                     let record = commit_key(req.commit_id);
@@ -1488,38 +1558,14 @@ impl Db {
                         || flushed.segments.iter().any(|f| m.obsolete.iter().any(|o| o.id == f.id))
                         || *started_ms + cfg.orphan_grace_ms
                             <= now_ms + bind_margin_ms(cfg) + cfg.clock_sync_max_error_ms;
-                    self.shared.env.trace(|| {
-                        let segs: Vec<&str> = flushed.segments.iter().map(|s| s.id.as_str()).collect();
-                        let keep = flushed.keep.as_ref().map(Vec::len);
-                        format!(
-                            "{} flush through v{through} segments {segs:?} keep {keep:?} superseded={superseded}",
-                            self.id
-                        )
-                    });
                     if superseded {
+                        self.shared.env.trace(|| format!("{} flush through v{through} superseded", self.id));
                         probe::hit(Probe::FlushSuperseded);
                         outcomes.push(Outcome::Unit(Err(Error::Conflict("flush superseded".into()))));
                         continue;
                     }
-                    tail.retain(|_, e| e.seq > *through);
-                    match &flushed.keep {
-                        Some(keep) => {
-                            for e in keep {
-                                let deleted = m.range_deletes.iter().any(|t| t.seq > e.seq && t.contains_key(&e.key));
-                                if !deleted && !tail.contains_key(&e.key) {
-                                    tail.insert(e.key.clone(), e.clone());
-                                }
-                            }
-                            sealed_in_place = true;
-                        }
-                        None => {
-                            m.segments.splice(0..0, flushed.segments.iter().cloned());
-                            flushed_tail = true;
-                        }
-                    }
-                    sealed += flushed.chunks;
-                    m.chunk_bytes.bound += flushed.sealed_bytes;
-                    m.flushes += 1;
+                    self.trace_flush("background", flushed, *through);
+                    flushed.install(&mut m, &mut tail, *through, &mut flush_tally);
                     meta_changed = true;
                     outcomes.push(Outcome::Unit(Ok(())));
                 }
@@ -1639,39 +1685,22 @@ impl Db {
         };
         let sync_flush = m.tail_bytes() > TAIL_SYNC_FLUSH_FACTOR * cfg.tail_max_bytes;
         if sync_flush || (!m.tail.is_empty() && crate::buggify::fires(0.05)) {
-            let f = flush_tail(&self.shared, &self.id, &std::mem::take(&mut m.tail), m.version).await?;
+            let (entries, through) = (std::mem::take(&mut m.tail), m.version);
+            let f = flush_tail(&self.shared, &self.id, &entries, through).await?;
             probe::hit(Probe::TailFlushedInCommit);
-            m.flushes += 1;
-            self.shared.env.trace(|| {
-                let segs: Vec<&str> = f.segments.iter().map(|s| s.id.as_str()).collect();
-                format!(
-                    "{} flush in commit v{} segments {segs:?} keep {:?}",
-                    self.id,
-                    m.version,
-                    f.keep.as_ref().map(Vec::len)
-                )
-            });
-            m.chunk_bytes.bound += f.sealed_bytes;
-            sealed += f.chunks;
-            match f.keep {
-                Some(keep) => {
-                    m.tail = keep;
-                    sealed_in_place = true;
-                }
-                None => {
-                    flushed_tail = true;
-                    m.segments.splice(0..0, f.segments);
-                }
-            }
+            self.trace_flush("in commit", &f, through);
+            let mut rest = BTreeMap::new();
+            f.install(&mut m, &mut rest, through, &mut flush_tally);
+            m.tail = rest.into_values().collect();
         }
         m.write_seq += 1;
         let probes: [(Probe, u64); 11] = [
             (Probe::RangeTombstoneWritten, m.range_deletes.iter().filter(|t| t.seq > base.m.version).count() as u64),
             (Probe::RangeTombstoneRetired, retired),
             (Probe::EntriesExpired, expired),
-            (Probe::ChunkSealedAtFlush, sealed),
-            (Probe::TailFlushed, flushed_tail as u64),
-            (Probe::TailSealedInPlace, sealed_in_place as u64),
+            (Probe::ChunkSealedAtFlush, flush_tally.chunks),
+            (Probe::TailFlushed, flush_tally.to_segments as u64),
+            (Probe::TailSealedInPlace, flush_tally.in_place as u64),
             (Probe::TailTombstonesPurged, purged_tombstones),
             (Probe::CommitBatched, (accepted.len() >= 2) as u64),
             (Probe::LeaseTakeover, takeover as u64),
@@ -1733,7 +1762,7 @@ impl Db {
         }
         {
             let mut st = self.st();
-            if st.flushing {
+            if st.flushing || !self.holds_lease(&st, &v.m) {
                 return;
             }
             st.flushing = true;
@@ -1801,6 +1830,14 @@ impl Db {
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn trace_flush(&self, how: &str, f: &Flushed, through: Seq) {
+        self.shared.env.trace(|| {
+            let segs: Vec<&str> = f.segments.iter().map(|s| s.id.as_str()).collect();
+            let keep = f.keep.as_ref().map(Vec::len);
+            format!("{} flush {how} through v{through} segments {segs:?} keep {keep:?}", self.id)
+        });
     }
 
     /// Holds `w` until the next commit, to install it in the same manifest
@@ -2140,10 +2177,44 @@ struct Flushed {
     /// When sealing stream records into chunks left little else, the entries
     /// that replace the tail instead, with the sealed records' chunk references.
     keep: Option<Vec<Entry>>,
-    /// Chunks sealed, their stored bytes, and their ids.
-    chunks: u64,
-    sealed_bytes: u64,
+    /// The ids of the chunks sealed, and their stored bytes.
     chunk_ids: Vec<String>,
+    sealed_bytes: u64,
+}
+
+impl Flushed {
+    /// Installs this flush of the tail of version `through` in `m`, whose tail
+    /// is being built in `tail`: removes the flushed entries from `tail`, and
+    /// adds the segments to level 0 or puts back the entries sealing left.
+    fn install(&self, m: &mut Manifest, tail: &mut BTreeMap<Bytes, Entry>, through: Seq, tally: &mut FlushTally) {
+        tail.retain(|_, e| e.seq > through);
+        match &self.keep {
+            Some(keep) => {
+                for e in keep {
+                    let deleted = m.range_deletes.iter().any(|t| t.seq > e.seq && t.contains_key(&e.key));
+                    if !deleted && !tail.contains_key(&e.key) {
+                        tail.insert(e.key.clone(), e.clone());
+                    }
+                }
+                tally.in_place = true;
+            }
+            None => {
+                m.segments.splice(0..0, self.segments.iter().cloned());
+                tally.to_segments = true;
+            }
+        }
+        tally.chunks += self.chunk_ids.len() as u64;
+        m.chunk_bytes.bound += self.sealed_bytes;
+        m.flushes += 1;
+    }
+}
+
+/// What the flushes a manifest write installs did, for probes.
+#[derive(Default)]
+struct FlushTally {
+    chunks: u64,
+    to_segments: bool,
+    in_place: bool,
 }
 
 /// Writes the entries of `tail`, the tail of version `version`, to level 0:
@@ -2161,11 +2232,11 @@ async fn flush_tail(shared: &Shared, db: &str, tail: &[Entry], version: Seq) -> 
     }
     sealer.finish(shared, db, &mut data).await?;
     let commit_records = &tail[split..];
-    let (chunks, sealed_bytes, chunk_ids) = (sealer.chunks, sealer.sealed_bytes, sealer.chunk_ids);
+    let (chunk_ids, sealed_bytes) = (sealer.chunk_ids, sealer.sealed_bytes);
     let rest: usize = data.iter().chain(commit_records).map(Entry::size).sum();
-    if chunks > 0 && rest <= cfg.tail_max_bytes / 2 {
+    if !chunk_ids.is_empty() && rest <= cfg.tail_max_bytes / 2 {
         let keep = Some(data.into_iter().chain(commit_records.iter().cloned()).collect());
-        return Ok(Flushed { segments: Vec::new(), keep, chunks, sealed_bytes, chunk_ids });
+        return Ok(Flushed { segments: Vec::new(), keep, chunk_ids, sealed_bytes });
     }
     let write = |part: &[Entry]| {
         let mut b = SegmentBuilder::new(cfg.block_target, cfg.compression);
@@ -2181,7 +2252,7 @@ async fn flush_tail(shared: &Shared, db: &str, tail: &[Entry], version: Seq) -> 
     };
     let (data, records) = tokio::join!(write(&data), write(commit_records));
     let segments = [data?, records?].into_iter().flatten().collect();
-    Ok(Flushed { segments, keep: None, chunks, sealed_bytes, chunk_ids })
+    Ok(Flushed { segments, keep: None, chunk_ids, sealed_bytes })
 }
 
 /// A flush found superseded after an ambiguous write of its batch may be
@@ -2385,8 +2456,9 @@ mod tests {
 
     async fn plan(segments: &[SegmentMeta], obsolete: Vec<Obsolete>, batch: Vec<Work>) -> Plan {
         let (eng, _, _) = engine(1, EngineConfig::small_for_tests());
+        let lease = Some(Lease { node: eng.shared.node_id.clone(), expires_ms: 5_000, ms: 5_000 });
         let mut m =
-            Manifest { segments: segments.to_vec(), obsolete, compaction_seq: 2, ..Manifest::new("d", 0, None) };
+            Manifest { segments: segments.to_vec(), obsolete, compaction_seq: 2, lease, ..Manifest::new("d", 0, None) };
         m.sort_segments();
         let mut batch = batch;
         for w in &mut batch {
@@ -2459,7 +2531,7 @@ mod tests {
         let ok = || Ok::<_, StoreError>("e2".to_string());
         let down = || Unavailable("timeout".into());
         let fatal = || Fatal("403".into());
-        // (first, hedge, outcome, time taken, whether the first write is left in flight)
+        // (first, hedge, outcome, time taken, whether the first write is left a stray)
         let cases = [
             ((100, ok()), None, Ok(()), 100, false),
             ((1_000, ok()), Some((10, Err(Refused))), Err(down()), 260, true),
@@ -2478,10 +2550,10 @@ mod tests {
                 let env = Arc::new(crate::env::Env::sim(1, 1_700_000_000_000, origin, 0));
                 let cfg = EngineConfig { manifest_put_hedge_ms: 250, ..EngineConfig::small_for_tests() };
                 let eng = crate::engine::Engine::new(Arc::new(script), env, cfg, "n".into());
-                let (got, still) = eng.db("d").put_manifest(Bytes::from_static(b"m"), "e1").await;
-                let got = got.map(drop);
+                let db = eng.db("d");
+                let got = db.put_manifest(Bytes::from_static(b"m"), "e1").await.map(drop);
                 let case = format!("first {first:?}, hedge {hedge:?}");
-                assert_eq!(still, in_flight, "{case}");
+                assert_eq!(db.st().stray_puts, u32::from(in_flight), "{case}");
                 match (&got, &want) {
                     (Err(Unavailable(_)), Err(Unavailable(_))) => {}
                     _ => assert_eq!(got, want, "{case}"),
@@ -2525,7 +2597,8 @@ mod tests {
         rt().block_on(async {
             let (eng, _, _) = engine(1, EngineConfig::small_for_tests());
             let ob = |c: char| Obsolete { kind: ObjKind::Segment, id: c.to_string().repeat(32), since_ms: 0 };
-            let m = Manifest { obsolete: vec![ob('a'), ob('b')], ..Manifest::new("d", 0, None) };
+            let lease = Some(Lease { node: eng.shared.node_id.clone(), expires_ms: 5_000, ms: 5_000 });
+            let m = Manifest { obsolete: vec![ob('a'), ob('b')], lease, ..Manifest::new("d", 0, None) };
             let base = Version::new(m, String::new(), eng.shared.clone());
             let (tx, _) = oneshot::channel();
             let sweep = Work::Obsolete { items: vec![ob('c')], blob_bytes: (0, 0), chunk_bytes: (0, 0), tx };

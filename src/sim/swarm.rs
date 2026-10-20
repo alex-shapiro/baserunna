@@ -145,6 +145,7 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
             storm_ms: k.log_range("chaos.storm_ms", 2_000, 120_000),
             calm_ms: k.log_range("chaos.calm_ms", 1_000, 30_000),
             crash: k.weight("chaos.crash"),
+            stop: k.weight("chaos.stop"),
             start: k.weight("chaos.start"),
             partition: k.weight("chaos.partition"),
             one_way_partition: k.weight("chaos.one_way_partition"),

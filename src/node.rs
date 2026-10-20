@@ -411,30 +411,40 @@ impl Node {
         self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Releases held database leases, leaves the cluster, and aborts background tasks.
-    pub async fn shutdown(&self) {
-        for db in self.engine.open_dbs() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), db.release_lease()).await;
-        }
+    /// Leaves the cluster, releases held database leases, and aborts background tasks. Leaving
+    /// writes the system database, so it comes first: once the node releases its leases, it
+    /// takes none again. Returns the databases whose leases it released.
+    pub async fn shutdown(&self) -> Vec<String> {
+        self.drain();
         let leave = self.run_meta(MetaCmd::Leave { id: self.id.clone() });
         let _ = tokio::time::timeout(Duration::from_secs(2), leave).await;
+        let released = self.engine.release_leases(Duration::from_secs(2)).await;
         self.env.shutdown();
+        released
     }
 
     pub fn members(&self) -> Vec<NodeRecord> {
         lock(&self.members).clone()
     }
 
-    /// Returns this node and the non-suspect cluster members with a recent heartbeat,
-    /// excluding any previous member entry that shares this node's address. This node
-    /// counts even before its heartbeat is seen, or while its clock makes it look stale.
+    /// Returns this node, unless it is draining, and the non-suspect cluster members with a
+    /// recent heartbeat, excluding any previous member entry that shares this node's address.
+    /// This node counts even before its heartbeat is seen, or while its clock makes it look
+    /// stale; a draining node takes on no new databases.
     pub fn live_members(&self) -> Vec<NodeRecord> {
         let now = self.now_ms() as i64;
         let mut live: Vec<NodeRecord> = cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
             .into_iter()
             .filter(|n| n.id != self.id && !self.is_suspect(&n.id) && n.addr != self.cfg.addr)
             .collect();
-        live.push(NodeRecord { id: self.id.clone(), addr: self.cfg.addr.clone(), started_at: 0, heartbeat_at: now });
+        if !self.draining() {
+            live.push(NodeRecord {
+                id: self.id.clone(),
+                addr: self.cfg.addr.clone(),
+                started_at: 0,
+                heartbeat_at: now,
+            });
+        }
         live
     }
 

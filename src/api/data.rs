@@ -500,7 +500,9 @@ async fn one_shot(
         return Err(Error::invalid("transactions with writes must use strong consistency"));
     }
     let octx = op_ctx(&node, &ctx, req.encoding);
-    let key = req.idempotency_key.as_deref();
+    // A request without writes commits nothing, so its key has nothing to deduplicate, and
+    // must not resolve (abort) a commit of that key, which only a writer may do.
+    let key = req.idempotency_key.as_deref().filter(|_| writes);
     let (commit_id, ran) = run_txn!(node, ctx, req.isolation.into(), c, key, |t| exec_ops(&octx, t, &req.ops).await);
     node.env.crash_point().await;
     Ok(axum::Json(match ran {
@@ -687,6 +689,8 @@ async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
 }
 
 async fn commit_status(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
+    // Resolving a commit that has not applied aborts it, which is a write.
+    ctx.require_write()?;
     let id = param(&p, "id")?;
     let cid = match id.strip_prefix("key:") {
         Some(k) => commit_id_for_key(&ctx.rec.id, k),

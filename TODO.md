@@ -25,6 +25,47 @@ design context.
 - [ ] **Publish release binaries and a container image.** Build and publish
       release binaries and a container image so external test suites can run
       a local node in CI.
+- [ ] **Bound store clock probes by time.** One stalled probe request holds
+      the node-wide `StoreClock::sync` lock until the stall ends (up to the
+      store's request timeout), blocking every caller of `store_time_ms`:
+      sweeps, flushes, compactions, and commits that use TTLs or blobs. A
+      probe slower than about `2 × clock_sync_max_error_ms` is discarded as
+      too imprecise anyway, so it can time out at that bound and count as an
+      imprecise attempt.
+- [ ] **Keep retention trims scheduled while the store clock is unknown.**
+      `trim_for_retention` returns without trimming when the node has no
+      recent store clock measurement, and nothing retries the trim until the
+      stream's next append or the next sweep, so a quiet stream can stay past
+      its retention for a sweep interval.
+- [ ] **Count the holder's lease from the manifest `PUT`, not the attempt.**
+      The committer records its own lease as starting when the commit attempt
+      began (`note_own_lease(&m, attempt_started)`), so time spent before the
+      `PUT`, such as a commit that flushes the tail itself and writes segments
+      first, is lost from the lease. Peers count a lease only from when they
+      observe it, after the `PUT` is sent, so the send time is the safe start.
+      A commit can otherwise land holding no usable lease, and the sweep or
+      compaction it triggers stops at once; simulation seed `mix 60000297`
+      (with the `chaos.stop` knob) fails this way, after buggify delays two
+      commits' writes by most of a lease.
+- [ ] **Bound the memory of open database handles.** Each open handle keeps
+      its current manifest, with a tail of up to four times `tail_max_bytes`,
+      and, on the node that commits to it, the compressed tail pages of its
+      last manifest write; only idle eviction (`db_idle_evict_ms`) limits how
+      many are open, so a node serving many busy databases has no memory
+      ceiling for them, unlike the block cache. Counting them against a budget
+      and evicting the least recently used handles would give one.
+- [ ] **Release leases concurrently on shutdown.** `Engine::release_leases`
+      releases one database at a time, a manifest write each, allowing each
+      up to 2 s, so shutdown time grows with the number of open databases,
+      and a process manager that kills the node first leaves the remaining
+      leases to expire.
+- [ ] **Wait for a hedged write's first `PUT` before reporting an unknown
+      outcome.** When the duplicate of a hedged manifest write is refused
+      while the first is still in flight, the attempt counts as ambiguous; if
+      retries run out then, the batch reports `outcome: "unknown"` although
+      the first `PUT`'s answer would settle it. `put_manifest` could hand back
+      the pending request instead of spawning it, for the committer to await
+      before giving up.
 
 ## Performance
 
@@ -94,6 +135,25 @@ design context.
 - [ ] **Run mutation testing in CI**, running `scripts/mutants.sh --in-diff` on
       pull requests and the full suite weekly.
 - [ ] **Track cost and throughput benchmarks in CI** across commits.
+- [ ] **Derive simulation timing checks from the fault model, and classify
+      failures.** Checks that wait a fixed time for the cluster to settle
+      (idle handles closed, a change reaching a watcher, a retention trim)
+      fail when one simulated store stall outlasts the wait, and such false
+      failures hide real ones that look alike, such as a commit wrongly
+      reported with an unknown outcome. Deadlines should follow from stall,
+      lease and housekeeping durations, and campaign reports should tell
+      safety failures from timing ones.
+- [ ] **Reach every rare probe on purpose, and require probes in CI.**
+      Probes in `Probe::RARE` are exempt from the coverage test, and
+      campaigns fail on unreached probes only with `SIM_REQUIRE_PROBES` set.
+      `PreconditionExplainedByReplay` and `RetentionTrimLeftToOwner` went
+      unreached in campaigns of about 100,000 runs, leaving their code paths
+      unsimulated. Each rare probe should name a workload or knob setting
+      that reaches it, checked by a targeted campaign.
+- [ ] **Report the knobs a scenario overrides.** Scenarios such as
+      `db_churn` overwrite swarm-drawn configuration (`db_idle_evict_ms`)
+      after the draw, so the knobs line of a trace shows values the run did
+      not use.
 - [ ] **Improve guided exploration breadth.** At equal run counts, guided
       exploration reaches rare probes more frequently than a random campaign
       but covers fewer distinct features (SPEC §13.4), and failures cluster in

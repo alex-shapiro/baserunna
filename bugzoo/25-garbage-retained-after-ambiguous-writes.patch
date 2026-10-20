@@ -1,10 +1,10 @@
 diff --git a/src/engine/db.rs b/src/engine/db.rs
-index 3a4eb24..1c94007 100644
+index b79fa1b..c74388c 100644
 --- a/src/engine/db.rs
 +++ b/src/engine/db.rs
-@@ -959,10 +959,6 @@ impl Db {
+@@ -1082,10 +1082,6 @@ impl Db {
                      maybe_applied = true;
-                     unknown_writes.push((m.write_seq, attempt_started));
+                     unknown_writes.push((m.write_seq, attempt_started, base.etag.clone()));
                      self.st().trusted = false;
 -                    // If the write was applied, `plan.gc` was removed from `obsolete` in the manifest.
 -                    // These objects have already passed their grace period, so they can be deleted safely

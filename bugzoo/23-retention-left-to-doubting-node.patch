@@ -1,10 +1,10 @@
 diff --git a/src/engine/db.rs b/src/engine/db.rs
-index 0e2dd5a..7581cf5 100644
+index b79fa1b..96ba0ea 100644
 --- a/src/engine/db.rs
 +++ b/src/engine/db.rs
-@@ -1175,12 +1175,6 @@ impl Db {
-                     };
-                     if let Some(c) = applied {
+@@ -1287,12 +1287,6 @@ impl Db {
+                     }
+                     if let Some(CommitState::Applied(c)) = state {
                          probe::hit(Probe::CommitReplayed);
 -                        let at = pending(base, &m, &tail);
 -                        for id in req.writes.streams.iter().map(StreamOp::id) {
@@ -15,7 +15,7 @@ index 0e2dd5a..7581cf5 100644
                          outcomes.push(Outcome::Seq(Ok(c)));
                          continue;
                      }
-@@ -1600,6 +1594,9 @@ impl Db {
+@@ -1864,6 +1858,9 @@ impl Db {
      async fn trim_for_retention(self: &Arc<Self>, id: u64) -> Result<()> {
          let Some(now) = self.shared.store_now_ms() else { return Ok(()) };
          let Some(v) = self.current() else { return Ok(()) };

@@ -275,6 +275,12 @@ async fn role_changes(sim: &Arc<Sim>, owner: &User, others: &[User; 3]) -> Resul
         set_role(&owner.c, "acme", &others[i], role).await?;
         change(i, sent, role);
     }
+    // Writes can all fail transiently under faults; keep writing until one is decided.
+    let decided = |a: &Attempt| matches!(a.status, 200 | 403 | 404);
+    let until = sim.now_ms() + 60_000;
+    while sim.now_ms() < until && !attempts.lock().unwrap_or_else(|e| e.into_inner()).iter().any(decided) {
+        sim.sleep(500).await;
+    }
     done.store(true, std::sync::atomic::Ordering::SeqCst);
     for w in writers {
         w.await.map_err(|e| format!("writer panicked: {e}"))?;

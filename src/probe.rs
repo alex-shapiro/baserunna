@@ -39,6 +39,23 @@ probes! {
     CommitReplayed,
     /// A transaction was rejected because its commit deadline had passed.
     CommitDeadlinePassed,
+    /// A commit flushed the tail itself, as background flushes fell behind.
+    TailFlushedInCommit,
+    /// A background flush of the tail was installed.
+    TailFlushedInBackground,
+    /// A background flush was rejected because the tail moved on in a way it cannot follow.
+    FlushSuperseded,
+    /// A background flush was found installed by an earlier ambiguous write.
+    FlushInstallReplayed,
+    /// After an ambiguous manifest write, the manifest moved past the etag the write
+    /// named, settling whether the batch applied.
+    AmbiguousWriteSettled,
+    /// A retention trim that failed with a retryable error was retried.
+    RetentionTrimRetried,
+    /// A commit status check found no record of a commit and aborted it.
+    CommitAborted,
+    /// An attempt of a commit that a status check had aborted was rejected.
+    AbortedCommitRejected,
     /// A transaction was rejected due to a read-write conflict.
     CommitConflict,
     /// A transaction conflicted with an earlier transaction in the same batch.
@@ -189,6 +206,8 @@ impl Probe {
         Probe::DeletionRepaired,
         Probe::NameResolvedAgain,
         Probe::PreconditionExplainedByReplay,
+        Probe::RetentionTrimRetried,
+        Probe::CommitUnknownAfterLeaseMoved,
     ];
 }
 

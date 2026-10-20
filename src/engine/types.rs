@@ -43,10 +43,24 @@ impl BlobRef {
 /// Each commit writes a record with its version as `seq` and, as its value,
 /// its store time and the records each of its stream appends received
 /// ([`encode_commit_record`]), so status checks can tell whether and how a
-/// commit applied (SPEC §5.5).
+/// commit applied (SPEC §5.5). A status check that finds no record writes an
+/// empty one, which aborts the commit id: no later attempt applies it.
 /// Records are retained for `commit_retention_ms` and dropped without a
 /// tombstone once expired.
 pub const COMMIT_SPACE: u8 = 0xFF;
+
+/// What a commit record says about its commit id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitRecord {
+    /// The commit applied at the store time `time_ms`, and its appends
+    /// received these records.
+    Applied { time_ms: u64, appends: Vec<Appended> },
+    /// A status check found the commit unapplied and aborted it.
+    Aborted,
+}
+
+/// The value of an abort record.
+pub const ABORT_RECORD: Bytes = Bytes::new();
 
 pub fn encode_commit_record(time_ms: u64, appends: &[Appended]) -> Bytes {
     let mut w = Writer::with_capacity(8 + 8 * appends.len());
@@ -58,15 +72,17 @@ pub fn encode_commit_record(time_ms: u64, appends: &[Appended]) -> Bytes {
     Bytes::from(w.into_inner())
 }
 
-/// A commit record's store time and appends.
-pub fn decode_commit_record(b: &[u8]) -> DResult<(u64, Vec<Appended>)> {
+pub fn decode_commit_record(b: &[u8]) -> DResult<CommitRecord> {
+    if b.is_empty() {
+        return Ok(CommitRecord::Aborted);
+    }
     let mut r = Reader::new(b);
     let time_ms = r.varint()?;
     let mut appends = Vec::new();
     while !r.is_empty() {
         appends.push(Appended { first_seq: r.varint()?, count: r.varint()? });
     }
-    Ok((time_ms, appends))
+    Ok(CommitRecord::Applied { time_ms, appends })
 }
 
 pub fn commit_key(id: u64) -> Bytes {
@@ -231,9 +247,11 @@ mod tests {
     #[test]
     fn commit_records_roundtrip() {
         let appends = [Appended { first_seq: 0, count: 3 }, Appended { first_seq: u64::MAX, count: 0 }];
-        assert_eq!(decode_commit_record(&encode_commit_record(17, &appends)).unwrap(), (17, appends.to_vec()));
-        assert_eq!(decode_commit_record(&encode_commit_record(5, &[])).unwrap(), (5, Vec::new()));
-        assert!(decode_commit_record(&[]).is_err());
+        let applied = |time_ms, appends: &[Appended]| CommitRecord::Applied { time_ms, appends: appends.to_vec() };
+        assert_eq!(decode_commit_record(&encode_commit_record(17, &appends)).unwrap(), applied(17, &appends));
+        assert_eq!(decode_commit_record(&encode_commit_record(5, &[])).unwrap(), applied(5, &[]));
+        assert_eq!(decode_commit_record(&ABORT_RECORD).unwrap(), CommitRecord::Aborted);
+        assert!(decode_commit_record(&[0x80]).is_err());
     }
 
     #[test]

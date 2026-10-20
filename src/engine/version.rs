@@ -165,7 +165,7 @@ impl Shared {
 
     async fn levels(&self, db: &str, id: &str) -> Result<Arc<Levels>> {
         let key = levels_key(db, id);
-        let ck = CacheKey { seg_path: Arc::from(key.as_str()), block: 0 };
+        let ck = CacheKey::levels(db, id);
         if let Some(CacheVal::Levels(l)) = self.cache.get(&ck) {
             return Ok(l);
         }
@@ -202,15 +202,11 @@ impl Shared {
         let key = levels_key(db, &id);
         self.retry.run(|| self.store.put(&key, data.clone(), crate::store::PutMode::Overwrite)).await?;
         crate::probe::hit(crate::probe::Probe::LevelsObjectWritten);
-        self.cache.insert(CacheKey { seg_path: Arc::from(key.as_str()), block: 0 }, CacheVal::Levels(Arc::new(l)));
+        self.cache.insert(CacheKey::levels(db, &id), CacheVal::Levels(Arc::new(l)));
         if let Some(t) = self.cfg.local_tier.clone() {
             self.env.spawn(async move { t.0.put(&key, data).await });
         }
         Ok(id)
-    }
-
-    fn cache_key(&self, db: &str, seg: &str, block: u32) -> CacheKey {
-        CacheKey { seg_path: Arc::from(seg_key(db, seg).as_str()), block }
     }
 
     fn local_key(db: &str, seg: &str, part: &str) -> String {
@@ -221,6 +217,10 @@ impl Shared {
         self.cfg.local_tier.as_ref()?.0.get(&Self::local_key(db, seg, part)).await
     }
 
+    fn local_has(&self, db: &str, seg: &str, part: &str) -> bool {
+        self.cfg.local_tier.as_ref().is_some_and(|t| t.0.contains(&Self::local_key(db, seg, part)))
+    }
+
     fn local_put(&self, db: &str, seg: &str, part: &str, data: Bytes) {
         if let Some(t) = self.cfg.local_tier.clone() {
             let key = Self::local_key(db, seg, part);
@@ -229,23 +229,24 @@ impl Shared {
     }
 
     /// Decodes a full segment and caches its index and blocks in memory.
-    fn cache_whole(&self, db: &str, seg: &str, data: &Bytes) -> Result<Arc<SegmentIndex>> {
+    fn cache_whole(&self, db: &str, seg: &str, data: &Bytes) -> Result<(Arc<SegmentIndex>, Vec<Block>)> {
         let idx = Arc::new(SegmentIndex::decode_whole(data)?);
-        for (bi, b) in segment::decode_blocks(&idx, 0, data)?.into_iter().enumerate() {
-            self.cache.insert(self.cache_key(db, seg, bi as u32), CacheVal::Block(b));
+        let blocks = segment::decode_blocks(&idx, 0, data)?;
+        for (bi, b) in blocks.iter().enumerate() {
+            self.cache.insert(CacheKey::block(db, seg, bi), CacheVal::Block(b.clone()));
         }
-        self.cache.insert(self.cache_key(db, seg, u32::MAX), CacheVal::Index(idx.clone()));
-        Ok(idx)
+        self.cache.insert(CacheKey::index(db, seg), CacheVal::Index(idx.clone()));
+        Ok((idx, blocks))
     }
 
     /// Caches a newly written segment in the local tier and its index in memory,
     /// also caching its decoded blocks in memory when `hot` is true.
     pub(crate) fn remember_segment(&self, db: &str, seg: &str, data: &Bytes, hot: bool) -> Result<()> {
         let idx = if hot {
-            self.cache_whole(db, seg, data)?
+            self.cache_whole(db, seg, data)?.0
         } else {
             let idx = Arc::new(SegmentIndex::decode_whole(data)?);
-            self.cache.insert(self.cache_key(db, seg, u32::MAX), CacheVal::Index(idx.clone()));
+            self.cache.insert(CacheKey::index(db, seg), CacheVal::Index(idx.clone()));
             idx
         };
         if idx.size <= self.whole_fetch_max() {
@@ -264,22 +265,49 @@ impl Shared {
     }
 
     /// Loads or returns the cached index of a segment.
+    #[cfg(test)]
     pub(crate) async fn seg_index(&self, db: &str, seg: &SegmentMeta) -> Result<Arc<SegmentIndex>> {
-        let ck = self.cache_key(db, &seg.id, u32::MAX);
-        if let Some(CacheVal::Index(i)) = self.cache.get(&ck) {
-            return Ok(i);
+        Ok(self.open_segment(db, seg, ReadMode::Cached).await?.0)
+    }
+
+    /// Returns the index of `seg` and, if it had to fetch a segment small
+    /// enough to read whole, all of its decoded blocks, so that a read does not
+    /// fetch the segment's blocks again should the cache not hold them. Reads
+    /// in [`ReadMode::Bulk`] use cached data but cache nothing.
+    async fn open_segment(&self, db: &str, seg: &SegmentMeta, mode: ReadMode) -> Result<Opened> {
+        let ck = CacheKey::index(db, &seg.id);
+        let cached = match mode {
+            ReadMode::Cached => self.cache.get(&ck),
+            ReadMode::Bulk => self.cache.peek(&ck),
+        };
+        if let Some(CacheVal::Index(i)) = cached {
+            return Ok((i, None));
         }
         if seg.size <= self.whole_fetch_max() {
+            if mode == ReadMode::Bulk {
+                return self.whole_segment(db, seg).await.map(|(i, b)| (i, Some(b)));
+            }
             if let Some(d) = self.local_get(db, &seg.id, "all").await
-                && let Ok(idx) = self.cache_whole(db, &seg.id, &d)
+                && let Ok((idx, blocks)) = self.cache_whole(db, &seg.id, &d)
             {
-                return Ok(idx);
+                return Ok((idx, Some(blocks)));
             }
             let g = self.seg_get(db, &seg.id, GetOpts::default()).await?;
-            let idx = self.cache_whole(db, &seg.id, &g.data)?;
+            let (idx, blocks) = self.cache_whole(db, &seg.id, &g.data)?;
             self.local_put(db, &seg.id, "all", g.data);
-            return Ok(idx);
+            return Ok((idx, Some(blocks)));
         }
+        let idx = Arc::new(self.load_index(db, seg, mode == ReadMode::Cached).await?);
+        if mode == ReadMode::Cached {
+            self.cache.insert(ck, CacheVal::Index(idx.clone()));
+        }
+        Ok((idx, None))
+    }
+
+    /// Loads the bloom filter and block index of a segment too large to fetch
+    /// whole, from the local tier or else from the store, keeping a local
+    /// copy of what it fetches if `keep`.
+    async fn load_index(&self, db: &str, seg: &SegmentMeta, keep: bool) -> Result<SegmentIndex> {
         let size = seg.size;
         let parse = |meta: &Bytes| -> Result<SegmentIndex> {
             let n = meta.len();
@@ -299,8 +327,6 @@ impl Shared {
         if let Some(meta) = self.local_get(db, &seg.id, "meta").await
             && let Ok(idx) = parse(&meta)
         {
-            let idx = Arc::new(idx);
-            self.cache.insert(ck, CacheVal::Index(idx.clone()));
             return Ok(idx);
         }
         let g = self
@@ -312,10 +338,27 @@ impl Shared {
         if g.data.len() as u64 != size - start {
             return Err(Error::internal("short segment read"));
         }
-        let idx = Arc::new(parse(&g.data)?);
-        self.cache.insert(ck, CacheVal::Index(idx.clone()));
-        self.local_put(db, &seg.id, "meta", g.data);
+        let idx = parse(&g.data)?;
+        if keep {
+            self.local_put(db, &seg.id, "meta", g.data);
+        }
         Ok(idx)
+    }
+
+    /// Reads a small segment whole from the local tier, or from the store if
+    /// the local copy is missing or corrupt, and decodes it without caching it.
+    async fn whole_segment(&self, db: &str, seg: &SegmentMeta) -> Result<(Arc<SegmentIndex>, Vec<Block>)> {
+        let decode = |d: &Bytes| -> Result<(Arc<SegmentIndex>, Vec<Block>)> {
+            let idx = Arc::new(SegmentIndex::decode_whole(d)?);
+            let blocks = segment::decode_blocks(&idx, 0, d)?;
+            Ok((idx, blocks))
+        };
+        if let Some(d) = self.local_get(db, &seg.id, "all").await
+            && let Ok(opened) = decode(&d)
+        {
+            return Ok(opened);
+        }
+        decode(&self.seg_get(db, &seg.id, GetOpts::default()).await?.data)
     }
 
     /// Reads from segment `seg` of `db`. Returns a retryable error if garbage collection removed
@@ -347,48 +390,69 @@ impl Shared {
     }
 
     fn cached_block(&self, db: &str, seg: &str, bi: usize) -> Option<Block> {
-        match self.cache.get(&self.cache_key(db, seg, bi as u32)) {
+        match self.cache.get(&CacheKey::block(db, seg, bi)) {
             Some(CacheVal::Block(b)) => Some(b),
             _ => None,
         }
     }
 
-    pub(crate) async fn seg_block(&self, db: &str, seg: &SegmentMeta, idx: &SegmentIndex, bi: usize) -> Result<Block> {
-        match self.cached_block(db, &seg.id, bi) {
-            Some(b) => Ok(b),
-            None => self.load_block(db, seg, idx, bi).await,
+    /// [`Shared::cached_block`] for bulk reads, which leave the cache as is.
+    fn peek_block(&self, db: &str, seg: &str, bi: usize) -> Option<Block> {
+        match self.cache.peek(&CacheKey::block(db, seg, bi)) {
+            Some(CacheVal::Block(b)) => Some(b),
+            _ => None,
         }
     }
 
-    async fn load_block(&self, db: &str, seg: &SegmentMeta, idx: &SegmentIndex, bi: usize) -> Result<Block> {
-        match self.local_block(db, &seg.id, bi).await {
+    /// Whether block `bi` of `seg` is cached in memory or in the local tier.
+    fn block_cached(&self, db: &str, seg: &str, bi: usize) -> bool {
+        self.cache.contains(&CacheKey::block(db, seg, bi)) || self.local_has(db, seg, &format!("b{bi}"))
+    }
+
+    pub(crate) async fn seg_block(&self, db: &str, seg: &SegmentMeta, idx: &SegmentIndex, bi: usize) -> Result<Block> {
+        if let Some(b) = self.cached_block(db, &seg.id, bi) {
+            return Ok(b);
+        }
+        match self.local_block(db, seg, bi, true).await {
             Some(b) => Ok(b),
             None => self.fetch_block(db, seg, idx, bi).await,
         }
     }
 
-    async fn local_block(&self, db: &str, seg: &str, bi: usize) -> Option<Block> {
-        let b = segment::decode_block(self.local_get(db, seg, &format!("b{bi}")).await?).ok()?;
-        self.cache.insert(self.cache_key(db, seg, bi as u32), CacheVal::Block(b.clone()));
+    /// Reads block `bi` of `seg` from the local tier, caching it in memory if
+    /// `keep`. A small segment is cached locally whole, so all its blocks
+    /// are cached again with it.
+    async fn local_block(&self, db: &str, seg: &SegmentMeta, bi: usize, keep: bool) -> Option<Block> {
+        if seg.size <= self.whole_fetch_max() {
+            let data = self.local_get(db, &seg.id, "all").await?;
+            if keep {
+                return self.cache_whole(db, &seg.id, &data).ok()?.1.into_iter().nth(bi);
+            }
+            let idx = SegmentIndex::decode_whole(&data).ok()?;
+            let (_, off, len) = *idx.blocks.get(bi)?;
+            return segment::decode_block(data.slice(off as usize..(off + len as u64) as usize)).ok();
+        }
+        let b = segment::decode_block(self.local_get(db, &seg.id, &format!("b{bi}")).await?).ok()?;
+        if keep {
+            self.cache.insert(CacheKey::block(db, &seg.id, bi), CacheVal::Block(b.clone()));
+        }
         Some(b)
     }
 
     async fn fetch_block(&self, db: &str, seg: &SegmentMeta, idx: &SegmentIndex, bi: usize) -> Result<Block> {
-        let ck = self.cache_key(db, &seg.id, bi as u32);
-        let part = format!("b{bi}");
         let (_, off, len) = idx.blocks[bi];
         let g = self.seg_get(db, &seg.id, GetOpts { range: Some(off..off + len as u64), ..Default::default() }).await?;
         if g.data.len() != len as usize {
             return Err(Error::internal("short block read"));
         }
         let b = segment::decode_block(g.data.clone())?;
-        self.cache.insert(ck, CacheVal::Block(b.clone()));
-        self.local_put(db, &seg.id, &part, g.data);
+        self.cache.insert(CacheKey::block(db, &seg.id, bi), CacheVal::Block(b.clone()));
+        self.local_put(db, &seg.id, &format!("b{bi}"), g.data);
         Ok(b)
     }
 
-    /// Fetches consecutive blocks starting at `blocks.start` up to `blocks.end`
-    /// within `bulk_read_bytes` in a single request, optionally caching them.
+    /// Fetches the consecutive blocks `blocks` of `seg` in a single request,
+    /// caching them in memory and in the local tier if `cache`.
     async fn seg_blocks_bulk(
         &self,
         db: &str,
@@ -397,28 +461,19 @@ impl Shared {
         blocks: std::ops::Range<usize>,
         cache: bool,
     ) -> Result<Vec<Block>> {
-        let first = blocks.start;
-        let mut end = first + 1;
-        while end < blocks.end.min(idx.blocks.len()) {
-            let span = idx.span(first..end + 1);
-            if span.end - span.start > self.cfg.bulk_read_bytes {
-                break;
-            }
-            end += 1;
-        }
-        let span = idx.span(first..end);
+        let span = idx.span(blocks.clone());
         let g = self.seg_get(db, &seg.id, GetOpts { range: Some(span.clone()), ..Default::default() }).await?;
         if g.data.len() as u64 != span.end - span.start {
             return Err(Error::internal("short segment read"));
         }
-        let decoded = segment::decode_blocks(idx, first, &g.data)?;
-        if decoded.len() != end - first {
+        let mut decoded = segment::decode_blocks(idx, blocks.start, &g.data)?;
+        decoded.truncate(blocks.len());
+        if decoded.len() != blocks.len() {
             return Err(Error::internal("short segment read"));
         }
         if cache {
-            for (i, b) in decoded.iter().enumerate() {
-                let bi = first + i;
-                self.cache.insert(self.cache_key(db, &seg.id, bi as u32), CacheVal::Block(b.clone()));
+            for (b, bi) in decoded.iter().zip(blocks) {
+                self.cache.insert(CacheKey::block(db, &seg.id, bi), CacheVal::Block(b.clone()));
                 let (_, off, len) = idx.blocks[bi];
                 let at = (off - span.start) as usize;
                 self.local_put(db, &seg.id, &format!("b{bi}"), g.data.slice(at..at + len as usize));
@@ -428,12 +483,18 @@ impl Shared {
     }
 }
 
+/// A segment's index and, when it was just read whole, its decoded blocks.
+type Opened = (Arc<SegmentIndex>, Option<Vec<Block>>);
+
 /// Block read strategy for segment iterators.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadMode {
-    /// Reads individual blocks through the cache.
+    /// Reads individual blocks through the caches, filling them, and reads
+    /// ahead once a forward scan has fetched two blocks of a segment.
     Cached,
-    /// Reads consecutive blocks in bulk requests, bypassing the cache (forward iteration only).
+    /// For compactions and sweeps, which read every block once: uses what the
+    /// caches hold without filling them, fetching small segments whole and
+    /// the uncached blocks of larger ones in bulk requests (forward only).
     Bulk,
 }
 
@@ -442,6 +503,8 @@ pub(crate) enum ReadMode {
 struct RunCursor {
     segs: VecDeque<SegmentMeta>,
     seg: Option<(SegmentMeta, Arc<SegmentIndex>)>,
+    /// The decoded blocks of the current segment, when it was read whole.
+    whole: Option<Vec<Block>>,
     /// Remaining block indices in the current segment, in iteration order.
     blocks: VecDeque<usize>,
     /// Prefetched blocks ready to be scanned.
@@ -510,6 +573,7 @@ impl MergeIter {
                 cursors.push(Cursor::Run(Box::new(RunCursor {
                     segs: run.into(),
                     seg: None,
+                    whole: None,
                     blocks: VecDeque::new(),
                     ready: VecDeque::new(),
                     fetched: 0,
@@ -563,36 +627,9 @@ impl MergeIter {
                 continue;
             }
             if let Some(bi) = r.blocks.pop_front() {
-                let (meta, idx) = r.seg.as_ref().ok_or_else(|| Error::internal("run cursor without a segment"))?;
-                // Switch to bulk prefetching after fetching 2 uncached blocks sequentially in a forward scan.
-                let bulk = match self.mode {
-                    ReadMode::Bulk => Some(false),
-                    ReadMode::Cached => {
-                        let near = match self.shared.cached_block(&self.db, &meta.id, bi) {
-                            Some(b) => Some(b),
-                            None => self.shared.local_block(&self.db, &meta.id, bi).await,
-                        };
-                        match near {
-                            Some(b) => {
-                                r.cur = Some(b);
-                                None
-                            }
-                            None if !reverse && r.fetched >= 2 => Some(true),
-                            None => {
-                                r.fetched += 1;
-                                r.cur = Some(self.shared.fetch_block(&self.db, meta, idx, bi).await?);
-                                None
-                            }
-                        }
-                    }
-                };
-                if let Some(cache) = bulk {
-                    let last = r.blocks.back().copied().unwrap_or(bi);
-                    let got = self.shared.seg_blocks_bulk(&self.db, meta, idx, bi..last + 1, cache).await?;
-                    for _ in 1..got.len() {
-                        r.blocks.pop_front();
-                    }
-                    r.ready.extend(got);
+                match self.mode {
+                    ReadMode::Cached => self.load_cached(r, bi).await?,
+                    ReadMode::Bulk => self.load_bulk(r, bi).await?,
                 }
                 r.pos = 0;
                 continue;
@@ -601,7 +638,7 @@ impl MergeIter {
                 r.seg = None;
                 return Ok(None);
             };
-            let idx = self.shared.seg_index(&self.db, &meta).await?;
+            let (idx, whole) = self.shared.open_segment(&self.db, &meta, self.mode).await?;
             let first = match &range.start {
                 Bound::Included(s) | Bound::Excluded(s) => idx.block_for(s),
                 Bound::Unbounded => Some(0),
@@ -621,7 +658,67 @@ impl MergeIter {
             r.blocks = blocks;
             r.fetched = 0;
             r.seg = Some((meta, idx));
+            r.whole = whole;
         }
+    }
+
+    /// Makes block `bi` of the cursor's segment current, through the caches.
+    async fn load_cached(&self, r: &mut RunCursor, bi: usize) -> Result<()> {
+        let (meta, idx) = r.seg.as_ref().ok_or_else(|| Error::internal("run cursor without a segment"))?;
+        if let Some(b) = r.whole.as_ref().and_then(|w| w.get(bi)) {
+            r.cur = Some(b.clone());
+        } else if let Some(b) = self.shared.cached_block(&self.db, &meta.id, bi) {
+            r.cur = Some(b);
+        } else if let Some(b) = self.shared.local_block(&self.db, meta, bi, true).await {
+            r.cur = Some(b);
+        } else if self.reverse || r.fetched < 2 {
+            r.fetched += 1;
+            r.cur = Some(self.shared.fetch_block(&self.db, meta, idx, bi).await?);
+        } else {
+            self.read_ahead(r, bi, true).await?;
+        }
+        Ok(())
+    }
+
+    /// Makes block `bi` of the cursor's segment current for a bulk read.
+    async fn load_bulk(&self, r: &mut RunCursor, bi: usize) -> Result<()> {
+        let (meta, _) = r.seg.as_ref().ok_or_else(|| Error::internal("run cursor without a segment"))?;
+        if let Some(b) = r.whole.as_ref().and_then(|w| w.get(bi)) {
+            r.cur = Some(b.clone());
+        } else if let Some(b) = self.shared.peek_block(&self.db, &meta.id, bi) {
+            r.cur = Some(b);
+        } else if meta.size <= self.shared.whole_fetch_max() {
+            let blocks = self.shared.whole_segment(&self.db, meta).await?.1;
+            r.cur = Some(blocks.get(bi).cloned().ok_or(Error::internal("short segment"))?);
+            r.whole = Some(blocks);
+        } else if let Some(b) = self.shared.local_block(&self.db, meta, bi, false).await {
+            r.cur = Some(b);
+        } else {
+            self.read_ahead(r, bi, false).await?;
+        }
+        Ok(())
+    }
+
+    /// Fetches block `bi` together with the uncached blocks that follow it
+    /// in the scan, up to `bulk_read_bytes`, in one request.
+    async fn read_ahead(&self, r: &mut RunCursor, bi: usize, cache: bool) -> Result<()> {
+        let (meta, idx) = r.seg.as_ref().ok_or_else(|| Error::internal("run cursor without a segment"))?;
+        let mut end = bi + 1;
+        while let Some(&next) = r.blocks.get(end - bi - 1) {
+            let span = idx.span(bi..next + 1);
+            if next != end
+                || span.end - span.start > self.shared.cfg.bulk_read_bytes
+                || self.shared.block_cached(&self.db, &meta.id, next)
+            {
+                break;
+            }
+            end += 1;
+        }
+        let mut got = self.shared.seg_blocks_bulk(&self.db, meta, idx, bi..end, cache).await?.into_iter();
+        r.blocks.drain(..end - bi - 1);
+        r.cur = got.next();
+        r.ready.extend(got);
+        Ok(())
     }
 
     fn advance(c: &mut Cursor) {
@@ -716,12 +813,15 @@ impl Version {
             return Ok(Some(self.m.tail[i].clone()));
         }
         for seg in self.candidates(key) {
-            let idx = self.shared.seg_index(&self.m.db_id, seg).await?;
+            let (idx, whole) = self.shared.open_segment(&self.m.db_id, seg, ReadMode::Cached).await?;
             if !idx.bloom.may_contain(key) {
                 continue;
             }
             let Some(bi) = idx.block_for(key) else { continue };
-            let b = self.shared.seg_block(&self.m.db_id, seg, &idx, bi).await?;
+            let b = match whole.and_then(|mut w| (bi < w.len()).then(|| w.swap_remove(bi))) {
+                Some(b) => b,
+                None => self.shared.seg_block(&self.m.db_id, seg, &idx, bi).await?,
+            };
             if let Ok(i) = b.binary_search_by(|e| e.key.as_ref().cmp(key)) {
                 return Ok(Some(b[i].clone()));
             }

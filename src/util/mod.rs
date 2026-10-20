@@ -5,6 +5,7 @@ pub mod crc32c;
 pub mod prop;
 pub mod rng;
 mod ttl;
+pub mod zstd;
 
 pub use ttl::TtlCache;
 

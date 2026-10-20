@@ -12,6 +12,29 @@ use std::time::Duration;
 /// Upper bound on how long an in-flight server request can remain active.
 pub const ZOMBIE_WAIT_MS: u64 = 30_000;
 
+/// Delays between retries of a request: doubling from 50 ms to 2 s, for
+/// about 13 minutes in all, so retries outlast node restarts under chaos.
+struct Backoff {
+    attempts: u32,
+    delay: u64,
+}
+
+impl Backoff {
+    fn new() -> Backoff {
+        Backoff { attempts: 0, delay: 50 }
+    }
+
+    /// Waits before every attempt but the first; false once retries are exhausted.
+    async fn wait(&mut self, sim: &Sim) -> bool {
+        if self.attempts > 0 {
+            sim.sleep(self.delay).await;
+            self.delay = (self.delay * 2).min(2_000);
+        }
+        self.attempts += 1;
+        self.attempts <= 400
+    }
+}
+
 pub struct Client {
     pub sim: Arc<Sim>,
     pub token: Option<String>,
@@ -208,15 +231,13 @@ impl Client {
 
     /// Retries an idempotent request across network failures, 503s, and conflicts.
     pub async fn call_retry(&self, method: &str, path: &str, body: Option<Json>) -> Resp {
-        let mut delay = 50;
-        for _ in 0..400 {
+        let mut backoff = Backoff::new();
+        while backoff.wait(&self.sim).await {
             match self.call(method, path, body.clone()).await {
                 Ok(r) if r.status == 503 || (r.status == 409 && r.code() == "conflict") => {}
                 Ok(r) => return r,
                 Err(_) => {}
             }
-            self.sim.sleep(delay).await;
-            delay = (delay * 2).min(2_000);
         }
         panic!("{}: {method} {path} never succeeded", self.name);
     }
@@ -326,7 +347,8 @@ impl Client {
     pub async fn signup(sim: &Arc<Sim>, name: &str, email: &str, password: &str) -> Result<Client, String> {
         let c = Client::new(sim, name);
         let body = json!({"email": email, "password": password});
-        for _ in 0..200 {
+        let mut backoff = Backoff::new();
+        while backoff.wait(sim).await {
             match c.post("/v1/auth/signup", body.clone()).await {
                 Ok(r) if r.status == 201 => {
                     return Ok(Client::with_token(sim, name, r.json["token"].as_str().unwrap_or_default()));
@@ -338,7 +360,6 @@ impl Client {
                 Ok(r) => return Err(format!("signup failed: {} {}", r.status, r.json)),
                 Err(_) => {}
             }
-            sim.sleep(200).await;
         }
         Err("signup never succeeded".into())
     }
@@ -346,7 +367,8 @@ impl Client {
     pub async fn login(sim: &Arc<Sim>, name: &str, email: &str, password: &str) -> Result<Client, String> {
         let c = Client::new(sim, name);
         let body = json!({"email": email, "password": password});
-        for _ in 0..200 {
+        let mut backoff = Backoff::new();
+        while backoff.wait(sim).await {
             match c.post("/v1/auth/login", body.clone()).await {
                 Ok(r) if r.status == 200 => {
                     return Ok(Client::with_token(sim, name, r.json["token"].as_str().unwrap_or_default()));
@@ -355,7 +377,6 @@ impl Client {
                 Ok(r) => return Err(format!("login failed: {} {}", r.status, r.json)),
                 Err(_) => {}
             }
-            sim.sleep(200).await;
         }
         Err("login never succeeded".into())
     }
@@ -369,7 +390,8 @@ impl Client {
             Some(o) => json!({"name": name, "org": o}),
             None => json!({"name": name}),
         };
-        for _ in 0..200 {
+        let mut backoff = Backoff::new();
+        while backoff.wait(&self.sim).await {
             match self.post("/v1/dbs", body.clone()).await {
                 Ok(r) if r.status == 201 => return Ok(()),
                 Ok(r) if r.status == 409 && r.code() == "already_exists" => return Ok(()),
@@ -377,7 +399,6 @@ impl Client {
                 Ok(r) => return Err(format!("create db {body}: {} {}", r.status, r.json)),
                 Err(_) => {}
             }
-            self.sim.sleep(200).await;
         }
         Err(format!("create db {body} never succeeded"))
     }

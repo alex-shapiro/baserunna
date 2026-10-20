@@ -349,6 +349,8 @@ async fn lock_txn(c: &Client, ops: Json, key: &str) -> Result<Result<(u64, Json)
             Ok(r) if r.status == 412 => {
                 return Ok(Err(r.json["error"]["details"]["op_index"].as_u64().unwrap_or(u64::MAX)));
             }
+            // An earlier attempt failed a check, which resolved the key as not applied.
+            Ok(r) if r.code() == "aborted" => return Ok(Err(u64::MAX)),
             Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => c.pause(30).await,
             Ok(r) if r.status != 503 && r.status != 429 => return Err(format!("lock: {} {}", r.status, r.json)),
             _ => c.pause(ZOMBIE_WAIT_MS).await,

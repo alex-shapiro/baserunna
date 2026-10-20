@@ -167,9 +167,10 @@ impl Watcher {
     /// Polls the change feed once, returning `Some(true)` if caught up or
     /// `None` on transient error.
     async fn poll(&mut self, wait_ms: u64) -> Result<Option<bool>, String> {
-        let at = self.c.sim.now_ms();
         let p = format!("{BASE}/changes?after={}&limit={}&wait_ms={wait_ms}", self.cursor, 1 + self.c.rng().below(8));
         let Ok(r): Result<Resp, _> = self.c.call("GET", &p, None).await else { return Ok(None) };
+        // The server checked the cursor at some time before it answered.
+        let at = self.c.sim.now_ms();
         match r.status {
             200 => {}
             410 => {

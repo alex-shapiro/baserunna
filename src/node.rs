@@ -197,6 +197,9 @@ const VERIFY_LINK: LinkLife = LinkLife { ms: 7 * 24 * 3_600_000, words: "7 days"
 
 pub const REAP_INTERVAL_MS: u64 = 60_000;
 
+/// The rendezvous key that picks the node running the reaper.
+const REAPER_KEY: &str = "reaper";
+
 const META_BATCH: usize = 500;
 
 /// Active interactive transaction state.
@@ -422,14 +425,17 @@ impl Node {
         lock(&self.members).clone()
     }
 
-    /// Returns non-suspect cluster members with a recent heartbeat, excluding any previous
-    /// member entry that shares this node's address.
+    /// Returns this node and the non-suspect cluster members with a recent heartbeat,
+    /// excluding any previous member entry that shares this node's address. This node
+    /// counts even before its heartbeat is seen, or while its clock makes it look stale.
     pub fn live_members(&self) -> Vec<NodeRecord> {
         let now = self.now_ms() as i64;
-        cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
+        let mut live: Vec<NodeRecord> = cluster::live(&self.members(), now, self.cfg.heartbeat_ms as i64)
             .into_iter()
-            .filter(|n| n.id == self.id || (!self.is_suspect(&n.id) && n.addr != self.cfg.addr))
-            .collect()
+            .filter(|n| n.id != self.id && !self.is_suspect(&n.id) && n.addr != self.cfg.addr)
+            .collect();
+        live.push(NodeRecord { id: self.id.clone(), addr: self.cfg.addr.clone(), started_at: 0, heartbeat_at: now });
+        live
     }
 
     pub async fn refresh_members(&self) -> Result<()> {
@@ -1285,9 +1291,16 @@ impl Node {
         self.limiter.prune(&self.cfg.limits);
     }
 
-    /// Purges deleted databases past their grace period and sweeps expired sessions.
+    /// Purges deleted databases past their grace period and sweeps expired
+    /// sessions, if this node is the reaper: the live member, counting itself,
+    /// that rendezvous hashing picks. However the nodes' views of the members
+    /// differ, the node that hashes highest of all of them picks itself, so
+    /// some node reaps. The system database's lease holder would not do, as
+    /// nodes disagree about it around each expiry of its lease: the holder
+    /// lets it go before the others do, and a reaper that always ran in that
+    /// moment would never run anywhere.
     pub async fn reap_deleted(&self) -> Result<usize> {
-        if self.route(SYS_DB).await.is_some() {
+        if cluster::rendezvous(REAPER_KEY, &self.live_members()).is_some_and(|n| n.id != self.id) {
             return Ok(0);
         }
         let Some(store_now) = self.engine.shared.store_now_ms() else {

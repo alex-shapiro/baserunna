@@ -2,7 +2,7 @@
 //! revocation, email verification, password reset, and account deletion.
 
 use super::super::Sim;
-use super::super::client::Client;
+use super::super::client::{Client, ZOMBIE_WAIT_MS};
 use super::steps::{MAIL_WAIT_MS, add_member, create_key, create_org, mailed_token, members, request_mail, status};
 use super::{cache_expiry, expect};
 use serde_json::{Value as Json, json};
@@ -80,6 +80,9 @@ async fn sessions(sim: &Arc<Sim>) -> Result<(), String> {
     cache_expiry(sim).await;
     expect(status(&b, "/v1/me").await == 401, "revoked session remained valid")?;
     expect(status(&c, "/v1/me").await == 200, "revoking session b terminated session c")?;
+    // A login whose response was lost may still create a session until its
+    // commit deadline passes, after a revocation of all other sessions.
+    sim.sleep(ZOMBIE_WAIT_MS).await;
     let r = a.call_settled("DELETE", "/v1/me/sessions", None).await;
     expect(r.status == 200, format!("revoke other sessions: {} {}", r.status, r.json))?;
     cache_expiry(sim).await;

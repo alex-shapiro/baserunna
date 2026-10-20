@@ -6,7 +6,7 @@
 //! consumer cursors, and stream states are verified against the committed append history.
 
 use super::super::Sim;
-use super::super::client::{Client, Resp, Status, ZOMBIE_WAIT_MS};
+use super::super::client::{Client, Resp, Status};
 use bytes::Bytes;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -75,9 +75,11 @@ enum Settled {
     Unknown,
 }
 
-/// Retries a request with idempotency key `key` until it receives a definitive
-/// response. On an ambiguous failure, waits for any in-flight attempt to finish
-/// and checks the commit records.
+/// Retries a request with idempotency key `key` (in `headers` or in a JSON
+/// `body`) until it receives a definitive response. On an ambiguous failure,
+/// resolves the commit at once; a status check aborts an unapplied commit for
+/// good, so the request is retried under a new key, as it is if an earlier
+/// attempt's failed precondition resolved the key.
 async fn settle_call(
     c: &Client,
     method: &str,
@@ -86,31 +88,45 @@ async fn settle_call(
     body: Bytes,
     key: &str,
 ) -> Result<Settled, String> {
-    let first = c.sim.now_ms();
-    for _ in 0..200 {
-        let ambiguous = match c.send(method, path, headers, body.clone()).await {
+    let (mut key, mut headers, mut body) = (key.to_string(), headers.to_vec(), body);
+    let mut first = c.sim.now_ms();
+    for attempt in 0..200 {
+        let (ambiguous, aborted) = match c.send(method, path, &headers, body.clone()).await {
             Ok(raw) => {
                 let json = serde_json::from_slice(&raw.body).unwrap_or(Json::Null);
                 let r = Resp { status: raw.status, json, raw };
                 match r.status {
-                    503 if r.outcome_unknown() => true,
-                    503 | 429 => false,
-                    409 if r.code() == "conflict" => false,
+                    503 if r.outcome_unknown() => (true, false),
+                    503 | 429 => (false, false),
+                    409 if r.code() == "conflict" => (false, false),
+                    409 if r.code() == "aborted" => (false, true),
                     _ => return Ok(Settled::Answer(r)),
                 }
             }
-            Err(_) => true,
+            Err(_) => (true, false),
         };
-        if !ambiguous {
+        if !ambiguous && !aborted {
             c.pause(200).await;
             continue;
         }
-        c.pause(ZOMBIE_WAIT_MS).await;
-        match c.commit_status("streams", &format!("key:{key}"), first).await? {
-            Status::Committed(j) => return Ok(Settled::Applied(j)),
-            Status::NotCommitted => {}
-            Status::Unknown => return Ok(Settled::Unknown),
+        if ambiguous {
+            match c.commit_status("streams", &format!("key:{key}"), first).await? {
+                Status::Committed(j) => return Ok(Settled::Applied(j)),
+                Status::Unknown => return Ok(Settled::Unknown),
+                Status::NotCommitted => {}
+            }
         }
+        let fresh = format!("{key}.{attempt}");
+        for (_, v) in headers.iter_mut().filter(|(h, _)| *h == "idempotency-key") {
+            *v = fresh.clone();
+        }
+        let quoted = |k: &str| format!("\"idempotency_key\":{}", Json::from(k));
+        if let Ok(text) = std::str::from_utf8(&body)
+            && text.contains(&quoted(&key))
+        {
+            body = Bytes::from(text.replace(&quoted(&key), &quoted(&fresh)));
+        }
+        (key, first) = (fresh, c.sim.now_ms());
     }
     Err(format!("{}: {method} {path} never settled", c.name))
 }
@@ -490,8 +506,6 @@ async fn consumer(c: Client, w: Shared, done: Arc<AtomicBool>) -> Result<(), Str
             Ok(r) if r.status == 200 || r.status == 409 || r.status == 404 => {}
             Ok(r) if r.retryable_not_applied() || r.status == 429 => {}
             _ => {
-                // Wait for any in-flight commit attempt to expire and fence it.
-                c.pause(ZOMBIE_WAIT_MS).await;
                 c.fence("streams", cid.as_str().unwrap_or_default()).await?;
             }
         }
@@ -537,10 +551,13 @@ async fn trimmer(c: Client, w: Shared, steps: usize) -> Result<(), String> {
 async fn lifecycle(c: Client, rounds: usize) -> Result<(), String> {
     for round in 0..rounds {
         for i in 0..3u64 {
-            let key = format!("tmp-{round}-{i}");
-            let body = json!({"records": [{"value": format!("{round}.{i}")}], "idempotency_key": key});
             let path = format!("{DB}/streams/tmp/records");
+            let mut attempt = 0;
             let first = loop {
+                // A status check left the key of an attempt of unknown outcome aborted.
+                let key = format!("tmp-{round}-{i}-{attempt}");
+                attempt += 1;
+                let body = json!({"records": [{"value": format!("{round}.{i}")}], "idempotency_key": key});
                 match settle_call(&c, "POST", &path, &[], Bytes::from(body.to_string()), &key).await? {
                     Settled::Applied(s) => break s["appends"][0].clone(),
                     Settled::Answer(r) if r.status == 200 => break r.json["first_seq"].clone(),

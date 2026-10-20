@@ -347,6 +347,10 @@ impl crate::engine::local::LocalStore for SimDisk {
         })
     }
 
+    fn contains(&self, key: &str) -> bool {
+        self.inner.contains(key)
+    }
+
     fn stats(&self) -> crate::engine::local::LocalStats {
         self.inner.stats()
     }

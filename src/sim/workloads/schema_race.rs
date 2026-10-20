@@ -91,7 +91,6 @@ async fn interactive(
         }
         Ok(r) if !r.outcome_unknown() => judge(&r, rejected),
         _ => {
-            c.pause(ZOMBIE_WAIT_MS).await;
             match c.commit_status("race", &cid, committing).await? {
                 Status::Committed(_) => Ok(Applied::Yes),
                 Status::NotCommitted => Ok(Applied::No),

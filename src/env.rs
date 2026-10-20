@@ -147,7 +147,7 @@ impl Env {
     pub fn fill_random(&self, out: &mut [u8]) {
         match &self.rng {
             Some(r) => r.lock().unwrap_or_else(|e| e.into_inner()).fill(out),
-            None => aws_lc_rs::rand::fill(out).expect("OS randomness unavailable"),
+            None => os_random(out),
         }
     }
 
@@ -238,4 +238,44 @@ impl Drop for Env {
 
 pub async fn sleep_ms(ms: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
+/// Fills `out` from the system's cryptographic generator. Each call into it
+/// reseeds from the kernel, which costs more than the rest of a small request,
+/// so small reads are served from a per-thread pool of its output. Bytes are
+/// zeroed in the pool once handed out.
+fn os_random(out: &mut [u8]) {
+    const POOL: usize = 512;
+    thread_local! {
+        static POOLED: std::cell::RefCell<([u8; POOL], usize)> = const { std::cell::RefCell::new(([0; POOL], POOL)) };
+    }
+    if out.len() > POOL / 8 {
+        aws_lc_rs::rand::fill(out).expect("OS randomness unavailable");
+        return;
+    }
+    POOLED.with(|p| {
+        let (pool, used) = &mut *p.borrow_mut();
+        if *used + out.len() > POOL {
+            aws_lc_rs::rand::fill(pool).expect("OS randomness unavailable");
+            *used = 0;
+        }
+        let taken = &mut pool[*used..*used + out.len()];
+        out.copy_from_slice(taken);
+        taken.fill(0);
+        *used += out.len();
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pooled_randomness_does_not_repeat() {
+        let env = super::Env::real();
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..20_000 {
+            let mut b = vec![0u8; 8 + i % 70];
+            env.fill_random(&mut b);
+            assert!(seen.insert(b), "draw {i} repeated");
+        }
+    }
 }

@@ -415,6 +415,13 @@ impl KvModel {
                     }
                     return Ok(());
                 }
+                // An earlier attempt failed its precondition, which resolved the key as not applied.
+                409 if r.code() == "aborted" => {
+                    if fail_at.is_none() {
+                        return Err(format!("step {}: aborted without a precondition to fail: {}", self.step, r.json));
+                    }
+                    return Ok(());
+                }
                 503 | 409 => {
                     // Safe to retry with the same idempotency key (409 indicates an OCC conflict with a zombie).
                     self.c.pause(100).await;
@@ -528,7 +535,6 @@ impl KvModel {
             Ok(r) if !r.outcome_unknown() && r.status != 503 => return Err(format!("commit: {} {}", r.status, r.json)),
             _ => {
                 // Resolve ambiguous commits via the commit-status endpoint or by reading the database.
-                self.c.pause(super::super::client::ZOMBIE_WAIT_MS).await;
                 match self.c.commit_status(&self.db, &commit_id, began).await? {
                     s @ Status::Committed(_) => s.version(),
                     Status::NotCommitted => None,

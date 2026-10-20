@@ -25,30 +25,30 @@ design context.
 - [ ] **Publish release binaries and a container image.** Build and publish
       release binaries and a container image so external test suites can run
       a local node in CI.
-- [ ] **Check local caches during bulk reads (`ReadMode::Bulk`).** Compaction
-      and GC sweeps use `ReadMode::Bulk` to avoid polluting the in-memory
-      block cache on misses, but `MergeIter::peek` currently bypasses the
-      in-memory and local-disk caches and fetches directly from object storage.
-      Checking the caches first without populating them on misses avoids
-      re-fetching segments that are already cached locally.
 
 ## Performance
 
-- [ ] **Resolve ambiguous commits without waiting for the commit deadline.**
-      Clients must currently wait for the 15 s commit deadline before calling
-      `GET /commits/{id}` (SPEC §6.2). Record the commit ID as aborted during
-      the status check's fencing manifest write so that late commit attempts
-      are rejected and the status check can return immediately.
-- [ ] **Reduce CPU overhead per request.** Profiles at 340 commits/s on a
-      single core show hotspots in memory allocation, `serde_json` response
-      serialization, segment key comparisons, and manifest zstd compression.
-- [ ] **Replace the sharded LRU block cache with a CLOCK cache.** Cache hits
-      currently acquire an exclusive shard lock to update the LRU list. A
-      CLOCK eviction policy allows cache hits to use a shared lock.
-- [ ] **Tune the inline WAL tail limit.** Median commit latency on Tigris
-      increases from 36 ms with an empty tail to 84 ms with a full 256 KiB
-      tail. Lowering the tail limit reduces commit latency at the cost of
-      more frequent L0 flushes.
+- [ ] **Delete the outputs of rejected compactions at once.** A compaction
+      whose install is rejected (its inputs changed, or it outlived the orphan
+      grace) leaves its output segments for the hourly orphan sweep, which
+      deletes them only after `orphan_grace_ms` (2 hours). Background flushes
+      already delete a superseded flush's outputs as soon as the rejection is
+      certain; compactions can do the same.
+- [ ] **Keep quiet databases' manifests on Tigris's small-object fast path.**
+      From a Fly.io machine, a Tigris `PUT` takes about 26 ms for objects of up
+      to 1,000 bytes and about 70 ms just above (p50; `GET`s step similarly
+      between 2 and 4 KiB), so a commit to a database with an empty tail is
+      about 2.5× faster than one with any tail. For a database that commits
+      rarely, flushing the tail once it goes quiet would keep its next commit
+      on the fast path, at the cost of a segment `PUT` per quiet period;
+      measure whether S3 and R2 behave alike before tuning for it.
+      `examples/commit_latency.rs` measures both.
+- [ ] **Keep the manifest tail as a sorted vector across a batch.** Each
+      commit batch clones the manifest, moves the tail into a `BTreeMap`, and
+      collects it back into a vector, cloning every entry's key and value
+      handles. Applying the batch's writes as an overlay over the base tail
+      and merging once would make the cost proportional to the batch rather
+      than the tail.
 
 ## Features
 
@@ -79,6 +79,13 @@ design context.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`, and publish the Rust `client` module as a standalone
       crate.
+
+- [ ] **Idempotency keys for raw KV writes.** `PUT` and `DELETE` on
+      `/v1/dbs/{db}/kv/{key}` take no idempotency key, and a `503` with an
+      unknown outcome names its commit ID only in the error message, so a
+      client whose response was lost cannot resolve the write through
+      `GET /commits/{id}`. Accept an `Idempotency-Key` header, as stream
+      appends do, and report the commit ID in a header.
 
 ## Testing
 

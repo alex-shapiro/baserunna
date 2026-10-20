@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value as Json, json};
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -476,6 +476,8 @@ enum Fail {
     NotFound,
     Exists,
     Precondition,
+    /// The idempotency key was resolved as not applied by an earlier failed precondition.
+    Aborted,
     TooLarge,
     /// Valid request with an in-run TTL whose exact expiry is not modeled.
     Unmodeled,
@@ -488,6 +490,7 @@ impl Fail {
             Fail::NotFound => (404, "not_found"),
             Fail::Exists => (409, "already_exists"),
             Fail::Precondition => (412, "precondition_failed"),
+            Fail::Aborted => (409, "aborted"),
             Fail::TooLarge => (413, "too_large"),
             Fail::Unmodeled => (200, ""),
         }
@@ -995,6 +998,8 @@ struct World {
     version: u64,
     last_write: BTreeMap<Vec<u8>, u64>,
     idem: BTreeMap<String, (u64, Vec<u64>)>,
+    /// Idempotency keys resolved as not applied by a failed precondition.
+    aborted: BTreeSet<String>,
     staged: BTreeMap<String, (Vec<u8>, String)>,
     query_cursors: BTreeMap<String, (Option<String>, Vec<TKey>)>,
     inline_max: usize,
@@ -1654,6 +1659,16 @@ impl World {
                 .any(|(s, c)| self.stream_changed(&StreamRead::Consumer(s.clone(), c.clone()), t.rv)),
         };
         Some(kv || pinned || streams)
+    }
+
+    /// Models the resolution of an idempotent request that failed a
+    /// precondition: its key is aborted, in a version of its own.
+    fn abort(&mut self, key: Option<&str>) {
+        if let Some(k) = key
+            && self.aborted.insert(k.to_string())
+        {
+            self.version += 1;
+        }
     }
 
     fn apply(&mut self, t: TxnView, version: u64) -> Result<(), String> {
@@ -2549,6 +2564,10 @@ impl<'a> Session<'a> {
                 self.expect("POST", &path, bytes, &Expect::Ok(200, want)).await?;
                 return Ok(());
             }
+            if self.w.aborted.contains(k) {
+                self.expect("POST", &path, bytes, &Expect::Err(Fail::Aborted, None)).await?;
+                return Ok(());
+            }
         }
         let mut t = TxnView::new(self.w.snap.clone(), self.w.version);
         let mut outs = Vec::new();
@@ -2564,6 +2583,9 @@ impl<'a> Session<'a> {
                 Err(f) => {
                     let idx = (f == Fail::Precondition).then_some(i);
                     self.expect("POST", &path, bytes, &Expect::Err(f, idx)).await?;
+                    if f == Fail::Precondition {
+                        self.w.abort(req.idempotency_key.as_deref());
+                    }
                     return Ok(());
                 }
             }
@@ -2577,6 +2599,7 @@ impl<'a> Session<'a> {
                 Ok(f) => f,
                 Err(i) => {
                     self.expect("POST", &path, bytes, &Expect::Err(Fail::Precondition, Some(i))).await?;
+                    self.w.abort(req.idempotency_key.as_deref());
                     return Ok(());
                 }
             };
@@ -2998,6 +3021,7 @@ impl Harness {
             version: 0,
             last_write: BTreeMap::new(),
             idem: BTreeMap::new(),
+            aborted: BTreeSet::new(),
             staged: BTreeMap::new(),
             query_cursors: BTreeMap::new(),
             inline_max: cfg.engine.value_inline_max,

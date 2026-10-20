@@ -197,7 +197,7 @@ fn schemas() -> Value {
         "Error": obj(json!({
             "error": obj(json!({
                 "code": enum_of(&["invalid_argument", "unauthenticated", "permission_denied", "not_found",
-                    "txn_not_found", "conflict", "already_exists", "precondition_failed", "too_large",
+                    "txn_not_found", "conflict", "already_exists", "aborted", "precondition_failed", "too_large",
                     "cursor_expired", "quota_exceeded", "rate_limited", "unavailable", "internal"]),
                 "message": s(),
                 "retryable": b(),
@@ -989,7 +989,8 @@ fn paths() -> Value {
             desc: Some(
                 "Operations execute in order with read-your-writes, atomically. Serializable by default; conflicts are \
             retried server-side. With `idempotency_key`, retries are never applied twice (a replay returns \
-            `replayed: true` and null results).",
+            `replayed: true` and null results). Once a commit status check, or a failed precondition, has \
+            resolved a key as not applied, attempts under it fail with `409 aborted`.",
             ),
             ..op(
                 "Run a one-shot transaction",
@@ -1038,9 +1039,9 @@ fn paths() -> Value {
         Op {
             params: vec![db(), path_param("id", "commit_id (16 hex characters) or key:<idempotency key>")],
             desc: Some(
-                "Fences in-flight attempts first, so the status is definitive for commits whose request has finished \
-            (wait at least the commit deadline, about 15 s, after an ambiguous failure). Commit records are \
-            retained for 10 minutes.",
+                "Definitive at once: a commit not yet applied is aborted, so no attempt of it, in flight or sent \
+            later, applies (each fails with `409 aborted`); retry the write under a new idempotency key. Commit \
+            records are retained for 10 minutes.",
             ),
             ..op(
                 "Resolve an ambiguous commit",

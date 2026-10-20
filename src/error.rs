@@ -13,6 +13,8 @@ pub enum Error {
     /// Optimistic concurrency conflict; retrying the transaction may succeed.
     Conflict(String),
     AlreadyExists(String),
+    /// A commit status check aborted this commit id; it never applies.
+    Aborted(String),
     PreconditionFailed {
         message: String,
         op_index: Option<usize>,
@@ -69,6 +71,7 @@ impl Error {
             Error::TxnNotFound => "txn_not_found",
             Error::Conflict(_) => "conflict",
             Error::AlreadyExists(_) => "already_exists",
+            Error::Aborted(_) => "aborted",
             Error::PreconditionFailed { .. } => "precondition_failed",
             Error::TooLarge(_) => "too_large",
             Error::CursorExpired(_) => "cursor_expired",
@@ -85,7 +88,7 @@ impl Error {
             Error::Unauthenticated(_) => 401,
             Error::PermissionDenied(_) => 403,
             Error::NotFound(_) | Error::TxnNotFound => 404,
-            Error::Conflict(_) | Error::AlreadyExists(_) => 409,
+            Error::Conflict(_) | Error::AlreadyExists(_) | Error::Aborted(_) => 409,
             Error::PreconditionFailed { .. } => 412,
             Error::TooLarge(_) => 413,
             Error::CursorExpired(_) => 410,
@@ -115,6 +118,7 @@ impl Error {
             | Error::NotFound(m)
             | Error::Conflict(m)
             | Error::AlreadyExists(m)
+            | Error::Aborted(m)
             | Error::TooLarge(m)
             | Error::CursorExpired(m)
             | Error::QuotaExceeded(m)

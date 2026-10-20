@@ -8,6 +8,7 @@
 
 use super::range_delete::RangeTombstone;
 use super::types::{Entry, Seq, is_commit_key, valid_object_id};
+use crate::util::bloom::key_hash;
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
 use crate::util::crc32c::crc32c;
 use bytes::Bytes;
@@ -130,6 +131,41 @@ pub struct Obsolete {
     pub since_ms: u64,
 }
 
+/// A tail page ends after a key whose hash has these bits clear: about 32 entries.
+const PAGE_KEY_MASK: u64 = 31;
+/// A tail page also ends once it holds this many bytes.
+const PAGE_MAX_BYTES: usize = 16 * 1024;
+
+/// The compressed tail pages of the last manifest a database encoded, by
+/// the SHA-256 of their uncompressed bytes.
+#[derive(Default)]
+pub struct PageCache {
+    frames: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+}
+
+impl PageCache {
+    /// Compresses `prefix`, the tail pages and `suffix` as consecutive zstd
+    /// frames, which decompress as one, reusing the cached frame of each
+    /// page whose bytes are unchanged. Keeps the frames of these pages only.
+    fn compress(&mut self, prefix: &[u8], tail: &[Vec<u8>], suffix: &[u8]) -> Option<Vec<u8>> {
+        let compress = |b: &[u8]| crate::util::zstd::compress(b, ZSTD_LEVEL).ok();
+        let mut out = compress(prefix)?;
+        let mut frames = std::collections::BTreeMap::new();
+        for page in tail {
+            let digest = crate::util::sha256(page);
+            let frame = match self.frames.remove(&digest) {
+                Some(frame) => frame,
+                None => compress(page)?,
+            };
+            out.extend_from_slice(&frame);
+            frames.insert(digest, frame);
+        }
+        out.extend_from_slice(&compress(suffix)?);
+        self.frames = frames;
+        Some(out)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Manifest {
     pub db_id: String,
@@ -164,6 +200,9 @@ pub struct Manifest {
     pub blob_bytes: BlobBytes,
     /// Bytes of sealed stream chunks, accounted like blob bytes.
     pub chunk_bytes: BlobBytes,
+    /// Incremented by every flush of the tail, so that a background flush
+    /// is installed only over the tail it flushed.
+    pub flushes: u64,
 }
 
 impl Manifest {
@@ -197,19 +236,31 @@ impl Manifest {
     }
 
     pub fn encode(&self) -> Bytes {
-        let body = self.encode_body();
-        let mut w = Writer::with_capacity(16 + body.len());
+        self.encode_with(&mut PageCache::default())
+    }
+
+    /// Encodes the manifest, compressing each page of the tail as a zstd frame
+    /// of its own and reusing the frames `pages` holds for pages unchanged since
+    /// the last encoding. A commit changes few pages of a large tail, so most of
+    /// the tail is not compressed again.
+    pub fn encode_with(&self, pages: &mut PageCache) -> Bytes {
+        let (prefix, tail, suffix) = self.encode_parts();
+        let len = prefix.len() + tail.iter().map(Vec::len).sum::<usize>() + suffix.len();
+        let mut w = Writer::with_capacity(16 + len);
         w.raw(MAGIC);
         w.u16(FORMAT);
-        match zstd::bulk::compress(&body, ZSTD_LEVEL).ok().filter(|c| c.len() + 10 < body.len() - body.len() / 8) {
+        let compressed = pages.compress(&prefix, &tail, &suffix).filter(|c| c.len() + 10 < len - len / 8);
+        match compressed {
             Some(c) => {
                 w.u8(1);
-                w.varint(body.len() as u64);
+                w.varint(len as u64);
                 w.raw(&c);
             }
             None => {
                 w.u8(0);
-                w.raw(&body);
+                w.raw(&prefix);
+                tail.iter().for_each(|p| w.raw(p));
+                w.raw(&suffix);
             }
         }
         let crc = crc32c(&w.buf);
@@ -217,8 +268,17 @@ impl Manifest {
         Bytes::from(w.into_inner())
     }
 
+    #[cfg(test)]
     pub(super) fn encode_body(&self) -> Vec<u8> {
-        let mut w = Writer::with_capacity(256 + self.tail_bytes());
+        let (prefix, tail, suffix) = self.encode_parts();
+        [vec![prefix], tail, vec![suffix]].concat().concat()
+    }
+
+    /// The encoded body: what precedes the tail's entries, the entries in
+    /// pages, and what follows them. A page ends after a key whose hash ends
+    /// in `PAGE_KEY_BITS` zero bits, so inserting a key changes only its page.
+    fn encode_parts(&self) -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
+        let mut w = Writer::with_capacity(1024);
         w.str(&self.db_id);
         w.u64(self.version);
         w.u64(self.write_seq);
@@ -251,9 +311,20 @@ impl Manifest {
         }
         w.varint(self.compaction_seq);
         w.varint(self.tail.len() as u64);
+        let prefix = w.into_inner();
+        let mut pages = Vec::new();
+        let page_capacity = 2 * PAGE_MAX_BYTES;
+        let mut page = Writer::with_capacity(page_capacity);
         for e in &self.tail {
-            e.encode(&mut w);
+            e.encode(&mut page);
+            if key_hash(&e.key) & PAGE_KEY_MASK == 0 || page.len() >= PAGE_MAX_BYTES {
+                pages.push(std::mem::replace(&mut page, Writer::with_capacity(page_capacity)).into_inner());
+            }
         }
+        if !page.is_empty() {
+            pages.push(page.into_inner());
+        }
+        let mut w = Writer::with_capacity(256);
         w.varint(self.range_deletes.len() as u64);
         for t in &self.range_deletes {
             t.encode(&mut w);
@@ -276,7 +347,8 @@ impl Manifest {
             w.varint(b.swept);
             w.varint(b.swept_at);
         }
-        w.into_inner()
+        w.varint(self.flushes);
+        (prefix, pages, w.into_inner())
     }
 
     pub fn decode(data: &Bytes) -> DResult<Manifest> {
@@ -301,8 +373,8 @@ impl Manifest {
                     return Err(DecodeError("manifest body too large"));
                 }
                 let rest = r.take(r.remaining())?;
-                let inflated =
-                    zstd::bulk::decompress(rest, n as usize).map_err(|_| DecodeError("bad compressed manifest"))?;
+                let inflated = crate::util::zstd::decompress(rest, n as usize)
+                    .map_err(|_| DecodeError("bad compressed manifest"))?;
                 if inflated.len() as u64 != n {
                     return Err(DecodeError("manifest body length mismatch"));
                 }
@@ -383,6 +455,8 @@ impl Manifest {
         let last_sweep_ms = r.varint()?;
         let blob_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
         let chunk_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
+        // Manifests written before flushes were counted end here.
+        let flushes = if r.is_empty() { 0 } else { r.varint()? };
         if !r.is_empty() {
             return Err(DecodeError("manifest trailing data"));
         }
@@ -405,6 +479,7 @@ impl Manifest {
             last_sweep_ms,
             blob_bytes,
             chunk_bytes,
+            flushes,
         };
         m.check_levels().map_err(DecodeError)?;
         Ok(m)
@@ -539,6 +614,7 @@ mod tests {
         let mut m = Manifest::new("db1", 123, Some(456));
         m.version = 42;
         m.write_seq = 50;
+        m.flushes = 300;
         m.time_ms = 1_700_000_000_000;
         m.flags = FLAG_DELETED;
         m.lease = Some(Lease { node: "n1".into(), expires_ms: 999, ms: 5_000 });
@@ -609,12 +685,58 @@ mod tests {
     }
 
     #[test]
+    fn tail_pages_are_compressed_once() {
+        let mut r = Rng::new(4);
+        let words = ["user", "active", "pending", "name", "email", "created", "status", "count"];
+        let mut m = sample();
+        m.tail = (0..2000u64)
+            .map(|i| {
+                let text: Vec<&str> = (0..40).map(|_| words[r.usize(words.len())]).collect();
+                Entry::new(Bytes::from(format!("k{i:05}")), i, Value::Inline(Bytes::from(text.join(" "))))
+            })
+            .collect();
+        let mut pages = PageCache::default();
+        let first = m.encode_with(&mut pages);
+        assert_eq!(Manifest::decode(&first).unwrap(), m);
+        let whole = crate::util::zstd::compress(&m.encode_body(), ZSTD_LEVEL).unwrap();
+        assert!(first.len() < whole.len() * 5 / 4, "paged {} bytes, whole {} bytes", first.len(), whole.len());
+        let frames: Vec<Vec<u8>> = pages.frames.values().cloned().collect();
+        assert!(frames.len() > 20, "{} pages", frames.len());
+        for (i, edit) in [7usize, 1234, 1999].into_iter().enumerate() {
+            m.tail[edit].value = Value::Inline(Bytes::from(format!("edit {i}")));
+            let key = Bytes::from(format!("k{edit:05}+"));
+            let at = m.tail.partition_point(|e| e.key < key);
+            m.tail.insert(at, Entry::new(key, 9_000 + i as u64, Value::Tombstone));
+            m.write_seq += 1;
+            let enc = m.encode_with(&mut pages);
+            assert_eq!(Manifest::decode(&enc).unwrap(), m);
+            assert_eq!(enc, m.encode(), "reused frames encode the same as fresh ones");
+        }
+        let kept = frames.iter().filter(|f| pages.frames.values().any(|g| g == *f)).count();
+        assert!(kept + 6 >= frames.len(), "{kept} of {} pages kept their frames", frames.len());
+    }
+
+    #[test]
     fn format_5_manifests_are_read() {
         let m = sample();
         let mut w = Writer::with_capacity(1024);
         w.raw(MAGIC);
         w.u16(FORMAT_RAW);
         w.raw(&m.encode_body());
+        let crc = crc32c(&w.buf);
+        w.u32(crc);
+        assert_eq!(Manifest::decode(&Bytes::from(w.into_inner())).unwrap(), m);
+    }
+
+    #[test]
+    fn manifests_without_a_flush_count_are_read() {
+        let m = Manifest { flushes: 0, ..sample() };
+        let body = m.encode_body();
+        let mut w = Writer::with_capacity(1024);
+        w.raw(MAGIC);
+        w.u16(FORMAT);
+        w.u8(0);
+        w.raw(&body[..body.len() - 1]);
         let crc = crc32c(&w.buf);
         w.u32(crc);
         assert_eq!(Manifest::decode(&Bytes::from(w.into_inner())).unwrap(), m);

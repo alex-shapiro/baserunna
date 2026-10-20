@@ -693,7 +693,7 @@ async fn commit_status(State(node): State<Arc<Node>>, Extension(ctx): Extension<
         None if id.len() == 16 => u64::from_str_radix(id, 16).map_err(|_| bad_commit_id())?,
         None => return Err(bad_commit_id()),
     };
-    Ok(axum::Json(match ctx.db.commit_status_fenced(cid).await? {
+    Ok(axum::Json(match ctx.db.resolve_commit(cid).await? {
         Some(c) => {
             json!({"status": "committed", "version": c.version, "commit_id": commit_hex(cid), "appends": first_seqs(&c)})
         }

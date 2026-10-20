@@ -47,9 +47,17 @@ struct Stats {
     broken: AtomicU64,
 }
 
+/// Virtual time after which writers start no more writes, nor retries of a
+/// write: under long fault storms an upload of many chunks may rarely complete.
+const WRITE_BUDGET_MS: u64 = 30 * 60_000;
+
 async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Result<(), String> {
     let mut rng = c.sim.fork_rng();
+    let deadline = c.sim.now_ms() + WRITE_BUDGET_MS;
     for _ in 0..rounds {
+        if c.sim.now_ms() > deadline {
+            break;
+        }
         c.pause(100 + rng.below(400)).await;
         let small = rng.chance(0.3);
         let k = rng.below(KEYS) + if small { KEYS } else { 0 };
@@ -66,7 +74,7 @@ async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Resul
             w.by_sha.insert(b64::hex(&sha256(&data)), data.clone());
             w.by_key.entry(k).or_default().push(data.clone());
         }
-        loop {
+        while c.sim.now_ms() <= deadline {
             match c.send("PUT", &path, &[], Bytes::from(data.to_vec())).await {
                 Ok(r) if r.status == 200 => {
                     let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap_or_default();

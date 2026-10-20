@@ -121,6 +121,7 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
         c.store = StoreFaults {
             latency_min_ms: k.range("store.latency_min_ms", 0, 5),
             latency_max_ms: k.log_range("store.latency_max_ms", 5, 120),
+            ms_per_mib: k.pick("store.ms_per_mib", &[0, 50, 150, 400]),
             p_slow: k.rate("store.p_slow", 0.02),
             p_stall: stalls,
             stall_ms: (lease, 3 * lease),

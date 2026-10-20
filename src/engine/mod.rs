@@ -24,7 +24,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 pub use config::EngineConfig;
-pub use db::{Committed, Consistency, Db, DbStats, LevelStats};
+pub use db::{CommitState, Committed, Consistency, Db, DbStats, LevelStats};
 pub use stream::{Appended, Record, Retention, Seek, StreamOp, StreamState};
 pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
 pub use types::{BlobRef, Entry, Seq, Value};
@@ -249,7 +249,7 @@ impl Engine {
     /// Removes the handle and cached entries for database `id`.
     pub fn forget(&self, id: &str) {
         self.dbs.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
-        self.shared.cache.evict_prefix(&db_prefix(id));
+        self.shared.cache.evict_db(id);
     }
 
     /// Deletes all objects belonging to database `id` from storage.

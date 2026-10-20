@@ -1,6 +1,7 @@
 //! Engine model and unit tests.
 
 use super::*;
+use crate::engine::types::commit_key;
 use crate::env::Env;
 use crate::error::Error;
 use crate::store::StoreError;
@@ -664,16 +665,52 @@ fn strong_reads_wait_for_the_write_in_flight() {
 }
 
 #[test]
-fn fenced_status_writes_the_manifest() {
+fn resolving_a_commit_aborts_it_for_good() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
-        let db = eng.db("d");
-        db.open(true).await.unwrap();
+        let db = opened(&eng, "d").await;
         put(&db, "k", "1").await;
+        let request = |id: u64| {
+            let db = db.clone();
+            async move {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                t.put(Bytes::from(format!("k{id}")), inline("v")).unwrap();
+                let mut r = t.into_request();
+                r.commit_id = id;
+                r
+            }
+        };
         let etag = || store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().etag;
+        let (stale, stale_again) = (request(42).await, request(42).await);
         let before = etag();
-        assert_eq!(db.commit_status_fenced(42).await.unwrap(), None);
-        assert_ne!(etag(), before, "the fence did not write the manifest");
+        assert_eq!(db.resolve_commit(42).await.unwrap(), None);
+        assert_ne!(etag(), before, "resolving an unknown commit did not write the manifest");
+        assert_eq!(db.commit_status(42).await.unwrap(), Some(CommitState::Aborted));
+        assert!(matches!(db.commit_detailed(stale).await, Err(Error::Aborted(_))), "an attempt older than the abort");
+        assert!(matches!(db.commit_detailed(request(42).await).await, Err(Error::Aborted(_))), "a new attempt");
+        let before = etag();
+        assert_eq!(db.resolve_commit(42).await.unwrap(), None);
+        assert_eq!(etag(), before, "resolving an aborted commit again wrote the manifest");
+
+        let late = request(43).await;
+        let (resolved, attempt) = tokio::join!(db.resolve_commit(43), db.commit_detailed(late));
+        assert_eq!(resolved.unwrap(), None);
+        assert!(matches!(attempt, Err(Error::Aborted(_))), "an attempt batched after the abort applied");
+        assert!(strong_get(&db, "k43").await.is_none());
+
+        let early = request(44).await;
+        let (attempt, resolved) = tokio::join!(db.commit_detailed(early), db.resolve_commit(44));
+        let version = attempt.unwrap().version;
+        assert_eq!(resolved.unwrap().map(|c| c.version), Some(version));
+        let before = etag();
+        assert_eq!(db.resolve_commit(44).await.unwrap().map(|c| c.version), Some(version));
+        assert_eq!(etag(), before, "resolving an applied commit wrote the manifest");
+
+        put_many(&db, "f", 20, 300).await;
+        flushed(&db).await;
+        assert!(db.current().unwrap().m.tail.iter().all(|e| e.key != commit_key(42)), "setup: flushed");
+        assert!(matches!(db.commit_detailed(stale_again).await, Err(Error::Aborted(_))), "aborted from a segment");
+        assert!(matches!(db.commit_detailed(request(42).await).await, Err(Error::Aborted(_))));
     });
 }
 
@@ -1146,6 +1183,17 @@ pub(super) async fn put_many(db: &Arc<Db>, prefix: &str, n: usize, len: usize) -
     db.commit(t.into_request()).await.unwrap()
 }
 
+/// Waits for background work, such as a flush of the tail, to finish.
+pub(super) async fn flushed(db: &Arc<Db>) {
+    for _ in 0..500 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if !db.busy() {
+            return;
+        }
+    }
+    panic!("background work never settled");
+}
+
 pub(super) async fn strong_get(db: &Arc<Db>, k: &str) -> Option<Value> {
     db.snapshot(Consistency::Strong).await.unwrap().get(k.as_bytes()).await.unwrap().map(|e| e.value)
 }
@@ -1387,7 +1435,11 @@ fn commit_records_make_commits_idempotent_until_they_expire() {
         let again = db.commit_detailed(request(99, 7).await).await.unwrap();
         assert_eq!((again.version, again.replayed), (ra.version, true), "an old commit is still known");
         for (id, version) in &ids {
-            assert_eq!(db.commit_status(*id).await.unwrap().map(|s| s.version), Some(*version));
+            let applied = |s| match s {
+                CommitState::Applied(c) => Some(c.version),
+                CommitState::Aborted => None,
+            };
+            assert_eq!(db.commit_status(*id).await.unwrap().and_then(applied), Some(*version));
         }
         assert_eq!(db.commit_status(424242).await.unwrap(), None);
         for _ in 0..2 {
@@ -1495,7 +1547,12 @@ fn flushes_are_compacted_in_the_background() {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let m = &db.current().unwrap().m;
         m.check_levels().unwrap();
-        assert!(m.compaction_seq > 0);
+        assert!(
+            m.compaction_seq > 0,
+            "tail {} segments {:?}",
+            m.tail_bytes(),
+            m.segments.iter().map(|s| (s.level, s.size)).collect::<Vec<_>>()
+        );
         assert!(m.level(0).len() < eng.shared.cfg.l0_compaction_trigger, "{} level 0 segments", m.level(0).len());
         let (base, targets) = compaction::level_targets(m, &eng.shared.cfg);
         for l in 1..manifest::MAX_LEVEL {
@@ -1543,7 +1600,9 @@ fn unchanged_manifests_are_revalidated_conditionally() {
 fn small_segments_load_with_one_request() {
     rt().block_on(async {
         let (a, store) = delayed_engine("a");
-        put_many(&opened(&a, "d").await, "k", 5, 500).await;
+        let db = opened(&a, "d").await;
+        put_many(&db, "k", 5, 500).await;
+        flushed(&db).await;
         let seg_gets = || store.gets_matching(|k| k.contains("/seg/"));
         let before = seg_gets();
         let db = second_node(&a, &store, "b").db("d");
@@ -1565,6 +1624,7 @@ fn validation_sees_flushed_writes_and_not_the_snapshot_itself() {
         fine.scan(&KeyRange::prefix(b"b"), false, 10).await.unwrap();
         fine.put(Bytes::from_static(b"y"), inline("1")).unwrap();
         put_many(&db, "a", 5, 500).await;
+        flushed(&db).await;
         assert!(db.current().unwrap().m.tail.is_empty(), "setup: the concurrent write was not flushed");
         assert_eq!(db.commit(stale.into_request()).await.unwrap_err().code(), "conflict");
         db.commit(fine.into_request()).await.expect("data as old as the snapshot conflicted");
@@ -1719,6 +1779,7 @@ fn written_segments_are_read_without_requests() {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
         put_many(&db, "k", 5, 500).await;
+        flushed(&db).await;
         assert!(db.current().unwrap().m.tail.is_empty(), "setup: no flush");
         let gets = || store.seg_get_bytes.lock().unwrap().len();
         let before = gets();
@@ -1744,6 +1805,8 @@ fn appends_move_down_without_rewrites() {
             }
         }
         assert!(levels.values().any(|l| l.len() > 1 && !l.contains(&0)), "no segment moved down a level as it was");
+        // The last flush is installed once no commit comes to share its manifest write.
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
         let writes = store.manifest_puts.load(SeqCst);
         tokio::time::sleep(Duration::from_millis(1_000)).await;
         assert_eq!(store.manifest_puts.load(SeqCst), writes, "compaction kept writing the manifest");
@@ -1776,6 +1839,63 @@ fn restarted_nodes_read_what_they_wrote_locally() {
         let v = restarted.db("d").read_version(Consistency::Strong).await.unwrap();
         assert_eq!(v.all_entries(false).await.unwrap().len(), 300);
         assert_eq!(gets(), before, "segment requests after a restart");
+    });
+}
+
+#[test]
+fn bulk_reads_use_the_caches_without_filling_them() {
+    rt().block_on(async {
+        let tier = local::LocalTier(Arc::new(local::MemLocal::new(64 << 20)));
+        let cfg = EngineConfig { local_tier: Some(tier), ..EngineConfig::small_for_tests() };
+        let (a, store) = delayed_engine_with("a", cfg.clone());
+        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        let db = opened(&a, "d").await;
+        let mut r = Rng::new(5);
+        for i in 0..80 {
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            for j in 0..5 {
+                t.put(Bytes::from(format!("k{:03}{j}", (i * 7) % 61)), Value::Inline(Bytes::from(r.bytes(120))))
+                    .unwrap();
+            }
+            db.commit(t.into_request()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let m = db.current().unwrap().m.clone();
+        let whole = |s: &manifest::SegmentMeta| s.size <= cfg.segment_whole_fetch_max;
+        assert!(m.segments.iter().any(whole) && !m.segments.iter().all(whole), "setup: segment sizes");
+        assert_eq!(gets(), 0, "segments this node wrote were fetched back");
+
+        let bulk = |e: &Arc<Engine>| {
+            let v = Version::new(m.clone(), String::new(), e.shared.clone());
+            async move {
+                let mut it = v.iter_bulk(true);
+                let mut got = Vec::new();
+                while let Some(e) = it.next().await.unwrap() {
+                    got.push(e);
+                }
+                got
+            }
+        };
+        let want = bulk(&a).await;
+        assert_eq!(gets(), 0);
+        let restarted = Engine::new(store.clone(), a.shared.env.clone(), cfg.clone(), "a2".into());
+        assert_eq!(bulk(&restarted).await, want);
+        assert_eq!(gets(), 0, "a restarted node read its local tier");
+        assert_eq!(restarted.shared.cache.stats().entries, 0, "bulk reads cached what they read");
+
+        let cold = Engine::new(
+            store.clone(),
+            a.shared.env.clone(),
+            EngineConfig { local_tier: None, ..cfg.clone() },
+            "b".into(),
+        );
+        assert_eq!(bulk(&cold).await, want);
+        let small = m.segments.iter().filter(|s| whole(s)).count();
+        let large: Vec<&manifest::SegmentMeta> = m.segments.iter().filter(|s| !whole(s)).collect();
+        let most = small + large.iter().map(|s| 2 + (s.size / cfg.bulk_read_bytes) as usize + 1).sum::<usize>();
+        assert!(gets() <= most, "{} requests for {small} small and {} large segments", gets(), large.len());
+        assert_eq!(cold.shared.cache.stats().entries, 0, "bulk reads cached what they fetched");
     });
 }
 
@@ -1875,7 +1995,9 @@ fn changes_are_entries_newer_than_the_snapshot() {
 #[test]
 fn one_compaction_at_a_time() {
     rt().block_on(async {
-        let (eng, store) = delayed_engine("a");
+        // A tail that holds a few commits, so that flushes keep up with them.
+        let cfg = EngineConfig { tail_max_bytes: 8 * 1024, ..EngineConfig::small_for_tests() };
+        let (eng, store) = delayed_engine_with("a", cfg);
         let db = opened(&eng, "d").await;
         store.put_reply_ms.store(50, SeqCst);
         for i in 0..16 {

@@ -828,7 +828,8 @@ fn replayed_commits_report_the_seqs_they_received() {
         let want = vec![Appended { first_seq: 1, count: 2 }, Appended { first_seq: 3, count: 1 }];
         assert_eq!((&first.appends, first.replayed), (&want, false));
         assert_eq!((&again.appends, again.replayed, again.time_ms), (&want, true, first.time_ms));
-        assert_eq!(db.commit_status(42).await.unwrap().map(|c| c.appends), Some(want));
+        let status = db.commit_status(42).await.unwrap();
+        assert!(matches!(status, Some(crate::engine::CommitState::Applied(c)) if c.appends == want));
         assert_eq!(read_all(&db, "s", ReadSpec::default()).await.records.len(), 4);
     });
 }
@@ -954,13 +955,15 @@ fn retention_trims_are_batched() {
             tokio::time::sleep(Duration::from_millis(100)).await;
             settle(&db).await;
         }
-        let before = trims();
+        let (before, started) = (trims(), tokio::time::Instant::now());
         for i in 0..30 {
             append_texts(&db, "age", &[&line(i)]).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
             settle(&db).await;
         }
-        assert!(trims() - before <= 4, "{} trims for 30 appends over 3 s", trims() - before);
+        // Trims wait for the stream to age a sixteenth of its retention past it: a second.
+        let secs = started.elapsed().as_secs();
+        assert!(trims() - before <= secs + 1, "{} trims for 30 appends over {secs} s", trims() - before);
         let b = read_all(&db, "bytes", ReadSpec { reverse: true, limit: Some(1000), ..Default::default() }).await;
         let kept: u64 = b.records.iter().map(|(r, _)| r.payload.len() as u64).sum();
         assert!((15_000..=17_000).contains(&kept), "kept {kept} bytes");

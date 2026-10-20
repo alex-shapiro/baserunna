@@ -4,12 +4,15 @@
 
 use super::blob::{BlobWriter, StageGuard};
 use super::compaction::{self, Kind};
-use super::manifest::{Lease, Manifest, ObjKind, Obsolete, SegmentMeta};
+use super::manifest::{Lease, Manifest, ObjKind, Obsolete, PageCache, SegmentMeta};
 use super::range_delete::RangeTombstone;
 use super::segment::SegmentBuilder;
 use super::stream::{self, Appended, Pending, Sealer, Seek, StreamOp};
 use super::txn::{CommitRequest, Isolation, Txn, WriteSet, validate};
-use super::types::{Entry, Seq, Value, commit_key, decode_commit_record, encode_commit_record, is_commit_key};
+use super::types::{
+    ABORT_RECORD, CommitRecord, Entry, Seq, Value, commit_key, decode_commit_record, encode_commit_record,
+    is_commit_key,
+};
 use super::version::{KeyRange, Snapshot, Version};
 use super::{Shared, blob_prefix, levels_key, manifest_key, seg_key};
 use crate::buggify::buggify;
@@ -82,32 +85,67 @@ enum Work {
     MarkDeleted {
         tx: oneshot::Sender<Result<()>>,
     },
+    /// Installs a background flush of the tail as of version `through`.
+    Flush {
+        through: Seq,
+        /// The manifest's `flushes` as of `through`.
+        flushes: u64,
+        flushed: Flushed,
+        /// Store time before any object was written.
+        started_ms: u64,
+        tx: oneshot::Sender<Result<()>>,
+    },
+    /// Resolves commit `id`, aborting it if it has not applied.
+    Resolve {
+        id: u64,
+        tx: oneshot::Sender<Result<Option<Committed>>>,
+    },
 }
 
 enum Outcome {
     Seq(Result<Committed>),
     Unit(Result<()>),
+    Resolved(Result<Option<Committed>>),
+}
+
+impl Outcome {
+    fn unit(self) -> Result<()> {
+        match self {
+            Outcome::Seq(r) => r.map(drop),
+            Outcome::Unit(r) => r,
+            Outcome::Resolved(r) => r.map(drop),
+        }
+    }
+
+    /// The error of an outcome delivered to work expecting another kind.
+    fn error(self) -> Error {
+        self.unit().err().unwrap_or_else(|| Error::internal("mismatched commit outcome"))
+    }
 }
 
 impl Work {
     fn deliver(self, o: Outcome) {
-        match (self, o) {
-            (Work::Commit { tx, .. }, Outcome::Seq(r)) => {
-                let _ = tx.send(r);
-            }
-            (Work::Commit { tx, .. }, Outcome::Unit(r)) => {
-                let _ = tx.send(r.map(|_| Committed { version: 0, replayed: false, time_ms: 0, appends: Vec::new() }));
-            }
-            (Work::Lease { tx: Some(tx), .. }, o)
-            | (Work::Compaction { tx, .. }, o)
-            | (Work::Obsolete { tx, .. }, o)
-            | (Work::MarkDeleted { tx }, o) => {
+        match self {
+            Work::Commit { tx, .. } => {
                 let _ = tx.send(match o {
-                    Outcome::Unit(r) => r,
-                    Outcome::Seq(r) => r.map(|_| ()),
+                    Outcome::Seq(r) => r,
+                    o => Err(o.error()),
                 });
             }
-            (Work::Lease { tx: None, .. }, _) => {}
+            Work::Resolve { tx, .. } => {
+                let _ = tx.send(match o {
+                    Outcome::Resolved(r) => r,
+                    o => Err(o.error()),
+                });
+            }
+            Work::Lease { tx: Some(tx), .. }
+            | Work::Compaction { tx, .. }
+            | Work::Flush { tx, .. }
+            | Work::Obsolete { tx, .. }
+            | Work::MarkDeleted { tx } => {
+                let _ = tx.send(o.unit());
+            }
+            Work::Lease { tx: None, .. } => {}
         }
     }
 
@@ -132,6 +170,7 @@ struct State {
     /// it, and the monotonic instant until which we may rely on it.
     own_lease: Option<(u64, Instant)>,
     compacting: bool,
+    flushing: bool,
     sweeping: bool,
     /// Indicates a write was rejected due to quota, signaling an earlier sweep.
     quota_pressure: bool,
@@ -151,6 +190,8 @@ impl State {
 struct Queue {
     items: VecDeque<QueuedWork>,
     running: bool,
+    /// A flush install waiting to share the manifest write of the next commit.
+    parked: Option<QueuedWork>,
 }
 
 struct QueuedWork {
@@ -172,6 +213,8 @@ pub struct Db {
     /// Notified whenever a newer version is installed.
     installed: tokio::sync::Notify,
     staging: Mutex<Staging>,
+    /// Compressed tail pages of the last manifest encoded for a write.
+    pages: Mutex<PageCache>,
 }
 
 /// Tracks in-flight and completed uncommitted blob uploads against the database quota.
@@ -179,6 +222,15 @@ pub struct Db {
 struct Staging {
     uploading: u64,
     staged: BTreeMap<String, (u64, Instant)>,
+}
+
+/// What the record of a commit id says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitState {
+    Applied(Committed),
+    /// A status check found the commit id unapplied and aborted it: no
+    /// attempt of it applies while the record is retained.
+    Aborted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,18 +293,20 @@ impl Db {
                 lease_requested: false,
                 own_lease: None,
                 compacting: false,
+                flushing: false,
                 sweeping: false,
                 quota_pressure: false,
                 trim_queue: BTreeSet::new(),
                 trimming: false,
             }),
-            q: Mutex::new(Queue { items: VecDeque::new(), running: false }),
+            q: Mutex::new(Queue { items: VecDeque::new(), running: false, parked: None }),
             load_lock: tokio::sync::Mutex::new(()),
             writes_started: 0.into(),
             writes_finished: 0.into(),
             write_done: tokio::sync::Notify::new(),
             installed: tokio::sync::Notify::new(),
             staging: Mutex::new(Staging::default()),
+            pages: Mutex::new(PageCache::default()),
         })
     }
 
@@ -276,7 +330,7 @@ impl Db {
     pub fn busy(&self) -> bool {
         let st = self.st();
         let q = self.queue();
-        q.running || !q.items.is_empty() || st.compacting || st.sweeping || st.trimming
+        q.running || !q.items.is_empty() || st.compacting || st.flushing || st.sweeping || st.trimming
     }
 
     pub(crate) fn idle_for(&self, ms: u64) -> bool {
@@ -285,6 +339,7 @@ impl Db {
         !q.running
             && q.items.is_empty()
             && !st.compacting
+            && !st.flushing
             && !st.sweeping
             && !st.trimming
             && st.last_access.elapsed() >= Duration::from_millis(ms)
@@ -800,18 +855,20 @@ impl Db {
         rx.await.map_err(|_| Error::unavailable("lease release interrupted"))?
     }
 
-    /// Checks whether commit `id` has been applied as of a strong read, and
-    /// how, as a replay of it would report.
-    pub async fn commit_status(self: &Arc<Self>, id: u64) -> Result<Option<Committed>> {
+    /// Reads the record of commit `id` as of a strong read: how it applied,
+    /// as a replay of it would report, or whether it was aborted.
+    pub async fn commit_status(self: &Arc<Self>, id: u64) -> Result<Option<CommitState>> {
         let v = self.read_version(Consistency::Strong).await?;
-        committed(&v, id).await
+        commit_state(&v, None, id).await
     }
 
-    /// Fences any in-flight commit attempts by writing the manifest, then
-    /// checks whether commit `id` was applied.
-    pub async fn commit_status_fenced(self: &Arc<Self>, id: u64) -> Result<Option<Committed>> {
-        self.acquire_lease().await?;
-        self.commit_status(id).await
+    /// Resolves commit `id` for good: returns how it applied, or `None` if it
+    /// has not, after recording it as aborted in a manifest write so that no
+    /// attempt, in flight or still to come, applies it (SPEC §6.2).
+    pub async fn resolve_commit(self: &Arc<Self>, id: u64) -> Result<Option<Committed>> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(Work::Resolve { id, tx });
+        rx.await.map_err(|_| Error::unavailable("commit resolution interrupted"))?
     }
 
     /// Wait until this node installs a version newer than `than`, or `max`
@@ -860,7 +917,13 @@ impl Db {
                 if buggify() {
                     n = 1 + crate::buggify::below(n as u64) as usize;
                 }
-                q.items.drain(..n).collect()
+                let mut batch: Vec<QueuedWork> = q.items.drain(..n).collect();
+                if batch.iter().any(|w| matches!(w.work, Work::Commit { .. }))
+                    && let Some(flush) = q.parked.take()
+                {
+                    batch.insert(0, flush);
+                }
+                batch
             };
             let started = Instant::now();
             let tally = Arc::new(Tally::default());
@@ -914,7 +977,9 @@ impl Db {
     async fn process(self: &Arc<Self>, batch: Vec<Work>) {
         let cfg = self.shared.cfg.clone();
         let mut maybe_applied = false;
-        let mut unknown_writes: Vec<(u64, Instant)> = Vec::new();
+        // Ambiguous writes of this batch: the `write_seq` each wrote, when it was
+        // sent, and the etag its `If-Match` named.
+        let mut unknown_writes: Vec<(u64, Instant, String)> = Vec::new();
         let mut attempt = 0u32;
         let mut base = match self.base_for_commit().await {
             Ok(v) => v,
@@ -963,7 +1028,7 @@ impl Db {
                         Outcome::Seq(Err(e @ Error::Unavailable { .. })) if maybe_applied => {
                             Outcome::Seq(Err(unknown(e)))
                         }
-                        other => other,
+                        other => superseded_unknown(&w, other, maybe_applied),
                     };
                     w.deliver(o);
                 }
@@ -977,12 +1042,15 @@ impl Db {
             let started = Instant::now();
             self.limit_own_lease(&m, attempt_started);
             self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let res = self.put_manifest(m.encode(), &base.etag).await;
+            let data = m.encode_with(&mut self.pages.lock().unwrap_or_else(|e| e.into_inner()));
+            let (res, still_in_flight) = self.put_manifest(data, &base.etag).await;
             if !res.is_ok() {
                 if matches!(res, Err(StoreError::Unavailable(_))) {
                     self.st().trusted = false;
                 }
-                self.write_finished();
+                if !still_in_flight {
+                    self.write_finished();
+                }
             }
             match res {
                 Ok(etag) => {
@@ -999,6 +1067,7 @@ impl Db {
                     });
                     self.clear_lease_flag(&batch);
                     for (w, o) in batch.into_iter().zip(plan.outcomes) {
+                        let o = superseded_unknown(&w, o, maybe_applied);
                         w.deliver(o);
                     }
                     self.after_commit(&v, plan.gc, plan.due);
@@ -1011,7 +1080,7 @@ impl Db {
                         probe::hit(Probe::ObsoleteDeletedAfterAmbiguousWrite);
                     }
                     maybe_applied = true;
-                    unknown_writes.push((m.write_seq, attempt_started));
+                    unknown_writes.push((m.write_seq, attempt_started, base.etag.clone()));
                     self.st().trusted = false;
                     // If the write was applied, `plan.gc` was removed from `obsolete` in the manifest.
                     // These objects have already passed their grace period, so they can be deleted safely
@@ -1040,10 +1109,20 @@ impl Db {
             loop {
                 match self.refresh(Instant::now(), false).await {
                     Ok(v) => {
-                        let sent = unknown_writes.iter().filter(|(ws, _)| *ws == v.m.write_seq).map(|(_, s)| *s).min();
+                        let sent =
+                            unknown_writes.iter().filter(|(ws, ..)| *ws == v.m.write_seq).map(|(_, s, _)| *s).min();
                         if let Some(sent) = sent {
                             probe::hit(Probe::AmbiguousWriteLanded);
                             self.note_own_lease(&v.m, sent);
+                        }
+                        // Once the manifest has moved past every etag an ambiguous write named, none
+                        // can apply any more, and one that did left its commit records in it.
+                        if maybe_applied
+                            && !unknown_writes.iter().any(|(.., etag)| *etag == v.etag)
+                            && !self.any_recorded(&v, &batch).await
+                        {
+                            probe::hit(Probe::AmbiguousWriteSettled);
+                            maybe_applied = false;
                         }
                         base = v;
                         break;
@@ -1062,25 +1141,47 @@ impl Db {
         }
     }
 
+    /// Whether `v` may hold the effects of `batch`: records of the commit of
+    /// any of its transactions, or a flush install, whose effects an install
+    /// sealing chunks in place leaves no trace of. A lookup that fails counts.
+    async fn any_recorded(&self, v: &Version, batch: &[Work]) -> bool {
+        for w in batch {
+            match w {
+                Work::Flush { .. } => return true,
+                Work::Commit { req, .. }
+                    if !matches!(commit_state(v, None, req.commit_id).await, Ok(None | Some(CommitState::Aborted))) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Writes the manifest with `If-Match: etag`, sending a duplicate `PUT` if the first does not
     /// complete within `manifest_put_hedge_ms`. If the duplicate fails with `PreconditionFailed`
     /// while the first `PUT` is still in flight, returns `StoreError::Unavailable` immediately
-    /// because the first `PUT` may have been applied.
-    async fn put_manifest(&self, data: Bytes, etag: &str) -> crate::store::SResult<String> {
-        let key = manifest_key(&self.id);
-        let put = || self.shared.store.put(&key, data.clone(), PutMode::IfMatch(etag.to_string()));
+    /// because the first `PUT` may have been applied, and leaves the write in flight (see
+    /// [`Db::write_finished`]) until the first `PUT` completes: its outcome then reports `true`.
+    async fn put_manifest(self: &Arc<Self>, data: Bytes, etag: &str) -> (crate::store::SResult<String>, bool) {
+        let (store, key, etag) = (self.shared.store.clone(), manifest_key(&self.id), etag.to_string());
+        let put = || -> crate::store::BoxFut<'static, crate::store::SResult<String>> {
+            let (store, key, data, etag) = (store.clone(), key.clone(), data.clone(), etag.clone());
+            Box::pin(async move { store.put(&key, data, PutMode::IfMatch(etag)).await })
+        };
         let mut hedge_ms = self.shared.cfg.manifest_put_hedge_ms;
         if hedge_ms > 0 && buggify() {
             hedge_ms = 1;
         }
         let mut first = put();
         if hedge_ms == 0 {
-            return first.await;
+            return (first.await, false);
         }
         if let Either::Left(r) =
             race(&mut first, &mut Box::pin(tokio::time::sleep(Duration::from_millis(hedge_ms)))).await
         {
-            return r;
+            return (r, false);
         }
         probe::hit(Probe::ManifestPutHedged);
         let ambiguous =
@@ -1095,19 +1196,27 @@ impl Db {
                 if hedge_won {
                     probe::hit(Probe::HedgeWon);
                 }
-                return Ok(etag);
+                return (Ok(etag), false);
             }
             Err(StoreError::PreconditionFailed) if hedge_won => {
                 probe::hit(Probe::HedgeRejectedFirstInFlight);
-                return Err(ambiguous());
+                // Until the first write lands or fails, other nodes may see it while this one
+                // could serve reads from the manifest it replaces.
+                let me = self.clone();
+                self.shared.env.spawn(async move {
+                    let _ = first.await;
+                    me.write_finished();
+                });
+                return (Err(ambiguous()), true);
             }
             Err(e) => e,
         };
-        match (e, if hedge_won { first.await } else { hedge.await }) {
+        let r = match (e, if hedge_won { first.await } else { hedge.await }) {
             (_, Ok(etag)) => Ok(etag),
             (StoreError::Unavailable(_), _) | (_, Err(StoreError::Unavailable(_))) => Err(ambiguous()),
             (e, Err(_)) => Err(e),
-        }
+        };
+        (r, false)
     }
 
     fn write_finished(&self) {
@@ -1150,6 +1259,7 @@ impl Db {
         let mut data_changed = false;
         let mut meta_changed = false;
         let mut release = false;
+        let (mut sealed, mut flushed_tail, mut sealed_in_place) = (0, false, false);
         let mut lease_ms = cfg.lease_ms;
         let quota = self.quota();
         let mut size = base.m.stored_bytes();
@@ -1169,11 +1279,13 @@ impl Db {
             match w {
                 Work::Commit { req, .. } => {
                     let record = commit_key(req.commit_id);
-                    let applied = match tail.get(&record) {
-                        Some(e) => Some(applied_commit(e)?),
-                        None => committed(base, req.commit_id).await?,
-                    };
-                    if let Some(c) = applied {
+                    let state = commit_state(base, Some(&tail), req.commit_id).await?;
+                    if state == Some(CommitState::Aborted) {
+                        probe::hit(Probe::AbortedCommitRejected);
+                        outcomes.push(Outcome::Seq(Err(aborted(req.commit_id))));
+                        continue;
+                    }
+                    if let Some(CommitState::Applied(c)) = state {
                         probe::hit(Probe::CommitReplayed);
                         let at = pending(base, &m, &tail);
                         for id in req.writes.streams.iter().map(StreamOp::id) {
@@ -1346,6 +1458,62 @@ impl Db {
                         outcomes.push(Outcome::Unit(Err(Error::Conflict("compaction inputs changed".into()))));
                     }
                 }
+                Work::Flush { through, flushes, flushed, started_ms, .. } => {
+                    let Some(now_ms) = now.store_ms else {
+                        outcomes.push(Outcome::Unit(Err(Error::unavailable("store clock not synchronized"))));
+                        continue;
+                    };
+                    let installed = !flushed.segments.is_empty()
+                        && flushed.segments.iter().all(|f| m.segments.iter().any(|s| s.id == f.id));
+                    if installed {
+                        probe::hit(Probe::FlushInstallReplayed);
+                        outcomes.push(Outcome::Unit(Ok(())));
+                        continue;
+                    }
+                    // No other flush may have written any of the flushed entries since: a copy in a
+                    // newer segment would shadow chunks that compactions seal from the older one. No
+                    // tombstone that shadowed a flushed entry may have been purged meanwhile. Outputs
+                    // as old as the orphan grace may be swept as orphans, like a compaction's.
+                    let superseded = m.flushes != *flushes
+                        || m.tombstone_horizon > *through
+                        || flushed.segments.iter().any(|f| m.obsolete.iter().any(|o| o.id == f.id))
+                        || *started_ms + cfg.orphan_grace_ms
+                            <= now_ms + bind_margin_ms(cfg) + cfg.clock_sync_max_error_ms;
+                    self.shared.env.trace(|| {
+                        let segs: Vec<&str> = flushed.segments.iter().map(|s| s.id.as_str()).collect();
+                        let keep = flushed.keep.as_ref().map(Vec::len);
+                        format!(
+                            "{} flush through v{through} segments {segs:?} keep {keep:?} superseded={superseded}",
+                            self.id
+                        )
+                    });
+                    if superseded {
+                        probe::hit(Probe::FlushSuperseded);
+                        outcomes.push(Outcome::Unit(Err(Error::Conflict("flush superseded".into()))));
+                        continue;
+                    }
+                    tail.retain(|_, e| e.seq > *through);
+                    match &flushed.keep {
+                        Some(keep) => {
+                            for e in keep {
+                                let deleted = m.range_deletes.iter().any(|t| t.seq > e.seq && t.contains_key(&e.key));
+                                if !deleted && !tail.contains_key(&e.key) {
+                                    tail.insert(e.key.clone(), e.clone());
+                                }
+                            }
+                            sealed_in_place = true;
+                        }
+                        None => {
+                            m.segments.splice(0..0, flushed.segments.iter().cloned());
+                            flushed_tail = true;
+                        }
+                    }
+                    sealed += flushed.chunks;
+                    m.chunk_bytes.bound += flushed.sealed_bytes;
+                    m.flushes += 1;
+                    meta_changed = true;
+                    outcomes.push(Outcome::Unit(Ok(())));
+                }
                 Work::Obsolete { items, blob_bytes: (swept, at), chunk_bytes: (chunks_swept, chunks_at), .. } => {
                     let Some(now_ms) = now.store_ms else {
                         outcomes.push(Outcome::Unit(Err(Error::unavailable("store clock not synchronized"))));
@@ -1374,6 +1542,18 @@ impl Db {
                     meta_changed = true;
                     outcomes.push(Outcome::Unit(Ok(())));
                 }
+                Work::Resolve { id, .. } => match commit_state(base, Some(&tail), *id).await? {
+                    Some(CommitState::Applied(c)) => outcomes.push(Outcome::Resolved(Ok(Some(c)))),
+                    Some(CommitState::Aborted) => outcomes.push(Outcome::Resolved(Ok(None))),
+                    None => {
+                        let (record, seq) = (commit_key(*id), last_seq + 1);
+                        tail.insert(record.clone(), Entry::new(record, seq, Value::Inline(ABORT_RECORD)));
+                        last_seq = seq;
+                        data_changed = true;
+                        probe::hit(Probe::CommitAborted);
+                        outcomes.push(Outcome::Resolved(Ok(None)));
+                    }
+                },
                 Work::MarkDeleted { .. } => {
                     m.flags |= super::manifest::FLAG_DELETED;
                     meta_changed = true;
@@ -1448,35 +1628,30 @@ impl Db {
         } else {
             Some(Lease { node: self.shared.node_id.clone(), expires_ms: now.wall_ms + lease_ms, ms: lease_ms })
         };
-        let mut sealed = 0;
-        let (mut flushed_tail, mut sealed_in_place) = (false, false);
-        if m.tail_bytes() > cfg.tail_max_bytes || (!m.tail.is_empty() && crate::buggify::fires(0.05)) {
-            let flushed = std::mem::take(&mut m.tail);
-            let split = flushed.partition_point(|e| !is_commit_key(&e.key));
-            let mut sealer = Sealer::new(cfg.stream_seal_min_bytes, cfg.stream_chunk_bytes);
-            let mut data = Vec::with_capacity(split);
-            for e in flushed[..split].iter().cloned() {
-                sealer.push(&self.shared, &self.id, e, &mut data).await?;
-            }
-            sealer.finish(&self.shared, &self.id, &mut data).await?;
-            m.chunk_bytes.bound += sealer.sealed_bytes;
-            sealed = sealer.chunks;
-            let commit_records = &flushed[split..];
-            let rest: usize = data.iter().chain(commit_records).map(Entry::size).sum();
-            if sealed > 0 && rest <= cfg.tail_max_bytes / 2 {
-                m.tail = data.into_iter().chain(commit_records.iter().cloned()).collect();
-                sealed_in_place = true;
-            } else {
-                flushed_tail = true;
-                for part in [commit_records, &data[..]] {
-                    if part.is_empty() {
-                        continue;
-                    }
-                    let mut b = SegmentBuilder::new(cfg.block_target, cfg.compression);
-                    for e in part {
-                        b.add(e);
-                    }
-                    m.segments.insert(0, compaction::write(&self.shared, &self.id, b, 0, m.version).await?);
+        let sync_flush = m.tail_bytes() > TAIL_SYNC_FLUSH_FACTOR * cfg.tail_max_bytes;
+        if sync_flush || (!m.tail.is_empty() && crate::buggify::fires(0.05)) {
+            let f = flush_tail(&self.shared, &self.id, &std::mem::take(&mut m.tail), m.version).await?;
+            probe::hit(Probe::TailFlushedInCommit);
+            m.flushes += 1;
+            self.shared.env.trace(|| {
+                let segs: Vec<&str> = f.segments.iter().map(|s| s.id.as_str()).collect();
+                format!(
+                    "{} flush in commit v{} segments {segs:?} keep {:?}",
+                    self.id,
+                    m.version,
+                    f.keep.as_ref().map(Vec::len)
+                )
+            });
+            m.chunk_bytes.bound += f.sealed_bytes;
+            sealed += f.chunks;
+            match f.keep {
+                Some(keep) => {
+                    m.tail = keep;
+                    sealed_in_place = true;
+                }
+                None => {
+                    flushed_tail = true;
+                    m.segments.splice(0..0, f.segments);
                 }
             }
         }
@@ -1522,15 +1697,118 @@ impl Db {
                 st.compacting = true;
                 let me = self.clone();
                 self.shared.env.spawn(async move {
-                    if let Err(e) = me.clone().compact().await {
-                        crate::debug!("compaction of {} stopped: {e}", me.id);
+                    loop {
+                        if let Err(e) = me.clone().compact().await {
+                            crate::debug!("compaction of {} stopped: {e}", me.id);
+                            break;
+                        }
+                        // A write installed as the compaction finished saw it still running.
+                        if !me.still_due(|st| &mut st.compacting, |m| compaction::pick(m, &me.shared.cfg).is_some()) {
+                            return;
+                        }
                     }
                     me.st().compacting = false;
                 });
             }
         }
+        self.maybe_flush(v);
         self.maybe_sweep(v);
         self.schedule_trims(due);
+    }
+
+    /// Flushes the tail of `v` in the background once it outgrows `tail_max_bytes`.
+    fn maybe_flush(self: &Arc<Self>, v: &Arc<Version>) {
+        let over = v.m.tail_bytes() > self.shared.cfg.tail_max_bytes;
+        if v.m.tail.is_empty() || !(over || crate::buggify::fires(0.05)) {
+            return;
+        }
+        {
+            let mut st = self.st();
+            if st.flushing {
+                return;
+            }
+            st.flushing = true;
+        }
+        let (me, mut v) = (self.clone(), v.clone());
+        self.shared.env.spawn(async move {
+            loop {
+                if let Err(e) = me.clone().flush(v).await {
+                    crate::debug!("flush of {} stopped: {e}", me.id);
+                    break;
+                }
+                // Commits installed during the flush saw it still running.
+                let limit = me.shared.cfg.tail_max_bytes;
+                if !me.still_due(|st| &mut st.flushing, |m| m.tail_bytes() > limit) {
+                    return;
+                }
+                match me.current() {
+                    Some(c) => v = c,
+                    None => break,
+                }
+            }
+            me.st().flushing = false;
+        });
+    }
+
+    /// Whether background work that just finished is due again on the
+    /// current version, as long as this node holds the lease. If it is not,
+    /// clears the work's flag (`compacting` or `flushing`) in the same
+    /// critical section that writes check it in.
+    fn still_due(&self, flag: fn(&mut State) -> &mut bool, due: impl Fn(&Manifest) -> bool) -> bool {
+        let mut st = self.st();
+        let again = st.current.as_ref().is_some_and(|c| self.holds_lease(&st, &c.m) && due(&c.m));
+        if !again {
+            *flag(&mut st) = false;
+        }
+        again
+    }
+
+    /// Writes the tail of `v` to level 0 segments, or seals its stream
+    /// records, and installs the result with a manifest write.
+    async fn flush(self: Arc<Self>, v: Arc<Version>) -> Result<()> {
+        let started_ms = self.shared.store_time_ms().await?;
+        let flushed = flush_tail(&self.shared, &self.id, &v.m.tail, v.m.version).await?;
+        self.shared.env.crash_point().await;
+        let outputs: Vec<Obsolete> = flushed
+            .segments
+            .iter()
+            .map(|s| &s.id)
+            .chain(&flushed.chunk_ids)
+            .map(|id| Obsolete { kind: ObjKind::Segment, id: id.clone(), since_ms: started_ms })
+            .collect();
+        let (tx, rx) = oneshot::channel();
+        let (through, flushes) = (v.m.version, v.m.flushes);
+        self.park(Work::Flush { through, flushes, flushed, started_ms, tx });
+        match rx.await.map_err(|_| Error::unavailable("flush install interrupted"))? {
+            Ok(()) => {
+                probe::hit(Probe::TailFlushedInBackground);
+                Ok(())
+            }
+            // No later manifest can install a superseded flush, so nothing references its objects.
+            // A flush superseded after an ambiguous write of its own install fails as unknown instead.
+            Err(e @ Error::Conflict(_)) => {
+                self.delete_obsolete(outputs);
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Holds `w` until the next commit, to install it in the same manifest
+    /// write, or for `FLUSH_INSTALL_WAIT_MS` should none come.
+    fn park(self: &Arc<Self>, w: Work) {
+        let queued = QueuedWork { work: w, enqueued_at: Instant::now(), request_id: None };
+        if let Some(old) = self.queue().parked.replace(queued) {
+            old.work.fail(Error::internal("a parked flush was replaced"));
+        }
+        let me = self.clone();
+        self.shared.env.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(FLUSH_INSTALL_WAIT_MS)).await;
+            let parked = me.queue().parked.take();
+            if let Some(q) = parked {
+                me.enqueue(q.work);
+            }
+        });
     }
 
     fn schedule_trims(self: &Arc<Self>, ids: BTreeSet<u64>) {
@@ -1554,7 +1832,10 @@ impl Db {
         }
     }
 
+    /// Commits the trims queued, retrying a trim that fails with a retryable
+    /// error a few times: one would otherwise wait for the next append or sweep.
     async fn trim_queued(self: Arc<Self>) -> Result<()> {
+        let mut failures = 0;
         loop {
             let id = {
                 let mut st = self.st();
@@ -1566,7 +1847,16 @@ impl Db {
                     }
                 }
             };
-            self.trim_for_retention(id).await?;
+            match self.trim_for_retention(id).await {
+                Ok(()) => failures = 0,
+                Err(e) if e.retryable() && failures < TRIM_RETRIES => {
+                    failures += 1;
+                    probe::hit(Probe::RetentionTrimRetried);
+                    self.st().trim_queue.insert(id);
+                    tokio::time::sleep(Duration::from_millis(100 << failures)).await;
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 
@@ -1797,20 +2087,104 @@ struct Now {
     store_ms: Option<u64>,
 }
 
-async fn committed(v: &Version, id: u64) -> Result<Option<Committed>> {
-    match v.get_entry(&commit_key(id)).await? {
-        Some(e) if !e.value.is_tombstone() => Ok(Some(applied_commit(&e)?)),
-        _ => Ok(None),
-    }
-}
-
-fn applied_commit(record: &Entry) -> Result<Committed> {
-    let decoded = match &record.value {
+/// The record of commit `id` in `v`, or in `tail`, the tail a batch is building on `v`.
+async fn commit_state(v: &Version, tail: Option<&BTreeMap<Bytes, Entry>>, id: u64) -> Result<Option<CommitState>> {
+    let key = commit_key(id);
+    let entry = match tail.map(|t| t.get(&key)) {
+        Some(Some(e)) => Some(e.clone()),
+        _ => v.get_entry(&key).await?,
+    };
+    let Some(e) = entry.filter(|e| !e.value.is_tombstone()) else { return Ok(None) };
+    let record = match &e.value {
         Value::Inline(b) => decode_commit_record(b).ok(),
         _ => None,
     };
-    let (time_ms, appends) = decoded.ok_or_else(|| Error::internal("corrupt commit record"))?;
-    Ok(Committed { version: record.seq, replayed: true, time_ms, appends })
+    Ok(Some(match record.ok_or_else(|| Error::internal("corrupt commit record"))? {
+        CommitRecord::Applied { time_ms, appends } => {
+            CommitState::Applied(Committed { version: e.seq, replayed: true, time_ms, appends })
+        }
+        CommitRecord::Aborted => CommitState::Aborted,
+    }))
+}
+
+pub(crate) fn aborted(id: u64) -> Error {
+    Error::Aborted(format!(
+        "a commit status check aborted commit {id:016x}, which did not apply and never will; retry under a new \
+         idempotency key, or in a new transaction"
+    ))
+}
+
+/// Retries of a retention trim that failed with a retryable error.
+const TRIM_RETRIES: u32 = 5;
+
+/// How long a flush install waits for a commit to share its manifest write.
+const FLUSH_INSTALL_WAIT_MS: u64 = 1_000;
+
+/// A commit flushes the tail itself only once it has outgrown `tail_max_bytes`
+/// this many times over, as when background flushes cannot keep up.
+const TAIL_SYNC_FLUSH_FACTOR: usize = 4;
+
+/// What flushing a tail wrote.
+struct Flushed {
+    /// Level 0 segments that replace the tail, newest first.
+    segments: Vec<SegmentMeta>,
+    /// When sealing stream records into chunks left little else, the entries
+    /// that replace the tail instead, with the sealed records' chunk references.
+    keep: Option<Vec<Entry>>,
+    /// Chunks sealed, their stored bytes, and their ids.
+    chunks: u64,
+    sealed_bytes: u64,
+    chunk_ids: Vec<String>,
+}
+
+/// Writes the entries of `tail`, the tail of version `version`, to level 0:
+/// runs of stream records long enough are sealed into chunks, commit records
+/// go to a segment of their own, and the remaining entries to another. If
+/// sealing left at most half `tail_max_bytes`, no segment is written and the
+/// remaining entries stay in the tail.
+async fn flush_tail(shared: &Shared, db: &str, tail: &[Entry], version: Seq) -> Result<Flushed> {
+    let cfg = &shared.cfg;
+    let split = tail.partition_point(|e| !is_commit_key(&e.key));
+    let mut sealer = Sealer::new(cfg.stream_seal_min_bytes, cfg.stream_chunk_bytes);
+    let mut data = Vec::with_capacity(split);
+    for e in tail[..split].iter().cloned() {
+        sealer.push(shared, db, e, &mut data).await?;
+    }
+    sealer.finish(shared, db, &mut data).await?;
+    let commit_records = &tail[split..];
+    let (chunks, sealed_bytes, chunk_ids) = (sealer.chunks, sealer.sealed_bytes, sealer.chunk_ids);
+    let rest: usize = data.iter().chain(commit_records).map(Entry::size).sum();
+    if chunks > 0 && rest <= cfg.tail_max_bytes / 2 {
+        let keep = Some(data.into_iter().chain(commit_records.iter().cloned()).collect());
+        return Ok(Flushed { segments: Vec::new(), keep, chunks, sealed_bytes, chunk_ids });
+    }
+    let write = |part: &[Entry]| {
+        let mut b = SegmentBuilder::new(cfg.block_target, cfg.compression);
+        for e in part {
+            b.add(e);
+        }
+        async move {
+            match b.is_empty() {
+                true => Ok(None),
+                false => compaction::write(shared, db, b, 0, version).await.map(Some),
+            }
+        }
+    };
+    let (data, records) = tokio::join!(write(&data), write(commit_records));
+    let segments = [data?, records?].into_iter().flatten().collect();
+    Ok(Flushed { segments, keep: None, chunks, sealed_bytes, chunk_ids })
+}
+
+/// A flush found superseded after an ambiguous write of its batch may be
+/// superseded by its own install, which that write applied: its outcome is
+/// unknown, and its objects may be referenced.
+fn superseded_unknown(w: &Work, o: Outcome, maybe_applied: bool) -> Outcome {
+    match (w, o) {
+        (Work::Flush { .. }, Outcome::Unit(Err(e @ Error::Conflict(_)))) if maybe_applied => {
+            Outcome::Unit(Err(unknown(e)))
+        }
+        (_, o) => o,
+    }
 }
 
 fn pending<'a>(base: &'a Version, m: &Manifest, tail: &'a BTreeMap<Bytes, Entry>) -> Pending<'a> {
@@ -2076,16 +2450,17 @@ mod tests {
         let ok = || Ok::<_, StoreError>("e2".to_string());
         let down = || Unavailable("timeout".into());
         let fatal = || Fatal("403".into());
+        // (first, hedge, outcome, time taken, whether the first write is left in flight)
         let cases = [
-            ((100, ok()), None, Ok(()), 100),
-            ((1_000, ok()), Some((10, Err(Refused))), Err(down()), 260),
-            ((300, Err(Refused)), Some((500, ok())), Ok(()), 750),
-            ((300, Err(down())), Some((100, Err(fatal()))), Err(down()), 350),
-            ((300, Err(Refused)), Some((200, Err(Refused))), Err(Refused), 450),
-            ((300, Err(fatal())), Some((100, Err(Refused))), Err(fatal()), 350),
-            ((1_000, Err(down())), Some((100, Err(fatal()))), Err(down()), 1_000),
+            ((100, ok()), None, Ok(()), 100, false),
+            ((1_000, ok()), Some((10, Err(Refused))), Err(down()), 260, true),
+            ((300, Err(Refused)), Some((500, ok())), Ok(()), 750, false),
+            ((300, Err(down())), Some((100, Err(fatal()))), Err(down()), 350, false),
+            ((300, Err(Refused)), Some((200, Err(Refused))), Err(Refused), 450, false),
+            ((300, Err(fatal())), Some((100, Err(Refused))), Err(fatal()), 350, false),
+            ((1_000, Err(down())), Some((100, Err(fatal()))), Err(down()), 1_000, false),
         ];
-        for (first, hedge, want, ms) in cases {
+        for (first, hedge, want, ms, in_flight) in cases {
             rt().block_on(async {
                 let script = Scripted(std::sync::Mutex::new(
                     [Some(first.clone()), hedge.clone()].into_iter().flatten().collect(),
@@ -2094,8 +2469,10 @@ mod tests {
                 let env = Arc::new(crate::env::Env::sim(1, 1_700_000_000_000, origin, 0));
                 let cfg = EngineConfig { manifest_put_hedge_ms: 250, ..EngineConfig::small_for_tests() };
                 let eng = crate::engine::Engine::new(Arc::new(script), env, cfg, "n".into());
-                let got = eng.db("d").put_manifest(Bytes::from_static(b"m"), "e1").await.map(drop);
+                let (got, still) = eng.db("d").put_manifest(Bytes::from_static(b"m"), "e1").await;
+                let got = got.map(drop);
                 let case = format!("first {first:?}, hedge {hedge:?}");
+                assert_eq!(still, in_flight, "{case}");
                 match (&got, &want) {
                     (Err(Unavailable(_)), Err(Unavailable(_))) => {}
                     _ => assert_eq!(got, want, "{case}"),

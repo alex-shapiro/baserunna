@@ -17,6 +17,8 @@ pub trait LocalStore: Send + Sync + 'static {
     fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, Option<Bytes>>;
     /// Best effort: failures are not reported.
     fn put<'a>(&'a self, key: &'a str, data: Bytes) -> BoxFut<'a, ()>;
+    /// Whether `key` is probably cached, without reading or touching it.
+    fn contains(&self, key: &str) -> bool;
     fn stats(&self) -> LocalStats;
 }
 
@@ -128,6 +130,10 @@ impl LocalStore for MemLocal {
         Box::pin(async {})
     }
 
+    fn contains(&self, key: &str) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).0.entries.contains_key(key)
+    }
+
     fn stats(&self) -> LocalStats {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).0.stats()
     }
@@ -236,6 +242,10 @@ impl LocalStore for DiskCache {
             })
             .await;
         })
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.lru().entries.contains_key(&file_name(key))
     }
 
     fn stats(&self) -> LocalStats {

@@ -60,6 +60,9 @@ pub struct WriteSet {
     /// Changes to streams, applied after `puts` by the committer, which
     /// gives appends their seqs (SPEC §5.11).
     pub streams: Vec<StreamOp>,
+    /// Blobs written by copying a committed value (`Txn::copy`). They are
+    /// already bound, so the staging rules for binding do not apply to them.
+    pub copied_blobs: std::collections::BTreeSet<String>,
 }
 
 impl WriteSet {
@@ -90,6 +93,12 @@ impl WriteSet {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Blobs this write set binds for the first time: staged blobs, as opposed to copies of
+    /// values that already reference them.
+    pub fn staged_blob_ids(&self) -> Vec<String> {
+        self.blob_ids().into_iter().filter(|id| !self.copied_blobs.contains(id)).collect()
     }
 }
 
@@ -252,6 +261,18 @@ impl Txn {
             self.pinned_expiry = earliest(self.pinned_expiry, rv.expires());
         }
         Ok(r)
+    }
+
+    /// Copies the committed value of `from` to `to`, returning whether `from` exists. The
+    /// read of `from` is pinned, so the copy commits only if `from` still holds the value,
+    /// which keeps any blob it references alive (SPEC §5.8).
+    pub async fn copy(&mut self, from: &[u8], to: Bytes) -> Result<bool> {
+        let Some(rv) = self.get_pinned(from).await? else { return Ok(false) };
+        if let (Value::Blob(b), Some(_)) = (&rv.value, rv.seq) {
+            self.writes.copied_blobs.insert(b.id.clone());
+        }
+        self.put(to, rv.value)?;
+        Ok(true)
     }
 
     /// Scans `range` with read-your-writes, recording the scanned interval in the read set.

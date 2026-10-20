@@ -49,9 +49,21 @@ pub struct Shared {
     pub metrics: Arc<crate::metrics::StoreMetrics>,
     /// True once the node begins releasing leases for shutdown.
     stopping: std::sync::atomic::AtomicBool,
+    /// Called with a database id and version after this node commits a new data version.
+    commit_hook: Mutex<Option<CommitHook>>,
 }
 
+/// Observes commits made by this node, for notifying other nodes.
+pub type CommitHook = Arc<dyn Fn(&str, u64) + Send + Sync>;
+
 impl Shared {
+    pub(crate) fn committed(&self, db: &str, version: u64) {
+        let h = self.commit_hook.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(h) = h {
+            h(db, version);
+        }
+    }
+
     pub(crate) fn stopping(&self) -> bool {
         self.stopping.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -214,6 +226,7 @@ impl Engine {
             observed_leases: Mutex::new(DetHashMap::default()),
             quota_exempt: Mutex::new(Default::default()),
             stopping: false.into(),
+            commit_hook: Mutex::new(None),
         });
         Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) })
     }
@@ -231,6 +244,16 @@ impl Engine {
     pub fn db(&self, id: &str) -> Arc<Db> {
         let mut g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
         g.entry(id.to_string()).or_insert_with(|| Db::new(id.to_string(), self.shared.clone())).clone()
+    }
+
+    /// The open handle for `id`, without opening one.
+    pub fn open_db(&self, id: &str) -> Option<Arc<Db>> {
+        self.dbs.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+    }
+
+    /// Installs a callback run after every commit this node makes.
+    pub fn set_commit_hook(&self, h: CommitHook) {
+        *self.shared.commit_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
     }
 
     pub fn open_count(&self) -> usize {

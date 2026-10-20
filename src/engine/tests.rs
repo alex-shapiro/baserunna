@@ -2261,11 +2261,68 @@ fn change_feed_cursors_expire_with_purged_deletions() {
         assert!(fresh.is_ok(), "{fresh:?}");
         let mid = ChangePos { seq: v.m.tombstone_horizon, kind: ChangePos::KEY, key: Bytes::from_static(b"a") };
         assert!(matches!(v.changes(&KeyRange::data(), &mid, 10).await, Err(Error::CursorExpired(_))));
+        // A follower starting from nothing needs no deletions, so its cursor never expires.
+        let all = v.changes(&KeyRange::data(), &ChangePos::after_version(0), 10).await.unwrap();
+        assert!(all.changes.iter().any(|c| matches!(c, Change::Entry(e) if &e.key[..] == b"b")));
         for pos in [ChangePos::after_version(7), mid] {
             assert_eq!(ChangePos::decode(&pos.encode()), Some(pos));
         }
         for bad in ["", "x", "1.", "1.2.AA", "1.0.!!", "1.1"] {
             assert_eq!(ChangePos::decode(bad), None, "{bad}");
         }
+    });
+}
+
+#[test]
+fn copies_share_values_and_blobs_without_staging_rules() {
+    rt().block_on(async {
+        let (eng, _store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        let blob = blob::write_blob(&eng.shared, "d", b"blob bytes", "x/y").await.unwrap();
+        let orphan = blob::write_blob(&eng.shared, "d", b"never bound", "x/y").await.unwrap();
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        t.put(Bytes::from_static(b"b"), Value::Blob(blob.clone())).unwrap();
+        db.commit(t.into_request()).await.unwrap();
+        put(&db, "i", "inline").await;
+        // Long after the blob's staging window, a copy can still bind it.
+        tokio::time::sleep(Duration::from_millis(eng.shared.cfg.blob_stage_ttl_ms * 2)).await;
+        let mut t = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
+        assert!(t.copy(b"b", Bytes::from_static(b"b2")).await.unwrap());
+        assert!(t.copy(b"i", Bytes::from_static(b"i2")).await.unwrap());
+        assert!(!t.copy(b"missing", Bytes::from_static(b"m2")).await.unwrap());
+        db.commit(t.into_request()).await.unwrap();
+        let v = db.read_version(Consistency::Strong).await.unwrap();
+        let get = |k: &'static [u8]| {
+            let v = v.clone();
+            async move { v.get(k, u64::MAX).await.unwrap().map(|e| e.value) }
+        };
+        assert_eq!(get(b"b2").await, Some(Value::Blob(blob.clone())));
+        assert_eq!(get(b"i2").await, get(b"i").await);
+        assert_eq!(get(b"m2").await, None);
+        // A copy whose source changes before it commits conflicts, even under snapshot
+        // isolation: the source might have held the last reference to its blob.
+        let mut t = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
+        assert!(t.copy(b"b", Bytes::from_static(b"b3")).await.unwrap());
+        let mut d = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        d.delete(Bytes::from_static(b"b")).unwrap();
+        db.commit(d.into_request()).await.unwrap();
+        assert!(matches!(db.commit(t.into_request()).await, Err(Error::Conflict(_))));
+        // The copy keeps the blob alive after its original key is gone.
+        let wait = eng.shared.cfg.orphan_grace_ms.max(eng.shared.cfg.blob_stage_ttl_ms) + 60_000;
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        db.maintenance_now().await.unwrap();
+        db.sweep_now().await.unwrap();
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(eng.shared.cfg.gc_grace_ms + 1_000)).await;
+            db.maintenance_now().await.unwrap();
+            db.sweep_now().await.unwrap();
+        }
+        assert!(
+            blob::read_range(&eng.shared, "d", &orphan, 0..orphan.size).await.is_err(),
+            "setup: collection deletes unbound blobs"
+        );
+        assert!(!db.current().unwrap().m.obsolete.iter().any(|o| o.id == blob.id), "a copied blob was collected");
+        let data = blob::read_range(&eng.shared, "d", &blob, 0..blob.size).await.unwrap();
+        assert_eq!(&data[..], b"blob bytes");
     });
 }

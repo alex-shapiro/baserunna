@@ -200,6 +200,10 @@ pub struct Db {
     writes_finished: std::sync::atomic::AtomicU64,
     write_done: tokio::sync::Notify,
     installed: tokio::sync::Notify,
+    /// Requests waiting in [`Db::wait_for_change`].
+    waiters: std::sync::atomic::AtomicUsize,
+    /// Whether a refresh prompted by another node's commit notice is running.
+    refreshing: std::sync::atomic::AtomicBool,
     staging: Mutex<Staging>,
     pages: Mutex<PageCache>,
 }
@@ -288,6 +292,8 @@ impl Db {
             writes_finished: 0.into(),
             write_done: tokio::sync::Notify::new(),
             installed: tokio::sync::Notify::new(),
+            waiters: Default::default(),
+            refreshing: Default::default(),
             staging: Mutex::new(Staging::default()),
             pages: Mutex::new(PageCache::default()),
         })
@@ -812,7 +818,7 @@ impl Db {
         if req.deadline.is_none() {
             req.deadline = Some(Instant::now() + Duration::from_millis(self.shared.cfg.commit_timeout_ms));
         }
-        if !req.writes.blob_ids().is_empty() || req.writes.needs_clock() {
+        if !req.writes.staged_blob_ids().is_empty() || req.writes.needs_clock() {
             self.shared.store_time_ms().await?;
         }
         let (tx, rx) = oneshot::channel();
@@ -862,13 +868,34 @@ impl Db {
 
     /// Waits until a version newer than `than` is installed locally, or until `max` elapses.
     pub async fn wait_for_change(&self, than: Seq, max: Duration) {
+        use std::sync::atomic::Ordering::SeqCst;
         let notified = self.installed.notified();
         let mut notified = std::pin::pin!(notified);
         notified.as_mut().enable();
         if self.current().is_some_and(|c| c.m.version > than) {
             return;
         }
+        self.waiters.fetch_add(1, SeqCst);
         let _ = tokio::time::timeout(max, notified).await;
+        self.waiters.fetch_sub(1, SeqCst);
+    }
+
+    /// Handles another node's notice that it committed `version`: if requests here are
+    /// waiting for changes and this node has not seen that version, reloads the manifest,
+    /// which wakes them.
+    pub fn notice_commit(self: &Arc<Self>, version: Seq) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.waiters.load(SeqCst) == 0 || self.current().is_some_and(|c| c.m.version >= version) {
+            return;
+        }
+        if self.refreshing.swap(true, SeqCst) {
+            return;
+        }
+        let me = self.clone();
+        self.shared.env.spawn(async move {
+            let _ = me.read_version(Consistency::Strong).await;
+            me.refreshing.store(false, SeqCst);
+        });
     }
 
     fn enqueue(self: &Arc<Self>, w: Work) {
@@ -1060,6 +1087,9 @@ impl Db {
                         w.deliver(o);
                     }
                     self.after_commit(&v, plan.gc, plan.due);
+                    if v.m.version > base.m.version {
+                        self.shared.committed(&self.id, v.m.version);
+                    }
                     return;
                 }
                 Err(StoreError::PreconditionFailed) => probe::hit(Probe::ManifestCasLost),
@@ -2195,7 +2225,7 @@ fn bind_margin_ms(cfg: &super::EngineConfig) -> u64 {
 /// Validates that all staged blobs referenced by `w` are within the stage TTL
 /// and have not been marked obsolete.
 fn bindable(w: &WriteSet, m: &Manifest, store_now: Option<u64>, cfg: &super::EngineConfig) -> Result<()> {
-    let ids = w.blob_ids();
+    let ids = w.staged_blob_ids();
     if ids.is_empty() {
         return Ok(());
     }

@@ -77,6 +77,10 @@ pub enum Op {
     Delete {
         key: String,
     },
+    Copy {
+        from: String,
+        to: String,
+    },
     DeleteRange {
         #[serde(default)]
         prefix: Option<String>,
@@ -221,6 +225,7 @@ impl Op {
             self,
             Op::Put { .. }
                 | Op::Delete { .. }
+                | Op::Copy { .. }
                 | Op::DeleteRange { .. }
                 | Op::Increment { .. }
                 | Op::InsertRow { .. }
@@ -453,6 +458,17 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
         Op::Delete { key } => {
             let k = user_key(&enc.decode(key, "key")?)?;
             txn.delete(k)?;
+            Ok(json!({}))
+        }
+        Op::Copy { from, to } => {
+            let f = user_key(&enc.decode(from, "from")?)?;
+            let t = user_key(&enc.decode(to, "to")?)?;
+            if !txn.copy(&f, t).await? {
+                return Err(Error::PreconditionFailed {
+                    message: format!("key {from} does not exist"),
+                    op_index: None,
+                });
+            }
             Ok(json!({}))
         }
         Op::DeleteRange { prefix, start, end } => {

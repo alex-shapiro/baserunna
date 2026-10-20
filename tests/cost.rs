@@ -21,6 +21,10 @@ const BUDGETS: &[(&str, f64, f64, f64, f64)] = &[
     // The window includes the first hourly orphan sweep's LISTs.
     ("hot_reads_10_per_s", 60.0, 300.0, 12.0, 0.0),
     ("idle_db", 0.0, 0.0, 0.0, 0.0),
+    // One manifest validation per staleness window; waiting requests read nothing.
+    ("idle_watcher", 13.0, 0.0, 0.0, 0.0),
+    // The writer's commit, and the home node's refresh when notified of it.
+    ("watch_wakeup", 2.0, 1.0, 0.0, 0.0),
     ("steady_write", 0.01, 1.01, 0.002, 0.002),
     ("node_overhead_1_node", 122.0, 31.0, 2.0, 0.0),
     ("node_overhead_3_nodes", 145.0, 31.0, 1.0, 0.0),

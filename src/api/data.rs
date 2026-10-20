@@ -711,7 +711,7 @@ fn bad_commit_id() -> Error {
     Error::invalid("commit id must be 16 hex characters or key:<idempotency key>")
 }
 
-const WATCH_WAIT_MAX_MS: u64 = 20_000;
+const WATCH_WAIT_MAX_MS: u64 = 60_000;
 
 fn feed_params(q: &Params) -> Result<(ChangePos, usize, Duration)> {
     let after = q.get("after").ok_or_else(|| Error::invalid("after is required (a version or a next_cursor)"))?;

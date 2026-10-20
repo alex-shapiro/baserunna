@@ -318,6 +318,10 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 tag_forward(&node, &mut fwd, &target, deadline);
                 let idempotent = parts.method == http::Method::GET || parts.method == http::Method::HEAD;
                 match node.services.transport.call(&addr, fwd).await {
+                    Ok(resp) if resp.headers().contains_key(STALE_TARGET_HEADER) => {
+                        node.mark_suspect(&target);
+                        req = Request::from_parts(parts, Body::from(bytes));
+                    }
                     Ok(resp) => return Ok(forwarded(resp, target)),
                     Err(te) if te.maybe_delivered && !idempotent => {
                         probe::hit(Probe::ForwardAmbiguous);
@@ -355,9 +359,16 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 };
             }
         }
-        // Re-resolve strongly if the cached database name points to a deleted or recreated database.
+        // Re-resolve strongly if the cached database name points to a deleted or recreated
+        // database. A request that accepts a stale snapshot checks at the same staleness, so
+        // it costs no store read while the snapshot is fresh; commits always check the
+        // manifest themselves.
+        let staleness = snapshot_staleness(req.uri().query());
         let opened = match node.open_db(&rec).await {
-            Ok(db) => match db.latest_snapshot().await {
+            Ok(db) => match match staleness {
+                Some(max_staleness_ms) => db.snapshot(Consistency::Snapshot { max_staleness_ms }).await,
+                None => db.latest_snapshot().await.map(|(s, _)| s),
+            } {
                 Err(Error::NotFound(m)) => Err(m),
                 Err(e) => return Err(e),
                 Ok(_) => Ok(db),
@@ -420,6 +431,10 @@ fn hops(h: &HeaderMap) -> u32 {
 }
 
 const SERVER_TIMING_HEADER: &str = "server-timing";
+
+/// Marks a forward refused because it was addressed to a previous process of the node at the
+/// target address. The request was not applied, so the sender may handle it itself.
+const STALE_TARGET_HEADER: &str = "x-baserunna-stale-target";
 
 /// Assigns an `x-request-id` header, attaches `Server-Timing`, and logs request completion.
 async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
@@ -490,12 +505,14 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
     }
     if req.headers().get(FORWARD_TO_HEADER).and_then(|v| v.to_str().ok()) != Some(node.id.as_str()) {
         probe::hit(Probe::ForwardToPreviousProcess);
-        return Error::Unavailable {
+        let mut resp = Error::Unavailable {
             message: "forwarded to a node that is no longer running".into(),
             retry_after_ms: Some(100),
             outcome_unknown: false,
         }
         .into_response();
+        resp.headers_mut().insert(STALE_TARGET_HEADER, HeaderValue::from_static("1"));
+        return resp;
     }
     // Scope deduplication keys to caller credentials and request target.
     let mut scope = Vec::new();
@@ -567,6 +584,15 @@ async fn internal_auth(State(node): State<Arc<Node>>, req: Request, next: Next) 
         return Error::PermissionDenied("bad cluster key".into()).into_response();
     }
     next.run(req).await
+}
+
+/// The staleness a request's query string allows, if it asks for snapshot consistency.
+fn snapshot_staleness(query: Option<&str>) -> Option<u64> {
+    let q: std::collections::BTreeMap<String, String> = serde_urlencoded::from_str(query?).ok()?;
+    match consistency_of(&q) {
+        Ok(Consistency::Snapshot { max_staleness_ms }) => Some(max_staleness_ms),
+        _ => None,
+    }
 }
 
 pub fn consistency_of(q: &std::collections::BTreeMap<String, String>) -> Result<Consistency> {
@@ -777,7 +803,12 @@ pub(crate) trait Found {
     fn found(&self) -> bool;
 }
 
-/// Polls `$read` on fresh snapshots until [`Found::found`] is true or `$wait` elapses.
+/// Runs `$read` on fresh snapshots until [`Found::found`] is true or `$wait` elapses. Between
+/// reads it waits for this node to install a newer version: one this node committed, or
+/// one another node announced (`notify_home`). Strong reads are also repeated every
+/// `watch_poll_ms`, since a node without the lease learns of other nodes' commits only by
+/// reading the manifest. Snapshot reads are repeated only once the snapshot is too stale,
+/// so an idle snapshot watcher reads the store at most once per `max_staleness_ms`.
 macro_rules! watch {
     ($node:expr, $db:expr, $c:expr, $wait:expr, |$t:ident| $read:expr) => {{
         let until_ = tokio::time::Instant::now() + $wait;
@@ -787,8 +818,13 @@ macro_rules! watch {
             if crate::api::Found::found(&out_) || left_.is_zero() {
                 break (out_, v_);
             }
-            let poll_ = std::time::Duration::from_millis($node.cfg.watch_poll_ms);
-            $db.wait_for_change(v_, left_.min(poll_)).await;
+            let poll_ms_ = match $c {
+                crate::engine::Consistency::Strong => $node.cfg.watch_poll_ms,
+                crate::engine::Consistency::Snapshot { max_staleness_ms } => {
+                    max_staleness_ms.max($node.cfg.watch_poll_ms)
+                }
+            };
+            $db.wait_for_change(v_, left_.min(std::time::Duration::from_millis(poll_ms_))).await;
         }
     }};
 }
@@ -804,6 +840,20 @@ async fn close_if_body_unread(req: Request, next: Next) -> Response {
         resp.headers_mut().insert(http::header::CONNECTION, HeaderValue::from_static("close"));
     }
     resp
+}
+
+#[derive(serde::Deserialize)]
+struct CommitNotice {
+    db: String,
+    version: u64,
+}
+
+/// Another node committed a version of a database whose home is this node.
+async fn commit_notice(State(node): State<Arc<Node>>, axum::Json(n): axum::Json<CommitNotice>) -> Response {
+    if let Some(db) = node.engine.open_db(&n.db) {
+        db.notice_commit(n.version);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn healthz(State(node): State<Arc<Node>>) -> Response {
@@ -827,6 +877,7 @@ pub fn router(node: Arc<Node>) -> Router {
         data::routes().merge(streams::routes()).route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
     let internal = Router::new()
         .route("/internal/v1/meta", post(account::internal_meta))
+        .route("/internal/v1/notice", post(commit_notice))
         .route_layer(middleware::from_fn_with_state(node.clone(), internal_auth));
     let r = Router::new()
         .route("/healthz", get(healthz))

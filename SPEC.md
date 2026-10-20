@@ -636,6 +636,11 @@ Crashed flushes, aborted compactions, abandoned blob uploads, and overwritten ro
 
 Because compaction output segments are unreferenced until the compaction is installed, a sweep can mark the outputs of a compaction that runs longer than the orphan grace period as obsolete. The compaction rejects the installation if its output segments have been marked obsolete.
 
+Blobs bound by `copy` (§6.3) were already referenced by the key copied, and
+the copy's read of that key is validated at commit, so every version between
+the read and the commit references the blob; no sweep can find it unreferenced
+in between.
+
 #### Long Blob Reads
 
 Streaming a large blob by ID can take longer than the 30 min obsolete grace period. A blob read that has run for 10 min writes a `dbs/{db_id}/blob/{blob_id}/pin` object and refreshes it every 10 min. If a blob is already listed in `obsolete` when a read by ID begins, the reader writes the pin before reading any chunks.
@@ -787,6 +792,7 @@ may have expired.
 | `scan`         | `prefix` or `start`/`end`, `limit` (≤1000), `reverse`, `keys_only`                                                                             | `{items, next_cursor?}`                                 |
 | `put`          | key, `value` or `blob_id`, `ttl_ms?`                                                                                                           | `{}`                                                    |
 | `delete`       | key                                                                                                                                            | `{}`                                                    |
+| `copy`         | `from`, `to`                                                                                                                                   | `{}`. 412 if `from` does not exist                      |
 | `delete_range` | `prefix` or `start`/`end`                                                                                                                      | `{}` (expanded at commit)                               |
 | `check`        | key + one of `exists`, `version`, `value`                                                                                                      | fails txn with 412 if false                             |
 | `increment`    | key, `by` (i64), `ttl_ms?`                                                                                                                     | `{value}`. Value is ASCII decimal; missing = 0          |
@@ -807,7 +813,14 @@ may have expired.
 
 `ttl_ms` (1 ms to 10 years) adds a TTL expiration relative to write
 commit time (§4.5); `update_row`, `update_rows` and `increment` do not
-upate an existing TTL by default.
+update an existing TTL by default.
+
+`copy` writes the committed value of `from` to `to` without moving data: a
+blob value is shared by both keys, not copied, and binding it is exempt from
+the staging rules for new blobs (§4.3). The read of `from` is validated at
+commit under every isolation level, so the copy commits only if `from` still
+references the blob, which keeps a garbage collection sweep from collecting it
+(§5.8). The copy does not keep `from`'s TTL.
 
 A record body is a `value` string or `json` value. Reads return each record
 as `{seq, time, headers?, value | json}`. A read's `next_seq` is where the
@@ -828,11 +841,26 @@ follows changes for a specific table. A page reports, for every key changed afte
 `deleted_range`. Intermediate values a key had in between are not reported.
 Changes are ordered by version, and within a version range deletions come
 first; a page holds at most `limit` of them and carries a `next_cursor` to
-pass as the next `after`, at once while `more` is true. With `wait_ms` (up
-to 20 s), a request that finds no change waits for one: on the lease holder, it
-returns as soon as a commit installs, elsewhere it re-reads the manifest
-every `watch_poll_ms` (1 s). Applying the pages in order to the state at
-`after` yields the current state.
+pass as the next `after`, at once while `more` is true. Applying the pages in
+order to the state at `after` yields the current state.
+
+With `wait_ms` (up to 60 s), a request that finds no change waits for one. A
+waiting request wakes when its node installs a newer version: one the node
+committed, or one another node announced. A node that commits a version of a
+database tells the database's rendezvous home (§7) with a best-effort
+internal notice, and the home reloads the manifest if requests there are
+waiting. Requests for a database without a lease are routed to its home, so
+waiting requests and the commits they wait for usually meet there. Between
+wakeups, a strong waiting read repeats every `watch_poll_ms` (1 s), since a
+node without the lease learns of other nodes' commits only from the manifest.
+A snapshot waiting read (`consistency=snapshot&max_staleness_ms=…`) repeats
+only once its snapshot is too stale, so a device that keeps a request waiting
+on an idle database costs one manifest read per `max_staleness_ms` and none
+in between; a lost notice delays it by at most that long.
+
+A cursor of `0` never expires: a follower starting from nothing needs no
+deletions, so its first pages are the database's live keys, a full state
+transfer.
 
 The engine finds the keys changed after a version by merging only the
 sources holding entries that new (`Version::changes`): the tail and the
@@ -871,8 +899,10 @@ its `version`.
   address belongs to a previous process and is ignored during routing. If the target is another node, the
   request is proxied, streaming large bodies, with `x-baserunna-hops`
   incremented; a request already forwarded twice is handled where it is. If
-  forwarding certainly failed (the request never left), the receiving node
-  handles the request itself. It can serve reads, and it can write only if
+  forwarding certainly failed (the request never left), or the target refused
+  it as addressed to a previous process at its address (marked by
+  `x-baserunna-stale-target`; nothing was applied), the receiving node marks
+  the target a suspect and handles the request itself. It can serve reads, and it can write only if
   no other node holds a valid lease (otherwise `503 unavailable` with
   `Retry-After`).
 - **Forwarded requests include the cluster key** (`x-baserunna-cluster-key`), so the
@@ -970,7 +1000,11 @@ across nodes.
 
 Name resolution is protected against staleness. If a cached name maps to
 a database whose manifest is marked deleted, the name is re-resolved
-strongly and the request continues against the new database. If metadata
+strongly and the request continues against the new database. The manifest
+is checked as strongly as the request reads: a request asking for a snapshot
+up to `max_staleness_ms` old checks a manifest at most that old, so it costs
+no store request while the node's copy is fresh. Commits check the manifest
+in any case. If metadata
 still maps the name to the deleted database, the deletion was interrupted
 halfway, and the node completes it. Creating a database whose name belongs
 to such a half-deleted database also completes the deletion first. A
@@ -1384,6 +1418,8 @@ Every 20 ms of virtual time, global oracles verify that at most 1 node relies on
   | blob upload / download                        | 0.25 PUT / 0.125 GET per MiB            |
   | steady writes, with flush/compaction/GC       | 1.001 PUT, 0.001 GET per commit         |
   | idle database                                 | 0 per hour                              |
+  | idle device waiting on changes (5 min stale)  | 12 GET per hour                         |
+  | commit noticed by a waiting request elsewhere | 1 GET (40 ms)                           |
   | node overhead (heartbeats, membership)        | 31 PUT + up to 140 GET per hour         |
   | stream append                                 | 1 PUT                                   |
   | stream tail read, lease holder                | 0                                       |
@@ -1456,8 +1492,9 @@ scripts/mutants.sh                                               # run mutation 
 46. _Precondition failure overtaken by in-flight attempt._ If a retried idempotent request failed a precondition while an earlier attempt was still in flight, the earlier attempt could still be committed after the `412` response. Precondition failures now write an abort record before returning (§6.2).
 47. _Stale leased reads during hedged manifest writes._ If a hedged duplicate `PUT` failed with `412` while the primary `PUT` was still in flight, the node reloaded the prior manifest and served leased reads before the primary `PUT` completed. Nodes now disable leased reads while a hedged `PUT` remains in flight and require a manifest read started after the ambiguous write before restoring trust (§5.5).
 48. _Levels object garbage-collected during stalled manifest read._ If a manifest read stalled past the GC grace period, its `.levels` object could be deleted before being fetched, causing a `500` error. The node now reloads the manifest if a `.levels` object is not found (§5.8).
+49. _Requests stuck on a restarted peer's previous process._ A node that forwarded a write to a peer that had restarted at the same address got a non-applied `503` back and passed it to the client, until its membership table caught up. The refusal is now marked, and the forwarding node marks the peer a suspect and handles the request itself (§7).
 
-Cost model tests (§13.5) also identified five efficiency defects: lapsed leases on read-heavy databases were never re-acquired, unleased strong reads validated the manifest twice, read-only renewals used the shorter write-lease duration, `.levels` objects under a separate prefix required an extra `LIST` call per sweep, and stream flushes wrote separate small segments for commit records and stream state instead of retaining unsealed entries in `tail`.
+Cost model tests (§13.5) also identified seven efficiency defects: lapsed leases on read-heavy databases were never re-acquired, unleased strong reads validated the manifest twice, read-only renewals used the shorter write-lease duration, `.levels` objects under a separate prefix required an extra `LIST` call per sweep, stream flushes wrote separate small segments for commit records and stream state instead of retaining unsealed entries in `tail`, every API request validated the manifest strongly even when it asked for a snapshot (so an idle device waiting on a change feed cost a `GET` per poll), and waiting change feed requests polled the manifest every second whatever their consistency.
 
 Security review alongside simulation testing identified that internal cluster endpoints were unauthenticated when `BASERUNNA_CLUSTER_SECRET` was unset; clusters now always generate and require a cluster key (§7).
 

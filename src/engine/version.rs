@@ -1069,9 +1069,11 @@ impl ChangePos {
         ChangePos { seq, kind: ChangePos::END, key: Bytes::new() }
     }
 
-    /// Returns true if all deletions after this position are retained when tombstones up to `horizon` have been purged.
+    /// Returns true if all deletions after this position that a follower needs are retained
+    /// when tombstones up to `horizon` have been purged. A follower starting from version 0
+    /// holds no keys, so it needs no deletions and never expires.
     pub fn retained_by(&self, horizon: Seq) -> bool {
-        self.seq > horizon || (self.seq == horizon && self.kind == ChangePos::END)
+        self.seq > horizon || (self.seq == horizon || self.seq == 0) && self.kind == ChangePos::END
     }
 
     /// Encodes the cursor as an opaque URL-safe string; see [`ChangePos::decode`].

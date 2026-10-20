@@ -295,9 +295,44 @@ impl Node {
             draining: std::sync::atomic::AtomicBool::new(false),
             cfg,
         });
+        let weak = Arc::downgrade(&node);
+        node.engine.set_commit_hook(Arc::new(move |db: &str, version: u64| {
+            if let Some(n) = weak.upgrade() {
+                n.notify_home(db, version);
+            }
+        }));
         node.bootstrap().await?;
         node.spawn_background();
         Ok(node)
+    }
+
+    /// Tells the database's rendezvous home that this node committed `version`, so requests
+    /// waiting there for changes see it at once rather than at their next poll. Requests for
+    /// a database without a lease are routed to its home, so waiting requests usually are
+    /// there. Best effort: a lost notice delays waiters until they poll.
+    fn notify_home(self: &Arc<Self>, db: &str, version: u64) {
+        let live = self.live_members();
+        let Some(home) = cluster::rendezvous(db, &live) else { return };
+        if home.id == self.id || home.addr == self.cfg.addr {
+            return;
+        }
+        let addr = home.addr.clone();
+        let body = serde_json::json!({"db": db, "version": version}).to_string();
+        let key = self.cluster_key();
+        let me = self.clone();
+        self.env.spawn(async move {
+            let Ok(mut req) =
+                Request::post("/internal/v1/notice").header("content-type", "application/json").body(Body::from(body))
+            else {
+                return;
+            };
+            if let Some(k) = key
+                && let Ok(v) = k.parse()
+            {
+                req.headers_mut().insert(CLUSTER_KEY_HEADER, v);
+            }
+            let _ = me.services.transport.call(&addr, req).await;
+        });
     }
 
     async fn bootstrap(self: &Arc<Self>) -> Result<()> {

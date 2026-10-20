@@ -289,6 +289,7 @@ fn schemas() -> Value {
                     "reverse": b(), "keys_only": b(), "cursor": s()}), &["op"]),
                 obj(json!({"op": {"const": "put"}, "key": s(), "value": s(), "blob_id": s(), "ttl_ms": ttl()}), &["op", "key"]),
                 obj(json!({"op": {"const": "delete"}, "key": s()}), &["op", "key"]),
+                obj(json!({"op": {"const": "copy"}, "from": s(), "to": s()}), &["op", "from", "to"]),
                 obj(json!({"op": {"const": "delete_range"}, "prefix": s(), "start": s(), "end": s()}), &["op"]),
                 obj(json!({"op": {"const": "check"}, "key": s(), "exists": b(), "version": i(), "value": s()}), &["op", "key"]),
                 obj(json!({"op": {"const": "increment"}, "key": s(), "by": i(), "ttl_ms": ttl()}), &["op", "key"]),
@@ -1188,7 +1189,7 @@ fn paths() -> Value {
         let mut v = vec![
             query_required("after", s(), "Report changes after this version or `next_cursor`"),
             query("limit", i(), "1..=1000 (default 100)"),
-            query("wait_ms", i(), "0..=20000: wait up to this duration for a change"),
+            query("wait_ms", i(), "0..=60000: wait up to this duration for a change"),
         ];
         v.extend(extra);
         v.extend(consistency());

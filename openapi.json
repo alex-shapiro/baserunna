@@ -1259,6 +1259,26 @@
           {
             "additionalProperties": false,
             "properties": {
+              "from": {
+                "type": "string"
+              },
+              "op": {
+                "const": "copy"
+              },
+              "to": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "from",
+              "to"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
               "end": {
                 "type": "string"
               },
@@ -3708,7 +3728,7 @@
             }
           },
           {
-            "description": "0..=20000: wait up to this duration for a change",
+            "description": "0..=60000: wait up to this duration for a change",
             "in": "query",
             "name": "wait_ms",
             "required": false,
@@ -5496,7 +5516,7 @@
             }
           },
           {
-            "description": "0..=20000: wait up to this duration for a change",
+            "description": "0..=60000: wait up to this duration for a change",
             "in": "query",
             "name": "wait_ms",
             "required": false,

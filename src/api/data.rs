@@ -189,7 +189,14 @@ async fn delete_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
     ctx.principal.require_unscoped()?;
     node.access_strong(&ctx.principal, &ctx.rec).await?.require_admin()?;
     ctx.db.mark_deleted().await?;
-    node.run_meta(MetaCmd::DeleteDb { id: ctx.rec.id.clone() }).await?;
+    node.env.crash_point().await;
+    // Ignore `NotFound` if a concurrent repair already removed the metadata record after the manifest was marked deleted.
+    match node.run_meta(MetaCmd::DeleteDb { id: ctx.rec.id.clone() }).await {
+        Ok(_) | Err(Error::NotFound(_)) => {}
+        Err(e) => {
+            return Err(Error::Unavailable { message: e.message(), retry_after_ms: None, outcome_unknown: true });
+        }
+    }
     node.forget_db_name(&ctx.rec.owner_id, &ctx.rec.name);
     node.engine.forget(&ctx.rec.id);
     Ok(axum::Json(json!({})))
@@ -495,6 +502,7 @@ async fn one_shot(
     let octx = op_ctx(&node, &ctx, req.encoding);
     let key = req.idempotency_key.as_deref();
     let (commit_id, ran) = run_txn!(node, ctx, req.isolation.into(), c, key, |t| exec_ops(&octx, t, &req.ops).await);
+    node.env.crash_point().await;
     Ok(axum::Json(match ran {
         Ran::Read { out, version } => json!({"version": version, "committed": false, "results": out}),
         Ran::Committed { mut out, commit } => {
@@ -511,7 +519,6 @@ async fn one_shot(
     }))
 }
 
-/// The first seq each of a commit's appends received.
 fn first_seqs(c: &Committed) -> Vec<u64> {
     c.appends.iter().map(|a| a.first_seq).collect()
 }
@@ -564,9 +571,14 @@ async fn begin_txn(
         .into_response())
 }
 
-fn get_open(node: &Node, ctx: &DbCtx, id: &str) -> Result<Arc<tokio::sync::Mutex<OpenTxn>>> {
-    node.txns.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned().ok_or(Error::TxnNotFound).inspect(|_| {
-        let _ = ctx;
+fn get_open(node: &Node, id: &str) -> Result<Arc<tokio::sync::Mutex<OpenTxn>>> {
+    if crate::buggify::fault(0.01) {
+        remove_open(node, id);
+    }
+    let open = node.txns.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned();
+    open.ok_or_else(|| {
+        crate::probe::hit(crate::probe::Probe::InteractiveTxnLost);
+        Error::TxnNotFound
     })
 }
 
@@ -587,7 +599,7 @@ async fn txn_ops(
     JsonBody(b): JsonBody<OpsBody>,
 ) -> Result<J> {
     let id = param(&p, "id")?.to_string();
-    let entry = get_open(&node, &ctx, &id)?;
+    let entry = get_open(&node, &id)?;
     let mut g = entry.lock().await;
     if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
         return Err(Error::TxnNotFound);
@@ -629,7 +641,7 @@ async fn commit_txn(
     JsonBody(b): JsonBody<Option<CommitBody>>,
 ) -> Result<J> {
     let id = param(&p, "id")?.to_string();
-    let entry = get_open(&node, &ctx, &id)?;
+    let entry = get_open(&node, &id)?;
     let mut g = entry.lock().await;
     if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
         return Err(Error::TxnNotFound);
@@ -664,7 +676,7 @@ async fn commit_txn(
 
 async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
     let id = param(&p, "id")?.to_string();
-    let entry = get_open(&node, &ctx, &id)?;
+    let entry = get_open(&node, &id)?;
     let g = entry.lock().await;
     if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
         return Err(Error::TxnNotFound);

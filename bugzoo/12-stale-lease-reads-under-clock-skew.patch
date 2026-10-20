@@ -1,0 +1,16 @@
+diff --git a/src/engine/db.rs b/src/engine/db.rs
+index 3a4eb24..cb7749e 100644
+--- a/src/engine/db.rs
++++ b/src/engine/db.rs
+@@ -324,9 +324,8 @@ impl Db {
+         if self.lease_expired_on_store(v, l) {
+             return None;
+         }
+-        let valid_for = Duration::from_millis(l.ms + self.shared.cfg.lease_margin_ms);
+-        let seen = self.shared.lease_seen(&self.id, l, m.write_seq);
+-        let left = (seen + valid_for).saturating_duration_since(Instant::now());
++        let until_ms = l.expires_ms + self.shared.cfg.lease_margin_ms;
++        let left = Duration::from_millis(until_ms.saturating_sub(self.shared.env.now_ms()));
+         (!left.is_zero()).then_some((l, left))
+     }
+ 

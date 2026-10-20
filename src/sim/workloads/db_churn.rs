@@ -38,7 +38,7 @@ async fn check_db(c: &Client, db: &str, want: &Option<BTreeMap<String, String>>,
     let r = c.call_retry("GET", &format!("/v1/dbs/{db}/kv?limit=1000"), None).await;
     match want {
         None if r.status == 404 => Ok(()),
-        None => Err(format!("{ctx}: deleted database {db} answers {} {}", r.status, r.json)),
+        None => Err(format!("{ctx}: deleted database {db} returned {} {}", r.status, r.json)),
         Some(m) => {
             let items = r.json["items"].as_array().ok_or(format!("{ctx}: scan of {db}: {} {}", r.status, r.json))?;
             let got: BTreeMap<String, String> = items
@@ -119,7 +119,7 @@ async fn client(c: Client, k: usize, dbs: usize, steps: usize) -> Result<(Model,
 }
 
 pub async fn run(sim: Arc<Sim>, clients: usize, dbs: usize, steps: usize, chaos: bool) -> Result<(), String> {
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut hs = Vec::new();
     for k in 0..clients {
         let c = Client::signup(&sim, &format!("churn{k}"), &format!("churn{k}@churn.test"), "password-123").await?;
@@ -133,13 +133,10 @@ pub async fn run(sim: Arc<Sim>, clients: usize, dbs: usize, steps: usize, chaos:
             Err(e) => err = err.or(Some(e)),
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
     if let Some(e) = err {
         return Err(e);
     }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     super::check_integrity(&sim).await?;
     for (model, c) in &done {
         for (db, want) in model {

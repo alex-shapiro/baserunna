@@ -70,17 +70,16 @@ async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Resul
             match c.send("PUT", &path, &[], Bytes::from(data.to_vec())).await {
                 Ok(r) if r.status == 200 => {
                     let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap_or_default();
-                    let v = v["version"].as_u64().ok_or("put: no version")?;
+                    let v = v["version"].as_u64().ok_or("put: missing version")?;
                     written.lock().unwrap_or_else(|e| e.into_inner()).by_version.insert((k, v), data.clone());
                     break;
                 }
                 Ok(r) if r.status == 503 && !String::from_utf8_lossy(&r.body).contains("\"unknown\"") => {
                     c.pause(100).await;
                 }
-                // Store stall exceeded the shortened stage TTL; commit rejected the expired upload.
-                Ok(r) if r.status == 400 && String::from_utf8_lossy(&r.body).contains("expired") => {}
+                // Abort this write if the upload exceeded the shortened staging TTL.
+                Ok(r) if r.status == 400 && String::from_utf8_lossy(&r.body).contains("expired") => break,
                 Ok(r) if r.status != 503 => return Err(format!("put {path}: {}", r.status)),
-                // Ambiguous: retrying the same content is safe.
                 _ => c.pause(ZOMBIE_WAIT_MS).await,
             }
         }
@@ -88,7 +87,7 @@ async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Resul
     Ok(())
 }
 
-/// Keys `0..KEYS` are large blobs, `KEYS..2 * KEYS` small ones.
+/// Keys `0..KEYS` are large blobs; `KEYS..2 * KEYS` are small blobs.
 fn key_name(k: u64) -> String {
     if k < KEYS { format!("f{k}") } else { format!("s{}", k - KEYS) }
 }
@@ -114,7 +113,7 @@ fn check_body(r: &super::super::SimResponse, candidates: &[Arc<Vec<u8>>], what: 
     if candidates.iter().any(matches) {
         return Ok(());
     }
-    Err(format!("{what}: {} bytes [{start}, {end}) match no content ever written there", r.body.len()))
+    Err(format!("{what}: {} bytes [{start}, {end}) do not match any written content", r.body.len()))
 }
 
 async fn reader(
@@ -138,8 +137,6 @@ async fn reader(
         let hdr: Vec<(&str, String)> = range.iter().map(|(a, b)| ("range", format!("bytes={a}-{b}"))).collect();
         let by_id = rng.chance(0.4);
         let (path, what) = if by_id {
-            // Resolve the key's current blob ID, then read by ID; the blob may
-            // be unreferenced and collected between the two requests.
             let r = c.get(&format!("{BASE}/kv?prefix=f{k}&keys_only=true&limit=1")).await;
             let Ok(r) = r else { continue };
             let Some(item) = r.json["items"].as_array().and_then(|a| a.first()).cloned() else { continue };
@@ -150,7 +147,6 @@ async fn reader(
         };
         let r = match c.send("GET", &path, &hdr, Bytes::new()).await {
             Ok(r) => r,
-            // Stream broken by a collected chunk, or lost response.
             Err(_) => {
                 stats.broken.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -165,7 +161,7 @@ async fn reader(
                         Some(c) => vec![c.clone()],
                         None => w.by_key.get(&k).cloned().unwrap_or_default(),
                     },
-                    (false, None) => return Err(format!("{what}: no version header")),
+                    (false, None) => return Err(format!("{what}: missing version header")),
                     (true, _) => w.by_sha.values().cloned().collect(),
                 };
                 drop(w);
@@ -189,7 +185,7 @@ async fn small_read(c: &Client, k: u64, written: &Mutex<Written>, stats: &Stats)
             if g["found"] != true {
                 return Ok(());
             }
-            let got = g["value"].as_str().and_then(b64::decode).ok_or(format!("{key}: no inline value: {g}"))?;
+            let got = g["value"].as_str().and_then(b64::decode).ok_or(format!("{key}: missing inline value: {g}"))?;
             let w = written.lock().unwrap_or_else(|e| e.into_inner());
             let want = g["version"].as_u64().and_then(|v| w.by_version.get(&(k, v)));
             let ok = match want {
@@ -197,7 +193,7 @@ async fn small_read(c: &Client, k: u64, written: &Mutex<Written>, stats: &Stats)
                 None => w.by_key.get(&k).is_some_and(|cs| cs.iter().any(|c| **c == got)),
             };
             if !ok {
-                return Err(format!("{key}: inline value of {} bytes matches nothing written", got.len()));
+                return Err(format!("{key}: inline value of {} bytes does not match any written value", got.len()));
             }
             stats.ok.fetch_add(1, Ordering::Relaxed);
             Ok(())
@@ -214,7 +210,7 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, rounds: usize, c
     let written = Arc::new(Mutex::new(Written::default()));
     let stats = Arc::new(Stats::default());
     let done = Arc::new(AtomicBool::new(false));
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let rs: Vec<_> = (0..readers)
         .map(|i| {
             let c = Client::with_token(&sim, &format!("gcreader{i}"), &token);
@@ -238,9 +234,6 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, rounds: usize, c
             err = err.or(Some(e));
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
     if let Some(e) = err {
         return Err(e);
     }
@@ -251,7 +244,7 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, rounds: usize, c
             stats.broken.load(Ordering::Relaxed)
         );
     }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     let e = &sim.cfg.engine;
     sim.sleep(e.orphan_grace_ms + e.gc_grace_ms + 2 * e.sweep_interval_ms).await;
     let body = json!({"ops": [{"op": "put", "key": "touch", "value": "1"}], "idempotency_key": "gc-touch"});

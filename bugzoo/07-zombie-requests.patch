@@ -1,0 +1,20 @@
+diff --git a/src/engine/db.rs b/src/engine/db.rs
+index 0e2dd5a..765bab8 100644
+--- a/src/engine/db.rs
++++ b/src/engine/db.rs
+@@ -1201,15 +1201,6 @@ impl Db {
+                         outcomes.push(Outcome::Seq(Ok(c)));
+                         continue;
+                     }
+-                    if req.deadline.is_some_and(|d| Instant::now() > d) {
+-                        probe::hit(Probe::CommitDeadlinePassed);
+-                        outcomes.push(Outcome::Seq(Err(Error::Unavailable {
+-                            message: "commit deadline exceeded".into(),
+-                            retry_after_ms: Some(100),
+-                            outcome_unknown: false,
+-                        })));
+-                        continue;
+-                    }
+                     if let Err(e) = validate(req, base, &accepted, &touched, time).await {
+                         if matches!(e, Error::Conflict(_)) {
+                             probe::hit(Probe::CommitConflict);

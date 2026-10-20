@@ -1,0 +1,12 @@
+diff --git a/src/node.rs b/src/node.rs
+index bc7700d..787d167 100644
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -968,7 +968,6 @@ impl Node {
+         let (user_id, fp) = auth::open_token(&self.cookie_key(), purpose, token, self.now_ms()).ok_or_else(bad)?;
+         match self.user_strong(&user_id).await {
+             Ok(user) => Ok((user, fp)),
+-            Err(e) if e.retryable() => Err(e),
+             Err(_) => Err(bad()),
+         }
+     }

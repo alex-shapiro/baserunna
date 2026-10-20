@@ -1,8 +1,33 @@
 //! Deterministic xoshiro256** PRNG seeded via SplitMix64.
 
+use std::cell::RefCell;
+use tokio::time::Instant;
+
+thread_local! {
+    static BRANCHES: RefCell<Vec<(Instant, u64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Configures virtual-time branch points `(instant, salt)` on the current thread,
+/// sorted by instant. Pass an empty vector to clear branch points.
+pub fn branch(points: Vec<(Instant, u64)>) {
+    BRANCHES.with(|b| *b.borrow_mut() = points);
+}
+
+fn branch_salt() -> u64 {
+    BRANCHES.with(|b| {
+        let b = b.borrow();
+        if b.is_empty() {
+            return 0;
+        }
+        let now = Instant::now();
+        b.iter().take_while(|(at, _)| *at <= now).fold(0, |acc, (_, salt)| acc ^ salt)
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct Rng {
     s: [u64; 4],
+    branched: bool,
 }
 
 fn splitmix64(state: &mut u64) -> u64 {
@@ -17,7 +42,12 @@ impl Rng {
     pub fn new(seed: u64) -> Rng {
         let mut st = seed;
         let s = [splitmix64(&mut st), splitmix64(&mut st), splitmix64(&mut st), splitmix64(&mut st)];
-        Rng { s }
+        Rng { s, branched: true }
+    }
+
+    /// Creates a generator that ignores thread-local branch points.
+    pub fn unbranched(seed: u64) -> Rng {
+        Rng { branched: false, ..Rng::new(seed) }
     }
 
     /// Derive an independent generator.
@@ -34,7 +64,13 @@ impl Rng {
         self.s[0] ^= self.s[3];
         self.s[2] ^= t;
         self.s[3] = self.s[3].rotate_left(45);
-        result
+        match if self.branched { branch_salt() } else { 0 } {
+            0 => result,
+            salt => {
+                let mut x = result ^ salt;
+                splitmix64(&mut x)
+            }
+        }
     }
 
     pub fn next_u32(&mut self) -> u32 {
@@ -74,6 +110,23 @@ impl Rng {
             return true;
         }
         self.unit() < p
+    }
+
+    /// Selects an index with probability proportional to its weight, or
+    /// returns `None` if the total weight is not positive.
+    pub fn weighted(&mut self, weights: &[f64]) -> Option<usize> {
+        let total: f64 = weights.iter().sum();
+        if total <= 0.0 {
+            return None;
+        }
+        let mut x = self.unit() * total;
+        for (i, w) in weights.iter().enumerate() {
+            if x < *w {
+                return Some(i);
+            }
+            x -= w;
+        }
+        weights.iter().rposition(|w| *w > 0.0)
     }
 
     /// Uniform float in `[0, 1)`.

@@ -1,0 +1,25 @@
+diff --git a/src/engine/clock.rs b/src/engine/clock.rs
+index 3870bd3..80d655d 100644
+--- a/src/engine/clock.rs
++++ b/src/engine/clock.rs
+@@ -82,7 +82,7 @@ impl StoreClock {
+             return Ok(());
+         }
+         let mut best: Option<Measurement> = None;
+-        for _ in 0..3 {
++        for _ in 0..1 {
+             let m = self.probe(store, retry).await?;
+             if best.is_none_or(|b| m.error_ms < b.error_ms) {
+                 best = Some(m);
+diff --git a/src/node.rs b/src/node.rs
+index bc7700d..5209bae 100644
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -1162,7 +1162,6 @@ impl Node {
+ 
+     fn housekeeping(&self) {
+         self.engine.evict_idle(self.cfg.db_idle_evict_ms);
+-        self.engine.shared.refresh_clock();
+         let idle = Duration::from_millis(self.cfg.txn_idle_ms);
+         let max = Duration::from_millis(self.cfg.txn_max_ms);
+         lock(&self.txns).retain(|_, t| match t.try_lock() {

@@ -1,0 +1,14 @@
+diff --git a/src/engine/db.rs b/src/engine/db.rs
+index 3a4eb24..396ad48 100644
+--- a/src/engine/db.rs
++++ b/src/engine/db.rs
+@@ -525,9 +525,6 @@ impl Db {
+     /// Returns a snapshot satisfying `c` paired with the store time at which
+     /// that version was current.
+     pub async fn snapshot(self: &Arc<Self>, c: Consistency) -> Result<Snapshot> {
+-        if c == Consistency::Strong {
+-            self.wait_for_in_flight_write().await;
+-        }
+         self.resolve_snapshot(c).await
+     }
+ 

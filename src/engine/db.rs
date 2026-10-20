@@ -12,7 +12,9 @@ use super::txn::{CommitRequest, Isolation, Txn, WriteSet, validate};
 use super::types::{Entry, Seq, Value, commit_key, decode_commit_record, encode_commit_record, is_commit_key};
 use super::version::{KeyRange, Snapshot, Version};
 use super::{Shared, blob_prefix, levels_key, manifest_key, seg_key};
+use crate::buggify::buggify;
 use crate::error::{Error, Result};
+use crate::probe::{self, Probe};
 use crate::store::{GetOpts, PutMode, StoreError};
 use crate::timing::{self, StoreOp, Tally};
 use crate::util::{Either, race};
@@ -61,6 +63,8 @@ enum Work {
         sealed_bytes: u64,
         /// The manifest's `compaction_seq` when the compaction was planned.
         compaction_seq: u64,
+        /// Store time before any output was written.
+        started_ms: u64,
         /// Segments below level 0 after compaction, and optional levels object ID if not stored inline.
         deep: Vec<SegmentMeta>,
         levels: Option<String>,
@@ -268,8 +272,7 @@ impl Db {
         self.st().current.clone()
     }
 
-    /// Whether background work (commits, compaction, sweeps, retention
-    /// trims) is running or queued.
+    /// Returns true if commits, compaction, sweeps, or retention trims are running or queued.
     pub fn busy(&self) -> bool {
         let st = self.st();
         let q = self.queue();
@@ -287,13 +290,10 @@ impl Db {
             && st.last_access.elapsed() >= Duration::from_millis(ms)
     }
 
-    // Lease validity is measured on each node's monotonic clock, never by
-    // comparing wall clocks: the holder counts from before it sent the
-    // renewing write, everyone else from when they first saw that renewal.
-    // Every observation follows the send, so others always consider a lease
-    // valid for longer than its holder relies on it, however skewed the
-    // wall clocks are. `expires_ms` in the manifest only identifies a
-    // renewal and serves as a hint.
+    // Lease validity is measured on each node's monotonic clock rather than wall clocks.
+    // The lease holder measures duration from before sending the renewing write, and other nodes
+    // measure from when they first observe that write. Because observation occurs after sending,
+    // other nodes always treat a lease as valid for longer than its holder relies on it.
 
     /// Remaining duration we may rely on our lease in `m`, or zero if `m` is
     /// not the manifest write that last renewed it.
@@ -316,11 +316,31 @@ impl Db {
         }
     }
 
+    /// Caps `own_lease` to the expiration granted by `m` when `m` is sent at `sent`,
+    /// because peers can observe `m` immediately after `sent`.
+    fn limit_own_lease(&self, m: &Manifest, sent: Instant) {
+        let mut st = self.st();
+        let Some((ws, until)) = st.own_lease else { return };
+        let granted = match m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
+            Some(l) => sent + Duration::from_millis(l.ms - self.shared.cfg.lease_margin_ms.min(l.ms)),
+            None => sent,
+        };
+        if granted < until {
+            probe::hit(Probe::LeaseShortenedInFlight);
+            st.own_lease = Some((ws, granted));
+        }
+    }
+
     /// Returns another node's lease in `v` and its remaining duration
     /// on this node's clock, or `None` if no foreign lease is active.
     fn foreign_lease<'a>(&self, v: &'a Version) -> Option<(&'a Lease, Duration)> {
+        self.observed_lease(v).filter(|(l, _)| l.node != self.shared.node_id)
+    }
+
+    /// Returns the lease in `v` and its remaining validity duration from when this node first observed it.
+    fn observed_lease<'a>(&self, v: &'a Version) -> Option<(&'a Lease, Duration)> {
         let m = &v.m;
-        let l = m.lease.as_ref().filter(|l| l.node != self.shared.node_id)?;
+        let l = m.lease.as_ref()?;
         if self.lease_expired_on_store(v, l) {
             return None;
         }
@@ -338,19 +358,27 @@ impl Db {
         let precision_ms = self.shared.store.time_precision_ms();
         let expired = now_ms > last_modified_ms + precision_ms + 2 * l.ms + self.shared.cfg.lease_margin_ms;
         if expired {
-            self.shared.counters.add(&super::Activity { expired_leases: 1, ..Default::default() });
+            probe::hit(Probe::ExpiredLeaseByStoreClock);
         }
         expired
     }
 
-    /// The node holding a valid lease on this database, if known.
+    /// Returns `(write_seq, etag, has_in_flight_write)` when this node holds a valid lease for strong reads.
+    pub fn leased_view(&self) -> Option<(u64, String, bool)> {
+        let st = self.st();
+        let cur = st.current.as_ref()?;
+        (st.trusted && self.holds_lease(&st, &cur.m))
+            .then(|| (cur.m.write_seq, cur.etag.clone(), self.has_in_flight_write()))
+    }
+
+    /// Returns the node ID of the current lease holder, if any.
     pub fn lease_holder(&self) -> Option<String> {
         let st = self.st();
         let cur = st.current.clone()?;
         if self.holds_lease(&st, &cur.m) {
             return Some(self.shared.node_id.clone());
         }
-        self.foreign_lease(&cur).map(|(l, _)| l.node.clone())
+        self.observed_lease(&cur).map(|(l, _)| l.node.clone())
     }
 
     /// Storage statistics at version `v`.
@@ -430,7 +458,12 @@ impl Db {
             )
         });
         let installed = match &st.current {
-            Some(c) if c.m.write_seq >= v.m.write_seq => c.clone(),
+            Some(c) if c.m.write_seq >= v.m.write_seq => {
+                if c.m.write_seq > v.m.write_seq {
+                    probe::hit(Probe::StaleVersionIgnored);
+                }
+                c.clone()
+            }
             _ => {
                 st.current = Some(v.clone());
                 self.installed.notify_waiters();
@@ -497,6 +530,7 @@ impl Db {
                         }
                         // Created concurrently, or ambiguous: read it back.
                         Err(StoreError::PreconditionFailed) | Err(StoreError::Unavailable(_)) => {
+                            probe::hit(Probe::ManifestCreateRaced);
                             tokio::time::sleep(Duration::from_millis(5)).await;
                             continue;
                         }
@@ -556,6 +590,9 @@ impl Db {
             if self.writes_finished.load(SeqCst) >= target {
                 break;
             }
+            if waited_since.is_none() {
+                probe::hit(Probe::StrongReadWaitedForWrite);
+            }
             waited_since.get_or_insert_with(Instant::now);
             notified.await;
         }
@@ -608,6 +645,9 @@ impl Db {
         st.reads_in_window += 1;
         let hot = st.hot(cfg.lease_read_threshold);
         let cur = st.current.clone()?;
+        if buggify() {
+            return None;
+        }
         let lease_left = if st.trusted { self.own_lease_left(&st, &cur.m) } else { Duration::ZERO };
         let leased = !lease_left.is_zero();
         let fresh = match c {
@@ -670,9 +710,9 @@ impl Db {
         let (snap, write_in_flight) = self.latest_snapshot().await?;
         let mut t =
             Txn::new(snap, Isolation::Serializable, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes);
-        if write_in_flight {
+        if write_in_flight || buggify() {
             t.mark_optimistic();
-            self.shared.counters.add(&super::Activity { optimistic_begins: 1, ..Default::default() });
+            probe::hit(Probe::OptimisticBegin);
         }
         Ok(t)
     }
@@ -682,14 +722,14 @@ impl Db {
     /// conflicted (or performed untracked reads) and must be re-executed.
     pub async fn revalidate(self: &Arc<Self>, t: Txn) -> Result<Option<Seq>> {
         if t.has_untracked_reads() {
-            self.shared.counters.add(&super::Activity { optimistic_reruns: 1, ..Default::default() });
+            probe::hit(Probe::OptimisticRerun);
             return Ok(None);
         }
         let snap = self.snapshot(Consistency::Strong).await?;
         match validate(&t.into_request(), &snap.version, &[], &[], snap.time_ms).await {
             Ok(()) => Ok(Some(snap.version.m.version)),
             Err(Error::Conflict(_)) => {
-                self.shared.counters.add(&super::Activity { optimistic_reruns: 1, ..Default::default() });
+                probe::hit(Probe::OptimisticRerun);
                 Ok(None)
             }
             Err(e) => Err(e),
@@ -816,7 +856,10 @@ impl Db {
                     q.running = false;
                     return;
                 }
-                let n = q.items.len().min(self.shared.cfg.commit_batch_max);
+                let mut n = q.items.len().min(self.shared.cfg.commit_batch_max);
+                if buggify() {
+                    n = 1 + crate::buggify::below(n as u64) as usize;
+                }
                 q.items.drain(..n).collect()
             };
             let started = Instant::now();
@@ -890,7 +933,7 @@ impl Db {
             let foreign = self.foreign_lease(&base).map(|(l, left)| (l.node.clone(), left));
             if let Some((holder, left)) = foreign {
                 let e = Error::NotOwner { holder, retry_after_ms: left.as_millis() as u64 };
-                // An earlier attempt may have landed before the lease moved.
+                probe::hit(if maybe_applied { Probe::CommitUnknownAfterLeaseMoved } else { Probe::CommitNotOwner });
                 let e = if maybe_applied { unknown(e) } else { e };
                 self.finish_failed(batch, e);
                 return;
@@ -908,15 +951,14 @@ impl Db {
             };
             if plan.quota_refused {
                 self.st().quota_pressure = true;
-                self.shared.counters.add(&super::Activity { quota_refusals: 1, ..Default::default() });
+                probe::hit(Probe::QuotaRefused);
             }
             let Some(m) = plan.manifest else {
                 self.maybe_sweep(&base);
                 self.schedule_trims(plan.due);
                 self.clear_lease_flag(&batch);
                 for (w, o) in batch.into_iter().zip(plan.outcomes) {
-                    // Without a new manifest write, an earlier ambiguous
-                    // attempt of this batch has not been fenced.
+                    // Mark outcomes unknown if a previous attempt of this batch was ambiguous and was not fenced by a newer manifest write.
                     let o = match o {
                         Outcome::Seq(Err(e @ Error::Unavailable { .. })) if maybe_applied => {
                             Outcome::Seq(Err(unknown(e)))
@@ -927,11 +969,16 @@ impl Db {
                 }
                 return;
             };
+            if crate::buggify::fires(0.02) {
+                let ms = crate::buggify::below(cfg.lease_ms);
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            self.shared.env.crash_point().await;
             let started = Instant::now();
+            self.limit_own_lease(&m, attempt_started);
             self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let res = self.put_manifest(m.encode(), &base.etag).await;
             if !res.is_ok() {
-                // Success clears the flag after installing (below).
                 if matches!(res, Err(StoreError::Unavailable(_))) {
                     self.st().trusted = false;
                 }
@@ -940,7 +987,10 @@ impl Db {
             match res {
                 Ok(etag) => {
                     self.note_own_lease(&m, attempt_started);
-                    self.shared.counters.add(&plan.activity);
+                    for (p, n) in plan.probes.into_iter().flatten() {
+                        probe::hit_n(p, n);
+                    }
+                    self.shared.env.crash_point().await;
                     let v = Arc::new(Version::new(m, etag, self.shared.clone()));
                     let v = self.install(v, Some(started));
                     self.write_finished();
@@ -954,8 +1004,12 @@ impl Db {
                     self.after_commit(&v, plan.gc, plan.due);
                     return;
                 }
-                Err(StoreError::PreconditionFailed) => {}
+                Err(StoreError::PreconditionFailed) => probe::hit(Probe::ManifestCasLost),
                 Err(StoreError::Unavailable(_)) => {
+                    probe::hit(Probe::ManifestWriteAmbiguous);
+                    if !plan.gc.is_empty() {
+                        probe::hit(Probe::ObsoleteDeletedAfterAmbiguousWrite);
+                    }
                     maybe_applied = true;
                     unknown_writes.push((m.write_seq, attempt_started));
                     self.st().trusted = false;
@@ -972,6 +1026,7 @@ impl Db {
                 }
             }
             if attempt >= cfg.commit_retry_max {
+                probe::hit(Probe::CommitRetriesExhausted);
                 let e = Error::Unavailable {
                     message: "could not commit after retries".into(),
                     retry_after_ms: Some(100),
@@ -987,6 +1042,7 @@ impl Db {
                     Ok(v) => {
                         let sent = unknown_writes.iter().filter(|(ws, _)| *ws == v.m.write_seq).map(|(_, s)| *s).min();
                         if let Some(sent) = sent {
+                            probe::hit(Probe::AmbiguousWriteLanded);
                             self.note_own_lease(&v.m, sent);
                         }
                         base = v;
@@ -1013,7 +1069,10 @@ impl Db {
     async fn put_manifest(&self, data: Bytes, etag: &str) -> crate::store::SResult<String> {
         let key = manifest_key(&self.id);
         let put = || self.shared.store.put(&key, data.clone(), PutMode::IfMatch(etag.to_string()));
-        let hedge_ms = self.shared.cfg.manifest_put_hedge_ms;
+        let mut hedge_ms = self.shared.cfg.manifest_put_hedge_ms;
+        if hedge_ms > 0 && buggify() {
+            hedge_ms = 1;
+        }
         let mut first = put();
         if hedge_ms == 0 {
             return first.await;
@@ -1023,7 +1082,7 @@ impl Db {
         {
             return r;
         }
-        self.shared.counters.add(&super::Activity { manifest_puts_hedged: 1, ..Default::default() });
+        probe::hit(Probe::ManifestPutHedged);
         let ambiguous =
             || StoreError::Unavailable("hedged manifest write rejected; the first write may have been applied".into());
         let mut hedge = put();
@@ -1032,8 +1091,16 @@ impl Db {
             Either::Right(r) => (r, true),
         };
         let e = match r {
-            Ok(etag) => return Ok(etag),
-            Err(StoreError::PreconditionFailed) if hedge_won => return Err(ambiguous()),
+            Ok(etag) => {
+                if hedge_won {
+                    probe::hit(Probe::HedgeWon);
+                }
+                return Ok(etag);
+            }
+            Err(StoreError::PreconditionFailed) if hedge_won => {
+                probe::hit(Probe::HedgeRejectedFirstInFlight);
+                return Err(ambiguous());
+            }
             Err(e) => e,
         };
         match (e, if hedge_won { first.await } else { hedge.await }) {
@@ -1065,10 +1132,7 @@ impl Db {
         let cfg = &self.shared.cfg;
         let mut m = base.m.clone();
         let mut tail: BTreeMap<Bytes, Entry> = m.tail.drain(..).map(|e| (e.key.clone(), e)).collect();
-        // The time of the versions this write creates. Never before the
-        // base's time, so readers' view of expiries only moves forward, nor
-        // before a committed transaction's read time, so readers agree with
-        // what it saw expired.
+        // Ensure the manifest timestamp does not move backward relative to `base` or any committed transaction's read time.
         let time = batch
             .iter()
             .filter_map(|w| match w {
@@ -1078,12 +1142,9 @@ impl Db {
             .chain([base.m.time_ms, now.store_ms.unwrap_or(0)])
             .max()
             .unwrap_or(0);
-        // Each accepted transaction gets its own sequence number, so every
-        // committed state of a key has a unique version.
         let mut last_seq = base.m.version;
         let mut outcomes = Vec::with_capacity(batch.len());
         let mut accepted: Vec<&WriteSet> = Vec::new();
-        // Keys the accepted transactions' stream ops wrote.
         let mut touched: Vec<KeyRange> = Vec::new();
         let mut due: BTreeSet<u64> = BTreeSet::new();
         let mut data_changed = false;
@@ -1094,6 +1155,7 @@ impl Db {
         let mut size = base.m.stored_bytes();
         let mut quota_refused = false;
         if base.m.is_deleted() {
+            probe::hit(Probe::DeletedDatabaseWrite);
             let outcomes = batch
                 .iter()
                 .map(|w| match w {
@@ -1101,27 +1163,18 @@ impl Db {
                     _ => Outcome::Unit(Err(Error::not_found("database deleted"))),
                 })
                 .collect();
-            return Ok(Plan {
-                manifest: None,
-                outcomes,
-                gc: Vec::new(),
-                quota_refused,
-                activity: Default::default(),
-                due,
-            });
+            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: None, due });
         }
         for w in batch {
             match w {
                 Work::Commit { req, .. } => {
-                    // Earlier in this batch, or in the base.
                     let record = commit_key(req.commit_id);
                     let applied = match tail.get(&record) {
                         Some(e) => Some(applied_commit(e)?),
                         None => committed(base, req.commit_id).await?,
                     };
                     if let Some(c) = applied {
-                        // The attempt that applied it may not have lived to
-                        // schedule the trims its retention calls for.
+                        probe::hit(Probe::CommitReplayed);
                         let at = pending(base, &m, &tail);
                         for id in req.writes.streams.iter().map(StreamOp::id) {
                             if at.state(id).await?.is_some_and(|s| s.trim_due(time)) {
@@ -1132,6 +1185,7 @@ impl Db {
                         continue;
                     }
                     if req.deadline.is_some_and(|d| Instant::now() > d) {
+                        probe::hit(Probe::CommitDeadlinePassed);
                         outcomes.push(Outcome::Seq(Err(Error::Unavailable {
                             message: "commit deadline exceeded".into(),
                             retry_after_ms: Some(100),
@@ -1140,10 +1194,14 @@ impl Db {
                         continue;
                     }
                     if let Err(e) = validate(req, base, &accepted, &touched, time).await {
+                        if matches!(e, Error::Conflict(_)) {
+                            probe::hit(Probe::CommitConflict);
+                        }
                         outcomes.push(Outcome::Seq(Err(e)));
                         continue;
                     }
                     if let Err(e) = bindable(&req.writes, &m, now.store_ms, cfg) {
+                        probe::hit(Probe::StagedBlobUnbindable);
                         outcomes.push(Outcome::Seq(Err(e)));
                         continue;
                     }
@@ -1235,6 +1293,7 @@ impl Db {
                     purged_max_seq,
                     sealed_bytes,
                     compaction_seq,
+                    started_ms,
                     deep,
                     levels,
                     ..
@@ -1243,12 +1302,16 @@ impl Db {
                         outcomes.push(Outcome::Unit(Err(Error::unavailable("store clock not synchronized"))));
                         continue;
                     };
+                    // Reject compaction outputs that are old enough for a concurrent sweep to treat as orphans.
+                    if *started_ms + cfg.orphan_grace_ms <= now_ms + bind_margin_ms(cfg) + cfg.clock_sync_max_error_ms {
+                        probe::hit(Probe::CompactionOutlivedOrphanGrace);
+                        outcomes.push(Outcome::Unit(Err(Error::unavailable("compaction outlived the orphan grace"))));
+                        continue;
+                    }
                     let present = inputs.iter().all(|id| m.segments.iter().any(|s| s.id == *id));
                     let installed = !outputs.is_empty()
                         && outputs.iter().all(|o| m.segments.iter().any(|s| s.id == o.id && s.level == o.level));
                     if m.compaction_seq == *compaction_seq && present {
-                        // Only compactions change the deeper levels, and none
-                        // installed since this one was planned.
                         if compaction::deep_after(&m, inputs, outputs) != *deep {
                             outcomes.push(Outcome::Unit(Err(Error::internal("compaction planned on other levels"))));
                             continue;
@@ -1276,9 +1339,10 @@ impl Db {
                         meta_changed = true;
                         outcomes.push(Outcome::Unit(Ok(())));
                     } else if installed {
-                        // An earlier, ambiguous attempt of this install landed.
+                        probe::hit(Probe::CompactionInstallReplayed);
                         outcomes.push(Outcome::Unit(Ok(())));
                     } else {
+                        probe::hit(Probe::CompactionInputsChanged);
                         outcomes.push(Outcome::Unit(Err(Error::Conflict("compaction inputs changed".into()))));
                     }
                 }
@@ -1319,22 +1383,12 @@ impl Db {
             }
         }
         if !data_changed && !meta_changed {
-            return Ok(Plan {
-                manifest: None,
-                outcomes,
-                gc: Vec::new(),
-                quota_refused,
-                activity: Default::default(),
-                due,
-            });
+            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: None, due });
         }
         if data_changed {
             m.version = last_seq;
         }
         m.time_ms = time;
-        // Readers of this manifest read at `time` or later: what has expired
-        // by then keeps only its tombstone. Commit records past their
-        // retention go entirely.
         let records_horizon = now.store_ms.map_or(0, |t| m.version_at_least_age(t, cfg.commit_retention_ms));
         let mut expired = 0;
         tail.retain(|k, e| {
@@ -1352,16 +1406,16 @@ impl Db {
         m.tail = tail.into_values().collect();
         let mut gc = Vec::new();
         let mut retired = 0;
+        let mut purged_tombstones = 0;
         if let Some(now_ms) = now.store_ms {
             let purge = m.version_at_least_age(now_ms, cfg.txn_max_lifetime_ms);
             let mut horizon = m.tombstone_horizon;
-            // Without data segments, tail tombstones shadow nothing: purge
-            // old ones.
             if m.segments.iter().all(compaction::holds_records) {
                 m.tail.retain(|e| {
                     let purged = e.value.is_tombstone() && e.seq <= purge;
                     if purged {
                         horizon = horizon.max(e.seq);
+                        purged_tombstones += 1;
                     }
                     !purged
                 });
@@ -1380,9 +1434,6 @@ impl Db {
             if data_changed && m.version_times.last().is_none_or(|(_, t)| *t + cfg.version_sample_ms <= now_ms) {
                 m.version_times.push((m.version, now_ms));
             }
-            // Keep the newest sample at least a transaction lifetime old, and
-            // one a commit retention old: the purge horizons of tombstones
-            // and commit records are read from them.
             let keep_after = now_ms.saturating_sub(cfg.txn_max_lifetime_ms.max(cfg.commit_retention_ms));
             while m.version_times.len() >= 2 && m.version_times[1].1 <= keep_after {
                 m.version_times.remove(0);
@@ -1391,17 +1442,15 @@ impl Db {
             (gc, keep) = m.obsolete.drain(..).partition(|o| o.since_ms + cfg.gc_grace_ms <= now_ms);
             m.obsolete = keep;
         }
+        let takeover = !release && base.m.lease.as_ref().is_some_and(|l| l.node != self.shared.node_id);
         m.lease = if release {
             None
         } else {
             Some(Lease { node: self.shared.node_id.clone(), expires_ms: now.wall_ms + lease_ms, ms: lease_ms })
         };
         let mut sealed = 0;
-        if m.tail_bytes() > cfg.tail_max_bytes {
-            // Data and commit records go to separate segments (see
-            // `compaction::pick`), each with every range deletion applied
-            // through `m.version`. Long runs of stream records are sealed
-            // instead (SPEC §5.11).
+        let (mut flushed_tail, mut sealed_in_place) = (false, false);
+        if m.tail_bytes() > cfg.tail_max_bytes || (!m.tail.is_empty() && crate::buggify::fires(0.05)) {
             let flushed = std::mem::take(&mut m.tail);
             let split = flushed.partition_point(|e| !is_commit_key(&e.key));
             let mut sealer = Sealer::new(cfg.stream_seal_min_bytes, cfg.stream_chunk_bytes);
@@ -1415,9 +1464,10 @@ impl Db {
             let commit_records = &flushed[split..];
             let rest: usize = data.iter().chain(commit_records).map(Entry::size).sum();
             if sealed > 0 && rest <= cfg.tail_max_bytes / 2 {
-                // Sealing alone made room: what is left stays inline.
                 m.tail = data.into_iter().chain(commit_records.iter().cloned()).collect();
+                sealed_in_place = true;
             } else {
+                flushed_tail = true;
                 for part in [commit_records, &data[..]] {
                     if part.is_empty() {
                         continue;
@@ -1431,14 +1481,20 @@ impl Db {
             }
         }
         m.write_seq += 1;
-        let activity = super::Activity {
-            range_tombstones_written: m.range_deletes.iter().filter(|t| t.seq > base.m.version).count() as u64,
-            range_tombstones_retired: retired,
-            expired_entries: expired,
-            chunks_sealed_at_flush: sealed,
-            ..Default::default()
-        };
-        Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, activity, due })
+        let probes: [(Probe, u64); 11] = [
+            (Probe::RangeTombstoneWritten, m.range_deletes.iter().filter(|t| t.seq > base.m.version).count() as u64),
+            (Probe::RangeTombstoneRetired, retired),
+            (Probe::EntriesExpired, expired),
+            (Probe::ChunkSealedAtFlush, sealed),
+            (Probe::TailFlushed, flushed_tail as u64),
+            (Probe::TailSealedInPlace, sealed_in_place as u64),
+            (Probe::TailTombstonesPurged, purged_tombstones),
+            (Probe::CommitBatched, (accepted.len() >= 2) as u64),
+            (Probe::LeaseTakeover, takeover as u64),
+            (Probe::ReadLeaseRenewed, (meta_changed && !data_changed && lease_ms > cfg.lease_ms) as u64),
+            (Probe::LeaseReleased, release as u64),
+        ];
+        Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, probes: Some(probes), due })
     }
 
     fn delete_obsolete(&self, gc: Vec<Obsolete>) {
@@ -1477,8 +1533,6 @@ impl Db {
         self.schedule_trims(due);
     }
 
-    /// Queues streams whose retention may call for a trim, starting a task
-    /// that trims them unless one is running.
     fn schedule_trims(self: &Arc<Self>, ids: BTreeSet<u64>) {
         let start = {
             let mut st = self.st();
@@ -1516,8 +1570,7 @@ impl Db {
         }
     }
 
-    /// Commits the trim that stream `id`'s retention calls for, if any. The
-    /// commit is refused if another node holds the lease, which then trims.
+    /// Commits any pending retention trim for stream `id`.
     async fn trim_for_retention(self: &Arc<Self>, id: u64) -> Result<()> {
         let Some(now) = self.shared.store_now_ms() else { return Ok(()) };
         let Some(v) = self.current() else { return Ok(()) };
@@ -1550,10 +1603,14 @@ impl Db {
         };
         match self.commit(req).await {
             Ok(_) => {
-                self.shared.counters.add(&super::Activity { retention_trims: 1, ..Default::default() });
+                probe::hit(Probe::RetentionTrimmed);
                 Ok(())
             }
-            Err(Error::NotFound(_) | Error::NotOwner { .. }) => Ok(()),
+            Err(Error::NotOwner { .. }) => {
+                probe::hit(Probe::RetentionTrimLeftToOwner);
+                Ok(())
+            }
+            Err(Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -1564,7 +1621,7 @@ impl Db {
         let Some(now) = self.shared.store_now_ms() else { return };
         let mut st = self.st();
         let interval = if st.quota_pressure { cfg.quota_sweep_interval_ms } else { cfg.sweep_interval_ms };
-        if st.sweeping || v.m.last_sweep_ms + interval > now {
+        if st.sweeping || (v.m.last_sweep_ms + interval > now && !crate::buggify::fires(0.02)) {
             return;
         }
         st.sweeping = true;
@@ -1586,6 +1643,7 @@ impl Db {
             let store_now = self.shared.store_time_ms().await?;
             let Some(v) = self.current() else { return Ok(()) };
             if !self.holds_lease(&self.st(), &v.m) {
+                probe::hit(Probe::CompactionLostLease);
                 return Ok(());
             }
             let Some(plan) = compaction::pick(&v.m, &cfg) else {
@@ -1607,6 +1665,7 @@ impl Db {
                 true => Some(self.shared.write_levels(&self.id, deep.clone()).await?),
                 false => None,
             };
+            self.shared.env.crash_point().await;
             let (tx, rx) = oneshot::channel();
             self.enqueue(Work::Compaction {
                 inputs,
@@ -1614,30 +1673,27 @@ impl Db {
                 purged_max_seq,
                 sealed_bytes,
                 compaction_seq: v.m.compaction_seq,
+                started_ms: store_now,
                 deep,
                 levels,
                 tx,
             });
             rx.await.map_err(|_| Error::unavailable("compaction install interrupted"))??;
             let n = plan.inputs.len() as u64;
-            let mut a = match plan.kind {
-                Kind::Drop => super::Activity { segments_dropped: n, ..Default::default() },
-                Kind::Rewrite => super::Activity { segments_rewritten: n, ..Default::default() },
-                Kind::DropExpired | Kind::Expire => super::Activity { segments_expired: n, ..Default::default() },
-                _ => Default::default(),
-            };
-            a.expired_entries = expired;
-            a.chunks_sealed_in_compaction = chunks;
-            self.shared.counters.add(&a);
+            match plan.kind {
+                Kind::Drop => probe::hit_n(Probe::SegmentDropped, n),
+                Kind::Rewrite => probe::hit_n(Probe::SegmentRewritten, n),
+                Kind::DropExpired | Kind::Expire => probe::hit_n(Probe::SegmentExpired, n),
+                Kind::Move { .. } => probe::hit(Probe::CompactionMoved),
+                Kind::Merge { .. } => {}
+            }
+            probe::hit(Probe::CompactionInstalled);
+            probe::hit_n(Probe::EntriesExpired, expired);
+            probe::hit_n(Probe::ChunkSealedInCompaction, chunks);
         }
     }
 
-    /// Find unreferenced (orphaned) objects and schedule them for deletion.
-    ///
-    /// Everything is compared in store time, read before the version whose
-    /// references are scanned: an object old enough at that moment cannot
-    /// be referenced by a commit that version does not contain (see
-    /// [`bindable`]).
+    /// Scans storage for unreferenced objects and records them as obsolete in the manifest.
     async fn sweep(self: Arc<Self>) -> Result<()> {
         let cfg = self.shared.cfg.clone();
         let now_ms = self.shared.store_time_ms().await?;
@@ -1651,8 +1707,6 @@ impl Db {
         referenced.extend(v.m.obsolete.iter().filter(|o| o.kind != ObjKind::Blob).map(|o| (o.kind, o.id.clone())));
         let mut referenced_blobs: BTreeSet<String> =
             v.m.obsolete.iter().filter(|o| o.kind == ObjKind::Blob).map(|o| o.id.clone()).collect();
-        // Live blob and chunk sizes for quota accounting, and the streams
-        // whose retention calls for a trim.
         let mut live_blobs: BTreeMap<String, u64> = BTreeMap::new();
         let mut live_chunks: BTreeMap<String, u64> = BTreeMap::new();
         let mut due = BTreeSet::new();
@@ -1685,7 +1739,6 @@ impl Db {
                 items.push(Obsolete { kind, id: id.to_string(), since_ms: now_ms });
             }
         }
-        // A blob's objects are listed together; it is as old as its newest.
         let blob_of = |key: &str| key.rsplit('/').nth(1).map(|s| s.to_string());
         let found = |id: String, mtime: u64, items: &mut Vec<Obsolete>| {
             let created = super::types::blob_id_time(&id).unwrap_or(0);
@@ -1716,6 +1769,10 @@ impl Db {
         let blob_bytes = (live_blobs.values().sum(), v.m.blob_bytes.bound);
         let chunk_bytes = (live_chunks.values().sum(), v.m.chunk_bytes.bound);
         self.schedule_trims(due);
+        if !items.is_empty() {
+            probe::hit(Probe::OrphansMarked);
+            self.shared.env.crash_point().await;
+        }
         let (tx, rx) = oneshot::channel();
         self.enqueue(Work::Obsolete { items, blob_bytes, chunk_bytes, tx });
         rx.await.map_err(|_| Error::unavailable("sweep interrupted"))?
@@ -1740,7 +1797,6 @@ struct Now {
     store_ms: Option<u64>,
 }
 
-/// How a commit applied, if `v` holds its commit record.
 async fn committed(v: &Version, id: u64) -> Result<Option<Committed>> {
     match v.get_entry(&commit_key(id)).await? {
         Some(e) if !e.value.is_tombstone() => Ok(Some(applied_commit(&e)?)),
@@ -1748,7 +1804,6 @@ async fn committed(v: &Version, id: u64) -> Result<Option<Committed>> {
     }
 }
 
-/// The commit a commit record tells of, as a replay of it reports.
 fn applied_commit(record: &Entry) -> Result<Committed> {
     let decoded = match &record.value {
         Value::Inline(b) => decode_commit_record(b).ok(),
@@ -1758,16 +1813,13 @@ fn applied_commit(record: &Entry) -> Result<Committed> {
     Ok(Committed { version: record.seq, replayed: true, time_ms, appends })
 }
 
-/// Committed state partway through building a batch: the base version, the
-/// batch's tail so far, and the range deletions of its earlier commits.
 fn pending<'a>(base: &'a Version, m: &Manifest, tail: &'a BTreeMap<Bytes, Entry>) -> Pending<'a> {
     let batch_deletes = m.range_deletes.iter().filter(|t| t.seq > base.m.version).cloned().collect();
     Pending { base, tail, batch_deletes }
 }
 
-/// Measurement errors on the committing and sweeping nodes together stay
-/// below this, so a blob a sweep finds too old to bind stays too old for
-/// every committer.
+/// Clock-error margin added to `blob_stage_ttl_ms` during sweeps so a blob is never marked
+/// obsolete while a committing node can still accept it.
 fn bind_margin_ms(cfg: &super::EngineConfig) -> u64 {
     2 * cfg.clock_sync_max_error_ms
 }
@@ -1790,7 +1842,6 @@ fn bindable(w: &WriteSet, m: &Manifest, store_now: Option<u64>, cfg: &super::Eng
     Ok(())
 }
 
-/// A paged listing of a prefix, one object at a time.
 struct Listing {
     prefix: String,
     page: std::vec::IntoIter<crate::store::ObjectMeta>,
@@ -1828,11 +1879,8 @@ struct Plan {
     manifest: Option<Manifest>,
     outcomes: Vec<Outcome>,
     gc: Vec<Obsolete>,
-    /// Indicates whether a commit in this batch was rejected due to quota.
     quota_refused: bool,
-    /// Storage activity recorded upon successful manifest write.
-    activity: super::Activity,
-    /// Streams whose retention may call for a trim after this write.
+    probes: Option<[(Probe, u64); 11]>,
     due: BTreeSet<u64>,
 }
 
@@ -1888,8 +1936,6 @@ async fn delete_range(
     Ok(())
 }
 
-/// Writes range tombstone `rt`, which replaces the range tombstones it
-/// covers and the tail's entries in its range.
 fn put_range_tombstone(m: &mut Manifest, tail: &mut BTreeMap<Bytes, Entry>, rt: RangeTombstone) {
     let end = rt.end.clone().map_or(Bound::Unbounded, Bound::Excluded);
     let in_tail: Vec<Bytes> =
@@ -1919,6 +1965,7 @@ async fn delete_object(shared: &Shared, db: &str, o: &Obsolete) -> Result<()> {
             let now = shared.store_now_ms().ok_or_else(|| Error::unavailable("store clock not synchronized"))?;
             if super::blob::pinned(shared, db, &o.id, now).await? {
                 // Pinned by an active read; a later sweep will collect it.
+                probe::hit(Probe::BlobPinnedAtCollection);
                 return Ok(());
             }
             let objs = crate::store::list_all(&*shared.store, &blob_prefix(db, &o.id), &shared.retry).await?;
@@ -1977,6 +2024,7 @@ mod tests {
             purged_max_seq: 0,
             sealed_bytes: 0,
             compaction_seq,
+            started_ms: 1_000,
             deep: Vec::new(),
             levels: None,
             tx,
@@ -2007,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_found_applied_after_an_unknown_outcome_renews_the_lease() {
+    fn ambiguous_write_recovery_renews_lease() {
         use crate::engine::tests::{delayed_engine_with, opened, put};
         use std::sync::atomic::Ordering::SeqCst;
         rt().block_on(async {
@@ -2023,7 +2071,7 @@ mod tests {
     }
 
     #[test]
-    fn hedged_writes_are_definite_only_when_neither_copy_may_have_applied() {
+    fn hedged_write_outcomes() {
         use StoreError::{Fatal, PreconditionFailed as Refused, Unavailable};
         let ok = || Ok::<_, StoreError>("e2".to_string());
         let down = || Unavailable("timeout".into());
@@ -2100,12 +2148,12 @@ mod tests {
             let p = db.build(&base, &[lease, sweep], Now { wall_ms: 10_000_000, store_ms: None }).await.unwrap();
             assert!(p.gc.is_empty());
             assert!(matches!(p.outcomes[1], Outcome::Unit(Err(Error::Unavailable { .. }))));
-            assert_eq!(p.manifest.unwrap().obsolete.len(), 2, "kept for later");
+            assert_eq!(p.manifest.unwrap().obsolete.len(), 2);
         });
     }
 
     #[test]
-    fn binding_checks_age_and_the_obsolete_list() {
+    fn binding_checks_age_and_obsolete_list() {
         let cfg = EngineConfig::small_for_tests();
         let now = 10_000_000;
         let id = super::super::types::make_blob_id(now - 1_000, &[1; 10]);
@@ -2124,11 +2172,11 @@ mod tests {
         };
         let fresh = Manifest::new("d", 0, None);
         assert!(bindable(&writes(&id), &fresh, Some(now), &cfg).is_ok());
-        assert!(bindable(&WriteSet::default(), &fresh, None, &cfg).is_ok(), "no blob, no clock needed");
+        assert!(bindable(&WriteSet::default(), &fresh, None, &cfg).is_ok());
         assert!(bindable(&writes(&id), &listed(ObjKind::Blob, &other), Some(now), &cfg).is_ok());
         assert!(bindable(&writes(&id), &listed(ObjKind::Segment, &id), Some(now), &cfg).is_ok());
-        assert!(bindable(&writes(&id), &listed(ObjKind::Blob, &id), Some(now), &cfg).is_err(), "an orphaned blob");
-        assert!(bindable(&writes(&old), &fresh, Some(now), &cfg).is_err(), "an expired blob");
+        assert!(bindable(&writes(&id), &listed(ObjKind::Blob, &id), Some(now), &cfg).is_err());
+        assert!(bindable(&writes(&old), &fresh, Some(now), &cfg).is_err());
         assert!(matches!(bindable(&writes(&id), &fresh, None, &cfg), Err(Error::Unavailable { .. })));
     }
 

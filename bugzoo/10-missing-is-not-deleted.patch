@@ -1,0 +1,16 @@
+diff --git a/src/api/data.rs b/src/api/data.rs
+index 6f92d1e..8162def 100644
+--- a/src/api/data.rs
++++ b/src/api/data.rs
+@@ -156,9 +156,8 @@ pub async fn create_db(
+         Err(Error::AlreadyExists(m)) => {
+             // If a prior deletion stopped after marking the manifest deleted, finish it and retry.
+             let (existing, _) = node.resolve_db_strong(&p, &DbRef::format(c.org.as_deref(), &c.name)).await?;
+-            let db = node.open_db(&existing).await?;
+-            let deleted =
+-                db.read_version(Consistency::Strong).await.is_err() && db.current().is_some_and(|v| v.m.is_deleted());
++            let db = node.engine.db(&existing.id);
++            let deleted = matches!(db.read_version(Consistency::Strong).await, Err(Error::NotFound(_)));
+             if !deleted {
+                 return Err(Error::AlreadyExists(m));
+             }

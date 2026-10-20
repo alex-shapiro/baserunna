@@ -3,6 +3,7 @@
 use super::tests::{delayed_engine, delayed_engine_with, known_objects, opened, put, rt, second_node};
 use super::*;
 use crate::error::Error;
+use crate::probe::{self, Probe};
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -44,7 +45,7 @@ async fn outlive_transactions(db: &Arc<Db>) {
 }
 
 #[test]
-fn large_range_deletes_take_one_entry_and_retire() {
+fn large_range_deletes_write_range_tombstone_and_retire() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
@@ -52,32 +53,31 @@ fn large_range_deletes_take_one_entry_and_retire() {
         put(&db, "u/after", "kept").await;
         settle().await;
         let before = db.read_version(Consistency::Strong).await.unwrap();
-        assert!(before.m.segments.len() > 3, "setup: segments");
+        assert!(before.m.segments.len() > 3);
         assert_eq!(live_keys(&before, "t/").await, 300);
         let size_before = before.m.stored_bytes();
         let seq = delete_prefix(&db, "t/").await;
         let v = db.read_version(Consistency::Strong).await.unwrap();
-        assert_eq!(v.m.range_deletes.len(), 1, "one entry for 300 keys");
+        assert_eq!(v.m.range_deletes.len(), 1);
         assert_eq!(v.m.range_deletes[0].seq, seq);
-        assert!(v.m.tail.iter().all(|e| !e.key.starts_with(b"t/")), "no point tombstones");
+        assert!(v.m.tail.iter().all(|e| !e.key.starts_with(b"t/")));
         assert_eq!(live_keys(&v, "t/").await, 0);
         assert_eq!(v.get(&key(17), v.read_time()).await.unwrap(), None);
         assert_eq!(v.get_entry(&key(17)).await.unwrap().map(|e| (e.seq, e.value)), Some((seq, Value::Tombstone)));
         assert!(v.get(b"u/after", v.read_time()).await.unwrap().is_some());
         settle().await;
         let v = db.read_version(Consistency::Strong).await.unwrap();
-        let a = eng.shared.counters.get();
-        assert!(a.segments_dropped > 0, "{a:?}");
+        assert!(probe::count(Probe::SegmentDropped) > 0);
         assert!(v.m.stored_bytes() < size_before / 4, "{} of {size_before} bytes left", v.m.stored_bytes());
-        assert!(v.m.segments.iter().all(|s| !v.m.range_deletes[0].dirties(s)), "cleaned up");
-        assert_eq!(v.m.range_deletes.len(), 1, "kept for transactions that might read from before it");
+        assert!(v.m.segments.iter().all(|s| !v.m.range_deletes[0].dirties(s)));
+        assert_eq!(v.m.range_deletes.len(), 1);
         assert_eq!(live_keys(&before, "t/").await, 300);
         assert!(before.get(&key(299), before.read_time()).await.unwrap().is_some());
         outlive_transactions(&db).await;
         let v = db.read_version(Consistency::Strong).await.unwrap();
-        assert!(v.m.range_deletes.is_empty(), "retired");
+        assert!(v.m.range_deletes.is_empty());
         assert!(v.m.tombstone_horizon >= seq);
-        assert_eq!(eng.shared.counters.get().range_tombstones_retired, 1);
+        assert_eq!(probe::count(Probe::RangeTombstoneRetired), 1);
         assert_eq!(live_keys(&v, "t/").await, 0);
         assert!(v.get(b"u/after", v.read_time()).await.unwrap().is_some());
         tokio::time::sleep(Duration::from_millis(eng.shared.cfg.gc_grace_ms)).await;
@@ -107,7 +107,7 @@ fn small_range_deletes_write_point_tombstones() {
 }
 
 #[test]
-fn a_range_delete_spares_its_own_transactions_writes() {
+fn range_delete_preserves_subsequent_writes_in_same_txn() {
     rt().block_on(async {
         let (eng, _store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
@@ -130,7 +130,7 @@ fn a_range_delete_spares_its_own_transactions_writes() {
 }
 
 #[test]
-fn range_deletes_conflict_with_what_they_cover() {
+fn range_deletes_conflict_with_covered_reads() {
     rt().block_on(async {
         let (eng, _store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
@@ -152,7 +152,7 @@ fn range_deletes_conflict_with_what_they_cover() {
         elsewhere.put(Bytes::from_static(b"w/4"), Value::Inline(Bytes::from_static(b"1"))).unwrap();
         delete_prefix(&db, "t/").await;
         settle().await;
-        assert!(eng.shared.counters.get().segments_dropped > 0, "the deleted data is gone from storage");
+        assert!(probe::count(Probe::SegmentDropped) > 0);
         for (name, t) in [("point", point), ("range", range), ("missing key", missing)] {
             let r = db.commit(t.into_request()).await;
             assert!(matches!(r, Err(Error::Conflict(_))), "{name}: {r:?}");
@@ -172,8 +172,7 @@ fn partly_deleted_segments_are_rewritten() {
         t.delete_range(KeyRange::half_open(key(110), Some(key(190)))).unwrap();
         db.commit(t.into_request()).await.unwrap();
         settle().await;
-        let a = eng.shared.counters.get();
-        assert!(a.segments_rewritten > 0, "{a:?}");
+        assert!(probe::count(Probe::SegmentRewritten) > 0);
         let v = db.read_version(Consistency::Strong).await.unwrap();
         assert!(v.m.segments.iter().all(|s| !v.m.range_deletes[0].dirties(s)));
         let got: Vec<Bytes> = v
@@ -200,13 +199,13 @@ fn deeper_levels_move_to_levels_objects() {
         settle().await;
         let v = db.read_version(Consistency::Strong).await.unwrap();
         let deep = v.m.deep_segments().len();
-        assert!(deep > 4, "setup: {deep} deep segments");
-        let id = v.m.levels.clone().expect("a levels object");
+        assert!(deep > 4);
+        let id = v.m.levels.clone().unwrap();
         let stored = store.mem.get_sync(&manifest_key("d"), &Default::default()).unwrap().data;
         let stored = manifest::Manifest::decode(&stored).unwrap().encode_body();
         let inline = manifest::Manifest { levels: None, ..v.m.clone() }.encode_body();
         assert!(stored.len() + 50 * deep < inline.len(), "{} bytes, inline {}", stored.len(), inline.len());
-        assert!(eng.shared.counters.get().levels_objects_written > 1);
+        assert!(probe::count(Probe::LevelsObjectWritten) > 1);
         let b = second_node(&eng, &store, "b");
         let vb = b.db("d").read_version(Consistency::Strong).await.unwrap();
         assert_eq!(vb.m.segments, v.m.segments);
@@ -218,7 +217,7 @@ fn deeper_levels_move_to_levels_objects() {
         settle().await;
         let m = db.read_version(Consistency::Strong).await.unwrap().m.clone();
         let objs: Vec<String> = store.mem.keys().into_iter().filter(|k| k.ends_with(LEVELS_SUFFIX)).collect();
-        assert_eq!(objs, vec![levels_key("d", m.levels.as_deref().unwrap())], "only the current levels object");
+        assert_eq!(objs, vec![levels_key("d", m.levels.as_deref().unwrap())]);
         let _ = id;
         delete_prefix(&db, "t/").await;
         settle().await;
@@ -238,7 +237,7 @@ async fn try_put(db: &Arc<Db>, k: Bytes, v: Value) -> crate::error::Result<Seq> 
 }
 
 #[test]
-fn quotas_refuse_growth_but_never_deletes() {
+fn quotas_refuse_growth_but_allow_deletes() {
     rt().block_on(async {
         let (eng, _store) = quota_engine(30_000);
         let db = opened(&eng, "d").await;
@@ -248,14 +247,14 @@ fn quotas_refuse_growth_but_never_deletes() {
                 Ok(_) => written += 1,
                 Err(e) => break e,
             }
-            assert!(written < 1000, "never refused");
+            assert!(written < 1000);
         };
         assert!(matches!(refused, Error::QuotaExceeded(_)), "{refused:?}");
         assert_eq!(refused.status(), 507);
         let v = db.read_version(Consistency::Strong).await.unwrap();
         assert!(v.m.stored_bytes() <= 30_000);
-        assert_eq!(live_keys(&v, "t/").await, written, "the refused commit left nothing");
-        assert_eq!(eng.shared.counters.get().quota_refusals, 1);
+        assert_eq!(live_keys(&v, "t/").await, written);
+        assert_eq!(probe::count(Probe::QuotaRefused), 1);
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         t.delete(key(0)).unwrap();
         db.commit(t.into_request()).await.unwrap();

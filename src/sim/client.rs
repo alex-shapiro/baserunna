@@ -24,6 +24,26 @@ pub struct Client {
     pub retry_rate_limited: bool,
 }
 
+/// Result of a commit status query.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Status {
+    /// The commit was applied; contains the status response payload.
+    Committed(Json),
+    NotCommitted,
+    /// The commit record retention window may have elapsed, so the outcome is indeterminate.
+    Unknown,
+}
+
+impl Status {
+    /// Returns the version at which the commit was applied, if committed.
+    pub fn version(&self) -> Option<u64> {
+        match self {
+            Status::Committed(j) => j["version"].as_u64(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Resp {
     pub status: u16,
@@ -40,13 +60,18 @@ impl Resp {
         self.json["error"]["code"].as_str().unwrap_or("")
     }
 
-    /// Returns true if the request failed with 503 and was definitely not applied.
+    /// Returns `true` if the request failed with HTTP 503 and was not applied.
     pub fn retryable_not_applied(&self) -> bool {
         self.status == 503 && self.json["error"]["details"]["outcome"] != "unknown"
     }
 
     pub fn outcome_unknown(&self) -> bool {
         self.status == 503 && self.json["error"]["details"]["outcome"] == "unknown"
+    }
+
+    /// Returns the index of the failed precondition operation from an HTTP 412 response.
+    pub fn failed_op(&self) -> Option<usize> {
+        (self.status == 412).then(|| self.json["error"]["details"]["op_index"].as_u64())?.map(|i| i as usize)
     }
 }
 
@@ -139,9 +164,13 @@ impl Client {
             self.name,
             match &r {
                 Ok(r) => format!(
-                    "{} {}{}",
+                    "{} {}{}{}",
                     r.status,
                     crate::util::b64::hex(&crate::util::sha256(&r.body)[..6]),
+                    match r.status >= 400 {
+                        true => format!(" {}", String::from_utf8_lossy(&r.body[..r.body.len().min(160)])),
+                        false => String::new(),
+                    },
                     r.headers
                         .get("x-baserunna-version")
                         .and_then(|v| v.to_str().ok())
@@ -217,6 +246,55 @@ impl Client {
         }
     }
 
+    /// Queries and fences the status of commit `id` (a commit ID or `key:<idempotency_key>`)
+    /// in `db` that was first attempted at `began` (SPEC §6.2).
+    pub async fn commit_status(&self, db: &str, id: &str, began: u64) -> Result<Status, String> {
+        let r = self.call_retry("GET", &format!("/v1/dbs/{db}/commits/{id}"), None).await;
+        match r.json["status"].as_str() {
+            Some("committed") if r.json["version"].is_u64() => Ok(Status::Committed(r.json)),
+            Some("not_committed") => {
+                let kept = r.json["retention_ms"].as_u64().ok_or(format!("missing retention_ms: {}", r.json))?;
+                let slack = 2 * self.sim.cfg.engine.clock_sync_max_error_ms;
+                match self.sim.now_ms() + slack < began.saturating_add(kept) {
+                    true => Ok(Status::NotCommitted),
+                    false => Ok(Status::Unknown),
+                }
+            }
+            _ => Err(format!("{}: commit status {id}: {} {}", self.name, r.status, r.json)),
+        }
+    }
+
+    /// Fences commit `id` in `db` so that subsequent attempts cannot be applied (SPEC §6.2).
+    pub async fn fence(&self, db: &str, id: &str) -> Result<(), String> {
+        self.commit_status(db, id, 0).await.map(|_| ())
+    }
+
+    /// Determines whether an ambiguous commit `id` in `db` (first attempted at `began`)
+    /// was applied. Checks the fenced commit status first, and falls back to reading
+    /// `marker` if the commit retention window has elapsed.
+    pub async fn resolve(&self, db: &str, id: &str, began: u64, marker: &str) -> Result<bool, String> {
+        match self.commit_status(db, id, began).await? {
+            Status::Committed(_) => Ok(true),
+            Status::NotCommitted => Ok(false),
+            Status::Unknown => {
+                let r =
+                    self.call_retry("GET", &format!("/v1/dbs/{db}/kv/{}", url_escape(marker.as_bytes())), None).await;
+                match r.status {
+                    200 => Ok(true),
+                    404 => Ok(false),
+                    s => Err(format!("{}: marker {marker}: {s} {}", self.name, r.json)),
+                }
+            }
+        }
+    }
+
+    /// Returns `true` if a retry of a request started at `began` is guaranteed
+    /// to fall within the server's commit retention window.
+    pub fn dedups(&self, began: u64) -> bool {
+        let e = &self.sim.cfg.engine;
+        self.sim.now_ms() + ZOMBIE_WAIT_MS + 2 * e.clock_sync_max_error_ms < began.saturating_add(e.commit_retention_ms)
+    }
+
     /// Collects all items in `field` across `next_cursor` pages of `path`.
     pub async fn paginate(&self, path: &str, field: &str) -> Result<Vec<Json>, String> {
         let sep = if path.contains('?') { '&' } else { '?' };
@@ -227,13 +305,13 @@ impl Client {
             if r.status != 200 {
                 return Err(format!("{}: GET {page}: {} {}", self.name, r.status, r.json));
             }
-            out.extend(r.json[field].as_array().cloned().ok_or(format!("GET {page}: no {field}: {}", r.json))?);
+            out.extend(r.json[field].as_array().cloned().ok_or(format!("GET {page}: missing {field}: {}", r.json))?);
             match r.json["next_cursor"].as_str() {
                 Some(c) => page = format!("{path}{sep}cursor={}", url_escape(c.as_bytes())),
                 None => return Ok(out),
             }
         }
-        Err(format!("{}: listing {path} never ended", self.name))
+        Err(format!("{}: listing {path} did not terminate", self.name))
     }
 
     pub async fn get(&self, path: &str) -> Result<Resp, NetError> {
@@ -253,8 +331,9 @@ impl Client {
                 Ok(r) if r.status == 201 => {
                     return Ok(Client::with_token(sim, name, r.json["token"].as_str().unwrap_or_default()));
                 }
-                // An earlier attempt may have succeeded.
-                Ok(r) if r.status == 409 => return Client::login(sim, name, email, password).await,
+                Ok(r) if r.status == 409 && r.code() == "already_exists" => {
+                    return Client::login(sim, name, email, password).await;
+                }
                 Ok(r) if r.status == 503 || r.status == 409 => {}
                 Ok(r) => return Err(format!("signup failed: {} {}", r.status, r.json)),
                 Err(_) => {}

@@ -1,7 +1,7 @@
 //! A service node: engine + metadata + auth + routing + background work.
 
 use crate::auth::{self, OidcProvider};
-use crate::cluster::{self, CLUSTER_KEY_HEADER, NoTransport, Transport};
+use crate::cluster::{self, CLUSTER_KEY_HEADER, DEADLINE_HEADER, NoTransport, Transport};
 use crate::engine::{Consistency, Db, Engine, EngineConfig, Isolation, Txn};
 use crate::env::Env;
 use crate::error::{Error, Result};
@@ -104,6 +104,17 @@ pub enum Credential {
     ApiKey { id: String, db_id: Option<String>, read_only: bool, rate_limit: Option<u32> },
 }
 
+/// Rate-limit accounting mode for a request (§9).
+#[derive(Clone, Copy, Debug)]
+pub enum Meter {
+    /// Consumes a token and rejects the request if a bucket is empty.
+    Take,
+    /// Consumes a token and allows overdrawing a bucket by up to its burst.
+    Borrow,
+    /// Does not consume tokens because the forwarding peer already charged the request.
+    Exempt,
+}
+
 #[derive(Clone, Debug)]
 pub struct Principal {
     pub user: User,
@@ -171,7 +182,6 @@ pub struct Services {
 }
 
 impl Services {
-    /// Returns a single-node configuration with no external services.
     pub fn local() -> Services {
         Services { transport: Arc::new(NoTransport), oidc: None, mailer: None }
     }
@@ -199,6 +209,15 @@ pub struct OpenTxn {
     pub encoding: crate::ops::Encoding,
 }
 
+tokio::task_local! {
+    static REQUEST_DEADLINE: Instant;
+}
+
+/// Runs `f` with `deadline` as the commit deadline for all metadata commands inside `f`.
+pub async fn with_deadline<F: std::future::Future>(deadline: Instant, f: F) -> F::Output {
+    REQUEST_DEADLINE.scope(deadline, f).await
+}
+
 pub struct Node {
     pub id: String,
     pub cfg: NodeConfig,
@@ -206,6 +225,7 @@ pub struct Node {
     pub engine: Arc<Engine>,
     pub services: Services,
     members: Mutex<Vec<NodeRecord>>,
+    members_refreshed_on_demand: Mutex<Option<Instant>>,
     suspects: Mutex<DetHashMap<String, Suspect>>,
     auth_cache: TtlCache<String, Principal>,
     name_cache: TtlCache<(String, String), DbRecord>,
@@ -232,6 +252,8 @@ struct Suspect {
     until: Instant,
 }
 
+const MEMBERS_REFRESH_ON_DEMAND_MIN: Duration = Duration::from_secs(1);
+
 const SUSPECT_MIN: Duration = Duration::from_secs(10);
 
 const CACHE_MAX: usize = 100_000;
@@ -254,6 +276,7 @@ impl Node {
             engine,
             services,
             members: Mutex::new(Vec::new()),
+            members_refreshed_on_demand: Mutex::new(None),
             suspects: Mutex::new(DetHashMap::default()),
             auth_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
             name_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
@@ -410,7 +433,11 @@ impl Node {
     }
 
     pub async fn refresh_members(&self) -> Result<()> {
-        let mut t = self.sys_read().await?;
+        self.refresh_members_at(false).await
+    }
+
+    async fn refresh_members_at(&self, strong: bool) -> Result<()> {
+        let mut t = self.sys_read_at(strong).await?;
         let nodes = meta::list_nodes(&mut t).await?;
         // Clear suspicion for peers that have heartbeated, restarted, or left.
         lock(&self.suspects).retain(|id, s| {
@@ -439,6 +466,27 @@ impl Node {
         lock(&self.members).iter().find(|n| n.id == node_id).map(|n| n.addr.clone())
     }
 
+    /// Returns the address of `node_id`. If `node_id` is not in the cached membership list,
+    /// performs a rate-limited strong refresh of the membership table first.
+    async fn addr_of_or_refresh(&self, node_id: &str) -> Option<String> {
+        if let Some(a) = self.addr_of(node_id) {
+            return Some(a);
+        }
+        let due = {
+            let mut last = lock(&self.members_refreshed_on_demand);
+            let due = last.is_none_or(|t| t.elapsed() >= MEMBERS_REFRESH_ON_DEMAND_MIN);
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        };
+        if due {
+            crate::probe::hit(crate::probe::Probe::MembersRefreshedForUnknownPeer);
+            let _ = self.refresh_members_at(true).await;
+        }
+        self.addr_of(node_id)
+    }
+
     /// Excludes `node_id` from routing with exponential backoff after an undelivered forward.
     pub fn mark_suspect(&self, node_id: &str) {
         let rec = lock(&self.members).iter().find(|n| n.id == node_id).cloned();
@@ -447,6 +495,7 @@ impl Node {
         let strikes = g.get(node_id).map_or(1, |s| s.strikes.saturating_add(1));
         let max = Duration::from_millis(3 * self.cfg.heartbeat_ms).max(SUSPECT_MIN);
         let backoff = SUSPECT_MIN.saturating_mul(1u32 << (strikes - 1).min(16)).min(max);
+        crate::probe::hit(crate::probe::Probe::PeerSuspected);
         g.insert(node_id.to_string(), Suspect { started_at, heartbeat_at, strikes, until: Instant::now() + backoff });
     }
 
@@ -456,6 +505,9 @@ impl Node {
 
     /// Returns the `(node_id, addr)` of the peer that should handle `db_id`, or `None` to handle locally.
     pub async fn route(&self, db_id: &str) -> Option<(String, String)> {
+        if crate::buggify::fault(0.02) {
+            return None;
+        }
         let db = self.engine.db(db_id);
         let _ = db.open(false).await;
         let target = match db.lease_holder() {
@@ -469,11 +521,16 @@ impl Node {
             return None;
         }
         if self.is_suspect(&target) {
+            self.env.trace(|| format!("{db_id}: {target} is suspect, handling locally"));
             return None;
         }
-        let addr = self.addr_of(&target)?;
-        // Do not forward to a previous process that ran at this node's address.
+        let Some(addr) = self.addr_of_or_refresh(&target).await else {
+            self.env.trace(|| format!("{db_id}: address for {target} is missing, handling locally"));
+            return None;
+        };
+        // Ignore a previous process that ran at this node's address.
         if addr == self.cfg.addr {
+            crate::probe::hit(crate::probe::Probe::OwnAddressIgnored);
             return None;
         }
         Some((target, addr))
@@ -503,18 +560,28 @@ impl Node {
     }
 
     async fn run_meta_json(&self, cmd: MetaCmd) -> Result<Json> {
+        with_deadline(self.meta_deadline(), self.run_meta_attempts(cmd)).await
+    }
+
+    async fn run_meta_attempts(&self, cmd: MetaCmd) -> Result<Json> {
         let sys = self.engine.db(SYS_DB);
+        let deadline = self.meta_deadline();
         let mut last_err = Error::unavailable("system database unavailable");
         for attempt in 0..10u32 {
             if attempt > 0 {
                 let d = 10 * (1u64 << attempt.min(7)) + self.env.random_below(20);
                 tokio::time::sleep(Duration::from_millis(d)).await;
+                if Instant::now() >= deadline {
+                    break;
+                }
             }
+            // Do not forward to a previous process that ran at this node's address.
             if let Some(holder) = sys.lease_holder()
                 && holder != self.id
-                && let Some(addr) = self.addr_of(&holder)
+                && let Some(addr) = self.addr_of(&holder).filter(|a| *a != self.cfg.addr)
             {
-                match self.forward_meta(&holder, &addr, &cmd).await {
+                crate::probe::hit(crate::probe::Probe::MetaForwarded);
+                match self.forward_meta(&holder, &addr, &cmd, deadline).await {
                     Ok(r) => return Ok(r),
                     // Reload the cluster key if it was initialized by another node after we started.
                     Err(Ok(Error::PermissionDenied(m))) if m.contains("cluster key") => {
@@ -562,8 +629,16 @@ impl Node {
         let sys = self.engine.db(SYS_DB);
         let mut t = sys.begin(Isolation::Serializable, Consistency::Strong).await?;
         let r = meta::apply(&mut t, &BlobResolver { db: &sys }, cmd, self.now_ms() as i64).await?;
-        sys.commit(t.into_request()).await?;
+        let mut req = t.into_request();
+        req.deadline = Some(self.meta_deadline());
+        sys.commit(req).await?;
         Ok(r)
+    }
+
+    fn meta_deadline(&self) -> Instant {
+        REQUEST_DEADLINE
+            .try_with(|d| *d)
+            .unwrap_or_else(|_| Instant::now() + Duration::from_millis(self.cfg.engine.commit_timeout_ms))
     }
 
     async fn forward_meta(
@@ -571,6 +646,7 @@ impl Node {
         holder: &str,
         addr: &str,
         cmd: &MetaCmd,
+        deadline: Instant,
     ) -> std::result::Result<Json, std::result::Result<Error, cluster::TransportError>> {
         let body = serde_json::to_vec(cmd).map_err(|e| Ok(Error::internal(e.to_string())))?;
         let mut req = Request::post("/internal/v1/meta")
@@ -588,6 +664,8 @@ impl Node {
         if let Ok(v) = holder.parse() {
             req.headers_mut().insert(cluster::FORWARD_TO_HEADER, v);
         }
+        let remaining = deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
+        req.headers_mut().insert(DEADLINE_HEADER, (self.now_ms() + remaining).into());
         if let Some(rid) = crate::log::request_id()
             && let Ok(v) = rid.parse()
         {
@@ -605,11 +683,11 @@ impl Node {
 
     /// Authenticates a bearer token or session cookie value and checks rate limits.
     pub async fn authenticate(&self, token: &str) -> Result<Principal> {
-        self.authenticate_metered(token, false).await
+        self.authenticate_metered(token, Meter::Take).await
     }
 
-    /// Authenticates `token` and checks rate limits, using [`Limiter::borrow`] when `may_borrow` is true.
-    pub async fn authenticate_metered(&self, token: &str, may_borrow: bool) -> Result<Principal> {
+    /// Authenticates `token` and applies rate limits according to `meter`.
+    pub async fn authenticate_metered(&self, token: &str, meter: Meter) -> Result<Principal> {
         let p = self.principal(token).await?;
         let user_key = format!("user:{}", p.user.id);
         let lim = &self.cfg.limits;
@@ -621,16 +699,17 @@ impl Node {
             }
             Credential::Session { .. } => &[(&user_key, lim.user)],
         };
-        match may_borrow {
-            true => self.limiter.borrow(keys, "requests")?,
-            false => self.limiter.take(keys, "requests")?,
+        match meter {
+            Meter::Take => self.limiter.take(keys, "requests")?,
+            Meter::Borrow => self.limiter.borrow(keys, "requests")?,
+            Meter::Exempt => {}
         }
         Ok(p)
     }
 
     async fn principal(&self, token: &str) -> Result<Principal> {
         let cache_key = auth::secret_hash(token);
-        if let Some(p) = self.auth_cache.get(&cache_key) {
+        if let Some(p) = self.auth_cache.get(&cache_key).filter(|_| !crate::buggify::fires(0.1)) {
             return Ok(p);
         }
         let read_at = Instant::now();
@@ -790,6 +869,7 @@ impl Node {
                 bootstrap_admin: false,
             })
             .await?;
+        self.env.crash_point().await;
         if let (true, Ok(mailer)) = (r.created, self.mailer()) {
             self.mail_verification(mailer, &r.user);
         }
@@ -832,6 +912,7 @@ impl Node {
             verify_email: false,
         })
         .await?;
+        self.env.crash_point().await;
         self.delete_ended_sessions(&user.id, Some(token_hash)).await;
         Ok(())
     }
@@ -999,23 +1080,23 @@ impl Node {
             self.token_link("/console/reset", auth::TokenPurpose::Reset, &user, &meta::password_fp(&user), &RESET_LINK);
         let text = format!(
             "Someone asked to reset the password of your Baserunna account. To choose a new one, open\n\n{link}\n\n\
-             The link is valid for {} and works once. If you did not ask for it, ignore this email.",
+             The link is valid for {} and sets one password. If you did not ask for it, ignore this email.",
             RESET_LINK.words
         );
         self.send_mail(mailer, Mail { to: email, subject: "Reset your Baserunna password".into(), text });
         Ok(())
     }
 
-    /// Resets a user's password using a single-use reset token, revokes existing sessions, and returns a new session.
+    /// Resets a user's password with a reset token, revokes existing sessions, and returns a new
+    /// session. Repeating the reset with the same password succeeds idempotently.
     pub async fn reset_password(&self, client: &str, token: &str, password: &str) -> Result<(User, String)> {
         auth::validate_password(password)?;
         let (user, fp) = self.open_link(client, auth::TokenPurpose::Reset, token).await?;
-        let used = || Error::Unauthenticated("this link has been used already".into());
-        if meta::password_fp(&user) != fp {
-            return Err(used());
-        }
         if user.disabled {
             return Err(Error::PermissionDenied("this account is disabled".into()));
+        }
+        if meta::password_fp(&user) != fp {
+            return self.retry_password_reset(client, &user, password).await;
         }
         let hash = self.hash_password(password).await?;
         let set = MetaCmd::SetPassword {
@@ -1025,7 +1106,35 @@ impl Node {
             keep_session: None,
             verify_email: true,
         };
-        self.run_meta(set).await.map_err(|e| if matches!(e, Error::PreconditionFailed { .. }) { used() } else { e })?;
+        match self.run_meta(set).await {
+            Ok(_) => {}
+            Err(Error::PreconditionFailed { .. }) => {
+                let user = self.user_strong(&user.id).await?;
+                return self.retry_password_reset(client, &user, password).await;
+            }
+            Err(e) => return Err(e),
+        }
+        self.env.crash_point().await;
+        self.finish_reset(client, &user).await
+    }
+
+    /// Completes a retried password reset when the reset token was already applied with `password`.
+    /// Enforces sign-in failure backoff before verifying `password`.
+    async fn retry_password_reset(&self, client: &str, user: &User, password: &str) -> Result<(User, String)> {
+        let used = || Error::Unauthenticated("this link has been used already".into());
+        let (lim, account) = (&self.cfg.limits, Self::failures_of(&user.email));
+        self.limiter.check_backoff(&[&account], "failed sign-ins")?;
+        let Some(h) = user.password_hash.clone() else { return Err(used()) };
+        let pw = password.to_string();
+        if !self.hashing(move || auth::verify_password(&pw, &h)).await? {
+            self.limiter.failed(&account, lim.account_free_failures, lim);
+            return Err(used());
+        }
+        crate::probe::hit(crate::probe::Probe::PasswordResetFinished);
+        self.finish_reset(client, user).await
+    }
+
+    async fn finish_reset(&self, client: &str, user: &User) -> Result<(User, String)> {
         self.forget_user(&user.id);
         self.delete_ended_sessions(&user.id, None).await;
         self.limiter.succeeded(&Self::failures_of(&user.email));
@@ -1036,7 +1145,6 @@ impl Node {
     /// Resolves a database reference (`name`, `org.name`, or `id:<db_id>`) and the caller's access.
     pub async fn resolve_db(&self, p: &Principal, name: &str) -> Result<(DbRecord, Access)> {
         match self.resolve_db_with(p, name, false).await {
-            // A miss may be a stale cache or snapshot: confirm strongly.
             Err(Error::NotFound(_)) => self.resolve_db_with(p, name, true).await,
             other => other,
         }
@@ -1195,6 +1303,7 @@ impl Node {
                 continue;
             }
             self.engine.purge(&d.id).await?;
+            self.env.crash_point().await;
             self.run_meta(MetaCmd::PurgePass { id: d.id.clone(), passes: d.purge_passes }).await?;
             n += 1;
         }
@@ -1211,6 +1320,16 @@ impl Node {
 
     pub fn open_txn_count(&self) -> usize {
         lock(&self.txns).len()
+    }
+
+    /// Returns the number of open interactive transactions for `db_id`.
+    pub async fn open_txn_count_for_db(&self, db_id: &str) -> usize {
+        let txns: Vec<_> = lock(&self.txns).values().cloned().collect();
+        let mut n = 0;
+        for t in txns {
+            n += usize::from(t.lock().await.db_id == db_id);
+        }
+        n
     }
 
     pub fn status_json(&self) -> Json {
@@ -1270,7 +1389,7 @@ mod tests {
             });
             tokio::time::sleep(Duration::from_millis(n.cfg.limits.hash_wait_ms / 2)).await;
             drop(held);
-            assert!(waiting.await.unwrap().unwrap().starts_with("pbkdf2-sha256$"), "a slot freed in time");
+            assert!(waiting.await.unwrap().unwrap().starts_with("pbkdf2-sha256$"));
         });
     }
 
@@ -1298,7 +1417,51 @@ mod tests {
     }
 
     #[test]
-    fn suspects_come_back_and_leavers_go() {
+    fn reset_link_is_idempotent_for_same_password_only() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let n = w.node(0).clone();
+            let user = n.password_signup("c", "reset@x.io", "password-1").await.unwrap();
+            let fp = super::meta::password_fp(&user);
+            let token = super::auth::sign_token(
+                &n.cookie_key(),
+                super::auth::TokenPurpose::Reset,
+                &user.id,
+                &fp,
+                n.now_ms() + 60_000,
+            );
+            let (a, b) =
+                tokio::join!(n.reset_password("c", &token, "password-2"), n.reset_password("c", &token, "password-2"));
+            assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
+            assert!(n.reset_password("c", &token, "password-3").await.is_err());
+        });
+    }
+
+    #[test]
+    fn restart_replaces_predecessor_with_skewed_clock() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let a = w.node(0).clone();
+            let now = a.now_ms() as i64;
+            let at = |id: &str, started_at| super::NodeRecord {
+                id: id.into(),
+                addr: "http://elsewhere".into(),
+                started_at,
+                heartbeat_at: now,
+            };
+            for rec in [at("before", now + 3_600_000), at("after", now)] {
+                a.run_meta(super::MetaCmd::Heartbeat { node: rec, dead_after_ms: 3_600_000 }).await.unwrap();
+            }
+            a.refresh_members().await.unwrap();
+            let live = super::cluster::live(&a.members(), now, a.cfg.heartbeat_ms as i64);
+            let there: Vec<&str> =
+                live.iter().filter(|m| m.addr == "http://elsewhere").map(|m| m.id.as_str()).collect();
+            assert_eq!(there, ["after"]);
+        });
+    }
+
+    #[test]
+    fn suspects_recover_and_shutdown_nodes_leave() {
         run_paused(async {
             let w = World::new(2, 1).await;
             let (a, b) = (w.node(0).clone(), w.node(1).clone());
@@ -1306,20 +1469,20 @@ mod tests {
             let live = |n: &super::Node| n.live_members().into_iter().map(|m| m.id).collect::<Vec<_>>();
             assert!(live(&a).contains(&b.id));
             a.mark_suspect(&b.id);
-            assert!(!live(&a).contains(&b.id), "a suspect is not routed to");
+            assert!(!live(&a).contains(&b.id));
             tokio::time::sleep(Duration::from_secs(11)).await;
-            assert!(live(&a).contains(&b.id), "the first suspicion lasts 10 s");
+            assert!(live(&a).contains(&b.id));
             a.mark_suspect(&b.id);
             tokio::time::sleep(Duration::from_secs(11)).await;
-            assert!(!live(&a).contains(&b.id), "repeated failures back off longer");
+            assert!(!live(&a).contains(&b.id));
             for _ in 0..8 {
                 a.mark_suspect(&b.id);
             }
             tokio::time::sleep(Duration::from_millis(a.cfg.heartbeat_ms + 2 * a.cfg.members_refresh_ms)).await;
-            assert!(live(&a).contains(&b.id), "a new heartbeat forgives a suspect");
+            assert!(live(&a).contains(&b.id));
             b.shutdown().await;
             a.refresh_members().await.unwrap();
-            assert!(a.members().iter().all(|m| m.id != b.id), "a node that shut down left the membership");
+            assert!(a.members().iter().all(|m| m.id != b.id));
         });
     }
 }

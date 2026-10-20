@@ -1,0 +1,53 @@
+# Test suite and deterministic simulation campaigns.
+name: Test
+on:
+  workflow_dispatch:
+  # pull_request:
+  # push:
+  #   branches:
+  #     - main
+  # schedule:
+  #   - cron: "17 3 * * *"
+  # workflow_dispatch:
+  #   inputs:
+  #     minutes:
+  #       description: Campaign minutes
+  #       default: "60"
+jobs:
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
+  campaign:
+    name: Simulation campaign
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --example sim_tool
+      - name: Run simulation campaign
+        env:
+          SIM_MINUTES: ${{ github.event_name == 'schedule' && '300' || github.event.inputs.minutes || '10' }}
+          SIM_COVERAGE: "1"
+          SIM_REQUIRE_PROBES: ${{ github.event_name == 'schedule' && '1' || '' }}
+        run: target/release/examples/sim_tool campaign all 1000000 ${{ github.run_id }}
+  explore:
+    name: Guided exploration
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --example sim_tool
+      - name: Run guided exploration
+        env:
+          SIM_MINUTES: "60"
+        run: target/release/examples/sim_tool explore all $(( ${{ github.run_id }} + (1 << 40) ))

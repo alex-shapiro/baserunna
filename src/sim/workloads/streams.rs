@@ -1,21 +1,12 @@
-//! `streams`: appenders, followers, readers, a consumer and trims work on
-//! several streams at once through random nodes, under faults.
+//! Simulation workload for stream appends, reads, consumers, long-poll followers, and retention.
 //!
-//! Appends carry idempotency keys and are retried until definitive, so the
-//! seqs of every committed record end up known; every read is recorded and
-//! checked against them once the run is over. Records must be the ones
-//! appended at their seqs, dense and in order, with times that never
-//! decrease and lie within their append's window. A strong read must see
-//! every append acknowledged before it began, and no trim undone. Appends
-//! expecting a seq let exactly one through per seq; a transactional append
-//! commits exactly with its counter; a consumer that advances its cursor in
-//! the transaction counting what it processed processes every record once;
-//! long-poll and event-stream followers receive every record once, in
-//! order; retention keeps a stream within its limits; and every stream ends
-//! equal to its model.
+//! Concurrent clients append records with idempotency keys, query ranges and filters, follow
+//! streams via long polling and server-sent events, advance consumer cursors in transactions,
+//! and trim records under fault injection. At quiescence, all recorded reads, follower logs,
+//! consumer cursors, and stream states are verified against the committed append history.
 
 use super::super::Sim;
-use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
+use super::super::client::{Client, Resp, Status, ZOMBIE_WAIT_MS};
 use bytes::Bytes;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,24 +15,20 @@ use std::sync::{Arc, Mutex};
 
 const DB: &str = "/v1/dbs/streams";
 const LEVELS: [&str; 3] = ["info", "warn", "error"];
-/// Retention of the `ret` stream.
 const RET_BYTES: u64 = 3_000;
 const RET_MS: u64 = 40_000;
 
-/// A committed record: its body as reads return it, and when its append ran.
+/// Expected record content and append time window.
 #[derive(Clone, Debug, PartialEq)]
 struct Expect {
     body: Json,
     headers: Json,
-    /// Sim time the append's first attempt started and its answer arrived.
     window: (u64, u64),
 }
 
-/// A read, as recorded for checking.
 #[derive(Clone, Debug)]
 struct Read {
     stream: String,
-    /// The query parameters, as JSON.
     spec: Json,
     resp: Json,
     window: (u64, u64),
@@ -49,30 +36,27 @@ struct Read {
 
 #[derive(Default)]
 struct World {
-    /// Records by stream and seq.
     log: BTreeMap<String, BTreeMap<u64, Expect>>,
-    /// Appends acknowledged: stream, next seq after them, sim time acknowledged.
+    /// Acknowledged appends: `(stream, next_seq, ack_time_ms)`.
     acked: Vec<(String, u64, u64)>,
-    /// Appends sent: stream, records, sim time first sent.
+    /// Sent appends: `(stream, record_count, start_time_ms)`.
     sent: Vec<(String, u64, u64)>,
     reads: Vec<Read>,
-    /// Explicit trims acknowledged: stream, before seq, sim time acknowledged.
+    /// Acknowledged explicit trims: `(stream, before_seq, ack_time_ms)`.
     trims: Vec<(String, u64, u64)>,
-    /// Successful appends expecting a seq: (writer, step) to seq.
+    /// Conditional appends: `(writer, step) -> seq`.
     cas: BTreeMap<(String, u64), u64>,
-    /// Appends whose outcome no commit record could tell.
+    /// Appends with unknown outcomes.
     uncertain: Vec<Uncertain>,
-    /// Transactions of `tx_writer` whose outcome no commit record could tell.
+    /// Count of `tx_writer` transactions with unknown outcomes.
     tx_unknown: u64,
 }
 
-/// An append that may or may not have applied, to be resolved from the
-/// records seen in the stream.
+/// Append with an unknown outcome, resolved by inspecting records read from the stream.
 #[derive(Debug)]
 struct Uncertain {
     stream: String,
     records: Vec<Expect>,
-    /// The `cas_writer` and step that sent it, and the seq it expected.
     cas: Option<((String, u64), u64)>,
 }
 
@@ -82,13 +66,12 @@ fn world(w: &Shared) -> std::sync::MutexGuard<'_, World> {
     w.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// How a request with an idempotency key ended.
+/// Outcome of an idempotent request.
 enum Settled {
     Answer(Resp),
-    /// An attempt whose answer was lost committed; this is its status.
+    /// Committed on an earlier attempt whose response was lost.
     Applied(Json),
-    /// Attempts began longer ago than commit records are kept, so whether
-    /// one applied is unknown.
+    /// Commit record retention expired before the outcome was determined.
     Unknown,
 }
 
@@ -123,24 +106,15 @@ async fn settle_call(
             continue;
         }
         c.pause(ZOMBIE_WAIT_MS).await;
-        let s = c.call_retry("GET", &format!("{DB}/commits/key:{key}"), None).await;
-        match s.json["status"].as_str() {
-            Some("committed") => return Ok(Settled::Applied(s.json)),
-            Some("not_committed") => {
-                let kept =
-                    s.json["retention_ms"].as_u64().ok_or_else(|| format!("status without retention: {}", s.json))?;
-                let slack = 2 * c.sim.cfg.engine.clock_sync_max_error_ms;
-                if c.sim.now_ms() - first + slack >= kept {
-                    return Ok(Settled::Unknown);
-                }
-            }
-            _ => return Err(format!("commit status of {key}: {} {}", s.status, s.json)),
+        match c.commit_status("streams", &format!("key:{key}"), first).await? {
+            Status::Committed(j) => return Ok(Settled::Applied(j)),
+            Status::NotCommitted => {}
+            Status::Unknown => return Ok(Settled::Unknown),
         }
     }
     Err(format!("{}: {method} {path} never settled", c.name))
 }
 
-/// How an appender sends its records.
 #[derive(Clone, Copy, Debug)]
 enum Format {
     Json,
@@ -153,8 +127,7 @@ fn record(name: &str, step: usize, j: usize, pad: usize) -> (Json, Json) {
     (json!({"w": name, "i": step, "j": j, "lvl": lvl, "pad": "x".repeat(pad)}), json!({"w": name}))
 }
 
-/// Appends `k` records to `stream`, if it holds `expect_seq` records, and
-/// records their seqs. Chat rooms are created by their first append.
+/// Appends `k` records to `stream` and records their sequence numbers.
 async fn append(
     c: &Client,
     w: &Shared,
@@ -212,7 +185,7 @@ async fn append(
             return Ok(None);
         }
         Settled::Answer(r) if r.status == 200 => {
-            let first = r.json["first_seq"].as_u64().ok_or("no first_seq")?;
+            let first = r.json["first_seq"].as_u64().ok_or("missing first_seq")?;
             if r.json["count"] != k || r.json["next_seq"].as_u64() != Some(first + k as u64) {
                 return Err(format!("append of {k} to {stream}: {}", r.json));
             }
@@ -226,8 +199,7 @@ async fn append(
     Ok(Some(first))
 }
 
-/// Settles each uncertain append from the records seen in its stream: it
-/// applied if any of its records was seen, at the seqs that record implies.
+/// Resolves uncertain appends by matching their records against observed stream reads.
 fn resolve(w: &mut World, seen: &BTreeMap<String, BTreeMap<u64, Json>>) -> Result<(), String> {
     for u in std::mem::take(&mut w.uncertain) {
         let mut firsts = BTreeSet::new();
@@ -281,7 +253,7 @@ async fn appender(c: Client, w: Shared, streams: Vec<String>, steps: usize) -> R
     Ok(())
 }
 
-/// Appenders racing on one stream, each expecting the seq it last saw.
+/// Appends to `cas` using conditional `expect_seq` checks.
 async fn cas_writer(c: Client, w: Shared, steps: usize) -> Result<(), String> {
     for step in 0..steps {
         let info = c.call_retry("GET", &format!("{DB}/streams/cas"), None).await;
@@ -298,7 +270,7 @@ async fn cas_writer(c: Client, w: Shared, steps: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Appends to `tx` and counts the appends in one transaction.
+/// Appends to `tx` and increments a counter in the same transaction.
 async fn tx_writer(c: Client, w: Shared, steps: usize) -> Result<(), String> {
     for step in 0..steps {
         let body = json!({
@@ -327,7 +299,6 @@ async fn tx_writer(c: Client, w: Shared, steps: usize) -> Result<(), String> {
             Some(_) => {}
             None => world(&w).tx_unknown += 1,
         }
-        // A read-only transaction sees the counter and the stream agree.
         let check = json!({"ops": [{"op": "get", "key": "tx/n"}, {"op": "stream_info", "stream": "tx"}]});
         let r = c.call_retry("POST", &format!("{DB}/txn"), Some(check)).await;
         let n: u64 = r.json["results"][0]["value"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -340,7 +311,6 @@ async fn tx_writer(c: Client, w: Shared, steps: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Reads and records a random read of a random stream.
 async fn reader(c: Client, w: Shared, done: Arc<AtomicBool>) -> Result<(), String> {
     while !done.load(Ordering::SeqCst) {
         let streams = ["log", "chat:0", "chat:1", "ret", "cas"];
@@ -398,7 +368,7 @@ async fn reader(c: Client, w: Shared, done: Arc<AtomicBool>) -> Result<(), Strin
     Ok(())
 }
 
-/// Follows `stream` from its start with long polls, or as event streams.
+/// Follows `stream` from sequence 0 using long polling or server-sent events.
 async fn follower(c: Client, stream: &str, events: bool, done: Arc<AtomicBool>) -> Result<Vec<(u64, Json)>, String> {
     let mut got: Vec<(u64, Json)> = Vec::new();
     let mut cursor = 0u64;
@@ -440,7 +410,7 @@ async fn follower(c: Client, stream: &str, events: bool, done: Arc<AtomicBool>) 
     }
 }
 
-/// The records of a server-sent event stream.
+/// Parses records from a server-sent event stream.
 fn parse_events(body: &[u8]) -> Result<Vec<Json>, String> {
     let text = std::str::from_utf8(body).map_err(|_| "event stream not UTF-8")?;
     let mut out = Vec::new();
@@ -454,16 +424,15 @@ fn parse_events(body: &[u8]) -> Result<Vec<Json>, String> {
             } else if let Some(v) = line.strip_prefix("event: ") {
                 kind = v;
             } else if !line.starts_with(':') {
-                return Err(format!("odd event line {line:?}"));
+                return Err(format!("invalid event line {line:?}"));
             }
         }
         match (kind, id, data) {
-            // The stream ended early; the follower picks up from where it got.
             ("error", _, _) => break,
             ("message", Some(id), Some(d)) => {
                 let rec: Json = serde_json::from_str(d).map_err(|e| format!("event data: {e}"))?;
                 if rec["seq"] != id {
-                    return Err(format!("event {id} carries {rec}"));
+                    return Err(format!("event {id} has mismatched seq: {rec}"));
                 }
                 out.push(rec);
             }
@@ -474,8 +443,7 @@ fn parse_events(body: &[u8]) -> Result<Vec<Json>, String> {
     Ok(out)
 }
 
-/// Processes `log` with a consumer cursor advanced in the transaction that
-/// counts what it processed.
+/// Reads from `log` using a consumer cursor and advances the cursor in the same transaction.
 async fn consumer(c: Client, w: Shared, done: Arc<AtomicBool>) -> Result<(), String> {
     let mut idle = 0;
     loop {
@@ -522,13 +490,9 @@ async fn consumer(c: Client, w: Shared, done: Arc<AtomicBool>) -> Result<(), Str
             Ok(r) if r.status == 200 || r.status == 409 || r.status == 404 => {}
             Ok(r) if r.retryable_not_applied() || r.status == 429 => {}
             _ => {
-                // The commit may have applied: resolve it before going on.
+                // Wait for any in-flight commit attempt to expire and fence it.
                 c.pause(ZOMBIE_WAIT_MS).await;
-                let cid = cid.as_str().unwrap_or_default();
-                let s = c.call_retry("GET", &format!("{DB}/commits/{cid}"), None).await;
-                if s.status != 200 {
-                    return Err(format!("commit status: {} {}", s.status, s.json));
-                }
+                c.fence("streams", cid.as_str().unwrap_or_default()).await?;
             }
         }
     }
@@ -547,7 +511,7 @@ impl FilterStatus for Result<Resp, super::super::NetError> {
     }
 }
 
-/// Appends to `ret`, whose retention trims it, and trims it explicitly.
+/// Appends to `ret` and periodically trims it.
 async fn trimmer(c: Client, w: Shared, steps: usize) -> Result<(), String> {
     for step in 0..steps {
         if c.rng().chance(0.15) {
@@ -580,7 +544,7 @@ async fn lifecycle(c: Client, rounds: usize) -> Result<(), String> {
                 match settle_call(&c, "POST", &path, &[], Bytes::from(body.to_string()), &key).await? {
                     Settled::Applied(s) => break s["appends"][0].clone(),
                     Settled::Answer(r) if r.status == 200 => break r.json["first_seq"].clone(),
-                    // As the only writer of tmp, its length tells whether the append applied.
+                    // As the sole writer to `tmp`, the stream length determines whether the append was applied.
                     Settled::Unknown => {
                         let info = c.call_retry("GET", &format!("{DB}/streams/tmp"), None).await;
                         match info.json["next_seq"].as_u64() {
@@ -612,7 +576,6 @@ async fn lifecycle(c: Client, rounds: usize) -> Result<(), String> {
         if info.json["next_seq"] != 0 {
             return Err(format!("a recreated stream does not start over: {}", info.json));
         }
-        // Retention, consumers and listings of the new stream.
         let body = json!({"retention_ms": 3_600_000, "max_bytes": null});
         let r = c.call_settled("PATCH", &format!("{DB}/streams/tmp"), Some(body)).await;
         if r.status != 200 || r.json["retention_ms"] != 3_600_000 || !r.json["max_bytes"].is_null() {
@@ -647,7 +610,7 @@ async fn lifecycle(c: Client, rounds: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// The record as reads return it, for comparison with a model.
+/// Formats `e` as a read response record at `seq`.
 fn shape(e: &Expect, seq: u64) -> Json {
     let mut j = e.body.clone();
     j["seq"] = json!(seq);
@@ -665,8 +628,6 @@ fn strip_time(r: &Json) -> Json {
     r
 }
 
-/// Times seen for each record, which must agree, fall within the append's
-/// window, and never decrease along the stream.
 fn strip_records(resp: &Json) -> Json {
     let mut r = resp.clone();
     let seqs: Vec<Json> =
@@ -675,7 +636,7 @@ fn strip_records(resp: &Json) -> Json {
     r
 }
 
-/// Where a read from a time began: the first seq it could return.
+/// Returns the starting sequence number of a `from_time` read.
 fn time_start(rd: &Read) -> Option<u64> {
     if !rd.spec["filter"].is_null() {
         return None;
@@ -683,7 +644,6 @@ fn time_start(rd: &Read) -> Option<u64> {
     let first = rd.resp["records"].as_array().and_then(|r| r.first()).and_then(|r| r["seq"].as_u64());
     match (rd.spec["reverse"] == true, rd.resp["done"] == true) {
         (false, _) => first.or_else(|| rd.resp["next_seq"].as_u64()),
-        // A reverse read ends at its start, unless its end came first.
         (true, true) if rd.spec["until_seq"].is_null() => rd.resp["next_seq"].as_u64(),
         (true, _) => None,
     }
@@ -718,12 +678,11 @@ fn check_times(log: &BTreeMap<String, BTreeMap<u64, Expect>>, reads: &[Read], ep
         }
         prev = Some((k, *t));
     }
-    // A read from a time begins at the first record at or after it.
+    // A `from_time` read starts at the first record with `time >= from_time`.
     for rd in reads.iter().filter(|r| r.resp.get("first_seq").is_some()) {
         let (Some(t), Some(lo)) = (rd.spec["from_time"].as_u64(), time_start(rd)) else { continue };
         let first = rd.resp["first_seq"].as_u64().unwrap_or(0);
-        // A record appended after the read may carry an earlier time, by the
-        // store clock's error; only records the read could see are bound.
+        // Records appended after the read may have an earlier timestamp within the clock error bound.
         let tail = rd.resp["tail_seq"].as_u64().unwrap_or(0);
         if let Some(at) = times.get(&(rd.stream.clone(), lo)).filter(|_| lo < tail)
             && *at < t
@@ -757,8 +716,7 @@ fn lvl_matches(spec: &Json, e: &Expect) -> bool {
     spec["filter"].is_null() || e.body["json"]["lvl"] == spec["filter"]["value"]
 }
 
-/// Checks one read against the stream's committed records, the appends
-/// acknowledged before it began and the trims before it.
+/// Verifies a recorded read against committed records, acknowledged appends, and trims.
 fn check_read(w: &World, rd: &Read) -> Result<(), String> {
     let log = w.log.get(&rd.stream).cloned().unwrap_or_default();
     let spec = &rd.spec;
@@ -800,7 +758,6 @@ fn check_read(w: &World, rd: &Read) -> Result<(), String> {
         if first > tail {
             return Err(format!("{} first {first} past tail {tail}", rd.stream));
         }
-        // Without a filter, a read returns consecutive records from its start.
         if spec["filter"].is_null() {
             let start = match (spec["from_seq"].as_u64(), spec["tail"].as_u64()) {
                 (Some(s), _) => Some(s.max(first)),
@@ -828,7 +785,7 @@ fn check_read(w: &World, rd: &Read) -> Result<(), String> {
             }
         }
     }
-    // A filtered read skips no match in the range it examined.
+    // Filtered forward reads must include all matching records in the scanned range.
     if !spec["filter"].is_null() && !reverse {
         let lo = seqs.first().copied();
         let next = resp["next_seq"].as_u64().unwrap_or(0);
@@ -887,7 +844,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     let client = |name: &str| Client::with_token(&sim, name, &token);
     let w: Shared = Arc::default();
     let done = Arc::new(AtomicBool::new(false));
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut writers = Vec::new();
     let streams = vec!["log".to_string(), "log".to_string(), "chat:0".to_string(), "chat:1".to_string()];
     for i in 0..3 {
@@ -912,10 +869,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
             Err(e) => err = err.or(Some(format!("writer panicked: {e}"))),
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     done.store(true, Ordering::SeqCst);
     for h in readers {
         match h.await {
@@ -939,11 +893,26 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
         return Err(e);
     }
     let c = client("checker");
-    // Retention: one more append after the oldest records aged, then the
-    // trims it calls for.
+    // Wait for the oldest records to age past the retention window, then trigger a retention trim.
     c.pause(RET_MS).await;
     append(&c, &w, "ret", 1_000_000, 1, Format::Json, None).await?;
     c.pause(2_000).await;
+    let eps = 2 * sim.cfg.engine.clock_sync_max_error_ms;
+    let due = crate::engine::Retention { retention_ms: Some(RET_MS), max_bytes: Some(RET_BYTES) }.due_at();
+    let (due_ms, due_bytes) = (due.retention_ms.unwrap_or(RET_MS), due.max_bytes.unwrap_or(RET_BYTES));
+    let deadline = c.sim.now_ms() + 60_000;
+    loop {
+        let info = c.call_retry("GET", &format!("{DB}/streams/ret"), None).await;
+        let bytes = info.json["bytes"].as_u64().unwrap_or(u64::MAX);
+        let fresh = info.json["first_time"].as_u64().is_none_or(|t| t + due_ms + 5_000 + eps >= c.sim.now_ms());
+        if bytes <= due_bytes && fresh {
+            break;
+        }
+        if c.sim.now_ms() > deadline {
+            return Err(format!("ret is past its retention: {}", info.json));
+        }
+        c.pause(1_000).await;
+    }
     let mut finals = Vec::new();
     for stream in ["log", "chat:0", "chat:1", "cas", "ret"] {
         finals.push((stream, read_stream_fully(&c, stream).await?));
@@ -998,22 +967,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     if sorted != cas_log {
         return Err(format!("appends expecting seqs won {sorted:?}, the stream holds {cas_log:?}"));
     }
-    let eps = 2 * sim.cfg.engine.clock_sync_max_error_ms;
-    let due = crate::engine::Retention { retention_ms: Some(RET_MS), max_bytes: Some(RET_BYTES) }.due_at();
-    let (due_ms, due_bytes) = (due.retention_ms.unwrap_or(RET_MS), due.max_bytes.unwrap_or(RET_BYTES));
-    let deadline = c.sim.now_ms() + 60_000;
-    loop {
-        let info = c.call_retry("GET", &format!("{DB}/streams/ret"), None).await;
-        let bytes = info.json["bytes"].as_u64().unwrap_or(u64::MAX);
-        let first_time = info.json["first_time"].as_u64().unwrap_or(0);
-        if bytes <= due_bytes && first_time + due_ms + 5_000 + eps >= c.sim.now_ms() {
-            break;
-        }
-        if c.sim.now_ms() > deadline {
-            return Err(format!("ret is past its retention: {}", info.json));
-        }
-        c.pause(1_000).await;
-    }
     let n = c.call_retry("GET", &format!("{DB}/kv/proc%2Fcount"), None).await;
     let processed: u64 = String::from_utf8_lossy(&n.raw.body).parse().unwrap_or(0);
     let cursor = c.call_retry("GET", &format!("{DB}/streams/log/consumers/proc"), None).await;
@@ -1038,13 +991,12 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     check_integrity(&sim).await
 }
 
-/// Checks the database's streams with [`crate::stream::check_integrity`].
 async fn check_integrity(sim: &Arc<Sim>) -> Result<(), String> {
-    let n = sim.up_nodes().first().copied().ok_or("no node up")?;
-    let node = sim.node(n).ok_or("node gone")?.node.clone();
+    let n = sim.up_nodes().first().copied().ok_or("all nodes are down")?;
+    let node = sim.node(n).ok_or("node is down")?.node.clone();
     let c = Client::login(sim, "integrity", "streams@streams.test", "password-123").await?;
     let r = c.call_retry("GET", DB, None).await;
-    let id = r.json["id"].as_str().ok_or("no database id")?.to_string();
+    let id = r.json["id"].as_str().ok_or("missing database id")?.to_string();
     let db = node.engine.db(&id);
     let mut t = crate::node::retry_unavailable(|| {
         db.begin(crate::engine::Isolation::Serializable, crate::engine::Consistency::Strong)
@@ -1080,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn the_checkers_catch_bad_reads() {
+    fn checkers_reject_invalid_reads() {
         let w = world_with(&[(0, "a"), (1, "b"), (2, "c")], 3);
         let ok = read(json!({"from_seq": 0, "limit": 10}), &[(0, "a", 150), (1, "b", 150), (2, "c", 160)], 0, 3, 300);
         check_read(&w, &ok).unwrap();
@@ -1101,7 +1053,7 @@ mod tests {
         let mut trimmed = w;
         trimmed.trims.push(("s".into(), 2, 250));
         let undone = read(json!({"from_seq": 0}), &[(1, "b", 150), (2, "c", 150)], 1, 3, 300);
-        assert!(check_read(&trimmed, &undone).is_err(), "an undone trim");
+        assert!(check_read(&trimmed, &undone).is_err());
         let w = world_with(&[(0, "a"), (1, "b")], 2);
         for (why, rs) in [
             ("times out of order", vec![(0, "a", 180), (1, "b", 120)]),
@@ -1112,11 +1064,11 @@ mod tests {
         }
         let a = read(json!({}), &[(0, "a", 150)], 0, 2, 300);
         let b = read(json!({}), &[(0, "a", 151)], 0, 2, 300);
-        assert!(check_times(&w.log, &[a, b], 0).is_err(), "two times for one record");
+        assert!(check_times(&w.log, &[a, b], 0).is_err());
     }
 
     #[test]
-    fn uncertain_appends_resolve_from_what_was_seen() {
+    fn uncertain_appends_are_resolved_from_observed_records() {
         let expect = |v: &str| Expect { body: json!({"value": v}), headers: Json::Null, window: (100, 200) };
         let seen = |records: &[(u64, &str)]| {
             let rs = records.iter().map(|(s, v)| (*s, json!({"seq": s, "value": v}))).collect();
@@ -1128,7 +1080,7 @@ mod tests {
             vec![uncertain(Some((("c".into(), 7), 1))), Uncertain { records: vec![expect("z")], ..uncertain(None) }];
         resolve(&mut w, &seen(&[(0, "a"), (2, "y")])).unwrap();
         let log: Vec<(u64, Json)> = w.log["s"].iter().map(|(s, e)| (*s, e.body["value"].clone())).collect();
-        assert_eq!(log, [(0, json!("a")), (1, json!("x")), (2, json!("y"))], "seen once, so applied; z never seen");
+        assert_eq!(log, [(0, json!("a")), (1, json!("x")), (2, json!("y"))]);
         assert_eq!(w.cas[&("c".to_string(), 7)], 1);
         for (why, cas, records) in [
             ("applied twice", None, &[(1, "x"), (5, "y")][..]),
@@ -1142,10 +1094,10 @@ mod tests {
     }
 
     #[test]
-    fn events_parse() {
+    fn events_are_parsed() {
         let body = b"id: 3\ndata: {\"seq\":3,\"time\":1}\n\n: keepalive\n\nid: 4\ndata: {\"seq\":4,\"time\":1}\n\n";
         assert_eq!(parse_events(body).unwrap().len(), 2);
-        assert!(parse_events(b"id: 3\ndata: {\"seq\":4}\n\n").is_err(), "an id that is not the record's seq");
+        assert!(parse_events(b"id: 3\ndata: {\"seq\":4}\n\n").is_err());
         assert_eq!(parse_events(b"event: error\ndata: {}\n\n").unwrap().len(), 0);
     }
 }

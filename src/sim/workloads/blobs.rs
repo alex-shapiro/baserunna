@@ -4,7 +4,7 @@
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
-use crate::engine::manifest::{Manifest, ObjKind};
+use crate::engine::manifest::{Levels, Manifest, ObjKind};
 use crate::engine::{Value, segment};
 use crate::util::{b64, sha256};
 use serde_json::json;
@@ -17,9 +17,15 @@ type IdSets = (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>);
 /// read directly from the store.
 pub fn db_objects(sim: &Sim, db_id: &str) -> Result<IdSets, String> {
     let g = sim.mem.get_sync(&crate::engine::manifest_key(db_id), &Default::default()).map_err(|e| e.to_string())?;
-    let m = Manifest::decode(&g.data).map_err(|e| e.to_string())?;
-    let mut entries = m.tail.clone();
+    let mut m = Manifest::decode(&g.data).map_err(|e| e.to_string())?;
     let mut segs = BTreeSet::new();
+    if let Some(id) = m.levels.clone() {
+        let l =
+            sim.mem.get_sync(&crate::engine::levels_key(db_id, &id), &Default::default()).map_err(|e| e.to_string())?;
+        m.attach_levels(&Levels::decode(&l.data).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        segs.insert(format!("{id}{}", crate::engine::LEVELS_SUFFIX));
+    }
+    let mut entries = m.tail.clone();
     for s in &m.segments {
         let d =
             sim.mem.get_sync(&crate::engine::seg_key(db_id, &s.id), &Default::default()).map_err(|e| e.to_string())?;
@@ -43,7 +49,11 @@ pub fn db_objects(sim: &Sim, db_id: &str) -> Result<IdSets, String> {
     let listed = m
         .obsolete
         .iter()
-        .map(|o| format!("{}:{}", if o.kind == ObjKind::Blob { "blob" } else { "seg" }, o.id))
+        .map(|o| match o.kind {
+            ObjKind::Blob => format!("blob:{}", o.id),
+            ObjKind::Segment => format!("seg:{}", o.id),
+            ObjKind::Levels => format!("seg:{}{}", o.id, crate::engine::LEVELS_SUFFIX),
+        })
         .collect();
     Ok((referenced, listed, segs))
 }
@@ -74,7 +84,7 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
     if r.status != 201 {
         return Err(format!("create table: {}", r.json));
     }
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut kv: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut rows: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut rng = sim.fork_rng();
@@ -155,10 +165,7 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
         }
         verify(&c, base, &kv, &rows, &mut rng).await?;
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     verify(&c, base, &kv, &rows, &mut rng).await?;
 
     let db_id = c.call_retry("GET", base, None).await.json["id"].as_str().unwrap_or_default().to_string();
@@ -170,21 +177,27 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
             c.call_settled("POST", "/v1/dbs/media/txn", Some(body)).await;
         }
     };
-    // Completeness is checked without store faults, under which a failed
-    // sweep waits for a later cycle.
     sim.store.set_faults_enabled(false);
     let (referenced0, _, _) = db_objects(&sim, &db_id)?;
     let garbage_before = stored_ids(&sim, &db_id, "blob").difference(&referenced0).count();
     sim.sleep(e.orphan_grace_ms.max(e.blob_stage_ttl_ms) + e.sweep_interval_ms + 1_000).await;
-    touch(1).await; // triggers the orphan sweep
+    touch(1).await;
     sim.sleep(10_000).await;
     sim.sleep(e.gc_grace_ms + 1_000).await;
-    touch(2).await; // deletes expired obsolete objects, in the background
+    touch(2).await;
     let unlisted_garbage = || -> Result<Option<String>, String> {
-        let (referenced, listed, _) = db_objects(&sim, &db_id)?;
-        Ok(stored_ids(&sim, &db_id, "blob")
+        let (referenced, listed, segs) = db_objects(&sim, &db_id)?;
+        let blob = stored_ids(&sim, &db_id, "blob")
             .into_iter()
-            .find(|b| !referenced.contains(b) && !listed.contains(&format!("blob:{b}"))))
+            .find(|b| !referenced.contains(b) && !listed.contains(&format!("blob:{b}")))
+            .map(|b| format!("blob {b}"));
+        let seg = || {
+            stored_ids(&sim, &db_id, "seg")
+                .into_iter()
+                .find(|s| !segs.contains(s) && !listed.contains(&format!("seg:{s}")))
+                .map(|s| format!("segment {s}"))
+        };
+        Ok(blob.or_else(seg))
     };
     for _ in 0..120 {
         sim.sleep(1_000).await;
@@ -192,10 +205,10 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
             break;
         }
     }
-    if let Some(b) = unlisted_garbage()? {
-        return Err(format!("garbage blob {b} survived a full GC cycle"));
+    if let Some(g) = unlisted_garbage()? {
+        return Err(format!("garbage {g} survived a full GC cycle"));
     }
-    let (referenced, listed, segs) = db_objects(&sim, &db_id)?;
+    let (referenced, _, _) = db_objects(&sim, &db_id)?;
     let stored_blobs = stored_ids(&sim, &db_id, "blob");
     for b in &referenced {
         if !stored_blobs.contains(b) {
@@ -209,16 +222,10 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
             referenced.len()
         );
     }
-    for s in stored_ids(&sim, &db_id, "seg") {
-        if !segs.contains(&s) && !listed.contains(&format!("seg:{s}")) {
-            return Err(format!("garbage segment {s} survived a full GC cycle"));
-        }
-    }
     verify(&c, base, &kv, &rows, &mut rng).await
 }
 
-/// Stage `data` and bind it with the request `bind` builds from the staging
-/// response, staging again if retries outlast the staged blob's TTL.
+/// Stages `data` and binds it using `bind`, re-staging if retries exceed the staging TTL.
 async fn stage_and_bind(
     c: &Client,
     base: &str,

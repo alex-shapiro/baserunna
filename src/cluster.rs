@@ -198,10 +198,13 @@ pub fn rendezvous<'a>(key: &str, nodes: &'a [NodeRecord]) -> Option<&'a NodeReco
     })
 }
 
-/// Filters `nodes` to members with a heartbeat within `3 * heartbeat_ms` of `now_ms`.
+/// Returns the live members from `nodes` that sent a heartbeat within
+/// `3 * heartbeat_ms` of `now_ms`. Excludes any node that was replaced by a
+/// newer live process at the same address.
 pub fn live(nodes: &[NodeRecord], now_ms: i64, heartbeat_ms: i64) -> Vec<NodeRecord> {
-    let mut v: Vec<NodeRecord> =
-        nodes.iter().filter(|n| n.heartbeat_at + 3 * heartbeat_ms >= now_ms).cloned().collect();
+    let fresh = |n: &NodeRecord| n.heartbeat_at + 3 * heartbeat_ms >= now_ms;
+    let replaced = |n: &NodeRecord| nodes.iter().any(|m| m.addr == n.addr && fresh(m) && m.started_at > n.started_at);
+    let mut v: Vec<NodeRecord> = nodes.iter().filter(|n| fresh(n) && !replaced(n)).cloned().collect();
     v.sort_by(|a, b| a.id.cmp(&b.id));
     v
 }
@@ -221,7 +224,6 @@ mod tests {
         for i in 0..3000 {
             let k = format!("db{i}");
             let o = rendezvous(&k, &nodes).unwrap().id.clone();
-            // Removing a different node never moves the key.
             let others: Vec<NodeRecord> =
                 nodes.iter().filter(|x| x.id == o || x.id != "b" || o == "b").cloned().collect();
             if o != "b" {
@@ -240,7 +242,7 @@ mod tests {
         rt.block_on(async {
             let d = ForwardDedup::new(Duration::from_secs(60));
             let (Delivery::First(first), Delivery::Duplicate(dup)) = (d.deliver("a"), d.deliver("a")) else {
-                panic!("the first copy must run and the second wait");
+                panic!("expected First then Duplicate");
             };
             let ok = ReplayedResponse {
                 status: http::StatusCode::CREATED,
@@ -252,10 +254,10 @@ mod tests {
                 dup.await.map(|r| (r.status, r.body)),
                 Some((http::StatusCode::CREATED, Bytes::from_static(b"done")))
             );
-            let Delivery::Duplicate(late) = d.deliver("a") else { panic!("a late copy must not run again") };
+            let Delivery::Duplicate(late) = d.deliver("a") else { panic!("expected Duplicate for late delivery") };
             assert!(late.await.is_some());
             let (Delivery::First(first), Delivery::Duplicate(dup)) = (d.deliver("b"), d.deliver("b")) else {
-                panic!("the first copy must run and the second wait");
+                panic!("expected First then Duplicate");
             };
             drop(first);
             assert!(dup.await.is_none());
@@ -268,6 +270,13 @@ mod tests {
         let mut a = n("a");
         a.heartbeat_at = 0;
         let b = n("b");
-        assert_eq!(live(&[a, b], 100, 10).len(), 1);
+        assert_eq!(live(&[a, b.clone()], 100, 10).len(), 1);
+        let restarted = NodeRecord { id: "b2".into(), started_at: 50, ..b.clone() };
+        let ids: Vec<String> = live(&[b, restarted], 100, 10).into_iter().map(|n| n.id).collect();
+        assert_eq!(ids, ["b2"], "restarted node must replace the previous process at the same address");
+        let dead_later = NodeRecord { id: "b0".into(), started_at: 80, heartbeat_at: 0, ..n("b") };
+        let restarted = NodeRecord { id: "b2".into(), started_at: 50, ..n("b") };
+        let ids: Vec<String> = live(&[dead_later, restarted], 100, 10).into_iter().map(|n| n.id).collect();
+        assert_eq!(ids, ["b2"], "expired node must not replace a live process");
     }
 }

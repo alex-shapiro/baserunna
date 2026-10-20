@@ -16,7 +16,8 @@ use crate::engine::{Committed, Consistency, Db, Txn};
 use crate::error::{Error, Result};
 use crate::log::{self, REQUEST_ID_HEADER};
 use crate::meta::{Access, DbRecord};
-use crate::node::{Node, Principal};
+use crate::node::{Meter, Node, Principal};
+use crate::probe::{self, Probe};
 use crate::timing;
 use axum::Router;
 use axum::body::Body;
@@ -282,7 +283,12 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         let deadline = request_deadline(&node, req.headers());
         let name = db_name_from_path(req.uri().path()).ok_or_else(|| Error::not_found("no such route"))?;
         let token = credential(req.headers()).ok_or_else(|| Error::Unauthenticated("missing credentials".into()))?;
-        let principal = node.authenticate_metered(&token, finishes_txn(&req)).await?;
+        let meter = match (is_from_peer(&node, req.headers()), finishes_txn(&req)) {
+            (true, _) => Meter::Exempt,
+            (false, true) => Meter::Borrow,
+            (false, false) => Meter::Take,
+        };
+        let principal = node.authenticate_metered(&token, meter).await?;
         let (mut rec, mut access) = node.resolve_db(&principal, &name).await?;
         let hops = hops(req.headers());
         if hops < 2
@@ -314,6 +320,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 match node.services.transport.call(&addr, fwd).await {
                     Ok(resp) => return Ok(forwarded(resp, target)),
                     Err(te) if te.maybe_delivered && !idempotent => {
+                        probe::hit(Probe::ForwardAmbiguous);
                         return Err(Error::Unavailable {
                             message: format!("forwarding to {target} failed: {}", te.message),
                             retry_after_ms: Some(1000),
@@ -321,6 +328,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                         });
                     }
                     Err(_) => {
+                        probe::hit(Probe::ForwardFailedHandledLocally);
                         node.mark_suspect(&target);
                         req = Request::from_parts(parts, Body::from(bytes));
                     }
@@ -334,6 +342,9 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 return match node.services.transport.call(&addr, fwd).await {
                     Ok(resp) => Ok(forwarded(resp, target)),
                     Err(te) => {
+                        if te.maybe_delivered {
+                            probe::hit(Probe::ForwardAmbiguous);
+                        }
                         node.mark_suspect(&target);
                         Err(Error::Unavailable {
                             message: format!("forwarding to {target} failed: {}", te.message),
@@ -361,12 +372,14 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 let (fresh, fresh_access) = node.resolve_db_strong(&principal, &name).await?;
                 if fresh.id == rec.id {
                     // Finish any interrupted deletion where the manifest was marked deleted before metadata removal.
+                    probe::hit(Probe::DeletionRepaired);
                     match node.run_meta(crate::meta::MetaCmd::DeleteDb { id: rec.id.clone() }).await {
                         Ok(_) | Err(Error::NotFound(_)) => node.forget_db_name(&rec.owner_id, &rec.name),
                         Err(e) => return Err(e),
                     }
                     return Err(Error::NotFound(m));
                 }
+                probe::hit(Probe::NameResolvedAgain);
                 (rec, access) = (fresh, fresh_access);
                 node.open_db(&rec).await?
             }
@@ -389,6 +402,9 @@ fn forwarded(mut resp: Response, target: String) -> Response {
 }
 
 fn tag_forward(node: &Node, req: &mut http::Request<Body>, target: &str, deadline: tokio::time::Instant) {
+    if let Some(v) = node.cluster_key().and_then(|k| HeaderValue::from_str(&k).ok()) {
+        req.headers_mut().insert(CLUSTER_KEY_HEADER, v);
+    }
     if let Ok(v) = HeaderValue::from_str(&node.env.random_hex(16)) {
         req.headers_mut().insert(FORWARD_ID_HEADER, v);
     }
@@ -424,7 +440,8 @@ async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: 
             let method = req.method().clone();
             let route = req.extensions().get::<MatchedPath>().cloned();
             let hops = hops(req.headers());
-            let resp = timing::scoped(tally.clone(), next.run(req)).await;
+            let deadline = request_deadline(&node, req.headers());
+            let resp = crate::node::with_deadline(deadline, timing::scoped(tally.clone(), next.run(req))).await;
             node.metrics.request(method.as_str(), route.as_ref().map(MatchedPath::as_str), started.elapsed());
             if log::enabled(log::Level::Info) {
                 let mut fields = vec![
@@ -472,6 +489,7 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
         return next.run(req).await;
     }
     if req.headers().get(FORWARD_TO_HEADER).and_then(|v| v.to_str().ok()) != Some(node.id.as_str()) {
+        probe::hit(Probe::ForwardToPreviousProcess);
         return Error::Unavailable {
             message: "forwarded to a node that is no longer running".into(),
             retry_after_ms: Some(100),
@@ -494,7 +512,11 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
     match node.forwards.deliver(&key) {
         Delivery::First(slot) => {
             let (parts, body) = next.run(req).await.into_parts();
-            match http_body_util::BodyExt::collect(body).await {
+            match http_body_util::BodyExt::collect(body).await.map_err(|e| e.to_string()) {
+                Ok(_) if crate::buggify::fault(0.01) => {
+                    slot.finish(None);
+                    unknown_outcome("response failed: buggified".into())
+                }
                 Ok(b) => {
                     let r = ReplayedResponse { status: parts.status, headers: parts.headers, body: b.to_bytes() };
                     slot.finish(Some(r.clone()));
@@ -507,8 +529,14 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
             }
         }
         Delivery::Duplicate(wait) => match wait.await {
-            Some(r) => replay(r),
-            None => unknown_outcome("duplicate of a forwarded request with an unknown outcome".into()),
+            Some(r) => {
+                probe::hit(Probe::ForwardDuplicateReplayed);
+                replay(r)
+            }
+            None => {
+                probe::hit(Probe::ForwardDuplicateUnknown);
+                unknown_outcome("duplicate of a forwarded request with an unknown outcome".into())
+            }
         },
     }
 }
@@ -524,17 +552,18 @@ fn unknown_outcome(message: String) -> Response {
     Error::Unavailable { message, retry_after_ms: Some(1000), outcome_unknown: true }.into_response()
 }
 
+/// Returns true if `headers` contain a valid cluster key.
+fn is_from_peer(node: &Node, headers: &HeaderMap) -> bool {
+    let given = headers.get(CLUSTER_KEY_HEADER).and_then(|v| v.to_str().ok());
+    match (node.cluster_key(), given) {
+        (Some(k), Some(v)) => crate::util::ct_eq(v.as_bytes(), k.as_bytes()),
+        _ => false,
+    }
+}
+
 /// Requires a valid cluster key header on internal endpoints.
 async fn internal_auth(State(node): State<Arc<Node>>, req: Request, next: Next) -> Response {
-    let ok = match node.cluster_key() {
-        None => false,
-        Some(k) => req
-            .headers()
-            .get(CLUSTER_KEY_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| crate::util::ct_eq(v.as_bytes(), k.as_bytes())),
-    };
-    if !ok {
+    if !is_from_peer(&node, req.headers()) {
         return Error::PermissionDenied("bad cluster key".into()).into_response();
     }
     next.run(req).await
@@ -554,19 +583,9 @@ pub fn consistency_of(q: &std::collections::BTreeMap<String, String>) -> Result<
     }
 }
 
-/// How [`run_txn!`] ended.
 pub(crate) enum Ran<T> {
-    /// The transaction wrote nothing; it read at `version`.
-    Read {
-        out: T,
-        version: u64,
-    },
-    Committed {
-        out: T,
-        commit: Committed,
-    },
-    /// An earlier attempt with the same idempotency key had committed.
-    /// Never without a key.
+    Read { out: T, version: u64 },
+    Committed { out: T, commit: Committed },
     Replayed(Committed),
 }
 
@@ -582,6 +601,10 @@ macro_rules! run_txn {
         let ran_ = match crate::api::earlier_attempt(ctx_, commit_id_, key_).await? {
             Some(c) => crate::api::Ran::Replayed(c),
             None => {
+                if crate::buggify::fires(0.2) {
+                    let ms = crate::buggify::below(200);
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
                 let mut attempt_ = 0u32;
                 let mut optimistic_ = true;
                 loop {
@@ -642,7 +665,6 @@ pub(crate) fn commit_id_for(node: &Node, ctx: &DbCtx, key: Option<&str>) -> Resu
     }
 }
 
-/// The commit of an earlier attempt with the idempotency key, if one applied.
 pub(crate) async fn earlier_attempt(ctx: &DbCtx, commit_id: u64, key: Option<&str>) -> Result<Option<Committed>> {
     match key {
         Some(_) => ctx.db.commit_status(commit_id).await,
@@ -650,8 +672,7 @@ pub(crate) async fn earlier_attempt(ctx: &DbCtx, commit_id: u64, key: Option<&st
     }
 }
 
-/// Commits `t`, which produced `out`; `None` if it conflicted and is to be
-/// run again.
+/// Commits `t` with output `out`, or returns `Ok(None)` when `t` must be retried after a conflict.
 pub(crate) async fn finish<T>(
     node: &Node,
     ctx: &DbCtx,
@@ -672,6 +693,7 @@ pub(crate) async fn finish<T>(
         Ok(c) if c.replayed && key.is_some() => Ok(Some(Ran::Replayed(c))),
         Ok(commit) => Ok(Some(Ran::Committed { out, commit })),
         Err(Error::Conflict(_)) if *attempt < node.cfg.txn_retries => {
+            probe::hit(Probe::TxnRetriedOnConflict);
             *attempt += 1;
             let backoff = 5 * (1 << *attempt) + node.env.random_below(10);
             tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
@@ -681,21 +703,22 @@ pub(crate) async fn finish<T>(
     }
 }
 
-/// Answers a failed transaction. A retried idempotent request can fail a
-/// precondition, or an append its expected seq, because an earlier attempt
-/// applied: a fenced status check tells.
+/// Resolves a failed transaction. If an idempotent request failed a precondition because a prior
+/// attempt was already committed, returns `Ran::Replayed` after a fenced commit-status check.
 pub(crate) async fn failed<T>(ctx: &DbCtx, commit_id: u64, key: Option<&str>, e: Error) -> Result<Ran<T>> {
     match e {
         Error::PreconditionFailed { .. } if key.is_some() => match ctx.db.commit_status_fenced(commit_id).await? {
-            Some(c) => Ok(Ran::Replayed(c)),
+            Some(c) => {
+                probe::hit(Probe::PreconditionExplainedByReplay);
+                Ok(Ran::Replayed(c))
+            }
             None => Err(e),
         },
         e => Err(naming_commit(e, commit_id)),
     }
 }
 
-/// Names the commit in an error that leaves its outcome unknown, so that
-/// the client can resolve it (SPEC §6.2).
+/// Attaches `commit_id` to an error with an unknown commit outcome (SPEC §6.2).
 pub(crate) fn naming_commit(e: Error, commit_id: u64) -> Error {
     match e {
         Error::Unavailable { message, retry_after_ms, outcome_unknown: true } => Error::Unavailable {
@@ -745,13 +768,11 @@ macro_rules! with_read {
 }
 pub(crate) use with_read;
 
-/// What a long poll reads: whether it found what the poll waits for.
 pub(crate) trait Found {
     fn found(&self) -> bool;
 }
 
-/// Runs `$read` on fresh snapshots until what it reads is [`Found`] or
-/// `$wait` elapses; evaluates to `(output, read_version)`.
+/// Polls `$read` on fresh snapshots until [`Found::found`] is true or `$wait` elapses.
 macro_rules! watch {
     ($node:expr, $db:expr, $c:expr, $wait:expr, |$t:ident| $read:expr) => {{
         let until_ = tokio::time::Instant::now() + $wait;

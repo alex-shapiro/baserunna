@@ -19,7 +19,7 @@ fn cookie_value(r: &super::super::SimResponse, name: &str) -> Option<String> {
 
 pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     let anon = Client::new(&sim, "anon");
-    let admin = Client::signup(&sim, "admin", "admin@auth.test", "admin-password").await?;
+    let admin = super::admin(&sim).await?;
     let me = admin.call_retry("GET", "/v1/me", None).await;
     expect(me.json["user"]["is_admin"] == true, format!("first user should be admin: {}", me.json))?;
     let alice = Client::signup(&sim, "alice", "Alice@Auth.test", "alice-password").await?;
@@ -137,7 +137,12 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
 
     expect(alice.call_retry("GET", "/v1/admin/users", None).await.status == 403, "non-admin listed users")?;
     let users = admin.call_retry("GET", "/v1/admin/users", None).await;
-    expect(users.json["users"].as_array().map(|a| a.len()) == Some(3), format!("users: {}", users.json))?;
+    let ours = users.json["users"].as_array().map(|a| {
+        a.iter()
+            .filter(|u| u["email"].as_str().is_some_and(|e| e.ends_with("@auth.test") || e == super::ADMIN_EMAIL))
+            .count()
+    });
+    expect(ours == Some(3), format!("users: {}", users.json))?;
     expect(!users.json.to_string().contains("pbkdf2"), "user listing leaks password hashes")?;
     let nodes = admin.call_retry("GET", "/v1/admin/nodes", None).await;
     expect(nodes.status == 200 && nodes.json["nodes"].as_array().is_some_and(|a| !a.is_empty()), "nodes")?;
@@ -166,6 +171,7 @@ async fn google_flow(
 ) -> Result<(u16, Option<String>), String> {
     let c = Client::new(sim, "browser");
     let mut start = None;
+    let mut delay = 50;
     for _ in 0..50 {
         match c.send("GET", "/v1/auth/google/start?return_to=/console/dbs", &[], bytes::Bytes::new()).await {
             Ok(r) if r.status == 302 => {
@@ -173,18 +179,20 @@ async fn google_flow(
                 break;
             }
             Ok(r) => return Err(format!("start: {}", r.status)),
-            Err(_) => {}
+            Err(_) => {
+                sim.sleep(delay).await;
+                delay = (delay * 2).min(2_000);
+            }
         }
     }
-    let r = start.ok_or("google sign-in never started")?;
+    let r = start.ok_or("google sign-in did not start")?;
     let loc = r.headers.get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
     let state = loc.split("state=").nth(1).and_then(|s| s.split('&').next()).unwrap_or_default().to_string();
-    let oauth = cookie_value(&r, "brs_oauth").ok_or("no state cookie")?;
+    let oauth = cookie_value(&r, "brs_oauth").ok_or("missing state cookie")?;
     let code = sim.google.issue_code(id);
     let st = state_override.unwrap_or(&state);
     let path = format!("/v1/auth/google/callback?code={code}&state={st}");
     match c.send("GET", &path, &[("cookie", format!("brs_oauth={oauth}"))], bytes::Bytes::new()).await {
-        // The single-use code may have been consumed: restart the flow.
         Ok(r) if r.status == 503 => Ok((0, None)),
         Ok(r) => {
             let loc = r.headers.get("location").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
@@ -196,8 +204,6 @@ async fn google_flow(
             }
             Ok((r.status, None))
         }
-        // A lost callback consumed the single-use code; the browser
-        // would restart the flow. Report as a failure to sign in.
         Err(_) => Ok((0, None)),
     }
 }
@@ -210,7 +216,7 @@ async fn google_until(sim: &Arc<Sim>, id: Identity) -> Result<(u16, Option<Strin
             done => return Ok(done),
         }
     }
-    Err(format!("google sign-in as {} never finished", id.email))
+    Err(format!("google sign-in as {} did not complete", id.email))
 }
 
 async fn google(sim: &Arc<Sim>) -> Result<(), String> {
@@ -235,9 +241,8 @@ async fn google(sim: &Arc<Sim>) -> Result<(), String> {
         other => return Err(format!("second google sign-in failed: {other:?}")),
     };
     let me2 = Client::with_token(sim, "gina2", &s2).call_retry("GET", "/v1/me", None).await;
-    expect(me2.json["user"]["id"] == me.json["user"]["id"], "second google login made a new user")?;
-    // Google must not link to an unverified password account, since whoever
-    // registered the password may not own the address.
+    expect(me2.json["user"]["id"] == me.json["user"]["id"], "second google login created a duplicate user")?;
+    // Google OAuth must not link to an unverified password account.
     let r = google_until(sim, ident("g-bob", "bob@auth.test", true)).await?;
     expect(r.0 == 403, format!("google signed into an unverified password account: {r:?}"))?;
     let bob = Client::login(sim, "bob", "bob@auth.test", "bob-password").await?;

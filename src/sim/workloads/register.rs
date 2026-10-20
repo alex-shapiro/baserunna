@@ -1,5 +1,4 @@
-//! `register`: concurrent writers and strong readers on a few keys, with a
-//! real-time linearizability check over the recorded history.
+//! Simulation workload for single-key linearizability with concurrent writers and strong readers.
 
 use super::super::Sim;
 use super::super::client::Client;
@@ -11,7 +10,6 @@ struct Op {
     key: usize,
     start: u64,
     end: u64,
-    /// For writes: the committed version if known.
     version: Option<u64>,
     value: String,
     write: bool,
@@ -32,7 +30,7 @@ pub async fn run(
     let token = owner.token.clone().unwrap_or_default();
     let keys = 2;
     let hist: Arc<Mutex<Vec<Op>>> = Arc::new(Mutex::new(Vec::new()));
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut hs = Vec::new();
     for w in 0..writers + readers {
         let c = Client::with_token(&sim, &format!("{}{w}", if w < writers { "writer" } else { "reader" }), &token);
@@ -101,10 +99,7 @@ pub async fn run(
     for h in hs {
         h.await.map_err(|e| e.to_string())?;
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     check(&hist.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
@@ -114,9 +109,7 @@ enum ReadKind {
     LocalGet,
     ReadOnlyTxn,
     ReadWriteTxn,
-    Interactive {
-        write: bool,
-    },
+    Interactive { write: bool },
 }
 
 /// Reads `r{key}` via `kind` and returns `(version, value)` (or `(0, "")` if not found).
@@ -254,8 +247,7 @@ mod tests {
             [w(0, 0, 10, 1, "a"), r(0, 5, 8, 0, ""), r(0, 20, 30, 1, "a"), w(0, 25, 40, 2, "b"), r(0, 30, 35, 1, "a")];
         check(&h).unwrap();
         check(&[w(0, 0, 100, 1, "a"), r(0, 10, 20, 1, "a"), r(1, 30, 40, 0, "")]).unwrap();
-        // Equal timestamps do not order operations: a read starting when a
-        // write or another read ends is concurrent with it.
+        // Operations with equal start and end timestamps are concurrent.
         check(&[w(0, 0, 10, 1, "a"), r(0, 10, 20, 0, "")]).unwrap();
         check(&[w(0, 0, 100, 1, "a"), r(0, 5, 10, 1, "a"), r(0, 10, 20, 0, "")]).unwrap();
     }

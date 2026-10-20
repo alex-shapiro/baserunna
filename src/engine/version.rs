@@ -6,9 +6,9 @@ use super::manifest::{Levels, MAX_LEVEL, Manifest, SegmentMeta};
 use super::range_delete::{RangeDeletes, RangeTombstone};
 use super::segment::{self, Block, FOOTER_LEN, Footer, SegmentIndex};
 use super::types::{COMMIT_SPACE, Entry, Seq};
-use super::{Shared, levels_key, seg_key};
+use super::{Shared, levels_key, manifest_key, seg_key};
 use crate::error::{Error, Result};
-use crate::store::GetOpts;
+use crate::store::{GetOpts, GetResult, StoreError};
 use bytes::Bytes;
 use std::collections::{BinaryHeap, VecDeque};
 use std::ops::Bound;
@@ -23,8 +23,7 @@ pub struct Version {
     pub(crate) shared: Arc<Shared>,
     /// `m.range_deletes`, indexed for lookups.
     deletes: Arc<RangeDeletes>,
-    /// Whether any stored value expires, so that what reads see depends on
-    /// the time they read at.
+    /// True if any stored value has an expiration timestamp.
     pub(crate) expiring: bool,
 }
 
@@ -40,8 +39,7 @@ impl KeyRange {
         KeyRange { start: Bound::Unbounded, end: Bound::Unbounded }
     }
 
-    /// Every key below the engine's commit records: all the data the
-    /// layers above store.
+    /// Key range covering all user data keys below `COMMIT_SPACE`.
     pub fn data() -> KeyRange {
         KeyRange { start: Bound::Unbounded, end: Bound::Excluded(Bytes::from_static(&[COMMIT_SPACE])) }
     }
@@ -73,8 +71,7 @@ impl KeyRange {
         lo && hi
     }
 
-    /// True if the key is below the range's end (i.e. a forward scan
-    /// starting at or before it has not passed the end).
+    /// Returns true if `k` is below `self.end`.
     pub fn before_end(&self, k: &[u8]) -> bool {
         match &self.end {
             Bound::Included(e) => k <= e.as_ref(),
@@ -102,15 +99,10 @@ impl KeyRange {
     }
 
     pub fn overlaps_keys(&self, min: &[u8], max: &[u8]) -> bool {
-        self.after_start_or_eq_max(max) && self.before_end(min)
+        self.after_start(max) && self.before_end(min)
     }
 
-    fn after_start_or_eq_max(&self, max: &[u8]) -> bool {
-        // Some key <= max is >= start.
-        self.after_start(max)
-    }
-
-    /// The keys in both ranges.
+    /// Returns the intersection of `self` and `other`.
     pub fn intersect(&self, other: &KeyRange) -> KeyRange {
         use std::cmp::Ordering::*;
         let start = match (&self.start, &other.start) {
@@ -135,7 +127,6 @@ impl KeyRange {
     }
 
     pub fn intersects(&self, other: &KeyRange) -> bool {
-        // Ranges intersect unless one ends before the other starts.
         let a_before_b = match (&self.end, &other.start) {
             (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
             (Bound::Excluded(e), Bound::Included(s)) => e <= s,
@@ -155,8 +146,8 @@ impl KeyRange {
 }
 
 impl Shared {
-    /// Decodes a stored manifest, fetching deeper levels from its levels
-    /// object if not already present in `current`.
+    /// Decodes a stored manifest and attaches deep-level segment metadata from `current`
+    /// or from the external levels object.
     pub(crate) async fn load_manifest(&self, db: &str, data: &Bytes, current: Option<&Version>) -> Result<Manifest> {
         let mut m = Manifest::decode(data)?;
         if m.db_id != db {
@@ -210,7 +201,7 @@ impl Shared {
         let data = l.encode();
         let key = levels_key(db, &id);
         self.retry.run(|| self.store.put(&key, data.clone(), crate::store::PutMode::Overwrite)).await?;
-        self.counters.add(&super::Activity { levels_objects_written: 1, ..Default::default() });
+        crate::probe::hit(crate::probe::Probe::LevelsObjectWritten);
         self.cache.insert(CacheKey { seg_path: Arc::from(key.as_str()), block: 0 }, CacheVal::Levels(Arc::new(l)));
         if let Some(t) = self.cfg.local_tier.clone() {
             self.env.spawn(async move { t.0.put(&key, data).await });
@@ -237,7 +228,7 @@ impl Shared {
         }
     }
 
-    /// Index a whole segment's bytes and cache its index and blocks.
+    /// Decodes a full segment and caches its index and blocks in memory.
     fn cache_whole(&self, db: &str, seg: &str, data: &Bytes) -> Result<Arc<SegmentIndex>> {
         let idx = Arc::new(SegmentIndex::decode_whole(data)?);
         for (bi, b) in segment::decode_blocks(&idx, 0, data)?.into_iter().enumerate() {
@@ -278,14 +269,13 @@ impl Shared {
         if let Some(CacheVal::Index(i)) = self.cache.get(&ck) {
             return Ok(i);
         }
-        let key = seg_key(db, &seg.id);
         if seg.size <= self.whole_fetch_max() {
             if let Some(d) = self.local_get(db, &seg.id, "all").await
                 && let Ok(idx) = self.cache_whole(db, &seg.id, &d)
             {
                 return Ok(idx);
             }
-            let g = self.retry.run(|| self.store.get(&key, GetOpts::default())).await?;
+            let g = self.seg_get(db, &seg.id, GetOpts::default()).await?;
             let idx = self.cache_whole(db, &seg.id, &g.data)?;
             self.local_put(db, &seg.id, "all", g.data);
             return Ok(idx);
@@ -314,13 +304,11 @@ impl Shared {
             return Ok(idx);
         }
         let g = self
-            .retry
-            .run(|| self.store.get(&key, GetOpts { range: Some(size - FOOTER_LEN as u64..size), ..Default::default() }))
+            .seg_get(db, &seg.id, GetOpts { range: Some(size - FOOTER_LEN as u64..size), ..Default::default() })
             .await?;
         let footer = Footer::decode(&g.data, size)?;
         let start = footer.bloom_off;
-        let g =
-            self.retry.run(|| self.store.get(&key, GetOpts { range: Some(start..size), ..Default::default() })).await?;
+        let g = self.seg_get(db, &seg.id, GetOpts { range: Some(start..size), ..Default::default() }).await?;
         if g.data.len() as u64 != size - start {
             return Err(Error::internal("short segment read"));
         }
@@ -328,6 +316,34 @@ impl Shared {
         self.cache.insert(ck, CacheVal::Index(idx.clone()));
         self.local_put(db, &seg.id, "meta", g.data);
         Ok(idx)
+    }
+
+    /// Reads from segment `seg` of `db`. Returns a retryable error if garbage collection removed
+    /// the segment after the reading version was superseded, or an internal error if the current
+    /// manifest still references `seg`.
+    async fn seg_get(&self, db: &str, seg: &str, opts: GetOpts) -> Result<GetResult> {
+        let key = seg_key(db, seg);
+        match self.retry.run(|| self.store.get(&key, opts.clone())).await {
+            Err(StoreError::NotFound) => Err(self.missing_segment_error(db, seg).await),
+            r => Ok(r?),
+        }
+    }
+
+    async fn missing_segment_error(&self, db: &str, seg: &str) -> Error {
+        let key = manifest_key(db);
+        let m = match self.retry.run(|| self.store.get(&key, GetOpts::default())).await {
+            Ok(g) => self.load_manifest(db, &g.data, None).await,
+            Err(StoreError::NotFound) => return Error::not_found("database not found"),
+            Err(e) => return e.into(),
+        };
+        match m {
+            Ok(m) if m.segments.iter().any(|s| s.id == seg) => Error::internal(format!("segment {seg} is missing")),
+            Ok(_) => {
+                crate::probe::hit(crate::probe::Probe::SegmentCollectedUnderRead);
+                Error::unavailable("garbage collection removed a segment this read needed; retry")
+            }
+            Err(e) => e,
+        }
     }
 
     fn cached_block(&self, db: &str, seg: &str, bi: usize) -> Option<Block> {
@@ -361,11 +377,7 @@ impl Shared {
         let ck = self.cache_key(db, &seg.id, bi as u32);
         let part = format!("b{bi}");
         let (_, off, len) = idx.blocks[bi];
-        let key = seg_key(db, &seg.id);
-        let g = self
-            .retry
-            .run(|| self.store.get(&key, GetOpts { range: Some(off..off + len as u64), ..Default::default() }))
-            .await?;
+        let g = self.seg_get(db, &seg.id, GetOpts { range: Some(off..off + len as u64), ..Default::default() }).await?;
         if g.data.len() != len as usize {
             return Err(Error::internal("short block read"));
         }
@@ -395,11 +407,7 @@ impl Shared {
             end += 1;
         }
         let span = idx.span(first..end);
-        let key = seg_key(db, &seg.id);
-        let g = self
-            .retry
-            .run(|| self.store.get(&key, GetOpts { range: Some(span.clone()), ..Default::default() }))
-            .await?;
+        let g = self.seg_get(db, &seg.id, GetOpts { range: Some(span.clone()), ..Default::default() }).await?;
         if g.data.len() as u64 != span.end - span.start {
             return Err(Error::internal("short segment read"));
         }
@@ -420,25 +428,25 @@ impl Shared {
     }
 }
 
-/// How an iterator loads segment blocks.
+/// Block read strategy for segment iterators.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadMode {
-    /// Block by block through the caches.
+    /// Reads individual blocks through the cache.
     Cached,
-    /// Consecutive blocks per request, bypassing the caches. Forward iteration only.
+    /// Reads consecutive blocks in bulk requests, bypassing the cache (forward iteration only).
     Bulk,
 }
 
-/// Iterates the entries of a sorted run of segments: one level 0 segment,
-/// or the segments of a deeper level, in iteration order.
+/// Iterates entries across a sorted run of segments (either a single L0 segment
+/// or the non-overlapping segments of a deeper level).
 struct RunCursor {
     segs: VecDeque<SegmentMeta>,
     seg: Option<(SegmentMeta, Arc<SegmentIndex>)>,
-    /// Blocks of the current segment still to visit, in iteration order.
+    /// Remaining block indices in the current segment, in iteration order.
     blocks: VecDeque<usize>,
-    /// Blocks already fetched ahead.
+    /// Prefetched blocks ready to be scanned.
     ready: VecDeque<Block>,
-    /// Blocks of the current segment fetched one at a time so far.
+    /// Count of individual block fetches performed on the current segment.
     fetched: u32,
     cur: Option<Block>,
     pos: usize,
@@ -449,15 +457,15 @@ enum Cursor {
     Run(Box<RunCursor>),
 }
 
-/// What a [`MergeIter`] iterates and how.
+/// Configuration for [`MergeIter`].
 pub(crate) struct IterSpec {
     pub range: KeyRange,
     pub reverse: bool,
     pub include_tombstones: bool,
     pub mode: ReadMode,
-    /// Range tombstones to filter out covered entries.
+    /// Range tombstones used to filter out covered entries.
     pub deletes: Option<Arc<RangeDeletes>>,
-    /// Entries that have expired at this store time read as tombstones.
+    /// Store timestamp at which expired entries are converted to tombstones.
     pub expire_at: Option<u64>,
 }
 
@@ -537,7 +545,6 @@ impl MergeIter {
                     if range.contains(&e.key) {
                         return Ok(Some(e.clone()));
                     }
-                    // Outside the range: skip if before it, stop if past it.
                     let past = if reverse { !range.after_start(&e.key) } else { !range.before_end(&e.key) };
                     if past {
                         r.segs.clear();
@@ -557,8 +564,7 @@ impl MergeIter {
             }
             if let Some(bi) = r.blocks.pop_front() {
                 let (meta, idx) = r.seg.as_ref().ok_or_else(|| Error::internal("run cursor without a segment"))?;
-                // A forward scan that keeps fetching blocks of a segment from
-                // the store reads ahead, up to the last block it needs.
+                // Switch to bulk prefetching after fetching 2 uncached blocks sequentially in a forward scan.
                 let bulk = match self.mode {
                     ReadMode::Bulk => Some(false),
                     ReadMode::Cached => {
@@ -604,7 +610,6 @@ impl MergeIter {
             if let Some(first) = first {
                 for bi in first..idx.blocks.len() {
                     blocks.push_back(bi);
-                    // Stop once a block's last key reaches past the end.
                     if !range.before_end(&idx.blocks[bi].0) {
                         break;
                     }
@@ -724,8 +729,7 @@ impl Version {
         Ok(None)
     }
 
-    /// Segments that may hold `key`, newest first: level 0 segments, then
-    /// at most one per deeper level.
+    /// Returns segments whose key range covers `key`, ordered from newest to oldest.
     fn candidates<'a>(&'a self, key: &'a [u8]) -> impl Iterator<Item = &'a SegmentMeta> + 'a {
         let covers = move |s: &&SegmentMeta| key >= s.min_key.as_ref() && key <= s.max_key.as_ref();
         let l0 = self.m.level(0).iter().filter(covers);
@@ -737,30 +741,28 @@ impl Version {
         l0.chain(deeper)
     }
 
-    /// Number of segments whose key range covers `key`.
+    /// Returns the number of segments whose key range covers `key`.
     pub fn segments_for_key(&self, key: &[u8]) -> usize {
         self.candidates(key).count()
     }
 
-    /// The entry for `key` if it is live at store time `at`: neither
-    /// deleted nor expired.
+    /// Returns the entry for `key` if it is neither deleted nor expired at store time `at`.
     pub async fn get(&self, key: &[u8], at: u64) -> Result<Option<Entry>> {
         Ok(self.get_entry(key).await?.filter(|e| !e.is_dead(at)))
     }
 
-    /// Earliest store time reads of this version may use: the version's own
-    /// time or the store's current clock, whichever is later.
+    /// Returns the store timestamp for reads against this version (`max(m.time_ms, store_now_ms)`).
     pub fn read_time(&self) -> u64 {
         self.m.time_ms.max(self.shared.store_now_ms().unwrap_or(0))
     }
 
-    /// This version's range tombstones, indexed for lookups.
+    /// Returns the indexed range tombstones for this version.
     pub(crate) fn deletes(&self) -> Arc<RangeDeletes> {
         self.deletes.clone()
     }
 
-    /// The sorted runs of this version: each level 0 segment alone, then
-    /// each deeper level.
+    /// Returns the sorted runs for this version: each matching L0 segment as a separate run,
+    /// followed by a run per non-empty deeper level.
     pub(crate) fn runs(&self, keep: impl Fn(&SegmentMeta) -> bool) -> Vec<Vec<SegmentMeta>> {
         let mut runs: Vec<Vec<SegmentMeta>> =
             self.m.level(0).iter().filter(|s| keep(s)).map(|s| vec![s.clone()]).collect();
@@ -773,9 +775,9 @@ impl Version {
         runs
     }
 
-    /// Returns the newest entry of each key in `range`, in order. Keys covered
-    /// by a range tombstone are skipped, even with `include_tombstones`.
-    /// With `at`, entries expired by then read as tombstones.
+    /// Returns an iterator over the newest entry for each key in `range`. Keys covered
+    /// by a range tombstone are skipped even when `include_tombstones` is true.
+    /// When `at` is set, entries expired at `at` are converted to tombstones.
     pub fn iter(&self, range: &KeyRange, reverse: bool, include_tombstones: bool, at: Option<u64>) -> MergeIter {
         let spec = IterSpec {
             range: range.clone(),
@@ -801,7 +803,7 @@ impl Version {
         MergeIter::new(self.shared.clone(), &self.m.db_id, &self.m.tail, self.runs(|_| true), spec)
     }
 
-    /// At most `limit` entries of `range` live at store time `at`, in order.
+    /// Returns up to `limit` live entries in `range` at store time `at`.
     pub async fn scan(&self, range: &KeyRange, reverse: bool, limit: usize, at: u64) -> Result<Vec<Entry>> {
         let mut out = Vec::new();
         if limit == 0 || range.is_empty() {
@@ -882,8 +884,8 @@ impl Version {
                 }
             }
         };
-        // Tombstones of one commit may overlap once clipped: report their
-        // union, so that no two changes share a position.
+        // Merge overlapping range tombstones from the same commit after clipping to `range`
+        // so that each change has a distinct position.
         let mut clipped: Vec<RangeTombstone> = self
             .m
             .range_deletes
@@ -928,12 +930,11 @@ impl Version {
     }
 }
 
-/// A version read at a moment: what has expired by `time_ms` reads as
-/// deleted.
+/// Database version paired with the store timestamp used to evaluate TTL expiration.
 #[derive(Clone)]
 pub struct Snapshot {
     pub version: Arc<Version>,
-    /// Store time of the read, never before the version's own time.
+    /// Store timestamp for the read (`>= version.m.time_ms`).
     pub time_ms: u64,
 }
 
@@ -951,13 +952,11 @@ impl Snapshot {
     }
 }
 
-/// A position in a change feed. Changes are ordered by version, and within
-/// one by kind (range deletions are applied first) and key, so a position after
-/// every change of version `seq` is `ChangePos::after_version(seq)`.
+/// Cursor position in a change feed, ordered by `(seq, kind, key)`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ChangePos {
     pub seq: Seq,
-    /// 0 for range deletions, 1 for keys, 2 for the end of the version.
+    /// `0` for range deletions, `1` for key entries, `2` for the end of `seq`.
     pub kind: u8,
     pub key: Bytes,
 }
@@ -971,8 +970,7 @@ impl ChangePos {
         ChangePos { seq, kind: ChangePos::END, key: Bytes::new() }
     }
 
-    /// Whether every deletion after this position is still stored, given
-    /// that those up to `horizon` may have been purged.
+    /// Returns true if all deletions after this position are retained when tombstones up to `horizon` have been purged.
     pub fn retained_by(&self, horizon: Seq) -> bool {
         self.seq > horizon || (self.seq == horizon && self.kind == ChangePos::END)
     }
@@ -999,10 +997,10 @@ impl ChangePos {
     }
 }
 
-/// One change reported by [`Version::changes`].
+/// Change entry returned by [`Version::changes`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
-    /// A key's newest entry: its value, or a tombstone if it was deleted.
+    /// Newest entry for a key (value or tombstone).
     Entry(Entry),
     /// Range deletion covering entries older than `seq`.
     DeleteRange(RangeTombstone),
@@ -1036,11 +1034,11 @@ impl Ord for Change {
     }
 }
 
-/// A page of a change feed.
+/// Page of changes returned by [`Version::changes`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangePage {
     pub changes: Vec<Change>,
-    /// More changes follow the last one.
+    /// True if additional changes follow this page.
     pub more: bool,
 }
 

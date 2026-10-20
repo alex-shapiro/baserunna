@@ -1,15 +1,15 @@
 //! Simulation workload for request rate limiting and authentication failure backoff.
 
 use super::super::client::{Client, Resp};
+use super::super::swarm::{Knobs, Profile, Skew, world};
 use super::super::{Sim, SimConfig};
 use super::expect;
 use crate::limits::{LimitConfig, Rate};
 use serde_json::{Value as Json, json};
 use std::sync::Arc;
 
-pub fn config() -> SimConfig {
-    let mut c = SimConfig::basic();
-    c.nodes = 2;
+pub fn config(k: &Knobs) -> SimConfig {
+    let mut c = world(k, Profile { nodes: (2, 3), faults: false, skew: Skew::None });
     c.node.limits = LimitConfig {
         user: Rate { per_sec: 10.0, burst: 20.0 },
         api_key: Rate::per_sec(100.0),

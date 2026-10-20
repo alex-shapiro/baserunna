@@ -1,13 +1,16 @@
 //! Deterministic cluster simulation in virtual time.
 
 pub mod amp;
+pub mod campaign;
 pub mod client;
 pub mod cost;
+pub mod explore;
 pub mod google;
 pub mod mail;
 pub mod openapi_check;
 mod storage_check;
 pub mod store;
+pub mod swarm;
 pub mod txn_fuzz;
 pub mod workloads;
 
@@ -27,7 +30,7 @@ use crate::util::rng::Rng;
 use axum::body::Body;
 use bytes::Bytes;
 use http::{Request, Response};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -98,20 +101,30 @@ impl NetFaults {
             forward_delay_max_ms: 0,
         }
     }
-
-    pub fn moderate() -> NetFaults {
-        NetFaults { latency_min_ms: 1, latency_max_ms: 10, p_lose_response: 0.01, ..NetFaults::none() }
-    }
 }
 
-/// Faults enabled for [`workloads::chaos_step`].
+/// Weights and timing parameters for cluster fault injection.
 #[derive(Clone, Debug, Default)]
 pub struct ChaosFaults {
-    /// Partitions that drop traffic in one direction only.
-    pub one_way_partitions: bool,
-    /// Isolate nodes from the object store while leaving peer traffic intact.
-    pub store_isolation: bool,
-    /// Maximum wall-clock jump in milliseconds, or 0 to disable.
+    pub enabled: bool,
+    /// Maximum pause duration between fault actions.
+    pub pause_ms: u64,
+    /// Duration of an active fault storm.
+    pub storm_ms: u64,
+    /// Maximum recovery period after a storm, during which the cluster is healed.
+    pub calm_ms: u64,
+    pub crash: u64,
+    pub start: u64,
+    pub partition: u64,
+    pub one_way_partition: u64,
+    /// Isolates a node from the object store while keeping peer network links intact.
+    pub store_isolation: u64,
+    /// Steps a node's wall clock by up to `clock_step_max_ms` in either direction.
+    pub clock_step: u64,
+    pub heal: u64,
+    pub quiet: u64,
+    /// Freezes a node's execution for up to three lease durations.
+    pub pause_node: u64,
     pub clock_step_max_ms: u64,
 }
 
@@ -120,7 +133,7 @@ pub struct SimConfig {
     pub nodes: usize,
     pub store: StoreFaults,
     pub net: NetFaults,
-    /// Maximum absolute wall-clock skew per node at start.
+    /// Maximum initial wall-clock skew per node.
     pub max_skew_ms: u64,
     pub chaos: ChaosFaults,
     pub engine: EngineConfig,
@@ -128,10 +141,19 @@ pub struct SimConfig {
     pub keep_log: bool,
     pub full_trace: bool,
     pub request_timeout_ms: u64,
+    pub knobs: Option<Arc<swarm::Knobs>>,
+    /// Fraction of buggify sites enabled in a simulation run.
+    pub buggify: f64,
+    pub crash_points: bool,
+    /// Probability that a node task yields before being polled.
+    pub reorder: f64,
+    pub disk: DiskFaults,
+    /// Sorted `(virtual_ms, salt)` branch points for deterministic replay and divergence.
+    pub branches: Vec<(u64, u64)>,
 }
 
 impl SimConfig {
-    /// Fast, fault-free single node.
+    /// Returns a fast, fault-free single-node configuration.
     pub fn basic() -> SimConfig {
         let engine = EngineConfig {
             lease_ms: 3_000,
@@ -147,7 +169,6 @@ impl SimConfig {
             clock_sync_max_error_ms: 100,
             levels_inline_max: 1,
             version_sample_ms: 5_000,
-            // Short enough to expire within a run, long enough to resolve ambiguous commits.
             commit_retention_ms: 120_000,
             ..EngineConfig::small_for_tests()
         };
@@ -192,61 +213,28 @@ impl SimConfig {
             keep_log: std::env::var("SIM_LOG").is_ok(),
             full_trace: std::env::var("SIM_LOG").as_deref() == Ok("all"),
             request_timeout_ms: 30_000,
-        }
-    }
-
-    /// Multi-node with store and network faults and clock skew within the
-    /// lease margin.
-    pub fn faulty(nodes: usize) -> SimConfig {
-        SimConfig {
-            nodes,
-            store: StoreFaults::moderate(),
-            net: NetFaults::moderate(),
-            max_skew_ms: 150,
-            ..SimConfig::basic()
-        }
-    }
-
-    /// [`SimConfig::faulty`] plus store stalls, list lag, duplicate/reordered
-    /// forwarding, and extreme clock skew.
-    pub fn hostile(nodes: usize) -> SimConfig {
-        let base = SimConfig::faulty(nodes);
-        let lease = base.engine.lease_ms;
-        SimConfig {
-            store: StoreFaults {
-                p_stall: 0.004,
-                stall_ms: (lease, 3 * lease),
-                list_lag_ms: 5_000,
-                ..StoreFaults::moderate()
-            },
-            net: NetFaults {
-                p_forward_duplicate: 0.03,
-                p_forward_delay: 0.05,
-                forward_delay_max_ms: 2_000,
-                ..NetFaults::moderate()
-            },
-            max_skew_ms: 10 * base.engine.lease_margin_ms,
-            chaos: ChaosFaults {
-                one_way_partitions: true,
-                store_isolation: true,
-                clock_step_max_ms: 10 * base.engine.lease_margin_ms,
-            },
-            ..base
+            knobs: None,
+            buggify: 0.0,
+            crash_points: false,
+            reorder: 0.0,
+            disk: DiskFaults { bytes: 64 * 1024, ..DiskFaults::default() },
+            branches: Vec::new(),
         }
     }
 }
 
 pub struct SimNode {
     pub idx: usize,
+    pub start: u64,
     pub node: Arc<Node>,
     pub router: axum::Router,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetError {
-    /// Never reached the node.
+    /// Request did not reach the node.
     Refused,
-    /// May have been processed.
+    /// Request may have been processed before the response was lost.
     Lost,
     Timeout,
 }
@@ -268,14 +256,21 @@ pub struct Sim {
     pub google: Arc<google::FakeGoogle>,
     pub mailbox: Arc<mail::Mailbox>,
     slots: Vec<Mutex<Option<Arc<SimNode>>>>,
-    disks: Vec<LocalTier>,
+    /// Serializes startup for each node slot so concurrent starts do not spawn duplicate instances.
+    starting: Vec<tokio::sync::Mutex<()>>,
+    disks: Vec<Option<LocalTier>>,
     partitions: Mutex<BTreeSet<(usize, usize)>>,
     store_isolated: Mutex<BTreeSet<usize>>,
     origin: Instant,
     base_ms: u64,
     starts: AtomicU64,
     pub crashes: AtomicU64,
-    past_activity: Mutex<crate::engine::Activity>,
+    violation: Mutex<Option<String>>,
+    pub knobs: Arc<swarm::Knobs>,
+    last_point_crash: Mutex<Option<Instant>>,
+    pub(crate) chaos: Mutex<workloads::ChaosState>,
+    pub(crate) chaos_over: tokio::sync::Notify,
+    pub(crate) admin: tokio::sync::Mutex<Option<String>>,
     me: Weak<Sim>,
 }
 
@@ -302,7 +297,69 @@ fn take_panic() -> Option<String> {
     PANIC.with(|p| p.borrow_mut().take())
 }
 
-const LOCAL_TIER_BYTES: u64 = 64 * 1024;
+/// Simulated local disk cache that persists across node restarts and injects read/write faults.
+struct SimDisk {
+    inner: MemLocal,
+    rng: Mutex<Rng>,
+    faults: DiskFaults,
+    trace: Arc<Trace>,
+}
+
+/// Fault injection parameters for simulated local disks.
+#[derive(Clone, Debug, Default)]
+pub struct DiskFaults {
+    /// Capacity of each node's local cache tier in bytes, or 0 to disable local caching.
+    pub bytes: u64,
+    /// Probability that a cached read misses as if the entry were evicted.
+    pub p_lose: f64,
+    /// Probability that a cache write is silently dropped.
+    pub p_drop_write: f64,
+    /// Probability that a cached read flips a random bit in the returned bytes.
+    pub p_corrupt: f64,
+}
+
+impl crate::engine::local::LocalStore for SimDisk {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, Option<Bytes>> {
+        Box::pin(async move {
+            let got = self.inner.get(key).await?;
+            let mut r = self.rng.lock().unwrap_or_else(|e| e.into_inner());
+            if r.chance(self.faults.p_lose) {
+                self.trace.event(&format!("disk lost {key}"));
+                return None;
+            }
+            if !got.is_empty() && r.chance(self.faults.p_corrupt) {
+                self.trace.event(&format!("disk corrupted {key}"));
+                let mut b = got.to_vec();
+                let i = r.usize(b.len());
+                b[i] ^= 1 << r.below(8);
+                return Some(Bytes::from(b));
+            }
+            Some(got)
+        })
+    }
+
+    fn put<'a>(&'a self, key: &'a str, data: Bytes) -> BoxFut<'a, ()> {
+        Box::pin(async move {
+            if self.rng.lock().unwrap_or_else(|e| e.into_inner()).chance(self.faults.p_drop_write) {
+                return;
+            }
+            self.inner.put(key, data).await
+        })
+    }
+
+    fn stats(&self) -> crate::engine::local::LocalStats {
+        self.inner.stats()
+    }
+}
+
+/// Minimum virtual time between two crash-point crashes.
+const POINT_CRASH_SPACING_MS: u64 = 30_000;
+
+/// Maximum virtual time allowed for a simulation run before timing out.
+const MAX_VIRTUAL_MS: u64 = 6 * 3_600_000;
+
+/// Virtual time interval between global invariant checks.
+const ORACLE_INTERVAL_MS: u64 = 20;
 
 pub fn addr_of(i: usize) -> String {
     format!("sim://n{i}")
@@ -370,10 +427,9 @@ impl Transport for SimTransport {
                     *resp.headers_mut() = r.headers;
                     Ok(resp)
                 }
-                Err(NetError::Refused) if duplicated => Err(TransportError {
-                    message: "connection refused after duplicate".into(),
-                    maybe_delivered: true,
-                }),
+                Err(NetError::Refused) if duplicated => {
+                    Err(TransportError { message: "connection refused after duplicate".into(), maybe_delivered: true })
+                }
                 Err(NetError::Refused) => Err(undelivered("connection refused")),
                 Err(e) => Err(TransportError { message: format!("{e:?}"), maybe_delivered: true }),
             }
@@ -454,6 +510,14 @@ impl Sim {
             base_ms + Instant::now().saturating_duration_since(clock_origin).as_millis() as u64
         })));
         let n = cfg.nodes;
+        let disks = (0..n)
+            .map(|_| {
+                let d = cfg.disk.clone();
+                let rng = Mutex::new(root.fork());
+                let disk = SimDisk { inner: MemLocal::new(d.bytes), rng, faults: d, trace: trace.clone() };
+                (cfg.disk.bytes > 0).then(|| LocalTier(Arc::new(disk)))
+            })
+            .collect();
         let sim = Arc::new_cyclic(|me| Sim {
             seed,
             rng: Mutex::new(root.fork()),
@@ -463,14 +527,20 @@ impl Sim {
             google,
             mailbox: Arc::new(mail::Mailbox::default()),
             slots: (0..n).map(|_| Mutex::new(None)).collect(),
-            disks: (0..n).map(|_| LocalTier(Arc::new(MemLocal::new(LOCAL_TIER_BYTES)))).collect(),
+            starting: (0..n).map(|_| tokio::sync::Mutex::new(())).collect(),
+            disks,
             partitions: Mutex::new(BTreeSet::new()),
             store_isolated: Mutex::new(BTreeSet::new()),
             origin,
             base_ms,
             starts: AtomicU64::new(0),
             crashes: AtomicU64::new(0),
-            past_activity: Mutex::new(Default::default()),
+            violation: Mutex::new(None),
+            knobs: cfg.knobs.clone().unwrap_or_else(|| Arc::new(swarm::Knobs::new(seed))),
+            last_point_crash: Mutex::new(None),
+            chaos: Mutex::new(Default::default()),
+            chaos_over: tokio::sync::Notify::new(),
+            admin: tokio::sync::Mutex::new(None),
             cfg,
             me: me.clone(),
         });
@@ -508,8 +578,12 @@ impl Sim {
         (0..self.slots.len()).filter(|i| self.node(*i).is_some()).collect()
     }
 
-    /// Starts or restarts node `i`.
+    /// Starts node `i` unless it is up.
     pub async fn start(&self, i: usize) {
+        let _starting = self.starting[i].lock().await;
+        if self.node(i).is_some() {
+            return;
+        }
         self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).remove(&i);
         let n = self.starts.fetch_add(1, Ordering::SeqCst);
         let skew = if self.cfg.max_skew_ms == 0 {
@@ -522,9 +596,13 @@ impl Sim {
         cfg.addr = addr_of(i);
         cfg.public_url = "https://baserunna.test".into();
         cfg.engine = self.cfg.engine.clone();
-        cfg.engine.local_tier = Some(self.disks[i].clone());
+        cfg.engine.local_tier = self.disks[i].clone();
         for attempt in 0..50u64 {
             let env = Arc::new(Env::sim(self.seed ^ (n * 7919 + attempt + 1), self.base_ms, self.origin, skew));
+            let me = self.me.clone();
+            env.set_crash_hook(Arc::new(move |why: &str| {
+                me.upgrade().is_some_and(|sim| sim.crash_at_point(i, n, why))
+            }));
             if self.cfg.keep_log {
                 let trace = self.trace.clone();
                 let base = self.base_ms;
@@ -546,7 +624,7 @@ impl Sim {
                     let router = api::router(node.clone());
                     self.trace.event(&format!("start n{i} as {}", node.id));
                     *self.slots[i].lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(Arc::new(SimNode { idx: i, node, router }));
+                        Some(Arc::new(SimNode { idx: i, start: n, node, router }));
                     return;
                 }
                 Err(e) => {
@@ -559,6 +637,33 @@ impl Sim {
         panic!("node {i} could not start");
     }
 
+    /// Crashes node `i` at a crash point if it is still running instance `n`,
+    /// and schedules a restart after a random delay.
+    fn crash_at_point(self: &Arc<Self>, i: usize, n: u64, why: &str) -> bool {
+        let current = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.start);
+        if current != Some(n) {
+            return false;
+        }
+        {
+            let mut last = self.last_point_crash.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|t| t.elapsed() < Duration::from_millis(POINT_CRASH_SPACING_MS)) {
+                return false;
+            }
+            *last = Some(Instant::now());
+        }
+        self.trace.event(&format!("n{i}: {why}"));
+        self.crash(i);
+        let sim = self.clone();
+        let delay = 100 + self.rand_below(5_000);
+        tokio::spawn(async move {
+            sim.sleep(delay).await;
+            if sim.node(i).is_none() {
+                sim.start(i).await;
+            }
+        });
+        true
+    }
+
     /// Aborts node `i`'s tasks and drops its in-memory state.
     pub fn crash(&self, i: usize) {
         let n = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -566,23 +671,52 @@ impl Sim {
             self.crashes.fetch_add(1, Ordering::SeqCst);
             self.trace.event(&format!("crash n{i} ({})", n.node.id));
             n.node.env.shutdown();
-            self.retire_activity(&n);
         }
     }
 
-    fn retire_activity(&self, n: &SimNode) {
-        self.past_activity.lock().unwrap_or_else(|e| e.into_inner()).add(&n.node.engine.shared.counters.get());
-    }
-
-    /// Returns total storage engine activity across all running and terminated nodes.
-    pub fn engine_activity(&self) -> crate::engine::Activity {
-        let mut a = *self.past_activity.lock().unwrap_or_else(|e| e.into_inner());
+    /// Verifies cluster-wide lease invariants: at most one node holds an active
+    /// lease per database, and any leased node without an in-flight manifest write
+    /// matches the latest manifest in object storage.
+    fn check_oracles(&self) -> Result<(), String> {
+        let mut holders: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for i in self.up_nodes() {
-            if let Some(n) = self.node(i) {
-                a.add(&n.node.engine.shared.counters.get());
+            let Some(n) = self.node(i) else { continue };
+            for db in n.node.engine.open_dbs() {
+                let Some((write_seq, etag, in_flight)) = db.leased_view() else { continue };
+                holders.entry(db.id.clone()).or_default().push(i);
+                if in_flight {
+                    continue;
+                }
+                let stored = self.mem.get_sync(&crate::engine::manifest_key(&db.id), &GetOpts::default());
+                if let Ok(g) = stored
+                    && g.etag != etag
+                {
+                    let ws = crate::engine::manifest::Manifest::decode(&g.data).map_or(0, |m| m.write_seq);
+                    return Err(format!(
+                        "n{i} holds lease on {} at write {write_seq}, but store has write {ws}",
+                        db.id
+                    ));
+                }
             }
         }
-        a
+        match holders.into_iter().find(|(_, ns)| ns.len() > 1) {
+            Some((db, ns)) => Err(format!("multiple nodes {ns:?} hold an active lease on {db}")),
+            None => Ok(()),
+        }
+    }
+
+    fn spawn_oracles(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let sim = self.clone();
+        tokio::spawn(async move {
+            loop {
+                sim.sleep(ORACLE_INTERVAL_MS).await;
+                if let Err(e) = sim.check_oracles() {
+                    sim.trace.event(&format!("oracle: {e}"));
+                    sim.violation.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+                    return;
+                }
+            }
+        })
     }
 
     pub async fn restart(&self, i: usize) {
@@ -620,6 +754,28 @@ impl Sim {
 
     fn store_isolated(&self, i: usize) -> bool {
         self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).contains(&i)
+    }
+
+    /// Suspends all task execution on node `i` for `ms` milliseconds.
+    pub fn pause_node(self: &Arc<Self>, i: usize, ms: u64) {
+        let Some(n) = self.node(i) else { return };
+        self.trace.event(&format!("pause n{i} for {ms}ms"));
+        n.node.env.pause();
+        let sim = self.clone();
+        tokio::spawn(async move {
+            sim.sleep(ms).await;
+            n.node.env.resume();
+            sim.trace.event(&format!("resume n{i}"));
+        });
+    }
+
+    /// Resumes all paused nodes.
+    pub fn resume_all(&self) {
+        for i in self.up_nodes() {
+            if let Some(n) = self.node(i) {
+                n.node.env.resume();
+            }
+        }
     }
 
     pub fn step_clock(&self, i: usize, delta_ms: i64) {
@@ -677,7 +833,6 @@ impl Sim {
             let n = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some(n) = n {
                 n.node.env.shutdown();
-                self.retire_activity(&n);
             }
         }
     }
@@ -698,7 +853,9 @@ pub struct SimOutcome {
     pub injected_faults: u64,
     pub crashes: u64,
     pub storage: StorageReport,
-    pub engine: crate::engine::Activity,
+    pub probes: crate::probe::Hits,
+    pub buggify: crate::buggify::Report,
+    pub knobs: Vec<(&'static str, String)>,
     pub trace_tail: Vec<String>,
 }
 
@@ -721,56 +878,105 @@ where
     F: FnOnce(Arc<Sim>) -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
-    let lvl = crate::log::level();
     if std::env::var("BASERUNNA_LOG").is_err() {
         crate::log::set_level(Some(crate::log::Level::Error));
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
     let full_trace = cfg.full_trace;
-    let out = rt.block_on(async move {
-        let start = Instant::now();
-        let sim = Sim::new(seed, cfg).await;
-        let mut result = match CatchPanic(Box::pin(f(sim.clone()))).await {
-            Ok(r) => r,
-            Err(()) => Err("workload panicked".into()),
-        };
-        let mut storage = StorageReport::default();
-        if result.is_ok() {
-            sim.store.set_faults_enabled(false);
-            sim.sleep(5_000).await;
-            match sim.check_storage().await {
-                Ok(r) => storage = r,
-                Err(e) => result = Err(format!("storage invariant: {e}")),
+    let b = crate::buggify::Config {
+        p_active: cfg.buggify,
+        faults: cfg.chaos.enabled,
+        crashes: cfg.crash_points,
+        p_reorder: cfg.reorder,
+    };
+    crate::buggify::enable(seed ^ 0xb066_1f1e, b);
+    let branches = cfg.branches.clone();
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(async move {
+            crate::probe::record();
+            crate::probe::set_branch_time(branches.last().map_or(0, |(ms, _)| *ms));
+            let start = Instant::now();
+            crate::util::rng::branch(
+                branches.iter().map(|(ms, salt)| (start + Duration::from_millis(*ms), *salt)).collect(),
+            );
+            let sim = Sim::new(seed, cfg).await;
+            let mut oracles = sim.spawn_oracles();
+            let mut workload = CatchPanic(Box::pin(f(sim.clone())));
+            let mut oracles_or_deadline = Box::pin(async {
+                let deadline = tokio::time::sleep(Duration::from_millis(MAX_VIRTUAL_MS));
+                match crate::util::race(&mut oracles, &mut Box::pin(deadline)).await {
+                    crate::util::Either::Left(_) => Ok(()),
+                    crate::util::Either::Right(()) => {
+                        Err(format!("workload timed out after {} s of virtual time", MAX_VIRTUAL_MS / 1000))
+                    }
+                }
+            });
+            let mut result = match crate::util::race(&mut workload, &mut oracles_or_deadline).await {
+                crate::util::Either::Left(Ok(r)) => r,
+                crate::util::Either::Left(Err(())) => Err("workload panicked".into()),
+                crate::util::Either::Right(r) => r,
+            };
+            drop(oracles_or_deadline);
+            drop(workload);
+            oracles.abort();
+            if let Some(v) = sim.violation.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                result = Err(format!("oracle: {v}"));
             }
-        }
-        if let Some(p) = take_panic() {
-            result = Err(format!("panic in simulation: {p}"));
-        }
-        let virtual_ms = start.elapsed().as_millis() as u64;
-        sim.shutdown_all();
-        let engine = sim.engine_activity();
-        let dump = sim.trace.dump();
-        let keep = if full_trace { dump.len() } else { 400 };
-        let trace_tail = dump[dump.len().saturating_sub(keep)..].to_vec();
-        SimOutcome {
-            seed,
-            result,
-            trace_hash: sim.trace.hash(),
-            events: sim.trace.events(),
-            virtual_ms,
-            store_ops: sim.store.stats.gets.load(Ordering::Relaxed)
-                + sim.store.stats.puts.load(Ordering::Relaxed)
-                + sim.store.stats.lists.load(Ordering::Relaxed)
-                + sim.store.stats.deletes.load(Ordering::Relaxed),
-            injected_faults: sim.store.stats.injected_failures.load(Ordering::Relaxed),
-            crashes: sim.crashes.load(Ordering::Relaxed),
-            storage,
-            engine,
-            trace_tail,
-        }
+            let mut storage = StorageReport::default();
+            if result.is_ok() {
+                sim.store.set_faults_enabled(false);
+                sim.sleep(5_000).await;
+                match sim.check_storage().await {
+                    Ok(r) => storage = r,
+                    Err(e) => result = Err(format!("storage invariant: {e}")),
+                }
+            }
+            if let Some(p) = take_panic() {
+                result = Err(format!("panic in simulation: {p}"));
+            }
+            let virtual_ms = start.elapsed().as_millis() as u64;
+            sim.shutdown_all();
+            let dump = sim.trace.dump();
+            let keep = if full_trace { dump.len() } else { 400 };
+            let trace_tail = dump[dump.len().saturating_sub(keep)..].to_vec();
+            SimOutcome {
+                seed,
+                result,
+                trace_hash: sim.trace.hash(),
+                events: sim.trace.events(),
+                virtual_ms,
+                store_ops: sim.store.stats.gets.load(Ordering::Relaxed)
+                    + sim.store.stats.puts.load(Ordering::Relaxed)
+                    + sim.store.stats.lists.load(Ordering::Relaxed)
+                    + sim.store.stats.deletes.load(Ordering::Relaxed),
+                injected_faults: sim.store.stats.injected_failures.load(Ordering::Relaxed),
+                crashes: sim.crashes.load(Ordering::Relaxed),
+                storage,
+                probes: crate::probe::Hits::default(),
+                buggify: Default::default(),
+                knobs: sim.knobs.drawn(),
+                trace_tail,
+            }
+        })
+    }));
+    crate::util::rng::branch(Vec::new());
+    let (probes, buggify) = (crate::probe::finish(), crate::buggify::disable());
+    let out = out.unwrap_or_else(|_| SimOutcome {
+        seed,
+        result: Err(format!("panic outside the workload: {}", take_panic().unwrap_or_default())),
+        trace_hash: 0,
+        events: 0,
+        virtual_ms: 0,
+        store_ops: 0,
+        injected_faults: 0,
+        crashes: 0,
+        storage: StorageReport::default(),
+        probes: Default::default(),
+        buggify: Default::default(),
+        knobs: Vec::new(),
+        trace_tail: Vec::new(),
     });
-    crate::log::set_level(lvl);
-    out
+    SimOutcome { probes, buggify, ..out }
 }
 
 /// Time required for two reaper passes to purge all deleted databases.
@@ -787,16 +993,15 @@ pub fn seeds(base: u64, default_count: u64) -> Vec<u64> {
     (0..n).map(|i| base.wrapping_mul(1_000_003).wrapping_add(i)).collect()
 }
 
-pub fn run_seeds<F, Fut>(name: &str, base: u64, default_count: u64, cfg: impl Fn() -> SimConfig, f: F)
-where
-    F: Fn(Arc<Sim>) -> Fut,
-    Fut: Future<Output = Result<(), String>>,
-{
+/// Runs `scenario` with the seeds from [`seeds`], panicking with a
+/// reproduction command on the first failure.
+pub fn run_seeds(scenario: &workloads::Scenario, base: u64, default_count: u64) {
+    let name = scenario.name;
     for seed in seeds(base, default_count) {
-        let out = run(seed, cfg(), &f);
+        let out = run(seed, scenario.config_for(seed), scenario.run);
         if std::env::var("SIM_VERBOSE").is_ok() {
             eprintln!(
-                "{name} seed={seed} ok={} events={} virtual={}s store_ops={} faults={} crashes={} storage={:?} engine={:?}",
+                "{name} seed={seed} ok={} events={} virtual={}s store_ops={} faults={} crashes={} storage={:?} probes={}",
                 out.result.is_ok(),
                 out.events,
                 out.virtual_ms / 1000,
@@ -804,14 +1009,18 @@ where
                 out.injected_faults,
                 out.crashes,
                 out.storage,
-                out.engine
+                out.probes.hit().count()
             );
         }
         if let Err(e) = out.result {
             for l in &out.trace_tail {
                 eprintln!("  | {l}");
             }
-            panic!("simulation {name} failed: {e}\nreproduce with: SIM_SEED={seed} cargo test {name} -- --nocapture");
+            let knobs: Vec<String> = out.knobs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            panic!(
+                "simulation {name} failed: {e}\nknobs: {}\nreproduce with: SIM_SEED={seed} cargo test sim_{name} -- --nocapture",
+                knobs.join(" ")
+            );
         }
     }
 }

@@ -1,14 +1,10 @@
-//! `watch`: a writer commits puts (some expiring), deletes and large range
-//! deletes while a watcher follows the change feed with long polls, both
-//! through random nodes, under faults.
+//! `watch`: verifies the key-value change feed under concurrent puts, TTL
+//! expirations, point deletes, and range deletes.
 //!
-//! Every change the watcher receives must be what the writer wrote at that
-//! version: a value it put, or the deletion of a key it deleted, deleted a
-//! range around, or put with a time to live. A cursor may expire only once
-//! a transaction lifetime has passed since the request that caught up to
-//! it. Once the writer stops and every value it wrote with a time to live
-//! has expired, the watcher's state built from the feed alone must equal
-//! the database's.
+//! Every change returned by the feed must match the write committed at that
+//! version, cursors must not expire within the transaction lifetime window,
+//! and the state reconstructed from the feed must match the final database
+//! state after all TTL entries expire.
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
@@ -19,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 const BASE: &str = "/v1/dbs/watch";
 
-/// One write of a committed transaction.
+/// Single write operation in a committed transaction.
 #[derive(Clone, Debug, PartialEq)]
 enum Write {
     Put { key: String, value: String, ttl: bool },
@@ -30,20 +26,33 @@ enum Write {
 /// Committed writes by version.
 type Log = Arc<Mutex<BTreeMap<u64, Vec<Write>>>>;
 
-/// Commit `ops` (with an idempotency key) until the outcome is definitive.
-async fn commit(c: &Client, ops: Json, key: &str) -> Result<u64, String> {
+/// Commits `ops` with an idempotency key until the outcome is definitive.
+/// Returns the committed version and whether an earlier attempt may also have
+/// been applied after its commit record expired.
+async fn commit(c: &Client, ops: Json, key: &str) -> Result<(u64, bool), String> {
     let body = json!({"ops": ops, "idempotency_key": key});
+    let first = c.sim.now_ms();
+    let mut ambiguous = false;
     loop {
         match c.call("POST", &format!("{BASE}/txn"), Some(body.clone())).await {
-            Ok(r) if r.status == 200 => return r.json["version"].as_u64().ok_or_else(|| "no version".into()),
+            Ok(r) if r.status == 200 => {
+                let v = r.json["version"].as_u64().ok_or("missing version")?;
+                let slack = 2 * c.sim.cfg.engine.clock_sync_max_error_ms;
+                let expired = c.sim.now_ms() - first + slack >= c.sim.cfg.engine.commit_retention_ms;
+                return Ok((v, ambiguous && expired));
+            }
             Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => c.pause(50).await,
             Ok(r) if r.status != 503 && r.status != 429 => return Err(format!("write: {} {}", r.status, r.json)),
-            _ => c.pause(ZOMBIE_WAIT_MS).await,
+            r => {
+                ambiguous |= r.as_ref().map_or(true, |r| r.outcome_unknown());
+                c.pause(ZOMBIE_WAIT_MS).await
+            }
         }
     }
 }
 
 async fn writer(c: Client, log: Log, steps: usize) -> Result<(), String> {
+    let mut prev = 0;
     for step in 0..steps {
         let k = format!("k/{}", c.rng().below(6));
         let roll = c.rng().below(10);
@@ -59,7 +68,6 @@ async fn writer(c: Client, log: Log, steps: usize) -> Result<(), String> {
             }
             5 | 6 => (json!([{"op": "delete", "key": k}]), vec![Write::Delete(k)]),
             7 | 8 => {
-                // Enough keys that deleting them takes a range tombstone.
                 let ops: Vec<Json> = (0..8)
                     .map(|i| json!({"op": "put", "key": format!("r/{i}"), "value": format!("r{step}")}))
                     .collect();
@@ -69,8 +77,17 @@ async fn writer(c: Client, log: Log, steps: usize) -> Result<(), String> {
             }
             _ => (json!([{"op": "delete_range", "prefix": "r/"}]), vec![Write::DeleteRange("r/".into())]),
         };
-        let v = commit(&c, ops, &format!("w{step}")).await?;
-        log.lock().unwrap_or_else(|e| e.into_inner()).entry(v).or_insert(writes);
+        let (v, maybe_twice) = commit(&c, ops, &format!("w{step}")).await?;
+        // Because there is a single writer, any earlier application of this step
+        // was committed at a version in `prev + 1..=v`.
+        let from = if maybe_twice { prev + 1 } else { v };
+        {
+            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            for u in from..=v {
+                l.entry(u).or_insert_with(|| writes.clone());
+            }
+        }
+        prev = v;
         let d = c.rng().below(400);
         c.pause(d).await;
     }
@@ -79,8 +96,8 @@ async fn writer(c: Client, log: Log, steps: usize) -> Result<(), String> {
 
 /// Verifies that a change from the feed matches a write in `log`.
 fn explained(ch: &Json, log: &BTreeMap<u64, Vec<Write>>) -> Result<(), String> {
-    let v = ch["version"].as_u64().ok_or("no version")?;
-    let writes = log.get(&v).ok_or_else(|| format!("{ch}: no write committed as version {v}"))?;
+    let v = ch["version"].as_u64().ok_or("missing version")?;
+    let writes = log.get(&v).ok_or_else(|| format!("{ch}: missing write at version {v}"))?;
     let ok = if let Some(r) = ch.get("deleted_range") {
         writes.iter().any(
             |w| matches!(w, Write::DeleteRange(p) if r["start"].as_str().is_some_and(|s| s.starts_with(p.as_str()))),
@@ -119,8 +136,7 @@ async fn read_all(c: &Client) -> (State, String) {
 struct Watcher {
     c: Client,
     cursor: String,
-    /// Start time of the last request that caught up with the feed; no
-    /// deletion after `cursor` committed before this timestamp.
+    /// Start time of the last request that caught up with the feed.
     cursor_at: u64,
     state: State,
     received: Vec<Json>,
@@ -185,7 +201,7 @@ impl Watcher {
             }
         }
         self.received.extend(changes.iter().cloned());
-        self.cursor = r.json["next_cursor"].as_str().ok_or("no next_cursor")?.to_string();
+        self.cursor = r.json["next_cursor"].as_str().ok_or("missing next_cursor")?.to_string();
         let more = r.json["more"] == true;
         if !more {
             self.cursor_at = at;
@@ -211,7 +227,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     let lifetime = sim.cfg.engine.txn_max_lifetime_ms;
     let eps = 2 * sim.cfg.engine.clock_sync_max_error_ms;
     let mut watcher = Watcher::start(Client::with_token(&sim, "watcher", &token), lifetime, eps).await;
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut err = None;
     while !done.load(Ordering::SeqCst) {
         let wait = watcher.c.rng().below(3_000);
@@ -224,9 +240,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
             watcher.c.pause(lifetime + 10_000).await;
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
     match w.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => err = err.or(Some(e)),
@@ -235,7 +248,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     if let Some(e) = err {
         return Err(e);
     }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     // Wait for all TTL entries to expire before comparing state.
     watcher.c.pause(4_000 + eps).await;
     while watcher.poll(0).await? != Some(true) {

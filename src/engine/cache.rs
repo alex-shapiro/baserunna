@@ -180,6 +180,9 @@ impl Cache {
     }
 
     pub fn get(&self, k: &CacheKey) -> Option<CacheVal> {
+        if crate::buggify::fires(0.05) {
+            return None;
+        }
         self.shard(k).get(k)
     }
 
@@ -246,11 +249,11 @@ mod tests {
 
     #[test]
     fn large_budgets_shard_and_stay_within_budget() {
-        let one = block(10).size();
+        let entry_size = block(10).size();
         let c = Cache::new(16 * SHARD_MIN_BYTES);
         assert_eq!(c.shards.len(), 16);
         let key = |i: u32| CacheKey { seg_path: Arc::from(format!("seg{}", i % 97)), block: i };
-        let n = (16 * SHARD_MIN_BYTES / one) as u32 * 2;
+        let n = (16 * SHARD_MIN_BYTES / entry_size) as u32 * 2;
         for i in 0..n {
             c.insert(key(i), block(10));
         }
@@ -263,21 +266,21 @@ mod tests {
     }
 
     #[test]
-    fn accounts_bytes_exactly() {
-        let one = block(10).size();
-        let c = Cache::new(2 * one);
+    fn accounts_bytes_accurately() {
+        let entry_size = block(10).size();
+        let c = Cache::new(2 * entry_size);
         let key = |i: u32| CacheKey { seg_path: Arc::from("s"), block: i };
         c.insert(key(0), block(10));
         c.insert(key(0), block(10));
-        assert_eq!(c.stats().bytes, one, "replacing an entry must not double count it");
+        assert_eq!(c.stats().bytes, entry_size);
         c.insert(key(1), block(10));
-        assert_eq!((c.stats().bytes, c.stats().entries), (2 * one, 2), "filling the budget exactly evicts nothing");
-        let exact = Cache::new(one);
+        assert_eq!((c.stats().bytes, c.stats().entries), (2 * entry_size, 2));
+        let exact = Cache::new(entry_size);
         exact.insert(key(0), block(10));
-        assert!(exact.get(&key(0)).is_some(), "an entry as large as the budget is cached");
-        let small = Cache::new(one - 1);
+        assert!(exact.get(&key(0)).is_some());
+        let small = Cache::new(entry_size - 1);
         small.insert(key(0), block(10));
-        assert_eq!((small.stats().bytes, small.stats().entries), (0, 0), "an entry over budget is not cached");
+        assert_eq!((small.stats().bytes, small.stats().entries), (0, 0));
         assert_eq!((small.stats().hits, small.stats().misses), (0, 0));
         assert!(small.get(&key(0)).is_none());
         assert!(exact.get(&key(0)).is_some());
@@ -285,7 +288,7 @@ mod tests {
         let other = CacheKey { seg_path: Arc::from("t"), block: 0 };
         c.insert(other.clone(), block(10));
         c.evict_prefix("s");
-        assert_eq!((c.stats().bytes, c.stats().entries), (one, 1), "evicting a prefix releases its bytes");
+        assert_eq!((c.stats().bytes, c.stats().entries), (entry_size, 1));
         assert!(c.get(&other).is_some());
     }
 }

@@ -31,7 +31,6 @@ const BUDGETS: &[(&str, f64, f64, f64, f64)] = &[
     ("restart_open_and_scan", 1.0, 0.0, 0.0, 0.0),
     ("stream_append", 0.0, 1.0, 0.0, 0.0),
     ("stream_tail_read_leased", 0.0, 0.0, 0.0, 0.0),
-    // A commit per request of about 20 KB, plus the chunks the tail is sealed into.
     ("log_ingest", 0.5, 62.0, 0.1, 0.1),
     ("cold_stream_read", 5.5, 0.0, 0.0, 0.0),
 ];
@@ -57,14 +56,14 @@ fn request_costs_stay_within_budget() {
             ("DELETE", c.deletes, budget.deletes),
         ] {
             if got > max + 1e-9 {
-                failures.push(format!("{name}: {got:.3} {what} per {} exceeds the budget of {max}", r.get(name).unit));
+                failures.push(format!("{name}: {got:.3} {what} per {} exceeds budget {max}", r.get(name).unit));
             }
         }
     }
     let names: Vec<&str> = BUDGETS.iter().map(|b| b.0).collect();
     for m in &r.measurements {
         if !names.contains(&m.name) {
-            failures.push(format!("{}: measured but has no budget row", m.name));
+            failures.push(format!("{}: missing budget row", m.name));
         }
     }
     if r.space_amplification > SPACE_AMPLIFICATION_BUDGET {
@@ -83,7 +82,7 @@ fn request_costs_stay_within_budget() {
     }
     assert!(
         failures.is_empty(),
-        "cost regressions (if intentional, update the budgets in tests/cost.rs and SPEC §13.4):\n  {}",
+        "cost regressions (if intentional, update the budgets in tests/cost.rs and SPEC §13.5):\n  {}",
         failures.join("\n  ")
     );
 }

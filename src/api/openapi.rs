@@ -89,8 +89,7 @@ fn enum_of(values: &[&str]) -> Value {
     json!({"type": "string", "enum": values})
 }
 
-/// A filter (SPEC §4.7) named `name`: `and`, `or` or `not` of filters, or
-/// one of `comparisons`.
+/// Builds a recursive filter schema named `name` with boolean combinators and `comparisons`.
 fn filter_schema(name: &str, comparisons: Vec<Value>, desc: &str) -> Value {
     let mut nodes = vec![
         obj(json!({"and": arr(r(name))}), &["and"]),
@@ -98,14 +97,14 @@ fn filter_schema(name: &str, comparisons: Vec<Value>, desc: &str) -> Value {
         obj(json!({"not": r(name)}), &["not"]),
     ];
     nodes.extend(comparisons);
-    let semantics = "A missing or null operand fails every comparison, `ne` included; `exists` tests for one. \
-        Numbers compare by value.";
+    let semantics = "A missing or null operand evaluates to false for all comparison operators, including `ne`; \
+        use `exists` to test for presence. Numeric values are compared by numeric value.";
     json!({"oneOf": nodes, "description": format!("{desc} {semantics}")})
 }
 
-/// A filter comparison of the operand named by `key`.
+/// Builds a comparison leaf schema for the operand field `key`.
 fn comparison(key: &str, operand: Value) -> Value {
-    let value = json!({"description": "Absent for `exists`, an array of at most 1000 for `in`, otherwise not null."});
+    let value = json!({"description": "Omitted for `exists`, an array of at most 1000 elements for `in`, or a non-null scalar."});
     obj(json!({(key): operand, "op": enum_of(&crate::filter::OPS), "value": value}), &[key, "op"])
 }
 
@@ -151,8 +150,8 @@ fn op<'a>(summary: &'a str, tag: &'a str, responses: Vec<(&'a str, Value)>) -> O
 fn db() -> Value {
     path_param(
         "db",
-        "Database reference: `name` (one of yours), `org.name` (an organization's), or `id:<db_id>` \
-         (administrators).",
+        "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` \
+         (administrators only).",
     )
 }
 
@@ -218,7 +217,7 @@ fn schemas() -> Value {
             "id": s(), "created_at": i(), "expires_at": i(), "client": nullable("string"),
             "method": enum_of(&["signup", "password", "google", "reset"]), "current": b(),
         }), &["id", "created_at", "expires_at", "client", "method", "current"],
-            "A signed-in session: `client` is the address that signed in, `current` the session making the request."),
+            "Authenticated session: `client` is the client address at sign-in, and `current` is true for the calling session."),
         "PasswordChange": obj_desc(json!({"current_password": s(), "new_password": {"type": "string", "minLength": 8}}),
             &["new_password"], "`current_password` is required for accounts that have a password."),
         "Role": enum_of(&["reader", "writer", "admin", "owner"]),
@@ -242,12 +241,12 @@ fn schemas() -> Value {
         "CreateApiKey": obj_desc(json!({
             "name": s(), "db": nullable("string"), "read_only": b(),
             "rate_limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 1_000_000},
-        }), &["name"], "`rate_limit`: requests per second this key may make on each node (default: the \
-            node's per-key limit)."),
+        }), &["name"], "`rate_limit`: maximum requests per second allowed for this key on each node (defaults to the \
+            node per-key limit)."),
         "Node": obj(json!({"id": s(), "addr": s(), "started_at": i(), "heartbeat_at": i(), "live": b()}),
             &["id", "addr", "started_at", "heartbeat_at", "live"]),
         "DbSummary": obj_desc(json!({"id": s(), "name": s(), "org": nullable("string"), "created_at": i()}),
-            &["id", "name", "org", "created_at"], "`org` is the owning organization (null for your own databases)."),
+            &["id", "name", "org", "created_at"], "`org` is the owning organization, or `null` for personal databases."),
         "LevelStats": obj(json!({"level": i(), "segments": i(), "bytes": i(), "entries": i()}),
             &["level", "segments", "bytes", "entries"]),
         "DbStats": obj_desc(json!({
@@ -257,21 +256,20 @@ fn schemas() -> Value {
             "quota_bytes": nullable("integer"),
         }), &["version", "levels", "tail_entries", "tail_bytes", "range_tombstones", "blob_bytes", "pending_gc_objects",
             "lease_holder", "lease_expires_at", "updated_at", "size_bytes", "quota_bytes"],
-            "The database at the version read (at most 5 s stale). `levels` lists segments by level, shallowest \
-            first; `size_bytes` (blobs included) counts against `quota_bytes`."),
+            "Database statistics at the read version (at most 5 s stale). `levels` lists segments by level from shallowest \
+            to deepest; `size_bytes` (including blobs) is counted against `quota_bytes`."),
         "DbInfo": obj_desc(json!({
             "id": s(), "name": s(), "org": nullable("string"), "role": r("Role"), "created_at": i(), "stats": r("DbStats"),
-        }), &["id", "name", "org", "role", "created_at", "stats"], "`role` is what you may do here: readers read, \
-            writers also write, admins also delete the database."),
+        }), &["id", "name", "org", "role", "created_at", "stats"], "`role` specifies the caller's permissions: `reader` allows reads, \
+            `writer` adds writes, and `admin` or `owner` adds database deletion."),
         "BlobMeta": obj_desc(json!({"blob_id": s(), "size": i(), "sha256": s(), "content_type": s()}),
-            &["blob_id", "size", "sha256", "content_type"], "An out-of-band blob."),
+            &["blob_id", "size", "sha256", "content_type"], "Out-of-band blob metadata."),
         "KvItem": obj_desc(json!({
             "key": s(), "key_b64": s(), "value": s(), "value_b64": s(), "blob": r("BlobMeta"),
             "version": nullable("integer"), "expires_at": i(),
-        }), &["version"], "A key and its value. Keys/values that are not valid UTF-8 in utf8 mode are \
-            returned in `key_b64` / `value_b64`. Values stored as blobs larger than the inline JSON limit \
-            only carry `blob`. A value written with a time to live has `expires_at` (cluster time, ms), \
-            unless the transaction reading it wrote it itself."),
+        }), &["version"], "Key-value entry. Keys and values that are not valid UTF-8 in `utf8` mode are \
+            returned in `key_b64` and `value_b64`. Values stored as blobs larger than the inline JSON limit \
+            include only `blob`. An entry with a TTL includes `expires_at` (cluster time in ms) once committed."),
         "ScanResult": obj(json!({"items": arr(r("KvItem")), "next_cursor": nullable("string"), "version": i()}),
             &["items", "next_cursor"]),
         "OpResult": obj_desc(json!({
@@ -281,8 +279,8 @@ fn schemas() -> Value {
             "row": r("Row"), "rows": arr(r("Row")), "expires_at": i(), "count": i(),
             "records": arr(r("StreamRecord")), "first_seq": i(), "next_seq": i(), "done": b(), "seq": i(),
             "bytes": i(), "first_time": i(), "last_time": i(),
-        }), &[], "Result of one op; the fields present depend on the op (see Op). An `append` reports \
-            `first_seq` once the transaction commits."),
+        }), &[], "Result of a transaction operation; populated fields depend on the operation type (see `Op`). \
+            An `append` operation reports `first_seq` when the transaction is committed."),
         "Op": {
             "oneOf": [
                 obj(json!({"op": {"const": "get"}, "key": s()}), &["op", "key"]),
@@ -320,14 +318,15 @@ fn schemas() -> Value {
                 obj(json!({"op": {"const": "set_consumer"}, "stream": s(), "consumer": s(), "seq": i()}),
                     &["op", "stream", "consumer", "seq"]),
             ],
-            "description": "One operation. Keys and values are UTF-8 strings unless the request sets `encoding: base64`. \
-                `ttl_ms` makes a value or row expire that long after the write commits; an update keeps a row's \
-                expiry unless it sets one. `update_rows` and `delete_rows` change every row `where` selects \
-                (at most `limit`), all within the transaction's write limit, and return `count`. Stream ops: \
-                `append` gets its seqs at commit (`expect_seq` fails the transaction with 412 unless the stream's \
-                next seq is still that); `read_stream` conflicts with appends only if it reached the stream's \
-                end, and sees the transaction's own trims but not its appends; `stream_info` conflicts with \
-                every append; `set_consumer` takes a seq at most the stream's next.",
+            "description": "Transaction operation. Keys and values are UTF-8 strings unless `encoding: base64` is set. \
+                `ttl_ms` sets the entry or row expiration relative to the commit timestamp; row updates preserve \
+                existing expiration unless `ttl_ms` is specified. `update_rows` and `delete_rows` modify all rows \
+                matching `where` (up to `limit`) within the transaction write limit and return `count`. For stream \
+                operations: `append` assigns sequence numbers at commit (`expect_seq` aborts the transaction with \
+                412 if the stream's next sequence number does not match); `read_stream` conflicts with concurrent \
+                appends only when the read reaches the end of the stream, and observes earlier trims in the same \
+                transaction but not uncommitted appends; `stream_info` conflicts with concurrent appends; \
+                `set_consumer` requires `seq` to be at most the stream's `next_seq`.",
         },
         "TxnRequest": obj(json!({
             "ops": arr(r("Op")),
@@ -341,7 +340,7 @@ fn schemas() -> Value {
             "version": i(), "committed": b(), "replayed": b(), "commit_id": s(),
             "results": {"oneOf": [arr(r("OpResult")), {"type": "null"}]},
             "appends": arr(i()),
-        }), &["version", "committed", "results"], "`appends`: the first seq each append received, in order."),
+        }), &["version", "committed", "results"], "`appends` lists the starting sequence number assigned to each `append` operation in order."),
         "BeginRequest": obj_desc(json!({"isolation": enum_of(&["serializable", "snapshot"]),
             "encoding": enum_of(&["utf8", "base64"]), "ops": arr(r("Op"))}), &[],
             "Optional operations to execute in the new transaction."),
@@ -372,10 +371,10 @@ fn schemas() -> Value {
         "TableSchema": obj(json!({"name": s(), "columns": arr(r("Column")), "primary_key": arr(s()),
             "indexes": arr(r("IndexInfo")), "version": i()}), &["name", "columns", "primary_key", "indexes"]),
         "Row": {"type": "object", "additionalProperties": true,
-            "description": "Column name to value. `bytes` are base64; `blob` columns take a staged `blob_id` \
-                on write and return BlobMeta on read."},
+            "description": "Map of column names to values. `bytes` columns use base64; `blob` columns accept a staged \
+                `blob_id` on write and return `BlobMeta` on read."},
         "Filter": filter_schema("Filter", vec![comparison("col", s())],
-            "A row filter: `and`, `or` or `not` of filters, or a comparison of the column `col`."),
+            "Row filter expression composed of `and`, `or`, `not`, or a comparison on column `col`."),
         "Query": obj_desc(json!({
             "index": s(), "eq": arr(any()),
             "range": obj(json!({"gt": any(), "gte": any(), "lt": any(), "lte": any()}), &[]),
@@ -384,24 +383,24 @@ fn schemas() -> Value {
             "reverse": b(), "cursor": s(),
             "consistency": enum_of(&["strong", "snapshot"]),
             "max_staleness_ms": i(),
-        }), &[], "Scan the primary key (default) or a secondary index: equality on a prefix of its columns \
-            (`eq`), an optional range on the next column, a residual filter, and pagination via `cursor`."),
+        }), &[], "Scans the primary key (default) or a secondary index (`index`) using an equality prefix (`eq`), \
+            an optional range bound on the next column, a residual `filter`, and pagination via `cursor`."),
         "Selection": obj_desc(json!({
             "index": s(), "eq": arr(any()),
             "range": obj(json!({"gt": any(), "gte": any(), "lt": any(), "lte": any()}), &[]),
             "filter": r("Filter"),
-        }), &[], "Rows to change, selected like a query: the primary key or an index (`index`), equality on a \
-            prefix of its columns (`eq`), a range on the next column and a residual filter. `{}` selects every row."),
+        }), &[], "Selects rows to modify using the primary key or a secondary index (`index`), an equality prefix \
+            (`eq`), a range bound on the next column, and a residual `filter`. `{}` selects all rows."),
         "InsertRows": obj(json!({"row": r("Row"), "rows": arr(r("Row")), "upsert": b(), "ttl_ms": ttl()}), &[]),
         "RowCount": obj(json!({"count": i(), "version": i()}), &["count", "version"]),
         "PkRequest": obj(json!({"pk": any(), "consistency": s(), "max_staleness_ms": i()}), &["pk"]),
         "UpdateRows": obj_desc(json!({"pk": any(), "where": r("Selection"), "limit": {"type": "integer", "minimum": 1},
             "set": r("Row"), "ttl_ms": ttl()}), &["set"],
-            "Exactly one of `pk` (one row; answers `found`) or `where` (every row it selects, at most `limit`; \
-            answers `count`). A row keeps its expiry unless `ttl_ms` sets one."),
+            "Specify either `pk` (updates a single row and returns `found`) or `where` (updates matching rows up to \
+            `limit` and returns `count`). Existing row expiration is preserved unless `ttl_ms` is set."),
         "DeleteRows": obj_desc(json!({"pk": any(), "where": r("Selection"), "limit": {"type": "integer", "minimum": 1}}),
-            &[], "Exactly one of `pk` (one row; answers `found`) or `where` (every row it selects, at most \
-            `limit`; answers `count`)."),
+            &[], "Specify either `pk` (deletes a single row and returns `found`) or `where` (deletes matching rows up to \
+            `limit` and returns `count`)."),
         "RowResult": obj(json!({"found": b(), "row": r("Row"), "expires_at": i(), "version": i()}), &["found", "version"]),
         "Found": obj(json!({"found": b(), "version": i()}), &["found", "version"]),
         "FoundOrCount": {"oneOf": [r("Found"), r("RowCount")]},
@@ -409,46 +408,45 @@ fn schemas() -> Value {
             "version": i(), "key": s(), "key_b64": s(), "value": s(), "value_b64": s(), "blob": r("BlobMeta"),
             "expires_at": i(), "deleted": {"const": true},
             "deleted_range": obj(json!({"start": s(), "start_b64": s(), "end": nullable("string"), "end_b64": s()}), &[]),
-        }), &["version"], "A key's value as of the feed's snapshot (with `expires_at` if it expires), a key \
-            deleted (`deleted`, also once its value expired), or every key in `[start, end)` deleted \
-            (`deleted_range`; `end: null` is the end of the keyspace)."),
+        }), &["version"], "Key change entry as of the feed snapshot: either a live key-value entry (with `expires_at` if set), \
+            a point deletion (`deleted: true`, including expired keys), or a range deletion over `[start, end)` \
+            (`deleted_range`, where `end: null` denotes the end of the keyspace)."),
         "KvChanges": obj(json!({"changes": arr(r("KvChange")), "more": b(), "next_cursor": s(), "version": i()}),
             &["changes", "more", "next_cursor", "version"]),
         "RowChange": obj_desc(json!({
             "version": i(), "pk": arr(any()), "row": r("Row"), "expires_at": i(), "deleted": {"const": true},
             "deleted_range": {"const": true},
-        }), &["version"], "A row as of the feed's snapshot, or its primary key and `deleted`."),
+        }), &["version"], "Row change entry as of the feed snapshot: either a live row, a deleted primary key (`deleted: true`), \
+            or a table truncation (`deleted_range: true`)."),
         "RowChanges": obj(json!({"changes": arr(r("RowChange")), "more": b(), "next_cursor": s(), "version": i()}),
             &["changes", "more", "next_cursor", "version"]),
         "QueryResult": obj(json!({"rows": arr(r("Row")), "next_cursor": nullable("string"), "version": i()}),
             &["rows", "next_cursor", "version"]),
         "Headers": {"type": "object", "additionalProperties": s(),
-            "description": "Header names (1-128 bytes) to values (at most 4 KiB); at most 64."},
+            "description": "Map of header names (1-128 bytes) to values (at most 4 KiB), with at most 64 entries."},
         "NewRecord": obj_desc(json!({"value": s(), "json": any(), "headers": r("Headers")}), &[],
-            "Exactly one of `value` (a string in the request's encoding) and `json` (any JSON value). A record \
-            takes at most 1 MiB."),
+            "Specify either `value` (encoded according to `encoding`) or `json` (any JSON value). Maximum record size is 1 MiB."),
         "StreamRecord": obj_desc(json!({
             "seq": i(), "time": i(), "headers": r("Headers"), "value": s(), "value_b64": s(), "json": any(),
-        }), &["seq", "time"], "`seq` is the record's position; `time` (cluster time, ms) is when its append \
-            committed. Its body is `json`, or `value` (`value_b64` if not UTF-8 in utf8 mode)."),
+        }), &["seq", "time"], "`seq` is the record sequence number; `time` (cluster time in ms) is the commit timestamp \
+            of the append. The payload is returned in `json`, `value`, or `value_b64`."),
         "Consumer": obj_desc(json!({"name": s(), "seq": i(), "lag": i(), "updated_at": i(), "version": i()}),
-            &["name", "seq", "lag", "updated_at"], "A consumer's cursor: the seq it reads from next, and how many \
-            records it has yet to read."),
+            &["name", "seq", "lag", "updated_at"], "Consumer cursor state: `seq` is the next sequence number to read, and `lag` \
+            is the number of unread records (`next_seq - seq`)."),
         "Stream": obj_desc(json!({
             "name": s(), "created_at": i(), "retention_ms": nullable("integer"), "max_bytes": nullable("integer"),
             "first_seq": i(), "next_seq": i(), "bytes": i(), "first_time": i(), "last_time": i(),
             "consumers": arr(r("Consumer")), "consumers_next_cursor": nullable("string"), "version": i(),
         }), &["name", "created_at", "retention_ms", "max_bytes", "first_seq", "next_seq", "bytes"],
-            "Records `first_seq` to `next_seq` (exclusive) are kept: `bytes` of bodies and headers, appended \
-            from `first_time` to `last_time`. Stream info lists the first 100 consumers; \
-            `consumers_next_cursor` continues the listing on the consumers route."),
+            "Stream metadata and state. Retained records span `[first_seq, next_seq)` with total payload and header size \
+            `bytes` and timestamps from `first_time` to `last_time`. `consumers` includes up to 100 consumers, continued via \
+            `consumers_next_cursor`."),
         "CreateStream": obj_desc(json!({
             "name": s(), "retention_ms": {"type": "integer", "minimum": 1}, "max_bytes": {"type": "integer", "minimum": 1},
-        }), &["name"], "Names are 1-128 characters of `[A-Za-z0-9_.:-]`. Records older than `retention_ms`, \
-            or beyond the newest `max_bytes`, may be trimmed; trims run once a stream is a sixteenth past a \
-            limit, and take it back to the limit."),
+        }), &["name"], "Stream names must be 1-128 characters matching `[A-Za-z0-9_.:-]`. Records older than `retention_ms` \
+            or exceeding `max_bytes` are eligible for automatic trimming."),
         "StreamConfig": obj_desc(json!({"retention_ms": nullable("integer"), "max_bytes": nullable("integer")}), &[],
-            "Fields left out keep their value; `null` removes a limit."),
+            "Omitted fields keep their current setting; `null` removes a retention limit."),
         "AppendRequest": obj(json!({
             "records": arr(r("NewRecord")), "expect_seq": i(), "create": b(), "idempotency_key": s(),
             "encoding": enum_of(&["utf8", "base64"]),
@@ -457,15 +455,15 @@ fn schemas() -> Value {
             "first_seq": i(), "next_seq": i(), "count": i(), "time": i(), "version": i(), "commit_id": s(),
             "replayed": b(),
         }), &["first_seq", "next_seq", "count", "time", "version", "commit_id", "replayed"],
-            "The records took seqs `first_seq` to `next_seq` (exclusive), at `time`. A replay (`replayed`) of \
-            an earlier attempt with the same idempotency key reports that attempt's records."),
+            "Appended records were assigned sequence numbers `[first_seq, next_seq)` at commit timestamp `time`. \
+            When `replayed` is true, the response returns the result of an earlier append with the same `idempotency_key`."),
         "StreamFilter": filter_schema("StreamFilter", vec![
             comparison("field", json!({"type": "string", "minLength": 1, "maxLength": 256})),
             comparison("header", json!({"type": "string", "minLength": 1, "maxLength": 128})),
             obj(json!({"op": {"const": "contains"}, "value": s()}), &["op", "value"]),
-        ], "A record filter: `and`, `or` or `not` of filters, or a comparison of a JSON body `field` (a dotted \
-            path; numeric segments index arrays), a `header`, or, naming neither, the body's text, which only \
-            `contains` tests."),
+        ], "Stream record filter composed of `and`, `or`, `not`, a comparison on a JSON body `field` (dot-separated \
+            path where numeric segments index arrays) or `header`, or a `{ \"op\": \"contains\", \"value\": \"...\" }` \
+            substring match on the raw record body."),
         "StreamRead": obj_desc(json!({
             "from_seq": i(), "from_time": i(), "tail": i(), "consumer": s(), "until_seq": i(), "until_time": i(),
             "reverse": b(), "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
@@ -473,20 +471,20 @@ fn schemas() -> Value {
             "scan_limit": {"type": "integer", "minimum": 1, "maximum": 100_000},
             "encoding": enum_of(&["utf8", "base64"]), "consistency": enum_of(&["strong", "snapshot"]),
             "max_staleness_ms": i(),
-        }), &[], "Records from at most one of `from_seq`, `from_time` (the first record at or after it), \
-            `tail` (the last N) and `consumer` (its cursor; a new consumer starts at the beginning), up to \
-            `until_seq` or `until_time` (exclusive), oldest first or with `reverse` newest first; at most \
-            `limit` (default 100) records and about `max_bytes` (default 4 MiB, at most 16 MiB). With \
-            `filter`, at most `scan_limit` records (default 10,000) are examined."),
+        }), &[], "Reads records starting from at most one of `from_seq`, `from_time` (first record at or after the timestamp), \
+            `tail` (last N records), or `consumer` (consumer cursor, starting at `first_seq` if unset), up to \
+            `until_seq` or `until_time` (exclusive). Returns records oldest-first (or newest-first when `reverse` is true), \
+            bounded by `limit` (default 100) and `max_bytes` (default 4 MiB, max 16 MiB). When `filter` is set, at most \
+            `scan_limit` records (default 10,000) are scanned."),
         "StreamRecords": obj_desc(json!({
             "records": arr(r("StreamRecord")), "next_seq": i(), "first_seq": i(), "tail_seq": i(), "done": b(),
             "version": i(),
         }), &["records", "next_seq", "first_seq", "tail_seq", "done", "version"],
-            "`next_seq` continues the read: the next `from_seq` of a forward read, the next `until_seq` of a \
-            reverse one. `done`: the read reached its end. `first_seq` and `tail_seq` are the stream's first \
-            and next seqs."),
+            "`next_seq` is the cursor for the next page (`from_seq` for forward reads, or `until_seq` for reverse reads). \
+            `done` is true when the read reached the end of the requested range. `first_seq` and `tail_seq` are the stream's \
+            current `first_seq` and `next_seq`."),
         "Trim": obj(json!({"before_seq": i(), "before_time": i()}), &[]),
-        "SetConsumer": obj_desc(json!({"seq": i()}), &["seq"], "At most the stream's next seq."),
+        "SetConsumer": obj_desc(json!({"seq": i()}), &["seq"], "Must be at most the stream's `next_seq`."),
     })
 }
 
@@ -594,8 +592,8 @@ fn paths() -> Value {
             public: true,
             body: Some(json_body(obj(json!({"email": s()}), &["email"]))),
             desc: Some(
-                "Mails a reset link valid for an hour if an account has this email. The answer does not say \
-                 whether one does. 404 if the server cannot send mail.",
+                "Mails a reset link valid for an hour if an account has this email. The response does not indicate \
+                 whether an account exists. Returns 404 if the server cannot send mail.",
             ),
             ..op("Request a password reset", "auth", vec![("200", resp("Requested", r("Empty")))])
         },
@@ -609,7 +607,9 @@ fn paths() -> Value {
                 json!({"token": s(), "password": {"type": "string", "minLength": 8}}),
                 &["token", "password"],
             ))),
-            desc: Some("Sets the password, verifies the email address and ends every session. The link works once."),
+            desc: Some(
+                "Sets the password, verifies the email address, and revokes all existing sessions. Repeating the request with the same password succeeds idempotently; any other password is rejected.",
+            ),
             ..op("Reset a password", "auth", vec![("200", resp("A new session", r("Session")))])
         },
     );
@@ -621,9 +621,9 @@ fn paths() -> Value {
             body: Some(json!({"required": false, "content": {"application/json": {"schema":
                 obj(json!({"password": s()}), &[])}}})),
             desc: Some(
-                "Deletes the account with its sessions, API keys, memberships and databases (purged after a grace \
-                 period). Accounts with a password confirm it. Refused for the last administrator and for the only \
-                 owner of an organization. Requires a session.",
+                "Deletes the account along with its sessions, API keys, memberships, and databases (purged after a grace \
+                 period). Password-authenticated accounts must confirm their password. Rejected for the last administrator \
+                 or the sole owner of an organization. Requires a session.",
             ),
             ..op("Delete your account", "auth", vec![("200", resp("Deleted", r("Empty")))])
         },
@@ -633,7 +633,7 @@ fn paths() -> Value {
         "post",
         Op {
             body: Some(json_body(r("PasswordChange"))),
-            desc: Some("Ends every other session. Requires a session."),
+            desc: Some("Revokes all other sessions. Requires a session."),
             ..op("Change your password", "auth", vec![("200", resp("Changed", r("Empty")))])
         },
     );
@@ -672,8 +672,8 @@ fn paths() -> Value {
         Op {
             params: vec![path_param("id", "Session id")],
             desc: Some(
-                "`current` says whether it was the session making the request, which is then signed out \
-                (its cookie cleared). Requires a session.",
+                "`current` indicates whether the revoked session was the caller's session (which clears its cookie). \
+                Requires a session.",
             ),
             ..op("Revoke a session", "auth", vec![("200", resp("Revoked", obj(json!({"current": b()}), &["current"])))])
         },
@@ -691,7 +691,7 @@ fn paths() -> Value {
         "post",
         Op {
             body: Some(json_body(r("CreateApiKey"))),
-            desc: Some("Keys may be limited to one database (`db`) and/or be read-only. Requires a session."),
+            desc: Some("Keys may be scoped to a single database (`db`) and/or marked read-only. Requires a session."),
             ..op(
                 "Create an API key",
                 "auth",
@@ -789,7 +789,7 @@ fn paths() -> Value {
         "delete",
         Op {
             params: vec![org()],
-            desc: Some("Owners only, once the organization has no databases."),
+            desc: Some("Requires the owner role and an organization with zero databases."),
             ..op("Delete an organization", "orgs", vec![("200", resp("Deleted", r("Empty")))])
         },
     );
@@ -820,7 +820,7 @@ fn paths() -> Value {
         Op {
             params: member(),
             body: Some(json_body(obj(json!({"role": r("Role")}), &["role"]))),
-            desc: Some("Changes that involve the owner role are for owners. The last owner keeps the role."),
+            desc: Some("Changes that involve the owner role require an owner. The last owner cannot be demoted."),
             ..op("Change a member's role", "orgs", vec![("200", resp("Changed", r("Member")))])
         },
     );
@@ -830,7 +830,7 @@ fn paths() -> Value {
         Op {
             params: member(),
             desc: Some(
-                "Admins remove non-owners, owners anyone; members remove themselves to leave. The last \
+                "Admins remove non-owners, owners remove any member, and members can remove themselves. The last \
                 owner cannot leave.",
             ),
             ..op("Remove a member", "orgs", vec![("200", resp("Removed", r("Empty")))])
@@ -844,8 +844,7 @@ fn paths() -> Value {
         Op {
             params: list_params,
             desc: Some(
-                "An API key limited to one database lists just that database, and cannot list an \
-                organization's.",
+                "An API key scoped to a single database lists only that database and cannot list organization databases.",
             ),
             ..op(
                 "List your or an organization's databases",
@@ -922,7 +921,7 @@ fn paths() -> Value {
                         "200",
                         json!({"description": "The value", "content": octet(), "headers": {
             "ETag": {"schema": s(), "description": "\"<version>\""}, "x-baserunna-version": {"schema": i()},
-            "x-baserunna-expires-at": {"schema": i(), "description": "When the value expires (cluster time, ms), if it does"}}}),
+            "x-baserunna-expires-at": {"schema": i(), "description": "Expiration timestamp (cluster time in ms), if set"}}}),
                     ),
                     ("206", bytes_resp("Partial content (Range)")),
                 ],
@@ -939,7 +938,7 @@ fn paths() -> Value {
                 key(),
                 header("If-Match", "\"<version>\": write only if unchanged"),
                 header("If-None-Match", "*: create only"),
-                query("ttl_ms", ttl(), "Expire the value this long after the write commits"),
+                query("ttl_ms", ttl(), "Expire the value after this duration once the write is committed"),
             ],
             desc: Some("Large bodies are streamed into an out-of-band blob. Content-Type is preserved for blobs."),
             ..op("Write a value from raw bytes", "kv", vec![("200", resp("Written", r("Version")))])
@@ -988,8 +987,8 @@ fn paths() -> Value {
             body: Some(json_body(r("TxnRequest"))),
             params: vec![db()],
             desc: Some(
-                "Ops execute in order with read-your-writes, atomically. Serializable by default; conflicts are \
-            retried server-side. With `idempotency_key`, retries never apply twice (a replay returns \
+                "Operations execute in order with read-your-writes, atomically. Serializable by default; conflicts are \
+            retried server-side. With `idempotency_key`, retries are never applied twice (a replay returns \
             `replayed: true` and null results).",
             ),
             ..op(
@@ -1039,9 +1038,9 @@ fn paths() -> Value {
         Op {
             params: vec![db(), path_param("id", "commit_id (16 hex characters) or key:<idempotency key>")],
             desc: Some(
-                "Fences in-flight attempts first, so the answer is final for commits whose request has ended \
-            (wait at least the commit deadline, about 15 s, after an ambiguous failure). Commits are \
-            remembered for 10 minutes; ask within that.",
+                "Fences in-flight attempts first, so the status is definitive for commits whose request has finished \
+            (wait at least the commit deadline, about 15 s, after an ambiguous failure). Commit records are \
+            retained for 10 minutes.",
             ),
             ..op(
                 "Resolve an ambiguous commit",
@@ -1162,7 +1161,7 @@ fn paths() -> Value {
         Op {
             body: Some(json_body(r("UpdateRows"))),
             params: vec![db(), table()],
-            ..op("Update columns of a row, or of many", "tables", vec![("200", resp("Updated", r("FoundOrCount")))])
+            ..op("Update columns of one or more rows", "tables", vec![("200", resp("Updated", r("FoundOrCount")))])
         },
     );
     add(
@@ -1171,7 +1170,7 @@ fn paths() -> Value {
         Op {
             body: Some(json_body(r("DeleteRows"))),
             params: vec![db(), table()],
-            ..op("Delete a row, or many", "tables", vec![("200", resp("Deleted", r("FoundOrCount")))])
+            ..op("Delete one or more rows", "tables", vec![("200", resp("Deleted", r("FoundOrCount")))])
         },
     );
     add(
@@ -1185,19 +1184,19 @@ fn paths() -> Value {
     );
     let feed = |extra: Vec<Value>| {
         let mut v = vec![
-            query_required("after", s(), "Report changes after this: a version, or a previous `next_cursor`"),
+            query_required("after", s(), "Report changes after this version or `next_cursor`"),
             query("limit", i(), "1..=1000 (default 100)"),
-            query("wait_ms", i(), "0..=20000: wait this long for a change if there is none yet"),
+            query("wait_ms", i(), "0..=20000: wait up to this duration for a change"),
         ];
         v.extend(extra);
         v.extend(consistency());
         v
     };
-    let feed_desc = "For each key changed after `after`, its state as of the feed's snapshot (intermediate values \
-        are not reported), ordered by version. Continue from `next_cursor`, at once while `more` is true. With \
-        `wait_ms`, the request waits for a change if there is none. Deletions are kept at least a transaction \
-        lifetime (5 minutes); a cursor older than the deletions still kept gets `410 cursor_expired`, and the \
-        client should read the current state again and follow on from its `version`.";
+    let feed_desc = "Returns the latest state as of the feed's snapshot for each key modified after `after` \
+        (intermediate states are omitted), ordered by version. Continue from `next_cursor` while `more` is true. \
+        If `wait_ms` is set, waits up to `wait_ms` for new changes. Tombstones are \
+        retained for at least the transaction lifetime (5 minutes); cursors older than the tombstone horizon \
+        fail with `410 cursor_expired`.";
     let mut kv_feed = vec![db()];
     kv_feed.extend(feed(vec![
         query("prefix", s(), "Key prefix"),
@@ -1302,13 +1301,12 @@ fn paths() -> Value {
                 query("expect_seq", i(), "Append only if the stream's next seq is this (else 412)"),
                 query("create", b(), "Create the stream if it does not exist"),
                 query("encoding", enum_of(&["utf8", "base64"]), "Encoding of JSON `value`s"),
-                header("Idempotency-Key", "Retries with the same key apply once (within 10 minutes)"),
+                header("Idempotency-Key", "Retries with the same key are applied once (within 10 minutes)"),
             ],
             desc: Some(
-                "Appends records atomically at the stream's next seqs; concurrent appends never conflict. \
-                 Empty lines of NDJSON and text bodies are skipped, as is a leading byte order mark; a body \
-                 without records appends none (`count` 0). Send NDJSON and text with their content type: \
-                 curl's `--data-binary` alone sends `application/x-www-form-urlencoded`, which is refused.",
+                "Appends records atomically at the stream's next sequence numbers; concurrent appends do not conflict. \
+                 Empty lines in NDJSON and text bodies and any leading UTF-8 BOM are skipped; an empty body \
+                 appends zero records (`count` 0). Send NDJSON and text requests with their matching `Content-Type`.",
             ),
             ..op("Append records", "streams", vec![("200", resp("Appended", r("Appended")))])
         },
@@ -1341,12 +1339,11 @@ fn paths() -> Value {
         Op {
             params: rd,
             desc: Some(
-                "As JSON, a page of records. As NDJSON, a record per line, with the page's `next_seq`, \
-                 `first_seq`, `tail_seq` and `done` in `x-baserunna-*` headers. As server-sent events (forward \
-                 reads only), each record as `id: <seq>` and `data: <record>`, then each later append for up \
-                 to `wait_ms`, with a comment every 15 s while idle; the stream ends at `limit` records, at \
-                 `until_seq` or `until_time`, after `wait_ms`, or when the node shuts down, and resumes after \
-                 `Last-Event-ID`. A read that fails before its first record answers with an error status.",
+                "Returns a page of records as JSON, one record per line as NDJSON (with `next_seq`, `first_seq`, \
+                 `tail_seq`, and `done` in `x-baserunna-*` headers), or a server-sent event stream (forward reads \
+                 only) emitting `id: <seq>` and `data: <record>` for up to `wait_ms` with a keepalive comment \
+                 every 15 s. SSE streams end at `limit`, `until_seq`, `until_time`, `wait_ms`, or node shutdown, \
+                 and resume after `Last-Event-ID`.",
             ),
             ..op(
                 "Read records",
@@ -1368,7 +1365,7 @@ fn paths() -> Value {
         Op {
             body: Some(json_body(r("StreamRead"))),
             params: vec![db(), stream()],
-            desc: Some("A read with a filter; continue from `next_seq` until `done`."),
+            desc: Some("Reads records matching a filter; continue from `next_seq` until `done` is true."),
             ..op("Query records", "streams", vec![("200", resp("Records", r("StreamRecords")))])
         },
     );
@@ -1449,13 +1446,13 @@ pub fn document() -> &'static Value {
             "info": {
                 "title": "Baserunna",
                 "version": env!("CARGO_PKG_VERSION"),
-                "description": "Transactional key-value, table and stream databases on object storage. Authenticate with \
+                "description": "Transactional key-value, table, and stream databases on object storage. Authenticate with \
                     `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the \
                     Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for \
-                    writes). Requests over a rate limit get 429 `rate_limited` with `Retry-After` and were not \
-                    applied; writes that would take a database past its size quota get 507 `quota_exceeded`. Every response \
-                    carries an `x-request-id` header: the client's own (1-64 characters of `[A-Za-z0-9._:-]`) or a \
-                    new one, which the server's logs record on every node the request reaches.",
+                    writes). Requests over a rate limit return 429 `rate_limited` with `Retry-After` and are not \
+                    applied; writes that would exceed a database's size quota return 507 `quota_exceeded`. Every response \
+                    includes an `x-request-id` header containing the client-supplied value (1-64 characters of \
+                    `[A-Za-z0-9._:-]`) or a generated ID recorded in server logs.",
             },
             "servers": [{"url": "/"}],
             "security": [{"bearer": []}],

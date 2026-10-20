@@ -3,168 +3,85 @@
 //! reproduce with `SIM_SEED=<seed> cargo test --test sim <name>`, and debug
 //! with `cargo run --release --example sim_tool -- trace <scenario> <seed>`.
 
-use baserunna::sim::workloads::{chaos_mix, scenario};
+use baserunna::probe::{self, Probe};
+use baserunna::sim::workloads::scenario;
 use baserunna::sim::{SimConfig, run, run_seeds};
 
-fn run_scenario(name: &str, base: u64, seeds: u64) {
-    let s = scenario(name).expect("scenario exists");
-    run_seeds(name, base, seeds, s.config, s.run);
+/// Generates a test function per scenario and verifies that all scenarios are covered.
+macro_rules! scenario_tests {
+    ($($test:ident: $name:literal, $base:literal, $seeds:literal;)*) => {
+        $(
+            #[test]
+            fn $test() {
+                run_seeds(&scenario($name).expect("scenario exists"), $base, $seeds);
+            }
+        )*
+
+        #[test]
+        fn every_scenario_has_a_test() {
+            let tested = [$($name),*];
+            for s in baserunna::sim::workloads::scenarios() {
+                assert!(tested.contains(&s.name), "scenario {} is not tested", s.name);
+            }
+        }
+    };
 }
 
-#[test]
-fn sim_kv_model_single_node() {
-    run_scenario("kv_single_node", 1, 2);
+scenario_tests! {
+    sim_kv_model: "kv_model", 1, 4;
+    sim_history: "history", 23, 4;
+    sim_bank: "bank", 3, 4;
+    sim_register: "register", 4, 4;
+    sim_tables: "tables", 5, 3;
+    sim_blobs: "blobs", 6, 3;
+    sim_auth: "auth", 7, 2;
+    sim_lifecycle: "lifecycle", 8, 3;
+    sim_console: "console", 10, 2;
+    sim_mix: "mix", 9, 4;
+    sim_limits: "limits", 17, 2;
+    sim_api_tour: "api_tour", 11, 2;
+    sim_schema_race: "schema_race", 12, 3;
+    sim_abandoned: "abandoned", 13, 3;
+    sim_blob_gc_race: "blob_gc_race", 14, 2;
+    sim_db_churn: "db_churn", 15, 2;
+    sim_ttl: "ttl", 18, 3;
+    sim_watch: "watch", 19, 3;
+    sim_streams: "streams", 22, 3;
+    sim_orgs: "orgs", 20, 2;
+    sim_accounts: "accounts", 21, 2;
 }
 
+/// Verifies that a branched run matches its parent up to the branch point and
+/// diverges deterministically afterward (SPEC §13.1).
 #[test]
-fn sim_kv_model_faulty_cluster() {
-    run_scenario("kv_faulty_cluster", 2, 2);
-}
-
-#[test]
-fn sim_bank_serializability() {
-    run_scenario("bank", 3, 2);
-}
-
-#[test]
-fn sim_register_linearizability() {
-    run_scenario("register", 4, 2);
-}
-
-#[test]
-fn sim_register_contended() {
-    run_scenario("register_contended", 22, 4);
-}
-
-#[test]
-fn sim_tables_and_indexes() {
-    run_scenario("tables", 5, 2);
-}
-
-#[test]
-fn sim_blobs_and_gc() {
-    run_scenario("blobs", 6, 2);
-}
-
-#[test]
-fn sim_auth() {
-    run_scenario("auth", 7, 2);
-}
-
-#[test]
-fn sim_lifecycle() {
-    run_scenario("lifecycle", 8, 2);
-}
-
-#[test]
-fn sim_console() {
-    run_scenario("console", 10, 2);
-}
-
-#[test]
-fn sim_rate_limits() {
-    run_scenario("limits", 17, 2);
-}
-
-#[test]
-fn sim_chaos_mix() {
-    run_scenario("chaos", 9, 1);
-}
-
-#[test]
-fn sim_schema_changes_race_row_writes() {
-    run_scenario("schema_race", 12, 2);
-}
-
-#[test]
-fn sim_abandoned_interactive_transactions() {
-    run_scenario("abandoned", 13, 2);
-}
-
-#[test]
-fn sim_blob_reads_race_gc() {
-    run_scenario("blob_gc_race", 14, 2);
-}
-
-#[test]
-fn sim_many_db_churn() {
-    run_scenario("db_churn", 15, 1);
-}
-
-#[test]
-fn sim_ttl_expiry() {
-    run_scenario("ttl", 18, 2);
-}
-
-#[test]
-fn sim_watch_change_feeds() {
-    run_scenario("watch", 19, 2);
-}
-
-#[test]
-fn sim_streams() {
-    run_scenario("streams", 22, 2);
-}
-
-#[test]
-fn sim_organization_roles() {
-    run_scenario("orgs", 20, 2);
-}
-
-#[test]
-fn sim_account_self_service() {
-    run_scenario("accounts", 21, 2);
-}
-
-/// Every workload again under [`SimConfig::hostile`].
-#[test]
-fn sim_hostile() {
-    for name in [
-        "kv_hostile",
-        "bank_hostile",
-        "register_hostile",
-        "register_contended_hostile",
-        "tables_hostile",
-        "blobs_hostile",
-        "lifecycle_hostile",
-        "schema_race_hostile",
-        "abandoned_hostile",
-        "blob_gc_race_hostile",
-        "db_churn_hostile",
-        "chaos_hostile",
-        "ttl_hostile",
-        "watch_hostile",
-        "streams_hostile",
-        "orgs_hostile",
-        "accounts_hostile",
-    ] {
-        run_scenario(name, 16, 1);
-    }
-}
-
-#[test]
-fn sim_hostile_is_deterministic() {
-    let s = scenario("chaos_hostile").expect("scenario exists");
-    let a = run(4243, (s.config)(), s.run);
-    let b = run(4243, (s.config)(), s.run);
-    assert!(a.result.is_ok(), "{:?}", a.result);
-    assert_eq!((a.trace_hash, a.events), (b.trace_hash, b.events), "same seed, different trace");
+fn branched_runs_repeat_their_parent_until_the_branch_point() {
+    let s = scenario("history").expect("scenario exists");
+    let run_at = |branches: Vec<(u64, u64)>| {
+        let mut cfg = s.config_for(7);
+        cfg.branches = branches;
+        let out = run(7, cfg, s.run);
+        assert!(out.result.is_ok(), "{:?}", out.result);
+        (out.trace_hash, out.knobs)
+    };
+    let (parent, knobs) = run_at(vec![]);
+    let (late, _) = run_at(vec![(u64::MAX / 2, 0xabc)]);
+    assert_eq!(late, parent);
+    let (early, early_knobs) = run_at(vec![(1, 0xabc)]);
+    assert_ne!(early, parent);
+    assert_eq!(early_knobs, knobs);
+    assert_eq!(run_at(vec![(1, 0xabc)]).0, early);
 }
 
 #[test]
 fn sim_is_deterministic() {
+    let s = scenario("mix").expect("scenario exists");
     let seed = baserunna::util::prop::env_u64("SIM_SEED").unwrap_or(4242);
-    let a = run(seed, SimConfig::faulty(3), |sim| chaos_mix(sim, 1));
-    let b = run(seed, SimConfig::faulty(3), |sim| chaos_mix(sim, 1));
+    let a = run(seed, s.config_for(seed), s.run);
+    let b = run(seed, s.config_for(seed), s.run);
     assert!(a.result.is_ok(), "{:?}", a.result);
     assert_eq!((a.trace_hash, a.events), (b.trace_hash, b.events), "same seed, different trace");
-    let c = run(seed + 1, SimConfig::faulty(3), |sim| chaos_mix(sim, 1));
+    let c = run(seed + 1, s.config_for(seed + 1), s.run);
     assert_ne!(a.trace_hash, c.trace_hash, "different seeds should diverge");
-}
-
-#[test]
-fn sim_api_tour() {
-    run_scenario("api_tour", 11, 2);
 }
 
 /// Verifies that the end-of-run storage invariant check detects missing objects.
@@ -404,7 +321,7 @@ fn store_clock_lease_expiry() {
         for db in ["old", "recent"] {
             owner.create_db(db).await?;
         }
-        let expired_before = sim.engine_activity().expired_leases;
+        let expired_before = probe::count(Probe::ExpiredLeaseByStoreClock);
         assert_eq!(put(client_on(0, "a"), "old").await, 200);
         let lease_ms = sim.cfg.engine.lease_ms;
         sim.sleep(3 * lease_ms + 2_000).await;
@@ -412,7 +329,7 @@ fn store_clock_lease_expiry() {
         sim.crash(0);
         assert_eq!(put(client_on(1, "c"), "recent").await, 503);
         assert_eq!(put(client_on(1, "d"), "old").await, 200);
-        assert!(sim.engine_activity().expired_leases > expired_before);
+        assert!(probe::count(Probe::ExpiredLeaseByStoreClock) > expired_before);
         Ok(())
     });
     out.result.unwrap();
@@ -440,7 +357,7 @@ fn request_and_commit_log_timing() {
         .find(|r| {
             r["msg"] == "commit" && r["request_ids"].as_array().is_some_and(|ids| ids.iter().any(|i| i == "put-1"))
         })
-        .expect("commit record naming the request");
+        .expect("commit record for put-1");
     assert!(commit["txns"].as_u64() >= Some(1), "{commit}");
     assert!(commit["store"]["manifest.put"]["n"].as_u64() >= Some(1), "{commit}");
     assert!(commit["store"]["manifest.put"]["bytes"].as_u64() > Some(0), "{commit}");
@@ -494,18 +411,17 @@ fn request_ids_follow_forwarded_requests() {
     for i in 0..12 {
         let rid = format!("client-{i}");
         let seen = ids(&rid);
-        assert!(!seen.is_empty(), "no log record for {rid}");
+        assert!(!seen.is_empty(), "{rid}");
         for r in seen.iter().filter(|r| r["forwarded_to"].is_string()) {
             forwarded += 1;
             assert!(
                 seen.iter().any(|t| t["node"] == r["forwarded_to"] && t["hops"] == 1 && t["status"] == r["status"]),
-                "the forward of {rid} was not logged under its id: {seen:?}"
+                "{rid}: {seen:?}"
             );
             assert_eq!(r["route"], "/v1/dbs/{db}/kv/{*key}");
         }
     }
-    assert!(forwarded > 0, "no request was forwarded: {requests:?}");
-    // Forwarded metadata commands on the system database's lease holder are logged under the caller's request ID.
+    assert!(forwarded > 0, "{requests:?}");
     let creates: Vec<_> = requests.iter().filter(|r| r["route"] == "/v1/dbs" && r["method"] == "POST").collect();
     let relayed = creates
         .iter()
@@ -515,5 +431,5 @@ fn request_ids_follow_forwarded_requests() {
             })
         })
         .count();
-    assert!(relayed > 0, "no forwarded metadata command carried its request's id: {creates:?}");
+    assert!(relayed > 0, "{creates:?}");
 }

@@ -1,0 +1,14 @@
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 480f3f1..966f585 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -95,7 +95,8 @@ impl Shared {
+ 
+     /// Returns the local instant when this node first observed the lease renewal at
+     /// `write_seq` for `db`.
+-    pub(crate) fn lease_seen(&self, db: &str, lease: &manifest::Lease, write_seq: u64) -> tokio::time::Instant {
++    pub(crate) fn lease_seen(&self, db: &str, lease: &manifest::Lease, _write_seq: u64) -> tokio::time::Instant {
++        let write_seq = lease.expires_ms;
+         let now = tokio::time::Instant::now();
+         let mut g = self.observed_leases.lock().unwrap_or_else(|e| e.into_inner());
+         if let Some((node, ws, seen)) = g.get(db)

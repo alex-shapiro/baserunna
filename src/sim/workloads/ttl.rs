@@ -1,18 +1,15 @@
-//! `ttl`: values and rows with times to live, under faults.
+//! `ttl`: verifies key-value and row TTL expiration and distributed lock
+//! renewal under faults.
 //!
-//! Each client owns a database and knows when every value it wrote
-//! expires, to within the uncertainty of its commit's time: between the
-//! request's start and its response, widened by the error the nodes'
-//! measurements of the store's clock may have. Reads must see a value
-//! until then and never after, and never a value it replaced. Rows behave
-//! the same way, and a unique value is taken exactly while its row lives.
+//! Each client tracks the expiration window `[t0 + ttl - eps, t1 + ttl + eps]`
+//! for every value and row it writes, where `[t0, t1]` is the commit request
+//! interval and `eps` bounds clock error. Reads must observe a value before
+//! its window and must not observe it after.
 //!
-//! Clients also take turns holding a lock: an expiring value that a
-//! serializable transaction writes only if it finds none, and that its
-//! holder renews just before it expires. Ordered by version, every
-//! acquisition must have committed no earlier than the previous lock
-//! expired, and every renewal before the lock it read did, which the
-//! lock's own expiries tell exactly.
+//! Clients also contend on a TTL-backed lock key, renewing it before expiration.
+//! In version order, each acquisition must be committed at or after the previous
+//! lock's expiration, and each renewal must be committed before the lock it read
+//! expired.
 
 use super::super::Sim;
 use super::super::client::{Client, ZOMBIE_WAIT_MS, url_escape};
@@ -21,13 +18,22 @@ use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-/// Expected state of a value: its data, commit version, and expiry window in
+/// Expected state of a value: data, commit version, and expiration window in
 /// simulation milliseconds.
 #[derive(Clone, Debug)]
 struct Val {
     data: String,
     version: u64,
     expires: Option<(u64, u64)>,
+    /// True when the commit record expired before retries finished, leaving
+    /// the write outcome unknown until the next definitive write or `expires`.
+    uncertain: bool,
+}
+
+impl Val {
+    fn uncertain() -> Val {
+        Val { data: String::new(), version: 0, expires: None, uncertain: true }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -40,10 +46,11 @@ enum Seen {
 /// Expected visibility of `v` for a read spanning `[r0, r1]`.
 fn expect(v: Option<&Val>, r0: u64, r1: u64, eps: u64) -> Seen {
     match v.map(|v| v.expires) {
+        Some(Some((_, hi))) if r0.saturating_sub(eps) >= hi => Seen::Absent,
+        _ if v.is_some_and(|v| v.uncertain) => Seen::Either,
         None => Seen::Absent,
         Some(None) => Seen::Present,
         Some(Some((lo, _))) if r1 + eps < lo => Seen::Present,
-        Some(Some((_, hi))) if r0.saturating_sub(eps) >= hi => Seen::Absent,
         Some(Some(_)) => Seen::Either,
     }
 }
@@ -57,6 +64,9 @@ fn check_read(
     eps: u64,
 ) -> Result<(), String> {
     let seen = expect(v, r0, r1, eps);
+    if v.is_some_and(|v| v.uncertain) && seen == Seen::Either {
+        return Ok(());
+    }
     match (got, v) {
         (None, _) if seen != Seen::Present => Ok(()),
         (Some((data, version, expires)), Some(m)) if seen != Seen::Absent => {
@@ -98,17 +108,27 @@ impl Owner {
         (!self.rng.chance(0.3)).then(|| 200 + self.rng.below(4_000))
     }
 
-    /// Commits `ops` with an idempotency key and returns the response along
-    /// with the timestamp when the first attempt started.
-    async fn commit(&mut self, ops: Json) -> Result<(super::super::client::Resp, u64), String> {
+    /// Commits `ops` with an idempotency key and returns the response and start
+    /// timestamp, or `None` if the commit retention window elapsed before a
+    /// definitive response was received.
+    async fn commit(&mut self, ops: Json) -> Result<Option<(super::super::client::Resp, u64)>, String> {
         self.step += 1;
         let body = json!({"ops": ops, "idempotency_key": format!("{}-{}", self.c.name, self.step)});
         let t0 = self.c.sim.now_ms();
+        let mut ambiguous = false;
         loop {
+            if ambiguous && !self.c.dedups(t0) {
+                return Ok(None);
+            }
             match self.c.call("POST", &self.path("/txn"), Some(body.clone())).await {
                 Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => self.c.pause(50).await,
-                Ok(r) if r.status == 200 || (400..500).contains(&r.status) && r.status != 429 => return Ok((r, t0)),
-                _ => self.c.pause(ZOMBIE_WAIT_MS).await,
+                Ok(r) if r.status == 200 || (400..500).contains(&r.status) && r.status != 429 => {
+                    return Ok(Some((r, t0)));
+                }
+                _ => {
+                    ambiguous = true;
+                    self.c.pause(ZOMBIE_WAIT_MS).await;
+                }
             }
         }
     }
@@ -121,19 +141,25 @@ impl Owner {
         if let Some(t) = ttl {
             op["ttl_ms"] = json!(t);
         }
-        let (r, t0) = self.commit(json!([op])).await?;
+        let Some((r, t0)) = self.commit(json!([op])).await? else {
+            self.model.insert(k, Val::uncertain());
+            return Ok(());
+        };
         if r.status != 200 {
             return Err(format!("put: {} {}", r.status, r.json));
         }
-        let (t1, version) = (self.c.sim.now_ms(), r.json["version"].as_u64().ok_or("no version")?);
+        let (t1, version) = (self.c.sim.now_ms(), r.json["version"].as_u64().ok_or("missing version")?);
         let expires = ttl.map(|t| (t0 + t - self.eps, t1 + t + self.eps));
-        self.model.insert(k, Val { data, version, expires });
+        self.model.insert(k, Val { data, version, expires, uncertain: false });
         Ok(())
     }
 
     async fn delete(&mut self) -> Result<(), String> {
         let k = KEYS[self.rng.usize(KEYS.len())].to_string();
-        let (r, _) = self.commit(json!([{"op": "delete", "key": k}])).await?;
+        let Some((r, _)) = self.commit(json!([{"op": "delete", "key": k}])).await? else {
+            self.model.insert(k, Val::uncertain());
+            return Ok(());
+        };
         if r.status != 200 {
             return Err(format!("delete: {} {}", r.status, r.json));
         }
@@ -163,7 +189,7 @@ impl Owner {
 
     async fn scan(&mut self) -> Result<(), String> {
         let Some((j, r0, r1)) = self.read(json!([{"op": "scan", "prefix": "k/"}])).await? else { return Ok(()) };
-        let items = j["results"][0]["items"].as_array().ok_or("no items")?;
+        let items = j["results"][0]["items"].as_array().ok_or("missing items")?;
         let got: BTreeMap<&str, &Json> = items.iter().map(|it| (it["key"].as_str().unwrap_or_default(), it)).collect();
         for k in KEYS {
             let it = got.get(k).map(|g| {
@@ -193,30 +219,42 @@ impl Owner {
         check_read(&format!("raw get {k}"), self.model.get(k), got, r0, r1, self.eps)
     }
 
-    /// Inserts a row with a unique token, verifying it is rejected only while
-    /// another live row holds that token.
+    /// Inserts a row with a unique token and verifies that it is rejected only
+    /// while another non-expired row holds that token.
     async fn insert_row(&mut self) -> Result<(), String> {
         let id = self.step as i64;
         let token = TOKENS[self.rng.usize(TOKENS.len())].to_string();
         let ttl = 200 + self.rng.below(3_000);
-        let holder = self.rows.iter().find(|(_, (t, _))| *t == token).map(|(id, (_, v))| (*id, v.clone()));
+        let holders: Vec<(i64, Val)> =
+            self.rows.iter().filter(|(_, (t, _))| *t == token).map(|(id, (_, v))| (*id, v.clone())).collect();
         let op = json!({"op": "insert_row", "table": "sess", "row": {"id": id, "token": token}, "ttl_ms": ttl});
-        let (r, t0) = self.commit(json!([op])).await?;
+        let Some((r, t0)) = self.commit(json!([op])).await? else {
+            let max_expiry = self.c.sim.now_ms() + ttl + self.eps;
+            self.rows.insert(id, (token, Val { expires: Some((0, max_expiry)), ..Val::uncertain() }));
+            return Ok(());
+        };
         let t1 = self.c.sim.now_ms();
-        let seen = expect(holder.as_ref().map(|h| &h.1), t0, t1, self.eps);
+        let seen =
+            holders.iter().map(|(_, v)| expect(Some(v), t0, t1, self.eps)).fold(Seen::Absent, |a, b| match (a, b) {
+                (Seen::Present, _) | (_, Seen::Present) => Seen::Present,
+                (Seen::Either, _) | (_, Seen::Either) => Seen::Either,
+                _ => Seen::Absent,
+            });
         match (r.status, seen) {
             (200, Seen::Absent | Seen::Either) => {
-                if let Some((old, _)) = holder {
-                    self.rows.remove(&old);
-                }
-                let version = r.json["version"].as_u64().ok_or("no version")?;
-                let val =
-                    Val { data: token.clone(), version, expires: Some((t0 + ttl - self.eps, t1 + ttl + self.eps)) };
+                self.rows.retain(|_, (t, _)| *t != token);
+                let version = r.json["version"].as_u64().ok_or("missing version")?;
+                let val = Val {
+                    data: token.clone(),
+                    version,
+                    expires: Some((t0 + ttl - self.eps, t1 + ttl + self.eps)),
+                    uncertain: false,
+                };
                 self.rows.insert(id, (token, val));
                 Ok(())
             }
             (409, Seen::Present | Seen::Either) => Ok(()),
-            (s, seen) => Err(format!("insert {token}: {s} {}, holder {holder:?} ({seen:?})", r.json)),
+            (s, seen) => Err(format!("insert {token}: {s} {}, holders {holders:?} ({seen:?})", r.json)),
         }
     }
 
@@ -238,11 +276,10 @@ impl Owner {
         let ops: Vec<Json> = (0..30)
             .map(|i| json!({"op": "put", "key": format!("b/{}/{i:02}", self.step), "value": "x".repeat(150), "ttl_ms": ttl}))
             .collect();
-        let (r, _) = self.commit(Json::Array(ops)).await?;
-        if r.status != 200 {
-            return Err(format!("bulk: {} {}", r.status, r.json));
+        match self.commit(Json::Array(ops)).await? {
+            Some((r, _)) if r.status != 200 => Err(format!("bulk: {} {}", r.status, r.json)),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     async fn step(&mut self) -> Result<(), String> {
@@ -273,9 +310,10 @@ impl Owner {
         let r = self.c.call_retry("GET", &self.path("/kv?prefix=k/&limit=100"), None).await;
         let keys: Vec<&str> =
             r.json["items"].as_array().into_iter().flatten().filter_map(|it| it["key"].as_str()).collect();
-        let want: Vec<&str> = self.model.keys().map(|k| k.as_str()).collect();
-        if keys != want {
-            return Err(format!("after every expiry: keys {keys:?}, want {want:?}"));
+        let sure: Vec<&str> = self.model.iter().filter(|(_, v)| !v.uncertain).map(|(k, _)| k.as_str()).collect();
+        let explained = |k: &&str| self.model.contains_key(*k);
+        if !sure.iter().all(|k| keys.contains(k)) || !keys.iter().all(explained) {
+            return Err(format!("after every expiry: keys {keys:?}, want {sure:?}"));
         }
         let q = self.c.call_retry("POST", &self.path("/tables/sess/rows/query"), Some(json!({}))).await;
         if q.json["rows"].as_array().is_none_or(|r| !r.is_empty()) {
@@ -301,12 +339,16 @@ struct LockWrite {
 
 const LOCK_TTL_MS: u64 = 1_500;
 
-async fn lock_txn(c: &Client, ops: Json, key: &str) -> Result<Option<(u64, Json)>, String> {
+/// Commits `ops` with idempotency key `key`, retrying until it is committed
+/// or fails a check (`Err` with the check's op index).
+async fn lock_txn(c: &Client, ops: Json, key: &str) -> Result<Result<(u64, Json), u64>, String> {
     let body = json!({"ops": ops, "idempotency_key": key});
     loop {
         match c.call("POST", "/v1/dbs/locks/txn", Some(body.clone())).await {
-            Ok(r) if r.status == 200 => return Ok(Some((r.json["version"].as_u64().ok_or("no version")?, r.json))),
-            Ok(r) if r.status == 412 => return Ok(None),
+            Ok(r) if r.status == 200 => return Ok(Ok((r.json["version"].as_u64().ok_or("missing version")?, r.json))),
+            Ok(r) if r.status == 412 => {
+                return Ok(Err(r.json["error"]["details"]["op_index"].as_u64().unwrap_or(u64::MAX)));
+            }
             Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => c.pause(30).await,
             Ok(r) if r.status != 503 && r.status != 429 => return Err(format!("lock: {} {}", r.status, r.json)),
             _ => c.pause(ZOMBIE_WAIT_MS).await,
@@ -326,12 +368,22 @@ async fn lock_expiry(c: &Client, version: u64) -> Option<u64> {
 
 /// Acquires the lock if free and attempts to renew it near its expiry.
 async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Result<(), String> {
+    let held = format!("held/{me}");
     let acquire = json!([
+        {"op": "check", "key": held, "exists": false},
         {"op": "check", "key": "lock", "exists": false},
         {"op": "put", "key": "lock", "value": me, "ttl_ms": LOCK_TTL_MS},
+        {"op": "put", "key": held, "value": ""},
         {"op": "increment", "key": "taken"},
     ]);
-    let Some((version, _)) = lock_txn(c, acquire, me).await? else { return Ok(()) };
+    let version = match lock_txn(c, acquire, me).await? {
+        Ok((version, _)) => version,
+        Err(0) => {
+            let r = c.call_retry("POST", "/v1/dbs/locks/txn", Some(json!({"ops": [{"op": "get", "key": held}]}))).await;
+            r.json["results"][0]["version"].as_u64().ok_or_else(|| format!("{held}: {}", r.json))?
+        }
+        Err(_) => return Ok(()),
+    };
     let expires = lock_expiry(c, version).await;
     out.lock().unwrap_or_else(|e| e.into_inner()).push(LockWrite { version, expires, renewal: None });
     let d = LOCK_TTL_MS - 400 + c.rng().below(500);
@@ -341,7 +393,7 @@ async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Re
         {"op": "check", "key": "lock", "value": me},
         {"op": "put", "key": "lock", "value": me, "ttl_ms": LOCK_TTL_MS},
     ]);
-    if let Some((version, r)) = lock_txn(c, renew, &format!("{me}/renew")).await? {
+    if let Ok((version, r)) = lock_txn(c, renew, &format!("{me}/renew")).await? {
         let seen = r["results"].get(0).and_then(|g| g["expires_at"].as_u64());
         let expires = lock_expiry(c, version).await;
         out.lock().unwrap_or_else(|e| e.into_inner()).push(LockWrite { version, expires, renewal: Some(seen) });
@@ -349,7 +401,7 @@ async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Re
     Ok(())
 }
 
-/// Verifies that in version order, each acquisition commits no earlier than
+/// Verifies that in version order, each acquisition is committed at or after
 /// the previous lock's expiry, and each renewal is committed before the lock it read
 /// expired.
 fn check_locks(writes: &[LockWrite]) -> Result<(), String> {
@@ -430,7 +482,7 @@ pub async fn run(sim: Arc<Sim>, owners: usize, steps: usize, chaos: bool) -> Res
             Ok::<(), String>(())
         }));
     }
-    let chaos_h = chaos.then(|| super::spawn_chaos(&sim));
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut owners_done = Vec::new();
     let mut err = None;
     for h in handles {
@@ -447,13 +499,10 @@ pub async fn run(sim: Arc<Sim>, owners: usize, steps: usize, chaos: bool) -> Res
             Err(e) => err = err.or(Some(format!("locker panicked: {e}"))),
         }
     }
-    if let Some(h) = chaos_h {
-        h.abort();
-    }
     if let Some(e) = err {
         return Err(e);
     }
-    super::recover(&sim).await;
+    super::settle(&sim, phase).await;
     let writes = lock_writes.lock().unwrap_or_else(|e| e.into_inner()).clone();
     check_locks(&writes)?;
     let acquired = writes.iter().filter(|w| w.renewal.is_none()).count();
@@ -474,29 +523,27 @@ mod tests {
     use super::*;
 
     fn val(expires: Option<(u64, u64)>) -> Val {
-        Val { data: "d".into(), version: 3, expires }
+        Val { data: "d".into(), version: 3, expires, uncertain: false }
     }
 
     #[test]
     fn reads_are_checked_against_expiry_windows() {
         let v = val(Some((1_000, 1_100)));
         assert!(check_read("t", Some(&v), Some(("d", 3, Some(1_050))), 800, 850, 10).is_ok());
-        assert!(check_read("t", Some(&v), None, 800, 850, 10).is_err(), "gone before it could expire");
-        assert!(
-            check_read("t", Some(&v), Some(("d", 3, Some(1_050))), 1_200, 1_250, 10).is_err(),
-            "seen after it expired"
-        );
+        assert!(check_read("t", Some(&v), None, 800, 850, 10).is_err());
+        assert!(check_read("t", Some(&v), Some(("d", 3, Some(1_050))), 1_200, 1_250, 10).is_err());
         assert!(check_read("t", Some(&v), None, 1_200, 1_250, 10).is_ok());
-        assert!(check_read("t", Some(&v), None, 1_000, 1_050, 10).is_ok(), "uncertain");
-        assert!(check_read("t", Some(&v), Some(("d", 3, Some(1_050))), 1_000, 1_050, 10).is_ok(), "uncertain");
-        assert!(check_read("t", Some(&v), Some(("old", 2, None)), 800, 850, 10).is_err(), "an older value");
-        assert!(
-            check_read("t", Some(&v), Some(("d", 3, Some(1_500))), 800, 850, 10).is_err(),
-            "expiry out of its window"
-        );
+        assert!(check_read("t", Some(&v), None, 1_000, 1_050, 10).is_ok());
+        assert!(check_read("t", Some(&v), Some(("d", 3, Some(1_050))), 1_000, 1_050, 10).is_ok());
+        assert!(check_read("t", Some(&v), Some(("old", 2, None)), 800, 850, 10).is_err());
+        assert!(check_read("t", Some(&v), Some(("d", 3, Some(1_500))), 800, 850, 10).is_err());
         assert!(check_read("t", Some(&val(None)), Some(("d", 3, None)), 0, 1, 10).is_ok());
         assert!(check_read("t", Some(&val(None)), Some(("d", 3, Some(5))), 0, 1, 10).is_err());
-        assert!(check_read("t", None, Some(("d", 3, None)), 0, 1, 10).is_err(), "a deleted value");
+        assert!(check_read("t", None, Some(("d", 3, None)), 0, 1, 10).is_err());
+        let unsure = Val { expires: Some((0, 1_000)), ..Val::uncertain() };
+        assert!(check_read("t", Some(&unsure), Some(("t1", 0, Some(990))), 900, 950, 10).is_ok());
+        assert!(check_read("t", Some(&unsure), None, 900, 950, 10).is_ok());
+        assert!(check_read("t", Some(&unsure), Some(("t1", 0, Some(990))), 5_000, 5_100, 10).is_err());
     }
 
     #[test]
@@ -510,14 +557,14 @@ mod tests {
             w(12, None, None),
         ];
         check_locks(&good).unwrap();
-        assert!(check_locks(&[w(5, Some(10_000), None), w(9, Some(11_499), None)]).is_err(), "taken before it expired");
-        assert!(check_locks(&[w(9, Some(11_000), None), w(5, Some(10_000), None)]).is_err(), "by version, not arrival");
+        assert!(check_locks(&[w(5, Some(10_000), None), w(9, Some(11_499), None)]).is_err());
+        assert!(check_locks(&[w(9, Some(11_000), None), w(5, Some(10_000), None)]).is_err());
         assert!(check_locks(&[w(5, None, None), w(5, None, None)]).is_err());
         let late = [w(5, Some(10_000), None), w(7, Some(11_500), Some(Some(10_000)))];
-        assert!(check_locks(&late).is_err(), "renewed after it expired");
+        assert!(check_locks(&late).is_err());
         let replayed = [w(5, Some(10_000), None), w(7, Some(11_500), Some(None))];
-        assert!(check_locks(&replayed).is_err(), "a replayed renewal after it expired");
+        assert!(check_locks(&replayed).is_err());
         let stale = [w(5, Some(10_000), None), w(6, Some(10_500), None), w(7, Some(11_000), Some(Some(10_000)))];
-        assert!(check_locks(&stale).is_err(), "renewed an older lock");
+        assert!(check_locks(&stale).is_err());
     }
 }

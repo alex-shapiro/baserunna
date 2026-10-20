@@ -545,8 +545,6 @@ fn gen_filter(r: &mut Rng, depth: u32) -> F {
     }
 }
 
-/// Every comparison of a null column fails; JSON compares numbers by value
-/// and orders only numbers and strings.
 fn oracle(f: &F, row: &FRow) -> bool {
     use std::cmp::Ordering::{self, *};
     let present = |col: &str| match col {
@@ -1006,6 +1004,38 @@ async fn check(db: &Arc<Db>) {
 }
 
 #[test]
+fn building_unique_index_keeps_entries_of_other_rows() {
+    rt().block_on(async {
+        for change in [json!(null), json!({"email": "z"}), json!({"g": 9})] {
+            let db = people(37, 20).await;
+            let blobs = BlobResolver { db: &db };
+            let mut t = begin(&db).await;
+            update(&mut t, &blobs, "p", &json!(15), &json!({"email": "e0"})).await.unwrap();
+            db.commit(t.into_request()).await.unwrap();
+            let idx = start_build(&db, &index_spec(json!({"name": "ix", "columns": ["email"], "unique": true}))).await;
+            assert!(build_step(&db, &idx).await.unwrap().is_none());
+            let mut t = begin(&db).await;
+            match &change {
+                Json::Null => delete(&mut t, "p", &json!(15)).await.map(|_| ()).unwrap(),
+                set => update(&mut t, &blobs, "p", &json!(15), set).await.map(|_| ()).unwrap(),
+            }
+            db.commit(t.into_request()).await.unwrap();
+            let mut done = None;
+            while done.is_none() {
+                done = match build_step(&db, &idx).await {
+                    Err(Error::AlreadyExists(_)) => {
+                        assert_eq!(change, json!({"g": 9}), "only a remaining duplicate fails the build");
+                        break;
+                    }
+                    r => r.unwrap(),
+                };
+            }
+            check(&db).await;
+        }
+    });
+}
+
+#[test]
 fn backfill_races_row_writes() {
     rt().block_on(async {
         for unique in [false, true] {
@@ -1278,10 +1308,10 @@ fn rows_expire_with_their_index_entries() {
         assert_eq!(get_expiring(&mut t, "people", &json!(1)).await.unwrap().and_then(|(_, e)| e), Some(expires));
         let dup =
             insert(&mut t, &blobs, "people", &json!({"id": 3, "email": "a@x", "age": 1}), InsertMode::Insert).await;
-        assert!(matches!(dup, Err(Error::AlreadyExists(_))), "the unique value is taken until the row expires");
+        assert!(matches!(dup, Err(Error::AlreadyExists(_))));
         tokio::time::sleep(std::time::Duration::from_millis(10_001)).await;
         let mut t = begin(&db).await;
-        assert_eq!(get(&mut t, "people", &json!(1)).await.unwrap(), None, "expired, and the older row stays gone");
+        assert_eq!(get(&mut t, "people", &json!(1)).await.unwrap(), None);
         assert!(get(&mut t, "people", &json!(2)).await.unwrap().is_some());
         let q: Query = serde_json::from_value(json!({"index": "by_email"})).unwrap();
         let rows = query(&mut t, "people", &q).await.unwrap().rows;
@@ -1327,14 +1357,9 @@ fn batch_row_operations() {
         }
         let sel = |v: Json| -> Selection { serde_json::from_value(v).unwrap() };
         let mut t = begin(&db).await;
-        for (set, why) in [
-            (json!({"id": 1}), "the primary key"),
-            (json!({"nope": 1}), "an unknown column"),
-            (json!({"age": "x"}), "a value of the wrong type"),
-            (json!([1]), "not an object"),
-        ] {
+        for set in [json!({"id": 1}), json!({"nope": 1}), json!({"age": "x"}), json!([1])] {
             let r = update_where(&mut t, &blobs, "people", &sel(json!({"eq": [-1]})), &set, Expiry::Keep, None).await;
-            assert!(matches!(r, Err(Error::InvalidArgument(_))), "{why}: {r:?}");
+            assert!(matches!(r, Err(Error::InvalidArgument(_))), "{r:?}");
         }
         let r = update_where(&mut t, &blobs, "people", &sel(json!({"index": "nope"})), &json!({}), Expiry::Keep, None)
             .await;

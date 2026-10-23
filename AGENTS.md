@@ -28,7 +28,7 @@ If you see an approach that is subpar, prefer to rip it out wholesale and replac
 - Avoid changelog-style comments at all cost. They pollute the codebase and harm the reader's
   understanding of the code as it exists.
 
-## Doc Guidelines
+## Writing Guidelines
 
 - If you find redundancies or overly verbose phrases while reading through a doc, remove them.
 - LLM written docs often turn into factslop over time. If you find that a doc seems to contain
@@ -36,3 +36,6 @@ If you see an approach that is subpar, prefer to rip it out wholesale and replac
   sentence, restructure it to explain exactly what you were looking for, concisely.
 - Never use middle voice. Instead of "writes commit together", use "writes are committed together".
 - Never write factslop. by default, docs should focus on the concrete being solved over lists of symbols and intricate implementation details that are already present in the code.
+- Avoid long tables in markdown because they are not human-readable. If a table has a row whose
+  formatted length exceeds a single line (typically ~100 characters) replace the table with
+  a more readable alternative.

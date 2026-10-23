@@ -904,11 +904,13 @@ impl Db {
 
     /// Reloads the manifest until it holds the newest noticed version, while requests wait.
     /// At most one reload runs at a time; notices that arrive during one are covered by it or
-    /// by the next.
+    /// by the next. A reload that brings no newer version ends the loop, so a notice of a
+    /// version this node cannot read costs one manifest read rather than a spin.
     fn load_noticed(self: &Arc<Self>) {
         use std::sync::atomic::Ordering::SeqCst;
+        let version = |db: &Db| db.current().map(|c| c.m.version);
         let behind =
-            |db: &Db| db.waiters.load(SeqCst) > 0 && db.current().is_none_or(|c| c.m.version < db.noticed.load(SeqCst));
+            move |db: &Db| db.waiters.load(SeqCst) > 0 && version(db).is_none_or(|v| v < db.noticed.load(SeqCst));
         if !behind(self) || self.refreshing.swap(true, SeqCst) {
             return;
         }
@@ -917,7 +919,8 @@ impl Db {
             loop {
                 while behind(&me) {
                     probe::hit(Probe::NoticedVersionLoaded);
-                    if me.read_version(Consistency::Strong).await.is_err() {
+                    let before = version(&me);
+                    if me.read_version(Consistency::Strong).await.is_err() || version(&me) == before {
                         me.refreshing.store(false, SeqCst);
                         return;
                     }

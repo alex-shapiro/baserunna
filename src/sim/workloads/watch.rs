@@ -172,10 +172,16 @@ impl Watcher {
     }
 
     /// Polls the change feed once, returning `Some(true)` if caught up or
-    /// `None` on transient error.
-    async fn poll(&mut self, wait_ms: u64) -> Result<Option<bool>, String> {
-        let p = format!("{BASE}/changes?after={}&limit={}&wait_ms={wait_ms}", self.cursor, 1 + self.c.rng().below(8));
-        let sent = self.c.sim.now_ms();
+    /// `None` on transient error. With `staleness`, the page may come from a
+    /// snapshot up to that old, possibly older than earlier pages.
+    async fn poll(&mut self, wait_ms: u64, staleness: Option<u64>) -> Result<Option<bool>, String> {
+        let mut p =
+            format!("{BASE}/changes?after={}&limit={}&wait_ms={wait_ms}", self.cursor, 1 + self.c.rng().below(8));
+        if let Some(s) = staleness {
+            p += &format!("&consistency=snapshot&max_staleness_ms={s}");
+        }
+        // A cursor's lifetime runs from the version its oldest page was read at.
+        let sent = self.c.sim.now_ms().saturating_sub(staleness.unwrap_or(0));
         let Ok(r): Result<Resp, _> = self.c.call("GET", &p, None).await else { return Ok(None) };
         let at = self.c.sim.now_ms();
         match r.status {
@@ -211,9 +217,7 @@ impl Watcher {
         self.received.extend(changes.iter().cloned());
         self.cursor = r.json["next_cursor"].as_str().ok_or("missing next_cursor")?.to_string();
         let more = r.json["more"] == true;
-        if !more {
-            self.cursor_at = sent;
-        }
+        self.cursor_at = if more { self.cursor_at.min(sent) } else { sent };
         Ok(Some(changes.is_empty() && !more))
     }
 }
@@ -239,7 +243,9 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     let mut err = None;
     while !done.load(Ordering::SeqCst) {
         let wait = watcher.c.rng().below(3_000);
-        if let Err(e) = watcher.poll(wait).await {
+        let stale = watcher.c.rng().chance(0.3);
+        let staleness = stale.then(|| 1 + watcher.c.rng().below(lifetime / 2));
+        if let Err(e) = watcher.poll(wait, staleness).await {
             err = Some(e);
             break;
         }
@@ -257,7 +263,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
         return Err(e);
     }
     super::settle(&sim, phase).await;
-    while watcher.poll(0).await? != Some(true) {
+    while watcher.poll(0, None).await? != Some(true) {
         watcher.c.pause(100).await;
     }
     let last = Write::Put { key: "last".into(), value: "last".into(), ttl: false };
@@ -265,7 +271,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     log.lock().unwrap_or_else(|e| e.into_inner()).insert(last_version, vec![last]);
     // Wait for all TTL entries to expire before comparing state.
     watcher.c.pause(4_000 + eps).await;
-    while watcher.poll(0).await? != Some(true) {
+    while watcher.poll(0, None).await? != Some(true) {
         watcher.c.pause(100).await;
     }
     watcher.state.retain(|_, (_, e)| e.is_none());

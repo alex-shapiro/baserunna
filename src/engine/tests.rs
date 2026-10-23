@@ -2404,6 +2404,38 @@ fn full_state_transfers_page_past_purged_deletions() {
 }
 
 #[test]
+fn full_state_transfers_expire_after_paging_a_stale_snapshot() {
+    rt().block_on(async {
+        let (eng, _store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        let cfg = eng.shared.cfg.clone();
+        for k in ["x", "k", "a", "b"] {
+            put(&db, k, "1").await;
+        }
+        let stale = db.read_version(Consistency::Strong).await.unwrap();
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        t.delete(Bytes::from_static(b"k")).unwrap();
+        let deleted = db.commit(t.into_request()).await.unwrap();
+        let fresh = db.read_version(Consistency::Strong).await.unwrap();
+        let first = fresh.changes(&KeyRange::data(), &ChangeCursor::after_version(0), 1).await.unwrap();
+        assert!(first.more && first.next.floor == deleted, "{first:?}");
+        // The next page comes from a snapshot taken before `k` was deleted, so the reader
+        // now holds `k` and needs its deletion.
+        let second = stale.changes(&KeyRange::data(), &first.next, 1).await.unwrap();
+        assert!(matches!(&second.changes[..], [Change::Entry(e)] if &e.key[..] == b"k" && !e.value.is_tombstone()));
+        assert!(second.more && second.next.floor == stale.m.version, "{second:?}");
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(cfg.txn_max_lifetime_ms.max(cfg.version_sample_ms))).await;
+            put(&db, "z", "x").await;
+        }
+        let v = db.read_version(Consistency::Strong).await.unwrap();
+        assert!(v.m.tombstone_horizon >= deleted, "setup: purged");
+        let r = v.changes(&KeyRange::data(), &second.next, 1).await;
+        assert!(matches!(r, Err(Error::CursorExpired(_))), "{r:?}");
+    });
+}
+
+#[test]
 fn commit_notices_wake_waiting_requests() {
     rt().block_on(async {
         let (a, store) = delayed_engine("a");
@@ -2439,5 +2471,13 @@ fn commit_notices_wake_waiting_requests() {
         reader.notice_commit(v3);
         assert!(waiting.await.unwrap());
         assert_eq!(seen(&reader), v3);
+        // A notice of a version the store does not have costs one manifest read, not a loop.
+        let manifest_gets = || store.gets.lock().unwrap().iter().filter(|(k, _)| k.ends_with("/manifest")).count();
+        let before = manifest_gets();
+        reader.notice_commit(v3 + 100);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(manifest_gets(), before, "no request was waiting, so nothing was read");
+        tokio::time::timeout(Duration::from_secs(5), reader.wait_for_change(v3, Duration::from_secs(2))).await.unwrap();
+        assert_eq!(manifest_gets(), before + 1);
     });
 }

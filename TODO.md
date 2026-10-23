@@ -77,6 +77,10 @@ design context.
       manifest copy-on-write and export/import.
 - [ ] **Database rename and ownership transfer** between users and
       organizations.
+- [ ] **One long-poll limit for change feeds and stream reads.** Change
+      feeds wait up to 60 s (`wait_ms`), stream record reads up to 20 s. A
+      snapshot waiter's store cost does not depend on the limit, so pick one
+      that fits common load balancer idle timeouts and use it for both.
 - [ ] **Organization access controls.** Add per-database role grants within an
       organization, organization-owned service accounts (API keys), and email
       invitations for unregistered users.
@@ -107,6 +111,11 @@ design context.
 
 ## Testing
 
+- [ ] **Fix the `auth` scenario's empty node listing.** About 1 in 24,000
+      `auth` seeds fail with `Err("nodes")` (e.g. `sim_tool trace auth
+      5006829`): `/v1/admin/nodes` lists only members read from the system
+      database, which can be empty after a crash before the node's first
+      heartbeat lands. The listing should always include the serving node.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the
       model-checked `http_txn` target.
 - [ ] **Run mutation testing in CI**, running `scripts/mutants.sh --in-diff` on

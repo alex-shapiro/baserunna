@@ -266,7 +266,7 @@ fn clone_parts(req: &Request) -> http::request::Builder {
     b
 }
 
-const BUFFER_FORWARD_MAX: u64 = 1024 * 1024;
+pub(crate) const BUFFER_FORWARD_MAX: u64 = 1024 * 1024;
 
 fn finishes_txn(req: &Request) -> bool {
     let route = req.extensions().get::<MatchedPath>().map(MatchedPath::as_str);
@@ -345,6 +345,16 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 fwd.headers_mut().insert(HOPS_HEADER, HeaderValue::from(hops + 1));
                 tag_forward(&node, &mut fwd, &target, deadline);
                 return match node.services.transport.call(&addr, fwd).await {
+                    // The streamed body is spent, so the client retries, and the retry is
+                    // handled here.
+                    Ok(resp) if resp.headers().contains_key(STALE_TARGET_HEADER) => {
+                        node.mark_suspect(&target);
+                        Err(Error::Unavailable {
+                            message: format!("{target} restarted; retry"),
+                            retry_after_ms: Some(100),
+                            outcome_unknown: false,
+                        })
+                    }
                     Ok(resp) => Ok(forwarded(resp, target)),
                     Err(te) => {
                         if te.maybe_delivered {

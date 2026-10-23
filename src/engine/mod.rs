@@ -50,16 +50,15 @@ pub struct Shared {
     /// True once the node begins releasing leases for shutdown.
     stopping: std::sync::atomic::AtomicBool,
     /// Called with a database id and version after this node commits a new data version.
-    commit_hook: Mutex<Option<CommitHook>>,
+    commit_hook: std::sync::OnceLock<CommitHook>,
 }
 
 /// Observes commits made by this node, for notifying other nodes.
-pub type CommitHook = Arc<dyn Fn(&str, u64) + Send + Sync>;
+pub type CommitHook = Box<dyn Fn(&str, u64) + Send + Sync>;
 
 impl Shared {
     pub(crate) fn committed(&self, db: &str, version: u64) {
-        let h = self.commit_hook.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(h) = h {
+        if let Some(h) = self.commit_hook.get() {
             h(db, version);
         }
     }
@@ -226,7 +225,7 @@ impl Engine {
             observed_leases: Mutex::new(DetHashMap::default()),
             quota_exempt: Mutex::new(Default::default()),
             stopping: false.into(),
-            commit_hook: Mutex::new(None),
+            commit_hook: std::sync::OnceLock::new(),
         });
         Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) })
     }
@@ -251,9 +250,10 @@ impl Engine {
         self.dbs.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
     }
 
-    /// Installs a callback run after every commit this node makes.
+    /// Installs the callback run after every commit this node makes. Only the first call
+    /// installs one.
     pub fn set_commit_hook(&self, h: CommitHook) {
-        *self.shared.commit_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+        let _ = self.shared.commit_hook.set(h);
     }
 
     pub fn open_count(&self) -> usize {

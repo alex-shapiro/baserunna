@@ -1027,7 +1027,7 @@ impl Version {
         let more = changes.len() > limit;
         changes.truncate(limit);
         let next = match changes.last() {
-            Some(c) if more => ChangeCursor { pos: c.pos(), floor },
+            Some(c) if more => ChangeCursor { pos: c.pos(), floor: floor.min(self.m.version) },
             _ if after.pos > ChangePos::after_version(self.m.version) => after.clone(),
             _ => ChangeCursor::after_version(self.m.version),
         };
@@ -1079,11 +1079,13 @@ impl ChangePos {
 /// Where a change feed reader resumes, and which deletions it still needs.
 ///
 /// A reader needs the deletions after `pos` of keys it holds. A reader that
-/// started at version 0 holds only keys it received from pages read at or after
-/// its first page's version, so it needs no deletion at or below that version:
-/// its `floor`. A full state transfer therefore expires only if the deletions
-/// purged since it started are newer than its first page, not merely newer than
-/// the old entries it is paging through.
+/// started at version 0 holds only keys it received from pages, each of which
+/// reflects every deletion up to the version it was read at, so it needs no
+/// deletion at or below the oldest of those versions: its `floor`. A full state
+/// transfer therefore expires only if the deletions purged since it started are
+/// newer than its oldest page, not merely newer than the old entries it is
+/// paging through. Pages read from an older snapshot than earlier pages (a
+/// stale snapshot read) lower the floor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeCursor {
     pub pos: ChangePos,

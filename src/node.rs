@@ -296,7 +296,7 @@ impl Node {
             cfg,
         });
         let weak = Arc::downgrade(&node);
-        node.engine.set_commit_hook(Arc::new(move |db: &str, version: u64| {
+        node.engine.set_commit_hook(Box::new(move |db: &str, version: u64| {
             if let Some(n) = weak.upgrade() {
                 n.notify_home(db, version);
             }
@@ -1526,6 +1526,32 @@ mod tests {
             // process at its address refuses; the write is not applied there, so it runs here.
             let put = Bytes::from(serde_json::json!({"ops": [{"op": "put", "key": "k", "value": "v"}]}).to_string());
             let r = w.call(other, "POST", "/v1/dbs/d/txn", &t, put).await;
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        });
+    }
+
+    #[test]
+    fn streamed_writes_routed_to_a_restarted_home_are_retried_locally() {
+        run_paused(async {
+            let mut w = World::new(2, 1).await;
+            for i in 0..2 {
+                w.node(i).refresh_members().await.unwrap();
+            }
+            let t = w.signup(0, "fwd@x.io").await;
+            let id = w.create_db(0, &t, "d").await;
+            let live = w.node(0).live_members();
+            let home_id = super::cluster::rendezvous(&id, &live).unwrap().id.clone();
+            let home = (0..2).find(|&i| w.node(i).id == home_id).unwrap();
+            let other = 1 - home;
+            w.restart_node(home).await;
+            // A body too large to buffer is streamed to the home and spent when the home's new
+            // process refuses it, so the request fails; its retry is handled here.
+            let big = Bytes::from(vec![7u8; 2 * crate::api::BUFFER_FORWARD_MAX as usize]);
+            let r = w.call(other, "PUT", "/v1/dbs/d/kv/big", &t, big.clone()).await;
+            assert_eq!(r.status, 503, "{}", String::from_utf8_lossy(&r.body));
+            assert_eq!(r.json()["error"]["details"]["outcome"], "not_applied", "{}", r.json());
+            assert!(r.headers.keys().all(|h| !h.as_str().starts_with("x-baserunna-stale")), "{:?}", r.headers);
+            let r = w.call(other, "PUT", "/v1/dbs/d/kv/big", &t, big).await;
             assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         });
     }

@@ -190,6 +190,7 @@ impl Transport for PeerTransport {
 
 pub struct Resp {
     pub status: u16,
+    pub headers: http::HeaderMap,
     pub body: Bytes,
 }
 
@@ -325,9 +326,9 @@ pub async fn call_router(router: &axum::Router, method: &str, path: &str, token:
         Ok(r) => r,
         Err(e) => match e {},
     };
-    let status = resp.status().as_u16();
-    let body = http_body_util::BodyExt::collect(resp.into_body()).await.map(|b| b.to_bytes()).unwrap_or_default();
-    Resp { status, body }
+    let (parts, body) = resp.into_parts();
+    let body = http_body_util::BodyExt::collect(body).await.map(|b| b.to_bytes()).unwrap_or_default();
+    Resp { status: parts.status.as_u16(), headers: parts.headers, body }
 }
 
 pub fn run_paused<F: Future>(f: F) -> F::Output {

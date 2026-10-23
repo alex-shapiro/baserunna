@@ -30,6 +30,7 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value as Json, json};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub const SESSION_COOKIE: &str = "brs_session";
 
@@ -360,10 +361,10 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
             }
         }
         // Re-resolve strongly if the cached database name points to a deleted or recreated
-        // database. A request that accepts a stale snapshot checks at the same staleness, so
-        // it costs no store read while the snapshot is fresh; commits always check the
-        // manifest themselves.
-        let staleness = snapshot_staleness(req.uri().query());
+        // database. A read that accepts a stale snapshot checks at the same staleness, so it
+        // costs no store read while the snapshot is fresh.
+        let read_only = matches!(*req.method(), http::Method::GET | http::Method::HEAD);
+        let staleness = read_only.then(|| snapshot_staleness(req.uri().query())).flatten();
         let opened = match node.open_db(&rec).await {
             Ok(db) => match match staleness {
                 Some(max_staleness_ms) => db.snapshot(Consistency::Snapshot { max_staleness_ms }).await,
@@ -803,12 +804,26 @@ pub(crate) trait Found {
     fn found(&self) -> bool;
 }
 
+/// How long a waiting read at `c` waits for a newer version before it reads again, ending by
+/// `until`. Strong reads are repeated every `watch_poll_ms`, since a node without the lease
+/// learns of other nodes' commits only by reading the manifest. Snapshot reads are repeated
+/// once their snapshot turns too stale (and at most every `watch_poll_ms`), so an idle
+/// snapshot watcher reads the store once per `max_staleness_ms`.
+pub(crate) fn reread_after(node: &Node, db: &Db, c: Consistency, until: tokio::time::Instant) -> Duration {
+    let now = tokio::time::Instant::now();
+    let poll = now + Duration::from_millis(node.cfg.watch_poll_ms);
+    let reread = match c {
+        Consistency::Strong => poll,
+        Consistency::Snapshot { max_staleness_ms } => {
+            db.stale_at(Duration::from_millis(max_staleness_ms)).map_or(poll, |at| at.max(poll))
+        }
+    };
+    reread.min(until).saturating_duration_since(now)
+}
+
 /// Runs `$read` on fresh snapshots until [`Found::found`] is true or `$wait` elapses. Between
 /// reads it waits for this node to install a newer version: one this node committed, or
-/// one another node announced (`notify_home`). Strong reads are also repeated every
-/// `watch_poll_ms`, since a node without the lease learns of other nodes' commits only by
-/// reading the manifest. Snapshot reads are repeated only once the snapshot is too stale,
-/// so an idle snapshot watcher reads the store at most once per `max_staleness_ms`.
+/// one another node announced (`notify_home`), or until [`reread_after`].
 macro_rules! watch {
     ($node:expr, $db:expr, $c:expr, $wait:expr, |$t:ident| $read:expr) => {{
         let until_ = tokio::time::Instant::now() + $wait;
@@ -818,13 +833,7 @@ macro_rules! watch {
             if crate::api::Found::found(&out_) || left_.is_zero() {
                 break (out_, v_);
             }
-            let poll_ms_ = match $c {
-                crate::engine::Consistency::Strong => $node.cfg.watch_poll_ms,
-                crate::engine::Consistency::Snapshot { max_staleness_ms } => {
-                    max_staleness_ms.max($node.cfg.watch_poll_ms)
-                }
-            };
-            $db.wait_for_change(v_, left_.min(std::time::Duration::from_millis(poll_ms_))).await;
+            $db.wait_for_change(v_, crate::api::reread_after(&$node, &$db, $c, until_)).await;
         }
     }};
 }

@@ -27,7 +27,7 @@ pub use db::{CommitState, Committed, Consistency, Db, DbStats, LevelStats};
 pub use stream::{Appended, Record, Retention, Seek, StreamOp, StreamState};
 pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
 pub use types::{BlobRef, Entry, Seq, Value};
-pub use version::{Change, ChangePage, ChangePos, KeyRange, Snapshot, Version};
+pub use version::{Change, ChangeCursor, ChangePage, ChangePos, KeyRange, Snapshot, Version};
 
 /// State shared by every database handle on a node.
 pub struct Shared {

@@ -147,7 +147,7 @@ async fn check_feed(db: &Arc<Db>, version: Seq, then: &Model, now: &Model, limit
     let snap = db.snapshot(Consistency::Strong).await.map_err(|e| e.to_string())?;
     let v = &snap.version;
     let mut mirror = then.clone();
-    let mut cursor = ChangePos::after_version(version);
+    let mut cursor = ChangeCursor::after_version(version);
     loop {
         let page = match v.changes(&KeyRange::data(), &cursor, limit).await {
             Err(Error::CursorExpired(_)) if version < v.m.tombstone_horizon => return Ok(()),
@@ -158,10 +158,10 @@ async fn check_feed(db: &Arc<Db>, version: Seq, then: &Model, now: &Model, limit
             return Err("feed page size".into());
         }
         for c in &page.changes {
-            if c.pos() <= cursor || c.seq() <= version || c.seq() > v.m.version {
+            if c.pos() <= cursor.pos || c.seq() <= version || c.seq() > v.m.version {
                 return Err(format!("feed out of order: {c:?} after {cursor:?}"));
             }
-            cursor = c.pos();
+            cursor.pos = c.pos();
             match c {
                 Change::Entry(e) if e.value.is_tombstone() => {
                     mirror.remove(e.key.as_ref());
@@ -2247,7 +2247,7 @@ fn change_feed_cursors_expire_with_purged_deletions() {
         t.delete(Bytes::from_static(b"a")).unwrap();
         let deleted = db.commit(t.into_request()).await.unwrap();
         let v = db.read_version(Consistency::Strong).await.unwrap();
-        let page = v.changes(&KeyRange::data(), &ChangePos::after_version(first), 10).await.unwrap();
+        let page = v.changes(&KeyRange::data(), &ChangeCursor::after_version(first), 10).await.unwrap();
         assert_eq!(page.changes, vec![Change::Entry(Entry::tombstone(Bytes::from_static(b"a"), deleted))]);
         for _ in 0..3 {
             tokio::time::sleep(Duration::from_millis(cfg.txn_max_lifetime_ms.max(cfg.version_sample_ms))).await;
@@ -2255,20 +2255,22 @@ fn change_feed_cursors_expire_with_purged_deletions() {
         }
         let v = db.read_version(Consistency::Strong).await.unwrap();
         assert!(v.m.tombstone_horizon >= deleted, "setup: purged");
-        let r = v.changes(&KeyRange::data(), &ChangePos::after_version(first), 10).await;
+        let r = v.changes(&KeyRange::data(), &ChangeCursor::after_version(first), 10).await;
         assert!(matches!(r, Err(Error::CursorExpired(_))), "{r:?}");
-        let fresh = v.changes(&KeyRange::data(), &ChangePos::after_version(v.m.tombstone_horizon), 10).await;
+        let fresh = v.changes(&KeyRange::data(), &ChangeCursor::after_version(v.m.tombstone_horizon), 10).await;
         assert!(fresh.is_ok(), "{fresh:?}");
-        let mid = ChangePos { seq: v.m.tombstone_horizon, kind: ChangePos::KEY, key: Bytes::from_static(b"a") };
+        let pos = ChangePos { seq: v.m.tombstone_horizon, kind: ChangePos::KEY, key: Bytes::from_static(b"a") };
+        let mid = ChangeCursor { pos, floor: 0 };
         assert!(matches!(v.changes(&KeyRange::data(), &mid, 10).await, Err(Error::CursorExpired(_))));
         // A follower starting from nothing needs no deletions, so its cursor never expires.
-        let all = v.changes(&KeyRange::data(), &ChangePos::after_version(0), 10).await.unwrap();
+        let all = v.changes(&KeyRange::data(), &ChangeCursor::after_version(0), 10).await.unwrap();
         assert!(all.changes.iter().any(|c| matches!(c, Change::Entry(e) if &e.key[..] == b"b")));
-        for pos in [ChangePos::after_version(7), mid] {
-            assert_eq!(ChangePos::decode(&pos.encode()), Some(pos));
+        let floored = ChangeCursor { floor: 9, ..mid.clone() };
+        for c in [ChangeCursor::after_version(7), mid, floored] {
+            assert_eq!(ChangeCursor::decode(&c.encode()), Some(c));
         }
-        for bad in ["", "x", "1.", "1.2.AA", "1.0.!!", "1.1"] {
-            assert_eq!(ChangePos::decode(bad), None, "{bad}");
+        for bad in ["", "x", "1.", "1.2.AA", "1.0.!!", "1.1", "1.1.AA.0", "1.1.AA.x", "1.1.AA.2.3"] {
+            assert_eq!(ChangeCursor::decode(bad), None, "{bad}");
         }
     });
 }
@@ -2286,23 +2288,28 @@ fn copies_share_values_and_blobs_without_staging_rules() {
         put(&db, "i", "inline").await;
         // Long after the blob's staging window, a copy can still bind it.
         tokio::time::sleep(Duration::from_millis(eng.shared.cfg.blob_stage_ttl_ms * 2)).await;
+        let blob_bytes = db.stats(&db.current().unwrap()).blob_bytes;
         let mut t = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
-        assert!(t.copy(b"b", Bytes::from_static(b"b2")).await.unwrap());
-        assert!(t.copy(b"i", Bytes::from_static(b"i2")).await.unwrap());
-        assert!(!t.copy(b"missing", Bytes::from_static(b"m2")).await.unwrap());
+        assert!(t.copy(b"b", Bytes::from_static(b"b2"), None).await.unwrap());
+        assert!(t.copy(b"i", Bytes::from_static(b"i2"), None).await.unwrap());
+        assert!(!t.copy(b"missing", Bytes::from_static(b"m2"), None).await.unwrap());
+        // A copy of a copy made in the same transaction still shares the bound blob.
+        assert!(t.copy(b"b2", Bytes::from_static(b"b4"), None).await.unwrap());
         db.commit(t.into_request()).await.unwrap();
         let v = db.read_version(Consistency::Strong).await.unwrap();
+        assert_eq!(db.stats(&v).blob_bytes, blob_bytes, "copies store no new blob bytes");
         let get = |k: &'static [u8]| {
             let v = v.clone();
             async move { v.get(k, u64::MAX).await.unwrap().map(|e| e.value) }
         };
         assert_eq!(get(b"b2").await, Some(Value::Blob(blob.clone())));
+        assert_eq!(get(b"b4").await, Some(Value::Blob(blob.clone())));
         assert_eq!(get(b"i2").await, get(b"i").await);
         assert_eq!(get(b"m2").await, None);
         // A copy whose source changes before it commits conflicts, even under snapshot
         // isolation: the source might have held the last reference to its blob.
         let mut t = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
-        assert!(t.copy(b"b", Bytes::from_static(b"b3")).await.unwrap());
+        assert!(t.copy(b"b", Bytes::from_static(b"b3"), None).await.unwrap());
         let mut d = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         d.delete(Bytes::from_static(b"b")).unwrap();
         db.commit(d.into_request()).await.unwrap();
@@ -2324,5 +2331,113 @@ fn copies_share_values_and_blobs_without_staging_rules() {
         assert!(!db.current().unwrap().m.obsolete.iter().any(|o| o.id == blob.id), "a copied blob was collected");
         let data = blob::read_range(&eng.shared, "d", &blob, 0..blob.size).await.unwrap();
         assert_eq!(&data[..], b"blob bytes");
+    });
+}
+
+#[test]
+fn full_state_transfers_page_past_purged_deletions() {
+    rt().block_on(async {
+        let (eng, _store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        let cfg = eng.shared.cfg.clone();
+        let delete = |k: &'static str| {
+            let db = db.clone();
+            async move {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                t.delete(Bytes::from_static(k.as_bytes())).unwrap();
+                db.commit(t.into_request()).await.unwrap()
+            }
+        };
+        let purge = || async {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(cfg.txn_max_lifetime_ms.max(cfg.version_sample_ms))).await;
+                put(&db, "z", "x").await;
+            }
+            db.read_version(Consistency::Strong).await.unwrap()
+        };
+        for k in ["a", "b", "c", "d", "e", "y"] {
+            put(&db, k, "1").await;
+        }
+        let deleted = delete("y").await;
+        let v = db.read_version(Consistency::Strong).await.unwrap();
+        let first = v.changes(&KeyRange::data(), &ChangeCursor::after_version(0), 2).await.unwrap();
+        assert!(first.more && first.next.floor == v.m.version);
+        assert_eq!(ChangeCursor::decode(&first.next.encode()), Some(first.next.clone()));
+        // A deletion from before the transfer began is purged: the transfer continues, though
+        // its position is older than the purged deletion.
+        let v = purge().await;
+        assert!(v.m.tombstone_horizon >= deleted && first.next.pos.seq < deleted, "setup: purged");
+        let mut held: BTreeMap<Bytes, Value> = BTreeMap::new();
+        let mut cursor = first.next.clone();
+        for c in &first.changes {
+            let Change::Entry(e) = c else { panic!("{c:?}") };
+            held.insert(e.key.clone(), e.value.clone());
+        }
+        loop {
+            let page = v.changes(&KeyRange::data(), &cursor, 2).await.unwrap();
+            for c in &page.changes {
+                match c {
+                    Change::Entry(e) if e.value.is_tombstone() => held.remove(&e.key),
+                    Change::Entry(e) => held.insert(e.key.clone(), e.value.clone()),
+                    Change::DeleteRange(_) => panic!("{c:?}"),
+                };
+            }
+            cursor = page.next;
+            if !page.more {
+                break;
+            }
+        }
+        let live: BTreeMap<Bytes, Value> =
+            v.all_entries(false).await.unwrap().into_iter().map(|e| (e.key, e.value)).collect();
+        assert_eq!(held, live);
+        assert_eq!(cursor, ChangeCursor::after_version(v.m.version));
+        // A key the transfer already delivered is deleted, and the deletion is purged before
+        // the transfer resumes: the reader would keep the key, so its cursor expires.
+        let first = v.changes(&KeyRange::data(), &ChangeCursor::after_version(0), 2).await.unwrap();
+        let Change::Entry(sent) = &first.changes[0] else { panic!() };
+        let key: &'static str = String::from_utf8(sent.key[1..].to_vec()).unwrap().leak();
+        delete(key).await;
+        let v = purge().await;
+        let r = v.changes(&KeyRange::data(), &first.next, 2).await;
+        assert!(matches!(r, Err(Error::CursorExpired(_))), "{r:?}");
+    });
+}
+
+#[test]
+fn commit_notices_wake_waiting_requests() {
+    rt().block_on(async {
+        let (a, store) = delayed_engine("a");
+        let b = second_node(&a, &store, "b");
+        let writer = opened(&a, "d").await;
+        let reader = opened(&b, "d").await;
+        let seen = |db: &Arc<Db>| db.current().unwrap().m.version;
+        let long = Duration::from_secs(3600);
+        let woken_at_once = |db: Arc<Db>, than: Seq| async move {
+            let started = tokio::time::Instant::now();
+            db.wait_for_change(than, long).await;
+            started.elapsed() < Duration::from_secs(1)
+        };
+        // A notice that arrives before a request waits still wakes the request.
+        let before = seen(&reader);
+        let v = put(&writer, "k", "1").await;
+        reader.notice_commit(v);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(seen(&reader), before, "no request was waiting, so nothing was read");
+        assert!(woken_at_once(reader.clone(), before).await);
+        assert_eq!(seen(&reader), v);
+        // A request dropped while waiting no longer counts as waiting.
+        assert!(tokio::time::timeout(Duration::from_millis(10), reader.wait_for_change(v, long)).await.is_err());
+        let v2 = put(&writer, "k", "2").await;
+        reader.notice_commit(v2);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(seen(&reader), v, "a dropped request left a waiter behind");
+        assert!(woken_at_once(reader.clone(), v).await);
+        // A notice wakes a request already waiting.
+        let waiting = tokio::spawn(woken_at_once(reader.clone(), v2));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let v3 = put(&writer, "k", "3").await;
+        reader.notice_commit(v3);
+        assert!(waiting.await.unwrap());
+        assert_eq!(seen(&reader), v3);
     });
 }

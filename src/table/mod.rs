@@ -4,7 +4,7 @@ pub mod schema;
 pub mod tuple;
 
 use crate::engine::{
-    BlobRef, Change, ChangePos, Consistency, Db, Isolation, KeyRange, ReadValue, Seq, Ttl, Txn, Value, blob,
+    BlobRef, Change, ChangeCursor, Consistency, Db, Isolation, KeyRange, ReadValue, Seq, Ttl, Txn, Value, blob,
 };
 use crate::error::{Error, Result};
 use crate::filter::{self, Target, Test};
@@ -1138,11 +1138,11 @@ pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult>
 pub struct RowChanges {
     pub changes: Vec<Json>,
     pub more: bool,
-    pub next: ChangePos,
+    pub next: ChangeCursor,
 }
 
 /// Return a page of row changes in `table` after `after` as of the transaction's snapshot.
-pub async fn row_changes(txn: &mut Txn, table: &str, after: &ChangePos, limit: usize) -> Result<RowChanges> {
+pub async fn row_changes(txn: &mut Txn, table: &str, after: &ChangeCursor, limit: usize) -> Result<RowChanges> {
     let s = get_schema(txn, table).await?;
     let prefix = table_prefix(SPACE_ROWS, s.id);
     let snapshot = txn.snapshot().clone();
@@ -1173,11 +1173,7 @@ pub async fn row_changes(txn: &mut Txn, table: &str, after: &ChangePos, limit: u
         }
         changes.push(j);
     }
-    let next = match (page.more, page.changes.last()) {
-        (true, Some(c)) => c.pos(),
-        _ => after.clone().max(ChangePos::after_version(snapshot.version())),
-    };
-    Ok(RowChanges { changes, more: page.more, next })
+    Ok(RowChanges { changes, more: page.more, next: page.next })
 }
 
 /// Verify that all stored index entries in `table` match its rows.

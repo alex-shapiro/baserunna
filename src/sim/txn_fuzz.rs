@@ -222,6 +222,8 @@ enum Op {
     Copy {
         from: String,
         to: String,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     DeleteRange {
         #[serde(default)]
@@ -1168,13 +1170,14 @@ impl World {
                 t.writes.insert(k, None);
                 Ok(json!({}).into())
             }
-            Op::Copy { from, to } => {
+            Op::Copy { from, to, ttl_ms } => {
                 let f = user_key(decode(enc, from)?)?;
                 let to = user_key(decode(enc, to)?)?;
+                let expiry = ttl(*ttl_ms)?;
                 let r = t.get(&f);
                 t.pinned.push(f);
                 let (v, _) = r.ok_or(Fail::Precondition)?;
-                t.put(to, MVal { expiry: Expiry::Never, ..v });
+                t.put(to, MVal { expiry, ..v });
                 Ok(json!({}).into())
             }
             Op::DeleteRange { prefix, start, end } => {
@@ -2298,7 +2301,11 @@ impl Gen<'_, '_> {
                 self.ttl(&mut o);
                 o
             }
-            5 if self.u.chance(128) => json!({"op": "copy", "from": self.key(enc), "to": self.key(enc)}),
+            5 if self.u.chance(128) => {
+                let mut o = json!({"op": "copy", "from": self.key(enc), "to": self.key(enc)});
+                self.ttl(&mut o);
+                o
+            }
             5 => json!({"op": "delete", "key": self.key(enc)}),
             6 => {
                 let mut o = json!({"op": "delete_range"});

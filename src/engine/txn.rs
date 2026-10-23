@@ -3,7 +3,7 @@
 //! writes.
 
 use super::stream::{self, StreamOp, StreamState};
-use super::types::{Seq, Value, is_commit_key};
+use super::types::{BlobRef, Seq, Value, is_commit_key};
 use super::version::{KeyRange, Snapshot, Version};
 use crate::error::{Error, Result};
 use bytes::Bytes;
@@ -85,20 +85,13 @@ impl WriteSet {
             || self.streams.iter().any(|s| matches!(s, StreamOp::Append { .. }))
     }
 
-    pub fn blob_ids(&self) -> Vec<String> {
-        self.puts
-            .values()
-            .filter_map(|v| match v {
-                Some(Put { value: Value::Blob(b), .. }) => Some(b.id.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// Blobs this write set binds for the first time: staged blobs, as opposed to copies of
     /// values that already reference them.
-    pub fn staged_blob_ids(&self) -> Vec<String> {
-        self.blob_ids().into_iter().filter(|id| !self.copied_blobs.contains(id)).collect()
+    pub fn staged_blobs(&self) -> impl Iterator<Item = &BlobRef> {
+        self.puts.values().filter_map(|v| match v {
+            Some(Put { value: Value::Blob(b), .. }) if !self.copied_blobs.contains(&b.id) => Some(b),
+            _ => None,
+        })
     }
 }
 
@@ -263,15 +256,15 @@ impl Txn {
         Ok(r)
     }
 
-    /// Copies the committed value of `from` to `to`, returning whether `from` exists. The
-    /// read of `from` is pinned, so the copy commits only if `from` still holds the value,
-    /// which keeps any blob it references alive (SPEC §5.8).
-    pub async fn copy(&mut self, from: &[u8], to: Bytes) -> Result<bool> {
+    /// Copies the value of `from` to `to` with expiration policy `ttl`, returning whether
+    /// `from` exists. The read of `from` is pinned, so the copy commits only if `from` still
+    /// holds the value, which keeps any blob it references alive (SPEC §5.8).
+    pub async fn copy(&mut self, from: &[u8], to: Bytes, ttl: Option<Ttl>) -> Result<bool> {
         let Some(rv) = self.get_pinned(from).await? else { return Ok(false) };
         if let (Value::Blob(b), Some(_)) = (&rv.value, rv.seq) {
             self.writes.copied_blobs.insert(b.id.clone());
         }
-        self.put(to, rv.value)?;
+        self.put_expiring(to, rv.value, ttl)?;
         Ok(true)
     }
 

@@ -80,6 +80,8 @@ pub enum Op {
     Copy {
         from: String,
         to: String,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
     },
     DeleteRange {
         #[serde(default)]
@@ -460,10 +462,10 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
             txn.delete(k)?;
             Ok(json!({}))
         }
-        Op::Copy { from, to } => {
+        Op::Copy { from, to, ttl_ms } => {
             let f = user_key(&enc.decode(from, "from")?)?;
             let t = user_key(&enc.decode(to, "to")?)?;
-            if !txn.copy(&f, t).await? {
+            if !txn.copy(&f, t, expiry(*ttl_ms)?).await? {
                 return Err(Error::PreconditionFailed {
                     message: format!("key {from} does not exist"),
                     op_index: None,

@@ -792,7 +792,7 @@ may have expired.
 | `scan`         | `prefix` or `start`/`end`, `limit` (≤1000), `reverse`, `keys_only`                                                                             | `{items, next_cursor?}`                                 |
 | `put`          | key, `value` or `blob_id`, `ttl_ms?`                                                                                                           | `{}`                                                    |
 | `delete`       | key                                                                                                                                            | `{}`                                                    |
-| `copy`         | `from`, `to`                                                                                                                                   | `{}`. 412 if `from` does not exist                      |
+| `copy`         | `from`, `to`, `ttl_ms?`                                                                                                                        | `{}`. 412 if `from` does not exist                      |
 | `delete_range` | `prefix` or `start`/`end`                                                                                                                      | `{}` (expanded at commit)                               |
 | `check`        | key + one of `exists`, `version`, `value`                                                                                                      | fails txn with 412 if false                             |
 | `increment`    | key, `by` (i64), `ttl_ms?`                                                                                                                     | `{value}`. Value is ASCII decimal; missing = 0          |
@@ -815,12 +815,13 @@ may have expired.
 commit time (§4.5); `update_row`, `update_rows` and `increment` do not
 update an existing TTL by default.
 
-`copy` writes the committed value of `from` to `to` without moving data: a
-blob value is shared by both keys, not copied, and binding it is exempt from
-the staging rules for new blobs (§4.3). The read of `from` is validated at
-commit under every isolation level, so the copy commits only if `from` still
-references the blob, which keeps a garbage collection sweep from collecting it
-(§5.8). The copy does not keep `from`'s TTL.
+`copy` writes the value of `from` to `to` without moving data: a blob value
+is shared by both keys, not copied, and binding it is exempt from the staging
+rules for new blobs (§4.3). The read of `from` is validated at commit under
+every isolation level, so the copy commits only if `from` still references
+the blob, which keeps a garbage collection sweep from collecting it (§5.8).
+Like `put`, the copy expires only if given `ttl_ms`; it does not inherit
+`from`'s TTL.
 
 A record body is a `value` string or `json` value. Reads return each record
 as `{seq, time, headers?, value | json}`. A read's `next_seq` is where the
@@ -854,13 +855,15 @@ waiting requests and the commits they wait for usually meet there. Between
 wakeups, a strong waiting read repeats every `watch_poll_ms` (1 s), since a
 node without the lease learns of other nodes' commits only from the manifest.
 A snapshot waiting read (`consistency=snapshot&max_staleness_ms=…`) repeats
-only once its snapshot is too stale, so a device that keeps a request waiting
-on an idle database costs one manifest read per `max_staleness_ms` and none
-in between; a lost notice delays it by at most that long.
+only once its snapshot turns too stale, so a device that keeps a request
+waiting on an idle database costs one manifest read per `max_staleness_ms`
+and none in between; a lost notice delays it by at most that long.
 
-A cursor of `0` never expires: a follower starting from nothing needs no
-deletions, so its first pages are the database's live keys, a full state
-transfer.
+Following from `0` is a full state transfer: the pages report every live
+key. A follower starting from nothing needs no deletion older than its first
+page, and its cursors record that page's version, so a transfer paging
+through old entries does not expire while older deletions are purged. Like
+any cursor, it stays valid at least `txn_max_lifetime` after its first page.
 
 The engine finds the keys changed after a version by merging only the
 sources holding entries that new (`Version::changes`): the tail and the
@@ -1000,13 +1003,12 @@ across nodes.
 
 Name resolution is protected against staleness. If a cached name maps to
 a database whose manifest is marked deleted, the name is re-resolved
-strongly and the request continues against the new database. The manifest
-is checked as strongly as the request reads: a request asking for a snapshot
-up to `max_staleness_ms` old checks a manifest at most that old, so it costs
-no store request while the node's copy is fresh. Commits check the manifest
-in any case. If metadata
-still maps the name to the deleted database, the deletion was interrupted
-halfway, and the node completes it. Creating a database whose name belongs
+strongly and the request continues against the new database. A read
+(`GET`) asking for a snapshot up to `max_staleness_ms` old checks a manifest
+at most that old, so it costs no store request while the node's copy is
+fresh; every other request checks the latest manifest. If metadata still
+maps the name to the deleted database, the deletion was interrupted halfway,
+and the node completes it. Creating a database whose name belongs
 to such a half-deleted database also completes the deletion first. A
 manifest is created lazily only after a strong check confirms the database
 exists, so a stale cache can never

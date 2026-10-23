@@ -1267,6 +1267,11 @@
               },
               "to": {
                 "type": "string"
+              },
+              "ttl_ms": {
+                "maximum": 315360000000,
+                "minimum": 1,
+                "type": "integer"
               }
             },
             "required": [

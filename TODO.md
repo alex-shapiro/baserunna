@@ -63,6 +63,12 @@ design context.
       batches currently move the manifest tail into a `BTreeMap` and back into
       a `Vec` on every commit. Merging sorted batch writes into the sorted tail
       vector makes CPU cost proportional to batch size instead of tail size.
+- [ ] **Send commit notices only to nodes with waiting requests.** A node
+      sends its rendezvous home one internal request per manifest install,
+      even when no request waits there, and requests waiting elsewhere (after
+      a failed forward, or on a stale view of the lease) are never notified
+      and wake only when they poll. Nodes could register their interest in a
+      database with the committing node, for as long as requests wait.
 
 ## Features
 

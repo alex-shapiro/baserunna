@@ -390,7 +390,6 @@ struct Follow {
 /// (the client resumes elsewhere with `Last-Event-ID`).
 fn events(node: Arc<Node>, f: Follow, spec: ReadSpec, first: (ReadOut, u64)) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
-    let poll = Duration::from_millis(node.cfg.watch_poll_ms);
     let env = node.env.clone();
     env.spawn(async move {
         let Follow { db, c, name, enc, wait } = f;
@@ -443,7 +442,7 @@ fn events(node: Arc<Node>, f: Follow, spec: ReadSpec, first: (ReadOut, u64)) -> 
                 }
                 quiet_since = Instant::now();
             }
-            db.wait_for_change(v, remaining.min(poll).min(KEEPALIVE)).await;
+            db.wait_for_change(v, crate::api::reread_after(&node, &db, c, until).min(KEEPALIVE)).await;
         }
     });
     let mut resp = Response::new(axum::body::Body::new(ChannelBody(rx)));

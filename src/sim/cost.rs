@@ -698,25 +698,16 @@ async fn streams(w: &mut World, out: &mut Vec<Measurement>) {
     out.push(r.stop("cold_stream_read", "MiB", bytes as f64 / (1 << 20) as f64, true));
 }
 
-/// Posts NDJSON, retrying requests refused without being applied, as when a peer still
-/// routes to a restarted node's previous process.
 async fn post_ndjson(router: &axum::Router, token: &str, path: &str, body: Bytes) -> u16 {
-    for _ in 0..5 {
-        let req = Request::post(path)
-            .header("authorization", format!("Bearer {token}"))
-            .header("content-type", "application/x-ndjson")
-            .body(Body::from(body.clone()))
-            .expect("request");
-        let status = match router.clone().oneshot(req).await {
-            Ok(r) => r.status().as_u16(),
-            Err(e) => match e {},
-        };
-        if status != 503 {
-            return status;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    let req = Request::post(path)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from(body))
+        .expect("request");
+    match router.clone().oneshot(req).await {
+        Ok(r) => r.status().as_u16(),
+        Err(e) => match e {},
     }
-    503
 }
 
 /// Workload parameters for monthly cost estimation.

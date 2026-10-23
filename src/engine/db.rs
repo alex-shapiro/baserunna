@@ -202,7 +202,9 @@ pub struct Db {
     installed: tokio::sync::Notify,
     /// Requests waiting in [`Db::wait_for_change`].
     waiters: std::sync::atomic::AtomicUsize,
-    /// Whether a refresh prompted by another node's commit notice is running.
+    /// The newest version other nodes announced committing ([`Db::notice_commit`]).
+    noticed: std::sync::atomic::AtomicU64,
+    /// Whether [`Db::load_noticed`] is reloading the manifest.
     refreshing: std::sync::atomic::AtomicBool,
     staging: Mutex<Staging>,
     pages: Mutex<PageCache>,
@@ -293,6 +295,7 @@ impl Db {
             write_done: tokio::sync::Notify::new(),
             installed: tokio::sync::Notify::new(),
             waiters: Default::default(),
+            noticed: Default::default(),
             refreshing: Default::default(),
             staging: Mutex::new(Staging::default()),
             pages: Mutex::new(PageCache::default()),
@@ -818,7 +821,7 @@ impl Db {
         if req.deadline.is_none() {
             req.deadline = Some(Instant::now() + Duration::from_millis(self.shared.cfg.commit_timeout_ms));
         }
-        if !req.writes.staged_blob_ids().is_empty() || req.writes.needs_clock() {
+        if req.writes.staged_blobs().next().is_some() || req.writes.needs_clock() {
             self.shared.store_time_ms().await?;
         }
         let (tx, rx) = oneshot::channel();
@@ -867,7 +870,8 @@ impl Db {
     }
 
     /// Waits until a version newer than `than` is installed locally, or until `max` elapses.
-    pub async fn wait_for_change(&self, than: Seq, max: Duration) {
+    /// A version another node announced (`notice_commit`) is loaded while requests wait.
+    pub async fn wait_for_change(self: &Arc<Self>, than: Seq, max: Duration) {
         use std::sync::atomic::Ordering::SeqCst;
         let notified = self.installed.notified();
         let mut notified = std::pin::pin!(notified);
@@ -875,26 +879,54 @@ impl Db {
         if self.current().is_some_and(|c| c.m.version > than) {
             return;
         }
-        self.waiters.fetch_add(1, SeqCst);
+        let _waiting = Waiting::new(&self.waiters);
+        if self.noticed.load(SeqCst) > than {
+            self.load_noticed();
+        }
         let _ = tokio::time::timeout(max, notified).await;
-        self.waiters.fetch_sub(1, SeqCst);
     }
 
-    /// Handles another node's notice that it committed `version`: if requests here are
-    /// waiting for changes and this node has not seen that version, reloads the manifest,
-    /// which wakes them.
+    /// When a snapshot read accepting `max_staleness` would next read the manifest, if this
+    /// node has validated one.
+    pub fn stale_at(&self, max_staleness: Duration) -> Option<Instant> {
+        self.st().verified_at.map(|v| v + max_staleness)
+    }
+
+    /// Handles another node's notice that it committed `version`: requests waiting here for
+    /// changes see it at once, rather than when they next read the manifest.
     pub fn notice_commit(self: &Arc<Self>, version: Seq) {
         use std::sync::atomic::Ordering::SeqCst;
-        if self.waiters.load(SeqCst) == 0 || self.current().is_some_and(|c| c.m.version >= version) {
-            return;
+        self.noticed.fetch_max(version, SeqCst);
+        if self.waiters.load(SeqCst) > 0 {
+            self.load_noticed();
         }
-        if self.refreshing.swap(true, SeqCst) {
+    }
+
+    /// Reloads the manifest until it holds the newest noticed version, while requests wait.
+    /// At most one reload runs at a time; notices that arrive during one are covered by it or
+    /// by the next.
+    fn load_noticed(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let behind =
+            |db: &Db| db.waiters.load(SeqCst) > 0 && db.current().is_none_or(|c| c.m.version < db.noticed.load(SeqCst));
+        if !behind(self) || self.refreshing.swap(true, SeqCst) {
             return;
         }
         let me = self.clone();
         self.shared.env.spawn(async move {
-            let _ = me.read_version(Consistency::Strong).await;
-            me.refreshing.store(false, SeqCst);
+            loop {
+                while behind(&me) {
+                    probe::hit(Probe::NoticedVersionLoaded);
+                    if me.read_version(Consistency::Strong).await.is_err() {
+                        me.refreshing.store(false, SeqCst);
+                        return;
+                    }
+                }
+                me.refreshing.store(false, SeqCst);
+                if !behind(&me) || me.refreshing.swap(true, SeqCst) {
+                    return;
+                }
+            }
         });
     }
 
@@ -1427,8 +1459,8 @@ impl Db {
                     if blob_bytes > 0 {
                         m.blob_bytes.bound += blob_bytes;
                         let mut g = self.staging();
-                        for id in req.writes.blob_ids() {
-                            g.staged.remove(&id);
+                        for b in req.writes.staged_blobs() {
+                            g.staged.remove(&b.id);
                         }
                     }
                     accepted.push(&req.writes);
@@ -2216,6 +2248,23 @@ fn pending<'a>(base: &'a Version, m: &Manifest, tail: &'a BTreeMap<Bytes, Entry>
     Pending { base, tail, batch_deletes }
 }
 
+/// Counts a request in [`Db::wait_for_change`] for as long as it waits, including when the
+/// request is dropped mid-wait.
+struct Waiting<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn new(n: &'a std::sync::atomic::AtomicUsize) -> Self {
+        n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Waiting(n)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Clock-error margin added to `blob_stage_ttl_ms` during sweeps so a blob is never marked
 /// obsolete while a committing node can still accept it.
 fn bind_margin_ms(cfg: &super::EngineConfig) -> u64 {
@@ -2225,14 +2274,14 @@ fn bind_margin_ms(cfg: &super::EngineConfig) -> u64 {
 /// Validates that all staged blobs referenced by `w` are within the stage TTL
 /// and have not been marked obsolete.
 fn bindable(w: &WriteSet, m: &Manifest, store_now: Option<u64>, cfg: &super::EngineConfig) -> Result<()> {
-    let ids = w.staged_blob_ids();
-    if ids.is_empty() {
+    let mut staged = w.staged_blobs().peekable();
+    if staged.peek().is_none() {
         return Ok(());
     }
     let now = store_now.ok_or_else(|| Error::unavailable("store clock not synchronized"))?;
-    let expired = ids.iter().any(|id| {
-        super::types::blob_id_time(id).unwrap_or(0) + cfg.blob_stage_ttl_ms < now
-            || m.obsolete.iter().any(|o| o.kind == ObjKind::Blob && o.id == *id)
+    let expired = staged.any(|b| {
+        super::types::blob_id_time(&b.id).unwrap_or(0) + cfg.blob_stage_ttl_ms < now
+            || m.obsolete.iter().any(|o| o.kind == ObjKind::Blob && o.id == b.id)
     });
     if expired {
         return Err(Error::invalid("a staged blob expired before it was committed"));
@@ -2286,16 +2335,12 @@ pub(crate) fn quota_exceeded(limit: u64) -> Error {
     Error::QuotaExceeded(format!("the database is at its size quota of {limit} bytes; delete data to make room"))
 }
 
-/// Returns `(total_added_bytes, bound_blob_bytes)` for a commit write set.
+/// Returns `(total_added_bytes, bound_blob_bytes)` for a commit write set. Copied blobs are
+/// already stored, so they add no blob bytes.
 fn growth(w: &WriteSet) -> (u64, u64) {
-    let mut added: u64 = w.streams.iter().map(StreamOp::appended_bytes).sum();
-    let mut blobs = 0;
-    for (k, p) in w.puts.iter().filter_map(|(k, p)| Some((k, p.as_ref()?))) {
-        added += (k.len() + p.value.size()) as u64;
-        if let Value::Blob(b) = &p.value {
-            blobs += b.size;
-        }
-    }
+    let added: u64 = w.streams.iter().map(StreamOp::appended_bytes).sum::<u64>()
+        + w.puts.iter().filter_map(|(k, p)| Some((k.len() + p.as_ref()?.value.size()) as u64)).sum::<u64>();
+    let blobs: u64 = w.staged_blobs().map(|b| b.size).sum();
     (added + blobs, blobs)
 }
 

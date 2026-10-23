@@ -159,9 +159,16 @@ impl Watcher {
         w
     }
 
+    /// Restarts from the database's current state: from a scan, or by following the feed
+    /// from version 0, a full state transfer that spans many versions when pages are small.
     async fn resync(&mut self) {
         self.cursor_at = self.c.sim.now_ms();
-        (self.state, self.cursor) = read_all(&self.c).await;
+        if self.c.rng().chance(0.5) {
+            self.state.clear();
+            self.cursor = "0".into();
+        } else {
+            (self.state, self.cursor) = read_all(&self.c).await;
+        }
     }
 
     /// Polls the change feed once, returning `Some(true)` if caught up or

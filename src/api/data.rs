@@ -6,7 +6,7 @@ use super::{
     with_read, with_txn,
 };
 use crate::engine::manifest::ObjKind;
-use crate::engine::{Change, ChangePos, Committed, Consistency, Isolation, Txn, Value, blob};
+use crate::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn, Value, blob};
 use crate::error::{Error, Result};
 use crate::meta::{self, DbRecord, DbRef, MetaCmd};
 use crate::node::{Node, OpenTxn};
@@ -713,9 +713,9 @@ fn bad_commit_id() -> Error {
 
 const WATCH_WAIT_MAX_MS: u64 = 60_000;
 
-fn feed_params(q: &Params) -> Result<(ChangePos, usize, Duration)> {
+fn feed_params(q: &Params) -> Result<(ChangeCursor, usize, Duration)> {
     let after = q.get("after").ok_or_else(|| Error::invalid("after is required (a version or a next_cursor)"))?;
-    let after = ChangePos::decode(after).ok_or_else(|| Error::invalid("bad after"))?;
+    let after = ChangeCursor::decode(after).ok_or_else(|| Error::invalid("bad after"))?;
     let limit = match q.get("limit") {
         None => 100,
         Some(l) => l
@@ -735,7 +735,7 @@ fn feed_params(q: &Params) -> Result<(ChangePos, usize, Duration)> {
     Ok((after, limit, Duration::from_millis(wait)))
 }
 
-impl Found for (Vec<Json>, bool, ChangePos) {
+impl Found for (Vec<Json>, bool, ChangeCursor) {
     fn found(&self) -> bool {
         !self.0.is_empty()
     }
@@ -759,11 +759,7 @@ async fn kv_changes(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbC
         for ch in &page.changes {
             out.push(kv_change_json(&octx, ch, t.read_time, keys_only).await?);
         }
-        let next = match (page.more, page.changes.last()) {
-            (true, Some(c)) => c.pos(),
-            _ => after.clone().max(ChangePos::after_version(t.read_version())),
-        };
-        Ok::<_, Error>((out, page.more, next))
+        Ok::<_, Error>((out, page.more, page.next))
     });
     Ok(axum::Json(json!({"changes": changes, "more": more, "next_cursor": next.encode(), "version": v})))
 }

@@ -311,28 +311,38 @@ impl Node {
     /// a database without a lease are routed to its home, so waiting requests usually are
     /// there. Best effort: a lost notice delays waiters until they poll.
     fn notify_home(self: &Arc<Self>, db: &str, version: u64) {
+        if db == SYS_DB {
+            return;
+        }
         let live = self.live_members();
         let Some(home) = cluster::rendezvous(db, &live) else { return };
         if home.id == self.id || home.addr == self.cfg.addr {
             return;
         }
         let addr = home.addr.clone();
-        let body = serde_json::json!({"db": db, "version": version}).to_string();
-        let key = self.cluster_key();
-        let me = self.clone();
+        let Ok(req) = self.internal_request("/internal/v1/notice", &serde_json::json!({"db": db, "version": version}))
+        else {
+            return;
+        };
+        let transport = self.services.transport.clone();
         self.env.spawn(async move {
-            let Ok(mut req) =
-                Request::post("/internal/v1/notice").header("content-type", "application/json").body(Body::from(body))
-            else {
-                return;
-            };
-            if let Some(k) = key
-                && let Ok(v) = k.parse()
-            {
-                req.headers_mut().insert(CLUSTER_KEY_HEADER, v);
-            }
-            let _ = me.services.transport.call(&addr, req).await;
+            let _ = transport.call(&addr, req).await;
         });
+    }
+
+    /// A request to another node's internal endpoint `path`, carrying the cluster key.
+    fn internal_request(&self, path: &str, body: &impl serde::Serialize) -> Result<Request<Body>> {
+        let body = serde_json::to_vec(body).map_err(|e| Error::internal(e.to_string()))?;
+        let mut req = Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if let Some(k) = self.cluster_key()
+            && let Ok(v) = k.parse()
+        {
+            req.headers_mut().insert(CLUSTER_KEY_HEADER, v);
+        }
+        Ok(req)
     }
 
     async fn bootstrap(self: &Arc<Self>) -> Result<()> {
@@ -692,16 +702,7 @@ impl Node {
         cmd: &MetaCmd,
         deadline: Instant,
     ) -> std::result::Result<Json, std::result::Result<Error, cluster::TransportError>> {
-        let body = serde_json::to_vec(cmd).map_err(|e| Ok(Error::internal(e.to_string())))?;
-        let mut req = Request::post("/internal/v1/meta")
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .map_err(|e| Ok(Error::internal(e.to_string())))?;
-        if let Some(k) = self.cluster_key()
-            && let Ok(v) = k.parse()
-        {
-            req.headers_mut().insert(CLUSTER_KEY_HEADER, v);
-        }
+        let mut req = self.internal_request("/internal/v1/meta", cmd).map_err(Ok)?;
         if let Ok(v) = self.env.random_hex(16).parse() {
             req.headers_mut().insert(cluster::FORWARD_ID_HEADER, v);
         }
@@ -1414,6 +1415,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::sim::cost::{World, run_paused};
+    use bytes::Bytes;
     use std::time::Duration;
 
     #[test]
@@ -1502,6 +1504,29 @@ mod tests {
             let there: Vec<&str> =
                 live.iter().filter(|m| m.addr == "http://elsewhere").map(|m| m.id.as_str()).collect();
             assert_eq!(there, ["after"]);
+        });
+    }
+
+    #[test]
+    fn writes_routed_to_a_restarted_home_are_handled_locally() {
+        run_paused(async {
+            let mut w = World::new(2, 1).await;
+            for i in 0..2 {
+                w.node(i).refresh_members().await.unwrap();
+            }
+            let t = w.signup(0, "fwd@x.io").await;
+            let id = w.create_db(0, &t, "d").await;
+            assert_eq!(w.holder(&id), None, "setup: an unleased database is routed to its home");
+            let live = w.node(0).live_members();
+            let home_id = super::cluster::rendezvous(&id, &live).unwrap().id.clone();
+            let home = (0..2).find(|&i| w.node(i).id == home_id).unwrap();
+            let other = 1 - home;
+            w.restart_node(home).await;
+            // The other node still knows only the home's previous process, which the new
+            // process at its address refuses; the write is not applied there, so it runs here.
+            let put = Bytes::from(serde_json::json!({"ops": [{"op": "put", "key": "k", "value": "v"}]}).to_string());
+            let r = w.call(other, "POST", "/v1/dbs/d/txn", &t, put).await;
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         });
     }
 

@@ -6299,6 +6299,72 @@
         ]
       }
     },
+    "/v1/limits": {
+      "get": {
+        "description": "Clients use these limits to size transactions, scans, long polls, and uploads.",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "blob_max": {
+                      "type": "integer"
+                    },
+                    "blob_stage_ttl_ms": {
+                      "type": "integer"
+                    },
+                    "json_body_max": {
+                      "type": "integer"
+                    },
+                    "json_value_max": {
+                      "type": "integer"
+                    },
+                    "long_poll_max_ms": {
+                      "type": "integer"
+                    },
+                    "scan_limit_max": {
+                      "type": "integer"
+                    },
+                    "txn_max_ops": {
+                      "type": "integer"
+                    },
+                    "txn_max_write_bytes": {
+                      "type": "integer"
+                    },
+                    "value_inline_max": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "txn_max_ops",
+                    "txn_max_write_bytes",
+                    "value_inline_max",
+                    "scan_limit_max",
+                    "long_poll_max_ms",
+                    "json_value_max",
+                    "json_body_max",
+                    "blob_max",
+                    "blob_stage_ttl_ms"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Limits"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [],
+        "summary": "Request limits of the server",
+        "tags": [
+          "ops"
+        ]
+      }
+    },
     "/v1/me": {
       "delete": {
         "description": "Deletes the account along with its sessions, API keys, memberships, and databases (purged after a grace period). Password-authenticated accounts must confirm their password. Rejected for the last administrator or the sole owner of an organization. Requires a session.",

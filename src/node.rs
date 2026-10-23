@@ -602,13 +602,17 @@ impl Node {
     }
 
     /// Returns the `(node_id, addr)` of the peer that should handle `db_id`, or `None` to handle locally.
-    pub async fn route(&self, db_id: &str) -> Option<(String, String)> {
+    ///
+    /// A request goes to the lease holder if one is known, and otherwise to the rendezvous home.
+    /// A long poll (`waits`) always goes to the rendezvous home: every commit wakes waiters there
+    /// (§6.4), whereas a waiter on a lease holder misses commits made after the lease moves.
+    pub async fn route(&self, db_id: &str, waits: bool) -> Option<(String, String)> {
         if crate::buggify::fault(0.02) {
             return None;
         }
         let db = self.engine.db(db_id);
         let _ = db.open(false).await;
-        let target = match db.lease_holder() {
+        let target = match db.lease_holder().filter(|_| !waits) {
             Some(h) => h,
             None => {
                 let live = self.live_members();
@@ -1502,7 +1506,7 @@ mod tests {
             let homed = (0..)
                 .map(|i| format!("db{i}"))
                 .find(|d| super::cluster::rendezvous(d, &both).unwrap().id == "earlier-run");
-            assert_eq!(a.route(&homed.unwrap()).await, None);
+            assert_eq!(a.route(&homed.unwrap(), false).await, None);
         });
     }
 
@@ -1672,6 +1676,71 @@ mod tests {
             commit().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert_eq!(notices() - before, 3);
+        });
+    }
+
+    #[test]
+    fn limits_report_the_configured_bounds() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let n = w.node(0);
+            let j = w.json(0, "GET", "/v1/limits", "", serde_json::Value::Null).await;
+            assert_eq!(j["long_poll_max_ms"], crate::api::LONG_POLL_MAX_MS, "{j}");
+            assert_eq!(j["txn_max_ops"], crate::ops::MAX_TXN_OPS);
+            assert_eq!(j["scan_limit_max"], crate::ops::MAX_SCAN_LIMIT);
+            assert_eq!(j["value_inline_max"], n.engine.shared.cfg.value_inline_max);
+            assert_eq!(j["txn_max_write_bytes"], n.engine.shared.cfg.txn_max_write_bytes);
+            assert_eq!(j["json_value_max"], n.cfg.json_value_max);
+            assert_eq!(j["json_body_max"], n.cfg.max_json_body);
+            assert_eq!(j["blob_stage_ttl_ms"], n.engine.shared.cfg.blob_stage_ttl_ms);
+        });
+    }
+
+    #[test]
+    fn long_polls_wake_after_the_lease_moves_to_the_home() {
+        run_paused(async {
+            let w = World::new(2, 1).await;
+            for i in 0..2 {
+                w.node(i).refresh_members().await.unwrap();
+            }
+            let t = w.signup(0, "moves@x.io").await;
+            let id = w.create_db(0, &t, "d").await;
+            let live = w.node(0).live_members();
+            let home_id = super::cluster::rendezvous(&id, &live).unwrap().id.clone();
+            let home = (0..2).find(|&i| w.node(i).id == home_id).unwrap();
+            let other = 1 - home;
+            let commit = |i: usize, value: &'static [u8]| {
+                let db = w.node(i).engine.db(&id);
+                async move {
+                    let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                    txn.put(crate::ops::user_key(b"k").unwrap(), crate::engine::Value::Inline(Bytes::from(value)))
+                        .unwrap();
+                    db.commit(txn.into_request()).await.unwrap()
+                }
+            };
+            w.json(other, "GET", "/v1/dbs/d/changes?after=0", &t, serde_json::Value::Null).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            commit(other, b"1").await;
+            assert_eq!(w.holder(&id), Some(other), "setup: the other node leases");
+            let feed = w.json(other, "GET", "/v1/dbs/d/changes?after=0", &t, serde_json::Value::Null).await;
+            let cursor = feed["next_cursor"].as_str().unwrap().to_string();
+            let (router, t2) = (w.node(other).router().unwrap(), t.clone());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            w.node(other).env.spawn(async move {
+                let path = format!(
+                    "/v1/dbs/d/changes?after={cursor}&wait_ms=50000&consistency=snapshot&max_staleness_ms=300000"
+                );
+                let r = crate::sim::cost::call_router(&router, "GET", &path, &t2, Bytes::new()).await;
+                let _ = tx.send((r.status, r.body, tokio::time::Instant::now()));
+            });
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            commit(home, b"2").await;
+            let committed = tokio::time::Instant::now();
+            let (status, body, answered) = rx.await.unwrap();
+            assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+            let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(j["changes"].as_array().map(Vec::len), Some(1), "{j}");
+            assert!(answered - committed < Duration::from_secs(2), "woke {:?} after the commit", answered - committed);
         });
     }
 

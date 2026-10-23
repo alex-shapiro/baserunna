@@ -526,6 +526,42 @@ fn paths() -> Value {
         },
     );
     add(
+        "/v1/limits",
+        "get",
+        Op {
+            public: true,
+            desc: Some("Clients use these limits to size transactions, scans, long polls, and uploads."),
+            ..op(
+                "Request limits of the server",
+                "ops",
+                vec![(
+                    "200",
+                    resp(
+                        "Limits",
+                        obj(
+                            json!({
+                                "txn_max_ops": i(), "txn_max_write_bytes": i(), "value_inline_max": i(),
+                                "scan_limit_max": i(), "long_poll_max_ms": i(), "json_value_max": i(),
+                                "json_body_max": i(), "blob_max": i(), "blob_stage_ttl_ms": i(),
+                            }),
+                            &[
+                                "txn_max_ops",
+                                "txn_max_write_bytes",
+                                "value_inline_max",
+                                "scan_limit_max",
+                                "long_poll_max_ms",
+                                "json_value_max",
+                                "json_body_max",
+                                "blob_max",
+                                "blob_stage_ttl_ms",
+                            ],
+                        ),
+                    ),
+                )],
+            )
+        },
+    );
+    add(
         "/v1/openapi.json",
         "get",
         Op { public: true, ..op("This document", "ops", vec![("200", resp("OpenAPI document", json!({})))]) },

@@ -108,6 +108,15 @@ design context.
 
 ## Testing
 
+- [ ] **Wake long polls while membership views differ.** Nodes route long
+      polls and send commit notices to the rendezvous home in their own view of
+      the live members. While views differ, a long poll can wait on a node that
+      notices do not reach, and it ends only at its timeout or when its
+      snapshot is stale. Views differ while a starting node's heartbeat has not
+      reached every peer's member table, and between refreshes if
+      `members_refresh_ms` is more than about `2 × heartbeat_ms` (the swarm
+      knobs generate such configurations). Derive the liveness window from both
+      settings, and send notices to the homes of recent member views.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the
       model-checked `http_txn` target.
 - [ ] **Run mutation testing in CI**, running `scripts/mutants.sh --in-diff` on
@@ -127,6 +136,10 @@ design context.
       a small number of seeds. Deduplicating failures by normalized message,
       weighting corpus entries by novelty, and incorporating probe-ordering
       and buggify-site features would preserve depth while improving breadth.
+
+- [ ] **Refresh bug zoo patches that no longer apply.** `09-stale-names-after-purge`,
+      `11-duplicated-forwards`, and `16-duplicated-forwards-across-restart` do
+      not apply to `main`.
 
 ## Docs
 

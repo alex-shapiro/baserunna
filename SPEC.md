@@ -871,7 +871,10 @@ To compute a page (`Version::changes`), the engine merges only the `tail` and se
   hour (about $0.15 a month).
 - **Routing**: for a request on DB `d`, the target is the lease holder if a
   valid lease is known, otherwise the live node maximizing
-  `hash(node_id ‖ d)` (rendezvous hashing). If the lease holder is not in the
+  `hash(node_id ‖ d)` (rendezvous hashing). Long-poll requests (`GET` with
+  `wait_ms > 0`) are always routed to the rendezvous home node, where commit
+  notices are sent (§6.4), so that waiting requests are notified even if
+  another node acquires the lease. If the lease holder is not in the
   cached member table, the node refreshes the member table with a strong read
   at most once per second. A member entry with the node's own
   address belongs to a previous process and is ignored during routing. If the target is another node, the
@@ -1126,6 +1129,7 @@ Routes (see the OpenAPI document for bodies):
 ```
 GET /healthz liveness (503 while shutting down)
 GET /v1/openapi.json
+GET /v1/limits request limits
 POST /v1/auth/signup | /v1/auth/login | /v1/auth/logout
 GET /v1/auth/google/start | /v1/auth/google/callback
 POST /v1/auth/verify-email a mailed verification token

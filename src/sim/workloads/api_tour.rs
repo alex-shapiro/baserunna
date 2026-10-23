@@ -1,5 +1,5 @@
-//! `api_tour`: exercises schema drop endpoints, interactive transaction aborts,
-//! commit status lookup by idempotency key, and admin metadata endpoints.
+//! Simulation workload for public endpoints, schema drop endpoints, interactive transaction
+//! aborts, commit status lookup by idempotency key, and admin metadata endpoints.
 
 use super::super::Sim;
 use super::super::client::Client;
@@ -13,6 +13,9 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     expect(h.json["ok"] == true, "healthz")?;
     let doc = anon.call_retry("GET", "/v1/openapi.json", None).await;
     expect(doc.json["openapi"] == "3.1.0", "openapi document")?;
+    let limits = anon.call_retry("GET", "/v1/limits", None).await;
+    let long_poll_max_ms = limits.json["long_poll_max_ms"].as_u64();
+    expect(long_poll_max_ms == Some(crate::api::LONG_POLL_MAX_MS), format!("limits: {}", limits.json))?;
     let r = anon.call_retry("GET", "/v1/auth/google/start", None).await;
     expect(r.status == 302, format!("google start: {}", r.status))?;
     let r = anon.call_retry("GET", "/v1/auth/google/callback?code=x&state=y", None).await;
@@ -23,6 +26,9 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     expect(me.json["user"]["email"] == "tour@api.test", "me")?;
     c.create_db("tour").await?;
     let base = "/v1/dbs/tour";
+    let excess_wait_ms = long_poll_max_ms.unwrap_or(0) + 1;
+    let r = c.call_retry("GET", &format!("{base}/changes?after=0&wait_ms={excess_wait_ms}"), None).await;
+    expect(r.status == 400, format!("wait_ms above limit: {}", r.status))?;
 
     let r = c
         .call_settled(

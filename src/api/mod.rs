@@ -281,7 +281,14 @@ fn finishes_txn(req: &Request) -> bool {
     }
 }
 
-/// Authenticates database-scoped requests and forwards them to the lease holder or handles them locally.
+fn is_long_poll(req: &Request) -> bool {
+    req.method() == http::Method::GET
+        && req.uri().query().is_some_and(|q| {
+            q.split('&').filter_map(|kv| kv.strip_prefix("wait_ms=")).any(|w| w.parse::<u64>().is_ok_and(|w| w > 0))
+        })
+}
+
+/// Authenticates database-scoped requests and routes them to the target node or handles them locally.
 async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
     let arrived = tokio::time::Instant::now();
     let res: Result<Response> = crate::engine::db::invoked_at(arrived, async {
@@ -297,7 +304,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         let (mut rec, mut access) = node.resolve_db(&principal, &name).await?;
         let hops = hops(req.headers());
         if hops < 2
-            && let Some((target, addr)) = node.route(&rec.id).await
+            && let Some((target, addr)) = node.route(&rec.id, is_long_poll(&req)).await
         {
             let small = req.method() == http::Method::GET
                 || req.method() == http::Method::DELETE
@@ -885,6 +892,21 @@ async fn healthz(State(node): State<Arc<Node>>) -> Response {
     axum::Json(json!({"ok": true, "node": node.status_json()})).into_response()
 }
 
+async fn limits(State(node): State<Arc<Node>>) -> axum::Json<Json> {
+    let engine_cfg = &node.engine.shared.cfg;
+    axum::Json(json!({
+        "txn_max_ops": crate::ops::MAX_TXN_OPS,
+        "txn_max_write_bytes": engine_cfg.txn_max_write_bytes,
+        "value_inline_max": engine_cfg.value_inline_max,
+        "scan_limit_max": crate::ops::MAX_SCAN_LIMIT,
+        "long_poll_max_ms": LONG_POLL_MAX_MS,
+        "json_value_max": node.cfg.json_value_max,
+        "json_body_max": node.cfg.max_json_body,
+        "blob_max": engine_cfg.blob_max,
+        "blob_stage_ttl_ms": engine_cfg.blob_stage_ttl_ms,
+    }))
+}
+
 async fn openapi() -> Response {
     ([(http::header::CONTENT_TYPE, "application/json")], openapi::document_json()).into_response()
 }
@@ -904,6 +926,7 @@ pub fn router(node: Arc<Node>) -> Router {
     let r = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/openapi.json", get(openapi))
+        .route("/v1/limits", get(limits))
         .merge(account::routes())
         .merge(orgs::routes())
         .route("/v1/dbs", get(data::list_dbs).post(data::create_db))

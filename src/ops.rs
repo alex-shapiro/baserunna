@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 pub const MAX_USER_KEY: usize = 4096;
 pub const MAX_SCAN_LIMIT: usize = 1000;
+pub const MAX_TXN_OPS: usize = 10_000;
 pub const MAX_TTL_MS: u64 = 10 * 365 * 24 * 3_600_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -385,8 +386,8 @@ pub async fn value_bytes(db: &Db, v: &Value) -> Result<Bytes> {
 
 /// Executes `ops` sequentially inside `txn`, returning one JSON result per operation.
 pub async fn exec_ops(ctx: &OpCtx<'_>, txn: &mut Txn, ops: &[Op]) -> Result<Vec<Json>> {
-    if ops.len() > 10_000 {
-        return Err(Error::invalid("too many ops (max 10000)"));
+    if ops.len() > MAX_TXN_OPS {
+        return Err(Error::invalid(format!("too many ops (max {MAX_TXN_OPS})")));
     }
     let mut results = Vec::with_capacity(ops.len());
     for (i, op) in ops.iter().enumerate() {

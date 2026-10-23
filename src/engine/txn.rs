@@ -60,8 +60,9 @@ pub struct WriteSet {
     /// Changes to streams, applied after `puts` by the committer, which
     /// gives appends their seqs (SPEC §5.11).
     pub streams: Vec<StreamOp>,
-    /// Blobs written by copying a committed value (`Txn::copy`). They are
-    /// already bound, so the staging rules for binding do not apply to them.
+    /// IDs of blobs copied from committed entries via [`Txn::copy`]. Because these
+    /// blobs are already bound in the manifest, commit validation skips staging checks
+    /// and quota additions for them.
     pub copied_blobs: std::collections::BTreeSet<String>,
 }
 
@@ -85,8 +86,8 @@ impl WriteSet {
             || self.streams.iter().any(|s| matches!(s, StreamOp::Append { .. }))
     }
 
-    /// Blobs this write set binds for the first time, each once: staged blobs, as opposed to
-    /// copies of values that already reference them.
+    /// Returns deduplicated blob references bound by this write set that are not in
+    /// `copied_blobs`.
     pub fn staged_blobs(&self) -> impl Iterator<Item = &BlobRef> {
         let mut seen = std::collections::BTreeSet::new();
         self.puts.values().filter_map(move |v| match v {
@@ -259,9 +260,10 @@ impl Txn {
         Ok(r)
     }
 
-    /// Copies the value of `from` to `to` with expiration policy `ttl`, returning whether
-    /// `from` exists. The read of `from` is pinned, so the copy commits only if `from` still
-    /// holds the value, which keeps any blob it references alive (SPEC §5.8).
+    /// Copies the value of `from` to `to` with expiration policy `ttl`, and returns `true` if
+    /// `from` exists. Pins `from` in the read set so that the commit fails if `from` is
+    /// modified before commit under any isolation level, preventing a referenced blob from
+    /// becoming unreferenced before the commit (SPEC §5.8).
     pub async fn copy(&mut self, from: &[u8], to: Bytes, ttl: Option<Ttl>) -> Result<bool> {
         let Some(rv) = self.get_pinned(from).await? else { return Ok(false) };
         if let (Value::Blob(b), Some(_)) = (&rv.value, rv.seq) {

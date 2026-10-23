@@ -285,11 +285,11 @@ and a stream record may be committed alongside a row update.
   retried with its idempotency key is applied once and returns the sequence
   numbers and timestamp from the original commit. An empty append writes no
   records but still validates `expect_seq`.
-- **Reads** start at a seq, a time, the last N records (`tail`) or a
-  consumer's cursor, run forward or in reverse, and stop at a limit (at
-  most 1,000 records and 16 MiB) or at an end seq or time. A forward read
-  that reaches the end can wait up to 50 s for the next append (`wait_ms`),
-  or stay open and deliver records as server-sent events.
+- **Reads** start at a sequence number, a timestamp, the last N records (`tail`),
+  or a consumer cursor, scan forward or in reverse, and stop at a limit (up to
+  1,000 records or 16 MiB) or at an end sequence number or timestamp. At the
+  end of a stream, a forward read can wait up to 50 s for a new append
+  (`wait_ms`) or stream records as server-sent events.
 - **Filters** (§4.7) select records by a JSON body field (`field`, a dotted
   path whose numeric segments index arrays), a header (`header`) or, naming
   neither, the body's text, which only `contains` tests. A filtered read
@@ -636,10 +636,7 @@ Crashed flushes, aborted compactions, abandoned blob uploads, and overwritten ro
 
 Because compaction output segments are unreferenced until the compaction is installed, a sweep can mark the outputs of a compaction that runs longer than the orphan grace period as obsolete. The compaction rejects the installation if its output segments have been marked obsolete.
 
-Blobs bound by `copy` (§6.3) were already referenced by the key copied, and
-the copy's read of that key is validated at commit, so every version between
-the read and the commit references the blob; no sweep can find it unreferenced
-in between.
+A `copy` operation (§6.3) shares the source key's blob without restaging it. Because the committer validates that the source key is unchanged at commit time under all isolation levels, the blob remains referenced in every manifest version between the read and the commit and cannot be swept as an orphan.
 
 #### Long Blob Reads
 
@@ -786,9 +783,7 @@ may have expired.
 
 ### 6.3 Ops
 
-Each op is listed with its fields and its result.
-
-Keys:
+Key operations:
 
 - `get`: key → `{found, value? | blob?, version?, expires_at?}`
 - `scan`: `prefix` or `start`/`end`, `limit` (≤1000), `reverse`, `keys_only` →
@@ -799,15 +794,15 @@ Keys:
 - `delete_range`: `prefix` or `start`/`end` → `{}` (expanded at commit)
 - `check`: key and one of `exists`, `version`, `value` → fails the
   transaction with 412 if false
-- `increment`: key, `by` (i64), `ttl_ms?` → `{value}`; the value is ASCII
-  decimal, and a missing key counts as 0
+- `increment`: key, `by` (i64), `ttl_ms?` → `{value}`; the value is an ASCII
+  decimal integer, and a missing key is treated as 0
 
-Rows:
+Row operations:
 
 - `get_row`: table, `pk` (array or scalar) → `{found, row?, expires_at?}`
 - `insert_row`: table, `row`, `ttl_ms?` → `{}`; 409 if the pk exists
 - `upsert_row`: table, `row`, `ttl_ms?` → `{}`
-- `update_row`: table, `pk`, `set`, `ttl_ms?` → `{found}` (a partial update)
+- `update_row`: table, `pk`, `set`, `ttl_ms?` → `{found}` (partial update)
 - `delete_row`: table, `pk` → `{found}`
 - `query_rows`: table, `index?`, `eq?`, `range?`, `filter?`, `limit`,
   `reverse`, `cursor` → `{rows, next_cursor?}`
@@ -815,7 +810,7 @@ Rows:
   `ttl_ms?`, `limit?` → `{count}`
 - `delete_rows`: table, `where`, `limit?` → `{count}`
 
-Streams:
+Stream operations:
 
 - `append`: stream, `records` (`value` or `json`, `headers?`), `expect_seq?`,
   `create?` → `{count, first_seq?}` (`first_seq` once committed)
@@ -831,13 +826,11 @@ Streams:
 commit time (§4.5); `update_row`, `update_rows` and `increment` do not
 update an existing TTL by default.
 
-`copy` writes the value of `from` to `to` without moving data: a blob value
-is shared by both keys, not copied, and binding it is exempt from the staging
-rules for new blobs (§4.3). The read of `from` is validated at commit under
-every isolation level, so the copy commits only if `from` still references
-the blob, which keeps a garbage collection sweep from collecting it (§5.8).
-Like `put`, the copy expires only if given `ttl_ms`; it does not inherit
-`from`'s TTL.
+`copy` writes the value of `from` to `to` without duplicating blob data. If
+`from` references a blob, `to` references the same blob without restaging
+(§4.3), and the source read is validated at commit time under all isolation
+levels so the blob cannot be garbage-collected before the commit (§5.8). `to`
+does not inherit the TTL of `from`; it expires only if `ttl_ms` is specified.
 
 A record body is a `value` string or `json` value. Reads return each record
 as `{seq, time, headers?, value | json}`. A read's `next_seq` is where the
@@ -850,47 +843,11 @@ on the request, every key and value in the request and response is standard base
 
 ### 6.4 Change feeds
 
-`GET /v1/dbs/{db}/changes?after=…` follows changes to keys, optionally
-of a `prefix` or a `start`/`end` range; `GET /v1/dbs/{db}/tables/{t}/changes`
-follows changes for a specific table. A page reports, for each key changed after
-`after`, its state as of the page's snapshot: its value (and `expires_at`),
-`deleted` (also once its value expired), or for a large range delete one
-`deleted_range`. Intermediate key values are not reported.
-Changes are ordered by version, and within a version range deletions are ordered
-first; a page holds at most `limit` of them and carries a `next_cursor` to
-pass as the next `after`, at once while `more` is true. Applying pages in
-order to the state at `after` yields the current state.
+Change feeds stream modified keys (`GET /v1/dbs/{db}/changes?after=…`, with an optional `prefix` or `start`/`end` range) or table rows (`GET /v1/dbs/{db}/tables/{t}/changes`) so that applying pages in order reconstructs the current state. For each key modified after the `after` cursor, a page reports the key's latest state in the page snapshot: its current value (with `expires_at` if set), `deleted` (including expired keys), or a `deleted_range` entry for a large range deletion. Intermediate values are omitted. Changes are ordered by version, with range deletions before key entries at the same version. Each page returns up to `limit` changes and a `next_cursor` to pass as the next `after` parameter; if `more` is true, additional changes are immediately available.
 
-With `wait_ms` (up to 50 s), a request that finds no change waits for one. A
-waiting request wakes when its node installs a newer version: one the node
-committed, or one another node announced. A node that commits a version of a
-database tells the database's rendezvous home (§7) with a best-effort
-internal notice, at most one in flight per database, carrying the newest
-version; the home reloads the manifest if requests there are waiting.
-Requests for a database without a lease are routed to its home, so waiting
-requests and the commits they wait for usually meet there. Between
-wakeups, a strong waiting read repeats every `watch_poll_ms` (1 s), since a
-node without the lease learns of other nodes' commits only from the manifest.
-A snapshot waiting read (`consistency=snapshot&max_staleness_ms=…`) repeats
-only once its snapshot turns too stale, so a device that keeps a request
-waiting on an idle database costs one manifest read per `max_staleness_ms`
-and none in between; a lost notice delays it by at most that long.
+If a poll finds 0 changes and `wait_ms` (up to 50 s) is set, the request waits until a newer version is installed on the node or the timeout expires. A node installs a newer version either by committing locally or by receiving a commit notice from another node. After committing a new data version, a node sends a best-effort `/internal/v1/notice` request with the latest version to the database's rendezvous home node (§7), coalescing concurrent notices so at most 1 request is in flight per database. If the home node has active waiters, it reloads the manifest and wakes them. While waiting without a wakeup, a `strong` read re-checks the manifest every `watch_poll_ms` (1 s), whereas a `snapshot` read (`consistency=snapshot&max_staleness_ms=…`) re-checks the manifest only after its cached snapshot exceeds `max_staleness_ms`.
 
-Following from `0` is a full state transfer: the pages report every live
-key. A follower starting from nothing needs no deletion older than every page
-it has read, and its cursors record the oldest version a page was read at, so
-a transfer paging through old entries does not expire while older deletions
-are purged. Like any cursor, it stays valid at least `txn_max_lifetime` after
-its oldest page.
-
-The engine finds the keys changed after a version by merging only the
-sources holding entries that new (`Version::changes`): the tail and the
-segments whose `max_seq` is past it, so a recent cursor reads little.
-Deletions are kept at least `txn_max_lifetime` (§5.6), so a cursor stays
-valid at least that long after the request that caught up to it. An older
-one may have missed purged deletions: the request fails with `410
-cursor_expired`, and the client reads the current state and follows on from
-its `version`.
+To compute a page (`Version::changes`), the engine merges only the `tail` and segments with `max_seq` at or above the cursor version. Because compaction retains tombstones for at least `txn_max_lifetime` (5 min, §5.6), a cursor remains valid for at least `txn_max_lifetime` after the snapshot of its oldest page. If tombstones needed by the cursor have been purged, the request fails with `410 cursor_expired` and the client must resynchronize. A client can resynchronize by starting from `after=0` to perform a full state transfer of all live keys. Because a reader starting from version 0 holds only keys returned by earlier pages of that transfer, it only requires tombstones newer than the oldest snapshot version read during the transfer; the cursor records that version as a floor so that purging older tombstones does not expire an in-progress transfer.
 
 ---
 
@@ -919,13 +876,14 @@ its `version`.
   at most once per second. A member entry with the node's own
   address belongs to a previous process and is ignored during routing. If the target is another node, the
   request is proxied, streaming large bodies, with `x-baserunna-hops`
-  incremented; a request already forwarded twice is handled where it is. If
-  forwarding certainly failed (the request never left), or the target refused
-  it as addressed to a previous process at its address (marked by
-  `x-baserunna-stale-target`; nothing was applied), the receiving node marks
-  the target a suspect and handles the request itself. It can serve reads, and it can write only if
-  no other node holds a valid lease (otherwise `503 unavailable` with
-  `Retry-After`).
+  incremented; a request already forwarded twice is handled locally. If a
+  forward fails before leaving the node, or if the target rejects it with
+  `x-baserunna-stale-target` because the target restarted with a new node ID,
+  the entry node marks the target as suspect and handles buffered requests
+  locally (or returns a retryable `503` for streamed bodies that were already
+  consumed). A fallback node can always serve reads, and can commit writes if
+  another node does not hold a valid lease (otherwise it returns `503 unavailable`
+  with `Retry-After`).
 - **Forwarded requests include the cluster key** (`x-baserunna-cluster-key`), so the
   receiving node does not deduct tokens from its rate limiters a second time.
 - **Forwarded requests execute at most once.** Each forward includes a random
@@ -1019,18 +977,18 @@ organizations, members, sessions, API keys, users) always read strongly.
 Together these ensure clients always see their own metadata writes, even
 across nodes.
 
-Name resolution is protected against staleness. If a cached name maps to
-a database whose manifest is marked deleted, the name is re-resolved
-strongly and the request continues against the new database. A read
-(`GET`) asking for a snapshot up to `max_staleness_ms` old checks a manifest
-at most that old, so it costs no store request while the node's copy is
-fresh; every other request checks the latest manifest. If metadata still
-maps the name to the deleted database, the deletion was interrupted halfway,
-and the node completes it. Creating a database whose name belongs
-to such a half-deleted database also completes the deletion first. A
-manifest is created lazily only after a strong check confirms the database
-exists, so a stale cache can never
-resurrect a purged database.
+Name resolution guards against stale cache entries. Before running a request,
+the node checks the target database's manifest using the request's consistency
+mode (a `GET` or `HEAD` with `consistency=snapshot` uses a snapshot within
+`max_staleness_ms`; all other requests check the latest manifest). If the
+manifest is marked deleted, the node re-resolves the database name with a
+strong metadata read. If the name now points to a recreated database, the
+request proceeds against the new database; if metadata still points to the
+deleted database, the node finishes the interrupted deletion. Creating a
+database with the name of a partially deleted database also finishes the prior
+deletion first. Because a missing manifest is created only after a strong
+metadata read confirms the database exists, a stale cache entry cannot
+recreate a purged database.
 
 ---
 
@@ -1339,10 +1297,10 @@ process CPU time and host steal time on Linux. `DELETE /v1/admin/metrics`
 returns and resets the histograms.
 
 On SIGTERM or SIGINT, a node drains (failing `/healthz`), stops accepting
-connections, waits for in-flight requests (requests waiting for changes with
-`wait_ms` return at once, so clients poll again elsewhere), leaves the membership table, and
-releases its database leases without acquiring new leases. [`DEPLOYING.md`](DEPLOYING.md) covers TLS, load balancers, the
-container image and bucket setup.
+connections, ends active `wait_ms` long polls immediately, waits for in-flight
+requests to finish, leaves the membership table, and releases its database
+leases without acquiring new ones. [`DEPLOYING.md`](DEPLOYING.md) covers TLS,
+load balancers, the container image, and bucket setup.
 
 `fs:` is for single-node development only. Compare-and-swap is serialized
 within one process, so the store takes an exclusive lock on `<dir>/.lock`,
@@ -1378,8 +1336,6 @@ Each simulation parameter is drawn independently from a hash of the run seed and
 ### 13.3 Workloads and checkers
 
 Workloads run concurrently with a shared chaos loop (`ChaosPhase`). When all active workloads finish their chaos phase, fault injection stops, the cluster heals, and each workload runs its final consistency and invariant checks. The `mix` scenario runs a random subset of at least two workloads concurrently in the same cluster. Any run that exceeds 6 hours of virtual time fails as a liveness violation.
-
-Each workload verifies its own properties:
 
 - `history`: Concurrent clients execute random multi-key transactions (single-request and interactive, serializable and snapshot-isolated, strong and snapshot reads, with and without idempotency keys). Each write records a unique marker key. At the end of the run, committed transactions are ordered by version and replayed to verify strict serializability, snapshot isolation, and read-your-writes.
 - `kv_model`: Exercises all KV endpoints under faults and compares every response against a reference model. Ambiguous commits are resolved via `/commits/{id}` or database state inspection. Verifies range tombstones, size quota enforcement, and KV change feed reconstruction.
@@ -1439,8 +1395,8 @@ Every 20 ms of virtual time, global oracles verify that at most 1 node relies on
   | blob upload / download                        | 0.25 PUT / 0.125 GET per MiB            |
   | steady writes, with flush/compaction/GC       | 1.001 PUT, 0.001 GET per commit         |
   | idle database                                 | 0 per hour                              |
-  | idle device waiting on changes (5 min stale)  | 12 GET per hour                         |
-  | commit noticed by a waiting request elsewhere | 1 GET (40 ms)                           |
+  | idle change-feed watcher (5 min staleness)    | 12 GET per hour                         |
+  | cross-node commit wakeup via notice           | 1 GET (40 ms)                           |
   | node overhead (heartbeats, membership)        | 31 PUT + up to 140 GET per hour         |
   | stream append                                 | 1 PUT                                   |
   | stream tail read, lease holder                | 0                                       |
@@ -1513,9 +1469,9 @@ scripts/mutants.sh                                               # run mutation 
 46. _Precondition failure overtaken by in-flight attempt._ If a retried idempotent request failed a precondition while an earlier attempt was still in flight, the earlier attempt could still be committed after the `412` response. Precondition failures now write an abort record before returning (§6.2).
 47. _Stale leased reads during hedged manifest writes._ If a hedged duplicate `PUT` failed with `412` while the primary `PUT` was still in flight, the node reloaded the prior manifest and served leased reads before the primary `PUT` completed. Nodes now disable leased reads while a hedged `PUT` remains in flight and require a manifest read started after the ambiguous write before restoring trust (§5.5).
 48. _Levels object garbage-collected during stalled manifest read._ If a manifest read stalled past the GC grace period, its `.levels` object could be deleted before being fetched, causing a `500` error. The node now reloads the manifest if a `.levels` object is not found (§5.8).
-49. _Requests stuck on a restarted peer's previous process._ A node that forwarded a write to a peer that had restarted at the same address got a non-applied `503` back and passed it to the client, until its membership table caught up. The refusal is now marked, and the forwarding node marks the peer a suspect and handles the request itself (§7).
+49. _Forwards rejected after a peer restart._ When a node forwarded a request to a peer that had restarted at the same address with a new node ID, the peer returned `503` and the entry node returned that error to the client until its membership cache refreshed. The peer now tags the rejection with `x-baserunna-stale-target`, and the entry node marks the peer as suspect and handles buffered requests locally (§7).
 
-Cost model tests (§13.5) also identified seven efficiency defects: lapsed leases on read-heavy databases were never re-acquired, unleased strong reads validated the manifest twice, read-only renewals used the shorter write-lease duration, `.levels` objects under a separate prefix required an extra `LIST` call per sweep, stream flushes wrote separate small segments for commit records and stream state instead of retaining unsealed entries in `tail`, every API request validated the manifest strongly even when it asked for a snapshot (so an idle device waiting on a change feed cost a `GET` per poll), and waiting change feed requests polled the manifest every second whatever their consistency.
+Cost model tests (§13.5) also identified seven efficiency defects: lapsed leases on read-heavy databases were never re-acquired, unleased strong reads validated the manifest twice, read-only renewals used the shorter write-lease duration, `.levels` objects under a separate prefix required an extra `LIST` call per sweep, stream flushes wrote separate small segments for commit records and stream state instead of retaining unsealed entries in `tail`, snapshot-consistency API requests validated the manifest with a strong read on open, and snapshot-consistency long polls re-read the manifest every second instead of waiting for their snapshot staleness bound.
 
 Security review alongside simulation testing identified that internal cluster endpoints were unauthenticated when `BASERUNNA_CLUSTER_SECRET` was unset; clusters now always generate and require a cluster key (§7).
 

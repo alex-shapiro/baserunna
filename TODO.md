@@ -63,17 +63,13 @@ design context.
       batches currently move the manifest tail into a `BTreeMap` and back into
       a `Vec` on every commit. Merging sorted batch writes into the sorted tail
       vector makes CPU cost proportional to batch size instead of tail size.
-- [ ] **Send commit notices only to nodes with waiting requests.** A writer
-      that is not the database's rendezvous home (for example, after a node
-      joins while the writer keeps renewing its lease) keeps one notice in
-      flight to the home for as long as it commits, even when no request
-      waits there. Requests waiting elsewhere (after a failed forward, or on a
-      stale view of the lease) are never notified and wake only when they
-      poll. Waiting nodes cannot register with the committer, since a stale
-      view of the lease is why they wait locally; instead the home could
-      answer a notice with "no waiters", the writer could stop notifying for
-      a while, and waits starting at the home in that window could poll the
-      manifest every `watch_poll_ms` until it ends.
+- [ ] **Suppress commit notices if the home node has 0 waiters.** If the lease
+      holder is not the database's rendezvous home, it sends a commit notice to
+      the home node on every commit batch even if 0 requests are waiting there.
+      Have the home node indicate in its response whether any requests are
+      waiting so the lease holder can pause notices for a bounded interval,
+      during which new waiters on the home node poll the manifest every
+      `watch_poll_ms`.
 
 ## Features
 
@@ -134,7 +130,6 @@ design context.
 
 ## Docs
 
-- [ ] **Replace SPEC's remaining wide tables.** The system database tables
-      (§8), organization roles (§9), error codes (§10), and configuration
-      (§12) have rows over 100 characters, against the writing guidelines in
-      `AGENTS.md`.
+- [ ] **Replace remaining wide tables in `SPEC.md`.** The tables in §8 (system
+      database), §9 (organization roles), §10 (error codes), and §12
+      (configuration) have rows wider than 100 characters.

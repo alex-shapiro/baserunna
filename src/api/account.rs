@@ -415,7 +415,6 @@ async fn admin_nodes(State(node): State<Arc<Node>>, Auth(p): Auth) -> Result<axu
     node.refresh_members().await?;
     let live: Vec<String> = node.live_members().into_iter().map(|n| n.id).collect();
     let mut members = node.members();
-    // A node is running before its first heartbeat reaches the system database.
     if !members.iter().any(|n| n.id == node.id) {
         let started_at = node.started_ms as i64;
         members.push(crate::meta::NodeRecord {

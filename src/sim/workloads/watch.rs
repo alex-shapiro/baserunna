@@ -159,8 +159,7 @@ impl Watcher {
         w
     }
 
-    /// Restarts from the database's current state: from a scan, or by following the feed
-    /// from version 0, a full state transfer that spans many versions when pages are small.
+    /// Resynchronizes the local state either from a full scan or from `after=0`.
     async fn resync(&mut self) {
         self.cursor_at = self.c.sim.now_ms();
         if self.c.rng().chance(0.5) {
@@ -172,15 +171,14 @@ impl Watcher {
     }
 
     /// Polls the change feed once, returning `Some(true)` if caught up or
-    /// `None` on transient error. With `staleness`, the page may come from a
-    /// snapshot up to that old, possibly older than earlier pages.
+    /// `None` on a transient error.
     async fn poll(&mut self, wait_ms: u64, staleness: Option<u64>) -> Result<Option<bool>, String> {
         let mut p =
             format!("{BASE}/changes?after={}&limit={}&wait_ms={wait_ms}", self.cursor, 1 + self.c.rng().below(8));
         if let Some(s) = staleness {
             p += &format!("&consistency=snapshot&max_staleness_ms={s}");
         }
-        // A cursor's lifetime runs from the version its oldest page was read at.
+        // Bound the snapshot age by `staleness` so cursor expiration checks match the oldest page snapshot.
         let sent = self.c.sim.now_ms().saturating_sub(staleness.unwrap_or(0));
         let Ok(r): Result<Resp, _> = self.c.call("GET", &p, None).await else { return Ok(None) };
         let at = self.c.sim.now_ms();

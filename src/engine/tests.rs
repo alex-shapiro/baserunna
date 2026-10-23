@@ -2262,7 +2262,7 @@ fn change_feed_cursors_expire_with_purged_deletions() {
         let pos = ChangePos { seq: v.m.tombstone_horizon, kind: ChangePos::KEY, key: Bytes::from_static(b"a") };
         let mid = ChangeCursor { pos, floor: 0 };
         assert!(matches!(v.changes(&KeyRange::data(), &mid, 10).await, Err(Error::CursorExpired(_))));
-        // A follower starting from nothing needs no deletions, so its cursor never expires.
+        // A cursor at version 0 does not require tombstones and never expires.
         let all = v.changes(&KeyRange::data(), &ChangeCursor::after_version(0), 10).await.unwrap();
         assert!(all.changes.iter().any(|c| matches!(c, Change::Entry(e) if &e.key[..] == b"b")));
         let floored = ChangeCursor { floor: 9, ..mid.clone() };
@@ -2286,14 +2286,13 @@ fn copies_share_values_and_blobs_without_staging_rules() {
         t.put(Bytes::from_static(b"b"), Value::Blob(blob.clone())).unwrap();
         db.commit(t.into_request()).await.unwrap();
         put(&db, "i", "inline").await;
-        // Long after the blob's staging window, a copy can still bind it.
+        // Copy succeeds after the blob staging TTL has elapsed.
         tokio::time::sleep(Duration::from_millis(eng.shared.cfg.blob_stage_ttl_ms * 2)).await;
         let blob_bytes = db.stats(&db.current().unwrap()).blob_bytes;
         let mut t = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
         assert!(t.copy(b"b", Bytes::from_static(b"b2"), None).await.unwrap());
         assert!(t.copy(b"i", Bytes::from_static(b"i2"), None).await.unwrap());
         assert!(!t.copy(b"missing", Bytes::from_static(b"m2"), None).await.unwrap());
-        // A copy of a copy made in the same transaction still shares the bound blob.
         assert!(t.copy(b"b2", Bytes::from_static(b"b4"), None).await.unwrap());
         db.commit(t.into_request()).await.unwrap();
         let v = db.read_version(Consistency::Strong).await.unwrap();
@@ -2306,15 +2305,14 @@ fn copies_share_values_and_blobs_without_staging_rules() {
         assert_eq!(get(b"b4").await, Some(Value::Blob(blob.clone())));
         assert_eq!(get(b"i2").await, get(b"i").await);
         assert_eq!(get(b"m2").await, None);
-        // A copy whose source changes before it commits conflicts, even under snapshot
-        // isolation: the source might have held the last reference to its blob.
+        // Modifying the source key before commit causes a conflict even under snapshot isolation.
         let mut t = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
         assert!(t.copy(b"b", Bytes::from_static(b"b3"), None).await.unwrap());
         let mut d = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         d.delete(Bytes::from_static(b"b")).unwrap();
         db.commit(d.into_request()).await.unwrap();
         assert!(matches!(db.commit(t.into_request()).await, Err(Error::Conflict(_))));
-        // The copy keeps the blob alive after its original key is gone.
+        // Garbage collection retains the shared blob after the original key is deleted.
         let wait = eng.shared.cfg.orphan_grace_ms.max(eng.shared.cfg.blob_stage_ttl_ms) + 60_000;
         tokio::time::sleep(Duration::from_millis(wait)).await;
         db.maintenance_now().await.unwrap();
@@ -2344,7 +2342,6 @@ fn blobs_bound_under_several_keys_count_once() {
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         t.put(Bytes::from_static(b"a"), Value::Blob(blob.clone())).unwrap();
         t.put(Bytes::from_static(b"b"), Value::Blob(blob.clone())).unwrap();
-        // A copy of a value written in the same transaction binds the same staged blob.
         assert!(t.copy(b"a", Bytes::from_static(b"c"), None).await.unwrap());
         db.commit(t.into_request()).await.unwrap();
         let v = db.read_version(Consistency::Strong).await.unwrap();
@@ -2382,8 +2379,7 @@ fn full_state_transfers_page_past_purged_deletions() {
         let first = v.changes(&KeyRange::data(), &ChangeCursor::after_version(0), 2).await.unwrap();
         assert!(first.more && first.next.floor == v.m.version);
         assert_eq!(ChangeCursor::decode(&first.next.encode()), Some(first.next.clone()));
-        // A deletion from before the transfer began is purged: the transfer continues, though
-        // its position is older than the purged deletion.
+        // Purging a tombstone older than the first page's snapshot does not expire the transfer cursor.
         let v = purge().await;
         assert!(v.m.tombstone_horizon >= deleted && first.next.pos.seq < deleted, "setup: purged");
         let mut held: BTreeMap<Bytes, Value> = BTreeMap::new();
@@ -2410,8 +2406,7 @@ fn full_state_transfers_page_past_purged_deletions() {
             v.all_entries(false).await.unwrap().into_iter().map(|e| (e.key, e.value)).collect();
         assert_eq!(held, live);
         assert_eq!(cursor, ChangeCursor::after_version(v.m.version));
-        // A key the transfer already delivered is deleted, and the deletion is purged before
-        // the transfer resumes: the reader would keep the key, so its cursor expires.
+        // Purging a tombstone newer than the first page's snapshot expires the transfer cursor.
         let first = v.changes(&KeyRange::data(), &ChangeCursor::after_version(0), 2).await.unwrap();
         let Change::Entry(sent) = &first.changes[0] else { panic!() };
         let key: &'static str = String::from_utf8(sent.key[1..].to_vec()).unwrap().leak();
@@ -2438,8 +2433,7 @@ fn full_state_transfers_expire_after_paging_a_stale_snapshot() {
         let fresh = db.read_version(Consistency::Strong).await.unwrap();
         let first = fresh.changes(&KeyRange::data(), &ChangeCursor::after_version(0), 1).await.unwrap();
         assert!(first.more && first.next.floor == deleted, "{first:?}");
-        // The next page comes from a snapshot taken before `k` was deleted, so the reader
-        // now holds `k` and needs its deletion.
+        // Reading a page from an older snapshot lowers the cursor floor to that snapshot's version.
         let second = stale.changes(&KeyRange::data(), &first.next, 1).await.unwrap();
         assert!(matches!(&second.changes[..], [Change::Entry(e)] if &e.key[..] == b"k" && !e.value.is_tombstone()));
         assert!(second.more && second.next.floor == stale.m.version, "{second:?}");
@@ -2463,39 +2457,36 @@ fn commit_notices_wake_waiting_requests() {
         let reader = opened(&b, "d").await;
         let seen = |db: &Arc<Db>| db.current().unwrap().m.version;
         let long = Duration::from_secs(3600);
-        let woken_at_once = |db: Arc<Db>, than: Seq| async move {
+        let woken_at_once = |db: Arc<Db>, after: Seq| async move {
             let started = tokio::time::Instant::now();
-            db.wait_for_change(than, long).await;
+            db.wait_for_change(after, long).await;
             started.elapsed() < Duration::from_secs(1)
         };
-        // A notice that arrives before a request waits still wakes the request.
         let before = seen(&reader);
         let v = put(&writer, "k", "1").await;
         reader.notice_commit(v);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(seen(&reader), before, "no request was waiting, so nothing was read");
+        assert_eq!(seen(&reader), before);
         assert!(woken_at_once(reader.clone(), before).await);
         assert_eq!(seen(&reader), v);
-        // A request dropped while waiting no longer counts as waiting.
         assert!(tokio::time::timeout(Duration::from_millis(10), reader.wait_for_change(v, long)).await.is_err());
         let v2 = put(&writer, "k", "2").await;
         reader.notice_commit(v2);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(seen(&reader), v, "a dropped request left a waiter behind");
+        assert_eq!(seen(&reader), v);
         assert!(woken_at_once(reader.clone(), v).await);
-        // A notice wakes a request already waiting.
         let waiting = tokio::spawn(woken_at_once(reader.clone(), v2));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let v3 = put(&writer, "k", "3").await;
         reader.notice_commit(v3);
         assert!(waiting.await.unwrap());
         assert_eq!(seen(&reader), v3);
-        // A notice of a version the store does not have costs one manifest read, not a loop.
+        // A notice for an unavailable version triggers at most 1 manifest read.
         let manifest_gets = || store.gets.lock().unwrap().iter().filter(|(k, _)| k.ends_with("/manifest")).count();
         let before = manifest_gets();
         reader.notice_commit(v3 + 100);
         tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(manifest_gets(), before, "no request was waiting, so nothing was read");
+        assert_eq!(manifest_gets(), before);
         tokio::time::timeout(Duration::from_secs(5), reader.wait_for_change(v3, Duration::from_secs(2))).await.unwrap();
         assert_eq!(manifest_gets(), before + 1);
     });
@@ -2517,8 +2508,6 @@ fn commit_notices_survive_failed_reloads() {
             started.elapsed()
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
-        // Every attempt of the reload the first notice starts fails, and a second notice arrives
-        // while it retries.
         store.manifest_get_outages.store(b.shared.retry.attempts, SeqCst);
         let v1 = put(&writer, "k", "1").await;
         reader.notice_commit(v1);

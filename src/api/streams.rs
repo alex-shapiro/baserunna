@@ -441,7 +441,7 @@ fn events(node: Arc<Node>, f: Follow, spec: ReadSpec, first: (ReadOut, u64)) -> 
                 }
                 quiet_since = Instant::now();
             }
-            db.wait_for_change(v, crate::api::reread_after(&node, &db, c, until).min(KEEPALIVE)).await;
+            db.wait_for_change(v, crate::api::next_poll_delay(&node, &db, c, until).min(KEEPALIVE)).await;
         }
     });
     let mut resp = Response::new(axum::body::Body::new(ChannelBody(rx)));

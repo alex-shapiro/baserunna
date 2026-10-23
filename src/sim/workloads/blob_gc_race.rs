@@ -39,14 +39,13 @@ struct Written {
     by_version: BTreeMap<(u64, u64), Arc<Vec<u8>>>,
     /// All content ever written to a key, including unacknowledged writes.
     by_key: BTreeMap<u64, Vec<Arc<Vec<u8>>>>,
-    /// Keys each key may have been copied from, including by unacknowledged copies.
+    /// Source keys copied into each destination key, including unacknowledged copies.
     copied_from: BTreeMap<u64, BTreeSet<u64>>,
 }
 
 impl Written {
-    /// All content key `k` may hold: content written to it or, transitively, to any key
-    /// copied to it. A copy reads its source when it commits, so content written to the
-    /// source after the copy was sent counts too.
+    /// Returns all values that key `k` can hold, including values written to keys transitively
+    /// copied into `k`.
     fn candidates(&self, k: u64) -> Vec<Arc<Vec<u8>>> {
         let mut keys = BTreeSet::from([k]);
         let mut todo = vec![k];
@@ -117,7 +116,6 @@ async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Resul
     Ok(())
 }
 
-/// Copies key `from` to key `to`, sharing its blob, which must outlive `from`'s deletion.
 async fn copy(c: &Client, from: u64, to: u64, written: &Mutex<Written>) -> Result<(), String> {
     written.lock().unwrap_or_else(|e| e.into_inner()).copied_from.entry(to).or_default().insert(from);
     let body = json!({"ops": [{"op": "copy", "from": key_name(from), "to": key_name(to)}]});

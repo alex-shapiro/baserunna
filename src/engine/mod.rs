@@ -55,7 +55,7 @@ pub struct Shared {
     commit_hook: std::sync::OnceLock<CommitHook>,
 }
 
-/// Observes commits made by this node, for notifying other nodes.
+/// Callback invoked with `(db_id, version)` after this node commits a new data version.
 pub type CommitHook = Box<dyn Fn(&str, u64) + Send + Sync>;
 
 impl Shared {
@@ -69,7 +69,7 @@ impl Shared {
         self.stopping.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Whether [`Engine::end_waits`] was called.
+    /// Returns true if [`Engine::end_waits`] has been called.
     pub fn waits_ended(&self) -> bool {
         self.waits_ended.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -253,13 +253,12 @@ impl Engine {
         g.entry(id.to_string()).or_insert_with(|| Db::new(id.to_string(), self.shared.clone())).clone()
     }
 
-    /// The open handle for `id`, without opening one.
+    /// Returns the open database handle for `id` if present in memory.
     pub fn db_if_open(&self, id: &str) -> Option<Arc<Db>> {
         self.dbs.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
     }
 
-    /// Installs the callback run after every commit this node makes. Only the first call
-    /// installs one.
+    /// Sets the callback invoked after this node commits a new data version.
     pub fn set_commit_hook(&self, h: CommitHook) {
         let _ = self.shared.commit_hook.set(h);
     }
@@ -268,7 +267,7 @@ impl Engine {
         self.dbs.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Ends every [`Db::wait_for_change`] at once, now and from now on.
+    /// Wakes all current [`Db::wait_for_change`] calls and causes future calls to return immediately.
     pub fn end_waits(&self) {
         self.shared.waits_ended.store(true, std::sync::atomic::Ordering::SeqCst);
         for db in self.open_dbs() {

@@ -1,6 +1,6 @@
 #![no_main]
-//! Decoding a change feed cursor must never panic, and decoded cursors
-//! must survive a round trip.
+//! Verifies that [`ChangeCursor::decode`] never panics and that
+//! [`ChangeCursor::encode`] round-trips.
 use baserunna::engine::ChangeCursor;
 use libfuzzer_sys::fuzz_target;
 

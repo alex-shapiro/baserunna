@@ -168,13 +168,10 @@ impl ObjectStore for MeteredStore {
     }
 }
 
-/// The nodes' routers by address, and the requests sent between them.
 #[derive(Default)]
 struct PeerNet {
     routers: BTreeMap<String, axum::Router>,
-    /// Requests sent to peers, by path.
     calls: BTreeMap<String, u64>,
-    /// Addresses whose requests never complete.
     stalled: BTreeSet<String>,
 }
 
@@ -290,12 +287,12 @@ impl World {
         node
     }
 
-    /// The number of requests nodes have sent each other on `path`.
+    /// Returns the total number of peer requests sent to `path`.
     pub fn peer_calls(&self, path: &str) -> u64 {
         self.peers.lock().unwrap_or_else(|e| e.into_inner()).calls.get(path).copied().unwrap_or(0)
     }
 
-    /// Makes requests to node `i` hang (`true`) or complete (`false`).
+    /// Configures whether peer requests to node `i` hang indefinitely.
     pub fn stall_peer(&self, i: usize, stalled: bool) {
         let addr = peer_addr(i);
         let mut net = self.peers.lock().unwrap_or_else(|e| e.into_inner());
@@ -546,8 +543,7 @@ async fn single_node(w: &World, out: &mut Vec<Measurement>) {
     tokio::time::sleep(Duration::from_secs(3600)).await;
     out.push(r.stop("idle_db", "hour", 1.0, false));
 
-    // A device that keeps a change feed request waiting on an idle database, as sync clients
-    // do, with snapshot reads up to five minutes stale.
+    // Measure an idle change-feed watcher polling with 5-minute snapshot staleness.
     let feed = "/v1/dbs/idle/changes?after=0&limit=1";
     let cursor = w.json(0, "GET", feed, &t, Json::Null).await["next_cursor"].as_str().expect("cursor").to_string();
     let wait = format!(
@@ -633,7 +629,7 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     }
     out.push(r.stop("snapshot_read", "read", 10.0, true));
 
-    // A commit on a node other than the database's home wakes a request waiting at the home.
+    // Measure cross-node wakeup latency when a remote writer commits while a request waits on the home node.
     tokio::time::sleep(Duration::from_secs(30)).await;
     let live = w.node(0).live_members();
     let home_id = crate::cluster::rendezvous(&id, &live).expect("home").id.clone();

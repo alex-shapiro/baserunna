@@ -229,8 +229,9 @@ pub struct Node {
     members: Mutex<Vec<NodeRecord>>,
     members_refreshed_on_demand: Mutex<Option<Instant>>,
     suspects: Mutex<DetHashMap<String, Suspect>>,
-    /// The newest version to announce per database with a commit notice in flight.
-    notices: Mutex<DetHashMap<String, u64>>,
+    /// Map from database ID to the latest committed version for databases with an active
+    /// [`Node::notify_home`] task.
+    pending_notices: Mutex<DetHashMap<String, u64>>,
     auth_cache: TtlCache<String, Principal>,
     name_cache: TtlCache<(String, String), DbRecord>,
     org_cache: TtlCache<String, Org>,
@@ -260,7 +261,7 @@ const MEMBERS_REFRESH_ON_DEMAND_MIN: Duration = Duration::from_secs(1);
 
 const SUSPECT_MIN: Duration = Duration::from_secs(10);
 
-/// How long a commit notice may take before the next one is sent in its place.
+/// Timeout for a `/internal/v1/notice` request to a peer node.
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const CACHE_MAX: usize = 100_000;
@@ -285,7 +286,7 @@ impl Node {
             members: Mutex::new(Vec::new()),
             members_refreshed_on_demand: Mutex::new(None),
             suspects: Mutex::new(DetHashMap::default()),
-            notices: Mutex::new(DetHashMap::default()),
+            pending_notices: Mutex::new(DetHashMap::default()),
             auth_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
             name_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
             org_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
@@ -312,43 +313,39 @@ impl Node {
         Ok(node)
     }
 
-    /// Tells the database's rendezvous home that this node committed `version`, so requests
-    /// waiting there for changes see it at once rather than at their next poll. Requests for
-    /// a database without a lease are routed to its home, so waiting requests usually are
-    /// there. Best effort: a lost notice delays waiters until they poll.
-    ///
-    /// At most one notice per database is in flight, so a busy writer sends one per round
-    /// trip, carrying the newest version, and a stalled home holds one request at a time.
+    /// Sends a best-effort `/internal/v1/notice` request with `version` to the database's
+    /// rendezvous home node so that long-polling readers on the home node wake immediately.
+    /// Coalesces concurrent notices so at most 1 request is in flight per database.
     fn notify_home(self: &Arc<Self>, db: &str, version: u64) {
         if db == SYS_DB {
             return;
         }
         {
-            let mut unsent = lock(&self.notices);
-            if let Some(v) = unsent.get_mut(db) {
+            let mut pending = lock(&self.pending_notices);
+            if let Some(v) = pending.get_mut(db) {
                 *v = (*v).max(version);
                 return;
             }
-            if self.peer_home(db).is_none() {
+            if self.peer_home_addr(db).is_none() {
                 return;
             }
-            unsent.insert(db.to_string(), version);
+            pending.insert(db.to_string(), version);
         }
-        let (me, db) = (Arc::downgrade(self), db.to_string());
+        let (node, db) = (Arc::downgrade(self), db.to_string());
         self.env.spawn(async move {
             let mut sent = 0;
-            while let Some(n) = me.upgrade() {
+            while let Some(n) = node.upgrade() {
                 let version = {
-                    let mut unsent = lock(&n.notices);
-                    match unsent.get(&db) {
+                    let mut pending = lock(&n.pending_notices);
+                    match pending.get(&db) {
                         Some(&v) if v > sent => v,
                         _ => {
-                            unsent.remove(&db);
+                            pending.remove(&db);
                             return;
                         }
                     }
                 };
-                let call = n.peer_home(&db).and_then(|addr| {
+                let call = n.peer_home_addr(&db).and_then(|addr| {
                     let req = n.internal_request("/internal/v1/notice", &json!({"db": db, "version": version})).ok()?;
                     Some(n.services.transport.call(&addr, req))
                 });
@@ -361,14 +358,14 @@ impl Node {
         });
     }
 
-    /// The address of the database's rendezvous home, if that is another node.
-    fn peer_home(&self, db: &str) -> Option<String> {
+    /// Returns the address of the rendezvous home node for `db` if the home node is a remote peer.
+    fn peer_home_addr(&self, db: &str) -> Option<String> {
         let live = self.live_members();
         let home = cluster::rendezvous(db, &live)?;
         (home.id != self.id && home.addr != self.cfg.addr).then(|| home.addr.clone())
     }
 
-    /// A request to another node's internal endpoint `path`, carrying the cluster key.
+    /// Builds a JSON `POST` request to `path` authenticated with the cluster key.
     fn internal_request(&self, path: &str, body: &impl serde::Serialize) -> Result<Request<Body>> {
         let body = serde_json::to_vec(body).map_err(|e| Error::internal(e.to_string()))?;
         let mut req = Request::post(path)
@@ -493,9 +490,8 @@ impl Node {
         self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Ends every request waiting for changes (`wait_ms`) as if its wait had elapsed, now and
-    /// from now on, so waits finish before the node stops. Call it once the node no longer
-    /// accepts connections, so clients poll again elsewhere rather than here.
+    /// Wakes all active `wait_ms` long polls and causes future waits on this node to return
+    /// immediately. Call after the server stops accepting new connections during shutdown.
     pub fn end_waits(&self) {
         self.engine.end_waits();
     }
@@ -1555,7 +1551,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_reads_end_when_the_node_ends_waits() {
+    fn end_waits_wakes_active_and_future_long_polls() {
         run_paused(async {
             let w = World::new(1, 1).await;
             let t = w.signup(0, "waits@x.io").await;
@@ -1587,7 +1583,7 @@ mod tests {
             for path in paths {
                 let (status, waited) = waiting(path).await.unwrap();
                 assert_eq!(status, 200);
-                assert!(waited < Duration::from_secs(1), "a wait that starts after waits ended: {waited:?}");
+                assert!(waited < Duration::from_secs(1), "{waited:?}");
             }
         });
     }
@@ -1607,8 +1603,6 @@ mod tests {
             let home = (0..2).find(|&i| w.node(i).id == home_id).unwrap();
             let other = 1 - home;
             w.restart_node(home).await;
-            // The other node still knows only the home's previous process, which the new
-            // process at its address refuses; the write is not applied there, so it runs here.
             let put = Bytes::from(serde_json::json!({"ops": [{"op": "put", "key": "k", "value": "v"}]}).to_string());
             let r = w.call(other, "POST", "/v1/dbs/d/txn", &t, put).await;
             assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
@@ -1629,8 +1623,6 @@ mod tests {
             let home = (0..2).find(|&i| w.node(i).id == home_id).unwrap();
             let other = 1 - home;
             w.restart_node(home).await;
-            // A body too large to buffer is streamed to the home and spent when the home's new
-            // process refuses it, so the request fails; its retry is handled here.
             let big = Bytes::from(vec![7u8; 2 * crate::api::BUFFER_FORWARD_MAX as usize]);
             let r = w.call(other, "PUT", "/v1/dbs/d/kv/big", &t, big.clone()).await;
             assert_eq!(r.status, 503, "{}", String::from_utf8_lossy(&r.body));

@@ -268,8 +268,8 @@ fn clone_parts(req: &Request) -> http::request::Builder {
 
 pub(crate) const BUFFER_FORWARD_MAX: u64 = 1024 * 1024;
 
-/// The longest a long-polling read (`wait_ms`) of a change feed or stream sends nothing,
-/// under the 60 s idle timeout common to load balancers and proxies.
+/// Maximum `wait_ms` duration for change-feed and stream long polls, chosen to
+/// stay below a 60 s load-balancer idle timeout.
 pub(crate) const LONG_POLL_MAX_MS: u64 = 50_000;
 
 fn finishes_txn(req: &Request) -> bool {
@@ -349,8 +349,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 fwd.headers_mut().insert(HOPS_HEADER, HeaderValue::from(hops + 1));
                 tag_forward(&node, &mut fwd, &target, deadline);
                 return match node.services.transport.call(&addr, fwd).await {
-                    // The streamed body is spent, so the client retries, and the retry is
-                    // handled here.
+                    // A streamed request body cannot be replayed locally after the target rejects it.
                     Ok(resp) if resp.headers().contains_key(STALE_TARGET_HEADER) => {
                         node.mark_suspect(&target);
                         Err(Error::Unavailable {
@@ -374,9 +373,8 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 };
             }
         }
-        // Re-resolve strongly if the cached database name points to a deleted or recreated
-        // database. A read that accepts a stale snapshot checks at the same staleness, so it
-        // costs no store read while the snapshot is fresh.
+        // Verify that the database manifest is not deleted, and re-resolve the name with a
+        // strong metadata read if it is.
         let read_only = matches!(*req.method(), http::Method::GET | http::Method::HEAD);
         let staleness = read_only.then(|| snapshot_staleness(req.uri().query())).flatten();
         let opened = match node.open_db(&rec).await {
@@ -450,8 +448,8 @@ fn hops(h: &HeaderMap) -> u32 {
 
 const SERVER_TIMING_HEADER: &str = "server-timing";
 
-/// Marks a forward refused because it was addressed to a previous process of the node at the
-/// target address. The request was not applied, so the sender may handle it itself.
+/// Response header set if a forwarded request is rejected because the target node ID does not
+/// match the running process. The request was not applied.
 const STALE_TARGET_HEADER: &str = "x-baserunna-stale-target";
 
 /// Assigns an `x-request-id` header, attaches `Server-Timing`, and logs request completion.
@@ -604,7 +602,7 @@ async fn internal_auth(State(node): State<Arc<Node>>, req: Request, next: Next) 
     next.run(req).await
 }
 
-/// The staleness a request's query string allows, if it asks for snapshot consistency.
+/// Returns `max_staleness_ms` if `query` specifies `consistency=snapshot`.
 fn snapshot_staleness(query: Option<&str>) -> Option<u64> {
     let q: std::collections::BTreeMap<String, String> = serde_urlencoded::from_str(query?).ok()?;
     match consistency_of(&q) {
@@ -821,12 +819,10 @@ pub(crate) trait Found {
     fn found(&self) -> bool;
 }
 
-/// How long a waiting read at `c` waits for a newer version before it reads again, ending by
-/// `until`. Strong reads are repeated every `watch_poll_ms`, since a node without the lease
-/// learns of other nodes' commits only by reading the manifest. Snapshot reads are repeated
-/// once their snapshot turns too stale, but no more often than every `watch_poll_ms`, so an
-/// idle snapshot watcher reads the store once per `max_staleness_ms`.
-pub(crate) fn reread_after(node: &Node, db: &Db, c: Consistency, until: tokio::time::Instant) -> Duration {
+/// Returns the maximum duration to wait for a local version wakeup before polling again,
+/// bounded by `until`. Strong reads poll every `watch_poll_ms`; snapshot reads wait until the
+/// cached snapshot exceeds `max_staleness_ms` (at least `watch_poll_ms`).
+pub(crate) fn next_poll_delay(node: &Node, db: &Db, c: Consistency, until: tokio::time::Instant) -> Duration {
     let now = tokio::time::Instant::now();
     let poll = now + Duration::from_millis(node.cfg.watch_poll_ms);
     let reread = match c {
@@ -838,10 +834,9 @@ pub(crate) fn reread_after(node: &Node, db: &Db, c: Consistency, until: tokio::t
     reread.min(until).saturating_duration_since(now)
 }
 
-/// Runs `$read` on fresh snapshots until [`Found::found`] is true, `$wait` elapses, or the
-/// node ends waits ([`Node::end_waits`]). Between reads it waits for this node to install a
-/// newer version: one this node committed, or one another node announced (`notify_home`),
-/// or until [`reread_after`].
+/// Evaluates `$read` in a loop until [`Found::found`] is true, `$wait` elapses, or
+/// [`Shared::waits_ended`](crate::engine::Shared::waits_ended) is set, waiting between
+/// attempts with [`Db::wait_for_change`] for up to [`next_poll_delay`].
 macro_rules! watch {
     ($node:expr, $db:expr, $c:expr, $wait:expr, |$t:ident| $read:expr) => {{
         let until_ = tokio::time::Instant::now() + $wait;
@@ -851,7 +846,7 @@ macro_rules! watch {
             if crate::api::Found::found(&out_) || left_.is_zero() || $node.engine.shared.waits_ended() {
                 break (out_, v_);
             }
-            $db.wait_for_change(v_, crate::api::reread_after(&$node, &$db, $c, until_)).await;
+            $db.wait_for_change(v_, crate::api::next_poll_delay(&$node, &$db, $c, until_)).await;
         }
     }};
 }
@@ -875,7 +870,7 @@ struct CommitNotice {
     version: u64,
 }
 
-/// Another node committed a version of a database whose home is this node.
+/// Handles `POST /internal/v1/notice` by recording a remote commit version on the database if open.
 async fn commit_notice(State(node): State<Arc<Node>>, axum::Json(n): axum::Json<CommitNotice>) -> Response {
     if let Some(db) = node.engine.db_if_open(&n.db) {
         db.notice_commit(n.version);

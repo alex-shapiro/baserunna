@@ -965,8 +965,8 @@ impl Version {
 
     /// Returns up to `limit` changes in `range` after `after` in feed order:
     /// the newest entry for each modified key and any range tombstones clipped
-    /// to `range`, with the cursor to resume from. Fails with `CursorExpired`
-    /// if deletions the reader needs may have been purged.
+    /// to `range`. Fails with `CursorExpired` if tombstones required by `after`
+    /// have been purged.
     pub async fn changes(&self, range: &KeyRange, after: &ChangeCursor, limit: usize) -> Result<ChangePage> {
         let floor = if after.is_start() { self.m.version } else { after.floor };
         if after.pos < ChangePos::after_version(self.m.tombstone_horizon) && floor < self.m.tombstone_horizon {
@@ -1076,20 +1076,18 @@ impl ChangePos {
     }
 }
 
-/// Where a change feed reader resumes, and which deletions it still needs.
+/// Resume cursor for a change feed.
 ///
-/// A reader needs the deletions after `pos` of keys it holds. A reader that
-/// started at version 0 holds only keys it received from pages, each of which
-/// reflects every deletion up to the version it was read at, so it needs no
-/// deletion at or below the oldest of those versions: its `floor`. A full state
-/// transfer therefore expires only if the deletions purged since it started are
-/// newer than its oldest page, not merely newer than the old entries it is
-/// paging through. Pages read from an older snapshot than earlier pages (a
-/// stale snapshot read) lower the floor.
+/// A cursor is valid only if all tombstones that could delete keys held by the
+/// caller are still retained (`> tombstone_horizon`). An incremental caller
+/// (`floor == 0`) requires all tombstones after `pos`. A caller performing a
+/// full state transfer from version 0 holds only keys returned by earlier pages
+/// of that transfer, so it requires only tombstones newer than `floor`, the
+/// minimum snapshot version across all pages read in the transfer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeCursor {
     pub pos: ChangePos,
-    /// Deletions at or below this version are not needed by the reader.
+    /// Minimum snapshot version read during a full state transfer from version 0, or `0`.
     pub floor: Seq,
 }
 
@@ -1098,7 +1096,6 @@ impl ChangeCursor {
         ChangeCursor { pos: ChangePos::after_version(seq), floor: 0 }
     }
 
-    /// Whether the reader starts from nothing, so it needs no deletions at all.
     fn is_start(&self) -> bool {
         self.pos == ChangePos::after_version(0)
     }
@@ -1175,7 +1172,7 @@ pub struct ChangePage {
     pub changes: Vec<Change>,
     /// True if additional changes follow this page.
     pub more: bool,
-    /// Where the next page starts.
+    /// Cursor for the next page.
     pub next: ChangeCursor,
 }
 

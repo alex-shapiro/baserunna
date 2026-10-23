@@ -229,6 +229,8 @@ pub struct Node {
     members: Mutex<Vec<NodeRecord>>,
     members_refreshed_on_demand: Mutex<Option<Instant>>,
     suspects: Mutex<DetHashMap<String, Suspect>>,
+    /// The newest version to announce per database with a commit notice in flight.
+    notices: Mutex<DetHashMap<String, u64>>,
     auth_cache: TtlCache<String, Principal>,
     name_cache: TtlCache<(String, String), DbRecord>,
     org_cache: TtlCache<String, Org>,
@@ -258,6 +260,9 @@ const MEMBERS_REFRESH_ON_DEMAND_MIN: Duration = Duration::from_secs(1);
 
 const SUSPECT_MIN: Duration = Duration::from_secs(10);
 
+/// How long a commit notice may take before the next one is sent in its place.
+const NOTICE_TIMEOUT: Duration = Duration::from_secs(2);
+
 const CACHE_MAX: usize = 100_000;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -280,6 +285,7 @@ impl Node {
             members: Mutex::new(Vec::new()),
             members_refreshed_on_demand: Mutex::new(None),
             suspects: Mutex::new(DetHashMap::default()),
+            notices: Mutex::new(DetHashMap::default()),
             auth_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
             name_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
             org_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
@@ -310,24 +316,53 @@ impl Node {
     /// waiting there for changes see it at once rather than at their next poll. Requests for
     /// a database without a lease are routed to its home, so waiting requests usually are
     /// there. Best effort: a lost notice delays waiters until they poll.
+    ///
+    /// At most one notice per database is in flight, so a busy writer sends one per round
+    /// trip, carrying the newest version, and a stalled home holds one request at a time.
     fn notify_home(self: &Arc<Self>, db: &str, version: u64) {
-        if db == SYS_DB {
+        if db == SYS_DB || self.peer_home(db).is_none() {
             return;
         }
-        let live = self.live_members();
-        let Some(home) = cluster::rendezvous(db, &live) else { return };
-        if home.id == self.id || home.addr == self.cfg.addr {
-            return;
+        {
+            let mut unsent = lock(&self.notices);
+            if let Some(v) = unsent.get_mut(db) {
+                *v = (*v).max(version);
+                return;
+            }
+            unsent.insert(db.to_string(), version);
         }
-        let addr = home.addr.clone();
-        let Ok(req) = self.internal_request("/internal/v1/notice", &serde_json::json!({"db": db, "version": version}))
-        else {
-            return;
-        };
-        let transport = self.services.transport.clone();
+        let (me, db) = (Arc::downgrade(self), db.to_string());
         self.env.spawn(async move {
-            let _ = transport.call(&addr, req).await;
+            let mut sent = 0;
+            while let Some(n) = me.upgrade() {
+                let version = {
+                    let mut unsent = lock(&n.notices);
+                    match unsent.get(&db) {
+                        Some(&v) if v > sent => v,
+                        _ => {
+                            unsent.remove(&db);
+                            return;
+                        }
+                    }
+                };
+                let call = n.peer_home(&db).and_then(|addr| {
+                    let req = n.internal_request("/internal/v1/notice", &json!({"db": db, "version": version})).ok()?;
+                    Some(n.services.transport.call(&addr, req))
+                });
+                drop(n);
+                if let Some(call) = call {
+                    let _ = tokio::time::timeout(NOTICE_TIMEOUT, call).await;
+                }
+                sent = version;
+            }
         });
+    }
+
+    /// The address of the database's rendezvous home, if that is another node.
+    fn peer_home(&self, db: &str) -> Option<String> {
+        let live = self.live_members();
+        let home = cluster::rendezvous(db, &live)?;
+        (home.id != self.id && home.addr != self.cfg.addr).then(|| home.addr.clone())
     }
 
     /// A request to another node's internal endpoint `path`, carrying the cluster key.
@@ -1414,6 +1449,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::engine::{Consistency, Isolation};
     use crate::sim::cost::{World, run_paused};
     use bytes::Bytes;
     use std::time::Duration;
@@ -1553,6 +1589,48 @@ mod tests {
             assert!(r.headers.keys().all(|h| !h.as_str().starts_with("x-baserunna-stale")), "{:?}", r.headers);
             let r = w.call(other, "PUT", "/v1/dbs/d/kv/big", &t, big).await;
             assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        });
+    }
+
+    #[test]
+    fn commit_notices_to_a_stalled_home_are_coalesced() {
+        run_paused(async {
+            let w = World::new(2, 1).await;
+            for i in 0..2 {
+                w.node(i).refresh_members().await.unwrap();
+            }
+            let t = w.signup(0, "notice@x.io").await;
+            let id = w.create_db(0, &t, "d").await;
+            let live = w.node(0).live_members();
+            let home_id = super::cluster::rendezvous(&id, &live).unwrap().id.clone();
+            let home = (0..2).find(|&i| w.node(i).id == home_id).unwrap();
+            let r = w.call(0, "PUT", "/v1/dbs/d/kv/k", &t, Bytes::from_static(b"v")).await;
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let db = w.node(1 - home).engine.db(&id);
+            let commit = || async {
+                let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                txn.put(crate::ops::user_key(b"k").unwrap(), crate::engine::Value::Inline(Bytes::new())).unwrap();
+                db.commit(txn.into_request()).await.unwrap();
+            };
+            let notices = || w.peer_calls("/internal/v1/notice");
+            commit().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let before = notices();
+            assert!(before > 0, "setup: a commit off the home sends a notice");
+            w.stall_peer(home, true);
+            for _ in 0..20 {
+                commit().await;
+            }
+            assert_eq!(notices() - before, 1, "one notice is in flight per database");
+            tokio::time::sleep(super::NOTICE_TIMEOUT + Duration::from_millis(100)).await;
+            assert_eq!(notices() - before, 2, "a timed-out notice is replaced by the newest version");
+            w.stall_peer(home, false);
+            tokio::time::sleep(super::NOTICE_TIMEOUT * 2).await;
+            assert_eq!(notices() - before, 2, "every commit was announced");
+            commit().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(notices() - before, 3);
         });
     }
 

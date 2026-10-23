@@ -2481,3 +2481,34 @@ fn commit_notices_wake_waiting_requests() {
         assert_eq!(manifest_gets(), before + 1);
     });
 }
+
+#[test]
+fn commit_notices_survive_failed_reloads() {
+    rt().block_on(async {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (a, store) = delayed_engine("a");
+        let b = second_node(&a, &store, "b");
+        let writer = opened(&a, "d").await;
+        let v0 = put(&writer, "k", "0").await;
+        let reader = opened(&b, "d").await;
+        let r = reader.clone();
+        let waiting = tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            r.wait_for_change(v0, Duration::from_secs(3600)).await;
+            started.elapsed()
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Every attempt of the reload the first notice starts fails, and a second notice arrives
+        // while it retries.
+        store.manifest_get_outages.store(b.shared.retry.attempts, SeqCst);
+        let v1 = put(&writer, "k", "1").await;
+        reader.notice_commit(v1);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let v2 = put(&writer, "k", "2").await;
+        reader.notice_commit(v2);
+        let waited = waiting.await.unwrap();
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        assert_eq!(store.manifest_get_outages.load(SeqCst), 0, "setup: the first reload failed");
+        assert_eq!(reader.current().unwrap().m.version, v2);
+    });
+}

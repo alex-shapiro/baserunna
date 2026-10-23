@@ -786,30 +786,46 @@ may have expired.
 
 ### 6.3 Ops
 
-| op             | fields                                                                                                                                         | result                                                  |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| `get`          | key                                                                                                                                            | `{found, value? \| blob?, version?, expires_at?}`       |
-| `scan`         | `prefix` or `start`/`end`, `limit` (≤1000), `reverse`, `keys_only`                                                                             | `{items, next_cursor?}`                                 |
-| `put`          | key, `value` or `blob_id`, `ttl_ms?`                                                                                                           | `{}`                                                    |
-| `delete`       | key                                                                                                                                            | `{}`                                                    |
-| `copy`         | `from`, `to`, `ttl_ms?`                                                                                                                        | `{}`. 412 if `from` does not exist                      |
-| `delete_range` | `prefix` or `start`/`end`                                                                                                                      | `{}` (expanded at commit)                               |
-| `check`        | key + one of `exists`, `version`, `value`                                                                                                      | fails txn with 412 if false                             |
-| `increment`    | key, `by` (i64), `ttl_ms?`                                                                                                                     | `{value}`. Value is ASCII decimal; missing = 0          |
-| `get_row`      | table, `pk` (array or scalar)                                                                                                                  | `{found, row?, expires_at?}`                            |
-| `insert_row`   | table, `row`, `ttl_ms?`                                                                                                                        | `{}`. 409 if pk exists                                  |
-| `upsert_row`   | table, `row`, `ttl_ms?`                                                                                                                        | `{}`                                                    |
-| `update_row`   | table, `pk`, `set`, `ttl_ms?`                                                                                                                  | `{found}`. Partial update                               |
-| `delete_row`   | table, `pk`                                                                                                                                    | `{found}`                                               |
-| `query_rows`   | table, `index?`, `eq?`, `range?`, `filter?`, `limit`, `reverse`, `cursor`                                                                      | `{rows, next_cursor?}`                                  |
-| `update_rows`  | table, `where` (`index?`, `eq?`, `range?`, `filter?`), `set`, `ttl_ms?`, `limit?`                                                              | `{count}`                                               |
-| `delete_rows`  | table, `where`, `limit?`                                                                                                                       | `{count}`                                               |
-| `append`       | stream, `records` (`value` or `json`, `headers?`), `expect_seq?`, `create?`                                                                    | `{count, first_seq?}` (`first_seq` once committed)      |
-| `read_stream`  | stream, `from_seq`, `from_time`, `tail` or `consumer`, `until_seq?`, `until_time?`, `reverse`, `limit`, `max_bytes?`, `filter?`, `scan_limit?` | `{records, next_seq, done}`                             |
-| `stream_info`  | stream                                                                                                                                         | `{first_seq, next_seq, bytes, first_time?, last_time?}` |
-| `trim_stream`  | stream, `before_seq`                                                                                                                           | `{}`                                                    |
-| `get_consumer` | stream, consumer                                                                                                                               | `{found, seq?}`                                         |
-| `set_consumer` | stream, consumer, `seq`                                                                                                                        | `{}`                                                    |
+Each op is listed with its fields and its result.
+
+Keys:
+
+- `get`: key → `{found, value? | blob?, version?, expires_at?}`
+- `scan`: `prefix` or `start`/`end`, `limit` (≤1000), `reverse`, `keys_only` →
+  `{items, next_cursor?}`
+- `put`: key, `value` or `blob_id`, `ttl_ms?` → `{}`
+- `delete`: key → `{}`
+- `copy`: `from`, `to`, `ttl_ms?` → `{}`; 412 if `from` does not exist
+- `delete_range`: `prefix` or `start`/`end` → `{}` (expanded at commit)
+- `check`: key and one of `exists`, `version`, `value` → fails the
+  transaction with 412 if false
+- `increment`: key, `by` (i64), `ttl_ms?` → `{value}`; the value is ASCII
+  decimal, and a missing key counts as 0
+
+Rows:
+
+- `get_row`: table, `pk` (array or scalar) → `{found, row?, expires_at?}`
+- `insert_row`: table, `row`, `ttl_ms?` → `{}`; 409 if the pk exists
+- `upsert_row`: table, `row`, `ttl_ms?` → `{}`
+- `update_row`: table, `pk`, `set`, `ttl_ms?` → `{found}` (a partial update)
+- `delete_row`: table, `pk` → `{found}`
+- `query_rows`: table, `index?`, `eq?`, `range?`, `filter?`, `limit`,
+  `reverse`, `cursor` → `{rows, next_cursor?}`
+- `update_rows`: table, `where` (`index?`, `eq?`, `range?`, `filter?`), `set`,
+  `ttl_ms?`, `limit?` → `{count}`
+- `delete_rows`: table, `where`, `limit?` → `{count}`
+
+Streams:
+
+- `append`: stream, `records` (`value` or `json`, `headers?`), `expect_seq?`,
+  `create?` → `{count, first_seq?}` (`first_seq` once committed)
+- `read_stream`: stream, `from_seq`, `from_time`, `tail` or `consumer`,
+  `until_seq?`, `until_time?`, `reverse`, `limit`, `max_bytes?`, `filter?`,
+  `scan_limit?` → `{records, next_seq, done}`
+- `stream_info`: stream → `{first_seq, next_seq, bytes, first_time?, last_time?}`
+- `trim_stream`: stream, `before_seq` → `{}`
+- `get_consumer`: stream, consumer → `{found, seq?}`
+- `set_consumer`: stream, consumer, `seq` → `{}`
 
 `ttl_ms` (1 ms to 10 years) adds a TTL expiration relative to write
 commit time (§4.5); `update_row`, `update_rows` and `increment` do not
@@ -849,9 +865,10 @@ With `wait_ms` (up to 60 s), a request that finds no change waits for one. A
 waiting request wakes when its node installs a newer version: one the node
 committed, or one another node announced. A node that commits a version of a
 database tells the database's rendezvous home (§7) with a best-effort
-internal notice, and the home reloads the manifest if requests there are
-waiting. Requests for a database without a lease are routed to its home, so
-waiting requests and the commits they wait for usually meet there. Between
+internal notice, at most one in flight per database, carrying the newest
+version; the home reloads the manifest if requests there are waiting.
+Requests for a database without a lease are routed to its home, so waiting
+requests and the commits they wait for usually meet there. Between
 wakeups, a strong waiting read repeats every `watch_poll_ms` (1 s), since a
 node without the lease learns of other nodes' commits only from the manifest.
 A snapshot waiting read (`consistency=snapshot&max_staleness_ms=…`) repeats
@@ -1361,29 +1378,29 @@ Each simulation parameter is drawn independently from a hash of the run seed and
 
 Workloads run concurrently with a shared chaos loop (`ChaosPhase`). When all active workloads finish their chaos phase, fault injection stops, the cluster heals, and each workload runs its final consistency and invariant checks. The `mix` scenario runs a random subset of at least two workloads concurrently in the same cluster. Any run that exceeds 6 hours of virtual time fails as a liveness violation.
 
-| workload       | verification                                                                                                                                                                                                                                                                                                                                                                                       |
-| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `history`      | Concurrent clients execute random multi-key transactions (single-request and interactive, serializable and snapshot-isolated, strong and snapshot reads, with and without idempotency keys). Each write records a unique marker key. At the end of the run, committed transactions are ordered by version and replayed to verify strict serializability, snapshot isolation, and read-your-writes. |
-| `kv_model`     | Exercises all KV endpoints under faults and compares every response against a reference model. Ambiguous commits are resolved via `/commits/{id}` or database state inspection. Verifies range tombstones, size quota enforcement, and KV change feed reconstruction.                                                                                                                              |
-| `bank`         | Concurrent account transfers across nodes. Verifies conservation of total balance and non-negative balances throughout the run and at completion.                                                                                                                                                                                                                                                  |
-| `register`     | Concurrent writers and strong readers on a small key set, verified for real-time linearizability across `GET`, unforwarded `GET`, and read-only and read-write transactions.                                                                                                                                                                                                                       |
-| `tables`       | Verifies table schema changes, point and range row mutations, unique index contention, table change feeds, and index integrity against a reference model.                                                                                                                                                                                                                                          |
-| `schema_race`  | Concurrent row writes (including batch updates and deletes at both isolation levels) racing with online column and index additions and drops. Verifies row state and index consistency.                                                                                                                                                                                                            |
-| `ttl`          | Verifies KV and row TTL expiration windows and distributed lock acquisition and renewal order under clock skew and faults.                                                                                                                                                                                                                                                                         |
-| `watch`        | Concurrent puts, TTL expirations, point deletes, and range deletes while a watcher polls `/changes`. Verifies that every change matches a committed write, cursors do not expire within the transaction lifetime, and the reconstructed state matches the final database state.                                                                                                                    |
-| `streams`      | Concurrent stream appends (with `expect_seq`, idempotency keys, and transactional counters), long-poll and SSE followers, forward/reverse/filtered/time-based reads, consumer cursors, explicit and retention trims, and stream recreation. Verifies dense sequence numbers, monotonic timestamps, and exact state reconstruction.                                                                 |
-| `blobs`        | Concurrent blob uploads, range reads, overwrites, and deletes verified by SHA-256, followed by garbage collection verification.                                                                                                                                                                                                                                                                    |
-| `blob_gc_race` | Concurrent long-running blob reads racing with overwrites, deletes, and short-grace-period garbage collection under clock skew.                                                                                                                                                                                                                                                                    |
-| `abandoned`    | Interactive transactions abandoned, aborted, or committed late across lease transitions. Verifies that committed updates are preserved, abandoned transactions are not committed, and open transaction handles are drained.                                                                                                                                                                        |
-| `db_churn`     | Rapid database creation, mutation, deletion, and recreation with small caches and aggressive handle eviction.                                                                                                                                                                                                                                                                                      |
-| `auth`         | Verifies signup, login, session management, scoped and read-only API keys, Google OAuth account linking rules, and database access control.                                                                                                                                                                                                                                                        |
-| `orgs`         | Concurrent organization creation, membership role transitions, and deletion races. Verifies role permissions within cache staleness bounds and organization ownership invariants.                                                                                                                                                                                                                  |
-| `accounts`     | Verifies password changes, session revocation, email verification and password reset links, and account deletion across nodes.                                                                                                                                                                                                                                                                     |
-| `limits`       | Verifies per-key, per-user, and per-IP rate limiting and authentication failure backoff.                                                                                                                                                                                                                                                                                                           |
-| `lifecycle`    | Database creation, mutation, deletion, and recreation across node crashes, verifying background storage purge and per-owner database counters.                                                                                                                                                                                                                                                     |
-| `console`      | Exercises all web console pages, verifying CSRF protection, HTML escaping, multipart uploads, safe attachment headers, pagination, and account/org/admin flows.                                                                                                                                                                                                                                    |
-| `api_tour`     | Exercises schema drop endpoints, transaction aborts, commit status lookup by idempotency key, and admin metrics endpoints.                                                                                                                                                                                                                                                                         |
-| `mix`          | Runs a random combination of at least two workloads concurrently in a shared cluster and chaos loop.                                                                                                                                                                                                                                                                                               |
+Each workload verifies its own properties:
+
+- `history`: Concurrent clients execute random multi-key transactions (single-request and interactive, serializable and snapshot-isolated, strong and snapshot reads, with and without idempotency keys). Each write records a unique marker key. At the end of the run, committed transactions are ordered by version and replayed to verify strict serializability, snapshot isolation, and read-your-writes.
+- `kv_model`: Exercises all KV endpoints under faults and compares every response against a reference model. Ambiguous commits are resolved via `/commits/{id}` or database state inspection. Verifies range tombstones, size quota enforcement, and KV change feed reconstruction.
+- `bank`: Concurrent account transfers across nodes. Verifies conservation of total balance and non-negative balances throughout the run and at completion.
+- `register`: Concurrent writers and strong readers on a small key set, verified for real-time linearizability across `GET`, unforwarded `GET`, and read-only and read-write transactions.
+- `tables`: Verifies table schema changes, point and range row mutations, unique index contention, table change feeds, and index integrity against a reference model.
+- `schema_race`: Concurrent row writes (including batch updates and deletes at both isolation levels) racing with online column and index additions and drops. Verifies row state and index consistency.
+- `ttl`: Verifies KV and row TTL expiration windows and distributed lock acquisition and renewal order under clock skew and faults.
+- `watch`: Concurrent puts, TTL expirations, point deletes, and range deletes while a watcher polls `/changes` with strong and stale snapshot reads, resynchronizing from a scan or by following the feed from version 0. Verifies that every change matches a committed write, cursors do not expire within the transaction lifetime, and the reconstructed state matches the final database state.
+- `streams`: Concurrent stream appends (with `expect_seq`, idempotency keys, and transactional counters), long-poll and SSE followers, forward/reverse/filtered/time-based reads, consumer cursors, explicit and retention trims, and stream recreation. Verifies dense sequence numbers, monotonic timestamps, and exact state reconstruction.
+- `blobs`: Concurrent blob uploads, range reads, overwrites, and deletes verified by SHA-256, followed by garbage collection verification.
+- `blob_gc_race`: Concurrent long-running blob reads racing with overwrites, copies, deletes, and short-grace-period garbage collection under clock skew.
+- `abandoned`: Interactive transactions abandoned, aborted, or committed late across lease transitions. Verifies that committed updates are preserved, abandoned transactions are not committed, and open transaction handles are drained.
+- `db_churn`: Rapid database creation, mutation, deletion, and recreation with small caches and aggressive handle eviction.
+- `auth`: Verifies signup, login, session management, scoped and read-only API keys, Google OAuth account linking rules, and database access control.
+- `orgs`: Concurrent organization creation, membership role transitions, and deletion races. Verifies role permissions within cache staleness bounds and organization ownership invariants.
+- `accounts`: Verifies password changes, session revocation, email verification and password reset links, and account deletion across nodes.
+- `limits`: Verifies per-key, per-user, and per-IP rate limiting and authentication failure backoff.
+- `lifecycle`: Database creation, mutation, deletion, and recreation across node crashes, verifying background storage purge and per-owner database counters.
+- `console`: Exercises all web console pages, verifying CSRF protection, HTML escaping, multipart uploads, safe attachment headers, pagination, and account/org/admin flows.
+- `api_tour`: Exercises schema drop endpoints, transaction aborts, commit status lookup by idempotency key, and admin metrics endpoints.
+- `mix`: Runs a random combination of at least two workloads concurrently in a shared cluster and chaos loop.
 
 Every 20 ms of virtual time, global oracles verify that at most 1 node relies on a lease for any database and that any node relying on a lease without an in-flight manifest write holds the latest manifest version in the store. At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, and stream chunks are intact and consistent. After a node shuts down gracefully, the simulator verifies that none of the released databases in storage have a lease held by that node.
 

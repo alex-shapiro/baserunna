@@ -63,12 +63,14 @@ design context.
       batches currently move the manifest tail into a `BTreeMap` and back into
       a `Vec` on every commit. Merging sorted batch writes into the sorted tail
       vector makes CPU cost proportional to batch size instead of tail size.
-- [ ] **Send commit notices only to nodes with waiting requests.** A node
-      sends its rendezvous home one internal request per manifest install,
-      even when no request waits there, and requests waiting elsewhere (after
-      a failed forward, or on a stale view of the lease) are never notified
-      and wake only when they poll. Nodes could register their interest in a
-      database with the committing node, for as long as requests wait.
+- [ ] **Send commit notices only to nodes with waiting requests.** A writer
+      that is not the database's rendezvous home (for example, after a node
+      joins while the writer keeps renewing its lease) keeps one notice in
+      flight to the home for as long as it commits, even when no request
+      waits there. Requests waiting elsewhere (after a failed forward, or on a
+      stale view of the lease) are never notified and wake only when they
+      poll. Nodes could register their interest in a database with the
+      committing node, for as long as requests wait.
 
 ## Features
 
@@ -111,11 +113,6 @@ design context.
 
 ## Testing
 
-- [ ] **Fix the `auth` scenario's empty node listing.** About 1 in 24,000
-      `auth` seeds fail with `Err("nodes")` (e.g. `sim_tool trace auth
-      5006829`): `/v1/admin/nodes` lists only members read from the system
-      database, which can be empty after a crash before the node's first
-      heartbeat lands. The listing should always include the serving node.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the
       model-checked `http_txn` target.
 - [ ] **Run mutation testing in CI**, running `scripts/mutants.sh --in-diff` on
@@ -135,3 +132,10 @@ design context.
       a small number of seeds. Deduplicating failures by normalized message,
       weighting corpus entries by novelty, and incorporating probe-ordering
       and buggify-site features would preserve depth while improving breadth.
+
+## Docs
+
+- [ ] **Replace SPEC's remaining wide tables.** The system database tables
+      (§8), organization roles (§9), error codes (§10), and configuration
+      (§12) have rows over 100 characters, against the writing guidelines in
+      `AGENTS.md`.

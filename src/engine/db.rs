@@ -904,8 +904,9 @@ impl Db {
 
     /// Reloads the manifest until it holds the newest noticed version, while requests wait.
     /// At most one reload runs at a time; notices that arrive during one are covered by it or
-    /// by the next. A reload that brings no newer version ends the loop, so a notice of a
-    /// version this node cannot read costs one manifest read rather than a spin.
+    /// by the next. A reload that brings no newer version ends the loop unless a newer notice
+    /// arrived during it, so a notice of a version this node cannot read costs one manifest
+    /// read rather than a spin, and a failed read does not swallow later notices.
     fn load_noticed(self: &Arc<Self>) {
         use std::sync::atomic::Ordering::SeqCst;
         let version = |db: &Db| db.current().map(|c| c.m.version);
@@ -917,16 +918,18 @@ impl Db {
         let me = self.clone();
         self.shared.env.spawn(async move {
             loop {
+                let mut stalled_at = None;
                 while behind(&me) {
                     probe::hit(Probe::NoticedVersionLoaded);
-                    let before = version(&me);
+                    let (before, noticed) = (version(&me), me.noticed.load(SeqCst));
                     if me.read_version(Consistency::Strong).await.is_err() || version(&me) == before {
-                        me.refreshing.store(false, SeqCst);
-                        return;
+                        stalled_at = Some(noticed);
+                        break;
                     }
                 }
                 me.refreshing.store(false, SeqCst);
-                if !behind(&me) || me.refreshing.swap(true, SeqCst) {
+                let stalled = stalled_at.is_some_and(|n| n == me.noticed.load(SeqCst));
+                if stalled || !behind(&me) || me.refreshing.swap(true, SeqCst) {
                     return;
                 }
             }

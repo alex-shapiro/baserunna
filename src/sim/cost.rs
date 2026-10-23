@@ -12,7 +12,7 @@ use axum::body::Body;
 use bytes::Bytes;
 use http::{Request, Response};
 use serde_json::{Value as Json, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -168,7 +168,17 @@ impl ObjectStore for MeteredStore {
     }
 }
 
-type Peers = Arc<Mutex<BTreeMap<String, axum::Router>>>;
+/// The nodes' routers by address, and the requests sent between them.
+#[derive(Default)]
+struct PeerNet {
+    routers: BTreeMap<String, axum::Router>,
+    /// Requests sent to peers, by path.
+    calls: BTreeMap<String, u64>,
+    /// Addresses whose requests never complete.
+    stalled: BTreeSet<String>,
+}
+
+type Peers = Arc<Mutex<PeerNet>>;
 
 struct PeerTransport {
     peers: Peers,
@@ -176,8 +186,15 @@ struct PeerTransport {
 
 impl Transport for PeerTransport {
     fn call(&self, addr: &str, req: Request<Body>) -> BoxFut<'static, Result<Response<Body>, TransportError>> {
-        let router = self.peers.lock().unwrap_or_else(|e| e.into_inner()).get(addr).cloned();
+        let mut net = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        *net.calls.entry(req.uri().path().to_string()).or_default() += 1;
+        let stalled = net.stalled.contains(addr);
+        let router = net.routers.get(addr).cloned();
+        drop(net);
         Box::pin(async move {
+            if stalled {
+                std::future::pending::<()>().await;
+            }
             let router =
                 router.ok_or_else(|| TransportError { message: "unknown peer".into(), maybe_delivered: false })?;
             match router.oneshot(req).await {
@@ -213,6 +230,10 @@ pub fn node_config(name: &str, addr: &str) -> NodeConfig {
         engine: EngineConfig::default(),
         ..NodeConfig::default()
     }
+}
+
+fn peer_addr(i: usize) -> String {
+    format!("cost://n{i}")
 }
 
 /// Simulated cluster backed by a [`MeteredStore`].
@@ -256,7 +277,7 @@ impl World {
     }
 
     async fn boot(&self, i: usize) -> Arc<Node> {
-        let addr = format!("cost://n{i}");
+        let addr = peer_addr(i);
         let env = Arc::new(Env::sim(0xc057 + i as u64 + 1000 * self.nodes.len() as u64, self.base_ms, self.origin, 0));
         let store: DynStore = self.store.clone();
         let transport = Arc::new(PeerTransport { peers: self.peers.clone() });
@@ -265,8 +286,24 @@ impl World {
         let services = crate::node::Services { transport, oidc: None, mailer: None };
         let node = Node::start(cfg, env, store, services).await.expect("node starts");
         let router = api::router(node.clone());
-        self.peers.lock().unwrap_or_else(|e| e.into_inner()).insert(addr, router);
+        self.peers.lock().unwrap_or_else(|e| e.into_inner()).routers.insert(addr, router);
         node
+    }
+
+    /// The number of requests nodes have sent each other on `path`.
+    pub fn peer_calls(&self, path: &str) -> u64 {
+        self.peers.lock().unwrap_or_else(|e| e.into_inner()).calls.get(path).copied().unwrap_or(0)
+    }
+
+    /// Makes requests to node `i` hang (`true`) or complete (`false`).
+    pub fn stall_peer(&self, i: usize, stalled: bool) {
+        let addr = peer_addr(i);
+        let mut net = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        if stalled {
+            net.stalled.insert(addr);
+        } else {
+            net.stalled.remove(&addr);
+        }
     }
 
     pub fn node(&self, i: usize) -> &Arc<Node> {

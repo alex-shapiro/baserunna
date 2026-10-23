@@ -24,8 +24,7 @@ use tokio::time::Instant;
 
 type J = axum::Json<Json>;
 
-const WAIT_MAX_MS: u64 = 20_000;
-const EVENTS_WAIT_MAX_MS: u64 = 300_000;
+pub(super) const EVENTS_WAIT_MAX_MS: u64 = 300_000;
 const KEEPALIVE: Duration = Duration::from_secs(15);
 /// Consumers stream info lists; the consumers route pages through the rest.
 const INFO_CONSUMERS: usize = 100;
@@ -304,7 +303,7 @@ async fn read(
     let format = format_of(&q, &headers)?;
     let mut spec = read_spec(&q)?;
     spec.validate()?;
-    let wait_max = if format == Format::Events { EVENTS_WAIT_MAX_MS } else { WAIT_MAX_MS };
+    let wait_max = if format == Format::Events { EVENTS_WAIT_MAX_MS } else { super::LONG_POLL_MAX_MS };
     let wait = number::<u64>(&q, "wait_ms")?.unwrap_or(0);
     if wait > wait_max {
         return Err(Error::invalid(format!("wait_ms must be in 0..={wait_max}")));

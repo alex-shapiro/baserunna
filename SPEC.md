@@ -288,8 +288,8 @@ and a stream record may be committed alongside a row update.
 - **Reads** start at a seq, a time, the last N records (`tail`) or a
   consumer's cursor, run forward or in reverse, and stop at a limit (at
   most 1,000 records and 16 MiB) or at an end seq or time. A forward read
-  that reaches the end can wait for the next append (`wait_ms`), or stay
-  open and deliver records as server-sent events.
+  that reaches the end can wait up to 50 s for the next append (`wait_ms`),
+  or stay open and deliver records as server-sent events.
 - **Filters** (§4.7) select records by a JSON body field (`field`, a dotted
   path whose numeric segments index arrays), a header (`header`) or, naming
   neither, the body's text, which only `contains` tests. A filtered read
@@ -861,7 +861,7 @@ first; a page holds at most `limit` of them and carries a `next_cursor` to
 pass as the next `after`, at once while `more` is true. Applying pages in
 order to the state at `after` yields the current state.
 
-With `wait_ms` (up to 60 s), a request that finds no change waits for one. A
+With `wait_ms` (up to 50 s), a request that finds no change waits for one. A
 waiting request wakes when its node installs a newer version: one the node
 committed, or one another node announced. A node that commits a version of a
 database tells the database's rendezvous home (§7) with a best-effort

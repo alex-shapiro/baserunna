@@ -1189,7 +1189,7 @@ fn paths() -> Value {
         let mut v = vec![
             query_required("after", s(), "Report changes after this version or `next_cursor`"),
             query("limit", i(), "1..=1000 (default 100)"),
-            query("wait_ms", i(), "0..=60000: wait up to this duration for a change"),
+            query("wait_ms", i(), &format!("0..={}: wait up to this duration for a change", super::LONG_POLL_MAX_MS)),
         ];
         v.extend(extra);
         v.extend(consistency());
@@ -1329,7 +1329,11 @@ fn paths() -> Value {
         query(
             "wait_ms",
             i(),
-            "Wait this long for an append if the read is caught up: 0..=20000, or up to 300000 for events",
+            &format!(
+                "Wait this long for an append if the read is caught up: 0..={}, or up to {} for events",
+                super::LONG_POLL_MAX_MS,
+                super::streams::EVENTS_WAIT_MAX_MS
+            ),
         ),
         query("format", enum_of(&["json", "ndjson", "sse"]), "Response format (default: from Accept, else json)"),
         query("encoding", enum_of(&["utf8", "base64"]), "Encoding of `value`s"),

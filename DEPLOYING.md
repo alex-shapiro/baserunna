@@ -95,9 +95,9 @@ forward database requests to the node holding the database's lease. Set up:
   clients retry safely with idempotency keys (SPEC §6.2).
 - **Timeouts and body sizes**: blob uploads and downloads stream up to
   `blob_max` (5 GiB), so allow long idle timeouts and large request bodies
-  on `/v1/dbs/*/kv/*` and `/v1/dbs/*/blobs`. Change feed reads with
-  `wait_ms` send nothing for up to 60 s, so the idle timeout must
-  exceed 60 s; at the common 60 s default, the longest waits fail with 504.
+  on `/v1/dbs/*/kv/*` and `/v1/dbs/*/blobs`. Change feed and stream reads
+  with `wait_ms` send nothing for up to 50 s, so the idle timeout must
+  exceed 50 s; the common 60 s default works.
 - **Client addresses**: sign-in throttling is per client address. Behind
   a proxy that appends the client to `X-Forwarded-For`, set
   `BASERUNNA_TRUSTED_PROXY_HOPS` to the number of such proxies (usually 1).

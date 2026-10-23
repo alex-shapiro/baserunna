@@ -320,13 +320,16 @@ impl Node {
     /// At most one notice per database is in flight, so a busy writer sends one per round
     /// trip, carrying the newest version, and a stalled home holds one request at a time.
     fn notify_home(self: &Arc<Self>, db: &str, version: u64) {
-        if db == SYS_DB || self.peer_home(db).is_none() {
+        if db == SYS_DB {
             return;
         }
         {
             let mut unsent = lock(&self.notices);
             if let Some(v) = unsent.get_mut(db) {
                 *v = (*v).max(version);
+                return;
+            }
+            if self.peer_home(db).is_none() {
                 return;
             }
             unsent.insert(db.to_string(), version);

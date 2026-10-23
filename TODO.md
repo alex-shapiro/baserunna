@@ -79,10 +79,6 @@ design context.
       manifest copy-on-write and export/import.
 - [ ] **Database rename and ownership transfer** between users and
       organizations.
-- [ ] **One long-poll limit for change feeds and stream reads.** Change
-      feeds wait up to 60 s (`wait_ms`), stream record reads up to 20 s. A
-      snapshot waiter's store cost does not depend on the limit, so pick one
-      that fits common load balancer idle timeouts and use it for both.
 - [ ] **Organization access controls.** Add per-database role grants within an
       organization, organization-owned service accounts (API keys), and email
       invitations for unregistered users.

@@ -85,11 +85,14 @@ impl WriteSet {
             || self.streams.iter().any(|s| matches!(s, StreamOp::Append { .. }))
     }
 
-    /// Blobs this write set binds for the first time: staged blobs, as opposed to copies of
-    /// values that already reference them.
+    /// Blobs this write set binds for the first time, each once: staged blobs, as opposed to
+    /// copies of values that already reference them.
     pub fn staged_blobs(&self) -> impl Iterator<Item = &BlobRef> {
-        self.puts.values().filter_map(|v| match v {
-            Some(Put { value: Value::Blob(b), .. }) if !self.copied_blobs.contains(&b.id) => Some(b),
+        let mut seen = std::collections::BTreeSet::new();
+        self.puts.values().filter_map(move |v| match v {
+            Some(Put { value: Value::Blob(b), .. }) if !self.copied_blobs.contains(&b.id) && seen.insert(&b.id) => {
+                Some(b)
+            }
             _ => None,
         })
     }

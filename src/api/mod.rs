@@ -268,6 +268,10 @@ fn clone_parts(req: &Request) -> http::request::Builder {
 
 pub(crate) const BUFFER_FORWARD_MAX: u64 = 1024 * 1024;
 
+/// The longest a long-polling read (`wait_ms`) of a change feed or stream sends nothing,
+/// under the 60 s idle timeout common to load balancers and proxies.
+pub(crate) const LONG_POLL_MAX_MS: u64 = 50_000;
+
 fn finishes_txn(req: &Request) -> bool {
     let route = req.extensions().get::<MatchedPath>().map(MatchedPath::as_str);
     match *req.method() {
@@ -376,14 +380,17 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         let read_only = matches!(*req.method(), http::Method::GET | http::Method::HEAD);
         let staleness = read_only.then(|| snapshot_staleness(req.uri().query())).flatten();
         let opened = match node.open_db(&rec).await {
-            Ok(db) => match match staleness {
-                Some(max_staleness_ms) => db.snapshot(Consistency::Snapshot { max_staleness_ms }).await,
-                None => db.latest_snapshot().await.map(|(s, _)| s),
-            } {
-                Err(Error::NotFound(m)) => Err(m),
-                Err(e) => return Err(e),
-                Ok(_) => Ok(db),
-            },
+            Ok(db) => {
+                let checked = match staleness {
+                    Some(max_staleness_ms) => db.snapshot(Consistency::Snapshot { max_staleness_ms }).await.map(drop),
+                    None => db.latest_snapshot().await.map(drop),
+                };
+                match checked {
+                    Err(Error::NotFound(m)) => Err(m),
+                    Err(e) => return Err(e),
+                    Ok(()) => Ok(db),
+                }
+            }
             Err(Error::NotFound(m)) => Err(m),
             Err(e) => return Err(e),
         };
@@ -817,8 +824,8 @@ pub(crate) trait Found {
 /// How long a waiting read at `c` waits for a newer version before it reads again, ending by
 /// `until`. Strong reads are repeated every `watch_poll_ms`, since a node without the lease
 /// learns of other nodes' commits only by reading the manifest. Snapshot reads are repeated
-/// once their snapshot turns too stale (and at most every `watch_poll_ms`), so an idle
-/// snapshot watcher reads the store once per `max_staleness_ms`.
+/// once their snapshot turns too stale, but no more often than every `watch_poll_ms`, so an
+/// idle snapshot watcher reads the store once per `max_staleness_ms`.
 pub(crate) fn reread_after(node: &Node, db: &Db, c: Consistency, until: tokio::time::Instant) -> Duration {
     let now = tokio::time::Instant::now();
     let poll = now + Duration::from_millis(node.cfg.watch_poll_ms);

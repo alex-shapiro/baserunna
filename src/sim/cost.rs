@@ -551,7 +551,7 @@ async fn single_node(w: &World, out: &mut Vec<Measurement>) {
     let feed = "/v1/dbs/idle/changes?after=0&limit=1";
     let cursor = w.json(0, "GET", feed, &t, Json::Null).await["next_cursor"].as_str().expect("cursor").to_string();
     let wait = format!(
-        "/v1/dbs/idle/changes?after={cursor}&limit=1&wait_ms=60000&consistency=snapshot&max_staleness_ms=300000"
+        "/v1/dbs/idle/changes?after={cursor}&limit=1&wait_ms=50000&consistency=snapshot&max_staleness_ms=300000"
     );
     let r = Recorder::start(s, &idle);
     let until = Instant::now() + Duration::from_secs(3600);
@@ -643,7 +643,7 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
         .as_str()
         .expect("cursor")
         .to_string();
-    let wait = format!("/v1/dbs/big/changes?after={cursor}&wait_ms=60000&consistency=snapshot&max_staleness_ms=300000");
+    let wait = format!("/v1/dbs/big/changes?after={cursor}&wait_ms=50000&consistency=snapshot&max_staleness_ms=300000");
     let router = w.node(home).router().expect("router");
     let t2 = t.clone();
     let waiter = tokio::spawn(async move {

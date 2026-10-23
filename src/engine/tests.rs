@@ -2335,6 +2335,25 @@ fn copies_share_values_and_blobs_without_staging_rules() {
 }
 
 #[test]
+fn blobs_bound_under_several_keys_count_once() {
+    rt().block_on(async {
+        let (eng, _store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        let blob = blob::write_blob(&eng.shared, "d", b"shared bytes", "x/y").await.unwrap();
+        let before = db.stats(&db.current().unwrap()).blob_bytes;
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        t.put(Bytes::from_static(b"a"), Value::Blob(blob.clone())).unwrap();
+        t.put(Bytes::from_static(b"b"), Value::Blob(blob.clone())).unwrap();
+        // A copy of a value written in the same transaction binds the same staged blob.
+        assert!(t.copy(b"a", Bytes::from_static(b"c"), None).await.unwrap());
+        db.commit(t.into_request()).await.unwrap();
+        let v = db.read_version(Consistency::Strong).await.unwrap();
+        assert_eq!(db.stats(&v).blob_bytes, before + blob.size);
+        assert_eq!(v.get(b"c", u64::MAX).await.unwrap().map(|e| e.value), Some(Value::Blob(blob)));
+    });
+}
+
+#[test]
 fn full_state_transfers_page_past_purged_deletions() {
     rt().block_on(async {
         let (eng, _store) = delayed_engine("a");

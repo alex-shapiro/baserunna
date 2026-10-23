@@ -838,16 +838,17 @@ pub(crate) fn reread_after(node: &Node, db: &Db, c: Consistency, until: tokio::t
     reread.min(until).saturating_duration_since(now)
 }
 
-/// Runs `$read` on fresh snapshots until [`Found::found`] is true or `$wait` elapses. Between
-/// reads it waits for this node to install a newer version: one this node committed, or
-/// one another node announced (`notify_home`), or until [`reread_after`].
+/// Runs `$read` on fresh snapshots until [`Found::found`] is true, `$wait` elapses, or the
+/// node ends waits ([`Node::end_waits`]). Between reads it waits for this node to install a
+/// newer version: one this node committed, or one another node announced (`notify_home`),
+/// or until [`reread_after`].
 macro_rules! watch {
     ($node:expr, $db:expr, $c:expr, $wait:expr, |$t:ident| $read:expr) => {{
         let until_ = tokio::time::Instant::now() + $wait;
         loop {
             let (out_, v_) = crate::api::with_read!($db, $c, |$t| $read);
             let left_ = until_.saturating_duration_since(tokio::time::Instant::now());
-            if crate::api::Found::found(&out_) || left_.is_zero() {
+            if crate::api::Found::found(&out_) || left_.is_zero() || $node.engine.shared.waits_ended() {
                 break (out_, v_);
             }
             $db.wait_for_change(v_, crate::api::reread_after(&$node, &$db, $c, until_)).await;
@@ -876,7 +877,7 @@ struct CommitNotice {
 
 /// Another node committed a version of a database whose home is this node.
 async fn commit_notice(State(node): State<Arc<Node>>, axum::Json(n): axum::Json<CommitNotice>) -> Response {
-    if let Some(db) = node.engine.open_db(&n.db) {
+    if let Some(db) = node.engine.db_if_open(&n.db) {
         db.notice_commit(n.version);
     }
     StatusCode::NO_CONTENT.into_response()

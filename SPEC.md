@@ -1339,7 +1339,8 @@ process CPU time and host steal time on Linux. `DELETE /v1/admin/metrics`
 returns and resets the histograms.
 
 On SIGTERM or SIGINT, a node drains (failing `/healthz`), stops accepting
-connections, waits for in-flight requests, leaves the membership table, and
+connections, waits for in-flight requests (requests waiting for changes with
+`wait_ms` return at once, so clients poll again elsewhere), leaves the membership table, and
 releases its database leases without acquiring new leases. [`DEPLOYING.md`](DEPLOYING.md) covers TLS, load balancers, the
 container image and bucket setup.
 

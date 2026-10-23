@@ -69,8 +69,11 @@ design context.
       flight to the home for as long as it commits, even when no request
       waits there. Requests waiting elsewhere (after a failed forward, or on a
       stale view of the lease) are never notified and wake only when they
-      poll. Nodes could register their interest in a database with the
-      committing node, for as long as requests wait.
+      poll. Waiting nodes cannot register with the committer, since a stale
+      view of the lease is why they wait locally; instead the home could
+      answer a notice with "no waiters", the writer could stop notifying for
+      a while, and waits starting at the home in that window could poll the
+      manifest every `watch_poll_ms` until it ends.
 
 ## Features
 

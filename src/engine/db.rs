@@ -869,14 +869,15 @@ impl Db {
         rx.await.map_err(|_| Error::unavailable("commit resolution interrupted"))?
     }
 
-    /// Waits until a version newer than `than` is installed locally, or until `max` elapses.
-    /// A version another node announced (`notice_commit`) is loaded while requests wait.
+    /// Waits until a version newer than `than` is installed locally, until `max` elapses, or
+    /// until the engine ends waits ([`super::Engine::end_waits`]). A version another node
+    /// announced (`notice_commit`) is loaded while requests wait.
     pub async fn wait_for_change(self: &Arc<Self>, than: Seq, max: Duration) {
         use std::sync::atomic::Ordering::SeqCst;
         let notified = self.installed.notified();
         let mut notified = std::pin::pin!(notified);
         notified.as_mut().enable();
-        if self.current().is_some_and(|c| c.m.version > than) {
+        if self.shared.waits_ended() || self.current().is_some_and(|c| c.m.version > than) {
             return;
         }
         let _waiting = Waiting::new(&self.waiters);
@@ -884,6 +885,10 @@ impl Db {
             self.load_noticed();
         }
         let _ = tokio::time::timeout(max, notified).await;
+    }
+
+    pub(crate) fn wake_waiters(&self) {
+        self.installed.notify_waiters();
     }
 
     /// When a snapshot read accepting `max_staleness` would next read the manifest, if this

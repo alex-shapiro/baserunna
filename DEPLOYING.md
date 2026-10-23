@@ -137,7 +137,9 @@ On SIGTERM (or SIGINT) a node:
 1. fails its health check for `BASERUNNA_DRAIN_DELAY_MS` (default 0) while
    still serving, so the load balancer stops sending it requests;
 2. stops accepting connections and lets in-flight requests finish, for at
-   most `BASERUNNA_SHUTDOWN_TIMEOUT_MS` (default 20 s);
+   most `BASERUNNA_SHUTDOWN_TIMEOUT_MS` (default 20 s); change feed and
+   stream reads waiting with `wait_ms` return at once, and their clients poll
+   again on another node;
 3. leaves the membership table and releases its database leases so that other
    nodes can take over writes immediately.
 

@@ -493,10 +493,18 @@ impl Node {
         self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Ends every request waiting for changes (`wait_ms`) as if its wait had elapsed, now and
+    /// from now on, so waits finish before the node stops. Call it once the node no longer
+    /// accepts connections, so clients poll again elsewhere rather than here.
+    pub fn end_waits(&self) {
+        self.engine.end_waits();
+    }
+
     /// Leaves the cluster, releases held database leases, and stops background tasks.
     /// Returns the database IDs whose leases were released.
     pub async fn shutdown(&self) -> Vec<String> {
         self.drain();
+        self.end_waits();
         let leave = self.run_meta(MetaCmd::Leave { id: self.id.clone() });
         let _ = tokio::time::timeout(Duration::from_secs(2), leave).await;
         let released = self.engine.release_leases(Duration::from_secs(2)).await;
@@ -1543,6 +1551,44 @@ mod tests {
             let there: Vec<&str> =
                 live.iter().filter(|m| m.addr == "http://elsewhere").map(|m| m.id.as_str()).collect();
             assert_eq!(there, ["after"]);
+        });
+    }
+
+    #[test]
+    fn waiting_reads_end_when_the_node_ends_waits() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let t = w.signup(0, "waits@x.io").await;
+            w.create_db(0, &t, "d").await;
+            let feed = w.json(0, "GET", "/v1/dbs/d/changes?after=0", &t, serde_json::Value::Null).await;
+            let cursor = feed["next_cursor"].as_str().unwrap().to_string();
+            let waiting = |path: String| {
+                let (router, t) = (w.node(0).router().unwrap(), t.clone());
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                w.node(0).env.spawn(async move {
+                    let started = tokio::time::Instant::now();
+                    let r = crate::sim::cost::call_router(&router, "GET", &path, &t, Bytes::new()).await;
+                    let _ = tx.send((r.status, started.elapsed()));
+                });
+                rx
+            };
+            let paths = [
+                format!("/v1/dbs/d/changes?after={cursor}&wait_ms=50000"),
+                format!("/v1/dbs/d/changes?after={cursor}&wait_ms=50000&consistency=snapshot&max_staleness_ms=300000"),
+            ];
+            let polls: Vec<_> = paths.iter().cloned().map(waiting).collect();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            w.node(0).end_waits();
+            for p in polls {
+                let (status, waited) = p.await.unwrap();
+                assert_eq!(status, 200);
+                assert!(waited < Duration::from_secs(6), "{waited:?}");
+            }
+            for path in paths {
+                let (status, waited) = waiting(path).await.unwrap();
+                assert_eq!(status, 200);
+                assert!(waited < Duration::from_secs(1), "a wait that starts after waits ended: {waited:?}");
+            }
         });
     }
 

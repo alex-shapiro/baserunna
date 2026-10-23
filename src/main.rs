@@ -172,6 +172,7 @@ async fn run() -> Result<(), String> {
         baserunna::info!("shutting down: draining for {:?}", shutdown.drain_delay);
         n2.drain();
         tokio::time::sleep(shutdown.drain_delay).await;
+        n2.end_waits();
         // Allow in-flight requests up to `timeout` to complete before forcing lease release.
         let n3 = n2.clone();
         env.spawn(async move {

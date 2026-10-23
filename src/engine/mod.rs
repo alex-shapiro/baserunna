@@ -49,6 +49,8 @@ pub struct Shared {
     pub metrics: Arc<crate::metrics::StoreMetrics>,
     /// True once the node begins releasing leases for shutdown.
     stopping: std::sync::atomic::AtomicBool,
+    /// True once [`Engine::end_waits`] is called.
+    waits_ended: std::sync::atomic::AtomicBool,
     /// Called with a database id and version after this node commits a new data version.
     commit_hook: std::sync::OnceLock<CommitHook>,
 }
@@ -65,6 +67,11 @@ impl Shared {
 
     pub(crate) fn stopping(&self) -> bool {
         self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether [`Engine::end_waits`] was called.
+    pub fn waits_ended(&self) -> bool {
+        self.waits_ended.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn quota_exempt(&self, db: &str) -> bool {
@@ -225,6 +232,7 @@ impl Engine {
             observed_leases: Mutex::new(DetHashMap::default()),
             quota_exempt: Mutex::new(Default::default()),
             stopping: false.into(),
+            waits_ended: false.into(),
             commit_hook: std::sync::OnceLock::new(),
         });
         Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) })
@@ -246,7 +254,7 @@ impl Engine {
     }
 
     /// The open handle for `id`, without opening one.
-    pub fn open_db(&self, id: &str) -> Option<Arc<Db>> {
+    pub fn db_if_open(&self, id: &str) -> Option<Arc<Db>> {
         self.dbs.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
     }
 
@@ -258,6 +266,14 @@ impl Engine {
 
     pub fn open_count(&self) -> usize {
         self.dbs.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Ends every [`Db::wait_for_change`] at once, now and from now on.
+    pub fn end_waits(&self) {
+        self.shared.waits_ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        for db in self.open_dbs() {
+            db.wake_waiters();
+        }
     }
 
     /// Returns currently open database handles sorted by ID.

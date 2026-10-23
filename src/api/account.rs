@@ -414,8 +414,17 @@ async fn admin_nodes(State(node): State<Arc<Node>>, Auth(p): Auth) -> Result<axu
     p.require_unscoped()?;
     node.refresh_members().await?;
     let live: Vec<String> = node.live_members().into_iter().map(|n| n.id).collect();
-    let nodes: Vec<Json> = node
-        .members()
+    let mut members = node.members();
+    if !members.iter().any(|n| n.id == node.id) {
+        let started_at = node.started_ms as i64;
+        members.push(crate::meta::NodeRecord {
+            id: node.id.clone(),
+            addr: node.cfg.addr.clone(),
+            started_at,
+            heartbeat_at: started_at,
+        });
+    }
+    let nodes: Vec<Json> = members
         .into_iter()
         .map(|n| {
             json!({

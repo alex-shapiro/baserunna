@@ -1259,6 +1259,31 @@
           {
             "additionalProperties": false,
             "properties": {
+              "from": {
+                "type": "string"
+              },
+              "op": {
+                "const": "copy"
+              },
+              "to": {
+                "type": "string"
+              },
+              "ttl_ms": {
+                "maximum": 315360000000,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "op",
+              "from",
+              "to"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
               "end": {
                 "type": "string"
               },
@@ -3708,7 +3733,7 @@
             }
           },
           {
-            "description": "0..=20000: wait up to this duration for a change",
+            "description": "0..=50000: wait up to this duration for a change",
             "in": "query",
             "name": "wait_ms",
             "required": false,
@@ -4925,7 +4950,7 @@
             }
           },
           {
-            "description": "Wait this long for an append if the read is caught up: 0..=20000, or up to 300000 for events",
+            "description": "Wait this long for an append if the read is caught up: 0..=50000, or up to 300000 for events",
             "in": "query",
             "name": "wait_ms",
             "required": false,
@@ -5496,7 +5521,7 @@
             }
           },
           {
-            "description": "0..=20000: wait up to this duration for a change",
+            "description": "0..=50000: wait up to this duration for a change",
             "in": "query",
             "name": "wait_ms",
             "required": false,

@@ -210,9 +210,13 @@ async fn google_flow(
 
 /// Retries [`google_flow`] when a lost callback consumes the single-use code.
 async fn google_until(sim: &Arc<Sim>, id: Identity) -> Result<(u16, Option<String>), String> {
+    let mut delay = 50;
     for _ in 0..50 {
         match google_flow(sim, id.clone(), None).await? {
-            (0, _) => {}
+            (0, _) => {
+                sim.sleep(delay).await;
+                delay = (delay * 2).min(2_000);
+            }
             done => return Ok(done),
         }
     }

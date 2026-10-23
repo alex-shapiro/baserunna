@@ -229,6 +229,9 @@ pub struct Node {
     members: Mutex<Vec<NodeRecord>>,
     members_refreshed_on_demand: Mutex<Option<Instant>>,
     suspects: Mutex<DetHashMap<String, Suspect>>,
+    /// Map from database ID to the latest committed version for databases with an active
+    /// [`Node::notify_home`] task.
+    pending_notices: Mutex<DetHashMap<String, u64>>,
     auth_cache: TtlCache<String, Principal>,
     name_cache: TtlCache<(String, String), DbRecord>,
     org_cache: TtlCache<String, Org>,
@@ -258,6 +261,9 @@ const MEMBERS_REFRESH_ON_DEMAND_MIN: Duration = Duration::from_secs(1);
 
 const SUSPECT_MIN: Duration = Duration::from_secs(10);
 
+/// Timeout for a `/internal/v1/notice` request to a peer node.
+const NOTICE_TIMEOUT: Duration = Duration::from_secs(2);
+
 const CACHE_MAX: usize = 100_000;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -280,6 +286,7 @@ impl Node {
             members: Mutex::new(Vec::new()),
             members_refreshed_on_demand: Mutex::new(None),
             suspects: Mutex::new(DetHashMap::default()),
+            pending_notices: Mutex::new(DetHashMap::default()),
             auth_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
             name_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
             org_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
@@ -295,9 +302,82 @@ impl Node {
             draining: std::sync::atomic::AtomicBool::new(false),
             cfg,
         });
+        let weak = Arc::downgrade(&node);
+        node.engine.set_commit_hook(Box::new(move |db: &str, version: u64| {
+            if let Some(n) = weak.upgrade() {
+                n.notify_home(db, version);
+            }
+        }));
         node.bootstrap().await?;
         node.spawn_background();
         Ok(node)
+    }
+
+    /// Sends a best-effort `/internal/v1/notice` request with `version` to the database's
+    /// rendezvous home node so that long-polling readers on the home node wake immediately.
+    /// Coalesces concurrent notices so at most 1 request is in flight per database.
+    fn notify_home(self: &Arc<Self>, db: &str, version: u64) {
+        if db == SYS_DB {
+            return;
+        }
+        {
+            let mut pending = lock(&self.pending_notices);
+            if let Some(v) = pending.get_mut(db) {
+                *v = (*v).max(version);
+                return;
+            }
+            if self.peer_home_addr(db).is_none() {
+                return;
+            }
+            pending.insert(db.to_string(), version);
+        }
+        let (node, db) = (Arc::downgrade(self), db.to_string());
+        self.env.spawn(async move {
+            let mut sent = 0;
+            while let Some(n) = node.upgrade() {
+                let version = {
+                    let mut pending = lock(&n.pending_notices);
+                    match pending.get(&db) {
+                        Some(&v) if v > sent => v,
+                        _ => {
+                            pending.remove(&db);
+                            return;
+                        }
+                    }
+                };
+                let call = n.peer_home_addr(&db).and_then(|addr| {
+                    let req = n.internal_request("/internal/v1/notice", &json!({"db": db, "version": version})).ok()?;
+                    Some(n.services.transport.call(&addr, req))
+                });
+                drop(n);
+                if let Some(call) = call {
+                    let _ = tokio::time::timeout(NOTICE_TIMEOUT, call).await;
+                }
+                sent = version;
+            }
+        });
+    }
+
+    /// Returns the address of the rendezvous home node for `db` if the home node is a remote peer.
+    fn peer_home_addr(&self, db: &str) -> Option<String> {
+        let live = self.live_members();
+        let home = cluster::rendezvous(db, &live)?;
+        (home.id != self.id && home.addr != self.cfg.addr).then(|| home.addr.clone())
+    }
+
+    /// Builds a JSON `POST` request to `path` authenticated with the cluster key.
+    fn internal_request(&self, path: &str, body: &impl serde::Serialize) -> Result<Request<Body>> {
+        let body = serde_json::to_vec(body).map_err(|e| Error::internal(e.to_string()))?;
+        let mut req = Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .map_err(|e| Error::internal(e.to_string()))?;
+        if let Some(k) = self.cluster_key()
+            && let Ok(v) = k.parse()
+        {
+            req.headers_mut().insert(CLUSTER_KEY_HEADER, v);
+        }
+        Ok(req)
     }
 
     async fn bootstrap(self: &Arc<Self>) -> Result<()> {
@@ -410,10 +490,17 @@ impl Node {
         self.draining.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Wakes all active `wait_ms` long polls and causes future waits on this node to return
+    /// immediately. Call after the server stops accepting new connections during shutdown.
+    pub fn end_waits(&self) {
+        self.engine.end_waits();
+    }
+
     /// Leaves the cluster, releases held database leases, and stops background tasks.
     /// Returns the database IDs whose leases were released.
     pub async fn shutdown(&self) -> Vec<String> {
         self.drain();
+        self.end_waits();
         let leave = self.run_meta(MetaCmd::Leave { id: self.id.clone() });
         let _ = tokio::time::timeout(Duration::from_secs(2), leave).await;
         let released = self.engine.release_leases(Duration::from_secs(2)).await;
@@ -657,16 +744,7 @@ impl Node {
         cmd: &MetaCmd,
         deadline: Instant,
     ) -> std::result::Result<Json, std::result::Result<Error, cluster::TransportError>> {
-        let body = serde_json::to_vec(cmd).map_err(|e| Ok(Error::internal(e.to_string())))?;
-        let mut req = Request::post("/internal/v1/meta")
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .map_err(|e| Ok(Error::internal(e.to_string())))?;
-        if let Some(k) = self.cluster_key()
-            && let Ok(v) = k.parse()
-        {
-            req.headers_mut().insert(CLUSTER_KEY_HEADER, v);
-        }
+        let mut req = self.internal_request("/internal/v1/meta", cmd).map_err(Ok)?;
         if let Ok(v) = self.env.random_hex(16).parse() {
             req.headers_mut().insert(cluster::FORWARD_ID_HEADER, v);
         }
@@ -1378,7 +1456,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::engine::{Consistency, Isolation};
     use crate::sim::cost::{World, run_paused};
+    use bytes::Bytes;
     use std::time::Duration;
 
     #[test]
@@ -1467,6 +1547,131 @@ mod tests {
             let there: Vec<&str> =
                 live.iter().filter(|m| m.addr == "http://elsewhere").map(|m| m.id.as_str()).collect();
             assert_eq!(there, ["after"]);
+        });
+    }
+
+    #[test]
+    fn end_waits_wakes_active_and_future_long_polls() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let t = w.signup(0, "waits@x.io").await;
+            w.create_db(0, &t, "d").await;
+            let feed = w.json(0, "GET", "/v1/dbs/d/changes?after=0", &t, serde_json::Value::Null).await;
+            let cursor = feed["next_cursor"].as_str().unwrap().to_string();
+            let waiting = |path: String| {
+                let (router, t) = (w.node(0).router().unwrap(), t.clone());
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                w.node(0).env.spawn(async move {
+                    let started = tokio::time::Instant::now();
+                    let r = crate::sim::cost::call_router(&router, "GET", &path, &t, Bytes::new()).await;
+                    let _ = tx.send((r.status, started.elapsed()));
+                });
+                rx
+            };
+            let paths = [
+                format!("/v1/dbs/d/changes?after={cursor}&wait_ms=50000"),
+                format!("/v1/dbs/d/changes?after={cursor}&wait_ms=50000&consistency=snapshot&max_staleness_ms=300000"),
+            ];
+            let polls: Vec<_> = paths.iter().cloned().map(waiting).collect();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            w.node(0).end_waits();
+            for p in polls {
+                let (status, waited) = p.await.unwrap();
+                assert_eq!(status, 200);
+                assert!(waited < Duration::from_secs(6), "{waited:?}");
+            }
+            for path in paths {
+                let (status, waited) = waiting(path).await.unwrap();
+                assert_eq!(status, 200);
+                assert!(waited < Duration::from_secs(1), "{waited:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn writes_routed_to_a_restarted_home_are_handled_locally() {
+        run_paused(async {
+            let mut w = World::new(2, 1).await;
+            for i in 0..2 {
+                w.node(i).refresh_members().await.unwrap();
+            }
+            let t = w.signup(0, "fwd@x.io").await;
+            let id = w.create_db(0, &t, "d").await;
+            assert_eq!(w.holder(&id), None, "setup: an unleased database is routed to its home");
+            let live = w.node(0).live_members();
+            let home_id = super::cluster::rendezvous(&id, &live).unwrap().id.clone();
+            let home = (0..2).find(|&i| w.node(i).id == home_id).unwrap();
+            let other = 1 - home;
+            w.restart_node(home).await;
+            let put = Bytes::from(serde_json::json!({"ops": [{"op": "put", "key": "k", "value": "v"}]}).to_string());
+            let r = w.call(other, "POST", "/v1/dbs/d/txn", &t, put).await;
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        });
+    }
+
+    #[test]
+    fn streamed_writes_routed_to_a_restarted_home_are_retried_locally() {
+        run_paused(async {
+            let mut w = World::new(2, 1).await;
+            for i in 0..2 {
+                w.node(i).refresh_members().await.unwrap();
+            }
+            let t = w.signup(0, "fwd@x.io").await;
+            let id = w.create_db(0, &t, "d").await;
+            let live = w.node(0).live_members();
+            let home_id = super::cluster::rendezvous(&id, &live).unwrap().id.clone();
+            let home = (0..2).find(|&i| w.node(i).id == home_id).unwrap();
+            let other = 1 - home;
+            w.restart_node(home).await;
+            let big = Bytes::from(vec![7u8; 2 * crate::api::BUFFER_FORWARD_MAX as usize]);
+            let r = w.call(other, "PUT", "/v1/dbs/d/kv/big", &t, big.clone()).await;
+            assert_eq!(r.status, 503, "{}", String::from_utf8_lossy(&r.body));
+            assert_eq!(r.json()["error"]["details"]["outcome"], "not_applied", "{}", r.json());
+            assert!(r.headers.keys().all(|h| !h.as_str().starts_with("x-baserunna-stale")), "{:?}", r.headers);
+            let r = w.call(other, "PUT", "/v1/dbs/d/kv/big", &t, big).await;
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        });
+    }
+
+    #[test]
+    fn commit_notices_to_a_stalled_home_are_coalesced() {
+        run_paused(async {
+            let w = World::new(2, 1).await;
+            for i in 0..2 {
+                w.node(i).refresh_members().await.unwrap();
+            }
+            let t = w.signup(0, "notice@x.io").await;
+            let id = w.create_db(0, &t, "d").await;
+            let live = w.node(0).live_members();
+            let home_id = super::cluster::rendezvous(&id, &live).unwrap().id.clone();
+            let home = (0..2).find(|&i| w.node(i).id == home_id).unwrap();
+            let r = w.call(0, "PUT", "/v1/dbs/d/kv/k", &t, Bytes::from_static(b"v")).await;
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let db = w.node(1 - home).engine.db(&id);
+            let commit = || async {
+                let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                txn.put(crate::ops::user_key(b"k").unwrap(), crate::engine::Value::Inline(Bytes::new())).unwrap();
+                db.commit(txn.into_request()).await.unwrap();
+            };
+            let notices = || w.peer_calls("/internal/v1/notice");
+            commit().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let before = notices();
+            assert!(before > 0, "setup: a commit off the home sends a notice");
+            w.stall_peer(home, true);
+            for _ in 0..20 {
+                commit().await;
+            }
+            assert_eq!(notices() - before, 1, "one notice is in flight per database");
+            tokio::time::sleep(super::NOTICE_TIMEOUT + Duration::from_millis(100)).await;
+            assert_eq!(notices() - before, 2, "a timed-out notice is replaced by the newest version");
+            w.stall_peer(home, false);
+            tokio::time::sleep(super::NOTICE_TIMEOUT * 2).await;
+            assert_eq!(notices() - before, 2, "every commit was announced");
+            commit().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(notices() - before, 3);
         });
     }
 

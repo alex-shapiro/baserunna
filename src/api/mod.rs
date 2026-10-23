@@ -30,6 +30,7 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value as Json, json};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub const SESSION_COOKIE: &str = "brs_session";
 
@@ -265,7 +266,11 @@ fn clone_parts(req: &Request) -> http::request::Builder {
     b
 }
 
-const BUFFER_FORWARD_MAX: u64 = 1024 * 1024;
+pub(crate) const BUFFER_FORWARD_MAX: u64 = 1024 * 1024;
+
+/// Maximum `wait_ms` duration for change-feed and stream long polls, chosen to
+/// stay below a 60 s load-balancer idle timeout.
+pub(crate) const LONG_POLL_MAX_MS: u64 = 50_000;
 
 fn finishes_txn(req: &Request) -> bool {
     let route = req.extensions().get::<MatchedPath>().map(MatchedPath::as_str);
@@ -318,6 +323,10 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 tag_forward(&node, &mut fwd, &target, deadline);
                 let idempotent = parts.method == http::Method::GET || parts.method == http::Method::HEAD;
                 match node.services.transport.call(&addr, fwd).await {
+                    Ok(resp) if resp.headers().contains_key(STALE_TARGET_HEADER) => {
+                        node.mark_suspect(&target);
+                        req = Request::from_parts(parts, Body::from(bytes));
+                    }
                     Ok(resp) => return Ok(forwarded(resp, target)),
                     Err(te) if te.maybe_delivered && !idempotent => {
                         probe::hit(Probe::ForwardAmbiguous);
@@ -340,6 +349,15 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 fwd.headers_mut().insert(HOPS_HEADER, HeaderValue::from(hops + 1));
                 tag_forward(&node, &mut fwd, &target, deadline);
                 return match node.services.transport.call(&addr, fwd).await {
+                    // A streamed request body cannot be replayed locally after the target rejects it.
+                    Ok(resp) if resp.headers().contains_key(STALE_TARGET_HEADER) => {
+                        node.mark_suspect(&target);
+                        Err(Error::Unavailable {
+                            message: format!("{target} restarted; retry"),
+                            retry_after_ms: Some(100),
+                            outcome_unknown: false,
+                        })
+                    }
                     Ok(resp) => Ok(forwarded(resp, target)),
                     Err(te) => {
                         if te.maybe_delivered {
@@ -355,13 +373,22 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 };
             }
         }
-        // Re-resolve strongly if the cached database name points to a deleted or recreated database.
+        // Verify that the database manifest is not deleted, and re-resolve the name with a
+        // strong metadata read if it is.
+        let read_only = matches!(*req.method(), http::Method::GET | http::Method::HEAD);
+        let staleness = read_only.then(|| snapshot_staleness(req.uri().query())).flatten();
         let opened = match node.open_db(&rec).await {
-            Ok(db) => match db.latest_snapshot().await {
-                Err(Error::NotFound(m)) => Err(m),
-                Err(e) => return Err(e),
-                Ok(_) => Ok(db),
-            },
+            Ok(db) => {
+                let checked = match staleness {
+                    Some(max_staleness_ms) => db.snapshot(Consistency::Snapshot { max_staleness_ms }).await.map(drop),
+                    None => db.latest_snapshot().await.map(drop),
+                };
+                match checked {
+                    Err(Error::NotFound(m)) => Err(m),
+                    Err(e) => return Err(e),
+                    Ok(()) => Ok(db),
+                }
+            }
             Err(Error::NotFound(m)) => Err(m),
             Err(e) => return Err(e),
         };
@@ -420,6 +447,10 @@ fn hops(h: &HeaderMap) -> u32 {
 }
 
 const SERVER_TIMING_HEADER: &str = "server-timing";
+
+/// Response header set if a forwarded request is rejected because the target node ID does not
+/// match the running process. The request was not applied.
+const STALE_TARGET_HEADER: &str = "x-baserunna-stale-target";
 
 /// Assigns an `x-request-id` header, attaches `Server-Timing`, and logs request completion.
 async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
@@ -490,12 +521,14 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
     }
     if req.headers().get(FORWARD_TO_HEADER).and_then(|v| v.to_str().ok()) != Some(node.id.as_str()) {
         probe::hit(Probe::ForwardToPreviousProcess);
-        return Error::Unavailable {
+        let mut resp = Error::Unavailable {
             message: "forwarded to a node that is no longer running".into(),
             retry_after_ms: Some(100),
             outcome_unknown: false,
         }
         .into_response();
+        resp.headers_mut().insert(STALE_TARGET_HEADER, HeaderValue::from_static("1"));
+        return resp;
     }
     // Scope deduplication keys to caller credentials and request target.
     let mut scope = Vec::new();
@@ -567,6 +600,15 @@ async fn internal_auth(State(node): State<Arc<Node>>, req: Request, next: Next) 
         return Error::PermissionDenied("bad cluster key".into()).into_response();
     }
     next.run(req).await
+}
+
+/// Returns `max_staleness_ms` if `query` specifies `consistency=snapshot`.
+fn snapshot_staleness(query: Option<&str>) -> Option<u64> {
+    let q: std::collections::BTreeMap<String, String> = serde_urlencoded::from_str(query?).ok()?;
+    match consistency_of(&q) {
+        Ok(Consistency::Snapshot { max_staleness_ms }) => Some(max_staleness_ms),
+        _ => None,
+    }
 }
 
 pub fn consistency_of(q: &std::collections::BTreeMap<String, String>) -> Result<Consistency> {
@@ -777,18 +819,34 @@ pub(crate) trait Found {
     fn found(&self) -> bool;
 }
 
-/// Polls `$read` on fresh snapshots until [`Found::found`] is true or `$wait` elapses.
+/// Returns the maximum duration to wait for a local version wakeup before polling again,
+/// bounded by `until`. Strong reads poll every `watch_poll_ms`; snapshot reads wait until the
+/// cached snapshot exceeds `max_staleness_ms` (at least `watch_poll_ms`).
+pub(crate) fn next_poll_delay(node: &Node, db: &Db, c: Consistency, until: tokio::time::Instant) -> Duration {
+    let now = tokio::time::Instant::now();
+    let poll = now + Duration::from_millis(node.cfg.watch_poll_ms);
+    let reread = match c {
+        Consistency::Strong => poll,
+        Consistency::Snapshot { max_staleness_ms } => {
+            db.stale_at(Duration::from_millis(max_staleness_ms)).map_or(poll, |at| at.max(poll))
+        }
+    };
+    reread.min(until).saturating_duration_since(now)
+}
+
+/// Evaluates `$read` in a loop until [`Found::found`] is true, `$wait` elapses, or
+/// [`Shared::waits_ended`](crate::engine::Shared::waits_ended) is set, waiting between
+/// attempts with [`Db::wait_for_change`] for up to [`next_poll_delay`].
 macro_rules! watch {
     ($node:expr, $db:expr, $c:expr, $wait:expr, |$t:ident| $read:expr) => {{
         let until_ = tokio::time::Instant::now() + $wait;
         loop {
             let (out_, v_) = crate::api::with_read!($db, $c, |$t| $read);
             let left_ = until_.saturating_duration_since(tokio::time::Instant::now());
-            if crate::api::Found::found(&out_) || left_.is_zero() {
+            if crate::api::Found::found(&out_) || left_.is_zero() || $node.engine.shared.waits_ended() {
                 break (out_, v_);
             }
-            let poll_ = std::time::Duration::from_millis($node.cfg.watch_poll_ms);
-            $db.wait_for_change(v_, left_.min(poll_)).await;
+            $db.wait_for_change(v_, crate::api::next_poll_delay(&$node, &$db, $c, until_)).await;
         }
     }};
 }
@@ -804,6 +862,20 @@ async fn close_if_body_unread(req: Request, next: Next) -> Response {
         resp.headers_mut().insert(http::header::CONNECTION, HeaderValue::from_static("close"));
     }
     resp
+}
+
+#[derive(serde::Deserialize)]
+struct CommitNotice {
+    db: String,
+    version: u64,
+}
+
+/// Handles `POST /internal/v1/notice` by recording a remote commit version on the database if open.
+async fn commit_notice(State(node): State<Arc<Node>>, axum::Json(n): axum::Json<CommitNotice>) -> Response {
+    if let Some(db) = node.engine.db_if_open(&n.db) {
+        db.notice_commit(n.version);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn healthz(State(node): State<Arc<Node>>) -> Response {
@@ -827,6 +899,7 @@ pub fn router(node: Arc<Node>) -> Router {
         data::routes().merge(streams::routes()).route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
     let internal = Router::new()
         .route("/internal/v1/meta", post(account::internal_meta))
+        .route("/internal/v1/notice", post(commit_notice))
         .route_layer(middleware::from_fn_with_state(node.clone(), internal_auth));
     let r = Router::new()
         .route("/healthz", get(healthz))

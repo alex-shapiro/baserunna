@@ -12,7 +12,7 @@ use axum::body::Body;
 use bytes::Bytes;
 use http::{Request, Response};
 use serde_json::{Value as Json, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -168,7 +168,14 @@ impl ObjectStore for MeteredStore {
     }
 }
 
-type Peers = Arc<Mutex<BTreeMap<String, axum::Router>>>;
+#[derive(Default)]
+struct PeerNet {
+    routers: BTreeMap<String, axum::Router>,
+    calls: BTreeMap<String, u64>,
+    stalled: BTreeSet<String>,
+}
+
+type Peers = Arc<Mutex<PeerNet>>;
 
 struct PeerTransport {
     peers: Peers,
@@ -176,8 +183,15 @@ struct PeerTransport {
 
 impl Transport for PeerTransport {
     fn call(&self, addr: &str, req: Request<Body>) -> BoxFut<'static, Result<Response<Body>, TransportError>> {
-        let router = self.peers.lock().unwrap_or_else(|e| e.into_inner()).get(addr).cloned();
+        let mut net = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        *net.calls.entry(req.uri().path().to_string()).or_default() += 1;
+        let stalled = net.stalled.contains(addr);
+        let router = net.routers.get(addr).cloned();
+        drop(net);
         Box::pin(async move {
+            if stalled {
+                std::future::pending::<()>().await;
+            }
             let router =
                 router.ok_or_else(|| TransportError { message: "unknown peer".into(), maybe_delivered: false })?;
             match router.oneshot(req).await {
@@ -190,6 +204,7 @@ impl Transport for PeerTransport {
 
 pub struct Resp {
     pub status: u16,
+    pub headers: http::HeaderMap,
     pub body: Bytes,
 }
 
@@ -212,6 +227,10 @@ pub fn node_config(name: &str, addr: &str) -> NodeConfig {
         engine: EngineConfig::default(),
         ..NodeConfig::default()
     }
+}
+
+fn peer_addr(i: usize) -> String {
+    format!("cost://n{i}")
 }
 
 /// Simulated cluster backed by a [`MeteredStore`].
@@ -255,7 +274,7 @@ impl World {
     }
 
     async fn boot(&self, i: usize) -> Arc<Node> {
-        let addr = format!("cost://n{i}");
+        let addr = peer_addr(i);
         let env = Arc::new(Env::sim(0xc057 + i as u64 + 1000 * self.nodes.len() as u64, self.base_ms, self.origin, 0));
         let store: DynStore = self.store.clone();
         let transport = Arc::new(PeerTransport { peers: self.peers.clone() });
@@ -264,8 +283,24 @@ impl World {
         let services = crate::node::Services { transport, oidc: None, mailer: None };
         let node = Node::start(cfg, env, store, services).await.expect("node starts");
         let router = api::router(node.clone());
-        self.peers.lock().unwrap_or_else(|e| e.into_inner()).insert(addr, router);
+        self.peers.lock().unwrap_or_else(|e| e.into_inner()).routers.insert(addr, router);
         node
+    }
+
+    /// Returns the total number of peer requests sent to `path`.
+    pub fn peer_calls(&self, path: &str) -> u64 {
+        self.peers.lock().unwrap_or_else(|e| e.into_inner()).calls.get(path).copied().unwrap_or(0)
+    }
+
+    /// Configures whether peer requests to node `i` hang indefinitely.
+    pub fn stall_peer(&self, i: usize, stalled: bool) {
+        let addr = peer_addr(i);
+        let mut net = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        if stalled {
+            net.stalled.insert(addr);
+        } else {
+            net.stalled.remove(&addr);
+        }
     }
 
     pub fn node(&self, i: usize) -> &Arc<Node> {
@@ -325,9 +360,9 @@ pub async fn call_router(router: &axum::Router, method: &str, path: &str, token:
         Ok(r) => r,
         Err(e) => match e {},
     };
-    let status = resp.status().as_u16();
-    let body = http_body_util::BodyExt::collect(resp.into_body()).await.map(|b| b.to_bytes()).unwrap_or_default();
-    Resp { status, body }
+    let (parts, body) = resp.into_parts();
+    let body = http_body_util::BodyExt::collect(body).await.map(|b| b.to_bytes()).unwrap_or_default();
+    Resp { status: parts.status.as_u16(), headers: parts.headers, body }
 }
 
 pub fn run_paused<F: Future>(f: F) -> F::Output {
@@ -507,6 +542,20 @@ async fn single_node(w: &World, out: &mut Vec<Measurement>) {
     let r = Recorder::start(s, &idle);
     tokio::time::sleep(Duration::from_secs(3600)).await;
     out.push(r.stop("idle_db", "hour", 1.0, false));
+
+    // Measure an idle change-feed watcher polling with 5-minute snapshot staleness.
+    let feed = "/v1/dbs/idle/changes?after=0&limit=1";
+    let cursor = w.json(0, "GET", feed, &t, Json::Null).await["next_cursor"].as_str().expect("cursor").to_string();
+    let wait = format!(
+        "/v1/dbs/idle/changes?after={cursor}&limit=1&wait_ms=50000&consistency=snapshot&max_staleness_ms=300000"
+    );
+    let r = Recorder::start(s, &idle);
+    let until = Instant::now() + Duration::from_secs(3600);
+    while Instant::now() < until {
+        let resp = w.json(0, "GET", &wait, &t, Json::Null).await;
+        assert_eq!(resp["changes"].as_array().map(|c| c.len()), Some(0));
+    }
+    out.push(r.stop("idle_watcher", "hour", 1.0, false));
 }
 
 /// Runs 1 commit/s over 1,000 keys for an hour and returns mean space
@@ -580,13 +629,43 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     }
     out.push(r.stop("snapshot_read", "read", 10.0, true));
 
+    // Measure cross-node wakeup latency when a remote writer commits while a request waits on the home node.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let live = w.node(0).live_members();
+    let home_id = crate::cluster::rendezvous(&id, &live).expect("home").id.clone();
+    let home = (0..w.len()).find(|&i| w.node(i).id == home_id).expect("home node");
+    let writer = (home + 1) % w.len();
+    let cursor = w.json(home, "GET", "/v1/dbs/big/changes?after=0&limit=1000", &t, Json::Null).await["next_cursor"]
+        .as_str()
+        .expect("cursor")
+        .to_string();
+    let wait = format!("/v1/dbs/big/changes?after={cursor}&wait_ms=50000&consistency=snapshot&max_staleness_ms=300000");
+    let router = w.node(home).router().expect("router");
+    let t2 = t.clone();
+    let waiter = tokio::spawn(async move {
+        let resp = call_router(&router, "GET", &wait, &t2, Bytes::new()).await;
+        (Instant::now(), resp.json()["changes"].as_array().map(|c| c.len()).unwrap_or(0))
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let wdb = w.node(writer).engine.db(&id);
+    let mut txn = wdb.begin(crate::engine::Isolation::Serializable, Consistency::Strong).await.expect("begin");
+    txn.put(crate::ops::user_key(b"woken").expect("key"), crate::engine::Value::Inline(value(8, 9))).expect("put");
+    let r = Recorder::start(&w.store, &id);
+    let committed = Instant::now();
+    wdb.commit(txn.into_request()).await.expect("commit");
+    let (woke, n) = waiter.await.expect("waiter");
+    assert_eq!(n, 1, "the waiter saw the commit");
+    let mut m = r.stop("watch_wakeup", "commit", 1.0, false);
+    m.latency_ms = Some(woke.duration_since(committed).as_millis() as f64);
+    out.push(m);
+
     w.restart_node(other).await;
     let db = w.node(other).engine.db(&id);
     let r = Recorder::start(&w.store, &id);
     let v = db.read_version(Consistency::Strong).await.expect("open after restart");
     assert!(v.get(&key, v.read_time()).await.expect("read").is_some());
     let all = v.scan(&crate::engine::KeyRange::data(), false, usize::MAX, v.read_time()).await.expect("scan");
-    assert_eq!(all.len(), 128);
+    assert_eq!(all.len(), 129);
     out.push(r.stop("restart_open_and_scan", "open", 1.0, true));
     segs
 }

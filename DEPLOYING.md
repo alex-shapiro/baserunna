@@ -93,9 +93,11 @@ forward database requests to the node holding the database's lease. Set up:
 - **No sticky sessions** and **no automatic retries of non-idempotent
   requests** (POST, PUT, DELETE). A retried write could apply twice;
   clients retry safely with idempotency keys (SPEC §6.2).
-- **Timeouts and body sizes** for blobs: uploads and downloads stream up
-  to `blob_max` (5 GiB), so allow long idle timeouts and large request
-  bodies on `/v1/dbs/*/kv/*` and `/v1/dbs/*/blobs`.
+- **Timeouts and body sizes**: Set the load balancer idle timeout above
+  50 s so that `wait_ms` long polls on change feeds and streams do not
+  time out before the server responds. On `/v1/dbs/*/kv/*` and
+  `/v1/dbs/*/blobs`, allow request bodies and streaming transfers up to
+  `blob_max` (5 GiB).
 - **Client addresses**: sign-in throttling is per client address. Behind
   a proxy that appends the client to `X-Forwarded-For`, set
   `BASERUNNA_TRUSTED_PROXY_HOPS` to the number of such proxies (usually 1).
@@ -134,8 +136,9 @@ On SIGTERM (or SIGINT) a node:
 
 1. fails its health check for `BASERUNNA_DRAIN_DELAY_MS` (default 0) while
    still serving, so the load balancer stops sending it requests;
-2. stops accepting connections and lets in-flight requests finish, for at
-   most `BASERUNNA_SHUTDOWN_TIMEOUT_MS` (default 20 s);
+2. stops accepting connections, ends active `wait_ms` long polls immediately,
+   and waits up to `BASERUNNA_SHUTDOWN_TIMEOUT_MS` (default 20 s) for
+   in-flight requests to complete;
 3. leaves the membership table and releases its database leases so that other
    nodes can take over writes immediately.
 

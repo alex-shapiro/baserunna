@@ -8,7 +8,7 @@ use super::super::{Sim, SimConfig};
 use crate::util::{b64, sha256};
 use bytes::Bytes;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -39,6 +39,25 @@ struct Written {
     by_version: BTreeMap<(u64, u64), Arc<Vec<u8>>>,
     /// All content ever written to a key, including unacknowledged writes.
     by_key: BTreeMap<u64, Vec<Arc<Vec<u8>>>>,
+    /// Source keys copied into each destination key, including unacknowledged copies.
+    copied_from: BTreeMap<u64, BTreeSet<u64>>,
+}
+
+impl Written {
+    /// Returns all values that key `k` can hold, including values written to keys transitively
+    /// copied into `k`.
+    fn candidates(&self, k: u64) -> Vec<Arc<Vec<u8>>> {
+        let mut keys = BTreeSet::from([k]);
+        let mut todo = vec![k];
+        while let Some(k) = todo.pop() {
+            for f in self.copied_from.get(&k).into_iter().flatten() {
+                if keys.insert(*f) {
+                    todo.push(*f);
+                }
+            }
+        }
+        keys.iter().flat_map(|k| self.by_key.get(k).into_iter().flatten().cloned()).collect()
+    }
 }
 
 #[derive(Default)]
@@ -62,6 +81,10 @@ async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Resul
         let path = format!("{BASE}/kv/{}", key_name(k));
         if rng.chance(0.2) {
             c.call_settled("DELETE", &path, None).await;
+            continue;
+        }
+        if rng.chance(0.2) {
+            copy(&c, rng.below(KEYS) + if small { KEYS } else { 0 }, k, &written).await?;
             continue;
         }
         let size =
@@ -91,6 +114,16 @@ async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Resul
         }
     }
     Ok(())
+}
+
+async fn copy(c: &Client, from: u64, to: u64, written: &Mutex<Written>) -> Result<(), String> {
+    written.lock().unwrap_or_else(|e| e.into_inner()).copied_from.entry(to).or_default().insert(from);
+    let body = json!({"ops": [{"op": "copy", "from": key_name(from), "to": key_name(to)}]});
+    let r = c.call_settled("POST", &format!("{BASE}/txn"), Some(body)).await;
+    match r.status {
+        200 | 412 => Ok(()),
+        s => Err(format!("copy {} to {}: {s} {}", key_name(from), key_name(to), r.json)),
+    }
 }
 
 /// Keys `0..KEYS` are large blobs; `KEYS..2 * KEYS` are small blobs.
@@ -165,7 +198,7 @@ async fn reader(
                 let candidates: Vec<Arc<Vec<u8>>> = match (by_id, version) {
                     (false, Some(v)) => match w.by_version.get(&(k, v)) {
                         Some(c) => vec![c.clone()],
-                        None => w.by_key.get(&k).cloned().unwrap_or_default(),
+                        None => w.candidates(k),
                     },
                     (false, None) => return Err(format!("{what}: missing version header")),
                     (true, _) => w.by_sha.values().cloned().collect(),
@@ -196,7 +229,7 @@ async fn small_read(c: &Client, k: u64, written: &Mutex<Written>, stats: &Stats)
             let want = g["version"].as_u64().and_then(|v| w.by_version.get(&(k, v)));
             let ok = match want {
                 Some(c) => **c == got,
-                None => w.by_key.get(&k).is_some_and(|cs| cs.iter().any(|c| **c == got)),
+                None => w.candidates(k).iter().any(|c| **c == got),
             };
             if !ok {
                 return Err(format!("{key}: inline value of {} bytes does not match any written value", got.len()));
@@ -268,7 +301,7 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, rounds: usize, c
             404 => {}
             200 => {
                 let w = written.lock().unwrap_or_else(|e| e.into_inner());
-                check_body(&r, &w.by_key.get(&k).cloned().unwrap_or_default(), &path)?;
+                check_body(&r, &w.candidates(k), &path)?;
             }
             s => return Err(format!("final read of {path}: {s}")),
         }

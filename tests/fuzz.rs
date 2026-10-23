@@ -110,8 +110,10 @@ fn seeds() -> Vec<(&'static str, &'static str, Value)> {
             "/v1/dbs/fz/txn",
             json!({"ops": [{"op": "put", "key": "a", "value": "1"}, {"op": "get", "key": "a"},
             {"op": "scan", "prefix": "", "limit": 3}, {"op": "increment", "key": "n", "by": 2},
-            {"op": "check", "key": "a", "exists": true}, {"op": "delete_range", "prefix": "zz"}]}),
+            {"op": "check", "key": "a", "exists": true}, {"op": "delete_range", "prefix": "zz"},
+            {"op": "copy", "from": "a", "to": "b", "ttl_ms": 1000}]}),
         ),
+        ("POST", "/v1/dbs/fz/txn", json!({"ops": [{"op": "copy", "from": "missing", "to": "c"}]})),
         (
             "POST",
             "/v1/dbs/fz/txn",

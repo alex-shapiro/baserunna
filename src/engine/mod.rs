@@ -27,7 +27,7 @@ pub use db::{CommitState, Committed, Consistency, Db, DbStats, LevelStats};
 pub use stream::{Appended, Record, Retention, Seek, StreamOp, StreamState};
 pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
 pub use types::{BlobRef, Entry, Seq, Value};
-pub use version::{Change, ChangePage, ChangePos, KeyRange, Snapshot, Version};
+pub use version::{Change, ChangeCursor, ChangePage, ChangePos, KeyRange, Snapshot, Version};
 
 /// State shared by every database handle on a node.
 pub struct Shared {
@@ -49,11 +49,29 @@ pub struct Shared {
     pub metrics: Arc<crate::metrics::StoreMetrics>,
     /// True once the node begins releasing leases for shutdown.
     stopping: std::sync::atomic::AtomicBool,
+    /// True once [`Engine::end_waits`] is called.
+    waits_ended: std::sync::atomic::AtomicBool,
+    /// Called with a database id and version after this node commits a new data version.
+    commit_hook: std::sync::OnceLock<CommitHook>,
 }
 
+/// Callback invoked with `(db_id, version)` after this node commits a new data version.
+pub type CommitHook = Box<dyn Fn(&str, u64) + Send + Sync>;
+
 impl Shared {
+    pub(crate) fn committed(&self, db: &str, version: u64) {
+        if let Some(h) = self.commit_hook.get() {
+            h(db, version);
+        }
+    }
+
     pub(crate) fn stopping(&self) -> bool {
         self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns true if [`Engine::end_waits`] has been called.
+    pub fn waits_ended(&self) -> bool {
+        self.waits_ended.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn quota_exempt(&self, db: &str) -> bool {
@@ -214,6 +232,8 @@ impl Engine {
             observed_leases: Mutex::new(DetHashMap::default()),
             quota_exempt: Mutex::new(Default::default()),
             stopping: false.into(),
+            waits_ended: false.into(),
+            commit_hook: std::sync::OnceLock::new(),
         });
         Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) })
     }
@@ -233,8 +253,26 @@ impl Engine {
         g.entry(id.to_string()).or_insert_with(|| Db::new(id.to_string(), self.shared.clone())).clone()
     }
 
+    /// Returns the open database handle for `id` if present in memory.
+    pub fn db_if_open(&self, id: &str) -> Option<Arc<Db>> {
+        self.dbs.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+    }
+
+    /// Sets the callback invoked after this node commits a new data version.
+    pub fn set_commit_hook(&self, h: CommitHook) {
+        let _ = self.shared.commit_hook.set(h);
+    }
+
     pub fn open_count(&self) -> usize {
         self.dbs.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Wakes all current [`Db::wait_for_change`] calls and causes future calls to return immediately.
+    pub fn end_waits(&self) {
+        self.shared.waits_ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        for db in self.open_dbs() {
+            db.wake_waiters();
+        }
     }
 
     /// Returns currently open database handles sorted by ID.

@@ -965,10 +965,11 @@ impl Version {
 
     /// Returns up to `limit` changes in `range` after `after` in feed order:
     /// the newest entry for each modified key and any range tombstones clipped
-    /// to `range`. Fails with `CursorExpired` if tombstones after `after` may
+    /// to `range`. Fails with `CursorExpired` if tombstones required by `after`
     /// have been purged.
-    pub async fn changes(&self, range: &KeyRange, after: &ChangePos, limit: usize) -> Result<ChangePage> {
-        if !after.retained_by(self.m.tombstone_horizon) {
+    pub async fn changes(&self, range: &KeyRange, after: &ChangeCursor, limit: usize) -> Result<ChangePage> {
+        let floor = if after.is_start() { self.m.version } else { after.floor };
+        if after.pos < ChangePos::after_version(self.m.tombstone_horizon) && floor < self.m.tombstone_horizon {
             return Err(Error::CursorExpired(format!(
                 "deletions up to version {} may have been purged; resynchronize",
                 self.m.tombstone_horizon
@@ -976,7 +977,7 @@ impl Version {
         }
         let mut best: BinaryHeap<Change> = BinaryHeap::new();
         let mut offer = |c: Change| {
-            if c.pos() > *after {
+            if c.pos() > after.pos {
                 best.push(c);
                 if best.len() > limit + 1 {
                     best.pop();
@@ -1015,17 +1016,22 @@ impl Version {
             deletes: Some(self.deletes.clone()),
             expire_at: None,
         };
-        let runs = self.runs(|s| s.max_seq >= after.seq);
+        let runs = self.runs(|s| s.max_seq >= after.pos.seq);
         let mut it = MergeIter::new(self.shared.clone(), &self.m.db_id, &self.m.tail, runs, spec);
         while let Some(e) = it.next().await? {
-            if e.seq >= after.seq {
+            if e.seq >= after.pos.seq {
                 offer(Change::Entry(e));
             }
         }
         let mut changes = best.into_sorted_vec();
         let more = changes.len() > limit;
         changes.truncate(limit);
-        Ok(ChangePage { changes, more })
+        let next = match changes.last() {
+            Some(c) if more => ChangeCursor { pos: c.pos(), floor: floor.min(self.m.version) },
+            _ if after.pos > ChangePos::after_version(self.m.version) => after.clone(),
+            _ => ChangeCursor::after_version(self.m.version),
+        };
+        Ok(ChangePage { changes, more, next })
     }
 }
 
@@ -1068,28 +1074,55 @@ impl ChangePos {
     pub fn after_version(seq: Seq) -> ChangePos {
         ChangePos { seq, kind: ChangePos::END, key: Bytes::new() }
     }
+}
 
-    /// Returns true if all deletions after this position are retained when tombstones up to `horizon` have been purged.
-    pub fn retained_by(&self, horizon: Seq) -> bool {
-        self.seq > horizon || (self.seq == horizon && self.kind == ChangePos::END)
+/// Resume cursor for a change feed.
+///
+/// A cursor is valid only if all tombstones that could delete keys held by the
+/// caller are still retained (`> tombstone_horizon`). An incremental caller
+/// (`floor == 0`) requires all tombstones after `pos`. A caller performing a
+/// full state transfer from version 0 holds only keys returned by earlier pages
+/// of that transfer, so it requires only tombstones newer than `floor`, the
+/// minimum snapshot version across all pages read in the transfer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeCursor {
+    pub pos: ChangePos,
+    /// Minimum snapshot version read during a full state transfer from version 0, or `0`.
+    pub floor: Seq,
+}
+
+impl ChangeCursor {
+    pub fn after_version(seq: Seq) -> ChangeCursor {
+        ChangeCursor { pos: ChangePos::after_version(seq), floor: 0 }
     }
 
-    /// Encodes the cursor as an opaque URL-safe string; see [`ChangePos::decode`].
+    fn is_start(&self) -> bool {
+        self.pos == ChangePos::after_version(0)
+    }
+
+    /// Encodes the cursor as an opaque URL-safe string; see [`ChangeCursor::decode`].
     pub fn encode(&self) -> String {
-        match self.kind {
-            ChangePos::END => self.seq.to_string(),
-            k => format!("{}.{k}.{}", self.seq, crate::util::b64::encode_url(&self.key)),
+        let p = &self.pos;
+        match (p.kind, self.floor) {
+            (ChangePos::END, _) => p.seq.to_string(),
+            (k, 0) => format!("{}.{k}.{}", p.seq, crate::util::b64::encode_url(&p.key)),
+            (k, f) => format!("{}.{k}.{}.{f}", p.seq, crate::util::b64::encode_url(&p.key)),
         }
     }
 
-    pub fn decode(s: &str) -> Option<ChangePos> {
-        let mut parts = s.splitn(3, '.');
+    pub fn decode(s: &str) -> Option<ChangeCursor> {
+        let mut parts = s.split('.');
         let seq = parts.next()?.parse().ok()?;
-        match (parts.next(), parts.next()) {
-            (None, _) => Some(ChangePos::after_version(seq)),
-            (Some(k), Some(key)) => {
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (None, ..) => Some(ChangeCursor::after_version(seq)),
+            (Some(k), Some(key), floor, None) => {
                 let kind = k.parse().ok().filter(|k| *k < ChangePos::END)?;
-                Some(ChangePos { seq, kind, key: Bytes::from(crate::util::b64::decode_url(key)?) })
+                let floor = match floor {
+                    None => 0,
+                    Some(f) => f.parse().ok().filter(|f| *f > 0)?,
+                };
+                let key = Bytes::from(crate::util::b64::decode_url(key)?);
+                Some(ChangeCursor { pos: ChangePos { seq, kind, key }, floor })
             }
             _ => None,
         }
@@ -1139,6 +1172,8 @@ pub struct ChangePage {
     pub changes: Vec<Change>,
     /// True if additional changes follow this page.
     pub more: bool,
+    /// Cursor for the next page.
+    pub next: ChangeCursor,
 }
 
 #[cfg(test)]
@@ -1196,8 +1231,8 @@ mod tests {
             ["", ".", "0", "1", "2", "3", "18446744073709551615", "18446744073709551616", "-1", "AA", "_-", "=", "é"];
         for _ in 0..20_000 {
             let s: String = (0..r.usize(6)).map(|_| pieces[r.usize(pieces.len())]).collect();
-            if let Some(p) = ChangePos::decode(&s) {
-                assert_eq!(ChangePos::decode(&p.encode()), Some(p), "{s:?}");
+            if let Some(c) = ChangeCursor::decode(&s) {
+                assert_eq!(ChangeCursor::decode(&c.encode()), Some(c), "{s:?}");
             }
         }
     }

@@ -1444,7 +1444,7 @@ fn row_changes_follow_writes() {
         let second = db.commit(t.into_request()).await.unwrap();
         let mut t = begin(&db).await;
         let mut got = Vec::new();
-        let mut after = ChangePos::after_version(start);
+        let mut after = ChangeCursor::after_version(start);
         loop {
             let page = row_changes(&mut t, "people", &after, 2).await.unwrap();
             got.extend(page.changes);
@@ -1461,7 +1461,7 @@ fn row_changes_follow_writes() {
             "{got:?}"
         );
         assert_eq!(got[2]["row"]["age"], json!(5));
-        assert_eq!(after, ChangePos::after_version(second));
+        assert_eq!(after, ChangeCursor::after_version(second));
         let page = row_changes(&mut t, "people", &after, 10).await.unwrap();
         assert!(page.changes.is_empty() && !page.more && page.next == after);
     });

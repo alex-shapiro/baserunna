@@ -175,6 +175,8 @@ probes! {
     MembersRefreshedForUnknownPeer,
     /// A peer node was marked suspect after a failed forward.
     PeerSuspected,
+    /// A node reloaded the manifest for waiting requests after another node announced a commit.
+    NoticedVersionLoaded,
     /// An interrupted database deletion was completed during routing.
     DeletionRepaired,
     /// A cached database name was resolved again after its target database was deleted.

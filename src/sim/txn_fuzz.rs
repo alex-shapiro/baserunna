@@ -219,6 +219,12 @@ enum Op {
     Delete {
         key: String,
     },
+    Copy {
+        from: String,
+        to: String,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
+    },
     DeleteRange {
         #[serde(default)]
         prefix: Option<String>,
@@ -392,6 +398,7 @@ impl Op {
             self,
             Op::Put { .. }
                 | Op::Delete { .. }
+                | Op::Copy { .. }
                 | Op::DeleteRange { .. }
                 | Op::Increment { .. }
                 | Op::InsertRow { .. }
@@ -513,6 +520,8 @@ struct TxnView {
     stream_keys: Vec<StreamRead>,
     stream_writes: Vec<StreamWrite>,
     consumer_writes: BTreeMap<(String, String), u64>,
+    /// Keys read by `copy`, validated under every isolation level.
+    pinned: Vec<Vec<u8>>,
     op_index: usize,
 }
 
@@ -530,6 +539,7 @@ impl TxnView {
             stream_keys: Vec::new(),
             stream_writes: Vec::new(),
             consumer_writes: BTreeMap::new(),
+            pinned: Vec::new(),
             op_index: 0,
         }
     }
@@ -1160,6 +1170,16 @@ impl World {
                 t.writes.insert(k, None);
                 Ok(json!({}).into())
             }
+            Op::Copy { from, to, ttl_ms } => {
+                let f = user_key(decode(enc, from)?)?;
+                let to = user_key(decode(enc, to)?)?;
+                let expiry = ttl(*ttl_ms)?;
+                let r = t.get(&f);
+                t.pinned.push(f);
+                let (v, _) = r.ok_or(Fail::Precondition)?;
+                t.put(to, MVal { expiry, ..v });
+                Ok(json!({}).into())
+            }
             Op::DeleteRange { prefix, start, end } => {
                 if prefix.is_none() && start.is_none() && end.is_none() {
                     return Err(Fail::Invalid);
@@ -1631,7 +1651,7 @@ impl World {
             ReadItem::Key(k) => changed(k),
             ReadItem::Range(r) => self.last_write.iter().any(|(k, v)| *v > t.rv && r.contains(k)),
         });
-        let pinned = t.stream_keys.iter().any(|r| self.stream_changed(r, t.rv));
+        let pinned = t.stream_keys.iter().any(|r| self.stream_changed(r, t.rv)) || t.pinned.iter().any(|k| changed(k));
         let streams = match iso {
             Iso::Serializable => t.stream_reads.iter().any(|r| self.stream_changed(r, t.rv)),
             Iso::Snapshot => t
@@ -2278,6 +2298,11 @@ impl Gen<'_, '_> {
                     }
                     _ => o["value"] = json!(self.value(enc)),
                 }
+                self.ttl(&mut o);
+                o
+            }
+            5 if self.u.chance(128) => {
+                let mut o = json!({"op": "copy", "from": self.key(enc), "to": self.key(enc)});
                 self.ttl(&mut o);
                 o
             }

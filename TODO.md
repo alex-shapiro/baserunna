@@ -63,6 +63,13 @@ design context.
       batches currently move the manifest tail into a `BTreeMap` and back into
       a `Vec` on every commit. Merging sorted batch writes into the sorted tail
       vector makes CPU cost proportional to batch size instead of tail size.
+- [ ] **Suppress commit notices if the home node has 0 waiters.** If the lease
+      holder is not the database's rendezvous home, it sends a commit notice to
+      the home node on every commit batch even if 0 requests are waiting there.
+      Have the home node indicate in its response whether any requests are
+      waiting so the lease holder can pause notices for a bounded interval,
+      during which new waiters on the home node poll the manifest every
+      `watch_poll_ms`.
 
 ## Features
 
@@ -120,3 +127,9 @@ design context.
       a small number of seeds. Deduplicating failures by normalized message,
       weighting corpus entries by novelty, and incorporating probe-ordering
       and buggify-site features would preserve depth while improving breadth.
+
+## Docs
+
+- [ ] **Replace remaining wide tables in `SPEC.md`.** The tables in §8 (system
+      database), §9 (organization roles), §10 (error codes), and §12
+      (configuration) have rows wider than 100 characters.

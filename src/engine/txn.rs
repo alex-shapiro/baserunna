@@ -3,7 +3,7 @@
 //! writes.
 
 use super::stream::{self, StreamOp, StreamState};
-use super::types::{Seq, Value, is_commit_key};
+use super::types::{BlobRef, Seq, Value, is_commit_key};
 use super::version::{KeyRange, Snapshot, Version};
 use crate::error::{Error, Result};
 use bytes::Bytes;
@@ -60,6 +60,10 @@ pub struct WriteSet {
     /// Changes to streams, applied after `puts` by the committer, which
     /// gives appends their seqs (SPEC §5.11).
     pub streams: Vec<StreamOp>,
+    /// IDs of blobs copied from committed entries via [`Txn::copy`]. Because these
+    /// blobs are already bound in the manifest, commit validation skips staging checks
+    /// and quota additions for them.
+    pub copied_blobs: std::collections::BTreeSet<String>,
 }
 
 impl WriteSet {
@@ -82,14 +86,16 @@ impl WriteSet {
             || self.streams.iter().any(|s| matches!(s, StreamOp::Append { .. }))
     }
 
-    pub fn blob_ids(&self) -> Vec<String> {
-        self.puts
-            .values()
-            .filter_map(|v| match v {
-                Some(Put { value: Value::Blob(b), .. }) => Some(b.id.clone()),
-                _ => None,
-            })
-            .collect()
+    /// Returns deduplicated blob references bound by this write set that are not in
+    /// `copied_blobs`.
+    pub fn staged_blobs(&self) -> impl Iterator<Item = &BlobRef> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.puts.values().filter_map(move |v| match v {
+            Some(Put { value: Value::Blob(b), .. }) if !self.copied_blobs.contains(&b.id) && seen.insert(&b.id) => {
+                Some(b)
+            }
+            _ => None,
+        })
     }
 }
 
@@ -252,6 +258,19 @@ impl Txn {
             self.pinned_expiry = earliest(self.pinned_expiry, rv.expires());
         }
         Ok(r)
+    }
+
+    /// Copies the value of `from` to `to` with expiration policy `ttl`, and returns `true` if
+    /// `from` exists. Pins `from` in the read set so that the commit fails if `from` is
+    /// modified before commit under any isolation level, preventing a referenced blob from
+    /// becoming unreferenced before the commit (SPEC §5.8).
+    pub async fn copy(&mut self, from: &[u8], to: Bytes, ttl: Option<Ttl>) -> Result<bool> {
+        let Some(rv) = self.get_pinned(from).await? else { return Ok(false) };
+        if let (Value::Blob(b), Some(_)) = (&rv.value, rv.seq) {
+            self.writes.copied_blobs.insert(b.id.clone());
+        }
+        self.put_expiring(to, rv.value, ttl)?;
+        Ok(true)
     }
 
     /// Scans `range` with read-your-writes, recording the scanned interval in the read set.

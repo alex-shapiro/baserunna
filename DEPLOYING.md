@@ -56,6 +56,13 @@ fly secrets set --app baserunna --stage \
 fly deploy --ha=false
 ```
 
+`fly storage create` makes a Global bucket, which is strongly consistent
+only within a region. That is enough for nodes in one region, but nodes in
+different regions could both win a manifest CAS. A cluster that may span
+regions needs a Single-region or Multi-region bucket, created in the Tigris
+dashboard or with `tigris mk --locations`, because the location type is
+chosen when a bucket is created.
+
 Set the admin secrets before the first deploy: under the default
 `first_user_only` sign-up policy, whoever signs up first otherwise becomes
 admin. Keep the app at one machine (`--ha=false`); a second one would need

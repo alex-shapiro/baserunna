@@ -1,22 +1,54 @@
 # TODO
 
-Planned work not included in v1, ordered by priority within each section.
-See [`SPEC.md`](SPEC.md) §15 (known limitations) and §16 (future work) for
-design context.
+Planned work, ordered by priority within each section. Blockers are
+correctness or security gaps that must be closed before v1; everything else
+can ship after it. See [`SPEC.md`](SPEC.md) §15 (known limitations) and §16
+(future work) for design context.
 
-## Before production use
+## Blockers
 
-- [ ] **Run integration tests against production object stores.** `CloudStore`
-      (S3, GCS, Azure, R2, MinIO) is currently only compile-tested. Add an
-      opt-in integration test suite gated on credentials that runs the
-      `ObjectStore` conformance suite: conditional `PUT` (`If-Match` and
-      `If-None-Match`), list-after-write, and byte-range `GET`. Run the
-      `multi_node` example against MinIO in CI. Verify that each provider's
-      conditional-write semantics match `SimStore` and that `last_modified`
-      timestamps are monotonic (SPEC §5.8).
-- [ ] **Test Google OAuth against Google's production endpoints.** Currently
-      only `FakeGoogle` is tested. Add an OIDC `nonce` and PKCE
-      (`code_verifier`) to the authorization-code flow in addition to `state`.
+- [ ] **Verify object-store semantics against Tigris.** V1 supports only
+      Tigris. Manifest fencing, lease takeover, and GC grace periods all
+      assume that the store honors conditional writes, but only `SimStore` is
+      tested. The Fly deployment runs a single node, so it would behave
+      identically on a store that ignored `If-Match`. Write an `ObjectStore`
+      conformance suite gated on credentials that checks `412` for a stale
+      `If-Match` and for `If-None-Match: *` on an existing object, `304` for a
+      matching conditional `GET`, list-after-write, byte-range `GET` edges,
+      and `last_modified` precision and monotonicity (SPEC §5.8). Run it, and
+      the `multi_node` example with nodes killed during writes, against a
+      Tigris bucket in CI. Name Tigris as the only supported store in
+      `DEPLOYING.md` and SPEC §12 and §15.
+- [ ] **Bound memory used by open database handles.** Each open handle
+      retains its manifest, including a `tail` of up to `tail_max_bytes`
+      (256 KiB), and is evicted only after `db_idle_evict_ms` (5 min) idle.
+      One account can own about 101,000 databases (1,000 of its own and 1,000
+      in each of up to 100 organizations) and, at 500 requests/s per node, can
+      open all of them within the eviction window. An account that pre-fills
+      tails can therefore exhaust node memory on demand. Enforce a byte budget
+      across open handles with LRU eviction. This blocks any deployment that
+      admits untrusted accounts.
+
+## Reliability and operations
+
+- [ ] **Stop store-time callers from waiting on clock probes.**
+      `StoreClock::sync` acquires its lock before checking whether the
+      measurement is stale, so every `store_time_ms` caller (stream appends,
+      TTL writes, blob uploads, and commits that bind staged blobs) waits for
+      the probe that runs every 10 minutes. A stalled probe blocks those
+      commits until its store requests time out. Check staleness before
+      locking, and time probes out at `2 × clock_sync_max_error_ms`, beyond
+      which they are discarded as imprecise.
+- [ ] **Configure object-store timeouts and retries.** `CloudStore` uses the
+      `object_store` defaults of 30 s per attempt and up to 10 retries over
+      3 minutes, nested inside `Retry`'s 5 attempts, so a single store call
+      can stall for many minutes. Choose bounds that fit the 5 s lease and
+      10 s commit deadline, and exercise them in the conformance suite.
+- [ ] **Test Google OAuth against Google's production endpoints.** Only
+      `FakeGoogle` is tested. Refetch the JWKS when an ID token names an
+      unknown `kid` instead of waiting for the 1-hour cache to expire. Add
+      PKCE (`code_verifier`) and an OIDC `nonce` as defense in depth; `state`
+      is already bound to a signed cookie.
 - [ ] **Prometheus metrics endpoint.** Expose `/metrics` in Prometheus text
       format including the histograms from `/v1/admin/metrics`, object-store
       byte counters, CAS conflicts, lease acquisitions and steals, cache hit
@@ -25,11 +57,6 @@ design context.
 - [ ] **Publish release binaries and a container image.** Build and publish
       release binaries and a container image so external test suites can run
       a local node in CI.
-- [ ] **Time out store-clock probes.** A stalled probe holds the node-wide
-      `StoreClock::sync` lock until the store request times out, blocking
-      callers of `store_time_ms`. Because probes slower than
-      `2 × clock_sync_max_error_ms` are discarded as imprecise, probes should
-      time out at that bound.
 - [ ] **Reschedule retention trims if the store clock is unknown.**
       `trim_for_retention` returns early if the node lacks a store-clock
       measurement, delaying retention trimming until the next append or sweep.
@@ -38,10 +65,6 @@ design context.
       commit attempt rather than at the start of the manifest `PUT`, subtracting
       synchronous pre-`PUT` work (such as synchronous tail flushes) from the
       local lease duration.
-- [ ] **Bound memory used by open database handles.** Each open handle retains
-      its current manifest and cached compressed tail pages, and handle count
-      is currently bounded only by idle eviction (`db_idle_evict_ms`). Enforce
-      a byte budget across open handles with LRU eviction.
 - [ ] **Release database leases concurrently on shutdown.**
       `Engine::release_leases` currently releases leases sequentially with a
       2 s timeout per database.
@@ -100,6 +123,10 @@ design context.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`, and publish the Rust `client` module as a standalone
       crate.
+- [ ] **Support object stores beyond Tigris.** Run the object-store
+      conformance suite against S3, GCS, Azure, R2, and MinIO before listing
+      each as supported. GCS conditional writes use object generations rather
+      than etags, so `CloudStore`'s etag handling needs GCS-specific coverage.
 
 - [ ] **Support idempotency keys for raw KV writes.** Accept an
       `Idempotency-Key` header on `PUT` and `DELETE /v1/dbs/{db}/kv/{key}` and

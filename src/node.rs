@@ -601,14 +601,20 @@ impl Node {
         lock(&self.suspects).get(node_id).is_some_and(|s| Instant::now() < s.until)
     }
 
-    /// Returns the `(node_id, addr)` of the peer that should handle `db_id`, or `None` to handle locally.
-    pub async fn route(&self, db_id: &str) -> Option<(String, String)> {
+    /// Returns the `(node_id, addr)` of the peer that should handle a request for `db_id`, or
+    /// `None` if this node should handle the request.
+    ///
+    /// Long-poll requests (`is_long_poll`) are always routed to the rendezvous home node, which
+    /// receives all commit notices, so that waiting requests are still woken if another node
+    /// acquires the lease. All other requests are routed to the lease holder if a lease holder is
+    /// known, or to the rendezvous home node otherwise.
+    pub async fn route(&self, db_id: &str, is_long_poll: bool) -> Option<(String, String)> {
         if crate::buggify::fault(0.02) {
             return None;
         }
         let db = self.engine.db(db_id);
         let _ = db.open(false).await;
-        let target = match db.lease_holder() {
+        let target = match db.lease_holder().filter(|_| !is_long_poll) {
             Some(h) => h,
             None => {
                 let live = self.live_members();
@@ -1502,7 +1508,7 @@ mod tests {
             let homed = (0..)
                 .map(|i| format!("db{i}"))
                 .find(|d| super::cluster::rendezvous(d, &both).unwrap().id == "earlier-run");
-            assert_eq!(a.route(&homed.unwrap()).await, None);
+            assert_eq!(a.route(&homed.unwrap(), false).await, None);
         });
     }
 
@@ -1672,6 +1678,75 @@ mod tests {
             commit().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert_eq!(notices() - before, 3);
+        });
+    }
+
+    #[test]
+    fn limits_endpoint_returns_configured_limits() {
+        run_paused(async {
+            let world = World::new(1, 1).await;
+            let node = world.node(0);
+            let limits = world.json(0, "GET", "/v1/limits", "", serde_json::Value::Null).await;
+            assert_eq!(limits["long_poll_max_ms"], crate::api::LONG_POLL_MAX_MS, "{limits}");
+            assert_eq!(limits["txn_max_ops"], crate::ops::MAX_TXN_OPS);
+            assert_eq!(limits["scan_limit_max"], crate::ops::MAX_SCAN_LIMIT);
+            assert_eq!(limits["value_inline_max"], node.engine.shared.cfg.value_inline_max);
+            assert_eq!(limits["txn_max_write_bytes"], node.engine.shared.cfg.txn_max_write_bytes);
+            assert_eq!(limits["json_value_max"], node.cfg.json_value_max);
+            assert_eq!(limits["json_body_max"], node.cfg.max_json_body);
+            assert_eq!(limits["blob_stage_ttl_ms"], node.engine.shared.cfg.blob_stage_ttl_ms);
+        });
+    }
+
+    #[test]
+    fn long_poll_is_woken_after_home_node_acquires_lease() {
+        run_paused(async {
+            let world = World::new(2, 1).await;
+            for i in 0..2 {
+                world.node(i).refresh_members().await.unwrap();
+            }
+            let token = world.signup(0, "moves@x.io").await;
+            let db_id = world.create_db(0, &token, "d").await;
+            let live = world.node(0).live_members();
+            let home_id = super::cluster::rendezvous(&db_id, &live).unwrap().id.clone();
+            let home = (0..2).find(|&i| world.node(i).id == home_id).unwrap();
+            let other = 1 - home;
+            let commit = |i: usize, value: &'static [u8]| {
+                let db = world.node(i).engine.db(&db_id);
+                async move {
+                    let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                    txn.put(crate::ops::user_key(b"k").unwrap(), crate::engine::Value::Inline(Bytes::from(value)))
+                        .unwrap();
+                    db.commit(txn.into_request()).await.unwrap()
+                }
+            };
+            world.json(other, "GET", "/v1/dbs/d/changes?after=0", &token, serde_json::Value::Null).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            commit(other, b"1").await;
+            assert_eq!(world.holder(&db_id), Some(other), "other node holds the lease");
+            let feed = world.json(other, "GET", "/v1/dbs/d/changes?after=0", &token, serde_json::Value::Null).await;
+            let cursor = feed["next_cursor"].as_str().unwrap().to_string();
+            let (router, poll_token) = (world.node(other).router().unwrap(), token.clone());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            world.node(other).env.spawn(async move {
+                let path = format!(
+                    "/v1/dbs/d/changes?after={cursor}&wait_ms=50000&consistency=snapshot&max_staleness_ms=300000"
+                );
+                let resp = crate::sim::cost::call_router(&router, "GET", &path, &poll_token, Bytes::new()).await;
+                let _ = tx.send((resp.status, resp.body, tokio::time::Instant::now()));
+            });
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            commit(home, b"2").await;
+            let committed_at = tokio::time::Instant::now();
+            let (status, body, completed_at) = rx.await.unwrap();
+            assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+            let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(page["changes"].as_array().map(Vec::len), Some(1), "{page}");
+            assert!(
+                completed_at - committed_at < Duration::from_secs(2),
+                "long poll completed {:?} after commit",
+                completed_at - committed_at
+            );
         });
     }
 

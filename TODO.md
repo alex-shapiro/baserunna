@@ -108,6 +108,14 @@ design context.
 
 ## Testing
 
+- [ ] **Deliver commit notices across membership transitions.** If nodes have
+      different cached views of live cluster members, a long-poll request can be
+      routed to a rendezvous home node that does not receive commit notices.
+      Peers can hold different membership views before all peers refresh after a
+      node joins, or between refreshes if `members_refresh_ms` is greater than
+      `2 × heartbeat_ms` in simulation swarm configurations. Derive the
+      membership liveness window from both intervals, and send commit notices to
+      the home nodes of both previous and current membership views.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the
       model-checked `http_txn` target.
 - [ ] **Run mutation testing in CI**, running `scripts/mutants.sh --in-diff` on
@@ -127,6 +135,11 @@ design context.
       a small number of seeds. Deduplicating failures by normalized message,
       weighting corpus entries by novelty, and incorporating probe-ordering
       and buggify-site features would preserve depth while improving breadth.
+
+- [ ] **Rebase stale bug-zoo patches onto `main`.** Update
+      `09-stale-names-after-purge`, `11-duplicated-forwards`, and
+      `16-duplicated-forwards-across-restart` so that they can be applied to
+      `main`.
 
 ## Docs
 

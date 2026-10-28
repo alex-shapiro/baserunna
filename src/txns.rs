@@ -76,12 +76,8 @@ impl OpenTxns {
         lock(&self.open).values().filter(|t| t.db_id == db_id).count()
     }
 
-    /// Checks whether `user_id` can allocate memory for an interactive transaction on `db_id`.
-    ///
-    /// If node memory usage exceeds the budget after idle databases are unloaded, the remaining
-    /// budget is shared across users by [`memory::fair_admission`]. If `user_id` is below its fair
-    /// share, idle transactions of users above their fair share are aborted (least recently used
-    /// first) until usage is within the budget. Otherwise, returns a retryable `503` error.
+    /// Enforces the node memory budget for a transaction of `user_id` on `db_id`, unloading idle
+    /// databases and evicting idle transactions via [`memory::fair_admission`] if needed.
     pub fn admit(&self, user_id: &str, db_id: &str) -> Result<()> {
         let shared = &self.engine.shared;
         if shared.is_system(db_id) || shared.reclaim_to_budget() {
@@ -105,8 +101,6 @@ impl OpenTxns {
         Ok(())
     }
 
-    /// Verifies that `user_id` is below the per-user open transaction limit and passes
-    /// [`OpenTxns::admit`].
     pub fn admit_begin(&self, user_id: &str, db_id: &str) -> Result<()> {
         self.check_per_user(&lock(&self.open), user_id)?;
         self.admit(user_id, db_id)
@@ -153,8 +147,6 @@ impl OpenTxns {
         Ok(TxnGuard { txns: self, open, guard, finished: false })
     }
 
-    /// Acquires exclusive access to `open`, or returns `TxnNotFound` if the transaction was
-    /// committed or aborted.
     pub async fn lock(&self, open: Arc<OpenTxn>) -> Result<TxnGuard<'_>> {
         let guard = open.txn.clone().lock_owned().await;
         if guard.is_none() {
@@ -164,8 +156,6 @@ impl OpenTxns {
         Ok(TxnGuard { txns: self, open, guard, finished: false })
     }
 
-    /// Looks up open transaction `id` for `user_id` on `db_id`, aborting it if its lifetime has
-    /// expired.
     pub fn get(&self, id: &str, user_id: &str, db_id: &str) -> Result<Arc<OpenTxn>> {
         if crate::buggify::fault(0.01) {
             self.remove(id);
@@ -210,7 +200,6 @@ impl OpenTxns {
         aborted
     }
 
-    /// Aborts transactions that have exceeded the idle timeout or maximum lifetime.
     pub fn expire(&self) {
         let TxnLimits { idle, lifetime, .. } = self.limits;
         let expired: Vec<_> = lock(&self.open)
@@ -283,14 +272,11 @@ impl TxnGuard<'_> {
         self.open.encoding
     }
 
-    /// Marks the request as completed if `result` is `Ok`; otherwise the transaction is aborted on
-    /// drop.
     pub fn finish<T>(mut self, result: Result<T>) -> Result<T> {
         self.finished = result.is_ok();
         result
     }
 
-    /// Removes the transaction from the open registry and returns it for commit or abort.
     pub fn take(mut self) -> Txn {
         self.finished = true;
         let mut txn = self.guard.take().expect("open transaction must be present while guard is active");

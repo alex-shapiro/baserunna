@@ -116,7 +116,6 @@ pub trait MemoryGate: Send + Sync {
 pub struct Held<K> {
     pub holder: K,
     pub bytes: usize,
-    /// True if the transaction is idle and can be aborted to reclaim memory.
     pub evictable: bool,
 }
 

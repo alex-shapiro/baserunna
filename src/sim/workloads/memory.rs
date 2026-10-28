@@ -116,16 +116,13 @@ async fn long_poll_worker(c: Client, db: String, rounds: usize) -> Result<(), St
     Ok(())
 }
 
-/// Maximum duration a user with 0 open transactions can be rejected for memory pressure before the
-/// workload fails.
 const MEMORY_REJECTION_MAX_MS: u64 = 20_000;
 
 fn is_memory_rejection(r: &super::super::client::Resp) -> bool {
     r.status == 503 && r.json["error"]["message"].as_str().is_some_and(|m| m.contains("memory budget"))
 }
 
-/// Builds ~80 KiB of `put` operations with values below `value_inline_max` so that the data is kept
-/// in the in-memory write set instead of staged as blobs.
+/// Values below `value_inline_max` are kept in the in-memory write set instead of staged as blobs.
 fn padding_ops(c: &Client) -> Vec<Json> {
     let inline = c.sim.cfg.engine.value_inline_max - 16;
     (0..80 * 1024 / inline)

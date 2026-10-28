@@ -196,14 +196,10 @@ impl Txn {
         }
     }
 
-    /// Returns a shared atomic counter that tracks the bytes charged to this transaction (see
-    /// [`Charge::meter`]).
     pub fn meter(&mut self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.charge.meter()
     }
 
-    /// Sets or clears the [`MemoryGate`] that checks incremental memory growth for this
-    /// transaction.
     pub fn set_memory_gate(&mut self, gate: Option<Arc<dyn MemoryGate>>) {
         self.gate = gate.map(|g| {
             let next_check = self.charge.bytes() + g.step_bytes();

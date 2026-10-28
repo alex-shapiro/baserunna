@@ -24,6 +24,7 @@ use crate::engine::events::{Mask, PartRef, Runs, decode_mask_object};
 use crate::engine::segment::{Compression, frame, unframe};
 use crate::error::{Error, Result};
 use crate::store::{GetOpts, PutMode, StoreError};
+use crate::util::{Either, race};
 use crate::util::bloom::Bloom;
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
 use bytes::Bytes;
@@ -927,13 +928,30 @@ impl Reading<'_> {
         }
     }
 
+    /// Reads `key`, sending a second `GET` if the first has not answered
+    /// within `event_get_hedge_ms`, so that one slow store request does not
+    /// hold up a query.
     async fn get(&self, key: &str, range: Option<Range<u64>>) -> Result<Bytes> {
-        let g = self
-            .shared
-            .retry
-            .run(|| self.shared.store.get(key, GetOpts { range: range.clone(), ..Default::default() }))
-            .await
-            .map_err(|e| match e {
+        let fetch =
+            || self.shared.retry.run(|| self.shared.store.get(key, GetOpts { range: range.clone(), ..Default::default() }));
+        let hedge_ms = self.shared.cfg.event_get_hedge_ms;
+        let mut first = Box::pin(fetch());
+        let g = if hedge_ms == 0 {
+            first.await
+        } else {
+            let mut delay = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(hedge_ms)));
+            match race(&mut first, &mut delay).await {
+                Either::Left(r) => r,
+                Either::Right(()) => {
+                    crate::probe::hit(crate::probe::Probe::PartGetHedged);
+                    self.stats.gets.fetch_add(1, Relaxed);
+                    match race(&mut first, &mut Box::pin(fetch())).await {
+                        Either::Left(r) | Either::Right(r) => r,
+                    }
+                }
+            }
+        };
+        let g = g.map_err(|e| match e {
                 StoreError::NotFound => {
                     Error::unavailable("garbage collection removed an event part this read needed; retry")
                 }
@@ -941,7 +959,7 @@ impl Reading<'_> {
             })?;
         self.stats.gets.fetch_add(1, Relaxed);
         self.stats.bytes.fetch_add(g.data.len() as u64, Relaxed);
-        if let Some(r) = range
+        if let Some(r) = &range
             && g.data.len() as u64 != r.end - r.start
         {
             return Err(Error::internal("short event part read"));

@@ -241,6 +241,8 @@ probes! {
     QuerySecondStage,
     /// A query mapped values through a lookup table.
     LookupApplied,
+    /// A slow event part read was sent again.
+    PartGetHedged,
 }
 
 impl Probe {

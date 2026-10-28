@@ -385,7 +385,7 @@ events to row tables.
   `consistency` is `strong` (which sees every acknowledged insert); a
   snapshot that lacks the table or a column named retries at a fresh one.
   A query fails with `413` past 4 GiB read, 1 GiB of aggregation state or
-  1 GiB of lookup rows.
+  1 GiB of lookup rows, and with a retryable `503` once it has run for 60 s.
 - **Deletes** remove the events matching a filter within a time range, in a
   transaction. A delete that would need an oversized mask in one partition
   fails with `413` naming it, so a caller deletes partition by partition.
@@ -847,9 +847,12 @@ remaining part's metadata and the column index of filtered columns, and
 skips parts whose dictionaries or statistics rule out a match, then granules
 by the primary index, statistics and blooms. It reads filter columns first
 (prewhere) and the rest only for granules with matches, then folds in the
-unsealed rows. Aggregates keep mergeable states, so the order of parts never
-changes an answer. Parts are cached whole when small, otherwise by column
-block, so a warm query performs no store `GET`s.
+unsealed rows. Up to 32 parts are read at once, each into a partial result
+that is merged in order; aggregates keep mergeable states, so the order of
+parts never changes an answer, and every partial result counts toward the
+query's state limit. A part `GET` unanswered after 1 s is sent again, so one
+slow store request does not hold up a query. Parts are cached whole when
+small, otherwise by column block, so a warm query performs no store `GET`s.
 
 #### Merges and retention
 
@@ -1711,7 +1714,7 @@ Tools:
 - Garbage collection requires object `last_modified` timestamps to come from a single coherent store clock (§13.5).
 - Stream retention runs on the lease holder, so a database with no activity keeps records past their retention until it is used again (§5.11). Trimmed chunks and their quota bytes are reclaimed by sweeps, hours later, as overwritten blobs are.
 - Stream filters scan records; there is no index on record contents, so a query finds needles at the rate it can scan (`scan_limit` records a request).
-- An event query runs on the node it reaches, on one task: its speed is one core's decoding rate, and its bounds are bytes read and state size, not time (§4.8).
+- An event query runs on the node it reaches, on one task: its speed is one core's decoding rate and its store's latency divided by 32 concurrent part reads (§5.12).
 - Event lookups read their whole row table on every query, up to 1 GiB (§4.8).
 - Event merges and retention run on the lease holder, so a database with no activity keeps expired partitions until it is used again (§5.12).
 - Event parts are cached in memory only; the local disk tier (§5.3) holds segments, so a restarted node reads parts from the store again.

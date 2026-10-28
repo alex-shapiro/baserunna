@@ -342,12 +342,16 @@ fn queries_match_a_model_through_seals_merges_and_deletes() {
 /// A table of `days` single-row parts behind a store with 25 ms latency,
 /// opened by a node whose caches are cold.
 async fn many_parts_cold(days: i64) -> (Arc<Db>, EngineConfig, Arc<Engine>) {
+    many_parts_cold_with(days, cfg()).await
+}
+
+async fn many_parts_cold_with(days: i64, cfg: EngineConfig) -> (Arc<Db>, EngineConfig, Arc<Engine>) {
     let origin = tokio::time::Instant::now();
     let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
     let env2 = env.clone();
     let mem = Arc::new(crate::store::MemStore::new(Box::new(move || env2.now_ms())));
     let store = Arc::new(crate::sim::cost::MeteredStore::new(mem, 0));
-    let cfg = EngineConfig { cache_bytes: 64 << 20, ..cfg() };
+    let cfg = EngineConfig { cache_bytes: 64 << 20, ..cfg };
     let eng = Engine::new(store.clone(), env.clone(), cfg.clone(), "node-a".into());
     let db = create_db(&eng, "db").await;
     let table = {
@@ -388,6 +392,24 @@ fn deletes_across_many_parts_commit_before_the_deadline() {
             .await
             .unwrap();
         assert_eq!(left.rows, vec![vec![json!(days / 2)]]);
+    });
+}
+
+/// A cold query reads parts that are too large to fetch whole (metadata,
+/// then column indexes, then blocks) concurrently, not one after another.
+#[test]
+fn cold_queries_read_large_parts_concurrently() {
+    rt().block_on(async {
+        let days = 200;
+        let (db, _cfg, _eng) = many_parts_cold_with(days, EngineConfig { segment_whole_fetch_max: 0, ..cfg() }).await;
+        let start = tokio::time::Instant::now();
+        let q = json!({"from": T0, "to": T0 + days * DAY, "where": {"col": "user", "op": "eq", "value": "u1"},
+            "group_by": ["user"], "aggregates": {"n": {"fn": "count"}}});
+        let out = query(&db, &q).await.unwrap();
+        assert_eq!(out.rows, vec![vec![json!("u1"), json!(days / 2)]]);
+        let ms = start.elapsed().as_millis();
+        assert!(out.stats.store_gets >= 3 * days as u64, "{:?}", out.stats);
+        assert!(ms < 2_000, "a cold query of {days} parts in {} GETs took {ms} ms", out.stats.store_gets);
     });
 }
 
@@ -1159,4 +1181,99 @@ mod storage {
             );
         });
     }
+}
+
+/// A query that runs past its time limit stops with a retryable error
+/// instead of holding its query slot until it finishes.
+#[test]
+fn queries_stop_at_their_time_limit() {
+    rt().block_on(async {
+        let days = 200;
+        let (db, _cfg, _eng) = many_parts_cold_with(days, EngineConfig { segment_whole_fetch_max: 0, ..cfg() }).await;
+        let q = Query::parse(json!({"from": T0, "to": T0 + days * DAY, "aggregates": {"n": {"fn": "count"}}})).unwrap();
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let s = get_schema(&mut t, "events").await.unwrap();
+        let start = tokio::time::Instant::now();
+        let limits = Limits { max_ms: 300, ..Limits::default() };
+        let r = exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await;
+        assert!(matches!(&r, Err(Error::Unavailable { outcome_unknown: false, message, .. }) if message.contains("300 ms")), "{r:?}");
+        assert!(start.elapsed().as_millis() <= 300, "{:?}", start.elapsed());
+    });
+}
+
+/// A store whose first `GET` of each event part object stalls.
+struct StallFirstPartGet {
+    inner: crate::store::DynStore,
+    stall_ms: u64,
+    seen: std::sync::Mutex<std::collections::BTreeSet<String>>,
+}
+
+impl crate::store::ObjectStore for StallFirstPartGet {
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+        opts: crate::store::GetOpts,
+    ) -> crate::store::BoxFut<'a, crate::store::SResult<crate::store::GetResult>> {
+        let stall = key.contains("/part/") && self.seen.lock().unwrap().insert(key.to_string());
+        Box::pin(async move {
+            if stall {
+                tokio::time::sleep(std::time::Duration::from_millis(self.stall_ms)).await;
+            }
+            self.inner.get(key, opts).await
+        })
+    }
+
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        data: Bytes,
+        mode: crate::store::PutMode,
+    ) -> crate::store::BoxFut<'a, crate::store::SResult<String>> {
+        self.inner.put(key, data, mode)
+    }
+
+    fn delete<'a>(&'a self, key: &'a str) -> crate::store::BoxFut<'a, crate::store::SResult<()>> {
+        self.inner.delete(key)
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+        start_after: Option<&'a str>,
+        limit: usize,
+    ) -> crate::store::BoxFut<'a, crate::store::SResult<crate::store::ListPage>> {
+        self.inner.list(prefix, start_after, limit)
+    }
+}
+
+/// A stalled part `GET` is hedged, so it delays a query by the hedge delay
+/// rather than by the stall.
+#[test]
+fn stalled_part_reads_are_hedged() {
+    rt().block_on(async {
+        let origin = tokio::time::Instant::now();
+        let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
+        let env2 = env.clone();
+        let mem = Arc::new(crate::store::MemStore::new(Box::new(move || env2.now_ms())));
+        let store = Arc::new(StallFirstPartGet { inner: mem, stall_ms: 30_000, seen: Default::default() });
+        let cfg = EngineConfig { cache_bytes: 64 << 20, ..cfg() };
+        let eng = Engine::new(store.clone(), env.clone(), cfg.clone(), "node-a".into());
+        let db = create_db(&eng, "db").await;
+        let rows: Vec<Json> = (0..20).map(|d| json!({"time": T0 + d * DAY, "event": "a"})).collect();
+        txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+        let id = {
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            get_schema(&mut t, "events").await.unwrap().id
+        };
+        assert!(maint::seal(&db, id).await.unwrap());
+        eng.release_leases(std::time::Duration::from_secs(2)).await;
+        let cold = Engine::new(store.clone(), env, cfg.clone(), "node-b".into());
+        let db = cold.db("db");
+        db.open(true).await.unwrap();
+        let start = tokio::time::Instant::now();
+        let out = query(&db, &json!({"from": T0, "to": T0 + 20 * DAY, "aggregates": {"n": {"fn": "count"}}})).await;
+        assert_eq!(out.unwrap().rows, vec![vec![json!(20)]]);
+        let ms = start.elapsed().as_millis() as u64;
+        assert!(ms < 2 * cfg.event_get_hedge_ms, "a query with stalled reads took {ms} ms");
+    });
 }

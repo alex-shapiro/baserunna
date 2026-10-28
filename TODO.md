@@ -51,6 +51,14 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       `PUT` is still in flight and retries are exhausted, awaiting the primary
       `PUT` can resolve the commit outcome instead of returning
       `outcome: "unknown"`.
+- [ ] **Keep event deletes from conflicting with concurrent inserts.** A
+      delete reads every unsealed row of its table and the part refs of its
+      time range, so as a serializable transaction it conflicts with any
+      insert or bind into them. A delete whose reads outlast the interval
+      between binds (a cold cache over many parts) retries until the cache is
+      warm, or fails with `409` after `txn_retries`. Evaluate the delete's
+      filter on rows and refs added since its snapshot inside the committer
+      instead of tracking them as reads.
 - [ ] **Sweep staged event parts after the last event table is dropped.**
       Sweeps list `part/` only while a database has event tables or part
       bytes, so a part staged by a bulk insert that races a drop of the last
@@ -98,9 +106,6 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 
 ## Features
 
-- [ ] **Event query time limits.** Queries are bounded by bytes read and
-      state size, not time. Add a deadline that cancels a query between
-      granules and answers `503` with the stats so far.
 - [ ] **Event rollups and projections.** Let a table declare aggregates by
       time bucket (or alternative sort orders) that seals and merges
       maintain, so dashboards read small parts.

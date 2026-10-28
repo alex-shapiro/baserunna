@@ -209,6 +209,8 @@ impl SimConfig {
                     trusted_proxy_hops: 1,
                 },
                 engine: engine.clone(),
+                // Below request_timeout_ms, so a query a client gave up on frees its slot first.
+                query_limits: crate::events::exec::Limits { max_ms: 20_000, ..Default::default() },
                 ..NodeConfig::default()
             },
             engine,

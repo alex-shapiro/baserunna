@@ -234,33 +234,46 @@ async fn insert(
     }
     let commit_id = super::commit_id_for(&node, &ctx, key.as_deref())?;
     if let Some(c) = super::earlier_attempt(&ctx, commit_id, key.as_deref()).await? {
-        return Ok(inserted(rows.len(), &c, true, commit_id));
+        return inserted(&c, commit_id);
     }
     let (schema, _) = with_read!(ctx.db, Consistency::Strong, |t| events::get_schema(t, &name).await);
     let valid = events::validate_rows(&schema, &rows, node.now_ms() as i64)?;
-    let n = valid.len();
     let c = node
         .event_buffers()
         .submit(ctx.db.clone(), schema, valid, commit_id, ctx.deadline.instant())
         .await
         .map_err(|e| super::naming_commit(e, commit_id))?;
-    Ok(inserted(n, &c, c.replayed, commit_id))
+    inserted(&c, commit_id)
 }
 
-fn inserted(count: usize, c: &Committed, replayed: bool, commit_id: u64) -> Response {
-    let status = if replayed { StatusCode::OK } else { StatusCode::CREATED };
+/// The answer to a bulk insert, from the commit that applied it: a replay
+/// reports what the original request inserted.
+fn inserted(c: &Committed, commit_id: u64) -> Result<Response> {
+    let Some(count) = c.inserted else {
+        return Err(Error::invalid("the idempotency key was used by a request other than an event insert"));
+    };
+    let status = if c.replayed { StatusCode::OK } else { StatusCode::CREATED };
     let body = json!({
-        "count": count, "version": c.version, "time": c.time_ms, "commit_id": commit_hex(commit_id), "replayed": replayed,
+        "count": count, "version": c.version, "time": c.time_ms, "commit_id": commit_hex(commit_id),
+        "replayed": c.replayed,
     });
-    (status, axum::Json(body)).into_response()
+    Ok((status, axum::Json(body)).into_response())
 }
 
-/// Splits a query body into the query and its consistency, which defaults
-/// to a snapshot at most 5 s old so that queries do not load the lease holder.
-fn query_consistency(b: Json) -> Result<(Json, Consistency)> {
-    let explicit = b.get("consistency").is_some();
-    let (b, c) = split_consistency(b)?;
-    Ok((b, if explicit { c } else { Consistency::Snapshot { max_staleness_ms: QUERY_STALENESS_MS } }))
+/// Splits a query body into the query and its consistency: a snapshot at
+/// most `max_staleness_ms` (5 s by default) old, so that queries do not load
+/// the lease holder, unless `consistency` says otherwise.
+fn query_consistency(mut b: Json) -> Result<(Json, Consistency)> {
+    if !b.is_object() {
+        return Err(Error::invalid("the query is a JSON object"));
+    }
+    if b.get("consistency").is_none() {
+        b["consistency"] = json!("snapshot");
+        if b.get("max_staleness_ms").is_none() {
+            b["max_staleness_ms"] = json!(QUERY_STALENESS_MS);
+        }
+    }
+    split_consistency(b)
 }
 
 async fn query(
@@ -339,9 +352,12 @@ pub(crate) fn bind_results_json(rs: &[Result<Committed>]) -> Json {
     Json::Array(
         rs.iter()
             .map(|r| match r {
-                Ok(c) => json!({"version": c.version, "time": c.time_ms, "replayed": c.replayed}),
-                Err(e) => json!({"error": {"code": e.code(), "message": e.message(), "status": e.status(),
-                    "details": match e { Error::Unavailable { outcome_unknown: true, .. } => json!({"outcome": "unknown"}), _ => json!({}) }}}),
+                Ok(c) => json!({"version": c.version, "time": c.time_ms, "replayed": c.replayed, "inserted": c.inserted}),
+                Err(e) => {
+                    let mut err = super::error_json(e);
+                    err["status"] = json!(e.status());
+                    json!({"error": err})
+                }
             })
             .collect(),
     )
@@ -356,6 +372,7 @@ pub(crate) fn bind_results_from_json(j: &Json, n: usize) -> Result<Vec<Result<Co
                 version: r["version"].as_u64().unwrap_or(0),
                 time_ms: r["time"].as_u64().unwrap_or(0),
                 replayed: r["replayed"].as_bool().unwrap_or(false),
+                inserted: r["inserted"].as_u64(),
                 appends: Vec::new(),
             }),
         })

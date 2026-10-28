@@ -5,7 +5,7 @@
 
 mod account;
 mod db;
-mod events;
+pub(crate) mod events;
 pub mod multipart;
 mod orgs;
 mod streams;

@@ -246,12 +246,14 @@ pub enum CommitState {
     Aborted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Committed {
     pub version: Seq,
     pub replayed: bool,
     pub time_ms: u64,
     pub appends: Vec<Appended>,
+    /// Events a bulk insert added.
+    pub inserted: Option<u64>,
 }
 
 /// Database storage statistics at a single version.
@@ -880,12 +882,7 @@ impl Db {
     /// Commits `req` and reports whether the commit ID was already applied.
     pub async fn commit_detailed(self: &Arc<Self>, mut req: CommitRequest) -> Result<Committed> {
         if req.writes.is_empty() {
-            return Ok(Committed {
-                version: req.read_version,
-                replayed: false,
-                time_ms: req.read_time,
-                appends: Vec::new(),
-            });
+            return Ok(Committed { version: req.read_version, time_ms: req.read_time, ..Committed::default() });
         }
         if req.deadline.is_none() {
             req.deadline = Some(Instant::now() + Duration::from_millis(self.shared.cfg.commit_timeout_ms));
@@ -1611,7 +1608,7 @@ impl Db {
                     m.part_bytes = (m.part_bytes + ev.part_bytes_added).saturating_sub(ev.part_bytes_removed);
                     events.extend(ev.tables.keys());
                     touched.extend(ev.touched);
-                    let value = encode_commit_record(time, &fx.appends);
+                    let value = encode_commit_record(time, &fx.appends, None);
                     tail.insert(record.clone(), Entry::new(record, new_seq, Value::Inline(value)));
                     if blob_bytes > 0 {
                         m.blob_bytes.bound += blob_bytes;
@@ -1630,6 +1627,7 @@ impl Db {
                         replayed: false,
                         time_ms: time,
                         appends: fx.appends,
+                        inserted: None,
                     })));
                 }
                 Work::Lease { release: r, for_reads, .. } => {
@@ -1772,17 +1770,23 @@ impl Db {
                 },
                 Work::Bind { bind, .. } => {
                     let mut results: Vec<Option<Result<Committed>>> = vec![None; bind.slots.len()];
-                    let mut seen = BTreeSet::new();
-                    for (r, sl) in results.iter_mut().zip(&bind.slots) {
+                    // A slot repeating an earlier slot's commit ID (a concurrent retry) writes
+                    // nothing and answers with that slot's outcome.
+                    let mut first_of: BTreeMap<u64, usize> = BTreeMap::new();
+                    let mut repeats: Vec<(usize, usize)> = Vec::new();
+                    for (i, (r, sl)) in results.iter_mut().zip(&bind.slots).enumerate() {
+                        if let Some(&j) = first_of.get(&sl.commit_id) {
+                            repeats.push((i, j));
+                            *r = Some(Err(Error::internal("a repeated bind slot")));
+                            continue;
+                        }
+                        first_of.insert(sl.commit_id, i);
                         *r = match commit_state(base, Some(&tail), sl.commit_id).await? {
                             Some(CommitState::Applied(c)) => {
                                 probe::hit(Probe::CommitReplayed);
                                 Some(Ok(Committed { replayed: true, ..c }))
                             }
                             Some(CommitState::Aborted) => Some(Err(aborted(sl.commit_id))),
-                            None if !seen.insert(sl.commit_id) => {
-                                Some(Err(Error::Conflict("the request was submitted twice".into())))
-                            }
                             None if sl.deadline.is_some_and(|d| Instant::now() > d) => {
                                 probe::hit(Probe::CommitDeadlinePassed);
                                 Some(Err(Error::Unavailable {
@@ -1886,13 +1890,14 @@ impl Db {
                         for i in &accepted {
                             let record = commit_key(bind.slots[*i].commit_id);
                             touched.push(KeyRange::point(&record));
-                            let value = encode_commit_record(time, &[]);
+                            let rows = bind.parts.iter().map(|p| p.slot_rows[*i].count()).sum();
+                            let value = encode_commit_record(time, &[], Some(rows));
                             tail.insert(record.clone(), Entry::new(record, new_seq, Value::Inline(value)));
                             results[*i] = Some(Ok(Committed {
                                 version: new_seq,
-                                replayed: false,
                                 time_ms: time,
-                                appends: Vec::new(),
+                                inserted: Some(rows),
+                                ..Committed::default()
                             }));
                         }
                         probe::hit(Probe::PartsBound);
@@ -1900,6 +1905,12 @@ impl Db {
                         events.insert(bind.table);
                         last_seq = new_seq;
                         data_changed = true;
+                    }
+                    for (i, j) in repeats {
+                        results[i] = match &results[j] {
+                            Some(Ok(c)) => Some(Ok(Committed { replayed: true, ..c.clone() })),
+                            other => other.clone(),
+                        };
                     }
                     let results =
                         results.into_iter().map(|r| r.unwrap_or_else(|| Err(Error::internal("unsettled bind slot"))));
@@ -2482,8 +2493,8 @@ async fn commit_state(v: &Version, tail: Option<&BTreeMap<Bytes, Entry>>, id: u6
         _ => None,
     };
     Ok(Some(match record.ok_or_else(|| Error::internal("corrupt commit record"))? {
-        CommitRecord::Applied { time_ms, appends } => {
-            CommitState::Applied(Committed { version: e.seq, replayed: true, time_ms, appends })
+        CommitRecord::Applied { time_ms, appends, inserted } => {
+            CommitState::Applied(Committed { version: e.seq, replayed: true, time_ms, appends, inserted })
         }
         CommitRecord::Aborted => CommitState::Aborted,
     }))

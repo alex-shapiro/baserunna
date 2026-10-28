@@ -853,38 +853,43 @@ impl Node {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(20 * (1 << attempt) + self.env.random_below(20))).await;
             }
-            if let Some(holder) = db.lease_holder()
-                && holder != self.id
-                && let Some(addr) = self.addr_of(&holder).filter(|a| *a != self.cfg.addr)
-            {
-                crate::probe::hit(crate::probe::Probe::BindForwarded);
-                let body =
-                    crate::api::ForwardedBind { db: db.id.clone(), bind: crate::util::b64::encode(&bind.encode()) };
-                match self.forward_internal(&holder, &addr, "/internal/v1/events/bind", &body).await {
-                    Ok(j) => return crate::api::bind_results_from_json(&j, n),
-                    Err(Ok(e @ Error::Unavailable { outcome_unknown: false, .. }))
-                    | Err(Ok(e @ Error::NotOwner { .. })) => {
-                        last = e;
-                        let _ = db.refresh(Instant::now(), false).await;
-                        continue;
-                    }
-                    Err(Ok(e)) => return Err(e),
-                    Err(Err(te)) if te.maybe_delivered => {
-                        return Err(Error::Unavailable {
-                            message: format!("bind outcome unknown: {}", te.message),
-                            retry_after_ms: Some(500),
-                            outcome_unknown: true,
-                        });
-                    }
-                    Err(Err(_)) => {
-                        self.mark_suspect(&holder);
-                        continue;
+            let forward_to = match db.lease_holder().filter(|h| *h != self.id) {
+                Some(h) => self.addr_of_or_refresh(&h).await.filter(|a| *a != self.cfg.addr).map(|a| (a, h)),
+                None => None,
+            };
+            let rs = match forward_to {
+                Some((addr, holder)) => {
+                    crate::probe::hit(crate::probe::Probe::BindForwarded);
+                    let body =
+                        crate::api::ForwardedBind { db: db.id.clone(), bind: crate::util::b64::encode(&bind.encode()) };
+                    match self.forward_internal(&holder, &addr, "/internal/v1/events/bind", &body).await {
+                        Ok(j) => crate::api::bind_results_from_json(&j, n)?,
+                        Err(Ok(e @ Error::Unavailable { outcome_unknown: false, .. }))
+                        | Err(Ok(e @ Error::NotOwner { .. })) => {
+                            last = e;
+                            let _ = db.refresh(Instant::now(), false).await;
+                            continue;
+                        }
+                        Err(Ok(e)) => return Err(e),
+                        Err(Err(te)) if te.maybe_delivered => {
+                            return Err(Error::Unavailable {
+                                message: format!("bind outcome unknown: {}", te.message),
+                                retry_after_ms: Some(500),
+                                outcome_unknown: true,
+                            });
+                        }
+                        Err(Err(_)) => {
+                            self.mark_suspect(&holder);
+                            continue;
+                        }
                     }
                 }
-            }
-            let rs = db.bind(bind.clone()).await?;
+                None => db.bind(bind.clone()).await?,
+            };
+            // Every slot failing with NotOwner means the bind reached a node that lost the lease.
             if attempt < 5 && rs.iter().all(|r| matches!(r, Err(Error::NotOwner { .. }))) {
                 last = Error::unavailable("another node took the lease");
+                let _ = db.refresh(Instant::now(), false).await;
                 continue;
             }
             return Ok(rs);

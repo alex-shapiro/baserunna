@@ -142,11 +142,19 @@ fn answer_html(a: &Json, times: &[String]) -> String {
     )
 }
 
-fn default_query(t: &Json) -> String {
+/// Events per day and by the leading sort key, named so that no output
+/// collides with the key.
+pub(crate) fn default_query(t: &Json) -> String {
     let time = t["time_column"].as_str().unwrap_or("time");
     let key = t["order_by"][0].as_str().unwrap_or(time);
-    json!({"from": "2000-01-01", "to": "2100-01-01", "group_by": [{"bucket": {"col": time}, "interval": "1d", "as": "day"}, key],
-        "aggregates": {"count": {"fn": "count"}}, "order_by": [{"col": "count", "desc": true}], "limit": 50})
+    let day = if key == "day" { "date" } else { "day" };
+    let count = if key == "count" { "events" } else { "count" };
+    let mut group_by = vec![json!({"bucket": {"col": time}, "interval": "1d", "as": day})];
+    if key != time {
+        group_by.push(json!(key));
+    }
+    json!({"from": "2000-01-01", "to": "2100-01-01", "group_by": group_by,
+        "aggregates": {count: {"fn": "count"}}, "order_by": [{"col": count, "desc": true}], "limit": 50})
     .to_string()
 }
 

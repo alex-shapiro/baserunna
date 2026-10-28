@@ -44,18 +44,24 @@ pub const COMMIT_SPACE: u8 = 0xFF;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitRecord {
-    Applied { time_ms: u64, appends: Vec<Appended> },
+    /// An applied commit, with what a replay of its request reports: its
+    /// stream appends, and the events a bulk insert added.
+    Applied { time_ms: u64, appends: Vec<Appended>, inserted: Option<u64> },
     Aborted,
 }
 
 pub const ABORT_RECORD: Bytes = Bytes::new();
 
-pub fn encode_commit_record(time_ms: u64, appends: &[Appended]) -> Bytes {
-    let mut w = Writer::with_capacity(8 + 8 * appends.len());
+pub fn encode_commit_record(time_ms: u64, appends: &[Appended], inserted: Option<u64>) -> Bytes {
+    let mut w = Writer::with_capacity(16 + 8 * appends.len());
     w.varint(time_ms);
+    w.varint(appends.len() as u64);
     for a in appends {
         w.varint(a.first_seq);
         w.varint(a.count);
+    }
+    if let Some(n) = inserted {
+        w.varint(n);
     }
     Bytes::from(w.into_inner())
 }
@@ -66,11 +72,16 @@ pub fn decode_commit_record(b: &[u8]) -> DResult<CommitRecord> {
     }
     let mut r = Reader::new(b);
     let time_ms = r.varint()?;
+    let n = r.varint()?;
     let mut appends = Vec::new();
-    while !r.is_empty() {
+    for _ in 0..n {
         appends.push(Appended { first_seq: r.varint()?, count: r.varint()? });
     }
-    Ok(CommitRecord::Applied { time_ms, appends })
+    let inserted = if r.is_empty() { None } else { Some(r.varint()?) };
+    if !r.is_empty() {
+        return Err(DecodeError("commit record trailing data"));
+    }
+    Ok(CommitRecord::Applied { time_ms, appends, inserted })
 }
 
 pub fn commit_key(id: u64) -> Bytes {
@@ -239,11 +250,13 @@ mod tests {
     #[test]
     fn commit_records_roundtrip() {
         let appends = [Appended { first_seq: 0, count: 3 }, Appended { first_seq: u64::MAX, count: 0 }];
-        let applied = |time_ms, appends: &[Appended]| CommitRecord::Applied { time_ms, appends: appends.to_vec() };
-        assert_eq!(decode_commit_record(&encode_commit_record(17, &appends)).unwrap(), applied(17, &appends));
-        assert_eq!(decode_commit_record(&encode_commit_record(5, &[])).unwrap(), applied(5, &[]));
+        for (time_ms, appends, inserted) in [(17, &appends[..], None), (5, &[][..], None), (9, &[][..], Some(0)), (1, &appends[..1], Some(70))] {
+            let want = CommitRecord::Applied { time_ms, appends: appends.to_vec(), inserted };
+            assert_eq!(decode_commit_record(&encode_commit_record(time_ms, appends, inserted)).unwrap(), want);
+        }
         assert_eq!(decode_commit_record(&ABORT_RECORD).unwrap(), CommitRecord::Aborted);
         assert!(decode_commit_record(&[0x80]).is_err());
+        assert!(decode_commit_record(&[1, 0, 2, 3]).is_err(), "trailing data");
     }
 
     #[test]

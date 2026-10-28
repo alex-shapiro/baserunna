@@ -39,32 +39,15 @@ pub const SESSION_COOKIE: &str = "brs_session";
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = StatusCode::from_u16(self.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let mut err = json!({
-            "code": self.code(),
-            "message": self.message(),
-            "retryable": self.retryable(),
-        });
-        let mut retry_after = None;
-        match &self {
-            Error::PreconditionFailed { op_index: Some(i), .. } => err["details"] = json!({"op_index": i}),
-            Error::NotOwner { holder, retry_after_ms } => {
-                err["details"] = json!({"lease_holder": holder});
-                retry_after = Some(*retry_after_ms);
-            }
-            Error::Unavailable { outcome_unknown, retry_after_ms, .. } => {
-                err["details"] = json!({"outcome": if *outcome_unknown { "unknown" } else { "not_applied" }});
-                retry_after = *retry_after_ms;
-            }
-            Error::RateLimited { retry_after_ms, .. } => {
-                err["details"] = json!({"retry_after_ms": retry_after_ms});
-                retry_after = Some(*retry_after_ms);
-            }
-            _ => {}
-        }
+        let retry_after = match &self {
+            Error::NotOwner { retry_after_ms, .. } | Error::RateLimited { retry_after_ms, .. } => Some(*retry_after_ms),
+            Error::Unavailable { retry_after_ms, .. } => *retry_after_ms,
+            _ => None,
+        };
         if let Error::Internal(m) = &self {
             crate::warn!("internal error: {m}");
         }
-        let mut resp = (status, axum::Json(json!({"error": err}))).into_response();
+        let mut resp = (status, axum::Json(json!({"error": error_json(&self)}))).into_response();
         if let Some(ms) = retry_after {
             let secs = ms.div_ceil(1000).max(1);
             if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
@@ -73,6 +56,21 @@ impl IntoResponse for Error {
         }
         resp
     }
+}
+
+/// The `error` member of an error response; [`error_from_json`] reverses it.
+pub fn error_json(e: &Error) -> Json {
+    let mut err = json!({"code": e.code(), "message": e.message(), "retryable": e.retryable()});
+    match e {
+        Error::PreconditionFailed { op_index: Some(i), .. } => err["details"] = json!({"op_index": i}),
+        Error::NotOwner { holder, .. } => err["details"] = json!({"lease_holder": holder}),
+        Error::Unavailable { outcome_unknown, .. } => {
+            err["details"] = json!({"outcome": if *outcome_unknown { "unknown" } else { "not_applied" }});
+        }
+        Error::RateLimited { retry_after_ms, .. } => err["details"] = json!({"retry_after_ms": retry_after_ms}),
+        _ => {}
+    }
+    err
 }
 
 /// Reconstructs an [`Error`] from a JSON error response.
@@ -96,10 +94,13 @@ pub fn error_from_json(status: u16, j: &Json) -> Error {
         "rate_limited" => {
             Error::RateLimited { message: m, retry_after_ms: e["details"]["retry_after_ms"].as_u64().unwrap_or(1_000) }
         }
-        "unavailable" => Error::Unavailable {
-            message: m,
-            retry_after_ms: Some(500),
-            outcome_unknown: e["details"]["outcome"] == "unknown",
+        "unavailable" => match e["details"]["lease_holder"].as_str() {
+            Some(holder) => Error::NotOwner { holder: holder.to_string(), retry_after_ms: 500 },
+            None => Error::Unavailable {
+                message: m,
+                retry_after_ms: Some(500),
+                outcome_unknown: e["details"]["outcome"] == "unknown",
+            },
         },
         _ => Error::Internal(format!("{status}: {m}")),
     }
@@ -1161,3 +1162,6 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod events_tests;

@@ -2,7 +2,9 @@
 //! budget.
 //!
 //! Concurrent workers write to database tails, long-poll change feeds across database unloads, and
-//! hold large interactive transaction write sets.
+//! hold large interactive transaction write sets. Each transaction holder is a separate user, and a
+//! hog user keeps as many large transactions open as it is allowed to, so holders verify that the
+//! hog cannot keep them from the memory budget (SPEC §5.12).
 
 use super::super::Sim;
 use super::super::SimConfig;
@@ -114,6 +116,56 @@ async fn long_poll_worker(c: Client, db: String, rounds: usize) -> Result<(), St
     Ok(())
 }
 
+/// Longest a user below its fair share may be refused for memory: long enough for idle databases to
+/// be unloaded, and shorter than the hog keeps any transaction open.
+const MEMORY_REFUSAL_MAX_MS: u64 = 20_000;
+
+fn is_memory_refusal(r: &super::super::client::Resp) -> bool {
+    r.status == 503 && r.json["error"]["message"].as_str().is_some_and(|m| m.contains("memory budget"))
+}
+
+/// Pads that put about 80 KiB in a transaction's write set. Values below the inline limit remain
+/// in the in-memory write set rather than being staged as blobs.
+fn pads(c: &Client) -> Vec<Json> {
+    let inline = c.sim.cfg.engine.value_inline_max - 16;
+    (0..80 * 1024 / inline)
+        .map(|i| json!({"op": "put", "key": format!("pad{i}"), "value": "p".repeat(inline)}))
+        .collect()
+}
+
+/// Keeps up to `max_open` transactions of about 80 KiB open on `db` until `until_ms`, touching each
+/// before it idles out and replacing any that the node aborts.
+async fn hog_worker(c: Client, db: String, max_open: usize, until_ms: u64) -> Result<(), String> {
+    let base = format!("/v1/dbs/{db}/transactions");
+    let mut open: Vec<String> = Vec::new();
+    while c.sim.now_ms() < until_ms {
+        if open.len() < max_open {
+            match c.call("POST", &base, Some(json!({"ops": pads(&c)}))).await {
+                Ok(r) if r.status == 201 => open.push(r.json["txn_id"].as_str().unwrap_or("").to_string()),
+                Ok(r) if r.status == 503 || r.status == 429 || r.status == 409 || r.status == 404 => {}
+                Ok(r) => return Err(format!("hog begin {db}: {} {}", r.status, r.json)),
+                Err(_) => {}
+            }
+        }
+        let mut kept = Vec::new();
+        for id in open {
+            let touch = json!({"ops": [{"op": "get", "key": "pad0"}]});
+            match c.call("POST", &format!("{base}/{id}/ops"), Some(touch)).await {
+                Ok(r) if r.status == 404 => {}
+                Ok(r) if r.status == 200 || r.status == 503 => kept.push(id),
+                Ok(r) => return Err(format!("hog ops {db}: {} {}", r.status, r.json)),
+                Err(_) => kept.push(id),
+            }
+        }
+        open = kept;
+        c.pause(500).await;
+    }
+    for id in open {
+        let _ = c.call("DELETE", &format!("{base}/{id}"), None).await;
+    }
+    Ok(())
+}
+
 async fn interactive_txn_worker(
     c: Client,
     db: String,
@@ -123,11 +175,25 @@ async fn interactive_txn_worker(
     let base = format!("/v1/dbs/{db}/transactions");
     for round in 0..rounds {
         let started = c.sim.now_ms();
+        let mut refused_since = None;
         let (id, cid) = loop {
             if c.sim.now_ms() - started > 600_000 {
                 return Err(format!("{db}: an interactive transaction was refused for 10 minutes"));
             }
-            match c.call("POST", &base, Some(json!({}))).await {
+            let r = c.call("POST", &base, Some(json!({}))).await;
+            match &r {
+                Ok(r) if is_memory_refusal(r) => {
+                    let since = *refused_since.get_or_insert(c.sim.now_ms());
+                    if c.sim.now_ms() - since > MEMORY_REFUSAL_MAX_MS {
+                        return Err(format!(
+                            "{db}: a user with no open transactions was refused for memory: {}",
+                            r.json
+                        ));
+                    }
+                }
+                _ => refused_since = None,
+            }
+            match r {
                 Ok(r) if r.status == 201 => {
                     break (
                         r.json["txn_id"].as_str().unwrap_or("").to_string(),
@@ -141,14 +207,8 @@ async fn interactive_txn_worker(
         };
         let key = format!("t{}", round % 3);
         let v = random_value(&c, &format!("{db}-{round}"));
-        // Values below the inline limit remain in the in-memory write set rather than being staged
-        // as blobs.
-        let inline = c.sim.cfg.engine.value_inline_max - 16;
-        let pads = 80 * 1024 / inline;
-        let pad: Vec<Json> =
-            (0..pads).map(|i| json!({"op": "put", "key": format!("pad{i}"), "value": "p".repeat(inline)})).collect();
         let mut ops = vec![json!({"op": "put", "key": key, "value": v})];
-        ops.extend(pad);
+        ops.extend(pads(&c));
         let ops = json!({"ops": ops});
         let added = match c.call("POST", &format!("{base}/{id}/ops"), Some(ops)).await {
             Ok(r) if r.status == 200 || r.status == 503 || r.status == 404 => r.status == 200,
@@ -196,11 +256,20 @@ pub async fn run(sim: Arc<Sim>, chaos: bool) -> Result<(), String> {
     }
     let polled: Vec<String> = (0..pollers).map(|i| format!("p{i}")).collect();
     let held: Vec<String> = (0..holders).map(|i| format!("h{i}")).collect();
-    for db in names.iter().flatten().chain(&polled).chain(&held) {
+    for db in names.iter().flatten().chain(&polled) {
         owner.create_db(db).await?;
     }
+    let mut holders = Vec::new();
+    for db in &held {
+        let c = Client::signup(&sim, &format!("{db}-holder"), &format!("{db}@sim.test"), "password-123").await?;
+        c.create_db(db).await?;
+        holders.push(c);
+    }
+    let hog = Client::signup(&sim, "hog", "hog@sim.test", "password-123").await?;
+    hog.create_db("hog").await?;
     let phase = chaos.then(|| super::chaos_phase(&sim));
     let client = |name: String| Client::with_token(&sim, &name, &token);
+    let hogging = tokio::spawn(hog_worker(hog, "hog".into(), 2 * holders.len(), sim.now_ms() + 120_000));
     let writes: Vec<_> = names
         .iter()
         .enumerate()
@@ -210,18 +279,23 @@ pub async fn run(sim: Arc<Sim>, chaos: bool) -> Result<(), String> {
         polled.iter().map(|db| tokio::spawn(long_poll_worker(client(format!("{db}-poller")), db.clone(), 3))).collect();
     let holds: Vec<_> = held
         .iter()
-        .map(|db| tokio::spawn(interactive_txn_worker(client(format!("{db}-holder")), db.clone(), steps / 4 + 1)))
+        .zip(&holders)
+        .map(|(db, c)| {
+            let c = Client::with_token(&sim, &c.name, c.token.as_deref().unwrap_or(""));
+            tokio::spawn(interactive_txn_worker(c, db.clone(), steps / 4 + 1))
+        })
         .collect();
     let mut model = BTreeMap::new();
     for t in writes.into_iter().chain(holds) {
         model.extend(t.await.map_err(|e| format!("task: {e}"))??);
     }
-    for t in polls {
+    for t in polls.into_iter().chain([hogging]) {
         t.await.map_err(|e| format!("task: {e}"))??;
     }
     super::settle(&sim, phase).await;
     for ((db, key), want) in &model {
-        let got = strong_get(&owner, db, key).await?;
+        let reader = held.iter().position(|h| h == db).map_or(&owner, |i| &holders[i]);
+        let got = strong_get(reader, db, key).await?;
         if got.as_deref() != Some(want.as_str()) {
             return Err(format!("{db}/{key}: final read {:?}, want {} bytes", got.map(|g| g.len()), want.len()));
         }

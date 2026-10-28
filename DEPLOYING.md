@@ -245,7 +245,9 @@ Rate limits and memory budgets are enforced per node, so an N-node cluster
 allows up to N times each configured rate. Setting a rate limit to 0 disables
 it. `BASERUNNA_DB_MEMORY_MB` must be at least 16 and cannot be disabled; if
 memory usage exceeds this budget after unloading idle databases, the node
-rejects new interactive transactions with `503` (SPEC §5.12).
+shares it fairly between users: it refuses interactive transactions of users
+holding at least a fair share with `503`, and aborts idle transactions of the
+users holding the most to admit the others (SPEC §5.12).
 
 - `BASERUNNA_DB_MAX_MB` (default `10240`): maximum size of each database in MiB (segments and blobs).
 - `BASERUNNA_DB_MEMORY_MB` (default `256`): per-node memory budget in MiB for open databases and transactions.

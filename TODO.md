@@ -23,11 +23,18 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       executed by the peer's previous process (`sim_tool trace tables 7344`).
       Execute locally only if the forward was sent once; otherwise return
       `outcome: "unknown"`.
-- [ ] **Enforce per-user fairness for the node memory budget.** A single user's
-      interactive transactions can consume a node's entire memory budget for up
-      to 5 minutes, causing other users' interactive transactions on that node
-      to be rejected (SPEC §5.12). Reserve a budget share per active user or
-      evict transactions from the user holding the most memory.
+- [ ] **Roll back a failed transaction operations request instead of aborting
+      the transaction.** Any error partway through `POST …/transactions/{id}/ops`,
+      including a memory refusal as the transaction grows past its user's fair
+      share (SPEC §5.12), aborts the whole transaction because the ops before
+      the failure cannot be undone. Record an undo log per request so that a
+      failed request leaves the transaction as it was before the request.
+- [ ] **Fix `db_churn` seed 202681: a read finds no database the workload
+      expects to exist.** A client's `get` returns `404 not_found` for a
+      database under churn (`sim_tool trace db_churn 202681`).
+- [ ] **Fix `streams` seed 202835: a stream keeps records past its
+      retention.** The workload sees records older than `retention_ms`
+      (`sim_tool trace streams 202835`).
 - [ ] **Abort open interactive transactions if a database is deleted.**
       Interactive transactions on a deleted database currently remain open
       until their 30 s idle timeout expires, consuming memory and counting

@@ -9,9 +9,10 @@ use crate::engine::manifest::ObjKind;
 use crate::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn, Value, blob};
 use crate::error::{Error, Result};
 use crate::meta::{self, DbRecord, DbRef, MetaCmd};
-use crate::node::{Node, OpenTxn, OpenTxnSlot};
+use crate::node::Node;
 use crate::ops::{self, Encoding, Op, OpCtx, exec_ops, user_key};
 use crate::table::{self, BlobResolver, ColumnSpec, CreateTable, IndexSpec, InsertMode, Query, Selection};
+use crate::txns::OpenTxn;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Extension, Path, Request, State};
@@ -23,7 +24,6 @@ use serde_json::{Value as Json, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
 
 type J = axum::Json<Json>;
 
@@ -540,39 +540,24 @@ async fn begin_txn(
     Extension(ctx): Extension<DbCtx>,
     JsonBody(b): JsonBody<Begin>,
 ) -> Result<Response> {
-    ctx.db.shared().check_memory(&ctx.db.id)?;
-    let mut t = match b.isolation.into() {
+    let user = &ctx.principal.user.id;
+    node.txns.admit_begin(user, &ctx.db.id)?;
+    let t = match b.isolation.into() {
         crate::engine::Isolation::Serializable => ctx.db.begin_optimistic().await?,
         iso => ctx.db.begin(iso, Consistency::Strong).await?,
     };
-    let results = exec_ops(&op_ctx(&node, &ctx, b.encoding), &mut t, &b.ops).await?;
+    let (rv, cid) = (t.read_version(), t.commit_id);
     let id = node.env.random_hex(16);
-    let rv = t.read_version();
-    let cid = t.commit_id;
-    let now = Instant::now();
-    let entry = OpenTxn {
-        db_id: ctx.rec.id.clone(),
-        user_id: ctx.principal.user.id.clone(),
-        txn: Some(t),
-        created: now,
-        last_used: now,
-        encoding: b.encoding,
-    };
-    {
-        let mut txns = node.txns.lock().unwrap_or_else(|e| e.into_inner());
-        let user = &ctx.principal.user.id;
-        if txns.values().filter(|s| s.user_id == *user).count() >= node.cfg.txns_per_user {
-            return Err(Error::RateLimited {
-                message: format!(
-                    "maximum of {} open interactive transactions per user exceeded",
-                    node.cfg.txns_per_user
-                ),
-                retry_after_ms: 1_000,
-            });
+    let mut g = node.txns.open(id.clone(), user, &ctx.rec.id, t, b.encoding)?;
+    let Some(t) = g.as_mut() else { return Err(Error::internal("a new transaction is closed")) };
+    let results = match exec_ops(&op_ctx(&node, &ctx, b.encoding), t, &b.ops).await {
+        Ok(results) => results,
+        Err(e) => {
+            *g = None;
+            node.txns.remove(&id);
+            return Err(e);
         }
-        let slot = OpenTxnSlot { user_id: user.clone(), txn: tokio::sync::Mutex::new(entry) };
-        txns.insert(id.clone(), Arc::new(slot));
-    }
+    };
     Ok((
         StatusCode::CREATED,
         axum::Json(json!({
@@ -587,19 +572,8 @@ async fn begin_txn(
         .into_response())
 }
 
-fn get_open(node: &Node, id: &str) -> Result<Arc<OpenTxnSlot>> {
-    if crate::buggify::fault(0.01) {
-        remove_open(node, id);
-    }
-    let open = node.txns.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned();
-    open.ok_or_else(|| {
-        crate::probe::hit(crate::probe::Probe::InteractiveTxnLost);
-        Error::TxnNotFound
-    })
-}
-
-fn remove_open(node: &Node, id: &str) {
-    node.txns.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+fn get_open(node: &Node, ctx: &DbCtx, id: &str) -> Result<Arc<OpenTxn>> {
+    node.txns.get(id, &ctx.principal.user.id, &ctx.rec.id)
 }
 
 #[derive(Deserialize)]
@@ -615,30 +589,18 @@ async fn txn_ops(
     JsonBody(b): JsonBody<OpsBody>,
 ) -> Result<J> {
     let id = param(&p, "id")?.to_string();
-    ctx.db.shared().check_memory(&ctx.db.id)?;
-    let entry = get_open(&node, &id)?;
-    let mut g = entry.txn.lock().await;
-    if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
-        return Err(Error::TxnNotFound);
-    }
-    let started = g.created;
-    if started.elapsed() > Duration::from_millis(node.cfg.txn_max_ms) {
-        drop(g);
-        remove_open(&node, &id);
-        return Err(Error::TxnNotFound);
-    }
-    g.last_used = Instant::now();
-    let enc = g.encoding;
-    let octx = op_ctx(&node, &ctx, enc);
-    let Some(t) = g.txn.as_mut() else {
-        return Err(Error::TxnNotFound);
+    let open = get_open(&node, &ctx, &id)?;
+    node.txns.admit(&open.user_id, &open.db_id)?;
+    let mut g = open.txn.lock().await;
+    open.touch();
+    let Some(t) = g.as_mut() else {
+        return Err(node.txns.lost(&id));
     };
-    match exec_ops(&octx, t, &b.ops).await {
+    match exec_ops(&op_ctx(&node, &ctx, open.encoding), t, &b.ops).await {
         Ok(results) => Ok(axum::Json(json!({"results": results}))),
         Err(e) => {
-            g.txn = None;
-            drop(g);
-            remove_open(&node, &id);
+            *g = None;
+            node.txns.abort(&id, &format!("a request on it failed: {}", e.message()));
             Err(e)
         }
     }
@@ -658,17 +620,12 @@ async fn commit_txn(
     JsonBody(b): JsonBody<Option<CommitBody>>,
 ) -> Result<J> {
     let id = param(&p, "id")?.to_string();
-    let entry = get_open(&node, &id)?;
-    let mut g = entry.txn.lock().await;
-    if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
-        return Err(Error::TxnNotFound);
-    }
-    let mut t = g.txn.take().ok_or(Error::TxnNotFound)?;
-    let enc = g.encoding;
-    drop(g);
-    remove_open(&node, &id);
+    let open = get_open(&node, &ctx, &id)?;
+    let mut t = open.txn.lock().await.take().ok_or_else(|| node.txns.lost(&id))?;
+    node.txns.remove(&id);
+    t.set_memory_gate(None);
     let b = b.unwrap_or_default();
-    let mut results = exec_ops(&op_ctx(&node, &ctx, enc), &mut t, &b.ops).await?;
+    let mut results = exec_ops(&op_ctx(&node, &ctx, open.encoding), &mut t, &b.ops).await?;
     if !t.is_read_only() {
         ctx.require_write()?;
     }
@@ -693,13 +650,9 @@ async fn commit_txn(
 
 async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
     let id = param(&p, "id")?.to_string();
-    let entry = get_open(&node, &id)?;
-    let g = entry.txn.lock().await;
-    if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
-        return Err(Error::TxnNotFound);
-    }
-    drop(g);
-    remove_open(&node, &id);
+    let open = get_open(&node, &ctx, &id)?;
+    *open.txn.lock().await = None;
+    node.txns.remove(&id);
     Ok(axum::Json(json!({})))
 }
 

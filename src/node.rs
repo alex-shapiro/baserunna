@@ -13,6 +13,7 @@ use crate::meta::{
 };
 use crate::store::DynStore;
 use crate::table::BlobResolver;
+use crate::txns::{OpenTxns, TxnLimits};
 use crate::util::{DetHashMap, TtlCache};
 use axum::body::Body;
 use http::Request;
@@ -62,6 +63,16 @@ pub struct NodeConfig {
     pub watch_poll_ms: u64,
     pub limits: LimitConfig,
     pub engine: EngineConfig,
+}
+
+impl NodeConfig {
+    pub fn txn_limits(&self) -> TxnLimits {
+        TxnLimits {
+            per_user: self.txns_per_user,
+            idle: Duration::from_millis(self.txn_idle_ms),
+            lifetime: Duration::from_millis(self.txn_max_ms),
+        }
+    }
 }
 
 impl Default for NodeConfig {
@@ -203,21 +214,6 @@ const REAPER_KEY: &str = "reaper";
 
 const META_BATCH: usize = 500;
 
-pub struct OpenTxnSlot {
-    pub user_id: String,
-    pub txn: tokio::sync::Mutex<OpenTxn>,
-}
-
-/// Active interactive transaction state.
-pub struct OpenTxn {
-    pub db_id: String,
-    pub user_id: String,
-    pub txn: Option<Txn>,
-    pub created: Instant,
-    pub last_used: Instant,
-    pub encoding: crate::ops::Encoding,
-}
-
 tokio::task_local! {
     static REQUEST_DEADLINE: Instant;
 }
@@ -244,7 +240,7 @@ pub struct Node {
     org_cache: TtlCache<String, Org>,
     /// Caches positive `(org_id, user_id)` role lookups; misses read strongly.
     role_cache: TtlCache<(String, String), Role>,
-    pub(crate) txns: Mutex<DetHashMap<String, Arc<OpenTxnSlot>>>,
+    pub txns: Arc<OpenTxns>,
     cookie_key: Mutex<Vec<u8>>,
     cluster_key: Mutex<Option<String>>,
     pub forwards: cluster::ForwardDedup,
@@ -283,6 +279,7 @@ impl Node {
         cfg.engine.validate().map_err(|e| Error::invalid(format!("engine configuration: {e}")))?;
         let id = format!("{}-{}", cfg.name, env.random_hex(4));
         let engine = Engine::new(store, env.clone(), cfg.engine.clone(), id.clone());
+        let txns = OpenTxns::new(engine.clone(), cfg.txn_limits());
         engine.mark_system(SYS_DB);
         let node = Arc::new(Node {
             id,
@@ -298,7 +295,7 @@ impl Node {
             name_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
             org_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
             role_cache: TtlCache::new(Duration::from_millis(cfg.auth_cache_ms), CACHE_MAX),
-            txns: Mutex::new(DetHashMap::default()),
+            txns,
             cookie_key: Mutex::new(Vec::new()),
             cluster_key: Mutex::new(None),
             forwards: cluster::ForwardDedup::new(Duration::from_secs(60)),
@@ -1371,12 +1368,7 @@ impl Node {
     fn housekeeping(&self) {
         self.engine.evict_idle(self.cfg.db_idle_evict_ms);
         self.engine.shared.refresh_clock();
-        let idle = Duration::from_millis(self.cfg.txn_idle_ms);
-        let max = Duration::from_millis(self.cfg.txn_max_ms);
-        lock(&self.txns).retain(|_, t| match t.txn.try_lock() {
-            Ok(t) => t.last_used.elapsed() < idle && t.created.elapsed() < max,
-            Err(_) => true,
-        });
+        self.txns.expire();
         self.auth_cache.prune();
         self.name_cache.prune();
         self.org_cache.prune();
@@ -1419,26 +1411,12 @@ impl Node {
         self.engine.shared.time_ms()
     }
 
-    pub fn open_txn_count(&self) -> usize {
-        lock(&self.txns).len()
-    }
-
-    /// Returns the number of open interactive transactions for `db_id`.
-    pub async fn open_txn_count_for_db(&self, db_id: &str) -> usize {
-        let txns: Vec<_> = lock(&self.txns).values().cloned().collect();
-        let mut n = 0;
-        for t in txns {
-            n += usize::from(t.txn.lock().await.db_id == db_id);
-        }
-        n
-    }
-
     pub fn status_json(&self) -> Json {
         json!({
             "node_id": self.id,
             "addr": self.cfg.addr,
             "open_databases": self.engine.open_count(),
-            "open_transactions": self.open_txn_count(),
+            "open_transactions": self.txns.len(),
             "memory": {
                 "used_bytes": self.engine.shared.memory.used(),
                 "limit_bytes": self.engine.shared.memory.limit(),
@@ -1689,79 +1667,6 @@ mod tests {
             commit().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert_eq!(notices() - before, 3);
-        });
-    }
-
-    #[test]
-    fn interactive_transactions_are_capped_per_user() {
-        run_paused(async {
-            let w = World::with_config(1, 1, |c| c.txns_per_user = 3).await;
-            let (alice, bob) = (w.signup(0, "alice@x.io").await, w.signup(0, "bob@x.io").await);
-            w.create_db(0, &alice, "a").await;
-            w.create_db(0, &bob, "b").await;
-            let begin = |token: &str, db: &str| {
-                let (token, db) = (token.to_string(), db.to_string());
-                let w = &w;
-                async move { w.call(0, "POST", &format!("/v1/dbs/{db}/transactions"), &token, Bytes::from("{}")).await }
-            };
-            let mut ids = Vec::new();
-            for _ in 0..3 {
-                let r = begin(&alice, "a").await;
-                assert_eq!(r.status, 201);
-                ids.push(r.json()["txn_id"].as_str().unwrap().to_string());
-            }
-            let r = begin(&alice, "a").await;
-            assert_eq!((r.status, r.json()["error"]["code"].as_str()), (429, Some("rate_limited")), "{:?}", r.json());
-            assert_eq!(begin(&bob, "b").await.status, 201, "user quota affected another user");
-            let r = w.call(0, "DELETE", &format!("/v1/dbs/a/transactions/{}", ids[0]), &alice, Bytes::new()).await;
-            assert_eq!(r.status, 200);
-            assert_eq!(begin(&alice, "a").await.status, 201, "an aborted transaction still counted");
-        });
-    }
-
-    #[test]
-    fn interactive_transactions_are_rejected_over_memory_budget_and_admitted_after_release() {
-        run_paused(async {
-            let w = World::with_config(1, 1, |c| c.engine.memory_bytes = 16 << 20).await;
-            let token = w.signup(0, "a@x.io").await;
-            w.create_db(0, &token, "a").await;
-            let ops: Vec<_> = (0..120)
-                .map(|i| serde_json::json!({"op": "put", "key": format!("k{i}"), "value": "v".repeat(20_000)}))
-                .collect();
-            let mut open = Vec::new();
-            let refused = loop {
-                let r = w.call(0, "POST", "/v1/dbs/a/transactions", &token, Bytes::from("{}")).await;
-                if r.status != 201 {
-                    break r;
-                }
-                let id = r.json()["txn_id"].as_str().unwrap().to_string();
-                let r = w
-                    .json(
-                        0,
-                        "POST",
-                        &format!("/v1/dbs/a/transactions/{id}/ops"),
-                        &token,
-                        serde_json::json!({"ops": ops}),
-                    )
-                    .await;
-                assert!(r["error"].is_null(), "{r}");
-                open.push(id);
-                assert!(open.len() < 20, "transactions were never refused");
-            };
-            assert_eq!(refused.status, 503, "{:?}", refused.json());
-            assert_eq!(refused.json()["error"]["retryable"], true);
-            let status = w.node(0).status_json();
-            assert!(status["memory"]["used_bytes"].as_u64() > status["memory"]["limit_bytes"].as_u64(), "{status}");
-            let r = w
-                .call(0, "POST", &format!("/v1/dbs/a/transactions/{}/commit", open[0]), &token, Bytes::from("{}"))
-                .await;
-            assert_eq!(r.status, 200, "committing a transaction under memory pressure: {:?}", r.json());
-            for id in &open[1..] {
-                let r = w.call(0, "DELETE", &format!("/v1/dbs/a/transactions/{id}"), &token, Bytes::new()).await;
-                assert_eq!(r.status, 200, "aborting a transaction under memory pressure: {:?}", r.json());
-            }
-            let r = w.call(0, "POST", "/v1/dbs/a/transactions", &token, Bytes::from("{}")).await;
-            assert_eq!(r.status, 201, "released memory was not reused");
         });
     }
 

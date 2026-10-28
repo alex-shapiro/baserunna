@@ -132,7 +132,7 @@ pub async fn run(sim: Arc<Sim>, clients: usize, txns: usize, chaos: bool) -> Res
     let id = info.json["id"].as_str().ok_or(format!("db info: {}", info.json))?.to_string();
     for i in sim.up_nodes() {
         let Some(n) = sim.node(i) else { continue };
-        let open = n.node.open_txn_count_for_db(&id).await;
+        let open = n.node.txns.count_for_db(&id);
         if open != 0 {
             return Err(format!("n{i} still holds {open} open transactions"));
         }

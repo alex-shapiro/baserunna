@@ -195,8 +195,11 @@ probes! {
     ModelAdoptedFromDatabase,
     /// An idle database manifest was unloaded to free memory.
     DatabaseUnloaded,
-    /// An interactive transaction was rejected because the node memory budget was exceeded.
+    /// An interactive transaction was refused because its user held at least a fair share of the
+    /// exceeded node memory budget.
     MemoryExhausted,
+    /// An idle interactive transaction was aborted to free memory for a user below its fair share.
+    TxnEvicted,
 }
 
 impl Probe {

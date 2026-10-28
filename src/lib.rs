@@ -27,6 +27,7 @@ pub mod store;
 pub mod stream;
 pub mod table;
 pub mod timing;
+pub mod txns;
 pub mod util;
 
 pub use error::{Error, Result};

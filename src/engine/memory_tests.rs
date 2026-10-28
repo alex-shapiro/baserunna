@@ -46,21 +46,16 @@ fn least_recently_used_idle_databases_are_unloaded() {
 }
 
 #[test]
-fn interactive_work_is_rejected_while_pinned_versions_exceed_budget() {
+fn unloading_cannot_reclaim_versions_pinned_by_transactions() {
     rt().block_on(async {
         let (eng, _store) = delayed_engine_with("a", config_with_memory_budget(16 * MIB));
         let mut pins = Vec::new();
-        while eng.shared.check_memory("next").is_ok() {
+        while eng.shared.reclaim() {
             let db = open_and_fill_db(&eng, &format!("d{}", pins.len()), 200).await;
             pins.push(db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap());
             assert!(pins.len() < 200);
         }
-        match eng.shared.check_memory("next") {
-            Err(e @ Error::Unavailable { retry_after_ms: Some(_), outcome_unknown: false, .. }) => {
-                assert!(e.retryable())
-            }
-            other => panic!("unexpected result: {other:?}"),
-        }
+        assert!(!eng.shared.reclaim(), "unloading released memory pinned by transactions");
         let db = open_and_fill_db(&eng, "loaded-anyway", 200).await;
         put(&db, "k", "v").await;
         let first = pins.remove(0);
@@ -68,7 +63,7 @@ fn interactive_work_is_rejected_while_pinned_versions_exceed_budget() {
         drop(first);
         assert!(read > 0);
         drop(pins);
-        eng.shared.check_memory("next").unwrap();
+        assert!(eng.shared.reclaim());
     });
 }
 
@@ -81,12 +76,11 @@ fn system_databases_are_exempt_from_memory_budget() {
         let used = eng.shared.memory.used();
         assert!(used < 64 * 1024, "system database charged {used} bytes");
         let mut pins = Vec::new();
-        while eng.shared.check_memory("d").is_ok() {
+        while eng.shared.reclaim() {
             let db = open_and_fill_db(&eng, &format!("d{}", pins.len()), 200).await;
             pins.push(db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap());
         }
         assert!(eng.shared.memory.is_exceeded());
-        eng.shared.check_memory("sys").unwrap();
         assert!(!sys.unload());
     });
 }

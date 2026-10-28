@@ -2,7 +2,7 @@
 //! read set, and a buffered write set. Reads see the transaction's own
 //! writes.
 
-use super::memory::{Charge, alloc_bytes};
+use super::memory::{Charge, MemoryGate, alloc_bytes};
 use super::stream::{self, StreamOp, StreamState};
 use super::types::{BlobRef, Seq, Value, is_commit_key};
 use super::version::{KeyRange, Snapshot, Version};
@@ -157,6 +157,8 @@ pub struct Txn {
     read_bytes: usize,
     max_read_bytes: usize,
     charge: Charge,
+    /// The gate growth is checked with, and the charge size up to which it last admitted growth.
+    gate: Option<(Arc<dyn MemoryGate>, usize)>,
     appended: usize,
     optimistic: bool,
     has_untracked_reads: bool,
@@ -187,10 +189,36 @@ impl Txn {
             read_bytes: 0,
             max_read_bytes: max_write_bytes,
             charge,
+            gate: None,
             appended: 0,
             optimistic: false,
             has_untracked_reads: false,
         }
+    }
+
+    /// Returns a counter of the memory this transaction holds, readable while another task owns
+    /// the transaction (see [`Charge::meter`]).
+    pub fn meter(&mut self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.charge.meter()
+    }
+
+    /// Checks further growth of the transaction's memory with `gate`, or stops checking it. Once
+    /// the gate refuses growth, reads and writes that would grow the transaction fail.
+    pub fn set_memory_gate(&mut self, gate: Option<Arc<dyn MemoryGate>>) {
+        self.gate = gate.map(|g| {
+            let until = self.charge.bytes() + g.chunk();
+            (g, until)
+        });
+    }
+
+    fn admit_growth(&mut self) -> Result<()> {
+        if let Some((gate, until)) = &mut self.gate
+            && self.charge.bytes() > *until
+        {
+            gate.admit()?;
+            *until = self.charge.bytes() + gate.chunk();
+        }
+        Ok(())
     }
 
     pub fn with_read_limit(mut self, max_read_bytes: usize) -> Txn {
@@ -383,7 +411,7 @@ impl Txn {
         if self.read_bytes > self.max_read_bytes {
             return Err(Error::TooLarge(format!("transaction read sets exceed {} bytes", self.max_read_bytes)));
         }
-        Ok(())
+        self.admit_growth()
     }
 
     fn account(&mut self, n: usize) -> Result<()> {
@@ -392,7 +420,7 @@ impl Txn {
         if self.write_bytes > self.max_write_bytes {
             return Err(Error::TooLarge(format!("transaction writes exceed {} bytes", self.max_write_bytes)));
         }
-        Ok(())
+        self.admit_growth()
     }
 
     pub fn put(&mut self, key: Bytes, value: Value) -> Result<()> {

@@ -107,10 +107,7 @@ impl Drop for Charge {
 
 /// Admission check for incremental transaction memory growth.
 pub trait MemoryGate: Send + Sync {
-    /// Returns an error if additional memory growth is rejected.
     fn admit(&self) -> crate::error::Result<()>;
-
-    /// Byte increment between admission checks.
     fn step_bytes(&self) -> usize;
 }
 

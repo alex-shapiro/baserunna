@@ -11,18 +11,13 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// Concurrency and timeout limits for open interactive transactions on a node.
 #[derive(Clone, Copy, Debug)]
 pub struct TxnLimits {
-    /// Maximum concurrent open transactions per user.
     pub per_user: usize,
-    /// Idle timeout before an unused transaction is aborted.
     pub idle: Duration,
-    /// Maximum total lifetime before a transaction is aborted.
     pub lifetime: Duration,
 }
 
-/// An open interactive transaction.
 pub struct OpenTxn {
     pub id: String,
     pub user_id: String,
@@ -30,12 +25,11 @@ pub struct OpenTxn {
     pub encoding: Encoding,
     created: Instant,
     last_used: Mutex<Instant>,
-    /// Bytes charged to the transaction's read and write sets (see [`Txn::meter`]).
     memory: Arc<AtomicUsize>,
     /// Weak reference to the transaction's snapshot version, used to attribute pinned version
-    /// memory.
+    /// memory without locking `txn`.
     snapshot: Weak<Version>,
-    /// Held while a request executes on the transaction; set to `None` on commit or abort.
+    /// Set to `None` on commit or abort.
     txn: Arc<tokio::sync::Mutex<Option<Txn>>>,
 }
 
@@ -49,12 +43,10 @@ impl OpenTxn {
     }
 }
 
-/// Active interactive transactions on a node.
 pub struct OpenTxns {
     engine: Arc<Engine>,
     limits: TxnLimits,
     open: Mutex<DetHashMap<String, Arc<OpenTxn>>>,
-    /// Abort reasons for recently aborted transactions, keyed by transaction ID.
     aborted: TtlCache<String, &'static str>,
 }
 
@@ -80,7 +72,6 @@ impl OpenTxns {
         self.len() == 0
     }
 
-    /// Returns the number of open transactions on `db_id`.
     pub fn count_for_db(&self, db_id: &str) -> usize {
         lock(&self.open).values().filter(|t| t.db_id == db_id).count()
     }
@@ -361,7 +352,6 @@ mod tests {
         (0..120).map(|i| json!({"op": "put", "key": format!("{tag}{i}"), "value": "v".repeat(20_000)})).collect()
     }
 
-    /// Maximum bytes a single transaction can allocate past the budget before the next gate check.
     fn growth_slack(w: &World) -> usize {
         w.node(0).engine.shared.memory.limit() / 1024 + 32 * 1024
     }

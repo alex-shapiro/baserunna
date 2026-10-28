@@ -28,7 +28,6 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-/// Bytes charged for a database handle beyond its ID.
 const HANDLE_BYTES: usize = std::mem::size_of::<Db>() + 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,8 +150,7 @@ struct State {
     distrusted_at: Option<Instant>,
     verified_at: Option<Instant>,
     last_access: Instant,
-    /// Value of [`Shared::access_ticks`] at the last access, ordering databases for unloading.
-    last_tick: u64,
+    last_access_seq: u64,
     window_start: Instant,
     reads_in_window: u32,
     reads_last_window: u32,
@@ -169,7 +167,7 @@ struct State {
     quota_pressure: bool,
     trim_queue: BTreeSet<u64>,
     trimming: bool,
-    /// Stored bytes of the manifest dropped by [`Db::unload`], for quota checks until it is loaded again.
+    /// Stored bytes from the last unloaded manifest, used for quota checks while unloaded.
     unloaded_stored_bytes: u64,
 }
 
@@ -216,8 +214,7 @@ pub struct Db {
     refreshing: std::sync::atomic::AtomicBool,
     staging: Mutex<Staging>,
     pages: Mutex<(PageCache, Charge)>,
-    /// Charges the handle itself to the memory budget.
-    _handle: Charge,
+    _handle_charge: Charge,
 }
 
 /// Tracks in-flight and completed uncommitted blob uploads against the database quota.
@@ -283,7 +280,7 @@ impl Db {
                 distrusted_at: None,
                 verified_at: None,
                 last_access: now,
-                last_tick: 0,
+                last_access_seq: 0,
                 window_start: now,
                 reads_in_window: 0,
                 reads_last_window: 0,
@@ -309,7 +306,7 @@ impl Db {
             refreshing: Default::default(),
             staging: Mutex::new(Staging::default()),
             pages: Mutex::new((PageCache::default(), Charge::new(&shared.memory, 0))),
-            _handle: Charge::new(&shared.memory, HANDLE_BYTES + id.len()),
+            _handle_charge: Charge::new(&shared.memory, HANDLE_BYTES + id.len()),
             id,
             shared,
         })
@@ -350,14 +347,12 @@ impl Db {
             && st.last_access.elapsed() >= Duration::from_millis(ms)
     }
 
-    /// Orders databases by their last access, least recent first.
-    pub(crate) fn access_order(&self) -> u64 {
-        self.st().last_tick
+    pub(crate) fn last_access_seq(&self) -> u64 {
+        self.st().last_access_seq
     }
 
-    /// Drops the cached manifest of an idle database to release its memory; the next access
-    /// loads it from storage again. Returns false, leaving the database loaded, if a load,
-    /// a manifest write, or background work is in progress.
+    /// Drops the cached manifest and page cache if the database is idle and not a system
+    /// database. Returns `true` if the manifest was unloaded.
     pub(crate) fn unload(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         let Ok(_load) = self.load_lock.try_lock() else { return false };
@@ -576,7 +571,7 @@ impl Db {
             }
         }
         drop(st);
-        self.shared.relieve();
+        self.shared.unload_idle();
         installed
     }
 
@@ -740,7 +735,7 @@ impl Db {
         let cfg = &self.shared.cfg;
         let mut st = self.st();
         st.last_access = now;
-        st.last_tick = self.shared.tick();
+        st.last_access_seq = self.shared.next_access_seq();
         let window = Duration::from_millis(cfg.read_lease_ms);
         let since = now.duration_since(st.window_start);
         if since > window {

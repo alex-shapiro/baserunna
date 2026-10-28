@@ -29,7 +29,7 @@ pub struct EngineConfig {
     pub blob_chunk_size: usize,
     pub blob_max: u64,
     pub cache_bytes: usize,
-    /// Memory for open databases' manifests and for transactions (SPEC §5.12).
+    /// Memory budget in bytes for open database manifests and active transactions.
     pub memory_bytes: usize,
     /// Node-local cache tier below the memory cache.
     pub local_tier: Option<LocalTier>,
@@ -45,7 +45,6 @@ pub struct EngineConfig {
     pub lease_read_threshold: u32,
     pub txn_max_lifetime_ms: u64,
     pub txn_max_write_bytes: usize,
-    /// Bytes of keys and key ranges a transaction's read set may hold.
     pub txn_max_read_bytes: usize,
     pub gc_grace_ms: u64,
     pub orphan_grace_ms: u64,
@@ -151,10 +150,7 @@ impl EngineConfig {
                 "clock_sync_interval_ms must be below clock_sync_max_age_ms",
             ),
             (self.level_size_ratio >= 2, "level_size_ratio must be at least 2"),
-            (
-                self.memory_bytes >= 64 * self.tail_max_bytes,
-                "memory_bytes must hold the tails of many databases (64 × tail_max_bytes)",
-            ),
+            (self.memory_bytes >= 64 * self.tail_max_bytes, "memory_bytes must be at least 64 * tail_max_bytes"),
             (
                 self.commit_retention_ms >= 2 * self.commit_timeout_ms,
                 "commit_retention_ms must leave time to resolve commits after commit_timeout_ms",
@@ -204,8 +200,8 @@ mod tests {
         EngineConfig::default().validate().unwrap();
         EngineConfig::small_for_tests().validate().unwrap();
         let tight = EngineConfig { gc_grace_ms: 5 * 60_000, ..EngineConfig::default() };
-        assert!(tight.validate().is_err(), "no room for clock error");
+        assert!(tight.validate().is_err());
         let starved = EngineConfig { memory_bytes: 8 * 1024 * 1024, ..EngineConfig::default() };
-        assert!(starved.validate().is_err(), "memory for only a few tails");
+        assert!(starved.validate().is_err());
     }
 }

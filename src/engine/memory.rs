@@ -1,20 +1,11 @@
-//! The node-wide budget for memory held on behalf of databases and transactions.
-//!
-//! An open database keeps its manifest, tail included, in memory, and a transaction keeps a
-//! snapshot and its read and write sets. Each of these is charged to one [`Memory`] budget.
-//! When the budget is exceeded, the engine unloads the least recently used idle databases.
-//! If that cannot free enough, starting or growing an interactive transaction, which holds
-//! memory across requests, fails with a retryable error until memory is released; work that
-//! completes within a request proceeds.
+//! Per-node memory accounting for open databases and active transactions.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-/// Bytes an allocation costs beyond its contents: the allocator's header and rounding.
 pub(crate) const ALLOC_OVERHEAD: usize = 16;
 
-/// Heap bytes of a buffer holding `len` bytes.
-pub(crate) fn heap(len: usize) -> usize {
+pub(crate) fn alloc_bytes(len: usize) -> usize {
     if len == 0 { 0 } else { len + ALLOC_OVERHEAD }
 }
 
@@ -29,7 +20,6 @@ impl Memory {
         Memory { limit, used: AtomicUsize::new(0) }
     }
 
-    /// Bytes currently charged.
     pub fn used(&self) -> usize {
         self.used.load(Relaxed)
     }
@@ -38,7 +28,7 @@ impl Memory {
         self.limit
     }
 
-    pub fn over(&self) -> bool {
+    pub fn is_exceeded(&self) -> bool {
         self.used() > self.limit
     }
 
@@ -51,7 +41,8 @@ impl Memory {
     }
 }
 
-/// Bytes charged to a [`Memory`] budget until the charge is dropped.
+/// RAII guard that charges bytes to a [`Memory`] budget and releases them on drop. Cloning a
+/// `Charge` adds an equal charge to the budget.
 #[derive(Debug, Default)]
 pub struct Charge {
     memory: Option<Arc<Memory>>,
@@ -64,21 +55,19 @@ impl Charge {
         Charge { memory: Some(memory.clone()), bytes }
     }
 
-    /// Adds `n` bytes to the charge.
-    pub fn grow(&mut self, n: usize) {
+    pub fn add(&mut self, bytes: usize) {
         if let Some(m) = &self.memory {
-            m.add(n);
+            m.add(bytes);
         }
-        self.bytes += n;
+        self.bytes += bytes;
     }
 
-    /// Changes the charge to `n` bytes.
-    pub fn set(&mut self, n: usize) {
+    pub fn set(&mut self, bytes: usize) {
         if let Some(m) = &self.memory {
-            m.add(n);
+            m.add(bytes);
             m.sub(self.bytes);
         }
-        self.bytes = n;
+        self.bytes = bytes;
     }
 
     pub fn bytes(&self) -> usize {
@@ -86,7 +75,6 @@ impl Charge {
     }
 }
 
-/// A clone holds its own copy of the memory, so it is charged again.
 impl Clone for Charge {
     fn clone(&self) -> Charge {
         match &self.memory {
@@ -109,13 +97,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn charges_are_released_when_dropped() {
+    fn charges_are_released_on_drop() {
         let m = Arc::new(Memory::new(100));
         let mut a = Charge::new(&m, 60);
-        assert!(!m.over());
-        a.grow(50);
+        assert!(!m.is_exceeded());
+        a.add(50);
         assert_eq!(m.used(), 110);
-        assert!(m.over());
+        assert!(m.is_exceeded());
         let b = Charge::new(&m, 5);
         a.set(10);
         assert_eq!(m.used(), 15);
@@ -123,7 +111,7 @@ mod tests {
         drop(b);
         assert_eq!(m.used(), 0);
         let mut free = Charge::default();
-        free.grow(7);
+        free.add(7);
         assert_eq!((free.bytes(), m.used()), (7, 0));
     }
 }

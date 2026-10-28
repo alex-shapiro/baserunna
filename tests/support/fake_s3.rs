@@ -1,8 +1,4 @@
-//! An in-process S3 endpoint for testing `CloudStore` without credentials.
-//!
-//! It implements the subset of the S3 API that `object_store` uses (object `PUT`, `GET`,
-//! `DELETE` with conditional and range headers, and `ListObjectsV2`), pages listings in
-//! small pages, and injects faults queued with [`FakeS3::fault`].
+//! In-process S3 HTTP server with fault injection for testing `CloudStore`.
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -13,15 +9,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const BUCKET: &str = "bucket";
-const PAGE: usize = 3;
+const MAX_LIST_KEYS: usize = 3;
 
 #[derive(Clone, Debug)]
 pub enum Fault {
-    /// Responds with this status without handling the request.
     Fail(u16),
-    /// Handles the request, then responds with this status as if the response were lost.
     ApplyThenFail(u16),
-    /// Waits before handling the request.
     Delay(Duration),
 }
 
@@ -54,7 +47,6 @@ impl FakeS3 {
         s
     }
 
-    /// Settings that point a `CloudStore` at this endpoint.
     pub fn config(&self) -> Vec<(String, String)> {
         [
             ("aws_endpoint", self.url.as_str()),
@@ -69,17 +61,15 @@ impl FakeS3 {
         .collect()
     }
 
-    /// Applies `fault` to the next request with `method`.
-    pub fn fault(&self, method: Method, fault: Fault) {
+    pub fn inject_fault(&self, method: Method, fault: Fault) {
         self.inner.lock().unwrap().faults.push_back((method, fault));
     }
 
-    /// Number of requests received with `method`.
-    pub fn requests(&self, method: &Method) -> usize {
+    pub fn request_count(&self, method: &Method) -> usize {
         self.inner.lock().unwrap().requests.get(method.as_str()).copied().unwrap_or(0)
     }
 
-    pub fn data(&self, key: &str) -> Option<Bytes> {
+    pub fn get_data(&self, key: &str) -> Option<Bytes> {
         self.inner.lock().unwrap().objects.get(key).map(|o| o.data.clone())
     }
 }
@@ -88,7 +78,7 @@ fn now_s() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-fn civil(secs: u64) -> (i64, u32, u32, u64) {
+fn utc_date_time(secs: u64) -> (i64, u32, u32, u64) {
     let days = (secs / 86_400) as i64;
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -105,22 +95,22 @@ fn civil(secs: u64) -> (i64, u32, u32, u64) {
 fn http_date(secs: u64) -> String {
     const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let (y, m, d, t) = civil(secs);
+    let (y, m, d, t) = utc_date_time(secs);
     let wd = DAYS[((secs / 86_400) % 7) as usize];
     format!("{wd}, {d:02} {} {y} {:02}:{:02}:{:02} GMT", MONTHS[m as usize - 1], t / 3600, t / 60 % 60, t % 60)
 }
 
 fn iso_date(secs: u64) -> String {
-    let (y, m, d, t) = civil(secs);
+    let (y, m, d, t) = utc_date_time(secs);
     format!("{y}-{m:02}-{d:02}T{:02}:{:02}:{:02}.000Z", t / 3600, t / 60 % 60, t % 60)
 }
 
-fn status(code: u16, body: &str) -> Response {
+fn response_with_status(code: u16, body: &str) -> Response {
     Response::builder().status(code).body(Body::from(body.to_string())).unwrap()
 }
 
-fn error(code: u16, s3_code: &str) -> Response {
-    status(
+fn xml_error_response(code: u16, s3_code: &str) -> Response {
+    response_with_status(
         code,
         &format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{s3_code}</Code><Message>{s3_code}</Message></Error>"
@@ -128,19 +118,19 @@ fn error(code: u16, s3_code: &str) -> Response {
     )
 }
 
-fn query(uri: &Uri) -> BTreeMap<String, String> {
+fn parse_query(uri: &Uri) -> BTreeMap<String, String> {
     uri.query()
         .unwrap_or("")
         .split('&')
         .filter(|kv| !kv.is_empty())
         .map(|kv| {
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            (decode(k), decode(v))
+            (percent_decode(k), percent_decode(v))
         })
         .collect()
 }
 
-fn decode(s: &str) -> String {
+fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -177,26 +167,26 @@ async fn handle(State(s): State<FakeS3>, method: Method, uri: Uri, headers: Head
         }
     };
     match fault {
-        Some(Fault::Fail(code)) => return error(code, "InjectedFault"),
+        Some(Fault::Fail(code)) => return xml_error_response(code, "InjectedFault"),
         Some(Fault::Delay(d)) => tokio::time::sleep(d).await,
         _ => {}
     }
     let resp = serve(&s, &method, &uri, &headers, body);
     match fault {
-        Some(Fault::ApplyThenFail(code)) => error(code, "InternalError"),
+        Some(Fault::ApplyThenFail(code)) => xml_error_response(code, "InternalError"),
         _ => resp,
     }
 }
 
 fn serve(s: &FakeS3, method: &Method, uri: &Uri, headers: &HeaderMap, body: Bytes) -> Response {
-    let path = decode(uri.path().trim_start_matches('/'));
+    let path = percent_decode(uri.path().trim_start_matches('/'));
     let Some(key) = path.strip_prefix(BUCKET).map(|k| k.trim_start_matches('/').to_string()) else {
-        return error(404, "NoSuchBucket");
+        return xml_error_response(404, "NoSuchBucket");
     };
     let header = |h: header::HeaderName| headers.get(h).and_then(|v| v.to_str().ok()).map(str::to_string);
     let mut g = s.inner.lock().unwrap();
     if key.is_empty() {
-        let q = query(uri);
+        let q = parse_query(uri);
         if *method == Method::POST && q.contains_key("delete") {
             return delete_objects(&mut g, &body);
         }
@@ -206,12 +196,12 @@ fn serve(s: &FakeS3, method: &Method, uri: &Uri, headers: &HeaderMap, body: Byte
         Method::PUT => {
             let cur = g.objects.get(&key).map(|o| o.etag.clone());
             if header(header::IF_NONE_MATCH).as_deref() == Some("*") && cur.is_some() {
-                return error(412, "PreconditionFailed");
+                return xml_error_response(412, "PreconditionFailed");
             }
             if let Some(want) = header(header::IF_MATCH) {
                 match cur {
-                    None => return error(404, "NoSuchKey"),
-                    Some(c) if c != want => return error(412, "PreconditionFailed"),
+                    None => return xml_error_response(404, "NoSuchKey"),
+                    Some(c) if c != want => return xml_error_response(412, "PreconditionFailed"),
                     _ => {}
                 }
             }
@@ -223,10 +213,10 @@ fn serve(s: &FakeS3, method: &Method, uri: &Uri, headers: &HeaderMap, body: Byte
         }
         Method::DELETE => {
             g.objects.remove(&key);
-            status(204, "")
+            response_with_status(204, "")
         }
         Method::GET | Method::HEAD => {
-            let Some(o) = g.objects.get(&key) else { return error(404, "NoSuchKey") };
+            let Some(o) = g.objects.get(&key) else { return xml_error_response(404, "NoSuchKey") };
             let size = o.data.len() as u64;
             if header(header::IF_NONE_MATCH).as_deref() == Some(o.etag.as_str()) {
                 return Response::builder().status(304).header(header::ETAG, &o.etag).body(Body::empty()).unwrap();
@@ -240,7 +230,7 @@ fn serve(s: &FakeS3, method: &Method, uri: &Uri, headers: &HeaderMap, body: Byte
                     let (a, z) = r.trim_start_matches("bytes=").split_once('-').unwrap();
                     let (a, z): (u64, u64) = (a.parse().unwrap(), z.parse().unwrap());
                     if a >= size {
-                        return error(416, "InvalidRange");
+                        return xml_error_response(416, "InvalidRange");
                     }
                     let z = z.min(size - 1);
                     b.status(206)
@@ -251,11 +241,10 @@ fn serve(s: &FakeS3, method: &Method, uri: &Uri, headers: &HeaderMap, body: Byte
                 }
             }
         }
-        _ => error(405, "MethodNotAllowed"),
+        _ => xml_error_response(405, "MethodNotAllowed"),
     }
 }
 
-/// `DeleteObjects`, which `object_store` uses for single deletes as well.
 fn delete_objects(g: &mut Inner, body: &[u8]) -> Response {
     let body = String::from_utf8_lossy(body);
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult>");
@@ -272,7 +261,7 @@ fn delete_objects(g: &mut Inner, body: &[u8]) -> Response {
 fn list(g: &Inner, q: &BTreeMap<String, String>) -> Response {
     let prefix = q.get("prefix").cloned().unwrap_or_default();
     let after = q.get("continuation-token").or(q.get("start-after")).cloned().unwrap_or_default();
-    let max = q.get("max-keys").and_then(|m| m.parse().ok()).unwrap_or(PAGE).min(PAGE);
+    let max = q.get("max-keys").and_then(|m| m.parse().ok()).unwrap_or(MAX_LIST_KEYS).min(MAX_LIST_KEYS);
     let keys: Vec<(&String, &Obj)> =
         g.objects.range(after.clone()..).filter(|(k, _)| **k > after && k.starts_with(&prefix)).take(max + 1).collect();
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>");

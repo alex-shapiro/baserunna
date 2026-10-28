@@ -1,52 +1,41 @@
 # TODO
 
-Planned work, ordered by priority within each section. Blockers are
-correctness or security gaps that must be closed before v1; everything else
-can ship after it. See [`SPEC.md`](SPEC.md) §15 (known limitations) and §16
-(future work) for design context.
-
-## Blockers
-
-None are known.
+Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
+§15 (known limitations) and §16 (future work) for design context.
 
 ## Reliability and operations
 
-- [ ] **Stop store-time callers from waiting on clock probes.**
-      `StoreClock::sync` acquires its lock before checking whether the
-      measurement is stale, so every `store_time_ms` caller (stream appends,
-      TTL writes, blob uploads, and commits that bind staged blobs) waits for
-      the probe that runs every 10 minutes. A stalled probe blocks those
-      commits until its store requests time out. Check staleness before
-      locking, and time probes out at `2 × clock_sync_max_error_ms`, beyond
-      which they are discarded as imprecise.
-- [ ] **Bound store calls by the deadlines of the requests that make them.**
-      `CloudStore` times requests out after 30 s and leaves retries to
-      `Retry`, which makes up to 5 attempts, so a read or a manifest load can
-      take minutes while its client gave up after seconds. Pass the request's
-      deadline down to store calls and stop retrying once it has passed.
-- [ ] **Treat a stale-target rejection as ambiguous when forwards can be
-      duplicated.** A forwarder that receives `x-baserunna-stale-target`
-      handles the request locally on the assumption that it never ran, but a
-      duplicated copy of the forward can have run on the target's previous
-      process. The simulator's duplicating network shows the request running
-      twice (`sim_tool trace tables 7344`: a unique-row insert answers
-      `409 already_exists` for its own write). The production HTTP transport
-      never duplicates a request, so only deployments behind retrying proxies
-      are exposed. Handle a stale-target rejection locally only if the forward
-      was sent once, and answer `outcome: "unknown"` otherwise.
-- [ ] **Share the memory budget fairly across users.** One user's interactive
-      transactions can hold a node's whole memory budget for up to their 5
-      minute lifetime, so that other users' transactions on that node are
-      refused meanwhile (SPEC §5.12). Reserve a share of the budget per active
-      user, or refuse the user holding the most memory first.
-- [ ] **End a deleted database's interactive transactions.** Transactions on a
-      deleted database stay open until they idle out (30 s), counting against
-      their user's 100-transaction cap and holding memory.
+- [ ] **Check store-clock staleness before acquiring the probe lock.**
+      `StoreClock::sync` acquires its mutex before checking whether the
+      measurement is stale, causing `store_time_ms` callers (stream appends,
+      TTL writes, blob uploads, and commits that bind staged blobs) to wait for
+      in-flight probes. Check staleness before locking, and bound probe
+      duration to `2 × clock_sync_max_error_ms`.
+- [ ] **Propagate request deadlines to object-store operations.**
+      `CloudStore` uses a 30 s per-request timeout and `Retry` makes up to 5
+      attempts, so a read or manifest load can continue after the client timed
+      out. Pass the request deadline to store operations and stop retrying
+      after the deadline expires.
+- [ ] **Report `outcome: "unknown"` on stale-target rejections if a forward was
+      retried.** If a node receives `x-baserunna-stale-target`, it executes the
+      request locally, assuming the peer never executed it. If a proxy or
+      network duplicated the forwarded request, an earlier copy could have been
+      executed by the peer's previous process (`sim_tool trace tables 7344`).
+      Execute locally only if the forward was sent once; otherwise return
+      `outcome: "unknown"`.
+- [ ] **Enforce per-user fairness for the node memory budget.** A single user's
+      interactive transactions can consume a node's entire memory budget for up
+      to 5 minutes, causing other users' interactive transactions on that node
+      to be rejected (SPEC §5.12). Reserve a budget share per active user or
+      evict transactions from the user holding the most memory.
+- [ ] **Abort open interactive transactions if a database is deleted.**
+      Interactive transactions on a deleted database currently remain open
+      until their 30 s idle timeout expires, consuming memory and counting
+      against the 100-transaction per-user limit.
 - [ ] **Test Google OAuth against Google's production endpoints.** Only
-      `FakeGoogle` is tested. Refetch the JWKS when an ID token names an
-      unknown `kid` instead of waiting for the 1-hour cache to expire. Add
-      PKCE (`code_verifier`) and an OIDC `nonce` as defense in depth; `state`
-      is already bound to a signed cookie.
+      `FakeGoogle` is tested in simulation. Refresh the cached JWKS if an ID
+      token contains an unknown `kid` instead of waiting for the 1-hour cache
+      TTL, and add PKCE (`code_verifier`) and an OIDC `nonce`.
 - [ ] **Prometheus metrics endpoint.** Expose `/metrics` in Prometheus text
       format including the histograms from `/v1/admin/metrics`, object-store
       byte counters, CAS conflicts, lease acquisitions and steals, cache hit
@@ -80,12 +69,10 @@ None are known.
 - [ ] **Flush idle database tails to reduce next-commit manifest size.**
       Flushing a non-empty tail after a database becomes idle reduces the size
       of the next manifest `PUT` at the cost of an extra segment `PUT`.
-- [ ] **Shrink in-memory tail entries.** An `Entry` takes 144 bytes before its
-      key and value because `Value` stores a `BlobRef` (two strings and a
-      digest) inline, so a tail of 100-byte values takes about twice its
-      encoded size in memory (`tests/memory_bound.rs`). Boxing `BlobRef`
-      shrinks `Entry` to 96 bytes, so the memory budget holds 20–35% more
-      databases whose tails hold small values.
+- [ ] **Box `BlobRef` in `Value` to reduce in-memory tail entry size.** `Entry`
+      currently occupies 144 bytes on the stack because `Value` stores
+      `BlobRef` inline. Boxing `BlobRef` shrinks `Entry` to 96 bytes and
+      reduces memory usage for tails with small inline values by 20–35%.
 - [ ] **Keep the manifest tail as a sorted vector across a batch.** Commit
       batches currently move the manifest tail into a `BTreeMap` and back into
       a `Vec` on every commit. Merging sorted batch writes into the sorted tail
@@ -127,11 +114,9 @@ None are known.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`, and publish the Rust `client` module as a standalone
       crate.
-- [ ] **Support object stores beyond Tigris.** Run the object-store
-      conformance suite against S3, GCS, Azure, R2, and MinIO before listing
-      each as supported. GCS conditional writes use object generations rather
-      than etags, so `CloudStore`'s etag handling needs GCS-specific coverage.
-
+- [ ] **Validate additional S3-compatible object stores.** Run the conformance
+      suite and failover check against AWS S3, Cloudflare R2, MinIO, Azure Blob
+      Storage, and Google Cloud Storage.
 - [ ] **Support idempotency keys for raw KV writes.** Accept an
       `Idempotency-Key` header on `PUT` and `DELETE /v1/dbs/{db}/kv/{key}` and
       return the commit ID in a response header so clients can resolve

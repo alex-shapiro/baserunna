@@ -1,15 +1,11 @@
-//! Checked failover workload on a real object store.
+//! Failover workload and consistency checker for a live object store.
 //!
-//! Runs several nodes on one store and, while killing and restarting them, drives counter
-//! increments and bank transfers through random nodes. Every write carries an idempotency
-//! key or commit ID, so its outcome is settled even when a node dies mid-request. The check
-//! fails if a committed write is missing or applied twice, if a strong read through any node
-//! disagrees with the settled writes, or if transfers do not conserve the bank's total.
+//! Runs multiple nodes against a shared store while killing and restarting nodes at random.
+//! Concurrent workers execute counter increments with idempotency keys and bank transfers with
+//! commit IDs across random nodes, then verify that all committed writes are durable, strong reads
+//! observe all settled writes, and total account balances remain constant.
 //!
 //! Run: `BASERUNNA_STORE=s3://bucket[/prefix] cargo run --release --example cluster_check -- [seconds]`
-//!
-//! The check writes under a fresh prefix of the store and deletes it afterwards. Without
-//! `BASERUNNA_STORE` (or with `mem:`), the nodes share an in-process store.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -26,7 +22,7 @@ const NODES: usize = 3;
 const COUNTERS: usize = 4;
 const TELLERS: usize = 2;
 const ACCOUNTS: usize = 5;
-const INITIAL: i64 = 100;
+const INITIAL_BALANCE: i64 = 100;
 const DB: &str = "check";
 
 struct Cluster {
@@ -46,8 +42,7 @@ impl Cluster {
         (x ^ (x >> 31)) % n
     }
 
-    /// A client of a random live node.
-    fn client(&self) -> Client {
+    fn random_client(&self) -> Client {
         let urls: Vec<String> = self.urls.lock().unwrap().iter().flatten().cloned().collect();
         let url = &urls[self.random(urls.len() as u64) as usize];
         Client::new(url).with_token(&self.token.lock().unwrap())
@@ -68,20 +63,18 @@ impl Cluster {
     }
 }
 
-/// Sends a request through a random node, giving up after 20 s.
-async fn call(c: &Cluster, method: &str, path: &str, body: Option<Value>) -> Result<Value, ApiError> {
-    let client = c.client();
+async fn send_request(c: &Cluster, method: &str, path: &str, body: Option<Value>) -> Result<Value, ApiError> {
+    let client = c.random_client();
     match tokio::time::timeout(Duration::from_secs(20), client.call(method, path, body)).await {
         Ok(r) => r,
         Err(_) => Err(ApiError { status: 0, code: "timeout".into(), message: "timed out".into(), body: Value::Null }),
     }
 }
 
-/// Retries a request until it succeeds or fails without being retryable.
-async fn settle(c: &Cluster, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+async fn call_with_retry(c: &Cluster, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
     let started = Instant::now();
     loop {
-        match call(c, method, path, body.clone()).await {
+        match send_request(c, method, path, body.clone()).await {
             Ok(v) => return Ok(v),
             Err(e) if e.status == 0 || e.retryable() || e.status == 503 => {
                 if started.elapsed() > Duration::from_secs(120) {
@@ -94,10 +87,8 @@ async fn settle(c: &Cluster, method: &str, path: &str, body: Option<Value>) -> R
     }
 }
 
-/// Settles a write's outcome through its commit status, which aborts the write if it has not
-/// committed.
-async fn committed(c: &Cluster, id: &str) -> Result<bool, String> {
-    let v = settle(c, "GET", &format!("/v1/dbs/{DB}/commits/{id}"), None).await?;
+async fn resolve_commit(c: &Cluster, id: &str) -> Result<bool, String> {
+    let v = call_with_retry(c, "GET", &format!("/v1/dbs/{DB}/commits/{id}"), None).await?;
     match v["status"].as_str() {
         Some("committed") => Ok(true),
         Some("not_committed") => Ok(false),
@@ -105,25 +96,29 @@ async fn committed(c: &Cluster, id: &str) -> Result<bool, String> {
     }
 }
 
-fn number(v: &Value) -> Option<i64> {
+fn parse_i64(v: &Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str()?.parse().ok())
 }
 
 async fn strong_get(c: &Cluster, key: &str) -> Result<Option<i64>, ApiError> {
-    let r = call(c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(json!({"ops": [{"op": "get", "key": key}]}))).await?;
-    Ok(number(&r["results"][0]["value"]))
+    let r = send_request(c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(json!({"ops": [{"op": "get", "key": key}]})))
+        .await?;
+    Ok(parse_i64(&r["results"][0]["value"]))
 }
 
 #[derive(Default)]
-struct Tally {
+struct Stats {
     commits: AtomicU64,
     unknown: AtomicU64,
     reads: AtomicU64,
 }
 
-/// Increments counter `w{i}` with idempotency keys and checks every strong read against the
-/// settled count. Returns the sequence numbers of committed increments.
-async fn counter(c: Arc<Cluster>, i: usize, stop: Arc<AtomicBool>, t: Arc<Tally>) -> Result<BTreeSet<u64>, String> {
+async fn increment_worker(
+    c: Arc<Cluster>,
+    i: usize,
+    stop: Arc<AtomicBool>,
+    t: Arc<Stats>,
+) -> Result<BTreeSet<u64>, String> {
     let mut done = BTreeSet::new();
     let mut n = 0;
     while !stop.load(SeqCst) {
@@ -133,12 +128,12 @@ async fn counter(c: Arc<Cluster>, i: usize, stop: Arc<AtomicBool>, t: Arc<Tally>
             "ops": [{"op": "increment", "key": format!("w{i}"), "by": 1}, {"op": "put", "key": format!("log/w{i}/{n:06}"), "value": "1"}],
             "idempotency_key": key,
         });
-        let applied = match call(&c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(body)).await {
+        let applied = match send_request(&c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(body)).await {
             Ok(r) if r["committed"] == true => true,
             Ok(r) => return Err(format!("increment {key} was not committed: {r}")),
             Err(_) => {
                 t.unknown.fetch_add(1, SeqCst);
-                committed(&c, &format!("key:{key}")).await?
+                resolve_commit(&c, &format!("key:{key}")).await?
             }
         };
         if applied {
@@ -156,43 +151,44 @@ async fn counter(c: Arc<Cluster>, i: usize, stop: Arc<AtomicBool>, t: Arc<Tally>
     Ok(done)
 }
 
-fn acct(i: usize) -> String {
+fn account_key(i: usize) -> String {
     format!("acct/{i}")
 }
 
-/// Moves money between random accounts in interactive serializable transactions.
-async fn teller(c: Arc<Cluster>, stop: Arc<AtomicBool>, t: Arc<Tally>) -> Result<(), String> {
+async fn transfer_worker(c: Arc<Cluster>, stop: Arc<AtomicBool>, t: Arc<Stats>) -> Result<(), String> {
     let base = format!("/v1/dbs/{DB}");
     while !stop.load(SeqCst) {
         let (a, b) = (c.random(ACCOUNTS as u64) as usize, c.random(ACCOUNTS as u64) as usize);
         if a == b {
             continue;
         }
-        let reads = json!([{"op": "get", "key": acct(a)}, {"op": "get", "key": acct(b)}]);
-        let Ok(r) = call(&c, "POST", &format!("{base}/transactions"), Some(json!({"ops": reads}))).await else {
+        let reads = json!([{"op": "get", "key": account_key(a)}, {"op": "get", "key": account_key(b)}]);
+        let Ok(r) = send_request(&c, "POST", &format!("{base}/transactions"), Some(json!({"ops": reads}))).await else {
             continue;
         };
         let (id, cid) =
             (r["txn_id"].as_str().unwrap_or("").to_string(), r["commit_id"].as_str().unwrap_or("").to_string());
-        let (Some(ba), Some(bb)) = (number(&r["results"][0]["value"]), number(&r["results"][1]["value"])) else {
+        let (Some(ba), Some(bb)) = (parse_i64(&r["results"][0]["value"]), parse_i64(&r["results"][1]["value"])) else {
             return Err(format!("missing balances: {r}"));
         };
         let amount = 1 + c.random(20) as i64;
         if ba < amount {
-            let _ = call(&c, "DELETE", &format!("{base}/transactions/{id}"), None).await;
+            let _ = send_request(&c, "DELETE", &format!("{base}/transactions/{id}"), None).await;
             continue;
         }
         let writes = json!([
-            {"op": "put", "key": acct(a), "value": (ba - amount).to_string()},
-            {"op": "put", "key": acct(b), "value": (bb + amount).to_string()},
+            {"op": "put", "key": account_key(a), "value": (ba - amount).to_string()},
+            {"op": "put", "key": account_key(b), "value": (bb + amount).to_string()},
         ]);
         let applied =
-            match call(&c, "POST", &format!("{base}/transactions/{id}/commit"), Some(json!({"ops": writes}))).await {
+            match send_request(&c, "POST", &format!("{base}/transactions/{id}/commit"), Some(json!({"ops": writes})))
+                .await
+            {
                 Ok(_) => true,
                 Err(e) if e.status == 409 || e.status == 404 => false,
                 Err(e) if e.status == 0 || e.status == 503 || e.retryable() => {
                     t.unknown.fetch_add(1, SeqCst);
-                    committed(&c, &cid).await?
+                    resolve_commit(&c, &cid).await?
                 }
                 Err(e) => return Err(format!("commit failed: {e}")),
             };
@@ -203,35 +199,37 @@ async fn teller(c: Arc<Cluster>, stop: Arc<AtomicBool>, t: Arc<Tally>) -> Result
     Ok(())
 }
 
-async fn balances(c: &Cluster) -> Result<Vec<i64>, String> {
+async fn read_balances(c: &Cluster) -> Result<Vec<i64>, String> {
     let body = json!({"ops": [{"op": "scan", "prefix": "acct/", "limit": 100}]});
-    let r = settle(c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(body)).await?;
+    let r = call_with_retry(c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(body)).await?;
     let items = r["results"][0]["items"].as_array().ok_or_else(|| format!("bad scan: {r}"))?;
-    Ok(items.iter().map(|it| number(&it["value"]).unwrap_or(i64::MIN)).collect())
+    Ok(items.iter().map(|it| parse_i64(&it["value"]).unwrap_or(i64::MIN)).collect())
 }
 
-fn audit(b: &[i64]) -> Result<(), String> {
-    if b.len() != ACCOUNTS || b.iter().sum::<i64>() != INITIAL * ACCOUNTS as i64 || b.iter().any(|x| *x < 0) {
-        return Err(format!("balances {b:?} do not conserve {} in {ACCOUNTS} accounts", INITIAL * ACCOUNTS as i64));
+fn verify_balances(b: &[i64]) -> Result<(), String> {
+    if b.len() != ACCOUNTS || b.iter().sum::<i64>() != INITIAL_BALANCE * ACCOUNTS as i64 || b.iter().any(|x| *x < 0) {
+        return Err(format!(
+            "balances {b:?} do not conserve {} in {ACCOUNTS} accounts",
+            INITIAL_BALANCE * ACCOUNTS as i64
+        ));
     }
     Ok(())
 }
 
-async fn auditor(c: Arc<Cluster>, stop: Arc<AtomicBool>, t: Arc<Tally>) -> Result<(), String> {
+async fn audit_worker(c: Arc<Cluster>, stop: Arc<AtomicBool>, t: Arc<Stats>) -> Result<(), String> {
     while !stop.load(SeqCst) {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let body = json!({"ops": [{"op": "scan", "prefix": "acct/", "limit": 100}]});
-        if let Ok(r) = call(&c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(body)).await {
+        if let Ok(r) = send_request(&c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(body)).await {
             let items = r["results"][0]["items"].as_array().cloned().unwrap_or_default();
-            audit(&items.iter().map(|it| number(&it["value"]).unwrap_or(i64::MIN)).collect::<Vec<_>>())?;
+            verify_balances(&items.iter().map(|it| parse_i64(&it["value"]).unwrap_or(i64::MIN)).collect::<Vec<_>>())?;
             t.reads.fetch_add(1, SeqCst);
         }
     }
     Ok(())
 }
 
-/// Kills a random node every few seconds and starts a replacement shortly after.
-async fn chaos(c: Arc<Cluster>, stop: Arc<AtomicBool>) {
+async fn kill_and_restart_nodes(c: Arc<Cluster>, stop: Arc<AtomicBool>) {
     while !stop.load(SeqCst) {
         tokio::time::sleep(Duration::from_millis(3_000 + c.random(4_000))).await;
         if stop.load(SeqCst) {
@@ -244,7 +242,7 @@ async fn chaos(c: Arc<Cluster>, stop: Arc<AtomicBool>) {
     }
 }
 
-async fn check(c: Arc<Cluster>, seconds: u64) -> Result<(), String> {
+async fn run_check(c: Arc<Cluster>, seconds: u64) -> Result<(), String> {
     for slot in 0..NODES {
         c.start(slot).await;
     }
@@ -252,18 +250,20 @@ async fn check(c: Arc<Cluster>, seconds: u64) -> Result<(), String> {
     let user = first.signup("check@example.com", "cluster-check-1").await.map_err(|e| e.to_string())?;
     *c.token.lock().unwrap() = user.token().unwrap_or_default().to_string();
     user.create_db(DB).await.map_err(|e| e.to_string())?;
-    let init: Vec<Value> =
-        (0..ACCOUNTS).map(|i| json!({"op": "put", "key": acct(i), "value": INITIAL.to_string()})).collect();
-    settle(&c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(json!({"ops": init, "idempotency_key": "init"}))).await?;
+    let init: Vec<Value> = (0..ACCOUNTS)
+        .map(|i| json!({"op": "put", "key": account_key(i), "value": INITIAL_BALANCE.to_string()}))
+        .collect();
+    call_with_retry(&c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(json!({"ops": init, "idempotency_key": "init"})))
+        .await?;
     tokio::time::sleep(Duration::from_millis(1_500)).await;
 
-    let (stop, tally) = (Arc::new(AtomicBool::new(false)), Arc::new(Tally::default()));
+    let (stop, tally) = (Arc::new(AtomicBool::new(false)), Arc::new(Stats::default()));
     let counters: Vec<_> =
-        (0..COUNTERS).map(|i| tokio::spawn(counter(c.clone(), i, stop.clone(), tally.clone()))).collect();
+        (0..COUNTERS).map(|i| tokio::spawn(increment_worker(c.clone(), i, stop.clone(), tally.clone()))).collect();
     let mut others: Vec<_> =
-        (0..TELLERS).map(|_| tokio::spawn(teller(c.clone(), stop.clone(), tally.clone()))).collect();
-    others.push(tokio::spawn(auditor(c.clone(), stop.clone(), tally.clone())));
-    let chaos = tokio::spawn(chaos(c.clone(), stop.clone()));
+        (0..TELLERS).map(|_| tokio::spawn(transfer_worker(c.clone(), stop.clone(), tally.clone()))).collect();
+    others.push(tokio::spawn(audit_worker(c.clone(), stop.clone(), tally.clone())));
+    let chaos = tokio::spawn(kill_and_restart_nodes(c.clone(), stop.clone()));
     tokio::time::sleep(Duration::from_secs(seconds)).await;
     stop.store(true, SeqCst);
     let _ = chaos.await;
@@ -289,7 +289,7 @@ async fn check(c: Arc<Cluster>, seconds: u64) -> Result<(), String> {
         let mut cursor = Value::Null;
         loop {
             let scan = json!({"op": "scan", "prefix": format!("log/w{i}/"), "limit": 1000, "keys_only": true, "cursor": cursor});
-            let r = settle(&c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(json!({"ops": [scan]}))).await?;
+            let r = call_with_retry(&c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(json!({"ops": [scan]}))).await?;
             let page = &r["results"][0];
             for it in page["items"].as_array().into_iter().flatten() {
                 logged.extend(it["key"].as_str().and_then(|k| k.rsplit('/').next()?.parse::<u64>().ok()));
@@ -305,7 +305,7 @@ async fn check(c: Arc<Cluster>, seconds: u64) -> Result<(), String> {
             return Err(format!("w{i}: committed increments {missing:?} are missing and {extra:?} were not committed"));
         }
     }
-    audit(&balances(&c).await?)?;
+    verify_balances(&read_balances(&c).await?)?;
     println!(
         "ok: {} commits ({} with unknown outcomes, settled), {} checked reads, {} node kills",
         tally.commits.load(SeqCst),
@@ -343,7 +343,7 @@ async fn main() {
         rng: AtomicU64::new(nonce as u64),
         kills: AtomicU64::new(0),
     });
-    let result = check(c.clone(), seconds).await;
+    let result = run_check(c.clone(), seconds).await;
     for slot in 0..NODES {
         c.kill(slot);
     }

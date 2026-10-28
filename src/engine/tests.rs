@@ -42,7 +42,6 @@ enum Op {
     Advance(u64),
     Sweep,
     Feed(usize, usize),
-    /// Drops the cached manifest, as memory pressure would.
     Unload,
 }
 

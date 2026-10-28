@@ -114,12 +114,11 @@ impl Value {
         matches!(self, Value::Tombstone)
     }
 
-    /// Heap bytes held by the value, beyond the `Value` itself.
     pub fn heap_bytes(&self) -> usize {
-        use super::memory::heap;
+        use super::memory::alloc_bytes;
         match self {
-            Value::Inline(b) => heap(b.len()),
-            Value::Blob(r) => heap(r.id.len()) + heap(r.content_type.len()),
+            Value::Inline(b) => alloc_bytes(b.len()),
+            Value::Blob(r) => alloc_bytes(r.id.len()) + alloc_bytes(r.content_type.len()),
             Value::Tombstone => 0,
         }
     }

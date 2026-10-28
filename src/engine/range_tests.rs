@@ -332,7 +332,7 @@ fn sweeps_recount_blob_bytes() {
 }
 
 #[test]
-fn exempt_databases_have_no_quota() {
+fn system_databases_are_exempt_from_quota() {
     let (eng, _store) = quota_engine(10);
     eng.mark_system("sys");
     assert_eq!(eng.db("sys").quota(), None);

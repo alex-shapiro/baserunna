@@ -1,8 +1,8 @@
-//! Object-store conformance: the contract checks of `baserunna::store::conformance` against
-//! every store implementation, `CloudStore` against an in-process S3 endpoint, and a live
-//! store when `BASERUNNA_TEST_STORE` names one (`s3://bucket[/prefix]`, with `AWS_*`
-//! credentials in the environment). Deliberately broken stores show that each check catches
-//! the violation it targets.
+//! Object-store conformance tests.
+//!
+//! Runs `baserunna::store::conformance` against `MemStore`, `FsStore`, `CloudStore` backed by an
+//! in-process S3 server, and a live S3 store if `BASERUNNA_TEST_STORE` is set. Also verifies that
+//! each conformance check detects its corresponding contract violation.
 
 #[path = "support/fake_s3.rs"]
 mod fake_s3;
@@ -19,18 +19,18 @@ fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
 }
 
-fn mem() -> DynStore {
+fn mem_store() -> DynStore {
     Arc::new(MemStore::with_system_clock())
 }
 
-fn fast() -> Config {
+fn fast_config() -> Config {
     Config { model_ops: 300, racers: 6, race_rounds: 3, ..Config::default() }
 }
 
 #[test]
 fn mem_store_conforms() {
-    let s = mem();
-    let passed = rt().block_on(conformance::run(s.clone(), s, &fast())).unwrap();
+    let s = mem_store();
+    let passed = rt().block_on(conformance::run(s.clone(), s, &fast_config())).unwrap();
     assert_eq!(passed.len(), 12, "{passed:?}");
 }
 
@@ -39,7 +39,7 @@ fn fs_store_conforms() {
     let dir = std::env::temp_dir().join(format!("baserunna-conformance-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let s: DynStore = Arc::new(FsStore::new(&dir).unwrap());
-    rt().block_on(conformance::run(s.clone(), s, &fast())).unwrap();
+    rt().block_on(conformance::run(s.clone(), s, &fast_config())).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -57,7 +57,7 @@ fn model_sequences_agree_on_mem_and_fs_stores() {
         |seed| {
             let cfg = Config { seed: *seed, model_ops: 250, ..Config::default() };
             rt.block_on(async {
-                for s in [mem(), fs.clone()] {
+                for s in [mem_store(), fs.clone()] {
                     conformance::run_checks(s.clone(), s, &cfg, &["model"]).await?;
                 }
                 Ok(())
@@ -78,7 +78,7 @@ fn cloud_store_conforms_against_an_s3_endpoint() {
     rt().block_on(async {
         let s3 = FakeS3::start().await;
         let (a, b) = (fake_store(&s3, "ns", &[]), fake_store(&s3, "ns", &[]));
-        conformance::run(a, b, &fast()).await.unwrap();
+        conformance::run(a, b, &fast_config()).await.unwrap();
     });
 }
 
@@ -89,35 +89,35 @@ fn cloud_store_reports_failed_conditional_writes_as_ambiguous_without_retrying()
         let s = fake_store(&s3, "", &[]);
         let e1 = s.put("m", Bytes::from_static(b"v1"), PutMode::Create).await.unwrap();
 
-        s3.fault(Method::PUT, Fault::ApplyThenFail(500));
-        let before = s3.requests(&Method::PUT);
+        s3.inject_fault(Method::PUT, Fault::ApplyThenFail(500));
+        let before = s3.request_count(&Method::PUT);
         let r = s.put("m", Bytes::from_static(b"v2"), PutMode::IfMatch(e1.clone())).await;
         assert!(matches!(r, Err(StoreError::Unavailable(_))), "an applied write that answered 500 returned {r:?}");
-        assert_eq!(s3.requests(&Method::PUT) - before, 1, "the conditional write was retried");
-        assert_eq!(s3.data("m").as_deref(), Some(&b"v2"[..]));
+        assert_eq!(s3.request_count(&Method::PUT) - before, 1, "the conditional write was retried");
+        assert_eq!(s3.get_data("m").as_deref(), Some(&b"v2"[..]));
 
-        s3.fault(Method::PUT, Fault::Fail(503));
+        s3.inject_fault(Method::PUT, Fault::Fail(503));
         let r = s.put("m", Bytes::from_static(b"v3"), PutMode::IfMatch(e1)).await;
         assert!(matches!(r, Err(StoreError::Unavailable(_))), "503 returned {r:?}");
 
-        s3.fault(Method::PUT, Fault::Fail(409));
+        s3.inject_fault(Method::PUT, Fault::Fail(409));
         let cur = s.get("m", GetOpts::default()).await.unwrap().etag;
         let r = s.put("m", Bytes::from_static(b"v4"), PutMode::IfMatch(cur)).await;
         assert_eq!(r, Err(StoreError::PreconditionFailed), "a conflicting conditional write");
 
-        s3.fault(Method::GET, Fault::Fail(500));
-        let before = s3.requests(&Method::GET);
+        s3.inject_fault(Method::GET, Fault::Fail(500));
+        let before = s3.request_count(&Method::GET);
         let r = s.get("m", GetOpts::default()).await.map(|g| g.data);
         assert!(matches!(r, Err(StoreError::Unavailable(_))), "500 on get returned {r:?}");
-        assert_eq!(s3.requests(&Method::GET) - before, 1, "the get was retried");
+        assert_eq!(s3.request_count(&Method::GET) - before, 1, "the get was retried");
 
-        s3.fault(Method::GET, Fault::Fail(403));
+        s3.inject_fault(Method::GET, Fault::Fail(403));
         let r = s.get("m", GetOpts::default()).await.map(|g| g.data);
         assert!(matches!(r, Err(StoreError::Fatal(_))), "403 returned {r:?}");
-        s3.fault(Method::GET, Fault::Fail(400));
+        s3.inject_fault(Method::GET, Fault::Fail(400));
         let r = s.get("m", GetOpts::default()).await.map(|g| g.data);
         assert!(matches!(r, Err(StoreError::Fatal(_))), "400 returned {r:?}");
-        s3.fault(Method::GET, Fault::Fail(429));
+        s3.inject_fault(Method::GET, Fault::Fail(429));
         let r = s.get("m", GetOpts::default()).await.map(|g| g.data);
         assert!(matches!(r, Err(StoreError::Unavailable(_))), "429 returned {r:?}");
     });
@@ -129,7 +129,7 @@ fn cloud_store_requests_time_out() {
         let s3 = FakeS3::start().await;
         let s = fake_store(&s3, "", &[("timeout", "300ms")]);
         s.put("k", Bytes::from_static(b"v"), PutMode::Overwrite).await.unwrap();
-        s3.fault(Method::GET, Fault::Delay(Duration::from_secs(5)));
+        s3.inject_fault(Method::GET, Fault::Delay(Duration::from_secs(5)));
         let t = std::time::Instant::now();
         let r = s.get("k", GetOpts::default()).await.map(|g| g.data);
         assert!(matches!(r, Err(StoreError::Unavailable(_))), "a stalled get returned {r:?}");
@@ -137,8 +137,7 @@ fn cloud_store_requests_time_out() {
     });
 }
 
-/// A live store from `BASERUNNA_TEST_STORE`, in a fresh prefix, through two clients.
-fn live() -> Option<(DynStore, DynStore)> {
+fn live_store_pair() -> Option<(DynStore, DynStore)> {
     let url = std::env::var("BASERUNNA_TEST_STORE").ok().filter(|u| !u.is_empty())?;
     let run = format!(
         "{}/conformance-{}-{}",
@@ -152,7 +151,7 @@ fn live() -> Option<(DynStore, DynStore)> {
 
 #[test]
 fn live_store_conforms() {
-    let Some((a, b)) = live() else {
+    let Some((a, b)) = live_store_pair() else {
         eprintln!("skipped: BASERUNNA_TEST_STORE is not set");
         return;
     };
@@ -161,38 +160,31 @@ fn live_store_conforms() {
     eprintln!("live store passed {passed:?}");
 }
 
-/// A [`MemStore`] with one deliberate contract violation.
-struct Broken {
+struct FaultyStore {
     inner: MemStore,
-    flaw: Flaw,
+    violation: Violation,
     written: Mutex<std::collections::BTreeMap<String, std::time::Instant>>,
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Flaw {
-    /// Treats every write as unconditional.
-    IgnoresPreconditions,
-    /// Checks a precondition, then writes, without atomicity.
-    NonAtomicConditions,
-    /// Leaves objects out of listings for a while after each write.
+enum Violation {
+    IgnorePreconditions,
+    NonAtomicPreconditions,
     StaleListings,
-    /// Stamps writes an hour in the future.
     SkewedClock,
-    /// Returns etags from `put` in a different form than `get`.
-    UnquotedPutEtags,
-    /// Ignores byte ranges.
-    IgnoresRanges,
+    MismatchedPutEtag,
+    IgnoreByteRanges,
 }
 
-impl ObjectStore for Broken {
+impl ObjectStore for FaultyStore {
     fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
         Box::pin(async move {
             let mut opts = opts;
-            if matches!(self.flaw, Flaw::IgnoresRanges) {
+            if matches!(self.violation, Violation::IgnoreByteRanges) {
                 opts.range = None;
             }
             let mut g = self.inner.get_sync(key, &opts)?;
-            if matches!(self.flaw, Flaw::SkewedClock) {
+            if matches!(self.violation, Violation::SkewedClock) {
                 g.last_modified_ms += 3_600_000;
             }
             Ok(g)
@@ -202,9 +194,9 @@ impl ObjectStore for Broken {
     fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
         Box::pin(async move {
             self.written.lock().unwrap().insert(key.to_string(), std::time::Instant::now());
-            let mode = match (self.flaw, mode) {
-                (Flaw::IgnoresPreconditions, _) => PutMode::Overwrite,
-                (Flaw::NonAtomicConditions, mode) => {
+            let mode = match (self.violation, mode) {
+                (Violation::IgnorePreconditions, _) => PutMode::Overwrite,
+                (Violation::NonAtomicPreconditions, mode) => {
                     let cur = self.inner.get_sync(key, &GetOpts::default()).ok().map(|g| g.etag);
                     let ok = match &mode {
                         PutMode::Overwrite => true,
@@ -220,8 +212,8 @@ impl ObjectStore for Broken {
                 (_, mode) => mode,
             };
             let etag = self.inner.put_sync(key, data, &mode)?;
-            Ok(match self.flaw {
-                Flaw::UnquotedPutEtags => format!("{etag}-unquoted"),
+            Ok(match self.violation {
+                Violation::MismatchedPutEtag => format!("{etag}-unquoted"),
                 _ => etag,
             })
         })
@@ -237,7 +229,7 @@ impl ObjectStore for Broken {
     fn list<'a>(&'a self, prefix: &'a str, after: Option<&'a str>, limit: usize) -> BoxFut<'a, SResult<ListPage>> {
         Box::pin(async move {
             let mut page = self.inner.list_sync(prefix, after, limit);
-            if matches!(self.flaw, Flaw::StaleListings) {
+            if matches!(self.violation, Violation::StaleListings) {
                 let w = self.written.lock().unwrap();
                 page.objects.retain(|o| w.get(&o.key).is_none_or(|t| t.elapsed() > Duration::from_secs(2)));
             }
@@ -253,29 +245,33 @@ impl ObjectStore for Broken {
 #[test]
 fn each_contract_violation_is_caught() {
     let cases = [
-        (Flaw::IgnoresPreconditions, "missing_objects"),
-        (Flaw::NonAtomicConditions, "update_race"),
-        (Flaw::StaleListings, "etags_identify_writes"),
-        (Flaw::SkewedClock, "store_clock"),
-        (Flaw::UnquotedPutEtags, "create_once"),
-        (Flaw::IgnoresRanges, "ranges"),
+        (Violation::IgnorePreconditions, "missing_objects"),
+        (Violation::NonAtomicPreconditions, "update_race"),
+        (Violation::StaleListings, "etags_identify_writes"),
+        (Violation::SkewedClock, "store_clock"),
+        (Violation::MismatchedPutEtag, "create_once"),
+        (Violation::IgnoreByteRanges, "ranges"),
     ];
     let rt = rt();
-    for (flaw, check) in cases {
-        let s: DynStore =
-            Arc::new(Broken { inner: MemStore::with_system_clock(), flaw, written: Mutex::new(Default::default()) });
-        let err = rt.block_on(conformance::run(s.clone(), s, &fast())).expect_err(&format!("{flaw:?} passed"));
-        assert!(err.starts_with(&format!("{check}:")), "{flaw:?} failed {err:?}, expected {check}");
+    for (violation, check) in cases {
+        let s: DynStore = Arc::new(FaultyStore {
+            inner: MemStore::with_system_clock(),
+            violation,
+            written: Mutex::new(Default::default()),
+        });
+        let err =
+            rt.block_on(conformance::run(s.clone(), s, &fast_config())).expect_err(&format!("{violation:?} passed"));
+        assert!(err.starts_with(&format!("{check}:")), "{violation:?} failed {err:?}, expected {check}");
     }
 }
 
 #[test]
 fn preflight_rejects_stores_without_conditional_writes() {
     let rt = rt();
-    rt.block_on(conformance::preflight(mem())).unwrap();
-    let broken: DynStore = Arc::new(Broken {
+    rt.block_on(conformance::preflight(mem_store())).unwrap();
+    let broken: DynStore = Arc::new(FaultyStore {
         inner: MemStore::with_system_clock(),
-        flaw: Flaw::IgnoresPreconditions,
+        violation: Violation::IgnorePreconditions,
         written: Mutex::new(Default::default()),
     });
     let err = rt.block_on(conformance::preflight(broken.clone())).unwrap_err();

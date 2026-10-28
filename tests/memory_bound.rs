@@ -1,6 +1,4 @@
-//! Measures real heap use with a counting allocator: the memory budget's charges must cover
-//! what decoded manifests actually allocate, and a node that opens many databases with full
-//! tails, even while something holds every handle, must stay within its budget.
+//! Verifies that memory accounting matches actual heap usage using a counting global allocator.
 
 use baserunna::engine::{Consistency, Engine, EngineConfig, Isolation, KeyRange, Value};
 use baserunna::env::Env;
@@ -10,32 +8,32 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
 
-struct Counting;
+struct CountingAllocator;
 
-static LIVE: AtomicIsize = AtomicIsize::new(0);
+static ALLOCATED_BYTES: AtomicIsize = AtomicIsize::new(0);
 
-unsafe impl GlobalAlloc for Counting {
+unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        LIVE.fetch_add(l.size() as isize, Relaxed);
+        ALLOCATED_BYTES.fetch_add(l.size() as isize, Relaxed);
         unsafe { System.alloc(l) }
     }
 
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        LIVE.fetch_sub(l.size() as isize, Relaxed);
+        ALLOCATED_BYTES.fetch_sub(l.size() as isize, Relaxed);
         unsafe { System.dealloc(p, l) }
     }
 
     unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        LIVE.fetch_add(n as isize - l.size() as isize, Relaxed);
+        ALLOCATED_BYTES.fetch_add(n as isize - l.size() as isize, Relaxed);
         unsafe { System.realloc(p, l, n) }
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: Counting = Counting;
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-fn live() -> isize {
-    LIVE.load(Relaxed)
+fn allocated_bytes() -> isize {
+    ALLOCATED_BYTES.load(Relaxed)
 }
 
 const MIB: usize = 1024 * 1024;
@@ -58,32 +56,30 @@ impl World {
     }
 }
 
-/// A database shape: `entries` tail entries with keys of `key` bytes and values of `value`
-/// bytes, then `deletes` range deletions, then `flushes` commits that flush the tail into
-/// segments.
 #[derive(Clone, Copy, Debug)]
-struct Shape {
-    entries: usize,
-    key: usize,
-    value: usize,
-    deletes: usize,
+struct DbShape {
+    tail_entries: usize,
+    key_bytes: usize,
+    value_bytes: usize,
+    range_deletes: usize,
 }
 
-async fn create(eng: &Arc<Engine>, id: &str, s: Shape) {
+async fn populate_db(eng: &Arc<Engine>, id: &str, s: DbShape) {
     let db = eng.db(id);
     db.open(true).await.unwrap();
     let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-    for i in 0..s.entries {
-        let mut k = format!("{i:0w$}", w = s.key).into_bytes();
-        k.truncate(s.key.max(1));
-        let value = if s.value == 0 { Value::Tombstone } else { Value::Inline(Bytes::from(vec![7u8; s.value])) };
+    for i in 0..s.tail_entries {
+        let mut k = format!("{i:0w$}", w = s.key_bytes).into_bytes();
+        k.truncate(s.key_bytes.max(1));
+        let value =
+            if s.value_bytes == 0 { Value::Tombstone } else { Value::Inline(Bytes::from(vec![7u8; s.value_bytes])) };
         match value {
             Value::Tombstone => t.delete(Bytes::from(k)).unwrap(),
             v => t.put(Bytes::from(k), v).unwrap(),
         }
     }
     db.commit(t.into_request()).await.unwrap();
-    for i in 0..s.deletes {
+    for i in 0..s.range_deletes {
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         let (a, b) = (format!("r{i:04}a"), format!("r{i:04}z"));
         t.delete_range(KeyRange::half_open(Bytes::from(a), Some(Bytes::from(b)))).unwrap();
@@ -91,32 +87,31 @@ async fn create(eng: &Arc<Engine>, id: &str, s: Shape) {
     }
 }
 
-/// Charges must cover what decoded manifests allocate, without grossly overstating it.
 async fn charges_cover_decoded_manifests(w: &World) {
     let writer = w.engine("w", 1 << 40);
     let shapes = [
-        Shape { entries: 0, key: 4, value: 1, deletes: 0 },
-        Shape { entries: 2000, key: 9, value: 100, deletes: 0 },
-        Shape { entries: 6000, key: 4, value: 1, deletes: 0 },
-        Shape { entries: 40, key: 16, value: 6000, deletes: 0 },
-        Shape { entries: 3000, key: 24, value: 0, deletes: 0 },
-        Shape { entries: 10, key: 8, value: 8, deletes: 200 },
+        DbShape { tail_entries: 0, key_bytes: 4, value_bytes: 1, range_deletes: 0 },
+        DbShape { tail_entries: 2000, key_bytes: 9, value_bytes: 100, range_deletes: 0 },
+        DbShape { tail_entries: 6000, key_bytes: 4, value_bytes: 1, range_deletes: 0 },
+        DbShape { tail_entries: 40, key_bytes: 16, value_bytes: 6000, range_deletes: 0 },
+        DbShape { tail_entries: 3000, key_bytes: 24, value_bytes: 0, range_deletes: 0 },
+        DbShape { tail_entries: 10, key_bytes: 8, value_bytes: 8, range_deletes: 200 },
     ];
     for (n, s) in shapes.iter().enumerate() {
         for i in 0..20 {
-            create(&writer, &format!("s{n}-{i}"), *s).await;
+            populate_db(&writer, &format!("s{n}-{i}"), *s).await;
         }
     }
     for (n, s) in shapes.iter().enumerate() {
         let reader = w.engine("r", 1 << 40);
-        let (heap_before, charged_before) = (live(), reader.shared.memory.used());
+        let (heap_before, charged_before) = (allocated_bytes(), reader.shared.memory.used());
         let mut handles = Vec::new();
         for i in 0..20 {
             let db = reader.db(&format!("s{n}-{i}"));
             db.open(false).await.unwrap();
             handles.push(db);
         }
-        let heap = (live() - heap_before).max(0) as usize;
+        let heap = (allocated_bytes() - heap_before).max(0) as usize;
         let charged = reader.shared.memory.used() - charged_before;
         eprintln!("{s:?}: heap {heap} B, charged {charged} B");
         assert!(heap <= charged + charged / 10 + 20 * 512, "{s:?}: {heap} heap bytes, but {charged} charged");
@@ -124,17 +119,20 @@ async fn charges_cover_decoded_manifests(w: &World) {
     }
 }
 
-/// One reader opens many databases whose tails together far exceed its budget, as a client
-/// reading each in turn would, while long polls hold every handle.
 async fn opening_many_databases_stays_within_the_budget(w: &World) {
     let writer = w.engine("w2", 1 << 40);
     let dbs = 300;
     for i in 0..dbs {
-        create(&writer, &format!("big{i}"), Shape { entries: 2000, key: 9, value: 100, deletes: 0 }).await;
+        populate_db(
+            &writer,
+            &format!("big{i}"),
+            DbShape { tail_entries: 2000, key_bytes: 9, value_bytes: 100, range_deletes: 0 },
+        )
+        .await;
     }
     let budget = 16 * MIB;
     let reader = w.engine("r2", budget);
-    let before = live();
+    let before = allocated_bytes();
     let mut held = Vec::new();
     let mut peak = 0;
     let mut refused = 0;
@@ -151,7 +149,7 @@ async fn opening_many_databases_stays_within_the_budget(w: &World) {
         assert!(t.get(b"000001234").await.unwrap().is_some());
         drop(t);
         held.push(db);
-        peak = peak.max(live() - before);
+        peak = peak.max(allocated_bytes() - before);
     }
     let peak = peak.max(0) as usize;
     let charged = reader.shared.memory.used();

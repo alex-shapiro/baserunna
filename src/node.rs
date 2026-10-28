@@ -54,7 +54,6 @@ pub struct NodeConfig {
     pub max_json_body: usize,
     pub txn_idle_ms: u64,
     pub txn_max_ms: u64,
-    /// Interactive transactions one user can have open on a node at once.
     pub txns_per_user: usize,
     pub db_idle_evict_ms: u64,
     pub secure_cookies: bool,
@@ -204,8 +203,7 @@ const REAPER_KEY: &str = "reaper";
 
 const META_BATCH: usize = 500;
 
-/// An open interactive transaction and the user who began it.
-pub struct OpenSlot {
+pub struct OpenTxnSlot {
     pub user_id: String,
     pub txn: tokio::sync::Mutex<OpenTxn>,
 }
@@ -246,7 +244,7 @@ pub struct Node {
     org_cache: TtlCache<String, Org>,
     /// Caches positive `(org_id, user_id)` role lookups; misses read strongly.
     role_cache: TtlCache<(String, String), Role>,
-    pub(crate) txns: Mutex<DetHashMap<String, Arc<OpenSlot>>>,
+    pub(crate) txns: Mutex<DetHashMap<String, Arc<OpenTxnSlot>>>,
     cookie_key: Mutex<Vec<u8>>,
     cluster_key: Mutex<Option<String>>,
     pub forwards: cluster::ForwardDedup,
@@ -1714,7 +1712,7 @@ mod tests {
             }
             let r = begin(&alice, "a").await;
             assert_eq!((r.status, r.json()["error"]["code"].as_str()), (429, Some("rate_limited")), "{:?}", r.json());
-            assert_eq!(begin(&bob, "b").await.status, 201, "one user's transactions limited another's");
+            assert_eq!(begin(&bob, "b").await.status, 201, "user quota affected another user");
             let r = w.call(0, "DELETE", &format!("/v1/dbs/a/transactions/{}", ids[0]), &alice, Bytes::new()).await;
             assert_eq!(r.status, 200);
             assert_eq!(begin(&alice, "a").await.status, 201, "an aborted transaction still counted");
@@ -1722,7 +1720,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_transactions_wait_for_memory_and_resume_when_it_is_released() {
+    fn interactive_transactions_are_rejected_over_memory_budget_and_admitted_after_release() {
         run_paused(async {
             let w = World::with_config(1, 1, |c| c.engine.memory_bytes = 16 << 20).await;
             let token = w.signup(0, "a@x.io").await;

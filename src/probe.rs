@@ -193,9 +193,9 @@ probes! {
     PasswordResetFinished,
     /// A simulated workload resynchronized its model from the database after an unresolved ambiguous write.
     ModelAdoptedFromDatabase,
-    /// An idle database was unloaded to bring memory use under the node's budget.
+    /// An idle database manifest was unloaded to free memory.
     DatabaseUnloaded,
-    /// A database load or transaction was refused because the node's memory budget was exhausted.
+    /// An interactive transaction was rejected because the node memory budget was exceeded.
     MemoryExhausted,
 }
 

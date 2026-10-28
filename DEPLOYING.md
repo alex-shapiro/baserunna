@@ -1,9 +1,9 @@
 # Deploying Baserunna
 
-A production cluster is a few identical, stateless nodes behind a load
-balancer, all pointed at one bucket. This guide covers what each piece
-needs. Configuration is through environment variables; the full list is in
-the [README](README.md#configuration) and SPEC §12.
+A production cluster consists of stateless nodes behind an HTTP load balancer
+that share a single object-storage bucket. Nodes are configured through
+environment variables (see [`README.md`](README.md#configuration) and
+[`SPEC.md`](SPEC.md) §12).
 
 ```
 clients ──TLS──▶ load balancer ──HTTP──▶ node, node, node ──▶ bucket
@@ -14,8 +14,8 @@ clients ──TLS──▶ load balancer ──HTTP──▶ node, node, node �
 
 ## Container image
 
-The [`Dockerfile`](Dockerfile) builds the release binary and copies it into
-a slim Debian image that runs it as an unprivileged user:
+The [`Dockerfile`](Dockerfile) builds the release binary and runs it as an
+unprivileged user in a minimal Debian image:
 
 ```sh
 docker build -t baserunna .
@@ -28,23 +28,22 @@ docker run -p 8080:8080 \
   baserunna
 ```
 
-Every node of a cluster needs:
+Each node in a cluster requires:
 
-- the same `BASERUNNA_STORE` and `BASERUNNA_CLUSTER_SECRET`;
-- its own `BASERUNNA_ADVERTISE`: the URL other nodes use to reach it
-  directly (a pod or instance IP, not the load balancer);
-- `BASERUNNA_PUBLIC_URL`: the URL browsers use. It sets the OAuth redirect
-  and makes session cookies `Secure` when it is `https://`.
+- identical `BASERUNNA_STORE` and `BASERUNNA_CLUSTER_SECRET` values;
+- a node-specific `BASERUNNA_ADVERTISE` URL reachable by peer nodes on a
+  private network (a pod or instance IP, not the load balancer);
+- `BASERUNNA_PUBLIC_URL`: the browser-facing URL used for OAuth redirects,
+  email links, and `Secure` session cookies (if `https://`).
 
-`fs:` stores are for a single development process only (SPEC §12).
+`fs:` stores are restricted to a single development process (SPEC §12).
 
 ## Fly.io (single node)
 
-[`fly.toml`](fly.toml) runs one node on a Fly machine against a
-[Tigris](https://fly.io/docs/tigris/) bucket, which supports the
-conditional writes Baserunna needs. Fly's proxy terminates TLS, and the
-machine stops when idle and starts on the next request. One-time setup,
-with [`flyctl`](https://fly.io/docs/flyctl/install/):
+[`fly.toml`](fly.toml) runs a single node on a Fly machine against a
+[Tigris](https://fly.io/docs/tigris/) bucket. Fly's proxy terminates TLS, and
+the machine stops if idle and starts on the next request. Initial setup with
+[`flyctl`](https://fly.io/docs/flyctl/install/):
 
 ```sh
 fly apps create baserunna
@@ -56,19 +55,18 @@ fly secrets set --app baserunna --stage \
 fly deploy --ha=false
 ```
 
-`fly storage create` makes a Global bucket, which is strongly consistent
-only within a region. That is enough for nodes in one region, but nodes in
-different regions could both win a manifest CAS. A cluster that may span
-regions needs a Single-region or Multi-region bucket, created in the Tigris
-dashboard or with `tigris mk --locations`, because the location type is
-chosen when a bucket is created.
+`fly storage create` creates a Global Tigris bucket, which provides strong
+consistency only within a single region. A cluster with nodes in multiple
+regions requires a Single-region or Multi-region bucket created in the Tigris
+dashboard or with `tigris mk --locations` so that conditional manifest writes
+are serialized across all nodes.
 
 Set the admin secrets before the first deploy: under the default
-`first_user_only` sign-up policy, whoever signs up first otherwise becomes
-admin. Keep the app at one machine (`--ha=false`); a second one would need
+`first_user_only` sign-up policy, the first user to sign up otherwise becomes
+admin. Keep the app at 1 machine (`--ha=false`); a multi-node cluster requires
 a private advertise address and a cluster secret. Background work (garbage
 collection, TTL expiry, stream retention) runs only while the machine is
-up.
+running.
 
 Use a `performance` machine for sustained load. A `shared-cpu-1x` machine
 serves ~3,900 cached GETs/s until its CPU credits are exhausted after a few
@@ -81,14 +79,13 @@ baserunna`).
 
 ## TLS
 
-Terminate TLS at the load balancer or ingress. Nodes speak plain HTTP, to
-the load balancer and to each other.
+Terminate TLS at the load balancer or ingress. Nodes communicate over plain
+HTTP with the load balancer and with each other.
 
-Forwarded requests between nodes carry the client's credentials, so the
-nodes' advertised addresses must be on a private network (a VPC, a
-Kubernetes pod network, or a service mesh that adds mTLS). Internal
-endpoints (`/internal/v1/…`) additionally require the cluster secret, but
-nothing else on the node-to-node path is encrypted by Baserunna itself.
+Forwarded requests between nodes include client credentials, so advertised
+node addresses must be on a private network (such as a VPC, Kubernetes pod
+network, or mTLS service mesh). Internal endpoints (`/internal/v1/…`) require
+the cluster secret, and node-to-node traffic is not encrypted by Baserunna.
 
 ## Load balancer
 
@@ -96,10 +93,10 @@ Any HTTP load balancer works; requests may land on any node, and nodes
 forward database requests to the node holding the database's lease. Set up:
 
 - **Health check**: `GET /healthz`. It returns 200 while the node serves
-  and 503 once it starts shutting down.
-- **No sticky sessions** and **no automatic retries of non-idempotent
-  requests** (POST, PUT, DELETE). A retried write could apply twice;
-  clients retry safely with idempotency keys (SPEC §6.2).
+  and 503 during shutdown.
+- **Disable sticky sessions and automatic retries of non-idempotent
+  requests** (POST, PUT, DELETE). Retrying a write without an idempotency key
+  can apply it twice (SPEC §6.2).
 - **Timeouts and body sizes**: Set the load balancer idle timeout above
   50 s so that `wait_ms` long polls on change feeds and streams do not
   time out before the server responds. On `/v1/dbs/*/kv/*` and
@@ -108,34 +105,31 @@ forward database requests to the node holding the database's lease. Set up:
 - **Client addresses**: sign-in throttling is per client address. Behind
   a proxy that appends the client to `X-Forwarded-For`, set
   `BASERUNNA_TRUSTED_PROXY_HOPS` to the number of such proxies (usually 1).
-  Leave it at 0 when nodes face clients directly, or clients could forge
-  their address.
+  Leave it at 0 if nodes face clients directly so that clients cannot spoof
+  their IP address.
 - Optionally block `/internal/` at the load balancer; nodes reach those
   endpoints directly.
 
 ## Logs
 
-Nodes log JSON lines to stderr (format in SPEC §12), and at the default
-level, `info`, every request on each node it reaches; `BASERUNNA_LOG=warn`
-keeps only problems. To follow a request through the cluster, filter on
-its `request_id`. To tie the nodes' logs to your proxy's, have the proxy
-send its request id as `x-request-id`: nodes keep ids of 1-64 characters
-of `[A-Za-z0-9._:-]` and replace any other with their own, so ids with
-other characters (an AWS ALB trace id's `=` and `;`, for example) need
-rewriting first.
+Nodes write JSON log lines to stderr (see SPEC §12). At the default `info`
+level, each node logs every request it handles; set `BASERUNNA_LOG=warn` to
+log only warnings and errors. Filter by `request_id` to trace a request across
+nodes. If a reverse proxy sets `x-request-id` to a 1–64 character string
+matching `[A-Za-z0-9._:-]`, nodes preserve that ID; otherwise, nodes generate
+a fresh ID.
 
 ## Mail
 
-Email verification and password resets need outbound mail. Set
-`BASERUNNA_MAIL_WEBHOOK_URL` to an endpoint that accepts
-`POST {"from", "to", "subject", "text"}` (optionally with
-`BASERUNNA_MAIL_WEBHOOK_TOKEN` as a bearer token, and
-`BASERUNNA_MAIL_FROM` as the sender): a small relay to SMTP or a mail
-provider's HTTP API. Links point at `BASERUNNA_PUBLIC_URL`. Without a
-webhook, the reset and verification endpoints answer 404, and Google
-sign-in cannot link to existing password accounts (their addresses cannot
-be verified). Mail is sent in the background, a few retries apiece; a node
-that stops first drops it, and the user asks again.
+Email verification and password resets require an outbound mail webhook. Set
+`BASERUNNA_MAIL_WEBHOOK_URL` to an HTTP endpoint that accepts
+`POST {"from", "to", "subject", "text"}` (with optional
+`BASERUNNA_MAIL_WEBHOOK_TOKEN` bearer authentication and `BASERUNNA_MAIL_FROM`
+sender address). Email links use `BASERUNNA_PUBLIC_URL`. If
+`BASERUNNA_MAIL_WEBHOOK_URL` is unset, the verification and password-reset
+endpoints return `404`, and Google sign-in cannot link to unverified password
+accounts. Outbound emails are sent asynchronously with retries and are not
+persisted across node restarts.
 
 ## Shutdown
 
@@ -152,9 +146,9 @@ On SIGTERM (or SIGINT) a node:
 Set the drain delay to at least the load balancer's health check interval
 times its unhealthy threshold, and give the orchestrator a grace period
 longer than both settings together (on Kubernetes,
-`terminationGracePeriodSeconds`). Interactive transactions open on a
-stopping node are lost (`404 txn_not_found`, nothing committed). A killed
-node loses nothing either; its databases just wait out their leases
+`terminationGracePeriodSeconds`). Uncommitted interactive transactions open on
+a stopping node are aborted (`404 txn_not_found`). If a node crashes,
+databases leased by that node become writable again after their leases expire
 (SPEC §5.7).
 
 ## Upgrades
@@ -167,33 +161,33 @@ nodes before starting the new version.
 
 ### Requirements
 
-Baserunna supports [Tigris](https://www.tigrisdata.com/), which passes its
+Baserunna supports [Tigris](https://www.tigrisdata.com/), which passes the
 object-store conformance suite and failover check (SPEC §13.5). Other
-S3-compatible stores are untested. Use one bucket (or one prefix,
-`s3://bucket/prefix`) per cluster, and nothing else should write there.
+S3-compatible stores are untested. Dedicate a separate bucket or key prefix
+(`s3://bucket/prefix`) to each cluster.
 
-Credentials, region and endpoint come from the standard `AWS_*` variables
-(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and
-`AWS_ENDPOINT_URL_S3`), which `fly storage create` sets.
+Credentials, region, and endpoint are read from standard `AWS_*` environment
+variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and
+`AWS_ENDPOINT_URL_S3`).
 
-Before serving, a node checks that the store rejects conflicting
-conditional writes and refuses to start if it does not, since such a store
-would let two nodes overwrite each other's commits. To check a bucket
-thoroughly, run the conformance suite and the failover check against it:
+At startup, each node runs conditional-write preflight checks against the
+store and refuses to start if they fail. To run the full conformance suite and
+failover check against a bucket:
 
 ```sh
 BASERUNNA_TEST_STORE=s3://<bucket> cargo test --release --test store_conformance
 BASERUNNA_STORE=s3://<bucket> cargo run --release --example cluster_check -- 180
 ```
 
-Both write under a fresh prefix of the bucket and delete it afterwards.
+Both commands write to a temporary prefix and delete all test objects before
+exiting.
 
 ### Permissions
 
-Nodes read, write, delete and list objects under the cluster's prefix, and
-nothing else.
+Nodes require permission to read, write, delete, and list objects under the
+cluster prefix.
 
-An S3-style policy for a prefix `baserunna/` of `my-bucket`:
+Example IAM policy for prefix `baserunna/` in `my-bucket`:
 
 ```json
 {
@@ -216,21 +210,19 @@ An S3-style policy for a prefix `baserunna/` of `my-bucket`:
 
 ### Lifecycle rules and versioning
 
-Garbage collection is Baserunna's job: it deletes replaced segments,
-unreferenced blobs and purged databases itself, after grace periods that
-protect running reads (SPEC §5.8).
+Baserunna deletes obsolete segments, unreferenced blobs, and purged databases
+automatically after grace periods that protect in-flight reads (SPEC §5.8).
 
-- **No expiration rules** on the cluster's prefix. Expiring an object that
-  a manifest references loses data.
-- **Abort incomplete multipart uploads** after a day. Baserunna writes
-  every object with a single PUT (blobs are stored as 8 MiB chunks), so it
-  leaves none behind; the rule costs nothing and cleans up after other
-  tools.
-- **Versioning off.** Every commit rewrites a database's manifest, so a
-  versioned bucket keeps a noncurrent version per commit. If versioning
-  must stay on, expire noncurrent versions after a day.
-- Keep the bucket's storage class one with immediate reads (no archive
-  tiers): any object may be read at any time.
+- **Do not configure object expiration rules** on the cluster prefix. Expiring
+  an object referenced by a manifest causes data loss.
+- **Abort incomplete multipart uploads** after 1 day. Baserunna writes each
+  object in a single `PUT` request (blobs are stored as 8 MiB chunks), so this
+  rule only cleans up incomplete uploads from external tools.
+- **Disable bucket versioning.** Every commit overwrites the database
+  manifest, so enabling versioning retains a noncurrent version per commit. If
+  versioning is required, expire noncurrent versions after 1 day.
+- **Use a storage class with immediate read access** (do not use archive
+  tiers).
 
 S3 lifecycle configuration with the rule above:
 
@@ -249,31 +241,31 @@ S3 lifecycle configuration with the rule above:
 
 ## Limits
 
-Rate limits are enforced per node, so an N-node cluster allows up to N times the configured rate. Setting a rate limit to 0 disables it. `BASERUNNA_DB_MEMORY_MB` also applies per node and cannot be disabled; it must be at least 16. Size it with `BASERUNNA_CACHE_MB` to fit the machine: nodes refuse new interactive transactions rather than exceed it (SPEC §5.12).
+Rate limits and memory budgets are enforced per node, so an N-node cluster
+allows up to N times each configured rate. Setting a rate limit to 0 disables
+it. `BASERUNNA_DB_MEMORY_MB` must be at least 16 and cannot be disabled; if
+memory usage exceeds this budget after unloading idle databases, the node
+rejects new interactive transactions with `503` (SPEC §5.12).
 
-| variable                                | default | limits                                       |
-| --------------------------------------- | ------- | -------------------------------------------- |
-| `BASERUNNA_DB_MAX_MB`                   | 10240   | size of each database (segments and blobs)   |
-| `BASERUNNA_DB_MEMORY_MB`                | 256     | memory for open databases and transactions   |
-| `BASERUNNA_USER_RPS`                    | 500     | requests per second per user                 |
-| `BASERUNNA_API_KEY_RPS`                 | 500     | requests per second per API key (or its own) |
-| `BASERUNNA_AUTH_RPS_PER_CLIENT`         | 1       | sign-ins and sign-ups per client address     |
-| `BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT` | 20      | accounts created per client address          |
-| `BASERUNNA_HASH_CONCURRENCY`            | CPUs    | password hashes computed at once             |
+- `BASERUNNA_DB_MAX_MB` (default `10240`): maximum size of each database in MiB (segments and blobs).
+- `BASERUNNA_DB_MEMORY_MB` (default `256`): per-node memory budget in MiB for open databases and transactions.
+- `BASERUNNA_USER_RPS` (default `500`): requests per second per user.
+- `BASERUNNA_API_KEY_RPS` (default `500`): requests per second per API key.
+- `BASERUNNA_AUTH_RPS_PER_CLIENT` (default `1`): authentication requests per second per client IP.
+- `BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT` (default `20`): account sign-ups per hour per client IP.
+- `BASERUNNA_HASH_CONCURRENCY` (default: CPU count): maximum concurrent password hashes.
 
 ## Configuration
 
-Each node is configured through environment variables. The main ones are below; [`SPEC.md`](SPEC.md) §12 contains the full list:
+Nodes are configured via environment variables (see [`SPEC.md`](SPEC.md) §12 for the complete list):
 
-| variable                                 | default                   |                                                                     |
-| ---------------------------------------- | ------------------------- | ------------------------------------------------------------------- |
-| `BASERUNNA_STORE`                        | `fs:./data`               | `fs:<dir>`, `mem:`, or `s3://bucket/prefix` (Tigris)                |
-| `BASERUNNA_LISTEN`                       | `0.0.0.0:8080`            |                                                                     |
-| `BASERUNNA_ADVERTISE`                    | `http://127.0.0.1:<port>` | URL that peers use to reach this node                               |
-| `BASERUNNA_PUBLIC_URL`                   | advertise URL             | browser-facing URL (OAuth redirect, mailed links, `Secure` cookies) |
-| `BASERUNNA_CLUSTER_SECRET`               | none                      | protects internal endpoints in multi-node clusters                  |
-| `BASERUNNA_SIGNUP`                       | `first_user_only`         | `open`, `first_user_only`, or `closed`                              |
-| `BASERUNNA_ADMIN_EMAIL` / `_PASSWORD`    | none                      | bootstrap an admin account                                          |
-| `BASERUNNA_GOOGLE_CLIENT_ID` / `_SECRET` | none                      | enables "Sign in with Google"                                       |
-| `BASERUNNA_MAIL_WEBHOOK_URL`             | none                      | enables verification and password reset mail                        |
-| `BASERUNNA_LOG`                          | `info`                    | `error` / `warn` / `info` (logs every request) / `debug` / `off`    |
+- `BASERUNNA_STORE` (default `fs:./data`): `fs:<dir>`, `mem:`, or `s3://bucket/prefix` (Tigris).
+- `BASERUNNA_LISTEN` (default `0.0.0.0:8080`): HTTP listen address.
+- `BASERUNNA_ADVERTISE` (default `http://127.0.0.1:<port>`): URL that peer nodes use to reach this node.
+- `BASERUNNA_PUBLIC_URL` (default: advertise URL): browser-facing URL for OAuth redirects, email links, and `Secure` cookies.
+- `BASERUNNA_CLUSTER_SECRET` (default: unset): shared secret protecting internal endpoints in multi-node clusters.
+- `BASERUNNA_SIGNUP` (default `first_user_only`): `open`, `first_user_only`, or `closed`.
+- `BASERUNNA_ADMIN_EMAIL` / `BASERUNNA_ADMIN_PASSWORD` (default: unset): bootstrap credentials for an admin account.
+- `BASERUNNA_GOOGLE_CLIENT_ID` / `BASERUNNA_GOOGLE_CLIENT_SECRET` (default: unset): Google OAuth credentials.
+- `BASERUNNA_MAIL_WEBHOOK_URL` (default: unset): HTTP webhook URL for verification and password-reset emails.
+- `BASERUNNA_LOG` (default `info`): log level (`error`, `warn`, `info`, `debug`, or `off`).

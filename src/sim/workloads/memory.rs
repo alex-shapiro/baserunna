@@ -1,10 +1,8 @@
-//! `memory`: many databases under a memory budget too small to hold them all.
+//! Simulation workload that exercises database eviction and admission control under a tight memory
+//! budget.
 //!
-//! Writers fill the tails of their databases through random nodes, long polls wait on
-//! databases that nodes unload while they wait, and interactive transactions hold write sets
-//! until nodes refuse new ones. Every strong read must return the settled writes, every long
-//! poll must observe the write it waits for, and refused transactions must be admitted once
-//! memory is released.
+//! Concurrent workers write to database tails, long-poll change feeds across database unloads, and
+//! hold large interactive transaction write sets.
 
 use super::super::Sim;
 use super::super::SimConfig;
@@ -14,8 +12,6 @@ use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// A budget that holds the working set of a few databases, including the segment metadata of
-/// the largest.
 pub fn config(k: &Knobs) -> SimConfig {
     let mut c = world(k, Profile { nodes: (1, 2), ..Profile::FAULTY });
     c.engine.tail_max_bytes = c.engine.tail_max_bytes.min(2048);
@@ -25,14 +21,11 @@ pub fn config(k: &Knobs) -> SimConfig {
     c
 }
 
-fn value(c: &Client, tag: &str) -> String {
+fn random_value(c: &Client, tag: &str) -> String {
     let n = 200 + c.rng().usize(1300);
     format!("{tag}:{}", "m".repeat(n))
 }
 
-/// Commits a write with an idempotency key and settles its outcome through its commit status,
-/// or, once its commit record may have expired, by reading the key: each written value is
-/// unique and has a single writer, and the status check fences later attempts.
 async fn settled_put(c: &Client, db: &str, key: &str, value: &str, id: &str) -> Result<Option<u64>, String> {
     let body = json!({"ops": [{"op": "put", "key": key, "value": value}], "idempotency_key": id});
     let began = c.sim.now_ms();
@@ -46,6 +39,8 @@ async fn settled_put(c: &Client, db: &str, key: &str, value: &str, id: &str) -> 
     match c.commit_status(db, &format!("key:{id}"), began).await? {
         s @ Status::Committed(_) => Ok(s.version()),
         Status::NotCommitted => Ok(None),
+        // `commit_status` fences any late retry, and each written value is unique to a single
+        // writer, so reading the key resolves the outcome if the commit record has expired.
         Status::Unknown => Ok((strong_get(c, db, key).await?.as_deref() == Some(value)).then_some(0)),
     }
 }
@@ -58,13 +53,12 @@ async fn strong_get(c: &Client, db: &str, key: &str) -> Result<Option<String>, S
     }
 }
 
-/// Writes to databases `dbs` and checks each settled write with a strong read.
-async fn writer(c: Client, dbs: Vec<String>, steps: usize) -> Result<BTreeMap<(String, String), String>, String> {
+async fn write_worker(c: Client, dbs: Vec<String>, steps: usize) -> Result<BTreeMap<(String, String), String>, String> {
     let mut model = BTreeMap::new();
     for step in 0..steps {
         let db = dbs[c.rng().usize(dbs.len())].clone();
         let key = format!("k{}", c.rng().below(6));
-        let v = value(&c, &format!("{}-{step}", c.name));
+        let v = random_value(&c, &format!("{}-{step}", c.name));
         if settled_put(&c, &db, &key, &v, &format!("{}-{step}", c.name)).await?.is_some() {
             model.insert((db.clone(), key.clone()), v);
         }
@@ -83,9 +77,7 @@ async fn writer(c: Client, dbs: Vec<String>, steps: usize) -> Result<BTreeMap<(S
     Ok(model)
 }
 
-/// Long-polls the change feed of `db` while the same client writes to it, and requires the
-/// poll to return that write.
-async fn poller(c: Client, db: String, rounds: usize) -> Result<(), String> {
+async fn long_poll_worker(c: Client, db: String, rounds: usize) -> Result<(), String> {
     for round in 0..rounds {
         let r = c.call_retry("GET", &format!("/v1/dbs/{db}/changes?after=0&limit=1000"), None).await;
         let after = r.json["next_cursor"].as_str().ok_or_else(|| format!("changes: {}", r.json))?.to_string();
@@ -108,7 +100,7 @@ async fn poller(c: Client, db: String, rounds: usize) -> Result<(), String> {
         };
         let pause = c.rng().below(3_000);
         c.pause(pause).await;
-        let v = value(&c, &format!("{db}-{round}"));
+        let v = random_value(&c, &format!("{db}-{round}"));
         let Some(_) = settled_put(&c, &db, "watched", &v, &format!("{db}-{round}")).await? else {
             poll.abort();
             continue;
@@ -122,9 +114,11 @@ async fn poller(c: Client, db: String, rounds: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Holds interactive transactions with large write sets on `db`, retrying refusals until
-/// admitted, and commits or aborts them.
-async fn holder(c: Client, db: String, rounds: usize) -> Result<BTreeMap<(String, String), String>, String> {
+async fn interactive_txn_worker(
+    c: Client,
+    db: String,
+    rounds: usize,
+) -> Result<BTreeMap<(String, String), String>, String> {
     let mut model = BTreeMap::new();
     let base = format!("/v1/dbs/{db}/transactions");
     for round in 0..rounds {
@@ -146,8 +140,9 @@ async fn holder(c: Client, db: String, rounds: usize) -> Result<BTreeMap<(String
             }
         };
         let key = format!("t{}", round % 3);
-        let v = value(&c, &format!("{db}-{round}"));
-        // Values below the inline limit stay in the write set rather than being staged as blobs.
+        let v = random_value(&c, &format!("{db}-{round}"));
+        // Values below the inline limit remain in the in-memory write set rather than being staged
+        // as blobs.
         let inline = c.sim.cfg.engine.value_inline_max - 16;
         let pads = 80 * 1024 / inline;
         let pad: Vec<Json> =
@@ -209,12 +204,14 @@ pub async fn run(sim: Arc<Sim>, chaos: bool) -> Result<(), String> {
     let writes: Vec<_> = names
         .iter()
         .enumerate()
-        .map(|(i, dbs)| tokio::spawn(writer(client(format!("w{i}")), dbs.clone(), steps)))
+        .map(|(i, dbs)| tokio::spawn(write_worker(client(format!("w{i}")), dbs.clone(), steps)))
         .collect();
     let polls: Vec<_> =
-        polled.iter().map(|db| tokio::spawn(poller(client(format!("{db}-poller")), db.clone(), 3))).collect();
-    let holds: Vec<_> =
-        held.iter().map(|db| tokio::spawn(holder(client(format!("{db}-holder")), db.clone(), steps / 4 + 1))).collect();
+        polled.iter().map(|db| tokio::spawn(long_poll_worker(client(format!("{db}-poller")), db.clone(), 3))).collect();
+    let holds: Vec<_> = held
+        .iter()
+        .map(|db| tokio::spawn(interactive_txn_worker(client(format!("{db}-holder")), db.clone(), steps / 4 + 1)))
+        .collect();
     let mut model = BTreeMap::new();
     for t in writes.into_iter().chain(holds) {
         model.extend(t.await.map_err(|e| format!("task: {e}"))??);

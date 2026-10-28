@@ -121,10 +121,8 @@ pub struct RangeDeletes {
 }
 
 impl RangeDeletes {
-    /// Approximate heap bytes of the index.
     pub fn heap_bytes(&self) -> usize {
-        use super::memory::heap;
-        heap(self.frags.capacity() * std::mem::size_of::<(Bytes, Option<Bytes>, Seq)>())
+        super::memory::alloc_bytes(self.frags.capacity() * std::mem::size_of::<(Bytes, Option<Bytes>, Seq)>())
     }
 
     pub fn new(rts: &[RangeTombstone]) -> RangeDeletes {

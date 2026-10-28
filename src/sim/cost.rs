@@ -250,7 +250,6 @@ impl World {
         World::with_config(n, latency_ms, |_| {}).await
     }
 
-    /// Like [`World::new`], with every node's configuration adjusted by `configure`.
     pub async fn with_config(n: usize, latency_ms: u64, configure: fn(&mut NodeConfig)) -> World {
         let origin = Instant::now();
         let base_ms = 1_750_000_000_000;

@@ -7,7 +7,6 @@ use object_store::{
 };
 use std::task::Poll;
 
-/// Bound on one store request, including the transfer of its body.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -16,8 +15,7 @@ pub struct CloudStore {
     prefix: String,
 }
 
-/// Extracts the HTTP status from an `object_store` error message, which does not expose it.
-fn http_status(message: &str) -> Option<u16> {
+fn parse_http_status(message: &str) -> Option<u16> {
     let rest = &message[message.find("status code: ")? + "status code: ".len()..];
     rest.get(..3)?.parse().ok()
 }
@@ -26,7 +24,7 @@ fn map_err(e: object_store::Error) -> StoreError {
     use object_store::Error as E;
     match e {
         E::NotFound { .. } => StoreError::NotFound,
-        // S3 answers `409 Conflict` to a conditional write that races another one; it was not applied.
+        // S3 returns `409 Conflict` if a conditional write races with another write.
         E::Precondition { .. } | E::AlreadyExists { .. } => StoreError::PreconditionFailed,
         E::NotModified { .. } => StoreError::NotModified,
         E::NotSupported { .. }
@@ -37,7 +35,7 @@ fn map_err(e: object_store::Error) -> StoreError {
         | E::UnknownConfigurationKey { .. } => StoreError::Fatal(e.to_string()),
         other => {
             let message = other.to_string();
-            match http_status(&message) {
+            match parse_http_status(&message) {
                 Some(416) => StoreError::Fatal("invalid range".into()),
                 Some(s) if (400..500).contains(&s) && s != 408 && s != 429 => StoreError::Fatal(message),
                 _ => StoreError::Unavailable(message),
@@ -47,18 +45,18 @@ fn map_err(e: object_store::Error) -> StoreError {
 }
 
 impl CloudStore {
-    /// Parses `s3://bucket[/prefix]`. Credentials, region and endpoint are read from the
-    /// standard `AWS_*` environment variables, as set by `fly storage create` for Tigris.
+    /// Parses `s3://bucket[/prefix]` and reads credentials, region, and endpoint from standard
+    /// `AWS_*` environment variables.
     ///
-    /// The client does not retry: a timed-out or failed request is reported as
-    /// [`StoreError::Unavailable`], so that callers can tell an ambiguous conditional write
-    /// from a clean conflict.
+    /// Automatic retries are disabled so that timed-out or failed requests return
+    /// [`StoreError::Unavailable`], allowing callers to distinguish ambiguous conditional writes
+    /// from precondition failures.
     pub fn from_url(url: &str) -> Result<CloudStore, String> {
         CloudStore::from_url_with(url, std::iter::empty::<(String, String)>())
     }
 
-    /// Like [`CloudStore::from_url`], with `object_store` S3 settings (such as
-    /// `aws_endpoint`) overriding the environment.
+    /// Parses `s3://bucket[/prefix]` with explicit `object_store` S3 settings overriding
+    /// environment variables.
     pub fn from_url_with(
         url: &str,
         settings: impl IntoIterator<Item = (impl AsRef<str>, impl Into<String>)>,
@@ -86,7 +84,7 @@ impl CloudStore {
 
     fn path(&self, key: &str) -> Path {
         debug_assert!(
-            key.chars().all(|c| c == '/' || key_char(c)),
+            key.chars().all(|c| c == '/' || is_valid_key_char(c)),
             "object key {key:?} has characters that S3 paths encode"
         );
         if self.prefix.is_empty() { Path::from(key) } else { Path::from(format!("{}/{}", self.prefix, key)) }
@@ -139,7 +137,7 @@ impl ObjectStore for CloudStore {
             };
             let opts = PutOptions { mode, ..Default::default() };
             let r = self.inner.put_opts(&self.path(key), PutPayload::from(data), opts).await.map_err(map_err)?;
-            r.e_tag.ok_or_else(|| StoreError::Fatal("store returned no etag".into()))
+            r.e_tag.ok_or_else(|| StoreError::Fatal("missing ETag in PUT response".into()))
         })
     }
 
@@ -203,10 +201,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn statuses_are_read_from_error_messages() {
+    fn http_status_is_parsed_from_error_message() {
         let m = "Error performing GET https://x/b/k in 8ms - Server returned non-2xx status code: 416 Range Not Satisfiable: <Error/>";
-        assert_eq!(http_status(m), Some(416));
-        assert_eq!(http_status("connection reset"), None);
-        assert_eq!(http_status("status code: 5"), None);
+        assert_eq!(parse_http_status(m), Some(416));
+        assert_eq!(parse_http_status("connection reset"), None);
+        assert_eq!(parse_http_status("status code: 5"), None);
     }
 }

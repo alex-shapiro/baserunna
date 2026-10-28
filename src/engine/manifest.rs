@@ -142,9 +142,8 @@ pub struct PageCache {
 }
 
 impl PageCache {
-    /// Heap bytes of the cached frames.
     pub fn heap_bytes(&self) -> usize {
-        self.frames.values().map(|f| super::memory::heap(f.len()) + 32 + 3 * super::memory::ALLOC_OVERHEAD).sum()
+        self.frames.values().map(|f| super::memory::alloc_bytes(f.len()) + 32 + 3 * super::memory::ALLOC_OVERHEAD).sum()
     }
 
     fn compress(&mut self, prefix: &[u8], tail: &[Vec<u8>], suffix: &[u8]) -> Option<Vec<u8>> {
@@ -221,28 +220,33 @@ impl Manifest {
         self.flags & FLAG_DELETED != 0
     }
 
-    /// Approximate heap bytes this manifest occupies once decoded.
     pub fn heap_bytes(&self) -> usize {
-        use super::memory::heap;
+        use super::memory::alloc_bytes;
         use std::mem::size_of;
-        let tail: usize = self.tail.iter().map(|e| heap(e.key.len()) + e.value.heap_bytes()).sum();
-        let segments: usize =
-            self.segments.iter().map(|s| heap(s.id.len()) + heap(s.min_key.len()) + heap(s.max_key.len())).sum();
-        let deletes: usize =
-            self.range_deletes.iter().map(|r| heap(r.start.len()) + r.end.as_ref().map_or(0, |e| heap(e.len()))).sum();
-        let obsolete: usize = self.obsolete.iter().map(|o| heap(o.id.len())).sum();
+        let tail: usize = self.tail.iter().map(|e| alloc_bytes(e.key.len()) + e.value.heap_bytes()).sum();
+        let segments: usize = self
+            .segments
+            .iter()
+            .map(|s| alloc_bytes(s.id.len()) + alloc_bytes(s.min_key.len()) + alloc_bytes(s.max_key.len()))
+            .sum();
+        let deletes: usize = self
+            .range_deletes
+            .iter()
+            .map(|r| alloc_bytes(r.start.len()) + r.end.as_ref().map_or(0, |e| alloc_bytes(e.len())))
+            .sum();
+        let obsolete: usize = self.obsolete.iter().map(|o| alloc_bytes(o.id.len())).sum();
         size_of::<Manifest>()
-            + heap(self.db_id.len())
-            + self.levels.as_ref().map_or(0, |l| heap(l.len()))
-            + self.lease.as_ref().map_or(0, |l| heap(l.node.len()))
-            + heap(self.tail.capacity() * size_of::<Entry>())
+            + alloc_bytes(self.db_id.len())
+            + self.levels.as_ref().map_or(0, |l| alloc_bytes(l.len()))
+            + self.lease.as_ref().map_or(0, |l| alloc_bytes(l.node.len()))
+            + alloc_bytes(self.tail.capacity() * size_of::<Entry>())
             + tail
-            + heap(self.segments.capacity() * size_of::<SegmentMeta>())
+            + alloc_bytes(self.segments.capacity() * size_of::<SegmentMeta>())
             + segments
-            + heap(self.range_deletes.capacity() * size_of::<RangeTombstone>())
+            + alloc_bytes(self.range_deletes.capacity() * size_of::<RangeTombstone>())
             + deletes
-            + heap(self.version_times.capacity() * size_of::<(Seq, u64)>())
-            + heap(self.obsolete.capacity() * size_of::<Obsolete>())
+            + alloc_bytes(self.version_times.capacity() * size_of::<(Seq, u64)>())
+            + alloc_bytes(self.obsolete.capacity() * size_of::<Obsolete>())
             + obsolete
     }
 

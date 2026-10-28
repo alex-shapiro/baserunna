@@ -55,8 +55,7 @@ pub struct OpenTxns {
     limits: TxnLimits,
     open: Mutex<DetHashMap<String, Arc<OpenTxn>>>,
     /// Why each recently aborted transaction was aborted.
-    aborted: TtlCache<String, String>,
-    me: Weak<OpenTxns>,
+    aborted: TtlCache<String, &'static str>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -65,12 +64,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl OpenTxns {
     pub fn new(engine: Arc<Engine>, limits: TxnLimits) -> Arc<OpenTxns> {
-        Arc::new_cyclic(|me| OpenTxns {
+        Arc::new(OpenTxns {
             engine,
             limits,
             open: Mutex::new(DetHashMap::default()),
             aborted: TtlCache::new(limits.lifetime, 100_000),
-            me: me.clone(),
         })
     }
 
@@ -110,9 +108,7 @@ impl OpenTxns {
             });
         };
         for i in victims {
-            let Ok(mut g) = open[i].txn.try_lock() else { continue };
-            if g.take().is_some() {
-                self.abort(&open[i].id, "it was aborted to free node memory for other users");
+            if self.close(&open[i], "it was aborted to free node memory for other users") {
                 crate::probe::hit(crate::probe::Probe::TxnEvicted);
             }
         }
@@ -140,14 +136,14 @@ impl OpenTxns {
     /// first request runs before any other. Growth of the transaction's memory is admitted like
     /// requests that extend it.
     pub fn open(
-        &self,
+        self: &Arc<Self>,
         id: String,
         user_id: &str,
         db_id: &str,
         mut txn: Txn,
         encoding: Encoding,
     ) -> Result<tokio::sync::OwnedMutexGuard<Option<Txn>>> {
-        let gate = Gate { txns: self.me.clone(), user_id: user_id.to_string(), db_id: db_id.to_string() };
+        let gate = Gate { txns: Arc::downgrade(self), user_id: user_id.to_string(), db_id: db_id.to_string() };
         txn.set_memory_gate(Some(Arc::new(gate)));
         let now = Instant::now();
         let open = Arc::new(OpenTxn {
@@ -179,7 +175,7 @@ impl OpenTxns {
             return Err(Error::txn_not_found());
         }
         if open.created.elapsed() > self.limits.lifetime {
-            self.abort(id, "it reached the maximum transaction lifetime");
+            self.close(&open, "it reached the maximum transaction lifetime");
             return Err(self.lost(id));
         }
         Ok(open)
@@ -200,28 +196,43 @@ impl OpenTxns {
     }
 
     /// Closes transaction `id` because of `why`, which later requests on it report.
-    pub fn abort(&self, id: &str, why: &str) {
+    pub fn abort(&self, id: &str, why: &'static str) {
         self.remove(id);
-        self.aborted.store(id.to_string(), Some(why.to_string()), Instant::now());
+        self.aborted.store(id.to_string(), Some(why), Instant::now());
+    }
+
+    /// Aborts `open` because of `why` unless a request is using it, and returns whether it was
+    /// aborted rather than already committed or aborted by its user.
+    fn close(&self, open: &OpenTxn, why: &'static str) -> bool {
+        let Ok(mut g) = open.txn.try_lock() else { return false };
+        let aborted = g.take().is_some();
+        drop(g);
+        match aborted {
+            true => self.abort(&open.id, why),
+            false => self.remove(&open.id),
+        }
+        aborted
     }
 
     /// Aborts transactions that have been idle or open too long.
     pub fn expire(&self) {
         let TxnLimits { idle, lifetime, .. } = self.limits;
-        let mut expired = Vec::new();
-        lock(&self.open).retain(|id, t| {
-            let why = match t.txn.try_lock() {
-                Err(_) => None,
-                Ok(_) if t.created.elapsed() >= lifetime => Some("it reached the maximum transaction lifetime"),
-                Ok(_) if t.last_used().elapsed() >= idle => Some("no request used it within the idle timeout"),
-                Ok(_) => None,
-            };
-            expired.extend(why.map(|why| (id.clone(), why)));
-            why.is_none()
-        });
+        let expired: Vec<_> = lock(&self.open)
+            .values()
+            .filter_map(|t| {
+                let why = if t.created.elapsed() >= lifetime {
+                    "it reached the maximum transaction lifetime"
+                } else if t.last_used().elapsed() >= idle {
+                    "no request used it within the idle timeout"
+                } else {
+                    return None;
+                };
+                Some((t.clone(), why))
+            })
+            .collect();
         self.aborted.prune();
-        for (id, why) in expired {
-            self.aborted.store(id, Some(why.to_string()), Instant::now());
+        for (t, why) in expired {
+            self.close(&t, why);
         }
     }
 
@@ -377,6 +388,66 @@ mod tests {
     }
 
     #[test]
+    fn expired_transactions_are_closed_for_requests_already_holding_them() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let token = w.signup(0, "a@x.io").await;
+            let db_id = w.create_db(0, &token, "a").await;
+            let node = w.node(0);
+            let db = node.engine.db(&db_id);
+            db.open(true).await.unwrap();
+            let t = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
+            drop(node.txns.open("t".into(), "a", &db_id, t, Default::default()).unwrap());
+            let held = node.txns.get("t", "a", &db_id).unwrap();
+            tokio::time::sleep(Duration::from_millis(node.cfg.txn_idle_ms)).await;
+            node.txns.expire();
+            assert!(held.txn.lock().await.is_none(), "an expired transaction stayed usable");
+        });
+    }
+
+    #[test]
+    fn abort_reasons_do_not_retain_request_input() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let token = w.signup(0, "a@x.io").await;
+            w.create_db(0, &token, "a").await;
+            let table = json!({"name": "t", "primary_key": ["id"], "columns": [
+                {"name": "id", "type": "int", "nullable": false}, {"name": "label", "type": "string"}]});
+            let r = w.json(0, "POST", "/v1/dbs/a/tables", &token, table).await;
+            assert!(r["error"].is_null(), "{r}");
+            let id = begin(&w, &token, "a").await.json()["txn_id"].as_str().unwrap().to_string();
+            let row = json!({"id": 1, "label": ["x".repeat(100_000)]});
+            let r = ops(&w, &token, "a", &id, json!([{"op": "insert_row", "table": "t", "row": row}])).await;
+            assert_eq!(r["error"]["code"], "invalid_argument", "{r}");
+            let r = ops(&w, &token, "a", &id, get_op()).await;
+            assert_eq!(r["error"]["code"], "txn_not_found", "{r}");
+            let kept = r["error"]["message"].as_str().unwrap().len();
+            assert!(kept < 200, "the abort reason retained {kept} bytes of the failed request");
+        });
+    }
+
+    #[test]
+    fn transactions_closed_by_their_user_are_not_reported_as_expired() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let token = w.signup(0, "a@x.io").await;
+            let db_id = w.create_db(0, &token, "a").await;
+            let node = w.node(0);
+            let db = node.engine.db(&db_id);
+            db.open(true).await.unwrap();
+            let t = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
+            let mut committing = node.txns.open("t".into(), "a", &db_id, t, Default::default()).unwrap();
+            committing.take();
+            drop(committing);
+            tokio::time::sleep(Duration::from_millis(node.cfg.txn_idle_ms)).await;
+            node.txns.expire();
+            assert_eq!(node.txns.len(), 0);
+            let e = node.txns.lost("t");
+            assert!(!e.message().contains("idle"), "a retried commit would report: {e:?}");
+        });
+    }
+
+    #[test]
     fn transactions_cannot_grow_past_the_memory_budget_and_finish_under_pressure() {
         run_paused(async {
             let w = World::with_config(1, 1, |c| c.engine.memory_bytes = 16 << 20).await;
@@ -388,7 +459,7 @@ mod tests {
             let aborted = aborted.expect("growing past the budget did not fail");
             let r = ops(&w, &token, "a", &aborted, get_op()).await;
             assert_eq!(r["error"]["code"], "txn_not_found", "{r}");
-            assert!(r["error"]["message"].as_str().unwrap().contains("fair share of the node memory budget"), "{r}");
+            assert!(r["error"]["message"].as_str().unwrap().contains("a request on it failed"), "{r}");
             let r = w
                 .call(0, "POST", &format!("/v1/dbs/a/transactions/{}/commit", open[0]), &token, Bytes::from("{}"))
                 .await;

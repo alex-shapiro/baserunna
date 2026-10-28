@@ -600,7 +600,7 @@ async fn txn_ops(
         Ok(results) => Ok(axum::Json(json!({"results": results}))),
         Err(e) => {
             *g = None;
-            node.txns.abort(&id, &format!("a request on it failed: {}", e.message()));
+            node.txns.abort(&id, "a request on it failed");
             Err(e)
         }
     }

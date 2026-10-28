@@ -215,12 +215,55 @@ const REAPER_KEY: &str = "reaper";
 const META_BATCH: usize = 500;
 
 tokio::task_local! {
-    static REQUEST_DEADLINE: Instant;
+    static REQUEST_DEADLINE: Deadline;
 }
 
-/// Runs `f` with `deadline` as the commit deadline for all metadata commands inside `f`.
-pub async fn with_deadline<F: std::future::Future>(deadline: Instant, f: F) -> F::Output {
+/// Request deadline that is extended by the elapsed duration while paused.
+#[derive(Clone, Debug)]
+pub struct Deadline(Arc<Mutex<DeadlineState>>);
+
+#[derive(Debug)]
+struct DeadlineState {
+    instant: Instant,
+    paused_since: Option<Instant>,
+}
+
+impl Deadline {
+    pub fn new(instant: Instant) -> Deadline {
+        Deadline(Arc::new(Mutex::new(DeadlineState { instant, paused_since: None })))
+    }
+
+    /// Returns the deadline instant, adjusted for any active pause.
+    pub fn instant(&self) -> Instant {
+        let s = lock(&self.0);
+        match s.paused_since {
+            Some(p) => s.instant + p.elapsed(),
+            None => s.instant,
+        }
+    }
+
+    /// Pauses the deadline if it is not already paused.
+    pub fn pause(&self) {
+        lock(&self.0).paused_since.get_or_insert_with(Instant::now);
+    }
+
+    /// Resumes a paused deadline and extends it by the paused duration.
+    pub fn resume(&self) {
+        let mut s = lock(&self.0);
+        if let Some(p) = s.paused_since.take() {
+            s.instant += p.elapsed();
+        }
+    }
+}
+
+/// Executes `f` with `deadline` set as the task-local request deadline.
+pub async fn with_deadline<F: std::future::Future>(deadline: Deadline, f: F) -> F::Output {
     REQUEST_DEADLINE.scope(deadline, f).await
+}
+
+/// Returns the task-local deadline set by [`with_deadline`].
+pub fn current_deadline() -> Option<Deadline> {
+    REQUEST_DEADLINE.try_with(Deadline::clone).ok()
 }
 
 pub struct Node {
@@ -672,7 +715,7 @@ impl Node {
 
     async fn run_meta_attempts(&self, cmd: MetaCmd) -> Result<Json> {
         let sys = self.engine.db(SYS_DB);
-        let deadline = self.meta_deadline();
+        let deadline = self.meta_deadline().instant();
         let mut last_err = Error::unavailable("system database unavailable");
         for attempt in 0..10u32 {
             if attempt > 0 {
@@ -736,15 +779,14 @@ impl Node {
         let mut t = sys.begin(Isolation::Serializable, Consistency::Strong).await?;
         let r = meta::apply(&mut t, &BlobResolver { db: &sys }, cmd, self.now_ms() as i64).await?;
         let mut req = t.into_request();
-        req.deadline = Some(self.meta_deadline());
+        req.deadline = Some(self.meta_deadline().instant());
         sys.commit(req).await?;
         Ok(r)
     }
 
-    fn meta_deadline(&self) -> Instant {
-        REQUEST_DEADLINE
-            .try_with(|d| *d)
-            .unwrap_or_else(|_| Instant::now() + Duration::from_millis(self.cfg.engine.commit_timeout_ms))
+    fn meta_deadline(&self) -> Deadline {
+        current_deadline()
+            .unwrap_or_else(|| Deadline::new(Instant::now() + Duration::from_millis(self.cfg.engine.commit_timeout_ms)))
     }
 
     async fn forward_meta(

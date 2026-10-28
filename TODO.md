@@ -5,11 +5,6 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 
 ## Reliability and operations
 
-- [ ] **Propagate request deadlines to object-store operations.**
-      `CloudStore` uses a 30 s per-request timeout and `Retry` makes up to 5
-      attempts, so a read or manifest load can continue after the client timed
-      out. Pass the request deadline to store operations and stop retrying
-      after the deadline expires.
 - [ ] **Report `outcome: "unknown"` on stale-target rejections if a forward was
       retried.** If a node receives `x-baserunna-stale-target`, it executes the
       request locally, assuming the peer never executed it. If a proxy or

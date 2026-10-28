@@ -628,7 +628,7 @@ async fn commit_txn(
         })));
     }
     let mut creq = t.into_request();
-    creq.deadline = Some(ctx.deadline);
+    creq.deadline = Some(ctx.deadline.instant());
     let c = ctx.db.commit_detailed(creq).await.map_err(|e| naming_commit(e, cid))?;
     let own_appends = b.ops.iter().filter(|o| matches!(o, Op::Append { .. })).count();
     ops::fill_appends(&b.ops, &mut results, &c.appends[c.appends.len().saturating_sub(own_appends)..]);

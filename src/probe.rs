@@ -39,6 +39,8 @@ probes! {
     CommitReplayed,
     /// A transaction was rejected because its commit deadline had passed.
     CommitDeadlinePassed,
+    /// A request was cancelled because its deadline expired.
+    RequestDeadlinePassed,
     /// A commit batch flushed the tail inline because background flushes fell behind.
     TailFlushedInCommit,
     /// A background tail flush was installed.

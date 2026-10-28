@@ -3,6 +3,7 @@
 use crate::engine::blob::{self, BlobWriter, chunk_plan, read_chunk};
 use crate::engine::{BlobRef, Shared};
 use crate::error::{Error, Result};
+use crate::node::Deadline;
 use crate::store::BoxFut;
 use axum::body::Body;
 use bytes::Bytes;
@@ -188,6 +189,46 @@ impl http_body::Body for TrackedBody {
 
     fn size_hint(&self) -> http_body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+/// Request body wrapper that pauses the request [`Deadline`] while waiting for client data.
+pub struct DeadlinePausingBody {
+    inner: Body,
+    deadline: Deadline,
+}
+
+impl DeadlinePausingBody {
+    pub fn new(inner: Body, deadline: Deadline) -> DeadlinePausingBody {
+        DeadlinePausingBody { inner, deadline }
+    }
+}
+
+impl http_body::Body for DeadlinePausingBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let polled = Pin::new(&mut self.inner).poll_frame(cx);
+        match polled {
+            Poll::Pending => self.deadline.pause(),
+            Poll::Ready(_) => self.deadline.resume(),
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for DeadlinePausingBody {
+    fn drop(&mut self) {
+        self.deadline.resume();
     }
 }
 

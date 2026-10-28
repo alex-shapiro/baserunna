@@ -9,6 +9,7 @@ pub mod blob_gc_race;
 pub mod blobs;
 pub mod console;
 pub mod db_churn;
+pub mod events;
 pub mod history;
 pub mod kv_model;
 pub mod lifecycle;
@@ -276,6 +277,7 @@ const MIX: &[(&str, &str)] = &[
     ("ttl", "mix.ttl"),
     ("watch", "mix.watch"),
     ("streams", "mix.streams"),
+    ("events", "mix.events"),
     ("orgs", "mix.orgs"),
     ("accounts", "mix.accounts"),
 ];
@@ -479,6 +481,17 @@ pub fn scenarios() -> Vec<Scenario> {
             name: "streams",
             config: |k| world(k, faulty((1, 4))),
             run: |s| Box::pin(streams::run(s.clone(), s.knobs.range("streams.steps", 30, 80) as usize, true)),
+        },
+        Scenario {
+            name: "events",
+            config: |k| {
+                let mut c = world(k, faulty((1, 4)));
+                // Small granules give parts enough of them for every pruning method to apply.
+                c.engine.event_granule_rows = k.log_range("events.granule_rows", 2, 16) as usize;
+                c.node.engine = c.engine.clone();
+                c
+            },
+            run: |s| Box::pin(events::run(s.clone(), s.knobs.range("events.steps", 10, 40) as usize, true)),
         },
         Scenario { name: "orgs", config: |k| world(k, faulty((1, 4))), run: |s| Box::pin(orgs::run(s)) },
         Scenario { name: "memory", config: memory::config, run: |s| Box::pin(memory::run(s, true)) },

@@ -209,6 +209,8 @@ probes! {
     BindSlotMasked,
     /// A bulk bind or transaction was refused because a staged event part had expired or was swept.
     StagedPartUnbindable,
+    /// A retried bulk bind found its parts already bound by an earlier attempt that landed.
+    BindInstallReplayed,
     /// A bulk bind was forwarded to the database's lease holder.
     BindForwarded,
     /// Unsealed event rows were sealed into parts.
@@ -269,6 +271,7 @@ impl Probe {
         Probe::ModelAdoptedFromDatabase,
         Probe::StagedPartUnbindable,
         Probe::BindSlotMasked,
+        Probe::BindInstallReplayed,
         Probe::MaskObjectWritten,
     ];
 }

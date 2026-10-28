@@ -125,7 +125,8 @@ impl Binder<'_> {
             Expr::Bucket { of, interval, offset_ms } => {
                 let inner = self.expr(of)?;
                 match &inner {
-                    BExpr::Col(id) if matches!(self.schema.column_by_id(*id).map(|c| c.ty), Some(EvType::Time | EvType::Int)) => {}
+                    BExpr::Col(id)
+                        if matches!(self.schema.column_by_id(*id).map(|c| c.ty), Some(EvType::Time | EvType::Int)) => {}
                     _ => return Err(Error::invalid("buckets take a time or int column")),
                 }
                 BExpr::Bucket(Box::new(inner), *interval, *offset_ms)
@@ -144,7 +145,9 @@ impl Binder<'_> {
                     }
                     t.try_map(|a| typed_arg(c, a))?
                 }
-                BExpr::Json(_) => return Err(Error::invalid("filter on a JSON column's path, such as {\"col\": .., \"path\": [..]}")),
+                BExpr::Json(_) => {
+                    return Err(Error::invalid("filter on a JSON column's path, such as {\"col\": .., \"path\": [..]}"));
+                }
                 _ => t.clone(),
             };
             Ok((b, t))
@@ -180,7 +183,9 @@ fn num_order(a: &Val, b: &Json) -> Option<Ordering> {
 impl Target<Json> for Val {
     fn equals(&self, arg: &Json) -> bool {
         match self {
-            Val::Int(_) | Val::Float(_) => matches!(arg, Json::Number(_)) && num_order(self, arg) == Some(Ordering::Equal),
+            Val::Int(_) | Val::Float(_) => {
+                matches!(arg, Json::Number(_)) && num_order(self, arg) == Some(Ordering::Equal)
+            }
             Val::Str(s) => arg.as_str() == Some(s),
             Val::Bool(b) => arg.as_bool() == Some(*b),
             Val::Json(j) => (&j).equals(arg),
@@ -210,7 +215,7 @@ impl Target<Json> for Val {
     }
 }
 
-fn datum_val(d: &Datum) -> Val {
+pub(crate) fn datum_val(d: &Datum) -> Val {
     match d {
         Datum::Null => Val::Null,
         Datum::Bool(b) => Val::Bool(*b),
@@ -251,7 +256,9 @@ impl ColData {
                 Vector::Bool(x) => x[i].map_or(Val::Null, Val::Bool),
                 Vector::Str(s) => match s.get(i) {
                     None => Val::Null,
-                    Some(t) if *json => serde_json::from_str::<Json>(t).map(|j| Val::from_json(&j)).unwrap_or(Val::Null),
+                    Some(t) if *json => {
+                        serde_json::from_str::<Json>(t).map(|j| Val::from_json(&j)).unwrap_or(Val::Null)
+                    }
                     Some(t) => Val::Str(t.to_string()),
                 },
             },
@@ -330,7 +337,9 @@ impl Batch {
                                     && *memo[c as usize].get_or_insert_with(|| {
                                         let text = &s.dict[c as usize];
                                         let v = if *json {
-                                            serde_json::from_str::<Json>(text).map(|j| Val::from_json(&j)).unwrap_or(Val::Null)
+                                            serde_json::from_str::<Json>(text)
+                                                .map(|j| Val::from_json(&j))
+                                                .unwrap_or(Val::Null)
                                         } else {
                                             Val::Str(text.clone())
                                         };
@@ -427,7 +436,9 @@ fn range_may(t: &Test<Json>, lo: &Stat, hi: &Stat) -> bool {
     let lt_strict = |a: &Json, s: &Stat| -> bool {
         match (a, s) {
             (Json::String(a), Stat::Str(s)) => s.as_str() < a.as_str(),
-            (Json::Number(_), Stat::Int(_) | Stat::Float(_)) => stat_val(s).total_cmp(&Val::from_json(a)) == Ordering::Less,
+            (Json::Number(_), Stat::Int(_) | Stat::Float(_)) => {
+                stat_val(s).total_cmp(&Val::from_json(a)) == Ordering::Less
+            }
             (Json::Bool(a), Stat::Bool(s)) => s < a,
             _ => false,
         }
@@ -576,7 +587,8 @@ impl Groups {
     }
 
     fn check_mem(&mut self) -> Result<()> {
-        let mem: usize = self.map.values().map(|(k, s)| k.len() * 32 + s.iter().map(State::mem_size).sum::<usize>()).sum();
+        let mem: usize =
+            self.map.values().map(|(k, s)| k.len() * 32 + s.iter().map(State::mem_size).sum::<usize>()).sum();
         self.mem = mem;
         if mem > self.max_mem {
             return Err(Error::TooLarge(format!(
@@ -680,7 +692,8 @@ impl Run<'_> {
                         }
                         let event = match &a.func {
                             AggFn::WindowFunnel { mode, .. } => {
-                                let mask = conds[ai].iter().enumerate().fold(0u32, |m, (k, c)| m | ((c[i] as u32) << k));
+                                let mask =
+                                    conds[ai].iter().enumerate().fold(0u32, |m, (k, c)| m | ((c[i] as u32) << k));
                                 if mask == 0 && !mode.strict_order {
                                     continue;
                                 }
@@ -691,7 +704,8 @@ impl Run<'_> {
                                 Some((t, b.pos.get(i).copied().unwrap_or_default(), mask))
                             }
                             AggFn::Retention(_) => {
-                                let mask = conds[ai].iter().enumerate().fold(0u32, |m, (k, c)| m | ((c[i] as u32) << k));
+                                let mask =
+                                    conds[ai].iter().enumerate().fold(0u32, |m, (k, c)| m | ((c[i] as u32) << k));
                                 Some((0, Pos::default(), mask))
                             }
                             _ => None,
@@ -700,7 +714,9 @@ impl Run<'_> {
                         states[ai].add(&v, event);
                     }
                 }
-                if groups.map.len() % 64 == 0 || first.aggregates.iter().any(|a| !matches!(a.func, AggFn::Count | AggFn::Sum | AggFn::Avg)) {
+                if groups.map.len() % 64 == 0
+                    || first.aggregates.iter().any(|a| !matches!(a.func, AggFn::Count | AggFn::Sum | AggFn::Avg))
+                {
                     groups.check_mem()?;
                 }
             }
@@ -755,7 +771,9 @@ impl Run<'_> {
                             .collect(),
                     )
                 }
-                Need::Json(id) => ColData::Vals(rows.iter().map(|(_, r)| r.get(id).map_or(Val::Null, datum_val)).collect()),
+                Need::Json(id) => {
+                    ColData::Vals(rows.iter().map(|(_, r)| r.get(id).map_or(Val::Null, datum_val)).collect())
+                }
                 Need::Lookup(_) => continue,
             };
             b.cols.insert(need, data);
@@ -766,7 +784,14 @@ impl Run<'_> {
     }
 
     /// Reads need `need` of granules `g` of part `r`.
-    async fn read_need(&self, rd: &Reading<'_>, r: &PartRef, meta: &PartMeta, need: &Need, g: std::ops::Range<usize>) -> Result<ColData> {
+    async fn read_need(
+        &self,
+        rd: &Reading<'_>,
+        r: &PartRef,
+        meta: &PartMeta,
+        need: &Need,
+        g: std::ops::Range<usize>,
+    ) -> Result<ColData> {
         let n = (meta.starts[g.end] - meta.starts[g.start]) as usize;
         Ok(match need {
             Need::Col(id) => match meta.find(&ColRef::User(*id)) {
@@ -785,9 +810,14 @@ impl Run<'_> {
                     let Vector::Str(s) = v else { return Err(Error::internal("shared bucket is not text")) };
                     ColData::Vals(
                         (0..n)
-                            .map(|i| match s.get(i).and_then(|t| serde_json::from_str::<serde_json::Map<String, Json>>(t).ok()) {
-                                Some(o) => o.get(key).map_or(Val::Null, Val::from_json),
-                                None => Val::Null,
+                            .map(|i| {
+                                match s
+                                    .get(i)
+                                    .and_then(|t| serde_json::from_str::<serde_json::Map<String, Json>>(t).ok())
+                                {
+                                    Some(o) => o.get(key).map_or(Val::Null, Val::from_json),
+                                    None => Val::Null,
+                                }
                             })
                             .collect(),
                     )
@@ -816,7 +846,9 @@ impl Run<'_> {
                     let Some(ci) = meta.find(&ColRef::Shared { col: *id, bucket: b }) else { continue };
                     let Vector::Str(s) = rd.column(r, meta, ci, g.clone()).await? else { continue };
                     for (i, l) in leaves.iter_mut().enumerate() {
-                        if let Some(o) = s.get(i).and_then(|t| serde_json::from_str::<serde_json::Map<String, Json>>(t).ok()) {
+                        if let Some(o) =
+                            s.get(i).and_then(|t| serde_json::from_str::<serde_json::Map<String, Json>>(t).ok())
+                        {
                             for (k, v) in o {
                                 l.push((json::path_segments(&k).unwrap_or_default(), v));
                             }
@@ -827,7 +859,11 @@ impl Run<'_> {
                     leaves
                         .into_iter()
                         .enumerate()
-                        .map(|(i, l)| if present.is_null(i) { Val::Null } else { Val::Json(Json::Object(json::unflatten(l))) })
+                        .map(
+                            |(i, l)| {
+                                if present.is_null(i) { Val::Null } else { Val::Json(Json::Object(json::unflatten(l))) }
+                            },
+                        )
                         .collect(),
                 )
             }
@@ -835,7 +871,13 @@ impl Run<'_> {
         })
     }
 
-    async fn positions(&self, rd: &Reading<'_>, r: &PartRef, meta: &PartMeta, g: std::ops::Range<usize>) -> Result<Vec<Pos>> {
+    async fn positions(
+        &self,
+        rd: &Reading<'_>,
+        r: &PartRef,
+        meta: &PartMeta,
+        g: std::ops::Range<usize>,
+    ) -> Result<Vec<Pos>> {
         let n = (meta.starts[g.end] - meta.starts[g.start]) as usize;
         let ords = match meta.find(&ColRef::Ordinal) {
             Some(ci) => rd.column(r, meta, ci, g.clone()).await?,
@@ -846,7 +888,9 @@ impl Run<'_> {
             (None, Some(ci)) => rd.column(r, meta, ci, g).await?,
             (None, None) => Vector::Int(vec![Some(0); n]),
         };
-        let (Vector::Int(o), Vector::Int(v)) = (ords, vers) else { return Err(Error::internal("bad position columns")) };
+        let (Vector::Int(o), Vector::Int(v)) = (ords, vers) else {
+            return Err(Error::internal("bad position columns"));
+        };
         Ok(o.iter()
             .zip(&v)
             .map(|(o, v)| Pos { version: v.unwrap_or(0) as u64, ordinal: o.unwrap_or(0) as u32 })
@@ -921,11 +965,13 @@ impl Run<'_> {
                 out.push(false);
                 continue;
             }
-            let pk: Option<(Vec<crate::table::tuple::Key>, Vec<crate::table::tuple::Key>)> =
-                match (crate::table::tuple::decode_all(&meta.pk[g]), crate::table::tuple::decode_all(&meta.pk[g + 1])) {
-                    (Ok(a), Ok(b)) if a.len() == sort_ids.len() && b.len() == sort_ids.len() => Some((a, b)),
-                    _ => None,
-                };
+            let pk: Option<(Vec<crate::table::tuple::Key>, Vec<crate::table::tuple::Key>)> = match (
+                crate::table::tuple::decode_all(&meta.pk[g]),
+                crate::table::tuple::decode_all(&meta.pk[g + 1]),
+            ) {
+                (Ok(a), Ok(b)) if a.len() == sort_ids.len() && b.len() == sort_ids.len() => Some((a, b)),
+                _ => None,
+            };
             let stat_ok = may(&self.plan.filter, &mut |e, t| {
                 let stat = |s: &GranStat| match (&s.min, &s.max) {
                     (Some(lo), Some(hi)) => range_may(t, lo, hi),
@@ -937,14 +983,18 @@ impl Run<'_> {
                             if !stat(&idx.stats[g]) {
                                 return false;
                             }
-                            if let (false, Some(bloom)) = (idx.blooms.is_empty(), idx.blooms.get(g / part::BLOOM_GRANULES as usize)) {
+                            if let (false, Some(bloom)) =
+                                (idx.blooms.is_empty(), idx.blooms.get(g / part::BLOOM_GRANULES as usize))
+                            {
                                 let vals: Vec<&Json> = match t {
                                     Test::Eq(a) => vec![a],
                                     Test::In(l) => l.iter().collect(),
                                     _ => Vec::new(),
                                 };
                                 if !vals.is_empty() {
-                                    let hit = vals.iter().any(|a| bloom_hash(*phys, a).is_none_or(|h| bloom.may_contain_hash(h)));
+                                    let hit = vals
+                                        .iter()
+                                        .any(|a| bloom_hash(*phys, a).is_none_or(|h| bloom.may_contain_hash(h)));
                                     if !hit {
                                         by_bloom = true;
                                         return false;
@@ -1012,7 +1062,14 @@ impl Run<'_> {
         Ok(())
     }
 
-    async fn granule_run(&mut self, rd: &Reading<'_>, r: &PartRef, meta: &PartMeta, mask: &Runs, g: std::ops::Range<usize>) -> Result<()> {
+    async fn granule_run(
+        &mut self,
+        rd: &Reading<'_>,
+        r: &PartRef,
+        meta: &PartMeta,
+        mask: &Runs,
+        g: std::ops::Range<usize>,
+    ) -> Result<()> {
         let rows = meta.rows_of(g.clone());
         let n = (rows.end - rows.start) as usize;
         self.stats.granules_read += (g.end - g.start) as u64;
@@ -1127,7 +1184,11 @@ pub async fn input(txn: &mut Txn, s: &EventSchema, from: i64, to: i64) -> Result
 }
 
 /// Builds the maps of the query's lookups at the transaction's snapshot.
-async fn lookup_maps(txn: &mut Txn, q: &Query, limits: &Limits) -> Result<Vec<(String, Arc<DetHashMap<Vec<u8>, Val>>)>> {
+async fn lookup_maps(
+    txn: &mut Txn,
+    q: &Query,
+    limits: &Limits,
+) -> Result<Vec<(String, Arc<DetHashMap<Vec<u8>, Val>>)>> {
     let mut out = Vec::new();
     for (name, l) in &q.lookups {
         let (ts, rows) = crate::table::rows_within(txn, &l.table, limits.lookup_max_bytes).await?;
@@ -1151,7 +1212,14 @@ async fn lookup_maps(txn: &mut Txn, q: &Query, limits: &Limits) -> Result<Vec<(S
 }
 
 /// Runs `q` on table `s` at the transaction's snapshot.
-pub async fn run(shared: &Shared, db: &str, txn: &mut Txn, s: &EventSchema, q: &Query, limits: &Limits) -> Result<Output> {
+pub async fn run(
+    shared: &Shared,
+    db: &str,
+    txn: &mut Txn,
+    s: &EventSchema,
+    q: &Query,
+    limits: &Limits,
+) -> Result<Output> {
     let maps = lookup_maps(txn, q, limits).await?;
     let names: BTreeMap<String, usize> = maps.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
     let binder = Binder { schema: s, lookups: &names };
@@ -1187,11 +1255,10 @@ pub async fn run(shared: &Shared, db: &str, txn: &mut Txn, s: &EventSchema, q: &
                 q.order_by
                     .iter()
                     .map(|o| {
-                        let e = columns
-                            .iter()
-                            .find(|(n, _)| *n == o.name)
-                            .map(|(_, e)| e.clone())
-                            .ok_or_else(|| Error::invalid(format!("order_by {:?} is not an output column", o.name)))?;
+                        let e =
+                            columns.iter().find(|(n, _)| *n == o.name).map(|(_, e)| e.clone()).ok_or_else(|| {
+                                Error::invalid(format!("order_by {:?} is not an output column", o.name))
+                            })?;
                         Ok((e, o.desc))
                     })
                     .collect::<Result<_>>()?
@@ -1241,7 +1308,8 @@ pub async fn run(shared: &Shared, db: &str, txn: &mut Txn, s: &EventSchema, q: &
     };
     let input = input(txn, s, q.from, q.to).await?;
     let plan = Plan { schema: s, filter, lookups, kind, first, rest, positions };
-    let mut run = Run { plan, stats: Stats { source: "columns".into(), nodes: 1, ..Default::default() }, groups, kept, agg_fns };
+    let mut run =
+        Run { plan, stats: Stats { source: "columns".into(), nodes: 1, ..Default::default() }, groups, kept, agg_fns };
     run.stats.parts = input.refs.len() as u64;
     let read_stats = ReadStats::default();
     let rd = Reading { shared, db, cache: true, stats: &read_stats };
@@ -1297,7 +1365,12 @@ fn finish(run: Run<'_>, q: &Query, limits: &Limits) -> Result<Output> {
             }
             sort_rows(&names, &mut rows, &q.order_by)?;
             rows.truncate(q.limit);
-            Ok(Output { columns: names, rows: rows.iter().map(|r| r.iter().map(Val::to_json).collect()).collect(), next_cursor: None, stats })
+            Ok(Output {
+                columns: names,
+                rows: rows.iter().map(|r| r.iter().map(Val::to_json).collect()).collect(),
+                next_cursor: None,
+                stats,
+            })
         }
     }
 }
@@ -1306,7 +1379,10 @@ fn sort_rows(names: &[String], rows: &mut [Vec<Val>], order: &[super::query::Ord
     let keys: Vec<(usize, bool)> = order
         .iter()
         .map(|o| {
-            let i = names.iter().position(|n| *n == o.name).ok_or_else(|| Error::invalid(format!("order_by {:?} is not an output", o.name)))?;
+            let i = names
+                .iter()
+                .position(|n| *n == o.name)
+                .ok_or_else(|| Error::invalid(format!("order_by {:?} is not an output", o.name)))?;
             Ok((i, o.desc))
         })
         .collect::<Result<_>>()?;
@@ -1324,19 +1400,27 @@ fn sort_rows(names: &[String], rows: &mut [Vec<Val>], order: &[super::query::Ord
 }
 
 /// Aggregates first-stage rows, whose columns are `names`, by `s`.
-fn second_stage(names: &[String], rows: Vec<Vec<Val>>, s: &Stage, limits: &Limits) -> Result<(Vec<String>, Vec<Vec<Val>>)> {
+fn second_stage(
+    names: &[String],
+    rows: Vec<Vec<Val>>,
+    s: &Stage,
+    limits: &Limits,
+) -> Result<(Vec<String>, Vec<Vec<Val>>)> {
     let bind = |e: &Expr| -> Result<BExpr> {
         match e {
-            Expr::Col { name, path } if path.is_empty() => names
-                .iter()
-                .position(|n| n == name)
-                .map(BExpr::Out)
-                .ok_or_else(|| Error::invalid(format!("then refers to {name:?}, which the first stage does not output"))),
-            Expr::Bucket { of, interval, offset_ms } => Ok(BExpr::Bucket(Box::new(bind_out(names, of)?), *interval, *offset_ms)),
+            Expr::Col { name, path } if path.is_empty() => {
+                names.iter().position(|n| n == name).map(BExpr::Out).ok_or_else(|| {
+                    Error::invalid(format!("then refers to {name:?}, which the first stage does not output"))
+                })
+            }
+            Expr::Bucket { of, interval, offset_ms } => {
+                Ok(BExpr::Bucket(Box::new(bind_out(names, of)?), *interval, *offset_ms))
+            }
             _ => Err(Error::invalid("then refers to first-stage outputs by name")),
         }
     };
-    let group_by: Vec<(String, BExpr)> = s.group_by.iter().map(|g| Ok((g.name.clone(), bind(&g.expr)?))).collect::<Result<_>>()?;
+    let group_by: Vec<(String, BExpr)> =
+        s.group_by.iter().map(|g| Ok((g.name.clone(), bind(&g.expr)?))).collect::<Result<_>>()?;
     let mut aggs = Vec::new();
     for a in &s.aggregates {
         if a.filter.is_some() || matches!(a.func, AggFn::WindowFunnel { .. } | AggFn::Retention(_)) {
@@ -1380,18 +1464,26 @@ fn second_stage(names: &[String], rows: Vec<Vec<Val>>, s: &Stage, limits: &Limit
 
 fn bind_out(names: &[String], e: &Expr) -> Result<BExpr> {
     match e {
-        Expr::Col { name, path } if path.is_empty() => names
-            .iter()
-            .position(|n| n == name)
-            .map(BExpr::Out)
-            .ok_or_else(|| Error::invalid(format!("then refers to {name:?}, which the first stage does not output"))),
+        Expr::Col { name, path } if path.is_empty() => {
+            names.iter().position(|n| n == name).map(BExpr::Out).ok_or_else(|| {
+                Error::invalid(format!("then refers to {name:?}, which the first stage does not output"))
+            })
+        }
         _ => Err(Error::invalid("then refers to first-stage outputs by name")),
     }
 }
 
 /// The rows of `r` matching `f` that its mask does not already delete, as
 /// sorted offsets; used by deletes.
-pub async fn matching_rows(shared: &Shared, db: &str, s: &EventSchema, r: &PartRef, f: &Filter, from: i64, to: i64) -> Result<Vec<u32>> {
+pub async fn matching_rows(
+    shared: &Shared,
+    db: &str,
+    s: &EventSchema,
+    r: &PartRef,
+    f: &Filter,
+    from: i64,
+    to: i64,
+) -> Result<Vec<u32>> {
     let names = BTreeMap::new();
     let binder = Binder { schema: s, lookups: &names };
     let time = BExpr::Col(s.time_id());
@@ -1405,7 +1497,15 @@ pub async fn matching_rows(shared: &Shared, db: &str, s: &EventSchema, r: &PartR
     }
     let mut first = BTreeSet::new();
     filter_needs(&filter, &mut first, &[]);
-    let plan = Plan { schema: s, filter, lookups: Vec::new(), kind: Kind::Aggregate { first: BoundStage { group_by: Vec::new(), aggregates: Vec::new() }, then: None }, first, rest: BTreeSet::new(), positions: false };
+    let plan = Plan {
+        schema: s,
+        filter,
+        lookups: Vec::new(),
+        kind: Kind::Aggregate { first: BoundStage { group_by: Vec::new(), aggregates: Vec::new() }, then: None },
+        first,
+        rest: BTreeSet::new(),
+        positions: false,
+    };
     let run = Run { plan, stats: Stats::default(), groups: None, kept: None, agg_fns: Vec::new() };
     let read_stats = ReadStats::default();
     let rd = Reading { shared, db, cache: true, stats: &read_stats };
@@ -1445,14 +1545,24 @@ pub fn row_matches(s: &EventSchema, row: &Row, f: &Filter, from: i64, to: i64) -
     let bf = binder.filter(f)?;
     let mut needs = BTreeSet::new();
     filter_needs(&bf, &mut needs, &[]);
-    let plan = Plan { schema: s, filter: bf, lookups: Vec::new(), kind: Kind::Aggregate { first: BoundStage { group_by: Vec::new(), aggregates: Vec::new() }, then: None }, first: needs, rest: BTreeSet::new(), positions: false };
+    let plan = Plan {
+        schema: s,
+        filter: bf,
+        lookups: Vec::new(),
+        kind: Kind::Aggregate { first: BoundStage { group_by: Vec::new(), aggregates: Vec::new() }, then: None },
+        first: needs,
+        rest: BTreeSet::new(),
+        positions: false,
+    };
     let run = Run { plan, stats: Stats::default(), groups: None, kept: None, agg_fns: Vec::new() };
     let mut b = Batch { n: 1, cols: BTreeMap::new(), pos: vec![Pos::default()] };
     for need in run.plan.first.iter() {
         let v = match need {
             Need::Col(id) => row.get(id).map_or_else(|| default_val(s.column_by_id(*id)), datum_val),
             Need::Path(id, key) => match row.get(id) {
-                Some(Datum::Json(j)) => json::leaf(j, &json::path_segments(key).unwrap_or_default()).map_or(Val::Null, Val::from_json),
+                Some(Datum::Json(j)) => {
+                    json::leaf(j, &json::path_segments(key).unwrap_or_default()).map_or(Val::Null, Val::from_json)
+                }
                 _ => Val::Null,
             },
             Need::Json(id) => row.get(id).map_or(Val::Null, datum_val),

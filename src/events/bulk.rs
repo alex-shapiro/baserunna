@@ -154,7 +154,8 @@ impl Buffers {
                             let slot = ranges.partition_point(|rg| rg.end <= r.pos.ordinal);
                             offsets[slot].push(i as u32);
                         }
-                        parts.push(StagedPart { part, slot_rows: offsets.into_iter().map(Runs::from_sorted).collect() });
+                        parts
+                            .push(StagedPart { part, slot_rows: offsets.into_iter().map(Runs::from_sorted).collect() });
                     }
                     Err(e) => {
                         failed = Some(e);

@@ -416,7 +416,11 @@ impl DdSketch {
                 let z = u32::try_from(r.varint()?).map_err(|_| DecodeError("bad bucket"))?;
                 let i = ((z >> 1) as i32) ^ -((z & 1) as i32);
                 let c = r.varint()?;
-                if neg { s.neg.insert(i, c) } else { s.pos.insert(i, c) };
+                if neg {
+                    s.neg.insert(i, c)
+                } else {
+                    s.pos.insert(i, c)
+                };
             }
         }
         Ok(s)
@@ -454,7 +458,9 @@ mod tests {
         for _ in 0..300 {
             let n = r.usize(40);
             let xs: Vec<f64> = (0..n)
-                .map(|_| (r.unit() - 0.5) * 10f64.powi(r.usize(40) as i32 - 20) * if r.chance(0.1) { 1e200 } else { 1.0 })
+                .map(|_| {
+                    (r.unit() - 0.5) * 10f64.powi(r.usize(40) as i32 - 20) * if r.chance(0.1) { 1e200 } else { 1.0 }
+                })
                 .collect();
             let want = exact(&xs);
             let mut shuffled = xs.clone();
@@ -487,7 +493,11 @@ mod tests {
             let mut b = Hll::default();
             for i in 0..n {
                 let hh = hash64(&i.to_le_bytes());
-                if i % 3 == 0 { a.add_hash(hh) } else { b.add_hash(hh) };
+                if i % 3 == 0 {
+                    a.add_hash(hh)
+                } else {
+                    b.add_hash(hh)
+                };
             }
             a.merge(&b);
             let e = a.estimate() as f64;
@@ -525,7 +535,11 @@ mod tests {
         let mut a = DdSketch::default();
         let mut b = DdSketch::default();
         for (i, x) in xs.iter().enumerate() {
-            if i % 2 == 0 { a.add(*x) } else { b.add(*x) };
+            if i % 2 == 0 {
+                a.add(*x)
+            } else {
+                b.add(*x)
+            };
         }
         a.merge(&b);
         xs.sort_by(f64::total_cmp);
@@ -538,5 +552,26 @@ mod tests {
         a.encode(&mut w);
         assert_eq!(DdSketch::decode(&mut Reader::new(&w.buf)).unwrap(), a);
         assert_eq!(DdSketch::default().quantile(0.5), None);
+    }
+}
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    #[test]
+    fn quarter_sums_are_exact() {
+        let mut r = crate::util::rng::Rng::new(1);
+        for _ in 0..10000 {
+            let xs: Vec<f64> = (0..r.usize(30)).map(|_| (r.below(400) as f64 - 100.0) / 4.0).collect();
+            let mut s = ExactSum::default();
+            xs.iter().for_each(|x| s.add(*x));
+            let naive: f64 = xs.iter().sum();
+            assert_eq!(s.value(), naive, "{xs:?}");
+            let cut = r.usize(xs.len() + 1);
+            let (mut a, mut b) = (ExactSum::default(), ExactSum::default());
+            xs[..cut].iter().for_each(|x| a.add(*x));
+            xs[cut..].iter().for_each(|x| b.add(*x));
+            a.merge(&b);
+            assert_eq!(a.value(), naive, "merged {xs:?} at {cut}");
+        }
     }
 }

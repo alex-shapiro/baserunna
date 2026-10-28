@@ -745,14 +745,16 @@ mod tests {
     }
 
     fn encode_legacy_format(m: &Manifest, format: u16) -> Bytes {
-        let body = Manifest { flush_seq: 0, ..m.clone() }.encode_body();
+        let flush_seq = if format == FORMAT_V7 { m.flush_seq } else { 0 };
+        let body = Manifest { flush_seq, part_bytes: 0, ..m.clone() }.encode_body();
         let mut w = Writer::with_capacity(1024);
         w.raw(MAGIC);
         w.u16(format);
-        if format == FORMAT_V6 {
+        if format != FORMAT_V5 {
             w.u8(0);
         }
-        w.raw(&body[..body.len() - 1]);
+        let trailing = if format == FORMAT_V7 { 1 } else { 2 };
+        w.raw(&body[..body.len() - trailing]);
         let crc = crc32c(&w.buf);
         w.u32(crc);
         Bytes::from(w.into_inner())
@@ -760,8 +762,8 @@ mod tests {
 
     #[test]
     fn decodes_legacy_manifest_formats() {
-        let m = Manifest { flush_seq: 0, ..sample() };
-        for format in [FORMAT_V5, FORMAT_V6] {
+        let m = Manifest { flush_seq: 0, part_bytes: 0, ..sample() };
+        for format in [FORMAT_V5, FORMAT_V6, FORMAT_V7] {
             assert_eq!(Manifest::decode(&encode_legacy_format(&m, format)).unwrap(), m, "format {format}");
         }
     }

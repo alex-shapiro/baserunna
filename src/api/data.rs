@@ -65,7 +65,13 @@ pub(super) fn param<'a>(p: &'a HashMap<String, String>, k: &str) -> Result<&'a s
 }
 
 fn op_ctx<'a>(node: &Node, ctx: &'a DbCtx, enc: Encoding) -> OpCtx<'a> {
-    OpCtx { db: &ctx.db, encoding: enc, access: ctx.access, json_value_max: node.cfg.json_value_max }
+    OpCtx {
+        db: &ctx.db,
+        encoding: enc,
+        access: ctx.access,
+        json_value_max: node.cfg.json_value_max,
+        query_limits: node.cfg.query_limits,
+    }
 }
 
 #[derive(Serialize)]

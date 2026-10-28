@@ -126,7 +126,13 @@ pub async fn create(txn: &mut Txn, def: &CreateEvents) -> Result<EventSchema> {
     };
     for c in &def.columns {
         let nullable = c.nullable && c.name != def.time_column;
-        s.columns.push(EvColumn { id: s.next_column_id, name: c.name.clone(), ty: c.ty, nullable, default: c.default.clone() });
+        s.columns.push(EvColumn {
+            id: s.next_column_id,
+            name: c.name.clone(),
+            ty: c.ty,
+            nullable,
+            default: c.default.clone(),
+        });
         s.next_column_id += 1;
     }
     s.validate()?;
@@ -169,7 +175,13 @@ pub async fn add_column(txn: &mut Txn, table: &str, c: &ColumnSpec) -> Result<Ev
     if !c.nullable && c.default.is_none() {
         return Err(Error::invalid("a new non-nullable column needs a default"));
     }
-    s.columns.push(EvColumn { id: s.next_column_id, name: c.name.clone(), ty: c.ty, nullable: c.nullable, default: c.default.clone() });
+    s.columns.push(EvColumn {
+        id: s.next_column_id,
+        name: c.name.clone(),
+        ty: c.ty,
+        nullable: c.nullable,
+        default: c.default.clone(),
+    });
     s.next_column_id += 1;
     s.validate()?;
     put_schema(txn, &s)?;
@@ -291,7 +303,24 @@ pub fn table_json(s: &EventSchema, st: &TableState, refs: &[PartRef]) -> Json {
 /// Reads table state at the transaction's snapshot without tracking it.
 pub async fn state(txn: &mut Txn, id: u32) -> Result<TableState> {
     match txn.untracked_snapshot().get_entry(&ev::state_key(id)).await? {
-        Some(e) if !e.value.is_tombstone() => Ok(ev::state_of(&e).ok_or_else(|| Error::internal("corrupt event state"))?.1),
+        Some(e) if !e.value.is_tombstone() => {
+            Ok(ev::state_of(&e).ok_or_else(|| Error::internal("corrupt event state"))?.1)
+        }
         _ => Ok(TableState::default()),
     }
+}
+
+/// The bounds of a delete: milliseconds or RFC 3339 timestamps, all time by default.
+pub fn time_bounds(from: &Option<Json>, to: &Option<Json>) -> Result<(i64, i64)> {
+    let bound = |v: &Option<Json>, k: &str, dflt: i64| -> Result<i64> {
+        match v {
+            None | Some(Json::Null) => Ok(dflt),
+            Some(Json::String(s)) => schema::parse_rfc3339(s)
+                .ok_or_else(|| Error::invalid(format!("{k} is milliseconds or an RFC 3339 timestamp"))),
+            Some(v) => {
+                v.as_i64().ok_or_else(|| Error::invalid(format!("{k} is milliseconds or an RFC 3339 timestamp")))
+            }
+        }
+    };
+    Ok((bound(from, "from", i64::MIN / 4)?, bound(to, "to", i64::MAX / 4)?))
 }

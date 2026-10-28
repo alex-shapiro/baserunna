@@ -280,7 +280,10 @@ impl Runs {
 pub enum Mask {
     Inline(Runs),
     /// An object at `part/{id}/0` holding the encoded runs and a CRC32C.
-    Object { id: String, size: u64 },
+    Object {
+        id: String,
+        size: u64,
+    },
 }
 
 /// Everything a query needs to decide whether to open a part, and what the
@@ -800,7 +803,8 @@ mod tests {
         assert_eq!(p.stored_bytes(), 5077);
         p.mask = Some(Mask::Inline(Runs(vec![(1, 2)])));
         assert!(PartRef::decode(&p.key(), &p.encode()).is_err(), "mask count must match");
-        let st = TableState { unsealed_rows: 4, unsealed_bytes: 99, sealed_through: Some(Pos { version: 3, ordinal: 1 }) };
+        let st =
+            TableState { unsealed_rows: 4, unsealed_bytes: 99, sealed_through: Some(Pos { version: 3, ordinal: 1 }) };
         assert_eq!(TableState::decode(&st.encode()).unwrap(), st);
         let runs = Runs(vec![(0, 3), (9, 1)]);
         assert_eq!(decode_mask_object(&encode_mask_object(&runs)).unwrap(), runs);

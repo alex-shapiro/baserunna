@@ -11,7 +11,7 @@ use super::exec::{self, Limits};
 use super::query::{Filter, Query};
 use super::*;
 use crate::engine::tests::{engine, rt};
-use crate::engine::{Consistency, Db, EngineConfig, Engine, Isolation};
+use crate::engine::{Consistency, Db, Engine, EngineConfig, Isolation};
 use crate::probe::Probe;
 use crate::util::rng::Rng;
 use serde_json::json;
@@ -146,7 +146,8 @@ impl Gen {
         }
         let r = &mut self.r;
         if r.chance(0.25) {
-            q["columns"] = json!(["time", "event", "user", "n", "x", "flag", "props", {"col": "props", "path": ["k1"]}]);
+            q["columns"] =
+                json!(["time", "event", "user", "n", "x", "flag", "props", {"col": "props", "path": ["k1"]}]);
             q["limit"] = json!(1 + r.usize(30));
             if r.chance(0.3) {
                 q["order_by"] = json!([{"col": "n", "desc": true}, "time"]);
@@ -175,15 +176,21 @@ impl Gen {
             ("q", json!({"fn": "quantiles", "of": "x", "q": [0.1, 0.5, 0.99]})),
             ("max_p", json!({"fn": "max", "of": {"col": "props", "path": ["k2"]}})),
             ("b_count", json!({"fn": "count", "where": {"col": "event", "op": "eq", "value": "b"}})),
-            ("funnel", json!({"fn": "window_funnel", "window_ms": DAY, "steps": [
-                {"col": "event", "op": "eq", "value": "a"},
-                {"col": "event", "op": "eq", "value": "b"},
-                {"col": "event", "op": "prefix", "value": "pag"}
-            ]})),
-            ("ret", json!({"fn": "retention", "conditions": [
-                {"col": "event", "op": "eq", "value": "a"},
-                {"col": "flag", "op": "eq", "value": true}
-            ]})),
+            (
+                "funnel",
+                json!({"fn": "window_funnel", "window_ms": DAY, "steps": [
+                    {"col": "event", "op": "eq", "value": "a"},
+                    {"col": "event", "op": "eq", "value": "b"},
+                    {"col": "event", "op": "prefix", "value": "pag"}
+                ]}),
+            ),
+            (
+                "ret",
+                json!({"fn": "retention", "conditions": [
+                    {"col": "event", "op": "eq", "value": "a"},
+                    {"col": "flag", "op": "eq", "value": true}
+                ]}),
+            ),
         ] {
             if r.chance(0.4) {
                 aggs.insert(name.into(), a);
@@ -222,15 +229,13 @@ async fn compare(db: &Arc<Db>, model: &Arc<Db>, q: &Json) -> Result<usize, Strin
     let got = query(db, q).await.map_err(|e| format!("{q}: {e}"))?;
     let want = query(model, q).await.map_err(|e| format!("model {q}: {e}"))?;
     if got.columns != want.columns || got.rows != want.rows {
-        return Err(format!(
-            "query {q}\n got {:?}\nwant {:?}\nstats {:?}",
-            got.rows, want.rows, got.stats
-        ));
+        return Err(format!("query {q}\n got {:?}\nwant {:?}\nstats {:?}", got.rows, want.rows, got.stats));
     }
     if q.get("columns").is_some() && got.next_cursor.is_some() != want.next_cursor.is_some() {
         return Err(format!("cursors differ for {q}"));
     }
-    let nonzero = got.rows.iter().filter(|r| r.iter().any(|v| v.as_i64().is_some_and(|n| n > 0) || v.is_string())).count();
+    let nonzero =
+        got.rows.iter().filter(|r| r.iter().any(|v| v.as_i64().is_some_and(|n| n > 0) || v.is_string())).count();
     Ok(nonzero)
 }
 
@@ -259,22 +264,31 @@ async fn run(seed: u64, steps: usize) -> Result<usize, String> {
                 let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
                 let s = get_schema(&mut t, "events").await.map_err(err)?;
                 let valid = validate_rows(&s, &rows, 0).map_err(err)?;
-                let c = bufs.submit(db.clone(), s, valid, g.r.next_u64(), tokio::time::Instant::now() + std::time::Duration::from_secs(10)).await;
+                let c = bufs
+                    .submit(
+                        db.clone(),
+                        s,
+                        valid,
+                        g.r.next_u64(),
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                    )
+                    .await;
                 c.map_err(err)?;
                 txn_do(&model, async |t| insert(t, "events", &rows, 0).await).await.map_err(err)?;
             }
-            5 => {
-                match maint::seal(&db, table).await {
-                    Ok(_) | Err(Error::Conflict(_)) => {}
-                    Err(e) => return Err(e.to_string()),
-                }
-            }
+            5 => match maint::seal(&db, table).await {
+                Ok(_) | Err(Error::Conflict(_)) => {}
+                Err(e) => return Err(e.to_string()),
+            },
             6 => maint::maintain(&db, table, 8).await.map_err(err)?,
             7 => {
                 let f: Filter = Filter::parse(g.filter()).map_err(err)?;
                 let (from, to) = (T0 + g.r.below(8) as i64 * DAY / 2, T0 + (4 + g.r.below(10)) as i64 * DAY);
-                let a = txn_do(&db, async |t| maint::delete(&db, t, "events", from, to, &f).await).await.map_err(err)?;
-                let b = txn_do(&model, async |t| maint::delete(&model, t, "events", from, to, &f).await).await.map_err(err)?;
+                let a =
+                    txn_do(&db, async |t| maint::delete(&db, t, "events", from, to, &f).await).await.map_err(err)?;
+                let b = txn_do(&model, async |t| maint::delete(&model, t, "events", from, to, &f).await)
+                    .await
+                    .map_err(err)?;
                 if a != b {
                     return Err(format!("step {step}: delete counted {a}, model {b}"));
                 }

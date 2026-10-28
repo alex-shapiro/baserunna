@@ -5,7 +5,7 @@ use super::data::{PathMap, commit_hex, param, split_consistency};
 use super::{DbCtx, JsonBody, Params, consistency_of, with_read, with_txn};
 use crate::engine::{Committed, Consistency};
 use crate::error::{Error, Result};
-use crate::events::exec::{self, Limits};
+use crate::events::exec;
 use crate::events::query::{Filter, Query};
 use crate::events::schema::SkipIndex;
 use crate::events::{self, ColumnSpec, CreateEvents};
@@ -140,7 +140,11 @@ async fn add_skip_index(
     Ok(axum::Json(out))
 }
 
-async fn drop_skip_index(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
+async fn drop_skip_index(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+) -> Result<J> {
     let (name, col) = (param(&p, "t")?.to_string(), param(&p, "c")?.to_string());
     let (s, v) = with_txn!(node, ctx, |t| events::drop_skip_index(t, &name, &col).await);
     let mut out = s.to_json();
@@ -250,7 +254,12 @@ fn query_consistency(b: Json) -> Result<(Json, Consistency)> {
     Ok((b, if explicit { c } else { Consistency::Snapshot { max_staleness_ms: 5_000 } }))
 }
 
-async fn query(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap, JsonBody(b): JsonBody<Json>) -> Result<J> {
+async fn query(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+    JsonBody(b): JsonBody<Json>,
+) -> Result<J> {
     let name = param(&p, "t")?.to_string();
     let (b, c) = query_consistency(b)?;
     let q = Query::parse(b)?;
@@ -286,19 +295,6 @@ pub(crate) struct DeleteBody {
     pub filter: Filter,
 }
 
-/// The bounds of a delete: milliseconds or RFC 3339, all time by default.
-pub(crate) fn delete_bounds(from: &Option<Json>, to: &Option<Json>) -> Result<(i64, i64)> {
-    let bound = |v: &Option<Json>, k: &str, dflt: i64| -> Result<i64> {
-        match v {
-            None | Some(Json::Null) => Ok(dflt),
-            Some(Json::String(s)) => crate::events::schema::parse_rfc3339(s)
-                .ok_or_else(|| Error::invalid(format!("{k} is milliseconds or an RFC 3339 timestamp"))),
-            Some(v) => v.as_i64().ok_or_else(|| Error::invalid(format!("{k} is milliseconds or an RFC 3339 timestamp"))),
-        }
-    };
-    Ok((bound(from, "from", i64::MIN / 4)?, bound(to, "to", i64::MAX / 4)?))
-}
-
 async fn delete_rows(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
@@ -306,7 +302,7 @@ async fn delete_rows(
     JsonBody(b): JsonBody<DeleteBody>,
 ) -> Result<J> {
     let name = param(&p, "t")?.to_string();
-    let (from, to) = delete_bounds(&b.from, &b.to)?;
+    let (from, to) = events::time_bounds(&b.from, &b.to)?;
     let db = ctx.db.clone();
     let (n, v) = with_txn!(node, ctx, |t| events::maint::delete(&db, t, &name, from, to, &b.filter).await);
     Ok(axum::Json(json!({"deleted": n, "version": v})))
@@ -349,16 +345,14 @@ pub(crate) fn bind_results_from_json(j: &Json, n: usize) -> Result<Vec<Result<Co
 }
 
 /// Handles `POST /internal/v1/events/bind` on the lease holder.
-pub(super) async fn internal_bind(State(node): State<Arc<Node>>, axum::Json(b): axum::Json<ForwardedBind>) -> Result<J> {
+pub(super) async fn internal_bind(
+    State(node): State<Arc<Node>>,
+    axum::Json(b): axum::Json<ForwardedBind>,
+) -> Result<J> {
     let data = crate::util::b64::decode(&b.bind).ok_or_else(|| Error::invalid("bad bind encoding"))?;
     let bind = crate::engine::events::Bind::decode(&data).map_err(|e| Error::invalid(e.to_string()))?;
     let db = node.engine.db(&b.db);
     db.open(false).await?;
     let rs = db.bind(bind).await?;
     Ok(axum::Json(bind_results_json(&rs)))
-}
-
-/// Default limits of the work one query does.
-pub fn default_limits() -> Limits {
-    Limits::default()
 }

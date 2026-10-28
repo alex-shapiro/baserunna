@@ -1209,7 +1209,13 @@ fn op_batches_limits_and_defaults() {
         let run = |access: Access, ops: Vec<Op>| {
             let db = db.clone();
             async move {
-                let ctx = OpCtx { db: &db, encoding: Encoding::Utf8, access, json_value_max: 1 << 20 };
+                let ctx = OpCtx {
+                    db: &db,
+                    encoding: Encoding::Utf8,
+                    access,
+                    json_value_max: 1 << 20,
+                    query_limits: Default::default(),
+                };
                 let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
                 exec_ops(&ctx, &mut t, &ops).await
             }

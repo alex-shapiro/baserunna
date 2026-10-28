@@ -858,10 +858,12 @@ impl Node {
                 && let Some(addr) = self.addr_of(&holder).filter(|a| *a != self.cfg.addr)
             {
                 crate::probe::hit(crate::probe::Probe::BindForwarded);
-                let body = crate::api::ForwardedBind { db: db.id.clone(), bind: crate::util::b64::encode(&bind.encode()) };
+                let body =
+                    crate::api::ForwardedBind { db: db.id.clone(), bind: crate::util::b64::encode(&bind.encode()) };
                 match self.forward_internal(&holder, &addr, "/internal/v1/events/bind", &body).await {
                     Ok(j) => return crate::api::bind_results_from_json(&j, n),
-                    Err(Ok(e @ Error::Unavailable { outcome_unknown: false, .. })) | Err(Ok(e @ Error::NotOwner { .. })) => {
+                    Err(Ok(e @ Error::Unavailable { outcome_unknown: false, .. }))
+                    | Err(Ok(e @ Error::NotOwner { .. })) => {
                         last = e;
                         let _ = db.refresh(Instant::now(), false).await;
                         continue;

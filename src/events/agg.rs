@@ -539,7 +539,10 @@ pub fn funnel(evs: &[(i64, Pos, u32)], steps: usize, window_ms: i64, mode: Funne
         if mode.strict_order && deepest > 0 && deepest < steps && mask & (1 << deepest) == 0 && mask & 1 == 0 {
             return deepest;
         }
-        if mode.strict_deduplication && deepest > 0 && mask & (1 << (deepest - 1)) != 0 && mask & (1 << deepest.min(steps - 1)) == 0
+        if mode.strict_deduplication
+            && deepest > 0
+            && mask & (1 << (deepest - 1)) != 0
+            && mask & (1 << deepest.min(steps - 1)) == 0
         {
             return deepest;
         }
@@ -610,10 +613,21 @@ mod tests {
                 .collect()
         };
         let funnel_fn = AggFn::WindowFunnel { window_ms: 30, steps: vec![], mode: FunnelMode::default() };
-        [AggFn::Count, AggFn::Sum, AggFn::Min, AggFn::Max, AggFn::Avg, AggFn::Uniq, AggFn::UniqExact, AggFn::Quantiles(vec![0.5, 0.9]), funnel_fn, AggFn::Retention(vec![])]
-            .into_iter()
-            .map(|f| (f, vals(&mut r)))
-            .collect()
+        [
+            AggFn::Count,
+            AggFn::Sum,
+            AggFn::Min,
+            AggFn::Max,
+            AggFn::Avg,
+            AggFn::Uniq,
+            AggFn::UniqExact,
+            AggFn::Quantiles(vec![0.5, 0.9]),
+            funnel_fn,
+            AggFn::Retention(vec![]),
+        ]
+        .into_iter()
+        .map(|f| (f, vals(&mut r)))
+        .collect()
     }
 
     #[test]

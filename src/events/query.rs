@@ -239,7 +239,11 @@ pub enum AggFn {
     Quantiles(Vec<f64>),
     /// The longest prefix of `steps` matched in time order, each within
     /// `window_ms` of the first.
-    WindowFunnel { window_ms: i64, steps: Vec<Filter>, mode: FunnelMode },
+    WindowFunnel {
+        window_ms: i64,
+        steps: Vec<Filter>,
+        mode: FunnelMode,
+    },
     /// Whether the first condition held, then whether it and each other one held.
     Retention(Vec<Filter>),
 }
@@ -277,13 +281,14 @@ fn agg(name: String, v: Json) -> Result<AggSpec> {
         "uniq_exact" => AggFn::UniqExact,
         "quantiles" => {
             let qs = match o.remove("q") {
-                Some(Json::Array(a)) if !a.is_empty() && a.len() <= 32 => a
-                    .iter()
-                    .map(|q| q.as_f64().filter(|q| (0.0..=1.0).contains(q)))
-                    .collect::<Option<Vec<f64>>>(),
+                Some(Json::Array(a)) if !a.is_empty() && a.len() <= 32 => {
+                    a.iter().map(|q| q.as_f64().filter(|q| (0.0..=1.0).contains(q))).collect::<Option<Vec<f64>>>()
+                }
                 _ => None,
             };
-            AggFn::Quantiles(qs.ok_or_else(|| Error::invalid("quantiles takes q: an array of 1..=32 numbers in 0..=1"))?)
+            AggFn::Quantiles(
+                qs.ok_or_else(|| Error::invalid("quantiles takes q: an array of 1..=32 numbers in 0..=1"))?,
+            )
         }
         "window_funnel" => {
             let window_ms = o
@@ -326,7 +331,10 @@ fn agg(name: String, v: Json) -> Result<AggSpec> {
     if let Some(k) = o.keys().next() {
         return Err(Error::invalid(format!("unknown key {k:?} in aggregate {name:?}")));
     }
-    let needs_of = matches!(func, AggFn::Sum | AggFn::Min | AggFn::Max | AggFn::Avg | AggFn::Uniq | AggFn::UniqExact | AggFn::Quantiles(_));
+    let needs_of = matches!(
+        func,
+        AggFn::Sum | AggFn::Min | AggFn::Max | AggFn::Avg | AggFn::Uniq | AggFn::UniqExact | AggFn::Quantiles(_)
+    );
     match (needs_of, &of) {
         (true, None) => return Err(Error::invalid(format!("aggregate {name:?} needs of"))),
         (false, Some(_)) => return Err(Error::invalid(format!("aggregate {name:?} takes no of"))),
@@ -416,7 +424,9 @@ impl Query {
             match o.remove(k) {
                 Some(Json::String(s)) => super::schema::parse_rfc3339(&s)
                     .ok_or_else(|| Error::invalid(format!("{k} is milliseconds or an RFC 3339 timestamp"))),
-                Some(v) => v.as_i64().ok_or_else(|| Error::invalid(format!("{k} is milliseconds or an RFC 3339 timestamp"))),
+                Some(v) => {
+                    v.as_i64().ok_or_else(|| Error::invalid(format!("{k} is milliseconds or an RFC 3339 timestamp")))
+                }
                 None => Err(Error::invalid(format!("a query needs {k}"))),
             }
         };
@@ -432,12 +442,16 @@ impl Query {
                 return Err(Error::invalid("a query has at most 8 lookups"));
             }
             for (name, spec) in m {
-                let Json::Object(mut s) = spec else { return Err(Error::invalid(format!("lookup {name:?} is an object"))) };
+                let Json::Object(mut s) = spec else {
+                    return Err(Error::invalid(format!("lookup {name:?} is an object")));
+                };
                 let table = match s.remove("table") {
                     Some(Json::String(t)) => t,
                     _ => return Err(Error::invalid(format!("lookup {name:?} needs a table"))),
                 };
-                let key = Expr::parse(s.remove("key").ok_or_else(|| Error::invalid(format!("lookup {name:?} needs a key")))?)?;
+                let key = Expr::parse(
+                    s.remove("key").ok_or_else(|| Error::invalid(format!("lookup {name:?} needs a key")))?,
+                )?;
                 let value = match s.remove("value") {
                     Some(Json::String(v)) => v,
                     _ => return Err(Error::invalid(format!("lookup {name:?} needs a value column"))),
@@ -512,7 +526,13 @@ impl Query {
         };
         let max = if rows_mode { ROWS_LIMIT_MAX } else { GROUPS_LIMIT_MAX };
         let limit = match o.remove("limit") {
-            None => if rows_mode { 100 } else { max },
+            None => {
+                if rows_mode {
+                    100
+                } else {
+                    max
+                }
+            }
             Some(v) => v
                 .as_u64()
                 .filter(|l| (1..=max as u64).contains(l))

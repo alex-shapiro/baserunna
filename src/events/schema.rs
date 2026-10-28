@@ -135,6 +135,9 @@ impl EventSchema {
                 return Err(Error::invalid(format!("duplicate column {:?}", c.name)));
             }
             if let Some(d) = &c.default {
+                if c.ty == EvType::Json {
+                    return Err(Error::invalid(format!("json column {:?} cannot have a default", c.name)));
+                }
                 match (c.ty, d) {
                     (EvType::Time, Json::String(s)) if s == NOW => {}
                     _ => {

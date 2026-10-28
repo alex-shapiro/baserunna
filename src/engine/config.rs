@@ -104,7 +104,7 @@ pub struct EngineConfig {
     pub event_tier_base_bytes: u64,
     /// Parts at or above this stored size are not merged further.
     pub event_part_max_bytes: u64,
-    /// Merges running longer than this are abandoned.
+    /// Merges running longer than this, or than the stage TTL allows, are abandoned.
     pub event_merge_max_ms: u64,
     /// Partitions whose time range ended this long ago are merged into as
     /// few parts as the size cap allows.
@@ -202,10 +202,6 @@ impl EngineConfig {
                 "stream_seal_min_bytes must not exceed stream_chunk_bytes",
             ),
             (self.event_merge_fan_in >= 2, "event_merge_fan_in must be at least 2"),
-            (
-                self.event_merge_max_ms + 2 * self.clock_sync_max_error_ms < self.blob_stage_ttl_ms,
-                "event_merge_max_ms must leave time to bind a merge's output before its stage expires",
-            ),
             (self.event_granule_rows >= 1 && self.event_chunk_bytes >= 1, "event granules and chunks are not empty"),
         ];
         match rules.iter().find(|(ok, _)| !ok) {

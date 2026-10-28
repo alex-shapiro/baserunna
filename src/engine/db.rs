@@ -1796,14 +1796,19 @@ impl Db {
                     }
                     let added: u64 = bind.parts.iter().map(|p| p.part.size).sum();
                     let refusal = match now.store_ms {
-                        _ if pending(base, &m, &tail).entry(&events::state_key(bind.table)).await?.is_none_or(|e| e.value.is_tombstone()) => {
+                        _ if pending(base, &m, &tail)
+                            .entry(&events::state_key(bind.table))
+                            .await?
+                            .is_none_or(|e| e.value.is_tombstone()) =>
+                        {
                             Some(Error::not_found("event table not found"))
                         }
                         None => Some(Error::unavailable("store clock not synchronized")),
-                        Some(t) if bind.parts.iter().any(|p| {
-                            !events::stage_fresh(&p.part.id, t + bind_margin_ms(cfg), cfg.blob_stage_ttl_ms)
-                                || m.obsolete.iter().any(|o| o.id == p.part.id)
-                        }) =>
+                        Some(t)
+                            if bind.parts.iter().any(|p| {
+                                !events::stage_fresh(&p.part.id, t + bind_margin_ms(cfg), cfg.blob_stage_ttl_ms)
+                                    || m.obsolete.iter().any(|o| o.id == p.part.id)
+                            }) =>
                         {
                             probe::hit(Probe::StagedPartUnbindable);
                             Some(Error::unavailable("staged event parts expired before they were bound; retry"))
@@ -1824,14 +1829,27 @@ impl Db {
                     }
                     let accepted: Vec<usize> = (0..results.len()).filter(|i| results[*i].is_none()).collect();
                     let since_ms = now.store_ms.unwrap_or(time);
+                    // A retry of a bind whose earlier attempt landed finds its parts already bound.
+                    let mut fresh = Vec::with_capacity(bind.parts.len());
+                    for p in &bind.parts {
+                        let bound = pending(base, &m, &tail)
+                            .entry(&p.part.key())
+                            .await?
+                            .is_some_and(|e| !e.value.is_tombstone());
+                        if bound {
+                            probe::hit(Probe::BindInstallReplayed);
+                        } else {
+                            fresh.push(p);
+                        }
+                    }
                     if accepted.is_empty() {
-                        for p in &bind.parts {
+                        for p in &fresh {
                             m.obsolete.push(Obsolete { kind: ObjKind::Part, id: p.part.id.clone(), since_ms });
                         }
-                        meta_changed |= !bind.parts.is_empty();
+                        meta_changed |= !fresh.is_empty();
                     } else {
                         let new_seq = last_seq + 1;
-                        for p in &bind.parts {
+                        for p in &fresh {
                             let mut mask = events::Runs::default();
                             for (i, rows) in p.slot_rows.iter().enumerate() {
                                 if results[i].is_some() {
@@ -1874,7 +1892,8 @@ impl Db {
                         last_seq = new_seq;
                         data_changed = true;
                     }
-                    let results = results.into_iter().map(|r| r.unwrap_or_else(|| Err(Error::internal("unsettled bind slot"))));
+                    let results =
+                        results.into_iter().map(|r| r.unwrap_or_else(|| Err(Error::internal("unsettled bind slot"))));
                     outcomes.push(Outcome::Binds(results.collect()));
                 }
                 Work::MarkDeleted { .. } => {
@@ -2376,6 +2395,9 @@ impl Db {
             found(c, mtime, &mut items);
         }
         let mut parts = Listing::new(format!("dbs/{}/part/", self.id));
+        if event_tables.is_empty() && v.m.part_bytes == 0 {
+            parts.done = true;
+        }
         let mut cur: Option<(String, u64)> = None;
         let part_found = |id: String, mtime: u64, items: &mut Vec<Obsolete>| {
             let created = super::types::blob_id_time(&id).unwrap_or(0);

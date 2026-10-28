@@ -959,8 +959,10 @@ async fn not_found() -> Error {
 
 /// Builds the HTTP router for the node.
 pub fn router(node: Arc<Node>) -> Router {
-    let db_routes =
-        data::routes().merge(streams::routes()).merge(events::routes()).route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
+    let db_routes = data::routes()
+        .merge(streams::routes())
+        .merge(events::routes())
+        .route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
     let internal = Router::new()
         .route("/internal/v1/meta", post(account::internal_meta))
         .route("/internal/v1/notice", post(commit_notice))

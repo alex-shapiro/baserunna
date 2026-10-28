@@ -60,6 +60,37 @@ impl Sim {
                     newest.insert(e.key.clone(), e);
                 }
             }
+            let mut positions: std::collections::BTreeMap<(u32, crate::engine::events::Pos), String> =
+                Default::default();
+            let mut part_bytes = 0u64;
+            for e in newest.values().filter(|e| deletes.seq_at(&e.key) <= e.seq && !e.value.is_tombstone()) {
+                let place = if let Some((table, pos)) = crate::engine::events::parse_row_key(&e.key) {
+                    vec![((table, pos), "an unsealed row".to_string())]
+                } else if e.key.first() == Some(&crate::engine::events::PARTS) {
+                    let r =
+                        crate::engine::events::ref_of(e).ok_or_else(|| format!("db {db}: corrupt part reference"))?;
+                    part_bytes += r.stored_bytes();
+                    let live = check_part(&self.mem, db, &r)?;
+                    rep.parts += 1;
+                    live.into_iter().map(|p| ((r.table, p), format!("part {}", r.id))).collect()
+                } else {
+                    Vec::new()
+                };
+                for (k, where_) in place {
+                    if let Some(other) = positions.insert(k, where_.clone()) {
+                        return Err(format!(
+                            "db {db}: event table {} row {:?} is in {other} and in {where_}",
+                            k.0, k.1
+                        ));
+                    }
+                }
+            }
+            if part_bytes != m.part_bytes {
+                return Err(format!(
+                    "db {db}: references name {part_bytes} part bytes, the manifest counts {}",
+                    m.part_bytes
+                ));
+            }
             // The end of the last record or chunk seen of each stream.
             let mut covered: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
             for e in newest.values().filter(|e| deletes.seq_at(&e.key) <= e.seq && !e.value.is_tombstone()) {
@@ -94,6 +125,40 @@ impl Sim {
     }
 }
 
+/// A part's chunks exist and decode to the rows its reference claims;
+/// returns the positions of the rows its mask leaves.
+fn check_part(
+    mem: &crate::store::MemStore,
+    db: &str,
+    r: &crate::engine::events::PartRef,
+) -> Result<Vec<crate::engine::events::Pos>, String> {
+    let mut stream = Vec::with_capacity(r.size as usize);
+    for i in 0..r.chunks() {
+        let k = crate::engine::part_chunk_key(db, &r.id, i);
+        let g = mem.get_sync(&k, &Default::default()).map_err(|e| format!("db {db}: part chunk {k} missing: {e}"))?;
+        stream.extend_from_slice(&g.data);
+    }
+    let (_, pos) = crate::events::part::inspect(&Bytes::from(stream), r).map_err(|e| format!("db {db}: {e}"))?;
+    let mask = match &r.mask {
+        None => crate::engine::events::Runs::default(),
+        Some(crate::engine::events::Mask::Inline(m)) => m.clone(),
+        Some(crate::engine::events::Mask::Object { id, .. }) => {
+            let k = crate::engine::part_chunk_key(db, id, 0);
+            let g = mem.get_sync(&k, &Default::default()).map_err(|e| format!("db {db}: mask {k} missing: {e}"))?;
+            crate::engine::events::decode_mask_object(&g.data).map_err(|e| format!("db {db}: mask {k}: {e}"))?
+        }
+    };
+    if mask.count() != r.deleted {
+        return Err(format!(
+            "db {db}: part {} mask deletes {} rows, its reference says {}",
+            r.id,
+            mask.count(),
+            r.deleted
+        ));
+    }
+    Ok(pos.into_iter().enumerate().filter(|(i, _)| !mask.contains(*i as u32)).map(|(_, p)| p).collect())
+}
+
 /// A chunk exists and holds exactly the records its reference claims.
 fn check_chunk(mem: &crate::store::MemStore, db: &str, id: u64, c: &stream::ChunkRef) -> Result<(), String> {
     let k = crate::engine::seg_key(db, &c.id);
@@ -122,5 +187,7 @@ pub struct StorageReport {
     pub blobs: usize,
     /// Live sealed stream chunks.
     pub chunks: usize,
+    /// Live event table parts.
+    pub parts: usize,
     pub objects: usize,
 }

@@ -863,15 +863,7 @@ pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_
             nonnull,
         });
     }
-    let meta = PartMeta {
-        rows,
-        granules,
-        starts,
-        sort_ids,
-        pk: pk.clone(),
-        cols,
-        shared: src.shared_paths(),
-    };
+    let meta = PartMeta { rows, granules, starts, sort_ids, pk: pk.clone(), cols, shared: src.shared_paths() };
     let encoded = meta.encode();
     let meta_off = sink.pos();
     sink.write(&encoded);
@@ -1033,9 +1025,8 @@ impl Reading<'_> {
         }
         let idx = self.index(r, meta, ci).await?;
         let (b0, b1) = (idx.block_of(g.start), idx.block_of(g.end - 1) + 1);
-        let mut decoded: Vec<Option<Arc<Vector>>> = (b0..b1)
-            .map(|b| self.cached::<Vector>(&CacheKey::part(self.db, &r.id, ci as u32, b as u32)))
-            .collect();
+        let mut decoded: Vec<Option<Arc<Vector>>> =
+            (b0..b1).map(|b| self.cached::<Vector>(&CacheKey::part(self.db, &r.id, ci as u32, b as u32))).collect();
         let mut b = b0;
         while b < b1 {
             if decoded[b - b0].is_some() {
@@ -1044,7 +1035,10 @@ impl Reading<'_> {
             }
             let start = idx.blocks[b].off;
             let mut end = b + 1;
-            while end < b1 && decoded[end - b0].is_none() && idx.blocks[end].off + idx.blocks[end].len - start <= COALESCE_BYTES {
+            while end < b1
+                && decoded[end - b0].is_none()
+                && idx.blocks[end].off + idx.blocks[end].len - start <= COALESCE_BYTES
+            {
                 end += 1;
             }
             let span = start..idx.blocks[end - 1].off + idx.blocks[end - 1].len;
@@ -1099,6 +1093,56 @@ impl Reading<'_> {
     }
 }
 
+/// Decodes a whole part stream and returns its metadata and the position
+/// of every row, checking each column's index and blocks; used by storage
+/// invariant checks.
+pub fn inspect(
+    stream: &Bytes,
+    r: &PartRef,
+) -> std::result::Result<(PartMeta, Vec<crate::engine::events::Pos>), String> {
+    if stream.len() as u64 != r.size {
+        return Err(format!("part {} has {} bytes, its reference says {}", r.id, stream.len(), r.size));
+    }
+    let slice = |off: u64, len: u64| -> std::result::Result<Bytes, String> {
+        let end = off.checked_add(len).filter(|e| *e <= r.size).ok_or("range out of bounds")?;
+        Ok(stream.slice(off as usize..end as usize))
+    };
+    let meta = PartMeta::decode(&slice(r.meta_off, r.meta_len)?).map_err(|e| e.to_string())?;
+    if meta.rows != r.rows || meta.pk.first() != Some(&r.min_key) || meta.pk.last() != Some(&r.max_key) {
+        return Err(format!("part {} metadata does not match its reference", r.id));
+    }
+    let mut columns: BTreeMap<ColRef, Vector> = BTreeMap::new();
+    for c in &meta.cols {
+        let idx = ColIndex::decode(&slice(c.index_off, c.index_len)?, c.phys).map_err(|e| e.to_string())?;
+        let mut parts = Vec::new();
+        for b in &idx.blocks {
+            let raw = unframe(&slice(b.off, b.len)?).map_err(|e| e.to_string())?;
+            parts.push(decode_block(&raw, c.phys, idx.dict.as_ref()).map_err(|e| e.to_string())?);
+        }
+        let v = Vector::concat(parts, c.phys);
+        if v.len() as u64 != meta.rows || (v.len() - v.nulls()) as u64 != c.nonnull {
+            return Err(format!("part {} column {:?} does not have its rows", r.id, c.cref));
+        }
+        columns.insert(c.cref.clone(), v);
+    }
+    let ints = |c: &ColRef| match columns.get(c) {
+        Some(Vector::Int(x)) => Some(x.clone()),
+        _ => None,
+    };
+    let ords = ints(&ColRef::Ordinal).ok_or_else(|| format!("part {} has no ordinals", r.id))?;
+    let vers = match (r.version, ints(&ColRef::Version)) {
+        (Some(v), None) => vec![Some(v as i64); ords.len()],
+        (None, Some(v)) => v,
+        _ => return Err(format!("part {} has versions in both its reference and its rows", r.id)),
+    };
+    let pos = ords
+        .iter()
+        .zip(&vers)
+        .map(|(o, v)| crate::engine::events::Pos { version: v.unwrap_or(0) as u64, ordinal: o.unwrap_or(0) as u32 })
+        .collect();
+    Ok((meta, pos))
+}
+
 /// Writes a mask object and returns its id and size.
 pub async fn write_mask(shared: &Shared, db: &str, runs: &Runs) -> Result<(String, u64)> {
     let id = crate::engine::types::make_blob_id(shared.time_ms(), &shared.env.random_bytes(10));
@@ -1130,7 +1174,13 @@ pub(crate) mod tests {
             let ints = Vector::Int(
                 (0..n)
                     .map(|i| {
-                        let v = if constant { base } else if r.chance(0.5) { base.wrapping_add(i as i64) } else { r.next_u64() as i64 };
+                        let v = if constant {
+                            base
+                        } else if r.chance(0.5) {
+                            base.wrapping_add(i as i64)
+                        } else {
+                            r.next_u64() as i64
+                        };
                         opt(&mut r).then_some(v)
                     })
                     .collect(),

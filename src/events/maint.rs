@@ -46,7 +46,9 @@ pub async fn schema_by_id(txn: &mut Txn, id: u32) -> Result<Option<EventSchema>>
 
 async fn delete_parts(shared: &Shared, db: &str, ids: impl IntoIterator<Item = String>) {
     for id in ids {
-        if let Ok(objs) = crate::store::list_all(&*shared.store, &crate::engine::part_prefix(db, &id), &shared.retry).await {
+        if let Ok(objs) =
+            crate::store::list_all(&*shared.store, &crate::engine::part_prefix(db, &id), &shared.retry).await
+        {
             for o in objs {
                 let _ = shared.retry.run(|| shared.store.delete(&o.key)).await;
             }
@@ -217,7 +219,10 @@ enum Feed {
     SharedPath(usize, String),
     /// The output shared bucket gathers these input path columns and this
     /// input shared bucket, leaving out paths the output stores as columns.
-    Bucket { paths: Vec<(usize, String)>, shared: Option<usize> },
+    Bucket {
+        paths: Vec<(usize, String)>,
+        shared: Option<usize>,
+    },
     /// The input's version (from its reference) or ordinal.
     Version,
     Ordinal,
@@ -256,6 +261,8 @@ struct MergeSource<'a> {
     row_bytes: u64,
     cursors: BTreeMap<(usize, usize, usize), Cursor>,
     cursor_plan: usize,
+    /// The default each output column stores for rows that lack a value.
+    defaults: Vec<Option<super::agg::Val>>,
 }
 
 impl MergeSource<'_> {
@@ -282,7 +289,9 @@ impl MergeSource<'_> {
             Vector::Bool(x) => x[at].map_or(super::agg::Val::Null, super::agg::Val::Bool),
             Vector::Str(s) => match s.get(at) {
                 None => super::agg::Val::Null,
-                Some(t) if json => serde_json::from_str::<Json>(t).map(|j| super::agg::Val::from_json(&j)).unwrap_or(super::agg::Val::Null),
+                Some(t) if json => serde_json::from_str::<Json>(t)
+                    .map(|j| super::agg::Val::from_json(&j))
+                    .unwrap_or(super::agg::Val::Null),
                 Some(t) => super::agg::Val::Str(t.to_string()),
             },
         })
@@ -292,7 +301,14 @@ impl MergeSource<'_> {
 fn to_vector(phys: Phys, json_text: bool, vals: Vec<Option<super::agg::Val>>) -> Vector {
     use super::agg::Val;
     match phys {
-        Phys::Int => Vector::Int(vals.into_iter().map(|v| match v { Some(Val::Int(i)) => Some(i), _ => None }).collect()),
+        Phys::Int => Vector::Int(
+            vals.into_iter()
+                .map(|v| match v {
+                    Some(Val::Int(i)) => Some(i),
+                    _ => None,
+                })
+                .collect(),
+        ),
         Phys::Float => Vector::Float(
             vals.into_iter()
                 .map(|v| match v {
@@ -301,7 +317,14 @@ fn to_vector(phys: Phys, json_text: bool, vals: Vec<Option<super::agg::Val>>) ->
                 })
                 .collect(),
         ),
-        Phys::Bool => Vector::Bool(vals.into_iter().map(|v| match v { Some(Val::Bool(b)) => Some(b), _ => None }).collect()),
+        Phys::Bool => Vector::Bool(
+            vals.into_iter()
+                .map(|v| match v {
+                    Some(Val::Bool(b)) => Some(b),
+                    _ => None,
+                })
+                .collect(),
+        ),
         Phys::Str => {
             let texts: Vec<Option<String>> = vals
                 .into_iter()
@@ -368,7 +391,9 @@ impl Source for MergeSource<'_> {
                     _ => Val::Null,
                 },
                 Feed::Bucket { paths, shared } => {
-                    let OutKind::Bucket(chosen) = self.kinds[plan].clone() else { return Err(Error::internal("bucket feed without a bucket")) };
+                    let OutKind::Bucket(chosen) = self.kinds[plan].clone() else {
+                        return Err(Error::internal("bucket feed without a bucket"));
+                    };
                     let mut o = Map::new();
                     for (ci, key) in paths {
                         let v = self.input_val(i, ci, row, plan).await?;
@@ -387,6 +412,10 @@ impl Source for MergeSource<'_> {
                     }
                     if o.is_empty() { Val::Null } else { Val::Json(Json::Object(o)) }
                 }
+            };
+            let v = match (&self.defaults[plan], v) {
+                (Some(d), Val::Null) => d.clone(),
+                (_, v) => v,
             };
             vals.push(Some(v));
         }
@@ -415,7 +444,13 @@ fn input_type(meta: &PartMeta, ci: usize) -> JType {
 }
 
 /// Writes the live rows of `inputs` as one part.
-async fn merge_parts(shared: &Shared, db: &str, s: &EventSchema, inputs: &[PartRef], stats: &ReadStats) -> Result<Option<PartRef>> {
+async fn merge_parts(
+    shared: &Shared,
+    db: &str,
+    s: &EventSchema,
+    inputs: &[PartRef],
+    stats: &ReadStats,
+) -> Result<Option<PartRef>> {
     let rd = Reading { shared, db, cache: false, stats };
     let mut ins = Vec::with_capacity(inputs.len());
     for r in inputs {
@@ -484,7 +519,13 @@ async fn merge_parts(shared: &Shared, db: &str, s: &EventSchema, inputs: &[PartR
                 EvType::String => union_dicts(&rd, &ins, &srcs).await?,
                 _ => None,
             };
-            plans.push(ColPlan { cref: ColRef::User(c.id), phys: phys_of(c.ty), json: false, dict, bloom: blooms.contains(&c.id) });
+            plans.push(ColPlan {
+                cref: ColRef::User(c.id),
+                phys: phys_of(c.ty),
+                json: false,
+                dict,
+                bloom: blooms.contains(&c.id),
+            });
             kinds.push(OutKind::Plain);
             feeds.push(srcs.iter().map(|s| s.map_or(Feed::None, Feed::Col)).collect());
             continue;
@@ -499,7 +540,10 @@ async fn merge_parts(shared: &Shared, db: &str, s: &EventSchema, inputs: &[PartR
                 stats.entry(key.to_string()).and_modify(|(m, ty)| (*m, *ty) = (*m + n, ty.join(t))).or_insert((n, t));
             }
             for p in inp.meta.shared.get(&c.id).into_iter().flatten() {
-                stats.entry(p.key.clone()).and_modify(|(m, ty)| (*m, *ty) = (*m + p.count, ty.join(p.ty))).or_insert((p.count, p.ty));
+                stats
+                    .entry(p.key.clone())
+                    .and_modify(|(m, ty)| (*m, *ty) = (*m + p.count, ty.join(p.ty)))
+                    .or_insert((p.count, p.ty));
             }
         }
         let chosen = Arc::new(choose_paths(&stats, shared.cfg.event_json_max_paths));
@@ -525,12 +569,28 @@ async fn merge_parts(shared: &Shared, db: &str, s: &EventSchema, inputs: &[PartR
                 })
                 .collect();
             let dict = if phys == Phys::Str && !js {
-                let srcs: Vec<Option<usize>> = path_feeds.iter().map(|f| match f { Feed::Col(ci) => Some(*ci), _ => None }).collect();
-                if path_feeds.iter().all(|f| matches!(f, Feed::Col(_) | Feed::None)) { union_dicts(&rd, &ins, &srcs).await? } else { None }
+                let srcs: Vec<Option<usize>> = path_feeds
+                    .iter()
+                    .map(|f| match f {
+                        Feed::Col(ci) => Some(*ci),
+                        _ => None,
+                    })
+                    .collect();
+                if path_feeds.iter().all(|f| matches!(f, Feed::Col(_) | Feed::None)) {
+                    union_dicts(&rd, &ins, &srcs).await?
+                } else {
+                    None
+                }
             } else {
                 None
             };
-            plans.push(ColPlan { cref: ColRef::Path { col: c.id, key: key.clone() }, phys, json: js, dict, bloom: false });
+            plans.push(ColPlan {
+                cref: ColRef::Path { col: c.id, key: key.clone() },
+                phys,
+                json: js,
+                dict,
+                bloom: false,
+            });
             kinds.push(OutKind::Plain);
             feeds.push(path_feeds);
         }
@@ -554,7 +614,13 @@ async fn merge_parts(shared: &Shared, db: &str, s: &EventSchema, inputs: &[PartR
                     Feed::Bucket { paths, shared }
                 })
                 .collect();
-            plans.push(ColPlan { cref: ColRef::Shared { col: c.id, bucket: b }, phys: Phys::Str, json: true, dict: None, bloom: false });
+            plans.push(ColPlan {
+                cref: ColRef::Shared { col: c.id, bucket: b },
+                phys: Phys::Str,
+                json: true,
+                dict: None,
+                bloom: false,
+            });
             kinds.push(OutKind::Bucket(chosen.clone()));
             feeds.push(bucket_feeds);
         }
@@ -568,12 +634,23 @@ async fn merge_parts(shared: &Shared, db: &str, s: &EventSchema, inputs: &[PartR
     plans.push(ColPlan { cref: ColRef::Ordinal, phys: Phys::Int, json: false, dict: None, bloom: false });
     kinds.push(OutKind::Plain);
     feeds.push(vec![Feed::Ordinal; ins.len()]);
-    let (min_version, max_version) = entries.iter().fold((u64::MAX, 0), |(lo, hi), e| (lo.min(e.1.version), hi.max(e.1.version)));
+    let stored: BTreeMap<u32, super::agg::Val> =
+        super::build::stored_defaults(s).into_iter().map(|(id, d)| (id, super::exec::datum_val(&d))).collect();
+    let defaults: Vec<Option<super::agg::Val>> = plans
+        .iter()
+        .map(|p| match &p.cref {
+            ColRef::User(id) => stored.get(id).cloned(),
+            _ => None,
+        })
+        .collect();
+    let (min_version, max_version) =
+        entries.iter().fold((u64::MAX, 0), |(lo, hi), e| (lo.min(e.1.version), hi.max(e.1.version)));
     let level = ins.iter().map(|i| i.r.level).max().unwrap_or(0).saturating_add(1);
     let partition = inputs[0].partition;
     let keys: Vec<Bytes> = entries.iter().map(|e| e.0.clone()).collect();
     let order: Vec<(u16, u32)> = entries.iter().map(|e| (e.2, e.3)).collect();
-    let (min_time, max_time) = inputs.iter().fold((i64::MAX, i64::MIN), |(lo, hi), r| (lo.min(r.min_time), hi.max(r.max_time)));
+    let (min_time, max_time) =
+        inputs.iter().fold((i64::MAX, i64::MIN), |(lo, hi), r| (lo.min(r.min_time), hi.max(r.max_time)));
     let mut src = MergeSource {
         rd: Reading { shared, db, cache: false, stats },
         inputs: ins,
@@ -586,6 +663,7 @@ async fn merge_parts(shared: &Shared, db: &str, s: &EventSchema, inputs: &[PartR
         row_bytes: (raw / live.max(1)).max(1),
         cursors: BTreeMap::new(),
         cursor_plan: usize::MAX,
+        defaults,
     };
     let mut sink = Sink::new(shared, db, part::new_part_id(shared));
     let w = part::write(&mut sink, &mut src, 3, sort_ids).await?;
@@ -635,7 +713,9 @@ pub async fn merge(db: &Arc<Db>, s: &EventSchema, inputs: &[PartRef]) -> Result<
     let started = shared.env.now_ms();
     let stats = ReadStats::default();
     let out = merge_parts(&shared, &db.id, s, inputs, &stats).await?;
-    if shared.env.now_ms().saturating_sub(started) > shared.cfg.event_merge_max_ms {
+    let cfg = &shared.cfg;
+    let max_ms = cfg.event_merge_max_ms.min(cfg.blob_stage_ttl_ms.saturating_sub(4 * cfg.clock_sync_max_error_ms));
+    if shared.env.now_ms().saturating_sub(started) > max_ms {
         if let Some(o) = out {
             delete_parts(&shared, &db.id, [o.id]).await;
         }
@@ -841,7 +921,8 @@ mod tests {
 
     #[test]
     fn rows_split_by_size() {
-        let row = |i: u32| PosRow { pos: Pos { version: 1, ordinal: i }, row: [(1, Datum::Str("x".repeat(100)))].into() };
+        let row =
+            |i: u32| PosRow { pos: Pos { version: 1, ordinal: i }, row: [(1, Datum::Str("x".repeat(100)))].into() };
         let groups = split_rows((0..10).map(row).collect(), 350);
         assert!(groups.len() >= 3 && groups.iter().all(|g| !g.is_empty()));
         assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), 10);

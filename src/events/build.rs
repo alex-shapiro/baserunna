@@ -64,6 +64,22 @@ pub fn dictionary<'a>(vals: impl Iterator<Item = &'a str>) -> Option<Arc<Vec<Str
     Some(Arc::new(set.into_iter().map(str::to_string).collect()))
 }
 
+/// The defaults that parts store for rows written before their column was
+/// added, so that every read of such a row sees the default.
+pub fn stored_defaults(schema: &EventSchema) -> Vec<(u32, Datum)> {
+    schema
+        .columns
+        .iter()
+        .filter_map(|c| {
+            let d = c.default.as_ref()?;
+            match super::schema::datum(c, d) {
+                Ok(v) if !v.is_null() && c.ty != EvType::Json => Some((c.id, v)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// Chooses the `max` most common paths to store as columns, the most
 /// common first and then by key.
 pub fn choose_paths(stats: &BTreeMap<String, (u64, JType)>, max: usize) -> BTreeSet<String> {
@@ -84,6 +100,11 @@ impl RowsSource {
     /// Sorts `rows` and plans their columns; `versions` stores each row's
     /// version, which binds of staged parts leave to their reference.
     pub fn new(schema: &EventSchema, mut rows: Vec<PosRow>, versions: bool, max_paths: usize) -> RowsSource {
+        for (id, d) in stored_defaults(schema) {
+            for r in rows.iter_mut() {
+                r.row.entry(id).or_insert_with(|| d.clone());
+            }
+        }
         let mut keyed: Vec<(Vec<u8>, PosRow)> = rows.drain(..).map(|r| (schema.sort_key(&r.row), r)).collect();
         keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.pos.cmp(&b.1.pos)));
         let keys: Vec<Bytes> = keyed.iter().map(|(k, _)| Bytes::from(k.clone())).collect();
@@ -152,7 +173,13 @@ impl RowsSource {
                     }
                     _ => None,
                 };
-                plans.push(ColPlan { cref: ColRef::Path { col: c.id, key: key.clone() }, phys, json: js, dict, bloom: false });
+                plans.push(ColPlan {
+                    cref: ColRef::Path { col: c.id, key: key.clone() },
+                    phys,
+                    json: js,
+                    dict,
+                    bloom: false,
+                });
                 getters.push(Getter::Path { col: c.id, key: key.clone(), ty });
             }
             let rest: Vec<SharedPath> = stats
@@ -239,7 +266,8 @@ impl RowsSource {
                     JType::Float => Vector::Float((0..ls.len()).map(|i| get(i).and_then(Json::as_f64)).collect()),
                     JType::Bool => Vector::Bool((0..ls.len()).map(|i| get(i).and_then(Json::as_bool)).collect()),
                     _ => {
-                        let texts: Vec<Option<String>> = (0..ls.len()).map(|i| get(i).map(|v| leaf_text(*ty, v))).collect();
+                        let texts: Vec<Option<String>> =
+                            (0..ls.len()).map(|i| get(i).map(|v| leaf_text(*ty, v))).collect();
                         Vector::Str(Strs::from_values(texts.iter().map(|t| t.as_deref())))
                     }
                 }

@@ -215,6 +215,17 @@ fn engine_knobs(k: &Knobs, c: &mut SimConfig) {
     e.read_lease_ms = e.lease_ms * k.range("engine.read_lease_multiple", 1, 3);
     e.lease_margin_ms = e.lease_ms / k.pick("engine.lease_margin_divisor", &[4, 10, 20]);
     e.version_sample_ms = k.log_range("engine.version_sample_ms", 500, 30_000);
+    e.event_seal_bytes = k.log_range("engine.event_seal_bytes", 256, 64 * 1024) as usize;
+    e.event_chunk_bytes = k.log_range("engine.event_chunk_bytes", 512, 1 << 20) as usize;
+    e.event_granule_rows = k.log_range("engine.event_granule_rows", 2, 512) as usize;
+    e.event_granule_bytes = k.log_range("engine.event_granule_bytes", 256, 64 * 1024) as usize;
+    e.event_block_bytes = k.log_range("engine.event_block_bytes", 64, 64 * 1024) as usize;
+    e.event_insert_part_max_bytes = k.log_range("engine.event_insert_part_max_bytes", 1024, 256 * 1024) as usize;
+    e.event_merge_fan_in = k.range("engine.event_merge_fan_in", 2, 8) as usize;
+    e.event_tier_base_bytes = k.log_range("engine.event_tier_base_bytes", 256, 64 * 1024);
+    e.event_part_max_bytes = k.log_range("engine.event_part_max_bytes", 4 * 1024, 1 << 20);
+    e.event_settle_ms = k.log_range("engine.event_settle_ms", 1_000, 86_400_000);
+    e.event_json_max_paths = k.log_range("engine.event_json_max_paths", 1, 64) as usize;
 }
 
 fn node_knobs(k: &Knobs, c: &mut SimConfig) {
@@ -225,6 +236,9 @@ fn node_knobs(k: &Knobs, c: &mut SimConfig) {
     n.sys_staleness_ms = k.log_range("node.sys_staleness_ms", 0, 1_000);
     n.db_idle_evict_ms = k.log_range("node.db_idle_evict_ms", 500, 60_000);
     n.index_backfill_batch_rows = k.log_range("node.index_backfill_batch_rows", 1, 64) as usize;
+    n.event_insert_buffer_ms = k.pick("node.event_insert_buffer_ms", &[0, 5, 50, 200]);
+    n.event_insert_buffer_bytes = k.log_range("node.event_insert_buffer_bytes", 512, 64 * 1024) as usize;
+    n.query_concurrency = k.range("node.query_concurrency", 1, 8) as usize;
     n.engine = c.engine.clone();
 }
 

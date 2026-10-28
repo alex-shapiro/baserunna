@@ -34,6 +34,15 @@ pub(super) fn served_locally(method: &http::Method, path: &str) -> bool {
         && matches!(segs[6], "rows" | "query")
 }
 
+/// Whether a request is an event query, which reads a snapshot at most
+/// [`QUERY_STALENESS_MS`] old unless it asks for strong consistency.
+pub(super) fn is_query(method: &http::Method, path: &str) -> bool {
+    served_locally(method, path) && path.trim_end_matches('/').ends_with("/query")
+}
+
+/// The staleness of an event query's snapshot by default.
+pub(super) const QUERY_STALENESS_MS: u64 = 5_000;
+
 pub fn routes() -> Router<Arc<Node>> {
     Router::new()
         .route("/v1/dbs/{db}/events", get(list).post(create))
@@ -251,7 +260,7 @@ fn inserted(count: usize, c: &Committed, replayed: bool, commit_id: u64) -> Resp
 fn query_consistency(b: Json) -> Result<(Json, Consistency)> {
     let explicit = b.get("consistency").is_some();
     let (b, c) = split_consistency(b)?;
-    Ok((b, if explicit { c } else { Consistency::Snapshot { max_staleness_ms: 5_000 } }))
+    Ok((b, if explicit { c } else { Consistency::Snapshot { max_staleness_ms: QUERY_STALENESS_MS } }))
 }
 
 async fn query(

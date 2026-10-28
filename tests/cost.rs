@@ -37,6 +37,13 @@ const BUDGETS: &[(&str, f64, f64, f64, f64)] = &[
     ("stream_tail_read_leased", 0.0, 0.0, 0.0, 0.0),
     ("log_ingest", 0.5, 62.0, 0.1, 0.1),
     ("cold_stream_read", 5.5, 0.0, 0.0, 0.0),
+    ("event_txn_insert", 0.0, 1.0, 0.0, 0.0),
+    // Parts, binds and merges for NDJSON arriving fast enough to fill insert buffers.
+    ("event_bulk_ingest", 0.0, 2.0, 0.0, 0.0),
+    ("event_query_warm", 0.0, 0.0, 0.0, 0.0),
+    // Per part: its metadata (or the whole part, when small) and the column indexes and blocks read.
+    ("event_query_cold", 2.0, 0.0, 0.0, 0.0),
+    ("event_table_idle", 0.0, 0.0, 0.0, 0.0),
 ];
 
 /// Monthly budget in USD for the `typical` profile.

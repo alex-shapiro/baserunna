@@ -390,8 +390,15 @@ pub struct LookupSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mode {
-    Rows { columns: Vec<Named>, cursor: Option<String> },
-    Aggregate { first: Stage, then: Option<Stage> },
+    /// Rows of the named columns; no columns means every column.
+    Rows {
+        columns: Vec<Named>,
+        cursor: Option<String>,
+    },
+    Aggregate {
+        first: Stage,
+        then: Option<Stage>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -466,12 +473,14 @@ impl Query {
                 lookups.insert(name, LookupSpec { table, key, value, default });
             }
         }
-        let rows_mode = o.contains_key("columns");
+        let rows_mode =
+            o.contains_key("columns") || !["group_by", "aggregates", "then"].iter().any(|k| o.contains_key(*k));
         if rows_mode && (o.contains_key("group_by") || o.contains_key("aggregates") || o.contains_key("then")) {
             return Err(Error::invalid("a query returns either columns or aggregates"));
         }
         let mode = if rows_mode {
             let columns = match o.remove("columns") {
+                None => Vec::new(),
                 Some(Json::Array(a)) if !a.is_empty() && a.len() <= EXPRS_MAX => {
                     a.into_iter().map(named).collect::<Result<Vec<_>>>()?
                 }
@@ -596,10 +605,12 @@ mod tests {
         let Mode::Aggregate { first, .. } = &q.mode else { panic!() };
         assert_eq!(first.group_by[0].name, "bucket");
         assert_eq!(first.group_by[1].name, "browser");
+        let all = Query::parse(json!({"from": 0, "to": 1})).unwrap();
+        assert_eq!(all.mode, Mode::Rows { columns: Vec::new(), cursor: None });
         for bad in [
             json!({"to": 1, "aggregates": {"n": {"fn": "count"}}}),
             json!({"from": 2, "to": 1, "aggregates": {"n": {"fn": "count"}}}),
-            json!({"from": 0, "to": 1}),
+            json!({"from": 0, "to": 1, "columns": []}),
             json!({"from": 0, "to": 1, "columns": ["a"], "aggregates": {"n": {"fn": "count"}}}),
             json!({"from": 0, "to": 1, "aggregates": {"n": {"fn": "sum"}}}),
             json!({"from": 0, "to": 1, "aggregates": {"n": {"fn": "count", "of": "x"}}}),

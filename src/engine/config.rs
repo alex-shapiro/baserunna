@@ -106,8 +106,8 @@ pub struct EngineConfig {
     pub event_part_max_bytes: u64,
     /// Merges running longer than this, or than the stage TTL allows, are abandoned.
     pub event_merge_max_ms: u64,
-    /// Partitions whose time range ended this long ago are merged into as
-    /// few parts as the size cap allows.
+    /// Partitions whose time range has ended and that received no new part
+    /// for this long are merged into as few parts as the size cap allows.
     pub event_settle_ms: u64,
     /// JSON paths stored as their own columns in each part; the rest share buckets.
     pub event_json_max_paths: usize,

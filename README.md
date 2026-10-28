@@ -9,6 +9,7 @@ Baserunna is a web service that hosts databases on object storage. Its goal is t
 - Idle databases are evicted from compute nodes, minimizing compute overhead
 - Reads and writes use snapshot isolation and serialized transactions
 - KV, table, event stream, and binary blob primitives
+- Event tables for analytics: columnar storage, funnels, retention, and unique counts over time ranges
 - Self service administration
 
 The key non-feature is _low latency_. Uncached reads and writes take 10s of ms at p50, with p99 ≥100ms. While Baserunna minimizes latency where possible, object storage is fundmentally slower than local storage. For many applications, this latency is an acceptable tradeoff for scalability and cost benefits.

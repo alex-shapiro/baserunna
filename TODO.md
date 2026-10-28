@@ -51,9 +51,29 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       `PUT` is still in flight and retries are exhausted, awaiting the primary
       `PUT` can resolve the commit outcome instead of returning
       `outcome: "unknown"`.
+- [ ] **Sweep staged event parts after the last event table is dropped.**
+      Sweeps list `part/` only while a database has event tables or part
+      bytes, so a part staged by a bulk insert that races a drop of the last
+      table stays an orphan until another event table is created.
 
 ## Performance
 
+- [ ] **Run event query decoding off the async runtime.** A query decodes
+      blocks and folds aggregates on a tokio worker, so a large query delays
+      other requests on that worker. Move CPU-bound granule work to a
+      blocking pool or a dedicated executor, bounded by `query_concurrency`.
+- [ ] **Split event queries across nodes.** One node reads every part of a
+      query. Fan parts out to peers by rendezvous hash, so their caches
+      stay warm, and merge partial aggregate states (they already encode and
+      merge) on the entry node.
+- [ ] **Cache event lookup maps.** Each query rebuilds lookup maps from the
+      whole row table. Cache them per table version and patch them from the
+      table's change feed.
+- [ ] **Keep event parts in the local disk tier.** Parts use the memory cache
+      only, so a restarted node or a working set larger than memory reads
+      parts from the store again.
+- [ ] **Dispatch event merges to other nodes.** Merges run on the lease
+      holder and compete with its commits for CPU and bandwidth.
 - [ ] **Immediately delete output segments of rejected compactions.** Rejected
       compactions currently leave their output segments for the orphan sweep to
       delete after `orphan_grace_ms` (2 hours).
@@ -78,6 +98,19 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 
 ## Features
 
+- [ ] **Event query time limits.** Queries are bounded by bytes read and
+      state size, not time. Add a deadline that cancels a query between
+      granules and answers `503` with the stats so far.
+- [ ] **Event rollups and projections.** Let a table declare aggregates by
+      time bucket (or alternative sort orders) that seals and merges
+      maintain, so dashboards read small parts.
+- [ ] **Configure event query limits by environment.** `NodeConfig`
+      `query_limits`, `query_concurrency` and the bulk insert buffer have no
+      `BASERUNNA_*` variables.
+- [ ] **Run event retention on idle databases.** Retention and merges are
+      scheduled after commits and sweeps, which run only on active
+      databases; a dormant database keeps expired partitions (and pays for
+      them) until it is used.
 - [ ] **Point-in-time restore and backups.** Retain historical manifests and
       delay GC of referenced segments. Add database snapshot/clone via
       manifest copy-on-write and export/import.
@@ -115,6 +148,9 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 
 ## Testing
 
+- [ ] **Run a long event-table campaign.** `sim_events` runs 24 seeds in CI;
+      run thousands, with larger tables and more nodes, before relying on
+      merges at scale.
 - [ ] **Deliver commit notices across membership transitions.** If nodes have
       different cached views of live cluster members, a long-poll request can be
       routed to a rendezvous home node that does not receive commit notices.

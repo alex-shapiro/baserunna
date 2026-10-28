@@ -152,7 +152,10 @@ pub fn tier(raw: u64, base: u64, k: u64) -> u32 {
 
 /// Chooses the most urgent maintenance for a table's references, by
 /// priority: retention drops, rewrites of mostly deleted parts, size-tiered
-/// merges, then merges that settle partitions whose time has passed.
+/// merges, then merges that settle partitions whose time has passed and
+/// that received no part for `event_settle_ms` (ClickHouse's
+/// `min_age_to_force_merge_seconds`), so that backfilling old partitions
+/// is not merged after every insert.
 pub fn plan(s: &EventSchema, refs: &[PartRef], cfg: &crate::engine::EngineConfig, now_ms: i64) -> Option<Task> {
     if let Some(r) = s.retention_ms {
         let cutoff = now_ms.saturating_sub(r as i64);
@@ -183,7 +186,9 @@ pub fn plan(s: &EventSchema, refs: &[PartRef], cfg: &crate::engine::EngineConfig
     }
     for (partition, parts) in &by_partition {
         let end = s.bucket_span(ev::partition_bucket(*partition)).1;
-        if parts.len() >= 2 && end.saturating_add(cfg.event_settle_ms as i64) < now_ms {
+        let newest = parts.iter().filter_map(|p| crate::engine::types::blob_id_time(&p.id)).max().unwrap_or(0) as i64;
+        let quiet = newest.saturating_add(cfg.event_settle_ms as i64) < now_ms;
+        if parts.len() >= 2 && end < now_ms && quiet {
             let mut ps = parts.clone();
             ps.sort_by(|a, b| a.raw_size.cmp(&b.raw_size).then(a.id.cmp(&b.id)));
             let mut chosen: Vec<PartRef> = Vec::new();

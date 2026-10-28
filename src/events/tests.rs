@@ -146,8 +146,10 @@ impl Gen {
         }
         let r = &mut self.r;
         if r.chance(0.25) {
-            q["columns"] =
-                json!(["time", "event", "user", "n", "x", "flag", "props", {"col": "props", "path": ["k1"]}]);
+            if r.chance(0.7) {
+                q["columns"] =
+                    json!(["time", "event", "user", "n", "x", "flag", "props", {"col": "props", "path": ["k1"]}]);
+            }
             q["limit"] = json!(1 + r.usize(30));
             if r.chance(0.3) {
                 q["order_by"] = json!([{"col": "n", "desc": true}, "time"]);
@@ -269,7 +271,7 @@ async fn run(seed: u64, steps: usize) -> Result<usize, String> {
                         db.clone(),
                         s,
                         valid,
-                        g.r.next_u64(),
+                        env.random_u64(),
                         tokio::time::Instant::now() + std::time::Duration::from_secs(10),
                     )
                     .await;

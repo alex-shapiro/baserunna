@@ -92,6 +92,20 @@ fn rand_json(r: &mut Rng, depth: u32) -> Value {
                 "token",
                 "current_password",
                 "new_password",
+                "from",
+                "to",
+                "group_by",
+                "aggregates",
+                "fn",
+                "of",
+                "path",
+                "lookup",
+                "bucket",
+                "interval",
+                "then",
+                "order_by",
+                "time_column",
+                "partition",
             ];
             let mut m = serde_json::Map::new();
             for _ in 0..r.usize(5) {
@@ -178,6 +192,47 @@ fn seeds() -> Vec<(&'static str, &'static str, Value)> {
         ("PATCH", "/v1/dbs/fz/streams/s", json!({"retention_ms": null, "max_bytes": 5})),
         (
             "POST",
+            "/v1/dbs/fz/events",
+            json!({"name": "e2", "columns": [{"name": "t", "type": "time"}, {"name": "j", "type": "json"}],
+            "time_column": "t", "order_by": ["t"], "partition": "hour", "retention_ms": 60_000}),
+        ),
+        (
+            "POST",
+            "/v1/dbs/fz/events/e/rows",
+            json!({"rows": [{"kind": "a", "n": 1, "props": {"x": [1], "y": {"z": "w"}}}, {"time": "2025-01-01T00:00:00Z", "kind": "b"}],
+            "idempotency_key": "ev"}),
+        ),
+        (
+            "POST",
+            "/v1/dbs/fz/events/e/query",
+            json!({"from": 0, "to": "2100-01-01", "where": {"or": [{"col": "kind", "op": "in", "value": ["a"]},
+                {"col": "props", "path": ["y", "z"], "op": "prefix", "value": "w"}]},
+            "lookups": {"p": {"table": "people", "key": {"col": "kind"}, "value": "who", "default": {"col": "kind"}}},
+            "group_by": [{"bucket": {"col": "time"}, "interval": "1d", "offset": "+02:00"}, {"lookup": "p"}],
+            "aggregates": {"n": {"fn": "count"}, "u": {"fn": "uniq", "of": "kind"}, "q": {"fn": "quantiles", "of": "n", "q": [0.5]},
+                "f": {"fn": "window_funnel", "window_ms": 1000, "steps": [{"col": "kind", "op": "eq", "value": "a"}], "mode": "strict_order"},
+                "r": {"fn": "retention", "conditions": [{"col": "n", "op": "exists"}]}},
+            "then": {"group_by": ["p"], "aggregates": {"s": {"fn": "sum", "of": "r"}}}, "order_by": [{"col": "s", "desc": true}], "limit": 3}),
+        ),
+        (
+            "POST",
+            "/v1/dbs/fz/events/e/query",
+            json!({"from": 0, "to": 9_000_000_000_000i64, "columns": ["time", "kind", "props", {"col": "props", "path": ["x"], "as": "x"}],
+            "order_by": [{"col": "kind", "desc": true}], "limit": 2, "cursor": null, "consistency": "strong"}),
+        ),
+        ("POST", "/v1/dbs/fz/events/e/delete", json!({"from": 0, "where": {"col": "n", "op": "ge", "value": 5}})),
+        ("POST", "/v1/dbs/fz/events/e/columns", json!({"name": "extra", "type": "float", "default": 1.5})),
+        ("POST", "/v1/dbs/fz/events/e/skip-indexes", json!({"column": "kind", "type": "bloom"})),
+        ("PATCH", "/v1/dbs/fz/events/e", json!({"retention_ms": 3_600_000})),
+        (
+            "POST",
+            "/v1/dbs/fz/txn",
+            json!({"ops": [{"op": "insert_events", "table": "e", "rows": [{"kind": "c", "n": 3}]},
+            {"op": "query_events", "table": "e", "from": 0, "to": 9_000_000_000_000i64, "aggregates": {"n": {"fn": "count"}}},
+            {"op": "delete_events", "table": "e", "where": {"col": "kind", "op": "eq", "value": "zz"}}]}),
+        ),
+        (
+            "POST",
             "/v1/dbs/fz/txn",
             json!({"ops": [{"op": "append", "stream": "s", "records": [{"value": "y"}], "expect_seq": 1},
             {"op": "read_stream", "stream": "s", "tail": 3, "filter": {"field": "n", "op": "gt", "value": 1}},
@@ -244,6 +299,22 @@ fn fuzz_http_api() {
         )
         .await;
         c.call_retry("POST", "/v1/dbs/fz/streams", Some(json!({"name": "s"}))).await;
+        c.call_retry(
+            "POST",
+            "/v1/dbs/fz/events",
+            Some(json!({"name": "e", "time_column": "time", "order_by": ["kind", "time"],
+            "columns": [{"name": "time", "type": "time", "default": "now"}, {"name": "kind", "type": "string"},
+                        {"name": "n", "type": "int"}, {"name": "props", "type": "json"}],
+            "skip_indexes": [{"column": "n", "type": "bloom"}]})),
+        )
+        .await;
+        c.call_retry(
+            "POST",
+            "/v1/dbs/fz/tables",
+            Some(json!({"name": "people", "primary_key": ["id"],
+            "columns": [{"name": "id", "type": "string", "nullable": false}, {"name": "who", "type": "string"}]})),
+        )
+        .await;
         baserunna::sim::workloads::steps::create_org(&c, "fz-org").await?;
         c.create_db_owned(Some("fz-org"), "d").await?;
         let token = c.token.clone().unwrap_or_default();
@@ -278,7 +349,11 @@ fn fuzz_http_api() {
             "/v1/dbs/fz/streams/s/consumers/",
             "/console/dbs/fz",
             "/console/dbs/fz/streams/",
+            "/v1/dbs/fz/events/",
+            "/v1/dbs/fz/events/e/",
+            "/console/dbs/fz/events/",
             "/internal/v1/meta",
+            "/internal/v1/events/bind",
         ];
         for i in 0..iters {
             let (method, path, body) = if r.chance(0.6) {

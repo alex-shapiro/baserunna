@@ -146,7 +146,9 @@ impl Binder<'_> {
                     t.try_map(|a| typed_arg(c, a))?
                 }
                 BExpr::Json(_) => {
-                    return Err(Error::invalid("filter on a JSON column's path, such as {\"col\": .., \"path\": [..]}"));
+                    return Err(Error::invalid(
+                        "filter on a JSON column's path, such as {\"col\": .., \"path\": [..]}",
+                    ));
                 }
                 _ => t.clone(),
             };
@@ -1247,8 +1249,14 @@ pub async fn run(
     let filter = filter::Filter::And(conds);
     let kind = match &q.mode {
         Mode::Rows { columns, cursor } => {
-            let columns: Vec<(String, BExpr)> =
-                columns.iter().map(|c: &Named| Ok((c.name.clone(), binder.expr(&c.expr)?))).collect::<Result<_>>()?;
+            let columns: Vec<(String, BExpr)> = if columns.is_empty() {
+                s.columns
+                    .iter()
+                    .map(|c| Ok((c.name.clone(), binder.expr(&Expr::Col { name: c.name.clone(), path: Vec::new() })?)))
+                    .collect::<Result<_>>()?
+            } else {
+                columns.iter().map(|c: &Named| Ok((c.name.clone(), binder.expr(&c.expr)?))).collect::<Result<_>>()?
+            };
             let order: Vec<(BExpr, bool)> = if q.order_by.is_empty() {
                 vec![(time.clone(), false)]
             } else {

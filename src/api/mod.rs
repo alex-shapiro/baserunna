@@ -394,7 +394,10 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         // Verify that the database manifest is not deleted, and re-resolve the name with a
         // strong metadata read if it is.
         let read_only = matches!(*req.method(), http::Method::GET | http::Method::HEAD);
-        let staleness = read_only.then(|| snapshot_staleness(req.uri().query())).flatten();
+        let staleness = match events::is_query(req.method(), req.uri().path()) {
+            true => Some(events::QUERY_STALENESS_MS),
+            false => read_only.then(|| snapshot_staleness(req.uri().query())).flatten(),
+        };
         let opened = match node.open_db(&rec).await {
             Ok(db) => {
                 let checked = match staleness {

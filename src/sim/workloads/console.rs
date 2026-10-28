@@ -198,6 +198,7 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     streams(&mut b, evil).await?;
     files(&sim, &mut b).await?;
     schema(&mut b).await?;
+    event_tables(&mut b, evil).await?;
     organizations(&sim, &mut b).await?;
     account(&sim).await?;
     mailed_links(&sim).await?;
@@ -394,6 +395,58 @@ async fn files(sim: &Arc<Sim>, b: &mut Browser) -> Result<(), String> {
     let r = b.req("GET", &href, None).await?;
     expect(r.status == 200 && r.body[..] == data[..], format!("downloading the blob returned {}", r.status))?;
     expect(header(&r, "content-disposition").starts_with("attachment"), "the blob download is not an attachment")
+}
+
+/// Verifies creating, inserting into, querying and dropping an event table.
+async fn event_tables(b: &mut Browser, evil: &str) -> Result<(), String> {
+    let e = b.submit_err("/console/dbs/webdb", "/console/dbs/webdb/events", &[("def", "{nope")]).await?;
+    expect(e.contains("Invalid JSON"), format!("a bad event table definition was refused for another reason: {e}"))?;
+    let db = b.page("/console/dbs/webdb").await?;
+    let def = after(&db, "action=\"/console/dbs/webdb/events\"")
+        .and_then(|f| after(f, "<textarea name=\"def\">"))
+        .and_then(|t| t.split("</textarea>").next())
+        .ok_or("the event table form has no starting definition")?
+        .replace("&quot;", "\"");
+    let et = "/console/dbs/webdb/events/events";
+    let to = b.submit_ok("/console/dbs/webdb", "/console/dbs/webdb/events", &[("def", &def)]).await?;
+    expect(to.starts_with(et), format!("creating an event table led to {to}"))?;
+    let rows = json!([
+        {"time": "2026-03-01T10:00:00Z", "event": "signup", "user": evil},
+        {"time": "2026-03-01T11:00:00Z", "event": "signup", "user": "bo"},
+        {"time": "2026-03-02T09:00:00Z", "event": "view", "user": "bo", "properties": {"page": "<i>home</i>"}},
+    ])
+    .to_string();
+    let to = b.submit_ok(et, &format!("{et}/rows"), &[("rows", &rows)]).await?;
+    expect(unescape_url(&to).contains("Inserted 3 events"), format!("inserting events led to {}", unescape_url(&to)))?;
+    b.submit_err(et, &format!("{et}/rows"), &[("rows", r#"[{"nope": 1}]"#)]).await?;
+    b.submit_err(et, &format!("{et}/rows"), &[("rows", "7")]).await?;
+    let page = b.page(et).await?;
+    expect(
+        page.contains("<td>2026-03-01 00:00:00</td><td>signup</td><td>2</td>"),
+        format!(
+            "the default query does not count events per day and name: {}",
+            after(&page, "<h2>Query").unwrap_or("")
+        ),
+    )?;
+    let q = r#"{"from": "2026-03-01", "to": "2026-03-03", "order_by": [{"col": "time"}], "limit": 10}"#;
+    let r = b.post(et, &format!("{et}/query"), &[("query", q)]).await?;
+    let page = String::from_utf8_lossy(&r.body);
+    expect(r.status == 200, format!("running a query returned {}", r.status))?;
+    expect(
+        !page.contains(evil) && page.contains("&lt;script&gt;"),
+        format!("query rows are shown unescaped: {}", after(&page, "<h2>Query").unwrap_or(&page)),
+    )?;
+    expect(!page.contains("<i>home") && page.contains("&lt;i&gt;home"), "JSON properties are shown unescaped")?;
+    expect(page.contains("3 rows"), format!("the query stats are missing: {page}"))?;
+    let bad = r#"{"from": "2026-03-01", "to": "2026-03-03", "where": {"col": "missing", "op": "eq", "value": 1}}"#;
+    let r = b.post(et, &format!("{et}/query"), &[("query", bad)]).await?;
+    let page = String::from_utf8_lossy(&r.body);
+    expect(page.contains("class=\"error\"") && page.contains("missing"), "a bad query does not say why")?;
+    expect(page.contains("&quot;missing&quot;"), "a bad query is not returned for fixing")?;
+    b.submit_err(et, &format!("{et}/delete"), &[("confirm", "nope")]).await?;
+    b.submit_ok(et, &format!("{et}/delete"), &[("confirm", "events")]).await?;
+    let db = b.page("/console/dbs/webdb").await?;
+    expect(!db.contains("events/events"), "a dropped event table is still listed")
 }
 
 async fn schema(b: &mut Browser) -> Result<(), String> {

@@ -407,8 +407,8 @@ fn schemas() -> Value {
                 "columns": arr(any()), "group_by": arr(any()), "aggregates": {"type": "object"}, "then": {"type": "object"},
                 "order_by": arr(any()), "limit": i(), "cursor": s(),
                 "consistency": enum_of(&["strong", "snapshot"]), "max_staleness_ms": i()},
-            "description": "A query over `[from, to)` of the time column: rows (`columns`, with `order_by` and \
-            `cursor`) or aggregates (`group_by` and `aggregates`, with an optional second stage `then`). Expressions \
+            "description": "A query over `[from, to)` of the time column: rows (`columns`, every column when \
+            omitted, with `order_by` and `cursor`) or aggregates (`group_by` and `aggregates`, with an optional second stage `then`). Expressions \
             are a column name, `{col, path?}`, `{lookup}` or `{bucket, interval, offset?}`; aggregates are count, sum, \
             min, max, avg, uniq, uniq_exact, quantiles, window_funnel and retention, each with an optional `where`. \
             Queries read a snapshot at most 5 s old unless `consistency` is `strong`."},

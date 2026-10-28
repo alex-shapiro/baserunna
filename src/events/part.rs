@@ -347,7 +347,7 @@ impl ColIndex {
         out
     }
 
-    fn decode(b: &Bytes, phys: Phys) -> DResult<ColIndex> {
+    pub fn decode(b: &Bytes, phys: Phys) -> DResult<ColIndex> {
         let raw = unframe(b)?;
         let mut r = Reader::new(&raw);
         let dict = match r.u8()? {
@@ -555,7 +555,8 @@ fn encode_block(v: &Vector, dict: Option<&BTreeMap<&str, u32>>) -> Vec<u8> {
     w.into_inner()
 }
 
-fn decode_block(raw: &[u8], phys: Phys, dict: Option<&Arc<Vec<String>>>) -> DResult<Vector> {
+/// Decodes a block's values; `dict` is its column's part-level dictionary.
+pub fn decode_block(raw: &[u8], phys: Phys, dict: Option<&Arc<Vec<String>>>) -> DResult<Vector> {
     let mut r = Reader::new(raw);
     let n = r.len(1 << 22)?;
     let nulls = match r.u8()? {

@@ -5,6 +5,7 @@
 
 mod account;
 mod db;
+mod events;
 pub mod multipart;
 mod orgs;
 mod streams;
@@ -41,6 +42,7 @@ pub fn routes() -> Router<Arc<Node>> {
         .route("/console/verify", get(verify_page).post(verify_post))
         .merge(db::routes())
         .merge(streams::routes())
+        .merge(events::routes())
         .merge(orgs::routes())
         .merge(account::routes())
 }

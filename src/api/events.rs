@@ -274,11 +274,20 @@ async fn query(
     let q = Query::parse(b)?;
     let limits = node.cfg.query_limits;
     let _slot = node.query_slot().await?;
-    let db = ctx.db.clone();
-    let (out, v) = with_read!(ctx.db, c, |t| {
-        let s = events::get_schema(t, &name).await?;
-        exec::run(db.shared(), &db.id, t, &s, &q, &limits).await
-    });
+    let run = async |c: Consistency| -> Result<(exec::Output, u64)> {
+        let db = ctx.db.clone();
+        Ok(with_read!(ctx.db, c, |t| {
+            let s = events::get_schema(t, &name).await?;
+            exec::run(db.shared(), &db.id, t, &s, &q, &limits).await
+        }))
+    };
+    // A snapshot may predate the table or a column the caller just added.
+    let (out, v) = match run(c).await {
+        Err(Error::NotFound(_) | Error::InvalidArgument(_)) if matches!(c, Consistency::Snapshot { .. }) => {
+            run(Consistency::Strong).await?
+        }
+        r => r?,
+    };
     Ok(axum::Json(output_json(&out, v)))
 }
 

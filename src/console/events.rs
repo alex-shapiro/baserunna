@@ -250,7 +250,10 @@ async fn table_page(Path((db, name)): Path<(String, String)>, s: Session, q: Par
 /// Runs a query typed into the console, rendering its answer or why it failed.
 async fn run_query(s: &Session, db: &str, t: &Json, text: &str) -> String {
     match serde_json::from_str::<Json>(text) {
-        Ok(q) => {
+        Ok(mut q) => {
+            if let Some(o) = q.as_object_mut() {
+                o.entry("consistency").or_insert(json!("strong"));
+            }
             let times = time_outputs(t, &q);
             let name = t["name"].as_str().unwrap_or_default();
             let reply = s.call("POST", &format!("{}/query", api_table(db, name)), Some(q)).await;

@@ -410,6 +410,9 @@ async fn event_tables(b: &mut Browser, evil: &str) -> Result<(), String> {
     let et = "/console/dbs/webdb/events/events";
     let to = b.submit_ok("/console/dbs/webdb", "/console/dbs/webdb/events", &[("def", &def)]).await?;
     expect(to.starts_with(et), format!("creating an event table led to {to}"))?;
+    let q = json!({"from": 0, "to": 1, "aggregates": {"n": {"fn": "count"}}});
+    let r = b.api("events-api").call_retry("POST", "/v1/dbs/webdb/events/events/query", Some(q)).await;
+    expect(r.status == 200, format!("querying a new event table at a snapshot: {} {}", r.status, r.json))?;
     let rows = json!([
         {"time": "2026-03-01T10:00:00Z", "event": "signup", "user": evil},
         {"time": "2026-03-01T11:00:00Z", "event": "signup", "user": "bo"},

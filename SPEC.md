@@ -364,8 +364,8 @@ events to row tables.
   JSON array or NDJSON) waits up to 200 ms for other inserts on the same
   node and commits with them in one manifest write, and with an
   idempotency key is applied once. An `insert_events` op in a transaction
-  commits with the transaction's other writes. Inserted events are visible
-  to the next query, and null JSON fields are dropped.
+  commits with the transaction's other writes. Null JSON fields are
+  dropped.
 - **Queries** read `[from, to)` of the time column with an optional filter
   (§4.7, where a column operand may carry a JSON `path`) and return either
   rows (`columns`, every column when omitted, with `order_by` and a resume
@@ -380,8 +380,10 @@ events to row tables.
   so answers never depend on how events are stored or merged. Lookups map a
   value through a row table (`{table, key, value, default}`), such as a
   user id to a plan. A query reads a snapshot at most 5 s old unless
-  `consistency` is `strong`, and fails with `413` past 4 GiB read, 1 GiB of
-  aggregation state or 1 GiB of lookup rows.
+  `consistency` is `strong` (which sees every acknowledged insert); a
+  snapshot that lacks the table or a column named retries at a fresh one.
+  A query fails with `413` past 4 GiB read, 1 GiB of aggregation state or
+  1 GiB of lookup rows.
 - **Deletes** remove the events matching a filter within a time range, in a
   transaction. A delete that would need an oversized mask in one partition
   fails with `413` naming it, so a caller deletes partition by partition.

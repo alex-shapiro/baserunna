@@ -5,12 +5,6 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 
 ## Reliability and operations
 
-- [ ] **Check store-clock staleness before acquiring the probe lock.**
-      `StoreClock::sync` acquires its mutex before checking whether the
-      measurement is stale, causing `store_time_ms` callers (stream appends,
-      TTL writes, blob uploads, and commits that bind staged blobs) to wait for
-      in-flight probes. Check staleness before locking, and bound probe
-      duration to `2 × clock_sync_max_error_ms`.
 - [ ] **Propagate request deadlines to object-store operations.**
       `CloudStore` uses a 30 s per-request timeout and `Retry` makes up to 5
       attempts, so a read or manifest load can continue after the client timed

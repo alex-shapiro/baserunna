@@ -619,7 +619,7 @@ Garbage collection deletes replaced segments, unreferenced orphan objects, and d
 
 Garbage collection compares timestamps written by different nodes against object-store `last_modified` times, so all GC timestamps use the object store's clock rather than node wall clocks.
 
-Every 10 minutes, each node overwrites a shared `clock` object and reads back its `last_modified` timestamp. Because that timestamp was assigned between the request start and response receipt on the node's monotonic clock, the midpoint of that interval gives the node's clock offset and the half-width gives the error bound. Probes with an error bound above 10 s are retried. A measurement is trusted for up to 1 hour. If a node lacks a valid measurement, it performs no garbage collection and refuses to bind staged blobs.
+Every 10 minutes, each node overwrites a shared `clock` object and reads back its `last_modified` timestamp. Because that timestamp was assigned between the request start and response receipt on the node's monotonic clock, the midpoint of that interval gives the node's clock offset and the half-width gives the error bound. Probes with an error bound above 10 s are retried. A measurement is trusted for up to 1 hour. If a node does not have a valid measurement, it skips garbage collection and rejects writes that require store time.
 
 #### Obsolete Segments
 

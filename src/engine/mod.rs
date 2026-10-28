@@ -119,8 +119,11 @@ impl Shared {
         self.store_now_ms().unwrap_or_else(|| self.env.now_ms())
     }
 
-    /// Synchronizes the store clock if stale and returns the current store time.
+    /// Returns the current store time, synchronizing the clock if it was not synchronized within `clock_sync_max_age_ms`.
     pub async fn store_time_ms(&self) -> crate::error::Result<u64> {
+        if let Some(now) = self.store_now_ms() {
+            return Ok(now);
+        }
         self.sync_clock().await?;
         self.store_now_ms().ok_or_else(|| crate::error::Error::unavailable("store clock not synchronized"))
     }

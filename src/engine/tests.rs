@@ -520,6 +520,7 @@ fn blob_limits_and_ranges() {
 pub(super) struct DelayStore {
     pub(super) mem: Arc<MemStore>,
     get_reply_ms: AtomicU64,
+    clock_get_reply_ms: AtomicU64,
     pub(super) put_reply_ms: AtomicU64,
     manifest_put_conflicts: AtomicU32,
     manifest_put_outages: AtomicU32,
@@ -558,7 +559,11 @@ impl ObjectStore for DelayStore {
             if let (true, Ok(g)) = (key.contains("/seg/"), &r) {
                 self.seg_get_bytes.lock().unwrap().push(g.data.len());
             }
-            tokio::time::sleep(Duration::from_millis(self.get_reply_ms.load(SeqCst))).await;
+            let mut delay = self.get_reply_ms.load(SeqCst);
+            if key == super::clock::PROBE_KEY {
+                delay += self.clock_get_reply_ms.load(SeqCst);
+            }
+            tokio::time::sleep(Duration::from_millis(delay)).await;
             r
         })
     }
@@ -609,6 +614,7 @@ pub(super) fn delayed_engine_with(node: &str, cfg: EngineConfig) -> (Arc<Engine>
     let store = Arc::new(DelayStore {
         mem,
         get_reply_ms: 0.into(),
+        clock_get_reply_ms: 0.into(),
         put_reply_ms: 0.into(),
         manifest_put_conflicts: 0.into(),
         manifest_put_outages: 0.into(),
@@ -2187,6 +2193,24 @@ fn values_expire_a_ttl_after_their_commit() {
         assert_eq!(strong_get(&db, "k").await, None);
         assert_eq!(snap.get(b"k").await.unwrap().map(|e| e.value), Some(inline("new")));
         assert!(db.snapshot(Consistency::Strong).await.unwrap().version.get_entry(b"k").await.unwrap().is_some());
+    });
+}
+
+#[test]
+fn writes_do_not_wait_for_clock_probes() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        let sh = &eng.shared;
+        sh.store_time_ms().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(sh.cfg.clock_sync_interval_ms)).await;
+        store.clock_get_reply_ms.store(3_600_000, SeqCst);
+        sh.refresh_clock();
+        tokio::task::yield_now().await;
+        let t = Instant::now();
+        put_ttl(&db, "k", "v", 60_000).await;
+        drop(db.blob_writer("x/y").await);
+        assert_eq!(t.elapsed(), Duration::ZERO);
     });
 }
 

@@ -242,17 +242,32 @@ pub struct World {
     peers: Peers,
     origin: Instant,
     base_ms: u64,
+    configure: fn(&mut NodeConfig),
 }
 
 impl World {
     pub async fn new(n: usize, latency_ms: u64) -> World {
+        World::with_config(n, latency_ms, |_| {}).await
+    }
+
+    /// Like [`World::new`], with every node's configuration adjusted by `configure`.
+    pub async fn with_config(n: usize, latency_ms: u64, configure: fn(&mut NodeConfig)) -> World {
         let origin = Instant::now();
         let base_ms = 1_750_000_000_000;
         let mem = Arc::new(MemStore::new(Box::new(move || {
             base_ms + Instant::now().saturating_duration_since(origin).as_millis() as u64
         })));
         let store = Arc::new(MeteredStore::new(mem.clone(), latency_ms));
-        let mut w = World { store, mem, nodes: Vec::new(), disks: Vec::new(), peers: Arc::default(), origin, base_ms };
+        let mut w = World {
+            store,
+            mem,
+            nodes: Vec::new(),
+            disks: Vec::new(),
+            peers: Arc::default(),
+            origin,
+            base_ms,
+            configure,
+        };
         for _ in 0..n {
             w.start_node().await;
         }
@@ -280,6 +295,7 @@ impl World {
         let transport = Arc::new(PeerTransport { peers: self.peers.clone() });
         let mut cfg = node_config(&format!("n{i}"), &addr);
         cfg.engine.local_tier = Some(self.disks[i].clone());
+        (self.configure)(&mut cfg);
         let services = crate::node::Services { transport, oidc: None, mailer: None };
         let node = Node::start(cfg, env, store, services).await.expect("node starts");
         let router = api::router(node.clone());

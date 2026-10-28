@@ -13,6 +13,7 @@ pub mod history;
 pub mod kv_model;
 pub mod lifecycle;
 pub mod limits;
+pub mod memory;
 pub mod orgs;
 pub mod register;
 pub mod schema_race;
@@ -480,6 +481,7 @@ pub fn scenarios() -> Vec<Scenario> {
             run: |s| Box::pin(streams::run(s.clone(), s.knobs.range("streams.steps", 30, 80) as usize, true)),
         },
         Scenario { name: "orgs", config: |k| world(k, faulty((1, 4))), run: |s| Box::pin(orgs::run(s)) },
+        Scenario { name: "memory", config: memory::config, run: |s| Box::pin(memory::run(s, true)) },
         Scenario { name: "accounts", config: |k| world(k, faulty((1, 4))), run: |s| Box::pin(accounts::run(s)) },
     ]
 }

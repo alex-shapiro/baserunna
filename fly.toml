@@ -20,6 +20,7 @@ kill_timeout = '30s'
 BASERUNNA_PUBLIC_URL = 'https://baserunna.fly.dev'
 BASERUNNA_TRUSTED_PROXY_HOPS = '1'
 BASERUNNA_CACHE_MB = '128'
+BASERUNNA_DB_MEMORY_MB = '128'
 
 [http_service]
 internal_port = 8080

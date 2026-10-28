@@ -58,6 +58,10 @@ impl MemStore {
     }
 
     pub fn put_sync(&self, key: &str, data: Bytes, mode: &PutMode) -> SResult<String> {
+        debug_assert!(
+            key.split('/').all(|s| !s.is_empty() && s.chars().all(key_char)),
+            "object key {key:?} is outside the store contract"
+        );
         let now = (self.clock)();
         let mut g = self.lock();
         match (mode, g.objects.get(key)) {

@@ -108,12 +108,12 @@ impl StoreClock {
         retry.run(|| store.put(PROBE_KEY, Bytes::from_static(b"probe"), PutMode::Overwrite)).await?;
         let g = retry.run(|| store.get(PROBE_KEY, GetOpts::default())).await?;
         let t2 = Instant::now();
-        // Our write, or a later one by another node, was applied between
-        // t0 and t2; its timestamp may be truncated.
+        // Our write, or a later one by another node, was applied between t0 and t2. Both its
+        // timestamp and the local ones are rounded down, to the store's precision and to 1 ms.
         let lm = g.last_modified_ms as i64;
-        let lo = lm - self.mono_ms(t2);
+        let lo = lm - self.mono_ms(t2) - 1;
         let hi = lm + store.time_precision_ms() as i64 - self.mono_ms(t0);
-        Ok(Measurement { offset_ms: lo + (hi - lo) / 2, error_ms: ((hi - lo) / 2) as u64, at: t2 })
+        Ok(Measurement { offset_ms: lo + (hi - lo) / 2, error_ms: ((hi - lo) as u64).div_ceil(2), at: t2 })
     }
 }
 

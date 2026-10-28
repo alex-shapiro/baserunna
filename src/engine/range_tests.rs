@@ -334,7 +334,7 @@ fn sweeps_recount_blob_bytes() {
 #[test]
 fn exempt_databases_have_no_quota() {
     let (eng, _store) = quota_engine(10);
-    eng.exempt_from_quota("sys");
+    eng.mark_system("sys");
     assert_eq!(eng.db("sys").quota(), None);
     assert_eq!(eng.db("d").quota(), Some(10));
     let (eng, _store) = delayed_engine("a");

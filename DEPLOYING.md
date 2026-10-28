@@ -167,21 +167,33 @@ nodes before starting the new version.
 
 ### Requirements
 
-The store must support conditional writes (`If-Match`, `If-None-Match`),
-strongly consistent reads after writes, and ranged GETs: S3, GCS, Azure
-Blob Storage, R2 and MinIO do. Use one bucket (or one prefix,
+Baserunna supports [Tigris](https://www.tigrisdata.com/), which passes its
+object-store conformance suite and failover check (SPEC §13.5). Other
+S3-compatible stores are untested. Use one bucket (or one prefix,
 `s3://bucket/prefix`) per cluster, and nothing else should write there.
 
-Credentials come from each provider's standard environment (`AWS_*`, for
-S3-compatible stores also `AWS_ENDPOINT`; `GOOGLE_*`; `AZURE_*`), as read
-by the `object_store` crate.
+Credentials, region and endpoint come from the standard `AWS_*` variables
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and
+`AWS_ENDPOINT_URL_S3`), which `fly storage create` sets.
+
+Before serving, a node checks that the store rejects conflicting
+conditional writes and refuses to start if it does not, since such a store
+would let two nodes overwrite each other's commits. To check a bucket
+thoroughly, run the conformance suite and the failover check against it:
+
+```sh
+BASERUNNA_TEST_STORE=s3://<bucket> cargo test --release --test store_conformance
+BASERUNNA_STORE=s3://<bucket> cargo run --release --example cluster_check -- 180
+```
+
+Both write under a fresh prefix of the bucket and delete it afterwards.
 
 ### Permissions
 
 Nodes read, write, delete and list objects under the cluster's prefix, and
 nothing else.
 
-S3 (IAM policy for a prefix `baserunna/` of `my-bucket`):
+An S3-style policy for a prefix `baserunna/` of `my-bucket`:
 
 ```json
 {
@@ -201,9 +213,6 @@ S3 (IAM policy for a prefix `baserunna/` of `my-bucket`):
   ]
 }
 ```
-
-GCS: `roles/storage.objectUser` on the bucket. Azure: `Storage Blob Data
-Contributor` on the container.
 
 ### Lifecycle rules and versioning
 
@@ -240,11 +249,12 @@ S3 lifecycle configuration with the rule above:
 
 ## Limits
 
-Rate limits are enforced per node, so an N-node cluster allows up to N times the configured rate. Setting a limit to 0 disables it.
+Rate limits are enforced per node, so an N-node cluster allows up to N times the configured rate. Setting a rate limit to 0 disables it. `BASERUNNA_DB_MEMORY_MB` also applies per node and cannot be disabled; it must be at least 16. Size it with `BASERUNNA_CACHE_MB` to fit the machine: nodes refuse new interactive transactions rather than exceed it (SPEC §5.12).
 
 | variable                                | default | limits                                       |
 | --------------------------------------- | ------- | -------------------------------------------- |
 | `BASERUNNA_DB_MAX_MB`                   | 10240   | size of each database (segments and blobs)   |
+| `BASERUNNA_DB_MEMORY_MB`                | 256     | memory for open databases and transactions   |
 | `BASERUNNA_USER_RPS`                    | 500     | requests per second per user                 |
 | `BASERUNNA_API_KEY_RPS`                 | 500     | requests per second per API key (or its own) |
 | `BASERUNNA_AUTH_RPS_PER_CLIENT`         | 1       | sign-ins and sign-ups per client address     |
@@ -257,7 +267,7 @@ Each node is configured through environment variables. The main ones are below; 
 
 | variable                                 | default                   |                                                                     |
 | ---------------------------------------- | ------------------------- | ------------------------------------------------------------------- |
-| `BASERUNNA_STORE`                        | `fs:./data`               | `fs:<dir>`, `mem:`, `s3://bucket/prefix`, `gs://…`, `az://…`        |
+| `BASERUNNA_STORE`                        | `fs:./data`               | `fs:<dir>`, `mem:`, or `s3://bucket/prefix` (Tigris)                |
 | `BASERUNNA_LISTEN`                       | `0.0.0.0:8080`            |                                                                     |
 | `BASERUNNA_ADVERTISE`                    | `http://127.0.0.1:<port>` | URL that peers use to reach this node                               |
 | `BASERUNNA_PUBLIC_URL`                   | advertise URL             | browser-facing URL (OAuth redirect, mailed links, `Secure` cookies) |

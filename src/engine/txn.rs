@@ -2,6 +2,7 @@
 //! read set, and a buffered write set. Reads see the transaction's own
 //! writes.
 
+use super::memory::{Charge, heap};
 use super::stream::{self, StreamOp, StreamState};
 use super::types::{BlobRef, Seq, Value, is_commit_key};
 use super::version::{KeyRange, Snapshot, Version};
@@ -115,6 +116,8 @@ pub struct CommitRequest {
     /// Reads validated under every isolation level; see [`Txn::get_pinned`].
     pub pinned_reads: Vec<Bytes>,
     pub writes: WriteSet,
+    /// Memory held by the read and write sets until the commit completes.
+    pub charge: Charge,
 }
 
 /// A value as seen by a transaction read.
@@ -152,6 +155,10 @@ pub struct Txn {
     pub commit_id: u64,
     write_bytes: usize,
     max_write_bytes: usize,
+    read_bytes: usize,
+    max_read_bytes: usize,
+    /// Charges the snapshot pin and the read and write sets to the node's memory budget.
+    charge: Charge,
     appended: usize,
     optimistic: bool,
     has_untracked_reads: bool,
@@ -166,6 +173,7 @@ fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 
 impl Txn {
     pub fn new(snapshot: Snapshot, isolation: Isolation, commit_id: u64, max_write_bytes: usize) -> Txn {
+        let charge = Charge::new(&snapshot.version.shared.memory, std::mem::size_of::<Txn>() + 256);
         Txn {
             snapshot: snapshot.version,
             read_time: snapshot.time_ms,
@@ -178,10 +186,19 @@ impl Txn {
             commit_id,
             write_bytes: 0,
             max_write_bytes,
+            read_bytes: 0,
+            max_read_bytes: max_write_bytes,
+            charge,
             appended: 0,
             optimistic: false,
             has_untracked_reads: false,
         }
+    }
+
+    /// Caps the bytes of keys and ranges the read set holds, which is `max_write_bytes` by default.
+    pub fn with_read_limit(mut self, max_read_bytes: usize) -> Txn {
+        self.max_read_bytes = max_read_bytes;
+        self
     }
 
     /// Returns true if this transaction began during an in-flight manifest
@@ -239,7 +256,7 @@ impl Txn {
         if let Some(p) = self.writes.puts.get(key) {
             return Ok(Txn::own(key, p));
         }
-        self.reads.push(ReadItem::Key(Bytes::copy_from_slice(key)));
+        self.note_read(ReadItem::Key(Bytes::copy_from_slice(key)))?;
         if self.masked(key) {
             return Ok(None);
         }
@@ -252,6 +269,7 @@ impl Txn {
 
     /// Reads `key` and validates it at commit time under all isolation levels.
     pub async fn get_pinned(&mut self, key: &[u8]) -> Result<Option<ReadValue>> {
+        self.account_read(heap(key.len()) + std::mem::size_of::<Bytes>())?;
         self.pinned_reads.push(Bytes::copy_from_slice(key));
         let r = self.get(key).await?;
         if let Some(rv @ ReadValue { seq: Some(_), .. }) = &r {
@@ -324,11 +342,11 @@ impl Txn {
                 } else {
                     KeyRange::new(range.start.clone(), Bound::Included(last))
                 };
-                self.reads.push(ReadItem::Range(covered));
+                self.note_read(ReadItem::Range(covered))?;
                 return Ok(out);
             }
             let Some(k) = last else {
-                self.reads.push(ReadItem::Range(range.clone()));
+                self.note_read(ReadItem::Range(range.clone()))?;
                 return Ok(out);
             };
             window = if reverse {
@@ -351,7 +369,29 @@ impl Txn {
         }
     }
 
+    /// Records `item` in the read set.
+    fn note_read(&mut self, item: ReadItem) -> Result<()> {
+        let n = std::mem::size_of::<ReadItem>()
+            + match &item {
+                ReadItem::Key(k) => heap(k.len()),
+                ReadItem::Range(r) => r.heap_bytes(),
+            };
+        self.account_read(n)?;
+        self.reads.push(item);
+        Ok(())
+    }
+
+    fn account_read(&mut self, n: usize) -> Result<()> {
+        self.read_bytes += n;
+        self.charge.grow(n);
+        if self.read_bytes > self.max_read_bytes {
+            return Err(Error::TooLarge(format!("transaction read sets exceed {} bytes", self.max_read_bytes)));
+        }
+        Ok(())
+    }
+
     fn account(&mut self, n: usize) -> Result<()> {
+        self.charge.grow(n);
         self.write_bytes += n;
         if self.write_bytes > self.max_write_bytes {
             return Err(Error::TooLarge(format!("transaction writes exceed {} bytes", self.max_write_bytes)));
@@ -445,8 +485,8 @@ impl Txn {
 
     /// Records a read of stream `id`'s records with seqs in `[lo, hi)`, or
     /// from `lo` on, in the read set.
-    pub fn note_stream_read(&mut self, id: u64, lo: u64, hi: Option<u64>) {
-        self.reads.push(ReadItem::Range(stream::records_between(id, lo, hi)));
+    pub fn note_stream_read(&mut self, id: u64, lo: u64, hi: Option<u64>) -> Result<()> {
+        self.note_read(ReadItem::Range(stream::records_between(id, lo, hi)))
     }
 
     pub fn into_request(self) -> CommitRequest {
@@ -464,6 +504,7 @@ impl Txn {
             reads: self.reads,
             pinned_reads: self.pinned_reads,
             writes: self.writes,
+            charge: self.charge,
         }
     }
 }

@@ -51,3 +51,28 @@ jobs:
         env:
           SIM_MINUTES: "60"
         run: target/release/examples/sim_tool explore all $(( ${{ github.run_id }} + (1 << 40) ))
+  tigris:
+    name: Tigris conformance and failover
+    runs-on: ubuntu-latest
+    env:
+      BASERUNNA_TEST_STORE: ${{ secrets.BASERUNNA_TEST_STORE }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.TIGRIS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT_URL_S3: https://fly.storage.tigris.dev
+      AWS_REGION: auto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Require Tigris credentials
+        run: |
+          if [ -z "$BASERUNNA_TEST_STORE" ]; then
+            echo "::error::set the BASERUNNA_TEST_STORE, TIGRIS_ACCESS_KEY_ID and TIGRIS_SECRET_ACCESS_KEY secrets"
+            exit 1
+          fi
+      - name: Conformance suite
+        run: cargo test --release --test store_conformance -- --nocapture
+      - name: Failover check
+        run: cargo run --release --example cluster_check -- 180
+        env:
+          BASERUNNA_STORE: ${{ secrets.BASERUNNA_TEST_STORE }}

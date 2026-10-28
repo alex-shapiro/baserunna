@@ -114,6 +114,16 @@ impl Value {
         matches!(self, Value::Tombstone)
     }
 
+    /// Heap bytes held by the value, beyond the `Value` itself.
+    pub fn heap_bytes(&self) -> usize {
+        use super::memory::heap;
+        match self {
+            Value::Inline(b) => heap(b.len()),
+            Value::Blob(r) => heap(r.id.len()) + heap(r.content_type.len()),
+            Value::Tombstone => 0,
+        }
+    }
+
     /// Approximate encoded size.
     pub fn size(&self) -> usize {
         match self {

@@ -39,6 +39,17 @@ pub fn store_from_url(url: &str) -> Result<DynStore, String> {
     }
 }
 
+/// Refuses to start on a store whose conditional writes cannot fence manifest updates.
+#[cfg(feature = "cloud")]
+async fn preflight(url: &str) -> Result<(), String> {
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let ns = format!("{}/preflight/{nonce:x}-{}", url.trim_end_matches('/'), std::process::id());
+    let store: DynStore = Arc::new(baserunna::store::CloudStore::from_url(&ns)?);
+    baserunna::store::conformance::preflight(store)
+        .await
+        .map_err(|e| format!("the object store at {url} cannot fence concurrent writers: {e}"))
+}
+
 struct Shutdown {
     /// Delay before stopping connection acceptance to allow health-check draining.
     drain_delay: Duration,
@@ -67,6 +78,7 @@ fn config() -> Result<(NodeConfig, String, String, Shutdown), String> {
         ..NodeConfig::default()
     };
     cfg.engine.cache_bytes = parse("BASERUNNA_CACHE_MB", 512usize)? * 1024 * 1024;
+    cfg.engine.memory_bytes = parse("BASERUNNA_DB_MEMORY_MB", 256usize)? * 1024 * 1024;
     if let Some(dir) = var("BASERUNNA_DISK_CACHE_DIR") {
         let bytes = parse("BASERUNNA_DISK_CACHE_MB", 10_240u64)? * 1024 * 1024;
         let tier = DiskCache::open(&dir, bytes).map_err(|e| format!("cannot open disk cache {dir}: {e}"))?;
@@ -131,6 +143,10 @@ async fn main() {
 async fn run() -> Result<(), String> {
     let (cfg, listen, store_url, shutdown) = config()?;
     let store = store_from_url(&store_url)?;
+    #[cfg(feature = "cloud")]
+    if store_url.starts_with("s3://") {
+        preflight(&store_url).await?;
+    }
     let oidc: Option<Arc<dyn baserunna::auth::OidcProvider>> =
         match (var("BASERUNNA_GOOGLE_CLIENT_ID"), var("BASERUNNA_GOOGLE_CLIENT_SECRET")) {
             #[cfg(feature = "cloud")]

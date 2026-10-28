@@ -24,6 +24,8 @@ pub struct Version {
     deletes: Arc<RangeDeletes>,
     /// True if any stored value has an expiration timestamp.
     pub(crate) expiring: bool,
+    /// The memory this version occupies, charged to the node's budget.
+    charge: super::memory::Charge,
 }
 
 /// Owned key range.
@@ -54,6 +56,15 @@ impl KeyRange {
 
     pub fn prefix(p: &[u8]) -> KeyRange {
         KeyRange::half_open(Bytes::copy_from_slice(p), crate::util::prefix_end(p).map(Bytes::from))
+    }
+
+    /// Heap bytes held by the bounds.
+    pub fn heap_bytes(&self) -> usize {
+        let b = |b: &Bound<Bytes>| match b {
+            Bound::Included(k) | Bound::Excluded(k) => super::memory::heap(k.len()),
+            Bound::Unbounded => 0,
+        };
+        b(&self.start) + b(&self.end)
     }
 
     pub fn contains(&self, k: &[u8]) -> bool {
@@ -787,11 +798,22 @@ impl Version {
     pub fn new(m: Manifest, etag: String, shared: Arc<Shared>) -> Version {
         let deletes = Arc::new(RangeDeletes::new(&m.range_deletes));
         let expiring = m.tail.iter().any(|e| e.expires.is_some()) || m.segments.iter().any(|s| s.expiring > 0);
-        Version { m, etag, stored_ms: None, shared, deletes, expiring }
+        let bytes =
+            std::mem::size_of::<Version>() + m.heap_bytes() + super::memory::heap(etag.len()) + deletes.heap_bytes();
+        let charge = match shared.is_system(&m.db_id) {
+            true => super::memory::Charge::default(),
+            false => super::memory::Charge::new(&shared.memory, bytes),
+        };
+        Version { m, etag, stored_ms: None, shared, deletes, expiring, charge }
     }
 
     pub fn version(&self) -> Seq {
         self.m.version
+    }
+
+    /// Bytes charged to the node's memory budget for this version.
+    pub fn memory_bytes(&self) -> usize {
+        self.charge.bytes()
     }
 
     /// Returns the newest entry for `key`, including tombstones. If covered by

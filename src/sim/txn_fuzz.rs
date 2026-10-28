@@ -2980,6 +2980,9 @@ impl<'a> Session<'a> {
         if !self.lost {
             self.full_check().await?;
         }
+        for t in self.txns.iter().filter(|t| t.alive) {
+            self.call("DELETE", &self.path(&format!("/transactions/{}", t.id)), &[], Vec::new()).await?;
+        }
         let r = self.call("DELETE", &self.path(""), &[], Vec::new()).await?;
         if r.status != 200 {
             return Err(format!("delete database: {} {}", r.status, r.json));

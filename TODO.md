@@ -7,27 +7,7 @@ can ship after it. See [`SPEC.md`](SPEC.md) §15 (known limitations) and §16
 
 ## Blockers
 
-- [ ] **Verify object-store semantics against Tigris.** V1 supports only
-      Tigris. Manifest fencing, lease takeover, and GC grace periods all
-      assume that the store honors conditional writes, but only `SimStore` is
-      tested. The Fly deployment runs a single node, so it would behave
-      identically on a store that ignored `If-Match`. Write an `ObjectStore`
-      conformance suite gated on credentials that checks `412` for a stale
-      `If-Match` and for `If-None-Match: *` on an existing object, `304` for a
-      matching conditional `GET`, list-after-write, byte-range `GET` edges,
-      and `last_modified` precision and monotonicity (SPEC §5.8). Run it, and
-      the `multi_node` example with nodes killed during writes, against a
-      Tigris bucket in CI. Name Tigris as the only supported store in
-      `DEPLOYING.md` and SPEC §12 and §15.
-- [ ] **Bound memory used by open database handles.** Each open handle
-      retains its manifest, including a `tail` of up to `tail_max_bytes`
-      (256 KiB), and is evicted only after `db_idle_evict_ms` (5 min) idle.
-      One account can own about 101,000 databases (1,000 of its own and 1,000
-      in each of up to 100 organizations) and, at 500 requests/s per node, can
-      open all of them within the eviction window. An account that pre-fills
-      tails can therefore exhaust node memory on demand. Enforce a byte budget
-      across open handles with LRU eviction. This blocks any deployment that
-      admits untrusted accounts.
+None are known.
 
 ## Reliability and operations
 
@@ -39,11 +19,29 @@ can ship after it. See [`SPEC.md`](SPEC.md) §15 (known limitations) and §16
       commits until its store requests time out. Check staleness before
       locking, and time probes out at `2 × clock_sync_max_error_ms`, beyond
       which they are discarded as imprecise.
-- [ ] **Configure object-store timeouts and retries.** `CloudStore` uses the
-      `object_store` defaults of 30 s per attempt and up to 10 retries over
-      3 minutes, nested inside `Retry`'s 5 attempts, so a single store call
-      can stall for many minutes. Choose bounds that fit the 5 s lease and
-      10 s commit deadline, and exercise them in the conformance suite.
+- [ ] **Bound store calls by the deadlines of the requests that make them.**
+      `CloudStore` times requests out after 30 s and leaves retries to
+      `Retry`, which makes up to 5 attempts, so a read or a manifest load can
+      take minutes while its client gave up after seconds. Pass the request's
+      deadline down to store calls and stop retrying once it has passed.
+- [ ] **Treat a stale-target rejection as ambiguous when forwards can be
+      duplicated.** A forwarder that receives `x-baserunna-stale-target`
+      handles the request locally on the assumption that it never ran, but a
+      duplicated copy of the forward can have run on the target's previous
+      process. The simulator's duplicating network shows the request running
+      twice (`sim_tool trace tables 7344`: a unique-row insert answers
+      `409 already_exists` for its own write). The production HTTP transport
+      never duplicates a request, so only deployments behind retrying proxies
+      are exposed. Handle a stale-target rejection locally only if the forward
+      was sent once, and answer `outcome: "unknown"` otherwise.
+- [ ] **Share the memory budget fairly across users.** One user's interactive
+      transactions can hold a node's whole memory budget for up to their 5
+      minute lifetime, so that other users' transactions on that node are
+      refused meanwhile (SPEC §5.12). Reserve a share of the budget per active
+      user, or refuse the user holding the most memory first.
+- [ ] **End a deleted database's interactive transactions.** Transactions on a
+      deleted database stay open until they idle out (30 s), counting against
+      their user's 100-transaction cap and holding memory.
 - [ ] **Test Google OAuth against Google's production endpoints.** Only
       `FakeGoogle` is tested. Refetch the JWKS when an ID token names an
       unknown `kid` instead of waiting for the 1-hour cache to expire. Add
@@ -82,6 +80,12 @@ can ship after it. See [`SPEC.md`](SPEC.md) §15 (known limitations) and §16
 - [ ] **Flush idle database tails to reduce next-commit manifest size.**
       Flushing a non-empty tail after a database becomes idle reduces the size
       of the next manifest `PUT` at the cost of an extra segment `PUT`.
+- [ ] **Shrink in-memory tail entries.** An `Entry` takes 144 bytes before its
+      key and value because `Value` stores a `BlobRef` (two strings and a
+      digest) inline, so a tail of 100-byte values takes about twice its
+      encoded size in memory (`tests/memory_bound.rs`). Boxing `BlobRef`
+      shrinks `Entry` to 96 bytes, so the memory budget holds 20–35% more
+      databases whose tails hold small values.
 - [ ] **Keep the manifest tail as a sorted vector across a batch.** Commit
       batches currently move the manifest tail into a `BTreeMap` and back into
       a `Vec` on every commit. Merging sorted batch writes into the sorted tail

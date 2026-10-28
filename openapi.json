@@ -6326,7 +6326,13 @@
                     "scan_limit_max": {
                       "type": "integer"
                     },
+                    "txn_max_open_per_user": {
+                      "type": "integer"
+                    },
                     "txn_max_ops": {
+                      "type": "integer"
+                    },
+                    "txn_max_read_bytes": {
                       "type": "integer"
                     },
                     "txn_max_write_bytes": {
@@ -6339,6 +6345,8 @@
                   "required": [
                     "txn_max_ops",
                     "txn_max_write_bytes",
+                    "txn_max_read_bytes",
+                    "txn_max_open_per_user",
                     "value_inline_max",
                     "scan_limit_max",
                     "long_poll_max_ms",

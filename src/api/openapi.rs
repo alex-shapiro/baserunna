@@ -539,13 +539,16 @@ fn paths() -> Value {
                         "Limits",
                         obj(
                             json!({
-                                "txn_max_ops": i(), "txn_max_write_bytes": i(), "value_inline_max": i(),
+                                "txn_max_ops": i(), "txn_max_write_bytes": i(), "txn_max_read_bytes": i(),
+                                "txn_max_open_per_user": i(), "value_inline_max": i(),
                                 "scan_limit_max": i(), "long_poll_max_ms": i(), "json_value_max": i(),
                                 "json_body_max": i(), "blob_max": i(), "blob_stage_ttl_ms": i(),
                             }),
                             &[
                                 "txn_max_ops",
                                 "txn_max_write_bytes",
+                                "txn_max_read_bytes",
+                                "txn_max_open_per_user",
                                 "value_inline_max",
                                 "scan_limit_max",
                                 "long_poll_max_ms",

@@ -355,7 +355,7 @@ pub async fn trim(txn: &mut Txn, name: &str, before_seq: Option<u64>, before_tim
             let before = txn.snapshot().stream_seek(c.id, &st, Seek::Time(t)).await?;
             // If all existing records are earlier than `t` (`before == st.next_seq`), leave the
             // read range unbounded above so that a concurrent append with a timestamp `< t` conflicts.
-            txn.note_stream_read(c.id, st.first_seq, (before < st.next_seq).then_some(before + 1));
+            txn.note_stream_read(c.id, st.first_seq, (before < st.next_seq).then_some(before + 1))?;
             before
         }
         _ => return Err(Error::invalid("trim needs exactly one of before_seq and before_time")),
@@ -566,8 +566,8 @@ pub async fn read(txn: &mut Txn, name: &str, spec: &ReadSpec) -> Result<ReadOut>
         (true, _, _) => lo.min(hi),
     };
     match spec.reverse {
-        false => txn.note_stream_read(c.id, lo, if exhausted { until } else { Some(next_seq) }),
-        true => txn.note_stream_read(c.id, if exhausted { lo } else { next_seq }, until),
+        false => txn.note_stream_read(c.id, lo, if exhausted { until } else { Some(next_seq) })?,
+        true => txn.note_stream_read(c.id, if exhausted { lo } else { next_seq }, until)?,
     }
     let open = !spec.reverse && exhausted && until.is_none_or(|u| u > st.next_seq);
     Ok(ReadOut { records, next_seq, done: exhausted, first_seq: st.first_seq, tail_seq: st.next_seq, open })

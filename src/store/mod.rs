@@ -1,5 +1,6 @@
 //! Object storage abstraction.
 
+pub mod conformance;
 mod fs;
 mod mem;
 
@@ -91,22 +92,44 @@ pub struct ListPage {
     pub next: Option<String>,
 }
 
+/// A strongly consistent object store shared by every node of a cluster.
+///
+/// Every operation observes all writes that completed before it started, from any client.
+/// An etag identifies one write: `put`, `get` and `list` report the same etag for it, and
+/// writes of different bytes never share one. [`conformance::run`] checks this contract
+/// against a live store.
+///
+/// Keys and `start_after` positions are `/`-separated, non-empty segments of [`key_char`]s,
+/// and no key is a `/`-delimited prefix of another.
 pub trait ObjectStore: Send + Sync + 'static {
+    /// Reads an object, or the part of it in `opts.range` clamped to its size. A non-empty
+    /// range that starts at or past the end of the object, or an empty one that starts past
+    /// it, fails with [`StoreError::Fatal`].
     fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>>;
-    /// Returns the new etag.
+    /// Writes an object and returns its etag. Of concurrent conditional writes against one
+    /// etag, at most one succeeds.
     fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>>;
     /// Idempotent: deleting a missing object succeeds.
     fn delete<'a>(&'a self, key: &'a str) -> BoxFut<'a, SResult<()>>;
-    /// Objects with the given prefix and key > `start_after`, in key order.
+    /// Up to `limit` objects under `prefix` with keys after `start_after`, in key order.
+    /// `prefix` is empty or ends with `/`.
     fn list<'a>(&'a self, prefix: &'a str, start_after: Option<&'a str>, limit: usize)
     -> BoxFut<'a, SResult<ListPage>>;
-    /// Granularity of `last_modified_ms` in milliseconds.
+    /// Granularity of `last_modified_ms`: each object's timestamp is the store time at which
+    /// it was written, rounded down to a multiple of this many milliseconds, on one clock
+    /// shared by all objects.
     fn time_precision_ms(&self) -> u64 {
         1_000
     }
 }
 
 pub type DynStore = Arc<dyn ObjectStore>;
+
+/// True for the characters that object keys are made of: ASCII letters and digits, `.`, `_`
+/// and `-`.
+pub fn key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
 
 /// Exponential-backoff retry policy for idempotent store operations.
 #[derive(Clone, Debug)]
@@ -158,15 +181,14 @@ pub async fn list_all(store: &dyn ObjectStore, prefix: &str, retry: &Retry) -> S
     }
 }
 
-/// Clamp `range` to `[0, size)`, failing if `start` is past the end.
+/// Clamps `range` to `[0, size)`. A non-empty range must start before the end of the
+/// object, and an empty one at or before it.
 pub(crate) fn clamp_range(range: &Option<Range<u64>>, size: u64) -> SResult<Range<u64>> {
     match range {
         None => Ok(0..size),
-        Some(r) => {
-            if r.start > r.end || (r.start >= size && !(r.start == 0 && size == 0)) {
-                return Err(StoreError::Fatal("invalid range".into()));
-            }
+        Some(r) if r.start <= r.end && (r.start < size || r.start == r.end && r.start <= size) => {
             Ok(r.start..r.end.min(size))
         }
+        Some(_) => Err(StoreError::Fatal("invalid range".into())),
     }
 }

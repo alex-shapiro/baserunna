@@ -9,7 +9,7 @@ use crate::engine::manifest::ObjKind;
 use crate::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn, Value, blob};
 use crate::error::{Error, Result};
 use crate::meta::{self, DbRecord, DbRef, MetaCmd};
-use crate::node::{Node, OpenTxn};
+use crate::node::{Node, OpenSlot, OpenTxn};
 use crate::ops::{self, Encoding, Op, OpCtx, exec_ops, user_key};
 use crate::table::{self, BlobResolver, ColumnSpec, CreateTable, IndexSpec, InsertMode, Query, Selection};
 use axum::Router;
@@ -540,6 +540,7 @@ async fn begin_txn(
     Extension(ctx): Extension<DbCtx>,
     JsonBody(b): JsonBody<Begin>,
 ) -> Result<Response> {
+    ctx.db.shared().admit(&ctx.db.id)?;
     let mut t = match b.isolation.into() {
         crate::engine::Isolation::Serializable => ctx.db.begin_optimistic().await?,
         iso => ctx.db.begin(iso, Consistency::Strong).await?,
@@ -557,7 +558,21 @@ async fn begin_txn(
         last_used: now,
         encoding: b.encoding,
     };
-    node.txns.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), Arc::new(tokio::sync::Mutex::new(entry)));
+    {
+        let mut txns = node.txns.lock().unwrap_or_else(|e| e.into_inner());
+        let user = &ctx.principal.user.id;
+        if txns.values().filter(|s| s.user_id == *user).count() >= node.cfg.txns_per_user {
+            return Err(Error::RateLimited {
+                message: format!(
+                    "a user can have at most {} interactive transactions open on a node; commit or abort one first",
+                    node.cfg.txns_per_user
+                ),
+                retry_after_ms: 1_000,
+            });
+        }
+        let slot = OpenSlot { user_id: user.clone(), txn: tokio::sync::Mutex::new(entry) };
+        txns.insert(id.clone(), Arc::new(slot));
+    }
     Ok((
         StatusCode::CREATED,
         axum::Json(json!({
@@ -572,7 +587,7 @@ async fn begin_txn(
         .into_response())
 }
 
-fn get_open(node: &Node, id: &str) -> Result<Arc<tokio::sync::Mutex<OpenTxn>>> {
+fn get_open(node: &Node, id: &str) -> Result<Arc<OpenSlot>> {
     if crate::buggify::fault(0.01) {
         remove_open(node, id);
     }
@@ -600,8 +615,9 @@ async fn txn_ops(
     JsonBody(b): JsonBody<OpsBody>,
 ) -> Result<J> {
     let id = param(&p, "id")?.to_string();
+    ctx.db.shared().admit(&ctx.db.id)?;
     let entry = get_open(&node, &id)?;
-    let mut g = entry.lock().await;
+    let mut g = entry.txn.lock().await;
     if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
         return Err(Error::TxnNotFound);
     }
@@ -643,7 +659,7 @@ async fn commit_txn(
 ) -> Result<J> {
     let id = param(&p, "id")?.to_string();
     let entry = get_open(&node, &id)?;
-    let mut g = entry.lock().await;
+    let mut g = entry.txn.lock().await;
     if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
         return Err(Error::TxnNotFound);
     }
@@ -678,7 +694,7 @@ async fn commit_txn(
 async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
     let id = param(&p, "id")?.to_string();
     let entry = get_open(&node, &id)?;
-    let g = entry.lock().await;
+    let g = entry.txn.lock().await;
     if g.db_id != ctx.rec.id || g.user_id != ctx.principal.user.id {
         return Err(Error::TxnNotFound);
     }

@@ -197,6 +197,11 @@ fn engine_knobs(k: &Knobs, c: &mut SimConfig) {
     e.level_size_ratio = k.range("engine.level_size_ratio", 2, 10);
     e.level_base_bytes = k.log_range("engine.level_base_bytes", 2 * 1024, 64 * 1024);
     e.cache_bytes = (k.log_range("engine.cache_bytes", 64 * 1024, 4 * 1024 * 1024) as usize).max(8 * e.block_target);
+    if k.chance("engine.memory_pressure", 0.5) {
+        e.tail_max_bytes = e.tail_max_bytes.min(2048);
+        let floor = (64 * e.tail_max_bytes as u64).max(256 * 1024);
+        e.memory_bytes = k.log_range("engine.memory_bytes", floor, 1024 * 1024) as usize;
+    }
     e.range_delete_points_max = k.log_range("engine.range_delete_points_max", 1, 300) as usize;
     e.levels_inline_max = k.range("engine.levels_inline_max", 1, 16) as usize;
     e.stream_seal_min_bytes = k.log_range("engine.stream_seal_min_bytes", 256, 16 * 1024) as usize;

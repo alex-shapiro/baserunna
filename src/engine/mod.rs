@@ -8,6 +8,7 @@ mod config;
 pub mod db;
 pub mod local;
 pub mod manifest;
+pub mod memory;
 pub mod range_delete;
 pub mod segment;
 pub mod stream;
@@ -44,8 +45,15 @@ pub struct Shared {
     /// Latest observed foreign lease `(holder, write_seq, first_seen)` per
     /// database, retained across `Db` handle evictions.
     pub(crate) observed_leases: Mutex<DetHashMap<String, (String, u64, tokio::time::Instant)>>,
-    /// Databases exempt from size quota limits.
-    quota_exempt: Mutex<std::collections::BTreeSet<String>>,
+    /// System databases: exempt from size quotas, never unloaded, and always admitted.
+    system: Mutex<std::collections::BTreeSet<String>>,
+    /// Budget for memory held by open databases and transactions.
+    pub memory: Arc<memory::Memory>,
+    engine: std::sync::OnceLock<std::sync::Weak<Engine>>,
+    /// When the last pass of [`Engine::relieve`] failed to get under the budget.
+    relief_failed_at: Mutex<Option<tokio::time::Instant>>,
+    /// Counts database accesses, ordering them for unloading.
+    access_ticks: std::sync::atomic::AtomicU64,
     pub metrics: Arc<crate::metrics::StoreMetrics>,
     /// True once the node begins releasing leases for shutdown.
     stopping: std::sync::atomic::AtomicBool,
@@ -74,8 +82,41 @@ impl Shared {
         self.waits_ended.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub(crate) fn quota_exempt(&self, db: &str) -> bool {
-        self.quota_exempt.lock().unwrap_or_else(|e| e.into_inner()).contains(db)
+    pub(crate) fn tick(&self) -> u64 {
+        self.access_ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
+    pub(crate) fn is_system(&self, db: &str) -> bool {
+        self.system.lock().unwrap_or_else(|e| e.into_inner()).contains(db)
+    }
+
+    /// Succeeds if work on database `db` that holds memory beyond a single request, such as an
+    /// interactive transaction, may start or grow: the budget has room, possibly after
+    /// unloading idle databases, or `db` is a system database. Work that finishes or releases
+    /// memory, and loads that requests need, are never refused.
+    pub fn admit(&self, db: &str) -> crate::error::Result<()> {
+        if !self.memory.over() || self.is_system(db) {
+            return Ok(());
+        }
+        self.relieve();
+        if !self.memory.over() {
+            return Ok(());
+        }
+        crate::probe::hit(crate::probe::Probe::MemoryExhausted);
+        Err(crate::error::Error::Unavailable {
+            message: "this node's memory for open databases and transactions is exhausted; retry shortly".into(),
+            retry_after_ms: Some(1_000),
+            outcome_unknown: false,
+        })
+    }
+
+    /// Unloads idle databases if memory use exceeds the budget.
+    pub(crate) fn relieve(&self) {
+        if self.memory.over()
+            && let Some(e) = self.engine.get().and_then(std::sync::Weak::upgrade)
+        {
+            e.relieve();
+        }
     }
 
     /// Returns the current store time if the clock offset was synchronized within `clock_sync_max_age_ms`.
@@ -219,6 +260,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(store: DynStore, env: Arc<Env>, cfg: EngineConfig, node_id: String) -> Arc<Engine> {
         let metrics = Arc::new(crate::metrics::StoreMetrics::default());
+        let memory = Arc::new(memory::Memory::new(cfg.memory_bytes));
         let shared = Arc::new(Shared {
             store: Arc::new(crate::timing::TimedStore { inner: store, metrics: metrics.clone() }),
             metrics,
@@ -230,21 +272,28 @@ impl Engine {
             retry: Retry::default(),
             clock: clock::StoreClock::new(),
             observed_leases: Mutex::new(DetHashMap::default()),
-            quota_exempt: Mutex::new(Default::default()),
+            system: Mutex::new(Default::default()),
+            memory,
+            engine: std::sync::OnceLock::new(),
+            relief_failed_at: Mutex::new(None),
+            access_ticks: 0.into(),
             stopping: false.into(),
             waits_ended: false.into(),
             commit_hook: std::sync::OnceLock::new(),
         });
-        Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) })
+        let engine = Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) });
+        let _ = engine.shared.engine.set(Arc::downgrade(&engine));
+        engine
     }
 
     pub fn env(&self) -> &Arc<Env> {
         &self.shared.env
     }
 
-    /// Exempts a database from size quota enforcement.
-    pub fn exempt_from_quota(&self, id: &str) {
-        self.shared.quota_exempt.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string());
+    /// Marks a database as a system database: exempt from its size quota and from the memory
+    /// budget, and never unloaded.
+    pub fn mark_system(&self, id: &str) {
+        self.shared.system.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string());
     }
 
     /// Returns the handle for database `id`, creating an unloaded handle if not already open.
@@ -297,6 +346,38 @@ impl Engine {
         released
     }
 
+    /// Unloads the least recently used idle databases until memory use is at most 7/8 of the
+    /// budget, and drops the handles of unloaded databases that nothing references. After a
+    /// pass that cannot get under the budget, further passes are skipped for 50 ms.
+    pub(crate) fn relieve(&self) {
+        let shared = &self.shared;
+        {
+            let failed = shared.relief_failed_at.lock().unwrap_or_else(|e| e.into_inner());
+            if failed.is_some_and(|t| t.elapsed() < Duration::from_millis(50)) {
+                return;
+            }
+        }
+        let target = shared.memory.limit() / 8 * 7;
+        let mut candidates: Vec<(u64, Arc<Db>)> = {
+            let g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
+            g.values().filter(|d| !shared.is_system(&d.id)).map(|d| (d.access_order(), d.clone())).collect()
+        };
+        candidates.sort_by_key(|(at, _)| *at);
+        for (_, db) in &candidates {
+            if shared.memory.used() <= target {
+                break;
+            }
+            db.unload();
+        }
+        drop(candidates);
+        self.dbs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, db| Arc::strong_count(db) > 1 || db.current().is_some());
+        let mut failed = shared.relief_failed_at.lock().unwrap_or_else(|e| e.into_inner());
+        *failed = shared.memory.over().then(tokio::time::Instant::now);
+    }
+
     /// Drops unreferenced handles that have been idle for `idle_ms`.
     pub fn evict_idle(&self, idle_ms: u64) {
         let mut g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
@@ -328,6 +409,8 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
+mod memory_tests;
 #[cfg(test)]
 mod range_tests;
 #[cfg(test)]

@@ -85,8 +85,8 @@ enum Settled {
 
 /// Retries an idempotent write until its outcome is known, rotating the
 /// key when an unapplied attempt was fenced.
-async fn settle(c: &Client, path: &str, ndjson: bool, body: &Json, key: &str) -> Result<Settled, String> {
-    let mut key = key.to_string();
+async fn settle(c: &Client, path: &str, ndjson: bool, body: &Json, base: &str) -> Result<Settled, String> {
+    let mut key = base.to_string();
     let mut first = c.sim.now_ms();
     for attempt in 0..200 {
         let (bytes, ct) = match (ndjson, body) {
@@ -128,7 +128,7 @@ async fn settle(c: &Client, path: &str, ndjson: bool, body: &Json, key: &str) ->
                 Status::NotCommitted => {}
             }
         }
-        (key, first) = (format!("{key}.{attempt}"), c.sim.now_ms());
+        (key, first) = (format!("{base}.{attempt}"), c.sim.now_ms());
     }
     Err(format!("{}: POST {path} never settled", c.name))
 }

@@ -42,6 +42,7 @@ enum Op {
     Advance(u64),
     Sweep,
     Feed(usize, usize),
+    Unload,
 }
 
 fn data_key(r: &mut Rng, max_len: usize) -> Vec<u8> {
@@ -79,7 +80,8 @@ fn gen_ops(r: &mut Rng) -> Vec<Op> {
             68..=85 => Op::Commit,
             86..=89 => Op::Settle,
             90..=93 => Op::Advance(if r.chance(0.5) { r.range(1, 6_000) } else { r.range(1, 3_000_000) }),
-            94..=96 => Op::Feed(r.usize(1000), 1 + r.usize(20)),
+            94..=95 => Op::Feed(r.usize(1000), 1 + r.usize(20)),
+            96..=97 => Op::Unload,
             _ => Op::Sweep,
         })
         .collect()
@@ -296,6 +298,10 @@ async fn run_ops(seed: u64, ops: &[Op]) -> Result<(), String> {
             Op::Feed(i, limit) => {
                 let (version, then) = &history[i % history.len()];
                 check_feed(&db, *version, then, &model, *limit).await?;
+            }
+            Op::Unload => {
+                db.unload();
+                check_against_model(&db, &model, &mut rng).await?;
             }
         }
     }
@@ -514,14 +520,14 @@ fn blob_limits_and_ranges() {
 pub(super) struct DelayStore {
     pub(super) mem: Arc<MemStore>,
     get_reply_ms: AtomicU64,
-    put_reply_ms: AtomicU64,
+    pub(super) put_reply_ms: AtomicU64,
     manifest_put_conflicts: AtomicU32,
     manifest_put_outages: AtomicU32,
     pub(super) manifest_put_lost: AtomicU32,
     manifest_get_outages: AtomicU32,
     stale_manifest: Mutex<Option<Bytes>>,
     manifest_puts: AtomicU32,
-    gets: Mutex<Vec<(String, bool)>>,
+    pub(super) gets: Mutex<Vec<(String, bool)>>,
     seg_get_bytes: Mutex<Vec<usize>>,
 }
 

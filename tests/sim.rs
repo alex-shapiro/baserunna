@@ -49,6 +49,7 @@ scenario_tests! {
     sim_streams: "streams", 22, 3;
     sim_orgs: "orgs", 20, 2;
     sim_accounts: "accounts", 21, 2;
+    sim_memory: "memory", 24, 3;
 }
 
 /// Verifies that a branched run matches its parent up to the branch point and

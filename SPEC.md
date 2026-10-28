@@ -709,6 +709,14 @@ Simulated benchmarks (`sim::amp`) measure segment and chunk bytes written per re
 | 20 feeds of 500 KB, appended round-robin  | 2.90 → 7.30              | 88%            |
 | 200 conversations of 50 KB, 25 per commit | 7.11 → 7.11              | 1%             |
 
+### 5.12 Memory
+
+Each node enforces a memory budget (`BASERUNNA_DB_MEMORY_MB`, default 256 MiB) across all open user databases and active transactions. Database handles, decoded manifests (including tail entries and segment metadata), and transaction snapshots, read sets, and write sets are charged to this budget. The system database is exempt.
+
+If memory usage exceeds the budget, the node unloads the least recently used idle databases until usage drops to 7/8 of the budget. Unloading drops the cached manifest while retaining the database handle, so active long-poll and SSE watchers do not prevent eviction, and the next request reloads the manifest with a single `GET`. A database is idle if it has 0 in-flight manifest reads, manifest writes, commits, or background tasks. Local lease state is preserved across unloads so that a lease holder resumes serving strong reads from memory after reloading the manifest.
+
+If memory usage remains above the budget after unloading all idle databases, the node rejects new interactive transactions and new interactive transaction operations with a retryable `503` error. Single-request transactions, interactive transaction commits, and interactive transaction aborts are still admitted so that in-flight work can finish and release memory. Each user is limited to 100 concurrent open interactive transactions per node.
+
 ---
 
 ## 6. Transactions
@@ -741,8 +749,10 @@ Simulated benchmarks (`sim::amp`) measure segment and chunk bytes written per re
 - Blind-write transactions never conflict, appends included.
 - Reads within a transaction see its own earlier writes, except appends.
 - Limits: `txn_max_ops` 10,000; `txn_max_write_bytes` 16 MiB, where blobs
-  count only their descriptor; 100,000 appended records; `txn_idle_timeout`
-  30 s; `txn_max_lifetime` 5 min.
+  count only their descriptor; `txn_max_read_bytes` 16 MiB of keys and key
+  ranges in the read set; 100,000 appended records; `txn_idle_timeout`
+  30 s; `txn_max_lifetime` 5 min; 100 open interactive transactions per user
+  on each node (§5.12).
 
 ### 6.2 Forms
 
@@ -1253,13 +1263,14 @@ content security policy.
 | `BASERUNNA_LISTEN`                       | `0.0.0.0:8080`                  | bind address                                                 |
 | `BASERUNNA_ADVERTISE`                    | `http://127.0.0.1:<port>`       | address peers use to forward                                 |
 | `BASERUNNA_NODE_ID`                      | random                          | stable id optional                                           |
-| `BASERUNNA_STORE`                        | `fs:./data`                     | `fs:<dir>`, `mem:`, `s3://bucket/prefix`, `gs://…`, `az://…` |
+| `BASERUNNA_STORE`                        | `fs:./data`                     | `fs:<dir>`, `mem:`, or `s3://bucket/prefix` (Tigris)         |
 | `BASERUNNA_CLUSTER_SECRET`               | none (required if >1 node)      | internal endpoint auth                                       |
 | `BASERUNNA_SIGNUP`                       | `first_user_only`               | `open` / `first_user_only` / `closed`                        |
 | `BASERUNNA_ADMIN_EMAIL` / `_PASSWORD`    | none                            | bootstrap admin                                              |
 | `BASERUNNA_GOOGLE_CLIENT_ID` / `_SECRET` | none                            | enables Google sign-in                                       |
 | `BASERUNNA_PUBLIC_URL`                   | advertise                       | OAuth redirect base, cookie `Secure`                         |
 | `BASERUNNA_CACHE_MB`                     | 512                             | block cache budget                                           |
+| `BASERUNNA_DB_MEMORY_MB`                 | 256                             | memory for open databases and transactions (§5.12)           |
 | `BASERUNNA_DISK_CACHE_DIR`               | none                            | directory of the local tier (§5.3); off if unset             |
 | `BASERUNNA_DISK_CACHE_MB`                | 10240                           | local tier budget                                            |
 | `BASERUNNA_LEASE_MS`                     | 5000                            | lease renewed by commits; leases renewed for reads last 3×   |
@@ -1361,6 +1372,7 @@ Workloads run concurrently with a shared chaos loop (`ChaosPhase`). When all act
 - `lifecycle`: Database creation, mutation, deletion, and recreation across node crashes, verifying background storage purge and per-owner database counters.
 - `console`: Exercises all web console pages, verifying CSRF protection, HTML escaping, multipart uploads, safe attachment headers, pagination, and account/org/admin flows.
 - `api_tour`: Exercises schema drop endpoints, transaction aborts, commit status lookup by idempotency key, and admin metrics endpoints.
+- `memory`: Exercises many databases under a tight memory budget while long-poll requests wait on unloaded databases and interactive transactions hold large write sets. Verifies that strong reads return all settled writes, long-poll requests observe expected writes, and rejected interactive transactions are admitted after memory is released.
 - `mix`: Runs a random combination of at least two workloads concurrently in a shared cluster and chaos loop.
 
 Every 20 ms of virtual time, global oracles verify that at most 1 node relies on a lease for any database and that any node relying on a lease without an in-flight manifest write holds the latest manifest version in the store. At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, and stream chunks are intact and consistent. After a node shuts down gracefully, the simulator verifies that none of the released databases in storage have a lease held by that node.
@@ -1382,6 +1394,9 @@ Every 20 ms of virtual time, global oracles verify that at most 1 node relies on
 - **Request IDs**: verifies in a multi-node simulation that `x-request-id` headers are validated, echoed in responses, propagated across forwarded requests and metadata commands, and recorded in server logs.
 - **Checker self-tests**: unit tests feed synthetic invalid histories and corrupted states to each simulation checker to verify that every checker detects violations.
 - **Mutation testing** (`scripts/mutants.sh`): runs `cargo-mutants` against the storage engine, table layer, transaction operations, and simulation checkers.
+- **Object-store conformance** (`store::conformance`, `tests/store_conformance.rs`): Verifies the object-store contract using 2 independent clients of the same store: conditional writes (including 16-writer races), cross-client visibility, etag uniqueness, byte ranges, pagination, store-clock coherence, and randomized model checking against `MemStore`. Runs against `MemStore`, `FsStore`, `CloudStore` backed by a fault-injecting in-process S3 server, and a live S3 store if `BASERUNNA_TEST_STORE` is set. Also verifies that each check detects synthetic contract violations, and that nodes run conditional-write preflight checks before serving.
+- **Failover check** (`examples/cluster_check.rs`): Runs multiple nodes against a shared store while killing and restarting nodes at random. Concurrent clients execute counter increments with idempotency keys and bank transfers with commit IDs, verifying that all committed writes are durable, strong reads match settled writes, and total account balances are conserved.
+- **Memory bound** (`tests/memory_bound.rs`): Uses a counting global allocator to verify that memory charges cover actual heap allocations for decoded manifests and that opening hundreds of databases with retained handles stays within the configured memory budget.
 - **Cost model** (`sim::cost`, `tests/cost.rs`): measures object-store `GET`, `PUT`, `HEAD`, and `LIST` request counts per operation in virtual time and enforces per-operation and monthly workload cost budgets:
 
   | operation                                     | requests                                |
@@ -1411,6 +1426,8 @@ Commands:
 
 ```
 cargo test                                                       # run unit, property, fuzz, and simulation tests
+BASERUNNA_TEST_STORE=s3://bucket cargo test --release --test store_conformance   # check a live store
+BASERUNNA_STORE=s3://bucket cargo run --release --example cluster_check -- 180    # run the failover check
 SIM_SEEDS=500 cargo test --release --test sim                    # run 500 seeds per scenario
 cargo run --release --example sim_tool -- campaign all 3000      # run a parallel campaign (SIM_MINUTES, SIM_COVERAGE=1)
 cargo run --release --example sim_tool -- explore all 1          # run guided exploration (SIM_RUNS, SIM_COMPARE=1)
@@ -1515,10 +1532,10 @@ Tools:
 - Size quotas are one setting for every database; there are no per-user or per-database overrides.
 - Roles are per organization: a user cannot be granted one database of an organization only.
 - Mail is sent only through an HTTP webhook (§12).
-- Multi-node deployments need an object store with conditional writes (S3, GCS, Azure, R2, MinIO); `fs:` is for one process (§12).
-- After a node crash, writes to the databases it leased wait for the lease to expire: at most 11 s for a database whose last renewal was a commit, 31 s for one kept leased by reads alone (§5.7).
-- Garbage collection relies on the store's `last_modified` timestamps coming from one coherent clock, as they do on the major providers.
-- `CloudStore` (S3/GCS/Azure through `object_store`) is exercised only by compile-time checks; the simulator tests the same semantics through `SimStore`.
+- Tigris is the only tested production object store (§13.5). `fs:` stores are restricted to a single process (§12).
+- After a node crash, writes to databases leased by that node wait for the lease to expire: up to 11 s after a commit renewal, or up to 31 s after a read-lease renewal (§5.7).
+- Garbage collection requires object `last_modified` timestamps to come from a single coherent store clock (§13.5).
+- The per-node memory budget is shared across all users without per-user quotas: a single user's interactive transactions can consume the entire budget for up to 5 minutes, causing other users' interactive transactions on that node to be rejected (§5.12).
 - Stream retention runs on the lease holder, so a database with no activity keeps records past their retention until it is used again (§5.11). Trimmed chunks and their quota bytes are reclaimed by sweeps, hours later, as overwritten blobs are.
 - Stream filters scan records; there is no index on record contents, so a query finds needles at the rate it can scan (`scan_limit` records a request).
 

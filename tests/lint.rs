@@ -21,7 +21,13 @@ const RULES: &[(&str, &[&str], &str)] = &[
     ("select!", &[], "select! polls branches in non-deterministic order"),
     (
         "tokio::spawn(",
-        &["src/sim/", "src/engine/tests.rs", "src/stream/tests.rs"],
+        &[
+            "src/sim/",
+            "src/engine/tests.rs",
+            "src/engine/memory_tests.rs",
+            "src/stream/tests.rs",
+            "src/store/conformance.rs",
+        ],
         "spawn tasks through Env so node crashes abort them",
     ),
     ("SystemTime", &["src/env.rs", "src/store/", "src/main.rs", "src/log.rs"], "read wall time from Env::now_ms"),

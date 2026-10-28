@@ -3,6 +3,7 @@
 use super::blob::{BlobWriter, StageGuard};
 use super::compaction::{self, Kind};
 use super::manifest::{Lease, Manifest, ObjKind, Obsolete, PageCache, SegmentMeta};
+use super::memory::Charge;
 use super::range_delete::RangeTombstone;
 use super::segment::SegmentBuilder;
 use super::stream::{self, Appended, Pending, Sealer, Seek, StreamOp};
@@ -26,6 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
+
+const HANDLE_BYTES: usize = std::mem::size_of::<Db>() + 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Consistency {
@@ -147,6 +150,7 @@ struct State {
     distrusted_at: Option<Instant>,
     verified_at: Option<Instant>,
     last_access: Instant,
+    last_access_seq: u64,
     window_start: Instant,
     reads_in_window: u32,
     reads_last_window: u32,
@@ -163,6 +167,8 @@ struct State {
     quota_pressure: bool,
     trim_queue: BTreeSet<u64>,
     trimming: bool,
+    /// Stored bytes from the last unloaded manifest, used for quota checks while unloaded.
+    unloaded_stored_bytes: u64,
 }
 
 impl State {
@@ -207,7 +213,8 @@ pub struct Db {
     /// True while [`Db::load_noticed`] is reloading the manifest.
     refreshing: std::sync::atomic::AtomicBool,
     staging: Mutex<Staging>,
-    pages: Mutex<PageCache>,
+    pages: Mutex<(PageCache, Charge)>,
+    _handle_charge: Charge,
 }
 
 /// Tracks in-flight and completed uncommitted blob uploads against the database quota.
@@ -267,14 +274,13 @@ impl Db {
     pub(crate) fn new(id: String, shared: Arc<Shared>) -> Arc<Db> {
         let now = Instant::now();
         Arc::new(Db {
-            id,
-            shared,
             st: Mutex::new(State {
                 current: None,
                 trusted: false,
                 distrusted_at: None,
                 verified_at: None,
                 last_access: now,
+                last_access_seq: 0,
                 window_start: now,
                 reads_in_window: 0,
                 reads_last_window: 0,
@@ -287,6 +293,7 @@ impl Db {
                 quota_pressure: false,
                 trim_queue: BTreeSet::new(),
                 trimming: false,
+                unloaded_stored_bytes: 0,
             }),
             q: Mutex::new(Queue { items: VecDeque::new(), running: false, parked_flush: None }),
             load_lock: tokio::sync::Mutex::new(()),
@@ -298,7 +305,10 @@ impl Db {
             noticed_version: Default::default(),
             refreshing: Default::default(),
             staging: Mutex::new(Staging::default()),
-            pages: Mutex::new(PageCache::default()),
+            pages: Mutex::new((PageCache::default(), Charge::new(&shared.memory, 0))),
+            _handle_charge: Charge::new(&shared.memory, HANDLE_BYTES + id.len()),
+            id,
+            shared,
         })
     }
 
@@ -335,6 +345,40 @@ impl Db {
             && !st.sweeping
             && !st.trimming
             && st.last_access.elapsed() >= Duration::from_millis(ms)
+    }
+
+    pub(crate) fn last_access_seq(&self) -> u64 {
+        self.st().last_access_seq
+    }
+
+    /// Drops the cached manifest and page cache if the database is idle and not a system
+    /// database. Returns `true` if the manifest was unloaded.
+    pub(crate) fn unload(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Ok(_load) = self.load_lock.try_lock() else { return false };
+        if self.shared.is_system(&self.id)
+            || self.refreshing.load(SeqCst)
+            || self.has_in_flight_write()
+            || self.staging().uploading > 0
+        {
+            return false;
+        }
+        let mut st = self.st();
+        let q = self.queue();
+        let busy = q.running || !q.items.is_empty() || q.parked_flush.is_some();
+        if busy || st.compacting || st.flushing || st.sweeping || st.trimming || st.in_flight_hedged_puts > 0 {
+            return false;
+        }
+        let Some(cur) = st.current.take() else { return false };
+        st.unloaded_stored_bytes = cur.m.stored_bytes();
+        st.verified_at = None;
+        drop(q);
+        drop(st);
+        let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+        pages.0 = PageCache::default();
+        pages.1.set(0);
+        probe::hit(Probe::DatabaseUnloaded);
+        true
     }
 
     // Lease validity is measured on each node's monotonic clock rather than wall clocks.
@@ -456,7 +500,7 @@ impl Db {
     /// Effective size quota for this database in bytes, or None if unlimited or exempt.
     pub fn quota(&self) -> Option<u64> {
         let limit = self.shared.cfg.db_max_bytes;
-        (limit > 0 && !self.shared.quota_exempt(&self.id)).then_some(limit)
+        (limit > 0 && !self.shared.is_system(&self.id)).then_some(limit)
     }
 
     fn staging(&self) -> std::sync::MutexGuard<'_, Staging> {
@@ -469,7 +513,10 @@ impl Db {
     /// Reserves `n` bytes for an in-flight upload against the database size quota.
     pub(crate) fn reserve_staging(&self, n: u64) -> Result<()> {
         let Some(limit) = self.quota() else { return Ok(()) };
-        let stored = self.current().map_or(0, |v| v.m.stored_bytes());
+        let stored = {
+            let st = self.st();
+            st.current.as_ref().map_or(st.unloaded_stored_bytes, |v| v.m.stored_bytes())
+        };
         let mut g = self.staging();
         let pending = g.uploading + g.staged.values().map(|(n, _)| n).sum::<u64>();
         if stored + pending + n > limit {
@@ -523,6 +570,8 @@ impl Db {
                 st.verified_at = Some(verified);
             }
         }
+        drop(st);
+        self.shared.unload_idle();
         installed
     }
 
@@ -686,6 +735,7 @@ impl Db {
         let cfg = &self.shared.cfg;
         let mut st = self.st();
         st.last_access = now;
+        st.last_access_seq = self.shared.next_access_seq();
         let window = Duration::from_millis(cfg.read_lease_ms);
         let since = now.duration_since(st.window_start);
         if since > window {
@@ -753,7 +803,9 @@ impl Db {
 
     pub async fn begin(self: &Arc<Self>, isolation: Isolation, c: Consistency) -> Result<Txn> {
         let snap = self.snapshot(c).await?;
-        Ok(Txn::new(snap, isolation, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes))
+        let cfg = &self.shared.cfg;
+        Ok(Txn::new(snap, isolation, self.shared.env.random_u64(), cfg.txn_max_write_bytes)
+            .with_read_limit(cfg.txn_max_read_bytes))
     }
 
     /// Begins a strong serializable transaction without waiting for an
@@ -763,7 +815,8 @@ impl Db {
     pub async fn begin_optimistic(self: &Arc<Self>) -> Result<Txn> {
         let (snap, write_in_flight) = self.latest_snapshot().await?;
         let mut t =
-            Txn::new(snap, Isolation::Serializable, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes);
+            Txn::new(snap, Isolation::Serializable, self.shared.env.random_u64(), self.shared.cfg.txn_max_write_bytes)
+                .with_read_limit(self.shared.cfg.txn_max_read_bytes);
         if write_in_flight || buggify() {
             t.mark_optimistic();
             probe::hit(Probe::OptimisticBegin);
@@ -846,7 +899,12 @@ impl Db {
     /// Releases this node's lease so other nodes can take over immediately. Returns whether
     /// this node held the lease, and released it.
     pub async fn release_lease(self: &Arc<Self>) -> Result<bool> {
-        let held = self.current().is_some_and(|c| c.m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id));
+        let held = {
+            let st = self.st();
+            let in_manifest =
+                st.current.as_ref().is_some_and(|c| c.m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id));
+            in_manifest || st.own_lease.is_some_and(|(_, until)| until > Instant::now())
+        };
         if !held {
             return Ok(false);
         }
@@ -1103,7 +1161,13 @@ impl Db {
             let started = Instant::now();
             self.limit_own_lease(&m, attempt_started);
             self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let data = m.encode_with(&mut self.pages.lock().unwrap_or_else(|e| e.into_inner()));
+            let data = {
+                let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+                let data = m.encode_with(&mut pages.0);
+                let bytes = pages.0.heap_bytes();
+                pages.1.set(bytes);
+                data
+            };
             let res = self.put_manifest(data, &base.etag).await;
             if !res.is_ok() {
                 if matches!(res, Err(StoreError::Unavailable(_))) {
@@ -1942,6 +2006,7 @@ impl Db {
             reads: Vec::new(),
             pinned_reads: Vec::new(),
             writes,
+            charge: Charge::default(),
         };
         match self.commit(req).await {
             Ok(_) => {

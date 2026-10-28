@@ -897,6 +897,8 @@ async fn limits(State(node): State<Arc<Node>>) -> axum::Json<Json> {
     axum::Json(json!({
         "txn_max_ops": crate::ops::MAX_TXN_OPS,
         "txn_max_write_bytes": engine_cfg.txn_max_write_bytes,
+        "txn_max_read_bytes": engine_cfg.txn_max_read_bytes,
+        "txn_max_open_per_user": node.cfg.txns_per_user,
         "value_inline_max": engine_cfg.value_inline_max,
         "scan_limit_max": crate::ops::MAX_SCAN_LIMIT,
         "long_poll_max_ms": LONG_POLL_MAX_MS,

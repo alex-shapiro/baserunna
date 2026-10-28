@@ -1,22 +1,41 @@
 # TODO
 
-Planned work not included in v1, ordered by priority within each section.
-See [`SPEC.md`](SPEC.md) §15 (known limitations) and §16 (future work) for
-design context.
+Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
+§15 (known limitations) and §16 (future work) for design context.
 
-## Before production use
+## Reliability and operations
 
-- [ ] **Run integration tests against production object stores.** `CloudStore`
-      (S3, GCS, Azure, R2, MinIO) is currently only compile-tested. Add an
-      opt-in integration test suite gated on credentials that runs the
-      `ObjectStore` conformance suite: conditional `PUT` (`If-Match` and
-      `If-None-Match`), list-after-write, and byte-range `GET`. Run the
-      `multi_node` example against MinIO in CI. Verify that each provider's
-      conditional-write semantics match `SimStore` and that `last_modified`
-      timestamps are monotonic (SPEC §5.8).
-- [ ] **Test Google OAuth against Google's production endpoints.** Currently
-      only `FakeGoogle` is tested. Add an OIDC `nonce` and PKCE
-      (`code_verifier`) to the authorization-code flow in addition to `state`.
+- [ ] **Check store-clock staleness before acquiring the probe lock.**
+      `StoreClock::sync` acquires its mutex before checking whether the
+      measurement is stale, causing `store_time_ms` callers (stream appends,
+      TTL writes, blob uploads, and commits that bind staged blobs) to wait for
+      in-flight probes. Check staleness before locking, and bound probe
+      duration to `2 × clock_sync_max_error_ms`.
+- [ ] **Propagate request deadlines to object-store operations.**
+      `CloudStore` uses a 30 s per-request timeout and `Retry` makes up to 5
+      attempts, so a read or manifest load can continue after the client timed
+      out. Pass the request deadline to store operations and stop retrying
+      after the deadline expires.
+- [ ] **Report `outcome: "unknown"` on stale-target rejections if a forward was
+      retried.** If a node receives `x-baserunna-stale-target`, it executes the
+      request locally, assuming the peer never executed it. If a proxy or
+      network duplicated the forwarded request, an earlier copy could have been
+      executed by the peer's previous process (`sim_tool trace tables 7344`).
+      Execute locally only if the forward was sent once; otherwise return
+      `outcome: "unknown"`.
+- [ ] **Enforce per-user fairness for the node memory budget.** A single user's
+      interactive transactions can consume a node's entire memory budget for up
+      to 5 minutes, causing other users' interactive transactions on that node
+      to be rejected (SPEC §5.12). Reserve a budget share per active user or
+      evict transactions from the user holding the most memory.
+- [ ] **Abort open interactive transactions if a database is deleted.**
+      Interactive transactions on a deleted database currently remain open
+      until their 30 s idle timeout expires, consuming memory and counting
+      against the 100-transaction per-user limit.
+- [ ] **Test Google OAuth against Google's production endpoints.** Only
+      `FakeGoogle` is tested in simulation. Refresh the cached JWKS if an ID
+      token contains an unknown `kid` instead of waiting for the 1-hour cache
+      TTL, and add PKCE (`code_verifier`) and an OIDC `nonce`.
 - [ ] **Prometheus metrics endpoint.** Expose `/metrics` in Prometheus text
       format including the histograms from `/v1/admin/metrics`, object-store
       byte counters, CAS conflicts, lease acquisitions and steals, cache hit
@@ -25,11 +44,6 @@ design context.
 - [ ] **Publish release binaries and a container image.** Build and publish
       release binaries and a container image so external test suites can run
       a local node in CI.
-- [ ] **Time out store-clock probes.** A stalled probe holds the node-wide
-      `StoreClock::sync` lock until the store request times out, blocking
-      callers of `store_time_ms`. Because probes slower than
-      `2 × clock_sync_max_error_ms` are discarded as imprecise, probes should
-      time out at that bound.
 - [ ] **Reschedule retention trims if the store clock is unknown.**
       `trim_for_retention` returns early if the node lacks a store-clock
       measurement, delaying retention trimming until the next append or sweep.
@@ -38,10 +52,6 @@ design context.
       commit attempt rather than at the start of the manifest `PUT`, subtracting
       synchronous pre-`PUT` work (such as synchronous tail flushes) from the
       local lease duration.
-- [ ] **Bound memory used by open database handles.** Each open handle retains
-      its current manifest and cached compressed tail pages, and handle count
-      is currently bounded only by idle eviction (`db_idle_evict_ms`). Enforce
-      a byte budget across open handles with LRU eviction.
 - [ ] **Release database leases concurrently on shutdown.**
       `Engine::release_leases` currently releases leases sequentially with a
       2 s timeout per database.
@@ -59,6 +69,10 @@ design context.
 - [ ] **Flush idle database tails to reduce next-commit manifest size.**
       Flushing a non-empty tail after a database becomes idle reduces the size
       of the next manifest `PUT` at the cost of an extra segment `PUT`.
+- [ ] **Box `BlobRef` in `Value` to reduce in-memory tail entry size.** `Entry`
+      currently occupies 144 bytes on the stack because `Value` stores
+      `BlobRef` inline. Boxing `BlobRef` shrinks `Entry` to 96 bytes and
+      reduces memory usage for tails with small inline values by 20–35%.
 - [ ] **Keep the manifest tail as a sorted vector across a batch.** Commit
       batches currently move the manifest tail into a `BTreeMap` and back into
       a `Vec` on every commit. Merging sorted batch writes into the sorted tail
@@ -100,7 +114,9 @@ design context.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`, and publish the Rust `client` module as a standalone
       crate.
-
+- [ ] **Validate additional S3-compatible object stores.** Run the conformance
+      suite and failover check against AWS S3, Cloudflare R2, MinIO, Azure Blob
+      Storage, and Google Cloud Storage.
 - [ ] **Support idempotency keys for raw KV writes.** Accept an
       `Idempotency-Key` header on `PUT` and `DELETE /v1/dbs/{db}/kv/{key}` and
       return the commit ID in a response header so clients can resolve

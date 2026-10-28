@@ -29,6 +29,8 @@ pub struct EngineConfig {
     pub blob_chunk_size: usize,
     pub blob_max: u64,
     pub cache_bytes: usize,
+    /// Memory budget in bytes for open database manifests and active transactions.
+    pub memory_bytes: usize,
     /// Node-local cache tier below the memory cache.
     pub local_tier: Option<LocalTier>,
     /// Duration of a lease renewed by a commit, measured on each node's
@@ -43,6 +45,7 @@ pub struct EngineConfig {
     pub lease_read_threshold: u32,
     pub txn_max_lifetime_ms: u64,
     pub txn_max_write_bytes: usize,
+    pub txn_max_read_bytes: usize,
     pub gc_grace_ms: u64,
     pub orphan_grace_ms: u64,
     pub blob_stage_ttl_ms: u64,
@@ -98,6 +101,7 @@ impl Default for EngineConfig {
             blob_chunk_size: 8 * 1024 * 1024,
             blob_max: 5 * 1024 * 1024 * 1024,
             cache_bytes: 512 * 1024 * 1024,
+            memory_bytes: 256 * 1024 * 1024,
             local_tier: None,
             lease_ms: 5_000,
             read_lease_ms: 15_000,
@@ -105,6 +109,7 @@ impl Default for EngineConfig {
             lease_read_threshold: 16,
             txn_max_lifetime_ms: 5 * 60_000,
             txn_max_write_bytes: 16 * 1024 * 1024,
+            txn_max_read_bytes: 16 * 1024 * 1024,
             gc_grace_ms: 30 * 60_000,
             orphan_grace_ms: 2 * 3_600_000,
             blob_stage_ttl_ms: 3_600_000,
@@ -145,6 +150,7 @@ impl EngineConfig {
                 "clock_sync_interval_ms must be below clock_sync_max_age_ms",
             ),
             (self.level_size_ratio >= 2, "level_size_ratio must be at least 2"),
+            (self.memory_bytes >= 64 * self.tail_max_bytes, "memory_bytes must be at least 64 * tail_max_bytes"),
             (
                 self.commit_retention_ms >= 2 * self.commit_timeout_ms,
                 "commit_retention_ms must leave time to resolve commits after commit_timeout_ms",
@@ -194,6 +200,8 @@ mod tests {
         EngineConfig::default().validate().unwrap();
         EngineConfig::small_for_tests().validate().unwrap();
         let tight = EngineConfig { gc_grace_ms: 5 * 60_000, ..EngineConfig::default() };
-        assert!(tight.validate().is_err(), "no room for clock error");
+        assert!(tight.validate().is_err());
+        let starved = EngineConfig { memory_bytes: 8 * 1024 * 1024, ..EngineConfig::default() };
+        assert!(starved.validate().is_err());
     }
 }

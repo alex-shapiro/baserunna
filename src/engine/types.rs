@@ -114,6 +114,15 @@ impl Value {
         matches!(self, Value::Tombstone)
     }
 
+    pub fn heap_bytes(&self) -> usize {
+        use super::memory::alloc_bytes;
+        match self {
+            Value::Inline(b) => alloc_bytes(b.len()),
+            Value::Blob(r) => alloc_bytes(r.id.len()) + alloc_bytes(r.content_type.len()),
+            Value::Tombstone => 0,
+        }
+    }
+
     /// Approximate encoded size.
     pub fn size(&self) -> usize {
         match self {

@@ -193,6 +193,10 @@ probes! {
     PasswordResetFinished,
     /// A simulated workload resynchronized its model from the database after an unresolved ambiguous write.
     ModelAdoptedFromDatabase,
+    /// An idle database manifest was unloaded to free memory.
+    DatabaseUnloaded,
+    /// An interactive transaction was rejected because the node memory budget was exceeded.
+    MemoryExhausted,
 }
 
 impl Probe {

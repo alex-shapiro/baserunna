@@ -1,5 +1,6 @@
 //! Object storage abstraction.
 
+pub mod conformance;
 mod fs;
 mod mem;
 
@@ -91,22 +92,40 @@ pub struct ListPage {
     pub next: Option<String>,
 }
 
+/// Strongly consistent object store shared by all nodes in a cluster.
+///
+/// Every operation observes all writes completed before it started. Each write produces a
+/// distinct etag that is returned by `put`, `get`, and `list`. [`conformance::run`] verifies
+/// this contract against a live store.
+///
+/// Keys and `start_after` cursors consist of `/`-separated, non-empty segments of
+/// [`is_valid_key_char`] characters. A key cannot be a `/`-delimited prefix of another key.
 pub trait ObjectStore: Send + Sync + 'static {
+    /// Reads an object, or the slice in `opts.range` clamped to its size. Returns
+    /// [`StoreError::Fatal`] if a non-empty range starts at or past the end of the object, or if
+    /// an empty range starts past the end of the object.
     fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>>;
-    /// Returns the new etag.
+    /// Writes an object and returns its etag. At most 1 concurrent conditional write with a
+    /// given precondition can succeed.
     fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>>;
-    /// Idempotent: deleting a missing object succeeds.
+    /// Deletes an object if it exists.
     fn delete<'a>(&'a self, key: &'a str) -> BoxFut<'a, SResult<()>>;
-    /// Objects with the given prefix and key > `start_after`, in key order.
+    /// Lists up to `limit` objects under `prefix` after `start_after`, sorted by key. `prefix`
+    /// must be empty or end with `/`.
     fn list<'a>(&'a self, prefix: &'a str, start_after: Option<&'a str>, limit: usize)
     -> BoxFut<'a, SResult<ListPage>>;
-    /// Granularity of `last_modified_ms` in milliseconds.
+    /// Granularity of `last_modified_ms` in milliseconds. Timestamps are rounded down to a
+    /// multiple of this value on a single store clock.
     fn time_precision_ms(&self) -> u64 {
         1_000
     }
 }
 
 pub type DynStore = Arc<dyn ObjectStore>;
+
+pub fn is_valid_key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
 
 /// Exponential-backoff retry policy for idempotent store operations.
 #[derive(Clone, Debug)]
@@ -158,15 +177,13 @@ pub async fn list_all(store: &dyn ObjectStore, prefix: &str, retry: &Retry) -> S
     }
 }
 
-/// Clamp `range` to `[0, size)`, failing if `start` is past the end.
+/// Clamps `range` to `[0, size)`, returning [`StoreError::Fatal`] if the start is out of bounds.
 pub(crate) fn clamp_range(range: &Option<Range<u64>>, size: u64) -> SResult<Range<u64>> {
     match range {
         None => Ok(0..size),
-        Some(r) => {
-            if r.start > r.end || (r.start >= size && !(r.start == 0 && size == 0)) {
-                return Err(StoreError::Fatal("invalid range".into()));
-            }
+        Some(r) if r.start <= r.end && (r.start < size || r.start == r.end && r.start <= size) => {
             Ok(r.start..r.end.min(size))
         }
+        Some(_) => Err(StoreError::Fatal("invalid range".into())),
     }
 }

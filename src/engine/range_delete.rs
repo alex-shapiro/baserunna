@@ -121,6 +121,10 @@ pub struct RangeDeletes {
 }
 
 impl RangeDeletes {
+    pub fn heap_bytes(&self) -> usize {
+        super::memory::alloc_bytes(self.frags.capacity() * std::mem::size_of::<(Bytes, Option<Bytes>, Seq)>())
+    }
+
     pub fn new(rts: &[RangeTombstone]) -> RangeDeletes {
         let mut starts: Vec<(&Bytes, usize)> = rts.iter().enumerate().map(|(i, t)| (&t.start, i)).collect();
         let mut ends: Vec<(&Bytes, usize)> =

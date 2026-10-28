@@ -82,7 +82,7 @@ pub fn error_from_json(status: u16, j: &Json) -> Error {
         "unauthenticated" => Error::Unauthenticated(m),
         "permission_denied" => Error::PermissionDenied(m),
         "not_found" => Error::NotFound(m),
-        "txn_not_found" => Error::TxnNotFound,
+        "txn_not_found" => Error::TxnNotFound(m),
         "conflict" => Error::Conflict(m),
         "already_exists" => Error::AlreadyExists(m),
         "precondition_failed" => {

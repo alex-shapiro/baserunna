@@ -9,7 +9,7 @@ pub enum Error {
     Unauthenticated(String),
     PermissionDenied(String),
     NotFound(String),
-    TxnNotFound,
+    TxnNotFound(String),
     /// Optimistic concurrency conflict; retrying the transaction may succeed.
     Conflict(String),
     AlreadyExists(String),
@@ -58,6 +58,10 @@ impl Error {
         Error::Internal(m.into())
     }
 
+    pub fn txn_not_found() -> Error {
+        Error::TxnNotFound("transaction not found (expired, aborted, or its node changed)".into())
+    }
+
     pub fn unavailable(m: impl Into<String>) -> Error {
         Error::Unavailable { message: m.into(), retry_after_ms: None, outcome_unknown: false }
     }
@@ -68,7 +72,7 @@ impl Error {
             Error::Unauthenticated(_) => "unauthenticated",
             Error::PermissionDenied(_) => "permission_denied",
             Error::NotFound(_) => "not_found",
-            Error::TxnNotFound => "txn_not_found",
+            Error::TxnNotFound(_) => "txn_not_found",
             Error::Conflict(_) => "conflict",
             Error::AlreadyExists(_) => "already_exists",
             Error::Aborted(_) => "aborted",
@@ -87,7 +91,7 @@ impl Error {
             Error::InvalidArgument(_) => 400,
             Error::Unauthenticated(_) => 401,
             Error::PermissionDenied(_) => 403,
-            Error::NotFound(_) | Error::TxnNotFound => 404,
+            Error::NotFound(_) | Error::TxnNotFound(_) => 404,
             Error::Conflict(_) | Error::AlreadyExists(_) | Error::Aborted(_) => 409,
             Error::PreconditionFailed { .. } => 412,
             Error::TooLarge(_) => 413,
@@ -103,7 +107,7 @@ impl Error {
         matches!(
             self,
             Error::Conflict(_)
-                | Error::TxnNotFound
+                | Error::TxnNotFound(_)
                 | Error::NotOwner { .. }
                 | Error::Unavailable { .. }
                 | Error::RateLimited { .. }
@@ -116,6 +120,7 @@ impl Error {
             | Error::Unauthenticated(m)
             | Error::PermissionDenied(m)
             | Error::NotFound(m)
+            | Error::TxnNotFound(m)
             | Error::Conflict(m)
             | Error::AlreadyExists(m)
             | Error::Aborted(m)
@@ -124,7 +129,6 @@ impl Error {
             | Error::QuotaExceeded(m)
             | Error::Internal(m) => m.clone(),
             Error::RateLimited { message, .. } => message.clone(),
-            Error::TxnNotFound => "transaction not found (expired, aborted, or its node changed)".into(),
             Error::PreconditionFailed { message, .. } => message.clone(),
             Error::NotOwner { holder, .. } => format!("database is leased by node {holder}"),
             Error::Unavailable { message, .. } => message.clone(),

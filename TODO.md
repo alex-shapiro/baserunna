@@ -23,11 +23,13 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       executed by the peer's previous process (`sim_tool trace tables 7344`).
       Execute locally only if the forward was sent once; otherwise return
       `outcome: "unknown"`.
-- [ ] **Enforce per-user fairness for the node memory budget.** A single user's
-      interactive transactions can consume a node's entire memory budget for up
-      to 5 minutes, causing other users' interactive transactions on that node
-      to be rejected (SPEC §5.12). Reserve a budget share per active user or
-      evict transactions from the user holding the most memory.
+- [ ] **Fix `db_churn` seed 202681: `GET` returns `404 not_found` for an
+      existing database.** During database churn, a `get` operation returns
+      `404 not_found` for a database that was created and not deleted
+      (`sim_tool trace db_churn 202681`).
+- [ ] **Fix `streams` seed 202835: expired stream records are returned after
+      `retention_ms`.** Stream reads return records older than `retention_ms`
+      (`sim_tool trace streams 202835`).
 - [ ] **Abort open interactive transactions if a database is deleted.**
       Interactive transactions on a deleted database currently remain open
       until their 30 s idle timeout expires, consuming memory and counting

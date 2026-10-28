@@ -86,24 +86,14 @@ impl Shared {
         self.system.lock().unwrap_or_else(|e| e.into_inner()).contains(db)
     }
 
-    /// Enforces the node memory budget before starting or extending an interactive transaction on
-    /// `db`. If memory usage exceeds the budget, unloads idle databases first and returns
-    /// [`crate::error::Error::Unavailable`] if usage remains over the limit. System databases are
-    /// exempt.
-    pub fn check_memory(&self, db: &str) -> crate::error::Result<()> {
-        if !self.memory.is_exceeded() || self.is_system(db) {
-            return Ok(());
+    /// Unloads idle databases if memory usage exceeds the budget, and returns true if usage is
+    /// then within the budget.
+    pub fn reclaim_to_budget(&self) -> bool {
+        if !self.memory.is_exceeded() {
+            return true;
         }
         self.unload_idle();
-        if !self.memory.is_exceeded() {
-            return Ok(());
-        }
-        crate::probe::hit(crate::probe::Probe::MemoryExhausted);
-        Err(crate::error::Error::Unavailable {
-            message: "node memory budget exceeded; retry later".into(),
-            retry_after_ms: Some(1_000),
-            outcome_unknown: false,
-        })
+        !self.memory.is_exceeded()
     }
 
     pub(crate) fn unload_idle(&self) {

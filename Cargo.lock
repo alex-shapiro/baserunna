@@ -122,6 +122,7 @@ dependencies = [
  "axum",
  "bytes",
  "crc32c",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",

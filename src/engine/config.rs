@@ -111,6 +111,8 @@ pub struct EngineConfig {
     pub event_settle_ms: u64,
     /// JSON paths stored as their own columns in each part; the rest share buckets.
     pub event_json_max_paths: usize,
+    /// Parts whose metadata a query or delete fetches at once.
+    pub event_read_concurrency: usize,
 }
 
 impl Default for EngineConfig {
@@ -173,6 +175,7 @@ impl Default for EngineConfig {
             event_merge_max_ms: 30 * 60_000,
             event_settle_ms: 24 * 3_600_000,
             event_json_max_paths: 1024,
+            event_read_concurrency: 32,
         }
     }
 }
@@ -202,6 +205,7 @@ impl EngineConfig {
                 "stream_seal_min_bytes must not exceed stream_chunk_bytes",
             ),
             (self.event_merge_fan_in >= 2, "event_merge_fan_in must be at least 2"),
+            (self.event_read_concurrency >= 1, "event_read_concurrency must be at least 1"),
             (self.event_granule_rows >= 1 && self.event_chunk_bytes >= 1, "event granules and chunks are not empty"),
         ];
         match rules.iter().find(|(ok, _)| !ok) {

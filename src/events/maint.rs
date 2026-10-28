@@ -20,6 +20,7 @@ use crate::probe::{self, Probe};
 use crate::table::schema::decode_row;
 use crate::table::tuple::{self, Key};
 use bytes::Bytes;
+use futures_util::{StreamExt, stream};
 use serde_json::{Map, Value as Json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -872,8 +873,11 @@ pub async fn delete(db: &Arc<Db>, txn: &mut Txn, name: &str, from: i64, to: i64,
     let shared = db.shared().clone();
     let stats = ReadStats::default();
     let rd = Reading { shared: &shared, db: &db.id, cache: true, stats: &stats };
+    let reads: Vec<_> =
+        input.refs.iter().map(|r| super::exec::matching_rows(&shared, &db.id, &s, r, f, from, to)).collect();
+    let mut matches = stream::iter(reads).buffered(shared.cfg.event_read_concurrency);
     for r in &input.refs {
-        let matched = super::exec::matching_rows(&shared, &db.id, &s, r, f, from, to).await?;
+        let matched = matches.next().await.ok_or_else(|| Error::internal("delete reads ended early"))??;
         if matched.is_empty() {
             continue;
         }

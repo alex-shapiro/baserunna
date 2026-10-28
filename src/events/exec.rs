@@ -22,6 +22,7 @@ use crate::probe::{self, Probe};
 use crate::table::schema::{Datum, Row, decode_row};
 use crate::util::DetHashMap;
 use crate::util::b64;
+use futures_util::{StreamExt, stream};
 use serde_json::{Value as Json, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1036,8 +1037,7 @@ impl Run<'_> {
     }
 
     /// Runs the query over part `r`.
-    async fn part(&mut self, rd: &Reading<'_>, r: &PartRef) -> Result<()> {
-        let meta = rd.meta(r).await?;
+    async fn part(&mut self, rd: &Reading<'_>, r: &PartRef, meta: Arc<PartMeta>) -> Result<()> {
         if !self.part_may(rd, r, &meta).await? {
             return Ok(());
         }
@@ -1321,12 +1321,22 @@ pub async fn run(
     run.stats.parts = input.refs.len() as u64;
     let read_stats = ReadStats::default();
     let rd = Reading { shared, db, cache: true, stats: &read_stats };
-    for r in &input.refs {
-        if !ref_may(&run.plan.filter, r, s.time_id()) {
-            probe::hit(Probe::PartPrunedByRef);
-            continue;
-        }
-        run.part(&rd, r).await?;
+    let refs: Vec<&PartRef> = input
+        .refs
+        .iter()
+        .filter(|r| {
+            let may = ref_may(&run.plan.filter, r, s.time_id());
+            if !may {
+                probe::hit(Probe::PartPrunedByRef);
+            }
+            may
+        })
+        .collect();
+    let metas: Vec<_> = refs.iter().map(|r| rd.meta(r)).collect();
+    let mut metas = stream::iter(metas).buffered(shared.cfg.event_read_concurrency);
+    for r in refs {
+        let meta = metas.next().await.ok_or_else(|| Error::internal("query reads ended early"))??;
+        run.part(&rd, r, meta).await?;
         if read_stats.bytes.load(Relaxed) > limits.max_bytes_read {
             return Err(Error::TooLarge(format!(
                 "the query read more than {} bytes; narrow its time range or filter",

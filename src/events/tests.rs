@@ -338,3 +338,72 @@ fn queries_match_a_model_through_seals_merges_and_deletes() {
     }
     assert!(answered > 50 * seeds as usize / 4, "too few queries found rows: {answered}");
 }
+
+/// A table of `days` single-row parts behind a store with 25 ms latency,
+/// opened by a node whose caches are cold.
+async fn many_parts_cold(days: i64) -> (Arc<Db>, EngineConfig, Arc<Engine>) {
+    let origin = tokio::time::Instant::now();
+    let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
+    let env2 = env.clone();
+    let mem = Arc::new(crate::store::MemStore::new(Box::new(move || env2.now_ms())));
+    let store = Arc::new(crate::sim::cost::MeteredStore::new(mem, 0));
+    let cfg = EngineConfig { cache_bytes: 64 << 20, ..cfg() };
+    let eng = Engine::new(store.clone(), env.clone(), cfg.clone(), "node-a".into());
+    let db = create_db(&eng, "db").await;
+    let table = {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        get_schema(&mut t, "events").await.unwrap().id
+    };
+    let rows: Vec<Json> =
+        (0..days).map(|d| json!({"time": T0 + d * DAY, "event": "a", "user": format!("u{}", d % 2)})).collect();
+    txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+    assert!(maint::seal(&db, table).await.unwrap());
+    eng.release_leases(std::time::Duration::from_secs(2)).await;
+    let cold = Engine::new(store.clone(), env, cfg.clone(), "node-b".into());
+    let db = cold.db("db");
+    db.open(true).await.unwrap();
+    store.set_latency_ms(25);
+    (db, cfg, cold)
+}
+
+/// A delete reads every part its time range covers before it commits, and
+/// it must commit before the request's deadline: on a table with hundreds
+/// of parts behind a store with realistic latency, it reads them concurrently.
+#[test]
+fn deletes_across_many_parts_commit_before_the_deadline() {
+    rt().block_on(async {
+        let days = 400;
+        let (db, cfg, _eng) = many_parts_cold(days).await;
+        let f = Filter::parse(json!({"col": "user", "op": "eq", "value": "u1"})).unwrap();
+        let start = tokio::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(cfg.commit_timeout_ms);
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let n = maint::delete(&db, &mut t, "events", i64::MIN / 4, i64::MAX / 4, &f).await.unwrap();
+        assert_eq!(n, days as u64 / 2);
+        let mut req = t.into_request();
+        req.deadline = Some(deadline);
+        let read_ms = start.elapsed().as_millis();
+        db.commit(req).await.unwrap_or_else(|e| panic!("delete reading {days} parts took {read_ms} ms: {e}"));
+        let left = query(&db, &json!({"from": T0, "to": T0 + days * DAY, "aggregates": {"n": {"fn": "count"}}}))
+            .await
+            .unwrap();
+        assert_eq!(left.rows, vec![vec![json!(days / 2)]]);
+    });
+}
+
+/// A cold query fetches the metadata of many parts at once rather than one
+/// part after another.
+#[test]
+fn cold_queries_read_parts_concurrently() {
+    rt().block_on(async {
+        let days = 400;
+        let (db, _cfg, _eng) = many_parts_cold(days).await;
+        let start = tokio::time::Instant::now();
+        let q = json!({"from": T0, "to": T0 + days * DAY, "where": {"col": "user", "op": "eq", "value": "u1"},
+            "aggregates": {"n": {"fn": "count"}}});
+        let out = query(&db, &q).await.unwrap();
+        assert_eq!(out.rows, vec![vec![json!(days / 2)]]);
+        let ms = start.elapsed().as_millis();
+        assert!(ms < 1_000, "a cold query of {days} parts took {ms} ms");
+    });
+}

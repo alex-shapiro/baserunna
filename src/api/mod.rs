@@ -16,7 +16,7 @@ use crate::engine::{Committed, Consistency, Db, Txn};
 use crate::error::{Error, Result};
 use crate::log::{self, REQUEST_ID_HEADER};
 use crate::meta::{Access, DbRecord};
-use crate::node::{Meter, Node, Principal};
+use crate::node::{Deadline, Meter, Node, Principal};
 use crate::probe::{self, Probe};
 use crate::timing;
 use axum::Router;
@@ -206,7 +206,7 @@ pub struct DbCtx {
     pub rec: DbRecord,
     pub access: Access,
     pub db: Arc<Db>,
-    pub deadline: tokio::time::Instant,
+    pub deadline: Deadline,
 }
 
 impl DbCtx {
@@ -281,18 +281,26 @@ fn finishes_txn(req: &Request) -> bool {
     }
 }
 
+fn long_poll_wait(req: &Request) -> Duration {
+    let wait_ms = req
+        .uri()
+        .query()
+        .filter(|_| req.method() == http::Method::GET)
+        .and_then(|q| q.split('&').filter_map(|kv| kv.strip_prefix("wait_ms=")).find_map(|w| w.parse::<u64>().ok()))
+        .unwrap_or(0);
+    Duration::from_millis(wait_ms.min(LONG_POLL_MAX_MS))
+}
+
 fn is_long_poll(req: &Request) -> bool {
-    req.method() == http::Method::GET
-        && req.uri().query().is_some_and(|q| {
-            q.split('&').filter_map(|kv| kv.strip_prefix("wait_ms=")).any(|w| w.parse::<u64>().is_ok_and(|w| w > 0))
-        })
+    !long_poll_wait(req).is_zero()
 }
 
 /// Authenticates database-scoped requests and routes them to the target node or handles them locally.
 async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
     let arrived = tokio::time::Instant::now();
     let res: Result<Response> = crate::engine::db::invoked_at(arrived, async {
-        let deadline = request_deadline(&node, req.headers());
+        let deadline =
+            crate::node::current_deadline().unwrap_or_else(|| Deadline::new(request_deadline(&node, req.headers())));
         let name = db_name_from_path(req.uri().path()).ok_or_else(|| Error::not_found("no such route"))?;
         let token = credential(req.headers()).ok_or_else(|| Error::Unauthenticated("missing credentials".into()))?;
         let meter = match (is_from_peer(&node, req.headers()), finishes_txn(&req)) {
@@ -327,7 +335,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                     .map_err(|e| Error::internal(e.to_string()))?;
                 *fwd.headers_mut() = parts.headers.clone();
                 fwd.headers_mut().insert(HOPS_HEADER, HeaderValue::from(hops + 1));
-                tag_forward(&node, &mut fwd, &target, deadline);
+                tag_forward(&node, &mut fwd, &target, deadline.instant());
                 let idempotent = parts.method == http::Method::GET || parts.method == http::Method::HEAD;
                 match node.services.transport.call(&addr, fwd).await {
                     Ok(resp) if resp.headers().contains_key(STALE_TARGET_HEADER) => {
@@ -354,7 +362,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                     .body(std::mem::take(req.body_mut()))
                     .map_err(|e| Error::internal(e.to_string()))?;
                 fwd.headers_mut().insert(HOPS_HEADER, HeaderValue::from(hops + 1));
-                tag_forward(&node, &mut fwd, &target, deadline);
+                tag_forward(&node, &mut fwd, &target, deadline.instant());
                 return match node.services.transport.call(&addr, fwd).await {
                     // A streamed request body cannot be replayed locally after the target rejects it.
                     Ok(resp) if resp.headers().contains_key(STALE_TARGET_HEADER) => {
@@ -459,7 +467,21 @@ const SERVER_TIMING_HEADER: &str = "server-timing";
 /// match the running process. The request was not applied.
 const STALE_TARGET_HEADER: &str = "x-baserunna-stale-target";
 
-/// Assigns an `x-request-id` header, attaches `Server-Timing`, and logs request completion.
+/// Polls `f` until it completes or `deadline + wait` expires, re-arming the timer if `deadline`
+/// is extended while paused.
+async fn run_until_deadline<F: std::future::Future>(deadline: &Deadline, wait: Duration, f: F) -> Option<F::Output> {
+    let mut f = std::pin::pin!(f);
+    loop {
+        match tokio::time::timeout_at(deadline.instant() + wait, &mut f).await {
+            Ok(out) => return Some(out),
+            Err(_) if deadline.instant() + wait <= tokio::time::Instant::now() => return None,
+            Err(_) => {}
+        }
+    }
+}
+
+/// Assigns an `x-request-id` header, enforces the request deadline, attaches
+/// `Server-Timing`, and logs request completion.
 async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
     let given = req.headers().get(REQUEST_ID_HEADER).filter(|v| v.to_str().is_ok_and(log::valid_request_id));
     let header = match given {
@@ -478,8 +500,23 @@ async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: 
             let method = req.method().clone();
             let route = req.extensions().get::<MatchedPath>().cloned();
             let hops = hops(req.headers());
-            let deadline = request_deadline(&node, req.headers());
-            let resp = crate::node::with_deadline(deadline, timing::scoped(tally.clone(), next.run(req))).await;
+            let deadline = Deadline::new(request_deadline(&node, req.headers()));
+            let wait = long_poll_wait(&req);
+            let idempotent = matches!(*req.method(), http::Method::GET | http::Method::HEAD);
+            let req = req.map(|b| Body::new(body::DeadlinePausingBody::new(b, deadline.clone())));
+            let run = crate::node::with_deadline(deadline.clone(), timing::scoped(tally.clone(), next.run(req)));
+            let resp = match run_until_deadline(&deadline, wait, run).await {
+                Some(resp) => resp,
+                None => {
+                    probe::hit(Probe::RequestDeadlinePassed);
+                    Error::Unavailable {
+                        message: "request deadline exceeded".into(),
+                        retry_after_ms: Some(1000),
+                        outcome_unknown: !idempotent,
+                    }
+                    .into_response()
+                }
+            };
             node.metrics.request(method.as_str(), route.as_ref().map(MatchedPath::as_str), started.elapsed());
             if log::enabled(log::Level::Info) {
                 let mut fields = vec![
@@ -740,7 +777,7 @@ pub(crate) async fn finish<T>(
     }
     let commit_id = t.commit_id;
     let mut req = t.into_request();
-    req.deadline = Some(ctx.deadline);
+    req.deadline = Some(ctx.deadline.instant());
     match ctx.db.commit_detailed(req).await {
         // Without an idempotency key, `replayed` is true only if the committer
         // retried an ambiguous manifest PUT that had already succeeded.
@@ -1038,5 +1075,80 @@ mod tests {
         assert_eq!(client_addr(&h, Some(peer), 2), "1.2.3.4", "two proxies");
         assert_eq!(client_addr(&h, Some(peer), 4), "10.0.0.9", "fewer entries than proxies");
         assert_eq!(client_addr(&HeaderMap::new(), None, 0), "unknown");
+    }
+
+    struct ChannelBody(tokio::sync::mpsc::Receiver<Bytes>);
+
+    impl http_body::Body for ChannelBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Bytes>, Self::Error>>> {
+            self.0.poll_recv(cx).map(|b| b.map(|b| Ok(http_body::Frame::data(b))))
+        }
+    }
+
+    #[test]
+    fn cancels_request_at_deadline() {
+        crate::sim::cost::run_paused(async {
+            let w = crate::sim::cost::World::new(1, 1).await;
+            let token = w.signup(0, "late@x.io").await;
+            w.create_db(0, &token, "d").await;
+            w.store.set_latency_ms(600_000);
+            let started = tokio::time::Instant::now();
+            let r = w.call(0, "PUT", "/v1/dbs/d/kv/k", &token, Bytes::from_static(b"v")).await;
+            let took = started.elapsed();
+            let timeout = Duration::from_millis(w.node(0).cfg.engine.commit_timeout_ms);
+            assert_eq!(r.status, 503, "{}", r.json());
+            assert_eq!(r.json()["error"]["message"], "request deadline exceeded", "{}", r.json());
+            assert_eq!(r.json()["error"]["details"]["outcome"], "unknown", "{}", r.json());
+            assert!(took >= timeout && took < timeout + Duration::from_secs(1), "elapsed: {took:?}");
+        });
+    }
+
+    #[test]
+    fn pauses_deadline_while_waiting_for_request_body() {
+        crate::sim::cost::run_paused(async {
+            let w = crate::sim::cost::World::new(1, 1).await;
+            let token = w.signup(0, "slow@x.io").await;
+            w.create_db(0, &token, "d").await;
+            let pause = Duration::from_millis(w.node(0).cfg.engine.commit_timeout_ms) * 2;
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            w.node(0).env.spawn(async move {
+                let _ = tx.send(Bytes::from_static(b"first ")).await;
+                tokio::time::sleep(pause).await;
+                let _ = tx.send(Bytes::from_static(b"second")).await;
+            });
+            let req = http::Request::builder()
+                .method("PUT")
+                .uri("/v1/dbs/d/kv/k")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::new(ChannelBody(rx)))
+                .unwrap();
+            let resp = w.node(0).router().unwrap().oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+            let got = w.call(0, "GET", "/v1/dbs/d/kv/k", &token, Bytes::new()).await;
+            assert_eq!(got.body.as_ref(), b"first second");
+        });
+    }
+
+    #[test]
+    fn long_poll_extends_deadline_by_wait_ms() {
+        crate::sim::cost::run_paused(async {
+            let w = crate::sim::cost::World::new(1, 1).await;
+            let token = w.signup(0, "patient@x.io").await;
+            w.create_db(0, &token, "d").await;
+            let wait = Duration::from_millis(w.node(0).cfg.engine.commit_timeout_ms) * 2;
+            let started = tokio::time::Instant::now();
+            let path = format!("/v1/dbs/d/changes?after=0&wait_ms={}", wait.as_millis());
+            let r = w.call(0, "GET", &path, &token, Bytes::new()).await;
+            assert_eq!(r.status, 200, "{}", r.json());
+            assert!(started.elapsed() >= wait, "elapsed: {:?}", started.elapsed());
+        });
     }
 }

@@ -471,7 +471,7 @@ Each open database has a per-node commit queue drained by a single committer tas
 3. Compute the batch's `version_time` as `max(base.time_ms, store_now, max(txn.read_time))` (§4.5).
 4. For each transaction in the batch:
    - Skip and return the recorded version if its commit record already exists in `base` or earlier in the batch, or reject it with `409 aborted` if its commit record is an abort record (§6.2).
-   - Reject it if its 10 second commit deadline has passed.
+   - Reject it if its 10-second request deadline has expired (§10).
    - Validate its read set (§6.1) against all writes with `seq > txn.read_version` in `base` and in earlier accepted transactions in the batch, rejecting conflicts with `409 conflict`.
    - Assign the accepted transaction the next sequence number (`base.version + 1`, `+ 2`, …), merge its writes into `tail`, and write its commit record.
 5. Expire old `tail` entries. Install any completed background tail flush, or flush the tail synchronously if it exceeds `4 × tail_max_bytes` (§5.5).
@@ -924,8 +924,8 @@ To compute a page (`Version::changes`), the engine merges only the `tail` and se
   or a generated ID. Forwards (including metadata commands sent to the
   system database's lease holder) include it in the same header, every
   response echoes it, and each node includes it in log entries for that request (§12).
-- **Deadlines propagate across forwards.** `x-baserunna-deadline-ms` specifies the
-  originating node's commit deadline in cluster time for both data requests and
+- **Deadlines are propagated across forwards.** `x-baserunna-deadline-ms` specifies the
+  originating node's request deadline (§10) in cluster time for data requests and
   forwarded metadata commands. The receiving node caps the deadline at its
   own `commit_timeout_ms` so that a delayed forward cannot be committed after
   the client's deadline.
@@ -1146,6 +1146,12 @@ Errors are returned as
 | 507    | `quota_exceeded` (the database is at its size quota, §5.10)                                                            |
 | 503    | `unavailable` (retryable, `Retry-After`; may include `outcome: "unknown"`; also a query on an index still being built) |
 | 500    | `internal`                                                                                                             |
+
+The server cancels a request with a retryable `503 unavailable` error if the
+request exceeds its `commit_timeout_ms` (10 s) deadline. The response includes
+`outcome: "unknown"` unless the request method is `GET` or `HEAD`. The deadline
+is paused while the server waits for the client to send the request body, and is
+extended by `wait_ms` for long-poll requests.
 
 Routes (see the OpenAPI document for bodies):
 

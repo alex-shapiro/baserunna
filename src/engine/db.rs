@@ -1820,6 +1820,12 @@ impl Db {
                                 cfg.event_max_bytes
                             )))
                         }
+                        _ if let Some(limit) = quota
+                            && size + added > limit =>
+                        {
+                            quota_refused = true;
+                            Some(quota_exceeded(limit))
+                        }
                         _ => None,
                     };
                     if let Some(e) = refusal {
@@ -1874,10 +1880,12 @@ impl Db {
                             };
                             m.part_bytes += r.stored_bytes();
                             let k = r.key();
+                            touched.push(KeyRange::point(&k));
                             tail.insert(k.clone(), Entry::new(k, new_seq, Value::Inline(r.encode())));
                         }
                         for i in &accepted {
                             let record = commit_key(bind.slots[*i].commit_id);
+                            touched.push(KeyRange::point(&record));
                             let value = encode_commit_record(time, &[]);
                             tail.insert(record.clone(), Entry::new(record, new_seq, Value::Inline(value)));
                             results[*i] = Some(Ok(Committed {
@@ -1888,6 +1896,7 @@ impl Db {
                             }));
                         }
                         probe::hit(Probe::PartsBound);
+                        size += added;
                         events.insert(bind.table);
                         last_seq = new_seq;
                         data_changed = true;
@@ -2334,10 +2343,14 @@ impl Db {
         let mut it = v.iter_bulk(false);
         while let Some(e) = it.next().await? {
             if e.key.first() == Some(&events::PARTS) {
-                if let Some(r) = events::ref_of(&e) {
-                    referenced_parts.extend(r.mask_object().map(str::to_string));
-                    referenced_parts.insert(r.id);
+                if e.value.is_tombstone() {
+                    continue;
                 }
+                let r = events::ref_of(&e).ok_or_else(|| {
+                    Error::internal("an event part reference is corrupt; sweeps stop rather than delete its part")
+                })?;
+                referenced_parts.extend(r.mask_object().map(str::to_string));
+                referenced_parts.insert(r.id);
             } else if let Some((table, _)) = events::state_of(&e) {
                 event_tables.insert(table);
             } else if let Some((_, stream::Stored::Chunk(c))) = stream::stored(&e) {
@@ -2677,10 +2690,19 @@ pub(crate) fn quota_exceeded(limit: u64) -> Error {
 }
 
 /// Returns `(total_added_bytes, newly_bound_blob_bytes)` for a commit write set.
+/// The bytes a write set adds toward the quota, and how many of them are
+/// staged blobs. Rewrites of event part references and table state (by
+/// seals, merges, deletes and retention) move or shrink data, so a full
+/// database can still make them.
 fn growth(w: &WriteSet) -> (u64, u64) {
+    let event_meta = |k: &[u8]| matches!(k.first(), Some(&events::PARTS | &events::TABLE_STATE));
     let added: u64 = w.streams.iter().map(StreamOp::appended_bytes).sum::<u64>()
         + w.events.iter().map(events::EventOp::inserted_bytes).sum::<u64>()
-        + w.puts.iter().filter_map(|(k, p)| Some((k.len() + p.as_ref()?.value.size()) as u64)).sum::<u64>();
+        + w.puts
+            .iter()
+            .filter(|(k, _)| !event_meta(k))
+            .filter_map(|(k, p)| Some((k.len() + p.as_ref()?.value.size()) as u64))
+            .sum::<u64>();
     let blobs: u64 = w.staged_blobs().map(|b| b.size).sum();
     (added + blobs, blobs)
 }

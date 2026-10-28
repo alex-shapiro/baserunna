@@ -932,3 +932,231 @@ mod query_semantics {
     }
 
 }
+/// Bulk inserts, binds and maintenance against concurrent transactions and quotas.
+mod storage {
+    use super::*;
+
+    /// Bulk-inserts `rows` through a bind that a concurrent commit of `req`
+    /// joins, so that the bind and the commit land in one batch, bind first.
+    async fn bind_beside(
+        db: &Arc<Db>,
+        s: &schema::EventSchema,
+        rows: &[Json],
+        req: crate::engine::CommitRequest,
+    ) -> (Result<crate::engine::Committed>, Result<u64>) {
+        db.shared().store_time_ms().await.unwrap();
+        let req = Arc::new(std::sync::Mutex::new(Some(req)));
+        let other: Arc<std::sync::Mutex<Option<Result<u64>>>> = Arc::default();
+        let (req2, other2) = (req.clone(), other.clone());
+        let bind: BindFn = Arc::new(move |db: Arc<Db>, b| {
+            let (req, other) = (req2.lock().unwrap().take(), other2.clone());
+            Box::pin(async move {
+                let (rs, o) = tokio::join!(db.bind(b), async {
+                    match req {
+                        Some(r) => db.commit(r).await,
+                        None => Ok(0),
+                    }
+                });
+                *other.lock().unwrap() = Some(o);
+                rs
+            })
+        });
+        let bufs = Buffers::new(BufferConfig { wait_ms: 0, max_bytes: 1 << 20 }, bind);
+        let valid = validate_rows(s, rows, 0).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let inserted = bufs.submit(db.clone(), s.clone(), valid, 4242, deadline).await;
+        let o = other.lock().unwrap().take().unwrap();
+        (inserted, o)
+    }
+
+    #[test]
+    fn a_drop_in_the_batch_after_a_bind_removes_the_bound_parts() {
+        rt().block_on(async {
+            let (eng, _store, env) = engine(3, cfg());
+            env.spawn(async {});
+            let db = create_db(&eng, "d").await;
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let s = get_schema(&mut t, "events").await.unwrap();
+            let mut d = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            super::drop(&mut d, "events").await.unwrap();
+            let (ins, dropped) = bind_beside(&db, &s, &[json!({"time": T0, "event": "a"})], d.into_request()).await;
+            // Either order is serializable, but a committed drop must leave nothing of the table.
+            if let Ok(dv) = dropped {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                let refs = super::refs(&mut t, s.id).await.unwrap();
+                let part_bytes = db.current().unwrap().m.part_bytes;
+                assert!(
+                    refs.is_empty() && part_bytes == 0,
+                    "insert {:?} and drop (v{dv}) both committed, yet the dropped table keeps {} part refs and part_bytes {}",
+                    ins.map(|c| c.version),
+                    refs.len(),
+                    part_bytes
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_delete_in_the_batch_after_a_bind_sees_the_bound_events() {
+        rt().block_on(async {
+            let (eng, _store, env) = engine(4, cfg());
+            env.spawn(async {});
+            let db = create_db(&eng, "d").await;
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let s = get_schema(&mut t, "events").await.unwrap();
+            let everything = Filter::parse(json!({"col": "event", "op": "exists"})).unwrap();
+            // An earlier event gives the delete something to write.
+            let earlier = [json!({"time": T0 + 1, "event": "b"})];
+            txn_do(&db, async |t| insert(t, "events", &earlier, 0).await).await.unwrap();
+            let mut d = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            maint::delete(&db, &mut d, "events", T0 - DAY, T0 + DAY, &everything).await.unwrap();
+            let (ins, deleted) = bind_beside(&db, &s, &[json!({"time": T0, "event": "a"})], d.into_request()).await;
+            let ins = ins.unwrap().version;
+            if let Ok(del) = deleted {
+                let q = json!({"from": T0 - DAY, "to": T0 + DAY, "aggregates": {"n": {"fn": "count"}}});
+                let out = query(&db, &q).await.unwrap();
+                assert!(
+                    del < ins || out.rows[0][0] == json!(0),
+                    "the insert committed at v{ins} and a delete of every event at v{del}, yet {:?} remain",
+                    out.rows
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn bulk_inserts_count_toward_the_database_quota() {
+        rt().block_on(async {
+            let quota = 64 * 1024;
+            let (eng, _store, env) = engine(5, EngineConfig { db_max_bytes: quota, ..cfg() });
+            env.spawn(async {});
+            let db = create_db(&eng, "d").await;
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let s = get_schema(&mut t, "events").await.unwrap();
+            let bufs = Buffers::new(
+                BufferConfig { wait_ms: 0, max_bytes: 1 << 20 },
+                Arc::new(|db: Arc<Db>, b| Box::pin(async move { db.bind(b).await })),
+            );
+            let mut r = Rng::new(1);
+            let mut refused = false;
+            for i in 0..40 {
+                let rows: Vec<Json> = (0..50)
+                    .map(|j| {
+                        let noise: String = (0..100).map(|_| char::from(b'a' + r.below(26) as u8)).collect();
+                        json!({"time": T0 + i * 1000 + j, "event": "a", "user": noise})
+                    })
+                    .collect();
+                let valid = validate_rows(&s, &rows, 0).unwrap();
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                match bufs.submit(db.clone(), s.clone(), valid, env.random_u64(), deadline).await {
+                    Ok(_) => {}
+                    Err(Error::QuotaExceeded(_)) => {
+                        refused = true;
+                        break;
+                    }
+                    Err(e) => panic!("insert {i}: {e}"),
+                }
+            }
+            let m = db.current().unwrap().m.clone();
+            assert!(
+                refused || m.part_bytes <= quota,
+                "a {quota} byte database accepted {} bytes of event parts; it reports size {}",
+                m.part_bytes,
+                m.stored_bytes()
+            );
+        });
+    }
+
+    #[test]
+    fn a_full_database_can_delete_events() {
+        rt().block_on(async {
+            let quota = 64 * 1024;
+            let (eng, _store, env) = engine(6, EngineConfig { db_max_bytes: quota, ..cfg() });
+            env.spawn(async {});
+            let db = create_db(&eng, "d").await;
+            let rows: Vec<Json> = (0..40).map(|i| json!({"time": T0 + i, "event": "a", "n": i})).collect();
+            txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let table = get_schema(&mut t, "events").await.unwrap().id;
+            assert!(maint::seal(&db, table).await.unwrap());
+            let mut i = 0;
+            for n in [400, 40, 1] {
+                loop {
+                    i += 1;
+                    let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                    t.put(Bytes::from(format!("\x01k{i}")), crate::engine::Value::Inline(Bytes::from(vec![7u8; n]))).unwrap();
+                    match db.commit(t.into_request()).await {
+                        Ok(_) => {}
+                        Err(Error::QuotaExceeded(_)) => break,
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+            }
+            let some = Filter::parse(json!({"col": "n", "op": "lt", "value": 5})).unwrap();
+            let r = txn_do(&db, async |t| maint::delete(&db, t, "events", T0, T0 + DAY, &some).await).await;
+            assert!(r.is_ok(), "deleting events from a full database failed: {:?}", r.err());
+        });
+    }
+
+    #[test]
+    fn a_partition_that_keeps_receiving_parts_stays_readable() {
+        rt().block_on(async {
+            let cfg = EngineConfig { event_merge_fan_in: 2, event_tier_base_bytes: 1 << 30, ..cfg() };
+            let (eng, _store, env) = engine(7, cfg);
+            env.spawn(async {});
+            let db = create_db(&eng, "d").await;
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let s = get_schema(&mut t, "events").await.unwrap();
+            let bufs = Buffers::new(
+                BufferConfig { wait_ms: 0, max_bytes: 1 << 20 },
+                Arc::new(|db: Arc<Db>, b| Box::pin(async move { db.bind(b).await })),
+            );
+            let q = json!({"from": T0, "to": T0 + DAY, "aggregates": {"n": {"fn": "count"}}});
+            for i in 0..80 {
+                let valid = validate_rows(&s, &[json!({"time": T0 + i, "event": "a"})], 0).unwrap();
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                bufs.submit(db.clone(), s.clone(), valid, env.random_u64(), deadline).await.unwrap();
+                let m = maint::maintain(&db, s.id, 8).await;
+                let out = query(&db, &q).await;
+                assert!(
+                    m.is_ok() && out.as_ref().is_ok_and(|o| o.rows[0][0] == json!(i + 1)),
+                    "after {} inserts into one partition: maintenance {m:?}, query {:?}",
+                    i + 1,
+                    out.map(|o| o.rows)
+                );
+            }
+        });
+    }
+
+    /// A part ref the sweep cannot decode stops the sweep instead of
+    /// letting it collect the part as an orphan.
+    #[test]
+    fn the_sweep_keeps_parts_whose_refs_it_cannot_read() {
+        rt().block_on(async {
+            let (eng, store, env) = engine(8, cfg());
+            env.spawn(async {});
+            let db = create_db(&eng, "d").await;
+            txn_do(&db, async |t| insert(t, "events", &[json!({"time": T0, "event": "a"})], 0).await).await.unwrap();
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let id = get_schema(&mut t, "events").await.unwrap().id;
+            assert!(maint::seal(&db, id).await.unwrap());
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let r = super::refs(&mut t, id).await.unwrap().remove(0);
+            let mut bad = r.encode().to_vec();
+            bad.push(0);
+            t.put(r.key(), crate::engine::Value::Inline(Bytes::from(bad))).unwrap();
+            db.commit(t.into_request()).await.unwrap();
+            let c = &db.shared().cfg;
+            let wait = c.orphan_grace_ms + c.blob_stage_ttl_ms + c.gc_grace_ms;
+            for _ in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                let _ = db.sweep_now().await;
+                let _ = db.maintenance_now().await;
+            }
+            assert!(
+                store.keys().iter().any(|k| k.contains(&format!("/part/{}/", r.id))),
+                "the sweep deleted a part whose ref it could not decode"
+            );
+        });
+    }
+}

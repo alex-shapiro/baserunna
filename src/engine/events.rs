@@ -455,8 +455,7 @@ impl PartRef {
             && p.min_time <= p.max_time
             && p.min_version <= p.max_version
             && p.deleted < p.rows.max(1)
-            && p.rows > 0
-            && p.level <= 64;
+            && p.rows > 0;
         if !ok {
             return Err(DecodeError("inconsistent part reference"));
         }
@@ -567,10 +566,6 @@ async fn state(at: &Pending<'_>, table: u32) -> Result<Option<TableState>> {
     }
 }
 
-fn point(k: &Bytes) -> KeyRange {
-    KeyRange::new(Bound::Included(k.clone()), Bound::Included(k.clone()))
-}
-
 /// Plans `ops` committed at `version`.
 pub(crate) async fn plan(ops: &[EventOp], at: &Pending<'_>, version: Seq) -> Result<Effects> {
     let mut fx = Effects::default();
@@ -639,7 +634,7 @@ pub(crate) async fn plan(ops: &[EventOp], at: &Pending<'_>, version: Seq) -> Res
     }
     for (table, st) in states {
         let k = state_key(table);
-        fx.touched.push(point(&k));
+        fx.touched.push(KeyRange::point(&k));
         fx.entries.push(Entry::new(k, version, Value::Inline(st.encode())));
         fx.tables.insert(table, st);
     }

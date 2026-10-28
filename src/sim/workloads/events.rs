@@ -68,6 +68,9 @@ struct World {
     extra_since: Option<u64>,
     /// Queries answered: the query, its answer, and the time it was sent.
     answers: Vec<(Json, Json)>,
+    /// Inserts into the retained table that were applied, and that were
+    /// of unknown outcome.
+    old_inserts: (u64, u64),
 }
 
 type Shared = Arc<Mutex<World>>;
@@ -576,15 +579,15 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     };
     tasks.push(alter);
     let old = {
-        let c = client("old");
+        let (c, w) = (client("old"), w.clone());
         tokio::spawn(async move {
             for i in 0..4 {
                 let now = c.sim.now_ms() as i64;
-                let rows = json!({"rows": [{"time": now - 30 * HOUR, "n": i}, {"time": now + 30 * HOUR, "n": i}],
-                    "idempotency_key": format!("old-{i}")});
-                let r = c.call_settled("POST", &format!("{DB}/events/old/rows"), Some(rows)).await;
-                if r.status != 201 && r.status != 200 {
-                    return Err(format!("old rows: {} {}", r.status, r.json));
+                let rows = json!({"rows": [{"time": now - 30 * HOUR, "n": i}, {"time": now + 30 * HOUR, "n": i}]});
+                match settle(&c, &format!("{DB}/events/old/rows"), false, &rows, &format!("old-{i}")).await? {
+                    Settled::Done(_) => world(&w).old_inserts.0 += 1,
+                    Settled::Unknown => world(&w).old_inserts.1 += 1,
+                    Settled::Rejected(r) => return Err(format!("old rows: {} {}", r.status, r.json)),
                 }
             }
             Ok(())
@@ -638,8 +641,9 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     }
     let checked = if certain { check_answers(&g)? } else { 0 };
     sim.trace.event(&format!("events: {} rows, {checked} answers checked", uids.len()));
+    let old_inserts = g.old_inserts;
     drop(g);
-    check_retention(&c).await?;
+    check_retention(&c, old_inserts).await?;
     tour(&c).await
 }
 
@@ -707,7 +711,7 @@ async fn tour(c: &Client) -> Result<(), String> {
 
 /// Parts of the retained table past their retention are dropped by
 /// maintenance after the next commit, and newer rows stay.
-async fn check_retention(c: &Client) -> Result<(), String> {
+async fn check_retention(c: &Client, (applied, unknown): (u64, u64)) -> Result<(), String> {
     let deadline = c.sim.now_ms() + 120_000;
     for round in 0.. {
         let rows = json!({"rows": [{"time": c.sim.now_ms(), "n": 99}], "idempotency_key": format!("check-{round}")});
@@ -726,7 +730,7 @@ async fn check_retention(c: &Client) -> Result<(), String> {
             cols.iter().position(|c| c == n).and_then(|i| a.json["rows"][0][i].as_u64())
         };
         let (stale, future) = (col("stale"), col("future"));
-        if future != Some(4) {
+        if !future.is_some_and(|n| (applied..=applied + unknown).contains(&n)) {
             return Err(format!("rows within retention were lost: {}", a.json));
         }
         if stale == Some(0) {

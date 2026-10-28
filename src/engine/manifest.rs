@@ -266,7 +266,7 @@ impl Manifest {
     pub fn stored_bytes(&self) -> u64 {
         let segments: u64 = self.segments.iter().filter(|s| !is_commit_key(&s.min_key)).map(|s| s.size).sum();
         let tail: usize = self.tail.iter().filter(|e| !is_commit_key(&e.key)).map(|e| e.size()).sum();
-        segments + tail as u64 + self.blob_bytes.total() + self.chunk_bytes.total()
+        segments + tail as u64 + self.blob_bytes.total() + self.chunk_bytes.total() + self.part_bytes
     }
 
     pub fn encode(&self) -> Bytes {

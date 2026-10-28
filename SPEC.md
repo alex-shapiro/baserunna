@@ -391,8 +391,10 @@ events to row tables.
   fails with `413` naming it, so a caller deletes partition by partition.
 - **Retention** (`retention_ms`) drops whole partitions once their end is
   older than it.
-- **Quota.** Event tables count toward the database's size quota (§5.10)
-  and are capped at 1 TiB each.
+- **Quota.** Event tables count toward the database's size quota (§5.10),
+  and a database's event parts are capped at 1 TiB. Seals, merges, deletes
+  and retention never grow a database, so a full database can still run
+  them.
 
 ## 5. Storage engine
 

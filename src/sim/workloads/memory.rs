@@ -4,7 +4,7 @@
 //! Concurrent workers write to database tails, long-poll change feeds across database unloads, and
 //! hold interactive transactions with large write sets. A separate heavy user keeps open as many
 //! large transactions as the budget allows, while other users verify that their interactive
-//! transactions are admitted within [`MEMORY_REFUSAL_MAX_MS`].
+//! transactions are admitted within [`MEMORY_REJECTION_MAX_MS`].
 
 use super::super::Sim;
 use super::super::SimConfig;
@@ -118,9 +118,9 @@ async fn long_poll_worker(c: Client, db: String, rounds: usize) -> Result<(), St
 
 /// Maximum duration a user with 0 open transactions can be rejected for memory pressure before the
 /// workload fails.
-const MEMORY_REFUSAL_MAX_MS: u64 = 20_000;
+const MEMORY_REJECTION_MAX_MS: u64 = 20_000;
 
-fn is_memory_refusal(r: &super::super::client::Resp) -> bool {
+fn is_memory_rejection(r: &super::super::client::Resp) -> bool {
     r.status == 503 && r.json["error"]["message"].as_str().is_some_and(|m| m.contains("memory budget"))
 }
 
@@ -173,23 +173,23 @@ async fn interactive_txn_worker(
     let base = format!("/v1/dbs/{db}/transactions");
     for round in 0..rounds {
         let started = c.sim.now_ms();
-        let mut refused_since = None;
+        let mut rejected_since = None;
         let (id, cid) = loop {
             if c.sim.now_ms() - started > 600_000 {
-                return Err(format!("{db}: an interactive transaction was refused for 10 minutes"));
+                return Err(format!("{db}: an interactive transaction was rejected for 10 minutes"));
             }
             let r = c.call("POST", &base, Some(json!({}))).await;
             match &r {
-                Ok(r) if is_memory_refusal(r) => {
-                    let since = *refused_since.get_or_insert(c.sim.now_ms());
-                    if c.sim.now_ms() - since > MEMORY_REFUSAL_MAX_MS {
+                Ok(r) if is_memory_rejection(r) => {
+                    let since = *rejected_since.get_or_insert(c.sim.now_ms());
+                    if c.sim.now_ms() - since > MEMORY_REJECTION_MAX_MS {
                         return Err(format!(
                             "{db}: a user with 0 open transactions was rejected for memory pressure: {}",
                             r.json
                         ));
                     }
                 }
-                _ => refused_since = None,
+                _ => rejected_since = None,
             }
             match r {
                 Ok(r) if r.status == 201 => {

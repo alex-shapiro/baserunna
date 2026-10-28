@@ -77,8 +77,8 @@ impl Charge {
         self.bytes
     }
 
-    /// Returns a shared atomic counter that tracks the charged byte count and resets to 0 when this
-    /// [`Charge`] is dropped.
+    /// Returns a shared atomic counter that tracks the charged byte count and is reset to 0 on
+    /// drop.
     pub fn meter(&mut self) -> Arc<AtomicUsize> {
         let bytes = self.bytes;
         self.meter.get_or_insert_with(|| Arc::new(AtomicUsize::new(bytes))).clone()
@@ -140,7 +140,7 @@ pub fn fair_share(mut available: usize, mut others: Vec<usize>) -> usize {
     available / claimants
 }
 
-/// Checks whether `requester` can allocate transaction memory when total node memory `used`
+/// Checks whether `requester` can allocate transaction memory if total node memory `used`
 /// exceeds `budget`, given the open transactions in `held` ordered by eviction priority.
 ///
 /// Bytes not tracked in `held` are deducted from `budget`, and the remainder is divided among
@@ -319,7 +319,7 @@ mod tests {
             let Some(evicted) = fair_admission(c.budget, used, &c.requester, &c.held) else {
                 return match mine >= share {
                     true => Ok(()),
-                    false => Err(format!("refused a requester holding {mine} below the fair share {share}")),
+                    false => Err(format!("rejected a requester holding {mine} below the fair share {share}")),
                 };
             };
             if mine >= share {

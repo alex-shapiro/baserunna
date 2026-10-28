@@ -35,7 +35,7 @@ pub struct OpenTxn {
     /// Weak reference to the transaction's snapshot version, used to attribute pinned version
     /// memory.
     snapshot: Weak<Version>,
-    /// Held while a request executes on the transaction; set to `None` when committed or aborted.
+    /// Held while a request executes on the transaction; set to `None` on commit or abort.
     txn: Arc<tokio::sync::Mutex<Option<Txn>>>,
 }
 
@@ -386,7 +386,7 @@ mod tests {
                 return (open, Some(id));
             }
             open.push(id);
-            assert!(open.len() < 20, "transactions were never refused");
+            assert!(open.len() < 20, "transactions were never rejected");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -504,11 +504,11 @@ mod tests {
             let w = World::with_config(1, 1, |c| c.engine.memory_bytes = 16 << 20).await;
             let token = w.signup(0, "a@x.io").await;
             w.create_db(0, &token, "a").await;
-            let (open, refused) = fill_memory(&w, &token, "a").await;
+            let (open, rejected) = fill_memory(&w, &token, "a").await;
             let memory = &w.node(0).engine.shared.memory;
             assert!(memory.used() <= memory.limit() + growth_slack(&w), "{} of {}", memory.used(), memory.limit());
-            let refused = refused.expect("growing past the budget did not fail");
-            let r = commit(&w, &token, "a", &refused).await;
+            let rejected = rejected.expect("growing past the budget did not fail");
+            let r = commit(&w, &token, "a", &rejected).await;
             assert_eq!(r.json()["error"]["code"], "txn_not_found", "{:?}", r.json());
             let r = commit(&w, &token, "a", &open[0]).await;
             assert_eq!(r.status, 200, "committing a transaction under memory pressure: {:?}", r.json());
@@ -535,21 +535,21 @@ mod tests {
                 let t = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
                 open.push(Some(node.txns.open(format!("t{i}"), "a", &db_id, t, Default::default()).unwrap()));
             }
-            let (memory, mut peak, mut refused) = (&node.engine.shared.memory, 0, 0);
+            let (memory, mut peak, mut rejected) = (&node.engine.shared.memory, 0, 0);
             for k in 0..120 {
                 for g in open.iter_mut() {
                     let Some(t) = g.as_mut() else { continue };
                     let put = t.txn().put(Bytes::from(format!("k{k}")), Value::Inline(Bytes::from(vec![b'v'; 20_000])));
                     if let Err(e) = put {
                         assert!(matches!(e, Error::Unavailable { .. }), "{e:?}");
-                        (*g, refused) = (None, refused + 1);
+                        (*g, rejected) = (None, rejected + 1);
                     }
                     peak = peak.max(memory.used());
                 }
             }
             assert!(
-                (1..=16).contains(&refused),
-                "{refused} of 20 transactions of 2.4 MB were refused in a 16 MiB budget"
+                (1..=16).contains(&rejected),
+                "{rejected} of 20 transactions of 2.4 MB were rejected in a 16 MiB budget"
             );
             let bound = memory.limit() + 20 * growth_slack(&w);
             assert!(peak <= bound, "interleaved growth peaked at {peak} of {}", memory.limit());
@@ -578,7 +578,7 @@ mod tests {
                 grown += 1;
                 let (used, limit) = (memory.used(), memory.limit());
                 assert!(used <= limit + growth_slack(&w), "bob's growth left {used} of {limit} bytes used");
-                assert!(grown < 10, "bob was never refused");
+                assert!(grown < 10, "bob was never rejected");
             }
             assert!(grown >= 3, "bob grew to {grown} write batches, less than half of the budget");
             let r = ops(&w, &alice, "a", &alices[0], get_op()).await;
@@ -608,7 +608,7 @@ mod tests {
                     break;
                 }
                 pins += 1;
-                assert!(pins < 100, "transactions pinning versions were never refused");
+                assert!(pins < 100, "transactions pinning versions were never rejected");
                 let put = json!({"ops": [{"op": "put", "key": format!("p{pins}"), "value": "x"}]});
                 let r = w.json(0, "POST", "/v1/dbs/a/txn", &alice, put).await;
                 assert!(r["error"].is_null(), "{r}");
@@ -618,7 +618,7 @@ mod tests {
             assert_eq!(
                 r.status,
                 201,
-                "bob was refused while alice's transactions pinned {pins} versions: {:?}",
+                "bob was rejected while alice's transactions pinned {pins} versions: {:?}",
                 r.json()
             );
             assert!(!memory.is_exceeded(), "admitting bob left {} of {} bytes used", memory.used(), memory.limit());

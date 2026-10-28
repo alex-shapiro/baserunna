@@ -23,12 +23,6 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       executed by the peer's previous process (`sim_tool trace tables 7344`).
       Execute locally only if the forward was sent once; otherwise return
       `outcome: "unknown"`.
-- [ ] **Roll back a failed transaction operations request instead of aborting
-      the transaction.** Any error partway through `POST …/transactions/{id}/ops`,
-      including a memory refusal as the transaction grows past its user's fair
-      share (SPEC §5.12), aborts the whole transaction because the ops before
-      the failure cannot be undone. Record an undo log per request so that a
-      failed request leaves the transaction as it was before the request.
 - [ ] **Fix `db_churn` seed 202681: a read finds no database the workload
       expects to exist.** A client's `get` returns `404 not_found` for a
       database under churn (`sim_tool trace db_churn 202681`).

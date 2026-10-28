@@ -718,7 +718,7 @@ If memory usage exceeds the budget, the node unloads the least recently used idl
 If memory usage remains above the budget after unloading all idle databases, the memory left for interactive transactions is shared max-min fairly between users, so that one user's transactions cannot lock other users out of a node:
 
 - A user holding less than its fair share may begin a transaction or run transaction operations. A user at or above its fair share is refused with a retryable `503`, and the transaction is left as it was. A user's fair share is the largest amount that fits in the budget when every user holding less keeps what it holds.
-- The share is checked again each time a transaction grows by another 1/1024 of the budget, so neither one large request nor many concurrent requests can carry a user past its share by more than that per request. A request refused as it grows fails with a retryable `503` and, like any failed transaction operation, aborts the transaction.
+- The share is checked again each time a transaction grows by another 1/1024 of the budget, so neither one large request nor many concurrent requests can carry a user past its share by more than that per request. A request refused as it grows aborts the transaction, like any failed operations request.
 - To make room for an admitted user, the node aborts idle transactions of the users furthest above their fair share, least recently used first, until usage is back within the budget. A transaction is aborted only if this brings its user closer to its fair share, so a user that grew just past its share keeps its transaction.
 - A user's transactions hold their read sets and write sets, and an equal share, among the transactions reading it, of any manifest version that only transactions keep loaded.
 
@@ -781,7 +781,10 @@ Single-request transactions, interactive transaction commits, and interactive tr
    server-side.
 2. **Interactive** (`/v1/dbs/{db}/transactions…`): begin, ops, commit,
    abort. `begin` and `commit` also accept `ops`, so a read-write transaction
-   can be executed in two requests. Because a serializable transaction can begin
+   can be executed in two requests. An `ops` request that fails or is
+   cancelled aborts the transaction, because some of its ops may have been
+   applied; a retryable failure is reported as `404 txn_not_found`, so that
+   the client restarts the transaction instead of retrying the request. Because a serializable transaction can begin
    while a commit is in flight (§5.5), a read-only transaction must be
    committed to validate its read set. Transaction state is stored on a database's owner node. If the
    owner changes or crashes, or the node aborts it to free memory for other

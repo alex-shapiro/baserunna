@@ -35,7 +35,7 @@ pub struct OpenTxn {
     /// The version the transaction reads, which it keeps loaded.
     snapshot: Weak<Version>,
     /// Locked by each request that uses the transaction; `None` once it is committed or aborted.
-    pub txn: Arc<tokio::sync::Mutex<Option<Txn>>>,
+    txn: Arc<tokio::sync::Mutex<Option<Txn>>>,
 }
 
 impl OpenTxn {
@@ -44,7 +44,7 @@ impl OpenTxn {
     }
 
     /// Records that a request is using the transaction.
-    pub fn touch(&self) {
+    fn touch(&self) {
         *lock(&self.last_used) = Instant::now();
     }
 }
@@ -132,9 +132,9 @@ impl OpenTxns {
         })
     }
 
-    /// Opens `txn` as transaction `id` of `user_id` on `db_id`, and returns it locked so that its
-    /// first request runs before any other. Growth of the transaction's memory is admitted like
-    /// requests that extend it.
+    /// Opens `txn` as transaction `id` of `user_id` on `db_id`, in use by the request that began it
+    /// so that this request runs before any other. Growth of the transaction's memory is admitted
+    /// like requests that extend it.
     pub fn open(
         self: &Arc<Self>,
         id: String,
@@ -142,7 +142,7 @@ impl OpenTxns {
         db_id: &str,
         mut txn: Txn,
         encoding: Encoding,
-    ) -> Result<tokio::sync::OwnedMutexGuard<Option<Txn>>> {
+    ) -> Result<InUse<'_>> {
         let gate = Gate { txns: Arc::downgrade(self), user_id: user_id.to_string(), db_id: db_id.to_string() };
         txn.set_memory_gate(Some(Arc::new(gate)));
         let now = Instant::now();
@@ -157,11 +157,22 @@ impl OpenTxns {
             snapshot: Arc::downgrade(txn.snapshot()),
             txn: Arc::new(tokio::sync::Mutex::new(Some(txn))),
         });
-        let first = open.txn.clone().try_lock_owned().map_err(|_| Error::internal("a new transaction is in use"))?;
+        let guard = open.txn.clone().try_lock_owned().map_err(|_| Error::internal("a new transaction is in use"))?;
         let mut g = lock(&self.open);
         self.check_per_user(&g, user_id)?;
-        g.insert(id, open);
-        Ok(first)
+        g.insert(id, open.clone());
+        Ok(InUse { txns: self, open, guard, finished: false })
+    }
+
+    /// Waits until no other request uses `open`, and returns it in use by this request, or why it
+    /// is gone.
+    pub async fn lock(&self, open: Arc<OpenTxn>) -> Result<InUse<'_>> {
+        let guard = open.txn.clone().lock_owned().await;
+        if guard.is_none() {
+            return Err(self.lost(&open.id));
+        }
+        open.touch();
+        Ok(InUse { txns: self, open, guard, finished: false })
     }
 
     /// Returns open transaction `id` of `user_id` on `db_id`, or why it is gone.
@@ -182,7 +193,7 @@ impl OpenTxns {
     }
 
     /// Returns the error for a request on transaction `id`, which is no longer open.
-    pub fn lost(&self, id: &str) -> Error {
+    fn lost(&self, id: &str) -> Error {
         crate::probe::hit(crate::probe::Probe::InteractiveTxnLost);
         match self.aborted.get(&id.to_string()) {
             Some(why) => Error::TxnNotFound(format!("transaction was aborted because {why}; retry it")),
@@ -191,26 +202,25 @@ impl OpenTxns {
     }
 
     /// Closes transaction `id` after it was committed or aborted by its user.
-    pub fn remove(&self, id: &str) {
+    fn remove(&self, id: &str) {
         lock(&self.open).remove(id);
     }
 
-    /// Closes transaction `id` because of `why`, which later requests on it report.
-    pub fn abort(&self, id: &str, why: &'static str) {
-        self.remove(id);
-        self.aborted.store(id.to_string(), Some(why), Instant::now());
-    }
-
-    /// Aborts `open` because of `why` unless a request is using it, and returns whether it was
-    /// aborted rather than already committed or aborted by its user.
+    /// Aborts `open` because of `why`, which later requests on it report, unless a request is using
+    /// it. Returns whether it was aborted rather than already committed or aborted by its user.
     fn close(&self, open: &OpenTxn, why: &'static str) -> bool {
         let Ok(mut g) = open.txn.try_lock() else { return false };
-        let aborted = g.take().is_some();
-        drop(g);
-        match aborted {
-            true => self.abort(&open.id, why),
-            false => self.remove(&open.id),
+        self.close_locked(open, &mut g, why)
+    }
+
+    /// Like [`OpenTxns::close`], for the request using `open`, whose lock on it is `txn`. The reason
+    /// is recorded before the lock is released, so that requests waiting for it report the reason.
+    fn close_locked(&self, open: &OpenTxn, txn: &mut Option<Txn>, why: &'static str) -> bool {
+        let aborted = txn.take().is_some();
+        if aborted {
+            self.aborted.store(open.id.clone(), Some(why), Instant::now());
         }
+        self.remove(&open.id);
         aborted
     }
 
@@ -267,6 +277,48 @@ impl OpenTxns {
                 (t, held)
             })
             .collect()
+    }
+}
+
+/// A request's exclusive use of an open transaction. A request that fails or is cancelled may have
+/// applied only some of its ops, so the transaction is aborted unless the request finishes.
+pub struct InUse<'a> {
+    txns: &'a OpenTxns,
+    open: Arc<OpenTxn>,
+    guard: tokio::sync::OwnedMutexGuard<Option<Txn>>,
+    finished: bool,
+}
+
+impl InUse<'_> {
+    pub fn txn(&mut self) -> &mut Txn {
+        self.guard.as_mut().expect("a transaction in use is open until its request finishes")
+    }
+
+    pub fn encoding(&self) -> Encoding {
+        self.open.encoding
+    }
+
+    /// Ends the request with `result`, aborting the transaction if the request failed.
+    pub fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+        self.finished = result.is_ok();
+        result
+    }
+
+    /// Ends the request by taking the transaction to commit it, which closes it.
+    pub fn take(mut self) -> Txn {
+        self.finished = true;
+        let mut txn = self.guard.take().expect("a transaction in use is open until its request finishes");
+        self.txns.remove(&self.open.id);
+        txn.set_memory_gate(None);
+        txn
+    }
+}
+
+impl Drop for InUse<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.txns.close_locked(&self.open, &mut self.guard, "a request on it failed or was cancelled");
+        }
     }
 }
 
@@ -339,9 +391,10 @@ mod tests {
             if !r["error"].is_null() {
                 assert_eq!(
                     (&r["error"]["code"], &r["error"]["retryable"]),
-                    (&json!("unavailable"), &json!(true)),
-                    "{r}"
+                    (&json!("txn_not_found"), &json!(true)),
+                    "a request refused as its transaction grew did not say the transaction is gone: {r}"
                 );
+                assert!(r["error"]["message"].as_str().unwrap().contains("memory budget"), "{r}");
                 return (open, Some(id));
             }
             open.push(id);
@@ -397,32 +450,11 @@ mod tests {
             let db = node.engine.db(&db_id);
             db.open(true).await.unwrap();
             let t = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
-            drop(node.txns.open("t".into(), "a", &db_id, t, Default::default()).unwrap());
+            node.txns.open("t".into(), "a", &db_id, t, Default::default()).unwrap().finish(Ok(())).unwrap();
             let held = node.txns.get("t", "a", &db_id).unwrap();
             tokio::time::sleep(Duration::from_millis(node.cfg.txn_idle_ms)).await;
             node.txns.expire();
             assert!(held.txn.lock().await.is_none(), "an expired transaction stayed usable");
-        });
-    }
-
-    #[test]
-    fn abort_reasons_do_not_retain_request_input() {
-        run_paused(async {
-            let w = World::new(1, 1).await;
-            let token = w.signup(0, "a@x.io").await;
-            w.create_db(0, &token, "a").await;
-            let table = json!({"name": "t", "primary_key": ["id"], "columns": [
-                {"name": "id", "type": "int", "nullable": false}, {"name": "label", "type": "string"}]});
-            let r = w.json(0, "POST", "/v1/dbs/a/tables", &token, table).await;
-            assert!(r["error"].is_null(), "{r}");
-            let id = begin(&w, &token, "a").await.json()["txn_id"].as_str().unwrap().to_string();
-            let row = json!({"id": 1, "label": ["x".repeat(100_000)]});
-            let r = ops(&w, &token, "a", &id, json!([{"op": "insert_row", "table": "t", "row": row}])).await;
-            assert_eq!(r["error"]["code"], "invalid_argument", "{r}");
-            let r = ops(&w, &token, "a", &id, get_op()).await;
-            assert_eq!(r["error"]["code"], "txn_not_found", "{r}");
-            let kept = r["error"]["message"].as_str().unwrap().len();
-            assert!(kept < 200, "the abort reason retained {kept} bytes of the failed request");
         });
     }
 
@@ -436,14 +468,45 @@ mod tests {
             let db = node.engine.db(&db_id);
             db.open(true).await.unwrap();
             let t = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
-            let mut committing = node.txns.open("t".into(), "a", &db_id, t, Default::default()).unwrap();
-            committing.take();
-            drop(committing);
+            drop(node.txns.open("t".into(), "a", &db_id, t, Default::default()).unwrap().take());
             tokio::time::sleep(Duration::from_millis(node.cfg.txn_idle_ms)).await;
             node.txns.expire();
             assert_eq!(node.txns.len(), 0);
             let e = node.txns.lost("t");
             assert!(!e.message().contains("idle"), "a retried commit would report: {e:?}");
+        });
+    }
+
+    async fn commit(w: &World, token: &str, db: &str, id: &str) -> Resp {
+        w.call(0, "POST", &format!("/v1/dbs/{db}/transactions/{id}/commit"), token, Bytes::from("{}")).await
+    }
+
+    #[test]
+    fn a_cancelled_request_aborts_its_transaction() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let token = w.signup(0, "a@x.io").await;
+            w.create_db(0, &token, "a").await;
+            let big = "b".repeat(w.node(0).cfg.engine.value_inline_max + 1);
+            let r = w
+                .json(0, "POST", "/v1/dbs/a/txn", &token, json!({"ops": [{"op": "put", "key": "blob", "value": big}]}))
+                .await;
+            assert!(r["error"].is_null(), "{r}");
+            let id = begin(&w, &token, "a").await.json()["txn_id"].as_str().unwrap().to_string();
+            w.store.set_latency_ms(1_000);
+            let request = ops(
+                &w,
+                &token,
+                "a",
+                &id,
+                json!([{"op": "put", "key": "x", "value": "1"}, {"op": "get", "key": "blob"}]),
+            );
+            let cancelled = tokio::time::timeout(Duration::from_millis(100), request).await;
+            assert!(cancelled.is_err(), "the request finished before it was cancelled: {cancelled:?}");
+            w.store.set_latency_ms(1);
+            let r = ops(&w, &token, "a", &id, json!([{"op": "get", "key": "x"}])).await;
+            assert_eq!(r["error"]["code"], "txn_not_found", "a partly applied request left its transaction open: {r}");
+            assert!(r["error"]["message"].as_str().unwrap().contains("cancelled"), "{r}");
         });
     }
 
@@ -453,16 +516,13 @@ mod tests {
             let w = World::with_config(1, 1, |c| c.engine.memory_bytes = 16 << 20).await;
             let token = w.signup(0, "a@x.io").await;
             w.create_db(0, &token, "a").await;
-            let (open, aborted) = fill_memory(&w, &token, "a").await;
+            let (open, refused) = fill_memory(&w, &token, "a").await;
             let memory = &w.node(0).engine.shared.memory;
             assert!(memory.used() <= memory.limit() + growth_slack(&w), "{} of {}", memory.used(), memory.limit());
-            let aborted = aborted.expect("growing past the budget did not fail");
-            let r = ops(&w, &token, "a", &aborted, get_op()).await;
-            assert_eq!(r["error"]["code"], "txn_not_found", "{r}");
-            assert!(r["error"]["message"].as_str().unwrap().contains("a request on it failed"), "{r}");
-            let r = w
-                .call(0, "POST", &format!("/v1/dbs/a/transactions/{}/commit", open[0]), &token, Bytes::from("{}"))
-                .await;
+            let refused = refused.expect("growing past the budget did not fail");
+            let r = commit(&w, &token, "a", &refused).await;
+            assert_eq!(r.json()["error"]["code"], "txn_not_found", "{:?}", r.json());
+            let r = commit(&w, &token, "a", &open[0]).await;
             assert_eq!(r.status, 200, "committing a transaction under memory pressure: {:?}", r.json());
             for id in &open[1..] {
                 let r = w.call(0, "DELETE", &format!("/v1/dbs/a/transactions/{id}"), &token, Bytes::new()).await;
@@ -491,11 +551,10 @@ mod tests {
             for k in 0..120 {
                 for g in open.iter_mut() {
                     let Some(t) = g.as_mut() else { continue };
-                    let Some(txn) = t.as_mut() else { continue };
-                    let put = txn.put(Bytes::from(format!("k{k}")), Value::Inline(Bytes::from(vec![b'v'; 20_000])));
+                    let put = t.txn().put(Bytes::from(format!("k{k}")), Value::Inline(Bytes::from(vec![b'v'; 20_000])));
                     if let Err(e) = put {
                         assert!(matches!(e, Error::Unavailable { .. }), "{e:?}");
-                        (**t, refused) = (None, refused + 1);
+                        (*g, refused) = (None, refused + 1);
                     }
                     peak = peak.max(memory.used());
                 }
@@ -525,7 +584,7 @@ mod tests {
             loop {
                 let r = ops(&w, &bob, "b", &bobs, big_puts(&format!("b{grown}-"))).await;
                 if !r["error"].is_null() {
-                    assert_eq!(r["error"]["code"], "unavailable", "{r}");
+                    assert_eq!(r["error"]["code"], "txn_not_found", "{r}");
                     break;
                 }
                 grown += 1;

@@ -548,16 +548,9 @@ async fn begin_txn(
     };
     let (rv, cid) = (t.read_version(), t.commit_id);
     let id = node.env.random_hex(16);
-    let mut g = node.txns.open(id.clone(), user, &ctx.rec.id, t, b.encoding)?;
-    let Some(t) = g.as_mut() else { return Err(Error::internal("a new transaction is closed")) };
-    let results = match exec_ops(&op_ctx(&node, &ctx, b.encoding), t, &b.ops).await {
-        Ok(results) => results,
-        Err(e) => {
-            *g = None;
-            node.txns.remove(&id);
-            return Err(e);
-        }
-    };
+    let mut txn = node.txns.open(id.clone(), user, &ctx.rec.id, t, b.encoding)?;
+    let results = exec_ops(&op_ctx(&node, &ctx, b.encoding), txn.txn(), &b.ops).await;
+    let results = txn.finish(results)?;
     Ok((
         StatusCode::CREATED,
         axum::Json(json!({
@@ -591,19 +584,16 @@ async fn txn_ops(
     let id = param(&p, "id")?.to_string();
     let open = get_open(&node, &ctx, &id)?;
     node.txns.admit(&open.user_id, &open.db_id)?;
-    let mut g = open.txn.lock().await;
-    open.touch();
-    let Some(t) = g.as_mut() else {
-        return Err(node.txns.lost(&id));
-    };
-    match exec_ops(&op_ctx(&node, &ctx, open.encoding), t, &b.ops).await {
-        Ok(results) => Ok(axum::Json(json!({"results": results}))),
-        Err(e) => {
-            *g = None;
-            node.txns.abort(&id, "a request on it failed");
-            Err(e)
-        }
-    }
+    let mut txn = node.txns.lock(open).await?;
+    let results = exec_ops(&op_ctx(&node, &ctx, txn.encoding()), txn.txn(), &b.ops).await;
+    let results = txn.finish(results).map_err(|e| match e.retryable() {
+        true => Error::TxnNotFound(format!(
+            "transaction was aborted because a request on it failed ({}); retry it",
+            e.message()
+        )),
+        false => e,
+    })?;
+    Ok(axum::Json(json!({"results": results})))
 }
 
 #[derive(Deserialize, Default)]
@@ -620,12 +610,11 @@ async fn commit_txn(
     JsonBody(b): JsonBody<Option<CommitBody>>,
 ) -> Result<J> {
     let id = param(&p, "id")?.to_string();
-    let open = get_open(&node, &ctx, &id)?;
-    let mut t = open.txn.lock().await.take().ok_or_else(|| node.txns.lost(&id))?;
-    node.txns.remove(&id);
-    t.set_memory_gate(None);
+    let txn = node.txns.lock(get_open(&node, &ctx, &id)?).await?;
+    let enc = txn.encoding();
+    let mut t = txn.take();
     let b = b.unwrap_or_default();
-    let mut results = exec_ops(&op_ctx(&node, &ctx, open.encoding), &mut t, &b.ops).await?;
+    let mut results = exec_ops(&op_ctx(&node, &ctx, enc), &mut t, &b.ops).await?;
     if !t.is_read_only() {
         ctx.require_write()?;
     }
@@ -650,9 +639,7 @@ async fn commit_txn(
 
 async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
     let id = param(&p, "id")?.to_string();
-    let open = get_open(&node, &ctx, &id)?;
-    *open.txn.lock().await = None;
-    node.txns.remove(&id);
+    drop(node.txns.lock(get_open(&node, &ctx, &id)?).await?.take());
     Ok(axum::Json(json!({})))
 }
 

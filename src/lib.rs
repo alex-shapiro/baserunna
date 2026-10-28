@@ -13,6 +13,7 @@ pub mod console;
 pub mod engine;
 pub mod env;
 pub mod error;
+pub mod events;
 pub mod filter;
 pub mod limits;
 pub mod log;

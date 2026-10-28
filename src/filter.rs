@@ -220,7 +220,8 @@ impl<A> Test<A> {
         })
     }
 
-    fn holds<T: Target<A>>(&self, t: &T) -> bool {
+    /// Whether the test holds for a present value.
+    pub fn holds<T: Target<A>>(&self, t: &T) -> bool {
         use Ordering::*;
         match self {
             Test::Eq(a) => t.equals(a),

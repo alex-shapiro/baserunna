@@ -3,6 +3,7 @@
 //! writes.
 
 use super::memory::{Charge, MemoryGate, alloc_bytes};
+use super::events::{self, EventOp};
 use super::stream::{self, StreamOp, StreamState};
 use super::types::{BlobRef, Seq, Value, is_commit_key};
 use super::version::{KeyRange, Snapshot, Version};
@@ -65,11 +66,14 @@ pub struct WriteSet {
     /// blobs are already bound in the manifest, commit validation skips staging checks
     /// and quota additions for them.
     pub copied_blobs: std::collections::BTreeSet<String>,
+    /// Changes to event tables, applied after `streams` by the committer,
+    /// which gives inserted rows their positions (SPEC §5.12).
+    pub events: Vec<EventOp>,
 }
 
 impl WriteSet {
     pub fn is_empty(&self) -> bool {
-        self.puts.is_empty() && self.range_deletes.is_empty() && self.streams.is_empty()
+        self.puts.is_empty() && self.range_deletes.is_empty() && self.streams.is_empty() && self.events.is_empty()
     }
 
     pub fn touches_key(&self, k: &[u8]) -> bool {
@@ -85,6 +89,7 @@ impl WriteSet {
     pub fn needs_clock(&self) -> bool {
         self.puts.values().any(|p| matches!(p, Some(Put { ttl: Some(Ttl::For(_)), .. })))
             || self.streams.iter().any(|s| matches!(s, StreamOp::Append { .. }))
+            || self.events.iter().any(|e| !e.new_objects().is_empty())
     }
 
     /// Returns deduplicated blob references bound by this write set that are not in
@@ -160,6 +165,7 @@ pub struct Txn {
     /// Admission gate for memory growth and the charged byte threshold for the next check.
     gate: Option<(Arc<dyn MemoryGate>, usize)>,
     appended: usize,
+    inserted: usize,
     optimistic: bool,
     has_untracked_reads: bool,
 }
@@ -191,6 +197,7 @@ impl Txn {
             charge,
             gate: None,
             appended: 0,
+            inserted: 0,
             optimistic: false,
             has_untracked_reads: false,
         }
@@ -472,6 +479,31 @@ impl Txn {
         self.account(payloads.iter().map(|p| p.len() + 24).sum())?;
         self.writes.streams.push(StreamOp::Append { id, payloads, expect, op_index });
         Ok(())
+    }
+
+    /// Inserts encoded rows into event table `table` at commit.
+    pub fn insert_events(&mut self, table: u32, rows: Vec<Bytes>) -> Result<()> {
+        self.inserted += rows.len();
+        if self.inserted > events::INSERT_MAX_ROWS {
+            return Err(Error::TooLarge(format!("a transaction inserts at most {} events", events::INSERT_MAX_ROWS)));
+        }
+        let op = EventOp::Insert { table, rows };
+        self.account(op.inserted_bytes() as usize)?;
+        self.writes.events.push(op);
+        Ok(())
+    }
+
+    /// Records an event op that accounts for puts the transaction made itself.
+    pub fn event_op(&mut self, op: EventOp) -> Result<()> {
+        self.account(64)?;
+        self.writes.events.push(op);
+        Ok(())
+    }
+
+    /// Records a read of `range` in the read set without reading it, for
+    /// reads performed on the snapshot directly.
+    pub fn note_read(&mut self, range: KeyRange) {
+        self.reads.push(ReadItem::Range(range));
     }
 
     /// Creates, configures or trims a stream at commit.

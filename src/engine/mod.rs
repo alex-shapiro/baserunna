@@ -6,6 +6,7 @@ pub mod clock;
 pub mod compaction;
 mod config;
 pub mod db;
+pub mod events;
 pub mod local;
 pub mod manifest;
 pub mod memory;
@@ -57,7 +58,14 @@ pub struct Shared {
     waits_ended: std::sync::atomic::AtomicBool,
     /// Called with a database id and version after this node commits a new data version.
     commit_hook: std::sync::OnceLock<CommitHook>,
+    /// Called on the lease holder with the event tables a commit changed.
+    event_hook: std::sync::OnceLock<EventHook>,
 }
+
+/// Callback invoked on the lease holder with a database and the event tables
+/// whose unsealed rows or parts a commit changed, to schedule sealing,
+/// merges and retention (SPEC §5.12).
+pub type EventHook = Box<dyn Fn(&Arc<Db>, std::collections::BTreeSet<u32>) + Send + Sync>;
 
 /// Callback invoked with `(db_id, version)` after this node commits a new data version.
 pub type CommitHook = Box<dyn Fn(&str, u64) + Send + Sync>;
@@ -66,6 +74,12 @@ impl Shared {
     pub(crate) fn committed(&self, db: &str, version: u64) {
         if let Some(h) = self.commit_hook.get() {
             h(db, version);
+        }
+    }
+
+    pub(crate) fn events_changed(&self, db: &Arc<Db>, tables: std::collections::BTreeSet<u32>) {
+        if let Some(h) = self.event_hook.get() {
+            h(db, tables);
         }
     }
 
@@ -195,6 +209,16 @@ pub fn pin_key(db: &str, blob: &str) -> String {
     format!("{}pin", blob_prefix(db, blob))
 }
 
+/// Returns the prefix of every object of an event table part or mask.
+pub fn part_prefix(db: &str, part: &str) -> String {
+    format!("dbs/{db}/part/{part}/")
+}
+
+/// Returns the storage key of chunk `idx` of an event table part or mask.
+pub fn part_chunk_key(db: &str, part: &str, idx: u64) -> String {
+    format!("dbs/{db}/part/{part}/{idx:04}")
+}
+
 pub fn db_prefix(db: &str) -> String {
     format!("dbs/{db}/")
 }
@@ -206,12 +230,19 @@ pub enum ObjectClass {
     Segment,
     Levels,
     Blob,
+    Part,
     Other,
 }
 
 impl ObjectClass {
-    pub const ALL: [ObjectClass; 5] =
-        [ObjectClass::Manifest, ObjectClass::Segment, ObjectClass::Levels, ObjectClass::Blob, ObjectClass::Other];
+    pub const ALL: [ObjectClass; 6] = [
+        ObjectClass::Manifest,
+        ObjectClass::Segment,
+        ObjectClass::Levels,
+        ObjectClass::Blob,
+        ObjectClass::Part,
+        ObjectClass::Other,
+    ];
 
     pub fn from_key(key: &str) -> ObjectClass {
         let Some((_, rest)) = key.strip_prefix("dbs/").and_then(|k| k.split_once('/')) else {
@@ -223,6 +254,8 @@ impl ObjectClass {
             if seg.ends_with(LEVELS_SUFFIX) { ObjectClass::Levels } else { ObjectClass::Segment }
         } else if rest.starts_with("blob/") {
             ObjectClass::Blob
+        } else if rest.starts_with("part/") {
+            ObjectClass::Part
         } else {
             ObjectClass::Other
         }
@@ -234,6 +267,7 @@ impl ObjectClass {
             ObjectClass::Segment => "segment",
             ObjectClass::Levels => "levels",
             ObjectClass::Blob => "blob",
+            ObjectClass::Part => "part",
             ObjectClass::Other => "other",
         }
     }
@@ -268,6 +302,7 @@ impl Engine {
             stopping: false.into(),
             waits_ended: false.into(),
             commit_hook: std::sync::OnceLock::new(),
+            event_hook: std::sync::OnceLock::new(),
         });
         let engine = Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) });
         let _ = engine.shared.engine.set(Arc::downgrade(&engine));
@@ -298,6 +333,11 @@ impl Engine {
     /// Sets the callback invoked after this node commits a new data version.
     pub fn set_commit_hook(&self, h: CommitHook) {
         let _ = self.shared.commit_hook.set(h);
+    }
+
+    /// Sets the callback that schedules event table maintenance.
+    pub fn set_event_hook(&self, h: EventHook) {
+        let _ = self.shared.event_hook.set(h);
     }
 
     pub fn open_count(&self) -> usize {

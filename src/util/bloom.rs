@@ -52,10 +52,14 @@ impl Bloom {
     }
 
     pub fn may_contain(&self, key: &[u8]) -> bool {
+        self.may_contain_hash(key_hash(key))
+    }
+
+    /// Checks a precomputed hash, as inserted by [`Bloom::insert_hash`].
+    pub fn may_contain_hash(&self, h: u64) -> bool {
         if self.bits.is_empty() {
             return true;
         }
-        let h = key_hash(key);
         let (mut a, b) = (h, h.rotate_left(32) | 1);
         let nbits = self.nbits();
         for _ in 0..self.k {

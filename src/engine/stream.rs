@@ -361,7 +361,7 @@ pub(crate) struct Pending<'a> {
 }
 
 impl Pending<'_> {
-    async fn entry(&self, k: &Bytes) -> Result<Option<Entry>> {
+    pub(crate) async fn entry(&self, k: &Bytes) -> Result<Option<Entry>> {
         if let Some(e) = self.tail.get(k) {
             return Ok(Some(e.clone()));
         }

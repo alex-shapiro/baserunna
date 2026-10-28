@@ -3,11 +3,13 @@
 mod account;
 pub mod body;
 mod data;
+mod events;
 pub mod openapi;
 mod orgs;
 mod streams;
 
 pub use account::session_cookie;
+pub(crate) use events::{ForwardedBind, bind_results_from_json};
 
 use crate::cluster::{
     CLUSTER_KEY_HEADER, DEADLINE_HEADER, Delivery, FORWARD_ID_HEADER, FORWARD_TO_HEADER, HOPS_HEADER, ReplayedResponse,
@@ -312,6 +314,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         let (mut rec, mut access) = node.resolve_db(&principal, &name).await?;
         let hops = hops(req.headers());
         if hops < 2
+            && !events::served_locally(req.method(), req.uri().path())
             && let Some((target, addr)) = node.route(&rec.id, is_long_poll(&req)).await
         {
             let small = req.method() == http::Method::GET
@@ -957,10 +960,11 @@ async fn not_found() -> Error {
 /// Builds the HTTP router for the node.
 pub fn router(node: Arc<Node>) -> Router {
     let db_routes =
-        data::routes().merge(streams::routes()).route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
+        data::routes().merge(streams::routes()).merge(events::routes()).route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
     let internal = Router::new()
         .route("/internal/v1/meta", post(account::internal_meta))
         .route("/internal/v1/notice", post(commit_notice))
+        .route("/internal/v1/events/bind", post(events::internal_bind))
         .route_layer(middleware::from_fn_with_state(node.clone(), internal_auth));
     let r = Router::new()
         .route("/healthz", get(healthz))

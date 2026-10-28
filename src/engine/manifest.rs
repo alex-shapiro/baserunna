@@ -17,7 +17,8 @@ const MAGIC: &[u8; 4] = b"BRMF";
 
 /// The database was deleted: every read and commit fails with not-found.
 pub const FLAG_DELETED: u64 = 1;
-const FORMAT: u16 = 7;
+const FORMAT: u16 = 8;
+const FORMAT_V7: u16 = 7;
 const FORMAT_V6: u16 = 6;
 const FORMAT_V5: u16 = 5;
 const ZSTD_LEVEL: i32 = 1;
@@ -105,6 +106,8 @@ pub enum ObjKind {
     Blob = 1,
     /// External levels object; see [`Manifest::levels`].
     Levels = 2,
+    /// An event table part or mask: every object under `part/{id}/`.
+    Part = 3,
 }
 
 /// Tracks referenced blob bytes for size quotas, updated incrementally on commit and reconciled by sweeps.
@@ -201,6 +204,9 @@ pub struct Manifest {
     pub chunk_bytes: BlobBytes,
     /// Incremented by every tail flush install so stale background flushes are rejected.
     pub flush_seq: u64,
+    /// Exact bytes of the event table parts and masks that references name
+    /// (SPEC §5.10), maintained by every commit that changes a reference.
+    pub part_bytes: u64,
 }
 
 impl Manifest {
@@ -370,6 +376,7 @@ impl Manifest {
             w.varint(b.swept_at);
         }
         w.varint(self.flush_seq);
+        w.varint(self.part_bytes);
         (prefix, pages, w.into_inner())
     }
 
@@ -389,8 +396,8 @@ impl Manifest {
         let format = r.u16()?;
         let src = match (format, r.u8()) {
             (FORMAT_V5, _) => src.slice(6..),
-            (FORMAT | FORMAT_V6, Ok(0)) => src.slice(7..),
-            (FORMAT | FORMAT_V6, Ok(1)) => {
+            (FORMAT | FORMAT_V7 | FORMAT_V6, Ok(0)) => src.slice(7..),
+            (FORMAT | FORMAT_V7 | FORMAT_V6, Ok(1)) => {
                 let n = r.varint()?;
                 if n > MAX_BODY {
                     return Err(DecodeError("manifest body too large"));
@@ -467,6 +474,7 @@ impl Manifest {
                 0 => ObjKind::Segment,
                 1 => ObjKind::Blob,
                 2 => ObjKind::Levels,
+                3 => ObjKind::Part,
                 _ => return Err(DecodeError("bad obsolete kind")),
             };
             let id = r.string()?;
@@ -478,7 +486,8 @@ impl Manifest {
         let last_sweep_ms = r.varint()?;
         let blob_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
         let chunk_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
-        let flush_seq = if format == FORMAT { r.varint()? } else { 0 };
+        let flush_seq = if format >= FORMAT_V7 { r.varint()? } else { 0 };
+        let part_bytes = if format >= FORMAT { r.varint()? } else { 0 };
         if !r.is_empty() {
             return Err(DecodeError("manifest trailing data"));
         }
@@ -502,6 +511,7 @@ impl Manifest {
             blob_bytes,
             chunk_bytes,
             flush_seq,
+            part_bytes,
         };
         m.check_levels().map_err(DecodeError)?;
         Ok(m)

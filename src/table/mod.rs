@@ -150,13 +150,7 @@ pub async fn create_table(txn: &mut Txn, def: &CreateTable) -> Result<TableSchem
         }
         return Err(Error::AlreadyExists(format!("table {:?} already exists", def.name)));
     }
-    let next = match txn.get(&next_id_key()).await? {
-        Some(ReadValue { value: Value::Inline(b), .. }) => std::str::from_utf8(&b)
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .ok_or_else(|| Error::internal("bad table id counter"))?,
-        _ => 1,
-    };
+    let next = allocate_table_id(txn).await?;
     let mut s = TableSchema {
         id: next,
         name: def.name.clone(),
@@ -187,9 +181,21 @@ pub async fn create_table(txn: &mut Txn, def: &CreateTable) -> Result<TableSchem
         s.next_index_id += 1;
     }
     s.validate()?;
-    txn.put(next_id_key(), Value::Inline(Bytes::from((next + 1).to_string())))?;
     put_schema(txn, &s)?;
     Ok(s)
+}
+
+/// Takes the next id shared by row and event tables.
+pub(crate) async fn allocate_table_id(txn: &mut Txn) -> Result<u32> {
+    let next = match txn.get(&next_id_key()).await? {
+        Some(ReadValue { value: Value::Inline(b), .. }) => std::str::from_utf8(&b)
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .ok_or_else(|| Error::internal("bad table id counter"))?,
+        _ => 1,
+    };
+    txn.put(next_id_key(), Value::Inline(Bytes::from((next + 1).to_string())))?;
+    Ok(next)
 }
 
 pub async fn drop_table(txn: &mut Txn, name: &str) -> Result<()> {
@@ -862,6 +868,26 @@ fn decode_stored_row(s: &TableSchema, prefix: &[u8], it: &ReadValue) -> Result<(
     let mut row = schema::decode_row(d)?;
     fill_defaults(s, &mut row)?;
     Ok((pk, row))
+}
+
+/// Every row of table `name` with its schema, read into the transaction's
+/// read set, stopping with `TooLarge` past `max_bytes` of stored rows.
+pub(crate) async fn rows_within(txn: &mut Txn, name: &str, max_bytes: usize) -> Result<(TableSchema, Vec<Row>)> {
+    let s = get_schema(txn, name).await?;
+    let prefix = table_prefix(SPACE_ROWS, s.id);
+    let mut out = Vec::new();
+    let mut bytes = 0;
+    let mut pages = Pages::new(KeyRange::prefix(&prefix));
+    while let Some(page) = pages.next(txn).await? {
+        for it in &page {
+            bytes += it.key.len() + it.value.size();
+            if bytes > max_bytes {
+                return Err(Error::TooLarge(format!("table {name:?} exceeds the lookup limit of {max_bytes} bytes")));
+            }
+            out.push(decode_stored_row(&s, &prefix, it)?.1);
+        }
+    }
+    Ok((s, out))
 }
 
 async fn all_rows(txn: &mut Txn, s: &TableSchema) -> Result<Vec<(Bytes, Vec<Key>, Row, Option<u64>)>> {

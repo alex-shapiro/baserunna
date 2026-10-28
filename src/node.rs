@@ -63,6 +63,14 @@ pub struct NodeConfig {
     pub watch_poll_ms: u64,
     pub limits: LimitConfig,
     pub engine: EngineConfig,
+    /// A bulk insert buffer is flushed this long after its first request.
+    pub event_insert_buffer_ms: u64,
+    /// A bulk insert buffer is flushed once it holds this many bytes of rows.
+    pub event_insert_buffer_bytes: usize,
+    /// Limits on the work of one event query.
+    pub query_limits: crate::events::exec::Limits,
+    /// Event queries run at once per node; more wait up to 5 s.
+    pub query_concurrency: usize,
 }
 
 impl NodeConfig {
@@ -107,6 +115,10 @@ impl Default for NodeConfig {
             watch_poll_ms: 1_000,
             limits: LimitConfig::default(),
             engine: EngineConfig { db_max_bytes: 10 << 30, ..EngineConfig::default() },
+            event_insert_buffer_ms: 200,
+            event_insert_buffer_bytes: 16 << 20,
+            query_limits: crate::events::exec::Limits::default(),
+            query_concurrency: std::thread::available_parallelism().map_or(4, |n| n.get()),
         }
     }
 }
@@ -292,7 +304,10 @@ pub struct Node {
     pub limiter: Limiter,
     pub metrics: crate::metrics::ServerMetrics,
     hash_slots: tokio::sync::Semaphore,
+    query_slots: tokio::sync::Semaphore,
     draining: std::sync::atomic::AtomicBool,
+    event_buffers: OnceLock<Arc<crate::events::bulk::Buffers>>,
+    pub maintainer: Arc<crate::events::maint::Maintainer>,
 }
 
 /// Tracks backoff state for a peer after an undelivered forward.
@@ -346,9 +361,33 @@ impl Node {
             limiter: Limiter::default(),
             metrics: Default::default(),
             hash_slots: tokio::sync::Semaphore::new(cfg.limits.hash_concurrency.max(1)),
+            query_slots: tokio::sync::Semaphore::new(cfg.query_concurrency.max(1)),
             draining: std::sync::atomic::AtomicBool::new(false),
+            event_buffers: OnceLock::new(),
+            maintainer: Arc::default(),
             cfg,
         });
+        let weak = Arc::downgrade(&node);
+        let bind: crate::events::bulk::BindFn = Arc::new(move |db, b| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                match weak.upgrade() {
+                    Some(n) => n.bind_events(db, b).await,
+                    None => Err(Error::unavailable("this node is shutting down")),
+                }
+            })
+        });
+        let buffer_cfg = crate::events::bulk::BufferConfig {
+            wait_ms: node.cfg.event_insert_buffer_ms,
+            max_bytes: node.cfg.event_insert_buffer_bytes,
+        };
+        let _ = node.event_buffers.set(crate::events::bulk::Buffers::new(buffer_cfg, bind));
+        let maintainer = node.maintainer.clone();
+        node.engine.set_event_hook(Box::new(move |db, tables| {
+            if db.id != SYS_DB {
+                maintainer.schedule(db, tables);
+            }
+        }));
         let weak = Arc::downgrade(&node);
         node.engine.set_commit_hook(Box::new(move |db: &str, version: u64| {
             if let Some(n) = weak.upgrade() {
@@ -782,6 +821,97 @@ impl Node {
         req.deadline = Some(self.meta_deadline().instant());
         sys.commit(req).await?;
         Ok(r)
+    }
+
+    /// The node's bulk insert buffers.
+    pub fn event_buffers(&self) -> &Arc<crate::events::bulk::Buffers> {
+        self.event_buffers.get().expect("event buffers are set at start")
+    }
+
+    /// Waits up to 5 s for capacity to run an event query.
+    pub async fn query_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        match tokio::time::timeout(Duration::from_secs(5), self.query_slots.acquire()).await {
+            Ok(Ok(p)) => Ok(p),
+            _ => Err(Error::Unavailable {
+                message: "the node is busy running queries; retry".into(),
+                retry_after_ms: Some(1000),
+                outcome_unknown: false,
+            }),
+        }
+    }
+
+    /// Binds staged event parts on the database's lease holder, forwarding
+    /// the bind when another node holds the lease.
+    pub async fn bind_events(
+        self: &Arc<Self>,
+        db: Arc<crate::engine::Db>,
+        bind: crate::engine::events::Bind,
+    ) -> Result<Vec<Result<crate::engine::Committed>>> {
+        let n = bind.slots.len();
+        let mut last = Error::unavailable("the database's lease holder is unavailable");
+        for attempt in 0..6u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(20 * (1 << attempt) + self.env.random_below(20))).await;
+            }
+            if let Some(holder) = db.lease_holder()
+                && holder != self.id
+                && let Some(addr) = self.addr_of(&holder).filter(|a| *a != self.cfg.addr)
+            {
+                crate::probe::hit(crate::probe::Probe::BindForwarded);
+                let body = crate::api::ForwardedBind { db: db.id.clone(), bind: crate::util::b64::encode(&bind.encode()) };
+                match self.forward_internal(&holder, &addr, "/internal/v1/events/bind", &body).await {
+                    Ok(j) => return crate::api::bind_results_from_json(&j, n),
+                    Err(Ok(e @ Error::Unavailable { outcome_unknown: false, .. })) | Err(Ok(e @ Error::NotOwner { .. })) => {
+                        last = e;
+                        let _ = db.refresh(Instant::now(), false).await;
+                        continue;
+                    }
+                    Err(Ok(e)) => return Err(e),
+                    Err(Err(te)) if te.maybe_delivered => {
+                        return Err(Error::Unavailable {
+                            message: format!("bind outcome unknown: {}", te.message),
+                            retry_after_ms: Some(500),
+                            outcome_unknown: true,
+                        });
+                    }
+                    Err(Err(_)) => {
+                        self.mark_suspect(&holder);
+                        continue;
+                    }
+                }
+            }
+            let rs = db.bind(bind.clone()).await?;
+            if attempt < 5 && rs.iter().all(|r| matches!(r, Err(Error::NotOwner { .. }))) {
+                last = Error::unavailable("another node took the lease");
+                continue;
+            }
+            return Ok(rs);
+        }
+        Err(last)
+    }
+
+    async fn forward_internal(
+        &self,
+        holder: &str,
+        addr: &str,
+        path: &str,
+        body: &impl serde::Serialize,
+    ) -> std::result::Result<Json, std::result::Result<Error, cluster::TransportError>> {
+        let mut req = self.internal_request(path, body).map_err(Ok)?;
+        if let Ok(v) = self.env.random_hex(16).parse() {
+            req.headers_mut().insert(cluster::FORWARD_ID_HEADER, v);
+        }
+        if let Ok(v) = holder.parse() {
+            req.headers_mut().insert(cluster::FORWARD_TO_HEADER, v);
+        }
+        let resp = self.services.transport.call(addr, req).await.map_err(Err)?;
+        let status = resp.status();
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .map_err(|e| Err(cluster::TransportError { message: e.to_string(), maybe_delivered: true }))?
+            .to_bytes();
+        let j: Json = serde_json::from_slice(&bytes).unwrap_or(Json::Null);
+        if status.is_success() { Ok(j) } else { Err(Ok(crate::api::error_from_json(status.as_u16(), &j))) }
     }
 
     fn meta_deadline(&self) -> Deadline {

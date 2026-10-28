@@ -364,8 +364,10 @@ events to row tables.
   JSON array or NDJSON) waits up to 200 ms for other inserts on the same
   node and commits with them in one manifest write, and with an
   idempotency key is applied once. An `insert_events` op in a transaction
-  commits with the transaction's other writes. Null JSON fields are
-  dropped.
+  commits with the transaction's other writes. Times range over the years
+  0000 to 9999. Null JSON fields are dropped, `-0.0` is stored as `0`, and
+  JSON integers outside the signed 64-bit range are refused, since queries
+  could not compare them exactly.
 - **Queries** read `[from, to)` of the time column with an optional filter
   (§4.7, where a column operand may carry a JSON `path`) and return either
   rows (`columns`, every column when omitted, with `order_by` and a resume

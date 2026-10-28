@@ -245,8 +245,10 @@ pub fn validate_rows(s: &EventSchema, rows: &[Json], now_ms: i64) -> Result<Vec<
                 o => o,
             })?;
             for d in row.values_mut() {
-                if let Datum::Json(j) = d {
-                    json::strip_nulls(j);
+                match d {
+                    Datum::Json(j) => json::normalize(j).map_err(|m| Error::invalid(format!("event {i}: {m}")))?,
+                    Datum::Float(f) if *f == 0.0 => *f = 0.0,
+                    _ => {}
                 }
             }
             if encode_row(&row).len() > schema::ROW_MAX_BYTES {

@@ -10,13 +10,25 @@ use serde_json::{Map, Value as Json};
 /// Shared buckets per JSON column for paths that are not their own columns.
 pub const BUCKETS: u8 = 32;
 
-/// Removes null members of objects, recursively; array elements are kept.
-pub fn strip_nulls(v: &mut Json) {
-    if let Json::Object(o) = v {
-        o.retain(|_, x| !x.is_null());
-        for x in o.values_mut() {
-            strip_nulls(x);
+/// Prepares an inserted value: removes null members of objects
+/// (recursively; array elements are kept), stores `-0.0` as `0.0` so that it
+/// equals zero in every comparison, and rejects integers beyond the signed
+/// 64-bit range, which queries could not compare exactly.
+pub fn normalize(v: &mut Json) -> Result<(), String> {
+    match v {
+        Json::Object(o) => {
+            o.retain(|_, x| !x.is_null());
+            o.values_mut().try_for_each(normalize)
         }
+        Json::Array(a) => a.iter_mut().try_for_each(normalize),
+        Json::Number(n) if n.is_u64() && n.as_i64().is_none() => {
+            Err(format!("{n} exceeds the signed 64-bit integer range; send it as a string"))
+        }
+        Json::Number(n) if n.as_f64() == Some(0.0) && n.is_f64() => {
+            *v = Json::from(0.0);
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -131,7 +143,7 @@ mod tests {
     #[test]
     fn flatten_then_unflatten_roundtrips() {
         let mut v = json!({"a": {"b": 1, "c": {"d": [1, null]}, "e": {}}, "f": null, "g": "x", "h.i": true});
-        strip_nulls(&mut v);
+        normalize(&mut v).unwrap();
         let o = v.as_object().unwrap();
         let leaves = flatten(o);
         let keys: Vec<&str> = leaves.iter().map(|(k, _)| k.as_str()).collect();
@@ -143,6 +155,17 @@ mod tests {
         assert_eq!(leaf(&v, &["a".into(), "e".into()]), Some(&json!({})));
         assert_eq!(leaf(&v, &["f".into()]), None);
         assert!(bucket(r#"["a"]"#) < BUCKETS);
+    }
+
+    #[test]
+    fn normalizing_zeroes_negative_zero_and_rejects_huge_integers() {
+        let mut v = json!({"z": -0.0, "a": [-0.0, {"n": null}], "i": -3});
+        normalize(&mut v).unwrap();
+        assert_eq!(v, json!({"z": 0.0, "a": [0.0, {}], "i": -3}));
+        assert!(v["z"].as_f64().unwrap().is_sign_positive());
+        assert!(normalize(&mut json!({"id": u64::MAX})).is_err());
+        assert!(normalize(&mut json!({"ids": [1, i64::MAX as u64 + 1]})).is_err());
+        assert!(normalize(&mut json!({"id": i64::MAX})).is_ok());
     }
 
     #[test]

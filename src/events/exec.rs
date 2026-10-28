@@ -138,7 +138,11 @@ impl Binder<'_> {
     fn filter(&self, f: &Filter) -> Result<BFilter> {
         f.bind(&mut |e: &Expr, t: &Test<Json>| {
             let b = self.expr(e)?;
-            let t = match &b {
+            let col = match &b {
+                BExpr::Bucket(inner, ..) => inner.as_ref(),
+                other => other,
+            };
+            let t = match col {
                 BExpr::Col(id) => {
                     let c = self.schema.column_by_id(*id).ok_or_else(|| Error::internal("bound column missing"))?;
                     if matches!(t, Test::Prefix(_) | Test::Contains(_)) && c.ty != EvType::String {
@@ -167,7 +171,7 @@ fn typed_arg(c: &EvColumn, a: &Json) -> Result<Json> {
             _ => json!(a.as_i64().ok_or_else(bad)?),
         },
         EvType::Int => json!(a.as_i64().ok_or_else(bad)?),
-        EvType::Float => json!(a.as_f64().filter(|f| f.is_finite()).ok_or_else(bad)?),
+        EvType::Float => json!(a.as_f64().filter(|f| f.is_finite()).ok_or_else(bad)? + 0.0),
         EvType::String => json!(a.as_str().ok_or_else(bad)?),
         EvType::Bool => json!(a.as_bool().ok_or_else(bad)?),
         EvType::Json => a.clone(),
@@ -285,7 +289,7 @@ impl Batch {
             BExpr::Lookup(k) => Need::Lookup(*k),
             BExpr::Bucket(inner, iv, off) => {
                 return match self.val(inner, i) {
-                    Val::Int(t) => Val::Int(iv.bucket(t, *off)),
+                    Val::Int(t) => iv.bucket(t, *off).map_or(Val::Null, Val::Int),
                     _ => Val::Null,
                 };
             }
@@ -408,8 +412,17 @@ fn may(f: &BFilter, oracle: &mut impl FnMut(&BExpr, &Test<Json>) -> bool) -> boo
     }
 }
 
-fn truncated(s: &str) -> bool {
-    s.len() + 4 > part::STAT_PREFIX
+/// Whether `a` is at most some string whose stored max is `s`. A stored
+/// max may be a cut prefix of the real one, and then only `a`'s first
+/// `s.len()` bytes can be compared.
+fn below_max(a: &str, s: &str, strict: bool) -> bool {
+    if s.len() + 4 > part::STAT_PREFIX {
+        a.as_bytes()[..a.len().min(s.len())] <= *s.as_bytes()
+    } else if strict {
+        a < s
+    } else {
+        a <= s
+    }
 }
 
 /// Whether a value in `[lo, hi]` may satisfy `t`. String bounds are
@@ -417,8 +430,7 @@ fn truncated(s: &str) -> bool {
 fn range_may(t: &Test<Json>, lo: &Stat, hi: &Stat) -> bool {
     let le = |a: &Json, s: &Stat| -> bool {
         match (a, s) {
-            (Json::String(a), Stat::Str(s)) if truncated(s) => part::stat_prefix(a) <= s.as_str(),
-            (Json::String(a), Stat::Str(s)) => a.as_str() <= s.as_str(),
+            (Json::String(a), Stat::Str(s)) => below_max(a, s, false),
             (Json::Number(_), Stat::Int(_) | Stat::Float(_)) => {
                 stat_val(s).total_cmp(&Val::from_json(a)) != Ordering::Less
             }
@@ -448,8 +460,7 @@ fn range_may(t: &Test<Json>, lo: &Stat, hi: &Stat) -> bool {
     };
     let gt_strict = |a: &Json, s: &Stat| -> bool {
         match (a, s) {
-            (Json::String(a), Stat::Str(s)) if truncated(s) => part::stat_prefix(a) <= s.as_str(),
-            (Json::String(a), Stat::Str(s)) => s.as_str() > a.as_str(),
+            (Json::String(a), Stat::Str(s)) => below_max(a, s, true),
             (Json::Number(_), Stat::Int(_) | Stat::Float(_)) => {
                 stat_val(s).total_cmp(&Val::from_json(a)) == Ordering::Greater
             }
@@ -951,12 +962,12 @@ impl Run<'_> {
                 indexes.insert(*id, (meta.cols[ci].phys, rd.index(r, meta, ci).await?));
             }
         }
-        let mut paths: BTreeMap<String, (bool, Arc<part::ColIndex>)> = BTreeMap::new();
+        let mut paths: BTreeMap<(u32, String), (bool, Arc<part::ColIndex>)> = BTreeMap::new();
         let mut pkeys = BTreeSet::new();
         collect_paths(&self.plan.filter, &mut pkeys);
         for (id, key) in pkeys {
             if let Some(ci) = meta.find(&ColRef::Path { col: id, key: key.clone() }) {
-                paths.insert(key, (meta.cols[ci].json, rd.index(r, meta, ci).await?));
+                paths.insert((id, key), (meta.cols[ci].json, rd.index(r, meta, ci).await?));
             }
         }
         let sort_ids = meta.sort_ids.clone();
@@ -1016,7 +1027,7 @@ impl Run<'_> {
                         }
                         None => true,
                     },
-                    BExpr::Path(_, _, key) => match paths.get(key) {
+                    BExpr::Path(id, _, key) => match paths.get(&(*id, key.clone())) {
                         Some((false, idx)) => stat(&idx.stats[g]),
                         Some((true, idx)) => idx.stats[g].min.is_some(),
                         None => true,
@@ -1192,8 +1203,24 @@ async fn lookup_maps(
     limits: &Limits,
 ) -> Result<Vec<(String, Arc<DetHashMap<Vec<u8>, Val>>)>> {
     let mut out = Vec::new();
+    let mut budget = limits.lookup_max_bytes;
+    let mut tables: BTreeMap<&str, Arc<(crate::table::schema::TableSchema, Vec<Row>)>> = BTreeMap::new();
     for (name, l) in &q.lookups {
-        let (ts, rows) = crate::table::rows_within(txn, &l.table, limits.lookup_max_bytes).await?;
+        let table = match tables.get(l.table.as_str()) {
+            Some(t) => t.clone(),
+            None => {
+                let t = Arc::new(crate::table::rows_within(txn, &l.table, &mut budget).await.map_err(|e| match e {
+                    Error::TooLarge(_) => Error::TooLarge(format!(
+                        "the query's lookup tables exceed {} bytes",
+                        limits.lookup_max_bytes
+                    )),
+                    e => e,
+                })?);
+                tables.insert(&l.table, t.clone());
+                t
+            }
+        };
+        let (ts, rows) = (&table.0, &table.1);
         if ts.primary_key.len() != 1 {
             return Err(Error::invalid(format!("lookup table {:?} needs a single-column primary key", l.table)));
         }
@@ -1203,7 +1230,7 @@ async fn lookup_maps(
             .map(|c| c.id)
             .ok_or_else(|| Error::invalid(format!("lookup table {:?} has no column {:?}", l.table, l.value)))?;
         let mut map = DetHashMap::default();
-        for r in &rows {
+        for r in rows {
             let k = r.get(&key_id).map_or(Val::Null, datum_val);
             let v = r.get(&val_id).map_or(Val::Null, datum_val);
             map.insert(k.canonical_bytes(), v);
@@ -1451,7 +1478,7 @@ fn second_stage(
             BExpr::Out(i) => row[*i].clone(),
             BExpr::Bucket(inner, iv, off) => match inner.as_ref() {
                 BExpr::Out(i) => match &row[*i] {
-                    Val::Int(t) => Val::Int(iv.bucket(*t, *off)),
+                    Val::Int(t) => iv.bucket(*t, *off).map_or(Val::Null, Val::Int),
                     _ => Val::Null,
                 },
                 _ => Val::Null,

@@ -871,19 +871,18 @@ fn decode_stored_row(s: &TableSchema, prefix: &[u8], it: &ReadValue) -> Result<(
 }
 
 /// Every row of table `name` with its schema, read into the transaction's
-/// read set, stopping with `TooLarge` past `max_bytes` of stored rows.
-pub(crate) async fn rows_within(txn: &mut Txn, name: &str, max_bytes: usize) -> Result<(TableSchema, Vec<Row>)> {
+/// read set. Their stored bytes are charged to `budget`, failing with
+/// `TooLarge` once it runs out.
+pub(crate) async fn rows_within(txn: &mut Txn, name: &str, budget: &mut usize) -> Result<(TableSchema, Vec<Row>)> {
     let s = get_schema(txn, name).await?;
     let prefix = table_prefix(SPACE_ROWS, s.id);
     let mut out = Vec::new();
-    let mut bytes = 0;
     let mut pages = Pages::new(KeyRange::prefix(&prefix));
     while let Some(page) = pages.next(txn).await? {
         for it in &page {
-            bytes += it.key.len() + it.value.size();
-            if bytes > max_bytes {
-                return Err(Error::TooLarge(format!("table {name:?} exceeds the lookup limit of {max_bytes} bytes")));
-            }
+            *budget = budget.checked_sub(it.key.len() + it.value.size()).ok_or_else(|| {
+                Error::TooLarge(format!("table {name:?} does not fit in the lookup limit"))
+            })?;
             out.push(decode_stored_row(&s, &prefix, it)?.1);
         }
     }

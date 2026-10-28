@@ -372,16 +372,25 @@ fn days_in_month(y: i64, m: u32) -> u32 {
 }
 
 /// Converts a JSON value to a datum of column `c`'s type.
+/// Times an event table stores, in milliseconds: years 0000 to 9999, which
+/// RFC 3339 can express.
+pub const TIME_RANGE: std::ops::RangeInclusive<i64> = -62_167_219_200_000..=253_402_300_799_999;
+
 pub fn datum(c: &EvColumn, v: &Json) -> Result<Datum> {
     if v.is_null() {
         return Ok(Datum::Null);
     }
     let bad = || Error::invalid(format!("column {:?} expects {}, got {v}", c.name, c.ty.name()));
     Ok(match c.ty {
-        EvType::Time => match v {
-            Json::String(s) => Datum::Int(parse_rfc3339(s).ok_or_else(bad)?),
-            _ => Datum::Int(v.as_i64().ok_or_else(bad)?),
-        },
+        EvType::Time => {
+            let t = match v {
+                Json::String(s) => parse_rfc3339(s),
+                _ => v.as_i64(),
+            };
+            Datum::Int(t.filter(|t| TIME_RANGE.contains(t)).ok_or_else(|| {
+                Error::invalid(format!("column {:?} expects a time in years 0000 to 9999, got {v}", c.name))
+            })?)
+        }
         EvType::String => Datum::Str(v.as_str().ok_or_else(bad)?.to_string()),
         EvType::Int => Datum::Int(v.as_i64().ok_or_else(bad)?),
         EvType::Float => {

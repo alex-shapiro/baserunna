@@ -41,9 +41,13 @@ impl Interval {
         })
     }
 
-    /// The start of the bucket holding `t`, in a fixed offset of `offset_ms` from UTC.
-    pub fn bucket(&self, t: i64, offset_ms: i64) -> i64 {
-        use super::schema::{Granularity, bucket_of, bucket_span};
+    /// The start of the bucket holding `t`, in a fixed offset of `offset_ms` from UTC,
+    /// or `None` for a `t` outside [`TIME_RANGE`](super::schema::TIME_RANGE).
+    pub fn bucket(&self, t: i64, offset_ms: i64) -> Option<i64> {
+        use super::schema::{Granularity, TIME_RANGE, bucket_of, bucket_span};
+        if !TIME_RANGE.contains(&t) {
+            return None;
+        }
         let local = t + offset_ms;
         let start = match *self {
             Interval::Fixed(w) => local.div_euclid(w) * w,
@@ -56,7 +60,7 @@ impl Interval {
                 bucket_span(Granularity::Month, m.div_euclid(n) * n).0
             }
         };
-        start - offset_ms
+        Some(start - offset_ms)
     }
 
     /// Whether every bucket of `self` lies within one bucket of `coarser`.
@@ -574,11 +578,12 @@ mod tests {
     fn intervals_bucket_and_divide() {
         let d = Interval::parse("1d").unwrap();
         assert_eq!(d, Interval::Fixed(86_400_000));
-        assert_eq!(d.bucket(86_400_000 + 5, 0), 86_400_000);
-        assert_eq!(d.bucket(-1, 0), -86_400_000);
-        assert_eq!(d.bucket(86_400_000 - 3_600_000, 3_600_000), 86_400_000 - 3_600_000, "a local midnight");
-        assert_eq!(Interval::parse("1mo").unwrap().bucket(31 * 86_400_000 + 1, 0), 31 * 86_400_000);
-        assert_eq!(Interval::parse("1w").unwrap().bucket(0, 0), -3 * 86_400_000, "weeks start on Monday");
+        assert_eq!(d.bucket(86_400_000 + 5, 0), Some(86_400_000));
+        assert_eq!(d.bucket(-1, 0), Some(-86_400_000));
+        assert_eq!(d.bucket(i64::MIN, 3_600_000), None);
+        assert_eq!(d.bucket(86_400_000 - 3_600_000, 3_600_000), Some(86_400_000 - 3_600_000), "a local midnight");
+        assert_eq!(Interval::parse("1mo").unwrap().bucket(31 * 86_400_000 + 1, 0), Some(31 * 86_400_000));
+        assert_eq!(Interval::parse("1w").unwrap().bucket(0, 0), Some(-3 * 86_400_000), "weeks start on Monday");
         assert!(Interval::parse("1h").unwrap().divides(&d));
         assert!(!Interval::parse("7h").unwrap().divides(&d));
         for bad in ["", "d", "0d", "1y", "1.5h"] {

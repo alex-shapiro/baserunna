@@ -483,7 +483,7 @@ fn get_bitmap(r: &mut Reader<'_>, n: usize) -> DResult<Vec<bool>> {
 
 /// Encodes the values of a block. Strings are coded with `dict` when the
 /// column has a part-level dictionary.
-fn encode_block(v: &Vector, dict: Option<&BTreeMap<&str, u32>>) -> Vec<u8> {
+fn encode_block(v: &Vector, dict: Option<&BTreeMap<&str, u32>>) -> Result<Vec<u8>> {
     let n = v.len();
     let mut w = Writer::with_capacity(n * 4 + 16);
     w.varint(n as u64);
@@ -532,7 +532,11 @@ fn encode_block(v: &Vector, dict: Option<&BTreeMap<&str, u32>>) -> Vec<u8> {
                     _ => 4,
                 };
                 w.u8(width);
-                let map: Vec<u32> = s.dict.iter().map(|x| d.get(x.as_str()).copied().unwrap_or(0)).collect();
+                let map: Vec<u32> = s
+                    .dict
+                    .iter()
+                    .map(|x| d.get(x.as_str()).copied().ok_or_else(|| Error::internal("a string is missing from its column's dictionary")))
+                    .collect::<Result<_>>()?;
                 for c in &s.codes {
                     let code = if *c == NULL_CODE { 0 } else { map[*c as usize] };
                     match width {
@@ -552,7 +556,7 @@ fn encode_block(v: &Vector, dict: Option<&BTreeMap<&str, u32>>) -> Vec<u8> {
             }
         },
     }
-    w.into_inner()
+    Ok(w.into_inner())
 }
 
 /// Decodes a block's values; `dict` is its column's part-level dictionary.
@@ -837,7 +841,7 @@ pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_
             pending.push(v);
             if pending_bytes >= block_bytes || g + 1 == granules.len() {
                 let block = Vector::concat(std::mem::take(&mut pending), plan.phys);
-                let raw = encode_block(&block, dict_map.as_ref());
+                let raw = encode_block(&block, dict_map.as_ref())?;
                 let off = sink.pos();
                 let mut framed = Vec::with_capacity(raw.len() + 16);
                 frame(&raw, Compression::Zstd(level), &mut framed);
@@ -1193,15 +1197,15 @@ pub(crate) mod tests {
                 (0..n).map(|_| opt(&mut r).then(|| words[r.usize(words.len())].as_str())).collect();
             let strs = Vector::Str(Strs::from_values(strs));
             for v in [ints, floats, bools] {
-                assert_eq!(decode_block(&encode_block(&v, None), v.phys(), None).unwrap(), v);
+                assert_eq!(decode_block(&encode_block(&v, None).unwrap(), v.phys(), None).unwrap(), v);
             }
             let Vector::Str(s) = &strs else { unreachable!() };
-            let back = decode_block(&encode_block(&strs, None), Phys::Str, None).unwrap();
+            let back = decode_block(&encode_block(&strs, None).unwrap(), Phys::Str, None).unwrap();
             let Vector::Str(b) = back else { panic!() };
             assert!((0..n).all(|i| b.get(i) == s.get(i)), "plain strings");
             let dict = Arc::new(words.clone());
             let map: BTreeMap<&str, u32> = dict.iter().enumerate().map(|(i, w)| (w.as_str(), i as u32)).collect();
-            let back = decode_block(&encode_block(&strs, Some(&map)), Phys::Str, Some(&dict)).unwrap();
+            let back = decode_block(&encode_block(&strs, Some(&map)).unwrap(), Phys::Str, Some(&dict)).unwrap();
             let Vector::Str(b) = back else { panic!() };
             assert!((0..n).all(|i| b.get(i) == s.get(i)), "dictionary strings");
         }
@@ -1248,7 +1252,7 @@ pub(crate) mod tests {
     fn fuzz_decoders_never_panic() {
         let mut r = Rng::new(31);
         let v = Vector::Int(vec![Some(1), None, Some(3)]);
-        let goods = [encode_block(&v, None)];
+        let goods = [encode_block(&v, None).unwrap()];
         for i in 0..20_000 {
             let mut d = goods[0].clone();
             if i % 3 == 0 {

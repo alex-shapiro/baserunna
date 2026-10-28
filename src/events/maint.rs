@@ -515,6 +515,8 @@ async fn merge_parts(
     let mut kinds = Vec::new();
     let mut feeds: Vec<Vec<Feed>> = Vec::new();
     let mut shared_out = BTreeMap::new();
+    let stored: BTreeMap<u32, super::agg::Val> =
+        super::build::stored_defaults(s).into_iter().map(|(id, d)| (id, super::exec::datum_val(&d))).collect();
     for c in &s.columns {
         let srcs: Vec<Option<usize>> = ins.iter().map(|i| i.meta.find(&ColRef::User(c.id))).collect();
         if srcs.iter().all(Option::is_none) {
@@ -522,7 +524,13 @@ async fn merge_parts(
         }
         if c.ty != EvType::Json {
             let dict = match c.ty {
-                EvType::String => union_dicts(&rd, &ins, &srcs).await?,
+                EvType::String => {
+                    let fill = match stored.get(&c.id) {
+                        Some(super::agg::Val::Str(f)) => Some(f.as_str()),
+                        _ => None,
+                    };
+                    union_dicts(&rd, &ins, &srcs, fill).await?
+                }
                 _ => None,
             };
             plans.push(ColPlan {
@@ -583,7 +591,7 @@ async fn merge_parts(
                     })
                     .collect();
                 if path_feeds.iter().all(|f| matches!(f, Feed::Col(_) | Feed::None)) {
-                    union_dicts(&rd, &ins, &srcs).await?
+                    union_dicts(&rd, &ins, &srcs, None).await?
                 } else {
                     None
                 }
@@ -640,8 +648,6 @@ async fn merge_parts(
     plans.push(ColPlan { cref: ColRef::Ordinal, phys: Phys::Int, json: false, dict: None, bloom: false });
     kinds.push(OutKind::Plain);
     feeds.push(vec![Feed::Ordinal; ins.len()]);
-    let stored: BTreeMap<u32, super::agg::Val> =
-        super::build::stored_defaults(s).into_iter().map(|(id, d)| (id, super::exec::datum_val(&d))).collect();
     let defaults: Vec<Option<super::agg::Val>> = plans
         .iter()
         .map(|p| match &p.cref {
@@ -696,10 +702,21 @@ async fn merge_parts(
     }))
 }
 
-/// The union of the inputs' dictionaries of a string column, if every
-/// input that has the column has one and the union stays small.
-async fn union_dicts(rd: &Reading<'_>, ins: &[Input], srcs: &[Option<usize>]) -> Result<Option<Arc<Vec<String>>>> {
+/// The union of the inputs' dictionaries of a string column, plus the
+/// `fill` that rows of inputs lacking the column take, if every input that
+/// has the column has a dictionary and the union stays small.
+async fn union_dicts(
+    rd: &Reading<'_>,
+    ins: &[Input],
+    srcs: &[Option<usize>],
+    fill: Option<&str>,
+) -> Result<Option<Arc<Vec<String>>>> {
     let mut all: Vec<Arc<Vec<String>>> = Vec::new();
+    if let Some(f) = fill
+        && srcs.iter().any(Option::is_none)
+    {
+        all.push(Arc::new(vec![f.to_string()]));
+    }
     for (inp, ci) in ins.iter().zip(srcs) {
         let Some(ci) = ci else { continue };
         if inp.meta.cols[*ci].phys != Phys::Str {

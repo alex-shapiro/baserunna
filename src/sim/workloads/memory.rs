@@ -1,10 +1,10 @@
-//! Simulation workload that exercises database eviction and admission control under a tight memory
-//! budget.
+//! Simulation workload that tests database unloading and fair transaction memory allocation under
+//! a tight memory budget (SPEC §5.12).
 //!
 //! Concurrent workers write to database tails, long-poll change feeds across database unloads, and
-//! hold large interactive transaction write sets. Each transaction holder is a separate user, and a
-//! hog user keeps as many large transactions open as it is allowed to, so holders verify that the
-//! hog cannot keep them from the memory budget (SPEC §5.12).
+//! hold interactive transactions with large write sets. A separate heavy user keeps open as many
+//! large transactions as the budget allows, while other users verify that their interactive
+//! transactions are admitted within [`MEMORY_REFUSAL_MAX_MS`].
 
 use super::super::Sim;
 use super::super::SimConfig;
@@ -116,31 +116,29 @@ async fn long_poll_worker(c: Client, db: String, rounds: usize) -> Result<(), St
     Ok(())
 }
 
-/// Longest a user below its fair share may be refused for memory: long enough for idle databases to
-/// be unloaded, and shorter than the hog keeps any transaction open.
+/// Maximum duration a user with 0 open transactions can be rejected for memory pressure before the
+/// workload fails.
 const MEMORY_REFUSAL_MAX_MS: u64 = 20_000;
 
 fn is_memory_refusal(r: &super::super::client::Resp) -> bool {
     r.status == 503 && r.json["error"]["message"].as_str().is_some_and(|m| m.contains("memory budget"))
 }
 
-/// Pads that put about 80 KiB in a transaction's write set. Values below the inline limit remain
-/// in the in-memory write set rather than being staged as blobs.
-fn pads(c: &Client) -> Vec<Json> {
+/// Builds ~80 KiB of `put` operations with values below `value_inline_max` so that the data is kept
+/// in the in-memory write set instead of staged as blobs.
+fn padding_ops(c: &Client) -> Vec<Json> {
     let inline = c.sim.cfg.engine.value_inline_max - 16;
     (0..80 * 1024 / inline)
         .map(|i| json!({"op": "put", "key": format!("pad{i}"), "value": "p".repeat(inline)}))
         .collect()
 }
 
-/// Keeps up to `max_open` transactions of about 80 KiB open on `db` until `until_ms`, touching each
-/// before it idles out and replacing any that the node aborts.
 async fn hog_worker(c: Client, db: String, max_open: usize, until_ms: u64) -> Result<(), String> {
     let base = format!("/v1/dbs/{db}/transactions");
     let mut open: Vec<String> = Vec::new();
     while c.sim.now_ms() < until_ms {
         if open.len() < max_open {
-            match c.call("POST", &base, Some(json!({"ops": pads(&c)}))).await {
+            match c.call("POST", &base, Some(json!({"ops": padding_ops(&c)}))).await {
                 Ok(r) if r.status == 201 => open.push(r.json["txn_id"].as_str().unwrap_or("").to_string()),
                 Ok(r) if r.status == 503 || r.status == 429 || r.status == 409 || r.status == 404 => {}
                 Ok(r) => return Err(format!("hog begin {db}: {} {}", r.status, r.json)),
@@ -186,7 +184,7 @@ async fn interactive_txn_worker(
                     let since = *refused_since.get_or_insert(c.sim.now_ms());
                     if c.sim.now_ms() - since > MEMORY_REFUSAL_MAX_MS {
                         return Err(format!(
-                            "{db}: a user with no open transactions was refused for memory: {}",
+                            "{db}: a user with 0 open transactions was rejected for memory pressure: {}",
                             r.json
                         ));
                     }
@@ -208,7 +206,7 @@ async fn interactive_txn_worker(
         let key = format!("t{}", round % 3);
         let v = random_value(&c, &format!("{db}-{round}"));
         let mut ops = vec![json!({"op": "put", "key": key, "value": v})];
-        ops.extend(pads(&c));
+        ops.extend(padding_ops(&c));
         let ops = json!({"ops": ops});
         let added = match c.call("POST", &format!("{base}/{id}/ops"), Some(ops)).await {
             Ok(r) if r.status == 200 || r.status == 503 || r.status == 404 => r.status == 200,

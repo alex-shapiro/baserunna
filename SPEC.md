@@ -715,14 +715,12 @@ Each node enforces a memory budget (`BASERUNNA_DB_MEMORY_MB`, default 256 MiB) a
 
 If memory usage exceeds the budget, the node unloads the least recently used idle databases until usage drops to 7/8 of the budget. Unloading drops the cached manifest while retaining the database handle, so active long-poll and SSE watchers do not prevent eviction, and the next request reloads the manifest with a single `GET`. A database is idle if it has 0 in-flight manifest reads, manifest writes, commits, or background tasks. Local lease state is preserved across unloads so that a lease holder resumes serving strong reads from memory after reloading the manifest.
 
-If memory usage remains above the budget after unloading all idle databases, the memory left for interactive transactions is shared max-min fairly between users, so that one user's transactions cannot lock other users out of a node:
+If memory usage remains above the budget after all idle databases are unloaded, the node allocates the remaining budget across users by max-min fair sharing for interactive transactions:
 
-- A user holding less than its fair share may begin a transaction or run transaction operations. A user at or above its fair share is refused with a retryable `503`, and the transaction is left as it was. A user's fair share is the largest amount that fits in the budget when every user holding less keeps what it holds.
-- The share is checked again each time a transaction grows by another 1/1024 of the budget, so neither one large request nor many concurrent requests can carry a user past its share by more than that per request. A request refused as it grows aborts the transaction, like any failed operations request.
-- To make room for an admitted user, the node aborts idle transactions of the users furthest above their fair share, least recently used first, until usage is back within the budget. A transaction is aborted only if this brings its user closer to its fair share, so a user that grew just past its share keeps its transaction.
-- A user's transactions hold their read sets and write sets, and an equal share, among the transactions reading it, of any manifest version that only transactions keep loaded.
-
-A request on a transaction the node aborted fails with a retryable `404 txn_not_found` that says why it was aborted.
+- A user's transaction memory usage is the sum of its transactions' read sets, write sets, and an equal share of each non-current manifest version pinned by those transactions.
+- A user's fair share is the maximum per-user allocation that fits in the remaining budget if each user below that allocation retains its current usage.
+- If a user is at or above its fair share, the node rejects transaction `begin` and `ops` requests with a retryable `503`. The node rechecks the user's share each time a transaction grows by 1/1024 of the budget.
+- If a user is below its fair share, the node admits the request and aborts the least recently used idle transactions of the users with the highest usage until total usage is within the budget. A transaction is aborted only if doing so moves its user's usage closer to the fair share.
 
 Single-request transactions, interactive transaction commits, and interactive transaction aborts are always admitted so that in-flight work can finish and release memory. Each user is limited to 100 concurrent open interactive transactions per node.
 
@@ -781,16 +779,18 @@ Single-request transactions, interactive transaction commits, and interactive tr
    server-side.
 2. **Interactive** (`/v1/dbs/{db}/transactions…`): begin, ops, commit,
    abort. `begin` and `commit` also accept `ops`, so a read-write transaction
-   can be executed in two requests. An `ops` request that fails or is
-   cancelled aborts the transaction, because some of its ops may have been
-   applied; a retryable failure is reported as `404 txn_not_found`, so that
-   the client restarts the transaction instead of retrying the request. Because a serializable transaction can begin
+   can be executed in two requests. If an `ops` request fails or is canceled,
+   the node aborts the transaction because partial operations may have been
+   applied; retryable failures return `404 txn_not_found` so that the client
+   restarts the transaction. Because a serializable transaction can begin
    while a commit is in flight (§5.5), a read-only transaction must be
-   committed to validate its read set. Transaction state is stored on a database's owner node. If the
-   owner changes or crashes, or the node aborts it to free memory for other
-   users (§5.12), the transaction is lost (`404 txn_not_found`) with no data
-   committed. `begin` returns the transaction's `commit_id` up
-   front, and `commit` the seqs its appends received.
+   committed to validate its read set. Transaction state is stored on the
+   database's owner node. If the owner changes or crashes, or if the node
+   aborts the transaction for timeout or memory pressure (§5.12), uncommitted
+   writes are discarded and subsequent requests return a retryable
+   `404 txn_not_found` with the abort reason. `begin` returns the transaction's
+   `commit_id` up front, and `commit` returns the sequence numbers assigned to
+   its appends.
 
 **Resolving ambiguity.** A `503` response with `outcome: "unknown"`, or a lost
 response, indicates that a commit may or may not have been applied. To resolve
@@ -1385,7 +1385,7 @@ Workloads run concurrently with a shared chaos loop (`ChaosPhase`). When all act
 - `lifecycle`: Database creation, mutation, deletion, and recreation across node crashes, verifying background storage purge and per-owner database counters.
 - `console`: Exercises all web console pages, verifying CSRF protection, HTML escaping, multipart uploads, safe attachment headers, pagination, and account/org/admin flows.
 - `api_tour`: Exercises schema drop endpoints, transaction aborts, commit status lookup by idempotency key, and admin metrics endpoints.
-- `memory`: Exercises many databases under a tight memory budget while long-poll requests wait on unloaded databases, several users hold interactive transactions with large write sets, and one user keeps as many open as it can. Verifies that strong reads return all settled writes, long-poll requests observe expected writes, and a user with no open transactions is never refused for memory for more than 20 s.
+- `memory`: Exercises many databases under a tight memory budget while long-poll requests wait on unloaded databases and multiple users hold interactive transactions with large write sets. Verifies that strong reads return all settled writes, long-poll requests observe expected writes, and a heavy user cannot starve other users of transaction memory for more than 20 s.
 - `mix`: Runs a random combination of at least two workloads concurrently in a shared cluster and chaos loop.
 
 Every 20 ms of virtual time, global oracles verify that at most 1 node relies on a lease for any database and that any node relying on a lease without an in-flight manifest write holds the latest manifest version in the store. At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, and stream chunks are intact and consistent. After a node shuts down gracefully, the simulator verifies that none of the released databases in storage have a lease held by that node.
@@ -1400,7 +1400,7 @@ Every 20 ms of virtual time, global oracles verify that at most 1 node relies on
 ### 13.5 Other test layers
 
 - **Unit tests** in each module.
-- **Property tests** using the in-crate generator and shrinker (`src/util/prop.rs`): verifies codec round trips, tuple ordering, segment building and reading, LSM-tree operations and change feeds against a reference model, stream operations and filters, table and index operations, range tombstone fragmentation, max-min fair sharing of the node memory budget, base64/varint/bloom filters, and metadata access-control state machines.
+- **Property tests** using the in-crate generator and shrinker (`src/util/prop.rs`): verifies codec round trips, tuple ordering, segment building and reading, LSM-tree operations and change feeds against a reference model, stream operations and filters, table and index operations, range tombstone fragmentation, max-min fair memory allocation, base64/varint/bloom filters, and metadata access-control state machines.
 - **Fuzz tests**: feeds arbitrary and mutated byte inputs to all binary and text decoders and random JSON requests to the HTTP router, verifying that arbitrary inputs do not cause panics or `500` responses.
 - **Transaction-op fuzzing** (`sim/txn_fuzz.rs`): generates random single-request and interactive transactions (including malformed operations) and compares every response against an independent transaction model.
 - **OpenAPI conformance**: validates every simulated HTTP response against `openapi.json` and verifies that `openapi.json` matches the router and generated specification.

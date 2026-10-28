@@ -23,11 +23,12 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       executed by the peer's previous process (`sim_tool trace tables 7344`).
       Execute locally only if the forward was sent once; otherwise return
       `outcome: "unknown"`.
-- [ ] **Fix `db_churn` seed 202681: a read finds no database the workload
-      expects to exist.** A client's `get` returns `404 not_found` for a
-      database under churn (`sim_tool trace db_churn 202681`).
-- [ ] **Fix `streams` seed 202835: a stream keeps records past its
-      retention.** The workload sees records older than `retention_ms`
+- [ ] **Fix `db_churn` seed 202681: `GET` returns `404 not_found` for an
+      existing database.** During database churn, a `get` operation returns
+      `404 not_found` for a database that was created and not deleted
+      (`sim_tool trace db_churn 202681`).
+- [ ] **Fix `streams` seed 202835: expired stream records are returned after
+      `retention_ms`.** Stream reads return records older than `retention_ms`
       (`sim_tool trace streams 202835`).
 - [ ] **Abort open interactive transactions if a database is deleted.**
       Interactive transactions on a deleted database currently remain open

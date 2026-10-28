@@ -6202,7 +6202,7 @@
     },
     "/v1/dbs/{db}/transactions/{id}/ops": {
       "post": {
-        "description": "Any error, or a cancelled request, aborts the transaction. Retryable errors are reported as `404 txn_not_found`: restart the transaction.",
+        "description": "If an error occurs or the request is canceled, the transaction is aborted. Retryable errors return `404 txn_not_found` so that the caller restarts the transaction.",
         "parameters": [
           {
             "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",

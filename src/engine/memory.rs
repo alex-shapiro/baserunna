@@ -1,5 +1,5 @@
-//! Per-node memory accounting for open databases and active transactions, and fair sharing of the
-//! budget between the holders of interactive transactions (SPEC §5.12).
+//! Per-node memory accounting and max-min fair allocation across users for interactive
+//! transactions (SPEC §5.12).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -77,8 +77,8 @@ impl Charge {
         self.bytes
     }
 
-    /// Returns a counter that reads this charge's current size, and 0 once it is dropped, without
-    /// access to the charge itself.
+    /// Returns a shared atomic counter that tracks the charged byte count and resets to 0 when this
+    /// [`Charge`] is dropped.
     pub fn meter(&mut self) -> Arc<AtomicUsize> {
         let bytes = self.bytes;
         self.meter.get_or_insert_with(|| Arc::new(AtomicUsize::new(bytes))).clone()
@@ -105,29 +105,29 @@ impl Drop for Charge {
     }
 }
 
-/// Decides whether a transaction may keep growing the memory it holds. A transaction with a gate
-/// asks it again each time its charge grows by another [`MemoryGate::chunk`] bytes.
+/// Admission check for incremental transaction memory growth.
 pub trait MemoryGate: Send + Sync {
-    /// Returns an error if the transaction must stop growing.
+    /// Returns an error if additional memory growth is rejected.
     fn admit(&self) -> crate::error::Result<()>;
 
-    /// Bytes a transaction may grow between checks.
-    fn chunk(&self) -> usize;
+    /// Byte increment between admission checks.
+    fn step_bytes(&self) -> usize;
 }
 
-/// Memory held by one open interactive transaction, attributed to the user who holds it.
+/// Memory usage of an open interactive transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Held<K> {
     pub holder: K,
     pub bytes: usize,
-    /// Whether the transaction can be aborted now, i.e. no request is using it.
+    /// True if the transaction is idle and can be aborted to reclaim memory.
     pub evictable: bool,
 }
 
-/// The largest per-holder allowance `L` such that granting `L` to a holder with unbounded demand,
-/// and `min(d, L)` to every holder with demand `d` in `others`, fits in `available` bytes: the
-/// max-min fair share of a holder that asks for more.
-pub fn fair_level(mut available: usize, mut others: Vec<usize>) -> usize {
+/// Computes the max-min fair share of `available` bytes for a requester, given the byte usage of
+/// all other holders in `others`.
+///
+/// Returns the largest allowance `L` such that `L + sum(min(d, L) for d in others) <= available`.
+pub fn fair_share(mut available: usize, mut others: Vec<usize>) -> usize {
     others.sort_unstable();
     let mut claimants = others.len() + 1;
     for d in others {
@@ -140,17 +140,15 @@ pub fn fair_level(mut available: usize, mut others: Vec<usize>) -> usize {
     available / claimants
 }
 
-/// Decides whether `requester` may grow the memory its interactive transactions hold while node
-/// memory usage `used` exceeds `budget`, given the memory `held` by every open interactive
-/// transaction in the order they should be evicted.
+/// Checks whether `requester` can allocate transaction memory when total node memory `used`
+/// exceeds `budget`, given the open transactions in `held` ordered by eviction priority.
 ///
-/// Memory not held by transactions is set aside, and the rest of the budget is shared max-min
-/// fairly between holders. A requester at or above its fair share is refused with `None`. A
-/// requester below it is admitted, and the returned indices of `held` name the transactions to
-/// abort so that usage returns to the budget: transactions of the holders furthest above the fair
-/// share, in `held` order, skipping any whose abort would leave its holder further below the fair
-/// share than it was above it. A holder that only grew while below its fair share therefore keeps
-/// its transactions, even though its last growth may have taken it just past the share.
+/// Bytes not tracked in `held` are deducted from `budget`, and the remainder is divided among
+/// holders by [`fair_share`]. If `requester` uses at least its fair share, returns `None`.
+/// Otherwise, returns the indices in `held` of evictable transactions to abort until `used` is
+/// within `budget`. In each step, the earliest evictable transaction of the holder with the
+/// largest usage is selected, provided that aborting it moves that holder's usage closer to the
+/// fair share.
 pub fn fair_admission<K: Ord>(budget: usize, used: usize, requester: &K, held: &[Held<K>]) -> Option<Vec<usize>> {
     let mut usage: BTreeMap<&K, usize> = BTreeMap::new();
     for h in held {
@@ -159,8 +157,8 @@ pub fn fair_admission<K: Ord>(budget: usize, used: usize, requester: &K, held: &
     let untracked = used.saturating_sub(usage.values().sum());
     let mine = usage.get(requester).copied().unwrap_or(0);
     let others = usage.iter().filter(|(k, _)| **k != requester).map(|(_, u)| *u).collect();
-    let level = fair_level(budget.saturating_sub(untracked), others);
-    if mine >= level {
+    let share = fair_share(budget.saturating_sub(untracked), others);
+    if mine >= share {
         return None;
     }
     let mut candidates: BTreeMap<&K, Vec<usize>> = BTreeMap::new();
@@ -174,7 +172,7 @@ pub fn fair_admission<K: Ord>(budget: usize, used: usize, requester: &K, held: &
     while excess > 0 {
         let mut victim: Option<(&K, usize)> = None;
         for (k, txns) in &candidates {
-            let over = usage[k].saturating_sub(level).saturating_mul(2);
+            let over = usage[k].saturating_sub(share).saturating_mul(2);
             let Some(pos) = txns.iter().position(|&i| held[i].bytes < over) else { continue };
             if victim.is_none_or(|(v, _)| usage[k] > usage[v]) {
                 victim = Some((k, pos));
@@ -234,16 +232,16 @@ mod tests {
     }
 
     #[test]
-    fn fair_level_splits_what_light_holders_leave() {
-        assert_eq!(fair_level(300, vec![]), 300);
-        assert_eq!(fair_level(300, vec![500, 500]), 100);
-        assert_eq!(fair_level(300, vec![20, 500]), 140);
-        assert_eq!(fair_level(300, vec![20, 30]), 250);
-        assert_eq!(fair_level(0, vec![1]), 0);
+    fn fair_share_splits_remaining_budget() {
+        assert_eq!(fair_share(300, vec![]), 300);
+        assert_eq!(fair_share(300, vec![500, 500]), 100);
+        assert_eq!(fair_share(300, vec![20, 500]), 140);
+        assert_eq!(fair_share(300, vec![20, 30]), 250);
+        assert_eq!(fair_share(0, vec![1]), 0);
     }
 
     #[test]
-    fn an_under_share_holder_is_admitted_by_evicting_the_heaviest_holder_least_recent_first() {
+    fn fair_admission_evicts_lru_from_heaviest_holder() {
         let h = |holder: &'static str, bytes, evictable| Held { holder, bytes, evictable };
         let held = [h("hog", 50, true), h("hog", 100, false), h("small", 30, true), h("hog", 80, true)];
         assert_eq!(fair_admission(200, 300, &"new", &held), Some(vec![0, 3]));
@@ -286,36 +284,29 @@ mod tests {
         u
     }
 
-    /// The fair level is the largest allowance that fits when every other holder keeps what it holds
-    /// up to that allowance.
     #[test]
-    fn prop_fair_level_is_the_largest_allowance_that_fits() {
+    fn prop_fair_share_is_max_feasible_allowance() {
         prop::check(
-            "fair_level_is_the_largest_allowance_that_fits",
+            "fair_share_is_max_feasible_allowance",
             3_000,
             |r| (r.usize(2_000), (0..r.usize(8)).map(|_| r.usize(600)).collect::<Vec<usize>>()),
             |(a, d)| prop::shrink_vec(d).into_iter().map(|d| (*a, d)).collect(),
             |(available, others)| {
                 let fits = |l: usize| l + others.iter().map(|d| (*d).min(l)).sum::<usize>() <= *available;
                 let best = (0..=*available).rev().find(|l| fits(*l)).unwrap_or(0);
-                let got = fair_level(*available, others.clone());
+                let got = fair_share(*available, others.clone());
                 if got != best {
-                    return Err(format!("fair level {got}, largest allowance that fits {best}"));
+                    return Err(format!("fair share {got}, largest allowance that fits {best}"));
                 }
                 Ok(())
             },
         );
     }
 
-    /// Whether aborting a transaction of `bytes` moves a holder of `usage` closer to `level`.
-    fn closer(usage: usize, level: usize, bytes: usize) -> bool {
-        usage > level && bytes < 2 * (usage - level)
+    fn moves_closer_to_share(usage: usize, share: usize, bytes: usize) -> bool {
+        usage > share && bytes < 2 * (usage - share)
     }
 
-    /// A requester is admitted exactly when it holds less than its fair share. Admission evicts only
-    /// idle transactions of other holders whose eviction moves them closer to the fair share, each
-    /// from the heaviest such holder, in eviction order, and stops as soon as usage is back within
-    /// the budget or no such transaction is left.
     #[test]
     fn prop_admission_is_max_min_fair() {
         prop::check("admission_is_max_min_fair", 5_000, gen_case, shrink_case, |c| {
@@ -324,15 +315,15 @@ mod tests {
             let mut usage = usage(&c.held);
             let mine = usage.get(&c.requester).copied().unwrap_or(0);
             let others = usage.iter().filter(|(k, _)| **k != c.requester).map(|(_, u)| *u).collect();
-            let level = fair_level(c.budget.saturating_sub(c.untracked), others);
+            let share = fair_share(c.budget.saturating_sub(c.untracked), others);
             let Some(evicted) = fair_admission(c.budget, used, &c.requester, &c.held) else {
-                return match mine >= level {
+                return match mine >= share {
                     true => Ok(()),
-                    false => Err(format!("refused a requester holding {mine} below the fair level {level}")),
+                    false => Err(format!("refused a requester holding {mine} below the fair share {share}")),
                 };
             };
-            if mine >= level {
-                return Err(format!("admitted a requester holding {mine} at or above the fair level {level}"));
+            if mine >= share {
+                return Err(format!("admitted a requester holding {mine} at or above the fair share {share}"));
             }
             let mut excess = used.saturating_sub(c.budget);
             let mut taken = std::collections::BTreeSet::new();
@@ -341,7 +332,7 @@ mod tests {
                     .iter()
                     .enumerate()
                     .filter(|(j, e)| e.evictable && e.holder != c.requester && !taken.contains(j))
-                    .filter(|(_, e)| closer(usage[&e.holder], level, e.bytes))
+                    .filter(|(_, e)| moves_closer_to_share(usage[&e.holder], share, e.bytes))
                     .map(|(j, _)| j)
                     .collect::<Vec<usize>>()
             };
@@ -349,7 +340,7 @@ mod tests {
                 let h = c.held.get(i).ok_or("evicted a transaction that does not exist")?;
                 let eligible = open(&taken, &usage);
                 if !eligible.contains(&i) {
-                    return Err(format!("evicted ineligible {h:?} (index {i}), level {level}, usage {usage:?}"));
+                    return Err(format!("evicted ineligible {h:?} (index {i}), share {share}, usage {usage:?}"));
                 }
                 if excess == 0 {
                     return Err(format!("eviction {n} came after usage was back within the budget"));
@@ -372,13 +363,10 @@ mod tests {
         });
     }
 
-    /// A hog that filled the budget alone is trimmed, as soon as another holder asks for memory,
-    /// to the budget or to within half of a transaction of its fair share, while the hog itself is
-    /// refused.
     #[test]
-    fn prop_light_holder_reclaims_budget_from_hog() {
+    fn prop_new_holder_reclaims_budget_from_heavy_holder() {
         prop::check(
-            "light_holder_reclaims_budget_from_hog",
+            "new_holder_reclaims_budget_from_heavy_holder",
             2_000,
             |r| {
                 let hog: Vec<usize> = (0..1 + r.usize(12)).map(|_| 1 + r.usize(200)).collect();
@@ -394,13 +382,13 @@ mod tests {
                     return Err("admitted the only holder while over budget".into());
                 }
                 let evicted =
-                    fair_admission(*budget, used(&held), &0, &held).ok_or("refused a holder with no memory")?;
+                    fair_admission(*budget, used(&held), &0, &held).ok_or("rejected a holder with 0 bytes")?;
                 let mut i = 0;
                 held.retain(|_| (!evicted.contains(&i), i += 1).0);
                 let (left, largest) = (used(&held), held.iter().map(|h| h.bytes).max().unwrap_or(0));
-                let level = fair_level(*budget, vec![left]);
-                if left > *budget && left > level + largest / 2 {
-                    return Err(format!("hog kept {left} over budget {budget} and fair level {level}"));
+                let share = fair_share(*budget, vec![left]);
+                if left > *budget && left > share + largest / 2 {
+                    return Err(format!("hog kept {left} over budget {budget} and fair share {share}"));
                 }
                 Ok(())
             },

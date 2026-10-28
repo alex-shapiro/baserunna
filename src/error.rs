@@ -9,8 +9,8 @@ pub enum Error {
     Unauthenticated(String),
     PermissionDenied(String),
     NotFound(String),
-    /// The interactive transaction does not exist on this node, or was aborted; restarting the
-    /// transaction may succeed.
+    /// The interactive transaction does not exist on this node or was aborted. Restarting the
+    /// transaction can succeed.
     TxnNotFound(String),
     /// Optimistic concurrency conflict; retrying the transaction may succeed.
     Conflict(String),

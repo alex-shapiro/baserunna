@@ -86,9 +86,9 @@ impl Shared {
         self.system.lock().unwrap_or_else(|e| e.into_inner()).contains(db)
     }
 
-    /// Returns true if memory usage is within the budget, unloading idle databases first if it is
-    /// not.
-    pub fn reclaim(&self) -> bool {
+    /// Unloads idle databases if memory usage exceeds the budget, and returns true if usage is
+    /// then within the budget.
+    pub fn reclaim_to_budget(&self) -> bool {
         if !self.memory.is_exceeded() {
             return true;
         }

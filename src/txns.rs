@@ -1,5 +1,5 @@
-//! Open interactive transactions on a node: the per-user limit on them, their expiry, and their
-//! fair share of the node memory budget (SPEC §5.12, §6.2).
+//! Per-node registry of open interactive transactions, enforcing per-user concurrency limits,
+//! idle and lifetime expiration, and max-min fair memory admission (SPEC §5.12, §6.2).
 
 use crate::engine::memory::{self, Held, MemoryGate};
 use crate::engine::{Engine, Txn, Version};
@@ -11,14 +11,14 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// Limits on the interactive transactions a node keeps open.
+/// Concurrency and timeout limits for open interactive transactions on a node.
 #[derive(Clone, Copy, Debug)]
 pub struct TxnLimits {
-    /// Most transactions one user may have open.
+    /// Maximum concurrent open transactions per user.
     pub per_user: usize,
-    /// A transaction no request has used for this long is aborted.
+    /// Idle timeout before an unused transaction is aborted.
     pub idle: Duration,
-    /// A transaction this old is aborted.
+    /// Maximum total lifetime before a transaction is aborted.
     pub lifetime: Duration,
 }
 
@@ -30,11 +30,12 @@ pub struct OpenTxn {
     pub encoding: Encoding,
     created: Instant,
     last_used: Mutex<Instant>,
-    /// Memory charged by the transaction's read and write sets (see [`Txn::meter`]).
+    /// Bytes charged to the transaction's read and write sets (see [`Txn::meter`]).
     memory: Arc<AtomicUsize>,
-    /// The version the transaction reads, which it keeps loaded.
+    /// Weak reference to the transaction's snapshot version, used to attribute pinned version
+    /// memory.
     snapshot: Weak<Version>,
-    /// Locked by each request that uses the transaction; `None` once it is committed or aborted.
+    /// Held while a request executes on the transaction; set to `None` when committed or aborted.
     txn: Arc<tokio::sync::Mutex<Option<Txn>>>,
 }
 
@@ -43,18 +44,17 @@ impl OpenTxn {
         *lock(&self.last_used)
     }
 
-    /// Records that a request is using the transaction.
     fn touch(&self) {
         *lock(&self.last_used) = Instant::now();
     }
 }
 
-/// The interactive transactions open on a node.
+/// Active interactive transactions on a node.
 pub struct OpenTxns {
     engine: Arc<Engine>,
     limits: TxnLimits,
     open: Mutex<DetHashMap<String, Arc<OpenTxn>>>,
-    /// Why each recently aborted transaction was aborted.
+    /// Abort reasons for recently aborted transactions, keyed by transaction ID.
     aborted: TtlCache<String, &'static str>,
 }
 
@@ -85,16 +85,15 @@ impl OpenTxns {
         lock(&self.open).values().filter(|t| t.db_id == db_id).count()
     }
 
-    /// Admits a request by `user_id` that begins or extends a transaction on `db_id`.
+    /// Checks whether `user_id` can allocate memory for an interactive transaction on `db_id`.
     ///
-    /// While the node's memory usage exceeds its budget after unloading idle databases, the memory
-    /// held by interactive transactions is shared max-min fairly between users: a user below its
-    /// fair share is admitted, and idle transactions of the users furthest above it are aborted,
-    /// least recently used first, to bring usage back within the budget. A user at or above its fair
-    /// share is refused with a retryable `503`.
+    /// If node memory usage exceeds the budget after idle databases are unloaded, the remaining
+    /// budget is shared across users by [`memory::fair_admission`]. If `user_id` is below its fair
+    /// share, idle transactions of users above their fair share are aborted (least recently used
+    /// first) until usage is within the budget. Otherwise, returns a retryable `503` error.
     pub fn admit(&self, user_id: &str, db_id: &str) -> Result<()> {
         let shared = &self.engine.shared;
-        if shared.is_system(db_id) || shared.reclaim() {
+        if shared.is_system(db_id) || shared.reclaim_to_budget() {
             return Ok(());
         }
         let (open, held): (Vec<_>, Vec<_>) = self.held_memory().into_iter().unzip();
@@ -108,15 +107,15 @@ impl OpenTxns {
             });
         };
         for i in victims {
-            if self.close(&open[i], "it was aborted to free node memory for other users") {
+            if self.abort(&open[i], "it was aborted to free node memory for other users") {
                 crate::probe::hit(crate::probe::Probe::TxnEvicted);
             }
         }
         Ok(())
     }
 
-    /// Admits a request by `user_id` that begins a transaction on `db_id`: the user must have fewer
-    /// than the most open transactions allowed, and is admitted by [`OpenTxns::admit`].
+    /// Verifies that `user_id` is below the per-user open transaction limit and passes
+    /// [`OpenTxns::admit`].
     pub fn admit_begin(&self, user_id: &str, db_id: &str) -> Result<()> {
         self.check_per_user(&lock(&self.open), user_id)?;
         self.admit(user_id, db_id)
@@ -132,9 +131,8 @@ impl OpenTxns {
         })
     }
 
-    /// Opens `txn` as transaction `id` of `user_id` on `db_id`, in use by the request that began it
-    /// so that this request runs before any other. Growth of the transaction's memory is admitted
-    /// like requests that extend it.
+    /// Registers `txn` as open transaction `id` for `user_id` on `db_id` and returns a locked
+    /// [`TxnGuard`] for the initial request.
     pub fn open(
         self: &Arc<Self>,
         id: String,
@@ -142,7 +140,7 @@ impl OpenTxns {
         db_id: &str,
         mut txn: Txn,
         encoding: Encoding,
-    ) -> Result<InUse<'_>> {
+    ) -> Result<TxnGuard<'_>> {
         let gate = Gate { txns: Arc::downgrade(self), user_id: user_id.to_string(), db_id: db_id.to_string() };
         txn.set_memory_gate(Some(Arc::new(gate)));
         let now = Instant::now();
@@ -161,21 +159,22 @@ impl OpenTxns {
         let mut g = lock(&self.open);
         self.check_per_user(&g, user_id)?;
         g.insert(id, open.clone());
-        Ok(InUse { txns: self, open, guard, finished: false })
+        Ok(TxnGuard { txns: self, open, guard, finished: false })
     }
 
-    /// Waits until no other request uses `open`, and returns it in use by this request, or why it
-    /// is gone.
-    pub async fn lock(&self, open: Arc<OpenTxn>) -> Result<InUse<'_>> {
+    /// Acquires exclusive access to `open`, or returns `TxnNotFound` if the transaction was
+    /// committed or aborted.
+    pub async fn lock(&self, open: Arc<OpenTxn>) -> Result<TxnGuard<'_>> {
         let guard = open.txn.clone().lock_owned().await;
         if guard.is_none() {
             return Err(self.lost(&open.id));
         }
         open.touch();
-        Ok(InUse { txns: self, open, guard, finished: false })
+        Ok(TxnGuard { txns: self, open, guard, finished: false })
     }
 
-    /// Returns open transaction `id` of `user_id` on `db_id`, or why it is gone.
+    /// Looks up open transaction `id` for `user_id` on `db_id`, aborting it if its lifetime has
+    /// expired.
     pub fn get(&self, id: &str, user_id: &str, db_id: &str) -> Result<Arc<OpenTxn>> {
         if crate::buggify::fault(0.01) {
             self.remove(id);
@@ -186,69 +185,64 @@ impl OpenTxns {
             return Err(Error::txn_not_found());
         }
         if open.created.elapsed() > self.limits.lifetime {
-            self.close(&open, "it reached the maximum transaction lifetime");
+            self.abort(&open, "it reached the maximum transaction lifetime");
             return Err(self.lost(id));
         }
         Ok(open)
     }
 
-    /// Returns the error for a request on transaction `id`, which is no longer open.
     fn lost(&self, id: &str) -> Error {
         crate::probe::hit(crate::probe::Probe::InteractiveTxnLost);
         match self.aborted.get(&id.to_string()) {
-            Some(why) => Error::TxnNotFound(format!("transaction was aborted because {why}; retry it")),
+            Some(reason) => Error::TxnNotFound(format!("transaction was aborted because {reason}; retry it")),
             None => Error::txn_not_found(),
         }
     }
 
-    /// Closes transaction `id` after it was committed or aborted by its user.
     fn remove(&self, id: &str) {
         lock(&self.open).remove(id);
     }
 
-    /// Aborts `open` because of `why`, which later requests on it report, unless a request is using
-    /// it. Returns whether it was aborted rather than already committed or aborted by its user.
-    fn close(&self, open: &OpenTxn, why: &'static str) -> bool {
+    fn abort(&self, open: &OpenTxn, reason: &'static str) -> bool {
         let Ok(mut g) = open.txn.try_lock() else { return false };
-        self.close_locked(open, &mut g, why)
+        self.abort_locked(open, &mut g, reason)
     }
 
-    /// Like [`OpenTxns::close`], for the request using `open`, whose lock on it is `txn`. The reason
-    /// is recorded before the lock is released, so that requests waiting for it report the reason.
-    fn close_locked(&self, open: &OpenTxn, txn: &mut Option<Txn>, why: &'static str) -> bool {
+    /// Records `reason` before `txn` is unlocked so that concurrent waiters observe the abort
+    /// reason.
+    fn abort_locked(&self, open: &OpenTxn, txn: &mut Option<Txn>, reason: &'static str) -> bool {
         let aborted = txn.take().is_some();
         if aborted {
-            self.aborted.store(open.id.clone(), Some(why), Instant::now());
+            self.aborted.store(open.id.clone(), Some(reason), Instant::now());
         }
         self.remove(&open.id);
         aborted
     }
 
-    /// Aborts transactions that have been idle or open too long.
+    /// Aborts transactions that have exceeded the idle timeout or maximum lifetime.
     pub fn expire(&self) {
         let TxnLimits { idle, lifetime, .. } = self.limits;
         let expired: Vec<_> = lock(&self.open)
             .values()
             .filter_map(|t| {
-                let why = if t.created.elapsed() >= lifetime {
+                let reason = if t.created.elapsed() >= lifetime {
                     "it reached the maximum transaction lifetime"
                 } else if t.last_used().elapsed() >= idle {
-                    "no request used it within the idle timeout"
+                    "it exceeded the idle timeout"
                 } else {
                     return None;
                 };
-                Some((t.clone(), why))
+                Some((t.clone(), reason))
             })
             .collect();
         self.aborted.prune();
-        for (t, why) in expired {
-            self.close(&t, why);
+        for (t, reason) in expired {
+            self.abort(&t, reason);
         }
     }
 
-    /// Returns open transactions in eviction order, least recently used first, with the memory each
-    /// holds: its read and write sets, and an equal share among the transactions that read it of a
-    /// version that only transactions keep loaded.
+    /// Returns open transactions ordered from least to most recently used, paired with their
+    /// memory usage (read set, write set, and an equal share of any non-current snapshot version).
     fn held_memory(&self) -> Vec<(Arc<OpenTxn>, Held<String>)> {
         let idle_since = |t: &OpenTxn| t.txn.try_lock().ok().filter(|g| g.is_some()).map(|_| t.last_used());
         let mut open: Vec<(Option<Instant>, Arc<OpenTxn>)> =
@@ -280,51 +274,49 @@ impl OpenTxns {
     }
 }
 
-/// A request's exclusive use of an open transaction. A request that fails or is cancelled may have
-/// applied only some of its ops, so the transaction is aborted unless the request finishes.
-pub struct InUse<'a> {
+/// Exclusive guard for an open transaction during a single request. If dropped before
+/// [`TxnGuard::finish`] succeeds or [`TxnGuard::take`] is called, the transaction is aborted.
+pub struct TxnGuard<'a> {
     txns: &'a OpenTxns,
     open: Arc<OpenTxn>,
     guard: tokio::sync::OwnedMutexGuard<Option<Txn>>,
     finished: bool,
 }
 
-impl InUse<'_> {
+impl TxnGuard<'_> {
     pub fn txn(&mut self) -> &mut Txn {
-        self.guard.as_mut().expect("a transaction in use is open until its request finishes")
+        self.guard.as_mut().expect("open transaction must be present while guard is active")
     }
 
     pub fn encoding(&self) -> Encoding {
         self.open.encoding
     }
 
-    /// Ends the request with `result`, aborting the transaction if the request failed.
+    /// Marks the request as completed if `result` is `Ok`; otherwise the transaction is aborted on
+    /// drop.
     pub fn finish<T>(mut self, result: Result<T>) -> Result<T> {
         self.finished = result.is_ok();
         result
     }
 
-    /// Ends the request by taking the transaction to commit it, which closes it.
+    /// Removes the transaction from the open registry and returns it for commit or abort.
     pub fn take(mut self) -> Txn {
         self.finished = true;
-        let mut txn = self.guard.take().expect("a transaction in use is open until its request finishes");
+        let mut txn = self.guard.take().expect("open transaction must be present while guard is active");
         self.txns.remove(&self.open.id);
         txn.set_memory_gate(None);
         txn
     }
 }
 
-impl Drop for InUse<'_> {
+impl Drop for TxnGuard<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.txns.close_locked(&self.open, &mut self.guard, "a request on it failed or was cancelled");
+            self.txns.abort_locked(&self.open, &mut self.guard, "a request on it failed or was cancelled");
         }
     }
 }
 
-/// Admits growth of a transaction's memory as [`OpenTxns::admit`] admits requests, so that
-/// concurrent requests, and single requests that grow a transaction by more than its user's fair
-/// share, cannot carry a user past its share by more than a chunk per request.
 struct Gate {
     txns: Weak<OpenTxns>,
     user_id: String,
@@ -339,7 +331,7 @@ impl MemoryGate for Gate {
         }
     }
 
-    fn chunk(&self) -> usize {
+    fn step_bytes(&self) -> usize {
         self.txns.upgrade().map_or(usize::MAX, |t| (t.engine.shared.memory.limit() / 1024).max(1))
     }
 }
@@ -365,19 +357,15 @@ mod tests {
         json!([{"op": "get", "key": "k0"}])
     }
 
-    /// 120 puts of 20 KB each: about 2.4 MB of write set.
     fn big_puts(tag: &str) -> Json {
         (0..120).map(|i| json!({"op": "put", "key": format!("{tag}{i}"), "value": "v".repeat(20_000)})).collect()
     }
 
-    /// Bytes past the budget a transaction may grow by before its gate is asked again: one gate
-    /// chunk and one put.
+    /// Maximum bytes a single transaction can allocate past the budget before the next gate check.
     fn growth_slack(w: &World) -> usize {
         w.node(0).engine.shared.memory.limit() / 1024 + 32 * 1024
     }
 
-    /// Opens transactions holding large write sets for `token` until the node refuses one, and
-    /// returns the open ones and the one aborted while growing, if any.
     async fn fill_memory(w: &World, token: &str, db: &str) -> (Vec<String>, Option<String>) {
         let mut open = Vec::new();
         loop {
@@ -392,7 +380,7 @@ mod tests {
                 assert_eq!(
                     (&r["error"]["code"], &r["error"]["retryable"]),
                     (&json!("txn_not_found"), &json!(true)),
-                    "a request refused as its transaction grew did not say the transaction is gone: {r}"
+                    "rejected ops request did not return txn_not_found: {r}"
                 );
                 assert!(r["error"]["message"].as_str().unwrap().contains("memory budget"), "{r}");
                 return (open, Some(id));
@@ -426,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn requests_on_expired_transactions_say_why_they_were_aborted() {
+    fn expired_transaction_returns_abort_reason() {
         run_paused(async {
             let w = World::new(1, 1).await;
             let token = w.signup(0, "a@x.io").await;
@@ -441,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_transactions_are_closed_for_requests_already_holding_them() {
+    fn expire_aborts_transaction_after_lookup() {
         run_paused(async {
             let w = World::new(1, 1).await;
             let token = w.signup(0, "a@x.io").await;
@@ -459,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn transactions_closed_by_their_user_are_not_reported_as_expired() {
+    fn committed_transaction_is_not_reported_as_expired() {
         run_paused(async {
             let w = World::new(1, 1).await;
             let token = w.signup(0, "a@x.io").await;
@@ -482,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_request_aborts_its_transaction() {
+    fn cancelled_ops_request_aborts_transaction() {
         run_paused(async {
             let w = World::new(1, 1).await;
             let token = w.signup(0, "a@x.io").await;
@@ -511,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn transactions_cannot_grow_past_the_memory_budget_and_finish_under_pressure() {
+    fn transactions_are_bounded_by_memory_budget_and_can_finish() {
         run_paused(async {
             let w = World::with_config(1, 1, |c| c.engine.memory_bytes = 16 << 20).await;
             let token = w.signup(0, "a@x.io").await;
@@ -534,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_growth_cannot_carry_a_user_past_the_memory_budget() {
+    fn concurrent_transaction_growth_is_bounded_by_memory_budget() {
         run_paused(async {
             let w = World::with_config(1, 1, |c| c.engine.memory_bytes = 16 << 20).await;
             let token = w.signup(0, "a@x.io").await;
@@ -569,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn a_user_holding_the_memory_budget_cannot_starve_other_users() {
+    fn user_at_memory_budget_cannot_starve_other_users() {
         run_paused(async {
             let w = World::with_config(1, 1, |c| c.engine.memory_bytes = 16 << 20).await;
             let (alice, bob) = (w.signup(0, "alice@x.io").await, w.signup(0, "bob@x.io").await);
@@ -578,7 +566,7 @@ mod tests {
             let (alices, _) = fill_memory(&w, &alice, "a").await;
             let memory = &w.node(0).engine.shared.memory;
             let r = begin(&w, &bob, "b").await;
-            assert_eq!(r.status, 201, "a user with no open transactions was refused: {:?}", r.json());
+            assert_eq!(r.status, 201, "a user with 0 open transactions was rejected: {:?}", r.json());
             let bobs = r.json()["txn_id"].as_str().unwrap().to_string();
             let mut grown = 0;
             loop {

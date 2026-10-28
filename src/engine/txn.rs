@@ -157,7 +157,7 @@ pub struct Txn {
     read_bytes: usize,
     max_read_bytes: usize,
     charge: Charge,
-    /// The gate growth is checked with, and the charge size up to which it last admitted growth.
+    /// Admission gate for memory growth and the charged byte threshold for the next check.
     gate: Option<(Arc<dyn MemoryGate>, usize)>,
     appended: usize,
     optimistic: bool,
@@ -196,27 +196,27 @@ impl Txn {
         }
     }
 
-    /// Returns a counter of the memory this transaction holds, readable while another task owns
-    /// the transaction (see [`Charge::meter`]).
+    /// Returns a shared atomic counter that tracks the bytes charged to this transaction (see
+    /// [`Charge::meter`]).
     pub fn meter(&mut self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.charge.meter()
     }
 
-    /// Checks further growth of the transaction's memory with `gate`, or stops checking it. Once
-    /// the gate refuses growth, reads and writes that would grow the transaction fail.
+    /// Sets or clears the [`MemoryGate`] that checks incremental memory growth for this
+    /// transaction.
     pub fn set_memory_gate(&mut self, gate: Option<Arc<dyn MemoryGate>>) {
         self.gate = gate.map(|g| {
-            let until = self.charge.bytes() + g.chunk();
-            (g, until)
+            let next_check = self.charge.bytes() + g.step_bytes();
+            (g, next_check)
         });
     }
 
     fn admit_growth(&mut self) -> Result<()> {
-        if let Some((gate, until)) = &mut self.gate
-            && self.charge.bytes() > *until
+        if let Some((gate, next_check)) = &mut self.gate
+            && self.charge.bytes() > *next_check
         {
             gate.admit()?;
-            *until = self.charge.bytes() + gate.chunk();
+            *next_check = self.charge.bytes() + gate.step_bytes();
         }
         Ok(())
     }

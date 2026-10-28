@@ -1060,8 +1060,8 @@ fn paths() -> Value {
             body: Some(json_body(r("OpsRequest"))),
             params: vec![db(), txn_id()],
             desc: Some(
-                "Any error, or a cancelled request, aborts the transaction. Retryable errors are reported as \
-                 `404 txn_not_found`: restart the transaction.",
+                "If an error occurs or the request is canceled, the transaction is aborted. Retryable errors return \
+                 `404 txn_not_found` so that the caller restarts the transaction.",
             ),
             ..op("Run ops in a transaction", "transactions", vec![("200", resp("Results", r("OpsResult")))])
         },

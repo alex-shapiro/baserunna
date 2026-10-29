@@ -1033,3 +1033,39 @@ fn bulk_insert_bodies_name_each_field_once() {
         w.shutdown();
     });
 }
+
+/// A deleted event leaves object storage within the purge window plus GC
+/// bounds, even when its part is too little deleted to be rewritten for
+/// space and its partition is never merged again.
+#[test]
+fn deleted_events_are_eventually_purged_from_storage() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        let rows = r#"[{"event": "a", "user": "u1", "time": 1000}, {"event": "a", "user": "u2", "time": 2000},
+            {"event": "a", "user": "pii-erase-me", "time": 3000}]"#;
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], rows).await;
+        assert_eq!(s, 201, "{r}");
+        let del = r#"{"where": {"col": "user", "op": "eq", "value": "pii-erase-me"}}"#;
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/delete", &[], del).await;
+        assert_eq!((s, r["deleted"].clone()), (200, json!(1)), "{r}");
+        for i in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_secs(3 * 3600)).await;
+            let put = json!({"ops": [{"op": "put", "key": format!("k{i}"), "value": "v"}]});
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/txn", &[], &put.to_string()).await;
+            assert_eq!(s, 200, "{r}");
+        }
+        let (s, d) = send(&w, 0, &t, "GET", "/v1/dbs/d/events/ev", &[], "").await;
+        assert_eq!((s, d["rows"].clone()), (200, json!(2)), "{d}");
+        let holding: Vec<String> = w
+            .mem
+            .keys()
+            .into_iter()
+            .filter(|k| {
+                let data = w.mem.get_sync(k, &Default::default()).unwrap().data;
+                data.windows(12).any(|x| x == b"pii-erase-me")
+            })
+            .collect();
+        assert!(holding.is_empty(), "3.75 days after the delete, {holding:?} still hold the deleted event: {d}");
+        w.shutdown();
+    });
+}

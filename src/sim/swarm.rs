@@ -225,6 +225,7 @@ fn engine_knobs(k: &Knobs, c: &mut SimConfig) {
     e.event_tier_base_bytes = k.log_range("engine.event_tier_base_bytes", 256, 64 * 1024);
     e.event_part_max_bytes = k.log_range("engine.event_part_max_bytes", 4 * 1024, 1 << 20);
     e.event_settle_ms = k.log_range("engine.event_settle_ms", 1_000, 86_400_000);
+    e.event_purge_ms = k.log_range("engine.event_purge_ms", 1_000, 86_400_000);
     e.event_json_max_paths = k.log_range("engine.event_json_max_paths", 1, 64) as usize;
     e.event_json_directory_bytes = k.log_range("engine.event_json_directory_bytes", 1, 1 << 20) as usize;
     e.event_mask_inline_bytes = k.log_range("engine.event_mask_inline_bytes", 1, 4096) as usize;

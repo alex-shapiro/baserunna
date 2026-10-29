@@ -523,6 +523,43 @@ mod stored_values {
         });
     }
 
+    /// A merge writes no dictionary value or JSON path that only deleted
+    /// rows held, whether the path was a column or listed in a bucket.
+    #[test]
+    fn merges_keep_nothing_of_deleted_rows() {
+        for max_paths in [1, 64] {
+            rt().block_on(async {
+                let (eng, store, _env) = engine(1, EngineConfig { event_json_max_paths: max_paths, ..cfg() });
+                let db = create_db(&eng, "d").await;
+                let live = |i: i64| json!({"time": T0 + i, "event": "a", "user": "u1", "props": {"plan": "free"}});
+                let secret = json!({"time": T0 + 2, "event": "a", "user": "secret-user",
+                    "props": {"plan": "secret-plan", "secret-path": 1}});
+                ins(&db, vec![live(0), secret, live(1)]).await;
+                seal_all(&db).await;
+                ins(&db, vec![live(3)]).await;
+                seal_all(&db).await;
+                let f = Filter::parse(json!({"col": "user", "op": "eq", "value": "secret-user"})).unwrap();
+                assert_eq!(
+                    txn_do(&db, async |t| maint::delete(&db, t, "events", 0, T0 * 2, &f).await).await.unwrap(),
+                    1
+                );
+                merge_all(&db).await;
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                let merged = refs(&mut t, table_id(&db).await).await.unwrap();
+                assert_eq!((merged.len(), merged[0].rows, merged[0].deleted), (1, 3, 0));
+                let prefix = crate::engine::part_prefix(&db.id, &merged[0].id);
+                let holding: Vec<String> = store
+                    .keys()
+                    .into_iter()
+                    .filter(|k| k.starts_with(&prefix))
+                    .filter(|k| store.get_sync(k, &Default::default()).unwrap().data.windows(6).any(|w| w == b"secret"))
+                    .collect();
+                assert!(holding.is_empty(), "with {max_paths} JSON path columns, {holding:?} hold a deleted row");
+                assert_eq!(count(&db, json!({"col": "props", "path": ["plan"], "op": "eq", "value": "free"})).await, 3);
+            });
+        }
+    }
+
     /// Integers beyond `i64` cannot be compared or aggregated exactly, so an
     /// insert refuses them instead of storing a rounded float.
     #[test]

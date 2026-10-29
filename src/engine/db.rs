@@ -1879,6 +1879,7 @@ impl Db {
                                 min_version: new_seq,
                                 max_version: new_seq,
                                 deleted,
+                                masked_ms: if deleted > 0 { time } else { 0 },
                                 mask: (deleted > 0).then_some(events::Mask::Inline(mask)),
                                 ..p.part.clone()
                             };

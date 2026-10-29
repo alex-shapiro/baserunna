@@ -431,6 +431,12 @@ events to row tables.
 - **Deletes** remove the events matching a filter within a time range, in a
   transaction. A delete that would need an oversized mask in one partition
   fails with `413` naming it, so a caller deletes partition by partition.
+  Deleted events leave object storage within about 26 hours on a database
+  that keeps committing: a part is rewritten without its deleted rows once
+  its oldest deletion is a day old (`event_purge_ms`), and the replaced
+  part is deleted 30 min later (§5.8). An event deleted before it was
+  sealed becomes an LSM tombstone, so if its row was flushed, its bytes
+  stay in a segment until compaction rewrites it, with no time bound.
 - **Retention** (`retention_ms`): queries skip events older than it, and
   maintenance drops parts once all their events are older, both by the
   store's clock (§5.8); without a store clock measurement, queries skip
@@ -892,8 +898,9 @@ merges cut granules as the rows' first writer did. A part is never written
 with a block, index or metadata larger than a reader accepts.
 
 A part ref (`0x0A`) stores the part's id, row count, time range, size,
-level, the positions it covers, and its deletion mask: deleted row offsets,
-inline up to 4 KiB, otherwise in a mask object.
+level, the positions it covers, its deletion mask (deleted row offsets,
+inline up to 4 KiB, otherwise in a mask object), and when the oldest row of
+the mask was masked.
 
 #### Queries
 
@@ -914,14 +921,20 @@ small, otherwise by column block, so a warm query performs no store `GET`s.
 
 #### Merges and retention
 
-After a seal or bind, the lease holder merges small parts of a partition by
-size tier (fan-in 8, up to 4 GiB parts), rewrites parts that are mostly
-deleted, and drops partitions past retention. A merge reads its inputs one
-column at a time, writes the merged part, and swaps the refs in a
-transaction that conflicts only with deletes on the same parts. A
-partition gets one final merge into a single part once it ended and no part
-has arrived for a day. A merge that outlives the stage TTL abandons its
-output.
+After a seal or bind, and after each GC sweep, the lease holder drops
+partitions past retention, rewrites parts that are mostly deleted, merges
+small parts of a partition by size tier (fan-in 8, up to 4 GiB parts),
+purges parts whose oldest deletion is `event_purge_ms` old, and settles
+partitions, in that order of priority. A merge reads its inputs one column
+at a time, writes the merged part, and swaps the refs in a transaction that
+conflicts only with deletes on the same parts. A merge plans its output's
+dictionaries and JSON paths from what the live rows of a masked input hold,
+read before the merge, so nothing of a deleted row survives it. A purge
+rewrites one part into a part without deletions, which is never purged
+again; purges rank below tiered merges, which purge the parts they take
+anyway, so a backlog of purges never holds up merges. A partition gets
+one final merge into a single part once it ended and no part has arrived
+for a day. A merge that outlives the stage TTL abandons its output.
 
 ---
 

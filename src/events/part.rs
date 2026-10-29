@@ -1516,6 +1516,7 @@ pub(crate) mod tests {
             min_version: 0,
             max_version: 0,
             deleted: 0,
+            masked_ms: 0,
             mask: None,
         }
     }

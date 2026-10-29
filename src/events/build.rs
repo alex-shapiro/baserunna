@@ -492,6 +492,7 @@ pub async fn write_rows(
         min_version: if versions { min_version } else { 0 },
         max_version: if versions { max_version } else { 0 },
         deleted: 0,
+        masked_ms: 0,
         mask: None,
     };
     Ok((r, src))

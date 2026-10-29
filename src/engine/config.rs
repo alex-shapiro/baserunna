@@ -109,6 +109,9 @@ pub struct EngineConfig {
     /// Partitions whose time range has ended and that received no new part
     /// for this long are merged into as few parts as the size cap allows.
     pub event_settle_ms: u64,
+    /// A part with deleted rows is rewritten without them once its oldest
+    /// deletion is this old, which bounds how long deleted events stay stored.
+    pub event_purge_ms: u64,
     /// JSON paths stored as their own columns in each part; the rest share buckets.
     pub event_json_max_paths: usize,
     /// Deletion masks up to this many bytes are stored in their part's
@@ -183,6 +186,7 @@ impl Default for EngineConfig {
             event_part_max_bytes: 4 << 30,
             event_merge_max_ms: 30 * 60_000,
             event_settle_ms: 24 * 3_600_000,
+            event_purge_ms: 24 * 3_600_000,
             event_json_max_paths: 1024,
             event_json_directory_bytes: 1 << 20,
             event_mask_inline_bytes: 4096,

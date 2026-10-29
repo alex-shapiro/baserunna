@@ -174,12 +174,18 @@ pub fn tier(raw: u64, base: u64, k: u64) -> u32 {
 
 /// Chooses the most urgent maintenance for a table's references, by
 /// priority: retention drops, rewrites of mostly deleted parts, size-tiered
-/// merges, then merges that settle partitions whose time has passed and
-/// that received no part for `event_settle_ms` (ClickHouse's
+/// merges, purges, then merges that settle partitions whose time has passed
+/// and that received no part for `event_settle_ms` (ClickHouse's
 /// `min_age_to_force_merge_seconds`), so that backfilling old partitions
-/// is not merged after every insert. Retention drops need `store_now_ms`,
-/// a lower bound on the store's clock, so that a node whose own clock runs
-/// ahead never drops events still within retention.
+/// is not merged after every insert. A purge rewrites the part with the
+/// oldest deletion once that deletion is `event_purge_ms` old, so deleted
+/// events leave storage in bounded time. Purges rank below tiered merges,
+/// which purge the parts they take anyway, so a backlog of purges cannot
+/// hold merges up; a purged part has no deletions, so it is never purged
+/// again.
+/// Retention drops need `store_now_ms`, a lower bound on the store's clock,
+/// so that a node whose own clock runs ahead never drops events still
+/// within retention.
 pub fn plan(
     s: &EventSchema,
     refs: &[PartRef],
@@ -221,6 +227,11 @@ pub fn plan(
             }
         }
     }
+    let purge_due =
+        |p: &&&PartRef| p.deleted > 0 && (p.masked_ms as i64).saturating_add(cfg.event_purge_ms as i64) <= now_ms;
+    if let Some(p) = refs.iter().filter(purge_due).min_by_key(|p| (p.masked_ms, &p.id)) {
+        return Some(Task::Merge(vec![(*p).clone()]));
+    }
     for (partition, parts) in &by_partition {
         let end = s.bucket_span(ev::partition_bucket(*partition)).1;
         let newest = parts.iter().map(|p| p.arrived_ms).max().unwrap_or(0) as i64;
@@ -257,6 +268,65 @@ struct Input {
     r: PartRef,
     meta: Arc<PartMeta>,
     mask: Arc<Runs>,
+    /// For a part with masked rows, what its live rows hold.
+    live: Option<Live>,
+}
+
+/// The dictionary values and JSON paths a part's live rows hold. A merge
+/// plans its output from these rather than from the part's metadata, which
+/// also describes its masked rows, so that no value or path of a deleted
+/// event outlives the merge.
+#[derive(Default)]
+struct Live {
+    /// Each dictionary-coded column's values, by column index.
+    dicts: BTreeMap<usize, Arc<Vec<String>>>,
+    /// Rows holding each path a column or the directory names, by column id and key.
+    paths: BTreeMap<(u32, String), u64>,
+}
+
+/// Reads the dictionary-coded and JSON path columns of a part with masked
+/// rows to find what its live rows hold.
+async fn census(rd: &Reading<'_>, r: &PartRef, meta: &PartMeta, mask: &Runs) -> Result<Live> {
+    let mut live = Live::default();
+    for (ci, c) in meta.cols.iter().enumerate() {
+        let dicted = c.phys == Phys::Str && rd.index(r, meta, ci).await?.dict.is_some();
+        if !dicted && !matches!(c.cref, ColRef::Path { .. } | ColRef::Shared { .. }) {
+            continue;
+        }
+        let mut values = BTreeSet::new();
+        for g in (0..meta.granule_count()).step_by(8) {
+            let v = rd.column(r, meta, ci, g..(g + 8).min(meta.granule_count())).await?;
+            for i in 0..v.len() {
+                let row = meta.starts[g] + i as u64;
+                if mask.contains(row as u32) || v.is_null(i) {
+                    continue;
+                }
+                match &c.cref {
+                    ColRef::Path { col, key } => *live.paths.entry((*col, key.clone())).or_default() += 1,
+                    ColRef::Shared { col, .. } => {
+                        if let Vector::Str(st) = &v
+                            && let Some(Ok(Json::Object(o))) = st.get(i).map(serde_json::from_str::<Json>)
+                        {
+                            for k in o.keys() {
+                                *live.paths.entry((*col, k.clone())).or_default() += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if dicted
+                    && let Vector::Str(st) = &v
+                    && let Some(t) = st.get(i)
+                {
+                    values.insert(t.to_string());
+                }
+            }
+        }
+        if dicted {
+            live.dicts.insert(ci, Arc::new(values.into_iter().collect()));
+        }
+    }
+    Ok(live)
 }
 
 /// How an output column of a merge gets its values from an input.
@@ -513,7 +583,12 @@ async fn merge_parts(
     let rd = Reading { shared, db, cache: Caching::Private(&memo), stats };
     let mut ins = Vec::with_capacity(inputs.len());
     for r in inputs {
-        ins.push(Input { r: r.clone(), meta: rd.meta(r).await?, mask: rd.mask(r).await? });
+        let (meta, mask) = (rd.meta(r).await?, rd.mask(r).await?);
+        let live = match r.deleted {
+            0 => None,
+            _ => Some(census(&rd, r, &meta, &mask).await?),
+        };
+        ins.push(Input { r: r.clone(), meta, mask, live });
     }
     let sort_ids = s.sort_ids();
     let mut entries: Vec<(Bytes, Pos, u16, u32, u64)> = Vec::new();
@@ -606,15 +681,21 @@ async fn merge_parts(
         feeds.push(srcs.iter().map(|s| s.map_or(Feed::None, Feed::Col)).collect());
         let mut stats: BTreeMap<String, (u64, JType)> = BTreeMap::new();
         for inp in &ins {
-            for (ci, key) in inp.meta.paths(c.id) {
-                let (n, t) = (inp.meta.cols[ci].nonnull, input_type(&inp.meta, ci));
-                stats.entry(key.to_string()).and_modify(|(m, ty)| (*m, *ty) = (*m + n, ty.join(t))).or_insert((n, t));
-            }
-            for p in inp.meta.shared.get(&c.id).into_iter().flatten() {
-                stats
-                    .entry(p.key.clone())
-                    .and_modify(|(m, ty)| (*m, *ty) = (*m + p.count, ty.join(p.ty)))
-                    .or_insert((p.count, p.ty));
+            let rows = |key: &str, n: u64| match &inp.live {
+                Some(l) => l.paths.get(&(c.id, key.to_string())).copied().unwrap_or(0),
+                None => n,
+            };
+            let named =
+                inp.meta.paths(c.id).map(|(ci, key)| (key, inp.meta.cols[ci].nonnull, input_type(&inp.meta, ci)));
+            let listed = inp.meta.shared.get(&c.id).into_iter().flatten().map(|p| (p.key.as_str(), p.count, p.ty));
+            for (key, n, t) in named.chain(listed) {
+                let n = rows(key, n);
+                if n > 0 {
+                    stats
+                        .entry(key.to_string())
+                        .and_modify(|(m, ty)| (*m, *ty) = (*m + n, ty.join(t)))
+                        .or_insert((n, t));
+                }
             }
         }
         // An input whose directory is partial may hold any path, of any type,
@@ -792,6 +873,7 @@ async fn merge_parts(
         min_version,
         max_version,
         deleted: 0,
+        masked_ms: 0,
         mask: None,
     }))
 }
@@ -816,7 +898,11 @@ async fn union_dicts(
         if inp.meta.cols[*ci].phys != Phys::Str {
             return Ok(None);
         }
-        match rd.index(&inp.r, &inp.meta, *ci).await?.dict.clone() {
+        let dict = match inp.live.as_ref().and_then(|l| l.dicts.get(ci)) {
+            Some(d) => Some(d.clone()),
+            None => rd.index(&inp.r, &inp.meta, *ci).await?.dict.clone(),
+        };
+        match dict {
             Some(d) => all.push(d),
             None => return Ok(None),
         }
@@ -1056,7 +1142,8 @@ pub async fn delete(db: &Arc<Db>, txn: &mut Txn, name: &str, from: i64, to: i64,
             let (id, size) = part::write_mask(&shared, &db.id, &runs).await?;
             Mask::Object { id, size }
         };
-        let new = PartRef { deleted: runs.count(), mask: Some(mask), ..r.clone() };
+        let masked_ms = if r.deleted == 0 { shared.time_ms() } else { r.masked_ms };
+        let new = PartRef { deleted: runs.count(), masked_ms, mask: Some(mask), ..r.clone() };
         txn.put(new.key(), Value::Inline(new.encode())).map_err(in_partition)?;
         txn.event_op(EventOp::part_ref(Some(r.clone()), Some(new))).map_err(in_partition)?;
         probe::hit(Probe::EventRowsMasked);
@@ -1076,6 +1163,70 @@ mod tests {
         assert_eq!(tier(255, 4, 8), 1);
         assert_eq!(tier(256, 4, 8), 2);
         assert_eq!(tier(u64::MAX, 4, 8), tier(u64::MAX - 1, 4, 8));
+    }
+
+    /// Purges of parts with old deletions yield to retention drops and
+    /// tiered merges, take the oldest deletion first, and end once the part
+    /// is rewritten without its masked rows.
+    #[test]
+    fn purges_follow_drops_and_tiered_merges_and_end() {
+        const DAY: i64 = 86_400_000;
+        let s: EventSchema = serde_json::from_value(serde_json::json!({
+            "id": 1, "name": "ev", "time_column": "time", "order_by": ["time"], "partition": "day",
+            "columns": [{"id": 0, "name": "time", "type": "time", "nullable": false}],
+            "retention_ms": 30 * DAY, "next_column_id": 1
+        }))
+        .unwrap();
+        let cfg =
+            crate::engine::EngineConfig { event_merge_fan_in: 2, event_purge_ms: DAY as u64, ..Default::default() };
+        let now = 100 * DAY + 3_600_000;
+        let part = |id: &str, day: i64, deleted: u64, masked_ms: i64| PartRef {
+            id: id.repeat(32),
+            table: 1,
+            partition: ev::partition_key(s.bucket(day * DAY)),
+            chunk_bytes: 1 << 20,
+            size: 1000,
+            raw_size: 1000,
+            rows: 100,
+            level: 0,
+            meta_off: 0,
+            meta_len: 10,
+            min_time: day * DAY,
+            max_time: day * DAY + 1,
+            arrived_ms: (day * DAY) as u64,
+            version: Some(1),
+            min_version: 1,
+            max_version: 1,
+            deleted,
+            masked_ms: masked_ms as u64,
+            mask: None,
+        };
+        let plan = |refs: &[PartRef], failed: &BTreeSet<String>| plan(&s, refs, failed, &cfg, now, Some(now));
+        let none = BTreeSet::new();
+        let ids = |t: Option<Task>| match t {
+            Some(Task::Drop(p)) => ("drop", p.into_iter().map(|p| p.id[..1].to_string()).collect::<Vec<_>>()),
+            Some(Task::Merge(p)) => ("merge", p.into_iter().map(|p| p.id[..1].to_string()).collect()),
+            None => ("none", vec![]),
+        };
+        let (young, old, older) = (part("a", 100, 1, now - DAY / 2), part("b", 99, 1, now - DAY), part("c", 98, 1, 7));
+        let expired = part("e", 50, 0, 0);
+        let tier = [part("t", 100, 0, 0), part("u", 100, 0, 0)];
+
+        let all = [vec![young.clone(), old.clone(), older.clone(), expired], tier.to_vec()].concat();
+        assert_eq!(ids(plan(&all, &none)), ("drop", vec!["e".into()]), "retention drops come first");
+        assert_eq!(ids(plan(&all[..3], &none)), ("merge", vec!["c".into()]), "the oldest deletion is purged first");
+        let merging = [vec![older.clone()], tier.to_vec()].concat();
+        assert_eq!(ids(plan(&merging, &none)), ("merge", vec!["t".into(), "u".into()]), "tiered merges come first");
+        let failed: BTreeSet<String> = [older.id.clone()].into();
+        assert_eq!(ids(plan(&all[..3], &failed)), ("merge", vec!["b".into()]), "a failed purge is left out");
+        assert_eq!(
+            ids(plan(std::slice::from_ref(&young), &none)),
+            ("none", vec![]),
+            "deletions within the window wait"
+        );
+
+        let purged = PartRef { id: "d".repeat(32), level: 1, rows: 99, deleted: 0, masked_ms: 0, ..older };
+        assert_eq!(ids(plan(&[young, purged], &none)), ("none", vec![]), "a purged part is not purged again");
     }
 
     #[test]

@@ -298,6 +298,9 @@ pub struct PartRef {
     pub max_version: Seq,
     /// Rows covered by the mask.
     pub deleted: u64,
+    /// When the oldest row of the mask was masked, which starts the part's
+    /// purge window (`event_purge_ms`); 0 without a mask.
+    pub masked_ms: u64,
     pub mask: Option<Mask>,
 }
 
@@ -364,6 +367,7 @@ impl PartRef {
         w.varint(self.min_version);
         w.varint(self.max_version);
         w.varint(self.deleted);
+        w.varint(self.masked_ms);
         match &self.mask {
             None => w.u8(0),
             Some(Mask::Inline(r)) => {
@@ -403,6 +407,7 @@ impl PartRef {
             min_version: 0,
             max_version: 0,
             deleted: 0,
+            masked_ms: 0,
             mask: None,
         };
         p.version = match r.u8()? {
@@ -413,6 +418,7 @@ impl PartRef {
         p.min_version = r.varint()?;
         p.max_version = r.varint()?;
         p.deleted = r.varint()?;
+        p.masked_ms = r.varint()?;
         p.mask = match r.u8()? {
             0 => None,
             1 => Some(Mask::Inline(Runs::decode(&mut r)?)),
@@ -774,6 +780,7 @@ mod tests {
             min_version: 9,
             max_version: 9,
             deleted: 3,
+            masked_ms: 1_700_000_100_000,
             mask: Some(Mask::Inline(Runs(vec![(1, 2), (50, 1)]))),
         }
     }
@@ -844,6 +851,7 @@ mod tests {
         part.version = None;
         part.mask = None;
         part.deleted = 0;
+        part.masked_ms = 0;
         let b = Bind {
             table: 7,
             slots: vec![BindSlot { commit_id: 1, deadline: None }, BindSlot { commit_id: 2, deadline: None }],

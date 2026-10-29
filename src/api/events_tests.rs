@@ -844,3 +844,42 @@ mod console_pages {
         });
     }
 }
+
+/// A large bulk insert of tiny events is written as a few parts, not one
+/// sequential store round trip per batch of rows decoded.
+#[test]
+fn a_large_bulk_insert_is_not_split_into_sequential_part_writes() {
+    run_paused(async {
+        let w = World::new(1, 20).await;
+        let t = w.signup(0, "ev@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let r = call_router(&w.node(0).router().unwrap(), "POST", "/v1/dbs/d/events", &t, Bytes::from(TABLE)).await;
+        assert_eq!(r.status, 201);
+        let nd = vec![r#"{"event":"a"}"#; 2_200_000].join("\n");
+        let start = tokio::time::Instant::now();
+        let ct = [("content-type", "application/x-ndjson")];
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &ct, &nd).await;
+        assert_eq!(s, 201, "{r}");
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_millis(500), "a 31 MB insert took {took:?} at 20 ms per store call");
+        w.shutdown();
+    });
+}
+
+/// A body naming `rows` or `idempotency_key` twice is refused rather than
+/// read one way or the other.
+#[test]
+fn bulk_insert_bodies_name_each_field_once() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        for b in [
+            r#"{"rows": [{"event": "a"}], "rows": [{"event": "b"}]}"#,
+            r#"{"idempotency_key": "a", "rows": [{"event": "a"}], "idempotency_key": "b"}"#,
+        ] {
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], b).await;
+            assert_eq!(s, 400, "{b}: {r}");
+        }
+        assert_eq!(count(&w, 0, &t).await, json!(0));
+        w.shutdown();
+    });
+}

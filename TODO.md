@@ -26,6 +26,12 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       can fail with `503 request deadline exceeded` until it gives up
       (`sim_tool trace streams 2601188`; also 2602361 and 2603205, on `main`
       as on this branch).
+- [ ] **Sweep when a lease is short.** A sweep starts after a commit and
+      skips its run if the lease has lapsed by the time its clock read and
+      refresh return, so with 1 s leases and slow store calls a database may
+      go unswept until its next commit; the `blobs` workload's final GC
+      check then fails (`sim_tool trace blobs 5000231`, where both sweeps
+      after the last two commits found the lease expired).
 - [ ] **Fix `streams` seed 202835: expired stream records are returned after
       `retention_ms`.** Stream reads return records older than `retention_ms`
       (`sim_tool trace streams 202835`).

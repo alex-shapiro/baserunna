@@ -7,7 +7,7 @@
 //! with another merge of the same parts) fails validation and is retried
 //! from a new snapshot, and its outputs are deleted at once.
 
-use super::build::{PathPlan, dictionary, plan_paths, write_encoded};
+use super::build::{PART_BUILD_BYTES, PathPlan, build_cost, dictionary, plan_paths, write_encoded};
 use super::json::{self, JType};
 use super::part::{self, Caching, ColPlan, ColRef, PartMeta, ReadStats, Reading, SharedPath, Sink, Source};
 use super::query::Filter;
@@ -87,14 +87,27 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
     let max_parts = refs_per_txn(cfg);
     let (mut bytes, mut rows, mut last) = (0u64, 0u64, None);
     let mut by_partition: BTreeMap<u32, Vec<(Pos, &[u8])>> = BTreeMap::new();
+    // Each partition's encoded bytes and build cost, which bound how many
+    // parts it is written as: a part holds at least half of either limit.
+    let mut sizes: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+    let parts_of = |(enc, cost): (usize, usize)| {
+        1 + enc / (cfg.event_insert_part_max_bytes / 2).max(1) + cost / (PART_BUILD_BYTES / 2)
+    };
+    let mut parts_needed = 0;
     for it in &items {
         let (_, pos) = ev::parse_row_key(&it.key).ok_or_else(|| Error::internal("bad unsealed row key"))?;
         let Value::Inline(b) = &it.value else { return Err(Error::internal("unsealed row stored out of line")) };
         let row = decode_row(b).map_err(|_| Error::internal("corrupt unsealed row"))?;
         let partition = ev::partition_key(s.bucket(s.time_of(&row)));
-        if !by_partition.contains_key(&partition) && by_partition.len() >= max_parts {
+        let old = sizes.get(&partition).copied();
+        let (enc, cost) = old.unwrap_or_default();
+        let new = (enc + b.len() + 12, cost + build_cost(b.len()));
+        let needed = parts_needed - old.map_or(0, parts_of) + parts_of(new);
+        if needed > max_parts && last.is_some() {
             break;
         }
+        parts_needed = needed;
+        sizes.insert(partition, new);
         bytes += (it.key.len() + b.len()) as u64;
         rows += 1;
         last = Some(pos);
@@ -1061,8 +1074,8 @@ mod tests {
     }
 
     #[test]
-    fn rows_split_by_size_and_count() {
-        use super::super::build::{PART_BUILD_ROWS, next_part};
+    fn rows_split_by_size_and_build_cost() {
+        use super::super::build::{PART_BUILD_BYTES, build_cost, next_part};
         let row = [b'x'; 100];
         let rows = |n: u32| (0..n).map(|i| (Pos { version: 1, ordinal: i }, &row[..]));
         let groups = |n: u32, max: usize| {
@@ -1075,6 +1088,7 @@ mod tests {
         };
         assert_eq!(groups(10, 350), [3, 3, 3, 1]);
         assert_eq!(groups(1, 1), [1], "a row larger than the limit is a part of its own");
-        assert_eq!(groups(PART_BUILD_ROWS as u32 * 2 + 1, usize::MAX), [PART_BUILD_ROWS, PART_BUILD_ROWS, 1]);
+        let per_part = PART_BUILD_BYTES / build_cost(100);
+        assert_eq!(groups(per_part as u32 * 2 + 1, usize::MAX), [per_part, per_part, 1]);
     }
 }

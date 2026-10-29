@@ -2929,6 +2929,31 @@ mod liveness {
         });
     }
 
+    /// A seal of a million rows of one partition fits one transaction's
+    /// references however small the transaction limit.
+    #[test]
+    fn seal_parts_fit_one_transaction() {
+        rt().block_on(async {
+            let big = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
+            let (eng, store, env) = engine(9, big.clone());
+            env.spawn(async {});
+            let db = create_db(&eng, "d").await;
+            for k in 0..10i64 {
+                let rows: Vec<Json> =
+                    (0..100_000i64).map(|i| json!({"time": T0 + i, "event": "t", "n": i + k * 100_000})).collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            }
+            db.release_lease().await.unwrap();
+            let small = EngineConfig { txn_max_write_bytes: 2048, ..big };
+            let eng2 = crate::engine::Engine::new(store.clone(), env.clone(), small, "node-b".into());
+            let db2 = eng2.db("d");
+            db2.open(false).await.unwrap();
+            let id = table_id(&db2).await;
+            let r = maint::seal(&db2, id).await;
+            assert!(matches!(r, Ok(true)), "seal of one partition: {r:?}");
+        });
+    }
+
     /// Retention drops the parts of a merge that failed, which merges leave out.
     #[test]
     fn retention_drops_parts_of_failed_merges() {

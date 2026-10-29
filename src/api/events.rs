@@ -259,18 +259,24 @@ impl<'de> serde::de::Visitor<'de> for Body<'_> {
         serde::de::Visitor::visit_seq(Events { f: self.f, failed: self.failed }, seq).map(|()| None)
     }
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<Option<String>, A::Error> {
-        let (mut key, mut rows) = (None, false);
+        let (mut key, mut rows, mut keyed) = (None, false, false);
         while let Some(k) = map.next_key::<String>()? {
+            if (k == "rows" && rows) || (k == "idempotency_key" && keyed) {
+                return Err(self.refuse(Error::invalid(format!("{k:?} appears twice"))));
+            }
             match k.as_str() {
                 "rows" => {
                     map.next_value_seed(Events { f: &mut *self.f, failed: &mut *self.failed })?;
                     rows = true;
                 }
-                "idempotency_key" => match map.next_value::<Json>()? {
-                    Json::Null => key = None,
-                    Json::String(k) => key = Some(k),
-                    _ => return Err(self.refuse(Error::invalid("idempotency_key is a string"))),
-                },
+                "idempotency_key" => {
+                    keyed = true;
+                    match map.next_value::<Json>()? {
+                        Json::Null => key = None,
+                        Json::String(k) => key = Some(k),
+                        _ => return Err(self.refuse(Error::invalid("idempotency_key is a string"))),
+                    }
+                }
                 other => return Err(self.refuse(Error::invalid(format!("unknown field {other:?}")))),
             }
         }

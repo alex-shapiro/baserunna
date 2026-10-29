@@ -30,23 +30,29 @@ pub fn stored_len(row: &Row) -> usize {
     encode_row(row).len() + 12 + flat
 }
 
-/// The most rows decoded at once to write a part, which bounds the memory
-/// of seals and bulk inserts whatever their events' sizes.
-pub const PART_BUILD_ROWS: usize = 32_768;
+/// The most memory, as estimated by [`build_cost`], that the rows of one
+/// part take decoded, which bounds the memory of seals and bulk inserts
+/// whatever their events' sizes.
+pub const PART_BUILD_BYTES: usize = 64 << 20;
 
-/// Takes from `rows` the next part's: about `max_bytes` of encodings and at
-/// most [`PART_BUILD_ROWS`] rows, at least one.
+/// The memory a row encoded in `len` bytes takes while its part is built.
+pub fn build_cost(len: usize) -> usize {
+    3 * len + 256
+}
+
+/// Takes from `rows` the next part's: about `max_bytes` of encodings and
+/// [`PART_BUILD_BYTES`] of decoded rows, at least one row.
 pub fn next_part<'a>(
     rows: &mut std::iter::Peekable<impl Iterator<Item = (Pos, &'a [u8])>>,
     max_bytes: usize,
 ) -> Vec<(Pos, &'a [u8])> {
-    let (mut group, mut bytes) = (Vec::new(), 0);
+    let (mut group, mut bytes, mut cost) = (Vec::new(), 0, 0);
     while let Some((_, r)) = rows.peek() {
-        let n = r.len() + 12;
-        if !group.is_empty() && (bytes + n > max_bytes || group.len() >= PART_BUILD_ROWS) {
+        let (n, c) = (r.len() + 12, build_cost(r.len()));
+        if !group.is_empty() && (bytes + n > max_bytes || cost + c > PART_BUILD_BYTES) {
             break;
         }
-        bytes += n;
+        (bytes, cost) = (bytes + n, cost + c);
         group.extend(rows.next());
     }
     group

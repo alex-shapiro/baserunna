@@ -299,12 +299,36 @@ fn json_eq(a: &Json, b: &Json) -> bool {
     }
 }
 
+/// Compares two JSON numbers by their exact values.
 fn number_order(x: &Number, y: &Number) -> Option<Ordering> {
-    match (x.as_i64(), y.as_i64(), x.as_u64(), y.as_u64()) {
-        (Some(a), Some(b), _, _) => Some(a.cmp(&b)),
-        (_, _, Some(a), Some(b)) => Some(a.cmp(&b)),
-        _ => x.as_f64()?.partial_cmp(&y.as_f64()?),
+    let int = |n: &Number| n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from));
+    match (int(x), int(y)) {
+        (Some(a), Some(b)) => Some(a.cmp(&b)),
+        (Some(a), None) => int_float_order(a, y.as_f64()?),
+        (None, Some(b)) => int_float_order(b, x.as_f64()?).map(Ordering::reverse),
+        (None, None) => x.as_f64()?.partial_cmp(&y.as_f64()?),
     }
+}
+
+/// Compares integer `i` with float `f` exactly, where converting either to
+/// the other's type would round.
+pub(crate) fn int_float_order(i: i128, f: f64) -> Option<Ordering> {
+    const TWO_127: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    if f.is_nan() {
+        return None;
+    }
+    if f >= TWO_127 {
+        return Some(Ordering::Less);
+    }
+    if f < -TWO_127 {
+        return Some(Ordering::Greater);
+    }
+    let t = f.trunc();
+    Some(match i.cmp(&(t as i128)) {
+        Ordering::Equal if f > t => Ordering::Less,
+        Ordering::Equal if f < t => Ordering::Greater,
+        o => o,
+    })
 }
 
 /// Whether `needle` occurs in `hay`.
@@ -316,6 +340,40 @@ pub fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Numbers near the limits of f64 and i64 compare as their exact values:
+    /// the order is total and agrees with i128 arithmetic where both are
+    /// integers.
+    #[test]
+    fn numbers_compare_exactly() {
+        let mut r = crate::util::rng::Rng::new(5);
+        let mut nums: Vec<Number> = Vec::new();
+        for _ in 0..400 {
+            let base = [0i64, 1 << 53, 1 << 60, i64::MAX - 1024, -(1 << 53)][r.usize(5)];
+            let i = base.wrapping_add(r.below(64) as i64 - 32);
+            nums.push(Number::from(i));
+            nums.push(Number::from_f64(i as f64 + [0.0, 0.5, -0.25][r.usize(3)]).unwrap());
+        }
+        nums.push(Number::from(u64::MAX));
+        nums.push(Number::from_f64(18_446_744_073_709_551_616.0).unwrap());
+        let ord = |a: &Number, b: &Number| number_order(a, b).unwrap();
+        for a in &nums {
+            for b in nums.iter().take(120) {
+                assert_eq!(ord(a, b), ord(b, a).reverse(), "{a} vs {b}");
+                if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+                    assert_eq!(ord(a, b), x.cmp(&y));
+                }
+            }
+        }
+        let mut sorted = nums.clone();
+        sorted.sort_by(ord);
+        for w in sorted.windows(3) {
+            assert_ne!(ord(&w[0], &w[2]), Ordering::Greater, "{} {} {}", w[0], w[1], w[2]);
+        }
+        let big = Number::from(1_152_921_504_606_846_977i64);
+        assert_eq!(ord(&big, &Number::from_f64(1_152_921_504_606_846_976.0).unwrap()), Ordering::Greater);
+        assert!(!json_eq(&json!([1_152_921_504_606_846_976.0]), &json!([1_152_921_504_606_846_977i64])));
+    }
 
     /// Comparisons name one JSON value, `v`.
     #[derive(Debug, PartialEq)]

@@ -77,6 +77,7 @@ impl Val {
         match self {
             Val::Float(f) if let Some(i) = exact_int(f) => Val::Int(i),
             Val::List(v) => Val::List(v.into_iter().map(Val::canonical).collect()),
+            Val::Json(j) => Val::Json(canonical_json(&j)),
             v => v,
         }
     }
@@ -127,7 +128,7 @@ impl Val {
             }
             Val::Json(j) => {
                 out.push(5);
-                put_escaped(out, j.to_string().as_bytes());
+                put_escaped(out, canonical_json(j).to_string().as_bytes());
             }
             Val::List(v) => {
                 out.push(6);
@@ -290,6 +291,20 @@ fn json_mem(j: &Json) -> usize {
     }
 }
 
+/// `j` with integral floats as ints, so that JSON values equal to each other
+/// have one text.
+fn canonical_json(j: &Json) -> Json {
+    match j {
+        Json::Number(n) if n.as_i64().is_none() && n.as_u64().is_none() => match n.as_f64().and_then(exact_int) {
+            Some(i) => Json::from(i),
+            None => j.clone(),
+        },
+        Json::Array(a) => Json::Array(a.iter().map(canonical_json).collect()),
+        Json::Object(m) => Json::Object(m.iter().map(|(k, v)| (k.clone(), canonical_json(v))).collect()),
+        _ => j.clone(),
+    }
+}
+
 /// 2^63, the first float past every `i64`.
 const TWO_63: f64 = 9_223_372_036_854_775_808.0;
 
@@ -310,21 +325,9 @@ fn put_escaped(out: &mut Vec<u8>, b: &[u8]) {
     out.extend([0, 0]);
 }
 
-/// Compares integer `i` with float `f` exactly, where converting either to
-/// the other's type would round.
+/// Compares integer `i` with float `f` exactly; stored floats are finite.
 fn int_float_cmp(i: i64, f: f64) -> Ordering {
-    if f.is_nan() || f >= TWO_63 {
-        return Ordering::Less;
-    }
-    if f < -TWO_63 {
-        return Ordering::Greater;
-    }
-    let t = f.trunc();
-    match i.cmp(&(t as i64)) {
-        Ordering::Equal if f > t => Ordering::Less,
-        Ordering::Equal if f < t => Ordering::Greater,
-        o => o,
-    }
+    crate::filter::int_float_order(i as i128, f).unwrap_or(Ordering::Less)
 }
 
 /// The distinct values of a `uniq_exact`, counting the bytes they hold.

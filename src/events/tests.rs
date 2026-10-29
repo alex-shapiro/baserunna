@@ -2959,7 +2959,7 @@ mod liveness {
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let done = Arc::new(std::sync::atomic::AtomicI64::new(0));
             let (db2, stop2, done2) = (db.clone(), stop.clone(), done.clone());
-            let inserter = tokio::spawn(async move {
+            let inserter = async move {
                 let mut i = 0i64;
                 while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
                     done2.store(i, std::sync::atomic::Ordering::Relaxed);
@@ -2971,15 +2971,17 @@ mod liveness {
                     tokio::task::yield_now().await;
                 }
                 i
-            });
+            };
             let merged_before = crate::probe::count(Probe::PartsMerged);
             let sealed_before = crate::probe::count(Probe::EventsSealed);
-            while done.load(std::sync::atomic::Ordering::Relaxed) < 500 {
-                maint::maintain(&db, id, 64).await.unwrap();
-                tokio::task::yield_now().await;
-            }
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            let inserted = inserter.await.unwrap();
+            let maintainer = async {
+                while done.load(std::sync::atomic::Ordering::Relaxed) < 500 {
+                    maint::maintain(&db, id, 64).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            };
+            let (inserted, ()) = tokio::join!(inserter, maintainer);
             let sealed = crate::probe::count(Probe::EventsSealed) - sealed_before;
             let merged = crate::probe::count(Probe::PartsMerged) - merged_before;
             let parts = part_count(&db, id).await;
@@ -3006,7 +3008,7 @@ mod liveness {
             let done = Arc::new(std::sync::atomic::AtomicI64::new(0));
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (db2, stop2, done2) = (db.clone(), stop.clone(), done.clone());
-            let inserter = tokio::spawn(async move {
+            let inserter = async move {
                 let mut i = 0i64;
                 while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
                     done2.store(i, std::sync::atomic::Ordering::Relaxed);
@@ -3018,14 +3020,16 @@ mod liveness {
                     tokio::task::yield_now().await;
                 }
                 i
-            });
+            };
             let expired_before = crate::probe::count(Probe::EventPartsExpired);
-            while done.load(std::sync::atomic::Ordering::Relaxed) < 500 {
-                maint::maintain(&db, id, 64).await.unwrap();
-                tokio::task::yield_now().await;
-            }
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            let inserted = inserter.await.unwrap();
+            let maintainer = async {
+                while done.load(std::sync::atomic::Ordering::Relaxed) < 500 {
+                    maint::maintain(&db, id, 64).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            };
+            let (inserted, ()) = tokio::join!(inserter, maintainer);
             let expired = crate::probe::count(Probe::EventPartsExpired) - expired_before;
             let parts = part_count(&db, id).await;
             maint::maintain(&db, id, 64).await.unwrap();

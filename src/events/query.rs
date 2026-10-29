@@ -363,13 +363,18 @@ fn stage(o: &mut Map<String, Json>) -> Result<Stage> {
     if group_by.is_empty() && aggregates.is_empty() {
         return Err(Error::invalid("a stage needs group_by or aggregates"));
     }
-    let mut names = std::collections::BTreeSet::new();
-    for n in group_by.iter().map(|g| &g.name).chain(aggregates.iter().map(|a| &a.name)) {
-        if !names.insert(n) {
+    unique_names(group_by.iter().map(|g| &g.name).chain(aggregates.iter().map(|a| &a.name)))?;
+    Ok(Stage { group_by, aggregates })
+}
+
+fn unique_names<'a>(names: impl Iterator<Item = &'a String>) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for n in names {
+        if !seen.insert(n) {
             return Err(Error::invalid(format!("output {n:?} is named twice; rename one with \"as\"")));
         }
     }
-    Ok(Stage { group_by, aggregates })
+    Ok(())
 }
 
 /// A lookup through a row table whose primary key is a single column.
@@ -481,6 +486,7 @@ impl Query {
                 }
                 _ => return Err(Error::invalid(format!("columns is an array of 1..={EXPRS_MAX} expressions"))),
             };
+            unique_names(columns.iter().map(|c| &c.name))?;
             let cursor = match o.remove("cursor") {
                 None | Some(Json::Null) => None,
                 Some(Json::String(c)) => Some(c),

@@ -153,7 +153,10 @@ pub(crate) fn default_query(t: &Json) -> String {
     if key != time {
         group_by.push(json!(key));
     }
-    json!({"from": "2000-01-01", "to": "2100-01-01", "group_by": group_by,
+    // The 30 days before the newest partition ends, and any newer events.
+    let newest = t["partitions"].as_array().into_iter().flatten().filter_map(|p| p["end"].as_i64()).max();
+    let from = newest.map_or(json!("2000-01-01"), |end| json!(end - 30 * 86_400_000));
+    json!({"from": from, "to": "2100-01-01", "group_by": group_by,
         "aggregates": {count: {"fn": "count"}}, "order_by": [{"col": count, "desc": true}], "limit": 50})
     .to_string()
 }
@@ -264,7 +267,7 @@ async fn run_query(s: &Session, db: &str, t: &Json, text: &str) -> String {
             }
             let times = time_outputs(t, &q);
             let name = t["name"].as_str().unwrap_or_default();
-            let reply = s.call("POST", &format!("{}/query", api_table(db, name)), Some(q)).await;
+            let reply = s.call("POST", &format!("{}/rows/query", api_table(db, name)), Some(q)).await;
             match reply.status.is_success() {
                 true => answer_html(&reply.body, &times),
                 false => format!(

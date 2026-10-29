@@ -377,12 +377,15 @@ events to row tables.
   rows (`columns`, every column when omitted, with `order_by` and a resume
   `cursor`, up to 10,000 rows per page) or aggregates. Aggregates group by
   columns, JSON paths, lookups and time buckets (`interval` in seconds,
-  minutes, hours, days, weeks starting Monday, or calendar months, with
+  minutes, hours or days counted from the epoch, so `7d` starts on
+  Thursdays, weeks starting Monday, or calendar months, with
   an optional fixed `offset` for a time zone), and compute `count`, `sum`, `min`, `max`, `avg`, `uniq`
   (HyperLogLog, exact up to 1,024 values), `uniq_exact`, `quantiles`
   (within 1% relative error), `window_funnel` and `retention`, each with an
   optional `where`. A `then` stage aggregates the first stage's groups, so a
-  funnel per user becomes a count per funnel step. Sums of floats are exact,
+  funnel per user becomes a count per funnel step. An aggregate query
+  returns its first `limit` groups by `order_by`, or, without a `limit`,
+  every group, failing with `413` past 100,000. Sums of floats are exact,
   so answers never depend on how events are stored or merged. Lookups map a
   value through a row table (`{table, key, value, default}`), such as a
   user id to a plan. A query reads a snapshot at most 5 s old (or
@@ -817,7 +820,7 @@ only with a concurrent delete of those rows.
 
 #### Bulk inserts
 
-Each node buffers bulk inserts per database for up to 200 ms or 16 MiB,
+Each node buffers bulk inserts per event table for up to 200 ms or 16 MiB,
 writes the buffered events as staged parts directly to the store, and sends
 the lease holder one bind (`/internal/v1/events/bind`) listing each
 request's parts. The committer installs every request's parts in one
@@ -1369,8 +1372,8 @@ GET /v1/dbs/{db}/events/{t} PATCH /v1/dbs/{db}/events/{t} (retention) DELETE /v1
 POST /v1/dbs/{db}/events/{t}/columns DELETE /v1/dbs/{db}/events/{t}/columns/{c}
 POST /v1/dbs/{db}/events/{t}/skip-indexes DELETE /v1/dbs/{db}/events/{t}/skip-indexes/{c}
 POST /v1/dbs/{db}/events/{t}/rows insert: JSON or NDJSON; Idempotency-Key
-POST /v1/dbs/{db}/events/{t}/query
-POST /v1/dbs/{db}/events/{t}/delete from, to, where
+POST /v1/dbs/{db}/events/{t}/rows/query
+POST /v1/dbs/{db}/events/{t}/rows/delete from, to, where
 GET /v1/admin/users GET /v1/admin/nodes POST /v1/admin/users/{id}/disable
 GET|DELETE /v1/admin/metrics read (and on DELETE, reset) node latency metrics
 ```
@@ -1429,7 +1432,7 @@ JavaScript framework and no external assets. Pages:
   drop; add and drop columns and indexes; rows), streams (create, delete,
   retention; newest records first, older pages, appending a record;
   consumers), event tables (create, drop; partitions and parts; a query
-  runner that starts with events per day; inserting events), and a
+  runner that starts with events per day of the newest month; inserting events), and a
   transaction runner (JSON);
 - organizations: list, create, delete; members (add by email, change
   role, remove, leave) and the organization's databases;

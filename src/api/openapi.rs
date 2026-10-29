@@ -411,7 +411,8 @@ fn schemas() -> Value {
             omitted, with `order_by` and `cursor`) or aggregates (`group_by` and `aggregates`, with an optional second stage `then`). Expressions \
             are a column name, `{col, path?}`, `{lookup}` or `{bucket, interval, offset?}`; aggregates are count, sum, \
             min, max, avg, uniq, uniq_exact, quantiles, window_funnel and retention, each with an optional `where`. \
-            Queries read a snapshot at most 5 s old unless `consistency` is `strong`."},
+            Aggregates answer with the first `limit` groups by `order_by`, or without a `limit` with every group, \
+            failing with 413 past 100,000. Queries read a snapshot at most 5 s old unless `consistency` is `strong`."},
         "EventQueryStats": obj(json!({"source": s(), "nodes": i(), "parts": i(), "parts_read": i(), "granules": i(),
             "granules_read": i(), "rows_read": i(), "unsealed_rows": i(), "bytes_read": i(), "store_gets": i()}),
             &["source", "nodes", "parts", "parts_read", "granules", "granules_read", "rows_read", "unsealed_rows",
@@ -1666,7 +1667,7 @@ fn paths() -> Value {
         },
     );
     add(
-        "/v1/dbs/{db}/events/{t}/query",
+        "/v1/dbs/{db}/events/{t}/rows/query",
         "post",
         Op {
             body: Some(json_body(r("EventQuery"))),
@@ -1675,7 +1676,7 @@ fn paths() -> Value {
         },
     );
     add(
-        "/v1/dbs/{db}/events/{t}/delete",
+        "/v1/dbs/{db}/events/{t}/rows/delete",
         "post",
         Op {
             body: Some(json_body(r("EventDelete"))),

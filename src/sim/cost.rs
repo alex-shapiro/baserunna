@@ -802,7 +802,7 @@ async fn events(w: &mut World, out: &mut Vec<Measurement>) {
 
     let query = json!({"from": day, "to": day + 86_400_000, "group_by": ["event"],
         "aggregates": {"n": {"fn": "count"}, "total": {"fn": "sum", "of": "value"}}});
-    let path = "/v1/dbs/analytics/events/e/query";
+    let path = "/v1/dbs/analytics/events/e/rows/query";
     let first = w.json(0, "POST", path, &t, query.clone()).await;
     assert_eq!(first["rows"].as_array().map(Vec::len), Some(3), "{first}");
     let r = Recorder::start(s, &id);

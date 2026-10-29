@@ -204,7 +204,7 @@ fn seeds() -> Vec<(&'static str, &'static str, Value)> {
         ),
         (
             "POST",
-            "/v1/dbs/fz/events/e/query",
+            "/v1/dbs/fz/events/e/rows/query",
             json!({"from": 0, "to": "2100-01-01", "where": {"or": [{"col": "kind", "op": "in", "value": ["a"]},
                 {"col": "props", "path": ["y", "z"], "op": "prefix", "value": "w"}]},
             "lookups": {"p": {"table": "people", "key": {"col": "kind"}, "value": "who", "default": {"col": "kind"}}},
@@ -216,11 +216,11 @@ fn seeds() -> Vec<(&'static str, &'static str, Value)> {
         ),
         (
             "POST",
-            "/v1/dbs/fz/events/e/query",
+            "/v1/dbs/fz/events/e/rows/query",
             json!({"from": 0, "to": 9_000_000_000_000i64, "columns": ["time", "kind", "props", {"col": "props", "path": ["x"], "as": "x"}],
             "order_by": [{"col": "kind", "desc": true}], "limit": 2, "cursor": null, "consistency": "strong"}),
         ),
-        ("POST", "/v1/dbs/fz/events/e/delete", json!({"from": 0, "where": {"col": "n", "op": "ge", "value": 5}})),
+        ("POST", "/v1/dbs/fz/events/e/rows/delete", json!({"from": 0, "where": {"col": "n", "op": "ge", "value": 5}})),
         ("POST", "/v1/dbs/fz/events/e/columns", json!({"name": "extra", "type": "float", "default": 1.5})),
         ("POST", "/v1/dbs/fz/events/e/skip-indexes", json!({"column": "kind", "type": "bloom"})),
         ("PATCH", "/v1/dbs/fz/events/e", json!({"retention_ms": 3_600_000})),

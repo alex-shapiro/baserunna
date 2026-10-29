@@ -42,6 +42,8 @@ pub const BLOOM_GRANULES: u32 = 4;
 const BLOOM_BITS: usize = 10;
 /// Most distinct strings coded into a part-level dictionary.
 pub const DICT_MAX: usize = 65_536;
+/// The most rows a block holds.
+pub const BLOCK_ROWS_MAX: usize = 1 << 22;
 /// The longest sort key the primary index holds; granules starting or
 /// ending at a longer one are not pruned by it.
 pub const PK_KEY_MAX: usize = 4096;
@@ -607,7 +609,7 @@ fn encode_block(v: &Vector, dict: Option<&BTreeMap<&str, u32>>) -> Result<Vec<u8
 /// Decodes a block's values; `dict` is its column's part-level dictionary.
 pub fn decode_block(raw: &[u8], phys: Phys, dict: Option<&Arc<Vec<String>>>) -> DResult<Vector> {
     let mut r = Reader::new(raw);
-    let n = r.len(1 << 22)?;
+    let n = r.len(BLOCK_ROWS_MAX)?;
     let nulls = match r.u8()? {
         NULLS_NONE => None,
         NULLS_BITMAP => Some(get_bitmap(&mut r, n)?),
@@ -877,7 +879,7 @@ pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_
         let mut hashes = Vec::new();
         let mut nonnull = 0u64;
         let mut pending: Vec<Vector> = Vec::new();
-        let mut pending_bytes = 0usize;
+        let (mut pending_bytes, mut pending_rows) = (0usize, 0usize);
         let mut first = 0u32;
         for (g, gr) in granules.iter().enumerate() {
             let v = src.column(pi, starts[g]..starts[g] + *gr as u64).await?;
@@ -896,8 +898,10 @@ pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_
                 }
             }
             pending_bytes += vector_bytes(&v);
+            pending_rows += v.len();
             pending.push(v);
-            if pending_bytes >= block_bytes || g + 1 == granules.len() {
+            let next_rows = granules.get(g + 1).map_or(0, |n| *n as usize);
+            if pending_bytes >= block_bytes || pending_rows + next_rows > BLOCK_ROWS_MAX || g + 1 == granules.len() {
                 let block = Vector::concat(std::mem::take(&mut pending), plan.phys);
                 let raw = encode_block(&block, dict_map.as_ref())?;
                 let off = sink.pos();
@@ -905,7 +909,7 @@ pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_
                 sink.write(&framed);
                 blocks.push(BlockLoc { off, len: framed.len() as u64, first_granule: first });
                 first = g as u32 + 1;
-                pending_bytes = 0;
+                (pending_bytes, pending_rows) = (0, 0);
                 sink.flush(false).await?;
             }
         }

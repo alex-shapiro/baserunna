@@ -454,7 +454,7 @@ async fn querier(c: Client, w: Shared, base: i64, steps: usize) -> Result<(), St
             (g.extra_since.is_some(), g.events.keys().nth(i).cloned())
         };
         let q = random_query(&c, base, extra, uid);
-        let r = c.call("POST", &format!("{DB}/events/e/query"), Some(q.clone())).await;
+        let r = c.call("POST", &format!("{DB}/events/e/rows/query"), Some(q.clone())).await;
         match r {
             Ok(r) if r.status == 200 => world(&w).answers.push((q, r.json)),
             Ok(r) if r.status == 503 || r.status == 429 => {}
@@ -501,7 +501,7 @@ async fn all_uids(c: &Client) -> Result<(BTreeSet<String>, u64), String> {
         if let Some(cur) = &cursor {
             q["cursor"] = json!(cur);
         }
-        let r = c.call_retry("POST", &format!("{DB}/events/e/query"), Some(q)).await;
+        let r = c.call_retry("POST", &format!("{DB}/events/e/rows/query"), Some(q)).await;
         if r.status != 200 {
             return Err(format!("final read: {} {}", r.status, r.json));
         }
@@ -695,7 +695,7 @@ async fn tour(c: &Client) -> Result<(), String> {
     let r = c.call_settled("POST", &format!("{DB}/txn"), Some(del)).await;
     expect(&r, 200, "delete in a transaction")?;
     let r = c
-        .call_settled("POST", &format!("{t}/delete"), Some(json!({"where": {"col": "n", "op": "eq", "value": 3}})))
+        .call_settled("POST", &format!("{t}/rows/delete"), Some(json!({"where": {"col": "n", "op": "eq", "value": 3}})))
         .await;
     expect(&r, 200, "delete")?;
     let r = c.call_retry("GET", &t, None).await;
@@ -731,7 +731,7 @@ async fn check_retention(c: &Client, (applied, unknown): (u64, u64)) -> Result<(
         let q = json!({"from": i64::MIN / 4, "to": i64::MAX / 4, "consistency": "strong",
             "aggregates": {"stale": {"fn": "count", "where": {"col": "time", "op": "lt", "value": now - 3 * HOUR}},
                            "future": {"fn": "count", "where": {"col": "time", "op": "gt", "value": now + 20 * HOUR}}}});
-        let a = c.call_retry("POST", &format!("{DB}/events/old/query"), Some(q)).await;
+        let a = c.call_retry("POST", &format!("{DB}/events/old/rows/query"), Some(q)).await;
         let col = |n: &str| {
             let cols = a.json["columns"].as_array().cloned().unwrap_or_default();
             cols.iter().position(|c| c == n).and_then(|i| a.json["rows"][0][i].as_u64())

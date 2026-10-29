@@ -80,6 +80,31 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 - [ ] **Bound merge memory.** `merge_parts` holds the sort key of every live
       input row at once, so a final merge of 4 GiB of small events holds
       hundreds of MB of keys. Merge sorted runs block by block instead.
+- [ ] **Find event tables by id in constant work.** `maint::schema_by_id`
+      decodes the event catalog, at most its first 10,000 entries, on every
+      seal and maintenance round, so a database with more event tables never
+      seals or merges the rest. Keep an id-to-name index in the catalog.
+- [ ] **Cap event part bytes on transactional inserts.** `event_max_bytes`
+      is checked only when binds add parts (`Db::bind`); events inserted by
+      transactions become parts through seals, which never refuse. Count
+      unsealed bytes toward the cap at commit.
+- [ ] **Charge event queries to the node memory budget.** A query's
+      aggregation state, kept rows and lookup maps (up to 1 GiB each,
+      `exec::Limits`) are charged to the query only, so
+      `query_concurrency` queries can hold many times `memory_bytes`.
+      Reserve query memory through the node's `MemoryGate`, and share query
+      slots fairly among users (`Node::query_slot` is first come, first
+      served).
+- [ ] **Bound event query reads while parts are in flight.** The 4 GiB read
+      limit is checked between absorbed parts, so up to
+      `event_read_concurrency` concurrent part reads can overshoot it.
+- [ ] **Retry stale event queries only for schema misses.** A snapshot query
+      failing with any `400` or `404` reruns at strong consistency with a
+      fresh time limit (`api::events::query`), doubling the cost of a plain
+      query mistake.
+- [ ] **Treat `query_events` in transactions like event queries.** The op
+      takes no query slot, gets no deadline extension, and drops a
+      `consistency` it is given.
 - [ ] **Sweep staged event parts after the last event table is dropped.**
       Sweeps list `part/` only while a database has event tables or part
       bytes, so a part staged by a bulk insert that races a drop of the last
@@ -186,7 +211,9 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       membership liveness window from both intervals, and send commit notices to
       the home nodes of both previous and current membership views.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the
-      model-checked `http_txn` target.
+      model-checked `http_txn` target. The `events` target feeds raw bytes
+      to `PartMeta::decode` and `ColIndex::decode`, which check a frame CRC
+      first; fuzz the bytes after `unframe` instead.
 - [ ] **Run mutation testing in CI**, running `scripts/mutants.sh --in-diff` on
       pull requests and the full suite weekly.
 - [ ] **Track cost and throughput benchmarks in CI** across commits.
@@ -209,6 +236,12 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       `09-stale-names-after-purge`, `11-duplicated-forwards`, and
       `16-duplicated-forwards-across-restart` so that they can be applied to
       `main`.
+
+## API
+
+- [ ] **Share one forwarding loop.** `Node::bind_events` and
+      `Node::forward_internal` repeat the retry and lease-refresh logic of
+      `Node::meta` for forwarded system commands.
 
 ## Docs
 

@@ -41,7 +41,7 @@ async fn setup(nodes: usize) -> (World, String) {
 
 async fn count(w: &World, i: usize, t: &str) -> Json {
     let q = json!({"from": 0, "to": i64::MAX / 8, "aggregates": {"n": {"fn": "count"}}, "consistency": "strong"});
-    let (s, r) = send(w, i, t, "POST", "/v1/dbs/d/events/ev/query", &[], &q.to_string()).await;
+    let (s, r) = send(w, i, t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], &q.to_string()).await;
     assert_eq!(s, 200, "{r}");
     r["rows"][0][0].clone()
 }
@@ -95,7 +95,7 @@ fn read_only_keys_and_strangers_cannot_write_events() {
         let nd = [("content-type", "application/x-ndjson")];
         assert_eq!(send(&w, 0, &ro, "POST", "/v1/dbs/d/events/ev/rows", &nd, "{\"event\":\"a\"}\n").await.0, 403);
         let del = json!({"where": {"col": "event", "op": "eq", "value": "a"}}).to_string();
-        assert_eq!(send(&w, 0, &ro, "POST", "/v1/dbs/d/events/ev/delete", &j, &del).await.0, 403);
+        assert_eq!(send(&w, 0, &ro, "POST", "/v1/dbs/d/events/ev/rows/delete", &j, &del).await.0, 403);
         assert_eq!(send(&w, 0, &ro, "PATCH", "/v1/dbs/d/events/ev", &j, r#"{"retention_ms": 1}"#).await.0, 403);
         assert_eq!(send(&w, 0, &ro, "DELETE", "/v1/dbs/d/events/ev", &[], "").await.0, 403);
         let col = r#"{"name":"x","type":"int"}"#;
@@ -110,7 +110,7 @@ fn read_only_keys_and_strangers_cannot_write_events() {
             "where": {"col": "event", "op": "eq", "value": "a"}}]})
         .to_string();
         assert_eq!(send(&w, 0, &ro, "POST", "/v1/dbs/d/txn", &j, &txn).await.0, 403);
-        let (s, r) = send(&w, 0, &ro, "POST", "/v1/dbs/d/events/ev/query", &j, r#"{"from":0,"to":1}"#).await;
+        let (s, r) = send(&w, 0, &ro, "POST", "/v1/dbs/d/events/ev/rows/query", &j, r#"{"from":0,"to":1}"#).await;
         assert_eq!(s, 200, "{r}");
         let other = w.signup(0, "other@api.test").await;
         w.create_db(0, &t, "e").await;
@@ -231,11 +231,11 @@ fn event_responses_match_the_openapi_document() {
             ("PATCH", "/v1/dbs/d/events/ev", json!({"retention_ms": null})),
             ("GET", "/v1/dbs/d/events/ev", Json::Null),
             ("GET", "/v1/dbs/d/events", Json::Null),
-            ("POST", "/v1/dbs/d/events/ev/query", json!({"from": 0, "to": "2100-01-01"})),
-            ("POST", "/v1/dbs/d/events/ev/query", json!({"from": 0, "to": "2100-01-01", "limit": 1})),
+            ("POST", "/v1/dbs/d/events/ev/rows/query", json!({"from": 0, "to": "2100-01-01"})),
+            ("POST", "/v1/dbs/d/events/ev/rows/query", json!({"from": 0, "to": "2100-01-01", "limit": 1})),
             (
                 "POST",
-                "/v1/dbs/d/events/ev/query",
+                "/v1/dbs/d/events/ev/rows/query",
                 json!({"from": 0, "to": "2100-01-01", "group_by": ["event"],
                 "aggregates": {"n": {"fn": "count"}, "u": {"fn": "uniq", "col": "user"},
                 "q": {"fn": "quantiles", "col": "n", "levels": [0.5]}}}),
@@ -247,7 +247,7 @@ fn event_responses_match_the_openapi_document() {
                 {"op": "query_events", "table": "ev", "from": 0, "to": "2100-01-01",
                  "aggregates": {"n": {"fn": "count"}}}]}),
             ),
-            ("POST", "/v1/dbs/d/events/ev/delete", json!({"where": {"col": "event", "op": "eq", "value": "a"}})),
+            ("POST", "/v1/dbs/d/events/ev/rows/delete", json!({"where": {"col": "event", "op": "eq", "value": "a"}})),
             (
                 "POST",
                 "/v1/dbs/d/txn",
@@ -291,7 +291,7 @@ fn query_consistency_options() {
             (r#"{"from":0,"to":1,"max_staleness_ms":0}"#, 200),
             (r#"{"from":0,"to":1,"consistency":"strong"}"#, 200),
         ] {
-            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/query", &[], q).await;
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], q).await;
             assert_eq!(s, want, "{q}: {r}");
         }
         w.shutdown();
@@ -317,9 +317,29 @@ fn console_default_queries_run_for_any_sort_key() {
             let (s, table) = send(&w, 0, &t, "POST", "/v1/dbs/d/events", &[], &def.to_string()).await;
             assert_eq!(s, 201, "{table}");
             let q = crate::console::events::default_query(&table);
-            let (s, r) = send(&w, 0, &t, "POST", &format!("/v1/dbs/d/events/{name}/query"), &[], &q).await;
+            let (s, r) = send(&w, 0, &t, "POST", &format!("/v1/dbs/d/events/{name}/rows/query"), &[], &q).await;
             assert_eq!(s, 200, "the console's default query for {def} fails: {r}");
         }
+        w.shutdown();
+    });
+}
+
+/// The console's table page runs its default query on every view, so it
+/// reads only the newest month of parts, however old the table is.
+#[test]
+fn console_default_queries_read_the_newest_month() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        let now = w.node(0).now_ms() as i64;
+        let day = 86_400_000;
+        let rows = json!([{"event": "a", "time": now - 400 * day}, {"event": "b", "time": now - 2 * day}]);
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], &rows.to_string()).await;
+        assert_eq!(s, 201, "{r}");
+        let (_, table) = send(&w, 0, &t, "GET", "/v1/dbs/d/events/ev", &[], "").await;
+        assert_eq!(table["parts"].as_array().map(Vec::len), Some(2), "{table}");
+        let q = crate::console::events::default_query(&table);
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], &q).await;
+        assert_eq!((s, r["stats"]["parts"].clone()), (200, json!(1)), "{q}: {r}");
         w.shutdown();
     });
 }
@@ -369,7 +389,7 @@ fn null_consistency_reads_as_absent() {
         let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/txn", &[], txn).await;
         assert_eq!(s, 200, "/txn: {r}");
         let q = r#"{"from": 0, "to": 1, "consistency": null, "max_staleness_ms": null}"#;
-        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/query", &[], q).await;
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], q).await;
         assert_eq!(s, 200, "event query: {r}");
         w.shutdown();
     });
@@ -411,7 +431,7 @@ fn slow_event_queries_run_past_the_request_deadline() {
         w.store.set_latency_ms(commit_timeout + 2_000);
         let started = tokio::time::Instant::now();
         let q = r#"{"from": 0, "to": 2000, "consistency": "strong", "aggregates": {"n": {"fn": "count"}}}"#;
-        let (s, r) = send(&w, cold, &t, "POST", "/v1/dbs/d/events/ev/query", &[], q).await;
+        let (s, r) = send(&w, cold, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], q).await;
         let took = started.elapsed().as_millis() as u64;
         assert!(took > commit_timeout, "the query took {took} ms: {s} {r}");
         assert_eq!((s, r["rows"].clone()), (200, serde_json::json!([[1]])), "after {took} ms: {r}");
@@ -522,7 +542,7 @@ mod requests {
             }
             tokio::time::sleep(Duration::from_secs(30)).await;
             let q = json!({"from": 0, "to": 10_000, "columns": ["event"], "consistency": "strong"});
-            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/query", &[], &q.to_string()).await;
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], &q.to_string()).await;
             assert_eq!(s, 200, "{r}");
             assert_eq!(r["rows"], json!([]), "events older than retention_ms are still returned: {r}");
             w.shutdown();
@@ -544,7 +564,7 @@ mod requests {
             let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/columns", &[], col).await;
             assert_eq!(s, 200, "{r}");
             let q = r#"{"from": 0, "to": 2000, "columns": ["seen"], "consistency": "strong"}"#;
-            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/query", &[], q).await;
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], q).await;
             assert_eq!((s, r["rows"].clone()), (200, json!([[null]])), "{r}");
             w.shutdown();
         });
@@ -556,9 +576,9 @@ mod requests {
         run_paused(async {
             let (w, t) = setup(1).await;
             let q = r#"{"from": 2000, "to": 1000, "aggregates": {"n": {"fn": "count"}}}"#;
-            let (sq, rq) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/query", &[], q).await;
+            let (sq, rq) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], q).await;
             let d = r#"{"from": 2000, "to": 1000, "where": {"col": "event", "op": "eq", "value": "a"}}"#;
-            let (sd, rd) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/delete", &[], d).await;
+            let (sd, rd) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/delete", &[], d).await;
             assert_eq!(sq, sd, "query {sq} {rq} vs delete {sd} {rd}");
             w.shutdown();
         });
@@ -594,5 +614,25 @@ mod requests {
             assert_eq!((s, r["error"]["message"].as_str().is_some_and(|m| m.contains("differ"))), (400, true), "{r}");
             w.shutdown();
         });
+    }
+}
+
+/// Bulk inserts and queries are served by the node they reach; every other
+/// event route goes to the lease holder.
+#[test]
+fn event_rows_routes_are_served_where_they_arrive() {
+    let post = http::Method::POST;
+    for (method, path, local, query) in [
+        (&post, "/v1/dbs/d/events/t/rows", true, false),
+        (&post, "/v1/dbs/d/events/t/rows/", true, false),
+        (&post, "/v1/dbs/d/events/t/rows/query", true, true),
+        (&post, "/v1/dbs/d/events/t/rows/delete", false, false),
+        (&post, "/v1/dbs/d/events/t/rows/query/x", false, false),
+        (&post, "/v1/dbs/d/tables/t/rows/query", false, false),
+        (&post, "/v1/dbs/d/events/rows/query", false, false),
+        (&http::Method::GET, "/v1/dbs/d/events/t/rows/query", false, false),
+    ] {
+        let got = (super::events::served_locally(method, path), super::events::is_query(method, path));
+        assert_eq!(got, (local, query), "{method} {path}");
     }
 }

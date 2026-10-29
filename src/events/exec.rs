@@ -1576,6 +1576,12 @@ fn finish(run: Run<'_, '_>, q: &Query, limits: &Limits) -> Result<Output> {
                 probe::hit(Probe::QuerySecondStage);
                 (names, rows) = second_stage(&names, rows, second, limits)?;
             }
+            if rows.len() > q.limit && !q.limited {
+                return Err(Error::TooLarge(format!(
+                    "the query has more than {} groups; set a limit or group by fewer values",
+                    q.limit
+                )));
+            }
             sort_rows(&names, &mut rows, &q.order_by)?;
             rows.truncate(q.limit);
             Ok(Output {

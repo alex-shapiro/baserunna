@@ -62,17 +62,6 @@ impl Interval {
         };
         Some(start - offset_ms)
     }
-
-    /// Whether every bucket of `self` lies within one bucket of `coarser`.
-    pub fn divides(&self, coarser: &Interval) -> bool {
-        match (*self, *coarser) {
-            (Interval::Fixed(a), Interval::Fixed(b)) => b % a == 0,
-            (Interval::Fixed(a), Interval::Weeks(_) | Interval::Months(_)) => 86_400_000 % a == 0,
-            (Interval::Weeks(a), Interval::Weeks(b)) => b % a == 0,
-            (Interval::Months(a), Interval::Months(b)) => b % a == 0,
-            _ => false,
-        }
-    }
 }
 
 fn bad_interval(s: &str) -> Error {
@@ -420,6 +409,8 @@ pub struct Query {
     pub mode: Mode,
     pub order_by: Vec<OrderBy>,
     pub limit: usize,
+    /// Whether the query gave its `limit`, rather than taking the default.
+    pub limited: bool,
 }
 
 /// Keys of a query body that the HTTP layer reads rather than the query.
@@ -538,6 +529,7 @@ impl Query {
             Some(_) => return Err(Error::invalid("order_by is an array")),
         };
         let max = if rows_mode { ROWS_LIMIT_MAX } else { GROUPS_LIMIT_MAX };
+        let limited = o.get("limit").is_some();
         let limit = match o.remove("limit") {
             None => {
                 if rows_mode {
@@ -554,7 +546,7 @@ impl Query {
         if let Some(k) = o.keys().next() {
             return Err(Error::invalid(format!("unknown query key {k:?}")));
         }
-        Ok(Query { from, to, filter, lookups, mode, order_by, limit })
+        Ok(Query { from, to, filter, lookups, mode, order_by, limit, limited })
     }
 
     /// The names a query outputs, in order.
@@ -584,8 +576,6 @@ mod tests {
         assert_eq!(d.bucket(86_400_000 - 3_600_000, 3_600_000), Some(86_400_000 - 3_600_000), "a local midnight");
         assert_eq!(Interval::parse("1mo").unwrap().bucket(31 * 86_400_000 + 1, 0), Some(31 * 86_400_000));
         assert_eq!(Interval::parse("1w").unwrap().bucket(0, 0), Some(-3 * 86_400_000), "weeks start on Monday");
-        assert!(Interval::parse("1h").unwrap().divides(&d));
-        assert!(!Interval::parse("7h").unwrap().divides(&d));
         for bad in ["", "d", "0d", "1y", "1.5h"] {
             assert!(Interval::parse(bad).is_err(), "{bad}");
         }

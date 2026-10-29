@@ -2169,6 +2169,33 @@ mod query_limits {
         exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await
     }
 
+    /// An aggregate query without a `limit` answers with every group or
+    /// fails: it never returns some of them as if they were all.
+    #[test]
+    fn aggregates_beyond_the_group_limit_are_refused_unless_limited() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let n = crate::events::query::GROUPS_LIMIT_MAX as i64 + 1;
+            for c in (0..n).collect::<Vec<_>>().chunks(20_000) {
+                let rows: Vec<Json> =
+                    c.iter().map(|i| json!({"time": T0 + i, "event": "a", "user": format!("u{i}")})).collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            }
+            let q = json!({"from": T0, "to": T0 + DAY, "group_by": ["user"], "aggregates": {"c": {"fn": "count"}}});
+            let r = run_with(&db, q.clone(), Limits::default()).await;
+            assert!(
+                matches!(r, Err(Error::TooLarge(_))),
+                "{} groups answered with {:?} rows",
+                n,
+                r.map(|o| o.rows.len())
+            );
+            let mut limited = q;
+            limited["limit"] = json!(10);
+            assert_eq!(run_with(&db, limited, Limits::default()).await.unwrap().rows.len(), 10);
+        });
+    }
+
     /// Group keys hold the same bytes whatever the aggregates are, so adding
     /// a `min` must not let a query past the state limit that `count` alone
     /// cannot pass.

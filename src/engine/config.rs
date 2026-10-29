@@ -215,6 +215,11 @@ impl EngineConfig {
             (self.event_merge_fan_in >= 2, "event_merge_fan_in must be at least 2"),
             (self.event_read_concurrency >= 1, "event_read_concurrency must be at least 1"),
             (self.event_granule_rows >= 1 && self.event_chunk_bytes >= 1, "event granules and chunks are not empty"),
+            (
+                self.event_granule_rows <= crate::events::part::BLOCK_ROWS_MAX
+                    && self.event_granule_bytes <= (crate::engine::segment::MAX_BLOCK_RAW / 4) as usize,
+                "event granules must fit a block",
+            ),
         ];
         match rules.iter().find(|(ok, _)| !ok) {
             Some((_, why)) => Err((*why).to_string()),
@@ -269,5 +274,7 @@ mod tests {
         assert!(tight.validate().is_err());
         let starved = EngineConfig { memory_bytes: 8 * 1024 * 1024, ..EngineConfig::default() };
         assert!(starved.validate().is_err());
+        let wide = EngineConfig { event_granule_bytes: 64 << 20, ..EngineConfig::default() };
+        assert!(wide.validate().is_err(), "a granule's block could exceed what a reader decodes");
     }
 }

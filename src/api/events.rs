@@ -27,19 +27,24 @@ type J = axum::Json<Json>;
 /// them to the lease holder: bulk inserts stage parts where they arrive,
 /// and queries read snapshots.
 pub(super) fn served_locally(method: &http::Method, path: &str) -> bool {
-    let segs: Vec<&str> = path.trim_end_matches('/').split('/').collect();
-    method == http::Method::POST
-        && segs.len() == 7
-        && segs[1] == "v1"
-        && segs[2] == "dbs"
-        && segs[4] == "events"
-        && matches!(segs[6], "rows" | "query")
+    matches!(event_rows_route(method, path).as_deref(), Some([] | ["query"]))
 }
 
 /// Whether a request is an event query, which reads a snapshot at most
 /// [`QUERY_STALENESS_MS`] old unless it asks for strong consistency.
 pub(super) fn is_query(method: &http::Method, path: &str) -> bool {
-    served_locally(method, path) && path.trim_end_matches('/').ends_with("/query")
+    matches!(event_rows_route(method, path).as_deref(), Some(["query"]))
+}
+
+/// The segments after `rows` of a `POST /v1/dbs/{db}/events/{t}/rows…` path.
+fn event_rows_route<'a>(method: &http::Method, path: &'a str) -> Option<Vec<&'a str>> {
+    let segs: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+    let route = method == http::Method::POST
+        && segs.len() >= 7
+        && segs[..3] == ["", "v1", "dbs"]
+        && segs[4] == "events"
+        && segs[6] == "rows";
+    route.then(|| segs[7..].to_vec())
 }
 
 /// The staleness of an event query's snapshot by default.
@@ -54,8 +59,8 @@ pub fn routes() -> Router<Arc<Node>> {
         .route("/v1/dbs/{db}/events/{t}/skip-indexes", post(add_skip_index))
         .route("/v1/dbs/{db}/events/{t}/skip-indexes/{c}", delete(drop_skip_index))
         .route("/v1/dbs/{db}/events/{t}/rows", post(insert))
-        .route("/v1/dbs/{db}/events/{t}/query", post(query))
-        .route("/v1/dbs/{db}/events/{t}/delete", post(delete_rows))
+        .route("/v1/dbs/{db}/events/{t}/rows/query", post(query))
+        .route("/v1/dbs/{db}/events/{t}/rows/delete", post(delete_rows))
 }
 
 async fn list(Extension(ctx): Extension<DbCtx>, q: Params) -> Result<J> {

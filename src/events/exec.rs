@@ -1,4 +1,4 @@
-//! Query execution (SPEC §5.12): pruning at every level before data is
+//! Query execution (SPEC §5.13): pruning at every level before data is
 //! read, then columnar batches through filters and aggregation.
 //!
 //! A query reads one snapshot: the part references of the partitions its

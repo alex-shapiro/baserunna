@@ -1,4 +1,4 @@
-//! Event table maintenance on the lease holder (SPEC §5.12): sealing
+//! Event table maintenance on the lease holder (SPEC §5.13): sealing
 //! unsealed rows into parts, size-tiered merges within partitions,
 //! dropping parts past retention, and deletes.
 //!

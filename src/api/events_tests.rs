@@ -395,3 +395,31 @@ fn a_transaction_cannot_read_events_it_inserts() {
         w.shutdown();
     });
 }
+
+/// An event query may run up to its own time limit, longer than the request
+/// deadline of other requests.
+#[test]
+fn slow_event_queries_run_past_the_request_deadline() {
+    run_paused(async {
+        let (w, t) = setup(2).await;
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let (s, r) =
+            send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], r#"[{"event": "a", "time": 1000}]"#).await;
+        assert_eq!(s, 201, "{r}");
+        let commit_timeout = w.node(0).cfg.engine.commit_timeout_ms;
+        let cold = 1 - w.holder(&db_id(&w, &t).await).expect("a lease holder");
+        w.store.set_latency_ms(commit_timeout + 2_000);
+        let started = tokio::time::Instant::now();
+        let q = r#"{"from": 0, "to": 2000, "consistency": "strong", "aggregates": {"n": {"fn": "count"}}}"#;
+        let (s, r) = send(&w, cold, &t, "POST", "/v1/dbs/d/events/ev/query", &[], q).await;
+        let took = started.elapsed().as_millis() as u64;
+        assert!(took > commit_timeout, "the query took {took} ms: {s} {r}");
+        assert_eq!((s, r["rows"].clone()), (200, serde_json::json!([[1]])), "after {took} ms: {r}");
+        w.shutdown();
+    });
+}
+
+async fn db_id(w: &World, t: &str) -> String {
+    let (_, info) = send(w, 0, t, "GET", "/v1/dbs/d", &[], "").await;
+    info["id"].as_str().expect("a database id").to_string()
+}

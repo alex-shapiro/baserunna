@@ -188,7 +188,7 @@ Use a prefix byte to avoid collisions between keyspaces.
 | `0x08` | consumer cursors: `0x08 ++ stream_id ++ consumer`                                   |
 | `0x09` | unsealed events: `0x09 ++ table_id ++ version(u64 BE) ++ ordinal(u32 BE)`           |
 | `0x0A` | event part refs: `0x0A ++ table_id ++ partition(u32) ++ part_id`                    |
-| `0x0B` | event table state (§5.12): `0x0B ++ table_id`                                       |
+| `0x0B` | event table state (§5.13): `0x0B ++ table_id`                                       |
 | `0xFF` | internal commit records (§5.5): `0xFF ++ commit_id(u64 BE)`                         |
 
 ### 4.3 Blobs
@@ -410,7 +410,7 @@ dbs/{db_id}/seg/{id}.levels          immutable list of the segments below level 
 dbs/{db_id}/blob/{blob_id}/{chunk}   immutable blob chunks
 dbs/{db_id}/blob/{blob_id}/meta      the blob's descriptor (BlobRef), for binding by id
 dbs/{db_id}/blob/{blob_id}/pin       rewritten by long reads (§5.8)
-dbs/{db_id}/part/{part_id}/{chunk}   immutable event part chunks, or a deletion mask (§5.12)
+dbs/{db_id}/part/{part_id}/{chunk}   immutable event part chunks, or a deletion mask (§5.13)
 clock                                every node's store-clock probe (§5.8)
 ```
 
@@ -1048,7 +1048,7 @@ To compute a page (`Version::changes`), the engine merges only the `tail` and se
   `wait_ms > 0`) are always routed to the rendezvous home node, where commit
   notices are sent (§6.4), so that waiting requests are notified even if
   another node acquires the lease. Event bulk inserts and queries are
-  served by the node they reach (§5.12). If the lease holder is not in the
+  served by the node they reach (§5.13). If the lease holder is not in the
   cached member table, the node refreshes the member table with a strong read
   at most once per second. A member entry with the node's own
   address belongs to a previous process and is ignored during routing. If the target is another node, the
@@ -1082,7 +1082,7 @@ To compute a page (`Version::changes`), the engine merges only the `tail` and se
   the client's deadline.
 - **Internal endpoints** (`/internal/v1/…`, used to run system-DB
   transactions on its owner and to bind event parts on a database's lease
-  holder, §5.12) always require `x-baserunna-cluster-key`. Its
+  holder, §5.13) always require `x-baserunna-cluster-key`. Its
   value is the configured `BASERUNNA_CLUSTER_SECRET` or, by default, a key
   generated once per cluster and stored in the system database's `config`
   table. Every node reads it from the shared store, which is the trust
@@ -1301,9 +1301,10 @@ Errors are returned as
 
 The server cancels a request with a retryable `503 unavailable` error if the
 request exceeds its `commit_timeout_ms` (10 s) deadline. The response includes
-`outcome: "unknown"` unless the request method is `GET` or `HEAD`. The deadline
-is paused while the server waits for the client to send the request body, and is
-extended by `wait_ms` for long-poll requests.
+`outcome: "unknown"` unless the request method is `GET` or `HEAD` or it is an
+event query. The deadline is paused while the server waits for the client to
+send the request body, and is extended by `wait_ms` for long-poll requests and
+by an event query's own 60 s time limit (§4.8).
 
 Routes (see the OpenAPI document for bodies):
 
@@ -1723,9 +1724,9 @@ Tools:
 - Garbage collection requires object `last_modified` timestamps to come from a single coherent store clock (§13.5).
 - Stream retention runs on the lease holder, so a database with no activity keeps records past their retention until it is used again (§5.11). Trimmed chunks and their quota bytes are reclaimed by sweeps, hours later, as overwritten blobs are.
 - Stream filters scan records; there is no index on record contents, so a query finds needles at the rate it can scan (`scan_limit` records a request).
-- An event query runs on the node it reaches, on one task: its speed is one core's decoding rate and its store's latency divided by 32 concurrent part reads (§5.12).
+- An event query runs on the node it reaches, on one task: its speed is one core's decoding rate and its store's latency divided by 32 concurrent part reads (§5.13).
 - Event lookups read their whole row table on every query, up to 1 GiB (§4.8).
-- Event merges and retention run on the lease holder, so a database with no activity keeps expired partitions until it is used again (§5.12).
+- Event merges and retention run on the lease holder, so a database with no activity keeps expired partitions until it is used again (§5.13).
 - Event parts are cached in memory only; the local disk tier (§5.3) holds segments, so a restarted node reads parts from the store again.
 
 ## 16. Future work

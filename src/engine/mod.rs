@@ -64,7 +64,7 @@ pub struct Shared {
 
 /// Callback invoked on the lease holder with a database and the event tables
 /// whose unsealed rows or parts a commit changed, to schedule sealing,
-/// merges and retention (SPEC §5.12).
+/// merges and retention (SPEC §5.13).
 pub type EventHook = Box<dyn Fn(&Arc<Db>, std::collections::BTreeSet<u32>) + Send + Sync>;
 
 /// Callback invoked with `(db_id, version)` after this node commits a new data version.

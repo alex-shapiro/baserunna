@@ -1,4 +1,4 @@
-//! Bulk inserts (SPEC §5.12): requests are buffered per node and table
+//! Bulk inserts (SPEC §5.13): requests are buffered per node and table
 //! (ClickHouse's asynchronous inserts with `wait_for_async_insert`),
 //! staged as level 0 parts on the receiving node, and bound by one commit
 //! on the lease holder, so row data never passes through it. Each request

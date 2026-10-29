@@ -1,4 +1,4 @@
-//! JSON columns as paths (SPEC §5.12): objects are flattened into leaf
+//! JSON columns as paths (SPEC §5.13): objects are flattened into leaf
 //! paths when written to a part and rebuilt when read.
 //!
 //! A leaf is a scalar, an array or an empty object. Nulls inside objects

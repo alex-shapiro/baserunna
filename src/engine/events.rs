@@ -1,4 +1,4 @@
-//! Event table storage in the LSM tree (SPEC §4.8, §5.12): unsealed rows,
+//! Event table storage in the LSM tree (SPEC §4.8, §5.13): unsealed rows,
 //! part references and per-table state, and how the committer applies the
 //! event ops of a transaction or a bulk bind.
 //!

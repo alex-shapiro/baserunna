@@ -2,8 +2,8 @@
 //! read set, and a buffered write set. Reads see the transaction's own
 //! writes.
 
-use super::memory::{Charge, MemoryGate, alloc_bytes};
 use super::events::{self, EventOp};
+use super::memory::{Charge, MemoryGate, alloc_bytes};
 use super::stream::{self, StreamOp, StreamState};
 use super::types::{BlobRef, Seq, Value, is_commit_key};
 use super::version::{KeyRange, Snapshot, Version};
@@ -67,7 +67,7 @@ pub struct WriteSet {
     /// and quota additions for them.
     pub copied_blobs: std::collections::BTreeSet<String>,
     /// Changes to event tables, applied after `streams` by the committer,
-    /// which gives inserted rows their positions (SPEC §5.12).
+    /// which gives inserted rows their positions (SPEC §5.13).
     pub events: Vec<EventOp>,
 }
 

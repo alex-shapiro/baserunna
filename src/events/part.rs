@@ -1,4 +1,4 @@
-//! The event part format (SPEC §5.12): an immutable, sorted, column-major
+//! The event part format (SPEC §5.13): an immutable, sorted, column-major
 //! byte stream stored as fixed-size chunk objects under `part/{id}/`.
 //!
 //! ```text

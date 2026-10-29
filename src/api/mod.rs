@@ -294,6 +294,15 @@ fn long_poll_wait(req: &Request) -> Duration {
     Duration::from_millis(wait_ms.min(LONG_POLL_MAX_MS))
 }
 
+/// How long a request may run past its deadline: a long poll's wait, or an
+/// event query's own time limit, which ends the query with its own error first.
+fn request_allowance(node: &Node, req: &Request) -> Duration {
+    match events::is_query(req.method(), req.uri().path()) {
+        true => Duration::from_millis(node.cfg.query_limits.max_ms),
+        false => long_poll_wait(req),
+    }
+}
+
 fn is_long_poll(req: &Request) -> bool {
     !long_poll_wait(req).is_zero()
 }
@@ -508,8 +517,9 @@ async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: 
             let route = req.extensions().get::<MatchedPath>().cloned();
             let hops = hops(req.headers());
             let deadline = Deadline::new(request_deadline(&node, req.headers()));
-            let wait = long_poll_wait(&req);
-            let idempotent = matches!(*req.method(), http::Method::GET | http::Method::HEAD);
+            let wait = request_allowance(&node, &req);
+            let idempotent = matches!(*req.method(), http::Method::GET | http::Method::HEAD)
+                || events::is_query(req.method(), req.uri().path());
             let req = req.map(|b| Body::new(body::DeadlinePausingBody::new(b, deadline.clone())));
             let run = crate::node::with_deadline(deadline.clone(), timing::scoped(tally.clone(), next.run(req)));
             let resp = match run_until_deadline(&deadline, wait, run).await {

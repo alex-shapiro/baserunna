@@ -85,7 +85,7 @@ pub struct EngineConfig {
     /// Event part bytes allowed per database (SPEC §5.10), or 0 for unlimited.
     pub event_max_bytes: u64,
     /// A table's unsealed rows are sealed into parts once they reach this
-    /// many bytes (SPEC §5.12).
+    /// many bytes (SPEC §5.13).
     pub event_seal_bytes: usize,
     /// Event parts are stored as objects of this many bytes.
     pub event_chunk_bytes: usize,

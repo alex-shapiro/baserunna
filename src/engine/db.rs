@@ -902,7 +902,7 @@ impl Db {
         })?
     }
 
-    /// Binds staged event parts (SPEC §5.12), returning each slot's outcome:
+    /// Binds staged event parts (SPEC §5.13), returning each slot's outcome:
     /// accepted slots share one commit version, and the rows of the others
     /// are masked.
     pub async fn bind(self: &Arc<Self>, bind: Bind) -> Result<Vec<Result<Committed>>> {

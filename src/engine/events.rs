@@ -294,8 +294,9 @@ pub struct PartRef {
     /// The version of every row, for parts whose rows were bound by one
     /// commit after the part was written; `None` when the part stores it.
     pub version: Option<Seq>,
-    pub min_version: Seq,
-    pub max_version: Seq,
+    /// Bounds on the positions of its rows.
+    pub min_pos: Pos,
+    pub max_pos: Pos,
     /// Rows covered by the mask.
     pub deleted: u64,
     /// When the oldest row of the mask was masked, which starts the part's
@@ -364,8 +365,10 @@ impl PartRef {
                 w.varint(v);
             }
         }
-        w.varint(self.min_version);
-        w.varint(self.max_version);
+        for p in [self.min_pos, self.max_pos] {
+            w.varint(p.version);
+            w.varint(u64::from(p.ordinal));
+        }
         w.varint(self.deleted);
         w.varint(self.masked_ms);
         match &self.mask {
@@ -404,8 +407,8 @@ impl PartRef {
             max_time: unzigzag(r.varint()?),
             arrived_ms: r.varint()?,
             version: None,
-            min_version: 0,
-            max_version: 0,
+            min_pos: Pos::default(),
+            max_pos: Pos::default(),
             deleted: 0,
             masked_ms: 0,
             mask: None,
@@ -415,8 +418,10 @@ impl PartRef {
             1 => Some(r.varint()?),
             _ => return Err(DecodeError("bad part version tag")),
         };
-        p.min_version = r.varint()?;
-        p.max_version = r.varint()?;
+        for p in [&mut p.min_pos, &mut p.max_pos] {
+            p.version = r.varint()?;
+            p.ordinal = u32::try_from(r.varint()?).map_err(|_| DecodeError("bad part position"))?;
+        }
         p.deleted = r.varint()?;
         p.masked_ms = r.varint()?;
         p.mask = match r.u8()? {
@@ -437,7 +442,7 @@ impl PartRef {
         let ok = p.chunk_bytes > 0
             && p.meta_off.checked_add(p.meta_len).is_some_and(|e| e <= p.size)
             && p.min_time <= p.max_time
-            && p.min_version <= p.max_version
+            && p.min_pos <= p.max_pos
             && p.deleted < p.rows.max(1)
             && p.rows > 0;
         if !ok {
@@ -777,8 +782,8 @@ mod tests {
             max_time: 1_700_000_000_000,
             arrived_ms: 1_700_000_000_123,
             version: Some(9),
-            min_version: 9,
-            max_version: 9,
+            min_pos: Pos { version: 9, ordinal: 2 },
+            max_pos: Pos { version: 9, ordinal: 300 },
             deleted: 3,
             masked_ms: 1_700_000_100_000,
             mask: Some(Mask::Inline(Runs(vec![(1, 2), (50, 1)]))),

@@ -899,26 +899,38 @@ merges cut granules as the rows' first writer did. A part is never written
 with a block, index or metadata larger than a reader accepts.
 
 A part ref (`0x0A`) stores the part's id, row count, time range, size,
-level, the positions it covers, its deletion mask (deleted row offsets,
-inline up to 4 KiB, otherwise in a mask object), and when the oldest row of
-the mask was masked.
+level, its least and greatest positions, its deletion mask (deleted row
+offsets, inline up to 4 KiB, otherwise in a mask object), and when the
+oldest row of the mask was masked.
 
 #### Queries
 
-A query reads a snapshot, prunes part refs by time range, then reads each
-remaining part's metadata and the column index of filtered columns, and
-skips parts whose dictionaries or statistics rule out a match, then granules
-by the primary index, statistics and blooms. It reads filter columns first
-(prewhere) and the rest only for granules with matches, then folds in the
-unsealed rows. Up to 32 parts are read at once, each into a partial result
-that holds at most 1/32 of the query's state limit, and partial results
-are merged in part order, so the merged result, which decides whether the
+A query reads a snapshot and its unsealed rows, prunes part refs by time
+range, then reads each remaining part's metadata and the column index of
+filtered columns, and skips parts whose dictionaries or statistics rule out
+a match, then granules by the primary index, statistics and blooms. It reads
+filter columns first (prewhere) and the rest only for granules with matches.
+Up to 32 parts are read at once, each into a partial result that holds at
+most 1/32 of the query's state limit, and partial results are merged in the
+order parts are read in, so the merged result, which decides whether the
 query exceeds its limit, grows as it would if parts were read one at a
 time; a part whose state outgrows its share is read again into it at its
 turn. Aggregates keep mergeable states, so how parts were stored or merged
 never changes an answer. A part `GET` unanswered after 1 s is sent again, so one
 slow store request does not hold up a query. Parts are cached whole when
 small, otherwise by column block, so a warm query performs no store `GET`s.
+
+A page of rows ordered first by time costs the parts that hold it, not the
+whole time range. Its cursor narrows the range, and parts whose time and
+position ranges place every row at or before the cursor are skipped. Parts
+are read in the page's order, and reading is stopped once the rows read
+decide the page: no unread part's ranges can place a row before the page's
+last row, and either a row past the page was read or an unread part
+certainly holds one (it lies within the range, the query has no filter,
+and some of its rows are not deleted). A part is started only while the
+rows read so far, and the rate at which they matched, suggest the page may
+need it, so the latest 10 events cost one part however many the range
+holds. Pages in other orders read every part.
 
 #### Merges and retention
 

@@ -229,6 +229,9 @@ probes! {
     MaskObjectWritten,
     /// A query skipped a part by its reference alone.
     PartPrunedByRef,
+    /// A rows query by time stopped reading parts once no unread part
+    /// could change its page.
+    RowPageStoppedEarly,
     /// A query skipped granules by the primary index or column statistics.
     GranulesPruned,
     /// A query skipped granules by a bloom filter skip index.

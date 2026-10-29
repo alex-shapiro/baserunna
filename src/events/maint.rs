@@ -817,8 +817,8 @@ async fn merge_parts(
             _ => None,
         })
         .collect();
-    let (min_version, max_version) =
-        entries.iter().fold((u64::MAX, 0), |(lo, hi), e| (lo.min(e.1.version), hi.max(e.1.version)));
+    let min_pos = entries.iter().map(|e| e.1).min().unwrap_or_default();
+    let max_pos = entries.iter().map(|e| e.1).max().unwrap_or_default();
     let level = ins.iter().map(|i| i.r.level).max().unwrap_or(0).saturating_add(1);
     let partition = inputs[0].partition;
     let keys: Vec<Bytes> = entries.iter().map(|e| e.0.clone()).collect();
@@ -870,8 +870,8 @@ async fn merge_parts(
         max_time,
         arrived_ms: inputs.iter().map(|r| r.arrived_ms).max().unwrap_or(0),
         version: None,
-        min_version,
-        max_version,
+        min_pos,
+        max_pos,
         deleted: 0,
         masked_ms: 0,
         mask: None,
@@ -1195,8 +1195,8 @@ mod tests {
             max_time: day * DAY + 1,
             arrived_ms: (day * DAY) as u64,
             version: Some(1),
-            min_version: 1,
-            max_version: 1,
+            min_pos: ev::Pos::default(),
+            max_pos: ev::Pos::default(),
             deleted,
             masked_ms: masked_ms as u64,
             mask: None,

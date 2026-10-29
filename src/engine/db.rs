@@ -1876,8 +1876,8 @@ impl Db {
                             }
                             let r = events::PartRef {
                                 version: Some(new_seq),
-                                min_version: new_seq,
-                                max_version: new_seq,
+                                min_pos: events::Pos { version: new_seq, ..p.part.min_pos },
+                                max_pos: events::Pos { version: new_seq, ..p.part.max_pos },
                                 deleted,
                                 masked_ms: if deleted > 0 { time } else { 0 },
                                 mask: (deleted > 0).then_some(events::Mask::Inline(mask)),

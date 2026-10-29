@@ -1562,6 +1562,149 @@ mod partial_results {
     }
 }
 
+/// Every page of rows equals a brute-force sort of the live events by the
+/// page's order, then insertion: whatever parts and unsealed rows hold them,
+/// however many parts are read at once, and whether the order leads with
+/// time, so that reading stops early, or not.
+#[test]
+fn row_pages_match_a_brute_force_sort() {
+    struct Ev {
+        time: i64,
+        user: String,
+        n: i64,
+        live: bool,
+    }
+    type Select = Box<dyn Fn(&Ev) -> bool>;
+    let mut hits = crate::probe::Hits::default();
+    let mut pages = 0;
+    let seeds: u64 = std::env::var("ROW_PAGE_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
+    for seed in 0..seeds {
+        rt().block_on(async {
+            let mut r = Rng::new(seed);
+            let cfg = EngineConfig { event_read_concurrency: *r.pick(&[1, 2, 32]), ..cfg() };
+            let (eng, _store, env) = engine(seed, cfg);
+            env.spawn(async {});
+            let db = create_db(&eng, "db").await;
+            let table = {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                get_schema(&mut t, "events").await.unwrap().id
+            };
+            let bufs = buffers();
+            let mut evs: Vec<Ev> = Vec::new();
+            for _ in 0..80 {
+                match r.usize(14) {
+                    0..=5 => {
+                        let rows: Vec<Json> = (0..1 + r.usize(12))
+                            .map(|_| {
+                                let time = T0 + r.below(6) as i64 * DAY + r.below(4) as i64 * 1000;
+                                let (user, n) = (format!("u{}", r.below(4)), r.below(5) as i64);
+                                evs.push(Ev { time, user: user.clone(), n, live: true });
+                                json!({"time": time, "event": "e", "user": user, "n": n})
+                            })
+                            .collect();
+                        if r.chance(0.5) {
+                            txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+                        } else {
+                            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                            let s = get_schema(&mut t, "events").await.unwrap();
+                            let valid = validate_rows(&s, &rows, 0).unwrap();
+                            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                            bufs.submit(db.clone(), s, valid, env.random_u64(), deadline).await.unwrap();
+                        }
+                    }
+                    6..=7 => {
+                        maint::seal(&db, table).await.unwrap();
+                    }
+                    8 => maint::maintain(&db, table, 8).await.unwrap(),
+                    9 => {
+                        let user = format!("u{}", r.below(4));
+                        let (from, to) = (T0 + r.below(6) as i64 * DAY, T0 + r.below(7) as i64 * DAY);
+                        let f = Filter::parse(json!({"col": "user", "op": "eq", "value": user})).unwrap();
+                        txn_do(&db, async |t| maint::delete(&db, t, "events", from, to, &f).await).await.unwrap();
+                        for e in evs.iter_mut().filter(|e| e.user == user && from <= e.time && e.time < to) {
+                            e.live = false;
+                        }
+                    }
+                    _ => {
+                        let from = T0 + r.below(3) as i64 * DAY - DAY;
+                        let to = from + (1 + r.below(7)) as i64 * DAY;
+                        let limit = 1 + r.usize(8);
+                        // Each order as (key, desc), where key 0 is time and 1 is n.
+                        const ORDERS: [&[(usize, bool)]; 6] = [
+                            &[],
+                            &[(0, true)],
+                            &[(0, false), (1, false)],
+                            &[(0, true), (1, true)],
+                            &[(1, true)],
+                            &[(1, false), (0, true)],
+                        ];
+                        let order = *r.pick(&ORDERS);
+                        let order_by: Vec<Json> = order
+                            .iter()
+                            .map(|(k, d)| json!({"col": if *k == 0 { "time" } else { "n" }, "desc": d}))
+                            .collect();
+                        let mut q = json!({"from": from, "to": to, "limit": limit,
+                            "columns": ["time", "user", "n"], "order_by": order_by});
+                        let filter: Option<(Json, Select)> = match r.usize(3) {
+                            0 => None,
+                            1 => {
+                                let u = format!("u{}", r.below(4));
+                                let f = json!({"col": "user", "op": "eq", "value": u.clone()});
+                                Some((f, Box::new(move |e: &Ev| e.user == u)))
+                            }
+                            _ => {
+                                let k = r.below(5) as i64;
+                                Some((json!({"col": "n", "op": "lt", "value": k}), Box::new(move |e: &Ev| e.n < k)))
+                            }
+                        };
+                        if let Some((f, _)) = &filter {
+                            q["where"] = f.clone();
+                        }
+                        let mut want: Vec<usize> = (0..evs.len())
+                            .filter(|i| {
+                                let e = &evs[*i];
+                                e.live && from <= e.time && e.time < to && filter.as_ref().is_none_or(|(_, f)| f(e))
+                            })
+                            .collect();
+                        let key = |e: &Ev, k: usize| if k == 0 { e.time } else { e.n };
+                        want.sort_by(|a, b| {
+                            let (ea, eb) = (&evs[*a], &evs[*b]);
+                            let order = if order.is_empty() { &[(0, false)][..] } else { order };
+                            order
+                                .iter()
+                                .map(|(k, d)| {
+                                    let o = key(ea, *k).cmp(&key(eb, *k));
+                                    if *d { o.reverse() } else { o }
+                                })
+                                .find(|o| o.is_ne())
+                                .unwrap_or(a.cmp(b))
+                        });
+                        let want: Vec<Vec<Json>> = want
+                            .iter()
+                            .map(|i| vec![json!(evs[*i].time), json!(evs[*i].user), json!(evs[*i].n)])
+                            .collect();
+                        for (p, page) in want.chunks(limit).chain(want.is_empty().then_some(&[][..])).enumerate() {
+                            let got = query(&db, &q).await.unwrap();
+                            let more = (p + 1) * limit < want.len();
+                            assert_eq!(
+                                (&got.rows[..], got.next_cursor.is_some()),
+                                (page, more),
+                                "seed {seed}, page {p} of {q}: {:?}",
+                                got.stats
+                            );
+                            pages += 1;
+                            q["cursor"] = json!(got.next_cursor);
+                        }
+                    }
+                }
+            }
+        });
+        hits.add(&crate::probe::finish());
+    }
+    let stopped = hits.count(Probe::RowPageStoppedEarly);
+    assert!(stopped * 4 > pages, "only {stopped} of {pages} pages stopped reading parts early");
+}
+
 /// A merge reads each small input part once, though it reads every column
 /// of each, and does so without filling the node's cache.
 #[test]

@@ -469,8 +469,8 @@ pub async fn write_rows(
         _ => None,
     });
     let (min_time, max_time) = times.fold((i64::MAX, i64::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
-    let (min_version, max_version) =
-        rows.iter().fold((u64::MAX, 0), |(lo, hi), r| (lo.min(r.pos.version), hi.max(r.pos.version)));
+    let min_pos = rows.iter().map(|r| r.pos).min().unwrap_or_default();
+    let max_pos = rows.iter().map(|r| r.pos).max().unwrap_or_default();
     let mut src = RowsSource::new(schema, rows, versions, &shared.cfg);
     let mut sink = Sink::new(shared, db, part::new_part_id(shared));
     let w = part::write(&mut sink, &mut src, 1, schema.sort_ids()).await?;
@@ -489,8 +489,8 @@ pub async fn write_rows(
         max_time,
         arrived_ms: crate::engine::types::blob_id_time(&sink.id).unwrap_or(0),
         version: None,
-        min_version: if versions { min_version } else { 0 },
-        max_version: if versions { max_version } else { 0 },
+        min_pos,
+        max_pos,
         deleted: 0,
         masked_ms: 0,
         mask: None,

@@ -6,7 +6,8 @@
 //! their references, then by dictionaries and missing columns, then granule
 //! by granule by the primary index, statistics and bloom filters. The
 //! filter's columns are read first, and the other columns only for granules
-//! with selected rows.
+//! with selected rows. A page of rows ordered by time reads parts in that
+//! order and stops once they decide it (see [`Frontier`]).
 
 use super::agg::{State, Val};
 use super::json;
@@ -22,7 +23,8 @@ use crate::probe::{self, Probe};
 use crate::table::schema::{Datum, Row, decode_row};
 use crate::util::DetHashMap;
 use crate::util::b64;
-use futures_util::{StreamExt, stream};
+use futures_util::StreamExt;
+use futures_util::stream::FuturesOrdered;
 use serde_json::{Value as Json, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -887,6 +889,10 @@ struct Run<'p, 'a> {
     stats: Stats,
     groups: Option<Groups>,
     kept: Option<Kept>,
+    /// Rows offered to `kept`: those past the filter and the cursor.
+    offered: u64,
+    /// Whether rows past those in `kept` are known to exist unread.
+    more: bool,
     agg_fns: Vec<AggFn>,
 }
 
@@ -900,12 +906,13 @@ impl<'p, 'a> Run<'p, 'a> {
                 (Some(Groups::new(max_mem)), None, first.aggregates.iter().map(|a| a.func.clone()).collect())
             }
         };
-        Run { plan, stats: Stats::default(), groups, kept, agg_fns }
+        Run { plan, stats: Stats::default(), groups, kept, offered: 0, more: false, agg_fns }
     }
 
     /// Merges `o`, a partial result over other rows.
     fn absorb(&mut self, o: Run<'_, '_>) -> Result<()> {
         self.stats.add(&o.stats);
+        self.offered += o.offered;
         if let (Some(k), Some(ok)) = (&mut self.kept, o.kept) {
             for (key, pos, row) in ok.rows {
                 k.push(key, pos, row)?;
@@ -959,6 +966,7 @@ impl<'p, 'a> Run<'p, 'a> {
                     }
                     let row = columns.iter().map(|(_, e)| b.val(e, i)).collect();
                     kept.push(key, pos, row)?;
+                    self.offered += 1;
                 }
             }
             Kind::Aggregate { first, .. } => {
@@ -1452,6 +1460,151 @@ fn ref_may(f: &BFilter, r: &PartRef, time_id: u32) -> bool {
     })
 }
 
+/// The order of a rows query whose first key is the time column, which
+/// bounds where in a part's time range its rows fall in the page.
+#[derive(Clone, Copy)]
+struct ByTime {
+    desc: bool,
+    /// Whether time is the only key, so rows of one time follow one another
+    /// by position.
+    alone: bool,
+}
+
+impl ByTime {
+    fn of(kind: &Kind, time: &BExpr) -> Option<ByTime> {
+        match kind {
+            Kind::Rows { order, .. } => match order.first() {
+                Some((e, desc)) if e == time => Some(ByTime { desc: *desc, alone: order.len() == 1 }),
+                _ => None,
+            },
+            Kind::Aggregate { .. } => None,
+        }
+    }
+
+    /// Whether time `a` comes before time `b`.
+    fn before(self, a: i64, b: i64) -> bool {
+        if self.desc { a > b } else { a < b }
+    }
+
+    /// Bounds on the times of a part's first and last rows in this order.
+    fn ends(self, r: &PartRef) -> (i64, i64) {
+        if self.desc { (r.max_time, r.min_time) } else { (r.min_time, r.max_time) }
+    }
+
+    /// Whether every row of part `r` comes after the row at time `t` and
+    /// position `p`, which `r` does not hold.
+    fn all_after(self, r: &PartRef, t: i64, p: Pos) -> bool {
+        let first = self.ends(r).0;
+        self.before(t, first) || (first == t && self.alone && r.min_pos > p)
+    }
+
+    /// Whether some row of part `r` may come after the row at time `t` and
+    /// position `p`.
+    fn some_after(self, r: &PartRef, t: i64, p: Pos) -> bool {
+        let last = self.ends(r).1;
+        self.before(t, last) || (last == t && (!self.alone || r.max_pos > p))
+    }
+
+    /// The order parts are read in: by the time of their first rows, then
+    /// by position, so that once a part's rows all come after a row, so do
+    /// every later part's.
+    fn read_order(self, a: &PartRef, b: &PartRef) -> Ordering {
+        let (x, y) = (self.ends(a).0, self.ends(b).0);
+        (if self.desc { y.cmp(&x) } else { x.cmp(&y) }).then(a.min_pos.cmp(&b.min_pos))
+    }
+}
+
+/// The time and position of a rows query's cursor, when its first key is
+/// a time.
+fn cursor_at(kind: &Kind) -> Option<(i64, Pos)> {
+    match kind {
+        Kind::Rows { after: Some((key, pos)), .. } => match key.first() {
+            Some(Val::Int(t)) => Some((*t, *pos)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// How a rows query by time reads its parts, sorted by
+/// [`ByTime::read_order`]: it starts reading a part only while its page may
+/// need it, and stops once the rows read decide the page.
+struct Frontier {
+    by: ByTime,
+    limit: usize,
+    /// Whether some part from each index on certainly holds a row past the
+    /// cursor that the query selects.
+    certain: Vec<bool>,
+    /// Rows of the parts read so far, and unsealed rows.
+    scanned: u64,
+    /// The times of the rows kept when [`Frontier::done`] last looked, in
+    /// the page's order.
+    times: Vec<i64>,
+}
+
+impl Frontier {
+    fn new(by: ByTime, limit: usize, refs: &[&PartRef], certain: impl Fn(&PartRef) -> bool, unsealed: u64) -> Frontier {
+        let mut c = vec![false; refs.len() + 1];
+        for i in (0..refs.len()).rev() {
+            c[i] = c[i + 1] || certain(refs[i]);
+        }
+        Frontier { by, limit, certain: c, scanned: unsealed, times: Vec::new() }
+    }
+
+    /// Whether the rows read before part `i` decide the page: every row of
+    /// the parts from `i` on comes after its last row, and either more rows
+    /// than it holds were read or one of those parts certainly holds one,
+    /// which `run` then notes.
+    fn done(&mut self, run: &mut Run<'_, '_>, refs: &[&PartRef], i: usize) -> bool {
+        let Some(kept) = run.kept.as_mut() else { return false };
+        kept.trim();
+        self.times.clear();
+        for (key, ..) in &kept.rows {
+            let Some(Val::Int(t)) = key.first() else { return false };
+            self.times.push(*t);
+        }
+        let Some((_, pos, _)) = kept.rows.get(self.limit - 1) else { return false };
+        let t = self.times[self.limit - 1];
+        let done = self.by.all_after(refs[i], t, *pos) && (kept.rows.len() > self.limit || self.certain[i]);
+        run.more |= done;
+        done
+    }
+
+    /// Whether to start reading part `next` while parts `i..next` are read:
+    /// whether it may hold rows of the page, supposing each part being read
+    /// selects rows at the rate the rows read so far were, all at its last
+    /// time.
+    fn wants(&self, run: &Run<'_, '_>, refs: &[&PartRef], i: usize, next: usize) -> bool {
+        let by = self.by;
+        let rate = if self.scanned == 0 { 1.0 } else { run.offered as f64 / self.scanned as f64 };
+        let mut reading: Vec<(i64, f64)> =
+            refs[i..next].iter().map(|r| (by.ends(r).1, (r.rows - r.deleted) as f64 * rate)).collect();
+        reading.sort_by(|a, b| if by.desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) });
+        let need = (self.limit + usize::from(!self.certain[next])) as f64;
+        let later = |a: i64, b: i64| if by.before(a, b) { b } else { a };
+        // The earliest time by which `need` rows are expected: for each
+        // prefix of the parts being read, the later of its last time and
+        // that of the kept row that makes up the rest.
+        let mut bound = None;
+        let mut expected = 0.0;
+        for j in 0..=reading.len() {
+            let floor = j.checked_sub(1).map(|j| reading[j].0);
+            if let Some(j) = j.checked_sub(1) {
+                expected += reading[j].1;
+            }
+            let rest = (need - expected).ceil().max(0.0) as usize;
+            let at = match rest.checked_sub(1) {
+                None => floor,
+                Some(k) => self.times.get(k).map(|t| floor.map_or(*t, |f| later(f, *t))),
+            };
+            if let Some(at) = at {
+                bound = Some(bound.map_or(at, |b| if by.before(at, b) { at } else { b }));
+            }
+        }
+        bound.is_none_or(|b| !by.before(b, by.ends(refs[next]).0))
+    }
+}
+
 fn cursor_encode(key: &[Val], pos: Pos) -> String {
     let v = json!([key.iter().map(Val::to_json).collect::<Vec<_>>(), pos.version, pos.ordinal]);
     b64::encode_url(v.to_string().as_bytes())
@@ -1592,15 +1745,7 @@ async fn run_within(
         probe::hit(Probe::LookupApplied);
     }
     let time = BExpr::Col(s.time_id());
-    let from = shared.store_now_ms().map_or(q.from, |now| q.from.max(s.retained_from(now as i64)));
-    let mut conds = vec![
-        filter::Filter::Cmp(time.clone(), Test::Ge(json!(from))),
-        filter::Filter::Cmp(time.clone(), Test::Lt(json!(q.to))),
-    ];
-    if let Some(f) = &q.filter {
-        conds.push(binder.filter(f)?);
-    }
-    let filter = filter::Filter::And(conds);
+    let user_filter = q.filter.as_ref().map(|f| binder.filter(f)).transpose()?;
     let kind = match &q.mode {
         Mode::Rows { columns, cursor } => {
             let columns: Vec<(String, BExpr)> = if columns.is_empty() {
@@ -1630,46 +1775,88 @@ async fn run_within(
         }
         Mode::Aggregate { first, then } => Kind::Aggregate { first: bind_stage(&binder, first)?, then: then.clone() },
     };
-    let input = input(txn, s, from, q.to).await?;
+    let by_time = ByTime::of(&kind, &time);
+    // The rows of a page by time that follow its cursor are no earlier
+    // than the cursor's time.
+    let past = by_time.and(cursor_at(&kind));
+    let mut from = shared.store_now_ms().map_or(q.from, |now| q.from.max(s.retained_from(now as i64)));
+    let mut to = q.to;
+    if let (Some(by), Some((t, _))) = (by_time, past) {
+        if by.desc {
+            to = to.min(t.saturating_add(1));
+        } else {
+            from = from.max(t);
+        }
+    }
+    let mut conds = vec![
+        filter::Filter::Cmp(time.clone(), Test::Ge(json!(from))),
+        filter::Filter::Cmp(time.clone(), Test::Lt(json!(to))),
+    ];
+    conds.extend(user_filter);
+    let filter = filter::Filter::And(conds);
+    let input = input(txn, s, from, to).await?;
     let deadline = Some((tokio::time::Instant::now() + std::time::Duration::from_millis(limits.max_ms), limits.max_ms));
     let plan = Plan::new(s, filter, lookups, kind, deadline);
     let mut run = Run::new(&plan, limits.max_memory_bytes);
     run.stats = Stats { source: "columns".into(), nodes: 1, parts: input.refs.len() as u64, ..Default::default() };
     let read_stats = ReadStats::default();
     let rd = Reading { shared, db, cache: Caching::Shared, stats: &read_stats };
-    let refs: Vec<&PartRef> = input
+    let mut refs: Vec<&PartRef> = input
         .refs
         .iter()
         .filter(|r| {
-            let may = ref_may(&plan.filter, r, s.time_id());
+            let may = ref_may(&plan.filter, r, s.time_id())
+                && by_time.zip(past).is_none_or(|(by, (t, p))| by.some_after(r, t, p));
             if !may {
                 probe::hit(Probe::PartPrunedByRef);
             }
             may
         })
         .collect();
+    run.unsealed(&input.unsealed).await?;
+    let mut frontier = by_time.map(|by| {
+        refs.sort_by(|a, b| by.read_order(a, b));
+        let certain = |r: &PartRef| {
+            q.filter.is_none()
+                && from <= r.min_time
+                && r.max_time < to
+                && r.rows > r.deleted
+                && past.is_none_or(|(t, p)| by.all_after(r, t, p))
+        };
+        Frontier::new(by, q.limit, &refs, certain, input.unsealed.len() as u64)
+    });
     // Parts are read concurrently into partial results, each holding at most
-    // its share of the state limit, and merged in part order, so the merged
-    // result grows as a serial read's would and the limit does not depend on
-    // which part arrives first. A part whose groups outgrow its share is
-    // read again into the merged result at its turn; rows mode holds rows the same way.
+    // its share of the state limit, and merged in the order they are read
+    // in, so the merged result grows as a serial read's would and the limit
+    // does not depend on which part arrives first. A part whose groups
+    // outgrow its share is read again into the merged result at its turn;
+    // rows mode holds rows the same way.
     let n = shared.cfg.event_read_concurrency.max(1);
     let share = limits.max_memory_bytes / n;
-    let reads: Vec<_> = refs
-        .iter()
-        .map(|r| {
-            let (mut partial, rd) = (Run::new(&plan, share), &rd);
-            async move {
-                let read = match rd.meta(r).await {
-                    Ok(meta) => partial.part(rd, r, meta).await,
-                    Err(e) => Err(e),
-                };
-                (partial, read)
-            }
-        })
-        .collect();
-    let mut reads = stream::iter(reads).buffered(n);
-    for r in &refs {
+    let read = |i: usize| {
+        let (mut partial, rd, r) = (Run::new(&plan, share), &rd, refs[i]);
+        async move {
+            let read = match rd.meta(r).await {
+                Ok(meta) => partial.part(rd, r, meta).await,
+                Err(e) => Err(e),
+            };
+            (partial, read)
+        }
+    };
+    let mut reads = FuturesOrdered::new();
+    let mut launched = 0;
+    for (i, r) in refs.iter().enumerate() {
+        if frontier.as_mut().is_some_and(|f| f.done(&mut run, &refs, i)) {
+            probe::hit(Probe::RowPageStoppedEarly);
+            break;
+        }
+        while launched < refs.len()
+            && reads.len() < n
+            && (launched == i || frontier.as_ref().is_none_or(|f| f.wants(&run, &refs, i, launched)))
+        {
+            reads.push_back(read(launched));
+            launched += 1;
+        }
         let (partial, read) = reads.next().await.ok_or_else(|| Error::internal("query reads ended early"))?;
         match read {
             Ok(()) => run.absorb(partial)?,
@@ -1681,6 +1868,9 @@ async fn run_within(
             }
             Err(e) => return Err(e),
         }
+        if let Some(f) = &mut frontier {
+            f.scanned += r.rows - r.deleted;
+        }
         if read_stats.bytes.load(Relaxed) > limits.max_bytes_read {
             return Err(Error::TooLarge(format!(
                 "the query read more than {} bytes; narrow its time range or filter",
@@ -1688,20 +1878,19 @@ async fn run_within(
             )));
         }
     }
-    run.unsealed(&input.unsealed).await?;
     run.stats.bytes_read = read_stats.bytes.load(Relaxed);
     run.stats.store_gets = read_stats.gets.load(Relaxed);
     finish(run, q, limits)
 }
 
 fn finish(run: Run<'_, '_>, q: &Query, limits: &Limits) -> Result<Output> {
-    let Run { plan, stats, groups, kept, agg_fns } = run;
+    let Run { plan, stats, groups, kept, more, agg_fns, .. } = run;
     match &plan.kind {
         Kind::Rows { columns, limit, .. } => {
             let limit = *limit;
             let mut kept = kept.ok_or_else(|| Error::internal("rows without a row set"))?;
             kept.trim();
-            let more = kept.rows.len() > limit;
+            let more = more || kept.rows.len() > limit;
             kept.rows.truncate(limit);
             let next_cursor = if more { kept.rows.last().map(|(k, p, _)| cursor_encode(k, *p)) } else { None };
             Ok(Output {

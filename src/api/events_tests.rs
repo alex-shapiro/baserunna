@@ -1069,3 +1069,39 @@ fn deleted_events_are_eventually_purged_from_storage() {
         w.shutdown();
     });
 }
+
+/// A page by time reads only the parts that can hold its rows: neither the
+/// parts before its cursor nor those after its last row.
+#[test]
+fn row_pages_read_only_parts_that_can_hold_them() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        let day = 86_400_000i64;
+        for d in 0..4 {
+            let rows: Vec<_> = (0..5).map(|i| json!({"event": "e", "time": d * day + i})).collect();
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], &json!(rows).to_string()).await;
+            assert_eq!(s, 201, "{r}");
+        }
+        let q = json!({"from": 0, "to": 4 * day, "limit": 5, "consistency": "strong"});
+        let (s, first) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], &q.to_string()).await;
+        assert_eq!(s, 200, "{first}");
+        let mut q2 = q.clone();
+        q2["cursor"] = first["next_cursor"].clone();
+        let (s, second) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], &q2.to_string()).await;
+        assert_eq!(s, 200, "{second}");
+        assert_eq!(second["rows"][0][0], json!(day), "{second}");
+        assert_eq!(
+            (first["stats"]["parts_read"].clone(), second["stats"]["parts_read"].clone()),
+            (json!(1), json!(1)),
+            "pages of 5 rows, each within one day's part, read: {} and {}",
+            first["stats"],
+            second["stats"]
+        );
+        let latest = json!({"from": 0, "to": 4 * day, "limit": 3, "order_by": [{"col": "time", "desc": true}],
+            "consistency": "strong"});
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], &latest.to_string()).await;
+        assert_eq!(s, 200, "{r}");
+        assert_eq!((&r["rows"][0][0], &r["stats"]["parts_read"]), (&json!(3 * day + 4), &json!(1)), "{r}");
+        w.shutdown();
+    });
+}

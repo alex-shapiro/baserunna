@@ -1197,49 +1197,54 @@ impl<'p, 'a> Run<'p, 'a> {
             }
         }
         // Whether some entry of its column's dictionary satisfies each
-        // comparison, by the comparison's address.
+        // comparison, by the comparison's address. A dictionary is scanned
+        // only for comparisons that pruning reaches: an unknown one stops a
+        // pass, is scanned, and pruning runs again.
         let mut dict_hits: DetHashMap<usize, bool> = DetHashMap::default();
         let mut work = Work::default();
-        let mut cmps = Vec::new();
-        comparisons(&self.plan.filter, &mut cmps);
-        for (e, t) in cmps {
-            let BExpr::Col(id) = e else { continue };
-            let Some(d) = meta.find(&ColRef::User(*id)).and_then(|ci| dicts.get(&ci)) else { continue };
+        let schema = self.plan.schema;
+        loop {
+            let mut by_dict = false;
+            let mut unknown: Option<(usize, Test<Json>, usize)> = None;
+            let ok = may(&self.plan.filter, &mut |e, t| match e {
+                BExpr::Col(id) => match meta.find(&ColRef::User(*id)) {
+                    None => holds(&default_val(schema.column_by_id(*id)), t),
+                    Some(ci) if meta.cols[ci].nonnull == 0 => false,
+                    Some(ci) => match (dict_hits.get(&addr(t)), dicts.get(&ci)) {
+                        (Some(hit), _) => {
+                            by_dict |= !hit;
+                            *hit
+                        }
+                        (None, Some(_)) => {
+                            unknown.get_or_insert_with(|| (addr(t), t.clone(), ci));
+                            true
+                        }
+                        (None, None) => true,
+                    },
+                },
+                BExpr::Path(id, _, key) => {
+                    meta.find(&ColRef::Path { col: *id, key: key.clone() }).is_some_and(|ci| meta.cols[ci].nonnull > 0)
+                        || (meta.may_share(*id, key)
+                            && meta.find(&ColRef::Shared { col: *id, bucket: json::bucket(key) }).is_some())
+                }
+                _ => true,
+            });
+            let Some((at, t, ci)) = unknown else {
+                if !ok && by_dict {
+                    probe::hit(Probe::PartPrunedByDictionary);
+                }
+                return Ok(ok);
+            };
             let mut hit = false;
-            for chunk in d.chunks(1024) {
+            for chunk in dicts[&ci].chunks(1024) {
                 work.add(self.plan, chunk.len()).await?;
                 if chunk.iter().any(|s| t.holds(&s.as_str())) {
                     hit = true;
                     break;
                 }
             }
-            dict_hits.insert(addr(t), hit);
+            dict_hits.insert(at, hit);
         }
-        let schema = self.plan.schema;
-        let mut by_dict = false;
-        let ok = may(&self.plan.filter, &mut |e, t| match e {
-            BExpr::Col(id) => match meta.find(&ColRef::User(*id)) {
-                None => holds(&default_val(schema.column_by_id(*id)), t),
-                Some(ci) if meta.cols[ci].nonnull == 0 => false,
-                Some(_) => match dict_hits.get(&addr(t)) {
-                    Some(hit) => {
-                        by_dict |= !hit;
-                        *hit
-                    }
-                    None => true,
-                },
-            },
-            BExpr::Path(id, _, key) => {
-                meta.find(&ColRef::Path { col: *id, key: key.clone() }).is_some_and(|ci| meta.cols[ci].nonnull > 0)
-                    || (meta.may_share(*id, key)
-                        && meta.find(&ColRef::Shared { col: *id, bucket: json::bucket(key) }).is_some())
-            }
-            _ => true,
-        });
-        if !ok && by_dict {
-            probe::hit(Probe::PartPrunedByDictionary);
-        }
-        Ok(ok)
     }
 
     /// The granules of a part that may hold matching rows.

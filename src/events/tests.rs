@@ -2519,6 +2519,45 @@ mod costly_filters {
             });
         }
     }
+
+    /// A part ruled out by one comparison's dictionary is not scanned
+    /// against the dictionaries of the filter's other comparisons, so a
+    /// query whose `event` matches no part answers at once however costly
+    /// its tests of `user` are.
+    #[test]
+    fn parts_ruled_out_by_one_dictionary_skip_the_others() {
+        timed_rt().block_on(async {
+            let d = EngineConfig::default();
+            let cfg = EngineConfig {
+                event_seal_bytes: d.event_seal_bytes,
+                event_chunk_bytes: d.event_chunk_bytes,
+                event_granule_rows: d.event_granule_rows,
+                event_granule_bytes: d.event_granule_bytes,
+                event_block_bytes: d.event_block_bytes,
+                event_insert_part_max_bytes: d.event_insert_part_max_bytes,
+                event_part_max_bytes: d.event_part_max_bytes,
+                ..EngineConfig::small_for_tests()
+            };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let long = "u".repeat(410);
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let id = get_schema(&mut t, "events").await.unwrap().id;
+            for p in 0..32i64 {
+                let rows: Vec<Json> = (0..2400i64)
+                    .map(|i| json!({"time": T0 + p * 10_000 + i, "event": "a", "user": format!("{long}{p}-{i}")}))
+                    .collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+                while maint::seal(&db, id).await.unwrap() {}
+            }
+            let ors: Vec<Json> =
+                (0..253).map(|k| json!({"col": "user", "op": "contains", "value": format!("u{k}x")})).collect();
+            let filter = json!({"and": [{"col": "event", "op": "eq", "value": "zzz"}, {"or": ors}]});
+            let q = json!({"from": T0, "to": T0 + DAY, "where": filter, "aggregates": {"c": {"fn": "count"}}});
+            let r = run_limited(&db, q).await;
+            assert_eq!(r.map(|o| o.rows), Some(vec![vec![json!(0)]]), "the query stopped at its 100 ms limit");
+        });
+    }
 }
 
 mod answers {

@@ -691,4 +691,23 @@ mod forwarding {
             w.shutdown();
         });
     }
+
+    /// The console's default query counts an event in the last second of
+    /// year 9999, which the table accepts.
+    #[test]
+    fn console_default_queries_count_the_latest_storable_event() {
+        run_paused(async {
+            let (w, t) = setup(1).await;
+            let rows = json!([{"event": "b", "time": "9999-12-31T23:59:59.500Z"}]);
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], &rows.to_string()).await;
+            assert_eq!(s, 201, "{r}");
+            let (_, table) = send(&w, 0, &t, "GET", "/v1/dbs/d/events/ev", &[], "").await;
+            let q = crate::console::events::default_query(&table);
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], &q).await;
+            assert_eq!(s, 200, "{q}: {r}");
+            let n: i64 = r["rows"].as_array().unwrap().iter().map(|row| row[2].as_i64().unwrap_or(0)).sum();
+            assert_eq!(n, 1, "the default query {q} answered {r}");
+            w.shutdown();
+        });
+    }
 }

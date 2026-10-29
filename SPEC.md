@@ -335,9 +335,10 @@ two of these forms in one object, makes the request `400`.
 - **Values compare within their type**. A column compares with values of
   its type (bytes as base64, by their bytes); only string, bytes and JSON
   columns take `prefix` and `contains`, and blob columns only `exists`. JSON (JSON columns, body fields, headers as strings) compares
-  numbers by value (`1` equals `1.0`), strings by their bytes and booleans
-  with false first; arrays and objects only equal. A comparison across
-  types is false.
+  numbers by their exact values (`1` equals `1.0`, and `2^53 + 1` does not
+  equal `2^53` as a float), strings by their bytes and booleans with false
+  first; arrays and objects only equal. A comparison across types is false.
+  A float column refuses an integer argument that no float equals.
 - **Limits**: a filter nests at most 16 deep and has at most 256 terms.
 
 ### 4.8 Event tables

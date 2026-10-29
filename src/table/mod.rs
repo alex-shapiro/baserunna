@@ -964,8 +964,21 @@ fn bind_filter(s: &TableSchema, f: &Filter) -> Result<RowFilter> {
         if !fits {
             return Err(Error::invalid(format!("{} does not apply to {} column {name:?}", test.name(), c.ty.name())));
         }
-        Ok((c.id, test.try_map(|v| datum_from_json(c.ty, v, name))?))
+        Ok((c.id, test.try_map(|v| filter_arg(c.ty, v, name))?))
     })
+}
+
+/// A filter argument as a datum of `ty`. A float column refuses integers
+/// that no float equals, which converting would round to a neighbour.
+fn filter_arg(ty: ColType, v: &Json, name: &str) -> Result<Datum> {
+    if ty == ColType::Float
+        && let Json::Number(n) = v
+        && let Some(i) = n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from))
+        && (i as f64) as i128 != i
+    {
+        return Err(Error::invalid(format!("float column {name:?} cannot equal {v}: compare with a float")));
+    }
+    datum_from_json(ty, v, name)
 }
 
 fn row_matches(f: &RowFilter, row: &Row) -> bool {

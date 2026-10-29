@@ -190,6 +190,9 @@ fn typed_arg(c: &EvColumn, a: &Json) -> Result<Json> {
         EvType::Int => json!(a.as_i64().ok_or_else(bad)?),
         // Integers stay exact: they compare with floats by value.
         EvType::Float if a.is_i64() => a.clone(),
+        EvType::Float if a.is_u64() => {
+            return Err(Error::invalid(format!("{a} exceeds the signed 64-bit integer range, as no event can")));
+        }
         EvType::Float => json!(a.as_f64().filter(|f| f.is_finite()).ok_or_else(bad)? + 0.0),
         EvType::String => json!(a.as_str().ok_or_else(bad)?),
         EvType::Bool => json!(a.as_bool().ok_or_else(bad)?),

@@ -821,3 +821,62 @@ fn rows_mode_refuses_duplicate_output_names() {
         assert!(r.is_err(), "answered columns {:?}", r.map(|o| o.columns));
     });
 }
+
+/// A float column refuses integer arguments beyond i64, as no event holds
+/// them, rather than rounding u64::MAX to 2^64; floats still compare.
+#[test]
+fn float_columns_refuse_integers_beyond_i64() {
+    rt().block_on(async {
+        let (eng, _store, env) = engine(1, EngineConfig::small_for_tests());
+        env.spawn(async {});
+        let db = create_db(&eng, "d").await;
+        let row = json!({"time": T0, "event": "a", "x": 18446744073709551616.0});
+        txn_do(&db, async |t| insert(t, "events", std::slice::from_ref(&row), 0).await).await.unwrap();
+        let count = async |w: Json| {
+            let q = json!({"from": T0, "to": T0 + DAY, "where": w, "aggregates": {"n": {"fn": "count"}}});
+            query(&db, &q).await.map(|o| o.rows[0][0].as_i64().unwrap())
+        };
+        let big = u64::MAX;
+        let eq = count(json!({"col": "x", "op": "eq", "value": big})).await;
+        let gt = count(json!({"col": "x", "op": "gt", "value": big})).await;
+        let le = count(json!({"col": "x", "op": "le", "value": big})).await;
+        assert!(
+            [&eq, &gt, &le].iter().all(|r| matches!(r, Err(Error::InvalidArgument(_)))),
+            "x = 2^64: eq, gt, le u64::MAX answered {eq:?} {gt:?} {le:?}"
+        );
+        let ge = count(json!({"col": "x", "op": "ge", "value": 18446744073709551616.0})).await;
+        assert_eq!(ge.ok(), Some(1));
+    });
+}
+
+/// A row-table float column refuses an integer no float equals instead of
+/// rounding it, so it never answers unlike a JSON column holding the value.
+#[test]
+fn row_table_float_columns_refuse_integers_no_float_equals() {
+    rt().block_on(async {
+        let (eng, _store, env) = engine(1, EngineConfig::small_for_tests());
+        env.spawn(async {});
+        let db = create_db(&eng, "d").await;
+        let row = json!({"id": 100, "plan": "big", "score": 9007199254740992.0, "meta": {"v": 9007199254740992.0}});
+        let d = db.clone();
+        txn_do(&db, async |t| {
+            let b = crate::table::BlobResolver { db: &d };
+            crate::table::insert(t, &b, "nums", &row, crate::table::InsertMode::Insert).await
+        })
+        .await
+        .unwrap();
+        let n = async |f: Json| {
+            let q: crate::table::Query = serde_json::from_value(json!({"filter": f})).unwrap();
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            crate::table::query(&mut t, "nums", &q).await.map(|r| r.rows.len())
+        };
+        let json_col = n(json!({"col": "meta", "op": "eq", "value": {"v": 9007199254740993i64}})).await;
+        let float_col = n(json!({"col": "score", "op": "eq", "value": 9007199254740993i64})).await;
+        assert!(
+            json_col.as_ref().is_ok_and(|n| *n == 0) && matches!(float_col, Err(Error::InvalidArgument(_))),
+            "2^53 eq 2^53 + 1: in a JSON column {json_col:?}, in a float column {float_col:?}"
+        );
+        let exact = n(json!({"col": "score", "op": "eq", "value": 9007199254740992i64})).await;
+        assert_eq!(exact.ok(), Some(1), "an integer a float equals compares");
+    });
+}

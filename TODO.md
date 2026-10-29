@@ -259,6 +259,17 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       `Idempotency-Key` header on `PUT` and `DELETE /v1/dbs/{db}/kv/{key}` and
       return the commit ID in a response header so clients can resolve
       ambiguous writes via `GET /commits/{id}`.
+- [ ] **Filter JSON columns whole and read inner objects by path.** Parts
+      store a JSON column as its leaf paths, so a filter on the column
+      itself is refused (`exec::Binder::filter`) and a path naming an inner
+      object reads as missing (`json::leaf`). Answer `exists` from the
+      column's presence and rebuild inner objects from the leaves under
+      their path.
+- [ ] **Compare row-table float columns with integers exactly.** Row-table
+      filters convert arguments to a column's datum (`table::filter_arg`), so
+      a float column refuses an integer no float equals, while event tables
+      compare it exactly (`x < 2^53 + 1` holds for 2^53). Keep integer
+      arguments exact as event filters do.
 
 ## Testing
 

@@ -285,7 +285,7 @@ pub fn json_line(
 ) -> String {
     let mut out = String::with_capacity(128);
     out.push_str("{\"ts\":");
-    push_str(&mut out, &rfc3339(ts_ms));
+    push_str(&mut out, &rfc3339(ts_ms as i64));
     out.push_str(",\"level\":");
     push_str(&mut out, l.name());
     for (k, v) in [("node", node), ("request_id", rid), ("msg", Some(msg))] {
@@ -325,9 +325,9 @@ fn text_line(l: Level, node: Option<&str>, rid: Option<&str>, msg: &str, fields:
 }
 
 /// Formats Unix epoch milliseconds as an RFC 3339 UTC timestamp.
-pub fn rfc3339(ms: u64) -> String {
-    let days = (ms / 86_400_000) as i64;
-    let rem = ms % 86_400_000;
+pub fn rfc3339(ms: i64) -> String {
+    let days = ms.div_euclid(86_400_000);
+    let rem = ms.rem_euclid(86_400_000);
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -388,6 +388,8 @@ mod tests {
         assert_eq!(rfc3339(951_782_400_000), "2000-02-29T00:00:00.000Z");
         assert_eq!(rfc3339(1_791_979_200_123), "2026-10-14T12:00:00.123Z");
         assert_eq!(rfc3339(4_107_542_399_999), "2100-02-28T23:59:59.999Z");
+        assert_eq!(rfc3339(-1), "1969-12-31T23:59:59.999Z");
+        assert_eq!(rfc3339(-62_167_219_200_000), "0000-01-01T00:00:00.000Z");
     }
 
     #[test]
@@ -409,7 +411,7 @@ mod tests {
                     return Err("a record spans lines".into());
                 }
                 let v: Json = serde_json::from_str(&line).map_err(|e| format!("{e}: {line}"))?;
-                let want = json!({"ts": rfc3339(*ts), "level": "info", "node": node, "msg": msg,
+                let want = json!({"ts": rfc3339(*ts as i64), "level": "info", "node": node, "msg": msg,
                     "n": n, "s": msg, "o": {"k": [1, null]}});
                 let mut want = want.as_object().cloned().unwrap_or_default();
                 if let Some(r) = rid {

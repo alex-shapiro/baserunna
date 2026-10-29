@@ -117,7 +117,7 @@ fn answer_html(a: &Json, times: &[String]) -> String {
         .map(|r| {
             let cells =
                 r.as_array().into_iter().flatten().enumerate().map(|(i, v)| match (is_time.get(i), v.as_i64()) {
-                    (Some(true), Some(ms)) if ms >= 0 => format!("<td>{}</td>", when(ms as u64)),
+                    (Some(true), Some(ms)) => format!("<td>{}</td>", when(ms)),
                     _ => format!("<td>{}</td>", cell(v)),
                 });
             format!("<tr>{}</tr>", cells.collect::<String>())
@@ -173,7 +173,7 @@ async fn render(s: &Session, db: &str, name: &str, t: &Json, q: &str, answer: St
         .map(|p| {
             format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                when(p["start"].as_u64().unwrap_or(0)),
+                when(p["start"].as_i64().unwrap_or(0)),
                 p["parts"],
                 p["rows"],
                 format_bytes(p["bytes"].as_u64().unwrap_or(0))
@@ -189,7 +189,7 @@ async fn render(s: &Session, db: &str, name: &str, t: &Json, q: &str, answer: St
             format!(
                 "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 esc(p["id"].as_str().unwrap_or_default()),
-                when(p["partition"].as_u64().unwrap_or(0)),
+                when(p["partition"].as_i64().unwrap_or(0)),
                 p["level"],
                 p["rows"],
                 p["deleted"],

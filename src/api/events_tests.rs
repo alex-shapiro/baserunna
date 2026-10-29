@@ -416,6 +416,31 @@ fn console_default_queries_read_the_newest_month() {
     });
 }
 
+/// The console shows times before 1970, which tables accept, as dates:
+/// partition starts and the times in query answers alike.
+#[test]
+fn console_shows_times_before_1970() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        let rows = r#"[{"event": "a", "time": "1960-06-15T12:00:00Z"}]"#;
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], rows).await;
+        assert_eq!(s, 201, "{r}");
+        let req = http::Request::builder()
+            .uri("/console/dbs/d/events/ev")
+            .header("cookie", format!("{}={t}", crate::api::SESSION_COOKIE))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = w.node(0).router().unwrap().oneshot(req).await.unwrap();
+        let html = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&html);
+        let at = |h: &str| html.find(h).unwrap_or_else(|| panic!("no {h} in {html}"));
+        let (answer, partitions) = (&html[..at("<h2>Partitions</h2>")], &html[at("<h2>Partitions</h2>")..]);
+        assert!(partitions.contains("<td>1960-06-15 00:00:00</td>"), "{partitions}");
+        assert!(answer.contains("<td>1960-06-15 00:00:00</td><td>a</td>"), "{answer}");
+        w.shutdown();
+    });
+}
+
 #[test]
 fn inserts_on_one_node_are_seen_by_strong_queries_on_others() {
     run_paused(async {

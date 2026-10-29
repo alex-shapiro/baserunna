@@ -414,8 +414,8 @@ fn span(ms: u64) -> String {
     }
 }
 
-fn when(ms: u64) -> String {
-    crate::log::rfc3339(ms)[..19].replace('T', " ")
+fn when(ms: impl TryInto<i64>) -> String {
+    crate::log::rfc3339(ms.try_into().unwrap_or(i64::MAX))[..19].replace('T', " ")
 }
 
 async fn login_page(State(node): State<Arc<Node>>, q: Params) -> Response {

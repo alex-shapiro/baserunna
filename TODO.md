@@ -123,9 +123,9 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       insert opens when the insert commits.
 - [ ] **Charge event queries to the node memory budget.** A query's
       aggregation state or kept rows with the columns it reads at once, and
-      its lookup maps (up to 1 GiB each, `exec::Limits`) are charged to the
-      query only, so `query_concurrency` queries can hold many times
-      `memory_bytes`.
+      the bytes its lookup maps hold (up to 1 GiB each, `exec::Limits`) are
+      charged to the query only, so `query_concurrency` queries can hold
+      many times `memory_bytes`.
       Reserve query memory through the node's `MemoryGate`, and share query
       slots fairly among users (`Node::query_slot` is first come, first
       served).

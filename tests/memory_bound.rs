@@ -538,3 +538,68 @@ fn queries_naming_many_shared_json_paths_stay_near_their_limit() {
         w.shutdown();
     });
 }
+
+/// A query's lookups hold memory near `lookup_max_bytes`, however many of
+/// them read the same table.
+#[test]
+fn query_lookups_stay_near_their_limit() {
+    use baserunna::sim::cost::{World, call_router, run_paused};
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    run_paused(async {
+        let w = World::with_config(1, 0, |c| c.query_limits.lookup_max_bytes = 8 * MIB).await;
+        let t = w.signup(0, "mem@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let router = w.node(0).router().unwrap();
+        let l = r#"{"name": "l", "columns": [{"name": "k", "type": "int"}, {"name": "v", "type": "int"}],
+            "primary_key": ["k"]}"#;
+        let r = call_router(&router, "POST", "/v1/dbs/d/tables", &t, Bytes::from(l)).await;
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        for b in 0..20 {
+            let ops: Vec<String> = (0..10_000)
+                .map(|i| format!(r#"{{"op": "insert_row", "table": "l", "row": {{"k": {}, "v": 1}}}}"#, b * 10_000 + i))
+                .collect();
+            let txn = format!(r#"{{"ops": [{}]}}"#, ops.join(","));
+            let r = call_router(&router, "POST", "/v1/dbs/d/txn", &t, Bytes::from(txn)).await;
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        }
+        let table = r#"{"name": "ev", "columns": [{"name": "time", "type": "time", "default": "now"}],
+            "time_column": "time", "order_by": ["time"]}"#;
+        let r = call_router(&router, "POST", "/v1/dbs/d/events", &t, Bytes::from(table)).await;
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        let txn = r#"{"ops": [{"op": "insert_events", "table": "ev", "rows": [{}]}]}"#;
+        let r = call_router(&router, "POST", "/v1/dbs/d/txn", &t, Bytes::from(txn)).await;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let lookups: serde_json::Map<String, serde_json::Value> =
+            (0..8).map(|i| (format!("l{i}"), serde_json::json!({"table": "l", "key": "time", "value": "v"}))).collect();
+        let q = serde_json::json!({"from": 0, "to": 9_999_999_999_999i64, "consistency": "strong",
+            "lookups": lookups, "aggregates": {"n": {"fn": "count"}}})
+        .to_string();
+        // Reading the table fills the node's block cache with about 30 MB,
+        // which the cache's budget bounds, not the query's; a scan of the
+        // table warms it first so that the query is measured alone.
+        let mut cursor = None;
+        loop {
+            let page = match cursor {
+                Some(c) => serde_json::json!({"limit": 1000, "cursor": c}),
+                None => serde_json::json!({"limit": 1000}),
+            };
+            let r =
+                call_router(&router, "POST", "/v1/dbs/d/tables/l/rows/query", &t, Bytes::from(page.to_string())).await;
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let page: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+            cursor = page["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let before = reset_peak();
+        let r = call_router(&router, "POST", "/v1/dbs/d/events/ev/rows/query", &t, Bytes::from(q)).await;
+        let grown = PEAK_BYTES.load(Relaxed) - before;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert!(
+            grown < 2 * 8 * MIB as isize,
+            "a query with 8 lookups of one table, within its 8 MiB lookup limit, grew the heap by {grown} bytes"
+        );
+        w.shutdown();
+    });
+}

@@ -23,6 +23,7 @@ use crate::probe::{self, Probe};
 use crate::table::schema::{Datum, Row, decode_row};
 use crate::util::DetHashMap;
 use crate::util::b64;
+use crate::util::codec::{Reader, Writer};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesOrdered;
 use serde_json::{Value as Json, json};
@@ -36,9 +37,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub struct Limits {
     /// Compressed bytes read from storage.
     pub max_bytes_read: u64,
-    /// Bytes of aggregation state.
+    /// Bytes of aggregation state or kept rows, with the columns read at once.
     pub max_memory_bytes: usize,
-    /// Bytes of rows read from the query's lookup tables.
+    /// Bytes the maps of the query's lookups hold.
     pub lookup_max_bytes: usize,
     /// Milliseconds a query runs before it stops with a retryable `503`.
     pub max_ms: u64,
@@ -111,7 +112,78 @@ enum Need {
 struct Lookup {
     key: BExpr,
     default: Option<BExpr>,
-    map: Arc<DetHashMap<Vec<u8>, Val>>,
+    map: Arc<LookupMap>,
+}
+
+/// A row table's primary keys mapped to one of its columns, held in about
+/// the bytes of the keys and values: each entry's key (its canonical bytes)
+/// and value (encoded) lie back to back in one buffer, found through an
+/// open-addressing table of entry numbers.
+#[derive(Default)]
+struct LookupMap {
+    data: Vec<u8>,
+    /// Where each entry starts in `data`.
+    starts: Vec<u32>,
+    /// Entry numbers plus one by hash slot, 0 for an empty slot; its length
+    /// is a power of two that keeps it at most 2/3 full.
+    slots: Vec<u32>,
+}
+
+impl LookupMap {
+    /// The bytes the map holds.
+    fn mem(&self) -> usize {
+        self.data.len() + 4 * (self.starts.len() + self.slots.len())
+    }
+
+    /// Appends an entry; entries are found once [`LookupMap::index`] runs.
+    fn push(&mut self, key: &[u8], v: &Val) -> Result<()> {
+        let start = u32::try_from(self.data.len()).map_err(|_| Error::TooLarge("a lookup map exceeds 4 GiB".into()))?;
+        let mut w = Writer::new();
+        w.bytes(key);
+        v.encode(&mut w);
+        self.data.extend_from_slice(&w.into_inner());
+        self.starts.push(start);
+        Ok(())
+    }
+
+    fn entry(&self, e: usize) -> Reader<'_> {
+        Reader::new(&self.data[self.starts[e] as usize..])
+    }
+
+    /// The bytes [`LookupMap::index`] adds.
+    fn index_mem(&self) -> usize {
+        let n = self.starts.len();
+        4 * (n + n / 2 + 1).next_power_of_two()
+    }
+
+    /// Builds the slots; of entries with equal keys, the last is found.
+    fn index(&mut self) {
+        let n = self.starts.len();
+        let mut slots = vec![0u32; self.index_mem() / 4];
+        let mask = slots.len() - 1;
+        for e in 0..n {
+            let key = self.entry(e).bytes().unwrap_or_default();
+            let mut s = crate::util::bloom::key_hash(key) as usize & mask;
+            while slots[s] != 0 && self.entry(slots[s] as usize - 1).bytes().ok() != Some(key) {
+                s = (s + 1) & mask;
+            }
+            slots[s] = e as u32 + 1;
+        }
+        self.slots = slots;
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Val> {
+        let mask = self.slots.len().checked_sub(1)?;
+        let mut s = crate::util::bloom::key_hash(key) as usize & mask;
+        loop {
+            let e = self.slots[s].checked_sub(1)? as usize;
+            let mut r = self.entry(e);
+            if r.bytes().ok() == Some(key) {
+                return Val::decode(&mut r, 0).ok();
+            }
+            s = (s + 1) & mask;
+        }
+    }
 }
 
 struct Binder<'a> {
@@ -484,8 +556,7 @@ impl<'r> Batch<'r> {
                         w.clone()
                             .map(|i| {
                                 let key = self.val(&l.key, i);
-                                let found =
-                                    if key.is_null() { None } else { l.map.get(&key.canonical_bytes()).cloned() };
+                                let found = if key.is_null() { None } else { l.map.get(&key.canonical_bytes()) };
                                 match found {
                                     Some(v) => v,
                                     None => l.default.as_ref().map_or(Val::Null, |d| self.val(d, i)),
@@ -1876,47 +1947,49 @@ pub async fn input(txn: &mut Txn, s: &EventSchema, from: i64, to: i64) -> Result
     Ok(Input { refs, unsealed })
 }
 
-/// Builds the maps of the query's lookups at the transaction's snapshot.
-async fn lookup_maps(
-    txn: &mut Txn,
-    q: &Query,
-    limits: &Limits,
-) -> Result<Vec<(String, Arc<DetHashMap<Vec<u8>, Val>>)>> {
-    let mut out = Vec::new();
+/// Builds the maps of the query's lookups at the transaction's snapshot:
+/// one per table and value column, which every lookup of them shares,
+/// filled in one pass over each table. The bytes the maps hold are charged
+/// to `lookup_max_bytes`.
+async fn lookup_maps(txn: &mut Txn, q: &Query, limits: &Limits) -> Result<Vec<(String, Arc<LookupMap>)>> {
+    let mut values: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for l in q.lookups.values() {
+        values.entry(l.table.as_str()).or_default().insert(l.value.as_str());
+    }
+    let too_large = || Error::TooLarge(format!("the query's lookup maps exceed {} bytes", limits.lookup_max_bytes));
     let mut budget = limits.lookup_max_bytes;
-    let mut tables: BTreeMap<&str, Arc<(crate::table::schema::TableSchema, Vec<Row>)>> = BTreeMap::new();
-    for (name, l) in &q.lookups {
-        let table = match tables.get(l.table.as_str()) {
-            Some(t) => t.clone(),
-            None => {
-                let t = Arc::new(crate::table::rows_within(txn, &l.table, &mut budget).await.map_err(|e| match e {
-                    Error::TooLarge(_) => {
-                        Error::TooLarge(format!("the query's lookup tables exceed {} bytes", limits.lookup_max_bytes))
-                    }
-                    e => e,
-                })?);
-                tables.insert(&l.table, t.clone());
-                t
-            }
-        };
-        let (ts, rows) = (&table.0, &table.1);
+    let mut maps: BTreeMap<(&str, &str), Arc<LookupMap>> = BTreeMap::new();
+    for (table, values) in values {
+        let ts = crate::table::get_schema(txn, table).await?;
         if ts.primary_key.len() != 1 {
-            return Err(Error::invalid(format!("lookup table {:?} needs a single-column primary key", l.table)));
+            return Err(Error::invalid(format!("lookup table {table:?} needs a single-column primary key")));
         }
         let key_id = ts.column(&ts.primary_key[0]).map(|c| c.id).ok_or_else(|| Error::internal("pk column missing"))?;
-        let val_id = ts
-            .column(&l.value)
-            .map(|c| c.id)
-            .ok_or_else(|| Error::invalid(format!("lookup table {:?} has no column {:?}", l.table, l.value)))?;
-        let mut map = DetHashMap::default();
-        for r in rows {
-            let k = r.get(&key_id).map_or(Val::Null, datum_val);
-            let v = r.get(&val_id).map_or(Val::Null, datum_val);
-            map.insert(k.canonical_bytes(), v);
+        let mut cols = Vec::with_capacity(values.len());
+        for value in values {
+            let id = ts
+                .column(value)
+                .map(|c| c.id)
+                .ok_or_else(|| Error::invalid(format!("lookup table {table:?} has no column {value:?}")))?;
+            cols.push((value, id, LookupMap::default()));
         }
-        out.push((name.clone(), Arc::new(map)));
+        crate::table::each_row(txn, &ts, |row| {
+            let key = row.get(&key_id).map_or(Val::Null, datum_val).canonical_bytes();
+            for (_, id, map) in cols.iter_mut() {
+                let before = map.mem();
+                map.push(&key, &row.get(id).map_or(Val::Null, datum_val))?;
+                budget = budget.checked_sub(map.mem() - before).ok_or_else(too_large)?;
+            }
+            Ok(())
+        })
+        .await?;
+        for (value, _, mut map) in cols {
+            budget = budget.checked_sub(map.index_mem()).ok_or_else(too_large)?;
+            map.index();
+            maps.insert((table, value), Arc::new(map));
+        }
     }
-    Ok(out)
+    Ok(q.lookups.iter().map(|(name, l)| (name.clone(), maps[&(l.table.as_str(), l.value.as_str())].clone())).collect())
 }
 
 /// Runs `q` on table `s` at the transaction's snapshot.
@@ -2337,4 +2410,29 @@ pub fn row_matches(s: &EventSchema, row: &Row, f: &Filter, from: i64, to: i64) -
 /// The kind of a plan that only selects rows, as deletes do.
 fn only_filter() -> Kind {
     Kind::Aggregate { first: BoundStage { group_by: Vec::new(), aggregates: Vec::new() }, then: None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_maps_find_the_last_value_of_each_key() {
+        let mut m = LookupMap::default();
+        assert_eq!(m.get(&Val::Int(1).canonical_bytes()), None, "an empty map finds nothing");
+        let keys: Vec<Val> = (0..1000).map(Val::Int).chain([Val::Str("a".into()), Val::Float(0.5)]).collect();
+        for (i, k) in keys.iter().enumerate() {
+            m.push(&k.canonical_bytes(), &Val::Str(format!("v{i}"))).unwrap();
+        }
+        m.push(&Val::Int(7).canonical_bytes(), &Val::Null).unwrap();
+        m.index();
+        assert!(3 * m.starts.len() <= 2 * m.slots.len(), "{} entries in {} slots", m.starts.len(), m.slots.len());
+        for (i, k) in keys.iter().enumerate() {
+            let want = if *k == Val::Int(7) { Val::Null } else { Val::Str(format!("v{i}")) };
+            assert_eq!(m.get(&k.canonical_bytes()), Some(want), "{k:?}");
+        }
+        for k in [Val::Int(1000), Val::Str("b".into()), Val::Float(1.5), Val::Null] {
+            assert_eq!(m.get(&k.canonical_bytes()), None, "{k:?}");
+        }
+    }
 }

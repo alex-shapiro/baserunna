@@ -172,7 +172,7 @@ impl Val {
         }
     }
 
-    fn encode(&self, w: &mut Writer) {
+    pub(crate) fn encode(&self, w: &mut Writer) {
         match self {
             Val::Null => w.u8(0),
             Val::Bool(b) => {
@@ -203,7 +203,7 @@ impl Val {
         }
     }
 
-    fn decode(r: &mut Reader<'_>, depth: u32) -> DResult<Val> {
+    pub(crate) fn decode(r: &mut Reader<'_>, depth: u32) -> DResult<Val> {
         if depth > 4 {
             return Err(DecodeError("value nests too deep"));
         }

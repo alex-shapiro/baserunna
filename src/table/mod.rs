@@ -880,23 +880,18 @@ fn decode_stored_row(s: &TableSchema, prefix: &[u8], it: &ReadValue) -> Result<(
     Ok((pk, row))
 }
 
-/// Every row of table `name` with its schema, read into the transaction's
-/// read set. Their stored bytes are charged to `budget`, failing with
-/// `TooLarge` once it runs out.
-pub(crate) async fn rows_within(txn: &mut Txn, name: &str, budget: &mut usize) -> Result<(TableSchema, Vec<Row>)> {
-    let s = get_schema(txn, name).await?;
+/// Reads every row of table `s` into the transaction's read set, passing
+/// each to `f` with its defaults filled in, so that the caller holds only
+/// what it keeps of them.
+pub(crate) async fn each_row(txn: &mut Txn, s: &TableSchema, mut f: impl FnMut(Row) -> Result<()>) -> Result<()> {
     let prefix = table_prefix(SPACE_ROWS, s.id);
-    let mut out = Vec::new();
     let mut pages = Pages::new(KeyRange::prefix(&prefix));
     while let Some(page) = pages.next(txn).await? {
         for it in &page {
-            *budget = budget
-                .checked_sub(it.key.len() + it.value.size())
-                .ok_or_else(|| Error::TooLarge(format!("table {name:?} does not fit in the lookup limit")))?;
-            out.push(decode_stored_row(&s, &prefix, it)?.1);
+            f(decode_stored_row(s, &prefix, it)?.1)?;
         }
     }
-    Ok((s, out))
+    Ok(())
 }
 
 async fn all_rows(txn: &mut Txn, s: &TableSchema) -> Result<Vec<(Bytes, Vec<Key>, Row, Option<u64>)>> {

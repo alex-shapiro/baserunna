@@ -415,7 +415,9 @@ events to row tables.
   - *Lookups* (`"lookups": {"plan": {"table": "users", "key": "user",
     "value": "plan", "default": ..}}`) map an expression through a row
     table's primary key to one of its columns; `default`, an expression,
-    answers when the key is missing.
+    answers when the key is missing. A query reads each lookup table once,
+    into one map per column it looks up, which holds each row's key and
+    value and is shared by every lookup of that column.
 
   For example, users per plan who viewed and then bought within a day:
   `{"from": "2026-10-01", "to": "2026-11-01", "lookups": {"plan": {"table":
@@ -430,7 +432,7 @@ events to row tables.
     retries at a fresh one.
   - *Limits.* A query fails with `413` past 4 GiB read, 1 GiB of
     aggregation state or kept rows with the columns it reads at once, or
-    1 GiB of lookup rows, and with a retryable `503` once it has run for
+    1 GiB of lookup maps, and with a retryable `503` once it has run for
     60 s.
 - **Deletes** remove the events matching a filter within a time range, in a
   transaction. A delete that would need an oversized mask in one partition
@@ -1840,7 +1842,7 @@ Tools:
 - Stream retention runs on the lease holder, so a database with no activity keeps records past their retention until it is used again (§5.11). Trimmed chunks and their quota bytes are reclaimed by sweeps, hours later, as overwritten blobs are.
 - Stream filters scan records; there is no index on record contents, so a query finds needles at the rate it can scan (`scan_limit` records a request).
 - An event query runs on the node it reaches, on one task: its speed is one core's decoding rate and its store's latency divided by 32 concurrent part reads (§5.13).
-- Event lookups read their whole row table on every query, up to 1 GiB (§4.8).
+- Event lookups read their whole row table on every query, into maps of up to 1 GiB (§4.8).
 - Event merges and retention run on the lease holder, so a database with no activity keeps expired parts, which queries skip, until it is used again (§5.13).
 - Event parts are cached in memory only; the local disk tier (§5.3) holds segments, so a restarted node reads parts from the store again.
 

@@ -362,8 +362,10 @@ events to row tables.
   dropped. `json` columns take no default, sort key or skip index.
 - **Inserts** take up to 1 MiB per event. A bulk insert (`POST …/rows`, a
   JSON array or NDJSON) waits up to 200 ms for other inserts on the same
-  node and commits with them in one manifest write, and with an
-  idempotency key is applied once. An `insert_events` op in a transaction
+  node and commits with them in one manifest write. With an idempotency
+  key it is applied once, a retry answers with what the first attempt
+  inserted, and a key used by another kind of request is refused with
+  `400`. An `insert_events` op in a transaction
   commits with the transaction's other writes. Times range over the years
   0000 to 9999. Null JSON fields are dropped, `-0.0` is stored as `0`, and
   JSON integers outside the signed 64-bit range are refused, since queries
@@ -381,8 +383,9 @@ events to row tables.
   funnel per user becomes a count per funnel step. Sums of floats are exact,
   so answers never depend on how events are stored or merged. Lookups map a
   value through a row table (`{table, key, value, default}`), such as a
-  user id to a plan. A query reads a snapshot at most 5 s old unless
-  `consistency` is `strong` (which sees every acknowledged insert); a
+  user id to a plan. A query reads a snapshot at most 5 s old (or
+  `max_staleness_ms`) unless `consistency` is `strong`, which sees every
+  acknowledged insert; a
   snapshot that lacks the table or a column named retries at a fresh one.
   A query fails with `413` past 4 GiB read, 1 GiB of aggregation state or
   1 GiB of lookup rows, and with a retryable `503` once it has run for 60 s.

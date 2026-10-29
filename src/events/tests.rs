@@ -3144,8 +3144,7 @@ mod maintenance_robustness {
             ins(&db, old).await;
             while maint::seal(&db, id).await.unwrap() {}
             let spec: ColumnSpec =
-                serde_json::from_value(json!({"name": "note", "type": "string", "default": "d".repeat(10_000)}))
-                    .unwrap();
+                serde_json::from_value(json!({"name": "note", "type": "string", "default": "d".repeat(1000)})).unwrap();
             txn_do(&db, async |t| add_column(t, "events", &spec).await).await.unwrap();
             // Distinct values past the dictionary's 1 MiB keep the merged column plain.
             let new: Vec<Json> = (0..200)
@@ -3156,7 +3155,7 @@ mod maintenance_robustness {
             let (s, rs) = schema_and_refs(&db).await;
             assert_eq!(rs.len(), 2, "two parts in one partition");
             let r = maint::merge(&db, &s, &rs).await;
-            assert!(r.is_ok(), "merging a table after adding a 10 KB default: {r:?}");
+            assert!(r.is_ok(), "merging a table after adding a 1 KB default: {r:?}");
         });
     }
 
@@ -3173,8 +3172,7 @@ mod maintenance_robustness {
             ins(&db, old).await;
             while maint::seal(&db, id).await.unwrap() {}
             let spec: ColumnSpec =
-                serde_json::from_value(json!({"name": "note", "type": "string", "default": "d".repeat(10_000)}))
-                    .unwrap();
+                serde_json::from_value(json!({"name": "note", "type": "string", "default": "d".repeat(1000)})).unwrap();
             txn_do(&db, async |t| add_column(t, "events", &spec).await).await.unwrap();
             for p in 0..7 {
                 let new: Vec<Json> = (0..200)

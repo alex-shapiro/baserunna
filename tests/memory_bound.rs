@@ -313,3 +313,43 @@ fn a_tiny_corrupt_column_index_does_not_decode_into_gigabytes() {
         index.len()
     );
 }
+
+/// Events that take a column's default grow by it, so a request of `{}`
+/// events against a table with the largest default expands about 300
+/// times; bulk inserts (held to 4 times their 32 MiB body limit) and
+/// transactions alike refuse once the expanded events pass the request's
+/// limit, and hold no more than it meanwhile.
+#[test]
+fn events_expanded_by_defaults_stay_within_their_request_limit() {
+    use baserunna::sim::cost::{World, call_router, run_paused};
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    run_paused(async {
+        let w = World::new(1, 0).await;
+        let t = w.signup(0, "mem@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let router = w.node(0).router().unwrap();
+        let pad = "x".repeat(baserunna::events::schema::DEFAULT_MAX_BYTES - 2);
+        let table = format!(
+            r#"{{"name": "ev", "columns": [{{"name": "time", "type": "time", "default": "now"}},
+            {{"name": "pad", "type": "string", "default": "{pad}"}}], "time_column": "time", "order_by": ["time"]}}"#
+        );
+        let r = call_router(&router, "POST", "/v1/dbs/d/events", &t, Bytes::from(table)).await;
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        let events = |n: usize| vec!["{}"; n].join(",");
+        let bulk = format!("[{}]", events(400_000));
+        let txn = format!(r#"{{"ops": [{{"op": "insert_events", "table": "ev", "rows": [{}]}}]}}"#, events(100_000));
+        for (path, body) in [("/v1/dbs/d/events/ev/rows", bulk), ("/v1/dbs/d/txn", txn)] {
+            let before = reset_peak();
+            let r = call_router(&router, "POST", path, &t, Bytes::from(body.clone())).await;
+            let grown = PEAK_BYTES.load(Relaxed) - before;
+            assert_eq!(r.status, 413, "{path}: {}", String::from_utf8_lossy(&r.body));
+            assert!(
+                grown < 192 * MIB as isize,
+                "{path}: a {} byte body grew the heap by {grown} bytes ({}x)",
+                body.len(),
+                grown / body.len() as isize
+            );
+        }
+        w.shutdown();
+    });
+}

@@ -362,10 +362,12 @@ events to row tables.
   columns that filters test for equality. Columns can be dropped, and
   added with a default that applies to events written before the column
   existed; an added time column defaulting to `"now"` must be nullable,
-  since it reads null for them. `json` columns take no default, sort key or
-  skip index.
+  since it reads null for them. A default takes at most 1 KiB, and `json`
+  columns take no default, sort key or skip index.
 - **Inserts** take up to 1 MiB per event, whose JSON objects flatten to
-  at most 4 MiB of paths and values. A bulk insert (`POST …/rows`, a
+  at most 4 MiB of paths and values. A request's events with their
+  defaults filled in are held to its own limit: 4 times a bulk insert's
+  32 MiB body limit, or the transaction's write limit. A bulk insert (`POST …/rows`, a
   JSON array or NDJSON) waits up to 200 ms for other inserts on the same
   node and commits with them in one manifest write. With an idempotency
   key it is applied once, a retry answers with what the first attempt

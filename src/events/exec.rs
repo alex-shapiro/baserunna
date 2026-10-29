@@ -600,7 +600,7 @@ struct Plan<'a> {
     /// When the query stops, and its time limit.
     deadline: Option<(tokio::time::Instant, u64)>,
     /// Rows evaluated between calls to [`Plan::pace`]: about [`PACE_WORK`]
-    /// comparisons' worth.
+    /// comparisons' and expressions' worth.
     window: usize,
 }
 
@@ -618,6 +618,10 @@ impl<'a> Plan<'a> {
         let mut positions = false;
         let mut cmps = Vec::new();
         comparisons(&filter, &mut cmps);
+        let exprs = match &kind {
+            Kind::Rows { columns, order, .. } => columns.len() + order.len(),
+            Kind::Aggregate { first: st, .. } => st.group_by.len() + st.aggregates.len(),
+        };
         match &kind {
             Kind::Rows { columns, order, .. } => {
                 columns.iter().for_each(|(_, e)| expr_needs(e, &mut rest, &lookups));
@@ -642,7 +646,7 @@ impl<'a> Plan<'a> {
             }
         }
         let rest = rest.difference(&first).cloned().collect();
-        let window = (PACE_WORK / (1 + cmps.len())).max(1);
+        let window = (PACE_WORK / (1 + cmps.len() + exprs)).max(1);
         Plan { schema, filter, lookups, kind, first, rest, positions, deadline, window }
     }
 

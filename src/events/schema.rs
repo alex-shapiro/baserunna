@@ -141,6 +141,12 @@ impl EventSchema {
                 if c.ty == EvType::Json {
                     return Err(Error::invalid(format!("json column {:?} cannot have a default", c.name)));
                 }
+                if d.to_string().len() > DEFAULT_MAX_BYTES {
+                    return Err(Error::invalid(format!(
+                        "column {:?} has a default of more than {DEFAULT_MAX_BYTES} bytes",
+                        c.name
+                    )));
+                }
                 match (c.ty, d) {
                     (EvType::Time, Json::String(s)) if s == NOW => {}
                     _ => {
@@ -383,6 +389,10 @@ fn days_in_month(y: i64, m: u32) -> u32 {
     }
 }
 
+/// The most bytes a column's default takes as JSON: every event written
+/// without the column holds a copy.
+pub const DEFAULT_MAX_BYTES: usize = 1024;
+
 /// Converts a JSON value to a datum of column `c`'s type.
 /// Times an event table stores, in milliseconds: years 0000 to 9999, which
 /// RFC 3339 can express.
@@ -485,6 +495,9 @@ mod tests {
         assert!(bad(&|s| s.columns[1].name = "_hidden".into()));
         assert!(bad(&|s| s.columns[4].default = Some(json!("x"))));
         assert!(bad(&|s| s.retention_ms = Some(0)));
+        let long = |n: usize| move |s: &mut EventSchema| s.columns[2].default = Some(json!("x".repeat(n)));
+        assert!(!bad(&long(DEFAULT_MAX_BYTES - 2)));
+        assert!(bad(&long(DEFAULT_MAX_BYTES - 1)), "a default takes at most {DEFAULT_MAX_BYTES} bytes");
     }
 
     #[test]

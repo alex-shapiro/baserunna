@@ -458,6 +458,35 @@ fn unparseable_times_are_refused_for_their_format() {
     });
 }
 
+/// A query's pacing counts the expressions it computes per row, so one
+/// computing many copies of a large default per row still stops near its
+/// time limit.
+#[test]
+fn queries_of_many_expressions_stop_near_their_time_limit() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+    rt.block_on(async {
+        let w = World::with_config(1, 0, |c| c.query_limits.max_ms = 500).await;
+        let t = w.signup(0, "ev@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events", &[], TABLE).await;
+        assert_eq!(s, 201, "{r}");
+        let rows: Vec<Json> = (0..40_000).map(|i| json!({"event": "a", "time": 1000 + i})).collect();
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], &json!(rows).to_string()).await;
+        assert_eq!(s, 201, "{r}");
+        let pad = "x".repeat(crate::events::schema::DEFAULT_MAX_BYTES - 2);
+        let col = json!({"name": "pad", "type": "string", "default": pad});
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/columns", &[], &col.to_string()).await;
+        assert_eq!(s, 200, "{r}");
+        let group_by: Vec<Json> = (0..64).map(|i| json!({"col": "pad", "as": format!("p{i}")})).collect();
+        let q = json!({"from": 0, "to": 1_000_000, "group_by": group_by, "consistency": "strong"}).to_string();
+        let started = tokio::time::Instant::now();
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], &q).await;
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_millis(1500), "a 500 ms query ran {elapsed:?}: {s} {r}");
+        w.shutdown();
+    });
+}
+
 #[test]
 fn inserts_on_one_node_are_seen_by_strong_queries_on_others() {
     run_paused(async {

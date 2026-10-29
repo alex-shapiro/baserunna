@@ -263,9 +263,17 @@ pub struct ValidRows {
     data: Vec<u8>,
     /// Each row's partition and end in `data`.
     rows: Vec<(u32, u32)>,
+    /// The most bytes the encoded rows may take, if limited.
+    limit: Option<usize>,
 }
 
 impl ValidRows {
+    /// Rows that refuse to grow past `limit` bytes, so that events expanded
+    /// by their defaults cannot outgrow the request that carried them.
+    pub fn up_to(limit: usize) -> ValidRows {
+        ValidRows { limit: Some(limit), ..ValidRows::default() }
+    }
+
     /// Validates event `v`, normalizing its JSON objects, and appends it.
     pub fn push(&mut self, s: &EventSchema, v: &Json, now_ms: i64) -> Result<()> {
         let i = self.rows.len();
@@ -287,6 +295,11 @@ impl ValidRows {
                 "event {i}'s JSON flattens to more than {} bytes of paths and values",
                 schema::ROW_STORED_MAX_BYTES
             )));
+        }
+        if let Some(limit) = self.limit
+            && self.bytes() + encoded.len() + 12 > limit
+        {
+            return Err(Error::TooLarge(format!("the events take more than {limit} bytes with their defaults")));
         }
         self.data.extend_from_slice(&encoded);
         let end = u32::try_from(self.data.len()).map_err(|_| Error::TooLarge("too many events".into()))?;
@@ -335,7 +348,11 @@ pub async fn insert(txn: &mut Txn, name: &str, rows: &[Json], now_ms: i64) -> Re
         return Err(Error::TooLarge(format!("a transaction inserts at most {} events", ev::INSERT_MAX_ROWS)));
     }
     let s = get_schema(txn, name).await?;
-    let rows = validate_rows(&s, rows, now_ms)?;
+    let mut valid = ValidRows::up_to(txn.write_budget());
+    for v in rows {
+        valid.push(&s, v, now_ms)?;
+    }
+    let rows = valid;
     txn.insert_events(s.id, rows.iter().map(|(_, r)| Bytes::copy_from_slice(r)).collect())?;
     Ok(rows.len())
 }

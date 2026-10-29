@@ -314,7 +314,9 @@ async fn insert(
     }
     let (schema, _) = with_read!(ctx.db, Consistency::Strong, |t| events::get_schema(t, &name).await);
     let now = node.now_ms() as i64;
-    let mut valid = events::ValidRows::default();
+    // Encoding adds row bookkeeping and the defaults events omit, so tiny
+    // events take a few times their text.
+    let mut valid = events::ValidRows::up_to(4 * limit);
     each_event(&ct, &data, &mut |v| valid.push(&schema, &v, now))?;
     drop(data);
     if valid.is_empty() {

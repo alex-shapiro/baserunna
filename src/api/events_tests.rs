@@ -487,6 +487,26 @@ fn queries_of_many_expressions_stop_near_their_time_limit() {
     });
 }
 
+/// A full body of the smallest events, which encode to several times their
+/// text, is inserted: only events expanded by defaults past their body's
+/// size are refused.
+#[test]
+fn full_bodies_of_tiny_events_are_inserted() {
+    run_paused(async {
+        let w = World::with_config(1, 0, |c| c.max_json_body = 64 << 10).await;
+        let t = w.signup(0, "ev@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events", &[], TABLE).await;
+        assert_eq!(s, 201, "{r}");
+        let body = vec!["{}"; 21_000].join("\n");
+        assert!(body.len() <= 64 << 10);
+        let ct = [("content-type", "application/x-ndjson")];
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &ct, &body).await;
+        assert_eq!((s, r["count"].clone()), (201, json!(21_000)), "{r}");
+        w.shutdown();
+    });
+}
+
 #[test]
 fn inserts_on_one_node_are_seen_by_strong_queries_on_others() {
     run_paused(async {

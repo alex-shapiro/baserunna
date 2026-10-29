@@ -268,8 +268,9 @@ pub struct ValidRows {
 }
 
 impl ValidRows {
-    /// Rows that refuse to grow past `limit` bytes, so that events expanded
-    /// by their defaults cannot outgrow the request that carried them.
+    /// Rows whose encodings refuse to grow past `limit` bytes, so that events
+    /// expanded by their defaults cannot outgrow the request that carried
+    /// them.
     pub fn up_to(limit: usize) -> ValidRows {
         ValidRows { limit: Some(limit), ..ValidRows::default() }
     }
@@ -297,9 +298,11 @@ impl ValidRows {
             )));
         }
         if let Some(limit) = self.limit
-            && self.bytes() + encoded.len() + 12 > limit
+            && self.data.len() + encoded.len() > limit
         {
-            return Err(Error::TooLarge(format!("the events take more than {limit} bytes with their defaults")));
+            return Err(Error::TooLarge(format!(
+                "the events take more than {limit} bytes once encoded, column defaults included"
+            )));
         }
         self.data.extend_from_slice(&encoded);
         let end = u32::try_from(self.data.len()).map_err(|_| Error::TooLarge("too many events".into()))?;

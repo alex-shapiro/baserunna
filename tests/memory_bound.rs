@@ -316,9 +316,9 @@ fn a_tiny_corrupt_column_index_does_not_decode_into_gigabytes() {
 
 /// Events that take a column's default grow by it, so a request of `{}`
 /// events against a table with the largest default expands about 300
-/// times; bulk inserts (held to 4 times their 32 MiB body limit) and
-/// transactions alike refuse once the expanded events pass the request's
-/// limit, and hold no more than it meanwhile.
+/// times; bulk inserts (held to 8 times their body) and transactions alike
+/// refuse once the expanded events pass the request's limit, and hold no
+/// more than it meanwhile.
 #[test]
 fn events_expanded_by_defaults_stay_within_their_request_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};

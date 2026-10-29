@@ -417,3 +417,124 @@ fn sealing_events_older_than_added_defaults_stays_near_their_size() {
         w.shutdown();
     });
 }
+
+/// A query reading unsealed events that lack columns added with defaults
+/// holds memory near its limit, not the defaults' size times the events.
+#[test]
+fn queries_of_unsealed_events_older_than_added_defaults_stay_near_their_limit() {
+    use baserunna::sim::cost::{World, call_router, run_paused};
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    run_paused(async {
+        let w = World::new(1, 0).await;
+        let t = w.signup(0, "mem@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let router = w.node(0).router().unwrap();
+        let unsealed = unsealed_events_older_than_large_defaults(&t, &router).await;
+        let q = r#"{"from": 0, "to": 9999999999999, "limit": 1, "consistency": "strong"}"#;
+        let before = reset_peak();
+        let r = call_router(&router, "POST", "/v1/dbs/d/events/ev/rows/query", &t, Bytes::from(q)).await;
+        let grown = PEAK_BYTES.load(Relaxed) - before;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert!(
+            grown < 256 * MIB as isize,
+            "a 1-row query of {unsealed} unsealed bytes grew the heap by {grown} bytes ({}x)",
+            grown / unsealed as isize
+        );
+        w.shutdown();
+    });
+}
+
+/// A query naming many JSON paths (one retention aggregate takes 32
+/// conditions of 255 comparisons each) holds memory near its limit over
+/// unsealed events, not the paths times the events, whether or not any
+/// event holds the paths.
+#[test]
+fn queries_naming_many_json_paths_stay_near_their_limit() {
+    use baserunna::sim::cost::{World, call_router, run_paused};
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    run_paused(async {
+        let w = World::new(1, 0).await;
+        let t = w.signup(0, "mem@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let router = w.node(0).router().unwrap();
+        let table = r#"{"name": "ev", "columns": [{"name": "time", "type": "time", "default": "now"},
+            {"name": "j", "type": "json", "nullable": true}], "time_column": "time", "order_by": ["time"]}"#;
+        let r = call_router(&router, "POST", "/v1/dbs/d/events", &t, Bytes::from(table)).await;
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        // 4,400 `{}` events take 29 bytes each unsealed, under the 128 KiB that seals them.
+        let rows = vec!["{}"; 4400].join(",");
+        let txn = format!(r#"{{"ops": [{{"op": "insert_events", "table": "ev", "rows": [{rows}]}}]}}"#);
+        let r = call_router(&router, "POST", "/v1/dbs/d/txn", &t, Bytes::from(txn)).await;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let conditions: Vec<serde_json::Value> = (0..32)
+            .map(|c| {
+                let any: Vec<_> = (0..255)
+                    .map(|i| serde_json::json!({"col": "j", "path": [format!("p{c}_{i}")], "op": "exists"}))
+                    .collect();
+                serde_json::json!({"or": any})
+            })
+            .collect();
+        let q = serde_json::json!({"from": 0, "to": 9_999_999_999_999i64, "consistency": "strong",
+            "aggregates": {"r": {"fn": "retention", "conditions": conditions}}})
+        .to_string();
+        let before = reset_peak();
+        let r = call_router(&router, "POST", "/v1/dbs/d/events/ev/rows/query", &t, Bytes::from(q.clone())).await;
+        let grown = PEAK_BYTES.load(Relaxed) - before;
+        assert!(
+            grown < 256 * MIB as isize,
+            "a {} byte query of 4,400 unsealed `{{}}` events grew the heap by {grown} bytes ({}): {}",
+            q.len(),
+            r.status,
+            String::from_utf8_lossy(&r.body[..r.body.len().min(300)])
+        );
+        w.shutdown();
+    });
+}
+
+/// A query naming many JSON paths that parts may keep in shared buckets
+/// holds memory near its limit, not the paths times the rows of a granule.
+#[test]
+fn queries_naming_many_shared_json_paths_stay_near_their_limit() {
+    use baserunna::sim::cost::{World, call_router, run_paused};
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    run_paused(async {
+        // Parts keep one path as a column and list none of the rest, so any
+        // path may be in their buckets.
+        let w = World::with_config(1, 0, |c| {
+            c.engine.event_json_max_paths = 1;
+            c.engine.event_json_directory_bytes = 1;
+        })
+        .await;
+        let t = w.signup(0, "mem@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let router = w.node(0).router().unwrap();
+        let table = r#"{"name": "ev", "columns": [{"name": "time", "type": "time", "default": "now"},
+            {"name": "j", "type": "json", "nullable": true}], "time_column": "time", "order_by": ["time"]}"#;
+        let r = call_router(&router, "POST", "/v1/dbs/d/events", &t, Bytes::from(table)).await;
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        let event =
+            format!(r#"{{"j": {{{}}}}}"#, (0..64).map(|i| format!(r#""k{i}": 1"#)).collect::<Vec<_>>().join(","));
+        let rows = format!("[{}]", vec![event.as_str(); 4400].join(","));
+        let r = call_router(&router, "POST", "/v1/dbs/d/events/ev/rows", &t, Bytes::from(rows)).await;
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        let conditions: Vec<serde_json::Value> = (0..32)
+            .map(|c| {
+                let any: Vec<_> = (0..255)
+                    .map(|i| serde_json::json!({"col": "j", "path": [format!("p{c}_{i}")], "op": "exists"}))
+                    .collect();
+                serde_json::json!({"or": any})
+            })
+            .collect();
+        let q = serde_json::json!({"from": 0, "to": 9_999_999_999_999i64, "consistency": "strong",
+            "aggregates": {"r": {"fn": "retention", "conditions": conditions}}})
+        .to_string();
+        let before = reset_peak();
+        let r = call_router(&router, "POST", "/v1/dbs/d/events/ev/rows/query", &t, Bytes::from(q.clone())).await;
+        let grown = PEAK_BYTES.load(Relaxed) - before;
+        let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(r.status, 200, "{body}");
+        assert_eq!(body["stats"]["rows_read"], 4400, "the events were read from a part: {body}");
+        assert!(grown < 256 * MIB as isize, "a {} byte query of 4,400 events grew the heap by {grown} bytes", q.len());
+        w.shutdown();
+    });
+}

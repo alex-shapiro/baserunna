@@ -283,11 +283,19 @@ fn default_val(c: Option<&EvColumn>) -> Val {
     }
 }
 
-/// The values of one need across a batch.
+/// The values of one need across a batch, or across its current window.
 #[derive(Clone, Debug)]
 enum ColData {
-    Vec { v: Vector, json: bool },
+    Vec {
+        v: Vector,
+        json: bool,
+    },
     Vals(Vec<Val>),
+    /// A value per row, or `default` where an unsealed row predates its column.
+    Filled {
+        vals: Vec<Option<Val>>,
+        default: Val,
+    },
     Const(Val),
 }
 
@@ -296,6 +304,7 @@ impl ColData {
         match self {
             ColData::Const(v) => v.clone(),
             ColData::Vals(v) => v[i].clone(),
+            ColData::Filled { vals, default } => vals[i].as_ref().unwrap_or(default).clone(),
             ColData::Vec { v, json } => match v {
                 Vector::Int(x) => x[i].map_or(Val::Null, Val::Int),
                 Vector::Float(x) => x[i].map_or(Val::Null, Val::Float),
@@ -312,20 +321,189 @@ impl ColData {
     }
 }
 
-/// Rows of one part's granules or of the unsealed rows, by column.
-struct Batch {
+/// How a batch derives a need that it does not read as a column.
+enum Derive {
+    /// An unsealed row's column, or the column's default.
+    UnsealedCol(Val),
+    /// A path of an unsealed row's JSON column, by its segments.
+    UnsealedPath(Vec<String>),
+    /// An unsealed row's whole JSON column.
+    UnsealedJson,
+    /// A path that a part keeps in the shared bucket `Batch::buckets[i]`.
+    Shared(usize),
+    /// A part's whole JSON column, rebuilt from whether each row has it, its
+    /// path columns, and its shared buckets in `Batch::buckets`.
+    Object {
+        present: Vector,
+        paths: Vec<(Vec<String>, ColData)>,
+        buckets: Vec<usize>,
+    },
+    Lookup,
+}
+
+/// Rows of one part's granules or of the unsealed rows, by need. Needs a
+/// part stores as columns are read for the whole batch; the others are
+/// derived one window of rows at a time ([`Batch::enter`]), so that however
+/// many needs and rows a batch has, it holds derived values for one
+/// window's rows.
+struct Batch<'r> {
     n: usize,
-    cols: BTreeMap<Need, ColData>,
     pos: Vec<Pos>,
+    /// The batch's rows, if they are unsealed rows.
+    rows: &'r [(Pos, Row)],
+    cols: BTreeMap<Need, ColData>,
+    derived: BTreeMap<Need, Derive>,
+    /// Shared buckets of JSON columns, by column and bucket, as text.
+    buckets: Vec<((u32, u8), Vector)>,
+    /// The rows of the window entered last, and the derived needs' values for them.
+    window: std::ops::Range<usize>,
+    window_cols: BTreeMap<Need, ColData>,
+    /// Bytes of the columns read for the whole batch.
+    mem: usize,
     /// What each comparison of a dictionary-coded column found of the
     /// entries it has tested, by the comparison's address, kept across the
     /// windows the batch is evaluated in.
     memos: Mutex<DetHashMap<usize, Vec<Option<bool>>>>,
 }
 
-impl Batch {
-    fn new(n: usize, pos: Vec<Pos>) -> Batch {
-        Batch { n, cols: BTreeMap::new(), pos, memos: Mutex::default() }
+impl<'r> Batch<'r> {
+    fn new(n: usize, pos: Vec<Pos>) -> Batch<'r> {
+        Batch {
+            n,
+            pos,
+            rows: &[],
+            cols: BTreeMap::new(),
+            derived: BTreeMap::new(),
+            buckets: Vec::new(),
+            window: 0..0,
+            window_cols: BTreeMap::new(),
+            mem: 0,
+            memos: Mutex::default(),
+        }
+    }
+
+    /// A batch of unsealed rows, deriving each of `needs` from them.
+    fn unsealed(rows: &'r [(Pos, Row)], needs: impl IntoIterator<Item = Need>, schema: &EventSchema) -> Batch<'r> {
+        let mut b = Batch { rows, ..Batch::new(rows.len(), rows.iter().map(|(p, _)| *p).collect()) };
+        for need in needs {
+            let d = match &need {
+                Need::Col(id) => Derive::UnsealedCol(default_val(schema.column_by_id(*id))),
+                Need::Path(_, key) => Derive::UnsealedPath(json::path_segments(key).unwrap_or_default()),
+                Need::Json(_) => Derive::UnsealedJson,
+                Need::Lookup(_) => Derive::Lookup,
+            };
+            b.derived.insert(need, d);
+        }
+        b
+    }
+
+    fn has(&self, need: &Need) -> bool {
+        self.cols.contains_key(need) || self.derived.contains_key(need)
+    }
+
+    fn put(&mut self, need: Need, v: Vector, json: bool) {
+        self.mem += held_bytes(&v);
+        self.cols.insert(need, ColData::Vec { v, json });
+    }
+
+    /// The index in `buckets` of column `col`'s shared bucket `bucket`, if read.
+    fn bucket(&self, col: u32, bucket: u8) -> Option<usize> {
+        self.buckets.iter().position(|(k, _)| *k == (col, bucket))
+    }
+
+    fn add_bucket(&mut self, col: u32, bucket: u8, v: Vector) -> Result<usize> {
+        if v.phys() != Phys::Str {
+            return Err(Error::internal("shared bucket is not text"));
+        }
+        self.mem += held_bytes(&v);
+        self.buckets.push(((col, bucket), v));
+        Ok(self.buckets.len() - 1)
+    }
+
+    /// Derives the values of rows `w` for every derived need, the lookups
+    /// last and in order: a lookup's key or default sees the other needs
+    /// and earlier lookups, and later lookups as null.
+    fn enter(&mut self, w: std::ops::Range<usize>, lookups: &[Lookup]) {
+        self.window = w.clone();
+        let parsed: Vec<Vec<Option<Object>>> = self.buckets.iter().map(|(_, v)| objects(v, w.clone())).collect();
+        let rows = &self.rows[w.start.min(self.rows.len())..w.end.min(self.rows.len())];
+        let derived = std::mem::take(&mut self.derived);
+        for (need, data) in self.window_cols.iter_mut() {
+            if matches!(need, Need::Lookup(_)) {
+                *data = ColData::Const(Val::Null);
+            }
+        }
+        for (need, d) in &derived {
+            let data = match (need, d) {
+                (Need::Col(id), Derive::UnsealedCol(default)) => ColData::Filled {
+                    vals: rows.iter().map(|(_, r)| r.get(id).map(datum_val)).collect(),
+                    default: default.clone(),
+                },
+                (Need::Path(id, _), Derive::UnsealedPath(segs)) => ColData::Vals(
+                    rows.iter()
+                        .map(|(_, r)| match r.get(id) {
+                            Some(Datum::Json(j)) => json::leaf(j, segs).map_or(Val::Null, Val::from_json),
+                            _ => Val::Null,
+                        })
+                        .collect(),
+                ),
+                (Need::Json(id), Derive::UnsealedJson) => {
+                    ColData::Vals(rows.iter().map(|(_, r)| r.get(id).map_or(Val::Null, datum_val)).collect())
+                }
+                (Need::Path(_, key), Derive::Shared(bi)) => ColData::Vals(
+                    parsed[*bi]
+                        .iter()
+                        .map(|o| o.as_ref().and_then(|o| o.get(key)).map_or(Val::Null, Val::from_json))
+                        .collect(),
+                ),
+                (_, Derive::Object { present, paths, buckets }) => ColData::Vals(
+                    w.clone()
+                        .map(|i| {
+                            if present.is_null(i) {
+                                return Val::Null;
+                            }
+                            let mut leaves = Vec::new();
+                            for (segs, data) in paths {
+                                let v = data.get(i);
+                                if !v.is_null() {
+                                    leaves.push((segs.clone(), v.to_json()));
+                                }
+                            }
+                            for bi in buckets {
+                                for (k, v) in parsed[*bi][i - w.start].iter().flat_map(|o| o.iter()) {
+                                    leaves.push((json::path_segments(k).unwrap_or_default(), v.clone()));
+                                }
+                            }
+                            Val::Json(Json::Object(json::unflatten(leaves)))
+                        })
+                        .collect(),
+                ),
+                (Need::Lookup(k), Derive::Lookup) => {
+                    let Some(l) = lookups.get(*k) else { continue };
+                    ColData::Vals(
+                        w.clone()
+                            .map(|i| {
+                                let key = self.val(&l.key, i);
+                                let found =
+                                    if key.is_null() { None } else { l.map.get(&key.canonical_bytes()).cloned() };
+                                match found {
+                                    Some(v) => v,
+                                    None => l.default.as_ref().map_or(Val::Null, |d| self.val(d, i)),
+                                }
+                            })
+                            .collect(),
+                    )
+                }
+                _ => continue,
+            };
+            match self.window_cols.get_mut(need) {
+                Some(slot) => *slot = data,
+                None => {
+                    self.window_cols.insert(need.clone(), data);
+                }
+            }
+        }
+        self.derived = derived;
     }
 
     fn val(&self, e: &BExpr, i: usize) -> Val {
@@ -342,7 +520,10 @@ impl Batch {
             }
             BExpr::Out(_) => return Val::Null,
         };
-        self.cols.get(&need).map_or(Val::Null, |c| c.get(i))
+        match self.cols.get(&need) {
+            Some(c) => c.get(i),
+            None => self.window_cols.get(&need).map_or(Val::Null, |c| c.get(i - self.window.start)),
+        }
     }
 
     /// Which of the rows from `start` for which `sel` holds also satisfy `f`.
@@ -421,6 +602,32 @@ impl Batch {
 /// A comparison's identity within its plan.
 fn addr(t: &Test<Json>) -> usize {
     std::ptr::from_ref(t) as usize
+}
+
+/// The heap bytes a batch holds for `v`: its values, and its strings'
+/// dictionary unless the dictionary is shared, as a part's dictionary is
+/// with the part's cached index.
+fn held_bytes(v: &Vector) -> usize {
+    v.values_mem_size()
+        + match v {
+            Vector::Str(s) if Arc::strong_count(&s.dict) == 1 => super::vector::dict_mem_size(&s.dict),
+            _ => 0,
+        }
+}
+
+/// A shared bucket's paths and values in one row.
+type Object = Arc<serde_json::Map<String, Json>>;
+
+/// The objects that rows `w` of a shared bucket's text hold, each distinct
+/// text parsed once.
+fn objects(v: &Vector, w: std::ops::Range<usize>) -> Vec<Option<Object>> {
+    let Vector::Str(s) = v else { return vec![None; w.len()] };
+    let mut parsed: DetHashMap<u32, Option<Object>> = DetHashMap::default();
+    w.map(|i| match s.codes[i] {
+        super::vector::NULL_CODE => None,
+        c => parsed.entry(c).or_insert_with(|| serde_json::from_str(&s.dict[c as usize]).ok().map(Arc::new)).clone(),
+    })
+    .collect()
 }
 
 /// The comparisons of `f`, in order.
@@ -600,7 +807,8 @@ struct Plan<'a> {
     /// When the query stops, and its time limit.
     deadline: Option<(tokio::time::Instant, u64)>,
     /// Rows evaluated between calls to [`Plan::pace`]: about [`PACE_WORK`]
-    /// comparisons' and expressions' worth.
+    /// comparisons', expressions' and needs' worth, which also bounds the
+    /// values a batch derives at once.
     window: usize,
 }
 
@@ -645,8 +853,9 @@ impl<'a> Plan<'a> {
                 }
             }
         }
-        let rest = rest.difference(&first).cloned().collect();
-        let window = (PACE_WORK / (1 + cmps.len() + exprs)).max(1);
+        let rest: BTreeSet<Need> = rest.difference(&first).cloned().collect();
+        let needs = first.len() + rest.len();
+        let window = (PACE_WORK / (1 + cmps.len() + exprs + needs)).max(1);
         Plan { schema, filter, lookups, kind, first, rest, positions, deadline, window }
     }
 
@@ -898,6 +1107,10 @@ struct Run<'p, 'a> {
     /// Whether rows past those in `kept` are known to exist unread.
     more: bool,
     agg_fns: Vec<AggFn>,
+    /// Bytes the state, with the columns of the batch being read, may hold.
+    max_mem: usize,
+    /// Whether a batch's columns took the state past `max_mem`.
+    overflowed: bool,
 }
 
 impl<'p, 'a> Run<'p, 'a> {
@@ -910,7 +1123,36 @@ impl<'p, 'a> Run<'p, 'a> {
                 (Some(Groups::new(max_mem)), None, first.aggregates.iter().map(|a| a.func.clone()).collect())
             }
         };
-        Run { plan, stats: Stats::default(), groups, kept, offered: 0, more: false, agg_fns }
+        Run {
+            plan,
+            stats: Stats::default(),
+            groups,
+            kept,
+            offered: 0,
+            more: false,
+            agg_fns,
+            max_mem,
+            overflowed: false,
+        }
+    }
+
+    /// Whether the run failed for holding more than its memory limit.
+    fn full(&self) -> bool {
+        self.overflowed || self.groups.as_ref().is_some_and(Groups::full) || self.kept.as_ref().is_some_and(Kept::full)
+    }
+
+    /// Fails once a batch holding `batch` bytes of columns takes the state
+    /// past the memory limit.
+    fn hold(&mut self, batch: usize) -> Result<()> {
+        let state = self.groups.as_ref().map_or(0, |g| g.mem) + self.kept.as_ref().map_or(0, |k| k.mem);
+        if state.saturating_add(batch) > self.max_mem {
+            self.overflowed = true;
+            return Err(Error::TooLarge(format!(
+                "the columns the query reads at once and its state exceed {} bytes of memory; read fewer columns",
+                self.max_mem
+            )));
+        }
+        Ok(())
     }
 
     /// Merges `o`, a partial result over other rows.
@@ -930,11 +1172,16 @@ impl<'p, 'a> Run<'p, 'a> {
 
     /// The rows of `b` among `base` for which `f` holds, evaluated a window
     /// at a time.
-    async fn select(&self, b: &Batch, f: &BFilter, base: &[bool]) -> Result<Vec<bool>> {
+    async fn select(&self, b: &mut Batch<'_>, f: &BFilter, base: &[bool]) -> Result<Vec<bool>> {
         let mut out = Vec::with_capacity(b.n);
         for start in (0..b.n).step_by(self.plan.window) {
-            self.plan.pace().await?;
             let end = (start + self.plan.window).min(b.n);
+            if !base[start..end].contains(&true) {
+                out.resize(end, false);
+                continue;
+            }
+            self.plan.pace().await?;
+            b.enter(start..end, &self.plan.lookups);
             out.extend(b.select(f, &base[start..end], start));
         }
         Ok(out)
@@ -942,11 +1189,12 @@ impl<'p, 'a> Run<'p, 'a> {
 
     /// Feeds the selected rows of a batch to the aggregation or row set, a
     /// window at a time.
-    async fn consume(&mut self, b: &Batch, sel: &[bool]) -> Result<()> {
+    async fn consume(&mut self, b: &mut Batch<'_>, sel: &[bool]) -> Result<()> {
         for start in (0..b.n).step_by(self.plan.window) {
             let end = (start + self.plan.window).min(b.n);
             if sel[start..end].contains(&true) {
                 self.plan.pace().await?;
+                b.enter(start..end, &self.plan.lookups);
                 self.consume_window(b, &sel[start..end], start)?;
             }
         }
@@ -1022,24 +1270,13 @@ impl<'p, 'a> Run<'p, 'a> {
         Ok(())
     }
 
-    fn lookups(&self, b: &mut Batch) {
-        for (k, l) in self.plan.lookups.iter().enumerate() {
-            if !self.plan.first.contains(&Need::Lookup(k)) && !self.plan.rest.contains(&Need::Lookup(k)) {
-                continue;
+    /// Registers the lookups the plan needs for `b` to derive.
+    fn lookups(&self, b: &mut Batch<'_>) {
+        for k in 0..self.plan.lookups.len() {
+            let need = Need::Lookup(k);
+            if self.plan.first.contains(&need) || self.plan.rest.contains(&need) {
+                b.derived.insert(need, Derive::Lookup);
             }
-            let vals: Vec<Val> = (0..b.n)
-                .map(|i| {
-                    let key = b.val(&l.key, i);
-                    if key.is_null() {
-                        return l.default.as_ref().map_or(Val::Null, |d| b.val(d, i));
-                    }
-                    match l.map.get(&key.canonical_bytes()) {
-                        Some(v) => v.clone(),
-                        None => l.default.as_ref().map_or(Val::Null, |d| b.val(d, i)),
-                    }
-                })
-                .collect();
-            b.cols.insert(Need::Lookup(k), ColData::Vals(vals));
         }
     }
 
@@ -1050,38 +1287,13 @@ impl<'p, 'a> Run<'p, 'a> {
         }
         self.stats.unsealed_rows += rows.len() as u64;
         self.stats.rows_read += rows.len() as u64;
-        let mut b = Batch::new(rows.len(), rows.iter().map(|(p, _)| *p).collect());
-        let needs: BTreeSet<Need> = self.plan.first.iter().chain(self.plan.rest.iter()).cloned().collect();
-        for need in needs {
-            let data = match &need {
-                Need::Col(id) => {
-                    let dflt = default_val(self.plan.schema.column_by_id(*id));
-                    ColData::Vals(rows.iter().map(|(_, r)| r.get(id).map_or_else(|| dflt.clone(), datum_val)).collect())
-                }
-                Need::Path(id, key) => {
-                    let path = json::path_segments(key).unwrap_or_default();
-                    ColData::Vals(
-                        rows.iter()
-                            .map(|(_, r)| match r.get(id) {
-                                Some(Datum::Json(j)) => json::leaf(j, &path).map_or(Val::Null, Val::from_json),
-                                _ => Val::Null,
-                            })
-                            .collect(),
-                    )
-                }
-                Need::Json(id) => {
-                    ColData::Vals(rows.iter().map(|(_, r)| r.get(id).map_or(Val::Null, datum_val)).collect())
-                }
-                Need::Lookup(_) => continue,
-            };
-            b.cols.insert(need, data);
-        }
-        self.lookups(&mut b);
-        let sel = self.select(&b, &self.plan.filter, &vec![true; b.n]).await?;
-        self.consume(&b, &sel).await
+        let needs = self.plan.first.iter().chain(self.plan.rest.iter()).cloned();
+        let mut b = Batch::unsealed(rows, needs, self.plan.schema);
+        let sel = self.select(&mut b, &self.plan.filter, &vec![true; rows.len()]).await?;
+        self.consume(&mut b, &sel).await
     }
 
-    /// Reads need `need` of granules `g` of part `r`.
+    /// Reads need `need` of granules `g` of part `r` into `b`.
     async fn read_need(
         &self,
         rd: &Reading<'_>,
@@ -1089,83 +1301,61 @@ impl<'p, 'a> Run<'p, 'a> {
         meta: &PartMeta,
         need: &Need,
         g: std::ops::Range<usize>,
-    ) -> Result<ColData> {
-        let n = (meta.starts[g.end] - meta.starts[g.start]) as usize;
-        Ok(match need {
+        b: &mut Batch<'_>,
+    ) -> Result<()> {
+        match need {
             Need::Col(id) => match meta.find(&ColRef::User(*id)) {
-                Some(ci) => ColData::Vec { v: rd.column(r, meta, ci, g).await?, json: false },
-                None => ColData::Const(default_val(self.plan.schema.column_by_id(*id))),
+                Some(ci) => b.put(need.clone(), rd.column(r, meta, ci, g).await?, false),
+                None => {
+                    b.cols.insert(need.clone(), ColData::Const(default_val(self.plan.schema.column_by_id(*id))));
+                }
             },
             Need::Path(id, key) => {
                 if let Some(ci) = meta.find(&ColRef::Path { col: *id, key: key.clone() }) {
-                    ColData::Vec { v: rd.column(r, meta, ci, g).await?, json: meta.cols[ci].json }
+                    b.put(need.clone(), rd.column(r, meta, ci, g).await?, meta.cols[ci].json);
                 } else if meta.may_share(*id, key)
                     && let Some(ci) = meta.find(&ColRef::Shared { col: *id, bucket: json::bucket(key) })
                 {
                     probe::hit(Probe::JsonSharedPathRead);
-                    let v = rd.column(r, meta, ci, g).await?;
-                    let Vector::Str(s) = v else { return Err(Error::internal("shared bucket is not text")) };
-                    ColData::Vals(
-                        (0..n)
-                            .map(|i| {
-                                match s
-                                    .get(i)
-                                    .and_then(|t| serde_json::from_str::<serde_json::Map<String, Json>>(t).ok())
-                                {
-                                    Some(o) => o.get(key).map_or(Val::Null, Val::from_json),
-                                    None => Val::Null,
-                                }
-                            })
-                            .collect(),
-                    )
+                    let bucket = json::bucket(key);
+                    let bi = match b.bucket(*id, bucket) {
+                        Some(bi) => bi,
+                        None => b.add_bucket(*id, bucket, rd.column(r, meta, ci, g).await?)?,
+                    };
+                    b.derived.insert(need.clone(), Derive::Shared(bi));
                 } else {
-                    ColData::Const(Val::Null)
+                    b.cols.insert(need.clone(), ColData::Const(Val::Null));
                 }
             }
             Need::Json(id) => {
-                let present = match meta.find(&ColRef::User(*id)) {
-                    Some(ci) => rd.column(r, meta, ci, g.clone()).await?,
-                    None => return Ok(ColData::Const(Val::Null)),
+                let Some(ci) = meta.find(&ColRef::User(*id)) else {
+                    b.cols.insert(need.clone(), ColData::Const(Val::Null));
+                    return Ok(());
                 };
-                let mut leaves: Vec<Vec<(Vec<String>, Json)>> = vec![Vec::new(); n];
-                let paths: Vec<(usize, String)> = meta.paths(*id).map(|(i, k)| (i, k.to_string())).collect();
-                for (ci, key) in paths {
-                    let segs = json::path_segments(&key).unwrap_or_default();
-                    let data = ColData::Vec { v: rd.column(r, meta, ci, g.clone()).await?, json: meta.cols[ci].json };
-                    for (i, l) in leaves.iter_mut().enumerate() {
-                        let v = data.get(i);
-                        if !v.is_null() {
-                            l.push((segs.clone(), v.to_json()));
-                        }
-                    }
+                let present = rd.column(r, meta, ci, g.clone()).await?;
+                b.mem += held_bytes(&present);
+                let mut paths = Vec::new();
+                for (ci, key) in meta.paths(*id).map(|(i, k)| (i, k.to_string())).collect::<Vec<_>>() {
+                    let v = rd.column(r, meta, ci, g.clone()).await?;
+                    b.mem += held_bytes(&v);
+                    paths.push((
+                        json::path_segments(&key).unwrap_or_default(),
+                        ColData::Vec { v, json: meta.cols[ci].json },
+                    ));
                 }
-                for b in 0..json::BUCKETS {
-                    let Some(ci) = meta.find(&ColRef::Shared { col: *id, bucket: b }) else { continue };
-                    let Vector::Str(s) = rd.column(r, meta, ci, g.clone()).await? else { continue };
-                    for (i, l) in leaves.iter_mut().enumerate() {
-                        if let Some(o) =
-                            s.get(i).and_then(|t| serde_json::from_str::<serde_json::Map<String, Json>>(t).ok())
-                        {
-                            for (k, v) in o {
-                                l.push((json::path_segments(&k).unwrap_or_default(), v));
-                            }
-                        }
-                    }
+                let mut buckets = Vec::new();
+                for bucket in 0..json::BUCKETS {
+                    let Some(ci) = meta.find(&ColRef::Shared { col: *id, bucket }) else { continue };
+                    buckets.push(match b.bucket(*id, bucket) {
+                        Some(bi) => bi,
+                        None => b.add_bucket(*id, bucket, rd.column(r, meta, ci, g.clone()).await?)?,
+                    });
                 }
-                ColData::Vals(
-                    leaves
-                        .into_iter()
-                        .enumerate()
-                        .map(
-                            |(i, l)| {
-                                if present.is_null(i) { Val::Null } else { Val::Json(Json::Object(json::unflatten(l))) }
-                            },
-                        )
-                        .collect(),
-                )
+                b.derived.insert(need.clone(), Derive::Object { present, paths, buckets });
             }
-            Need::Lookup(_) => ColData::Const(Val::Null),
-        })
+            Need::Lookup(_) => {}
+        }
+        Ok(())
     }
 
     async fn positions(
@@ -1368,6 +1558,7 @@ impl<'p, 'a> Run<'p, 'a> {
             return Ok(());
         }
         self.stats.parts_read += 1;
+        let max_rows = self.run_rows(r, &meta);
         let mut g = 0;
         while g < keep.len() {
             if !keep[g] {
@@ -1375,7 +1566,7 @@ impl<'p, 'a> Run<'p, 'a> {
                 continue;
             }
             let mut end = g + 1;
-            while end < keep.len() && keep[end] && end - g < 16 {
+            while end < keep.len() && keep[end] && end - g < 16 && meta.starts[end + 1] - meta.starts[g] <= max_rows {
                 end += 1;
             }
             self.granule_run(rd, r, &meta, &mask, g..end).await?;
@@ -1384,6 +1575,35 @@ impl<'p, 'a> Run<'p, 'a> {
         Ok(())
     }
 
+    /// The most rows of part `r` that a granule run reads at once: a
+    /// quarter of the memory limit at the widths the run's columns decode
+    /// to, so that the columns of a partial result's runs fit its share of
+    /// the limit. Rebuilt JSON objects are counted at the part's average
+    /// row size. A run reads one granule at least.
+    fn run_rows(&self, r: &PartRef, meta: &PartMeta) -> u64 {
+        let width = |ci: usize| match meta.cols[ci].phys {
+            Phys::Int | Phys::Float => 16,
+            Phys::Bool => 2,
+            Phys::Str => 4,
+        };
+        let mut per_row = if self.plan.positions { 16 } else { 0 };
+        for need in self.plan.first.iter().chain(&self.plan.rest) {
+            per_row += match need {
+                Need::Col(id) => meta.find(&ColRef::User(*id)).map_or(0, width),
+                Need::Path(id, key) => meta.find(&ColRef::Path { col: *id, key: key.clone() }).map_or(4, width),
+                Need::Json(id) => meta.find(&ColRef::User(*id)).map_or(0, |ci| {
+                    let paths: usize = meta.paths(*id).map(|(ci, _)| width(ci)).sum();
+                    width(ci) + paths + 4 * json::BUCKETS as usize + (r.raw_size / r.rows.max(1)) as usize
+                }),
+                Need::Lookup(_) => 0,
+            };
+        }
+        (self.max_mem / 4 / per_row.max(1)) as u64
+    }
+
+    /// Runs the query over granules `g` of part `r`: reads the filter's
+    /// needs, selects rows, and reads the other needs only if some row
+    /// is selected.
     async fn granule_run(
         &mut self,
         rd: &Reading<'_>,
@@ -1392,45 +1612,44 @@ impl<'p, 'a> Run<'p, 'a> {
         mask: &Runs,
         g: std::ops::Range<usize>,
     ) -> Result<()> {
+        let plan = self.plan;
         let rows = meta.rows_of(g.clone());
         let n = (rows.end - rows.start) as usize;
         self.stats.granules_read += (g.end - g.start) as u64;
         self.stats.rows_read += n as u64;
         let mut b = Batch::new(n, Vec::new());
-        for need in self.plan.first.clone() {
-            if !matches!(need, Need::Lookup(_)) {
-                let d = self.read_need(rd, r, meta, &need, g.clone()).await?;
-                b.cols.insert(need, d);
-            }
+        for need in &plan.first {
+            self.read_need(rd, r, meta, need, g.clone(), &mut b).await?;
+            self.hold(b.mem)?;
         }
         let base: Vec<bool> = (0..n).map(|i| !mask.contains(rows.start as u32 + i as u32)).collect();
-        let lookups_first = self.plan.first.iter().any(|n| matches!(n, Need::Lookup(_)));
+        let lookups_first = plan.first.iter().any(|n| matches!(n, Need::Lookup(_)));
         if lookups_first {
-            for need in self.plan.rest.clone() {
-                if !matches!(need, Need::Lookup(_)) && !b.cols.contains_key(&need) {
-                    let d = self.read_need(rd, r, meta, &need, g.clone()).await?;
-                    b.cols.insert(need, d);
+            for need in &plan.rest {
+                if !b.has(need) {
+                    self.read_need(rd, r, meta, need, g.clone(), &mut b).await?;
+                    self.hold(b.mem)?;
                 }
             }
             self.lookups(&mut b);
         }
-        let sel = self.select(&b, &self.plan.filter, &base).await?;
+        let sel = self.select(&mut b, &plan.filter, &base).await?;
         if !sel.contains(&true) {
             return Ok(());
         }
-        for need in self.plan.rest.clone() {
-            if !matches!(need, Need::Lookup(_)) && !b.cols.contains_key(&need) {
-                let d = self.read_need(rd, r, meta, &need, g.clone()).await?;
-                b.cols.insert(need, d);
+        for need in &plan.rest {
+            if !b.has(need) {
+                self.read_need(rd, r, meta, need, g.clone(), &mut b).await?;
+                self.hold(b.mem)?;
             }
         }
-        if !lookups_first {
-            self.lookups(&mut b);
-        }
-        if self.plan.positions {
+        self.lookups(&mut b);
+        if plan.positions {
             b.pos = self.positions(rd, r, meta, g).await?;
+            b.mem += b.pos.capacity() * std::mem::size_of::<Pos>();
+            self.hold(b.mem)?;
         }
-        self.consume(&b, &sel).await
+        self.consume(&mut b, &sel).await
     }
 }
 
@@ -1832,9 +2051,9 @@ async fn run_within(
     // Parts are read concurrently into partial results, each holding at most
     // its share of the state limit, and merged in the order they are read
     // in, so the merged result grows as a serial read's would and the limit
-    // does not depend on which part arrives first. A part whose groups
-    // outgrow its share is read again into the merged result at its turn;
-    // rows mode holds rows the same way.
+    // does not depend on which part arrives first. A part whose groups, or
+    // the columns it reads at once, outgrow its share is read again into the
+    // merged result at its turn; rows mode holds rows the same way.
     let n = shared.cfg.event_read_concurrency.max(1);
     let share = limits.max_memory_bytes / n;
     let read = |i: usize| {
@@ -1864,10 +2083,7 @@ async fn run_within(
         let (partial, read) = reads.next().await.ok_or_else(|| Error::internal("query reads ended early"))?;
         match read {
             Ok(()) => run.absorb(partial)?,
-            Err(Error::TooLarge(_))
-                if partial.groups.as_ref().is_some_and(Groups::full)
-                    || partial.kept.as_ref().is_some_and(Kept::full) =>
-            {
+            Err(Error::TooLarge(_)) if partial.full() => {
                 run.part(&rd, r, rd.meta(r).await?).await?;
             }
             Err(e) => return Err(e),
@@ -2074,12 +2290,11 @@ pub async fn matching_rows(
         let rows = meta.rows_of(g..g + 1);
         let n = (rows.end - rows.start) as usize;
         let mut b = Batch::new(n, Vec::new());
-        for need in run.plan.first.clone() {
-            let d = run.read_need(&rd, r, &meta, &need, g..g + 1).await?;
-            b.cols.insert(need, d);
+        for need in &plan.first {
+            run.read_need(&rd, r, &meta, need, g..g + 1, &mut b).await?;
         }
         let base: Vec<bool> = (0..n).map(|i| !mask.contains(rows.start as u32 + i as u32)).collect();
-        let sel = b.select(&run.plan.filter, &base, 0);
+        let sel = run.select(&mut b, &plan.filter, &base).await?;
         out.extend(sel.iter().enumerate().filter(|(_, s)| **s).map(|(i, _)| rows.start as u32 + i as u32));
     }
     Ok(out)

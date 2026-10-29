@@ -2540,6 +2540,51 @@ mod query_limits {
         });
     }
 
+    /// The columns a query reads at once count toward its memory limit
+    /// with its state: a part whose columns outgrow a concurrent read's
+    /// share of the limit is read again at its turn under the whole limit,
+    /// and a query whose columns of one granule exceed the whole limit fails
+    /// rather than holding them.
+    #[test]
+    fn the_columns_a_query_reads_at_once_count_toward_its_memory_limit() {
+        rt().block_on(async {
+            let cfg = EngineConfig {
+                event_granule_rows: 1024,
+                event_granule_bytes: 10 << 20,
+                event_insert_part_max_bytes: 64 << 20,
+                event_json_max_paths: 64,
+                ..cfg()
+            };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            for d in 0..4i64 {
+                let rows: Vec<Json> = (0..512i64)
+                    .map(|i| {
+                        let props: serde_json::Map<String, Json> =
+                            (0..64).map(|k| (format!("p{k}"), json!(i))).collect();
+                        json!({"time": T0 + d * DAY + i, "event": "a", "props": props})
+                    })
+                    .collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            }
+            while maint::seal(&db, id).await.unwrap() {}
+            // Each part's granule holds 64 int path columns of 512 rows: 512 KiB decoded.
+            let any: Vec<Json> =
+                (0..64).map(|k| json!({"col": "props", "path": [format!("p{k}")], "op": "eq", "value": 7})).collect();
+            let q = json!({"from": T0, "to": T0 + 4 * DAY, "where": {"or": any}, "aggregates": {"n": {"fn": "count"}}});
+            let whole = run_with(&db, q.clone(), Limits::default()).await.unwrap();
+            assert_eq!((whole.rows, whole.stats.unsealed_rows), (vec![vec![json!(4)]], 0));
+            let shares = run_with(&db, q.clone(), Limits { max_memory_bytes: 2 << 20, ..Limits::default() }).await;
+            assert_eq!(shares.map(|o| o.rows), Ok(vec![vec![json!(4)]]), "parts past a 64 KiB share are read again");
+            let r = run_with(&db, q, Limits { max_memory_bytes: 256 << 10, ..Limits::default() }).await;
+            assert!(
+                matches!(&r, Err(Error::TooLarge(m)) if m.contains("columns")),
+                "512 KiB of columns pass a 256 KiB limit: {r:?}"
+            );
+        });
+    }
+
     /// A query whose reads never wait (warm caches, an in-memory store) still
     /// stops at its time limit.
     #[test]

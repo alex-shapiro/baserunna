@@ -429,8 +429,9 @@ events to row tables.
     acknowledged insert; a snapshot that lacks the table or a column named
     retries at a fresh one.
   - *Limits.* A query fails with `413` past 4 GiB read, 1 GiB of
-    aggregation state or kept rows, or 1 GiB of lookup rows, and with a
-    retryable `503` once it has run for 60 s.
+    aggregation state or kept rows with the columns it reads at once, or
+    1 GiB of lookup rows, and with a retryable `503` once it has run for
+    60 s.
 - **Deletes** remove the events matching a filter within a time range, in a
   transaction. A delete that would need an oversized mask in one partition
   fails with `413` naming it, so a caller deletes partition by partition.
@@ -921,15 +922,27 @@ range, then reads each remaining part's metadata and the column index of
 filtered columns, and skips parts whose dictionaries or statistics rule out
 a match, then granules by the primary index, statistics and blooms. It reads
 filter columns first (prewhere) and the rest only for granules with matches.
+
+A query holds memory near its limit however many columns, paths and rows
+it names. Granules are read in runs of up to 16 whose columns take about a
+quarter of the memory limit decoded, and a run's columns count toward the
+limit with the query's state. Values that are not read as columns (paths
+in shared buckets, whole JSON objects, lookups, and the unsealed rows'
+values, a column's default standing for a row older than the column) are
+derived for a window of rows at a time, and windows shrink with the
+query's comparisons, expressions and needs, so that a query naming
+thousands of JSON paths holds about 2^16 derived values at once.
+
 Up to 32 parts are read at once, each into a partial result that holds at
 most 1/32 of the query's state limit, and partial results are merged in the
 order parts are read in, so the merged result, which decides whether the
 query exceeds its limit, grows as it would if parts were read one at a
-time; a part whose state outgrows its share is read again into it at its
-turn. Aggregates keep mergeable states, so how parts were stored or merged
-never changes an answer. A part `GET` unanswered after 1 s is sent again, so one
-slow store request does not hold up a query. Parts are cached whole when
-small, otherwise by column block, so a warm query performs no store `GET`s.
+time; a part whose state, with the columns it reads at once, outgrows its
+share is read again into it at its turn. Aggregates keep mergeable states,
+so how parts were stored or merged never changes an answer. A part `GET`
+unanswered after 1 s is sent again, so one slow store request does not
+hold up a query. Parts are cached whole when small, otherwise by column
+block, so a warm query performs no store `GET`s.
 
 A page of rows ordered first by time costs the parts that hold it, not the
 whole time range. Its cursor narrows the range, and parts whose time and

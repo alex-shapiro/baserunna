@@ -54,6 +54,9 @@ pub const PK_KEY_MAX: usize = 4096;
 pub const DICT_MAX_BYTES: usize = 1 << 20;
 /// Adjacent byte ranges are fetched together up to this size.
 const COALESCE_BYTES: u64 = 1 << 20;
+/// The most bytes a framed block, index or metadata takes: [`unframe`]
+/// refuses longer payloads, and stores a payload compressed only when smaller.
+const FRAMED_MAX: u64 = crate::engine::segment::MAX_BLOCK_RAW + 16;
 
 /// What a physical column holds.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -279,6 +282,9 @@ impl PartMeta {
                 *x = r.varint()?;
             }
             let [index_off, index_len, data_off, data_len, nonnull] = v;
+            if index_off.checked_add(index_len).is_none() || data_off.checked_add(data_len).is_none() {
+                return Err(DecodeError("column out of range"));
+            }
             cols.push(ColMeta { cref, phys, json, index_off, index_len, data_off, data_len, nonnull });
         }
         let nj = r.len(r.remaining())?;
@@ -348,6 +354,11 @@ impl ColIndex {
         self.blocks.partition_point(|b| b.first_granule as usize <= granule).saturating_sub(1)
     }
 
+    /// The granules block `b` holds, of a part with `granules` granules.
+    pub fn granules_of(&self, b: usize, granules: usize) -> Range<usize> {
+        self.blocks[b].first_granule as usize..self.blocks.get(b + 1).map_or(granules, |n| n.first_granule as usize)
+    }
+
     fn mem_size(&self) -> usize {
         self.dict.as_ref().map_or(0, |d| d.iter().map(|s| s.len() + 24).sum())
             + self.blocks.len() * 24
@@ -392,7 +403,11 @@ impl ColIndex {
         framed(&w.buf, Compression::Zstd(1), "a column index")
     }
 
-    pub fn decode(b: &Bytes, phys: Phys) -> DResult<ColIndex> {
+    /// Decodes the index of column `col` of the part `meta` describes,
+    /// refusing one whose blocks do not lie in order within the column's
+    /// data, starting with the first granule.
+    pub fn decode(b: &Bytes, meta: &PartMeta, col: &ColMeta) -> DResult<ColIndex> {
+        let (phys, granules) = (col.phys, meta.granule_count());
         let raw = unframe(b)?;
         let mut r = Reader::new(&raw);
         let dict = match r.u8()? {
@@ -410,16 +425,30 @@ impl ColIndex {
         if dict.is_some() && phys != Phys::Str {
             return Err(DecodeError("dictionary on a non-string column"));
         }
-        let nb = r.len(r.remaining())?;
-        let mut blocks = Vec::with_capacity(nb);
+        let nb = r.len(granules)?;
+        if nb == 0 {
+            return Err(DecodeError("a column index without blocks"));
+        }
+        let data_end = col.data_off.checked_add(col.data_len).ok_or(DecodeError("column out of range"))?;
+        let mut blocks: Vec<BlockLoc> = Vec::with_capacity(nb);
         for _ in 0..nb {
             let b = BlockLoc {
                 off: r.varint()?,
                 len: r.varint()?,
                 first_granule: u32::try_from(r.varint()?).map_err(|_| DecodeError("bad block"))?,
             };
-            if blocks.last().is_some_and(|p: &BlockLoc| p.first_granule >= b.first_granule) {
+            let in_order = match blocks.last() {
+                None => b.first_granule == 0 && b.off >= col.data_off,
+                Some(p) => b.first_granule > p.first_granule && b.off >= p.off + p.len,
+            };
+            if !in_order {
                 return Err(DecodeError("blocks out of order"));
+            }
+            if b.first_granule as usize >= granules
+                || b.len > FRAMED_MAX
+                || b.off.checked_add(b.len).is_none_or(|end| end > data_end)
+            {
+                return Err(DecodeError("block outside its column"));
             }
             blocks.push(b);
         }
@@ -442,8 +471,8 @@ impl ColIndex {
         if !r.is_empty() {
             return Err(DecodeError("column index trailing data"));
         }
-        if blocks.first().is_some_and(|b| b.first_granule != 0) {
-            return Err(DecodeError("first block does not start the column"));
+        if stats.len() != granules {
+            return Err(DecodeError("column statistics do not match the part's granules"));
         }
         Ok(ColIndex { dict, blocks, stats, blooms })
     }
@@ -1111,7 +1140,7 @@ impl Reading<'_> {
         if let Some(m) = self.cached::<PartMeta>(&k) {
             return Ok(m);
         }
-        let b = self.read(r, r.meta_off..r.meta_off + r.meta_len).await?;
+        let b = self.read(r, section(r.meta_off, r.meta_len)?).await?;
         let m = Arc::new(PartMeta::decode(&b)?);
         if m.rows != r.rows {
             return Err(Error::internal("event part rows do not match its reference"));
@@ -1126,14 +1155,8 @@ impl Reading<'_> {
             return Ok(i);
         }
         let c = &meta.cols[ci];
-        let b = self.read(r, c.index_off..c.index_off + c.index_len).await?;
-        let idx = ColIndex::decode(&b, c.phys)?;
-        if idx.stats.len() != meta.granules.len()
-            || idx.blocks.iter().any(|b| b.first_granule as usize >= meta.granules.len())
-        {
-            return Err(Error::internal("event column index does not match its part"));
-        }
-        let idx = Arc::new(idx);
+        let b = self.read(r, section(c.index_off, c.index_len)?).await?;
+        let idx = Arc::new(ColIndex::decode(&b, meta, c)?);
         self.remember(k, idx.clone(), idx.mem_size());
         Ok(idx)
     }
@@ -1169,9 +1192,8 @@ impl Reading<'_> {
                 let at = (loc.off - span.start) as usize;
                 let raw = unframe(&data.slice(at..at + loc.len as usize))?;
                 let v = Arc::new(decode_block(&raw, c.phys, idx.dict.as_ref())?);
-                let first = loc.first_granule as usize;
-                let last = idx.blocks.get(bi + 1).map_or(meta.granules.len(), |n| n.first_granule as usize);
-                if v.len() as u64 != meta.starts[last] - meta.starts[first] {
+                let rows = meta.rows_of(idx.granules_of(bi, meta.granule_count()));
+                if v.len() as u64 != rows.end - rows.start {
                     return Err(Error::internal("event block does not match its granules"));
                 }
                 // The index is charged for the part-level dictionary a block shares.
@@ -1219,6 +1241,14 @@ impl Reading<'_> {
     }
 }
 
+/// The byte range of a framed section `len` bytes long at `off`.
+fn section(off: u64, len: u64) -> DResult<Range<u64>> {
+    match off.checked_add(len) {
+        Some(end) if len <= FRAMED_MAX => Ok(off..end),
+        _ => Err(DecodeError("event part section out of range")),
+    }
+}
+
 /// Decodes a whole part stream and returns its metadata and the position
 /// of every row, checking each column's index and blocks; used by storage
 /// invariant checks.
@@ -1239,7 +1269,7 @@ pub fn inspect(
     }
     let mut columns: BTreeMap<ColRef, Vector> = BTreeMap::new();
     for c in &meta.cols {
-        let idx = ColIndex::decode(&slice(c.index_off, c.index_len)?, c.phys).map_err(|e| e.to_string())?;
+        let idx = ColIndex::decode(&slice(c.index_off, c.index_len)?, &meta, c).map_err(|e| e.to_string())?;
         let mut parts = Vec::new();
         for b in &idx.blocks {
             let raw = unframe(&slice(b.off, b.len)?).map_err(|e| e.to_string())?;
@@ -1365,9 +1395,126 @@ pub(crate) mod tests {
             ],
             blooms: vec![bloom],
         };
-        assert_eq!(ColIndex::decode(&Bytes::from(idx.encode(Phys::Str).unwrap()), Phys::Str).unwrap(), idx);
+        assert_eq!(ColIndex::decode(&Bytes::from(idx.encode(Phys::Str).unwrap()), &meta, &meta.cols[0]).unwrap(), idx);
         assert_eq!((idx.block_of(0), idx.block_of(1)), (0, 1));
         assert_eq!(stat_prefix(&"é".repeat(40)).len(), 32);
+    }
+
+    /// The metadata of a part of `granules` whose only column, of ordinals,
+    /// holds the first `data_len` bytes of the part.
+    fn one_column_part(phys: Phys, granules: Vec<u32>, data_len: u64) -> PartMeta {
+        let mut starts = vec![0];
+        starts.extend(granules.iter().scan(0, |at, g| {
+            *at += *g as u64;
+            Some(*at)
+        }));
+        PartMeta {
+            rows: *starts.last().unwrap(),
+            pk: vec![Bytes::new(); starts.len()],
+            granules,
+            starts,
+            sort_ids: vec![],
+            cols: vec![ColMeta {
+                cref: ColRef::Ordinal,
+                phys,
+                json: false,
+                index_off: data_len,
+                index_len: 0,
+                data_off: 0,
+                data_len,
+                nonnull: 0,
+            }],
+            shared: BTreeMap::new(),
+            partial: BTreeSet::new(),
+        }
+    }
+
+    /// Stores a two-granule part whose only column (ordinals) has the
+    /// given blocks in its index, and reads the column back.
+    fn read_with_blocks(blocks: impl Fn(&[(u64, u64)]) -> Vec<BlockLoc>) -> Result<Vector> {
+        use crate::engine::tests::{engine, rt};
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, crate::engine::EngineConfig::small_for_tests());
+            let db = eng.db("d");
+            db.open(true).await.unwrap();
+            let shared = db.shared();
+            let mut stream = Vec::new();
+            let mut locs = Vec::new();
+            for x in [1i64, 2] {
+                let f = framed(&encode_block(&Vector::Int(vec![Some(x)]), None).unwrap(), Compression::Zstd(1), "")
+                    .unwrap();
+                locs.push((stream.len() as u64, f.len() as u64));
+                stream.extend_from_slice(&f);
+            }
+            let stat = GranStat { nulls: 0, min: Some(Stat::Int(1)), max: Some(Stat::Int(2)) };
+            let index = ColIndex { dict: None, blocks: blocks(&locs), stats: vec![stat.clone(), stat], blooms: vec![] }
+                .encode(Phys::Int)
+                .unwrap();
+            let mut meta = one_column_part(Phys::Int, vec![1, 1], stream.len() as u64);
+            meta.cols[0].index_off = stream.len() as u64;
+            meta.cols[0].index_len = index.len() as u64;
+            stream.extend_from_slice(&index);
+            let meta = meta.encode().unwrap();
+            let meta_off = stream.len() as u64;
+            stream.extend_from_slice(&meta);
+            let id = new_part_id(shared);
+            let key = crate::engine::part_chunk_key(&db.id, &id, 0);
+            shared.store.put(&key, Bytes::from(stream.clone()), PutMode::Overwrite).await.unwrap();
+            let r = PartRef {
+                id,
+                table: 1,
+                partition: 0,
+                chunk_bytes: 1 << 20,
+                size: stream.len() as u64,
+                raw_size: 2,
+                rows: 2,
+                level: 0,
+                meta_off,
+                meta_len: meta.len() as u64,
+                min_time: 0,
+                max_time: 0,
+                arrived_ms: 0,
+                version: Some(1),
+                min_version: 0,
+                max_version: 0,
+                deleted: 0,
+                mask: None,
+            };
+            let stats = ReadStats::default();
+            let rd = Reading { shared, db: &db.id, cache: Caching::Shared, stats: &stats };
+            let m = rd.meta(&r).await?;
+            rd.column(&r, &m, 0, 0..2).await
+        })
+    }
+
+    #[test]
+    fn a_well_formed_index_reads_back() {
+        let v = read_with_blocks(|l| {
+            vec![
+                BlockLoc { off: l[0].0, len: l[0].1, first_granule: 0 },
+                BlockLoc { off: l[1].0, len: l[1].1, first_granule: 1 },
+            ]
+        });
+        assert_eq!(v.unwrap(), Vector::Int(vec![Some(1), Some(2)]));
+    }
+
+    #[test]
+    fn a_column_index_without_blocks_is_refused() {
+        let v = std::panic::catch_unwind(|| read_with_blocks(|_| vec![]));
+        assert!(matches!(v, Ok(Err(_))), "{v:?}");
+    }
+
+    #[test]
+    fn a_column_index_with_overlapping_blocks_is_refused() {
+        let v = std::panic::catch_unwind(|| {
+            read_with_blocks(|l| {
+                vec![
+                    BlockLoc { off: l[0].0, len: l[0].1 + l[1].1 + 1, first_granule: 0 },
+                    BlockLoc { off: l[1].0, len: l[1].1, first_granule: 1 },
+                ]
+            })
+        });
+        assert!(matches!(v, Ok(Err(_))), "{v:?}");
     }
 
     #[test]
@@ -1389,7 +1536,8 @@ pub(crate) mod tests {
             }
             for p in [Phys::Int, Phys::Float, Phys::Bool, Phys::Str] {
                 let _ = decode_block(&d, p, Some(&Arc::new(vec!["a".into()])));
-                let _ = ColIndex::decode(&Bytes::from(d.clone()), p);
+                let meta = one_column_part(p, vec![2, 1], 64);
+                let _ = ColIndex::decode(&Bytes::from(d.clone()), &meta, &meta.cols[0]);
             }
             let _ = PartMeta::decode(&Bytes::from(d));
         }

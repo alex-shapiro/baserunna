@@ -4,7 +4,7 @@
 //! without panicking, and what decodes must survive a round trip.
 use baserunna::engine::events::{Bind, PartRef, Runs, TableState, decode_mask_object, encode_mask_object, ref_key};
 use baserunna::events::agg::State;
-use baserunna::events::part::{ColIndex, PartMeta, decode_block};
+use baserunna::events::part::{ColIndex, ColMeta, ColRef, PartMeta, decode_block};
 use baserunna::events::query::Query;
 use baserunna::events::vector::Phys;
 use baserunna::util::codec::Reader;
@@ -27,8 +27,28 @@ fuzz_target!(|data: &[u8]| {
     }
     let _ = Bind::decode(data);
     let _ = PartMeta::decode(&b);
+    let mut part = PartMeta {
+        rows: 3,
+        granules: vec![2, 1],
+        starts: vec![0, 2, 3],
+        sort_ids: vec![],
+        pk: vec![bytes::Bytes::new(); 3],
+        cols: vec![ColMeta {
+            cref: ColRef::Ordinal,
+            phys: Phys::Int,
+            json: false,
+            index_off: 1 << 20,
+            index_len: data.len() as u64,
+            data_off: 0,
+            data_len: 1 << 20,
+            nonnull: 3,
+        }],
+        shared: Default::default(),
+        partial: Default::default(),
+    };
     for p in [Phys::Int, Phys::Float, Phys::Bool, Phys::Str] {
-        let _ = ColIndex::decode(&b, p);
+        part.cols[0].phys = p;
+        let _ = ColIndex::decode(&b, &part, &part.cols[0]);
         let _ = decode_block(data, p, Some(&std::sync::Arc::new(vec!["a".into(), "b".into()])));
     }
     let _ = State::decode(&mut Reader::new(data));

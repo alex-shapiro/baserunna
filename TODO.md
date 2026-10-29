@@ -107,6 +107,13 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       is checked only when binds add parts (`Db::bind`); events inserted by
       transactions become parts through seals, which never refuse. Count
       unsealed bytes toward the cap at commit.
+- [ ] **Purge deleted unsealed events and idle databases' deletions.** An
+      event deleted before it was sealed becomes an LSM tombstone; if its
+      row was flushed, its bytes stay in a segment until a compaction
+      happens to rewrite it, with no time bound (as for KV deletes). Purges
+      of deleted part rows also run only when the database commits. Flush
+      and compact segments holding old tombstones on a timer, and run event
+      maintenance from the node's housekeeping.
 - [ ] **Charge sealed part overhead to inserts.** A seal writes one part
       per partition, of about 330 bytes at least, and seals are not
       checked against the quota, so 6,000 events one per hourly partition

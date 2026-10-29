@@ -2475,6 +2475,50 @@ mod costly_filters {
             }
         });
     }
+
+    /// Filters whose every test is costly stop at the time limit rather
+    /// than answering late, over unsealed rows and over one large granule
+    /// alike.
+    #[test]
+    fn costly_string_tests_stop_at_the_time_limit() {
+        for sealed in [false, true] {
+            timed_rt().block_on(async {
+                let d = EngineConfig::default();
+                let cfg = EngineConfig {
+                    event_seal_bytes: d.event_seal_bytes,
+                    event_chunk_bytes: d.event_chunk_bytes,
+                    event_granule_rows: d.event_granule_rows,
+                    event_granule_bytes: d.event_granule_bytes,
+                    event_block_bytes: d.event_block_bytes,
+                    event_insert_part_max_bytes: d.event_insert_part_max_bytes,
+                    event_part_max_bytes: d.event_part_max_bytes,
+                    ..EngineConfig::small_for_tests()
+                };
+                let (eng, _store, _env) = engine(1, cfg);
+                let db = create_db(&eng, "d").await;
+                let long = "u".repeat(1000);
+                let rows: Vec<Json> =
+                    (0..2000i64).map(|i| json!({"time": T0 + i, "event": "a", "user": format!("{long}{i}")})).collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+                if sealed {
+                    let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                    let id = get_schema(&mut t, "events").await.unwrap().id;
+                    while maint::seal(&db, id).await.unwrap() {}
+                }
+                let ors: Vec<Json> = (0..255)
+                    .map(|k| {
+                        let op = if k % 2 == 0 { "contains" } else { "prefix" };
+                        json!({"col": "user", "op": op, "value": format!("u{k}x")})
+                    })
+                    .collect();
+                let aggregates: serde_json::Map<String, Json> =
+                    (0..64).map(|a| (format!("c{a}"), json!({"fn": "count", "where": {"or": ors}}))).collect();
+                let q = json!({"from": T0, "to": T0 + DAY, "aggregates": aggregates});
+                let r = run_limited(&db, q).await;
+                assert!(r.is_none(), "sealed {sealed}: {:?}", r.map(|o| o.rows));
+            });
+        }
+    }
 }
 
 mod answers {

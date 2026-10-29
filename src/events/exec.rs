@@ -26,8 +26,8 @@ use futures_util::{StreamExt, stream};
 use serde_json::{Value as Json, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Limits on the work one query does.
 #[derive(Clone, Copy, Debug)]
@@ -315,9 +315,17 @@ struct Batch {
     n: usize,
     cols: BTreeMap<Need, ColData>,
     pos: Vec<Pos>,
+    /// What each comparison of a dictionary-coded column found of the
+    /// entries it has tested, by the comparison's address, kept across the
+    /// windows the batch is evaluated in.
+    memos: Mutex<DetHashMap<usize, Vec<Option<bool>>>>,
 }
 
 impl Batch {
+    fn new(n: usize, pos: Vec<Pos>) -> Batch {
+        Batch { n, cols: BTreeMap::new(), pos, memos: Mutex::default() }
+    }
+
     fn val(&self, e: &BExpr, i: usize) -> Val {
         let need = match e {
             BExpr::Col(id) => Need::Col(*id),
@@ -335,34 +343,34 @@ impl Batch {
         self.cols.get(&need).map_or(Val::Null, |c| c.get(i))
     }
 
-    /// Rows of the batch for which `f` holds, among `sel`.
-    fn select(&self, f: &BFilter, sel: &[bool]) -> Vec<bool> {
+    /// Which of the rows from `start` for which `sel` holds also satisfy `f`.
+    fn select(&self, f: &BFilter, sel: &[bool], start: usize) -> Vec<bool> {
         match f {
             filter::Filter::And(fs) => {
                 let mut s = sel.to_vec();
                 for x in fs {
-                    if !s.iter().any(|b| *b) {
+                    if !s.contains(&true) {
                         break;
                     }
-                    s = self.select(x, &s);
+                    s = self.select(x, &s, start);
                 }
                 s
             }
             filter::Filter::Or(fs) => {
-                let mut out = vec![false; self.n];
+                let mut out = vec![false; sel.len()];
                 for x in fs {
                     let rest: Vec<bool> = sel.iter().zip(&out).map(|(s, o)| *s && !o).collect();
-                    if !rest.iter().any(|b| *b) {
+                    if !rest.contains(&true) {
                         break;
                     }
-                    for (o, y) in out.iter_mut().zip(self.select(x, &rest)) {
+                    for (o, y) in out.iter_mut().zip(self.select(x, &rest, start)) {
                         *o |= y;
                     }
                 }
                 out
             }
             filter::Filter::Not(x) => {
-                let y = self.select(x, sel);
+                let y = self.select(x, sel, start);
                 sel.iter().zip(y).map(|(s, y)| *s && !y).collect()
             }
             filter::Filter::Cmp(e, t) => {
@@ -372,30 +380,32 @@ impl Batch {
                     _ => None,
                 };
                 if let Some(ColData::Vec { v: Vector::Str(s), json }) = dict {
-                    let mut memo: Vec<Option<bool>> = vec![None; s.dict.len()];
-                    return (0..self.n)
-                        .map(|i| {
-                            sel[i] && {
+                    let mut memos = self.memos.lock().unwrap_or_else(PoisonError::into_inner);
+                    let memo = memos.entry(addr(t)).or_insert_with(|| vec![None; s.dict.len()]);
+                    return sel
+                        .iter()
+                        .zip(start..)
+                        .map(|(sel, i)| {
+                            *sel && {
                                 let c = s.codes[i];
                                 c != super::vector::NULL_CODE
                                     && *memo[c as usize].get_or_insert_with(|| {
                                         let text = &s.dict[c as usize];
-                                        let v = if *json {
+                                        if *json {
                                             serde_json::from_str::<Json>(text)
-                                                .map(|j| Val::from_json(&j))
-                                                .unwrap_or(Val::Null)
+                                                .is_ok_and(|j| holds(&Val::from_json(&j), t))
                                         } else {
-                                            Val::Str(text.clone())
-                                        };
-                                        !v.is_null() && t.holds(&v)
+                                            t.holds(&text.as_str())
+                                        }
                                     })
                             }
                         })
                         .collect();
                 }
-                (0..self.n)
-                    .map(|i| {
-                        sel[i] && {
+                sel.iter()
+                    .zip(start..)
+                    .map(|(sel, i)| {
+                        *sel && {
                             let v = self.val(e, i);
                             !v.is_null() && t.holds(&v)
                         }
@@ -403,6 +413,20 @@ impl Batch {
                     .collect()
             }
         }
+    }
+}
+
+/// A comparison's identity within its plan.
+fn addr(t: &Test<Json>) -> usize {
+    std::ptr::from_ref(t) as usize
+}
+
+/// The comparisons of `f`, in order.
+fn comparisons<'f>(f: &'f BFilter, out: &mut Vec<(&'f BExpr, &'f Test<Json>)>) {
+    match f {
+        filter::Filter::And(fs) | filter::Filter::Or(fs) => fs.iter().for_each(|x| comparisons(x, out)),
+        filter::Filter::Not(x) => comparisons(x, out),
+        filter::Filter::Cmp(e, t) => out.push((e, t)),
     }
 }
 
@@ -557,6 +581,10 @@ fn bloom_hash(phys: Phys, a: &Json) -> Option<u64> {
     })
 }
 
+/// Units of work, each about one comparison, that a query does between
+/// checks of its deadline, at which it also yields to other tasks.
+const PACE_WORK: usize = 1 << 16;
+
 /// A query bound to a table, ready to run on parts and unsealed rows.
 struct Plan<'a> {
     schema: &'a EventSchema,
@@ -569,6 +597,89 @@ struct Plan<'a> {
     positions: bool,
     /// When the query stops, and its time limit.
     deadline: Option<(tokio::time::Instant, u64)>,
+    /// Rows evaluated between calls to [`Plan::pace`]: about [`PACE_WORK`]
+    /// comparisons' worth.
+    window: usize,
+}
+
+impl<'a> Plan<'a> {
+    fn new(
+        schema: &'a EventSchema,
+        filter: BFilter,
+        lookups: Vec<Lookup>,
+        kind: Kind,
+        deadline: Option<(tokio::time::Instant, u64)>,
+    ) -> Plan<'a> {
+        let mut first = BTreeSet::new();
+        filter_needs(&filter, &mut first, &lookups);
+        let mut rest = BTreeSet::new();
+        let mut positions = false;
+        let mut cmps = Vec::new();
+        comparisons(&filter, &mut cmps);
+        match &kind {
+            Kind::Rows { columns, order, .. } => {
+                columns.iter().for_each(|(_, e)| expr_needs(e, &mut rest, &lookups));
+                order.iter().for_each(|(e, _)| expr_needs(e, &mut rest, &lookups));
+                positions = true;
+            }
+            Kind::Aggregate { first: st, .. } => {
+                st.group_by.iter().for_each(|(_, e)| expr_needs(e, &mut rest, &lookups));
+                for a in &st.aggregates {
+                    if let Some(e) = &a.of {
+                        expr_needs(e, &mut rest, &lookups);
+                    }
+                    for f in a.filter.iter().chain(&a.conditions) {
+                        filter_needs(f, &mut rest, &lookups);
+                        comparisons(f, &mut cmps);
+                    }
+                    if matches!(a.func, AggFn::WindowFunnel { .. }) {
+                        rest.insert(Need::Col(schema.time_id()));
+                        positions = true;
+                    }
+                }
+            }
+        }
+        let rest = rest.difference(&first).cloned().collect();
+        let window = (PACE_WORK / (1 + cmps.len())).max(1);
+        Plan { schema, filter, lookups, kind, first, rest, positions, deadline, window }
+    }
+
+    /// Fails once the query has run past its time limit, and otherwise
+    /// yields to other tasks. Work that never waits calls this every
+    /// [`PACE_WORK`] units or so.
+    async fn pace(&self) -> Result<()> {
+        if let Some((at, max_ms)) = self.deadline
+            && tokio::time::Instant::now() >= at
+        {
+            return Err(timed_out(max_ms));
+        }
+        tokio::task::yield_now().await;
+        Ok(())
+    }
+
+    /// The work of testing a granule's statistics and blooms against the
+    /// filter, which tests every value of an `in` list.
+    fn granule_work(&self) -> usize {
+        let mut cmps = Vec::new();
+        comparisons(&self.filter, &mut cmps);
+        cmps.iter().map(|(_, t)| 1 + if let Test::In(l) = t { l.items().len() } else { 0 }).sum()
+    }
+}
+
+/// Work done since a query last paced itself.
+#[derive(Default)]
+struct Work(usize);
+
+impl Work {
+    /// Counts `n` units, pacing the plan once they add up to [`PACE_WORK`].
+    async fn add(&mut self, plan: &Plan<'_>, n: usize) -> Result<()> {
+        self.0 += n;
+        if self.0 >= PACE_WORK {
+            self.0 = 0;
+            plan.pace().await?;
+        }
+        Ok(())
+    }
 }
 
 struct BoundStage {
@@ -806,13 +917,39 @@ impl<'p, 'a> Run<'p, 'a> {
         Ok(())
     }
 
-    /// Feeds the selected rows of a batch to the aggregation or row set.
-    fn consume(&mut self, b: &Batch, sel: &[bool]) -> Result<()> {
+    /// The rows of `b` among `base` for which `f` holds, evaluated a window
+    /// at a time.
+    async fn select(&self, b: &Batch, f: &BFilter, base: &[bool]) -> Result<Vec<bool>> {
+        let mut out = Vec::with_capacity(b.n);
+        for start in (0..b.n).step_by(self.plan.window) {
+            self.plan.pace().await?;
+            let end = (start + self.plan.window).min(b.n);
+            out.extend(b.select(f, &base[start..end], start));
+        }
+        Ok(out)
+    }
+
+    /// Feeds the selected rows of a batch to the aggregation or row set, a
+    /// window at a time.
+    async fn consume(&mut self, b: &Batch, sel: &[bool]) -> Result<()> {
+        for start in (0..b.n).step_by(self.plan.window) {
+            let end = (start + self.plan.window).min(b.n);
+            if sel[start..end].contains(&true) {
+                self.plan.pace().await?;
+                self.consume_window(b, &sel[start..end], start)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Feeds the rows from `start` for which `sel` holds.
+    fn consume_window(&mut self, b: &Batch, sel: &[bool], start: usize) -> Result<()> {
         let plan = &self.plan;
+        let rows = || (start..start + sel.len()).filter(|i| sel[i - start]);
         match &plan.kind {
             Kind::Rows { columns, order, after, .. } => {
                 let kept = self.kept.as_mut().ok_or_else(|| Error::internal("rows without a row set"))?;
-                for i in (0..b.n).filter(|i| sel[*i]) {
+                for i in rows() {
                     let key: Vec<Val> = order.iter().map(|(e, _)| b.val(e, i)).collect();
                     let pos = b.pos.get(i).copied().unwrap_or_default();
                     if let Some((ak, ap)) = after
@@ -828,21 +965,25 @@ impl<'p, 'a> Run<'p, 'a> {
                 let groups = self.groups.as_mut().ok_or_else(|| Error::internal("aggregates without groups"))?;
                 let fns: Vec<&AggFn> = first.aggregates.iter().map(|a| &a.func).collect();
                 let agg_sel: Vec<Option<Vec<bool>>> =
-                    first.aggregates.iter().map(|a| a.filter.as_ref().map(|f| b.select(f, sel))).collect();
-                let conds: Vec<Vec<Vec<bool>>> =
-                    first.aggregates.iter().map(|a| a.conditions.iter().map(|c| b.select(c, sel)).collect()).collect();
+                    first.aggregates.iter().map(|a| a.filter.as_ref().map(|f| b.select(f, sel, start))).collect();
+                let conds: Vec<Vec<Vec<bool>>> = first
+                    .aggregates
+                    .iter()
+                    .map(|a| a.conditions.iter().map(|c| b.select(c, sel, start)).collect())
+                    .collect();
                 let time = BExpr::Col(plan.schema.time_id());
-                for i in (0..b.n).filter(|i| sel[*i]) {
+                for i in rows() {
                     let keys: Vec<Val> = first.group_by.iter().map(|(_, e)| b.val(e, i).canonical()).collect();
+                    let w = i - start;
                     groups.update(keys, &fns, |states| {
                         for (ai, a) in first.aggregates.iter().enumerate() {
-                            if agg_sel[ai].as_ref().is_some_and(|s| !s[i]) {
+                            if agg_sel[ai].as_ref().is_some_and(|s| !s[w]) {
                                 continue;
                             }
                             let event = match &a.func {
                                 AggFn::WindowFunnel { mode, .. } => {
                                     let mask =
-                                        conds[ai].iter().enumerate().fold(0u32, |m, (k, c)| m | ((c[i] as u32) << k));
+                                        conds[ai].iter().enumerate().fold(0u32, |m, (k, c)| m | ((c[w] as u32) << k));
                                     if mask == 0 && !mode.strict_order {
                                         continue;
                                     }
@@ -854,7 +995,7 @@ impl<'p, 'a> Run<'p, 'a> {
                                 }
                                 AggFn::Retention(_) => {
                                     let mask =
-                                        conds[ai].iter().enumerate().fold(0u32, |m, (k, c)| m | ((c[i] as u32) << k));
+                                        conds[ai].iter().enumerate().fold(0u32, |m, (k, c)| m | ((c[w] as u32) << k));
                                     Some((0, Pos::default(), mask))
                                 }
                                 _ => None,
@@ -891,13 +1032,13 @@ impl<'p, 'a> Run<'p, 'a> {
     }
 
     /// Runs the query over unsealed rows.
-    fn unsealed(&mut self, rows: &[(Pos, Row)]) -> Result<()> {
+    async fn unsealed(&mut self, rows: &[(Pos, Row)]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
         self.stats.unsealed_rows += rows.len() as u64;
         self.stats.rows_read += rows.len() as u64;
-        let mut b = Batch { n: rows.len(), cols: BTreeMap::new(), pos: rows.iter().map(|(p, _)| *p).collect() };
+        let mut b = Batch::new(rows.len(), rows.iter().map(|(p, _)| *p).collect());
         let needs: BTreeSet<Need> = self.plan.first.iter().chain(self.plan.rest.iter()).cloned().collect();
         for need in needs {
             let data = match &need {
@@ -924,8 +1065,8 @@ impl<'p, 'a> Run<'p, 'a> {
             b.cols.insert(need, data);
         }
         self.lookups(&mut b);
-        let sel = b.select(&self.plan.filter, &vec![true; b.n]);
-        self.consume(&b, &sel)
+        let sel = self.select(&b, &self.plan.filter, &vec![true; b.n]).await?;
+        self.consume(&b, &sel).await
     }
 
     /// Reads need `need` of granules `g` of part `r`.
@@ -1055,17 +1196,35 @@ impl<'p, 'a> Run<'p, 'a> {
                 dicts.insert(ci, d);
             }
         }
+        // Whether some entry of its column's dictionary satisfies each
+        // comparison, by the comparison's address.
+        let mut dict_hits: DetHashMap<usize, bool> = DetHashMap::default();
+        let mut work = Work::default();
+        let mut cmps = Vec::new();
+        comparisons(&self.plan.filter, &mut cmps);
+        for (e, t) in cmps {
+            let BExpr::Col(id) = e else { continue };
+            let Some(d) = meta.find(&ColRef::User(*id)).and_then(|ci| dicts.get(&ci)) else { continue };
+            let mut hit = false;
+            for chunk in d.chunks(1024) {
+                work.add(self.plan, chunk.len()).await?;
+                if chunk.iter().any(|s| t.holds(&s.as_str())) {
+                    hit = true;
+                    break;
+                }
+            }
+            dict_hits.insert(addr(t), hit);
+        }
         let schema = self.plan.schema;
         let mut by_dict = false;
         let ok = may(&self.plan.filter, &mut |e, t| match e {
             BExpr::Col(id) => match meta.find(&ColRef::User(*id)) {
                 None => holds(&default_val(schema.column_by_id(*id)), t),
                 Some(ci) if meta.cols[ci].nonnull == 0 => false,
-                Some(ci) => match dicts.get(&ci) {
-                    Some(d) => {
-                        let hit = d.iter().any(|s| holds(&Val::Str(s.clone()), t));
+                Some(_) => match dict_hits.get(&addr(t)) {
+                    Some(hit) => {
                         by_dict |= !hit;
-                        hit
+                        *hit
                     }
                     None => true,
                 },
@@ -1104,7 +1263,9 @@ impl<'p, 'a> Run<'p, 'a> {
         let sort_ids = meta.sort_ids.clone();
         let mut out = Vec::with_capacity(meta.granule_count());
         let (mut by_stats, mut by_bloom) = (false, false);
+        let (mut work, granule_work) = (Work::default(), self.plan.granule_work());
         for g in 0..meta.granule_count() {
+            work.add(self.plan, granule_work).await?;
             let rows = meta.rows_of(g..g + 1);
             if mask.covers(rows.start as u32, rows.end as u32) {
                 out.push(false);
@@ -1214,19 +1375,11 @@ impl<'p, 'a> Run<'p, 'a> {
         mask: &Runs,
         g: std::ops::Range<usize>,
     ) -> Result<()> {
-        // Granules read from the cache never wait, so the query yields and
-        // checks its deadline here, as reads from the store would let it.
-        if let Some((at, max_ms)) = self.plan.deadline
-            && tokio::time::Instant::now() >= at
-        {
-            return Err(timed_out(max_ms));
-        }
-        tokio::task::consume_budget().await;
         let rows = meta.rows_of(g.clone());
         let n = (rows.end - rows.start) as usize;
         self.stats.granules_read += (g.end - g.start) as u64;
         self.stats.rows_read += n as u64;
-        let mut b = Batch { n, cols: BTreeMap::new(), pos: Vec::new() };
+        let mut b = Batch::new(n, Vec::new());
         for need in self.plan.first.clone() {
             if !matches!(need, Need::Lookup(_)) {
                 let d = self.read_need(rd, r, meta, &need, g.clone()).await?;
@@ -1244,8 +1397,8 @@ impl<'p, 'a> Run<'p, 'a> {
             }
             self.lookups(&mut b);
         }
-        let sel = b.select(&self.plan.filter, &base);
-        if !sel.iter().any(|s| *s) {
+        let sel = self.select(&b, &self.plan.filter, &base).await?;
+        if !sel.contains(&true) {
             return Ok(());
         }
         for need in self.plan.rest.clone() {
@@ -1260,7 +1413,7 @@ impl<'p, 'a> Run<'p, 'a> {
         if self.plan.positions {
             b.pos = self.positions(rd, r, meta, g).await?;
         }
-        self.consume(&b, &sel)
+        self.consume(&b, &sel).await
     }
 }
 
@@ -1472,37 +1625,9 @@ async fn run_within(
         }
         Mode::Aggregate { first, then } => Kind::Aggregate { first: bind_stage(&binder, first)?, then: then.clone() },
     };
-    let mut first = BTreeSet::new();
-    filter_needs(&filter, &mut first, &lookups);
-    let mut rest = BTreeSet::new();
-    let mut positions = false;
-    match &kind {
-        Kind::Rows { columns, order, .. } => {
-            columns.iter().for_each(|(_, e)| expr_needs(e, &mut rest, &lookups));
-            order.iter().for_each(|(e, _)| expr_needs(e, &mut rest, &lookups));
-            positions = true;
-        }
-        Kind::Aggregate { first: st, .. } => {
-            st.group_by.iter().for_each(|(_, e)| expr_needs(e, &mut rest, &lookups));
-            for a in &st.aggregates {
-                if let Some(e) = &a.of {
-                    expr_needs(e, &mut rest, &lookups);
-                }
-                if let Some(f) = &a.filter {
-                    filter_needs(f, &mut rest, &lookups);
-                }
-                a.conditions.iter().for_each(|c| filter_needs(c, &mut rest, &lookups));
-                if matches!(a.func, AggFn::WindowFunnel { .. }) {
-                    rest.insert(Need::Col(s.time_id()));
-                    positions = true;
-                }
-            }
-        }
-    }
-    let rest: BTreeSet<Need> = rest.difference(&first).cloned().collect();
     let input = input(txn, s, from, q.to).await?;
     let deadline = Some((tokio::time::Instant::now() + std::time::Duration::from_millis(limits.max_ms), limits.max_ms));
-    let plan = Plan { schema: s, filter, lookups, kind, first, rest, positions, deadline };
+    let plan = Plan::new(s, filter, lookups, kind, deadline);
     let mut run = Run::new(&plan, limits.max_memory_bytes);
     run.stats = Stats { source: "columns".into(), nodes: 1, parts: input.refs.len() as u64, ..Default::default() };
     let read_stats = ReadStats::default();
@@ -1558,7 +1683,7 @@ async fn run_within(
             )));
         }
     }
-    run.unsealed(&input.unsealed)?;
+    run.unsealed(&input.unsealed).await?;
     run.stats.bytes_read = read_stats.bytes.load(Relaxed);
     run.stats.store_gets = read_stats.gets.load(Relaxed);
     finish(run, q, limits)
@@ -1733,18 +1858,7 @@ pub async fn matching_rows(
     if !ref_may(&filter, r, s.time_id()) {
         return Ok(Vec::new());
     }
-    let mut first = BTreeSet::new();
-    filter_needs(&filter, &mut first, &[]);
-    let plan = Plan {
-        schema: s,
-        filter,
-        lookups: Vec::new(),
-        kind: Kind::Aggregate { first: BoundStage { group_by: Vec::new(), aggregates: Vec::new() }, then: None },
-        first,
-        rest: BTreeSet::new(),
-        positions: false,
-        deadline: None,
-    };
+    let plan = Plan::new(s, filter, Vec::new(), only_filter(), None);
     let run = Run::new(&plan, usize::MAX);
     let read_stats = ReadStats::default();
     let rd = Reading { shared, db, cache: Caching::Shared, stats: &read_stats };
@@ -1761,13 +1875,13 @@ pub async fn matching_rows(
         }
         let rows = meta.rows_of(g..g + 1);
         let n = (rows.end - rows.start) as usize;
-        let mut b = Batch { n, cols: BTreeMap::new(), pos: Vec::new() };
+        let mut b = Batch::new(n, Vec::new());
         for need in run.plan.first.clone() {
             let d = run.read_need(&rd, r, &meta, &need, g..g + 1).await?;
             b.cols.insert(need, d);
         }
         let base: Vec<bool> = (0..n).map(|i| !mask.contains(rows.start as u32 + i as u32)).collect();
-        let sel = b.select(&run.plan.filter, &base);
+        let sel = b.select(&run.plan.filter, &base, 0);
         out.extend(sel.iter().enumerate().filter(|(_, s)| **s).map(|(i, _)| rows.start as u32 + i as u32));
     }
     Ok(out)
@@ -1787,21 +1901,9 @@ pub fn row_matches(s: &EventSchema, row: &Row, f: &Filter, from: i64, to: i64) -
     if t < from || t >= to {
         return Ok(false);
     }
-    let bf = binder.filter(f)?;
-    let mut needs = BTreeSet::new();
-    filter_needs(&bf, &mut needs, &[]);
-    let plan = Plan {
-        schema: s,
-        filter: bf,
-        lookups: Vec::new(),
-        kind: Kind::Aggregate { first: BoundStage { group_by: Vec::new(), aggregates: Vec::new() }, then: None },
-        first: needs,
-        rest: BTreeSet::new(),
-        deadline: None,
-        positions: false,
-    };
+    let plan = Plan::new(s, binder.filter(f)?, Vec::new(), only_filter(), None);
     let run = Run::new(&plan, usize::MAX);
-    let mut b = Batch { n: 1, cols: BTreeMap::new(), pos: vec![Pos::default()] };
+    let mut b = Batch::new(1, vec![Pos::default()]);
     for need in run.plan.first.iter() {
         let v = match need {
             Need::Col(id) => row.get(id).map_or_else(|| default_val(s.column_by_id(*id)), datum_val),
@@ -1816,5 +1918,10 @@ pub fn row_matches(s: &EventSchema, row: &Row, f: &Filter, from: i64, to: i64) -
         };
         b.cols.insert(need.clone(), ColData::Vals(vec![v]));
     }
-    Ok(b.select(&run.plan.filter, &[true])[0])
+    Ok(b.select(&run.plan.filter, &[true], 0)[0])
+}
+
+/// The kind of a plan that only selects rows, as deletes do.
+fn only_filter() -> Kind {
+    Kind::Aggregate { first: BoundStage { group_by: Vec::new(), aggregates: Vec::new() }, then: None }
 }

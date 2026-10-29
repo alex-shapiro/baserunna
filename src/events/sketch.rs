@@ -121,6 +121,15 @@ impl ExactSum {
 
     /// The sum rounded to the nearest double, or an infinity past the range.
     pub fn value(&self) -> f64 {
+        self.quotient(1)
+    }
+
+    /// The sum divided by `n`, which must be positive, rounded once to the
+    /// nearest double (ties to even), or an infinity past the range. The
+    /// quotient is finite whenever it is within the range, even if the sum
+    /// is not.
+    pub fn quotient(&self, n: u64) -> f64 {
+        debug_assert!(n > 0);
         let mut s = self.clone();
         s.normalize();
         if s.limbs.is_empty() {
@@ -135,17 +144,35 @@ impl ExactSum {
                 *l = v.rem_euclid(1 << LIMB_BITS);
             }
         }
-        let Some(top) = s.limbs.iter().rposition(|l| *l != 0) else { return 0.0 };
-        let lo = top.saturating_sub(2);
-        let mut acc: u128 = 0;
-        for i in (lo..=top).rev() {
-            acc = (acc << LIMB_BITS) | s.limbs[i] as u128;
+        // The quotient's magnitude by long division, with one guard limb
+        // below the fixed point's least significant bit to round with.
+        let n = n.max(1) as u128;
+        let mut q = [0u32; LIMBS + 1];
+        let mut rem = 0u128;
+        for i in (0..q.len()).rev() {
+            let limb = if i > 0 { s.limbs[i - 1] as u128 } else { 0 };
+            let cur = rem << LIMB_BITS | limb;
+            q[i] = (cur / n) as u32;
+            rem = cur % n;
         }
-        if s.limbs[..lo].iter().any(|l| *l != 0) {
-            acc |= 1;
+        let Some(top) = q.iter().rposition(|l| *l != 0) else { return 0.0 };
+        let bits = LIMB_BITS as usize;
+        let bit = |i: usize| u64::from(q[i / bits] >> (i % bits) & 1);
+        let high = top * bits + bits - 1 - q[top].leading_zeros() as usize;
+        // The result's last bit: 53 bits down from the highest, but never
+        // below 2^-1074, where doubles turn subnormal.
+        let lsb = high.saturating_sub(52).max(bits);
+        let mut mant = (lsb..=high).rev().fold(0u64, |m, i| m << 1 | bit(i));
+        let below = lsb - 1;
+        let sticky =
+            rem != 0 || q[..below / bits].iter().any(|l| *l != 0) || q[below / bits] & ((1 << (below % bits)) - 1) != 0;
+        if bit(below) == 1 && (sticky || mant & 1 == 1) {
+            mant += 1;
         }
-        let exp = LSB_EXP + (lo as i32) * LIMB_BITS as i32;
-        let mag = scale(acc as f64, exp);
+        if mant == 0 {
+            return 0.0;
+        }
+        let mag = scale(mant as f64, LSB_EXP + (lsb - bits) as i32);
         if neg { -mag } else { mag }
     }
 
@@ -483,6 +510,22 @@ mod tests {
         assert_eq!(exact(&[1.0, 2f64.powi(-60)]), 1.0, "ties and stickies round to nearest");
         assert_eq!(exact(&[1.0, 2f64.powi(-53), 2f64.powi(-100)]), 1.0000000000000002);
         assert_eq!(exact(&[f64::MAX, -f64::MAX, 3.0]), 3.0);
+    }
+
+    #[test]
+    fn quotients_round_once() {
+        let q = |xs: &[f64], n: u64| {
+            let mut s = ExactSum::default();
+            xs.iter().for_each(|x| s.add(*x));
+            s.quotient(n)
+        };
+        assert_eq!(q(&[f64::MAX, f64::MAX], 2), f64::MAX, "a sum beyond f64 is divided before rounding");
+        assert_eq!(q(&[-f64::MAX, -f64::MAX, -f64::MAX], 3), -f64::MAX);
+        assert_eq!(q(&[1.0, 2.0], 3), 1.0);
+        assert_eq!(q(&[1.0], 3), 1.0 / 3.0);
+        let tiny = 5e-324;
+        assert_eq!(q(&[2f64.powi(33) * tiny], 1 << 34), 0.0, "ties to even");
+        assert_eq!(q(&[(2f64.powi(33) + 2.0) * tiny], (1 << 34) + 2), tiny, "just over half a unit rounds up");
     }
 
     #[test]

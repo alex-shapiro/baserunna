@@ -492,7 +492,7 @@ impl State {
             (State::SumList(l), _) => Val::List(l.iter().map(SumState::value).collect()),
             (State::Min(m) | State::Max(m), _) => m.clone().unwrap_or(Val::Null),
             (State::Avg(_, 0), _) => Val::Null,
-            (State::Avg(s, n), _) => Val::Float(s.exact().value() / *n as f64),
+            (State::Avg(s, n), _) => Val::Float(s.exact().quotient(*n)),
             (State::Uniq(h), _) => Val::Int(h.estimate() as i64),
             (State::UniqExact(s), _) => Val::Int(s.set.len() as i64),
             (State::Quantiles(d), AggFn::Quantiles(qs)) => {
@@ -833,5 +833,121 @@ mod tie_tests {
             };
             assert_eq!(fold(&[&a, &b]), fold(&[&b, &a]), "{f:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod mean_tests {
+    use super::*;
+    use crate::util::rng::Rng;
+
+    /// A two's complement integer counting units of 2^-1074, wide enough for
+    /// any count of doubles times any double.
+    #[derive(Clone, Copy)]
+    struct Big([u64; 36]);
+
+    impl Big {
+        /// `mant * 2^exp`, for `exp >= -1074`, negated if `neg`.
+        fn new(mant: u128, exp: i32, neg: bool) -> Big {
+            let shift = (exp + 1074) as usize;
+            let (i, off) = (shift / 64, shift % 64);
+            let mut w = [0u64; 36];
+            for (k, part) in [mant as u64, (mant >> 64) as u64].into_iter().enumerate() {
+                let wide = (part as u128) << off;
+                w[i + k] |= wide as u64;
+                w[i + k + 1] |= (wide >> 64) as u64;
+            }
+            let b = Big(w);
+            if neg { b.neg() } else { b }
+        }
+
+        /// `x * n`, exactly.
+        fn of(x: &Val, n: u64) -> Big {
+            match *x {
+                Val::Int(i) => Big::new(i.unsigned_abs() as u128 * n as u128, 0, i < 0),
+                Val::Float(f) => {
+                    let bits = f.to_bits();
+                    let (e, frac) = (((bits >> 52) & 0x7FF) as i32, (bits & ((1 << 52) - 1)) as u128);
+                    let (mant, exp) = if e == 0 { (frac, -1074) } else { (frac | 1 << 52, e - 1075) };
+                    Big::new(mant * n as u128, exp, f.is_sign_negative())
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        fn add(self, o: Big) -> Big {
+            let mut w = [0u64; 36];
+            let mut carry = false;
+            for (i, out) in w.iter_mut().enumerate() {
+                let (s, c1) = self.0[i].overflowing_add(o.0[i]);
+                let (s, c2) = s.overflowing_add(carry as u64);
+                (*out, carry) = (s, c1 || c2);
+            }
+            Big(w)
+        }
+
+        fn neg(self) -> Big {
+            Big(self.0.map(|x| !x)).add(Big::new(1, -1074, false))
+        }
+
+        /// The absolute value's words, most significant first, so that
+        /// magnitudes compare as slices.
+        fn magnitude(self) -> Vec<u64> {
+            let abs = if self.0[35] >> 63 == 1 { self.neg() } else { self };
+            abs.0.into_iter().rev().collect()
+        }
+    }
+
+    /// A huge (regime 0), tiny (1) or arbitrary double, or sometimes an int.
+    fn random_val(r: &mut Rng, regime: usize) -> Val {
+        if r.chance(0.1) {
+            return Val::Int(r.next_u64() as i64 >> r.usize(64));
+        }
+        let exp = match regime {
+            0 => 2040 + r.below(7),
+            1 => r.below(4),
+            _ => r.below(2047),
+        };
+        let sign = if r.chance(0.3) { 1 << 63 } else { 0 };
+        Val::Float(f64::from_bits(sign | exp << 52 | r.below(1 << 52)))
+    }
+
+    /// The mean is the double nearest the exact mean, ties to even, even
+    /// when the sum is beyond f64 or the mean is subnormal.
+    #[test]
+    fn means_round_once_to_nearest() {
+        let mut r = Rng::new(9);
+        for it in 0..20_000 {
+            let regime = r.usize(3);
+            let vals: Vec<Val> = (0..1 + r.usize(30)).map(|_| random_val(&mut r, regime)).collect();
+            let mut st = State::new(&AggFn::Avg);
+            vals.iter().for_each(|v| st.add(v, None));
+            let Val::Float(got) = st.finalize(&AggFn::Avg) else { panic!("iter {it}: not a float") };
+            assert!(got.is_finite(), "iter {it}: mean of {vals:?} is {got}");
+            let n = vals.len() as u64;
+            let sum = vals.iter().fold(Big::new(0, 0, false), |acc, v| acc.add(Big::of(v, 1)));
+            let dist = |m: f64| sum.add(Big::of(&Val::Float(m), n).neg()).magnitude();
+            let d = dist(got);
+            for m in [got.next_up(), got.next_down()].into_iter().filter(|m| m.is_finite()) {
+                let dm = dist(m);
+                assert!(d < dm || (d == dm && got.to_bits() & 1 == 0), "iter {it}: mean of {vals:?} is {got}, not {m}");
+            }
+        }
+    }
+
+    #[test]
+    fn means_of_tiny_values_round_to_the_subnormal_grid() {
+        let mean = |xs: &[f64]| {
+            let mut st = State::new(&AggFn::Avg);
+            xs.iter().for_each(|x| st.add(&Val::Float(*x), None));
+            st.finalize(&AggFn::Avg)
+        };
+        let tiny = 5e-324;
+        assert_eq!(mean(&[tiny, 0.0, 0.0]), Val::Float(0.0));
+        assert_eq!(mean(&[tiny, tiny, 0.0]), Val::Float(tiny));
+        assert_eq!(mean(&[tiny, 0.0]), Val::Float(0.0), "ties to even");
+        assert_eq!(mean(&[3.0 * tiny, 0.0]), Val::Float(2.0 * tiny), "ties to even");
+        assert_eq!(mean(&[f64::MAX, f64::MAX, f64::MAX]), Val::Float(f64::MAX));
+        assert_eq!(mean(&[-f64::MAX, -f64::MAX]), Val::Float(-f64::MAX));
     }
 }

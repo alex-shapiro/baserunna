@@ -908,3 +908,17 @@ fn funnel_modes_ignore_expired_attempts() {
         assert_eq!(got, [json!(3), json!(3)], "strict_order, strict_deduplication");
     });
 }
+
+/// A mean of finite values is finite even when their sum is beyond f64.
+#[test]
+fn avg_of_huge_values_is_finite() {
+    rt().block_on(async {
+        let (eng, _store, env) = engine(1, EngineConfig::small_for_tests());
+        env.spawn(async {});
+        let db = create_db(&eng, "d").await;
+        let rows: Vec<Json> = (0..2).map(|i| json!({"time": T0 + i, "event": "a", "x": 1e308})).collect();
+        txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+        let q = json!({"from": T0, "to": T0 + DAY, "aggregates": {"m": {"fn": "avg", "of": "x"}}});
+        assert_eq!(query(&db, &q).await.unwrap().rows[0][0], json!(1e308));
+    });
+}

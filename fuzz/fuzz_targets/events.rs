@@ -26,7 +26,7 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(Runs::decode(&mut Reader::new(&r.to_bytes())), Ok(r));
     }
     let _ = Bind::decode(data);
-    let _ = PartMeta::decode(&b);
+    let _ = PartMeta::decode(&b, 3);
     let mut part = PartMeta {
         rows: 3,
         granules: vec![2, 1],
@@ -49,7 +49,7 @@ fuzz_target!(|data: &[u8]| {
     for p in [Phys::Int, Phys::Float, Phys::Bool, Phys::Str] {
         part.cols[0].phys = p;
         let _ = ColIndex::decode(&b, &part, &part.cols[0]);
-        let _ = decode_block(data, p, Some(&std::sync::Arc::new(vec!["a".into(), "b".into()])));
+        let _ = decode_block(data, p, Some(&std::sync::Arc::new(vec!["a".into(), "b".into()])), 3);
     }
     let _ = State::decode(&mut Reader::new(data));
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) {

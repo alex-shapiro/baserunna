@@ -44,8 +44,15 @@ const BLOOM_BITS: usize = 10;
 const BLOOM_MAX_BYTES: usize = 8 << 20;
 /// Most distinct strings coded into a part-level dictionary.
 pub const DICT_MAX: usize = 65_536;
-/// The most rows a block holds.
+/// The most rows a block, and so a granule, holds.
 pub const BLOCK_ROWS_MAX: usize = 1 << 22;
+/// The most granules a part holds: tens of billions of rows in granules of
+/// thousands, far more than a part's size limit admits.
+pub const GRANULES_MAX: usize = 1 << 22;
+/// The most columns a part stores.
+pub const PART_COLUMNS_MAX: usize = 1 << 16;
+/// The most shared paths a part's directory lists.
+pub const SHARED_PATHS_MAX: usize = 1 << 20;
 /// The longest sort key the primary index holds; granules starting or
 /// ending at a longer one are not pruned by it.
 pub const PK_KEY_MAX: usize = 4096;
@@ -197,6 +204,13 @@ impl PartMeta {
     }
 
     fn encode(&self) -> Result<Vec<u8>> {
+        let listed: usize = self.shared.values().map(Vec::len).sum();
+        if self.granules.len() > GRANULES_MAX
+            || [self.cols.len(), self.shared.len(), self.partial.len()].iter().any(|n| *n > PART_COLUMNS_MAX)
+            || listed > SHARED_PATHS_MAX
+        {
+            return Err(Error::internal("an event part has more granules, columns or paths than a part can hold"));
+        }
         let mut w = Writer::new();
         w.raw(MAGIC);
         w.u8(FORMAT);
@@ -238,28 +252,32 @@ impl PartMeta {
         framed(&w.buf, Compression::Zstd(1), "part metadata")
     }
 
-    pub fn decode(b: &Bytes) -> DResult<PartMeta> {
+    /// Decodes the metadata of a part of `rows` rows.
+    pub fn decode(b: &Bytes, rows: u64) -> DResult<PartMeta> {
         let raw = unframe(b)?;
         let mut r = Reader::new(&raw);
         if r.take(4)? != MAGIC || r.u8()? != FORMAT {
             return Err(DecodeError("bad part metadata"));
         }
-        let rows = r.varint()?;
-        let n = r.len(r.remaining())?;
+        if r.varint()? != rows || rows == 0 {
+            return Err(DecodeError("part metadata does not match the part's rows"));
+        }
+        // Each granule takes at least a byte for its size and one for its key.
+        let n = r.len(GRANULES_MAX.min(usize::try_from(rows).unwrap_or(usize::MAX)).min(r.remaining() / 2))?;
         let mut granules = Vec::with_capacity(n);
         let mut starts = Vec::with_capacity(n + 1);
         let mut at = 0u64;
         for _ in 0..n {
             let g = u32::try_from(r.varint()?).map_err(|_| DecodeError("bad granule"))?;
-            if g == 0 {
-                return Err(DecodeError("empty granule"));
+            if g == 0 || g as usize > BLOCK_ROWS_MAX {
+                return Err(DecodeError("bad granule"));
             }
             starts.push(at);
             at += g as u64;
             granules.push(g);
         }
         starts.push(at);
-        if at != rows || rows == 0 {
+        if at != rows {
             return Err(DecodeError("granules do not cover the part"));
         }
         let ns = r.len(8)?;
@@ -269,9 +287,13 @@ impl PartMeta {
         }
         let mut pk = Vec::with_capacity(n + 1);
         for _ in 0..=n {
-            pk.push(Bytes::copy_from_slice(r.bytes()?));
+            let k = r.bytes()?;
+            if k.len() > PK_KEY_MAX {
+                return Err(DecodeError("primary index key too long"));
+            }
+            pk.push(Bytes::copy_from_slice(k));
         }
-        let nc = r.len(r.remaining())?;
+        let nc = r.len(PART_COLUMNS_MAX)?;
         let mut cols = Vec::with_capacity(nc);
         for _ in 0..nc {
             let cref = ColRef::decode(&mut r)?;
@@ -282,16 +304,19 @@ impl PartMeta {
                 *x = r.varint()?;
             }
             let [index_off, index_len, data_off, data_len, nonnull] = v;
-            if index_off.checked_add(index_len).is_none() || data_off.checked_add(data_len).is_none() {
+            let in_range = index_off.checked_add(index_len).is_some() && data_off.checked_add(data_len).is_some();
+            if !in_range || nonnull > rows {
                 return Err(DecodeError("column out of range"));
             }
             cols.push(ColMeta { cref, phys, json, index_off, index_len, data_off, data_len, nonnull });
         }
-        let nj = r.len(r.remaining())?;
+        let nj = r.len(PART_COLUMNS_MAX)?;
         let mut shared = BTreeMap::new();
+        let mut listed = 0;
         for _ in 0..nj {
             let col = u32::try_from(r.varint()?).map_err(|_| DecodeError("bad column id"))?;
-            let np = r.len(r.remaining())?;
+            let np = r.len(SHARED_PATHS_MAX - listed)?;
+            listed += np;
             let mut paths = Vec::with_capacity(np.min(4096));
             for _ in 0..np {
                 let key = r.string()?;
@@ -301,7 +326,7 @@ impl PartMeta {
             }
             shared.insert(col, paths);
         }
-        let np = r.len(r.remaining())?;
+        let np = r.len(PART_COLUMNS_MAX)?;
         let mut partial = BTreeSet::new();
         for _ in 0..np {
             partial.insert(u32::try_from(r.varint()?).map_err(|_| DecodeError("bad column id"))?);
@@ -355,8 +380,14 @@ impl ColIndex {
     }
 
     /// The granules block `b` holds, of a part with `granules` granules.
-    pub fn granules_of(&self, b: usize, granules: usize) -> Range<usize> {
+    fn granules_of(&self, b: usize, granules: usize) -> Range<usize> {
         self.blocks[b].first_granule as usize..self.blocks.get(b + 1).map_or(granules, |n| n.first_granule as usize)
+    }
+
+    /// The rows block `b` holds, of the part `meta` describes.
+    pub fn rows_of(&self, b: usize, meta: &PartMeta) -> u64 {
+        let rows = meta.rows_of(self.granules_of(b, meta.granule_count()));
+        rows.end - rows.start
     }
 
     fn mem_size(&self) -> usize {
@@ -415,8 +446,14 @@ impl ColIndex {
             1 => {
                 let n = r.len(DICT_MAX)?;
                 let mut d = Vec::with_capacity(n);
+                let mut bytes = 0;
                 for _ in 0..n {
-                    d.push(r.string()?);
+                    let s = r.string()?;
+                    bytes += s.len();
+                    if bytes > DICT_MAX_BYTES {
+                        return Err(DecodeError("dictionary too large"));
+                    }
+                    d.push(s);
                 }
                 Some(Arc::new(d))
             }
@@ -452,29 +489,44 @@ impl ColIndex {
             }
             blocks.push(b);
         }
-        let ns = r.len(r.remaining())?;
-        let mut stats = Vec::with_capacity(ns);
-        for _ in 0..ns {
+        let mut idx = ColIndex { dict, blocks, stats: Vec::new(), blooms: Vec::new() };
+        if (0..nb).any(|b| idx.rows_of(b, meta) > BLOCK_ROWS_MAX as u64) {
+            return Err(DecodeError("block too large"));
+        }
+        if r.varint()? != granules as u64 {
+            return Err(DecodeError("column statistics do not match the part's granules"));
+        }
+        idx.stats.reserve_exact(granules);
+        for g in 0..granules {
             let nulls = u32::try_from(r.varint()?).map_err(|_| DecodeError("bad null count"))?;
+            if nulls > meta.granules[g] {
+                return Err(DecodeError("bad null count"));
+            }
             let (min, max) = match r.u8()? {
                 0 => (None, None),
                 1 => (Some(get_stat(&mut r, phys)?), Some(get_stat(&mut r, phys)?)),
                 _ => return Err(DecodeError("bad stat tag")),
             };
-            stats.push(GranStat { nulls, min, max });
+            idx.stats.push(GranStat { nulls, min, max });
         }
-        let nl = r.len(r.remaining())?;
-        let mut blooms = Vec::with_capacity(nl);
+        let nl = r.varint()?;
+        if nl != 0 && nl != granules.div_ceil(BLOOM_GRANULES as usize) as u64 {
+            return Err(DecodeError("column blooms do not match the part's granules"));
+        }
+        idx.blooms.reserve_exact(nl as usize);
+        let mut bloom_bytes = 0;
         for _ in 0..nl {
-            blooms.push(Bloom::decode(&mut r)?);
+            let b = Bloom::decode(&mut r)?;
+            bloom_bytes += b.size_bytes();
+            if bloom_bytes > BLOOM_MAX_BYTES {
+                return Err(DecodeError("column blooms too large"));
+            }
+            idx.blooms.push(b);
         }
         if !r.is_empty() {
             return Err(DecodeError("column index trailing data"));
         }
-        if stats.len() != granules {
-            return Err(DecodeError("column statistics do not match the part's granules"));
-        }
-        Ok(ColIndex { dict, blocks, stats, blooms })
+        Ok(idx)
     }
 }
 
@@ -501,7 +553,13 @@ fn get_stat(r: &mut Reader<'_>, phys: Phys) -> DResult<Stat> {
         Phys::Int => Stat::Int(unzigzag(r.varint()?)),
         Phys::Float => Stat::Float(f64::from_bits(r.u64()?)),
         Phys::Bool => Stat::Bool(r.bool()?),
-        Phys::Str => Stat::Str(r.string()?),
+        Phys::Str => {
+            let s = r.string()?;
+            if s.len() > STAT_PREFIX {
+                return Err(DecodeError("string statistic too long"));
+            }
+            Stat::Str(s)
+        }
     })
 }
 
@@ -637,10 +695,14 @@ fn encode_block(v: &Vector, dict: Option<&BTreeMap<&str, u32>>) -> Result<Vec<u8
     Ok(w.into_inner())
 }
 
-/// Decodes a block's values; `dict` is its column's part-level dictionary.
-pub fn decode_block(raw: &[u8], phys: Phys, dict: Option<&Arc<Vec<String>>>) -> DResult<Vector> {
+/// Decodes the values of a block of `rows` rows; `dict` is its column's
+/// part-level dictionary.
+pub fn decode_block(raw: &[u8], phys: Phys, dict: Option<&Arc<Vec<String>>>, rows: u64) -> DResult<Vector> {
     let mut r = Reader::new(raw);
     let n = r.len(BLOCK_ROWS_MAX)?;
+    if n as u64 != rows {
+        return Err(DecodeError("block does not hold its granules' rows"));
+    }
     let nulls = match r.u8()? {
         NULLS_NONE => None,
         NULLS_BITMAP => Some(get_bitmap(&mut r, n)?),
@@ -1141,10 +1203,7 @@ impl Reading<'_> {
             return Ok(m);
         }
         let b = self.read(r, section(r.meta_off, r.meta_len)?).await?;
-        let m = Arc::new(PartMeta::decode(&b)?);
-        if m.rows != r.rows {
-            return Err(Error::internal("event part rows do not match its reference"));
-        }
+        let m = Arc::new(PartMeta::decode(&b, r.rows)?);
         self.remember(k, m.clone(), m.mem_size());
         Ok(m)
     }
@@ -1191,11 +1250,7 @@ impl Reading<'_> {
                 let loc = idx.blocks[bi];
                 let at = (loc.off - span.start) as usize;
                 let raw = unframe(&data.slice(at..at + loc.len as usize))?;
-                let v = Arc::new(decode_block(&raw, c.phys, idx.dict.as_ref())?);
-                let rows = meta.rows_of(idx.granules_of(bi, meta.granule_count()));
-                if v.len() as u64 != rows.end - rows.start {
-                    return Err(Error::internal("event block does not match its granules"));
-                }
+                let v = Arc::new(decode_block(&raw, c.phys, idx.dict.as_ref(), idx.rows_of(bi, meta))?);
                 // The index is charged for the part-level dictionary a block shares.
                 let size = match (&*v, &idx.dict) {
                     (Vector::Str(s), Some(d)) if Arc::ptr_eq(&s.dict, d) => v.values_mem_size(),
@@ -1263,17 +1318,15 @@ pub fn inspect(
         let end = off.checked_add(len).filter(|e| *e <= r.size).ok_or("range out of bounds")?;
         Ok(stream.slice(off as usize..end as usize))
     };
-    let meta = PartMeta::decode(&slice(r.meta_off, r.meta_len)?).map_err(|e| e.to_string())?;
-    if meta.rows != r.rows {
-        return Err(format!("part {} metadata does not match its reference", r.id));
-    }
+    let meta = PartMeta::decode(&slice(r.meta_off, r.meta_len)?, r.rows).map_err(|e| e.to_string())?;
     let mut columns: BTreeMap<ColRef, Vector> = BTreeMap::new();
     for c in &meta.cols {
         let idx = ColIndex::decode(&slice(c.index_off, c.index_len)?, &meta, c).map_err(|e| e.to_string())?;
         let mut parts = Vec::new();
-        for b in &idx.blocks {
+        for (bi, b) in idx.blocks.iter().enumerate() {
             let raw = unframe(&slice(b.off, b.len)?).map_err(|e| e.to_string())?;
-            parts.push(decode_block(&raw, c.phys, idx.dict.as_ref()).map_err(|e| e.to_string())?);
+            let rows = idx.rows_of(bi, &meta);
+            parts.push(decode_block(&raw, c.phys, idx.dict.as_ref(), rows).map_err(|e| e.to_string())?);
         }
         let v = Vector::concat(parts, c.phys);
         if v.len() as u64 != meta.rows || (v.len() - v.nulls()) as u64 != c.nonnull {
@@ -1348,15 +1401,16 @@ pub(crate) mod tests {
                 (0..n).map(|_| opt(&mut r).then(|| words[r.usize(words.len())].as_str())).collect();
             let strs = Vector::Str(Strs::from_values(strs));
             for v in [ints, floats, bools] {
-                assert_eq!(decode_block(&encode_block(&v, None).unwrap(), v.phys(), None).unwrap(), v);
+                assert_eq!(decode_block(&encode_block(&v, None).unwrap(), v.phys(), None, n as u64).unwrap(), v);
             }
             let Vector::Str(s) = &strs else { unreachable!() };
-            let back = decode_block(&encode_block(&strs, None).unwrap(), Phys::Str, None).unwrap();
+            let back = decode_block(&encode_block(&strs, None).unwrap(), Phys::Str, None, n as u64).unwrap();
             let Vector::Str(b) = back else { panic!() };
             assert!((0..n).all(|i| b.get(i) == s.get(i)), "plain strings");
             let dict = Arc::new(words.clone());
             let map: BTreeMap<&str, u32> = dict.iter().enumerate().map(|(i, w)| (w.as_str(), i as u32)).collect();
-            let back = decode_block(&encode_block(&strs, Some(&map)).unwrap(), Phys::Str, Some(&dict)).unwrap();
+            let back =
+                decode_block(&encode_block(&strs, Some(&map)).unwrap(), Phys::Str, Some(&dict), n as u64).unwrap();
             let Vector::Str(b) = back else { panic!() };
             assert!((0..n).all(|i| b.get(i) == s.get(i)), "dictionary strings");
         }
@@ -1383,7 +1437,7 @@ pub(crate) mod tests {
             shared: BTreeMap::from([(4, vec![SharedPath { key: r#"["y"]"#.into(), count: 2, ty: JType::Dyn }])]),
             partial: BTreeSet::from([4]),
         };
-        assert_eq!(PartMeta::decode(&Bytes::from(meta.encode().unwrap())).unwrap(), meta);
+        assert_eq!(PartMeta::decode(&Bytes::from(meta.encode().unwrap()), 5).unwrap(), meta);
         let mut bloom = Bloom::new(3, 10);
         bloom.insert_hash(bloom_hash_str("x"));
         let idx = ColIndex {
@@ -1535,11 +1589,11 @@ pub(crate) mod tests {
                 }
             }
             for p in [Phys::Int, Phys::Float, Phys::Bool, Phys::Str] {
-                let _ = decode_block(&d, p, Some(&Arc::new(vec!["a".into()])));
+                let _ = decode_block(&d, p, Some(&Arc::new(vec!["a".into()])), 3);
                 let meta = one_column_part(p, vec![2, 1], 64);
                 let _ = ColIndex::decode(&Bytes::from(d.clone()), &meta, &meta.cols[0]);
             }
-            let _ = PartMeta::decode(&Bytes::from(d));
+            let _ = PartMeta::decode(&Bytes::from(d), 3);
         }
     }
 }

@@ -228,3 +228,88 @@ fn bulk_inserts_hold_memory_near_their_body_size() {
         w.shutdown();
     });
 }
+
+/// Small, well-framed but corrupt part metadata and column indexes do not
+/// decode into gigabytes: 30M granules or statistics take 2 bytes each raw
+/// and tens of bytes each decoded.
+#[test]
+fn a_tiny_corrupt_column_index_does_not_decode_into_gigabytes() {
+    use baserunna::events::part::{ColIndex, ColMeta, ColRef, PartMeta};
+    use baserunna::events::vector::Phys;
+    use baserunna::util::codec::Writer;
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let framed = |w: Writer| {
+        let mut out = Vec::new();
+        baserunna::engine::segment::frame(&w.into_inner(), baserunna::engine::segment::Compression::Zstd(1), &mut out);
+        Bytes::from(out)
+    };
+    let n = 30_000_000u64;
+
+    let mut w = Writer::new();
+    w.raw(b"BRPT");
+    w.u8(1);
+    w.varint(n);
+    w.varint(n);
+    for _ in 0..n {
+        w.varint(1);
+    }
+    w.varint(0);
+    for _ in 0..=n {
+        w.varint(0);
+    }
+    for _ in 0..3 {
+        w.varint(0);
+    }
+    let meta = framed(w);
+    let before = reset_peak();
+    let decoded = PartMeta::decode(&meta, n);
+    let grown = PEAK_BYTES.load(Relaxed) - before;
+    let granules = decoded.map(|m| m.granule_count());
+    assert!(
+        grown < 256 * MIB as isize,
+        "{} bytes of part metadata decoded to {granules:?} granules, growing the heap by {grown} bytes",
+        meta.len()
+    );
+
+    let part = PartMeta {
+        rows: 1,
+        granules: vec![1],
+        starts: vec![0, 1],
+        sort_ids: vec![],
+        pk: vec![Bytes::new(); 2],
+        cols: vec![ColMeta {
+            cref: ColRef::Ordinal,
+            phys: Phys::Int,
+            json: false,
+            index_off: 16,
+            index_len: 0,
+            data_off: 0,
+            data_len: 16,
+            nonnull: 1,
+        }],
+        shared: Default::default(),
+        partial: Default::default(),
+    };
+    let mut w = Writer::new();
+    w.u8(0);
+    w.varint(1);
+    for v in [0, 16, 0] {
+        w.varint(v);
+    }
+    w.varint(n);
+    for _ in 0..n {
+        w.varint(0);
+        w.u8(0);
+    }
+    w.varint(0);
+    let index = framed(w);
+    let before = reset_peak();
+    let decoded = ColIndex::decode(&index, &part, &part.cols[0]);
+    let grown = PEAK_BYTES.load(Relaxed) - before;
+    let stats = decoded.map(|i| i.stats.len());
+    assert!(
+        grown < 256 * MIB as isize,
+        "a {} byte column index decoded to {stats:?} statistics, growing the heap by {grown} bytes",
+        index.len()
+    );
+}

@@ -165,10 +165,6 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       path that an input keeps in a shared bucket by parsing that bucket's
       JSON once for every output path (`Feed::SharedPath`), so merging parts
       with partial directories costs paths × rows × bucket size.
-- [ ] **Sweep staged event parts after the last event table is dropped.**
-      Sweeps list `part/` only while a database has event tables or part
-      bytes, so a part staged by a bulk insert that races a drop of the last
-      table stays an orphan until another event table is created.
 
 ## Performance
 

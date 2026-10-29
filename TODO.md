@@ -94,6 +94,12 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       repeated slot whose rows interleave with others' can add about one byte
       per row of a 16 MiB buffer to a part reference. Have maintenance
       rewrite parts whose inline mask exceeds `event_mask_inline_bytes`.
+- [ ] **Build parts column-wise from encoded rows.** Seals and bulk
+      inserts decode each part's rows into `table::schema::Row` maps (a
+      B-tree per row) before `RowsSource` transposes them, so a part of tiny
+      events holds several hundred bytes per row while it is built and a
+      32 MiB bulk insert of 14-byte events peaks at about 11x its body
+      (`tests/memory_bound.rs`). Decode straight into column vectors.
 - [ ] **Bound merge memory.** `merge_parts` holds the sort key of every live
       input row at once, so a final merge of 4 GiB of small events holds
       hundreds of MB of keys. Merge sorted runs block by block instead.

@@ -378,7 +378,8 @@ events to row tables.
 - **Queries** read `[from, to)` of the time column, with an optional
   filter (§4.7, where a JSON column is compared by `path`), and answer
   with rows or aggregates. Answers never depend on how events are stored
-  or merged: aggregates keep mergeable states, and sums of floats are exact.
+  or merged: aggregates keep mergeable states, and sums of floats are exact
+  (a sum past the double range answers null).
   - *Expressions* name a column (`"user"`), a JSON path
     (`{"col": "props", "path": ["plan"]}`), a lookup (`{"lookup": "plan"}`)
     or a time bucket (`{"bucket": {"col": "time"}, "interval": "1d",

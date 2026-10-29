@@ -276,7 +276,8 @@ impl SumState {
         {
             return Val::Int(i);
         }
-        Val::Float(self.exact().value())
+        let v = self.exact().value();
+        if v.is_finite() { Val::Float(v) } else { Val::Null }
     }
 }
 

@@ -1090,7 +1090,6 @@ fn diff_quantiles_are_within_one_percent() {
 /// that reads it should see null: not count it as a distinct value, nor
 /// group it apart from other nulls, nor sort it above every number.
 #[test]
-#[ignore = "product bug: an overflowed sum is +inf inside the engine but null in answers"]
 fn float_sum_overflow_is_null_in_then() {
     rt().block_on(async {
         let (eng, _store, env) = engine(1, EngineConfig::small_for_tests());

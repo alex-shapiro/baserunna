@@ -1076,7 +1076,7 @@ impl Ev<'_> {
                     }
                     f => {
                         let cell = scalar_agg(f, &vals, false);
-                        if unverifiable(f, &cell) {
+                        if unverifiable(&cell) {
                             kinds[group.len() + ai] = ColKind::Approx;
                         }
                         cell
@@ -1090,12 +1090,10 @@ impl Ev<'_> {
     }
 }
 
-/// Whether the engine's answer of `f` cannot be ordered or aggregated again
-/// like the reference's `cell`: an approximate distinct count, or a sum
-/// beyond the double range, which answers null but which the engine orders,
-/// groups and counts as an infinity (`float_sum_overflow_is_null_in_then`).
-fn unverifiable(f: &AggFn, cell: &Cell) -> bool {
-    matches!(cell, Cell::About(..)) || (matches!(f, AggFn::Sum) && matches!(cell, Cell::V(Json::Null)))
+/// Whether the engine's answer cannot be ordered or aggregated again like
+/// the reference's `cell`: an approximate distinct count.
+fn unverifiable(cell: &Cell) -> bool {
+    matches!(cell, Cell::About(..))
 }
 
 /// An aggregate of plain values; `lists` when the values are answers of
@@ -1262,7 +1260,7 @@ fn second_stage(
             let vals: Vec<Json> = members.iter().map(|r| of.map_or(Json::Null, |o| eval(o, r))).collect();
             let lists = of.is_some_and(|o| o.1.is_none() && kinds[o.0] == ColKind::List);
             let cell = scalar_agg(f, &vals, lists);
-            if unverifiable(f, &cell) {
+            if unverifiable(&cell) {
                 out_kinds[group.len() + k] = ColKind::Approx;
             }
             row.push(cell);

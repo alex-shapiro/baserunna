@@ -59,6 +59,13 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       warm, or fails with `409` after `txn_retries`. Evaluate the delete's
       filter on rows and refs added since its snapshot inside the committer
       instead of tracking them as reads.
+- [ ] **Run event deletes past the commit deadline.** A delete reads every
+      part its filter cannot rule out by time range inside its transaction,
+      and the request's commit deadline (`commit_timeout_ms`, 10 s) bounds
+      those reads: with 32 concurrent reads at 25 ms, about 12,000 parts.
+      Larger deletes fail with a retryable `503` that cannot succeed. Run
+      them as background mutations that mask part by part and report
+      progress.
 - [ ] **Sweep staged event parts after the last event table is dropped.**
       Sweeps list `part/` only while a database has event tables or part
       bytes, so a part staged by a bulk insert that races a drop of the last

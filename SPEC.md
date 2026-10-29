@@ -393,9 +393,13 @@ events to row tables.
     (HyperLogLog, exact up to 1,024 values) or `uniq_exact` of the
     expression `of`; `quantiles` of `of` at levels `q` (a list, answered as
     a list within 1% relative error); `window_funnel` with `steps` (filters),
-    `window_ms` and an optional `mode` (`strict_order`,
-    `strict_deduplication`, `strict_increase`), answered as the number of
-    steps one group reached in order within the window; or `retention`
+    `window_ms` and an optional `mode`, answered as the highest step any
+    attempt reached, where an attempt starts at each event matching the
+    first step and advances at each later event matching its next step
+    within `window_ms` of its start (modes judge each attempt alone:
+    `strict_order` ends it at any event other than its next step,
+    `strict_deduplication` at a repeat of a step it reached, and
+    `strict_increase` requires each step strictly after the last); or `retention`
     with `conditions` (filters), answered as a list whose `i`th entry says
     whether the group met the first condition and the `i`th. A `then`
     stage groups the first stage's outputs by name, so a funnel per user

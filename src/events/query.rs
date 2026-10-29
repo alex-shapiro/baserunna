@@ -207,12 +207,13 @@ fn named(v: Json) -> Result<Named> {
     Ok(Named { expr, name })
 }
 
-/// How [`AggFn::WindowFunnel`] treats events between steps.
+/// How [`AggFn::WindowFunnel`] treats events between steps of one attempt;
+/// see [`super::agg::funnel`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FunnelMode {
-    /// Any event that is not the next step, once the funnel started, ends it.
+    /// An event in the attempt's window that is not its next step ends it.
     pub strict_order: bool,
-    /// A repeat of the step last reached ends the funnel.
+    /// A repeat of a step the attempt already reached ends it.
     pub strict_deduplication: bool,
     /// Each step must come strictly after the previous one.
     pub strict_increase: bool,

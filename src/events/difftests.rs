@@ -591,58 +591,59 @@ fn diff_unsealed_and_sealed_answer_alike() {
     eprintln!("answered {answered}; errors {:?}", errs);
 }
 
+/// `funnel` answers like a literal simulation of every attempt, one per event
+/// matching the first step, in every combination of modes.
 #[test]
 fn diff_funnel_matches_brute_force() {
     use super::agg::funnel;
     use super::query::FunnelMode;
     use crate::engine::events::Pos;
-    fn brute(evs: &[(i64, Pos, u32)], steps: usize, w: i64, inc: bool) -> usize {
+    fn brute(evs: &[(i64, Pos, u32)], steps: usize, w: i64, m: FunnelMode) -> usize {
         let mut e = evs.to_vec();
         e.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         let mut best = 0;
-        #[allow(clippy::too_many_arguments)]
-        fn go(
-            e: &[(i64, Pos, u32)],
-            from: usize,
-            l: usize,
-            start: i64,
-            last: i64,
-            steps: usize,
-            w: i64,
-            inc: bool,
-            best: &mut usize,
-        ) {
-            *best = (*best).max(l);
-            if l == steps {
-                return;
+        for (i, &(start, _, mask)) in e.iter().enumerate() {
+            if steps == 0 || mask & 1 == 0 {
+                continue;
             }
-            for j in from..e.len() {
-                let (t, _, m) = e[j];
-                if m & (1 << l) != 0 && t <= start + w && (!inc || t > last) {
-                    go(e, j + 1, l + 1, start, t, steps, w, inc, best);
+            let (mut level, mut last) = (1, start);
+            for &(t, _, mask) in &e[i + 1..] {
+                if level == steps || t > start + w {
+                    break;
+                }
+                let next = mask & (1 << level) != 0;
+                if next && (!m.strict_increase || t > last) {
+                    level += 1;
+                    last = t;
+                } else if (m.strict_order && !next) || (m.strict_deduplication && mask & ((1 << level) - 1) != 0) {
+                    break;
                 }
             }
-        }
-        for i in 0..e.len() {
-            if e[i].2 & 1 != 0 {
-                go(&e, i + 1, 1, e[i].0, e[i].0, steps, w, inc, &mut best);
-            }
+            best = best.max(level);
         }
         best
     }
     let mut r = Rng::new(3);
-    for it in 0..200_000 {
-        let steps = 1 + r.usize(4);
-        let n = r.usize(8);
-        let evs: Vec<(i64, Pos, u32)> = (0..n)
-            .map(|i| (r.below(6) as i64, Pos { version: 1, ordinal: i as u32 }, r.below(1 << steps) as u32))
+    for it in 0..100_000 {
+        let steps = r.usize(5);
+        let n = r.usize(10);
+        let mut evs: Vec<(i64, Pos, u32)> = (0..n)
+            .map(|i| {
+                let mask = if r.chance(0.6) { 1 << r.usize(steps.max(1)) } else { r.below(1 << steps) as u32 };
+                (r.below(8) as i64, Pos { version: 1, ordinal: i as u32 }, mask)
+            })
             .collect();
-        let w = r.below(5) as i64;
-        for inc in [false, true] {
-            let m = FunnelMode { strict_increase: inc, ..Default::default() };
+        r.shuffle(&mut evs);
+        let w = r.below(6) as i64;
+        for bits in 0..8 {
+            let m = FunnelMode {
+                strict_order: bits & 1 != 0,
+                strict_deduplication: bits & 2 != 0,
+                strict_increase: bits & 4 != 0,
+            };
             let got = funnel(&evs, steps, w, m);
-            let want = brute(&evs, steps, w, inc);
-            assert_eq!(got, want, "iter {it} inc {inc} steps {steps} w {w} evs {evs:?}");
+            let want = brute(&evs, steps, w, m);
+            assert_eq!(got, want, "iter {it} {m:?} steps {steps} w {w} evs {evs:?}");
         }
     }
 }
@@ -878,5 +879,32 @@ fn row_table_float_columns_refuse_integers_no_float_equals() {
         );
         let exact = n(json!({"col": "score", "op": "eq", "value": 9007199254740992i64})).await;
         assert_eq!(exact.ok(), Some(1), "an integer a float equals compares");
+    });
+}
+
+/// Each funnel attempt is judged on its own events: an attempt whose window
+/// expired days ago neither ends nor shortens a later, clean one.
+#[test]
+fn funnel_modes_ignore_expired_attempts() {
+    rt().block_on(async {
+        let (eng, _store, env) = engine(1, EngineConfig::small_for_tests());
+        env.spawn(async {});
+        let db = create_db(&eng, "d").await;
+        let order = [(0, "a"), (1, "b"), (2 * DAY, "a"), (2 * DAY + 1, "b"), (2 * DAY + 2, "c")];
+        let dedup = [(0, "a"), (2 * DAY, "a"), (2 * DAY + 1, "b"), (2 * DAY + 2, "c")];
+        let mut rows = Vec::new();
+        for (user, evs) in [("order", &order[..]), ("dedup", &dedup[..])] {
+            rows.extend(evs.iter().map(|(t, e)| json!({"time": T0 + t, "event": e, "user": user})));
+        }
+        txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+        let steps: Vec<Json> =
+            ["a", "b", "c"].iter().map(|e| json!({"col": "event", "op": "eq", "value": e})).collect();
+        let mut got = Vec::new();
+        for (user, mode) in [("order", "strict_order"), ("dedup", "strict_deduplication")] {
+            let q = json!({"from": T0, "to": T0 + 3 * DAY, "where": {"col": "user", "op": "eq", "value": user},
+                "aggregates": {"f": {"fn": "window_funnel", "window_ms": 60_000, "steps": steps, "mode": mode}}});
+            got.push(query(&db, &q).await.unwrap().rows[0][0].clone());
+        }
+        assert_eq!(got, [json!(3), json!(3)], "strict_order, strict_deduplication");
     });
 }

@@ -623,58 +623,68 @@ impl State {
     }
 }
 
-/// The number of funnel steps reached (ClickHouse's `windowFunnel`).
+/// The highest funnel step a group reached (after ClickHouse's
+/// `windowFunnel`), given each event's time, position and the mask of steps
+/// it matches.
 ///
-/// Events are taken in time order, then insertion order; within one event,
-/// later steps are tried first so that one event never fulfills two
-/// consecutive steps. A chain starts at each event matching the first step
-/// and reaches step `l` from a chain at step `l - 1` whose first event lies
-/// within `window_ms`.
+/// An attempt starts at each event matching the first step, having reached
+/// step 1. The group's later events (in time order, then insertion order)
+/// within `window_ms` of the attempt's first event are considered in turn:
+/// one matching the attempt's next step advances it one step (with
+/// `strict_increase`, only if its time is after that of the attempt's
+/// previous step). An event that does not advance the attempt ends it, with
+/// `strict_order`, if it does not match the next step and, with
+/// `strict_deduplication`, if it matches a step the attempt already reached.
+/// The answer is the highest step any attempt reaches.
 pub fn funnel(evs: &[(i64, Pos, u32)], steps: usize, window_ms: i64, mode: FunnelMode) -> usize {
+    if steps == 0 {
+        return 0;
+    }
     let mut evs = evs.to_vec();
     evs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    // chains[l] = the first event's time of the latest chain that reached step l + 1.
-    let mut chains: Vec<Option<i64>> = vec![None; steps];
-    let reached = |c: &[Option<i64>]| c.iter().rposition(Option::is_some).map_or(0, |l| l + 1);
-    // With strict_increase, an event extends only chains as they stood
-    // before its timestamp, so a tie cannot replace a chain it could extend.
-    let (mut before, mut at) = (chains.clone(), None);
+    // Live attempts at the same step meet the same fate at every event, except
+    // that a later start keeps its window open longer and, with
+    // strict_increase, a step reached at the current time cannot be followed
+    // at that time. So per step only the latest start counts, kept apart for
+    // attempts that reached step l + 1 before the current time (`before[l]`)
+    // and at it (`at[l]`).
+    let mut before: Vec<Option<i64>> = vec![None; steps - 1];
+    let mut at: Vec<Option<i64>> = vec![None; steps - 1];
+    let mut now = None;
+    let mut best = 0;
     for (t, _, mask) in evs {
-        if mode.strict_increase && at != Some(t) {
-            before.clone_from(&chains);
-            at = Some(t);
-        }
-        let deepest = reached(&chains);
-        if mode.strict_order && deepest > 0 && deepest < steps && mask & (1 << deepest) == 0 && mask & 1 == 0 {
-            return deepest;
-        }
-        if mode.strict_deduplication
-            && deepest > 0
-            && mask & (1 << (deepest - 1)) != 0
-            && mask & (1 << deepest.min(steps - 1)) == 0
-        {
-            return deepest;
-        }
-        for l in (0..steps).rev() {
-            if mask & (1 << l) == 0 {
-                continue;
+        if now != Some(t) {
+            now = Some(t);
+            for (b, a) in before.iter_mut().zip(&mut at) {
+                *b = (*b).max(a.take());
             }
-            if l == 0 {
-                chains[0] = Some(t);
-                continue;
-            }
-            let prev = if mode.strict_increase { before[l - 1] } else { chains[l - 1] };
-            if let Some(first) = prev
-                && t <= first.saturating_add(window_ms)
-            {
-                chains[l] = Some(first);
+        }
+        let open = |start: Option<i64>| start.filter(|s| t <= s.saturating_add(window_ms));
+        for l in (1..steps).rev() {
+            let next = mask & (1 << l) != 0;
+            let ends = (mode.strict_order && !next) || (mode.strict_deduplication && mask & ((1 << l) - 1) != 0);
+            let (b, a) = (open(before[l - 1]), open(at[l - 1]));
+            let a_advances = next && !mode.strict_increase;
+            let advanced = b.filter(|_| next).max(a.filter(|_| a_advances));
+            if advanced.is_some() {
                 if l + 1 == steps {
                     return steps;
                 }
+                at[l] = at[l].max(advanced);
+                best = best.max(l + 1);
             }
+            before[l - 1] = if next || ends { None } else { b };
+            at[l - 1] = if a_advances || ends { None } else { a };
+        }
+        if mask & 1 != 0 {
+            if steps == 1 {
+                return 1;
+            }
+            at[0] = at[0].max(Some(t));
+            best = best.max(1);
         }
     }
-    reached(&chains)
+    best
 }
 
 #[cfg(test)]
@@ -702,7 +712,12 @@ mod tests {
         assert_eq!(funnel(&[ev(0, 0, 1), ev(1, 1, 2), ev(2, 2, 0), ev(3, 3, 4)], 3, 10, order), 2);
         assert_eq!(funnel(&[ev(0, 0, 1), ev(1, 1, 2), ev(2, 2, 0), ev(3, 3, 4)], 3, 10, m), 3);
         let dedup = FunnelMode { strict_deduplication: true, ..m };
-        assert_eq!(funnel(&[ev(0, 0, 1), ev(1, 1, 1), ev(2, 2, 2)], 2, 10, dedup), 1);
+        let repeat = [ev(0, 0, 1), ev(1, 1, 2), ev(2, 2, 2), ev(3, 3, 4)];
+        assert_eq!(funnel(&repeat, 3, 10, dedup), 2, "a repeated step ends the attempt");
+        assert_eq!(funnel(&repeat, 3, 10, m), 3);
+        assert_eq!(funnel(&[ev(0, 0, 1), ev(1, 1, 1), ev(2, 2, 2)], 2, 10, dedup), 2, "a repeat of step 1 starts anew");
+        let stale = [ev(0, 0, 1), ev(1, 1, 2), ev(100, 2, 1), ev(101, 3, 2), ev(102, 4, 4)];
+        assert_eq!(funnel(&stale, 3, 10, order), 3, "an expired attempt does not end a later one");
     }
 
     /// A value an aggregate adds, with its funnel or retention event.

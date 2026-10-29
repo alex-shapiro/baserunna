@@ -2899,6 +2899,80 @@ mod maintenance_robustness {
             assert_eq!(after.len(), 1, "parts of a quiet partition: {} before, {} after", before.len(), after.len());
         });
     }
+
+    /// A store whose clock probe writes fail once `fail` is set.
+    struct FailClockProbes {
+        inner: crate::store::DynStore,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::store::ObjectStore for FailClockProbes {
+        fn get<'a>(
+            &'a self,
+            key: &'a str,
+            opts: crate::store::GetOpts,
+        ) -> crate::store::BoxFut<'a, crate::store::SResult<crate::store::GetResult>> {
+            self.inner.get(key, opts)
+        }
+        fn put<'a>(
+            &'a self,
+            key: &'a str,
+            data: Bytes,
+            mode: crate::store::PutMode,
+        ) -> crate::store::BoxFut<'a, crate::store::SResult<String>> {
+            if key == crate::engine::clock::PROBE_KEY && self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async { Err(crate::store::StoreError::Unavailable("probe refused".into())) });
+            }
+            self.inner.put(key, data, mode)
+        }
+        fn delete<'a>(&'a self, key: &'a str) -> crate::store::BoxFut<'a, crate::store::SResult<()>> {
+            self.inner.delete(key)
+        }
+        fn list<'a>(
+            &'a self,
+            prefix: &'a str,
+            start_after: Option<&'a str>,
+            limit: usize,
+        ) -> crate::store::BoxFut<'a, crate::store::SResult<crate::store::ListPage>> {
+            self.inner.list(prefix, start_after, limit)
+        }
+    }
+
+    /// Retention follows the store's clock: a lease holder whose store clock
+    /// measurement has lapsed and whose own clock runs ahead neither drops
+    /// nor hides events still within retention.
+    #[test]
+    fn retention_never_follows_a_skewed_wall_clock() {
+        rt().block_on(async {
+            const HOUR: u64 = 3_600_000;
+            let origin = tokio::time::Instant::now();
+            let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
+            let env2 = env.clone();
+            let mem = Arc::new(crate::store::MemStore::new(Box::new(move || env2.now_ms() - 2 * HOUR)));
+            let store = Arc::new(FailClockProbes { inner: mem, fail: Default::default() });
+            let eng = Engine::new(store.clone(), env.clone(), cfg(), "node-a".into());
+            let db = eng.db("d");
+            db.open(true).await.unwrap();
+            let mut def = table_def();
+            def.retention_ms = Some(3 * HOUR);
+            txn_do(&db, async |t| create(t, &def).await).await.unwrap();
+            let store_now = db.shared().store_time_ms().await.unwrap() as i64;
+            let rows = [json!({"time": store_now - 90 * 60_000, "event": "a"})];
+            txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            let (s, _) = schema_and_refs(&db).await;
+            assert!(maint::seal(&db, s.id).await.unwrap());
+            // Clock probes fail for an hour, so the measurement lapses while
+            // the event, 2.5 hours old by the store's clock, is retained.
+            store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(HOUR + 60_000)).await;
+            assert!(db.shared().store_now_ms().is_none());
+            let _ = maint::maintain(&db, s.id, 8).await;
+            let (_, refs) = schema_and_refs(&db).await;
+            assert_eq!(refs.len(), 1, "maintenance dropped a part within retention");
+            let q = json!({"from": 0, "to": T0 * 2, "aggregates": {"n": {"fn": "count"}}});
+            assert_eq!(query(&db, &q).await.unwrap().rows, vec![vec![json!(1)]], "a query hid a retained event");
+        });
+    }
 }
 mod liveness {
     use super::*;

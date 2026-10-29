@@ -1420,7 +1420,7 @@ async fn run_within(
         probe::hit(Probe::LookupApplied);
     }
     let time = BExpr::Col(s.time_id());
-    let from = q.from.max(s.retained_from(shared.time_ms() as i64));
+    let from = shared.store_now_ms().map_or(q.from, |now| q.from.max(s.retained_from(now as i64)));
     let mut conds = vec![
         filter::Filter::Cmp(time.clone(), Test::Ge(json!(from))),
         filter::Filter::Cmp(time.clone(), Test::Lt(json!(q.to))),

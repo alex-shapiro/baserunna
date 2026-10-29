@@ -425,7 +425,9 @@ events to row tables.
   transaction. A delete that would need an oversized mask in one partition
   fails with `413` naming it, so a caller deletes partition by partition.
 - **Retention** (`retention_ms`): queries skip events older than it, and
-  maintenance drops parts once all their events are older.
+  maintenance drops parts once all their events are older, both by the
+  store's clock (§5.8); without a store clock measurement, queries skip
+  nothing and parts are not dropped.
 - **Quota.** Event tables count toward the database's size quota (§5.10),
   and a database's event parts are capped at 1 TiB. Seals, merges, deletes
   and retention never grow a database, so a full database can still run

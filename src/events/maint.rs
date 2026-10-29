@@ -177,16 +177,21 @@ pub fn tier(raw: u64, base: u64, k: u64) -> u32 {
 /// merges, then merges that settle partitions whose time has passed and
 /// that received no part for `event_settle_ms` (ClickHouse's
 /// `min_age_to_force_merge_seconds`), so that backfilling old partitions
-/// is not merged after every insert.
+/// is not merged after every insert. Retention drops need `store_now_ms`,
+/// a lower bound on the store's clock, so that a node whose own clock runs
+/// ahead never drops events still within retention.
 pub fn plan(
     s: &EventSchema,
     refs: &[PartRef],
     failed: &BTreeSet<String>,
     cfg: &crate::engine::EngineConfig,
     now_ms: i64,
+    store_now_ms: Option<i64>,
 ) -> Option<Task> {
-    if s.retention_ms.is_some() {
-        let cutoff = s.retained_from(now_ms);
+    if s.retention_ms.is_some()
+        && let Some(store_now) = store_now_ms
+    {
+        let cutoff = s.retained_from(store_now);
         let expired: Vec<PartRef> =
             refs.iter().filter(|p| p.max_time < cutoff).take(refs_per_txn(cfg)).cloned().collect();
         if !expired.is_empty() {
@@ -916,8 +921,8 @@ pub async fn maintain_skipping(db: &Arc<Db>, table: u32, rounds: usize, failed: 
             refs.push(ev::ref_of(&e).ok_or_else(|| Error::internal("corrupt part reference"))?);
         }
         failed.retain(|id| refs.iter().any(|r| r.id == *id));
-        let now = shared.time_ms() as i64;
-        match plan(&s, &refs, failed, &shared.cfg, now) {
+        let store_now = shared.store_earliest_now_ms().map(|t| t as i64);
+        match plan(&s, &refs, failed, &shared.cfg, shared.time_ms() as i64, store_now) {
             None if sealing => continue,
             None => break,
             Some(Task::Drop(parts)) => drop_expired(db, &parts).await?,

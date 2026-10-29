@@ -57,8 +57,18 @@ async fn delete_parts(shared: &Shared, db: &str, ids: impl IntoIterator<Item = S
     }
 }
 
+/// Bytes a transaction is charged for each part reference it writes, at most.
+const REF_WRITE_BYTES: usize = 512;
+
+/// The most part references one maintenance transaction writes or removes.
+pub fn refs_per_txn(cfg: &crate::engine::EngineConfig) -> usize {
+    (cfg.txn_max_write_bytes / REF_WRITE_BYTES).max(1)
+}
+
 /// Seals up to `event_insert_part_max_bytes` of table `table`'s unsealed
-/// rows into level 0 parts. Returns whether it sealed anything.
+/// rows, in position order, into level 0 parts, stopping before rows of
+/// more partitions than one transaction can reference. Returns whether it
+/// sealed anything.
 pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
     let shared = db.shared().clone();
     let cfg = &shared.cfg;
@@ -71,41 +81,59 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
     let avg = (st.unsealed_bytes / st.unsealed_rows).max(1) as usize;
     let limit = (cfg.event_insert_part_max_bytes / avg).max(1);
     let items = txn.scan(&ev::rows(table), false, limit).await?;
-    let Some(last) = items.last().and_then(|it| ev::parse_row_key(&it.key)).map(|(_, p)| p) else { return Ok(false) };
-    let mut bytes = 0u64;
+    let max_parts = refs_per_txn(cfg);
+    let (mut bytes, mut rows, mut last) = (0u64, 0u64, None);
     let mut by_partition: BTreeMap<u32, Vec<PosRow>> = BTreeMap::new();
     for it in &items {
         let (_, pos) = ev::parse_row_key(&it.key).ok_or_else(|| Error::internal("bad unsealed row key"))?;
         let Value::Inline(b) = &it.value else { return Err(Error::internal("unsealed row stored out of line")) };
-        bytes += (it.key.len() + b.len()) as u64;
         let row = decode_row(b).map_err(|_| Error::internal("corrupt unsealed row"))?;
-        by_partition.entry(ev::partition_key(s.bucket(s.time_of(&row)))).or_default().push(PosRow { pos, row });
+        let partition = ev::partition_key(s.bucket(s.time_of(&row)));
+        if !by_partition.contains_key(&partition) && by_partition.len() >= max_parts {
+            break;
+        }
+        bytes += (it.key.len() + b.len()) as u64;
+        rows += 1;
+        last = Some(pos);
+        by_partition.entry(partition).or_default().push(PosRow { pos, row });
     }
+    let Some(last) = last else { return Ok(false) };
     let mut written = Vec::new();
     for (partition, rows) in by_partition {
         for chunk in split_rows(rows, cfg.event_insert_part_max_bytes) {
-            let (r, _) = write_rows(&shared, &db.id, &s, partition, chunk, true).await?;
-            written.push(r);
+            let r = write_rows(&shared, &db.id, &s, partition, chunk, true).await;
+            match r {
+                Ok((r, _)) => written.push(r),
+                Err(e) => {
+                    delete_parts(&shared, &db.id, written.into_iter().map(|r| r.id)).await;
+                    return Err(e);
+                }
+            }
         }
     }
     shared.env.crash_point().await;
-    txn.delete_range(ev::rows_through(table, last))?;
-    for r in &written {
-        txn.put(r.key(), Value::Inline(r.encode()))?;
-        txn.event_op(EventOp::part_ref(None, Some(r.clone())))?;
-    }
-    txn.event_op(EventOp::Forget { table, rows: items.len() as u64, bytes, sealed_through: Some(last) })?;
-    match db.commit(txn.into_request()).await {
+    let committed = async {
+        txn.delete_range(ev::rows_through(table, last))?;
+        for r in &written {
+            txn.put(r.key(), Value::Inline(r.encode()))?;
+            txn.event_op(EventOp::part_ref(None, Some(r.clone())))?;
+        }
+        txn.event_op(EventOp::Forget { table, rows, bytes, sealed_through: Some(last) })?;
+        db.commit(txn.into_request()).await
+    };
+    match committed.await {
         Ok(_) => {
             probe::hit(Probe::EventsSealed);
             Ok(true)
         }
-        Err(e @ (Error::Conflict(_) | Error::NotFound(_))) => {
-            probe::hit(Probe::SealConflicted);
+        Err(e @ Error::Unavailable { outcome_unknown: true, .. }) => Err(e),
+        Err(e) => {
+            if matches!(e, Error::Conflict(_) | Error::NotFound(_)) {
+                probe::hit(Probe::SealConflicted);
+            }
             delete_parts(&shared, &db.id, written.into_iter().map(|r| r.id)).await;
             Err(e)
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -160,7 +188,8 @@ pub fn tier(raw: u64, base: u64, k: u64) -> u32 {
 pub fn plan(s: &EventSchema, refs: &[PartRef], cfg: &crate::engine::EngineConfig, now_ms: i64) -> Option<Task> {
     if let Some(r) = s.retention_ms {
         let cutoff = now_ms.saturating_sub(r as i64);
-        let expired: Vec<PartRef> = refs.iter().filter(|p| p.max_time < cutoff).cloned().collect();
+        let expired: Vec<PartRef> =
+            refs.iter().filter(|p| p.max_time < cutoff).take(refs_per_txn(cfg)).cloned().collect();
         if !expired.is_empty() {
             return Some(Task::Drop(expired));
         }
@@ -794,9 +823,14 @@ pub async fn drop_expired(db: &Arc<Db>, parts: &[PartRef]) -> Result<()> {
     Ok(())
 }
 
-/// Runs maintenance on table `table` until nothing is due, at most `rounds` steps.
+/// Runs maintenance on table `table` until nothing is due, at most `rounds`
+/// steps. A merge that fails other than by a conflict is not planned again
+/// in this call, so it does not hold up the table's other merges; the first
+/// such error is returned at the end.
 pub async fn maintain(db: &Arc<Db>, table: u32, rounds: usize) -> Result<()> {
     let shared = db.shared().clone();
+    let mut failed: BTreeSet<String> = BTreeSet::new();
+    let mut first_error = None;
     for _ in 0..rounds {
         let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await?;
         let Some(s) = schema_by_id(&mut txn, table).await? else { return Ok(()) };
@@ -812,17 +846,21 @@ pub async fn maintain(db: &Arc<Db>, table: u32, rounds: usize) -> Result<()> {
         for e in snap.scan(&ev::refs(table), false, usize::MAX >> 1, txn.read_time).await? {
             refs.push(ev::ref_of(&e).ok_or_else(|| Error::internal("corrupt part reference"))?);
         }
+        refs.retain(|r| !failed.contains(&r.id));
         let now = shared.time_ms() as i64;
         match plan(&s, &refs, &shared.cfg, now) {
-            None => return Ok(()),
+            None => break,
             Some(Task::Drop(parts)) => drop_expired(db, &parts).await?,
             Some(Task::Merge(parts)) => match merge(db, &s, &parts).await {
                 Ok(()) | Err(Error::Conflict(_)) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    failed.extend(parts.into_iter().map(|p| p.id));
+                    first_error.get_or_insert(e);
+                }
             },
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Schedules maintenance per table, running at most one task per table.

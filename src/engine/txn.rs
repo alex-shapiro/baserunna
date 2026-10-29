@@ -493,6 +493,12 @@ impl Txn {
         Ok(())
     }
 
+    /// Whether the transaction inserts events into `table`, which its reads
+    /// of the table cannot see before commit.
+    pub fn inserts_events(&self, table: u32) -> bool {
+        self.writes.events.iter().any(|op| matches!(op, EventOp::Insert { table: t, .. } if *t == table))
+    }
+
     /// Records an event op that accounts for puts the transaction made itself.
     pub fn event_op(&mut self, op: EventOp) -> Result<()> {
         self.account(64)?;

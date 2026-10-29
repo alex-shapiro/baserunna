@@ -1256,6 +1256,13 @@ pub struct Input {
 /// Reads the references and unsealed rows a query over `[from, to)` needs,
 /// recording both in the transaction's read set.
 pub async fn input(txn: &mut Txn, s: &EventSchema, from: i64, to: i64) -> Result<Input> {
+    if txn.inserts_events(s.id) {
+        return Err(Error::invalid(format!(
+            "this transaction inserts into event table {:?}, so it cannot also query or delete its events: \
+             positions are assigned at commit",
+            s.name
+        )));
+    }
     let mut refs = Vec::new();
     if from < to {
         let (lo, hi) = (ev::partition_key(s.bucket(from)), ev::partition_key(s.bucket(to - 1)));

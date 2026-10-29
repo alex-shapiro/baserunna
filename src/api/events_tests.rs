@@ -374,3 +374,24 @@ fn null_consistency_reads_as_absent() {
         w.shutdown();
     });
 }
+
+/// A transaction that inserts events cannot also query or delete them,
+/// since their positions are assigned at commit; it fails without writing.
+#[test]
+fn a_transaction_cannot_read_events_it_inserts() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        let insert = json!({"op": "insert_events", "table": "ev", "rows": [{"event": "a", "time": 1000}]});
+        for second in [
+            json!({"op": "query_events", "table": "ev", "from": 0, "to": "2100-01-01", "aggregates": {"n": {"fn": "count"}}}),
+            json!({"op": "delete_events", "table": "ev", "where": {"col": "event", "op": "eq", "value": "a"}}),
+        ] {
+            let txn = json!({"ops": [insert, second]});
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/txn", &[], &txn.to_string()).await;
+            assert_eq!(s, 400, "{r}");
+            assert!(r["error"]["message"].as_str().unwrap_or("").contains("cannot also query or delete"), "{r}");
+        }
+        assert_eq!(count(&w, 0, &t).await, json!(0));
+        w.shutdown();
+    });
+}

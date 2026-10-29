@@ -900,7 +900,10 @@ output.
   rather than miss index maintenance.
 - Read-only transactions always succeed and are serialized at `read_version`.
 - Blind-write transactions never conflict, appends included.
-- Reads within a transaction see its own earlier writes, except appends.
+- Reads within a transaction see its own earlier writes, except appends and
+  inserted events: since events get their positions at commit, a
+  transaction that inserts into an event table cannot also query it or
+  delete from it (`400`).
 - Limits: `txn_max_ops` 10,000; `txn_max_write_bytes` 16 MiB, where blobs
   count only their descriptor; `txn_max_read_bytes` 16 MiB of keys and key
   ranges in the read set; 100,000 appended records; `txn_idle_timeout`

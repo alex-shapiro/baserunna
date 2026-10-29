@@ -1476,3 +1476,218 @@ fn merges_fetch_each_small_input_once() {
         assert_eq!(query(&db, &q).await.unwrap().rows, vec![vec![json!(80)]]);
     });
 }
+/// Maintenance whose transactions must fit the write limit, and merges that fail.
+mod maintenance_limits {
+    use super::*;
+
+    async fn table_id(db: &Arc<Db>) -> u32 {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        get_schema(&mut t, "events").await.unwrap().id
+    }
+
+    async fn part_count(db: &Arc<Db>) -> usize {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let id = get_schema(&mut t, "events").await.unwrap().id;
+        refs(&mut t, id).await.unwrap().len()
+    }
+
+    async fn part_objects(db: &Arc<Db>) -> usize {
+        let sh = db.shared();
+        let prefix = format!("dbs/{}/part/", db.id);
+        crate::store::list_all(&*sh.store, &prefix, &sh.retry).await.unwrap().len()
+    }
+
+    /// One single-row part in each of `days` day partitions ending yesterday,
+    /// sealed `per_seal` partitions at a time so that every seal fits.
+    async fn daily_parts(db: &Arc<Db>, days: i64, per_seal: i64) {
+        let id = table_id(db).await;
+        for chunk in (0..days).collect::<Vec<_>>().chunks(per_seal as usize) {
+            let rows: Vec<Json> =
+                chunk.iter().map(|d| json!({"time": T0 - (days + 1 - d) * DAY, "event": "a"})).collect();
+            txn_do(db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            assert!(maint::seal(db, id).await.unwrap());
+        }
+        assert_eq!(part_count(db).await, days as usize);
+    }
+
+    fn small_txns() -> EngineConfig {
+        EngineConfig { txn_max_write_bytes: 8 * 1024, ..cfg() }
+    }
+
+    /// Retention drops expired parts in transactions that fit the write
+    /// limit, however many parts have expired.
+    #[test]
+    fn retention_of_many_parts_fits_the_transaction_limit() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, small_txns());
+            let db = create_db(&eng, "d").await;
+            daily_parts(&db, 120, 10).await;
+            txn_do(&db, async |t| set_retention(t, "events", Some(DAY as u64)).await).await.unwrap();
+            let id = table_id(&db).await;
+            let mut errors = Vec::new();
+            for _ in 0..3 {
+                if let Err(e) = maint::maintain(&db, id, 64).await {
+                    errors.push(e.to_string());
+                }
+            }
+            assert_eq!((part_count(&db).await, errors), (0, Vec::<String>::new()), "expired parts remain");
+        });
+    }
+
+    /// Rows spanning more partitions than one transaction may reference are
+    /// sealed by several seals, and no seal leaves parts behind.
+    #[test]
+    fn sealing_rows_across_many_partitions_succeeds() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, small_txns());
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            let rows: Vec<Json> = (0..60).map(|d| json!({"time": T0 - (61 - d) * DAY, "event": "a"})).collect();
+            txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            let mut outcomes = Vec::new();
+            for _ in 0..10 {
+                let r = maint::seal(&db, id).await.map_err(|e| e.to_string());
+                outcomes.push(r.clone());
+                if r != Ok(true) {
+                    break;
+                }
+            }
+            let leaked = part_objects(&db).await;
+            assert_eq!(
+                (outcomes.last().cloned(), part_count(&db).await, leaked),
+                (Some(Ok(false)), 60, 60),
+                "attempts: {outcomes:?}; part objects in the store: {leaked}"
+            );
+        });
+    }
+
+    /// The same with the shipped limits: two transactions of 60,000 events,
+    /// one per hour over 14 years, committed before the next seal.
+    #[test]
+    fn sealing_a_large_hourly_backfill_succeeds_with_default_limits() {
+        rt().block_on(async {
+            let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = eng.db("d");
+            db.open(true).await.unwrap();
+            let mut def = table_def();
+            def.partition = schema::Granularity::Hour;
+            txn_do(&db, async |t| create(t, &def).await).await.unwrap();
+            let id = table_id(&db).await;
+            const HOUR: i64 = 3_600_000;
+            let n = 120_000i64;
+            for half in (0..n).collect::<Vec<_>>().chunks(n as usize / 2) {
+                let rows: Vec<Json> = half.iter().map(|h| json!({"time": T0 - (n - h) * HOUR, "event": "a"})).collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            }
+            let r = maint::seal(&db, id).await;
+            assert!(matches!(r, Ok(true)), "seal: {r:?}; part objects left in the store: {}", part_objects(&db).await);
+        });
+    }
+
+    /// A seal racing a drop and re-create of its table under the same name,
+    /// or a column drop, at every relative timing.
+    #[test]
+    fn seals_racing_drops_and_column_changes() {
+        for delay in [0u64, 10, 20, 30, 40, 50, 60, 80, 100, 150] {
+            for variant in 0..2 {
+                rt().block_on(async {
+                    let origin = tokio::time::Instant::now();
+                    let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
+                    let env2 = env.clone();
+                    let mem = Arc::new(crate::store::MemStore::new(Box::new(move || env2.now_ms())));
+                    let store = Arc::new(crate::sim::cost::MeteredStore::new(mem, 0));
+                    let eng = Engine::new(store.clone(), env.clone(), cfg(), "node-a".into());
+                    let db = create_db(&eng, "d").await;
+                    let old = table_id(&db).await;
+                    let rows: Vec<Json> =
+                        (0..20).map(|i| json!({"time": T0 - DAY + i * 3_600_000, "event": "a", "n": 3})).collect();
+                    txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+                    store.set_latency_ms(10);
+                    let racer = async {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        if variant == 0 {
+                            txn_do(&db, async |t| drop(t, "events").await).await.unwrap();
+                            txn_do(&db, async |t| create(t, &table_def()).await).await.unwrap();
+                            let new = [json!({"time": T0 - DAY, "event": "b", "n": 4})];
+                            txn_do(&db, async |t| insert(t, "events", &new, 0).await).await.unwrap();
+                        } else {
+                            txn_do(&db, async |t| drop_column(t, "events", "n").await).await.unwrap();
+                            let c: ColumnSpec = serde_json::from_value(
+                                json!({"name": "n", "type": "string", "nullable": false, "default": "z"}),
+                            )
+                            .unwrap();
+                            txn_do(&db, async |t| add_column(t, "events", &c).await).await.unwrap();
+                        }
+                    };
+                    let (sealed, _) = tokio::join!(maint::seal(&db, old), racer);
+                    if let Err(e) = &sealed {
+                        assert!(matches!(e, Error::Conflict(_) | Error::NotFound(_)), "seal: {e}");
+                    }
+                    let id = table_id(&db).await;
+                    while maint::seal(&db, id).await.unwrap() {}
+                    let q = json!({"from": 0, "to": T0 * 2, "group_by": ["event", "n"],
+                        "aggregates": {"c": {"fn": "count"}}});
+                    let got = query(&db, &q).await.unwrap().rows;
+                    let want = if variant == 0 {
+                        vec![vec![json!("b"), json!(4), json!(1)]]
+                    } else {
+                        vec![vec![json!("a"), json!("z"), json!(20)]]
+                    };
+                    assert_eq!(got, want, "delay {delay} variant {variant}, first seal {sealed:?}");
+                    let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                    let stale = refs(&mut t, old).await.unwrap();
+                    let live: u64 = refs(&mut t, id).await.unwrap().iter().map(|r| r.stored_bytes()).sum();
+                    if variant == 0 {
+                        assert!(stale.is_empty(), "delay {delay}: the dropped table kept {} refs", stale.len());
+                    }
+                    let st = super::state(&mut t, old).await.unwrap();
+                    if variant == 0 {
+                        assert_eq!(st.unsealed_rows, 0, "delay {delay}");
+                    }
+                    assert_eq!(db.current().unwrap().m.part_bytes, live, "delay {delay} variant {variant}");
+                });
+            }
+        }
+    }
+
+    /// A merge that outlives `event_merge_max_ms` is abandoned without
+    /// holding up the merges of the table's other partitions.
+    #[test]
+    fn a_merge_that_runs_too_long_does_not_block_other_partitions() {
+        rt().block_on(async {
+            let origin = tokio::time::Instant::now();
+            let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
+            let env2 = env.clone();
+            let mem = Arc::new(crate::store::MemStore::new(Box::new(move || env2.now_ms())));
+            let store = Arc::new(crate::sim::cost::MeteredStore::new(mem, 0));
+            let cfg = EngineConfig { event_merge_max_ms: 2_000, segment_whole_fetch_max: 0, ..cfg() };
+            let eng = Engine::new(store.clone(), env.clone(), cfg, "node-a".into());
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            // Partition A gets three parts of 250 rows (many granules, so a
+            // merge of about 2.5 s); partition B, a day later, three single-row
+            // parts (a merge of about 1.4 s).
+            for k in 0..3i64 {
+                let mut rows: Vec<Json> = (0..250)
+                    .map(|i| json!({"time": T0 - 10 * DAY + k * 1000 + i, "event": format!("e{i}"), "n": i}))
+                    .collect();
+                rows.push(json!({"time": T0 - 9 * DAY + k, "event": "b"}));
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+                assert!(maint::seal(&db, id).await.unwrap());
+            }
+            assert_eq!(part_count(&db).await, 6);
+            store.set_latency_ms(25);
+            let mut errors = Vec::new();
+            for _ in 0..3 {
+                let start = tokio::time::Instant::now();
+                let r = maint::maintain(&db, id, 8).await;
+                errors.push(format!("{:?} after {} ms", r.err(), start.elapsed().as_millis()));
+            }
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let b = ev::partition_key(T0 / DAY - 9);
+            let in_b = refs(&mut t, id).await.unwrap().iter().filter(|r| r.partition == b).count();
+            assert_eq!(in_b, 1, "partition B was never merged; maintenance: {errors:?}");
+        });
+    }
+}

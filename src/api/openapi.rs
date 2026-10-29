@@ -192,6 +192,63 @@ fn consistency() -> Vec<Value> {
     ]
 }
 
+/// An op that names its `target` (a table or stream) and takes the fields of
+/// the read request body schema `body`, except those the transaction sets.
+fn op_over(op: &str, target: &str, body: Value) -> Value {
+    let mut props = body["properties"].as_object().cloned().unwrap_or_default();
+    for k in ["consistency", "max_staleness_ms", "encoding"] {
+        props.remove(k);
+    }
+    props.insert("op".into(), json!({"const": op}));
+    props.insert(target.into(), s());
+    let mut required = vec![json!("op"), json!(target)];
+    required.extend(body["required"].as_array().into_iter().flatten().cloned());
+    json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
+}
+
+fn row_query() -> Value {
+    obj_desc(json!({
+        "index": s(), "eq": arr(any()),
+        "range": obj(json!({"gt": any(), "gte": any(), "lt": any(), "lte": any()}), &[]),
+        "filter": r("Filter"),
+        "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "reverse": b(), "cursor": s(),
+        "consistency": enum_of(&["strong", "snapshot"]),
+        "max_staleness_ms": i(),
+    }), &[], "Scans the primary key (default) or a secondary index (`index`) using an equality prefix (`eq`), \
+        an optional range bound on the next column, a residual `filter`, and pagination via `cursor`.")
+}
+
+fn stream_read() -> Value {
+    obj_desc(json!({
+        "from_seq": i(), "from_time": i(), "tail": i(), "consumer": s(), "until_seq": i(), "until_time": i(),
+        "reverse": b(), "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 16 << 20}, "filter": r("StreamFilter"),
+        "scan_limit": {"type": "integer", "minimum": 1, "maximum": 100_000},
+        "encoding": enum_of(&["utf8", "base64"]), "consistency": enum_of(&["strong", "snapshot"]),
+        "max_staleness_ms": i(),
+    }), &[], "Reads records starting from at most one of `from_seq`, `from_time` (first record at or after the timestamp), \
+        `tail` (last N records), or `consumer` (consumer cursor, starting at `first_seq` if unset), up to \
+        `until_seq` or `until_time` (exclusive). Returns records oldest-first (or newest-first when `reverse` is true), \
+        bounded by `limit` (default 100) and `max_bytes` (default 4 MiB, max 16 MiB). When `filter` is set, at most \
+        `scan_limit` records (default 10,000) are scanned.")
+}
+
+fn event_query() -> Value {
+    obj_desc(json!({
+        "from": r("Time"), "to": r("Time"), "where": r("EventFilter"), "lookups": {"type": "object"},
+        "columns": arr(any()), "group_by": arr(any()), "aggregates": {"type": "object"}, "then": {"type": "object"},
+        "order_by": arr(any()), "limit": i(), "cursor": s(),
+        "consistency": enum_of(&["strong", "snapshot"]), "max_staleness_ms": i(),
+    }), &["from", "to"], "A query over `[from, to)` of the time column: rows (`columns`, every column when \
+        omitted, with `order_by` and `cursor`, 100 per page by default) or aggregates (`group_by` and `aggregates`, \
+        with an optional second stage `then`). Expressions are a column name, `{col, path?}`, `{lookup}` or \
+        `{bucket, interval, offset?}`; aggregates are count, sum, min, max, avg, uniq, uniq_exact, quantiles, \
+        window_funnel and retention, each with an optional `where`. Aggregates answer with the first `limit` groups \
+        by `order_by`, or without a `limit` with every group, failing with 413 past 100,000. Queries read a \
+        snapshot at most 5 s old unless `consistency` is `strong`.")
+}
+
 fn schemas() -> Value {
     json!({
         "Error": obj(json!({
@@ -306,12 +363,10 @@ fn schemas() -> Value {
                     "ttl_ms": ttl(), "limit": {"type": "integer", "minimum": 1}}), &["op", "table", "where", "set"]),
                 obj(json!({"op": {"const": "delete_rows"}, "table": s(), "where": r("Selection"),
                     "limit": {"type": "integer", "minimum": 1}}), &["op", "table", "where"]),
-                {"type": "object", "properties": {"op": {"const": "query_rows"}, "table": s()},
-                 "required": ["op", "table"], "allOf": [r("Query")], "additionalProperties": true},
+                op_over("query_rows", "table", row_query()),
                 obj(json!({"op": {"const": "append"}, "stream": s(), "records": arr(r("NewRecord")),
                     "expect_seq": i(), "create": b()}), &["op", "stream", "records"]),
-                {"type": "object", "properties": {"op": {"const": "read_stream"}, "stream": s()},
-                 "required": ["op", "stream"], "allOf": [r("StreamRead")], "additionalProperties": true},
+                op_over("read_stream", "stream", stream_read()),
                 obj(json!({"op": {"const": "stream_info"}, "stream": s()}), &["op", "stream"]),
                 obj(json!({"op": {"const": "trim_stream"}, "stream": s(), "before_seq": i(), "before_time": i()}),
                     &["op", "stream"]),
@@ -321,8 +376,7 @@ fn schemas() -> Value {
                     &["op", "stream", "consumer", "seq"]),
                 obj(json!({"op": {"const": "insert_events"}, "table": s(), "rows": arr(json!({"type": "object"}))}),
                     &["op", "table", "rows"]),
-                {"type": "object", "properties": {"op": {"const": "query_events"}, "table": s()},
-                 "required": ["op", "table"], "allOf": [r("EventQuery")], "additionalProperties": true},
+                op_over("query_events", "table", event_query()),
                 obj(json!({"op": {"const": "delete_events"}, "table": s(), "from": r("Time"), "to": r("Time"),
                     "where": r("EventFilter")}), &["op", "table", "where"]),
             ],
@@ -402,17 +456,7 @@ fn schemas() -> Value {
             &["count", "version", "time", "commit_id", "replayed"]),
         "EventFilter": {"type": "object", "description": "A filter (SPEC §4.7) whose comparisons name a column \
             (`col`), a JSON path (`col` and `path`, an array of keys), a lookup (`lookup`), or a time bucket."},
-        "EventQuery": {"type": "object", "required": ["from", "to"], "additionalProperties": false,
-            "properties": {"from": r("Time"), "to": r("Time"), "where": r("EventFilter"), "lookups": {"type": "object"},
-                "columns": arr(any()), "group_by": arr(any()), "aggregates": {"type": "object"}, "then": {"type": "object"},
-                "order_by": arr(any()), "limit": i(), "cursor": s(),
-                "consistency": enum_of(&["strong", "snapshot"]), "max_staleness_ms": i()},
-            "description": "A query over `[from, to)` of the time column: rows (`columns`, every column when \
-            omitted, with `order_by` and `cursor`, 100 per page by default) or aggregates (`group_by` and `aggregates`, with an optional second stage `then`). Expressions \
-            are a column name, `{col, path?}`, `{lookup}` or `{bucket, interval, offset?}`; aggregates are count, sum, \
-            min, max, avg, uniq, uniq_exact, quantiles, window_funnel and retention, each with an optional `where`. \
-            Aggregates answer with the first `limit` groups by `order_by`, or without a `limit` with every group, \
-            failing with 413 past 100,000. Queries read a snapshot at most 5 s old unless `consistency` is `strong`."},
+        "EventQuery": event_query(),
         "EventQueryStats": obj(json!({"source": s(), "nodes": i(), "parts": i(), "parts_read": i(), "granules": i(),
             "granules_read": i(), "rows_read": i(), "unsealed_rows": i(), "bytes_read": i(), "store_gets": i()}),
             &["source", "nodes", "parts", "parts_read", "granules", "granules_read", "rows_read", "unsealed_rows",
@@ -438,16 +482,7 @@ fn schemas() -> Value {
                 `blob_id` on write and return `BlobMeta` on read."},
         "Filter": filter_schema("Filter", vec![comparison("col", s())],
             "Row filter expression composed of `and`, `or`, `not`, or a comparison on column `col`."),
-        "Query": obj_desc(json!({
-            "index": s(), "eq": arr(any()),
-            "range": obj(json!({"gt": any(), "gte": any(), "lt": any(), "lte": any()}), &[]),
-            "filter": r("Filter"),
-            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-            "reverse": b(), "cursor": s(),
-            "consistency": enum_of(&["strong", "snapshot"]),
-            "max_staleness_ms": i(),
-        }), &[], "Scans the primary key (default) or a secondary index (`index`) using an equality prefix (`eq`), \
-            an optional range bound on the next column, a residual `filter`, and pagination via `cursor`."),
+        "Query": row_query(),
         "Selection": obj_desc(json!({
             "index": s(), "eq": arr(any()),
             "range": obj(json!({"gt": any(), "gte": any(), "lt": any(), "lte": any()}), &[]),
@@ -527,18 +562,7 @@ fn schemas() -> Value {
         ], "Stream record filter composed of `and`, `or`, `not`, a comparison on a JSON body `field` (dot-separated \
             path where numeric segments index arrays) or `header`, or a `{ \"op\": \"contains\", \"value\": \"...\" }` \
             substring match on the raw record body."),
-        "StreamRead": obj_desc(json!({
-            "from_seq": i(), "from_time": i(), "tail": i(), "consumer": s(), "until_seq": i(), "until_time": i(),
-            "reverse": b(), "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 16 << 20}, "filter": r("StreamFilter"),
-            "scan_limit": {"type": "integer", "minimum": 1, "maximum": 100_000},
-            "encoding": enum_of(&["utf8", "base64"]), "consistency": enum_of(&["strong", "snapshot"]),
-            "max_staleness_ms": i(),
-        }), &[], "Reads records starting from at most one of `from_seq`, `from_time` (first record at or after the timestamp), \
-            `tail` (last N records), or `consumer` (consumer cursor, starting at `first_seq` if unset), up to \
-            `until_seq` or `until_time` (exclusive). Returns records oldest-first (or newest-first when `reverse` is true), \
-            bounded by `limit` (default 100) and `max_bytes` (default 4 MiB, max 16 MiB). When `filter` is set, at most \
-            `scan_limit` records (default 10,000) are scanned."),
+        "StreamRead": stream_read(),
         "StreamRecords": obj_desc(json!({
             "records": arr(r("StreamRecord")), "next_seq": i(), "first_seq": i(), "tail_seq": i(), "done": b(),
             "version": i(),

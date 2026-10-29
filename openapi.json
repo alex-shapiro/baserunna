@@ -1998,15 +1998,42 @@
             "type": "object"
           },
           {
-            "additionalProperties": true,
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/Query"
-              }
-            ],
+            "additionalProperties": false,
             "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "eq": {
+                "items": {},
+                "type": "array"
+              },
+              "filter": {
+                "$ref": "#/components/schemas/Filter"
+              },
+              "index": {
+                "type": "string"
+              },
+              "limit": {
+                "maximum": 1000,
+                "minimum": 1,
+                "type": "integer"
+              },
               "op": {
                 "const": "query_rows"
+              },
+              "range": {
+                "additionalProperties": false,
+                "properties": {
+                  "gt": {},
+                  "gte": {},
+                  "lt": {},
+                  "lte": {}
+                },
+                "required": [],
+                "type": "object"
+              },
+              "reverse": {
+                "type": "boolean"
               },
               "table": {
                 "type": "string"
@@ -2048,18 +2075,52 @@
             "type": "object"
           },
           {
-            "additionalProperties": true,
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/StreamRead"
-              }
-            ],
+            "additionalProperties": false,
             "properties": {
+              "consumer": {
+                "type": "string"
+              },
+              "filter": {
+                "$ref": "#/components/schemas/StreamFilter"
+              },
+              "from_seq": {
+                "type": "integer"
+              },
+              "from_time": {
+                "type": "integer"
+              },
+              "limit": {
+                "maximum": 1000,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "max_bytes": {
+                "maximum": 16777216,
+                "minimum": 1,
+                "type": "integer"
+              },
               "op": {
                 "const": "read_stream"
               },
+              "reverse": {
+                "type": "boolean"
+              },
+              "scan_limit": {
+                "maximum": 100000,
+                "minimum": 1,
+                "type": "integer"
+              },
               "stream": {
                 "type": "string"
+              },
+              "tail": {
+                "type": "integer"
+              },
+              "until_seq": {
+                "type": "integer"
+              },
+              "until_time": {
+                "type": "integer"
               }
             },
             "required": [
@@ -2174,23 +2235,56 @@
             "type": "object"
           },
           {
-            "additionalProperties": true,
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/EventQuery"
-              }
-            ],
+            "additionalProperties": false,
             "properties": {
+              "aggregates": {
+                "type": "object"
+              },
+              "columns": {
+                "items": {},
+                "type": "array"
+              },
+              "cursor": {
+                "type": "string"
+              },
+              "from": {
+                "$ref": "#/components/schemas/Time"
+              },
+              "group_by": {
+                "items": {},
+                "type": "array"
+              },
+              "limit": {
+                "type": "integer"
+              },
+              "lookups": {
+                "type": "object"
+              },
               "op": {
                 "const": "query_events"
               },
+              "order_by": {
+                "items": {},
+                "type": "array"
+              },
               "table": {
                 "type": "string"
+              },
+              "then": {
+                "type": "object"
+              },
+              "to": {
+                "$ref": "#/components/schemas/Time"
+              },
+              "where": {
+                "$ref": "#/components/schemas/EventFilter"
               }
             },
             "required": [
               "op",
-              "table"
+              "table",
+              "from",
+              "to"
             ],
             "type": "object"
           },

@@ -135,3 +135,57 @@ fn validator_catches_drift() {
     assert_eq!(match_path(doc(), "/v1/dbs/a/tables/t/rows/get").unwrap().0, "/v1/dbs/{db}/tables/{t}/rows/get");
     assert!(validate(doc(), &json!({"type": "integer"}), &json!(1.5), "$").is_err());
 }
+
+/// Every op kind, with every field the server accepts, validates against the
+/// documented `Op` schema, and fields the server refuses do not.
+#[test]
+fn op_schema_matches_the_ops_the_server_accepts() {
+    let f = json!({"col": "a", "op": "eq", "value": 1});
+    let accepted = [
+        json!({"op": "get", "key": "k"}),
+        json!({"op": "scan", "prefix": "p", "start": "a", "end": "z", "limit": 10, "reverse": true,
+            "keys_only": true, "cursor": "c"}),
+        json!({"op": "put", "key": "k", "value": "v", "ttl_ms": 1}),
+        json!({"op": "delete", "key": "k"}),
+        json!({"op": "copy", "from": "a", "to": "b", "ttl_ms": 1}),
+        json!({"op": "delete_range", "prefix": "p"}),
+        json!({"op": "check", "key": "k", "exists": true, "version": 1, "value": "v"}),
+        json!({"op": "increment", "key": "k", "by": 2, "ttl_ms": 1}),
+        json!({"op": "get_row", "table": "t", "pk": 1}),
+        json!({"op": "insert_row", "table": "t", "row": {"a": 1}, "ttl_ms": 1}),
+        json!({"op": "upsert_row", "table": "t", "row": {"a": 1}}),
+        json!({"op": "update_row", "table": "t", "pk": 1, "set": {"a": 2}}),
+        json!({"op": "delete_row", "table": "t", "pk": 1}),
+        json!({"op": "update_rows", "table": "t", "where": {"filter": f}, "set": {"a": 2}, "limit": 5}),
+        json!({"op": "delete_rows", "table": "t", "where": {}, "limit": 5}),
+        json!({"op": "query_rows", "table": "t", "index": "i", "eq": [1], "range": {"gt": 1}, "filter": f,
+            "limit": 10, "reverse": true, "cursor": "c"}),
+        json!({"op": "append", "stream": "s", "records": [{"value": "x"}], "expect_seq": 1, "create": true}),
+        json!({"op": "read_stream", "stream": "s", "from_seq": 1, "until_seq": 9, "reverse": false, "limit": 5,
+            "max_bytes": 100, "filter": {"field": "a", "op": "eq", "value": 1}, "scan_limit": 10}),
+        json!({"op": "stream_info", "stream": "s"}),
+        json!({"op": "trim_stream", "stream": "s", "before_seq": 3}),
+        json!({"op": "get_consumer", "stream": "s", "consumer": "c"}),
+        json!({"op": "set_consumer", "stream": "s", "consumer": "c", "seq": 1}),
+        json!({"op": "insert_events", "table": "e", "rows": [{"time": 1}]}),
+        json!({"op": "query_events", "table": "e", "from": 0, "to": "2026-01-01T00:00:00Z", "where": f,
+            "group_by": ["a"], "aggregates": {"n": {"fn": "count"}}, "order_by": ["n"], "limit": 5}),
+        json!({"op": "query_events", "table": "e", "from": 0, "to": 1, "columns": ["a"], "cursor": "c"}),
+        json!({"op": "delete_events", "table": "e", "from": 0, "to": 1, "where": f}),
+    ];
+    let refused = [
+        json!({"op": "query_rows", "table": "t", "consistency": "strong"}),
+        json!({"op": "read_stream", "stream": "s", "encoding": "base64"}),
+        json!({"op": "query_events", "table": "e", "from": 0, "to": 1, "consistency": "strong"}),
+        json!({"op": "query_events", "table": "e", "from": 0, "to": 1, "nope": 1}),
+    ];
+    let schema = json!({"$ref": "#/components/schemas/Op"});
+    for op in accepted {
+        serde_json::from_value::<baserunna::ops::Op>(op.clone()).unwrap_or_else(|e| panic!("server refuses {op}: {e}"));
+        validate(doc(), &schema, &op, "$").unwrap_or_else(|e| panic!("schema refuses {op}: {e}"));
+    }
+    for op in refused {
+        assert!(serde_json::from_value::<baserunna::ops::Op>(op.clone()).is_err(), "server accepts {op}");
+        assert!(validate(doc(), &schema, &op, "$").is_err(), "schema accepts {op}");
+    }
+}

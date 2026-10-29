@@ -418,15 +418,9 @@ pub struct Query {
     pub limited: bool,
 }
 
-/// Keys of a query body that the HTTP layer reads rather than the query.
-pub const TRANSPORT_KEYS: [&str; 2] = ["consistency", "max_staleness_ms"];
-
 impl Query {
     pub fn parse(v: Json) -> Result<Query> {
         let Json::Object(mut o) = v else { return Err(Error::invalid("a query is a JSON object")) };
-        for k in TRANSPORT_KEYS {
-            o.remove(k);
-        }
         let time = |o: &mut Map<String, Json>, k: &str| -> Result<i64> {
             match o.remove(k) {
                 Some(Json::String(s)) => super::schema::parse_rfc3339(&s)

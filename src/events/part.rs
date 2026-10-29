@@ -1483,6 +1483,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// Stores `stream` in chunks of `chunk_bytes` as a part whose reference
+    /// gives `rows` and the metadata's offset and length `meta_at`.
+    async fn store_part(
+        db: &crate::engine::Db,
+        stream: &[u8],
+        chunk_bytes: u64,
+        rows: u64,
+        meta_at: (u64, u64),
+    ) -> PartRef {
+        let shared = db.shared();
+        let id = new_part_id(shared);
+        for (ci, chunk) in stream.chunks(chunk_bytes as usize).enumerate() {
+            let key = crate::engine::part_chunk_key(&db.id, &id, ci as u64);
+            shared.store.put(&key, Bytes::copy_from_slice(chunk), PutMode::Overwrite).await.unwrap();
+        }
+        PartRef {
+            id,
+            table: 1,
+            partition: 0,
+            chunk_bytes,
+            size: stream.len() as u64,
+            raw_size: rows,
+            rows,
+            level: 0,
+            meta_off: meta_at.0,
+            meta_len: meta_at.1,
+            min_time: 0,
+            max_time: 0,
+            arrived_ms: 0,
+            version: None,
+            min_version: 0,
+            max_version: 0,
+            deleted: 0,
+            mask: None,
+        }
+    }
+
     /// Stores a two-granule part whose only column (ordinals) has the
     /// given blocks in its index, and reads the column back.
     fn read_with_blocks(blocks: impl Fn(&[(u64, u64)]) -> Vec<BlockLoc>) -> Result<Vector> {
@@ -1509,31 +1546,9 @@ pub(crate) mod tests {
             meta.cols[0].index_len = index.len() as u64;
             stream.extend_from_slice(&index);
             let meta = meta.encode().unwrap();
-            let meta_off = stream.len() as u64;
+            let meta_at = (stream.len() as u64, meta.len() as u64);
             stream.extend_from_slice(&meta);
-            let id = new_part_id(shared);
-            let key = crate::engine::part_chunk_key(&db.id, &id, 0);
-            shared.store.put(&key, Bytes::from(stream.clone()), PutMode::Overwrite).await.unwrap();
-            let r = PartRef {
-                id,
-                table: 1,
-                partition: 0,
-                chunk_bytes: 1 << 20,
-                size: stream.len() as u64,
-                raw_size: 2,
-                rows: 2,
-                level: 0,
-                meta_off,
-                meta_len: meta.len() as u64,
-                min_time: 0,
-                max_time: 0,
-                arrived_ms: 0,
-                version: Some(1),
-                min_version: 0,
-                max_version: 0,
-                deleted: 0,
-                mask: None,
-            };
+            let r = store_part(&db, &stream, 1 << 20, 2, meta_at).await;
             let stats = ReadStats::default();
             let rd = Reading { shared, db: &db.id, cache: Caching::Shared, stats: &stats };
             let m = rd.meta(&r).await?;
@@ -1569,6 +1584,291 @@ pub(crate) mod tests {
             })
         });
         assert!(matches!(v, Ok(Err(_))), "{v:?}");
+    }
+
+    /// Rows supplied from whole columns.
+    struct Columns {
+        plans: Vec<ColPlan>,
+        cols: Vec<Vector>,
+    }
+
+    impl Source for Columns {
+        fn rows(&self) -> u64 {
+            self.cols[0].len() as u64
+        }
+
+        fn row_bytes(&self, _: u64) -> u64 {
+            64
+        }
+
+        fn key_at(&self, i: u64) -> Bytes {
+            Bytes::copy_from_slice(&i.to_be_bytes())
+        }
+
+        fn plans(&self) -> &[ColPlan] {
+            &self.plans
+        }
+
+        fn shared_paths(&self) -> BTreeMap<u32, Vec<SharedPath>> {
+            BTreeMap::from([(4, vec![SharedPath { key: r#"["y"]"#.into(), count: 3, ty: JType::Dyn }])])
+        }
+
+        fn partial_paths(&self) -> BTreeSet<u32> {
+            BTreeSet::from([4])
+        }
+
+        async fn column(&mut self, plan: usize, rows: Range<u64>) -> Result<Vector> {
+            Ok(self.cols[plan].slice(rows.start as usize..rows.end as usize))
+        }
+    }
+
+    /// `n` rows of a column of every type and encoding.
+    fn sample_columns(r: &mut Rng, n: usize) -> Columns {
+        let words: Vec<String> = (0..5).map(|i| format!("w{i}é")).collect();
+        let pick = |r: &mut Rng| r.chance(0.8).then(|| words[r.usize(words.len())].as_str());
+        let plan = |cref, phys, dict, bloom| ColPlan { cref, phys, json: false, dict, bloom };
+        let path = ColRef::Path { col: 4, key: r#"["x"]"#.into() };
+        Columns {
+            plans: vec![
+                plan(ColRef::Ordinal, Phys::Int, None, false),
+                plan(ColRef::Version, Phys::Int, None, false),
+                plan(ColRef::User(1), Phys::Float, None, true),
+                plan(ColRef::User(2), Phys::Bool, None, false),
+                plan(ColRef::User(3), Phys::Str, Some(Arc::new(words.clone())), true),
+                ColPlan { cref: path, phys: Phys::Str, json: true, dict: None, bloom: false },
+            ],
+            cols: vec![
+                Vector::Int((0..n).map(|i| r.chance(0.9).then_some(i as i64 * 3)).collect()),
+                Vector::Int(vec![Some(7); n]),
+                Vector::Float((0..n).map(|_| r.chance(0.8).then(|| r.unit())).collect()),
+                Vector::Bool((0..n).map(|_| r.chance(0.8).then(|| r.chance(0.5))).collect()),
+                Vector::Str(Strs::from_values((0..n).map(|_| pick(r)))),
+                Vector::Str(Strs::from_values((0..n).map(|_| pick(r)))),
+            ],
+        }
+    }
+
+    /// A value at or beside an edge: zero, the largest, around `near`, or random.
+    fn edge(r: &mut Rng, near: u64) -> u64 {
+        match r.usize(6) {
+            0 => 0,
+            1 => u64::MAX - r.below(4),
+            2 => near.saturating_sub(r.below(4)),
+            3 => near.saturating_add(r.below(4)),
+            4 => r.below(near.max(1).saturating_mul(2)),
+            _ => r.next_u64(),
+        }
+    }
+
+    /// Overwrites, inserts, removes or truncates a few bytes of `b`.
+    fn mutate_bytes(r: &mut Rng, b: &mut Vec<u8>) {
+        for _ in 0..1 + r.usize(4) {
+            let at = r.usize(b.len() + 1);
+            let byte = r.next_u32() as u8;
+            match r.usize(4) {
+                0 if at < b.len() => b[at] = *r.pick(&[0, 1, 0x7f, 0x80, 0xff, byte]),
+                1 => b.insert(at, byte),
+                2 if at < b.len() => drop(b.remove(at)),
+                _ => b.truncate(at),
+            }
+        }
+    }
+
+    /// Changes one field of part metadata.
+    fn mutate_meta(r: &mut Rng, m: &mut PartMeta, size: u64) {
+        let n = m.granules.len();
+        let c = r.usize(m.cols.len());
+        match r.usize(8) {
+            0 => m.granules[r.usize(n)] = edge(r, 16) as u32,
+            1 => {
+                // Moves rows between granules, keeping the part's row count.
+                let (a, b) = (r.usize(n), r.usize(n));
+                let k = r.below(m.granules[a] as u64) as u32;
+                m.granules[a] -= k;
+                m.granules[b] += k;
+            }
+            2 if r.chance(0.5) => drop(m.granules.pop()),
+            2 => m.granules.push(16),
+            3 => m.pk[r.usize(n + 1)] = Bytes::from(vec![7; PK_KEY_MAX + r.usize(2)]),
+            4 => {
+                let col = &mut m.cols[c];
+                let field = [&mut col.index_off, &mut col.index_len, &mut col.data_off, &mut col.data_len];
+                let f = r.usize(4);
+                *field[f] = edge(r, size);
+            }
+            5 => m.cols[c].phys = *r.pick(&[Phys::Int, Phys::Float, Phys::Bool, Phys::Str]),
+            6 => m.cols[c].nonnull = edge(r, m.rows),
+            _ if r.chance(0.5) => drop(m.cols.pop()),
+            _ => m.cols.push(m.cols[c].clone()),
+        }
+    }
+
+    /// Changes one field of a column index.
+    fn mutate_index(r: &mut Rng, idx: &mut ColIndex, size: u64) {
+        let (nb, g) = (idx.blocks.len(), r.usize(idx.stats.len()));
+        let b = r.usize(nb);
+        match r.usize(8) {
+            0 => idx.blocks.clear(),
+            1 => drop(idx.blocks.remove(b)),
+            2 => idx.blocks.swap(b, r.usize(nb)),
+            3 => idx.blocks.insert(b, idx.blocks[b]),
+            4 => idx.blocks[b].off = edge(r, size),
+            5 => idx.blocks[b].len = edge(r, size),
+            6 => idx.blocks[b].first_granule = edge(r, 4) as u32,
+            _ => match r.usize(7) {
+                0 => drop(idx.stats.pop()),
+                1 => idx.stats.push(idx.stats[0].clone()),
+                2 => drop(idx.blooms.pop()),
+                3 => idx.blooms.push(Bloom::new(1, 10)),
+                4 => idx.stats[g].nulls = edge(r, 16) as u32,
+                5 => idx.dict = None,
+                _ => idx.dict = Some(Arc::new(vec!["z".into()])),
+            },
+        }
+    }
+
+    /// A corrupt copy of a part's stream, with the rows and the metadata's
+    /// offset and length its reference gives.
+    fn corrupt(
+        r: &mut Rng,
+        stream: &[u8],
+        meta: &PartMeta,
+        meta_at: (u64, u64),
+        indexes: &[ColIndex],
+    ) -> (Vec<u8>, u64, (u64, u64)) {
+        let mut s = stream.to_vec();
+        let size = s.len() as u64;
+        let mut m = meta.clone();
+        let ci = r.usize(m.cols.len());
+        let phys = m.cols[ci].phys;
+        let mut idx = indexes[ci].clone();
+        let mut index = None;
+        let mut meta_bytes = None;
+        let mut reference = None;
+        match r.usize(6) {
+            0 => mutate_meta(r, &mut m, size),
+            1 => {
+                mutate_index(r, &mut idx, size);
+                index = Some(idx.encode(phys).unwrap());
+            }
+            2 => {
+                let mut raw = unframe(&Bytes::from(idx.encode(phys).unwrap())).unwrap().to_vec();
+                mutate_bytes(r, &mut raw);
+                index = Some(framed(&raw, Compression::Zstd(1), "").unwrap());
+            }
+            3 => {
+                let mut raw = unframe(&Bytes::from(m.encode().unwrap())).unwrap().to_vec();
+                mutate_bytes(r, &mut raw);
+                meta_bytes = Some(framed(&raw, Compression::Zstd(1), "").unwrap());
+            }
+            4 => {
+                // Moves the column's blocks from `bi` on to the end of the
+                // stream, corrupting block `bi`'s values under a valid frame.
+                let bi = r.usize(idx.blocks.len());
+                for (i, loc) in idx.blocks.iter_mut().enumerate().skip(bi) {
+                    let mut block = s[loc.off as usize..(loc.off + loc.len) as usize].to_vec();
+                    if i == bi {
+                        let mut raw = unframe(&Bytes::from(block)).unwrap().to_vec();
+                        mutate_bytes(r, &mut raw);
+                        block = framed(&raw, Compression::Zstd(1), "").unwrap();
+                    }
+                    (loc.off, loc.len) = (s.len() as u64, block.len() as u64);
+                    s.extend_from_slice(&block);
+                }
+                (m.cols[ci].data_off, m.cols[ci].data_len) = (0, s.len() as u64);
+                index = Some(idx.encode(phys).unwrap());
+            }
+            _ => {
+                let mut fields = [meta.rows, meta_at.0, meta_at.1];
+                let f = r.usize(3);
+                fields[f] = edge(r, fields[f]);
+                reference = Some(fields);
+            }
+        }
+        if let Some(index) = index {
+            (m.cols[ci].index_off, m.cols[ci].index_len) = (s.len() as u64, index.len() as u64);
+            s.extend_from_slice(&index);
+        }
+        let meta_bytes = meta_bytes.or_else(|| m.encode().ok()).unwrap_or_default();
+        let mut at = (s.len() as u64, meta_bytes.len() as u64);
+        s.extend_from_slice(&meta_bytes);
+        let mut rows = meta.rows;
+        if let Some([n, off, len]) = reference {
+            (rows, at) = (n, (off, len));
+        }
+        (s, rows, at)
+    }
+
+    /// Reads of real parts whose metadata, column indexes or blocks are
+    /// corrupted, by changing a field and encoding it again or by changing
+    /// payload bytes under a valid frame, return an error or the rows they
+    /// asked for, and never panic.
+    #[test]
+    fn corrupt_parts_are_refused_without_panicking() {
+        use crate::engine::tests::{engine, rt};
+        let rt = rt();
+        let (_eng, db) = rt.block_on(async {
+            let (eng, _store, _env) = engine(1, crate::engine::EngineConfig::small_for_tests());
+            let db = eng.db("d");
+            db.open(true).await.unwrap();
+            (eng, db)
+        });
+        let shared = db.shared();
+        let mut src = sample_columns(&mut Rng::new(5), 150);
+        let (stream, r0) = rt.block_on(async {
+            let mut sink = Sink::new(shared, &db.id, new_part_id(shared));
+            let w = write(&mut sink, &mut src, 1, vec![]).await.unwrap();
+            let mut stream = Vec::new();
+            for ci in 0..w.size.div_ceil(w.chunk_bytes) {
+                let key = crate::engine::part_chunk_key(&db.id, &sink.id, ci);
+                stream.extend_from_slice(&shared.store.get(&key, GetOpts::default()).await.unwrap().data);
+            }
+            let r0 = store_part(&db, &stream, w.chunk_bytes, w.rows, (w.meta_off, w.meta_len)).await;
+            (stream, r0)
+        });
+        let (meta, _) = inspect(&Bytes::from(stream.clone()), &r0).unwrap();
+        assert!(meta.granule_count() > 4 && meta.cols.len() == src.cols.len(), "{meta:?}");
+        let indexes: Vec<ColIndex> = meta
+            .cols
+            .iter()
+            .map(|c| {
+                let b = Bytes::copy_from_slice(&stream[c.index_off as usize..(c.index_off + c.index_len) as usize]);
+                ColIndex::decode(&b, &meta, c).unwrap()
+            })
+            .collect();
+        assert!(indexes.iter().any(|i| i.blocks.len() > 2), "{indexes:?}");
+        crate::util::prop::check(
+            "corrupt_parts_are_refused_without_panicking",
+            3000,
+            |r| r.next_u64(),
+            |_| Vec::new(),
+            |seed| {
+                let mut r = Rng::new(*seed);
+                let (s, rows, meta_at) = corrupt(&mut r, &stream, &meta, (r0.meta_off, r0.meta_len), &indexes);
+                let chunk_bytes = *r.pick(&[256, 1 << 20]);
+                let memo = Memo::default();
+                let stats = ReadStats::default();
+                let cache = if r.chance(0.5) { Caching::Shared } else { Caching::Private(&memo) };
+                let rd = Reading { shared, db: &db.id, cache, stats: &stats };
+                rt.block_on(async {
+                    let pr = store_part(&db, &s, chunk_bytes, rows, meta_at).await;
+                    let _ = inspect(&Bytes::from(s), &pr);
+                    let Ok(m) = rd.meta(&pr).await else { return Ok(()) };
+                    for ci in 0..m.cols.len() {
+                        let n = m.granule_count();
+                        let first = r.usize(n);
+                        let g = first..first + 1 + r.usize(n - first);
+                        if let Ok(v) = rd.column(&pr, &m, ci, g.clone()).await {
+                            let want = m.rows_of(g.clone());
+                            if v.len() as u64 != want.end - want.start || v.phys() != m.cols[ci].phys {
+                                return Err(format!("column {ci} granules {g:?} read {} rows", v.len()));
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+            },
+        );
     }
 
     #[test]

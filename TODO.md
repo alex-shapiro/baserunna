@@ -116,6 +116,17 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 - [ ] **Treat `query_events` in transactions like event queries.** The op
       takes no query slot, gets no deadline extension, and drops a
       `consistency` it is given.
+- [ ] **Store bind slot rows sparsely and cap partitions per insert.** Each
+      staged part carries a `Runs` per slot of its bind (`StagedPart::
+      slot_rows`), so a bind's encoding and the committer's work grow with
+      slots × parts (1,501 slots × 1,502 parts encode to 2.4 MB), and one
+      bulk insert may span any number of partitions, staged one `PUT` at a
+      time even after every slot's deadline has passed.
+- [ ] **Re-check part references when a sweep's obsolete parts install.**
+      The sweep's safety for parts, as for blobs, rests on the stage-TTL
+      margin alone; a bind whose manifest `PUT` lands more than
+      `4 × clock_sync_max_error_ms` after its attempt began could see its
+      part collected. Skip parts referenced at install time.
 - [ ] **Re-resolve database names for strong event queries.** An event
       query checks that its database exists at a snapshot 5 s old whatever
       `consistency` its body asks for, so a strong query on a node that

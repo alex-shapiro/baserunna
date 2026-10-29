@@ -829,9 +829,11 @@ Each node buffers bulk inserts per event table for up to 200 ms or 16 MiB,
 writes the buffered events as staged parts directly to the store, and sends
 the lease holder one bind (`/internal/v1/events/bind`) listing each
 request's parts. The committer installs every request's parts in one
-manifest write at one version, with a commit record per request; a request
-that fails validation (a dropped table, the quota, a replayed key) gets a
-mask over its rows instead of failing its neighbours. A bulk insert thus
+manifest write at one version, with a commit record per request. A request
+refused on its own (a replayed or aborted key, a passed deadline) gets a
+mask over its rows instead of failing its neighbours; since requests share
+parts, what refuses the parts (a dropped table, the quota, an expired
+stage) refuses every request of the bind. A bulk insert thus
 costs one part `PUT` per partition plus a share of one manifest write, and
 its rows never pass through the LSM tree.
 

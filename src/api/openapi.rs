@@ -467,7 +467,8 @@ fn schemas() -> Value {
         "EventsInserted": obj(json!({"count": i(), "version": i(), "time": i(), "commit_id": s(), "replayed": b()}),
             &["count", "version", "time", "commit_id", "replayed"]),
         "EventFilter": {"type": "object", "description": "A filter (SPEC §4.7) whose comparisons name a column \
-            (`col`), a JSON path (`col` and `path`, an array of keys), a lookup (`lookup`), or a time bucket."},
+            (`col`), a JSON column's path (`col` and `path`, an array of keys naming a leaf), a lookup \
+            (`lookup`), or a time bucket."},
         "EventQuery": event_query(),
         "EventQueryStats": obj(json!({"source": s(), "nodes": i(), "parts": i(), "parts_read": i(), "granules": i(),
             "granules_read": i(), "rows_read": i(), "unsealed_rows": i(), "bytes_read": i(), "store_gets": i()}),

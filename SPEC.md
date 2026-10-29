@@ -338,7 +338,8 @@ two of these forms in one object, makes the request `400`.
   numbers by their exact values (`1` equals `1.0`, and `2^53 + 1` does not
   equal `2^53` as a float), strings by their bytes and booleans with false
   first; arrays and objects only equal. A comparison across types is false.
-  A float column refuses an integer argument that no float equals.
+  A row table's float column refuses an integer argument that no float
+  equals; an event table's compares with it exactly.
 - **Limits**: a filter nests at most 16 deep and has at most 256 terms.
 
 ### 4.8 Event tables
@@ -375,7 +376,7 @@ events to row tables.
   JSON integers outside the signed 64-bit range are refused, since queries
   could not compare them exactly.
 - **Queries** read `[from, to)` of the time column, with an optional
-  filter (§4.7, where a column operand may carry a JSON `path`), and answer
+  filter (§4.7, where a JSON column is compared by `path`), and answer
   with rows or aggregates. Answers never depend on how events are stored
   or merged: aggregates keep mergeable states, and sums of floats are exact.
   - *Expressions* name a column (`"user"`), a JSON path
@@ -384,6 +385,8 @@ events to row tables.
     "offset": "-05:00"}`); any of them takes `as` to name its output.
     Buckets are seconds, minutes, hours or days counted from the epoch (so
     `7d` starts on Thursdays), weeks starting Monday, or calendar months.
+    A JSON path names a leaf: a scalar, an array or an empty object. A path
+    to an inner object reads as missing, as ClickHouse's JSON paths do.
   - *Rows* (`columns`, every column when omitted) come by time, or by the
     query's `order_by` of output names, 100 per page by default and up to
     10,000, with a `cursor` to resume.

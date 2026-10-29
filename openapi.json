@@ -784,7 +784,7 @@
         "type": "object"
       },
       "EventFilter": {
-        "description": "A filter (SPEC §4.7) whose comparisons name a column (`col`), a JSON path (`col` and `path`, an array of keys), a lookup (`lookup`), or a time bucket.",
+        "description": "A filter (SPEC §4.7) whose comparisons name a column (`col`), a JSON column's path (`col` and `path`, an array of keys naming a leaf), a lookup (`lookup`), or a time bucket.",
         "type": "object"
       },
       "EventInsert": {

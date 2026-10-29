@@ -196,10 +196,11 @@ fn typed_arg(c: &EvColumn, a: &Json) -> Result<Json> {
 }
 
 fn num_order(a: &Val, b: &Json) -> Option<Ordering> {
-    match (a, b.as_i64()) {
-        (Val::Int(x), Some(y)) => Some(x.cmp(&y)),
-        _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
-    }
+    let b = match b.as_i64() {
+        Some(i) => Val::Int(i),
+        None => Val::Float(b.as_f64()?),
+    };
+    a.num_cmp(&b)
 }
 
 /// Values compare as JSON: numbers by value, strings by bytes, booleans with
@@ -547,6 +548,8 @@ struct Plan<'a> {
     first: BTreeSet<Need>,
     rest: BTreeSet<Need>,
     positions: bool,
+    /// When the query stops, and its time limit.
+    deadline: Option<(tokio::time::Instant, u64)>,
 }
 
 struct BoundStage {
@@ -588,15 +591,23 @@ fn bind_stage(b: &Binder<'_>, s: &Stage) -> Result<BoundStage> {
     Ok(BoundStage { group_by, aggregates })
 }
 
-/// Group states of one aggregation stage.
+/// A group: its key values, its states, and the bytes charged for each.
+struct Group {
+    keys: Vec<Val>,
+    states: Vec<State>,
+    key_mem: usize,
+    state_mem: usize,
+}
+
+/// Group states of one aggregation stage, and the memory they hold.
 struct Groups {
-    map: DetHashMap<Vec<u8>, (Vec<Val>, Vec<State>)>,
+    map: DetHashMap<Vec<u8>, Group>,
     mem: usize,
     max_mem: usize,
 }
 
-fn new_group_mem(kb: &[u8], fns: &[&AggFn]) -> usize {
-    kb.len() * 2 + 64 + fns.len() * 64
+fn state_mem(states: &[State]) -> usize {
+    states.iter().map(State::mem_size).sum()
 }
 
 impl Groups {
@@ -604,33 +615,39 @@ impl Groups {
         Groups { map: DetHashMap::default(), mem: 0, max_mem }
     }
 
-    /// Records that the groups hold `mem` bytes, failing past the limit.
-    fn charge(&mut self, mem: usize) -> Result<()> {
-        self.mem = mem;
-        if mem > self.max_mem {
+    /// Accounts for state that held `old` bytes holding `new`, failing past the limit.
+    fn charge(&mut self, old: usize, new: usize) -> Result<()> {
+        self.mem = (self.mem + new).saturating_sub(old);
+        if self.mem > self.max_mem {
             return Err(Error::TooLarge(format!(
-                "the query's aggregation state exceeds {} bytes of memory; narrow the time range or group by fewer values",
+                "the query's state exceeds {} bytes of memory; narrow the time range or group by fewer values",
                 self.max_mem
             )));
         }
         Ok(())
     }
 
-    fn entry(&mut self, keys: Vec<Val>, fns: &[&AggFn]) -> Result<&mut Vec<State>> {
+    /// Applies `f` to the states of the group with `keys`, creating it.
+    fn update(&mut self, keys: Vec<Val>, fns: &[&AggFn], f: impl FnOnce(&mut [State])) -> Result<()> {
         let mut kb = Vec::new();
         for k in &keys {
             kb.extend(k.canonical_bytes());
         }
-        if !self.map.contains_key(&kb) {
-            self.charge(self.mem + new_group_mem(&kb, fns))?;
-        }
-        Ok(&mut self.map.entry(kb).or_insert_with(|| (keys, fns.iter().map(|f| State::new(f)).collect())).1)
-    }
-
-    fn check_mem(&mut self) -> Result<()> {
-        let mem: usize =
-            self.map.values().map(|(k, s)| k.len() * 32 + s.iter().map(State::mem_size).sum::<usize>()).sum();
-        self.charge(mem)
+        let (mut old, mut new) = (0, 0);
+        let g = match self.map.entry(kb) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let key_mem = 64 + 2 * e.key().len() + keys.iter().map(|k| k.mem_size() + 32).sum::<usize>();
+                new += key_mem;
+                let states: Vec<State> = fns.iter().map(|f| State::new(f)).collect();
+                e.insert(Group { keys, states, key_mem, state_mem: 0 })
+            }
+        };
+        f(&mut g.states);
+        old += g.state_mem;
+        g.state_mem = state_mem(&g.states);
+        new += g.state_mem;
+        self.charge(old, new)
     }
 
     fn full(&self) -> bool {
@@ -638,24 +655,25 @@ impl Groups {
     }
 
     /// Merges the groups of `o`, a partial result of the same stage.
-    fn absorb(&mut self, o: Groups, fns: &[&AggFn]) -> Result<()> {
-        let mut added = 0;
-        for (kb, (keys, states)) in o.map {
-            match self.map.entry(kb) {
+    fn absorb(&mut self, o: Groups) -> Result<()> {
+        for (kb, og) in o.map {
+            let (old, new) = match self.map.entry(kb) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
-                    e.get_mut().1.iter_mut().zip(&states).for_each(|(a, b)| a.merge(b));
+                    let g = e.get_mut();
+                    g.states.iter_mut().zip(&og.states).for_each(|(a, b)| a.merge(b));
+                    let old = g.state_mem;
+                    g.state_mem = state_mem(&g.states);
+                    (old, g.state_mem)
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    added += new_group_mem(e.key(), fns);
-                    e.insert((keys, states));
+                    let n = og.key_mem + og.state_mem;
+                    e.insert(og);
+                    (0, n)
                 }
-            }
+            };
+            self.charge(old, new)?;
         }
-        if fns.iter().all(|f| matches!(f, AggFn::Count | AggFn::Sum | AggFn::Avg)) {
-            self.charge(self.mem + added)
-        } else {
-            self.check_mem()
-        }
+        Ok(())
     }
 
     /// Finalized rows sorted by group key.
@@ -663,7 +681,7 @@ impl Groups {
         let mut rows: Vec<(Vec<u8>, Vec<Val>)> = self
             .map
             .into_iter()
-            .map(|(kb, (keys, states))| {
+            .map(|(kb, Group { keys, states, .. })| {
                 let mut row = keys;
                 row.extend(states.iter().zip(fns).map(|(s, f)| s.finalize(f).canonical()));
                 (kb, row)
@@ -679,10 +697,21 @@ struct Kept {
     rows: Vec<(Vec<Val>, Pos, Vec<Val>)>,
     desc: Vec<bool>,
     limit: usize,
+    /// Bytes the rows hold, and the most they may.
+    mem: usize,
+    max_mem: usize,
+}
+
+fn row_mem(key: &[Val], row: &[Val]) -> usize {
+    64 + key.iter().chain(row).map(|v| v.mem_size() + 32).sum::<usize>()
 }
 
 impl Kept {
-    fn cmp(desc: &[bool], a: &(Vec<Val>, Pos), b: &(Vec<Val>, Pos)) -> Ordering {
+    fn new(desc: Vec<bool>, limit: usize, max_mem: usize) -> Kept {
+        Kept { rows: Vec::new(), desc, limit, mem: 0, max_mem }
+    }
+
+    fn cmp(desc: &[bool], a: (&[Val], Pos), b: (&[Val], Pos)) -> Ordering {
         for (i, d) in desc.iter().enumerate() {
             let o = a.0[i].total_cmp(&b.0[i]);
             let o = if *d { o.reverse() } else { o };
@@ -693,17 +722,31 @@ impl Kept {
         a.1.cmp(&b.1)
     }
 
-    fn push(&mut self, key: Vec<Val>, pos: Pos, row: Vec<Val>) {
+    fn push(&mut self, key: Vec<Val>, pos: Pos, row: Vec<Val>) -> Result<()> {
+        self.mem += row_mem(&key, &row);
         self.rows.push((key, pos, row));
         if self.rows.len() > 2 * (self.limit + 1) + 64 {
             self.trim();
         }
+        if self.full() {
+            return Err(Error::TooLarge(format!(
+                "the query's rows exceed {} bytes of memory; select fewer columns or rows",
+                self.max_mem
+            )));
+        }
+        Ok(())
+    }
+
+    fn full(&self) -> bool {
+        self.mem > self.max_mem
     }
 
     fn trim(&mut self) {
-        let desc = self.desc.clone();
-        self.rows.sort_by(|a, b| Kept::cmp(&desc, &(a.0.clone(), a.1), &(b.0.clone(), b.1)));
+        let desc = std::mem::take(&mut self.desc);
+        self.rows.sort_by(|a, b| Kept::cmp(&desc, (&a.0, a.1), (&b.0, b.1)));
+        self.desc = desc;
         self.rows.truncate(self.limit + 1);
+        self.mem = self.rows.iter().map(|(k, _, r)| row_mem(k, r)).sum();
     }
 }
 
@@ -720,11 +763,9 @@ struct Run<'p, 'a> {
 impl<'p, 'a> Run<'p, 'a> {
     fn new(plan: &'p Plan<'a>, max_mem: usize) -> Run<'p, 'a> {
         let (groups, kept, agg_fns) = match &plan.kind {
-            Kind::Rows { order, limit, .. } => (
-                None,
-                Some(Kept { rows: Vec::new(), desc: order.iter().map(|(_, d)| *d).collect(), limit: *limit }),
-                Vec::new(),
-            ),
+            Kind::Rows { order, limit, .. } => {
+                (None, Some(Kept::new(order.iter().map(|(_, d)| *d).collect(), *limit, max_mem)), Vec::new())
+            }
             Kind::Aggregate { first, .. } => {
                 (Some(Groups::new(max_mem)), None, first.aggregates.iter().map(|a| a.func.clone()).collect())
             }
@@ -737,12 +778,11 @@ impl<'p, 'a> Run<'p, 'a> {
         self.stats.add(&o.stats);
         if let (Some(k), Some(ok)) = (&mut self.kept, o.kept) {
             for (key, pos, row) in ok.rows {
-                k.push(key, pos, row);
+                k.push(key, pos, row)?;
             }
         }
         if let (Some(g), Some(og)) = (&mut self.groups, o.groups) {
-            let fns: Vec<&AggFn> = self.agg_fns.iter().collect();
-            g.absorb(og, &fns)?;
+            g.absorb(og)?;
         }
         Ok(())
     }
@@ -757,12 +797,12 @@ impl<'p, 'a> Run<'p, 'a> {
                     let key: Vec<Val> = order.iter().map(|(e, _)| b.val(e, i)).collect();
                     let pos = b.pos.get(i).copied().unwrap_or_default();
                     if let Some((ak, ap)) = after
-                        && Kept::cmp(&kept.desc, &(key.clone(), pos), &(ak.clone(), *ap)) != Ordering::Greater
+                        && Kept::cmp(&kept.desc, (&key, pos), (ak, *ap)) != Ordering::Greater
                     {
                         continue;
                     }
                     let row = columns.iter().map(|(_, e)| b.val(e, i)).collect();
-                    kept.push(key, pos, row);
+                    kept.push(key, pos, row)?;
                 }
             }
             Kind::Aggregate { first, .. } => {
@@ -775,39 +815,35 @@ impl<'p, 'a> Run<'p, 'a> {
                 let time = BExpr::Col(plan.schema.time_id());
                 for i in (0..b.n).filter(|i| sel[*i]) {
                     let keys: Vec<Val> = first.group_by.iter().map(|(_, e)| b.val(e, i).canonical()).collect();
-                    let states = groups.entry(keys, &fns)?;
-                    for (ai, a) in first.aggregates.iter().enumerate() {
-                        if agg_sel[ai].as_ref().is_some_and(|s| !s[i]) {
-                            continue;
-                        }
-                        let event = match &a.func {
-                            AggFn::WindowFunnel { mode, .. } => {
-                                let mask =
-                                    conds[ai].iter().enumerate().fold(0u32, |m, (k, c)| m | ((c[i] as u32) << k));
-                                if mask == 0 && !mode.strict_order {
-                                    continue;
+                    groups.update(keys, &fns, |states| {
+                        for (ai, a) in first.aggregates.iter().enumerate() {
+                            if agg_sel[ai].as_ref().is_some_and(|s| !s[i]) {
+                                continue;
+                            }
+                            let event = match &a.func {
+                                AggFn::WindowFunnel { mode, .. } => {
+                                    let mask =
+                                        conds[ai].iter().enumerate().fold(0u32, |m, (k, c)| m | ((c[i] as u32) << k));
+                                    if mask == 0 && !mode.strict_order {
+                                        continue;
+                                    }
+                                    let t = match b.val(&time, i) {
+                                        Val::Int(t) => t,
+                                        _ => continue,
+                                    };
+                                    Some((t, b.pos.get(i).copied().unwrap_or_default(), mask))
                                 }
-                                let t = match b.val(&time, i) {
-                                    Val::Int(t) => t,
-                                    _ => continue,
-                                };
-                                Some((t, b.pos.get(i).copied().unwrap_or_default(), mask))
-                            }
-                            AggFn::Retention(_) => {
-                                let mask =
-                                    conds[ai].iter().enumerate().fold(0u32, |m, (k, c)| m | ((c[i] as u32) << k));
-                                Some((0, Pos::default(), mask))
-                            }
-                            _ => None,
-                        };
-                        let v = a.of.as_ref().map_or(Val::Null, |e| b.val(e, i));
-                        states[ai].add(&v, event);
-                    }
-                }
-                if groups.map.len() % 64 == 0
-                    || first.aggregates.iter().any(|a| !matches!(a.func, AggFn::Count | AggFn::Sum | AggFn::Avg))
-                {
-                    groups.check_mem()?;
+                                AggFn::Retention(_) => {
+                                    let mask =
+                                        conds[ai].iter().enumerate().fold(0u32, |m, (k, c)| m | ((c[i] as u32) << k));
+                                    Some((0, Pos::default(), mask))
+                                }
+                                _ => None,
+                            };
+                            let v = a.of.as_ref().map_or(Val::Null, |e| b.val(e, i));
+                            states[ai].add(&v, event);
+                        }
+                    })?;
                 }
             }
         }
@@ -891,11 +927,10 @@ impl<'p, 'a> Run<'p, 'a> {
             Need::Path(id, key) => {
                 if let Some(ci) = meta.find(&ColRef::Path { col: *id, key: key.clone() }) {
                     ColData::Vec { v: rd.column(r, meta, ci, g).await?, json: meta.cols[ci].json }
-                } else if meta.shared.get(id).is_some_and(|ps| ps.iter().any(|p| p.key == *key)) {
+                } else if meta.may_share(*id, key)
+                    && let Some(ci) = meta.find(&ColRef::Shared { col: *id, bucket: json::bucket(key) })
+                {
                     probe::hit(Probe::JsonSharedPathRead);
-                    let ci = meta
-                        .find(&ColRef::Shared { col: *id, bucket: json::bucket(key) })
-                        .ok_or_else(|| Error::internal("shared path without its bucket"))?;
                     let v = rd.column(r, meta, ci, g).await?;
                     let Vector::Str(s) = v else { return Err(Error::internal("shared bucket is not text")) };
                     ColData::Vals(
@@ -1018,7 +1053,8 @@ impl<'p, 'a> Run<'p, 'a> {
             },
             BExpr::Path(id, _, key) => {
                 meta.find(&ColRef::Path { col: *id, key: key.clone() }).is_some_and(|ci| meta.cols[ci].nonnull > 0)
-                    || meta.shared.get(id).is_some_and(|ps| ps.iter().any(|p| p.key == *key))
+                    || (meta.may_share(*id, key)
+                        && meta.find(&ColRef::Shared { col: *id, bucket: json::bucket(key) }).is_some())
             }
             _ => true,
         });
@@ -1159,6 +1195,14 @@ impl<'p, 'a> Run<'p, 'a> {
         mask: &Runs,
         g: std::ops::Range<usize>,
     ) -> Result<()> {
+        // Granules read from the cache never wait, so the query yields and
+        // checks its deadline here, as reads from the store would let it.
+        if let Some((at, max_ms)) = self.plan.deadline
+            && tokio::time::Instant::now() >= at
+        {
+            return Err(timed_out(max_ms));
+        }
+        tokio::task::consume_budget().await;
         let rows = meta.rows_of(g.clone());
         let n = (rows.end - rows.start) as usize;
         self.stats.granules_read += (g.end - g.start) as u64;
@@ -1334,11 +1378,15 @@ pub async fn run(
     let limit = std::time::Duration::from_millis(limits.max_ms);
     match tokio::time::timeout(limit, run_within(shared, db, txn, s, q, limits)).await {
         Ok(r) => r,
-        Err(_) => Err(Error::Unavailable {
-            message: format!("the query ran longer than {} ms; narrow its time range or filter", limits.max_ms),
-            retry_after_ms: Some(1_000),
-            outcome_unknown: false,
-        }),
+        Err(_) => Err(timed_out(limits.max_ms)),
+    }
+}
+
+fn timed_out(max_ms: u64) -> Error {
+    Error::Unavailable {
+        message: format!("the query ran longer than {max_ms} ms; narrow its time range or filter"),
+        retry_after_ms: Some(1_000),
+        outcome_unknown: false,
     }
 }
 
@@ -1434,7 +1482,8 @@ async fn run_within(
     }
     let rest: BTreeSet<Need> = rest.difference(&first).cloned().collect();
     let input = input(txn, s, from, q.to).await?;
-    let plan = Plan { schema: s, filter, lookups, kind, first, rest, positions };
+    let deadline = Some((tokio::time::Instant::now() + std::time::Duration::from_millis(limits.max_ms), limits.max_ms));
+    let plan = Plan { schema: s, filter, lookups, kind, first, rest, positions, deadline };
     let mut run = Run::new(&plan, limits.max_memory_bytes);
     run.stats = Stats { source: "columns".into(), nodes: 1, parts: input.refs.len() as u64, ..Default::default() };
     let read_stats = ReadStats::default();
@@ -1454,7 +1503,7 @@ async fn run_within(
     // its share of the state limit, and merged in part order, so the merged
     // result grows as a serial read's would and the limit does not depend on
     // which part arrives first. A part whose groups outgrow its share is
-    // read again into the merged result at its turn.
+    // read again into the merged result at its turn; rows mode holds rows the same way.
     let n = shared.cfg.event_read_concurrency.max(1);
     let share = limits.max_memory_bytes / n;
     let reads: Vec<_> = refs
@@ -1475,7 +1524,10 @@ async fn run_within(
         let (partial, read) = reads.next().await.ok_or_else(|| Error::internal("query reads ended early"))?;
         match read {
             Ok(()) => run.absorb(partial)?,
-            Err(Error::TooLarge(_)) if partial.groups.as_ref().is_some_and(Groups::full) => {
+            Err(Error::TooLarge(_))
+                if partial.groups.as_ref().is_some_and(Groups::full)
+                    || partial.kept.as_ref().is_some_and(Kept::full) =>
+            {
                 run.part(&rd, r, rd.meta(r).await?).await?;
             }
             Err(e) => return Err(e),
@@ -1606,13 +1658,13 @@ fn second_stage(
     let mut groups = Groups::new(limits.max_memory_bytes);
     for row in &rows {
         let keys: Vec<Val> = group_by.iter().map(|(_, e)| eval(e, row).canonical()).collect();
-        let states = groups.entry(keys, &fns)?;
-        for (i, (_, _, of)) in aggs.iter().enumerate() {
-            let v = of.as_ref().map_or(Val::Null, |e| eval(e, row));
-            states[i].add(&v, None);
-        }
+        groups.update(keys, &fns, |states| {
+            for (i, (_, _, of)) in aggs.iter().enumerate() {
+                let v = of.as_ref().map_or(Val::Null, |e| eval(e, row));
+                states[i].add(&v, None);
+            }
+        })?;
     }
-    groups.check_mem()?;
     let mut out_names: Vec<String> = group_by.iter().map(|(n, _)| n.clone()).collect();
     out_names.extend(aggs.iter().map(|(n, _, _)| n.clone()));
     let out = if group_by.is_empty() && groups.map.is_empty() {
@@ -1666,6 +1718,7 @@ pub async fn matching_rows(
         first,
         rest: BTreeSet::new(),
         positions: false,
+        deadline: None,
     };
     let run = Run::new(&plan, usize::MAX);
     let read_stats = ReadStats::default();
@@ -1713,6 +1766,7 @@ pub fn row_matches(s: &EventSchema, row: &Row, f: &Filter, from: i64, to: i64) -
         kind: Kind::Aggregate { first: BoundStage { group_by: Vec::new(), aggregates: Vec::new() }, then: None },
         first: needs,
         rest: BTreeSet::new(),
+        deadline: None,
         positions: false,
     };
     let run = Run::new(&plan, usize::MAX);

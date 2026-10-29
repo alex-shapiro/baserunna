@@ -361,7 +361,8 @@ events to row tables.
   default, which applies to events written before the column existed
   (an added column defaulting to `"now"` must be nullable, and reads null
   for them), and dropped. `json` columns take no default, sort key or skip index.
-- **Inserts** take up to 1 MiB per event. A bulk insert (`POST …/rows`, a
+- **Inserts** take up to 1 MiB per event, whose JSON objects flatten to
+  at most 4 MiB of paths and values. A bulk insert (`POST …/rows`, a
   JSON array or NDJSON) waits up to 200 ms for other inserts on the same
   node and commits with them in one manifest write. With an idempotency
   key it is applied once, a retry answers with what the first attempt
@@ -389,7 +390,7 @@ events to row tables.
   acknowledged insert; a
   snapshot that lacks the table or a column named retries at a fresh one.
   A query fails with `413` past 4 GiB read, 1 GiB of aggregation state or
-  1 GiB of lookup rows, and with a retryable `503` once it has run for 60 s.
+  kept rows, or 1 GiB of lookup rows, and with a retryable `503` once it has run for 60 s.
 - **Deletes** remove the events matching a filter within a time range, in a
   transaction. A delete that would need an oversized mask in one partition
   fails with `413` naming it, so a caller deletes partition by partition.
@@ -830,15 +831,21 @@ parts start sorted, so they never pass through the LSM tree.
 
 A part is one partition's events sorted by the table's `order_by` and
 position, written as a stream of 32 MiB chunk objects (`part/{id}/{n}`).
-Rows are grouped into granules of 8,192 rows or 10 MiB, and each column's
-granule is a framed block (§5.3) encoded per column: integers as deltas or
-constants, strings as dictionary codes with the part's dictionary, nulls as
-bitmaps. Each column's index holds the block locations, per-granule
-min/max/null statistics, and bloom filters per 4 granules for skip-indexed
-columns. Part metadata holds the granule ranges, the sort key of each
-granule's first row (a primary index), and the column directory. JSON
-columns become one column per path; the 1,024 most common paths are
-columns, and the rest share 32 hashed buckets.
+Rows are grouped into granules of 8,192 rows or 10 MiB, counting each
+row's JSON at its flattened size, and each column's granule is a framed
+block (§5.3) encoded per column: integers as deltas or constants, strings
+as dictionary codes with the part's dictionary (up to 65,536 values and
+1 MiB), nulls as bitmaps. Each column's index holds the block locations,
+per-granule min/max/null statistics, and bloom filters per 4 granules for
+skip-indexed columns. Part metadata holds the granule ranges, the sort key
+of each granule's first row (a primary index, which skips keys over 4 KiB),
+and the column directory. JSON columns become one column per path: the
+1,024 most common paths of up to 256 bytes (shared among the table's JSON
+columns) are columns, and the rest share 32 hashed buckets, listed in a
+directory of up to 1 MiB; a part whose directory omits paths is read as if
+any path may be in its buckets. Each part also stores every row's size, so
+merges cut granules as the rows' first writer did. A part is never written
+with a block, index or metadata larger than a reader accepts.
 
 A part ref (`0x0A`) stores the part's id, row count, time range, size,
 level, the positions it covers, and its deletion mask: deleted row offsets,

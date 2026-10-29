@@ -2,7 +2,7 @@
 //! sealed unsealed rows.
 
 use super::json::{self, JType};
-use super::part::{self, ColPlan, ColRef, DICT_MAX, SharedPath, Sink, Source};
+use super::part::{self, ColPlan, ColRef, DICT_MAX, DICT_MAX_BYTES, SharedPath, Sink, Source};
 use super::schema::{EvType, EventSchema};
 use super::vector::{Phys, Strs, Vector};
 use crate::engine::Shared;
@@ -14,6 +14,21 @@ use serde_json::{Map, Value as Json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
+
+/// The bytes `row` takes in a part's columns, uncompressed: its encoding
+/// plus its JSON objects flattened to paths, which repeat each leaf's
+/// path. Granules are cut by it, so that no block outgrows what a reader
+/// accepts.
+pub fn stored_len(row: &Row) -> usize {
+    let flat: usize = row
+        .values()
+        .map(|d| match d {
+            Datum::Json(Json::Object(o)) => json::flattened_len(o),
+            _ => 0,
+        })
+        .sum();
+    encode_row(row).len() + 12 + flat
+}
 
 /// A row to write: its position and values.
 #[derive(Clone, Debug, PartialEq)]
@@ -27,6 +42,7 @@ enum Getter {
     Present(u32),
     Version,
     Ordinal,
+    RowBytes,
     Path { col: u32, key: String, ty: JType },
     Shared { col: u32, bucket: u8, chosen: Arc<BTreeSet<String>> },
 }
@@ -41,6 +57,7 @@ pub struct RowsSource {
     /// Leaves of each JSON column's object in each row.
     leaves: BTreeMap<u32, Vec<BTreeMap<String, Json>>>,
     shared: BTreeMap<u32, Vec<SharedPath>>,
+    partial: BTreeSet<u32>,
 }
 
 fn phys_of(t: EvType) -> Phys {
@@ -55,9 +72,12 @@ fn phys_of(t: EvType) -> Phys {
 /// A part-level dictionary for `vals`, if they have few enough distinct values.
 pub fn dictionary<'a>(vals: impl Iterator<Item = &'a str>) -> Option<Arc<Vec<String>>> {
     let mut set = BTreeSet::new();
+    let mut bytes = 0;
     for v in vals {
-        set.insert(v);
-        if set.len() > DICT_MAX {
+        if set.insert(v) {
+            bytes += v.len();
+        }
+        if set.len() > DICT_MAX || bytes > DICT_MAX_BYTES {
             return None;
         }
     }
@@ -83,9 +103,56 @@ pub fn stored_defaults(schema: &EventSchema) -> Vec<(u32, Datum)> {
 /// Chooses the `max` most common paths to store as columns, the most
 /// common first and then by key.
 pub fn choose_paths(stats: &BTreeMap<String, (u64, JType)>, max: usize) -> BTreeSet<String> {
-    let mut v: Vec<(&String, u64)> = stats.iter().map(|(k, (n, _))| (k, *n)).collect();
+    let mut v: Vec<(&String, u64)> =
+        stats.iter().filter(|(k, _)| k.len() <= PATH_COLUMN_KEY_MAX).map(|(k, (n, _))| (k, *n)).collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     v.into_iter().take(max).map(|(k, _)| k.clone()).collect()
+}
+
+/// Paths longer than this are never stored as columns.
+pub const PATH_COLUMN_KEY_MAX: usize = 256;
+
+/// How a part stores one JSON column's paths.
+pub struct PathPlan {
+    /// Paths stored as columns of their own.
+    pub chosen: Arc<BTreeSet<String>>,
+    /// The other paths the part's directory lists, by key.
+    pub listed: Vec<SharedPath>,
+    /// Whether the other paths include some that `listed` leaves out.
+    pub partial: bool,
+    /// The shared buckets holding the other paths.
+    pub buckets: BTreeSet<u8>,
+}
+
+/// Plans a JSON column's paths from their counts and types: the most common
+/// `event_json_max_paths` become columns, and the rest share buckets and
+/// are listed, most common first, while they fit
+/// `event_json_directory_bytes`. Both limits are divided among the table's
+/// `json_columns`.
+pub fn plan_paths(
+    stats: &BTreeMap<String, (u64, JType)>,
+    cfg: &crate::engine::EngineConfig,
+    json_columns: usize,
+    partial: bool,
+) -> PathPlan {
+    let share = json_columns.max(1);
+    let chosen = Arc::new(choose_paths(stats, (cfg.event_json_max_paths / share).max(1)));
+    let mut rest: Vec<(&String, &(u64, JType))> = stats.iter().filter(|(k, _)| !chosen.contains(*k)).collect();
+    let buckets = rest.iter().map(|(k, _)| json::bucket(k)).collect();
+    rest.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
+    let budget = cfg.event_json_directory_bytes / share;
+    let mut bytes = 0;
+    let mut listed: Vec<SharedPath> = Vec::new();
+    for (k, (n, t)) in &rest {
+        bytes += k.len();
+        if bytes > budget {
+            break;
+        }
+        listed.push(SharedPath { key: (*k).clone(), count: *n, ty: *t });
+    }
+    let partial = partial || listed.len() < rest.len();
+    listed.sort_by(|a, b| a.key.cmp(&b.key));
+    PathPlan { chosen, listed, partial, buckets }
 }
 
 /// The value of a path in a column of type `ty`, as a vector element.
@@ -99,7 +166,12 @@ pub fn leaf_text(ty: JType, v: &Json) -> String {
 impl RowsSource {
     /// Sorts `rows` and plans their columns; `versions` stores each row's
     /// version, which binds of staged parts leave to their reference.
-    pub fn new(schema: &EventSchema, mut rows: Vec<PosRow>, versions: bool, max_paths: usize) -> RowsSource {
+    pub fn new(
+        schema: &EventSchema,
+        mut rows: Vec<PosRow>,
+        versions: bool,
+        cfg: &crate::engine::EngineConfig,
+    ) -> RowsSource {
         for (id, d) in stored_defaults(schema) {
             for r in rows.iter_mut() {
                 r.row.entry(id).or_insert_with(|| d.clone());
@@ -109,12 +181,14 @@ impl RowsSource {
         keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.pos.cmp(&b.1.pos)));
         let keys: Vec<Bytes> = keyed.iter().map(|(k, _)| Bytes::from(k.clone())).collect();
         let rows: Vec<PosRow> = keyed.into_iter().map(|(_, r)| r).collect();
-        let bytes = rows.iter().map(|r| encode_row(&r.row).len() as u64 + 12).collect();
+        let bytes = rows.iter().map(|r| stored_len(&r.row) as u64).collect();
         let blooms: BTreeSet<u32> = schema.bloom_ids().into_iter().collect();
         let mut plans = Vec::new();
         let mut getters = Vec::new();
         let mut leaves = BTreeMap::new();
         let mut shared = BTreeMap::new();
+        let mut partial = BTreeSet::new();
+        let json_columns = schema.columns.iter().filter(|c| c.ty == EvType::Json).count();
         for c in &schema.columns {
             if !rows.iter().any(|r| r.row.contains_key(&c.id)) {
                 continue;
@@ -155,7 +229,7 @@ impl RowsSource {
                     stats.entry(k.clone()).and_modify(|(n, ty)| (*n, *ty) = (*n + 1, ty.join(t))).or_insert((1, t));
                 }
             }
-            let chosen = Arc::new(choose_paths(&stats, max_paths));
+            let PathPlan { chosen, listed, partial: cut, buckets } = plan_paths(&stats, cfg, json_columns, false);
             for key in chosen.iter() {
                 let ty = stats[key].1;
                 let (phys, js) = match ty {
@@ -182,12 +256,6 @@ impl RowsSource {
                 });
                 getters.push(Getter::Path { col: c.id, key: key.clone(), ty });
             }
-            let rest: Vec<SharedPath> = stats
-                .iter()
-                .filter(|(k, _)| !chosen.contains(*k))
-                .map(|(k, (n, t))| SharedPath { key: k.clone(), count: *n, ty: *t })
-                .collect();
-            let buckets: BTreeSet<u8> = rest.iter().map(|p| json::bucket(&p.key)).collect();
             for b in buckets {
                 plans.push(ColPlan {
                     cref: ColRef::Shared { col: c.id, bucket: b },
@@ -198,8 +266,11 @@ impl RowsSource {
                 });
                 getters.push(Getter::Shared { col: c.id, bucket: b, chosen: chosen.clone() });
             }
-            if !rest.is_empty() {
-                shared.insert(c.id, rest);
+            if !listed.is_empty() {
+                shared.insert(c.id, listed);
+            }
+            if cut {
+                partial.insert(c.id);
             }
             leaves.insert(c.id, per_row);
         }
@@ -209,7 +280,9 @@ impl RowsSource {
         }
         plans.push(ColPlan { cref: ColRef::Ordinal, phys: Phys::Int, json: false, dict: None, bloom: false });
         getters.push(Getter::Ordinal);
-        RowsSource { rows, bytes, keys, plans, getters, leaves, shared }
+        plans.push(ColPlan { cref: ColRef::RowBytes, phys: Phys::Int, json: false, dict: None, bloom: false });
+        getters.push(Getter::RowBytes);
+        RowsSource { rows, bytes, keys, plans, getters, leaves, shared, partial }
     }
 
     pub fn sorted(&self) -> &[PosRow] {
@@ -258,6 +331,7 @@ impl RowsSource {
             Getter::Present(id) => Vector::Bool(rs.iter().map(|r| r.row.contains_key(id).then_some(true)).collect()),
             Getter::Version => Vector::Int(rs.iter().map(|r| Some(r.pos.version as i64)).collect()),
             Getter::Ordinal => Vector::Int(rs.iter().map(|r| Some(r.pos.ordinal as i64)).collect()),
+            Getter::RowBytes => Vector::Int(self.bytes[rows].iter().map(|b| Some(*b as i64)).collect()),
             Getter::Path { col, key, ty } => {
                 let ls = &self.leaves[col][rows];
                 let get = |i: usize| ls[i].get(key);
@@ -312,6 +386,10 @@ impl Source for RowsSource {
         self.shared.clone()
     }
 
+    fn partial_paths(&self) -> BTreeSet<u32> {
+        self.partial.clone()
+    }
+
     async fn column(&mut self, plan: usize, rows: Range<u64>) -> Result<Vector> {
         let v = self.values(&self.getters[plan], rows.start as usize..rows.end as usize);
         let phys = self.plans[plan].phys;
@@ -337,7 +415,7 @@ pub async fn write_rows(
     let (min_time, max_time) = times.fold((i64::MAX, i64::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
     let (min_version, max_version) =
         rows.iter().fold((u64::MAX, 0), |(lo, hi), r| (lo.min(r.pos.version), hi.max(r.pos.version)));
-    let mut src = RowsSource::new(schema, rows, versions, shared.cfg.event_json_max_paths);
+    let mut src = RowsSource::new(schema, rows, versions, &shared.cfg);
     let mut sink = Sink::new(shared, db, part::new_part_id(shared));
     let w = part::write(&mut sink, &mut src, 1, schema.sort_ids()).await?;
     let r = PartRef {

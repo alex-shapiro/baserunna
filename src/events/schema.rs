@@ -10,6 +10,9 @@ use serde_json::{Map, Value as Json, json};
 pub const COLUMNS_MAX: usize = 256;
 /// Largest encoded row.
 pub const ROW_MAX_BYTES: usize = 1 << 20;
+/// The most bytes an event's columns hold in a part, its JSON objects
+/// flattened to paths; see [`super::build::stored_len`].
+pub const ROW_STORED_MAX_BYTES: usize = 4 * ROW_MAX_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

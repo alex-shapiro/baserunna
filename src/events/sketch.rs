@@ -342,7 +342,7 @@ impl DdSketch {
         if !x.is_finite() {
             return;
         }
-        if x.abs() < 1e-300 {
+        if x == 0.0 {
             self.zeros += 1;
             return;
         }
@@ -372,7 +372,8 @@ impl DdSketch {
         }
         let rank = (q.clamp(0.0, 1.0) * (n - 1) as f64).floor() as u64;
         let g = gamma();
-        let value = |i: i32| 2.0 * g.powi(i) / (g + 1.0);
+        // In log space, since gamma^i alone overflows near f64::MAX.
+        let value = |i: i32| (i as f64 * g.ln() + (2.0 / (g + 1.0)).ln()).exp().min(f64::MAX);
         let mut seen = 0u64;
         for (i, c) in self.neg.iter().rev() {
             seen += c;

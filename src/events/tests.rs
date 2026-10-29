@@ -242,7 +242,9 @@ async fn compare(db: &Arc<Db>, model: &Arc<Db>, q: &Json) -> Result<usize, Strin
 }
 
 async fn run(seed: u64, steps: usize) -> Result<usize, String> {
-    let (eng, _store, env) = engine(seed, cfg());
+    // Odd seeds list few shared JSON paths in each part's directory.
+    let directory = if seed.is_multiple_of(2) { 1 << 20 } else { 1 << (seed % 7) };
+    let (eng, _store, env) = engine(seed, EngineConfig { event_json_directory_bytes: directory, ..cfg() });
     env.spawn(async {});
     let db = create_db(&eng, "real").await;
     let model = create_db(&eng, "model").await;
@@ -1886,5 +1888,474 @@ mod maintenance_limits {
             }
             assert_eq!(outcomes.last(), Some(&Ok(false)), "seals: {outcomes:?}");
         });
+    }
+}
+mod part_limits {
+    use super::*;
+
+    async fn table_id(db: &Arc<Db>) -> u32 {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        get_schema(&mut t, "events").await.unwrap().id
+    }
+
+    async fn ins(db: &Arc<Db>, rows: Vec<Json>) {
+        txn_do(db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+    }
+
+    async fn count(db: &Arc<Db>, w: Json) -> i64 {
+        let q = json!({"from": 0, "to": T0 * 2, "where": w, "aggregates": {"n": {"fn": "count"}}});
+        query(db, &q).await.unwrap().rows[0][0].as_i64().unwrap()
+    }
+
+    /// JSON keyed by ids (`{"scores": {"user-…": 1}}`) gives every event its
+    /// own paths. A part lists only as many as fit its metadata, and paths
+    /// it leaves out are still read from their shared buckets, through
+    /// seals and merges.
+    #[test]
+    fn parts_of_events_with_unique_json_paths_keep_small_metadata() {
+        rt().block_on(async {
+            let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            let user = |i: i64| format!("user-{i:06}-{}", "u".repeat(120));
+            for half in 0..2i64 {
+                let rows: Vec<Json> = (0..10_000i64)
+                    .map(|i| {
+                        let n = half * 10_000 + i;
+                        json!({"time": T0 + n, "event": "a", "props": {"scores": {user(n): n}}})
+                    })
+                    .collect();
+                ins(&db, rows).await;
+                while maint::seal(&db, id).await.unwrap() {}
+            }
+            let meta_bytes = async || {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                let rs = refs(&mut t, id).await.unwrap();
+                let stats = part::ReadStats::default();
+                let rd = part::Reading { shared: db.shared(), db: &db.id, cache: part::Caching::Shared, stats: &stats };
+                let mut most = 0;
+                for r in &rs {
+                    let m = rd.meta(r).await.unwrap();
+                    most = most.max(m.shared.values().flatten().map(|p| p.key.len()).sum::<usize>());
+                }
+                (rs.len(), most)
+            };
+            let probe = async |n: i64| {
+                let q = json!({"from": 0, "to": T0 * 2,
+                    "where": {"col": "props", "path": ["scores", user(n)], "op": "eq", "value": n},
+                    "aggregates": {"n": {"fn": "count"}}});
+                query(&db, &q).await.unwrap().rows[0][0].as_i64().unwrap()
+            };
+            let (parts, meta) = meta_bytes().await;
+            assert!(parts >= 2 && meta <= 1 << 20, "{parts} parts, listing up to {meta} bytes of paths");
+            for n in [0, 4_999, 9_999, 10_000, 19_999] {
+                assert_eq!(probe(n).await, 1, "sealed: the path of event {n}");
+            }
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let s = get_schema(&mut t, "events").await.unwrap();
+            let rs = refs(&mut t, id).await.unwrap();
+            maint::merge(&db, &s, &rs).await.unwrap();
+            let (parts, meta) = meta_bytes().await;
+            assert!(parts == 1 && meta <= 1 << 20, "merged: {parts} parts, listing {meta} bytes of paths");
+            for n in [0, 4_999, 9_999, 10_000, 19_999] {
+                assert_eq!(probe(n).await, 1, "merged: the path of event {n}");
+            }
+        });
+    }
+
+    /// A merge types paths that a part with a partial directory may hold
+    /// unlisted as JSON text, since that part may hold them with any type.
+    #[test]
+    fn merges_keep_paths_a_partial_directory_does_not_list() {
+        rt().block_on(async {
+            let cfg = EngineConfig { event_json_max_paths: 1, event_json_directory_bytes: 1, ..cfg() };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            let strs: Vec<Json> = (0..5).map(|i| json!({"time": T0 + i, "event": "a", "props": {"p1": "s"}})).collect();
+            ins(&db, strs).await;
+            assert!(maint::seal(&db, id).await.unwrap());
+            let ints = vec![
+                json!({"time": T0 + 10, "event": "a", "props": {"a": 1, "p1": 7}}),
+                json!({"time": T0 + 11, "event": "a", "props": {"a": 1}}),
+            ];
+            ins(&db, ints).await;
+            assert!(maint::seal(&db, id).await.unwrap());
+            let w = json!({"col": "props", "path": ["p1"], "op": "eq", "value": 7});
+            assert_eq!(count(&db, w.clone()).await, 1, "sealed");
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let s = get_schema(&mut t, "events").await.unwrap();
+            let rs = refs(&mut t, id).await.unwrap();
+            maint::merge(&db, &s, &rs).await.unwrap();
+            assert_eq!(count(&db, w).await, 1, "merged");
+        });
+    }
+
+    #[test]
+    fn an_added_float_default_of_negative_zero_survives_seal() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            ins(&db, vec![json!({"time": T0, "event": "a"})]).await;
+            let spec: ColumnSpec =
+                serde_json::from_value(json!({"name": "z", "type": "float", "default": -0.0})).unwrap();
+            txn_do(&db, async |t| add_column(t, "events", &spec).await).await.unwrap();
+            let w = json!({"col": "z", "op": "ge", "value": 0});
+            assert_eq!(count(&db, w.clone()).await, 1, "unsealed: the default -0.0 is >= 0");
+            assert!(maint::seal(&db, table_id(&db).await).await.unwrap());
+            assert_eq!(count(&db, w).await, 1, "sealed: the default -0.0 is >= 0");
+        });
+    }
+
+    /// A shared JSON bucket repeats every leaf's full path, so an event under
+    /// 1 MiB whose leaves share a long prefix can hold many times its size.
+    /// Events that flatten past the limit are refused, and granules of the
+    /// rest are cut by their flattened size, so their parts stay readable.
+    #[test]
+    fn events_with_long_json_paths_stay_readable_after_seal() {
+        rt().block_on(async {
+            let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let prefix = "p".repeat(2000);
+            let props = |leaves: usize, salt: usize| {
+                let mut inner = serde_json::Map::new();
+                let mut i = 0u64;
+                while inner.len() < leaves {
+                    let k = format!("k{salt}_{i}");
+                    i += 1;
+                    if json::bucket(&json::path_key(&[prefix.clone(), k.clone()])) == 0 {
+                        inner.insert(k, json!(1));
+                    }
+                }
+                let mut props = serde_json::Map::new();
+                props.insert(prefix.clone(), Json::Object(inner));
+                Json::Object(props)
+            };
+            let huge = json!({"time": T0, "event": "a", "props": props(40_000, 0)});
+            assert!(huge.to_string().len() < 1 << 20, "the event is under 1 MiB");
+            let r = txn_do(&db, async |t| insert(t, "events", std::slice::from_ref(&huge), 0).await).await;
+            assert!(matches!(r, Err(Error::TooLarge(_))), "an event flattening to 80 MB was accepted: {r:?}");
+            for salt in 0..30 {
+                ins(&db, vec![json!({"time": T0 + salt as i64, "event": "a", "props": props(1_500, salt)})]).await;
+            }
+            let q = json!({"from": 0, "to": T0 * 2, "columns": ["props"], "limit": 1});
+            assert!(query(&db, &q).await.is_ok(), "unsealed reads");
+            assert!(maint::seal(&db, table_id(&db).await).await.unwrap());
+            let r = query(&db, &q).await;
+            assert!(r.is_ok(), "sealed reads: {:?}", r.err());
+        });
+    }
+
+    /// Large rows that sort together among many small ones stay readable
+    /// after a merge: granules are cut by each row's stored size, not by
+    /// the inputs' average row, and string dictionaries stay small.
+    #[test]
+    fn merged_large_rows_stay_readable() {
+        rt().block_on(async {
+            let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            let small: Vec<Json> = (0..500).map(|i| json!({"time": T0 + 1000 + i, "event": "b"})).collect();
+            ins(&db, small).await;
+            while maint::seal(&db, id).await.unwrap() {}
+            for i in 0..70 {
+                let big = format!("{i:04}{}", "x".repeat(1_000_000));
+                ins(&db, vec![json!({"time": T0 + i, "event": "a", "user": big})]).await;
+            }
+            while maint::seal(&db, id).await.unwrap() {}
+            let q = json!({"from": 0, "to": T0 * 2, "columns": ["user"], "limit": 1});
+            assert!(query(&db, &q).await.is_ok(), "sealed parts read");
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let s = get_schema(&mut t, "events").await.unwrap();
+            let rs = refs(&mut t, s.id).await.unwrap();
+            assert!(rs.len() >= 2, "parts: {}", rs.len());
+            maint::merge(&db, &s, &rs).await.unwrap();
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let after = refs(&mut t, s.id).await.unwrap();
+            assert_eq!((after.len(), after[0].rows), (1, 570), "one merged part");
+            let r = query(&db, &q).await;
+            assert!(r.is_ok(), "merged part reads: {:?}", r.err());
+        });
+    }
+
+    /// The cache charges part metadata for every shared JSON path it holds.
+    #[test]
+    fn part_metadata_is_charged_for_shared_paths() {
+        rt().block_on(async {
+            let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            for b in 0..4 {
+                let rows: Vec<Json> = (0..50)
+                    .map(|i| {
+                        let mut p = serde_json::Map::new();
+                        for k in 0..100 {
+                            p.insert(format!("item_{b}_{i}_{k}_{}", "q".repeat(30)), json!(1));
+                        }
+                        json!({"time": T0 + b * 50 + i, "event": "a", "props": p})
+                    })
+                    .collect();
+                ins(&db, rows).await;
+            }
+            while maint::seal(&db, id).await.unwrap() {}
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let rs = refs(&mut t, id).await.unwrap();
+            let cache = &db.shared().cache;
+            let stats = part::ReadStats::default();
+            let rd = part::Reading { shared: db.shared(), db: &db.id, cache: part::Caching::Shared, stats: &stats };
+            for r in &rs {
+                let before = cache.stats();
+                let m = rd.meta(r).await.unwrap();
+                let after = cache.stats();
+                let held: usize = m.shared.values().flatten().map(|p| p.key.len()).sum();
+                if after.entries > before.entries {
+                    let charged = after.bytes - before.bytes;
+                    assert!(charged >= held, "part metadata holding {held} bytes of paths is charged {charged}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn dictionary_code_widths_roundtrip() {
+        rt().block_on(async {
+            let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            for (day, n) in [(0i64, 256usize), (1, 257), (2, 65_536), (3, 65_537)] {
+                for c in 0..(n / 5000 + 1) {
+                    let rows: Vec<Json> = (c * 5000..((c + 1) * 5000).min(n))
+                        .map(|i| {
+                            json!({"time": T0 + day * DAY + i as i64, "event": "a", "user": format!("u{i}"),
+                            "props": {"p": format!("v{i}")}})
+                        })
+                        .collect();
+                    ins(&db, rows).await;
+                }
+            }
+            let probe = |i: usize| json!({"col": "user", "op": "eq", "value": format!("u{i}")});
+            let pprobe = |i: usize| json!({"col": "props", "path": ["p"], "op": "eq", "value": format!("v{i}")});
+            let mut want = Vec::new();
+            for i in [0, 255, 256, 65_535, 65_536] {
+                want.push((count(&db, probe(i)).await, count(&db, pprobe(i)).await));
+            }
+            while maint::seal(&db, id).await.unwrap() {}
+            let mut got = Vec::new();
+            for i in [0, 255, 256, 65_535, 65_536] {
+                got.push((count(&db, probe(i)).await, count(&db, pprobe(i)).await));
+            }
+            assert_eq!(got, want);
+        });
+    }
+}
+
+mod query_limits {
+    use super::*;
+
+    async fn table_id(db: &Arc<Db>) -> u32 {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        get_schema(&mut t, "events").await.unwrap().id
+    }
+
+    async fn run_with(db: &Arc<Db>, q: Json, limits: Limits) -> Result<exec::Output> {
+        let q = Query::parse(q).unwrap();
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let s = get_schema(&mut t, "events").await.unwrap();
+        exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await
+    }
+
+    /// Group keys hold the same bytes whatever the aggregates are, so adding
+    /// a `min` must not let a query past the state limit that `count` alone
+    /// cannot pass.
+    #[test]
+    fn the_state_limit_counts_group_keys_for_every_aggregate() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            let pad = "x".repeat(20_000);
+            for chunk in 0..8i64 {
+                let rows: Vec<Json> = (0..8i64)
+                    .map(|i| {
+                        let d = chunk * 8 + i;
+                        json!({"time": T0 + d * DAY, "event": "a", "user": format!("{d}{pad}"), "n": d})
+                    })
+                    .collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            }
+            while maint::seal(&db, id).await.unwrap() {}
+            let limits = Limits { max_memory_bytes: 512 << 10, ..Limits::default() };
+            let base = json!({"from": T0, "to": T0 + 64 * DAY, "group_by": ["user"]});
+            let mut count_only = base.clone();
+            count_only["aggregates"] = json!({"c": {"fn": "count"}});
+            let mut with_min = base.clone();
+            with_min["aggregates"] = json!({"c": {"fn": "count"}, "m": {"fn": "min", "of": "n"}});
+            let a = run_with(&db, count_only, limits).await;
+            assert!(
+                matches!(a, Err(Error::TooLarge(_))),
+                "64 keys of 20 KB exceed 512 KiB: {:?}",
+                a.map(|o| o.rows.len())
+            );
+            let b = run_with(&db, with_min, limits).await;
+            assert!(
+                matches!(b, Err(Error::TooLarge(_))),
+                "the same 1.3 MB of group keys pass a 512 KiB limit once a min is added: {:?}",
+                b.map(|o| o.rows.len())
+            );
+        });
+    }
+
+    /// A query whose reads never wait (warm caches, an in-memory store) still
+    /// stops at its time limit.
+    #[test]
+    fn a_query_whose_reads_never_wait_stops_at_its_time_limit() {
+        crate::probe::record();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        rt.block_on(async {
+            let (eng, _store, _env) = engine(1, EngineConfig { cache_bytes: 256 << 20, ..cfg() });
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            for c in 0..100i64 {
+                let rows: Vec<Json> = (0..1000i64)
+                    .map(|i| json!({"time": T0 + c * 1000 + i, "event": "a", "user": format!("u{}", c * 1000 + i), "n": i}))
+                    .collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            }
+            while maint::seal(&db, id).await.unwrap() {}
+            let q = json!({"from": T0, "to": T0 + DAY, "group_by": ["user"],
+                "aggregates": {"u": {"fn": "uniq_exact", "of": "n"}}});
+            let start = tokio::time::Instant::now();
+            let warm = run_with(&db, q.clone(), Limits::default()).await.unwrap();
+            let warm_ms = start.elapsed().as_millis();
+            assert_eq!(warm.rows.len(), 100_000);
+            let r = run_with(&db, q, Limits { max_ms: 1, ..Limits::default() }).await;
+            assert!(
+                warm_ms < 5 || matches!(r, Err(Error::Unavailable { .. })),
+                "a query that runs {warm_ms} ms answered within a 1 ms limit: {:?}",
+                r.map(|o| o.rows.len())
+            );
+        });
+    }
+
+    /// Accounting for aggregation state costs no more than the aggregation:
+    /// a `min` per group is not much slower than a `count` per group.
+    #[test]
+    fn state_accounting_is_not_quadratic_in_groups() {
+        crate::probe::record();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        rt.block_on(async {
+            let (eng, _store, _env) = engine(1, EngineConfig { cache_bytes: 256 << 20, ..cfg() });
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            for c in 0..100i64 {
+                let rows: Vec<Json> = (0..1000i64)
+                    .map(|i| json!({"time": T0 + c * 1000 + i, "event": "a", "user": format!("u{}", c * 1000 + i), "n": i}))
+                    .collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            }
+            while maint::seal(&db, id).await.unwrap() {}
+            let mut times = Vec::new();
+            for agg in [json!({"fn": "count"}), json!({"fn": "min", "of": "n"})] {
+                let q = json!({"from": T0, "to": T0 + DAY, "group_by": ["user"], "aggregates": {"a": agg}});
+                let mut best = u128::MAX;
+                for _ in 0..3 {
+                    let start = tokio::time::Instant::now();
+                    let out = run_with(&db, q.clone(), Limits::default()).await.unwrap();
+                    assert_eq!(out.rows.len(), 100_000);
+                    best = best.min(start.elapsed().as_millis());
+                }
+                times.push(best);
+            }
+            assert!(times[1] <= 3 * times[0].max(10), "count took {} ms, min took {} ms", times[0], times[1]);
+        });
+    }
+
+    /// Rows mode keeps whole rows in memory; the state limit must bound them too.
+    #[test]
+    fn rows_mode_is_bounded_by_the_memory_limit() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let pad = "y".repeat(20_000);
+            for chunk in 0..8i64 {
+                let rows: Vec<Json> = (0..8i64)
+                    .map(|i| json!({"time": T0 + chunk * 8 + i, "event": "a", "props": {"blob": format!("{chunk}{i}{pad}")}}))
+                    .collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            }
+            let limits = Limits { max_memory_bytes: 256 << 10, ..Limits::default() };
+            let q = json!({"from": T0, "to": T0 + DAY, "columns": ["props"], "limit": 1000});
+            let r = run_with(&db, q, limits).await;
+            assert!(
+                matches!(r, Err(Error::TooLarge(_))),
+                "1.3 MB of rows held under a 256 KiB memory limit: {:?}",
+                r.map(|o| o.rows.len())
+            );
+        });
+    }
+
+    /// Ints and floats beyond 2^53 in one JSON path sort consistently, so a
+    /// query neither panics nor pages them out of order.
+    #[test]
+    fn large_mixed_numbers_sort_and_page_exactly() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let base = 1i64 << 53;
+            let mut r = Rng::new(3);
+            let mut rows = Vec::new();
+            for i in 0..3000i64 {
+                let k = r.below(64) as i64;
+                let v = if r.chance(0.5) { json!(base + k) } else { json!((base + 2 * (k / 2)) as f64) };
+                rows.push(json!({"time": T0 + i, "event": "a", "props": {"v": v}}));
+            }
+            for c in rows.chunks(500) {
+                let c = c.to_vec();
+                txn_do(&db, async |t| insert(t, "events", &c, 0).await).await.unwrap();
+            }
+            let cols = json!([{"col": "props", "path": ["v"], "as": "v"}, "time"]);
+            let full = query(
+                &db,
+                &json!({"from": T0, "to": T0 + DAY, "columns": cols, "order_by": ["v"], "limit": 10_000}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(full.rows.len(), 3000);
+            let mut got = Vec::new();
+            let mut cursor = Json::Null;
+            loop {
+                let page = query(
+                    &db,
+                    &json!({"from": T0, "to": T0 + DAY, "columns": cols, "order_by": ["v"], "limit": 97, "cursor": cursor}),
+                )
+                .await
+                .unwrap();
+                got.extend(page.rows);
+                match page.next_cursor {
+                    Some(c) => cursor = json!(c),
+                    None => break,
+                }
+                assert!(got.len() <= 3000, "pages return more rows than the table holds");
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            let dups = got.iter().filter(|r| !seen.insert(r[1].as_i64().unwrap())).count();
+            assert_eq!((got.len(), dups), (3000, 0), "paging returned {} rows, {dups} repeated", got.len());
+        });
+    }
+
+    /// Quantiles stay within 1% of finite values at both ends of the range.
+    #[test]
+    fn quantiles_of_extreme_values_are_finite() {
+        for x in [1e308, f64::MAX, -1e308, 1e-305, 5e-324] {
+            let mut d = super::sketch::DdSketch::default();
+            d.add(x);
+            let q = d.quantile(0.5).unwrap();
+            assert!(q.is_finite() && ((q - x) / x).abs() <= 0.0101, "median of [{x:e}] is {q:e}");
+        }
     }
 }

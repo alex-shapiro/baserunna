@@ -29,7 +29,7 @@ const BLOOM_BITS_PER_KEY: usize = 10;
 const CODEC_RAW: u8 = 0;
 const CODEC_ZSTD: u8 = 1;
 /// Decompressed blocks larger than this are rejected as corrupt.
-const MAX_BLOCK_RAW: u64 = 64 << 20;
+pub(crate) const MAX_BLOCK_RAW: u64 = 64 << 20;
 /// Smallest valid block: codec, entry count and checksum.
 const MIN_BLOCK_LEN: u32 = 9;
 

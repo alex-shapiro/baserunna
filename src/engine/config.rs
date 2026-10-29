@@ -111,6 +111,9 @@ pub struct EngineConfig {
     pub event_settle_ms: u64,
     /// JSON paths stored as their own columns in each part; the rest share buckets.
     pub event_json_max_paths: usize,
+    /// Bytes of shared JSON path keys a part's metadata lists; past it, the
+    /// most common are listed and readers check the buckets for the rest.
+    pub event_json_directory_bytes: usize,
     /// Parts a query or delete reads at once.
     pub event_read_concurrency: usize,
     /// An event part `GET` unanswered after this long is sent again, and the
@@ -178,6 +181,7 @@ impl Default for EngineConfig {
             event_merge_max_ms: 30 * 60_000,
             event_settle_ms: 24 * 3_600_000,
             event_json_max_paths: 1024,
+            event_json_directory_bytes: 1 << 20,
             event_read_concurrency: 32,
             event_get_hedge_ms: 1_000,
         }

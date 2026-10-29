@@ -88,6 +88,15 @@ impl Val {
         self.total_cmp(o).then_with(|| self.canonical_bytes().cmp(&o.canonical_bytes()))
     }
 
+    /// Bytes the value holds beyond its own size, about.
+    pub fn mem_size(&self) -> usize {
+        match self {
+            Val::Str(s) => s.len(),
+            Val::Json(_) | Val::List(_) => self.canonical_bytes().len(),
+            _ => 0,
+        }
+    }
+
     /// Bytes equal exactly for values that compare equal.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(16);
@@ -140,16 +149,23 @@ impl Val {
         }
     }
 
+    /// Compares two numbers by their exact values.
+    pub fn num_cmp(&self, o: &Val) -> Option<Ordering> {
+        Some(match (self, o) {
+            (Val::Int(a), Val::Int(b)) => a.cmp(b),
+            (Val::Float(a), Val::Float(b)) => a.total_cmp(b),
+            (Val::Int(a), Val::Float(b)) => int_float_cmp(*a, *b),
+            (Val::Float(a), Val::Int(b)) => int_float_cmp(*b, *a).reverse(),
+            _ => return None,
+        })
+    }
+
     /// A total order: null, booleans, numbers by value, strings by bytes,
     /// then JSON and lists by their canonical bytes.
     pub fn total_cmp(&self, o: &Val) -> Ordering {
         match (self, o) {
             (Val::Bool(a), Val::Bool(b)) => a.cmp(b),
-            (Val::Int(a), Val::Int(b)) => a.cmp(b),
-            (Val::Int(_) | Val::Float(_), Val::Int(_) | Val::Float(_)) => {
-                let (a, b) = (self.as_f64().unwrap_or(0.0), o.as_f64().unwrap_or(0.0));
-                a.total_cmp(&b)
-            }
+            (Val::Int(_) | Val::Float(_), Val::Int(_) | Val::Float(_)) => self.num_cmp(o).unwrap_or(Ordering::Equal),
             (Val::Str(a), Val::Str(b)) => a.as_bytes().cmp(b.as_bytes()),
             _ if self.rank() == o.rank() => self.canonical_bytes().cmp(&o.canonical_bytes()),
             _ => self.rank().cmp(&o.rank()),
@@ -260,6 +276,48 @@ impl SumState {
     }
 }
 
+/// Compares integer `i` with float `f` exactly, where converting either to
+/// the other's type would round.
+fn int_float_cmp(i: i64, f: f64) -> Ordering {
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if f.is_nan() || f >= TWO_63 {
+        return Ordering::Less;
+    }
+    if f < -TWO_63 {
+        return Ordering::Greater;
+    }
+    let t = f.trunc();
+    match i.cmp(&(t as i64)) {
+        Ordering::Equal if f > t => Ordering::Less,
+        Ordering::Equal if f < t => Ordering::Greater,
+        o => o,
+    }
+}
+
+/// The distinct values of a `uniq_exact`, counting the bytes they hold.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExactSet {
+    set: BTreeSet<Vec<u8>>,
+    bytes: usize,
+}
+
+impl ExactSet {
+    fn insert(&mut self, v: Vec<u8>) {
+        let n = v.len() + 32;
+        if self.set.insert(v) {
+            self.bytes += n;
+        }
+    }
+}
+
+impl FromIterator<Vec<u8>> for ExactSet {
+    fn from_iter<I: IntoIterator<Item = Vec<u8>>>(it: I) -> ExactSet {
+        let mut s = ExactSet::default();
+        it.into_iter().for_each(|v| s.insert(v));
+        s
+    }
+}
+
 /// An aggregate's partial state.
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
@@ -271,7 +329,7 @@ pub enum State {
     Max(Option<Val>),
     Avg(SumState, u64),
     Uniq(Hll),
-    UniqExact(BTreeSet<Vec<u8>>),
+    UniqExact(ExactSet),
     Quantiles(DdSketch),
     /// `(time, position, steps matched)` of each event of the group.
     Funnel(Vec<(i64, Pos, u32)>),
@@ -287,7 +345,7 @@ impl State {
             AggFn::Max => State::Max(None),
             AggFn::Avg => State::Avg(SumState::default(), 0),
             AggFn::Uniq => State::Uniq(Hll::default()),
-            AggFn::UniqExact => State::UniqExact(BTreeSet::new()),
+            AggFn::UniqExact => State::UniqExact(ExactSet::default()),
             AggFn::Quantiles(_) => State::Quantiles(DdSketch::default()),
             AggFn::WindowFunnel { .. } => State::Funnel(Vec::new()),
             AggFn::Retention(_) => State::Retention(0),
@@ -383,7 +441,7 @@ impl State {
                 *n += m;
             }
             (State::Uniq(a), State::Uniq(b)) => a.merge(b),
-            (State::UniqExact(a), State::UniqExact(b)) => a.extend(b.iter().cloned()),
+            (State::UniqExact(a), State::UniqExact(b)) => b.set.iter().for_each(|v| a.insert(v.clone())),
             (State::Quantiles(a), State::Quantiles(b)) => a.merge(b),
             (State::Funnel(a), State::Funnel(b)) => a.extend_from_slice(b),
             (State::Retention(a), State::Retention(b)) => *a |= b,
@@ -400,7 +458,7 @@ impl State {
             (State::Avg(_, 0), _) => Val::Null,
             (State::Avg(s, n), _) => Val::Float(s.exact().value() / *n as f64),
             (State::Uniq(h), _) => Val::Int(h.estimate() as i64),
-            (State::UniqExact(s), _) => Val::Int(s.len() as i64),
+            (State::UniqExact(s), _) => Val::Int(s.set.len() as i64),
             (State::Quantiles(d), AggFn::Quantiles(qs)) => {
                 Val::List(qs.iter().map(|q| d.quantile(*q).map_or(Val::Null, Val::Float)).collect())
             }
@@ -419,9 +477,9 @@ impl State {
     pub fn mem_size(&self) -> usize {
         32 + match self {
             State::SumList(l) => l.len() * 64,
-            State::Min(Some(v)) | State::Max(Some(v)) => v.canonical_bytes().len(),
+            State::Min(Some(v)) | State::Max(Some(v)) => v.mem_size(),
             State::Uniq(h) => h.mem_size(),
-            State::UniqExact(s) => s.iter().map(|b| b.len() + 32).sum(),
+            State::UniqExact(s) => s.bytes,
             State::Quantiles(d) => d.mem_size(),
             State::Funnel(e) => e.len() * 32,
             _ => 32,
@@ -464,8 +522,8 @@ impl State {
             }
             State::UniqExact(set) => {
                 w.u8(7);
-                w.varint(set.len() as u64);
-                set.iter().for_each(|b| w.bytes(b));
+                w.varint(set.set.len() as u64);
+                set.set.iter().for_each(|b| w.bytes(b));
             }
             State::Quantiles(d) => {
                 w.u8(8);

@@ -7,7 +7,7 @@
 //! with another merge of the same parts) fails validation and is retried
 //! from a new snapshot, and its outputs are deleted at once.
 
-use super::build::{PosRow, choose_paths, dictionary, write_rows};
+use super::build::{PathPlan, PosRow, dictionary, plan_paths, write_rows};
 use super::json::{self, JType};
 use super::part::{self, Caching, ColPlan, ColRef, PartMeta, ReadStats, Reading, SharedPath, Sink, Source};
 use super::query::Filter;
@@ -265,6 +265,8 @@ enum Feed {
     /// The input's version (from its reference) or ordinal.
     Version,
     Ordinal,
+    /// The row's stored bytes.
+    RowBytes,
     None,
 }
 
@@ -297,7 +299,9 @@ struct MergeSource<'a> {
     kinds: Vec<OutKind>,
     feeds: Vec<Vec<Feed>>,
     shared_out: BTreeMap<u32, Vec<SharedPath>>,
-    row_bytes: u64,
+    partial_out: BTreeSet<u32>,
+    /// Each output row's stored bytes.
+    bytes: Vec<u64>,
     cursors: BTreeMap<(usize, usize, usize), Cursor>,
     cursor_plan: usize,
     /// The default each output column stores for rows that lack a value.
@@ -384,8 +388,8 @@ impl Source for MergeSource<'_> {
         self.order.len() as u64
     }
 
-    fn row_bytes(&self, _: u64) -> u64 {
-        self.row_bytes
+    fn row_bytes(&self, i: u64) -> u64 {
+        self.bytes[i as usize]
     }
 
     fn key_at(&self, i: u64) -> Bytes {
@@ -398,6 +402,10 @@ impl Source for MergeSource<'_> {
 
     fn shared_paths(&self) -> BTreeMap<u32, Vec<SharedPath>> {
         self.shared_out.clone()
+    }
+
+    fn partial_paths(&self) -> BTreeSet<u32> {
+        self.partial_out.clone()
     }
 
     async fn column(&mut self, plan: usize, rows: Range<u64>) -> Result<Vector> {
@@ -424,6 +432,7 @@ impl Source for MergeSource<'_> {
                     Some(ci) => self.input_val(i, ci, row, plan).await?,
                     None => Val::Int(0),
                 },
+                Feed::RowBytes => Val::Int(self.bytes[out as usize] as i64),
                 Feed::Col(ci) => self.input_val(i, ci, row, plan).await?,
                 Feed::SharedPath(ci, key) => match self.input_val(i, ci, row, plan).await? {
                     Val::Json(Json::Object(o)) => o.get(&key).map_or(Val::Null, Val::from_json),
@@ -497,7 +506,7 @@ async fn merge_parts(
         ins.push(Input { r: r.clone(), meta: rd.meta(r).await?, mask: rd.mask(r).await? });
     }
     let sort_ids = s.sort_ids();
-    let mut entries: Vec<(Bytes, Pos, u16, u32)> = Vec::new();
+    let mut entries: Vec<(Bytes, Pos, u16, u32, u64)> = Vec::new();
     for (i, inp) in ins.iter().enumerate() {
         let g = 0..inp.meta.granule_count();
         let mut cols = Vec::new();
@@ -514,6 +523,10 @@ async fn merge_parts(
         let vers = match (inp.r.version, inp.meta.find(&ColRef::Version)) {
             (None, Some(ci)) => Some(rd.column(&inp.r, &inp.meta, ci, g.clone()).await?),
             _ => None,
+        };
+        let sizes = match inp.meta.find(&ColRef::RowBytes) {
+            Some(ci) => Some(rd.column(&inp.r, &inp.meta, ci, g.clone()).await?),
+            None => return Err(Error::internal(format!("part {} does not store its row sizes", inp.r.id))),
         };
         for row in 0..inp.meta.rows as usize {
             if inp.mask.contains(row as u32) {
@@ -535,20 +548,20 @@ async fn merge_parts(
             };
             let version = inp.r.version.unwrap_or(int_at(&vers) as u64);
             let pos = Pos { version, ordinal: int_at(&ords) as u32 };
-            entries.push((Bytes::from(tuple::encode(&keys)), pos, i as u16, row as u32));
+            entries.push((Bytes::from(tuple::encode(&keys)), pos, i as u16, row as u32, int_at(&sizes) as u64));
         }
     }
     if entries.is_empty() {
         return Ok(None);
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    let live: u64 = entries.len() as u64;
-    let raw: u64 = ins.iter().map(|i| i.r.raw_size * i.r.live_rows() / i.r.rows.max(1)).sum();
     let blooms: BTreeSet<u32> = s.bloom_ids().into_iter().collect();
     let mut plans = Vec::new();
     let mut kinds = Vec::new();
     let mut feeds: Vec<Vec<Feed>> = Vec::new();
     let mut shared_out = BTreeMap::new();
+    let mut partial_out = BTreeSet::new();
+    let json_columns = s.columns.iter().filter(|c| c.ty == EvType::Json).count();
     let stored: BTreeMap<u32, super::agg::Val> =
         super::build::stored_defaults(s).into_iter().map(|(id, d)| (id, super::exec::datum_val(&d))).collect();
     for c in &s.columns {
@@ -594,7 +607,33 @@ async fn merge_parts(
                     .or_insert((p.count, p.ty));
             }
         }
-        let chosen = Arc::new(choose_paths(&stats, shared.cfg.event_json_max_paths));
+        // An input whose directory is partial may hold any path, of any type,
+        // in its buckets: paths it does not name are typed as JSON text.
+        let partial_in = ins.iter().any(|i| i.meta.partial.contains(&c.id));
+        for inp in ins.iter().filter(|i| i.meta.partial.contains(&c.id)) {
+            let named: BTreeSet<&str> = inp
+                .meta
+                .paths(c.id)
+                .map(|(_, k)| k)
+                .chain(inp.meta.shared.get(&c.id).into_iter().flatten().map(|p| p.key.as_str()))
+                .collect();
+            for (key, (_, ty)) in stats.iter_mut() {
+                if !named.contains(key.as_str()) {
+                    *ty = ty.join(JType::Dyn);
+                }
+            }
+        }
+        let PathPlan { chosen, listed, partial, mut buckets } =
+            plan_paths(&stats, &shared.cfg, json_columns, partial_in);
+        for inp in ins.iter().filter(|i| i.meta.partial.contains(&c.id)) {
+            for m in &inp.meta.cols {
+                if let ColRef::Shared { col, bucket } = m.cref
+                    && col == c.id
+                {
+                    buckets.insert(bucket);
+                }
+            }
+        }
         for key in chosen.iter() {
             let ty = stats[key].1;
             let (phys, js) = match ty {
@@ -609,9 +648,7 @@ async fn merge_parts(
                 .map(|inp| match inp.meta.find(&ColRef::Path { col: c.id, key: key.clone() }) {
                     Some(ci) => Feed::Col(ci),
                     None => match inp.meta.find(&ColRef::Shared { col: c.id, bucket: json::bucket(key) }) {
-                        Some(ci) if inp.meta.shared.get(&c.id).is_some_and(|ps| ps.iter().any(|p| p.key == *key)) => {
-                            Feed::SharedPath(ci, key.clone())
-                        }
+                        Some(ci) if inp.meta.may_share(c.id, key) => Feed::SharedPath(ci, key.clone()),
                         _ => Feed::None,
                     },
                 })
@@ -642,12 +679,6 @@ async fn merge_parts(
             kinds.push(OutKind::Plain);
             feeds.push(path_feeds);
         }
-        let rest: Vec<SharedPath> = stats
-            .iter()
-            .filter(|(k, _)| !chosen.contains(*k))
-            .map(|(k, (n, t))| SharedPath { key: k.clone(), count: *n, ty: *t })
-            .collect();
-        let buckets: BTreeSet<u8> = rest.iter().map(|p| json::bucket(&p.key)).collect();
         for b in buckets {
             let bucket_feeds: Vec<Feed> = ins
                 .iter()
@@ -672,8 +703,11 @@ async fn merge_parts(
             kinds.push(OutKind::Bucket(chosen.clone()));
             feeds.push(bucket_feeds);
         }
-        if !rest.is_empty() {
-            shared_out.insert(c.id, rest);
+        if !listed.is_empty() {
+            shared_out.insert(c.id, listed);
+        }
+        if partial {
+            partial_out.insert(c.id);
         }
     }
     plans.push(ColPlan { cref: ColRef::Version, phys: Phys::Int, json: false, dict: None, bloom: false });
@@ -682,6 +716,9 @@ async fn merge_parts(
     plans.push(ColPlan { cref: ColRef::Ordinal, phys: Phys::Int, json: false, dict: None, bloom: false });
     kinds.push(OutKind::Plain);
     feeds.push(vec![Feed::Ordinal; ins.len()]);
+    plans.push(ColPlan { cref: ColRef::RowBytes, phys: Phys::Int, json: false, dict: None, bloom: false });
+    kinds.push(OutKind::Plain);
+    feeds.push(vec![Feed::RowBytes; ins.len()]);
     let defaults: Vec<Option<super::agg::Val>> = plans
         .iter()
         .map(|p| match &p.cref {
@@ -695,6 +732,7 @@ async fn merge_parts(
     let partition = inputs[0].partition;
     let keys: Vec<Bytes> = entries.iter().map(|e| e.0.clone()).collect();
     let order: Vec<(u16, u32)> = entries.iter().map(|e| (e.2, e.3)).collect();
+    let bytes: Vec<u64> = entries.iter().map(|e| e.4).collect();
     let (min_time, max_time) =
         inputs.iter().fold((i64::MAX, i64::MIN), |(lo, hi), r| (lo.min(r.min_time), hi.max(r.max_time)));
     let mut src = MergeSource {
@@ -706,7 +744,8 @@ async fn merge_parts(
         kinds,
         feeds,
         shared_out,
-        row_bytes: (raw / live.max(1)).max(1),
+        partial_out,
+        bytes,
         cursors: BTreeMap::new(),
         cursor_plan: usize::MAX,
         defaults,

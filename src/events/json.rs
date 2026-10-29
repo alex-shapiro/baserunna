@@ -41,6 +41,28 @@ pub fn path_segments(key: &str) -> Option<Vec<String>> {
     serde_json::from_str(key).ok()
 }
 
+/// The bytes of `o`'s leaves as an object keyed by canonical path, the most
+/// that the path and shared bucket columns of a part hold for `o`.
+pub fn flattened_len(o: &Map<String, Json>) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut n = Count(2);
+    for (k, v) in flatten(o) {
+        let _ = serde_json::to_writer(&mut n, &k);
+        let _ = serde_json::to_writer(&mut n, v);
+        n.0 += 2;
+    }
+    n.0
+}
+
 /// Leaf paths of `o` as canonical keys, with their values.
 pub fn flatten(o: &Map<String, Json>) -> Vec<(String, &Json)> {
     fn walk<'a>(o: &'a Map<String, Json>, prefix: &mut Vec<String>, out: &mut Vec<(String, &'a Json)>) {

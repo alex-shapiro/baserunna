@@ -255,6 +255,12 @@ pub fn validate_rows(s: &EventSchema, rows: &[Json], now_ms: i64) -> Result<Vec<
             if encode_row(&row).len() > schema::ROW_MAX_BYTES {
                 return Err(Error::TooLarge(format!("event {i} exceeds {} bytes", schema::ROW_MAX_BYTES)));
             }
+            if build::stored_len(&row) > schema::ROW_STORED_MAX_BYTES {
+                return Err(Error::TooLarge(format!(
+                    "event {i}'s JSON flattens to more than {} bytes of paths and values",
+                    schema::ROW_STORED_MAX_BYTES
+                )));
+            }
             Ok(row)
         })
         .collect()

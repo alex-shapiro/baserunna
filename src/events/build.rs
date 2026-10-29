@@ -9,6 +9,7 @@ use crate::engine::Shared;
 use crate::engine::events::{PartRef, Pos};
 use crate::error::Result;
 use crate::table::schema::{Datum, Row, encode_row};
+use crate::table::tuple::{self, Key};
 use bytes::Bytes;
 use serde_json::{Map, Value as Json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,20 +41,52 @@ pub fn build_cost(len: usize) -> usize {
     3 * len + 256
 }
 
-/// Takes from `rows` the next part's: about `max_bytes` of encodings and
-/// [`PART_BUILD_BYTES`] of decoded rows, at least one row.
-pub fn next_part<'a>(
-    rows: &mut std::iter::Peekable<impl Iterator<Item = (Pos, &'a [u8])>>,
-    max_bytes: usize,
-) -> Vec<(Pos, &'a [u8])> {
-    let (mut group, mut bytes, mut cost) = (Vec::new(), 0, 0);
-    while let Some((_, r)) = rows.peek() {
-        let (n, c) = (r.len() + 12, build_cost(r.len()));
-        if !group.is_empty() && (bytes + n > max_bytes || cost + c > PART_BUILD_BYTES) {
+/// What rows gathered into a part take: the bytes the part stores for them
+/// (their [`Defaults::stored_len`]), which `event_insert_part_max_bytes`
+/// bounds, and the memory of building it (their [`build_cost`]), which
+/// [`PART_BUILD_BYTES`] bounds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PartSize {
+    pub stored: usize,
+    pub cost: usize,
+}
+
+impl PartSize {
+    /// The size of `row`, encoded in `encoded` bytes.
+    pub fn of(row: &Row, encoded: usize, defaults: &Defaults) -> PartSize {
+        PartSize { stored: defaults.stored_len(row), cost: build_cost(encoded) }
+    }
+
+    pub fn fits(self, max_bytes: usize) -> bool {
+        self.stored <= max_bytes && self.cost <= PART_BUILD_BYTES
+    }
+
+    /// The most parts that [`next_part`] cuts rows of this size into: each
+    /// holds at least half of one of the limits.
+    pub fn parts(self, max_bytes: usize) -> usize {
+        1 + self.stored / (max_bytes / 2).max(1) + self.cost / (PART_BUILD_BYTES / 2)
+    }
+}
+
+impl std::ops::Add for PartSize {
+    type Output = PartSize;
+
+    fn add(self, o: PartSize) -> PartSize {
+        PartSize { stored: self.stored + o.stored, cost: self.cost + o.cost }
+    }
+}
+
+/// Takes from `rows` the next part's: rows of at most `max_bytes` stored
+/// and [`PART_BUILD_BYTES`] of build cost, at least one row.
+pub fn next_part<T>(rows: &mut std::iter::Peekable<impl Iterator<Item = (PartSize, T)>>, max_bytes: usize) -> Vec<T> {
+    let (mut group, mut size) = (Vec::new(), PartSize::default());
+    while let Some((n, _)) = rows.peek() {
+        let grown = size + *n;
+        if !group.is_empty() && !grown.fits(max_bytes) {
             break;
         }
-        (bytes, cost) = (bytes + n, cost + c);
-        group.extend(rows.next());
+        size = grown;
+        group.extend(rows.next().map(|(_, r)| r));
     }
     group
 }
@@ -70,20 +103,33 @@ pub async fn write_encoded<'a>(
     versions: bool,
     out: &mut Vec<(PartRef, Vec<Pos>)>,
 ) -> Result<()> {
-    let mut rows = rows.peekable();
+    let defaults = Defaults::of(schema);
+    let mut rows = Decoding { rows, defaults: &defaults }.peekable();
     while rows.peek().is_some() {
-        let decoded = next_part(&mut rows, shared.cfg.event_insert_part_max_bytes)
-            .into_iter()
-            .map(|(pos, r)| {
-                let row = crate::table::schema::decode_row(r)
-                    .map_err(|_| crate::error::Error::internal("corrupt event row"))?;
-                Ok(PosRow { pos, row })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let decoded =
+            next_part(&mut rows, shared.cfg.event_insert_part_max_bytes).into_iter().collect::<Result<Vec<_>>>()?;
         let (part, src) = write_rows(shared, db, schema, partition, decoded, versions).await?;
         out.push((part, src.sorted().iter().map(|r| r.pos).collect()));
     }
     Ok(())
+}
+
+/// Encoded rows, decoded as they are taken, with their sizes.
+struct Decoding<'d, I> {
+    rows: I,
+    defaults: &'d Defaults,
+}
+
+impl<'a, I: Iterator<Item = (Pos, &'a [u8])>> Iterator for Decoding<'_, I> {
+    type Item = (PartSize, Result<PosRow>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (pos, r) = self.rows.next()?;
+        Some(match crate::table::schema::decode_row(r) {
+            Ok(row) => (PartSize::of(&row, r.len(), self.defaults), Ok(PosRow { pos, row })),
+            Err(_) => (PartSize::default(), Err(crate::error::Error::internal("corrupt event row"))),
+        })
+    }
 }
 
 /// A row to write: its position and values.
@@ -114,6 +160,7 @@ pub struct RowsSource {
     leaves: BTreeMap<u32, Vec<BTreeMap<String, Json>>>,
     shared: BTreeMap<u32, Vec<SharedPath>>,
     partial: BTreeSet<u32>,
+    defaults: Defaults,
 }
 
 fn phys_of(t: EvType) -> Phys {
@@ -140,20 +187,56 @@ pub fn dictionary<'a>(vals: impl Iterator<Item = &'a str>) -> Option<Arc<Vec<Str
     Some(Arc::new(set.into_iter().map(str::to_string).collect()))
 }
 
-/// The defaults that parts store for rows written before their column was
-/// added, so that every read of such a row sees the default.
-pub fn stored_defaults(schema: &EventSchema) -> Vec<(u32, Datum)> {
-    schema
-        .columns
-        .iter()
-        .filter_map(|c| {
-            let d = c.default.as_ref()?;
-            match super::schema::datum(c, d) {
-                Ok(v) if !v.is_null() && c.ty != EvType::Json => Some((c.id, v)),
-                _ => None,
-            }
-        })
-        .collect()
+/// The defaults of a table's columns that parts store for rows written
+/// before the column was added, so that every read of such a row sees the
+/// default. Rows are not filled with them: a part's builder writes a
+/// column's default where a row lacks it, so that a 1 KiB default costs
+/// nothing per row until it is encoded.
+#[derive(Clone, Debug, Default)]
+pub struct Defaults {
+    /// Each default, and the bytes it adds to a row's [`stored_len`].
+    cols: BTreeMap<u32, (Datum, usize)>,
+}
+
+impl Defaults {
+    pub fn of(schema: &EventSchema) -> Defaults {
+        let cols = schema
+            .columns
+            .iter()
+            .filter_map(|c| {
+                let d = c.default.as_ref()?;
+                match super::schema::datum(c, d) {
+                    Ok(v) if !v.is_null() && c.ty != EvType::Json => {
+                        let len = encode_row(&Row::from([(c.id, v.clone())])).len() - encode_row(&Row::new()).len();
+                        Some((c.id, (v, len)))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        Defaults { cols }
+    }
+
+    /// The default of column `id`, if parts store one.
+    pub fn get(&self, id: u32) -> Option<&Datum> {
+        self.cols.get(&id).map(|(d, _)| d)
+    }
+
+    /// The value of column `id` that a part stores for `row`.
+    pub fn value<'r>(&'r self, row: &'r Row, id: u32) -> Option<&'r Datum> {
+        row.get(&id).or_else(|| self.get(id))
+    }
+
+    /// The bytes that a row lacking column `id` grows by when the part
+    /// stores its default.
+    pub fn len(&self, id: u32) -> usize {
+        self.cols.get(&id).map_or(0, |(_, n)| *n)
+    }
+
+    /// The [`stored_len`] of `row` with the defaults it lacks.
+    pub fn stored_len(&self, row: &Row) -> usize {
+        stored_len(row) + self.cols.iter().filter(|(id, _)| !row.contains_key(id)).map(|(_, (_, n))| n).sum::<usize>()
+    }
 }
 
 /// Chooses the `max` most common paths to store as columns, the most
@@ -228,16 +311,20 @@ impl RowsSource {
         versions: bool,
         cfg: &crate::engine::EngineConfig,
     ) -> RowsSource {
-        for (id, d) in stored_defaults(schema) {
-            for r in rows.iter_mut() {
-                r.row.entry(id).or_insert_with(|| d.clone());
-            }
-        }
-        let mut keyed: Vec<(Vec<u8>, PosRow)> = rows.drain(..).map(|r| (schema.sort_key(&r.row), r)).collect();
+        let defaults = Defaults::of(schema);
+        let sort_ids = schema.sort_ids();
+        let sort_key = |row: &Row| {
+            let keys: Vec<Key> = sort_ids
+                .iter()
+                .map(|id| defaults.value(row, *id).and_then(Datum::to_key).unwrap_or(Key::Null))
+                .collect();
+            tuple::encode(&keys)
+        };
+        let mut keyed: Vec<(Vec<u8>, PosRow)> = rows.drain(..).map(|r| (sort_key(&r.row), r)).collect();
         keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.pos.cmp(&b.1.pos)));
         let keys: Vec<Bytes> = keyed.iter().map(|(k, _)| Bytes::from(k.clone())).collect();
         let rows: Vec<PosRow> = keyed.into_iter().map(|(_, r)| r).collect();
-        let bytes = rows.iter().map(|r| stored_len(&r.row) as u64).collect();
+        let bytes = rows.iter().map(|r| defaults.stored_len(&r.row) as u64).collect();
         let blooms: BTreeSet<u32> = schema.bloom_ids().into_iter().collect();
         let mut plans = Vec::new();
         let mut getters = Vec::new();
@@ -246,12 +333,12 @@ impl RowsSource {
         let mut partial = BTreeSet::new();
         let json_columns = schema.columns.iter().filter(|c| c.ty == EvType::Json).count();
         for c in &schema.columns {
-            if !rows.iter().any(|r| r.row.contains_key(&c.id)) {
+            if defaults.get(c.id).is_none() && !rows.iter().any(|r| r.row.contains_key(&c.id)) {
                 continue;
             }
             if c.ty != EvType::Json {
                 let dict = match c.ty {
-                    EvType::String => dictionary(rows.iter().filter_map(|r| match r.row.get(&c.id) {
+                    EvType::String => dictionary(rows.iter().filter_map(|r| match defaults.value(&r.row, c.id) {
                         Some(Datum::Str(s)) => Some(s.as_str()),
                         _ => None,
                     })),
@@ -338,7 +425,7 @@ impl RowsSource {
         getters.push(Getter::Ordinal);
         plans.push(ColPlan { cref: ColRef::RowBytes, phys: Phys::Int, json: false, dict: None, bloom: false });
         getters.push(Getter::RowBytes);
-        RowsSource { rows, bytes, keys, plans, getters, leaves, shared, partial }
+        RowsSource { rows, bytes, keys, plans, getters, leaves, shared, partial, defaults }
     }
 
     pub fn sorted(&self) -> &[PosRow] {
@@ -349,10 +436,7 @@ impl RowsSource {
         let rs = &self.rows[rows.clone()];
         match g {
             Getter::User(id) => {
-                fn get<'r>(r: &'r PosRow, id: &u32) -> Option<&'r Datum> {
-                    r.row.get(id)
-                }
-                let get = |r: &'a PosRow| get(r, id);
+                let get = |r: &'a PosRow| self.defaults.value(&r.row, *id);
                 match rs.iter().find_map(get) {
                     Some(Datum::Int(_)) | None => Vector::Int(
                         rs.iter()

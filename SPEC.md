@@ -868,7 +868,12 @@ committer, counts unsealed rows and bytes and the stored bytes of its parts.
 Once a table holds 128 KiB of unsealed rows, the lease holder
 seals them in a transaction: it writes parts per partition, then deletes the
 rows it sealed with one range delete and adds part refs. A seal conflicts
-only with a concurrent delete of those rows.
+only with a concurrent delete of those rows. A row written before a column
+with a default was added is sealed with the default, which the part's
+builder writes where the row lacks the column instead of copying it into
+the row, and which counts toward the 64 MiB of rows a part is built from;
+so 128 KiB of tiny events that 254 added 1 KiB defaults expand to over
+1 GB become parts of 64 MiB each, built in memory near their encoded size.
 
 #### Bulk inserts
 

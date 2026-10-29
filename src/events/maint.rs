@@ -7,7 +7,7 @@
 //! with another merge of the same parts) fails validation and is retried
 //! from a new snapshot, and its outputs are deleted at once.
 
-use super::build::{PART_BUILD_BYTES, PathPlan, build_cost, dictionary, plan_paths, write_encoded};
+use super::build::{Defaults, PartSize, PathPlan, dictionary, plan_paths, write_encoded};
 use super::json::{self, JType};
 use super::part::{self, Caching, ColPlan, ColRef, PartMeta, ReadStats, Reading, SharedPath, Sink, Source};
 use super::query::Filter;
@@ -87,12 +87,12 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
     let max_parts = refs_per_txn(cfg);
     let (mut bytes, mut rows, mut last) = (0u64, 0u64, None);
     let mut by_partition: BTreeMap<u32, Vec<(Pos, &[u8])>> = BTreeMap::new();
-    // Each partition's encoded bytes and build cost, which bound how many
-    // parts it is written as: a part holds at least half of either limit.
-    let mut sizes: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
-    let parts_of = |(enc, cost): (usize, usize)| {
-        1 + enc / (cfg.event_insert_part_max_bytes / 2).max(1) + cost / (PART_BUILD_BYTES / 2)
-    };
+    // Each partition's size, which bounds how many parts it is written as.
+    // Rows written before a column with a default was added are stored
+    // with it, so a part may store far more than its rows' encodings.
+    let mut sizes: BTreeMap<u32, PartSize> = BTreeMap::new();
+    let defaults = Defaults::of(&s);
+    let parts_of = |size: PartSize| size.parts(cfg.event_insert_part_max_bytes);
     let mut parts_needed = 0;
     for it in &items {
         let (_, pos) = ev::parse_row_key(&it.key).ok_or_else(|| Error::internal("bad unsealed row key"))?;
@@ -100,8 +100,7 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
         let row = decode_row(b).map_err(|_| Error::internal("corrupt unsealed row"))?;
         let partition = ev::partition_key(s.bucket(s.time_of(&row)));
         let old = sizes.get(&partition).copied();
-        let (enc, cost) = old.unwrap_or_default();
-        let new = (enc + b.len() + 12, cost + build_cost(b.len()));
+        let new = old.unwrap_or_default() + PartSize::of(&row, b.len(), &defaults);
         let needed = parts_needed - old.map_or(0, parts_of) + parts_of(new);
         if needed > max_parts && last.is_some() {
             break;
@@ -647,8 +646,9 @@ async fn merge_parts(
     let mut shared_out = BTreeMap::new();
     let mut partial_out = BTreeSet::new();
     let json_columns = s.columns.iter().filter(|c| c.ty == EvType::Json).count();
+    let stored_defaults = Defaults::of(s);
     let stored: BTreeMap<u32, super::agg::Val> =
-        super::build::stored_defaults(s).into_iter().map(|(id, d)| (id, super::exec::datum_val(&d))).collect();
+        s.columns.iter().filter_map(|c| Some((c.id, super::exec::datum_val(stored_defaults.get(c.id)?)))).collect();
     for c in &s.columns {
         let srcs: Vec<Option<usize>> = ins.iter().map(|i| i.meta.find(&ColRef::User(c.id))).collect();
         if srcs.iter().all(Option::is_none) {
@@ -830,8 +830,10 @@ async fn merge_parts(
                 .iter()
                 .enumerate()
                 .filter(|(p, _)| matches!(feeds[*p][i], Feed::None))
-                .filter_map(|(p, _)| defaults[p].as_ref())
-                .map(|d| d.mem_size() as u64 + 8)
+                .map(|(_, plan)| match plan.cref {
+                    ColRef::User(id) => stored_defaults.len(id) as u64,
+                    _ => 0,
+                })
                 .sum()
         })
         .collect();
@@ -1231,9 +1233,8 @@ mod tests {
 
     #[test]
     fn rows_split_by_size_and_build_cost() {
-        use super::super::build::{PART_BUILD_BYTES, build_cost, next_part};
-        let row = [b'x'; 100];
-        let rows = |n: u32| (0..n).map(|i| (Pos { version: 1, ordinal: i }, &row[..]));
+        use super::super::build::{PART_BUILD_BYTES, PartSize, build_cost, next_part};
+        let rows = |n: u32| (0..n).map(|i| (PartSize { stored: 112, cost: build_cost(100) }, i));
         let groups = |n: u32, max: usize| {
             let mut it = rows(n).peekable();
             let mut out = Vec::new();

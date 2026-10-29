@@ -2,7 +2,6 @@
 
 use crate::error::{Error, Result};
 use crate::table::schema::{Datum, Row, valid_ident};
-use crate::table::tuple::{self, Key};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json, json};
 
@@ -242,12 +241,6 @@ impl EventSchema {
             Some(Datum::Int(t)) => *t,
             _ => 0,
         }
-    }
-
-    pub fn sort_key(&self, row: &Row) -> Vec<u8> {
-        let keys: Vec<Key> =
-            self.sort_ids().iter().map(|id| row.get(id).and_then(Datum::to_key).unwrap_or(Key::Null)).collect();
-        tuple::encode(&keys)
     }
 
     /// The earliest time retained at `now_ms`: queries skip earlier events,

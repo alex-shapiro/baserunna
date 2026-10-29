@@ -353,3 +353,67 @@ fn events_expanded_by_defaults_stay_within_their_request_limit() {
         w.shutdown();
     });
 }
+
+/// Sets up table `ev` holding 4,400 unsealed `{}` events (29 bytes each, under
+/// the 128 KiB that seals them), then adds 254 string columns, each with a
+/// 1 KiB default, which those events lack.
+async fn unsealed_events_older_than_large_defaults(t: &str, router: &axum::Router) -> u64 {
+    use baserunna::sim::cost::call_router;
+    let table = r#"{"name": "ev", "columns": [{"name": "time", "type": "time", "default": "now"}],
+        "time_column": "time", "order_by": ["time"]}"#;
+    let r = call_router(router, "POST", "/v1/dbs/d/events", t, Bytes::from(table)).await;
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let rows = vec!["{}"; 4400].join(",");
+    let txn = format!(r#"{{"ops": [{{"op": "insert_events", "table": "ev", "rows": [{rows}]}}]}}"#);
+    let r = call_router(router, "POST", "/v1/dbs/d/txn", t, Bytes::from(txn)).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let pad = "x".repeat(baserunna::events::schema::DEFAULT_MAX_BYTES - 2);
+    for i in 0..254 {
+        let col = format!(r#"{{"name": "c{i}", "type": "string", "default": "{pad}"}}"#);
+        let r = call_router(router, "POST", "/v1/dbs/d/events/ev/columns", t, Bytes::from(col)).await;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    }
+    let info = call_router(router, "GET", "/v1/dbs/d/events/ev", t, Bytes::new()).await;
+    let info: serde_json::Value = serde_json::from_slice(&info.body).unwrap();
+    assert_eq!(info["unsealed_rows"], 4400, "{info}");
+    info["unsealed_bytes"].as_u64().unwrap()
+}
+
+/// Sealing events written before a column with a default was added fills
+/// the default into each of them; the seal holds memory near the size of
+/// the rows it seals, not the defaults' size times the events.
+#[test]
+fn sealing_events_older_than_added_defaults_stays_near_their_size() {
+    use baserunna::sim::cost::{World, call_router, run_paused};
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    run_paused(async {
+        let w = World::new(1, 0).await;
+        let t = w.signup(0, "mem@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let router = w.node(0).router().unwrap();
+        let unsealed = unsealed_events_older_than_large_defaults(&t, &router).await;
+        let before = reset_peak();
+        // One more event, which takes every default, passes the seal threshold.
+        let txn = r#"{"ops": [{"op": "insert_events", "table": "ev", "rows": [{}]}]}"#;
+        let r = call_router(&router, "POST", "/v1/dbs/d/txn", &t, Bytes::from(txn)).await;
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let mut sealed = false;
+        for _ in 0..600 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let info = call_router(&router, "GET", "/v1/dbs/d/events/ev", &t, Bytes::new()).await;
+            let info: serde_json::Value = serde_json::from_slice(&info.body).unwrap();
+            if info["unsealed_rows"] == 0 {
+                sealed = true;
+                break;
+            }
+        }
+        let grown = PEAK_BYTES.load(Relaxed) - before;
+        assert!(sealed, "the events were never sealed");
+        assert!(
+            grown < 256 * MIB as isize,
+            "sealing 4,401 events ({unsealed} unsealed bytes before the last) grew the heap by {grown} bytes ({}x)",
+            grown / unsealed as isize
+        );
+        w.shutdown();
+    });
+}

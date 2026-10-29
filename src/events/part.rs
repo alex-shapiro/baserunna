@@ -1174,7 +1174,12 @@ impl Reading<'_> {
                 if v.len() as u64 != meta.starts[last] - meta.starts[first] {
                     return Err(Error::internal("event block does not match its granules"));
                 }
-                self.remember_block(CacheKey::part(self.db, &r.id, ci as u32, bi as u32), v.clone(), raw.len() + 64);
+                // The index is charged for the part-level dictionary a block shares.
+                let size = match (&*v, &idx.dict) {
+                    (Vector::Str(s), Some(d)) if Arc::ptr_eq(&s.dict, d) => v.values_mem_size(),
+                    _ => v.mem_size(),
+                };
+                self.remember_block(CacheKey::part(self.db, &r.id, ci as u32, bi as u32), v.clone(), size);
                 decoded[bi - b0] = Some(v);
             }
             b = end;

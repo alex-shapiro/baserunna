@@ -3256,3 +3256,37 @@ mod liveness {
         }
     }
 }
+
+/// The cache charges a decoded column block for the memory it holds.
+#[test]
+fn cached_blocks_are_charged_their_decoded_size() {
+    rt().block_on(async {
+        let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
+        let (eng, _store, _env) = engine(1, cfg);
+        let db = create_db(&eng, "d").await;
+        for c in 0..5i64 {
+            let rows: Vec<Json> =
+                (0..10_000i64).map(|i| json!({"time": T0 + c * 10_000 + i, "event": "a", "n": 5})).collect();
+            txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+        }
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let s = get_schema(&mut t, "events").await.unwrap();
+        while maint::seal(&db, s.id).await.unwrap() {}
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let rs = refs(&mut t, s.id).await.unwrap();
+        let stats = part::ReadStats::default();
+        let rd = part::Reading { shared: db.shared(), db: &db.id, cache: part::Caching::Shared, stats: &stats };
+        let n_id = s.column("n").unwrap().id;
+        let (mut charged, mut held) = (0usize, 0usize);
+        for r in &rs {
+            let m = rd.meta(r).await.unwrap();
+            let ci = m.find(&part::ColRef::User(n_id)).unwrap();
+            rd.index(r, &m, ci).await.unwrap();
+            let before = db.shared().cache.stats().bytes;
+            let v = rd.column(r, &m, ci, 0..m.granule_count()).await.unwrap();
+            charged += db.shared().cache.stats().bytes - before;
+            held += v.len() * std::mem::size_of::<Option<i64>>();
+        }
+        assert!(charged >= held, "decoded blocks holding {held} bytes are charged {charged} bytes");
+    });
+}

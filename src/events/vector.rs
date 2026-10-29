@@ -108,6 +108,26 @@ impl Vector {
         (0..self.len()).filter(|i| self.is_null(*i)).count()
     }
 
+    /// Heap bytes the values hold, not counting a string dictionary.
+    pub fn values_mem_size(&self) -> usize {
+        use std::mem::size_of;
+        match self {
+            Vector::Int(v) => v.capacity() * size_of::<Option<i64>>(),
+            Vector::Float(v) => v.capacity() * size_of::<Option<f64>>(),
+            Vector::Bool(v) => v.capacity() * size_of::<Option<bool>>(),
+            Vector::Str(s) => s.codes.capacity() * size_of::<u32>(),
+        }
+    }
+
+    /// Heap bytes the vector holds, its string dictionary included.
+    pub fn mem_size(&self) -> usize {
+        self.values_mem_size()
+            + match self {
+                Vector::Str(s) => dict_mem_size(&s.dict),
+                _ => 0,
+            }
+    }
+
     pub fn slice(&self, r: std::ops::Range<usize>) -> Vector {
         match self {
             Vector::Int(v) => Vector::Int(v[r].to_vec()),
@@ -183,6 +203,11 @@ impl Vector {
             }
         }
     }
+}
+
+/// Heap bytes a string dictionary holds, its shared allocation included.
+pub fn dict_mem_size(dict: &Arc<Vec<String>>) -> usize {
+    16 + dict.capacity() * std::mem::size_of::<String>() + dict.iter().map(String::capacity).sum::<usize>()
 }
 
 #[cfg(test)]

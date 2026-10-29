@@ -985,12 +985,37 @@ fn row_matches(f: &RowFilter, row: &Row) -> bool {
     f.eval(&mut |id| row.get(id).filter(|d| !matches!(d, Datum::Null | Datum::Json(Json::Null))))
 }
 
+/// A datum as equality sees it: one equals another of its own type only.
+fn plain(d: &Datum) -> Option<filter::Plain<'_>> {
+    use filter::Plain;
+    Some(match d {
+        Datum::Null => Plain::Null,
+        Datum::Bool(b) => Plain::Bool(*b),
+        Datum::Int(i) => Plain::Int(i128::from(*i)),
+        Datum::Float(f) => Plain::Float(*f),
+        Datum::Str(s) => Plain::Str(s),
+        Datum::Bytes(b) => Plain::Bytes(b),
+        Datum::Json(j) => Plain::Json(j),
+        Datum::Blob(_) => return None,
+    })
+}
+
+impl filter::Arg for Datum {
+    fn eq_hash(&self) -> u64 {
+        plain(self).map_or(0, filter::Plain::eq_hash)
+    }
+}
+
 impl Target<Datum> for &Datum {
     fn equals(&self, arg: &Datum) -> bool {
         match (self, arg) {
             (Datum::Json(x), Datum::Json(y)) => Target::equals(&x, y),
             _ => Target::order(self, arg) == Some(std::cmp::Ordering::Equal),
         }
+    }
+
+    fn eq_hash(&self) -> Option<u64> {
+        plain(self).map(filter::Plain::eq_hash)
     }
 
     fn order(&self, arg: &Datum) -> Option<std::cmp::Ordering> {

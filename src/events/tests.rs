@@ -2423,6 +2423,60 @@ mod query_limits {
         }
     }
 }
+
+mod costly_filters {
+    use super::*;
+
+    /// A runtime whose clock runs, so a query's time limit passes while its
+    /// filters compute.
+    fn timed_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap()
+    }
+
+    /// Runs `q` with a 100 ms limit, failing unless it stops within a
+    /// second: its answer, or `None` when it stopped at the limit.
+    async fn run_limited(db: &Arc<Db>, q: Json) -> Option<exec::Output> {
+        let q = Query::parse(q).unwrap();
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let s = get_schema(&mut t, "events").await.unwrap();
+        let start = tokio::time::Instant::now();
+        let r = exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits { max_ms: 100, ..Limits::default() }).await;
+        let ms = start.elapsed().as_millis();
+        match r {
+            Ok(o) => {
+                assert!(ms < 1000, "a query with a 100 ms limit ran {ms} ms and answered {:?}", o.rows);
+                Some(o)
+            }
+            Err(Error::Unavailable { outcome_unknown: false, message, .. }) if message.contains("100 ms") => {
+                assert!(ms < 1000, "a query with a 100 ms limit ran {ms} ms before it stopped");
+                None
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+
+    /// 255 `or`ed `in` tests of 1,000 values each cost a row one lookup per
+    /// test, however long the lists are.
+    #[test]
+    fn costly_filters_stop_at_the_time_limit() {
+        timed_rt().block_on(async {
+            let (eng, _store, _env) = engine(1, EngineConfig::small_for_tests());
+            let db = create_db(&eng, "d").await;
+            let rows: Vec<Json> = (0..2000i64).map(|i| json!({"time": T0 + i, "event": "a", "n": i})).collect();
+            txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            let ors: Vec<Json> = (0..255i64)
+                .map(|k| {
+                    json!({"col": "n", "op": "in", "value": (0..1000i64).map(|j| -1 - k * 1000 - j).collect::<Vec<_>>()})
+                })
+                .collect();
+            let q = json!({"from": T0, "to": T0 + DAY, "where": {"or": ors}, "aggregates": {"c": {"fn": "count"}}});
+            if let Some(o) = run_limited(&db, q).await {
+                assert_eq!(o.rows, vec![vec![json!(0)]]);
+            }
+        });
+    }
+}
+
 mod answers {
     use super::*;
 

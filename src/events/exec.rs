@@ -17,7 +17,7 @@ use super::vector::{Phys, Vector};
 use crate::engine::events::{self as ev, PartRef, Pos, Runs};
 use crate::engine::{Shared, Txn, Value};
 use crate::error::{Error, Result};
-use crate::filter::{self, Target, Test};
+use crate::filter::{self, Plain, Target, Test};
 use crate::probe::{self, Probe};
 use crate::table::schema::{Datum, Row, decode_row};
 use crate::util::DetHashMap;
@@ -221,6 +221,20 @@ impl Target<Json> for Val {
             Val::Json(j) => (&j).equals(arg),
             Val::List(_) | Val::Null => false,
         }
+    }
+
+    fn eq_hash(&self) -> Option<u64> {
+        Some(
+            match self {
+                Val::Int(i) => Plain::Int(i128::from(*i)),
+                Val::Float(f) => Plain::Float(*f),
+                Val::Str(s) => Plain::Str(s),
+                Val::Bool(b) => Plain::Bool(*b),
+                Val::Json(j) => Plain::Json(j),
+                Val::List(_) | Val::Null => Plain::Null,
+            }
+            .eq_hash(),
+        )
     }
 
     fn order(&self, arg: &Json) -> Option<Ordering> {
@@ -493,7 +507,7 @@ fn range_may(t: &Test<Json>, lo: &Stat, hi: &Stat) -> bool {
     };
     match t {
         Test::Eq(a) => ge(a, lo) && le(a, hi),
-        Test::In(l) => l.iter().any(|a| ge(a, lo) && le(a, hi)),
+        Test::In(l) => l.items().iter().any(|a| ge(a, lo) && le(a, hi)),
         Test::Lt(a) => lt_strict(a, lo),
         Test::Le(a) => ge(a, lo),
         Test::Gt(a) => gt_strict(a, hi),
@@ -1119,7 +1133,7 @@ impl<'p, 'a> Run<'p, 'a> {
                             {
                                 let vals: Vec<&Json> = match t {
                                     Test::Eq(a) => vec![a],
-                                    Test::In(l) => l.iter().collect(),
+                                    Test::In(l) => l.items().iter().collect(),
                                     _ => Vec::new(),
                                 };
                                 if !vals.is_empty() {

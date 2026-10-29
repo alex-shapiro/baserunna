@@ -204,9 +204,57 @@ impl G {
         }
     }
 
+    /// An `in` test with up to the longest list, mostly of values that no
+    /// row holds, and otherwise of values that rows hold in another form:
+    /// integers for integral floats, `-0.0` for `0`, objects with their keys
+    /// in another order.
+    fn long_in(&mut self) -> Json {
+        let kind = self.r.usize(4);
+        let n = 1 + self.r.usize(crate::filter::LIST_MAX);
+        let mut list = Vec::with_capacity(n);
+        for _ in 0..n {
+            let noise = self.r.chance(0.95);
+            let i = self.r.below(1 << 20) as i64;
+            list.push(match kind {
+                0 if noise => json!(i - (1 << 19)),
+                0 => pick(&mut self.r, &[json!(i % 8 - 3), json!(i64::MIN), json!(i64::MAX), json!(1i64 << 60)]),
+                1 if noise => json!(i as f64 + 0.25),
+                1 => pick(
+                    &mut self.r,
+                    &[
+                        json!(1),
+                        json!(3),
+                        json!(-0.0),
+                        json!(1.5),
+                        json!(-2.25),
+                        json!(1e20),
+                        json!(1e308),
+                        json!(5e-324),
+                        json!(1i64 << 60),
+                        json!((1i64 << 60) + 1),
+                        json!(1152921504606846976.0),
+                    ],
+                ),
+                2 if noise => json!(format!("e{i}")),
+                2 => json!(pick(&mut self.r, &EVS)),
+                _ if noise => pick(&mut self.r, &[json!(i), json!(format!("s{i}")), json!([i, "a"])]),
+                _ => {
+                    let v = self.scalar();
+                    pick(&mut self.r, &[v, json!(-0.0), json!(1.0), json!([1.0, "a"]), json!({"z": 1.0, "deep": "s0"})])
+                }
+            });
+        }
+        match kind {
+            0 => json!({"col": "n", "op": "in", "value": list}),
+            1 => json!({"col": "x", "op": "in", "value": list}),
+            2 => json!({"col": "event", "op": "in", "value": list}),
+            _ => json!({"col": "props", "path": self.path(), "op": "in", "value": list}),
+        }
+    }
+
     fn leaf(&mut self) -> Json {
         let ops = ["eq", "ne", "lt", "le", "gt", "ge"];
-        match self.r.usize(17) {
+        match self.r.usize(18) {
             0 => json!({"col": "event", "op": pick(&mut self.r, &ops), "value": pick(&mut self.r, &EVS)}),
             1 => json!({"col": "event", "op": "in", "value": ["a", "c", ""]}),
             2 => {
@@ -243,6 +291,7 @@ impl G {
             14 => {
                 json!({"col": "time", "op": pick(&mut self.r, &ops), "value": T0 + self.r.below(20) as i64 * DAY / 4})
             }
+            16 => self.long_in(),
             15 if !self.added.is_empty() => {
                 json!({"col": self.added[0], "op": pick(&mut self.r, &["eq", "ne", "prefix"]), "value": pick(&mut self.r, &["dflt", "given", "d"])})
             }
@@ -669,11 +718,18 @@ fn ref_value(row: &Json, e: &super::query::Expr) -> Option<Json> {
 }
 
 fn ref_eval(row: &Json, f: &Filter) -> bool {
-    use crate::filter::Filter as F;
+    use crate::filter::{Filter as F, Target, Test};
     match f {
         F::And(fs) => fs.iter().all(|x| ref_eval(row, x)),
         F::Or(fs) => fs.iter().any(|x| ref_eval(row, x)),
         F::Not(x) => !ref_eval(row, x),
+        // Unlike the engine, the reference compares with every value of an
+        // `in` list rather than finding candidates by hash.
+        F::Cmp(e, Test::In(l)) => ref_value(row, e).is_some_and(|v| {
+            l.items()
+                .iter()
+                .any(|a| if v.is_number() { super::agg::Val::from_json(&v).equals(a) } else { (&v).equals(a) })
+        }),
         F::Cmp(e, t) => ref_value(row, e)
             .is_some_and(|v| if v.is_number() { t.holds(&super::agg::Val::from_json(&v)) } else { t.holds(&&v) }),
     }
@@ -718,7 +774,14 @@ fn diff_filters_match_the_json_reference() {
             }
             for _ in 0..300 {
                 let fj = g.filter(2);
-                let Ok(f) = Filter::parse(fj.clone()) else { continue };
+                // Arguments compare with stored values, so they are
+                // normalized as those are: -0.0 is 0.
+                let mut normal = fj.clone();
+                let Ok(f) =
+                    json::normalize(&mut normal).and_then(|()| Filter::parse(normal).map_err(|e| e.to_string()))
+                else {
+                    continue;
+                };
                 let q = json!({"from": T0 - DAY, "to": T0 + 1000 * DAY, "where": fj, "lookups": {
                     "plan": {"table": "people", "key": {"col": "user"}, "value": "plan", "default": {"col": "event"}}},
                     "aggregates": {"n": {"fn": "count"}}});

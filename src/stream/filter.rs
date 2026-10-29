@@ -90,6 +90,14 @@ impl Target<Json> for Value<'_> {
         }
     }
 
+    fn eq_hash(&self) -> Option<u64> {
+        match self {
+            Value::Json(j) => Target::eq_hash(j),
+            Value::Str(s) => Target::eq_hash(s),
+            Value::Text(_) => None,
+        }
+    }
+
     fn order(&self, arg: &Json) -> Option<Ordering> {
         match self {
             Value::Json(j) => Target::order(j, arg),

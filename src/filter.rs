@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value as Json};
 use std::cmp::Ordering;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// The deepest a filter nests.
 pub const DEPTH_MAX: usize = 16;
@@ -20,6 +21,8 @@ pub const DEPTH_MAX: usize = 16;
 pub const NODES_MAX: usize = 256;
 /// The most values an `in` list holds.
 pub const LIST_MAX: usize = 1000;
+/// 2^127, past which no float is an i128.
+const TWO_127: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
 /// Every comparison op, by name.
 pub const OPS: [&str; 10] = ["eq", "ne", "lt", "le", "gt", "ge", "in", "prefix", "contains", "exists"];
 
@@ -42,7 +45,7 @@ pub enum Test<A> {
     Le(A),
     Gt(A),
     Ge(A),
-    In(Vec<A>),
+    In(List<A>),
     Prefix(A),
     Contains(A),
     Exists,
@@ -60,9 +63,18 @@ pub trait Operand: Sized {
     }
 }
 
+/// A comparison argument.
+pub trait Arg {
+    /// The hash of the argument as equality sees it: see [`Target::eq_hash`].
+    fn eq_hash(&self) -> u64;
+}
+
 /// A present operand value, tested against arguments of type `A`.
 pub trait Target<A> {
     fn equals(&self, arg: &A) -> bool;
+    /// A hash that the value shares with every argument it equals, by which
+    /// `in` finds its candidates; `None` compares it with every argument.
+    fn eq_hash(&self) -> Option<u64>;
     /// `None` when the two have no order between them, such as a number
     /// and a string.
     fn order(&self, arg: &A) -> Option<Ordering>;
@@ -178,7 +190,7 @@ impl Test<Json> {
             "gt" => Test::Gt(v),
             "ge" => Test::Ge(v),
             "in" => match v {
-                Json::Array(a) if a.len() <= LIST_MAX && !a.iter().any(Json::is_null) => Test::In(a),
+                Json::Array(a) if a.len() <= LIST_MAX && !a.iter().any(Json::is_null) => Test::In(List::new(a)),
                 _ => return fail(&format!("takes an array of at most {LIST_MAX} values, none null")),
             },
             "prefix" if v.is_string() => Test::Prefix(v),
@@ -205,7 +217,7 @@ impl<A> Test<A> {
     }
 
     /// The same test with every argument converted by `f`.
-    pub fn try_map<B>(&self, mut f: impl FnMut(&A) -> Result<B>) -> Result<Test<B>> {
+    pub fn try_map<B: Arg>(&self, mut f: impl FnMut(&A) -> Result<B>) -> Result<Test<B>> {
         Ok(match self {
             Test::Eq(a) => Test::Eq(f(a)?),
             Test::Ne(a) => Test::Ne(f(a)?),
@@ -213,7 +225,7 @@ impl<A> Test<A> {
             Test::Le(a) => Test::Le(f(a)?),
             Test::Gt(a) => Test::Gt(f(a)?),
             Test::Ge(a) => Test::Ge(f(a)?),
-            Test::In(l) => Test::In(l.iter().map(f).collect::<Result<_>>()?),
+            Test::In(l) => Test::In(List::new(l.items.iter().map(f).collect::<Result<_>>()?)),
             Test::Prefix(a) => Test::Prefix(f(a)?),
             Test::Contains(a) => Test::Contains(f(a)?),
             Test::Exists => Test::Exists,
@@ -230,11 +242,109 @@ impl<A> Test<A> {
             Test::Le(a) => matches!(t.order(a), Some(Less | Equal)),
             Test::Gt(a) => t.order(a) == Some(Greater),
             Test::Ge(a) => matches!(t.order(a), Some(Greater | Equal)),
-            Test::In(l) => l.iter().any(|a| t.equals(a)),
+            Test::In(l) => l.any_equals(t),
             Test::Prefix(a) => t.starts_with(a),
             Test::Contains(a) => t.contains(a),
             Test::Exists => true,
         }
+    }
+}
+
+/// The arguments of an `in` test, indexed by hash so that testing a value
+/// costs about the same however long the list is.
+#[derive(Debug, Clone)]
+pub struct List<A> {
+    items: Vec<A>,
+    /// The hash and index of every item, sorted.
+    by_hash: Vec<(u64, u32)>,
+}
+
+impl<A: Arg> List<A> {
+    pub fn new(items: Vec<A>) -> List<A> {
+        let mut by_hash: Vec<(u64, u32)> = items.iter().zip(0..).map(|(a, i)| (a.eq_hash(), i)).collect();
+        by_hash.sort_unstable();
+        List { items, by_hash }
+    }
+}
+
+impl<A> List<A> {
+    pub fn items(&self) -> &[A] {
+        &self.items
+    }
+
+    /// Whether `t` equals some item.
+    pub fn any_equals<T: Target<A>>(&self, t: &T) -> bool {
+        let Some(h) = t.eq_hash() else { return self.items.iter().any(|a| t.equals(a)) };
+        let from = self.by_hash.partition_point(|(x, _)| *x < h);
+        self.by_hash[from..].iter().take_while(|(x, _)| *x == h).any(|(_, i)| t.equals(&self.items[*i as usize]))
+    }
+}
+
+impl<A: PartialEq> PartialEq for List<A> {
+    fn eq(&self, o: &List<A>) -> bool {
+        self.items == o.items
+    }
+}
+
+/// A value as equality sees it, to hash: numbers by their exact values,
+/// whether written as integers or floats; strings and byte strings by their
+/// bytes; and JSON as JSON compares.
+#[derive(Clone, Copy, Debug)]
+pub enum Plain<'a> {
+    Null,
+    Bool(bool),
+    Int(i128),
+    Float(f64),
+    Str(&'a str),
+    Bytes(&'a [u8]),
+    Json(&'a Json),
+}
+
+impl Plain<'_> {
+    pub fn eq_hash(self) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.feed(&mut h);
+        h.finish()
+    }
+
+    fn feed(self, h: &mut DefaultHasher) {
+        match self {
+            Plain::Null => 0u8.hash(h),
+            Plain::Bool(b) => (1u8, b).hash(h),
+            Plain::Int(i) => (2u8, i).hash(h),
+            // An integral float hashes as the integer it equals; -0.0 as 0.
+            Plain::Float(f) if f.fract() == 0.0 && f.abs() < TWO_127 => (2u8, f as i128).hash(h),
+            Plain::Float(f) => (3u8, f.to_bits()).hash(h),
+            Plain::Str(s) => (4u8, s).hash(h),
+            Plain::Bytes(b) => (5u8, b).hash(h),
+            Plain::Json(Json::Null) => Plain::Null.feed(h),
+            Plain::Json(Json::Bool(b)) => Plain::Bool(*b).feed(h),
+            Plain::Json(Json::Number(n)) => match n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from)) {
+                Some(i) => Plain::Int(i).feed(h),
+                None => Plain::Float(n.as_f64().unwrap_or(f64::NAN)).feed(h),
+            },
+            Plain::Json(Json::String(s)) => Plain::Str(s).feed(h),
+            Plain::Json(Json::Array(a)) => {
+                (6u8, a.len()).hash(h);
+                a.iter().for_each(|x| Plain::Json(x).feed(h));
+            }
+            Plain::Json(Json::Object(o)) => {
+                // Equal objects may list their keys in different orders.
+                let entries = o.iter().fold(0u64, |sum, (k, v)| {
+                    let mut e = DefaultHasher::new();
+                    k.hash(&mut e);
+                    Plain::Json(v).feed(&mut e);
+                    sum.wrapping_add(e.finish())
+                });
+                (7u8, o.len(), entries).hash(h);
+            }
+        }
+    }
+}
+
+impl Arg for Json {
+    fn eq_hash(&self) -> u64 {
+        Plain::Json(self).eq_hash()
     }
 }
 
@@ -245,6 +355,10 @@ impl<A> Test<A> {
 impl Target<Json> for &Json {
     fn equals(&self, arg: &Json) -> bool {
         json_eq(self, arg)
+    }
+
+    fn eq_hash(&self) -> Option<u64> {
+        Some(Plain::Json(self).eq_hash())
     }
 
     fn order(&self, arg: &Json) -> Option<Ordering> {
@@ -273,6 +387,10 @@ impl Target<Json> for &Json {
 impl Target<Json> for &str {
     fn equals(&self, arg: &Json) -> bool {
         arg.as_str() == Some(*self)
+    }
+
+    fn eq_hash(&self) -> Option<u64> {
+        Some(Plain::Str(self).eq_hash())
     }
 
     fn order(&self, arg: &Json) -> Option<Ordering> {
@@ -313,7 +431,6 @@ fn number_order(x: &Number, y: &Number) -> Option<Ordering> {
 /// Compares integer `i` with float `f` exactly, where converting either to
 /// the other's type would round.
 pub(crate) fn int_float_order(i: i128, f: f64) -> Option<Ordering> {
-    const TWO_127: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
     if f.is_nan() {
         return None;
     }
@@ -373,6 +490,52 @@ mod tests {
         let big = Number::from(1_152_921_504_606_846_977i64);
         assert_eq!(ord(&big, &Number::from_f64(1_152_921_504_606_846_976.0).unwrap()), Ordering::Greater);
         assert!(!json_eq(&json!([1_152_921_504_606_846_976.0]), &json!([1_152_921_504_606_846_977i64])));
+    }
+
+    /// Values that compare equal hash alike, so an `in` list finds exactly
+    /// the values that comparing with each of its items would.
+    #[test]
+    fn lists_find_what_equality_finds() {
+        let mut r = crate::util::rng::Rng::new(7);
+        let scalar = |r: &mut crate::util::rng::Rng| -> Json {
+            let i = [0i64, 1, -1, 1 << 53, 1 << 60, i64::MAX, i64::MIN][r.usize(7)].wrapping_add(r.below(3) as i64 - 1);
+            match r.usize(8) {
+                0 => json!(i),
+                1 => json!(i as f64),
+                2 => json!([0.0, -0.0, 0.5, 1e308, 5e-324, 18_446_744_073_709_551_616.0][r.usize(6)]),
+                3 => json!(u64::MAX - r.below(2)),
+                4 => json!(["", "a", "1", "0"][r.usize(4)]),
+                5 => json!(r.chance(0.5)),
+                6 => json!(i as f64 + 0.5),
+                _ => json!(i % 3),
+            }
+        };
+        let value = |r: &mut crate::util::rng::Rng| -> Json {
+            match r.usize(5) {
+                0 => json!([scalar(r), scalar(r)]),
+                1 => json!({"a": scalar(r), "b": [scalar(r)]}),
+                2 => json!({"b": [scalar(r)], "a": scalar(r)}),
+                _ => scalar(r),
+            }
+        };
+        let vals: Vec<Json> = (0..600).map(|_| value(&mut r)).collect();
+        for a in &vals {
+            for b in &vals {
+                if json_eq(a, b) {
+                    assert_eq!(Arg::eq_hash(a), Arg::eq_hash(b), "{a} and {b} are equal");
+                }
+            }
+        }
+        for _ in 0..200 {
+            let items: Vec<Json> = (0..r.usize(50)).map(|_| vals[r.usize(vals.len())].clone()).collect();
+            let list = List::new(items.clone());
+            for v in vals.iter().take(100) {
+                assert_eq!(list.any_equals(&v), items.iter().any(|a| json_eq(v, a)), "{v} in {items:?}");
+                if let Some(s) = v.as_str() {
+                    assert_eq!(list.any_equals(&s), items.iter().any(|a| json_eq(v, a)), "{v} in {items:?}");
+                }
+            }
+        }
     }
 
     /// Comparisons name one JSON value, `v`.

@@ -357,10 +357,11 @@ events to row tables.
   cheap. `partition` (`hour`, `day` by default, `week`, starting Monday, or
   `month`, in UTC) groups events by time, so retention and range queries
   skip whole partitions. Optional skip indexes add bloom filters to
-  columns that filters test for equality. Columns can be added with a
-  default, which applies to events written before the column existed
-  (an added column defaulting to `"now"` must be nullable, and reads null
-  for them), and dropped. `json` columns take no default, sort key or skip index.
+  columns that filters test for equality. Columns can be dropped, and
+  added with a default that applies to events written before the column
+  existed; an added time column defaulting to `"now"` must be nullable,
+  since it reads null for them. `json` columns take no default, sort key or
+  skip index.
 - **Inserts** take up to 1 MiB per event, whose JSON objects flatten to
   at most 4 MiB of paths and values. A bulk insert (`POST …/rows`, a
   JSON array or NDJSON) waits up to 200 ms for other inserts on the same
@@ -372,28 +373,32 @@ events to row tables.
   0000 to 9999. Null JSON fields are dropped, `-0.0` is stored as `0`, and
   JSON integers outside the signed 64-bit range are refused, since queries
   could not compare them exactly.
-- **Queries** read `[from, to)` of the time column with an optional filter
-  (§4.7, where a column operand may carry a JSON `path`) and return either
-  rows (`columns`, every column when omitted, with `order_by` and a resume
-  `cursor`, up to 10,000 rows per page) or aggregates. Aggregates group by
-  columns, JSON paths, lookups and time buckets (`interval` in seconds,
-  minutes, hours or days counted from the epoch, so `7d` starts on
-  Thursdays, weeks starting Monday, or calendar months, with
-  an optional fixed `offset` for a time zone), and compute `count`, `sum`, `min`, `max`, `avg`, `uniq`
-  (HyperLogLog, exact up to 1,024 values), `uniq_exact`, `quantiles`
-  (within 1% relative error), `window_funnel` and `retention`, each with an
-  optional `where`. A `then` stage aggregates the first stage's groups, so a
-  funnel per user becomes a count per funnel step. An aggregate query
-  returns its first `limit` groups by `order_by`, or, without a `limit`,
-  every group, failing with `413` past 100,000. Sums of floats are exact,
-  so answers never depend on how events are stored or merged. Lookups map a
-  value through a row table (`{table, key, value, default}`), such as a
-  user id to a plan. A query reads a snapshot at most 5 s old (or
-  `max_staleness_ms`) unless `consistency` is `strong`, which sees every
-  acknowledged insert; a
-  snapshot that lacks the table or a column named retries at a fresh one.
-  A query fails with `413` past 4 GiB read, 1 GiB of aggregation state or
-  kept rows, or 1 GiB of lookup rows, and with a retryable `503` once it has run for 60 s.
+- **Queries** read `[from, to)` of the time column, with an optional
+  filter (§4.7, where a column operand may carry a JSON `path`), and answer
+  with rows or aggregates. Answers never depend on how events are stored
+  or merged: aggregates keep mergeable states, and sums of floats are exact.
+  - *Rows* (`columns`, every column when omitted) come in `order_by` order,
+    100 per page by default and up to 10,000, with a `cursor` to resume.
+  - *Aggregates* group by columns, JSON paths, lookups and time buckets,
+    and compute `count`, `sum`, `min`, `max`, `avg`, `uniq` (HyperLogLog,
+    exact up to 1,024 values), `uniq_exact`, `quantiles` (within 1%
+    relative error), `window_funnel` and `retention`, each with an optional
+    `where`. Buckets are seconds, minutes, hours or days counted from the
+    epoch (so `7d` starts on Thursdays), weeks starting Monday, or calendar
+    months, with an optional fixed `offset` for a time zone. A `then` stage
+    aggregates the first stage's groups, so a funnel per user becomes a
+    count per funnel step. The answer holds the first `limit` groups by
+    `order_by`, or, without a `limit`, every group, failing with `413` past
+    100,000.
+  - *Lookups* map a value through a row table (`{table, key, value,
+    default}`), such as a user id to a plan.
+  - *Consistency.* A query reads a snapshot at most 5 s old (or
+    `max_staleness_ms`) unless `consistency` is `strong`, which sees every
+    acknowledged insert; a snapshot that lacks the table or a column named
+    retries at a fresh one.
+  - *Limits.* A query fails with `413` past 4 GiB read, 1 GiB of
+    aggregation state or kept rows, or 1 GiB of lookup rows, and with a
+    retryable `503` once it has run for 60 s.
 - **Deletes** remove the events matching a filter within a time range, in a
   transaction. A delete that would need an oversized mask in one partition
   fails with `413` naming it, so a caller deletes partition by partition.
@@ -826,9 +831,9 @@ the lease holder one bind (`/internal/v1/events/bind`) listing each
 request's parts. The committer installs every request's parts in one
 manifest write at one version, with a commit record per request; a request
 that fails validation (a dropped table, the quota, a replayed key) gets a
-mask over its rows instead of failing its neighbours. A bulk insert so costs
-one part `PUT` per partition plus a share of one manifest write, and its
-parts start sorted, so they never pass through the LSM tree.
+mask over its rows instead of failing its neighbours. A bulk insert thus
+costs one part `PUT` per partition plus a share of one manifest write, and
+its rows never pass through the LSM tree.
 
 #### Parts
 
@@ -1432,7 +1437,7 @@ JavaScript framework and no external assets. Pages:
   drop; add and drop columns and indexes; rows), streams (create, delete,
   retention; newest records first, older pages, appending a record;
   consumers), event tables (create, drop; partitions and parts; a query
-  runner that starts with events per day of the newest month; inserting events), and a
+  runner that starts with events per day over the 30 days before the newest partition ends; inserting events), and a
   transaction runner (JSON);
 - organizations: list, create, delete; members (add by email, change
   role, remove, leave) and the organization's databases;

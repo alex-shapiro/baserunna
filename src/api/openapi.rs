@@ -396,19 +396,19 @@ fn schemas() -> Value {
         }), &["name", "columns", "time_column", "order_by", "partition", "skip_indexes", "retention_ms"],
             "An event table's schema; describing one table adds its partitions, parts and sizes."),
         "EventRetention": obj(json!({"retention_ms": nullable("integer")}), &["retention_ms"]),
-        "EventInsert": obj_desc(json!({"rows": arr(json!({"type": "object"})), "idempotency_key": s()}), &["rows"],
+        "EventInsert": obj_desc(json!({"rows": arr(json!({"type": "object"})), "idempotency_key": nullable("string")}), &["rows"],
             "Events to insert; an array of events or NDJSON (`application/x-ndjson`) is also accepted."),
         "EventsInserted": obj(json!({"count": i(), "version": i(), "time": i(), "commit_id": s(), "replayed": b()}),
             &["count", "version", "time", "commit_id", "replayed"]),
         "EventFilter": {"type": "object", "description": "A filter (SPEC §4.7) whose comparisons name a column \
             (`col`), a JSON path (`col` and `path`, an array of keys), a lookup (`lookup`), or a time bucket."},
-        "EventQuery": {"type": "object", "required": ["from", "to"], "additionalProperties": true,
+        "EventQuery": {"type": "object", "required": ["from", "to"], "additionalProperties": false,
             "properties": {"from": r("Time"), "to": r("Time"), "where": r("EventFilter"), "lookups": {"type": "object"},
                 "columns": arr(any()), "group_by": arr(any()), "aggregates": {"type": "object"}, "then": {"type": "object"},
                 "order_by": arr(any()), "limit": i(), "cursor": s(),
                 "consistency": enum_of(&["strong", "snapshot"]), "max_staleness_ms": i()},
             "description": "A query over `[from, to)` of the time column: rows (`columns`, every column when \
-            omitted, with `order_by` and `cursor`) or aggregates (`group_by` and `aggregates`, with an optional second stage `then`). Expressions \
+            omitted, with `order_by` and `cursor`, 100 per page by default) or aggregates (`group_by` and `aggregates`, with an optional second stage `then`). Expressions \
             are a column name, `{col, path?}`, `{lookup}` or `{bucket, interval, offset?}`; aggregates are count, sum, \
             min, max, avg, uniq, uniq_exact, quantiles, window_funnel and retention, each with an optional `where`. \
             Aggregates answer with the first `limit` groups by `order_by`, or without a `limit` with every group, \

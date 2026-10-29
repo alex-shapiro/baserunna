@@ -25,7 +25,7 @@ type J = axum::Json<Json>;
 
 /// Routes whose requests every node serves itself instead of forwarding
 /// them to the lease holder: bulk inserts stage parts where they arrive,
-/// and queries read snapshots.
+/// and queries read part objects, which any node can.
 pub(super) fn served_locally(method: &http::Method, path: &str) -> bool {
     matches!(event_rows_route(method, path).as_deref(), Some([] | ["query"]))
 }

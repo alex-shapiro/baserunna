@@ -1421,7 +1421,7 @@ GET /v1/admin/users GET /v1/admin/nodes POST /v1/admin/users/{id}/disable
 GET|DELETE /v1/admin/metrics read (and on DELETE, reset) node latency metrics
 ```
 
-Listings take `limit` and `cursor` and answer `next_cursor` (§8).
+Listings take `limit` and `cursor` and answer `next_cursor` (§8). Tables, event tables and streams are listed by name and also take a name `prefix`.
 
 Raw KV semantics:
 

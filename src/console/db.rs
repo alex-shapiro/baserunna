@@ -126,6 +126,7 @@ struct Schema {
 #[derive(Deserialize)]
 struct Tables {
     tables: Vec<Schema>,
+    next_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -338,9 +339,9 @@ async fn db_page(Path(db): Path<String>, s: Session, q: Params) -> Page {
 async fn render_db(s: &Session, db: &str, q: &Fields, forms: Forms, flash: Option<Flash>) -> Page {
     let info: DbInfo = s.get(&api_db(db)).await.map_err(|e| back("/console/dbs", &e, false))?;
     let keys = keys_section(s, db, &info, q).await.map_err(|e| s.fail(db, &e))?;
-    let tables = tables_section(s, db, &info, forms.table_def.as_deref()).await.map_err(|e| s.fail(db, &e))?;
+    let tables = tables_section(s, db, &info, q, forms.table_def.as_deref()).await.map_err(|e| s.fail(db, &e))?;
     let streams = super::streams::streams_section(s, db, info.role.can_write(), q).await.map_err(|e| s.fail(db, &e))?;
-    let events = super::events::events_section(s, db, info.role.can_write()).await.map_err(|e| s.fail(db, &e))?;
+    let events = super::events::events_section(s, db, info.role.can_write(), q).await.map_err(|e| s.fail(db, &e))?;
     let txn = txn_section(s, db, forms.txn.as_deref(), forms.result.as_deref());
     let danger = if info.role.can_administer() {
         format!(
@@ -419,8 +420,9 @@ async fn keys_section(s: &Session, db: &str, info: &DbInfo, q: &Fields) -> Resul
     ))
 }
 
-async fn tables_section(s: &Session, db: &str, info: &DbInfo, def: Option<&str>) -> Result<String, String> {
-    let tables: Tables = s.get(&format!("{}/tables", api_db(db))).await?;
+async fn tables_section(s: &Session, db: &str, info: &DbInfo, q: &Fields, def: Option<&str>) -> Result<String, String> {
+    let p = Pager::of(q, "tables");
+    let tables: Tables = s.get(&format!("{}/tables?{}", api_db(db), p.api_query())).await?;
     let rows: Vec<String> = tables
         .tables
         .iter()
@@ -447,8 +449,9 @@ async fn tables_section(s: &Session, db: &str, info: &DbInfo, def: Option<&str>)
         String::new()
     };
     Ok(format!(
-        r#"<h2>Tables</h2><div class="card">{t}{create}</div>"#,
-        t = table(&["Table", "Columns", "Indexes"], &rows, "No tables.")
+        r#"<h2>Tables</h2><div class="card">{t}{more}{create}</div>"#,
+        t = table(&["Table", "Columns", "Indexes"], &rows, "No tables."),
+        more = p.links(&db_path(db), tables.next_cursor.as_deref()),
     ))
 }
 

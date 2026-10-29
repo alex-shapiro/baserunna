@@ -26,11 +26,11 @@ pub const SPACE_ROW_BLOBS: u8 = 0x04;
 
 const MAX_EXAMINED_PER_QUERY: usize = 10_000;
 
+/// Where table schemas are kept, by name.
+const SCHEMAS: &[u8] = &[SPACE_CATALOG, b't', b'/'];
+
 fn catalog_key(name: &str) -> Bytes {
-    let mut k = vec![SPACE_CATALOG];
-    k.extend_from_slice(b"t/");
-    k.extend_from_slice(name.as_bytes());
-    Bytes::from(k)
+    Bytes::from([SCHEMAS, name.as_bytes()].concat())
 }
 
 /// Backfill cursor key for a building index, stored outside the schema so
@@ -79,11 +79,21 @@ fn blob_side_key(tid: u32, pk: &[Key], col: u32) -> Bytes {
     Bytes::from(k)
 }
 
-pub async fn list_tables(txn: &mut Txn) -> Result<Vec<TableSchema>> {
-    let mut prefix = vec![SPACE_CATALOG];
-    prefix.extend_from_slice(b"t/");
-    let items = txn.scan(&KeyRange::prefix(&prefix), false, 10_000).await?;
-    items.iter().map(decode_schema).collect()
+/// A page of the tables whose names start with `prefix`, after `cursor`,
+/// with the cursor of the next page.
+pub async fn list_tables(
+    txn: &mut Txn,
+    prefix: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<(Vec<TableSchema>, Option<String>)> {
+    let (page, next) = crate::catalog::names_page(txn, SCHEMAS, prefix, limit, cursor).await?;
+    Ok((page.iter().map(|(_, it)| decode_schema(it)).collect::<Result<_>>()?, next))
+}
+
+/// Every table, for checks that must see them all.
+pub async fn all_tables(txn: &mut Txn) -> Result<Vec<TableSchema>> {
+    txn.scan(&KeyRange::prefix(SCHEMAS), false, usize::MAX).await?.iter().map(decode_schema).collect()
 }
 
 fn decode_schema(it: &ReadValue) -> Result<TableSchema> {
@@ -1306,7 +1316,7 @@ pub async fn check_indexes(txn: &mut Txn, table: &str) -> Result<()> {
 /// Verify that no rows, index entries, blob entries, or backfill cursors belong
 /// to dropped tables, indexes, or columns.
 pub async fn check_no_orphans(txn: &mut Txn) -> Result<()> {
-    let tables = list_tables(txn).await?;
+    let tables = all_tables(txn).await?;
     let live: BTreeSet<u32> = tables.iter().map(|s| s.id).collect();
     let live_idx: BTreeSet<(u32, u32)> = tables.iter().flat_map(|s| s.indexes.iter().map(|i| (s.id, i.id))).collect();
     let blob_cols: BTreeSet<(u32, u32)> =

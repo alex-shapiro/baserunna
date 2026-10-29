@@ -25,7 +25,7 @@ mod difftests;
 mod tests;
 
 use crate::engine::events::{self as ev, EventOp, PartRef, TableState};
-use crate::engine::{KeyRange, ReadValue, Txn, Value};
+use crate::engine::{ReadValue, Txn, Value};
 use crate::error::{Error, Result};
 use crate::table::SPACE_CATALOG;
 use crate::table::schema::{Datum, encode_row};
@@ -34,11 +34,11 @@ use schema::{EvColumn, EvType, EventSchema, Granularity, SkipIndex};
 use serde::Deserialize;
 use serde_json::Value as Json;
 
+/// Where event table schemas are kept, by name.
+pub(crate) const SCHEMAS: &[u8] = &[SPACE_CATALOG, b'e', b'/'];
+
 fn catalog_key(name: &str) -> Bytes {
-    let mut k = vec![SPACE_CATALOG];
-    k.extend_from_slice(b"e/");
-    k.extend_from_slice(name.as_bytes());
-    Bytes::from(k)
+    Bytes::from([SCHEMAS, name.as_bytes()].concat())
 }
 
 fn decode_schema(it: &ReadValue) -> Result<EventSchema> {
@@ -53,12 +53,16 @@ fn put_schema(txn: &mut Txn, s: &EventSchema) -> Result<()> {
     txn.put(catalog_key(&s.name), Value::Inline(Bytes::from(data)))
 }
 
-/// Lists the event tables, by name.
-pub async fn list(txn: &mut Txn) -> Result<Vec<EventSchema>> {
-    let mut prefix = vec![SPACE_CATALOG];
-    prefix.extend_from_slice(b"e/");
-    let items = txn.scan(&KeyRange::prefix(&prefix), false, 10_000).await?;
-    items.iter().map(decode_schema).collect()
+/// A page of the event tables whose names start with `prefix`, after
+/// `cursor`, with the cursor of the next page.
+pub async fn list(
+    txn: &mut Txn,
+    prefix: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<(Vec<EventSchema>, Option<String>)> {
+    let (page, next) = crate::catalog::names_page(txn, SCHEMAS, prefix, limit, cursor).await?;
+    Ok((page.iter().map(|(_, it)| decode_schema(it)).collect::<Result<_>>()?, next))
 }
 
 /// Reads the schema of `name`, pinning it so that a concurrent schema change

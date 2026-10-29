@@ -558,6 +558,86 @@ async fn db_id(w: &World, t: &str) -> String {
     info["id"].as_str().expect("a database id").to_string()
 }
 
+#[test]
+fn event_table_listings_are_paginated() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        let def = json!({"name": "ev2", "columns": [{"name": "time", "type": "time"}], "time_column": "time", "order_by": ["time"]});
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events", &[], &def.to_string()).await;
+        assert_eq!(s, 201, "{r}");
+        let (s, r) = send(&w, 0, &t, "GET", "/v1/dbs/d/events?limit=1", &[], "").await;
+        assert_eq!(s, 200, "{r}");
+        assert_eq!(r["tables"].as_array().map(Vec::len), Some(1), "limit=1 lists: {r}");
+        assert!(r["next_cursor"].is_string(), "no next_cursor: {r}");
+        w.shutdown();
+    });
+}
+
+fn row_table(name: &str) -> String {
+    json!({"name": name, "primary_key": ["id"], "columns": [{"name": "id", "type": "int", "nullable": false}]})
+        .to_string()
+}
+
+#[test]
+fn row_table_listings_are_paginated() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        for name in ["a", "b"] {
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/tables", &[], &row_table(name)).await;
+            assert_eq!(s, 201, "{r}");
+        }
+        let (s, r) = send(&w, 0, &t, "GET", "/v1/dbs/d/tables?limit=1", &[], "").await;
+        assert_eq!(s, 200, "{r}");
+        assert_eq!(r["tables"].as_array().map(Vec::len), Some(1), "limit=1 lists: {r}");
+        assert!(r["next_cursor"].is_string(), "no next_cursor: {r}");
+        w.shutdown();
+    });
+}
+
+/// Every catalog listing pages through all its entries exactly once, in
+/// name order, filters by prefix, and refuses page sizes outside 1..=1000.
+#[test]
+fn catalog_listings_page_through_each_entry_once() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        let names: Vec<String> = (0..7).map(|i| format!("p{i}")).collect();
+        for n in &names {
+            let def = json!({"name": n, "columns": [{"name": "time", "type": "time"}], "time_column": "time", "order_by": ["time"]});
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events", &[], &def.to_string()).await;
+            assert_eq!(s, 201, "{r}");
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/tables", &[], &row_table(n)).await;
+            assert_eq!(s, 201, "{r}");
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/streams", &[], &json!({"name": n}).to_string()).await;
+            assert_eq!(s, 201, "{r}");
+        }
+        for (path, field) in [("events", "tables"), ("tables", "tables"), ("streams", "streams")] {
+            let (mut seen, mut pages, mut cursor) = (Vec::new(), 0, None::<String>);
+            loop {
+                let after = cursor.as_ref().map(|c| format!("&cursor={c}")).unwrap_or_default();
+                let uri = format!("/v1/dbs/d/{path}?prefix=p&limit=3{after}");
+                let (s, r) = send(&w, 0, &t, "GET", &uri, &[], "").await;
+                assert_eq!(s, 200, "{uri}: {r}");
+                pages += 1;
+                seen.extend(r[field].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap().to_string()));
+                match r["next_cursor"].as_str() {
+                    Some(c) => cursor = Some(c.to_string()),
+                    None => break,
+                }
+            }
+            assert_eq!((seen, pages), (names.clone(), 3), "{path}");
+            let (s, r) = send(&w, 0, &t, "GET", &format!("/v1/dbs/d/{path}?prefix=p"), &[], "").await;
+            assert_eq!((s, r[field].as_array().map(Vec::len)), (200, Some(7)), "{path} by default: {r}");
+            for limit in [0, 1001] {
+                let (s, r) = send(&w, 0, &t, "GET", &format!("/v1/dbs/d/{path}?limit={limit}"), &[], "").await;
+                assert_eq!(s, 400, "{path} limit={limit}: {r}");
+            }
+            let (s, r) = send(&w, 0, &t, "GET", &format!("/v1/dbs/d/{path}?cursor=%25"), &[], "").await;
+            assert_eq!(s, 400, "{path} with a bad cursor: {r}");
+        }
+        w.shutdown();
+    });
+}
+
 mod requests {
     use super::*;
     use std::time::Duration;

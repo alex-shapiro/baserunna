@@ -2,7 +2,10 @@
 //! partitions and parts, with a query runner and inserts.
 
 use super::db::{api_db, db_path};
-use super::{Flash, Page, Params, Posted, Session, back, esc, field, format_bytes, page, stay, table, url_seg, when};
+use super::{
+    Fields, Flash, Page, Pager, Params, Posted, Session, back, esc, field, format_bytes, page, stay, table, url_seg,
+    when,
+};
 use crate::meta::Role;
 use axum::Router;
 use axum::extract::Path;
@@ -34,6 +37,7 @@ fn api_table(db: &str, t: &str) -> String {
 #[derive(Deserialize)]
 struct TableList {
     tables: Vec<Json>,
+    next_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -44,8 +48,9 @@ struct Info {
 const DEFAULT_TABLE: &str = r#"{"name": "events", "columns": [{"name": "time", "type": "time", "default": "now"}, {"name": "event", "type": "string"}, {"name": "user", "type": "string"}, {"name": "properties", "type": "json"}], "time_column": "time", "order_by": ["event", "time"], "partition": "day"}"#;
 
 /// The event tables section of a database's page.
-pub(super) async fn events_section(s: &Session, db: &str, can_write: bool) -> Result<String, String> {
-    let list: TableList = s.get(&format!("{}/events", api_db(db))).await?;
+pub(super) async fn events_section(s: &Session, db: &str, can_write: bool, q: &Fields) -> Result<String, String> {
+    let p = Pager::of(q, "events");
+    let list: TableList = s.get(&format!("{}/events?{}", api_db(db), p.api_query())).await?;
     let rows: Vec<String> = list
         .tables
         .iter()
@@ -72,8 +77,9 @@ pub(super) async fn events_section(s: &Session, db: &str, can_write: bool) -> Re
         String::new()
     };
     Ok(format!(
-        r#"<h2>Event tables</h2><div class="card">{t}{create}</div>"#,
+        r#"<h2>Event tables</h2><div class="card">{t}{more}{create}</div>"#,
         t = table(&["Event table", "Columns", "Sort key", "Partition"], &rows, "No event tables."),
+        more = p.links(&db_path(db), list.next_cursor.as_deref()),
     ))
 }
 

@@ -2,8 +2,8 @@
 
 use super::body::{BlobBody, Upload, parse_range, read_upload};
 use super::{
-    Auth, DbCtx, Found, JsonBody, LONG_POLL_MAX_MS, Params, Ran, consistency_of, naming_commit, paging, percent_decode,
-    run_txn, watch, with_read, with_txn,
+    Auth, DbCtx, Found, JsonBody, LONG_POLL_MAX_MS, Params, Ran, consistency_of, name_paging, naming_commit, paging,
+    percent_decode, run_txn, watch, with_read, with_txn,
 };
 use crate::engine::manifest::ObjKind;
 use crate::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn, Value, blob};
@@ -805,10 +805,11 @@ async fn row_changes(
 }
 
 async fn list_tables(Extension(ctx): Extension<DbCtx>, q: Params) -> Result<J> {
+    let (prefix, limit, cursor) = name_paging(&q)?;
     let c = consistency_of(&q)?;
-    let (ts, v) = with_read!(ctx.db, c, |t| table::list_tables(t).await);
-    let out: Vec<Json> = ts.iter().map(|s| s.to_json()).collect();
-    Ok(axum::Json(json!({"tables": out, "version": v})))
+    let ((ts, next), v) = with_read!(ctx.db, c, |t| table::list_tables(t, &prefix, limit, cursor.as_deref()).await);
+    let tables: Vec<Json> = ts.iter().map(|s| s.to_json()).collect();
+    Ok(axum::Json(json!({"tables": tables, "next_cursor": next, "version": v})))
 }
 
 async fn create_table(

@@ -4572,6 +4572,35 @@
             }
           },
           {
+            "description": "Names starting with this",
+            "in": "query",
+            "name": "prefix",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
             "in": "query",
             "name": "consistency",
@@ -4601,6 +4630,12 @@
                 "schema": {
                   "additionalProperties": false,
                   "properties": {
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "tables": {
                       "items": {
                         "$ref": "#/components/schemas/EventTable"
@@ -4613,6 +4648,7 @@
                   },
                   "required": [
                     "tables",
+                    "next_cursor",
                     "version"
                   ],
                   "type": "object"
@@ -6624,6 +6660,35 @@
             }
           },
           {
+            "description": "Names starting with this",
+            "in": "query",
+            "name": "prefix",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
             "in": "query",
             "name": "consistency",
@@ -6653,6 +6718,12 @@
                 "schema": {
                   "additionalProperties": false,
                   "properties": {
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "tables": {
                       "items": {
                         "$ref": "#/components/schemas/TableSchema"
@@ -6665,6 +6736,7 @@
                   },
                   "required": [
                     "tables",
+                    "next_cursor",
                     "version"
                   ],
                   "type": "object"

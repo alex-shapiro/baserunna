@@ -105,7 +105,7 @@ pub async fn check_all_indexes(sim: &Arc<Sim>, db_id: &str) -> Result<(), String
     let mut t = crate::node::retry_unavailable(|| db.begin(Isolation::Serializable, Consistency::Strong))
         .await
         .map_err(|e| e.to_string())?;
-    let tables = crate::table::list_tables(&mut t).await.map_err(|e| e.to_string())?;
+    let tables = crate::table::all_tables(&mut t).await.map_err(|e| e.to_string())?;
     for s in tables {
         crate::table::check_indexes(&mut t, &s.name).await.map_err(|e| format!("table {}: {e}", s.name))?;
     }

@@ -4,7 +4,7 @@
 use super::data::{
     PathMap, commit_hex, content_type, idempotency_header, one_idempotency_key, param, split_consistency,
 };
-use super::{DbCtx, JsonBody, Params, consistency_of, with_read, with_txn};
+use super::{DbCtx, JsonBody, Params, consistency_of, name_paging, with_read, with_txn};
 use crate::engine::{Committed, Consistency};
 use crate::error::{Error, Result};
 use crate::events::exec;
@@ -64,9 +64,11 @@ pub fn routes() -> Router<Arc<Node>> {
 }
 
 async fn list(Extension(ctx): Extension<DbCtx>, q: Params) -> Result<J> {
+    let (prefix, limit, cursor) = name_paging(&q)?;
     let c = consistency_of(&q)?;
-    let (ts, v) = with_read!(ctx.db, c, |t| events::list(t).await);
-    Ok(axum::Json(json!({"tables": ts.iter().map(|s| s.to_json()).collect::<Vec<_>>(), "version": v})))
+    let ((ts, next), v) = with_read!(ctx.db, c, |t| events::list(t, &prefix, limit, cursor.as_deref()).await);
+    let tables: Vec<Json> = ts.iter().map(|s| s.to_json()).collect();
+    Ok(axum::Json(json!({"tables": tables, "next_cursor": next, "version": v})))
 }
 
 async fn create(

@@ -177,6 +177,23 @@ fn page_of(field: &str, items: Value) -> Value {
     obj(Value::Object(props), &[field, "next_cursor"])
 }
 
+/// The parameters of a database's listing by name.
+fn names_paging() -> Vec<Value> {
+    let mut out = vec![db(), query("prefix", s(), "Names starting with this")];
+    out.extend(paging());
+    out.extend(consistency());
+    out
+}
+
+/// A page of a database's listing by name, read at `version`.
+fn names_page_of(field: &str, items: Value) -> Value {
+    let mut props = Map::new();
+    props.insert(field.to_string(), arr(items));
+    props.insert("next_cursor".into(), nullable("string"));
+    props.insert("version".into(), i());
+    obj(Value::Object(props), &[field, "next_cursor", "version"])
+}
+
 fn table() -> Value {
     path_param("t", "Table name.")
 }
@@ -1192,24 +1209,12 @@ fn paths() -> Value {
             )
         },
     );
-    let mut lt = vec![db()];
-    lt.extend(consistency());
     add(
         "/v1/dbs/{db}/tables",
         "get",
         Op {
-            params: lt,
-            ..op(
-                "List tables",
-                "tables",
-                vec![(
-                    "200",
-                    resp(
-                        "Tables",
-                        obj(json!({"tables": arr(r("TableSchema")), "version": i()}), &["tables", "version"]),
-                    ),
-                )],
-            )
+            params: names_paging(),
+            ..op("List tables", "tables", vec![("200", resp("Tables", names_page_of("tables", r("TableSchema"))))])
         },
     );
     add(
@@ -1369,28 +1374,12 @@ fn paths() -> Value {
         },
     );
     let stream = || path_param("s", "Stream name.");
-    let mut ls = vec![db(), query("prefix", s(), "Names starting with this")];
-    ls.extend(paging());
-    ls.extend(consistency());
     add(
         "/v1/dbs/{db}/streams",
         "get",
         Op {
-            params: ls,
-            ..op(
-                "List streams",
-                "streams",
-                vec![(
-                    "200",
-                    resp(
-                        "Streams",
-                        obj(
-                            json!({"streams": arr(r("Stream")), "next_cursor": nullable("string"), "version": i()}),
-                            &["streams", "next_cursor", "version"],
-                        ),
-                    ),
-                )],
-            )
+            params: names_paging(),
+            ..op("List streams", "streams", vec![("200", resp("Streams", names_page_of("streams", r("Stream"))))])
         },
     );
     add(
@@ -1578,23 +1567,15 @@ fn paths() -> Value {
         },
     );
     let evt = || path_param("t", "Event table name.");
-    let mut le = vec![db()];
-    le.extend(consistency());
     add(
         "/v1/dbs/{db}/events",
         "get",
         Op {
-            params: le,
+            params: names_paging(),
             ..op(
                 "List event tables",
                 "events",
-                vec![(
-                    "200",
-                    resp(
-                        "Event tables",
-                        obj(json!({"tables": arr(r("EventTable")), "version": i()}), &["tables", "version"]),
-                    ),
-                )],
+                vec![("200", resp("Event tables", names_page_of("tables", r("EventTable"))))],
             )
         },
     );

@@ -7,6 +7,7 @@
 pub mod api;
 pub mod auth;
 pub mod buggify;
+pub mod catalog;
 pub mod client;
 pub mod cluster;
 pub mod console;

@@ -5,7 +5,9 @@ use super::data::{
     PathMap, bool_param, commit_hex, content_type, encoding_param, idempotency_header, one_idempotency_key, param,
     split_consistency,
 };
-use super::{DbCtx, Found, JsonBody, Params, Ran, consistency_of, paging, run_txn, watch, with_read, with_txn};
+use super::{
+    DbCtx, Found, JsonBody, Params, Ran, consistency_of, name_paging, paging, run_txn, watch, with_read, with_txn,
+};
 use crate::engine::{Committed, Consistency, Db, Isolation, Retention, StreamState};
 use crate::error::{Error, Result};
 use crate::node::Node;
@@ -47,17 +49,8 @@ fn number<T: std::str::FromStr>(q: &Params, k: &str) -> Result<Option<T>> {
     q.get(k).map(|v| v.parse().map_err(|_| Error::invalid(format!("{k} must be a number")))).transpose()
 }
 
-fn page_of(q: &Params) -> Result<(usize, Option<String>)> {
-    let (limit, cursor) = paging(q)?;
-    if !(1..=1000).contains(&limit) {
-        return Err(Error::invalid("limit must be in 1..=1000"));
-    }
-    Ok((limit, cursor))
-}
-
 async fn list(Extension(ctx): Extension<DbCtx>, q: Params) -> Result<J> {
-    let (limit, cursor) = page_of(&q)?;
-    let prefix = q.get("prefix").cloned().unwrap_or_default();
+    let (prefix, limit, cursor) = name_paging(&q)?;
     let c = consistency_of(&q)?;
     let ((page, next), v) = with_read!(ctx.db, c, |t| stream::list(t, &prefix, limit, cursor.as_deref()).await);
     let streams: Vec<Json> = page.iter().map(|(n, c, st)| stream::stream_json(n, c, st)).collect();
@@ -475,7 +468,7 @@ async fn trim(
 
 async fn consumers(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, q: Params) -> Result<J> {
     let name = param(&p, "s")?.to_string();
-    let (limit, cursor) = page_of(&q)?;
+    let (limit, cursor) = paging(&q)?;
     let c = consistency_of(&q)?;
     let ((st, (list, next)), v) = with_read!(ctx.db, c, |t| {
         let (_, st) = stream::info(t, &name).await?;

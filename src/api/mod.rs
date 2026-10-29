@@ -1074,13 +1074,25 @@ pub(crate) use axum::extract::Query as QueryParams;
 
 pub(crate) type Params = QueryParams<std::collections::BTreeMap<String, String>>;
 
-/// Extracts `limit` and `cursor` pagination parameters.
+/// Extracts the `limit` and `cursor` of a listing: `limit` is in
+/// 1..=[`PAGE_MAX`](crate::meta::PAGE_MAX), [`PAGE_DEFAULT`](crate::meta::PAGE_DEFAULT) if absent.
 pub(crate) fn paging(q: &Params) -> Result<(usize, Option<String>)> {
+    let max = crate::meta::PAGE_MAX;
     let limit = match q.get("limit") {
         None => crate::meta::PAGE_DEFAULT,
-        Some(l) => l.parse().map_err(|_| Error::invalid("limit must be a number"))?,
+        Some(l) => l
+            .parse()
+            .ok()
+            .filter(|l| (1..=max).contains(l))
+            .ok_or_else(|| Error::invalid(format!("limit must be in 1..={max}")))?,
     };
     Ok((limit, q.get("cursor").filter(|c| !c.is_empty()).cloned()))
+}
+
+/// Extracts the `prefix`, `limit` and `cursor` of a listing by name.
+pub(crate) fn name_paging(q: &Params) -> Result<(String, usize, Option<String>)> {
+    let (limit, cursor) = paging(q)?;
+    Ok((q.get("prefix").cloned().unwrap_or_default(), limit, cursor))
 }
 
 #[cfg(test)]

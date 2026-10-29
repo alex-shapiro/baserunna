@@ -30,10 +30,8 @@ use std::sync::{Arc, Mutex};
 /// recording the read: maintenance conflicts with drops through the rows
 /// and references it reads instead.
 pub async fn schema_by_id(txn: &mut Txn, id: u32) -> Result<Option<EventSchema>> {
-    let mut prefix = vec![crate::table::SPACE_CATALOG];
-    prefix.extend_from_slice(b"e/");
     let snap = txn.untracked_snapshot().clone();
-    let items = snap.scan(&crate::engine::KeyRange::prefix(&prefix), false, 10_000, txn.read_time).await?;
+    let items = snap.scan(&crate::engine::KeyRange::prefix(super::SCHEMAS), false, usize::MAX, txn.read_time).await?;
     for e in items {
         if let Value::Inline(b) = &e.value
             && let Ok(s) = serde_json::from_slice::<EventSchema>(b)

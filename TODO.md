@@ -267,11 +267,9 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 
 - [ ] **Check event maintenance liveness and storage invariants in
       simulation.** The `events` workload never bounds part counts under
-      load or checks that ended partitions settle, never drops or re-adds
-      columns or recreates a busy table under load, and deletes only by
-      `uid` over all time. `storage_check` does not look for unreferenced
-      `part/` objects or check part sortedness, statistics, blooms and
-      directories against their rows. Steady-insert starvation of merges
+      load or checks that ended partitions settle. `storage_check` does
+      not check part sortedness, statistics, blooms and directories against
+      their rows. Steady-insert starvation of merges
       (`events::tests::liveness`) passed every campaign.
 - [ ] **Run a long event-table campaign.** `sim_events` runs 24 seeds in CI;
       run thousands, with larger tables and more nodes, before relying on

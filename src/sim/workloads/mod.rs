@@ -10,6 +10,8 @@ pub mod blobs;
 pub mod console;
 pub mod db_churn;
 pub mod events;
+pub mod events_churn;
+pub mod events_retention;
 pub mod history;
 pub mod kv_model;
 pub mod lifecycle;
@@ -488,6 +490,7 @@ pub fn scenarios() -> Vec<Scenario> {
                 let mut c = world(k, faulty((1, 4)));
                 // Small granules give parts enough of them for every pruning method to apply.
                 c.engine.event_granule_rows = k.log_range("events.granule_rows", 2, 16) as usize;
+                events::short_gc(k, &mut c);
                 c.node.engine = c.engine.clone();
                 c
             },

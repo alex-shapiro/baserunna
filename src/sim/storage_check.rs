@@ -63,6 +63,7 @@ impl Sim {
             let mut positions: std::collections::BTreeMap<(u32, crate::engine::events::Pos), String> =
                 Default::default();
             let mut part_bytes = 0u64;
+            let mut referenced_parts: BTreeSet<String> = BTreeSet::new();
             let live = || newest.values().filter(|e| deletes.seq_at(&e.key) <= e.seq && !e.value.is_tombstone());
             let schemas: std::collections::BTreeMap<u32, String> = live()
                 .filter(|e| e.key.starts_with(crate::events::SCHEMAS))
@@ -128,6 +129,8 @@ impl Sim {
                     let r =
                         crate::engine::events::ref_of(e).ok_or_else(|| format!("db {db}: corrupt part reference"))?;
                     part_bytes += r.stored_bytes();
+                    referenced_parts.insert(r.id.clone());
+                    referenced_parts.extend(r.mask_object().map(str::to_string));
                     for id in std::iter::once(r.id.as_str()).chain(r.mask_object()) {
                         if m.obsolete.iter().any(|o| o.id == id) {
                             return Err(format!("db {db}: part {} names object {id}, which awaits deletion", r.id));
@@ -146,6 +149,27 @@ impl Sim {
                             k.0, k.1
                         ));
                     }
+                }
+            }
+            let prefix = format!("dbs/{db}/part/");
+            let mut stored: std::collections::BTreeMap<&str, u64> = Default::default();
+            for k in keys.range(prefix.clone()..).take_while(|k| k.starts_with(&prefix)) {
+                let id = k[prefix.len()..].split('/').next().unwrap_or_default();
+                let g = self.mem.get_sync(k, &Default::default()).map_err(|e| format!("{k}: {e}"))?;
+                let t = stored.entry(id).or_default();
+                *t = (*t).max(g.last_modified_ms);
+            }
+            for (id, mtime) in stored {
+                if referenced_parts.contains(id) {
+                    continue;
+                }
+                match m.obsolete.iter().find(|o| o.id == id) {
+                    Some(o) => rep.obsolete_parts.push(UnreferencedPart {
+                        db: db.to_string(),
+                        id: id.into(),
+                        at_ms: o.since_ms,
+                    }),
+                    None => rep.orphan_parts.push(UnreferencedPart { db: db.to_string(), id: id.into(), at_ms: mtime }),
                 }
             }
             if part_bytes != m.part_bytes {
@@ -253,4 +277,17 @@ pub struct StorageReport {
     /// Live event table parts.
     pub parts: usize,
     pub objects: usize,
+    /// Stored event parts and masks no reference names and `obsolete` does
+    /// not list, with their newest object's `last_modified`.
+    pub orphan_parts: Vec<UnreferencedPart>,
+    /// Stored event parts and masks awaiting deletion, with the store time
+    /// they were listed in `obsolete`.
+    pub obsolete_parts: Vec<UnreferencedPart>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnreferencedPart {
+    pub db: String,
+    pub id: String,
+    pub at_ms: u64,
 }

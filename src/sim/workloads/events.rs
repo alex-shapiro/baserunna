@@ -2,14 +2,21 @@
 //!
 //! Concurrent clients bulk insert events (JSON and NDJSON, with idempotency
 //! keys) and insert them in transactions together with row upserts, delete
-//! events, add a column mid-run, and query at random snapshots, while seals,
-//! merges and bulk binds run on whichever nodes hold leases under faults.
+//! events by uid and by filter, add a column mid-run, and query at random
+//! snapshots, while seals, merges and bulk binds run on whichever nodes hold
+//! leases under faults. Depending on knobs, a second table is dropped and
+//! recreated under load ([`super::events_churn`]), a third takes events at
+//! its retention boundary ([`super::events_retention`]), and garbage
+//! collection is short enough that the run ends by waiting out sweeps.
 //! Every query is checked against a reference model that evaluates it naively
 //! over the rows committed at the response's version, and at quiescence the
 //! table must hold exactly the rows the model says, with retention honored.
 
-use super::super::Sim;
 use super::super::client::{Client, Resp, Status};
+use super::super::swarm::Knobs;
+use super::super::{Sim, SimConfig};
+use super::events_churn::Churn;
+use super::events_retention::Retention;
 use bytes::Bytes;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,7 +61,20 @@ impl Ev {
 enum Write {
     Insert(Vec<String>),
     Delete(Vec<String>),
+    /// A delete of the events within `[from, to)` matching a filter.
+    DeleteWhere(i64, i64, Json),
     Person(String, String),
+}
+
+impl Write {
+    /// Whether this write deletes event `e` if `e` is live when it commits.
+    fn deletes(&self, e: &Ev) -> bool {
+        match self {
+            Write::Delete(us) => us.contains(&e.uid),
+            Write::DeleteWhere(from, to, f) => e.time >= *from && e.time < *to && holds(e, f),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -80,7 +100,7 @@ fn world(w: &Shared) -> std::sync::MutexGuard<'_, World> {
 }
 
 /// The outcome of an idempotent write.
-enum Settled {
+pub(super) enum Settled {
     Done(Json),
     Unknown,
     Rejected(Resp),
@@ -88,7 +108,7 @@ enum Settled {
 
 /// Retries an idempotent write until its outcome is known, rotating the
 /// key when an unapplied attempt was fenced.
-async fn settle(c: &Client, path: &str, ndjson: bool, body: &Json, base: &str) -> Result<Settled, String> {
+pub(super) async fn settle(c: &Client, path: &str, ndjson: bool, body: &Json, base: &str) -> Result<Settled, String> {
     let mut key = base.to_string();
     let mut first = c.sim.now_ms();
     for attempt in 0..200 {
@@ -211,10 +231,41 @@ async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: 
     Ok(())
 }
 
-async fn deleter(c: Client, w: Shared, steps: usize) -> Result<(), String> {
+/// Deletes the events matching a filter within a few hours, so the delete
+/// masks parts that merges are rewriting.
+async fn filter_delete(c: &Client, w: &Shared, base: i64, step: usize) -> Result<(), String> {
+    let (from, to, filter) = {
+        let mut r = c.rng();
+        let from = base - 6 * HOUR + r.below(80) as i64 * HOUR;
+        let to = from + (1 + r.below(12)) as i64 * HOUR;
+        let filter = match r.below(3) {
+            0 => json!({"col": "kind", "op": "eq", "value": KINDS[r.usize(KINDS.len())]}),
+            1 => json!({"col": "g", "op": "ge", "value": 7 + r.below(3)}),
+            _ => json!({"col": "props", "path": [format!("p{}", r.below(5))], "op": "eq", "value": r.below(4)}),
+        };
+        (from, to, filter)
+    };
+    let body = json!({"ops": [{"op": "delete_events", "table": "e", "from": from, "to": to, "where": filter}]});
+    let write = Write::DeleteWhere(from, to, filter);
+    match settle(c, &format!("{DB}/txn"), false, &body, &format!("{}-w{step}", c.name)).await? {
+        Settled::Done(j) => {
+            let v = j["version"].as_u64().ok_or(format!("{}: no version in {j}", c.name))?;
+            world(w).committed.push((v, write));
+        }
+        Settled::Unknown => world(w).unknown.push(write),
+        Settled::Rejected(r) => return Err(format!("{}: filter delete refused: {} {}", c.name, r.status, r.json)),
+    }
+    Ok(())
+}
+
+async fn deleter(c: Client, w: Shared, base: i64, steps: usize, filters: bool) -> Result<(), String> {
     for step in 0..steps {
         let ms = 500 + c.rng().below(1_500);
         c.pause(ms).await;
+        if filters && c.rng().chance(0.5) {
+            filter_delete(&c, &w, base, step).await?;
+            continue;
+        }
         let victims: Vec<String> = {
             let g = world(&w);
             let live: Vec<&String> = g
@@ -319,9 +370,9 @@ fn snapshot(g: &World, v: u64) -> Option<(Vec<&Ev>, BTreeMap<String, String>)> {
     for (_, wr) in writes {
         match wr {
             Write::Insert(u) => live.extend(u.iter().cloned()),
-            Write::Delete(u) => u.iter().for_each(|x| {
-                live.remove(x);
-            }),
+            Write::Delete(_) | Write::DeleteWhere(..) => {
+                live.retain(|u| !g.events.get(u).is_some_and(|e| wr.deletes(e)))
+            }
             Write::Person(d, p) => {
                 persons.insert(d.clone(), p.clone());
             }
@@ -507,7 +558,10 @@ async fn all_uids(c: &Client) -> Result<(BTreeSet<String>, u64), String> {
         }
         version = version.max(r.json["version"].as_u64().unwrap_or(0));
         for row in r.json["rows"].as_array().into_iter().flatten() {
-            uids.insert(row[0].as_str().unwrap_or_default().to_string());
+            let u = row[0].as_str().unwrap_or_default().to_string();
+            if !uids.insert(u.clone()) {
+                return Err(format!("final read holds {u} twice"));
+            }
         }
         match r.json["next_cursor"].as_str() {
             Some(n) => cursor = Some(n.to_string()),
@@ -549,6 +603,84 @@ async fn setup(c: &Client) -> Result<(), String> {
     Ok(())
 }
 
+/// With some seeds, shortens garbage collection so that sweeps collect
+/// orphaned and replaced parts within a run: stage TTLs, orphan grace and
+/// sweep intervals of seconds, and an obsolete grace just above the
+/// transaction lifetime.
+pub fn short_gc(k: &Knobs, c: &mut SimConfig) {
+    if !k.chance("events.short_gc", 0.4) {
+        return;
+    }
+    let e = &mut c.engine;
+    e.blob_stage_ttl_ms = k.range("events.stage_ttl_ms", 15_000, 60_000);
+    e.orphan_grace_ms = k.range("events.orphan_grace_ms", 2_000, 60_000);
+    e.sweep_interval_ms = k.range("events.sweep_interval_ms", 500, 10_000);
+    e.gc_grace_ms =
+        e.txn_max_lifetime_ms + 2 * e.clock_sync_max_error_ms + k.range("events.gc_grace_extra_ms", 0, 10_000);
+}
+
+/// Whether garbage collection is short enough for [`idle`] to wait it out.
+fn gc_is_short(sim: &Sim) -> bool {
+    sim.cfg.engine.orphan_grace_ms <= 60_000 && sim.cfg.engine.blob_stage_ttl_ms <= 60_000
+}
+
+/// Keeps the database active, with a write every second or two, long
+/// enough for every part orphaned before it began to be swept and deleted,
+/// then checks that none is left: every part stored since before the wait
+/// is referenced, or is listed as obsolete for less than the grace period.
+/// An orphan may be seen just after a commit removed it from `obsolete`,
+/// while its deletion is in flight, so only one that stays for a sweep
+/// interval and a grace period fails the check.
+async fn idle(c: &Client) -> Result<(), String> {
+    let e = &c.sim.cfg.engine;
+    let start = c.sim.now_ms();
+    let wait = e.orphan_grace_ms.max(e.blob_stage_ttl_ms + 1_000) + e.sweep_interval_ms + e.gc_grace_ms + 15_000;
+    let limit = e.sweep_interval_ms + e.gc_grace_ms + 20_000;
+    c.sim.trace.event(&format!("events: idling {wait} ms for sweeps"));
+    let mut seen: BTreeMap<String, u64> = BTreeMap::new();
+    for i in 0u64.. {
+        let r = c.call_retry("PUT", &format!("{DB}/kv/idle"), Some(json!(i))).await;
+        if !r.ok() {
+            return Err(format!("idle write: {} {}", r.status, r.json));
+        }
+        let ms = 1_000 + c.rng().below(1_000);
+        c.pause(ms).await;
+        let now = c.sim.now_ms();
+        if now < start + wait {
+            continue;
+        }
+        let rep = c.sim.check_storage().await?;
+        let stale: Vec<String> = rep
+            .orphan_parts
+            .iter()
+            .filter(|o| o.at_ms < start)
+            .chain(rep.obsolete_parts.iter().filter(|o| o.at_ms + e.gc_grace_ms + 10_000 < now))
+            .map(|o| format!("{}/{}", o.db, o.id))
+            .collect();
+        if stale.is_empty() {
+            c.sim.trace.event(&format!(
+                "events: after idling, {} parts live, {} orphans and {} obsolete parts are recent",
+                rep.parts,
+                rep.orphan_parts.len(),
+                rep.obsolete_parts.len()
+            ));
+            return Ok(());
+        }
+        seen.retain(|id, _| stale.contains(id));
+        for id in stale {
+            let since = *seen.entry(id.clone()).or_insert(now);
+            if since + limit < now {
+                return Err(format!(
+                    "part {id} was never collected: unreferenced since before {start}, still stored at {now}; \
+                     orphans {:?}, obsolete {:?}",
+                    rep.orphan_parts, rep.obsolete_parts
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String> {
     let owner = Client::signup(&sim, "events", "events@events.test", "password-123").await?;
     setup(&owner).await?;
@@ -556,13 +688,30 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     let client = |name: &str| Client::with_token(&sim, name, &token);
     let base = (sim.now_ms() as i64).div_euclid(HOUR) * HOUR;
     let w: Shared = Arc::default();
-    let phase = chaos.then(|| super::chaos_phase(&sim));
     let mut tasks = Vec::new();
+    let churn = match sim.knobs.chance("events.churn", 0.5) {
+        true => {
+            let (ch, ts) = Churn::start(&sim, client, base, steps).await?;
+            tasks.extend(ts);
+            Some(ch)
+        }
+        false => None,
+    };
+    let retention = match sim.knobs.chance("events.retention", 0.5) {
+        true => {
+            let (rt, ts) = Retention::start(&sim, client, steps).await?;
+            tasks.extend(ts);
+            Some(rt)
+        }
+        false => None,
+    };
+    let filters = sim.knobs.chance("events.filter_deletes", 0.5);
+    let phase = chaos.then(|| super::chaos_phase(&sim));
     for i in 0..2 {
         tasks.push(tokio::spawn(inserter(client(&format!("bulk{i}")), w.clone(), base, steps, false)));
     }
     tasks.push(tokio::spawn(inserter(client("txn"), w.clone(), base, steps / 2, true)));
-    tasks.push(tokio::spawn(deleter(client("del"), w.clone(), steps / 4)));
+    tasks.push(tokio::spawn(deleter(client("del"), w.clone(), base, steps / 4, filters)));
     tasks.push(tokio::spawn(querier(client("q0"), w.clone(), base, steps)));
     let alter = {
         let (c, w) = (client("alter"), w.clone());
@@ -611,37 +760,46 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
         return Err(e);
     }
     let c = client("checker");
+    if chaos && gc_is_short(&sim) {
+        idle(&c).await?;
+    }
+    if let Some(ch) = &churn {
+        ch.check(&c).await?;
+    }
+    if let Some(rt) = &retention {
+        rt.check(&c).await?;
+    }
     let (uids, version) = all_uids(&c).await?;
     let old_inserts = {
         let mut g = world(&w);
         let unknown = std::mem::take(&mut g.unknown);
         let certain = unknown.is_empty();
-        for u in unknown {
+        let (rows, _) = snapshot(&g, version).ok_or("unresolved writes")?;
+        let must: BTreeSet<String> = rows.iter().map(|e| e.uid.clone()).collect();
+        // Writes of unknown outcome may or may not have taken effect, but an
+        // insert takes effect whole.
+        let (mut may_present, mut may_absent) = (BTreeSet::new(), BTreeSet::new());
+        let deletable = |e: &Ev| g.committed.iter().map(|(_, wr)| wr).chain(unknown.iter()).any(|wr| wr.deletes(e));
+        for u in &unknown {
             match u {
                 Write::Insert(us) => {
                     let present = us.iter().filter(|u| uids.contains(*u)).count();
-                    let deleted =
-                        |u: &String| g.committed.iter().any(|(_, wr)| matches!(wr, Write::Delete(d) if d.contains(u)));
-                    if present != 0 && us.iter().any(|u| !uids.contains(u) && !deleted(u)) {
+                    if present != 0 && us.iter().any(|u| !uids.contains(u) && !deletable(&g.events[u])) {
                         return Err(format!("an insert of unknown outcome is partly present: {us:?}"));
                     }
-                    if present > 0 {
-                        g.committed.push((0, Write::Insert(us)));
-                    }
+                    may_present.extend(us.iter().cloned());
                 }
-                Write::Delete(us) => {
-                    if us.iter().all(|u| !uids.contains(u)) {
-                        g.committed.push((version, Write::Delete(us)));
-                    }
+                Write::Delete(_) | Write::DeleteWhere(..) => {
+                    may_absent.extend(g.events.values().filter(|e| u.deletes(e)).map(|e| e.uid.clone()));
                 }
                 Write::Person(..) => {}
             }
         }
-        let (rows, _) = snapshot(&g, version).ok_or("unresolved writes")?;
-        let want: BTreeSet<String> = rows.iter().map(|e| e.uid.clone()).collect();
-        if want != uids {
-            let missing: Vec<&String> = want.difference(&uids).take(5).collect();
-            let extra: Vec<&String> = uids.difference(&want).take(5).collect();
+        let missing: Vec<&String> =
+            must.iter().filter(|u| !uids.contains(*u) && !may_absent.contains(*u)).take(5).collect();
+        let extra: Vec<&String> =
+            uids.iter().filter(|u| !must.contains(*u) && !may_present.contains(*u)).take(5).collect();
+        if !missing.is_empty() || !extra.is_empty() {
             return Err(format!(
                 "the table holds the wrong rows at v{version}: missing {missing:?}, unexpected {extra:?}"
             ));

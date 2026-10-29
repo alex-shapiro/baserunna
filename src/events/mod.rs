@@ -145,7 +145,7 @@ pub async fn create(txn: &mut Txn, def: &CreateEvents) -> Result<EventSchema> {
 /// Every part reference of table `id`, read into the transaction's read set.
 pub async fn refs(txn: &mut Txn, id: u32) -> Result<Vec<PartRef>> {
     let items = txn.scan(&ev::refs(id), false, usize::MAX >> 1).await?;
-    items.iter().map(|it| ref_of(it)).collect()
+    items.iter().map(ref_of).collect()
 }
 
 pub fn ref_of(it: &ReadValue) -> Result<PartRef> {
@@ -160,7 +160,7 @@ pub async fn drop(txn: &mut Txn, name: &str) -> Result<()> {
     let s = get_schema(txn, name).await?;
     for r in refs(txn, s.id).await? {
         txn.delete(r.key())?;
-        txn.event_op(EventOp::Ref { old: Some(r), new: None })?;
+        txn.event_op(EventOp::part_ref(Some(r), None))?;
     }
     txn.delete_range(ev::rows(s.id))?;
     txn.delete(ev::state_key(s.id))?;

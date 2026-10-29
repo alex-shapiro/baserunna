@@ -244,10 +244,10 @@ impl SumState {
     }
 
     fn value(&self) -> Val {
-        if !self.float {
-            if let Ok(i) = i64::try_from(self.ints) {
-                return Val::Int(i);
-            }
+        if !self.float
+            && let Ok(i) = i64::try_from(self.ints)
+        {
+            return Val::Int(i);
         }
         Val::Float(self.exact().value())
     }
@@ -596,9 +596,12 @@ mod tests {
         assert_eq!(funnel(&[ev(0, 0, 1), ev(1, 1, 1), ev(2, 2, 2)], 2, 10, dedup), 1);
     }
 
-    fn sample_states() -> Vec<(AggFn, Vec<(Val, Option<(i64, Pos, u32)>)>)> {
+    /// A value an aggregate adds, with its funnel or retention event.
+    type Input = (Val, Option<(i64, Pos, u32)>);
+
+    fn sample_states() -> Vec<(AggFn, Vec<Input>)> {
         let mut r = Rng::new(7);
-        let vals = |r: &mut Rng| -> Vec<(Val, Option<(i64, Pos, u32)>)> {
+        let vals = |r: &mut Rng| -> Vec<Input> {
             (0..r.usize(50))
                 .map(|i| {
                     let v = match r.usize(5) {

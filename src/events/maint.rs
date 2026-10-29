@@ -92,7 +92,7 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
     txn.delete_range(ev::rows_through(table, last))?;
     for r in &written {
         txn.put(r.key(), Value::Inline(r.encode()))?;
-        txn.event_op(EventOp::Ref { old: None, new: Some(r.clone()) })?;
+        txn.event_op(EventOp::part_ref(None, Some(r.clone())))?;
     }
     txn.event_op(EventOp::Forget { table, rows: items.len() as u64, bytes, sealed_through: Some(last) })?;
     match db.commit(txn.into_request()).await {
@@ -756,11 +756,11 @@ pub async fn merge(db: &Arc<Db>, s: &EventSchema, inputs: &[PartRef]) -> Result<
             return Err(Error::Conflict("a merge input changed".into()));
         }
         txn.delete(r.key())?;
-        txn.event_op(EventOp::Ref { old: Some(r.clone()), new: None })?;
+        txn.event_op(EventOp::part_ref(Some(r.clone()), None))?;
     }
     if let Some(o) = &out {
         txn.put(o.key(), Value::Inline(o.encode()))?;
-        txn.event_op(EventOp::Ref { old: None, new: Some(o.clone()) })?;
+        txn.event_op(EventOp::part_ref(None, Some(o.clone())))?;
     }
     match db.commit(txn.into_request()).await {
         Ok(_) => {
@@ -785,7 +785,7 @@ pub async fn drop_expired(db: &Arc<Db>, parts: &[PartRef]) -> Result<()> {
         let cur = txn.get(&r.key()).await?.map(|it| super::ref_of(&it)).transpose()?;
         if let Some(c) = cur {
             txn.delete(c.key())?;
-            txn.event_op(EventOp::Ref { old: Some(c), new: None })?;
+            txn.event_op(EventOp::part_ref(Some(c), None))?;
         }
     }
     db.commit(txn.into_request()).await?;
@@ -910,7 +910,7 @@ pub async fn delete(db: &Arc<Db>, txn: &mut Txn, name: &str, from: i64, to: i64,
         };
         if runs.count() >= r.rows {
             txn.delete(r.key()).map_err(in_partition)?;
-            txn.event_op(EventOp::Ref { old: Some(r.clone()), new: None }).map_err(in_partition)?;
+            txn.event_op(EventOp::part_ref(Some(r.clone()), None)).map_err(in_partition)?;
             probe::hit(Probe::EventRowsMasked);
             continue;
         }
@@ -924,7 +924,7 @@ pub async fn delete(db: &Arc<Db>, txn: &mut Txn, name: &str, from: i64, to: i64,
         };
         let new = PartRef { deleted: runs.count(), mask: Some(mask), ..r.clone() };
         txn.put(new.key(), Value::Inline(new.encode())).map_err(in_partition)?;
-        txn.event_op(EventOp::Ref { old: Some(r.clone()), new: Some(new) }).map_err(in_partition)?;
+        txn.event_op(EventOp::part_ref(Some(r.clone()), Some(new))).map_err(in_partition)?;
         probe::hit(Probe::EventRowsMasked);
     }
     Ok(count)

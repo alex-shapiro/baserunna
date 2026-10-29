@@ -1296,10 +1296,9 @@ async fn lookup_maps(
             Some(t) => t.clone(),
             None => {
                 let t = Arc::new(crate::table::rows_within(txn, &l.table, &mut budget).await.map_err(|e| match e {
-                    Error::TooLarge(_) => Error::TooLarge(format!(
-                        "the query's lookup tables exceed {} bytes",
-                        limits.lookup_max_bytes
-                    )),
+                    Error::TooLarge(_) => {
+                        Error::TooLarge(format!("the query's lookup tables exceed {} bytes", limits.lookup_max_bytes))
+                    }
                     e => e,
                 })?);
                 tables.insert(&l.table, t.clone());

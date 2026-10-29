@@ -7,7 +7,15 @@ const TABLE: &str = r#"{"name": "ev", "columns": [{"name": "time", "type": "time
     {"name": "event", "type": "string"}, {"name": "user", "type": "string"}],
     "time_column": "time", "order_by": ["event", "time"]}"#;
 
-async fn send(w: &World, i: usize, t: &str, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, Json) {
+async fn send(
+    w: &World,
+    i: usize,
+    t: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, Json) {
     let router = w.node(i).router().unwrap();
     let mut b = http::Request::builder().method(method).uri(path);
     if !t.is_empty() {
@@ -225,19 +233,35 @@ fn event_responses_match_the_openapi_document() {
             ("GET", "/v1/dbs/d/events", Json::Null),
             ("POST", "/v1/dbs/d/events/ev/query", json!({"from": 0, "to": "2100-01-01"})),
             ("POST", "/v1/dbs/d/events/ev/query", json!({"from": 0, "to": "2100-01-01", "limit": 1})),
-            ("POST", "/v1/dbs/d/events/ev/query", json!({"from": 0, "to": "2100-01-01", "group_by": ["event"],
+            (
+                "POST",
+                "/v1/dbs/d/events/ev/query",
+                json!({"from": 0, "to": "2100-01-01", "group_by": ["event"],
                 "aggregates": {"n": {"fn": "count"}, "u": {"fn": "uniq", "col": "user"},
-                "q": {"fn": "quantiles", "col": "n", "levels": [0.5]}}})),
-            ("POST", "/v1/dbs/d/txn", json!({"ops": [{"op": "insert_events", "table": "ev", "rows": [{"event": "c"}]},
+                "q": {"fn": "quantiles", "col": "n", "levels": [0.5]}}}),
+            ),
+            (
+                "POST",
+                "/v1/dbs/d/txn",
+                json!({"ops": [{"op": "insert_events", "table": "ev", "rows": [{"event": "c"}]},
                 {"op": "query_events", "table": "ev", "from": 0, "to": "2100-01-01",
-                 "aggregates": {"n": {"fn": "count"}}}]})),
+                 "aggregates": {"n": {"fn": "count"}}}]}),
+            ),
             ("POST", "/v1/dbs/d/events/ev/delete", json!({"where": {"col": "event", "op": "eq", "value": "a"}})),
-            ("POST", "/v1/dbs/d/txn", json!({"ops": [{"op": "delete_events", "table": "ev",
-                "where": {"col": "event", "op": "eq", "value": "b"}}]})),
+            (
+                "POST",
+                "/v1/dbs/d/txn",
+                json!({"ops": [{"op": "delete_events", "table": "ev",
+                "where": {"col": "event", "op": "eq", "value": "b"}}]}),
+            ),
             ("DELETE", "/v1/dbs/d/events/ev/skip-indexes/user", Json::Null),
             ("DELETE", "/v1/dbs/d/events/ev/columns/n", Json::Null),
-            ("POST", "/v1/dbs/d/events", json!({"name": "ev", "columns": [{"name": "time", "type": "time"}],
-                "time_column": "time", "order_by": ["time"], "if_not_exists": true})),
+            (
+                "POST",
+                "/v1/dbs/d/events",
+                json!({"name": "ev", "columns": [{"name": "time", "type": "time"}],
+                "time_column": "time", "order_by": ["time"], "if_not_exists": true}),
+            ),
             ("DELETE", "/v1/dbs/d/events/ev", Json::Null),
             ("GET", "/v1/dbs/d/events/ev", Json::Null),
         ];

@@ -352,7 +352,9 @@ pub(crate) fn bind_results_json(rs: &[Result<Committed>]) -> Json {
     Json::Array(
         rs.iter()
             .map(|r| match r {
-                Ok(c) => json!({"version": c.version, "time": c.time_ms, "replayed": c.replayed, "inserted": c.inserted}),
+                Ok(c) => {
+                    json!({"version": c.version, "time": c.time_ms, "replayed": c.replayed, "inserted": c.inserted})
+                }
                 Err(e) => {
                     let mut err = super::error_json(e);
                     err["status"] = json!(e.status());

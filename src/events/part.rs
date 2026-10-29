@@ -24,9 +24,9 @@ use crate::engine::events::{Mask, PartRef, Runs, decode_mask_object};
 use crate::engine::segment::{Compression, frame, unframe};
 use crate::error::{Error, Result};
 use crate::store::{GetOpts, PutMode, StoreError};
-use crate::util::{Either, race};
 use crate::util::bloom::Bloom;
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
+use crate::util::{Either, race};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -443,12 +443,12 @@ pub fn stat_prefix(s: &str) -> &str {
 
 /// The hash a bloom filter indexes for a value.
 pub fn bloom_hash_int(v: i64) -> u64 {
-    crate::util::bloom::key_hash(&[&[b'i'][..], &v.to_le_bytes()].concat())
+    crate::util::bloom::key_hash(&[&b"i"[..], &v.to_le_bytes()].concat())
 }
 
 pub fn bloom_hash_float(v: f64) -> u64 {
     let v = if v == 0.0 { 0.0 } else { v };
-    crate::util::bloom::key_hash(&[&[b'f'][..], &v.to_bits().to_le_bytes()].concat())
+    crate::util::bloom::key_hash(&[&b"f"[..], &v.to_bits().to_le_bytes()].concat())
 }
 
 pub fn bloom_hash_bool(v: bool) -> u64 {
@@ -456,7 +456,7 @@ pub fn bloom_hash_bool(v: bool) -> u64 {
 }
 
 pub fn bloom_hash_str(v: &str) -> u64 {
-    crate::util::bloom::key_hash(&[&[b's'][..], v.as_bytes()].concat())
+    crate::util::bloom::key_hash(&[&b"s"[..], v.as_bytes()].concat())
 }
 
 const NULLS_NONE: u8 = 0;
@@ -536,7 +536,11 @@ fn encode_block(v: &Vector, dict: Option<&BTreeMap<&str, u32>>) -> Result<Vec<u8
                 let map: Vec<u32> = s
                     .dict
                     .iter()
-                    .map(|x| d.get(x.as_str()).copied().ok_or_else(|| Error::internal("a string is missing from its column's dictionary")))
+                    .map(|x| {
+                        d.get(x.as_str())
+                            .copied()
+                            .ok_or_else(|| Error::internal("a string is missing from its column's dictionary"))
+                    })
                     .collect::<Result<_>>()?;
                 for c in &s.codes {
                     let code = if *c == NULL_CODE { 0 } else { map[*c as usize] };
@@ -831,7 +835,7 @@ pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_
             nonnull += (v.len() - v.nulls()) as u64;
             if plan.bloom {
                 bloom_hashes(&v, &mut hashes);
-                if (g as u32 + 1) % BLOOM_GRANULES == 0 || g + 1 == granules.len() {
+                if (g as u32 + 1).is_multiple_of(BLOOM_GRANULES) || g + 1 == granules.len() {
                     let mut b = Bloom::new(hashes.len(), BLOOM_BITS);
                     hashes.iter().for_each(|h| b.insert_hash(*h));
                     blooms.push(b);
@@ -932,8 +936,9 @@ impl Reading<'_> {
     /// within `event_get_hedge_ms`, so that one slow store request does not
     /// hold up a query.
     async fn get(&self, key: &str, range: Option<Range<u64>>) -> Result<Bytes> {
-        let fetch =
-            || self.shared.retry.run(|| self.shared.store.get(key, GetOpts { range: range.clone(), ..Default::default() }));
+        let fetch = || {
+            self.shared.retry.run(|| self.shared.store.get(key, GetOpts { range: range.clone(), ..Default::default() }))
+        };
         let hedge_ms = self.shared.cfg.event_get_hedge_ms;
         let mut first = Box::pin(fetch());
         let g = if hedge_ms == 0 {
@@ -952,11 +957,11 @@ impl Reading<'_> {
             }
         };
         let g = g.map_err(|e| match e {
-                StoreError::NotFound => {
-                    Error::unavailable("garbage collection removed an event part this read needed; retry")
-                }
-                other => other.into(),
-            })?;
+            StoreError::NotFound => {
+                Error::unavailable("garbage collection removed an event part this read needed; retry")
+            }
+            other => other.into(),
+        })?;
         self.stats.gets.fetch_add(1, Relaxed);
         self.stats.bytes.fetch_add(g.data.len() as u64, Relaxed);
         if let Some(r) = &range

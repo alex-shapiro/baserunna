@@ -880,9 +880,9 @@ pub(crate) async fn rows_within(txn: &mut Txn, name: &str, budget: &mut usize) -
     let mut pages = Pages::new(KeyRange::prefix(&prefix));
     while let Some(page) = pages.next(txn).await? {
         for it in &page {
-            *budget = budget.checked_sub(it.key.len() + it.value.size()).ok_or_else(|| {
-                Error::TooLarge(format!("table {name:?} does not fit in the lookup limit"))
-            })?;
+            *budget = budget
+                .checked_sub(it.key.len() + it.value.size())
+                .ok_or_else(|| Error::TooLarge(format!("table {name:?} does not fit in the lookup limit")))?;
             out.push(decode_stored_row(&s, &prefix, it)?.1);
         }
     }

@@ -485,10 +485,13 @@ mod stored_values {
             let db = create_db(&eng, "d").await;
             let long = "x".repeat(40);
             let max = format!("{}é", "x".repeat(31));
-            ins(&db, vec![
-                json!({"time": T0, "event": "a", "user": long}),
-                json!({"time": T0 + 1, "event": "a", "user": max}),
-            ])
+            ins(
+                &db,
+                vec![
+                    json!({"time": T0, "event": "a", "user": long}),
+                    json!({"time": T0 + 1, "event": "a", "user": max}),
+                ],
+            )
             .await;
             let eq = json!({"col": "user", "op": "eq", "value": long});
             let prefix = json!({"col": "user", "op": "prefix", "value": "x".repeat(33)});
@@ -620,7 +623,8 @@ mod stored_values {
                     seal_all(&db).await;
                 }
                 let all = json!(["time", "event", "user", "n", "x", "flag", "props", "plan"]);
-                let rows_q = |cols: Json| json!({"from": 0, "to": T0 * 2, "columns": cols, "order_by": ["time"], "limit": 1000});
+                let rows_q =
+                    |cols: Json| json!({"from": 0, "to": T0 * 2, "columns": cols, "order_by": ["time"], "limit": 1000});
                 let mut filters = Vec::new();
                 for s in strs() {
                     filters.push(json!({"col": "event", "op": "eq", "value": s}));
@@ -654,7 +658,11 @@ mod stored_values {
                     let want = query(&model, &rows_q(all.clone())).await.unwrap().rows;
                     assert_eq!(got, want, "seed {seed} {stage} rows");
                     for f in &filters {
-                        assert_eq!(count(&db, f.clone()).await, count(&model, f.clone()).await, "seed {seed} {stage} {f}");
+                        assert_eq!(
+                            count(&db, f.clone()).await,
+                            count(&model, f.clone()).await,
+                            "seed {seed} {stage} {f}"
+                        );
                     }
                 }
             });
@@ -697,7 +705,6 @@ mod stored_values {
             }
         });
     }
-
 }
 /// Query answers that pruning and part layouts must not change.
 mod query_semantics {
@@ -756,15 +763,18 @@ mod query_semantics {
         });
     }
 
-
     #[test]
     fn bucket_of_extreme_int_does_not_panic() {
         rt().block_on(async {
             let (_e, db, _id) =
                 setup(def(json!([{"name": "time", "type": "time"}, {"name": "n", "type": "int"}]))).await;
             ins(&db, "e", vec![json!({"time": T0, "n": i64::MIN})]).await;
-            let out = q(&db, "e", json!({"from": T0, "to": T0 + DAY,
-                "group_by": [{"bucket": {"col": "n"}, "interval": "1d"}], "aggregates": {"c": {"fn": "count"}}}))
+            let out = q(
+                &db,
+                "e",
+                json!({"from": T0, "to": T0 + DAY,
+                "group_by": [{"bucket": {"col": "n"}, "interval": "1d"}], "aggregates": {"c": {"fn": "count"}}}),
+            )
             .await;
             assert_eq!(out.rows, vec![vec![Json::Null, json!(1)]], "a bucket beyond the time range is null");
         });
@@ -788,15 +798,23 @@ mod query_semantics {
             for order in
                 [json!(["time"]), json!([{"col": "k", "desc": true}]), json!(["k", {"col": "time", "desc": true}])]
             {
-                let full = q(&db, "e", json!({"from": T0, "to": T0 + DAY, "columns": ["time", "k"],
-                    "order_by": order, "limit": 1000}))
+                let full = q(
+                    &db,
+                    "e",
+                    json!({"from": T0, "to": T0 + DAY, "columns": ["time", "k"],
+                    "order_by": order, "limit": 1000}),
+                )
                 .await;
                 assert_eq!(full.rows.len(), want);
                 let mut got = Vec::new();
                 let mut cursor = Json::Null;
                 loop {
-                    let page = q(&db, "e", json!({"from": T0, "to": T0 + DAY, "columns": ["time", "k"],
-                        "order_by": order, "limit": 4, "cursor": cursor}))
+                    let page = q(
+                        &db,
+                        "e",
+                        json!({"from": T0, "to": T0 + DAY, "columns": ["time", "k"],
+                        "order_by": order, "limit": 4, "cursor": cursor}),
+                    )
                     .await;
                     got.extend(page.rows);
                     match page.next_cursor {
@@ -823,7 +841,8 @@ mod query_semantics {
             let query = json!({"from": i64::MIN, "to": i64::MAX, "group_by": ["c"],
                 "aggregates": {"n": {"fn": "count"}, "s": {"fn": "sum", "of": "c"},
                     "sevens": {"fn": "count", "where": {"col": "c", "op": "eq", "value": 7}}}});
-            let want = vec![vec![json!(1), json!(1), json!(1), json!(0)], vec![json!(7), json!(4), json!(28), json!(4)]];
+            let want =
+                vec![vec![json!(1), json!(1), json!(1), json!(0)], vec![json!(7), json!(4), json!(28), json!(4)]];
             assert_eq!(q(&db, "e", query.clone()).await.rows, want, "mixed");
             maint::seal(&db, id).await.unwrap();
             assert_eq!(q(&db, "e", query.clone()).await.rows, want, "sealed");
@@ -915,7 +934,11 @@ mod query_semantics {
                 max += 64;
             }
             let r = run(&["people", "teams"], max).await;
-            assert!(matches!(r, Err(Error::TooLarge(_))), "two tables of {max} bytes each pass: {:?}", r.map(|o| o.rows));
+            assert!(
+                matches!(r, Err(Error::TooLarge(_))),
+                "two tables of {max} bytes each pass: {:?}",
+                r.map(|o| o.rows)
+            );
             let r = run(&["people"; 8], max).await;
             assert!(r.is_ok(), "lookups of one table read it once: {:?}", r.err());
         });
@@ -926,9 +949,13 @@ mod query_semantics {
         rt().block_on(async {
             let (_e, db, _id) = setup(def(json!([{"name": "time", "type": "time"}]))).await;
             ins(&db, "e", vec![json!({"time": "2024-01-02T10:00:00Z"})]).await;
-            let out = q(&db, "e", json!({"from": "2024-01-01T00:00:00Z", "to": "2024-01-05T00:00:00Z",
+            let out = q(
+                &db,
+                "e",
+                json!({"from": "2024-01-01T00:00:00Z", "to": "2024-01-05T00:00:00Z",
                 "where": {"bucket": {"col": "time"}, "interval": "1d", "op": "eq", "value": "2024-01-02T00:00:00Z"},
-                "aggregates": {"n": {"fn": "count"}}}))
+                "aggregates": {"n": {"fn": "count"}}}),
+            )
             .await;
             assert_eq!(out.rows, vec![vec![json!(1)]]);
         });
@@ -952,7 +979,6 @@ mod query_semantics {
         assert_eq!(w.bucket(t("2024-01-01T05:00:00Z"), est), Some(t("2024-01-01T05:00:00Z")));
         assert_eq!(w.bucket(t("1969-12-28T00:00:00Z"), 0), Some(t("1969-12-22T00:00:00Z")));
     }
-
 }
 /// Bulk inserts, binds and maintenance against concurrent transactions and quotas.
 mod storage {
@@ -1106,7 +1132,8 @@ mod storage {
                 loop {
                     i += 1;
                     let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-                    t.put(Bytes::from(format!("\x01k{i}")), crate::engine::Value::Inline(Bytes::from(vec![7u8; n]))).unwrap();
+                    t.put(Bytes::from(format!("\x01k{i}")), crate::engine::Value::Inline(Bytes::from(vec![7u8; n])))
+                        .unwrap();
                     match db.commit(t.into_request()).await {
                         Ok(_) => {}
                         Err(Error::QuotaExceeded(_)) => break,
@@ -1196,7 +1223,10 @@ fn queries_stop_at_their_time_limit() {
         let start = tokio::time::Instant::now();
         let limits = Limits { max_ms: 300, ..Limits::default() };
         let r = exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await;
-        assert!(matches!(&r, Err(Error::Unavailable { outcome_unknown: false, message, .. }) if message.contains("300 ms")), "{r:?}");
+        assert!(
+            matches!(&r, Err(Error::Unavailable { outcome_unknown: false, message, .. }) if message.contains("300 ms")),
+            "{r:?}"
+        );
         assert!(start.elapsed().as_millis() <= 300, "{:?}", start.elapsed());
     });
 }

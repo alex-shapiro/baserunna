@@ -507,15 +507,27 @@ pub enum EventOp {
     /// Inserts encoded rows into `table`, giving them positions at commit.
     Insert { table: u32, rows: Vec<Bytes> },
     /// Accounts for a reference added, replaced or removed by a put in the
-    /// same write set. `old` is the reference the transaction read, which
-    /// validation guarantees is still current: its objects that `new` does
-    /// not name become obsolete.
-    Ref { old: Option<PartRef>, new: Option<PartRef> },
+    /// same write set; see [`EventOp::part_ref`].
+    Ref(Box<RefChange>),
     /// Unsealed rows removed by a seal or a delete in the same write set.
     Forget { table: u32, rows: u64, bytes: u64, sealed_through: Option<Pos> },
 }
 
+/// A part reference added, replaced or removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefChange {
+    pub old: Option<PartRef>,
+    pub new: Option<PartRef>,
+}
+
 impl EventOp {
+    /// Accounts for reference `old` becoming `new`. `old` is the reference
+    /// the transaction read, which validation guarantees is still current:
+    /// its objects that `new` does not name become obsolete.
+    pub fn part_ref(old: Option<PartRef>, new: Option<PartRef>) -> EventOp {
+        EventOp::Ref(Box::new(RefChange { old, new }))
+    }
+
     pub fn inserted_bytes(&self) -> u64 {
         match self {
             EventOp::Insert { rows, .. } => rows.iter().map(|r| r.len() as u64 + 32).sum(),
@@ -525,7 +537,8 @@ impl EventOp {
 
     /// Objects first named by this op, which must be bindable.
     pub fn new_objects(&self) -> Vec<&str> {
-        let EventOp::Ref { old, new: Some(n) } = self else { return Vec::new() };
+        let EventOp::Ref(c) = self else { return Vec::new() };
+        let RefChange { old, new: Some(n) } = c.as_ref() else { return Vec::new() };
         let mut v = Vec::new();
         if old.as_ref().is_none_or(|o| o.id != n.id) {
             v.push(n.id.as_str());
@@ -608,7 +621,8 @@ pub(crate) async fn plan(ops: &[EventOp], at: &Pending<'_>, version: Seq) -> Res
                 }
                 states.insert(*table, st);
             }
-            EventOp::Ref { old, new } => {
+            EventOp::Ref(c) => {
+                let RefChange { old, new } = c.as_ref();
                 if let Some(o) = old {
                     fx.part_bytes_removed += o.stored_bytes();
                     if new.as_ref().is_none_or(|n| n.id != o.id) {

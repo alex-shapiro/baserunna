@@ -46,7 +46,11 @@ pub const COMMIT_SPACE: u8 = 0xFF;
 pub enum CommitRecord {
     /// An applied commit, with what a replay of its request reports: its
     /// stream appends, and the events a bulk insert added.
-    Applied { time_ms: u64, appends: Vec<Appended>, inserted: Option<u64> },
+    Applied {
+        time_ms: u64,
+        appends: Vec<Appended>,
+        inserted: Option<u64>,
+    },
     Aborted,
 }
 
@@ -250,7 +254,9 @@ mod tests {
     #[test]
     fn commit_records_roundtrip() {
         let appends = [Appended { first_seq: 0, count: 3 }, Appended { first_seq: u64::MAX, count: 0 }];
-        for (time_ms, appends, inserted) in [(17, &appends[..], None), (5, &[][..], None), (9, &[][..], Some(0)), (1, &appends[..1], Some(70))] {
+        for (time_ms, appends, inserted) in
+            [(17, &appends[..], None), (5, &[][..], None), (9, &[][..], Some(0)), (1, &appends[..1], Some(70))]
+        {
             let want = CommitRecord::Applied { time_ms, appends: appends.to_vec(), inserted };
             assert_eq!(decode_commit_record(&encode_commit_record(time_ms, appends, inserted)).unwrap(), want);
         }

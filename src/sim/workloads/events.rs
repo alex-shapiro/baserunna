@@ -227,7 +227,11 @@ async fn deleter(c: Client, w: Shared, steps: usize) -> Result<(), String> {
                 .flatten()
                 .collect();
             let mut r = c.rng();
-            (0..r.usize(6)).filter_map(|_| (!live.is_empty()).then(|| live[r.usize(live.len())].clone())).collect()
+            if live.is_empty() {
+                Vec::new()
+            } else {
+                (0..r.usize(6)).map(|_| live[r.usize(live.len())].clone()).collect()
+            }
         };
         if victims.is_empty() {
             continue;
@@ -608,41 +612,44 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     }
     let c = client("checker");
     let (uids, version) = all_uids(&c).await?;
-    let mut g = world(&w);
-    let unknown = std::mem::take(&mut g.unknown);
-    let certain = unknown.is_empty();
-    for u in unknown {
-        match u {
-            Write::Insert(us) => {
-                let present = us.iter().filter(|u| uids.contains(*u)).count();
-                let deleted =
-                    |u: &String| g.committed.iter().any(|(_, wr)| matches!(wr, Write::Delete(d) if d.contains(u)));
-                if present != 0 && us.iter().any(|u| !uids.contains(u) && !deleted(u)) {
-                    return Err(format!("an insert of unknown outcome is partly present: {us:?}"));
+    let old_inserts = {
+        let mut g = world(&w);
+        let unknown = std::mem::take(&mut g.unknown);
+        let certain = unknown.is_empty();
+        for u in unknown {
+            match u {
+                Write::Insert(us) => {
+                    let present = us.iter().filter(|u| uids.contains(*u)).count();
+                    let deleted =
+                        |u: &String| g.committed.iter().any(|(_, wr)| matches!(wr, Write::Delete(d) if d.contains(u)));
+                    if present != 0 && us.iter().any(|u| !uids.contains(u) && !deleted(u)) {
+                        return Err(format!("an insert of unknown outcome is partly present: {us:?}"));
+                    }
+                    if present > 0 {
+                        g.committed.push((0, Write::Insert(us)));
+                    }
                 }
-                if present > 0 {
-                    g.committed.push((0, Write::Insert(us)));
+                Write::Delete(us) => {
+                    if us.iter().all(|u| !uids.contains(u)) {
+                        g.committed.push((version, Write::Delete(us)));
+                    }
                 }
+                Write::Person(..) => {}
             }
-            Write::Delete(us) => {
-                if us.iter().all(|u| !uids.contains(u)) {
-                    g.committed.push((version, Write::Delete(us)));
-                }
-            }
-            Write::Person(..) => {}
         }
-    }
-    let (rows, _) = snapshot(&g, version).ok_or("unresolved writes")?;
-    let want: BTreeSet<String> = rows.iter().map(|e| e.uid.clone()).collect();
-    if want != uids {
-        let missing: Vec<&String> = want.difference(&uids).take(5).collect();
-        let extra: Vec<&String> = uids.difference(&want).take(5).collect();
-        return Err(format!("the table holds the wrong rows at v{version}: missing {missing:?}, unexpected {extra:?}"));
-    }
-    let checked = if certain { check_answers(&g)? } else { 0 };
-    sim.trace.event(&format!("events: {} rows, {checked} answers checked", uids.len()));
-    let old_inserts = g.old_inserts;
-    drop(g);
+        let (rows, _) = snapshot(&g, version).ok_or("unresolved writes")?;
+        let want: BTreeSet<String> = rows.iter().map(|e| e.uid.clone()).collect();
+        if want != uids {
+            let missing: Vec<&String> = want.difference(&uids).take(5).collect();
+            let extra: Vec<&String> = uids.difference(&want).take(5).collect();
+            return Err(format!(
+                "the table holds the wrong rows at v{version}: missing {missing:?}, unexpected {extra:?}"
+            ));
+        }
+        let checked = if certain { check_answers(&g)? } else { 0 };
+        sim.trace.event(&format!("events: {} rows, {checked} answers checked", uids.len()));
+        g.old_inserts
+    };
     check_retention(&c, old_inserts).await?;
     tour(&c).await
 }

@@ -73,11 +73,29 @@ pub fn error_json(e: &Error) -> Json {
     err
 }
 
-/// Reconstructs an [`Error`] from a JSON error response.
+/// The largest forwarded bind a lease holder reads.
+const BIND_BODY_MAX: usize = 1 << 30;
+
+/// Reconstructs an [`Error`] from a JSON error response, or from its status
+/// alone when the body is not one.
 pub fn error_from_json(status: u16, j: &Json) -> Error {
     let e = &j["error"];
     let m = e["message"].as_str().unwrap_or("request failed").to_string();
-    match e["code"].as_str().unwrap_or("") {
+    let code = match e["code"].as_str() {
+        Some(c) => c,
+        None => match status {
+            400 => "invalid_argument",
+            401 => "unauthenticated",
+            403 => "permission_denied",
+            404 => "not_found",
+            413 => "too_large",
+            429 => "rate_limited",
+            // Whatever answered may have passed the request on.
+            503 => return Error::Unavailable { message: m, retry_after_ms: Some(500), outcome_unknown: true },
+            _ => "",
+        },
+    };
+    match code {
         "invalid_argument" => Error::InvalidArgument(m),
         "unauthenticated" => Error::Unauthenticated(m),
         "permission_denied" => Error::PermissionDenied(m),
@@ -982,7 +1000,9 @@ pub fn router(node: Arc<Node>) -> Router {
     let internal = Router::new()
         .route("/internal/v1/meta", post(account::internal_meta))
         .route("/internal/v1/notice", post(commit_notice))
-        .route("/internal/v1/events/bind", post(events::internal_bind))
+        // A bind lists every part of a buffer for each of its requests, which
+        // the client body limit does not bound.
+        .route("/internal/v1/events/bind", post(events::internal_bind).layer(DefaultBodyLimit::max(BIND_BODY_MAX)))
         .route_layer(middleware::from_fn_with_state(node.clone(), internal_auth));
     let r = Router::new()
         .route("/healthz", get(healthz))

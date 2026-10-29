@@ -21,6 +21,11 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       segments thousands of times before it serves a request, and chaos
       crashes it again first, so the workload never finishes
       (`sim_tool trace db_churn 606688` on `main`, 601086 on this branch).
+- [ ] **Fix stream reads that outlast the request deadline.** Since
+      requests are cancelled at `commit_timeout_ms`, a checker's stream read
+      can fail with `503 request deadline exceeded` until it gives up
+      (`sim_tool trace streams 2601188`; also 2602361 and 2603205, on `main`
+      as on this branch).
 - [ ] **Fix `streams` seed 202835: expired stream records are returned after
       `retention_ms`.** Stream reads return records older than `retention_ms`
       (`sim_tool trace streams 202835`).
@@ -111,6 +116,15 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 - [ ] **Treat `query_events` in transactions like event queries.** The op
       takes no query slot, gets no deadline extension, and drops a
       `consistency` it is given.
+- [ ] **Re-resolve database names for strong event queries.** An event
+      query checks that its database exists at a snapshot 5 s old whatever
+      `consistency` its body asks for, so a strong query on a node that
+      cached a name deleted and recreated elsewhere fails once with `404
+      database deleted` before the name is looked up again.
+- [ ] **Merge partial-directory parts in one pass per row.** A merge reads a
+      path that an input keeps in a shared bucket by parsing that bucket's
+      JSON once for every output path (`Feed::SharedPath`), so merging parts
+      with partial directories costs paths × rows × bucket size.
 - [ ] **Sweep staged event parts after the last event table is dropped.**
       Sweeps list `part/` only while a database has event tables or part
       bytes, so a part staged by a bulk insert that races a drop of the last

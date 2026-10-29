@@ -2708,3 +2708,195 @@ mod answers {
         });
     }
 }
+mod maintenance_robustness {
+    use super::*;
+
+    async fn table_id(db: &Arc<Db>) -> u32 {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        get_schema(&mut t, "events").await.unwrap().id
+    }
+
+    async fn ins(db: &Arc<Db>, rows: Vec<Json>) {
+        txn_do(db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+    }
+
+    async fn schema_and_refs(db: &Arc<Db>) -> (EventSchema, Vec<PartRef>) {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let s = get_schema(&mut t, "events").await.unwrap();
+        let rs = refs(&mut t, s.id).await.unwrap();
+        (s, rs)
+    }
+
+    /// Rows of a part written before a column was added take its default in a
+    /// merge, but their stored sizes (RowBytes) do not count it, so a merged
+    /// granule of small rows holds 8,192 copies of the default in one block.
+    #[test]
+    fn merges_fill_large_defaults_into_readable_blocks() {
+        rt().block_on(async {
+            let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            let old: Vec<Json> = (0..8192).map(|i| json!({"time": T0 + i, "event": "a"})).collect();
+            ins(&db, old).await;
+            while maint::seal(&db, id).await.unwrap() {}
+            let spec: ColumnSpec =
+                serde_json::from_value(json!({"name": "note", "type": "string", "default": "d".repeat(10_000)}))
+                    .unwrap();
+            txn_do(&db, async |t| add_column(t, "events", &spec).await).await.unwrap();
+            // Distinct values past the dictionary's 1 MiB keep the merged column plain.
+            let new: Vec<Json> = (0..200)
+                .map(|i| json!({"time": T0 + 9000 + i, "event": "a", "note": format!("{i:05}{}", "n".repeat(6000))}))
+                .collect();
+            ins(&db, new).await;
+            while maint::seal(&db, id).await.unwrap() {}
+            let (s, rs) = schema_and_refs(&db).await;
+            assert_eq!(rs.len(), 2, "two parts in one partition");
+            let r = maint::merge(&db, &s, &rs).await;
+            assert!(r.is_ok(), "merging a table after adding a 10 KB default: {r:?}");
+        });
+    }
+
+    /// The failing merge above is planned first on every maintenance run, so
+    /// the table's other partitions are never merged.
+    #[test]
+    fn a_failing_merge_does_not_starve_other_partitions() {
+        rt().block_on(async {
+            let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            let old: Vec<Json> = (0..8192).map(|i| json!({"time": T0 + i, "event": "a"})).collect();
+            ins(&db, old).await;
+            while maint::seal(&db, id).await.unwrap() {}
+            let spec: ColumnSpec =
+                serde_json::from_value(json!({"name": "note", "type": "string", "default": "d".repeat(10_000)}))
+                    .unwrap();
+            txn_do(&db, async |t| add_column(t, "events", &spec).await).await.unwrap();
+            for p in 0..7 {
+                let new: Vec<Json> = (0..200)
+                    .map(|i| {
+                        json!({"time": T0 + 9000 + p * 1000 + i, "event": "a",
+                               "note": format!("{p}{i:05}{}", "n".repeat(6000))})
+                    })
+                    .collect();
+                ins(&db, new).await;
+                while maint::seal(&db, id).await.unwrap() {}
+            }
+            for p in 0..8 {
+                ins(&db, vec![json!({"time": T0 + DAY + p, "event": "b"})]).await;
+                while maint::seal(&db, id).await.unwrap() {}
+            }
+            let (_, before) = schema_and_refs(&db).await;
+            assert_eq!(before.len(), 16);
+            let r = maint::maintain(&db, id, 64).await;
+            let (_, after) = schema_and_refs(&db).await;
+            assert!(after.len() < 16, "maintenance: {r:?}; parts {} -> {}", before.len(), after.len());
+        });
+    }
+
+    /// Rows of a part, generated on demand: one skip-indexed int column.
+    struct Synth {
+        n: u64,
+        /// Distinct values of the column.
+        distinct: u64,
+        plans: Vec<part::ColPlan>,
+    }
+
+    impl part::Source for Synth {
+        fn rows(&self) -> u64 {
+            self.n
+        }
+        fn row_bytes(&self, _: u64) -> u64 {
+            16
+        }
+        fn key_at(&self, i: u64) -> bytes::Bytes {
+            bytes::Bytes::from(crate::table::tuple::encode(&[crate::table::tuple::Key::Int(i as i64)]))
+        }
+        fn plans(&self) -> &[part::ColPlan] {
+            &self.plans
+        }
+        fn shared_paths(&self) -> std::collections::BTreeMap<u32, Vec<part::SharedPath>> {
+            Default::default()
+        }
+        fn partial_paths(&self) -> std::collections::BTreeSet<u32> {
+            Default::default()
+        }
+        async fn column(&mut self, _: usize, rows: std::ops::Range<u64>) -> Result<vector::Vector> {
+            Ok(vector::Vector::Int(rows.map(|i| Some((i % self.distinct) as i64)).collect()))
+        }
+    }
+
+    /// A merged part of a busy day (56M events) with a skip index can be
+    /// written: blooms are sized by distinct values, and a column with too
+    /// many for its blooms to fit an index keeps none.
+    #[test]
+    fn parts_with_many_rows_and_a_skip_index_can_be_written() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, EngineConfig::default());
+            let db = create_db(&eng, "d").await;
+            for distinct in [1_000, 56_000_000] {
+                let plans = vec![part::ColPlan {
+                    cref: part::ColRef::User(3),
+                    phys: vector::Phys::Int,
+                    json: false,
+                    dict: None,
+                    bloom: true,
+                }];
+                let mut src = Synth { n: 56_000_000, distinct, plans };
+                let mut sink = part::Sink::new(db.shared(), &db.id, part::new_part_id(db.shared()));
+                let w = part::write(&mut sink, &mut src, 1, vec![3]).await;
+                assert!(w.is_ok(), "writing 56M rows of {distinct} values with a skip index: {:?}", w.err());
+            }
+        });
+    }
+
+    /// Size-tiered merges take `fan_in` parts of a tier whatever their sizes,
+    /// so parts just under `event_part_max_bytes` merge into one several
+    /// times larger.
+    #[test]
+    fn tier_merges_stay_under_the_part_size_limit() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, EngineConfig { event_insert_part_max_bytes: 1 << 20, ..cfg() });
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            let mut r = Rng::new(3);
+            for b in 0..3 {
+                let rows: Vec<Json> = (0..2500)
+                    .map(|i| json!({"time": T0 + b * 10_000 + i, "event": "a", "user": format!("{:016x}", r.next_u64())}))
+                    .collect();
+                ins(&db, rows).await;
+                while maint::seal(&db, id).await.unwrap() {}
+            }
+            maint::maintain(&db, id, 64).await.unwrap();
+            let (_, rs) = schema_and_refs(&db).await;
+            let max = db.shared().cfg.event_part_max_bytes;
+            let sizes: Vec<u64> = rs.iter().map(|r| r.size).collect();
+            assert!(sizes.iter().all(|s| *s <= max), "part sizes {sizes:?}, limit {max}");
+        });
+    }
+
+    /// A partition that ended and got no part for a day is merged into one
+    /// part, but each settling merge's output counts as a new arrival.
+    #[test]
+    fn quiet_partitions_settle_into_one_part() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            // Two parts in each of three tiers, so no tier has the fan-in of 3.
+            for (k, n) in [1i64, 1, 40, 40, 200, 200].into_iter().enumerate() {
+                let rows: Vec<Json> =
+                    (0..n).map(|i| json!({"time": T0 - 10 * DAY + k as i64 * 1000 + i, "event": "a"})).collect();
+                ins(&db, rows).await;
+                while maint::seal(&db, id).await.unwrap() {}
+            }
+            maint::maintain(&db, id, 64).await.unwrap();
+            let (_, before) = schema_and_refs(&db).await;
+            tokio::time::sleep(std::time::Duration::from_millis(db.shared().cfg.event_settle_ms + 60_000)).await;
+            maint::maintain(&db, id, 64).await.unwrap();
+            let (_, after) = schema_and_refs(&db).await;
+            assert_eq!(after.len(), 1, "parts of a quiet partition: {} before, {} after", before.len(), after.len());
+        });
+    }
+}

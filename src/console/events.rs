@@ -156,7 +156,7 @@ pub(crate) fn default_query(t: &Json) -> String {
     // The 30 days before the newest partition ends, and any newer events.
     let newest = t["partitions"].as_array().into_iter().flatten().filter_map(|p| p["end"].as_i64()).max();
     let from = newest.map_or(json!("2000-01-01"), |end| json!(end - 30 * 86_400_000));
-    json!({"from": from, "to": "2100-01-01", "group_by": group_by,
+    json!({"from": from, "to": "9999-12-31T23:59:59Z", "group_by": group_by,
         "aggregates": {count: {"fn": "count"}}, "order_by": [{"col": count, "desc": true}], "limit": 50})
     .to_string()
 }

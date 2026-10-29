@@ -121,7 +121,7 @@ fn read_only_keys_and_strangers_cannot_write_events() {
             for path in ["/v1/dbs/d/events/ev/rows".to_string(), format!("/v1/dbs/id:{id}/events/ev/rows")] {
                 let (s, r) = send(&w, 0, tok, "POST", &path, &j, rows).await;
                 assert!(s == 404 || s == 403, "{path}: {s} {r}");
-                let qp = path.replace("/rows", "/query");
+                let qp = format!("{path}/query");
                 let (s, r) = send(&w, 0, tok, "POST", &qp, &j, r#"{"from":0,"to":1}"#).await;
                 assert!(s == 404 || s == 403, "{qp}: {s} {r}");
             }
@@ -634,5 +634,61 @@ fn event_rows_routes_are_served_where_they_arrive() {
     ] {
         let got = (super::events::served_locally(method, path), super::events::is_query(method, path));
         assert_eq!(got, (local, query), "{method} {path}");
+    }
+}
+mod forwarding {
+    use super::*;
+    use std::time::Duration;
+
+    async fn setup_cfg(nodes: usize, configure: fn(&mut crate::node::NodeConfig)) -> (World, String) {
+        let w = World::with_config(nodes, 0, configure).await;
+        let t = w.signup(0, "ev@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let r = call_router(&w.node(0).router().unwrap(), "POST", "/v1/dbs/d/events", &t, Bytes::from(TABLE)).await;
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        (w, t)
+    }
+
+    /// A bulk insert accepted by the lease holder is accepted by every node:
+    /// a forwarded bind is not bounded by the client JSON body limit.
+    #[test]
+    fn forwarded_binds_are_not_bounded_by_the_json_body_limit() {
+        run_paused(async {
+            let (w, t) = setup_cfg(2, |c| c.max_json_body = 256 << 10).await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let id = db_id(&w, &t).await;
+            for i in 0..2 {
+                count(&w, i, &t).await;
+            }
+            let h = w.holder(&id).expect("a lease holder");
+            let n = 1 - h;
+            let day = 86_400_000i64;
+            let rows: Vec<Json> = (0..4000).map(|i| json!({"event": "a", "time": i * day})).collect();
+            let body = Json::Array(rows).to_string();
+            assert!(body.len() < 256 << 10, "{}", body.len());
+            let p = "/v1/dbs/d/events/ev/rows";
+            let (sh, rh) = send(&w, h, &t, "POST", p, &[], &body).await;
+            let (sn, rn) = send(&w, n, &t, "POST", p, &[], &body).await;
+            assert_eq!((sh, sn), (201, 201), "on the holder: {sh} {rh}\non the other node: {sn} {rn}");
+            w.shutdown();
+        });
+    }
+
+    /// The console's table page runs its default query; a table holding an
+    /// event after 2100 still gets an answer.
+    #[test]
+    fn console_default_queries_cover_far_future_events() {
+        run_paused(async {
+            let (w, t) = setup(1).await;
+            let rows =
+                json!([{"event": "a", "time": "2026-01-01T00:00:00Z"}, {"event": "b", "time": "2200-01-01T00:00:00Z"}]);
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], &rows.to_string()).await;
+            assert_eq!(s, 201, "{r}");
+            let (_, table) = send(&w, 0, &t, "GET", "/v1/dbs/d/events/ev", &[], "").await;
+            let q = crate::console::events::default_query(&table);
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], &q).await;
+            assert_eq!(s, 200, "the console's default query fails: {q}: {r}");
+            w.shutdown();
+        });
     }
 }

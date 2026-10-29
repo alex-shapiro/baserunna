@@ -40,6 +40,8 @@ pub const STAT_PREFIX: usize = 32;
 /// Granules per bloom filter.
 pub const BLOOM_GRANULES: u32 = 4;
 const BLOOM_BITS: usize = 10;
+/// The most bytes of bloom filters one column of a part holds.
+const BLOOM_MAX_BYTES: usize = 8 << 20;
 /// Most distinct strings coded into a part-level dictionary.
 pub const DICT_MAX: usize = 65_536;
 /// The most rows a block holds.
@@ -387,7 +389,7 @@ impl ColIndex {
         for b in &self.blooms {
             b.encode(&mut w);
         }
-        framed(&w.buf, Compression::Zstd(1), "part metadata")
+        framed(&w.buf, Compression::Zstd(1), "a column index")
     }
 
     pub fn decode(b: &Bytes, phys: Phys) -> DResult<ColIndex> {
@@ -878,6 +880,7 @@ pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_
         let mut blooms = Vec::new();
         let mut hashes = Vec::new();
         let mut nonnull = 0u64;
+        let mut bloom_bytes = 0;
         let mut pending: Vec<Vector> = Vec::new();
         let (mut pending_bytes, mut pending_rows) = (0usize, 0usize);
         let mut first = 0u32;
@@ -888,11 +891,14 @@ pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_
             }
             stats.push(granule_stat(&v));
             nonnull += (v.len() - v.nulls()) as u64;
-            if plan.bloom {
+            if plan.bloom && bloom_bytes <= BLOOM_MAX_BYTES {
                 bloom_hashes(&v, &mut hashes);
                 if (g as u32 + 1).is_multiple_of(BLOOM_GRANULES) || g + 1 == granules.len() {
+                    hashes.sort_unstable();
+                    hashes.dedup();
                     let mut b = Bloom::new(hashes.len(), BLOOM_BITS);
                     hashes.iter().for_each(|h| b.insert_hash(*h));
+                    bloom_bytes += b.size_bytes();
                     blooms.push(b);
                     hashes.clear();
                 }
@@ -914,6 +920,10 @@ pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_
             }
         }
         let data_len = sink.pos() - data_off;
+        // A part with too many distinct values for its blooms keeps none.
+        if bloom_bytes > BLOOM_MAX_BYTES {
+            blooms.clear();
+        }
         let index = ColIndex { dict: plan.dict.clone(), blocks, stats, blooms }.encode(plan.phys)?;
         let index_off = sink.pos();
         sink.write(&index);

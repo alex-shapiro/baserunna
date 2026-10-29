@@ -431,6 +431,7 @@ pub async fn write_rows(
         meta_len: w.meta_len,
         min_time,
         max_time,
+        arrived_ms: crate::engine::types::blob_id_time(&sink.id).unwrap_or(0),
         version: None,
         min_version: if versions { min_version } else { 0 },
         max_version: if versions { max_version } else { 0 },

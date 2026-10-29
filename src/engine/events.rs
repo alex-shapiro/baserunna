@@ -288,6 +288,9 @@ pub struct PartRef {
     pub meta_len: u64,
     pub min_time: i64,
     pub max_time: i64,
+    /// When the newest of its rows reached a part: the part's creation for
+    /// staged and sealed parts, and its newest input's for a merge.
+    pub arrived_ms: u64,
     /// The version of every row, for parts whose rows were bound by one
     /// commit after the part was written; `None` when the part stores it.
     pub version: Option<Seq>,
@@ -350,6 +353,7 @@ impl PartRef {
         w.varint(self.meta_len);
         w.varint(zigzag(self.min_time));
         w.varint(zigzag(self.max_time));
+        w.varint(self.arrived_ms);
         match self.version {
             None => w.u8(0),
             Some(v) => {
@@ -394,6 +398,7 @@ impl PartRef {
             meta_len: r.varint()?,
             min_time: unzigzag(r.varint()?),
             max_time: unzigzag(r.varint()?),
+            arrived_ms: r.varint()?,
             version: None,
             min_version: 0,
             max_version: 0,
@@ -764,6 +769,7 @@ mod tests {
             meta_len: 1000,
             min_time: -5,
             max_time: 1_700_000_000_000,
+            arrived_ms: 1_700_000_000_123,
             version: Some(9),
             min_version: 9,
             max_version: 9,

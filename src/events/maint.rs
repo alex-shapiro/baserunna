@@ -212,34 +212,42 @@ pub fn plan(s: &EventSchema, refs: &[PartRef], cfg: &crate::engine::EngineConfig
             tiers.entry(tier(p.raw_size, cfg.event_tier_base_bytes, k as u64)).or_default().push(p);
         }
         for t in tiers.values_mut() {
-            if t.len() >= k {
-                t.sort_by(|a, b| a.raw_size.cmp(&b.raw_size).then(a.id.cmp(&b.id)));
-                return Some(Task::Merge(t.iter().take(k).map(|p| (*p).clone()).collect()));
+            if t.len() >= k
+                && let Some(chosen) = smallest_under_cap(t, k, cfg.event_part_max_bytes)
+            {
+                return Some(Task::Merge(chosen));
             }
         }
     }
     for (partition, parts) in &by_partition {
         let end = s.bucket_span(ev::partition_bucket(*partition)).1;
-        let newest = parts.iter().filter_map(|p| crate::engine::types::blob_id_time(&p.id)).max().unwrap_or(0) as i64;
+        let newest = parts.iter().map(|p| p.arrived_ms).max().unwrap_or(0) as i64;
         let quiet = newest.saturating_add(cfg.event_settle_ms as i64) < now_ms;
-        if parts.len() >= 2 && end < now_ms && quiet {
-            let mut ps = parts.clone();
-            ps.sort_by(|a, b| a.raw_size.cmp(&b.raw_size).then(a.id.cmp(&b.id)));
-            let mut chosen: Vec<PartRef> = Vec::new();
-            let mut size = 0;
-            for p in ps.into_iter().take(k) {
-                if size + p.size > cfg.event_part_max_bytes && chosen.len() >= 2 {
-                    break;
-                }
-                size += p.size;
-                chosen.push(p.clone());
-            }
-            if chosen.len() >= 2 {
-                return Some(Task::Merge(chosen));
-            }
+        if parts.len() >= 2
+            && end < now_ms
+            && quiet
+            && let Some(chosen) = smallest_under_cap(&mut parts.clone(), k, cfg.event_part_max_bytes)
+        {
+            return Some(Task::Merge(chosen));
         }
     }
     None
+}
+
+/// The smallest of `parts`, at most `k` and at least 2, whose sizes add up
+/// to at most `cap`.
+fn smallest_under_cap(parts: &mut [&PartRef], k: usize, cap: u64) -> Option<Vec<PartRef>> {
+    parts.sort_by(|a, b| a.raw_size.cmp(&b.raw_size).then(a.id.cmp(&b.id)));
+    let mut chosen: Vec<PartRef> = Vec::new();
+    let mut size = 0;
+    for p in parts.iter().take(k) {
+        if size + p.size > cap {
+            break;
+        }
+        size += p.size;
+        chosen.push((*p).clone());
+    }
+    (chosen.len() >= 2).then_some(chosen)
 }
 
 /// An input part of a merge.
@@ -732,7 +740,19 @@ async fn merge_parts(
     let partition = inputs[0].partition;
     let keys: Vec<Bytes> = entries.iter().map(|e| e.0.clone()).collect();
     let order: Vec<(u16, u32)> = entries.iter().map(|e| (e.2, e.3)).collect();
-    let bytes: Vec<u64> = entries.iter().map(|e| e.4).collect();
+    // Rows of an input that lacks a column with a default grow by it.
+    let filled: Vec<u64> = (0..ins.len())
+        .map(|i| {
+            plans
+                .iter()
+                .enumerate()
+                .filter(|(p, _)| matches!(feeds[*p][i], Feed::None))
+                .filter_map(|(p, _)| defaults[p].as_ref())
+                .map(|d| d.mem_size() as u64 + 8)
+                .sum()
+        })
+        .collect();
+    let bytes: Vec<u64> = entries.iter().map(|e| e.4 + filled[e.2 as usize]).collect();
     let (min_time, max_time) =
         inputs.iter().fold((i64::MAX, i64::MIN), |(lo, hi), r| (lo.min(r.min_time), hi.max(r.max_time)));
     let mut src = MergeSource {
@@ -765,6 +785,7 @@ async fn merge_parts(
         meta_len: w.meta_len,
         min_time,
         max_time,
+        arrived_ms: inputs.iter().map(|r| r.arrived_ms).max().unwrap_or(0),
         version: None,
         min_version,
         max_version,
@@ -871,8 +892,13 @@ pub async fn drop_expired(db: &Arc<Db>, parts: &[PartRef]) -> Result<()> {
 /// call, so it does not hold up the table's other merges, and its error is
 /// returned at the end; other errors end maintenance at once.
 pub async fn maintain(db: &Arc<Db>, table: u32, rounds: usize) -> Result<()> {
+    maintain_skipping(db, table, rounds, &mut BTreeSet::new()).await
+}
+
+/// [`maintain`], leaving out parts whose merge failed for a reason a retry
+/// would meet again, and adding to `failed` the parts of merges that fail.
+pub async fn maintain_skipping(db: &Arc<Db>, table: u32, rounds: usize, failed: &mut BTreeSet<String>) -> Result<()> {
     let shared = db.shared().clone();
-    let mut failed: BTreeSet<String> = BTreeSet::new();
     let mut first_error = None;
     for _ in 0..rounds {
         let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await?;
@@ -889,6 +915,7 @@ pub async fn maintain(db: &Arc<Db>, table: u32, rounds: usize) -> Result<()> {
         for e in snap.scan(&ev::refs(table), false, usize::MAX >> 1, txn.read_time).await? {
             refs.push(ev::ref_of(&e).ok_or_else(|| Error::internal("corrupt part reference"))?);
         }
+        failed.retain(|id| refs.iter().any(|r| r.id == *id));
         refs.retain(|r| !failed.contains(&r.id));
         let now = shared.time_ms() as i64;
         match plan(&s, &refs, &shared.cfg, now) {
@@ -896,21 +923,31 @@ pub async fn maintain(db: &Arc<Db>, table: u32, rounds: usize) -> Result<()> {
             Some(Task::Drop(parts)) => drop_expired(db, &parts).await?,
             Some(Task::Merge(parts)) => match merge(db, &s, &parts).await {
                 Ok(()) | Err(Error::Conflict(_)) => {}
-                Err(e @ Error::TooLarge(_)) => {
+                Err(e @ (Error::NotOwner { .. } | Error::Unavailable { .. })) => return Err(e),
+                Err(e) => {
+                    crate::debug!("event merge of {} table {table} failed: {e}", db.id);
                     failed.extend(parts.into_iter().map(|p| p.id));
                     first_error.get_or_insert(e);
                 }
-                Err(e) => return Err(e),
             },
         }
     }
     first_error.map_or(Ok(()), Err)
 }
 
+/// Parts of failed merges, and when the first of them failed.
+type FailedMerges = (BTreeSet<String>, tokio::time::Instant);
+
+/// How long maintenance leaves out the parts of a failed merge.
+const FAILED_MERGE_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Schedules maintenance per table, running at most one task per table.
 #[derive(Default)]
 pub struct Maintainer {
     running: Mutex<BTreeMap<(String, u32), bool>>,
+    /// Parts of each table whose merge failed, which later runs leave out
+    /// for [`FAILED_MERGE_RETRY`] after the first failure.
+    failed: Mutex<BTreeMap<(String, u32), FailedMerges>>,
 }
 
 impl Maintainer {
@@ -929,8 +966,16 @@ impl Maintainer {
             let (me, db) = (self.clone(), db.clone());
             db.shared().env.clone().spawn(async move {
                 loop {
-                    if let Err(e) = maintain(&db, t, 64).await {
+                    let now = tokio::time::Instant::now();
+                    let (mut failed, since) = match me.failed.lock().unwrap_or_else(|e| e.into_inner()).remove(&key) {
+                        Some((f, since)) if now.duration_since(since) < FAILED_MERGE_RETRY => (f, since),
+                        _ => (BTreeSet::new(), now),
+                    };
+                    if let Err(e) = maintain_skipping(&db, t, 64, &mut failed).await {
                         crate::debug!("event maintenance of {} table {t} stopped: {e}", db.id);
+                    }
+                    if !failed.is_empty() {
+                        me.failed.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), (failed, since));
                     }
                     let mut g = me.running.lock().unwrap_or_else(|e| e.into_inner());
                     match g.get_mut(&key) {

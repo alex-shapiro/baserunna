@@ -16,6 +16,11 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       existing database.** During database churn, a `get` operation returns
       `404 not_found` for a database that was created and not deleted
       (`sim_tool trace db_churn 202681`).
+- [ ] **Fix `db_churn` timeouts of a crash-looping node.** With a small
+      cache under memory pressure, a restarted node re-reads the same system
+      segments thousands of times before it serves a request, and chaos
+      crashes it again first, so the workload never finishes
+      (`sim_tool trace db_churn 606688` on `main`, 601086 on this branch).
 - [ ] **Fix `streams` seed 202835: expired stream records are returned after
       `retention_ms`.** Stream reads return records older than `retention_ms`
       (`sim_tool trace streams 202835`).

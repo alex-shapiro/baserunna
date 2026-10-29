@@ -83,12 +83,6 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       Larger deletes fail with a retryable `503` that cannot succeed. Run
       them as background mutations that mask part by part and report
       progress.
-- [ ] **Drop event tables in constant work.** `events::drop` deletes every
-      part reference in one transaction, at about 113 bytes each, so a table
-      of more than about 148,000 parts (for example 17 years of hourly
-      partitions) exceeds `txn_max_write_bytes` and cannot be dropped. Keep
-      part bytes per table in its state, range-delete the references, and let
-      the orphan sweep collect the parts.
 - [ ] **Bound bind masks.** The committer stores a bind's mask inline
       whatever its size (`Mask::Inline` in `Db::build`), so a rejected or
       repeated slot whose rows interleave with others' can add about one byte

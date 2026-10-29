@@ -172,13 +172,13 @@ pub fn ref_of(it: &ReadValue) -> Result<PartRef> {
     }
 }
 
-/// Drops table `name`, its unsealed rows and its parts.
+/// Drops table `name`, its unsealed rows and its parts, writing the same few
+/// keys however large the table. It reads no part references, so parts bound,
+/// sealed or merged meanwhile do not conflict with it; their objects are
+/// left unreferenced for the orphan sweep (SPEC §5.8).
 pub async fn drop(txn: &mut Txn, name: &str) -> Result<()> {
     let s = get_schema(txn, name).await?;
-    for r in refs(txn, s.id).await? {
-        txn.delete(r.key())?;
-        txn.event_op(EventOp::part_ref(Some(r), None))?;
-    }
+    txn.delete_range(ev::refs(s.id))?;
     txn.delete_range(ev::rows(s.id))?;
     txn.event_op(EventOp::Drop { table: s.id })?;
     txn.delete(name_key(s.id))?;

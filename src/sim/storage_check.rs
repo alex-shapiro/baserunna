@@ -86,15 +86,15 @@ impl Sim {
                 return Err(format!("db {db}: event table names by id {names:?} do not match the schemas {schemas:?}"));
             }
             let tables: std::collections::BTreeSet<u32> = schemas.into_keys().collect();
-            // Each table's state, and the unsealed rows and bytes it should count.
+            // Each table's state, and the unsealed rows and part bytes it should count.
             let mut states: std::collections::BTreeMap<u32, crate::engine::events::TableState> = Default::default();
-            let mut unsealed: std::collections::BTreeMap<u32, crate::engine::events::TableState> = Default::default();
+            let mut counted: std::collections::BTreeMap<u32, crate::engine::events::TableState> = Default::default();
             for e in live() {
                 let table = if let Some((t, _)) = crate::engine::events::parse_row_key(&e.key) {
                     let crate::engine::Value::Inline(row) = &e.value else {
                         return Err(format!("db {db}: unsealed row {:?} is not inline", e.key));
                     };
-                    let c = unsealed.entry(t).or_default();
+                    let c = counted.entry(t).or_default();
                     c.unsealed_rows += 1;
                     c.unsealed_bytes += (e.key.len() + row.len()) as u64;
                     t
@@ -102,6 +102,7 @@ impl Sim {
                     states.insert(t, st);
                     t
                 } else if let Some(r) = crate::engine::events::ref_of(e) {
+                    counted.entry(r.table).or_default().part_bytes += r.stored_bytes();
                     r.table
                 } else {
                     continue;
@@ -115,12 +116,19 @@ impl Sim {
             }
             for t in &tables {
                 let st = states.get(t).ok_or_else(|| format!("db {db}: event table {t} has no state"))?;
-                if *st != unsealed.get(t).copied().unwrap_or_default() {
+                let want = counted.get(t).copied().unwrap_or_default();
+                if *st != want {
                     return Err(format!(
-                        "db {db}: event table {t} state {st:?} does not count its unsealed rows {:?}",
-                        unsealed.get(t)
+                        "db {db}: event table {t} state {st:?} does not count its unsealed rows and parts {want:?}"
                     ));
                 }
+            }
+            let tables_part_bytes: u64 = states.values().map(|s| s.part_bytes).sum();
+            if tables_part_bytes != m.part_bytes {
+                return Err(format!(
+                    "db {db}: event tables count {tables_part_bytes} part bytes, the manifest {}",
+                    m.part_bytes
+                ));
             }
             for e in live() {
                 let place = if let Some((table, pos)) = crate::engine::events::parse_row_key(&e.key) {

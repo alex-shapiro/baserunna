@@ -442,6 +442,9 @@ events to row tables.
   maintenance drops parts once all their events are older, both by the
   store's clock (§5.8); without a store clock measurement, queries skip
   nothing and parts are not dropped.
+- **Dropping** a table takes the same small transaction however many parts
+  it has, and inserts that keep arriving do not hold it up. Its parts leave
+  object storage when the orphan sweep collects them (§5.8).
 - **Quota.** Event tables count toward the database's size quota (§5.10),
   and a database's event parts are capped at 1 TiB. Seals, merges, deletes
   and retention are not refused at the quota, so a full database can still
@@ -757,8 +760,8 @@ A `copy` operation (§6.3) shares the source key's blob without restaging it. Be
 
 Replaced event parts and masks enter `obsolete` like segments. The sweep
 also collects every referenced part and mask id and lists `part/` (only
-when the database has event tables or part bytes, so other databases pay no
-`LIST`), and moves unreferenced ids older than the grace period, whose
+on a database that has ever had an event table, so other databases pay no
+`LIST`, and the parts of a dropped last table are still found), and moves unreferenced ids older than the grace period, whose
 creation time is older than the stage TTL, into `obsolete`. Deleting a part
 lists and deletes its chunks.
 
@@ -858,8 +861,9 @@ granules it needs, and an idle table costs nothing.
 
 An inserted event is a row under `0x09 ++ table_id ++ version ++ ordinal`:
 its position orders it among all of the table's events and stays with it
-through every rewrite. The table's state entry (`0x0B`) counts unsealed rows
-and bytes. Once a table holds 128 KiB of unsealed rows, the lease holder
+through every rewrite. The table's state entry (`0x0B`), written only by the
+committer, counts unsealed rows and bytes and the stored bytes of its parts.
+Once a table holds 128 KiB of unsealed rows, the lease holder
 seals them in a transaction: it writes parts per partition, then deletes the
 rows it sealed with one range delete and adds part refs. A seal conflicts
 only with a concurrent delete of those rows.
@@ -948,6 +952,16 @@ again; purges rank below tiered merges, which purge the parts they take
 anyway, so a backlog of purges never holds up merges. A partition gets
 one final merge into a single part once it ended and no part has arrived
 for a day. A merge that outlives the stage TTL abandons its output.
+
+#### Drops
+
+A drop range-deletes the table's rows and part refs and removes its state
+entry, and the committer subtracts the part bytes that state counts at the
+commit from the database's. The drop reads no refs, so it neither grows
+with the table nor conflicts with binds, seals or merges that commit while
+it runs; whichever of them commits after it is refused (a bind or seal
+finds no state, maintenance that read refs conflicts with the range
+delete). The dropped parts are left for the orphan sweep (§5.8).
 
 ---
 
@@ -1758,6 +1772,7 @@ scripts/mutants.sh                                               # run mutation 
 47. _Stale leased reads during hedged manifest writes._ If a hedged duplicate `PUT` failed with `412` while the primary `PUT` was still in flight, the node reloaded the prior manifest and served leased reads before the primary `PUT` completed. Nodes now disable leased reads while a hedged `PUT` remains in flight and require a manifest read started after the ambiguous write before restoring trust (§5.5).
 48. _Levels object garbage-collected during stalled manifest read._ If a manifest read stalled past the GC grace period, its `.levels` object could be deleted before being fetched, causing a `500` error. The node now reloads the manifest if a `.levels` object is not found (§5.8).
 49. _Forwards rejected after a peer restart._ When a node forwarded a request to a peer that had restarted at the same address with a new node ID, the peer returned `503` and the entry node returned that error to the client until its membership cache refreshed. The peer now tags the rejection with `x-baserunna-stale-target`, and the entry node marks the peer as suspect and handles buffered requests locally (§7).
+50. _Event table drops starved by inserts._ Dropping an event table read every part ref into its read set, so each bind, seal or merge on the table between its snapshot and commit made it conflict, and under steady bulk inserts it never committed. A drop now range-deletes the refs and subtracts the part bytes the table's state counts (§5.13).
 
 Cost model tests (§13.5) also identified seven efficiency defects: lapsed leases on read-heavy databases were never re-acquired, unleased strong reads validated the manifest twice, read-only renewals used the shorter write-lease duration, `.levels` objects under a separate prefix required an extra `LIST` call per sweep, stream flushes wrote separate small segments for commit records and stream state instead of retaining unsealed entries in `tail`, snapshot-consistency API requests validated the manifest with a strong read on open, and snapshot-consistency long polls re-read the manifest every second instead of waiting for their snapshot staleness bound.
 

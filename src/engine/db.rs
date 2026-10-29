@@ -1606,6 +1606,9 @@ impl Db {
                         m.obsolete.push(Obsolete { kind, id, since_ms: now.store_ms.unwrap_or(time) });
                     }
                     m.part_bytes = (m.part_bytes + ev.part_bytes_added).saturating_sub(ev.part_bytes_removed);
+                    if req.writes.events.iter().any(|o| matches!(o, events::EventOp::Create { .. })) {
+                        m.flags |= super::manifest::FLAG_EVENT_TABLES;
+                    }
                     events.extend(ev.tables.keys());
                     touched.extend(ev.touched);
                     let value = encode_commit_record(time, &fx.appends, None);
@@ -1799,14 +1802,9 @@ impl Db {
                         };
                     }
                     let added: u64 = bind.parts.iter().map(|p| p.part.size).sum();
+                    let state = events::state(&pending(base, &m, &tail), bind.table).await?;
                     let refusal = match now.store_ms {
-                        _ if pending(base, &m, &tail)
-                            .entry(&events::state_key(bind.table))
-                            .await?
-                            .is_none_or(|e| e.value.is_tombstone()) =>
-                        {
-                            Some(Error::not_found("event table not found"))
-                        }
+                        _ if state.is_none() => Some(Error::not_found("event table not found")),
                         None => Some(Error::unavailable("store clock not synchronized")),
                         Some(t)
                             if bind.parts.iter().any(|p| {
@@ -1859,6 +1857,7 @@ impl Db {
                         meta_changed |= !fresh.is_empty();
                     } else {
                         let new_seq = last_seq + 1;
+                        let mut st = state.ok_or_else(|| Error::internal("a bind accepted without table state"))?;
                         for p in &fresh {
                             let mut mask = events::Runs::default();
                             for (i, rows) in p.slot_rows.iter().enumerate() {
@@ -1884,10 +1883,14 @@ impl Db {
                                 ..p.part.clone()
                             };
                             m.part_bytes += r.stored_bytes();
+                            st.part_bytes += r.stored_bytes();
                             let k = r.key();
                             touched.push(KeyRange::point(&k));
                             tail.insert(k.clone(), Entry::new(k, new_seq, Value::Inline(r.encode())));
                         }
+                        let k = events::state_key(bind.table);
+                        touched.push(KeyRange::point(&k));
+                        tail.insert(k.clone(), Entry::new(k, new_seq, Value::Inline(st.encode())));
                         for i in &accepted {
                             let record = commit_key(bind.slots[*i].commit_id);
                             touched.push(KeyRange::point(&record));
@@ -2420,9 +2423,7 @@ impl Db {
             found(c, mtime, &mut items);
         }
         let mut parts = Listing::new(format!("dbs/{}/part/", self.id));
-        if event_tables.is_empty() && v.m.part_bytes == 0 {
-            parts.done = true;
-        }
+        parts.done = v.m.flags & super::manifest::FLAG_EVENT_TABLES == 0;
         let mut cur: Option<(String, u64)> = None;
         let part_found = |id: String, mtime: u64, items: &mut Vec<Obsolete>| {
             let created = super::types::blob_id_time(&id).unwrap_or(0);

@@ -1279,6 +1279,78 @@ mod storage {
             );
         });
     }
+
+    /// A drop reads none of its table's parts, so binds and seals landing
+    /// between its snapshot and its commit neither make it conflict nor
+    /// outlive it; a delete that read the parts before the drop committed
+    /// is refused.
+    #[test]
+    fn a_drop_commits_while_parts_keep_landing() {
+        rt().block_on(async {
+            let (eng, _store, env) = engine(9, cfg());
+            env.spawn(async {});
+            let db = create_db(&eng, "d").await;
+            db.shared().store_time_ms().await.unwrap();
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let s = get_schema(&mut t, "events").await.unwrap();
+            txn_do(&db, async |t| insert(t, "events", &[json!({"time": T0, "event": "a"})], 0).await).await.unwrap();
+            assert!(maint::seal(&db, s.id).await.unwrap());
+            let mut d = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            drop(&mut d, "events").await.unwrap();
+            let valid = validate_rows(&s, &[json!({"time": T0 + 1, "event": "b"})], 0).unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            buffers().submit(db.clone(), s.clone(), valid, 78, deadline).await.unwrap();
+            txn_do(&db, async |t| insert(t, "events", &[json!({"time": T0 + 2, "event": "c"})], 0).await)
+                .await
+                .unwrap();
+            assert!(maint::seal(&db, s.id).await.unwrap());
+            let everything = Filter::parse(json!({"col": "event", "op": "exists"})).unwrap();
+            let mut del = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            maint::delete(&db, &mut del, "events", T0 - DAY, T0 + DAY, &everything).await.unwrap();
+            let dropped = db.commit(d.into_request()).await;
+            let deleted = db.commit(del.into_request()).await;
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let left = refs(&mut t, s.id).await.unwrap().len();
+            let part_bytes = db.current().unwrap().m.part_bytes;
+            assert!(
+                dropped.is_ok()
+                    && matches!(deleted, Err(Error::Conflict(_) | Error::NotFound(_)))
+                    && left == 0
+                    && part_bytes == 0,
+                "drop {:?}, delete after it {:?}, refs left {left}, part_bytes {part_bytes}",
+                dropped,
+                deleted
+            );
+        });
+    }
+
+    /// Dropping a database's last event table leaves its parts, and a part
+    /// staged for it but never bound, to the sweep, which still lists them.
+    #[test]
+    fn the_sweep_collects_the_parts_of_the_last_dropped_table() {
+        rt().block_on(async {
+            let (eng, store, env) = engine(10, cfg());
+            env.spawn(async {});
+            let db = create_db(&eng, "d").await;
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let id = get_schema(&mut t, "events").await.unwrap().id;
+            txn_do(&db, async |t| insert(t, "events", &[json!({"time": T0, "event": "a"})], 0).await).await.unwrap();
+            assert!(maint::seal(&db, id).await.unwrap());
+            let staged = crate::engine::types::make_blob_id(env.now_ms(), &[7; 10]);
+            let k = crate::engine::part_chunk_key(&db.id, &staged, 0);
+            store.put_sync(&k, Bytes::from_static(b"staged"), &crate::store::PutMode::Overwrite).unwrap();
+            txn_do(&db, async |t| drop(t, "events").await).await.unwrap();
+            let c = &db.shared().cfg;
+            let wait = c.orphan_grace_ms + c.blob_stage_ttl_ms + c.gc_grace_ms;
+            for _ in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                let _ = db.sweep_now().await;
+                let _ = db.maintenance_now().await;
+            }
+            let left: Vec<String> = store.keys().into_iter().filter(|k| k.contains("/part/")).collect();
+            assert!(left.is_empty(), "parts left after dropping the last table: {left:?}");
+        });
+    }
 }
 
 /// A query that runs past its time limit stops with a retryable error
@@ -1800,6 +1872,20 @@ mod maintenance_limits {
                 }
             }
             assert_eq!((part_count(&db).await, errors), (0, Vec::<String>::new()), "expired parts remain");
+        });
+    }
+
+    /// A drop writes the same few keys however many parts its table has, so
+    /// a table of more parts than one transaction may reference drops.
+    #[test]
+    fn dropping_a_table_of_many_parts_fits_the_transaction_limit() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, small_txns());
+            let db = create_db(&eng, "d").await;
+            daily_parts(&db, 120, 10).await;
+            let r = txn_do(&db, async |t| drop(t, "events").await).await;
+            assert!(r.is_ok(), "dropping a table of 120 parts: {r:?}");
+            assert_eq!(db.current().unwrap().m.part_bytes, 0);
         });
     }
 

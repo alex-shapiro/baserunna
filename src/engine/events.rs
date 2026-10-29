@@ -124,16 +124,20 @@ pub fn parse_state_key(k: &[u8]) -> Option<u32> {
     }
 }
 
-/// Committer-maintained counters of a table's unsealed rows. Transactions
-/// never read it into their read sets, so inserts stay blind writes.
+/// Committer-maintained counters of a table's unsealed rows and parts.
+/// Transactions never read it into their read sets, so inserts and binds
+/// stay blind writes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TableState {
     pub unsealed_rows: u64,
     /// Key and value bytes of the unsealed rows.
     pub unsealed_bytes: u64,
+    /// Stored bytes of the objects its part references name, which a drop
+    /// subtracts from the database's without reading the references.
+    pub part_bytes: u64,
 }
 
-const STATE_FORMAT: u8 = 1;
+const STATE_FORMAT: u8 = 2;
 
 impl TableState {
     pub fn encode(&self) -> Bytes {
@@ -141,6 +145,7 @@ impl TableState {
         w.u8(STATE_FORMAT);
         w.varint(self.unsealed_rows);
         w.varint(self.unsealed_bytes);
+        w.varint(self.part_bytes);
         Bytes::from(w.into_inner())
     }
 
@@ -151,10 +156,11 @@ impl TableState {
         }
         let unsealed_rows = r.varint()?;
         let unsealed_bytes = r.varint()?;
+        let part_bytes = r.varint()?;
         if !r.is_empty() {
             return Err(DecodeError("event table state trailing data"));
         }
-        Ok(TableState { unsealed_rows, unsealed_bytes })
+        Ok(TableState { unsealed_rows, unsealed_bytes, part_bytes })
     }
 }
 
@@ -503,7 +509,9 @@ pub enum EventOp {
     /// Creates the state of a new table.
     Create { table: u32 },
     /// Removes a dropped table's state, after which nothing can insert into
-    /// or bind parts to it.
+    /// or bind parts to it, and stops counting its parts as of the commit
+    /// toward the database's. The transaction range-deletes the table's
+    /// rows and references itself.
     Drop { table: u32 },
 }
 
@@ -565,7 +573,8 @@ pub(crate) struct Effects {
     pub tables: BTreeMap<u32, TableState>,
 }
 
-async fn state(at: &Pending<'_>, table: u32) -> Result<Option<TableState>> {
+/// The state of `table` as of `at`; `None` if the table does not exist.
+pub(crate) async fn state(at: &Pending<'_>, table: u32) -> Result<Option<TableState>> {
     match at.entry(&state_key(table)).await? {
         None => Ok(None),
         Some(e) if e.value.is_tombstone() => Ok(None),
@@ -624,13 +633,15 @@ pub(crate) async fn plan(ops: &[EventOp], at: &Pending<'_>, version: Seq) -> Res
             }
             EventOp::Create { .. } => *st = Some(TableState::default()),
             EventOp::Drop { .. } => {
-                *st = None;
+                fx.part_bytes_removed += st.take().map_or(0, |s| s.part_bytes);
                 let rows = self::rows(table);
                 fx.entries.retain(|e| !rows.contains(&e.key));
             }
             EventOp::Ref(c) => {
                 let RefChange { old, new } = c.as_ref();
+                let st = st.as_mut().ok_or_else(not_found)?;
                 if let Some(o) = old {
+                    st.part_bytes = st.part_bytes.saturating_sub(o.stored_bytes());
                     fx.part_bytes_removed += o.stored_bytes();
                     if new.as_ref().is_none_or(|n| n.id != o.id) {
                         fx.obsolete.push((ObjKind::Part, o.id.clone()));
@@ -642,9 +653,7 @@ pub(crate) async fn plan(ops: &[EventOp], at: &Pending<'_>, version: Seq) -> Res
                     }
                 }
                 if let Some(n) = new {
-                    if st.is_none() {
-                        return Err(not_found());
-                    }
+                    st.part_bytes += n.stored_bytes();
                     fx.part_bytes_added += n.stored_bytes();
                 }
             }
@@ -822,7 +831,7 @@ mod tests {
         assert_eq!(p.stored_bytes(), 5077);
         p.mask = Some(Mask::Inline(Runs(vec![(1, 2)])));
         assert!(PartRef::decode(&p.key(), &p.encode()).is_err(), "mask count must match");
-        let st = TableState { unsealed_rows: 4, unsealed_bytes: 99 };
+        let st = TableState { unsealed_rows: 4, unsealed_bytes: 99, part_bytes: 5077 };
         assert_eq!(TableState::decode(&st.encode()).unwrap(), st);
         let runs = Runs(vec![(0, 3), (9, 1)]);
         assert_eq!(decode_mask_object(&encode_mask_object(&runs)).unwrap(), runs);

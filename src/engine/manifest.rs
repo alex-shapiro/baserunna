@@ -17,6 +17,9 @@ const MAGIC: &[u8; 4] = b"BRMF";
 
 /// The database was deleted: every read and commit fails with not-found.
 pub const FLAG_DELETED: u64 = 1;
+/// The database has had an event table, so `part/` may hold objects for the
+/// orphan sweep to collect, even once every table is dropped.
+pub const FLAG_EVENT_TABLES: u64 = 2;
 const FORMAT: u16 = 8;
 const FORMAT_V7: u16 = 7;
 const FORMAT_V6: u16 = 6;

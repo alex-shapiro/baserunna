@@ -189,7 +189,13 @@ pub fn tier(raw: u64, base: u64, k: u64) -> u32 {
 /// that received no part for `event_settle_ms` (ClickHouse's
 /// `min_age_to_force_merge_seconds`), so that backfilling old partitions
 /// is not merged after every insert.
-pub fn plan(s: &EventSchema, refs: &[PartRef], cfg: &crate::engine::EngineConfig, now_ms: i64) -> Option<Task> {
+pub fn plan(
+    s: &EventSchema,
+    refs: &[PartRef],
+    failed: &BTreeSet<String>,
+    cfg: &crate::engine::EngineConfig,
+    now_ms: i64,
+) -> Option<Task> {
     if s.retention_ms.is_some() {
         let cutoff = s.retained_from(now_ms);
         let expired: Vec<PartRef> =
@@ -198,12 +204,14 @@ pub fn plan(s: &EventSchema, refs: &[PartRef], cfg: &crate::engine::EngineConfig
             return Some(Task::Drop(expired));
         }
     }
+    // Parts of merges that failed are left out of merges, not of drops.
+    let refs: Vec<&PartRef> = refs.iter().filter(|p| !failed.contains(&p.id)).collect();
     if let Some(p) = refs.iter().find(|p| p.deleted * 2 >= p.rows) {
-        return Some(Task::Merge(vec![p.clone()]));
+        return Some(Task::Merge(vec![(*p).clone()]));
     }
     let k = cfg.event_merge_fan_in.max(2);
     let mut by_partition: BTreeMap<u32, Vec<&PartRef>> = BTreeMap::new();
-    for p in refs.iter().filter(|p| p.size < cfg.event_part_max_bytes) {
+    for p in refs.iter().copied().filter(|p| p.size < cfg.event_part_max_bytes) {
         by_partition.entry(p.partition).or_default().push(p);
     }
     for parts in by_partition.values() {
@@ -904,9 +912,12 @@ pub async fn maintain_skipping(db: &Arc<Db>, table: u32, rounds: usize, failed: 
         let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await?;
         let Some(s) = schema_by_id(&mut txn, table).await? else { return Ok(()) };
         let st: TableState = super::state(&mut txn, table).await?;
-        if st.unsealed_bytes >= shared.cfg.event_seal_bytes as u64 && st.unsealed_rows > 0 {
+        // A round that seals also plans from the snapshot before the seal, so
+        // that steady inserts do not starve merges and retention.
+        let sealing = st.unsealed_bytes >= shared.cfg.event_seal_bytes as u64 && st.unsealed_rows > 0;
+        if sealing {
             match seal(db, table).await {
-                Ok(_) | Err(Error::Conflict(_)) => continue,
+                Ok(_) | Err(Error::Conflict(_)) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -916,9 +927,9 @@ pub async fn maintain_skipping(db: &Arc<Db>, table: u32, rounds: usize, failed: 
             refs.push(ev::ref_of(&e).ok_or_else(|| Error::internal("corrupt part reference"))?);
         }
         failed.retain(|id| refs.iter().any(|r| r.id == *id));
-        refs.retain(|r| !failed.contains(&r.id));
         let now = shared.time_ms() as i64;
-        match plan(&s, &refs, &shared.cfg, now) {
+        match plan(&s, &refs, failed, &shared.cfg, now) {
+            None if sealing => continue,
             None => break,
             Some(Task::Drop(parts)) => drop_expired(db, &parts).await?,
             Some(Task::Merge(parts)) => match merge(db, &s, &parts).await {
@@ -1000,6 +1011,7 @@ impl Maintainer {
 /// parts get masks.
 pub async fn delete(db: &Arc<Db>, txn: &mut Txn, name: &str, from: i64, to: i64, f: &Filter) -> Result<u64> {
     let s = super::get_schema(txn, name).await?;
+    super::exec::check_filter(&s, f)?;
     let input = super::exec::input(txn, &s, from, to).await?;
     let mut count = 0u64;
     let (mut rows, mut bytes) = (0u64, 0u64);

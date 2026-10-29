@@ -215,7 +215,7 @@ probes! {
     BindForwarded,
     /// Unsealed event rows were sealed into parts.
     EventsSealed,
-    /// A seal failed validation because a concurrent commit changed the rows it read.
+    /// A seal failed validation because a concurrent delete or drop removed rows it read.
     SealConflicted,
     /// Event parts were merged.
     PartsMerged,
@@ -275,6 +275,7 @@ impl Probe {
         Probe::BindSlotMasked,
         Probe::BindInstallReplayed,
         Probe::MaskObjectWritten,
+        Probe::SealConflicted,
     ];
 }
 

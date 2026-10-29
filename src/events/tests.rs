@@ -2900,3 +2900,256 @@ mod maintenance_robustness {
         });
     }
 }
+mod liveness {
+    use super::*;
+
+    async fn table_id(db: &Arc<Db>) -> u32 {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        get_schema(&mut t, "events").await.unwrap().id
+    }
+
+    async fn part_count(db: &Arc<Db>, id: u32) -> usize {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        refs(&mut t, id).await.unwrap().len()
+    }
+
+    /// Maintenance seals whenever unsealed rows pass `event_seal_bytes` and
+    /// then starts its next round, so a table whose inserts keep the
+    /// unsealed bytes above it is sealed round after round and never merged.
+    /// A delete naming an unknown column is refused, as a query naming it
+    /// is, whether or not any events are in its range.
+    #[test]
+    fn deletes_refuse_unknown_columns_on_empty_ranges() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let f = Filter::parse(json!({"col": "nope", "op": "eq", "value": 1})).unwrap();
+            let r = txn_do(&db, async |t| maint::delete(&db, t, "events", 0, 1, &f).await).await;
+            assert!(matches!(r, Err(Error::InvalidArgument(_))), "{r:?}");
+        });
+    }
+
+    /// Retention drops the parts of a merge that failed, which merges leave out.
+    #[test]
+    fn retention_drops_parts_of_failed_merges() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            txn_do(&db, async |t| insert(t, "events", &[json!({"time": T0 - 10 * DAY, "event": "a"})], 0).await)
+                .await
+                .unwrap();
+            assert!(maint::seal(&db, id).await.unwrap());
+            txn_do(&db, async |t| set_retention(t, "events", Some(DAY as u64)).await).await.unwrap();
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let mut failed: std::collections::BTreeSet<String> =
+                refs(&mut t, id).await.unwrap().into_iter().map(|r| r.id).collect();
+            assert_eq!(failed.len(), 1);
+            maint::maintain_skipping(&db, id, 8, &mut failed).await.unwrap();
+            assert_eq!(part_count(&db, id).await, 0, "a part past retention was kept");
+        });
+    }
+
+    #[test]
+    fn steady_inserts_do_not_starve_merges() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, EngineConfig::small_for_tests());
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let done = Arc::new(std::sync::atomic::AtomicI64::new(0));
+            let (db2, stop2, done2) = (db.clone(), stop.clone(), done.clone());
+            let inserter = tokio::spawn(async move {
+                let mut i = 0i64;
+                while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    done2.store(i, std::sync::atomic::Ordering::Relaxed);
+                    let rows = vec![json!({"time": T0 + i, "event": "a", "user": "u".repeat(1500)})];
+                    let mut t = db2.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                    insert(&mut t, "events", &rows, 0).await.unwrap();
+                    db2.commit(t.into_request()).await.unwrap();
+                    i += 1;
+                    tokio::task::yield_now().await;
+                }
+                i
+            });
+            let merged_before = crate::probe::count(Probe::PartsMerged);
+            let sealed_before = crate::probe::count(Probe::EventsSealed);
+            while done.load(std::sync::atomic::Ordering::Relaxed) < 500 {
+                maint::maintain(&db, id, 64).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let inserted = inserter.await.unwrap();
+            let sealed = crate::probe::count(Probe::EventsSealed) - sealed_before;
+            let merged = crate::probe::count(Probe::PartsMerged) - merged_before;
+            let parts = part_count(&db, id).await;
+            maint::maintain(&db, id, 64).await.unwrap();
+            let idle = part_count(&db, id).await;
+            assert!(
+                merged > 0,
+                "{inserted} inserts into one partition: maintenance sealed {sealed} times, \
+                 merged {merged} times, leaving {parts} parts ({idle} after one idle run; fan-in {})",
+                db.shared().cfg.event_merge_fan_in
+            );
+        });
+    }
+
+    /// The same starvation keeps parts past retention: none is dropped while
+    /// inserts keep the unsealed bytes above `event_seal_bytes`.
+    #[test]
+    fn steady_inserts_do_not_starve_retention() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, EngineConfig::small_for_tests());
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            txn_do(&db, async |t| set_retention(t, "events", Some(DAY as u64)).await).await.unwrap();
+            let done = Arc::new(std::sync::atomic::AtomicI64::new(0));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (db2, stop2, done2) = (db.clone(), stop.clone(), done.clone());
+            let inserter = tokio::spawn(async move {
+                let mut i = 0i64;
+                while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    done2.store(i, std::sync::atomic::Ordering::Relaxed);
+                    let rows = vec![json!({"time": T0 - 10 * DAY + i, "event": "a", "user": "u".repeat(1500)})];
+                    let mut t = db2.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                    insert(&mut t, "events", &rows, 0).await.unwrap();
+                    db2.commit(t.into_request()).await.unwrap();
+                    i += 1;
+                    tokio::task::yield_now().await;
+                }
+                i
+            });
+            let expired_before = crate::probe::count(Probe::EventPartsExpired);
+            while done.load(std::sync::atomic::Ordering::Relaxed) < 500 {
+                maint::maintain(&db, id, 64).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let inserted = inserter.await.unwrap();
+            let expired = crate::probe::count(Probe::EventPartsExpired) - expired_before;
+            let parts = part_count(&db, id).await;
+            maint::maintain(&db, id, 64).await.unwrap();
+            let idle = part_count(&db, id).await;
+            assert!(
+                expired > 0,
+                "{inserted} inserts of events 10 days old into a table retaining 1 day: \
+                 {expired} retention drops, {parts} parts kept ({idle} after one idle run)"
+            );
+        });
+    }
+
+    async fn names(db: &Arc<Db>) -> Vec<String> {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        get_schema(&mut t, "events").await.unwrap().columns.iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// The model test with columns dropped, added and added again by name,
+    /// with and without defaults, between seals and merges.
+    async fn run_schema(seed: u64, steps: usize) -> Result<usize, String> {
+        let directory = if seed.is_multiple_of(2) { 1 << 20 } else { 1 << (seed % 7) };
+        let (eng, _store, env) = engine(seed, EngineConfig { event_json_directory_bytes: directory, ..cfg() });
+        env.spawn(async {});
+        let db = create_db(&eng, "real").await;
+        let model = create_db(&eng, "model").await;
+        let bufs = buffers();
+        let mut g = Gen { r: Rng::new(seed), next_time: T0 };
+        let table = table_id(&db).await;
+        let err = |e: Error| e.to_string();
+        let mut answered = 0;
+        for step in 0..steps {
+            let cols = names(&db).await;
+            let keep = |mut j: Json| {
+                j.as_object_mut().unwrap().retain(|k, _| cols.contains(k));
+                j
+            };
+            match g.r.usize(11) {
+                0..=2 => {
+                    let rows: Vec<Json> = (0..1 + g.r.usize(20)).map(|_| keep(g.row())).collect();
+                    txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.map_err(err)?;
+                    txn_do(&model, async |t| insert(t, "events", &rows, 0).await).await.map_err(err)?;
+                }
+                3..=4 => {
+                    let rows: Vec<Json> = (0..1 + g.r.usize(40)).map(|_| keep(g.row())).collect();
+                    let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                    let s = get_schema(&mut t, "events").await.map_err(err)?;
+                    let valid = validate_rows(&s, &rows, 0).map_err(err)?;
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                    bufs.submit(db.clone(), s, valid, env.random_u64(), deadline).await.map_err(err)?;
+                    txn_do(&model, async |t| insert(t, "events", &rows, 0).await).await.map_err(err)?;
+                }
+                5 => match maint::seal(&db, table).await {
+                    Ok(_) | Err(Error::Conflict(_)) => {}
+                    Err(e) => return Err(e.to_string()),
+                },
+                6 => maint::maintain(&db, table, 8).await.map_err(err)?,
+                7 => {
+                    let name = ["n", "x", "flag", "props"][g.r.usize(4)];
+                    if cols.iter().any(|c| c == name) {
+                        for d in [&db, &model] {
+                            txn_do(d, async |t| drop_column(t, "events", name).await).await.map_err(err)?;
+                        }
+                    } else {
+                        let spec = match name {
+                            "n" => {
+                                [json!({"name": "n", "type": "int", "default": 9}), json!({"name": "n", "type": "int"})]
+                                    [g.r.usize(2)]
+                                .clone()
+                            }
+                            "x" => json!({"name": "x", "type": "float", "default": 2.5}),
+                            "flag" => json!({"name": "flag", "type": "bool", "default": true}),
+                            _ => json!({"name": "props", "type": "json"}),
+                        };
+                        let spec: ColumnSpec = serde_json::from_value(spec).unwrap();
+                        for d in [&db, &model] {
+                            txn_do(d, async |t| add_column(t, "events", &spec).await).await.map_err(err)?;
+                        }
+                    }
+                }
+                8 => {
+                    let f: Filter = Filter::parse(g.filter()).map_err(err)?;
+                    let (from, to) = (T0 + g.r.below(8) as i64 * DAY / 2, T0 + (4 + g.r.below(10)) as i64 * DAY);
+                    let a = txn_do(&db, async |t| maint::delete(&db, t, "events", from, to, &f).await).await;
+                    let b = txn_do(&model, async |t| maint::delete(&model, t, "events", from, to, &f).await).await;
+                    match (a, b) {
+                        (Ok(a), Ok(b)) if a == b => {}
+                        (Err(a), Err(b)) if a.to_string() == b.to_string() => {}
+                        // Unsealed rows outside the range never bind the filter.
+                        (Err(Error::InvalidArgument(_)), Ok(0)) | (Ok(0), Err(Error::InvalidArgument(_))) => {}
+                        (a, b) => return Err(format!("step {step}: delete {a:?}, model {b:?}")),
+                    }
+                }
+                _ => {
+                    let q = g.query();
+                    let got = query(&db, &q).await;
+                    let want = query(&model, &q).await;
+                    match (got, want) {
+                        (Ok(got), Ok(want)) => {
+                            if got.columns != want.columns || got.rows != want.rows {
+                                return Err(format!(
+                                    "step {step}: query {q}\n got {:?}\nwant {:?}",
+                                    got.rows, want.rows
+                                ));
+                            }
+                            answered += 1;
+                        }
+                        (Err(a), Err(b)) if a.to_string() == b.to_string() => {}
+                        (a, b) => return Err(format!("step {step}: query {q}: {:?} vs model {:?}", a.err(), b.err())),
+                    }
+                }
+            }
+        }
+        Ok(answered)
+    }
+
+    #[test]
+    fn queries_match_a_model_through_column_changes() {
+        let seeds: u64 = std::env::var("EVENT_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+        for seed in 0..seeds {
+            rt().block_on(async {
+                if let Err(e) = run_schema(seed, 200).await {
+                    panic!("seed {seed}: {e}");
+                }
+            });
+        }
+    }
+}

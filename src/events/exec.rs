@@ -1757,6 +1757,12 @@ pub async fn matching_rows(
 }
 
 /// Whether unsealed row `row` matches `f` within `[from, to)`; used by deletes.
+/// Checks that `f` names only columns of `s`, as a query would.
+pub fn check_filter(s: &EventSchema, f: &Filter) -> Result<()> {
+    let names = BTreeMap::new();
+    Binder { schema: s, lookups: &names }.filter(f).map(drop)
+}
+
 pub fn row_matches(s: &EventSchema, row: &Row, f: &Filter, from: i64, to: i64) -> Result<bool> {
     let names = BTreeMap::new();
     let binder = Binder { schema: s, lookups: &names };

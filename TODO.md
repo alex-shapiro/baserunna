@@ -127,6 +127,12 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       margin alone; a bind whose manifest `PUT` lands more than
       `4 × clock_sync_max_error_ms` after its attempt began could see its
       part collected. Skip parts referenced at install time.
+- [ ] **Refuse binds whose columns were dropped since validation.** A bulk
+      insert validated before a column is dropped and re-added binds its
+      rows under the old column id, so the value reads null or the new
+      default (`Db::bind` checks the table, not its columns). Carry the
+      validating schema's column ids in `Bind` and refuse, retryably, a
+      bind naming a dropped one.
 - [ ] **Re-resolve database names for strong event queries.** An event
       query checks that its database exists at a snapshot 5 s old whatever
       `consistency` its body asks for, so a strong query on a node that
@@ -230,6 +236,14 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 
 ## Testing
 
+- [ ] **Check event maintenance liveness and storage invariants in
+      simulation.** The `events` workload never bounds part counts under
+      load or checks that ended partitions settle, never drops or re-adds
+      columns or recreates a busy table under load, and deletes only by
+      `uid` over all time. `storage_check` does not look for unreferenced
+      `part/` objects or check part sortedness, statistics, blooms and
+      directories against their rows. Steady-insert starvation of merges
+      (`events::tests::liveness`) passed every campaign.
 - [ ] **Run a long event-table campaign.** `sim_events` runs 24 seeds in CI;
       run thousands, with larger tables and more nodes, before relying on
       merges at scale.

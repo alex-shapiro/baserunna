@@ -22,6 +22,8 @@ pub mod vector;
 #[cfg(test)]
 mod difftests;
 #[cfg(test)]
+mod reference;
+#[cfg(test)]
 mod tests;
 
 use crate::engine::events::{self as ev, EventOp, PartRef, TableState};

@@ -103,10 +103,6 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 - [ ] **Bound merge memory.** `merge_parts` holds the sort key of every live
       input row at once, so a final merge of 4 GiB of small events holds
       hundreds of MB of keys. Merge sorted runs block by block instead.
-- [ ] **Find event tables by id in constant work.** `maint::schema_by_id`
-      decodes the event catalog, at most its first 10,000 entries, on every
-      seal and maintenance round, so a database with more event tables never
-      seals or merges the rest. Keep an id-to-name index in the catalog.
 - [ ] **Cap event part bytes on transactional inserts.** `event_max_bytes`
       is checked only when binds add parts (`Db::bind`); events inserted by
       transactions become parts through seals, which never refuse. Count

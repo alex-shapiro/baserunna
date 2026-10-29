@@ -41,6 +41,14 @@ fn catalog_key(name: &str) -> Bytes {
     Bytes::from([SCHEMAS, name.as_bytes()].concat())
 }
 
+/// Where event table names are kept, by table id, so that maintenance finds
+/// a table's schema by its id.
+pub(crate) const NAMES: &[u8] = &[SPACE_CATALOG, b'e', b'#'];
+
+fn name_key(id: u32) -> Bytes {
+    Bytes::from([NAMES, &id.to_be_bytes()].concat())
+}
+
 fn decode_schema(it: &ReadValue) -> Result<EventSchema> {
     match &it.value {
         Value::Inline(b) => serde_json::from_slice(b).map_err(|e| Error::internal(format!("bad event schema: {e}"))),
@@ -144,6 +152,7 @@ pub async fn create(txn: &mut Txn, def: &CreateEvents) -> Result<EventSchema> {
     s.validate()?;
     s.id = crate::table::allocate_table_id(txn).await?;
     put_schema(txn, &s)?;
+    txn.put(name_key(s.id), Value::Inline(Bytes::from(s.name.clone())))?;
     txn.event_op(EventOp::Create { table: s.id })?;
     Ok(s)
 }
@@ -170,6 +179,7 @@ pub async fn drop(txn: &mut Txn, name: &str) -> Result<()> {
     }
     txn.delete_range(ev::rows(s.id))?;
     txn.event_op(EventOp::Drop { table: s.id })?;
+    txn.delete(name_key(s.id))?;
     txn.delete(catalog_key(name))
 }
 

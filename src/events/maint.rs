@@ -31,16 +31,18 @@ use std::sync::{Arc, Mutex};
 /// and references it reads instead.
 pub async fn schema_by_id(txn: &mut Txn, id: u32) -> Result<Option<EventSchema>> {
     let snap = txn.untracked_snapshot().clone();
-    let items = snap.scan(&crate::engine::KeyRange::prefix(super::SCHEMAS), false, usize::MAX, txn.read_time).await?;
-    for e in items {
-        if let Value::Inline(b) = &e.value
-            && let Ok(s) = serde_json::from_slice::<EventSchema>(b)
-            && s.id == id
-        {
-            return Ok(Some(s));
+    let Some(name) = snap.get(&super::name_key(id), txn.read_time).await? else { return Ok(None) };
+    let Value::Inline(name) = &name.value else { return Err(Error::internal("corrupt event table name")) };
+    let Some(e) = snap.get(&super::catalog_key(&String::from_utf8_lossy(name)), txn.read_time).await? else {
+        return Ok(None);
+    };
+    match &e.value {
+        Value::Inline(b) => {
+            let s: EventSchema = serde_json::from_slice(b).map_err(|e| Error::internal(e.to_string()))?;
+            Ok((s.id == id).then_some(s))
         }
+        _ => Err(Error::internal("corrupt event table schema")),
     }
-    Ok(None)
 }
 
 async fn delete_parts(shared: &Shared, db: &str, ids: impl IntoIterator<Item = String>) {

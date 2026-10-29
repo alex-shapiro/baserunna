@@ -3037,6 +3037,35 @@ mod maintenance_robustness {
         });
     }
 
+    /// Maintenance finds a table's schema by id however many event tables
+    /// precede it, and not once the table is dropped.
+    #[test]
+    fn schemas_are_found_by_id_among_many_tables() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = eng.db("d");
+            db.open(true).await.unwrap();
+            for batch in 0..21 {
+                txn_do(&db, async |t| {
+                    for i in 0..500 {
+                        let mut def = table_def();
+                        def.name = format!("t{:05}", batch * 500 + i);
+                        create(t, &def).await?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            }
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let last = get_schema(&mut t, "t10499").await.unwrap();
+            assert_eq!(maint::schema_by_id(&mut t, last.id).await.unwrap().map(|s| s.name), Some(last.name));
+            txn_do(&db, async |t| drop(t, "t10499").await).await.unwrap();
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            assert!(maint::schema_by_id(&mut t, last.id).await.unwrap().is_none());
+        });
+    }
+
     /// A store whose clock probe writes fail once `fail` is set.
     struct FailClockProbes {
         inner: crate::store::DynStore,

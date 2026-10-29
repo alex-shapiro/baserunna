@@ -64,16 +64,27 @@ impl Sim {
                 Default::default();
             let mut part_bytes = 0u64;
             let live = || newest.values().filter(|e| deletes.seq_at(&e.key) <= e.seq && !e.value.is_tombstone());
-            let tables: std::collections::BTreeSet<u32> = live()
-                .filter(|e| e.key.starts_with(&[crate::table::SPACE_CATALOG, b'e', b'/']))
+            let schemas: std::collections::BTreeMap<u32, String> = live()
+                .filter(|e| e.key.starts_with(crate::events::SCHEMAS))
                 .filter_map(|e| match &e.value {
                     crate::engine::Value::Inline(b) => {
                         serde_json::from_slice::<crate::events::schema::EventSchema>(b).ok()
                     }
                     _ => None,
                 })
-                .map(|s| s.id)
+                .map(|s| (s.id, s.name))
                 .collect();
+            let names: std::collections::BTreeMap<u32, String> = live()
+                .filter_map(|e| {
+                    let id = u32::from_be_bytes(e.key.strip_prefix(crate::events::NAMES)?.try_into().ok()?);
+                    let crate::engine::Value::Inline(b) = &e.value else { return None };
+                    Some((id, String::from_utf8_lossy(b).into_owned()))
+                })
+                .collect();
+            if names != schemas {
+                return Err(format!("db {db}: event table names by id {names:?} do not match the schemas {schemas:?}"));
+            }
+            let tables: std::collections::BTreeSet<u32> = schemas.into_keys().collect();
             // Each table's state, and the unsealed rows and bytes it should count.
             let mut states: std::collections::BTreeMap<u32, crate::engine::events::TableState> = Default::default();
             let mut unsealed: std::collections::BTreeMap<u32, crate::engine::events::TableState> = Default::default();

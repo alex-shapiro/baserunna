@@ -396,12 +396,23 @@ pub fn datum(c: &EvColumn, v: &Json) -> Result<Datum> {
     Ok(match c.ty {
         EvType::Time => {
             let t = match v {
-                Json::String(s) => parse_rfc3339(s),
-                _ => v.as_i64(),
+                Json::String(s) => parse_rfc3339(s).ok_or_else(|| {
+                    Error::invalid(format!(
+                        "column {:?} expects an RFC 3339 time with an offset (Z or ±HH:MM), got {v}",
+                        c.name
+                    ))
+                })?,
+                _ => v.as_i64().ok_or_else(|| {
+                    Error::invalid(format!("column {:?} expects whole milliseconds since the epoch, got {v}", c.name))
+                })?,
             };
-            Datum::Int(t.filter(|t| TIME_RANGE.contains(t)).ok_or_else(|| {
-                Error::invalid(format!("column {:?} expects a time in years 0000 to 9999, got {v}", c.name))
-            })?)
+            if !TIME_RANGE.contains(&t) {
+                return Err(Error::invalid(format!(
+                    "column {:?} expects a time in years 0000 to 9999, got {v}",
+                    c.name
+                )));
+            }
+            Datum::Int(t)
         }
         EvType::String => Datum::Str(v.as_str().ok_or_else(bad)?.to_string()),
         EvType::Int => Datum::Int(v.as_i64().ok_or_else(bad)?),

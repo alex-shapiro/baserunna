@@ -441,6 +441,23 @@ fn console_shows_times_before_1970() {
     });
 }
 
+/// A time that is not an RFC 3339 timestamp with an offset or whole
+/// milliseconds is refused for its format, not as out of range.
+#[test]
+fn unparseable_times_are_refused_for_their_format() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        for time in [json!("2026-10-01T12:00:00"), json!("2026-10-01T12:00:00.123456"), json!(1_790_000_000_000.5)] {
+            let rows = json!([{"event": "a", "time": time}]);
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], &rows.to_string()).await;
+            assert_eq!(s, 400, "{r}");
+            let m = r["error"]["message"].as_str().unwrap_or_default();
+            assert!(!m.contains("years 0000 to 9999"), "{time} is refused as out of range: {m}");
+        }
+        w.shutdown();
+    });
+}
+
 #[test]
 fn inserts_on_one_node_are_seen_by_strong_queries_on_others() {
     run_paused(async {

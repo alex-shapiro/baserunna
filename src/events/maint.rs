@@ -998,7 +998,7 @@ pub async fn delete(db: &Arc<Db>, txn: &mut Txn, name: &str, from: i64, to: i64,
             continue;
         }
         let encoded = runs.to_bytes();
-        let mask = if encoded.len() <= ev::MASK_INLINE_MAX {
+        let mask = if encoded.len() <= shared.cfg.event_mask_inline_bytes {
             Mask::Inline(runs.clone())
         } else {
             probe::hit(Probe::MaskObjectWritten);

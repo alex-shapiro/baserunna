@@ -24,8 +24,6 @@ pub const PARTS: u8 = 0x0A;
 pub const TABLE_STATE: u8 = 0x0B;
 /// Most rows one transaction inserts into event tables.
 pub const INSERT_MAX_ROWS: usize = 100_000;
-/// Masks larger than this are stored as objects rather than in references.
-pub const MASK_INLINE_MAX: usize = 4096;
 
 fn table_prefix(space: u8, table: u32) -> Vec<u8> {
     let mut k = Vec::with_capacity(32);

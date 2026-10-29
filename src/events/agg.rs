@@ -75,15 +75,15 @@ impl Val {
     /// and print alike however they were stored.
     pub fn canonical(self) -> Val {
         match self {
-            Val::Float(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => Val::Int(f as i64),
+            Val::Float(f) if let Some(i) = exact_int(f) => Val::Int(i),
             Val::List(v) => Val::List(v.into_iter().map(Val::canonical).collect()),
             v => v,
         }
     }
 
-    /// [`Val::total_cmp`], with values that compare equal but differ (an int
-    /// and a float beyond 2^53) ordered by their canonical bytes, so that a
-    /// min or max does not depend on the order values arrive in.
+    /// [`Val::total_cmp`], with values that compare equal but differ (JSON
+    /// values of one rank) ordered by their canonical bytes, so that a min
+    /// or max does not depend on the order values arrive in.
     pub fn strict_cmp(&self, o: &Val) -> Ordering {
         self.total_cmp(o).then_with(|| self.canonical_bytes().cmp(&o.canonical_bytes()))
     }
@@ -92,7 +92,8 @@ impl Val {
     pub fn mem_size(&self) -> usize {
         match self {
             Val::Str(s) => s.len(),
-            Val::Json(_) | Val::List(_) => self.canonical_bytes().len(),
+            Val::Json(j) => json_mem(j),
+            Val::List(v) => v.iter().map(|x| 32 + x.mem_size()).sum(),
             _ => 0,
         }
     }
@@ -112,23 +113,21 @@ impl Val {
                 out.push(2);
                 out.extend(i.to_be_bytes());
             }
-            Val::Float(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => {
+            Val::Float(f) if let Some(i) = exact_int(*f) => {
                 out.push(2);
-                out.extend((*f as i64).to_be_bytes());
+                out.extend(i.to_be_bytes());
             }
             Val::Float(f) => {
                 out.push(3);
-                out.extend((if *f == 0.0 { 0.0 } else { *f }).to_bits().to_be_bytes());
+                out.extend(f.to_bits().to_be_bytes());
             }
             Val::Str(s) => {
                 out.push(4);
-                out.extend(s.as_bytes());
-                out.push(0);
+                put_escaped(out, s.as_bytes());
             }
             Val::Json(j) => {
                 out.push(5);
-                out.extend(j.to_string().as_bytes());
-                out.push(0);
+                put_escaped(out, j.to_string().as_bytes());
             }
             Val::List(v) => {
                 out.push(6);
@@ -255,6 +254,10 @@ impl SumState {
         self.float |= o.float;
     }
 
+    fn mem_size(&self) -> usize {
+        40 + self.floats.mem_size()
+    }
+
     fn exact(&self) -> ExactSum {
         let mut s = self.floats.clone();
         let mut rest = self.ints;
@@ -276,10 +279,40 @@ impl SumState {
     }
 }
 
+/// Bytes a JSON value holds beyond its own size, about: a map stores its
+/// entries in B-tree nodes of up to 11.
+fn json_mem(j: &Json) -> usize {
+    match j {
+        Json::String(s) => s.len(),
+        Json::Array(a) => a.iter().map(|v| 32 + json_mem(v)).sum(),
+        Json::Object(m) => m.len().div_ceil(11) * 11 * 56 + m.iter().map(|(k, v)| k.len() + json_mem(v)).sum::<usize>(),
+        _ => 0,
+    }
+}
+
+/// 2^63, the first float past every `i64`.
+const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+
+/// The integer equal to `f`, if there is one.
+fn exact_int(f: f64) -> Option<i64> {
+    (f.fract() == 0.0 && (-TWO_63..TWO_63).contains(&f)).then_some(f as i64)
+}
+
+/// Writes `b` so that it ends where it appears to: zero bytes are escaped,
+/// and the text ends with two zeros, which keeps byte order.
+fn put_escaped(out: &mut Vec<u8>, b: &[u8]) {
+    for &c in b {
+        match c {
+            0 => out.extend([0, 0xFF]),
+            c => out.push(c),
+        }
+    }
+    out.extend([0, 0]);
+}
+
 /// Compares integer `i` with float `f` exactly, where converting either to
 /// the other's type would round.
 fn int_float_cmp(i: i64, f: f64) -> Ordering {
-    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
     if f.is_nan() || f >= TWO_63 {
         return Ordering::Less;
     }
@@ -476,7 +509,8 @@ impl State {
     /// Approximate bytes of memory the state holds.
     pub fn mem_size(&self) -> usize {
         32 + match self {
-            State::SumList(l) => l.len() * 64,
+            State::Sum(s) | State::Avg(s, _) => s.mem_size(),
+            State::SumList(l) => l.iter().map(SumState::mem_size).sum(),
             State::Min(Some(v)) | State::Max(Some(v)) => v.mem_size(),
             State::Uniq(h) => h.mem_size(),
             State::UniqExact(s) => s.bytes,
@@ -596,10 +630,17 @@ impl State {
 pub fn funnel(evs: &[(i64, Pos, u32)], steps: usize, window_ms: i64, mode: FunnelMode) -> usize {
     let mut evs = evs.to_vec();
     evs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    // chains[l] = (first time, last time) of the latest chain that reached step l + 1.
-    let mut chains: Vec<Option<(i64, i64)>> = vec![None; steps];
-    let reached = |c: &[Option<(i64, i64)>]| c.iter().rposition(Option::is_some).map_or(0, |l| l + 1);
+    // chains[l] = the first event's time of the latest chain that reached step l + 1.
+    let mut chains: Vec<Option<i64>> = vec![None; steps];
+    let reached = |c: &[Option<i64>]| c.iter().rposition(Option::is_some).map_or(0, |l| l + 1);
+    // With strict_increase, an event extends only chains as they stood
+    // before its timestamp, so a tie cannot replace a chain it could extend.
+    let (mut before, mut at) = (chains.clone(), None);
     for (t, _, mask) in evs {
+        if mode.strict_increase && at != Some(t) {
+            before.clone_from(&chains);
+            at = Some(t);
+        }
         let deepest = reached(&chains);
         if mode.strict_order && deepest > 0 && deepest < steps && mask & (1 << deepest) == 0 && mask & 1 == 0 {
             return deepest;
@@ -616,14 +657,14 @@ pub fn funnel(evs: &[(i64, Pos, u32)], steps: usize, window_ms: i64, mode: Funne
                 continue;
             }
             if l == 0 {
-                chains[0] = Some((t, t));
+                chains[0] = Some(t);
                 continue;
             }
-            if let Some((first, last)) = chains[l - 1]
+            let prev = if mode.strict_increase { before[l - 1] } else { chains[l - 1] };
+            if let Some(first) = prev
                 && t <= first.saturating_add(window_ms)
-                && (!mode.strict_increase || last < t)
             {
-                chains[l] = Some((first, t));
+                chains[l] = Some(first);
                 if l + 1 == steps {
                     return steps;
                 }

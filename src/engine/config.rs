@@ -111,6 +111,9 @@ pub struct EngineConfig {
     pub event_settle_ms: u64,
     /// JSON paths stored as their own columns in each part; the rest share buckets.
     pub event_json_max_paths: usize,
+    /// Deletion masks up to this many bytes are stored in their part's
+    /// reference; larger ones in a mask object.
+    pub event_mask_inline_bytes: usize,
     /// Bytes of shared JSON path keys a part's metadata lists; past it, the
     /// most common are listed and readers check the buckets for the rest.
     pub event_json_directory_bytes: usize,
@@ -182,6 +185,7 @@ impl Default for EngineConfig {
             event_settle_ms: 24 * 3_600_000,
             event_json_max_paths: 1024,
             event_json_directory_bytes: 1 << 20,
+            event_mask_inline_bytes: 4096,
             event_read_concurrency: 32,
             event_get_hedge_ms: 1_000,
         }

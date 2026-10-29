@@ -188,6 +188,8 @@ fn typed_arg(c: &EvColumn, a: &Json) -> Result<Json> {
             _ => json!(a.as_i64().ok_or_else(bad)?),
         },
         EvType::Int => json!(a.as_i64().ok_or_else(bad)?),
+        // Integers stay exact: they compare with floats by value.
+        EvType::Float if a.is_i64() => a.clone(),
         EvType::Float => json!(a.as_f64().filter(|f| f.is_finite()).ok_or_else(bad)? + 0.0),
         EvType::String => json!(a.as_str().ok_or_else(bad)?),
         EvType::Bool => json!(a.as_bool().ok_or_else(bad)?),
@@ -247,7 +249,7 @@ pub(crate) fn datum_val(d: &Datum) -> Val {
         Datum::Int(i) => Val::Int(*i),
         Datum::Float(f) => Val::Float(*f),
         Datum::Str(s) => Val::Str(s.clone()),
-        Datum::Json(j) => Val::Json(j.clone()),
+        Datum::Json(j) => Val::from_json(j),
         Datum::Bytes(b) => Val::Str(b64::encode(b)),
         Datum::Blob(_) => Val::Null,
     }
@@ -256,7 +258,7 @@ pub(crate) fn datum_val(d: &Datum) -> Val {
 /// A column's value where a row or part predates it.
 fn default_val(c: Option<&EvColumn>) -> Val {
     match c.and_then(|c| c.default.as_ref().map(|d| (c, d))) {
-        Some((_, Json::String(s))) if s == NOW => Val::Null,
+        Some((c, Json::String(s))) if c.ty == EvType::Time && s == NOW => Val::Null,
         Some((c, d)) => super::schema::datum(c, d).map(|d| datum_val(&d)).unwrap_or(Val::Null),
         None => Val::Null,
     }
@@ -725,7 +727,7 @@ impl Kept {
     fn push(&mut self, key: Vec<Val>, pos: Pos, row: Vec<Val>) -> Result<()> {
         self.mem += row_mem(&key, &row);
         self.rows.push((key, pos, row));
-        if self.rows.len() > 2 * (self.limit + 1) + 64 {
+        if self.rows.len() > 2 * (self.limit + 1) + 64 || self.full() {
             self.trim();
         }
         if self.full() {

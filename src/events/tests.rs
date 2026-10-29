@@ -1992,6 +1992,43 @@ mod part_limits {
         });
     }
 
+    /// A delete whose mask outgrows a reference is stored as a mask object,
+    /// which queries, later deletes and merges read.
+    #[test]
+    fn large_deletion_masks_are_stored_as_objects() {
+        crate::probe::record();
+        rt().block_on(async {
+            let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            let rows: Vec<Json> = (0..6_000i64)
+                .map(|i| json!({"time": T0 + i, "event": "a", "n": i, "user": if i % 2 == 1 { "odd" } else { "even" }}))
+                .collect();
+            ins(&db, rows).await;
+            while maint::seal(&db, id).await.unwrap() {}
+            let delete = async |w: Json| {
+                let f = Filter::parse(w).unwrap();
+                txn_do(&db, async |t| maint::delete(&db, t, "events", i64::MIN / 4, i64::MAX / 4, &f).await)
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(delete(json!({"col": "user", "op": "eq", "value": "odd"})).await, 3_000);
+            assert!(crate::probe::finish().count(Probe::MaskObjectWritten) > 0, "the mask fit its reference");
+            assert_eq!(count(&db, json!({"col": "n", "op": "ge", "value": 0})).await, 3_000);
+            assert_eq!(count(&db, json!({"col": "n", "op": "eq", "value": 3})).await, 0);
+            assert_eq!(count(&db, json!({"col": "n", "op": "eq", "value": 4})).await, 1);
+            assert_eq!(delete(json!({"col": "n", "op": "lt", "value": 1_000})).await, 500);
+            assert_eq!(count(&db, json!({"col": "n", "op": "ge", "value": 0})).await, 2_500);
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let s = get_schema(&mut t, "events").await.unwrap();
+            let rs = refs(&mut t, id).await.unwrap();
+            maint::merge(&db, &s, &rs).await.unwrap();
+            assert_eq!(count(&db, json!({"col": "n", "op": "ge", "value": 0})).await, 2_500);
+            assert_eq!(count(&db, json!({"col": "n", "op": "eq", "value": 1_002})).await, 1);
+        });
+    }
+
     #[test]
     fn an_added_float_default_of_negative_zero_survives_seal() {
         rt().block_on(async {
@@ -2384,5 +2421,290 @@ mod query_limits {
             let q = d.quantile(0.5).unwrap();
             assert!(q.is_finite() && ((q - x) / x).abs() <= 0.0101, "median of [{x:e}] is {q:e}");
         }
+    }
+}
+mod answers {
+    use super::*;
+
+    async fn table_id(db: &Arc<Db>) -> u32 {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        get_schema(&mut t, "events").await.unwrap().id
+    }
+
+    async fn run_with(db: &Arc<Db>, q: Json, limits: Limits) -> Result<exec::Output> {
+        let q = Query::parse(q).unwrap();
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let s = get_schema(&mut t, "events").await.unwrap();
+        exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await
+    }
+
+    async fn ins(db: &Arc<Db>, rows: Vec<Json>) {
+        txn_do(db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+    }
+
+    /// Two different (user, event) pairs are two groups.
+    #[test]
+    fn distinct_group_keys_stay_distinct() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            ins(
+                &db,
+                vec![
+                    json!({"time": T0, "event": "c", "user": "a\u{0}\u{4}b"}),
+                    json!({"time": T0 + 1, "event": "b\u{0}\u{4}c", "user": "a"}),
+                ],
+            )
+            .await;
+            let q = json!({"from": T0, "to": T0 + DAY, "group_by": ["user", "event"],
+                "aggregates": {"c": {"fn": "count"}}});
+            let out = query(&db, &q).await.unwrap();
+            assert_eq!(out.rows.len(), 2, "two distinct groups answered as {:?}", out.rows);
+        });
+    }
+
+    /// A sum of floats holds a 70-limb exact accumulator, which the state limit
+    /// counts; a sum of integers holds none.
+    #[test]
+    fn sum_states_are_charged_for_their_accumulators() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let rows: Vec<Json> = (0..2000i64)
+                .map(|i| json!({"time": T0 + i, "event": "a", "user": format!("u{i}"), "n": i, "x": i as f64 + 0.5}))
+                .collect();
+            ins(&db, rows).await;
+            let sums = |of: &str| {
+                let mut aggs = serde_json::Map::new();
+                for k in 0..8 {
+                    aggs.insert(format!("s{k}"), json!({"fn": "sum", "of": of}));
+                }
+                json!({"from": T0, "to": T0 + DAY, "group_by": ["user"], "aggregates": aggs})
+            };
+            let limits = Limits { max_memory_bytes: 4 << 20, ..Limits::default() };
+            let ints = run_with(&db, sums("n"), limits).await;
+            assert!(ints.is_ok(), "integer sums hold no float accumulator: {:?}", ints.err());
+            let held = 2000 * 8 * std::mem::size_of::<i64>() * 70;
+            let r = run_with(&db, sums("x"), limits).await;
+            assert!(
+                matches!(r, Err(Error::TooLarge(_))),
+                "{held} bytes of float sum accumulators held under a {} byte limit: {:?}",
+                4 << 20,
+                r.map(|o| o.rows.len())
+            );
+        });
+    }
+
+    /// A JSON object's in-memory size is far above its text; rows mode must count it.
+    #[test]
+    fn json_rows_are_charged_for_their_memory() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let mut props = serde_json::Map::new();
+            for k in 0..1000 {
+                props.insert(format!("k{k}"), json!({"x": 1}));
+            }
+            let rows: Vec<Json> =
+                (0..100i64).map(|i| json!({"time": T0 + i, "event": "a", "props": props.clone()})).collect();
+            ins(&db, rows).await;
+            // Each inner object allocates a B-tree leaf of 11 (String, Value) slots.
+            let held = 100 * 1000 * 11 * (24 + 32);
+            let limits = Limits { max_memory_bytes: 8 << 20, ..Limits::default() };
+            let q = json!({"from": T0, "to": T0 + DAY, "columns": ["props"], "limit": 100});
+            let r = run_with(&db, q, limits).await;
+            assert!(
+                matches!(r, Err(Error::TooLarge(_))),
+                "at least {held} bytes of JSON rows held under an {} byte limit: {:?}",
+                8 << 20,
+                r.map(|o| o.rows.len())
+            );
+        });
+    }
+
+    /// A page whose rows fit the memory limit is answered.
+    #[test]
+    fn rows_that_fit_the_limit_are_answered() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let pad = "z".repeat(10_000);
+            let rows: Vec<Json> =
+                (0..300i64).map(|i| json!({"time": T0 + i, "event": "a", "user": format!("{i}{pad}")})).collect();
+            ins(&db, rows).await;
+            let limits = Limits { max_memory_bytes: 1_500_000, ..Limits::default() };
+            let q = json!({"from": T0, "to": T0 + DAY, "columns": ["user"], "limit": 100});
+            let r = run_with(&db, q, limits).await;
+            assert!(r.is_ok(), "100 rows of 10 KB under a 1.5 MB limit: {:?}", r.err());
+        });
+    }
+
+    /// Float columns compare exactly with integer arguments.
+    #[test]
+    fn float_columns_compare_exactly_with_large_ints() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            ins(&db, vec![json!({"time": T0, "event": "a", "x": 9007199254740992.0f64})]).await;
+            let mut got = Vec::new();
+            for op in ["lt", "eq"] {
+                let w = json!({"col": "x", "op": op, "value": 9007199254740993i64});
+                let q = json!({"from": T0, "to": T0 + DAY, "where": w, "aggregates": {"n": {"fn": "count"}}});
+                got.push(query(&db, &q).await.unwrap().rows[0][0].as_i64().unwrap());
+            }
+            assert_eq!(got, vec![1, 0], "2^53 < 2^53 + 1 and 2^53 != 2^53 + 1");
+        });
+    }
+
+    /// Pages continue where they stopped after the rows they read are sealed.
+    #[test]
+    fn pages_continue_across_a_seal() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            for c in 0..3i64 {
+                let rows: Vec<Json> = (0..5i64).map(|i| json!({"time": T0, "event": "a", "n": c * 5 + i})).collect();
+                ins(&db, rows).await;
+            }
+            let base = json!({"from": T0, "to": T0 + DAY, "columns": ["n"], "limit": 4});
+            let mut got = Vec::new();
+            let mut cursor = Json::Null;
+            let mut sealed = false;
+            loop {
+                let mut q = base.clone();
+                q["cursor"] = cursor.clone();
+                let page = query(&db, &q).await.unwrap();
+                got.extend(page.rows.into_iter().map(|r| r[0].as_i64().unwrap()));
+                if !sealed {
+                    assert!(maint::seal(&db, id).await.unwrap());
+                    sealed = true;
+                }
+                match page.next_cursor {
+                    Some(c) => cursor = json!(c),
+                    None => break,
+                }
+            }
+            got.sort();
+            assert_eq!(got, (0..15).collect::<Vec<_>>());
+        });
+    }
+
+    /// A strict-order funnel answers the same unsealed and sealed.
+    #[test]
+    fn strict_funnels_agree_across_storage() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            ins(
+                &db,
+                vec![
+                    json!({"time": T0, "event": "a", "user": "u"}),
+                    json!({"time": T0 + 2, "event": "b", "user": "u"}),
+                ],
+            )
+            .await;
+            ins(
+                &db,
+                vec![
+                    json!({"time": T0 + 1, "event": "x", "user": "u"}),
+                    json!({"time": T0 + 2, "event": "a", "user": "u"}),
+                ],
+            )
+            .await;
+            let q = json!({"from": T0, "to": T0 + DAY, "group_by": ["user"], "aggregates": {"f": {"fn": "window_funnel",
+                "window_ms": DAY, "mode": "strict_order", "steps": [
+                {"col": "event", "op": "eq", "value": "a"}, {"col": "event", "op": "eq", "value": "b"}]}}});
+            let a = query(&db, &q).await.unwrap().rows;
+            assert!(maint::seal(&db, id).await.unwrap());
+            let b = query(&db, &q).await.unwrap().rows;
+            assert_eq!(a, b);
+        });
+    }
+
+    /// a@0 then b@5 is a strictly increasing two-step funnel, whatever
+    /// other a events happen at 5.
+    #[test]
+    fn strict_increase_funnels_use_earlier_starts() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            ins(
+                &db,
+                vec![
+                    json!({"time": T0, "event": "a", "user": "u"}),
+                    json!({"time": T0 + 5, "event": "a", "user": "u"}),
+                    json!({"time": T0 + 5, "event": "b", "user": "u"}),
+                ],
+            )
+            .await;
+            let q = json!({"from": T0, "to": T0 + DAY, "aggregates": {"f": {"fn": "window_funnel",
+                "window_ms": DAY, "mode": "strict_increase", "steps": [
+                {"col": "event", "op": "eq", "value": "a"}, {"col": "event", "op": "eq", "value": "b"}]}}});
+            let rows = query(&db, &q).await.unwrap().rows;
+            assert_eq!(rows, vec![vec![json!(2)]]);
+        });
+    }
+
+    /// A string column added with the default "now" reads that string for
+    /// earlier events however they are stored.
+    #[test]
+    fn a_string_default_of_now_reads_alike_unsealed_and_sealed() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            ins(&db, vec![json!({"time": T0, "event": "a"})]).await;
+            let spec: ColumnSpec =
+                serde_json::from_value(json!({"name": "src", "type": "string", "nullable": true, "default": "now"}))
+                    .unwrap();
+            txn_do(&db, async |t| add_column(t, "events", &spec).await).await.unwrap();
+            let q = json!({"from": T0, "to": T0 + DAY, "columns": ["src"]});
+            let unsealed = query(&db, &q).await.unwrap().rows;
+            assert!(maint::seal(&db, id).await.unwrap());
+            let sealed = query(&db, &q).await.unwrap().rows;
+            assert_eq!(unsealed, sealed, "unsealed vs sealed");
+        });
+    }
+
+    /// Lookup values from a JSON column compare as numbers when they are numbers.
+    #[test]
+    fn json_lookup_values_compare_as_numbers() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let tdef: crate::table::CreateTable = serde_json::from_value(json!({"name": "people",
+                "columns": [{"name": "id", "type": "string"}, {"name": "score", "type": "json"}],
+                "primary_key": ["id"]}))
+            .unwrap();
+            txn_do(&db, async |t| crate::table::create_table(t, &tdef).await.map(|_| ())).await.unwrap();
+            for row in [json!({"id": "u1", "score": 9}), json!({"id": "u2", "score": 10})] {
+                let d = db.clone();
+                txn_do(&db, async |t| {
+                    let b = crate::table::BlobResolver { db: &d };
+                    crate::table::insert(t, &b, "people", &row, crate::table::InsertMode::Insert).await
+                })
+                .await
+                .unwrap();
+            }
+            ins(
+                &db,
+                vec![
+                    json!({"time": T0, "event": "a", "user": "u1"}),
+                    json!({"time": T0 + 1, "event": "a", "user": "u2"}),
+                ],
+            )
+            .await;
+            let q = json!({"from": T0, "to": T0 + DAY,
+                "lookups": {"s": {"table": "people", "key": {"col": "user"}, "value": "score"}},
+                "where": {"lookup": "s", "op": "gt", "value": 3},
+                "aggregates": {"n": {"fn": "count"}, "top": {"fn": "max", "of": {"lookup": "s"}}}});
+            let mut all = q.clone();
+            all.as_object_mut().unwrap().remove("where");
+            let unfiltered = query(&db, &all).await.unwrap().rows;
+            let rows = query(&db, &q).await.unwrap().rows;
+            assert_eq!((unfiltered, rows), (vec![vec![json!(2), json!(10)]], vec![vec![json!(2), json!(10)]]));
+        });
     }
 }

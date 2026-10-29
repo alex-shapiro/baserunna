@@ -61,9 +61,10 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       time range, so as a serializable transaction it conflicts with any
       insert or bind into them. A delete whose reads outlast the interval
       between binds (a cold cache over many parts) retries until the cache is
-      warm, or fails with `409` after `txn_retries`. Evaluate the delete's
-      filter on rows and refs added since its snapshot inside the committer
-      instead of tracking them as reads.
+      warm, or fails with `409` after `txn_retries`; under a crash storm a
+      delete may never commit (`sim_tool trace events 2126696`). Evaluate
+      the delete's filter on rows and refs added since its snapshot inside
+      the committer instead of tracking them as reads.
 - [ ] **Run event deletes past the commit deadline.** A delete reads every
       part its filter cannot rule out by time range inside its transaction,
       and the request's commit deadline (`commit_timeout_ms`, 10 s) bounds
@@ -81,7 +82,7 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       whatever its size (`Mask::Inline` in `Db::build`), so a rejected or
       repeated slot whose rows interleave with others' can add about one byte
       per row of a 16 MiB buffer to a part reference. Have maintenance
-      rewrite parts whose inline mask exceeds `MASK_INLINE_MAX`.
+      rewrite parts whose inline mask exceeds `event_mask_inline_bytes`.
 - [ ] **Bound merge memory.** `merge_parts` holds the sort key of every live
       input row at once, so a final merge of 4 GiB of small events holds
       hundreds of MB of keys. Merge sorted runs block by block instead.

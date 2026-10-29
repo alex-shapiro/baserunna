@@ -175,7 +175,7 @@ pub async fn add_column(txn: &mut Txn, table: &str, c: &ColumnSpec) -> Result<Ev
     if !c.nullable && c.default.is_none() {
         return Err(Error::invalid("a new non-nullable column needs a default"));
     }
-    if !c.nullable && c.default.as_ref().and_then(Json::as_str) == Some(schema::NOW) {
+    if !c.nullable && c.ty == EvType::Time && c.default.as_ref().and_then(Json::as_str) == Some(schema::NOW) {
         return Err(Error::invalid("a new column defaulting to \"now\" is nullable: earlier events read as null"));
     }
     s.columns.push(EvColumn {

@@ -31,23 +31,39 @@ const LIMBS: usize = 70;
 const LSB_EXP: i32 = -1074;
 
 /// The exact sum of finite floats: a fixed-point accumulator wide enough
-/// for any finite double, rounded once when read.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// for any finite double, rounded once when read. Its limbs are allocated
+/// by the first nonzero float.
+#[derive(Clone, Debug, Default)]
 pub struct ExactSum {
     limbs: Vec<i64>,
     adds: u32,
 }
 
-impl Default for ExactSum {
-    fn default() -> Self {
-        ExactSum { limbs: vec![0; LIMBS], adds: 0 }
+impl PartialEq for ExactSum {
+    fn eq(&self, o: &ExactSum) -> bool {
+        let limbs = |s: &ExactSum| {
+            let mut s = s.clone();
+            s.normalize();
+            if s.limbs.is_empty() { vec![0; LIMBS] } else { s.limbs }
+        };
+        limbs(self) == limbs(o)
     }
 }
 
+impl Eq for ExactSum {}
+
 impl ExactSum {
+    /// Bytes the accumulator holds.
+    pub fn mem_size(&self) -> usize {
+        24 + self.limbs.capacity() * 8
+    }
+
     pub fn add(&mut self, x: f64) {
         if x == 0.0 || !x.is_finite() {
             return;
+        }
+        if self.limbs.is_empty() {
+            self.limbs = vec![0; LIMBS];
         }
         let bits = x.to_bits();
         let exp = ((bits >> 52) & 0x7FF) as i32;
@@ -70,6 +86,9 @@ impl ExactSum {
     }
 
     fn normalize(&mut self) {
+        if self.limbs.is_empty() {
+            return;
+        }
         let mut carry = 0i64;
         for l in self.limbs.iter_mut() {
             let v = *l + carry;
@@ -83,6 +102,13 @@ impl ExactSum {
     }
 
     pub fn merge(&mut self, o: &ExactSum) {
+        if o.limbs.is_empty() {
+            return;
+        }
+        if self.limbs.is_empty() {
+            *self = o.clone();
+            return;
+        }
         let mut o = o.clone();
         o.normalize();
         self.normalize();
@@ -97,6 +123,9 @@ impl ExactSum {
     pub fn value(&self) -> f64 {
         let mut s = self.clone();
         s.normalize();
+        if s.limbs.is_empty() {
+            return 0.0;
+        }
         let neg = s.limbs[LIMBS - 1] < 0;
         if neg {
             let mut borrow = 0i64;
@@ -134,6 +163,9 @@ impl ExactSum {
     pub fn decode(r: &mut Reader<'_>) -> DResult<ExactSum> {
         let mut s = ExactSum::default();
         let n = r.len(LIMBS)?;
+        if n > 0 {
+            s.limbs = vec![0; LIMBS];
+        }
         for _ in 0..n {
             let i = r.u8()? as usize;
             if i >= LIMBS {

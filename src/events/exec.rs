@@ -117,22 +117,23 @@ struct Lookup {
 
 /// A row table's primary keys mapped to one of its columns, held in about
 /// the bytes of the keys and values: each entry's key (its canonical bytes)
-/// and value (encoded) lie back to back in one buffer, found through an
-/// open-addressing table of entry numbers.
+/// and value (encoded) lie back to back in one buffer, found by binary
+/// search over the entries sorted by key, which costs the same whatever the
+/// keys (a hash table over them could be flooded with keys chosen to
+/// collide).
 #[derive(Default)]
 struct LookupMap {
     data: Vec<u8>,
     /// Where each entry starts in `data`.
     starts: Vec<u32>,
-    /// Entry numbers plus one by hash slot, 0 for an empty slot; its length
-    /// is a power of two that keeps it at most 2/3 full.
-    slots: Vec<u32>,
+    /// Entry numbers by key, entries of equal keys in insertion order.
+    sorted: Vec<u32>,
 }
 
 impl LookupMap {
     /// The bytes the map holds.
     fn mem(&self) -> usize {
-        self.data.len() + 4 * (self.starts.len() + self.slots.len())
+        self.data.len() + 4 * (self.starts.len() + self.sorted.len())
     }
 
     /// Appends an entry; entries are found once [`LookupMap::index`] runs.
@@ -146,43 +147,31 @@ impl LookupMap {
         Ok(())
     }
 
-    fn entry(&self, e: usize) -> Reader<'_> {
-        Reader::new(&self.data[self.starts[e] as usize..])
+    fn entry(&self, e: u32) -> Reader<'_> {
+        Reader::new(&self.data[self.starts[e as usize] as usize..])
+    }
+
+    fn key(&self, e: u32) -> &[u8] {
+        self.entry(e).bytes().unwrap_or_default()
     }
 
     /// The bytes [`LookupMap::index`] adds.
     fn index_mem(&self) -> usize {
-        let n = self.starts.len();
-        4 * (n + n / 2 + 1).next_power_of_two()
+        4 * self.starts.len()
     }
 
-    /// Builds the slots; of entries with equal keys, the last is found.
+    /// Sorts the entries by key; of entries with equal keys, the last is found.
     fn index(&mut self) {
-        let n = self.starts.len();
-        let mut slots = vec![0u32; self.index_mem() / 4];
-        let mask = slots.len() - 1;
-        for e in 0..n {
-            let key = self.entry(e).bytes().unwrap_or_default();
-            let mut s = crate::util::bloom::key_hash(key) as usize & mask;
-            while slots[s] != 0 && self.entry(slots[s] as usize - 1).bytes().ok() != Some(key) {
-                s = (s + 1) & mask;
-            }
-            slots[s] = e as u32 + 1;
-        }
-        self.slots = slots;
+        let mut sorted: Vec<u32> = (0..self.starts.len() as u32).collect();
+        sorted.sort_by(|a, b| self.key(*a).cmp(self.key(*b)));
+        self.sorted = sorted;
     }
 
     fn get(&self, key: &[u8]) -> Option<Val> {
-        let mask = self.slots.len().checked_sub(1)?;
-        let mut s = crate::util::bloom::key_hash(key) as usize & mask;
-        loop {
-            let e = self.slots[s].checked_sub(1)? as usize;
-            let mut r = self.entry(e);
-            if r.bytes().ok() == Some(key) {
-                return Val::decode(&mut r, 0).ok();
-            }
-            s = (s + 1) & mask;
-        }
+        let after = self.sorted.partition_point(|e| self.key(*e) <= key);
+        let e = *self.sorted.get(after.checked_sub(1)?)?;
+        let mut r = self.entry(e);
+        (r.bytes().ok()? == key).then(|| Val::decode(&mut r, 0).ok()).flatten()
     }
 }
 
@@ -2416,6 +2405,33 @@ fn only_filter() -> Kind {
 mod tests {
     use super::*;
 
+    /// Keys chosen to share a hash slot cost a lookup map what any keys do:
+    /// it finds entries by sorting, not by a hash an attacker can predict.
+    #[test]
+    fn lookup_maps_resist_colliding_keys() {
+        let keys = |n: usize, collide: bool| -> Vec<Vec<u8>> {
+            let window = (n + n / 2 + 1).next_power_of_two() as u64 / 8;
+            (0i64..)
+                .map(|i| Val::Int(i).canonical_bytes())
+                .filter(|k| !collide || crate::util::bloom::key_hash(k) & (window * 8 - 1) < window)
+                .take(n)
+                .collect()
+        };
+        let build = |keys: &[Vec<u8>]| {
+            let start = tokio::time::Instant::now();
+            let mut m = LookupMap::default();
+            for k in keys {
+                m.push(k, &Val::Int(1)).unwrap();
+            }
+            m.index();
+            assert!(keys.iter().all(|k| m.get(k) == Some(Val::Int(1))));
+            start.elapsed()
+        };
+        let n = 1 << 15;
+        let (honest, colliding) = (build(&keys(n, false)), build(&keys(n, true)));
+        assert!(colliding < honest * 10 + std::time::Duration::from_millis(200), "{honest:?} vs {colliding:?}");
+    }
+
     #[test]
     fn lookup_maps_find_the_last_value_of_each_key() {
         let mut m = LookupMap::default();
@@ -2426,7 +2442,6 @@ mod tests {
         }
         m.push(&Val::Int(7).canonical_bytes(), &Val::Null).unwrap();
         m.index();
-        assert!(3 * m.starts.len() <= 2 * m.slots.len(), "{} entries in {} slots", m.starts.len(), m.slots.len());
         for (i, k) in keys.iter().enumerate() {
             let want = if *k == Val::Int(7) { Val::Null } else { Val::Str(format!("v{i}")) };
             assert_eq!(m.get(&k.canonical_bytes()), Some(want), "{k:?}");

@@ -236,9 +236,14 @@ fn event_responses_match_the_openapi_document() {
             (
                 "POST",
                 "/v1/dbs/d/events/ev/rows/query",
-                json!({"from": 0, "to": "2100-01-01", "group_by": ["event"],
-                "aggregates": {"n": {"fn": "count"}, "u": {"fn": "uniq", "col": "user"},
-                "q": {"fn": "quantiles", "col": "n", "levels": [0.5]}}}),
+                json!({"from": 0, "to": "2100-01-01", "group_by": ["user"],
+                "aggregates": {"n": {"fn": "count"}, "u": {"fn": "uniq", "of": "event"},
+                "q": {"fn": "quantiles", "of": "time", "q": [0.5, 0.9]},
+                "f": {"fn": "window_funnel", "window_ms": 3_600_000, "mode": "strict_increase", "steps": [
+                    {"col": "event", "op": "eq", "value": "a"}, {"col": "event", "op": "eq", "value": "b"}]},
+                "r": {"fn": "retention", "conditions": [
+                    {"col": "event", "op": "eq", "value": "a"}, {"col": "event", "op": "eq", "value": "b"}]}},
+                "then": {"group_by": ["f"], "aggregates": {"users": {"fn": "count"}}}}),
             ),
             (
                 "POST",
@@ -273,8 +278,47 @@ fn event_responses_match_the_openapi_document() {
             if let Err(e) = crate::sim::openapi_check::check_response(m, p, &sr) {
                 bad.push(format!("{m} {p} {}: {e}\n  {}", r.status, String::from_utf8_lossy(&r.body)));
             }
+            if p.ends_with("/rows/query") && r.status != 200 {
+                bad.push(format!("{m} {p} {b}: {} {}", r.status, String::from_utf8_lossy(&r.body)));
+            }
         }
         assert!(bad.is_empty(), "{}", bad.join("\n"));
+        w.shutdown();
+    });
+}
+
+/// The funnel per plan that SPEC §4.8 shows as an example answers as it says.
+#[test]
+fn the_spec_example_query_answers() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        let users = json!({"name": "users", "columns": [{"name": "user", "type": "string"},
+            {"name": "plan", "type": "string"}], "primary_key": ["user"]});
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/tables", &[], &users.to_string()).await;
+        assert_eq!(s, 201, "{r}");
+        for (u, plan) in [("u1", "pro"), ("u2", "free"), ("u3", "pro")] {
+            let row = json!({"row": {"user": u, "plan": plan}}).to_string();
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/tables/users/rows", &[], &row).await;
+            assert!(s == 200 || s == 201, "{r}");
+        }
+        let at = |d: &str| format!("2026-10-0{d}T12:00:00Z");
+        let rows = json!([
+            {"event": "view", "user": "u1", "time": at("2")}, {"event": "buy", "user": "u1", "time": at("2")},
+            {"event": "view", "user": "u2", "time": at("2")}, {"event": "buy", "user": "u2", "time": at("5")},
+            {"event": "view", "user": "u3", "time": at("3")},
+        ]);
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], &rows.to_string()).await;
+        assert_eq!(s, 201, "{r}");
+        let q = r#"{"from": "2026-10-01", "to": "2026-11-01", "lookups": {"plan": {"table":
+  "users", "key": "user", "value": "plan"}}, "group_by": ["user", {"lookup":
+  "plan", "as": "plan"}], "aggregates": {"steps": {"fn": "window_funnel",
+  "window_ms": 86400000, "steps": [{"col": "event", "op": "eq", "value":
+  "view"}, {"col": "event", "op": "eq", "value": "buy"}]}}, "then":
+  {"group_by": ["plan", "steps"], "aggregates": {"users": {"fn": "count"}}}, "consistency": "strong"}"#;
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows/query", &[], q).await;
+        assert_eq!(s, 200, "{r}");
+        assert_eq!(r["columns"], json!(["plan", "steps", "users"]), "{r}");
+        assert_eq!(r["rows"], json!([["free", 1, 1], ["pro", 1, 1], ["pro", 2, 1]]), "{r}");
         w.shutdown();
     });
 }
@@ -707,6 +751,95 @@ mod forwarding {
             assert_eq!(s, 200, "{q}: {r}");
             let n: i64 = r["rows"].as_array().unwrap().iter().map(|row| row[2].as_i64().unwrap_or(0)).sum();
             assert_eq!(n, 1, "the default query {q} answered {r}");
+            w.shutdown();
+        });
+    }
+}
+
+/// A transaction that reuses a bulk insert's idempotency key is refused,
+/// as a bulk insert reusing a transaction's key is, instead of answering
+/// `replayed: true` without applying its ops.
+#[test]
+fn transactions_refuse_a_key_used_by_a_bulk_insert() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        let h = [("content-type", "application/json"), ("idempotency-key", "shared")];
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &h, r#"[{"event": "a"}]"#).await;
+        assert_eq!(s, 201, "{r}");
+        let txn = json!({"ops": [{"op": "put", "key": "x", "value": "y"}], "idempotency_key": "shared"});
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/txn", &[], &txn.to_string()).await;
+        let (g, _) = send(&w, 0, &t, "GET", "/v1/dbs/d/kv/x", &[], "").await;
+        assert!(s == 400 || g == 200, "the transaction answered {s} {r} but its put was not applied (GET x: {g})");
+        w.shutdown();
+    });
+}
+
+mod console_pages {
+    use super::*;
+
+    async fn web(w: &World, t: &str, m: &str, p: &str, form: &[(&str, &str)]) -> (u16, String) {
+        let body: Vec<String> = form
+            .iter()
+            .map(|(k, v)| {
+                let enc: String = v
+                    .bytes()
+                    .map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") })
+                    .collect();
+                format!("{k}={enc}")
+            })
+            .collect();
+        let req = http::Request::builder()
+            .method(m)
+            .uri(p)
+            .header("cookie", format!("{}={t}", crate::api::SESSION_COOKIE))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(axum::body::Body::from(body.join("&")))
+            .unwrap();
+        let resp = w.node(0).router().unwrap().oneshot(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let b = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&b).to_string())
+    }
+
+    fn csrf_of(html: &str) -> String {
+        let i = html.find("name=\"csrf\" value=\"").expect("a csrf token") + "name=\"csrf\" value=\"".len();
+        html[i..i + html[i..].find('"').unwrap()].to_string()
+    }
+
+    /// The query runner shows time buckets as times, including those a
+    /// `then` stage groups by.
+    #[test]
+    fn query_runner_shows_second_stage_buckets_as_times() {
+        run_paused(async {
+            let (w, t) = setup(1).await;
+            let rows = r#"[{"event": "a", "time": "2023-11-14T22:13:20Z"}]"#;
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], rows).await;
+            assert_eq!(s, 201, "{r}");
+            let (_, page) = web(&w, &t, "GET", "/console/dbs/d/events/ev", &[]).await;
+            let q = r#"{"from": 0, "to": "2100-01-01",
+                "group_by": [{"bucket": "time", "interval": "1h", "as": "hour"}], "aggregates": {"n": {"fn": "count"}},
+                "then": {"group_by": [{"bucket": "hour", "interval": "1d", "as": "day"}], "aggregates": {"hours": {"fn": "count"}}}}"#;
+            let (s, html) =
+                web(&w, &t, "POST", "/console/dbs/d/events/ev/query", &[("csrf", &csrf_of(&page)), ("query", q)]).await;
+            assert_eq!(s, 200);
+            let answer = &html[html.find("<th>day</th>").expect("an answer table")..];
+            let answer = &answer[..answer.find("</table>").unwrap()];
+            assert!(answer.contains("<td>2023-11-14 00:00:00</td>"), "the day bucket is shown as a number: {answer}");
+            w.shutdown();
+        });
+    }
+
+    /// A retention shorter than an hour is not shown as zero.
+    #[test]
+    fn table_page_shows_sub_hour_retention() {
+        run_paused(async {
+            let (w, t) = setup(1).await;
+            let (s, r) = send(&w, 0, &t, "PATCH", "/v1/dbs/d/events/ev", &[], r#"{"retention_ms": 1800000}"#).await;
+            assert_eq!(s, 200, "{r}");
+            let (_, page) = web(&w, &t, "GET", "/console/dbs/d/events/ev", &[]).await;
+            let stats = &page[page.find("<span>Retention</span>").expect("a retention stat")..];
+            let stats = &stats[..stats.find("</div>").unwrap()];
+            assert!(!stats.contains(">0 h"), "30 minutes of retention reads as zero: {stats}");
             w.shutdown();
         });
     }

@@ -12,17 +12,31 @@ Baserunna is a web service that hosts databases on object storage. Its goal is t
 - Event tables for analytics: columnar storage, funnels, retention, and unique counts over time ranges
 - Self service administration
 
-The key non-feature is _low latency_. Uncached reads and writes take 10s of ms at p50, with p99 ≥100ms. While Baserunna minimizes latency where possible, object storage is fundmentally slower than local storage. For many applications, this latency is an acceptable tradeoff for scalability and cost benefits.
+The key non-feature is _low latency_. Uncached reads and writes take 10s of ms at p50, with p99 ≥100ms. While Baserunna minimizes latency where possible, object storage is fundamentally slower than local storage. For many applications, this latency is an acceptable tradeoff for scalability and cost benefits.
 
 Full design details are in [`SPEC.md`](SPEC.md).
 
 ## Quick start
 
-Run a single node locally at.
+Run a single node locally, and open its console:
 
 ```sh
 cargo run --release
 open http://127.0.0.1:8080/console
+```
+
+An event table takes inserts in bulk and answers aggregate queries, such as
+events per day (SPEC §4.8 describes the query language):
+
+```sh
+curl -X POST localhost:8080/v1/dbs/app/events -H "authorization: Bearer $TOKEN" -d '{"name": "clicks",
+  "columns": [{"name": "time", "type": "time", "default": "now"}, {"name": "page", "type": "string"}],
+  "time_column": "time", "order_by": ["page", "time"]}'
+curl -X POST localhost:8080/v1/dbs/app/events/clicks/rows -H "authorization: Bearer $TOKEN" \
+  -d '[{"page": "/"}, {"page": "/pricing"}]'
+curl -X POST localhost:8080/v1/dbs/app/events/clicks/rows/query -H "authorization: Bearer $TOKEN" \
+  -d '{"from": "2026-01-01", "to": "2027-01-01", "group_by": [{"bucket": {"col": "time"}, "interval": "1d", "as": "day"}],
+       "aggregates": {"clicks": {"fn": "count"}}}'
 ```
 
 For more information on deployment, see [DEPLOYING.md](DEPLOYING.md).

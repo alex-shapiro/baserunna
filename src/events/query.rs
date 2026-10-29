@@ -535,8 +535,8 @@ impl Query {
             Some(_) => return Err(Error::invalid("order_by is an array")),
         };
         let max = if rows_mode { ROWS_LIMIT_MAX } else { GROUPS_LIMIT_MAX };
-        let limited = o.get("limit").is_some();
-        let limit = match o.remove("limit") {
+        let limited = o.get("limit").is_some_and(|l| !l.is_null());
+        let limit = match o.remove("limit").filter(|l| !l.is_null()) {
             None => {
                 if rows_mode {
                     100
@@ -608,6 +608,8 @@ mod tests {
         assert_eq!(first.group_by[1].name, "browser");
         let all = Query::parse(json!({"from": 0, "to": 1})).unwrap();
         assert_eq!(all.mode, Mode::Rows { columns: Vec::new(), cursor: None });
+        let unlimited = Query::parse(json!({"from": 0, "to": 1, "limit": null})).unwrap();
+        assert_eq!((unlimited.limit, unlimited.limited), (100, false), "a null limit is no limit");
         for bad in [
             json!({"to": 1, "aggregates": {"n": {"fn": "count"}}}),
             json!({"from": 2, "to": 1, "aggregates": {"n": {"fn": "count"}}}),

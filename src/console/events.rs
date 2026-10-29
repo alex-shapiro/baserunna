@@ -95,7 +95,8 @@ fn time_outputs(t: &Json, q: &Json) -> Vec<String> {
         .filter(|c| c["type"] == "time")
         .filter_map(|c| c["name"].as_str().map(str::to_string))
         .collect();
-    for g in q["group_by"].as_array().into_iter().flatten() {
+    let stages = q["group_by"].as_array().into_iter().chain(q["then"]["group_by"].as_array());
+    for g in stages.flatten() {
         if g.get("bucket").is_some() {
             out.push(g["as"].as_str().unwrap_or("bucket").to_string());
         }
@@ -238,7 +239,7 @@ async fn render(s: &Session, db: &str, name: &str, t: &Json, q: &str, answer: St
             bytes = format_bytes(t["bytes"].as_u64().unwrap_or(0)),
             un = t["unsealed_rows"],
             ret = match t["retention_ms"].as_u64() {
-                Some(ms) => format!("{} h", ms / 3_600_000),
+                Some(ms) => super::span(ms),
                 None => "keeps everything".into(),
             },
             order = esc(&t["order_by"].to_string()),

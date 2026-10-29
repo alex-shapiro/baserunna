@@ -311,7 +311,7 @@ async fn streams(b: &mut Browser, evil: &str) -> Result<(), String> {
     )?;
     expect(link(&page, "Newest").is_some() && link(&page, "Older →").is_none(), "the oldest page's pager is wrong")?;
     b.submit_ok(sp, &format!("{sp}/retention"), &[("retention_ms", "3600000"), ("max_bytes", "")]).await?;
-    expect(b.page(sp).await?.contains("keeps 3600 s"), "the retention is not shown")?;
+    expect(b.page(sp).await?.contains("keeps 1 h"), "the retention is not shown")?;
     b.submit_err(sp, &format!("{sp}/retention"), &[("retention_ms", "soon")]).await?;
     b.submit_ok(sp, &format!("{sp}/trim"), &[("before_seq", "10")]).await?;
     expect(b.page(sp).await?.contains("<span>Records</span>10–61"), "the trim is not shown")?;

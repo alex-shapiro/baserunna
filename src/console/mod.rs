@@ -405,6 +405,15 @@ fn format_bytes(n: u64) -> String {
     }
 }
 
+/// A duration in the largest unit that states it exactly, such as `30 min`.
+fn span(ms: u64) -> String {
+    let units = [(86_400_000, "d"), (3_600_000, "h"), (60_000, "min"), (1000, "s")];
+    match units.iter().find(|(u, _)| ms > 0 && ms.is_multiple_of(*u)) {
+        Some((u, name)) => format!("{} {name}", ms / u),
+        None => format!("{ms} ms"),
+    }
+}
+
 fn when(ms: u64) -> String {
     crate::log::rfc3339(ms)[..19].replace('T', " ")
 }

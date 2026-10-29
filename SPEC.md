@@ -378,21 +378,42 @@ events to row tables.
   filter (§4.7, where a column operand may carry a JSON `path`), and answer
   with rows or aggregates. Answers never depend on how events are stored
   or merged: aggregates keep mergeable states, and sums of floats are exact.
-  - *Rows* (`columns`, every column when omitted) come in `order_by` order,
-    100 per page by default and up to 10,000, with a `cursor` to resume.
-  - *Aggregates* group by columns, JSON paths, lookups and time buckets,
-    and compute `count`, `sum`, `min`, `max`, `avg`, `uniq` (HyperLogLog,
-    exact up to 1,024 values), `uniq_exact`, `quantiles` (within 1%
-    relative error), `window_funnel` and `retention`, each with an optional
-    `where`. Buckets are seconds, minutes, hours or days counted from the
-    epoch (so `7d` starts on Thursdays), weeks starting Monday, or calendar
-    months, with an optional fixed `offset` for a time zone. A `then` stage
-    aggregates the first stage's groups, so a funnel per user becomes a
-    count per funnel step. The answer holds the first `limit` groups by
-    `order_by`, or, without a `limit`, every group, failing with `413` past
-    100,000.
-  - *Lookups* map a value through a row table (`{table, key, value,
-    default}`), such as a user id to a plan.
+  - *Expressions* name a column (`"user"`), a JSON path
+    (`{"col": "props", "path": ["plan"]}`), a lookup (`{"lookup": "plan"}`)
+    or a time bucket (`{"bucket": {"col": "time"}, "interval": "1d",
+    "offset": "-05:00"}`); any of them takes `as` to name its output.
+    Buckets are seconds, minutes, hours or days counted from the epoch (so
+    `7d` starts on Thursdays), weeks starting Monday, or calendar months.
+  - *Rows* (`columns`, every column when omitted) come by time, or by the
+    query's `order_by` of output names, 100 per page by default and up to
+    10,000, with a `cursor` to resume.
+  - *Aggregates* (`group_by` and `aggregates`, an object of named
+    aggregates, answered in name order) are `{"fn": .., "of": .., "where":
+    ..}` where `fn` is `count`, `sum`, `min`, `max`, `avg`, `uniq`
+    (HyperLogLog, exact up to 1,024 values) or `uniq_exact` of the
+    expression `of`; `quantiles` of `of` at levels `q` (a list, answered as
+    a list within 1% relative error); `window_funnel` with `steps` (filters),
+    `window_ms` and an optional `mode` (`strict_order`,
+    `strict_deduplication`, `strict_increase`), answered as the number of
+    steps one group reached in order within the window; or `retention`
+    with `conditions` (filters), answered as a list whose `i`th entry says
+    whether the group met the first condition and the `i`th. A `then`
+    stage groups the first stage's outputs by name, so a funnel per user
+    becomes a count per funnel step. The answer holds the first `limit`
+    groups by `order_by`, or, without a `limit`, every group, failing with
+    `413` past 100,000.
+  - *Lookups* (`"lookups": {"plan": {"table": "users", "key": "user",
+    "value": "plan", "default": ..}}`) map an expression through a row
+    table's primary key to one of its columns; `default`, an expression,
+    answers when the key is missing.
+
+  For example, users per plan who viewed and then bought within a day:
+  `{"from": "2026-10-01", "to": "2026-11-01", "lookups": {"plan": {"table":
+  "users", "key": "user", "value": "plan"}}, "group_by": ["user", {"lookup":
+  "plan", "as": "plan"}], "aggregates": {"steps": {"fn": "window_funnel",
+  "window_ms": 86400000, "steps": [{"col": "event", "op": "eq", "value":
+  "view"}, {"col": "event", "op": "eq", "value": "buy"}]}}, "then":
+  {"group_by": ["plan", "steps"], "aggregates": {"users": {"fn": "count"}}}}`.
   - *Consistency.* A query reads a snapshot at most 5 s old (or
     `max_staleness_ms`) unless `consistency` is `strong`, which sees every
     acknowledged insert; a snapshot that lacks the table or a column named

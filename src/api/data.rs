@@ -546,6 +546,9 @@ async fn one_shot(
                 "results": out, "appends": first_seqs(&commit),
             })
         }
+        Ran::Replayed(c) if c.inserted.is_some() => {
+            return Err(Error::invalid("the idempotency key was used by an event bulk insert"));
+        }
         Ran::Replayed(c) => json!({
             "version": c.version, "committed": true, "replayed": true,
             "commit_id": commit_hex(commit_id), "results": Json::Null, "appends": first_seqs(&c),

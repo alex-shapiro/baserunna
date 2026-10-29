@@ -335,8 +335,8 @@ fn schemas() -> Value {
                 appends only when the read reaches the end of the stream, and observes earlier trims in the same \
                 transaction but not uncommitted appends; `stream_info` conflicts with concurrent appends; \
                 `set_consumer` requires `seq` to be at most the stream's `next_seq`. For event tables: \
-                `insert_events` gives rows their positions at commit, and the transaction's own queries do not see \
-                them; `query_events` in a read-write serializable transaction conflicts with any concurrent insert \
+                `insert_events` gives rows their positions at commit, so a transaction that inserts into a table \
+                cannot also query or delete its events (400); `query_events` in a read-write serializable transaction conflicts with any concurrent insert \
                 into the table; `delete_events` masks matching rows of parts and deletes matching unsealed rows.",
         },
         "TxnRequest": obj(json!({

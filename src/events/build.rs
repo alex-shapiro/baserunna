@@ -353,8 +353,6 @@ pub async fn write_rows(
         meta_len: w.meta_len,
         min_time,
         max_time,
-        min_key: w.min_key,
-        max_key: w.max_key,
         version: None,
         min_version: if versions { min_version } else { 0 },
         max_version: if versions { max_version } else { 0 },

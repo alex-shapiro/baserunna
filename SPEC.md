@@ -358,8 +358,9 @@ events to row tables.
   `month`, in UTC) groups events by time, so retention and range queries
   skip whole partitions. Optional skip indexes add bloom filters to
   columns that filters test for equality. Columns can be added with a
-  default, which applies to events written before the column existed, and
-  dropped. `json` columns take no default, sort key or skip index.
+  default, which applies to events written before the column existed
+  (an added column defaulting to `"now"` must be nullable, and reads null
+  for them), and dropped. `json` columns take no default, sort key or skip index.
 - **Inserts** take up to 1 MiB per event. A bulk insert (`POST …/rows`, a
   JSON array or NDJSON) waits up to 200 ms for other inserts on the same
   node and commits with them in one manifest write. With an idempotency
@@ -392,8 +393,8 @@ events to row tables.
 - **Deletes** remove the events matching a filter within a time range, in a
   transaction. A delete that would need an oversized mask in one partition
   fails with `413` naming it, so a caller deletes partition by partition.
-- **Retention** (`retention_ms`) drops whole partitions once their end is
-  older than it.
+- **Retention** (`retention_ms`): queries skip events older than it, and
+  maintenance drops parts once all their events are older.
 - **Quota.** Event tables count toward the database's size quota (§5.10),
   and a database's event parts are capped at 1 TiB. Seals, merges, deletes
   and retention never grow a database, so a full database can still run
@@ -1726,7 +1727,7 @@ Tools:
 - Stream filters scan records; there is no index on record contents, so a query finds needles at the rate it can scan (`scan_limit` records a request).
 - An event query runs on the node it reaches, on one task: its speed is one core's decoding rate and its store's latency divided by 32 concurrent part reads (§5.13).
 - Event lookups read their whole row table on every query, up to 1 GiB (§4.8).
-- Event merges and retention run on the lease holder, so a database with no activity keeps expired partitions until it is used again (§5.13).
+- Event merges and retention run on the lease holder, so a database with no activity keeps expired parts, which queries skip, until it is used again (§5.13).
 - Event parts are cached in memory only; the local disk tier (§5.3) holds segments, so a restarted node reads parts from the store again.
 
 ## 16. Future work

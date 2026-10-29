@@ -241,6 +241,15 @@ impl EventSchema {
         tuple::encode(&keys)
     }
 
+    /// The earliest time retained at `now_ms`: queries skip earlier events,
+    /// and maintenance drops parts holding only earlier events.
+    pub fn retained_from(&self, now_ms: i64) -> i64 {
+        match self.retention_ms {
+            Some(r) => now_ms.saturating_sub(r.min(i64::MAX as u64) as i64),
+            None => i64::MIN,
+        }
+    }
+
     /// The partition bucket holding time `t`.
     pub fn bucket(&self, t: i64) -> i64 {
         bucket_of(self.partition, t)
@@ -398,7 +407,8 @@ pub fn datum(c: &EvColumn, v: &Json) -> Result<Datum> {
             if !f.is_finite() {
                 return Err(bad());
             }
-            Datum::Float(f)
+            // -0.0 is stored as 0.0, which it equals, so statistics need not order the two.
+            Datum::Float(if f == 0.0 { 0.0 } else { f })
         }
         EvType::Bool => Datum::Bool(v.as_bool().ok_or_else(bad)?),
         EvType::Json => match v {

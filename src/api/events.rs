@@ -1,7 +1,9 @@
 //! Event table routes (SPEC §4.8, §10): tables, bulk inserts as JSON or
 //! NDJSON, queries and deletes.
 
-use super::data::{PathMap, commit_hex, param, split_consistency};
+use super::data::{
+    PathMap, commit_hex, content_type, idempotency_header, one_idempotency_key, param, split_consistency,
+};
 use super::{DbCtx, JsonBody, Params, consistency_of, with_read, with_txn};
 use crate::engine::{Committed, Consistency};
 use crate::error::{Error, Result};
@@ -168,7 +170,7 @@ fn parse_rows(content_type: &str, data: &[u8]) -> Result<(Vec<Json>, Option<Stri
             Ok(Json::Array(rows)) => Ok((rows, None)),
             Ok(Json::Object(mut o)) => {
                 let key = match o.remove("idempotency_key") {
-                    None => None,
+                    None | Some(Json::Null) => None,
                     Some(Json::String(k)) => Some(k),
                     Some(_) => return Err(Error::invalid("idempotency_key is a string")),
                 };
@@ -209,26 +211,14 @@ async fn insert(
 ) -> Result<Response> {
     ctx.require_write()?;
     let name = param(&p, "t")?.to_string();
-    let ct = req
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    let header_key = match req.headers().get("idempotency-key") {
-        None => None,
-        Some(v) => Some(v.to_str().map_err(|_| Error::invalid("Idempotency-Key must be visible ASCII"))?.to_string()),
-    };
+    let ct = content_type(req.headers());
+    let header_key = idempotency_header(req.headers())?;
     let limit = node.cfg.max_json_body;
     let data = axum::body::to_bytes(req.into_body(), limit)
         .await
         .map_err(|_| Error::TooLarge(format!("bulk inserts are limited to {limit} bytes")))?;
     let (rows, body_key) = parse_rows(&ct, &data)?;
-    let key = header_key.or(body_key);
+    let key = one_idempotency_key(header_key, body_key)?;
     if rows.is_empty() {
         return Err(Error::invalid("insert at least one event"));
     }

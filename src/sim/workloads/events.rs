@@ -716,8 +716,8 @@ async fn tour(c: &Client) -> Result<(), String> {
     expect(&r, 404, "describe a dropped table")
 }
 
-/// Parts of the retained table past their retention are dropped by
-/// maintenance after the next commit, and newer rows stay.
+/// Queries of the retained table skip rows past its retention, parts past
+/// it are dropped by maintenance after the next commit, and newer rows stay.
 async fn check_retention(c: &Client, (applied, unknown): (u64, u64)) -> Result<(), String> {
     let deadline = c.sim.now_ms() + 120_000;
     for round in 0.. {
@@ -740,11 +740,18 @@ async fn check_retention(c: &Client, (applied, unknown): (u64, u64)) -> Result<(
         if !future.is_some_and(|n| (applied..=applied + unknown).contains(&n)) {
             return Err(format!("rows within retention were lost: {}", a.json));
         }
-        if stale == Some(0) {
+        if stale != Some(0) {
+            return Err(format!("a query returned rows past retention: {}", a.json));
+        }
+        let info = c.call_retry("GET", &format!("{DB}/events/old"), None).await;
+        let Some(parts) = info.json["parts"].as_array() else {
+            return Err(format!("describe the retained table: {} {}", info.status, info.json));
+        };
+        if parts.iter().all(|p| p["max_time"].as_i64().is_some_and(|t| t >= now - 3 * HOUR)) {
             return Ok(());
         }
         if c.sim.now_ms() > deadline {
-            return Err(format!("rows past retention were never dropped: {}", a.json));
+            return Err(format!("parts past retention were never dropped: {}", info.json));
         }
     }
     Ok(())

@@ -138,7 +138,7 @@ pub async fn create(txn: &mut Txn, def: &CreateEvents) -> Result<EventSchema> {
     s.validate()?;
     s.id = crate::table::allocate_table_id(txn).await?;
     put_schema(txn, &s)?;
-    txn.put(ev::state_key(s.id), Value::Inline(TableState::default().encode()))?;
+    txn.event_op(EventOp::Create { table: s.id })?;
     Ok(s)
 }
 
@@ -163,7 +163,7 @@ pub async fn drop(txn: &mut Txn, name: &str) -> Result<()> {
         txn.event_op(EventOp::part_ref(Some(r), None))?;
     }
     txn.delete_range(ev::rows(s.id))?;
-    txn.delete(ev::state_key(s.id))?;
+    txn.event_op(EventOp::Drop { table: s.id })?;
     txn.delete(catalog_key(name))
 }
 
@@ -174,6 +174,9 @@ pub async fn add_column(txn: &mut Txn, table: &str, c: &ColumnSpec) -> Result<Ev
     }
     if !c.nullable && c.default.is_none() {
         return Err(Error::invalid("a new non-nullable column needs a default"));
+    }
+    if !c.nullable && c.default.as_ref().and_then(Json::as_str) == Some(schema::NOW) {
+        return Err(Error::invalid("a new column defaulting to \"now\" is nullable: earlier events read as null"));
     }
     s.columns.push(EvColumn {
         id: s.next_column_id,
@@ -245,10 +248,8 @@ pub fn validate_rows(s: &EventSchema, rows: &[Json], now_ms: i64) -> Result<Vec<
                 o => o,
             })?;
             for d in row.values_mut() {
-                match d {
-                    Datum::Json(j) => json::normalize(j).map_err(|m| Error::invalid(format!("event {i}: {m}")))?,
-                    Datum::Float(f) if *f == 0.0 => *f = 0.0,
-                    _ => {}
+                if let Datum::Json(j) = d {
+                    json::normalize(j).map_err(|m| Error::invalid(format!("event {i}: {m}")))?;
                 }
             }
             if encode_row(&row).len() > schema::ROW_MAX_BYTES {
@@ -324,5 +325,9 @@ pub fn time_bounds(from: &Option<Json>, to: &Option<Json>) -> Result<(i64, i64)>
             }
         }
     };
-    Ok((bound(from, "from", i64::MIN / 4)?, bound(to, "to", i64::MAX / 4)?))
+    let (from, to) = (bound(from, "from", i64::MIN / 4)?, bound(to, "to", i64::MAX / 4)?);
+    if from > to {
+        return Err(Error::invalid("from is after to"));
+    }
+    Ok((from, to))
 }

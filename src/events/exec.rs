@@ -1367,8 +1367,9 @@ async fn run_within(
         probe::hit(Probe::LookupApplied);
     }
     let time = BExpr::Col(s.time_id());
+    let from = q.from.max(s.retained_from(shared.time_ms() as i64));
     let mut conds = vec![
-        filter::Filter::Cmp(time.clone(), Test::Ge(json!(q.from))),
+        filter::Filter::Cmp(time.clone(), Test::Ge(json!(from))),
         filter::Filter::Cmp(time.clone(), Test::Lt(json!(q.to))),
     ];
     if let Some(f) = &q.filter {
@@ -1432,7 +1433,7 @@ async fn run_within(
         }
     }
     let rest: BTreeSet<Need> = rest.difference(&first).cloned().collect();
-    let input = input(txn, s, q.from, q.to).await?;
+    let input = input(txn, s, from, q.to).await?;
     let plan = Plan { schema: s, filter, lookups, kind, first, rest, positions };
     let mut run = Run::new(&plan, limits.max_memory_bytes);
     run.stats = Stats { source: "columns".into(), nodes: 1, parts: input.refs.len() as u64, ..Default::default() };

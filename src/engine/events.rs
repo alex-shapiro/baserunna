@@ -133,8 +133,6 @@ pub struct TableState {
     pub unsealed_rows: u64,
     /// Key and value bytes of the unsealed rows.
     pub unsealed_bytes: u64,
-    /// Every row at or before this position has been sealed or deleted.
-    pub sealed_through: Option<Pos>,
 }
 
 const STATE_FORMAT: u8 = 1;
@@ -145,14 +143,6 @@ impl TableState {
         w.u8(STATE_FORMAT);
         w.varint(self.unsealed_rows);
         w.varint(self.unsealed_bytes);
-        match self.sealed_through {
-            None => w.u8(0),
-            Some(p) => {
-                w.u8(1);
-                w.varint(p.version);
-                w.varint(p.ordinal as u64);
-            }
-        }
         Bytes::from(w.into_inner())
     }
 
@@ -163,18 +153,10 @@ impl TableState {
         }
         let unsealed_rows = r.varint()?;
         let unsealed_bytes = r.varint()?;
-        let sealed_through = match r.u8()? {
-            0 => None,
-            1 => Some(Pos {
-                version: r.varint()?,
-                ordinal: u32::try_from(r.varint()?).map_err(|_| DecodeError("bad ordinal"))?,
-            }),
-            _ => return Err(DecodeError("bad sealed position tag")),
-        };
         if !r.is_empty() {
             return Err(DecodeError("event table state trailing data"));
         }
-        Ok(TableState { unsealed_rows, unsealed_bytes, sealed_through })
+        Ok(TableState { unsealed_rows, unsealed_bytes })
     }
 }
 
@@ -308,9 +290,6 @@ pub struct PartRef {
     pub meta_len: u64,
     pub min_time: i64,
     pub max_time: i64,
-    /// Tuple-encoded sort keys of the first and last rows.
-    pub min_key: Bytes,
-    pub max_key: Bytes,
     /// The version of every row, for parts whose rows were bound by one
     /// commit after the part was written; `None` when the part stores it.
     pub version: Option<Seq>,
@@ -362,7 +341,7 @@ impl PartRef {
     }
 
     pub fn encode(&self) -> Bytes {
-        let mut w = Writer::with_capacity(160 + self.min_key.len() + self.max_key.len());
+        let mut w = Writer::with_capacity(160);
         w.u8(REF_FORMAT);
         w.varint(self.chunk_bytes);
         w.varint(self.size);
@@ -373,8 +352,6 @@ impl PartRef {
         w.varint(self.meta_len);
         w.varint(zigzag(self.min_time));
         w.varint(zigzag(self.max_time));
-        w.bytes(&self.min_key);
-        w.bytes(&self.max_key);
         match self.version {
             None => w.u8(0),
             Some(v) => {
@@ -419,8 +396,6 @@ impl PartRef {
             meta_len: r.varint()?,
             min_time: unzigzag(r.varint()?),
             max_time: unzigzag(r.varint()?),
-            min_key: Bytes::copy_from_slice(r.bytes()?),
-            max_key: Bytes::copy_from_slice(r.bytes()?),
             version: None,
             min_version: 0,
             max_version: 0,
@@ -510,7 +485,12 @@ pub enum EventOp {
     /// same write set; see [`EventOp::part_ref`].
     Ref(Box<RefChange>),
     /// Unsealed rows removed by a seal or a delete in the same write set.
-    Forget { table: u32, rows: u64, bytes: u64, sealed_through: Option<Pos> },
+    Forget { table: u32, rows: u64, bytes: u64 },
+    /// Creates the state of a new table.
+    Create { table: u32 },
+    /// Removes a dropped table's state, after which nothing can insert into
+    /// or bind parts to it.
+    Drop { table: u32 },
 }
 
 /// A part reference added, replaced or removed.
@@ -579,22 +559,37 @@ async fn state(at: &Pending<'_>, table: u32) -> Result<Option<TableState>> {
     }
 }
 
-/// Plans `ops` committed at `version`.
+/// Plans `ops` committed at `version`. The plan owns every table's state
+/// entry, so ops later in the write set see the state earlier ones left.
 pub(crate) async fn plan(ops: &[EventOp], at: &Pending<'_>, version: Seq) -> Result<Effects> {
     let mut fx = Effects::default();
-    let mut states: BTreeMap<u32, TableState> = BTreeMap::new();
+    // The planned state of each table the write set names, `None` once
+    // dropped, and whether its state existed before.
+    let mut states: BTreeMap<u32, (Option<TableState>, bool)> = BTreeMap::new();
     let mut ordinals: BTreeMap<u32, u32> = BTreeMap::new();
+    let not_found = || Error::not_found("event table not found");
     for op in ops {
+        let table = match op {
+            EventOp::Insert { table, .. }
+            | EventOp::Forget { table, .. }
+            | EventOp::Create { table }
+            | EventOp::Drop { table } => *table,
+            EventOp::Ref(c) => c.new.as_ref().or(c.old.as_ref()).map(|r| r.table).unwrap_or(0),
+        };
+        let (st, _) = match states.entry(table) {
+            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::btree_map::Entry::Vacant(e) => {
+                let st = state(at, table).await?;
+                e.insert((st, st.is_some()))
+            }
+        };
         match op {
-            EventOp::Insert { table, rows } => {
-                let mut st = match states.get(table) {
-                    Some(s) => *s,
-                    None => state(at, *table).await?.ok_or_else(|| Error::not_found("event table not found"))?,
-                };
-                let next = ordinals.entry(*table).or_insert(0);
+            EventOp::Insert { rows, .. } => {
+                let st = st.as_mut().ok_or_else(not_found)?;
+                let next = ordinals.entry(table).or_insert(0);
                 let first = Pos { version, ordinal: *next };
                 for r in rows {
-                    let k = row_key(*table, Pos { version, ordinal: *next });
+                    let k = row_key(table, Pos { version, ordinal: *next });
                     st.unsealed_rows += 1;
                     st.unsealed_bytes += (k.len() + r.len()) as u64;
                     fx.entries.push(Entry::new(k, version, Value::Inline(r.clone())));
@@ -603,23 +598,21 @@ pub(crate) async fn plan(ops: &[EventOp], at: &Pending<'_>, version: Seq) -> Res
                 if !rows.is_empty() {
                     let last = Pos { version, ordinal: *next - 1 };
                     fx.touched.push(KeyRange::new(
-                        Bound::Included(row_key(*table, first)),
-                        Bound::Included(row_key(*table, last)),
+                        Bound::Included(row_key(table, first)),
+                        Bound::Included(row_key(table, last)),
                     ));
                 }
-                states.insert(*table, st);
             }
-            EventOp::Forget { table, rows, bytes, sealed_through } => {
-                let mut st = match states.get(table) {
-                    Some(s) => *s,
-                    None => state(at, *table).await?.ok_or_else(|| Error::not_found("event table not found"))?,
-                };
+            EventOp::Forget { rows, bytes, .. } => {
+                let st = st.as_mut().ok_or_else(not_found)?;
                 st.unsealed_rows = st.unsealed_rows.saturating_sub(*rows);
                 st.unsealed_bytes = st.unsealed_bytes.saturating_sub(*bytes);
-                if let Some(p) = sealed_through {
-                    st.sealed_through = st.sealed_through.max(Some(*p));
-                }
-                states.insert(*table, st);
+            }
+            EventOp::Create { .. } => *st = Some(TableState::default()),
+            EventOp::Drop { .. } => {
+                *st = None;
+                let rows = self::rows(table);
+                fx.entries.retain(|e| !rows.contains(&e.key));
             }
             EventOp::Ref(c) => {
                 let RefChange { old, new } = c.as_ref();
@@ -635,22 +628,25 @@ pub(crate) async fn plan(ops: &[EventOp], at: &Pending<'_>, version: Seq) -> Res
                     }
                 }
                 if let Some(n) = new {
+                    if st.is_none() {
+                        return Err(not_found());
+                    }
                     fx.part_bytes_added += n.stored_bytes();
-                }
-                let table = new.as_ref().or(old.as_ref()).map(|r| r.table).unwrap_or(0);
-                if !states.contains_key(&table)
-                    && let Some(st) = state(at, table).await?
-                {
-                    states.insert(table, st);
                 }
             }
         }
     }
-    for (table, st) in states {
+    for (table, (st, existed)) in states {
         let k = state_key(table);
+        match st {
+            Some(st) => {
+                fx.entries.push(Entry::new(k.clone(), version, Value::Inline(st.encode())));
+                fx.tables.insert(table, st);
+            }
+            None if existed => fx.entries.push(Entry::tombstone(k.clone(), version)),
+            None => continue,
+        }
         fx.touched.push(KeyRange::point(&k));
-        fx.entries.push(Entry::new(k, version, Value::Inline(st.encode())));
-        fx.tables.insert(table, st);
     }
     Ok(fx)
 }
@@ -770,8 +766,6 @@ mod tests {
             meta_len: 1000,
             min_time: -5,
             max_time: 1_700_000_000_000,
-            min_key: Bytes::from_static(b"a"),
-            max_key: Bytes::from_static(b"z"),
             version: Some(9),
             min_version: 9,
             max_version: 9,
@@ -812,8 +806,7 @@ mod tests {
         assert_eq!(p.stored_bytes(), 5077);
         p.mask = Some(Mask::Inline(Runs(vec![(1, 2)])));
         assert!(PartRef::decode(&p.key(), &p.encode()).is_err(), "mask count must match");
-        let st =
-            TableState { unsealed_rows: 4, unsealed_bytes: 99, sealed_through: Some(Pos { version: 3, ordinal: 1 }) };
+        let st = TableState { unsealed_rows: 4, unsealed_bytes: 99 };
         assert_eq!(TableState::decode(&st.encode()).unwrap(), st);
         let runs = Runs(vec![(0, 3), (9, 1)]);
         assert_eq!(decode_mask_object(&encode_mask_object(&runs)).unwrap(), runs);

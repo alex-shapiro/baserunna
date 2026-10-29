@@ -63,7 +63,54 @@ impl Sim {
             let mut positions: std::collections::BTreeMap<(u32, crate::engine::events::Pos), String> =
                 Default::default();
             let mut part_bytes = 0u64;
-            for e in newest.values().filter(|e| deletes.seq_at(&e.key) <= e.seq && !e.value.is_tombstone()) {
+            let live = || newest.values().filter(|e| deletes.seq_at(&e.key) <= e.seq && !e.value.is_tombstone());
+            let tables: std::collections::BTreeSet<u32> = live()
+                .filter(|e| e.key.starts_with(&[crate::table::SPACE_CATALOG, b'e', b'/']))
+                .filter_map(|e| match &e.value {
+                    crate::engine::Value::Inline(b) => {
+                        serde_json::from_slice::<crate::events::schema::EventSchema>(b).ok()
+                    }
+                    _ => None,
+                })
+                .map(|s| s.id)
+                .collect();
+            // Each table's state, and the unsealed rows and bytes it should count.
+            let mut states: std::collections::BTreeMap<u32, crate::engine::events::TableState> = Default::default();
+            let mut unsealed: std::collections::BTreeMap<u32, crate::engine::events::TableState> = Default::default();
+            for e in live() {
+                let table = if let Some((t, _)) = crate::engine::events::parse_row_key(&e.key) {
+                    let crate::engine::Value::Inline(row) = &e.value else {
+                        return Err(format!("db {db}: unsealed row {:?} is not inline", e.key));
+                    };
+                    let c = unsealed.entry(t).or_default();
+                    c.unsealed_rows += 1;
+                    c.unsealed_bytes += (e.key.len() + row.len()) as u64;
+                    t
+                } else if let Some((t, st)) = crate::engine::events::state_of(e) {
+                    states.insert(t, st);
+                    t
+                } else if let Some(r) = crate::engine::events::ref_of(e) {
+                    r.table
+                } else {
+                    continue;
+                };
+                if !tables.contains(&table) {
+                    return Err(format!(
+                        "db {db}: {:?} belongs to event table {table}, which is not in the catalog",
+                        e.key
+                    ));
+                }
+            }
+            for t in &tables {
+                let st = states.get(t).ok_or_else(|| format!("db {db}: event table {t} has no state"))?;
+                if *st != unsealed.get(t).copied().unwrap_or_default() {
+                    return Err(format!(
+                        "db {db}: event table {t} state {st:?} does not count its unsealed rows {:?}",
+                        unsealed.get(t)
+                    ));
+                }
+            }
+            for e in live() {
                 let place = if let Some((table, pos)) = crate::engine::events::parse_row_key(&e.key) {
                     vec![((table, pos), "an unsealed row".to_string())]
                 } else if e.key.first() == Some(&crate::engine::events::PARTS) {

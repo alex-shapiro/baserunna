@@ -1589,7 +1589,9 @@ fn paths() -> Value {
         Op {
             body: Some(json_body(r("EventRetention"))),
             params: vec![db(), evt()],
-            desc: Some("Parts whose rows are all older than `retention_ms` are dropped by background maintenance."),
+            desc: Some(
+                "Queries skip events older than `retention_ms`, and background maintenance drops parts whose events are all older.",
+            ),
             ..op("Change an event table's retention", "events", vec![("200", resp("Event table", r("EventTable")))])
         },
     );
@@ -1607,7 +1609,9 @@ fn paths() -> Value {
         Op {
             body: Some(json_body(r("EventColumn"))),
             params: vec![db(), evt()],
-            desc: Some("Rows written before the column existed read as its default."),
+            desc: Some(
+                "Rows written before the column existed read as its default, or as null for a nullable column defaulting to `\"now\"`.",
+            ),
             ..op("Add a column", "events", vec![("200", resp("Event table", r("EventTable")))])
         },
     );

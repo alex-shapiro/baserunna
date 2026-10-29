@@ -1,7 +1,10 @@
 //! Stream routes (SPEC §4.6, §10): streams, appends, reads as JSON,
 //! NDJSON or server-sent events, queries, trims and consumers.
 
-use super::data::{PathMap, bool_param, commit_hex, encoding_param, param, split_consistency};
+use super::data::{
+    PathMap, bool_param, commit_hex, content_type, encoding_param, idempotency_header, one_idempotency_key, param,
+    split_consistency,
+};
 use super::{DbCtx, Found, JsonBody, Params, Ran, consistency_of, paging, run_txn, watch, with_read, with_txn};
 use crate::engine::{Committed, Consistency, Db, Isolation, Retention, StreamState};
 use crate::error::{Error, Result};
@@ -160,21 +163,6 @@ struct AppendBody {
     encoding: Option<Encoding>,
 }
 
-fn content_type(h: &HeaderMap) -> String {
-    let ct = h.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
-}
-
-fn idempotency_header(h: &HeaderMap) -> Result<Option<String>> {
-    match h.get("idempotency-key") {
-        None => Ok(None),
-        Some(v) => match v.to_str() {
-            Ok(k) => Ok(Some(k.to_string())),
-            Err(_) => Err(Error::invalid("Idempotency-Key must be visible ASCII")),
-        },
-    }
-}
-
 async fn append(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
@@ -198,7 +186,7 @@ async fn append(
                 serde_json::from_slice(&data).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))?;
             expect = expect.or(b.expect_seq);
             create |= b.create;
-            key = key.or(b.idempotency_key);
+            key = one_idempotency_key(key, b.idempotency_key)?;
             let enc = match b.encoding {
                 Some(e) => e,
                 None => encoding_param(&q)?,

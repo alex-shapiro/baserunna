@@ -4682,7 +4682,7 @@
         ]
       },
       "patch": {
-        "description": "Parts whose rows are all older than `retention_ms` are dropped by background maintenance.",
+        "description": "Queries skip events older than `retention_ms`, and background maintenance drops parts whose events are all older.",
         "parameters": [
           {
             "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
@@ -4736,7 +4736,7 @@
     },
     "/v1/dbs/{db}/events/{t}/columns": {
       "post": {
-        "description": "Rows written before the column existed read as its default.",
+        "description": "Rows written before the column existed read as its default, or as null for a nullable column defaulting to `\"now\"`.",
         "parameters": [
           {
             "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",

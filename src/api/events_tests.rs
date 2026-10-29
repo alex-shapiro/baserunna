@@ -423,3 +423,176 @@ async fn db_id(w: &World, t: &str) -> String {
     let (_, info) = send(w, 0, t, "GET", "/v1/dbs/d", &[], "").await;
     info["id"].as_str().expect("a database id").to_string()
 }
+
+mod requests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn setup_with(nodes: usize, latency_ms: u64, configure: fn(&mut crate::node::NodeConfig)) -> (World, String) {
+        let w = World::with_config(nodes, latency_ms, configure).await;
+        let t = w.signup(0, "ev@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let r = call_router(&w.node(0).router().unwrap(), "POST", "/v1/dbs/d/events", &t, Bytes::from(TABLE)).await;
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        (w, t)
+    }
+
+    /// The request that fills a node's insert buffer may be cancelled while
+    /// the buffer flushes without failing the requests buffered with it.
+    #[test]
+    fn a_cancelled_insert_does_not_fail_inserts_buffered_with_it() {
+        run_paused(async {
+            let (w, t) = setup_with(1, 20, |c| {
+                c.event_insert_buffer_bytes = 4_000;
+                c.event_insert_buffer_ms = 2_000;
+            })
+            .await;
+            let p = "/v1/dbs/d/events/ev/rows";
+            let a_body = format!(r#"[{{"event": "a", "user": "{}"}}]"#, "a".repeat(2_500));
+            let b_body = format!(r#"[{{"event": "b", "user": "{}"}}]"#, "b".repeat(2_500));
+            let a = send(&w, 0, &t, "POST", p, &[], &a_body);
+            let b = async {
+                while w.node(0).event_buffers().pending() == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                let fut = send(&w, 0, &t, "POST", p, &[], &b_body);
+                tokio::pin!(fut);
+                while w.node(0).event_buffers().pending() > 0 {
+                    if let Some(r) = futures_util::FutureExt::now_or_never(&mut fut) {
+                        panic!("the second insert finished before it was cancelled: {r:?}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                // The second client disconnects while its request flushes the buffer.
+            };
+            let ((s, r), ()) = tokio::join!(a, b);
+            assert_eq!(s, 201, "an insert failed because another client's request was cancelled: {r}");
+            w.shutdown();
+        });
+    }
+
+    /// A client resolves its in-flight insert's key (SPEC §6.2) while the
+    /// insert waits in a non-holder node's buffer: the forwarded bind is
+    /// refused as aborted, and the client gets the same 409 as on the holder.
+    #[test]
+    fn a_forwarded_bind_keeps_its_aborted_error() {
+        run_paused(async {
+            let (w, t) = setup(2).await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let id = db_id(&w, &t).await;
+            for i in 0..2 {
+                count(&w, i, &t).await;
+            }
+            let h = w.holder(&id).expect("a lease holder");
+            let n = 1 - h;
+            let insert =
+                send(&w, n, &t, "POST", "/v1/dbs/d/events/ev/rows", &[("idempotency-key", "k")], r#"[{"event": "a"}]"#);
+            let resolve = async {
+                while w.node(n).event_buffers().pending() == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                let (s, r) = send(&w, h, &t, "GET", "/v1/dbs/d/commits/key:k", &[], "").await;
+                assert_eq!((s, r["status"].clone()), (200, json!("not_committed")), "{r}");
+            };
+            let ((s, r), ()) = tokio::join!(insert, resolve);
+            assert_eq!((s, r["error"]["code"].clone()), (409, json!("aborted")), "{r}");
+            w.shutdown();
+        });
+    }
+
+    /// Events past retention are not returned, including rows inserted by
+    /// transactions that stay unsealed below `event_seal_bytes`.
+    #[test]
+    fn queries_skip_unsealed_events_past_retention() {
+        run_paused(async {
+            let (w, t) = setup(1).await;
+            let (s, r) =
+                send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], r#"[{"event": "bulk", "time": 1000}]"#).await;
+            assert_eq!(s, 201, "{r}");
+            let txn =
+                json!({"ops": [{"op": "insert_events", "table": "ev", "rows": [{"event": "txn", "time": 2000}]}]});
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/txn", &[], &txn.to_string()).await;
+            assert_eq!(s, 200, "{r}");
+            let (s, r) = send(&w, 0, &t, "PATCH", "/v1/dbs/d/events/ev", &[], r#"{"retention_ms": 3600000}"#).await;
+            assert_eq!(s, 200, "{r}");
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], r#"[{"event": "fresh"}]"#).await;
+                assert_eq!(s, 201, "{r}");
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let q = json!({"from": 0, "to": 10_000, "columns": ["event"], "consistency": "strong"});
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/query", &[], &q.to_string()).await;
+            assert_eq!(s, 200, "{r}");
+            assert_eq!(r["rows"], json!([]), "events older than retention_ms are still returned: {r}");
+            w.shutdown();
+        });
+    }
+
+    /// An added column defaulting to `"now"` has no value for earlier events.
+    #[test]
+    fn an_added_column_defaulting_to_now_is_nullable() {
+        run_paused(async {
+            let (w, t) = setup(1).await;
+            let (s, r) =
+                send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], r#"[{"event": "a", "time": 1000}]"#).await;
+            assert_eq!(s, 201, "{r}");
+            let col = r#"{"name": "seen", "type": "time", "nullable": false, "default": "now"}"#;
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/columns", &[], col).await;
+            assert_eq!(s, 400, "a non-nullable column was added that reads null for earlier events: {r}");
+            let col = r#"{"name": "seen", "type": "time", "default": "now"}"#;
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/columns", &[], col).await;
+            assert_eq!(s, 200, "{r}");
+            let q = r#"{"from": 0, "to": 2000, "columns": ["seen"], "consistency": "strong"}"#;
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/query", &[], q).await;
+            assert_eq!((s, r["rows"].clone()), (200, json!([[null]])), "{r}");
+            w.shutdown();
+        });
+    }
+
+    /// A delete whose range is reversed is refused, as a query's is.
+    #[test]
+    fn deletes_refuse_reversed_ranges_like_queries() {
+        run_paused(async {
+            let (w, t) = setup(1).await;
+            let q = r#"{"from": 2000, "to": 1000, "aggregates": {"n": {"fn": "count"}}}"#;
+            let (sq, rq) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/query", &[], q).await;
+            let d = r#"{"from": 2000, "to": 1000, "where": {"col": "event", "op": "eq", "value": "a"}}"#;
+            let (sd, rd) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/delete", &[], d).await;
+            assert_eq!(sq, sd, "query {sq} {rq} vs delete {sd} {rd}");
+            w.shutdown();
+        });
+    }
+
+    /// A null `idempotency_key` means none, as for stream appends and `/txn`.
+    #[test]
+    fn a_null_idempotency_key_in_the_body_is_absent() {
+        run_paused(async {
+            let (w, t) = setup(1).await;
+            let b = r#"{"rows": [{"event": "a"}], "idempotency_key": null}"#;
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], b).await;
+            assert_eq!(s, 201, "{r}");
+            w.shutdown();
+        });
+    }
+
+    /// A request naming one key in its header and another in its body is
+    /// refused instead of being answered for the header's key.
+    #[test]
+    fn header_and_body_idempotency_keys_must_agree() {
+        run_paused(async {
+            let (w, t) = setup(1).await;
+            let p = "/v1/dbs/d/events/ev/rows";
+            let (s, r) = send(&w, 0, &t, "POST", p, &[("idempotency-key", "h")], r#"[{"event": "a"}]"#).await;
+            assert_eq!(s, 201, "{r}");
+            let b = r#"{"rows": [{"event": "b"}], "idempotency_key": "other"}"#;
+            let (s, r) = send(&w, 0, &t, "POST", p, &[("idempotency-key", "h")], b).await;
+            assert_eq!((s, r["error"]["message"].as_str().is_some_and(|m| m.contains("differ"))), (400, true), "{r}");
+            let p = "/v1/dbs/d/streams/s/records?create=true";
+            let b = r#"{"records": [{"value": "x"}], "idempotency_key": "other"}"#;
+            let (s, r) = send(&w, 0, &t, "POST", p, &[("idempotency-key", "s")], b).await;
+            assert_eq!((s, r["error"]["message"].as_str().is_some_and(|m| m.contains("differ"))), (400, true), "{r}");
+            w.shutdown();
+        });
+    }
+}

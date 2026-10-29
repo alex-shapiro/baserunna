@@ -488,6 +488,33 @@ pub(super) fn commit_id_for_key(db_id: &str, key: &str) -> u64 {
     u64::from_be_bytes(a)
 }
 
+/// A request body's content type, lowercased and without parameters.
+pub(super) fn content_type(h: &HeaderMap) -> String {
+    let ct = h.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+}
+
+pub(super) fn idempotency_header(h: &HeaderMap) -> Result<Option<String>> {
+    match h.get("idempotency-key") {
+        None => Ok(None),
+        Some(v) => match v.to_str() {
+            Ok(k) => Ok(Some(k.to_string())),
+            Err(_) => Err(Error::invalid("Idempotency-Key must be visible ASCII")),
+        },
+    }
+}
+
+/// The idempotency key of a request that may give it in its header and its
+/// body, which must agree.
+pub(super) fn one_idempotency_key(header: Option<String>, body: Option<String>) -> Result<Option<String>> {
+    match (header, body) {
+        (Some(h), Some(b)) if h != b => {
+            Err(Error::invalid("the Idempotency-Key header and the body's idempotency_key differ"))
+        }
+        (h, b) => Ok(h.or(b)),
+    }
+}
+
 pub(super) fn commit_hex(id: u64) -> String {
     format!("{id:016x}")
 }

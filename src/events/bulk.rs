@@ -69,7 +69,7 @@ impl Buffers {
         let (tx, rx) = oneshot::channel();
         let slot = Slot { rows, commit_id, deadline, tx };
         if bytes >= self.cfg.max_bytes || self.cfg.wait_ms == 0 {
-            self.flush(db, schema, vec![slot]).await;
+            self.spawn_flush(db, schema, vec![slot]);
         } else {
             let key = (db.id.clone(), schema.id);
             let mut full = None;
@@ -109,12 +109,12 @@ impl Buffers {
                         }
                     };
                     if let Some(b) = b {
-                        me.flush(b.db, b.schema, b.slots).await;
+                        me.spawn_flush(b.db, b.schema, b.slots);
                     }
                 });
             }
             if let Some(b) = full {
-                self.flush(b.db, b.schema, b.slots).await;
+                self.spawn_flush(b.db, b.schema, b.slots);
             }
         }
         rx.await.map_err(|_| Error::Unavailable {
@@ -122,6 +122,13 @@ impl Buffers {
             retry_after_ms: Some(500),
             outcome_unknown: true,
         })?
+    }
+
+    /// Flushes `slots` in a task of its own, so that a cancelled request
+    /// does not cancel the flush of the requests buffered with it.
+    fn spawn_flush(self: &Arc<Self>, db: Arc<Db>, schema: EventSchema, slots: Vec<Slot>) {
+        let me = self.clone();
+        db.shared().env.clone().spawn(async move { me.flush(db, schema, slots).await });
     }
 
     /// Stages the slots' rows as parts and binds them, answering each slot.

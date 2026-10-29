@@ -772,8 +772,6 @@ pub struct Written {
     pub meta_len: u64,
     pub raw_size: u64,
     pub rows: u64,
-    pub min_key: Bytes,
-    pub max_key: Bytes,
     pub chunk_bytes: u64,
 }
 
@@ -884,16 +882,7 @@ pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_
         let n = whole.len();
         sink.shared.cache.insert(CacheKey::part(sink.db, &sink.id, WHOLE, 0), CacheVal::Any(Arc::new(whole), n));
     }
-    Ok(Written {
-        size,
-        meta_off,
-        meta_len: encoded.len() as u64,
-        raw_size,
-        rows,
-        min_key: pk[0].clone(),
-        max_key: pk[pk.len() - 1].clone(),
-        chunk_bytes: sink.chunk_bytes,
-    })
+    Ok(Written { size, meta_off, meta_len: encoded.len() as u64, raw_size, rows, chunk_bytes: sink.chunk_bytes })
 }
 
 const META: u32 = u32::MAX;
@@ -1164,7 +1153,7 @@ pub fn inspect(
         Ok(stream.slice(off as usize..end as usize))
     };
     let meta = PartMeta::decode(&slice(r.meta_off, r.meta_len)?).map_err(|e| e.to_string())?;
-    if meta.rows != r.rows || meta.pk.first() != Some(&r.min_key) || meta.pk.last() != Some(&r.max_key) {
+    if meta.rows != r.rows {
         return Err(format!("part {} metadata does not match its reference", r.id));
     }
     let mut columns: BTreeMap<ColRef, Vector> = BTreeMap::new();

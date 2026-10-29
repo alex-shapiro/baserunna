@@ -85,6 +85,7 @@ pub fn error_from_json(status: u16, j: &Json) -> Error {
         "txn_not_found" => Error::TxnNotFound(m),
         "conflict" => Error::Conflict(m),
         "already_exists" => Error::AlreadyExists(m),
+        "aborted" => Error::Aborted(m),
         "precondition_failed" => {
             Error::PreconditionFailed { message: m, op_index: e["details"]["op_index"].as_u64().map(|i| i as usize) }
         }
@@ -102,6 +103,7 @@ pub fn error_from_json(status: u16, j: &Json) -> Error {
                 outcome_unknown: e["details"]["outcome"] == "unknown",
             },
         },
+        "internal" => Error::Internal(m),
         _ => Error::Internal(format!("{status}: {m}")),
     }
 }
@@ -1051,6 +1053,56 @@ mod tests {
             assert!(!finishes("POST", "/v1/dbs/app/transactions/x/y/z/commit").await);
             assert!(!finishes("DELETE", "/v1/dbs/app/transactions/x/y").await);
         });
+    }
+
+    /// Every error survives a forward: its JSON form parses back to an error
+    /// with the same JSON form and status.
+    #[test]
+    fn errors_round_trip_through_json() {
+        let m = || "m".to_string();
+        let all = [
+            Error::InvalidArgument(m()),
+            Error::Unauthenticated(m()),
+            Error::PermissionDenied(m()),
+            Error::NotFound(m()),
+            Error::TxnNotFound(m()),
+            Error::Conflict(m()),
+            Error::AlreadyExists(m()),
+            Error::Aborted(m()),
+            Error::PreconditionFailed { message: m(), op_index: Some(3) },
+            Error::PreconditionFailed { message: m(), op_index: None },
+            Error::TooLarge(m()),
+            Error::CursorExpired(m()),
+            Error::QuotaExceeded(m()),
+            Error::RateLimited { message: m(), retry_after_ms: 70 },
+            Error::NotOwner { holder: "n1".into(), retry_after_ms: 500 },
+            Error::Unavailable { message: m(), retry_after_ms: Some(500), outcome_unknown: true },
+            Error::Unavailable { message: m(), retry_after_ms: Some(500), outcome_unknown: false },
+            Error::Internal(m()),
+        ];
+        for e in &all {
+            // Fails to compile when a variant is added, so that it joins `all`.
+            match e {
+                Error::InvalidArgument(_)
+                | Error::Unauthenticated(_)
+                | Error::PermissionDenied(_)
+                | Error::NotFound(_)
+                | Error::TxnNotFound(_)
+                | Error::Conflict(_)
+                | Error::AlreadyExists(_)
+                | Error::Aborted(_)
+                | Error::PreconditionFailed { .. }
+                | Error::TooLarge(_)
+                | Error::CursorExpired(_)
+                | Error::QuotaExceeded(_)
+                | Error::RateLimited { .. }
+                | Error::NotOwner { .. }
+                | Error::Unavailable { .. }
+                | Error::Internal(_) => {}
+            }
+            let back = error_from_json(e.status(), &json!({"error": error_json(e)}));
+            assert_eq!((back.status(), error_json(&back)), (e.status(), error_json(e)), "{e:?} came back as {back:?}");
+        }
     }
 
     #[test]

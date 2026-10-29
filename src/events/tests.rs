@@ -1208,6 +1208,38 @@ mod storage {
             );
         });
     }
+
+    /// Dropping a table whose events are in parts removes its state, so a
+    /// bulk insert staged against the dropped table is refused instead of
+    /// binding parts that nothing can drop again.
+    #[test]
+    fn dropping_a_table_with_parts_refuses_later_binds() {
+        rt().block_on(async {
+            let (eng, _store, env) = engine(1, cfg());
+            env.spawn(async {});
+            let db = create_db(&eng, "d").await;
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let s = get_schema(&mut t, "events").await.unwrap();
+            let rows = [json!({"time": T0, "event": "a"})];
+            txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            assert!(maint::seal(&db, s.id).await.unwrap());
+            txn_do(&db, async |t| drop(t, "events").await).await.unwrap();
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let state_left = t.get(&ev::state_key(s.id)).await.unwrap().is_some();
+            let valid = validate_rows(&s, &rows, 0).unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            let bound = buffers().submit(db.clone(), s.clone(), valid, 77, deadline).await;
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let stale = refs(&mut t, s.id).await.unwrap().len();
+            let part_bytes = db.current().unwrap().m.part_bytes;
+            assert!(
+                !state_left && bound.is_err() && stale == 0 && part_bytes == 0,
+                "after the drop: state entry left {state_left}, bind {:?}, refs of the dropped table {stale}, \
+                 part_bytes {part_bytes}",
+                bound.map(|c| c.version)
+            );
+        });
+    }
 }
 
 /// A query that runs past its time limit stops with a retryable error
@@ -1793,6 +1825,66 @@ mod maintenance_limits {
             assert!(matches!(r, Err(Error::NotOwner { .. })), "{r:?}");
             let left = part_objects(&db).await - before;
             assert!(left <= 1, "merge outputs left in the store by a node without the lease: {left}");
+        });
+    }
+
+    /// A seal conflicts only with deletes of the rows it seals: an insert
+    /// committed while the seal writes its parts adds rows after them.
+    #[test]
+    fn a_seal_commits_despite_a_concurrent_insert() {
+        let mut outcomes = Vec::new();
+        for delay in [0u64, 1, 2, 5, 10, 15, 20, 30] {
+            rt().block_on(async {
+                let origin = tokio::time::Instant::now();
+                let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
+                let env2 = env.clone();
+                let mem = Arc::new(crate::store::MemStore::new(Box::new(move || env2.now_ms())));
+                let store = Arc::new(crate::sim::cost::MeteredStore::new(mem, 0));
+                let eng = Engine::new(store.clone(), env.clone(), cfg(), "node-a".into());
+                let db = create_db(&eng, "d").await;
+                let id = table_id(&db).await;
+                let rows: Vec<Json> = (0..20).map(|i| json!({"time": T0 + i, "event": "a"})).collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+                store.set_latency_ms(10);
+                let racer = async {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    let more = [json!({"time": T0 + 100, "event": "b"})];
+                    txn_do(&db, async |t| insert(t, "events", &more, 0).await).await.unwrap();
+                };
+                let (sealed, _) = tokio::join!(maint::seal(&db, id), racer);
+                outcomes.push((delay, sealed.map_err(|e| e.to_string())));
+            });
+        }
+        assert!(outcomes.iter().all(|(_, r)| *r == Ok(true)), "seals racing an insert: {outcomes:?}");
+    }
+
+    /// Events with long sort key values, each in its own day, inserted by
+    /// transactions within the default limits, can be sealed.
+    #[test]
+    fn events_with_long_sort_keys_can_be_sealed() {
+        rt().block_on(async {
+            let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let id = table_id(&db).await;
+            for batch in 0..3i64 {
+                let rows: Vec<Json> = (0..10i64)
+                    .map(|i| {
+                        let d = batch * 10 + i;
+                        json!({"time": T0 - (40 - d) * DAY, "event": format!("{}{d}", "x".repeat(400_000))})
+                    })
+                    .collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            }
+            let mut outcomes = Vec::new();
+            for _ in 0..5 {
+                let r = maint::seal(&db, id).await.map_err(|e| e.to_string());
+                outcomes.push(r.clone());
+                if r != Ok(true) {
+                    break;
+                }
+            }
+            assert_eq!(outcomes.last(), Some(&Ok(false)), "seals: {outcomes:?}");
         });
     }
 }

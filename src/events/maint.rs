@@ -80,7 +80,10 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
     }
     let avg = (st.unsealed_bytes / st.unsealed_rows).max(1) as usize;
     let limit = (cfg.event_insert_part_max_bytes / avg).max(1);
-    let items = txn.scan(&ev::rows(table), false, limit).await?;
+    // Only the sealed rows join the read set: rows inserted after the
+    // snapshot follow them, so they cannot conflict.
+    let snap = txn.untracked_snapshot().clone();
+    let items = snap.scan(&ev::rows(table), false, limit, txn.read_time).await?;
     let max_parts = refs_per_txn(cfg);
     let (mut bytes, mut rows, mut last) = (0u64, 0u64, None);
     let mut by_partition: BTreeMap<u32, Vec<PosRow>> = BTreeMap::new();
@@ -98,6 +101,7 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
         by_partition.entry(partition).or_default().push(PosRow { pos, row });
     }
     let Some(last) = last else { return Ok(false) };
+    txn.note_read(ev::rows_through(table, last));
     let mut written = Vec::new();
     for (partition, rows) in by_partition {
         for chunk in split_rows(rows, cfg.event_insert_part_max_bytes) {
@@ -118,7 +122,7 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
             txn.put(r.key(), Value::Inline(r.encode()))?;
             txn.event_op(EventOp::part_ref(None, Some(r.clone())))?;
         }
-        txn.event_op(EventOp::Forget { table, rows, bytes, sealed_through: Some(last) })?;
+        txn.event_op(EventOp::Forget { table, rows, bytes })?;
         db.commit(txn.into_request()).await
     };
     match committed.await {
@@ -186,8 +190,8 @@ pub fn tier(raw: u64, base: u64, k: u64) -> u32 {
 /// `min_age_to_force_merge_seconds`), so that backfilling old partitions
 /// is not merged after every insert.
 pub fn plan(s: &EventSchema, refs: &[PartRef], cfg: &crate::engine::EngineConfig, now_ms: i64) -> Option<Task> {
-    if let Some(r) = s.retention_ms {
-        let cutoff = now_ms.saturating_sub(r as i64);
+    if s.retention_ms.is_some() {
+        let cutoff = s.retained_from(now_ms);
         let expired: Vec<PartRef> =
             refs.iter().filter(|p| p.max_time < cutoff).take(refs_per_txn(cfg)).cloned().collect();
         if !expired.is_empty() {
@@ -722,8 +726,6 @@ async fn merge_parts(
         meta_len: w.meta_len,
         min_time,
         max_time,
-        min_key: w.min_key,
-        max_key: w.max_key,
         version: None,
         min_version,
         max_version,
@@ -926,7 +928,7 @@ pub async fn delete(db: &Arc<Db>, txn: &mut Txn, name: &str, from: i64, to: i64,
         }
     }
     if rows > 0 {
-        txn.event_op(EventOp::Forget { table: s.id, rows, bytes, sealed_through: None })?;
+        txn.event_op(EventOp::Forget { table: s.id, rows, bytes })?;
         count += rows;
     }
     let shared = db.shared().clone();

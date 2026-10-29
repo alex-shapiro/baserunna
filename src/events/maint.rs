@@ -772,7 +772,7 @@ pub async fn merge(db: &Arc<Db>, s: &EventSchema, inputs: &[PartRef]) -> Result<
         if let Some(o) = out {
             delete_parts(&shared, &db.id, [o.id]).await;
         }
-        return Err(Error::unavailable("the merge ran too long"));
+        return Err(Error::TooLarge(format!("the merge ran longer than {max_ms} ms")));
     }
     shared.env.crash_point().await;
     let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await?;
@@ -797,14 +797,16 @@ pub async fn merge(db: &Arc<Db>, s: &EventSchema, inputs: &[PartRef]) -> Result<
             probe::hit(Probe::PartsMerged);
             Ok(())
         }
-        Err(e @ Error::Conflict(_)) => {
-            probe::hit(Probe::MergeConflicted);
+        Err(e @ Error::Unavailable { outcome_unknown: true, .. }) => Err(e),
+        Err(e) => {
+            if matches!(e, Error::Conflict(_)) {
+                probe::hit(Probe::MergeConflicted);
+            }
             if let Some(o) = out {
                 delete_parts(&shared, &db.id, [o.id]).await;
             }
             Err(e)
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -824,9 +826,9 @@ pub async fn drop_expired(db: &Arc<Db>, parts: &[PartRef]) -> Result<()> {
 }
 
 /// Runs maintenance on table `table` until nothing is due, at most `rounds`
-/// steps. A merge that fails other than by a conflict is not planned again
-/// in this call, so it does not hold up the table's other merges; the first
-/// such error is returned at the end.
+/// steps. A merge too large to finish in time is not planned again in this
+/// call, so it does not hold up the table's other merges, and its error is
+/// returned at the end; other errors end maintenance at once.
 pub async fn maintain(db: &Arc<Db>, table: u32, rounds: usize) -> Result<()> {
     let shared = db.shared().clone();
     let mut failed: BTreeSet<String> = BTreeSet::new();
@@ -853,10 +855,11 @@ pub async fn maintain(db: &Arc<Db>, table: u32, rounds: usize) -> Result<()> {
             Some(Task::Drop(parts)) => drop_expired(db, &parts).await?,
             Some(Task::Merge(parts)) => match merge(db, &s, &parts).await {
                 Ok(()) | Err(Error::Conflict(_)) => {}
-                Err(e) => {
+                Err(e @ Error::TooLarge(_)) => {
                     failed.extend(parts.into_iter().map(|p| p.id));
                     first_error.get_or_insert(e);
                 }
+                Err(e) => return Err(e),
             },
         }
     }

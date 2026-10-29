@@ -851,11 +851,12 @@ skips parts whose dictionaries or statistics rule out a match, then granules
 by the primary index, statistics and blooms. It reads filter columns first
 (prewhere) and the rest only for granules with matches, then folds in the
 unsealed rows. Up to 32 parts are read at once, each into a partial result
-merged when its part is done; aggregates keep mergeable states and break
-ties by value, so the order parts finish in never changes an answer. A
-partial result holds at most 1/32 of the query's state limit; a part whose
-state outgrows that is read again into the merged result, which alone
-decides whether a query exceeds its limit. A part `GET` unanswered after 1 s is sent again, so one
+that holds at most 1/32 of the query's state limit, and partial results
+are merged in part order, so the merged result, which decides whether the
+query exceeds its limit, grows as it would if parts were read one at a
+time; a part whose state outgrows its share is read again into it at its
+turn. Aggregates keep mergeable states, so how parts were stored or merged
+never changes an answer. A part `GET` unanswered after 1 s is sent again, so one
 slow store request does not hold up a query. Parts are cached whole when
 small, otherwise by column block, so a warm query performs no store `GET`s.
 

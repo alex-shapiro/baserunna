@@ -1449,54 +1449,41 @@ async fn run_within(
             may
         })
         .collect();
-    let too_much_read = || {
-        (read_stats.bytes.load(Relaxed) > limits.max_bytes_read).then(|| {
-            Error::TooLarge(format!(
-                "the query read more than {} bytes; narrow its time range or filter",
-                limits.max_bytes_read
-            ))
-        })
-    };
     // Parts are read concurrently into partial results, each holding at most
-    // its share of the state limit, and merged as they finish; merges ignore
-    // order, so the answer is the same. A part whose groups outgrow its share
-    // is read again into the whole result once the others are merged, so the
-    // whole result alone decides whether the query is too large.
+    // its share of the state limit, and merged in part order, so the merged
+    // result grows as a serial read's would and the limit does not depend on
+    // which part arrives first. A part whose groups outgrow its share is
+    // read again into the merged result at its turn.
     let n = shared.cfg.event_read_concurrency.max(1);
     let share = limits.max_memory_bytes / n;
     let reads: Vec<_> = refs
         .iter()
-        .enumerate()
-        .map(|(i, r)| {
+        .map(|r| {
             let (mut partial, rd) = (Run::new(&plan, share), &rd);
             async move {
                 let read = match rd.meta(r).await {
                     Ok(meta) => partial.part(rd, r, meta).await,
                     Err(e) => Err(e),
                 };
-                (i, partial, read)
+                (partial, read)
             }
         })
         .collect();
-    let mut reads = stream::iter(reads).buffer_unordered(n);
-    let mut outgrown = Vec::new();
-    while let Some((i, partial, read)) = reads.next().await {
+    let mut reads = stream::iter(reads).buffered(n);
+    for r in &refs {
+        let (partial, read) = reads.next().await.ok_or_else(|| Error::internal("query reads ended early"))?;
         match read {
             Ok(()) => run.absorb(partial)?,
-            Err(Error::TooLarge(_)) if partial.groups.as_ref().is_some_and(Groups::full) => outgrown.push(i),
+            Err(Error::TooLarge(_)) if partial.groups.as_ref().is_some_and(Groups::full) => {
+                run.part(&rd, r, rd.meta(r).await?).await?;
+            }
             Err(e) => return Err(e),
         }
-        if let Some(e) = too_much_read() {
-            return Err(e);
-        }
-    }
-    drop(reads);
-    outgrown.sort_unstable();
-    for i in outgrown {
-        let r = refs[i];
-        run.part(&rd, r, rd.meta(r).await?).await?;
-        if let Some(e) = too_much_read() {
-            return Err(e);
+        if read_stats.bytes.load(Relaxed) > limits.max_bytes_read {
+            return Err(Error::TooLarge(format!(
+                "the query read more than {} bytes; narrow its time range or filter",
+                limits.max_bytes_read
+            )));
         }
     }
     run.unsealed(&input.unsealed)?;

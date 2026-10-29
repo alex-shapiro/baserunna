@@ -483,6 +483,9 @@ impl Txn {
 
     /// Inserts encoded rows into event table `table` at commit.
     pub fn insert_events(&mut self, table: u32, rows: Vec<Bytes>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         self.inserted += rows.len();
         if self.inserted > events::INSERT_MAX_ROWS {
             return Err(Error::TooLarge(format!("a transaction inserts at most {} events", events::INSERT_MAX_ROWS)));

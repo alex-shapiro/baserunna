@@ -1434,6 +1434,61 @@ mod partial_results {
             assert_eq!(many.map(|o| o.rows), Ok(one.unwrap().rows), "32 parts at a time");
         });
     }
+
+    /// Min over strings of `rows` sealed into one part per day, read by a
+    /// cold node whose first part `GET` (the earliest day's) stalls.
+    async fn min_event_by_user_with_slow_first_part(
+        rows: Vec<Json>,
+        cfg: EngineConfig,
+        max_memory_bytes: usize,
+    ) -> Result<exec::Output> {
+        let origin = tokio::time::Instant::now();
+        let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
+        let env2 = env.clone();
+        let mem = Arc::new(crate::store::MemStore::new(Box::new(move || env2.now_ms())));
+        let store = Arc::new(StallOnePartGet { inner: mem, armed: Default::default() });
+        let cfg = EngineConfig { cache_bytes: 64 << 20, event_get_hedge_ms: 0, ..cfg };
+        let eng = Engine::new(store.clone(), env.clone(), cfg.clone(), "node-a".into());
+        let db = create_db(&eng, "db").await;
+        txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+        let id = {
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            get_schema(&mut t, "events").await.unwrap().id
+        };
+        assert!(maint::seal(&db, id).await.unwrap());
+        eng.release_leases(std::time::Duration::from_secs(2)).await;
+        let cold = Engine::new(store.clone(), env, cfg, "node-b".into());
+        let db = cold.db("db");
+        db.open(true).await.unwrap();
+        store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let q = Query::parse(json!({"from": T0, "to": T0 + 64 * DAY, "group_by": ["user"],
+            "aggregates": {"m": {"fn": "min", "of": "event"}}}))
+        .unwrap();
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let s = get_schema(&mut t, "events").await.unwrap();
+        exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits { max_memory_bytes, ..Limits::default() }).await
+    }
+
+    /// Whether a min over strings fits its memory limit must not depend on
+    /// which part arrives first: day 0 holds a short minimum for each of 8
+    /// users, days 1..=8 a long non-minimal string for one user each.
+    #[test]
+    fn min_state_memory_limit_ignores_part_arrival_order() {
+        rt().block_on(async {
+            let mut rows: Vec<Json> =
+                (0..8).map(|u| json!({"time": T0, "event": "a", "user": format!("u{u}")})).collect();
+            rows.extend(
+                (0..8).map(|u| json!({"time": T0 + (u + 1) * DAY, "event": "b".repeat(600), "user": format!("u{u}")})),
+            );
+            let want: Vec<Vec<Json>> = (0..8).map(|u| vec![json!(format!("u{u}")), json!("a")]).collect();
+            let serial = EngineConfig { event_read_concurrency: 1, ..cfg() };
+            let one = min_event_by_user_with_slow_first_part(rows.clone(), serial, 3000).await;
+            assert_eq!(one.map(|o| o.rows), Ok(want.clone()), "one part at a time");
+            let four = EngineConfig { event_read_concurrency: 4, ..cfg() };
+            let many = min_event_by_user_with_slow_first_part(rows, four, 3000).await;
+            assert_eq!(many.map(|o| o.rows), Ok(want), "4 parts at a time, first part slow");
+        });
+    }
 }
 
 /// A merge reads each small input part once, though it reads every column
@@ -1688,6 +1743,56 @@ mod maintenance_limits {
             let b = ev::partition_key(T0 / DAY - 9);
             let in_b = refs(&mut t, id).await.unwrap().iter().filter(|r| r.partition == b).count();
             assert_eq!(in_b, 1, "partition B was never merged; maintenance: {errors:?}");
+        });
+    }
+
+    /// Inserting no events leaves nothing a later read could miss.
+    #[test]
+    fn an_empty_insert_does_not_refuse_later_queries() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            assert_eq!(insert(&mut t, "events", &[], 0).await.unwrap(), 0);
+            let s = get_schema(&mut t, "events").await.unwrap();
+            let q = Query::parse(json!({"from": 0, "to": T0, "aggregates": {"n": {"fn": "count"}}})).unwrap();
+            let r = exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits::default()).await.map(|o| o.rows);
+            assert_eq!(r, Ok(vec![vec![json!(0)]]));
+        });
+    }
+
+    /// Maintenance on a node that no longer holds the lease stops at the
+    /// first merge that cannot commit, rather than running (and leaving the
+    /// output of) a merge in every partition.
+    #[test]
+    fn maintenance_without_the_lease_stops_after_one_merge() {
+        rt().block_on(async {
+            let origin = tokio::time::Instant::now();
+            let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
+            let env2 = env.clone();
+            let mem = Arc::new(crate::store::MemStore::new(Box::new(move || env2.now_ms())));
+            let store = Arc::new(crate::sim::cost::MeteredStore::new(mem, 0));
+            let a = Engine::new(store.clone(), env.clone(), cfg(), "node-a".into());
+            let db = create_db(&a, "d").await;
+            let id = table_id(&db).await;
+            for k in 0..3i64 {
+                let rows: Vec<Json> = (0..6).map(|d| json!({"time": T0 - (d + 2) * DAY + k, "event": "a"})).collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+                assert!(maint::seal(&db, id).await.unwrap());
+            }
+            assert_eq!(part_count(&db).await, 18);
+            let before = part_objects(&db).await;
+            let b = Engine::new(store.clone(), env.clone(), cfg(), "node-b".into());
+            let db_b = b.db("d");
+            db_b.open(false).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let mut t = db_b.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            t.put(Bytes::from_static(b"k"), crate::engine::Value::Inline(Bytes::from_static(b"v"))).unwrap();
+            db_b.commit(t.into_request()).await.unwrap();
+            let r = maint::maintain(&db, id, 64).await;
+            assert!(matches!(r, Err(Error::NotOwner { .. })), "{r:?}");
+            let left = part_objects(&db).await - before;
+            assert!(left <= 1, "merge outputs left in the store by a node without the lease: {left}");
         });
     }
 }

@@ -207,46 +207,58 @@ fn op_over(op: &str, target: &str, body: Value) -> Value {
 }
 
 fn row_query() -> Value {
-    obj_desc(json!({
-        "index": s(), "eq": arr(any()),
-        "range": obj(json!({"gt": any(), "gte": any(), "lt": any(), "lte": any()}), &[]),
-        "filter": r("Filter"),
-        "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-        "reverse": b(), "cursor": s(),
-        "consistency": enum_of(&["strong", "snapshot"]),
-        "max_staleness_ms": i(),
-    }), &[], "Scans the primary key (default) or a secondary index (`index`) using an equality prefix (`eq`), \
-        an optional range bound on the next column, a residual `filter`, and pagination via `cursor`.")
+    obj_desc(
+        json!({
+            "index": s(), "eq": arr(any()),
+            "range": obj(json!({"gt": any(), "gte": any(), "lt": any(), "lte": any()}), &[]),
+            "filter": r("Filter"),
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "reverse": b(), "cursor": s(),
+            "consistency": enum_of(&["strong", "snapshot"]),
+            "max_staleness_ms": i(),
+        }),
+        &[],
+        "Scans the primary key (default) or a secondary index (`index`) using an equality prefix (`eq`), \
+        an optional range bound on the next column, a residual `filter`, and pagination via `cursor`.",
+    )
 }
 
 fn stream_read() -> Value {
-    obj_desc(json!({
-        "from_seq": i(), "from_time": i(), "tail": i(), "consumer": s(), "until_seq": i(), "until_time": i(),
-        "reverse": b(), "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 16 << 20}, "filter": r("StreamFilter"),
-        "scan_limit": {"type": "integer", "minimum": 1, "maximum": 100_000},
-        "encoding": enum_of(&["utf8", "base64"]), "consistency": enum_of(&["strong", "snapshot"]),
-        "max_staleness_ms": i(),
-    }), &[], "Reads records starting from at most one of `from_seq`, `from_time` (first record at or after the timestamp), \
+    obj_desc(
+        json!({
+            "from_seq": i(), "from_time": i(), "tail": i(), "consumer": s(), "until_seq": i(), "until_time": i(),
+            "reverse": b(), "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 16 << 20}, "filter": r("StreamFilter"),
+            "scan_limit": {"type": "integer", "minimum": 1, "maximum": 100_000},
+            "encoding": enum_of(&["utf8", "base64"]), "consistency": enum_of(&["strong", "snapshot"]),
+            "max_staleness_ms": i(),
+        }),
+        &[],
+        "Reads records starting from at most one of `from_seq`, `from_time` (first record at or after the timestamp), \
         `tail` (last N records), or `consumer` (consumer cursor, starting at `first_seq` if unset), up to \
         `until_seq` or `until_time` (exclusive). Returns records oldest-first (or newest-first when `reverse` is true), \
         bounded by `limit` (default 100) and `max_bytes` (default 4 MiB, max 16 MiB). When `filter` is set, at most \
-        `scan_limit` records (default 10,000) are scanned.")
+        `scan_limit` records (default 10,000) are scanned.",
+    )
 }
 
 fn event_query() -> Value {
-    obj_desc(json!({
-        "from": r("Time"), "to": r("Time"), "where": r("EventFilter"), "lookups": {"type": "object"},
-        "columns": arr(any()), "group_by": arr(any()), "aggregates": {"type": "object"}, "then": {"type": "object"},
-        "order_by": arr(any()), "limit": i(), "cursor": s(),
-        "consistency": enum_of(&["strong", "snapshot"]), "max_staleness_ms": i(),
-    }), &["from", "to"], "A query over `[from, to)` of the time column: rows (`columns`, every column when \
+    obj_desc(
+        json!({
+            "from": r("Time"), "to": r("Time"), "where": r("EventFilter"), "lookups": {"type": "object"},
+            "columns": arr(any()), "group_by": arr(any()), "aggregates": {"type": "object"}, "then": {"type": "object"},
+            "order_by": arr(any()), "limit": i(), "cursor": s(),
+            "consistency": enum_of(&["strong", "snapshot"]), "max_staleness_ms": i(),
+        }),
+        &["from", "to"],
+        "A query over `[from, to)` of the time column: rows (`columns`, every column when \
         omitted, with `order_by` and `cursor`, 100 per page by default) or aggregates (`group_by` and `aggregates`, \
         with an optional second stage `then`). Expressions are a column name, `{col, path?}`, `{lookup}` or \
         `{bucket, interval, offset?}`; aggregates are count, sum, min, max, avg, uniq, uniq_exact, quantiles, \
         window_funnel and retention, each with an optional `where`. Aggregates answer with the first `limit` groups \
         by `order_by`, or without a `limit` with every group, failing with 413 past 100,000. Queries read a \
-        snapshot at most 5 s old unless `consistency` is `strong`.")
+        snapshot at most 5 s old unless `consistency` is `strong`.",
+    )
 }
 
 fn schemas() -> Value {

@@ -63,6 +63,34 @@ fn replayed_bulk_insert_reports_the_original_count() {
     });
 }
 
+/// JSON integers that `serde_json` would round to a float are refused on
+/// every insert path rather than stored rounded; floats that large are kept.
+#[test]
+fn integers_beyond_64_bits_are_refused_not_rounded() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        let (s, r) =
+            send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/columns", &[], r#"{"name": "p", "type": "json"}"#).await;
+        assert_eq!(s, 200, "{r}");
+        let ndjson = [("content-type", "application/x-ndjson")];
+        for n in ["9223372036854775808", "18446744073709551616", "-9223372036854775809"] {
+            let event = format!(r#"{{"event": "a", "time": 1000, "p": {{"id": {n}}}}}"#);
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], &format!("[{event}]")).await;
+            assert_eq!(s, 400, "bulk {n}: {r}");
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &ndjson, &event).await;
+            assert_eq!(s, 400, "NDJSON {n}: {r}");
+            let txn = format!(r#"{{"ops": [{{"op": "insert_events", "table": "ev", "rows": [{event}]}}]}}"#);
+            let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/txn", &[], &txn).await;
+            assert_eq!(s, 400, "txn {n}: {r}");
+        }
+        assert_eq!(count(&w, 0, &t).await, json!(0));
+        let (s, r) =
+            send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], r#"[{"time": 1000, "p": {"x": 1e19}}]"#).await;
+        assert_eq!(s, 201, "{r}");
+        w.shutdown();
+    });
+}
+
 #[test]
 fn bulk_insert_refuses_a_key_used_by_a_transaction() {
     run_paused(async {

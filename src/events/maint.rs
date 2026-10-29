@@ -7,7 +7,7 @@
 //! with another merge of the same parts) fails validation and is retried
 //! from a new snapshot, and its outputs are deleted at once.
 
-use super::build::{PathPlan, PosRow, dictionary, plan_paths, write_rows};
+use super::build::{PathPlan, dictionary, plan_paths, write_encoded};
 use super::json::{self, JType};
 use super::part::{self, Caching, ColPlan, ColRef, PartMeta, ReadStats, Reading, SharedPath, Sink, Source};
 use super::query::Filter;
@@ -86,7 +86,7 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
     let items = snap.scan(&ev::rows(table), false, limit, txn.read_time).await?;
     let max_parts = refs_per_txn(cfg);
     let (mut bytes, mut rows, mut last) = (0u64, 0u64, None);
-    let mut by_partition: BTreeMap<u32, Vec<PosRow>> = BTreeMap::new();
+    let mut by_partition: BTreeMap<u32, Vec<(Pos, &[u8])>> = BTreeMap::new();
     for it in &items {
         let (_, pos) = ev::parse_row_key(&it.key).ok_or_else(|| Error::internal("bad unsealed row key"))?;
         let Value::Inline(b) = &it.value else { return Err(Error::internal("unsealed row stored out of line")) };
@@ -98,23 +98,18 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
         bytes += (it.key.len() + b.len()) as u64;
         rows += 1;
         last = Some(pos);
-        by_partition.entry(partition).or_default().push(PosRow { pos, row });
+        by_partition.entry(partition).or_default().push((pos, b));
     }
     let Some(last) = last else { return Ok(false) };
     txn.note_read(ev::rows_through(table, last));
-    let mut written = Vec::new();
+    let mut parts = Vec::new();
     for (partition, rows) in by_partition {
-        for chunk in split_rows(rows, cfg.event_insert_part_max_bytes) {
-            let r = write_rows(&shared, &db.id, &s, partition, chunk, true).await;
-            match r {
-                Ok((r, _)) => written.push(r),
-                Err(e) => {
-                    delete_parts(&shared, &db.id, written.into_iter().map(|r| r.id)).await;
-                    return Err(e);
-                }
-            }
+        if let Err(e) = write_encoded(&shared, &db.id, &s, partition, rows.into_iter(), true, &mut parts).await {
+            delete_parts(&shared, &db.id, parts.into_iter().map(|(r, _)| r.id)).await;
+            return Err(e);
         }
     }
+    let written: Vec<PartRef> = parts.into_iter().map(|(r, _)| r).collect();
     shared.env.crash_point().await;
     let committed = async {
         txn.delete_range(ev::rows_through(table, last))?;
@@ -139,25 +134,6 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
             Err(e)
         }
     }
-}
-
-/// Splits rows into groups of about `max` encoded bytes.
-pub fn split_rows(rows: Vec<PosRow>, max: usize) -> Vec<Vec<PosRow>> {
-    let mut out = vec![Vec::new()];
-    let mut bytes = 0;
-    for r in rows {
-        let n = crate::table::schema::encode_row(&r.row).len() + 12;
-        if bytes + n > max && out.last().is_some_and(|v: &Vec<PosRow>| !v.is_empty()) {
-            out.push(Vec::new());
-            bytes = 0;
-        }
-        bytes += n;
-        if let Some(last) = out.last_mut() {
-            last.push(r);
-        }
-    }
-    out.retain(|v| !v.is_empty());
-    out
 }
 
 /// Work the merge planner chose for one partition.
@@ -1073,7 +1049,6 @@ pub async fn delete(db: &Arc<Db>, txn: &mut Txn, name: &str, from: i64, to: i64,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::table::schema::Datum;
 
     #[test]
     fn tiers_grow_by_the_fan_in() {
@@ -1086,12 +1061,20 @@ mod tests {
     }
 
     #[test]
-    fn rows_split_by_size() {
-        let row =
-            |i: u32| PosRow { pos: Pos { version: 1, ordinal: i }, row: [(1, Datum::Str("x".repeat(100)))].into() };
-        let groups = split_rows((0..10).map(row).collect(), 350);
-        assert!(groups.len() >= 3 && groups.iter().all(|g| !g.is_empty()));
-        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), 10);
-        assert_eq!(split_rows(vec![row(0)], 1).len(), 1, "a row larger than the limit is a part of its own");
+    fn rows_split_by_size_and_count() {
+        use super::super::build::{PART_BUILD_ROWS, next_part};
+        let row = [b'x'; 100];
+        let rows = |n: u32| (0..n).map(|i| (Pos { version: 1, ordinal: i }, &row[..]));
+        let groups = |n: u32, max: usize| {
+            let mut it = rows(n).peekable();
+            let mut out = Vec::new();
+            while it.peek().is_some() {
+                out.push(next_part(&mut it, max).len());
+            }
+            out
+        };
+        assert_eq!(groups(10, 350), [3, 3, 3, 1]);
+        assert_eq!(groups(1, 1), [1], "a row larger than the limit is a part of its own");
+        assert_eq!(groups(PART_BUILD_ROWS as u32 * 2 + 1, usize::MAX), [PART_BUILD_ROWS, PART_BUILD_ROWS, 1]);
     }
 }

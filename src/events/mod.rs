@@ -28,7 +28,7 @@ use crate::engine::events::{self as ev, EventOp, PartRef, TableState};
 use crate::engine::{KeyRange, ReadValue, Txn, Value};
 use crate::error::{Error, Result};
 use crate::table::SPACE_CATALOG;
-use crate::table::schema::{Datum, Row, encode_row};
+use crate::table::schema::{Datum, encode_row};
 use bytes::Bytes;
 use schema::{EvColumn, EvType, EventSchema, Granularity, SkipIndex};
 use serde::Deserialize;
@@ -240,41 +240,88 @@ pub async fn set_retention(txn: &mut Txn, table: &str, retention_ms: Option<u64>
     Ok(s)
 }
 
-/// Validates JSON rows against `s`, normalizing JSON objects.
-pub fn validate_rows(s: &EventSchema, rows: &[Json], now_ms: i64) -> Result<Vec<Row>> {
-    rows.iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let mut row = s.row(v, now_ms).map_err(|e| match e {
-                Error::InvalidArgument(m) => Error::invalid(format!("event {i}: {m}")),
-                o => o,
-            })?;
-            for d in row.values_mut() {
-                if let Datum::Json(j) = d {
-                    json::normalize(j).map_err(|m| Error::invalid(format!("event {i}: {m}")))?;
-                }
+/// Events validated against their table and encoded for storage, in one
+/// buffer, so that a request holds about its encoded size.
+#[derive(Clone, Debug, Default)]
+pub struct ValidRows {
+    data: Vec<u8>,
+    /// Each row's partition and end in `data`.
+    rows: Vec<(u32, u32)>,
+}
+
+impl ValidRows {
+    /// Validates event `v`, normalizing its JSON objects, and appends it.
+    pub fn push(&mut self, s: &EventSchema, v: &Json, now_ms: i64) -> Result<()> {
+        let i = self.rows.len();
+        let mut row = s.row(v, now_ms).map_err(|e| match e {
+            Error::InvalidArgument(m) => Error::invalid(format!("event {i}: {m}")),
+            o => o,
+        })?;
+        for d in row.values_mut() {
+            if let Datum::Json(j) = d {
+                json::normalize(j).map_err(|m| Error::invalid(format!("event {i}: {m}")))?;
             }
-            if encode_row(&row).len() > schema::ROW_MAX_BYTES {
-                return Err(Error::TooLarge(format!("event {i} exceeds {} bytes", schema::ROW_MAX_BYTES)));
-            }
-            if build::stored_len(&row) > schema::ROW_STORED_MAX_BYTES {
-                return Err(Error::TooLarge(format!(
-                    "event {i}'s JSON flattens to more than {} bytes of paths and values",
-                    schema::ROW_STORED_MAX_BYTES
-                )));
-            }
-            Ok(row)
-        })
-        .collect()
+        }
+        let encoded = encode_row(&row);
+        if encoded.len() > schema::ROW_MAX_BYTES {
+            return Err(Error::TooLarge(format!("event {i} exceeds {} bytes", schema::ROW_MAX_BYTES)));
+        }
+        if build::stored_len(&row) > schema::ROW_STORED_MAX_BYTES {
+            return Err(Error::TooLarge(format!(
+                "event {i}'s JSON flattens to more than {} bytes of paths and values",
+                schema::ROW_STORED_MAX_BYTES
+            )));
+        }
+        self.data.extend_from_slice(&encoded);
+        let end = u32::try_from(self.data.len()).map_err(|_| Error::TooLarge("too many events".into()))?;
+        self.rows.push((ev::partition_key(s.bucket(s.time_of(&row))), end));
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Bytes the rows hold, counting each row's bookkeeping.
+    pub fn bytes(&self) -> usize {
+        self.data.len() + 12 * self.rows.len()
+    }
+
+    /// Row `i`'s partition and encoding.
+    pub fn get(&self, i: usize) -> (u32, &[u8]) {
+        let start = if i == 0 { 0 } else { self.rows[i - 1].1 as usize };
+        let (p, end) = self.rows[i];
+        (p, &self.data[start..end as usize])
+    }
+
+    /// Each row's partition and encoding.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &[u8])> {
+        (0..self.rows.len()).map(|i| self.get(i))
+    }
+}
+
+/// Validates JSON rows against `s`; see [`ValidRows::push`].
+pub fn validate_rows(s: &EventSchema, rows: &[Json], now_ms: i64) -> Result<ValidRows> {
+    let mut out = ValidRows::default();
+    for v in rows {
+        out.push(s, v, now_ms)?;
+    }
+    Ok(out)
 }
 
 /// Inserts JSON rows into table `name` at commit, returning how many.
 pub async fn insert(txn: &mut Txn, name: &str, rows: &[Json], now_ms: i64) -> Result<usize> {
+    if rows.len() > ev::INSERT_MAX_ROWS {
+        return Err(Error::TooLarge(format!("a transaction inserts at most {} events", ev::INSERT_MAX_ROWS)));
+    }
     let s = get_schema(txn, name).await?;
     let rows = validate_rows(&s, rows, now_ms)?;
-    let n = rows.len();
-    txn.insert_events(s.id, rows.iter().map(|r| Bytes::from(encode_row(r))).collect())?;
-    Ok(n)
+    txn.insert_events(s.id, rows.iter().map(|(_, r)| Bytes::copy_from_slice(r)).collect())?;
+    Ok(rows.len())
 }
 
 /// The JSON description of a table and its storage.

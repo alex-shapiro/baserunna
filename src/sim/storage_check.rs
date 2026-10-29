@@ -117,6 +117,11 @@ impl Sim {
                     let r =
                         crate::engine::events::ref_of(e).ok_or_else(|| format!("db {db}: corrupt part reference"))?;
                     part_bytes += r.stored_bytes();
+                    for id in std::iter::once(r.id.as_str()).chain(r.mask_object()) {
+                        if m.obsolete.iter().any(|o| o.id == id) {
+                            return Err(format!("db {db}: part {} names object {id}, which awaits deletion", r.id));
+                        }
+                    }
                     let live = check_part(&self.mem, db, &r)?;
                     rep.parts += 1;
                     live.into_iter().map(|p| ((r.table, p), format!("part {}", r.id))).collect()

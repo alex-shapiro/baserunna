@@ -106,6 +106,15 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       Reserve query memory through the node's `MemoryGate`, and share query
       slots fairly among users (`Node::query_slot` is first come, first
       served).
+- [ ] **Stream `/txn` bodies.** A transaction's body is parsed whole into
+      JSON values, so 32 MiB of tiny `insert_events` rows briefly holds
+      gigabytes before `INSERT_MAX_ROWS` refuses them. Bulk inserts stream
+      their bodies (`api::events::each_event`), and their buffers are not
+      charged to the node memory budget either.
+- [ ] **Re-check retention when dropping expired parts.** `drop_expired`
+      drops the parts its plan chose without reading the table's retention
+      again, so clearing retention while a drop is in flight still drops
+      them.
 - [ ] **Bound event query reads while parts are in flight.** The 4 GiB read
       limit is checked between absorbed parts, so up to
       `event_read_concurrency` concurrent part reads can overshoot it.

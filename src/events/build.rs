@@ -30,6 +30,56 @@ pub fn stored_len(row: &Row) -> usize {
     encode_row(row).len() + 12 + flat
 }
 
+/// The most rows decoded at once to write a part, which bounds the memory
+/// of seals and bulk inserts whatever their events' sizes.
+pub const PART_BUILD_ROWS: usize = 32_768;
+
+/// Takes from `rows` the next part's: about `max_bytes` of encodings and at
+/// most [`PART_BUILD_ROWS`] rows, at least one.
+pub fn next_part<'a>(
+    rows: &mut std::iter::Peekable<impl Iterator<Item = (Pos, &'a [u8])>>,
+    max_bytes: usize,
+) -> Vec<(Pos, &'a [u8])> {
+    let (mut group, mut bytes) = (Vec::new(), 0);
+    while let Some((_, r)) = rows.peek() {
+        let n = r.len() + 12;
+        if !group.is_empty() && (bytes + n > max_bytes || group.len() >= PART_BUILD_ROWS) {
+            break;
+        }
+        bytes += n;
+        group.extend(rows.next());
+    }
+    group
+}
+
+/// Writes the encoded `rows` of one partition as level 0 parts, decoding
+/// one part's rows at a time, and appends each part and the positions of
+/// its rows, in its order, to `out`.
+pub async fn write_encoded<'a>(
+    shared: &Shared,
+    db: &str,
+    schema: &EventSchema,
+    partition: u32,
+    rows: impl Iterator<Item = (Pos, &'a [u8])> + Send,
+    versions: bool,
+    out: &mut Vec<(PartRef, Vec<Pos>)>,
+) -> Result<()> {
+    let mut rows = rows.peekable();
+    while rows.peek().is_some() {
+        let decoded = next_part(&mut rows, shared.cfg.event_insert_part_max_bytes)
+            .into_iter()
+            .map(|(pos, r)| {
+                let row = crate::table::schema::decode_row(r)
+                    .map_err(|_| crate::error::Error::internal("corrupt event row"))?;
+                Ok(PosRow { pos, row })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (part, src) = write_rows(shared, db, schema, partition, decoded, versions).await?;
+        out.push((part, src.sorted().iter().map(|r| r.pos).collect()));
+    }
+    Ok(())
+}
+
 /// A row to write: its position and values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PosRow {

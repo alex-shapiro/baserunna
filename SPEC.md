@@ -464,9 +464,10 @@ tail: [Entry]                                         sorted by key, newest valu
 range_deletes: [(start, end?, seq)]                   range tombstones (§5.5)
 tombstone_horizon: u64                                tombstones with seq <= horizon may have been purged
 version_times: [(version, store_ms)]                  sparse samples (≥30 s apart) for time-based policies
-obsolete: [(kind, id, since_store_ms)]                segments, levels objects and blobs awaiting deletion
+obsolete: [(kind, id, since_store_ms)]                segments, levels objects, blobs and parts awaiting deletion
 blob_bytes: {bound, swept, swept_at}                  blob bytes for the size quota (§5.10)
 chunk_bytes: {bound, swept, swept_at}                 sealed stream chunk bytes, likewise (§5.11)
+part_bytes: u64                                       bytes of referenced event parts and masks (§5.13)
 flush_seq: u64                                        incremented by every tail flush (§5.5)
 ```
 
@@ -943,7 +944,7 @@ output.
 - Blind-write transactions never conflict, appends included.
 - Reads within a transaction see its own earlier writes, except appends and
   inserted events: since events get their positions at commit, a
-  transaction that inserts into an event table cannot also query it or
+  transaction that has inserted into an event table cannot then query it or
   delete from it (`400`).
 - Limits: `txn_max_ops` 10,000; `txn_max_write_bytes` 16 MiB, where blobs
   count only their descriptor; `txn_max_read_bytes` 16 MiB of keys and key

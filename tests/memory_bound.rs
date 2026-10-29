@@ -11,10 +11,26 @@ use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
 struct CountingAllocator;
 
 static ALLOCATED_BYTES: AtomicIsize = AtomicIsize::new(0);
+/// The most bytes allocated at once since [`reset_peak`].
+static PEAK_BYTES: AtomicIsize = AtomicIsize::new(0);
+
+fn grew(by: isize) {
+    let now = ALLOCATED_BYTES.fetch_add(by, Relaxed) + by;
+    PEAK_BYTES.fetch_max(now, Relaxed);
+}
+
+/// Tests take turns, so that one's allocations do not count toward another's peak.
+static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn reset_peak() -> isize {
+    let now = ALLOCATED_BYTES.load(Relaxed);
+    PEAK_BYTES.store(now, Relaxed);
+    now
+}
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        ALLOCATED_BYTES.fetch_add(l.size() as isize, Relaxed);
+        grew(l.size() as isize);
         unsafe { System.alloc(l) }
     }
 
@@ -24,7 +40,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        ALLOCATED_BYTES.fetch_add(n as isize - l.size() as isize, Relaxed);
+        grew(n as isize - l.size() as isize);
         unsafe { System.realloc(p, l, n) }
     }
 }
@@ -164,11 +180,51 @@ async fn opening_many_databases_stays_within_the_budget(w: &World) {
 
 #[test]
 fn memory_charges_bound_real_heap_use() {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
     rt.block_on(async {
         baserunna::log::set_level(Some(baserunna::log::Level::Warn));
         let w = World::new();
         charges_cover_decoded_manifests(&w).await;
         opening_many_databases_stays_within_the_budget(&w).await;
+    });
+}
+
+/// A bulk insert holds memory near its body's size while it is parsed,
+/// buffered and written as parts, however small its events are.
+#[test]
+fn bulk_inserts_hold_memory_near_their_body_size() {
+    use baserunna::sim::cost::{World, call_router, run_paused};
+    use tower::ServiceExt;
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    run_paused(async {
+        let w = World::new(1, 0).await;
+        let t = w.signup(0, "mem@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let router = w.node(0).router().unwrap();
+        let table = r#"{"name": "ev", "columns": [{"name": "time", "type": "time", "default": "now"},
+            {"name": "event", "type": "string"}], "time_column": "time", "order_by": ["event", "time"]}"#;
+        let r = call_router(&router, "POST", "/v1/dbs/d/events", &t, Bytes::from(table)).await;
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        let line = "{\"event\":\"a\"}\n";
+        let body = line.repeat((32 * MIB) / line.len() - 10);
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("/v1/dbs/d/events/ev/rows")
+            .header("authorization", format!("Bearer {t}"))
+            .header("content-type", "application/x-ndjson")
+            .body(axum::body::Body::from(body.clone()))
+            .unwrap();
+        let before = reset_peak();
+        let resp = router.oneshot(req).await.unwrap();
+        let grown = PEAK_BYTES.load(Relaxed) - before;
+        assert_eq!(resp.status(), 201);
+        assert!(
+            grown < 8 * body.len() as isize,
+            "a {} byte bulk insert of tiny events grew the heap by {grown} bytes ({}x its body)",
+            body.len(),
+            grown / body.len() as isize
+        );
+        w.shutdown();
     });
 }

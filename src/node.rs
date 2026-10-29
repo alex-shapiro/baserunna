@@ -764,10 +764,11 @@ impl Node {
                     break;
                 }
             }
-            if let Some(holder) = sys.lease_holder()
-                && holder != self.id
-                && let Some(addr) = self.addr_of(&holder).filter(|a| *a != self.cfg.addr)
-            {
+            let forward_to = match sys.lease_holder().filter(|h| *h != self.id) {
+                Some(h) => self.addr_of_or_refresh(&h).await.filter(|a| *a != self.cfg.addr).map(|a| (a, h)),
+                None => None,
+            };
+            if let Some((addr, holder)) = forward_to {
                 crate::probe::hit(crate::probe::Probe::MetaForwarded);
                 match self.forward_meta(&holder, &addr, &cmd, deadline).await {
                     Ok(r) => return Ok(r),
@@ -784,6 +785,11 @@ impl Node {
                     }
                     Err(Ok(e @ Error::Unavailable { outcome_unknown: false, .. })) => {
                         last_err = e;
+                        continue;
+                    }
+                    Err(Ok(e @ Error::NotOwner { .. })) => {
+                        last_err = e;
+                        let _ = sys.refresh(Instant::now(), false).await;
                         continue;
                     }
                     Err(Ok(e)) => return Err(e),

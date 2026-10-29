@@ -908,18 +908,36 @@ pub struct ReadStats {
     pub bytes: AtomicU64,
 }
 
+/// Decoded part data one read keeps to itself.
+pub type Memo = std::sync::Mutex<std::collections::HashMap<CacheKey, CacheVal>>;
+
+/// How reads of parts use the caches.
+pub enum Caching<'a> {
+    /// Fill the node's cache with what is fetched.
+    Shared,
+    /// Read the node's cache without filling it, as a merge does since it
+    /// reads its inputs once; metadata, indexes and whole small parts, which
+    /// the read fetches again for each column, are kept in the memo.
+    Private(&'a Memo),
+}
+
 /// How reads of parts use the caches.
 pub struct Reading<'a> {
     pub shared: &'a Shared,
     pub db: &'a str,
-    /// Populate caches with what is fetched; merges read without polluting them.
-    pub cache: bool,
+    pub cache: Caching<'a>,
     pub stats: &'a ReadStats,
 }
 
 impl Reading<'_> {
     fn cached<T: Send + Sync + 'static>(&self, k: &CacheKey) -> Option<Arc<T>> {
-        let v = if self.cache { self.shared.cache.get(k) } else { self.shared.cache.peek(k) };
+        let v = match self.cache {
+            Caching::Shared => self.shared.cache.get(k),
+            Caching::Private(m) => {
+                let kept = m.lock().unwrap_or_else(|e| e.into_inner()).get(k).cloned();
+                kept.or_else(|| self.shared.cache.peek(k))
+            }
+        };
         match v {
             Some(CacheVal::Any(a, _)) => a.downcast::<T>().ok(),
             _ => None,
@@ -927,7 +945,17 @@ impl Reading<'_> {
     }
 
     fn remember<T: Send + Sync + 'static>(&self, k: CacheKey, v: Arc<T>, size: usize) {
-        if self.cache {
+        match self.cache {
+            Caching::Shared => self.shared.cache.insert(k, CacheVal::Any(v, size)),
+            Caching::Private(m) => {
+                m.lock().unwrap_or_else(|e| e.into_inner()).insert(k, CacheVal::Any(v, size));
+            }
+        }
+    }
+
+    /// Remembers a decoded column block, which a private read uses once.
+    fn remember_block(&self, k: CacheKey, v: Arc<Vector>, size: usize) {
+        if let Caching::Shared = self.cache {
             self.shared.cache.insert(k, CacheVal::Any(v, size));
         }
     }
@@ -1081,7 +1109,7 @@ impl Reading<'_> {
                 if v.len() as u64 != meta.starts[last] - meta.starts[first] {
                     return Err(Error::internal("event block does not match its granules"));
                 }
-                self.remember(CacheKey::part(self.db, &r.id, ci as u32, bi as u32), v.clone(), raw.len() + 64);
+                self.remember_block(CacheKey::part(self.db, &r.id, ci as u32, bi as u32), v.clone(), raw.len() + 64);
                 decoded[bi - b0] = Some(v);
             }
             b = end;

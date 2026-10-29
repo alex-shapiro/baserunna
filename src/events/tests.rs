@@ -1307,3 +1307,172 @@ fn stalled_part_reads_are_hedged() {
         assert!(ms < 2 * cfg.event_get_hedge_ms, "a query with stalled reads took {ms} ms");
     });
 }
+/// Partial results of parts read concurrently, and filter constants they prune with.
+mod partial_results {
+    use super::*;
+
+    async fn count_where(db: &Arc<Db>, w: Json) -> i64 {
+        let q = json!({"from": 0, "to": T0 * 2, "where": w, "aggregates": {"n": {"fn": "count"}}});
+        query(db, &q).await.unwrap().rows[0][0].as_i64().unwrap()
+    }
+
+    /// A `-0.0` filter constant on a JSON path matches `0.0` rows while
+    /// unsealed, so sealing must not prune them by stats.
+    #[test]
+    fn negative_zero_json_path_filter_survives_stat_pruning() {
+        rt().block_on(async {
+            let (eng, _store, _env) = engine(1, cfg());
+            let db = create_db(&eng, "d").await;
+            let rows = vec![json!({"time": T0, "event": "a", "props": {"z": -0.0}})];
+            txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            let w = json!({"col": "props", "path": ["z"], "op": "eq", "value": -0.0});
+            assert_eq!(count_where(&db, w.clone()).await, 1, "unsealed");
+            let id = {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                get_schema(&mut t, "events").await.unwrap().id
+            };
+            assert!(maint::seal(&db, id).await.unwrap());
+            assert_eq!(count_where(&db, w).await, 1, "sealed");
+        });
+    }
+
+    async fn group_by_user(db: &Arc<Db>, days: i64, max_memory_bytes: usize) -> Result<exec::Output> {
+        let q = Query::parse(json!({"from": T0, "to": T0 + days * DAY, "group_by": ["user"],
+            "aggregates": {"n": {"fn": "count"}}}))
+        .unwrap();
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let s = get_schema(&mut t, "events").await.unwrap();
+        exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits { max_memory_bytes, ..Limits::default() }).await
+    }
+
+    /// A store whose first part `GET` after arming stalls for 5 s.
+    struct StallOnePartGet {
+        inner: crate::store::DynStore,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::store::ObjectStore for StallOnePartGet {
+        fn get<'a>(
+            &'a self,
+            key: &'a str,
+            opts: crate::store::GetOpts,
+        ) -> crate::store::BoxFut<'a, crate::store::SResult<crate::store::GetResult>> {
+            let stall = key.contains("/part/") && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if stall {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                self.inner.get(key, opts).await
+            })
+        }
+
+        fn put<'a>(
+            &'a self,
+            key: &'a str,
+            data: Bytes,
+            mode: crate::store::PutMode,
+        ) -> crate::store::BoxFut<'a, crate::store::SResult<String>> {
+            self.inner.put(key, data, mode)
+        }
+
+        fn delete<'a>(&'a self, key: &'a str) -> crate::store::BoxFut<'a, crate::store::SResult<()>> {
+            self.inner.delete(key)
+        }
+
+        fn list<'a>(
+            &'a self,
+            prefix: &'a str,
+            start_after: Option<&'a str>,
+            limit: usize,
+        ) -> crate::store::BoxFut<'a, crate::store::SResult<crate::store::ListPage>> {
+            self.inner.list(prefix, start_after, limit)
+        }
+    }
+
+    /// Groups by user over `days` single-row parts, read by a cold node whose
+    /// first part `GET` stalls.
+    async fn group_by_user_with_slow_first_part(
+        days: i64,
+        cfg: EngineConfig,
+        max_memory_bytes: usize,
+    ) -> Result<exec::Output> {
+        let origin = tokio::time::Instant::now();
+        let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
+        let env2 = env.clone();
+        let mem = Arc::new(crate::store::MemStore::new(Box::new(move || env2.now_ms())));
+        let store = Arc::new(StallOnePartGet { inner: mem, armed: Default::default() });
+        let cfg = EngineConfig { cache_bytes: 64 << 20, event_get_hedge_ms: 0, ..cfg };
+        let eng = Engine::new(store.clone(), env.clone(), cfg.clone(), "node-a".into());
+        let db = create_db(&eng, "db").await;
+        let rows: Vec<Json> =
+            (0..days).map(|d| json!({"time": T0 + d * DAY, "event": "a", "user": format!("u{}", d % 2)})).collect();
+        txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+        let id = {
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            get_schema(&mut t, "events").await.unwrap().id
+        };
+        assert!(maint::seal(&db, id).await.unwrap());
+        eng.release_leases(std::time::Duration::from_secs(2)).await;
+        let cold = Engine::new(store.clone(), env, cfg, "node-b".into());
+        let db = cold.db("db");
+        db.open(true).await.unwrap();
+        store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        group_by_user(&db, days, max_memory_bytes).await
+    }
+
+    /// Reading parts concurrently must not change whether a query fits its
+    /// memory limit: two groups fit in 450 bytes however parts are read, even
+    /// when the first part is slow to arrive.
+    #[test]
+    fn concurrent_parts_do_not_multiply_group_memory() {
+        rt().block_on(async {
+            let days = 64;
+            let serial = EngineConfig { event_read_concurrency: 1, ..cfg() };
+            let one = group_by_user_with_slow_first_part(days, serial, 450).await;
+            assert!(one.is_ok(), "one part at a time: {one:?}");
+            let many = group_by_user_with_slow_first_part(days, cfg(), 450).await;
+            assert_eq!(many.map(|o| o.rows), Ok(one.unwrap().rows), "32 parts at a time");
+        });
+    }
+}
+
+/// A merge reads each small input part once, though it reads every column
+/// of each, and does so without filling the node's cache.
+#[test]
+fn merges_fetch_each_small_input_once() {
+    rt().block_on(async {
+        let origin = tokio::time::Instant::now();
+        let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
+        let env2 = env.clone();
+        let mem = Arc::new(crate::store::MemStore::new(Box::new(move || env2.now_ms())));
+        let store = Arc::new(crate::sim::cost::MeteredStore::new(mem, 0));
+        let cfg = EngineConfig { cache_bytes: 64 << 20, event_chunk_bytes: 1 << 20, ..cfg() };
+        let eng = Engine::new(store.clone(), env.clone(), cfg.clone(), "node-a".into());
+        let db = create_db(&eng, "db").await;
+        let id = {
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            get_schema(&mut t, "events").await.unwrap().id
+        };
+        for k in 0..4 {
+            let rows: Vec<Json> = (0..20)
+                .map(|i| json!({"time": T0 + k * 100 + i, "event": "a", "user": format!("u{i}"), "n": i, "props": {"k": i}}))
+                .collect();
+            txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            assert!(maint::seal(&db, id).await.unwrap());
+        }
+        eng.release_leases(std::time::Duration::from_secs(2)).await;
+        let cold = Engine::new(store.clone(), env, cfg, "node-b".into());
+        let db = cold.db("db");
+        db.open(true).await.unwrap();
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let s = get_schema(&mut t, "events").await.unwrap();
+        let inputs = refs(&mut t, id).await.unwrap();
+        assert_eq!(inputs.len(), 4);
+        let before = store.scope("db").gets;
+        maint::merge(&db, &s, &inputs).await.unwrap();
+        let part_gets = store.scope("db").gets - before;
+        assert_eq!(part_gets, inputs.len() as f64, "GETs for {} small inputs", inputs.len());
+        let q = json!({"from": T0, "to": T0 + DAY, "aggregates": {"n": {"fn": "count"}}});
+        assert_eq!(query(&db, &q).await.unwrap().rows, vec![vec![json!(80)]]);
+    });
+}

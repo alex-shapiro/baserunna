@@ -10,7 +10,7 @@
 
 use super::agg::{State, Val};
 use super::json;
-use super::part::{self, ColRef, GranStat, PartMeta, ReadStats, Reading, Stat};
+use super::part::{self, Caching, ColRef, GranStat, PartMeta, ReadStats, Reading, Stat};
 use super::query::{AggFn, Expr, Filter, Interval, Mode, Named, Query, Stage};
 use super::schema::{EvColumn, EvType, EventSchema, NOW, parse_rfc3339};
 use super::vector::{Phys, Vector};
@@ -27,7 +27,6 @@ use serde_json::{Value as Json, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 
 /// Limits on the work one query does.
@@ -168,7 +167,12 @@ impl Binder<'_> {
                         "filter on a JSON column's path, such as {\"col\": .., \"path\": [..]}",
                     ));
                 }
-                _ => t.clone(),
+                // Constants compare with stored values, so they are normalized the same way.
+                _ => t.try_map(|a| {
+                    let mut a = a.clone();
+                    json::normalize(&mut a).map_err(Error::invalid)?;
+                    Ok::<_, Error>(a)
+                })?,
             };
             Ok((b, t))
         })
@@ -584,20 +588,11 @@ fn bind_stage(b: &Binder<'_>, s: &Stage) -> Result<BoundStage> {
     Ok(BoundStage { group_by, aggregates })
 }
 
-/// Group states of one aggregation stage. Every `Groups` of a query,
-/// including the partial results of parts read concurrently, charges one
-/// shared memory budget.
+/// Group states of one aggregation stage.
 struct Groups {
     map: DetHashMap<Vec<u8>, (Vec<Val>, Vec<State>)>,
     mem: usize,
     max_mem: usize,
-    budget: Arc<AtomicUsize>,
-}
-
-impl Drop for Groups {
-    fn drop(&mut self) {
-        self.budget.fetch_sub(self.mem, Relaxed);
-    }
 }
 
 fn new_group_mem(kb: &[u8], fns: &[&AggFn]) -> usize {
@@ -605,20 +600,14 @@ fn new_group_mem(kb: &[u8], fns: &[&AggFn]) -> usize {
 }
 
 impl Groups {
-    fn new(max_mem: usize, budget: Arc<AtomicUsize>) -> Groups {
-        Groups { map: DetHashMap::default(), mem: 0, max_mem, budget }
+    fn new(max_mem: usize) -> Groups {
+        Groups { map: DetHashMap::default(), mem: 0, max_mem }
     }
 
-    /// Records that the groups hold `mem` bytes, failing once the query's
-    /// groups together exceed the limit.
+    /// Records that the groups hold `mem` bytes, failing past the limit.
     fn charge(&mut self, mem: usize) -> Result<()> {
-        let total = if mem >= self.mem {
-            self.budget.fetch_add(mem - self.mem, Relaxed) + (mem - self.mem)
-        } else {
-            self.budget.fetch_sub(self.mem - mem, Relaxed) - (self.mem - mem)
-        };
         self.mem = mem;
-        if total > self.max_mem {
+        if mem > self.max_mem {
             return Err(Error::TooLarge(format!(
                 "the query's aggregation state exceeds {} bytes of memory; narrow the time range or group by fewer values",
                 self.max_mem
@@ -644,12 +633,14 @@ impl Groups {
         self.charge(mem)
     }
 
+    fn full(&self) -> bool {
+        self.mem > self.max_mem
+    }
+
     /// Merges the groups of `o`, a partial result of the same stage.
-    fn absorb(&mut self, mut o: Groups, fns: &[&AggFn]) -> Result<()> {
-        let map = std::mem::take(&mut o.map);
-        drop(o);
+    fn absorb(&mut self, o: Groups, fns: &[&AggFn]) -> Result<()> {
         let mut added = 0;
-        for (kb, (keys, states)) in map {
+        for (kb, (keys, states)) in o.map {
             match self.map.entry(kb) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
                     e.get_mut().1.iter_mut().zip(&states).for_each(|(a, b)| a.merge(b));
@@ -668,8 +659,9 @@ impl Groups {
     }
 
     /// Finalized rows sorted by group key.
-    fn finish(mut self, fns: &[&AggFn]) -> Vec<Vec<Val>> {
-        let mut rows: Vec<(Vec<u8>, Vec<Val>)> = std::mem::take(&mut self.map)
+    fn finish(self, fns: &[&AggFn]) -> Vec<Vec<Val>> {
+        let mut rows: Vec<(Vec<u8>, Vec<Val>)> = self
+            .map
             .into_iter()
             .map(|(kb, (keys, states))| {
                 let mut row = keys;
@@ -726,18 +718,16 @@ struct Run<'p, 'a> {
 }
 
 impl<'p, 'a> Run<'p, 'a> {
-    fn new(plan: &'p Plan<'a>, max_mem: usize, budget: &Arc<AtomicUsize>) -> Run<'p, 'a> {
+    fn new(plan: &'p Plan<'a>, max_mem: usize) -> Run<'p, 'a> {
         let (groups, kept, agg_fns) = match &plan.kind {
             Kind::Rows { order, limit, .. } => (
                 None,
                 Some(Kept { rows: Vec::new(), desc: order.iter().map(|(_, d)| *d).collect(), limit: *limit }),
                 Vec::new(),
             ),
-            Kind::Aggregate { first, .. } => (
-                Some(Groups::new(max_mem, budget.clone())),
-                None,
-                first.aggregates.iter().map(|a| a.func.clone()).collect(),
-            ),
+            Kind::Aggregate { first, .. } => {
+                (Some(Groups::new(max_mem)), None, first.aggregates.iter().map(|a| a.func.clone()).collect())
+            }
         };
         Run { plan, stats: Stats::default(), groups, kept, agg_fns }
     }
@@ -1437,12 +1427,11 @@ async fn run_within(
     let rest: BTreeSet<Need> = rest.difference(&first).cloned().collect();
     let input = input(txn, s, q.from, q.to).await?;
     let plan = Plan { schema: s, filter, lookups, kind, first, rest, positions };
-    let budget = Arc::new(AtomicUsize::new(0));
-    let mut run = Run::new(&plan, limits.max_memory_bytes, &budget);
+    let mut run = Run::new(&plan, limits.max_memory_bytes);
     run.stats = Stats { source: "columns".into(), nodes: 1, parts: input.refs.len() as u64, ..Default::default() };
     let read_stats = ReadStats::default();
-    let rd = Reading { shared, db, cache: true, stats: &read_stats };
-    let parts: Vec<_> = input
+    let rd = Reading { shared, db, cache: Caching::Shared, stats: &read_stats };
+    let refs: Vec<&PartRef> = input
         .refs
         .iter()
         .filter(|r| {
@@ -1452,23 +1441,55 @@ async fn run_within(
             }
             may
         })
-        .map(|r| {
-            let (mut partial, rd) = (Run::new(&plan, limits.max_memory_bytes, &budget), &rd);
+        .collect();
+    let too_much_read = || {
+        (read_stats.bytes.load(Relaxed) > limits.max_bytes_read).then(|| {
+            Error::TooLarge(format!(
+                "the query read more than {} bytes; narrow its time range or filter",
+                limits.max_bytes_read
+            ))
+        })
+    };
+    // Parts are read concurrently into partial results, each holding at most
+    // its share of the state limit, and merged as they finish; merges ignore
+    // order, so the answer is the same. A part whose groups outgrow its share
+    // is read again into the whole result once the others are merged, so the
+    // whole result alone decides whether the query is too large.
+    let n = shared.cfg.event_read_concurrency.max(1);
+    let share = limits.max_memory_bytes / n;
+    let reads: Vec<_> = refs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let (mut partial, rd) = (Run::new(&plan, share), &rd);
             async move {
-                partial.part(rd, r, rd.meta(r).await?).await?;
-                Ok::<_, Error>(partial)
+                let read = match rd.meta(r).await {
+                    Ok(meta) => partial.part(rd, r, meta).await,
+                    Err(e) => Err(e),
+                };
+                (i, partial, read)
             }
         })
         .collect();
-    // Parts are read concurrently into partial results, merged in order.
-    let mut parts = stream::iter(parts).buffered(shared.cfg.event_read_concurrency);
-    while let Some(partial) = parts.next().await {
-        run.absorb(partial?)?;
-        if read_stats.bytes.load(Relaxed) > limits.max_bytes_read {
-            return Err(Error::TooLarge(format!(
-                "the query read more than {} bytes; narrow its time range or filter",
-                limits.max_bytes_read
-            )));
+    let mut reads = stream::iter(reads).buffer_unordered(n);
+    let mut outgrown = Vec::new();
+    while let Some((i, partial, read)) = reads.next().await {
+        match read {
+            Ok(()) => run.absorb(partial)?,
+            Err(Error::TooLarge(_)) if partial.groups.as_ref().is_some_and(Groups::full) => outgrown.push(i),
+            Err(e) => return Err(e),
+        }
+        if let Some(e) = too_much_read() {
+            return Err(e);
+        }
+    }
+    drop(reads);
+    outgrown.sort_unstable();
+    for i in outgrown {
+        let r = refs[i];
+        run.part(&rd, r, rd.meta(r).await?).await?;
+        if let Some(e) = too_much_read() {
+            return Err(e);
         }
     }
     run.unsealed(&input.unsealed)?;
@@ -1587,7 +1608,7 @@ fn second_stage(
         }
     };
     let fns: Vec<&AggFn> = aggs.iter().map(|(_, f, _)| f).collect();
-    let mut groups = Groups::new(limits.max_memory_bytes, Arc::default());
+    let mut groups = Groups::new(limits.max_memory_bytes);
     for row in &rows {
         let keys: Vec<Val> = group_by.iter().map(|(_, e)| eval(e, row).canonical()).collect();
         let states = groups.entry(keys, &fns)?;
@@ -1651,9 +1672,9 @@ pub async fn matching_rows(
         rest: BTreeSet::new(),
         positions: false,
     };
-    let run = Run::new(&plan, usize::MAX, &Arc::default());
+    let run = Run::new(&plan, usize::MAX);
     let read_stats = ReadStats::default();
-    let rd = Reading { shared, db, cache: true, stats: &read_stats };
+    let rd = Reading { shared, db, cache: Caching::Shared, stats: &read_stats };
     let meta = rd.meta(r).await?;
     if !run.part_may(&rd, r, &meta).await? {
         return Ok(Vec::new());
@@ -1699,7 +1720,7 @@ pub fn row_matches(s: &EventSchema, row: &Row, f: &Filter, from: i64, to: i64) -
         rest: BTreeSet::new(),
         positions: false,
     };
-    let run = Run::new(&plan, usize::MAX, &Arc::default());
+    let run = Run::new(&plan, usize::MAX);
     let mut b = Batch { n: 1, cols: BTreeMap::new(), pos: vec![Pos::default()] };
     for need in run.plan.first.iter() {
         let v = match need {

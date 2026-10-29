@@ -897,9 +897,11 @@ pub(super) fn split_consistency(mut body: Json) -> Result<(Json, Consistency)> {
     let (c, s) = match body.as_object_mut() {
         Some(o) => (
             o.remove("consistency")
+                .filter(|v| !v.is_null())
                 .map(|v| v.as_str().map(str::to_string).ok_or_else(|| Error::invalid("consistency must be a string")))
                 .transpose()?,
             o.remove("max_staleness_ms")
+                .filter(|v| !v.is_null())
                 .map(|v| v.as_u64().ok_or_else(|| Error::invalid("max_staleness_ms must be a number")))
                 .transpose()?,
         ),

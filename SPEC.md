@@ -851,9 +851,11 @@ skips parts whose dictionaries or statistics rule out a match, then granules
 by the primary index, statistics and blooms. It reads filter columns first
 (prewhere) and the rest only for granules with matches, then folds in the
 unsealed rows. Up to 32 parts are read at once, each into a partial result
-that is merged in order; aggregates keep mergeable states, so the order of
-parts never changes an answer, and every partial result counts toward the
-query's state limit. A part `GET` unanswered after 1 s is sent again, so one
+merged when its part is done; aggregates keep mergeable states and break
+ties by value, so the order parts finish in never changes an answer. A
+partial result holds at most 1/32 of the query's state limit; a part whose
+state outgrows that is read again into the merged result, which alone
+decides whether a query exceeds its limit. A part `GET` unanswered after 1 s is sent again, so one
 slow store request does not hold up a query. Parts are cached whole when
 small, otherwise by column block, so a warm query performs no store `GET`s.
 
@@ -1597,7 +1599,7 @@ Every 20 ms of virtual time, global oracles verify that at most 1 node relies on
   | log ingestion, 20 KB NDJSON appends           | 1 PUT per append + 5 PUT per MiB, 0 GET |
   | cold read of a sealed log                     | 5 GET per MiB                           |
   | event insert in a transaction                 | 1 PUT                                   |
-  | event bulk ingest, 1 KB NDJSON events         | 1.5 PUT per MiB, 0 GET                  |
+  | event bulk ingest, 1 KB NDJSON events         | 1.5 PUT + 1.3 GET per MiB               |
   | warm event query                              | 0                                       |
   | cold event query                              | 1.5 GET per part read                   |
   | idle event table                              | 0 per hour                              |

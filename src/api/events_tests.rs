@@ -338,3 +338,39 @@ fn inserts_on_one_node_are_seen_by_strong_queries_on_others() {
         w.shutdown();
     });
 }
+
+/// A meta command reaches the system database after its lease moves.
+#[test]
+fn meta_commands_survive_a_system_lease_move() {
+    run_paused(async {
+        let (w, t) = setup(3).await;
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let sys = crate::meta::SYS_DB;
+        let h = w.holder(sys).expect("a system lease holder");
+        let (n, m) = ((h + 1) % 3, (h + 2) % 3);
+        w.node(n).engine.db(sys).refresh(tokio::time::Instant::now(), false).await.unwrap();
+        assert_eq!(w.node(n).engine.db(sys).lease_holder().as_deref(), Some(w.node(h).id.as_str()));
+        assert!(w.node(h).engine.db(sys).release_lease().await.unwrap());
+        let md = w.node(m).engine.db(sys);
+        md.refresh(tokio::time::Instant::now(), false).await.unwrap();
+        md.acquire_lease().await.unwrap();
+        let (s, r) = send(&w, n, &t, "POST", "/v1/dbs", &[], r#"{"name": "d2"}"#).await;
+        assert!(s == 200 || s == 201, "creating a database on node {n} fails: {s} {r}");
+        w.shutdown();
+    });
+}
+
+/// `"consistency": null` reads as an absent field, as `/txn` reads it.
+#[test]
+fn null_consistency_reads_as_absent() {
+    run_paused(async {
+        let (w, t) = setup(1).await;
+        let txn = r#"{"ops": [{"op": "get", "key": "x"}], "consistency": null, "max_staleness_ms": null}"#;
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/txn", &[], txn).await;
+        assert_eq!(s, 200, "/txn: {r}");
+        let q = r#"{"from": 0, "to": 1, "consistency": null, "max_staleness_ms": null}"#;
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/query", &[], q).await;
+        assert_eq!(s, 200, "event query: {r}");
+        w.shutdown();
+    });
+}

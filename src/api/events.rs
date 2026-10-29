@@ -267,9 +267,9 @@ fn query_consistency(mut b: Json) -> Result<(Json, Consistency)> {
     if !b.is_object() {
         return Err(Error::invalid("the query is a JSON object"));
     }
-    if b.get("consistency").is_none() {
+    if b.get("consistency").is_none_or(Json::is_null) {
         b["consistency"] = json!("snapshot");
-        if b.get("max_staleness_ms").is_none() {
+        if b.get("max_staleness_ms").is_none_or(Json::is_null) {
             b["max_staleness_ms"] = json!(QUERY_STALENESS_MS);
         }
     }

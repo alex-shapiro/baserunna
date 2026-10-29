@@ -81,6 +81,13 @@ impl Val {
         }
     }
 
+    /// [`Val::total_cmp`], with values that compare equal but differ (an int
+    /// and a float beyond 2^53) ordered by their canonical bytes, so that a
+    /// min or max does not depend on the order values arrive in.
+    pub fn strict_cmp(&self, o: &Val) -> Ordering {
+        self.total_cmp(o).then_with(|| self.canonical_bytes().cmp(&o.canonical_bytes()))
+    }
+
     /// Bytes equal exactly for values that compare equal.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(16);
@@ -314,12 +321,12 @@ impl State {
                 }
             }
             State::Min(m) => {
-                if !v.is_null() && m.as_ref().is_none_or(|x| v.total_cmp(x) == Ordering::Less) {
+                if !v.is_null() && m.as_ref().is_none_or(|x| v.strict_cmp(x) == Ordering::Less) {
                     *m = Some(v.clone().canonical());
                 }
             }
             State::Max(m) => {
-                if !v.is_null() && m.as_ref().is_none_or(|x| v.total_cmp(x) == Ordering::Greater) {
+                if !v.is_null() && m.as_ref().is_none_or(|x| v.strict_cmp(x) == Ordering::Greater) {
                     *m = Some(v.clone().canonical());
                 }
             }
@@ -361,12 +368,12 @@ impl State {
             (State::Sum(a), State::SumList(b)) if *a == SumState::default() => *self = State::SumList(b.clone()),
             (State::SumList(_), State::Sum(b)) if *b == SumState::default() => {}
             (State::Min(a), State::Min(Some(b))) => {
-                if a.as_ref().is_none_or(|x| b.total_cmp(x) == Ordering::Less) {
+                if a.as_ref().is_none_or(|x| b.strict_cmp(x) == Ordering::Less) {
                     *a = Some(b.clone());
                 }
             }
             (State::Max(a), State::Max(Some(b))) => {
-                if a.as_ref().is_none_or(|x| b.total_cmp(x) == Ordering::Greater) {
+                if a.as_ref().is_none_or(|x| b.strict_cmp(x) == Ordering::Greater) {
                     *a = Some(b.clone());
                 }
             }
@@ -687,6 +694,27 @@ mod tests {
             let n = r.usize(64);
             let b = r.bytes(n);
             let _ = State::decode(&mut Reader::new(&b));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tie_tests {
+    use super::*;
+
+    /// Values that compare equal, such as an int and a float beyond 2^53,
+    /// leave the same min and max whatever order they arrive in.
+    #[test]
+    fn min_and_max_ties_ignore_order() {
+        let (a, b) = (Val::Int(1 << 60), Val::Float((1u64 << 60) as f64));
+        assert_eq!(a.total_cmp(&b), Ordering::Equal);
+        for f in [AggFn::Min, AggFn::Max] {
+            let fold = |vals: &[&Val]| {
+                let mut s = State::new(&f);
+                vals.iter().for_each(|v| s.add(v, None));
+                s.finalize(&f)
+            };
+            assert_eq!(fold(&[&a, &b]), fold(&[&b, &a]), "{f:?}");
         }
     }
 }

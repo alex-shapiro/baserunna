@@ -9,7 +9,7 @@
 
 use super::build::{PosRow, choose_paths, dictionary, write_rows};
 use super::json::{self, JType};
-use super::part::{self, ColPlan, ColRef, PartMeta, ReadStats, Reading, SharedPath, Sink, Source};
+use super::part::{self, Caching, ColPlan, ColRef, PartMeta, ReadStats, Reading, SharedPath, Sink, Source};
 use super::query::Filter;
 use super::schema::{EvType, EventSchema};
 use super::vector::{Phys, Strs, Vector};
@@ -457,7 +457,8 @@ async fn merge_parts(
     inputs: &[PartRef],
     stats: &ReadStats,
 ) -> Result<Option<PartRef>> {
-    let rd = Reading { shared, db, cache: false, stats };
+    let memo = part::Memo::default();
+    let rd = Reading { shared, db, cache: Caching::Private(&memo), stats };
     let mut ins = Vec::with_capacity(inputs.len());
     for r in inputs {
         ins.push(Input { r: r.clone(), meta: rd.meta(r).await?, mask: rd.mask(r).await? });
@@ -664,7 +665,7 @@ async fn merge_parts(
     let (min_time, max_time) =
         inputs.iter().fold((i64::MAX, i64::MIN), |(lo, hi), r| (lo.min(r.min_time), hi.max(r.max_time)));
     let mut src = MergeSource {
-        rd: Reading { shared, db, cache: false, stats },
+        rd: Reading { shared, db, cache: Caching::Private(&memo), stats },
         inputs: ins,
         order,
         keys,
@@ -889,7 +890,7 @@ pub async fn delete(db: &Arc<Db>, txn: &mut Txn, name: &str, from: i64, to: i64,
     }
     let shared = db.shared().clone();
     let stats = ReadStats::default();
-    let rd = Reading { shared: &shared, db: &db.id, cache: true, stats: &stats };
+    let rd = Reading { shared: &shared, db: &db.id, cache: Caching::Shared, stats: &stats };
     let reads: Vec<_> =
         input.refs.iter().map(|r| super::exec::matching_rows(&shared, &db.id, &s, r, f, from, to)).collect();
     let mut matches = stream::iter(reads).buffered(shared.cfg.event_read_concurrency);

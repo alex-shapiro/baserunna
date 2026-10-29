@@ -557,7 +557,7 @@ async fn download_blob(Path((db, blob)): Path<(String, String)>, s: Session) -> 
 
 async fn run_txn(Path(db): Path<String>, Posted { s, f }: Posted) -> Page {
     let text = field(&f, "body").to_string();
-    let result = match serde_json::from_str::<Json>(&text) {
+    let result = match crate::api::parse_json::<Json>(text.as_bytes()) {
         Ok(body) => {
             let reply = s.call("POST", &format!("{}/txn", api_db(&db)), Some(body)).await;
             serde_json::to_string_pretty(&reply.body).unwrap_or_default()
@@ -570,7 +570,7 @@ async fn run_txn(Path(db): Path<String>, Posted { s, f }: Posted) -> Page {
 
 async fn create_table(Path(db): Path<String>, Posted { s, f }: Posted) -> Page {
     let text = field(&f, "def").to_string();
-    let outcome = match serde_json::from_str::<Json>(&text) {
+    let outcome = match crate::api::parse_json::<Json>(text.as_bytes()) {
         Ok(def) => s.api("POST", &format!("{}/tables", api_db(&db)), Some(def)).await,
         Err(e) => Err(format!("Invalid JSON: {e}")),
     };
@@ -691,7 +691,7 @@ async fn add_column(Path((db, t)): Path<(String, String)>, Posted { s, f }: Post
     let tp = table_path(&db, &t);
     let default = match field(&f, "default").trim() {
         "" => None,
-        d => match serde_json::from_str::<Json>(d) {
+        d => match crate::api::parse_json::<Json>(d.as_bytes()) {
             Ok(v) => Some(v),
             Err(e) => return Ok(back(&tp, &format!("The default is not JSON: {e}"), false)),
         },

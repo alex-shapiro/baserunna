@@ -138,9 +138,15 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for JsonBody<T> {
             _ => Error::invalid(format!("could not read body: {e}")),
         })?;
         let b: &[u8] = if b.iter().all(|c| c.is_ascii_whitespace()) { b"{}" } else { &b };
-        refuse_inexact_integers(b)?;
-        serde_json::from_slice(b).map(JsonBody).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))
+        parse_json(b).map(JsonBody).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))
     }
+}
+
+/// Parses JSON text a request carries, refusing integers it would round
+/// (see [`refuse_inexact_integers`]); the error says what is wrong.
+pub(crate) fn parse_json<T: DeserializeOwned>(text: &[u8]) -> std::result::Result<T, String> {
+    refuse_inexact_integers(text).map_err(|e| e.message())?;
+    serde_json::from_slice(text).map_err(|e| e.to_string())
 }
 
 /// Refuses JSON text holding an integer literal outside both the signed and

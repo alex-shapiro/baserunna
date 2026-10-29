@@ -252,7 +252,7 @@ async fn append(Path((db, name)): Path<(String, String)>, Posted { s, f }: Poste
     let sp = stream_path(&db, &name);
     let value = field(&f, "value");
     let record = match f.contains_key("json") {
-        true => match serde_json::from_str::<Json>(value) {
+        true => match crate::api::parse_json::<Json>(value.as_bytes()) {
             Ok(j) => json!({"json": j}),
             Err(e) => return Ok(back(&sp, &format!("The record is not JSON: {e}"), false)),
         },

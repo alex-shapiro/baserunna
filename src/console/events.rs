@@ -261,7 +261,7 @@ async fn table_page(Path((db, name)): Path<(String, String)>, s: Session, q: Par
 
 /// Runs a query typed into the console, rendering its answer or why it failed.
 async fn run_query(s: &Session, db: &str, t: &Json, text: &str) -> String {
-    match serde_json::from_str::<Json>(text) {
+    match crate::api::parse_json::<Json>(text.as_bytes()) {
         Ok(mut q) => {
             if let Some(o) = q.as_object_mut() {
                 o.entry("consistency").or_insert(json!("strong"));
@@ -283,7 +283,7 @@ async fn run_query(s: &Session, db: &str, t: &Json, text: &str) -> String {
 
 async fn create(Path(db): Path<String>, Posted { s, f }: Posted) -> Page {
     let dp = db_path(&db);
-    let def = match serde_json::from_str::<Json>(field(&f, "def")) {
+    let def = match crate::api::parse_json::<Json>(field(&f, "def").as_bytes()) {
         Ok(d) => d,
         Err(e) => return Ok(back(&dp, &format!("Invalid JSON: {e}"), false)),
     };
@@ -302,7 +302,7 @@ async fn query(Path((db, name)): Path<(String, String)>, Posted { s, f }: Posted
 
 async fn insert(Path((db, name)): Path<(String, String)>, Posted { s, f }: Posted) -> Page {
     let tp = table_path(&db, &name);
-    let rows = match serde_json::from_str::<Json>(field(&f, "rows")) {
+    let rows = match crate::api::parse_json::<Json>(field(&f, "rows").as_bytes()) {
         Ok(Json::Array(r)) => r,
         Ok(o @ Json::Object(_)) => vec![o],
         Ok(_) => return Ok(back(&tp, "Give an event object or an array of them.", false)),

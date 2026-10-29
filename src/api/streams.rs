@@ -183,7 +183,7 @@ async fn append(
     let bodies: Vec<Body> = match ct.as_str() {
         "" | "application/json" => {
             let b: AppendBody =
-                serde_json::from_slice(&data).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))?;
+                super::parse_json(&data).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))?;
             expect = expect.or(b.expect_seq);
             create |= b.create;
             key = one_idempotency_key(key, b.idempotency_key)?;
@@ -542,6 +542,21 @@ mod tests {
         let r = call_router(&router, "POST", "/v1/dbs/logs/streams", &t, Bytes::from(r#"{"name":"app"}"#)).await;
         assert_eq!(r.status, 201);
         (w, router, t)
+    }
+
+    /// SPEC §10: a JSON body holding an integer outside both 64-bit ranges
+    /// is refused with 400 rather than read as a rounded float, as the txn
+    /// route's stream appends are.
+    #[test]
+    fn json_appends_refuse_inexact_integers() {
+        run_paused(async {
+            let (w, router, t) = world().await;
+            let body = r#"{"records": [{"json": {"n": 123456789012345678901234567890}}]}"#;
+            let (status, r) = send(&router, &t, "POST", &format!("{S}/records"), &[], body).await;
+            let (_, read) = send(&router, &t, "GET", &format!("{S}/records?tail=1"), &[], "").await;
+            assert_eq!(status, 400, "appended {r}; the stream now holds {}", read["records"]);
+            w.shutdown();
+        });
     }
 
     async fn send(

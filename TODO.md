@@ -135,8 +135,7 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       fresh time limit (`api::events::query`), doubling the cost of a plain
       query mistake.
 - [ ] **Treat `query_events` in transactions like event queries.** The op
-      takes no query slot, gets no deadline extension, and drops a
-      `consistency` it is given.
+      takes no query slot and gets no deadline extension.
 - [ ] **Store bind slot rows sparsely and cap partitions per insert.** Each
       staged part carries a `Runs` per slot of its bind (`StagedPart::
       slot_rows`), so a bind's encoding and the committer's work grow with

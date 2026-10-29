@@ -487,6 +487,27 @@ fn queries_of_many_expressions_stop_near_their_time_limit() {
     });
 }
 
+/// A small bulk insert into a table whose columns have ordinary defaults is
+/// inserted: the events' defaults may take more than 8 times their text.
+#[test]
+fn small_bulk_inserts_take_ordinary_defaults() {
+    run_paused(async {
+        let w = World::new(1, 0).await;
+        let t = w.signup(0, "ev@api.test").await;
+        w.create_db(0, &t, "d").await;
+        let table = r#"{"name": "ev", "columns": [{"name": "time", "type": "time", "default": "now"},
+            {"name": "event", "type": "string", "default": "page_view"},
+            {"name": "country", "type": "string", "default": "unknown"},
+            {"name": "platform", "type": "string", "default": "web"}],
+            "time_column": "time", "order_by": ["event", "time"]}"#;
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events", &[], table).await;
+        assert_eq!(s, 201, "{r}");
+        let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], "[{}]").await;
+        assert_eq!((s, r["count"].clone()), (201, json!(1)), "{r}");
+        w.shutdown();
+    });
+}
+
 /// A full body of the smallest events, which encode to several times their
 /// text, is inserted: only events expanded by defaults past their body's
 /// size are refused.

@@ -101,6 +101,15 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       one masked row takes 441 store `GET`s against 303 unmasked. It also
       records bucket keys the part's directory does not list, which are
       never looked up. Plan each output column while the merge reads it.
+- [ ] **Size granule runs by decoded string widths.** `Run::run_rows`
+      counts a string column at 4 bytes a row, its dictionary codes, but a
+      column without a part dictionary decodes to its text, so a concurrent
+      part read of high-cardinality strings outgrows its share of the query
+      limit and the part is decoded again serially. With the block cache
+      the second read costs CPU only; under a cache too small to hold the
+      part it doubles the store `GET`s (100 against 50 for 16,384 rows of
+      two 120-byte columns under a 256 KiB cache). Count text from the
+      column's index, or measure runs as they are read.
 - [ ] **Charge cached segment blocks their decoded size.** The block cache
       charges a decoded entry its key and value bytes plus 48
       (`CacheVal::size`), while an `Entry` and its `Bytes` handles take about

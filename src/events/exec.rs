@@ -1661,6 +1661,14 @@ impl<'p, 'a> Run<'p, 'a> {
         (self.max_mem / 4 / per_row.max(1)) as u64
     }
 
+    /// Whether the largest granule of part `r` fits the memory limit at the
+    /// widths [`Run::run_rows`] counts, so that a partial result can read the
+    /// part without overflowing its share.
+    fn fits(&self, r: &PartRef, meta: &PartMeta) -> bool {
+        let largest = meta.starts.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+        largest <= 4 * self.run_rows(r, meta)
+    }
+
     /// Runs the query over granules `g` of part `r`: reads the filter's
     /// needs, selects rows, and reads the other needs only if some row
     /// is selected.
@@ -2122,6 +2130,10 @@ async fn run_within(
         let (mut partial, rd, r) = (Run::new(&plan, share), &rd, refs[i]);
         async move {
             let read = match rd.meta(r).await {
+                Ok(meta) if !partial.fits(r, &meta) => {
+                    partial.overflowed = true;
+                    Err(Error::TooLarge("a granule outgrows a partial result's share".into()))
+                }
                 Ok(meta) => partial.part(rd, r, meta).await,
                 Err(e) => Err(e),
             };

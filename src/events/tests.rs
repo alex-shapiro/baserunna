@@ -3765,3 +3765,132 @@ fn cached_blocks_are_charged_their_decoded_size() {
         assert!(charged >= held, "decoded blocks holding {held} bytes are charged {charged} bytes");
     });
 }
+mod partial_reads_wide_json {
+    use super::*;
+
+    /// A rows-mode query of a sparse JSON column reads each part once. Events
+    /// each hold 4 of 300 property keys, so a part stores 300 path columns,
+    /// and one granule of the whole column decodes to 1,024 × 300 × 16
+    /// bytes, past a 128 MiB limit's 4 MiB share, just as 8,192 such rows
+    /// (39 MB) pass the default 1 GiB limit's 32 MiB share.
+    #[test]
+    fn sparse_json_columns_do_not_read_parts_twice() {
+        rt().block_on(async {
+            let cfg = EngineConfig {
+                event_granule_rows: 1024,
+                event_granule_bytes: 10 << 20,
+                event_insert_part_max_bytes: 64 << 20,
+                event_json_max_paths: 1024,
+                event_json_directory_bytes: 1 << 20,
+                ..cfg()
+            };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            for d in 0..4i64 {
+                let rows: Vec<Json> = (0..1024i64)
+                    .map(|k| {
+                        let props: serde_json::Map<String, Json> =
+                            (0..4).map(|j| (format!("k{}", (k * 4 + j) % 300), json!(k))).collect();
+                        json!({"time": T0 + d * DAY + k, "event": "a", "props": props})
+                    })
+                    .collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            }
+            let id = {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                get_schema(&mut t, "events").await.unwrap().id
+            };
+            while maint::seal(&db, id).await.unwrap() {}
+            let q = json!({"from": T0, "to": T0 + 4 * DAY, "columns": ["time", "props"], "limit": 10});
+            let run = async |max: usize| {
+                let q = Query::parse(q.clone()).unwrap();
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                let s = get_schema(&mut t, "events").await.unwrap();
+                let limits = Limits { max_memory_bytes: max, ..Limits::default() };
+                exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await.unwrap()
+            };
+            let big = run(4 << 30).await;
+            let small = run(128 << 20).await;
+            assert_eq!(big.rows, small.rows);
+            assert_eq!(big.rows.len(), 10);
+            assert!(
+                small.stats.store_gets <= big.stats.store_gets + big.stats.store_gets / 10,
+                "store GETs {} under a 128 MiB limit, {} under 4 GiB (stats {:?})",
+                small.stats.store_gets,
+                big.stats.store_gets,
+                small.stats
+            );
+        });
+    }
+}
+
+mod partial_reads_at_defaults {
+    use super::*;
+
+    /// At the default granule size and the default 1 GiB query limit, a count
+    /// filtered on two 120-byte high-cardinality string columns reads its one
+    /// part once: the store `GET`s match those under a limit 32 times larger.
+    #[test]
+    fn default_limits_read_high_cardinality_strings_once() {
+        rt().block_on(async {
+            let d = EngineConfig::default();
+            let cfg = EngineConfig {
+                event_granule_rows: d.event_granule_rows,
+                event_granule_bytes: d.event_granule_bytes,
+                event_block_bytes: d.event_block_bytes,
+                event_chunk_bytes: d.event_chunk_bytes,
+                event_insert_part_max_bytes: d.event_insert_part_max_bytes,
+                event_read_concurrency: d.event_read_concurrency,
+                txn_max_write_bytes: 64 << 20,
+                cache_bytes: d.cache_bytes,
+                ..cfg()
+            };
+            let (eng, _store, _env) = engine(1, cfg);
+            let db = create_db(&eng, "d").await;
+            let pad = "x".repeat(112);
+            let n = 16 * 8192i64;
+            for chunk in 0..n / 8192 {
+                let rows: Vec<Json> = (0..8192i64)
+                    .map(|i| {
+                        let k = chunk * 8192 + i;
+                        json!({"time": T0 + k, "event": format!("{k:08}{pad}"), "user": format!("{pad}{k:08}")})
+                    })
+                    .collect();
+                txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
+            }
+            let id = {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                get_schema(&mut t, "events").await.unwrap().id
+            };
+            while maint::seal(&db, id).await.unwrap() {}
+            // Merged, as maintenance merges a day's sealed parts.
+            let (s, rs) = {
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                let s = get_schema(&mut t, "events").await.unwrap();
+                let rs = refs(&mut t, s.id).await.unwrap();
+                (s, rs)
+            };
+            maint::merge(&db, &s, &rs).await.unwrap();
+            let q = json!({"from": T0, "to": T0 + DAY,
+                "where": {"and": [{"col": "event", "op": "ne", "value": "-"}, {"col": "user", "op": "ne", "value": "-"}]},
+                "aggregates": {"n": {"fn": "count"}}});
+            let run = async |max: usize| {
+                let q = Query::parse(q.clone()).unwrap();
+                let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+                let s = get_schema(&mut t, "events").await.unwrap();
+                let limits = Limits { max_memory_bytes: max, ..Limits::default() };
+                exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await.unwrap()
+            };
+            let big = run(32 << 30).await;
+            let dflt = run(Limits::default().max_memory_bytes).await;
+            assert_eq!((&big.rows, &dflt.rows), (&vec![vec![json!(n)]], &vec![vec![json!(n)]]));
+            assert!(
+                dflt.stats.store_gets <= big.stats.store_gets + big.stats.store_gets / 10,
+                "store GETs {} under the default limit, {} under 32 GiB (stats {:?})",
+                dflt.stats.store_gets,
+                big.stats.store_gets,
+                dflt.stats
+            );
+        });
+    }
+}

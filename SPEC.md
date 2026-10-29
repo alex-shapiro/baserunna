@@ -430,8 +430,10 @@ events to row tables.
   nothing and parts are not dropped.
 - **Quota.** Event tables count toward the database's size quota (§5.10),
   and a database's event parts are capped at 1 TiB. Seals, merges, deletes
-  and retention never grow a database, so a full database can still run
-  them.
+  and retention are not refused at the quota, so a full database can still
+  run them. Only seals can grow a database: each partition's rows become a
+  part of a few hundred bytes at least, so events spread one per partition
+  take up to about 7 times their unsealed size once sealed.
 
 ## 5. Storage engine
 

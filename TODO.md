@@ -111,6 +111,12 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       is checked only when binds add parts (`Db::bind`); events inserted by
       transactions become parts through seals, which never refuse. Count
       unsealed bytes toward the cap at commit.
+- [ ] **Charge sealed part overhead to inserts.** A seal writes one part
+      per partition, of about 330 bytes at least, and seals are not
+      checked against the quota, so 6,000 events one per hourly partition
+      grow from 282 KB unsealed to 1.98 MB sealed and can carry a database
+      7 times past its quota. Charge the part overhead of each partition an
+      insert opens when the insert commits.
 - [ ] **Charge event queries to the node memory budget.** A query's
       aggregation state, kept rows and lookup maps (up to 1 GiB each,
       `exec::Limits`) are charged to the query only, so

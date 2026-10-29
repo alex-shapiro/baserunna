@@ -101,6 +101,11 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       one masked row takes 441 store `GET`s against 303 unmasked. It also
       records bucket keys the part's directory does not list, which are
       never looked up. Plan each output column while the merge reads it.
+- [ ] **Charge cached segment blocks their decoded size.** The block cache
+      charges a decoded entry its key and value bytes plus 48
+      (`CacheVal::size`), while an `Entry` and its `Bytes` handles take about
+      twice that, so a cache of small entries holds about twice
+      `cache_bytes` (a table scan retaining 29.5 MB of heap counted 15.7 MB).
 - [ ] **Bound merge memory.** `merge_parts` holds the sort key of every live
       input row at once, so a final merge of 4 GiB of small events holds
       hundreds of MB of keys. Merge sorted runs block by block instead.

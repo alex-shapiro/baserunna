@@ -552,6 +552,21 @@ mod tests {
         });
     }
 
+    /// An NDJSON append is a JSON entry point too: an integer outside both
+    /// 64-bit ranges is refused rather than read back as a rounded float.
+    #[test]
+    fn ndjson_appends_refuse_inexact_integers() {
+        run_paused(async {
+            let (w, router, t) = world().await;
+            let body = "{\"n\": 123456789012345678901234567890}\n";
+            let ct = [("content-type", "application/x-ndjson")];
+            let (status, r) = send(&router, &t, "POST", &format!("{S}/records"), &ct, body).await;
+            let (_, read) = send(&router, &t, "GET", &format!("{S}/records?tail=1"), &[], "").await;
+            assert_eq!(status, 400, "appended {r}; the stream now holds {}", read["records"]);
+            w.shutdown();
+        });
+    }
+
     async fn send(
         router: &axum::Router,
         t: &str,

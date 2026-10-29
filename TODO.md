@@ -94,6 +94,13 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       events holds several hundred bytes per row while it is built and a
       32 MiB bulk insert of 14-byte events peaks at about 11x its body
       (`tests/memory_bound.rs`). Decode straight into column vectors.
+- [ ] **Read masked merge inputs once.** Before merging a part with
+      deletions, `maint::census` reads its string and JSON columns to plan
+      the output's dictionaries and paths from live rows, and the merge
+      then fetches the same blocks again: rewriting a 3,000-row part with
+      one masked row takes 441 store `GET`s against 303 unmasked. It also
+      records bucket keys the part's directory does not list, which are
+      never looked up. Plan each output column while the merge reads it.
 - [ ] **Bound merge memory.** `merge_parts` holds the sort key of every live
       input row at once, so a final merge of 4 GiB of small events holds
       hundreds of MB of keys. Merge sorted runs block by block instead.

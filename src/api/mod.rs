@@ -143,48 +143,11 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for JsonBody<T> {
 }
 
 /// Parses JSON text a request carries, refusing integers it would round
-/// (see [`refuse_inexact_integers`]); the error says what is wrong.
+/// (see [`crate::util::json::refuse_inexact_integers`]); the error says
+/// what is wrong.
 pub(crate) fn parse_json<T: DeserializeOwned>(text: &[u8]) -> std::result::Result<T, String> {
-    refuse_inexact_integers(text).map_err(|e| e.message())?;
+    crate::util::json::refuse_inexact_integers(text)?;
     serde_json::from_slice(text).map_err(|e| e.to_string())
-}
-
-/// Refuses JSON text holding an integer literal outside both the signed and
-/// the unsigned 64-bit range, which `serde_json` would silently round to a
-/// float.
-pub(crate) fn refuse_inexact_integers(text: &[u8]) -> Result<()> {
-    let mut i = 0;
-    while i < text.len() {
-        match text[i] {
-            b'"' => {
-                i += 1;
-                while i < text.len() && text[i] != b'"' {
-                    i += if text[i] == b'\\' { 2 } else { 1 };
-                }
-                i += 1;
-            }
-            b'-' | b'0'..=b'9' => {
-                let start = i;
-                i += 1;
-                while i < text.len() && matches!(text[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') {
-                    i += 1;
-                }
-                let lit = std::str::from_utf8(&text[start..i]).unwrap_or_default();
-                let digits = lit.strip_prefix('-').unwrap_or(lit);
-                if !digits.is_empty()
-                    && digits.bytes().all(|c| c.is_ascii_digit())
-                    && lit.parse::<i64>().is_err()
-                    && lit.parse::<u64>().is_err()
-                {
-                    return Err(Error::invalid(format!(
-                        "integer {lit} is outside the 64-bit range; send it as a string"
-                    )));
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    Ok(())
 }
 
 /// Extracts a bearer token or session cookie from `headers`.
@@ -1099,62 +1062,6 @@ pub(crate) fn name_paging(q: &Params) -> Result<(String, usize, Option<String>)>
 mod tests {
     use super::*;
     use tower::ServiceExt;
-
-    /// Integer literals are refused exactly when they fit neither 64-bit
-    /// range, wherever they sit in a JSON text, and never inside strings or
-    /// as float literals.
-    #[test]
-    fn inexact_integers_are_refused_exactly() {
-        use crate::util::rng::Rng;
-        fn digits(r: &mut Rng) -> String {
-            let n = 1 + r.usize(28);
-            let mut d: String = (0..n).map(|_| char::from(b'0' + r.below(10) as u8)).collect();
-            if d.len() > 1 && d.starts_with('0') {
-                d.replace_range(0..1, "1");
-            }
-            d
-        }
-        fn value(r: &mut Rng, depth: usize, inexact: &mut bool) -> String {
-            match r.usize(if depth > 2 { 4 } else { 6 }) {
-                0 => {
-                    let lit = format!("{}{}", if r.chance(0.5) { "-" } else { "" }, digits(r));
-                    let v: i128 = lit.parse().unwrap();
-                    *inexact |= v < i64::MIN as i128 || v > u64::MAX as i128;
-                    lit
-                }
-                1 => format!("{}.{}e{}", digits(r), digits(r), r.below(20)),
-                2 => format!("\"{}\\\" {}\"", digits(r), digits(r)),
-                3 => ["true", "null", "\"\\\\\"", "-0"][r.usize(4)].to_string(),
-                4 => {
-                    let n = r.usize(4);
-                    format!("[{}]", (0..n).map(|_| value(r, depth + 1, inexact)).collect::<Vec<_>>().join(", "))
-                }
-                _ => {
-                    let n = r.usize(4);
-                    let fields: Vec<String> =
-                        (0..n).map(|k| format!("\"{k}\": {}", value(r, depth + 1, inexact))).collect();
-                    format!("{{{}}}", fields.join(","))
-                }
-            }
-        }
-        crate::util::prop::check(
-            "inexact_integers_are_refused_exactly",
-            5000,
-            |r| {
-                let mut inexact = false;
-                let text = value(r, 0, &mut inexact);
-                (text, inexact)
-            },
-            |_| Vec::new(),
-            |(text, inexact)| {
-                serde_json::from_str::<serde_json::Value>(text).map_err(|e| format!("{text}: {e}"))?;
-                match (refuse_inexact_integers(text.as_bytes()).is_err(), *inexact) {
-                    (a, b) if a == b => Ok(()),
-                    (refused, _) => Err(format!("{text}: refused {refused}")),
-                }
-            },
-        );
-    }
 
     #[test]
     fn only_routes_finishing_a_transaction_may_overdraw() {

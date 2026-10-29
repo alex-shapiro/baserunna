@@ -176,7 +176,7 @@ const BODY_SHAPE: &str = "the body is {\"rows\": [...]}, an array of events, or 
 /// of events or NDJSON, as it is parsed, so that a body is never held as a
 /// whole parsed value; returns the body's idempotency key.
 fn each_event(content_type: &str, data: &[u8], f: &mut dyn FnMut(Json) -> Result<()>) -> Result<Option<String>> {
-    super::refuse_inexact_integers(data)?;
+    crate::util::json::refuse_inexact_integers(data).map_err(Error::invalid)?;
     match content_type {
         "" | "application/json" => {
             let mut failed = None;

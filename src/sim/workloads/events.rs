@@ -325,8 +325,9 @@ fn random_query(c: &Client, base: i64, extra: bool, uid: Option<String>) -> Json
         q["consistency"] = json!("strong");
     }
     if r.chance(0.2) {
-        q["columns"] = json!(["uid", "g", "kind"]);
-        q["order_by"] = json!([{"col": "uid", "desc": r.chance(0.5)}]);
+        let by_time = r.chance(0.5);
+        q["columns"] = if by_time { json!(["time", "uid"]) } else { json!(["uid", "g", "kind"]) };
+        q["order_by"] = json!([{"col": if by_time { "time" } else { "uid" }, "desc": r.chance(0.5)}]);
         q["limit"] = json!(1 + r.usize(10));
         return q;
     }
@@ -415,6 +416,14 @@ fn model_answer(q: &Json, rows: &[&Ev], persons: &BTreeMap<String, String>) -> V
     let (from, to) = (q["from"].as_i64().unwrap_or(0), q["to"].as_i64().unwrap_or(0));
     let sel: Vec<&&Ev> =
         rows.iter().filter(|e| e.time >= from && e.time < to && q.get("where").is_none_or(|f| holds(e, f))).collect();
+    if q["order_by"][0]["col"] == "time" {
+        let mut by_time: Vec<&&Ev> = sel;
+        by_time.sort_by_key(|e| e.time);
+        if q["order_by"][0]["desc"] == true {
+            by_time.reverse();
+        }
+        return by_time.iter().map(|e| vec![json!(e.time), json!(e.uid)]).collect();
+    }
     if let Some(cols) = q.get("columns") {
         let desc = q["order_by"][0]["desc"].as_bool().unwrap_or(false);
         let mut uids: Vec<&&Ev> = sel;
@@ -532,6 +541,11 @@ fn check_answers(g: &World) -> Result<usize, String> {
             .iter()
             .map(|r| r.as_array().cloned().unwrap_or_default())
             .collect();
+        if q["order_by"][0]["col"] == "time" {
+            time_page_matches(q, &got, &want).map_err(|e| format!("query {q} at v{v}: {e}"))?;
+            checked += 1;
+            continue;
+        }
         let ordered = q.get("columns").is_some();
         if normalize(&got, ordered) != normalize(&want, ordered) {
             return Err(format!("query {q} at v{v}\n got {got:?}\nwant {want:?}"));
@@ -539,6 +553,26 @@ fn check_answers(g: &World) -> Result<usize, String> {
         checked += 1;
     }
     Ok(checked)
+}
+
+/// Whether `got`, a page of `[time, uid]` rows by time, holds the times of
+/// the first rows of `want`, every match in that order, and only matches;
+/// rows of equal times come in insertion order, which the model does not
+/// know, so they may be any of the matches at that time.
+fn time_page_matches(q: &Json, got: &[Vec<Json>], want: &[Vec<Json>]) -> Result<(), String> {
+    let limit = q["limit"].as_u64().unwrap_or(100) as usize;
+    let times = |rows: &[Vec<Json>]| rows.iter().map(|r| r[0].as_i64()).collect::<Vec<_>>();
+    let page = &want[..want.len().min(limit)];
+    if times(got) != times(page) {
+        return Err(format!("times {:?}, want {:?}", times(got), times(page)));
+    }
+    let matches: BTreeSet<(Option<i64>, String)> = want.iter().map(|r| (r[0].as_i64(), r[1].to_string())).collect();
+    let uids: BTreeSet<String> = got.iter().map(|r| r[1].to_string()).collect();
+    match got.iter().find(|r| !matches.contains(&(r[0].as_i64(), r[1].to_string()))) {
+        Some(r) => Err(format!("{r:?} matches no event")),
+        None if uids.len() < got.len() => Err(format!("an event is repeated in {got:?}")),
+        None => Ok(()),
+    }
 }
 
 /// Reads every live row's uid at a strong snapshot.

@@ -44,13 +44,7 @@ pub const COMMIT_SPACE: u8 = 0xFF;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitRecord {
-    /// An applied commit, with what a replay of its request reports: its
-    /// stream appends, and the events a bulk insert added.
-    Applied {
-        time_ms: u64,
-        appends: Vec<Appended>,
-        inserted: Option<u64>,
-    },
+    Applied { time_ms: u64, appends: Vec<Appended>, inserted: Option<u64> },
     Aborted,
 }
 

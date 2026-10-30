@@ -1,28 +1,26 @@
-//! Event table schemas, row validation, time parsing and partitioning.
+//! Event table schemas, row validation, time parsing, and partitioning.
 
 use crate::error::{Error, Result};
 use crate::table::schema::{Datum, Row, valid_ident};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json, json};
 
-/// Most columns an event table declares.
 pub const COLUMNS_MAX: usize = 256;
-/// Largest encoded row.
 pub const ROW_MAX_BYTES: usize = 1 << 20;
-/// The most bytes an event's columns hold in a part, its JSON objects
-/// flattened to paths; see [`super::build::stored_len`].
+/// Maximum byte length of a row's column values in a part after JSON objects
+/// are flattened to paths; see [`super::build::stored_len`].
 pub const ROW_STORED_MAX_BYTES: usize = 4 * ROW_MAX_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EvType {
-    /// Milliseconds since the epoch.
+    /// Milliseconds since the Unix epoch.
     Time,
     String,
     Int,
     Float,
     Bool,
-    /// A JSON object, flattened into paths in parts.
+    /// JSON object flattened into leaf paths in parts.
     Json,
 }
 
@@ -50,7 +48,7 @@ pub struct EvColumn {
     pub default: Option<Json>,
 }
 
-/// The span of time each partition covers, in UTC.
+/// Time interval covered by each partition, in UTC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Granularity {
@@ -90,7 +88,8 @@ pub struct EventSchema {
     pub next_column_id: u32,
 }
 
-/// The default of a time column that takes the inserting node's clock.
+/// Default value for a time column that evaluates to the inserting node's
+/// wall-clock time.
 pub const NOW: &str = "now";
 
 const MS_PER_HOUR: i64 = 3_600_000;
@@ -109,7 +108,6 @@ impl EventSchema {
         self.column(&self.time_column).map_or(0, |c| c.id)
     }
 
-    /// Column ids of the sort key, in order.
     pub fn sort_ids(&self) -> Vec<u32> {
         self.order_by.iter().filter_map(|n| self.column(n)).map(|c| c.id).collect()
     }
@@ -123,13 +121,13 @@ impl EventSchema {
             return Err(Error::invalid(format!("invalid event table name {:?}", self.name)));
         }
         if self.columns.is_empty() || self.columns.len() > COLUMNS_MAX {
-            return Err(Error::invalid(format!("an event table needs 1..={COLUMNS_MAX} columns")));
+            return Err(Error::invalid(format!("an event table requires 1..={COLUMNS_MAX} columns")));
         }
         let mut seen = std::collections::BTreeSet::new();
         for c in &self.columns {
             if !valid_ident(&c.name) || c.name.starts_with('_') {
                 return Err(Error::invalid(format!(
-                    "invalid column name {:?}: names match [a-zA-Z][a-zA-Z0-9_]{{0,63}}",
+                    "invalid column name {:?}: names must match [a-zA-Z][a-zA-Z0-9_]{{0,63}}",
                     c.name
                 )));
             }
@@ -161,10 +159,10 @@ impl EventSchema {
             .column(&self.time_column)
             .ok_or_else(|| Error::invalid(format!("time column {:?} does not exist", self.time_column)))?;
         if time.ty != EvType::Time || time.nullable {
-            return Err(Error::invalid("the time column has type time and is not nullable"));
+            return Err(Error::invalid("the time column must have type time and cannot be nullable"));
         }
         if self.order_by.is_empty() || self.order_by.len() > 8 {
-            return Err(Error::invalid("order_by names 1..=8 columns"));
+            return Err(Error::invalid("order_by must specify 1..=8 columns"));
         }
         let mut keyed = std::collections::BTreeSet::new();
         for n in &self.order_by {
@@ -210,10 +208,10 @@ impl EventSchema {
         })
     }
 
-    /// Validates a JSON object as a row of this table, filling defaults; a
-    /// time column defaulting to [`NOW`] takes `now_ms`.
+    /// Validates JSON object `v` as a row of this table and fills default
+    /// values, using `now_ms` for time columns that default to [`NOW`].
     pub fn row(&self, v: &Json, now_ms: i64) -> Result<Row> {
-        let Json::Object(o) = v else { return Err(Error::invalid("an event is a JSON object")) };
+        let Json::Object(o) = v else { return Err(Error::invalid("an event must be a JSON object")) };
         if let Some(k) = o.keys().find(|k| self.column(k).is_none()) {
             return Err(Error::invalid(format!("unknown column {k:?}")));
         }
@@ -235,7 +233,6 @@ impl EventSchema {
         Ok(row)
     }
 
-    /// The time of a validated row.
     pub fn time_of(&self, row: &Row) -> i64 {
         match row.get(&self.time_id()) {
             Some(Datum::Int(t)) => *t,
@@ -243,8 +240,7 @@ impl EventSchema {
         }
     }
 
-    /// The earliest time retained at `now_ms`: queries skip earlier events,
-    /// and maintenance drops parts holding only earlier events.
+    /// Returns the earliest timestamp retained at `now_ms`.
     pub fn retained_from(&self, now_ms: i64) -> i64 {
         match self.retention_ms {
             Some(r) => now_ms.saturating_sub(r.min(i64::MAX as u64) as i64),
@@ -252,12 +248,12 @@ impl EventSchema {
         }
     }
 
-    /// The partition bucket holding time `t`.
     pub fn bucket(&self, t: i64) -> i64 {
         bucket_of(self.partition, t)
     }
 
-    /// The first millisecond of partition bucket `b`, and the first of the next.
+    /// Returns the inclusive start and exclusive end timestamps in milliseconds
+    /// for partition bucket `b`.
     pub fn bucket_span(&self, b: i64) -> (i64, i64) {
         bucket_span(self.partition, b)
     }
@@ -284,14 +280,15 @@ pub fn bucket_span(g: Granularity, b: i64) -> (i64, i64) {
     }
 }
 
-/// The first millisecond of month `m` counted from January 1970.
+/// Returns the first millisecond of month `m`, where `0` is January 1970.
 pub fn month_start(m: i64) -> i64 {
     let y = 1970 + m.div_euclid(12);
     let mo = m.rem_euclid(12) as u32 + 1;
     days_from_civil(y, mo, 1) * MS_PER_DAY
 }
 
-/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
+/// Converts a proleptic Gregorian date to days since 1970-01-01 using Howard
+/// Hinnant's algorithm.
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -315,8 +312,8 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Parses an RFC 3339 timestamp such as `2025-10-01T12:30:00.250Z` or
-/// `2025-10-01 12:30:00+02:00` into milliseconds since the epoch.
+/// Parses an RFC 3339 timestamp or `YYYY-MM-DD` date into milliseconds since
+/// the Unix epoch.
 pub fn parse_rfc3339(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     let num = |r: std::ops::Range<usize>| -> Option<i64> {
@@ -382,15 +379,12 @@ fn days_in_month(y: i64, m: u32) -> u32 {
     }
 }
 
-/// The most bytes a column's default takes as JSON: every event written
-/// without the column holds a copy.
 pub const DEFAULT_MAX_BYTES: usize = 1024;
 
-/// Converts a JSON value to a datum of column `c`'s type.
-/// Times an event table stores, in milliseconds: years 0000 to 9999, which
-/// RFC 3339 can express.
+/// Supported millisecond timestamp range from year 0000 through year 9999.
 pub const TIME_RANGE: std::ops::RangeInclusive<i64> = -62_167_219_200_000..=253_402_300_799_999;
 
+/// Converts JSON value `v` to a [`Datum`] matching column `c`'s type.
 pub fn datum(c: &EvColumn, v: &Json) -> Result<Datum> {
     if v.is_null() {
         return Ok(Datum::Null);
@@ -424,7 +418,7 @@ pub fn datum(c: &EvColumn, v: &Json) -> Result<Datum> {
             if !f.is_finite() {
                 return Err(bad());
             }
-            // -0.0 is stored as 0.0, which it equals, so statistics need not order the two.
+            // Canonicalize -0.0 to 0.0 so min/max statistics do not depend on zero sign.
             Datum::Float(if f == 0.0 { 0.0 } else { f })
         }
         EvType::Bool => Datum::Bool(v.as_bool().ok_or_else(bad)?),
@@ -435,7 +429,6 @@ pub fn datum(c: &EvColumn, v: &Json) -> Result<Datum> {
     })
 }
 
-/// A row as JSON with column names.
 pub fn row_json(s: &EventSchema, row: &Row) -> Map<String, Json> {
     let mut o = Map::new();
     for c in &s.columns {
@@ -471,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn schemas_validate() {
+    fn schema_validation() {
         let s = sample();
         s.validate().unwrap();
         let bad = |f: &dyn Fn(&mut EventSchema)| {
@@ -494,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_validate_and_default() {
+    fn row_validation_and_defaults() {
         let s = sample();
         let r = s.row(&json!({"event": "a", "properties": {"x": 1}}), 77).unwrap();
         assert_eq!(s.time_of(&r), 77);
@@ -521,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn calendars_roundtrip_and_buckets_contain_their_times() {
+    fn calendar_roundtrip_and_bucket_bounds() {
         let mut r = Rng::new(3);
         for _ in 0..20_000 {
             let days = r.below(200_000) as i64 - 100_000;

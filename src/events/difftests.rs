@@ -1,6 +1,5 @@
-//! Differential tests: the same events in a database that never seals and in
-//! one that seals and merges with tiny granules and JSON directories, both
-//! checked against the reference evaluator of [`super::reference`].
+//! Differential tests comparing an unsealed database, a database with sealed
+//! and merged parts, and the [`super::reference`] evaluator.
 
 use super::exec::{self, Limits};
 use super::query::{Filter, Query};
@@ -29,11 +28,8 @@ const EVS: [&str; 10] = [
 const T0: i64 = 1_700_000_000_000;
 const INTERVALS: [&str; 11] = ["1s", "90m", "1h", "6h", "1d", "7d", "1w", "2w", "1mo", "3mo", "12mo"];
 const OFFSETS: [&str; 5] = ["Z", "+05:30", "-08:00", "+14:00", "-23:59"];
-/// Lookups that queries declare, besides `plan`, `nn` and `meta`.
 const MORE_LOOKUPS: [&str; 4] = ["pk", "fl", "xs", "bk"];
 
-/// The lookups every generated query declares: with defaults of each kind
-/// of expression or none, and keys of other types than the table's.
 fn lookups() -> Json {
     json!({
         "plan": {"table": "people", "key": {"col": "user"}, "value": "plan", "default": {"col": "event"}},
@@ -47,7 +43,6 @@ fn lookups() -> Json {
     })
 }
 
-/// Times at the edges of what tables hold and of calendar units.
 fn extreme_times() -> Vec<i64> {
     let at = |y, m, d, ms: i64| rf::days_of(y, m, d) * DAY + ms;
     vec![
@@ -91,7 +86,6 @@ async fn query_at(db: &Arc<Db>, q: &Json, c: Consistency) -> Result<exec::Output
 
 static VARIANT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The table's definition: a sort key and partitioning that vary by seed.
 pub(super) fn table_json() -> Json {
     let v = VARIANT.load(std::sync::atomic::Ordering::Relaxed);
     let order_by =
@@ -121,8 +115,6 @@ pub(super) fn table_def() -> CreateEvents {
     serde_json::from_value(table_json()).unwrap()
 }
 
-/// Rows of the lookup tables: `people`, keyed by string, one of whose
-/// people has no plan, and `nums`, keyed by int.
 fn lookup_rows() -> Vec<(&'static str, Json)> {
     let mut rows = Vec::new();
     for i in 0..8 {
@@ -139,7 +131,6 @@ fn lookup_rows() -> Vec<(&'static str, Json)> {
     rows
 }
 
-/// A reference holding what [`create_db`] creates.
 pub(super) fn reference() -> Reference {
     let mut tables = BTreeMap::new();
     for name in ["people", "nums"] {
@@ -288,10 +279,6 @@ impl G {
         }
     }
 
-    /// An `in` test with up to the longest list, mostly of values that no
-    /// row holds, and otherwise of values that rows hold in another form:
-    /// integers for integral floats, `-0.0` for `0`, objects with their keys
-    /// in another order.
     fn long_in(&mut self) -> Json {
         let kind = self.r.usize(4);
         let n = 1 + self.r.usize(crate::filter::LIST_MAX);
@@ -593,7 +580,7 @@ impl G {
     }
 }
 
-/// Runs `q` on both databases, paging through rows mode with each one's own cursors.
+/// Runs `q` on both databases, paging through row results using each database's cursors.
 async fn compare(a: &Arc<Db>, b: &Arc<Db>, q: &Json) -> std::result::Result<bool, String> {
     let mut qa = q.clone();
     let mut qb = q.clone();
@@ -659,8 +646,7 @@ async fn compare(a: &Arc<Db>, b: &Arc<Db>, q: &Json) -> std::result::Result<bool
     }
 }
 
-/// Checks a snapshot read's answer to `q` against some recent state of the
-/// reference: a snapshot is at most 5 s old, so it may miss recent writes.
+/// Verifies a snapshot read with up to 5 s staleness against the recent reference history.
 async fn check_snapshot(db: &Arc<Db>, history: &[Reference], q: &Json) -> std::result::Result<(), String> {
     let mut q = q.clone();
     if q.get("columns").is_some() || q.get("aggregates").is_none() {
@@ -674,11 +660,10 @@ async fn check_snapshot(db: &Arc<Db>, history: &[Reference], q: &Json) -> std::r
             return Ok(());
         }
     }
-    last.map_err(|e| format!("a snapshot read matches no recent state; against the oldest: {e}"))
+    last.map_err(|e| format!("snapshot read did not match any recent reference state; oldest: {e}"))
 }
 
-/// Checks `db`'s answer to `q`, every page of it in rows mode, against the
-/// reference's.
+/// Verifies the result of `q` on `db` against `r` across all cursor pages.
 async fn check_ref(db: &Arc<Db>, r: &Reference, q: &Json, c: Consistency) -> std::result::Result<(), String> {
     let Ok(parsed) = Query::parse(q.clone()) else { return Ok(()) };
     let want = r.query(&parsed);
@@ -687,9 +672,9 @@ async fn check_ref(db: &Arc<Db>, r: &Reference, q: &Json, c: Consistency) -> std
     loop {
         match (query_at(db, &page_q, c).await, &want) {
             (Err(_), Err(_)) if pages.is_empty() => return Ok(()),
-            (Err(e), _) => return Err(format!("query {page_q}\nthe engine refused: {e}; the reference: {want:?}")),
+            (Err(e), _) => return Err(format!("query {page_q}\nengine rejected: {e}; reference: {want:?}")),
             (Ok(o), Err(w)) => {
-                return Err(format!("query {q}\nthe engine answered {:?}; the reference refuses: {w}", o.rows));
+                return Err(format!("query {q}\nengine returned {:?}; reference rejected: {w}", o.rows));
             }
             (Ok(o), Ok(_)) => {
                 columns.clear();
@@ -716,7 +701,7 @@ async fn check_ref(db: &Arc<Db>, r: &Reference, q: &Json, c: Consistency) -> std
         }
         let got = query_at(db, &fq, c).await.map(|o| o.rows);
         let want = r.query(&Query::parse(fq).unwrap());
-        first = format!("\nfirst stage: the engine {got:?}\nthe reference {want:?}");
+        first = format!("\nfirst stage: engine {got:?}\nreference {want:?}");
     }
     Err(format!("query {q}\n{e}{first}"))
 }
@@ -742,7 +727,6 @@ pub(super) async fn run(seed: u64, steps: usize) -> std::result::Result<usize, S
     };
     let mut g = G { r, t: T0, added: Vec::new(), dropped: false };
     let mut model = reference();
-    // Reference states, newest last, for snapshot reads.
     let mut history = vec![model.clone()];
     let bind: super::bulk::BindFn = Arc::new(|db: Arc<Db>, b| Box::pin(async move { db.bind(b).await }));
     let bufs = super::bulk::Buffers::new(super::bulk::BufferConfig { wait_ms: 0, max_bytes: 4096 }, bind);
@@ -850,7 +834,7 @@ pub(super) async fn run(seed: u64, steps: usize) -> std::result::Result<usize, S
 }
 
 #[test]
-fn diff_unsealed_and_sealed_answer_alike() {
+fn diff_unsealed_and_sealed_queries() {
     let seeds: u64 = std::env::var("DIFF_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
     let first: u64 = std::env::var("DIFF_FIRST").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let steps: usize = std::env::var("DIFF_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(150);
@@ -874,8 +858,6 @@ fn diff_unsealed_and_sealed_answer_alike() {
     eprintln!("answered {answered}; errors {:?}", errs);
 }
 
-/// `funnel` answers like a literal simulation of every attempt, one per event
-/// matching the first step, in every combination of modes.
 #[test]
 fn diff_funnel_matches_brute_force() {
     use super::agg::funnel;
@@ -931,11 +913,8 @@ fn diff_funnel_matches_brute_force() {
     }
 }
 
-/// Counts of random filters over sealed and unsealed events, against the
-/// reference's: comparisons of every op on columns, JSON paths of mixed
-/// types, lookups and buckets, and refusals of mistyped arguments.
 #[test]
-fn diff_filters_match_the_json_reference() {
+fn diff_filters_match_reference() {
     let seeds: u64 = std::env::var("DIFF_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
     let mut bad = Vec::new();
     let mut checked = 0;
@@ -983,8 +962,6 @@ fn diff_filters_match_the_json_reference() {
     assert!(bad.is_empty(), "{} of {checked} filters differ", bad.len());
 }
 
-/// A database named `id` holding `rows`, inserted in batches of which some
-/// are sealed into parts, then merged, and a reference holding them.
 async fn load(eng: &Arc<Engine>, id: &str, rows: &[Json], r: &mut Rng) -> (Arc<Db>, Reference) {
     let db = create_db(eng, id).await;
     let table = {
@@ -1006,9 +983,6 @@ async fn load(eng: &Arc<Engine>, id: &str, rows: &[Json], r: &mut Rng) -> (Arc<D
     (db, model)
 }
 
-/// `uniq` counts exactly up to 1,024 distinct values, whether they arrive in
-/// one part or many, as integers or as equal floats, and within a few
-/// percent beyond.
 #[test]
 fn diff_uniq_is_exact_up_to_1024_values() {
     rt().block_on(async {
@@ -1043,10 +1017,8 @@ fn diff_uniq_is_exact_up_to_1024_values() {
     });
 }
 
-/// `quantiles` answers within 1% of a value at each level's rank, over
-/// values spanning every magnitude and sign, sealed and merged or not.
 #[test]
-fn diff_quantiles_are_within_one_percent() {
+fn diff_quantiles_stay_within_error_bound() {
     rt().block_on(async {
         let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, event_granule_rows: 61, ..EngineConfig::small_for_tests() };
         let (eng, _store, env) = engine(6, cfg);
@@ -1086,9 +1058,6 @@ fn diff_quantiles_are_within_one_percent() {
     });
 }
 
-/// A float sum beyond the double range answers null, so a second stage
-/// that reads it should see null: not count it as a distinct value, nor
-/// group it apart from other nulls, nor sort it above every number.
 #[test]
 fn float_sum_overflow_is_null_in_then() {
     rt().block_on(async {
@@ -1105,7 +1074,7 @@ fn float_sum_overflow_is_null_in_then() {
         let first = json!({"from": T0, "to": T0 + DAY, "group_by": ["user"],
             "aggregates": {"s": {"fn": "sum", "of": "x"}, "a": {"fn": "avg", "of": "x"}}});
         let out = query(&db, &first).await.unwrap();
-        assert_eq!(out.rows[0], [json!("big"), json!(1e308), Json::Null], "the sum answers null");
+        assert_eq!(out.rows[0], [json!("big"), json!(1e308), Json::Null], "sum overflow is null");
         let mut q = first.clone();
         q["then"] =
             json!({"aggregates": {"sums": {"fn": "uniq_exact", "of": "s"}, "avgs": {"fn": "uniq_exact", "of": "a"}}});
@@ -1116,17 +1085,13 @@ fn float_sum_overflow_is_null_in_then() {
         assert_eq!(
             (distinct[0].clone(), order.iter().map(|r| r[0].clone()).collect::<Vec<_>>()),
             (vec![json!(2), json!(2)], vec![json!("one"), json!("none"), json!("big")]),
-            "distinct non-null sums and averages; users by sum, nulls last when descending"
+            "distinct non-null sums and averages; nulls sort last in descending order"
         );
     });
 }
 
-/// A delete's filter is bound only when a row or part falls in its range, so
-/// one naming a column that does not exist (or a lookup, or a whole JSON
-/// column) deletes nothing with 200 over unsealed rows, but fails with 400
-/// once the same events are sealed into a part of the partition.
 #[test]
-fn delete_filters_are_validated_whatever_the_storage() {
+fn delete_validates_filter_on_empty_range() {
     rt().block_on(async {
         let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::small_for_tests() };
         let (eng, _store, env) = engine(1, cfg);
@@ -1152,8 +1117,6 @@ fn delete_filters_are_validated_whatever_the_storage() {
     });
 }
 
-/// Numbers compare by exact value as scalars, but through f64 inside JSON
-/// arrays: [2^60 as a float] equals and contains 2^60 + 1.
 #[test]
 fn json_array_numbers_compare_exactly() {
     rt().block_on(async {
@@ -1176,7 +1139,7 @@ fn json_array_numbers_compare_exactly() {
 }
 
 #[test]
-fn json_values_equal_in_filters_group_alike() {
+fn equal_json_values_share_group_key() {
     rt().block_on(async {
         let (eng, _store, env) = engine(1, EngineConfig::small_for_tests());
         env.spawn(async {});
@@ -1190,26 +1153,24 @@ fn json_values_equal_in_filters_group_alike() {
             "group_by": [{"col": "props", "path": ["a"], "as": "a"}], "aggregates": {"n": {"fn": "count"},
             "u": {"fn": "uniq_exact", "of": {"col": "props", "path": ["a"]}}}});
         let out = query(&db, &q).await.unwrap();
-        assert_eq!(out.rows.len(), 1, "values the filter calls equal form {:?}", out.rows);
+        assert_eq!(out.rows.len(), 1, "equal values must be grouped together: {:?}", out.rows);
     });
 }
 
 #[test]
-fn rows_mode_refuses_duplicate_output_names() {
+fn rows_mode_rejects_duplicate_output_names() {
     rt().block_on(async {
         let (eng, _store, env) = engine(1, EngineConfig::small_for_tests());
         env.spawn(async {});
         let db = create_db(&eng, "d").await;
         let q = json!({"from": T0, "to": T0 + DAY, "columns": ["n", {"col": "x", "as": "n"}]});
         let r = query(&db, &q).await;
-        assert!(r.is_err(), "answered columns {:?}", r.map(|o| o.columns));
+        assert!(r.is_err(), "returned columns {:?}", r.map(|o| o.columns));
     });
 }
 
-/// A float column refuses integer arguments beyond i64, as no event holds
-/// them, rather than rounding u64::MAX to 2^64; floats still compare.
 #[test]
-fn float_columns_refuse_integers_beyond_i64() {
+fn float_columns_reject_integers_beyond_i64() {
     rt().block_on(async {
         let (eng, _store, env) = engine(1, EngineConfig::small_for_tests());
         env.spawn(async {});
@@ -1226,17 +1187,15 @@ fn float_columns_refuse_integers_beyond_i64() {
         let le = count(json!({"col": "x", "op": "le", "value": big})).await;
         assert!(
             [&eq, &gt, &le].iter().all(|r| matches!(r, Err(Error::InvalidArgument(_)))),
-            "x = 2^64: eq, gt, le u64::MAX answered {eq:?} {gt:?} {le:?}"
+            "x = 2^64: eq, gt, le u64::MAX returned {eq:?} {gt:?} {le:?}"
         );
         let ge = count(json!({"col": "x", "op": "ge", "value": 18446744073709551616.0})).await;
         assert_eq!(ge.ok(), Some(1));
     });
 }
 
-/// A row-table float column refuses an integer no float equals instead of
-/// rounding it, so it never answers unlike a JSON column holding the value.
 #[test]
-fn row_table_float_columns_refuse_integers_no_float_equals() {
+fn row_table_float_columns_reject_inexact_integers() {
     rt().block_on(async {
         let (eng, _store, env) = engine(1, EngineConfig::small_for_tests());
         env.spawn(async {});
@@ -1261,12 +1220,10 @@ fn row_table_float_columns_refuse_integers_no_float_equals() {
             "2^53 eq 2^53 + 1: in a JSON column {json_col:?}, in a float column {float_col:?}"
         );
         let exact = n(json!({"col": "score", "op": "eq", "value": 9007199254740992i64})).await;
-        assert_eq!(exact.ok(), Some(1), "an integer a float equals compares");
+        assert_eq!(exact.ok(), Some(1));
     });
 }
 
-/// Each funnel attempt is judged on its own events: an attempt whose window
-/// expired days ago neither ends nor shortens a later, clean one.
 #[test]
 fn funnel_modes_ignore_expired_attempts() {
     rt().block_on(async {
@@ -1292,7 +1249,6 @@ fn funnel_modes_ignore_expired_attempts() {
     });
 }
 
-/// A mean of finite values is finite even when their sum is beyond f64.
 #[test]
 fn avg_of_huge_values_is_finite() {
     rt().block_on(async {

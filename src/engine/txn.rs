@@ -66,8 +66,7 @@ pub struct WriteSet {
     /// blobs are already bound in the manifest, commit validation skips staging checks
     /// and quota additions for them.
     pub copied_blobs: std::collections::BTreeSet<String>,
-    /// Changes to event tables, applied after `streams` by the committer,
-    /// which gives inserted rows their positions (SPEC §5.13).
+    /// Event table operations applied after `streams` at commit (SPEC §5.13).
     pub events: Vec<EventOp>,
 }
 
@@ -496,21 +495,19 @@ impl Txn {
         Ok(())
     }
 
-    /// Whether the transaction inserts events into `table`, which its reads
-    /// of the table cannot see before commit.
+    /// Returns true if the transaction has buffered event inserts for `table`.
+    /// Uncommitted event inserts are not visible to reads in the same transaction.
     pub fn inserts_events(&self, table: u32) -> bool {
         self.writes.events.iter().any(|op| matches!(op, EventOp::Insert { table: t, .. } if *t == table))
     }
 
-    /// Records an event op that accounts for puts the transaction made itself.
     pub fn event_op(&mut self, op: EventOp) -> Result<()> {
         self.account(64)?;
         self.writes.events.push(op);
         Ok(())
     }
 
-    /// Records a read of `range` in the read set without reading it, for
-    /// reads performed on the snapshot directly.
+    /// Adds `range` to the transaction's read set for reads performed directly on the snapshot.
     pub fn note_read(&mut self, range: KeyRange) {
         self.reads.push(ReadItem::Range(range));
     }

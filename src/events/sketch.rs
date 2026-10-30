@@ -1,14 +1,10 @@
-//! Mergeable summaries for aggregates whose results must not depend on how
-//! rows are split across parts, merges and seals: an exact float sum, a
-//! HyperLogLog distinct count and a DDSketch quantile summary. Each merge
-//! is commutative and associative, so a query's answer depends only on the
-//! rows it aggregated.
+//! Commutative, associative aggregate summaries: exact float sums,
+//! HyperLogLog distinct counts, and DDSketch quantile summaries.
 
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
 use std::collections::BTreeMap;
 
-/// A 64-bit hash with good dispersion, stable across releases because
-/// aggregate states may be persisted.
+/// Computes a deterministic 64-bit hash for persisted aggregate states.
 pub fn hash64(data: &[u8]) -> u64 {
     let mut h: u64 = 0x9E37_79B9_7F4A_7C15 ^ (data.len() as u64).wrapping_mul(0xA076_1D64_78BD_642F);
     for c in data.chunks(8) {
@@ -27,12 +23,12 @@ fn mix(mut z: u64) -> u64 {
 
 const LIMB_BITS: u32 = 32;
 const LIMBS: usize = 70;
-/// The fixed point's least significant bit is 2^-1074, the smallest subnormal.
+/// Exponent of the least significant fixed-point bit, `2^-1074`, which is the
+/// smallest positive `f64` subnormal.
 const LSB_EXP: i32 = -1074;
 
-/// The exact sum of finite floats: a fixed-point accumulator wide enough
-/// for any finite double, rounded once when read. Its limbs are allocated
-/// by the first nonzero float.
+/// Fixed-point accumulator that computes the exact sum of finite `f64` values
+/// and rounds once on read.
 #[derive(Clone, Debug, Default)]
 pub struct ExactSum {
     limbs: Vec<i64>,
@@ -53,7 +49,6 @@ impl PartialEq for ExactSum {
 impl Eq for ExactSum {}
 
 impl ExactSum {
-    /// Bytes the accumulator holds.
     pub fn mem_size(&self) -> usize {
         24 + self.limbs.capacity() * 8
     }
@@ -89,14 +84,14 @@ impl ExactSum {
         if self.limbs.is_empty() {
             return;
         }
-        let mut carry = 0i64;
+        let mut overflow = 0i64;
         for l in self.limbs.iter_mut() {
-            let v = *l + carry;
-            carry = v >> LIMB_BITS;
+            let v = *l + overflow;
+            overflow = v >> LIMB_BITS;
             *l = v & 0xFFFF_FFFF;
         }
         if let Some(top) = self.limbs.last_mut() {
-            *top += carry << LIMB_BITS;
+            *top += overflow << LIMB_BITS;
         }
         self.adds = 0;
     }
@@ -119,15 +114,13 @@ impl ExactSum {
         self.normalize();
     }
 
-    /// The sum rounded to the nearest double, or an infinity past the range.
+    /// Returns the sum rounded to the nearest `f64`, or infinity on overflow.
     pub fn value(&self) -> f64 {
         self.quotient(1)
     }
 
-    /// The sum divided by `n`, which must be positive, rounded once to the
-    /// nearest double (ties to even), or an infinity past the range. The
-    /// quotient is finite whenever it is within the range, even if the sum
-    /// is not.
+    /// Divides the exact sum by positive `n` and rounds once to the nearest
+    /// `f64` using round-ties-to-even, returning infinity on overflow.
     pub fn quotient(&self, n: u64) -> f64 {
         debug_assert!(n > 0);
         let mut s = self.clone();
@@ -144,8 +137,7 @@ impl ExactSum {
                 *l = v.rem_euclid(1 << LIMB_BITS);
             }
         }
-        // The quotient's magnitude by long division, with one guard limb
-        // below the fixed point's least significant bit to round with.
+        // Long division with a guard limb below 2^-1074 for exact rounding.
         let n = n.max(1) as u128;
         let mut q = [0u32; LIMBS + 1];
         let mut rem = 0u128;
@@ -159,8 +151,7 @@ impl ExactSum {
         let bits = LIMB_BITS as usize;
         let bit = |i: usize| u64::from(q[i / bits] >> (i % bits) & 1);
         let high = top * bits + bits - 1 - q[top].leading_zeros() as usize;
-        // The result's last bit: 53 bits down from the highest, but never
-        // below 2^-1074, where doubles turn subnormal.
+        // Clamp the least significant mantissa bit at 2^-1074 for subnormals.
         let lsb = high.saturating_sub(52).max(bits);
         let mut mant = (lsb..=high).rev().fold(0u64, |m, i| m << 1 | bit(i));
         let below = lsb - 1;
@@ -204,8 +195,7 @@ impl ExactSum {
     }
 }
 
-/// `x * 2^e`, rounding at most once: every step but the last is exact
-/// unless the result overflows.
+/// Multiplies `x` by `2^e`, rounding at most once at the final step.
 fn scale(mut x: f64, mut e: i32) -> f64 {
     let pow2 = |s: i32| f64::from_bits(((s + 1023) as u64) << 52);
     while e != 0 {
@@ -218,12 +208,10 @@ fn scale(mut x: f64, mut e: i32) -> f64 {
 
 const HLL_P: u32 = 14;
 const HLL_M: usize = 1 << HLL_P;
-/// Distinct hashes kept exactly before switching to registers.
 const HLL_EXACT_MAX: usize = 1024;
 
-/// An approximate distinct count after ClickHouse's `uniqCombined`: an exact
-/// set of hashes while small, then a HyperLogLog sketch read with Ertl's
-/// improved estimator.
+/// Distinct-count sketch that stores an exact hash set up to `HLL_EXACT_MAX`
+/// elements and transitions to a 14-bit HyperLogLog register array.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hll {
     Exact(std::collections::BTreeSet<u64>),
@@ -330,8 +318,8 @@ fn set_register(regs: &mut [u8], h: u64) {
     regs[idx] = regs[idx].max(rank);
 }
 
-/// Ertl's improved raw estimator ("New cardinality estimation algorithms
-/// for HyperLogLog sketches", 2017, algorithm 6), unbiased without tables.
+/// Computes Ertl's improved HyperLogLog cardinality estimate from 2017,
+/// Algorithm 6.
 fn ertl(regs: &[u8]) -> f64 {
     let q = 64 - HLL_P as usize;
     let m = regs.len() as f64;
@@ -380,11 +368,11 @@ fn tau(x: f64) -> f64 {
     }
 }
 
-/// Relative accuracy of quantiles.
+/// Relative error bound for [`DdSketch`] quantiles.
 pub const DD_ALPHA: f64 = 0.01;
 
-/// A DDSketch: counts of values in logarithmic buckets, so every quantile
-/// is within [`DD_ALPHA`] of a value at that rank and merging adds counts.
+/// Quantile sketch using logarithmic histogram buckets with relative error
+/// bound [`DD_ALPHA`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DdSketch {
     pos: BTreeMap<i32, u64>,
@@ -423,7 +411,8 @@ impl DdSketch {
         self.zeros += o.zeros;
     }
 
-    /// The value at quantile `q` in `[0, 1]`, or `None` if empty.
+    /// Returns the estimated value at quantile `q` in `[0.0, 1.0]`, or `None`
+    /// if the sketch is empty.
     pub fn quantile(&self, q: f64) -> Option<f64> {
         let n = self.count();
         if n == 0 {
@@ -431,7 +420,7 @@ impl DdSketch {
         }
         let rank = (q.clamp(0.0, 1.0) * (n - 1) as f64).floor() as u64;
         let g = gamma();
-        // In log space, since gamma^i alone overflows near f64::MAX.
+        // Evaluate bucket value in log space to prevent overflow if gamma^i > f64::MAX.
         let value = |i: i32| (i as f64 * g.ln() + (2.0 / (g + 1.0)).ln()).exp().min(f64::MAX);
         let mut seen = 0u64;
         for (i, c) in self.neg.iter().rev() {
@@ -499,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_sums_round_once() {
+    fn exact_sum_single_rounding() {
         assert_eq!(exact(&[]), 0.0);
         assert_eq!(exact(&[0.1, 0.2]), 0.30000000000000004);
         assert_eq!(exact(&[1e100, 1.0, -1e100]), 1.0);
@@ -507,13 +496,13 @@ mod tests {
         assert_eq!(exact(&[-f64::MAX, -f64::MAX]), f64::NEG_INFINITY);
         assert_eq!(exact(&[5e-324, 5e-324]), 1e-323);
         assert_eq!(exact(&[-3.5, 1.25]), -2.25);
-        assert_eq!(exact(&[1.0, 2f64.powi(-60)]), 1.0, "ties and stickies round to nearest");
+        assert_eq!(exact(&[1.0, 2f64.powi(-60)]), 1.0, "ties and stickies are rounded to nearest");
         assert_eq!(exact(&[1.0, 2f64.powi(-53), 2f64.powi(-100)]), 1.0000000000000002);
         assert_eq!(exact(&[f64::MAX, -f64::MAX, 3.0]), 3.0);
     }
 
     #[test]
-    fn quotients_round_once() {
+    fn quotient_single_rounding() {
         let q = |xs: &[f64], n: u64| {
             let mut s = ExactSum::default();
             xs.iter().for_each(|x| s.add(*x));
@@ -525,11 +514,11 @@ mod tests {
         assert_eq!(q(&[1.0], 3), 1.0 / 3.0);
         let tiny = 5e-324;
         assert_eq!(q(&[2f64.powi(33) * tiny], 1 << 34), 0.0, "ties to even");
-        assert_eq!(q(&[(2f64.powi(33) + 2.0) * tiny], (1 << 34) + 2), tiny, "just over half a unit rounds up");
+        assert_eq!(q(&[(2f64.powi(33) + 2.0) * tiny], (1 << 34) + 2), tiny, "just over half a unit is rounded up");
     }
 
     #[test]
-    fn exact_sums_ignore_order_and_grouping() {
+    fn exact_sum_order_and_merge_invariance() {
         let mut r = Rng::new(4);
         for _ in 0..300 {
             let n = r.usize(40);
@@ -558,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_counts_are_exact_while_small_and_accurate_after() {
+    fn hll_exact_and_register_accuracy() {
         let mut h = Hll::default();
         for i in 0..1000u64 {
             h.add_hash(hash64(&i.to_le_bytes()));
@@ -585,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_count_merges_ignore_order() {
+    fn hll_merge_order_invariance() {
         let mut r = Rng::new(8);
         for _ in 0..30 {
             let hashes: Vec<u64> = (0..r.usize(3000)).map(|_| hash64(&(r.below(2500)).to_le_bytes())).collect();
@@ -604,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn quantiles_are_within_relative_accuracy() {
+    fn ddsketch_relative_accuracy() {
         let mut r = Rng::new(2);
         let mut xs: Vec<f64> = (0..20_000).map(|_| (r.unit() - 0.2) * 1000.0f64).collect();
         xs.push(0.0);
@@ -634,7 +623,7 @@ mod tests {
 mod probe_tests {
     use super::*;
     #[test]
-    fn quarter_sums_are_exact() {
+    fn dyadic_quarter_sums_are_exact() {
         let mut r = crate::util::rng::Rng::new(1);
         for _ in 0..10000 {
             let xs: Vec<f64> = (0..r.usize(30)).map(|_| (r.below(400) as f64 - 100.0) / 4.0).collect();

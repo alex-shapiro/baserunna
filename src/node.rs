@@ -63,13 +63,13 @@ pub struct NodeConfig {
     pub watch_poll_ms: u64,
     pub limits: LimitConfig,
     pub engine: EngineConfig,
-    /// A bulk insert buffer is flushed this long after its first request.
+    /// Maximum time in milliseconds before a bulk insert buffer is flushed.
     pub event_insert_buffer_ms: u64,
-    /// A bulk insert buffer is flushed once it holds this many bytes of rows.
+    /// Byte threshold at which a bulk insert buffer is flushed.
     pub event_insert_buffer_bytes: usize,
-    /// Limits on the work of one event query.
+    /// Resource limits for an event query.
     pub query_limits: crate::events::exec::Limits,
-    /// Event queries run at once per node; more wait up to 5 s.
+    /// Maximum number of concurrent event queries per node.
     pub query_concurrency: usize,
 }
 
@@ -829,12 +829,11 @@ impl Node {
         Ok(r)
     }
 
-    /// The node's bulk insert buffers.
     pub fn event_buffers(&self) -> &Arc<crate::events::bulk::Buffers> {
         self.event_buffers.get().expect("event buffers are set at start")
     }
 
-    /// Waits up to 5 s for capacity to run an event query.
+    /// Acquires a permit to run an event query, waiting up to 5 s.
     pub async fn query_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
         match tokio::time::timeout(Duration::from_secs(5), self.query_slots.acquire()).await {
             Ok(Ok(p)) => Ok(p),
@@ -846,8 +845,8 @@ impl Node {
         }
     }
 
-    /// Binds staged event parts on the database's lease holder, forwarding
-    /// the bind when another node holds the lease.
+    /// Binds staged event parts on the lease holder, forwarding if another node
+    /// holds the lease.
     pub async fn bind_events(
         self: &Arc<Self>,
         db: Arc<crate::engine::Db>,
@@ -892,7 +891,7 @@ impl Node {
                 }
                 None => db.bind(bind.clone()).await?,
             };
-            // Every slot failing with NotOwner means the bind reached a node that lost the lease.
+            // Retry if all slots failed with NotOwner after the peer lost the lease.
             if attempt < 5 && rs.iter().all(|r| matches!(r, Err(Error::NotOwner { .. }))) {
                 last = Error::unavailable("another node took the lease");
                 let _ = db.refresh(Instant::now(), false).await;

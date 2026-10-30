@@ -1,5 +1,5 @@
-//! The OpenAPI document is well formed, every reference can be resolved, and the
-//! documented routes are exactly the router's public routes.
+//! Verifies that the OpenAPI document is well-formed, all `$ref` targets exist,
+//! and documented routes match the router's public routes.
 
 use baserunna::sim::SimResponse;
 use baserunna::sim::openapi_check::{check_response, doc, match_path, validate};
@@ -24,8 +24,6 @@ fn refs(v: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// `openapi.json` at the repository root is the published copy of the
-/// document; regenerate with `cargo run --example gen_openapi`.
 #[test]
 fn checked_in_document_is_current() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi.json");
@@ -49,13 +47,12 @@ fn document_is_well_formed() {
     }
     for (p, item) in d["paths"].as_object().unwrap() {
         for (m, op) in item.as_object().unwrap() {
-            assert!(op["responses"].is_object(), "{m} {p} has no responses");
-            assert!(op["summary"].is_string(), "{m} {p} has no summary");
+            assert!(op["responses"].is_object(), "{m} {p} is missing responses");
+            assert!(op["summary"].is_string(), "{m} {p} is missing summary");
         }
     }
 }
 
-/// Public routes registered in the router, from the source.
 fn router_routes() -> BTreeSet<(String, String)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut out = BTreeSet::new();
@@ -105,8 +102,8 @@ fn documented_routes_match_router() {
     assert!(routed.len() >= 40, "route parser found only {} routes", routed.len());
     let missing: Vec<_> = routed.difference(&documented).collect();
     let extra: Vec<_> = documented.difference(&routed).collect();
-    assert!(missing.is_empty(), "routes not documented: {missing:?}");
-    assert!(extra.is_empty(), "documented routes that do not exist: {extra:?}");
+    assert!(missing.is_empty(), "undocumented routes: {missing:?}");
+    assert!(extra.is_empty(), "nonexistent documented routes: {extra:?}");
 }
 
 fn resp(status: u16, body: Value) -> SimResponse {
@@ -125,8 +122,8 @@ fn validator_catches_drift() {
         resp(201, d)
     };
     assert!(check_response("POST", "/v1/dbs", &db(json!("a"), None)).is_ok());
-    assert!(check_response("POST", "/v1/dbs", &db(json!(1), None)).is_err(), "a mistyped field");
-    assert!(check_response("POST", "/v1/dbs", &db(json!("a"), Some(("x", json!(1))))).is_err(), "an extra field");
+    assert!(check_response("POST", "/v1/dbs", &db(json!(1), None)).is_err(), "mistyped field");
+    assert!(check_response("POST", "/v1/dbs", &db(json!("a"), Some(("x", json!(1))))).is_err(), "extra field");
     let err = json!({"error": {"code": "not_found", "message": "m", "retryable": false}});
     assert!(check_response("GET", "/v1/dbs/x/kv/a%2Fb", &resp(404, err.clone())).is_ok());
     let bad = json!({"error": {"code": "nope", "message": "m", "retryable": false}});
@@ -136,10 +133,8 @@ fn validator_catches_drift() {
     assert!(validate(doc(), &json!({"type": "integer"}), &json!(1.5), "$").is_err());
 }
 
-/// Every op kind, with every field the server accepts, validates against the
-/// documented `Op` schema, and fields the server refuses do not.
 #[test]
-fn op_schema_matches_the_ops_the_server_accepts() {
+fn op_schema_matches_accepted_ops() {
     let f = json!({"col": "a", "op": "eq", "value": 1});
     let accepted = [
         json!({"op": "get", "key": "k"}),
@@ -173,7 +168,7 @@ fn op_schema_matches_the_ops_the_server_accepts() {
         json!({"op": "query_events", "table": "e", "from": 0, "to": 1, "columns": ["a"], "cursor": "c"}),
         json!({"op": "delete_events", "table": "e", "from": 0, "to": 1, "where": f}),
     ];
-    let refused = [
+    let rejected = [
         json!({"op": "query_rows", "table": "t", "consistency": "strong"}),
         json!({"op": "read_stream", "stream": "s", "encoding": "base64"}),
         json!({"op": "query_events", "table": "e", "from": 0, "to": 1, "consistency": "strong"}),
@@ -181,10 +176,10 @@ fn op_schema_matches_the_ops_the_server_accepts() {
     ];
     let schema = json!({"$ref": "#/components/schemas/Op"});
     for op in accepted {
-        serde_json::from_value::<baserunna::ops::Op>(op.clone()).unwrap_or_else(|e| panic!("server refuses {op}: {e}"));
-        validate(doc(), &schema, &op, "$").unwrap_or_else(|e| panic!("schema refuses {op}: {e}"));
+        serde_json::from_value::<baserunna::ops::Op>(op.clone()).unwrap_or_else(|e| panic!("server rejects {op}: {e}"));
+        validate(doc(), &schema, &op, "$").unwrap_or_else(|e| panic!("schema rejects {op}: {e}"));
     }
-    for op in refused {
+    for op in rejected {
         assert!(serde_json::from_value::<baserunna::ops::Op>(op.clone()).is_err(), "server accepts {op}");
         assert!(validate(doc(), &schema, &op, "$").is_err(), "schema accepts {op}");
     }

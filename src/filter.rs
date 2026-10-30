@@ -1,13 +1,8 @@
-//! Filters (SPEC §4.7): boolean combinations of comparisons that select
-//! table rows and stream records. This module owns the language: its JSON
-//! form, its limits and what every comparison means. A layer supplies only
-//! its operands, parsing what a comparison names ([`Operand`]) and resolving
-//! it to a value that comparisons test ([`Target`]).
+//! Boolean filter expressions for tables, streams, and event tables (SPEC §4.7).
 //!
-//! A filter is exactly one of `{"and": [f, ...]}`, `{"or": [f, ...]}`,
-//! `{"not": f}` or a comparison: the layer's operand keys, `op`, and a
-//! `value` for every op but `exists`. A missing or null operand fails every
-//! comparison, `ne` included, and only `exists` tells it apart.
+//! Each storage layer implements [`Operand`] to parse its target specifier and
+//! [`Target`] to evaluate comparisons against its values. A missing or `null`
+//! operand evaluates to `false` for all comparison operators, including `ne`.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Deserializer};
@@ -15,19 +10,17 @@ use serde_json::{Map, Number, Value as Json};
 use std::cmp::Ordering;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-/// The deepest a filter nests.
+/// Maximum nesting depth of a filter.
 pub const DEPTH_MAX: usize = 16;
-/// The most nodes (combinators and comparisons) a filter has.
+/// Maximum number of combinator and comparison nodes in a filter.
 pub const NODES_MAX: usize = 256;
-/// The most values an `in` list holds.
+/// Maximum number of elements in an `in` list.
 pub const LIST_MAX: usize = 1000;
-/// 2^127, past which no float is an i128.
+// 2^127: f64 values at or above this magnitude exceed i128::MAX.
 const TWO_127: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
-/// Every comparison op, by name.
 pub const OPS: [&str; 10] = ["eq", "ne", "lt", "le", "gt", "ge", "in", "prefix", "contains", "exists"];
 
-/// A filter over operands `O`, whose comparisons take arguments `A`: JSON
-/// as parsed, or whatever a layer binds them to.
+/// A boolean filter tree over operands `O` and comparison arguments `A`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter<O, A = Json> {
     And(Vec<Filter<O, A>>),
@@ -36,7 +29,7 @@ pub enum Filter<O, A = Json> {
     Cmp(O, Test<A>),
 }
 
-/// What a comparison asks of its operand's value.
+/// A comparison operator and its argument.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Test<A> {
     Eq(A),
@@ -51,40 +44,38 @@ pub enum Test<A> {
     Exists,
 }
 
-/// What a layer's comparisons name: a column, a field, a header.
+/// An operand selector in a filter comparison (such as a column, JSON path, or header).
 pub trait Operand: Sized {
-    /// Parses the operand from a comparison's keys other than `op` and
-    /// `value`, removing the ones it reads. Keys left over are refused.
+    /// Extracts the operand from a comparison object after `op` and `value` have
+    /// been removed. Any remaining keys in `keys` cause parsing to fail.
     fn parse(keys: &mut Map<String, Json>) -> Result<Self>;
 
-    /// Refuses a test the operand cannot take.
+    /// Validates that `test` is supported for this operand.
     fn check(&self, _test: &Test<Json>) -> Result<()> {
         Ok(())
     }
 }
 
-/// A comparison argument.
+/// A bound comparison argument that can be hashed for `in`-list lookup.
 pub trait Arg {
-    /// The hash of the argument as equality sees it: see [`Target::eq_hash`].
+    /// Returns a hash consistent with [`Target::equals`] and [`Target::eq_hash`].
     fn eq_hash(&self) -> u64;
 }
 
-/// A present operand value, tested against arguments of type `A`.
+/// A non-null operand value that can be compared against arguments of type `A`.
 pub trait Target<A> {
     fn equals(&self, arg: &A) -> bool;
-    /// A hash that the value shares with every argument it equals, by which
-    /// `in` finds its candidates; `None` compares it with every argument.
+    /// Returns a hash equal to [`Arg::eq_hash`] for any argument `a` where
+    /// `self.equals(a)` is `true`, or `None` to fall back to a linear scan.
     fn eq_hash(&self) -> Option<u64>;
-    /// `None` when the two have no order between them, such as a number
-    /// and a string.
+    /// Compares `self` and `arg`, or returns `None` if their types are not mutually comparable.
     fn order(&self, arg: &A) -> Option<Ordering>;
     fn starts_with(&self, arg: &A) -> bool;
     fn contains(&self, arg: &A) -> bool;
 }
 
 impl<O, A> Filter<O, A> {
-    /// Whether the filter holds, given each operand's value: `None` when it
-    /// is missing or null.
+    /// Evaluates the filter using `value` to look up each operand (`None` if missing or null).
     pub fn eval<T: Target<A>>(&self, value: &mut impl FnMut(&O) -> Option<T>) -> bool {
         match self {
             Filter::And(fs) => fs.iter().all(|f| f.eval(value)),
@@ -94,8 +85,7 @@ impl<O, A> Filter<O, A> {
         }
     }
 
-    /// The same filter with each comparison rewritten by `f`, as a layer
-    /// resolves names and types its arguments once rather than per value.
+    /// Transforms each comparison in the filter tree using `f`.
     pub fn bind<P, B>(&self, f: &mut impl FnMut(&O, &Test<A>) -> Result<(P, Test<B>)>) -> Result<Filter<P, B>> {
         let all = |fs: &[Filter<O, A>], f: &mut _| fs.iter().map(|x| x.bind(f)).collect::<Result<Vec<_>>>();
         Ok(match self {
@@ -111,7 +101,6 @@ impl<O, A> Filter<O, A> {
 }
 
 impl<O: Operand> Filter<O> {
-    /// Parses a filter, refusing anything but exactly the grammar above.
     pub fn parse(v: Json) -> Result<Self> {
         Self::node(v, 0, &mut 0)
     }
@@ -126,9 +115,9 @@ impl<O: Operand> Filter<O> {
         let Json::Object(mut o) = v else { return Err(Error::invalid("a filter is a JSON object")) };
         if o.keys().any(|k| matches!(k.as_str(), "and" | "or" | "not")) {
             if o.len() != 1 {
-                return Err(not_one(&o));
+                return Err(invalid_filter_keys(&o));
             }
-            let (k, v) = o.into_iter().next().expect("one key");
+            let (k, v) = o.into_iter().next().expect("single key");
             let list = |v: Json, nodes: &mut usize| match v {
                 Json::Array(fs) => fs.into_iter().map(|f| Self::node(f, depth + 1, nodes)).collect(),
                 _ => Err(Error::invalid(format!("{k} takes an array of filters"))),
@@ -142,7 +131,7 @@ impl<O: Operand> Filter<O> {
         let op = match o.remove("op") {
             Some(Json::String(op)) => op,
             Some(_) => return Err(Error::invalid("op is a string")),
-            None => return Err(not_one(&o)),
+            None => return Err(invalid_filter_keys(&o)),
         };
         let test = Test::parse(&op, o.remove("value"))?;
         let operand = O::parse(&mut o)?;
@@ -154,7 +143,7 @@ impl<O: Operand> Filter<O> {
     }
 }
 
-fn not_one(o: &Map<String, Json>) -> Error {
+fn invalid_filter_keys(o: &Map<String, Json>) -> Error {
     let keys: Vec<&str> = o.keys().map(String::as_str).collect();
     Error::invalid(format!(
         "a filter is exactly one of and, or, not or a comparison with op, not {{{}}}",
@@ -216,7 +205,7 @@ impl<A> Test<A> {
         }
     }
 
-    /// The same test with every argument converted by `f`.
+    /// Maps each argument in the test using `f`.
     pub fn try_map<B: Arg>(&self, mut f: impl FnMut(&A) -> Result<B>) -> Result<Test<B>> {
         Ok(match self {
             Test::Eq(a) => Test::Eq(f(a)?),
@@ -232,7 +221,7 @@ impl<A> Test<A> {
         })
     }
 
-    /// Whether the test holds for a present value.
+    /// Evaluates the test against a non-null target `t`.
     pub fn holds<T: Target<A>>(&self, t: &T) -> bool {
         use Ordering::*;
         match self {
@@ -250,12 +239,10 @@ impl<A> Test<A> {
     }
 }
 
-/// The arguments of an `in` test, indexed by hash so that testing a value
-/// costs about the same however long the list is.
+/// Arguments of an `in` comparison, indexed by [`Arg::eq_hash`].
 #[derive(Debug, Clone)]
 pub struct List<A> {
     items: Vec<A>,
-    /// The hash and index of every item, sorted.
     by_hash: Vec<(u64, u32)>,
 }
 
@@ -272,7 +259,6 @@ impl<A> List<A> {
         &self.items
     }
 
-    /// Whether `t` equals some item.
     pub fn any_equals<T: Target<A>>(&self, t: &T) -> bool {
         let Some(h) = t.eq_hash() else { return self.items.iter().any(|a| t.equals(a)) };
         let from = self.by_hash.partition_point(|(x, _)| *x < h);
@@ -286,9 +272,7 @@ impl<A: PartialEq> PartialEq for List<A> {
     }
 }
 
-/// A value as equality sees it, to hash: numbers by their exact values,
-/// whether written as integers or floats; strings and byte strings by their
-/// bytes; and JSON as JSON compares.
+/// Canonical representation of a scalar or JSON value for equality hashing.
 #[derive(Clone, Copy, Debug)]
 pub enum Plain<'a> {
     Null,
@@ -312,7 +296,7 @@ impl Plain<'_> {
             Plain::Null => 0u8.hash(h),
             Plain::Bool(b) => (1u8, b).hash(h),
             Plain::Int(i) => (2u8, i).hash(h),
-            // An integral float hashes as the integer it equals; -0.0 as 0.
+            // Hash integral floats identically to integers so 1.0 and 1 share a hash.
             Plain::Float(f) if f.fract() == 0.0 && f.abs() < TWO_127 => (2u8, f as i128).hash(h),
             Plain::Float(f) => (3u8, f.to_bits()).hash(h),
             Plain::Str(s) => (4u8, s).hash(h),
@@ -329,7 +313,7 @@ impl Plain<'_> {
                 a.iter().for_each(|x| Plain::Json(x).feed(h));
             }
             Plain::Json(Json::Object(o)) => {
-                // Equal objects may list their keys in different orders.
+                // Combine entry hashes with wrapping addition so key order does not affect the hash.
                 let entries = o.iter().fold(0u64, |sum, (k, v)| {
                     let mut e = DefaultHasher::new();
                     k.hash(&mut e);
@@ -348,10 +332,6 @@ impl Arg for Json {
     }
 }
 
-/// JSON values compare as JSON: numbers by value (`1` equals `1.0`),
-/// strings by their bytes, booleans with false first, and arrays and
-/// objects only for equality. A string contains its substrings and an array
-/// its elements.
 impl Target<Json> for &Json {
     fn equals(&self, arg: &Json) -> bool {
         json_eq(self, arg)
@@ -383,7 +363,6 @@ impl Target<Json> for &Json {
     }
 }
 
-/// A string compares as the JSON string it would be.
 impl Target<Json> for &str {
     fn equals(&self, arg: &Json) -> bool {
         arg.as_str() == Some(*self)
@@ -417,7 +396,6 @@ fn json_eq(a: &Json, b: &Json) -> bool {
     }
 }
 
-/// Compares two JSON numbers by their exact values.
 fn number_order(x: &Number, y: &Number) -> Option<Ordering> {
     let int = |n: &Number| n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from));
     match (int(x), int(y)) {
@@ -428,8 +406,7 @@ fn number_order(x: &Number, y: &Number) -> Option<Ordering> {
     }
 }
 
-/// Compares integer `i` with float `f` exactly, where converting either to
-/// the other's type would round.
+/// Compares `i` and `f` by exact numerical value without precision loss.
 pub(crate) fn int_float_order(i: i128, f: f64) -> Option<Ordering> {
     if f.is_nan() {
         return None;
@@ -448,7 +425,6 @@ pub(crate) fn int_float_order(i: i128, f: f64) -> Option<Ordering> {
     })
 }
 
-/// Whether `needle` occurs in `hay`.
 pub fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
     needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
 }
@@ -458,11 +434,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Numbers near the limits of f64 and i64 compare as their exact values:
-    /// the order is total and agrees with i128 arithmetic where both are
-    /// integers.
     #[test]
-    fn numbers_compare_exactly() {
+    fn number_order_is_exact_across_int_and_float() {
         let mut r = crate::util::rng::Rng::new(5);
         let mut nums: Vec<Number> = Vec::new();
         for _ in 0..400 {
@@ -492,10 +465,8 @@ mod tests {
         assert!(!json_eq(&json!([1_152_921_504_606_846_976.0]), &json!([1_152_921_504_606_846_977i64])));
     }
 
-    /// Values that compare equal hash alike, so an `in` list finds exactly
-    /// the values that comparing with each of its items would.
     #[test]
-    fn lists_find_what_equality_finds() {
+    fn in_list_matches_equality_for_all_json_types() {
         let mut r = crate::util::rng::Rng::new(7);
         let scalar = |r: &mut crate::util::rng::Rng| -> Json {
             let i = [0i64, 1, -1, 1 << 53, 1 << 60, i64::MAX, i64::MIN][r.usize(7)].wrapping_add(r.below(3) as i64 - 1);
@@ -538,7 +509,6 @@ mod tests {
         }
     }
 
-    /// Comparisons name one JSON value, `v`.
     #[derive(Debug, PartialEq)]
     struct V;
 
@@ -599,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn a_node_is_exactly_one_thing() {
+    fn filter_rejects_ambiguous_or_malformed_nodes() {
         let a = json!({"v": true, "op": "exists"});
         for bad in [
             json!({"and": [a], "or": [a]}),
@@ -618,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn values_fit_their_op() {
+    fn filter_rejects_invalid_operator_arguments() {
         for bad in [
             json!({"v": true, "op": "between", "value": 1}),
             json!({"v": true, "op": 1, "value": 1}),

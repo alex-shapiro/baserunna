@@ -295,9 +295,8 @@ pub struct SegmentIndex {
     pub size: u64,
 }
 
-/// Appends `raw` to `out` as a framed block: a codec byte, the payload
-/// (zstd-compressed with its raw length when that saves more than an eighth)
-/// and a CRC32C of both.
+/// Appends `raw` to `out` as a framed block with a codec tag, payload, and CRC32C checksum.
+/// Compresses the payload with zstd if `compression` is enabled and saves more than 12.5%.
 pub fn frame(raw: &[u8], compression: Compression, out: &mut Vec<u8>) {
     let off = out.len();
     let compressed = match compression {

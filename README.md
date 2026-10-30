@@ -18,15 +18,14 @@ Full design details are in [`SPEC.md`](SPEC.md).
 
 ## Quick start
 
-Run a single node locally, and open its console:
+Run a single node locally and open the web console:
 
 ```sh
 cargo run --release
 open http://127.0.0.1:8080/console
 ```
 
-An event table takes inserts in bulk and answers aggregate queries, such as
-events per day (SPEC §4.8 describes the query language):
+Create an event table, insert events, and query daily counts:
 
 ```sh
 curl -X POST localhost:8080/v1/dbs/app/events -H "authorization: Bearer $TOKEN" -d '{"name": "clicks",

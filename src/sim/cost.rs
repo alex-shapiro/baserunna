@@ -748,8 +748,6 @@ async fn streams(w: &mut World, out: &mut Vec<Measurement>) {
     out.push(r.stop("cold_stream_read", "MiB", bytes as f64 / (1 << 20) as f64, true));
 }
 
-/// Event tables: transactional inserts, bulk ingestion with its merges,
-/// warm and cold aggregate queries, and an idle table.
 async fn events(w: &mut World, out: &mut Vec<Measurement>) {
     let t = w.signup(0, "events@cost.test").await;
     let id = w.create_db(0, &t, "analytics").await;
@@ -775,8 +773,6 @@ async fn events(w: &mut World, out: &mut Vec<Measurement>) {
     }
     out.push(r.stop("event_txn_insert", "commit", 20.0, true));
 
-    // Ingestion at a rate that fills the insert buffer: rounds of 32
-    // concurrent requests of 500 events each, about 4 MiB a round.
     let router = w.node(0).router().expect("router");
     let r = Recorder::start(s, &id);
     let mut bytes = 0;

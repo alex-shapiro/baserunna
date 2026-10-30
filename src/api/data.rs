@@ -488,7 +488,7 @@ pub(super) fn commit_id_for_key(db_id: &str, key: &str) -> u64 {
     u64::from_be_bytes(a)
 }
 
-/// A request body's content type, lowercased and without parameters.
+/// Extracts the lowercase MIME type from `Content-Type` without parameters.
 pub(super) fn content_type(h: &HeaderMap) -> String {
     let ct = h.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
@@ -504,8 +504,7 @@ pub(super) fn idempotency_header(h: &HeaderMap) -> Result<Option<String>> {
     }
 }
 
-/// The idempotency key of a request that may give it in its header and its
-/// body, which must agree.
+/// Returns the idempotency key from the header or body, or an error if both are present and differ.
 pub(super) fn one_idempotency_key(header: Option<String>, body: Option<String>) -> Result<Option<String>> {
     match (header, body) {
         (Some(h), Some(b)) if h != b => {

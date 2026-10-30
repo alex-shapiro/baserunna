@@ -1,10 +1,5 @@
-//! A reference for event queries: SPEC §4.7 and §4.8 evaluated directly over
-//! events held as JSON, one event at a time, with exact arithmetic and none
-//! of the engine's parts, vectors, sketches or aggregate states.
-//!
-//! The reference shares only the query parser with the engine. Where SPEC
-//! leaves a choice open (how values of different types order, that `sum`
-//! counts booleans as 0 and 1), it follows the engine's documented choice.
+//! Reference evaluator for event queries.
+//! Evaluates queries directly over JSON events with exact arithmetic.
 
 use super::query::{AggFn, Expr, Filter, FunnelMode, Interval, LookupSpec, Mode, Query, Stage};
 use crate::filter::{Filter as F, Test};
@@ -13,13 +8,11 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 pub const DAY: i64 = 86_400_000;
-/// 0000-01-01T00:00:00Z and 9999-12-31T23:59:59.999Z.
+/// Timestamp bounds from 0000-01-01T00:00:00Z to 9999-12-31T23:59:59.999Z.
 pub const TIME_MIN: i64 = -62_167_219_200_000;
 pub const TIME_MAX: i64 = 253_402_300_799_999;
 
-// Calendar arithmetic (proleptic Gregorian, UTC).
-
-/// Days from 0000-01-01 to January 1 of year `y`.
+/// Returns the number of days from 0000-01-01 to January 1 of year `y`.
 fn days_before_year(y: i64) -> i64 {
     365 * y + (y + 3).div_euclid(4) - (y + 99).div_euclid(100) + (y + 399).div_euclid(400)
 }
@@ -39,7 +32,7 @@ fn month_len(y: i64, m: i64) -> i64 {
     }
 }
 
-/// The year, month and day of day `days` counted from 1970-01-01.
+/// Converts a day offset from 1970-01-01 to `(year, month, day)`.
 pub fn civil(days: i64) -> (i64, i64, i64) {
     let d = days + EPOCH_DAYS;
     let mut y = (d as f64 / 365.2425).floor() as i64;
@@ -58,14 +51,12 @@ pub fn civil(days: i64) -> (i64, i64, i64) {
     (y, m, rest + 1)
 }
 
-/// Days from 1970-01-01 to `y-m-d`.
+/// Converts `(year, month, day)` to a day offset from 1970-01-01.
 pub fn days_of(y: i64, m: i64, d: i64) -> i64 {
     days_before_year(y) - EPOCH_DAYS + (1..m).map(|k| month_len(y, k)).sum::<i64>() + d - 1
 }
 
-/// The start of the bucket holding `t` in local time `offset_ms` ahead of
-/// UTC: fixed widths counted from the epoch, weeks from Monday 1969-12-29,
-/// months from January 1970.
+/// Returns the start timestamp of the bucket containing `t` at `offset_ms` from UTC.
 pub fn bucket(t: i64, iv: Interval, offset_ms: i64) -> Option<i64> {
     if !(TIME_MIN..=TIME_MAX).contains(&t) {
         return None;
@@ -88,7 +79,7 @@ pub fn bucket(t: i64, iv: Interval, offset_ms: i64) -> Option<i64> {
     Some(start - offset_ms)
 }
 
-/// Formats `t` as RFC 3339 in a local time `offset_min` minutes ahead of UTC.
+/// Formats `t` as RFC 3339 at `offset_min` minutes from UTC.
 pub fn format_rfc3339(t: i64, offset_min: i64) -> String {
     let local = t + offset_min * 60_000;
     let (y, mo, d) = civil(local.div_euclid(DAY));
@@ -101,7 +92,7 @@ pub fn format_rfc3339(t: i64, offset_min: i64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{frac:03}{zone}")
 }
 
-/// Parses the RFC 3339 forms [`format_rfc3339`] writes, and plain dates.
+/// Parses an RFC 3339 timestamp or plain date into milliseconds from the Unix epoch.
 pub fn parse_rfc3339(s: &str) -> Option<i64> {
     let n = |r: std::ops::Range<usize>| -> Option<i64> {
         let t = s.get(r)?;
@@ -127,8 +118,6 @@ pub fn parse_rfc3339(s: &str) -> Option<i64> {
     };
     Some(day + ((h * 60 + mi - off) * 60 + sec) * 1000 + ms)
 }
-
-// Values. A value is JSON; null is a missing value.
 
 #[derive(Clone, Copy, Debug)]
 enum Num {
@@ -168,8 +157,8 @@ fn num_cmp(a: Num, b: Num) -> Ordering {
     }
 }
 
-/// Equality as filters see it: numbers by exact value, arrays and objects
-/// member by member, and nothing across types.
+/// Compares two JSON values for filter equality: numbers by exact value,
+/// arrays and objects recursively, and false across different types.
 pub fn json_eq(a: &Json, b: &Json) -> bool {
     match (a, b) {
         (Json::Number(x), Json::Number(y)) => num_cmp(num(x), num(y)) == Ordering::Equal,
@@ -181,8 +170,7 @@ pub fn json_eq(a: &Json, b: &Json) -> bool {
     }
 }
 
-/// The order filters see: numbers by value, strings by bytes, false before
-/// true, and none between other values.
+/// Compares two JSON values of the same scalar type.
 fn order(a: &Json, b: &Json) -> Option<Ordering> {
     match (a, b) {
         (Json::Number(x), Json::Number(y)) => Some(num_cmp(num(x), num(y))),
@@ -192,7 +180,7 @@ fn order(a: &Json, b: &Json) -> Option<Ordering> {
     }
 }
 
-/// `v` with every integral float that an i64 holds written as that integer.
+/// Converts integral floats within the `i64` range to JSON integers.
 pub fn canon(v: &Json) -> Json {
     match v {
         Json::Number(n) => match num(n) {
@@ -207,8 +195,6 @@ pub fn canon(v: &Json) -> Json {
     }
 }
 
-/// Text equal exactly for values that are equal: the identity of a group
-/// key or of a distinct value.
 fn identity(v: &Json) -> String {
     canon(v).to_string()
 }
@@ -223,8 +209,8 @@ fn rank(v: &Json) -> u8 {
     }
 }
 
-/// The total order of sorting, `min` and `max`: null, booleans, numbers,
-/// strings, then arrays and objects by their canonical text.
+/// Total order for sorting, `min`, and `max`: null, booleans, numbers,
+/// strings, then arrays and objects by canonical JSON.
 pub fn total(a: &Json, b: &Json) -> Ordering {
     match (rank(a), rank(b)) {
         (x, y) if x != y => x.cmp(&y),
@@ -233,13 +219,12 @@ pub fn total(a: &Json, b: &Json) -> Ordering {
     }
 }
 
-/// Answers alike: equal by [`json_eq`], numbers by exact value.
 pub fn same(a: &Json, b: &Json) -> bool {
     json_eq(a, b)
 }
 
-/// An inserted JSON value as stored: object members that are null dropped,
-/// `-0.0` as `0`; integers beyond i64 refused.
+/// Normalizes an inserted JSON value: removes null object fields, normalizes
+/// `-0.0` to `0.0`, and rejects integers outside `i64`.
 fn normalize(v: &Json) -> Result<Json, String> {
     Ok(match v {
         Json::Object(o) => Json::Object(
@@ -255,7 +240,7 @@ fn normalize(v: &Json) -> Result<Json, String> {
     })
 }
 
-/// The value at `path` in object `o`: a scalar, an array or an empty object.
+/// Extracts the leaf value at `path` from `o`, returning `Null` for missing paths or non-empty objects.
 fn leaf(o: &Json, path: &[String]) -> Json {
     let mut cur = o;
     for seg in path {
@@ -270,12 +255,10 @@ fn leaf(o: &Json, path: &[String]) -> Json {
     }
 }
 
-// Exact arithmetic for sums and means.
-
 const LIMBS: usize = 72;
 
-/// An exact sum of integers and doubles, in units of 2^-1074, as signed
-/// base-2^32 digits that are normalized only when read.
+/// Exact accumulator for integers and floats in units of 2^-1074, stored as
+/// unnormalized signed base-2^32 limbs.
 #[derive(Clone)]
 struct Exact(Vec<i128>);
 
@@ -308,7 +291,6 @@ impl Exact {
         self.add_shifted(i.unsigned_abs() as u128, 1074, i < 0);
     }
 
-    /// The sign and magnitude, as little-endian base-2^32 digits.
     fn sign_mag(&self) -> (bool, Vec<u32>) {
         let norm = |src: &[i128]| -> (Vec<u32>, i128) {
             let mut d = src.to_vec();
@@ -356,8 +338,8 @@ impl Exact {
     }
 }
 
-/// The double nearest `mag * 2^-(1074 + k)`, ties to even, where `sticky`
-/// says that the true value is a little more than that.
+/// Rounds `mag * 2^-(1074 + k)` to the nearest `f64` with ties to even, where
+/// `sticky` indicates non-zero trailing bits.
 fn round(mag: &[u32], k: u32, sticky: bool) -> f64 {
     let bit = |i: i64| i >= 0 && (mag[(i / 32) as usize] >> (i % 32)) & 1 == 1;
     let Some(top) = (0..mag.len() as i64 * 32).rev().find(|i| bit(*i)) else { return 0.0 };
@@ -386,9 +368,8 @@ fn round(mag: &[u32], k: u32, sticky: bool) -> f64 {
     f64::from_bits(e << 52 | (kept & ((1 << 52) - 1)))
 }
 
-/// A sum as SPEC answers it: exact, an integer when every value is one and
-/// the total fits, else the double nearest the exact total. Booleans count
-/// as 0 and 1; strings, arrays and objects are skipped.
+/// Computes the exact sum of `vals` as an `i64` if all inputs are integers or
+/// booleans and the total fits in `i64`, or as the nearest `f64` otherwise.
 fn sum(vals: &[&Json]) -> Json {
     let (mut ex, mut ints, mut float) = (Exact::new(), 0i128, false);
     for v in vals {
@@ -420,7 +401,7 @@ fn float_json(f: f64) -> Json {
     if f.is_finite() { json!(f) } else { Json::Null }
 }
 
-/// The exact mean of the values [`sum`] counts, rounded once; null without any.
+/// Computes the exact mean of numeric and boolean values in `vals`, rounded once.
 fn avg(vals: &[&Json]) -> Json {
     let mut ex = Exact::new();
     let mut n = 0u64;
@@ -438,15 +419,13 @@ fn avg(vals: &[&Json]) -> Json {
     if n == 0 { Json::Null } else { float_json(ex.mean(n)) }
 }
 
-// Schema and rows.
-
 #[derive(Clone, Debug)]
 pub struct Col {
     pub id: u32,
     pub name: String,
     pub ty: String,
     pub default: Option<Json>,
-    /// The first event written while the column existed.
+    /// First sequence number at which this column existed.
     pub since: u64,
 }
 
@@ -456,7 +435,6 @@ pub struct Row {
     pub vals: BTreeMap<u32, Json>,
 }
 
-/// A row table that lookups read: its primary key column and rows.
 #[derive(Clone, Debug)]
 pub struct Table {
     pub key: String,
@@ -464,7 +442,7 @@ pub struct Table {
     pub rows: Vec<Map<String, Json>>,
 }
 
-/// One event table and the row tables its queries look up.
+/// Reference state for an event table and its lookup tables.
 #[derive(Clone, Debug)]
 pub struct Reference {
     pub cols: Vec<Col>,
@@ -475,7 +453,7 @@ pub struct Reference {
     next_seq: u64,
 }
 
-/// A column's value as an insert stores it.
+/// Validates and normalizes `v` for a column of type `ty`.
 fn typed(ty: &str, v: &Json) -> Result<Json, String> {
     let bad = || Err(format!("{v} is not a {ty}"));
     Ok(match ty {
@@ -499,7 +477,6 @@ fn typed(ty: &str, v: &Json) -> Result<Json, String> {
 }
 
 impl Reference {
-    /// A table of `columns` (`{name, type, default}`) whose time column is `time`.
     pub fn new(columns: &[Json], time: &str, tables: BTreeMap<String, Table>) -> Reference {
         let mut r =
             Reference { cols: Vec::new(), time: time.into(), rows: Vec::new(), tables, next_id: 1, next_seq: 0 };
@@ -529,7 +506,7 @@ impl Reference {
         for (i, r) in rows.iter().enumerate() {
             let mut vals = BTreeMap::new();
             for c in &self.cols {
-                // Inserts in these tests take the time 0 as the node's clock.
+                // Reference tests evaluate `"now"` defaults at timestamp 0.
                 let v = match (r.get(&c.name).filter(|v| !v.is_null()), &c.default) {
                     (Some(v), _) => typed(&c.ty, v)?,
                     (None, Some(Json::String(s))) if c.ty == "time" && s == "now" => json!(0),
@@ -549,7 +526,7 @@ impl Reference {
         self.cols.iter().find(|c| c.name == name)
     }
 
-    /// Column `c` of `row`, or the column's default if it was added later.
+    /// Reads column `c` from `row`, returning the column default if `row` precedes the column.
     fn cell(&self, row: &Row, c: &Col) -> Json {
         if row.seq < c.since {
             return c.default.as_ref().and_then(|d| typed(&c.ty, d).ok()).unwrap_or(Json::Null);
@@ -562,7 +539,7 @@ impl Reference {
         self.cell(row, c).as_i64().unwrap_or(0)
     }
 
-    /// Deletes the events in `[from, to)` that match `f`, counting them.
+    /// Deletes events in `[from, to)` that match `f` and returns the deleted count.
     pub fn delete(&mut self, from: i64, to: i64, f: &Filter) -> Result<u64, String> {
         let ev = Ev { r: self, lookups: BTreeMap::new() };
         let f = ev.filter(f)?;
@@ -576,7 +553,7 @@ impl Reference {
         Ok(gone.len() as u64)
     }
 
-    /// The answer to `q`, or why the engine must refuse it.
+    /// Evaluates `q` against the reference state.
     pub fn query(&self, q: &Query) -> Result<Answer, String> {
         let mut ev = Ev { r: self, lookups: BTreeMap::new() };
         let mut lookups = BTreeMap::new();
@@ -603,7 +580,7 @@ impl Reference {
                     q.order_by
                         .iter()
                         .map(|o| {
-                            let e = cols.iter().find(|(n, _)| *n == o.name).ok_or("order_by names no output")?;
+                            let e = cols.iter().find(|(n, _)| *n == o.name).ok_or("unknown order_by column")?;
                             Ok((e.1.clone(), o.desc))
                         })
                         .collect::<Result<_, String>>()?
@@ -664,29 +641,23 @@ fn names_of(s: &Stage) -> Vec<String> {
 fn order_of(names: &[String], q: &Query) -> Result<Vec<(usize, bool)>, String> {
     q.order_by
         .iter()
-        .map(|o| names.iter().position(|n| *n == o.name).map(|i| (i, o.desc)).ok_or("order_by names no output".into()))
+        .map(|o| names.iter().position(|n| *n == o.name).map(|i| (i, o.desc)).ok_or("unknown order_by column".into()))
         .collect()
 }
 
-/// What a column of aggregate output holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColKind {
-    /// Exact values.
     Plain,
-    /// Lists that an aggregate answers (quantiles, retention), which the
-    /// engine orders by their encoding.
+    /// List output from `retention`, ordered by internal encoding in the engine.
     List,
-    /// Approximate values: quantiles, or distinct counts past 1,024.
+    /// Approximate output from `quantiles`, or `uniq` above 1,024 distinct values.
     Approx,
 }
 
-/// One answer cell.
 #[derive(Clone, Debug)]
 pub enum Cell {
     V(Json),
-    /// Each quantile's bounds, or `None` for no values.
     Quant(Vec<Option<(f64, f64)>>),
-    /// A number within bounds.
     About(f64, f64),
 }
 
@@ -716,17 +687,24 @@ impl Cell {
 
 #[derive(Debug)]
 pub enum Answer {
-    /// Every matching row in order.
-    Rows { columns: Vec<String>, rows: Vec<Vec<Json>>, limit: usize },
-    /// Every group, in no order; the answer holds the first `limit` by `order`.
-    Groups { columns: Vec<String>, rows: Vec<Vec<Cell>>, order: Vec<(usize, bool)>, limit: usize, exact_order: bool },
-    /// A second stage over approximate values.
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<Json>>,
+        limit: usize,
+    },
+    Groups {
+        columns: Vec<String>,
+        rows: Vec<Vec<Cell>>,
+        order: Vec<(usize, bool)>,
+        limit: usize,
+        exact_order: bool,
+    },
+    /// Second-stage query over approximate first-stage outputs.
     Unverifiable,
 }
 
 impl Answer {
-    /// Checks the engine's answer, `got` (the rows of every page of rows
-    /// mode, with each page's size), against this one.
+    /// Verifies engine output `got` and pagination metadata `pages` against this reference answer.
     pub fn check(&self, columns: &[String], got: &[Vec<Json>], pages: &[(usize, bool)]) -> Result<(), String> {
         match self {
             Answer::Unverifiable => Ok(()),
@@ -739,7 +717,7 @@ impl Answer {
                     let want = (*limit).min(rows.len().saturating_sub(at));
                     let want_more = at + want < rows.len();
                     if *n != want || *more != want_more {
-                        return Err(format!("page {i} has {n} rows (more {more}), want {want} (more {want_more})"));
+                        return Err(format!("page {i} has {n} rows, more {more}, want {want}, more {want_more}"));
                     }
                     at += n;
                 }
@@ -800,11 +778,8 @@ impl Answer {
     }
 }
 
-// Binding and evaluation.
-
 #[derive(Clone, Debug)]
 enum RE {
-    /// A column, with a path if it is JSON.
     Col(Col, Vec<String>),
     Lookup(String),
     Bucket(Box<RE>, Interval, i64),
@@ -835,7 +810,6 @@ enum RF {
 struct BoundLookup {
     key: RE,
     default: Option<RE>,
-    /// Primary keys and values.
     rows: Vec<(Json, Json)>,
 }
 
@@ -844,8 +818,7 @@ struct Ev<'a> {
     lookups: BTreeMap<String, BoundLookup>,
 }
 
-/// Converts a filter argument to a column of type `ty`, as SPEC compares
-/// within types.
+/// Validates and normalizes filter literal `a` for a column of type `ty`.
 fn typed_arg(ty: &str, a: &Json) -> Result<Json, String> {
     let bad = || Err(format!("{a} does not compare with {ty}"));
     Ok(match ty {
@@ -889,15 +862,15 @@ impl Ev<'_> {
     fn expr(&self, e: &Expr) -> Result<RE, String> {
         Ok(match e {
             Expr::Col { name, path } => {
-                let c = self.r.col(name).ok_or(format!("no column {name}"))?;
+                let c = self.r.col(name).ok_or(format!("unknown column {name}"))?;
                 if !path.is_empty() && c.ty != "json" {
-                    return Err(format!("{name} takes no path"));
+                    return Err(format!("{name} is not a JSON column"));
                 }
                 RE::Col(c.clone(), path.clone())
             }
             Expr::Lookup(n) => {
                 if !self.lookups.contains_key(n) {
-                    return Err(format!("no lookup {n}"));
+                    return Err(format!("unknown lookup {n}"));
                 }
                 RE::Lookup(n.clone())
             }
@@ -905,21 +878,19 @@ impl Ev<'_> {
                 RE::Col(c, p) if p.is_empty() && (c.ty == "time" || c.ty == "int") => {
                     RE::Bucket(Box::new(RE::Col(c, p)), *interval, *offset_ms)
                 }
-                _ => return Err("buckets take a time or int column".into()),
+                _ => return Err("bucket requires a time or int column".into()),
             },
         })
     }
 
     fn lookup(&self, spec: &LookupSpec) -> Result<BoundLookup, String> {
-        let t = self.r.tables.get(&spec.table).ok_or(format!("no table {}", spec.table))?;
+        let t = self.r.tables.get(&spec.table).ok_or(format!("unknown table {}", spec.table))?;
         if !t.columns.contains(&spec.value) {
-            return Err(format!("no column {}", spec.value));
+            return Err(format!("unknown column {}", spec.value));
         }
-        // A lookup's key and default bind before the lookups are known, so
-        // neither may name one (the parser refuses that).
         let key = self.expr(&spec.key)?;
         if matches!(&key, RE::Col(c, p) if c.ty == "json" && p.is_empty()) {
-            return Err("a whole JSON column is no lookup key".into());
+            return Err("lookup key cannot be a JSON column without a path".into());
         }
         let default = spec.default.as_ref().map(|d| self.expr(d)).transpose()?;
         let rows = t
@@ -952,7 +923,7 @@ impl Ev<'_> {
                     && matches!(t, Test::Prefix(_) | Test::Contains(_))
                     && ty != "string"
                 {
-                    return Err(format!("{ty} takes no prefix or contains"));
+                    return Err(format!("{ty} does not support prefix or contains"));
                 }
                 let arg = |a: &Json| match &ty {
                     Some(ty) => typed_arg(ty, a),
@@ -1090,14 +1061,12 @@ impl Ev<'_> {
     }
 }
 
-/// Whether the engine's answer cannot be ordered or aggregated again like
-/// the reference's `cell`: an approximate distinct count.
 fn unverifiable(cell: &Cell) -> bool {
     matches!(cell, Cell::About(..))
 }
 
-/// An aggregate of plain values; `lists` when the values are answers of
-/// aggregates that answer lists, which `sum` adds element by element.
+/// Evaluates a scalar aggregate over `vals`. If `lists` is true, `sum` adds
+/// array elements positionally.
 fn scalar_agg(f: &AggFn, vals: &[Json], lists: bool) -> Cell {
     let present: Vec<&Json> = vals.iter().filter(|v| !v.is_null()).collect();
     match f {
@@ -1155,9 +1124,7 @@ fn scalar_agg(f: &AggFn, vals: &[Json], lists: bool) -> Cell {
     }
 }
 
-/// The highest step any attempt reaches, by SPEC: an attempt starts at each
-/// event matching the first step and advances at each later event (by time,
-/// then insertion) matching its next step within `window_ms` of its start.
+/// Evaluates `window_funnel` over events sorted by `(timestamp, seq)`.
 fn funnel(mut evs: Vec<(i64, u64, Vec<bool>)>, steps: usize, window_ms: i64, mode: FunnelMode) -> usize {
     evs.sort_by_key(|e| (e.0, e.1));
     let mut best = 0;
@@ -1183,8 +1150,8 @@ fn funnel(mut evs: Vec<(i64, u64, Vec<bool>)>, steps: usize, window_ms: i64, mod
     best
 }
 
-/// The second stage over first-stage answers, or `None` if it reads
-/// approximate values or orders lists.
+/// Evaluates the `then` stage over first-stage outputs, returning `None` if it
+/// depends on approximate values or orders list outputs.
 #[allow(clippy::type_complexity)]
 fn second_stage(
     names: &[String],
@@ -1192,15 +1159,15 @@ fn second_stage(
     kinds: &[ColKind],
     s: &Stage,
 ) -> Result<Option<(Vec<String>, Vec<Vec<Cell>>, Vec<ColKind>)>, String> {
-    let out = |n: &str| names.iter().position(|x| x == n).ok_or(format!("then names {n}, not an output"));
+    let out = |n: &str| names.iter().position(|x| x == n).ok_or(format!("unknown first-stage output {n}"));
     let bind = |e: &Expr| -> Result<(usize, Option<(Interval, i64)>), String> {
         match e {
             Expr::Col { name, path } if path.is_empty() => Ok((out(name)?, None)),
             Expr::Bucket { of, interval, offset_ms } => match of.as_ref() {
                 Expr::Col { name, path } if path.is_empty() => Ok((out(name)?, Some((*interval, *offset_ms)))),
-                _ => Err("then buckets name outputs".into()),
+                _ => Err("then bucket must reference a first-stage output".into()),
             },
-            _ => Err("then names outputs".into()),
+            _ => Err("then expression must reference a first-stage output".into()),
         }
     };
     let group: Vec<(usize, Option<(Interval, i64)>)> =
@@ -1208,7 +1175,7 @@ fn second_stage(
     let mut aggs = Vec::new();
     for a in &s.aggregates {
         if a.filter.is_some() || matches!(a.func, AggFn::WindowFunnel { .. } | AggFn::Retention(_)) {
-            return Err("second-stage aggregates take no where, funnels or retention".into());
+            return Err("second-stage aggregates do not support where, window_funnel, or retention".into());
         }
         aggs.push((a.func.clone(), a.of.as_ref().map(bind).transpose()?));
     }

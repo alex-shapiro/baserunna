@@ -1,9 +1,8 @@
-//! Checks on JSON text that `serde_json` alone cannot make.
+//! Pre-parse validation for raw JSON bytes.
 
-/// Refuses JSON text holding an integer literal outside both the signed and
-/// the unsigned 64-bit range, which `serde_json` would silently round to a
-/// float.
-pub fn refuse_inexact_integers(text: &[u8]) -> Result<(), String> {
+/// Rejects JSON text that contains an integer literal outside the `i64` and `u64`
+/// ranges, which `serde_json` would round to `f64`.
+pub fn reject_inexact_integers(text: &[u8]) -> Result<(), String> {
     let mut i = 0;
     while i < text.len() {
         match text[i] {
@@ -40,11 +39,8 @@ pub fn refuse_inexact_integers(text: &[u8]) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// Integer literals are refused exactly when they fit neither 64-bit
-    /// range, wherever they sit in a JSON text, and never inside strings or
-    /// as float literals.
     #[test]
-    fn inexact_integers_are_refused_exactly() {
+    fn reject_inexact_integers_matches_i64_and_u64_bounds() {
         use crate::util::rng::Rng;
         fn digits(r: &mut Rng) -> String {
             let n = 1 + r.usize(28);
@@ -78,7 +74,7 @@ mod tests {
             }
         }
         crate::util::prop::check(
-            "inexact_integers_are_refused_exactly",
+            "reject_inexact_integers_matches_i64_and_u64_bounds",
             5000,
             |r| {
                 let mut inexact = false;
@@ -88,9 +84,9 @@ mod tests {
             |_| Vec::new(),
             |(text, inexact)| {
                 serde_json::from_str::<serde_json::Value>(text).map_err(|e| format!("{text}: {e}"))?;
-                match (refuse_inexact_integers(text.as_bytes()).is_err(), *inexact) {
+                match (reject_inexact_integers(text.as_bytes()).is_err(), *inexact) {
                     (a, b) if a == b => Ok(()),
-                    (refused, _) => Err(format!("{text}: refused {refused}")),
+                    (rejected, _) => Err(format!("{text}: rejected {rejected}")),
                 }
             },
         );

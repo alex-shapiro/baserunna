@@ -1,11 +1,12 @@
 //! Event tables (SPEC §4.8): append-only, columnar collections for
-//! analytical queries, committed by the same transactions as keys, rows
+//! analytical queries, committed by the same transactions as keys, rows,
 //! and streams.
 //!
-//! Rows inserted by transactions start as unsealed rows in the LSM tree and
-//! are sealed into immutable columnar parts in the background; bulk inserts
+//! Transactions insert unsealed rows into the LSM tree, and background
+//! maintenance seals those rows into immutable columnar parts. Bulk inserts
 //! write parts directly. Parts are merged by a size-tiered policy within
-//! time partitions, and queries read both from one snapshot.
+//! time partitions, and queries read both unsealed rows and parts from a
+//! single snapshot.
 
 pub mod agg;
 pub mod build;
@@ -36,15 +37,14 @@ use schema::{EvColumn, EvType, EventSchema, Granularity, SkipIndex};
 use serde::Deserialize;
 use serde_json::Value as Json;
 
-/// Where event table schemas are kept, by name.
+/// Key prefix for event table schemas, indexed by table name.
 pub(crate) const SCHEMAS: &[u8] = &[SPACE_CATALOG, b'e', b'/'];
 
 fn catalog_key(name: &str) -> Bytes {
     Bytes::from([SCHEMAS, name.as_bytes()].concat())
 }
 
-/// Where event table names are kept, by table id, so that maintenance finds
-/// a table's schema by its id.
+/// Key prefix for event table names, indexed by table ID.
 pub(crate) const NAMES: &[u8] = &[SPACE_CATALOG, b'e', b'#'];
 
 fn name_key(id: u32) -> Bytes {
@@ -63,8 +63,8 @@ fn put_schema(txn: &mut Txn, s: &EventSchema) -> Result<()> {
     txn.put(catalog_key(&s.name), Value::Inline(Bytes::from(data)))
 }
 
-/// A page of the event tables whose names start with `prefix`, after
-/// `cursor`, with the cursor of the next page.
+/// Returns a page of event tables whose names start with `prefix` after
+/// `cursor`, and the cursor for the next page.
 pub async fn list(
     txn: &mut Txn,
     prefix: &str,
@@ -75,8 +75,9 @@ pub async fn list(
     Ok((page.iter().map(|(_, it)| decode_schema(it)).collect::<Result<_>>()?, next))
 }
 
-/// Reads the schema of `name`, pinning it so that a concurrent schema change
-/// or drop makes the transaction fail under every isolation level.
+/// Reads the schema of `name` and pins the catalog entry so that a concurrent
+/// schema change or table drop causes the transaction to fail at every
+/// isolation level.
 pub async fn get_schema(txn: &mut Txn, name: &str) -> Result<EventSchema> {
     match txn.get_pinned(&catalog_key(name)).await? {
         Some(it) => decode_schema(&it),
@@ -84,24 +85,23 @@ pub async fn get_schema(txn: &mut Txn, name: &str) -> Result<EventSchema> {
     }
 }
 
-/// A column as a request declares it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ColumnSpec {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: EvType,
-    #[serde(default = "yes")]
+    #[serde(default = "default_true")]
     pub nullable: bool,
     #[serde(default)]
     pub default: Option<Json>,
 }
 
-fn yes() -> bool {
+fn default_true() -> bool {
     true
 }
 
-fn day() -> Granularity {
+fn default_day() -> Granularity {
     Granularity::Day
 }
 
@@ -112,7 +112,7 @@ pub struct CreateEvents {
     pub columns: Vec<ColumnSpec>,
     pub time_column: String,
     pub order_by: Vec<String>,
-    #[serde(default = "day")]
+    #[serde(default = "default_day")]
     pub partition: Granularity,
     #[serde(default)]
     pub skip_indexes: Vec<SkipIndex>,
@@ -159,7 +159,7 @@ pub async fn create(txn: &mut Txn, def: &CreateEvents) -> Result<EventSchema> {
     Ok(s)
 }
 
-/// Every part reference of table `id`, read into the transaction's read set.
+/// Reads all part references for table `id` into the transaction's read set.
 pub async fn refs(txn: &mut Txn, id: u32) -> Result<Vec<PartRef>> {
     let items = txn.scan(&ev::refs(id), false, usize::MAX >> 1).await?;
     items.iter().map(ref_of).collect()
@@ -172,10 +172,11 @@ pub fn ref_of(it: &ReadValue) -> Result<PartRef> {
     }
 }
 
-/// Drops table `name`, its unsealed rows and its parts, writing the same few
-/// keys however large the table. It reads no part references, so parts bound,
-/// sealed or merged meanwhile do not conflict with it; their objects are
-/// left unreferenced for the orphan sweep (SPEC §5.8).
+/// Drops table `name`, its unsealed rows, and its part references.
+///
+/// This function does not read part references, so concurrent part bindings,
+/// seals, or merges do not conflict with it. Unreferenced part objects are
+/// removed by the orphan sweep (SPEC §5.8).
 pub async fn drop(txn: &mut Txn, name: &str) -> Result<()> {
     let s = get_schema(txn, name).await?;
     txn.delete_range(ev::refs(s.id))?;
@@ -191,10 +192,12 @@ pub async fn add_column(txn: &mut Txn, table: &str, c: &ColumnSpec) -> Result<Ev
         return Err(Error::AlreadyExists(format!("column {:?} already exists", c.name)));
     }
     if !c.nullable && c.default.is_none() {
-        return Err(Error::invalid("a new non-nullable column needs a default"));
+        return Err(Error::invalid("a new non-nullable column requires a default"));
     }
     if !c.nullable && c.ty == EvType::Time && c.default.as_ref().and_then(Json::as_str) == Some(schema::NOW) {
-        return Err(Error::invalid("a new column defaulting to \"now\" is nullable: earlier events read as null"));
+        return Err(Error::invalid(
+            "a new column defaulting to \"now\" must be nullable: earlier events are read as null",
+        ));
     }
     s.columns.push(EvColumn {
         id: s.next_column_id,
@@ -240,14 +243,13 @@ pub async fn add_skip_index(txn: &mut Txn, table: &str, i: &SkipIndex) -> Result
 pub async fn drop_skip_index(txn: &mut Txn, table: &str, column: &str) -> Result<EventSchema> {
     let mut s = get_schema(txn, table).await?;
     if !s.skip_indexes.iter().any(|x| x.column == column) {
-        return Err(Error::not_found(format!("no skip index on {column:?}")));
+        return Err(Error::not_found(format!("skip index on {column:?} not found")));
     }
     s.skip_indexes.retain(|x| x.column != column);
     put_schema(txn, &s)?;
     Ok(s)
 }
 
-/// Sets or clears the table's retention.
 pub async fn set_retention(txn: &mut Txn, table: &str, retention_ms: Option<u64>) -> Result<EventSchema> {
     let mut s = get_schema(txn, table).await?;
     s.retention_ms = retention_ms;
@@ -256,26 +258,24 @@ pub async fn set_retention(txn: &mut Txn, table: &str, retention_ms: Option<u64>
     Ok(s)
 }
 
-/// Events validated against their table and encoded for storage, in one
-/// buffer, so that a request holds about its encoded size.
+/// Validated and encoded rows stored in a single buffer.
 #[derive(Clone, Debug, Default)]
 pub struct ValidRows {
     data: Vec<u8>,
-    /// Each row's partition and end in `data`.
+    /// Partition key and end offset in `data` for each row.
     rows: Vec<(u32, u32)>,
-    /// The most bytes the encoded rows may take, if limited.
     limit: Option<usize>,
 }
 
 impl ValidRows {
-    /// Rows whose encodings refuse to grow past `limit` bytes, so that events
-    /// expanded by their defaults cannot outgrow the request that carried
-    /// them.
+    /// Creates a buffer that rejects additional rows if the total encoded size
+    /// exceeds `limit` bytes.
     pub fn up_to(limit: usize) -> ValidRows {
         ValidRows { limit: Some(limit), ..ValidRows::default() }
     }
 
-    /// Validates event `v`, normalizing its JSON objects, and appends it.
+    /// Validates event `v`, normalizes its JSON objects, and appends its
+    /// encoded representation.
     pub fn push(&mut self, s: &EventSchema, v: &Json, now_ms: i64) -> Result<()> {
         let i = self.rows.len();
         let mut row = s.row(v, now_ms).map_err(|e| match e {
@@ -293,7 +293,7 @@ impl ValidRows {
         }
         if build::stored_len(&row) > schema::ROW_STORED_MAX_BYTES {
             return Err(Error::TooLarge(format!(
-                "event {i}'s JSON flattens to more than {} bytes of paths and values",
+                "event {i}'s JSON is flattened to more than {} bytes of paths and values",
                 schema::ROW_STORED_MAX_BYTES
             )));
         }
@@ -318,25 +318,24 @@ impl ValidRows {
         self.rows.is_empty()
     }
 
-    /// Bytes the rows hold, counting each row's bookkeeping.
+    /// Total memory used by the encoded data and row offsets, in bytes.
     pub fn bytes(&self) -> usize {
         self.data.len() + 12 * self.rows.len()
     }
 
-    /// Row `i`'s partition and encoding.
+    /// Returns the partition key and encoded bytes of row `i`.
     pub fn get(&self, i: usize) -> (u32, &[u8]) {
         let start = if i == 0 { 0 } else { self.rows[i - 1].1 as usize };
         let (p, end) = self.rows[i];
         (p, &self.data[start..end as usize])
     }
 
-    /// Each row's partition and encoding.
     pub fn iter(&self) -> impl Iterator<Item = (u32, &[u8])> {
         (0..self.rows.len()).map(|i| self.get(i))
     }
 }
 
-/// Validates JSON rows against `s`; see [`ValidRows::push`].
+/// Validates and encodes `rows` against schema `s`.
 pub fn validate_rows(s: &EventSchema, rows: &[Json], now_ms: i64) -> Result<ValidRows> {
     let mut out = ValidRows::default();
     for v in rows {
@@ -345,7 +344,8 @@ pub fn validate_rows(s: &EventSchema, rows: &[Json], now_ms: i64) -> Result<Vali
     Ok(out)
 }
 
-/// Inserts JSON rows into table `name` at commit, returning how many.
+/// Buffers `rows` for insertion into table `name` at commit and returns the
+/// number of inserted rows.
 pub async fn insert(txn: &mut Txn, name: &str, rows: &[Json], now_ms: i64) -> Result<usize> {
     if rows.len() > ev::INSERT_MAX_ROWS {
         return Err(Error::TooLarge(format!("a transaction inserts at most {} events", ev::INSERT_MAX_ROWS)));
@@ -360,7 +360,6 @@ pub async fn insert(txn: &mut Txn, name: &str, rows: &[Json], now_ms: i64) -> Re
     Ok(rows.len())
 }
 
-/// The JSON description of a table and its storage.
 pub fn table_json(s: &EventSchema, st: &TableState, refs: &[PartRef]) -> Json {
     let mut out = s.to_json();
     let mut parts: Vec<Json> = Vec::new();
@@ -394,7 +393,8 @@ pub fn table_json(s: &EventSchema, st: &TableState, refs: &[PartRef]) -> Json {
     out
 }
 
-/// Reads table state at the transaction's snapshot without tracking it.
+/// Reads table state from the transaction's snapshot without adding the state
+/// key to the conflict read set.
 pub async fn state(txn: &mut Txn, id: u32) -> Result<TableState> {
     match txn.untracked_snapshot().get_entry(&ev::state_key(id)).await? {
         Some(e) if !e.value.is_tombstone() => {
@@ -404,15 +404,16 @@ pub async fn state(txn: &mut Txn, id: u32) -> Result<TableState> {
     }
 }
 
-/// The bounds of a delete: milliseconds or RFC 3339 timestamps, all time by default.
+/// Parses inclusive delete bounds from millisecond integers or RFC 3339
+/// timestamps, defaulting to the full supported time range.
 pub fn time_bounds(from: &Option<Json>, to: &Option<Json>) -> Result<(i64, i64)> {
     let bound = |v: &Option<Json>, k: &str, dflt: i64| -> Result<i64> {
         match v {
             None | Some(Json::Null) => Ok(dflt),
             Some(Json::String(s)) => schema::parse_rfc3339(s)
-                .ok_or_else(|| Error::invalid(format!("{k} is milliseconds or an RFC 3339 timestamp"))),
+                .ok_or_else(|| Error::invalid(format!("{k} must be milliseconds or an RFC 3339 timestamp"))),
             Some(v) => {
-                v.as_i64().ok_or_else(|| Error::invalid(format!("{k} is milliseconds or an RFC 3339 timestamp")))
+                v.as_i64().ok_or_else(|| Error::invalid(format!("{k} must be milliseconds or an RFC 3339 timestamp")))
             }
         }
     };

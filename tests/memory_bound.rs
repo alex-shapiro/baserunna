@@ -11,15 +11,14 @@ use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
 struct CountingAllocator;
 
 static ALLOCATED_BYTES: AtomicIsize = AtomicIsize::new(0);
-/// The most bytes allocated at once since [`reset_peak`].
 static PEAK_BYTES: AtomicIsize = AtomicIsize::new(0);
 
-fn grew(by: isize) {
+fn add_allocated(by: isize) {
     let now = ALLOCATED_BYTES.fetch_add(by, Relaxed) + by;
     PEAK_BYTES.fetch_max(now, Relaxed);
 }
 
-/// Tests take turns, so that one's allocations do not count toward another's peak.
+// Serializes tests so allocations from concurrent tests do not inflate PEAK_BYTES.
 static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn reset_peak() -> isize {
@@ -30,7 +29,7 @@ fn reset_peak() -> isize {
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        grew(l.size() as isize);
+        add_allocated(l.size() as isize);
         unsafe { System.alloc(l) }
     }
 
@@ -40,7 +39,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        grew(n as isize - l.size() as isize);
+        add_allocated(n as isize - l.size() as isize);
         unsafe { System.realloc(p, l, n) }
     }
 }
@@ -135,7 +134,7 @@ async fn charges_cover_decoded_manifests(w: &World) {
     }
 }
 
-async fn opening_many_databases_stays_within_the_budget(w: &World) {
+async fn opening_many_databases_respects_budget(w: &World) {
     let writer = w.engine("w2", 1 << 40);
     let dbs = 300;
     for i in 0..dbs {
@@ -151,13 +150,13 @@ async fn opening_many_databases_stays_within_the_budget(w: &World) {
     let before = allocated_bytes();
     let mut held = Vec::new();
     let mut peak = 0;
-    let mut refused = 0;
+    let mut rejected = 0;
     for i in 0..dbs {
         let db = reader.db(&format!("big{i}"));
         let mut t = match db.begin(Isolation::Serializable, Consistency::Strong).await {
             Ok(t) => t,
             Err(e) if e.retryable() => {
-                refused += 1;
+                rejected += 1;
                 continue;
             }
             Err(e) => panic!("{e}"),
@@ -173,9 +172,9 @@ async fn opening_many_databases_stays_within_the_budget(w: &World) {
         "opened {} of {dbs} databases: heap peaked at {peak} B, {charged} B charged, budget {budget}",
         held.len()
     );
-    assert_eq!(refused, 0, "idle databases should be unloaded rather than refusing loads");
-    assert!(charged <= budget + MIB, "charged {charged} bytes with a budget of {budget}");
-    assert!(peak <= budget + budget / 4 + 2 * MIB, "heap grew by {peak} bytes with a budget of {budget}");
+    assert_eq!(rejected, 0, "idle databases must be evicted instead of rejecting loads");
+    assert!(charged <= budget + MIB, "charged {charged} bytes with budget {budget}");
+    assert!(peak <= budget + budget / 4 + 2 * MIB, "heap grew by {peak} bytes with budget {budget}");
 }
 
 #[test]
@@ -186,14 +185,12 @@ fn memory_charges_bound_real_heap_use() {
         baserunna::log::set_level(Some(baserunna::log::Level::Warn));
         let w = World::new();
         charges_cover_decoded_manifests(&w).await;
-        opening_many_databases_stays_within_the_budget(&w).await;
+        opening_many_databases_respects_budget(&w).await;
     });
 }
 
-/// A bulk insert holds memory within a small multiple of its body while it is parsed,
-/// buffered and written as parts, however small its events are.
 #[test]
-fn bulk_inserts_hold_memory_near_their_body_size() {
+fn bulk_inserts_bound_memory_by_body_size() {
     use baserunna::sim::cost::{World, call_router, run_paused};
     use tower::ServiceExt;
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
@@ -221,7 +218,7 @@ fn bulk_inserts_hold_memory_near_their_body_size() {
         assert_eq!(resp.status(), 201);
         assert!(
             grown < 16 * body.len() as isize,
-            "a {} byte bulk insert of tiny events grew the heap by {grown} bytes ({}x its body)",
+            "{}-byte bulk insert grew heap by {grown} bytes ({}x body size)",
             body.len(),
             grown / body.len() as isize
         );
@@ -229,11 +226,8 @@ fn bulk_inserts_hold_memory_near_their_body_size() {
     });
 }
 
-/// Small, well-framed but corrupt part metadata and column indexes do not
-/// decode into gigabytes: 30M granules or statistics take 2 bytes each raw
-/// and tens of bytes each decoded.
 #[test]
-fn a_tiny_corrupt_column_index_does_not_decode_into_gigabytes() {
+fn corrupt_column_index_bounds_decoded_memory() {
     use baserunna::events::part::{ColIndex, ColMeta, ColRef, PartMeta};
     use baserunna::events::vector::Phys;
     use baserunna::util::codec::Writer;
@@ -267,7 +261,7 @@ fn a_tiny_corrupt_column_index_does_not_decode_into_gigabytes() {
     let granules = decoded.map(|m| m.granule_count());
     assert!(
         grown < 256 * MIB as isize,
-        "{} bytes of part metadata decoded to {granules:?} granules, growing the heap by {grown} bytes",
+        "{} bytes of part metadata decoded to {granules:?} granules and grew heap by {grown} bytes",
         meta.len()
     );
 
@@ -309,18 +303,13 @@ fn a_tiny_corrupt_column_index_does_not_decode_into_gigabytes() {
     let stats = decoded.map(|i| i.stats.len());
     assert!(
         grown < 256 * MIB as isize,
-        "a {} byte column index decoded to {stats:?} statistics, growing the heap by {grown} bytes",
+        "{}-byte column index decoded to {stats:?} statistics and grew heap by {grown} bytes",
         index.len()
     );
 }
 
-/// Events that take a column's default grow by it, so a request of `{}`
-/// events against a table with the largest default expands about 300
-/// times; bulk inserts (held to 8 times their body) and transactions alike
-/// refuse once the expanded events pass the request's limit, and hold no
-/// more than it meanwhile.
 #[test]
-fn events_expanded_by_defaults_stay_within_their_request_limit() {
+fn events_expanded_by_defaults_respect_request_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     run_paused(async {
@@ -345,7 +334,7 @@ fn events_expanded_by_defaults_stay_within_their_request_limit() {
             assert_eq!(r.status, 413, "{path}: {}", String::from_utf8_lossy(&r.body));
             assert!(
                 grown < 192 * MIB as isize,
-                "{path}: a {} byte body grew the heap by {grown} bytes ({}x)",
+                "{path}: {}-byte body grew heap by {grown} bytes ({}x)",
                 body.len(),
                 grown / body.len() as isize
             );
@@ -354,10 +343,7 @@ fn events_expanded_by_defaults_stay_within_their_request_limit() {
     });
 }
 
-/// Sets up table `ev` holding 4,400 unsealed `{}` events (29 bytes each, under
-/// the 128 KiB that seals them), then adds 254 string columns, each with a
-/// 1 KiB default, which those events lack.
-async fn unsealed_events_older_than_large_defaults(t: &str, router: &axum::Router) -> u64 {
+async fn setup_unsealed_events_with_large_defaults(t: &str, router: &axum::Router) -> u64 {
     use baserunna::sim::cost::call_router;
     let table = r#"{"name": "ev", "columns": [{"name": "time", "type": "time", "default": "now"}],
         "time_column": "time", "order_by": ["time"]}"#;
@@ -379,11 +365,8 @@ async fn unsealed_events_older_than_large_defaults(t: &str, router: &axum::Route
     info["unsealed_bytes"].as_u64().unwrap()
 }
 
-/// Sealing events written before a column with a default was added fills
-/// the default into each of them; the seal holds memory near the size of
-/// the rows it seals, not the defaults' size times the events.
 #[test]
-fn sealing_events_older_than_added_defaults_stays_near_their_size() {
+fn sealing_events_with_added_defaults_bounds_memory() {
     use baserunna::sim::cost::{World, call_router, run_paused};
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     run_paused(async {
@@ -391,9 +374,8 @@ fn sealing_events_older_than_added_defaults_stays_near_their_size() {
         let t = w.signup(0, "mem@api.test").await;
         w.create_db(0, &t, "d").await;
         let router = w.node(0).router().unwrap();
-        let unsealed = unsealed_events_older_than_large_defaults(&t, &router).await;
+        let unsealed = setup_unsealed_events_with_large_defaults(&t, &router).await;
         let before = reset_peak();
-        // One more event, which takes every default, passes the seal threshold.
         let txn = r#"{"ops": [{"op": "insert_events", "table": "ev", "rows": [{}]}]}"#;
         let r = call_router(&router, "POST", "/v1/dbs/d/txn", &t, Bytes::from(txn)).await;
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
@@ -408,20 +390,18 @@ fn sealing_events_older_than_added_defaults_stays_near_their_size() {
             }
         }
         let grown = PEAK_BYTES.load(Relaxed) - before;
-        assert!(sealed, "the events were never sealed");
+        assert!(sealed, "events were not sealed");
         assert!(
             grown < 256 * MIB as isize,
-            "sealing 4,401 events ({unsealed} unsealed bytes before the last) grew the heap by {grown} bytes ({}x)",
+            "sealing 4,401 events ({unsealed} unsealed bytes) grew heap by {grown} bytes ({}x)",
             grown / unsealed as isize
         );
         w.shutdown();
     });
 }
 
-/// A query reading unsealed events that lack columns added with defaults
-/// holds memory near its limit, not the defaults' size times the events.
 #[test]
-fn queries_of_unsealed_events_older_than_added_defaults_stay_near_their_limit() {
+fn queries_on_unsealed_events_with_added_defaults_respect_memory_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     run_paused(async {
@@ -429,7 +409,7 @@ fn queries_of_unsealed_events_older_than_added_defaults_stay_near_their_limit() 
         let t = w.signup(0, "mem@api.test").await;
         w.create_db(0, &t, "d").await;
         let router = w.node(0).router().unwrap();
-        let unsealed = unsealed_events_older_than_large_defaults(&t, &router).await;
+        let unsealed = setup_unsealed_events_with_large_defaults(&t, &router).await;
         let q = r#"{"from": 0, "to": 9999999999999, "limit": 1, "consistency": "strong"}"#;
         let before = reset_peak();
         let r = call_router(&router, "POST", "/v1/dbs/d/events/ev/rows/query", &t, Bytes::from(q)).await;
@@ -437,19 +417,15 @@ fn queries_of_unsealed_events_older_than_added_defaults_stay_near_their_limit() 
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         assert!(
             grown < 256 * MIB as isize,
-            "a 1-row query of {unsealed} unsealed bytes grew the heap by {grown} bytes ({}x)",
+            "single-row query on {unsealed} unsealed bytes grew heap by {grown} bytes ({}x)",
             grown / unsealed as isize
         );
         w.shutdown();
     });
 }
 
-/// A query naming many JSON paths (one retention aggregate takes 32
-/// conditions of 255 comparisons each) holds memory near its limit over
-/// unsealed events, not the paths times the events, whether or not any
-/// event holds the paths.
 #[test]
-fn queries_naming_many_json_paths_stay_near_their_limit() {
+fn queries_with_many_json_paths_respect_memory_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     run_paused(async {
@@ -461,7 +437,6 @@ fn queries_naming_many_json_paths_stay_near_their_limit() {
             {"name": "j", "type": "json", "nullable": true}], "time_column": "time", "order_by": ["time"]}"#;
         let r = call_router(&router, "POST", "/v1/dbs/d/events", &t, Bytes::from(table)).await;
         assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
-        // 4,400 `{}` events take 29 bytes each unsealed, under the 128 KiB that seals them.
         let rows = vec!["{}"; 4400].join(",");
         let txn = format!(r#"{{"ops": [{{"op": "insert_events", "table": "ev", "rows": [{rows}]}}]}}"#);
         let r = call_router(&router, "POST", "/v1/dbs/d/txn", &t, Bytes::from(txn)).await;
@@ -482,7 +457,7 @@ fn queries_naming_many_json_paths_stay_near_their_limit() {
         let grown = PEAK_BYTES.load(Relaxed) - before;
         assert!(
             grown < 256 * MIB as isize,
-            "a {} byte query of 4,400 unsealed `{{}}` events grew the heap by {grown} bytes ({}): {}",
+            "{}-byte query on 4,400 unsealed events grew heap by {grown} bytes ({}): {}",
             q.len(),
             r.status,
             String::from_utf8_lossy(&r.body[..r.body.len().min(300)])
@@ -491,15 +466,11 @@ fn queries_naming_many_json_paths_stay_near_their_limit() {
     });
 }
 
-/// A query naming many JSON paths that parts may keep in shared buckets
-/// holds memory near its limit, not the paths times the rows of a granule.
 #[test]
-fn queries_naming_many_shared_json_paths_stay_near_their_limit() {
+fn queries_with_many_shared_json_paths_respect_memory_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     run_paused(async {
-        // Parts keep one path as a column and list none of the rest, so any
-        // path may be in their buckets.
         let w = World::with_config(1, 0, |c| {
             c.engine.event_json_max_paths = 1;
             c.engine.event_json_directory_bytes = 1;
@@ -533,16 +504,14 @@ fn queries_naming_many_shared_json_paths_stay_near_their_limit() {
         let grown = PEAK_BYTES.load(Relaxed) - before;
         let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(r.status, 200, "{body}");
-        assert_eq!(body["stats"]["rows_read"], 4400, "the events were read from a part: {body}");
-        assert!(grown < 256 * MIB as isize, "a {} byte query of 4,400 events grew the heap by {grown} bytes", q.len());
+        assert_eq!(body["stats"]["rows_read"], 4400, "events were read from part: {body}");
+        assert!(grown < 256 * MIB as isize, "{}-byte query on 4,400 events grew heap by {grown} bytes", q.len());
         w.shutdown();
     });
 }
 
-/// A query's lookups hold memory near `lookup_max_bytes`, however many of
-/// them read the same table.
 #[test]
-fn query_lookups_stay_near_their_limit() {
+fn query_lookups_respect_memory_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     run_paused(async {
@@ -574,9 +543,7 @@ fn query_lookups_stay_near_their_limit() {
         let q = serde_json::json!({"from": 0, "to": 9_999_999_999_999i64, "consistency": "strong",
             "lookups": lookups, "aggregates": {"n": {"fn": "count"}}})
         .to_string();
-        // Reading the table fills the node's block cache with about 30 MB,
-        // which the cache's budget bounds, not the query's; a scan of the
-        // table warms it first so that the query is measured alone.
+        // Pre-warm the node block cache so the measurement isolates query lookup allocations.
         let mut cursor = None;
         loop {
             let page = match cursor {
@@ -598,7 +565,7 @@ fn query_lookups_stay_near_their_limit() {
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         assert!(
             grown < 2 * 8 * MIB as isize,
-            "a query with 8 lookups of one table, within its 8 MiB lookup limit, grew the heap by {grown} bytes"
+            "query with 8 lookups of the same table (8 MiB lookup limit) grew heap by {grown} bytes"
         );
         w.shutdown();
     });

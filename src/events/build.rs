@@ -1,4 +1,4 @@
-//! Writing level 0 parts from rows held in memory: staged bulk inserts and
+//! Level 0 part construction from in-memory rows for staged bulk inserts and
 //! sealed unsealed rows.
 
 use super::json::{self, JType};
@@ -16,10 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-/// The bytes `row` takes in a part's columns, uncompressed: its encoding
-/// plus its JSON objects flattened to paths, which repeat each leaf's
-/// path. Granules are cut by it, so that no block outgrows what a reader
-/// accepts.
+/// Returns the uncompressed byte size of `row` in part columns, including the
+/// row encoding and flattened JSON leaf paths.
 pub fn stored_len(row: &Row) -> usize {
     let flat: usize = row
         .values()
@@ -31,20 +29,17 @@ pub fn stored_len(row: &Row) -> usize {
     encode_row(row).len() + 12 + flat
 }
 
-/// The most memory, as estimated by [`build_cost`], that the rows of one
-/// part take decoded, which bounds the memory of seals and bulk inserts
-/// whatever their events' sizes.
+/// Maximum estimated decoded memory ([`build_cost`]) for rows in a single part.
 pub const PART_BUILD_BYTES: usize = 64 << 20;
 
-/// The memory a row encoded in `len` bytes takes while its part is built.
+/// Estimates the in-memory byte cost of building a part for a row of `len`
+/// encoded bytes.
 pub fn build_cost(len: usize) -> usize {
     3 * len + 256
 }
 
-/// What rows gathered into a part take: the bytes the part stores for them
-/// (their [`Defaults::stored_len`]), which `event_insert_part_max_bytes`
-/// bounds, and the memory of building it (their [`build_cost`]), which
-/// [`PART_BUILD_BYTES`] bounds.
+/// Uncompressed column size ([`Defaults::stored_len`]) and build memory cost
+/// ([`build_cost`]) of rows accumulated for a part.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PartSize {
     pub stored: usize,
@@ -52,7 +47,7 @@ pub struct PartSize {
 }
 
 impl PartSize {
-    /// The size of `row`, encoded in `encoded` bytes.
+    /// Computes the [`PartSize`] of `row` with `encoded` byte length.
     pub fn of(row: &Row, encoded: usize, defaults: &Defaults) -> PartSize {
         PartSize { stored: defaults.stored_len(row), cost: build_cost(encoded) }
     }
@@ -61,8 +56,8 @@ impl PartSize {
         self.stored <= max_bytes && self.cost <= PART_BUILD_BYTES
     }
 
-    /// The most parts that [`next_part`] cuts rows of this size into: each
-    /// holds at least half of one of the limits.
+    /// Upper bound on the number of parts produced by [`next_part`] for rows of
+    /// this total size.
     pub fn parts(self, max_bytes: usize) -> usize {
         1 + self.stored / (max_bytes / 2).max(1) + self.cost / (PART_BUILD_BYTES / 2)
     }
@@ -76,8 +71,8 @@ impl std::ops::Add for PartSize {
     }
 }
 
-/// Takes from `rows` the next part's: rows of at most `max_bytes` stored
-/// and [`PART_BUILD_BYTES`] of build cost, at least one row.
+/// Takes a non-empty batch of rows for the next part within `max_bytes` of
+/// stored size and [`PART_BUILD_BYTES`] of build cost.
 pub fn next_part<T>(rows: &mut std::iter::Peekable<impl Iterator<Item = (PartSize, T)>>, max_bytes: usize) -> Vec<T> {
     let (mut group, mut size) = (Vec::new(), PartSize::default());
     while let Some((n, _)) = rows.peek() {
@@ -91,9 +86,9 @@ pub fn next_part<T>(rows: &mut std::iter::Peekable<impl Iterator<Item = (PartSiz
     group
 }
 
-/// Writes the encoded `rows` of one partition as level 0 parts, decoding
-/// one part's rows at a time, and appends each part and the positions of
-/// its rows, in its order, to `out`.
+/// Writes encoded `rows` of a single partition as level 0 parts, decoding a
+/// single part batch at a time, and appends each part reference and sorted row
+/// positions to `out`.
 pub async fn write_encoded<'a>(
     shared: &Shared,
     db: &str,
@@ -114,7 +109,6 @@ pub async fn write_encoded<'a>(
     Ok(())
 }
 
-/// Encoded rows, decoded as they are taken, with their sizes.
 struct Decoding<'d, I> {
     rows: I,
     defaults: &'d Defaults,
@@ -132,7 +126,6 @@ impl<'a, I: Iterator<Item = (Pos, &'a [u8])>> Iterator for Decoding<'_, I> {
     }
 }
 
-/// A row to write: its position and values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PosRow {
     pub pos: Pos,
@@ -149,14 +142,13 @@ enum Getter {
     Shared { col: u32, bucket: u8, chosen: Arc<BTreeSet<String>> },
 }
 
-/// Rows sorted by the sort key, then by position, as a part [`Source`].
+/// Part [`Source`] of rows sorted by sort key and position.
 pub struct RowsSource {
     rows: Vec<PosRow>,
     bytes: Vec<u64>,
     keys: Vec<Bytes>,
     plans: Vec<ColPlan>,
     getters: Vec<Getter>,
-    /// Leaves of each JSON column's object in each row.
     leaves: BTreeMap<u32, Vec<BTreeMap<String, Json>>>,
     shared: BTreeMap<u32, Vec<SharedPath>>,
     partial: BTreeSet<u32>,
@@ -172,7 +164,8 @@ fn phys_of(t: EvType) -> Phys {
     }
 }
 
-/// A part-level dictionary for `vals`, if they have few enough distinct values.
+/// Builds a part-level dictionary for `vals` if the distinct count and total
+/// byte length are within [`DICT_MAX`] and [`DICT_MAX_BYTES`].
 pub fn dictionary<'a>(vals: impl Iterator<Item = &'a str>) -> Option<Arc<Vec<String>>> {
     let mut set = BTreeSet::new();
     let mut bytes = 0;
@@ -187,14 +180,10 @@ pub fn dictionary<'a>(vals: impl Iterator<Item = &'a str>) -> Option<Arc<Vec<Str
     Some(Arc::new(set.into_iter().map(str::to_string).collect()))
 }
 
-/// The defaults of a table's columns that parts store for rows written
-/// before the column was added, so that every read of such a row sees the
-/// default. Rows are not filled with them: a part's builder writes a
-/// column's default where a row lacks it, so that a 1 KiB default costs
-/// nothing per row until it is encoded.
+/// Column defaults materialized into parts for rows written before the column
+/// was added.
 #[derive(Clone, Debug, Default)]
 pub struct Defaults {
-    /// Each default, and the bytes it adds to a row's [`stored_len`].
     cols: BTreeMap<u32, (Datum, usize)>,
 }
 
@@ -217,30 +206,28 @@ impl Defaults {
         Defaults { cols }
     }
 
-    /// The default of column `id`, if parts store one.
     pub fn get(&self, id: u32) -> Option<&Datum> {
         self.cols.get(&id).map(|(d, _)| d)
     }
 
-    /// The value of column `id` that a part stores for `row`.
+    /// Returns the column value for `id` in `row`, or the default if absent.
     pub fn value<'r>(&'r self, row: &'r Row, id: u32) -> Option<&'r Datum> {
         row.get(&id).or_else(|| self.get(id))
     }
 
-    /// The bytes that a row lacking column `id` grows by when the part
-    /// stores its default.
+    /// Returns the stored byte length of the default for column `id`.
     pub fn len(&self, id: u32) -> usize {
         self.cols.get(&id).map_or(0, |(_, n)| *n)
     }
 
-    /// The [`stored_len`] of `row` with the defaults it lacks.
+    /// Returns the [`stored_len`] of `row` including any missing column defaults.
     pub fn stored_len(&self, row: &Row) -> usize {
         stored_len(row) + self.cols.iter().filter(|(id, _)| !row.contains_key(id)).map(|(_, (_, n))| n).sum::<usize>()
     }
 }
 
-/// Chooses the `max` most common paths to store as columns, the most
-/// common first and then by key.
+/// Selects up to `max` paths with keys at most [`PATH_COLUMN_KEY_MAX`] bytes,
+/// ordered by descending count and then ascending key.
 pub fn choose_paths(stats: &BTreeMap<String, (u64, JType)>, max: usize) -> BTreeSet<String> {
     let mut v: Vec<(&String, u64)> =
         stats.iter().filter(|(k, _)| k.len() <= PATH_COLUMN_KEY_MAX).map(|(k, (n, _))| (k, *n)).collect();
@@ -248,26 +235,23 @@ pub fn choose_paths(stats: &BTreeMap<String, (u64, JType)>, max: usize) -> BTree
     v.into_iter().take(max).map(|(k, _)| k.clone()).collect()
 }
 
-/// Paths longer than this are never stored as columns.
+/// Maximum byte length of a JSON path key stored as a dedicated column.
 pub const PATH_COLUMN_KEY_MAX: usize = 256;
 
-/// How a part stores one JSON column's paths.
+/// Storage plan for paths of a JSON column in a part.
 pub struct PathPlan {
-    /// Paths stored as columns of their own.
+    /// Paths stored in dedicated columns.
     pub chosen: Arc<BTreeSet<String>>,
-    /// The other paths the part's directory lists, by key.
+    /// Shared-bucket paths listed in the part directory, sorted by key.
     pub listed: Vec<SharedPath>,
-    /// Whether the other paths include some that `listed` leaves out.
+    /// True if shared buckets contain paths omitted from `listed`.
     pub partial: bool,
-    /// The shared buckets holding the other paths.
+    /// Shared bucket indices that contain remaining paths.
     pub buckets: BTreeSet<u8>,
 }
 
-/// Plans a JSON column's paths from their counts and types: the most common
-/// `event_json_max_paths` become columns, and the rest share buckets and
-/// are listed, most common first, while they fit
-/// `event_json_directory_bytes`. Both limits are divided among the table's
-/// `json_columns`.
+/// Partitions JSON path statistics into dedicated path columns and shared
+/// buckets, dividing path count and directory byte budgets across `json_columns`.
 pub fn plan_paths(
     stats: &BTreeMap<String, (u64, JType)>,
     cfg: &crate::engine::EngineConfig,
@@ -294,7 +278,7 @@ pub fn plan_paths(
     PathPlan { chosen, listed, partial, buckets }
 }
 
-/// The value of a path in a column of type `ty`, as a vector element.
+/// Formats JSON leaf value `v` for a path column of type `ty`.
 pub fn leaf_text(ty: JType, v: &Json) -> String {
     match (ty, v) {
         (JType::Str, Json::String(s)) => s.clone(),
@@ -303,8 +287,8 @@ pub fn leaf_text(ty: JType, v: &Json) -> String {
 }
 
 impl RowsSource {
-    /// Sorts `rows` and plans their columns; `versions` stores each row's
-    /// version, which binds of staged parts leave to their reference.
+    /// Sorts `rows` and plans columns; if `versions` is true, a `ColRef::Version`
+    /// column is included.
     pub fn new(
         schema: &EventSchema,
         mut rows: Vec<PosRow>,
@@ -537,8 +521,8 @@ impl Source for RowsSource {
     }
 }
 
-/// Writes `rows` of one partition as a level 0 part and returns its
-/// reference (without a version when `versions` is false).
+/// Writes `rows` of a single partition as a level 0 part and returns its
+/// [`PartRef`] and [`RowsSource`].
 pub async fn write_rows(
     shared: &Shared,
     db: &str,

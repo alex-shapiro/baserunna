@@ -1,10 +1,4 @@
-//! End-to-end tests of event tables on a single-node engine.
-//!
-//! The main property test drives a table through random transactional and
-//! bulk inserts, seals, merges and deletes, and checks that every random
-//! query answers exactly as it does on a model table that holds the same
-//! rows unsealed: so part encoding, JSON flattening, pruning, masks and
-//! merges never change an answer.
+//! End-to-end tests for event tables.
 
 use super::bulk::{BindFn, BufferConfig, Buffers};
 use super::exec::{self, Limits};
@@ -242,7 +236,7 @@ async fn compare(db: &Arc<Db>, model: &Arc<Db>, q: &Json) -> Result<usize, Strin
 }
 
 async fn run(seed: u64, steps: usize) -> Result<usize, String> {
-    // Odd seeds list few shared JSON paths in each part's directory.
+    // Odd seeds limit the JSON path directory size in each part.
     let directory = if seed.is_multiple_of(2) { 1 << 20 } else { 1 << (seed % 7) };
     let (eng, _store, env) = engine(seed, EngineConfig { event_json_directory_bytes: directory, ..cfg() });
     env.spawn(async {});
@@ -311,7 +305,7 @@ async fn run(seed: u64, steps: usize) -> Result<usize, String> {
 }
 
 #[test]
-fn queries_match_a_model_through_seals_merges_and_deletes() {
+fn queries_match_model_through_seals_merges_and_deletes() {
     let seeds: u64 = std::env::var("EVENT_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
     let mut answered = 0;
     let mut hits = crate::probe::Hits::default();
@@ -341,8 +335,8 @@ fn queries_match_a_model_through_seals_merges_and_deletes() {
     assert!(answered > 50 * seeds as usize / 4, "too few queries found rows: {answered}");
 }
 
-/// A table of `days` single-row parts behind a store with 25 ms latency,
-/// opened by a node whose caches are cold.
+/// Creates a table of `days` single-row parts on a store with 25 ms latency,
+/// opened by a node with cold caches.
 async fn many_parts_cold(days: i64) -> (Arc<Db>, EngineConfig, Arc<Engine>) {
     many_parts_cold_with(days, cfg()).await
 }
@@ -372,11 +366,8 @@ async fn many_parts_cold_with(days: i64, cfg: EngineConfig) -> (Arc<Db>, EngineC
     (db, cfg, cold)
 }
 
-/// A delete reads every part its time range covers before it commits, and
-/// it must commit before the request's deadline: on a table with hundreds
-/// of parts behind a store with realistic latency, it reads them concurrently.
 #[test]
-fn deletes_across_many_parts_commit_before_the_deadline() {
+fn deletes_across_many_parts_commit_before_deadline() {
     rt().block_on(async {
         let days = 400;
         let (db, cfg, _eng) = many_parts_cold(days).await;
@@ -397,8 +388,6 @@ fn deletes_across_many_parts_commit_before_the_deadline() {
     });
 }
 
-/// A cold query reads parts that are too large to fetch whole (metadata,
-/// then column indexes, then blocks) concurrently, not one after another.
 #[test]
 fn cold_queries_read_large_parts_concurrently() {
     rt().block_on(async {
@@ -411,12 +400,10 @@ fn cold_queries_read_large_parts_concurrently() {
         assert_eq!(out.rows, vec![vec![json!("u1"), json!(days / 2)]]);
         let ms = start.elapsed().as_millis();
         assert!(out.stats.store_gets >= 3 * days as u64, "{:?}", out.stats);
-        assert!(ms < 2_000, "a cold query of {days} parts in {} GETs took {ms} ms", out.stats.store_gets);
+        assert!(ms < 2_000, "cold query of {days} parts in {} GETs took {ms} ms", out.stats.store_gets);
     });
 }
 
-/// A cold query fetches the metadata of many parts at once rather than one
-/// part after another.
 #[test]
 fn cold_queries_read_parts_concurrently() {
     rt().block_on(async {
@@ -428,10 +415,10 @@ fn cold_queries_read_parts_concurrently() {
         let out = query(&db, &q).await.unwrap();
         assert_eq!(out.rows, vec![vec![json!(days / 2)]]);
         let ms = start.elapsed().as_millis();
-        assert!(ms < 1_000, "a cold query of {days} parts took {ms} ms");
+        assert!(ms < 1_000, "cold query of {days} parts took {ms} ms");
     });
 }
-/// Values survive sealing and merging exactly as unsealed rows hold them.
+
 mod stored_values {
     use super::*;
 
@@ -518,15 +505,13 @@ mod stored_values {
             let before = rows(&db, json!(["time", "plan"])).await;
             assert_eq!(before, vec![vec![json!(T0), json!("free")], vec![json!(T0 + 1), json!("pro")]]);
             merge_all(&db).await;
-            assert_eq!(rows(&db, json!(["time", "plan"])).await, before, "merge keeps the default");
+            assert_eq!(rows(&db, json!(["time", "plan"])).await, before, "merge preserves column default");
             assert_eq!(count(&db, json!({"col": "plan", "op": "eq", "value": "free"})).await, 1);
         });
     }
 
-    /// A merge writes no dictionary value or JSON path that only deleted
-    /// rows held, whether the path was a column or listed in a bucket.
     #[test]
-    fn merges_keep_nothing_of_deleted_rows() {
+    fn merges_omit_deleted_rows() {
         for max_paths in [1, 64] {
             rt().block_on(async {
                 let (eng, store, _env) = engine(1, EngineConfig { event_json_max_paths: max_paths, ..cfg() });
@@ -554,16 +539,17 @@ mod stored_values {
                     .filter(|k| k.starts_with(&prefix))
                     .filter(|k| store.get_sync(k, &Default::default()).unwrap().data.windows(6).any(|w| w == b"secret"))
                     .collect();
-                assert!(holding.is_empty(), "with {max_paths} JSON path columns, {holding:?} hold a deleted row");
+                assert!(
+                    holding.is_empty(),
+                    "with {max_paths} JSON path columns, {holding:?} retain data from a deleted row"
+                );
                 assert_eq!(count(&db, json!({"col": "props", "path": ["plan"], "op": "eq", "value": "free"})).await, 3);
             });
         }
     }
 
-    /// Integers beyond `i64` cannot be compared or aggregated exactly, so an
-    /// insert refuses them instead of storing a rounded float.
     #[test]
-    fn json_integers_beyond_i64_are_refused() {
+    fn json_integers_beyond_i64_are_rejected() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
@@ -612,7 +598,6 @@ mod stored_values {
         }
     }
 
-    /// Sealed and merged parts answer like unsealed rows for tricky values.
     #[test]
     fn tricky_values_roundtrip_through_parts() {
         for seed in 0..std::env::var("EVENT_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(6u64) {
@@ -708,9 +693,8 @@ mod stored_values {
         }
     }
 
-    /// Times are limited to what RFC 3339 can express, at insert.
     #[test]
-    fn times_beyond_rfc3339_are_refused() {
+    fn times_beyond_rfc3339_are_rejected() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
@@ -726,7 +710,7 @@ mod stored_values {
     }
 
     #[test]
-    fn extreme_times_seal_and_bucket_with_offset() {
+    fn extreme_times_are_sealed_and_bucketed_with_offset() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
@@ -745,11 +729,10 @@ mod stored_values {
         });
     }
 }
-/// Query answers that pruning and part layouts must not change.
+
 mod query_semantics {
     use super::*;
 
-    /// A fresh engine with table `def` created; returns the db and table id.
     async fn setup(def: Json) -> (Arc<Engine>, Arc<Db>, u32) {
         let (eng, _store, env) = engine(1, cfg());
         env.spawn(async {});
@@ -775,10 +758,9 @@ mod query_semantics {
         json!({"name": "e", "columns": cols, "time_column": "time", "order_by": ["time"], "partition": "day"})
     }
 
-    /// Answers before and after sealing must agree.
     async fn before_after(db: &Arc<Db>, table: u32, query: Json) -> (exec::Output, exec::Output) {
         let a = q(db, "e", query.clone()).await;
-        assert!(maint::seal(db, table).await.unwrap(), "nothing sealed");
+        assert!(maint::seal(db, table).await.unwrap(), "expected seal");
         let b = q(db, "e", query).await;
         assert_eq!(b.stats.unsealed_rows, 0);
         (a, b)
@@ -815,7 +797,7 @@ mod query_semantics {
                 "group_by": [{"bucket": {"col": "n"}, "interval": "1d"}], "aggregates": {"c": {"fn": "count"}}}),
             )
             .await;
-            assert_eq!(out.rows, vec![vec![Json::Null, json!(1)]], "a bucket beyond the time range is null");
+            assert_eq!(out.rows, vec![vec![Json::Null, json!(1)]], "bucket outside time range is null");
         });
     }
 
@@ -923,7 +905,7 @@ mod query_semantics {
                 "where": {"lookup": "plan", "op": "ne", "value": "zzz"},
                 "group_by": [{"lookup": "plan"}], "aggregates": {"n": {"fn": "count"}}});
             let (a, b) = before_after(&db, _id, query).await;
-            // uid 2 maps to a null plan, which is not the default.
+            // Row 2 has an explicit null `plan`, so the lookup does not fall back to the default.
             let want = vec![vec![json!("b"), json!(1)], vec![json!("d"), json!(1)], vec![json!("pro"), json!(1)]];
             assert_eq!(a.rows, want, "unsealed");
             assert_eq!(b.rows, want, "sealed");
@@ -931,7 +913,7 @@ mod query_semantics {
     }
 
     #[test]
-    fn lookup_limit_covers_the_whole_query() {
+    fn lookup_limit_applies_across_entire_query() {
         rt().block_on(async {
             let (_e, db, _id) =
                 setup(def(json!([{"name": "time", "type": "time"}, {"name": "uid", "type": "int"}]))).await;
@@ -979,7 +961,7 @@ mod query_semantics {
                 r.map(|o| o.rows)
             );
             let r = run(&["people"; 8], max).await;
-            assert!(r.is_ok(), "lookups of one table read it once: {:?}", r.err());
+            assert!(r.is_ok(), "repeated lookups on the same table load it once: {:?}", r.err());
         });
     }
 
@@ -1019,12 +1001,11 @@ mod query_semantics {
         assert_eq!(w.bucket(t("1969-12-28T00:00:00Z"), 0), Some(t("1969-12-22T00:00:00Z")));
     }
 }
-/// Bulk inserts, binds and maintenance against concurrent transactions and quotas.
+
 mod storage {
     use super::*;
 
-    /// Bulk-inserts `rows` through a bind that a concurrent commit of `req`
-    /// joins, so that the bind and the commit land in one batch, bind first.
+    /// Submits a bulk insert of `rows` and commits `req` in the same commit batch.
     async fn bind_beside(
         db: &Arc<Db>,
         s: &schema::EventSchema,
@@ -1057,7 +1038,7 @@ mod storage {
     }
 
     #[test]
-    fn a_drop_in_the_batch_after_a_bind_removes_the_bound_parts() {
+    fn drop_after_bind_in_same_batch_removes_bound_parts() {
         rt().block_on(async {
             let (eng, _store, env) = engine(3, cfg());
             env.spawn(async {});
@@ -1067,14 +1048,13 @@ mod storage {
             let mut d = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
             super::drop(&mut d, "events").await.unwrap();
             let (ins, dropped) = bind_beside(&db, &s, &[json!({"time": T0, "event": "a"})], d.into_request()).await;
-            // Either order is serializable, but a committed drop must leave nothing of the table.
             if let Ok(dv) = dropped {
                 let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
                 let refs = super::refs(&mut t, s.id).await.unwrap();
                 let part_bytes = db.current().unwrap().m.part_bytes;
                 assert!(
                     refs.is_empty() && part_bytes == 0,
-                    "insert {:?} and drop (v{dv}) both committed, yet the dropped table keeps {} part refs and part_bytes {}",
+                    "insert {:?} and drop v{dv} both committed, but the dropped table retained {} part refs and part_bytes {}",
                     ins.map(|c| c.version),
                     refs.len(),
                     part_bytes
@@ -1084,7 +1064,7 @@ mod storage {
     }
 
     #[test]
-    fn a_delete_in_the_batch_after_a_bind_sees_the_bound_events() {
+    fn delete_after_bind_in_same_batch_observes_bound_events() {
         rt().block_on(async {
             let (eng, _store, env) = engine(4, cfg());
             env.spawn(async {});
@@ -1092,7 +1072,6 @@ mod storage {
             let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
             let s = get_schema(&mut t, "events").await.unwrap();
             let everything = Filter::parse(json!({"col": "event", "op": "exists"})).unwrap();
-            // An earlier event gives the delete something to write.
             let earlier = [json!({"time": T0 + 1, "event": "b"})];
             txn_do(&db, async |t| insert(t, "events", &earlier, 0).await).await.unwrap();
             let mut d = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
@@ -1104,7 +1083,7 @@ mod storage {
                 let out = query(&db, &q).await.unwrap();
                 assert!(
                     del < ins || out.rows[0][0] == json!(0),
-                    "the insert committed at v{ins} and a delete of every event at v{del}, yet {:?} remain",
+                    "insert committed at v{ins} and delete committed at v{del}, but {:?} remain",
                     out.rows
                 );
             }
@@ -1112,7 +1091,7 @@ mod storage {
     }
 
     #[test]
-    fn bulk_inserts_count_toward_the_database_quota() {
+    fn bulk_inserts_count_toward_database_quota() {
         rt().block_on(async {
             let quota = 64 * 1024;
             let (eng, _store, env) = engine(5, EngineConfig { db_max_bytes: quota, ..cfg() });
@@ -1125,7 +1104,7 @@ mod storage {
                 Arc::new(|db: Arc<Db>, b| Box::pin(async move { db.bind(b).await })),
             );
             let mut r = Rng::new(1);
-            let mut refused = false;
+            let mut rejected = false;
             for i in 0..40 {
                 let rows: Vec<Json> = (0..50)
                     .map(|j| {
@@ -1138,7 +1117,7 @@ mod storage {
                 match bufs.submit(db.clone(), s.clone(), valid, env.random_u64(), deadline).await {
                     Ok(_) => {}
                     Err(Error::QuotaExceeded(_)) => {
-                        refused = true;
+                        rejected = true;
                         break;
                     }
                     Err(e) => panic!("insert {i}: {e}"),
@@ -1146,8 +1125,8 @@ mod storage {
             }
             let m = db.current().unwrap().m.clone();
             assert!(
-                refused || m.part_bytes <= quota,
-                "a {quota} byte database accepted {} bytes of event parts; it reports size {}",
+                rejected || m.part_bytes <= quota,
+                "{quota}-byte database accepted {} bytes of event parts, reported size {}",
                 m.part_bytes,
                 m.stored_bytes()
             );
@@ -1155,7 +1134,7 @@ mod storage {
     }
 
     #[test]
-    fn a_full_database_can_delete_events() {
+    fn full_database_allows_event_deletes() {
         rt().block_on(async {
             let quota = 64 * 1024;
             let (eng, _store, env) = engine(6, EngineConfig { db_max_bytes: quota, ..cfg() });
@@ -1187,7 +1166,7 @@ mod storage {
     }
 
     #[test]
-    fn a_partition_that_keeps_receiving_parts_stays_readable() {
+    fn partition_receiving_continuous_parts_remains_readable() {
         rt().block_on(async {
             let cfg = EngineConfig { event_merge_fan_in: 2, event_tier_base_bytes: 1 << 30, ..cfg() };
             let (eng, _store, env) = engine(7, cfg);
@@ -1208,7 +1187,7 @@ mod storage {
                 let out = query(&db, &q).await;
                 assert!(
                     m.is_ok() && out.as_ref().is_ok_and(|o| o.rows[0][0] == json!(i + 1)),
-                    "after {} inserts into one partition: maintenance {m:?}, query {:?}",
+                    "after {} inserts into partition: maintenance {m:?}, query {:?}",
                     i + 1,
                     out.map(|o| o.rows)
                 );
@@ -1216,10 +1195,8 @@ mod storage {
         });
     }
 
-    /// A part ref the sweep cannot decode stops the sweep instead of
-    /// letting it collect the part as an orphan.
     #[test]
-    fn the_sweep_keeps_parts_whose_refs_it_cannot_read() {
+    fn sweep_preserves_parts_with_unreadable_refs() {
         rt().block_on(async {
             let (eng, store, env) = engine(8, cfg());
             env.spawn(async {});
@@ -1243,16 +1220,13 @@ mod storage {
             }
             assert!(
                 store.keys().iter().any(|k| k.contains(&format!("/part/{}/", r.id))),
-                "the sweep deleted a part whose ref it could not decode"
+                "sweep deleted a part whose reference could not be decoded"
             );
         });
     }
 
-    /// Dropping a table whose events are in parts removes its state, so a
-    /// bulk insert staged against the dropped table is refused instead of
-    /// binding parts that nothing can drop again.
     #[test]
-    fn dropping_a_table_with_parts_refuses_later_binds() {
+    fn dropped_table_rejects_concurrent_part_binds() {
         rt().block_on(async {
             let (eng, _store, env) = engine(1, cfg());
             env.spawn(async {});
@@ -1273,19 +1247,15 @@ mod storage {
             let part_bytes = db.current().unwrap().m.part_bytes;
             assert!(
                 !state_left && bound.is_err() && stale == 0 && part_bytes == 0,
-                "after the drop: state entry left {state_left}, bind {:?}, refs of the dropped table {stale}, \
+                "after drop: state entry left {state_left}, bind {:?}, refs of dropped table {stale}, \
                  part_bytes {part_bytes}",
                 bound.map(|c| c.version)
             );
         });
     }
 
-    /// A drop reads none of its table's parts, so binds and seals landing
-    /// between its snapshot and its commit neither make it conflict nor
-    /// outlive it; a delete that read the parts before the drop committed
-    /// is refused.
     #[test]
-    fn a_drop_commits_while_parts_keep_landing() {
+    fn drop_commits_concurrently_with_binds_and_seals() {
         rt().block_on(async {
             let (eng, _store, env) = engine(9, cfg());
             env.spawn(async {});
@@ -1324,10 +1294,8 @@ mod storage {
         });
     }
 
-    /// Dropping a database's last event table leaves its parts, and a part
-    /// staged for it but never bound, to the sweep, which still lists them.
     #[test]
-    fn the_sweep_collects_the_parts_of_the_last_dropped_table() {
+    fn sweep_deletes_parts_of_last_dropped_table() {
         rt().block_on(async {
             let (eng, store, env) = engine(10, cfg());
             env.spawn(async {});
@@ -1353,8 +1321,6 @@ mod storage {
     }
 }
 
-/// A query that runs past its time limit stops with a retryable error
-/// instead of holding its query slot until it finishes.
 #[test]
 fn queries_stop_at_their_time_limit() {
     rt().block_on(async {
@@ -1374,7 +1340,7 @@ fn queries_stop_at_their_time_limit() {
     });
 }
 
-/// A store whose first `GET` of each event part object stalls.
+/// ObjectStore wrapper that stalls the first `GET` on each event part object.
 struct StallFirstPartGet {
     inner: crate::store::DynStore,
     stall_ms: u64,
@@ -1419,8 +1385,6 @@ impl crate::store::ObjectStore for StallFirstPartGet {
     }
 }
 
-/// A stalled part `GET` is hedged, so it delays a query by the hedge delay
-/// rather than by the stall.
 #[test]
 fn stalled_part_reads_are_hedged() {
     rt().block_on(async {
@@ -1447,10 +1411,10 @@ fn stalled_part_reads_are_hedged() {
         let out = query(&db, &json!({"from": T0, "to": T0 + 20 * DAY, "aggregates": {"n": {"fn": "count"}}})).await;
         assert_eq!(out.unwrap().rows, vec![vec![json!(20)]]);
         let ms = start.elapsed().as_millis() as u64;
-        assert!(ms < 2 * cfg.event_get_hedge_ms, "a query with stalled reads took {ms} ms");
+        assert!(ms < 2 * cfg.event_get_hedge_ms, "query with stalled reads took {ms} ms");
     });
 }
-/// Partial results of parts read concurrently, and filter constants they prune with.
+
 mod partial_results {
     use super::*;
 
@@ -1459,8 +1423,6 @@ mod partial_results {
         query(db, &q).await.unwrap().rows[0][0].as_i64().unwrap()
     }
 
-    /// A `-0.0` filter constant on a JSON path matches `0.0` rows while
-    /// unsealed, so sealing must not prune them by stats.
     #[test]
     fn negative_zero_json_path_filter_survives_stat_pruning() {
         rt().block_on(async {
@@ -1488,7 +1450,7 @@ mod partial_results {
         exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits { max_memory_bytes, ..Limits::default() }).await
     }
 
-    /// A store whose first part `GET` after arming stalls for 5 s.
+    /// ObjectStore wrapper that stalls the first part `GET` after `armed` is set.
     struct StallOnePartGet {
         inner: crate::store::DynStore,
         armed: std::sync::atomic::AtomicBool,
@@ -1532,8 +1494,6 @@ mod partial_results {
         }
     }
 
-    /// Groups by user over `days` single-row parts, read by a cold node whose
-    /// first part `GET` stalls.
     async fn group_by_user_with_slow_first_part(
         days: i64,
         cfg: EngineConfig,
@@ -1563,23 +1523,18 @@ mod partial_results {
         group_by_user(&db, days, max_memory_bytes).await
     }
 
-    /// Reading parts concurrently must not change whether a query fits its
-    /// memory limit: two groups fit in 450 bytes however parts are read, even
-    /// when the first part is slow to arrive.
     #[test]
     fn concurrent_parts_do_not_multiply_group_memory() {
         rt().block_on(async {
             let days = 64;
             let serial = EngineConfig { event_read_concurrency: 1, ..cfg() };
-            let one = group_by_user_with_slow_first_part(days, serial, 450).await;
-            assert!(one.is_ok(), "one part at a time: {one:?}");
+            let single = group_by_user_with_slow_first_part(days, serial, 450).await;
+            assert!(single.is_ok(), "serial part reads: {single:?}");
             let many = group_by_user_with_slow_first_part(days, cfg(), 450).await;
-            assert_eq!(many.map(|o| o.rows), Ok(one.unwrap().rows), "32 parts at a time");
+            assert_eq!(many.map(|o| o.rows), Ok(single.unwrap().rows), "32 concurrent part reads");
         });
     }
 
-    /// Min over strings of `rows` sealed into one part per day, read by a
-    /// cold node whose first part `GET` (the earliest day's) stalls.
     async fn min_event_by_user_with_slow_first_part(
         rows: Vec<Json>,
         cfg: EngineConfig,
@@ -1612,9 +1567,6 @@ mod partial_results {
         exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits { max_memory_bytes, ..Limits::default() }).await
     }
 
-    /// Whether a min over strings fits its memory limit must not depend on
-    /// which part arrives first: day 0 holds a short minimum for each of 8
-    /// users, days 1..=8 a long non-minimal string for one user each.
     #[test]
     fn min_state_memory_limit_ignores_part_arrival_order() {
         rt().block_on(async {
@@ -1625,21 +1577,17 @@ mod partial_results {
             );
             let want: Vec<Vec<Json>> = (0..8).map(|u| vec![json!(format!("u{u}")), json!("a")]).collect();
             let serial = EngineConfig { event_read_concurrency: 1, ..cfg() };
-            let one = min_event_by_user_with_slow_first_part(rows.clone(), serial, 3000).await;
-            assert_eq!(one.map(|o| o.rows), Ok(want.clone()), "one part at a time");
+            let single = min_event_by_user_with_slow_first_part(rows.clone(), serial, 3000).await;
+            assert_eq!(single.map(|o| o.rows), Ok(want.clone()), "serial part reads");
             let four = EngineConfig { event_read_concurrency: 4, ..cfg() };
             let many = min_event_by_user_with_slow_first_part(rows, four, 3000).await;
-            assert_eq!(many.map(|o| o.rows), Ok(want), "4 parts at a time, first part slow");
+            assert_eq!(many.map(|o| o.rows), Ok(want), "4 concurrent part reads, first part slow");
         });
     }
 }
 
-/// Every page of rows equals a brute-force sort of the live events by the
-/// page's order, then insertion: whatever parts and unsealed rows hold them,
-/// however many parts are read at once, and whether the order leads with
-/// time, so that reading stops early, or not.
 #[test]
-fn row_pages_match_a_brute_force_sort() {
+fn row_pages_match_brute_force_sort() {
     struct Ev {
         time: i64,
         user: String,
@@ -1701,7 +1649,7 @@ fn row_pages_match_a_brute_force_sort() {
                         let from = T0 + r.below(3) as i64 * DAY - DAY;
                         let to = from + (1 + r.below(7)) as i64 * DAY;
                         let limit = 1 + r.usize(8);
-                        // Each order as (key, desc), where key 0 is time and 1 is n.
+                        // Sort order pairs `(key, desc)`, where key 0 is `time` and key 1 is `n`.
                         const ORDERS: [&[(usize, bool)]; 6] = [
                             &[],
                             &[(0, true)],
@@ -1777,8 +1725,6 @@ fn row_pages_match_a_brute_force_sort() {
     assert!(stopped * 4 > pages, "only {stopped} of {pages} pages stopped reading parts early");
 }
 
-/// A merge reads each small input part once, though it reads every column
-/// of each, and does so without filling the node's cache.
 #[test]
 fn merges_fetch_each_small_input_once() {
     rt().block_on(async {
@@ -1817,7 +1763,6 @@ fn merges_fetch_each_small_input_once() {
         assert_eq!(query(&db, &q).await.unwrap().rows, vec![vec![json!(80)]]);
     });
 }
-/// Maintenance whose transactions must fit the write limit, and merges that fail.
 mod maintenance_limits {
     use super::*;
 
@@ -1838,8 +1783,7 @@ mod maintenance_limits {
         crate::store::list_all(&*sh.store, &prefix, &sh.retry).await.unwrap().len()
     }
 
-    /// One single-row part in each of `days` day partitions ending yesterday,
-    /// sealed `per_seal` partitions at a time so that every seal fits.
+    /// Inserts and seals `days` single-row daily parts in batches of `per_seal`.
     async fn daily_parts(db: &Arc<Db>, days: i64, per_seal: i64) {
         let id = table_id(db).await;
         for chunk in (0..days).collect::<Vec<_>>().chunks(per_seal as usize) {
@@ -1855,10 +1799,8 @@ mod maintenance_limits {
         EngineConfig { txn_max_write_bytes: 8 * 1024, ..cfg() }
     }
 
-    /// Retention drops expired parts in transactions that fit the write
-    /// limit, however many parts have expired.
     #[test]
-    fn retention_of_many_parts_fits_the_transaction_limit() {
+    fn retention_of_many_parts_fits_transaction_limit() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, small_txns());
             let db = create_db(&eng, "d").await;
@@ -1875,22 +1817,18 @@ mod maintenance_limits {
         });
     }
 
-    /// A drop writes the same few keys however many parts its table has, so
-    /// a table of more parts than one transaction may reference drops.
     #[test]
-    fn dropping_a_table_of_many_parts_fits_the_transaction_limit() {
+    fn dropping_table_with_many_parts_fits_transaction_limit() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, small_txns());
             let db = create_db(&eng, "d").await;
             daily_parts(&db, 120, 10).await;
             let r = txn_do(&db, async |t| drop(t, "events").await).await;
-            assert!(r.is_ok(), "dropping a table of 120 parts: {r:?}");
+            assert!(r.is_ok(), "dropping table with 120 parts: {r:?}");
             assert_eq!(db.current().unwrap().m.part_bytes, 0);
         });
     }
 
-    /// Rows spanning more partitions than one transaction may reference are
-    /// sealed by several seals, and no seal leaves parts behind.
     #[test]
     fn sealing_rows_across_many_partitions_succeeds() {
         rt().block_on(async {
@@ -1911,15 +1849,13 @@ mod maintenance_limits {
             assert_eq!(
                 (outcomes.last().cloned(), part_count(&db).await, leaked),
                 (Some(Ok(false)), 60, 60),
-                "attempts: {outcomes:?}; part objects in the store: {leaked}"
+                "attempts: {outcomes:?}; part objects in store: {leaked}"
             );
         });
     }
 
-    /// The same with the shipped limits: two transactions of 60,000 events,
-    /// one per hour over 14 years, committed before the next seal.
     #[test]
-    fn sealing_a_large_hourly_backfill_succeeds_with_default_limits() {
+    fn sealing_large_hourly_backfill_succeeds_with_default_limits() {
         rt().block_on(async {
             let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
             let (eng, _store, _env) = engine(1, cfg);
@@ -1936,12 +1872,10 @@ mod maintenance_limits {
                 txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
             }
             let r = maint::seal(&db, id).await;
-            assert!(matches!(r, Ok(true)), "seal: {r:?}; part objects left in the store: {}", part_objects(&db).await);
+            assert!(matches!(r, Ok(true)), "seal: {r:?}; part objects left in store: {}", part_objects(&db).await);
         });
     }
 
-    /// A seal racing a drop and re-create of its table under the same name,
-    /// or a column drop, at every relative timing.
     #[test]
     fn seals_racing_drops_and_column_changes() {
         for delay in [0u64, 10, 20, 30, 40, 50, 60, 80, 100, 150] {
@@ -1994,7 +1928,7 @@ mod maintenance_limits {
                     let stale = refs(&mut t, old).await.unwrap();
                     let live: u64 = refs(&mut t, id).await.unwrap().iter().map(|r| r.stored_bytes()).sum();
                     if variant == 0 {
-                        assert!(stale.is_empty(), "delay {delay}: the dropped table kept {} refs", stale.len());
+                        assert!(stale.is_empty(), "delay {delay}: dropped table retained {} refs", stale.len());
                     }
                     let st = super::state(&mut t, old).await.unwrap();
                     if variant == 0 {
@@ -2006,10 +1940,8 @@ mod maintenance_limits {
         }
     }
 
-    /// A merge that outlives `event_merge_max_ms` is abandoned without
-    /// holding up the merges of the table's other partitions.
     #[test]
-    fn a_merge_that_runs_too_long_does_not_block_other_partitions() {
+    fn timed_out_merge_does_not_block_other_partitions() {
         rt().block_on(async {
             let origin = tokio::time::Instant::now();
             let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
@@ -2020,9 +1952,6 @@ mod maintenance_limits {
             let eng = Engine::new(store.clone(), env.clone(), cfg, "node-a".into());
             let db = create_db(&eng, "d").await;
             let id = table_id(&db).await;
-            // Partition A gets three parts of 250 rows (many granules, so a
-            // merge of about 2.5 s); partition B, a day later, three single-row
-            // parts (a merge of about 1.4 s).
             for k in 0..3i64 {
                 let mut rows: Vec<Json> = (0..250)
                     .map(|i| json!({"time": T0 - 10 * DAY + k * 1000 + i, "event": format!("e{i}"), "n": i}))
@@ -2046,9 +1975,8 @@ mod maintenance_limits {
         });
     }
 
-    /// Inserting no events leaves nothing a later read could miss.
     #[test]
-    fn an_empty_insert_does_not_refuse_later_queries() {
+    fn empty_insert_does_not_break_subsequent_queries() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
@@ -2061,11 +1989,8 @@ mod maintenance_limits {
         });
     }
 
-    /// Maintenance on a node that no longer holds the lease stops at the
-    /// first merge that cannot commit, rather than running (and leaving the
-    /// output of) a merge in every partition.
     #[test]
-    fn maintenance_without_the_lease_stops_after_one_merge() {
+    fn maintenance_without_lease_stops_after_first_merge() {
         rt().block_on(async {
             let origin = tokio::time::Instant::now();
             let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
@@ -2092,14 +2017,12 @@ mod maintenance_limits {
             let r = maint::maintain(&db, id, 64).await;
             assert!(matches!(r, Err(Error::NotOwner { .. })), "{r:?}");
             let left = part_objects(&db).await - before;
-            assert!(left <= 1, "merge outputs left in the store by a node without the lease: {left}");
+            assert!(left <= 1, "merge outputs left in store by node without lease: {left}");
         });
     }
 
-    /// A seal conflicts only with deletes of the rows it seals: an insert
-    /// committed while the seal writes its parts adds rows after them.
     #[test]
-    fn a_seal_commits_despite_a_concurrent_insert() {
+    fn seal_commits_concurrently_with_insert() {
         let mut outcomes = Vec::new();
         for delay in [0u64, 1, 2, 5, 10, 15, 20, 30] {
             rt().block_on(async {
@@ -2126,8 +2049,6 @@ mod maintenance_limits {
         assert!(outcomes.iter().all(|(_, r)| *r == Ok(true)), "seals racing an insert: {outcomes:?}");
     }
 
-    /// Events with long sort key values, each in its own day, inserted by
-    /// transactions within the default limits, can be sealed.
     #[test]
     fn events_with_long_sort_keys_can_be_sealed() {
         rt().block_on(async {
@@ -2173,12 +2094,8 @@ mod part_limits {
         query(db, &q).await.unwrap().rows[0][0].as_i64().unwrap()
     }
 
-    /// JSON keyed by ids (`{"scores": {"user-…": 1}}`) gives every event its
-    /// own paths. A part lists only as many as fit its metadata, and paths
-    /// it leaves out are still read from their shared buckets, through
-    /// seals and merges.
     #[test]
-    fn parts_of_events_with_unique_json_paths_keep_small_metadata() {
+    fn parts_with_unique_json_paths_bound_metadata_size() {
         rt().block_on(async {
             let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
             let (eng, _store, _env) = engine(1, cfg);
@@ -2216,7 +2133,7 @@ mod part_limits {
             let (parts, meta) = meta_bytes().await;
             assert!(parts >= 2 && meta <= 1 << 20, "{parts} parts, listing up to {meta} bytes of paths");
             for n in [0, 4_999, 9_999, 10_000, 19_999] {
-                assert_eq!(probe(n).await, 1, "sealed: the path of event {n}");
+                assert_eq!(probe(n).await, 1, "sealed: path of event {n}");
             }
             let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
             let s = get_schema(&mut t, "events").await.unwrap();
@@ -2225,15 +2142,13 @@ mod part_limits {
             let (parts, meta) = meta_bytes().await;
             assert!(parts == 1 && meta <= 1 << 20, "merged: {parts} parts, listing {meta} bytes of paths");
             for n in [0, 4_999, 9_999, 10_000, 19_999] {
-                assert_eq!(probe(n).await, 1, "merged: the path of event {n}");
+                assert_eq!(probe(n).await, 1, "merged: path of event {n}");
             }
         });
     }
 
-    /// A merge types paths that a part with a partial directory may hold
-    /// unlisted as JSON text, since that part may hold them with any type.
     #[test]
-    fn merges_keep_paths_a_partial_directory_does_not_list() {
+    fn merges_preserve_unlisted_paths_from_truncated_directories() {
         rt().block_on(async {
             let cfg = EngineConfig { event_json_max_paths: 1, event_json_directory_bytes: 1, ..cfg() };
             let (eng, _store, _env) = engine(1, cfg);
@@ -2258,8 +2173,6 @@ mod part_limits {
         });
     }
 
-    /// A delete whose mask outgrows a reference is stored as a mask object,
-    /// which queries, later deletes and merges read.
     #[test]
     fn large_deletion_masks_are_stored_as_objects() {
         crate::probe::record();
@@ -2280,7 +2193,7 @@ mod part_limits {
                     .unwrap()
             };
             assert_eq!(delete(json!({"col": "user", "op": "eq", "value": "odd"})).await, 3_000);
-            assert!(crate::probe::finish().count(Probe::MaskObjectWritten) > 0, "the mask fit its reference");
+            assert!(crate::probe::finish().count(Probe::MaskObjectWritten) > 0, "expected external mask object");
             assert_eq!(count(&db, json!({"col": "n", "op": "ge", "value": 0})).await, 3_000);
             assert_eq!(count(&db, json!({"col": "n", "op": "eq", "value": 3})).await, 0);
             assert_eq!(count(&db, json!({"col": "n", "op": "eq", "value": 4})).await, 1);
@@ -2296,7 +2209,7 @@ mod part_limits {
     }
 
     #[test]
-    fn an_added_float_default_of_negative_zero_survives_seal() {
+    fn added_negative_zero_float_default_survives_seal() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
@@ -2305,16 +2218,12 @@ mod part_limits {
                 serde_json::from_value(json!({"name": "z", "type": "float", "default": -0.0})).unwrap();
             txn_do(&db, async |t| add_column(t, "events", &spec).await).await.unwrap();
             let w = json!({"col": "z", "op": "ge", "value": 0});
-            assert_eq!(count(&db, w.clone()).await, 1, "unsealed: the default -0.0 is >= 0");
+            assert_eq!(count(&db, w.clone()).await, 1, "unsealed: default -0.0 is >= 0");
             assert!(maint::seal(&db, table_id(&db).await).await.unwrap());
-            assert_eq!(count(&db, w).await, 1, "sealed: the default -0.0 is >= 0");
+            assert_eq!(count(&db, w).await, 1, "sealed: default -0.0 is >= 0");
         });
     }
 
-    /// A shared JSON bucket repeats every leaf's full path, so an event under
-    /// 1 MiB whose leaves share a long prefix can hold many times its size.
-    /// Events that flatten past the limit are refused, and granules of the
-    /// rest are cut by their flattened size, so their parts stay readable.
     #[test]
     fn events_with_long_json_paths_stay_readable_after_seal() {
         rt().block_on(async {
@@ -2337,23 +2246,20 @@ mod part_limits {
                 Json::Object(props)
             };
             let huge = json!({"time": T0, "event": "a", "props": props(40_000, 0)});
-            assert!(huge.to_string().len() < 1 << 20, "the event is under 1 MiB");
+            assert!(huge.to_string().len() < 1 << 20, "serialized event is under 1 MiB");
             let r = txn_do(&db, async |t| insert(t, "events", std::slice::from_ref(&huge), 0).await).await;
-            assert!(matches!(r, Err(Error::TooLarge(_))), "an event flattening to 80 MB was accepted: {r:?}");
+            assert!(matches!(r, Err(Error::TooLarge(_))), "event flattening to 80 MB was accepted: {r:?}");
             for salt in 0..30 {
                 ins(&db, vec![json!({"time": T0 + salt as i64, "event": "a", "props": props(1_500, salt)})]).await;
             }
             let q = json!({"from": 0, "to": T0 * 2, "columns": ["props"], "limit": 1});
-            assert!(query(&db, &q).await.is_ok(), "unsealed reads");
+            assert!(query(&db, &q).await.is_ok(), "unsealed read");
             assert!(maint::seal(&db, table_id(&db).await).await.unwrap());
             let r = query(&db, &q).await;
-            assert!(r.is_ok(), "sealed reads: {:?}", r.err());
+            assert!(r.is_ok(), "sealed read: {:?}", r.err());
         });
     }
 
-    /// Large rows that sort together among many small ones stay readable
-    /// after a merge: granules are cut by each row's stored size, not by
-    /// the inputs' average row, and string dictionaries stay small.
     #[test]
     fn merged_large_rows_stay_readable() {
         rt().block_on(async {
@@ -2370,7 +2276,7 @@ mod part_limits {
             }
             while maint::seal(&db, id).await.unwrap() {}
             let q = json!({"from": 0, "to": T0 * 2, "columns": ["user"], "limit": 1});
-            assert!(query(&db, &q).await.is_ok(), "sealed parts read");
+            assert!(query(&db, &q).await.is_ok(), "sealed read");
             let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
             let s = get_schema(&mut t, "events").await.unwrap();
             let rs = refs(&mut t, s.id).await.unwrap();
@@ -2378,13 +2284,12 @@ mod part_limits {
             maint::merge(&db, &s, &rs).await.unwrap();
             let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
             let after = refs(&mut t, s.id).await.unwrap();
-            assert_eq!((after.len(), after[0].rows), (1, 570), "one merged part");
+            assert_eq!((after.len(), after[0].rows), (1, 570), "merged part");
             let r = query(&db, &q).await;
-            assert!(r.is_ok(), "merged part reads: {:?}", r.err());
+            assert!(r.is_ok(), "merged read: {:?}", r.err());
         });
     }
 
-    /// The cache charges part metadata for every shared JSON path it holds.
     #[test]
     fn part_metadata_is_charged_for_shared_paths() {
         rt().block_on(async {
@@ -2472,10 +2377,8 @@ mod query_limits {
         exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await
     }
 
-    /// An aggregate query without a `limit` answers with every group or
-    /// fails: it never returns some of them as if they were all.
     #[test]
-    fn aggregates_beyond_the_group_limit_are_refused_unless_limited() {
+    fn aggregates_exceeding_group_limit_are_rejected_without_limit() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
@@ -2487,23 +2390,15 @@ mod query_limits {
             }
             let q = json!({"from": T0, "to": T0 + DAY, "group_by": ["user"], "aggregates": {"c": {"fn": "count"}}});
             let r = run_with(&db, q.clone(), Limits::default()).await;
-            assert!(
-                matches!(r, Err(Error::TooLarge(_))),
-                "{} groups answered with {:?} rows",
-                n,
-                r.map(|o| o.rows.len())
-            );
+            assert!(matches!(r, Err(Error::TooLarge(_))), "{} groups returned {:?} rows", n, r.map(|o| o.rows.len()));
             let mut limited = q;
             limited["limit"] = json!(10);
             assert_eq!(run_with(&db, limited, Limits::default()).await.unwrap().rows.len(), 10);
         });
     }
 
-    /// Group keys hold the same bytes whatever the aggregates are, so adding
-    /// a `min` must not let a query past the state limit that `count` alone
-    /// cannot pass.
     #[test]
-    fn the_state_limit_counts_group_keys_for_every_aggregate() {
+    fn state_memory_limit_counts_group_keys_for_all_aggregates() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
@@ -2534,19 +2429,14 @@ mod query_limits {
             let b = run_with(&db, with_min, limits).await;
             assert!(
                 matches!(b, Err(Error::TooLarge(_))),
-                "the same 1.3 MB of group keys pass a 512 KiB limit once a min is added: {:?}",
+                "1.3 MB of group keys passed 512 KiB limit with min aggregate: {:?}",
                 b.map(|o| o.rows.len())
             );
         });
     }
 
-    /// The columns a query reads at once count toward its memory limit
-    /// with its state: a part whose columns outgrow a concurrent read's
-    /// share of the limit is read again at its turn under the whole limit,
-    /// and a query whose columns of one granule exceed the whole limit fails
-    /// rather than holding them.
     #[test]
-    fn the_columns_a_query_reads_at_once_count_toward_its_memory_limit() {
+    fn concurrently_read_columns_count_toward_memory_limit() {
         rt().block_on(async {
             let cfg = EngineConfig {
                 event_granule_rows: 1024,
@@ -2569,26 +2459,27 @@ mod query_limits {
                 txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
             }
             while maint::seal(&db, id).await.unwrap() {}
-            // Each part's granule holds 64 int path columns of 512 rows: 512 KiB decoded.
             let any: Vec<Json> =
                 (0..64).map(|k| json!({"col": "props", "path": [format!("p{k}")], "op": "eq", "value": 7})).collect();
             let q = json!({"from": T0, "to": T0 + 4 * DAY, "where": {"or": any}, "aggregates": {"n": {"fn": "count"}}});
             let whole = run_with(&db, q.clone(), Limits::default()).await.unwrap();
             assert_eq!((whole.rows, whole.stats.unsealed_rows), (vec![vec![json!(4)]], 0));
             let shares = run_with(&db, q.clone(), Limits { max_memory_bytes: 2 << 20, ..Limits::default() }).await;
-            assert_eq!(shares.map(|o| o.rows), Ok(vec![vec![json!(4)]]), "parts past a 64 KiB share are read again");
+            assert_eq!(
+                shares.map(|o| o.rows),
+                Ok(vec![vec![json!(4)]]),
+                "parts exceeding per-worker share are retried"
+            );
             let r = run_with(&db, q, Limits { max_memory_bytes: 256 << 10, ..Limits::default() }).await;
             assert!(
                 matches!(&r, Err(Error::TooLarge(m)) if m.contains("columns")),
-                "512 KiB of columns pass a 256 KiB limit: {r:?}"
+                "512 KiB of columns passed 256 KiB limit: {r:?}"
             );
         });
     }
 
-    /// A query whose reads never wait (warm caches, an in-memory store) still
-    /// stops at its time limit.
     #[test]
-    fn a_query_whose_reads_never_wait_stops_at_its_time_limit() {
+    fn cpu_bound_query_stops_at_time_limit() {
         crate::probe::record();
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         rt.block_on(async {
@@ -2611,14 +2502,12 @@ mod query_limits {
             let r = run_with(&db, q, Limits { max_ms: 1, ..Limits::default() }).await;
             assert!(
                 warm_ms < 5 || matches!(r, Err(Error::Unavailable { .. })),
-                "a query that runs {warm_ms} ms answered within a 1 ms limit: {:?}",
+                "query running {warm_ms} ms completed within 1 ms limit: {:?}",
                 r.map(|o| o.rows.len())
             );
         });
     }
 
-    /// Accounting for aggregation state costs no more than the aggregation:
-    /// a `min` per group is not much slower than a `count` per group.
     #[test]
     fn state_accounting_is_not_quadratic_in_groups() {
         crate::probe::record();
@@ -2650,9 +2539,8 @@ mod query_limits {
         });
     }
 
-    /// Rows mode keeps whole rows in memory; the state limit must bound them too.
     #[test]
-    fn rows_mode_is_bounded_by_the_memory_limit() {
+    fn rows_mode_is_bounded_by_memory_limit() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
@@ -2668,14 +2556,12 @@ mod query_limits {
             let r = run_with(&db, q, limits).await;
             assert!(
                 matches!(r, Err(Error::TooLarge(_))),
-                "1.3 MB of rows held under a 256 KiB memory limit: {:?}",
+                "1.3 MB of rows held under 256 KiB memory limit: {:?}",
                 r.map(|o| o.rows.len())
             );
         });
     }
 
-    /// Ints and floats beyond 2^53 in one JSON path sort consistently, so a
-    /// query neither panics nor pages them out of order.
     #[test]
     fn large_mixed_numbers_sort_and_page_exactly() {
         rt().block_on(async {
@@ -2715,15 +2601,14 @@ mod query_limits {
                     Some(c) => cursor = json!(c),
                     None => break,
                 }
-                assert!(got.len() <= 3000, "pages return more rows than the table holds");
+                assert!(got.len() <= 3000, "pages returned more rows than the table holds");
             }
             let mut seen = std::collections::BTreeSet::new();
             let dups = got.iter().filter(|r| !seen.insert(r[1].as_i64().unwrap())).count();
-            assert_eq!((got.len(), dups), (3000, 0), "paging returned {} rows, {dups} repeated", got.len());
+            assert_eq!((got.len(), dups), (3000, 0), "paging returned {} rows, {dups} duplicates", got.len());
         });
     }
 
-    /// Quantiles stay within 1% of finite values at both ends of the range.
     #[test]
     fn quantiles_of_extreme_values_are_finite() {
         for x in [1e308, f64::MAX, -1e308, 1e-305, 5e-324] {
@@ -2738,14 +2623,11 @@ mod query_limits {
 mod costly_filters {
     use super::*;
 
-    /// A runtime whose clock runs, so a query's time limit passes while its
-    /// filters compute.
     fn timed_rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap()
     }
 
-    /// Runs `q` with a 100 ms limit, failing unless it stops within a
-    /// second: its answer, or `None` when it stopped at the limit.
+    /// Runs `q` with a 100 ms timeout and returns `None` if the query times out.
     async fn run_limited(db: &Arc<Db>, q: Json) -> Option<exec::Output> {
         let q = Query::parse(q).unwrap();
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
@@ -2755,21 +2637,19 @@ mod costly_filters {
         let ms = start.elapsed().as_millis();
         match r {
             Ok(o) => {
-                assert!(ms < 1000, "a query with a 100 ms limit ran {ms} ms and answered {:?}", o.rows);
+                assert!(ms < 1000, "query with 100 ms limit ran {ms} ms and returned {:?}", o.rows);
                 Some(o)
             }
             Err(Error::Unavailable { outcome_unknown: false, message, .. }) if message.contains("100 ms") => {
-                assert!(ms < 1000, "a query with a 100 ms limit ran {ms} ms before it stopped");
+                assert!(ms < 1000, "query with 100 ms limit ran {ms} ms before stopping");
                 None
             }
             Err(e) => panic!("{e:?}"),
         }
     }
 
-    /// 255 `or`ed `in` tests of 1,000 values each cost a row one lookup per
-    /// test, however long the lists are.
     #[test]
-    fn costly_filters_stop_at_the_time_limit() {
+    fn costly_in_filters_stop_at_time_limit() {
         timed_rt().block_on(async {
             let (eng, _store, _env) = engine(1, EngineConfig::small_for_tests());
             let db = create_db(&eng, "d").await;
@@ -2787,11 +2667,8 @@ mod costly_filters {
         });
     }
 
-    /// Filters whose every test is costly stop at the time limit rather
-    /// than answering late, over unsealed rows and over one large granule
-    /// alike.
     #[test]
-    fn costly_string_tests_stop_at_the_time_limit() {
+    fn costly_string_filters_stop_at_time_limit() {
         for sealed in [false, true] {
             timed_rt().block_on(async {
                 let d = EngineConfig::default();
@@ -2831,12 +2708,8 @@ mod costly_filters {
         }
     }
 
-    /// A part ruled out by one comparison's dictionary is not scanned
-    /// against the dictionaries of the filter's other comparisons, so a
-    /// query whose `event` matches no part answers at once however costly
-    /// its tests of `user` are.
     #[test]
-    fn parts_ruled_out_by_one_dictionary_skip_the_others() {
+    fn part_pruned_by_first_dictionary_skips_remaining_comparisons() {
         timed_rt().block_on(async {
             let d = EngineConfig::default();
             let cfg = EngineConfig {
@@ -2866,7 +2739,7 @@ mod costly_filters {
             let filter = json!({"and": [{"col": "event", "op": "eq", "value": "zzz"}, {"or": ors}]});
             let q = json!({"from": T0, "to": T0 + DAY, "where": filter, "aggregates": {"c": {"fn": "count"}}});
             let r = run_limited(&db, q).await;
-            assert_eq!(r.map(|o| o.rows), Some(vec![vec![json!(0)]]), "the query stopped at its 100 ms limit");
+            assert_eq!(r.map(|o| o.rows), Some(vec![vec![json!(0)]]), "query timed out at 100 ms limit");
         });
     }
 }
@@ -2890,7 +2763,6 @@ mod answers {
         txn_do(db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
     }
 
-    /// Two different (user, event) pairs are two groups.
     #[test]
     fn distinct_group_keys_stay_distinct() {
         rt().block_on(async {
@@ -2911,8 +2783,6 @@ mod answers {
         });
     }
 
-    /// A sum of floats holds a 70-limb exact accumulator, which the state limit
-    /// counts; a sum of integers holds none.
     #[test]
     fn sum_states_are_charged_for_their_accumulators() {
         rt().block_on(async {
@@ -2931,7 +2801,7 @@ mod answers {
             };
             let limits = Limits { max_memory_bytes: 4 << 20, ..Limits::default() };
             let ints = run_with(&db, sums("n"), limits).await;
-            assert!(ints.is_ok(), "integer sums hold no float accumulator: {:?}", ints.err());
+            assert!(ints.is_ok(), "integer sums do not allocate float accumulators: {:?}", ints.err());
             let held = 2000 * 8 * std::mem::size_of::<i64>() * 70;
             let r = run_with(&db, sums("x"), limits).await;
             assert!(
@@ -2943,7 +2813,6 @@ mod answers {
         });
     }
 
-    /// A JSON object's in-memory size is far above its text; rows mode must count it.
     #[test]
     fn json_rows_are_charged_for_their_memory() {
         rt().block_on(async {
@@ -2956,7 +2825,6 @@ mod answers {
             let rows: Vec<Json> =
                 (0..100i64).map(|i| json!({"time": T0 + i, "event": "a", "props": props.clone()})).collect();
             ins(&db, rows).await;
-            // Each inner object allocates a B-tree leaf of 11 (String, Value) slots.
             let held = 100 * 1000 * 11 * (24 + 32);
             let limits = Limits { max_memory_bytes: 8 << 20, ..Limits::default() };
             let q = json!({"from": T0, "to": T0 + DAY, "columns": ["props"], "limit": 100});
@@ -2970,9 +2838,8 @@ mod answers {
         });
     }
 
-    /// A page whose rows fit the memory limit is answered.
     #[test]
-    fn rows_that_fit_the_limit_are_answered() {
+    fn rows_within_memory_limit_succeed() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
@@ -2987,7 +2854,6 @@ mod answers {
         });
     }
 
-    /// Float columns compare exactly with integer arguments.
     #[test]
     fn float_columns_compare_exactly_with_large_ints() {
         rt().block_on(async {
@@ -3004,9 +2870,8 @@ mod answers {
         });
     }
 
-    /// Pages continue where they stopped after the rows they read are sealed.
     #[test]
-    fn pages_continue_across_a_seal() {
+    fn pages_continue_across_seal() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
@@ -3038,7 +2903,6 @@ mod answers {
         });
     }
 
-    /// A strict-order funnel answers the same unsealed and sealed.
     #[test]
     fn strict_funnels_agree_across_storage() {
         rt().block_on(async {
@@ -3071,8 +2935,6 @@ mod answers {
         });
     }
 
-    /// a@0 then b@5 is a strictly increasing two-step funnel, whatever
-    /// other a events happen at 5.
     #[test]
     fn strict_increase_funnels_use_earlier_starts() {
         rt().block_on(async {
@@ -3095,10 +2957,8 @@ mod answers {
         });
     }
 
-    /// A string column added with the default "now" reads that string for
-    /// earlier events however they are stored.
     #[test]
-    fn a_string_default_of_now_reads_alike_unsealed_and_sealed() {
+    fn string_default_now_matches_across_unsealed_and_sealed() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
@@ -3116,7 +2976,6 @@ mod answers {
         });
     }
 
-    /// Lookup values from a JSON column compare as numbers when they are numbers.
     #[test]
     fn json_lookup_values_compare_as_numbers() {
         rt().block_on(async {
@@ -3156,6 +3015,7 @@ mod answers {
         });
     }
 }
+
 mod maintenance_robustness {
     use super::*;
 
@@ -3175,9 +3035,6 @@ mod maintenance_robustness {
         (s, rs)
     }
 
-    /// Rows of a part written before a column was added take its default in a
-    /// merge, but their stored sizes (RowBytes) do not count it, so a merged
-    /// granule of small rows holds 8,192 copies of the default in one block.
     #[test]
     fn merges_fill_large_defaults_into_readable_blocks() {
         rt().block_on(async {
@@ -3191,23 +3048,20 @@ mod maintenance_robustness {
             let spec: ColumnSpec =
                 serde_json::from_value(json!({"name": "note", "type": "string", "default": "d".repeat(1000)})).unwrap();
             txn_do(&db, async |t| add_column(t, "events", &spec).await).await.unwrap();
-            // Distinct values past the dictionary's 1 MiB keep the merged column plain.
             let new: Vec<Json> = (0..200)
                 .map(|i| json!({"time": T0 + 9000 + i, "event": "a", "note": format!("{i:05}{}", "n".repeat(6000))}))
                 .collect();
             ins(&db, new).await;
             while maint::seal(&db, id).await.unwrap() {}
             let (s, rs) = schema_and_refs(&db).await;
-            assert_eq!(rs.len(), 2, "two parts in one partition");
+            assert_eq!(rs.len(), 2, "two parts in partition");
             let r = maint::merge(&db, &s, &rs).await;
             assert!(r.is_ok(), "merging a table after adding a 1 KB default: {r:?}");
         });
     }
 
-    /// The failing merge above is planned first on every maintenance run, so
-    /// the table's other partitions are never merged.
     #[test]
-    fn a_failing_merge_does_not_starve_other_partitions() {
+    fn failing_merge_does_not_starve_other_partitions() {
         rt().block_on(async {
             let cfg = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
             let (eng, _store, _env) = engine(1, cfg);
@@ -3241,10 +3095,8 @@ mod maintenance_robustness {
         });
     }
 
-    /// Rows of a part, generated on demand: one skip-indexed int column.
     struct Synth {
         n: u64,
-        /// Distinct values of the column.
         distinct: u64,
         plans: Vec<part::ColPlan>,
     }
@@ -3273,11 +3125,8 @@ mod maintenance_robustness {
         }
     }
 
-    /// A merged part of a busy day (56M events) with a skip index can be
-    /// written: blooms are sized by distinct values, and a column with too
-    /// many for its blooms to fit an index keeps none.
     #[test]
-    fn parts_with_many_rows_and_a_skip_index_can_be_written() {
+    fn large_parts_with_skip_index_can_be_written() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, EngineConfig::default());
             let db = create_db(&eng, "d").await;
@@ -3297,11 +3146,8 @@ mod maintenance_robustness {
         });
     }
 
-    /// Size-tiered merges take `fan_in` parts of a tier whatever their sizes,
-    /// so parts just under `event_part_max_bytes` merge into one several
-    /// times larger.
     #[test]
-    fn tier_merges_stay_under_the_part_size_limit() {
+    fn tier_merges_stay_within_part_size_limit() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, EngineConfig { event_insert_part_max_bytes: 1 << 20, ..cfg() });
             let db = create_db(&eng, "d").await;
@@ -3322,15 +3168,12 @@ mod maintenance_robustness {
         });
     }
 
-    /// A partition that ended and got no part for a day is merged into one
-    /// part, but each settling merge's output counts as a new arrival.
     #[test]
-    fn quiet_partitions_settle_into_one_part() {
+    fn quiet_partitions_settle_into_single_part() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
             let id = table_id(&db).await;
-            // Two parts in each of three tiers, so no tier has the fan-in of 3.
             for (k, n) in [1i64, 1, 40, 40, 200, 200].into_iter().enumerate() {
                 let rows: Vec<Json> =
                     (0..n).map(|i| json!({"time": T0 - 10 * DAY + k as i64 * 1000 + i, "event": "a"})).collect();
@@ -3346,8 +3189,6 @@ mod maintenance_robustness {
         });
     }
 
-    /// Maintenance finds a table's schema by id however many event tables
-    /// precede it, and not once the table is dropped.
     #[test]
     fn schemas_are_found_by_id_among_many_tables() {
         rt().block_on(async {
@@ -3375,7 +3216,6 @@ mod maintenance_robustness {
         });
     }
 
-    /// A store whose clock probe writes fail once `fail` is set.
     struct FailClockProbes {
         inner: crate::store::DynStore,
         fail: std::sync::atomic::AtomicBool,
@@ -3396,7 +3236,7 @@ mod maintenance_robustness {
             mode: crate::store::PutMode,
         ) -> crate::store::BoxFut<'a, crate::store::SResult<String>> {
             if key == crate::engine::clock::PROBE_KEY && self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Box::pin(async { Err(crate::store::StoreError::Unavailable("probe refused".into())) });
+                return Box::pin(async { Err(crate::store::StoreError::Unavailable("probe rejected".into())) });
             }
             self.inner.put(key, data, mode)
         }
@@ -3413,11 +3253,8 @@ mod maintenance_robustness {
         }
     }
 
-    /// Retention follows the store's clock: a lease holder whose store clock
-    /// measurement has lapsed and whose own clock runs ahead neither drops
-    /// nor hides events still within retention.
     #[test]
-    fn retention_never_follows_a_skewed_wall_clock() {
+    fn retention_ignores_skewed_local_wall_clock() {
         rt().block_on(async {
             const HOUR: u64 = 3_600_000;
             let origin = tokio::time::Instant::now();
@@ -3436,8 +3273,6 @@ mod maintenance_robustness {
             txn_do(&db, async |t| insert(t, "events", &rows, 0).await).await.unwrap();
             let (s, _) = schema_and_refs(&db).await;
             assert!(maint::seal(&db, s.id).await.unwrap());
-            // Clock probes fail for an hour, so the measurement lapses while
-            // the event, 2.5 hours old by the store's clock, is retained.
             store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(HOUR + 60_000)).await;
             assert!(db.shared().store_now_ms().is_none());
@@ -3449,6 +3284,7 @@ mod maintenance_robustness {
         });
     }
 }
+
 mod liveness {
     use super::*;
 
@@ -3462,13 +3298,8 @@ mod liveness {
         refs(&mut t, id).await.unwrap().len()
     }
 
-    /// Maintenance seals whenever unsealed rows pass `event_seal_bytes` and
-    /// then starts its next round, so a table whose inserts keep the
-    /// unsealed bytes above it is sealed round after round and never merged.
-    /// A delete naming an unknown column is refused, as a query naming it
-    /// is, whether or not any events are in its range.
     #[test]
-    fn deletes_refuse_unknown_columns_on_empty_ranges() {
+    fn deletes_reject_unknown_columns_on_empty_ranges() {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
@@ -3478,10 +3309,8 @@ mod liveness {
         });
     }
 
-    /// A seal of a million rows of one partition fits one transaction's
-    /// references however small the transaction limit.
     #[test]
-    fn seal_parts_fit_one_transaction() {
+    fn seal_parts_fit_single_transaction() {
         rt().block_on(async {
             let big = EngineConfig { event_seal_bytes: usize::MAX >> 1, ..EngineConfig::default() };
             let (eng, store, env) = engine(9, big.clone());
@@ -3499,11 +3328,10 @@ mod liveness {
             db2.open(false).await.unwrap();
             let id = table_id(&db2).await;
             let r = maint::seal(&db2, id).await;
-            assert!(matches!(r, Ok(true)), "seal of one partition: {r:?}");
+            assert!(matches!(r, Ok(true)), "seal of partition: {r:?}");
         });
     }
 
-    /// Retention drops the parts of a merge that failed, which merges leave out.
     #[test]
     fn retention_drops_parts_of_failed_merges() {
         rt().block_on(async {
@@ -3563,15 +3391,13 @@ mod liveness {
             let idle = part_count(&db, id).await;
             assert!(
                 merged > 0,
-                "{inserted} inserts into one partition: maintenance sealed {sealed} times, \
-                 merged {merged} times, leaving {parts} parts ({idle} after one idle run; fan-in {})",
+                "{inserted} inserts: maintenance sealed {sealed} times, \
+                 merged {merged} times, leaving {parts} parts, {idle} after idle run, fan-in {}",
                 db.shared().cfg.event_merge_fan_in
             );
         });
     }
 
-    /// The same starvation keeps parts past retention: none is dropped while
-    /// inserts keep the unsealed bytes above `event_seal_bytes`.
     #[test]
     fn steady_inserts_do_not_starve_retention() {
         rt().block_on(async {
@@ -3611,18 +3437,16 @@ mod liveness {
             assert!(
                 expired > 0,
                 "{inserted} inserts of events 10 days old into a table retaining 1 day: \
-                 {expired} retention drops, {parts} parts kept ({idle} after one idle run)"
+                 {expired} retention drops, {parts} parts kept, {idle} after idle run"
             );
         });
     }
 
-    async fn names(db: &Arc<Db>) -> Vec<String> {
+    async fn column_names(db: &Arc<Db>) -> Vec<String> {
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         get_schema(&mut t, "events").await.unwrap().columns.iter().map(|c| c.name.clone()).collect()
     }
 
-    /// The model test with columns dropped, added and added again by name,
-    /// with and without defaults, between seals and merges.
     async fn run_schema(seed: u64, steps: usize) -> Result<usize, String> {
         let directory = if seed.is_multiple_of(2) { 1 << 20 } else { 1 << (seed % 7) };
         let (eng, _store, env) = engine(seed, EngineConfig { event_json_directory_bytes: directory, ..cfg() });
@@ -3635,7 +3459,7 @@ mod liveness {
         let err = |e: Error| e.to_string();
         let mut answered = 0;
         for step in 0..steps {
-            let cols = names(&db).await;
+            let cols = column_names(&db).await;
             let keep = |mut j: Json| {
                 j.as_object_mut().unwrap().retain(|k, _| cols.contains(k));
                 j
@@ -3691,7 +3515,6 @@ mod liveness {
                     match (a, b) {
                         (Ok(a), Ok(b)) if a == b => {}
                         (Err(a), Err(b)) if a.to_string() == b.to_string() => {}
-                        // Unsealed rows outside the range never bind the filter.
                         (Err(Error::InvalidArgument(_)), Ok(0)) | (Ok(0), Err(Error::InvalidArgument(_))) => {}
                         (a, b) => return Err(format!("step {step}: delete {a:?}, model {b:?}")),
                     }
@@ -3720,7 +3543,7 @@ mod liveness {
     }
 
     #[test]
-    fn queries_match_a_model_through_column_changes() {
+    fn queries_match_model_through_column_changes() {
         let seeds: u64 = std::env::var("EVENT_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
         for seed in 0..seeds {
             rt().block_on(async {
@@ -3732,7 +3555,6 @@ mod liveness {
     }
 }
 
-/// The cache charges a decoded column block for the memory it holds.
 #[test]
 fn cached_blocks_are_charged_their_decoded_size() {
     rt().block_on(async {
@@ -3765,14 +3587,10 @@ fn cached_blocks_are_charged_their_decoded_size() {
         assert!(charged >= held, "decoded blocks holding {held} bytes are charged {charged} bytes");
     });
 }
+
 mod partial_reads_wide_json {
     use super::*;
 
-    /// A rows-mode query of a sparse JSON column reads each part once. Events
-    /// each hold 4 of 300 property keys, so a part stores 300 path columns,
-    /// and one granule of the whole column decodes to 1,024 × 300 × 16
-    /// bytes, past a 128 MiB limit's 4 MiB share, just as 8,192 such rows
-    /// (39 MB) pass the default 1 GiB limit's 32 MiB share.
     #[test]
     fn sparse_json_columns_do_not_read_parts_twice() {
         rt().block_on(async {
@@ -3815,7 +3633,7 @@ mod partial_reads_wide_json {
             assert_eq!(big.rows.len(), 10);
             assert!(
                 small.stats.store_gets <= big.stats.store_gets + big.stats.store_gets / 10,
-                "store GETs {} under a 128 MiB limit, {} under 4 GiB (stats {:?})",
+                "store GETs {} under a 128 MiB limit, {} under 4 GiB, stats {:?}",
                 small.stats.store_gets,
                 big.stats.store_gets,
                 small.stats
@@ -3827,9 +3645,6 @@ mod partial_reads_wide_json {
 mod partial_reads_at_defaults {
     use super::*;
 
-    /// At the default granule size and the default 1 GiB query limit, a count
-    /// filtered on two 120-byte high-cardinality string columns reads its one
-    /// part once: the store `GET`s match those under a limit 32 times larger.
     #[test]
     fn default_limits_read_high_cardinality_strings_once() {
         rt().block_on(async {
@@ -3863,7 +3678,6 @@ mod partial_reads_at_defaults {
                 get_schema(&mut t, "events").await.unwrap().id
             };
             while maint::seal(&db, id).await.unwrap() {}
-            // Merged, as maintenance merges a day's sealed parts.
             let (s, rs) = {
                 let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
                 let s = get_schema(&mut t, "events").await.unwrap();
@@ -3886,7 +3700,7 @@ mod partial_reads_at_defaults {
             assert_eq!((&big.rows, &dflt.rows), (&vec![vec![json!(n)]], &vec![vec![json!(n)]]));
             assert!(
                 dflt.stats.store_gets <= big.stats.store_gets + big.stats.store_gets / 10,
-                "store GETs {} under the default limit, {} under 32 GiB (stats {:?})",
+                "store GETs {} under the default limit, {} under 32 GiB, stats {:?}",
                 dflt.stats.store_gets,
                 big.stats.store_gets,
                 dflt.stats

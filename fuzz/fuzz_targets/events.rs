@@ -1,8 +1,6 @@
 #![no_main]
-//! Event part references, table state, masks, binds, part streams (their
-//! metadata, column indexes and blocks), aggregate states and queries must
-//! decode or parse without panicking, and what decodes must survive a round
-//! trip.
+//! Fuzzes event part decoding, table state, deletion masks, binds, aggregate
+//! states, and query parsing.
 use baserunna::engine::events::{Bind, PartRef, Runs, TableState, decode_mask_object, encode_mask_object, ref_key};
 use baserunna::engine::segment::{Compression, frame};
 use baserunna::events::agg::State;
@@ -13,10 +11,7 @@ use baserunna::util::codec::Reader;
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 
-/// A part stream built from `data`: a row count byte, then sections of a
-/// little-endian `u16` length and that many bytes, each framed so that its
-/// checksum holds; the last section is the metadata.
-fn part(data: &[u8]) -> Option<(Bytes, PartRef)> {
+fn build_part(data: &[u8]) -> Option<(Bytes, PartRef)> {
     let (&rows, mut rest) = data.split_first()?;
     let mut stream = Vec::new();
     let mut meta = (0, 0);
@@ -66,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(Runs::decode(&mut Reader::new(&r.to_bytes())), Ok(r));
     }
     let _ = Bind::decode(data);
-    if let Some((stream, r)) = part(data) {
+    if let Some((stream, r)) = build_part(data) {
         let _ = inspect(&stream, &r);
     }
     let mut meta = PartMeta {

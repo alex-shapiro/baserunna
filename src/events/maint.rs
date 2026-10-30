@@ -1,11 +1,11 @@
-//! Event table maintenance on the lease holder (SPEC §5.13): sealing
-//! unsealed rows into parts, size-tiered merges within partitions,
-//! dropping parts past retention, and deletes.
+//! Event table maintenance on the lease holder (SPEC §5.13).
 //!
-//! Every change is an ordinary serializable transaction whose read set
-//! holds what it replaced, so a seal or merge that raced with a delete (or
-//! with another merge of the same parts) fails validation and is retried
-//! from a new snapshot, and its outputs are deleted at once.
+//! Maintenance seals unsealed rows into parts, merges parts within partitions
+//! using a size-tiered policy, drops expired parts, and deletes matching rows.
+//! Each maintenance step is committed as a serializable transaction whose read
+//! set includes the replaced rows or part references. If a concurrent delete or
+//! merge modifies an input, commit validation fails and the newly written part
+//! objects are deleted immediately.
 
 use super::build::{Defaults, PartSize, PathPlan, dictionary, plan_paths, write_encoded};
 use super::json::{self, JType};
@@ -26,9 +26,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-/// Finds the schema of table `id` at the transaction's snapshot without
-/// recording the read: maintenance conflicts with drops through the rows
-/// and references it reads instead.
+/// Reads the schema of table `id` at `txn`'s snapshot without adding the
+/// catalog keys to `txn`'s read set.
+///
+/// Maintenance transactions detect concurrent table drops through conflicts on
+/// the row keys and part references they read.
 pub async fn schema_by_id(txn: &mut Txn, id: u32) -> Result<Option<EventSchema>> {
     let snap = txn.untracked_snapshot().clone();
     let Some(name) = snap.get(&super::name_key(id), txn.read_time).await? else { return Ok(None) };
@@ -57,18 +59,16 @@ async fn delete_parts(shared: &Shared, db: &str, ids: impl IntoIterator<Item = S
     }
 }
 
-/// Bytes a transaction is charged for each part reference it writes, at most.
 const REF_WRITE_BYTES: usize = 512;
 
-/// The most part references one maintenance transaction writes or removes.
+/// Returns the maximum number of part references a single maintenance
+/// transaction can write or delete within `cfg.txn_max_write_bytes`.
 pub fn refs_per_txn(cfg: &crate::engine::EngineConfig) -> usize {
     (cfg.txn_max_write_bytes / REF_WRITE_BYTES).max(1)
 }
 
-/// Seals up to `event_insert_part_max_bytes` of table `table`'s unsealed
-/// rows, in position order, into level 0 parts, stopping before rows of
-/// more partitions than one transaction can reference. Returns whether it
-/// sealed anything.
+/// Seals a prefix of unsealed rows in `table` into level-0 parts and returns
+/// true if any rows were sealed.
 pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
     let shared = db.shared().clone();
     let cfg = &shared.cfg;
@@ -80,16 +80,13 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
     }
     let avg = (st.unsealed_bytes / st.unsealed_rows).max(1) as usize;
     let limit = (cfg.event_insert_part_max_bytes / avg).max(1);
-    // Only the sealed rows join the read set: rows inserted after the
-    // snapshot follow them, so they cannot conflict.
+    // Scan untracked and record only `rows_through(table, last)` so rows
+    // appended after `last` do not cause a read-write conflict.
     let snap = txn.untracked_snapshot().clone();
     let items = snap.scan(&ev::rows(table), false, limit, txn.read_time).await?;
     let max_parts = refs_per_txn(cfg);
     let (mut bytes, mut rows, mut last) = (0u64, 0u64, None);
     let mut by_partition: BTreeMap<u32, Vec<(Pos, &[u8])>> = BTreeMap::new();
-    // Each partition's size, which bounds how many parts it is written as.
-    // Rows written before a column with a default was added are stored
-    // with it, so a part may store far more than its rows' encodings.
     let mut sizes: BTreeMap<u32, PartSize> = BTreeMap::new();
     let defaults = Defaults::of(&s);
     let parts_of = |size: PartSize| size.parts(cfg.event_insert_part_max_bytes);
@@ -148,16 +145,16 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
     }
 }
 
-/// Work the merge planner chose for one partition.
+/// Maintenance task selected for a partition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Task {
-    /// Parts past retention, dropped without reading them.
+    /// Expired parts to delete without reading their data.
     Drop(Vec<PartRef>),
-    /// Parts merged (or one part rewritten without its masked rows).
+    /// Parts to merge or rewrite without masked rows.
     Merge(Vec<PartRef>),
 }
 
-/// The merge tier of a part: `floor(log_k(raw_size / base))`.
+/// Returns the size tier `floor(log_k(raw / base))` of a part.
 pub fn tier(raw: u64, base: u64, k: u64) -> u32 {
     let mut t = 0;
     let mut cap = base.max(1).saturating_mul(k);
@@ -171,20 +168,17 @@ pub fn tier(raw: u64, base: u64, k: u64) -> u32 {
     t
 }
 
-/// Chooses the most urgent maintenance for a table's references, by
-/// priority: retention drops, rewrites of mostly deleted parts, size-tiered
-/// merges, purges, then merges that settle partitions whose time has passed
-/// and that received no part for `event_settle_ms` (ClickHouse's
-/// `min_age_to_force_merge_seconds`), so that backfilling old partitions
-/// is not merged after every insert. A purge rewrites the part with the
-/// oldest deletion once that deletion is `event_purge_ms` old, so deleted
-/// events leave storage in bounded time. Purges rank below tiered merges,
-/// which purge the parts they take anyway, so a backlog of purges cannot
-/// hold merges up; a purged part has no deletions, so it is never purged
-/// again.
-/// Retention drops need `store_now_ms`, a lower bound on the store's clock,
-/// so that a node whose own clock runs ahead never drops events still
-/// within retention.
+/// Selects the highest-priority maintenance task for `refs`, or `None` if no
+/// work is due.
+///
+/// Tasks are prioritized in order:
+/// 1. Retention drops, using `store_now_ms` so a node with a fast local clock
+///    cannot drop unexpired events.
+/// 2. Single-part rewrites if at least half of a part's rows are masked.
+/// 3. Size-tiered merges of at least `event_merge_fan_in` parts in the same tier.
+/// 4. Deletion purges once a part's oldest deletion reaches `event_purge_ms`.
+/// 5. Settling merges of past partitions that have not received a part for
+///    `event_settle_ms`.
 pub fn plan(
     s: &EventSchema,
     refs: &[PartRef],
@@ -203,7 +197,6 @@ pub fn plan(
             return Some(Task::Drop(expired));
         }
     }
-    // Parts of merges that failed are left out of merges, not of drops.
     let refs: Vec<&PartRef> = refs.iter().filter(|p| !failed.contains(&p.id)).collect();
     if let Some(p) = refs.iter().find(|p| p.deleted * 2 >= p.rows) {
         return Some(Task::Merge(vec![(*p).clone()]));
@@ -246,8 +239,6 @@ pub fn plan(
     None
 }
 
-/// The smallest of `parts`, at most `k` and at least 2, whose sizes add up
-/// to at most `cap`.
 fn smallest_under_cap(parts: &mut [&PartRef], k: usize, cap: u64) -> Option<Vec<PartRef>> {
     parts.sort_by(|a, b| a.raw_size.cmp(&b.raw_size).then(a.id.cmp(&b.id)));
     let mut chosen: Vec<PartRef> = Vec::new();
@@ -262,29 +253,23 @@ fn smallest_under_cap(parts: &mut [&PartRef], k: usize, cap: u64) -> Option<Vec<
     (chosen.len() >= 2).then_some(chosen)
 }
 
-/// An input part of a merge.
 struct Input {
     r: PartRef,
     meta: Arc<PartMeta>,
     mask: Arc<Runs>,
-    /// For a part with masked rows, what its live rows hold.
     live: Option<Live>,
 }
 
-/// The dictionary values and JSON paths a part's live rows hold. A merge
-/// plans its output from these rather than from the part's metadata, which
-/// also describes its masked rows, so that no value or path of a deleted
-/// event outlives the merge.
+/// Dictionary values and JSON paths present in the unmasked rows of a part.
+///
+/// Using live-row statistics rather than `PartMeta` ensures that deleted
+/// dictionary entries and JSON paths are purged if the part is merged.
 #[derive(Default)]
 struct Live {
-    /// Each dictionary-coded column's values, by column index.
     dicts: BTreeMap<usize, Arc<Vec<String>>>,
-    /// Rows holding each path a column or the directory names, by column id and key.
     paths: BTreeMap<(u32, String), u64>,
 }
 
-/// Reads the dictionary-coded and JSON path columns of a part with masked
-/// rows to find what its live rows hold.
 async fn census(rd: &Reading<'_>, r: &PartRef, meta: &PartMeta, mask: &Runs) -> Result<Live> {
     let mut live = Live::default();
     for (ci, c) in meta.cols.iter().enumerate() {
@@ -328,50 +313,34 @@ async fn census(rd: &Reading<'_>, r: &PartRef, meta: &PartMeta, mask: &Runs) -> 
     Ok(live)
 }
 
-/// How an output column of a merge gets its values from an input.
 #[derive(Clone, Debug)]
 enum Feed {
-    /// The output column is this column of the input, converted as needed.
     Col(usize),
-    /// The output path's values live in the input's shared bucket column.
     SharedPath(usize, String),
-    /// The output shared bucket gathers these input path columns and this
-    /// input shared bucket, leaving out paths the output stores as columns.
-    Bucket {
-        paths: Vec<(usize, String)>,
-        shared: Option<usize>,
-    },
-    /// The input's version (from its reference) or ordinal.
+    Bucket { paths: Vec<(usize, String)>, shared: Option<usize> },
     Version,
     Ordinal,
-    /// The row's stored bytes.
     RowBytes,
     None,
 }
 
-/// What an output column holds, for converting input values.
 #[derive(Clone, Debug)]
 enum OutKind {
     Plain,
-    /// A shared bucket, leaving out the paths the output stores as columns.
     Bucket(Arc<BTreeSet<String>>),
 }
 
-/// A decoded run of one input column, kept while a merge reads it in order.
 struct Cursor {
     granule: usize,
     start: u64,
     v: Option<Vector>,
 }
 
-/// The rows of several parts merged in sort key and position order, as a
-/// part [`Source`]. Columns are produced one at a time from cursors over
-/// the inputs (ClickHouse's vertical merge), so memory holds the sort keys
-/// and one run of each input column.
+/// Vertical merge source that streams output columns sequentially across inputs
+/// sorted by `(sort_key, pos)`.
 struct MergeSource<'a> {
     rd: Reading<'a>,
     inputs: Vec<Input>,
-    /// For each output row, its input and row offset.
     order: Vec<(u16, u32)>,
     keys: Vec<Bytes>,
     plans: Vec<ColPlan>,
@@ -379,16 +348,13 @@ struct MergeSource<'a> {
     feeds: Vec<Vec<Feed>>,
     shared_out: BTreeMap<u32, Vec<SharedPath>>,
     partial_out: BTreeSet<u32>,
-    /// Each output row's stored bytes.
     bytes: Vec<u64>,
     cursors: BTreeMap<(usize, usize, usize), Cursor>,
     cursor_plan: usize,
-    /// The default each output column stores for rows that lack a value.
     defaults: Vec<Option<super::agg::Val>>,
 }
 
 impl MergeSource<'_> {
-    /// The value of input column `ci` at `row` of input `i`, reading it in order.
     async fn input_val(&mut self, i: usize, ci: usize, row: u64, feed_key: usize) -> Result<super::agg::Val> {
         let inp = &self.inputs[i];
         let key = (feed_key, i, ci);
@@ -570,7 +536,6 @@ fn input_type(meta: &PartMeta, ci: usize) -> JType {
     }
 }
 
-/// Writes the live rows of `inputs` as one part.
 async fn merge_parts(
     shared: &Shared,
     db: &str,
@@ -698,8 +663,9 @@ async fn merge_parts(
                 }
             }
         }
-        // An input whose directory is partial may hold any path, of any type,
-        // in its buckets: paths it does not name are typed as JSON text.
+        // An input with a partial path directory can contain unlisted paths of any
+        // type in its shared buckets, so paths missing from that input's directory
+        // must be widened to `JType::Dyn`.
         let partial_in = ins.iter().any(|i| i.meta.partial.contains(&c.id));
         for inp in ins.iter().filter(|i| i.meta.partial.contains(&c.id)) {
             let named: BTreeSet<&str> = inp
@@ -823,7 +789,6 @@ async fn merge_parts(
     let partition = inputs[0].partition;
     let keys: Vec<Bytes> = entries.iter().map(|e| e.0.clone()).collect();
     let order: Vec<(u16, u32)> = entries.iter().map(|e| (e.2, e.3)).collect();
-    // Rows of an input that lacks a column with a default grow by it.
     let filled: Vec<u64> = (0..ins.len())
         .map(|i| {
             plans
@@ -880,9 +845,6 @@ async fn merge_parts(
     }))
 }
 
-/// The union of the inputs' dictionaries of a string column, plus the
-/// `fill` that rows of inputs lacking the column take, if every input that
-/// has the column has a dictionary and the union stays small.
 async fn union_dicts(
     rd: &Reading<'_>,
     ins: &[Input],
@@ -912,7 +874,7 @@ async fn union_dicts(
     Ok(dictionary(all.iter().flat_map(|d| d.iter().map(String::as_str))))
 }
 
-/// Merges `inputs` (or rewrites one) and commits the replacement.
+/// Merges `inputs` into a single part and commits the part reference update.
 pub async fn merge(db: &Arc<Db>, s: &EventSchema, inputs: &[PartRef]) -> Result<()> {
     let shared = db.shared().clone();
     let started = shared.env.now_ms();
@@ -962,7 +924,7 @@ pub async fn merge(db: &Arc<Db>, s: &EventSchema, inputs: &[PartRef]) -> Result<
     }
 }
 
-/// Deletes parts past retention.
+/// Deletes expired part references in a serializable transaction.
 pub async fn drop_expired(db: &Arc<Db>, parts: &[PartRef]) -> Result<()> {
     let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await?;
     for r in parts {
@@ -977,16 +939,14 @@ pub async fn drop_expired(db: &Arc<Db>, parts: &[PartRef]) -> Result<()> {
     Ok(())
 }
 
-/// Runs maintenance on table `table` until nothing is due, at most `rounds`
-/// steps. A merge too large to finish in time is not planned again in this
-/// call, so it does not hold up the table's other merges, and its error is
-/// returned at the end; other errors end maintenance at once.
+/// Runs up to `rounds` maintenance steps on `table` until the table is idle.
 pub async fn maintain(db: &Arc<Db>, table: u32, rounds: usize) -> Result<()> {
     maintain_skipping(db, table, rounds, &mut BTreeSet::new()).await
 }
 
-/// [`maintain`], leaving out parts whose merge failed for a reason a retry
-/// would meet again, and adding to `failed` the parts of merges that fail.
+/// Runs up to `rounds` maintenance steps on `table`, skipping part IDs in
+/// `failed` and recording part IDs from merges that fail with a non-transient
+/// error.
 pub async fn maintain_skipping(db: &Arc<Db>, table: u32, rounds: usize, failed: &mut BTreeSet<String>) -> Result<()> {
     let shared = db.shared().clone();
     let mut first_error = None;
@@ -994,8 +954,8 @@ pub async fn maintain_skipping(db: &Arc<Db>, table: u32, rounds: usize, failed: 
         let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await?;
         let Some(s) = schema_by_id(&mut txn, table).await? else { return Ok(()) };
         let st: TableState = super::state(&mut txn, table).await?;
-        // A round that seals also plans from the snapshot before the seal, so
-        // that steady inserts do not starve merges and retention.
+        // Plan merges and drops from the pre-seal snapshot in the same round so
+        // continuous inserts cannot starve compaction or retention.
         let sealing = st.unsealed_bytes >= shared.cfg.event_seal_bytes as u64 && st.unsealed_rows > 0;
         if sealing {
             match seal(db, table).await {
@@ -1028,23 +988,19 @@ pub async fn maintain_skipping(db: &Arc<Db>, table: u32, rounds: usize, failed: 
     first_error.map_or(Ok(()), Err)
 }
 
-/// Parts of failed merges, and when the first of them failed.
 type FailedMerges = (BTreeSet<String>, tokio::time::Instant);
 
-/// How long maintenance leaves out the parts of a failed merge.
 const FAILED_MERGE_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Schedules maintenance per table, running at most one task per table.
+/// Runs background maintenance tasks with at most a single active task per table.
 #[derive(Default)]
 pub struct Maintainer {
     running: Mutex<BTreeMap<(String, u32), bool>>,
-    /// Parts of each table whose merge failed, which later runs leave out
-    /// for [`FAILED_MERGE_RETRY`] after the first failure.
     failed: Mutex<BTreeMap<(String, u32), FailedMerges>>,
 }
 
 impl Maintainer {
-    /// Runs maintenance for `tables` of `db` in the background.
+    /// Schedules background maintenance for `tables` in `db`.
     pub fn schedule(self: &Arc<Self>, db: &Arc<Db>, tables: BTreeSet<u32>) {
         for t in tables {
             let key = (db.id.clone(), t);
@@ -1088,9 +1044,8 @@ impl Maintainer {
     }
 }
 
-/// Deletes the rows of table `name` matching `f` within `[from, to)`, in
-/// the transaction, returning how many. Unsealed rows get tombstones and
-/// parts get masks.
+/// Deletes rows in table `name` that match `f` within `[from, to)` and returns
+/// the number of deleted rows.
 pub async fn delete(db: &Arc<Db>, txn: &mut Txn, name: &str, from: i64, to: i64, f: &Filter) -> Result<u64> {
     let s = super::get_schema(txn, name).await?;
     super::exec::check_filter(&s, f)?;
@@ -1158,7 +1113,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tiers_grow_by_the_fan_in() {
+    fn compute_size_tiers() {
         assert_eq!(tier(0, 4, 8), 0);
         assert_eq!(tier(31, 4, 8), 0);
         assert_eq!(tier(32, 4, 8), 1);
@@ -1167,11 +1122,8 @@ mod tests {
         assert_eq!(tier(u64::MAX, 4, 8), tier(u64::MAX - 1, 4, 8));
     }
 
-    /// Purges of parts with old deletions yield to retention drops and
-    /// tiered merges, take the oldest deletion first, and end once the part
-    /// is rewritten without its masked rows.
     #[test]
-    fn purges_follow_drops_and_tiered_merges_and_end() {
+    fn plan_prioritizes_drops_and_tiered_merges_before_purges() {
         const DAY: i64 = 86_400_000;
         let s: EventSchema = serde_json::from_value(serde_json::json!({
             "id": 1, "name": "ev", "time_column": "time", "order_by": ["time"], "partition": "day",
@@ -1220,7 +1172,7 @@ mod tests {
         let merging = [vec![older.clone()], tier.to_vec()].concat();
         assert_eq!(ids(plan(&merging, &none)), ("merge", vec!["t".into(), "u".into()]), "tiered merges come first");
         let failed: BTreeSet<String> = [older.id.clone()].into();
-        assert_eq!(ids(plan(&all[..3], &failed)), ("merge", vec!["b".into()]), "a failed purge is left out");
+        assert_eq!(ids(plan(&all[..3], &failed)), ("merge", vec!["b".into()]), "a failed purge is skipped");
         assert_eq!(
             ids(plan(std::slice::from_ref(&young), &none)),
             ("none", vec![]),
@@ -1232,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_split_by_size_and_build_cost() {
+    fn split_rows_by_size_and_build_cost() {
         use super::super::build::{PART_BUILD_BYTES, PartSize, build_cost, next_part};
         let rows = |n: u32| (0..n).map(|i| (PartSize { stored: 112, cost: build_cost(100) }, i));
         let groups = |n: u32, max: usize| {
@@ -1244,7 +1196,7 @@ mod tests {
             out
         };
         assert_eq!(groups(10, 350), [3, 3, 3, 1]);
-        assert_eq!(groups(1, 1), [1], "a row larger than the limit is a part of its own");
+        assert_eq!(groups(1, 1), [1], "a row larger than the limit is placed in its own part");
         let per_part = PART_BUILD_BYTES / build_cost(100);
         assert_eq!(groups(per_part as u32 * 2 + 1, usize::MAX), [per_part, per_part, 1]);
     }

@@ -1,10 +1,4 @@
-//! Event table storage in the LSM tree (SPEC §4.8, §5.13): unsealed rows,
-//! part references and per-table state, and how the committer applies the
-//! event ops of a transaction or a bulk bind.
-//!
-//! Every change to which rows exist is a commit that changes these entries,
-//! so at every version each row lives in exactly one place: as an unsealed
-//! row, or in a part named by a reference.
+//! Event table entries in the LSM tree and committer operations (SPEC §4.8, §5.13).
 
 use super::manifest::ObjKind;
 use super::stream::Pending;
@@ -22,7 +16,7 @@ pub const UNSEALED: u8 = 0x09;
 pub const PARTS: u8 = 0x0A;
 /// Key prefix of table state: `TABLE_STATE ++ table`.
 pub const TABLE_STATE: u8 = 0x0B;
-/// Most rows one transaction inserts into event tables.
+/// Maximum rows inserted into event tables by a single transaction.
 pub const INSERT_MAX_ROWS: usize = 100_000;
 
 fn table_prefix(space: u8, table: u32) -> Vec<u8> {
@@ -32,9 +26,7 @@ fn table_prefix(space: u8, table: u32) -> Vec<u8> {
     k
 }
 
-/// A row's position: the version of the commit that inserted it and its
-/// index among that table's rows in the commit. Positions are unique and
-/// increase in commit order.
+/// Unique row position ordered by commit `version` and `ordinal` within the table's rows in that commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Pos {
     pub version: u64,
@@ -58,17 +50,15 @@ pub fn parse_row_key(k: &[u8]) -> Option<(u32, Pos)> {
     Some((table, Pos { version, ordinal }))
 }
 
-/// Every unsealed row of `table`.
 pub fn rows(table: u32) -> KeyRange {
     KeyRange::prefix(&table_prefix(UNSEALED, table))
 }
 
-/// The unsealed rows of `table` at or before `through`.
 pub fn rows_through(table: u32, through: Pos) -> KeyRange {
     KeyRange::new(Bound::Included(Bytes::from(table_prefix(UNSEALED, table))), Bound::Included(row_key(table, through)))
 }
 
-/// Partitions are stored offset by 2^31 so that keys order like the signed buckets.
+/// Encodes a signed partition `bucket` with a `0x8000_0000` offset so that unsigned keys preserve signed order.
 pub fn partition_key(bucket: i64) -> u32 {
     (bucket.clamp(i32::MIN as i64, i32::MAX as i64) as i32 as u32) ^ 0x8000_0000
 }
@@ -94,12 +84,11 @@ pub fn parse_ref_key(k: &[u8]) -> Option<(u32, u32, &str)> {
     Some((table, partition, id))
 }
 
-/// The references of every partition of `table`.
 pub fn refs(table: u32) -> KeyRange {
     KeyRange::prefix(&table_prefix(PARTS, table))
 }
 
-/// The references of partitions `lo..=hi` of `table`.
+/// Returns the key range of part references for `table` in partitions `lo..=hi`.
 pub fn refs_between(table: u32, lo: u32, hi: u32) -> KeyRange {
     let mut s = table_prefix(PARTS, table);
     s.extend_from_slice(&lo.to_be_bytes());
@@ -124,16 +113,13 @@ pub fn parse_state_key(k: &[u8]) -> Option<u32> {
     }
 }
 
-/// Committer-maintained counters of a table's unsealed rows and parts.
-/// Transactions never read it into their read sets, so inserts and binds
-/// stay blind writes.
+/// Committer-maintained counters for an event table.
+/// Transactions do not add `TableState` to their read sets, so event inserts and binds do not conflict on it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TableState {
     pub unsealed_rows: u64,
-    /// Key and value bytes of the unsealed rows.
     pub unsealed_bytes: u64,
-    /// Stored bytes of the objects its part references name, which a drop
-    /// subtracts from the database's without reading the references.
+    /// Total stored bytes of referenced parts and mask objects for this table.
     pub part_bytes: u64,
 }
 
@@ -172,13 +158,12 @@ pub fn state_of(e: &Entry) -> Option<(u32, TableState)> {
     }
 }
 
-/// Deleted row offsets of a part as sorted, disjoint, non-adjacent runs
-/// `(start, len)`.
+/// Sorted, disjoint, non-adjacent `(start, len)` runs of row offsets in a part.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Runs(pub Vec<(u32, u32)>);
 
 impl Runs {
-    /// Runs covering the sorted, distinct `offsets`.
+    /// Builds runs from sorted row `offsets`.
     pub fn from_sorted(offsets: impl IntoIterator<Item = u32>) -> Runs {
         let mut v: Vec<(u32, u32)> = Vec::new();
         for o in offsets {
@@ -204,7 +189,7 @@ impl Runs {
         i > 0 && o < self.0[i - 1].0 + self.0[i - 1].1
     }
 
-    /// Whether every row in `lo..hi` is covered.
+    /// Returns true if all row offsets in `lo..hi` are contained in `self`.
     pub fn covers(&self, lo: u32, hi: u32) -> bool {
         if lo >= hi {
             return true;
@@ -261,52 +246,41 @@ impl Runs {
     }
 }
 
-/// Where a part's delete mask is stored.
+/// Deletion mask for a part, stored inline in [`PartRef`] or as a separate object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mask {
     Inline(Runs),
-    /// An object at `part/{id}/0` holding the encoded runs and a CRC32C.
+    /// Mask object at `part/{id}/0000` containing encoded runs and a CRC32C checksum.
     Object {
         id: String,
         size: u64,
     },
 }
 
-/// Everything a query needs to decide whether to open a part, and what the
-/// committer needs to account for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartRef {
-    /// 32 hex characters: a 48-bit creation time and 80 random bits.
     pub id: String,
     pub table: u32,
     pub partition: u32,
-    /// The part's byte stream is stored in objects of this many bytes.
     pub chunk_bytes: u64,
-    /// Stored bytes of the part.
     pub size: u64,
-    /// Uncompressed bytes of its rows, which decide its merge tier.
+    /// Uncompressed row bytes, used to assign the part to a merge tier.
     pub raw_size: u64,
     pub rows: u64,
-    /// The merges that produced the part: 0 for staged and sealed parts.
+    /// Merge depth: 0 for staged and sealed parts.
     pub level: u8,
-    /// Byte range of the part's metadata in its stream.
     pub meta_off: u64,
     pub meta_len: u64,
     pub min_time: i64,
     pub max_time: i64,
-    /// When the newest of its rows reached a part: the part's creation for
-    /// staged and sealed parts, and its newest input's for a merge.
+    /// Creation timestamp of the newest input part, or of this part if unmerged.
     pub arrived_ms: u64,
-    /// The version of every row, for parts whose rows were bound by one
-    /// commit after the part was written; `None` when the part stores it.
+    /// Commit version shared by all rows in a newly bound staged part, or `None` if stored in the part's version column.
     pub version: Option<Seq>,
-    /// Bounds on the positions of its rows.
     pub min_pos: Pos,
     pub max_pos: Pos,
-    /// Rows covered by the mask.
     pub deleted: u64,
-    /// When the oldest row of the mask was masked, which starts the part's
-    /// purge window (`event_purge_ms`); 0 without a mask.
+    /// Timestamp of the first deletion in this part, or 0 if unmasked.
     pub masked_ms: u64,
     pub mask: Option<Mask>,
 }
@@ -326,12 +300,11 @@ impl PartRef {
         ref_key(self.table, self.partition, &self.id)
     }
 
-    /// Rows not covered by the mask.
     pub fn live_rows(&self) -> u64 {
         self.rows - self.deleted
     }
 
-    /// Bytes of objects the reference names: the part and its mask object.
+    /// Total stored bytes of the part and its external mask object, if any.
     pub fn stored_bytes(&self) -> u64 {
         self.size
             + match &self.mask {
@@ -470,7 +443,6 @@ pub fn ref_of(e: &Entry) -> Option<PartRef> {
     }
 }
 
-/// Encodes a mask object.
 pub fn encode_mask_object(r: &Runs) -> Bytes {
     let mut w = Writer::new();
     w.raw(b"BRMK");
@@ -496,26 +468,30 @@ pub fn decode_mask_object(b: &[u8]) -> DResult<Runs> {
     Ok(runs)
 }
 
-/// Changes to event tables that the committer applies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventOp {
-    /// Inserts encoded rows into `table`, giving them positions at commit.
-    Insert { table: u32, rows: Vec<Bytes> },
-    /// Accounts for a reference added, replaced or removed by a put in the
-    /// same write set; see [`EventOp::part_ref`].
+    /// Inserts encoded rows into `table` and assigns their positions at commit.
+    Insert {
+        table: u32,
+        rows: Vec<Bytes>,
+    },
+    /// Updates stored byte counts and marks replaced objects obsolete for a [`PartRef`] change in the same write set.
     Ref(Box<RefChange>),
-    /// Unsealed rows removed by a seal or a delete in the same write set.
-    Forget { table: u32, rows: u64, bytes: u64 },
-    /// Creates the state of a new table.
-    Create { table: u32 },
-    /// Removes a dropped table's state, after which nothing can insert into
-    /// or bind parts to it, and stops counting its parts as of the commit
-    /// toward the database's. The transaction range-deletes the table's
-    /// rows and references itself.
-    Drop { table: u32 },
+    /// Subtracts unsealed row and byte counts removed by a seal or delete in the same write set.
+    Forget {
+        table: u32,
+        rows: u64,
+        bytes: u64,
+    },
+    Create {
+        table: u32,
+    },
+    /// Deletes the [`TableState`] for `table` and subtracts its `part_bytes` from the database total.
+    Drop {
+        table: u32,
+    },
 }
 
-/// A part reference added, replaced or removed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefChange {
     pub old: Option<PartRef>,
@@ -523,9 +499,8 @@ pub struct RefChange {
 }
 
 impl EventOp {
-    /// Accounts for reference `old` becoming `new`. `old` is the reference
-    /// the transaction read, which validation guarantees is still current:
-    /// its objects that `new` does not name become obsolete.
+    /// Records a [`PartRef`] transition from `old` to `new`.
+    /// Objects referenced by `old` that are not referenced by `new` are marked obsolete at commit.
     pub fn part_ref(old: Option<PartRef>, new: Option<PartRef>) -> EventOp {
         EventOp::Ref(Box::new(RefChange { old, new }))
     }
@@ -537,7 +512,7 @@ impl EventOp {
         }
     }
 
-    /// Objects first named by this op, which must be bindable.
+    /// Returns newly referenced part and mask object IDs that must pass stage TTL validation.
     pub fn new_objects(&self) -> Vec<&str> {
         let EventOp::Ref(c) = self else { return Vec::new() };
         let RefChange { old, new: Some(n) } = c.as_ref() else { return Vec::new() };
@@ -554,26 +529,21 @@ impl EventOp {
     }
 }
 
-/// Whether an object staged at the time in its id can still be bound at
-/// store time `now`.
+/// Returns true if an object with creation timestamp encoded in `id` is within `stage_ttl_ms` at `now`.
 pub fn stage_fresh(id: &str, now: u64, stage_ttl_ms: u64) -> bool {
     blob_id_time(id).is_some_and(|t| t + stage_ttl_ms >= now)
 }
 
-/// What a write set's event ops do to the committed state.
 #[derive(Debug, Default)]
 pub(crate) struct Effects {
     pub entries: Vec<Entry>,
     pub touched: Vec<KeyRange>,
-    /// Objects no longer referenced.
     pub obsolete: Vec<(ObjKind, String)>,
     pub part_bytes_added: u64,
     pub part_bytes_removed: u64,
-    /// Tables whose unsealed rows or references changed.
     pub tables: BTreeMap<u32, TableState>,
 }
 
-/// The state of `table` as of `at`; `None` if the table does not exist.
 pub(crate) async fn state(at: &Pending<'_>, table: u32) -> Result<Option<TableState>> {
     match at.entry(&state_key(table)).await? {
         None => Ok(None),
@@ -582,12 +552,8 @@ pub(crate) async fn state(at: &Pending<'_>, table: u32) -> Result<Option<TableSt
     }
 }
 
-/// Plans `ops` committed at `version`. The plan owns every table's state
-/// entry, so ops later in the write set see the state earlier ones left.
 pub(crate) async fn plan(ops: &[EventOp], at: &Pending<'_>, version: Seq) -> Result<Effects> {
     let mut fx = Effects::default();
-    // The planned state of each table the write set names, `None` once
-    // dropped, and whether its state existed before.
     let mut states: BTreeMap<u32, (Option<TableState>, bool)> = BTreeMap::new();
     let mut ordinals: BTreeMap<u32, u32> = BTreeMap::new();
     let not_found = || Error::not_found("event table not found");
@@ -674,26 +640,24 @@ pub(crate) async fn plan(ops: &[EventOp], at: &Pending<'_>, version: Seq) -> Res
     Ok(fx)
 }
 
-/// One request of a bulk bind: its own transaction and commit record.
+/// Single request slot in a [`Bind`] batch.
 #[derive(Clone, Debug)]
 pub struct BindSlot {
     pub commit_id: u64,
-    /// After this instant the committer rejects the slot without applying it.
+    /// Instant after which the committer rejects this slot without applying it.
     pub deadline: Option<tokio::time::Instant>,
 }
 
-/// A part staged for a bulk bind, and which of its rows each slot wrote.
 #[derive(Clone, Debug)]
 pub struct StagedPart {
-    /// `version` and `mask` are set by the committer.
+    /// `version` and `mask` are populated by the committer.
     pub part: PartRef,
-    /// For each slot of the bind, the row offsets it wrote in this part.
+    /// Row offsets in `part` written by each slot in [`Bind::slots`].
     pub slot_rows: Vec<Runs>,
 }
 
-/// Bulk inserted requests whose rows were staged together as parts, bound
-/// by one commit: accepted slots share its version, and the rows of
-/// rejected slots are masked.
+/// Batch of bulk-insert requests staged into shared parts and committed together.
+/// Accepted slots share a single commit version, and rows belonging to rejected slots are masked.
 #[derive(Clone, Debug)]
 pub struct Bind {
     pub table: u32,
@@ -702,8 +666,7 @@ pub struct Bind {
 }
 
 impl Bind {
-    /// Encodes the bind for forwarding to the lease holder, with deadlines as
-    /// remaining milliseconds.
+    /// Encodes the bind batch for forwarding to the lease holder, converting deadlines to remaining milliseconds.
     pub fn encode(&self) -> Bytes {
         let now = tokio::time::Instant::now();
         let mut w = Writer::new();
@@ -800,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_order_and_parse() {
+    fn key_encoding_and_ranges() {
         let a = row_key(1, Pos { version: 5, ordinal: u32::MAX });
         let b = row_key(1, Pos { version: 6, ordinal: 0 });
         assert!(a < b && b < row_key(2, Pos::default()));
@@ -822,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn refs_and_states_roundtrip() {
+    fn part_ref_and_table_state_codec() {
         let mut p = sample_ref();
         assert_eq!(PartRef::decode(&p.key(), &p.encode()).unwrap(), p);
         p.mask = Some(Mask::Object { id: "f".repeat(32), size: 77 });
@@ -830,7 +793,7 @@ mod tests {
         assert_eq!(PartRef::decode(&p.key(), &p.encode()).unwrap(), p);
         assert_eq!(p.stored_bytes(), 5077);
         p.mask = Some(Mask::Inline(Runs(vec![(1, 2)])));
-        assert!(PartRef::decode(&p.key(), &p.encode()).is_err(), "mask count must match");
+        assert!(PartRef::decode(&p.key(), &p.encode()).is_err());
         let st = TableState { unsealed_rows: 4, unsealed_bytes: 99, part_bytes: 5077 };
         assert_eq!(TableState::decode(&st.encode()).unwrap(), st);
         let runs = Runs(vec![(0, 3), (9, 1)]);
@@ -852,7 +815,7 @@ mod tests {
             }
             assert_eq!(u.count() as usize, a.union(&b).count());
             assert_eq!(Runs::decode(&mut Reader::new(&u.to_bytes())).unwrap(), u);
-            assert!(u.0.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "runs are disjoint and apart");
+            assert!(u.0.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0));
             let lo = r.usize(n) as u32;
             let hi = lo + r.usize(10) as u32;
             assert_eq!(u.covers(lo, hi), (lo..hi).all(|o| u.contains(o)));
@@ -860,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn binds_roundtrip() {
+    fn bind_codec() {
         let mut part = sample_ref();
         part.version = None;
         part.mask = None;
@@ -877,13 +840,13 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_decoders_never_panic() {
+    fn fuzz_decoders() {
         let p = sample_ref();
-        let goods = [p.encode(), TableState::default().encode(), encode_mask_object(&Runs(vec![(3, 4)]))];
+        let inputs = [p.encode(), TableState::default().encode(), encode_mask_object(&Runs(vec![(3, 4)]))];
         let key = p.key();
         let mut r = Rng::new(23);
         for i in 0..20_000 {
-            let mut d = goods[i % goods.len()].to_vec();
+            let mut d = inputs[i % inputs.len()].to_vec();
             for _ in 0..r.usize(3) {
                 if !d.is_empty() {
                     let at = r.usize(d.len());

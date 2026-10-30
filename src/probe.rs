@@ -207,7 +207,7 @@ probes! {
     PartsBound,
     /// A bulk bind masked the rows of a rejected request in a shared part.
     BindSlotMasked,
-    /// A bulk bind or transaction was refused because a staged event part had expired or was swept.
+    /// A bulk bind or transaction was rejected because a staged event part had expired or was swept.
     StagedPartUnbindable,
     /// A retried bulk bind found its parts already bound by an earlier attempt that landed.
     BindInstallReplayed,
@@ -229,8 +229,7 @@ probes! {
     MaskObjectWritten,
     /// A query skipped a part by its reference alone.
     PartPrunedByRef,
-    /// A rows query by time stopped reading parts once no unread part
-    /// could change its page.
+    /// A time-ordered row query stopped early once remaining parts were outside the page bounds.
     RowPageStoppedEarly,
     /// A query skipped granules by the primary index or column statistics.
     GranulesPruned,

@@ -1,24 +1,26 @@
-//! The event query language (SPEC §4.8): a time range, a filter, and either
-//! columns to return or grouped aggregates, with an optional second stage.
+//! Event query parser (SPEC §4.8).
+//!
+//! A query specifies a time range, an optional filter, and either output
+//! columns or up to two aggregation stages.
 
 use crate::error::{Error, Result};
 use crate::filter::{self, Operand, Test};
 use serde_json::{Map, Value as Json};
 use std::collections::BTreeMap;
 
-/// Most rows a query returns in rows mode.
+/// Maximum rows returned in rows mode.
 pub const ROWS_LIMIT_MAX: usize = 10_000;
-/// Most groups a query returns in aggregate mode.
+/// Maximum groups returned in aggregate mode.
 pub const GROUPS_LIMIT_MAX: usize = 100_000;
-/// Most expressions in a stage's `group_by`, `columns` or `aggregates`.
+/// Maximum expressions in `group_by`, `columns`, or `aggregates`.
 pub const EXPRS_MAX: usize = 64;
-/// Most steps of a funnel or conditions of a retention aggregate.
+/// Maximum funnel steps or retention conditions.
 pub const STEPS_MAX: usize = 32;
 
-/// A time bucket width.
+/// Time bucket width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Interval {
-    /// A fixed width in milliseconds: minutes, hours or days.
+    /// Fixed width in milliseconds.
     Fixed(i64),
     /// Weeks starting on Monday.
     Weeks(i64),
@@ -41,8 +43,8 @@ impl Interval {
         })
     }
 
-    /// The start of the bucket holding `t`, in a fixed offset of `offset_ms` from UTC,
-    /// or `None` for a `t` outside [`TIME_RANGE`](super::schema::TIME_RANGE).
+    /// Returns the start of the bucket that contains `t` at UTC offset `offset_ms`,
+    /// or `None` if `t` is outside [`TIME_RANGE`](super::schema::TIME_RANGE).
     pub fn bucket(&self, t: i64, offset_ms: i64) -> Option<i64> {
         use super::schema::{Granularity, TIME_RANGE, bucket_of, bucket_span};
         if !TIME_RANGE.contains(&t) {
@@ -68,7 +70,7 @@ fn bad_interval(s: &str) -> Error {
     Error::invalid(format!("bad interval {s:?}: use a count and a unit of s, m, h, d, w or mo, such as 15m or 1d"))
 }
 
-/// Parses a fixed offset such as `+02:00`, `-05:30` or `Z`.
+/// Parses a fixed UTC offset such as `+02:00`, `-05:30`, or `Z` into milliseconds.
 pub fn parse_offset(s: &str) -> Result<i64> {
     if s == "Z" || s == "UTC" {
         return Ok(0);
@@ -87,19 +89,18 @@ pub fn parse_offset(s: &str) -> Result<i64> {
     Ok(if b[0] == b'-' { -ms } else { ms })
 }
 
-/// An expression evaluated per row (or, in a second stage, per first-stage row).
+/// Row expression.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
-    /// A column, or a leaf path within a JSON column.
+    /// Column or JSON leaf path.
     Col { name: String, path: Vec<String> },
-    /// A named lookup.
+    /// Declared lookup reference.
     Lookup(String),
-    /// The start of the time bucket holding the value.
+    /// Start timestamp of the time bucket that contains `of`.
     Bucket { of: Box<Expr>, interval: Interval, offset_ms: i64 },
 }
 
 impl Expr {
-    /// The default output name.
     pub fn default_name(&self) -> String {
         match self {
             Expr::Col { name, path } if path.is_empty() => name.clone(),
@@ -109,7 +110,6 @@ impl Expr {
         }
     }
 
-    /// Parses an expression from its operand keys, removing those it reads.
     fn take(keys: &mut Map<String, Json>) -> Result<Expr> {
         if let Some(b) = keys.remove("bucket") {
             let of = Expr::parse(b)?;
@@ -127,7 +127,7 @@ impl Expr {
         if let Some(l) = keys.remove("lookup") {
             return match l {
                 Json::String(s) => Ok(Expr::Lookup(s)),
-                _ => Err(Error::invalid("lookup names a lookup")),
+                _ => Err(Error::invalid("lookup is a string")),
             };
         }
         let name = match keys.remove("col") {
@@ -179,14 +179,14 @@ impl Operand for Expr {
 
 pub type Filter = filter::Filter<Expr>;
 
-/// An expression and its output name.
+/// Expression and its output name.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Named {
     pub expr: Expr,
     pub name: String,
 }
 
-fn named(v: Json) -> Result<Named> {
+fn parse_named(v: Json) -> Result<Named> {
     let alias = match &v {
         Json::Object(o) => match o.get("as") {
             Some(Json::String(s)) => Some(s.clone()),
@@ -207,15 +207,14 @@ fn named(v: Json) -> Result<Named> {
     Ok(Named { expr, name })
 }
 
-/// How [`AggFn::WindowFunnel`] treats events between steps of one attempt;
-/// see [`super::agg::funnel`].
+/// Ordering rules for [`AggFn::WindowFunnel`]. See [`super::agg::funnel`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FunnelMode {
-    /// An event in the attempt's window that is not its next step ends it.
+    /// Any event in the window that does not match the next step ends the attempt.
     pub strict_order: bool,
-    /// A repeat of a step the attempt already reached ends it.
+    /// Repeating a previously matched step ends the attempt.
     pub strict_deduplication: bool,
-    /// Each step must come strictly after the previous one.
+    /// Each step must have a strictly greater timestamp than the previous step.
     pub strict_increase: bool,
 }
 
@@ -229,16 +228,15 @@ pub enum AggFn {
     /// Approximate distinct count.
     Uniq,
     UniqExact,
-    /// Values at each quantile in `0..=1`, within 1% relative error.
+    /// Approximate values at each quantile in `0..=1` within 1% relative error.
     Quantiles(Vec<f64>),
-    /// The longest prefix of `steps` matched in time order, each within
-    /// `window_ms` of the first.
+    /// Length of the longest prefix of `steps` matched in timestamp order within `window_ms` of the first step.
     WindowFunnel {
         window_ms: i64,
         steps: Vec<Filter>,
         mode: FunnelMode,
     },
-    /// Whether the first condition held, then whether it and each other one held.
+    /// For each condition, whether both the first condition and that condition matched.
     Retention(Vec<Filter>),
 }
 
@@ -247,11 +245,10 @@ pub struct AggSpec {
     pub name: String,
     pub func: AggFn,
     pub of: Option<Expr>,
-    /// Applied before each row is added (ClickHouse's `-If`).
     pub filter: Option<Filter>,
 }
 
-fn agg(name: String, v: Json) -> Result<AggSpec> {
+fn parse_agg(name: String, v: Json) -> Result<AggSpec> {
     let Json::Object(mut o) = v else { return Err(Error::invalid(format!("aggregate {name:?} is an object"))) };
     let f = match o.remove("fn") {
         Some(Json::String(f)) => f,
@@ -331,7 +328,7 @@ fn agg(name: String, v: Json) -> Result<AggSpec> {
     );
     match (needs_of, &of) {
         (true, None) => return Err(Error::invalid(format!("aggregate {name:?} needs of"))),
-        (false, Some(_)) => return Err(Error::invalid(format!("aggregate {name:?} takes no of"))),
+        (false, Some(_)) => return Err(Error::invalid(format!("aggregate {name:?} does not take of"))),
         _ => {}
     }
     Ok(AggSpec { name, func, of, filter })
@@ -341,44 +338,44 @@ fn bad_mode() -> Error {
     Error::invalid("mode is strict_order, strict_deduplication, strict_increase, or an array of them")
 }
 
-/// One aggregation: grouping expressions and named aggregates.
+/// Grouping expressions and aggregates for a single aggregation stage.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stage {
     pub group_by: Vec<Named>,
     pub aggregates: Vec<AggSpec>,
 }
 
-fn stage(o: &mut Map<String, Json>) -> Result<Stage> {
+fn parse_stage(o: &mut Map<String, Json>) -> Result<Stage> {
     let group_by = match o.remove("group_by") {
         None => Vec::new(),
-        Some(Json::Array(a)) if a.len() <= EXPRS_MAX => a.into_iter().map(named).collect::<Result<_>>()?,
+        Some(Json::Array(a)) if a.len() <= EXPRS_MAX => a.into_iter().map(parse_named).collect::<Result<_>>()?,
         Some(_) => return Err(Error::invalid(format!("group_by is an array of at most {EXPRS_MAX} expressions"))),
     };
     let aggregates = match o.remove("aggregates") {
         None => Vec::new(),
         Some(Json::Object(m)) if m.len() <= EXPRS_MAX => {
-            m.into_iter().map(|(k, v)| agg(k, v)).collect::<Result<Vec<_>>>()?
+            m.into_iter().map(|(k, v)| parse_agg(k, v)).collect::<Result<Vec<_>>>()?
         }
         Some(_) => return Err(Error::invalid(format!("aggregates is an object of at most {EXPRS_MAX} aggregates"))),
     };
     if group_by.is_empty() && aggregates.is_empty() {
         return Err(Error::invalid("a stage needs group_by or aggregates"));
     }
-    unique_names(group_by.iter().map(|g| &g.name).chain(aggregates.iter().map(|a| &a.name)))?;
+    check_unique_names(group_by.iter().map(|g| &g.name).chain(aggregates.iter().map(|a| &a.name)))?;
     Ok(Stage { group_by, aggregates })
 }
 
-fn unique_names<'a>(names: impl Iterator<Item = &'a String>) -> Result<()> {
+fn check_unique_names<'a>(names: impl Iterator<Item = &'a String>) -> Result<()> {
     let mut seen = std::collections::BTreeSet::new();
     for n in names {
         if !seen.insert(n) {
-            return Err(Error::invalid(format!("output {n:?} is named twice; rename one with \"as\"")));
+            return Err(Error::invalid(format!("duplicate output name {n:?}; set a distinct alias with \"as\"")));
         }
     }
     Ok(())
 }
 
-/// A lookup through a row table whose primary key is a single column.
+/// Lookup against a row table that has a single-column primary key.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LookupSpec {
     pub table: String,
@@ -389,7 +386,7 @@ pub struct LookupSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mode {
-    /// Rows of the named columns; no columns means every column.
+    /// Returns raw rows. If `columns` is empty, all table columns are returned.
     Rows {
         columns: Vec<Named>,
         cursor: Option<String>,
@@ -415,7 +412,7 @@ pub struct Query {
     pub mode: Mode,
     pub order_by: Vec<OrderBy>,
     pub limit: usize,
-    /// Whether the query gave its `limit`, rather than taking the default.
+    /// True if `limit` was explicitly provided rather than defaulted.
     pub limited: bool,
 }
 
@@ -477,11 +474,11 @@ impl Query {
             let columns = match o.remove("columns") {
                 None => Vec::new(),
                 Some(Json::Array(a)) if !a.is_empty() && a.len() <= EXPRS_MAX => {
-                    a.into_iter().map(named).collect::<Result<Vec<_>>>()?
+                    a.into_iter().map(parse_named).collect::<Result<Vec<_>>>()?
                 }
                 _ => return Err(Error::invalid(format!("columns is an array of 1..={EXPRS_MAX} expressions"))),
             };
-            unique_names(columns.iter().map(|c| &c.name))?;
+            check_unique_names(columns.iter().map(|c| &c.name))?;
             let cursor = match o.remove("cursor") {
                 None | Some(Json::Null) => None,
                 Some(Json::String(c)) => Some(c),
@@ -489,11 +486,11 @@ impl Query {
             };
             Mode::Rows { columns, cursor }
         } else {
-            let first = stage(&mut o)?;
+            let first = parse_stage(&mut o)?;
             let then = match o.remove("then") {
                 None => None,
                 Some(Json::Object(mut t)) => {
-                    let s = stage(&mut t)?;
+                    let s = parse_stage(&mut t)?;
                     if let Some(k) = t.keys().next() {
                         return Err(Error::invalid(format!("unknown key {k:?} in then")));
                     }
@@ -550,7 +547,7 @@ impl Query {
         Ok(Query { from, to, filter, lookups, mode, order_by, limit, limited })
     }
 
-    /// The names a query outputs, in order.
+    /// Returns the output column names in order.
     pub fn outputs(&self) -> Vec<String> {
         match &self.mode {
             Mode::Rows { columns, .. } => columns.iter().map(|c| c.name.clone()).collect(),
@@ -568,13 +565,13 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn intervals_bucket_and_divide() {
+    fn parse_and_bucket_intervals() {
         let d = Interval::parse("1d").unwrap();
         assert_eq!(d, Interval::Fixed(86_400_000));
         assert_eq!(d.bucket(86_400_000 + 5, 0), Some(86_400_000));
         assert_eq!(d.bucket(-1, 0), Some(-86_400_000));
         assert_eq!(d.bucket(i64::MIN, 3_600_000), None);
-        assert_eq!(d.bucket(86_400_000 - 3_600_000, 3_600_000), Some(86_400_000 - 3_600_000), "a local midnight");
+        assert_eq!(d.bucket(86_400_000 - 3_600_000, 3_600_000), Some(86_400_000 - 3_600_000), "local midnight");
         assert_eq!(Interval::parse("1mo").unwrap().bucket(31 * 86_400_000 + 1, 0), Some(31 * 86_400_000));
         assert_eq!(Interval::parse("1w").unwrap().bucket(0, 0), Some(-3 * 86_400_000), "weeks start on Monday");
         for bad in ["", "d", "0d", "1y", "1.5h"] {
@@ -585,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn queries_parse() {
+    fn parse_queries() {
         let q = Query::parse(json!({
             "from": 0, "to": "1970-01-02T00:00:00Z",
             "where": {"col": "event", "op": "eq", "value": "$pageview"},
@@ -604,7 +601,7 @@ mod tests {
         let all = Query::parse(json!({"from": 0, "to": 1})).unwrap();
         assert_eq!(all.mode, Mode::Rows { columns: Vec::new(), cursor: None });
         let unlimited = Query::parse(json!({"from": 0, "to": 1, "limit": null})).unwrap();
-        assert_eq!((unlimited.limit, unlimited.limited), (100, false), "a null limit is no limit");
+        assert_eq!((unlimited.limit, unlimited.limited), (100, false), "null limit uses default");
         for bad in [
             json!({"to": 1, "aggregates": {"n": {"fn": "count"}}}),
             json!({"from": 2, "to": 1, "aggregates": {"n": {"fn": "count"}}}),

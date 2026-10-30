@@ -16,22 +16,18 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       existing database.** During database churn, a `get` operation returns
       `404 not_found` for a database that was created and not deleted
       (`sim_tool trace db_churn 202681`).
-- [ ] **Fix `db_churn` timeouts of a crash-looping node.** With a small
-      cache under memory pressure, a restarted node re-reads the same system
-      segments thousands of times before it serves a request, and chaos
-      crashes it again first, so the workload never finishes
-      (`sim_tool trace db_churn 606688` on `main`, 601086 on this branch).
-- [ ] **Fix stream reads that outlast the request deadline.** Since
-      requests are cancelled at `commit_timeout_ms`, a checker's stream read
-      can fail with `503 request deadline exceeded` until it gives up
-      (`sim_tool trace streams 2601188`; also 2602361 and 2603205, on `main`
-      as on this branch).
-- [ ] **Sweep when a lease is short.** A sweep starts after a commit and
-      skips its run if the lease has lapsed by the time its clock read and
-      refresh return, so with 1 s leases and slow store calls a database may
-      go unswept until its next commit; the `blobs` workload's final GC
-      check then fails (`sim_tool trace blobs 5000231`, where both sweeps
-      after the last two commits found the lease expired).
+- [ ] **Fix `db_churn` timeouts if a node crash-loops under memory pressure.**
+      Under a small cache budget, a restarted node repeatedly re-reads the same
+      system segments before serving requests, and fault injection can crash the
+      node again before the workload finishes (`sim_tool trace db_churn 606688`).
+- [ ] **Fix stream reads that exceed the request deadline.** Requests are
+      canceled at `commit_timeout_ms`, which can cause large stream reads to
+      fail repeatedly with `503 request deadline exceeded`
+      (`sim_tool trace streams 2601188`).
+- [ ] **Run garbage collection sweeps even if the lease duration is short.** A
+      post-commit sweep skips execution if the lease expires while reading the
+      store clock and refreshing the manifest, leaving the database unswept
+      until the next commit (`sim_tool trace blobs 5000231`).
 - [ ] **Fix `streams` seed 202835: expired stream records are returned after
       `retention_ms`.** Stream reads return records older than `retention_ms`
       (`sim_tool trace streams 202835`).
@@ -67,145 +63,116 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       `PUT` is still in flight and retries are exhausted, awaiting the primary
       `PUT` can resolve the commit outcome instead of returning
       `outcome: "unknown"`.
-- [ ] **Keep event deletes from conflicting with concurrent inserts.** A
-      delete reads every unsealed row of its table and the part refs of its
-      time range, so as a serializable transaction it conflicts with any
-      insert or bind into them. A delete whose reads outlast the interval
-      between binds (a cold cache over many parts) retries until the cache is
-      warm, or fails with `409` after `txn_retries`; under a crash storm a
-      delete may never commit (`sim_tool trace events 2126696`). Evaluate
-      the delete's filter on rows and refs added since its snapshot inside
-      the committer instead of tracking them as reads.
-- [ ] **Run event deletes past the commit deadline.** A delete reads every
-      part its filter cannot rule out by time range inside its transaction,
-      and the request's commit deadline (`commit_timeout_ms`, 10 s) bounds
-      those reads: with 32 concurrent reads at 25 ms, about 12,000 parts.
-      Larger deletes fail with a retryable `503` that cannot succeed. Run
-      them as background mutations that mask part by part and report
-      progress.
-- [ ] **Bound bind masks.** The committer stores a bind's mask inline
-      whatever its size (`Mask::Inline` in `Db::build`), so a rejected or
-      repeated slot whose rows interleave with others' can add about one byte
-      per row of a 16 MiB buffer to a part reference. Have maintenance
-      rewrite parts whose inline mask exceeds `event_mask_inline_bytes`.
-- [ ] **Build parts column-wise from encoded rows.** Seals and bulk
-      inserts decode each part's rows into `table::schema::Row` maps (a
-      B-tree per row) before `RowsSource` transposes them, so a part of tiny
-      events holds several hundred bytes per row while it is built and a
-      32 MiB bulk insert of 14-byte events peaks at about 11x its body
-      (`tests/memory_bound.rs`). Decode straight into column vectors.
-- [ ] **Read masked merge inputs once.** Before merging a part with
-      deletions, `maint::census` reads its string and JSON columns to plan
-      the output's dictionaries and paths from live rows, and the merge
-      then fetches the same blocks again: rewriting a 3,000-row part with
-      one masked row takes 441 store `GET`s against 303 unmasked. It also
-      records bucket keys the part's directory does not list, which are
-      never looked up. Plan each output column while the merge reads it.
-- [ ] **Size granule runs by decoded string widths.** `Run::run_rows`
-      counts a string column at 4 bytes a row, its dictionary codes, but a
-      column without a part dictionary decodes to its text, so a concurrent
-      part read of high-cardinality strings outgrows its share of the query
-      limit and the part is decoded again serially. With the block cache
-      the second read costs CPU only; under a cache too small to hold the
-      part it doubles the store `GET`s (100 against 50 for 16,384 rows of
-      two 120-byte columns under a 256 KiB cache). Count text from the
-      column's index, or measure runs as they are read.
-- [ ] **Charge cached segment blocks their decoded size.** The block cache
-      charges a decoded entry its key and value bytes plus 48
-      (`CacheVal::size`), while an `Entry` and its `Bytes` handles take about
-      twice that, so a cache of small entries holds about twice
-      `cache_bytes` (a table scan retaining 29.5 MB of heap counted 15.7 MB).
-- [ ] **Bound merge memory.** `merge_parts` holds the sort key of every live
-      input row at once, so a final merge of 4 GiB of small events holds
-      hundreds of MB of keys. Merge sorted runs block by block instead.
-- [ ] **Cap event part bytes on transactional inserts.** `event_max_bytes`
-      is checked only when binds add parts (`Db::bind`); events inserted by
-      transactions become parts through seals, which never refuse. Count
-      unsealed bytes toward the cap at commit.
-- [ ] **Purge deleted unsealed events and idle databases' deletions.** An
-      event deleted before it was sealed becomes an LSM tombstone; if its
-      row was flushed, its bytes stay in a segment until a compaction
-      happens to rewrite it, with no time bound (as for KV deletes). Purges
-      of deleted part rows also run only when the database commits. Flush
-      and compact segments holding old tombstones on a timer, and run event
-      maintenance from the node's housekeeping.
-- [ ] **Charge sealed part overhead to inserts.** A seal writes one part
-      per partition, of about 330 bytes at least, and seals are not
-      checked against the quota, so 6,000 events one per hourly partition
-      grow from 282 KB unsealed to 1.98 MB sealed and can carry a database
-      7 times past its quota. Charge the part overhead of each partition an
-      insert opens when the insert commits.
-- [ ] **Charge event queries to the node memory budget.** A query's
-      aggregation state or kept rows with the columns it reads at once, and
-      the bytes its lookup maps hold (up to 1 GiB each, `exec::Limits`) are
-      charged to the query only, so `query_concurrency` queries can hold
-      many times `memory_bytes`.
-      Reserve query memory through the node's `MemoryGate`, and share query
-      slots fairly among users (`Node::query_slot` is first come, first
-      served).
-- [ ] **Stream `/txn` bodies.** A transaction's body is parsed whole into
-      JSON values, so 32 MiB of tiny `insert_events` rows briefly holds
-      gigabytes before `INSERT_MAX_ROWS` refuses them. Bulk inserts stream
-      their bodies (`api::events::each_event`), and their buffers are not
-      charged to the node memory budget either.
-- [ ] **Re-check retention when dropping expired parts.** `drop_expired`
-      drops the parts its plan chose without reading the table's retention
-      again, so clearing retention while a drop is in flight still drops
-      them.
-- [ ] **Bound event query reads while parts are in flight.** The 4 GiB read
-      limit is checked between absorbed parts, so up to
-      `event_read_concurrency` concurrent part reads can overshoot it.
-- [ ] **Retry stale event queries only for schema misses.** A snapshot query
-      failing with any `400` or `404` reruns at strong consistency with a
-      fresh time limit (`api::events::query`), doubling the cost of a plain
-      query mistake.
-- [ ] **Treat `query_events` in transactions like event queries.** The op
-      takes no query slot and gets no deadline extension.
-- [ ] **Store bind slot rows sparsely and cap partitions per insert.** Each
-      staged part carries a `Runs` per slot of its bind (`StagedPart::
-      slot_rows`), so a bind's encoding and the committer's work grow with
-      slots × parts (1,501 slots × 1,502 parts encode to 2.4 MB), and one
-      bulk insert may span any number of partitions, staged one `PUT` at a
-      time even after every slot's deadline has passed.
-- [ ] **Re-check part references when a sweep's obsolete parts install.**
-      The sweep's safety for parts, as for blobs, rests on the stage-TTL
-      margin alone; a bind whose manifest `PUT` lands more than
-      `4 × clock_sync_max_error_ms` after its attempt began could see its
-      part collected. Skip parts referenced at install time.
-- [ ] **Refuse binds whose columns were dropped since validation.** A bulk
-      insert validated before a column is dropped and re-added binds its
-      rows under the old column id, so the value reads null or the new
-      default (`Db::bind` checks the table, not its columns). Carry the
-      validating schema's column ids in `Bind` and refuse, retryably, a
-      bind naming a dropped one.
-- [ ] **Re-resolve database names for strong event queries.** An event
-      query checks that its database exists at a snapshot 5 s old whatever
-      `consistency` its body asks for, so a strong query on a node that
-      cached a name deleted and recreated elsewhere fails once with `404
-      database deleted` before the name is looked up again.
-- [ ] **Merge partial-directory parts in one pass per row.** A merge reads a
-      path that an input keeps in a shared bucket by parsing that bucket's
-      JSON once for every output path (`Feed::SharedPath`), so merging parts
-      with partial directories costs paths × rows × bucket size.
+- [ ] **Prevent event deletes from conflicting with concurrent inserts.** An
+      event delete adds all unsealed rows and part references in its time range
+      to the transaction read set, causing serializable conflicts with
+      concurrent inserts and binds (`sim_tool trace events 2126696`). Evaluate
+      the delete filter against rows and part references added after the
+      snapshot inside the committer instead of tracking them in the read set.
+- [ ] **Execute large event deletes asynchronously.** An event delete reads all
+      candidate parts within its transaction and fails with `503` if those reads
+      exceed `commit_timeout_ms` (10 s). Run large deletes as background
+      operations that update part masks incrementally.
+- [ ] **Bound inline deletion masks on bound parts.** The committer stores masks
+      for rejected or duplicate bind slots inline regardless of size. Rewrite
+      parts in background maintenance if their inline mask exceeds
+      `event_mask_inline_bytes`.
+- [ ] **Decode rows directly into column vectors during part builds.** Seals and
+      bulk inserts decode each row into a `BTreeMap` before transposing columns,
+      causing a 32 MiB bulk insert of small events to peak at roughly 11x the
+      request body size (`tests/memory_bound.rs`).
+- [ ] **Read masked merge inputs in a single pass.** Before merging a part that
+      has deletions, `maint::census` reads its string and JSON columns to plan
+      output dictionaries and paths, and the merge then fetches the same blocks
+      a second time. Plan each output column during the merge pass instead.
+- [ ] **Estimate granule run memory from actual string lengths.**
+      `Run::run_rows` estimates string columns at 4 bytes per row (the
+      dictionary code width), even if a high-cardinality column is stored
+      without a dictionary. Use the column index byte length so concurrent reads
+      of high-cardinality string columns do not exceed their memory share and
+      fall back to serial re-reads.
+- [ ] **Account for object overhead in the segment block cache.**
+      `CacheVal::size` charges key and value bytes plus 48 bytes per entry,
+      undercounting small entries by roughly half of their heap allocation.
+- [ ] **Bound memory usage during part merges.** `merge_parts` holds the sort
+      key of every live input row in memory at once. Merge sorted runs block by
+      block instead.
+- [ ] **Enforce `event_max_bytes` on transactional event inserts.**
+      `event_max_bytes` is checked during bulk-insert binds (`Db::bind`), but
+      transactional inserts are sealed in the background without checking the
+      table cap. Count unsealed event bytes toward `event_max_bytes` at commit
+      time.
+- [ ] **Purge deleted events on idle databases and in unsealed segments.**
+      Unsealed events deleted before sealing remain in LSM segments until
+      compaction rewrites them, and part deletion purges only run after a
+      commit. Trigger periodic flushes, compactions, and event maintenance from
+      node housekeeping.
+- [ ] **Account for minimum part overhead during event inserts.** Sealing writes
+      at least 330 bytes per partition without checking the database quota, so
+      sparse inserts across many partitions can exceed the quota after sealing.
+      Charge the per-partition metadata overhead if an insert opens a partition.
+- [ ] **Charge event query memory to the node `MemoryGate`.** Event query state,
+      column batches, and lookup maps are bounded per query (`exec::Limits`),
+      but concurrent queries are not charged against the node's global
+      `memory_bytes` budget and `Node::query_slot` is not fair-shared across
+      users.
+- [ ] **Stream `/txn` request bodies and charge bulk insert buffers to
+      `MemoryGate`.** Transaction requests parse the full JSON body into memory
+      before checking `INSERT_MAX_ROWS`, and bulk insert buffers are not charged
+      against the node memory budget.
+- [ ] **Recheck table retention before committing expired-part drops.**
+      `drop_expired` commits its planned part drops without verifying that
+      `retention_ms` is unchanged, so clearing retention while a drop is in
+      flight still deletes the parts.
+- [ ] **Check the 4 GiB query read limit during in-flight part reads.** The read
+      byte limit is only checked after each part finishes, allowing up to
+      `event_read_concurrency` concurrent part reads to overshoot the limit.
+- [ ] **Retry snapshot event queries only on missing table or column errors.**
+      `api::events::query` retries any `400` or `404` failure at strong
+      consistency, which executes invalid queries twice.
+- [ ] **Acquire a query slot and extend deadlines for transactional
+      `query_events` ops.** Unlike the `/rows/query` endpoint, `query_events`
+      inside a transaction does not acquire a `Node::query_slot` permit or
+      extend the request deadline.
+- [ ] **Encode `StagedPart::slot_rows` sparsely and limit partitions per bulk
+      insert.** Each `StagedPart` stores a `Runs` entry for every slot in the
+      bind batch, scaling bind encoding size with `slots * parts`, and a single
+      bulk insert can span an unbounded number of partitions.
+- [ ] **Skip referenced parts during orphan sweep installation.** If a bind
+      commit is delayed past `4 * clock_sync_max_error_ms`, a concurrent sweep
+      can mark its staged parts as obsolete. Filter out parts that are
+      referenced in the manifest at sweep install time.
+- [ ] **Reject binds if a target column was dropped after validation.**
+      `Db::bind` checks that the table still exists, but if a column is dropped
+      and re-added while a bulk insert is buffered, rows are bound under the old
+      column ID. Include column IDs in `Bind` and return a retryable conflict if
+      any column was dropped.
+- [ ] **Refresh the database name cache on `404` during strong event queries.**
+      Event queries resolve the database name using a 5 s cached snapshot even
+      if `consistency` is `strong`, causing a strong query to fail once with
+      `404` if the database was recently recreated on another node.
+- [ ] **Parse shared JSON buckets once per row during merges.** While merging a
+      part with a partial path directory, `Feed::SharedPath` reparses the shared
+      bucket JSON once per output path instead of once per row.
 
 ## Performance
 
-- [ ] **Run event query decoding off the async runtime.** A query decodes
-      blocks and folds aggregates on a tokio worker, so a large query delays
-      other requests on that worker. Move CPU-bound granule work to a
-      blocking pool or a dedicated executor, bounded by `query_concurrency`.
-- [ ] **Split event queries across nodes.** One node reads every part of a
-      query. Fan parts out to peers by rendezvous hash, so their caches
-      stay warm, and merge partial aggregate states (they already encode and
-      merge) on the entry node.
-- [ ] **Cache event lookup maps.** Each query rebuilds lookup maps from the
-      whole row table. Cache them per table version and patch them from the
-      table's change feed.
-- [ ] **Keep event parts in the local disk tier.** Parts use the memory cache
-      only, so a restarted node or a working set larger than memory reads
-      parts from the store again.
-- [ ] **Dispatch event merges to other nodes.** Merges run on the lease
-      holder and compete with its commits for CPU and bandwidth.
+- [ ] **Move event query block decoding and aggregation off Tokio worker
+      threads.** Execute CPU-bound granule decoding and aggregation on a
+      dedicated thread pool bounded by `query_concurrency` so large queries do
+      not stall async workers.
+- [ ] **Distribute event part reads across cluster nodes.** Route part reads to
+      peers by rendezvous hashing to utilize cluster-wide memory caches and CPU,
+      then merge partial aggregate states on the entry node.
+- [ ] **Cache event query lookup maps across queries.** Queries currently
+      rebuild lookup maps by scanning the target table on every execution. Cache
+      lookup maps by table version and update them from the table change feed.
+- [ ] **Cache event parts in the local disk cache tier.** Event parts are
+      currently cached only in memory, so node restarts and working sets larger
+      than RAM must re-fetch parts from object storage.
+- [ ] **Offload event part merges from the lease holder.** Background part
+      merges currently run on the database lease holder and contend with commit
+      batches for CPU and network bandwidth.
 - [ ] **Immediately delete output segments of rejected compactions.** Rejected
       compactions currently leave their output segments for the orphan sweep to
       delete after `orphan_grace_ms` (2 hours).
@@ -230,16 +197,15 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 
 ## Features
 
-- [ ] **Event rollups and projections.** Let a table declare aggregates by
-      time bucket (or alternative sort orders) that seals and merges
-      maintain, so dashboards read small parts.
-- [ ] **Configure event query limits by environment.** `NodeConfig`
-      `query_limits`, `query_concurrency` and the bulk insert buffer have no
-      `BASERUNNA_*` variables.
-- [ ] **Run event retention on idle databases.** Retention and merges are
-      scheduled after commits and sweeps, which run only on active
-      databases; a dormant database keeps expired partitions (and pays for
-      them) until it is used.
+- [ ] **Event table rollups and projections.** Allow event tables to declare
+      pre-aggregated rollups or alternate sort orders maintained automatically
+      during seals and merges.
+- [ ] **Expose environment variables for event query and bulk insert limits.**
+      Add `BASERUNNA_*` environment variables for `query_limits`,
+      `query_concurrency`, and bulk insert buffer settings in `NodeConfig`.
+- [ ] **Run event retention and merges on idle databases.** Event maintenance
+      is currently triggered only by a commit or sweep on an active database,
+      leaving expired partitions in storage if a database is idle.
 - [ ] **Point-in-time restore and backups.** Retain historical manifests and
       delay GC of referenced segments. Add database snapshot/clone via
       manifest copy-on-write and export/import.
@@ -274,29 +240,26 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       `Idempotency-Key` header on `PUT` and `DELETE /v1/dbs/{db}/kv/{key}` and
       return the commit ID in a response header so clients can resolve
       ambiguous writes via `GET /commits/{id}`.
-- [ ] **Filter JSON columns whole and read inner objects by path.** Parts
-      store a JSON column as its leaf paths, so a filter on the column
-      itself is refused (`exec::Binder::filter`) and a path naming an inner
-      object reads as missing (`json::leaf`). Answer `exists` from the
-      column's presence and rebuild inner objects from the leaves under
-      their path.
-- [ ] **Compare row-table float columns with integers exactly.** Row-table
-      filters convert arguments to a column's datum (`table::filter_arg`), so
-      a float column refuses an integer no float equals, while event tables
-      compare it exactly (`x < 2^53 + 1` holds for 2^53). Keep integer
-      arguments exact as event filters do.
+- [ ] **Support filtering whole JSON columns and reading nested JSON objects by
+      path.** Event parts store only leaf JSON paths, so filtering on a root
+      JSON column is rejected (`exec::Binder::filter`) and querying a non-leaf
+      path returns `null` (`json::leaf`). Support `exists` on root JSON columns
+      and reconstruct nested objects from their leaf paths.
+- [ ] **Use exact numeric comparisons for row-table float filters.** Row-table
+      filters convert integer filter arguments to `f64` (`table::filter_arg`)
+      and reject integers that are not exactly representable as `f64`. Compare
+      `f64` columns against integer arguments using exact numeric ordering as
+      event tables do.
 
 ## Testing
 
-- [ ] **Check event maintenance liveness and storage invariants in
-      simulation.** The `events` workload never bounds part counts under
-      load or checks that ended partitions settle. `storage_check` does
-      not check part sortedness, statistics, blooms and directories against
-      their rows. Steady-insert starvation of merges
-      (`events::tests::liveness`) passed every campaign.
-- [ ] **Run a long event-table campaign.** `sim_events` runs 24 seeds in CI;
-      run thousands, with larger tables and more nodes, before relying on
-      merges at scale.
+- [ ] **Verify event merge liveness and part-internal invariants in
+      simulation.** Check in the `events` workload that part counts remain
+      bounded and completed partitions settle into a single part, and verify
+      part sort order, granule statistics, bloom filters, and path directories
+      in `storage_check`.
+- [ ] **Run an extended multi-thousand-seed `sim_events` campaign** with larger
+      tables and node counts.
 - [ ] **Deliver commit notices across membership transitions.** If nodes have
       different cached views of live cluster members, a long-poll request can be
       routed to a rendezvous home node that does not receive commit notices.
@@ -306,9 +269,8 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       membership liveness window from both intervals, and send commit notices to
       the home nodes of both previous and current membership views.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the
-      model-checked `http_txn` target. The `events` target feeds raw bytes
-      to `PartMeta::decode` and `ColIndex::decode`, which check a frame CRC
-      first; fuzz the bytes after `unframe` instead.
+      model-checked `http_txn` target, and fuzz `PartMeta::decode` and
+      `ColIndex::decode` on unframed byte slices instead of CRC-framed inputs.
 - [ ] **Run mutation testing in CI**, running `scripts/mutants.sh --in-diff` on
       pull requests and the full suite weekly.
 - [ ] **Track cost and throughput benchmarks in CI** across commits.
@@ -334,9 +296,9 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 
 ## API
 
-- [ ] **Share one forwarding loop.** `Node::bind_events` and
-      `Node::forward_internal` repeat the retry and lease-refresh logic of
-      `Node::meta` for forwarded system commands.
+- [ ] **Unify internal request forwarding retry loops.** Consolidate the retry
+      and lease-refresh logic shared by `Node::bind_events`,
+      `Node::forward_internal`, and `Node::meta`.
 
 ## Docs
 

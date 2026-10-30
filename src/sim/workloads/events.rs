@@ -1,16 +1,9 @@
 //! Simulation workload for event tables.
 //!
-//! Concurrent clients bulk insert events (JSON and NDJSON, with idempotency
-//! keys) and insert them in transactions together with row upserts, delete
-//! events by uid and by filter, add a column mid-run, and query at random
-//! snapshots, while seals, merges and bulk binds run on whichever nodes hold
-//! leases under faults. Depending on knobs, a second table is dropped and
-//! recreated under load ([`super::events_churn`]), a third takes events at
-//! its retention boundary ([`super::events_retention`]), and garbage
-//! collection is short enough that the run ends by waiting out sweeps.
-//! Every query is checked against a reference model that evaluates it naively
-//! over the rows committed at the response's version, and at quiescence the
-//! table must hold exactly the rows the model says, with retention honored.
+//! Concurrent clients run bulk and transactional inserts, deletes, schema
+//! alterations, and snapshot queries under injected faults. Query responses
+//! and final table contents are verified against a reference model at the
+//! commit version of each operation.
 
 use super::super::client::{Client, Resp, Status};
 use super::super::swarm::Knobs;
@@ -24,7 +17,6 @@ use std::sync::{Arc, Mutex};
 
 const DB: &str = "/v1/dbs/events";
 const HOUR: i64 = 3_600_000;
-/// Default of the column added mid-run, which older rows report.
 const EXTRA_DEFAULT: i64 = 7;
 const KINDS: [&str; 4] = ["view", "click", "buy", "visit"];
 
@@ -56,22 +48,19 @@ impl Ev {
     }
 }
 
-/// A committed write: its version, or `None` when its outcome stayed unknown.
 #[derive(Clone, Debug)]
 enum Write {
     Insert(Vec<String>),
     Delete(Vec<String>),
-    /// A delete of the events within `[from, to)` matching a filter.
     DeleteWhere(i64, i64, Json),
     Person(String, String),
 }
 
 impl Write {
-    /// Whether this write deletes event `e` if `e` is live when it commits.
     fn deletes(&self, e: &Ev) -> bool {
         match self {
             Write::Delete(us) => us.contains(&e.uid),
-            Write::DeleteWhere(from, to, f) => e.time >= *from && e.time < *to && holds(e, f),
+            Write::DeleteWhere(from, to, f) => e.time >= *from && e.time < *to && matches_filter(e, f),
             _ => false,
         }
     }
@@ -80,16 +69,10 @@ impl Write {
 #[derive(Default)]
 struct World {
     events: BTreeMap<String, Ev>,
-    /// Writes known to be committed, with their versions.
     committed: Vec<(u64, Write)>,
-    /// Writes whose outcome is unknown (commit records expired).
     unknown: Vec<Write>,
-    /// The version from which queries may name the added column.
     extra_since: Option<u64>,
-    /// Queries answered: the query, its answer, and the time it was sent.
     answers: Vec<(Json, Json)>,
-    /// Inserts into the retained table that were applied, and that were
-    /// of unknown outcome.
     old_inserts: (u64, u64),
 }
 
@@ -99,7 +82,6 @@ fn world(w: &Shared) -> std::sync::MutexGuard<'_, World> {
     w.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The outcome of an idempotent write.
 pub(super) enum Settled {
     Done(Json),
     Unknown,
@@ -107,7 +89,7 @@ pub(super) enum Settled {
 }
 
 /// Retries an idempotent write until its outcome is known, rotating the
-/// key when an unapplied attempt was fenced.
+/// idempotency key if an unapplied attempt is fenced.
 pub(super) async fn settle(c: &Client, path: &str, ndjson: bool, body: &Json, base: &str) -> Result<Settled, String> {
     let mut key = base.to_string();
     let mut first = c.sim.now_ms();
@@ -153,7 +135,7 @@ pub(super) async fn settle(c: &Client, path: &str, ndjson: bool, body: &Json, ba
         }
         (key, first) = (format!("{base}.{attempt}"), c.sim.now_ms());
     }
-    Err(format!("{}: POST {path} never settled", c.name))
+    Err(format!("{}: POST {path} did not settle", c.name))
 }
 
 fn event(c: &Client, base: i64, n: usize, extra: bool) -> Ev {
@@ -209,7 +191,7 @@ async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: 
         }
         match settle(&c, &path, ndjson, &body, &key).await? {
             Settled::Done(j) => {
-                let v = j["version"].as_u64().ok_or(format!("{}: no version in {j}", c.name))?;
+                let v = j["version"].as_u64().ok_or(format!("{}: missing version in {j}", c.name))?;
                 let mut g = world(&w);
                 g.committed.push((v, Write::Insert(uids)));
                 if let Some((d, p)) = person {
@@ -223,7 +205,7 @@ async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: 
                     g.unknown.push(Write::Person(d, p));
                 }
             }
-            Settled::Rejected(r) => return Err(format!("{}: insert refused: {} {}", c.name, r.status, r.json)),
+            Settled::Rejected(r) => return Err(format!("{}: insert rejected: {} {}", c.name, r.status, r.json)),
         }
         let ms = c.rng().below(300);
         c.pause(ms).await;
@@ -231,8 +213,6 @@ async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: 
     Ok(())
 }
 
-/// Deletes the events matching a filter within a few hours, so the delete
-/// masks parts that merges are rewriting.
 async fn filter_delete(c: &Client, w: &Shared, base: i64, step: usize) -> Result<(), String> {
     let (from, to, filter) = {
         let mut r = c.rng();
@@ -249,11 +229,11 @@ async fn filter_delete(c: &Client, w: &Shared, base: i64, step: usize) -> Result
     let write = Write::DeleteWhere(from, to, filter);
     match settle(c, &format!("{DB}/txn"), false, &body, &format!("{}-w{step}", c.name)).await? {
         Settled::Done(j) => {
-            let v = j["version"].as_u64().ok_or(format!("{}: no version in {j}", c.name))?;
+            let v = j["version"].as_u64().ok_or(format!("{}: missing version in {j}", c.name))?;
             world(w).committed.push((v, write));
         }
         Settled::Unknown => world(w).unknown.push(write),
-        Settled::Rejected(r) => return Err(format!("{}: filter delete refused: {} {}", c.name, r.status, r.json)),
+        Settled::Rejected(r) => return Err(format!("{}: filter delete rejected: {} {}", c.name, r.status, r.json)),
     }
     Ok(())
 }
@@ -290,17 +270,16 @@ async fn deleter(c: Client, w: Shared, base: i64, steps: usize, filters: bool) -
         let body = json!({"ops": [{"op": "delete_events", "table": "e", "where": {"col": "uid", "op": "in", "value": victims}}]});
         match settle(&c, &format!("{DB}/txn"), false, &body, &format!("{}-{step}", c.name)).await? {
             Settled::Done(j) => {
-                let v = j["version"].as_u64().ok_or(format!("{}: no version in {j}", c.name))?;
+                let v = j["version"].as_u64().ok_or(format!("{}: missing version in {j}", c.name))?;
                 world(&w).committed.push((v, Write::Delete(victims)));
             }
             Settled::Unknown => world(&w).unknown.push(Write::Delete(victims)),
-            Settled::Rejected(r) => return Err(format!("{}: delete refused: {} {}", c.name, r.status, r.json)),
+            Settled::Rejected(r) => return Err(format!("{}: delete rejected: {} {}", c.name, r.status, r.json)),
         }
     }
     Ok(())
 }
 
-/// Builds a random query whose answer the model can compute.
 fn random_query(c: &Client, base: i64, extra: bool, uid: Option<String>) -> Json {
     let mut r = c.rng();
     let from =
@@ -358,8 +337,6 @@ fn random_query(c: &Client, base: i64, extra: bool, uid: Option<String>) -> Json
     q
 }
 
-/// The rows visible at version `v`, and the persons table then, or `None`
-/// if an unknown write makes the snapshot uncertain.
 fn snapshot(g: &World, v: u64) -> Option<(Vec<&Ev>, BTreeMap<String, String>)> {
     if !g.unknown.is_empty() {
         return None;
@@ -382,9 +359,9 @@ fn snapshot(g: &World, v: u64) -> Option<(Vec<&Ev>, BTreeMap<String, String>)> {
     Some((live.iter().filter_map(|u| g.events.get(u)).collect(), persons))
 }
 
-fn holds(e: &Ev, f: &Json) -> bool {
+fn matches_filter(e: &Ev, f: &Json) -> bool {
     if let Some(n) = f.get("not") {
-        return !holds(e, n);
+        return !matches_filter(e, n);
     }
     let col = f["col"].as_str().unwrap_or("");
     let val: Json = match col {
@@ -411,11 +388,12 @@ fn holds(e: &Ev, f: &Json) -> bool {
     }
 }
 
-/// The model's answer to aggregate or rows query `q` over `rows`.
 fn model_answer(q: &Json, rows: &[&Ev], persons: &BTreeMap<String, String>) -> Vec<Vec<Json>> {
     let (from, to) = (q["from"].as_i64().unwrap_or(0), q["to"].as_i64().unwrap_or(0));
-    let sel: Vec<&&Ev> =
-        rows.iter().filter(|e| e.time >= from && e.time < to && q.get("where").is_none_or(|f| holds(e, f))).collect();
+    let sel: Vec<&&Ev> = rows
+        .iter()
+        .filter(|e| e.time >= from && e.time < to && q.get("where").is_none_or(|f| matches_filter(e, f)))
+        .collect();
     if q["order_by"][0]["col"] == "time" {
         let mut by_time: Vec<&&Ev> = sel;
         by_time.sort_by_key(|e| e.time);
@@ -488,7 +466,6 @@ fn model_answer(q: &Json, rows: &[&Ev], persons: &BTreeMap<String, String>) -> V
         .collect()
 }
 
-/// Rows compared as sets, with numbers compared by value.
 fn normalize(rows: &[Vec<Json>], ordered: bool) -> Vec<String> {
     fn num(v: &Json) -> Json {
         match v {
@@ -529,7 +506,7 @@ async fn querier(c: Client, w: Shared, base: i64, steps: usize) -> Result<(), St
 fn check_answers(g: &World) -> Result<usize, String> {
     let mut checked = 0;
     for (q, a) in &g.answers {
-        let v = a["version"].as_u64().ok_or(format!("answer without a version: {a}"))?;
+        let v = a["version"].as_u64().ok_or(format!("answer is missing version: {a}"))?;
         if q["aggregates"].get("extra").is_some() && g.extra_since.is_none_or(|s| v < s) {
             continue;
         }
@@ -537,7 +514,7 @@ fn check_answers(g: &World) -> Result<usize, String> {
         let want = model_answer(q, &rows, &persons);
         let got: Vec<Vec<Json>> = a["rows"]
             .as_array()
-            .ok_or(format!("answer without rows: {a}"))?
+            .ok_or(format!("answer is missing rows: {a}"))?
             .iter()
             .map(|r| r.as_array().cloned().unwrap_or_default())
             .collect();
@@ -555,10 +532,8 @@ fn check_answers(g: &World) -> Result<usize, String> {
     Ok(checked)
 }
 
-/// Whether `got`, a page of `[time, uid]` rows by time, holds the times of
-/// the first rows of `want`, every match in that order, and only matches;
-/// rows of equal times come in insertion order, which the model does not
-/// know, so they may be any of the matches at that time.
+// Rows with equal timestamps are ordered by insertion position, which is not
+// tracked by the model, so any matching event at that timestamp is valid.
 fn time_page_matches(q: &Json, got: &[Vec<Json>], want: &[Vec<Json>]) -> Result<(), String> {
     let limit = q["limit"].as_u64().unwrap_or(100) as usize;
     let times = |rows: &[Vec<Json>]| rows.iter().map(|r| r[0].as_i64()).collect::<Vec<_>>();
@@ -569,13 +544,12 @@ fn time_page_matches(q: &Json, got: &[Vec<Json>], want: &[Vec<Json>]) -> Result<
     let matches: BTreeSet<(Option<i64>, String)> = want.iter().map(|r| (r[0].as_i64(), r[1].to_string())).collect();
     let uids: BTreeSet<String> = got.iter().map(|r| r[1].to_string()).collect();
     match got.iter().find(|r| !matches.contains(&(r[0].as_i64(), r[1].to_string()))) {
-        Some(r) => Err(format!("{r:?} matches no event")),
-        None if uids.len() < got.len() => Err(format!("an event is repeated in {got:?}")),
+        Some(r) => Err(format!("unexpected row {r:?}")),
+        None if uids.len() < got.len() => Err(format!("duplicate event in {got:?}")),
         None => Ok(()),
     }
 }
 
-/// Reads every live row's uid at a strong snapshot.
 async fn all_uids(c: &Client) -> Result<(BTreeSet<String>, u64), String> {
     let mut uids = BTreeSet::new();
     let mut cursor: Option<String> = None;
@@ -594,7 +568,7 @@ async fn all_uids(c: &Client) -> Result<(BTreeSet<String>, u64), String> {
         for row in r.json["rows"].as_array().into_iter().flatten() {
             let u = row[0].as_str().unwrap_or_default().to_string();
             if !uids.insert(u.clone()) {
-                return Err(format!("final read holds {u} twice"));
+                return Err(format!("final read returned duplicate uid {u}"));
             }
         }
         match r.json["next_cursor"].as_str() {
@@ -637,10 +611,8 @@ async fn setup(c: &Client) -> Result<(), String> {
     Ok(())
 }
 
-/// With some seeds, shortens garbage collection so that sweeps collect
-/// orphaned and replaced parts within a run: stage TTLs, orphan grace and
-/// sweep intervals of seconds, and an obsolete grace just above the
-/// transaction lifetime.
+/// Configures short garbage collection intervals so orphan and obsolete part
+/// sweeps finish within a simulation run.
 pub fn short_gc(k: &Knobs, c: &mut SimConfig) {
     if !k.chance("events.short_gc", 0.4) {
         return;
@@ -653,18 +625,13 @@ pub fn short_gc(k: &Knobs, c: &mut SimConfig) {
         e.txn_max_lifetime_ms + 2 * e.clock_sync_max_error_ms + k.range("events.gc_grace_extra_ms", 0, 10_000);
 }
 
-/// Whether garbage collection is short enough for [`idle`] to wait it out.
 fn gc_is_short(sim: &Sim) -> bool {
     sim.cfg.engine.orphan_grace_ms <= 60_000 && sim.cfg.engine.blob_stage_ttl_ms <= 60_000
 }
 
-/// Keeps the database active, with a write every second or two, long
-/// enough for every part orphaned before it began to be swept and deleted,
-/// then checks that none is left: every part stored since before the wait
-/// is referenced, or is listed as obsolete for less than the grace period.
-/// An orphan may be seen just after a commit removed it from `obsolete`,
-/// while its deletion is in flight, so only one that stays for a sweep
-/// interval and a grace period fails the check.
+// A part removed from `obsolete` by a commit can appear as an orphan while its
+// object store deletion is in flight, so only parts that remain uncollected
+// past `limit` fail the check.
 async fn idle(c: &Client) -> Result<(), String> {
     let e = &c.sim.cfg.engine;
     let start = c.sim.now_ms();
@@ -705,7 +672,7 @@ async fn idle(c: &Client) -> Result<(), String> {
             let since = *seen.entry(id.clone()).or_insert(now);
             if since + limit < now {
                 return Err(format!(
-                    "part {id} was never collected: unreferenced since before {start}, still stored at {now}; \
+                    "part {id} was not collected: unreferenced before {start}, still stored at {now}; \
                      orphans {:?}, obsolete {:?}",
                     rep.orphan_parts, rep.obsolete_parts
                 ));
@@ -810,8 +777,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
         let certain = unknown.is_empty();
         let (rows, _) = snapshot(&g, version).ok_or("unresolved writes")?;
         let must: BTreeSet<String> = rows.iter().map(|e| e.uid.clone()).collect();
-        // Writes of unknown outcome may or may not have taken effect, but an
-        // insert takes effect whole.
         let (mut may_present, mut may_absent) = (BTreeSet::new(), BTreeSet::new());
         let deletable = |e: &Ev| g.committed.iter().map(|(_, wr)| wr).chain(unknown.iter()).any(|wr| wr.deletes(e));
         for u in &unknown {
@@ -819,7 +784,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
                 Write::Insert(us) => {
                     let present = us.iter().filter(|u| uids.contains(*u)).count();
                     if present != 0 && us.iter().any(|u| !uids.contains(u) && !deletable(&g.events[u])) {
-                        return Err(format!("an insert of unknown outcome is partly present: {us:?}"));
+                        return Err(format!("insert with unknown outcome was partially applied: {us:?}"));
                     }
                     may_present.extend(us.iter().cloned());
                 }
@@ -834,9 +799,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
         let extra: Vec<&String> =
             uids.iter().filter(|u| !must.contains(*u) && !may_present.contains(*u)).take(5).collect();
         if !missing.is_empty() || !extra.is_empty() {
-            return Err(format!(
-                "the table holds the wrong rows at v{version}: missing {missing:?}, unexpected {extra:?}"
-            ));
+            return Err(format!("table row mismatch at v{version}: missing {missing:?}, unexpected {extra:?}"));
         }
         let checked = if certain { check_answers(&g)? } else { 0 };
         sim.trace.event(&format!("events: {} rows, {checked} answers checked", uids.len()));
@@ -846,7 +809,6 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     tour(&c).await
 }
 
-/// Exercises the schema endpoints on a scratch table and checks their effects.
 async fn tour(c: &Client) -> Result<(), String> {
     let t = format!("{DB}/events/tour");
     let expect = |r: &Resp, status: u16, what: &str| -> Result<(), String> {
@@ -863,7 +825,7 @@ async fn tour(c: &Client) -> Result<(), String> {
         return Err(format!("tour add skip index: {} {}", r.status, r.json));
     }
     let r = c.call_settled("DELETE", &format!("{t}/columns/who"), None).await;
-    expect(&r, 400, "drop an indexed column")?;
+    expect(&r, 400, "drop indexed column")?;
     let r = c.call_settled("DELETE", &format!("{t}/skip-indexes/who"), None).await;
     if r.status != 200 && r.status != 404 {
         return Err(format!("tour drop skip index: {} {}", r.status, r.json));
@@ -885,7 +847,7 @@ async fn tour(c: &Client) -> Result<(), String> {
     let del = json!({"ops": [{"op": "delete_events", "table": "tour", "where": {"col": "n", "op": "ge", "value": 2}}],
         "idempotency_key": "tour-delete"});
     let r = c.call_settled("POST", &format!("{DB}/txn"), Some(del)).await;
-    expect(&r, 200, "delete in a transaction")?;
+    expect(&r, 200, "delete in transaction")?;
     let r = c
         .call_settled("POST", &format!("{t}/rows/delete"), Some(json!({"where": {"col": "n", "op": "eq", "value": 3}})))
         .await;
@@ -898,18 +860,16 @@ async fn tour(c: &Client) -> Result<(), String> {
     let r = c.call_retry("GET", &format!("{DB}/events"), None).await;
     expect(&r, 200, "list")?;
     if !r.json["tables"].as_array().is_some_and(|ts| ts.iter().any(|x| x["name"] == "tour")) {
-        return Err(format!("tour missing from the list: {}", r.json));
+        return Err(format!("tour missing from list: {}", r.json));
     }
     let r = c.call_settled("DELETE", &t, None).await;
     if r.status != 200 && r.status != 404 {
         return Err(format!("tour drop: {} {}", r.status, r.json));
     }
     let r = c.call_retry("GET", &t, None).await;
-    expect(&r, 404, "describe a dropped table")
+    expect(&r, 404, "describe dropped table")
 }
 
-/// Queries of the retained table skip rows past its retention, parts past
-/// it are dropped by maintenance after the next commit, and newer rows stay.
 async fn check_retention(c: &Client, (applied, unknown): (u64, u64)) -> Result<(), String> {
     let deadline = c.sim.now_ms() + 120_000;
     for round in 0.. {
@@ -933,17 +893,17 @@ async fn check_retention(c: &Client, (applied, unknown): (u64, u64)) -> Result<(
             return Err(format!("rows within retention were lost: {}", a.json));
         }
         if stale != Some(0) {
-            return Err(format!("a query returned rows past retention: {}", a.json));
+            return Err(format!("query returned expired rows: {}", a.json));
         }
         let info = c.call_retry("GET", &format!("{DB}/events/old"), None).await;
         let Some(parts) = info.json["parts"].as_array() else {
-            return Err(format!("describe the retained table: {} {}", info.status, info.json));
+            return Err(format!("describe retained table: {} {}", info.status, info.json));
         };
         if parts.iter().all(|p| p["max_time"].as_i64().is_some_and(|t| t >= now - 3 * HOUR)) {
             return Ok(());
         }
         if c.sim.now_ms() > deadline {
-            return Err(format!("parts past retention were never dropped: {}", info.json));
+            return Err(format!("expired parts were not dropped: {}", info.json));
         }
     }
     Ok(())

@@ -1,13 +1,11 @@
-//! Column vectors: the values of one column for a run of rows, as parts
-//! store them and queries evaluate them.
+//! Columnar value vectors used in parts and query execution.
 
 use std::sync::Arc;
 
-/// The code of a null string.
+/// Dictionary code representing a null string.
 pub const NULL_CODE: u32 = u32::MAX;
 
-/// Strings as codes into a dictionary, which a part shares across a column
-/// so that predicates run once per distinct value.
+/// Dictionary-encoded string vector.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Strs {
     pub dict: Arc<Vec<String>>,
@@ -22,7 +20,8 @@ impl Strs {
         }
     }
 
-    /// Codes each value into a dictionary of the distinct values, in first-seen order.
+    /// Encodes `vals` into a dictionary of distinct strings in first-seen
+    /// order.
     pub fn from_values<'a>(vals: impl IntoIterator<Item = Option<&'a str>>) -> Strs {
         let mut dict: Vec<String> = Vec::new();
         let mut ids: crate::util::DetHashMap<&'a str, u32> = Default::default();
@@ -48,7 +47,6 @@ pub enum Vector {
     Str(Strs),
 }
 
-/// A physical column type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phys {
     Int = 0,
@@ -108,7 +106,8 @@ impl Vector {
         (0..self.len()).filter(|i| self.is_null(*i)).count()
     }
 
-    /// Heap bytes the values hold, not counting a string dictionary.
+    /// Heap memory allocated for the value buffer, excluding any string
+    /// dictionary.
     pub fn values_mem_size(&self) -> usize {
         use std::mem::size_of;
         match self {
@@ -119,7 +118,8 @@ impl Vector {
         }
     }
 
-    /// Heap bytes the vector holds, its string dictionary included.
+    /// Total heap memory allocated for the vector, including any string
+    /// dictionary.
     pub fn mem_size(&self) -> usize {
         self.values_mem_size()
             + match self {
@@ -137,8 +137,8 @@ impl Vector {
         }
     }
 
-    /// Concatenates vectors of one type; strings with different dictionaries
-    /// are coded into a merged one.
+    /// Concatenates `parts` into a vector of type `phys`, replacing mismatched
+    /// vector types with nulls and merging distinct string dictionaries.
     pub fn concat(parts: Vec<Vector>, phys: Phys) -> Vector {
         if parts.len() == 1 {
             return parts.into_iter().next().unwrap_or_else(|| phys.nulls(0));
@@ -205,7 +205,7 @@ impl Vector {
     }
 }
 
-/// Heap bytes a string dictionary holds, its shared allocation included.
+/// Heap memory allocated for `dict` and its string buffers.
 pub fn dict_mem_size(dict: &Arc<Vec<String>>) -> usize {
     16 + dict.capacity() * std::mem::size_of::<String>() + dict.iter().map(String::capacity).sum::<usize>()
 }
@@ -215,7 +215,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strings_code_and_concat() {
+    fn str_encoding_and_concat() {
         let a = Strs::from_values([Some("x"), None, Some("y"), Some("x")]);
         assert_eq!(a.dict.len(), 2);
         assert_eq!((a.get(0), a.get(1), a.get(3)), (Some("x"), None, Some("x")));

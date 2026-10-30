@@ -1,14 +1,12 @@
-//! An event table dropped and recreated under the same name, and columns
-//! added and dropped on it, while bulk and transactional inserts, seals,
-//! merges and queries run on it.
+//! Simulation workload for concurrent event table DDL and DML.
 //!
-//! Schema changes take no idempotency key, so one whose response was lost
-//! has an unknown version. Each is kept as the range of versions it may have
-//! committed at: above the highest version seen before it was sent, and
-//! below any write sent after it settled. An answer is checked only when
-//! every schema change and insert falls on a known side of its version; it
-//! must hold exactly the rows inserted into the generation of the table
-//! that existed then, with the values of the column that existed then.
+//! Because schema changes lack idempotency keys, a schema change with a lost
+//! response has an unknown commit version. The model bounds each schema change
+//! to the version range `(lo, hi]` between the highest version observed before
+//! the request was sent and the lowest version of any write sent after the
+//! request settled. Query responses are verified against the reference model
+//! if all preceding schema changes and inserts have known ordering relative to
+//! the response version.
 
 use super::super::Sim;
 use super::super::client::Client;
@@ -30,7 +28,6 @@ fn definition() -> Json {
     })
 }
 
-/// The default of added column `c{n}`, which events written before it read.
 fn default_of(n: u32) -> i64 {
     1_000 + n as i64
 }
@@ -43,20 +40,16 @@ enum Kind {
     DropCol(u32),
 }
 
-/// A schema change, which committed at a version in `(lo, hi]`; `hi` is
-/// bounded by later writes when the response was lost.
 #[derive(Clone, Debug)]
 struct Ddl {
     kind: Kind,
     lo: u64,
     hi: Option<u64>,
-    /// When the change had certainly committed.
     done_ms: u64,
 }
 
 struct Insert {
     sent_ms: u64,
-    /// `None` when the outcome stayed unknown.
     version: Option<u64>,
     uids: Vec<String>,
 }
@@ -72,17 +65,11 @@ struct Answer {
 #[derive(Default)]
 struct World {
     ddl: Vec<Ddl>,
-    /// Each event's `k`, and the added column it gave a value for.
     evs: BTreeMap<String, (i64, Option<(u32, i64)>)>,
     inserts: Vec<Insert>,
-    /// Deletes by uid, with their versions, `None` when unknown.
     deletes: Vec<(Option<u64>, Vec<String>)>,
-    /// The highest version any response showed.
     seen: u64,
-    /// The added column, once its addition was acknowledged.
     col: Option<u32>,
-    /// Whether the churner still changes the schema; inserts and queries
-    /// run until it stops, and then a few more.
     churning: bool,
     answers: Vec<Answer>,
 }
@@ -93,8 +80,6 @@ fn world(w: &Shared) -> std::sync::MutexGuard<'_, World> {
     w.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The table at some version: whether it exists, the index of the schema
-/// change that created its generation, and its added column.
 struct State {
     exists: bool,
     create: usize,
@@ -102,13 +87,12 @@ struct State {
 }
 
 impl World {
-    fn see(&mut self, j: &Json) {
+    fn observe(&mut self, j: &Json) {
         if let Some(v) = j["version"].as_u64() {
             self.seen = self.seen.max(v);
         }
     }
 
-    /// The versions schema change `i` may have committed at, `(lo, hi]`.
     fn bounds(&self, i: usize) -> (u64, u64) {
         let d = &self.ddl[i];
         let later = || {
@@ -123,8 +107,6 @@ impl World {
         (d.lo, d.hi.unwrap_or_else(later))
     }
 
-    /// Whether schema change `i` is visible at version `v`, if known; a
-    /// strong read sent after the change settled sees it.
     fn applied(&self, i: usize, v: u64, strong_sent: Option<u64>) -> Option<bool> {
         if strong_sent.is_some_and(|s| s > self.ddl[i].done_ms) {
             return Some(true);
@@ -139,8 +121,6 @@ impl World {
         }
     }
 
-    /// Whether schema change `i` committed after a write at version `w`,
-    /// if known. Schema changes commit in order.
     fn after(&self, i: usize, w: u64) -> Option<bool> {
         if (0..=i).any(|j| self.bounds(j).0 >= w) {
             return Some(true);
@@ -164,8 +144,6 @@ impl World {
         Some(st)
     }
 
-    /// The uids the table holds at `v` in generation `st`, or `None` if an
-    /// insert's place is unknown.
     fn rows_at(&self, v: u64, st: &State) -> Option<BTreeSet<&String>> {
         let mut out = BTreeSet::new();
         for x in &self.inserts {
@@ -189,7 +167,6 @@ impl World {
         Some(out)
     }
 
-    /// The value event `uid` reads for added column `c{n}`.
     fn value(&self, uid: &str, n: u32) -> i64 {
         match self.evs.get(uid).and_then(|e| e.1) {
             Some((m, x)) if m == n => x,
@@ -198,13 +175,13 @@ impl World {
     }
 
     fn check(&self, a: &Answer) -> Result<bool, String> {
-        let v = a.json["version"].as_u64().ok_or(format!("churn answer without a version: {}", a.json))?;
+        let v = a.json["version"].as_u64().ok_or(format!("churn answer is missing version: {}", a.json))?;
         let Some(st) = self.state_at(v, a.strong.then_some(a.sent_ms)) else { return Ok(false) };
         if !st.exists {
-            return Err(format!("churn answered at v{v}, when the table was dropped: {}", a.json));
+            return Err(format!("churn answered at v{v} while table was dropped: {}", a.json));
         }
         if a.col.is_some() && a.col != st.col {
-            return Err(format!("churn answered for column {:?} at v{v}, which had column {:?}", a.col, st.col));
+            return Err(format!("churn answered for column {:?} at v{v}, expected column {:?}", a.col, st.col));
         }
         let Some(uids) = self.rows_at(v, &st) else { return Ok(false) };
         let got = a.json["rows"].as_array().cloned().unwrap_or_default();
@@ -240,10 +217,8 @@ impl World {
     }
 }
 
-/// Whether a task that ran `step` of at least `steps` steps, `after` of
-/// them since the churner stopped, is done. It stops at `10 * steps`
-/// regardless, so a churner that cannot commit does not keep it going.
-fn done(w: &Shared, step: usize, steps: usize, after: &mut usize) -> bool {
+// Caps iterations at `10 * steps` so a blocked churner does not stall workers.
+fn is_done(w: &Shared, step: usize, steps: usize, after: &mut usize) -> bool {
     if !world(w).churning {
         *after += 1;
     }
@@ -253,7 +228,7 @@ fn done(w: &Shared, step: usize, steps: usize, after: &mut usize) -> bool {
 async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: bool) -> Result<(), String> {
     let mut after = 0;
     for step in 0.. {
-        if done(&w, step, steps, &mut after) {
+        if is_done(&w, step, steps, &mut after) {
             break;
         }
         let col = world(&w).col;
@@ -283,16 +258,15 @@ async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: 
         let sent_ms = c.sim.now_ms();
         match settle(&c, &path, ndjson, &body, &format!("{}-{step}", c.name)).await? {
             Settled::Done(j) => {
-                let v = j["version"].as_u64().ok_or(format!("{}: no version in {j}", c.name))?;
+                let v = j["version"].as_u64().ok_or(format!("{}: missing version in {j}", c.name))?;
                 let mut g = world(&w);
-                g.see(&j);
+                g.observe(&j);
                 g.inserts.push(Insert { sent_ms, version: Some(v), uids });
             }
             Settled::Unknown => world(&w).inserts.push(Insert { sent_ms, version: None, uids }),
-            // The table was dropped, or the column named was dropped, before the insert.
             Settled::Rejected(r) if r.status == 404 => {}
             Settled::Rejected(r) if r.status == 400 && r.json.to_string().contains("unknown column") => {}
-            Settled::Rejected(r) => return Err(format!("{}: churn insert refused: {} {}", c.name, r.status, r.json)),
+            Settled::Rejected(r) => return Err(format!("{}: churn insert rejected: {} {}", c.name, r.status, r.json)),
         }
         let ms = c.rng().below(400);
         c.pause(ms).await;
@@ -300,11 +274,10 @@ async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: 
     Ok(())
 }
 
-/// Deletes a few acknowledged events, of any generation, by uid.
 async fn deleter(c: Client, w: Shared, steps: usize) -> Result<(), String> {
     let mut after = 0;
     for step in 0.. {
-        if done(&w, step, steps, &mut after) {
+        if is_done(&w, step, steps, &mut after) {
             break;
         }
         let ms = 500 + c.rng().below(2_000);
@@ -322,20 +295,18 @@ async fn deleter(c: Client, w: Shared, steps: usize) -> Result<(), String> {
             "where": {"col": "uid", "op": "in", "value": victims}}]});
         let d = match settle(&c, &format!("{DB}/txn"), false, &body, &format!("{}-{step}", c.name)).await? {
             Settled::Done(j) => {
-                world(&w).see(&j);
-                Some(j["version"].as_u64().ok_or(format!("{}: no version in {j}", c.name))?)
+                world(&w).observe(&j);
+                Some(j["version"].as_u64().ok_or(format!("{}: missing version in {j}", c.name))?)
             }
             Settled::Unknown => None,
             Settled::Rejected(r) if r.status == 404 => continue,
-            Settled::Rejected(r) => return Err(format!("{}: churn delete refused: {} {}", c.name, r.status, r.json)),
+            Settled::Rejected(r) => return Err(format!("{}: churn delete rejected: {} {}", c.name, r.status, r.json)),
         };
         world(&w).deletes.push((d, victims));
     }
     Ok(())
 }
 
-/// Runs a schema change, recording the versions it may have committed at.
-/// `again` is the status a repeat of an earlier attempt that took effect gets.
 async fn ddl(c: &Client, w: &Shared, kind: Kind, method: &str, path: &str, body: Option<Json>) -> Result<(), String> {
     let (ok, again) = match kind {
         Kind::Create => (201, 409),
@@ -348,8 +319,8 @@ async fn ddl(c: &Client, w: &Shared, kind: Kind, method: &str, path: &str, body:
     let mut g = world(w);
     let hi = match r.status {
         s if s == ok => {
-            g.see(&r.json);
-            let v = r.json["version"].as_u64().ok_or(format!("churn {kind:?} without a version: {}", r.json))?;
+            g.observe(&r.json);
+            let v = r.json["version"].as_u64().ok_or(format!("churn {kind:?} is missing version: {}", r.json))?;
             g.ddl.push(Ddl { kind, lo: v - 1, hi: Some(v), done_ms });
             return Ok(());
         }
@@ -360,8 +331,6 @@ async fn ddl(c: &Client, w: &Shared, kind: Kind, method: &str, path: &str, body:
     Ok(())
 }
 
-/// Drops and recreates the table, and adds and drops a column, one change
-/// at a time.
 async fn churner(c: Client, w: Shared, steps: usize) -> Result<(), String> {
     let r = churn(&c, &w, steps).await;
     world(&w).churning = false;
@@ -424,7 +393,7 @@ fn query(c: &Client, col: Option<u32>) -> (Json, bool) {
 async fn querier(c: Client, w: Shared, steps: usize) -> Result<(), String> {
     let mut after = 0;
     for step in 0.. {
-        if done(&w, step, steps, &mut after) {
+        if is_done(&w, step, steps, &mut after) {
             break;
         }
         let ms = 200 + c.rng().below(800);
@@ -439,7 +408,7 @@ async fn querier(c: Client, w: Shared, steps: usize) -> Result<(), String> {
                 }
                 let strong = q["consistency"] == "strong";
                 let mut g = world(&w);
-                g.see(&r.json);
+                g.observe(&r.json);
                 g.answers.push(Answer { sent_ms, strong, col, aggregate, json: r.json });
             }
             Ok(r) if r.status == 503 || r.status == 429 || r.status == 404 => {}
@@ -455,7 +424,6 @@ async fn setup(c: &Client, w: &Shared) -> Result<(), String> {
     ddl(c, w, Kind::Create, "POST", &format!("{DB}/events"), Some(definition())).await
 }
 
-/// The churn workload's tasks.
 pub struct Churn {
     w: Shared,
 }
@@ -481,10 +449,7 @@ impl Churn {
         Ok((Churn { w }, tasks))
     }
 
-    /// Checks every answer whose version the model places, then the final
-    /// table: rows of earlier generations are gone, every row acknowledged
-    /// since the last creation is present, and every row reads its value of
-    /// the added column.
+    /// Verifies recorded query responses and final table state against the model.
     pub async fn check(&self, c: &Client) -> Result<(), String> {
         let mut checked = 0;
         {
@@ -514,7 +479,7 @@ impl Churn {
             for row in r.json["rows"].as_array().into_iter().flatten() {
                 let u = row[0].as_str().unwrap_or_default().to_string();
                 if got.insert(u.clone(), row[1].as_i64()).is_some() {
-                    return Err(format!("churn final read holds {u} twice"));
+                    return Err(format!("churn final read returned duplicate uid {u}"));
                 }
             }
             match r.json["next_cursor"].as_str() {
@@ -525,7 +490,7 @@ impl Churn {
         let g = world(&self.w);
         let st = g.state_at(version, Some(sent_ms)).ok_or("churn: final state unknown")?;
         if !st.exists || st.col != col {
-            return Err(format!("churn: final table exists {} with column {:?}, expected {col:?}", st.exists, st.col));
+            return Err(format!("churn: final table exists={} col={:?}, expected col={col:?}", st.exists, st.col));
         }
         let (mut must, mut may) = (BTreeSet::new(), BTreeSet::new());
         for x in &g.inserts {
@@ -548,15 +513,14 @@ impl Churn {
         let unexpected: Vec<&String> = got.keys().filter(|u| !must.contains(u) && !may.contains(u)).take(5).collect();
         if !missing.is_empty() || !unexpected.is_empty() {
             return Err(format!(
-                "churn table (generation {}) holds the wrong rows at v{version}: missing {missing:?}, unexpected \
-                 {unexpected:?} (rows of a dropped generation, or of no insert)",
+                "churn table (generation {}) mismatch at v{version}: missing {missing:?}, unexpected {unexpected:?}",
                 st.create
             ));
         }
         if let Some(n) = col {
             for (u, x) in &got {
                 if *x != Some(g.value(u, n)) {
-                    return Err(format!("churn row {u} reads c{n} = {x:?}, expected {}", g.value(u, n)));
+                    return Err(format!("churn row {u} has c{n} = {x:?}, expected {}", g.value(u, n)));
                 }
             }
         }

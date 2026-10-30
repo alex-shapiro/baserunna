@@ -1,10 +1,9 @@
-//! Event table console pages: a database's event tables, and each table's
-//! partitions and parts, with a query runner and inserts.
+//! Console pages for event tables.
 
 use super::db::{api_db, db_path};
 use super::{
-    Fields, Flash, Page, Pager, Params, Posted, Session, back, esc, field, format_bytes, page, stay, table, url_seg,
-    when,
+    Fields, Flash, Page, Pager, Params, Posted, Session, back, esc, field, format_bytes, format_duration,
+    format_timestamp, page, stay, table, url_seg,
 };
 use crate::meta::Role;
 use axum::Router;
@@ -14,7 +13,6 @@ use serde::Deserialize;
 use serde_json::{Value as Json, json};
 use std::sync::Arc;
 
-/// Parts listed on a table's page.
 const PARTS_SHOWN: usize = 100;
 
 pub fn routes() -> Router<Arc<crate::node::Node>> {
@@ -47,7 +45,6 @@ struct Info {
 
 const DEFAULT_TABLE: &str = r#"{"name": "events", "columns": [{"name": "time", "type": "time", "default": "now"}, {"name": "event", "type": "string"}, {"name": "user", "type": "string"}, {"name": "properties", "type": "json"}], "time_column": "time", "order_by": ["event", "time"], "partition": "day"}"#;
 
-/// The event tables section of a database's page.
 pub(super) async fn events_section(s: &Session, db: &str, can_write: bool, q: &Fields) -> Result<String, String> {
     let p = Pager::of(q, "events");
     let list: TableList = s.get(&format!("{}/events?{}", api_db(db), p.api_query())).await?;
@@ -92,7 +89,7 @@ fn cell(v: &Json) -> String {
     }
 }
 
-/// Output columns holding times: time buckets, and time columns read as is.
+/// Returns the names of query output columns that represent timestamps.
 fn time_outputs(t: &Json, q: &Json) -> Vec<String> {
     let mut out: Vec<String> = t["columns"]
         .as_array()
@@ -110,7 +107,6 @@ fn time_outputs(t: &Json, q: &Json) -> Vec<String> {
     out
 }
 
-/// The answer to a query as a table, with its statistics.
 fn answer_html(a: &Json, times: &[String]) -> String {
     let names: Vec<&str> = a["columns"].as_array().into_iter().flatten().map(|c| c.as_str().unwrap_or("")).collect();
     let cols: Vec<String> = names.iter().map(|c| esc(c)).collect();
@@ -123,7 +119,7 @@ fn answer_html(a: &Json, times: &[String]) -> String {
         .map(|r| {
             let cells =
                 r.as_array().into_iter().flatten().enumerate().map(|(i, v)| match (is_time.get(i), v.as_i64()) {
-                    (Some(true), Some(ms)) => format!("<td>{}</td>", when(ms)),
+                    (Some(true), Some(ms)) => format!("<td>{}</td>", format_timestamp(ms)),
                     _ => format!("<td>{}</td>", cell(v)),
                 });
             format!("<tr>{}</tr>", cells.collect::<String>())
@@ -149,8 +145,7 @@ fn answer_html(a: &Json, times: &[String]) -> String {
     )
 }
 
-/// Events per day and by the leading sort key, named so that no output
-/// collides with the key.
+/// Builds a default query that counts events per day and leading sort key over the latest 30 days.
 pub(crate) fn default_query(t: &Json) -> String {
     let time = t["time_column"].as_str().unwrap_or("time");
     let key = t["order_by"][0].as_str().unwrap_or(time);
@@ -160,7 +155,6 @@ pub(crate) fn default_query(t: &Json) -> String {
     if key != time {
         group_by.push(json!(key));
     }
-    // The 30 days before the newest partition ends, and any newer events.
     let newest = t["partitions"].as_array().into_iter().flatten().filter_map(|p| p["end"].as_i64()).max();
     let from = newest.map_or(json!("2000-01-01"), |end| json!(end - 30 * 86_400_000));
     json!({"from": from, "to": crate::events::schema::TIME_RANGE.end() + 1, "group_by": group_by,
@@ -179,7 +173,7 @@ async fn render(s: &Session, db: &str, name: &str, t: &Json, q: &str, answer: St
         .map(|p| {
             format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                when(p["start"].as_i64().unwrap_or(0)),
+                format_timestamp(p["start"].as_i64().unwrap_or(0)),
                 p["parts"],
                 p["rows"],
                 format_bytes(p["bytes"].as_u64().unwrap_or(0))
@@ -195,7 +189,7 @@ async fn render(s: &Session, db: &str, name: &str, t: &Json, q: &str, answer: St
             format!(
                 "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 esc(p["id"].as_str().unwrap_or_default()),
-                when(p["partition"].as_i64().unwrap_or(0)),
+                format_timestamp(p["partition"].as_i64().unwrap_or(0)),
                 p["level"],
                 p["rows"],
                 p["deleted"],
@@ -245,7 +239,7 @@ async fn render(s: &Session, db: &str, name: &str, t: &Json, q: &str, answer: St
             bytes = format_bytes(t["bytes"].as_u64().unwrap_or(0)),
             un = t["unsealed_rows"],
             ret = match t["retention_ms"].as_u64() {
-                Some(ms) => super::span(ms),
+                Some(ms) => format_duration(ms),
                 None => "keeps everything".into(),
             },
             order = esc(&t["order_by"].to_string()),
@@ -265,7 +259,6 @@ async fn table_page(Path((db, name)): Path<(String, String)>, s: Session, q: Par
     render(&s, &db, &name, &t, &text, answer, Flash::of(&q)).await
 }
 
-/// Runs a query typed into the console, rendering its answer or why it failed.
 async fn run_query(s: &Session, db: &str, t: &Json, text: &str) -> String {
     match crate::api::parse_json::<Json>(text.as_bytes()) {
         Ok(mut q) => {

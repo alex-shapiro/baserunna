@@ -58,13 +58,10 @@ pub struct Shared {
     waits_ended: std::sync::atomic::AtomicBool,
     /// Called with a database id and version after this node commits a new data version.
     commit_hook: std::sync::OnceLock<CommitHook>,
-    /// Called on the lease holder with the event tables a commit changed.
     event_hook: std::sync::OnceLock<EventHook>,
 }
 
-/// Callback invoked on the lease holder with a database and the event tables
-/// whose unsealed rows or parts a commit changed, to schedule sealing,
-/// merges and retention (SPEC §5.13).
+/// Callback invoked on the lease holder after a commit modifies event table rows or parts (SPEC §5.13).
 pub type EventHook = Box<dyn Fn(&Arc<Db>, std::collections::BTreeSet<u32>) + Send + Sync>;
 
 /// Callback invoked with `(db_id, version)` after this node commits a new data version.
@@ -209,12 +206,10 @@ pub fn pin_key(db: &str, blob: &str) -> String {
     format!("{}pin", blob_prefix(db, blob))
 }
 
-/// Returns the prefix of every object of an event table part or mask.
 pub fn part_prefix(db: &str, part: &str) -> String {
     format!("dbs/{db}/part/{part}/")
 }
 
-/// Returns the storage key of chunk `idx` of an event table part or mask.
 pub fn part_chunk_key(db: &str, part: &str, idx: u64) -> String {
     format!("dbs/{db}/part/{part}/{idx:04}")
 }
@@ -335,7 +330,6 @@ impl Engine {
         let _ = self.shared.commit_hook.set(h);
     }
 
-    /// Sets the callback that schedules event table maintenance.
     pub fn set_event_hook(&self, h: EventHook) {
         let _ = self.shared.event_hook.set(h);
     }

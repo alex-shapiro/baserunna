@@ -372,7 +372,7 @@
       },
       "CreateEventTable": {
         "additionalProperties": false,
-        "description": "Rows are sorted by `order_by` within each part, so filters on a prefix of the sort key read few granules. Partitions (UTC, default `day`) bound merges and retention. The sort key, time column and partition cannot change.",
+        "description": "Rows are sorted by `order_by` within each part. Partitions are in UTC (default `day`). `order_by`, `time_column`, and `partition` are immutable.",
         "properties": {
           "columns": {
             "items": {
@@ -738,7 +738,7 @@
       },
       "EventColumn": {
         "additionalProperties": false,
-        "description": "An event table column. Columns are nullable by default; a `time` column may default to `\"now\"`, the inserting node's clock. A `json` column holds objects, whose null members are dropped.",
+        "description": "Event table column. Columns are nullable by default. A `time` column can default to `\"now\"`. A `json` column stores JSON objects with null fields removed.",
         "properties": {
           "default": {},
           "name": {
@@ -784,7 +784,7 @@
         "type": "object"
       },
       "EventFilter": {
-        "description": "A filter (SPEC §4.7) whose comparisons name a column (`col`), a JSON column's path (`col` and `path`, an array of keys naming a leaf), a lookup (`lookup`), or a time bucket.",
+        "description": "Filter expression (SPEC §4.7) that compares a column (`col`), a JSON path (`col` and `path`), a lookup (`lookup`), or a time bucket (`bucket` and `interval`).",
         "type": "object"
       },
       "EventInsert": {
@@ -811,7 +811,7 @@
       },
       "EventQuery": {
         "additionalProperties": false,
-        "description": "A query over `[from, to)` of the time column: rows (`columns`, every column when omitted, with `order_by` and `cursor`, 100 per page by default) or aggregates (`group_by` and `aggregates`, with an optional second stage `then`). Expressions are a column name, `{col, path?}`, `{lookup}` or `{bucket, interval, offset?}`; aggregates are count, sum, min, max, avg, uniq, uniq_exact, quantiles, window_funnel and retention, each with an optional `where`. Aggregates answer with the first `limit` groups by `order_by`, or without a `limit` with every group, failing with 413 past 100,000. Queries read a snapshot at most 5 s old unless `consistency` is `strong`.",
+        "description": "Queries the time column over `[from, to)`. Set `columns` (default: all columns) to return rows with `order_by` and `cursor` (default limit 100), or set `group_by` and `aggregates` (with optional second stage `then`) to return up to 100,000 groups. Reads a snapshot at most 5 s old unless `consistency` is `strong`.",
         "properties": {
           "aggregates": {
             "type": "object"
@@ -969,7 +969,7 @@
       },
       "EventTable": {
         "additionalProperties": false,
-        "description": "An event table's schema; describing one table adds its partitions, parts and sizes.",
+        "description": "Event table schema; single-table responses also include partitions, parts, and row/byte counts.",
         "properties": {
           "bytes": {
             "type": "integer"
@@ -1636,7 +1636,7 @@
         "type": "object"
       },
       "Op": {
-        "description": "Transaction operation. Keys and values are UTF-8 strings unless `encoding: base64` is set. `ttl_ms` sets the entry or row expiration relative to the commit timestamp; row updates preserve existing expiration unless `ttl_ms` is specified. `update_rows` and `delete_rows` modify all rows matching `where` (up to `limit`) within the transaction write limit and return `count`. For stream operations: `append` assigns sequence numbers at commit (`expect_seq` aborts the transaction with 412 if the stream's next sequence number does not match); `read_stream` conflicts with concurrent appends only when the read reaches the end of the stream, and observes earlier trims in the same transaction but not uncommitted appends; `stream_info` conflicts with concurrent appends; `set_consumer` requires `seq` to be at most the stream's `next_seq`. For event tables: `insert_events` gives rows their positions at commit, so a transaction that inserts into a table cannot also query or delete its events (400); `query_events` in a read-write serializable transaction conflicts with any concurrent insert into the table; `delete_events` masks matching rows of parts and deletes matching unsealed rows.",
+        "description": "Transaction operation. Keys and values are UTF-8 strings unless `encoding: base64` is set. `ttl_ms` sets the entry or row expiration relative to the commit timestamp; row updates preserve existing expiration unless `ttl_ms` is specified. `update_rows` and `delete_rows` modify all rows matching `where` (up to `limit`) within the transaction write limit and return `count`. For stream operations: `append` assigns sequence numbers at commit (`expect_seq` aborts the transaction with 412 if the stream's next sequence number does not match); `read_stream` conflicts with concurrent appends only if the read reaches the end of the stream, and observes earlier trims in the same transaction but not uncommitted appends; `stream_info` conflicts with concurrent appends; `set_consumer` requires `seq` to be at most the stream's `next_seq`. For event tables: `insert_events` assigns row positions at commit, so a transaction that inserts into a table cannot also query or delete from it (400); `query_events` in a read-write serializable transaction conflicts with concurrent inserts into the table; `delete_events` masks matching rows in parts and deletes matching unsealed rows.",
         "oneOf": [
           {
             "additionalProperties": false,
@@ -3044,7 +3044,7 @@
       },
       "StreamRead": {
         "additionalProperties": false,
-        "description": "Reads records starting from at most one of `from_seq`, `from_time` (first record at or after the timestamp), `tail` (last N records), or `consumer` (consumer cursor, starting at `first_seq` if unset), up to `until_seq` or `until_time` (exclusive). Returns records oldest-first (or newest-first when `reverse` is true), bounded by `limit` (default 100) and `max_bytes` (default 4 MiB, max 16 MiB). When `filter` is set, at most `scan_limit` records (default 10,000) are scanned.",
+        "description": "Reads records starting from at most one of `from_seq`, `from_time` (first record at or after the timestamp), `tail` (last N records), or `consumer` (consumer cursor, starting at `first_seq` if unset), up to `until_seq` or `until_time` (exclusive). Returns records oldest-first, or newest-first if `reverse` is true, bounded by `limit` (default 100) and `max_bytes` (default 4 MiB, max 16 MiB). If `filter` is set, at most `scan_limit` records (default 10,000) are scanned.",
         "properties": {
           "consistency": {
             "enum": [
@@ -4809,7 +4809,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "summary": "Describe an event table, its partitions and parts",
+        "summary": "Describe an event table, its partitions, and its parts",
         "tags": [
           "events"
         ]
@@ -4869,7 +4869,7 @@
     },
     "/v1/dbs/{db}/events/{t}/columns": {
       "post": {
-        "description": "Rows written before the column existed read as its default, or as null for a nullable column defaulting to `\"now\"`.",
+        "description": "Rows written before the column was added return its default value, or `null` if the default is `\"now\"`.",
         "parameters": [
           {
             "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
@@ -4975,7 +4975,7 @@
     },
     "/v1/dbs/{db}/events/{t}/rows": {
       "post": {
-        "description": "Bulk insert: the receiving node buffers requests for up to 200 ms, writes them as parts and binds them in one commit; each request is its own transaction. Answered once the rows are committed.",
+        "description": "Buffers requests on the receiving node for up to 200 ms, writes staged parts, and binds them in a single commit. Each request is committed as an independent transaction.",
         "parameters": [
           {
             "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
@@ -5014,7 +5014,7 @@
             },
             "application/x-ndjson": {
               "schema": {
-                "description": "An event per line",
+                "description": "One JSON event object per line",
                 "type": "string"
               }
             }
@@ -5054,7 +5054,7 @@
     },
     "/v1/dbs/{db}/events/{t}/rows/delete": {
       "post": {
-        "description": "Deletes the rows within `[from, to)` (all time by default) matching `where` in one transaction; a delete larger than the transaction limits fails with 413 naming the partition it stopped in.",
+        "description": "Deletes rows in `[from, to)` (default: all time) that match `where` in a single transaction. Returns 413 if the delete exceeds transaction limits.",
         "parameters": [
           {
             "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
@@ -5161,7 +5161,7 @@
     },
     "/v1/dbs/{db}/events/{t}/skip-indexes": {
       "post": {
-        "description": "Parts written afterwards, and older parts once merged, carry the index.",
+        "description": "New parts and merged parts include the skip index.",
         "parameters": [
           {
             "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",

@@ -1,6 +1,5 @@
-//! HTTP API fuzzing inside the simulator: random and mutated requests must
-//! never produce a 500 or a panic, and responses on documented routes must
-//! conform to the OpenAPI document. Scale with `FUZZ_ITERS`.
+//! Fuzzes the HTTP API and transaction operations in the simulator. Scale
+//! iterations with `FUZZ_ITERS`.
 
 use baserunna::sim::client::Client;
 use baserunna::sim::{SimConfig, openapi_check, run};
@@ -116,7 +115,6 @@ fn rand_json(r: &mut Rng, depth: u32) -> Value {
     }
 }
 
-/// Valid request bodies that mutation starts from.
 fn seeds() -> Vec<(&'static str, &'static str, Value)> {
     vec![
         (
@@ -421,7 +419,6 @@ fn fuzz_http_api() {
         if std::env::var("FUZZ_VERBOSE").is_ok() {
             eprintln!("status histogram: {hist:?}");
         }
-        // Ensure enough requests pass validation to exercise handlers.
         let ok = hist.iter().filter(|(s, _)| **s < 300).map(|(_, n)| n).sum::<usize>();
         if ok * 10 < iters {
             return Err(format!("too few successful fuzz requests: {hist:?}"));
@@ -435,9 +432,6 @@ fn fuzz_http_api() {
     assert!(out.result.is_ok(), "{:?}", out.result);
 }
 
-/// Structure-aware fuzzing of the transaction-op language against an exact
-/// model. Scale with `FUZZ_ITERS`; `FUZZ_VERBOSE` prints response counts per
-/// route and status, and `FUZZ_DEBUG` includes error messages.
 #[test]
 fn fuzz_txn_ops_against_model() {
     let iters = baserunna::util::prop::env_u64("FUZZ_ITERS").unwrap_or(400);

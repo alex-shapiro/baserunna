@@ -63,10 +63,8 @@ fn replayed_bulk_insert_reports_the_original_count() {
     });
 }
 
-/// JSON integers that `serde_json` would round to a float are refused on
-/// every insert path rather than stored rounded; floats that large are kept.
 #[test]
-fn integers_beyond_64_bits_are_refused_not_rounded() {
+fn integers_beyond_64_bits_are_rejected() {
     run_paused(async {
         let (w, t) = setup(1).await;
         let (s, r) =
@@ -92,7 +90,7 @@ fn integers_beyond_64_bits_are_refused_not_rounded() {
 }
 
 #[test]
-fn bulk_insert_refuses_a_key_used_by_a_transaction() {
+fn bulk_insert_rejects_idempotency_key_used_by_transaction() {
     run_paused(async {
         let (w, t) = setup(1).await;
         let txn = json!({"ops": [{"op": "put", "key": "x", "value": "y"}], "idempotency_key": "shared"});
@@ -192,7 +190,7 @@ fn bulk_insert_bodies() {
 }
 
 #[test]
-fn concurrent_retries_with_one_key_insert_once() {
+fn concurrent_retries_with_same_key_insert_once() {
     run_paused(async {
         let (w, t) = setup(3).await;
         let h = [("idempotency-key", "same")];
@@ -208,7 +206,7 @@ fn concurrent_retries_with_one_key_insert_once() {
         println!("{a:?} {b:?} {c:?}");
         assert_eq!(count(&w, 0, &t).await, json!(1));
         let ok = [&a, &b, &c].iter().filter(|r| r.0 == 201 || r.0 == 200).count();
-        assert_eq!(ok, 3, "every retry of one insert succeeds: {a:?} {b:?} {c:?}");
+        assert_eq!(ok, 3, "every retry of the insert succeeds: {a:?} {b:?} {c:?}");
         w.shutdown();
     });
 }
@@ -315,9 +313,8 @@ fn event_responses_match_the_openapi_document() {
     });
 }
 
-/// The funnel per plan that SPEC §4.8 shows as an example answers as it says.
 #[test]
-fn the_spec_example_query_answers() {
+fn spec_example_funnel_query_returns_expected_rows() {
     run_paused(async {
         let (w, t) = setup(1).await;
         let users = json!({"name": "users", "columns": [{"name": "user", "type": "string"},
@@ -396,8 +393,6 @@ fn console_default_queries_run_for_any_sort_key() {
     });
 }
 
-/// The console's table page runs its default query on every view, so it
-/// reads only the newest month of parts, however old the table is.
 #[test]
 fn console_default_queries_read_the_newest_month() {
     run_paused(async {
@@ -416,8 +411,6 @@ fn console_default_queries_read_the_newest_month() {
     });
 }
 
-/// The console shows times before 1970, which tables accept, as dates:
-/// partition starts and the times in query answers alike.
 #[test]
 fn console_shows_times_before_1970() {
     run_paused(async {
@@ -433,7 +426,7 @@ fn console_shows_times_before_1970() {
         let resp = w.node(0).router().unwrap().oneshot(req).await.unwrap();
         let html = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
         let html = String::from_utf8_lossy(&html);
-        let at = |h: &str| html.find(h).unwrap_or_else(|| panic!("no {h} in {html}"));
+        let at = |h: &str| html.find(h).unwrap_or_else(|| panic!("missing {h} in {html}"));
         let (answer, partitions) = (&html[..at("<h2>Partitions</h2>")], &html[at("<h2>Partitions</h2>")..]);
         assert!(partitions.contains("<td>1960-06-15 00:00:00</td>"), "{partitions}");
         assert!(answer.contains("<td>1960-06-15 00:00:00</td><td>a</td>"), "{answer}");
@@ -441,10 +434,8 @@ fn console_shows_times_before_1970() {
     });
 }
 
-/// A time that is not an RFC 3339 timestamp with an offset or whole
-/// milliseconds is refused for its format, not as out of range.
 #[test]
-fn unparseable_times_are_refused_for_their_format() {
+fn unparseable_times_are_rejected_for_invalid_format() {
     run_paused(async {
         let (w, t) = setup(1).await;
         for time in [json!("2026-10-01T12:00:00"), json!("2026-10-01T12:00:00.123456"), json!(1_790_000_000_000.5)] {
@@ -452,15 +443,12 @@ fn unparseable_times_are_refused_for_their_format() {
             let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], &rows.to_string()).await;
             assert_eq!(s, 400, "{r}");
             let m = r["error"]["message"].as_str().unwrap_or_default();
-            assert!(!m.contains("years 0000 to 9999"), "{time} is refused as out of range: {m}");
+            assert!(!m.contains("years 0000 to 9999"), "{time} was rejected as out of range: {m}");
         }
         w.shutdown();
     });
 }
 
-/// A query's pacing counts the expressions it computes per row, so one
-/// computing many copies of a large default per row still stops near its
-/// time limit.
 #[test]
 fn queries_of_many_expressions_stop_near_their_time_limit() {
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
@@ -487,8 +475,6 @@ fn queries_of_many_expressions_stop_near_their_time_limit() {
     });
 }
 
-/// A small bulk insert into a table whose columns have ordinary defaults is
-/// inserted: the events' defaults may take more than 8 times their text.
 #[test]
 fn small_bulk_inserts_take_ordinary_defaults() {
     run_paused(async {
@@ -508,9 +494,6 @@ fn small_bulk_inserts_take_ordinary_defaults() {
     });
 }
 
-/// A full body of the smallest events, which encode to several times their
-/// text, is inserted: only events expanded by defaults past their body's
-/// size are refused.
 #[test]
 fn full_bodies_of_tiny_events_are_inserted() {
     run_paused(async {
@@ -529,7 +512,7 @@ fn full_bodies_of_tiny_events_are_inserted() {
 }
 
 #[test]
-fn inserts_on_one_node_are_seen_by_strong_queries_on_others() {
+fn inserts_are_visible_to_strong_queries_on_other_nodes() {
     run_paused(async {
         let (w, t) = setup(3).await;
         for i in 0..3 {
@@ -543,7 +526,6 @@ fn inserts_on_one_node_are_seen_by_strong_queries_on_others() {
     });
 }
 
-/// A meta command reaches the system database after its lease moves.
 #[test]
 fn meta_commands_survive_a_system_lease_move() {
     run_paused(async {
@@ -564,9 +546,8 @@ fn meta_commands_survive_a_system_lease_move() {
     });
 }
 
-/// `"consistency": null` reads as an absent field, as `/txn` reads it.
 #[test]
-fn null_consistency_reads_as_absent() {
+fn null_consistency_is_treated_as_absent() {
     run_paused(async {
         let (w, t) = setup(1).await;
         let txn = r#"{"ops": [{"op": "get", "key": "x"}], "consistency": null, "max_staleness_ms": null}"#;
@@ -579,8 +560,6 @@ fn null_consistency_reads_as_absent() {
     });
 }
 
-/// A transaction that inserts events cannot also query or delete them,
-/// since their positions are assigned at commit; it fails without writing.
 #[test]
 fn a_transaction_cannot_read_events_it_inserts() {
     run_paused(async {
@@ -600,8 +579,6 @@ fn a_transaction_cannot_read_events_it_inserts() {
     });
 }
 
-/// An event query may run up to its own time limit, longer than the request
-/// deadline of other requests.
 #[test]
 fn slow_event_queries_run_past_the_request_deadline() {
     run_paused(async {
@@ -638,7 +615,7 @@ fn event_table_listings_are_paginated() {
         let (s, r) = send(&w, 0, &t, "GET", "/v1/dbs/d/events?limit=1", &[], "").await;
         assert_eq!(s, 200, "{r}");
         assert_eq!(r["tables"].as_array().map(Vec::len), Some(1), "limit=1 lists: {r}");
-        assert!(r["next_cursor"].is_string(), "no next_cursor: {r}");
+        assert!(r["next_cursor"].is_string(), "missing next_cursor: {r}");
         w.shutdown();
     });
 }
@@ -659,13 +636,11 @@ fn row_table_listings_are_paginated() {
         let (s, r) = send(&w, 0, &t, "GET", "/v1/dbs/d/tables?limit=1", &[], "").await;
         assert_eq!(s, 200, "{r}");
         assert_eq!(r["tables"].as_array().map(Vec::len), Some(1), "limit=1 lists: {r}");
-        assert!(r["next_cursor"].is_string(), "no next_cursor: {r}");
+        assert!(r["next_cursor"].is_string(), "missing next_cursor: {r}");
         w.shutdown();
     });
 }
 
-/// Every catalog listing pages through all its entries exactly once, in
-/// name order, filters by prefix, and refuses page sizes outside 1..=1000.
 #[test]
 fn catalog_listings_page_through_each_entry_once() {
     run_paused(async {
@@ -721,10 +696,8 @@ mod requests {
         (w, t)
     }
 
-    /// The request that fills a node's insert buffer may be cancelled while
-    /// the buffer flushes without failing the requests buffered with it.
     #[test]
-    fn a_cancelled_insert_does_not_fail_inserts_buffered_with_it() {
+    fn canceled_insert_does_not_fail_other_buffered_inserts() {
         run_paused(async {
             let (w, t) = setup_with(1, 20, |c| {
                 c.event_insert_buffer_bytes = 4_000;
@@ -743,21 +716,17 @@ mod requests {
                 tokio::pin!(fut);
                 while w.node(0).event_buffers().pending() > 0 {
                     if let Some(r) = futures_util::FutureExt::now_or_never(&mut fut) {
-                        panic!("the second insert finished before it was cancelled: {r:?}");
+                        panic!("the second insert finished before it was canceled: {r:?}");
                     }
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-                // The second client disconnects while its request flushes the buffer.
             };
             let ((s, r), ()) = tokio::join!(a, b);
-            assert_eq!(s, 201, "an insert failed because another client's request was cancelled: {r}");
+            assert_eq!(s, 201, "an insert failed because another client's request was canceled: {r}");
             w.shutdown();
         });
     }
 
-    /// A client resolves its in-flight insert's key (SPEC §6.2) while the
-    /// insert waits in a non-holder node's buffer: the forwarded bind is
-    /// refused as aborted, and the client gets the same 409 as on the holder.
     #[test]
     fn a_forwarded_bind_keeps_its_aborted_error() {
         run_paused(async {
@@ -784,8 +753,6 @@ mod requests {
         });
     }
 
-    /// Events past retention are not returned, including rows inserted by
-    /// transactions that stay unsealed below `event_seal_bytes`.
     #[test]
     fn queries_skip_unsealed_events_past_retention() {
         run_paused(async {
@@ -813,7 +780,6 @@ mod requests {
         });
     }
 
-    /// An added column defaulting to `"now"` has no value for earlier events.
     #[test]
     fn an_added_column_defaulting_to_now_is_nullable() {
         run_paused(async {
@@ -823,7 +789,7 @@ mod requests {
             assert_eq!(s, 201, "{r}");
             let col = r#"{"name": "seen", "type": "time", "nullable": false, "default": "now"}"#;
             let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/columns", &[], col).await;
-            assert_eq!(s, 400, "a non-nullable column was added that reads null for earlier events: {r}");
+            assert_eq!(s, 400, "a non-nullable column was added that is null for earlier events: {r}");
             let col = r#"{"name": "seen", "type": "time", "default": "now"}"#;
             let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/columns", &[], col).await;
             assert_eq!(s, 200, "{r}");
@@ -834,9 +800,8 @@ mod requests {
         });
     }
 
-    /// A delete whose range is reversed is refused, as a query's is.
     #[test]
-    fn deletes_refuse_reversed_ranges_like_queries() {
+    fn deletes_reject_reversed_time_ranges() {
         run_paused(async {
             let (w, t) = setup(1).await;
             let q = r#"{"from": 2000, "to": 1000, "aggregates": {"n": {"fn": "count"}}}"#;
@@ -848,7 +813,6 @@ mod requests {
         });
     }
 
-    /// A null `idempotency_key` means none, as for stream appends and `/txn`.
     #[test]
     fn a_null_idempotency_key_in_the_body_is_absent() {
         run_paused(async {
@@ -860,8 +824,6 @@ mod requests {
         });
     }
 
-    /// A request naming one key in its header and another in its body is
-    /// refused instead of being answered for the header's key.
     #[test]
     fn header_and_body_idempotency_keys_must_agree() {
         run_paused(async {
@@ -881,8 +843,6 @@ mod requests {
     }
 }
 
-/// Bulk inserts and queries are served by the node they reach; every other
-/// event route goes to the lease holder.
 #[test]
 fn event_rows_routes_are_served_where_they_arrive() {
     let post = http::Method::POST;
@@ -913,8 +873,6 @@ mod forwarding {
         (w, t)
     }
 
-    /// A bulk insert accepted by the lease holder is accepted by every node:
-    /// a forwarded bind is not bounded by the client JSON body limit.
     #[test]
     fn forwarded_binds_are_not_bounded_by_the_json_body_limit() {
         run_paused(async {
@@ -938,8 +896,6 @@ mod forwarding {
         });
     }
 
-    /// The console's table page runs its default query; a table holding an
-    /// event after 2100 still gets an answer.
     #[test]
     fn console_default_queries_cover_far_future_events() {
         run_paused(async {
@@ -956,8 +912,6 @@ mod forwarding {
         });
     }
 
-    /// The console's default query counts an event in the last second of
-    /// year 9999, which the table accepts.
     #[test]
     fn console_default_queries_count_the_latest_storable_event() {
         run_paused(async {
@@ -976,11 +930,8 @@ mod forwarding {
     }
 }
 
-/// A transaction that reuses a bulk insert's idempotency key is refused,
-/// as a bulk insert reusing a transaction's key is, instead of answering
-/// `replayed: true` without applying its ops.
 #[test]
-fn transactions_refuse_a_key_used_by_a_bulk_insert() {
+fn transactions_reject_idempotency_key_used_by_bulk_insert() {
     run_paused(async {
         let (w, t) = setup(1).await;
         let h = [("content-type", "application/json"), ("idempotency-key", "shared")];
@@ -1026,8 +977,6 @@ mod console_pages {
         html[i..i + html[i..].find('"').unwrap()].to_string()
     }
 
-    /// The query runner shows time buckets as times, including those a
-    /// `then` stage groups by.
     #[test]
     fn query_runner_shows_second_stage_buckets_as_times() {
         run_paused(async {
@@ -1049,7 +998,6 @@ mod console_pages {
         });
     }
 
-    /// A retention shorter than an hour is not shown as zero.
     #[test]
     fn table_page_shows_sub_hour_retention() {
         run_paused(async {
@@ -1059,14 +1007,12 @@ mod console_pages {
             let (_, page) = web(&w, &t, "GET", "/console/dbs/d/events/ev", &[]).await;
             let stats = &page[page.find("<span>Retention</span>").expect("a retention stat")..];
             let stats = &stats[..stats.find("</div>").unwrap()];
-            assert!(!stats.contains(">0 h"), "30 minutes of retention reads as zero: {stats}");
+            assert!(!stats.contains(">0 h"), "30 minutes of retention is shown as zero: {stats}");
             w.shutdown();
         });
     }
 }
 
-/// A large bulk insert of tiny events is written as a few parts, not one
-/// sequential store round trip per batch of rows decoded.
 #[test]
 fn a_large_bulk_insert_is_not_split_into_sequential_part_writes() {
     run_paused(async {
@@ -1086,10 +1032,8 @@ fn a_large_bulk_insert_is_not_split_into_sequential_part_writes() {
     });
 }
 
-/// A body naming `rows` or `idempotency_key` twice is refused rather than
-/// read one way or the other.
 #[test]
-fn bulk_insert_bodies_name_each_field_once() {
+fn bulk_insert_rejects_duplicate_body_fields() {
     run_paused(async {
         let (w, t) = setup(1).await;
         for b in [
@@ -1104,9 +1048,6 @@ fn bulk_insert_bodies_name_each_field_once() {
     });
 }
 
-/// A deleted event leaves object storage within the purge window plus GC
-/// bounds, even when its part is too little deleted to be rewritten for
-/// space and its partition is never merged again.
 #[test]
 fn deleted_events_are_eventually_purged_from_storage() {
     run_paused(async {
@@ -1140,8 +1081,6 @@ fn deleted_events_are_eventually_purged_from_storage() {
     });
 }
 
-/// A page by time reads only the parts that can hold its rows: neither the
-/// parts before its cursor nor those after its last row.
 #[test]
 fn row_pages_read_only_parts_that_can_hold_them() {
     run_paused(async {

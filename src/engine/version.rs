@@ -53,7 +53,7 @@ impl KeyRange {
         KeyRange { start: Bound::Included(start), end: end.map(Bound::Excluded).unwrap_or(Bound::Unbounded) }
     }
 
-    /// The range holding only `k`.
+    /// `[k, k]`.
     pub fn point(k: &Bytes) -> KeyRange {
         KeyRange::new(Bound::Included(k.clone()), Bound::Included(k.clone()))
     }

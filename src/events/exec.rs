@@ -1,13 +1,10 @@
-//! Query execution (SPEC §5.13): pruning at every level before data is
-//! read, then columnar batches through filters and aggregation.
+//! Query execution (SPEC §5.13).
 //!
-//! A query reads one snapshot: the part references of the partitions its
-//! time range overlaps and the table's unsealed rows. Parts are pruned by
-//! their references, then by dictionaries and missing columns, then granule
-//! by granule by the primary index, statistics and bloom filters. The
-//! filter's columns are read first, and the other columns only for granules
-//! with selected rows. A page of rows ordered by time reads parts in that
-//! order and stops once they decide it (see [`Frontier`]).
+//! A query reads a single snapshot of unsealed rows and part references in
+//! the target partitions. Parts and granules are pruned using reference time
+//! bounds, column presence, dictionaries, the primary index, min/max
+//! statistics, and bloom filters. Filter columns are read first; remaining
+//! columns are read only for granules that have matching rows.
 
 use super::agg::{State, Val};
 use super::json;
@@ -32,16 +29,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// Limits on the work one query does.
+/// Resource limits for a single query.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// Compressed bytes read from storage.
+    /// Maximum compressed bytes read from storage.
     pub max_bytes_read: u64,
-    /// Bytes of aggregation state or kept rows, with the columns read at once.
+    /// Maximum memory in bytes for aggregation state or top rows plus active column batches.
     pub max_memory_bytes: usize,
-    /// Bytes the maps of the query's lookups hold.
+    /// Maximum memory in bytes for lookup maps.
     pub lookup_max_bytes: usize,
-    /// Milliseconds a query runs before it stops with a retryable `503`.
+    /// Query timeout in milliseconds before returning a retryable `503`.
     pub max_ms: u64,
 }
 
@@ -51,7 +48,7 @@ impl Default for Limits {
     }
 }
 
-/// What a query did, for its response.
+/// Execution statistics returned in the query response.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Stats {
     pub source: String,
@@ -76,7 +73,7 @@ impl Stats {
     }
 }
 
-/// A query's answer.
+/// Query result and execution statistics.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Output {
     pub columns: Vec<String>,
@@ -85,22 +82,20 @@ pub struct Output {
     pub stats: Stats,
 }
 
-/// An expression bound to the table's columns.
+/// Expression bound to table column IDs or first-stage output indices.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BExpr {
     Col(u32),
     Path(u32, Vec<String>, String),
-    /// A whole JSON column.
     Json(u32),
     Lookup(usize),
     Bucket(Box<BExpr>, Interval, i64),
-    /// A first-stage output, in the second stage.
+    /// First-stage output index used in the second stage.
     Out(usize),
 }
 
 type BFilter = filter::Filter<BExpr, Json>;
 
-/// A column, path or derived value a batch provides.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Need {
     Col(u32),
@@ -115,28 +110,23 @@ struct Lookup {
     map: Arc<LookupMap>,
 }
 
-/// A row table's primary keys mapped to one of its columns, held in about
-/// the bytes of the keys and values: each entry's key (its canonical bytes)
-/// and value (encoded) lie back to back in one buffer, found by binary
-/// search over the entries sorted by key, which costs the same whatever the
-/// keys (a hash table over them could be flooded with keys chosen to
-/// collide).
+/// Maps encoded primary keys to column values in a flat byte buffer.
+///
+/// Entries are looked up by binary search over `sorted` rather than hashing
+/// to prevent hash-collision denial-of-service attacks.
 #[derive(Default)]
 struct LookupMap {
     data: Vec<u8>,
-    /// Where each entry starts in `data`.
     starts: Vec<u32>,
-    /// Entry numbers by key, entries of equal keys in insertion order.
+    /// Entry indices sorted by canonical key bytes, with ties ordered by insertion.
     sorted: Vec<u32>,
 }
 
 impl LookupMap {
-    /// The bytes the map holds.
     fn mem(&self) -> usize {
         self.data.len() + 4 * (self.starts.len() + self.sorted.len())
     }
 
-    /// Appends an entry; entries are found once [`LookupMap::index`] runs.
     fn push(&mut self, key: &[u8], v: &Val) -> Result<()> {
         let start = u32::try_from(self.data.len()).map_err(|_| Error::TooLarge("a lookup map exceeds 4 GiB".into()))?;
         let mut w = Writer::new();
@@ -155,12 +145,10 @@ impl LookupMap {
         self.entry(e).bytes().unwrap_or_default()
     }
 
-    /// The bytes [`LookupMap::index`] adds.
     fn index_mem(&self) -> usize {
         4 * self.starts.len()
     }
 
-    /// Sorts the entries by key; of entries with equal keys, the last is found.
     fn index(&mut self) {
         let mut sorted: Vec<u32> = (0..self.starts.len() as u32).collect();
         sorted.sort_by(|a, b| self.key(*a).cmp(self.key(*b)));
@@ -192,7 +180,9 @@ impl Binder<'_> {
                     (EvType::Json, true) => BExpr::Json(c.id),
                     (EvType::Json, false) => BExpr::Path(c.id, path.clone(), json::path_key(path)),
                     (_, true) => BExpr::Col(c.id),
-                    (_, false) => return Err(Error::invalid(format!("column {name:?} is not json and takes no path"))),
+                    (_, false) => {
+                        return Err(Error::invalid(format!("column {name:?} is not json and does not take a path")));
+                    }
                 }
             }
             Expr::Lookup(n) => BExpr::Lookup(
@@ -230,7 +220,6 @@ impl Binder<'_> {
                         "filter on a JSON column's path, such as {\"col\": .., \"path\": [..]}",
                     ));
                 }
-                // Constants compare with stored values, so they are normalized the same way.
                 _ => t.try_map(|a| {
                     let mut a = a.clone();
                     json::normalize(&mut a).map_err(Error::invalid)?;
@@ -242,7 +231,6 @@ impl Binder<'_> {
     }
 }
 
-/// Converts a filter argument to the type of column `c`, refusing a mismatch.
 fn typed_arg(c: &EvColumn, a: &Json) -> Result<Json> {
     let bad = || Error::invalid(format!("column {:?} compares with {} values, not {a}", c.name, c.ty.name()));
     Ok(match c.ty {
@@ -251,10 +239,10 @@ fn typed_arg(c: &EvColumn, a: &Json) -> Result<Json> {
             _ => json!(a.as_i64().ok_or_else(bad)?),
         },
         EvType::Int => json!(a.as_i64().ok_or_else(bad)?),
-        // Integers stay exact: they compare with floats by value.
+        // Preserve 64-bit integer precision so exact integer literals can be compared with float columns.
         EvType::Float if a.is_i64() => a.clone(),
         EvType::Float if a.is_u64() => {
-            return Err(Error::invalid(format!("{a} exceeds the signed 64-bit integer range, as no event can")));
+            return Err(Error::invalid(format!("{a} exceeds the signed 64-bit integer range")));
         }
         EvType::Float => json!(a.as_f64().filter(|f| f.is_finite()).ok_or_else(bad)? + 0.0),
         EvType::String => json!(a.as_str().ok_or_else(bad)?),
@@ -271,8 +259,6 @@ fn num_order(a: &Val, b: &Json) -> Option<Ordering> {
     a.num_cmp(&b)
 }
 
-/// Values compare as JSON: numbers by value, strings by bytes, booleans with
-/// false first, and arrays and objects only for equality.
 impl Target<Json> for Val {
     fn equals(&self, arg: &Json) -> bool {
         match self {
@@ -335,7 +321,7 @@ pub(crate) fn datum_val(d: &Datum) -> Val {
     }
 }
 
-/// A column's value where a row or part predates it.
+/// Returns the default value for a column if a row or part predates the column.
 fn default_val(c: Option<&EvColumn>) -> Val {
     match c.and_then(|c| c.default.as_ref().map(|d| (c, d))) {
         Some((c, Json::String(s))) if c.ty == EvType::Time && s == NOW => Val::Null,
@@ -344,19 +330,11 @@ fn default_val(c: Option<&EvColumn>) -> Val {
     }
 }
 
-/// The values of one need across a batch, or across its current window.
 #[derive(Clone, Debug)]
 enum ColData {
-    Vec {
-        v: Vector,
-        json: bool,
-    },
+    Vec { v: Vector, json: bool },
     Vals(Vec<Val>),
-    /// A value per row, or `default` where an unsealed row predates its column.
-    Filled {
-        vals: Vec<Option<Val>>,
-        default: Val,
-    },
+    Filled { vals: Vec<Option<Val>>, default: Val },
     Const(Val),
 }
 
@@ -382,48 +360,32 @@ impl ColData {
     }
 }
 
-/// How a batch derives a need that it does not read as a column.
 enum Derive {
-    /// An unsealed row's column, or the column's default.
     UnsealedCol(Val),
-    /// A path of an unsealed row's JSON column, by its segments.
     UnsealedPath(Vec<String>),
-    /// An unsealed row's whole JSON column.
     UnsealedJson,
-    /// A path that a part keeps in the shared bucket `Batch::buckets[i]`.
     Shared(usize),
-    /// A part's whole JSON column, rebuilt from whether each row has it, its
-    /// path columns, and its shared buckets in `Batch::buckets`.
-    Object {
-        present: Vector,
-        paths: Vec<(Vec<String>, ColData)>,
-        buckets: Vec<usize>,
-    },
+    Object { present: Vector, paths: Vec<(Vec<String>, ColData)>, buckets: Vec<usize> },
     Lookup,
 }
 
-/// Rows of one part's granules or of the unsealed rows, by need. Needs a
-/// part stores as columns are read for the whole batch; the others are
-/// derived one window of rows at a time ([`Batch::enter`]), so that however
-/// many needs and rows a batch has, it holds derived values for one
-/// window's rows.
+/// Columnar row batch for a granule run or unsealed rows.
+///
+/// Stored columns are loaded for the entire batch. Derived values such as
+/// unsealed columns, shared JSON buckets, reconstructed JSON objects, and
+/// lookups are materialized per row window in [`Batch::enter`] to bound peak
+/// memory.
 struct Batch<'r> {
     n: usize,
     pos: Vec<Pos>,
-    /// The batch's rows, if they are unsealed rows.
     rows: &'r [(Pos, Row)],
     cols: BTreeMap<Need, ColData>,
     derived: BTreeMap<Need, Derive>,
-    /// Shared buckets of JSON columns, by column and bucket, as text.
     buckets: Vec<((u32, u8), Vector)>,
-    /// The rows of the window entered last, and the derived needs' values for them.
     window: std::ops::Range<usize>,
     window_cols: BTreeMap<Need, ColData>,
-    /// Bytes of the columns read for the whole batch.
     mem: usize,
-    /// What each comparison of a dictionary-coded column found of the
-    /// entries it has tested, by the comparison's address, kept across the
-    /// windows the batch is evaluated in.
+    /// Per-comparison results cached by dictionary code across windows.
     memos: Mutex<DetHashMap<usize, Vec<Option<bool>>>>,
 }
 
@@ -443,7 +405,6 @@ impl<'r> Batch<'r> {
         }
     }
 
-    /// A batch of unsealed rows, deriving each of `needs` from them.
     fn unsealed(rows: &'r [(Pos, Row)], needs: impl IntoIterator<Item = Need>, schema: &EventSchema) -> Batch<'r> {
         let mut b = Batch { rows, ..Batch::new(rows.len(), rows.iter().map(|(p, _)| *p).collect()) };
         for need in needs {
@@ -467,7 +428,6 @@ impl<'r> Batch<'r> {
         self.cols.insert(need, ColData::Vec { v, json });
     }
 
-    /// The index in `buckets` of column `col`'s shared bucket `bucket`, if read.
     fn bucket(&self, col: u32, bucket: u8) -> Option<usize> {
         self.buckets.iter().position(|(k, _)| *k == (col, bucket))
     }
@@ -481,12 +441,11 @@ impl<'r> Batch<'r> {
         Ok(self.buckets.len() - 1)
     }
 
-    /// Derives the values of rows `w` for every derived need, the lookups
-    /// last and in order: a lookup's key or default sees the other needs
-    /// and earlier lookups, and later lookups as null.
+    /// Materializes derived values for row range `w`. Lookups are evaluated last
+    /// in declaration order because `Need::Lookup` sorts after other `Need` variants.
     fn enter(&mut self, w: std::ops::Range<usize>, lookups: &[Lookup]) {
         self.window = w.clone();
-        let parsed: Vec<Vec<Option<Object>>> = self.buckets.iter().map(|(_, v)| objects(v, w.clone())).collect();
+        let parsed: Vec<Vec<Option<Object>>> = self.buckets.iter().map(|(_, v)| parse_objects(v, w.clone())).collect();
         let rows = &self.rows[w.start.min(self.rows.len())..w.end.min(self.rows.len())];
         let derived = std::mem::take(&mut self.derived);
         for (need, data) in self.window_cols.iter_mut() {
@@ -586,7 +545,6 @@ impl<'r> Batch<'r> {
         }
     }
 
-    /// Which of the rows from `start` for which `sel` holds also satisfy `f`.
     fn select(&self, f: &BFilter, sel: &[bool], start: usize) -> Vec<bool> {
         match f {
             filter::Filter::And(fs) => {
@@ -624,7 +582,7 @@ impl<'r> Batch<'r> {
                 };
                 if let Some(ColData::Vec { v: Vector::Str(s), json }) = dict {
                     let mut memos = self.memos.lock().unwrap_or_else(PoisonError::into_inner);
-                    let memo = memos.entry(addr(t)).or_insert_with(|| vec![None; s.dict.len()]);
+                    let memo = memos.entry(test_addr(t)).or_insert_with(|| vec![None; s.dict.len()]);
                     return sel
                         .iter()
                         .zip(start..)
@@ -659,14 +617,12 @@ impl<'r> Batch<'r> {
     }
 }
 
-/// A comparison's identity within its plan.
-fn addr(t: &Test<Json>) -> usize {
+fn test_addr(t: &Test<Json>) -> usize {
     std::ptr::from_ref(t) as usize
 }
 
-/// The heap bytes a batch holds for `v`: its values, and its strings'
-/// dictionary unless the dictionary is shared, as a part's dictionary is
-/// with the part's cached index.
+/// Returns the heap bytes owned exclusively by `v`, excluding dictionaries
+/// shared with the part index cache.
 fn held_bytes(v: &Vector) -> usize {
     v.values_mem_size()
         + match v {
@@ -675,12 +631,9 @@ fn held_bytes(v: &Vector) -> usize {
         }
 }
 
-/// A shared bucket's paths and values in one row.
 type Object = Arc<serde_json::Map<String, Json>>;
 
-/// The objects that rows `w` of a shared bucket's text hold, each distinct
-/// text parsed once.
-fn objects(v: &Vector, w: std::ops::Range<usize>) -> Vec<Option<Object>> {
+fn parse_objects(v: &Vector, w: std::ops::Range<usize>) -> Vec<Option<Object>> {
     let Vector::Str(s) = v else { return vec![None; w.len()] };
     let mut parsed: DetHashMap<u32, Option<Object>> = DetHashMap::default();
     w.map(|i| match s.codes[i] {
@@ -690,7 +643,6 @@ fn objects(v: &Vector, w: std::ops::Range<usize>) -> Vec<Option<Object>> {
     .collect()
 }
 
-/// The comparisons of `f`, in order.
 fn comparisons<'f>(f: &'f BFilter, out: &mut Vec<(&'f BExpr, &'f Test<Json>)>) {
     match f {
         filter::Filter::And(fs) | filter::Filter::Or(fs) => fs.iter().for_each(|x| comparisons(x, out)),
@@ -732,20 +684,21 @@ fn expr_needs(e: &BExpr, out: &mut BTreeSet<Need>, lookups: &[Lookup]) {
     }
 }
 
-/// Whether `f` may hold given what `may` says of each comparison.
-fn may(f: &BFilter, oracle: &mut impl FnMut(&BExpr, &Test<Json>) -> bool) -> bool {
+fn may_match(f: &BFilter, oracle: &mut impl FnMut(&BExpr, &Test<Json>) -> bool) -> bool {
     match f {
-        filter::Filter::And(fs) => fs.iter().all(|x| may(x, oracle)),
-        filter::Filter::Or(fs) => fs.iter().any(|x| may(x, oracle)),
+        filter::Filter::And(fs) => fs.iter().all(|x| may_match(x, oracle)),
+        filter::Filter::Or(fs) => fs.iter().any(|x| may_match(x, oracle)),
         filter::Filter::Not(_) => true,
         filter::Filter::Cmp(e, t) => oracle(e, t),
     }
 }
 
-/// Whether `a` is at most some string whose stored max is `s`. A stored
-/// max may be a cut prefix of the real one, and then only `a`'s first
-/// `s.len()` bytes can be compared.
-fn below_max(a: &str, s: &str, strict: bool) -> bool {
+/// Returns true if `a` can be less than or equal to a string whose stored
+/// maximum prefix is `s`, or strictly less than if `strict` is true.
+///
+/// If `s` might have been truncated at [`part::STAT_PREFIX`] bytes, only the
+/// first `s.len()` bytes of `a` can be compared.
+fn is_below_max(a: &str, s: &str, strict: bool) -> bool {
     if s.len() + 4 > part::STAT_PREFIX {
         a.as_bytes()[..a.len().min(s.len())] <= *s.as_bytes()
     } else if strict {
@@ -755,12 +708,11 @@ fn below_max(a: &str, s: &str, strict: bool) -> bool {
     }
 }
 
-/// Whether a value in `[lo, hi]` may satisfy `t`. String bounds are
-/// prefixes; the upper one may stand for longer strings.
-fn range_may(t: &Test<Json>, lo: &Stat, hi: &Stat) -> bool {
+/// Returns true if a value in `[lo, hi]` can satisfy `t`.
+fn range_may_match(t: &Test<Json>, lo: &Stat, hi: &Stat) -> bool {
     let le = |a: &Json, s: &Stat| -> bool {
         match (a, s) {
-            (Json::String(a), Stat::Str(s)) => below_max(a, s, false),
+            (Json::String(a), Stat::Str(s)) => is_below_max(a, s, false),
             (Json::Number(_), Stat::Int(_) | Stat::Float(_)) => {
                 stat_val(s).total_cmp(&Val::from_json(a)) != Ordering::Less
             }
@@ -790,7 +742,7 @@ fn range_may(t: &Test<Json>, lo: &Stat, hi: &Stat) -> bool {
     };
     let gt_strict = |a: &Json, s: &Stat| -> bool {
         match (a, s) {
-            (Json::String(a), Stat::Str(s)) => below_max(a, s, true),
+            (Json::String(a), Stat::Str(s)) => is_below_max(a, s, true),
             (Json::Number(_), Stat::Int(_) | Stat::Float(_)) => {
                 stat_val(s).total_cmp(&Val::from_json(a)) == Ordering::Greater
             }
@@ -836,7 +788,6 @@ fn key_stat(k: &crate::table::tuple::Key) -> Option<Stat> {
     }
 }
 
-/// Whether a constant value satisfies `t`.
 fn holds(v: &Val, t: &Test<Json>) -> bool {
     !v.is_null() && t.holds(v)
 }
@@ -850,25 +801,17 @@ fn bloom_hash(phys: Phys, a: &Json) -> Option<u64> {
     })
 }
 
-/// Units of work, each about one comparison, that a query does between
-/// checks of its deadline, at which it also yields to other tasks.
 const PACE_WORK: usize = 1 << 16;
 
-/// A query bound to a table, ready to run on parts and unsealed rows.
 struct Plan<'a> {
     schema: &'a EventSchema,
     filter: BFilter,
     lookups: Vec<Lookup>,
     kind: Kind,
-    /// Needs of the filter, read before the rest.
     first: BTreeSet<Need>,
     rest: BTreeSet<Need>,
     positions: bool,
-    /// When the query stops, and its time limit.
     deadline: Option<(tokio::time::Instant, u64)>,
-    /// Rows evaluated between calls to [`Plan::pace`]: about [`PACE_WORK`]
-    /// comparisons', expressions' and needs' worth, which also bounds the
-    /// values a batch derives at once.
     window: usize,
 }
 
@@ -919,9 +862,6 @@ impl<'a> Plan<'a> {
         Plan { schema, filter, lookups, kind, first, rest, positions, deadline, window }
     }
 
-    /// Fails once the query has run past its time limit, and otherwise
-    /// yields to other tasks. Work that never waits calls this every
-    /// [`PACE_WORK`] units or so.
     async fn pace(&self) -> Result<()> {
         if let Some((at, max_ms)) = self.deadline
             && tokio::time::Instant::now() >= at
@@ -932,8 +872,6 @@ impl<'a> Plan<'a> {
         Ok(())
     }
 
-    /// The work of testing a granule's statistics and blooms against the
-    /// filter, which tests every value of an `in` list.
     fn granule_work(&self) -> usize {
         let mut cmps = Vec::new();
         comparisons(&self.filter, &mut cmps);
@@ -941,12 +879,10 @@ impl<'a> Plan<'a> {
     }
 }
 
-/// Work done since a query last paced itself.
 #[derive(Default)]
 struct Work(usize);
 
 impl Work {
-    /// Counts `n` units, pacing the plan once they add up to [`PACE_WORK`].
     async fn add(&mut self, plan: &Plan<'_>, n: usize) -> Result<()> {
         self.0 += n;
         if self.0 >= PACE_WORK {
@@ -967,7 +903,6 @@ struct BoundAgg {
     func: AggFn,
     of: Option<BExpr>,
     filter: Option<BFilter>,
-    /// Steps of a funnel or conditions of a retention aggregate.
     conditions: Vec<BFilter>,
 }
 
@@ -996,7 +931,6 @@ fn bind_stage(b: &Binder<'_>, s: &Stage) -> Result<BoundStage> {
     Ok(BoundStage { group_by, aggregates })
 }
 
-/// A group: its key values, its states, and the bytes charged for each.
 struct Group {
     keys: Vec<Val>,
     states: Vec<State>,
@@ -1004,7 +938,6 @@ struct Group {
     state_mem: usize,
 }
 
-/// Group states of one aggregation stage, and the memory they hold.
 struct Groups {
     map: DetHashMap<Vec<u8>, Group>,
     mem: usize,
@@ -1020,7 +953,6 @@ impl Groups {
         Groups { map: DetHashMap::default(), mem: 0, max_mem }
     }
 
-    /// Accounts for state that held `old` bytes holding `new`, failing past the limit.
     fn charge(&mut self, old: usize, new: usize) -> Result<()> {
         self.mem = (self.mem + new).saturating_sub(old);
         if self.mem > self.max_mem {
@@ -1032,7 +964,6 @@ impl Groups {
         Ok(())
     }
 
-    /// Applies `f` to the states of the group with `keys`, creating it.
     fn update(&mut self, keys: Vec<Val>, fns: &[&AggFn], f: impl FnOnce(&mut [State])) -> Result<()> {
         let mut kb = Vec::new();
         for k in &keys {
@@ -1059,7 +990,6 @@ impl Groups {
         self.mem > self.max_mem
     }
 
-    /// Merges the groups of `o`, a partial result of the same stage.
     fn absorb(&mut self, o: Groups) -> Result<()> {
         for (kb, og) in o.map {
             let (old, new) = match self.map.entry(kb) {
@@ -1081,7 +1011,6 @@ impl Groups {
         Ok(())
     }
 
-    /// Finalized rows sorted by group key.
     fn finish(self, fns: &[&AggFn]) -> Vec<Vec<Val>> {
         let mut rows: Vec<(Vec<u8>, Vec<Val>)> = self
             .map
@@ -1097,12 +1026,11 @@ impl Groups {
     }
 }
 
-/// Rows kept for rows mode: the best `limit + 1` by order key and position.
-struct Kept {
+/// Retains the top `limit + 1` rows by sort key and position.
+struct TopRows {
     rows: Vec<(Vec<Val>, Pos, Vec<Val>)>,
     desc: Vec<bool>,
     limit: usize,
-    /// Bytes the rows hold, and the most they may.
     mem: usize,
     max_mem: usize,
 }
@@ -1111,9 +1039,9 @@ fn row_mem(key: &[Val], row: &[Val]) -> usize {
     64 + key.iter().chain(row).map(|v| v.mem_size() + 32).sum::<usize>()
 }
 
-impl Kept {
-    fn new(desc: Vec<bool>, limit: usize, max_mem: usize) -> Kept {
-        Kept { rows: Vec::new(), desc, limit, mem: 0, max_mem }
+impl TopRows {
+    fn new(desc: Vec<bool>, limit: usize, max_mem: usize) -> TopRows {
+        TopRows { rows: Vec::new(), desc, limit, mem: 0, max_mem }
     }
 
     fn cmp(desc: &[bool], a: (&[Val], Pos), b: (&[Val], Pos)) -> Ordering {
@@ -1148,28 +1076,22 @@ impl Kept {
 
     fn trim(&mut self) {
         let desc = std::mem::take(&mut self.desc);
-        self.rows.sort_by(|a, b| Kept::cmp(&desc, (&a.0, a.1), (&b.0, b.1)));
+        self.rows.sort_by(|a, b| TopRows::cmp(&desc, (&a.0, a.1), (&b.0, b.1)));
         self.desc = desc;
         self.rows.truncate(self.limit + 1);
         self.mem = self.rows.iter().map(|(k, _, r)| row_mem(k, r)).sum();
     }
 }
 
-/// A query's progress over the rows it has read: the whole query's, or one
-/// part's partial result, which [`Run::absorb`] merges.
 struct Run<'p, 'a> {
     plan: &'p Plan<'a>,
     stats: Stats,
     groups: Option<Groups>,
-    kept: Option<Kept>,
-    /// Rows offered to `kept`: those past the filter and the cursor.
+    kept: Option<TopRows>,
     offered: u64,
-    /// Whether rows past those in `kept` are known to exist unread.
     more: bool,
     agg_fns: Vec<AggFn>,
-    /// Bytes the state, with the columns of the batch being read, may hold.
     max_mem: usize,
-    /// Whether a batch's columns took the state past `max_mem`.
     overflowed: bool,
 }
 
@@ -1177,7 +1099,7 @@ impl<'p, 'a> Run<'p, 'a> {
     fn new(plan: &'p Plan<'a>, max_mem: usize) -> Run<'p, 'a> {
         let (groups, kept, agg_fns) = match &plan.kind {
             Kind::Rows { order, limit, .. } => {
-                (None, Some(Kept::new(order.iter().map(|(_, d)| *d).collect(), *limit, max_mem)), Vec::new())
+                (None, Some(TopRows::new(order.iter().map(|(_, d)| *d).collect(), *limit, max_mem)), Vec::new())
             }
             Kind::Aggregate { first, .. } => {
                 (Some(Groups::new(max_mem)), None, first.aggregates.iter().map(|a| a.func.clone()).collect())
@@ -1196,13 +1118,12 @@ impl<'p, 'a> Run<'p, 'a> {
         }
     }
 
-    /// Whether the run failed for holding more than its memory limit.
     fn full(&self) -> bool {
-        self.overflowed || self.groups.as_ref().is_some_and(Groups::full) || self.kept.as_ref().is_some_and(Kept::full)
+        self.overflowed
+            || self.groups.as_ref().is_some_and(Groups::full)
+            || self.kept.as_ref().is_some_and(TopRows::full)
     }
 
-    /// Fails once a batch holding `batch` bytes of columns takes the state
-    /// past the memory limit.
     fn hold(&mut self, batch: usize) -> Result<()> {
         let state = self.groups.as_ref().map_or(0, |g| g.mem) + self.kept.as_ref().map_or(0, |k| k.mem);
         if state.saturating_add(batch) > self.max_mem {
@@ -1215,7 +1136,6 @@ impl<'p, 'a> Run<'p, 'a> {
         Ok(())
     }
 
-    /// Merges `o`, a partial result over other rows.
     fn absorb(&mut self, o: Run<'_, '_>) -> Result<()> {
         self.stats.add(&o.stats);
         self.offered += o.offered;
@@ -1230,8 +1150,6 @@ impl<'p, 'a> Run<'p, 'a> {
         Ok(())
     }
 
-    /// The rows of `b` among `base` for which `f` holds, evaluated a window
-    /// at a time.
     async fn select(&self, b: &mut Batch<'_>, f: &BFilter, base: &[bool]) -> Result<Vec<bool>> {
         let mut out = Vec::with_capacity(b.n);
         for start in (0..b.n).step_by(self.plan.window) {
@@ -1247,8 +1165,6 @@ impl<'p, 'a> Run<'p, 'a> {
         Ok(out)
     }
 
-    /// Feeds the selected rows of a batch to the aggregation or row set, a
-    /// window at a time.
     async fn consume(&mut self, b: &mut Batch<'_>, sel: &[bool]) -> Result<()> {
         for start in (0..b.n).step_by(self.plan.window) {
             let end = (start + self.plan.window).min(b.n);
@@ -1261,7 +1177,6 @@ impl<'p, 'a> Run<'p, 'a> {
         Ok(())
     }
 
-    /// Feeds the rows from `start` for which `sel` holds.
     fn consume_window(&mut self, b: &Batch, sel: &[bool], start: usize) -> Result<()> {
         let plan = &self.plan;
         let rows = || (start..start + sel.len()).filter(|i| sel[i - start]);
@@ -1272,7 +1187,7 @@ impl<'p, 'a> Run<'p, 'a> {
                     let key: Vec<Val> = order.iter().map(|(e, _)| b.val(e, i)).collect();
                     let pos = b.pos.get(i).copied().unwrap_or_default();
                     if let Some((ak, ap)) = after
-                        && Kept::cmp(&kept.desc, (&key, pos), (ak, *ap)) != Ordering::Greater
+                        && TopRows::cmp(&kept.desc, (&key, pos), (ak, *ap)) != Ordering::Greater
                     {
                         continue;
                     }
@@ -1330,7 +1245,6 @@ impl<'p, 'a> Run<'p, 'a> {
         Ok(())
     }
 
-    /// Registers the lookups the plan needs for `b` to derive.
     fn lookups(&self, b: &mut Batch<'_>) {
         for k in 0..self.plan.lookups.len() {
             let need = Need::Lookup(k);
@@ -1340,7 +1254,6 @@ impl<'p, 'a> Run<'p, 'a> {
         }
     }
 
-    /// Runs the query over unsealed rows.
     async fn unsealed(&mut self, rows: &[(Pos, Row)]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -1353,7 +1266,6 @@ impl<'p, 'a> Run<'p, 'a> {
         self.consume(&mut b, &sel).await
     }
 
-    /// Reads need `need` of granules `g` of part `r` into `b`.
     async fn read_need(
         &self,
         rd: &Reading<'_>,
@@ -1444,9 +1356,7 @@ impl<'p, 'a> Run<'p, 'a> {
             .collect())
     }
 
-    /// Whether a part can hold matching rows, by what its metadata and
-    /// dictionaries say of each comparison.
-    async fn part_may(&self, rd: &Reading<'_>, r: &PartRef, meta: &PartMeta) -> Result<bool> {
+    async fn part_may_match(&self, rd: &Reading<'_>, r: &PartRef, meta: &PartMeta) -> Result<bool> {
         let mut dicts: BTreeMap<usize, Arc<Vec<String>>> = BTreeMap::new();
         let mut cols = BTreeSet::new();
         collect_cols(&self.plan.filter, &mut cols);
@@ -1458,27 +1368,24 @@ impl<'p, 'a> Run<'p, 'a> {
                 dicts.insert(ci, d);
             }
         }
-        // Whether some entry of its column's dictionary satisfies each
-        // comparison, by the comparison's address. A dictionary is scanned
-        // only for comparisons that pruning reaches: an unknown one stops a
-        // pass, is scanned, and pruning runs again.
+        // Scan dictionaries lazily only for comparisons reached during pruning.
         let mut dict_hits: DetHashMap<usize, bool> = DetHashMap::default();
         let mut work = Work::default();
         let schema = self.plan.schema;
         loop {
             let mut by_dict = false;
             let mut unknown: Option<(usize, Test<Json>, usize)> = None;
-            let ok = may(&self.plan.filter, &mut |e, t| match e {
+            let ok = may_match(&self.plan.filter, &mut |e, t| match e {
                 BExpr::Col(id) => match meta.find(&ColRef::User(*id)) {
                     None => holds(&default_val(schema.column_by_id(*id)), t),
                     Some(ci) if meta.cols[ci].nonnull == 0 => false,
-                    Some(ci) => match (dict_hits.get(&addr(t)), dicts.get(&ci)) {
+                    Some(ci) => match (dict_hits.get(&test_addr(t)), dicts.get(&ci)) {
                         (Some(hit), _) => {
                             by_dict |= !hit;
                             *hit
                         }
                         (None, Some(_)) => {
-                            unknown.get_or_insert_with(|| (addr(t), t.clone(), ci));
+                            unknown.get_or_insert_with(|| (test_addr(t), t.clone(), ci));
                             true
                         }
                         (None, None) => true,
@@ -1509,7 +1416,6 @@ impl<'p, 'a> Run<'p, 'a> {
         }
     }
 
-    /// The granules of a part that may hold matching rows.
     async fn granules(&self, rd: &Reading<'_>, r: &PartRef, meta: &PartMeta, mask: &Runs) -> Result<Vec<bool>> {
         let mut cols = BTreeSet::new();
         collect_cols(&self.plan.filter, &mut cols);
@@ -1545,9 +1451,9 @@ impl<'p, 'a> Run<'p, 'a> {
                 (Ok(a), Ok(b)) if a.len() == sort_ids.len() && b.len() == sort_ids.len() => Some((a, b)),
                 _ => None,
             };
-            let stat_ok = may(&self.plan.filter, &mut |e, t| {
+            let stat_ok = may_match(&self.plan.filter, &mut |e, t| {
                 let stat = |s: &GranStat| match (&s.min, &s.max) {
-                    (Some(lo), Some(hi)) => range_may(t, lo, hi),
+                    (Some(lo), Some(hi)) => range_may_match(t, lo, hi),
                     _ => false,
                 };
                 match e {
@@ -1578,7 +1484,7 @@ impl<'p, 'a> Run<'p, 'a> {
                                 && let Some(k) = sort_ids.iter().position(|s| s == id)
                                 && lo[..k] == hi[..k]
                                 && let (Some(l), Some(h)) = (key_stat(&lo[k]), key_stat(&hi[k]))
-                                && !range_may(t, &l, &h)
+                                && !range_may_match(t, &l, &h)
                             {
                                 return false;
                             }
@@ -1606,9 +1512,8 @@ impl<'p, 'a> Run<'p, 'a> {
         Ok(out)
     }
 
-    /// Runs the query over part `r`.
     async fn part(&mut self, rd: &Reading<'_>, r: &PartRef, meta: Arc<PartMeta>) -> Result<()> {
-        if !self.part_may(rd, r, &meta).await? {
+        if !self.part_may_match(rd, r, &meta).await? {
             return Ok(());
         }
         let mask = rd.mask(r).await?;
@@ -1635,11 +1540,8 @@ impl<'p, 'a> Run<'p, 'a> {
         Ok(())
     }
 
-    /// The most rows of part `r` that a granule run reads at once: a
-    /// quarter of the memory limit at the widths the run's columns decode
-    /// to, so that the columns of a partial result's runs fit its share of
-    /// the limit. Rebuilt JSON objects are counted at the part's average
-    /// row size. A run reads one granule at least.
+    /// Returns the maximum rows of part `r` to decode in a single granule run
+    /// so decoded columns use at most 25% of `max_mem`.
     fn run_rows(&self, r: &PartRef, meta: &PartMeta) -> u64 {
         let width = |ci: usize| match meta.cols[ci].phys {
             Phys::Int | Phys::Float => 16,
@@ -1661,17 +1563,11 @@ impl<'p, 'a> Run<'p, 'a> {
         (self.max_mem / 4 / per_row.max(1)) as u64
     }
 
-    /// Whether the largest granule of part `r` fits the memory limit at the
-    /// widths [`Run::run_rows`] counts, so that a partial result can read the
-    /// part without overflowing its share.
     fn fits(&self, r: &PartRef, meta: &PartMeta) -> bool {
         let largest = meta.starts.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
         largest <= 4 * self.run_rows(r, meta)
     }
 
-    /// Runs the query over granules `g` of part `r`: reads the filter's
-    /// needs, selects rows, and reads the other needs only if some row
-    /// is selected.
     async fn granule_run(
         &mut self,
         rd: &Reading<'_>,
@@ -1743,21 +1639,18 @@ fn collect_paths(f: &BFilter, out: &mut BTreeSet<(u32, String)>) {
     }
 }
 
-/// Whether part `r` may hold rows matching `f`, by its reference alone.
-fn ref_may(f: &BFilter, r: &PartRef, time_id: u32) -> bool {
-    may(f, &mut |e, t| match e {
-        BExpr::Col(id) if *id == time_id => range_may(t, &Stat::Int(r.min_time), &Stat::Int(r.max_time)),
+fn ref_may_match(f: &BFilter, r: &PartRef, time_id: u32) -> bool {
+    may_match(f, &mut |e, t| match e {
+        BExpr::Col(id) if *id == time_id => range_may_match(t, &Stat::Int(r.min_time), &Stat::Int(r.max_time)),
         _ => true,
     })
 }
 
-/// The order of a rows query whose first key is the time column, which
-/// bounds where in a part's time range its rows fall in the page.
+/// Time ordering of a rows query whose leading sort key is the time column.
 #[derive(Clone, Copy)]
 struct ByTime {
     desc: bool,
-    /// Whether time is the only key, so rows of one time follow one another
-    /// by position.
+    /// True if the time column is the only sort key, so ties are ordered by [`Pos`].
     alone: bool,
 }
 
@@ -1772,41 +1665,30 @@ impl ByTime {
         }
     }
 
-    /// Whether time `a` comes before time `b`.
     fn before(self, a: i64, b: i64) -> bool {
         if self.desc { a > b } else { a < b }
     }
 
-    /// Bounds on the times of a part's first and last rows in this order.
     fn ends(self, r: &PartRef) -> (i64, i64) {
         if self.desc { (r.max_time, r.min_time) } else { (r.min_time, r.max_time) }
     }
 
-    /// Whether every row of part `r` comes after the row at time `t` and
-    /// position `p`, which `r` does not hold.
     fn all_after(self, r: &PartRef, t: i64, p: Pos) -> bool {
         let first = self.ends(r).0;
         self.before(t, first) || (first == t && self.alone && r.min_pos > p)
     }
 
-    /// Whether some row of part `r` may come after the row at time `t` and
-    /// position `p`.
     fn some_after(self, r: &PartRef, t: i64, p: Pos) -> bool {
         let last = self.ends(r).1;
         self.before(t, last) || (last == t && (!self.alone || r.max_pos > p))
     }
 
-    /// The order parts are read in: by the time of their first rows, then
-    /// by position, so that once a part's rows all come after a row, so do
-    /// every later part's.
     fn read_order(self, a: &PartRef, b: &PartRef) -> Ordering {
         let (x, y) = (self.ends(a).0, self.ends(b).0);
         (if self.desc { y.cmp(&x) } else { x.cmp(&y) }).then(a.min_pos.cmp(&b.min_pos))
     }
 }
 
-/// The time and position of a rows query's cursor, when its first key is
-/// a time.
 fn cursor_at(kind: &Kind) -> Option<(i64, Pos)> {
     match kind {
         Kind::Rows { after: Some((key, pos)), .. } => match key.first() {
@@ -1817,19 +1699,14 @@ fn cursor_at(kind: &Kind) -> Option<(i64, Pos)> {
     }
 }
 
-/// How a rows query by time reads its parts, sorted by
-/// [`ByTime::read_order`]: it starts reading a part only while its page may
-/// need it, and stops once the rows read decide the page.
+/// Schedules part reads for time-ordered row queries and stops early once the
+/// current page is complete.
 struct Frontier {
     by: ByTime,
     limit: usize,
-    /// Whether some part from each index on certainly holds a row past the
-    /// cursor that the query selects.
+    /// For each index `i`, true if any part in `refs[i..]` is guaranteed to contain a matching row after the cursor.
     certain: Vec<bool>,
-    /// Rows of the parts read so far, and unsealed rows.
     scanned: u64,
-    /// The times of the rows kept when [`Frontier::done`] last looked, in
-    /// the page's order.
     times: Vec<i64>,
 }
 
@@ -1842,11 +1719,9 @@ impl Frontier {
         Frontier { by, limit, certain: c, scanned: unsealed, times: Vec::new() }
     }
 
-    /// Whether the rows read before part `i` decide the page: every row of
-    /// the parts from `i` on comes after its last row, and either more rows
-    /// than it holds were read or one of those parts certainly holds one,
-    /// which `run` then notes.
-    fn done(&mut self, run: &mut Run<'_, '_>, refs: &[&PartRef], i: usize) -> bool {
+    /// Returns true if all rows in `refs[i..]` sort after the `limit`-th kept row
+    /// and the existence of a next page is already determined.
+    fn is_done(&mut self, run: &mut Run<'_, '_>, refs: &[&PartRef], i: usize) -> bool {
         let Some(kept) = run.kept.as_mut() else { return false };
         kept.trim();
         self.times.clear();
@@ -1861,11 +1736,10 @@ impl Frontier {
         done
     }
 
-    /// Whether to start reading part `next` while parts `i..next` are read:
-    /// whether it may hold rows of the page, supposing each part being read
-    /// selects rows at the rate the rows read so far were, all at its last
-    /// time.
-    fn wants(&self, run: &Run<'_, '_>, refs: &[&PartRef], i: usize, next: usize) -> bool {
+    /// Estimates whether part `next` can contribute to the page while `refs[i..next]`
+    /// are in flight, assuming in-flight parts match at the observed selectivity rate
+    /// and their matching rows fall at the end of each part's time range.
+    fn should_read(&self, run: &Run<'_, '_>, refs: &[&PartRef], i: usize, next: usize) -> bool {
         let by = self.by;
         let rate = if self.scanned == 0 { 1.0 } else { run.offered as f64 / self.scanned as f64 };
         let mut reading: Vec<(i64, f64)> =
@@ -1873,9 +1747,6 @@ impl Frontier {
         reading.sort_by(|a, b| if by.desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) });
         let need = (self.limit + usize::from(!self.certain[next])) as f64;
         let later = |a: i64, b: i64| if by.before(a, b) { b } else { a };
-        // The earliest time by which `need` rows are expected: for each
-        // prefix of the parts being read, the later of its last time and
-        // that of the kept row that makes up the rest.
         let mut bound = None;
         let mut expected = 0.0;
         for j in 0..=reading.len() {
@@ -1912,13 +1783,13 @@ fn cursor_decode(c: &str, n: usize) -> Result<(Vec<Val>, Pos)> {
     Ok((keys, Pos { version, ordinal }))
 }
 
-/// A query's input: the references and unsealed rows it reads.
+/// Part references and unsealed rows read by a query.
 pub struct Input {
     pub refs: Vec<PartRef>,
     pub unsealed: Vec<(Pos, Row)>,
 }
 
-/// Reads the references and unsealed rows a query over `[from, to)` needs,
+/// Reads the part references for `[from, to)` and all unsealed rows of table `s`,
 /// recording both in the transaction's read set.
 pub async fn input(txn: &mut Txn, s: &EventSchema, from: i64, to: i64) -> Result<Input> {
     if txn.inserts_events(s.id) {
@@ -1944,10 +1815,6 @@ pub async fn input(txn: &mut Txn, s: &EventSchema, from: i64, to: i64) -> Result
     Ok(Input { refs, unsealed })
 }
 
-/// Builds the maps of the query's lookups at the transaction's snapshot:
-/// one per table and value column, which every lookup of them shares,
-/// filled in one pass over each table. The bytes the maps hold are charged
-/// to `lookup_max_bytes`.
 async fn lookup_maps(txn: &mut Txn, q: &Query, limits: &Limits) -> Result<Vec<(String, Arc<LookupMap>)>> {
     let mut values: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for l in q.lookups.values() {
@@ -1967,7 +1834,7 @@ async fn lookup_maps(txn: &mut Txn, q: &Query, limits: &Limits) -> Result<Vec<(S
             let id = ts
                 .column(value)
                 .map(|c| c.id)
-                .ok_or_else(|| Error::invalid(format!("lookup table {table:?} has no column {value:?}")))?;
+                .ok_or_else(|| Error::invalid(format!("lookup table {table:?} does not have column {value:?}")))?;
             cols.push((value, id, LookupMap::default()));
         }
         crate::table::each_row(txn, &ts, |row| {
@@ -1989,7 +1856,7 @@ async fn lookup_maps(txn: &mut Txn, q: &Query, limits: &Limits) -> Result<Vec<(S
     Ok(q.lookups.iter().map(|(name, l)| (name.clone(), maps[&(l.table.as_str(), l.value.as_str())].clone())).collect())
 }
 
-/// Runs `q` on table `s` at the transaction's snapshot.
+/// Executes query `q` on event table `s` at `txn`'s snapshot.
 pub async fn run(
     shared: &Shared,
     db: &str,
@@ -2069,8 +1936,6 @@ async fn run_within(
         Mode::Aggregate { first, then } => Kind::Aggregate { first: bind_stage(&binder, first)?, then: then.clone() },
     };
     let by_time = ByTime::of(&kind, &time);
-    // The rows of a page by time that follow its cursor are no earlier
-    // than the cursor's time.
     let past = by_time.and(cursor_at(&kind));
     let mut from = shared.store_now_ms().map_or(q.from, |now| q.from.max(s.retained_from(now as i64)));
     let mut to = q.to;
@@ -2098,7 +1963,7 @@ async fn run_within(
         .refs
         .iter()
         .filter(|r| {
-            let may = ref_may(&plan.filter, r, s.time_id())
+            let may = ref_may_match(&plan.filter, r, s.time_id())
                 && by_time.zip(past).is_none_or(|(by, (t, p))| by.some_after(r, t, p));
             if !may {
                 probe::hit(Probe::PartPrunedByRef);
@@ -2118,12 +1983,9 @@ async fn run_within(
         };
         Frontier::new(by, q.limit, &refs, certain, input.unsealed.len() as u64)
     });
-    // Parts are read concurrently into partial results, each holding at most
-    // its share of the state limit, and merged in the order they are read
-    // in, so the merged result grows as a serial read's would and the limit
-    // does not depend on which part arrives first. A part whose groups, or
-    // the columns it reads at once, outgrow its share is read again into the
-    // merged result at its turn; rows mode holds rows the same way.
+    // Read parts concurrently into partial runs bounded to an equal share of
+    // `max_memory_bytes` and merge them in deterministic part order. If a part
+    // exceeds its share, re-read it directly into `run`.
     let n = shared.cfg.event_read_concurrency.max(1);
     let share = limits.max_memory_bytes / n;
     let read = |i: usize| {
@@ -2132,7 +1994,7 @@ async fn run_within(
             let read = match rd.meta(r).await {
                 Ok(meta) if !partial.fits(r, &meta) => {
                     partial.overflowed = true;
-                    Err(Error::TooLarge("a granule outgrows a partial result's share".into()))
+                    Err(Error::TooLarge("a granule exceeds a partial result's memory share".into()))
                 }
                 Ok(meta) => partial.part(rd, r, meta).await,
                 Err(e) => Err(e),
@@ -2143,13 +2005,13 @@ async fn run_within(
     let mut reads = FuturesOrdered::new();
     let mut launched = 0;
     for (i, r) in refs.iter().enumerate() {
-        if frontier.as_mut().is_some_and(|f| f.done(&mut run, &refs, i)) {
+        if frontier.as_mut().is_some_and(|f| f.is_done(&mut run, &refs, i)) {
             probe::hit(Probe::RowPageStoppedEarly);
             break;
         }
         while launched < refs.len()
             && reads.len() < n
-            && (launched == i || frontier.as_ref().is_none_or(|f| f.wants(&run, &refs, i, launched)))
+            && (launched == i || frontier.as_ref().is_none_or(|f| f.should_read(&run, &refs, i, launched)))
         {
             reads.push_back(read(launched));
             launched += 1;
@@ -2250,7 +2112,6 @@ fn sort_rows(names: &[String], rows: &mut [Vec<Val>], order: &[super::query::Ord
     Ok(())
 }
 
-/// Aggregates first-stage rows, whose columns are `names`, by `s`.
 fn second_stage(
     names: &[String],
     rows: Vec<Vec<Val>>,
@@ -2275,7 +2136,7 @@ fn second_stage(
     let mut aggs = Vec::new();
     for a in &s.aggregates {
         if a.filter.is_some() || matches!(a.func, AggFn::WindowFunnel { .. } | AggFn::Retention(_)) {
-            return Err(Error::invalid("second-stage aggregates take no where, funnels or retention"));
+            return Err(Error::invalid("second-stage aggregates do not support where, funnels, or retention"));
         }
         aggs.push((a.name.clone(), a.func.clone(), a.of.as_ref().map(bind).transpose()?));
     }
@@ -2324,8 +2185,7 @@ fn bind_out(names: &[String], e: &Expr) -> Result<BExpr> {
     }
 }
 
-/// The rows of `r` matching `f` that its mask does not already delete, as
-/// sorted offsets; used by deletes.
+/// Returns the sorted row offsets of live rows in part `r` that match `f` within `[from, to)`.
 pub async fn matching_rows(
     shared: &Shared,
     db: &str,
@@ -2343,7 +2203,7 @@ pub async fn matching_rows(
         filter::Filter::Cmp(time, Test::Lt(json!(to))),
         binder.filter(f)?,
     ]);
-    if !ref_may(&filter, r, s.time_id()) {
+    if !ref_may_match(&filter, r, s.time_id()) {
         return Ok(Vec::new());
     }
     let plan = Plan::new(s, filter, Vec::new(), only_filter(), None);
@@ -2351,7 +2211,7 @@ pub async fn matching_rows(
     let read_stats = ReadStats::default();
     let rd = Reading { shared, db, cache: Caching::Shared, stats: &read_stats };
     let meta = rd.meta(r).await?;
-    if !run.part_may(&rd, r, &meta).await? {
+    if !run.part_may_match(&rd, r, &meta).await? {
         return Ok(Vec::new());
     }
     let mask = rd.mask(r).await?;
@@ -2374,13 +2234,13 @@ pub async fn matching_rows(
     Ok(out)
 }
 
-/// Whether unsealed row `row` matches `f` within `[from, to)`; used by deletes.
-/// Checks that `f` names only columns of `s`, as a query would.
+/// Validates that `f` references valid columns and types in `s`.
 pub fn check_filter(s: &EventSchema, f: &Filter) -> Result<()> {
     let names = BTreeMap::new();
     Binder { schema: s, lookups: &names }.filter(f).map(drop)
 }
 
+/// Returns true if unsealed row `row` falls within `[from, to)` and matches `f`.
 pub fn row_matches(s: &EventSchema, row: &Row, f: &Filter, from: i64, to: i64) -> Result<bool> {
     let names = BTreeMap::new();
     let binder = Binder { schema: s, lookups: &names };
@@ -2408,7 +2268,6 @@ pub fn row_matches(s: &EventSchema, row: &Row, f: &Filter, from: i64, to: i64) -
     Ok(b.select(&run.plan.filter, &[true], 0)[0])
 }
 
-/// The kind of a plan that only selects rows, as deletes do.
 fn only_filter() -> Kind {
     Kind::Aggregate { first: BoundStage { group_by: Vec::new(), aggregates: Vec::new() }, then: None }
 }
@@ -2417,10 +2276,8 @@ fn only_filter() -> Kind {
 mod tests {
     use super::*;
 
-    /// Keys chosen to share a hash slot cost a lookup map what any keys do:
-    /// it finds entries by sorting, not by a hash an attacker can predict.
     #[test]
-    fn lookup_maps_resist_colliding_keys() {
+    fn lookup_map_resists_hash_collisions() {
         let keys = |n: usize, collide: bool| -> Vec<Vec<u8>> {
             let window = (n + n / 2 + 1).next_power_of_two() as u64 / 8;
             (0i64..)
@@ -2445,9 +2302,9 @@ mod tests {
     }
 
     #[test]
-    fn lookup_maps_find_the_last_value_of_each_key() {
+    fn lookup_map_returns_last_value_for_key() {
         let mut m = LookupMap::default();
-        assert_eq!(m.get(&Val::Int(1).canonical_bytes()), None, "an empty map finds nothing");
+        assert_eq!(m.get(&Val::Int(1).canonical_bytes()), None, "empty map returns None");
         let keys: Vec<Val> = (0..1000).map(Val::Int).chain([Val::Str("a".into()), Val::Float(0.5)]).collect();
         for (i, k) in keys.iter().enumerate() {
             m.push(&k.canonical_bytes(), &Val::Str(format!("v{i}"))).unwrap();

@@ -1,19 +1,18 @@
-//! JSON columns as paths (SPEC §5.13): objects are flattened into leaf
-//! paths when written to a part and rebuilt when read.
+//! JSON column path flattening (SPEC §5.13). Objects are flattened into leaf
+//! paths in parts and reconstructed on read.
 //!
-//! A leaf is a scalar, an array or an empty object. Nulls inside objects
-//! are dropped when a row is inserted, so a path is either present with a
-//! non-null leaf or absent, in unsealed rows and parts alike.
+//! A leaf is a scalar, an array, or an empty object. Null object fields are
+//! removed during insertion so that every stored path has a non-null leaf
+//! value in both unsealed rows and parts.
 
 use serde_json::{Map, Value as Json};
 
-/// Shared buckets per JSON column for paths that are not their own columns.
+/// Number of shared hash buckets per JSON column for non-subcolumn paths.
 pub const BUCKETS: u8 = 32;
 
-/// Prepares an inserted value: removes null members of objects
-/// (recursively; array elements are kept), stores `-0.0` as `0.0` so that it
-/// equals zero in every comparison, and rejects integers beyond the signed
-/// 64-bit range, which queries could not compare exactly.
+/// Normalizes an inserted JSON value in place by recursively removing null
+/// object fields, converting `-0.0` to `0.0`, and rejecting integers outside
+/// the signed 64-bit range.
 pub fn normalize(v: &mut Json) -> Result<(), String> {
     match v {
         Json::Object(o) => {
@@ -32,7 +31,7 @@ pub fn normalize(v: &mut Json) -> Result<(), String> {
     }
 }
 
-/// The canonical text of a path: a JSON array of its segments.
+/// Encodes path `segments` as a canonical JSON array string.
 pub fn path_key(segments: &[String]) -> String {
     serde_json::to_string(segments).unwrap_or_default()
 }
@@ -41,8 +40,8 @@ pub fn path_segments(key: &str) -> Option<Vec<String>> {
     serde_json::from_str(key).ok()
 }
 
-/// The bytes of `o`'s leaves as an object keyed by canonical path, the most
-/// that the path and shared bucket columns of a part hold for `o`.
+/// Returns the serialized byte length of `o`'s leaves as a JSON object keyed
+/// by canonical path.
 pub fn flattened_len(o: &Map<String, Json>) -> usize {
     struct Count(usize);
     impl std::io::Write for Count {
@@ -63,7 +62,7 @@ pub fn flattened_len(o: &Map<String, Json>) -> usize {
     n.0
 }
 
-/// Leaf paths of `o` as canonical keys, with their values.
+/// Flattens `o` into pairs of canonical path key and leaf value.
 pub fn flatten(o: &Map<String, Json>) -> Vec<(String, &Json)> {
     fn walk<'a>(o: &'a Map<String, Json>, prefix: &mut Vec<String>, out: &mut Vec<(String, &'a Json)>) {
         for (k, v) in o {
@@ -81,7 +80,8 @@ pub fn flatten(o: &Map<String, Json>) -> Vec<(String, &Json)> {
     out
 }
 
-/// The leaf at `path` in `o`, if present.
+/// Returns the leaf value at `path` in `o`, or `None` if `path` is absent or
+/// points to a non-empty object.
 pub fn leaf<'a>(o: &'a Json, path: &[String]) -> Option<&'a Json> {
     let mut cur = o;
     for seg in path {
@@ -94,7 +94,7 @@ pub fn leaf<'a>(o: &'a Json, path: &[String]) -> Option<&'a Json> {
     }
 }
 
-/// Rebuilds an object from leaf paths.
+/// Reconstructs a nested JSON object from leaf paths and values.
 pub fn unflatten(leaves: impl IntoIterator<Item = (Vec<String>, Json)>) -> Map<String, Json> {
     fn insert(m: &mut Map<String, Json>, path: &[String], v: Json) {
         match path {
@@ -116,19 +116,19 @@ pub fn unflatten(leaves: impl IntoIterator<Item = (Vec<String>, Json)>) -> Map<S
     root
 }
 
-/// The shared bucket of a path that is not a column of its own.
+/// Returns the shared bucket index in `0..BUCKETS` for canonical path `key`.
 pub fn bucket(key: &str) -> u8 {
     (crate::util::bloom::key_hash(key.as_bytes()) % BUCKETS as u64) as u8
 }
 
-/// How the values of one path are stored.
+/// Storage type of values for a single JSON path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum JType {
     Int,
     Float,
     Str,
     Bool,
-    /// Mixed or non-scalar values, stored as JSON text.
+    /// Mixed-type or non-scalar values encoded as JSON text.
     Dyn,
 }
 
@@ -143,7 +143,6 @@ impl JType {
         }
     }
 
-    /// The type of a path holding values of both types.
     pub fn join(self, other: JType) -> JType {
         if self == other { self } else { JType::Dyn }
     }
@@ -163,7 +162,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn flatten_then_unflatten_roundtrips() {
+    fn flatten_and_unflatten_roundtrip() {
         let mut v = json!({"a": {"b": 1, "c": {"d": [1, null]}, "e": {}}, "f": null, "g": "x", "h.i": true});
         normalize(&mut v).unwrap();
         let o = v.as_object().unwrap();
@@ -180,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizing_zeroes_negative_zero_and_rejects_huge_integers() {
+    fn normalize_canonicalizes_negative_zero_and_rejects_u64() {
         let mut v = json!({"z": -0.0, "a": [-0.0, {"n": null}], "i": -3});
         normalize(&mut v).unwrap();
         assert_eq!(v, json!({"z": 0.0, "a": [0.0, {}], "i": -3}));
@@ -191,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn types_join_to_dynamic() {
+    fn jtype_join_and_tags() {
         assert_eq!(JType::of(&json!(1)), JType::Int);
         assert_eq!(JType::of(&json!(1.5)), JType::Float);
         assert_eq!(JType::of(&json!(u64::MAX)), JType::Dyn);

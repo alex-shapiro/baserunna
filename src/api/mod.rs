@@ -58,7 +58,7 @@ impl IntoResponse for Error {
     }
 }
 
-/// The `error` member of an error response; [`error_from_json`] reverses it.
+/// Serializes an [`Error`] as the `error` object of an HTTP error response.
 pub fn error_json(e: &Error) -> Json {
     let mut err = json!({"code": e.code(), "message": e.message(), "retryable": e.retryable()});
     match e {
@@ -73,11 +73,11 @@ pub fn error_json(e: &Error) -> Json {
     err
 }
 
-/// The largest forwarded bind a lease holder reads.
+/// Maximum body size for `/internal/v1/events/bind`.
 const BIND_BODY_MAX: usize = 1 << 30;
 
-/// Reconstructs an [`Error`] from a JSON error response, or from its status
-/// alone when the body is not one.
+/// Reconstructs an [`Error`] from a JSON error response, falling back to `status`
+/// if `error.code` is absent.
 pub fn error_from_json(status: u16, j: &Json) -> Error {
     let e = &j["error"];
     let m = e["message"].as_str().unwrap_or("request failed").to_string();
@@ -90,7 +90,7 @@ pub fn error_from_json(status: u16, j: &Json) -> Error {
             404 => "not_found",
             413 => "too_large",
             429 => "rate_limited",
-            // Whatever answered may have passed the request on.
+            // A 503 without an error body may come from a peer after forwarding.
             503 => return Error::Unavailable { message: m, retry_after_ms: Some(500), outcome_unknown: true },
             _ => "",
         },
@@ -142,11 +142,9 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for JsonBody<T> {
     }
 }
 
-/// Parses JSON text a request carries, refusing integers it would round
-/// (see [`crate::util::json::refuse_inexact_integers`]); the error says
-/// what is wrong.
+/// Deserializes `text` as JSON after rejecting out-of-range integer literals.
 pub(crate) fn parse_json<T: DeserializeOwned>(text: &[u8]) -> std::result::Result<T, String> {
-    crate::util::json::refuse_inexact_integers(text)?;
+    crate::util::json::reject_inexact_integers(text)?;
     serde_json::from_slice(text).map_err(|e| e.to_string())
 }
 
@@ -322,8 +320,7 @@ fn long_poll_wait(req: &Request) -> Duration {
     Duration::from_millis(wait_ms.min(LONG_POLL_MAX_MS))
 }
 
-/// How long a request may run past its deadline: a long poll's wait, or an
-/// event query's own time limit, which ends the query with its own error first.
+/// Extra time allowed past the request deadline for long-polling or event queries.
 fn request_allowance(node: &Node, req: &Request) -> Duration {
     match events::is_query(req.method(), req.uri().path()) {
         true => Duration::from_millis(node.cfg.query_limits.max_ms),
@@ -1008,8 +1005,6 @@ pub fn router(node: Arc<Node>) -> Router {
     let internal = Router::new()
         .route("/internal/v1/meta", post(account::internal_meta))
         .route("/internal/v1/notice", post(commit_notice))
-        // A bind lists every part of a buffer for each of its requests, which
-        // the client body limit does not bound.
         .route("/internal/v1/events/bind", post(events::internal_bind).layer(DefaultBodyLimit::max(BIND_BODY_MAX)))
         .route_layer(middleware::from_fn_with_state(node.clone(), internal_auth));
     let r = Router::new()
@@ -1037,8 +1032,7 @@ pub(crate) use axum::extract::Query as QueryParams;
 
 pub(crate) type Params = QueryParams<std::collections::BTreeMap<String, String>>;
 
-/// Extracts the `limit` and `cursor` of a listing: `limit` is in
-/// 1..=[`PAGE_MAX`](crate::meta::PAGE_MAX), [`PAGE_DEFAULT`](crate::meta::PAGE_DEFAULT) if absent.
+/// Extracts `limit` (default [`PAGE_DEFAULT`](crate::meta::PAGE_DEFAULT), in `1..=PAGE_MAX`) and `cursor` query parameters.
 pub(crate) fn paging(q: &Params) -> Result<(usize, Option<String>)> {
     let max = crate::meta::PAGE_MAX;
     let limit = match q.get("limit") {
@@ -1052,7 +1046,7 @@ pub(crate) fn paging(q: &Params) -> Result<(usize, Option<String>)> {
     Ok((limit, q.get("cursor").filter(|c| !c.is_empty()).cloned()))
 }
 
-/// Extracts the `prefix`, `limit` and `cursor` of a listing by name.
+/// Extracts `prefix`, `limit`, and `cursor` query parameters.
 pub(crate) fn name_paging(q: &Params) -> Result<(String, usize, Option<String>)> {
     let (limit, cursor) = paging(q)?;
     Ok((q.get("prefix").cloned().unwrap_or_default(), limit, cursor))
@@ -1095,8 +1089,6 @@ mod tests {
         });
     }
 
-    /// Every error survives a forward: its JSON form parses back to an error
-    /// with the same JSON form and status.
     #[test]
     fn errors_round_trip_through_json() {
         let m = || "m".to_string();
@@ -1121,7 +1113,7 @@ mod tests {
             Error::Internal(m()),
         ];
         for e in &all {
-            // Fails to compile when a variant is added, so that it joins `all`.
+            // Exhaustive match so new `Error` variants must be added to `all`.
             match e {
                 Error::InvalidArgument(_)
                 | Error::Unauthenticated(_)

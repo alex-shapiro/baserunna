@@ -82,48 +82,41 @@ pub struct EngineConfig {
     pub stream_chunk_bytes: usize,
     /// Largest stream record payload.
     pub stream_record_max: usize,
-    /// Event part bytes allowed per database (SPEC §5.10), or 0 for unlimited.
+    /// Maximum event part bytes per database (SPEC §5.10), or 0 for unlimited.
     pub event_max_bytes: u64,
-    /// A table's unsealed rows are sealed into parts once they reach this
-    /// many bytes (SPEC §5.13).
+    /// Unsealed rows of a table are sealed into parts if they reach this size (SPEC §5.13).
     pub event_seal_bytes: usize,
-    /// Event parts are stored as objects of this many bytes.
+    /// Maximum size of each chunk object of an event part.
     pub event_chunk_bytes: usize,
-    /// Most rows in a granule, the unit of pruning and reading.
+    /// Maximum rows per granule.
     pub event_granule_rows: usize,
-    /// A granule ends early once its uncompressed bytes reach this.
+    /// Uncompressed byte threshold at which a granule ends early.
     pub event_granule_bytes: usize,
-    /// A column block, the unit of compression, holds whole granules up to
-    /// about this many uncompressed bytes.
+    /// Target uncompressed size of a column block of granules.
     pub event_block_bytes: usize,
-    /// Most bytes of rows sorted in memory and written as one staged or sealed part.
+    /// Maximum uncompressed row bytes sorted in memory for a single staged or sealed part.
     pub event_insert_part_max_bytes: usize,
-    /// Parts of one tier merged at a time, and the ratio between tiers.
+    /// Number of parts in a tier merged together, and the size ratio between tiers.
     pub event_merge_fan_in: usize,
-    /// Raw size of the parts in the lowest merge tier.
+    /// Target uncompressed size of parts in the lowest merge tier.
     pub event_tier_base_bytes: u64,
     /// Parts at or above this stored size are not merged further.
     pub event_part_max_bytes: u64,
-    /// Merges running longer than this, or than the stage TTL allows, are abandoned.
+    /// Maximum duration of a part merge before it is aborted.
     pub event_merge_max_ms: u64,
-    /// Partitions whose time range has ended and that received no new part
-    /// for this long are merged into as few parts as the size cap allows.
+    /// Idle duration after a partition's time range ends before its parts are merged into a minimum number of parts.
     pub event_settle_ms: u64,
-    /// A part with deleted rows is rewritten without them once its oldest
-    /// deletion is this old, which bounds how long deleted events stay stored.
+    /// Maximum age of the oldest deletion in a part before the part is rewritten without deleted rows.
     pub event_purge_ms: u64,
-    /// JSON paths stored as their own columns in each part; the rest share buckets.
+    /// Maximum JSON paths stored as dedicated columns per part; remaining paths are hashed into buckets.
     pub event_json_max_paths: usize,
-    /// Deletion masks up to this many bytes are stored in their part's
-    /// reference; larger ones in a mask object.
+    /// Maximum encoded size of a deletion mask stored inline in a part reference before it is written to a mask object.
     pub event_mask_inline_bytes: usize,
-    /// Bytes of shared JSON path keys a part's metadata lists; past it, the
-    /// most common are listed and readers check the buckets for the rest.
+    /// Maximum byte size of the bucketed JSON path directory in part metadata.
     pub event_json_directory_bytes: usize,
-    /// Parts a query or delete reads at once.
+    /// Maximum parts read concurrently by a query or delete.
     pub event_read_concurrency: usize,
-    /// An event part `GET` unanswered after this long is sent again, and the
-    /// first answer wins; 0 disables hedging.
+    /// Delay in milliseconds before sending a duplicate event part `GET`, or 0 to disable hedging.
     pub event_get_hedge_ms: u64,
 }
 
@@ -222,11 +215,14 @@ impl EngineConfig {
             ),
             (self.event_merge_fan_in >= 2, "event_merge_fan_in must be at least 2"),
             (self.event_read_concurrency >= 1, "event_read_concurrency must be at least 1"),
-            (self.event_granule_rows >= 1 && self.event_chunk_bytes >= 1, "event granules and chunks are not empty"),
+            (
+                self.event_granule_rows >= 1 && self.event_chunk_bytes >= 1,
+                "event_granule_rows and event_chunk_bytes must be at least 1",
+            ),
             (
                 self.event_granule_rows <= crate::events::part::BLOCK_ROWS_MAX
                     && self.event_granule_bytes <= (crate::engine::segment::MAX_BLOCK_RAW / 4) as usize,
-                "event granules must fit a block",
+                "event granules must fit within a block",
             ),
         ];
         match rules.iter().find(|(ok, _)| !ok) {
@@ -283,6 +279,6 @@ mod tests {
         let starved = EngineConfig { memory_bytes: 8 * 1024 * 1024, ..EngineConfig::default() };
         assert!(starved.validate().is_err());
         let wide = EngineConfig { event_granule_bytes: 64 << 20, ..EngineConfig::default() };
-        assert!(wide.validate().is_err(), "a granule's block could exceed what a reader decodes");
+        assert!(wide.validate().is_err());
     }
 }

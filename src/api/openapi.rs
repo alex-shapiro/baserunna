@@ -177,7 +177,6 @@ fn page_of(field: &str, items: Value) -> Value {
     obj(Value::Object(props), &[field, "next_cursor"])
 }
 
-/// The parameters of a database's listing by name.
 fn names_paging() -> Vec<Value> {
     let mut out = vec![db(), query("prefix", s(), "Names starting with this")];
     out.extend(paging());
@@ -185,7 +184,6 @@ fn names_paging() -> Vec<Value> {
     out
 }
 
-/// A page of a database's listing by name, read at `version`.
 fn names_page_of(field: &str, items: Value) -> Value {
     let mut props = Map::new();
     props.insert(field.to_string(), arr(items));
@@ -209,8 +207,8 @@ fn consistency() -> Vec<Value> {
     ]
 }
 
-/// An op that names its `target` (a table or stream) and takes the fields of
-/// the read request body schema `body`, except those the transaction sets.
+/// Builds a transaction op schema with `op` and `target` fields plus the properties of `body`
+/// (excluding consistency and encoding).
 fn op_over(op: &str, target: &str, body: Value) -> Value {
     let mut props = body["properties"].as_object().cloned().unwrap_or_default();
     for k in ["consistency", "max_staleness_ms", "encoding"] {
@@ -253,8 +251,8 @@ fn stream_read() -> Value {
         &[],
         "Reads records starting from at most one of `from_seq`, `from_time` (first record at or after the timestamp), \
         `tail` (last N records), or `consumer` (consumer cursor, starting at `first_seq` if unset), up to \
-        `until_seq` or `until_time` (exclusive). Returns records oldest-first (or newest-first when `reverse` is true), \
-        bounded by `limit` (default 100) and `max_bytes` (default 4 MiB, max 16 MiB). When `filter` is set, at most \
+        `until_seq` or `until_time` (exclusive). Returns records oldest-first, or newest-first if `reverse` is true, \
+        bounded by `limit` (default 100) and `max_bytes` (default 4 MiB, max 16 MiB). If `filter` is set, at most \
         `scan_limit` records (default 10,000) are scanned.",
     )
 }
@@ -268,13 +266,9 @@ fn event_query() -> Value {
             "consistency": enum_of(&["strong", "snapshot"]), "max_staleness_ms": i(),
         }),
         &["from", "to"],
-        "A query over `[from, to)` of the time column: rows (`columns`, every column when \
-        omitted, with `order_by` and `cursor`, 100 per page by default) or aggregates (`group_by` and `aggregates`, \
-        with an optional second stage `then`). Expressions are a column name, `{col, path?}`, `{lookup}` or \
-        `{bucket, interval, offset?}`; aggregates are count, sum, min, max, avg, uniq, uniq_exact, quantiles, \
-        window_funnel and retention, each with an optional `where`. Aggregates answer with the first `limit` groups \
-        by `order_by`, or without a `limit` with every group, failing with 413 past 100,000. Queries read a \
-        snapshot at most 5 s old unless `consistency` is `strong`.",
+        "Queries the time column over `[from, to)`. Set `columns` (default: all columns) to return rows with \
+        `order_by` and `cursor` (default limit 100), or set `group_by` and `aggregates` (with optional second stage \
+        `then`) to return up to 100,000 groups. Reads a snapshot at most 5 s old unless `consistency` is `strong`.",
     )
 }
 
@@ -415,12 +409,12 @@ fn schemas() -> Value {
                 matching `where` (up to `limit`) within the transaction write limit and return `count`. For stream \
                 operations: `append` assigns sequence numbers at commit (`expect_seq` aborts the transaction with \
                 412 if the stream's next sequence number does not match); `read_stream` conflicts with concurrent \
-                appends only when the read reaches the end of the stream, and observes earlier trims in the same \
+                appends only if the read reaches the end of the stream, and observes earlier trims in the same \
                 transaction but not uncommitted appends; `stream_info` conflicts with concurrent appends; \
                 `set_consumer` requires `seq` to be at most the stream's `next_seq`. For event tables: \
-                `insert_events` gives rows their positions at commit, so a transaction that inserts into a table \
-                cannot also query or delete its events (400); `query_events` in a read-write serializable transaction conflicts with any concurrent insert \
-                into the table; `delete_events` masks matching rows of parts and deletes matching unsealed rows.",
+                `insert_events` assigns row positions at commit, so a transaction that inserts into a table \
+                cannot also query or delete from it (400); `query_events` in a read-write serializable transaction conflicts with concurrent inserts \
+                into the table; `delete_events` masks matching rows in parts and deletes matching unsealed rows.",
         },
         "TxnRequest": obj(json!({
             "ops": arr(r("Op")),
@@ -455,17 +449,16 @@ fn schemas() -> Value {
         "Time": {"type": ["integer", "string"], "description": "Milliseconds since the epoch, or an RFC 3339 timestamp."},
         "EventColumn": obj_desc(json!({"name": s(), "type": enum_of(&["time", "string", "int", "float", "bool", "json"]),
             "nullable": b(), "default": any()}), &["name", "type"],
-            "An event table column. Columns are nullable by default; a `time` column may default to `\"now\"`, the \
-            inserting node's clock. A `json` column holds objects, whose null members are dropped."),
+            "Event table column. Columns are nullable by default. A `time` column can default to `\"now\"`. \
+            A `json` column stores JSON objects with null fields removed."),
         "SkipIndex": obj(json!({"column": s(), "type": enum_of(&["bloom"])}), &["column", "type"]),
         "CreateEventTable": obj_desc(json!({
             "name": s(), "columns": arr(r("EventColumn")), "time_column": s(), "order_by": arr(s()),
             "partition": enum_of(&["hour", "day", "week", "month"]), "skip_indexes": arr(r("SkipIndex")),
             "retention_ms": {"type": "integer", "minimum": 1}, "if_not_exists": b(),
         }), &["name", "columns", "time_column", "order_by"],
-            "Rows are sorted by `order_by` within each part, so filters on a prefix of the sort key read few granules. \
-            Partitions (UTC, default `day`) bound merges and retention. The sort key, time column and partition \
-            cannot change."),
+            "Rows are sorted by `order_by` within each part. Partitions are in UTC (default `day`). \
+            `order_by`, `time_column`, and `partition` are immutable."),
         "EventTable": obj_desc(json!({
             "name": s(), "columns": arr(r("EventColumn")), "time_column": s(), "order_by": arr(s()),
             "partition": enum_of(&["hour", "day", "week", "month"]), "skip_indexes": arr(r("SkipIndex")),
@@ -477,15 +470,14 @@ fn schemas() -> Value {
                 &["id", "partition", "rows", "deleted", "bytes", "raw_bytes", "level", "min_time", "max_time"])),
             "unsealed_rows": i(), "unsealed_bytes": i(), "rows": i(), "bytes": i(),
         }), &["name", "columns", "time_column", "order_by", "partition", "skip_indexes", "retention_ms"],
-            "An event table's schema; describing one table adds its partitions, parts and sizes."),
+            "Event table schema; single-table responses also include partitions, parts, and row/byte counts."),
         "EventRetention": obj(json!({"retention_ms": nullable("integer")}), &["retention_ms"]),
         "EventInsert": obj_desc(json!({"rows": arr(json!({"type": "object"})), "idempotency_key": nullable("string")}), &["rows"],
             "Events to insert; an array of events or NDJSON (`application/x-ndjson`) is also accepted."),
         "EventsInserted": obj(json!({"count": i(), "version": i(), "time": i(), "commit_id": s(), "replayed": b()}),
             &["count", "version", "time", "commit_id", "replayed"]),
-        "EventFilter": {"type": "object", "description": "A filter (SPEC §4.7) whose comparisons name a column \
-            (`col`), a JSON column's path (`col` and `path`, an array of keys naming a leaf), a lookup \
-            (`lookup`), or a time bucket."},
+        "EventFilter": {"type": "object", "description": "Filter expression (SPEC §4.7) that compares a column \
+            (`col`), a JSON path (`col` and `path`), a lookup (`lookup`), or a time bucket (`bucket` and `interval`)."},
         "EventQuery": event_query(),
         "EventQueryStats": obj(json!({"source": s(), "nodes": i(), "parts": i(), "parts_read": i(), "granules": i(),
             "granules_read": i(), "rows_read": i(), "unsealed_rows": i(), "bytes_read": i(), "store_gets": i()}),
@@ -1596,7 +1588,7 @@ fn paths() -> Value {
         Op {
             params: ge,
             ..op(
-                "Describe an event table, its partitions and parts",
+                "Describe an event table, its partitions, and its parts",
                 "events",
                 vec![("200", resp("Event table", r("EventTable")))],
             )
@@ -1629,7 +1621,7 @@ fn paths() -> Value {
             body: Some(json_body(r("EventColumn"))),
             params: vec![db(), evt()],
             desc: Some(
-                "Rows written before the column existed read as its default, or as null for a nullable column defaulting to `\"now\"`.",
+                "Rows written before the column was added return its default value, or `null` if the default is `\"now\"`.",
             ),
             ..op("Add a column", "events", vec![("200", resp("Event table", r("EventTable")))])
         },
@@ -1648,7 +1640,7 @@ fn paths() -> Value {
         Op {
             body: Some(json_body(r("SkipIndex"))),
             params: vec![db(), evt()],
-            desc: Some("Parts written afterwards, and older parts once merged, carry the index."),
+            desc: Some("New parts and merged parts include the skip index."),
             ..op("Add a skip index", "events", vec![("200", resp("Event table", r("EventTable")))])
         },
     );
@@ -1666,7 +1658,7 @@ fn paths() -> Value {
         Op {
             body: Some(json!({"required": true, "content": {
                 "application/json": {"schema": r("EventInsert")},
-                "application/x-ndjson": {"schema": {"type": "string", "description": "An event per line"}},
+                "application/x-ndjson": {"schema": {"type": "string", "description": "One JSON event object per line"}},
             }})),
             params: vec![
                 db(),
@@ -1674,8 +1666,8 @@ fn paths() -> Value {
                 header("Idempotency-Key", "Retries with the same key are applied once (within 10 minutes)"),
             ],
             desc: Some(
-                "Bulk insert: the receiving node buffers requests for up to 200 ms, writes them as parts and binds \
-                 them in one commit; each request is its own transaction. Answered once the rows are committed.",
+                "Buffers requests on the receiving node for up to 200 ms, writes staged parts, and binds \
+                 them in a single commit. Each request is committed as an independent transaction.",
             ),
             ..op(
                 "Insert events",
@@ -1700,8 +1692,8 @@ fn paths() -> Value {
             body: Some(json_body(r("EventDelete"))),
             params: vec![db(), evt()],
             desc: Some(
-                "Deletes the rows within `[from, to)` (all time by default) matching `where` in one transaction; \
-                 a delete larger than the transaction limits fails with 413 naming the partition it stopped in.",
+                "Deletes rows in `[from, to)` (default: all time) that match `where` in a single transaction. \
+                 Returns 413 if the delete exceeds transaction limits.",
             ),
             ..op("Delete events", "events", vec![("200", resp("Deleted", r("EventsDeleted")))])
         },

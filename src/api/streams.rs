@@ -1,5 +1,4 @@
-//! Stream routes (SPEC §4.6, §10): streams, appends, reads as JSON,
-//! NDJSON or server-sent events, queries, trims and consumers.
+//! HTTP routes for streams (SPEC §4.6, §10).
 
 use super::data::{
     PathMap, bool_param, commit_hex, content_type, encoding_param, idempotency_header, one_idempotency_key, param,
@@ -537,11 +536,8 @@ mod tests {
         (w, router, t)
     }
 
-    /// SPEC §10: a JSON body holding an integer outside both 64-bit ranges
-    /// is refused with 400 rather than read as a rounded float, as the txn
-    /// route's stream appends are.
     #[test]
-    fn json_appends_refuse_inexact_integers() {
+    fn json_appends_reject_inexact_integers() {
         run_paused(async {
             let (w, router, t) = world().await;
             let body = r#"{"records": [{"json": {"n": 123456789012345678901234567890}}]}"#;
@@ -552,10 +548,8 @@ mod tests {
         });
     }
 
-    /// An NDJSON append is a JSON entry point too: an integer outside both
-    /// 64-bit ranges is refused rather than read back as a rounded float.
     #[test]
-    fn ndjson_appends_refuse_inexact_integers() {
+    fn ndjson_appends_reject_inexact_integers() {
         run_paused(async {
             let (w, router, t) = world().await;
             let body = "{\"n\": 123456789012345678901234567890}\n";

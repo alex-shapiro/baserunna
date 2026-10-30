@@ -9,8 +9,7 @@ use bytes::Bytes;
 use std::collections::BTreeSet;
 
 impl Sim {
-    /// Verifies quiescence storage invariants: manifests can be decoded, referenced levels
-    /// and segments exist and decode, and all live blob chunks are present.
+    /// Verifies quiescence storage invariants across all databases.
     pub async fn check_storage(&self) -> Result<StorageReport, String> {
         let keys: BTreeSet<String> = self.mem.keys().into_iter().collect();
         let mut rep = StorageReport::default();
@@ -19,7 +18,7 @@ impl Sim {
             let db = k
                 .strip_prefix("dbs/")
                 .and_then(|s| s.strip_suffix("/manifest"))
-                .ok_or_else(|| format!("odd manifest key {k}"))?;
+                .ok_or_else(|| format!("invalid manifest key {k}"))?;
             let g = self.mem.get_sync(k, &Default::default()).map_err(|e| e.to_string())?;
             let mut m = Manifest::decode(&g.data).map_err(|e| format!("{k}: {e}"))?;
             rep.databases += 1;
@@ -50,8 +49,7 @@ impl Sim {
                 rep.segments += 1;
                 entries.extend(es);
             }
-            // Only the newest, non-deleted entry per key is live; shadowed or deleted
-            // blob references may have been garbage collected.
+            // Shadowed or deleted blob references may be garbage-collected.
             let deletes = RangeDeletes::new(&m.range_deletes);
             let mut newest: std::collections::BTreeMap<Bytes, &crate::engine::Entry> =
                 std::collections::BTreeMap::new();
@@ -83,10 +81,9 @@ impl Sim {
                 })
                 .collect();
             if names != schemas {
-                return Err(format!("db {db}: event table names by id {names:?} do not match the schemas {schemas:?}"));
+                return Err(format!("db {db}: event table names by id {names:?} do not match schemas {schemas:?}"));
             }
             let tables: std::collections::BTreeSet<u32> = schemas.into_keys().collect();
-            // Each table's state, and the unsealed rows and part bytes it should count.
             let mut states: std::collections::BTreeMap<u32, crate::engine::events::TableState> = Default::default();
             let mut counted: std::collections::BTreeMap<u32, crate::engine::events::TableState> = Default::default();
             for e in live() {
@@ -109,30 +106,28 @@ impl Sim {
                 };
                 if !tables.contains(&table) {
                     return Err(format!(
-                        "db {db}: {:?} belongs to event table {table}, which is not in the catalog",
+                        "db {db}: {:?} belongs to event table {table}, which is missing from the catalog",
                         e.key
                     ));
                 }
             }
             for t in &tables {
-                let st = states.get(t).ok_or_else(|| format!("db {db}: event table {t} has no state"))?;
+                let st = states.get(t).ok_or_else(|| format!("db {db}: event table {t} is missing state"))?;
                 let want = counted.get(t).copied().unwrap_or_default();
                 if *st != want {
-                    return Err(format!(
-                        "db {db}: event table {t} state {st:?} does not count its unsealed rows and parts {want:?}"
-                    ));
+                    return Err(format!("db {db}: event table {t} state {st:?} does not match counted state {want:?}"));
                 }
             }
             let tables_part_bytes: u64 = states.values().map(|s| s.part_bytes).sum();
             if tables_part_bytes != m.part_bytes {
                 return Err(format!(
-                    "db {db}: event tables count {tables_part_bytes} part bytes, the manifest {}",
+                    "db {db}: event table part_bytes sum {tables_part_bytes} does not match manifest part_bytes {}",
                     m.part_bytes
                 ));
             }
             for e in live() {
                 let place = if let Some((table, pos)) = crate::engine::events::parse_row_key(&e.key) {
-                    vec![((table, pos), "an unsealed row".to_string())]
+                    vec![((table, pos), "unsealed row".to_string())]
                 } else if e.key.first() == Some(&crate::engine::events::PARTS) {
                     let r =
                         crate::engine::events::ref_of(e).ok_or_else(|| format!("db {db}: corrupt part reference"))?;
@@ -141,7 +136,7 @@ impl Sim {
                     referenced_parts.extend(r.mask_object().map(str::to_string));
                     for id in std::iter::once(r.id.as_str()).chain(r.mask_object()) {
                         if m.obsolete.iter().any(|o| o.id == id) {
-                            return Err(format!("db {db}: part {} names object {id}, which awaits deletion", r.id));
+                            return Err(format!("db {db}: part {} references obsolete object {id}", r.id));
                         }
                     }
                     let live = check_part(&self.mem, db, &r)?;
@@ -182,11 +177,10 @@ impl Sim {
             }
             if part_bytes != m.part_bytes {
                 return Err(format!(
-                    "db {db}: references name {part_bytes} part bytes, the manifest counts {}",
+                    "db {db}: referenced part_bytes {part_bytes} does not match manifest part_bytes {}",
                     m.part_bytes
                 ));
             }
-            // The end of the last record or chunk seen of each stream.
             let mut covered: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
             for e in newest.values().filter(|e| deletes.seq_at(&e.key) <= e.seq && !e.value.is_tombstone()) {
                 if let Some((id, s)) = stream::stored(e) {
@@ -220,8 +214,6 @@ impl Sim {
     }
 }
 
-/// A part's chunks exist and decode to the rows its reference claims;
-/// returns the positions of the rows its mask leaves.
 fn check_part(
     mem: &crate::store::MemStore,
     db: &str,
@@ -245,7 +237,7 @@ fn check_part(
     };
     if mask.count() != r.deleted {
         return Err(format!(
-            "db {db}: part {} mask deletes {} rows, its reference says {}",
+            "db {db}: part {} mask deletes {} rows, reference records {}",
             r.id,
             mask.count(),
             r.deleted
@@ -254,7 +246,6 @@ fn check_part(
     Ok(pos.into_iter().enumerate().filter(|(i, _)| !mask.contains(*i as u32)).map(|(_, p)| p).collect())
 }
 
-/// A chunk exists and holds exactly the records its reference claims.
 fn check_chunk(mem: &crate::store::MemStore, db: &str, id: u64, c: &stream::ChunkRef) -> Result<(), String> {
     let k = crate::engine::seg_key(db, &c.id);
     let g = mem.get_sync(&k, &Default::default()).map_err(|e| format!("db {db}: chunk {} missing: {e}", c.id))?;
@@ -269,7 +260,7 @@ fn check_chunk(mem: &crate::store::MemStore, db: &str, id: u64, c: &stream::Chun
         seq += 1;
     }
     if seq != c.last_seq + 1 || bytes != c.bytes || g.data.len() as u64 != c.size {
-        return Err(format!("chunk {k} holds seqs {}..{seq} ({bytes} bytes) but claims {c:?}", c.first_seq));
+        return Err(format!("chunk {k} holds seqs {}..{seq} ({bytes} bytes), expected {c:?}", c.first_seq));
     }
     Ok(())
 }
@@ -280,16 +271,12 @@ pub struct StorageReport {
     pub segments: usize,
     pub levels_objects: usize,
     pub blobs: usize,
-    /// Live sealed stream chunks.
     pub chunks: usize,
-    /// Live event table parts.
     pub parts: usize,
     pub objects: usize,
-    /// Stored event parts and masks no reference names and `obsolete` does
-    /// not list, with their newest object's `last_modified`.
+    /// Unreferenced part and mask objects missing from `Manifest::obsolete`.
     pub orphan_parts: Vec<UnreferencedPart>,
-    /// Stored event parts and masks awaiting deletion, with the store time
-    /// they were listed in `obsolete`.
+    /// Part and mask objects listed in `Manifest::obsolete`.
     pub obsolete_parts: Vec<UnreferencedPart>,
 }
 

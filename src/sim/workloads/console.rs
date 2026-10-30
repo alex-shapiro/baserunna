@@ -136,7 +136,6 @@ fn unescape_url(s: &str) -> String {
     String::from_utf8_lossy(&crate::api::percent_decode(s)).into_owned()
 }
 
-/// Returns the `href` attribute of the link labelled `text`.
 fn link(html: &str, text: &str) -> Option<String> {
     let end = html.find(&format!(">{text}</a>"))?;
     let needle = "href=\"";
@@ -160,9 +159,8 @@ async fn login(sim: &Arc<Sim>, name: &str, email: &str, password: &str) -> Resul
     Ok(b)
 }
 
-/// Asserts that signing in with `password` is rejected.
 async fn cannot_login(sim: &Arc<Sim>, email: &str, password: &str, why: &str) -> Result<(), String> {
-    let mut b = Browser::new(sim, "refused");
+    let mut b = Browser::new(sim, "rejected");
     let r = b.req("POST", "/console/login", Some(form(&[("email", email), ("password", password)]))).await?;
     expect(b.cookie.is_none() && header(&r, "location").contains("err="), why)
 }
@@ -397,15 +395,14 @@ async fn files(sim: &Arc<Sim>, b: &mut Browser) -> Result<(), String> {
     expect(header(&r, "content-disposition").starts_with("attachment"), "the blob download is not an attachment")
 }
 
-/// Verifies creating, inserting into, querying and dropping an event table.
 async fn event_tables(b: &mut Browser, evil: &str) -> Result<(), String> {
     let e = b.submit_err("/console/dbs/webdb", "/console/dbs/webdb/events", &[("def", "{nope")]).await?;
-    expect(e.contains("Invalid JSON"), format!("a bad event table definition was refused for another reason: {e}"))?;
+    expect(e.contains("Invalid JSON"), format!("invalid event table definition was rejected with wrong error: {e}"))?;
     let db = b.page("/console/dbs/webdb").await?;
     let def = after(&db, "action=\"/console/dbs/webdb/events\"")
         .and_then(|f| after(f, "<textarea name=\"def\">"))
         .and_then(|t| t.split("</textarea>").next())
-        .ok_or("the event table form has no starting definition")?
+        .ok_or("missing default event table definition")?
         .replace("&quot;", "\"");
     let et = "/console/dbs/webdb/events/events";
     let to = b.submit_ok("/console/dbs/webdb", "/console/dbs/webdb/events", &[("def", &def)]).await?;
@@ -467,7 +464,7 @@ async fn schema(b: &mut Browser) -> Result<(), String> {
     b.submit_ok(t, &columns, &[("name", "memo"), ("type", "string"), ("nullable", "1"), ("default", "\"n/a\"")])
         .await?;
     let e = b.submit_err(t, &columns, &[("name", "bad"), ("type", "int"), ("default", "{")]).await?;
-    expect(e.contains("not JSON"), format!("a bad default was refused for another reason: {e}"))?;
+    expect(e.contains("not JSON"), format!("invalid default was rejected with wrong error: {e}"))?;
     b.submit_ok(t, &format!("{t}/indexes"), &[("name", "by_label"), ("columns", "label, memo"), ("unique", "1")])
         .await?;
     let api = b.api("schema-api");
@@ -504,7 +501,7 @@ async fn organizations(sim: &Arc<Sim>, owner: &mut Browser) -> Result<(), String
     owner.submit_ok(o, &format!("{o}/members"), &[("email", "member@console.test"), ("role", "reader")]).await?;
     let e =
         owner.submit_err(o, &format!("{o}/members"), &[("email", "nobody@console.test"), ("role", "reader")]).await?;
-    expect(e.contains("no account"), format!("adding an unknown account was refused for another reason: {e}"))?;
+    expect(e.contains("no account"), format!("unknown account was rejected with wrong error: {e}"))?;
     let orgs = m.page("/console/orgs").await?;
     expect(orgs.contains(">acme</a></td><td>reader</td>"), "the member does not see the organization and role")?;
     let p = m.page(o).await?;
@@ -513,7 +510,7 @@ async fn organizations(sim: &Arc<Sim>, owner: &mut Browser) -> Result<(), String
     expect(db.contains("read-only access") && !db.contains("Upload file"), "a reader gets write forms")?;
     let shared = "/console/dbs/acme.shared";
     let e = m.submit_err(shared, &format!("{shared}/kv"), &[("key", "k"), ("value", "v")]).await?;
-    expect(e.contains("cannot write"), format!("a reader's write was refused for another reason: {e}"))?;
+    expect(e.contains("cannot write"), format!("reader write was rejected with wrong error: {e}"))?;
     let member_id = m.api("member-api").call_retry("GET", "/v1/me", None).await.json["user"]["id"]
         .as_str()
         .ok_or("missing member id")?
@@ -548,7 +545,7 @@ async fn account(sim: &Arc<Sim>) -> Result<(), String> {
     let acct = "/console/account";
     let pw = "/console/account/password";
     let e = a.submit_err(acct, pw, &[("current_password", "wrong-pass"), ("new_password", "self-pass-2")]).await?;
-    expect(e.contains("incorrect"), format!("a wrong current password was refused for another reason: {e}"))?;
+    expect(e.contains("incorrect"), format!("wrong current password was rejected with wrong error: {e}"))?;
     a.submit_ok(acct, pw, &[("current_password", pass), ("new_password", "self-pass-2")]).await?;
     cache_expiry(sim).await;
     expect(
@@ -586,7 +583,7 @@ async fn account(sim: &Arc<Sim>) -> Result<(), String> {
     let del = "/console/account/delete";
     d.submit_err(acct, del, &[("confirm", "someone@else.test"), ("password", "doomed-pass")]).await?;
     let e = d.submit_err(acct, del, &[("confirm", "doomed@console.test"), ("password", "nope-nope")]).await?;
-    expect(e.contains("incorrect"), format!("a wrong password was refused for another reason: {e}"))?;
+    expect(e.contains("incorrect"), format!("wrong password was rejected with wrong error: {e}"))?;
     let to = d.submit(acct, del, &[("confirm", "doomed@console.test"), ("password", "doomed-pass")]).await?;
     expect(
         to.starts_with("/console/login") && to.contains("ok=") && d.cookie.is_none(),
@@ -619,7 +616,7 @@ async fn mailed_links(sim: &Arc<Sim>) -> Result<(), String> {
     expect(anon.page("/console/forgot").await?.contains("Send link"), "the forgot page lacks its form")?;
     let before = sim.mailbox.count(email);
     let r = anon.req("POST", "/console/forgot", Some(form(&[("email", email)]))).await?;
-    expect(header(&r, "location").starts_with("/console/login?ok="), "requesting a reset was refused")?;
+    expect(header(&r, "location").starts_with("/console/login?ok="), "password reset request was rejected")?;
     let r = anon.req("POST", "/console/forgot", Some(form(&[("email", "ghost@console.test")]))).await?;
     expect(header(&r, "location").starts_with("/console/login?ok="), "unknown accounts return a different response")?;
     sim.sleep(500).await;

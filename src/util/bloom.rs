@@ -55,7 +55,7 @@ impl Bloom {
         self.may_contain_hash(key_hash(key))
     }
 
-    /// Checks a precomputed hash, as inserted by [`Bloom::insert_hash`].
+    /// Checks whether a precomputed hash from [`Bloom::insert_hash`] may be in the filter.
     pub fn may_contain_hash(&self, h: u64) -> bool {
         if self.bits.is_empty() {
             return true;

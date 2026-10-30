@@ -405,8 +405,8 @@ fn format_bytes(n: u64) -> String {
     }
 }
 
-/// A duration in the largest unit that states it exactly, such as `30 min`.
-fn span(ms: u64) -> String {
+/// Formats a duration in the largest exact unit (`d`, `h`, `min`, `s`, or `ms`).
+fn format_duration(ms: u64) -> String {
     let units = [(86_400_000, "d"), (3_600_000, "h"), (60_000, "min"), (1000, "s")];
     match units.iter().find(|(u, _)| ms > 0 && ms.is_multiple_of(*u)) {
         Some((u, name)) => format!("{} {name}", ms / u),
@@ -414,9 +414,11 @@ fn span(ms: u64) -> String {
     }
 }
 
-fn when(ms: impl TryInto<i64>) -> String {
+fn format_timestamp(ms: impl TryInto<i64>) -> String {
     crate::log::rfc3339(ms.try_into().unwrap_or(i64::MAX))[..19].replace('T', " ")
 }
+
+use self::format_timestamp as when;
 
 async fn login_page(State(node): State<Arc<Node>>, q: Params) -> Response {
     let google = if node.services.oidc.is_some() {

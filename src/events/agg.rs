@@ -1,7 +1,4 @@
-//! Query values and aggregate states. Every aggregate is a state with
-//! `add`, `merge` and `finalize` (ClickHouse's `-State` and `-Merge`), so
-//! partial states computed per part or per unsealed batch combine into the
-//! same answer however the rows were split.
+//! Query values and mergeable aggregate states.
 
 use super::query::{AggFn, FunnelMode};
 use super::sketch::{DdSketch, ExactSum, Hll, hash64};
@@ -11,7 +8,7 @@ use serde_json::{Value as Json, json};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
-/// A value a query evaluates or returns.
+/// Value produced during query evaluation.
 #[derive(Clone, Debug)]
 pub enum Val {
     Null,
@@ -19,9 +16,7 @@ pub enum Val {
     Int(i64),
     Float(f64),
     Str(String),
-    /// An array or object from a JSON column.
     Json(Json),
-    /// An aggregate's array result.
     List(Vec<Val>),
 }
 
@@ -71,8 +66,8 @@ impl Val {
         }
     }
 
-    /// The value with integral floats as ints, so that equal numbers group
-    /// and print alike however they were stored.
+    /// Converts integral floats in `self` to `i64` so that equal numbers have
+    /// identical representations.
     pub fn canonical(self) -> Val {
         match self {
             Val::Float(f) if let Some(i) = exact_int(f) => Val::Int(i),
@@ -82,14 +77,13 @@ impl Val {
         }
     }
 
-    /// [`Val::total_cmp`], with values that compare equal but differ (JSON
-    /// values of one rank) ordered by their canonical bytes, so that a min
-    /// or max does not depend on the order values arrive in.
+    /// Orders `self` and `o` by [`Val::total_cmp`], breaking ties by
+    /// [`Val::canonical_bytes`] so that `min` and `max` are independent of
+    /// input order.
     pub fn strict_cmp(&self, o: &Val) -> Ordering {
         self.total_cmp(o).then_with(|| self.canonical_bytes().cmp(&o.canonical_bytes()))
     }
 
-    /// Bytes the value holds beyond its own size, about.
     pub fn mem_size(&self) -> usize {
         match self {
             Val::Str(s) => s.len(),
@@ -99,7 +93,8 @@ impl Val {
         }
     }
 
-    /// Bytes equal exactly for values that compare equal.
+    /// Returns a canonical byte encoding that is identical if and only if two
+    /// values are equal.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(16);
         self.put_key(&mut out);
@@ -149,7 +144,7 @@ impl Val {
         }
     }
 
-    /// Compares two numbers by their exact values.
+    /// Compares two numeric values by exact mathematical value.
     pub fn num_cmp(&self, o: &Val) -> Option<Ordering> {
         Some(match (self, o) {
             (Val::Int(a), Val::Int(b)) => a.cmp(b),
@@ -160,8 +155,8 @@ impl Val {
         })
     }
 
-    /// A total order: null, booleans, numbers by value, strings by bytes,
-    /// then JSON and lists by their canonical bytes.
+    /// Compares `self` and `o` using the total order: `Null < Bool < Int/Float
+    /// < Str < Json < List`.
     pub fn total_cmp(&self, o: &Val) -> Ordering {
         match (self, o) {
             (Val::Bool(a), Val::Bool(b)) => a.cmp(b),
@@ -205,7 +200,7 @@ impl Val {
 
     pub(crate) fn decode(r: &mut Reader<'_>, depth: u32) -> DResult<Val> {
         if depth > 4 {
-            return Err(DecodeError("value nests too deep"));
+            return Err(DecodeError("value is nested too deeply"));
         }
         Ok(match r.u8()? {
             0 => Val::Null,
@@ -223,7 +218,7 @@ impl Val {
     }
 }
 
-/// An exact sum of integers and floats.
+/// Exact accumulator for integer and floating-point sums.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SumState {
     ints: i128,
@@ -281,8 +276,6 @@ impl SumState {
     }
 }
 
-/// Bytes a JSON value holds beyond its own size, about: a map stores its
-/// entries in B-tree nodes of up to 11.
 fn json_mem(j: &Json) -> usize {
     match j {
         Json::String(s) => s.len(),
@@ -292,8 +285,6 @@ fn json_mem(j: &Json) -> usize {
     }
 }
 
-/// `j` with integral floats as ints, so that JSON values equal to each other
-/// have one text.
 fn canonical_json(j: &Json) -> Json {
     match j {
         Json::Number(n) if n.as_i64().is_none() && n.as_u64().is_none() => match n.as_f64().and_then(exact_int) {
@@ -306,16 +297,15 @@ fn canonical_json(j: &Json) -> Json {
     }
 }
 
-/// 2^63, the first float past every `i64`.
+/// `2^63`, the smallest `f64` above `i64::MAX`.
 const TWO_63: f64 = 9_223_372_036_854_775_808.0;
 
-/// The integer equal to `f`, if there is one.
 fn exact_int(f: f64) -> Option<i64> {
     (f.fract() == 0.0 && (-TWO_63..TWO_63).contains(&f)).then_some(f as i64)
 }
 
-/// Writes `b` so that it ends where it appears to: zero bytes are escaped,
-/// and the text ends with two zeros, which keeps byte order.
+/// Appends `b` with `0x00` escaped as `0x00 0xFF` and terminated by `0x00 0x00`
+/// to preserve lexicographical byte order.
 fn put_escaped(out: &mut Vec<u8>, b: &[u8]) {
     for &c in b {
         match c {
@@ -326,12 +316,10 @@ fn put_escaped(out: &mut Vec<u8>, b: &[u8]) {
     out.extend([0, 0]);
 }
 
-/// Compares integer `i` with float `f` exactly; stored floats are finite.
 fn int_float_cmp(i: i64, f: f64) -> Ordering {
     crate::filter::int_float_order(i as i128, f).unwrap_or(Ordering::Less)
 }
 
-/// The distinct values of a `uniq_exact`, counting the bytes they hold.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExactSet {
     set: BTreeSet<Vec<u8>>,
@@ -355,12 +343,12 @@ impl FromIterator<Vec<u8>> for ExactSet {
     }
 }
 
-/// An aggregate's partial state.
+/// Partial aggregate state.
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
     Count(u64),
     Sum(SumState),
-    /// Element-wise sums of arrays, as of retention results.
+    /// Element-wise sum of array values.
     SumList(Vec<SumState>),
     Min(Option<Val>),
     Max(Option<Val>),
@@ -368,7 +356,7 @@ pub enum State {
     Uniq(Hll),
     UniqExact(ExactSet),
     Quantiles(DdSketch),
-    /// `(time, position, steps matched)` of each event of the group.
+    /// Per-event `(timestamp, position, matched_step_mask)` tuples for a group.
     Funnel(Vec<(i64, Pos, u32)>),
     Retention(u32),
 }
@@ -389,8 +377,8 @@ impl State {
         }
     }
 
-    /// Adds one row's value; funnels and retention take their events and
-    /// condition masks through `event` and `mask` instead.
+    /// Accumulates a row value `v`, or a `(timestamp, position, condition_mask)`
+    /// tuple `event` for funnel and retention aggregates.
     pub fn add(&mut self, v: &Val, event: Option<(i64, Pos, u32)>) {
         match self {
             State::Count(n) => *n += 1,
@@ -510,7 +498,6 @@ impl State {
         }
     }
 
-    /// Approximate bytes of memory the state holds.
     pub fn mem_size(&self) -> usize {
         32 + match self {
             State::Sum(s) | State::Avg(s, _) => s.mem_size(),
@@ -624,31 +611,26 @@ impl State {
     }
 }
 
-/// The highest funnel step a group reached (after ClickHouse's
-/// `windowFunnel`), given each event's time, position and the mask of steps
-/// it matches.
+/// Computes the highest funnel step in `0..=steps` reached by a group within
+/// `window_ms`.
 ///
-/// An attempt starts at each event matching the first step, having reached
-/// step 1. The group's later events (in time order, then insertion order)
-/// within `window_ms` of the attempt's first event are considered in turn:
-/// one matching the attempt's next step advances it one step (with
-/// `strict_increase`, only if its time is after that of the attempt's
-/// previous step). An event that does not advance the attempt ends it, with
-/// `strict_order`, if it does not match the next step and, with
-/// `strict_deduplication`, if it matches a step the attempt already reached.
-/// The answer is the highest step any attempt reaches.
+/// Events are ordered by timestamp and then by insertion position. Each event
+/// that matches step 1 starts a funnel attempt. Subsequent events within
+/// `window_ms` of the attempt's start timestamp advance the attempt by a
+/// single step if they match the next step; if `mode.strict_increase` is set,
+/// the event must also have a strictly greater timestamp than the previous
+/// step. If `mode.strict_order` is set, an event that does not match the next
+/// step terminates the attempt. If `mode.strict_deduplication` is set, an
+/// event that matches an already completed step terminates the attempt.
 pub fn funnel(evs: &[(i64, Pos, u32)], steps: usize, window_ms: i64, mode: FunnelMode) -> usize {
     if steps == 0 {
         return 0;
     }
     let mut evs = evs.to_vec();
     evs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    // Live attempts at the same step meet the same fate at every event, except
-    // that a later start keeps its window open longer and, with
-    // strict_increase, a step reached at the current time cannot be followed
-    // at that time. So per step only the latest start counts, kept apart for
-    // attempts that reached step l + 1 before the current time (`before[l]`)
-    // and at it (`at[l]`).
+    // Track only the latest start timestamp at each step: `before[l]` for
+    // attempts that reached step l + 1 before `now`, and `at[l]` for attempts
+    // that reached step l + 1 at `now` for `strict_increase`.
     let mut before: Vec<Option<i64>> = vec![None; steps - 1];
     let mut at: Vec<Option<i64>> = vec![None; steps - 1];
     let mut now = None;
@@ -698,14 +680,14 @@ mod tests {
     }
 
     #[test]
-    fn funnels_follow_windows_and_modes() {
+    fn funnel_windows_and_modes() {
         let m = FunnelMode::default();
         assert_eq!(funnel(&[], 3, 10, m), 0);
         assert_eq!(funnel(&[ev(0, 0, 1), ev(5, 1, 2), ev(9, 2, 4)], 3, 10, m), 3);
         assert_eq!(funnel(&[ev(0, 0, 1), ev(5, 1, 2), ev(11, 2, 4)], 3, 10, m), 2, "outside the window");
         assert_eq!(funnel(&[ev(0, 0, 1), ev(8, 1, 1), ev(12, 2, 2), ev(17, 3, 4)], 3, 10, m), 3, "a later start fits");
         assert_eq!(funnel(&[ev(5, 1, 2), ev(9, 2, 4), ev(0, 0, 1)], 3, 10, m), 3, "events are sorted by time");
-        assert_eq!(funnel(&[ev(0, 0, 3)], 2, 10, m), 1, "one event fulfills one step");
+        assert_eq!(funnel(&[ev(0, 0, 3)], 2, 10, m), 1, "a single event fulfills a single step");
         assert_eq!(funnel(&[ev(0, 0, 1), ev(0, 1, 2)], 2, 10, m), 2, "ties keep insertion order");
         let inc = FunnelMode { strict_increase: true, ..m };
         assert_eq!(funnel(&[ev(0, 0, 1), ev(0, 1, 2)], 2, 10, inc), 1);
@@ -718,10 +700,9 @@ mod tests {
         assert_eq!(funnel(&repeat, 3, 10, m), 3);
         assert_eq!(funnel(&[ev(0, 0, 1), ev(1, 1, 1), ev(2, 2, 2)], 2, 10, dedup), 2, "a repeat of step 1 starts anew");
         let stale = [ev(0, 0, 1), ev(1, 1, 2), ev(100, 2, 1), ev(101, 3, 2), ev(102, 4, 4)];
-        assert_eq!(funnel(&stale, 3, 10, order), 3, "an expired attempt does not end a later one");
+        assert_eq!(funnel(&stale, 3, 10, order), 3, "an expired attempt does not end a later attempt");
     }
 
-    /// A value an aggregate adds, with its funnel or retention event.
     type Input = (Val, Option<(i64, Pos, u32)>);
 
     fn sample_states() -> Vec<(AggFn, Vec<Input>)> {
@@ -759,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn states_merge_in_any_grouping_and_order() {
+    fn state_merge_order_and_grouping_invariance() {
         let mut r = Rng::new(11);
         for _ in 0..50 {
             for (f, rows) in sample_states() {
@@ -793,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn values_order_and_canonicalize() {
+    fn val_ordering_and_canonicalization() {
         assert_eq!(Val::Float(2.0), Val::Int(2));
         assert_ne!(Val::Float(2.5), Val::Int(2));
         assert_eq!(Val::Int(1).total_cmp(&Val::Float(1.5)), Ordering::Less);
@@ -820,10 +801,8 @@ mod tests {
 mod tie_tests {
     use super::*;
 
-    /// Values that compare equal, such as an int and a float beyond 2^53,
-    /// leave the same min and max whatever order they arrive in.
     #[test]
-    fn min_and_max_ties_ignore_order() {
+    fn min_and_max_tie_breaking_is_order_independent() {
         let (a, b) = (Val::Int(1 << 60), Val::Float((1u64 << 60) as f64));
         assert_eq!(a.total_cmp(&b), Ordering::Equal);
         for f in [AggFn::Min, AggFn::Max] {
@@ -842,13 +821,11 @@ mod mean_tests {
     use super::*;
     use crate::util::rng::Rng;
 
-    /// A two's complement integer counting units of 2^-1074, wide enough for
-    /// any count of doubles times any double.
+    /// Two's complement fixed-point integer in units of `2^-1074`.
     #[derive(Clone, Copy)]
     struct Big([u64; 36]);
 
     impl Big {
-        /// `mant * 2^exp`, for `exp >= -1074`, negated if `neg`.
         fn new(mant: u128, exp: i32, neg: bool) -> Big {
             let shift = (exp + 1074) as usize;
             let (i, off) = (shift / 64, shift % 64);
@@ -862,7 +839,6 @@ mod mean_tests {
             if neg { b.neg() } else { b }
         }
 
-        /// `x * n`, exactly.
         fn of(x: &Val, n: u64) -> Big {
             match *x {
                 Val::Int(i) => Big::new(i.unsigned_abs() as u128 * n as u128, 0, i < 0),
@@ -878,11 +854,11 @@ mod mean_tests {
 
         fn add(self, o: Big) -> Big {
             let mut w = [0u64; 36];
-            let mut carry = false;
+            let mut overflow = false;
             for (i, out) in w.iter_mut().enumerate() {
                 let (s, c1) = self.0[i].overflowing_add(o.0[i]);
-                let (s, c2) = s.overflowing_add(carry as u64);
-                (*out, carry) = (s, c1 || c2);
+                let (s, c2) = s.overflowing_add(overflow as u64);
+                (*out, overflow) = (s, c1 || c2);
             }
             Big(w)
         }
@@ -891,15 +867,12 @@ mod mean_tests {
             Big(self.0.map(|x| !x)).add(Big::new(1, -1074, false))
         }
 
-        /// The absolute value's words, most significant first, so that
-        /// magnitudes compare as slices.
         fn magnitude(self) -> Vec<u64> {
             let abs = if self.0[35] >> 63 == 1 { self.neg() } else { self };
             abs.0.into_iter().rev().collect()
         }
     }
 
-    /// A huge (regime 0), tiny (1) or arbitrary double, or sometimes an int.
     fn random_val(r: &mut Rng, regime: usize) -> Val {
         if r.chance(0.1) {
             return Val::Int(r.next_u64() as i64 >> r.usize(64));
@@ -913,10 +886,8 @@ mod mean_tests {
         Val::Float(f64::from_bits(sign | exp << 52 | r.below(1 << 52)))
     }
 
-    /// The mean is the double nearest the exact mean, ties to even, even
-    /// when the sum is beyond f64 or the mean is subnormal.
     #[test]
-    fn means_round_once_to_nearest() {
+    fn mean_single_rounding_to_nearest() {
         let mut r = Rng::new(9);
         for it in 0..20_000 {
             let regime = r.usize(3);
@@ -937,7 +908,7 @@ mod mean_tests {
     }
 
     #[test]
-    fn means_of_tiny_values_round_to_the_subnormal_grid() {
+    fn subnormal_mean_rounding() {
         let mean = |xs: &[f64]| {
             let mut st = State::new(&AggFn::Avg);
             xs.iter().for_each(|x| st.add(&Val::Float(*x), None));

@@ -1,20 +1,21 @@
-//! The event part format (SPEC §5.13): an immutable, sorted, column-major
-//! byte stream stored as fixed-size chunk objects under `part/{id}/`.
+//! Columnar event part format (SPEC §5.13). An event part is an immutable,
+//! sorted, column-major byte stream stored across fixed-size chunk objects
+//! under `part/{id}/`.
 //!
 //! ```text
 //! stream   = [column]* [metadata]
 //! column   = [block]* [column index]
-//! block    = framed (segment codec + CRC32C) values of one or more whole granules
+//! block    = framed (segment codec + CRC32C) values of a granule run
 //! index    = framed dictionary, block locations, per-granule statistics, blooms
 //! metadata = framed "BRPT", granule sizes, sort key, primary index, column
 //!            directory, shared JSON path directory
 //! ```
 //!
-//! A granule is the unit of pruning and reading: queries skip granules by
-//! the primary index (sort key values at granule starts) and by per-granule
-//! statistics, then fetch the blocks holding the granules they read. A part
-//! reference records the metadata's byte range, so opening a part takes one
-//! ranged `GET`; a column's index is fetched only when the column is read.
+//! Queries prune granules using the primary index and per-granule statistics,
+//! then fetch only the column blocks covering matching granules. A [`PartRef`]
+//! stores the byte offset and length of the part metadata footer so opening a
+//! part requires a single ranged `GET`, and column indexes are fetched only
+//! for referenced columns.
 
 use super::json::JType;
 use super::vector::{NULL_CODE, Phys, Strs, Vector};
@@ -35,50 +36,43 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 const MAGIC: &[u8; 4] = b"BRPT";
 const FORMAT: u8 = 1;
-/// Prefix length of string statistics.
+/// Maximum byte length of string min/max prefixes in granule statistics.
 pub const STAT_PREFIX: usize = 32;
-/// Granules per bloom filter.
+/// Number of granules covered by each bloom filter entry.
 pub const BLOOM_GRANULES: u32 = 4;
 const BLOOM_BITS: usize = 10;
-/// The most bytes of bloom filters one column of a part holds.
 const BLOOM_MAX_BYTES: usize = 8 << 20;
-/// Most distinct strings coded into a part-level dictionary.
+/// Maximum number of distinct entries in a part-level string dictionary.
 pub const DICT_MAX: usize = 65_536;
-/// The most rows a block, and so a granule, holds.
+/// Maximum number of rows in a single block or granule.
 pub const BLOCK_ROWS_MAX: usize = 1 << 22;
-/// The most granules a part holds: tens of billions of rows in granules of
-/// thousands, far more than a part's size limit admits.
+/// Maximum number of granules in a part.
 pub const GRANULES_MAX: usize = 1 << 22;
-/// The most columns a part stores.
+/// Maximum number of physical columns in a part.
 pub const PART_COLUMNS_MAX: usize = 1 << 16;
-/// The most shared paths a part's directory lists.
+/// Maximum number of shared JSON paths listed in a part directory.
 pub const SHARED_PATHS_MAX: usize = 1 << 20;
-/// The longest sort key the primary index holds; granules starting or
-/// ending at a longer one are not pruned by it.
+/// Maximum byte length of a primary-index sort key; longer sort keys are omitted.
 pub const PK_KEY_MAX: usize = 4096;
-/// The most bytes of strings a dictionary holds, so that a column's index
-/// stays small beside its blocks.
+/// Maximum total string byte length in a part-level dictionary.
 pub const DICT_MAX_BYTES: usize = 1 << 20;
-/// Adjacent byte ranges are fetched together up to this size.
 const COALESCE_BYTES: u64 = 1 << 20;
-/// The most bytes a framed block, index or metadata takes: [`unframe`]
-/// refuses longer payloads, and stores a payload compressed only when smaller.
 const FRAMED_MAX: u64 = crate::engine::segment::MAX_BLOCK_RAW + 16;
 
-/// What a physical column holds.
+/// Identifier for a physical column stored in a part.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ColRef {
-    /// A table column by id; for a JSON column, whether the object is present.
+    /// User-defined column by ID; for a JSON column, stores a boolean presence flag.
     User(u32),
-    /// The commit version of each row.
+    /// Commit version of each row.
     Version,
-    /// Each row's ordinal within its version.
+    /// Row ordinal within its commit version.
     Ordinal,
-    /// Each row's [`super::build::stored_len`], by which merges cut granules.
+    /// Uncompressed byte length ([`super::build::stored_len`]) of each row.
     RowBytes,
-    /// One leaf path of a JSON column, by canonical key.
+    /// Dedicated subcolumn for a JSON leaf path.
     Path { col: u32, key: String },
-    /// A JSON column's other paths hashing to `bucket`, as JSON object text per row.
+    /// Shared JSON bucket column storing serialized JSON objects for paths hashing to `bucket`.
     Shared { col: u32, bucket: u8 },
 }
 
@@ -119,12 +113,12 @@ impl ColRef {
     }
 }
 
-/// A column a part stores.
+/// Metadata entry for a physical column in [`PartMeta`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColMeta {
     pub cref: ColRef,
     pub phys: Phys,
-    /// Strings hold JSON text.
+    /// True if string values contain serialized JSON text.
     pub json: bool,
     pub index_off: u64,
     pub index_len: u64,
@@ -133,7 +127,7 @@ pub struct ColMeta {
     pub nonnull: u64,
 }
 
-/// A JSON path kept in a part's shared buckets, with its count and type.
+/// Directory entry for a JSON leaf path stored in shared buckets.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedPath {
     pub key: String,
@@ -141,28 +135,26 @@ pub struct SharedPath {
     pub ty: JType,
 }
 
-/// A part's metadata: everything needed to locate its granules and columns.
+/// Footer metadata locating granules, primary keys, and columns in a part.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartMeta {
     pub rows: u64,
-    /// Rows of each granule.
+    /// Row count of each granule.
     pub granules: Vec<u32>,
-    /// First row of each granule, and the row count last.
+    /// Starting row offset of each granule, followed by the total row count.
     pub starts: Vec<u64>,
     pub sort_ids: Vec<u32>,
-    /// Sort key of the first row of each granule, and of the last row; empty
-    /// where longer than [`PK_KEY_MAX`].
+    /// Tuple-encoded sort key of the first row of each granule and the last row of the part (empty if longer than [`PK_KEY_MAX`]).
     pub pk: Vec<Bytes>,
     pub cols: Vec<ColMeta>,
-    /// Shared paths of each JSON column, the most common when `partial`
-    /// holds the column.
+    /// Shared bucket paths for each JSON column.
     pub shared: BTreeMap<u32, Vec<SharedPath>>,
-    /// JSON columns whose shared buckets hold paths that `shared` does not list.
+    /// JSON column IDs whose shared buckets contain paths omitted from `shared`.
     pub partial: BTreeSet<u32>,
 }
 
 impl PartMeta {
-    /// Bytes the decoded metadata holds in memory, about.
+    /// Approximate heap memory usage in bytes.
     pub fn mem_size(&self) -> usize {
         let cols: usize = self
             .cols
@@ -178,7 +170,7 @@ impl PartMeta {
         cols + shared + self.pk.iter().map(|k| k.len() + 16).sum::<usize>() + self.granules.len() * 12
     }
 
-    /// Whether path `key` of JSON column `col` may be in a shared bucket.
+    /// Returns true if path `key` of JSON column `col` may reside in a shared bucket.
     pub fn may_share(&self, col: u32, key: &str) -> bool {
         self.partial.contains(&col) || self.shared.get(&col).is_some_and(|ps| ps.iter().any(|p| p.key == key))
     }
@@ -195,7 +187,7 @@ impl PartMeta {
         self.granules.len()
     }
 
-    /// Path columns of JSON column `col`.
+    /// Returns `(col_idx, path_key)` for all dedicated path subcolumns of JSON column `col`.
     pub fn paths(&self, col: u32) -> impl Iterator<Item = (usize, &str)> {
         self.cols.iter().enumerate().filter_map(move |(i, m)| match &m.cref {
             ColRef::Path { col: c, key } if *c == col => Some((i, key.as_str())),
@@ -209,7 +201,7 @@ impl PartMeta {
             || [self.cols.len(), self.shared.len(), self.partial.len()].iter().any(|n| *n > PART_COLUMNS_MAX)
             || listed > SHARED_PATHS_MAX
         {
-            return Err(Error::internal("an event part has more granules, columns or paths than a part can hold"));
+            return Err(Error::internal("part metadata exceeds granule, column, or path limits"));
         }
         let mut w = Writer::new();
         w.raw(MAGIC);
@@ -252,7 +244,7 @@ impl PartMeta {
         framed(&w.buf, Compression::Zstd(1), "part metadata")
     }
 
-    /// Decodes the metadata of a part of `rows` rows.
+    /// Decodes part metadata and verifies that granule row counts sum to `rows`.
     pub fn decode(b: &Bytes, rows: u64) -> DResult<PartMeta> {
         let raw = unframe(b)?;
         let mut r = Reader::new(&raw);
@@ -262,7 +254,7 @@ impl PartMeta {
         if r.varint()? != rows || rows == 0 {
             return Err(DecodeError("part metadata does not match the part's rows"));
         }
-        // Each granule takes at least a byte for its size and one for its key.
+        // Each granule requires at least 2 bytes (size varint + primary key length varint).
         let n = r.len(GRANULES_MAX.min(usize::try_from(rows).unwrap_or(usize::MAX)).min(r.remaining() / 2))?;
         let mut granules = Vec::with_capacity(n);
         let mut starts = Vec::with_capacity(n + 1);
@@ -338,21 +330,20 @@ impl PartMeta {
     }
 }
 
-/// A statistic value: min or max of a granule.
+/// Minimum or maximum value of a column within a granule.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stat {
     Int(i64),
     Float(f64),
     Bool(bool),
-    /// The value's prefix of at most [`STAT_PREFIX`] bytes.
+    /// UTF-8 prefix truncated to at most [`STAT_PREFIX`] bytes.
     Str(String),
 }
 
-/// Statistics of one column in one granule.
+/// Per-granule column statistics.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GranStat {
     pub nulls: u32,
-    /// `None` when every value is null.
     pub min: Option<Stat>,
     pub max: Option<Stat>,
 }
@@ -364,13 +355,13 @@ pub struct BlockLoc {
     pub first_granule: u32,
 }
 
-/// A column's index: its dictionary, block locations, statistics and blooms.
+/// Per-column index containing dictionary entries, block locations, granule statistics, and bloom filters.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColIndex {
     pub dict: Option<Arc<Vec<String>>>,
     pub blocks: Vec<BlockLoc>,
     pub stats: Vec<GranStat>,
-    /// One filter per [`BLOOM_GRANULES`] granules.
+    /// Bloom filters covering groups of [`BLOOM_GRANULES`] granules.
     pub blooms: Vec<Bloom>,
 }
 
@@ -379,12 +370,11 @@ impl ColIndex {
         self.blocks.partition_point(|b| b.first_granule as usize <= granule).saturating_sub(1)
     }
 
-    /// The granules block `b` holds, of a part with `granules` granules.
     fn granules_of(&self, b: usize, granules: usize) -> Range<usize> {
         self.blocks[b].first_granule as usize..self.blocks.get(b + 1).map_or(granules, |n| n.first_granule as usize)
     }
 
-    /// The rows block `b` holds, of the part `meta` describes.
+    /// Returns the number of rows in block `b`.
     pub fn rows_of(&self, b: usize, meta: &PartMeta) -> u64 {
         let rows = meta.rows_of(self.granules_of(b, meta.granule_count()));
         rows.end - rows.start
@@ -434,9 +424,7 @@ impl ColIndex {
         framed(&w.buf, Compression::Zstd(1), "a column index")
     }
 
-    /// Decodes the index of column `col` of the part `meta` describes,
-    /// refusing one whose blocks do not lie in order within the column's
-    /// data, starting with the first granule.
+    /// Decodes the index for `col` and validates that its blocks cover all granules in order.
     pub fn decode(b: &Bytes, meta: &PartMeta, col: &ColMeta) -> DResult<ColIndex> {
         let (phys, granules) = (col.phys, meta.granule_count());
         let raw = unframe(b)?;
@@ -563,7 +551,7 @@ fn get_stat(r: &mut Reader<'_>, phys: Phys) -> DResult<Stat> {
     })
 }
 
-/// The longest prefix of `s` of at most [`STAT_PREFIX`] bytes on a character boundary.
+/// Returns the longest UTF-8 prefix of `s` within [`STAT_PREFIX`] bytes.
 pub fn stat_prefix(s: &str) -> &str {
     let mut end = s.len().min(STAT_PREFIX);
     while !s.is_char_boundary(end) {
@@ -572,7 +560,6 @@ pub fn stat_prefix(s: &str) -> &str {
     &s[..end]
 }
 
-/// The hash a bloom filter indexes for a value.
 pub fn bloom_hash_int(v: i64) -> u64 {
     crate::util::bloom::key_hash(&[&b"i"[..], &v.to_le_bytes()].concat())
 }
@@ -613,8 +600,6 @@ fn get_bitmap(r: &mut Reader<'_>, n: usize) -> DResult<Vec<bool>> {
     Ok((0..n).map(|i| b[i / 8] & (1 << (i % 8)) != 0).collect())
 }
 
-/// Encodes the values of a block. Strings are coded with `dict` when the
-/// column has a part-level dictionary.
 fn encode_block(v: &Vector, dict: Option<&BTreeMap<&str, u32>>) -> Result<Vec<u8>> {
     let n = v.len();
     let mut w = Writer::with_capacity(n * 4 + 16);
@@ -670,7 +655,7 @@ fn encode_block(v: &Vector, dict: Option<&BTreeMap<&str, u32>>) -> Result<Vec<u8
                     .map(|x| {
                         d.get(x.as_str())
                             .copied()
-                            .ok_or_else(|| Error::internal("a string is missing from its column's dictionary"))
+                            .ok_or_else(|| Error::internal("string missing from column dictionary"))
                     })
                     .collect::<Result<_>>()?;
                 for c in &s.codes {
@@ -695,8 +680,7 @@ fn encode_block(v: &Vector, dict: Option<&BTreeMap<&str, u32>>) -> Result<Vec<u8
     Ok(w.into_inner())
 }
 
-/// Decodes the values of a block of `rows` rows; `dict` is its column's
-/// part-level dictionary.
+/// Decodes a column block of `rows` rows using optional part-level dictionary `dict`.
 pub fn decode_block(raw: &[u8], phys: Phys, dict: Option<&Arc<Vec<String>>>, rows: u64) -> DResult<Vector> {
     let mut r = Reader::new(raw);
     let n = r.len(BLOCK_ROWS_MAX)?;
@@ -772,7 +756,7 @@ pub fn decode_block(raw: &[u8], phys: Phys, dict: Option<&Arc<Vec<String>>>, row
     Ok(v)
 }
 
-/// The approximate uncompressed bytes of `v`.
+/// Returns the approximate uncompressed byte size of `v`.
 pub fn vector_bytes(v: &Vector) -> usize {
     match v {
         Vector::Int(x) => x.len() * 8,
@@ -816,33 +800,33 @@ fn bloom_hashes(v: &Vector, out: &mut Vec<u64>) {
     }
 }
 
-/// How a part being written stores one column.
+/// Column storage configuration for a part being written.
 #[derive(Clone, Debug)]
 pub struct ColPlan {
     pub cref: ColRef,
     pub phys: Phys,
     pub json: bool,
-    /// A part-level dictionary for a string column, if its values are known up front.
+    /// Optional part-level dictionary for a string column.
     pub dict: Option<Arc<Vec<String>>>,
     pub bloom: bool,
 }
 
-/// Rows of a part being written, supplied a column at a time in row order.
+/// Column-oriented row stream for constructing a part.
 pub trait Source {
     fn rows(&self) -> u64;
-    /// Uncompressed bytes of row `i`, which decide granule boundaries.
+    /// Uncompressed byte size of row `i`, used to determine granule boundaries.
     fn row_bytes(&self, i: u64) -> u64;
-    /// The tuple-encoded sort key of row `i`.
+    /// Tuple-encoded sort key of row `i`.
     fn key_at(&self, i: u64) -> Bytes;
     fn plans(&self) -> &[ColPlan];
     fn shared_paths(&self) -> BTreeMap<u32, Vec<SharedPath>>;
-    /// JSON columns whose shared paths [`Source::shared_paths`] lists only in part.
+    /// JSON column IDs whose shared paths in [`Source::shared_paths`] are truncated.
     fn partial_paths(&self) -> BTreeSet<u32>;
-    /// The values of column `plan` for `rows`, requested in increasing order.
+    /// Returns values for column `plan` across `rows`.
     fn column(&mut self, plan: usize, rows: Range<u64>) -> impl Future<Output = Result<Vector>> + Send;
 }
 
-/// Accumulates a part's stream and uploads it in chunks as they fill.
+/// Buffers a part byte stream and uploads fixed-size chunk objects to storage.
 pub struct Sink<'a> {
     shared: &'a Shared,
     db: &'a str,
@@ -850,7 +834,6 @@ pub struct Sink<'a> {
     chunk_bytes: u64,
     buf: Vec<u8>,
     written: u64,
-    /// The whole stream, kept while it is small enough to cache.
     whole: Option<Vec<u8>>,
 }
 
@@ -889,7 +872,6 @@ impl<'a> Sink<'a> {
         Ok(())
     }
 
-    /// Uploads every full chunk, and with `all` the rest too.
     async fn flush(&mut self, all: bool) -> Result<()> {
         while self.buf.len() as u64 >= self.chunk_bytes || (all && !self.buf.is_empty()) {
             let n = (self.chunk_bytes as usize).min(self.buf.len());
@@ -901,18 +883,16 @@ impl<'a> Sink<'a> {
     }
 }
 
-/// Frames `raw`, refusing more bytes than [`unframe`] accepts, so that a
-/// part is never written that cannot be read.
 fn framed(raw: &[u8], c: Compression, what: &str) -> Result<Vec<u8>> {
     if raw.len() as u64 > crate::engine::segment::MAX_BLOCK_RAW {
-        return Err(Error::internal(format!("{what} of {} bytes is more than a part can hold", raw.len())));
+        return Err(Error::internal(format!("{what} of {} bytes exceeds maximum block size", raw.len())));
     }
     let mut out = Vec::with_capacity(raw.len() / 2 + 16);
     frame(raw, c, &mut out);
     Ok(out)
 }
 
-/// What writing a part produced, for its reference.
+/// Layout summary returned after writing a part.
 #[derive(Clone, Debug)]
 pub struct Written {
     pub size: u64,
@@ -923,7 +903,7 @@ pub struct Written {
     pub chunk_bytes: u64,
 }
 
-/// Splits rows into granules of at most `max_rows` rows and about `max_bytes` bytes.
+/// Partitions rows into granules of at most `max_rows` rows or `max_bytes` bytes.
 pub fn granules(src: &impl Source, max_rows: usize, max_bytes: usize) -> Vec<u32> {
     let mut out = Vec::new();
     let (mut n, mut bytes) = (0u32, 0u64);
@@ -941,20 +921,18 @@ pub fn granules(src: &impl Source, max_rows: usize, max_bytes: usize) -> Vec<u32
     out
 }
 
-/// Writes the part `src` describes to `sink`, compressing blocks at
-/// `level`, and returns its layout. Memory holds one block per column.
+/// Writes all columns and metadata from `src` into `sink` using compression `level`.
 pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_ids: Vec<u32>) -> Result<Written> {
     let cfg = &sink.shared.cfg;
     let rows = src.rows();
     if rows == 0 {
-        return Err(Error::internal("an event part needs rows"));
+        return Err(Error::internal("event part cannot be empty"));
     }
     let granules = granules(src, cfg.event_granule_rows, cfg.event_granule_bytes);
     let mut starts = vec![0u64];
     for g in &granules {
         starts.push(starts.last().copied().unwrap_or(0) + *g as u64);
     }
-    // A key too long to index is left empty, which no granule's bounds use.
     let indexed = |k: Bytes| if k.len() > PK_KEY_MAX { Bytes::new() } else { k };
     let mut pk: Vec<Bytes> = starts[..granules.len()].iter().map(|s| indexed(src.key_at(*s))).collect();
     pk.push(indexed(src.key_at(rows - 1)));
@@ -978,7 +956,7 @@ pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_
         for (g, gr) in granules.iter().enumerate() {
             let v = src.column(pi, starts[g]..starts[g] + *gr as u64).await?;
             if v.len() != *gr as usize || v.phys() != plan.phys {
-                return Err(Error::internal("a part source returned the wrong column"));
+                return Err(Error::internal("part source returned mismatched column length or type"));
             }
             stats.push(granule_stat(&v));
             nonnull += (v.len() - v.nulls()) as u64;
@@ -1011,7 +989,6 @@ pub async fn write(sink: &mut Sink<'_>, src: &mut impl Source, level: i32, sort_
             }
         }
         let data_len = sink.pos() - data_off;
-        // A part with too many distinct values for its blooms keeps none.
         if bloom_bytes > BLOOM_MAX_BYTES {
             blooms.clear();
         }
@@ -1058,27 +1035,25 @@ const WHOLE: u32 = u32::MAX - 1;
 const MASK: u32 = u32::MAX - 2;
 const INDEX: u32 = u32::MAX;
 
-/// Counters of the work a read did.
+/// Object-store request counters for a part read operation.
 #[derive(Debug, Default)]
 pub struct ReadStats {
     pub gets: AtomicU64,
     pub bytes: AtomicU64,
 }
 
-/// Decoded part data one read keeps to itself.
+/// Per-operation cache for decoded part metadata and indexes during maintenance reads.
 pub type Memo = std::sync::Mutex<std::collections::HashMap<CacheKey, CacheVal>>;
 
-/// How reads of parts use the caches.
+/// Cache policy for reading event parts.
 pub enum Caching<'a> {
-    /// Fill the node's cache with what is fetched.
+    /// Populate the shared node block cache on misses.
     Shared,
-    /// Read the node's cache without filling it, as a merge does since it
-    /// reads its inputs once; metadata, indexes and whole small parts, which
-    /// the read fetches again for each column, are kept in the memo.
+    /// Probe the shared block cache without populating it on misses, storing metadata and indexes in a local [`Memo`].
     Private(&'a Memo),
 }
 
-/// How reads of parts use the caches.
+/// Reader for fetching and caching event part metadata, indexes, blocks, and masks.
 pub struct Reading<'a> {
     pub shared: &'a Shared,
     pub db: &'a str,
@@ -1110,16 +1085,12 @@ impl Reading<'_> {
         }
     }
 
-    /// Remembers a decoded column block, which a private read uses once.
     fn remember_block(&self, k: CacheKey, v: Arc<Vector>, size: usize) {
         if let Caching::Shared = self.cache {
             self.shared.cache.insert(k, CacheVal::Any(v, size));
         }
     }
 
-    /// Reads `key`, sending a second `GET` if the first has not answered
-    /// within `event_get_hedge_ms`, so that one slow store request does not
-    /// hold up a query.
     async fn get(&self, key: &str, range: Option<Range<u64>>) -> Result<Bytes> {
         let fetch = || {
             self.shared.retry.run(|| self.shared.store.get(key, GetOpts { range: range.clone(), ..Default::default() }))
@@ -1143,7 +1114,7 @@ impl Reading<'_> {
         };
         let g = g.map_err(|e| match e {
             StoreError::NotFound => {
-                Error::unavailable("garbage collection removed an event part this read needed; retry")
+                Error::unavailable("garbage collection removed a referenced event part during the read; retry")
             }
             other => other.into(),
         })?;
@@ -1157,7 +1128,6 @@ impl Reading<'_> {
         Ok(g.data)
     }
 
-    /// Reads `range` of part `r`'s stream.
     async fn read(&self, r: &PartRef, range: Range<u64>) -> Result<Bytes> {
         if range.end > r.size || range.start > range.end {
             return Err(Error::internal("event part range out of bounds"));
@@ -1176,7 +1146,6 @@ impl Reading<'_> {
         Ok(Bytes::from(out))
     }
 
-    /// The whole stream of a small part, fetched with one `GET` per chunk.
     async fn whole(&self, r: &PartRef) -> Result<Option<Arc<Bytes>>> {
         if r.size > self.shared.cfg.segment_whole_fetch_max {
             return Ok(None);
@@ -1220,7 +1189,7 @@ impl Reading<'_> {
         Ok(idx)
     }
 
-    /// The values of column `ci` for granules `g`.
+    /// Reads and decodes column `ci` across granule range `g`.
     pub async fn column(&self, r: &PartRef, meta: &PartMeta, ci: usize, g: Range<usize>) -> Result<Vector> {
         let c = &meta.cols[ci];
         if g.is_empty() {
@@ -1251,7 +1220,7 @@ impl Reading<'_> {
                 let at = (loc.off - span.start) as usize;
                 let raw = unframe(&data.slice(at..at + loc.len as usize))?;
                 let v = Arc::new(decode_block(&raw, c.phys, idx.dict.as_ref(), idx.rows_of(bi, meta))?);
-                // The index is charged for the part-level dictionary a block shares.
+                // Omit shared dictionary memory because it is already charged to ColIndex.
                 let size = match (&*v, &idx.dict) {
                     (Vector::Str(s), Some(d)) if Arc::ptr_eq(&s.dict, d) => v.values_mem_size(),
                     _ => v.mem_size(),
@@ -1273,7 +1242,7 @@ impl Reading<'_> {
         Ok(Vector::concat(parts, c.phys))
     }
 
-    /// The rows of part `r` its mask deletes.
+    /// Loads the deletion mask for part `r`.
     pub async fn mask(&self, r: &PartRef) -> Result<Arc<Runs>> {
         match &r.mask {
             None => Ok(Arc::new(Runs::default())),
@@ -1296,7 +1265,6 @@ impl Reading<'_> {
     }
 }
 
-/// The byte range of a framed section `len` bytes long at `off`.
 fn section(off: u64, len: u64) -> DResult<Range<u64>> {
     match off.checked_add(len) {
         Some(end) if len <= FRAMED_MAX => Ok(off..end),
@@ -1304,15 +1272,13 @@ fn section(off: u64, len: u64) -> DResult<Range<u64>> {
     }
 }
 
-/// Decodes a whole part stream and returns its metadata and the position
-/// of every row, checking each column's index and blocks; used by storage
-/// invariant checks.
+/// Validates all column indexes and blocks in `stream` and returns `(PartMeta, row_positions)`.
 pub fn inspect(
     stream: &Bytes,
     r: &PartRef,
 ) -> std::result::Result<(PartMeta, Vec<crate::engine::events::Pos>), String> {
     if stream.len() as u64 != r.size {
-        return Err(format!("part {} has {} bytes, its reference says {}", r.id, stream.len(), r.size));
+        return Err(format!("part {} has {} bytes, expected {}", r.id, stream.len(), r.size));
     }
     let slice = |off: u64, len: u64| -> std::result::Result<Bytes, String> {
         let end = off.checked_add(len).filter(|e| *e <= r.size).ok_or("range out of bounds")?;
@@ -1330,7 +1296,7 @@ pub fn inspect(
         }
         let v = Vector::concat(parts, c.phys);
         if v.len() as u64 != meta.rows || (v.len() - v.nulls()) as u64 != c.nonnull {
-            return Err(format!("part {} column {:?} does not have its rows", r.id, c.cref));
+            return Err(format!("part {} column {:?} row or non-null count mismatch", r.id, c.cref));
         }
         columns.insert(c.cref.clone(), v);
     }
@@ -1338,11 +1304,11 @@ pub fn inspect(
         Some(Vector::Int(x)) => Some(x.clone()),
         _ => None,
     };
-    let ords = ints(&ColRef::Ordinal).ok_or_else(|| format!("part {} has no ordinals", r.id))?;
+    let ords = ints(&ColRef::Ordinal).ok_or_else(|| format!("part {} is missing ordinals", r.id))?;
     let vers = match (r.version, ints(&ColRef::Version)) {
         (Some(v), None) => vec![Some(v as i64); ords.len()],
         (None, Some(v)) => v,
-        _ => return Err(format!("part {} has versions in both its reference and its rows", r.id)),
+        _ => return Err(format!("part {} specifies versions in both reference and column", r.id)),
     };
     let pos = ords
         .iter()
@@ -1352,7 +1318,7 @@ pub fn inspect(
     Ok((meta, pos))
 }
 
-/// Writes a mask object and returns its id and size.
+/// Uploads an external deletion mask object and returns `(mask_id, size_bytes)`.
 pub async fn write_mask(shared: &Shared, db: &str, runs: &Runs) -> Result<(String, u64)> {
     let id = crate::engine::types::make_blob_id(shared.time_ms(), &shared.env.random_bytes(10));
     let data = crate::engine::events::encode_mask_object(runs);
@@ -1361,7 +1327,7 @@ pub async fn write_mask(shared: &Shared, db: &str, runs: &Runs) -> Result<(Strin
     Ok((id, data.len() as u64))
 }
 
-/// A new part id: a 48-bit creation time and 80 random bits.
+/// Generates a part ID encoding a 48-bit timestamp and 80 random bits.
 pub fn new_part_id(shared: &Shared) -> String {
     crate::engine::types::make_blob_id(shared.time_ms(), &shared.env.random_bytes(10))
 }
@@ -1372,7 +1338,7 @@ pub(crate) mod tests {
     use crate::util::rng::Rng;
 
     #[test]
-    fn blocks_roundtrip_every_encoding() {
+    fn roundtrip_block_encodings() {
         let mut r = Rng::new(9);
         for _ in 0..300 {
             let n = 1 + r.usize(200);
@@ -1417,7 +1383,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn metadata_and_indexes_roundtrip() {
+    fn roundtrip_metadata_and_indexes() {
         let meta = PartMeta {
             rows: 5,
             granules: vec![3, 2],
@@ -1454,9 +1420,7 @@ pub(crate) mod tests {
         assert_eq!(stat_prefix(&"é".repeat(40)).len(), 32);
     }
 
-    /// The metadata of a part of `granules` whose only column, of ordinals,
-    /// holds the first `data_len` bytes of the part.
-    fn one_column_part(phys: Phys, granules: Vec<u32>, data_len: u64) -> PartMeta {
+    fn single_column_part(phys: Phys, granules: Vec<u32>, data_len: u64) -> PartMeta {
         let mut starts = vec![0];
         starts.extend(granules.iter().scan(0, |at, g| {
             *at += *g as u64;
@@ -1483,8 +1447,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Stores `stream` in chunks of `chunk_bytes` as a part whose reference
-    /// gives `rows` and the metadata's offset and length `meta_at`.
     async fn store_part(
         db: &crate::engine::Db,
         stream: &[u8],
@@ -1521,8 +1483,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Stores a two-granule part whose only column (ordinals) has the
-    /// given blocks in its index, and reads the column back.
     fn read_with_blocks(blocks: impl Fn(&[(u64, u64)]) -> Vec<BlockLoc>) -> Result<Vector> {
         use crate::engine::tests::{engine, rt};
         rt().block_on(async {
@@ -1542,7 +1502,7 @@ pub(crate) mod tests {
             let index = ColIndex { dict: None, blocks: blocks(&locs), stats: vec![stat.clone(), stat], blooms: vec![] }
                 .encode(Phys::Int)
                 .unwrap();
-            let mut meta = one_column_part(Phys::Int, vec![1, 1], stream.len() as u64);
+            let mut meta = single_column_part(Phys::Int, vec![1, 1], stream.len() as u64);
             meta.cols[0].index_off = stream.len() as u64;
             meta.cols[0].index_len = index.len() as u64;
             stream.extend_from_slice(&index);
@@ -1558,7 +1518,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_well_formed_index_reads_back() {
+    fn valid_index_is_read() {
         let v = read_with_blocks(|l| {
             vec![
                 BlockLoc { off: l[0].0, len: l[0].1, first_granule: 0 },
@@ -1569,13 +1529,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_column_index_without_blocks_is_refused() {
+    fn column_index_without_blocks_is_rejected() {
         let v = std::panic::catch_unwind(|| read_with_blocks(|_| vec![]));
         assert!(matches!(v, Ok(Err(_))), "{v:?}");
     }
 
     #[test]
-    fn a_column_index_with_overlapping_blocks_is_refused() {
+    fn column_index_with_overlapping_blocks_is_rejected() {
         let v = std::panic::catch_unwind(|| {
             read_with_blocks(|l| {
                 vec![
@@ -1587,7 +1547,6 @@ pub(crate) mod tests {
         assert!(matches!(v, Ok(Err(_))), "{v:?}");
     }
 
-    /// Rows supplied from whole columns.
     struct Columns {
         plans: Vec<ColPlan>,
         cols: Vec<Vector>,
@@ -1623,7 +1582,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// `n` rows of a column of every type and encoding.
     fn sample_columns(r: &mut Rng, n: usize) -> Columns {
         let words: Vec<String> = (0..5).map(|i| format!("w{i}é")).collect();
         let pick = |r: &mut Rng| r.chance(0.8).then(|| words[r.usize(words.len())].as_str());
@@ -1649,7 +1607,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A value at or beside an edge: zero, the largest, around `near`, or random.
     fn edge(r: &mut Rng, near: u64) -> u64 {
         match r.usize(6) {
             0 => 0,
@@ -1661,7 +1618,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Overwrites, inserts, removes or truncates a few bytes of `b`.
     fn mutate_bytes(r: &mut Rng, b: &mut Vec<u8>) {
         for _ in 0..1 + r.usize(4) {
             let at = r.usize(b.len() + 1);
@@ -1675,14 +1631,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// Changes one field of part metadata.
     fn mutate_meta(r: &mut Rng, m: &mut PartMeta, size: u64) {
         let n = m.granules.len();
         let c = r.usize(m.cols.len());
         match r.usize(8) {
             0 => m.granules[r.usize(n)] = edge(r, 16) as u32,
             1 => {
-                // Moves rows between granules, keeping the part's row count.
                 let (a, b) = (r.usize(n), r.usize(n));
                 let k = r.below(m.granules[a] as u64) as u32;
                 m.granules[a] -= k;
@@ -1704,7 +1658,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Changes one field of a column index.
     fn mutate_index(r: &mut Rng, idx: &mut ColIndex, size: u64) {
         let (nb, g) = (idx.blocks.len(), r.usize(idx.stats.len()));
         let b = r.usize(nb);
@@ -1728,8 +1681,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A corrupt copy of a part's stream, with the rows and the metadata's
-    /// offset and length its reference gives.
     fn corrupt(
         r: &mut Rng,
         stream: &[u8],
@@ -1763,8 +1714,6 @@ pub(crate) mod tests {
                 meta_bytes = Some(framed(&raw, Compression::Zstd(1), "").unwrap());
             }
             4 => {
-                // Moves the column's blocks from `bi` on to the end of the
-                // stream, corrupting block `bi`'s values under a valid frame.
                 let bi = r.usize(idx.blocks.len());
                 for (i, loc) in idx.blocks.iter_mut().enumerate().skip(bi) {
                     let mut block = s[loc.off as usize..(loc.off + loc.len) as usize].to_vec();
@@ -1800,12 +1749,8 @@ pub(crate) mod tests {
         (s, rows, at)
     }
 
-    /// Reads of real parts whose metadata, column indexes or blocks are
-    /// corrupted, by changing a field and encoding it again or by changing
-    /// payload bytes under a valid frame, return an error or the rows they
-    /// asked for, and never panic.
     #[test]
-    fn corrupt_parts_are_refused_without_panicking() {
+    fn corrupt_parts_are_rejected_without_panicking() {
         use crate::engine::tests::{engine, rt};
         let rt = rt();
         let (_eng, db) = rt.block_on(async {
@@ -1839,7 +1784,7 @@ pub(crate) mod tests {
             .collect();
         assert!(indexes.iter().any(|i| i.blocks.len() > 2), "{indexes:?}");
         crate::util::prop::check(
-            "corrupt_parts_are_refused_without_panicking",
+            "corrupt_parts_are_rejected_without_panicking",
             3000,
             |r| r.next_u64(),
             |_| Vec::new(),
@@ -1873,7 +1818,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fuzz_decoders_never_panic() {
+    fn fuzz_decoders() {
         let mut r = Rng::new(31);
         let v = Vector::Int(vec![Some(1), None, Some(3)]);
         let goods = [encode_block(&v, None).unwrap()];
@@ -1891,7 +1836,7 @@ pub(crate) mod tests {
             }
             for p in [Phys::Int, Phys::Float, Phys::Bool, Phys::Str] {
                 let _ = decode_block(&d, p, Some(&Arc::new(vec!["a".into()])), 3);
-                let meta = one_column_part(p, vec![2, 1], 64);
+                let meta = single_column_part(p, vec![2, 1], 64);
                 let _ = ColIndex::decode(&Bytes::from(d.clone()), &meta, &meta.cols[0]);
             }
             let _ = PartMeta::decode(&Bytes::from(d), 3);

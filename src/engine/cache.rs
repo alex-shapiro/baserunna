@@ -31,7 +31,6 @@ impl CacheKey {
         CacheKey { db: hash_str(db), object: object_id(id), part: PART_LEVELS }
     }
 
-    /// Item `item` of section `section` of an event part or mask object.
     pub fn part(db: &str, id: &str, section: u32, item: u32) -> CacheKey {
         CacheKey { db: hash_str(db), object: object_id(id) ^ ((section as u128 + 1) << 96).rotate_left(17), part: item }
     }
@@ -97,7 +96,7 @@ pub enum CacheVal {
     Index(Arc<SegmentIndex>),
     Block(Block),
     Levels(Arc<Levels>),
-    /// Decoded event part data, with its approximate size in bytes.
+    /// Arbitrary cached value and its estimated heap size in bytes.
     Any(Arc<dyn std::any::Any + Send + Sync>, usize),
 }
 

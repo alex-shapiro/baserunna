@@ -50,7 +50,7 @@ fn data_key(r: &mut Rng, max_len: usize) -> Vec<u8> {
     if k[0] == types::COMMIT_SPACE {
         k[0] -= 1;
     }
-    // Event tables own these spaces, and the sweep refuses refs it cannot read.
+    // Event tables reserve these prefixes, and sweeps fail if a part reference cannot be decoded.
     if (events::UNSEALED..=events::TABLE_STATE).contains(&k[0]) {
         k[0] = events::UNSEALED - 1;
     }

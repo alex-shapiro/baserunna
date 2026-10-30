@@ -76,7 +76,7 @@ struct Info {
 fn limits(s: &Stream) -> String {
     let mut out = Vec::new();
     if let Some(ms) = s.retention_ms {
-        out.push(super::span(ms));
+        out.push(super::format_duration(ms));
     }
     if let Some(b) = s.max_bytes {
         out.push(format_bytes(b));

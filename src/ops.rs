@@ -213,7 +213,7 @@ pub enum Op {
     },
 }
 
-/// A `query_events` op: a table and an event query beside it.
+/// Payload of a `query_events` transaction operation.
 #[derive(Debug, Clone)]
 pub struct EventsQuery {
     pub table: String,
@@ -303,7 +303,7 @@ pub struct OpCtx<'a> {
     pub access: crate::meta::Access,
     /// Blob values up to this size are returned inline in JSON.
     pub json_value_max: u64,
-    /// Limits on the work of `query_events` ops.
+    /// Resource limits for `query_events` operations.
     pub query_limits: crate::events::exec::Limits,
 }
 

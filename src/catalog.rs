@@ -1,6 +1,4 @@
-//! Paged listings of catalog entries (SPEC §10): entries stored at
-//! `space ++ name`, listed in name order after an opaque cursor that holds
-//! the last name of the previous page.
+//! Paginated prefix scans over catalog entries keyed by `space ++ name` (SPEC §10).
 
 use crate::engine::{KeyRange, ReadValue, Txn};
 use crate::error::{Error, Result};
@@ -8,12 +6,11 @@ use crate::util::b64;
 use bytes::Bytes;
 use std::ops::Bound;
 
-/// A page of named entries and the cursor of the next page.
+/// A page of `(name, entry)` pairs and the cursor for the next page.
 pub type NamesPage = (Vec<(String, ReadValue)>, Option<String>);
 
-/// Up to `limit` entries keyed `space ++ name` whose names start with
-/// `prefix`, after the name `cursor` holds. The next cursor is `Some` when
-/// more entries may follow. A cursor that does not decode is refused.
+/// Scans up to `limit` entries with keys `space ++ name` where `name` starts
+/// with `prefix`, resuming after `cursor` if present.
 pub async fn names_page(
     txn: &mut Txn,
     space: &[u8],
@@ -31,8 +28,6 @@ pub async fn names_page(
     Ok((page, next))
 }
 
-/// The keys `space ++ name` of names starting with `prefix` after the name
-/// `cursor` holds; `None` if no name can be.
 fn names_after(space: &[u8], prefix: &str, cursor: Option<&str>) -> Result<Option<KeyRange>> {
     let key = |name: &[u8]| Bytes::from([space, name].concat());
     let range = KeyRange::prefix(&key(prefix.as_bytes()));

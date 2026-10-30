@@ -1,5 +1,4 @@
-//! Event table routes (SPEC §4.8, §10): tables, bulk inserts as JSON or
-//! NDJSON, queries and deletes.
+//! HTTP routes for event tables (SPEC §4.8, §10).
 
 use super::data::{
     PathMap, commit_hex, content_type, idempotency_header, one_idempotency_key, param, split_consistency,
@@ -23,20 +22,16 @@ use std::sync::Arc;
 
 type J = axum::Json<Json>;
 
-/// Routes whose requests every node serves itself instead of forwarding
-/// them to the lease holder: bulk inserts stage parts where they arrive,
-/// and queries read part objects, which any node can.
+/// Returns `true` if a request is an event bulk insert or query, which can be
+/// served by any node without forwarding to the lease holder.
 pub(super) fn served_locally(method: &http::Method, path: &str) -> bool {
     matches!(event_rows_route(method, path).as_deref(), Some([] | ["query"]))
 }
 
-/// Whether a request is an event query, which reads a snapshot at most
-/// [`QUERY_STALENESS_MS`] old unless it asks for strong consistency.
 pub(super) fn is_query(method: &http::Method, path: &str) -> bool {
     matches!(event_rows_route(method, path).as_deref(), Some(["query"]))
 }
 
-/// The segments after `rows` of a `POST /v1/dbs/{db}/events/{t}/rows…` path.
 fn event_rows_route<'a>(method: &http::Method, path: &'a str) -> Option<Vec<&'a str>> {
     let segs: Vec<&str> = path.trim_end_matches('/').split('/').collect();
     let route = method == http::Method::POST
@@ -47,7 +42,7 @@ fn event_rows_route<'a>(method: &http::Method, path: &'a str) -> Option<Vec<&'a 
     route.then(|| segs[7..].to_vec())
 }
 
-/// The staleness of an event query's snapshot by default.
+/// Default maximum snapshot staleness for event queries, in milliseconds.
 pub(super) const QUERY_STALENESS_MS: u64 = 5_000;
 
 pub fn routes() -> Router<Arc<Node>> {
@@ -172,11 +167,10 @@ async fn drop_skip_index(
 
 const BODY_SHAPE: &str = "the body is {\"rows\": [...]}, an array of events, or NDJSON";
 
-/// Calls `f` with each event of an insert body, `{"rows": [...]}`, an array
-/// of events or NDJSON, as it is parsed, so that a body is never held as a
-/// whole parsed value; returns the body's idempotency key.
+/// Streams events from a JSON or NDJSON insert body into `f` without buffering
+/// the parsed array, and returns the body's `idempotency_key` if present.
 fn each_event(content_type: &str, data: &[u8], f: &mut dyn FnMut(Json) -> Result<()>) -> Result<Option<String>> {
-    crate::util::json::refuse_inexact_integers(data).map_err(Error::invalid)?;
+    crate::util::json::reject_inexact_integers(data).map_err(Error::invalid)?;
     match content_type {
         "" | "application/json" => {
             let mut failed = None;
@@ -203,8 +197,6 @@ fn each_event(content_type: &str, data: &[u8], f: &mut dyn FnMut(Json) -> Result
     }
 }
 
-/// An insert body's events, each passed to `f`; an error of `f` stops the
-/// parse and is kept in `failed`.
 struct Events<'a> {
     f: &'a mut dyn FnMut(Json) -> Result<()>,
     failed: &'a mut Option<Error>,
@@ -226,23 +218,22 @@ impl<'de> serde::de::Visitor<'de> for Events<'_> {
         while let Some(v) = seq.next_element::<Json>()? {
             if let Err(e) = (self.f)(v) {
                 *self.failed = Some(e);
-                return Err(serde::de::Error::custom("refused"));
+                return Err(serde::de::Error::custom("rejected"));
             }
         }
         Ok(())
     }
 }
 
-/// An insert body, answering its idempotency key.
 struct Body<'a> {
     f: &'a mut dyn FnMut(Json) -> Result<()>,
     failed: &'a mut Option<Error>,
 }
 
 impl Body<'_> {
-    fn refuse<E: serde::de::Error>(self, e: Error) -> E {
+    fn serde_err<E: serde::de::Error>(self, e: Error) -> E {
         *self.failed = Some(e);
-        E::custom("refused")
+        E::custom("rejected")
     }
 }
 
@@ -265,7 +256,7 @@ impl<'de> serde::de::Visitor<'de> for Body<'_> {
         let (mut key, mut rows, mut keyed) = (None, false, false);
         while let Some(k) = map.next_key::<String>()? {
             if (k == "rows" && rows) || (k == "idempotency_key" && keyed) {
-                return Err(self.refuse(Error::invalid(format!("{k:?} appears twice"))));
+                return Err(self.serde_err(Error::invalid(format!("{k:?} appears twice"))));
             }
             match k.as_str() {
                 "rows" => {
@@ -277,14 +268,14 @@ impl<'de> serde::de::Visitor<'de> for Body<'_> {
                     match map.next_value::<Json>()? {
                         Json::Null => key = None,
                         Json::String(k) => key = Some(k),
-                        _ => return Err(self.refuse(Error::invalid("idempotency_key is a string"))),
+                        _ => return Err(self.serde_err(Error::invalid("idempotency_key is a string"))),
                     }
                 }
-                other => return Err(self.refuse(Error::invalid(format!("unknown field {other:?}")))),
+                other => return Err(self.serde_err(Error::invalid(format!("unknown field {other:?}")))),
             }
         }
         if !rows {
-            return Err(self.refuse(Error::invalid(BODY_SHAPE)));
+            return Err(self.serde_err(Error::invalid(BODY_SHAPE)));
         }
         Ok(key)
     }
@@ -304,8 +295,7 @@ async fn insert(
     let data = axum::body::to_bytes(req.into_body(), limit)
         .await
         .map_err(|_| Error::TooLarge(format!("bulk inserts are limited to {limit} bytes")))?;
-    // A retry is answered from its first attempt before its events are read,
-    // so the body is parsed once for its key and once for its events.
+    // Extract the idempotency key first so a replay returns before validating rows.
     let body_key = each_event(&ct, &data, &mut |_| Ok(()))?;
     let key = one_idempotency_key(header_key, body_key)?;
     let commit_id = super::commit_id_for(&node, &ctx, key.as_deref())?;
@@ -314,8 +304,7 @@ async fn insert(
     }
     let (schema, _) = with_read!(ctx.db, Consistency::Strong, |t| events::get_schema(t, &name).await);
     let now = node.now_ms() as i64;
-    // Encoding adds the defaults events omit, so the smallest events take
-    // up to about 5 times their text; any body may encode to the body limit.
+    // Encoded column defaults can expand small JSON objects up to ~5x.
     let mut valid = events::ValidRows::up_to((8 * data.len()).max(limit));
     each_event(&ct, &data, &mut |v| valid.push(&schema, &v, now))?;
     drop(data);
@@ -330,8 +319,6 @@ async fn insert(
     inserted(&c, commit_id)
 }
 
-/// The answer to a bulk insert, from the commit that applied it: a replay
-/// reports what the original request inserted.
 fn inserted(c: &Committed, commit_id: u64) -> Result<Response> {
     let Some(count) = c.inserted else {
         return Err(Error::invalid("the idempotency key was used by a request other than an event insert"));
@@ -344,9 +331,7 @@ fn inserted(c: &Committed, commit_id: u64) -> Result<Response> {
     Ok((status, axum::Json(body)).into_response())
 }
 
-/// Splits a query body into the query and its consistency: a snapshot at
-/// most `max_staleness_ms` (5 s by default) old, so that queries do not load
-/// the lease holder, unless `consistency` says otherwise.
+/// Extracts consistency settings from an event query body, defaulting to a 5 s snapshot.
 fn query_consistency(mut b: Json) -> Result<(Json, Consistency)> {
     if !b.is_object() {
         return Err(Error::invalid("the query is a JSON object"));
@@ -378,7 +363,7 @@ async fn query(
             exec::run(db.shared(), &db.id, t, &s, &q, &limits).await
         }))
     };
-    // A snapshot may predate the table or a column the caller just added.
+    // Retry with strong consistency if the local snapshot predates a new table or column.
     let (out, v) = match run(c).await {
         Err(Error::NotFound(_) | Error::InvalidArgument(_)) if matches!(c, Consistency::Snapshot { .. }) => {
             run(Consistency::Strong).await?
@@ -388,7 +373,6 @@ async fn query(
     Ok(axum::Json(output_json(&out, v)))
 }
 
-/// The JSON form of a query's answer at version `v`.
 pub fn output_json(out: &exec::Output, v: u64) -> Json {
     json!({
         "columns": out.columns,
@@ -423,15 +407,14 @@ async fn delete_rows(
     Ok(axum::Json(json!({"deleted": n, "version": v})))
 }
 
-/// The body of `POST /internal/v1/events/bind`: a bind forwarded to the lease holder.
+/// Request body for `POST /internal/v1/events/bind`.
 #[derive(serde::Serialize, Deserialize)]
 pub(crate) struct ForwardedBind {
     pub db: String,
-    /// The bind's binary encoding, as base64.
+    /// Base64-encoded [`crate::engine::events::Bind`].
     pub bind: String,
 }
 
-/// Encodes each slot's outcome of a bind.
 pub(crate) fn bind_results_json(rs: &[Result<Committed>]) -> Json {
     Json::Array(
         rs.iter()
@@ -465,7 +448,6 @@ pub(crate) fn bind_results_from_json(j: &Json, n: usize) -> Result<Vec<Result<Co
         .collect())
 }
 
-/// Handles `POST /internal/v1/events/bind` on the lease holder.
 pub(super) async fn internal_bind(
     State(node): State<Arc<Node>>,
     axum::Json(b): axum::Json<ForwardedBind>,

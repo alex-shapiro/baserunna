@@ -218,7 +218,7 @@ pub fn parse_lines(data: &Bytes, json: bool) -> Result<Vec<Body>> {
             if serde_json::from_slice::<serde::de::IgnoredAny>(line).is_err() {
                 return Err(Error::invalid(format!("line {} is not JSON", i + 1)));
             }
-            crate::util::json::refuse_inexact_integers(line)
+            crate::util::json::reject_inexact_integers(line)
                 .map_err(|e| Error::invalid(format!("line {}: {e}", i + 1)))?;
             out.push(Body { json: true, headers: Vec::new(), data: slice });
         } else {

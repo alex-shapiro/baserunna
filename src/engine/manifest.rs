@@ -17,8 +17,7 @@ const MAGIC: &[u8; 4] = b"BRMF";
 
 /// The database was deleted: every read and commit fails with not-found.
 pub const FLAG_DELETED: u64 = 1;
-/// The database has had an event table, so `part/` may hold objects for the
-/// orphan sweep to collect, even once every table is dropped.
+/// Set if the database has had an event table, so that orphan sweeps scan `part/`.
 pub const FLAG_EVENT_TABLES: u64 = 2;
 const FORMAT: u16 = 8;
 const FORMAT_V7: u16 = 7;
@@ -109,7 +108,7 @@ pub enum ObjKind {
     Blob = 1,
     /// External levels object; see [`Manifest::levels`].
     Levels = 2,
-    /// An event table part or mask: every object under `part/{id}/`.
+    /// Event table part or mask object under `part/{id}/`.
     Part = 3,
 }
 
@@ -207,8 +206,7 @@ pub struct Manifest {
     pub chunk_bytes: BlobBytes,
     /// Incremented by every tail flush install so stale background flushes are rejected.
     pub flush_seq: u64,
-    /// Exact bytes of the event table parts and masks that references name
-    /// (SPEC §5.10), maintained by every commit that changes a reference.
+    /// Total stored bytes of referenced event table parts and mask objects (SPEC §5.10).
     pub part_bytes: u64,
 }
 

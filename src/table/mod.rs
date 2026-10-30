@@ -26,7 +26,7 @@ pub const SPACE_ROW_BLOBS: u8 = 0x04;
 
 const MAX_EXAMINED_PER_QUERY: usize = 10_000;
 
-/// Where table schemas are kept, by name.
+/// Key prefix for row table schemas.
 const SCHEMAS: &[u8] = &[SPACE_CATALOG, b't', b'/'];
 
 fn catalog_key(name: &str) -> Bytes {
@@ -79,8 +79,7 @@ fn blob_side_key(tid: u32, pk: &[Key], col: u32) -> Bytes {
     Bytes::from(k)
 }
 
-/// A page of the tables whose names start with `prefix`, after `cursor`,
-/// with the cursor of the next page.
+/// Lists up to `limit` table schemas whose names start with `prefix`, resuming after `cursor`.
 pub async fn list_tables(
     txn: &mut Txn,
     prefix: &str,
@@ -91,7 +90,7 @@ pub async fn list_tables(
     Ok((page.iter().map(|(_, it)| decode_schema(it)).collect::<Result<_>>()?, next))
 }
 
-/// Every table, for checks that must see them all.
+/// Returns all table schemas in the database.
 pub async fn all_tables(txn: &mut Txn) -> Result<Vec<TableSchema>> {
     txn.scan(&KeyRange::prefix(SCHEMAS), false, usize::MAX).await?.iter().map(decode_schema).collect()
 }
@@ -195,7 +194,7 @@ pub async fn create_table(txn: &mut Txn, def: &CreateTable) -> Result<TableSchem
     Ok(s)
 }
 
-/// Takes the next id shared by row and event tables.
+/// Allocates the next table ID, shared across row and event tables.
 pub(crate) async fn allocate_table_id(txn: &mut Txn) -> Result<u32> {
     let next = match txn.get(&next_id_key()).await? {
         Some(ReadValue { value: Value::Inline(b), .. }) => std::str::from_utf8(&b)
@@ -880,9 +879,8 @@ fn decode_stored_row(s: &TableSchema, prefix: &[u8], it: &ReadValue) -> Result<(
     Ok((pk, row))
 }
 
-/// Reads every row of table `s` into the transaction's read set, passing
-/// each to `f` with its defaults filled in, so that the caller holds only
-/// what it keeps of them.
+/// Scans all rows of table `s` into the transaction's read set and passes each
+/// decoded row to `f`.
 pub(crate) async fn each_row(txn: &mut Txn, s: &TableSchema, mut f: impl FnMut(Row) -> Result<()>) -> Result<()> {
     let prefix = table_prefix(SPACE_ROWS, s.id);
     let mut pages = Pages::new(KeyRange::prefix(&prefix));
@@ -973,8 +971,8 @@ fn bind_filter(s: &TableSchema, f: &Filter) -> Result<RowFilter> {
     })
 }
 
-/// A filter argument as a datum of `ty`. A float column refuses integers
-/// that no float equals, which converting would round to a neighbour.
+/// Converts a JSON filter argument to a [`Datum`] of `ty`, rejecting integer
+/// literals that cannot be represented losslessly as `f64` for float columns.
 fn filter_arg(ty: ColType, v: &Json, name: &str) -> Result<Datum> {
     if ty == ColType::Float
         && let Json::Number(n) = v
@@ -990,7 +988,6 @@ fn row_matches(f: &RowFilter, row: &Row) -> bool {
     f.eval(&mut |id| row.get(id).filter(|d| !matches!(d, Datum::Null | Datum::Json(Json::Null))))
 }
 
-/// A datum as equality sees it: one equals another of its own type only.
 fn plain(d: &Datum) -> Option<filter::Plain<'_>> {
     use filter::Plain;
     Some(match d {

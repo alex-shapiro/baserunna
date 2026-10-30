@@ -1,13 +1,11 @@
-//! Events inserted near an event table's retention boundary while its
-//! retention changes and maintenance drops expired partitions.
+//! Simulation workload for event table retention boundaries.
 //!
-//! Retention is judged by the store's clock, which the simulator's clock
-//! is, within the clock-sync error. An event is at risk once any retention
-//! that may have been in effect put it within [`SLACK_MS`] of the boundary:
-//! it may be skipped by queries and dropped by maintenance. Every other
-//! acknowledged event must be in every answer at or after its version, no
-//! answer may hold an event no insert wrote, and after healing no query may
-//! return an event clearly past the final retention.
+//! Retention is evaluated against the store clock within the clock-sync error
+//! bound. If any active retention setting places an event within [`SLACK_MS`]
+//! of the retention cutoff, queries may omit the event and maintenance may drop
+//! its partition. Every other committed event must appear in all queries at or
+//! after its commit version, and post-healing queries must omit events older
+//! than the final retention window.
 
 use super::super::Sim;
 use super::super::client::Client;
@@ -20,18 +18,12 @@ const DB: &str = "/v1/dbs/events";
 const TABLE: &str = "/v1/dbs/events/events/ret";
 const MINUTE: i64 = 60_000;
 const HOUR: i64 = 3_600_000;
-/// Retentions the table switches among.
 const RETENTIONS: [i64; 3] = [90 * MINUTE, 2 * HOUR, 150 * MINUTE];
-/// Clock error and scheduling slack around the retention boundary.
 const SLACK_MS: i64 = 3_000;
-/// How long a replaced retention may still be applied: a maintenance round
-/// plans drops from a schema snapshot and commits them without reading the
-/// retention again (TODO.md, "Re-check retention when dropping expired
-/// parts").
+// Maintenance plans partition drops from a schema snapshot and commits them
+// without re-reading the retention setting.
 const LAG_MS: i64 = 60_000;
 
-/// A retention setting: when it was requested, and when it had certainly
-/// taken effect.
 struct Change {
     retention: i64,
     sent_ms: i64,
@@ -64,9 +56,7 @@ fn world(w: &Shared) -> std::sync::MutexGuard<'_, World> {
 }
 
 impl World {
-    /// The latest boundary any retention in effect up to `upto` drew: events
-    /// before it, plus slack, may have been skipped or dropped.
-    fn risk_line(&self, upto: i64) -> i64 {
+    fn risk_cutoff(&self, upto: i64) -> i64 {
         let mut line = i64::MIN;
         for (i, c) in self.changes.iter().enumerate() {
             if c.sent_ms > upto {
@@ -114,9 +104,9 @@ async fn inserter(c: Client, w: Shared, steps: usize, transactional: bool) -> Re
             (format!("{TABLE}/rows"), if nd { json!(rows) } else { json!({"rows": rows}) }, nd)
         };
         let version = match settle(&c, &path, ndjson, &body, &format!("{}-{step}", c.name)).await? {
-            Settled::Done(j) => Some(j["version"].as_u64().ok_or(format!("{}: no version in {j}", c.name))?),
+            Settled::Done(j) => Some(j["version"].as_u64().ok_or(format!("{}: missing version in {j}", c.name))?),
             Settled::Unknown => None,
-            Settled::Rejected(r) => return Err(format!("{}: ret insert refused: {} {}", c.name, r.status, r.json)),
+            Settled::Rejected(r) => return Err(format!("{}: ret insert rejected: {} {}", c.name, r.status, r.json)),
         };
         world(&w).inserts.push(Insert { version, uids });
         let ms = c.rng().below(500);
@@ -150,12 +140,11 @@ fn rows_query(strong: bool) -> Json {
     q
 }
 
-/// The uids of a rows answer, which holds each event at most once.
 fn distinct_uids(answer: &Json) -> Result<BTreeSet<String>, String> {
     let mut uids = BTreeSet::new();
     for u in answer["rows"].as_array().into_iter().flatten().filter_map(|x| x[0].as_str()) {
         if !uids.insert(u.to_string()) {
-            return Err(format!("ret answer at v{} holds {u} twice", answer["version"]));
+            return Err(format!("ret answer at v{} returned duplicate uid {u}", answer["version"]));
         }
     }
     Ok(uids)
@@ -170,7 +159,7 @@ async fn querier(c: Client, w: Shared, steps: usize) -> Result<(), String> {
         let recv_ms = c.sim.now_ms() as i64;
         match r {
             Ok(r) if r.status == 200 && !r.json["next_cursor"].is_string() => {
-                let version = r.json["version"].as_u64().ok_or(format!("ret answer without a version: {}", r.json))?;
+                let version = r.json["version"].as_u64().ok_or(format!("ret answer is missing version: {}", r.json))?;
                 let uids = distinct_uids(&r.json)?;
                 world(&w).answers.push(Answer { recv_ms, version, uids });
             }
@@ -215,10 +204,10 @@ impl Retention {
     }
 
     fn check_answer(g: &World, a: &Answer, final_read: bool) -> Result<(), String> {
-        let line = g.risk_line(a.recv_ms);
+        let cutoff = g.risk_cutoff(a.recv_ms);
         for u in &a.uids {
             if !g.times.contains_key(u) {
-                return Err(format!("ret answer at v{} holds {u}, which no insert wrote", a.version));
+                return Err(format!("ret answer at v{} returned unknown uid {u}", a.version));
             }
         }
         for x in &g.inserts {
@@ -226,14 +215,14 @@ impl Retention {
                 continue;
             }
             for u in &x.uids {
-                if !a.uids.contains(u) && g.times[u] >= line {
+                if !a.uids.contains(u) && g.times[u] >= cutoff {
                     return Err(format!(
-                        "ret answer at v{} lacks {u} (time {}), acknowledged at v{:?}, {} ms within retention \
-                         (risk line {line}, read at {}{})",
+                        "ret answer at v{} is missing {u} (time {}), committed at v{:?}, {} ms within retention \
+                         (cutoff {cutoff}, read at {}{})",
                         a.version,
                         g.times[u],
                         x.version,
-                        g.times[u] - line + SLACK_MS,
+                        g.times[u] - cutoff + SLACK_MS,
                         a.recv_ms,
                         if final_read { ", final" } else { "" }
                     ));
@@ -243,8 +232,8 @@ impl Retention {
         Ok(())
     }
 
-    /// Checks the answers collected under faults, then a strong read after
-    /// healing, which must also skip events clearly past the final retention.
+    /// Verifies recorded query responses and runs a final strong query to confirm
+    /// that expired events are omitted.
     pub async fn check(&self, c: &Client) -> Result<(), String> {
         let sent_ms = c.sim.now_ms() as i64;
         let r = c.call_retry("POST", &format!("{TABLE}/rows/query"), Some(rows_query(true))).await;
@@ -262,7 +251,7 @@ impl Retention {
         Self::check_answer(&g, &last, true)?;
         let past = sent_ms - g.current() - SLACK_MS;
         if let Some(u) = last.uids.iter().find(|u| g.times[*u] < past) {
-            return Err(format!("ret final read returned {u} at {}, past retention (before {past})", g.times[u]));
+            return Err(format!("ret final read returned expired uid {u} at {} (cutoff {past})", g.times[u]));
         }
         c.sim.trace.event(&format!(
             "events: ret {} rows after {} retention changes, {} answers checked",

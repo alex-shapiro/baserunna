@@ -488,7 +488,6 @@ pub fn scenarios() -> Vec<Scenario> {
             name: "events",
             config: |k| {
                 let mut c = world(k, faulty((1, 4)));
-                // Small granules give parts enough of them for every pruning method to apply.
                 c.engine.event_granule_rows = k.log_range("events.granule_rows", 2, 16) as usize;
                 events::short_gc(k, &mut c);
                 c.node.engine = c.engine.clone();

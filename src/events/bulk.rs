@@ -1,8 +1,8 @@
-//! Bulk inserts (SPEC §5.13): requests are buffered per node and table
-//! (ClickHouse's asynchronous inserts with `wait_for_async_insert`),
-//! staged as level 0 parts on the receiving node, and bound by one commit
-//! on the lease holder, so row data never passes through it. Each request
-//! is its own transaction with its own commit record.
+//! Bulk inserts (SPEC §5.13) buffer requests per node and table, stage rows as
+//! level 0 parts on the receiving node, and bind them in a single commit on the
+//! lease holder so that row data never passes through the lease holder. Each
+//! request is committed as an independent transaction with a dedicated commit
+//! record.
 
 use super::ValidRows;
 use super::build::write_encoded;
@@ -16,10 +16,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-/// Binds staged parts on the database's lease holder.
+/// Binds staged parts on the database lease holder.
 pub type BindFn = Arc<dyn Fn(Arc<Db>, Bind) -> BoxFut<'static, Result<Vec<Result<Committed>>>> + Send + Sync>;
 
-/// How long a buffer waits for more requests, and how much it holds.
+/// Batching limits for an insert buffer.
 #[derive(Clone, Copy, Debug)]
 pub struct BufferConfig {
     pub wait_ms: u64,
@@ -41,7 +41,7 @@ struct Buffer {
     generation: u64,
 }
 
-/// The insert buffers of a node, one per database and table.
+/// Insert buffers on a node, keyed by database and table.
 pub struct Buffers {
     map: Mutex<BTreeMap<(String, u32), Buffer>>,
     generations: std::sync::atomic::AtomicU64,
@@ -54,8 +54,8 @@ impl Buffers {
         Arc::new(Buffers { map: Mutex::new(BTreeMap::new()), generations: Default::default(), bind, cfg })
     }
 
-    /// Inserts validated `rows` into table `schema` of `db` as one
-    /// transaction with id `commit_id`, answered once its rows are bound.
+    /// Buffers `rows` for insertion into `schema` as a transaction with
+    /// `commit_id` and waits until the rows are bound.
     pub async fn submit(
         self: &Arc<Self>,
         db: Arc<Db>,
@@ -123,17 +123,15 @@ impl Buffers {
         })?
     }
 
-    /// Flushes `slots` in a task of its own, so that a cancelled request
-    /// does not cancel the flush of the requests buffered with it.
+    // Spawns the flush in a separate task so that a canceled request does not
+    // abort the flush for other requests in the batch.
     fn spawn_flush(self: &Arc<Self>, db: Arc<Db>, schema: EventSchema, slots: Vec<Slot>) {
         let me = self.clone();
         db.shared().env.clone().spawn(async move { me.flush(db, schema, slots).await });
     }
 
-    /// Stages the slots' rows as parts and binds them, answering each slot.
     async fn flush(&self, db: Arc<Db>, schema: EventSchema, slots: Vec<Slot>) {
         let mut ranges = Vec::with_capacity(slots.len());
-        // Each partition's rows as (slot, row) indices, in position order.
         let mut by_partition: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
         let mut ordinal = 0u32;
         let mut senders = Vec::with_capacity(slots.len());
@@ -194,7 +192,7 @@ impl Buffers {
         }
     }
 
-    /// Requests waiting in buffers.
+    /// Returns the number of requests waiting in buffers.
     pub fn pending(&self) -> usize {
         self.map.lock().unwrap_or_else(|e| e.into_inner()).values().map(|b| b.slots.len()).sum()
     }

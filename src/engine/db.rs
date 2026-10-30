@@ -252,7 +252,7 @@ pub struct Committed {
     pub replayed: bool,
     pub time_ms: u64,
     pub appends: Vec<Appended>,
-    /// Events a bulk insert added.
+    /// Number of events added by a bulk insert.
     pub inserted: Option<u64>,
 }
 
@@ -902,9 +902,8 @@ impl Db {
         })?
     }
 
-    /// Binds staged event parts (SPEC §5.13), returning each slot's outcome:
-    /// accepted slots share one commit version, and the rows of the others
-    /// are masked.
+    /// Binds staged event parts (SPEC §5.13) and returns the outcome for each slot.
+    /// Accepted slots share a single commit version, and rows of rejected slots are masked.
     pub async fn bind(self: &Arc<Self>, bind: Bind) -> Result<Vec<Result<Committed>>> {
         self.shared.store_time_ms().await?;
         let (tx, rx) = oneshot::channel();
@@ -1773,14 +1772,12 @@ impl Db {
                 },
                 Work::Bind { bind, .. } => {
                     let mut results: Vec<Option<Result<Committed>>> = vec![None; bind.slots.len()];
-                    // A slot repeating an earlier slot's commit ID (a concurrent retry) writes
-                    // nothing and answers with that slot's outcome.
                     let mut first_of: BTreeMap<u64, usize> = BTreeMap::new();
                     let mut repeats: Vec<(usize, usize)> = Vec::new();
                     for (i, (r, sl)) in results.iter_mut().zip(&bind.slots).enumerate() {
                         if let Some(&j) = first_of.get(&sl.commit_id) {
                             repeats.push((i, j));
-                            *r = Some(Err(Error::internal("a repeated bind slot")));
+                            *r = Some(Err(Error::internal("repeated bind slot")));
                             continue;
                         }
                         first_of.insert(sl.commit_id, i);
@@ -1803,7 +1800,7 @@ impl Db {
                     }
                     let added: u64 = bind.parts.iter().map(|p| p.part.size).sum();
                     let state = events::state(&pending(base, &m, &tail), bind.table).await?;
-                    let refusal = match now.store_ms {
+                    let rejected = match now.store_ms {
                         _ if state.is_none() => Some(Error::not_found("event table not found")),
                         None => Some(Error::unavailable("store clock not synchronized")),
                         Some(t)
@@ -1830,14 +1827,13 @@ impl Db {
                         }
                         _ => None,
                     };
-                    if let Some(e) = refusal {
+                    if let Some(e) = rejected {
                         for r in results.iter_mut().filter(|r| r.is_none()) {
                             *r = Some(Err(e.clone()));
                         }
                     }
                     let accepted: Vec<usize> = (0..results.len()).filter(|i| results[*i].is_none()).collect();
                     let since_ms = now.store_ms.unwrap_or(time);
-                    // A retry of a bind whose earlier attempt landed finds its parts already bound.
                     let mut fresh = Vec::with_capacity(bind.parts.len());
                     for p in &bind.parts {
                         let bound = pending(base, &m, &tail)
@@ -1857,7 +1853,7 @@ impl Db {
                         meta_changed |= !fresh.is_empty();
                     } else {
                         let new_seq = last_seq + 1;
-                        let mut st = state.ok_or_else(|| Error::internal("a bind accepted without table state"))?;
+                        let mut st = state.ok_or_else(|| Error::internal("bind accepted without table state"))?;
                         for p in &fresh {
                             let mut mask = events::Runs::default();
                             for (i, rows) in p.slot_rows.iter().enumerate() {
@@ -2361,9 +2357,7 @@ impl Db {
                 if e.value.is_tombstone() {
                     continue;
                 }
-                let r = events::ref_of(&e).ok_or_else(|| {
-                    Error::internal("an event part reference is corrupt; sweeps stop rather than delete its part")
-                })?;
+                let r = events::ref_of(&e).ok_or_else(|| Error::internal("corrupt event part reference"))?;
                 referenced_parts.extend(r.mask_object().map(str::to_string));
                 referenced_parts.insert(r.id);
             } else if let Some((table, _)) = events::state_of(&e) {
@@ -2625,7 +2619,7 @@ fn bind_margin_ms(cfg: &super::EngineConfig) -> u64 {
     2 * cfg.clock_sync_max_error_ms
 }
 
-/// Validates that all staged blobs referenced by `w` are within the stage TTL
+/// Validates that all staged blobs and event parts referenced by `w` are within the stage TTL
 /// and have not been marked obsolete.
 fn bindable(w: &WriteSet, m: &Manifest, store_now: Option<u64>, cfg: &super::EngineConfig) -> Result<()> {
     let parts: Vec<&str> = w.events.iter().flat_map(|e| e.new_objects()).collect();
@@ -2694,7 +2688,6 @@ struct Plan {
     quota_refused: bool,
     probes: Option<[(Probe, u64); 11]>,
     due: BTreeSet<u64>,
-    /// Event tables whose unsealed rows or references changed.
     events: BTreeSet<u32>,
 }
 
@@ -2703,10 +2696,8 @@ pub(crate) fn quota_exceeded(limit: u64) -> Error {
 }
 
 /// Returns `(total_added_bytes, newly_bound_blob_bytes)` for a commit write set.
-/// The bytes a write set adds toward the quota, and how many of them are
-/// staged blobs. Rewrites of event part references and table state (by
-/// seals, merges, deletes and retention) move or shrink data, so a full
-/// database can still make them.
+/// Event part reference and table state updates are excluded so that maintenance
+/// and deletions succeed if the database is at quota.
 fn growth(w: &WriteSet) -> (u64, u64) {
     let event_meta = |k: &[u8]| matches!(k.first(), Some(&events::PARTS | &events::TABLE_STATE));
     let added: u64 = w.streams.iter().map(StreamOp::appended_bytes).sum::<u64>()

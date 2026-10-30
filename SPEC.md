@@ -319,7 +319,7 @@ and a stream record may be committed alongside a row update.
 
 ### 4.7 Filters
 
-Table queries, row selections, and stream reads share a single server-side filter language. A filter object is `{"and": [f, ...]}`, `{"or": [f, ...]}`, `{"not": f}`, or a leaf comparison containing an operand (`col`, `field`, or `header`), an operator (`op`), and an argument (`value`). Requests that combine multiple filter forms in a single object or include unknown keys are rejected with `400`.
+Table queries, row selections, and stream reads share a server-side filter language. A filter object is `{"and": [f, ...]}`, `{"or": [f, ...]}`, `{"not": f}`, or a leaf comparison containing an operand (`col`, `field`, or `header`), an operator (`op`), and an argument (`value`). Requests that combine multiple filter forms in a single object or include unknown keys are rejected with `400`.
 
 - **Operators**: `eq`, `ne`, `lt`, `le`, `gt`, `ge` (for numbers, strings, or booleans), `in` (an array of up to 1,000 non-null values), `prefix` (strings), `contains` (substring or array element), and `exists` (which does not take a `value`). Filter arguments cannot be `null`.
 - **Null and missing values**: Any comparison other than `exists` against a missing or `null` operand evaluates to `false`, including `ne`. Use `{"not": {..., "op": "exists"}}` to match missing or `null` values.
@@ -333,36 +333,38 @@ Event tables store append-mostly, timestamped records in columnar parts and exec
 - **Schemas**: An event table defines up to 256 columns of type `time` (milliseconds since the Unix epoch, formatted as an integer or RFC 3339 timestamp), `string`, `int`, `float`, `bool`, or `json` (a JSON object queried by leaf path). A required non-nullable `time` column serves as the partitioning and range-filter timestamp; if its default is `"now"`, omitted timestamps are populated from the serving node's clock. The `order_by` key (1 to 8 columns) defines the sort order within storage parts and accelerates filters on leading sort columns. Events are partitioned by UTC time (`hour`, `day` by default, `week` starting Monday, or `month`) so range queries and retention drops can skip whole partitions. Optional `bloom` skip indexes accelerate equality and `in` filters on scalar columns. Columns can be added or dropped online; a newly added column with a default value applies retroactively to older events, and a newly added `time` column with default `"now"` must be nullable because older events evaluate to `null`. Column defaults are limited to 1 KiB, and `json` columns cannot have defaults, sort keys, or skip indexes.
 - **Inserts**: Events are inserted either in bulk (`POST /v1/dbs/{db}/events/{t}/rows` as JSON or NDJSON) or transactionally (`insert_events` in `/txn`). Each event is limited to 1 MiB encoded and 4 MiB of flattened JSON paths and values. After applying column defaults, the total encoded size of an insert batch is bounded by `max(body_limit, 8 * request_body_bytes)` for bulk inserts or `txn_max_write_bytes` for transactions. Bulk inserts on a node are coalesced for up to 200 ms, written directly to object storage as columnar parts, and committed in a single manifest update. Bulk inserts with an `Idempotency-Key` are applied at most once; replaying the key returns the original count, and reusing a key from a different operation type is rejected with `400`. Timestamps must fall within years `0000` through `9999`. In JSON columns, `null` object fields are omitted, `-0.0` is normalized to `0`, and integers outside the signed 64-bit range are rejected with `400`.
 - **Queries**: Queries scan a half-open time range `[from, to)` on the table's time column, apply an optional filter (§4.7, with `path` for JSON columns), and return either paginated rows or grouped aggregates. Query results are invariant to how events are partitioned or merged: all aggregate states are associative and commutative, and floating-point sums and averages use exact accumulator arithmetic (returning `null` if the final `f64` result overflows).
-  - *Expressions*: An expression references a column (`"user"`), a JSON leaf path (`{"col": "props", "path": ["plan"]}`), a dimension lookup (`{"lookup": "plan"}`), or a time bucket (`{"bucket": {"col": "time"}, "interval": "1d", "offset": "-05:00"}`), with an optional `"as"` alias. Supported bucket intervals are seconds (`s`), minutes (`m`), hours (`h`), or days (`d`) aligned to the Unix epoch, weeks (`w`) starting Monday, and calendar months (`mo`). JSON paths address leaf values (scalars, arrays, or empty objects); paths to non-empty intermediate objects evaluate to `null`.
-  - *Row queries*: Selecting `columns` (or omitting both `group_by` and `aggregates`) returns raw events ordered by the time column or by `order_by` output aliases, returning 100 rows by default (up to 10,000) along with a `cursor` for pagination.
-  - *Aggregate queries*: Specifying `group_by` or `aggregates` groups matching events and evaluates named aggregate functions in alphabetical key order. Supported functions (`{"fn": ..., "of": ..., "where": ...}`) are `count`, `sum`, `min`, `max`, `avg`, `uniq` (HyperLogLog, exact up to 1,024 distinct values), `uniq_exact`, `quantiles` (DDSketch over `q` levels within 1% relative error), `window_funnel` (evaluating ordered `steps` filters within `window_ms`, supporting `strict_order`, `strict_deduplication`, and `strict_increase` per attempt), and `retention` (returning a boolean array indicating whether a group satisfied `conditions[0]` and each subsequent `conditions[i]`). An optional `then` stage re-aggregates the first stage's output columns. Results are sorted by `order_by` and truncated to `limit`; queries without a `limit` fail with `413` if group count exceeds 100,000.
-  - *Lookups*: The `lookups` map (`{"plan": {"table": "users", "key": "user", "value": "plan", "default": ...}}`) joins an event expression against the primary key of a row table in the same database and returns the target column (or `default` if unmatched). Each referenced column of a lookup table is scanned once per query into a shared compact lookup map.
-  - *Consistency*: Queries use `snapshot` consistency by default (reading a snapshot at most 5 s or `max_staleness_ms` old) or `strong` consistency to observe all acknowledged writes. If a cached snapshot predates the target event table or a referenced column, the query automatically retries with a strong snapshot.
-  - *Resource limits*: A query is rejected with `413` if it reads more than 4 GiB of part data, exceeds 1 GiB of aggregate state / buffered rows plus active column vectors, or exceeds 1 GiB of lookup maps. Queries that run longer than 60 s are canceled with a retryable `503`.
+  - _Expressions_: An expression references a column (`"user"`), a JSON leaf path (`{"col": "props", "path": ["plan"]}`), a dimension lookup (`{"lookup": "plan"}`), or a time bucket (`{"bucket": {"col": "time"}, "interval": "1d", "offset": "-05:00"}`), with an optional `"as"` alias. Supported bucket intervals are seconds (`s`), minutes (`m`), hours (`h`), or days (`d`) aligned to the Unix epoch, weeks (`w`) starting Monday, and calendar months (`mo`). JSON paths address leaf values (scalars, arrays, or empty objects); paths to non-empty intermediate objects evaluate to `null`.
+  - _Row queries_: Selecting `columns` (or omitting both `group_by` and `aggregates`) returns raw events ordered by the time column or by `order_by` output aliases, returning 100 rows by default (up to 10,000) along with a `cursor` for pagination.
+  - _Aggregate queries_: Specifying `group_by` or `aggregates` groups matching events and evaluates named aggregate functions in alphabetical key order. Supported functions (`{"fn": ..., "of": ..., "where": ...}`) are `count`, `sum`, `min`, `max`, `avg`, `uniq` (HyperLogLog, exact up to 1,024 distinct values), `uniq_exact`, `quantiles` (DDSketch over `q` levels within 1% relative error), `window_funnel` (evaluating ordered `steps` filters within `window_ms`, supporting `strict_order`, `strict_deduplication`, and `strict_increase` per attempt), and `retention` (returning a boolean array indicating whether a group satisfied `conditions[0]` and each subsequent `conditions[i]`). An optional `then` stage re-aggregates the first stage's output columns. Results are sorted by `order_by` and truncated to `limit`; queries without a `limit` fail with `413` if group count exceeds 100,000.
+  - _Lookups_: The `lookups` map (`{"plan": {"table": "users", "key": "user", "value": "plan", "default": ...}}`) joins an event expression against the primary key of a row table in the same database and returns the target column (or `default` if unmatched). Each referenced column of a lookup table is scanned once per query into a shared compact lookup map.
+  - _Consistency_: Queries use `snapshot` consistency by default (reading a snapshot at most 5 s or `max_staleness_ms` old) or `strong` consistency to observe all acknowledged writes. If a cached snapshot predates the target event table or a referenced column, the query automatically retries with a strong snapshot.
+  - _Resource limits_: A query is rejected with `413` if it reads more than 4 GiB of part data, exceeds 1 GiB of aggregate state / buffered rows plus active column vectors, or exceeds 1 GiB of lookup maps. Queries that run longer than 60 s are canceled with a retryable `503`.
 
   Example two-stage funnel query with a dimension lookup:
+
   ```json
   {
     "from": "2026-10-01",
     "to": "2026-11-01",
-    "lookups": {"plan": {"table": "users", "key": "user", "value": "plan"}},
-    "group_by": ["user", {"lookup": "plan", "as": "plan"}],
+    "lookups": { "plan": { "table": "users", "key": "user", "value": "plan" } },
+    "group_by": ["user", { "lookup": "plan", "as": "plan" }],
     "aggregates": {
       "steps": {
         "fn": "window_funnel",
         "window_ms": 86400000,
         "steps": [
-          {"col": "event", "op": "eq", "value": "view"},
-          {"col": "event", "op": "eq", "value": "buy"}
+          { "col": "event", "op": "eq", "value": "view" },
+          { "col": "event", "op": "eq", "value": "buy" }
         ]
       }
     },
     "then": {
       "group_by": ["plan", "steps"],
-      "aggregates": {"users": {"fn": "count"}}
+      "aggregates": { "users": { "fn": "count" } }
     }
   }
   ```
+
 - **Deletes**: `POST /v1/dbs/{db}/events/{t}/rows/delete` (or `delete_events` in `/txn`) transactionally removes events matching a filter within `[from, to)`. If a delete produces a mask larger than the per-partition limit, the request fails with `413` so the caller can delete narrower time ranges. Masked rows are physically purged from object storage within roughly 26 hours on active databases: background maintenance rewrites parts whose oldest deletion exceeds `event_purge_ms` (24 hours), and garbage collection removes the replaced part objects 30 minutes later (§5.8). Events deleted while still unsealed in the LSM tree become standard LSM tombstones and are reclaimed during segment compaction.
 - **Retention**: If `retention_ms` is configured on an event table, queries exclude events older than `store_clock - retention_ms`, and background maintenance drops parts whose `max_time` is older than the cutoff (§5.8). If the node does not have a valid store-clock measurement, retention filtering and drops are paused.
 - **Dropping tables**: Dropping an event table executes in constant time by writing range tombstones over the table's unsealed rows and part references without scanning existing parts, avoiding conflicts with concurrent inserts or merges. Unreferenced part objects are reclaimed asynchronously by the orphan sweep (§5.8).

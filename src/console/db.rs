@@ -126,6 +126,7 @@ struct Schema {
 #[derive(Deserialize)]
 struct Tables {
     tables: Vec<Schema>,
+    next_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -338,8 +339,9 @@ async fn db_page(Path(db): Path<String>, s: Session, q: Params) -> Page {
 async fn render_db(s: &Session, db: &str, q: &Fields, forms: Forms, flash: Option<Flash>) -> Page {
     let info: DbInfo = s.get(&api_db(db)).await.map_err(|e| back("/console/dbs", &e, false))?;
     let keys = keys_section(s, db, &info, q).await.map_err(|e| s.fail(db, &e))?;
-    let tables = tables_section(s, db, &info, forms.table_def.as_deref()).await.map_err(|e| s.fail(db, &e))?;
+    let tables = tables_section(s, db, &info, q, forms.table_def.as_deref()).await.map_err(|e| s.fail(db, &e))?;
     let streams = super::streams::streams_section(s, db, info.role.can_write(), q).await.map_err(|e| s.fail(db, &e))?;
+    let events = super::events::events_section(s, db, info.role.can_write(), q).await.map_err(|e| s.fail(db, &e))?;
     let txn = txn_section(s, db, forms.txn.as_deref(), forms.result.as_deref());
     let danger = if info.role.can_administer() {
         format!(
@@ -356,7 +358,7 @@ async fn render_db(s: &Session, db: &str, q: &Fields, forms: Forms, flash: Optio
         Some(s),
         flash.as_ref(),
         &format!(
-            r#"<h1>{dbn}</h1><p class="muted">id <code>{id}</code></p>{metrics}{keys}{tables}{streams}{txn}{danger}"#,
+            r#"<h1>{dbn}</h1><p class="muted">id <code>{id}</code></p>{metrics}{keys}{tables}{streams}{events}{txn}{danger}"#,
             dbn = esc(db),
             id = esc(&info.id),
             metrics = metrics(&info),
@@ -418,8 +420,9 @@ async fn keys_section(s: &Session, db: &str, info: &DbInfo, q: &Fields) -> Resul
     ))
 }
 
-async fn tables_section(s: &Session, db: &str, info: &DbInfo, def: Option<&str>) -> Result<String, String> {
-    let tables: Tables = s.get(&format!("{}/tables", api_db(db))).await?;
+async fn tables_section(s: &Session, db: &str, info: &DbInfo, q: &Fields, def: Option<&str>) -> Result<String, String> {
+    let p = Pager::of(q, "tables");
+    let tables: Tables = s.get(&format!("{}/tables?{}", api_db(db), p.api_query())).await?;
     let rows: Vec<String> = tables
         .tables
         .iter()
@@ -446,8 +449,9 @@ async fn tables_section(s: &Session, db: &str, info: &DbInfo, def: Option<&str>)
         String::new()
     };
     Ok(format!(
-        r#"<h2>Tables</h2><div class="card">{t}{create}</div>"#,
-        t = table(&["Table", "Columns", "Indexes"], &rows, "No tables.")
+        r#"<h2>Tables</h2><div class="card">{t}{more}{create}</div>"#,
+        t = table(&["Table", "Columns", "Indexes"], &rows, "No tables."),
+        more = p.links(&db_path(db), tables.next_cursor.as_deref()),
     ))
 }
 
@@ -556,7 +560,7 @@ async fn download_blob(Path((db, blob)): Path<(String, String)>, s: Session) -> 
 
 async fn run_txn(Path(db): Path<String>, Posted { s, f }: Posted) -> Page {
     let text = field(&f, "body").to_string();
-    let result = match serde_json::from_str::<Json>(&text) {
+    let result = match crate::api::parse_json::<Json>(text.as_bytes()) {
         Ok(body) => {
             let reply = s.call("POST", &format!("{}/txn", api_db(&db)), Some(body)).await;
             serde_json::to_string_pretty(&reply.body).unwrap_or_default()
@@ -569,7 +573,7 @@ async fn run_txn(Path(db): Path<String>, Posted { s, f }: Posted) -> Page {
 
 async fn create_table(Path(db): Path<String>, Posted { s, f }: Posted) -> Page {
     let text = field(&f, "def").to_string();
-    let outcome = match serde_json::from_str::<Json>(&text) {
+    let outcome = match crate::api::parse_json::<Json>(text.as_bytes()) {
         Ok(def) => s.api("POST", &format!("{}/tables", api_db(&db)), Some(def)).await,
         Err(e) => Err(format!("Invalid JSON: {e}")),
     };
@@ -690,7 +694,7 @@ async fn add_column(Path((db, t)): Path<(String, String)>, Posted { s, f }: Post
     let tp = table_path(&db, &t);
     let default = match field(&f, "default").trim() {
         "" => None,
-        d => match serde_json::from_str::<Json>(d) {
+        d => match crate::api::parse_json::<Json>(d.as_bytes()) {
             Ok(v) => Some(v),
             Err(e) => return Ok(back(&tp, &format!("The default is not JSON: {e}"), false)),
         },

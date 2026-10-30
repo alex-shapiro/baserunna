@@ -82,6 +82,42 @@ pub struct EngineConfig {
     pub stream_chunk_bytes: usize,
     /// Largest stream record payload.
     pub stream_record_max: usize,
+    /// Maximum event part bytes per database (SPEC §5.10), or 0 for unlimited.
+    pub event_max_bytes: u64,
+    /// Unsealed rows of a table are sealed into parts if they reach this size (SPEC §5.13).
+    pub event_seal_bytes: usize,
+    /// Maximum size of each chunk object of an event part.
+    pub event_chunk_bytes: usize,
+    /// Maximum rows per granule.
+    pub event_granule_rows: usize,
+    /// Uncompressed byte threshold at which a granule ends early.
+    pub event_granule_bytes: usize,
+    /// Target uncompressed size of a column block of granules.
+    pub event_block_bytes: usize,
+    /// Maximum uncompressed row bytes sorted in memory for a single staged or sealed part.
+    pub event_insert_part_max_bytes: usize,
+    /// Number of parts in a tier merged together, and the size ratio between tiers.
+    pub event_merge_fan_in: usize,
+    /// Target uncompressed size of parts in the lowest merge tier.
+    pub event_tier_base_bytes: u64,
+    /// Parts at or above this stored size are not merged further.
+    pub event_part_max_bytes: u64,
+    /// Maximum duration of a part merge before it is aborted.
+    pub event_merge_max_ms: u64,
+    /// Idle duration after a partition's time range ends before its parts are merged into a minimum number of parts.
+    pub event_settle_ms: u64,
+    /// Maximum age of the oldest deletion in a part before the part is rewritten without deleted rows.
+    pub event_purge_ms: u64,
+    /// Maximum JSON paths stored as dedicated columns per part; remaining paths are hashed into buckets.
+    pub event_json_max_paths: usize,
+    /// Maximum encoded size of a deletion mask stored inline in a part reference before it is written to a mask object.
+    pub event_mask_inline_bytes: usize,
+    /// Maximum byte size of the bucketed JSON path directory in part metadata.
+    pub event_json_directory_bytes: usize,
+    /// Maximum parts read concurrently by a query or delete.
+    pub event_read_concurrency: usize,
+    /// Delay in milliseconds before sending a duplicate event part `GET`, or 0 to disable hedging.
+    pub event_get_hedge_ms: u64,
 }
 
 impl Default for EngineConfig {
@@ -131,6 +167,24 @@ impl Default for EngineConfig {
             stream_seal_min_bytes: 64 * 1024,
             stream_chunk_bytes: 2 * 1024 * 1024,
             stream_record_max: 1024 * 1024,
+            event_max_bytes: 1 << 40,
+            event_seal_bytes: 128 * 1024,
+            event_chunk_bytes: 32 * 1024 * 1024,
+            event_granule_rows: 8192,
+            event_granule_bytes: 10 * 1024 * 1024,
+            event_block_bytes: 64 * 1024,
+            event_insert_part_max_bytes: 64 * 1024 * 1024,
+            event_merge_fan_in: 8,
+            event_tier_base_bytes: 4 * 1024 * 1024,
+            event_part_max_bytes: 4 << 30,
+            event_merge_max_ms: 30 * 60_000,
+            event_settle_ms: 24 * 3_600_000,
+            event_purge_ms: 24 * 3_600_000,
+            event_json_max_paths: 1024,
+            event_json_directory_bytes: 1 << 20,
+            event_mask_inline_bytes: 4096,
+            event_read_concurrency: 32,
+            event_get_hedge_ms: 1_000,
         }
     }
 }
@@ -159,6 +213,17 @@ impl EngineConfig {
                 self.stream_seal_min_bytes <= self.stream_chunk_bytes,
                 "stream_seal_min_bytes must not exceed stream_chunk_bytes",
             ),
+            (self.event_merge_fan_in >= 2, "event_merge_fan_in must be at least 2"),
+            (self.event_read_concurrency >= 1, "event_read_concurrency must be at least 1"),
+            (
+                self.event_granule_rows >= 1 && self.event_chunk_bytes >= 1,
+                "event_granule_rows and event_chunk_bytes must be at least 1",
+            ),
+            (
+                self.event_granule_rows <= crate::events::part::BLOCK_ROWS_MAX
+                    && self.event_granule_bytes <= (crate::engine::segment::MAX_BLOCK_RAW / 4) as usize,
+                "event granules must fit within a block",
+            ),
         ];
         match rules.iter().find(|(ok, _)| !ok) {
             Some((_, why)) => Err((*why).to_string()),
@@ -186,6 +251,16 @@ impl EngineConfig {
             stream_seal_min_bytes: 1024,
             stream_chunk_bytes: 4 * 1024,
             stream_record_max: 8 * 1024,
+            event_seal_bytes: 1024,
+            event_chunk_bytes: 2 * 1024,
+            event_granule_rows: 16,
+            event_granule_bytes: 2 * 1024,
+            event_block_bytes: 512,
+            event_insert_part_max_bytes: 16 * 1024,
+            event_merge_fan_in: 3,
+            event_tier_base_bytes: 1024,
+            event_part_max_bytes: 64 * 1024,
+            event_json_max_paths: 4,
             ..EngineConfig::default()
         }
     }
@@ -203,5 +278,7 @@ mod tests {
         assert!(tight.validate().is_err());
         let starved = EngineConfig { memory_bytes: 8 * 1024 * 1024, ..EngineConfig::default() };
         assert!(starved.validate().is_err());
+        let wide = EngineConfig { event_granule_bytes: 64 << 20, ..EngineConfig::default() };
+        assert!(wide.validate().is_err());
     }
 }

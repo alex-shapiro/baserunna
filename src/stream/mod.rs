@@ -5,6 +5,7 @@
 
 pub mod filter;
 
+use crate::catalog::names_page;
 use crate::engine::stream::{self as es, StreamIter};
 use crate::engine::{KeyRange, Record, Retention, Seek, StreamOp, StreamState, Txn, Value};
 use crate::error::{Error, Result};
@@ -68,27 +69,6 @@ fn decode<T: DeserializeOwned>(v: &Value, what: &str) -> Result<T> {
         Value::Inline(b) => serde_json::from_slice(b).map_err(|_| Error::internal(format!("corrupt {what}"))),
         _ => Err(Error::internal(format!("corrupt {what}"))),
     }
-}
-
-/// The keys `space ++ name` of names starting with `prefix`, after the name
-/// a listing cursor holds; `None` if no name is.
-fn names_after(space: &[u8], prefix: &str, cursor: Option<&str>) -> Result<Option<KeyRange>> {
-    let key = |name: &str| Bytes::from([space, name.as_bytes()].concat());
-    let range = KeyRange::prefix(&key(prefix));
-    let Some(c) = cursor else { return Ok(Some(range)) };
-    let after =
-        b64::decode_url(c).and_then(|b| String::from_utf8(b).ok()).ok_or_else(|| Error::invalid("bad cursor"))?;
-    let after = key(&after);
-    Ok(match range.contains(&after) {
-        true => Some(KeyRange::new(std::ops::Bound::Excluded(after), range.end)),
-        false if after < key(prefix) => Some(range),
-        false => None,
-    })
-}
-
-/// The cursor that resumes a listing after `name`, if the page was full.
-fn next_cursor(more: bool, name: Option<&String>) -> Option<String> {
-    name.filter(|_| more).map(|n| b64::encode_url(n.as_bytes()))
 }
 
 /// A stream's catalog entry.
@@ -238,6 +218,8 @@ pub fn parse_lines(data: &Bytes, json: bool) -> Result<Vec<Body>> {
             if serde_json::from_slice::<serde::de::IgnoredAny>(line).is_err() {
                 return Err(Error::invalid(format!("line {} is not JSON", i + 1)));
             }
+            crate::util::json::reject_inexact_integers(line)
+                .map_err(|e| Error::invalid(format!("line {}: {e}", i + 1)))?;
             out.push(Body { json: true, headers: Vec::new(), data: slice });
         } else {
             out.push(Body::text(slice));
@@ -426,16 +408,13 @@ pub async fn list(
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<(Vec<(String, Catalog, StreamState)>, Option<String>)> {
-    let Some(range) = names_after(&[SPACE_CATALOG], prefix, cursor)? else { return Ok((Vec::new(), None)) };
-    let items = txn.scan(&range, false, limit + 1).await?;
-    let mut out = Vec::with_capacity(limit.min(items.len()));
-    for it in items.iter().take(limit) {
-        let name = String::from_utf8_lossy(&it.key[1..]).into_owned();
+    let (page, next) = names_page(txn, &[SPACE_CATALOG], prefix, limit, cursor).await?;
+    let mut out = Vec::with_capacity(page.len());
+    for (name, it) in page {
         let c: Catalog = decode(&it.value, "stream catalog")?;
         let st = state(txn, &c, false).await?;
         out.push((name, c, st));
     }
-    let next = next_cursor(items.len() > limit, out.last().map(|(n, _, _)| n));
     Ok((out, next))
 }
 
@@ -628,13 +607,8 @@ pub async fn list_consumers(
     cursor: Option<&str>,
 ) -> Result<(Vec<(String, Consumer)>, Option<String>)> {
     let c = open(txn, stream).await?;
-    let Some(range) = names_after(&consumer_key(c.id, ""), "", cursor)? else { return Ok((Vec::new(), None)) };
-    let items = txn.scan(&range, false, limit + 1).await?;
-    let mut out = Vec::with_capacity(limit.min(items.len()));
-    for it in items.iter().take(limit) {
-        out.push((String::from_utf8_lossy(&it.key[9..]).into_owned(), decode(&it.value, "consumer")?));
-    }
-    let next = next_cursor(items.len() > limit, out.last().map(|(n, _)| n));
+    let (page, next) = names_page(txn, &consumer_key(c.id, ""), "", limit, cursor).await?;
+    let out = page.into_iter().map(|(name, it)| Ok((name, decode(&it.value, "consumer")?))).collect::<Result<_>>()?;
     Ok((out, next))
 }
 

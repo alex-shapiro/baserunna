@@ -2,8 +2,8 @@
 
 use super::body::{BlobBody, Upload, parse_range, read_upload};
 use super::{
-    Auth, DbCtx, Found, JsonBody, LONG_POLL_MAX_MS, Params, Ran, consistency_of, naming_commit, paging, percent_decode,
-    run_txn, watch, with_read, with_txn,
+    Auth, DbCtx, Found, JsonBody, LONG_POLL_MAX_MS, Params, Ran, consistency_of, name_paging, naming_commit, paging,
+    percent_decode, run_txn, watch, with_read, with_txn,
 };
 use crate::engine::manifest::ObjKind;
 use crate::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn, Value, blob};
@@ -65,7 +65,13 @@ pub(super) fn param<'a>(p: &'a HashMap<String, String>, k: &str) -> Result<&'a s
 }
 
 fn op_ctx<'a>(node: &Node, ctx: &'a DbCtx, enc: Encoding) -> OpCtx<'a> {
-    OpCtx { db: &ctx.db, encoding: enc, access: ctx.access, json_value_max: node.cfg.json_value_max }
+    OpCtx {
+        db: &ctx.db,
+        encoding: enc,
+        access: ctx.access,
+        json_value_max: node.cfg.json_value_max,
+        query_limits: node.cfg.query_limits,
+    }
 }
 
 #[derive(Serialize)]
@@ -482,6 +488,32 @@ pub(super) fn commit_id_for_key(db_id: &str, key: &str) -> u64 {
     u64::from_be_bytes(a)
 }
 
+/// Extracts the lowercase MIME type from `Content-Type` without parameters.
+pub(super) fn content_type(h: &HeaderMap) -> String {
+    let ct = h.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+}
+
+pub(super) fn idempotency_header(h: &HeaderMap) -> Result<Option<String>> {
+    match h.get("idempotency-key") {
+        None => Ok(None),
+        Some(v) => match v.to_str() {
+            Ok(k) => Ok(Some(k.to_string())),
+            Err(_) => Err(Error::invalid("Idempotency-Key must be visible ASCII")),
+        },
+    }
+}
+
+/// Returns the idempotency key from the header or body, or an error if both are present and differ.
+pub(super) fn one_idempotency_key(header: Option<String>, body: Option<String>) -> Result<Option<String>> {
+    match (header, body) {
+        (Some(h), Some(b)) if h != b => {
+            Err(Error::invalid("the Idempotency-Key header and the body's idempotency_key differ"))
+        }
+        (h, b) => Ok(h.or(b)),
+    }
+}
+
 pub(super) fn commit_hex(id: u64) -> String {
     format!("{id:016x}")
 }
@@ -512,6 +544,9 @@ async fn one_shot(
                 "version": commit.version, "committed": true, "commit_id": commit_hex(commit_id),
                 "results": out, "appends": first_seqs(&commit),
             })
+        }
+        Ran::Replayed(c) if c.inserted.is_some() => {
+            return Err(Error::invalid("the idempotency key was used by an event bulk insert"));
         }
         Ran::Replayed(c) => json!({
             "version": c.version, "committed": true, "replayed": true,
@@ -769,10 +804,11 @@ async fn row_changes(
 }
 
 async fn list_tables(Extension(ctx): Extension<DbCtx>, q: Params) -> Result<J> {
+    let (prefix, limit, cursor) = name_paging(&q)?;
     let c = consistency_of(&q)?;
-    let (ts, v) = with_read!(ctx.db, c, |t| table::list_tables(t).await);
-    let out: Vec<Json> = ts.iter().map(|s| s.to_json()).collect();
-    Ok(axum::Json(json!({"tables": out, "version": v})))
+    let ((ts, next), v) = with_read!(ctx.db, c, |t| table::list_tables(t, &prefix, limit, cursor.as_deref()).await);
+    let tables: Vec<Json> = ts.iter().map(|s| s.to_json()).collect();
+    Ok(axum::Json(json!({"tables": tables, "next_cursor": next, "version": v})))
 }
 
 async fn create_table(
@@ -890,8 +926,14 @@ async fn insert_rows(
 pub(super) fn split_consistency(mut body: Json) -> Result<(Json, Consistency)> {
     let (c, s) = match body.as_object_mut() {
         Some(o) => (
-            o.remove("consistency").and_then(|v| v.as_str().map(|s| s.to_string())),
-            o.remove("max_staleness_ms").and_then(|v| v.as_u64()),
+            o.remove("consistency")
+                .filter(|v| !v.is_null())
+                .map(|v| v.as_str().map(str::to_string).ok_or_else(|| Error::invalid("consistency must be a string")))
+                .transpose()?,
+            o.remove("max_staleness_ms")
+                .filter(|v| !v.is_null())
+                .map(|v| v.as_u64().ok_or_else(|| Error::invalid("max_staleness_ms must be a number")))
+                .transpose()?,
         ),
         None => return Err(Error::invalid("body must be a JSON object")),
     };

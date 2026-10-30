@@ -197,6 +197,40 @@ pub enum Op {
         consumer: String,
         seq: u64,
     },
+    InsertEvents {
+        table: String,
+        rows: Vec<Json>,
+    },
+    QueryEvents(EventsQuery),
+    DeleteEvents {
+        table: String,
+        #[serde(default)]
+        from: Option<Json>,
+        #[serde(default)]
+        to: Option<Json>,
+        #[serde(rename = "where")]
+        filter: crate::events::query::Filter,
+    },
+}
+
+/// Payload of a `query_events` transaction operation.
+#[derive(Debug, Clone)]
+pub struct EventsQuery {
+    pub table: String,
+    pub query: crate::events::query::Query,
+}
+
+impl<'de> Deserialize<'de> for EventsQuery {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<EventsQuery, D::Error> {
+        use serde::de::Error as _;
+        let mut fields = serde_json::Map::deserialize(d)?;
+        let table = fields.remove("table").ok_or_else(|| D::Error::missing_field("table"))?;
+        Ok(EventsQuery {
+            table: serde_json::from_value(table).map_err(D::Error::custom)?,
+            query: crate::events::query::Query::parse(Json::Object(fields))
+                .map_err(|e| D::Error::custom(e.message()))?,
+        })
+    }
 }
 
 /// A `read_stream` op: a stream and a [`ReadSpec`] beside it.
@@ -240,6 +274,8 @@ impl Op {
                 | Op::Append { .. }
                 | Op::TrimStream { .. }
                 | Op::SetConsumer { .. }
+                | Op::InsertEvents { .. }
+                | Op::DeleteEvents { .. }
         )
     }
 }
@@ -267,6 +303,8 @@ pub struct OpCtx<'a> {
     pub access: crate::meta::Access,
     /// Blob values up to this size are returned inline in JSON.
     pub json_value_max: u64,
+    /// Resource limits for `query_events` operations.
+    pub query_limits: crate::events::exec::Limits,
 }
 
 pub fn user_key(k: &[u8]) -> Result<Bytes> {
@@ -618,6 +656,20 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
         Op::SetConsumer { stream: name, consumer, seq } => {
             stream::set_consumer(txn, name, consumer, *seq, ctx.db.shared().time_ms()).await?;
             Ok(json!({}))
+        }
+        Op::InsertEvents { table, rows } => {
+            let n = crate::events::insert(txn, table, rows, ctx.db.shared().time_ms() as i64).await?;
+            Ok(json!({"count": n}))
+        }
+        Op::QueryEvents(EventsQuery { table, query }) => {
+            let s = crate::events::get_schema(txn, table).await?;
+            let out = crate::events::exec::run(ctx.db.shared(), &ctx.db.id, txn, &s, query, &ctx.query_limits).await?;
+            Ok(json!({"columns": out.columns, "rows": out.rows, "next_cursor": out.next_cursor, "stats": out.stats}))
+        }
+        Op::DeleteEvents { table, from, to, filter } => {
+            let (from, to) = crate::events::time_bounds(from, to)?;
+            let n = crate::events::maint::delete(ctx.db, txn, table, from, to, filter).await?;
+            Ok(json!({"deleted": n}))
         }
     }
 }

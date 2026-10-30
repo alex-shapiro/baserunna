@@ -53,6 +53,11 @@ impl KeyRange {
         KeyRange { start: Bound::Included(start), end: end.map(Bound::Excluded).unwrap_or(Bound::Unbounded) }
     }
 
+    /// `[k, k]`.
+    pub fn point(k: &Bytes) -> KeyRange {
+        KeyRange::new(Bound::Included(k.clone()), Bound::Included(k.clone()))
+    }
+
     pub fn prefix(p: &[u8]) -> KeyRange {
         KeyRange::half_open(Bytes::copy_from_slice(p), crate::util::prefix_end(p).map(Bytes::from))
     }

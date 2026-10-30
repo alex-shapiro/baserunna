@@ -2,6 +2,7 @@
 
 use super::blob::{BlobWriter, StageGuard};
 use super::compaction::{self, Kind};
+use super::events::{self, Bind};
 use super::manifest::{Lease, Manifest, ObjKind, Obsolete, PageCache, SegmentMeta};
 use super::memory::Charge;
 use super::range_delete::RangeTombstone;
@@ -90,12 +91,17 @@ enum Work {
         id: u64,
         tx: oneshot::Sender<Result<Option<Committed>>>,
     },
+    Bind {
+        bind: Bind,
+        tx: oneshot::Sender<Vec<Result<Committed>>>,
+    },
 }
 
 enum Outcome {
     Seq(Result<Committed>),
     Unit(Result<()>),
     Resolved(Result<Option<Committed>>),
+    Binds(Vec<Result<Committed>>),
 }
 
 impl Outcome {
@@ -104,6 +110,7 @@ impl Outcome {
             Outcome::Seq(r) => r.map(drop),
             Outcome::Unit(r) => r,
             Outcome::Resolved(r) => r.map(drop),
+            Outcome::Binds(v) => v.into_iter().find_map(|r| r.err()).map_or(Ok(()), Err),
         }
     }
 
@@ -125,6 +132,15 @@ impl Work {
                 let _ = tx.send(match o {
                     Outcome::Resolved(r) => r,
                     o => Err(o.error()),
+                });
+            }
+            Work::Bind { bind, tx } => {
+                let _ = tx.send(match o {
+                    Outcome::Binds(v) => v,
+                    o => {
+                        let e = o.error();
+                        vec![Err(e); bind.slots.len()]
+                    }
                 });
             }
             Work::Lease { tx: Some(tx), .. }
@@ -230,12 +246,14 @@ pub enum CommitState {
     Aborted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Committed {
     pub version: Seq,
     pub replayed: bool,
     pub time_ms: u64,
     pub appends: Vec<Appended>,
+    /// Number of events added by a bulk insert.
+    pub inserted: Option<u64>,
 }
 
 /// Database storage statistics at a single version.
@@ -864,12 +882,7 @@ impl Db {
     /// Commits `req` and reports whether the commit ID was already applied.
     pub async fn commit_detailed(self: &Arc<Self>, mut req: CommitRequest) -> Result<Committed> {
         if req.writes.is_empty() {
-            return Ok(Committed {
-                version: req.read_version,
-                replayed: false,
-                time_ms: req.read_time,
-                appends: Vec::new(),
-            });
+            return Ok(Committed { version: req.read_version, time_ms: req.read_time, ..Committed::default() });
         }
         if req.deadline.is_none() {
             req.deadline = Some(Instant::now() + Duration::from_millis(self.shared.cfg.commit_timeout_ms));
@@ -887,6 +900,22 @@ impl Db {
             retry_after_ms: None,
             outcome_unknown: true,
         })?
+    }
+
+    /// Binds staged event parts (SPEC §5.13) and returns the outcome for each slot.
+    /// Accepted slots share a single commit version, and rows of rejected slots are masked.
+    pub async fn bind(self: &Arc<Self>, bind: Bind) -> Result<Vec<Result<Committed>>> {
+        self.shared.store_time_ms().await?;
+        let (tx, rx) = oneshot::channel();
+        let enqueued = Instant::now();
+        self.enqueue(Work::Bind { bind, tx });
+        let r = rx.await;
+        timing::record_commit_wait(enqueued.elapsed());
+        r.map_err(|_| Error::Unavailable {
+            message: "commit interrupted".into(),
+            retry_after_ms: None,
+            outcome_unknown: true,
+        })
     }
 
     /// Acquire or renew this node's lease.
@@ -1147,6 +1176,14 @@ impl Db {
                         Outcome::Seq(Err(e @ Error::Unavailable { .. })) if maybe_applied => {
                             Outcome::Seq(Err(unknown(e)))
                         }
+                        Outcome::Binds(v) if maybe_applied => Outcome::Binds(
+                            v.into_iter()
+                                .map(|r| match r {
+                                    Err(e @ Error::Unavailable { .. }) => Err(unknown(e)),
+                                    r => r,
+                                })
+                                .collect(),
+                        ),
                         other => mark_superseded_flush_unknown(&w, other, maybe_applied),
                     };
                     w.deliver(o);
@@ -1193,7 +1230,7 @@ impl Db {
                         let o = mark_superseded_flush_unknown(&w, o, maybe_applied);
                         w.deliver(o);
                     }
-                    self.after_commit(&v, plan.gc, plan.due);
+                    self.after_commit(&v, plan.gc, plan.due, plan.events);
                     if v.m.version > base.m.version {
                         self.shared.committed(&self.id, v.m.version);
                     }
@@ -1272,6 +1309,19 @@ impl Db {
     async fn fail_batch(self: &Arc<Self>, base: &Version, batch: Vec<Work>, e: Error) {
         let mut rest = Vec::with_capacity(batch.len());
         for w in batch {
+            if let Work::Bind { bind, .. } = &w {
+                let mut out = Vec::with_capacity(bind.slots.len());
+                for s in &bind.slots {
+                    out.push(match commit_state(base, None, s.commit_id).await.ok().flatten() {
+                        Some(CommitState::Applied(c)) => Ok(c),
+                        Some(CommitState::Aborted) => Err(aborted(s.commit_id)),
+                        None => Err(e.clone()),
+                    });
+                }
+                self.clear_lease_flag(std::slice::from_ref(&w));
+                w.deliver(Outcome::Binds(out));
+                continue;
+            }
             let decided = match &w {
                 Work::Commit { req, .. } => commit_state(base, None, req.commit_id).await.ok().flatten(),
                 _ => None,
@@ -1298,6 +1348,13 @@ impl Db {
         for w in batch {
             match w {
                 Work::Flush { .. } => return true,
+                Work::Bind { bind, .. } => {
+                    for sl in &bind.slots {
+                        if matches!(commit_state(v, None, sl.commit_id).await, Ok(Some(CommitState::Applied(_)))) {
+                            return true;
+                        }
+                    }
+                }
                 Work::Commit { req, .. }
                     if !matches!(commit_state(v, None, req.commit_id).await, Ok(None | Some(CommitState::Aborted))) =>
                 {
@@ -1407,6 +1464,7 @@ impl Db {
         let mut accepted: Vec<&WriteSet> = Vec::new();
         let mut touched: Vec<KeyRange> = Vec::new();
         let mut due: BTreeSet<u64> = BTreeSet::new();
+        let mut events: BTreeSet<u32> = BTreeSet::new();
         let mut data_changed = false;
         let mut meta_changed = false;
         let mut release = false;
@@ -1424,7 +1482,7 @@ impl Db {
                     _ => Outcome::Unit(Err(Error::not_found("database deleted"))),
                 })
                 .collect();
-            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: None, due });
+            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: None, due, events });
         }
         // Background work is planned under the local lease and must not be installed if the lease
         // was released or lost.
@@ -1507,6 +1565,17 @@ impl Db {
                             }
                         }
                     };
+                    let ev = match req.writes.events.is_empty() {
+                        true => events::Effects::default(),
+                        false => match events::plan(&req.writes.events, &pending(base, &m, &tail), new_seq).await {
+                            Ok(fx) => fx,
+                            Err(e @ Error::NotFound(_)) => {
+                                outcomes.push(Outcome::Seq(Err(e)));
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        },
+                    };
                     size += added;
                     for r in &req.writes.range_deletes {
                         delete_range(base, &mut m, &mut tail, r, new_seq, cfg.range_delete_points_max).await?;
@@ -1529,7 +1598,19 @@ impl Db {
                     for rt in fx.trims.iter().filter_map(|r| RangeTombstone::new(r, new_seq)) {
                         put_range_tombstone(&mut m, &mut tail, rt);
                     }
-                    let value = encode_commit_record(time, &fx.appends);
+                    for e in ev.entries {
+                        tail.insert(e.key.clone(), e);
+                    }
+                    for (kind, id) in ev.obsolete {
+                        m.obsolete.push(Obsolete { kind, id, since_ms: now.store_ms.unwrap_or(time) });
+                    }
+                    m.part_bytes = (m.part_bytes + ev.part_bytes_added).saturating_sub(ev.part_bytes_removed);
+                    if req.writes.events.iter().any(|o| matches!(o, events::EventOp::Create { .. })) {
+                        m.flags |= super::manifest::FLAG_EVENT_TABLES;
+                    }
+                    events.extend(ev.tables.keys());
+                    touched.extend(ev.touched);
+                    let value = encode_commit_record(time, &fx.appends, None);
                     tail.insert(record.clone(), Entry::new(record, new_seq, Value::Inline(value)));
                     if blob_bytes > 0 {
                         m.blob_bytes.bound += blob_bytes;
@@ -1548,6 +1629,7 @@ impl Db {
                         replayed: false,
                         time_ms: time,
                         appends: fx.appends,
+                        inserted: None,
                     })));
                 }
                 Work::Lease { release: r, for_reads, .. } => {
@@ -1658,7 +1740,7 @@ impl Db {
                         let live = match it.kind {
                             ObjKind::Segment => m.segments.iter().any(|s| s.id == it.id),
                             ObjKind::Levels => m.levels.as_deref() == Some(it.id.as_str()),
-                            ObjKind::Blob => false,
+                            ObjKind::Blob | ObjKind::Part => false,
                         };
                         if !listed && !live {
                             m.obsolete.push(it.clone());
@@ -1688,6 +1770,152 @@ impl Db {
                         outcomes.push(Outcome::Resolved(Ok(None)));
                     }
                 },
+                Work::Bind { bind, .. } => {
+                    let mut results: Vec<Option<Result<Committed>>> = vec![None; bind.slots.len()];
+                    let mut first_of: BTreeMap<u64, usize> = BTreeMap::new();
+                    let mut repeats: Vec<(usize, usize)> = Vec::new();
+                    for (i, (r, sl)) in results.iter_mut().zip(&bind.slots).enumerate() {
+                        if let Some(&j) = first_of.get(&sl.commit_id) {
+                            repeats.push((i, j));
+                            *r = Some(Err(Error::internal("repeated bind slot")));
+                            continue;
+                        }
+                        first_of.insert(sl.commit_id, i);
+                        *r = match commit_state(base, Some(&tail), sl.commit_id).await? {
+                            Some(CommitState::Applied(c)) => {
+                                probe::hit(Probe::CommitReplayed);
+                                Some(Ok(Committed { replayed: true, ..c }))
+                            }
+                            Some(CommitState::Aborted) => Some(Err(aborted(sl.commit_id))),
+                            None if sl.deadline.is_some_and(|d| Instant::now() > d) => {
+                                probe::hit(Probe::CommitDeadlinePassed);
+                                Some(Err(Error::Unavailable {
+                                    message: "commit deadline exceeded".into(),
+                                    retry_after_ms: Some(100),
+                                    outcome_unknown: false,
+                                }))
+                            }
+                            None => None,
+                        };
+                    }
+                    let added: u64 = bind.parts.iter().map(|p| p.part.size).sum();
+                    let state = events::state(&pending(base, &m, &tail), bind.table).await?;
+                    let rejected = match now.store_ms {
+                        _ if state.is_none() => Some(Error::not_found("event table not found")),
+                        None => Some(Error::unavailable("store clock not synchronized")),
+                        Some(t)
+                            if bind.parts.iter().any(|p| {
+                                !events::stage_fresh(&p.part.id, t + bind_margin_ms(cfg), cfg.blob_stage_ttl_ms)
+                                    || m.obsolete.iter().any(|o| o.id == p.part.id)
+                            }) =>
+                        {
+                            probe::hit(Probe::StagedPartUnbindable);
+                            Some(Error::unavailable("staged event parts expired before they were bound; retry"))
+                        }
+                        _ if cfg.event_max_bytes > 0 && m.part_bytes + added > cfg.event_max_bytes => {
+                            quota_refused = true;
+                            Some(Error::QuotaExceeded(format!(
+                                "the database's event tables are at their quota of {} bytes; delete events to make room",
+                                cfg.event_max_bytes
+                            )))
+                        }
+                        _ if let Some(limit) = quota
+                            && size + added > limit =>
+                        {
+                            quota_refused = true;
+                            Some(quota_exceeded(limit))
+                        }
+                        _ => None,
+                    };
+                    if let Some(e) = rejected {
+                        for r in results.iter_mut().filter(|r| r.is_none()) {
+                            *r = Some(Err(e.clone()));
+                        }
+                    }
+                    let accepted: Vec<usize> = (0..results.len()).filter(|i| results[*i].is_none()).collect();
+                    let since_ms = now.store_ms.unwrap_or(time);
+                    let mut fresh = Vec::with_capacity(bind.parts.len());
+                    for p in &bind.parts {
+                        let bound = pending(base, &m, &tail)
+                            .entry(&p.part.key())
+                            .await?
+                            .is_some_and(|e| !e.value.is_tombstone());
+                        if bound {
+                            probe::hit(Probe::BindInstallReplayed);
+                        } else {
+                            fresh.push(p);
+                        }
+                    }
+                    if accepted.is_empty() {
+                        for p in &fresh {
+                            m.obsolete.push(Obsolete { kind: ObjKind::Part, id: p.part.id.clone(), since_ms });
+                        }
+                        meta_changed |= !fresh.is_empty();
+                    } else {
+                        let new_seq = last_seq + 1;
+                        let mut st = state.ok_or_else(|| Error::internal("bind accepted without table state"))?;
+                        for p in &fresh {
+                            let mut mask = events::Runs::default();
+                            for (i, rows) in p.slot_rows.iter().enumerate() {
+                                if results[i].is_some() {
+                                    mask = mask.union(rows);
+                                }
+                            }
+                            let deleted = mask.count();
+                            if deleted >= p.part.rows {
+                                m.obsolete.push(Obsolete { kind: ObjKind::Part, id: p.part.id.clone(), since_ms });
+                                continue;
+                            }
+                            if deleted > 0 {
+                                probe::hit(Probe::BindSlotMasked);
+                            }
+                            let r = events::PartRef {
+                                version: Some(new_seq),
+                                min_pos: events::Pos { version: new_seq, ..p.part.min_pos },
+                                max_pos: events::Pos { version: new_seq, ..p.part.max_pos },
+                                deleted,
+                                masked_ms: if deleted > 0 { time } else { 0 },
+                                mask: (deleted > 0).then_some(events::Mask::Inline(mask)),
+                                ..p.part.clone()
+                            };
+                            m.part_bytes += r.stored_bytes();
+                            st.part_bytes += r.stored_bytes();
+                            let k = r.key();
+                            touched.push(KeyRange::point(&k));
+                            tail.insert(k.clone(), Entry::new(k, new_seq, Value::Inline(r.encode())));
+                        }
+                        let k = events::state_key(bind.table);
+                        touched.push(KeyRange::point(&k));
+                        tail.insert(k.clone(), Entry::new(k, new_seq, Value::Inline(st.encode())));
+                        for i in &accepted {
+                            let record = commit_key(bind.slots[*i].commit_id);
+                            touched.push(KeyRange::point(&record));
+                            let rows = bind.parts.iter().map(|p| p.slot_rows[*i].count()).sum();
+                            let value = encode_commit_record(time, &[], Some(rows));
+                            tail.insert(record.clone(), Entry::new(record, new_seq, Value::Inline(value)));
+                            results[*i] = Some(Ok(Committed {
+                                version: new_seq,
+                                time_ms: time,
+                                inserted: Some(rows),
+                                ..Committed::default()
+                            }));
+                        }
+                        probe::hit(Probe::PartsBound);
+                        size += added;
+                        events.insert(bind.table);
+                        last_seq = new_seq;
+                        data_changed = true;
+                    }
+                    for (i, j) in repeats {
+                        results[i] = match &results[j] {
+                            Some(Ok(c)) => Some(Ok(Committed { replayed: true, ..c.clone() })),
+                            other => other.clone(),
+                        };
+                    }
+                    let results =
+                        results.into_iter().map(|r| r.unwrap_or_else(|| Err(Error::internal("unsettled bind slot"))));
+                    outcomes.push(Outcome::Binds(results.collect()));
+                }
                 Work::MarkDeleted { .. } => {
                     m.flags |= super::manifest::FLAG_DELETED;
                     meta_changed = true;
@@ -1697,7 +1925,7 @@ impl Db {
             }
         }
         if !data_changed && !meta_changed {
-            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: None, due });
+            return Ok(Plan { manifest: None, outcomes, gc: Vec::new(), quota_refused, probes: None, due, events });
         }
         if data_changed {
             m.version = last_seq;
@@ -1786,7 +2014,7 @@ impl Db {
             (Probe::ReadLeaseRenewed, (meta_changed && !data_changed && lease_ms > cfg.lease_ms) as u64),
             (Probe::LeaseReleased, release as u64),
         ];
-        Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, probes: Some(probes), due })
+        Ok(Plan { manifest: Some(m), outcomes, gc, quota_refused, probes: Some(probes), due, events })
     }
 
     fn delete_obsolete(&self, gc: Vec<Obsolete>) {
@@ -1804,8 +2032,11 @@ impl Db {
         });
     }
 
-    fn after_commit(self: &Arc<Self>, v: &Arc<Version>, gc: Vec<Obsolete>, due: BTreeSet<u64>) {
+    fn after_commit(self: &Arc<Self>, v: &Arc<Version>, gc: Vec<Obsolete>, due: BTreeSet<u64>, events: BTreeSet<u32>) {
         let cfg = &self.shared.cfg;
+        if !events.is_empty() {
+            self.shared.events_changed(self, events);
+        }
         self.delete_obsolete(gc);
         self.shared.refresh_clock();
         {
@@ -2117,9 +2348,21 @@ impl Db {
         let mut live_blobs: BTreeMap<String, u64> = BTreeMap::new();
         let mut live_chunks: BTreeMap<String, u64> = BTreeMap::new();
         let mut due = BTreeSet::new();
+        let mut event_tables = BTreeSet::new();
+        let mut referenced_parts: BTreeSet<String> =
+            v.m.obsolete.iter().filter(|o| o.kind == ObjKind::Part).map(|o| o.id.clone()).collect();
         let mut it = v.iter_bulk(false);
         while let Some(e) = it.next().await? {
-            if let Some((_, stream::Stored::Chunk(c))) = stream::stored(&e) {
+            if e.key.first() == Some(&events::PARTS) {
+                if e.value.is_tombstone() {
+                    continue;
+                }
+                let r = events::ref_of(&e).ok_or_else(|| Error::internal("corrupt event part reference"))?;
+                referenced_parts.extend(r.mask_object().map(str::to_string));
+                referenced_parts.insert(r.id);
+            } else if let Some((table, _)) = events::state_of(&e) {
+                event_tables.insert(table);
+            } else if let Some((_, stream::Stored::Chunk(c))) = stream::stored(&e) {
                 referenced.insert((ObjKind::Segment, c.id.clone()));
                 live_chunks.insert(c.id, c.size);
             } else if let Some((id, st)) = stream::state_of(&e) {
@@ -2173,6 +2416,36 @@ impl Db {
         if let Some((c, mtime)) = cur {
             found(c, mtime, &mut items);
         }
+        let mut parts = Listing::new(format!("dbs/{}/part/", self.id));
+        parts.done = v.m.flags & super::manifest::FLAG_EVENT_TABLES == 0;
+        let mut cur: Option<(String, u64)> = None;
+        let part_found = |id: String, mtime: u64, items: &mut Vec<Obsolete>| {
+            let created = super::types::blob_id_time(&id).unwrap_or(0);
+            if super::types::valid_object_id(&id)
+                && !referenced_parts.contains(&id)
+                && mtime + cfg.orphan_grace_ms <= now_ms
+                && created + cfg.blob_stage_ttl_ms + bind_margin_ms(&cfg) <= now_ms
+            {
+                items.push(Obsolete { kind: ObjKind::Part, id, since_ms: now_ms });
+            }
+        };
+        while let Some(o) = parts.next(&self.shared).await? {
+            let Some(id) = blob_of(&o.key) else { continue };
+            match &mut cur {
+                Some((c, mtime)) if *c == id => *mtime = (*mtime).max(o.last_modified_ms),
+                _ => {
+                    if let Some((c, mtime)) = cur.replace((id, o.last_modified_ms)) {
+                        part_found(c, mtime, &mut items);
+                    }
+                }
+            }
+        }
+        if let Some((c, mtime)) = cur {
+            part_found(c, mtime, &mut items);
+        }
+        if !event_tables.is_empty() {
+            self.shared.events_changed(&self, event_tables);
+        }
         let blob_bytes = (live_blobs.values().sum(), v.m.blob_bytes.bound);
         let chunk_bytes = (live_chunks.values().sum(), v.m.chunk_bytes.bound);
         self.schedule_trims(due);
@@ -2216,8 +2489,8 @@ async fn commit_state(v: &Version, tail: Option<&BTreeMap<Bytes, Entry>>, id: u6
         _ => None,
     };
     Ok(Some(match record.ok_or_else(|| Error::internal("corrupt commit record"))? {
-        CommitRecord::Applied { time_ms, appends } => {
-            CommitState::Applied(Committed { version: e.seq, replayed: true, time_ms, appends })
+        CommitRecord::Applied { time_ms, appends, inserted } => {
+            CommitState::Applied(Committed { version: e.seq, replayed: true, time_ms, appends, inserted })
         }
         CommitRecord::Aborted => CommitState::Aborted,
     }))
@@ -2346,9 +2619,20 @@ fn bind_margin_ms(cfg: &super::EngineConfig) -> u64 {
     2 * cfg.clock_sync_max_error_ms
 }
 
-/// Validates that all staged blobs referenced by `w` are within the stage TTL
+/// Validates that all staged blobs and event parts referenced by `w` are within the stage TTL
 /// and have not been marked obsolete.
 fn bindable(w: &WriteSet, m: &Manifest, store_now: Option<u64>, cfg: &super::EngineConfig) -> Result<()> {
+    let parts: Vec<&str> = w.events.iter().flat_map(|e| e.new_objects()).collect();
+    if !parts.is_empty() {
+        let now = store_now.ok_or_else(|| Error::unavailable("store clock not synchronized"))?;
+        let stale = parts.iter().any(|id| {
+            !events::stage_fresh(id, now + bind_margin_ms(cfg), cfg.blob_stage_ttl_ms)
+                || m.obsolete.iter().any(|o| o.kind == ObjKind::Part && o.id == *id)
+        });
+        if stale {
+            return Err(Error::unavailable("a staged event part expired before it was committed; retry"));
+        }
+    }
     let mut staged = w.staged_blobs().peekable();
     if staged.peek().is_none() {
         return Ok(());
@@ -2404,6 +2688,7 @@ struct Plan {
     quota_refused: bool,
     probes: Option<[(Probe, u64); 11]>,
     due: BTreeSet<u64>,
+    events: BTreeSet<u32>,
 }
 
 pub(crate) fn quota_exceeded(limit: u64) -> Error {
@@ -2411,9 +2696,17 @@ pub(crate) fn quota_exceeded(limit: u64) -> Error {
 }
 
 /// Returns `(total_added_bytes, newly_bound_blob_bytes)` for a commit write set.
+/// Event part reference and table state updates are excluded so that maintenance
+/// and deletions succeed if the database is at quota.
 fn growth(w: &WriteSet) -> (u64, u64) {
+    let event_meta = |k: &[u8]| matches!(k.first(), Some(&events::PARTS | &events::TABLE_STATE));
     let added: u64 = w.streams.iter().map(StreamOp::appended_bytes).sum::<u64>()
-        + w.puts.iter().filter_map(|(k, p)| Some((k.len() + p.as_ref()?.value.size()) as u64)).sum::<u64>();
+        + w.events.iter().map(events::EventOp::inserted_bytes).sum::<u64>()
+        + w.puts
+            .iter()
+            .filter(|(k, _)| !event_meta(k))
+            .filter_map(|(k, p)| Some((k.len() + p.as_ref()?.value.size()) as u64))
+            .sum::<u64>();
     let blobs: u64 = w.staged_blobs().map(|b| b.size).sum();
     (added + blobs, blobs)
 }
@@ -2477,6 +2770,12 @@ async fn delete_object(shared: &Shared, db: &str, o: &Obsolete) -> Result<()> {
         ObjKind::Segment | ObjKind::Levels => {
             let key = if o.kind == ObjKind::Segment { seg_key(db, &o.id) } else { levels_key(db, &o.id) };
             shared.retry.run(|| shared.store.delete(&key)).await?;
+        }
+        ObjKind::Part => {
+            let objs = crate::store::list_all(&*shared.store, &super::part_prefix(db, &o.id), &shared.retry).await?;
+            for ob in objs {
+                shared.retry.run(|| shared.store.delete(&ob.key)).await?;
+            }
         }
         ObjKind::Blob => {
             let now = shared.store_now_ms().ok_or_else(|| Error::unavailable("store clock not synchronized"))?;

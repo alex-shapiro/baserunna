@@ -76,7 +76,7 @@ struct Info {
 fn limits(s: &Stream) -> String {
     let mut out = Vec::new();
     if let Some(ms) = s.retention_ms {
-        out.push(format!("{} s", ms / 1000));
+        out.push(super::format_duration(ms));
     }
     if let Some(b) = s.max_bytes {
         out.push(format_bytes(b));
@@ -252,7 +252,7 @@ async fn append(Path((db, name)): Path<(String, String)>, Posted { s, f }: Poste
     let sp = stream_path(&db, &name);
     let value = field(&f, "value");
     let record = match f.contains_key("json") {
-        true => match serde_json::from_str::<Json>(value) {
+        true => match crate::api::parse_json::<Json>(value.as_bytes()) {
             Ok(j) => json!({"json": j}),
             Err(e) => return Ok(back(&sp, &format!("The record is not JSON: {e}"), false)),
         },

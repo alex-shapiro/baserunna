@@ -1,8 +1,8 @@
 # Baserunna Specification
 
 Baserunna is a web service that stores small databases on object storage.
-Each database supports serializable transactions, KV APIs, tables, and
-streams. Baserunna service data is itself stored in a Baserunna database.
+Each database supports serializable transactions, KV APIs, tables,
+streams, and event tables for analytics. Baserunna service data is itself stored in a Baserunna database.
 
 Status: v1 specification. Sections marked **(future)** are explicitly out of
 scope for v1.
@@ -40,6 +40,7 @@ scope for v1.
 
 - Databases are typically ≤ 10s of MiB and occasionally 100s of MiB.
 - Databases may also reference large binary assets of up to GiBs each.
+- Event tables may hold up to ~1 TiB of append-mostly events, queried by time range.
 - Reads are ~10× more frequent than writes.
 - One server may host hundreds to thousands of active databases, and far more idle databases.
 - Servers fail arbitrarily. Uncommitted transactions may be lost.
@@ -185,6 +186,9 @@ Use a prefix byte to avoid collisions between keyspaces.
 | `0x06` | stream records and chunk references: `0x06 ++ stream_id(u64 BE) ++ seq(u64 BE)`     |
 | `0x07` | internal stream state (§5.11): `0x07 ++ stream_id`                                  |
 | `0x08` | consumer cursors: `0x08 ++ stream_id ++ consumer`                                   |
+| `0x09` | unsealed events: `0x09 ++ table_id ++ version(u64 BE) ++ ordinal(u32 BE)`           |
+| `0x0A` | event part refs: `0x0A ++ table_id ++ partition(u32) ++ part_id`                    |
+| `0x0B` | event table state (§5.13): `0x0B ++ table_id`                                       |
 | `0xFF` | internal commit records (§5.5): `0xFF ++ commit_id(u64 BE)`                         |
 
 ### 4.3 Blobs
@@ -315,26 +319,56 @@ and a stream record may be committed alongside a row update.
 
 ### 4.7 Filters
 
-Table queries and selections and stream reads filter with one language,
-evaluated server-side. A filter is exactly one of `{"and": [f, ...]}`,
-`{"or": [f, ...]}`, `{"not": f}` or a comparison: the operand's keys (a
-column, a field, a header), `op`, and a `value`. Any other key, or keys of
-two of these forms in one object, makes the request `400`.
+Table queries, row selections, and stream reads share a server-side filter language. A filter object is `{"and": [f, ...]}`, `{"or": [f, ...]}`, `{"not": f}`, or a leaf comparison containing an operand (`col`, `field`, or `header`), an operator (`op`), and an argument (`value`). Requests that combine multiple filter forms in a single object or include unknown keys are rejected with `400`.
 
-- **Comparisons**: `eq`, `ne`, `lt`, `le`, `gt`, `ge` (a number, string or
-  boolean), `in` (an array of at most 1000 values), `prefix` (a string),
-  `contains` (a substring, or an element of an array) and `exists`, which
-  alone takes no value. Values are never null.
-- **Missing and null are one**: a comparison of a missing or null operand
-  is false, `ne` included, so `ne` means "present and different". Only
-  `exists` tells such an operand apart, and `not exists` selects it.
-- **Values compare within their type**. A column compares with values of
-  its type (bytes as base64, by their bytes); only string, bytes and JSON
-  columns take `prefix` and `contains`, and blob columns only `exists`. JSON (JSON columns, body fields, headers as strings) compares
-  numbers by value (`1` equals `1.0`), strings by their bytes and booleans
-  with false first; arrays and objects only equal. A comparison across
-  types is false.
-- **Limits**: a filter nests at most 16 deep and has at most 256 terms.
+- **Operators**: `eq`, `ne`, `lt`, `le`, `gt`, `ge` (for numbers, strings, or booleans), `in` (an array of up to 1,000 non-null values), `prefix` (strings), `contains` (substring or array element), and `exists` (which does not take a `value`). Filter arguments cannot be `null`.
+- **Null and missing values**: Any comparison other than `exists` against a missing or `null` operand evaluates to `false`, including `ne`. Use `{"not": {..., "op": "exists"}}` to match missing or `null` values.
+- **Type semantics**: Typed columns are compared against values of the same type (`bytes` columns accept base64 strings and are compared lexicographically by raw bytes). Only `string`, `bytes`, and `json` columns support `prefix` and `contains`, and `blob` columns support only `exists`. JSON values (JSON columns, stream fields, and string headers) compare numbers by exact numeric value (`1` equals `1.0`, and `2^53 + 1` is greater than `2^53`), strings by UTF-8 bytes, and booleans with `false < true`; arrays and objects support only equality. Cross-type comparisons evaluate to `false`. Row-table `float` columns reject integer filter arguments that cannot be represented exactly as IEEE 754 `f64`, whereas event-table `float` columns compare against 64-bit integers using exact numeric ordering.
+- **Limits**: Filters may have a maximum depth of 16 and at most 256 nodes.
+
+### 4.8 Event tables
+
+Event tables store append-mostly, timestamped records in columnar parts and execute analytical queries over time ranges with bounded memory. Because event tables reside in the same database as KV pairs, row tables, and streams, a transaction can insert events alongside row updates, and event queries can enrich events with lookups from row tables.
+
+- **Schemas**: An event table defines up to 256 columns of type `time` (milliseconds since the Unix epoch, formatted as an integer or RFC 3339 timestamp), `string`, `int`, `float`, `bool`, or `json` (a JSON object queried by leaf path). A required non-nullable `time` column serves as the partitioning and range-filter timestamp; if its default is `"now"`, omitted timestamps are populated from the serving node's clock. The `order_by` key (1 to 8 columns) defines the sort order within storage parts and accelerates filters on leading sort columns. Events are partitioned by UTC time (`hour`, `day` by default, `week` starting Monday, or `month`) so range queries and retention drops can skip whole partitions. Optional `bloom` skip indexes accelerate equality and `in` filters on scalar columns. Columns can be added or dropped online; a newly added column with a default value applies retroactively to older events, and a newly added `time` column with default `"now"` must be nullable because older events evaluate to `null`. Column defaults are limited to 1 KiB, and `json` columns cannot have defaults, sort keys, or skip indexes.
+- **Inserts**: Events are inserted either in bulk (`POST /v1/dbs/{db}/events/{t}/rows` as JSON or NDJSON) or transactionally (`insert_events` in `/txn`). Each event is limited to 1 MiB encoded and 4 MiB of flattened JSON paths and values. After applying column defaults, the total encoded size of an insert batch is bounded by `max(body_limit, 8 * request_body_bytes)` for bulk inserts or `txn_max_write_bytes` for transactions. Bulk inserts on a node are coalesced for up to 200 ms, written directly to object storage as columnar parts, and committed in a single manifest update. Bulk inserts with an `Idempotency-Key` are applied at most once; replaying the key returns the original count, and reusing a key from a different operation type is rejected with `400`. Timestamps must fall within years `0000` through `9999`. In JSON columns, `null` object fields are omitted, `-0.0` is normalized to `0`, and integers outside the signed 64-bit range are rejected with `400`.
+- **Queries**: Queries scan a half-open time range `[from, to)` on the table's time column, apply an optional filter (§4.7, with `path` for JSON columns), and return either paginated rows or grouped aggregates. Query results are invariant to how events are partitioned or merged: all aggregate states are associative and commutative, and floating-point sums and averages use exact accumulator arithmetic (returning `null` if the final `f64` result overflows).
+  - _Expressions_: An expression references a column (`"user"`), a JSON leaf path (`{"col": "props", "path": ["plan"]}`), a dimension lookup (`{"lookup": "plan"}`), or a time bucket (`{"bucket": {"col": "time"}, "interval": "1d", "offset": "-05:00"}`), with an optional `"as"` alias. Supported bucket intervals are seconds (`s`), minutes (`m`), hours (`h`), or days (`d`) aligned to the Unix epoch, weeks (`w`) starting Monday, and calendar months (`mo`). JSON paths address leaf values (scalars, arrays, or empty objects); paths to non-empty intermediate objects evaluate to `null`.
+  - _Row queries_: Selecting `columns` (or omitting both `group_by` and `aggregates`) returns raw events ordered by the time column or by `order_by` output aliases, returning 100 rows by default (up to 10,000) along with a `cursor` for pagination.
+  - _Aggregate queries_: Specifying `group_by` or `aggregates` groups matching events and evaluates named aggregate functions in alphabetical key order. Supported functions (`{"fn": ..., "of": ..., "where": ...}`) are `count`, `sum`, `min`, `max`, `avg`, `uniq` (HyperLogLog, exact up to 1,024 distinct values), `uniq_exact`, `quantiles` (DDSketch over `q` levels within 1% relative error), `window_funnel` (evaluating ordered `steps` filters within `window_ms`, supporting `strict_order`, `strict_deduplication`, and `strict_increase` per attempt), and `retention` (returning a boolean array indicating whether a group satisfied `conditions[0]` and each subsequent `conditions[i]`). An optional `then` stage re-aggregates the first stage's output columns. Results are sorted by `order_by` and truncated to `limit`; queries without a `limit` fail with `413` if group count exceeds 100,000.
+  - _Lookups_: The `lookups` map (`{"plan": {"table": "users", "key": "user", "value": "plan", "default": ...}}`) joins an event expression against the primary key of a row table in the same database and returns the target column (or `default` if unmatched). Each referenced column of a lookup table is scanned once per query into a shared compact lookup map.
+  - _Consistency_: Queries use `snapshot` consistency by default (reading a snapshot at most 5 s or `max_staleness_ms` old) or `strong` consistency to observe all acknowledged writes. If a cached snapshot predates the target event table or a referenced column, the query automatically retries with a strong snapshot.
+  - _Resource limits_: A query is rejected with `413` if it reads more than 4 GiB of part data, exceeds 1 GiB of aggregate state / buffered rows plus active column vectors, or exceeds 1 GiB of lookup maps. Queries that run longer than 60 s are canceled with a retryable `503`.
+
+  Example two-stage funnel query with a dimension lookup:
+
+  ```json
+  {
+    "from": "2026-10-01",
+    "to": "2026-11-01",
+    "lookups": { "plan": { "table": "users", "key": "user", "value": "plan" } },
+    "group_by": ["user", { "lookup": "plan", "as": "plan" }],
+    "aggregates": {
+      "steps": {
+        "fn": "window_funnel",
+        "window_ms": 86400000,
+        "steps": [
+          { "col": "event", "op": "eq", "value": "view" },
+          { "col": "event", "op": "eq", "value": "buy" }
+        ]
+      }
+    },
+    "then": {
+      "group_by": ["plan", "steps"],
+      "aggregates": { "users": { "fn": "count" } }
+    }
+  }
+  ```
+
+- **Deletes**: `POST /v1/dbs/{db}/events/{t}/rows/delete` (or `delete_events` in `/txn`) transactionally removes events matching a filter within `[from, to)`. If a delete produces a mask larger than the per-partition limit, the request fails with `413` so the caller can delete narrower time ranges. Masked rows are physically purged from object storage within roughly 26 hours on active databases: background maintenance rewrites parts whose oldest deletion exceeds `event_purge_ms` (24 hours), and garbage collection removes the replaced part objects 30 minutes later (§5.8). Events deleted while still unsealed in the LSM tree become standard LSM tombstones and are reclaimed during segment compaction.
+- **Retention**: If `retention_ms` is configured on an event table, queries exclude events older than `store_clock - retention_ms`, and background maintenance drops parts whose `max_time` is older than the cutoff (§5.8). If the node does not have a valid store-clock measurement, retention filtering and drops are paused.
+- **Dropping tables**: Dropping an event table executes in constant time by writing range tombstones over the table's unsealed rows and part references without scanning existing parts, avoiding conflicts with concurrent inserts or merges. Unreferenced part objects are reclaimed asynchronously by the orphan sweep (§5.8).
+- **Quotas**: Unsealed event bytes and referenced part bytes count toward the database size quota (§5.10), and total event part storage per database is capped at 1 TiB. Background seals, merges, deletes, and retention drops bypass quota checks so a full database can still compact and free space. Sealing unsealed events creates at least one ~330-byte part per partition, which can increase accounted size if events are sparsely distributed across many partitions.
 
 ## 5. Storage engine
 
@@ -347,6 +381,7 @@ dbs/{db_id}/seg/{id}.levels          immutable list of the segments below level 
 dbs/{db_id}/blob/{blob_id}/{chunk}   immutable blob chunks
 dbs/{db_id}/blob/{blob_id}/meta      the blob's descriptor (BlobRef), for binding by id
 dbs/{db_id}/blob/{blob_id}/pin       rewritten by long reads (§5.8)
+dbs/{db_id}/part/{part_id}/{chunk}   immutable event part chunks, or a deletion mask (§5.13)
 clock                                every node's store-clock probe (§5.8)
 ```
 
@@ -368,9 +403,10 @@ tail: [Entry]                                         sorted by key, newest valu
 range_deletes: [(start, end?, seq)]                   range tombstones (§5.5)
 tombstone_horizon: u64                                tombstones with seq <= horizon may have been purged
 version_times: [(version, store_ms)]                  sparse samples (≥30 s apart) for time-based policies
-obsolete: [(kind, id, since_store_ms)]                segments, levels objects and blobs awaiting deletion
+obsolete: [(kind, id, since_store_ms)]                segments, levels objects, blobs and parts awaiting deletion
 blob_bytes: {bound, swept, swept_at}                  blob bytes for the size quota (§5.10)
 chunk_bytes: {bound, swept, swept_at}                 sealed stream chunk bytes, likewise (§5.11)
+part_bytes: u64                                       bytes of referenced event parts and masks (§5.13)
 flush_seq: u64                                        incremented by every tail flush (§5.5)
 ```
 
@@ -638,6 +674,10 @@ Because compaction output segments are unreferenced until the compaction is inst
 
 A `copy` operation (§6.3) shares the source key's blob without restaging it. Because the committer validates that the source key is unchanged at commit time under all isolation levels, the blob remains referenced in every manifest version between the read and the commit and cannot be swept as an orphan.
 
+#### Event Parts
+
+Replaced event parts and deletion masks are added to `manifest.obsolete` like LSM segments. During the orphan sweep, if the database has ever contained an event table (`FLAG_EVENT_TABLES`), the lease holder collects all referenced part and mask IDs from the LSM tree, lists `part/` in object storage, and moves unreferenced IDs whose `last_modified` exceeds the orphan grace period and whose embedded creation timestamp exceeds the stage TTL into `obsolete`. Deleting an obsolete part lists and deletes all chunk objects under `dbs/{db_id}/part/{part_id}/`.
+
 #### Long Blob Reads
 
 Streaming a large blob by ID can take longer than the 30 min obsolete grace period. A blob read that has run for 10 min writes a `dbs/{db_id}/blob/{blob_id}/pin` object and refreshes it every 10 min. If a blob is already listed in `obsolete` when a read by ID begins, the reader writes the pin before reading any chunks.
@@ -657,7 +697,7 @@ There are two read consistency modes:
 
 ### 5.10 Size Quotas
 
-Each user database is capped at 10 GiB by default (`BASERUNNA_DB_MAX_MB`; the system database is exempt). A database's accounted size is the sum of its `tail` bytes, LSM segment bytes (excluding commit-record segments), referenced blob bytes, and sealed stream chunk bytes (§5.11).
+Each user database is capped at 10 GiB by default (`BASERUNNA_DB_MAX_MB`; the system database is exempt). A database's accounted size is the sum of its `tail` bytes, LSM segment bytes (excluding commit-record segments), referenced blob bytes, sealed stream chunk bytes (§5.11), and event part bytes (`part_bytes` in the manifest, updated exactly on every commit because each part has a single reference).
 
 Overwriting or deleting a key in the LSM tree does not immediately show whether a blob or stream chunk is still referenced elsewhere. To track their size without scanning the database on every commit, the manifest maintains three counters for `blob_bytes` and `chunk_bytes`:
 
@@ -724,7 +764,41 @@ If memory usage remains above the budget after all idle databases are unloaded, 
 
 Single-request transactions, interactive transaction commits, and interactive transaction aborts are always admitted so that in-flight work can finish and release memory. Each user is limited to 100 concurrent open interactive transactions per node.
 
----
+### 5.13 Event storage
+
+Event tables combine transactional LSM writes for low-volume inserts with immutable columnar objects ("parts") for bulk ingestion and analytical scans. Queries read a consistent snapshot across both unsealed LSM rows and columnar parts, while idle event tables consume zero compute.
+
+#### Unsealed rows and sealing
+
+Transactionally inserted events are written to the LSM tree under `0x09 ++ table_id ++ version ++ ordinal`, assigning each event a unique `(version, ordinal)` position that is preserved across all subsequent seals and merges. The committer maintains per-table counters of unsealed rows, unsealed bytes, and referenced part bytes in the table state entry (`0x0B ++ table_id`). Once a table accumulates at least 128 KiB of unsealed rows, the lease holder seals them in the background by writing columnar parts per partition, replacing the sealed LSM rows with a range tombstone, and inserting part references (`0x0A`). Sealing conflicts only with concurrent deletes covering the sealed rows. If a column with a default value was added after an unsealed row was written, the part builder materializes the default directly into the column vector without copying it into each unsealed row, and counts the expanded default size toward the 64 MiB per-part build limit.
+
+#### Bulk inserts
+
+Bulk insert requests bypass the LSM tree by coalescing events in memory per node and table (up to 200 ms or 16 MiB), writing staged columnar parts directly to object storage, and sending a single `/internal/v1/events/bind` request to the database lease holder. The committer installs all staged parts from the bind batch in a single manifest write and records per-request commit records. If an individual request in the batch is rejected (for example, due to an aborted idempotency key or an expired deadline), the committer masks that request's row ranges in the shared part references so the remaining requests in the batch still succeed. Table-wide errors (such as a dropped table, exceeded quota, or expired stage TTL) reject the entire bind batch.
+
+#### Parts
+
+Each part stores a single partition's events sorted by `(order_by, position)` across 32 MiB chunk objects (`dbs/{db_id}/part/{part_id}/{chunk}`). Within a part, rows are divided into granules of up to 8,192 rows or 10 MiB of flattened data, and each column is stored as a framed block (§5.3) per granule using type-specific encodings (delta or constant encoding for integers, dictionary or plain encoding for strings with up to 65,536 entries / 1 MiB per part dictionary, and bitmaps for nulls). Each column has an index storing block byte ranges, per-granule min/max/null statistics, and optional bloom filters covering groups of 4 granules. The part footer (`PartMeta`) stores granule row offsets, the primary index (the sort key of each granule's first row, omitting keys larger than 4 KiB), and the column directory. JSON columns are decomposed into subcolumns by leaf path: up to 1,024 frequent paths (with keys up to 256 bytes) are stored as dedicated typed columns, while remaining paths are hashed into 32 shared JSON buckets and listed in a path directory capped at 1 MiB. Each part also records per-row byte sizes so subsequent merges preserve granule size bounds.
+
+A part reference (`0x0A ++ table_id ++ partition ++ part_id`) stores the part ID, row count, timestamp range, byte size, compaction level, min/max event positions, deletion mask (stored inline up to 4 KiB or in a separate mask object), and the timestamp of the oldest unpurged deletion.
+
+#### Queries
+
+Query execution prunes part references by time range, fetches part metadata and filtered column indexes, eliminates parts and granules using dictionary checks, min/max statistics, primary keys, and bloom filters, and evaluates filter columns (prewhere) before reading projected columns for matching granules.
+
+Memory usage per query is bounded regardless of the number of columns, JSON paths, or rows scanned. The executor reads granules in runs of up to 16 whose decoded columns fit within 25% of the query memory budget, charging active column vectors alongside aggregate state. Derived values (shared JSON bucket paths, reconstructed JSON objects, dimension lookups, unsealed row values, and retroactive column defaults) are evaluated in bounded row windows that shrink proportionally with the number of expressions in the query.
+
+Up to 32 parts are read concurrently into partial results, each capped at 1/32 of the query state budget, and merged in deterministic part order so memory accounting is independent of completion order. If a part's partial state and active columns exceed its 1/32 share, that part is re-evaluated serially against the main accumulator. Stalled part `GET` requests are hedged after 1 s. Small parts are cached as a single entry in the memory block cache, while larger parts are cached by individual metadata, index, and column blocks.
+
+Paginated row queries ordered by the time column read only the parts needed to fill the requested page. The pagination cursor narrows the scan time range and skips parts whose `(time, position)` bounds precede the cursor. Parts are scanned in query order and execution stops once all unread parts follow the page's last row and at least 1 additional matching row is known to exist for `next_cursor`.
+
+#### Merges and retention
+
+After seals, binds, and GC sweeps, the lease holder runs background maintenance in priority order: dropping expired partitions past `retention_ms`, rewriting parts with a high fraction of deleted rows, merging same-tier parts within a partition (size-tiered fan-in of 8, up to 4 GiB per output part), purging parts whose oldest deletion exceeds `event_purge_ms` (24 hours), and compacting quiet completed partitions that have not received new parts for 24 hours into a single part. A merge streams input columns sequentially, writes a new part object, and swaps the part references in a transaction that conflicts only with concurrent deletes on those parts. For inputs with deletion masks, the merge scans live rows first to build output dictionaries and JSON path directories so deleted values do not remain in part metadata.
+
+#### Drops
+
+Dropping an event table writes range tombstones over the table's unsealed rows and part references, deletes the table state entry, and decrements the database's `part_bytes` counter by the table's recorded part bytes. Because the drop transaction does not read individual part references, its write set size is constant and it does not conflict with concurrent binds, seals, or merges; any maintenance or bind operation that is committed after the drop fails validation against the deleted table state or range tombstone.
 
 ## 6. Transactions
 
@@ -754,7 +828,10 @@ Single-request transactions, interactive transaction commits, and interactive tr
   rather than miss index maintenance.
 - Read-only transactions always succeed and are serialized at `read_version`.
 - Blind-write transactions never conflict, appends included.
-- Reads within a transaction see its own earlier writes, except appends.
+- Reads within a transaction see its own earlier writes, except stream appends and
+  event inserts: because event positions are assigned at commit time, a
+  transaction that inserts into an event table cannot query or delete from that
+  table in the same transaction (`400`).
 - Limits: `txn_max_ops` 10,000; `txn_max_write_bytes` 16 MiB, where blobs
   count only their descriptor; `txn_max_read_bytes` 16 MiB of keys and key
   ranges in the read set; 100,000 appended records; `txn_idle_timeout`
@@ -845,6 +922,12 @@ Stream operations:
 - `get_consumer`: stream, consumer → `{found, seq?}`
 - `set_consumer`: stream, consumer, `seq` → `{}`
 
+Event operations:
+
+- `insert_events`: table, `rows` → `{count}`
+- `query_events`: table, `from`, `to`, `where?`, `columns?` | (`group_by?`, `aggregates?`, `then?`), `lookups?`, `order_by?`, `limit?`, `cursor?` → `{columns, rows, next_cursor?, stats}`
+- `delete_events`: table, `from?`, `to?`, `where` → `{deleted}`
+
 `ttl_ms` (1 ms to 10 years) adds a TTL expiration relative to write
 commit time (§4.5); `update_row`, `update_rows` and `increment` do not
 update an existing TTL by default.
@@ -872,8 +955,6 @@ If a poll finds 0 changes and `wait_ms` (up to 50 s) is set, the request waits u
 
 To compute a page (`Version::changes`), the engine merges only the `tail` and segments with `max_seq` at or above the cursor version. Because compaction retains tombstones for at least `txn_max_lifetime` (5 min, §5.6), a cursor remains valid for at least `txn_max_lifetime` after the snapshot of its oldest page. If tombstones needed by the cursor have been purged, the request fails with `410 cursor_expired` and the client must resynchronize. A client can resynchronize by starting from `after=0` to perform a full state transfer of all live keys. Because a reader starting from version 0 holds only keys returned by earlier pages of that transfer, it only requires tombstones newer than the oldest snapshot version read during the transfer; the cursor records that version as a floor so that purging older tombstones does not expire an in-progress transfer.
 
----
-
 ## 7. Cluster
 
 - **Cluster time.** Timestamps that one node writes and another compares
@@ -897,7 +978,8 @@ To compute a page (`Version::changes`), the engine merges only the `tail` and se
   `hash(node_id ‖ d)` (rendezvous hashing). Long-poll requests (`GET` with
   `wait_ms > 0`) are always routed to the rendezvous home node, where commit
   notices are sent (§6.4), so that waiting requests are notified even if
-  another node acquires the lease. If the lease holder is not in the
+  another node acquires the lease. Event bulk inserts and queries are
+  served by the node they reach (§5.13). If the lease holder is not in the
   cached member table, the node refreshes the member table with a strong read
   at most once per second. A member entry with the node's own
   address belongs to a previous process and is ignored during routing. If the target is another node, the
@@ -930,7 +1012,8 @@ To compute a page (`Version::changes`), the engine merges only the `tail` and se
   own `commit_timeout_ms` so that a delayed forward cannot be committed after
   the client's deadline.
 - **Internal endpoints** (`/internal/v1/…`, used to run system-DB
-  transactions on its owner) always require `x-baserunna-cluster-key`. Its
+  transactions on its owner and to bind event parts on a database's lease
+  holder, §5.13) always require `x-baserunna-cluster-key`. Its
   value is the configured `BASERUNNA_CLUSTER_SECRET` or, by default, a key
   generated once per cluster and stored in the system database's `config`
   table. Every node reads it from the shared store, which is the trust
@@ -939,8 +1022,6 @@ To compute a page (`Version::changes`), the engine merges only the `tail` and se
   (`If-None-Match: *`, so it is idempotent) and runs the schema-migration
   transaction (it checks the catalog first, so it is idempotent). The node
   then registers its heartbeat.
-
----
 
 ## 8. Service metadata (system DB)
 
@@ -1015,8 +1096,6 @@ database with the name of a partially deleted database also finishes the prior
 deletion first. Because a missing manifest is created only after a strong
 metadata read confirms the database exists, a stale cache entry cannot
 recreate a purged database.
-
----
 
 ## 9. Authentication and authorization
 
@@ -1119,15 +1198,15 @@ recreate a purged database.
   Console forms are protected against CSRF with a per-session token:
   HMAC(cookie_key, session token hash).
 
----
-
 ## 10. HTTP API
 
 The API is JSON over HTTP. All routes are under `/v1`. The full schema is in
 `openapi.json` (OpenAPI 3.1, generated by `src/api/openapi.rs`), served at `GET /v1/openapi.json`. DB-scoped
 routes take `{db}`, a reference: `name` (a database of the caller's),
 `org.name` (an organization's), or `id:<db_id>` (administrators).
-Responses carry `x-request-id` (§7).
+Responses include the `x-request-id` header (§7).
+
+If a request JSON body contains an integer outside of the signed and unsigned 64-bit ranges, the request is rejected with `400`.
 
 Errors are returned as
 `{"error": {"code", "message", "retryable", "details"?}}`:
@@ -1149,9 +1228,10 @@ Errors are returned as
 
 The server cancels a request with a retryable `503 unavailable` error if the
 request exceeds its `commit_timeout_ms` (10 s) deadline. The response includes
-`outcome: "unknown"` unless the request method is `GET` or `HEAD`. The deadline
-is paused while the server waits for the client to send the request body, and is
-extended by `wait_ms` for long-poll requests.
+`outcome: "unknown"` unless the request method is `GET` or `HEAD` or it is an
+event query. The deadline is paused while the server waits for the client to
+send the request body, and is extended by `wait_ms` for long-poll requests and
+by an event query's own 60 s time limit (§4.8).
 
 Routes (see the OpenAPI document for bodies):
 
@@ -1203,11 +1283,18 @@ POST /v1/dbs/{db}/streams/{s}/records/query filtered read
 POST /v1/dbs/{db}/streams/{s}/trim before_seq
 GET /v1/dbs/{db}/streams/{s}/consumers limit, cursor
 GET|PUT|DELETE /v1/dbs/{db}/streams/{s}/consumers/{c}
+GET /v1/dbs/{db}/events POST /v1/dbs/{db}/events
+GET /v1/dbs/{db}/events/{t} PATCH /v1/dbs/{db}/events/{t} (retention) DELETE /v1/dbs/{db}/events/{t}
+POST /v1/dbs/{db}/events/{t}/columns DELETE /v1/dbs/{db}/events/{t}/columns/{c}
+POST /v1/dbs/{db}/events/{t}/skip-indexes DELETE /v1/dbs/{db}/events/{t}/skip-indexes/{c}
+POST /v1/dbs/{db}/events/{t}/rows insert: JSON or NDJSON; Idempotency-Key
+POST /v1/dbs/{db}/events/{t}/rows/query
+POST /v1/dbs/{db}/events/{t}/rows/delete from, to, where
 GET /v1/admin/users GET /v1/admin/nodes POST /v1/admin/users/{id}/disable
 GET|DELETE /v1/admin/metrics read (and on DELETE, reset) node latency metrics
 ```
 
-Listings take `limit` and `cursor` and answer `next_cursor` (§8).
+List endpoints accept `limit` and `cursor` query parameters and return `next_cursor` (§8). Table, event table, and stream listings are ordered by name and support an optional `prefix` filter.
 
 Raw KV semantics:
 
@@ -1246,8 +1333,6 @@ tail_seq, done, version}`), or per the `Accept` header or `format`
   the node shuts down; the client resumes after `Last-Event-ID`. A read that
   fails before the stream starts answers with its error status.
 
----
-
 ## 11. Admin console
 
 Server-rendered HTML from the same axum app under `/console`. It uses no
@@ -1260,7 +1345,9 @@ JavaScript framework and no external assets. Pages:
   (prefix scan, view, delete, put, file upload, download), tables (create,
   drop; add and drop columns and indexes; rows), streams (create, delete,
   retention; newest records first, older pages, appending a record;
-  consumers), and a transaction runner (JSON);
+  consumers), event tables (create, drop; partition and part inspection; a
+  query runner defaulting to daily event counts over the latest 30-day window;
+  event insertion), and a transaction runner (JSON);
 - organizations: list, create, delete; members (add by email, change
   role, remove, leave) and the organization's databases;
 - account: verification status, password change, sessions (revoke one or
@@ -1272,8 +1359,6 @@ JavaScript framework and no external assets. Pages:
 Every listing is paginated. POST forms carry a CSRF token. All output is
 HTML-escaped. Downloads are attachments with `nosniff` and a sandboxing
 content security policy.
-
----
 
 ## 12. Configuration (environment)
 
@@ -1341,8 +1426,6 @@ within one process, so the store takes an exclusive lock on `<dir>/.lock`,
 and a second process (or a second store in the same process) fails to open
 the directory.
 
----
-
 ## 13. Deterministic simulation testing (DST)
 
 The simulator executes a multi-node cluster on a single thread in virtual time, injects storage, network, and process faults, and verifies client-observed behavior and cluster invariants against reference models.
@@ -1380,6 +1463,7 @@ Workloads run concurrently with a shared chaos loop (`ChaosPhase`). When all act
 - `ttl`: Verifies KV and row TTL expiration windows and distributed lock acquisition and renewal order under clock skew and faults.
 - `watch`: Concurrent puts, TTL expirations, point deletes, and range deletes while a watcher polls `/changes` with strong and stale snapshot reads, resynchronizing from a scan or by following the feed from version 0. Verifies that every change matches a committed write, cursors do not expire within the transaction lifetime, and the reconstructed state matches the final database state.
 - `streams`: Concurrent stream appends (with `expect_seq`, idempotency keys, and transactional counters), long-poll and SSE followers, forward/reverse/filtered/time-based reads, consumer cursors, explicit and retention trims, and stream recreation. Verifies dense sequence numbers, monotonic timestamps, and exact state reconstruction.
+- `events`: Concurrent bulk inserts (JSON and NDJSON across all nodes), transactional inserts alongside row upserts, deletes by `uid` and by filter within time ranges, column additions, and retention updates, while queriers compare randomized queries (filters, group-bys, time buckets, lookups, two-stage funnels, and paginated row scans) against a per-version reference model. After fault healing, the checker verifies that every acknowledged event is returned exactly once. Additional sub-workloads exercise concurrent table drops, recreations, and column churn, insert events near dynamic retention cutoffs to verify that retained events are never dropped early, and run accelerated garbage collection to verify that all replaced and orphaned parts are deleted.
 - `blobs`: Concurrent blob uploads, range reads, overwrites, and deletes verified by SHA-256, followed by garbage collection verification.
 - `blob_gc_race`: Concurrent long-running blob reads racing with overwrites, copies, deletes, and short-grace-period garbage collection under clock skew.
 - `abandoned`: Interactive transactions abandoned, aborted, or committed late across lease transitions. Verifies that committed updates are preserved, abandoned transactions are not committed, and open transaction handles are drained.
@@ -1394,7 +1478,7 @@ Workloads run concurrently with a shared chaos loop (`ChaosPhase`). When all act
 - `memory`: Exercises many databases under a tight memory budget while long-poll requests wait on unloaded databases and multiple users hold interactive transactions with large write sets. Verifies that strong reads return all settled writes, long-poll requests observe expected writes, and a heavy user cannot starve other users of transaction memory for more than 20 s.
 - `mix`: Runs a random combination of at least two workloads concurrently in a shared cluster and chaos loop.
 
-Every 20 ms of virtual time, global oracles verify that at most 1 node relies on a lease for any database and that any node relying on a lease without an in-flight manifest write holds the latest manifest version in the store. At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, and stream chunks are intact and consistent. After a node shuts down gracefully, the simulator verifies that none of the released databases in storage have a lease held by that node.
+Every 20 ms of virtual time, global oracles verify that at most 1 node relies on a lease for any database and that any node relying on a lease without an in-flight manifest write holds the latest manifest version in the store. At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, stream chunks, and event parts and masks are intact and consistent, that event positions are unique across unsealed rows and parts, and that `part_bytes` equals the referenced parts' sizes. After a node shuts down gracefully, the simulator verifies that none of the released databases in storage have a lease held by that node.
 
 ### 13.4 Coverage, campaigns, and exploration
 
@@ -1440,6 +1524,11 @@ Every 20 ms of virtual time, global oracles verify that at most 1 node relies on
   | stream tail read, lease holder                | 0                                       |
   | log ingestion, 20 KB NDJSON appends           | 1 PUT per append + 5 PUT per MiB, 0 GET |
   | cold read of a sealed log                     | 5 GET per MiB                           |
+  | event insert in a transaction                 | 1 PUT                                   |
+  | event bulk ingest, 1 KB NDJSON events         | 1.5 PUT + 1.3 GET per MiB               |
+  | warm event query                              | 0                                       |
+  | cold event query                              | 1.5 GET per part read                   |
+  | idle event table                              | 0 per hour                              |
 
 Commands:
 
@@ -1510,12 +1599,11 @@ scripts/mutants.sh                                               # run mutation 
 47. _Stale leased reads during hedged manifest writes._ If a hedged duplicate `PUT` failed with `412` while the primary `PUT` was still in flight, the node reloaded the prior manifest and served leased reads before the primary `PUT` completed. Nodes now disable leased reads while a hedged `PUT` remains in flight and require a manifest read started after the ambiguous write before restoring trust (§5.5).
 48. _Levels object garbage-collected during stalled manifest read._ If a manifest read stalled past the GC grace period, its `.levels` object could be deleted before being fetched, causing a `500` error. The node now reloads the manifest if a `.levels` object is not found (§5.8).
 49. _Forwards rejected after a peer restart._ When a node forwarded a request to a peer that had restarted at the same address with a new node ID, the peer returned `503` and the entry node returned that error to the client until its membership cache refreshed. The peer now tags the rejection with `x-baserunna-stale-target`, and the entry node marks the peer as suspect and handles buffered requests locally (§7).
+50. _Event table drops starved by inserts._ Dropping an event table previously scanned all part references into the transaction read set, causing concurrent binds, seals, or merges to trigger serializable conflicts under steady insert load. Dropping an event table now writes range tombstones without reading individual part references and subtracts the table's recorded part bytes in the committer (§5.13).
 
 Cost model tests (§13.5) also identified seven efficiency defects: lapsed leases on read-heavy databases were never re-acquired, unleased strong reads validated the manifest twice, read-only renewals used the shorter write-lease duration, `.levels` objects under a separate prefix required an extra `LIST` call per sweep, stream flushes wrote separate small segments for commit records and stream state instead of retaining unsealed entries in `tail`, snapshot-consistency API requests validated the manifest with a strong read on open, and snapshot-consistency long polls re-read the manifest every second instead of waiting for their snapshot staleness bound.
 
 Security review alongside simulation testing identified that internal cluster endpoints were unauthenticated when `BASERUNNA_CLUSTER_SECRET` was unset; clusters now always generate and require a cluster key (§7).
-
----
 
 ## 14. Examples (`examples/`)
 
@@ -1539,8 +1627,6 @@ Tools:
 - `commit_latency` measures commit and object-store request latency across manifest tail limits
 - `gen_openapi` regenerates `openapi.json`
 
----
-
 ## 15. Known limitations (v1)
 
 - The manifest is rewritten on every commit, and with it the WAL and L0.
@@ -1556,6 +1642,10 @@ Tools:
 - Garbage collection requires object `last_modified` timestamps to come from a single coherent store clock (§13.5).
 - Stream retention runs on the lease holder, so a database with no activity keeps records past their retention until it is used again (§5.11). Trimmed chunks and their quota bytes are reclaimed by sweeps, hours later, as overwritten blobs are.
 - Stream filters scan records; there is no index on record contents, so a query finds needles at the rate it can scan (`scan_limit` records a request).
+- Event queries execute on a single task on the receiving node, bounded by single-core decoding throughput and up to 32 concurrent part reads (§5.13).
+- Event query lookups scan the entire referenced row table on each query into in-memory maps capped at 1 GiB (§4.8).
+- Event merges and retention drops run only on active databases, so an idle database retains expired parts (which queries filter out) until the database is accessed again (§5.13).
+- Event parts are cached only in the in-memory block cache and are not written to the local disk cache tier (§5.3).
 
 ## 16. Future work
 
@@ -1567,3 +1657,5 @@ Tools:
 - stream consumer groups that share a stream's records among workers, with acknowledgements and redelivery
 - per-block summaries of stream records (bloom filters of field values) so that filters skip blocks
 - merging small sealed chunks
+- distributed event query execution across cluster nodes with partial aggregate merging on the entry node
+- pre-aggregated event rollups and alternate sort-order projections maintained during seals and merges

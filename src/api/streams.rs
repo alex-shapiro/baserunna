@@ -1,8 +1,12 @@
-//! Stream routes (SPEC §4.6, §10): streams, appends, reads as JSON,
-//! NDJSON or server-sent events, queries, trims and consumers.
+//! HTTP routes for streams (SPEC §4.6, §10).
 
-use super::data::{PathMap, bool_param, commit_hex, encoding_param, param, split_consistency};
-use super::{DbCtx, Found, JsonBody, Params, Ran, consistency_of, paging, run_txn, watch, with_read, with_txn};
+use super::data::{
+    PathMap, bool_param, commit_hex, content_type, encoding_param, idempotency_header, one_idempotency_key, param,
+    split_consistency,
+};
+use super::{
+    DbCtx, Found, JsonBody, Params, Ran, consistency_of, name_paging, paging, run_txn, watch, with_read, with_txn,
+};
 use crate::engine::{Committed, Consistency, Db, Isolation, Retention, StreamState};
 use crate::error::{Error, Result};
 use crate::node::Node;
@@ -44,17 +48,8 @@ fn number<T: std::str::FromStr>(q: &Params, k: &str) -> Result<Option<T>> {
     q.get(k).map(|v| v.parse().map_err(|_| Error::invalid(format!("{k} must be a number")))).transpose()
 }
 
-fn page_of(q: &Params) -> Result<(usize, Option<String>)> {
-    let (limit, cursor) = paging(q)?;
-    if !(1..=1000).contains(&limit) {
-        return Err(Error::invalid("limit must be in 1..=1000"));
-    }
-    Ok((limit, cursor))
-}
-
 async fn list(Extension(ctx): Extension<DbCtx>, q: Params) -> Result<J> {
-    let (limit, cursor) = page_of(&q)?;
-    let prefix = q.get("prefix").cloned().unwrap_or_default();
+    let (prefix, limit, cursor) = name_paging(&q)?;
     let c = consistency_of(&q)?;
     let ((page, next), v) = with_read!(ctx.db, c, |t| stream::list(t, &prefix, limit, cursor.as_deref()).await);
     let streams: Vec<Json> = page.iter().map(|(n, c, st)| stream::stream_json(n, c, st)).collect();
@@ -160,21 +155,6 @@ struct AppendBody {
     encoding: Option<Encoding>,
 }
 
-fn content_type(h: &HeaderMap) -> String {
-    let ct = h.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
-}
-
-fn idempotency_header(h: &HeaderMap) -> Result<Option<String>> {
-    match h.get("idempotency-key") {
-        None => Ok(None),
-        Some(v) => match v.to_str() {
-            Ok(k) => Ok(Some(k.to_string())),
-            Err(_) => Err(Error::invalid("Idempotency-Key must be visible ASCII")),
-        },
-    }
-}
-
 async fn append(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
@@ -195,10 +175,10 @@ async fn append(
     let bodies: Vec<Body> = match ct.as_str() {
         "" | "application/json" => {
             let b: AppendBody =
-                serde_json::from_slice(&data).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))?;
+                super::parse_json(&data).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))?;
             expect = expect.or(b.expect_seq);
             create |= b.create;
-            key = key.or(b.idempotency_key);
+            key = one_idempotency_key(key, b.idempotency_key)?;
             let enc = match b.encoding {
                 Some(e) => e,
                 None => encoding_param(&q)?,
@@ -487,7 +467,7 @@ async fn trim(
 
 async fn consumers(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, q: Params) -> Result<J> {
     let name = param(&p, "s")?.to_string();
-    let (limit, cursor) = page_of(&q)?;
+    let (limit, cursor) = paging(&q)?;
     let c = consistency_of(&q)?;
     let ((st, (list, next)), v) = with_read!(ctx.db, c, |t| {
         let (_, st) = stream::info(t, &name).await?;
@@ -554,6 +534,31 @@ mod tests {
         let r = call_router(&router, "POST", "/v1/dbs/logs/streams", &t, Bytes::from(r#"{"name":"app"}"#)).await;
         assert_eq!(r.status, 201);
         (w, router, t)
+    }
+
+    #[test]
+    fn json_appends_reject_inexact_integers() {
+        run_paused(async {
+            let (w, router, t) = world().await;
+            let body = r#"{"records": [{"json": {"n": 123456789012345678901234567890}}]}"#;
+            let (status, r) = send(&router, &t, "POST", &format!("{S}/records"), &[], body).await;
+            let (_, read) = send(&router, &t, "GET", &format!("{S}/records?tail=1"), &[], "").await;
+            assert_eq!(status, 400, "appended {r}; the stream now holds {}", read["records"]);
+            w.shutdown();
+        });
+    }
+
+    #[test]
+    fn ndjson_appends_reject_inexact_integers() {
+        run_paused(async {
+            let (w, router, t) = world().await;
+            let body = "{\"n\": 123456789012345678901234567890}\n";
+            let ct = [("content-type", "application/x-ndjson")];
+            let (status, r) = send(&router, &t, "POST", &format!("{S}/records"), &ct, body).await;
+            let (_, read) = send(&router, &t, "GET", &format!("{S}/records?tail=1"), &[], "").await;
+            assert_eq!(status, 400, "appended {r}; the stream now holds {}", read["records"]);
+            w.shutdown();
+        });
     }
 
     async fn send(

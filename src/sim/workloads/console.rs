@@ -136,7 +136,6 @@ fn unescape_url(s: &str) -> String {
     String::from_utf8_lossy(&crate::api::percent_decode(s)).into_owned()
 }
 
-/// Returns the `href` attribute of the link labelled `text`.
 fn link(html: &str, text: &str) -> Option<String> {
     let end = html.find(&format!(">{text}</a>"))?;
     let needle = "href=\"";
@@ -160,9 +159,8 @@ async fn login(sim: &Arc<Sim>, name: &str, email: &str, password: &str) -> Resul
     Ok(b)
 }
 
-/// Asserts that signing in with `password` is rejected.
 async fn cannot_login(sim: &Arc<Sim>, email: &str, password: &str, why: &str) -> Result<(), String> {
-    let mut b = Browser::new(sim, "refused");
+    let mut b = Browser::new(sim, "rejected");
     let r = b.req("POST", "/console/login", Some(form(&[("email", email), ("password", password)]))).await?;
     expect(b.cookie.is_none() && header(&r, "location").contains("err="), why)
 }
@@ -198,6 +196,7 @@ pub async fn run(sim: Arc<Sim>) -> Result<(), String> {
     streams(&mut b, evil).await?;
     files(&sim, &mut b).await?;
     schema(&mut b).await?;
+    event_tables(&mut b, evil).await?;
     organizations(&sim, &mut b).await?;
     account(&sim).await?;
     mailed_links(&sim).await?;
@@ -310,7 +309,7 @@ async fn streams(b: &mut Browser, evil: &str) -> Result<(), String> {
     )?;
     expect(link(&page, "Newest").is_some() && link(&page, "Older →").is_none(), "the oldest page's pager is wrong")?;
     b.submit_ok(sp, &format!("{sp}/retention"), &[("retention_ms", "3600000"), ("max_bytes", "")]).await?;
-    expect(b.page(sp).await?.contains("keeps 3600 s"), "the retention is not shown")?;
+    expect(b.page(sp).await?.contains("keeps 1 h"), "the retention is not shown")?;
     b.submit_err(sp, &format!("{sp}/retention"), &[("retention_ms", "soon")]).await?;
     b.submit_ok(sp, &format!("{sp}/trim"), &[("before_seq", "10")]).await?;
     expect(b.page(sp).await?.contains("<span>Records</span>10–61"), "the trim is not shown")?;
@@ -396,6 +395,60 @@ async fn files(sim: &Arc<Sim>, b: &mut Browser) -> Result<(), String> {
     expect(header(&r, "content-disposition").starts_with("attachment"), "the blob download is not an attachment")
 }
 
+async fn event_tables(b: &mut Browser, evil: &str) -> Result<(), String> {
+    let e = b.submit_err("/console/dbs/webdb", "/console/dbs/webdb/events", &[("def", "{nope")]).await?;
+    expect(e.contains("Invalid JSON"), format!("invalid event table definition was rejected with wrong error: {e}"))?;
+    let db = b.page("/console/dbs/webdb").await?;
+    let def = after(&db, "action=\"/console/dbs/webdb/events\"")
+        .and_then(|f| after(f, "<textarea name=\"def\">"))
+        .and_then(|t| t.split("</textarea>").next())
+        .ok_or("missing default event table definition")?
+        .replace("&quot;", "\"");
+    let et = "/console/dbs/webdb/events/events";
+    let to = b.submit_ok("/console/dbs/webdb", "/console/dbs/webdb/events", &[("def", &def)]).await?;
+    expect(to.starts_with(et), format!("creating an event table led to {to}"))?;
+    let q = json!({"from": 0, "to": 1, "aggregates": {"n": {"fn": "count"}}});
+    let r = b.api("events-api").call_retry("POST", "/v1/dbs/webdb/events/events/rows/query", Some(q)).await;
+    expect(r.status == 200, format!("querying a new event table at a snapshot: {} {}", r.status, r.json))?;
+    let rows = json!([
+        {"time": "2026-03-01T10:00:00Z", "event": "signup", "user": evil},
+        {"time": "2026-03-01T11:00:00Z", "event": "signup", "user": "bo"},
+        {"time": "2026-03-02T09:00:00Z", "event": "view", "user": "bo", "properties": {"page": "<i>home</i>"}},
+    ])
+    .to_string();
+    let to = b.submit_ok(et, &format!("{et}/rows"), &[("rows", &rows)]).await?;
+    expect(unescape_url(&to).contains("Inserted 3 events"), format!("inserting events led to {}", unescape_url(&to)))?;
+    b.submit_err(et, &format!("{et}/rows"), &[("rows", r#"[{"nope": 1}]"#)]).await?;
+    b.submit_err(et, &format!("{et}/rows"), &[("rows", "7")]).await?;
+    let page = b.page(et).await?;
+    expect(
+        page.contains("<td>2026-03-01 00:00:00</td><td>signup</td><td>2</td>"),
+        format!(
+            "the default query does not count events per day and name: {}",
+            after(&page, "<h2>Query").unwrap_or("")
+        ),
+    )?;
+    let q = r#"{"from": "2026-03-01", "to": "2026-03-03", "order_by": [{"col": "time"}], "limit": 10}"#;
+    let r = b.post(et, &format!("{et}/query"), &[("query", q)]).await?;
+    let page = String::from_utf8_lossy(&r.body);
+    expect(r.status == 200, format!("running a query returned {}", r.status))?;
+    expect(
+        !page.contains(evil) && page.contains("&lt;script&gt;"),
+        format!("query rows are shown unescaped: {}", after(&page, "<h2>Query").unwrap_or(&page)),
+    )?;
+    expect(!page.contains("<i>home") && page.contains("&lt;i&gt;home"), "JSON properties are shown unescaped")?;
+    expect(page.contains("3 rows"), format!("the query stats are missing: {page}"))?;
+    let bad = r#"{"from": "2026-03-01", "to": "2026-03-03", "where": {"col": "missing", "op": "eq", "value": 1}}"#;
+    let r = b.post(et, &format!("{et}/query"), &[("query", bad)]).await?;
+    let page = String::from_utf8_lossy(&r.body);
+    expect(page.contains("class=\"error\"") && page.contains("missing"), "a bad query does not say why")?;
+    expect(page.contains("&quot;missing&quot;"), "a bad query is not returned for fixing")?;
+    b.submit_err(et, &format!("{et}/delete"), &[("confirm", "nope")]).await?;
+    b.submit_ok(et, &format!("{et}/delete"), &[("confirm", "events")]).await?;
+    let db = b.page("/console/dbs/webdb").await?;
+    expect(!db.contains("events/events"), "a dropped event table is still listed")
+}
+
 async fn schema(b: &mut Browser) -> Result<(), String> {
     let evil = "<img src=x onerror=alert(1)>";
     let r = b.post("/console/dbs/webdb", "/console/dbs/webdb/tables", &[("def", "{not json")]).await?;
@@ -411,7 +464,7 @@ async fn schema(b: &mut Browser) -> Result<(), String> {
     b.submit_ok(t, &columns, &[("name", "memo"), ("type", "string"), ("nullable", "1"), ("default", "\"n/a\"")])
         .await?;
     let e = b.submit_err(t, &columns, &[("name", "bad"), ("type", "int"), ("default", "{")]).await?;
-    expect(e.contains("not JSON"), format!("a bad default was refused for another reason: {e}"))?;
+    expect(e.contains("not JSON"), format!("invalid default was rejected with wrong error: {e}"))?;
     b.submit_ok(t, &format!("{t}/indexes"), &[("name", "by_label"), ("columns", "label, memo"), ("unique", "1")])
         .await?;
     let api = b.api("schema-api");
@@ -448,7 +501,7 @@ async fn organizations(sim: &Arc<Sim>, owner: &mut Browser) -> Result<(), String
     owner.submit_ok(o, &format!("{o}/members"), &[("email", "member@console.test"), ("role", "reader")]).await?;
     let e =
         owner.submit_err(o, &format!("{o}/members"), &[("email", "nobody@console.test"), ("role", "reader")]).await?;
-    expect(e.contains("no account"), format!("adding an unknown account was refused for another reason: {e}"))?;
+    expect(e.contains("no account"), format!("unknown account was rejected with wrong error: {e}"))?;
     let orgs = m.page("/console/orgs").await?;
     expect(orgs.contains(">acme</a></td><td>reader</td>"), "the member does not see the organization and role")?;
     let p = m.page(o).await?;
@@ -457,7 +510,7 @@ async fn organizations(sim: &Arc<Sim>, owner: &mut Browser) -> Result<(), String
     expect(db.contains("read-only access") && !db.contains("Upload file"), "a reader gets write forms")?;
     let shared = "/console/dbs/acme.shared";
     let e = m.submit_err(shared, &format!("{shared}/kv"), &[("key", "k"), ("value", "v")]).await?;
-    expect(e.contains("cannot write"), format!("a reader's write was refused for another reason: {e}"))?;
+    expect(e.contains("cannot write"), format!("reader write was rejected with wrong error: {e}"))?;
     let member_id = m.api("member-api").call_retry("GET", "/v1/me", None).await.json["user"]["id"]
         .as_str()
         .ok_or("missing member id")?
@@ -492,7 +545,7 @@ async fn account(sim: &Arc<Sim>) -> Result<(), String> {
     let acct = "/console/account";
     let pw = "/console/account/password";
     let e = a.submit_err(acct, pw, &[("current_password", "wrong-pass"), ("new_password", "self-pass-2")]).await?;
-    expect(e.contains("incorrect"), format!("a wrong current password was refused for another reason: {e}"))?;
+    expect(e.contains("incorrect"), format!("wrong current password was rejected with wrong error: {e}"))?;
     a.submit_ok(acct, pw, &[("current_password", pass), ("new_password", "self-pass-2")]).await?;
     cache_expiry(sim).await;
     expect(
@@ -530,7 +583,7 @@ async fn account(sim: &Arc<Sim>) -> Result<(), String> {
     let del = "/console/account/delete";
     d.submit_err(acct, del, &[("confirm", "someone@else.test"), ("password", "doomed-pass")]).await?;
     let e = d.submit_err(acct, del, &[("confirm", "doomed@console.test"), ("password", "nope-nope")]).await?;
-    expect(e.contains("incorrect"), format!("a wrong password was refused for another reason: {e}"))?;
+    expect(e.contains("incorrect"), format!("wrong password was rejected with wrong error: {e}"))?;
     let to = d.submit(acct, del, &[("confirm", "doomed@console.test"), ("password", "doomed-pass")]).await?;
     expect(
         to.starts_with("/console/login") && to.contains("ok=") && d.cookie.is_none(),
@@ -563,7 +616,7 @@ async fn mailed_links(sim: &Arc<Sim>) -> Result<(), String> {
     expect(anon.page("/console/forgot").await?.contains("Send link"), "the forgot page lacks its form")?;
     let before = sim.mailbox.count(email);
     let r = anon.req("POST", "/console/forgot", Some(form(&[("email", email)]))).await?;
-    expect(header(&r, "location").starts_with("/console/login?ok="), "requesting a reset was refused")?;
+    expect(header(&r, "location").starts_with("/console/login?ok="), "password reset request was rejected")?;
     let r = anon.req("POST", "/console/forgot", Some(form(&[("email", "ghost@console.test")]))).await?;
     expect(header(&r, "location").starts_with("/console/login?ok="), "unknown accounts return a different response")?;
     sim.sleep(500).await;

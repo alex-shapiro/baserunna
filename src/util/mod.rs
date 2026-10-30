@@ -2,6 +2,7 @@ pub mod b64;
 pub mod bloom;
 pub mod codec;
 pub mod crc32c;
+pub mod json;
 pub mod prop;
 pub mod rng;
 mod ttl;

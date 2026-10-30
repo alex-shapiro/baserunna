@@ -63,6 +63,9 @@ pub fn validate(root: &Json, schema: &Json, v: &Json, path: &str) -> Result<(), 
             return Err(format!("{path}: matches no alternative: {errs:?}"));
         }
     }
+    for member in s.get("allOf").and_then(|a| a.as_array()).into_iter().flatten() {
+        validate(root, member, v, path)?;
+    }
     if let Some(o) = v.as_object() {
         if let Some(req) = s.get("required").and_then(|r| r.as_array()) {
             for r in req.iter().filter_map(|r| r.as_str()) {

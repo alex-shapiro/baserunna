@@ -26,11 +26,11 @@ pub const SPACE_ROW_BLOBS: u8 = 0x04;
 
 const MAX_EXAMINED_PER_QUERY: usize = 10_000;
 
+/// Key prefix for row table schemas.
+const SCHEMAS: &[u8] = &[SPACE_CATALOG, b't', b'/'];
+
 fn catalog_key(name: &str) -> Bytes {
-    let mut k = vec![SPACE_CATALOG];
-    k.extend_from_slice(b"t/");
-    k.extend_from_slice(name.as_bytes());
-    Bytes::from(k)
+    Bytes::from([SCHEMAS, name.as_bytes()].concat())
 }
 
 /// Backfill cursor key for a building index, stored outside the schema so
@@ -79,11 +79,20 @@ fn blob_side_key(tid: u32, pk: &[Key], col: u32) -> Bytes {
     Bytes::from(k)
 }
 
-pub async fn list_tables(txn: &mut Txn) -> Result<Vec<TableSchema>> {
-    let mut prefix = vec![SPACE_CATALOG];
-    prefix.extend_from_slice(b"t/");
-    let items = txn.scan(&KeyRange::prefix(&prefix), false, 10_000).await?;
-    items.iter().map(decode_schema).collect()
+/// Lists up to `limit` table schemas whose names start with `prefix`, resuming after `cursor`.
+pub async fn list_tables(
+    txn: &mut Txn,
+    prefix: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<(Vec<TableSchema>, Option<String>)> {
+    let (page, next) = crate::catalog::names_page(txn, SCHEMAS, prefix, limit, cursor).await?;
+    Ok((page.iter().map(|(_, it)| decode_schema(it)).collect::<Result<_>>()?, next))
+}
+
+/// Returns all table schemas in the database.
+pub async fn all_tables(txn: &mut Txn) -> Result<Vec<TableSchema>> {
+    txn.scan(&KeyRange::prefix(SCHEMAS), false, usize::MAX).await?.iter().map(decode_schema).collect()
 }
 
 fn decode_schema(it: &ReadValue) -> Result<TableSchema> {
@@ -150,13 +159,7 @@ pub async fn create_table(txn: &mut Txn, def: &CreateTable) -> Result<TableSchem
         }
         return Err(Error::AlreadyExists(format!("table {:?} already exists", def.name)));
     }
-    let next = match txn.get(&next_id_key()).await? {
-        Some(ReadValue { value: Value::Inline(b), .. }) => std::str::from_utf8(&b)
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .ok_or_else(|| Error::internal("bad table id counter"))?,
-        _ => 1,
-    };
+    let next = allocate_table_id(txn).await?;
     let mut s = TableSchema {
         id: next,
         name: def.name.clone(),
@@ -187,9 +190,21 @@ pub async fn create_table(txn: &mut Txn, def: &CreateTable) -> Result<TableSchem
         s.next_index_id += 1;
     }
     s.validate()?;
-    txn.put(next_id_key(), Value::Inline(Bytes::from((next + 1).to_string())))?;
     put_schema(txn, &s)?;
     Ok(s)
+}
+
+/// Allocates the next table ID, shared across row and event tables.
+pub(crate) async fn allocate_table_id(txn: &mut Txn) -> Result<u32> {
+    let next = match txn.get(&next_id_key()).await? {
+        Some(ReadValue { value: Value::Inline(b), .. }) => std::str::from_utf8(&b)
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .ok_or_else(|| Error::internal("bad table id counter"))?,
+        _ => 1,
+    };
+    txn.put(next_id_key(), Value::Inline(Bytes::from((next + 1).to_string())))?;
+    Ok(next)
 }
 
 pub async fn drop_table(txn: &mut Txn, name: &str) -> Result<()> {
@@ -864,6 +879,19 @@ fn decode_stored_row(s: &TableSchema, prefix: &[u8], it: &ReadValue) -> Result<(
     Ok((pk, row))
 }
 
+/// Scans all rows of table `s` into the transaction's read set and passes each
+/// decoded row to `f`.
+pub(crate) async fn each_row(txn: &mut Txn, s: &TableSchema, mut f: impl FnMut(Row) -> Result<()>) -> Result<()> {
+    let prefix = table_prefix(SPACE_ROWS, s.id);
+    let mut pages = Pages::new(KeyRange::prefix(&prefix));
+    while let Some(page) = pages.next(txn).await? {
+        for it in &page {
+            f(decode_stored_row(s, &prefix, it)?.1)?;
+        }
+    }
+    Ok(())
+}
+
 async fn all_rows(txn: &mut Txn, s: &TableSchema) -> Result<Vec<(Bytes, Vec<Key>, Row, Option<u64>)>> {
     let prefix = table_prefix(SPACE_ROWS, s.id);
     let mut out = Vec::new();
@@ -939,12 +967,45 @@ fn bind_filter(s: &TableSchema, f: &Filter) -> Result<RowFilter> {
         if !fits {
             return Err(Error::invalid(format!("{} does not apply to {} column {name:?}", test.name(), c.ty.name())));
         }
-        Ok((c.id, test.try_map(|v| datum_from_json(c.ty, v, name))?))
+        Ok((c.id, test.try_map(|v| filter_arg(c.ty, v, name))?))
     })
+}
+
+/// Converts a JSON filter argument to a [`Datum`] of `ty`, rejecting integer
+/// literals that cannot be represented losslessly as `f64` for float columns.
+fn filter_arg(ty: ColType, v: &Json, name: &str) -> Result<Datum> {
+    if ty == ColType::Float
+        && let Json::Number(n) = v
+        && let Some(i) = n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from))
+        && (i as f64) as i128 != i
+    {
+        return Err(Error::invalid(format!("float column {name:?} cannot equal {v}: compare with a float")));
+    }
+    datum_from_json(ty, v, name)
 }
 
 fn row_matches(f: &RowFilter, row: &Row) -> bool {
     f.eval(&mut |id| row.get(id).filter(|d| !matches!(d, Datum::Null | Datum::Json(Json::Null))))
+}
+
+fn plain(d: &Datum) -> Option<filter::Plain<'_>> {
+    use filter::Plain;
+    Some(match d {
+        Datum::Null => Plain::Null,
+        Datum::Bool(b) => Plain::Bool(*b),
+        Datum::Int(i) => Plain::Int(i128::from(*i)),
+        Datum::Float(f) => Plain::Float(*f),
+        Datum::Str(s) => Plain::Str(s),
+        Datum::Bytes(b) => Plain::Bytes(b),
+        Datum::Json(j) => Plain::Json(j),
+        Datum::Blob(_) => return None,
+    })
+}
+
+impl filter::Arg for Datum {
+    fn eq_hash(&self) -> u64 {
+        plain(self).map_or(0, filter::Plain::eq_hash)
+    }
 }
 
 impl Target<Datum> for &Datum {
@@ -953,6 +1014,10 @@ impl Target<Datum> for &Datum {
             (Datum::Json(x), Datum::Json(y)) => Target::equals(&x, y),
             _ => Target::order(self, arg) == Some(std::cmp::Ordering::Equal),
         }
+    }
+
+    fn eq_hash(&self) -> Option<u64> {
+        plain(self).map(filter::Plain::eq_hash)
     }
 
     fn order(&self, arg: &Datum) -> Option<std::cmp::Ordering> {
@@ -1243,7 +1308,7 @@ pub async fn check_indexes(txn: &mut Txn, table: &str) -> Result<()> {
 /// Verify that no rows, index entries, blob entries, or backfill cursors belong
 /// to dropped tables, indexes, or columns.
 pub async fn check_no_orphans(txn: &mut Txn) -> Result<()> {
-    let tables = list_tables(txn).await?;
+    let tables = all_tables(txn).await?;
     let live: BTreeSet<u32> = tables.iter().map(|s| s.id).collect();
     let live_idx: BTreeSet<(u32, u32)> = tables.iter().flat_map(|s| s.indexes.iter().map(|i| (s.id, i.id))).collect();
     let blob_cols: BTreeSet<(u32, u32)> =

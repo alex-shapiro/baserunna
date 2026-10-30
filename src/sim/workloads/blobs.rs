@@ -53,6 +53,7 @@ pub fn db_objects(sim: &Sim, db_id: &str) -> Result<IdSets, String> {
             ObjKind::Blob => format!("blob:{}", o.id),
             ObjKind::Segment => format!("seg:{}", o.id),
             ObjKind::Levels => format!("seg:{}{}", o.id, crate::engine::LEVELS_SUFFIX),
+            ObjKind::Part => format!("part:{}", o.id),
         })
         .collect();
     Ok((referenced, listed, segs))

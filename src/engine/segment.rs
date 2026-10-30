@@ -29,7 +29,7 @@ const BLOOM_BITS_PER_KEY: usize = 10;
 const CODEC_RAW: u8 = 0;
 const CODEC_ZSTD: u8 = 1;
 /// Decompressed blocks larger than this are rejected as corrupt.
-const MAX_BLOCK_RAW: u64 = 64 << 20;
+pub(crate) const MAX_BLOCK_RAW: u64 = 64 << 20;
 /// Smallest valid block: codec, entry count and checksum.
 const MIN_BLOCK_LEN: u32 = 9;
 
@@ -163,27 +163,7 @@ impl SegmentBuilder {
         let mut raw = std::mem::take(&mut self.block);
         raw.u32(self.block_entries);
         let off = self.out.len();
-        let compressed = match self.compression {
-            Compression::Zstd(level) if raw.len() >= 64 => {
-                crate::util::zstd::compress(&raw.buf, level).ok().filter(|c| c.len() + 10 < raw.len() - raw.len() / 8)
-            }
-            _ => None,
-        };
-        match compressed {
-            Some(c) => {
-                self.out.push(CODEC_ZSTD);
-                let mut len = Writer::with_capacity(10);
-                len.varint(raw.len() as u64);
-                self.out.extend_from_slice(&len.buf);
-                self.out.extend_from_slice(&c);
-            }
-            None => {
-                self.out.push(CODEC_RAW);
-                self.out.extend_from_slice(&raw.buf);
-            }
-        }
-        let crc = crc32c(&self.out[off..]);
-        self.out.extend_from_slice(&crc.to_le_bytes());
+        frame(&raw.buf, self.compression, &mut self.out);
         let len = (self.out.len() - off) as u32;
         self.index.push((Bytes::copy_from_slice(&self.last_key), off as u64, len));
         self.block_entries = 0;
@@ -315,6 +295,57 @@ pub struct SegmentIndex {
     pub size: u64,
 }
 
+/// Appends `raw` to `out` as a framed block with a codec tag, payload, and CRC32C checksum.
+/// Compresses the payload with zstd if `compression` is enabled and saves more than 12.5%.
+pub fn frame(raw: &[u8], compression: Compression, out: &mut Vec<u8>) {
+    let off = out.len();
+    let compressed = match compression {
+        Compression::Zstd(level) if raw.len() >= 64 => {
+            crate::util::zstd::compress(raw, level).ok().filter(|c| c.len() + 10 < raw.len() - raw.len() / 8)
+        }
+        _ => None,
+    };
+    match compressed {
+        Some(c) => {
+            out.push(CODEC_ZSTD);
+            let mut len = Writer::with_capacity(10);
+            len.varint(raw.len() as u64);
+            out.extend_from_slice(&len.buf);
+            out.extend_from_slice(&c);
+        }
+        None => {
+            out.push(CODEC_RAW);
+            out.extend_from_slice(raw);
+        }
+    }
+    let crc = crc32c(&out[off..]);
+    out.extend_from_slice(&crc.to_le_bytes());
+}
+
+/// Verifies and decompresses a block written by [`frame`].
+pub fn unframe(raw: &Bytes) -> DResult<Bytes> {
+    let body = check_crc(raw)?;
+    let (&codec, _) = body.split_first().ok_or(DecodeError("block too short"))?;
+    let payload = raw.slice(1..body.len());
+    match codec {
+        CODEC_RAW => Ok(payload),
+        CODEC_ZSTD => {
+            let mut r = Reader::new(&payload);
+            let n = r.varint()?;
+            if n > MAX_BLOCK_RAW {
+                return Err(DecodeError("block too large"));
+            }
+            let c = &payload[payload.len() - r.remaining()..];
+            let d = crate::util::zstd::decompress(c, n as usize).map_err(|_| DecodeError("bad compressed block"))?;
+            if d.len() as u64 != n {
+                return Err(DecodeError("compressed block length mismatch"));
+            }
+            Ok(Bytes::from(d))
+        }
+        _ => Err(DecodeError("unknown block codec")),
+    }
+}
+
 fn check_crc(section: &[u8]) -> DResult<&[u8]> {
     if section.len() < 4 {
         return Err(DecodeError("section too short"));
@@ -392,26 +423,7 @@ pub type Block = Arc<Vec<Entry>>;
 
 /// Decode and verify one stored block.
 pub fn decode_block(raw: Bytes) -> DResult<Block> {
-    let body = check_crc(&raw)?;
-    let (&codec, _) = body.split_first().ok_or(DecodeError("block too short"))?;
-    let payload = raw.slice(1..body.len());
-    let data = match codec {
-        CODEC_RAW => payload,
-        CODEC_ZSTD => {
-            let mut r = Reader::new(&payload);
-            let n = r.varint()?;
-            if n > MAX_BLOCK_RAW {
-                return Err(DecodeError("block too large"));
-            }
-            let c = &payload[payload.len() - r.remaining()..];
-            let d = crate::util::zstd::decompress(c, n as usize).map_err(|_| DecodeError("bad compressed block"))?;
-            if d.len() as u64 != n {
-                return Err(DecodeError("compressed block length mismatch"));
-            }
-            Bytes::from(d)
-        }
-        _ => return Err(DecodeError("unknown block codec")),
-    };
+    let data = unframe(&raw)?;
     if data.len() < 4 {
         return Err(DecodeError("block too short"));
     }

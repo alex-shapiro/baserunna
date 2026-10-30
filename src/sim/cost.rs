@@ -474,6 +474,7 @@ pub fn measure_all() -> Report {
             overhead(&w, &mut out, "node_overhead_1_node").await;
             let segs = multi_node(&mut w, &mut out).await;
             streams(&mut w, &mut out).await;
+            events(&mut w, &mut out).await;
             w.shutdown();
             (amp, segs)
         };
@@ -745,6 +746,77 @@ async fn streams(w: &mut World, out: &mut Vec<Measurement>) {
     }
     assert_eq!(st.records(), 21 + 100 * requests as u64);
     out.push(r.stop("cold_stream_read", "MiB", bytes as f64 / (1 << 20) as f64, true));
+}
+
+async fn events(w: &mut World, out: &mut Vec<Measurement>) {
+    let t = w.signup(0, "events@cost.test").await;
+    let id = w.create_db(0, &t, "analytics").await;
+    let s = &*w.store;
+    let table = json!({"name": "e", "columns": [{"name": "time", "type": "time"}, {"name": "event", "type": "string"},
+        {"name": "user", "type": "string"}, {"name": "value", "type": "float"}, {"name": "props", "type": "json"}],
+        "time_column": "time", "order_by": ["event", "time"]});
+    assert_eq!(w.call(0, "POST", "/v1/dbs/analytics/events", &t, Bytes::from(table.to_string())).await.status, 201);
+    let day = 1_700_000_000_000i64 / 86_400_000 * 86_400_000;
+    let event = |i: usize| {
+        json!({"time": day + (i as i64 * 7_919) % 86_400_000, "event": (["view", "click", "buy"][i % 3]),
+            "user": format!("u{}", i % 997), "value": (i % 100) as f64 / 4.0,
+            "props": {"page": format!("/p{}", i % 50), "ref": (["a", "b"][i % 2])}})
+    };
+    let txn = |i: usize| {
+        let rows: Vec<Json> = (0..10).map(|j| event(i * 10 + j)).collect();
+        Bytes::from(json!({"ops": [{"op": "insert_events", "table": "e", "rows": rows}]}).to_string())
+    };
+    assert_eq!(w.call(0, "POST", "/v1/dbs/analytics/txn", &t, txn(0)).await.status, 200);
+    let r = Recorder::start(s, &id);
+    for i in 1..21 {
+        assert_eq!(w.call(0, "POST", "/v1/dbs/analytics/txn", &t, txn(i)).await.status, 200);
+    }
+    out.push(r.stop("event_txn_insert", "commit", 20.0, true));
+
+    let router = w.node(0).router().expect("router");
+    let r = Recorder::start(s, &id);
+    let mut bytes = 0;
+    for round in 0..16 {
+        let mut handles = Vec::new();
+        for k in 0..32 {
+            let base = 1_000_000 + (round * 32 + k) * 500;
+            let body: String = (0..500).map(|i| event(base + i).to_string() + "\n").collect();
+            bytes += body.len();
+            let router = router.clone();
+            let t = t.clone();
+            handles.push(tokio::spawn(async move {
+                post_ndjson(&router, &t, "/v1/dbs/analytics/events/e/rows", Bytes::from(body)).await
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.expect("insert"), 201);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    out.push(r.stop("event_bulk_ingest", "MiB", bytes as f64 / (1 << 20) as f64, false));
+
+    let query = json!({"from": day, "to": day + 86_400_000, "group_by": ["event"],
+        "aggregates": {"n": {"fn": "count"}, "total": {"fn": "sum", "of": "value"}}});
+    let path = "/v1/dbs/analytics/events/e/rows/query";
+    let first = w.json(0, "POST", path, &t, query.clone()).await;
+    assert_eq!(first["rows"].as_array().map(Vec::len), Some(3), "{first}");
+    let r = Recorder::start(s, &id);
+    for _ in 0..10 {
+        w.json(0, "POST", path, &t, query.clone()).await;
+    }
+    out.push(r.stop("event_query_warm", "query", 10.0, true));
+
+    let other = w.start_node().await;
+    let parts = first["stats"]["parts"].as_u64().unwrap_or(1).max(1);
+    let r = Recorder::start(&w.store, &id);
+    let cold = w.json(other, "POST", path, &t, query.clone()).await;
+    assert_eq!(cold["rows"], first["rows"]);
+    out.push(r.stop("event_query_cold", "part", parts as f64, true));
+
+    let r = Recorder::start(&w.store, &id);
+    tokio::time::sleep(Duration::from_secs(3_600)).await;
+    out.push(r.stop("event_table_idle", "hour", 1.0, false));
 }
 
 async fn post_ndjson(router: &axum::Router, token: &str, path: &str, body: Bytes) -> u16 {

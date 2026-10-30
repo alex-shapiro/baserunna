@@ -47,6 +47,7 @@ scenario_tests! {
     sim_ttl: "ttl", 18, 3;
     sim_watch: "watch", 19, 3;
     sim_streams: "streams", 22, 3;
+    sim_events: "events", 24, 3;
     sim_orgs: "orgs", 20, 2;
     sim_accounts: "accounts", 21, 2;
     sim_memory: "memory", 24, 3;

@@ -3,11 +3,13 @@
 mod account;
 pub mod body;
 mod data;
+mod events;
 pub mod openapi;
 mod orgs;
 mod streams;
 
 pub use account::session_cookie;
+pub(crate) use events::{ForwardedBind, bind_results_from_json};
 
 use crate::cluster::{
     CLUSTER_KEY_HEADER, DEADLINE_HEADER, Delivery, FORWARD_ID_HEADER, FORWARD_TO_HEADER, HOPS_HEADER, ReplayedResponse,
@@ -37,32 +39,15 @@ pub const SESSION_COOKIE: &str = "brs_session";
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = StatusCode::from_u16(self.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let mut err = json!({
-            "code": self.code(),
-            "message": self.message(),
-            "retryable": self.retryable(),
-        });
-        let mut retry_after = None;
-        match &self {
-            Error::PreconditionFailed { op_index: Some(i), .. } => err["details"] = json!({"op_index": i}),
-            Error::NotOwner { holder, retry_after_ms } => {
-                err["details"] = json!({"lease_holder": holder});
-                retry_after = Some(*retry_after_ms);
-            }
-            Error::Unavailable { outcome_unknown, retry_after_ms, .. } => {
-                err["details"] = json!({"outcome": if *outcome_unknown { "unknown" } else { "not_applied" }});
-                retry_after = *retry_after_ms;
-            }
-            Error::RateLimited { retry_after_ms, .. } => {
-                err["details"] = json!({"retry_after_ms": retry_after_ms});
-                retry_after = Some(*retry_after_ms);
-            }
-            _ => {}
-        }
+        let retry_after = match &self {
+            Error::NotOwner { retry_after_ms, .. } | Error::RateLimited { retry_after_ms, .. } => Some(*retry_after_ms),
+            Error::Unavailable { retry_after_ms, .. } => *retry_after_ms,
+            _ => None,
+        };
         if let Error::Internal(m) = &self {
             crate::warn!("internal error: {m}");
         }
-        let mut resp = (status, axum::Json(json!({"error": err}))).into_response();
+        let mut resp = (status, axum::Json(json!({"error": error_json(&self)}))).into_response();
         if let Some(ms) = retry_after {
             let secs = ms.div_ceil(1000).max(1);
             if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
@@ -73,11 +58,44 @@ impl IntoResponse for Error {
     }
 }
 
-/// Reconstructs an [`Error`] from a JSON error response.
+/// Serializes an [`Error`] as the `error` object of an HTTP error response.
+pub fn error_json(e: &Error) -> Json {
+    let mut err = json!({"code": e.code(), "message": e.message(), "retryable": e.retryable()});
+    match e {
+        Error::PreconditionFailed { op_index: Some(i), .. } => err["details"] = json!({"op_index": i}),
+        Error::NotOwner { holder, .. } => err["details"] = json!({"lease_holder": holder}),
+        Error::Unavailable { outcome_unknown, .. } => {
+            err["details"] = json!({"outcome": if *outcome_unknown { "unknown" } else { "not_applied" }});
+        }
+        Error::RateLimited { retry_after_ms, .. } => err["details"] = json!({"retry_after_ms": retry_after_ms}),
+        _ => {}
+    }
+    err
+}
+
+/// Maximum body size for `/internal/v1/events/bind`.
+const BIND_BODY_MAX: usize = 1 << 30;
+
+/// Reconstructs an [`Error`] from a JSON error response, falling back to `status`
+/// if `error.code` is absent.
 pub fn error_from_json(status: u16, j: &Json) -> Error {
     let e = &j["error"];
     let m = e["message"].as_str().unwrap_or("request failed").to_string();
-    match e["code"].as_str().unwrap_or("") {
+    let code = match e["code"].as_str() {
+        Some(c) => c,
+        None => match status {
+            400 => "invalid_argument",
+            401 => "unauthenticated",
+            403 => "permission_denied",
+            404 => "not_found",
+            413 => "too_large",
+            429 => "rate_limited",
+            // A 503 without an error body may come from a peer after forwarding.
+            503 => return Error::Unavailable { message: m, retry_after_ms: Some(500), outcome_unknown: true },
+            _ => "",
+        },
+    };
+    match code {
         "invalid_argument" => Error::InvalidArgument(m),
         "unauthenticated" => Error::Unauthenticated(m),
         "permission_denied" => Error::PermissionDenied(m),
@@ -85,6 +103,7 @@ pub fn error_from_json(status: u16, j: &Json) -> Error {
         "txn_not_found" => Error::TxnNotFound(m),
         "conflict" => Error::Conflict(m),
         "already_exists" => Error::AlreadyExists(m),
+        "aborted" => Error::Aborted(m),
         "precondition_failed" => {
             Error::PreconditionFailed { message: m, op_index: e["details"]["op_index"].as_u64().map(|i| i as usize) }
         }
@@ -94,11 +113,15 @@ pub fn error_from_json(status: u16, j: &Json) -> Error {
         "rate_limited" => {
             Error::RateLimited { message: m, retry_after_ms: e["details"]["retry_after_ms"].as_u64().unwrap_or(1_000) }
         }
-        "unavailable" => Error::Unavailable {
-            message: m,
-            retry_after_ms: Some(500),
-            outcome_unknown: e["details"]["outcome"] == "unknown",
+        "unavailable" => match e["details"]["lease_holder"].as_str() {
+            Some(holder) => Error::NotOwner { holder: holder.to_string(), retry_after_ms: 500 },
+            None => Error::Unavailable {
+                message: m,
+                retry_after_ms: Some(500),
+                outcome_unknown: e["details"]["outcome"] == "unknown",
+            },
         },
+        "internal" => Error::Internal(m),
         _ => Error::Internal(format!("{status}: {m}")),
     }
 }
@@ -115,8 +138,14 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for JsonBody<T> {
             _ => Error::invalid(format!("could not read body: {e}")),
         })?;
         let b: &[u8] = if b.iter().all(|c| c.is_ascii_whitespace()) { b"{}" } else { &b };
-        serde_json::from_slice(b).map(JsonBody).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))
+        parse_json(b).map(JsonBody).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))
     }
+}
+
+/// Deserializes `text` as JSON after rejecting out-of-range integer literals.
+pub(crate) fn parse_json<T: DeserializeOwned>(text: &[u8]) -> std::result::Result<T, String> {
+    crate::util::json::reject_inexact_integers(text)?;
+    serde_json::from_slice(text).map_err(|e| e.to_string())
 }
 
 /// Extracts a bearer token or session cookie from `headers`.
@@ -291,6 +320,14 @@ fn long_poll_wait(req: &Request) -> Duration {
     Duration::from_millis(wait_ms.min(LONG_POLL_MAX_MS))
 }
 
+/// Extra time allowed past the request deadline for long-polling or event queries.
+fn request_allowance(node: &Node, req: &Request) -> Duration {
+    match events::is_query(req.method(), req.uri().path()) {
+        true => Duration::from_millis(node.cfg.query_limits.max_ms),
+        false => long_poll_wait(req),
+    }
+}
+
 fn is_long_poll(req: &Request) -> bool {
     !long_poll_wait(req).is_zero()
 }
@@ -312,6 +349,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         let (mut rec, mut access) = node.resolve_db(&principal, &name).await?;
         let hops = hops(req.headers());
         if hops < 2
+            && !events::served_locally(req.method(), req.uri().path())
             && let Some((target, addr)) = node.route(&rec.id, is_long_poll(&req)).await
         {
             let small = req.method() == http::Method::GET
@@ -391,7 +429,10 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         // Verify that the database manifest is not deleted, and re-resolve the name with a
         // strong metadata read if it is.
         let read_only = matches!(*req.method(), http::Method::GET | http::Method::HEAD);
-        let staleness = read_only.then(|| snapshot_staleness(req.uri().query())).flatten();
+        let staleness = match events::is_query(req.method(), req.uri().path()) {
+            true => Some(events::QUERY_STALENESS_MS),
+            false => read_only.then(|| snapshot_staleness(req.uri().query())).flatten(),
+        };
         let opened = match node.open_db(&rec).await {
             Ok(db) => {
                 let checked = match staleness {
@@ -501,8 +542,9 @@ async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: 
             let route = req.extensions().get::<MatchedPath>().cloned();
             let hops = hops(req.headers());
             let deadline = Deadline::new(request_deadline(&node, req.headers()));
-            let wait = long_poll_wait(&req);
-            let idempotent = matches!(*req.method(), http::Method::GET | http::Method::HEAD);
+            let wait = request_allowance(&node, &req);
+            let idempotent = matches!(*req.method(), http::Method::GET | http::Method::HEAD)
+                || events::is_query(req.method(), req.uri().path());
             let req = req.map(|b| Body::new(body::DeadlinePausingBody::new(b, deadline.clone())));
             let run = crate::node::with_deadline(deadline.clone(), timing::scoped(tally.clone(), next.run(req)));
             let resp = match run_until_deadline(&deadline, wait, run).await {
@@ -956,11 +998,14 @@ async fn not_found() -> Error {
 
 /// Builds the HTTP router for the node.
 pub fn router(node: Arc<Node>) -> Router {
-    let db_routes =
-        data::routes().merge(streams::routes()).route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
+    let db_routes = data::routes()
+        .merge(streams::routes())
+        .merge(events::routes())
+        .route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
     let internal = Router::new()
         .route("/internal/v1/meta", post(account::internal_meta))
         .route("/internal/v1/notice", post(commit_notice))
+        .route("/internal/v1/events/bind", post(events::internal_bind).layer(DefaultBodyLimit::max(BIND_BODY_MAX)))
         .route_layer(middleware::from_fn_with_state(node.clone(), internal_auth));
     let r = Router::new()
         .route("/healthz", get(healthz))
@@ -987,13 +1032,24 @@ pub(crate) use axum::extract::Query as QueryParams;
 
 pub(crate) type Params = QueryParams<std::collections::BTreeMap<String, String>>;
 
-/// Extracts `limit` and `cursor` pagination parameters.
+/// Extracts `limit` (default [`PAGE_DEFAULT`](crate::meta::PAGE_DEFAULT), in `1..=PAGE_MAX`) and `cursor` query parameters.
 pub(crate) fn paging(q: &Params) -> Result<(usize, Option<String>)> {
+    let max = crate::meta::PAGE_MAX;
     let limit = match q.get("limit") {
         None => crate::meta::PAGE_DEFAULT,
-        Some(l) => l.parse().map_err(|_| Error::invalid("limit must be a number"))?,
+        Some(l) => l
+            .parse()
+            .ok()
+            .filter(|l| (1..=max).contains(l))
+            .ok_or_else(|| Error::invalid(format!("limit must be in 1..={max}")))?,
     };
     Ok((limit, q.get("cursor").filter(|c| !c.is_empty()).cloned()))
+}
+
+/// Extracts `prefix`, `limit`, and `cursor` query parameters.
+pub(crate) fn name_paging(q: &Params) -> Result<(String, usize, Option<String>)> {
+    let (limit, cursor) = paging(q)?;
+    Ok((q.get("prefix").cloned().unwrap_or_default(), limit, cursor))
 }
 
 #[cfg(test)]
@@ -1031,6 +1087,54 @@ mod tests {
             assert!(!finishes("POST", "/v1/dbs/app/transactions/x/y/z/commit").await);
             assert!(!finishes("DELETE", "/v1/dbs/app/transactions/x/y").await);
         });
+    }
+
+    #[test]
+    fn errors_round_trip_through_json() {
+        let m = || "m".to_string();
+        let all = [
+            Error::InvalidArgument(m()),
+            Error::Unauthenticated(m()),
+            Error::PermissionDenied(m()),
+            Error::NotFound(m()),
+            Error::TxnNotFound(m()),
+            Error::Conflict(m()),
+            Error::AlreadyExists(m()),
+            Error::Aborted(m()),
+            Error::PreconditionFailed { message: m(), op_index: Some(3) },
+            Error::PreconditionFailed { message: m(), op_index: None },
+            Error::TooLarge(m()),
+            Error::CursorExpired(m()),
+            Error::QuotaExceeded(m()),
+            Error::RateLimited { message: m(), retry_after_ms: 70 },
+            Error::NotOwner { holder: "n1".into(), retry_after_ms: 500 },
+            Error::Unavailable { message: m(), retry_after_ms: Some(500), outcome_unknown: true },
+            Error::Unavailable { message: m(), retry_after_ms: Some(500), outcome_unknown: false },
+            Error::Internal(m()),
+        ];
+        for e in &all {
+            // Exhaustive match so new `Error` variants must be added to `all`.
+            match e {
+                Error::InvalidArgument(_)
+                | Error::Unauthenticated(_)
+                | Error::PermissionDenied(_)
+                | Error::NotFound(_)
+                | Error::TxnNotFound(_)
+                | Error::Conflict(_)
+                | Error::AlreadyExists(_)
+                | Error::Aborted(_)
+                | Error::PreconditionFailed { .. }
+                | Error::TooLarge(_)
+                | Error::CursorExpired(_)
+                | Error::QuotaExceeded(_)
+                | Error::RateLimited { .. }
+                | Error::NotOwner { .. }
+                | Error::Unavailable { .. }
+                | Error::Internal(_) => {}
+            }
+            let back = error_from_json(e.status(), &json!({"error": error_json(e)}));
+            assert_eq!((back.status(), error_json(&back)), (e.status(), error_json(e)), "{e:?} came back as {back:?}");
+        }
     }
 
     #[test]
@@ -1152,3 +1256,6 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod events_tests;

@@ -7,12 +7,14 @@
 pub mod api;
 pub mod auth;
 pub mod buggify;
+pub mod catalog;
 pub mod client;
 pub mod cluster;
 pub mod console;
 pub mod engine;
 pub mod env;
 pub mod error;
+pub mod events;
 pub mod filter;
 pub mod limits;
 pub mod log;

@@ -17,7 +17,10 @@ const MAGIC: &[u8; 4] = b"BRMF";
 
 /// The database was deleted: every read and commit fails with not-found.
 pub const FLAG_DELETED: u64 = 1;
-const FORMAT: u16 = 7;
+/// Set if the database has had an event table, so that orphan sweeps scan `part/`.
+pub const FLAG_EVENT_TABLES: u64 = 2;
+const FORMAT: u16 = 8;
+const FORMAT_V7: u16 = 7;
 const FORMAT_V6: u16 = 6;
 const FORMAT_V5: u16 = 5;
 const ZSTD_LEVEL: i32 = 1;
@@ -105,6 +108,8 @@ pub enum ObjKind {
     Blob = 1,
     /// External levels object; see [`Manifest::levels`].
     Levels = 2,
+    /// Event table part or mask object under `part/{id}/`.
+    Part = 3,
 }
 
 /// Tracks referenced blob bytes for size quotas, updated incrementally on commit and reconciled by sweeps.
@@ -201,6 +206,8 @@ pub struct Manifest {
     pub chunk_bytes: BlobBytes,
     /// Incremented by every tail flush install so stale background flushes are rejected.
     pub flush_seq: u64,
+    /// Total stored bytes of referenced event table parts and mask objects (SPEC §5.10).
+    pub part_bytes: u64,
 }
 
 impl Manifest {
@@ -260,7 +267,7 @@ impl Manifest {
     pub fn stored_bytes(&self) -> u64 {
         let segments: u64 = self.segments.iter().filter(|s| !is_commit_key(&s.min_key)).map(|s| s.size).sum();
         let tail: usize = self.tail.iter().filter(|e| !is_commit_key(&e.key)).map(|e| e.size()).sum();
-        segments + tail as u64 + self.blob_bytes.total() + self.chunk_bytes.total()
+        segments + tail as u64 + self.blob_bytes.total() + self.chunk_bytes.total() + self.part_bytes
     }
 
     pub fn encode(&self) -> Bytes {
@@ -370,6 +377,7 @@ impl Manifest {
             w.varint(b.swept_at);
         }
         w.varint(self.flush_seq);
+        w.varint(self.part_bytes);
         (prefix, pages, w.into_inner())
     }
 
@@ -389,8 +397,8 @@ impl Manifest {
         let format = r.u16()?;
         let src = match (format, r.u8()) {
             (FORMAT_V5, _) => src.slice(6..),
-            (FORMAT | FORMAT_V6, Ok(0)) => src.slice(7..),
-            (FORMAT | FORMAT_V6, Ok(1)) => {
+            (FORMAT | FORMAT_V7 | FORMAT_V6, Ok(0)) => src.slice(7..),
+            (FORMAT | FORMAT_V7 | FORMAT_V6, Ok(1)) => {
                 let n = r.varint()?;
                 if n > MAX_BODY {
                     return Err(DecodeError("manifest body too large"));
@@ -467,6 +475,7 @@ impl Manifest {
                 0 => ObjKind::Segment,
                 1 => ObjKind::Blob,
                 2 => ObjKind::Levels,
+                3 => ObjKind::Part,
                 _ => return Err(DecodeError("bad obsolete kind")),
             };
             let id = r.string()?;
@@ -478,7 +487,8 @@ impl Manifest {
         let last_sweep_ms = r.varint()?;
         let blob_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
         let chunk_bytes = BlobBytes { bound: r.varint()?, swept: r.varint()?, swept_at: r.varint()? };
-        let flush_seq = if format == FORMAT { r.varint()? } else { 0 };
+        let flush_seq = if format >= FORMAT_V7 { r.varint()? } else { 0 };
+        let part_bytes = if format >= FORMAT { r.varint()? } else { 0 };
         if !r.is_empty() {
             return Err(DecodeError("manifest trailing data"));
         }
@@ -502,6 +512,7 @@ impl Manifest {
             blob_bytes,
             chunk_bytes,
             flush_seq,
+            part_bytes,
         };
         m.check_levels().map_err(DecodeError)?;
         Ok(m)
@@ -735,14 +746,16 @@ mod tests {
     }
 
     fn encode_legacy_format(m: &Manifest, format: u16) -> Bytes {
-        let body = Manifest { flush_seq: 0, ..m.clone() }.encode_body();
+        let flush_seq = if format == FORMAT_V7 { m.flush_seq } else { 0 };
+        let body = Manifest { flush_seq, part_bytes: 0, ..m.clone() }.encode_body();
         let mut w = Writer::with_capacity(1024);
         w.raw(MAGIC);
         w.u16(format);
-        if format == FORMAT_V6 {
+        if format != FORMAT_V5 {
             w.u8(0);
         }
-        w.raw(&body[..body.len() - 1]);
+        let trailing = if format == FORMAT_V7 { 1 } else { 2 };
+        w.raw(&body[..body.len() - trailing]);
         let crc = crc32c(&w.buf);
         w.u32(crc);
         Bytes::from(w.into_inner())
@@ -750,8 +763,8 @@ mod tests {
 
     #[test]
     fn decodes_legacy_manifest_formats() {
-        let m = Manifest { flush_seq: 0, ..sample() };
-        for format in [FORMAT_V5, FORMAT_V6] {
+        let m = Manifest { flush_seq: 0, part_bytes: 0, ..sample() };
+        for format in [FORMAT_V5, FORMAT_V6, FORMAT_V7] {
             assert_eq!(Manifest::decode(&encode_legacy_format(&m, format)).unwrap(), m, "format {format}");
         }
     }

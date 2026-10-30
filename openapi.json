@@ -370,6 +370,59 @@
         ],
         "type": "object"
       },
+      "CreateEventTable": {
+        "additionalProperties": false,
+        "description": "Rows are sorted by `order_by` within each part. Partitions are in UTC (default `day`). `order_by`, `time_column`, and `partition` are immutable.",
+        "properties": {
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/EventColumn"
+            },
+            "type": "array"
+          },
+          "if_not_exists": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "order_by": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "partition": {
+            "enum": [
+              "hour",
+              "day",
+              "week",
+              "month"
+            ],
+            "type": "string"
+          },
+          "retention_ms": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "skip_indexes": {
+            "items": {
+              "$ref": "#/components/schemas/SkipIndex"
+            },
+            "type": "array"
+          },
+          "time_column": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "columns",
+          "time_column",
+          "order_by"
+        ],
+        "type": "object"
+      },
       "CreateStream": {
         "additionalProperties": false,
         "description": "Stream names must be 1-128 characters matching `[A-Za-z0-9_.:-]`. Records older than `retention_ms` or exceeding `max_bytes` are eligible for automatic trimming.",
@@ -680,6 +733,429 @@
         },
         "required": [
           "error"
+        ],
+        "type": "object"
+      },
+      "EventColumn": {
+        "additionalProperties": false,
+        "description": "Event table column. Columns are nullable by default. A `time` column can default to `\"now\"`. A `json` column stores JSON objects with null fields removed.",
+        "properties": {
+          "default": {},
+          "name": {
+            "type": "string"
+          },
+          "nullable": {
+            "type": "boolean"
+          },
+          "type": {
+            "enum": [
+              "time",
+              "string",
+              "int",
+              "float",
+              "bool",
+              "json"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ],
+        "type": "object"
+      },
+      "EventDelete": {
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "$ref": "#/components/schemas/Time"
+          },
+          "to": {
+            "$ref": "#/components/schemas/Time"
+          },
+          "where": {
+            "$ref": "#/components/schemas/EventFilter"
+          }
+        },
+        "required": [
+          "where"
+        ],
+        "type": "object"
+      },
+      "EventFilter": {
+        "description": "Filter expression (SPEC §4.7) that compares a column (`col`), a JSON path (`col` and `path`), a lookup (`lookup`), or a time bucket (`bucket` and `interval`).",
+        "type": "object"
+      },
+      "EventInsert": {
+        "additionalProperties": false,
+        "description": "Events to insert; an array of events or NDJSON (`application/x-ndjson`) is also accepted.",
+        "properties": {
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rows": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "rows"
+        ],
+        "type": "object"
+      },
+      "EventQuery": {
+        "additionalProperties": false,
+        "description": "Queries the time column over `[from, to)`. Set `columns` (default: all columns) to return rows with `order_by` and `cursor` (default limit 100), or set `group_by` and `aggregates` (with optional second stage `then`) to return up to 100,000 groups. Reads a snapshot at most 5 s old unless `consistency` is `strong`.",
+        "properties": {
+          "aggregates": {
+            "type": "object"
+          },
+          "columns": {
+            "items": {},
+            "type": "array"
+          },
+          "consistency": {
+            "enum": [
+              "strong",
+              "snapshot"
+            ],
+            "type": "string"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "from": {
+            "$ref": "#/components/schemas/Time"
+          },
+          "group_by": {
+            "items": {},
+            "type": "array"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "lookups": {
+            "type": "object"
+          },
+          "max_staleness_ms": {
+            "type": "integer"
+          },
+          "order_by": {
+            "items": {},
+            "type": "array"
+          },
+          "then": {
+            "type": "object"
+          },
+          "to": {
+            "$ref": "#/components/schemas/Time"
+          },
+          "where": {
+            "$ref": "#/components/schemas/EventFilter"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ],
+        "type": "object"
+      },
+      "EventQueryResult": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rows": {
+            "items": {
+              "items": {},
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/EventQueryStats"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "columns",
+          "rows",
+          "next_cursor",
+          "version",
+          "stats"
+        ],
+        "type": "object"
+      },
+      "EventQueryStats": {
+        "additionalProperties": false,
+        "properties": {
+          "bytes_read": {
+            "type": "integer"
+          },
+          "granules": {
+            "type": "integer"
+          },
+          "granules_read": {
+            "type": "integer"
+          },
+          "nodes": {
+            "type": "integer"
+          },
+          "parts": {
+            "type": "integer"
+          },
+          "parts_read": {
+            "type": "integer"
+          },
+          "rows_read": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "store_gets": {
+            "type": "integer"
+          },
+          "unsealed_rows": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source",
+          "nodes",
+          "parts",
+          "parts_read",
+          "granules",
+          "granules_read",
+          "rows_read",
+          "unsealed_rows",
+          "bytes_read",
+          "store_gets"
+        ],
+        "type": "object"
+      },
+      "EventRetention": {
+        "additionalProperties": false,
+        "properties": {
+          "retention_ms": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "retention_ms"
+        ],
+        "type": "object"
+      },
+      "EventTable": {
+        "additionalProperties": false,
+        "description": "Event table schema; single-table responses also include partitions, parts, and row/byte counts.",
+        "properties": {
+          "bytes": {
+            "type": "integer"
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/EventColumn"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "order_by": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "partition": {
+            "enum": [
+              "hour",
+              "day",
+              "week",
+              "month"
+            ],
+            "type": "string"
+          },
+          "partitions": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bytes": {
+                  "type": "integer"
+                },
+                "end": {
+                  "type": "integer"
+                },
+                "parts": {
+                  "type": "integer"
+                },
+                "rows": {
+                  "type": "integer"
+                },
+                "start": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "start",
+                "end",
+                "parts",
+                "rows",
+                "bytes"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "parts": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bytes": {
+                  "type": "integer"
+                },
+                "deleted": {
+                  "type": "integer"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "level": {
+                  "type": "integer"
+                },
+                "max_time": {
+                  "type": "integer"
+                },
+                "min_time": {
+                  "type": "integer"
+                },
+                "partition": {
+                  "type": "integer"
+                },
+                "raw_bytes": {
+                  "type": "integer"
+                },
+                "rows": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "partition",
+                "rows",
+                "deleted",
+                "bytes",
+                "raw_bytes",
+                "level",
+                "min_time",
+                "max_time"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "retention_ms": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rows": {
+            "type": "integer"
+          },
+          "skip_indexes": {
+            "items": {
+              "$ref": "#/components/schemas/SkipIndex"
+            },
+            "type": "array"
+          },
+          "time_column": {
+            "type": "string"
+          },
+          "unsealed_bytes": {
+            "type": "integer"
+          },
+          "unsealed_rows": {
+            "type": "integer"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "columns",
+          "time_column",
+          "order_by",
+          "partition",
+          "skip_indexes",
+          "retention_ms"
+        ],
+        "type": "object"
+      },
+      "EventsDeleted": {
+        "additionalProperties": false,
+        "properties": {
+          "deleted": {
+            "type": "integer"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deleted",
+          "version"
+        ],
+        "type": "object"
+      },
+      "EventsInserted": {
+        "additionalProperties": false,
+        "properties": {
+          "commit_id": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer"
+          },
+          "replayed": {
+            "type": "boolean"
+          },
+          "time": {
+            "type": "integer"
+          },
+          "version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "count",
+          "version",
+          "time",
+          "commit_id",
+          "replayed"
         ],
         "type": "object"
       },
@@ -1160,7 +1636,7 @@
         "type": "object"
       },
       "Op": {
-        "description": "Transaction operation. Keys and values are UTF-8 strings unless `encoding: base64` is set. `ttl_ms` sets the entry or row expiration relative to the commit timestamp; row updates preserve existing expiration unless `ttl_ms` is specified. `update_rows` and `delete_rows` modify all rows matching `where` (up to `limit`) within the transaction write limit and return `count`. For stream operations: `append` assigns sequence numbers at commit (`expect_seq` aborts the transaction with 412 if the stream's next sequence number does not match); `read_stream` conflicts with concurrent appends only when the read reaches the end of the stream, and observes earlier trims in the same transaction but not uncommitted appends; `stream_info` conflicts with concurrent appends; `set_consumer` requires `seq` to be at most the stream's `next_seq`.",
+        "description": "Transaction operation. Keys and values are UTF-8 strings unless `encoding: base64` is set. `ttl_ms` sets the entry or row expiration relative to the commit timestamp; row updates preserve existing expiration unless `ttl_ms` is specified. `update_rows` and `delete_rows` modify all rows matching `where` (up to `limit`) within the transaction write limit and return `count`. For stream operations: `append` assigns sequence numbers at commit (`expect_seq` aborts the transaction with 412 if the stream's next sequence number does not match); `read_stream` conflicts with concurrent appends only if the read reaches the end of the stream, and observes earlier trims in the same transaction but not uncommitted appends; `stream_info` conflicts with concurrent appends; `set_consumer` requires `seq` to be at most the stream's `next_seq`. For event tables: `insert_events` assigns row positions at commit, so a transaction that inserts into a table cannot also query or delete from it (400); `query_events` in a read-write serializable transaction conflicts with concurrent inserts into the table; `delete_events` masks matching rows in parts and deletes matching unsealed rows.",
         "oneOf": [
           {
             "additionalProperties": false,
@@ -1522,15 +1998,42 @@
             "type": "object"
           },
           {
-            "additionalProperties": true,
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/Query"
-              }
-            ],
+            "additionalProperties": false,
             "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "eq": {
+                "items": {},
+                "type": "array"
+              },
+              "filter": {
+                "$ref": "#/components/schemas/Filter"
+              },
+              "index": {
+                "type": "string"
+              },
+              "limit": {
+                "maximum": 1000,
+                "minimum": 1,
+                "type": "integer"
+              },
               "op": {
                 "const": "query_rows"
+              },
+              "range": {
+                "additionalProperties": false,
+                "properties": {
+                  "gt": {},
+                  "gte": {},
+                  "lt": {},
+                  "lte": {}
+                },
+                "required": [],
+                "type": "object"
+              },
+              "reverse": {
+                "type": "boolean"
               },
               "table": {
                 "type": "string"
@@ -1572,18 +2075,52 @@
             "type": "object"
           },
           {
-            "additionalProperties": true,
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/StreamRead"
-              }
-            ],
+            "additionalProperties": false,
             "properties": {
+              "consumer": {
+                "type": "string"
+              },
+              "filter": {
+                "$ref": "#/components/schemas/StreamFilter"
+              },
+              "from_seq": {
+                "type": "integer"
+              },
+              "from_time": {
+                "type": "integer"
+              },
+              "limit": {
+                "maximum": 1000,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "max_bytes": {
+                "maximum": 16777216,
+                "minimum": 1,
+                "type": "integer"
+              },
               "op": {
                 "const": "read_stream"
               },
+              "reverse": {
+                "type": "boolean"
+              },
+              "scan_limit": {
+                "maximum": 100000,
+                "minimum": 1,
+                "type": "integer"
+              },
               "stream": {
                 "type": "string"
+              },
+              "tail": {
+                "type": "integer"
+              },
+              "until_seq": {
+                "type": "integer"
+              },
+              "until_time": {
+                "type": "integer"
               }
             },
             "required": [
@@ -1673,6 +2210,109 @@
               "seq"
             ],
             "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "op": {
+                "const": "insert_events"
+              },
+              "rows": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "table": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "table",
+              "rows"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "aggregates": {
+                "type": "object"
+              },
+              "columns": {
+                "items": {},
+                "type": "array"
+              },
+              "cursor": {
+                "type": "string"
+              },
+              "from": {
+                "$ref": "#/components/schemas/Time"
+              },
+              "group_by": {
+                "items": {},
+                "type": "array"
+              },
+              "limit": {
+                "type": "integer"
+              },
+              "lookups": {
+                "type": "object"
+              },
+              "op": {
+                "const": "query_events"
+              },
+              "order_by": {
+                "items": {},
+                "type": "array"
+              },
+              "table": {
+                "type": "string"
+              },
+              "then": {
+                "type": "object"
+              },
+              "to": {
+                "$ref": "#/components/schemas/Time"
+              },
+              "where": {
+                "$ref": "#/components/schemas/EventFilter"
+              }
+            },
+            "required": [
+              "op",
+              "table",
+              "from",
+              "to"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "from": {
+                "$ref": "#/components/schemas/Time"
+              },
+              "op": {
+                "const": "delete_events"
+              },
+              "table": {
+                "type": "string"
+              },
+              "to": {
+                "$ref": "#/components/schemas/Time"
+              },
+              "where": {
+                "$ref": "#/components/schemas/EventFilter"
+              }
+            },
+            "required": [
+              "op",
+              "table",
+              "where"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -1686,7 +2326,16 @@
           "bytes": {
             "type": "integer"
           },
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "count": {
+            "type": "integer"
+          },
+          "deleted": {
             "type": "integer"
           },
           "done": {
@@ -1733,12 +2382,18 @@
           },
           "rows": {
             "items": {
-              "$ref": "#/components/schemas/Row"
+              "type": [
+                "object",
+                "array"
+              ]
             },
             "type": "array"
           },
           "seq": {
             "type": "integer"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/EventQueryStats"
           },
           "value": {
             "type": [
@@ -2155,6 +2810,25 @@
         ],
         "type": "object"
       },
+      "SkipIndex": {
+        "additionalProperties": false,
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "bloom"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "column",
+          "type"
+        ],
+        "type": "object"
+      },
       "Stream": {
         "additionalProperties": false,
         "description": "Stream metadata and state. Retained records span `[first_seq, next_seq)` with total payload and header size `bytes` and timestamps from `first_time` to `last_time`. `consumers` includes up to 100 consumers, continued via `consumers_next_cursor`.",
@@ -2370,7 +3044,7 @@
       },
       "StreamRead": {
         "additionalProperties": false,
-        "description": "Reads records starting from at most one of `from_seq`, `from_time` (first record at or after the timestamp), `tail` (last N records), or `consumer` (consumer cursor, starting at `first_seq` if unset), up to `until_seq` or `until_time` (exclusive). Returns records oldest-first (or newest-first when `reverse` is true), bounded by `limit` (default 100) and `max_bytes` (default 4 MiB, max 16 MiB). When `filter` is set, at most `scan_limit` records (default 10,000) are scanned.",
+        "description": "Reads records starting from at most one of `from_seq`, `from_time` (first record at or after the timestamp), `tail` (last N records), or `consumer` (consumer cursor, starting at `first_seq` if unset), up to `until_seq` or `until_time` (exclusive). Returns records oldest-first, or newest-first if `reverse` is true, bounded by `limit` (default 100) and `max_bytes` (default 4 MiB, max 16 MiB). If `filter` is set, at most `scan_limit` records (default 10,000) are scanned.",
         "properties": {
           "consistency": {
             "enum": [
@@ -2530,6 +3204,13 @@
           "indexes"
         ],
         "type": "object"
+      },
+      "Time": {
+        "description": "Milliseconds since the epoch, or an RFC 3339 timestamp.",
+        "type": [
+          "integer",
+          "string"
+        ]
       },
       "Trim": {
         "additionalProperties": false,
@@ -2716,7 +3397,7 @@
     }
   },
   "info": {
-    "description": "Transactional key-value, table, and stream databases on object storage. Authenticate with `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for writes). Requests over a rate limit return 429 `rate_limited` with `Retry-After` and are not applied; writes that would exceed a database's size quota return 507 `quota_exceeded`. Every response includes an `x-request-id` header containing the client-supplied value (1-64 characters of `[A-Za-z0-9._:-]`) or a generated ID recorded in server logs.",
+    "description": "Transactional key-value, table, stream, and event-table databases on object storage. Authenticate with `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for writes). Requests over a rate limit return 429 `rate_limited` with `Retry-After` and are not applied; writes that would exceed a database's size quota return 507 `quota_exceeded`. Every response includes an `x-request-id` header containing the client-supplied value (1-64 characters of `[A-Za-z0-9._:-]`) or a generated ID recorded in server logs.",
     "title": "Baserunna",
     "version": "0.1.0"
   },
@@ -3875,6 +4556,712 @@
         "summary": "Resolve an ambiguous commit",
         "tags": [
           "transactions"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/events": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Names starting with this",
+            "in": "query",
+            "name": "prefix",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "tables": {
+                      "items": {
+                        "$ref": "#/components/schemas/EventTable"
+                      },
+                      "type": "array"
+                    },
+                    "version": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "tables",
+                    "next_cursor",
+                    "version"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Event tables"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List event tables",
+        "tags": [
+          "events"
+        ]
+      },
+      "post": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateEventTable"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventTable"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Create an event table",
+        "tags": [
+          "events"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/events/{t}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Event table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Version"
+                }
+              }
+            },
+            "description": "Dropped"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Drop an event table",
+        "tags": [
+          "events"
+        ]
+      },
+      "get": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Event table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
+            "in": "query",
+            "name": "consistency",
+            "required": false,
+            "schema": {
+              "enum": [
+                "strong",
+                "snapshot"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Staleness bound for snapshot reads (default 5000).",
+            "in": "query",
+            "name": "max_staleness_ms",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventTable"
+                }
+              }
+            },
+            "description": "Event table"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Describe an event table, its partitions, and its parts",
+        "tags": [
+          "events"
+        ]
+      },
+      "patch": {
+        "description": "Queries skip events older than `retention_ms`, and background maintenance drops parts whose events are all older.",
+        "parameters": [
+          {
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Event table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EventRetention"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventTable"
+                }
+              }
+            },
+            "description": "Event table"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Change an event table's retention",
+        "tags": [
+          "events"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/events/{t}/columns": {
+      "post": {
+        "description": "Rows written before the column was added return its default value, or `null` if the default is `\"now\"`.",
+        "parameters": [
+          {
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Event table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EventColumn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventTable"
+                }
+              }
+            },
+            "description": "Event table"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Add a column",
+        "tags": [
+          "events"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/events/{t}/columns/{c}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Event table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Column name.",
+            "in": "path",
+            "name": "c",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventTable"
+                }
+              }
+            },
+            "description": "Event table"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Drop a column",
+        "tags": [
+          "events"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/events/{t}/rows": {
+      "post": {
+        "description": "Buffers requests on the receiving node for up to 200 ms, writes staged parts, and binds them in a single commit. Each request is committed as an independent transaction.",
+        "parameters": [
+          {
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Event table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Retries with the same key are applied once (within 10 minutes)",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EventInsert"
+              }
+            },
+            "application/x-ndjson": {
+              "schema": {
+                "description": "One JSON event object per line",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventsInserted"
+                }
+              }
+            },
+            "description": "Replayed"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventsInserted"
+                }
+              }
+            },
+            "description": "Inserted"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Insert events",
+        "tags": [
+          "events"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/events/{t}/rows/delete": {
+      "post": {
+        "description": "Deletes rows in `[from, to)` (default: all time) that match `where` in a single transaction. Returns 413 if the delete exceeds transaction limits.",
+        "parameters": [
+          {
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Event table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EventDelete"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventsDeleted"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Delete events",
+        "tags": [
+          "events"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/events/{t}/rows/query": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Event table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EventQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventQueryResult"
+                }
+              }
+            },
+            "description": "Query result"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Query events",
+        "tags": [
+          "events"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/events/{t}/skip-indexes": {
+      "post": {
+        "description": "New parts and merged parts include the skip index.",
+        "parameters": [
+          {
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Event table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SkipIndex"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventTable"
+                }
+              }
+            },
+            "description": "Event table"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Add a skip index",
+        "tags": [
+          "events"
+        ]
+      }
+    },
+    "/v1/dbs/{db}/events/{t}/skip-indexes/{c}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Database reference: `name` (personal database), `org.name` (organization database), or `id:<db_id>` (administrators only).",
+            "in": "path",
+            "name": "db",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Event table name.",
+            "in": "path",
+            "name": "t",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Indexed column name.",
+            "in": "path",
+            "name": "c",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventTable"
+                }
+              }
+            },
+            "description": "Event table"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Drop a skip index",
+        "tags": [
+          "events"
         ]
       }
     },
@@ -5273,6 +6660,35 @@
             }
           },
           {
+            "description": "Names starting with this",
+            "in": "query",
+            "name": "prefix",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size (default 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "From a previous next_cursor",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "`strong` (default, linearizable) or `snapshot` (bounded staleness).",
             "in": "query",
             "name": "consistency",
@@ -5302,6 +6718,12 @@
                 "schema": {
                   "additionalProperties": false,
                   "properties": {
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "tables": {
                       "items": {
                         "$ref": "#/components/schemas/TableSchema"
@@ -5314,6 +6736,7 @@
                   },
                   "required": [
                     "tables",
+                    "next_cursor",
                     "version"
                   ],
                   "type": "object"
@@ -7093,6 +8516,9 @@
     },
     {
       "name": "streams"
+    },
+    {
+      "name": "events"
     },
     {
       "name": "admin"

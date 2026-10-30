@@ -30,6 +30,10 @@ impl CacheKey {
     pub fn levels(db: &str, id: &str) -> CacheKey {
         CacheKey { db: hash_str(db), object: object_id(id), part: PART_LEVELS }
     }
+
+    pub fn part(db: &str, id: &str, section: u32, item: u32) -> CacheKey {
+        CacheKey { db: hash_str(db), object: object_id(id) ^ ((section as u128 + 1) << 96).rotate_left(17), part: item }
+    }
 }
 
 /// Parses 32-character hex object IDs directly, or hashes non-hex test IDs.
@@ -92,11 +96,14 @@ pub enum CacheVal {
     Index(Arc<SegmentIndex>),
     Block(Block),
     Levels(Arc<Levels>),
+    /// Arbitrary cached value and its estimated heap size in bytes.
+    Any(Arc<dyn std::any::Any + Send + Sync>, usize),
 }
 
 impl CacheVal {
     fn size(&self) -> usize {
         match self {
+            CacheVal::Any(_, n) => *n + 64,
             CacheVal::Index(i) => i.mem_size(),
             CacheVal::Block(b) => b.iter().map(|e| e.size() + 48).sum::<usize>() + 64,
             CacheVal::Levels(l) => {

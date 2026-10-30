@@ -203,6 +203,48 @@ probes! {
     /// An idle interactive transaction was aborted to reclaim memory for a user below its fair
     /// share.
     TxnEvicted,
+    /// A bulk bind committed staged event parts.
+    PartsBound,
+    /// A bulk bind masked the rows of a rejected request in a shared part.
+    BindSlotMasked,
+    /// A bulk bind or transaction was rejected because a staged event part had expired or was swept.
+    StagedPartUnbindable,
+    /// A retried bulk bind found its parts already bound by an earlier attempt that landed.
+    BindInstallReplayed,
+    /// A bulk bind was forwarded to the database's lease holder.
+    BindForwarded,
+    /// Unsealed event rows were sealed into parts.
+    EventsSealed,
+    /// A seal failed validation because a concurrent delete or drop removed rows it read.
+    SealConflicted,
+    /// Event parts were merged.
+    PartsMerged,
+    /// A merge failed validation because a concurrent commit changed its inputs.
+    MergeConflicted,
+    /// Event parts past their table's retention were dropped.
+    EventPartsExpired,
+    /// A delete masked rows of an event part.
+    EventRowsMasked,
+    /// A delete wrote a mask too large to inline as its own object.
+    MaskObjectWritten,
+    /// A query skipped a part by its reference alone.
+    PartPrunedByRef,
+    /// A time-ordered row query stopped early once remaining parts were outside the page bounds.
+    RowPageStoppedEarly,
+    /// A query skipped granules by the primary index or column statistics.
+    GranulesPruned,
+    /// A query skipped granules by a bloom filter skip index.
+    GranulesPrunedByBloom,
+    /// A query skipped a part because its string dictionary matched nothing.
+    PartPrunedByDictionary,
+    /// A query read a JSON path from a part's shared buckets.
+    JsonSharedPathRead,
+    /// A query ran a second aggregation stage.
+    QuerySecondStage,
+    /// A query mapped values through a lookup table.
+    LookupApplied,
+    /// A slow event part read was sent again.
+    PartGetHedged,
 }
 
 impl Probe {
@@ -231,6 +273,11 @@ impl Probe {
         Probe::CommitUnknownAfterLeaseMoved,
         Probe::DecidedCommitAnswered,
         Probe::ModelAdoptedFromDatabase,
+        Probe::StagedPartUnbindable,
+        Probe::BindSlotMasked,
+        Probe::BindInstallReplayed,
+        Probe::MaskObjectWritten,
+        Probe::SealConflicted,
     ];
 }
 

@@ -94,8 +94,11 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
+ "baserunna-api",
+ "baserunna-client",
  "bytes",
  "crc32c",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -110,13 +113,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "baserunna-api"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+]
+
+[[package]]
+name = "baserunna-client"
+version = "0.1.0"
+dependencies = [
+ "baserunna-api",
+ "bytes",
+ "http",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "baserunna-fuzz"
 version = "0.0.0"
 dependencies = [
  "baserunna",
+ "baserunna-api",
+ "baserunna-client",
  "bytes",
+ "http",
  "libfuzzer-sys",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

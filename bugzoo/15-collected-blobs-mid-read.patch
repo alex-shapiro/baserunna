@@ -1,7 +1,7 @@
-diff --git a/src/engine/blob.rs b/src/engine/blob.rs
+diff --git a/crates/baserunna/src/engine/blob.rs b/crates/baserunna/src/engine/blob.rs
 index 3828464..5b2598b 100644
---- a/src/engine/blob.rs
-+++ b/src/engine/blob.rs
+--- a/crates/baserunna/src/engine/blob.rs
++++ b/crates/baserunna/src/engine/blob.rs
 @@ -196,13 +196,7 @@ pub async fn read_chunk(shared: &Shared, db: &str, blob: &BlobRef, ci: u64, r: R
      let g = shared
          .retry

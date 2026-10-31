@@ -120,6 +120,8 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "axum",
+ "baserunna-api",
+ "baserunna-client",
  "bytes",
  "crc32c",
  "futures-util",
@@ -137,6 +139,33 @@ dependencies = [
  "tokio",
  "tower",
  "zstd",
+]
+
+[[package]]
+name = "baserunna-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "http",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "tokio",
+ "tower",
+]
+
+[[package]]
+name = "baserunna-client"
+version = "0.1.0"
+dependencies = [
+ "baserunna-api",
+ "bytes",
+ "http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

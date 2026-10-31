@@ -71,29 +71,29 @@ were not triggered by the random campaigns; dedicated deterministic tests
 
 ## Patch descriptions
 
-- **01** `Node::resolve_db` (`src/node.rs`) returns `NotFound` from a cached or snapshot lookup without retrying with a strong read (`resolve_db_with(.., true)`).
-- **02** If `db_routing` (`src/api/mod.rs`) executes a buffered request locally after a forward fails prior to execution, it reconstructs the request from method, URI, version, and headers instead of calling `Request::from_parts(parts, ..)`, discarding axum extensions.
-- **03** `Db::build` (`src/engine/db.rs`) assigns version `base.m.version + 1` to all transactions in a group-commit batch instead of `last_seq + 1`.
+- **01** `Node::resolve_db` (`crates/baserunna/src/node.rs`) returns `NotFound` from a cached or snapshot lookup without retrying with a strong read (`resolve_db_with(.., true)`).
+- **02** If `db_routing` (`crates/baserunna/src/api/mod.rs`) executes a buffered request locally after a forward fails prior to execution, it reconstructs the request from method, URI, version, and headers instead of calling `Request::from_parts(parts, ..)`, discarding axum extensions.
+- **03** `Db::build` (`crates/baserunna/src/engine/db.rs`) assigns version `base.m.version + 1` to all transactions in a group-commit batch instead of `last_seq + 1`.
 - **04** `Db::snapshot` skips `wait_for_in_flight_write` on strong reads.
-- **06** `db_routing` skips `MetaCmd::DeleteDb` when strong re-resolution maps a name to the same deleted database, and `create_db` (`src/api/data.rs`) returns `AlreadyExists` without completing a partial database deletion.
+- **06** `db_routing` skips `MetaCmd::DeleteDb` when strong re-resolution maps a name to the same deleted database, and `create_db` (`crates/baserunna/src/api/data.rs`) returns `AlreadyExists` without completing a partial database deletion.
 - **07** `Db::build` does not reject transactions whose commit deadline has expired.
-- **08** `list_keys` (`src/api/account.rs`) reads from the system database with bounded staleness (`sys_read`) instead of strong consistency (`sys_read_strong`).
+- **08** `list_keys` (`crates/baserunna/src/api/account.rs`) reads from the system database with bounded staleness (`sys_read`) instead of strong consistency (`sys_read_strong`).
 - **09** In `db_routing`, `NotFound` from `open_db` (when the manifest has already been purged) is returned as HTTP 404 instead of triggering strong re-resolution in the system database.
 - **10** `create_db` treats `NotFound` from a strong read of the database handle as evidence that the database was deleted, even when the manifest for a newly created database has not yet been written.
-- **11** `dedup_forwarded` (`src/api/mod.rs`) executes forwarded writes without deduplicating via `ForwardDedup`.
+- **11** `dedup_forwarded` (`crates/baserunna/src/api/mod.rs`) executes forwarded writes without deduplicating via `ForwardDedup`.
 - **12** `Db::foreign_lease` computes the remaining lease duration using the local wall clock (`expires_ms + lease_margin_ms - env.now_ms()`) instead of the monotonic instant when the lease was first observed.
-- **13** `Engine::evict_idle` (`src/engine/mod.rs`) clears the observed foreign lease state when evicting an idle `Db` handle.
-- **14** `table::get_schema` (`src/table/mod.rs`) reads the table catalog entry with `txn.get` instead of `txn.get_pinned`.
-- **15** `blob::read_chunk` (`src/engine/blob.rs`) maps a missing blob chunk to HTTP 500 instead of a retryable `503 Unavailable` error.
+- **13** `Engine::evict_idle` (`crates/baserunna/src/engine/mod.rs`) clears the observed foreign lease state when evicting an idle `Db` handle.
+- **14** `table::get_schema` (`crates/baserunna/src/table/mod.rs`) reads the table catalog entry with `txn.get` instead of `txn.get_pinned`.
+- **15** `blob::read_chunk` (`crates/baserunna/src/engine/blob.rs`) maps a missing blob chunk to HTTP 500 instead of a retryable `503 Unavailable` error.
 - **16** `dedup_forwarded` does not reject forwarded requests whose `x-baserunna-forward-to` header specifies a different node ID.
 - **17** `Shared::lease_seen` identifies a lease renewal by `lease.expires_ms` instead of the manifest `write_seq`.
-- **18** `StoreClock::sync` (`src/engine/clock.rs`) performs only a single probe instead of up to 3 probes, and `Node::housekeeping` does not call `refresh_clock`.
-- **19** `Session::is_live` (`src/meta/mod.rs`) does not check `password_fp`.
+- **18** `StoreClock::sync` (`crates/baserunna/src/engine/clock.rs`) performs only a single probe instead of up to 3 probes, and `Node::housekeeping` does not call `refresh_clock`.
+- **19** `Session::is_live` (`crates/baserunna/src/meta/mod.rs`) does not check `password_fp`.
 - **20** The partial-deletion repair in `db_routing` ignores errors from `DeleteDb` and returns HTTP 404.
 - **21** `Node::open_link` maps all errors from reading the user record, including retryable storage errors, to HTTP 401.
 - **22** In `Db::process`, a batch that encounters a foreign lease returns `NotOwner` (`not_applied`) even after a prior manifest `PUT` failed with an unknown outcome.
 - **23** `Db::trim_for_retention` exits unless the local node holds the lease, and `Db::build` does not schedule retention trims when replaying an already-committed transaction.
-- **24** The `not_committed` response in `src/api/data.rs` reports `retention_ms: u64::MAX` instead of the configured commit retention window, causing `Client::commit_status` to treat `not_committed` as definitive even after commit records have expired.
+- **24** The `not_committed` response in `crates/baserunna/src/api/data.rs` reports `retention_ms: u64::MAX` instead of the configured commit retention window, causing `Client::commit_status` to treat `not_committed` as definitive even after commit records have expired.
 - **25** `Db::process` skips deleting expired obsolete objects (`plan.gc`) when the manifest `PUT` returns an unknown outcome.
 - **26** `Node::live_members` and `Node::route` do not filter out peer records that have the local node's advertise address.
 - **27** After a manifest `PUT` fails with an unknown outcome, the manifest reload in `Db::process` does not record the local node's lease when the reloaded manifest matches that write.

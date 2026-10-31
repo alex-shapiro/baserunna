@@ -1,7 +1,7 @@
-diff --git a/src/api/mod.rs b/src/api/mod.rs
+diff --git a/crates/baserunna/src/api/mod.rs b/crates/baserunna/src/api/mod.rs
 index 0983090..3bacc84 100644
---- a/src/api/mod.rs
-+++ b/src/api/mod.rs
+--- a/crates/baserunna/src/api/mod.rs
++++ b/crates/baserunna/src/api/mod.rs
 @@ -351,7 +351,6 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                  Err(e) => return Err(e),
                  Ok(_) => Ok(db),

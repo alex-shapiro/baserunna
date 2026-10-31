@@ -80,7 +80,7 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 - [ ] **Decode rows directly into column vectors during part builds.** Seals and
       bulk inserts decode each row into a `BTreeMap` before transposing columns,
       causing a 32 MiB bulk insert of small events to peak at roughly 11x the
-      request body size (`tests/memory_bound.rs`).
+      request body size (`crates/baserunna/tests/memory_bound.rs`).
 - [ ] **Read masked merge inputs in a single pass.** Before merging a part that
       has deletions, `maint::census` reads its string and JSON columns to plan
       output dictionaries and paths, and the merge then fetches the same blocks
@@ -230,9 +230,21 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       read-ahead for cold sequential reads, per-block field summaries for
       filter pruning, small-chunk compaction, and background retention trimming
       for idle databases.
+- [ ] **Generate `openapi.json` from the API types.** Only the routes that
+      `baserunna-client` sends have types in `baserunna-api`; the other
+      handlers build their JSON with `json!`, and `api/openapi.rs` documents
+      every route by hand, so the document can drift from the server.
+      Move the request and response types of each route into
+      `baserunna-api`, derive JSON Schema for them, and build the document
+      from the `Endpoint` list. Table filters, stream filters, and event
+      queries have custom parsers and need hand-written schemas.
+- [ ] **Replace the `baserunna::client` module with `baserunna-client`.** The
+      examples use the untyped client in `crates/baserunna/src/client.rs`
+      for tables, streams, and event tables. Add typed methods for those
+      routes to `baserunna-client`, move the examples to it, and delete the
+      module.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
-      `openapi.json`, and publish the Rust `client` module as a standalone
-      crate.
+      `openapi.json`.
 - [ ] **Validate additional S3-compatible object stores.** Run the conformance
       suite and failover check against AWS S3, Cloudflare R2, MinIO, Azure Blob
       Storage, and Google Cloud Storage.
@@ -253,6 +265,9 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 
 ## Testing
 
+- [ ] **Regenerate the bug zoo patches that no longer apply.** Patches 09,
+      11, 16, and 18 do not apply to the current tree, so `bugzoo/run.sh`
+      reports them as `patch does not apply` instead of testing them.
 - [ ] **Verify event merge liveness and part-internal invariants in
       simulation.** Check in the `events` workload that part counts remain
       bounded and completed partitions settle into a single part, and verify

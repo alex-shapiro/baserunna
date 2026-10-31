@@ -1,7 +1,7 @@
-diff --git a/src/engine/db.rs b/src/engine/db.rs
+diff --git a/crates/baserunna/src/engine/db.rs b/crates/baserunna/src/engine/db.rs
 index b79fa1b..96ba0ea 100644
---- a/src/engine/db.rs
-+++ b/src/engine/db.rs
+--- a/crates/baserunna/src/engine/db.rs
++++ b/crates/baserunna/src/engine/db.rs
 @@ -1287,12 +1287,6 @@ impl Db {
                      }
                      if let Some(CommitState::Applied(c)) = state {

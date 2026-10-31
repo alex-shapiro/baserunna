@@ -4,10 +4,7 @@ FROM rust:1.97-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake clang perl && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY src src
-COPY benches benches
-COPY examples examples
-COPY tests tests
+COPY crates crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked --bin baserunna && cp target/release/baserunna /baserunna

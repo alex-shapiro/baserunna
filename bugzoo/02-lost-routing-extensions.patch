@@ -1,7 +1,7 @@
-diff --git a/src/api/mod.rs b/src/api/mod.rs
+diff --git a/crates/baserunna/src/api/mod.rs b/crates/baserunna/src/api/mod.rs
 index 0b6bed6..ac33e07 100644
---- a/src/api/mod.rs
-+++ b/src/api/mod.rs
+--- a/crates/baserunna/src/api/mod.rs
++++ b/crates/baserunna/src/api/mod.rs
 @@ -325,7 +325,11 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                      Err(_) => {
                          probe::hit(Probe::ForwardFailedHandledLocally);

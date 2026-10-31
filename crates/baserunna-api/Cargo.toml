@@ -1,0 +1,18 @@
+[package]
+name = "baserunna-api"
+description = "Request and response types of the Baserunna HTTP API, shared by the server and its clients"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+serde_urlencoded.workspace = true
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }

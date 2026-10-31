@@ -1,7 +1,7 @@
-diff --git a/src/engine/db.rs b/src/engine/db.rs
+diff --git a/crates/baserunna/src/engine/db.rs b/crates/baserunna/src/engine/db.rs
 index 3a4eb24..ddfd67f 100644
---- a/src/engine/db.rs
-+++ b/src/engine/db.rs
+--- a/crates/baserunna/src/engine/db.rs
++++ b/crates/baserunna/src/engine/db.rs
 @@ -1160,7 +1160,7 @@ impl Db {
                          outcomes.push(Outcome::Seq(Err(quota_exceeded(limit))));
                          continue;

@@ -1,7 +1,7 @@
-diff --git a/src/table/mod.rs b/src/table/mod.rs
+diff --git a/crates/baserunna/src/table/mod.rs b/crates/baserunna/src/table/mod.rs
 index 85e9574..5777e8c 100644
---- a/src/table/mod.rs
-+++ b/src/table/mod.rs
+--- a/crates/baserunna/src/table/mod.rs
++++ b/crates/baserunna/src/table/mod.rs
 @@ -95,7 +95,7 @@ fn decode_schema(it: &ReadValue) -> Result<TableSchema> {
  
  /// Reads the schema for `name` and pins its catalog key so that concurrent schema changes cause a conflict.

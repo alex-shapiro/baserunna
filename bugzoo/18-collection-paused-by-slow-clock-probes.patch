@@ -1,7 +1,7 @@
-diff --git a/src/engine/clock.rs b/src/engine/clock.rs
+diff --git a/crates/baserunna/src/engine/clock.rs b/crates/baserunna/src/engine/clock.rs
 index 3870bd3..80d655d 100644
---- a/src/engine/clock.rs
-+++ b/src/engine/clock.rs
+--- a/crates/baserunna/src/engine/clock.rs
++++ b/crates/baserunna/src/engine/clock.rs
 @@ -82,7 +82,7 @@ impl StoreClock {
              return Ok(());
          }
@@ -11,10 +11,10 @@ index 3870bd3..80d655d 100644
              let m = self.probe(store, retry).await?;
              if best.is_none_or(|b| m.error_ms < b.error_ms) {
                  best = Some(m);
-diff --git a/src/node.rs b/src/node.rs
+diff --git a/crates/baserunna/src/node.rs b/crates/baserunna/src/node.rs
 index bc7700d..5209bae 100644
---- a/src/node.rs
-+++ b/src/node.rs
+--- a/crates/baserunna/src/node.rs
++++ b/crates/baserunna/src/node.rs
 @@ -1162,7 +1162,6 @@ impl Node {
  
      fn housekeeping(&self) {

@@ -1,8 +1,5 @@
-//! Error responses.
-
 use serde::{Deserialize, Serialize};
 
-/// Body of every error response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub error: ApiError,
@@ -13,55 +10,49 @@ pub struct ApiError {
     pub code: ErrorCode,
     #[serde(default)]
     pub message: String,
-    /// Whether the same request can succeed if it is sent again later.
+    /// True if repeating the same request later can succeed.
     #[serde(default)]
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub details: Option<Details>,
+    pub details: Option<ErrorDetails>,
 }
 
-/// Machine-readable error kind. Each code has one HTTP status, except `unavailable`.
+/// Machine-readable error code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
-    /// 400: the request is malformed or violates a limit.
+    /// 400: the request is malformed or exceeds a limit.
     InvalidArgument,
-    /// 401: the credentials are missing, expired, or revoked.
+    /// 401: credentials are missing, expired, or revoked.
     Unauthenticated,
-    /// 403
     PermissionDenied,
-    /// 404
     NotFound,
     /// 404: the interactive transaction expired, was aborted, or its node changed.
     TxnNotFound,
-    /// 409: a concurrent transaction conflicted. A retry can succeed.
+    /// 409: a concurrent transaction conflicted; a retry can succeed.
     Conflict,
-    /// 409
     AlreadyExists,
-    /// 409: an earlier attempt with the same idempotency key was aborted. Retry with a new key.
+    /// 409: an earlier attempt with the same idempotency key was aborted; retry with a new key.
     Aborted,
-    /// 412: a `check` or `copy` operation failed; `details.op_index` identifies it.
+    /// 412: a `check` or `copy` operation failed at `details.op_index`.
     PreconditionFailed,
-    /// 413
     TooLarge,
     /// 410: the change-feed cursor is older than the retained history.
     CursorExpired,
-    /// 507: the storage quota of the database is used.
+    /// 507: the database storage quota is full.
     QuotaExceeded,
     /// 429: wait `details.retry_after_ms` before the next request.
     RateLimited,
-    /// 503: the service cannot complete the request now; `details.outcome` tells whether a
+    /// 503: the service cannot complete the request now; `details.outcome` indicates whether a
     /// write was applied.
     Unavailable,
-    /// 500
     Internal,
-    /// A code that this release of the API does not know.
+    /// Error code from a newer server release.
     #[serde(other)]
     Unknown,
 }
 
 impl ErrorCode {
-    /// Returns the code as it appears in JSON.
     pub fn as_str(self) -> &'static str {
         match self {
             ErrorCode::InvalidArgument => "invalid_argument",
@@ -84,28 +75,27 @@ impl ErrorCode {
     }
 }
 
-/// Additional data of an error. Each field applies to some codes only.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Details {
-    /// `precondition_failed`: index of the failed operation in the transaction.
+pub struct ErrorDetails {
+    /// Index of the failed operation in a transaction (`precondition_failed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_index: Option<usize>,
-    /// `unavailable`: node that holds the lease of the database.
+    /// Node that holds the database lease (`unavailable`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_holder: Option<String>,
-    /// `unavailable`: whether a write of the request was applied.
+    /// Whether a write was applied before the failure (`unavailable`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
-    /// `rate_limited`: time to wait before the next request.
+    /// Delay in milliseconds before the next request (`rate_limited`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
 }
 
-/// Whether a failed request changed data.
+/// Whether a failed request modified data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     NotApplied,
-    /// The request may or may not have been applied.
+    /// The request might have been applied.
     Unknown,
 }

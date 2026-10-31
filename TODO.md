@@ -230,19 +230,13 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       read-ahead for cold sequential reads, per-block field summaries for
       filter pruning, small-chunk compaction, and background retention trimming
       for idle databases.
-- [ ] **Generate `openapi.json` from the API types.** Only the routes that
-      `baserunna-client` sends have types in `baserunna-api`; the other
-      handlers build their JSON with `json!`, and `api/openapi.rs` documents
-      every route by hand, so the document can drift from the server.
-      Move the request and response types of each route into
-      `baserunna-api`, derive JSON Schema for them, and build the document
-      from the `Endpoint` list. Table filters, stream filters, and event
-      queries have custom parsers and need hand-written schemas.
-- [ ] **Replace the `baserunna::client` module with `baserunna-client`.** The
-      examples use the untyped client in `crates/baserunna/src/client.rs`
-      for tables, streams, and event tables. Add typed methods for those
-      routes to `baserunna-client`, move the examples to it, and delete the
-      module.
+- [ ] **Generate `openapi.json` from the API types.** Move all route request and
+      response types into `baserunna-api`, derive JSON Schema for them, and
+      generate `openapi.json` from the `Endpoint` definitions instead of
+      maintaining `api/openapi.rs` by hand.
+- [ ] **Replace `baserunna::client` with `baserunna-client`.** Add table,
+      stream, and event-table methods to `baserunna-client`, migrate the
+      examples, and delete `crates/baserunna/src/client.rs`.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`.
 - [ ] **Validate additional S3-compatible object stores.** Run the conformance
@@ -265,9 +259,8 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 
 ## Testing
 
-- [ ] **Regenerate the bug zoo patches that no longer apply.** Patches 09,
-      11, 16, and 18 do not apply to the current tree, so `bugzoo/run.sh`
-      reports them as `patch does not apply` instead of testing them.
+- [ ] **Regenerate stale bug zoo patches.** Update patches 09, 11, 16, and 18 so
+      they apply to the current tree.
 - [ ] **Verify event merge liveness and part-internal invariants in
       simulation.** Check in the `events` workload that part counts remain
       bounded and completed partitions settle into a single part, and verify

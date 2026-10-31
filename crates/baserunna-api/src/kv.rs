@@ -1,9 +1,8 @@
-//! Transactions, the change feed, and blobs.
+//! Transaction, change-feed, and blob types.
 //!
-//! Keys and values appear in JSON as text in the `encoding` of the request: UTF-8 text for
-//! `utf8`, or standard base64 with padding for `base64`. If a response with `utf8` encoding holds
-//! bytes that are not valid UTF-8, the server writes them as base64 to a field with the suffix
-//! `_b64` (such as `key_b64`) and omits the plain field.
+//! Keys and values are encoded as UTF-8 strings or as padded standard base64.
+//! If a response uses `utf8` encoding and a byte slice is not valid UTF-8, the server omits the
+//! plain field and writes base64 to the corresponding `_b64` field.
 
 use crate::{Endpoint, NoBody, Octets, fill_route, is_false, json_body, with_query};
 use http::{Method, StatusCode};
@@ -11,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as Json;
 use serde_json::value::RawValue;
 
-/// `POST /v1/dbs/{db}/txn`: runs operations as one transaction.
+/// `POST /v1/dbs/{db}/txn`: executes operations in a single transaction.
 #[derive(Clone, Debug)]
 pub struct Txn {
     pub db: String,
@@ -24,7 +23,6 @@ impl Endpoint for Txn {
     type Body = TxnRequest;
     type Response = TxnResponse;
 
-    /// A transaction is idempotent if it only reads or if it has an idempotency key.
     fn is_idempotent(body: &TxnRequest) -> bool {
         body.is_idempotent()
     }
@@ -34,7 +32,7 @@ impl Endpoint for Txn {
     }
 }
 
-/// `GET /v1/dbs/{db}/changes`: reads the changes after a cursor, and optionally waits for them.
+/// `GET /v1/dbs/{db}/changes`: reads changes after a cursor, optionally waiting for new changes.
 #[derive(Clone, Debug)]
 pub struct Changes {
     pub db: String,
@@ -57,10 +55,9 @@ impl Endpoint for Changes {
     }
 }
 
-/// `POST /v1/dbs/{db}/blobs`: uploads a blob for a later `put` with `blob_id`.
+/// `POST /v1/dbs/{db}/blobs`: uploads a blob to reference by `blob_id` in a later `put`.
 ///
-/// A staged blob that no key references is deleted after `blob_stage_ttl_ms`, so a repeated
-/// upload has no lasting effect.
+/// Unreferenced staged blobs expire after `blob_stage_ttl_ms`.
 #[derive(Clone, Debug)]
 pub struct StageBlob {
     pub db: String,
@@ -82,7 +79,7 @@ impl Endpoint for StageBlob {
     }
 }
 
-/// `GET /v1/dbs/{db}/blobs/{blob_id}`: reads the content of a blob.
+/// `GET /v1/dbs/{db}/blobs/{blob_id}`: downloads a blob.
 #[derive(Clone, Debug)]
 pub struct ReadBlob {
     pub db: String,
@@ -105,7 +102,6 @@ impl Endpoint for ReadBlob {
     }
 }
 
-/// How keys and values appear in JSON.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Encoding {
@@ -122,14 +118,13 @@ pub enum Isolation {
     Snapshot,
 }
 
-/// Consistency of a read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Consistency {
     /// Reads the latest committed version.
     #[default]
     Strong,
-    /// Reads a cached version that is at most `max_staleness_ms` old (default 5000).
+    /// Reads a cached version that is at most `max_staleness_ms` old, defaulting to 5000 ms.
     Snapshot,
 }
 
@@ -145,12 +140,11 @@ pub struct TxnRequest {
     pub encoding: Encoding,
     #[serde(default, skip_serializing_if = "is_default")]
     pub isolation: Isolation,
-    /// Key that makes a write transaction safe to send again: the server applies the
-    /// transaction at most once per key and returns `replayed: true` for a repeated request.
-    /// The server ignores the key of a transaction without writes.
+    /// Deduplication key for write transactions. The server applies a transaction at most once per
+    /// key and sets `replayed: true` on repeated requests. Ignored for read-only transactions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
-    /// Consistency of a transaction without writes.
+    /// Consistency level for read-only transactions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consistency: Option<Consistency>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,24 +152,19 @@ pub struct TxnRequest {
 }
 
 impl TxnRequest {
-    /// Checks whether sending the request again after it succeeds has no effect.
     pub fn is_idempotent(&self) -> bool {
         self.idempotency_key.is_some() || !self.ops.iter().any(Op::is_write)
     }
 }
 
-/// An operation of a transaction, identified by its `op` field.
-///
-/// Fields that hold keys or values are text in the `encoding` of the request. Operations on
-/// tables, streams, and event tables hold their filters, queries, and rows as JSON, which the
-/// server validates.
+/// Key and value fields use the request `encoding`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Op {
     Get {
         key: String,
     },
-    /// Reads keys with `prefix`, or keys in `[start, end)`, in key order.
+    /// Reads keys matching `prefix` or in `[start, end)`.
     Scan {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prefix: Option<String>,
@@ -183,19 +172,20 @@ pub enum Op {
         start: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         end: Option<String>,
-        /// Maximum number of items (default 100).
+        /// Maximum number of items, defaulting to 100.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
         #[serde(default, skip_serializing_if = "is_false")]
         reverse: bool,
-        /// Omits values from the items.
+        /// If true, omits values from the returned items.
         #[serde(default, skip_serializing_if = "is_false")]
         keys_only: bool,
-        /// `next_cursor` of the previous page.
+        /// `next_cursor` from the previous page.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
     },
-    /// Writes exactly one of `value` and `blob_id` (a staged blob) to `key`.
+    /// Writes `value` or a staged `blob_id` to `key`. Exactly one of `value` or `blob_id` must be
+    /// set.
     Put {
         key: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -208,15 +198,15 @@ pub enum Op {
     Delete {
         key: String,
     },
-    /// Writes the value of `from` to `to`. Fails with `precondition_failed` if `from` does not
-    /// exist.
+    /// Copies the value of `from` to `to`, or fails with `precondition_failed` if `from` is
+    /// absent.
     Copy {
         from: String,
         to: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ttl_ms: Option<u64>,
     },
-    /// Deletes keys with `prefix`, or keys in `[start, end)`.
+    /// Deletes keys matching `prefix` or in `[start, end)`.
     DeleteRange {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prefix: Option<String>,
@@ -225,8 +215,8 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         end: Option<String>,
     },
-    /// Fails the transaction with `precondition_failed` unless `key` satisfies every given
-    /// condition.
+    /// Fails the transaction with `precondition_failed` unless `key` satisfies all specified
+    /// conditions.
     Check {
         key: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,7 +226,7 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         value: Option<String>,
     },
-    /// Adds `by` to the decimal integer stored at `key` (0 if absent).
+    /// Adds `by` to the base-10 integer at `key`, treating an absent key as 0.
     Increment {
         key: String,
         #[serde(default = "one")]
@@ -377,23 +367,18 @@ impl Op {
     }
 }
 
-/// A `read_stream` operation: a stream and the read options beside it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReadStream {
     pub stream: String,
-    /// The other fields of the operation.
     pub spec: serde_json::Map<String, Json>,
 }
 
-/// A `query_events` operation: an event table and the query fields beside it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryEvents {
     pub table: String,
-    /// The other fields of the operation.
     pub query: serde_json::Map<String, Json>,
 }
 
-/// Implements serde for a struct of a name field and the map of all other fields.
 macro_rules! named_map {
     ($t:ident, $name:ident, $rest:ident) => {
         impl Serialize for $t {
@@ -423,49 +408,39 @@ macro_rules! named_map {
 named_map!(ReadStream, stream, spec);
 named_map!(QueryEvents, table, query);
 
-/// Response of a transaction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TxnResponse {
-    /// Commit version of a write transaction, or the version that a read transaction read.
+    /// Commit version for a write transaction, or snapshot version for a read transaction.
     pub version: u64,
     pub committed: bool,
-    /// Commit ID of a write transaction, which `GET /v1/dbs/{db}/commits/{id}` resolves.
+    /// Commit ID for checking commit status at `GET /v1/dbs/{db}/commits/{id}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_id: Option<String>,
-    /// Set if an earlier request with the same idempotency key committed the transaction.
+    /// True if an earlier request with the same idempotency key already committed the transaction.
     #[serde(default, skip_serializing_if = "is_false")]
     pub replayed: bool,
-    /// One result per operation, or `None` if `replayed` is set.
+    /// Per-operation results, or `None` if `replayed` is true.
     pub results: Option<Vec<OpResult>>,
-    /// First sequence number of each `append` operation, in order.
+    /// First sequence number assigned to each `append` operation, in order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appends: Option<Vec<u64>>,
 }
 
 json_body!(TxnRequest, TxnResponse);
 
-/// Result of one operation.
-///
-/// The JSON of a result has no tag, so deserialization keeps each result as [`OpResult::Raw`];
-/// [`OpResult::decode`] reads it as the result type of its operation.
+/// Because operation results are untagged in JSON, deserialization stores each result as
+/// [`OpResult::Raw`]; call [`OpResult::decode`] to parse it as the expected type.
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub enum OpResult {
-    /// Result of `get`.
     Get(GetResult),
-    /// Result of `scan`.
     Scan(ScanResult),
-    /// Result of `put`, `delete`, `copy`, `delete_range`, `check`, and other operations that
-    /// return `{}`.
     Done(crate::Empty),
-    /// Result of an operation on a table, stream, or event table, or of `increment`.
     Other(Json),
-    /// A result as received.
     Raw(Box<RawValue>),
 }
 
 impl OpResult {
-    /// Reads the result as `T`, such as [`GetResult`] for a `get` operation.
     pub fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, String> {
         let r = match self {
             OpResult::Raw(r) => serde_json::from_str(r.get()),
@@ -484,19 +459,18 @@ impl<'de> Deserialize<'de> for OpResult {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetResult {
     pub found: bool,
-    /// The value, unless it is a blob that exceeds `json_value_max`.
+    /// Value, omitted if the value is a blob larger than `json_value_max`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_b64: Option<String>,
-    /// Set if the value is a blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob: Option<BlobMeta>,
-    /// Set if `found` is set: the version of the key, or `Some(None)` (JSON `null`) if the
-    /// transaction wrote the key earlier.
+    /// Key version if `found` is true, or `Some(None)` if the key was written earlier in the same
+    /// transaction.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub version: Option<Option<u64>>,
-    /// Expiry time in milliseconds since the Unix epoch.
+    /// Expiration time in milliseconds since the Unix epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
 }
@@ -504,7 +478,6 @@ pub struct GetResult {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanResult {
     pub items: Vec<ScanItem>,
-    /// Cursor of the next page, or `None` after the last page.
     pub next_cursor: Option<String>,
 }
 
@@ -514,16 +487,15 @@ pub struct ScanItem {
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_b64: Option<String>,
-    /// The value, unless the scan is `keys_only` or the value is a blob that exceeds
+    /// Value, omitted if `keys_only` is true or if the value is a blob larger than
     /// `json_value_max`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_b64: Option<String>,
-    /// Set if the value is a blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob: Option<BlobMeta>,
-    /// Version of the key, or `None` if the transaction wrote the key earlier.
+    /// Key version, or `None` if the key was written earlier in the same transaction.
     pub version: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
@@ -535,35 +507,32 @@ json_body!(GetResult, ScanResult);
 pub struct BlobMeta {
     pub blob_id: String,
     pub size: u64,
-    /// SHA-256 digest of the content in lowercase hex.
+    /// Lowercase hex SHA-256 digest of the blob content.
     pub sha256: String,
     pub content_type: String,
 }
 
 json_body!(BlobMeta);
 
-/// Query parameters of [`Changes`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangesQuery {
-    /// A version, or the `next_cursor` of the previous page. `0` reads from the start of the
-    /// retained history.
+    /// Version or `next_cursor` from the previous page. `"0"` starts at the beginning of retained
+    /// history.
     pub after: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<Encoding>,
-    /// Reads keys with `prefix`, or keys in `[start, end)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end: Option<String>,
-    /// Omits values from the changes.
     #[serde(default, skip_serializing_if = "is_false", deserialize_with = "flag")]
     pub keys_only: bool,
-    /// Maximum number of changes (default 100).
+    /// Maximum number of changes, defaulting to 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
-    /// Time to wait for a change if none is available.
+    /// Maximum time in milliseconds to wait if no changes are available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -572,7 +541,6 @@ pub struct ChangesQuery {
     pub max_staleness_ms: Option<u64>,
 }
 
-/// Deserializes a query flag: `true`, `1`, or an empty value, or `false` or `0`.
 fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
     match String::deserialize(d)?.as_str() {
         "true" | "1" | "" => Ok(true),
@@ -585,16 +553,15 @@ fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
 pub struct ChangePage {
     /// Changes in commit order.
     pub changes: Vec<Change>,
-    /// Whether more changes are available after `next_cursor` now.
+    /// True if more changes are immediately available after `next_cursor`.
     pub more: bool,
     pub next_cursor: String,
-    /// Version that the server read.
+    /// Snapshot version read by the server.
     pub version: u64,
 }
 
 json_body!(ChangePage);
 
-/// A write to one key, or a deletion of a key range.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     pub version: u64,
@@ -612,26 +579,26 @@ pub struct Change {
     pub blob: Option<BlobMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
-    /// Set instead of `key` if the change deletes a range.
+    /// Range deleted by this change; mutually exclusive with `key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_range: Option<DeletedRange>,
 }
 
-/// Keys in `[start, end)`; an `end` of `None` extends to the end of the key space.
+/// Key range `[start, end)`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeletedRange {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_b64: Option<String>,
-    /// `Some(None)` (JSON `null`) for an unbounded range; `None` if `end_b64` holds the end.
+    /// `Some(None)` if the upper bound is unbounded, or `None` if `end_b64` is set.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub end: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_b64: Option<String>,
 }
 
-/// Deserializes a field that is present, including JSON `null`, as `Some`.
+/// Wraps a present field value, including JSON `null`, in `Some`.
 fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
     T::deserialize(d).map(Some)
 }

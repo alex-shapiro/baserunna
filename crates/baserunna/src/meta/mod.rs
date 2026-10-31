@@ -58,7 +58,6 @@ pub struct User {
 }
 
 impl User {
-    /// Returns the fields of the user that the API shows to the user.
     pub fn public(&self) -> baserunna_api::User {
         baserunna_api::User {
             id: self.id.clone(),

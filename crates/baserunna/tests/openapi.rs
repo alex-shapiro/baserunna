@@ -53,7 +53,6 @@ fn document_is_well_formed() {
     }
 }
 
-/// Returns the method and route of the `baserunna_api` endpoint type `name`.
 fn api_endpoint(name: &str) -> (String, &'static str) {
     use baserunna_api::{self as api, Endpoint};
     fn of<E: Endpoint>() -> (String, &'static str) {

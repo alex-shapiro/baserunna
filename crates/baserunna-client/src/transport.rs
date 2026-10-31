@@ -1,5 +1,3 @@
-//! The seam between [`Client`](crate::Client) and the network.
-
 use bytes::Bytes;
 use std::fmt;
 use std::future::Future;
@@ -8,10 +6,9 @@ use std::sync::Arc;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Sends HTTP requests to a Baserunna server.
+/// HTTP transport for sending requests to a Baserunna server.
 ///
-/// The URI of each request holds only the path and the query string; the transport adds the
-/// server address. Tests implement this trait to route requests through a simulated network.
+/// Request URIs contain only the path and query string; the transport prepends the server URL.
 pub trait Transport: Send + Sync {
     fn send(&self, req: http::Request<Bytes>) -> BoxFuture<'_, Result<http::Response<Bytes>, TransportError>>;
 }
@@ -22,15 +19,14 @@ impl<T: Transport + ?Sized> Transport for Arc<T> {
     }
 }
 
-/// A request that did not receive a complete response.
+/// Transport-level failure before receiving a complete HTTP response.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransportError {
-    /// The request did not reach the server, for example because the connection failed.
+    /// The request was not sent to the server, for example because the connection failed.
     NotSent(String),
-    /// The request may have reached the server before the failure.
+    /// The request might have reached the server before failing.
     Unknown(String),
-    /// The request exceeded the deadline of the transport. The client does not send it again,
-    /// because the next attempt would wait as long.
+    /// The request exceeded the transport timeout and is not retried.
     TimedOut(String),
 }
 
@@ -55,17 +51,15 @@ mod http_transport {
     use bytes::Bytes;
     use std::time::Duration;
 
-    /// HTTP and HTTPS transport.
+    /// HTTP and HTTPS transport backed by `reqwest`.
     pub struct HttpTransport {
         base: String,
         client: reqwest::Client,
     }
 
     impl HttpTransport {
-        /// Creates a transport for the server at `base_url`, such as `https://example.com`.
-        ///
-        /// A request fails with [`TransportError::TimedOut`] after 90 s, which exceeds the
-        /// longest long poll of the server.
+        /// Creates a transport for `base_url` with a 10 s connect timeout and a 90 s request
+        /// timeout.
         pub fn new(base_url: &str) -> HttpTransport {
             let client = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
@@ -76,7 +70,6 @@ mod http_transport {
             HttpTransport::with_client(base_url, client)
         }
 
-        /// Creates a transport that sends requests with `client`.
         pub fn with_client(base_url: &str, client: reqwest::Client) -> HttpTransport {
             HttpTransport { base: base_url.trim_end_matches('/').to_string(), client }
         }
@@ -90,7 +83,7 @@ mod http_transport {
                 let resp =
                     self.client.request(parts.method, url).headers(parts.headers).body(body).send().await.map_err(
                         |e| {
-                            // A connection that timed out sent nothing, so it is not a request timeout.
+                            // Check `is_connect` before `is_timeout` because a connect timeout is also a timeout, but nothing was sent.
                             if e.is_connect() || e.is_builder() {
                                 TransportError::NotSent(e.to_string())
                             } else if e.is_timeout() {

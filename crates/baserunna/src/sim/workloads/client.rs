@@ -1,10 +1,9 @@
-//! Simulation workload for `baserunna-client` under network, process, and store faults.
+//! Simulation workload for `baserunna-client` under network, process, and storage faults.
 //!
-//! Counter clients increment their own keys with a version check and an idempotency key per
-//! transaction, so a retry that applies a write twice, or reports a failure for an applied
-//! write, breaks the count. Mutators write, copy, and delete binary keys while a watcher
-//! rebuilds the key space from the change feed; at the end the rebuilt replica must equal a
-//! scan. Every response also passes the OpenAPI check of the simulated client.
+//! Counter tasks increment keys with a version precondition and an idempotency key per transaction
+//! to verify that retries do not apply a write twice or report an applied write as `NotApplied`.
+//! Mutator tasks write, copy, and delete binary keys while a watcher task reconstructs the key
+//! space from the change feed and compares the final state against a full scan.
 
 use super::super::Sim;
 use super::super::client::{Client as SimClient, ZOMBIE_WAIT_MS};
@@ -49,7 +48,6 @@ fn client(sim: &Arc<Sim>, name: &str) -> Client {
     Client::new(t)
 }
 
-/// Registers an account, or signs in if a lost response hid an earlier registration.
 async fn signed_up(sim: &Arc<Sim>, name: &str, email: &str) -> Result<Client, String> {
     let c = client(sim, name);
     let password = "client-password";
@@ -62,8 +60,6 @@ fn with_name(sim: &Arc<Sim>, c: &Client, name: &str) -> Client {
     client(sim, name).with_token(c.token().unwrap_or_default())
 }
 
-/// Calls a non-idempotent request until it succeeds, treating error `done` as the success of an
-/// earlier attempt whose response was lost.
 async fn at_least_once<F: Future<Output = Result<(), Error>>>(
     sim: &Arc<Sim>,
     done: ErrorCode,
@@ -81,7 +77,6 @@ async fn at_least_once<F: Future<Output = Result<(), Error>>>(
     .await
 }
 
-/// Fails with a non-transient error unless `cond` is true.
 fn check(cond: bool, what: &str) -> Result<(), Error> {
     match cond {
         true => Ok(()),
@@ -89,7 +84,6 @@ fn check(cond: bool, what: &str) -> Result<(), Error> {
     }
 }
 
-/// Calls `f`, which must fail, until it fails with a non-transient error, and returns its code.
 async fn definitive<T: std::fmt::Debug, F: Future<Output = Result<T, Error>>>(
     sim: &Arc<Sim>,
     mut f: impl FnMut() -> F,
@@ -104,7 +98,6 @@ async fn definitive<T: std::fmt::Debug, F: Future<Output = Result<T, Error>>>(
     Err("a request never failed definitively".into())
 }
 
-/// Calls `f` until it succeeds or fails with a non-transient error, pausing between attempts.
 async fn retry<T, F: Future<Output = Result<T, Error>>>(sim: &Arc<Sim>, mut f: impl FnMut() -> F) -> Result<T, String> {
     for _ in 0..400 {
         match f().await {
@@ -116,8 +109,6 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(sim: &Arc<Sim>, mut f: i
     Err("a request never succeeded".into())
 }
 
-/// Increments key `ctr/{i}` `steps` times with a version check, resolving unknown outcomes by
-/// reading the counter.
 async fn count(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), String> {
     let key = Bytes::from(format!("ctr/{i}"));
     let (mut n, mut version) = (0u64, None);
@@ -132,7 +123,7 @@ async fn count(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Stri
             Ok(out) => (n, version) = (n + 1, Some(out.version)),
             Err(e) if e.outcome() == Outcome::NotApplied && e.code() != Some(ErrorCode::PreconditionFailed) => {}
             Err(e) if e.outcome() == Outcome::Unknown => {
-                // An earlier attempt can still apply until it times out on the server.
+                // Wait for any in-flight attempt to time out on the server before reading the counter.
                 sim.sleep(ZOMBIE_WAIT_MS).await;
                 let (got, v) = read_counter(&sim, &db, &key).await?;
                 expect(got == n || got == n + 1, format!("counter {i} is {got} after {n} increments and a failure"))?;
@@ -161,14 +152,12 @@ async fn read_counter(sim: &Arc<Sim>, db: &Db, key: &Bytes) -> Result<(u64, Opti
     }
 }
 
-/// Keys of mutator `i`, including bytes that are not valid UTF-8.
 fn mutator_key(i: usize, k: u64) -> Bytes {
     let mut b = format!("m{i}/").into_bytes();
     b.extend_from_slice(&[[b'a', 0xff, 0x00, b'/'][k as usize % 4], b'0' + (k / 4) as u8]);
     Bytes::from(b)
 }
 
-/// Applies random writes, blob writes, copies, and deletes to the keys of mutator `i`.
 async fn mutate(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), String> {
     for step in 0..steps {
         sim.sleep(sim.rand_below(500)).await;
@@ -187,7 +176,7 @@ async fn mutate(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Str
             _ => Op::Put { key, value: Bytes::from(format!("{i}-{step}")) },
         };
         match db.txn(std::slice::from_ref(&op), Some(&format!("m{i}-{step}"))).await {
-            Ok(out) => expect(out.results.is_none_or(|r| r == [OpResult::Done]), "a write returns no data")?,
+            Ok(out) => expect(out.results.is_none_or(|r| r == [OpResult::Done]), "write operations return Done")?,
             Err(e) if e.code() == Some(ErrorCode::PreconditionFailed) && matches!(op, Op::Copy { .. }) => {}
             Err(e) if e.code() == Some(ErrorCode::Aborted) => {}
             Err(e) if e.outcome() == Outcome::Unknown || e.is_transient(true) => {}
@@ -198,7 +187,6 @@ async fn mutate(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Str
     Ok(())
 }
 
-/// Keys and values rebuilt from the change feed, and the cursor of the next read.
 struct Replica {
     keys: BTreeMap<Bytes, (u64, Bytes)>,
     cursor: String,
@@ -224,11 +212,10 @@ impl Replica {
 fn data(v: &Value) -> Result<Bytes, String> {
     match v {
         Value::Inline(b) | Value::Blob { data: Some(b), .. } => Ok(b.clone()),
-        Value::Blob { meta, data: None } => Err(format!("blob {} has no inline data", meta.blob_id)),
+        Value::Blob { meta, data: None } => Err(format!("blob {} is missing inline data", meta.blob_id)),
     }
 }
 
-/// Follows the change feed with long polls, restarting from a scan if the cursor expires.
 async fn watch(sim: Arc<Sim>, db: Db, steps: usize) -> Result<Replica, String> {
     let mut r = Replica { keys: BTreeMap::new(), cursor: "0".into() };
     for _ in 0..steps {
@@ -241,7 +228,6 @@ async fn watch(sim: Arc<Sim>, db: Db, steps: usize) -> Result<Replica, String> {
     Ok(r)
 }
 
-/// Applies one page of changes and returns whether the page was empty and the last one.
 async fn read_changes(db: &Db, r: &mut Replica, wait_ms: u64) -> Result<bool, Error> {
     let req = ChangesRequest {
         range: KeyRange::Prefix(Bytes::new()),
@@ -259,7 +245,6 @@ async fn read_changes(db: &Db, r: &mut Replica, wait_ms: u64) -> Result<bool, Er
     Ok(done)
 }
 
-/// Reads the feed until no more changes are available.
 async fn catch_up(sim: &Arc<Sim>, db: &Db, mut r: Replica) -> Result<Replica, String> {
     for _ in 0..400 {
         match read_changes(db, &mut r, 0).await {
@@ -273,14 +258,13 @@ async fn catch_up(sim: &Arc<Sim>, db: &Db, mut r: Replica) -> Result<Replica, St
     Err("the change feed never caught up".into())
 }
 
-/// Rebuilds a replica from a scan and continues the feed at the version of the scan.
 async fn rescan(sim: &Arc<Sim>, db: &Db) -> Result<Replica, String> {
     let ops = [Op::Scan { range: KeyRange::Prefix(Bytes::new()), limit: 1000, reverse: false, keys_only: false }];
     let out = retry(sim, || db.txn(&ops, None)).await?;
     let Some([OpResult::Scan(page)]) = out.results.as_deref() else {
         return Err("unexpected scan result".into());
     };
-    expect(page.cursor.is_none(), "the key space fits in one page")?;
+    expect(page.cursor.is_none(), "the key space fits in a single page")?;
     let keys = page
         .entries
         .iter()
@@ -293,7 +277,6 @@ async fn scan_all(sim: &Arc<Sim>, db: &Db) -> Result<BTreeMap<Bytes, (u64, Bytes
     Ok(rescan(sim, db).await?.keys)
 }
 
-/// Exercises the account and organization endpoints and the mapping of their errors.
 async fn accounts(sim: &Arc<Sim>, owner: &Client) -> Result<(), String> {
     let member = signed_up(sim, "client-member", "member@client.test").await?;
     let me = retry(sim, || member.me()).await?;

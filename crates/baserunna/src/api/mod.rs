@@ -62,20 +62,20 @@ impl IntoResponse for Error {
 
 /// Converts an [`Error`] to the `error` object of an HTTP error response.
 pub fn api_error(e: &Error) -> api::ApiError {
-    let details = |d: api::Details| Some(d);
+    let details = |d: api::ErrorDetails| Some(d);
     let details = match e {
         Error::PreconditionFailed { op_index: Some(i), .. } => {
-            details(api::Details { op_index: Some(*i), ..api::Details::default() })
+            details(api::ErrorDetails { op_index: Some(*i), ..api::ErrorDetails::default() })
         }
         Error::NotOwner { holder, .. } => {
-            details(api::Details { lease_holder: Some(holder.clone()), ..api::Details::default() })
+            details(api::ErrorDetails { lease_holder: Some(holder.clone()), ..api::ErrorDetails::default() })
         }
         Error::Unavailable { outcome_unknown, .. } => {
             let outcome = if *outcome_unknown { api::Outcome::Unknown } else { api::Outcome::NotApplied };
-            details(api::Details { outcome: Some(outcome), ..api::Details::default() })
+            details(api::ErrorDetails { outcome: Some(outcome), ..api::ErrorDetails::default() })
         }
         Error::RateLimited { retry_after_ms, .. } => {
-            details(api::Details { retry_after_ms: Some(*retry_after_ms), ..api::Details::default() })
+            details(api::ErrorDetails { retry_after_ms: Some(*retry_after_ms), ..api::ErrorDetails::default() })
         }
         _ => None,
     };
@@ -91,7 +91,7 @@ pub fn error_json(e: &Error) -> Json {
 const BIND_BODY_MAX: usize = 1 << 30;
 
 /// Reconstructs an [`Error`] from a JSON error response, falling back to `status`
-/// if the body has no `error` object.
+/// if the `error` object is missing.
 pub fn error_from_json(status: u16, j: &Json) -> Error {
     match api::ApiError::deserialize(&j["error"]) {
         Ok(e) => error_from_api(status, e),
@@ -143,7 +143,6 @@ fn error_from_api(status: u16, e: api::ApiError) -> Error {
     }
 }
 
-/// Successful response of endpoint `E`.
 pub(crate) struct Reply<E: Endpoint> {
     body: E::Response,
     headers: HeaderMap,
@@ -172,7 +171,6 @@ impl<E: Endpoint> IntoResponse for Reply<E> {
     }
 }
 
-/// Request body of endpoint `E`.
 pub(crate) struct Req<E: Endpoint>(pub E::Body);
 
 impl<S: Send + Sync, E: Endpoint> FromRequest<S> for Req<E>
@@ -189,7 +187,6 @@ where
     }
 }
 
-/// Query parameters of type `T`, reporting errors in the API's format.
 pub(crate) struct QueryOf<T>(pub T);
 
 impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for QueryOf<T> {
@@ -202,8 +199,6 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for QueryOf<T> {
     }
 }
 
-/// A handler of endpoint `E`: an async function whose last argument is [`Req<E>`] and whose
-/// output is [`Reply<E>`], so that it reads and writes the types of [`baserunna_api`].
 pub(crate) trait EndpointHandler<E, T>: Sized {
     fn into_method_router(self) -> axum::routing::MethodRouter<Arc<Node>>;
 }
@@ -232,9 +227,7 @@ endpoint_handler!(T1, T2);
 endpoint_handler!(T1, T2, T3);
 endpoint_handler!(T1, T2, T3, T4);
 
-/// Registration of handlers for [`Endpoint`]s.
 pub(crate) trait Endpoints {
-    /// Routes `E::ROUTE` and `E::METHOD` to `h`.
     fn endpoint<E: Endpoint, T>(self, h: impl EndpointHandler<E, T>) -> Self;
 }
 

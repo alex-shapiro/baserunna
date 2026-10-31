@@ -1,4 +1,4 @@
-//! Accounts, sessions, and organizations.
+//! Account, session, and organization types.
 
 use crate::{Empty, Endpoint, NoBody, fill_route, json_body};
 use http::{Method, StatusCode};
@@ -24,7 +24,7 @@ impl Endpoint for SignUp {
     }
 }
 
-/// `POST /v1/auth/login`: starts a session with a password.
+/// `POST /v1/auth/login`: starts a session with an email and password.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LogIn;
 
@@ -71,10 +71,8 @@ pub struct Credentials {
     pub password: String,
 }
 
-/// A new session. The response also sets the session cookie.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
-    /// Bearer token of the session.
     pub token: String,
     pub user: User,
 }
@@ -98,22 +96,21 @@ pub struct Me {
     pub credential: Credential,
 }
 
-/// The credential that authenticated a request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Credential {
     Session,
     ApiKey {
         id: String,
-        /// Database that the key is limited to, if any.
+        /// Database that the key is restricted to, or `None` for all user databases.
         db: Option<String>,
         read_only: bool,
-        /// Requests per second per node, or `None` for the default limit.
+        /// Maximum requests per second per node, or `None` for the default limit.
         rate_limit: Option<u32>,
     },
 }
 
-/// `POST /v1/orgs`: creates an organization owned by the user.
+/// `POST /v1/orgs`: creates an organization owned by the authenticated user.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CreateOrg;
 
@@ -159,7 +156,6 @@ impl Endpoint for AddMember {
 #[derive(Clone, Debug)]
 pub struct RemoveMember {
     pub org: String,
-    /// User ID of the member.
     pub user: String,
 }
 
@@ -185,7 +181,6 @@ pub struct NewOrg {
     pub name: String,
 }
 
-/// An organization and the role of the user in it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Org {
     pub id: String,

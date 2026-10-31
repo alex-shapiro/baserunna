@@ -8,9 +8,7 @@
 # Surviving mutants are listed in mutants.out/missed.txt.
 
 profile = "mutants"
-# Client mutants are caught by the client's unit tests and by the `client` simulation
-# scenario of the server crate. cargo-mutants runs its baseline with the tests of the
-# mutated package only, which has no `sim` target, so test client files with
+# Because `baserunna-client` has no `sim` test target, test client files with
 # `--baseline=skip --timeout=300`.
 test_package = ["baserunna", "baserunna-client"]
 # The cost guard catches mutants that only waste object-store requests.

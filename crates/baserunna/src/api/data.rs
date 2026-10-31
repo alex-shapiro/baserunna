@@ -432,7 +432,6 @@ fn isolation(i: api::Isolation) -> Isolation {
     }
 }
 
-/// Returns the consistency of a request, which defaults to strong.
 fn consistency_from(c: Option<api::Consistency>, max_staleness_ms: Option<u64>) -> Consistency {
     match c {
         None | Some(api::Consistency::Strong) => Consistency::Strong,

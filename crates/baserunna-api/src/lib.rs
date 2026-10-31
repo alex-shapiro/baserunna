@@ -1,13 +1,7 @@
-//! Request and response types of the Baserunna HTTP API.
+//! HTTP API request and response types.
 //!
-//! The server and the `baserunna-client` crate both use these types, so they cannot disagree
-//! about a route, a field name, or a field type. Each [`Endpoint`] names one route together with
-//! the types of its request body and its response body. The server registers a handler for an
-//! endpoint only if the handler reads `E::Body` and returns `E::Response`, and the client sends
-//! `E::Body` and reads `E::Response`.
-//!
-//! Different releases of the server and the client stay compatible if the API changes only by
-//! addition: response types ignore unknown fields, and new request fields must be optional.
+//! If the API changes only by addition, different releases of the server and the client stay
+//! compatible: response types ignore unknown fields, and new request fields must be optional.
 
 #![forbid(unsafe_code)]
 
@@ -23,7 +17,7 @@ pub use account::{
     Role, Session, SignUp, User,
 };
 pub use db::{CreateDb, Db, NewDb};
-pub use error::{ApiError, Details, ErrorBody, ErrorCode, Outcome};
+pub use error::{ApiError, ErrorBody, ErrorCode, ErrorDetails, Outcome};
 pub use kv::{
     BlobMeta, Change, ChangePage, Changes, ChangesQuery, Consistency, DeletedRange, Encoding, GetResult, Isolation, Op,
     OpResult, QueryEvents, ReadBlob, ReadStream, ScanItem, ScanResult, StageBlob, Txn, TxnRequest, TxnResponse,
@@ -34,40 +28,32 @@ use bytes::Bytes;
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
-/// An HTTP route of the API and the types that it exchanges.
-///
-/// A value of the type holds the path parameters and the query parameters of one request.
+/// An HTTP route and its request and response types.
 pub trait Endpoint {
     const METHOD: Method;
     /// Route in axum syntax, with a `{name}` segment for each path parameter.
     const ROUTE: &'static str;
-    /// Status of a successful response.
     const STATUS: StatusCode;
     type Body: Body;
-    /// Body of a successful response.
     type Response: Body;
 
-    /// Checks whether sending the request with `body` again after it succeeds has no effect.
+    /// Returns true if repeating a successful request has no effect.
     fn is_idempotent(body: &Self::Body) -> bool;
 
-    /// Returns the path and the query string of the request.
     fn path(&self) -> String;
 }
 
-/// Content of a request or response body.
+/// Request or response body encoding.
 pub trait Body: Sized {
-    /// `Content-Type` of the body, or `None` if the message has no body.
+    /// `Content-Type` header value, or `None` if the body is empty.
     const CONTENT_TYPE: Option<&'static str>;
 
     fn encode(&self) -> Bytes;
 
-    /// Decodes a body, or returns a description of why it does not match the type.
     fn decode(b: Bytes) -> Result<Self, String>;
 }
 
-/// The body of a message without content.
-///
-/// The server reads an empty request body as `{}`, which decodes as `NoBody`.
+/// Empty request or response body.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoBody {}
 
@@ -83,7 +69,7 @@ impl Body for NoBody {
     }
 }
 
-/// An `application/octet-stream` body.
+/// Binary `application/octet-stream` body.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Octets(pub Bytes);
 
@@ -99,7 +85,7 @@ impl Body for Octets {
     }
 }
 
-/// The `{}` response of a request that returns no data.
+/// Empty `{}` JSON response body.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Empty {}
 
@@ -123,9 +109,10 @@ pub(crate) use json_body;
 
 json_body!(Empty, ErrorBody);
 
-/// Fills each `{name}` segment of `route` with the next element of `params`, percent-encoded.
+/// Replaces each `{name}` segment in `route` with the corresponding percent-encoded value from
+/// `params`.
 ///
-/// Panics if the number of parameters differs from the number of `{name}` segments.
+/// Panics if `params.len()` does not equal the number of `{name}` segments.
 pub fn fill_route(route: &str, params: &[&str]) -> String {
     let mut out = String::with_capacity(route.len() + params.iter().map(|p| p.len()).sum::<usize>());
     let mut params = params.iter();
@@ -144,7 +131,7 @@ pub fn fill_route(route: &str, params: &[&str]) -> String {
     out
 }
 
-/// Appends `s` to `out`, percent-encoding every byte except RFC 3986 unreserved characters.
+/// Appends `s` to `out`, percent-encoding all bytes except RFC 3986 unreserved characters.
 pub fn percent_encode(s: &str, out: &mut String) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for b in s.bytes() {
@@ -158,7 +145,6 @@ pub fn percent_encode(s: &str, out: &mut String) {
     }
 }
 
-/// Returns `path` with the query string of `query` appended, if it has any parameters.
 pub(crate) fn with_query<Q: Serialize>(mut path: String, query: &Q) -> String {
     let q = serde_urlencoded::to_string(query).expect("API query types serialize");
     if !q.is_empty() {

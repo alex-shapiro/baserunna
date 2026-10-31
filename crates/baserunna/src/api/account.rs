@@ -56,7 +56,6 @@ fn with_cookie(mut r: Response, c: HeaderValue) -> Response {
     r
 }
 
-/// Returns a new session as the response of endpoint `E`, with its session cookie.
 fn session_reply<E: Endpoint<Response = api::Session>>(node: &Node, token: String, user: &meta::User) -> Reply<E> {
     let cookie = session_cookie(node, &token, node.cfg.session_ttl_ms / 1000);
     Reply::new(api::Session { token, user: user.public() }).header(http::header::SET_COOKIE, cookie)

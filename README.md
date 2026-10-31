@@ -18,9 +18,9 @@ Full design details are in [`SPEC.md`](SPEC.md).
 
 The repository is a Cargo workspace:
 
-- `crates/baserunna`: the server.
-- `crates/baserunna-api`: the request and response types of the HTTP API, which the server and the client share.
-- `crates/baserunna-client`: a typed Rust client that retries requests that are safe to send again.
+- `crates/baserunna`: server
+- `crates/baserunna-api`: HTTP API request and response types
+- `crates/baserunna-client`: typed HTTP client with retries
 
 ## Quick start
 

@@ -1,6 +1,6 @@
 [package]
 name = "baserunna-api"
-description = "Request and response types of the Baserunna HTTP API, shared by the server and its clients"
+description = "HTTP API request and response types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,7 +1,7 @@
 #![no_main]
-//! The client never panics on a response, whatever its status, headers, and body.
+//! Verifies that `baserunna-client` does not panic on arbitrary HTTP responses.
 use baserunna_client::{
-    BoxFuture, ChangesRequest, Client, Expect, KeyRange, Op, Retry, Transport, TransportError,
+    BoxFuture, ChangesRequest, Client, Expect, KeyRange, Op, RetryPolicy, Transport, TransportError,
 };
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
@@ -28,7 +28,7 @@ fuzz_target!(|data: &[u8]| {
         resp = resp.header("content-length", body.len().to_string());
     }
     let resp = resp.body(Bytes::copy_from_slice(body)).unwrap();
-    let client = Client::new(Fixed(resp)).with_retry(Retry { attempts: 1, ..Retry::default() });
+    let client = Client::new(Fixed(resp)).with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() });
     let db = client.db("d");
     let ops = [
         Op::Get { key: Bytes::from_static(b"a") },

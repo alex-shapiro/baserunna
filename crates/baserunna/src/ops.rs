@@ -18,15 +18,14 @@ pub const MAX_TTL_MS: u64 = 10 * 365 * 24 * 3_600_000;
 
 pub use baserunna_api::Encoding;
 
-/// Conversions between bytes and their JSON text in an [`Encoding`].
 pub trait EncodingExt {
     fn decode(&self, s: &str, what: &str) -> Result<Vec<u8>>;
 
     /// Encodes `b` as JSON, returning `Json::Null` for non-UTF-8 bytes in `Utf8` mode.
     fn encode(&self, b: &[u8]) -> Json;
 
-    /// Returns the text of `b` for a field and for its `_b64` fallback field: exactly one is
-    /// set.
+    /// Encodes `b` into `(field, field_b64)`, setting only the second element if `b` cannot be
+    /// represented in `self`.
     fn text(&self, b: &[u8]) -> (Option<String>, Option<String>);
 }
 
@@ -56,7 +55,6 @@ impl EncodingExt for Encoding {
     }
 }
 
-/// A validated transaction operation, parsed from an [`api::Op`].
 #[derive(Debug, Clone)]
 pub enum Op {
     Get {
@@ -191,14 +189,12 @@ pub struct EventsQuery {
     pub query: crate::events::query::Query,
 }
 
-/// A `read_stream` op: a stream and a [`ReadSpec`] beside it.
 #[derive(Debug, Clone)]
 pub struct StreamRead {
     pub stream: String,
     pub spec: ReadSpec,
 }
 
-/// Parses `v` as part of an operation, reporting errors as an invalid request body.
 fn parse<T: serde::de::DeserializeOwned>(v: Json) -> Result<T> {
     serde_json::from_value(v).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))
 }
@@ -260,7 +256,6 @@ impl TryFrom<api::Op> for Op {
     }
 }
 
-/// Parses the operations of a request.
 pub fn parse_ops(ops: Vec<api::Op>) -> Result<Vec<Op>> {
     ops.into_iter().map(Op::try_from).collect()
 }
@@ -359,15 +354,14 @@ pub fn user_range(enc: Encoding, prefix: Option<&str>, start: Option<&str>, end:
     Ok(KeyRange::new(s, e))
 }
 
-/// Value fields of a key in a response: the value text, its `_b64` fallback, and the blob
-/// metadata. Blob content is included if it does not exceed `json_value_max`.
 pub struct ValueFields {
     pub value: Option<String>,
     pub value_b64: Option<String>,
     pub blob: Option<api::BlobMeta>,
 }
 
-/// Returns the response fields of `v`, omitting inline data if `keys_only` is set.
+/// Encodes `v` for a response, omitting inline values and blob data if `keys_only` is true or if a
+/// blob exceeds `json_value_max`.
 pub async fn value_fields(ctx: &OpCtx<'_>, v: &Value, keys_only: bool) -> Result<ValueFields> {
     let mut out = ValueFields { value: None, value_b64: None, blob: None };
     let data = match v {

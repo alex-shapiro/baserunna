@@ -2,7 +2,6 @@ use super::*;
 use crate::api::{ErrorCode, Outcome};
 use std::sync::Mutex;
 
-/// Transport that returns scripted responses in order and records the requests.
 #[derive(Default)]
 struct Script {
     responses: Mutex<Vec<Result<http::Response<Bytes>, TransportError>>>,
@@ -48,7 +47,7 @@ fn put() -> Vec<Op> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn requests_carry_the_route_method_token_and_body_of_their_endpoint() {
+async fn requests_include_endpoint_route_method_token_and_body() {
     let ok = r#"{"version":3,"committed":true,"commit_id":"00000000000000aa","results":[{}],"appends":[]}"#;
     let (c, s) = script(vec![resp(200, &[], ok)]);
     let out = c.db("team.tools").txn(&put(), Some("key-1")).await.unwrap();
@@ -66,7 +65,7 @@ async fn requests_carry_the_route_method_token_and_body_of_their_endpoint() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn requests_without_a_body_send_no_content_type() {
+async fn empty_request_bodies_omit_content_type() {
     let limits = r#"{"txn_max_ops":1,"txn_max_write_bytes":1,"txn_max_read_bytes":1,"txn_max_open_per_user":1,"value_inline_max":1,"scan_limit_max":1,"long_poll_max_ms":1,"json_value_max":1,"json_body_max":1,"blob_max":1,"blob_stage_ttl_ms":1,"added_later":true}"#;
     let (c, s) = script(vec![resp(200, &[], limits)]);
     assert_eq!(c.limits().await.unwrap().txn_max_ops, 1, "unknown fields are ignored");
@@ -156,7 +155,7 @@ async fn results_are_decoded_by_the_type_of_their_operation() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_replayed_transaction_has_no_results() {
+async fn replayed_transactions_omit_results() {
     let body =
         r#"{"version":4,"committed":true,"replayed":true,"commit_id":"0000000000000001","results":null,"appends":[]}"#;
     let (c, _) = script(vec![resp(200, &[], body)]);
@@ -181,7 +180,7 @@ async fn responses_that_do_not_match_their_operations_are_malformed() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn api_errors_carry_their_code_details_and_outcome() {
+async fn api_errors_preserve_code_details_and_outcome() {
     let cases = [
         (412, "precondition_failed", r#"{"op_index":2}"#, Outcome::NotApplied, 1),
         (503, "unavailable", r#"{"outcome":"unknown"}"#, Outcome::Unknown, 4),
@@ -297,7 +296,6 @@ async fn the_first_success_ends_the_retries() {
     );
 }
 
-/// SplitMix64 generator for property tests.
 struct Rng(u64);
 
 impl Rng {
@@ -314,7 +312,6 @@ impl Rng {
     }
 }
 
-/// Mutates `b` by replacing, inserting, or deleting bytes.
 fn mutate(r: &mut Rng, mut b: Vec<u8>) -> Vec<u8> {
     const BYTES: &[u8] = b"{}[]\":,0a-=n";
     for _ in 0..1 + r.below(4) {

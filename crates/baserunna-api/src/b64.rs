@@ -31,7 +31,7 @@ fn encode_with(data: &[u8], alpha: &[u8; 64], pad: bool) -> String {
     String::from_utf8(out).expect("base64 is ASCII")
 }
 
-/// Maps each byte to its 6-bit value in an alphabet, or to `INVALID`.
+/// Maps each byte to its 6-bit value in `alpha`, or to `INVALID`.
 const fn table(alpha: &[u8; 64]) -> [u8; 256] {
     let mut t = [INVALID; 256];
     let mut i = 0;
@@ -68,7 +68,7 @@ fn decode_with(s: &str, url: bool) -> Option<Vec<u8>> {
     let (chunks, rest) = trimmed.as_chunks::<4>();
     for c in chunks {
         let (a, b, c, d) = (table[c[0] as usize], table[c[1] as usize], table[c[2] as usize], table[c[3] as usize]);
-        // Values are below 64, so the union is `INVALID` only if a byte is invalid.
+        // Valid values are below 64, so `a | b | c | d` equals `INVALID` (0xff) if and only if at least one byte is invalid.
         if (a | b | c | d) == INVALID {
             return None;
         }
@@ -85,7 +85,7 @@ fn decode_with(s: &str, url: bool) -> Option<Vec<u8>> {
             n |= u32::from(v) << (18 - 6 * i);
         }
         out.push((n >> 16) as u8);
-        // Non-canonical encodings set bits after the last byte.
+        // Reject non-canonical encodings that set trailing bits past the last output byte.
         if rest.len() == 2 && n & 0xFFFF != 0 {
             return None;
         }
@@ -148,7 +148,6 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// SplitMix64 generator for property tests.
     struct Rng(u64);
 
     impl Rng {

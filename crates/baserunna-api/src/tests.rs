@@ -2,7 +2,6 @@ use super::*;
 use serde_json::{Value as Json, json};
 use tower::ServiceExt;
 
-/// SplitMix64 generator for property tests.
 struct Rng(u64);
 
 impl Rng {
@@ -28,7 +27,6 @@ impl Rng {
     }
 }
 
-/// Route, number of path parameters, and the path of a request with given parameters.
 type Route = (&'static str, usize, Box<dyn Fn(&[String]) -> String>);
 
 fn routes() -> Vec<Route> {

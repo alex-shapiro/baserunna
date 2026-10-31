@@ -2,25 +2,24 @@ use crate::TransportError;
 use baserunna_api::{ApiError, ErrorCode, Outcome};
 use std::fmt;
 
-/// A request that failed after all attempts.
+/// Request failure after all retry attempts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The server returned an error response.
     Api {
         status: u16,
         error: ApiError,
-        /// Time to wait before the next request, from `details.retry_after_ms` or the
-        /// `Retry-After` header.
+        /// Delay before the next request, from `details.retry_after_ms` or the `Retry-After`
+        /// header.
         retry_after_ms: Option<u64>,
     },
-    /// A response that the API did not produce, such as an error page of a proxy or a
-    /// captive portal.
+    /// Non-API HTTP response, such as a proxy error page or captive portal.
     Foreign {
         status: u16,
         retry_after_ms: Option<u64>,
         path: String,
     },
-    /// A JSON response with a success status whose body does not match the API.
+    /// JSON response with a 2xx status whose body does not match the expected schema.
     Malformed {
         path: String,
         reason: String,
@@ -29,7 +28,6 @@ pub enum Error {
 }
 
 impl Error {
-    /// Returns the error code of an [`Error::Api`].
     pub fn code(&self) -> Option<ErrorCode> {
         match self {
             Error::Api { error, .. } => Some(error.code),
@@ -37,7 +35,7 @@ impl Error {
         }
     }
 
-    /// Checks whether the failed request may have been applied.
+    /// Returns whether the failed request might have been applied.
     pub fn outcome(&self) -> Outcome {
         let unknown = match self {
             Error::Api { error, .. } => match error.code {
@@ -59,8 +57,9 @@ impl Error {
         }
     }
 
-    /// Checks whether the same request can succeed later. An idempotent request can be sent
-    /// again after a failure with an unknown outcome.
+    /// Returns true if repeating the request later can succeed.
+    ///
+    /// If `idempotent` is false, errors with [`Outcome::Unknown`] return false.
     pub fn is_transient(&self, idempotent: bool) -> bool {
         let may_repeat = idempotent || self.outcome() == Outcome::NotApplied;
         match self {

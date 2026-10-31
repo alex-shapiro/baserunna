@@ -1,5 +1,3 @@
-//! Databases.
-
 use crate::{Endpoint, json_body};
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -28,7 +26,7 @@ impl Endpoint for CreateDb {
 #[serde(deny_unknown_fields)]
 pub struct NewDb {
     pub name: String,
-    /// Organization that owns the database, or `None` for a personal database.
+    /// Owning organization, or `None` for a personal database.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org: Option<String>,
 }
@@ -37,7 +35,7 @@ pub struct NewDb {
 pub struct Db {
     pub id: String,
     pub name: String,
-    /// Organization that owns the database, or `None` for a personal database.
+    /// Owning organization, or `None` for a personal database.
     pub org: Option<String>,
     pub created_at: i64,
 }

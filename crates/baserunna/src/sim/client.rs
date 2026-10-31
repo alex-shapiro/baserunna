@@ -416,7 +416,6 @@ impl Client {
     }
 }
 
-/// Sends the requests of a [`baserunna_client::Client`] through the simulated network.
 impl baserunna_client::Transport for Client {
     fn send(
         &self,

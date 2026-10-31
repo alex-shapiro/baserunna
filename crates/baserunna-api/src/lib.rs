@@ -43,11 +43,12 @@ pub trait Endpoint {
     const ROUTE: &'static str;
     /// Status of a successful response.
     const STATUS: StatusCode;
-    /// Whether a repeated request has no effect after the first one succeeds.
-    const IDEMPOTENT: bool;
     type Body: Body;
     /// Body of a successful response.
     type Response: Body;
+
+    /// Checks whether sending the request with `body` again after it succeeds has no effect.
+    fn is_idempotent(body: &Self::Body) -> bool;
 
     /// Returns the path and the query string of the request.
     fn path(&self) -> String;

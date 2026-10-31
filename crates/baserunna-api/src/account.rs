@@ -12,9 +12,12 @@ impl Endpoint for SignUp {
     const METHOD: Method = Method::POST;
     const ROUTE: &'static str = "/v1/auth/signup";
     const STATUS: StatusCode = StatusCode::CREATED;
-    const IDEMPOTENT: bool = false;
     type Body = Credentials;
     type Response = Session;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        false
+    }
 
     fn path(&self) -> String {
         Self::ROUTE.into()
@@ -29,9 +32,12 @@ impl Endpoint for LogIn {
     const METHOD: Method = Method::POST;
     const ROUTE: &'static str = "/v1/auth/login";
     const STATUS: StatusCode = StatusCode::OK;
-    const IDEMPOTENT: bool = false;
     type Body = Credentials;
     type Response = Session;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        false
+    }
 
     fn path(&self) -> String {
         Self::ROUTE.into()
@@ -46,9 +52,12 @@ impl Endpoint for GetMe {
     const METHOD: Method = Method::GET;
     const ROUTE: &'static str = "/v1/me";
     const STATUS: StatusCode = StatusCode::OK;
-    const IDEMPOTENT: bool = true;
     type Body = NoBody;
     type Response = Me;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        true
+    }
 
     fn path(&self) -> String {
         Self::ROUTE.into()
@@ -112,9 +121,12 @@ impl Endpoint for CreateOrg {
     const METHOD: Method = Method::POST;
     const ROUTE: &'static str = "/v1/orgs";
     const STATUS: StatusCode = StatusCode::CREATED;
-    const IDEMPOTENT: bool = false;
     type Body = NewOrg;
     type Response = Org;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        false
+    }
 
     fn path(&self) -> String {
         Self::ROUTE.into()
@@ -131,9 +143,12 @@ impl Endpoint for AddMember {
     const METHOD: Method = Method::POST;
     const ROUTE: &'static str = "/v1/orgs/{org}/members";
     const STATUS: StatusCode = StatusCode::CREATED;
-    const IDEMPOTENT: bool = false;
     type Body = NewMember;
     type Response = Member;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        false
+    }
 
     fn path(&self) -> String {
         fill_route(Self::ROUTE, &[&self.org])
@@ -152,9 +167,12 @@ impl Endpoint for RemoveMember {
     const METHOD: Method = Method::DELETE;
     const ROUTE: &'static str = "/v1/orgs/{org}/members/{user}";
     const STATUS: StatusCode = StatusCode::OK;
-    const IDEMPOTENT: bool = false;
     type Body = NoBody;
     type Response = Empty;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        false
+    }
 
     fn path(&self) -> String {
         fill_route(Self::ROUTE, &[&self.org, &self.user])

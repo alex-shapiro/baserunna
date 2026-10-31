@@ -21,11 +21,13 @@ impl Endpoint for Txn {
     const METHOD: Method = Method::POST;
     const ROUTE: &'static str = "/v1/dbs/{db}/txn";
     const STATUS: StatusCode = StatusCode::OK;
-    /// A transaction is idempotent if it only reads or if it has an idempotency key; see
-    /// [`TxnRequest::is_idempotent`].
-    const IDEMPOTENT: bool = false;
     type Body = TxnRequest;
     type Response = TxnResponse;
+
+    /// A transaction is idempotent if it only reads or if it has an idempotency key.
+    fn is_idempotent(body: &TxnRequest) -> bool {
+        body.is_idempotent()
+    }
 
     fn path(&self) -> String {
         fill_route(Self::ROUTE, &[&self.db])
@@ -43,9 +45,12 @@ impl Endpoint for Changes {
     const METHOD: Method = Method::GET;
     const ROUTE: &'static str = "/v1/dbs/{db}/changes";
     const STATUS: StatusCode = StatusCode::OK;
-    const IDEMPOTENT: bool = true;
     type Body = NoBody;
     type Response = ChangePage;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        true
+    }
 
     fn path(&self) -> String {
         with_query(fill_route(Self::ROUTE, &[&self.db]), &self.query)
@@ -65,9 +70,12 @@ impl Endpoint for StageBlob {
     const METHOD: Method = Method::POST;
     const ROUTE: &'static str = "/v1/dbs/{db}/blobs";
     const STATUS: StatusCode = StatusCode::CREATED;
-    const IDEMPOTENT: bool = true;
     type Body = Octets;
     type Response = BlobMeta;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        true
+    }
 
     fn path(&self) -> String {
         fill_route(Self::ROUTE, &[&self.db])
@@ -85,9 +93,12 @@ impl Endpoint for ReadBlob {
     const METHOD: Method = Method::GET;
     const ROUTE: &'static str = "/v1/dbs/{db}/blobs/{blob_id}";
     const STATUS: StatusCode = StatusCode::OK;
-    const IDEMPOTENT: bool = true;
     type Body = NoBody;
     type Response = Octets;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        true
+    }
 
     fn path(&self) -> String {
         fill_route(Self::ROUTE, &[&self.db, &self.blob_id])

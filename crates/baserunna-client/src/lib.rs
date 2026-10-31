@@ -93,37 +93,29 @@ impl Client {
         self.retry_policy
     }
 
-    /// Sends a request to endpoint `E` and retries transient failures if `E` is idempotent.
-    pub async fn send<E: Endpoint>(&self, endpoint: &E, body: &E::Body) -> Result<E::Response, Error> {
-        self.send_with(endpoint, body, E::IDEMPOTENT).await
-    }
-
-    /// Sends a request to endpoint `E`, where `idempotent` tells whether the request can be sent
-    /// again after a failure with an unknown outcome.
+    /// Sends a request to endpoint `E`, retrying transient failures that did not apply it, and
+    /// any transient failure if the request is idempotent ([`Endpoint::is_idempotent`]).
     ///
     /// If the last attempt fails without applying the request, but an earlier attempt failed
     /// with an unknown outcome, the error of the earlier attempt is returned, because that
     /// attempt may have been applied. A `precondition_failed` or `aborted` error is returned as
     /// is, because the server resolves the earlier attempts of an idempotency key before it
     /// returns one.
-    pub async fn send_with<E: Endpoint>(
-        &self,
-        endpoint: &E,
-        body: &E::Body,
-        idempotent: bool,
-    ) -> Result<E::Response, Error> {
-        let r = self.send_accepting(endpoint, body, idempotent, |_| false).await?;
-        Ok(r.expect("no error is accepted"))
+    pub async fn send<E: Endpoint>(&self, endpoint: &E, body: &E::Body) -> Result<E::Response, Error> {
+        let r = self.send_allowing(endpoint, body, None).await?;
+        Ok(r.expect("no error is allowed"))
     }
 
-    /// Like [`Client::send_with`], but returns `Ok(None)` for an error that `accept` accepts.
-    async fn send_accepting<E: Endpoint>(
+    /// Like [`Client::send`], but returns `Ok(None)` if the server answers with `allowed_error`,
+    /// which means that the goal of the request is already reached. A request with an allowed
+    /// error is idempotent, because a repeated request can only succeed or fail with that error.
+    async fn send_allowing<E: Endpoint>(
         &self,
         endpoint: &E,
         body: &E::Body,
-        idempotent: bool,
-        accept: impl Fn(&Error) -> bool,
+        allowed_error: Option<api::ErrorCode>,
     ) -> Result<Option<E::Response>, Error> {
+        let idempotent = E::is_idempotent(body) || allowed_error.is_some();
         let path = endpoint.path();
         let body = body.encode();
         let mut backoff = self.retry_policy.initial_backoff_ms;
@@ -134,7 +126,7 @@ impl Client {
         loop {
             let err = match self.attempt::<E>(&path, &body).await {
                 Ok(r) => return Ok(Some(r)),
-                Err(e) if accept(&e) => return Ok(None),
+                Err(e) if allowed_error.is_some() && e.code() == allowed_error => return Ok(None),
                 Err(e) => e,
             };
             let transient = err.is_transient(idempotent);
@@ -201,8 +193,7 @@ impl Client {
     /// repeated request has no further effect.
     pub async fn ensure_db(&self, name: &str, org: Option<&str>) -> Result<(), Error> {
         let b = api::NewDb { name: name.into(), org: org.map(Into::into) };
-        let exists = |e: &Error| e.code() == Some(api::ErrorCode::AlreadyExists);
-        self.send_accepting(&api::CreateDb, &b, true, exists).await.map(drop)
+        self.send_allowing(&api::CreateDb, &b, Some(api::ErrorCode::AlreadyExists)).await.map(drop)
     }
 
     pub async fn create_org(&self, name: &str) -> Result<api::Org, Error> {
@@ -291,7 +282,7 @@ impl Db {
         };
         let e = api::Txn { db: self.name.clone() };
         let path = e.path();
-        let resp = self.client.send_with(&e, &req, req.is_idempotent()).await?;
+        let resp = self.client.send(&e, &req).await?;
         TxnOutcome::decode(ops, resp).map_err(|reason| Error::Malformed { path, reason })
     }
 

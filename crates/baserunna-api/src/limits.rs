@@ -10,9 +10,12 @@ impl Endpoint for GetLimits {
     const METHOD: Method = Method::GET;
     const ROUTE: &'static str = "/v1/limits";
     const STATUS: StatusCode = StatusCode::OK;
-    const IDEMPOTENT: bool = true;
     type Body = NoBody;
     type Response = Limits;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        true
+    }
 
     fn path(&self) -> String {
         Self::ROUTE.into()

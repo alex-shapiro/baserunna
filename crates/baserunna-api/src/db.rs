@@ -12,9 +12,12 @@ impl Endpoint for CreateDb {
     const METHOD: Method = Method::POST;
     const ROUTE: &'static str = "/v1/dbs";
     const STATUS: StatusCode = StatusCode::CREATED;
-    const IDEMPOTENT: bool = false;
     type Body = NewDb;
     type Response = Db;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        false
+    }
 
     fn path(&self) -> String {
         Self::ROUTE.into()

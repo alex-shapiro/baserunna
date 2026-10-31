@@ -2,43 +2,47 @@
 # kills mutated tests that allocate without bound:
 #
 #   scripts/mutants.sh                          # everything below (hours)
-#   scripts/mutants.sh -F 'src/engine/txn.rs'   # a subset
+#   scripts/mutants.sh -F 'crates/baserunna/src/engine/txn.rs'   # a subset
 #   git diff main > /tmp/d && scripts/mutants.sh --in-diff /tmp/d   # changed lines only
 #
 # Surviving mutants are listed in mutants.out/missed.txt.
 
 profile = "mutants"
+# Because `baserunna-client` has no `sim` test target, test client files with
+# `--baseline=skip --timeout=300`.
+test_package = ["baserunna", "baserunna-client"]
 # The cost guard catches mutants that only waste object-store requests.
 # Building only these targets (not every test and example) keeps each
 # mutant's rebuild short.
 additional_cargo_args = ["--lib", "--test", "sim", "--test", "fuzz", "--test", "cost"]
 minimum_test_timeout = 60
 exclude_globs = [
-    "src/engine/tests.rs",
-    "src/table/tests.rs",
+    "crates/baserunna/src/engine/tests.rs",
+    "crates/baserunna/src/table/tests.rs",
     # Struct-field deletions ignore `examine_re`, so files that are mostly
     # configuration literals are excluded whole.
-    "src/api/**",
-    "src/store/**",
-    "src/main.rs",
-    "src/meta/mod.rs",
-    "src/meta/tests.rs",
-    "src/client.rs",
-    "src/engine/config.rs",
-    "src/sim/mod.rs",
-    "src/sim/cost.rs",
-    "src/sim/store.rs",
-    "src/sim/google.rs",
+    "crates/baserunna/src/api/**",
+    "crates/baserunna/src/store/**",
+    "crates/baserunna/src/main.rs",
+    "crates/baserunna/src/meta/mod.rs",
+    "crates/baserunna/src/meta/tests.rs",
+    "crates/baserunna/src/client.rs",
+    "crates/baserunna/src/engine/config.rs",
+    "crates/baserunna/src/sim/mod.rs",
+    "crates/baserunna/src/sim/cost.rs",
+    "crates/baserunna/src/sim/store.rs",
+    "crates/baserunna/src/sim/google.rs",
 ]
 # The storage engine, tables, ops and organization rules entirely; of the
 # simulator, only the checkers (a weakened checker must be caught by its
 # self-tests).
 examine_re = [
-    '^src/(engine|table)/',
-    '^src/ops\.rs',
-    '^src/meta/org\.rs',
-    '^src/sim/storage_check\.rs',
-    '^src/sim/workloads/\w+\.rs:.* in (check|audit|check_body|check_value|check_version|check_read|check_locks|explained|TxnSim::\w+|check_attempts|History::some_role)$',
+    '^crates/baserunna-client/src/(lib|error|kv)\.rs',
+    '^crates/baserunna/src/(engine|table)/',
+    '^crates/baserunna/src/ops\.rs',
+    '^crates/baserunna/src/meta/org\.rs',
+    '^crates/baserunna/src/sim/storage_check\.rs',
+    '^crates/baserunna/src/sim/workloads/\w+\.rs:.* in (check|audit|check_body|check_value|check_version|check_read|check_locks|explained|TxnSim::\w+|check_attempts|History::some_role)$',
 ]
 exclude_re = [
     # Diagnostics: tracing and formatting cannot change results.

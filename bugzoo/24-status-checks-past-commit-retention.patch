@@ -1,7 +1,7 @@
-diff --git a/src/api/data.rs b/src/api/data.rs
+diff --git a/crates/baserunna/src/api/data.rs b/crates/baserunna/src/api/data.rs
 index 6f92d1e..8638957 100644
---- a/src/api/data.rs
-+++ b/src/api/data.rs
+--- a/crates/baserunna/src/api/data.rs
++++ b/crates/baserunna/src/api/data.rs
 @@ -688,7 +688,7 @@ async fn commit_status(State(node): State<Arc<Node>>, Extension(ctx): Extension<
          None => json!({
              "status": "not_committed",

@@ -80,7 +80,7 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 - [ ] **Decode rows directly into column vectors during part builds.** Seals and
       bulk inserts decode each row into a `BTreeMap` before transposing columns,
       causing a 32 MiB bulk insert of small events to peak at roughly 11x the
-      request body size (`tests/memory_bound.rs`).
+      request body size (`crates/baserunna/tests/memory_bound.rs`).
 - [ ] **Read masked merge inputs in a single pass.** Before merging a part that
       has deletions, `maint::census` reads its string and JSON columns to plan
       output dictionaries and paths, and the merge then fetches the same blocks
@@ -230,9 +230,15 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       read-ahead for cold sequential reads, per-block field summaries for
       filter pruning, small-chunk compaction, and background retention trimming
       for idle databases.
+- [ ] **Generate `openapi.json` from the API types.** Move all route request and
+      response types into `baserunna-api`, derive JSON Schema for them, and
+      generate `openapi.json` from the `Endpoint` definitions instead of
+      maintaining `api/openapi.rs` by hand.
+- [ ] **Replace `baserunna::client` with `baserunna-client`.** Add table,
+      stream, and event-table methods to `baserunna-client`, migrate the
+      examples, and delete `crates/baserunna/src/client.rs`.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
-      `openapi.json`, and publish the Rust `client` module as a standalone
-      crate.
+      `openapi.json`.
 - [ ] **Validate additional S3-compatible object stores.** Run the conformance
       suite and failover check against AWS S3, Cloudflare R2, MinIO, Azure Blob
       Storage, and Google Cloud Storage.
@@ -253,6 +259,8 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 
 ## Testing
 
+- [ ] **Regenerate stale bug zoo patches.** Update patches 09, 11, 16, and 18 so
+      they apply to the current tree.
 - [ ] **Verify event merge liveness and part-internal invariants in
       simulation.** Check in the `events` workload that part counts remain
       bounded and completed partitions settle into a single part, and verify

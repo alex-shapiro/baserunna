@@ -1,7 +1,7 @@
-diff --git a/src/api/data.rs b/src/api/data.rs
+diff --git a/crates/baserunna/src/api/data.rs b/crates/baserunna/src/api/data.rs
 index 6f92d1e..8162def 100644
---- a/src/api/data.rs
-+++ b/src/api/data.rs
+--- a/crates/baserunna/src/api/data.rs
++++ b/crates/baserunna/src/api/data.rs
 @@ -156,9 +156,8 @@ pub async fn create_db(
          Err(Error::AlreadyExists(m)) => {
              // If a prior deletion stopped after marking the manifest deleted, finish it and retry.

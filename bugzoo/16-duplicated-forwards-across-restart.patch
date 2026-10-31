@@ -1,7 +1,7 @@
-diff --git a/src/api/mod.rs b/src/api/mod.rs
+diff --git a/crates/baserunna/src/api/mod.rs b/crates/baserunna/src/api/mod.rs
 index 0b6bed6..1bd5668 100644
---- a/src/api/mod.rs
-+++ b/src/api/mod.rs
+--- a/crates/baserunna/src/api/mod.rs
++++ b/crates/baserunna/src/api/mod.rs
 @@ -479,15 +479,6 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
      if req.method() == http::Method::GET || req.method() == http::Method::HEAD {
          return next.run(req).await;

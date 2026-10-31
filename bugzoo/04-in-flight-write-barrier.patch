@@ -1,7 +1,7 @@
-diff --git a/src/engine/db.rs b/src/engine/db.rs
+diff --git a/crates/baserunna/src/engine/db.rs b/crates/baserunna/src/engine/db.rs
 index 3a4eb24..396ad48 100644
---- a/src/engine/db.rs
-+++ b/src/engine/db.rs
+--- a/crates/baserunna/src/engine/db.rs
++++ b/crates/baserunna/src/engine/db.rs
 @@ -525,9 +525,6 @@ impl Db {
      /// Returns a snapshot satisfying `c` paired with the store time at which
      /// that version was current.

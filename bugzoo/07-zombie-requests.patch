@@ -1,7 +1,7 @@
-diff --git a/src/engine/db.rs b/src/engine/db.rs
+diff --git a/crates/baserunna/src/engine/db.rs b/crates/baserunna/src/engine/db.rs
 index 0e2dd5a..765bab8 100644
---- a/src/engine/db.rs
-+++ b/src/engine/db.rs
+--- a/crates/baserunna/src/engine/db.rs
++++ b/crates/baserunna/src/engine/db.rs
 @@ -1201,15 +1201,6 @@ impl Db {
                          outcomes.push(Outcome::Seq(Ok(c)));
                          continue;

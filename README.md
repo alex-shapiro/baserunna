@@ -16,6 +16,12 @@ The key non-feature is _low latency_. Uncached reads and writes take 10s of ms a
 
 Full design details are in [`SPEC.md`](SPEC.md).
 
+The repository is a Cargo workspace:
+
+- `crates/baserunna`: server
+- `crates/baserunna-api`: HTTP API request and response types
+- `crates/baserunna-client`: typed HTTP client with retries
+
 ## Quick start
 
 Run a single node locally and open the web console:

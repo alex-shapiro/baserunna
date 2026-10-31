@@ -1,7 +1,7 @@
-diff --git a/src/api/mod.rs b/src/api/mod.rs
+diff --git a/crates/baserunna/src/api/mod.rs b/crates/baserunna/src/api/mod.rs
 index 0b6bed6..aabbc48 100644
---- a/src/api/mod.rs
-+++ b/src/api/mod.rs
+--- a/crates/baserunna/src/api/mod.rs
++++ b/crates/baserunna/src/api/mod.rs
 @@ -369,8 +369,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                      // Finish any interrupted deletion where the manifest was marked deleted before metadata removal.
                      probe::hit(Probe::DeletionRepaired);

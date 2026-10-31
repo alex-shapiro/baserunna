@@ -4,6 +4,7 @@ use bytes::Bytes;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -13,6 +14,12 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// server address. Tests implement this trait to route requests through a simulated network.
 pub trait Transport: Send + Sync {
     fn send(&self, req: http::Request<Bytes>) -> BoxFuture<'_, Result<http::Response<Bytes>, TransportError>>;
+}
+
+impl<T: Transport + ?Sized> Transport for Arc<T> {
+    fn send(&self, req: http::Request<Bytes>) -> BoxFuture<'_, Result<http::Response<Bytes>, TransportError>> {
+        (**self).send(req)
+    }
 }
 
 /// A request that did not receive a complete response.

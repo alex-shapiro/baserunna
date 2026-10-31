@@ -35,7 +35,7 @@ use std::time::Duration;
 
 /// When and how often the client sends a failed request again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Retry {
+pub struct RetryPolicy {
     /// Maximum number of attempts per request (at least 1).
     pub attempts: u32,
     /// Pause before the second attempt. Each later pause is 3 times longer, up to
@@ -46,9 +46,9 @@ pub struct Retry {
     pub max_retry_after_ms: u64,
 }
 
-impl Default for Retry {
-    fn default() -> Retry {
-        Retry { attempts: 4, initial_backoff_ms: 100, max_backoff_ms: 2_000, max_retry_after_ms: 10_000 }
+impl Default for RetryPolicy {
+    fn default() -> RetryPolicy {
+        RetryPolicy { attempts: 4, initial_backoff_ms: 100, max_backoff_ms: 2_000, max_retry_after_ms: 10_000 }
     }
 }
 
@@ -57,25 +57,23 @@ impl Default for Retry {
 pub struct Client {
     transport: Arc<dyn Transport>,
     token: Option<Arc<str>>,
-    retry: Retry,
+    retry_policy: RetryPolicy,
 }
 
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
             .field("token", &self.token.as_ref().map(|_| "<hidden>"))
-            .field("retry", &self.retry)
+            .field("retry", &self.retry_policy)
             .finish_non_exhaustive()
     }
 }
 
 impl Client {
+    /// Creates a client that sends requests through `transport`. Pass an `Arc` of the
+    /// transport to keep a handle to it.
     pub fn new(transport: impl Transport + 'static) -> Client {
-        Client::with_transport(Arc::new(transport))
-    }
-
-    pub fn with_transport(transport: Arc<dyn Transport>) -> Client {
-        Client { transport, token: None, retry: Retry::default() }
+        Client { transport: Arc::new(transport), token: None, retry_policy: RetryPolicy::default() }
     }
 
     /// Returns a client that authenticates with a session token or an API key.
@@ -83,16 +81,16 @@ impl Client {
         Client { token: Some(token.into()), ..self.clone() }
     }
 
-    pub fn with_retry(&self, retry: Retry) -> Client {
-        Client { retry, ..self.clone() }
+    pub fn with_retry_policy(&self, retry_policy: RetryPolicy) -> Client {
+        Client { retry_policy, ..self.clone() }
     }
 
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
     }
 
-    pub fn retry_policy(&self) -> Retry {
-        self.retry
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.retry_policy
     }
 
     /// Sends a request to endpoint `E` and retries transient failures if `E` is idempotent.
@@ -128,7 +126,7 @@ impl Client {
     ) -> Result<Option<E::Response>, Error> {
         let path = endpoint.path();
         let body = body.encode();
-        let mut backoff = self.retry.initial_backoff_ms;
+        let mut backoff = self.retry_policy.initial_backoff_ms;
         let mut attempt = 1;
         // The first failure that may have applied the request, unless a later response is
         // definitive.
@@ -143,7 +141,7 @@ impl Client {
             if unresolved.is_none() && err.outcome() == api::Outcome::Unknown {
                 unresolved = Some(err.clone());
             }
-            if !transient || attempt >= self.retry.attempts {
+            if !transient || attempt >= self.retry_policy.attempts {
                 // Only the server's verdict on the idempotency key resolves an earlier attempt.
                 let resolved = matches!(err.code(), Some(api::ErrorCode::PreconditionFailed | api::ErrorCode::Aborted));
                 return Err(match (err.outcome(), unresolved) {
@@ -151,9 +149,9 @@ impl Client {
                     _ => err,
                 });
             }
-            let pause = err.retry_after_ms().map_or(backoff, |ms| ms.min(self.retry.max_retry_after_ms));
+            let pause = err.retry_after_ms().map_or(backoff, |ms| ms.min(self.retry_policy.max_retry_after_ms));
             tokio::time::sleep(Duration::from_millis(pause)).await;
-            backoff = backoff.saturating_mul(3).min(self.retry.max_backoff_ms);
+            backoff = backoff.saturating_mul(3).min(self.retry_policy.max_backoff_ms);
             attempt += 1;
         }
     }

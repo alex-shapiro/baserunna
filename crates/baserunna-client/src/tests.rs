@@ -28,7 +28,7 @@ fn resp(status: u16, headers: &[(&str, &str)], body: &str) -> Result<http::Respo
 
 fn script(responses: Vec<Result<http::Response<Bytes>, TransportError>>) -> (Client, Arc<Script>) {
     let s = Arc::new(Script { responses: Mutex::new(responses), ..Script::default() });
-    (Client::with_transport(s.clone()).with_token("t"), s)
+    (Client::new(s.clone()).with_token("t"), s)
 }
 
 fn sent(s: &Script) -> usize {
@@ -261,7 +261,7 @@ async fn retries_back_off_and_follow_retry_after_up_to_a_bound() {
     assert_eq!(began.elapsed().as_millis(), 30_000, "Retry-After is capped at 10 s");
 
     let (c, s) = script(vec![resp(503, &[], "<html>Busy</html>")]);
-    let one = c.with_retry(Retry { attempts: 1, ..Retry::default() });
+    let one = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() });
     one.db("s").txn(&GET, None).await.unwrap_err();
     assert_eq!(sent(&s), 1);
 }
@@ -352,7 +352,7 @@ fn arbitrary_responses_never_panic_the_client() {
             }
             let body = String::from_utf8_lossy(&body).into_owned();
             let (c, _) = script(vec![Ok(b.body(Bytes::from(body)).unwrap())]);
-            let c = c.with_retry(Retry { attempts: 1, ..Retry::default() });
+            let c = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() });
             let db = c.db("s");
             let ops = [
                 Op::Get { key: "a".into() },

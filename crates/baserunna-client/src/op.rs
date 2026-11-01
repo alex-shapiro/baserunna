@@ -268,7 +268,7 @@ impl Op {
             (Op::QueryRows { cursor, .. }, OpResult::QueryRows(p)) => *cursor = Some(p.cursor.clone()?),
             (Op::ReadStream(r), OpResult::ReadStream(p)) if !p.done => {
                 if r.reverse {
-                    r.until_seq = Some(p.next_seq);
+                    (r.until_seq, r.until_time) = (Some(p.next_seq), None);
                 } else {
                     r.from_seq = Some(p.next_seq);
                     (r.from_time, r.tail, r.consumer) = (None, None, None);

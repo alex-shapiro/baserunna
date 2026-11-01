@@ -512,3 +512,19 @@ async fn creating_an_existing_table_still_checks_its_column_types() {
     let e = db.create_table(&t).await.unwrap_err();
     assert_eq!(e.code(), Some(api::ErrorCode::InvalidArgument), "{e}");
 }
+
+#[tokio::test]
+async fn reverse_stream_reads_bounded_by_time_page_through_every_record() {
+    let (db, _) = node("").await;
+    let events: Vec<u64> = (0..5).collect();
+    db.write(&[Op::append("log", &events)]).await.unwrap();
+    let op = Op::ReadStream(api::ReadStream {
+        stream: "log".into(),
+        until_time: Some(u64::MAX / 2),
+        reverse: true,
+        limit: Some(2),
+        ..api::ReadStream::default()
+    });
+    let read: Vec<u64> = pages(&db, op).await.into_iter().flat_map(|r| r.records::<u64>().unwrap()).collect();
+    assert_eq!(read, [4, 3, 2, 1, 0]);
+}

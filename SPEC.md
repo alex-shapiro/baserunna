@@ -963,7 +963,8 @@ To compute a page (`Version::changes`), the engine merges only the `tail` and se
   them; a node uses its own clock only until its first measurement.
 - **Membership** is stored in the `nodes` table of the system DB. Each node
   rewrites `{id, addr, started_at, heartbeat_at}` every `heartbeat_ms`
-  (120 s) and re-reads the table every `members_refresh_ms` (30 s). A node is
+  (120 s) and re-reads the table every `members_refresh_ms` (30 s), or every
+  `heartbeat_ms` if that is shorter, so that live peers never appear stale. A node is
   live if `heartbeat_at > now − 3 × heartbeat_ms` and a newer process has not
   registered at its address. Each node includes itself in the live set unless it is draining. Crashes are detected by
   requests rather than heartbeats: a forward that certainly never arrived

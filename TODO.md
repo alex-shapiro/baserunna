@@ -281,10 +281,22 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       different cached views of live cluster members, a long-poll request can be
       routed to a rendezvous home node that does not receive commit notices.
       Peers can hold different membership views before all peers refresh after a
-      node joins, or between refreshes if `members_refresh_ms` is greater than
-      `2 × heartbeat_ms` in simulation swarm configurations. Derive the
-      membership liveness window from both intervals, and send commit notices to
-      the home nodes of both previous and current membership views.
+      node joins. Send commit notices to the home nodes of both previous and
+      current membership views.
+- [ ] **Route interactive transaction requests to the node that holds the
+      transaction.** An open transaction lives in the memory of the node that
+      began it, but later requests on it are routed like any database request,
+      to the lease holder or the rendezvous home in the receiving node's view of
+      live members. When views differ, such as after a node joins or while a
+      peer is suspect, a commit reaches another node and fails with
+      `txn_not_found`. Encode the node in the transaction ID and forward by it.
+- [ ] **Let a client abort a transaction whose begin outcome is unknown.** The
+      server assigns the transaction ID in the `begin` response, so if that
+      response is lost, `baserunna_client::Txn` cannot abort the transaction and
+      it holds one of the user's open transaction slots until its idle timeout.
+      Accept a client-chosen transaction ID on `begin`.
+- [ ] **Fix the `events` fuzz target**, which no longer compiles because
+      `PartRef` has no `min_version` and `max_version` fields.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the
       model-checked `http_txn` target, and fuzz `PartMeta::decode` and
       `ColIndex::decode` on unframed byte slices instead of CRC-framed inputs.

@@ -514,11 +514,14 @@ impl Node {
 
     fn spawn_background(self: &Arc<Self>) {
         let me = Arc::downgrade(self);
-        let (refresh, hb) = (self.cfg.members_refresh_ms, Duration::from_millis(self.cfg.heartbeat_ms));
+        let hb = Duration::from_millis(self.cfg.heartbeat_ms);
+        // Peers count a node as live for 3 heartbeat intervals after the heartbeat they last read,
+        // so both heartbeats and reads must happen at least once per interval.
+        let period = Duration::from_millis(self.cfg.members_refresh_ms).min(hb);
         self.env.spawn(async move {
             let mut last_heartbeat = Instant::now();
             loop {
-                tokio::time::sleep(Duration::from_millis(refresh)).await;
+                tokio::time::sleep(period).await;
                 let Some(n) = me.upgrade() else { return };
                 if last_heartbeat.elapsed() >= hb {
                     match n.heartbeat().await {
@@ -1923,6 +1926,26 @@ mod tests {
                 completed_at - committed_at
             );
         });
+    }
+
+    #[test]
+    fn peers_stay_live_whatever_the_refresh_interval() {
+        fn check(configure: fn(&mut super::NodeConfig)) {
+            run_paused(async move {
+                let w = World::with_config(2, 1, configure).await;
+                let (a, b) = (w.node(0).clone(), w.node(1).clone());
+                let refresh = a.cfg.members_refresh_ms;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                for ms in (2_000..30_000).step_by(100) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let live: Vec<String> = a.live_members().into_iter().map(|m| m.id).collect();
+                    assert!(live.contains(&b.id), "refresh {refresh} ms: {} is not live after {ms} ms", b.id);
+                }
+            });
+        }
+        check(|c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 999));
+        check(|c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 2_000));
+        check(|c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 10_000));
     }
 
     #[test]

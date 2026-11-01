@@ -430,3 +430,40 @@ async fn a_table_with_a_column_type_the_server_does_not_know_is_rejected() {
     let e = db.create_table(&t).await.unwrap_err();
     assert_eq!(e.code(), Some(api::ErrorCode::InvalidArgument), "{e}");
 }
+
+#[tokio::test]
+async fn a_begin_whose_caller_leaves_after_the_response_arrives_is_aborted() {
+    use std::future::Future;
+    use std::task::Poll;
+    let (db, _) = node_with("", |c| c.txns_per_user = 1).await;
+    let client = db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() });
+    let db = client.db(db.name());
+    let mut txn = db.begin();
+    {
+        let mut run = std::pin::pin!(txn.run_one(Op::get("k")));
+        let pending = std::future::poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx).is_pending())).await;
+        assert!(pending, "the begin is in flight");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    drop(txn);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut txn = db.begin();
+    let begun = txn.run_one(Op::get("k")).await;
+    assert!(begun.is_ok(), "a new transaction begins: {begun:?}");
+    txn.abort().await;
+}
+
+#[tokio::test]
+async fn a_cancelled_abort_still_frees_the_open_transaction_slot() {
+    let (db, router) = node_with(api::AbortTxn::ROUTE, |c| c.txns_per_user = 1).await;
+    let mut txn = db.begin();
+    txn.run_one(Op::get("k")).await.unwrap();
+    router.fail(api::AbortTxn::ROUTE, Fault::Drop, 1);
+    let r = tokio::time::timeout(Duration::from_millis(0), txn.abort()).await;
+    assert!(r.is_err(), "the abort was cancelled");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut txn = db.begin();
+    let begun = txn.run_one(Op::get("k")).await;
+    assert!(begun.is_ok(), "a new transaction begins: {begun:?}");
+    txn.abort().await;
+}

@@ -72,7 +72,8 @@ impl Txn {
             None => {
                 let b =
                     api::BeginRequest { encoding: api::Encoding::Base64, ops: api_ops, ..api::BeginRequest::default() };
-                let r = begin(self.db.clone(), b).await.map(|r| {
+                let r = begin(self.db.clone(), b).await.map(|mut g| {
+                    let r = g.begun.take().expect("a begin guard holds its transaction until taken");
                     self.open = Some(Open { id: r.txn_id, commit_id: r.commit_id });
                     r.results
                 });
@@ -140,40 +141,50 @@ impl Txn {
     }
 
     /// Aborts the transaction, ignoring failures because the server aborts an idle transaction
-    /// after its timeout.
+    /// after its timeout. If the abort is cancelled, dropping the transaction aborts it again.
     pub async fn abort(mut self) {
-        if let Some(id) = self.take_open() {
+        if let Some(id) = self.open_id() {
             abort(&self.db, id).await;
         }
+        self.open = None;
     }
 
-    /// Returns the ID of the transaction if it is still open on the server, and forgets it.
-    fn take_open(&mut self) -> Option<String> {
-        let open = self.open.take()?;
-        (!self.failed.as_ref().is_some_and(ends_txn)).then_some(open.id)
+    /// Returns the ID of the transaction if it is still open on the server.
+    fn open_id(&self) -> Option<String> {
+        let open = self.open.as_ref()?;
+        (!self.failed.as_ref().is_some_and(ends_txn)).then(|| open.id.clone())
     }
 }
 
 impl Drop for Txn {
     fn drop(&mut self) {
-        if let Some(id) = self.take_open()
-            && let Ok(rt) = tokio::runtime::Handle::try_current()
-        {
-            let db = self.db.clone();
-            rt.spawn(async move { abort(&db, id).await });
+        if let Some(id) = self.open_id() {
+            abort_later(self.db.clone(), id);
+        }
+    }
+}
+
+/// Transaction that a begin opened, which is aborted when dropped unless [`Txn::run`] takes it.
+struct Begun {
+    db: Db,
+    begun: Option<api::Begun>,
+}
+
+impl Drop for Begun {
+    fn drop(&mut self) {
+        if let Some(b) = self.begun.take() {
+            abort_later(self.db.clone(), b.txn_id);
         }
     }
 }
 
 /// Begins a transaction on `db` in a task of its own, so that if the caller stops waiting, such as
-/// when its task is cancelled, the task aborts the transaction once the server returns it.
-async fn begin(db: Db, body: api::BeginRequest) -> Result<api::Begun, Error> {
+/// when its task is cancelled, the transaction is aborted once the server returns it.
+async fn begin(db: Db, body: api::BeginRequest) -> Result<Begun, Error> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let r = db.client().send(&api::BeginTxn { db: db.name().into() }, &body).await;
-        if let Err(Ok(begun)) = tx.send(r) {
-            abort(&db, begun.txn_id).await;
-        }
+        let _ = tx.send(r.map(|b| Begun { db, begun: Some(b) }));
     });
     let stopped = || Error::Transport(TransportError::Unknown("the runtime stopped the begin request".into()));
     rx.await.unwrap_or_else(|_| Err(stopped()))
@@ -187,6 +198,13 @@ fn ends_txn(e: &Error) -> bool {
 async fn abort(db: &Db, id: String) {
     let e = api::AbortTxn { db: db.name().into(), id };
     let _ = db.client().send(&e, &api::NoBody {}).await;
+}
+
+/// Aborts transaction `id` in the background on the current Tokio runtime, if there is one.
+fn abort_later(db: Db, id: String) {
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        rt.spawn(async move { abort(&db, id).await });
+    }
 }
 
 impl Db {

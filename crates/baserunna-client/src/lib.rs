@@ -196,8 +196,7 @@ impl Client {
         tokio::time::sleep(Duration::from_millis(1 + (self.entropy)() % bound.max(1))).await;
     }
 
-    /// Returns a random 128-bit ID as 32 lowercase hex digits, for idempotency keys and
-    /// transaction IDs.
+    /// Returns a random 128-bit idempotency key as 32 lowercase hex digits.
     pub(crate) fn random_id(&self) -> String {
         format!("{:016x}{:016x}", (self.entropy)(), (self.entropy)())
     }

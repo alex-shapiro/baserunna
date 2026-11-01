@@ -490,3 +490,12 @@ async fn an_empty_prefix_selects_no_rows() {
     let left = db.read_one(Op::query_all::<Item>()).await.unwrap().rows::<Item>().unwrap();
     assert_eq!((read.len(), left.len()), (0, 2), "an empty prefix read {read:?} and left {left:?}");
 }
+
+#[tokio::test]
+async fn creating_an_existing_table_still_checks_its_column_types() {
+    let (db, _) = node("").await;
+    let mut t = table();
+    t.columns[0].ty = api::ColumnType::Unknown;
+    let e = db.create_table(&t).await.unwrap_err();
+    assert_eq!(e.code(), Some(api::ErrorCode::InvalidArgument), "{e}");
+}

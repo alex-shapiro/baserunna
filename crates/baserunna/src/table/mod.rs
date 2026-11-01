@@ -116,6 +116,7 @@ fn put_schema(txn: &mut Txn, s: &TableSchema) -> Result<()> {
 }
 
 pub async fn create_table(txn: &mut Txn, def: &api::NewTable) -> Result<TableSchema> {
+    let types = def.columns.iter().map(|c| ColType::from_api(c.ty)).collect::<Result<Vec<_>>>()?;
     if let Some(existing) = txn.get(&catalog_key(&def.name)).await? {
         if def.if_not_exists {
             return decode_schema(&existing);
@@ -132,11 +133,11 @@ pub async fn create_table(txn: &mut Txn, def: &api::NewTable) -> Result<TableSch
         next_column_id: 1,
         next_index_id: 1,
     };
-    for c in &def.columns {
+    for (c, ty) in def.columns.iter().zip(types) {
         s.columns.push(Column {
             id: s.next_column_id,
             name: c.name.clone(),
-            ty: ColType::from_api(c.ty)?,
+            ty,
             nullable: c.nullable && !def.primary_key.contains(&c.name),
             default: c.default.clone(),
         });

@@ -261,25 +261,33 @@ pub fn parse_ops(ops: Vec<api::Op>) -> Result<Vec<Op>> {
 
 impl Op {
     pub fn is_write(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            Op::Get { .. }
+            | Op::Scan { .. }
+            | Op::Check { .. }
+            | Op::GetRow { .. }
+            | Op::QueryRows { .. }
+            | Op::ReadStream(_)
+            | Op::StreamInfo { .. }
+            | Op::GetConsumer { .. }
+            | Op::QueryEvents(_) => false,
             Op::Put { .. }
-                | Op::Delete { .. }
-                | Op::Copy { .. }
-                | Op::DeleteRange { .. }
-                | Op::Increment { .. }
-                | Op::InsertRow { .. }
-                | Op::UpsertRow { .. }
-                | Op::UpdateRow { .. }
-                | Op::DeleteRow { .. }
-                | Op::UpdateRows { .. }
-                | Op::DeleteRows { .. }
-                | Op::Append { .. }
-                | Op::TrimStream { .. }
-                | Op::SetConsumer { .. }
-                | Op::InsertEvents { .. }
-                | Op::DeleteEvents { .. }
-        )
+            | Op::Delete { .. }
+            | Op::Copy { .. }
+            | Op::DeleteRange { .. }
+            | Op::Increment { .. }
+            | Op::InsertRow { .. }
+            | Op::UpsertRow { .. }
+            | Op::UpdateRow { .. }
+            | Op::DeleteRow { .. }
+            | Op::UpdateRows { .. }
+            | Op::DeleteRows { .. }
+            | Op::Append { .. }
+            | Op::TrimStream { .. }
+            | Op::SetConsumer { .. }
+            | Op::InsertEvents { .. }
+            | Op::DeleteEvents { .. } => true,
+        }
     }
 }
 

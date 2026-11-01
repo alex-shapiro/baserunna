@@ -325,7 +325,8 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       `where` or `query_rows` without `eq`, `range` or `filter` as every row,
       so a raw HTTP client or a generated SDK that builds an empty prefix at
       runtime deletes or reads the whole table. `baserunna-client` guards
-      against this on its side.
+      against this on its side. A `delete_range` with an empty `prefix` likewise
+      deletes every key.
 - [ ] **Fix the `events` fuzz target**, which no longer compiles because
       `PartRef` has no `min_version` and `max_version` fields.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the

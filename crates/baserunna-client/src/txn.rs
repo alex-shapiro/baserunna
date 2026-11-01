@@ -63,9 +63,9 @@ impl Txn {
         }
         let queued = self.writes.len();
         let ops: Vec<Op> = self.writes.drain(..).chain(ops.iter().cloned()).collect();
-        self.wrote |= ops.iter().any(Op::is_write);
         self.started.get_or_insert_with(tokio::time::Instant::now);
-        let api_ops = ops.iter().map(Op::to_api).collect();
+        let api_ops: Vec<api::Op> = ops.iter().map(Op::to_api).collect();
+        self.wrote |= api_ops.iter().any(api::Op::is_write);
         // The transaction counts as failed until the request completes, so that it cannot commit
         // operations of a request that its caller cancelled.
         let cancelled = TransportError::Unknown("a request on the transaction was cancelled".into());

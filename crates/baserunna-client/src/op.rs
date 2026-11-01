@@ -237,26 +237,7 @@ impl Op {
     }
 
     pub fn is_write(&self) -> bool {
-        match self {
-            Op::Get { .. }
-            | Op::Scan { .. }
-            | Op::Check { .. }
-            | Op::GetRow { .. }
-            | Op::QueryRows { .. }
-            | Op::ReadStream(_) => false,
-            Op::Put { .. }
-            | Op::PutBlob { .. }
-            | Op::Delete { .. }
-            | Op::DeleteRange { .. }
-            | Op::Copy { .. }
-            | Op::Increment { .. }
-            | Op::InsertRow { .. }
-            | Op::UpsertRow { .. }
-            | Op::UpdateRow { .. }
-            | Op::DeleteRow { .. }
-            | Op::DeleteRows { .. }
-            | Op::Append { .. } => true,
-        }
+        self.to_api().is_write()
     }
 
     /// Returns the operation that reads the page after `result`, or `None` if `result` is the

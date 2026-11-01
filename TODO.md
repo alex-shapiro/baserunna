@@ -321,6 +321,11 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       `read_stream` that starts from `tail` recomputes its lower bound from the
       stream's end on each page, so `Op::next_page` returns a different range if
       records are appended between pages.
+- [ ] **Require an explicit request to select every row.** The server reads a
+      `where` or `query_rows` without `eq`, `range` or `filter` as every row,
+      so a raw HTTP client or a generated SDK that builds an empty prefix at
+      runtime deletes or reads the whole table. `baserunna-client` guards
+      against this on its side.
 - [ ] **Fix the `events` fuzz target**, which no longer compiles because
       `PartRef` has no `min_version` and `max_version` fields.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the

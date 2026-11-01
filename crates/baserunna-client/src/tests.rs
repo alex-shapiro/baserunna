@@ -921,3 +921,17 @@ async fn retry_does_not_rerun_a_transaction_whose_responses_never_decode() {
     assert!(matches!(&e, Error::NotApplied(cause) if matches!(**cause, Error::Malformed { .. })), "{e:?}");
     assert_eq!(sent(&s), 3, "a response that cannot decode ends the loop");
 }
+
+#[tokio::test(start_paused = true)]
+async fn retry_does_not_rerun_a_transaction_after_an_error_code_it_cannot_read() {
+    let newer = resp(400, &[], r#"{"error":{"code":"schema_locked","message":"m","retryable":false}}"#);
+    let (c, s) = script(vec![resp(201, &[], BEGUN), newer, resp(200, &[], "{}")]);
+    let db = c.db("s");
+    let mut retry = db.retry();
+    let mut txn = db.begin();
+    txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
+    let r = txn.run_one(Op::get("k")).await.map(drop);
+    let e = retry.finish(txn, r).await.unwrap_err();
+    assert_eq!(e.code(), Some(ErrorCode::Unknown), "{e:?}");
+    assert_eq!(sent(&s), 3, "an error the client cannot read ends the loop");
+}

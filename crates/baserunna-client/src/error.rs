@@ -81,8 +81,10 @@ impl Error {
             },
             Error::Foreign { status, .. } => matches!(status, 200..=299 | 407 | 408 | 429 | 500..) && may_repeat,
             Error::Malformed { .. } | Error::Decode { .. } => false,
-            // Only a response that the client cannot read fails the same way again.
-            Error::NotApplied(e) => !matches!(**e, Error::Malformed { .. }),
+            // A request that timed out may run again in a new transaction, with a new deadline.
+            Error::NotApplied(e) => {
+                e.is_transient(true) || matches!(**e, Error::Transport(TransportError::TimedOut(_)))
+            }
             Error::Transport(TransportError::TimedOut(_)) => false,
             Error::Transport(_) => may_repeat,
         }

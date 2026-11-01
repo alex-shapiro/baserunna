@@ -518,11 +518,6 @@ async fn begin_txn(
     Req(b): Req<api::BeginTxn>,
 ) -> Result<Reply<api::BeginTxn>> {
     let ops = ops::parse_ops(b.ops)?;
-    let id = match b.txn_id {
-        Some(id) if id.len() == 32 && id.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) => id,
-        Some(_) => return Err(Error::invalid("txn_id must be 32 lowercase hex digits")),
-        None => node.env.random_hex(16),
-    };
     let user = &ctx.principal.user.id;
     node.txns.admit_begin(user, &ctx.db.id)?;
     let t = match isolation(b.isolation) {
@@ -530,6 +525,7 @@ async fn begin_txn(
         iso => ctx.db.begin(iso, Consistency::Strong).await?,
     };
     let (rv, cid) = (t.read_version(), t.commit_id);
+    let id = node.env.random_hex(16);
     let mut txn = node.txns.open(id.clone(), user, &ctx.rec.id, t, b.encoding)?;
     let results = exec_ops(&op_ctx(&node, &ctx, b.encoding), txn.txn(), &ops).await;
     let results = txn.finish(results)?;
@@ -606,8 +602,7 @@ async fn abort_txn(
     _: Req<api::AbortTxn>,
 ) -> Result<Reply<api::AbortTxn>> {
     let id = param(&p, "id")?.to_string();
-    let open = get_open(&node, &ctx, &id).inspect_err(|_| node.txns.abort_unopened(&id))?;
-    drop(node.txns.lock(open).await?.take());
+    drop(node.txns.lock(get_open(&node, &ctx, &id)?).await?.take());
     Ok(Reply::new(api::Empty {}))
 }
 

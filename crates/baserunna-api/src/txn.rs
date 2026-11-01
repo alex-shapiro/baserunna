@@ -233,11 +233,6 @@ pub struct BeginRequest {
     pub encoding: Encoding,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ops: Vec<Op>,
-    /// Transaction ID chosen by the client, as 32 lowercase hex digits, so that the client can
-    /// abort the transaction if the response is lost. Fails with `already_exists` if a transaction
-    /// with this ID is open.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub txn_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

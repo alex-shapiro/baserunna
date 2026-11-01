@@ -13,16 +13,19 @@ use crate::{Db, Error, Op, OpResult, TransportError};
 #[derive(Debug)]
 pub struct Txn {
     db: Db,
-    /// ID of the transaction once a request may have begun it on the server: the ID the client
-    /// chose, then the ID the server returned.
-    id: Option<String>,
-    /// Commit ID once the transaction began.
-    commit_id: Option<String>,
+    /// The transaction on the server once it began, until it ends.
+    open: Option<Open>,
     writes: Vec<Op>,
     wrote: bool,
     failed: Option<Error>,
     /// Time of the first request, which bounds how long a commit status remains definitive.
     started: Option<tokio::time::Instant>,
+}
+
+#[derive(Debug)]
+struct Open {
+    id: String,
+    commit_id: String,
 }
 
 /// Commit of a write transaction.
@@ -47,7 +50,7 @@ impl TxnError for Error {
 
 impl Txn {
     pub(crate) fn new(db: Db) -> Txn {
-        Txn { db, id: None, commit_id: None, writes: Vec::new(), wrote: false, failed: None, started: None }
+        Txn { db, open: None, writes: Vec::new(), wrote: false, failed: None, started: None }
     }
 
     /// Executes `ops` and returns one result per operation.
@@ -65,33 +68,22 @@ impl Txn {
         // operations of a request that its caller cancelled.
         let cancelled = TransportError::Unknown("a request on the transaction was cancelled".into());
         self.failed = Some(Error::Transport(cancelled));
-        let (path, sent) = match &self.commit_id {
+        let (path, sent) = match &self.open {
             None => {
-                let id = self.id.insert(self.db.client().random_id()).clone();
-                let e = api::BeginTxn { db: self.db.name().into() };
-                let b = api::BeginRequest {
-                    encoding: api::Encoding::Base64,
-                    ops: api_ops,
-                    txn_id: Some(id),
-                    ..api::BeginRequest::default()
-                };
-                let r = self.db.client().send(&e, &b).await.map(|r| {
-                    (self.id, self.commit_id) = (Some(r.txn_id), Some(r.commit_id));
+                let b =
+                    api::BeginRequest { encoding: api::Encoding::Base64, ops: api_ops, ..api::BeginRequest::default() };
+                let r = begin(self.db.clone(), b).await.map(|r| {
+                    self.open = Some(Open { id: r.txn_id, commit_id: r.commit_id });
                     r.results
                 });
-                (e.path(), r)
+                (api::BeginTxn { db: self.db.name().into() }.path(), r)
             }
-            Some(_) => {
-                let id = self.id.clone().expect("a begun transaction has an ID");
-                let e = api::TxnOps { db: self.db.name().into(), id };
+            Some(o) => {
+                let e = api::TxnOps { db: self.db.name().into(), id: o.id.clone() };
                 (e.path(), self.db.client().send(&e, &api::OpsRequest { ops: api_ops }).await.map(|r| r.results))
             }
         };
         self.failed = sent.as_ref().err().cloned();
-        // A begin that was not applied opened nothing to abort.
-        if self.commit_id.is_none() && self.failed.as_ref().is_some_and(|e| e.outcome() == Outcome::NotApplied) {
-            self.id = None;
-        }
         let results = sent?;
         decode_results(ops, &results).map_err(|reason| Error::Malformed { path, reason })
     }
@@ -107,7 +99,7 @@ impl Txn {
 
     /// Executes the queued writes and commits, which validates the reads of a read-only
     /// transaction. A transaction that never began commits its writes in one request, or returns
-    /// `None` if it has none.
+    /// `None` if it writes nothing.
     ///
     /// If the commit outcome is unknown, the commit is resolved through the server: the result is
     /// the commit, an [`Error::NotApplied`], or the original error if the server cannot be
@@ -118,15 +110,15 @@ impl Txn {
             return Err(e);
         }
         let writes = std::mem::take(&mut self.writes);
-        let Some(commit_id) = self.commit_id.clone() else {
+        let Some(Open { id, commit_id }) = &self.open else {
             return self.db.write(&writes).await;
         };
-        let id = self.id.clone().expect("a begun transaction has an ID");
-        let e = api::CommitTxn { db: self.db.name().into(), id };
+        let e = api::CommitTxn { db: self.db.name().into(), id: id.clone() };
+        let commit_id = commit_id.clone();
         let body = api::CommitRequest { ops: writes.iter().map(Op::to_api).collect() };
         let err = match self.db.client().send(&e, &body).await {
             Ok(c) => {
-                self.id = None;
+                self.open = None;
                 return Ok(Some(Committed { version: c.version, commit_id: c.commit_id, appends: c.appends }));
             }
             Err(e) if e.outcome() == Outcome::NotApplied => {
@@ -152,10 +144,10 @@ impl Txn {
         }
     }
 
-    /// Returns the ID of the transaction if it may be open on the server, and forgets it.
+    /// Returns the ID of the transaction if it is still open on the server, and forgets it.
     fn take_open(&mut self) -> Option<String> {
-        let id = self.id.take()?;
-        (!self.failed.as_ref().is_some_and(ends_txn)).then_some(id)
+        let open = self.open.take()?;
+        (!self.failed.as_ref().is_some_and(ends_txn)).then_some(open.id)
     }
 }
 
@@ -168,6 +160,20 @@ impl Drop for Txn {
             rt.spawn(async move { abort(&db, id).await });
         }
     }
+}
+
+/// Begins a transaction on `db` in a task of its own, so that if the caller stops waiting, such as
+/// when its task is cancelled, the task aborts the transaction once the server returns it.
+async fn begin(db: Db, body: api::BeginRequest) -> Result<api::Begun, Error> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let r = db.client().send(&api::BeginTxn { db: db.name().into() }, &body).await;
+        if let Err(Ok(begun)) = tx.send(r) {
+            abort(&db, begun.txn_id).await;
+        }
+    });
+    let stopped = || Error::Transport(TransportError::Unknown("the runtime stopped the begin request".into()));
+    rx.await.unwrap_or_else(|_| Err(stopped()))
 }
 
 /// Returns true if the server discarded the transaction when it returned `e`.

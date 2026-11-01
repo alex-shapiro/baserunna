@@ -15,7 +15,7 @@ bytes.workspace = true
 http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 reqwest = { workspace = true, features = ["rustls"], optional = true }
 
 [dev-dependencies]

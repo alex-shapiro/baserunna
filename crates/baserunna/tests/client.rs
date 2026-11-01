@@ -22,8 +22,10 @@ enum Fault {
     Drop,
     /// Sends the request and drops the response, reporting an unknown outcome.
     LoseResponse,
-    /// Sends the request and never returns its response, as if the caller cancelled the request.
+    /// Sends the request and never returns its response.
     Hang,
+    /// Sends the request and returns its response after 500 ms.
+    Slow,
 }
 
 /// Transport that sends requests to an in-process router and can fail one route.
@@ -76,6 +78,11 @@ impl Transport for Router {
                 Fault::Hang => {
                     Router::call(self.app.clone(), req).await;
                     std::future::pending().await
+                }
+                Fault::Slow => {
+                    let resp = Router::call(self.app.clone(), req).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    Ok(resp)
                 }
             }
         })
@@ -355,54 +362,51 @@ async fn a_write_that_changes_nothing_commits_nothing() {
 }
 
 #[tokio::test]
-async fn a_transaction_whose_begin_response_never_arrives_is_aborted() {
-    for fault in [Fault::LoseResponse, Fault::Hang] {
-        let (db, router) = node_with(api::BeginTxn::ROUTE, |c| c.txns_per_user = 1).await;
-        let client = db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() });
-        let db = client.db(db.name());
-        router.fail(api::BeginTxn::ROUTE, fault, 1);
-        let mut txn = db.begin();
-        let begun = tokio::time::timeout(Duration::from_millis(200), txn.run_one(Op::get("k"))).await;
-        assert!(!matches!(begun, Ok(Ok(_))), "the begin response never arrives: {begun:?}");
-        txn.abort().await;
-        let mut txn = db.begin();
-        let begun = txn.run_one(Op::get("k")).await;
-        assert!(begun.is_ok(), "a new transaction begins after the lost one is aborted: {begun:?}");
-        txn.abort().await;
-    }
-}
-
-#[tokio::test]
-async fn a_client_chosen_transaction_id_is_unique_and_hex() {
-    let (db, _) = node("").await;
-    let begin = |id: &str| {
-        let b = api::BeginRequest { txn_id: Some(id.into()), ..api::BeginRequest::default() };
-        let db = db.clone();
-        async move { db.client().send(&api::BeginTxn { db: db.name().into() }, &b).await }
-    };
-    let id = "0123456789abcdef0123456789abcdef";
-    assert_eq!(begin(id).await.unwrap().txn_id, id);
-    assert_eq!(begin(id).await.unwrap_err().code(), Some(api::ErrorCode::AlreadyExists));
-    for bad in ["0123456789ABCDEF0123456789ABCDEF", "abc", "../../commit"] {
-        assert_eq!(begin(bad).await.unwrap_err().code(), Some(api::ErrorCode::InvalidArgument), "{bad}");
-    }
-}
-
-#[tokio::test]
-async fn a_begin_that_arrives_after_its_abort_does_not_open() {
+async fn a_begin_whose_caller_stops_waiting_is_aborted() {
     let (db, router) = node_with(api::BeginTxn::ROUTE, |c| c.txns_per_user = 1).await;
     let client = db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() });
     let db = client.db(db.name());
-    router.fail(api::BeginTxn::ROUTE, Fault::Drop, 1);
+    router.fail(api::BeginTxn::ROUTE, Fault::Slow, 1);
     let mut txn = db.begin();
-    assert!(txn.run_one(Op::get("k")).await.is_err());
-    txn.abort().await;
-    let late = router.dropped.lock().pop().unwrap();
-    let resp = Router::call(router.app.clone(), late).await;
-    assert_eq!(resp.status(), 404, "a begin delivered after its abort: {:?}", resp.body());
+    let begun = tokio::time::timeout(Duration::from_millis(200), txn.run_one(Op::get("k"))).await;
+    assert!(begun.is_err(), "the caller stopped waiting: {begun:?}");
+    drop(txn);
+    let sent = router.sent.load(Ordering::Relaxed);
+    let aborted = async {
+        while router.sent.load(Ordering::Relaxed) == sent {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), aborted).await.expect("the begun transaction is aborted");
     let mut txn = db.begin();
     let begun = txn.run_one(Op::get("k")).await;
     assert!(begun.is_ok(), "a new transaction begins: {begun:?}");
+    txn.abort().await;
+}
+
+#[tokio::test]
+async fn a_begin_retried_after_memory_pressure_eases_succeeds() {
+    let (db, _) = node_with("", |c| c.engine.memory_bytes = 16 << 20).await;
+    let big = |tag: &str| -> Vec<Op> { (0..120).map(|i| Op::put(format!("{tag}{i}"), vec![b'v'; 20_000])).collect() };
+    let once = db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() });
+    let mut fillers = Vec::new();
+    loop {
+        let mut t = once.db(db.name()).begin();
+        if t.run(&big(&format!("f{}-", fillers.len()))).await.is_err() {
+            break;
+        }
+        fillers.push(t);
+    }
+    let freer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for t in fillers {
+            t.abort().await;
+        }
+    });
+    let mut txn = db.begin();
+    let r = txn.run(&big("late-")).await;
+    freer.await.unwrap();
+    assert!(r.is_ok(), "a begin retried after its Retry-After, once memory was freed: {r:?}");
     txn.abort().await;
 }
 

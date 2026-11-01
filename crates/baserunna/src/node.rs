@@ -513,19 +513,27 @@ impl Node {
         let me = Arc::downgrade(self);
         let hb = Duration::from_millis(self.cfg.heartbeat_ms);
         // Peers count a node as live for 3 heartbeat intervals after the heartbeat they last read,
-        // so both heartbeats and reads must happen at least once per interval.
+        // so heartbeats and reads each happen at least once per interval.
         let period = Duration::from_millis(self.cfg.members_refresh_ms).min(hb);
         self.env.spawn(async move {
-            let mut last_heartbeat = Instant::now();
+            let mut wait = hb;
+            loop {
+                tokio::time::sleep(wait).await;
+                let Some(n) = me.upgrade() else { return };
+                wait = match n.heartbeat().await {
+                    Ok(()) => hb,
+                    Err(e) => {
+                        crate::debug!("{}: heartbeat failed: {e}", n.id);
+                        period
+                    }
+                };
+            }
+        });
+        let me = Arc::downgrade(self);
+        self.env.spawn(async move {
             loop {
                 tokio::time::sleep(period).await;
                 let Some(n) = me.upgrade() else { return };
-                if last_heartbeat.elapsed() >= hb {
-                    match n.heartbeat().await {
-                        Ok(()) => last_heartbeat = Instant::now(),
-                        Err(e) => crate::debug!("{}: heartbeat failed: {e}", n.id),
-                    }
-                }
                 let _ = n.refresh_members().await;
             }
         });
@@ -1929,9 +1937,9 @@ mod tests {
 
     #[test]
     fn peers_stay_live_whatever_the_refresh_interval() {
-        fn check(configure: fn(&mut super::NodeConfig)) {
+        fn check(latency_ms: u64, configure: fn(&mut super::NodeConfig)) {
             run_paused(async move {
-                let w = World::with_config(2, 1, configure).await;
+                let w = World::with_config(2, latency_ms, configure).await;
                 let (a, b) = (w.node(0).clone(), w.node(1).clone());
                 let refresh = a.cfg.members_refresh_ms;
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1942,9 +1950,10 @@ mod tests {
                 }
             });
         }
-        check(|c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 999));
-        check(|c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 2_000));
-        check(|c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 10_000));
+        check(1, |c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 999));
+        check(100, |c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 950));
+        check(1, |c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 2_000));
+        check(1, |c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 10_000));
     }
 
     #[test]

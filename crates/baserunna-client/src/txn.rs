@@ -8,8 +8,8 @@ use crate::{Db, Error, Op, OpResult};
 /// operations.
 ///
 /// After a request on the transaction fails, later calls return the same error. Dropping a begun
-/// transaction without [`Txn::commit`] or [`Txn::abort`] leaves it open on the server until its
-/// idle timeout.
+/// transaction without [`Txn::commit`] or [`Txn::abort`], such as when its task is cancelled,
+/// aborts it in the background on the current Tokio runtime.
 #[derive(Debug)]
 pub struct Txn {
     db: Db,
@@ -99,49 +99,68 @@ impl Txn {
     /// If the commit outcome is unknown, the commit is resolved through the server: the result is
     /// the commit, an [`Error::NotApplied`], or the original error if the server cannot be
     /// reached.
-    pub async fn commit(self) -> Result<Option<Committed>, Error> {
+    pub async fn commit(mut self) -> Result<Option<Committed>, Error> {
         if let Some(e) = self.failed.clone() {
-            self.abort_open().await;
+            self.abort().await;
             return Err(e);
         }
-        let Txn { db, open, writes, wrote, started, .. } = self;
-        let Some(open) = open else {
+        let writes = std::mem::take(&mut self.writes);
+        let Some(open) = &self.open else {
             return match writes.is_empty() {
                 true => Ok(None),
-                false => db.write(&writes).await.map(Some),
+                false => self.db.write(&writes).await.map(Some),
             };
         };
-        let e = api::CommitTxn { db: db.name().into(), id: open.id.clone() };
+        let e = api::CommitTxn { db: self.db.name().into(), id: open.id.clone() };
+        let commit_id = open.commit_id.clone();
         let body = api::CommitRequest { ops: writes.iter().map(Op::to_api).collect() };
-        let err = match db.client().send(&e, &body).await {
-            Ok(c) => return Ok(Some(Committed { version: c.version, commit_id: c.commit_id, appends: c.appends })),
+        let err = match self.db.client().send(&e, &body).await {
+            Ok(c) => {
+                self.open = None;
+                return Ok(Some(Committed { version: c.version, commit_id: c.commit_id, appends: c.appends }));
+            }
             Err(e) if e.outcome() == Outcome::NotApplied => {
                 // A commit rejected before it reached the transaction, such as by a rate limit, leaves it open.
-                if !ends_txn(&e) {
-                    abort(&db, open.id).await;
-                }
+                self.failed = Some(e.clone());
+                self.abort().await;
                 return Err(e);
             }
             Err(e) => e,
         };
-        if !wrote && writes.is_empty() {
+        if !self.wrote && writes.is_empty() {
             return Err(Error::NotApplied(Box::new(err)));
         }
-        let started = started.unwrap_or_else(tokio::time::Instant::now);
-        db.resolve(&open.commit_id, started, err).await.map(Some)
+        let started = self.started.unwrap_or_else(tokio::time::Instant::now);
+        self.db.resolve(&commit_id, started, err).await.map(Some)
     }
 
     /// Aborts the transaction, ignoring failures because the server aborts an idle transaction
     /// after its timeout.
-    pub async fn abort(self) {
-        self.abort_open().await;
+    pub async fn abort(mut self) {
+        if let Some(id) = self.take_open() {
+            abort(&self.db, id).await;
+        }
     }
 
-    async fn abort_open(self) {
-        if let Some(o) = self.open
-            && !self.failed.as_ref().is_some_and(ends_txn)
+    /// Returns the ID of the transaction if it is still open on the server, and forgets it.
+    fn take_open(&mut self) -> Option<String> {
+        let open = self.open.take()?;
+        (!self.failed.as_ref().is_some_and(ends_txn)).then_some(open.id)
+    }
+
+    /// Returns true if a request on the transaction failed, so that nothing it ran can commit.
+    fn has_failed(&self) -> bool {
+        self.failed.is_some()
+    }
+}
+
+impl Drop for Txn {
+    fn drop(&mut self) {
+        if let Some(id) = self.take_open()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
         {
-            abort(&self.db, o.id).await;
+            let db = self.db.clone();
+            rt.spawn(async move { abort(&db, id).await });
         }
     }
 }
@@ -154,13 +173,6 @@ fn ends_txn(e: &Error) -> bool {
 async fn abort(db: &Db, id: String) {
     let e = api::AbortTxn { db: db.name().into(), id };
     let _ = db.client().send(&e, &api::NoBody {}).await;
-}
-
-impl Txn {
-    /// Returns true if a request on the transaction failed, so that nothing it ran can commit.
-    fn has_failed(&self) -> bool {
-        self.failed.is_some()
-    }
 }
 
 impl Db {

@@ -242,10 +242,6 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       schema changes, row routes, streams, events, organizations) are still
       built or parsed as untyped JSON on the server, so the compiler cannot
       check them against `baserunna-client`.
-- [ ] **Abort a dropped interactive transaction.** Dropping a begun
-      `baserunna_client::Txn`, such as when a request handler is cancelled,
-      leaves the transaction open on the server until its idle timeout, where
-      it counts against the 100-transaction per-user limit.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`.
 - [ ] **Validate additional S3-compatible object stores.** Run the conformance

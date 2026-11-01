@@ -75,12 +75,17 @@ impl Transport for Router {
 }
 
 async fn node(fail_route: &'static str) -> (Db, Arc<Router>) {
+    node_with(fail_route, |_| {}).await
+}
+
+async fn node_with(fail_route: &'static str, configure: impl FnOnce(&mut NodeConfig)) -> (Db, Arc<Router>) {
     baserunna::log::set_level(Some(baserunna::log::Level::Warn));
-    let cfg = NodeConfig {
+    let mut cfg = NodeConfig {
         pbkdf2_iterations: 1000,
         limits: baserunna::limits::LimitConfig::unlimited(),
         ..NodeConfig::default()
     };
+    configure(&mut cfg);
     let store = Arc::new(MemStore::with_system_clock());
     let node = Node::start(cfg, Arc::new(Env::real()), store, Services::local()).await.unwrap();
     let router = Arc::new(Router {
@@ -276,4 +281,24 @@ async fn concurrent_read_modify_writes_serialize_through_retries() {
     let c = db.read_one(Op::get_row::<Item>(("c", 0))).await.unwrap().row::<Item>().unwrap().unwrap();
     assert_eq!(c.label.as_deref(), Some("16"), "every increment applied exactly once");
     assert!(router.sent.load(Ordering::Relaxed) >= 16 * 2);
+}
+
+#[tokio::test]
+async fn a_dropped_transaction_is_aborted_and_frees_its_open_transaction_slot() {
+    let (db, router) = node_with("", |c| c.txns_per_user = 2).await;
+    let client = db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() });
+    let db = client.db(db.name());
+    for i in 0..5 {
+        let mut txn = db.begin();
+        let begun = txn.run_one(Op::get("k")).await;
+        assert!(begun.is_ok(), "transaction {i} begins after earlier ones were dropped: {begun:?}");
+        let sent = router.sent.load(Ordering::Relaxed);
+        drop(txn);
+        let aborted = async {
+            while router.sent.load(Ordering::Relaxed) == sent {
+                tokio::task::yield_now().await;
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), aborted).await;
+    }
 }

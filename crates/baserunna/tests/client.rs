@@ -479,3 +479,14 @@ async fn a_prefix_of_none_matches_only_rows_whose_key_is_null() {
     let left = db.read_one(Op::query::<Item>("a")).await.unwrap().rows::<Item>().unwrap();
     assert_eq!(left.len(), 1, "deleting the rows of a missing owner deleted other rows");
 }
+
+#[tokio::test]
+async fn an_empty_prefix_selects_no_rows() {
+    let (db, _) = node("").await;
+    db.write(&[Op::insert(&item("a", 1)), Op::insert(&item("b", 2))]).await.unwrap();
+    let prefix: Vec<String> = Vec::new();
+    let read = db.read_one(Op::query::<Item>(&prefix)).await.unwrap().rows::<Item>().unwrap();
+    db.write(&[Op::delete_rows::<Item>(&prefix)]).await.unwrap();
+    let left = db.read_one(Op::query_all::<Item>()).await.unwrap().rows::<Item>().unwrap();
+    assert_eq!((read.len(), left.len()), (0, 2), "an empty prefix read {read:?} and left {left:?}");
+}

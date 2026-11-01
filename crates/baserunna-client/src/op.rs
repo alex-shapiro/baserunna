@@ -139,6 +139,8 @@ fn json(v: &impl Serialize) -> Json {
 /// Converts a key prefix, one value or a tuple of the leading key columns, to its column values.
 fn prefix(eq: &impl Serialize) -> api::Selection {
     let eq = match json(eq) {
+        // The server reads an empty prefix as every row, which must be asked for explicitly.
+        Json::Array(a) if a.is_empty() => vec![Json::Null],
         Json::Array(a) => a,
         one => vec![one],
     };
@@ -193,7 +195,8 @@ impl Op {
         Op::DeleteRow { table: R::TABLE.into(), pk: json(&pk) }
     }
 
-    /// Deletes the rows of `R` whose leading primary key columns equal `eq`, a value or a tuple.
+    /// Deletes the rows of `R` whose leading primary key columns equal `eq`, a value or a tuple. An
+    /// empty or `None` prefix matches no rows.
     pub fn delete_rows<R: Row>(eq: impl Serialize) -> Op {
         Op::DeleteRows { table: R::TABLE.into(), selection: prefix(&eq) }
     }
@@ -203,7 +206,7 @@ impl Op {
     }
 
     /// Reads the first page of rows of `R` whose leading primary key columns equal `eq`, a value
-    /// or a tuple.
+    /// or a tuple. An empty or `None` prefix matches no rows.
     pub fn query<R: Row>(eq: impl Serialize) -> Op {
         Op::query_rows::<R>(prefix(&eq))
     }

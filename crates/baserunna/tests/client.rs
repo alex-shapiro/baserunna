@@ -4,7 +4,7 @@
 use baserunna::env::Env;
 use baserunna::node::{Node, NodeConfig, Services};
 use baserunna::store::MemStore;
-use baserunna_api::{self as api, Column, ColumnType, Endpoint as _, NewTable, Outcome};
+use baserunna_api::{self as api, ColumnType, Endpoint as _, NewColumn, NewTable, Outcome};
 use baserunna_client::{BoxFuture, Client, Db, Error, Expect, Op, OpResult, Route, Row, Transport, TransportError};
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -127,9 +127,9 @@ fn table() -> NewTable {
     NewTable {
         name: Item::TABLE.into(),
         columns: vec![
-            Column::new("owner", ColumnType::String),
-            Column::new("id", ColumnType::Int),
-            Column::nullable("label", ColumnType::String),
+            NewColumn::new("owner", ColumnType::String),
+            NewColumn::new("id", ColumnType::Int),
+            NewColumn::nullable("label", ColumnType::String),
         ],
         primary_key: vec!["owner".into(), "id".into()],
         indexes: vec![],

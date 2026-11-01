@@ -10,7 +10,7 @@
 use super::super::Sim;
 use super::super::client::{Client as SimClient, ZOMBIE_WAIT_MS};
 use super::{chaos_phase, expect, settle};
-use baserunna_api::{Column, ColumnType, NewTable};
+use baserunna_api::{ColumnType, NewColumn, NewTable};
 use baserunna_api::{ErrorCode, Outcome, Role};
 use baserunna_client::{
     Change, ChangesRequest, Client, Db, Entry, Error, Expect, KeyRange, Op, OpResult, Row, Txn, TxnError, Value,
@@ -216,7 +216,7 @@ impl TxnError for LedgerError {
 async fn open_accounts(sim: &Arc<Sim>, db: &Db) -> Result<(), String> {
     let table = NewTable {
         name: Account::TABLE.into(),
-        columns: vec![Column::new("id", ColumnType::String), Column::new("balance", ColumnType::Int)],
+        columns: vec![NewColumn::new("id", ColumnType::String), NewColumn::new("balance", ColumnType::Int)],
         primary_key: vec!["id".into()],
         indexes: vec![],
         if_not_exists: true,

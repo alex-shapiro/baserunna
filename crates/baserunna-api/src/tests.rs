@@ -301,7 +301,7 @@ fn table_definitions_default_to_nullable_columns() {
     assert!(t.columns[0].nullable && !t.if_not_exists);
     let def = NewTable {
         name: "t".into(),
-        columns: vec![Column::new("id", ColumnType::String), Column::nullable("n", ColumnType::Int)],
+        columns: vec![NewColumn::new("id", ColumnType::String), NewColumn::nullable("n", ColumnType::Int)],
         primary_key: vec!["id".into()],
         indexes: vec![],
         if_not_exists: true,
@@ -427,4 +427,11 @@ fn change_queries_parse_flags_like_the_server() {
     let q = ChangesQuery { after: "7".into(), prefix: Some("a+b/=".into()), ..ChangesQuery::default() };
     let back: ChangesQuery = serde_urlencoded::from_str(&serde_urlencoded::to_string(&q).unwrap()).unwrap();
     assert_eq!(back, q);
+}
+
+#[test]
+fn new_columns_reject_unknown_fields_while_columns_ignore_them() {
+    let col = json!({"name": "id", "type": "int", "nullable": false, "comment": "new"});
+    assert!(serde_json::from_value::<NewColumn>(col.clone()).unwrap_err().to_string().contains("comment"));
+    assert_eq!(serde_json::from_value::<Column>(col).unwrap().name, "id");
 }

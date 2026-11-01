@@ -831,3 +831,12 @@ async fn retry_does_not_restart_after_an_unknown_outcome_outside_a_failed_transa
     assert_eq!(r, Err(outside), "the outside write may have applied, so the loop must not run it again");
     assert_eq!(sent(&s), 5);
 }
+
+#[tokio::test(start_paused = true)]
+async fn table_responses_ignore_fields_added_by_newer_servers() {
+    let body = r#"{"name":"items","columns":[{"name":"id","type":"int","nullable":false,"comment":"new"}],
+        "primary_key":["id"],"indexes":[{"name":"i","columns":["id"],"unique":false,"state":"ready","x":1}],"y":2}"#;
+    let (c, _) = script(vec![resp(200, &[], body)]);
+    let got = c.db("app").get_table("items").await;
+    assert!(got.is_ok(), "{got:?}");
+}

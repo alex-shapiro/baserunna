@@ -452,7 +452,7 @@ fn small() -> Backfill {
     Backfill { batch_rows: 7, ..Backfill::default() }
 }
 
-fn column(v: Json) -> api::Column {
+fn column(v: Json) -> api::NewColumn {
     serde_json::from_value(v).unwrap()
 }
 

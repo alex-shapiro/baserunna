@@ -801,7 +801,7 @@ async fn add_column(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
-    JsonBody(c): JsonBody<api::Column>,
+    JsonBody(c): JsonBody<api::NewColumn>,
 ) -> Result<J> {
     let name = param(&p, "t")?.to_string();
     let (s, v) = with_txn!(node, ctx, |t| table::add_column(t, &name, &c).await);

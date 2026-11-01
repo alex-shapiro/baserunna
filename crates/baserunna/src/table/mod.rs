@@ -181,7 +181,7 @@ pub async fn drop_table(txn: &mut Txn, name: &str) -> Result<()> {
     txn.delete(catalog_key(name))
 }
 
-pub async fn add_column(txn: &mut Txn, table: &str, c: &api::Column) -> Result<TableSchema> {
+pub async fn add_column(txn: &mut Txn, table: &str, c: &api::NewColumn) -> Result<TableSchema> {
     let mut s = get_schema(txn, table).await?;
     if s.column(&c.name).is_some() {
         return Err(Error::AlreadyExists(format!("column {:?} already exists", c.name)));

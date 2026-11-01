@@ -32,7 +32,7 @@ pub use op::{
 };
 pub use table::{
     Column, ColumnType, CreateTable, CreatedTable, GetTable, GetTableQuery, Index, IndexState, ListTables,
-    ListTablesQuery, NewIndex, NewTable, Table, TablePage,
+    ListTablesQuery, NewColumn, NewIndex, NewTable, Table, TablePage,
 };
 pub use txn::{
     AbortTxn, BeginRequest, BeginTxn, Begun, CommitRequest, CommitStatus, CommitTxn, Committed, Consistency, Encoding,

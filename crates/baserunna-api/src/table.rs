@@ -120,9 +120,10 @@ impl ColumnType {
     }
 }
 
+/// Column to create, in a new table or added to an existing one.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Column {
+pub struct NewColumn {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: ColumnType,
@@ -133,16 +134,27 @@ pub struct Column {
     pub default: Option<Json>,
 }
 
-impl Column {
+impl NewColumn {
     /// Returns a non-nullable column.
-    pub fn new(name: &str, ty: ColumnType) -> Column {
-        Column { name: name.into(), ty, nullable: false, default: None }
+    pub fn new(name: &str, ty: ColumnType) -> NewColumn {
+        NewColumn { name: name.into(), ty, nullable: false, default: None }
     }
 
     /// Returns a nullable column.
-    pub fn nullable(name: &str, ty: ColumnType) -> Column {
-        Column { nullable: true, ..Column::new(name, ty) }
+    pub fn nullable(name: &str, ty: ColumnType) -> NewColumn {
+        NewColumn { nullable: true, ..NewColumn::new(name, ty) }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Column {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: ColumnType,
+    pub nullable: bool,
+    /// Value of the column in rows written before the column was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Json>,
 }
 
 fn yes() -> bool {
@@ -162,7 +174,7 @@ pub struct NewIndex {
 #[serde(deny_unknown_fields)]
 pub struct NewTable {
     pub name: String,
-    pub columns: Vec<Column>,
+    pub columns: Vec<NewColumn>,
     pub primary_key: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub indexes: Vec<NewIndex>,

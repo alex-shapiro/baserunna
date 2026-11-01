@@ -5,7 +5,7 @@ use baserunna::env::Env;
 use baserunna::node::{Node, NodeConfig, Services};
 use baserunna::store::MemStore;
 use baserunna_api::{self as api, Column, ColumnType, Endpoint as _, NewTable, Outcome};
-use baserunna_client::{BoxFuture, Client, Db, Error, Op, OpResult, Route, Row, Transport, TransportError};
+use baserunna_client::{BoxFuture, Client, Db, Error, Expect, Op, OpResult, Route, Row, Transport, TransportError};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -175,7 +175,8 @@ async fn tables_rows_streams_and_keys_round_trip_through_the_server() {
     assert_eq!(e.code(), Some(api::ErrorCode::AlreadyExists), "{e}");
 
     let events: Vec<u64> = (0..2100).collect();
-    let appended = db.write(&[Op::append("log", &events[..1500]), Op::append("log", &events[1500..])]).await.unwrap();
+    let appended =
+        db.write(&[Op::append("log", &events[..1500]), Op::append("log", &events[1500..])]).await.unwrap().unwrap();
     assert_eq!(appended.appends, [0, 1500]);
     let read: Vec<u64> =
         pages(&db, Op::read_stream("log", 0)).await.into_iter().flat_map(|r| r.records().unwrap()).collect();
@@ -237,7 +238,7 @@ async fn a_commit_that_never_arrived_is_fenced_so_a_late_copy_cannot_apply() {
 async fn a_write_applies_once_when_every_response_is_lost() {
     let (db, router) = node(api::Txn::ROUTE).await;
     router.fail(api::Txn::ROUTE, Fault::LoseResponse, 4);
-    let done = db.write(&[Op::increment("n", 1), Op::append("log", &["x"])]).await.unwrap();
+    let done = db.write(&[Op::increment("n", 1), Op::append("log", &["x"])]).await.unwrap().unwrap();
     assert_eq!(router.fault.lock().1, 0, "every attempt lost its response");
     let read = db.read(&[Op::get("n"), Op::read_stream("log", 0)]).await.unwrap();
     let n = read[0].clone().entry().unwrap().unwrap();
@@ -301,5 +302,32 @@ async fn a_dropped_transaction_is_aborted_and_frees_its_open_transaction_slot() 
             }
         };
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), aborted).await;
+    }
+}
+
+#[tokio::test]
+async fn a_write_without_write_operations_checks_its_preconditions_and_commits_nothing() {
+    let (db, _) = node("").await;
+    assert_eq!(db.write(&[]).await.unwrap(), None);
+    let absent = Op::Check { key: "k".into(), expect: Expect::Absent };
+    assert_eq!(db.write(std::slice::from_ref(&absent)).await.unwrap(), None);
+    db.write(&[Op::put("k", "v")]).await.unwrap();
+    let e = db.write(&[absent]).await.unwrap_err();
+    assert_eq!(e.code(), Some(api::ErrorCode::PreconditionFailed), "{e}");
+}
+#[tokio::test]
+async fn a_write_that_changes_nothing_commits_nothing() {
+    let (db, _) = node("").await;
+    let set = serde_json::json!({"label": "x"});
+    for op in [
+        Op::delete_rows::<Item>("nobody"),
+        Op::update::<Item>(("nobody", 1), &set),
+        Op::delete_row::<Item>(("nobody", 1)),
+    ] {
+        let r = db.write(std::slice::from_ref(&op)).await;
+        assert_eq!(r, Ok(None), "{op:?}");
+        let mut txn = db.begin();
+        txn.write([op]);
+        assert_eq!(txn.commit().await, Ok(None));
     }
 }

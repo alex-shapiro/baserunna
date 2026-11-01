@@ -196,8 +196,9 @@ impl Client {
         tokio::time::sleep(Duration::from_millis(1 + (self.entropy)() % bound.max(1))).await;
     }
 
-    /// Returns a new random idempotency key.
-    pub(crate) fn idempotency_key(&self) -> String {
+    /// Returns a random 128-bit ID as 32 lowercase hex digits, for idempotency keys and
+    /// transaction IDs.
+    pub(crate) fn random_id(&self) -> String {
         format!("{:016x}{:016x}", (self.entropy)(), (self.entropy)())
     }
 
@@ -360,23 +361,25 @@ impl Db {
         Ok(self.read(std::slice::from_ref(&op)).await?.swap_remove(0))
     }
 
-    /// Executes `ops` in a single transaction that applies exactly once.
+    /// Executes `ops` in a single transaction that applies exactly once, or returns `None` if the
+    /// transaction wrote nothing, such as one of only checks or a delete of a missing row.
     ///
     /// If the outcome remains unknown after retries, the commit is resolved through the server: the
     /// result is the commit, an [`Error::NotApplied`], or the original error if the server cannot
     /// be reached.
-    pub async fn write(&self, ops: &[Op]) -> Result<Committed, Error> {
-        let key = self.client.idempotency_key();
+    pub async fn write(&self, ops: &[Op]) -> Result<Option<Committed>, Error> {
+        if ops.is_empty() {
+            return Ok(None);
+        }
+        let key = self.client.random_id();
         let started = tokio::time::Instant::now();
         match self.txn(ops, Some(&key)).await {
             Ok(out) => {
-                let commit_id = out.commit_id.ok_or_else(|| Error::Malformed {
-                    path: api::Txn { db: self.name.clone() }.path(),
-                    reason: "a write transaction has no commit ID".into(),
-                })?;
-                Ok(Committed { version: out.version, commit_id, appends: out.appends })
+                Ok(out.commit_id.map(|commit_id| Committed { version: out.version, commit_id, appends: out.appends }))
             }
-            Err(e) if e.outcome() == api::Outcome::Unknown => self.resolve(&format!("key:{key}"), started, e).await,
+            Err(e) if e.outcome() == api::Outcome::Unknown => {
+                self.resolve(&format!("key:{key}"), started, e).await.map(Some)
+            }
             Err(e) => Err(e),
         }
     }

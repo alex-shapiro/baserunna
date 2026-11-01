@@ -637,7 +637,7 @@ async fn writes_apply_exactly_once_by_resolving_their_idempotency_key() {
     let lost = Err(TransportError::Unknown("response lost".into()));
     let committed = r#"{"status":"committed","version":5,"commit_id":"0000000000000001","appends":[]}"#;
     let (c, s) = script(vec![lost.clone(), lost.clone(), lost.clone(), lost, resp(200, &[], committed)]);
-    assert_eq!(c.db("s").write(&put()).await.unwrap().version, 5);
+    assert_eq!(c.db("s").write(&put()).await.unwrap().unwrap().version, 5);
     let r = requests(&s);
     let key = r[0].2["idempotency_key"].as_str().unwrap().to_string();
     assert!(r[..4].iter().all(|x| x.2["idempotency_key"] == key.as_str()), "retries reuse the key");
@@ -645,7 +645,7 @@ async fn writes_apply_exactly_once_by_resolving_their_idempotency_key() {
     let (c, s) = script(vec![api_err(400, "invalid_argument", "null")]);
     assert_eq!(c.db("s").write(&put()).await.unwrap_err().code(), Some(ErrorCode::InvalidArgument));
     assert_eq!(sent(&s), 1, "a definitive failure is not resolved");
-    let keys: std::collections::HashSet<String> = (0..100).map(|_| c.idempotency_key()).collect();
+    let keys: std::collections::HashSet<String> = (0..100).map(|_| c.random_id()).collect();
     assert_eq!(keys.len(), 100, "keys are unique");
 }
 

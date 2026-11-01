@@ -106,10 +106,7 @@ impl Txn {
         }
         let writes = std::mem::take(&mut self.writes);
         let Some(open) = &self.open else {
-            return match writes.is_empty() {
-                true => Ok(None),
-                false => self.db.write(&writes).await.map(Some),
-            };
+            return self.db.write(&writes).await;
         };
         let e = api::CommitTxn { db: self.db.name().into(), id: open.id.clone() };
         let commit_id = open.commit_id.clone();

@@ -311,6 +311,13 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       `txn_not_found` instead of the cause. Record the cause with the abort
       reasons that `txn_not_found` reports, or end the transaction only once the
       commit cannot be retried.
+- [ ] **Reject writes in `baserunna_client::Db::read`.** It sends write
+      operations without an idempotency key, so they are not exactly-once and a
+      lost response leaves their outcome unknown.
+- [ ] **Restart a transaction loop after its own request times out.**
+      `Retry::finish` restarts after a connection reset on one of the
+      transaction's own requests but not after a timeout, although neither lets
+      the transaction commit.
 - [ ] **Fix the `events` fuzz target**, which no longer compiles because
       `PartRef` has no `min_version` and `max_version` fields.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the

@@ -21,10 +21,11 @@ use crate::table::schema::decode_row;
 use crate::table::tuple::{self, Key};
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
+use parking_lot::Mutex;
 use serde_json::{Map, Value as Json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Reads the schema of table `id` at `txn`'s snapshot without adding the
 /// catalog keys to `txn`'s read set.
@@ -1005,7 +1006,7 @@ impl Maintainer {
         for t in tables {
             let key = (db.id.clone(), t);
             {
-                let mut g = self.running.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = self.running.lock();
                 if let Some(again) = g.get_mut(&key) {
                     *again = true;
                     continue;
@@ -1016,7 +1017,7 @@ impl Maintainer {
             db.shared().env.clone().spawn(async move {
                 loop {
                     let now = tokio::time::Instant::now();
-                    let (mut failed, since) = match me.failed.lock().unwrap_or_else(|e| e.into_inner()).remove(&key) {
+                    let (mut failed, since) = match me.failed.lock().remove(&key) {
                         Some((f, since)) if now.duration_since(since) < FAILED_MERGE_RETRY => (f, since),
                         _ => (BTreeSet::new(), now),
                     };
@@ -1024,9 +1025,9 @@ impl Maintainer {
                         crate::debug!("event maintenance of {} table {t} stopped: {e}", db.id);
                     }
                     if !failed.is_empty() {
-                        me.failed.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), (failed, since));
+                        me.failed.lock().insert(key.clone(), (failed, since));
                     }
-                    let mut g = me.running.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut g = me.running.lock();
                     match g.get_mut(&key) {
                         Some(again) if *again => *again = false,
                         _ => {
@@ -1040,7 +1041,7 @@ impl Maintainer {
     }
 
     pub fn active(&self) -> usize {
-        self.running.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.running.lock().len()
     }
 }
 

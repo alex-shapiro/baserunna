@@ -5,8 +5,8 @@
 //! exclusive lock on its root directory so no second `FsStore` can open it.
 
 use super::*;
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 const ETAG_LEN: usize = 16;
 const LOCK_FILE: &str = ".lock";
@@ -62,7 +62,7 @@ impl FsStore {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let etag = crate::util::b64::hex(&data[..ETAG_LEN]);
+        let etag = baserunna_api::b64::hex(&data[..ETAG_LEN]);
         Ok((etag, data[ETAG_LEN..].to_vec(), mtime))
     }
 
@@ -72,7 +72,7 @@ impl FsStore {
             Ok(mut f) => {
                 let mut b = [0u8; ETAG_LEN];
                 f.read_exact(&mut b).map_err(|e| StoreError::Fatal(e.to_string()))?;
-                Ok(Some(crate::util::b64::hex(&b)))
+                Ok(Some(baserunna_api::b64::hex(&b)))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(StoreError::Unavailable(e.to_string())),
@@ -84,12 +84,12 @@ impl FsStore {
         aws_lc_rs::rand::fill(&mut tag).map_err(|_| StoreError::Fatal("rng".into()))?;
         let dir = path.parent().unwrap_or(root);
         std::fs::create_dir_all(dir).map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        let tmp = dir.join(format!(".tmp-{}", crate::util::b64::hex(&tag)));
+        let tmp = dir.join(format!(".tmp-{}", baserunna_api::b64::hex(&tag)));
         let mut buf = Vec::with_capacity(ETAG_LEN + data.len());
         buf.extend_from_slice(&tag);
         buf.extend_from_slice(data);
         std::fs::write(&tmp, &buf).map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        let _g = cas_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = cas_lock.lock();
         let ok = match mode {
             PutMode::Overwrite => true,
             PutMode::Create => Self::current_etag(path)?.is_none(),
@@ -100,7 +100,7 @@ impl FsStore {
             return Err(StoreError::PreconditionFailed);
         }
         std::fs::rename(&tmp, path).map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        Ok(crate::util::b64::hex(&tag))
+        Ok(baserunna_api::b64::hex(&tag))
     }
 
     fn list_blocking(root: &Path, prefix: &str, start_after: Option<&str>, limit: usize) -> SResult<ListPage> {

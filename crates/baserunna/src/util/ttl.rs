@@ -1,8 +1,8 @@
 //! Fixed-TTL bounded cache.
 
 use super::DetHashMap;
+use parking_lot::Mutex;
 use std::hash::Hash;
-use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -18,17 +18,13 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
         TtlCache { ttl, max, map: Mutex::new(DetHashMap::default()) }
     }
 
-    fn map(&self) -> std::sync::MutexGuard<'_, DetHashMap<K, (Instant, V)>> {
-        self.map.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     pub fn get(&self, k: &K) -> Option<V> {
-        self.map().get(k).filter(|(at, _)| at.elapsed() < self.ttl).map(|(_, v)| v.clone())
+        self.map.lock().get(k).filter(|(at, _)| at.elapsed() < self.ttl).map(|(_, v)| v.clone())
     }
 
     /// Inserts `v` under `k` with expiration `read_at + ttl`, or removes `k` if `v` is `None`.
     pub fn store(&self, k: K, v: Option<V>, read_at: Instant) {
-        let mut m = self.map();
+        let mut m = self.map.lock();
         match v {
             Some(v) => {
                 if m.len() >= self.max {
@@ -43,21 +39,21 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
     }
 
     pub fn remove(&self, k: &K) {
-        self.map().remove(k);
+        self.map.lock().remove(k);
     }
 
     pub fn retain(&self, mut keep: impl FnMut(&K, &V) -> bool) {
-        self.map().retain(|k, (_, v)| keep(k, v));
+        self.map.lock().retain(|k, (_, v)| keep(k, v));
     }
 
     /// Remove expired entries.
     pub fn prune(&self) {
         let ttl = self.ttl;
-        self.map().retain(|_, (at, _)| at.elapsed() < ttl);
+        self.map.lock().retain(|_, (at, _)| at.elapsed() < ttl);
     }
 
     pub fn len(&self) -> usize {
-        self.map().len()
+        self.map.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {

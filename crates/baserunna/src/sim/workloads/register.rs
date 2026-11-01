@@ -2,8 +2,9 @@
 
 use super::super::Sim;
 use super::super::client::Client;
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 struct Op {
@@ -54,15 +55,7 @@ pub async fn run(
                             .and_then(|j| j["version"].as_u64()),
                         _ => None,
                     };
-                    hist.lock().unwrap_or_else(|e| e.into_inner()).push(Op {
-                        key,
-                        start,
-                        end,
-                        version,
-                        value,
-                        write: true,
-                        client: c.name.clone(),
-                    });
+                    hist.lock().push(Op { key, start, end, version, value, write: true, client: c.name.clone() });
                 } else {
                     // Consecutive reads through different nodes must not observe stale state.
                     let kinds = match c.rng().below(8) {
@@ -80,7 +73,7 @@ pub async fn run(
                         let read = read_once(&c, db, key, kind).await;
                         let end = sim2.now_ms();
                         if let Some((version, value)) = read {
-                            hist.lock().unwrap_or_else(|e| e.into_inner()).push(Op {
+                            hist.lock().push(Op {
                                 key,
                                 start,
                                 end,
@@ -100,7 +93,7 @@ pub async fn run(
         h.await.map_err(|e| e.to_string())?;
     }
     super::settle(&sim, phase).await;
-    check(&hist.lock().unwrap_or_else(|e| e.into_inner()))
+    check(&hist.lock())
 }
 
 #[derive(Clone, Copy)]

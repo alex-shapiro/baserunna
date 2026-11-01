@@ -4,9 +4,10 @@ use crate::store::BoxFut;
 use crate::util::DetHashMap;
 use crate::util::crc32c::crc32c;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Byte-budgeted key-value cache on node-local storage.
 pub trait LocalStore: Send + Sync + 'static {
@@ -107,13 +108,13 @@ impl MemLocal {
 
 impl LocalStore for MemLocal {
     fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, Option<Bytes>> {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.inner.lock();
         let r = if g.0.touch(key) { g.1.get(key).cloned() } else { None };
         Box::pin(async move { r })
     }
 
     fn put<'a>(&'a self, key: &'a str, data: Bytes) -> BoxFut<'a, ()> {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.inner.lock();
         for k in g.0.insert(key, data.len() as u64, self.budget) {
             g.1.remove(&k);
         }
@@ -124,11 +125,11 @@ impl LocalStore for MemLocal {
     }
 
     fn contains(&self, key: &str) -> bool {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).0.entries.contains_key(key)
+        self.inner.lock().0.entries.contains_key(key)
     }
 
     fn stats(&self) -> LocalStats {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).0.stats()
+        self.inner.lock().0.stats()
     }
 }
 
@@ -181,10 +182,6 @@ impl DiskCache {
         Ok(DiskCache { dir, budget, lru: Arc::new(Mutex::new(lru)) })
     }
 
-    fn lru(&self) -> std::sync::MutexGuard<'_, Lru> {
-        self.lru.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     fn read(path: &Path) -> Option<Bytes> {
         let d = std::fs::read(path).ok()?;
         let (body, c) = d.split_at_checked(d.len().checked_sub(4)?)?;
@@ -205,13 +202,13 @@ impl LocalStore for DiskCache {
     fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, Option<Bytes>> {
         Box::pin(async move {
             let name = file_name(key);
-            if !self.lru().touch(&name) {
+            if !self.lru.lock().touch(&name) {
                 return None;
             }
             let path = self.dir.join(&name);
             let r = tokio::task::spawn_blocking(move || DiskCache::read(&path)).await.ok().flatten();
             if r.is_none() {
-                self.lru().remove(&name);
+                self.lru.lock().remove(&name);
                 let _ = std::fs::remove_file(self.dir.join(&name));
             }
             r
@@ -221,7 +218,7 @@ impl LocalStore for DiskCache {
     fn put<'a>(&'a self, key: &'a str, data: Bytes) -> BoxFut<'a, ()> {
         Box::pin(async move {
             let name = file_name(key);
-            let evicted = self.lru().insert(&name, data.len() as u64 + 4, self.budget);
+            let evicted = self.lru.lock().insert(&name, data.len() as u64 + 4, self.budget);
             let dir = self.dir.clone();
             let lru = self.lru.clone();
             let _ = tokio::task::spawn_blocking(move || {
@@ -229,7 +226,7 @@ impl LocalStore for DiskCache {
                     let _ = std::fs::remove_file(dir.join(k));
                 }
                 if !evicted.contains(&name) && DiskCache::write(&dir, &name, &data).is_err() {
-                    lru.lock().unwrap_or_else(|e| e.into_inner()).remove(&name);
+                    lru.lock().remove(&name);
                 }
             })
             .await;
@@ -237,11 +234,11 @@ impl LocalStore for DiskCache {
     }
 
     fn contains(&self, key: &str) -> bool {
-        self.lru().entries.contains_key(&file_name(key))
+        self.lru.lock().entries.contains_key(&file_name(key))
     }
 
     fn stats(&self) -> LocalStats {
-        self.lru().stats()
+        self.lru.lock().stats()
     }
 }
 

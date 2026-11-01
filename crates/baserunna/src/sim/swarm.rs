@@ -9,9 +9,9 @@ use super::store::StoreFaults;
 use super::{ChaosFaults, DiskFaults, NetFaults, SimConfig};
 use crate::engine::segment::Compression;
 use crate::util::rng::Rng;
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::sync::Mutex;
 
 /// Parameter generator seeded by the simulation run seed.
 #[derive(Debug)]
@@ -35,7 +35,7 @@ impl Knobs {
     }
 
     fn note<T: Debug>(&self, name: &'static str, v: T) -> T {
-        self.drawn.lock().unwrap_or_else(|e| e.into_inner()).insert(name, format!("{v:?}"));
+        self.drawn.lock().insert(name, format!("{v:?}"));
         v
     }
 
@@ -80,7 +80,7 @@ impl Knobs {
 
     /// Returns all sampled `(name, value)` pairs sorted by name.
     pub fn drawn(&self) -> Vec<(&'static str, String)> {
-        self.drawn.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, v)| (*k, v.clone())).collect()
+        self.drawn.lock().iter().map(|(k, v)| (*k, v.clone())).collect()
     }
 }
 

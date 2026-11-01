@@ -438,7 +438,7 @@ fn schemas() -> Value {
         "CommitRequest": obj_desc(json!({"ops": arr(r("Op"))}), &[], "Optional operations to execute before the transaction is committed."),
         "OpsRequest": obj(json!({"ops": arr(r("Op"))}), &["ops"]),
         "OpsResult": obj(json!({"results": arr(r("OpResult"))}), &["results"]),
-        "Committed": obj(json!({"version": i(), "commit_id": s(), "appends": arr(i()), "results": arr(r("OpResult"))}),
+        "Committed": obj(json!({"version": i(), "committed": b(), "commit_id": s(), "appends": arr(i()), "results": arr(r("OpResult"))}),
             &["version", "commit_id"]),
         "Metrics": obj(json!({"node": s(), "store": {"type": "object"}, "commits": {"type": "object"},
             "routes": {"type": "object"}, "lag": {"type": "object"}, "cpu": {"type": "object"}}),

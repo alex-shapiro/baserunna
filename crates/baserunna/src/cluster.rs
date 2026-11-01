@@ -6,7 +6,8 @@ use crate::util::DetHashMap;
 use axum::body::Body;
 use bytes::Bytes;
 use http::{Request, Response};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -100,7 +101,7 @@ struct Slot {
 
 impl Slot {
     fn finish(&self, r: Option<ReplayedResponse>) {
-        let mut g = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.result.lock();
         if g.is_none() {
             *g = Some(r);
         }
@@ -113,7 +114,7 @@ impl Slot {
             let notified = self.done.notified();
             let mut notified = std::pin::pin!(notified);
             notified.as_mut().enable();
-            if let Some(r) = self.result.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            if let Some(r) = self.result.lock().clone() {
                 return r;
             }
             notified.await;
@@ -155,7 +156,7 @@ impl ForwardDedup {
     }
 
     pub fn deliver(&self, id: &str) -> Delivery {
-        let mut g = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.slots.lock();
         if g.len() > 100_000 {
             let keep = self.retention;
             g.retain(|_, (t, _)| t.elapsed() < keep);
@@ -172,7 +173,7 @@ impl ForwardDedup {
     /// Removes entries older than the retention period.
     pub fn expire(&self) {
         let keep = self.retention;
-        self.slots.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (t, _)| t.elapsed() < keep);
+        self.slots.lock().retain(|_, (t, _)| t.elapsed() < keep);
     }
 }
 

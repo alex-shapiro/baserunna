@@ -12,7 +12,8 @@ use baserunna::store::conformance::{self, Config};
 use baserunna::store::*;
 use bytes::Bytes;
 use fake_s3::{FakeS3, Fault};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn rt() -> tokio::runtime::Runtime {
@@ -193,7 +194,7 @@ impl ObjectStore for FaultyStore {
 
     fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
         Box::pin(async move {
-            self.written.lock().unwrap().insert(key.to_string(), std::time::Instant::now());
+            self.written.lock().insert(key.to_string(), std::time::Instant::now());
             let mode = match (self.violation, mode) {
                 (Violation::IgnorePreconditions, _) => PutMode::Overwrite,
                 (Violation::NonAtomicPreconditions, mode) => {
@@ -230,7 +231,7 @@ impl ObjectStore for FaultyStore {
         Box::pin(async move {
             let mut page = self.inner.list_sync(prefix, after, limit);
             if matches!(self.violation, Violation::StaleListings) {
-                let w = self.written.lock().unwrap();
+                let w = self.written.lock();
                 page.objects.retain(|o| w.get(&o.key).is_none_or(|t| t.elapsed() > Duration::from_secs(2)));
             }
             Ok(page)

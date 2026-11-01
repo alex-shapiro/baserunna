@@ -3,12 +3,14 @@
 use super::tuple::Key;
 use crate::engine::BlobRef;
 use crate::error::{Error, Result};
-use crate::util::b64;
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
+use baserunna_api as api;
+use baserunna_api::b64;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 
+/// Stored column type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ColType {
@@ -40,6 +42,47 @@ impl ColType {
     pub fn indexable(self) -> bool {
         !matches!(self, ColType::Json | ColType::Blob)
     }
+
+    /// Converts a requested column type, failing if this server does not know it.
+    pub fn from_api(t: api::ColumnType) -> Result<ColType> {
+        let names = || ColType::ALL.map(ColType::name).join(", ");
+        ColType::ALL
+            .into_iter()
+            .find(|c| c.to_api() == t)
+            .ok_or_else(|| Error::invalid(format!("a column type is one of {}", names())))
+    }
+
+    pub fn to_api(self) -> api::ColumnType {
+        match self {
+            ColType::String => api::ColumnType::String,
+            ColType::Int => api::ColumnType::Int,
+            ColType::Float => api::ColumnType::Float,
+            ColType::Bool => api::ColumnType::Bool,
+            ColType::Bytes => api::ColumnType::Bytes,
+            ColType::Json => api::ColumnType::Json,
+            ColType::Blob => api::ColumnType::Blob,
+        }
+    }
+}
+
+/// Every row write maintains an index in either state, but only a `Ready`
+/// index can serve queries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexState {
+    #[default]
+    Ready,
+    /// Being backfilled from the table's rows.
+    Building,
+}
+
+impl IndexState {
+    pub fn to_api(self) -> api::IndexState {
+        match self {
+            IndexState::Ready => api::IndexState::Ready,
+            IndexState::Building => api::IndexState::Building,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -61,17 +104,6 @@ pub struct IndexDef {
     pub unique: bool,
     #[serde(default)]
     pub state: IndexState,
-}
-
-/// Every row write maintains an index in either state, but only a `Ready`
-/// index can serve queries.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum IndexState {
-    #[default]
-    Ready,
-    /// Being backfilled from the table's rows.
-    Building,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -259,17 +291,29 @@ impl TableSchema {
         Ok(())
     }
 
+    pub fn to_api(&self) -> baserunna_api::Table {
+        let column = |c: &Column| baserunna_api::Column {
+            name: c.name.clone(),
+            ty: c.ty.to_api(),
+            nullable: c.nullable,
+            default: c.default.clone(),
+        };
+        let index = |i: &IndexDef| baserunna_api::Index {
+            name: i.name.clone(),
+            columns: i.columns.clone(),
+            unique: i.unique,
+            state: i.state.to_api(),
+        };
+        baserunna_api::Table {
+            name: self.name.clone(),
+            columns: self.columns.iter().map(column).collect(),
+            primary_key: self.primary_key.clone(),
+            indexes: self.indexes.iter().map(index).collect(),
+        }
+    }
+
     pub fn to_json(&self) -> Json {
-        json!({
-            "name": self.name,
-            "columns": self.columns.iter().map(|c| {
-                let mut o = json!({"name": c.name, "type": c.ty, "nullable": c.nullable});
-                if let Some(d) = &c.default { o["default"] = d.clone(); }
-                o
-            }).collect::<Vec<_>>(),
-            "primary_key": self.primary_key,
-            "indexes": self.indexes.iter().map(|i| json!({"name": i.name, "columns": i.columns, "unique": i.unique, "state": i.state})).collect::<Vec<_>>(),
-        })
+        serde_json::to_value(self.to_api()).expect("table schemas serialize")
     }
 }
 

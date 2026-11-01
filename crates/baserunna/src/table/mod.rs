@@ -8,7 +8,7 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use crate::filter::{self, Target, Test};
-use crate::util::b64;
+use baserunna_api::{self as api, b64};
 use bytes::Bytes;
 use schema::{ColType, Column, Datum, IndexDef, IndexState, Row, TableSchema, datum_from_json, key_from_json};
 use serde::Deserialize;
@@ -115,44 +115,8 @@ fn put_schema(txn: &mut Txn, s: &TableSchema) -> Result<()> {
     txn.put(catalog_key(&s.name), Value::Inline(Bytes::from(data)))
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ColumnSpec {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub ty: ColType,
-    #[serde(default = "default_true")]
-    pub nullable: bool,
-    #[serde(default)]
-    pub default: Option<Json>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IndexSpec {
-    pub name: String,
-    pub columns: Vec<String>,
-    #[serde(default)]
-    pub unique: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateTable {
-    pub name: String,
-    pub columns: Vec<ColumnSpec>,
-    pub primary_key: Vec<String>,
-    #[serde(default)]
-    pub indexes: Vec<IndexSpec>,
-    #[serde(default)]
-    pub if_not_exists: bool,
-}
-
-pub async fn create_table(txn: &mut Txn, def: &CreateTable) -> Result<TableSchema> {
+pub async fn create_table(txn: &mut Txn, def: &api::NewTable) -> Result<TableSchema> {
+    let types = def.columns.iter().map(|c| ColType::from_api(c.ty)).collect::<Result<Vec<_>>>()?;
     if let Some(existing) = txn.get(&catalog_key(&def.name)).await? {
         if def.if_not_exists {
             return decode_schema(&existing);
@@ -169,11 +133,11 @@ pub async fn create_table(txn: &mut Txn, def: &CreateTable) -> Result<TableSchem
         next_column_id: 1,
         next_index_id: 1,
     };
-    for c in &def.columns {
+    for (c, ty) in def.columns.iter().zip(types) {
         s.columns.push(Column {
             id: s.next_column_id,
             name: c.name.clone(),
-            ty: c.ty,
+            ty,
             nullable: c.nullable && !def.primary_key.contains(&c.name),
             default: c.default.clone(),
         });
@@ -218,7 +182,7 @@ pub async fn drop_table(txn: &mut Txn, name: &str) -> Result<()> {
     txn.delete(catalog_key(name))
 }
 
-pub async fn add_column(txn: &mut Txn, table: &str, c: &ColumnSpec) -> Result<TableSchema> {
+pub async fn add_column(txn: &mut Txn, table: &str, c: &api::NewColumn) -> Result<TableSchema> {
     let mut s = get_schema(txn, table).await?;
     if s.column(&c.name).is_some() {
         return Err(Error::AlreadyExists(format!("column {:?} already exists", c.name)));
@@ -229,7 +193,7 @@ pub async fn add_column(txn: &mut Txn, table: &str, c: &ColumnSpec) -> Result<Ta
     s.columns.push(Column {
         id: s.next_column_id,
         name: c.name.clone(),
-        ty: c.ty,
+        ty: ColType::from_api(c.ty)?,
         nullable: c.nullable,
         default: c.default.clone(),
     });
@@ -307,7 +271,7 @@ macro_rules! retrying_txn {
 /// Resumes an interrupted build if an identical `building` index already exists.
 /// If a unique index encounters duplicate values during backfill, the index is
 /// removed and `AlreadyExists` is returned.
-pub async fn add_index(db: &Arc<Db>, table: &str, spec: &IndexSpec, opts: Backfill) -> Result<(TableSchema, Seq)> {
+pub async fn add_index(db: &Arc<Db>, table: &str, spec: &api::NewIndex, opts: Backfill) -> Result<(TableSchema, Seq)> {
     let (idx, _) = retrying_txn!(db, |t| begin_index(t, table, spec).await);
     match backfill(db, table, &idx, opts).await {
         Err(Error::AlreadyExists(m)) => {
@@ -318,7 +282,7 @@ pub async fn add_index(db: &Arc<Db>, table: &str, spec: &IndexSpec, opts: Backfi
     }
 }
 
-async fn begin_index(txn: &mut Txn, table: &str, spec: &IndexSpec) -> Result<IndexDef> {
+async fn begin_index(txn: &mut Txn, table: &str, spec: &api::NewIndex) -> Result<IndexDef> {
     let mut s = get_schema(txn, table).await?;
     if let Some(i) = s.index(&spec.name) {
         if i.state == IndexState::Building && i.columns == spec.columns && i.unique == spec.unique {
@@ -905,15 +869,6 @@ async fn all_rows(txn: &mut Txn, s: &TableSchema) -> Result<Vec<(Bytes, Vec<Key>
     Ok(out)
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct RangeSpec {
-    pub gt: Option<Json>,
-    pub gte: Option<Json>,
-    pub lt: Option<Json>,
-    pub lte: Option<Json>,
-}
-
 /// Row filter (SPEC §4.7) over table columns (`{"col": name, "op": ..}`).
 pub type Filter = filter::Filter<Col>;
 
@@ -937,7 +892,7 @@ pub struct Query {
     #[serde(default)]
     pub eq: Vec<Json>,
     #[serde(default)]
-    pub range: Option<RangeSpec>,
+    pub range: Option<api::RangeSpec>,
     #[serde(default)]
     pub filter: Option<Filter>,
     #[serde(default)]
@@ -961,7 +916,9 @@ fn bind_filter(s: &TableSchema, f: &Filter) -> Result<RowFilter> {
         let fits = match (test, c.ty) {
             (Test::Exists, _) => true,
             (_, ColType::Blob) => false,
-            (Test::Prefix(_) | Test::Contains(_), ty) => matches!(ty, ColType::String | ColType::Bytes | ColType::Json),
+            (Test::Prefix(_) | Test::Contains(_), ty) => {
+                matches!(ty, ColType::String | ColType::Bytes | ColType::Json)
+            }
             _ => true,
         };
         if !fits {
@@ -1056,9 +1013,22 @@ pub struct Selection {
     #[serde(default)]
     pub eq: Vec<Json>,
     #[serde(default)]
-    pub range: Option<RangeSpec>,
+    pub range: Option<api::RangeSpec>,
     #[serde(default)]
     pub filter: Option<Filter>,
+}
+
+impl TryFrom<baserunna_api::Selection> for Selection {
+    type Error = Error;
+
+    fn try_from(s: baserunna_api::Selection) -> Result<Selection> {
+        let baserunna_api::Selection { index, eq, range, filter } = s;
+        let filter = filter
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))?;
+        Ok(Selection { index, eq, range, filter })
+    }
 }
 
 struct AccessPath {

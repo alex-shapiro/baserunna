@@ -234,9 +234,23 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       response types into `baserunna-api`, derive JSON Schema for them, and
       generate `openapi.json` from the `Endpoint` definitions instead of
       maintaining `api/openapi.rs` by hand.
-- [ ] **Replace `baserunna::client` with `baserunna-client`.** Add table,
-      stream, and event-table methods to `baserunna-client`, migrate the
-      examples, and delete `crates/baserunna/src/client.rs`.
+- [ ] **Replace `baserunna::client` with `baserunna-client`.** Add event-table
+      operations and schema routes to `baserunna-client`, migrate the examples,
+      and delete `crates/baserunna/src/client.rs`.
+- [ ] **Cover every transaction operation in `baserunna_client::Op`.** It lacks
+      `update_rows`, `stream_info`, `trim_stream`, `get_consumer`,
+      `set_consumer`, the event operations, `ttl_ms` on writes, `expect_seq` on
+      `append`, and `check` by value, so stream consumers cannot be used from
+      the client at all.
+- [ ] **Return operation results from client writes.** `Db::write` and
+      `Txn::commit` drop the per-operation results that the server returns, so
+      a caller cannot read, for example, the value of an `increment` or the
+      count of a `delete_rows` with exactly-once semantics.
+- [ ] **Type the remaining JSON in `baserunna-api`.** `query_events` results,
+      row and stream `filter`s, and the routes outside `Endpoint` (KV, table
+      schema changes, row routes, streams, events, organizations) are still
+      built or parsed as untyped JSON on the server, so the compiler cannot
+      check them against `baserunna-client`.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`.
 - [ ] **Validate additional S3-compatible object stores.** Run the conformance
@@ -272,10 +286,49 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       different cached views of live cluster members, a long-poll request can be
       routed to a rendezvous home node that does not receive commit notices.
       Peers can hold different membership views before all peers refresh after a
-      node joins, or between refreshes if `members_refresh_ms` is greater than
-      `2 × heartbeat_ms` in simulation swarm configurations. Derive the
-      membership liveness window from both intervals, and send commit notices to
-      the home nodes of both previous and current membership views.
+      node joins. Send commit notices to the home nodes of both previous and
+      current membership views.
+- [ ] **Route interactive transaction requests to the node that holds the
+      transaction.** An open transaction lives in the memory of the node that
+      began it, but later requests on it are routed like any database request,
+      to the lease holder or the rendezvous home in the receiving node's view of
+      live members. When views differ, such as after a node joins or while a
+      peer is suspect, a commit reaches another node and fails with
+      `txn_not_found`. Encode the node in the transaction ID and forward by it.
+- [ ] **Let a client abort a transaction whose begin response is lost.** The
+      server assigns the transaction ID in the `begin` response, so if the
+      network loses that response or the request times out after the server
+      opened the transaction, `baserunna_client::Txn` cannot abort it and it
+      holds one of the user's open transaction slots until its idle timeout. A
+      client-chosen ID with abort tombstones was tried and rejected: tombstones
+      for arbitrary IDs need a per-user bound, a retried begin must not hit the
+      tombstone of its own failed attempt, and older servers reject the new
+      field.
+- [ ] **Report why an interactive commit failed when its retry finds no
+      transaction.** The commit handler removes the transaction before it can
+      fail, so after a transient failure such as `503 commit deadline exceeded`,
+      `baserunna_client::Client` retries the commit and reports the retry's
+      `txn_not_found` instead of the cause. Record the cause with the abort
+      reasons that `txn_not_found` reports, or end the transaction only once the
+      commit cannot be retried.
+- [ ] **Reject writes in `baserunna_client::Db::read`.** It sends write
+      operations without an idempotency key, so they are not exactly-once and a
+      lost response leaves their outcome unknown.
+- [ ] **Decode roles added by newer servers.** `api::Role` has no fallback for
+      unknown values, so `Me` and `Member` responses from a newer server with a
+      new role fail to decode in `baserunna-client`.
+- [ ] **Page reverse stream reads from a fixed lower bound.** A reverse
+      `read_stream` that starts from `tail` recomputes its lower bound from the
+      stream's end on each page, so `Op::next_page` returns a different range if
+      records are appended between pages.
+- [ ] **Require an explicit request to select every row.** The server reads a
+      `where` or `query_rows` without `eq`, `range` or `filter` as every row,
+      so a raw HTTP client or a generated SDK that builds an empty prefix at
+      runtime deletes or reads the whole table. `baserunna-client` guards
+      against this on its side. A `delete_range` with an empty `prefix` likewise
+      deletes every key.
+- [ ] **Fix the `events` fuzz target**, which no longer compiles because
+      `PartRef` has no `min_version` and `max_version` fields.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the
       model-checked `http_txn` target, and fuzz `PartMeta::decode` and
       `ColIndex::decode` on unframed byte slices instead of CRC-framed inputs.

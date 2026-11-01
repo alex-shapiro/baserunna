@@ -22,9 +22,10 @@ use crate::store::{GetOpts, PutMode, StoreError};
 use crate::timing::{self, StoreOp, Tally};
 use crate::util::{Either, race};
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -330,32 +331,24 @@ impl Db {
         })
     }
 
-    fn st(&self) -> std::sync::MutexGuard<'_, State> {
-        self.st.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
-        self.q.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     pub fn shared(&self) -> &Arc<Shared> {
         &self.shared
     }
 
     pub fn current(&self) -> Option<Arc<Version>> {
-        self.st().current.clone()
+        self.st.lock().current.clone()
     }
 
     /// Returns true if commits, compaction, sweeps, or retention trims are running or queued.
     pub fn busy(&self) -> bool {
-        let st = self.st();
-        let q = self.queue();
+        let st = self.st.lock();
+        let q = self.q.lock();
         q.running || !q.items.is_empty() || st.compacting || st.flushing || st.sweeping || st.trimming
     }
 
     pub(crate) fn idle_for(&self, ms: u64) -> bool {
-        let st = self.st();
-        let q = self.queue();
+        let st = self.st.lock();
+        let q = self.q.lock();
         !q.running
             && q.items.is_empty()
             && !st.compacting
@@ -366,7 +359,7 @@ impl Db {
     }
 
     pub(crate) fn last_access_seq(&self) -> u64 {
-        self.st().last_access_seq
+        self.st.lock().last_access_seq
     }
 
     /// Drops the cached manifest and page cache if the database is idle and not a system
@@ -381,8 +374,8 @@ impl Db {
         {
             return false;
         }
-        let mut st = self.st();
-        let q = self.queue();
+        let mut st = self.st.lock();
+        let q = self.q.lock();
         let busy = q.running || !q.items.is_empty() || q.parked_flush.is_some();
         if busy || st.compacting || st.flushing || st.sweeping || st.trimming || st.in_flight_hedged_puts > 0 {
             return false;
@@ -392,7 +385,7 @@ impl Db {
         st.verified_at = None;
         drop(q);
         drop(st);
-        let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pages = self.pages.lock();
         pages.0 = PageCache::default();
         pages.1.set(0);
         probe::hit(Probe::DatabaseUnloaded);
@@ -421,14 +414,14 @@ impl Db {
     fn note_own_lease(&self, m: &Manifest, sent: Instant) {
         if let Some(l) = m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
             let margin = self.shared.cfg.lease_margin_ms.min(l.ms);
-            self.st().own_lease = Some((m.write_seq, sent + Duration::from_millis(l.ms - margin)));
+            self.st.lock().own_lease = Some((m.write_seq, sent + Duration::from_millis(l.ms - margin)));
         }
     }
 
     /// Caps `own_lease` to the expiration granted by `m` at `sent` because peers can observe `m`
     /// immediately after `sent`.
     fn limit_own_lease(&self, m: &Manifest, sent: Instant) {
-        let mut st = self.st();
+        let mut st = self.st.lock();
         let Some((ws, until)) = st.own_lease else { return };
         let granted = match m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
             Some(l) => sent + Duration::from_millis(l.ms - self.shared.cfg.lease_margin_ms.min(l.ms)),
@@ -470,14 +463,14 @@ impl Db {
 
     /// Returns `(write_seq, etag, has_in_flight_write)` if this node holds a valid lease for strong reads.
     pub fn leased_view(&self) -> Option<(u64, String, bool)> {
-        let st = self.st();
+        let st = self.st.lock();
         let cur = st.current.as_ref()?;
         (st.trusted && st.in_flight_hedged_puts == 0 && self.holds_lease(&st, &cur.m))
             .then(|| (cur.m.write_seq, cur.etag.clone(), self.has_in_flight_write()))
     }
 
     pub fn lease_holder(&self) -> Option<String> {
-        let st = self.st();
+        let st = self.st.lock();
         let cur = st.current.clone()?;
         if self.holds_lease(&st, &cur.m) {
             return Some(self.shared.node_id.clone());
@@ -521,8 +514,8 @@ impl Db {
         (limit > 0 && !self.shared.is_system(&self.id)).then_some(limit)
     }
 
-    fn staging(&self) -> std::sync::MutexGuard<'_, Staging> {
-        let mut g = self.staging.lock().unwrap_or_else(|e| e.into_inner());
+    fn staging(&self) -> parking_lot::MutexGuard<'_, Staging> {
+        let mut g = self.staging.lock();
         let ttl = Duration::from_millis(self.shared.cfg.blob_stage_ttl_ms);
         g.staged.retain(|_, (_, at)| at.elapsed() < ttl);
         g
@@ -532,7 +525,7 @@ impl Db {
     pub(crate) fn reserve_staging(&self, n: u64) -> Result<()> {
         let Some(limit) = self.quota() else { return Ok(()) };
         let stored = {
-            let st = self.st();
+            let st = self.st.lock();
             st.current.as_ref().map_or(st.unloaded_stored_bytes, |v| v.m.stored_bytes())
         };
         let mut g = self.staging();
@@ -556,7 +549,7 @@ impl Db {
     /// Installs `v` if it is newer than `current`, and marks `current` as trusted if `verified`
     /// is not earlier than `distrusted_at`.
     fn install(&self, v: Arc<Version>, verified: Instant) -> Arc<Version> {
-        let mut st = self.st();
+        let mut st = self.st.lock();
         self.shared.env.trace(|| {
             format!(
                 "{} install v{} ws{} (current {:?})",
@@ -602,7 +595,7 @@ impl Db {
     async fn refresh_at(self: &Arc<Self>, not_before: Instant, create: bool) -> Result<(Arc<Version>, Instant)> {
         let _g = self.load_lock.lock().await;
         let (etag, cur) = {
-            let st = self.st();
+            let st = self.st.lock();
             if let (Some(c), Some(va)) = (&st.current, st.verified_at)
                 && va >= not_before
                 && st.trusted
@@ -734,7 +727,7 @@ impl Db {
         let (v, current_at) = self.refresh_at(not_before, false).await?;
         self.shared.env.trace(|| format!("{} read v{} after refresh (lease={:?})", self.id, v.m.version, v.m.lease));
         let hot = {
-            let mut st = self.st();
+            let mut st = self.st.lock();
             let hot = st.hot(self.shared.cfg.lease_read_threshold) && !st.lease_requested;
             if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v).is_none() {
                 st.lease_requested = true;
@@ -751,7 +744,7 @@ impl Db {
 
     fn cached(self: &Arc<Self>, c: Consistency, now: Instant) -> Option<(Arc<Version>, Instant)> {
         let cfg = &self.shared.cfg;
-        let mut st = self.st();
+        let mut st = self.st.lock();
         st.last_access = now;
         st.last_access_seq = self.shared.next_access_seq();
         let window = Duration::from_millis(cfg.read_lease_ms);
@@ -929,7 +922,7 @@ impl Db {
     /// this node held the lease, and released it.
     pub async fn release_lease(self: &Arc<Self>) -> Result<bool> {
         let held = {
-            let st = self.st();
+            let st = self.st.lock();
             let in_manifest =
                 st.current.as_ref().is_some_and(|c| c.m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id));
             in_manifest || st.own_lease.is_some_and(|(_, until)| until > Instant::now())
@@ -981,7 +974,7 @@ impl Db {
     /// Returns the instant at which the cached manifest exceeds `max_staleness`, or `None` if
     /// the manifest has not been validated.
     pub fn stale_at(&self, max_staleness: Duration) -> Option<Instant> {
-        self.st().verified_at.map(|v| v + max_staleness)
+        self.st.lock().verified_at.map(|v| v + max_staleness)
     }
 
     /// Records that another node committed `version` and reloads the manifest if any callers
@@ -1030,7 +1023,7 @@ impl Db {
 
     fn enqueue(self: &Arc<Self>, w: Work) {
         let spawn = {
-            let mut q = self.queue();
+            let mut q = self.q.lock();
             q.items.push_back(QueuedWork {
                 work: w,
                 enqueued_at: Instant::now(),
@@ -1052,7 +1045,7 @@ impl Db {
     async fn committer(self: Arc<Self>) {
         loop {
             let queued: Vec<QueuedWork> = {
-                let mut q = self.queue();
+                let mut q = self.q.lock();
                 if q.items.is_empty() {
                     q.running = false;
                     return;
@@ -1109,7 +1102,7 @@ impl Db {
 
     async fn base_for_commit(self: &Arc<Self>) -> Result<Arc<Version>> {
         let (cur, trusted) = {
-            let st = self.st();
+            let st = self.st.lock();
             (st.current.clone(), st.trusted)
         };
         match cur {
@@ -1163,7 +1156,7 @@ impl Db {
                 }
             };
             if plan.quota_refused {
-                self.st().quota_pressure = true;
+                self.st.lock().quota_pressure = true;
                 probe::hit(Probe::QuotaRefused);
             }
             let Some(m) = plan.manifest else {
@@ -1199,7 +1192,7 @@ impl Db {
             self.limit_own_lease(&m, attempt_started);
             self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let data = {
-                let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+                let mut pages = self.pages.lock();
                 let data = m.encode_with(&mut pages.0);
                 let bytes = pages.0.heap_bytes();
                 pages.1.set(bytes);
@@ -1208,7 +1201,7 @@ impl Db {
             let res = self.put_manifest(data, &base.etag).await;
             if !res.is_ok() {
                 if matches!(res, Err(StoreError::Unavailable(_))) {
-                    self.st().distrust();
+                    self.st.lock().distrust();
                 }
                 self.write_finished();
             }
@@ -1244,7 +1237,7 @@ impl Db {
                     }
                     maybe_applied = true;
                     unknown_writes.push((m.write_seq, attempt_started, base.etag.clone()));
-                    self.st().distrust();
+                    self.st.lock().distrust();
                     // If the write was applied, `plan.gc` was removed from `obsolete` in the manifest.
                     // These objects have already passed their grace period, so they can be deleted safely
                     // even if the write failed.
@@ -1406,11 +1399,11 @@ impl Db {
             }
             Err(StoreError::PreconditionFailed) if hedge_won => {
                 probe::hit(Probe::HedgeRejectedFirstInFlight);
-                self.st().in_flight_hedged_puts += 1;
+                self.st.lock().in_flight_hedged_puts += 1;
                 let me = self.clone();
                 self.shared.env.spawn(async move {
                     let landed = !matches!(first.await, Err(StoreError::PreconditionFailed));
-                    let mut st = me.st();
+                    let mut st = me.st.lock();
                     st.in_flight_hedged_puts -= 1;
                     if landed {
                         st.distrust();
@@ -1434,7 +1427,7 @@ impl Db {
 
     fn clear_lease_flag(&self, batch: &[Work]) {
         if batch.iter().any(|w| matches!(w, Work::Lease { .. })) {
-            self.st().lease_requested = false;
+            self.st.lock().lease_requested = false;
         }
     }
 
@@ -2040,7 +2033,7 @@ impl Db {
         self.delete_obsolete(gc);
         self.shared.refresh_clock();
         {
-            let mut st = self.st();
+            let mut st = self.st.lock();
             if !st.compacting && compaction::pick(&v.m, cfg).is_some() {
                 st.compacting = true;
                 let me = self.clone();
@@ -2055,7 +2048,7 @@ impl Db {
                             return;
                         }
                     }
-                    me.st().compacting = false;
+                    me.st.lock().compacting = false;
                 });
             }
         }
@@ -2070,7 +2063,7 @@ impl Db {
             return;
         }
         {
-            let mut st = self.st();
+            let mut st = self.st.lock();
             if st.flushing || !self.holds_lease(&st, &v.m) {
                 return;
             }
@@ -2092,14 +2085,14 @@ impl Db {
                     None => break,
                 }
             }
-            me.st().flushing = false;
+            me.st.lock().flushing = false;
         });
     }
 
     /// Checks whether background work is still needed on the current version while holding the
     /// state lock, clearing `flag` if not.
     fn has_more_work(&self, flag: fn(&mut State) -> &mut bool, due: impl Fn(&Manifest) -> bool) -> bool {
-        let mut st = self.st();
+        let mut st = self.st.lock();
         let again = st.current.as_ref().is_some_and(|c| self.holds_lease(&st, &c.m) && due(&c.m));
         if !again {
             *flag(&mut st) = false;
@@ -2147,13 +2140,13 @@ impl Db {
     /// Parks a flush for up to `FLUSH_INSTALL_WAIT_MS` so it can be batched with the next commit.
     fn park_flush(self: &Arc<Self>, w: Work) {
         let queued = QueuedWork { work: w, enqueued_at: Instant::now(), request_id: None };
-        if let Some(old) = self.queue().parked_flush.replace(queued) {
+        if let Some(old) = self.q.lock().parked_flush.replace(queued) {
             old.work.fail(Error::internal("a parked flush was replaced"));
         }
         let me = self.clone();
         self.shared.env.spawn(async move {
             tokio::time::sleep(Duration::from_millis(FLUSH_INSTALL_WAIT_MS)).await;
-            let parked = me.queue().parked_flush.take();
+            let parked = me.q.lock().parked_flush.take();
             if let Some(q) = parked {
                 me.enqueue(q.work);
             }
@@ -2162,7 +2155,7 @@ impl Db {
 
     fn schedule_trims(self: &Arc<Self>, ids: BTreeSet<u64>) {
         let start = {
-            let mut st = self.st();
+            let mut st = self.st.lock();
             st.trim_queue.extend(ids);
             let start = !st.trimming && !st.trim_queue.is_empty();
             st.trimming |= start;
@@ -2173,7 +2166,7 @@ impl Db {
             self.shared.env.spawn(async move {
                 if let Err(e) = me.clone().trim_queued().await {
                     crate::debug!("retention trims of {} stopped: {e}", me.id);
-                    let mut st = me.st();
+                    let mut st = me.st.lock();
                     st.trim_queue.clear();
                     st.trimming = false;
                 }
@@ -2185,7 +2178,7 @@ impl Db {
         let mut failures = 0;
         loop {
             let id = {
-                let mut st = self.st();
+                let mut st = self.st.lock();
                 match st.trim_queue.pop_first() {
                     Some(id) => id,
                     None => {
@@ -2199,7 +2192,7 @@ impl Db {
                 Err(e) if e.retryable() && failures < TRIM_RETRIES => {
                     failures += 1;
                     probe::hit(Probe::RetentionTrimRetried);
-                    self.st().trim_queue.insert(id);
+                    self.st.lock().trim_queue.insert(id);
                     tokio::time::sleep(Duration::from_millis(100 << failures)).await;
                 }
                 Err(e) => return Err(e),
@@ -2257,7 +2250,7 @@ impl Db {
     fn maybe_sweep(self: &Arc<Self>, v: &Version) {
         let cfg = &self.shared.cfg;
         let Some(now) = self.shared.store_now_ms() else { return };
-        let mut st = self.st();
+        let mut st = self.st.lock();
         let interval = if st.quota_pressure { cfg.quota_sweep_interval_ms } else { cfg.sweep_interval_ms };
         if st.sweeping || (v.m.last_sweep_ms + interval > now && !crate::buggify::fires(0.02)) {
             return;
@@ -2269,7 +2262,7 @@ impl Db {
             if let Err(e) = me.clone().sweep().await {
                 crate::debug!("sweep of {} stopped: {e}", me.id);
             }
-            me.st().sweeping = false;
+            me.st.lock().sweeping = false;
         });
     }
 
@@ -2280,7 +2273,7 @@ impl Db {
         loop {
             let store_now = self.shared.store_time_ms().await?;
             let Some(v) = self.current() else { return Ok(()) };
-            if !self.holds_lease(&self.st(), &v.m) {
+            if !self.holds_lease(&self.st.lock(), &v.m) {
                 probe::hit(Probe::CompactionLostLease);
                 return Ok(());
             }
@@ -2336,7 +2329,7 @@ impl Db {
         let cfg = self.shared.cfg.clone();
         let now_ms = self.shared.store_time_ms().await?;
         let v = self.refresh(Instant::now(), false).await?;
-        if !self.holds_lease(&self.st(), &v.m) {
+        if !self.holds_lease(&self.st.lock(), &v.m) {
             return Ok(());
         }
         let mut referenced: BTreeSet<(ObjKind, String)> =
@@ -2850,14 +2843,14 @@ mod tests {
 
     use crate::store::{BoxFut, GetResult, ListPage, ObjectStore};
 
-    struct Scripted(std::sync::Mutex<VecDeque<(u64, crate::store::SResult<String>)>>);
+    struct Scripted(parking_lot::Mutex<VecDeque<(u64, crate::store::SResult<String>)>>);
 
     impl ObjectStore for Scripted {
         fn get<'a>(&'a self, _: &'a str, _: GetOpts) -> BoxFut<'a, crate::store::SResult<GetResult>> {
             Box::pin(async { Err(StoreError::NotFound) })
         }
         fn put<'a>(&'a self, _: &'a str, _: Bytes, _: PutMode) -> BoxFut<'a, crate::store::SResult<String>> {
-            let (ms, r) = self.0.lock().unwrap().pop_front().expect("unexpected put");
+            let (ms, r) = self.0.lock().pop_front().expect("unexpected put");
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
                 r
@@ -2883,7 +2876,7 @@ mod tests {
             store.manifest_put_lost.store(1, SeqCst);
             put(&db, "k", "2").await;
             let cur = db.current().unwrap();
-            assert!(db.holds_lease(&db.st(), &cur.m));
+            assert!(db.holds_lease(&db.st.lock(), &cur.m));
         });
     }
 
@@ -2904,7 +2897,7 @@ mod tests {
         ];
         for (first, hedge, want, ms, in_flight) in cases {
             rt().block_on(async {
-                let script = Scripted(std::sync::Mutex::new(
+                let script = Scripted(parking_lot::Mutex::new(
                     [Some(first.clone()), hedge.clone()].into_iter().flatten().collect(),
                 ));
                 let origin = tokio::time::Instant::now();
@@ -2914,7 +2907,7 @@ mod tests {
                 let db = eng.db("d");
                 let got = db.put_manifest(Bytes::from_static(b"m"), "e1").await.map(drop);
                 let case = format!("first {first:?}, hedge {hedge:?}");
-                assert_eq!(db.st().in_flight_hedged_puts, u32::from(in_flight), "{case}");
+                assert_eq!(db.st.lock().in_flight_hedged_puts, u32::from(in_flight), "{case}");
                 match (&got, &want) {
                     (Err(Unavailable(_)), Err(Unavailable(_))) => {}
                     _ => assert_eq!(got, want, "{case}"),

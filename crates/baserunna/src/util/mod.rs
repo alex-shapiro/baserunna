@@ -1,4 +1,3 @@
-pub use baserunna_api::b64;
 pub mod bloom;
 pub mod codec;
 pub mod crc32c;
@@ -106,6 +105,7 @@ pub fn key_successor(key: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baserunna_api::b64;
 
     #[test]
     fn prefix_end_works() {

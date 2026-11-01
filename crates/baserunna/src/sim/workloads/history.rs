@@ -16,9 +16,10 @@
 use super::super::Sim;
 use super::super::client::{Client, Status, ZOMBIE_WAIT_MS};
 use crate::util::rng::Rng;
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
@@ -699,7 +700,7 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
                 }
                 t.end = sim.now_ms();
                 sim.trace.event(&format!("history {t:?}"));
-                history.lock().unwrap_or_else(|e| e.into_inner()).push(t);
+                history.lock().push(t);
             }
             Ok::<(), String>(())
         }));
@@ -714,7 +715,7 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
         return Err(e);
     }
     super::settle(&sim, phase).await;
-    let mut h = history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut h = history.lock().clone();
     h.push(final_read(&sim, &owner, db, shape.keys).await?);
     let markers = owner.paginate(&format!("/v1/dbs/{db}/kv?prefix=m/&limit=100"), "items").await?;
     let mut markers: BTreeMap<String, u64> = markers

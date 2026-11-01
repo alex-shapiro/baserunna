@@ -879,7 +879,7 @@ mod query_semantics {
                 {"name": "time", "type": "time"}, {"name": "uid", "type": "int"}, {"name": "alias", "type": "string"}
             ])))
             .await;
-            let tdef: crate::table::CreateTable = serde_json::from_value(json!({"name": "people",
+            let tdef: baserunna_api::NewTable = serde_json::from_value(json!({"name": "people",
                 "columns": [{"name": "id", "type": "int"}, {"name": "plan", "type": "string"}],
                 "primary_key": ["id"]}))
             .unwrap();
@@ -918,7 +918,7 @@ mod query_semantics {
             let (_e, db, _id) =
                 setup(def(json!([{"name": "time", "type": "time"}, {"name": "uid", "type": "int"}]))).await;
             for name in ["people", "teams"] {
-                let tdef: crate::table::CreateTable = serde_json::from_value(json!({"name": name,
+                let tdef: baserunna_api::NewTable = serde_json::from_value(json!({"name": name,
                     "columns": [{"name": "id", "type": "int"}, {"name": "plan", "type": "string"}],
                     "primary_key": ["id"]}))
                 .unwrap();
@@ -1013,11 +1013,11 @@ mod storage {
         req: crate::engine::CommitRequest,
     ) -> (Result<crate::engine::Committed>, Result<u64>) {
         db.shared().store_time_ms().await.unwrap();
-        let req = Arc::new(std::sync::Mutex::new(Some(req)));
-        let other: Arc<std::sync::Mutex<Option<Result<u64>>>> = Arc::default();
+        let req = Arc::new(parking_lot::Mutex::new(Some(req)));
+        let other: Arc<parking_lot::Mutex<Option<Result<u64>>>> = Arc::default();
         let (req2, other2) = (req.clone(), other.clone());
         let bind: BindFn = Arc::new(move |db: Arc<Db>, b| {
-            let (req, other) = (req2.lock().unwrap().take(), other2.clone());
+            let (req, other) = (req2.lock().take(), other2.clone());
             Box::pin(async move {
                 let (rs, o) = tokio::join!(db.bind(b), async {
                     match req {
@@ -1025,7 +1025,7 @@ mod storage {
                         None => Ok(0),
                     }
                 });
-                *other.lock().unwrap() = Some(o);
+                *other.lock() = Some(o);
                 rs
             })
         });
@@ -1033,7 +1033,7 @@ mod storage {
         let valid = validate_rows(s, rows, 0).unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let inserted = bufs.submit(db.clone(), s.clone(), valid, 4242, deadline).await;
-        let o = other.lock().unwrap().take().unwrap();
+        let o = other.lock().take().unwrap();
         (inserted, o)
     }
 
@@ -1344,7 +1344,7 @@ fn queries_stop_at_their_time_limit() {
 struct StallFirstPartGet {
     inner: crate::store::DynStore,
     stall_ms: u64,
-    seen: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    seen: parking_lot::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl crate::store::ObjectStore for StallFirstPartGet {
@@ -1353,7 +1353,7 @@ impl crate::store::ObjectStore for StallFirstPartGet {
         key: &'a str,
         opts: crate::store::GetOpts,
     ) -> crate::store::BoxFut<'a, crate::store::SResult<crate::store::GetResult>> {
-        let stall = key.contains("/part/") && self.seen.lock().unwrap().insert(key.to_string());
+        let stall = key.contains("/part/") && self.seen.lock().insert(key.to_string());
         Box::pin(async move {
             if stall {
                 tokio::time::sleep(std::time::Duration::from_millis(self.stall_ms)).await;
@@ -2981,7 +2981,7 @@ mod answers {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
-            let tdef: crate::table::CreateTable = serde_json::from_value(json!({"name": "people",
+            let tdef: baserunna_api::NewTable = serde_json::from_value(json!({"name": "people",
                 "columns": [{"name": "id", "type": "string"}, {"name": "score", "type": "json"}],
                 "primary_key": ["id"]}))
             .unwrap();

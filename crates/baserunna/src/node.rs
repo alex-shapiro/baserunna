@@ -17,9 +17,10 @@ use crate::txns::{OpenTxns, TxnLimits};
 use crate::util::{DetHashMap, TtlCache};
 use axum::body::Body;
 use http::Request;
+use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde_json::{Value as Json, json};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -247,7 +248,7 @@ impl Deadline {
 
     /// Returns the deadline instant, adjusted for any active pause.
     pub fn instant(&self) -> Instant {
-        let s = lock(&self.0);
+        let s = self.0.lock();
         match s.paused_since {
             Some(p) => s.instant + p.elapsed(),
             None => s.instant,
@@ -256,12 +257,12 @@ impl Deadline {
 
     /// Pauses the deadline if it is not already paused.
     pub fn pause(&self) {
-        lock(&self.0).paused_since.get_or_insert_with(Instant::now);
+        self.0.lock().paused_since.get_or_insert_with(Instant::now);
     }
 
     /// Resumes a paused deadline and extends it by the paused duration.
     pub fn resume(&self) {
-        let mut s = lock(&self.0);
+        let mut s = self.0.lock();
         if let Some(p) = s.paused_since.take() {
             s.instant += p.elapsed();
         }
@@ -326,10 +327,6 @@ const SUSPECT_MIN: Duration = Duration::from_secs(10);
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const CACHE_MAX: usize = 100_000;
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 impl Node {
     /// Starts a node, bootstrapping the system database and background tasks.
@@ -407,7 +404,7 @@ impl Node {
             return;
         }
         {
-            let mut pending = lock(&self.pending_notices);
+            let mut pending = self.pending_notices.lock();
             if let Some(v) = pending.get_mut(db) {
                 *v = (*v).max(version);
                 return;
@@ -422,7 +419,7 @@ impl Node {
             let mut sent = 0;
             while let Some(n) = node.upgrade() {
                 let version = {
-                    let mut pending = lock(&n.pending_notices);
+                    let mut pending = n.pending_notices.lock();
                     match pending.get(&db) {
                         Some(&v) if v > sent => v,
                         _ => {
@@ -475,21 +472,21 @@ impl Node {
         // Load members and cluster key before running metadata commands so they can be forwarded.
         let _ = self.refresh_members().await;
         if let Some(k) = &self.cfg.cluster_secret {
-            *lock(&self.cluster_key) = Some(k.clone());
+            *self.cluster_key.lock() = Some(k.clone());
         } else if let Ok(mut t) = self.sys_read_strong().await
             && meta::is_migrated(&mut t).await.unwrap_or(false)
             && let Ok(Some(k)) = meta::get_config(&mut t, "cluster_key").await
         {
-            *lock(&self.cluster_key) = Some(k);
+            *self.cluster_key.lock() = Some(k);
         }
         retry_unavailable(|| self.run_meta(MetaCmd::Migrate)).await?;
         let ensure = |key: &str| MetaCmd::EnsureConfig { key: key.into(), value: self.env.random_hex(32) };
         if self.cfg.cluster_secret.is_none() {
             let k: String = retry_unavailable(|| self.run_meta_as(ensure("cluster_key"))).await?;
-            *lock(&self.cluster_key) = Some(k);
+            *self.cluster_key.lock() = Some(k);
         }
         let key: String = retry_unavailable(|| self.run_meta_as(ensure("cookie_key"))).await?;
-        *lock(&self.cookie_key) = crate::util::b64::unhex(&key).unwrap_or_else(|| key.into_bytes());
+        *self.cookie_key.lock() = baserunna_api::b64::unhex(&key).unwrap_or_else(|| key.into_bytes());
         if let (Some(e), Some(p)) = (&self.cfg.admin_email, &self.cfg.admin_password) {
             let email = auth::normalize_email(e)?;
             let mut t = self.sys_read().await?;
@@ -514,18 +511,29 @@ impl Node {
 
     fn spawn_background(self: &Arc<Self>) {
         let me = Arc::downgrade(self);
-        let (refresh, hb) = (self.cfg.members_refresh_ms, Duration::from_millis(self.cfg.heartbeat_ms));
+        let hb = Duration::from_millis(self.cfg.heartbeat_ms);
+        // Peers count a node as live for 3 heartbeat intervals after the heartbeat they last read,
+        // so heartbeats and reads each happen at least once per interval.
+        let period = Duration::from_millis(self.cfg.members_refresh_ms).min(hb);
         self.env.spawn(async move {
-            let mut last_heartbeat = Instant::now();
+            let mut wait = hb;
             loop {
-                tokio::time::sleep(Duration::from_millis(refresh)).await;
+                tokio::time::sleep(wait).await;
                 let Some(n) = me.upgrade() else { return };
-                if last_heartbeat.elapsed() >= hb {
-                    match n.heartbeat().await {
-                        Ok(()) => last_heartbeat = Instant::now(),
-                        Err(e) => crate::debug!("{}: heartbeat failed: {e}", n.id),
+                wait = match n.heartbeat().await {
+                    Ok(()) => hb,
+                    Err(e) => {
+                        crate::debug!("{}: heartbeat failed: {e}", n.id);
+                        period
                     }
-                }
+                };
+            }
+        });
+        let me = Arc::downgrade(self);
+        self.env.spawn(async move {
+            loop {
+                tokio::time::sleep(period).await;
+                let Some(n) = me.upgrade() else { return };
                 let _ = n.refresh_members().await;
             }
         });
@@ -560,11 +568,11 @@ impl Node {
 
     /// Returns the shared cluster secret for internal endpoints.
     pub fn cluster_key(&self) -> Option<String> {
-        lock(&self.cluster_key).clone()
+        self.cluster_key.lock().clone()
     }
 
     pub fn cookie_key(&self) -> Vec<u8> {
-        lock(&self.cookie_key).clone()
+        self.cookie_key.lock().clone()
     }
 
     /// Marks the node as draining so health checks return 503 while in-flight requests finish.
@@ -595,7 +603,7 @@ impl Node {
     }
 
     pub fn members(&self) -> Vec<NodeRecord> {
-        lock(&self.members).clone()
+        self.members.lock().clone()
     }
 
     /// Returns live non-suspect peers with distinct addresses, plus this node if it is not draining.
@@ -624,10 +632,10 @@ impl Node {
         let mut t = self.sys_read_at(strong).await?;
         let nodes = meta::list_nodes(&mut t).await?;
         // Clear suspicion for peers that have heartbeated, restarted, or left.
-        lock(&self.suspects).retain(|id, s| {
+        self.suspects.lock().retain(|id, s| {
             nodes.iter().any(|n| n.id == *id && n.started_at == s.started_at && n.heartbeat_at <= s.heartbeat_at)
         });
-        *lock(&self.members) = nodes;
+        *self.members.lock() = nodes;
         Ok(())
     }
 
@@ -647,7 +655,7 @@ impl Node {
     }
 
     pub fn addr_of(&self, node_id: &str) -> Option<String> {
-        lock(&self.members).iter().find(|n| n.id == node_id).map(|n| n.addr.clone())
+        self.members.lock().iter().find(|n| n.id == node_id).map(|n| n.addr.clone())
     }
 
     /// Returns the address of `node_id`. If `node_id` is not in the cached membership list,
@@ -657,7 +665,7 @@ impl Node {
             return Some(a);
         }
         let due = {
-            let mut last = lock(&self.members_refreshed_on_demand);
+            let mut last = self.members_refreshed_on_demand.lock();
             let due = last.is_none_or(|t| t.elapsed() >= MEMBERS_REFRESH_ON_DEMAND_MIN);
             if due {
                 *last = Some(Instant::now());
@@ -673,9 +681,9 @@ impl Node {
 
     /// Excludes `node_id` from routing with exponential backoff after an undelivered forward.
     pub fn mark_suspect(&self, node_id: &str) {
-        let rec = lock(&self.members).iter().find(|n| n.id == node_id).cloned();
+        let rec = self.members.lock().iter().find(|n| n.id == node_id).cloned();
         let (started_at, heartbeat_at) = rec.map(|n| (n.started_at, n.heartbeat_at)).unwrap_or((0, i64::MIN));
-        let mut g = lock(&self.suspects);
+        let mut g = self.suspects.lock();
         let strikes = g.get(node_id).map_or(1, |s| s.strikes.saturating_add(1));
         let max = Duration::from_millis(3 * self.cfg.heartbeat_ms).max(SUSPECT_MIN);
         let backoff = SUSPECT_MIN.saturating_mul(1u32 << (strikes - 1).min(16)).min(max);
@@ -684,7 +692,7 @@ impl Node {
     }
 
     fn is_suspect(&self, node_id: &str) -> bool {
-        lock(&self.suspects).get(node_id).is_some_and(|s| Instant::now() < s.until)
+        self.suspects.lock().get(node_id).is_some_and(|s| Instant::now() < s.until)
     }
 
     /// Returns the `(node_id, addr)` of the peer that should handle a request for `db_id`, or
@@ -778,7 +786,7 @@ impl Node {
                             && let Ok(mut t) = self.sys_read_strong().await
                             && let Ok(Some(k)) = meta::get_config(&mut t, "cluster_key").await
                         {
-                            *lock(&self.cluster_key) = Some(k);
+                            *self.cluster_key.lock() = Some(k);
                         }
                         last_err = Error::unavailable("cluster key mismatch");
                         continue;
@@ -865,8 +873,10 @@ impl Node {
             let rs = match forward_to {
                 Some((addr, holder)) => {
                     crate::probe::hit(crate::probe::Probe::BindForwarded);
-                    let body =
-                        crate::api::ForwardedBind { db: db.id.clone(), bind: crate::util::b64::encode(&bind.encode()) };
+                    let body = crate::api::ForwardedBind {
+                        db: db.id.clone(),
+                        bind: baserunna_api::b64::encode(&bind.encode()),
+                    };
                     match self.forward_internal(&holder, &addr, "/internal/v1/events/bind", &body).await {
                         Ok(j) => crate::api::bind_results_from_json(&j, n)?,
                         Err(Ok(e @ Error::Unavailable { outcome_unknown: false, .. }))
@@ -1923,6 +1933,27 @@ mod tests {
                 completed_at - committed_at
             );
         });
+    }
+
+    #[test]
+    fn peers_stay_live_whatever_the_refresh_interval() {
+        fn check(latency_ms: u64, configure: fn(&mut super::NodeConfig)) {
+            run_paused(async move {
+                let w = World::with_config(2, latency_ms, configure).await;
+                let (a, b) = (w.node(0).clone(), w.node(1).clone());
+                let refresh = a.cfg.members_refresh_ms;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                for ms in (2_000..30_000).step_by(100) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let live: Vec<String> = a.live_members().into_iter().map(|m| m.id).collect();
+                    assert!(live.contains(&b.id), "refresh {refresh} ms: {} is not live after {ms} ms", b.id);
+                }
+            });
+        }
+        check(1, |c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 999));
+        check(100, |c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 950));
+        check(1, |c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 2_000));
+        check(1, |c| (c.heartbeat_ms, c.members_refresh_ms) = (1_000, 10_000));
     }
 
     #[test]

@@ -9,10 +9,11 @@ use crate::store::{BoxFut, DynStore, GetOpts, GetResult, ListPage, MemStore, Obj
 use crate::util::prop;
 use crate::util::rng::Rng;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -481,7 +482,7 @@ fn lease_sightings_outlive_handles_and_prune_when_full() {
         assert!(sh.lease_seen("a", &lease("y"), 6) > first);
         let a_seen = sh.lease_seen("a", &lease("y"), 6);
         let v = sh.cfg.read_lease_ms + sh.cfg.lease_margin_ms;
-        let present = |id: &str| sh.observed_leases.lock().unwrap().contains_key(id);
+        let present = |id: &str| sh.observed_leases.lock().contains_key(id);
         let age_to = |x: u64| async move {
             let now = tokio::time::Instant::now();
             tokio::time::advance((a_seen + std::time::Duration::from_millis(x * v / 100)) - now).await;
@@ -542,26 +543,26 @@ fn take_fault(n: &AtomicU32) -> bool {
 
 impl DelayStore {
     fn gets_matching(&self, f: impl Fn(&str) -> bool) -> usize {
-        self.gets.lock().unwrap().iter().filter(|(k, _)| f(k)).count()
+        self.gets.lock().iter().filter(|(k, _)| f(k)).count()
     }
 }
 
 impl ObjectStore for DelayStore {
     fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
         Box::pin(async move {
-            self.gets.lock().unwrap().push((key.to_string(), opts.if_none_match.is_some()));
+            self.gets.lock().push((key.to_string(), opts.if_none_match.is_some()));
             if key.ends_with("/manifest") && take_fault(&self.manifest_get_outages) {
                 return Err(StoreError::Unavailable("injected".into()));
             }
             if key.ends_with("/manifest")
-                && let Some(data) = self.stale_manifest.lock().unwrap().take()
+                && let Some(data) = self.stale_manifest.lock().take()
             {
                 let size = data.len() as u64;
                 return Ok(GetResult { data, etag: "stale".into(), size, last_modified_ms: 0 });
             }
             let r = self.mem.get_sync(key, &opts);
             if let (true, Ok(g)) = (key.contains("/seg/"), &r) {
-                self.seg_get_bytes.lock().unwrap().push(g.data.len());
+                self.seg_get_bytes.lock().push(g.data.len());
             }
             let mut delay = self.get_reply_ms.load(SeqCst);
             if key == super::clock::PROBE_KEY {
@@ -950,7 +951,7 @@ fn a_manifest_whose_levels_object_was_collected_is_read_again() {
         store.mem.delete(&levels_key("d", &old)).await.unwrap();
 
         let b = second_node(&a, &store, "b");
-        *store.stale_manifest.lock().unwrap() = Some(stale.clone());
+        *store.stale_manifest.lock() = Some(stale.clone());
         let before = crate::probe::count(crate::probe::Probe::LevelsCollectedUnderRead);
         let v = b.db("d").refresh(Instant::now(), false).await.unwrap();
         assert_eq!(v.m.levels, levels(), "read the replacing manifest");
@@ -959,7 +960,7 @@ fn a_manifest_whose_levels_object_was_collected_is_read_again() {
         let c = second_node(&a, &store, "c");
         let current = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().data;
         store.mem.delete(&levels_key("d", levels().as_deref().unwrap())).await.unwrap();
-        *store.stale_manifest.lock().unwrap() = Some(current);
+        *store.stale_manifest.lock() = Some(current);
         let r = c.db("d").refresh(Instant::now(), false).await;
         assert!(matches!(r, Err(Error::Internal(_))), "{:?}", r.err());
     });
@@ -1195,7 +1196,8 @@ fn handles_are_shared_until_idle_and_gone_after_purge() {
 
 #[test]
 fn op_batches_limits_and_defaults() {
-    use crate::ops::{Encoding, Op, OpCtx, exec_ops, make_value};
+    use crate::ops::{Op, OpCtx, exec_ops, make_value};
+    use baserunna_api::Encoding;
     rt().block_on(async {
         let (eng, _store) = delayed_engine("a");
         let db = eng.db("d");
@@ -1695,12 +1697,12 @@ fn unchanged_manifests_are_revalidated_conditionally() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
-        let after_open = store.gets.lock().unwrap().len();
+        let after_open = store.gets.lock().len();
         for _ in 0..2 {
             tokio::time::sleep(Duration::from_millis(1)).await;
             db.read_version(Consistency::Strong).await.unwrap();
         }
-        let gets = store.gets.lock().unwrap()[after_open..].to_vec();
+        let gets = store.gets.lock()[after_open..].to_vec();
         assert!(
             gets.len() == 2 && gets.iter().all(|(k, conditional)| k.ends_with("/manifest") && *conditional),
             "{gets:?}"
@@ -1829,7 +1831,7 @@ fn large_databases_compact_in_bounded_requests() {
         let total: u64 = v.m.segments.iter().map(|s| s.size).sum();
         assert!(total > 30 * cfg.segment_target_bytes as u64, "setup: only {total} bytes of segments");
         assert!(v.m.compaction_seq > 10, "setup: little compaction");
-        let largest_read = store.seg_get_bytes.lock().unwrap().iter().copied().max().unwrap_or(0);
+        let largest_read = store.seg_get_bytes.lock().iter().copied().max().unwrap_or(0);
         let bound = cfg.segment_whole_fetch_max.max(cfg.bulk_read_bytes) as usize;
         assert!(largest_read <= bound, "a {largest_read}-byte segment read");
         for s in v.m.segments.iter().filter(|s| s.level > 0) {
@@ -1863,12 +1865,12 @@ fn long_scans_read_ahead() {
         let mut m = manifest::Manifest::new("d", 0, None);
         m.segments = vec![seg.clone()];
         let v = Version::new(m, String::new(), eng.shared.clone());
-        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        let gets = || store.seg_get_bytes.lock().len();
         v.scan(&KeyRange::data(), false, 3, v.read_time()).await.unwrap();
         let short = gets();
         assert!(short <= 3, "a short scan made {short} requests (index and one block)");
         let largest_block = eng.shared.seg_index("d", &seg).await.unwrap().blocks.iter().map(|b| b.2).max().unwrap();
-        let last_read = *store.seg_get_bytes.lock().unwrap().last().unwrap();
+        let last_read = *store.seg_get_bytes.lock().last().unwrap();
         assert!(last_read <= largest_block as usize, "a short scan read {last_read} bytes ahead");
         let cold = second_node(&eng, &store, "b");
         let v2 = Version::new(v.m.clone(), String::new(), cold.shared.clone());
@@ -1893,7 +1895,7 @@ fn written_segments_are_read_without_requests() {
         put_many(&db, "k", 5, 500).await;
         flushed(&db).await;
         assert!(db.current().unwrap().m.tail.is_empty());
-        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        let gets = || store.seg_get_bytes.lock().len();
         let before = gets();
         assert!(strong_get(&db, "k03").await.is_some());
         assert_eq!(gets(), before, "a flushed segment was fetched back");
@@ -1945,7 +1947,7 @@ fn restarted_nodes_read_what_they_wrote_locally() {
         let whole = |s: &manifest::SegmentMeta| s.size <= cfg.segment_whole_fetch_max;
         assert!(m.segments.iter().any(whole) && !m.segments.iter().all(whole), "setup: segment sizes");
         let restarted = Engine::new(store.clone(), a.shared.env.clone(), cfg, "a2".into());
-        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        let gets = || store.seg_get_bytes.lock().len();
         let before = gets();
         let v = restarted.db("d").read_version(Consistency::Strong).await.unwrap();
         assert_eq!(v.all_entries(false).await.unwrap().len(), 300);
@@ -1959,7 +1961,7 @@ fn bulk_reads_use_the_caches_without_filling_them() {
         let tier = local::LocalTier(Arc::new(local::MemLocal::new(64 << 20)));
         let cfg = EngineConfig { local_tier: Some(tier), ..EngineConfig::small_for_tests() };
         let (a, store) = delayed_engine_with("a", cfg.clone());
-        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        let gets = || store.seg_get_bytes.lock().len();
         let db = opened(&a, "d").await;
         let mut r = Rng::new(5);
         for i in 0..80 {
@@ -2027,14 +2029,14 @@ fn bulk_reads_take_whole_blocks() {
             let idx = eng.shared.seg_index("d", &v.m.segments[0]).await.unwrap();
             let largest = idx.blocks.iter().map(|b| b.2 as u64).max().unwrap();
             assert!(window == 1 || window >= 2 * largest, "setup: blocks of up to {largest} bytes");
-            let before = store.seg_get_bytes.lock().unwrap().len();
+            let before = store.seg_get_bytes.lock().len();
             let mut it = v.iter_bulk(true);
             let mut got = Vec::new();
             while let Some(e) = it.next().await.unwrap() {
                 got.push(e);
             }
             assert_eq!(got, entries);
-            let reads: Vec<usize> = store.seg_get_bytes.lock().unwrap()[before..].to_vec();
+            let reads: Vec<usize> = store.seg_get_bytes.lock()[before..].to_vec();
             if window == 1 {
                 assert_eq!(reads.len(), idx.blocks.len(), "one block per request");
             } else {
@@ -2523,7 +2525,7 @@ fn commit_notices_wake_waiting_requests() {
         assert!(waiting.await.unwrap());
         assert_eq!(seen(&reader), v3);
         // A notice for an unavailable version triggers at most 1 manifest read.
-        let manifest_gets = || store.gets.lock().unwrap().iter().filter(|(k, _)| k.ends_with("/manifest")).count();
+        let manifest_gets = || store.gets.lock().iter().filter(|(k, _)| k.ends_with("/manifest")).count();
         let before = manifest_gets();
         reader.notice_commit(v3 + 100);
         tokio::time::sleep(Duration::from_secs(1)).await;

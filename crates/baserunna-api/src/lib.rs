@@ -6,27 +6,42 @@
 #![forbid(unsafe_code)]
 
 mod account;
+mod admin;
 pub mod b64;
 mod db;
 mod error;
 mod kv;
 mod limits;
+mod op;
+mod table;
+mod txn;
 
 pub use account::{
     AddMember, CreateOrg, Credential, Credentials, GetMe, LogIn, Me, Member, NewMember, NewOrg, Org, RemoveMember,
     Role, Session, SignUp, User,
 };
+pub use admin::{CommitMetrics, Cpu, GetMetrics, Histogram, Metrics, ResetMetrics};
 pub use db::{CreateDb, Db, NewDb};
 pub use error::{ApiError, ErrorBody, ErrorCode, ErrorDetails, Outcome};
-pub use kv::{
-    BlobMeta, Change, ChangePage, Changes, ChangesQuery, Consistency, DeletedRange, Encoding, GetResult, Isolation, Op,
-    OpResult, QueryEvents, ReadBlob, ReadStream, ScanItem, ScanResult, StageBlob, Txn, TxnRequest, TxnResponse,
-};
+pub use kv::{BlobMeta, Change, ChangePage, Changes, ChangesQuery, DeletedRange, ReadBlob, StageBlob};
 pub use limits::{GetLimits, Limits};
+pub use op::{
+    AppendResult, ConsumerResult, CountResult, DeletedResult, FoundResult, GetResult, IncrementResult, NewRecord, Op,
+    OpResult, PAGE_MAX, QueryEvents, RangeSpec, ReadStream, RecordsResult, RowResult, RowsResult, ScanItem, ScanResult,
+    Selection, StreamRecord, StreamState,
+};
+pub use table::{
+    Column, ColumnType, CreateTable, CreatedTable, GetTable, GetTableQuery, Index, IndexState, ListTables,
+    ListTablesQuery, NewColumn, NewIndex, NewTable, Table, TablePage,
+};
+pub use txn::{
+    AbortTxn, BeginRequest, BeginTxn, Begun, CommitRequest, CommitStatus, CommitTxn, Committed, Consistency, Encoding,
+    GetCommit, Isolation, OpsRequest, OpsResponse, Txn, TxnOps, TxnRequest, TxnResponse,
+};
 
 use bytes::Bytes;
 use http::{Method, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// An HTTP route and its request and response types.
 pub trait Endpoint {
@@ -39,6 +54,17 @@ pub trait Endpoint {
 
     /// Returns true if repeating a successful request has no effect.
     fn is_idempotent(body: &Self::Body) -> bool;
+
+    /// Returns true if the request changes nothing, so that no failed attempt of it applied.
+    fn is_read_only(_body: &Self::Body) -> bool {
+        Self::METHOD == Method::GET
+    }
+
+    /// Returns true if the request ends its transaction even if it fails with `conflict`, so that
+    /// only a new transaction can succeed.
+    fn conflict_ends_txn() -> bool {
+        false
+    }
 
     fn path(&self) -> String;
 }
@@ -156,6 +182,15 @@ pub(crate) fn with_query<Q: Serialize>(mut path: String, query: &Q) -> String {
 
 pub(crate) fn is_false(b: &bool) -> bool {
     !*b
+}
+
+pub(crate) fn is_default<T: Default + PartialEq>(t: &T) -> bool {
+    *t == T::default()
+}
+
+/// Wraps a present field value, including JSON `null`, in `Some`.
+pub(crate) fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
 }
 
 #[cfg(test)]

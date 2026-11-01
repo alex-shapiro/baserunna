@@ -7,6 +7,6 @@ fuzz_target!(|data: &[u8]| {
         let _ = baserunna::ops::parse_ops(ops);
     }
     let _ = serde_json::from_slice::<baserunna::table::Query>(data);
-    let _ = serde_json::from_slice::<baserunna::table::CreateTable>(data);
+    let _ = serde_json::from_slice::<baserunna_api::NewTable>(data);
     let _ = serde_json::from_slice::<baserunna::meta::MetaCmd>(data);
 });

@@ -5,12 +5,14 @@
 
 use super::super::client::{Client, ZOMBIE_WAIT_MS};
 use super::super::{Sim, SimConfig};
-use crate::util::{b64, sha256};
+use crate::util::sha256;
+use baserunna_api::b64;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 const BASE: &str = "/v1/dbs/gc";
 const KEYS: u64 = 3;
@@ -91,7 +93,7 @@ async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Resul
             if small { rng.range(SMALL.0 as u64, SMALL.1 as u64) as usize } else { MIN_SIZE + rng.usize(2 * MIN_SIZE) };
         let data = Arc::new(rng.bytes(size));
         {
-            let mut w = written.lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = written.lock();
             w.by_sha.insert(b64::hex(&sha256(&data)), data.clone());
             w.by_key.entry(k).or_default().push(data.clone());
         }
@@ -100,7 +102,7 @@ async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Resul
                 Ok(r) if r.status == 200 => {
                     let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap_or_default();
                     let v = v["version"].as_u64().ok_or("put: missing version")?;
-                    written.lock().unwrap_or_else(|e| e.into_inner()).by_version.insert((k, v), data.clone());
+                    written.lock().by_version.insert((k, v), data.clone());
                     break;
                 }
                 Ok(r) if r.status == 503 && !String::from_utf8_lossy(&r.body).contains("\"unknown\"") => {
@@ -117,7 +119,7 @@ async fn writer(c: Client, rounds: usize, written: Arc<Mutex<Written>>) -> Resul
 }
 
 async fn copy(c: &Client, from: u64, to: u64, written: &Mutex<Written>) -> Result<(), String> {
-    written.lock().unwrap_or_else(|e| e.into_inner()).copied_from.entry(to).or_default().insert(from);
+    written.lock().copied_from.entry(to).or_default().insert(from);
     let body = json!({"ops": [{"op": "copy", "from": key_name(from), "to": key_name(to)}]});
     let r = c.call_settled("POST", &format!("{BASE}/txn"), Some(body)).await;
     match r.status {
@@ -193,7 +195,7 @@ async fn reader(
         };
         match r.status {
             200 | 206 => {
-                let w = written.lock().unwrap_or_else(|e| e.into_inner());
+                let w = written.lock();
                 let version = header(&r, "x-baserunna-version").and_then(|v| v.parse::<u64>().ok());
                 let candidates: Vec<Arc<Vec<u8>>> = match (by_id, version) {
                     (false, Some(v)) => match w.by_version.get(&(k, v)) {
@@ -225,7 +227,7 @@ async fn small_read(c: &Client, k: u64, written: &Mutex<Written>, stats: &Stats)
                 return Ok(());
             }
             let got = g["value"].as_str().and_then(b64::decode).ok_or(format!("{key}: missing inline value: {g}"))?;
-            let w = written.lock().unwrap_or_else(|e| e.into_inner());
+            let w = written.lock();
             let want = g["version"].as_u64().and_then(|v| w.by_version.get(&(k, v)));
             let ok = match want {
                 Some(c) => **c == got,
@@ -300,7 +302,7 @@ pub async fn run(sim: Arc<Sim>, writers: usize, readers: usize, rounds: usize, c
         match r.status {
             404 => {}
             200 => {
-                let w = written.lock().unwrap_or_else(|e| e.into_inner());
+                let w = written.lock();
                 check_body(&r, &w.candidates(k), &path)?;
             }
             s => return Err(format!("final read of {path}: {s}")),

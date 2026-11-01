@@ -12,10 +12,11 @@ mod common;
 
 use baserunna::client::{ApiError, Client};
 use baserunna::store::{DynStore, MemStore, Retry, list_all};
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const NODES: usize = 3;
@@ -43,20 +44,20 @@ impl Cluster {
     }
 
     fn random_client(&self) -> Client {
-        let urls: Vec<String> = self.urls.lock().unwrap().iter().flatten().cloned().collect();
+        let urls: Vec<String> = self.urls.lock().iter().flatten().cloned().collect();
         let url = &urls[self.random(urls.len() as u64) as usize];
-        Client::new(url).with_token(&self.token.lock().unwrap())
+        Client::new(url).with_token(&self.token.lock())
     }
 
     async fn start(&self, slot: usize) {
         let node = common::start_isolated((self.open)(), &format!("node{slot}")).await;
-        self.urls.lock().unwrap()[slot] = Some(node.url.clone());
-        self.nodes.lock().unwrap()[slot] = Some(node);
+        self.urls.lock()[slot] = Some(node.url.clone());
+        self.nodes.lock()[slot] = Some(node);
     }
 
     fn kill(&self, slot: usize) {
-        self.urls.lock().unwrap()[slot] = None;
-        if let Some(n) = self.nodes.lock().unwrap()[slot].take() {
+        self.urls.lock()[slot] = None;
+        if let Some(n) = self.nodes.lock()[slot].take() {
             n.kill();
             self.kills.fetch_add(1, SeqCst);
         }
@@ -246,9 +247,9 @@ async fn run_check(c: Arc<Cluster>, seconds: u64) -> Result<(), String> {
     for slot in 0..NODES {
         c.start(slot).await;
     }
-    let first = Client::new(c.urls.lock().unwrap()[0].as_ref().unwrap());
+    let first = Client::new(c.urls.lock()[0].as_ref().unwrap());
     let user = first.signup("check@example.com", "cluster-check-1").await.map_err(|e| e.to_string())?;
-    *c.token.lock().unwrap() = user.token().unwrap_or_default().to_string();
+    *c.token.lock() = user.token().unwrap_or_default().to_string();
     user.create_db(DB).await.map_err(|e| e.to_string())?;
     let init: Vec<Value> = (0..ACCOUNTS)
         .map(|i| json!({"op": "put", "key": account_key(i), "value": INITIAL_BALANCE.to_string()}))

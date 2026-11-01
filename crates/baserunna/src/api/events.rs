@@ -452,7 +452,7 @@ pub(super) async fn internal_bind(
     State(node): State<Arc<Node>>,
     axum::Json(b): axum::Json<ForwardedBind>,
 ) -> Result<J> {
-    let data = crate::util::b64::decode(&b.bind).ok_or_else(|| Error::invalid("bad bind encoding"))?;
+    let data = baserunna_api::b64::decode(&b.bind).ok_or_else(|| Error::invalid("bad bind encoding"))?;
     let bind = crate::engine::events::Bind::decode(&data).map_err(|e| Error::invalid(e.to_string()))?;
     let db = node.engine.db(&b.db);
     db.open(false).await?;

@@ -30,10 +30,11 @@ use crate::util::rng::Rng;
 use axum::body::Body;
 use bytes::Bytes;
 use http::{Request, Response};
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use store::{SimStore, StoreFaults};
 use tokio::time::Instant;
@@ -51,7 +52,7 @@ impl Trace {
     }
 
     pub fn event(&self, s: &str) {
-        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.state.lock();
         for b in s.bytes() {
             g.0 ^= b as u64;
             g.0 = g.0.wrapping_mul(0x0000_0100_0000_01B3);
@@ -60,20 +61,20 @@ impl Trace {
         g.0 = g.0.wrapping_mul(0x0000_0100_0000_01B3);
         g.1 += 1;
         if let Some(l) = &self.log {
-            l.lock().unwrap_or_else(|e| e.into_inner()).push(s.to_string());
+            l.lock().push(s.to_string());
         }
     }
 
     pub fn hash(&self) -> u64 {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).0
+        self.state.lock().0
     }
 
     pub fn events(&self) -> u64 {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).1
+        self.state.lock().1
     }
 
     pub fn dump(&self) -> Vec<String> {
-        self.log.as_ref().map(|l| l.lock().unwrap_or_else(|e| e.into_inner()).clone()).unwrap_or_default()
+        self.log.as_ref().map(|l| l.lock().clone()).unwrap_or_default()
     }
 }
 
@@ -326,7 +327,7 @@ impl crate::engine::local::LocalStore for SimDisk {
     fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, Option<Bytes>> {
         Box::pin(async move {
             let got = self.inner.get(key).await?;
-            let mut r = self.rng.lock().unwrap_or_else(|e| e.into_inner());
+            let mut r = self.rng.lock();
             if r.chance(self.faults.p_lose) {
                 self.trace.event(&format!("disk lost {key}"));
                 return None;
@@ -344,7 +345,7 @@ impl crate::engine::local::LocalStore for SimDisk {
 
     fn put<'a>(&'a self, key: &'a str, data: Bytes) -> BoxFut<'a, ()> {
         Box::pin(async move {
-            if self.rng.lock().unwrap_or_else(|e| e.into_inner()).chance(self.faults.p_drop_write) {
+            if self.rng.lock().chance(self.faults.p_drop_write) {
                 return;
             }
             self.inner.put(key, data).await
@@ -559,15 +560,15 @@ impl Sim {
     }
 
     pub fn rand_below(&self, n: u64) -> u64 {
-        self.rng.lock().unwrap_or_else(|e| e.into_inner()).below(n.max(1))
+        self.rng.lock().below(n.max(1))
     }
 
     pub fn chance(&self, p: f64) -> bool {
-        self.rng.lock().unwrap_or_else(|e| e.into_inner()).chance(p)
+        self.rng.lock().chance(p)
     }
 
     pub fn fork_rng(&self) -> Rng {
-        self.rng.lock().unwrap_or_else(|e| e.into_inner()).fork()
+        self.rng.lock().fork()
     }
 
     pub fn now_ms(&self) -> u64 {
@@ -579,7 +580,7 @@ impl Sim {
     }
 
     pub fn node(&self, i: usize) -> Option<Arc<SimNode>> {
-        self.slots.get(i)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.slots.get(i)?.lock().clone()
     }
 
     pub fn up_nodes(&self) -> Vec<usize> {
@@ -592,7 +593,7 @@ impl Sim {
         if self.node(i).is_some() {
             return;
         }
-        self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).remove(&i);
+        self.store_isolated.lock().remove(&i);
         let n = self.starts.fetch_add(1, Ordering::SeqCst);
         let skew = if self.cfg.max_skew_ms == 0 {
             0
@@ -632,8 +633,7 @@ impl Sim {
                 Ok(node) => {
                     let router = api::router(node.clone());
                     self.trace.event(&format!("start n{i} as {}", node.id));
-                    *self.slots[i].lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(Arc::new(SimNode { idx: i, start: n, node, router }));
+                    *self.slots[i].lock() = Some(Arc::new(SimNode { idx: i, start: n, node, router }));
                     return;
                 }
                 Err(e) => {
@@ -654,12 +654,12 @@ impl Sim {
     /// Crashes node `i` at a crash point if it is still running instance `n`,
     /// and schedules a restart after a random delay.
     fn crash_at_point(self: &Arc<Self>, i: usize, n: u64, why: &str) -> bool {
-        let current = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.start);
+        let current = self.slots[i].lock().as_ref().map(|s| s.start);
         if current != Some(n) {
             return false;
         }
         {
-            let mut last = self.last_point_crash.lock().unwrap_or_else(|e| e.into_inner());
+            let mut last = self.last_point_crash.lock();
             if last.is_some_and(|t| t.elapsed() < Duration::from_millis(POINT_CRASH_SPACING_MS)) {
                 return false;
             }
@@ -681,7 +681,7 @@ impl Sim {
     /// Gracefully shuts down node `i` and verifies that its released leases are cleared in object storage.
     pub async fn stop(&self, i: usize) {
         let _starting = self.starting[i].lock().await;
-        let Some(n) = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        let Some(n) = self.slots[i].lock().take() else { return };
         self.trace.event(&format!("stop n{i} ({})", n.node.id));
         let released = n.node.shutdown().await;
         for db in released {
@@ -690,7 +690,7 @@ impl Sim {
             if lease.is_some_and(|l| l.node == n.node.id) {
                 let e = format!("n{i} released its lease on {db} as it stopped, but storage names it again");
                 self.trace.event(&format!("oracle: {e}"));
-                self.violation.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+                self.violation.lock().get_or_insert(e);
             }
         }
         self.trace.event(&format!("stopped n{i}"));
@@ -698,7 +698,7 @@ impl Sim {
 
     /// Aborts node `i`'s tasks and drops its in-memory state.
     pub fn crash(&self, i: usize) {
-        let n = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).take();
+        let n = self.slots[i].lock().take();
         if let Some(n) = n {
             self.crashes.fetch_add(1, Ordering::SeqCst);
             self.trace.event(&format!("crash n{i} ({})", n.node.id));
@@ -744,7 +744,7 @@ impl Sim {
                 sim.sleep(ORACLE_INTERVAL_MS).await;
                 if let Err(e) = sim.check_oracles() {
                     sim.trace.event(&format!("oracle: {e}"));
-                    sim.violation.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+                    sim.violation.lock().get_or_insert(e);
                     return;
                 }
             }
@@ -757,7 +757,7 @@ impl Sim {
     }
 
     pub fn partition(&self, a: usize, b: usize) {
-        let mut p = self.partitions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = self.partitions.lock();
         p.insert((a, b));
         p.insert((b, a));
         self.trace.event(&format!("partition {a}-{b}"));
@@ -765,32 +765,31 @@ impl Sim {
 
     /// Drops traffic from `from` to `to`, including responses to requests sent by `to`.
     pub fn partition_one_way(&self, from: usize, to: usize) {
-        self.partitions.lock().unwrap_or_else(|e| e.into_inner()).insert((from, to));
+        self.partitions.lock().insert((from, to));
         self.trace.event(&format!("partition {from}->{to}"));
     }
 
     pub fn isolate_from_store(&self, i: usize) {
-        self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).insert(i);
+        self.store_isolated.lock().insert(i);
         self.trace.event(&format!("isolate n{i} from store"));
     }
 
     pub fn heal(&self) {
-        self.partitions.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.partitions.lock().clear();
+        self.store_isolated.lock().clear();
         self.trace.event("heal");
     }
 
     fn partitioned(&self, from: usize, to: usize) -> bool {
-        self.partitions.lock().unwrap_or_else(|e| e.into_inner()).contains(&(from, to))
+        self.partitions.lock().contains(&(from, to))
     }
 
     fn is_isolated(&self, i: usize) -> bool {
-        self.store_isolated(i)
-            || self.partitions.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| a == i || b == i)
+        self.store_isolated(i) || self.partitions.lock().iter().any(|&(a, b)| a == i || b == i)
     }
 
     fn store_isolated(&self, i: usize) -> bool {
-        self.store_isolated.lock().unwrap_or_else(|e| e.into_inner()).contains(&i)
+        self.store_isolated.lock().contains(&i)
     }
 
     /// Suspends all task execution on node `i` for `ms` milliseconds.
@@ -867,7 +866,7 @@ impl Sim {
 
     pub fn shutdown_all(&self) {
         for i in 0..self.slots.len() {
-            let n = self.slots[i].lock().unwrap_or_else(|e| e.into_inner()).take();
+            let n = self.slots[i].lock().take();
             if let Some(n) = n {
                 n.node.env.shutdown();
             }
@@ -956,7 +955,7 @@ where
             drop(oracles_or_deadline);
             drop(workload);
             oracles.abort();
-            if let Some(v) = sim.violation.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            if let Some(v) = sim.violation.lock().take() {
                 result = Err(format!("oracle: {v}"));
             }
             let mut storage = StorageReport::default();

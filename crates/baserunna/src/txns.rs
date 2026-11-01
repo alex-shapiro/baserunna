@@ -4,10 +4,11 @@
 use crate::engine::memory::{self, Held, MemoryGate};
 use crate::engine::{Engine, Txn, Version};
 use crate::error::{Error, Result};
-use crate::ops::Encoding;
 use crate::util::{DetHashMap, TtlCache};
+use baserunna_api::Encoding;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -35,11 +36,11 @@ pub struct OpenTxn {
 
 impl OpenTxn {
     fn last_used(&self) -> Instant {
-        *lock(&self.last_used)
+        *self.last_used.lock()
     }
 
     fn touch(&self) {
-        *lock(&self.last_used) = Instant::now();
+        *self.last_used.lock() = Instant::now();
     }
 }
 
@@ -48,10 +49,6 @@ pub struct OpenTxns {
     limits: TxnLimits,
     open: Mutex<DetHashMap<String, Arc<OpenTxn>>>,
     aborted: TtlCache<String, &'static str>,
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl OpenTxns {
@@ -65,7 +62,7 @@ impl OpenTxns {
     }
 
     pub fn len(&self) -> usize {
-        lock(&self.open).len()
+        self.open.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -73,7 +70,7 @@ impl OpenTxns {
     }
 
     pub fn count_for_db(&self, db_id: &str) -> usize {
-        lock(&self.open).values().filter(|t| t.db_id == db_id).count()
+        self.open.lock().values().filter(|t| t.db_id == db_id).count()
     }
 
     /// Enforces the node memory budget for a transaction of `user_id` on `db_id`, unloading idle
@@ -102,7 +99,7 @@ impl OpenTxns {
     }
 
     pub fn admit_begin(&self, user_id: &str, db_id: &str) -> Result<()> {
-        self.check_per_user(&lock(&self.open), user_id)?;
+        self.check_per_user(&self.open.lock(), user_id)?;
         self.admit(user_id, db_id)
     }
 
@@ -141,7 +138,7 @@ impl OpenTxns {
             txn: Arc::new(tokio::sync::Mutex::new(Some(txn))),
         });
         let guard = open.txn.clone().try_lock_owned().map_err(|_| Error::internal("a new transaction is in use"))?;
-        let mut g = lock(&self.open);
+        let mut g = self.open.lock();
         self.check_per_user(&g, user_id)?;
         g.insert(id, open.clone());
         Ok(TxnGuard { txns: self, open, guard, finished: false })
@@ -160,7 +157,7 @@ impl OpenTxns {
         if crate::buggify::fault(0.01) {
             self.remove(id);
         }
-        let open = lock(&self.open).get(id).cloned();
+        let open = self.open.lock().get(id).cloned();
         let open = open.ok_or_else(|| self.lost(id))?;
         if open.user_id != user_id || open.db_id != db_id {
             return Err(Error::txn_not_found());
@@ -181,7 +178,7 @@ impl OpenTxns {
     }
 
     fn remove(&self, id: &str) {
-        lock(&self.open).remove(id);
+        self.open.lock().remove(id);
     }
 
     fn abort(&self, open: &OpenTxn, reason: &'static str) -> bool {
@@ -202,7 +199,9 @@ impl OpenTxns {
 
     pub fn expire(&self) {
         let TxnLimits { idle, lifetime, .. } = self.limits;
-        let expired: Vec<_> = lock(&self.open)
+        let expired: Vec<_> = self
+            .open
+            .lock()
             .values()
             .filter_map(|t| {
                 let reason = if t.created.elapsed() >= lifetime {
@@ -226,7 +225,7 @@ impl OpenTxns {
     fn held_memory(&self) -> Vec<(Arc<OpenTxn>, Held<String>)> {
         let idle_since = |t: &OpenTxn| t.txn.try_lock().ok().filter(|g| g.is_some()).map(|_| t.last_used());
         let mut open: Vec<(Option<Instant>, Arc<OpenTxn>)> =
-            lock(&self.open).values().map(|t| (idle_since(t), t.clone())).collect();
+            self.open.lock().values().map(|t| (idle_since(t), t.clone())).collect();
         open.sort_by(|a, b| (a.0.is_none(), a.0, &a.1.id).cmp(&(b.0.is_none(), b.0, &b.1.id)));
         let pinned: Vec<Option<Arc<Version>>> = open
             .iter()

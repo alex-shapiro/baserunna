@@ -16,7 +16,7 @@ pub use org::{
 
 use crate::engine::Txn;
 use crate::error::{Error, Result};
-use crate::table::{self, BlobResolver, CreateTable, InsertMode, Query};
+use crate::table::{self, BlobResolver, InsertMode, Query};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
@@ -607,7 +607,7 @@ async fn other_enabled_admin(txn: &mut Txn, user_id: &str) -> Result<bool> {
 }
 
 fn expired_sessions(before_ms: i64) -> Query {
-    let range = crate::table::RangeSpec { lt: Some(json!(before_ms)), ..Default::default() };
+    let range = baserunna_api::RangeSpec { lt: Some(json!(before_ms)), ..Default::default() };
     Query { index: Some("by_expiry".into()), range: Some(range), ..Default::default() }
 }
 
@@ -811,7 +811,7 @@ async fn migrate(w: &mut Write<'_, '_>) -> Result<bool> {
         return Ok(false);
     }
     for t in tables() {
-        let mut def: CreateTable = serde_json::from_value(t).map_err(|e| Error::internal(e.to_string()))?;
+        let mut def: baserunna_api::NewTable = serde_json::from_value(t).map_err(|e| Error::internal(e.to_string()))?;
         def.if_not_exists = true;
         table::create_table(w.txn, &def).await?;
     }

@@ -24,6 +24,14 @@ pub enum Error {
         path: String,
         reason: String,
     },
+    /// An operation result does not decode as the requested type.
+    Decode {
+        what: String,
+        reason: String,
+    },
+    /// A request failed with an unknown outcome but is known not to have applied and never to apply,
+    /// because the server fenced it or because it ran in a transaction that can no longer commit.
+    NotApplied(Box<Error>),
     Transport(TransportError),
 }
 
@@ -31,6 +39,7 @@ impl Error {
     pub fn code(&self) -> Option<ErrorCode> {
         match self {
             Error::Api { error, .. } => Some(error.code),
+            Error::NotApplied(e) => e.code(),
             _ => None,
         }
     }
@@ -45,6 +54,7 @@ impl Error {
             },
             Error::Foreign { status, .. } => matches!(status, 200..=299 | 408 | 429 | 500..),
             Error::Malformed { .. } => true,
+            Error::Decode { .. } | Error::NotApplied(_) => false,
             Error::Transport(t) => !matches!(t, TransportError::NotSent(_)),
         };
         if unknown { Outcome::Unknown } else { Outcome::NotApplied }
@@ -70,9 +80,39 @@ impl Error {
                 _ => false,
             },
             Error::Foreign { status, .. } => matches!(status, 200..=299 | 407 | 408 | 429 | 500..) && may_repeat,
-            Error::Malformed { .. } => false,
+            Error::Malformed { .. } | Error::Decode { .. } => false,
+            Error::NotApplied(e) => e.is_transient(true),
             Error::Transport(TransportError::TimedOut(_)) => false,
             Error::Transport(_) => may_repeat,
+        }
+    }
+}
+
+impl Error {
+    /// Returns true if a transaction loop of [`Db::retry`](crate::Db::retry) restarts after this
+    /// error: the transaction applied nothing and a new attempt can succeed.
+    pub fn restarts_txn(&self) -> bool {
+        // A transaction whose request timed out can run again, with a new deadline.
+        let timed_out =
+            matches!(self, Error::NotApplied(c) if matches!(**c, Error::Transport(TransportError::TimedOut(_))));
+        matches!(self.code(), Some(ErrorCode::TxnNotFound | ErrorCode::Aborted))
+            || self.is_transient(false)
+            || timed_out
+    }
+
+    /// Returns the error of a request whose first `n` operations the caller did not pass, with
+    /// `op_index` counted from the caller's first operation, or cleared if the failed operation was
+    /// one of the first `n`.
+    pub(crate) fn without_ops(self, n: usize) -> Error {
+        match self {
+            Error::Api { status, mut error, retry_after_ms } => {
+                if let Some(d) = &mut error.details {
+                    d.op_index = d.op_index.and_then(|i| i.checked_sub(n));
+                }
+                Error::Api { status, error, retry_after_ms }
+            }
+            Error::NotApplied(e) => Error::NotApplied(Box::new(e.without_ops(n))),
+            other => other,
         }
     }
 }
@@ -85,6 +125,8 @@ impl fmt::Display for Error {
             }
             Error::Foreign { status, path, .. } => write!(f, "HTTP {status} from {path} without an API response"),
             Error::Malformed { path, reason } => write!(f, "unexpected response from {path}: {reason}"),
+            Error::Decode { what, reason } => write!(f, "cannot decode {what}: {reason}"),
+            Error::NotApplied(e) => write!(f, "{e} (confirmed not applied)"),
             Error::Transport(t) => t.fmt(f),
         }
     }

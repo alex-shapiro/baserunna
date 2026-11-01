@@ -6,8 +6,8 @@
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, Status, url_escape};
-use crate::util::b64;
 use crate::util::rng::Rng;
+use baserunna_api::b64;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;

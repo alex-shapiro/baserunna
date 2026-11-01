@@ -10,12 +10,12 @@ use super::{
 use crate::engine::{Committed, Consistency, Db, Isolation, Retention, StreamState};
 use crate::error::{Error, Result};
 use crate::node::Node;
-use crate::ops::Encoding;
-use crate::stream::{self, AppendTo, Body, NewRecord, ReadOut, ReadSpec};
+use crate::stream::{self, AppendTo, Body, ReadOut, ReadSpec};
 use axum::Router;
 use axum::extract::{Extension, Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use baserunna_api::{Encoding, NewRecord};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::Deserialize;
@@ -183,7 +183,7 @@ async fn append(
                 Some(e) => e,
                 None => encoding_param(&q)?,
             };
-            b.records.into_iter().map(|r| r.into_body(enc)).collect::<Result<_>>()?
+            b.records.into_iter().map(|r| stream::record_body(r, enc)).collect::<Result<_>>()?
         }
         "application/x-ndjson" | "application/jsonl" | "application/json-lines" => stream::parse_lines(&data, true)?,
         "text/plain" => stream::parse_lines(&data, false)?,

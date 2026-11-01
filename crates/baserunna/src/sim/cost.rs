@@ -11,11 +11,12 @@ use crate::store::{BoxFut, DynStore, GetOpts, GetResult, ListPage, MemStore, Obj
 use axum::body::Body;
 use bytes::Bytes;
 use http::{Request, Response};
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 use tower::ServiceExt;
@@ -101,7 +102,7 @@ impl MeteredStore {
     }
 
     fn count(&self, key: &str, f: impl FnOnce(&mut Counts)) {
-        let mut g = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.counts.lock();
         f(g.entry(scope_of(key).to_string()).or_default());
     }
 
@@ -113,11 +114,11 @@ impl MeteredStore {
     }
 
     pub fn scope(&self, scope: &str) -> Counts {
-        self.counts.lock().unwrap_or_else(|e| e.into_inner()).get(scope).copied().unwrap_or_default()
+        self.counts.lock().get(scope).copied().unwrap_or_default()
     }
 
     pub fn total(&self) -> Counts {
-        self.counts.lock().unwrap_or_else(|e| e.into_inner()).values().fold(Counts::default(), |a, c| a.plus(c))
+        self.counts.lock().values().fold(Counts::default(), |a, c| a.plus(c))
     }
 }
 
@@ -183,7 +184,7 @@ struct PeerTransport {
 
 impl Transport for PeerTransport {
     fn call(&self, addr: &str, req: Request<Body>) -> BoxFut<'static, Result<Response<Body>, TransportError>> {
-        let mut net = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut net = self.peers.lock();
         *net.calls.entry(req.uri().path().to_string()).or_default() += 1;
         let stalled = net.stalled.contains(addr);
         let router = net.routers.get(addr).cloned();
@@ -298,19 +299,19 @@ impl World {
         let services = crate::node::Services { transport, oidc: None, mailer: None };
         let node = Node::start(cfg, env, store, services).await.expect("node starts");
         let router = api::router(node.clone());
-        self.peers.lock().unwrap_or_else(|e| e.into_inner()).routers.insert(addr, router);
+        self.peers.lock().routers.insert(addr, router);
         node
     }
 
     /// Returns the total number of peer requests sent to `path`.
     pub fn peer_calls(&self, path: &str) -> u64 {
-        self.peers.lock().unwrap_or_else(|e| e.into_inner()).calls.get(path).copied().unwrap_or(0)
+        self.peers.lock().calls.get(path).copied().unwrap_or(0)
     }
 
     /// Configures whether peer requests to node `i` hang indefinitely.
     pub fn stall_peer(&self, i: usize, stalled: bool) {
         let addr = peer_addr(i);
-        let mut net = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut net = self.peers.lock();
         if stalled {
             net.stalled.insert(addr);
         } else {

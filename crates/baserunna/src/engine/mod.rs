@@ -20,7 +20,8 @@ pub mod version;
 use crate::env::Env;
 use crate::store::{DynStore, Retry};
 use crate::util::DetHashMap;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -94,7 +95,7 @@ impl Shared {
     }
 
     pub(crate) fn is_system(&self, db: &str) -> bool {
-        self.system.lock().unwrap_or_else(|e| e.into_inner()).contains(db)
+        self.system.lock().contains(db)
     }
 
     /// Unloads idle databases if memory usage exceeds the budget, and returns true if usage is
@@ -160,7 +161,7 @@ impl Shared {
     /// `write_seq` for `db`.
     pub(crate) fn lease_seen(&self, db: &str, lease: &manifest::Lease, write_seq: u64) -> tokio::time::Instant {
         let now = tokio::time::Instant::now();
-        let mut g = self.observed_leases.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.observed_leases.lock();
         if let Some((node, ws, seen)) = g.get(db)
             && *node == lease.node
             && *ws == write_seq
@@ -311,18 +312,18 @@ impl Engine {
     /// Marks `id` as a system database, exempting it from size quotas, memory limits, and
     /// manifest unloading.
     pub fn mark_system(&self, id: &str) {
-        self.shared.system.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string());
+        self.shared.system.lock().insert(id.to_string());
     }
 
     /// Returns the handle for database `id`, creating an unloaded handle if not already open.
     pub fn db(&self, id: &str) -> Arc<Db> {
-        let mut g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.dbs.lock();
         g.entry(id.to_string()).or_insert_with(|| Db::new(id.to_string(), self.shared.clone())).clone()
     }
 
     /// Returns the open database handle for `id` if present in memory.
     pub fn db_if_open(&self, id: &str) -> Option<Arc<Db>> {
-        self.dbs.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+        self.dbs.lock().get(id).cloned()
     }
 
     /// Sets the callback invoked after this node commits a new data version.
@@ -335,7 +336,7 @@ impl Engine {
     }
 
     pub fn open_count(&self) -> usize {
-        self.dbs.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.dbs.lock().len()
     }
 
     /// Wakes all current [`Db::wait_for_change`] calls and causes future calls to return immediately.
@@ -348,7 +349,7 @@ impl Engine {
 
     /// Returns currently open database handles sorted by ID.
     pub fn open_dbs(&self) -> Vec<Arc<Db>> {
-        let g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.dbs.lock();
         let mut v: Vec<Arc<Db>> = g.values().cloned().collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
         v
@@ -374,14 +375,14 @@ impl Engine {
     pub(crate) fn unload_idle(&self) {
         let shared = &self.shared;
         {
-            let failed = shared.unload_failed_at.lock().unwrap_or_else(|e| e.into_inner());
+            let failed = shared.unload_failed_at.lock();
             if failed.is_some_and(|t| t.elapsed() < Duration::from_millis(50)) {
                 return;
             }
         }
         let target = shared.memory.limit() / 8 * 7;
         let mut candidates: Vec<(u64, Arc<Db>)> = {
-            let g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
+            let g = self.dbs.lock();
             g.values().filter(|d| !shared.is_system(&d.id)).map(|d| (d.last_access_seq(), d.clone())).collect()
         };
         candidates.sort_by_key(|(at, _)| *at);
@@ -392,24 +393,21 @@ impl Engine {
             db.unload();
         }
         drop(candidates);
-        self.dbs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, db| Arc::strong_count(db) > 1 || db.current().is_some());
-        let mut failed = shared.unload_failed_at.lock().unwrap_or_else(|e| e.into_inner());
+        self.dbs.lock().retain(|_, db| Arc::strong_count(db) > 1 || db.current().is_some());
+        let mut failed = shared.unload_failed_at.lock();
         *failed = shared.memory.is_exceeded().then(tokio::time::Instant::now);
     }
 
     /// Drops unreferenced handles that have been idle for `idle_ms`.
     pub fn evict_idle(&self, idle_ms: u64) {
-        let mut g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.dbs.lock();
         let idle_ms = if crate::buggify::buggify() { 0 } else { idle_ms };
         g.retain(|_, db| Arc::strong_count(db) > 1 || !db.idle_for(idle_ms));
     }
 
     /// Removes the handle and cached entries for database `id`.
     pub fn forget(&self, id: &str) {
-        self.dbs.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.dbs.lock().remove(id);
         self.shared.cache.evict_db(id);
     }
 

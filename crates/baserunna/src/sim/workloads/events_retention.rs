@@ -10,9 +10,10 @@
 use super::super::Sim;
 use super::super::client::Client;
 use super::events::{Settled, settle};
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const DB: &str = "/v1/dbs/events";
 const TABLE: &str = "/v1/dbs/events/events/ret";
@@ -51,10 +52,6 @@ struct World {
 
 type Shared = Arc<Mutex<World>>;
 
-fn world(w: &Shared) -> std::sync::MutexGuard<'_, World> {
-    w.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 impl World {
     fn risk_cutoff(&self, upto: i64) -> i64 {
         let mut line = i64::MIN;
@@ -78,7 +75,7 @@ impl World {
 
 async fn inserter(c: Client, w: Shared, steps: usize, transactional: bool) -> Result<(), String> {
     for step in 0..steps {
-        let retention = world(&w).current();
+        let retention = w.lock().current();
         let now = c.sim.now_ms() as i64;
         let n = 1 + c.rng().usize(6);
         let mut rows = Vec::new();
@@ -96,7 +93,7 @@ async fn inserter(c: Client, w: Shared, steps: usize, transactional: bool) -> Re
             times.push((uid, time));
         }
         let uids: Vec<String> = times.iter().map(|t| t.0.clone()).collect();
-        world(&w).times.extend(times);
+        w.lock().times.extend(times);
         let (path, body, ndjson) = if transactional {
             (format!("{DB}/txn"), json!({"ops": [{"op": "insert_events", "table": "ret", "rows": rows}]}), false)
         } else {
@@ -108,7 +105,7 @@ async fn inserter(c: Client, w: Shared, steps: usize, transactional: bool) -> Re
             Settled::Unknown => None,
             Settled::Rejected(r) => return Err(format!("{}: ret insert rejected: {} {}", c.name, r.status, r.json)),
         };
-        world(&w).inserts.push(Insert { version, uids });
+        w.lock().inserts.push(Insert { version, uids });
         let ms = c.rng().below(500);
         c.pause(ms).await;
     }
@@ -126,7 +123,7 @@ async fn retainer(c: Client, w: Shared, steps: usize) -> Result<(), String> {
             return Err(format!("ret set retention: {} {}", r.status, r.json));
         }
         let done_ms = c.sim.now_ms() as i64;
-        world(&w).changes.push(Change { retention, sent_ms, done_ms });
+        w.lock().changes.push(Change { retention, sent_ms, done_ms });
     }
     Ok(())
 }
@@ -161,7 +158,7 @@ async fn querier(c: Client, w: Shared, steps: usize) -> Result<(), String> {
             Ok(r) if r.status == 200 && !r.json["next_cursor"].is_string() => {
                 let version = r.json["version"].as_u64().ok_or(format!("ret answer is missing version: {}", r.json))?;
                 let uids = distinct_uids(&r.json)?;
-                world(&w).answers.push(Answer { recv_ms, version, uids });
+                w.lock().answers.push(Answer { recv_ms, version, uids });
             }
             Ok(r) if r.status == 200 || r.status == 503 || r.status == 429 => {}
             Ok(r) => return Err(format!("{}: ret query failed: {} {}", c.name, r.status, r.json)),
@@ -192,7 +189,7 @@ impl Retention {
             return Err(format!("ret create: {} {}", r.status, r.json));
         }
         let w: Shared = Arc::default();
-        world(&w).changes.push(Change { retention: 2 * HOUR, sent_ms: 0, done_ms: 0 });
+        w.lock().changes.push(Change { retention: 2 * HOUR, sent_ms: 0, done_ms: 0 });
         sim.trace.event("events: inserting at the retention boundary of table ret");
         let tasks = vec![
             tokio::spawn(inserter(client("rtb"), w.clone(), steps, false)),
@@ -243,7 +240,7 @@ impl Retention {
         }
         let version = r.json["version"].as_u64().unwrap_or(0);
         let uids = distinct_uids(&r.json)?;
-        let g = world(&self.w);
+        let g = self.w.lock();
         for a in &g.answers {
             Self::check_answer(&g, a, false)?;
         }

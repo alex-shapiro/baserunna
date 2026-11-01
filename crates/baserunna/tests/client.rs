@@ -528,3 +528,15 @@ async fn reverse_stream_reads_bounded_by_time_page_through_every_record() {
     let read: Vec<u64> = pages(&db, op).await.into_iter().flat_map(|r| r.records::<u64>().unwrap()).collect();
     assert_eq!(read, [4, 3, 2, 1, 0]);
 }
+
+#[tokio::test]
+async fn a_failed_operation_is_named_by_its_index_in_the_run() {
+    let (db, _) = node("").await;
+    db.write(&[Op::put("k", "v")]).await.unwrap();
+    let mut txn = db.begin();
+    txn.run_one(Op::get("k")).await.unwrap();
+    txn.write([Op::put("x", "1")]);
+    let e = txn.run(&[Op::get("x"), Op::Check { key: "k".into(), expect: Expect::Absent }]).await.unwrap_err();
+    let Error::Api { error, .. } = &e else { panic!("{e:?}") };
+    assert_eq!(error.details.as_ref().and_then(|d| d.op_index), Some(1), "{e}");
+}

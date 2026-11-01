@@ -86,7 +86,7 @@ impl Txn {
                 (e.path(), self.db.client().send(&e, &api::OpsRequest { ops: api_ops }).await.map(|r| r.results))
             }
         };
-        self.failed = sent.as_ref().err().map(not_applied);
+        self.failed = sent.as_ref().err().map(|e| not_applied(&e.clone().without_ops(queued)));
         let Ok(results) = sent else {
             return Err(self.failed.clone().expect("a failed request is recorded"));
         };

@@ -89,6 +89,24 @@ impl Error {
     }
 }
 
+impl Error {
+    /// Returns the error of a request whose first `n` operations the caller did not pass, with
+    /// `op_index` counted from the caller's first operation, or cleared if the failed operation was
+    /// one of the first `n`.
+    pub(crate) fn without_ops(self, n: usize) -> Error {
+        match self {
+            Error::Api { status, mut error, retry_after_ms } => {
+                if let Some(d) = &mut error.details {
+                    d.op_index = d.op_index.and_then(|i| i.checked_sub(n));
+                }
+                Error::Api { status, error, retry_after_ms }
+            }
+            Error::NotApplied(e) => Error::NotApplied(Box::new(e.without_ops(n))),
+            other => other,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

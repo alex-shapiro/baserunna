@@ -415,8 +415,8 @@ pub(crate) const LONG_POLL_MAX_MS: u64 = 50_000;
 fn finishes_txn(req: &Request) -> bool {
     let route = req.extensions().get::<MatchedPath>().map(MatchedPath::as_str);
     match *req.method() {
-        http::Method::POST => route == Some(data::COMMIT_ROUTE),
-        http::Method::DELETE => route == Some(data::TXN_ROUTE),
+        http::Method::POST => route == Some(api::CommitTxn::ROUTE),
+        http::Method::DELETE => route == Some(api::AbortTxn::ROUTE),
         _ => false,
     }
 }
@@ -1145,16 +1145,21 @@ pub(crate) type Params = QueryParams<std::collections::BTreeMap<String, String>>
 
 /// Extracts `limit` (default [`PAGE_DEFAULT`](crate::meta::PAGE_DEFAULT), in `1..=PAGE_MAX`) and `cursor` query parameters.
 pub(crate) fn paging(q: &Params) -> Result<(usize, Option<String>)> {
-    let max = crate::meta::PAGE_MAX;
-    let limit = match q.get("limit") {
-        None => crate::meta::PAGE_DEFAULT,
-        Some(l) => l
-            .parse()
-            .ok()
-            .filter(|l| (1..=max).contains(l))
-            .ok_or_else(|| Error::invalid(format!("limit must be in 1..={max}")))?,
-    };
-    Ok((limit, q.get("cursor").filter(|c| !c.is_empty()).cloned()))
+    let limit = q.get("limit").map(|l| l.parse().map_err(|_| limit_error())).transpose()?;
+    Ok((page_limit(limit)?, q.get("cursor").filter(|c| !c.is_empty()).cloned()))
+}
+
+/// Validates a listing page size, defaulting to `PAGE_DEFAULT`.
+pub(crate) fn page_limit(limit: Option<usize>) -> Result<usize> {
+    match limit {
+        None => Ok(crate::meta::PAGE_DEFAULT),
+        Some(l) if (1..=crate::meta::PAGE_MAX).contains(&l) => Ok(l),
+        Some(_) => Err(limit_error()),
+    }
+}
+
+fn limit_error() -> Error {
+    Error::invalid(format!("limit must be in 1..={}", crate::meta::PAGE_MAX))
 }
 
 /// Extracts `prefix`, `limit`, and `cursor` query parameters.
@@ -1174,9 +1179,9 @@ mod tests {
         rt.block_on(async {
             let app = axum::Router::new()
                 .route("/v1/dbs/{db}/transactions", post(|| async {}))
-                .route(data::TXN_ROUTE, axum::routing::delete(|| async {}))
+                .route(api::AbortTxn::ROUTE, axum::routing::delete(|| async {}))
                 .route("/v1/dbs/{db}/transactions/{id}/ops", post(|| async {}))
-                .route(data::COMMIT_ROUTE, post(|| async {}))
+                .route(api::CommitTxn::ROUTE, post(|| async {}))
                 .route("/v1/dbs/{db}/kv/{*key}", axum::routing::delete(|| async {}))
                 .route_layer(middleware::from_fn(|req: Request, _: Next| async move {
                     super::finishes_txn(&req).to_string().into_response()

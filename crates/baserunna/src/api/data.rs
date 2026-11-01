@@ -3,7 +3,7 @@
 use super::body::{BlobBody, Upload, parse_range, read_upload};
 use super::{
     Auth, DbCtx, Endpoints as _, Found, JsonBody, LONG_POLL_MAX_MS, Params, QueryOf, Ran, Reply, Req, consistency_of,
-    name_paging, naming_commit, paging, percent_decode, run_txn, watch, with_read, with_txn,
+    naming_commit, page_limit, paging, percent_decode, run_txn, watch, with_read, with_txn,
 };
 use crate::engine::manifest::ObjKind;
 use crate::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn, Value, blob};
@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::meta::{self, DbRecord, DbRef, MetaCmd};
 use crate::node::Node;
 use crate::ops::{self, Encoding, EncodingExt, Op, OpCtx, exec_ops, user_key};
-use crate::table::{self, BlobResolver, ColumnSpec, CreateTable, IndexSpec, InsertMode, Query, Selection};
+use crate::table::{self, BlobResolver, ColumnSpec, IndexSpec, InsertMode, Query, Selection};
 use crate::txns::OpenTxn;
 use axum::Router;
 use axum::body::Body;
@@ -28,9 +28,6 @@ use std::time::Duration;
 
 type J = axum::Json<Json>;
 
-pub(super) const TXN_ROUTE: &str = "/v1/dbs/{db}/transactions/{id}";
-pub(super) const COMMIT_ROUTE: &str = "/v1/dbs/{db}/transactions/{id}/commit";
-
 pub fn routes() -> Router<Arc<Node>> {
     Router::new()
         .route("/v1/dbs/{db}", get(get_db).delete(delete_db))
@@ -40,12 +37,13 @@ pub fn routes() -> Router<Arc<Node>> {
         .route(api::StageBlob::ROUTE, post(stage_blob))
         .route(api::ReadBlob::ROUTE, get(get_blob))
         .endpoint::<api::Txn, _>(one_shot)
-        .route("/v1/dbs/{db}/transactions", post(begin_txn))
-        .route(TXN_ROUTE, delete(abort_txn))
-        .route("/v1/dbs/{db}/transactions/{id}/ops", post(txn_ops))
-        .route(COMMIT_ROUTE, post(commit_txn))
-        .route("/v1/dbs/{db}/commits/{id}", get(commit_status))
-        .route("/v1/dbs/{db}/tables", get(list_tables).post(create_table))
+        .endpoint::<api::BeginTxn, _>(begin_txn)
+        .endpoint::<api::AbortTxn, _>(abort_txn)
+        .endpoint::<api::TxnOps, _>(txn_ops)
+        .endpoint::<api::CommitTxn, _>(commit_txn)
+        .endpoint::<api::GetCommit, _>(commit_status)
+        .endpoint::<api::ListTables, _>(list_tables)
+        .endpoint::<api::CreateTable, _>(create_table)
         .route("/v1/dbs/{db}/tables/{t}", get(get_table).delete(drop_table))
         .route("/v1/dbs/{db}/tables/{t}/columns", post(add_column))
         .route("/v1/dbs/{db}/tables/{t}/columns/{c}", delete(drop_column))
@@ -522,22 +520,11 @@ fn first_seqs(c: &Committed) -> Vec<u64> {
     c.appends.iter().map(|a| a.first_seq).collect()
 }
 
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct Begin {
-    #[serde(default)]
-    isolation: api::Isolation,
-    #[serde(default)]
-    encoding: Encoding,
-    #[serde(default)]
-    ops: Vec<api::Op>,
-}
-
 async fn begin_txn(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
-    JsonBody(b): JsonBody<Begin>,
-) -> Result<Response> {
+    Req(b): Req<api::BeginTxn>,
+) -> Result<Reply<api::BeginTxn>> {
     let ops = ops::parse_ops(b.ops)?;
     let user = &ctx.principal.user.id;
     node.txns.admit_begin(user, &ctx.db.id)?;
@@ -550,36 +537,26 @@ async fn begin_txn(
     let mut txn = node.txns.open(id.clone(), user, &ctx.rec.id, t, b.encoding)?;
     let results = exec_ops(&op_ctx(&node, &ctx, b.encoding), txn.txn(), &ops).await;
     let results = txn.finish(results)?;
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(json!({
-            "txn_id": id,
-            "commit_id": commit_hex(cid),
-            "read_version": rv,
-            "expires_at": node.now_ms() + node.cfg.txn_max_ms,
-            "idle_timeout_ms": node.cfg.txn_idle_ms,
-            "results": results,
-        })),
-    )
-        .into_response())
+    Ok(Reply::new(api::Begun {
+        txn_id: id,
+        commit_id: commit_hex(cid),
+        read_version: rv,
+        expires_at: node.now_ms() + node.cfg.txn_max_ms,
+        idle_timeout_ms: node.cfg.txn_idle_ms,
+        results,
+    }))
 }
 
 fn get_open(node: &Node, ctx: &DbCtx, id: &str) -> Result<Arc<OpenTxn>> {
     node.txns.get(id, &ctx.principal.user.id, &ctx.rec.id)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OpsBody {
-    ops: Vec<api::Op>,
-}
-
 async fn txn_ops(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
-    JsonBody(b): JsonBody<OpsBody>,
-) -> Result<J> {
+    Req(b): Req<api::TxnOps>,
+) -> Result<Reply<api::TxnOps>> {
     let id = param(&p, "id")?.to_string();
     let ops = ops::parse_ops(b.ops)?;
     let open = get_open(&node, &ctx, &id)?;
@@ -593,24 +570,17 @@ async fn txn_ops(
         )),
         false => e,
     })?;
-    Ok(axum::Json(json!({"results": results})))
-}
-
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct CommitBody {
-    #[serde(default)]
-    ops: Vec<api::Op>,
+    Ok(Reply::new(api::OpsResponse { results }))
 }
 
 async fn commit_txn(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
-    JsonBody(b): JsonBody<Option<CommitBody>>,
-) -> Result<J> {
+    Req(b): Req<api::CommitTxn>,
+) -> Result<Reply<api::CommitTxn>> {
     let id = param(&p, "id")?.to_string();
-    let ops = ops::parse_ops(b.unwrap_or_default().ops)?;
+    let ops = ops::parse_ops(b.ops)?;
     let txn = node.txns.lock(get_open(&node, &ctx, &id)?).await?;
     let enc = txn.encoding();
     let mut t = txn.take();
@@ -623,27 +593,33 @@ async fn commit_txn(
         let Some(version) = ctx.db.revalidate(t).await? else {
             return Err(Error::Conflict("transaction conflicts with a concurrent commit".into()));
         };
-        return Ok(axum::Json(json!({
-            "version": version, "commit_id": commit_hex(cid), "appends": [], "results": results,
-        })));
+        return Ok(Reply::new(api::Committed { version, commit_id: commit_hex(cid), appends: Vec::new(), results }));
     }
     let mut creq = t.into_request();
     creq.deadline = Some(ctx.deadline.instant());
     let c = ctx.db.commit_detailed(creq).await.map_err(|e| naming_commit(e, cid))?;
     let own_appends = ops.iter().filter(|o| matches!(o, Op::Append { .. })).count();
     ops::fill_appends(&ops, &mut results, &c.appends[c.appends.len().saturating_sub(own_appends)..]);
-    Ok(axum::Json(json!({
-        "version": c.version, "commit_id": commit_hex(cid), "appends": first_seqs(&c), "results": results,
-    })))
+    Ok(Reply::new(api::Committed { version: c.version, commit_id: commit_hex(cid), appends: first_seqs(&c), results }))
 }
 
-async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
+async fn abort_txn(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+    _: Req<api::AbortTxn>,
+) -> Result<Reply<api::AbortTxn>> {
     let id = param(&p, "id")?.to_string();
     drop(node.txns.lock(get_open(&node, &ctx, &id)?).await?.take());
-    Ok(axum::Json(json!({})))
+    Ok(Reply::new(api::Empty {}))
 }
 
-async fn commit_status(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
+async fn commit_status(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+    _: Req<api::GetCommit>,
+) -> Result<Reply<api::GetCommit>> {
     ctx.require_write()?;
     let id = param(&p, "id")?;
     let cid = match id.strip_prefix("key:") {
@@ -651,15 +627,14 @@ async fn commit_status(State(node): State<Arc<Node>>, Extension(ctx): Extension<
         None if id.len() == 16 => u64::from_str_radix(id, 16).map_err(|_| bad_commit_id())?,
         None => return Err(bad_commit_id()),
     };
-    Ok(axum::Json(match ctx.db.resolve_commit(cid).await? {
+    Ok(Reply::new(match ctx.db.resolve_commit(cid).await? {
         Some(c) => {
-            json!({"status": "committed", "version": c.version, "commit_id": commit_hex(cid), "appends": first_seqs(&c)})
+            api::CommitStatus::Committed { version: c.version, commit_id: commit_hex(cid), appends: first_seqs(&c) }
         }
-        None => json!({
-            "status": "not_committed",
-            "commit_id": commit_hex(cid),
-            "retention_ms": node.cfg.engine.commit_retention_ms,
-        }),
+        None => api::CommitStatus::NotCommitted {
+            commit_id: commit_hex(cid),
+            retention_ms: node.cfg.engine.commit_retention_ms,
+        },
     }))
 }
 
@@ -776,23 +751,26 @@ async fn row_changes(
     Ok(axum::Json(json!({"changes": changes, "more": more, "next_cursor": next.encode(), "version": v})))
 }
 
-async fn list_tables(Extension(ctx): Extension<DbCtx>, q: Params) -> Result<J> {
-    let (prefix, limit, cursor) = name_paging(&q)?;
-    let c = consistency_of(&q)?;
+async fn list_tables(
+    Extension(ctx): Extension<DbCtx>,
+    QueryOf(q): QueryOf<api::ListTablesQuery>,
+    _: Req<api::ListTables>,
+) -> Result<Reply<api::ListTables>> {
+    let limit = page_limit(q.limit)?;
+    let (prefix, cursor) = (q.prefix.unwrap_or_default(), q.cursor.filter(|c| !c.is_empty()));
+    let c = consistency_from(q.consistency, q.max_staleness_ms);
     let ((ts, next), v) = with_read!(ctx.db, c, |t| table::list_tables(t, &prefix, limit, cursor.as_deref()).await);
-    let tables: Vec<Json> = ts.iter().map(|s| s.to_json()).collect();
-    Ok(axum::Json(json!({"tables": tables, "next_cursor": next, "version": v})))
+    let tables = ts.iter().map(|s| s.to_api()).collect();
+    Ok(Reply::new(api::TablePage { tables, next_cursor: next, version: v }))
 }
 
 async fn create_table(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
-    JsonBody(def): JsonBody<CreateTable>,
-) -> Result<Response> {
-    let (s, v) = with_txn!(node, ctx, |t| table::create_table(t, &def).await);
-    let mut out = s.to_json();
-    out["version"] = json!(v);
-    Ok((StatusCode::CREATED, axum::Json(out)).into_response())
+    Req(def): Req<api::CreateTable>,
+) -> Result<Reply<api::CreateTable>> {
+    let (s, version) = with_txn!(node, ctx, |t| table::create_table(t, &def).await);
+    Ok(Reply::new(api::CreatedTable { table: s.to_api(), version }))
 }
 
 async fn get_table(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, q: Params) -> Result<J> {

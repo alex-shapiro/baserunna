@@ -24,6 +24,14 @@ pub enum Error {
         path: String,
         reason: String,
     },
+    /// An operation result does not decode as the requested type.
+    Decode {
+        what: String,
+        reason: String,
+    },
+    /// A request failed with an unknown outcome, and the server confirmed that it was not applied
+    /// and never will be.
+    NotApplied(Box<Error>),
     Transport(TransportError),
 }
 
@@ -31,6 +39,7 @@ impl Error {
     pub fn code(&self) -> Option<ErrorCode> {
         match self {
             Error::Api { error, .. } => Some(error.code),
+            Error::NotApplied(e) => e.code(),
             _ => None,
         }
     }
@@ -45,6 +54,7 @@ impl Error {
             },
             Error::Foreign { status, .. } => matches!(status, 200..=299 | 408 | 429 | 500..),
             Error::Malformed { .. } => true,
+            Error::Decode { .. } | Error::NotApplied(_) => false,
             Error::Transport(t) => !matches!(t, TransportError::NotSent(_)),
         };
         if unknown { Outcome::Unknown } else { Outcome::NotApplied }
@@ -70,7 +80,8 @@ impl Error {
                 _ => false,
             },
             Error::Foreign { status, .. } => matches!(status, 200..=299 | 407 | 408 | 429 | 500..) && may_repeat,
-            Error::Malformed { .. } => false,
+            Error::Malformed { .. } | Error::Decode { .. } => false,
+            Error::NotApplied(_) => true,
             Error::Transport(TransportError::TimedOut(_)) => false,
             Error::Transport(_) => may_repeat,
         }
@@ -85,6 +96,8 @@ impl fmt::Display for Error {
             }
             Error::Foreign { status, path, .. } => write!(f, "HTTP {status} from {path} without an API response"),
             Error::Malformed { path, reason } => write!(f, "unexpected response from {path}: {reason}"),
+            Error::Decode { what, reason } => write!(f, "cannot decode {what}: {reason}"),
+            Error::NotApplied(e) => write!(f, "{e} (confirmed not applied)"),
             Error::Transport(t) => t.fmt(f),
         }
     }

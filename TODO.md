@@ -234,9 +234,18 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       response types into `baserunna-api`, derive JSON Schema for them, and
       generate `openapi.json` from the `Endpoint` definitions instead of
       maintaining `api/openapi.rs` by hand.
-- [ ] **Replace `baserunna::client` with `baserunna-client`.** Add table,
-      stream, and event-table methods to `baserunna-client`, migrate the
-      examples, and delete `crates/baserunna/src/client.rs`.
+- [ ] **Replace `baserunna::client` with `baserunna-client`.** Add event-table
+      operations and schema routes to `baserunna-client`, migrate the examples,
+      and delete `crates/baserunna/src/client.rs`.
+- [ ] **Type the remaining JSON in `baserunna-api`.** `query_events` results,
+      row and stream `filter`s, and the routes outside `Endpoint` (KV, table
+      schema changes, row routes, streams, events, organizations) are still
+      built or parsed as untyped JSON on the server, so the compiler cannot
+      check them against `baserunna-client`.
+- [ ] **Abort a dropped interactive transaction.** Dropping a begun
+      `baserunna_client::Txn`, such as when a request handler is cancelled,
+      leaves the transaction open on the server until its idle timeout, where
+      it counts against the 100-transaction per-user limit.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`.
 - [ ] **Validate additional S3-compatible object stores.** Run the conformance

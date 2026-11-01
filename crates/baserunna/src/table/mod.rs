@@ -115,42 +115,7 @@ fn put_schema(txn: &mut Txn, s: &TableSchema) -> Result<()> {
     txn.put(catalog_key(&s.name), Value::Inline(Bytes::from(data)))
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ColumnSpec {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub ty: ColType,
-    #[serde(default = "default_true")]
-    pub nullable: bool,
-    #[serde(default)]
-    pub default: Option<Json>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IndexSpec {
-    pub name: String,
-    pub columns: Vec<String>,
-    #[serde(default)]
-    pub unique: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateTable {
-    pub name: String,
-    pub columns: Vec<ColumnSpec>,
-    pub primary_key: Vec<String>,
-    #[serde(default)]
-    pub indexes: Vec<IndexSpec>,
-    #[serde(default)]
-    pub if_not_exists: bool,
-}
+pub use baserunna_api::{Column as ColumnSpec, NewIndex as IndexSpec, NewTable as CreateTable};
 
 pub async fn create_table(txn: &mut Txn, def: &CreateTable) -> Result<TableSchema> {
     if let Some(existing) = txn.get(&catalog_key(&def.name)).await? {
@@ -905,14 +870,7 @@ async fn all_rows(txn: &mut Txn, s: &TableSchema) -> Result<Vec<(Bytes, Vec<Key>
     Ok(out)
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct RangeSpec {
-    pub gt: Option<Json>,
-    pub gte: Option<Json>,
-    pub lt: Option<Json>,
-    pub lte: Option<Json>,
-}
+pub use baserunna_api::RangeSpec;
 
 /// Row filter (SPEC §4.7) over table columns (`{"col": name, "op": ..}`).
 pub type Filter = filter::Filter<Col>;
@@ -1059,6 +1017,19 @@ pub struct Selection {
     pub range: Option<RangeSpec>,
     #[serde(default)]
     pub filter: Option<Filter>,
+}
+
+impl TryFrom<baserunna_api::Selection> for Selection {
+    type Error = Error;
+
+    fn try_from(s: baserunna_api::Selection) -> Result<Selection> {
+        let baserunna_api::Selection { index, eq, range, filter } = s;
+        let filter = filter
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))?;
+        Ok(Selection { index, eq, range, filter })
+    }
 }
 
 struct AccessPath {

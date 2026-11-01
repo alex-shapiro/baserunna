@@ -19,6 +19,11 @@ impl<T: Transport + ?Sized> Transport for Arc<T> {
     }
 }
 
+/// Request extension with the route template of the endpoint, such as
+/// `/v1/dbs/{db}/transactions/{id}/commit`, for transports that record per-endpoint metrics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Route(pub &'static str);
+
 /// Transport-level failure before receiving a complete HTTP response.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransportError {

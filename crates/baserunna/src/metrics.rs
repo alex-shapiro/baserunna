@@ -2,7 +2,7 @@
 
 use crate::engine::ObjectClass;
 use crate::timing::StoreOp;
-use serde_json::{Map, Value as Json, json};
+use baserunna_api as api;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, RwLock};
@@ -67,22 +67,23 @@ impl Histogram {
         0.0
     }
 
-    pub fn json(&self) -> Json {
+    pub fn summary(&self) -> api::Histogram {
         let counts: Vec<u64> = self.buckets.iter().map(|b| b.load(Relaxed)).collect();
         let total: u64 = counts.iter().sum();
         if total == 0 {
-            return json!({"count": 0});
+            return api::Histogram::default();
         }
-        let round = |ms: f64| (ms * 10.0).round() / 10.0;
-        json!({
-            "count": total,
-            "mean_ms": round(self.sum_us.load(Relaxed) as f64 / total as f64 / 1000.0),
-            "p50_ms": round(self.quantile_ms(&counts, total, 0.5)),
-            "p90_ms": round(self.quantile_ms(&counts, total, 0.9)),
-            "p99_ms": round(self.quantile_ms(&counts, total, 0.99)),
-            "p999_ms": round(self.quantile_ms(&counts, total, 0.999)),
-            "max_ms": round(self.max_us.load(Relaxed) as f64 / 1000.0),
-        })
+        let round = |ms: f64| Some((ms * 10.0).round() / 10.0);
+        api::Histogram {
+            count: total,
+            mean_ms: round(self.sum_us.load(Relaxed) as f64 / total as f64 / 1000.0),
+            p50_ms: round(self.quantile_ms(&counts, total, 0.5)),
+            p90_ms: round(self.quantile_ms(&counts, total, 0.9)),
+            p99_ms: round(self.quantile_ms(&counts, total, 0.99)),
+            p999_ms: round(self.quantile_ms(&counts, total, 0.999)),
+            max_ms: round(self.max_us.load(Relaxed) as f64 / 1000.0),
+            errors: None,
+        }
     }
 
     fn reset(&self) {
@@ -118,25 +119,24 @@ impl StoreMetrics {
         self.batch_txns_max.fetch_max(txns as u64, Relaxed);
     }
 
-    pub fn json_into(&self, out: &mut Map<String, Json>) {
-        let mut store = Map::new();
+    /// Sets the object store and commit metrics in `out`.
+    pub fn fill(&self, out: &mut api::Metrics) {
         for class in ObjectClass::ALL {
             for op in StoreOp::ALL {
                 let h = &self.store[class as usize][op as usize];
                 if h.count() == 0 {
                     continue;
                 }
-                let mut v = h.json();
-                v["errors"] = json!(self.store_errors[class as usize][op as usize].load(Relaxed));
-                store.insert(format!("{}.{}", class.name(), op.name()), v);
+                let errors = Some(self.store_errors[class as usize][op as usize].load(Relaxed));
+                out.store.insert(format!("{}.{}", class.name(), op.name()), api::Histogram { errors, ..h.summary() });
             }
         }
-        let mut commits = self.commits.json();
         let batches = self.commits.count().max(1) as f64;
-        commits["txns_per_batch"] = json!((self.batch_txns.load(Relaxed) as f64 / batches * 10.0).round() / 10.0);
-        commits["max_txns_per_batch"] = json!(self.batch_txns_max.load(Relaxed));
-        out.insert("store".into(), Json::Object(store));
-        out.insert("commits".into(), commits);
+        out.commits = api::CommitMetrics {
+            latency: self.commits.summary(),
+            txns_per_batch: (self.batch_txns.load(Relaxed) as f64 / batches * 10.0).round() / 10.0,
+            max_txns_per_batch: self.batch_txns_max.load(Relaxed),
+        };
     }
 
     pub fn reset(&self) {
@@ -171,16 +171,16 @@ impl ServerMetrics {
         self.lag.record(late);
     }
 
-    pub fn json_into(&self, out: &mut Map<String, Json>) {
+    /// Sets the HTTP route, scheduler lag, and CPU metrics in `out`.
+    pub fn fill(&self, out: &mut api::Metrics) {
         let routes = self.routes.read().unwrap_or_else(|e| e.into_inner());
-        let routes: Map<String, Json> = METHODS
+        out.routes = METHODS
             .iter()
             .zip(routes.iter())
-            .flat_map(|(m, by_route)| by_route.iter().map(move |(r, h)| (format!("{m} {r}"), h.json())))
+            .flat_map(|(m, by_route)| by_route.iter().map(move |(r, h)| (format!("{m} {r}"), h.summary())))
             .collect();
-        out.insert("routes".into(), Json::Object(routes));
-        out.insert("lag".into(), self.lag.json());
-        out.insert("cpu".into(), cpu_json());
+        out.lag = self.lag.summary();
+        out.cpu = cpu();
     }
 
     pub fn reset(&self) {
@@ -189,7 +189,7 @@ impl ServerMetrics {
     }
 }
 
-fn cpu_json() -> Json {
+fn cpu() -> api::Cpu {
     const TICK_MS: u64 = 10;
     let process = std::fs::read_to_string("/proc/self/stat").ok().and_then(|s| {
         // In /proc/self/stat, fields 11 and 12 after "(comm)" are utime and stime.
@@ -200,7 +200,7 @@ fn cpu_json() -> Json {
         let cpu = s.lines().next()?.split_whitespace().skip(1).filter_map(|x| x.parse::<u64>().ok());
         Some(cpu.collect::<Vec<_>>().get(7)? * TICK_MS)
     });
-    json!({"process_ms": process, "steal_ms": steal})
+    api::Cpu { process_ms: process, steal_ms: steal }
 }
 
 #[cfg(test)]
@@ -213,18 +213,18 @@ mod tests {
         for ms in 1..=100 {
             h.record(Duration::from_millis(ms));
         }
-        let j = h.json();
-        assert_eq!(j["count"], 100);
-        let near = |k: &str, want: f64| {
-            let got = j[k].as_f64().unwrap();
+        let s = h.summary();
+        assert_eq!(s.count, 100);
+        let near = |k: &str, got: Option<f64>, want: f64| {
+            let got = got.unwrap();
             assert!(got >= want && got <= want * 1.25 + 0.1, "{k}: {got} vs {want}");
         };
-        near("p50_ms", 50.0);
-        near("p90_ms", 90.0);
-        near("p99_ms", 99.0);
-        assert_eq!(j["max_ms"], 100.0);
+        near("p50_ms", s.p50_ms, 50.0);
+        near("p90_ms", s.p90_ms, 90.0);
+        near("p99_ms", s.p99_ms, 99.0);
+        assert_eq!(s.max_ms, Some(100.0));
         h.reset();
-        assert_eq!(h.json()["count"], 0);
+        assert_eq!(h.summary(), api::Histogram::default());
     }
 
     #[test]
@@ -234,17 +234,9 @@ mod tests {
             m.request(method, Some("/v1/dbs/{db}"), Duration::from_millis(1));
         }
         m.request("ZZ", None, Duration::from_millis(1));
-        let mut out = Map::new();
-        m.json_into(&mut out);
-        let routes: Vec<_> =
-            out["routes"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v["count"].clone())).collect();
-        assert_eq!(
-            routes,
-            [
-                ("GET /v1/dbs/{db}".into(), json!(2)),
-                ("OTHER /v1/dbs/{db}".into(), json!(2)),
-                ("OTHER unmatched".into(), json!(1))
-            ]
-        );
+        let mut out = api::Metrics::default();
+        m.fill(&mut out);
+        let routes: Vec<_> = out.routes.iter().map(|(k, v)| (k.as_str(), v.count)).collect();
+        assert_eq!(routes, [("GET /v1/dbs/{db}", 2), ("OTHER /v1/dbs/{db}", 2), ("OTHER unmatched", 1)]);
     }
 }

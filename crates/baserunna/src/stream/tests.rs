@@ -1016,9 +1016,9 @@ fn bodies_and_lines() {
     assert!(parse_lines(&Bytes::from_static(b"{}\nnope\n"), true).is_err());
     assert_eq!(parse_lines(&Bytes::from_static(b"one\ntwo"), false).unwrap().len(), 2);
     let r: NewRecord = serde_json::from_value(json!({"json": null})).unwrap();
-    assert_eq!(r.into_body(Encoding::Utf8).unwrap().data, Bytes::from_static(b"null"));
+    assert_eq!(record_body(r, Encoding::Utf8).unwrap().data, Bytes::from_static(b"null"));
     let both: NewRecord = serde_json::from_value(json!({"json": 1, "value": "x"})).unwrap();
-    assert!(both.into_body(Encoding::Utf8).is_err());
+    assert!(record_body(both, Encoding::Utf8).is_err());
     assert!(valid_name("app.api:prod-1") && !valid_name("a/b") && !valid_name("") && !valid_name(&"x".repeat(129)));
     let rec = Record { seq: 4, time_ms: 9, pos: 0, payload: Bytes::new() };
     let raw = Body::text(Bytes::from_static(b"\xff"));

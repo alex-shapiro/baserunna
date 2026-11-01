@@ -9,38 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ColType {
-    String,
-    Int,
-    Float,
-    Bool,
-    Bytes,
-    Json,
-    Blob,
-}
-
-impl ColType {
-    pub const ALL: [ColType; 7] =
-        [ColType::String, ColType::Int, ColType::Float, ColType::Bool, ColType::Bytes, ColType::Json, ColType::Blob];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            ColType::String => "string",
-            ColType::Int => "int",
-            ColType::Float => "float",
-            ColType::Bool => "bool",
-            ColType::Bytes => "bytes",
-            ColType::Json => "json",
-            ColType::Blob => "blob",
-        }
-    }
-
-    pub fn indexable(self) -> bool {
-        !matches!(self, ColType::Json | ColType::Blob)
-    }
-}
+pub use baserunna_api::{ColumnType as ColType, IndexState};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Column {
@@ -61,17 +30,6 @@ pub struct IndexDef {
     pub unique: bool,
     #[serde(default)]
     pub state: IndexState,
-}
-
-/// Every row write maintains an index in either state, but only a `Ready`
-/// index can serve queries.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum IndexState {
-    #[default]
-    Ready,
-    /// Being backfilled from the table's rows.
-    Building,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -259,17 +217,29 @@ impl TableSchema {
         Ok(())
     }
 
+    pub fn to_api(&self) -> baserunna_api::Table {
+        let column = |c: &Column| baserunna_api::Column {
+            name: c.name.clone(),
+            ty: c.ty,
+            nullable: c.nullable,
+            default: c.default.clone(),
+        };
+        let index = |i: &IndexDef| baserunna_api::Index {
+            name: i.name.clone(),
+            columns: i.columns.clone(),
+            unique: i.unique,
+            state: i.state,
+        };
+        baserunna_api::Table {
+            name: self.name.clone(),
+            columns: self.columns.iter().map(column).collect(),
+            primary_key: self.primary_key.clone(),
+            indexes: self.indexes.iter().map(index).collect(),
+        }
+    }
+
     pub fn to_json(&self) -> Json {
-        json!({
-            "name": self.name,
-            "columns": self.columns.iter().map(|c| {
-                let mut o = json!({"name": c.name, "type": c.ty, "nullable": c.nullable});
-                if let Some(d) = &c.default { o["default"] = d.clone(); }
-                o
-            }).collect::<Vec<_>>(),
-            "primary_key": self.primary_key,
-            "indexes": self.indexes.iter().map(|i| json!({"name": i.name, "columns": i.columns, "unique": i.unique, "state": i.state})).collect::<Vec<_>>(),
-        })
+        serde_json::to_value(self.to_api()).expect("table schemas serialize")
     }
 }
 

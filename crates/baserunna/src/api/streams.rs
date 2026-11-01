@@ -183,7 +183,7 @@ async fn append(
                 Some(e) => e,
                 None => encoding_param(&q)?,
             };
-            b.records.into_iter().map(|r| r.into_body(enc)).collect::<Result<_>>()?
+            b.records.into_iter().map(|r| stream::record_body(r, enc)).collect::<Result<_>>()?
         }
         "application/x-ndjson" | "application/jsonl" | "application/json-lines" => stream::parse_lines(&data, true)?,
         "text/plain" => stream::parse_lines(&data, false)?,

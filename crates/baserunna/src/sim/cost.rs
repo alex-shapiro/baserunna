@@ -381,12 +381,8 @@ pub async fn call_router(router: &axum::Router, method: &str, path: &str, token:
 }
 
 pub fn run_paused<F: Future>(f: F) -> F::Output {
-    let lvl = crate::log::level();
-    crate::log::set_level(Some(crate::log::Level::Error));
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
-    let out = rt.block_on(f);
-    crate::log::set_level(lvl);
-    out
+    rt.block_on(f)
 }
 
 pub const LATENCY_MS: u64 = 20;

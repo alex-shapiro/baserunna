@@ -203,7 +203,6 @@ fn concurrent_retries_with_same_key_insert_once() {
             send(&w, 0, &t, "POST", p, &h, body),
             send(&w, 1, &t, "POST", p, &h, body)
         );
-        println!("{a:?} {b:?} {c:?}");
         assert_eq!(count(&w, 0, &t).await, json!(1));
         let ok = [&a, &b, &c].iter().filter(|r| r.0 == 201 || r.0 == 200).count();
         assert_eq!(ok, 3, "every retry of the insert succeeds: {a:?} {b:?} {c:?}");
@@ -234,8 +233,7 @@ fn bulk_insert_survives_a_lease_move_while_buffered() {
         };
         let ((s, r), ()) = tokio::join!(insert, mover);
         assert_eq!(w.holder(&id), Some(m));
-        println!("holder {h} -> {m}, insert on {n}: {s} {r}");
-        assert_eq!(s, 201, "an insert buffered while the lease moved fails: {r}");
+        assert_eq!(s, 201, "an insert on {n} buffered while the lease moved from {h} to {m} fails: {r}");
         w.shutdown();
     });
 }

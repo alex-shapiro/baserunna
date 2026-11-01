@@ -978,7 +978,7 @@ pub async fn maintain_skipping(db: &Arc<Db>, table: u32, rounds: usize, failed: 
                 Ok(()) | Err(Error::Conflict(_)) => {}
                 Err(e @ (Error::NotOwner { .. } | Error::Unavailable { .. })) => return Err(e),
                 Err(e) => {
-                    crate::debug!("event merge of {} table {table} failed: {e}", db.id);
+                    tracing::debug!(db = %db.id, table = %table, error = %e, "event merge failed");
                     failed.extend(parts.into_iter().map(|p| p.id));
                     first_error.get_or_insert(e);
                 }
@@ -1021,7 +1021,7 @@ impl Maintainer {
                         _ => (BTreeSet::new(), now),
                     };
                     if let Err(e) = maintain_skipping(&db, t, 64, &mut failed).await {
-                        crate::debug!("event maintenance of {} table {t} stopped: {e}", db.id);
+                        tracing::debug!(db = %db.id, table = %t, error = %e, "event maintenance stopped");
                     }
                     if !failed.is_empty() {
                         me.failed.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), (failed, since));

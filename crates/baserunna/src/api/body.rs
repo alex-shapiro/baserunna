@@ -87,7 +87,7 @@ impl http_body::Body for BlobBody {
                     }
                     this.fut = Some(Box::pin(async move {
                         if pin && let Err(e) = blob::pin(&shared, &db, &blob.id).await {
-                            crate::warn!("could not pin blob {} of {db} for a long read: {e}", blob.id);
+                            tracing::warn!(db = %db, blob = %blob.id, error = %e, "could not pin a blob for a long read");
                         }
                         read_chunk(&shared, &db, &blob, ci, r).await
                     }));

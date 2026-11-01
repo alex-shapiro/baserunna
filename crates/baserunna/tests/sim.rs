@@ -6,6 +6,68 @@
 use baserunna::probe::{self, Probe};
 use baserunna::sim::workloads::scenario;
 use baserunna::sim::{SimConfig, run, run_seeds};
+use serde_json::Value as Json;
+use std::sync::{Arc, Mutex};
+
+/// Log events captured on the current thread as JSON lines.
+struct Capture {
+    lines: Arc<Mutex<Vec<u8>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+struct Lines(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Lines {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Captures info-level log events emitted on the current thread.
+fn capture() -> Capture {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let sink = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .flatten_event(true)
+        .with_current_span(false)
+        .with_span_list(true)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || Lines(sink.clone()))
+        .finish();
+    Capture { lines, _guard: tracing::subscriber::set_default(subscriber) }
+}
+
+impl Capture {
+    /// Returns each captured event as one JSON object holding its fields and
+    /// the fields of its enclosing spans, with nested JSON fields parsed.
+    fn records(&self) -> Vec<Json> {
+        let lines = self.lines.lock().unwrap();
+        let mut out = Vec::new();
+        for line in String::from_utf8_lossy(&lines).lines() {
+            let mut r: serde_json::Map<String, Json> = serde_json::from_str(line).expect("a JSON log line");
+            for span in r.remove("spans").and_then(|s| s.as_array().cloned()).unwrap_or_default() {
+                r.extend(
+                    span.as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter(|(k, _)| *k != "name")
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                );
+            }
+            if let Some(store) = r.get("store").and_then(Json::as_str).and_then(|s| serde_json::from_str(s).ok()) {
+                r.insert("store".into(), store);
+            }
+            out.push(Json::Object(r));
+        }
+        out
+    }
+}
 
 /// Generates a test function per scenario and verifies that all scenarios are covered.
 macro_rules! scenario_tests {
@@ -340,9 +402,9 @@ fn store_clock_lease_expiry() {
 
 #[test]
 fn request_and_commit_log_timing() {
-    use baserunna::log::{Level, REQUEST_ID_HEADER, capture};
+    use baserunna::request_id::HEADER as REQUEST_ID_HEADER;
     use baserunna::sim::client::Client;
-    let cap = capture(Level::Info);
+    let cap = capture();
     let out = run(22, SimConfig::basic(), |sim| async move {
         let c = Client::signup(&sim, "u", "u@timing.test", "password-123").await?;
         c.create_db("t").await?;
@@ -352,13 +414,14 @@ fn request_and_commit_log_timing() {
     });
     out.result.unwrap();
     let records = cap.records();
-    let put = records.iter().find(|r| r["msg"] == "request" && r["request_id"] == "put-1").expect("request record");
+    let put = records.iter().find(|r| r["message"] == "request" && r["request_id"] == "put-1").expect("request record");
     assert_eq!(put["commits"], 1, "{put}");
     assert!(put["commit_ms"].is_u64(), "{put}");
     let commit = records
         .iter()
         .find(|r| {
-            r["msg"] == "commit" && r["request_ids"].as_array().is_some_and(|ids| ids.iter().any(|i| i == "put-1"))
+            r["message"] == "commit"
+                && r["request_ids"].as_str().is_some_and(|ids| ids.split(',').any(|i| i == "put-1"))
         })
         .expect("commit record for put-1");
     assert!(commit["txns"].as_u64() >= Some(1), "{commit}");
@@ -371,9 +434,9 @@ fn request_and_commit_log_timing() {
 
 #[test]
 fn request_ids_follow_forwarded_requests() {
-    use baserunna::log::{Level, REQUEST_ID_HEADER, capture};
+    use baserunna::request_id::HEADER as REQUEST_ID_HEADER;
     use baserunna::sim::client::Client;
-    let cap = capture(Level::Info);
+    let cap = capture();
     let mut cfg = SimConfig::basic();
     cfg.nodes = 2;
     let out = run(21, cfg, |sim| async move {
@@ -392,12 +455,12 @@ fn request_ids_follow_forwarded_requests() {
             }
             sent.push(rid);
         }
-        let too_long = "x".repeat(baserunna::log::MAX_REQUEST_ID_LEN + 1);
+        let too_long = "x".repeat(baserunna::request_id::MAX_LEN + 1);
         for bad in ["has space", "é", &too_long] {
             let r = c.send("GET", "/v1/me", &[(REQUEST_ID_HEADER, bad.to_string())], "".into()).await;
             let r = r.map_err(|e| format!("{e:?}"))?;
             let echoed = r.headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()).unwrap_or_default();
-            if echoed == bad || !baserunna::log::valid_request_id(echoed) {
+            if echoed == bad || !baserunna::request_id::valid(echoed) {
                 return Err(format!("invalid id {bad:?} echoed as {echoed:?}"));
             }
         }
@@ -408,7 +471,7 @@ fn request_ids_follow_forwarded_requests() {
     });
     out.result.unwrap();
     let records = cap.records();
-    let requests: Vec<_> = records.iter().filter(|r| r["msg"] == "request").collect();
+    let requests: Vec<_> = records.iter().filter(|r| r["message"] == "request").collect();
     let ids = |rid: &str| requests.iter().filter(|r| r["request_id"] == rid).collect::<Vec<_>>();
     let mut forwarded = 0;
     for i in 0..12 {

@@ -16,10 +16,10 @@ use crate::cluster::{
 };
 use crate::engine::{Committed, Consistency, Db, Txn};
 use crate::error::{Error, Result};
-use crate::log::{self, REQUEST_ID_HEADER};
 use crate::meta::{Access, DbRecord};
 use crate::node::{Deadline, Meter, Node, Principal};
 use crate::probe::{self, Probe};
+use crate::request_id;
 use crate::timing;
 use axum::Router;
 use axum::body::Body;
@@ -35,6 +35,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value as Json, json};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 
 pub const SESSION_COOKIE: &str = "brs_session";
 
@@ -47,7 +48,7 @@ impl IntoResponse for Error {
             _ => None,
         };
         if let Error::Internal(m) = &self {
-            crate::warn!("internal error: {m}");
+            tracing::error!(error = %m, "internal error");
         }
         let mut resp = (status, axum::Json(api::ErrorBody { error: api_error(&self) })).into_response();
         if let Some(ms) = retry_after {
@@ -635,17 +636,17 @@ async fn run_until_deadline<F: std::future::Future>(deadline: &Deadline, wait: D
 /// Assigns an `x-request-id` header, enforces the request deadline, attaches
 /// `Server-Timing`, and logs request completion.
 async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
-    let given = req.headers().get(REQUEST_ID_HEADER).filter(|v| v.to_str().is_ok_and(log::valid_request_id));
+    let given = req.headers().get(request_id::HEADER).filter(|v| v.to_str().is_ok_and(request_id::valid));
     let header = match given {
         Some(v) => v.clone(),
         None => HeaderValue::from_str(&node.env.random_hex(8)).unwrap_or(HeaderValue::from_static("0")),
     };
-    req.headers_mut().insert(REQUEST_ID_HEADER, header.clone());
+    req.headers_mut().insert(request_id::HEADER, header.clone());
     let rid = header.to_str().unwrap_or_default();
-    let ctx = log::Context { node: node.id.as_str().into(), request_id: rid.into() };
+    let span = tracing::error_span!(parent: &node.env.span(), "request", request_id = rid);
     let started = tokio::time::Instant::now();
     let tally = Arc::new(timing::Tally::default());
-    let mut resp = log::scoped(ctx, {
+    let handle = {
         let tally = tally.clone();
         let node = node.clone();
         async move {
@@ -671,40 +672,34 @@ async fn request_context(State(node): State<Arc<Node>>, mut req: Request, next: 
                 }
             };
             node.metrics.request(method.as_str(), route.as_ref().map(MatchedPath::as_str), started.elapsed());
-            if log::enabled(log::Level::Info) {
-                let mut fields = vec![
-                    ("method", json!(method.as_str())),
-                    ("route", json!(route.as_ref().map_or("unmatched", MatchedPath::as_str))),
-                    ("status", json!(resp.status().as_u16())),
-                    ("ms", json!(started.elapsed().as_millis() as u64)),
-                    ("hops", json!(hops)),
-                ];
-                if let Some(ForwardedTo(t)) = resp.extensions().get::<ForwardedTo>() {
-                    fields.push(("forwarded_to", json!(t)));
-                }
-                if let Some(store) = tally.store_json() {
-                    fields.push(("store_ms", json!(tally.store_ms())));
-                    fields.push(("store", store));
-                }
-                if let (n @ 1.., wait) = tally.commits() {
-                    fields.push(("commits", json!(n)));
-                    fields.push(("commit_ms", json!(wait)));
-                }
-                if tally.read_wait_ms() > 0 {
-                    fields.push(("read_wait_ms", json!(tally.read_wait_ms())));
-                }
-                log::event(log::Level::Info, "request", &fields);
+            if tracing::enabled!(tracing::Level::INFO) {
+                let store = tally.store_json();
+                let (commits, commit_ms) = tally.commits();
+                tracing::info!(
+                    method = method.as_str(),
+                    route = route.as_ref().map_or("unmatched", MatchedPath::as_str),
+                    status = resp.status().as_u16(),
+                    ms = started.elapsed().as_millis() as u64,
+                    hops,
+                    forwarded_to = resp.extensions().get::<ForwardedTo>().map(|ForwardedTo(t)| t.as_str()),
+                    store_ms = store.is_some().then(|| tally.store_ms()),
+                    store = store.as_ref().map(tracing::field::display),
+                    commits = (commits > 0).then_some(commits),
+                    commit_ms = (commits > 0).then_some(commit_ms),
+                    read_wait_ms = Some(tally.read_wait_ms()).filter(|ms| *ms > 0),
+                    "request"
+                );
             }
             resp
         }
-    })
-    .await;
+    };
+    let mut resp = request_id::scoped(rid.into(), handle.instrument(span)).await;
     if !resp.headers().contains_key(SERVER_TIMING_HEADER)
         && let Ok(v) = HeaderValue::from_str(&tally.server_timing(started.elapsed()))
     {
         resp.headers_mut().insert(SERVER_TIMING_HEADER, v);
     }
-    resp.headers_mut().insert(REQUEST_ID_HEADER, header);
+    resp.headers_mut().insert(request_id::HEADER, header);
     resp
 }
 

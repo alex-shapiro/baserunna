@@ -3002,9 +3002,6 @@ pub struct Harness {
 
 impl Harness {
     pub fn new(seed: u64) -> Harness {
-        if std::env::var("BASERUNNA_LOG").is_err() {
-            crate::log::set_level(Some(crate::log::Level::Error));
-        }
         let rt =
             tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
         let (sim, token) = rt.block_on(async {

@@ -286,8 +286,8 @@ impl Session {
             if let Some(ct) = content_type {
                 b = b.header("content-type", ct);
             }
-            if let Some(rid) = crate::log::request_id() {
-                b = b.header(crate::log::REQUEST_ID_HEADER, rid.as_ref());
+            if let Some(rid) = crate::request_id::current() {
+                b = b.header(crate::request_id::HEADER, rid.as_ref());
             }
             let Ok(req) = b.body(Body::from(body.clone())) else {
                 return (StatusCode::BAD_REQUEST, "bad request").into_response();
@@ -414,8 +414,22 @@ fn format_duration(ms: u64) -> String {
     }
 }
 
+/// Formats Unix epoch milliseconds as a UTC `YYYY-MM-DD hh:mm:ss` timestamp.
 fn format_timestamp(ms: impl TryInto<i64>) -> String {
-    crate::log::rfc3339(ms.try_into().unwrap_or(i64::MAX))[..19].replace('T', " ")
+    let ms: i64 = ms.try_into().unwrap_or(i64::MAX);
+    let days = ms.div_euclid(86_400_000);
+    let secs = ms.rem_euclid(86_400_000) / 1000;
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
 }
 
 use self::format_timestamp as when;
@@ -554,6 +568,16 @@ async fn verify_post(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamps() {
+        assert_eq!(format_timestamp(0), "1970-01-01 00:00:00");
+        assert_eq!(format_timestamp(951_782_400_000i64), "2000-02-29 00:00:00");
+        assert_eq!(format_timestamp(1_791_979_200_123i64), "2026-10-14 12:00:00");
+        assert_eq!(format_timestamp(4_107_542_399_999i64), "2100-02-28 23:59:59");
+        assert_eq!(format_timestamp(-1), "1969-12-31 23:59:59");
+        assert_eq!(format_timestamp(-62_167_219_200_000i64), "0000-01-01 00:00:00");
+    }
 
     #[test]
     fn escaping() {

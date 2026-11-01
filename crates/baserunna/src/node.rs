@@ -22,6 +22,7 @@ use serde_json::{Value as Json, json};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::Instant;
+use tracing::Instrument;
 
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -336,6 +337,7 @@ impl Node {
     pub async fn start(cfg: NodeConfig, env: Arc<Env>, store: DynStore, services: Services) -> Result<Arc<Node>> {
         cfg.engine.validate().map_err(|e| Error::invalid(format!("engine configuration: {e}")))?;
         let id = format!("{}-{}", cfg.name, env.random_hex(4));
+        env.set_span(tracing::error_span!("node", node = %id));
         let engine = Engine::new(store, env.clone(), cfg.engine.clone(), id.clone());
         let txns = OpenTxns::new(engine.clone(), cfg.txn_limits());
         engine.mark_system(SYS_DB);
@@ -394,7 +396,7 @@ impl Node {
                 n.notify_home(db, version);
             }
         }));
-        node.bootstrap().await?;
+        node.bootstrap().instrument(node.env.span()).await?;
         node.spawn_background();
         Ok(node)
     }
@@ -468,7 +470,7 @@ impl Node {
 
     async fn bootstrap(self: &Arc<Self>) -> Result<()> {
         if let Err(e) = self.engine.shared.store_time_ms().await {
-            crate::warn!("{}: could not measure the store clock yet: {e}", self.id);
+            tracing::warn!(error = %e, "could not measure the store clock yet");
         }
         let sys = self.engine.db(SYS_DB);
         retry_unavailable(|| sys.open(true)).await?;
@@ -523,7 +525,7 @@ impl Node {
                 if last_heartbeat.elapsed() >= hb {
                     match n.heartbeat().await {
                         Ok(()) => last_heartbeat = Instant::now(),
-                        Err(e) => crate::debug!("{}: heartbeat failed: {e}", n.id),
+                        Err(e) => tracing::debug!(error = %e, "heartbeat failed"),
                     }
                 }
                 let _ = n.refresh_members().await;
@@ -543,7 +545,7 @@ impl Node {
                 tokio::time::sleep(Duration::from_millis(REAP_INTERVAL_MS)).await;
                 let Some(n) = me.upgrade() else { return };
                 if let Err(e) = n.reap_deleted().await {
-                    crate::debug!("{}: reaper: {e}", n.id);
+                    tracing::debug!(error = %e, "reaping deleted accounts failed");
                 }
             }
         });
@@ -947,10 +949,10 @@ impl Node {
         }
         let remaining = deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
         req.headers_mut().insert(DEADLINE_HEADER, (self.now_ms() + remaining).into());
-        if let Some(rid) = crate::log::request_id()
+        if let Some(rid) = crate::request_id::current()
             && let Ok(v) = rid.parse()
         {
-            req.headers_mut().insert(crate::log::REQUEST_ID_HEADER, v);
+            req.headers_mut().insert(crate::request_id::HEADER, v);
         }
         let resp = self.services.transport.call(addr, req).await.map_err(Err)?;
         let status = resp.status();
@@ -1200,7 +1202,7 @@ impl Node {
 
     async fn delete_ended_sessions(&self, user_id: &str, keep: Option<&str>) {
         if let Err(e) = self.revoke_sessions(user_id, keep).await {
-            crate::warn!("deleting sessions ended by a password change: {e}");
+            tracing::warn!(user = user_id, error = %e, "deleting sessions ended by a password change failed");
         }
     }
 
@@ -1260,7 +1262,7 @@ impl Node {
             if db.open(false).await.is_ok()
                 && let Err(e) = db.mark_deleted().await
             {
-                crate::warn!("flagging database {id} of a deleted account: {e}");
+                tracing::warn!(db = %id, error = %e, "flagging a database of a deleted account failed");
             }
             self.engine.forget(&id);
         }
@@ -1282,7 +1284,7 @@ impl Node {
             for attempt in 0..5u32 {
                 match mailer.send(&mail).await {
                     Ok(()) => return,
-                    Err(e) => crate::warn!("sending mail (attempt {}): {e}", attempt + 1),
+                    Err(e) => tracing::warn!(attempt = attempt + 1, error = %e, "sending mail failed"),
                 }
                 tokio::time::sleep(Duration::from_millis(1_000 << attempt)).await;
             }

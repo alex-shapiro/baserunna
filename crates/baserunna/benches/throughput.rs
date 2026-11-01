@@ -68,7 +68,6 @@ async fn bench(threads: usize) {
     let latency = env("BENCH_LATENCY_MS", 0);
     let keys = env("BENCH_KEYS", 1).max(1);
     let value_bytes = env("BENCH_VALUE_BYTES", 8) as usize;
-    baserunna::log::set_level(Some(baserunna::log::Level::Error));
 
     let store = Arc::new(MeteredStore::new(Arc::new(MemStore::with_system_clock()), 0));
     let mut cfg = node_config("bench", "http://127.0.0.1:0");

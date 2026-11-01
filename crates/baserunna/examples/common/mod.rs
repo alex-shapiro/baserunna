@@ -47,9 +47,8 @@ pub async fn start(store: DynStore, name: &str, signup: SignupPolicy) -> Server 
         members_refresh_ms: 1_000,
         ..NodeConfig::default()
     };
-    if std::env::var("BASERUNNA_LOG").is_err() {
-        baserunna::log::set_level(Some(baserunna::log::Level::Warn));
-    }
+    let filter = std::env::var("BASERUNNA_LOG").unwrap_or_else(|_| "warn".into());
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
     let services = Services { transport: Arc::new(HttpTransport::new()), oidc: None, mailer: None };
     let node = Node::start(cfg, Arc::new(Env::real()), store, services).await.expect("node start");
     let app = baserunna::api::router(node.clone());

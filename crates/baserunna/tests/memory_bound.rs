@@ -182,7 +182,6 @@ fn memory_charges_bound_real_heap_use() {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
     rt.block_on(async {
-        baserunna::log::set_level(Some(baserunna::log::Level::Warn));
         let w = World::new();
         charges_cover_decoded_manifests(&w).await;
         opening_many_databases_respects_budget(&w).await;

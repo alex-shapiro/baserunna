@@ -7,9 +7,17 @@ use baserunna::limits::Rate;
 use baserunna::meta::SignupPolicy;
 use baserunna::node::{Node, NodeConfig, Services};
 use baserunna::store::{DynStore, FsStore, MemStore};
+use futures_util::future::Either;
+use std::future::IntoFuture;
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
 
 fn var(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|v| !v.is_empty())
@@ -102,6 +110,39 @@ fn config() -> Result<(NodeConfig, String, String, Shutdown), String> {
     Ok((cfg, listen, store, shutdown))
 }
 
+/// Installs the global tracing subscriber configured by `BASERUNNA_LOG` and
+/// `BASERUNNA_LOG_FORMAT`. Events are written to stderr from a background
+/// thread that drops them when stderr falls behind; dropping the returned guard
+/// flushes queued events.
+fn init_logging() -> Result<WorkerGuard, String> {
+    let filter = var("BASERUNNA_LOG").unwrap_or_else(|| "info".into());
+    let filter = EnvFilter::try_new(&filter).map_err(|e| format!("invalid BASERUNNA_LOG {filter:?}: {e}"))?;
+    let (writer, guard) = tracing_appender::non_blocking(std::io::stderr());
+    let dropped = writer.error_counter();
+    let layer = tracing_subscriber::fmt::layer().with_writer(writer);
+    let layer = match var("BASERUNNA_LOG_FORMAT").as_deref() {
+        None | Some("json") => layer.json().flatten_event(true).with_current_span(false).with_span_list(true).boxed(),
+        Some("text") => layer.with_ansi(std::io::stderr().is_terminal()).boxed(),
+        Some(o) => return Err(format!("unknown log format {o:?} (json or text)")),
+    };
+    tracing_subscriber::registry().with(filter).with(layer).try_init().map_err(|e| e.to_string())?;
+    std::thread::Builder::new()
+        .name("log-drops".into())
+        .spawn(move || {
+            let mut reported = 0;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let n = dropped.dropped_lines();
+                if n > reported {
+                    tracing::warn!(lines = n - reported, "dropped log lines because stderr fell behind");
+                    reported = n;
+                }
+            }
+        })
+        .map_err(|e| format!("cannot start the log monitor: {e}"))?;
+    Ok(guard)
+}
+
 /// Resolves on SIGTERM or SIGINT.
 async fn stop_signal() {
     #[cfg(unix)]
@@ -116,7 +157,7 @@ async fn stop_signal() {
                 either.await;
                 return;
             }
-            _ => baserunna::warn!("cannot install signal handlers; stopping on Ctrl-C only"),
+            _ => tracing::warn!("cannot install signal handlers; stopping on Ctrl-C only"),
         }
     }
     let _ = tokio::signal::ctrl_c().await;
@@ -124,19 +165,19 @@ async fn stop_signal() {
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = baserunna::log::init_from_env() {
-        eprintln!("baserunna: {e}");
-        std::process::exit(1);
-    }
-    baserunna::log::start_background_writer();
+    let logs = match init_logging() {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("baserunna: {e}");
+            std::process::exit(1);
+        }
+    };
     let result = run().await;
     if let Err(e) = &result {
-        baserunna::error!("{e}");
+        tracing::error!("{e}");
     }
-    baserunna::log::flush();
-    if result.is_err() {
-        std::process::exit(1);
-    }
+    drop(logs);
+    std::process::exit(i32::from(result.is_err()));
 }
 
 async fn run() -> Result<(), String> {
@@ -176,36 +217,48 @@ async fn run() -> Result<(), String> {
             n.metrics.lag(started.elapsed().saturating_sub(PERIOD));
         }
     });
-    baserunna::log::set_process_node(&node.id);
+    serve(node.clone(), &listen, &store_url, shutdown).instrument(env.span()).await
+}
+
+/// Serves `node` on `listen` until a stop signal, then drains and releases its leases.
+async fn serve(node: Arc<Node>, listen: &str, store_url: &str, shutdown: Shutdown) -> Result<(), String> {
     let app = baserunna::api::router(node.clone());
     let listener =
-        tokio::net::TcpListener::bind(&listen).await.map_err(|e| format!("cannot listen on {listen}: {e}"))?;
-    baserunna::info!("listening on {listen} (store {store_url})");
-    let n2 = node.clone();
-    let stopping = async move {
-        stop_signal().await;
-        baserunna::info!("shutting down: draining for {:?}", shutdown.drain_delay);
-        n2.drain();
-        tokio::time::sleep(shutdown.drain_delay).await;
-        n2.end_waits();
-        // Allow in-flight requests up to `timeout` to complete before forcing lease release.
-        let n3 = n2.clone();
-        env.spawn(async move {
-            tokio::time::sleep(shutdown.timeout).await;
-            baserunna::warn!("shutting down: requests still in flight after {:?}", shutdown.timeout);
-            n3.shutdown().await;
-            baserunna::log::flush();
-            std::process::exit(0);
-        });
+        tokio::net::TcpListener::bind(listen).await.map_err(|e| format!("cannot listen on {listen}: {e}"))?;
+    tracing::info!(addr = listen, store = store_url, "listening");
+    let drained = Arc::new(tokio::sync::Notify::new());
+    let stopping = {
+        let (node, drained) = (node.clone(), drained.clone());
+        async move {
+            stop_signal().await;
+            tracing::info!(drain_ms = shutdown.drain_delay.as_millis() as u64, "shutting down: draining");
+            node.drain();
+            tokio::time::sleep(shutdown.drain_delay).await;
+            node.end_waits();
+            drained.notify_one();
+        }
+        .in_current_span()
     };
     let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
         let _ = tcp.set_nodelay(true);
     });
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+    let serving = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(stopping)
-        .await
-        .map_err(|e| e.to_string())?;
-    baserunna::info!("shutting down: releasing leases");
+        .into_future();
+    let overdue = async {
+        drained.notified().await;
+        tokio::time::sleep(shutdown.timeout).await;
+    };
+    let serving = std::pin::pin!(serving);
+    let overdue = std::pin::pin!(overdue);
+    match futures_util::future::select(serving, overdue).await {
+        Either::Left((served, _)) => served.map_err(|e| e.to_string())?,
+        Either::Right(((), _)) => tracing::warn!(
+            timeout_ms = shutdown.timeout.as_millis() as u64,
+            "shutting down: requests still in flight after the timeout"
+        ),
+    }
+    tracing::info!("shutting down: releasing leases");
     node.shutdown().await;
     Ok(())
 }

@@ -864,7 +864,7 @@ impl Db {
     /// Creates a writer for a new staged blob, syncing the store clock first if needed.
     pub async fn blob_writer(self: &Arc<Self>, content_type: &str) -> BlobWriter {
         if let Err(e) = self.shared.store_time_ms().await {
-            crate::debug!("staging a blob without store time: {e}");
+            tracing::debug!(error = %e, "staging a blob without store time");
         }
         let w = BlobWriter::new(self.shared.clone(), &self.id, content_type);
         match self.quota() {
@@ -1034,7 +1034,7 @@ impl Db {
             q.items.push_back(QueuedWork {
                 work: w,
                 enqueued_at: Instant::now(),
-                request_id: crate::log::request_id(),
+                request_id: crate::request_id::current(),
             });
             if q.running {
                 false
@@ -1083,28 +1083,24 @@ impl Db {
     }
 
     fn log_batch(&self, enqueued: &[(Instant, Option<Arc<str>>)], txn_count: usize, started: Instant, tally: &Tally) {
-        use crate::log::{self, Level};
-        use serde_json::json;
-        if tally.store_calls(super::ObjectClass::Manifest, StoreOp::Put) == 0 || !log::enabled(Level::Info) {
+        if tally.store_calls(super::ObjectClass::Manifest, StoreOp::Put) == 0
+            || !tracing::enabled!(tracing::Level::INFO)
+        {
             return;
         }
         let oldest = enqueued.iter().map(|(at, _)| *at).min().unwrap_or(started);
-        let mut fields = vec![
-            ("db", json!(self.id)),
-            ("txns", json!(txn_count)),
-            ("work", json!(enqueued.len())),
-            ("queued_ms", json!((started - oldest).as_millis() as u64)),
-            ("build_ms", json!(tally.build_ms())),
-            ("ms", json!(started.elapsed().as_millis() as u64)),
-        ];
-        if let Some(store) = tally.store_json() {
-            fields.push(("store", store));
-        }
         let ids: Vec<&str> = enqueued.iter().filter_map(|(_, id)| id.as_deref()).collect();
-        if !ids.is_empty() {
-            fields.push(("request_ids", json!(ids)));
-        }
-        log::event(Level::Info, "commit", &fields);
+        tracing::info!(
+            db = %self.id,
+            txns = txn_count,
+            work = enqueued.len(),
+            queued_ms = (started - oldest).as_millis() as u64,
+            build_ms = tally.build_ms(),
+            ms = started.elapsed().as_millis() as u64,
+            store = tally.store_json().as_ref().map(tracing::field::display),
+            request_ids = (!ids.is_empty()).then(|| ids.join(",")),
+            "commit"
+        );
     }
 
     async fn base_for_commit(self: &Arc<Self>) -> Result<Arc<Version>> {
@@ -2026,7 +2022,7 @@ impl Db {
         self.shared.env.spawn(async move {
             for o in gc {
                 if let Err(e) = delete_object(&shared, &db, &o).await {
-                    crate::warn!("gc delete {}/{} failed: {e}", db, o.id);
+                    tracing::warn!(db = %db, object = %o.id, error = %e, "gc delete failed");
                 }
             }
         });
@@ -2047,7 +2043,7 @@ impl Db {
                 self.shared.env.spawn(async move {
                     loop {
                         if let Err(e) = me.clone().compact().await {
-                            crate::debug!("compaction of {} stopped: {e}", me.id);
+                            tracing::debug!(db = %me.id, error = %e, "compaction stopped");
                             break;
                         }
                         if !me.has_more_work(|st| &mut st.compacting, |m| compaction::pick(m, &me.shared.cfg).is_some())
@@ -2080,7 +2076,7 @@ impl Db {
         self.shared.env.spawn(async move {
             loop {
                 if let Err(e) = me.clone().flush(v).await {
-                    crate::debug!("flush of {} stopped: {e}", me.id);
+                    tracing::debug!(db = %me.id, error = %e, "flush stopped");
                     break;
                 }
                 let limit = me.shared.cfg.tail_max_bytes;
@@ -2172,7 +2168,7 @@ impl Db {
             let me = self.clone();
             self.shared.env.spawn(async move {
                 if let Err(e) = me.clone().trim_queued().await {
-                    crate::debug!("retention trims of {} stopped: {e}", me.id);
+                    tracing::debug!(db = %me.id, error = %e, "retention trims stopped");
                     let mut st = me.st();
                     st.trim_queue.clear();
                     st.trimming = false;
@@ -2267,7 +2263,7 @@ impl Db {
         let me = self.clone();
         self.shared.env.spawn(async move {
             if let Err(e) = me.clone().sweep().await {
-                crate::debug!("sweep of {} stopped: {e}", me.id);
+                tracing::debug!(db = %me.id, error = %e, "sweep stopped");
             }
             me.st().sweeping = false;
         });

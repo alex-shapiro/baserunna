@@ -1395,25 +1395,29 @@ content security policy.
 | `BASERUNNA_PBKDF2_ITERATIONS`            | 600000                          | password hashing cost for new hashes                         |
 | `BASERUNNA_DRAIN_DELAY_MS`               | 0                               | on SIGTERM/SIGINT, fail health checks this long first        |
 | `BASERUNNA_SHUTDOWN_TIMEOUT_MS`          | 20000                           | then let in-flight requests finish for at most this long     |
-| `BASERUNNA_LOG`                          | `info`                          | `error` / `warn` / `info` (every request) / `debug` / `off`  |
+| `BASERUNNA_LOG`                          | `info`                          | level or `tracing` filter, e.g. `info,baserunna=debug`       |
 | `BASERUNNA_LOG_FORMAT`                   | `json`                          | `json` (one object per line) or `text`                       |
 | `BASERUNNA_MAIL_WEBHOOK_URL`             | none                            | enables mail: each message is POSTed there as JSON           |
 | `BASERUNNA_MAIL_WEBHOOK_TOKEN`           | none                            | bearer token for the mail webhook                            |
 | `BASERUNNA_MAIL_FROM`                    | `Baserunna <noreply@localhost>` | sender passed to the webhook                                 |
 
-Logs are written to stderr as JSON lines
-(`{"ts", "level", "node", "request_id", "msg", ...}`) from a background
-thread; if stderr falls behind, excess lines are dropped with a warning. At
-`info` level, each node logs every request it handles under its `request_id`
-(§7) with `method`, `route` (the route template rather than the raw path,
-which may contain user keys), `status`, `ms`, `hops`, `forwarded_to` (when
-forwarded to another node), and latency breakdowns for object-store calls
+Logs are `tracing` events written to stderr as JSON lines
+(`{"timestamp", "level", "message", "target", <fields>, "spans"}`) from a
+background thread; if stderr falls behind, excess lines are dropped and the
+count is logged as a warning. `BASERUNNA_LOG` takes a `tracing` filter
+directive, so `debug` also enables dependencies' debug logs while
+`baserunna=debug` does not. Events run inside a `node` span carrying the
+`node` ID and, while serving a request, a `request` span carrying its
+`request_id` (§7). At `info` level, each node logs a `"request"` event for every
+request it handles with `method`, `route` (the route template rather than the
+raw path, which may contain user keys), `status`, `ms`, `hops`, `forwarded_to`
+(when forwarded to another node), and latency breakdowns for object-store calls
 (`store`, `store_ms`), commit waits (`commits`, `commit_ms`), and in-flight
 manifest waits (`read_wait_ms`). Responses include these totals in the
 `Server-Timing` header (`total`, `store`, `commit`, and `wait`, in ms). After a
-commit batch writes a manifest, the node logs a `msg: "commit"` event with queue
-wait (`queued_ms`), batch build time (`build_ms`), store calls (`store`), and
-participating `request_ids`. The mail webhook receives `{"from", "to",
+commit batch writes a manifest, the node logs a `"commit"` event with queue
+wait (`queued_ms`), batch build time (`build_ms`), store calls (`store`, a JSON
+string), and the comma-separated `request_ids` of its transactions. The mail webhook receives `{"from", "to",
 "subject", "text"}`.
 
 `GET /v1/admin/metrics` returns latency histograms for object-store

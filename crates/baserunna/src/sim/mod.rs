@@ -910,14 +910,24 @@ impl<F: Future> Future for CatchPanic<F> {
     }
 }
 
+/// Sends log events on this thread to the test harness's captured output, filtered
+/// by `BASERUNNA_LOG`, until the returned guard is dropped. Returns `None` when
+/// `BASERUNNA_LOG` is unset or the thread already has a subscriber.
+pub fn log_to_test_output() -> Option<tracing::subscriber::DefaultGuard> {
+    let filter = std::env::var("BASERUNNA_LOG").ok()?;
+    if !tracing::dispatcher::get_default(|d| d.is::<tracing::subscriber::NoSubscriber>()) {
+        return None;
+    }
+    let subscriber = tracing_subscriber::fmt().with_env_filter(filter).with_test_writer().finish();
+    Some(tracing::subscriber::set_default(subscriber))
+}
+
 pub fn run<F, Fut>(seed: u64, cfg: SimConfig, f: F) -> SimOutcome
 where
     F: FnOnce(Arc<Sim>) -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
-    if std::env::var("BASERUNNA_LOG").is_err() {
-        crate::log::set_level(Some(crate::log::Level::Error));
-    }
+    let _logs = log_to_test_output();
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
     let full_trace = cfg.full_trace;
     let b = crate::buggify::Config {

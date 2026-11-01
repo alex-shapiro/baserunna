@@ -114,10 +114,11 @@ forward database requests to the node holding the database's lease. Set up:
 
 Nodes write JSON log lines to stderr (see SPEC §12). At the default `info`
 level, each node logs every request it handles; set `BASERUNNA_LOG=warn` to
-log only warnings and errors. Filter by `request_id` to trace a request across
-nodes. If a reverse proxy sets `x-request-id` to a 1–64 character string
-matching `[A-Za-z0-9._:-]`, nodes preserve that ID; otherwise, nodes generate
-a fresh ID.
+log only warnings and errors, or a filter such as `info,baserunna::engine=debug`
+to debug one module. Filter by the `request` span's `request_id` to trace a
+request across nodes. If a reverse proxy sets `x-request-id` to a 1–64
+character string matching `[A-Za-z0-9._:-]`, nodes preserve that ID;
+otherwise, nodes generate a fresh ID.
 
 ## Mail
 
@@ -270,4 +271,5 @@ Nodes are configured via environment variables (see [`SPEC.md`](SPEC.md) §12 fo
 - `BASERUNNA_ADMIN_EMAIL` / `BASERUNNA_ADMIN_PASSWORD` (default: unset): bootstrap credentials for an admin account.
 - `BASERUNNA_GOOGLE_CLIENT_ID` / `BASERUNNA_GOOGLE_CLIENT_SECRET` (default: unset): Google OAuth credentials.
 - `BASERUNNA_MAIL_WEBHOOK_URL` (default: unset): HTTP webhook URL for verification and password-reset emails.
-- `BASERUNNA_LOG` (default `info`): log level (`error`, `warn`, `info`, `debug`, or `off`).
+- `BASERUNNA_LOG` (default `info`): log level (`error`, `warn`, `info`, `debug`, `trace`, or `off`) or a `tracing` filter such as `info,baserunna::engine=debug`.
+- `BASERUNNA_LOG_FORMAT` (default `json`): `json` or `text`.

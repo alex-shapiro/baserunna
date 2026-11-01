@@ -53,7 +53,6 @@ async fn run() {
         "mem:" => Arc::new(MemStore::with_system_clock()),
         _ => Arc::new(CloudStore::from_url(&format!("{}/{prefix}", url.trim_end_matches('/'))).expect("store url")),
     };
-    baserunna::log::set_level(Some(baserunna::log::Level::Error));
     println!("store {url}/{prefix}");
 
     println!("\nraw latency by object size ({} each)", num("LAT_RAW_COUNT", 20));

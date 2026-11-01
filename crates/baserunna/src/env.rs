@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use tracing::Instrument;
 
 enum Clock {
     Real,
@@ -25,6 +26,7 @@ pub struct Env {
     tracer: Mutex<Option<Tracer>>,
     crash_hook: Mutex<Option<CrashHook>>,
     gate: Arc<Gate>,
+    span: Mutex<tracing::Span>,
 }
 
 #[derive(Default)]
@@ -65,6 +67,7 @@ impl Env {
             tracer: Mutex::new(None),
             crash_hook: Mutex::new(None),
             gate: Arc::default(),
+            span: Mutex::new(tracing::Span::none()),
         }
     }
 
@@ -77,6 +80,7 @@ impl Env {
             tracer: Mutex::new(None),
             crash_hook: Mutex::new(None),
             gate: Arc::default(),
+            span: Mutex::new(tracing::Span::none()),
         }
     }
 
@@ -179,11 +183,23 @@ impl Env {
         crate::util::b64::hex(&self.random_bytes(nbytes))
     }
 
-    /// Spawns a background task aborted on [`Env::shutdown`].
+    /// Sets the span that tasks from [`Env::spawn`] run in, identifying the node they belong to.
+    pub fn set_span(&self, span: tracing::Span) {
+        *self.span.lock().unwrap_or_else(|e| e.into_inner()) = span;
+    }
+
+    /// Returns the span set by [`Env::set_span`].
+    pub fn span(&self) -> tracing::Span {
+        self.span.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Spawns a background task aborted on [`Env::shutdown`]. The task runs in
+    /// this environment's span rather than the caller's.
     pub fn spawn<F>(&self, fut: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let fut = fut.instrument(self.span());
         let mut t = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         while t.try_join_next().is_some() {}
         match self.clock {

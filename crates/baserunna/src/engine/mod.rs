@@ -150,7 +150,7 @@ impl Shared {
             let me = self.clone();
             self.env.spawn(async move {
                 if let Err(e) = me.sync_clock().await {
-                    crate::debug!("store clock sync failed: {e}");
+                    tracing::debug!(error = %e, "store clock sync failed");
                 }
             });
         }

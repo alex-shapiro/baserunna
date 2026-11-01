@@ -57,6 +57,7 @@ impl Endpoint for ListTables {
 pub struct GetTable {
     pub db: String,
     pub table: String,
+    pub query: GetTableQuery,
 }
 
 impl Endpoint for GetTable {
@@ -71,7 +72,7 @@ impl Endpoint for GetTable {
     }
 
     fn path(&self) -> String {
-        fill_route(Self::ROUTE, &[&self.db, &self.table])
+        with_query(fill_route(Self::ROUTE, &[&self.db, &self.table]), &self.query)
     }
 }
 
@@ -213,6 +214,14 @@ pub struct ListTablesQuery {
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consistency: Option<Consistency>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_staleness_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetTableQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consistency: Option<Consistency>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

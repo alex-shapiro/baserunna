@@ -77,6 +77,7 @@ fn api_endpoint(name: &str) -> (String, &'static str) {
         "GetCommit" => of::<api::GetCommit>(),
         "CreateTable" => of::<api::CreateTable>(),
         "ListTables" => of::<api::ListTables>(),
+        "GetTable" => of::<api::GetTable>(),
         "Changes" => of::<api::Changes>(),
         "StageBlob" => of::<api::StageBlob>(),
         "ReadBlob" => of::<api::ReadBlob>(),

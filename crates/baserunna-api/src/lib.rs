@@ -31,8 +31,8 @@ pub use op::{
     Selection, StreamRecord, StreamState,
 };
 pub use table::{
-    Column, ColumnType, CreateTable, CreatedTable, GetTable, Index, IndexState, ListTables, ListTablesQuery, NewIndex,
-    NewTable, Table, TablePage,
+    Column, ColumnType, CreateTable, CreatedTable, GetTable, GetTableQuery, Index, IndexState, ListTables,
+    ListTablesQuery, NewIndex, NewTable, Table, TablePage,
 };
 pub use txn::{
     AbortTxn, BeginRequest, BeginTxn, Begun, CommitRequest, CommitStatus, CommitTxn, Committed, Consistency, Encoding,

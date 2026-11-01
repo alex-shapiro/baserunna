@@ -44,7 +44,8 @@ pub fn routes() -> Router<Arc<Node>> {
         .endpoint::<api::GetCommit, _>(commit_status)
         .endpoint::<api::ListTables, _>(list_tables)
         .endpoint::<api::CreateTable, _>(create_table)
-        .route("/v1/dbs/{db}/tables/{t}", get(get_table).delete(drop_table))
+        .endpoint::<api::GetTable, _>(get_table)
+        .route(api::GetTable::ROUTE, delete(drop_table))
         .route("/v1/dbs/{db}/tables/{t}/columns", post(add_column))
         .route("/v1/dbs/{db}/tables/{t}/columns/{c}", delete(drop_column))
         .route("/v1/dbs/{db}/tables/{t}/indexes", post(add_index))
@@ -778,11 +779,16 @@ async fn create_table(
     Ok(Reply::new(api::CreatedTable { table: s.to_api(), version }))
 }
 
-async fn get_table(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, q: Params) -> Result<J> {
+async fn get_table(
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+    QueryOf(q): QueryOf<api::GetTableQuery>,
+    _: Req<api::GetTable>,
+) -> Result<Reply<api::GetTable>> {
     let name = param(&p, "t")?.to_string();
-    let c = consistency_of(&q)?;
+    let c = consistency_from(q.consistency, q.max_staleness_ms);
     let (s, _) = with_read!(ctx.db, c, |t| table::get_schema(t, &name).await);
-    Ok(axum::Json(s.to_json()))
+    Ok(Reply::new(s.to_api()))
 }
 
 async fn drop_table(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {

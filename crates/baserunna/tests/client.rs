@@ -162,6 +162,7 @@ async fn tables_rows_streams_and_keys_round_trip_through_the_server() {
     assert_eq!(again.table.primary_key, ["owner", "id"], "creating an existing table returns its schema");
     let page = db.list_tables(api::ListTablesQuery::default()).await.unwrap();
     assert_eq!(page.tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["items"]);
+    assert_eq!(db.get_table("items").await.unwrap(), again.table);
 
     let rows: Vec<Op> = (0..2500).map(|i| Op::insert(&item(if i % 2 == 0 { "a" } else { "b" }, i))).collect();
     db.write(&rows).await.unwrap();

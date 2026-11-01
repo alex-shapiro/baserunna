@@ -344,6 +344,11 @@ impl Db {
         self.client.send(&api::CreateTable { db: self.name.clone() }, table).await
     }
 
+    pub async fn get_table(&self, name: &str) -> Result<api::Table, Error> {
+        let e = api::GetTable { db: self.name.clone(), table: name.into(), query: api::GetTableQuery::default() };
+        self.client.send(&e, &api::NoBody {}).await
+    }
+
     pub async fn list_tables(&self, query: api::ListTablesQuery) -> Result<api::TablePage, Error> {
         self.client.send(&api::ListTables { db: self.name.clone(), query }, &api::NoBody {}).await
     }

@@ -908,3 +908,16 @@ async fn a_transaction_whose_results_do_not_decode_cannot_commit() {
     let methods: Vec<_> = requests(&s).into_iter().map(|r| r.0).collect();
     assert_eq!(methods, ["POST", "POST", "DELETE"], "the transaction is aborted, not committed");
 }
+
+#[tokio::test(start_paused = true)]
+async fn retry_does_not_rerun_a_transaction_whose_responses_never_decode() {
+    let (c, s) = script((0..20).flat_map(|_| [resp(201, &[], BEGUN), resp(200, &[], "{}")]).collect());
+    let db = c.db("s");
+    let mut retry = db.retry();
+    let mut txn = db.begin();
+    txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
+    let r = txn.run_one(Op::get("k")).await.map(drop);
+    let e = retry.finish(txn, r).await.unwrap_err();
+    assert!(matches!(&e, Error::NotApplied(cause) if matches!(**cause, Error::Malformed { .. })), "{e:?}");
+    assert_eq!(sent(&s), 3, "a response that cannot decode ends the loop");
+}

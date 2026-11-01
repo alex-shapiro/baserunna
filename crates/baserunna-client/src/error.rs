@@ -81,7 +81,8 @@ impl Error {
             },
             Error::Foreign { status, .. } => matches!(status, 200..=299 | 407 | 408 | 429 | 500..) && may_repeat,
             Error::Malformed { .. } | Error::Decode { .. } => false,
-            Error::NotApplied(_) => true,
+            // Only a response that the client cannot read fails the same way again.
+            Error::NotApplied(e) => !matches!(**e, Error::Malformed { .. }),
             Error::Transport(TransportError::TimedOut(_)) => false,
             Error::Transport(_) => may_repeat,
         }

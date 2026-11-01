@@ -492,6 +492,19 @@ async fn an_empty_prefix_selects_no_rows() {
 }
 
 #[tokio::test]
+async fn queued_writes_run_in_order_with_later_operations() {
+    let (db, _) = node("").await;
+    let mut txn = db.begin();
+    txn.write([Op::put("k", "first")]);
+    let seen = txn.run_one(Op::get("k")).await.unwrap().entry().unwrap().map(|e| e.value);
+    txn.run(&[Op::put("k", "second")]).await.unwrap();
+    txn.commit().await.unwrap();
+    let k = db.read_one(Op::get("k")).await.unwrap().entry().unwrap().unwrap();
+    assert_eq!(seen.as_ref().and_then(|v| v.data()).map(|d| d.as_ref()), Some(&b"first"[..]));
+    assert_eq!(k.value.data().unwrap().as_ref(), b"second");
+}
+
+#[tokio::test]
 async fn creating_an_existing_table_still_checks_its_column_types() {
     let (db, _) = node("").await;
     let mut t = table();

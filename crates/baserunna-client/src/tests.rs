@@ -863,3 +863,36 @@ async fn table_listings_decode_column_types_and_index_states_added_by_newer_serv
     assert_eq!(page.tables[1].columns[0].ty, api::ColumnType::Unknown);
     assert_eq!(page.tables[1].indexes[0].state, api::IndexState::Unknown);
 }
+
+#[tokio::test(start_paused = true)]
+async fn retry_does_not_restart_after_an_outside_write_that_failed_like_the_transaction() {
+    let (c, s) = script(vec![Err(TransportError::Unknown("connection reset".into()))]);
+    let db = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() }).db("s");
+    let mut retry = db.retry();
+    let mut txn = db.begin();
+    let ops = put();
+    let (read, outside) = tokio::join!(txn.run_one(Op::get("k")), db.write(&ops));
+    assert_eq!(read.unwrap_err().outcome(), Outcome::NotApplied, "a failed transaction never commits");
+    let outside = outside.unwrap_err();
+    assert_eq!(outside.outcome(), Outcome::Unknown, "the outside write may have applied");
+    let r: Result<Option<()>, Error> = retry.finish(txn, Err(outside.clone())).await;
+    assert_eq!(r, Err(outside), "the loop must not run the outside write again ({} requests)", sent(&s));
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_restarts_after_a_request_of_its_transaction_times_out() {
+    let timed_out = Err(TransportError::TimedOut("deadline".into()));
+    let (c, _) = script(vec![timed_out, resp(201, &[], BEGUN), resp(200, &[], COMMITTED)]);
+    let db = c.db("s");
+    let mut retry = db.retry();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let mut txn = db.begin();
+        let r = txn.run_one(Op::get_row::<Thing>("a")).await.map(drop);
+        if retry.finish(txn, r).await.unwrap().is_some() {
+            break;
+        }
+    }
+    assert_eq!(attempts, 2, "a transaction whose request timed out never commits, so it restarts");
+}

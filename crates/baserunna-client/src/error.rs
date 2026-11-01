@@ -29,8 +29,8 @@ pub enum Error {
         what: String,
         reason: String,
     },
-    /// A request failed with an unknown outcome, and the server confirmed that it was not applied
-    /// and never will be.
+    /// A request failed with an unknown outcome but is known not to have applied and never to apply,
+    /// because the server fenced it or because it ran in a transaction that can no longer commit.
     NotApplied(Box<Error>),
     Transport(TransportError),
 }

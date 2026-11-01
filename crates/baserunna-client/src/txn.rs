@@ -61,13 +61,15 @@ impl Txn {
         if ops.is_empty() {
             return Ok(Vec::new());
         }
+        let queued = self.writes.len();
+        let ops: Vec<Op> = self.writes.drain(..).chain(ops.iter().cloned()).collect();
         self.wrote |= ops.iter().any(Op::is_write);
         self.started.get_or_insert_with(tokio::time::Instant::now);
         let api_ops = ops.iter().map(Op::to_api).collect();
         // The transaction counts as failed until the request completes, so that it cannot commit
         // operations of a request that its caller cancelled.
         let cancelled = TransportError::Unknown("a request on the transaction was cancelled".into());
-        self.failed = Some(Error::Transport(cancelled));
+        self.failed = Some(not_applied(&Error::Transport(cancelled)));
         let (path, sent) = match &self.open {
             None => {
                 let b =
@@ -84,16 +86,20 @@ impl Txn {
                 (e.path(), self.db.client().send(&e, &api::OpsRequest { ops: api_ops }).await.map(|r| r.results))
             }
         };
-        self.failed = sent.as_ref().err().cloned();
-        let results = sent?;
-        decode_results(ops, &results).map_err(|reason| Error::Malformed { path, reason })
+        self.failed = sent.as_ref().err().map(not_applied);
+        let Ok(results) = sent else {
+            return Err(self.failed.clone().expect("a failed request is recorded"));
+        };
+        let mut results = decode_results(&ops, &results).map_err(|reason| Error::Malformed { path, reason })?;
+        Ok(results.split_off(queued))
     }
 
     pub async fn run_one(&mut self, op: Op) -> Result<OpResult, Error> {
         Ok(self.run(std::slice::from_ref(&op)).await?.swap_remove(0))
     }
 
-    /// Queues `ops` to execute when the transaction commits.
+    /// Queues `ops` to execute with the next request on the transaction, a [`Txn::run`] or the
+    /// commit, before that request's own operations.
     pub fn write(&mut self, ops: impl IntoIterator<Item = Op>) {
         self.writes.extend(ops);
     }
@@ -190,6 +196,15 @@ async fn begin(db: Db, body: api::BeginRequest) -> Result<Begun, Error> {
     rx.await.unwrap_or_else(|_| Err(stopped()))
 }
 
+/// Returns the error of a failed request on a transaction, which is [`Error::NotApplied`] even if
+/// the request's outcome is unknown, because the transaction never commits after it fails.
+fn not_applied(e: &Error) -> Error {
+    match e.outcome() {
+        Outcome::Unknown => Error::NotApplied(Box::new(e.clone())),
+        Outcome::NotApplied => e.clone(),
+    }
+}
+
 /// Returns true if the server discarded the transaction when it returned `e`.
 fn ends_txn(e: &Error) -> bool {
     matches!(e.code(), Some(ErrorCode::TxnNotFound | ErrorCode::Conflict))
@@ -249,9 +264,6 @@ impl Retry {
     /// Returns the committed result, `Ok(None)` after a backoff if the transaction should run
     /// again, or the error that ends the loop.
     pub async fn finish<T, E: TxnError>(&mut self, txn: Txn, result: Result<T, E>) -> Result<Option<T>, E> {
-        // Only the error of a failed request on `txn` is known to have applied nothing, whatever its
-        // outcome, because the transaction never commits after it.
-        let failed = txn.failed.clone();
         let err = match result {
             Ok(v) => match txn.commit().await {
                 Ok(_) => return Ok(Some(v)),
@@ -262,7 +274,7 @@ impl Retry {
                 e
             }
         };
-        let restart = err.client_error().is_some_and(|e| restarts(e, failed.as_ref() == Some(e)));
+        let restart = err.client_error().is_some_and(restarts);
         let client = self.db.client();
         if !restart || self.attempt >= client.retry_policy().txn_attempts {
             return Err(err);
@@ -275,9 +287,6 @@ impl Retry {
 
 /// Returns true if a new attempt of a transaction that failed with `e` can succeed without
 /// applying its writes twice.
-fn restarts(e: &Error, applied_nothing: bool) -> bool {
-    if e.code() == Some(ErrorCode::TxnNotFound) || e.code() == Some(ErrorCode::Aborted) {
-        return true;
-    }
-    e.is_transient(applied_nothing)
+fn restarts(e: &Error) -> bool {
+    matches!(e.code(), Some(ErrorCode::TxnNotFound | ErrorCode::Aborted)) || e.is_transient(false)
 }

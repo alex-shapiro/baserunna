@@ -314,10 +314,13 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 - [ ] **Reject writes in `baserunna_client::Db::read`.** It sends write
       operations without an idempotency key, so they are not exactly-once and a
       lost response leaves their outcome unknown.
-- [ ] **Restart a transaction loop after its own request times out.**
-      `Retry::finish` restarts after a connection reset on one of the
-      transaction's own requests but not after a timeout, although neither lets
-      the transaction commit.
+- [ ] **Decode roles added by newer servers.** `api::Role` has no fallback for
+      unknown values, so `Me` and `Member` responses from a newer server with a
+      new role fail to decode in `baserunna-client`.
+- [ ] **Page reverse stream reads from a fixed lower bound.** A reverse
+      `read_stream` that starts from `tail` recomputes its lower bound from the
+      stream's end on each page, so `Op::next_page` returns a different range if
+      records are appended between pages.
 - [ ] **Fix the `events` fuzz target**, which no longer compiles because
       `PartRef` has no `min_version` and `max_version` fields.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the

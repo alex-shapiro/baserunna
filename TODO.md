@@ -237,6 +237,15 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 - [ ] **Replace `baserunna::client` with `baserunna-client`.** Add event-table
       operations and schema routes to `baserunna-client`, migrate the examples,
       and delete `crates/baserunna/src/client.rs`.
+- [ ] **Cover every transaction operation in `baserunna_client::Op`.** It lacks
+      `update_rows`, `stream_info`, `trim_stream`, `get_consumer`,
+      `set_consumer`, the event operations, `ttl_ms` on writes, `expect_seq` on
+      `append`, and `check` by value, so stream consumers cannot be used from
+      the client at all.
+- [ ] **Return operation results from client writes.** `Db::write` and
+      `Txn::commit` drop the per-operation results that the server returns, so
+      a caller cannot read, for example, the value of an `increment` or the
+      count of a `delete_rows` with exactly-once semantics.
 - [ ] **Type the remaining JSON in `baserunna-api`.** `query_events` results,
       row and stream `filter`s, and the routes outside `Endpoint` (KV, table
       schema changes, row routes, streams, events, organizations) are still

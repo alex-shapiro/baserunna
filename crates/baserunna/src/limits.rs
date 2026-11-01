@@ -5,7 +5,7 @@
 
 use crate::error::Error;
 use crate::util::DetHashMap;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -157,7 +157,7 @@ impl Limiter {
 
     fn take_inner(&self, keys: &[(&str, Rate)], what: &str, borrow: bool) -> Result<(), Error> {
         let now = Instant::now();
-        let mut g = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.buckets.lock();
         if g.len() >= MAX_KEYS {
             prune_buckets(&mut g, now);
         }
@@ -182,7 +182,7 @@ impl Limiter {
     /// Returns an error if any of `keys` is currently in backoff.
     pub fn check_backoff(&self, keys: &[&str], what: &str) -> Result<(), Error> {
         let now = Instant::now();
-        let g = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.failures.lock();
         let wait = keys.iter().filter_map(|k| g.get(*k)).map(|f| f.until.saturating_duration_since(now)).max();
         match wait {
             Some(w) if !w.is_zero() => Err(limited(what, w)),
@@ -194,7 +194,7 @@ impl Limiter {
     /// `free` attempts are exceeded.
     pub fn failed(&self, key: &str, free: u32, cfg: &LimitConfig) {
         let now = Instant::now();
-        let mut g = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.failures.lock();
         if g.len() >= MAX_KEYS {
             prune_failures(&mut g, now, cfg);
         }
@@ -212,19 +212,18 @@ impl Limiter {
     }
 
     pub fn succeeded(&self, key: &str) {
-        self.failures.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+        self.failures.lock().remove(key);
     }
 
     /// Drops full buckets and expired failure records.
     pub fn prune(&self, cfg: &LimitConfig) {
         let now = Instant::now();
-        prune_buckets(&mut self.buckets.lock().unwrap_or_else(|e| e.into_inner()), now);
-        prune_failures(&mut self.failures.lock().unwrap_or_else(|e| e.into_inner()), now, cfg);
+        prune_buckets(&mut self.buckets.lock(), now);
+        prune_failures(&mut self.failures.lock(), now, cfg);
     }
 
     pub fn tracked(&self) -> usize {
-        self.buckets.lock().unwrap_or_else(|e| e.into_inner()).len()
-            + self.failures.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.buckets.lock().len() + self.failures.lock().len()
     }
 }
 

@@ -97,8 +97,8 @@ async fn run() {
             db.open(true).await.expect("open");
             let commits = (cycles * tail_kb * 1024 / value_bytes as u64).max(200);
             let warmup = commits / 3;
-            let before = std::sync::Mutex::new(None);
-            let lat = std::sync::Mutex::new(Vec::new());
+            let before = parking_lot::Mutex::new(None);
+            let lat = parking_lot::Mutex::new(Vec::new());
             let next = std::sync::atomic::AtomicU64::new(0);
             let work = (0..writers).map(|w| {
                 let (db, lat, next, before, store) = (db.clone(), &lat, &next, &before, &store);
@@ -110,7 +110,7 @@ async fn run() {
                             return;
                         }
                         if i == warmup {
-                            *before.lock().unwrap() = Some(store.total());
+                            *before.lock() = Some(store.total());
                         }
                         let t = Instant::now();
                         let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await.expect("begin");
@@ -118,14 +118,14 @@ async fn run() {
                         txn.put(key, Value::Inline(Bytes::from(rng.text(value_bytes)))).expect("put");
                         db.commit(txn.into_request()).await.expect("commit");
                         if i >= warmup {
-                            lat.lock().unwrap().push(t.elapsed());
+                            lat.lock().push(t.elapsed());
                         }
                     }
                 }
             });
             futures_join_all(work.collect()).await;
-            let (after, before) = (store.total(), before.lock().unwrap().take().unwrap_or_default());
-            let mut lat = lat.into_inner().unwrap();
+            let (after, before) = (store.total(), before.lock().take().unwrap_or_default());
+            let mut lat = lat.into_inner();
             lat.sort();
             let n = lat.len() as f64;
             let puts = after.puts - before.puts;

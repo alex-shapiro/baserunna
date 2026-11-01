@@ -5,8 +5,8 @@
 //! exclusive lock on its root directory so no second `FsStore` can open it.
 
 use super::*;
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 const ETAG_LEN: usize = 16;
 const LOCK_FILE: &str = ".lock";
@@ -89,7 +89,7 @@ impl FsStore {
         buf.extend_from_slice(&tag);
         buf.extend_from_slice(data);
         std::fs::write(&tmp, &buf).map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        let _g = cas_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = cas_lock.lock();
         let ok = match mode {
             PutMode::Overwrite => true,
             PutMode::Create => Self::current_etag(path)?.is_none(),

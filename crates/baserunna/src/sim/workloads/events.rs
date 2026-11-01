@@ -11,9 +11,10 @@ use super::super::{Sim, SimConfig};
 use super::events_churn::Churn;
 use super::events_retention::Retention;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const DB: &str = "/v1/dbs/events";
 const HOUR: i64 = 3_600_000;
@@ -77,10 +78,6 @@ struct World {
 }
 
 type Shared = Arc<Mutex<World>>;
-
-fn world(w: &Shared) -> std::sync::MutexGuard<'_, World> {
-    w.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 pub(super) enum Settled {
     Done(Json),
@@ -159,7 +156,7 @@ fn event(c: &Client, base: i64, n: usize, extra: bool) -> Ev {
 
 async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: bool) -> Result<(), String> {
     for step in 0..steps {
-        let extra = world(&w).extra_since.is_some();
+        let extra = w.lock().extra_since.is_some();
         let n = 1 + c.rng().usize(12);
         let evs: Vec<Ev> = (0..n).map(|i| event(&c, base, step * 100 + i, extra)).collect();
         let rows: Vec<Json> = evs.iter().map(Ev::json).collect();
@@ -184,7 +181,7 @@ async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: 
         };
         let uids: Vec<String> = evs.iter().map(|e| e.uid.clone()).collect();
         {
-            let mut g = world(&w);
+            let mut g = w.lock();
             for e in &evs {
                 g.events.insert(e.uid.clone(), e.clone());
             }
@@ -192,14 +189,14 @@ async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: 
         match settle(&c, &path, ndjson, &body, &key).await? {
             Settled::Done(j) => {
                 let v = j["version"].as_u64().ok_or(format!("{}: missing version in {j}", c.name))?;
-                let mut g = world(&w);
+                let mut g = w.lock();
                 g.committed.push((v, Write::Insert(uids)));
                 if let Some((d, p)) = person {
                     g.committed.push((v, Write::Person(d, p)));
                 }
             }
             Settled::Unknown => {
-                let mut g = world(&w);
+                let mut g = w.lock();
                 g.unknown.push(Write::Insert(uids));
                 if let Some((d, p)) = person {
                     g.unknown.push(Write::Person(d, p));
@@ -230,9 +227,9 @@ async fn filter_delete(c: &Client, w: &Shared, base: i64, step: usize) -> Result
     match settle(c, &format!("{DB}/txn"), false, &body, &format!("{}-w{step}", c.name)).await? {
         Settled::Done(j) => {
             let v = j["version"].as_u64().ok_or(format!("{}: missing version in {j}", c.name))?;
-            world(w).committed.push((v, write));
+            w.lock().committed.push((v, write));
         }
-        Settled::Unknown => world(w).unknown.push(write),
+        Settled::Unknown => w.lock().unknown.push(write),
         Settled::Rejected(r) => return Err(format!("{}: filter delete rejected: {} {}", c.name, r.status, r.json)),
     }
     Ok(())
@@ -247,7 +244,7 @@ async fn deleter(c: Client, w: Shared, base: i64, steps: usize, filters: bool) -
             continue;
         }
         let victims: Vec<String> = {
-            let g = world(&w);
+            let g = w.lock();
             let live: Vec<&String> = g
                 .committed
                 .iter()
@@ -271,9 +268,9 @@ async fn deleter(c: Client, w: Shared, base: i64, steps: usize, filters: bool) -
         match settle(&c, &format!("{DB}/txn"), false, &body, &format!("{}-{step}", c.name)).await? {
             Settled::Done(j) => {
                 let v = j["version"].as_u64().ok_or(format!("{}: missing version in {j}", c.name))?;
-                world(&w).committed.push((v, Write::Delete(victims)));
+                w.lock().committed.push((v, Write::Delete(victims)));
             }
-            Settled::Unknown => world(&w).unknown.push(Write::Delete(victims)),
+            Settled::Unknown => w.lock().unknown.push(Write::Delete(victims)),
             Settled::Rejected(r) => return Err(format!("{}: delete rejected: {} {}", c.name, r.status, r.json)),
         }
     }
@@ -486,14 +483,14 @@ async fn querier(c: Client, w: Shared, base: i64, steps: usize) -> Result<(), St
         let ms = 200 + c.rng().below(800);
         c.pause(ms).await;
         let (extra, uid) = {
-            let g = world(&w);
+            let g = w.lock();
             let i = c.rng().below(g.events.len().max(1) as u64) as usize;
             (g.extra_since.is_some(), g.events.keys().nth(i).cloned())
         };
         let q = random_query(&c, base, extra, uid);
         let r = c.call("POST", &format!("{DB}/events/e/rows/query"), Some(q.clone())).await;
         match r {
-            Ok(r) if r.status == 200 => world(&w).answers.push((q, r.json)),
+            Ok(r) if r.status == 200 => w.lock().answers.push((q, r.json)),
             Ok(r) if r.status == 503 || r.status == 429 => {}
             Ok(r) if r.status == 400 && r.json.to_string().contains("extra") => {}
             Ok(r) => return Err(format!("{}: query {q} failed: {} {}", c.name, r.status, r.json)),
@@ -723,7 +720,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
             let r = c.call_settled("POST", &format!("{DB}/events/e/columns"), Some(col)).await;
             match r.status {
                 200 => {
-                    world(&w).extra_since = r.json["version"].as_u64();
+                    w.lock().extra_since = r.json["version"].as_u64();
                     Ok(())
                 }
                 409 => Ok(()),
@@ -739,8 +736,8 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
                 let now = c.sim.now_ms() as i64;
                 let rows = json!({"rows": [{"time": now - 30 * HOUR, "n": i}, {"time": now + 30 * HOUR, "n": i}]});
                 match settle(&c, &format!("{DB}/events/old/rows"), false, &rows, &format!("old-{i}")).await? {
-                    Settled::Done(_) => world(&w).old_inserts.0 += 1,
-                    Settled::Unknown => world(&w).old_inserts.1 += 1,
+                    Settled::Done(_) => w.lock().old_inserts.0 += 1,
+                    Settled::Unknown => w.lock().old_inserts.1 += 1,
                     Settled::Rejected(r) => return Err(format!("old rows: {} {}", r.status, r.json)),
                 }
             }
@@ -772,7 +769,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     }
     let (uids, version) = all_uids(&c).await?;
     let old_inserts = {
-        let mut g = world(&w);
+        let mut g = w.lock();
         let unknown = std::mem::take(&mut g.unknown);
         let certain = unknown.is_empty();
         let (rows, _) = snapshot(&g, version).ok_or("unresolved writes")?;

@@ -1,7 +1,7 @@
 use super::*;
 use crate::api::{ErrorCode, Outcome};
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 #[derive(Default)]
 struct Script {
@@ -11,8 +11,8 @@ struct Script {
 
 impl Transport for Script {
     fn send(&self, req: http::Request<Bytes>) -> BoxFuture<'_, Result<http::Response<Bytes>, TransportError>> {
-        self.requests.lock().unwrap().push(req);
-        let mut r = self.responses.lock().unwrap();
+        self.requests.lock().push(req);
+        let mut r = self.responses.lock();
         let next = if r.len() > 1 { r.remove(0) } else { r[0].clone() };
         Box::pin(async move { next })
     }
@@ -32,7 +32,7 @@ fn script(responses: Vec<Result<http::Response<Bytes>, TransportError>>) -> (Cli
 }
 
 fn sent(s: &Script) -> usize {
-    s.requests.lock().unwrap().len()
+    s.requests.lock().len()
 }
 
 const ERR: &str = r#"{"error":{"code":"CODE","message":"m","retryable":true,"details":DETAILS}}"#;
@@ -61,7 +61,7 @@ async fn requests_include_endpoint_route_method_token_and_body() {
             results: Some(vec![OpResult::Done])
         }
     );
-    let r = &s.requests.lock().unwrap()[0];
+    let r = &s.requests.lock()[0];
     assert_eq!((r.method().as_str(), r.uri().to_string()), ("POST", "/v1/dbs/team.tools/txn".to_string()));
     assert_eq!(r.headers()["authorization"], "Bearer t");
     assert_eq!(r.headers()["content-type"], "application/json");
@@ -75,7 +75,7 @@ async fn empty_request_bodies_omit_content_type() {
     let limits = r#"{"txn_max_ops":1,"txn_max_write_bytes":1,"txn_max_read_bytes":1,"txn_max_open_per_user":1,"value_inline_max":1,"scan_limit_max":1,"long_poll_max_ms":1,"json_value_max":1,"json_body_max":1,"blob_max":1,"blob_stage_ttl_ms":1,"added_later":true}"#;
     let (c, s) = script(vec![resp(200, &[], limits)]);
     assert_eq!(c.limits().await.unwrap().txn_max_ops, 1, "unknown fields are ignored");
-    let r = &s.requests.lock().unwrap()[0];
+    let r = &s.requests.lock()[0];
     assert!(r.headers().get("content-type").is_none() && r.body().is_empty());
 }
 
@@ -83,7 +83,7 @@ async fn empty_request_bodies_omit_content_type() {
 async fn path_parameters_are_percent_encoded() {
     let (c, s) = script(vec![resp(200, &[], "{}")]);
     c.remove_member("a/b c", "u?#%").await.unwrap();
-    let uri = s.requests.lock().unwrap()[0].uri().to_string();
+    let uri = s.requests.lock()[0].uri().to_string();
     assert_eq!(uri, "/v1/orgs/a%2Fb%20c/members/u%3F%23%25");
 }
 
@@ -105,7 +105,7 @@ async fn change_requests_encode_the_range_and_wait() {
         max_staleness_ms: Some(300_000),
     };
     let p = c.db("s").changes(&req).await.unwrap();
-    let uri = s.requests.lock().unwrap()[0].uri().to_string();
+    let uri = s.requests.lock()[0].uri().to_string();
     assert_eq!(
         uri,
         "/v1/dbs/s/changes?after=0&encoding=base64&prefix=dC8%3D&limit=50&wait_ms=20000&consistency=snapshot&max_staleness_ms=300000"
@@ -302,7 +302,7 @@ async fn the_first_success_ends_the_retries() {
     ]);
     assert_eq!(c.db("s").stage_blob(Bytes::from_static(b"x")).await.unwrap().blob_id, "b");
     assert_eq!(sent(&s), 3);
-    let r = &s.requests.lock().unwrap()[2];
+    let r = &s.requests.lock()[2];
     assert_eq!(
         (r.headers()["content-type"].to_str().unwrap(), r.body().as_ref()),
         ("application/octet-stream", &b"x"[..])
@@ -457,7 +457,7 @@ fn wire(op: &Op) -> serde_json::Value {
 
 fn requests(s: &Script) -> Vec<(String, String, serde_json::Value)> {
     let json = |b: &Bytes| serde_json::from_slice(b).unwrap_or(serde_json::Value::Null);
-    let rs = s.requests.lock().unwrap();
+    let rs = s.requests.lock();
     rs.iter().map(|r| (r.method().to_string(), r.uri().to_string(), json(r.body()))).collect()
 }
 
@@ -577,7 +577,7 @@ async fn a_transaction_begins_with_its_first_operations_and_commits_its_writes()
     assert_eq!(r[1].1, "/v1/dbs/s/transactions/t1/ops");
     assert_eq!(r[2].1, "/v1/dbs/s/transactions/t1/commit");
     assert_eq!(r[2].2["ops"][0]["op"], "delete_row", "queued writes execute with the commit");
-    let routes: Vec<_> = s.requests.lock().unwrap().iter().map(|r| r.extensions().get::<Route>().unwrap().0).collect();
+    let routes: Vec<_> = s.requests.lock().iter().map(|r| r.extensions().get::<Route>().unwrap().0).collect();
     assert_eq!(routes, [api::BeginTxn::ROUTE, api::TxnOps::ROUTE, api::CommitTxn::ROUTE]);
 }
 

@@ -75,8 +75,8 @@ pub async fn run(sim: Arc<Sim>, size: Size, chaos: bool) -> Result<(), String> {
 fn client(sim: &Arc<Sim>, name: &str) -> Client {
     let mut t = SimClient::new(sim, name);
     t.retry_rate_limited = false;
-    let rng = std::sync::Mutex::new(sim.fork_rng());
-    Client::new(t).with_entropy(move || rng.lock().unwrap_or_else(|e| e.into_inner()).next_u64())
+    let rng = parking_lot::Mutex::new(sim.fork_rng());
+    Client::new(t).with_entropy(move || rng.lock().next_u64())
 }
 
 async fn signed_up(sim: &Arc<Sim>, name: &str, email: &str) -> Result<Client, String> {

@@ -4,8 +4,9 @@
 
 use super::super::Sim;
 use super::super::client::Client;
+use parking_lot::Mutex;
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const INITIAL: i64 = 100;
 
@@ -158,7 +159,7 @@ pub async fn run(sim: Arc<Sim>, accounts: usize, clients: usize, transfers: usiz
                     (a, b, 1 + r.below(40) as i64)
                 };
                 if transfer(&c, db, a, b, amt, &format!("{}/{n}", c.name)).await? {
-                    applied.lock().unwrap_or_else(|e| e.into_inner()).push((a, b, amt));
+                    applied.lock().push((a, b, amt));
                 }
             }
             Ok::<(), String>(())
@@ -177,7 +178,7 @@ pub async fn run(sim: Arc<Sim>, accounts: usize, clients: usize, transfers: usiz
     }
     super::settle(&sim, phase).await;
     let mut want = vec![INITIAL; accounts];
-    for (a, b, amt) in applied.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for (a, b, amt) in applied.lock().iter() {
         want[*a] -= amt;
         want[*b] += amt;
     }

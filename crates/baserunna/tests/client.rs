@@ -7,9 +7,10 @@ use baserunna::store::MemStore;
 use baserunna_api::{self as api, Column, ColumnType, Endpoint as _, NewTable, Outcome};
 use baserunna_client::{BoxFuture, Client, Db, Error, Op, OpResult, Route, Row, Transport, TransportError};
 use bytes::Bytes;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 /// How [`Router`] fails the next request to `fail_route`.
@@ -34,7 +35,7 @@ struct Router {
 impl Router {
     fn fail(&self, route: &'static str, fault: Fault, times: usize) -> &Self {
         assert_eq!(route, self.fail_route);
-        *self.fault.lock().unwrap() = (fault, times);
+        *self.fault.lock() = (fault, times);
         self
     }
 
@@ -50,7 +51,7 @@ impl Transport for Router {
         Box::pin(async move {
             self.sent.fetch_add(1, Ordering::Relaxed);
             let fault = {
-                let mut f = self.fault.lock().unwrap();
+                let mut f = self.fault.lock();
                 match req.extensions().get::<Route>() {
                     Some(Route(r)) if *r == self.fail_route && f.1 > 0 => {
                         f.1 -= 1;
@@ -62,7 +63,7 @@ impl Transport for Router {
             match fault {
                 Fault::None => Ok(Router::call(self.app.clone(), req).await),
                 Fault::Drop => {
-                    self.dropped.lock().unwrap().push(req);
+                    self.dropped.lock().push(req);
                     Err(TransportError::Unknown("connection reset".into()))
                 }
                 Fault::LoseResponse => {
@@ -226,7 +227,7 @@ async fn a_commit_that_never_arrived_is_fenced_so_a_late_copy_cannot_apply() {
     router.fail(api::CommitTxn::ROUTE, Fault::Drop, 1);
     let e = txn.commit().await.unwrap_err();
     assert!(matches!(&e, Error::NotApplied(_)) && e.outcome() == Outcome::NotApplied, "{e:?}");
-    let late = router.dropped.lock().unwrap().pop().unwrap();
+    let late = router.dropped.lock().pop().unwrap();
     let resp = Router::call(router.app.clone(), late).await;
     assert_eq!(resp.status(), 409, "{:?}", resp.body());
     assert_eq!(db.read_one(Op::get("n")).await.unwrap().entry().unwrap(), None, "the fenced commit never applies");
@@ -237,7 +238,7 @@ async fn a_write_applies_once_when_every_response_is_lost() {
     let (db, router) = node(api::Txn::ROUTE).await;
     router.fail(api::Txn::ROUTE, Fault::LoseResponse, 4);
     let done = db.write(&[Op::increment("n", 1), Op::append("log", &["x"])]).await.unwrap();
-    assert_eq!(router.fault.lock().unwrap().1, 0, "every attempt lost its response");
+    assert_eq!(router.fault.lock().1, 0, "every attempt lost its response");
     let read = db.read(&[Op::get("n"), Op::read_stream("log", 0)]).await.unwrap();
     let n = read[0].clone().entry().unwrap().unwrap();
     assert_eq!((n.version, n.value.data().unwrap().as_ref()), (Some(done.version), &b"1"[..]));

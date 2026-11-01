@@ -10,7 +10,7 @@
 use crate::error::{Error, Result};
 use crate::store::{GetOpts, ObjectStore, PutMode, Retry};
 use bytes::Bytes;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -48,7 +48,7 @@ impl StoreClock {
     }
 
     fn last(&self) -> Option<Measurement> {
-        *self.last.lock().unwrap_or_else(|e| e.into_inner())
+        *self.last.lock()
     }
 
     /// The store's current time, from a measurement at most `max_age` old.
@@ -93,7 +93,7 @@ impl StoreClock {
         }
         match best {
             Some(m) if m.error_ms <= max_error_ms => {
-                *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(m);
+                *self.last.lock() = Some(m);
                 Ok(())
             }
             m => Err(Error::unavailable(format!(
@@ -156,12 +156,12 @@ mod tests {
 
     /// Test store that delays GETs by the configured durations and truncates
     /// `last_modified` to the declared precision.
-    struct Slow(MemStore, std::sync::Mutex<Vec<Duration>>, u64, std::sync::atomic::AtomicUsize);
+    struct Slow(MemStore, parking_lot::Mutex<Vec<Duration>>, u64, std::sync::atomic::AtomicUsize);
 
     impl Slow {
         fn new(mem: MemStore, delays: &[u64]) -> Slow {
             let delays = delays.iter().rev().map(|d| Duration::from_millis(*d)).collect();
-            Slow(mem, std::sync::Mutex::new(delays), 1, Default::default())
+            Slow(mem, parking_lot::Mutex::new(delays), 1, Default::default())
         }
 
         fn probes(&self) -> usize {
@@ -170,7 +170,7 @@ mod tests {
 
         fn delay(&self) -> Duration {
             self.3.fetch_add(1, Ordering::SeqCst);
-            let mut d = self.1.lock().unwrap();
+            let mut d = self.1.lock();
             if d.len() > 1 { d.pop().unwrap() } else { d[0] }
         }
     }

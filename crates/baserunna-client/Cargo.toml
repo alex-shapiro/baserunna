@@ -19,4 +19,5 @@ tokio = { workspace = true, features = ["time"] }
 reqwest = { workspace = true, features = ["rustls"], optional = true }
 
 [dev-dependencies]
+parking_lot.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

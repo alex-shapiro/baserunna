@@ -10,7 +10,7 @@ use super::campaign::{Job, Report, default_threads, run_jobs};
 use super::workloads::Scenario;
 use crate::probe::{Hits, Probe};
 use crate::util::rng::Rng;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::Instant;
 
 /// Number of jobs scheduled per batch before updating the corpus. Kept
@@ -91,10 +91,10 @@ pub fn explore(
             |i| jobs.get(i).cloned(),
             |i, j, out| {
                 progress(j, &out);
-                outs.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(out);
+                outs.lock()[i] = Some(out);
             },
         );
-        let outs = outs.into_inner().unwrap_or_else(|e| e.into_inner());
+        let outs = outs.into_inner();
         for (job, out) in jobs.into_iter().zip(outs) {
             let Some(out) = out else { continue };
             if report.add(scenarios, &job, &out) {

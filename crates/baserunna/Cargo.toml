@@ -22,6 +22,7 @@ http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+parking_lot.workspace = true
 serde = { version = "1", features = ["derive"] }
 zstd = { version = "0.13", default-features = false }
 serde_json = { version = "1", features = ["float_roundtrip"] }

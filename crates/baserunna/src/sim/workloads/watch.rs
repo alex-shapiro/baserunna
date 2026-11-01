@@ -8,10 +8,11 @@
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 const BASE: &str = "/v1/dbs/watch";
 
@@ -82,7 +83,7 @@ async fn writer(c: Client, log: Log, steps: usize) -> Result<(), String> {
         // was committed at a version in `prev + 1..=v`.
         let from = if maybe_twice { prev + 1 } else { v };
         {
-            let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+            let mut l = log.lock();
             for u in from..=v {
                 l.entry(u).or_insert_with(|| writes.clone());
             }
@@ -266,7 +267,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     }
     let last = Write::Put { key: "last".into(), value: "last".into(), ttl: false };
     let (last_version, _) = commit(&watcher.c, json!([{"op": "put", "key": "last", "value": "last"}]), "last").await?;
-    log.lock().unwrap_or_else(|e| e.into_inner()).insert(last_version, vec![last]);
+    log.lock().insert(last_version, vec![last]);
     // Wait for all TTL entries to expire before comparing state.
     watcher.c.pause(4_000 + eps).await;
     while watcher.poll(0, None).await? != Some(true) {
@@ -277,7 +278,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     if watcher.state != state {
         return Err(format!("the watcher's state {:?} differs from the database's {state:?}", watcher.state));
     }
-    let log = log.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let log = log.lock().clone();
     for ch in &watcher.received {
         explained(ch, &log)?;
     }

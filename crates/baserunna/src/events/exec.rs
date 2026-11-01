@@ -23,11 +23,12 @@ use crate::util::b64;
 use crate::util::codec::{Reader, Writer};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesOrdered;
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex, PoisonError};
 
 /// Resource limits for a single query.
 #[derive(Clone, Copy, Debug)]
@@ -581,7 +582,7 @@ impl<'r> Batch<'r> {
                     _ => None,
                 };
                 if let Some(ColData::Vec { v: Vector::Str(s), json }) = dict {
-                    let mut memos = self.memos.lock().unwrap_or_else(PoisonError::into_inner);
+                    let mut memos = self.memos.lock();
                     let memo = memos.entry(test_addr(t)).or_insert_with(|| vec![None; s.dict.len()]);
                     return sel
                         .iter()

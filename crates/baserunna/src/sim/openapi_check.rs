@@ -94,20 +94,20 @@ pub fn validate(root: &Json, schema: &Json, v: &Json, path: &str) -> Result<(), 
     Ok(())
 }
 
-static COVERAGE: std::sync::Mutex<std::collections::BTreeSet<(String, String)>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static COVERAGE: parking_lot::Mutex<std::collections::BTreeSet<(String, String)>> =
+    parking_lot::Mutex::new(std::collections::BTreeSet::new());
 
 pub fn record_coverage(method: &str, path: &str) {
     if let Some((tpl, item)) = match_path(doc(), path) {
         let m = method.to_ascii_lowercase();
         if item.get(&m).is_some() {
-            COVERAGE.lock().unwrap_or_else(|e| e.into_inner()).insert((tpl.to_string(), m));
+            COVERAGE.lock().insert((tpl.to_string(), m));
         }
     }
 }
 
 pub fn coverage() -> std::collections::BTreeSet<(String, String)> {
-    COVERAGE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    COVERAGE.lock().clone()
 }
 
 /// Returns all `(path_template, method)` pairs in the OpenAPI document.

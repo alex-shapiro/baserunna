@@ -1,8 +1,8 @@
 //! In-memory object store.
 
 use super::*;
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 struct Obj {
     data: Bytes,
@@ -35,12 +35,8 @@ impl MemStore {
         }))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     pub fn get_sync(&self, key: &str, opts: &GetOpts) -> SResult<GetResult> {
-        let g = self.lock();
+        let g = self.inner.lock();
         let o = g.objects.get(key).ok_or(StoreError::NotFound)?;
         if let Some(e) = &opts.if_none_match
             && *e == o.etag
@@ -63,7 +59,7 @@ impl MemStore {
             "object key {key:?} is outside the store contract"
         );
         let now = (self.clock)();
-        let mut g = self.lock();
+        let mut g = self.inner.lock();
         match (mode, g.objects.get(key)) {
             (PutMode::Create, Some(_)) => return Err(StoreError::PreconditionFailed),
             (PutMode::IfMatch(_), None) => return Err(StoreError::PreconditionFailed),
@@ -79,11 +75,11 @@ impl MemStore {
     }
 
     pub fn delete_sync(&self, key: &str) {
-        self.lock().objects.remove(key);
+        self.inner.lock().objects.remove(key);
     }
 
     pub fn list_sync(&self, prefix: &str, start_after: Option<&str>, limit: usize) -> ListPage {
-        let g = self.lock();
+        let g = self.inner.lock();
         let mut objects = Vec::new();
         let lower = match start_after {
             Some(s) if s >= prefix => std::ops::Bound::Excluded(s.to_string()),
@@ -110,15 +106,15 @@ impl MemStore {
     }
 
     pub fn keys(&self) -> Vec<String> {
-        self.lock().objects.keys().cloned().collect()
+        self.inner.lock().objects.keys().cloned().collect()
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.lock().objects.values().map(|o| o.data.len() as u64).sum()
+        self.inner.lock().objects.values().map(|o| o.data.len() as u64).sum()
     }
 
     pub fn len(&self) -> usize {
-        self.lock().objects.len()
+        self.inner.lock().objects.len()
     }
 
     pub fn is_empty(&self) -> bool {

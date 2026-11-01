@@ -225,7 +225,7 @@ pub struct GoogleOidc {
     pub client_secret: String,
     issuers: Vec<String>,
     http: reqwest::Client,
-    jwks_cache: std::sync::Mutex<Option<(std::time::Instant, Json)>>,
+    jwks_cache: parking_lot::Mutex<Option<(std::time::Instant, Json)>>,
 }
 
 #[cfg(feature = "cloud")]
@@ -236,7 +236,7 @@ impl GoogleOidc {
             client_secret,
             issuers: vec!["https://accounts.google.com".into(), "accounts.google.com".into()],
             http: reqwest::Client::new(),
-            jwks_cache: std::sync::Mutex::new(None),
+            jwks_cache: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -307,7 +307,7 @@ impl OidcProvider for GoogleOidc {
 
     fn jwks(&self) -> BoxFut<'_, Result<Json>> {
         Box::pin(async move {
-            if let Some((t, j)) = self.jwks_cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+            if let Some((t, j)) = self.jwks_cache.lock().as_ref()
                 && t.elapsed() < std::time::Duration::from_secs(3600)
             {
                 return Ok(j.clone());
@@ -321,7 +321,7 @@ impl OidcProvider for GoogleOidc {
                 .json()
                 .await
                 .map_err(|e| Error::unavailable(format!("google jwks: {e}")))?;
-            *self.jwks_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((std::time::Instant::now(), j.clone()));
+            *self.jwks_cache.lock() = Some((std::time::Instant::now(), j.clone()));
             Ok(j)
         })
     }

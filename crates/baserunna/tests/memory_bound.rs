@@ -19,7 +19,7 @@ fn add_allocated(by: isize) {
 }
 
 // Serializes tests so allocations from concurrent tests do not inflate PEAK_BYTES.
-static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TURN: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn reset_peak() -> isize {
     let now = ALLOCATED_BYTES.load(Relaxed);
@@ -179,7 +179,7 @@ async fn opening_many_databases_respects_budget(w: &World) {
 
 #[test]
 fn memory_charges_bound_real_heap_use() {
-    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = TURN.lock();
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
     rt.block_on(async {
         baserunna::log::set_level(Some(baserunna::log::Level::Warn));
@@ -193,7 +193,7 @@ fn memory_charges_bound_real_heap_use() {
 fn bulk_inserts_bound_memory_by_body_size() {
     use baserunna::sim::cost::{World, call_router, run_paused};
     use tower::ServiceExt;
-    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = TURN.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
         let t = w.signup(0, "mem@api.test").await;
@@ -231,7 +231,7 @@ fn corrupt_column_index_bounds_decoded_memory() {
     use baserunna::events::part::{ColIndex, ColMeta, ColRef, PartMeta};
     use baserunna::events::vector::Phys;
     use baserunna::util::codec::Writer;
-    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = TURN.lock();
     let framed = |w: Writer| {
         let mut out = Vec::new();
         baserunna::engine::segment::frame(&w.into_inner(), baserunna::engine::segment::Compression::Zstd(1), &mut out);
@@ -311,7 +311,7 @@ fn corrupt_column_index_bounds_decoded_memory() {
 #[test]
 fn events_expanded_by_defaults_respect_request_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
-    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = TURN.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
         let t = w.signup(0, "mem@api.test").await;
@@ -368,7 +368,7 @@ async fn setup_unsealed_events_with_large_defaults(t: &str, router: &axum::Route
 #[test]
 fn sealing_events_with_added_defaults_bounds_memory() {
     use baserunna::sim::cost::{World, call_router, run_paused};
-    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = TURN.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
         let t = w.signup(0, "mem@api.test").await;
@@ -403,7 +403,7 @@ fn sealing_events_with_added_defaults_bounds_memory() {
 #[test]
 fn queries_on_unsealed_events_with_added_defaults_respect_memory_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
-    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = TURN.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
         let t = w.signup(0, "mem@api.test").await;
@@ -427,7 +427,7 @@ fn queries_on_unsealed_events_with_added_defaults_respect_memory_limit() {
 #[test]
 fn queries_with_many_json_paths_respect_memory_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
-    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = TURN.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
         let t = w.signup(0, "mem@api.test").await;
@@ -469,7 +469,7 @@ fn queries_with_many_json_paths_respect_memory_limit() {
 #[test]
 fn queries_with_many_shared_json_paths_respect_memory_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
-    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = TURN.lock();
     run_paused(async {
         let w = World::with_config(1, 0, |c| {
             c.engine.event_json_max_paths = 1;
@@ -513,7 +513,7 @@ fn queries_with_many_shared_json_paths_respect_memory_limit() {
 #[test]
 fn query_lookups_respect_memory_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
-    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = TURN.lock();
     run_paused(async {
         let w = World::with_config(1, 0, |c| c.query_limits.lookup_max_bytes = 8 * MIB).await;
         let t = w.signup(0, "mem@api.test").await;

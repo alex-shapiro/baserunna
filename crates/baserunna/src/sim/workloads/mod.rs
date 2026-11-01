@@ -196,7 +196,7 @@ pub struct ChaosPhase {
 
 /// Starts a chaos phase for the calling workload.
 pub fn chaos_phase(sim: &Arc<Sim>) -> ChaosPhase {
-    let mut st = sim.chaos.lock().unwrap_or_else(|e| e.into_inner());
+    let mut st = sim.chaos.lock();
     st.active += 1;
     if st.task.is_none() {
         crate::buggify::set_quiet(false);
@@ -208,7 +208,7 @@ pub fn chaos_phase(sim: &Arc<Sim>) -> ChaosPhase {
 impl ChaosPhase {
     fn leave(&mut self) -> Option<u64> {
         self.open = false;
-        let mut st = self.sim.chaos.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.sim.chaos.lock();
         st.active -= 1;
         if st.active > 0 {
             return None;
@@ -226,13 +226,13 @@ impl ChaosPhase {
         let over = sim.chaos_over.notified();
         let mut over = std::pin::pin!(over);
         over.as_mut().enable();
-        let seen = sim.chaos.lock().unwrap_or_else(|e| e.into_inner()).ended;
+        let seen = sim.chaos.lock().ended;
         if self.leave().is_some() {
             recover_and_release(sim.clone()).await;
             return;
         }
         loop {
-            if sim.chaos.lock().unwrap_or_else(|e| e.into_inner()).ended > seen {
+            if sim.chaos.lock().ended > seen {
                 return;
             }
             over.as_mut().await;
@@ -252,7 +252,7 @@ impl Drop for ChaosPhase {
 
 async fn recover_and_release(sim: Arc<Sim>) {
     recover(&sim).await;
-    sim.chaos.lock().unwrap_or_else(|e| e.into_inner()).ended += 1;
+    sim.chaos.lock().ended += 1;
     sim.chaos_over.notify_waiters();
 }
 

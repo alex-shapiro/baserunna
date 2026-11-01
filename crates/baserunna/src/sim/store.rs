@@ -4,9 +4,10 @@ use super::Trace;
 use crate::store::*;
 use crate::util::rng::Rng;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -98,7 +99,7 @@ impl HeldReplies {
             let released = self.released.notified();
             let mut released = std::pin::pin!(released);
             released.as_mut().enable();
-            let held = self.suffix.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| key.ends_with(s));
+            let held = self.suffix.lock().as_ref().is_some_and(|s| key.ends_with(s));
             if !held {
                 return;
             }
@@ -126,22 +127,22 @@ impl SimStore {
     }
 
     pub fn set_faults(&self, f: StoreFaults) {
-        *self.faults.lock().unwrap_or_else(|e| e.into_inner()) = f;
+        *self.faults.lock() = f;
     }
 
     /// Blocks write responses for keys ending in `suffix` until [`SimStore::release_replies`] is called.
     pub fn hold_replies(&self, suffix: &str) {
-        *self.held_replies.suffix.lock().unwrap_or_else(|e| e.into_inner()) = Some(suffix.to_string());
+        *self.held_replies.suffix.lock() = Some(suffix.to_string());
     }
 
     pub fn release_replies(&self) {
-        *self.held_replies.suffix.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.held_replies.suffix.lock() = None;
         self.held_replies.released.notify_waiters();
     }
 
     fn draw(&self) -> Draw {
-        let f = self.faults.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let mut r = self.rng.lock().unwrap_or_else(|e| e.into_inner());
+        let f = self.faults.lock().clone();
+        let mut r = self.rng.lock();
         let mut latency_ms = r.range(f.latency_min_ms, f.latency_max_ms.max(f.latency_min_ms) + 1);
         if r.chance(f.p_slow) {
             latency_ms *= 10;
@@ -166,17 +167,13 @@ impl SimStore {
     }
 
     fn transfer_time(&self, bytes: usize) -> Duration {
-        let ms_per_mib = self.faults.lock().unwrap_or_else(|e| e.into_inner()).ms_per_mib;
+        let ms_per_mib = self.faults.lock().ms_per_mib;
         Duration::from_millis((bytes as u64 * ms_per_mib) >> 20)
-    }
-
-    fn view(&self) -> std::sync::MutexGuard<'_, ListView> {
-        self.view.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lagged_list(&self, prefix: &str, start_after: Option<&str>, limit: usize) -> ListPage {
         let now = Instant::now();
-        let mut view = self.view();
+        let mut view = self.view.lock();
         view.hidden_until.retain(|_, t| *t > now);
         view.ghosts.retain(|_, (_, t)| *t > now);
         if view.hidden_until.is_empty() && view.ghosts.is_empty() {
@@ -257,7 +254,7 @@ impl ObjectStore for SimStore {
                 let r =
                     if before { Err(unavailable("injected put failure")) } else { mem.put_sync(&key2, data, &mode) };
                 if r.is_ok() && list_lag_ms > 0 {
-                    let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut v = view.lock();
                     v.ghosts.remove(&key2);
                     if !existed {
                         v.hidden_until.insert(key2.clone(), Instant::now() + Duration::from_millis(list_lag_ms));
@@ -309,7 +306,7 @@ impl ObjectStore for SimStore {
                     last_modified_ms: g.last_modified_ms,
                 };
                 let until = Instant::now() + Duration::from_millis(d.list_lag_ms);
-                let mut v = self.view();
+                let mut v = self.view.lock();
                 v.hidden_until.remove(key);
                 v.ghosts.insert(key.to_string(), (meta, until));
             }

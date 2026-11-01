@@ -3,8 +3,8 @@
 use super::workloads::Scenario;
 use super::{SimOutcome, run};
 use crate::probe::{Hits, Probe};
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -203,9 +203,9 @@ pub fn campaign(
     let job = |i: usize| Some(Job::fresh(scenarios.len(), seeds.start, i as u64)).filter(|j| j.seed < seeds.end);
     run_jobs(scenarios, threads, deadline, job, |_, j, out| {
         progress(j, &out);
-        report.lock().unwrap_or_else(|e| e.into_inner()).add(scenarios, j, &out);
+        report.lock().add(scenarios, j, &out);
     });
-    let mut r = report.into_inner().unwrap_or_else(|e| e.into_inner());
+    let mut r = report.into_inner();
     r.failures.sort_by_key(|(j, _)| (j.scenario, j.seed));
     r
 }

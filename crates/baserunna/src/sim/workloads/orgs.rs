@@ -11,9 +11,10 @@ use super::super::{NetError, Sim};
 use super::steps::{add_member, create_key, create_org, members};
 use super::{cache_expiry, cache_lag, expect};
 use crate::meta::Role;
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 struct User {
     c: Client,
@@ -228,11 +229,11 @@ async fn role_changes(sim: &Arc<Sim>, owner: &User, others: &[User; 3]) -> Resul
     cache_expiry(sim).await;
     let history: Arc<Mutex<Vec<History>>> = Arc::default();
     let change = |i: usize, sent: u64, role: Option<Role>| {
-        history.lock().unwrap_or_else(|e| e.into_inner())[i].0.push((sent, sim.now_ms(), role));
+        history.lock()[i].0.push((sent, sim.now_ms(), role));
     };
     for (i, u) in others.iter().enumerate() {
         let current = members(&owner.c, "acme").await?.get(&u.id).copied();
-        history.lock().unwrap_or_else(|e| e.into_inner()).push(History(vec![(0, 0, current)]));
+        history.lock().push(History(vec![(0, 0, current)]));
         let sent = sim.now_ms();
         set_role(&owner.c, "acme", u, Some(Role::Writer)).await?;
         change(i, sent, Some(Role::Writer));
@@ -255,7 +256,7 @@ async fn role_changes(sim: &Arc<Sim>, owner: &User, others: &[User; 3]) -> Resul
                     Err(_) => 0,
                 };
                 let a = Attempt { user: i, key, start, end: sim.now_ms(), status };
-                attempts.lock().unwrap_or_else(|e| e.into_inner()).push(a);
+                attempts.lock().push(a);
                 sim.sleep(50 + sim.rand_below(300)).await;
             }
         }));
@@ -277,7 +278,7 @@ async fn role_changes(sim: &Arc<Sim>, owner: &User, others: &[User; 3]) -> Resul
     }
     let decided = |a: &Attempt| matches!(a.status, 200 | 403 | 404);
     let until = sim.now_ms() + 60_000;
-    while sim.now_ms() < until && !attempts.lock().unwrap_or_else(|e| e.into_inner()).iter().any(decided) {
+    while sim.now_ms() < until && !attempts.lock().iter().any(decided) {
         sim.sleep(500).await;
     }
     done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -285,8 +286,8 @@ async fn role_changes(sim: &Arc<Sim>, owner: &User, others: &[User; 3]) -> Resul
         w.await.map_err(|e| format!("writer panicked: {e}"))?;
     }
     sim.sleep(ZOMBIE_WAIT_MS).await;
-    let history = std::mem::take(&mut *history.lock().unwrap_or_else(|e| e.into_inner()));
-    let attempts = std::mem::take(&mut *attempts.lock().unwrap_or_else(|e| e.into_inner()));
+    let history = std::mem::take(&mut *history.lock());
+    let attempts = std::mem::take(&mut *attempts.lock());
     check_attempts(&history, &attempts, cache_lag(sim))?;
     let items = owner.c.paginate("/v1/dbs/acme.main/kv?prefix=w&keys_only=true&limit=1000", "items").await?;
     let stored: std::collections::BTreeSet<&str> = items.iter().filter_map(|i| i["key"].as_str()).collect();

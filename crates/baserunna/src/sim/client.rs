@@ -5,8 +5,9 @@ use crate::util::rng::Rng;
 use axum::body::Body;
 use bytes::Bytes;
 use http::Request;
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Upper bound on how long an in-flight server request can remain active.
@@ -135,7 +136,7 @@ impl Client {
         if up.is_empty() {
             return None;
         }
-        let i = self.rng.lock().unwrap_or_else(|e| e.into_inner()).usize(up.len());
+        let i = self.rng.lock().usize(up.len());
         Some(up[i])
     }
 
@@ -411,8 +412,8 @@ impl Client {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 
-    pub fn rng(&self) -> std::sync::MutexGuard<'_, Rng> {
-        self.rng.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn rng(&self) -> parking_lot::MutexGuard<'_, Rng> {
+        self.rng.lock()
     }
 }
 

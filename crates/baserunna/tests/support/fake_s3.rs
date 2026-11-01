@@ -4,8 +4,9 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, Uri, header};
 use axum::response::Response;
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const BUCKET: &str = "bucket";
@@ -62,15 +63,15 @@ impl FakeS3 {
     }
 
     pub fn inject_fault(&self, method: Method, fault: Fault) {
-        self.inner.lock().unwrap().faults.push_back((method, fault));
+        self.inner.lock().faults.push_back((method, fault));
     }
 
     pub fn request_count(&self, method: &Method) -> usize {
-        self.inner.lock().unwrap().requests.get(method.as_str()).copied().unwrap_or(0)
+        self.inner.lock().requests.get(method.as_str()).copied().unwrap_or(0)
     }
 
     pub fn get_data(&self, key: &str) -> Option<Bytes> {
-        self.inner.lock().unwrap().objects.get(key).map(|o| o.data.clone())
+        self.inner.lock().objects.get(key).map(|o| o.data.clone())
     }
 }
 
@@ -159,7 +160,7 @@ fn xml_escape(s: &str) -> String {
 
 async fn handle(State(s): State<FakeS3>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let fault = {
-        let mut g = s.inner.lock().unwrap();
+        let mut g = s.inner.lock();
         *g.requests.entry(method.to_string()).or_default() += 1;
         match g.faults.iter().position(|(m, _)| *m == method) {
             Some(i) => g.faults.remove(i).map(|(_, f)| f),
@@ -184,7 +185,7 @@ fn serve(s: &FakeS3, method: &Method, uri: &Uri, headers: &HeaderMap, body: Byte
         return xml_error_response(404, "NoSuchBucket");
     };
     let header = |h: header::HeaderName| headers.get(h).and_then(|v| v.to_str().ok()).map(str::to_string);
-    let mut g = s.inner.lock().unwrap();
+    let mut g = s.inner.lock();
     if key.is_empty() {
         let q = parse_query(uri);
         if *method == Method::POST && q.contains_key("delete") {

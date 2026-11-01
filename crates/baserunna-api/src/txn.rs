@@ -280,7 +280,11 @@ pub struct OpsResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Committed {
+    /// Commit version, or the read version if the transaction wrote nothing.
     pub version: u64,
+    /// False if the transaction wrote nothing, so that no commit was applied.
+    #[serde(default = "yes")]
+    pub committed: bool,
     pub commit_id: String,
     /// First sequence number assigned to each `append` operation in the transaction, in order.
     pub appends: Vec<u64>,
@@ -302,6 +306,10 @@ pub enum CommitStatus {
         commit_id: String,
         retention_ms: u64,
     },
+}
+
+fn yes() -> bool {
+    true
 }
 
 json_body!(

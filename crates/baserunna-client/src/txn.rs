@@ -98,8 +98,8 @@ impl Txn {
     }
 
     /// Executes the queued writes and commits, which validates the reads of a read-only
-    /// transaction. A transaction that never began commits its writes in one request, or returns
-    /// `None` if it writes nothing.
+    /// transaction, and returns `None` if the transaction wrote nothing. A transaction that never
+    /// began commits its writes in one request.
     ///
     /// If the commit outcome is unknown, the commit is resolved through the server: the result is
     /// the commit, an [`Error::NotApplied`], or the original error if the server cannot be
@@ -119,7 +119,8 @@ impl Txn {
         let err = match self.db.client().send(&e, &body).await {
             Ok(c) => {
                 self.open = None;
-                return Ok(Some(Committed { version: c.version, commit_id: c.commit_id, appends: c.appends }));
+                let done = Committed { version: c.version, commit_id: c.commit_id, appends: c.appends };
+                return Ok(c.committed.then_some(done));
             }
             Err(e) if e.outcome() == Outcome::NotApplied => {
                 // A commit rejected before it reached the transaction, such as by a rate limit, leaves it open.
@@ -133,7 +134,9 @@ impl Txn {
             return Err(Error::NotApplied(Box::new(err)));
         }
         let started = self.started.unwrap_or_else(tokio::time::Instant::now);
-        self.db.resolve(&commit_id, started, err).await.map(Some)
+        let resolved = self.db.resolve(&commit_id, started, err).await?;
+        self.open = None;
+        Ok(Some(resolved))
     }
 
     /// Aborts the transaction, ignoring failures because the server aborts an idle transaction

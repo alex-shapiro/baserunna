@@ -2794,7 +2794,8 @@ impl<'a> Session<'a> {
         };
         let mut results: Vec<Json> = outs.iter().map(|o| o.json.clone()).collect();
         if !t.is_write() {
-            let want = json!({"version": t.rv, "commit_id": ANY, "appends": [], "results": results});
+            let want =
+                json!({"version": t.rv, "committed": false, "commit_id": ANY, "appends": [], "results": results});
             let r = self.expect("POST", &path, bytes, &Expect::Ok(200, want)).await?;
             self.learn_cursors(&outs, &r.json["results"]);
             return Ok(());
@@ -2807,7 +2808,8 @@ impl<'a> Session<'a> {
         for ((_, r), f) in appended.zip(&firsts[firsts.len().saturating_sub(own)..]) {
             r["first_seq"] = json!(f);
         }
-        let committed = json!({"version": v, "commit_id": ANY, "appends": firsts, "results": results});
+        let committed =
+            json!({"version": v, "committed": true, "commit_id": ANY, "appends": firsts, "results": results});
         match self.w.conflicts(&t, iso) {
             Some(false) => {
                 if let Err(i) = outcome {

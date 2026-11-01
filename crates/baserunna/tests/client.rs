@@ -411,6 +411,17 @@ async fn a_begin_retried_after_memory_pressure_eases_succeeds() {
 }
 
 #[tokio::test]
+async fn a_begun_transaction_that_writes_nothing_commits_nothing() {
+    let (db, _) = node("").await;
+    for writes in [vec![], vec![Op::delete_row::<Item>(("nobody", 1))]] {
+        let mut txn = db.begin();
+        txn.run_one(Op::get("k")).await.unwrap();
+        txn.write(writes);
+        assert_eq!(txn.commit().await, Ok(None), "like Db::write and a transaction that never began");
+    }
+}
+
+#[tokio::test]
 async fn a_table_with_a_column_type_the_server_does_not_know_is_rejected() {
     let (db, _) = node("").await;
     let mut t = table();

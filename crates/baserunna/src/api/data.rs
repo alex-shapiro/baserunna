@@ -585,14 +585,17 @@ async fn commit_txn(
         let Some(version) = ctx.db.revalidate(t).await? else {
             return Err(Error::Conflict("transaction conflicts with a concurrent commit".into()));
         };
-        return Ok(Reply::new(api::Committed { version, commit_id: commit_hex(cid), appends: Vec::new(), results }));
+        let commit_id = commit_hex(cid);
+        return Ok(Reply::new(api::Committed { version, committed: false, commit_id, appends: Vec::new(), results }));
     }
+    let committed = !t.is_read_only();
     let mut creq = t.into_request();
     creq.deadline = Some(ctx.deadline.instant());
     let c = ctx.db.commit_detailed(creq).await.map_err(|e| naming_commit(e, cid))?;
     let own_appends = ops.iter().filter(|o| matches!(o, Op::Append { .. })).count();
     ops::fill_appends(&ops, &mut results, &c.appends[c.appends.len().saturating_sub(own_appends)..]);
-    Ok(Reply::new(api::Committed { version: c.version, commit_id: commit_hex(cid), appends: first_seqs(&c), results }))
+    let (commit_id, appends) = (commit_hex(cid), first_seqs(&c));
+    Ok(Reply::new(api::Committed { version: c.version, committed, commit_id, appends, results }))
 }
 
 async fn abort_txn(

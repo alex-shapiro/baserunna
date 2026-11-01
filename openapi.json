@@ -296,6 +296,9 @@
           "commit_id": {
             "type": "string"
           },
+          "committed": {
+            "type": "boolean"
+          },
           "results": {
             "items": {
               "$ref": "#/components/schemas/OpResult"

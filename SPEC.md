@@ -867,7 +867,7 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
    writes are discarded and subsequent requests return a retryable
    `404 txn_not_found` with the abort reason. `begin` returns the transaction's
    `commit_id` up front, and `commit` returns the sequence numbers assigned to
-   its appends.
+   its appends, with `committed: false` if the transaction wrote nothing.
 
 **Resolving ambiguity.** A `503` response with `outcome: "unknown"`, or a lost
 response, indicates that a commit may or may not have been applied. To resolve

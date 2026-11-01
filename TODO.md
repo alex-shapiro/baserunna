@@ -304,6 +304,13 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       for arbitrary IDs need a per-user bound, a retried begin must not hit the
       tombstone of its own failed attempt, and older servers reject the new
       field.
+- [ ] **Report why an interactive commit failed when its retry finds no
+      transaction.** The commit handler removes the transaction before it can
+      fail, so after a transient failure such as `503 commit deadline exceeded`,
+      `baserunna_client::Client` retries the commit and reports the retry's
+      `txn_not_found` instead of the cause. Record the cause with the abort
+      reasons that `txn_not_found` reports, or end the transaction only once the
+      commit cannot be retried.
 - [ ] **Fix the `events` fuzz target**, which no longer compiles because
       `PartRef` has no `min_version` and `max_version` fields.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the

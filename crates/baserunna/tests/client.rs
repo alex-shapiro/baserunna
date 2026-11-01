@@ -565,6 +565,18 @@ async fn a_write_whose_first_attempt_never_arrived_reports_the_servers_refusal()
 }
 
 #[tokio::test]
+async fn a_failed_check_whose_response_is_lost_reports_precondition_failed() {
+    let (db, router) = node(api::Txn::ROUTE).await;
+    db.write(&[Op::put("k", "v")]).await.unwrap();
+    router.fail(api::Txn::ROUTE, Fault::LoseResponse, 1);
+    let cas = [Op::Check { key: "k".into(), expect: Expect::Absent }, Op::put("k", "w")];
+    let e = db.write(&cas).await.unwrap_err();
+    assert_eq!(e.code(), Some(api::ErrorCode::PreconditionFailed), "{e}");
+    let k = db.read_one(Op::get("k")).await.unwrap().entry().unwrap().unwrap();
+    assert_eq!(k.value.data().unwrap().as_ref(), b"v", "the refused write never applied");
+}
+
+#[tokio::test]
 async fn a_retried_read_reports_the_servers_answer() {
     let (db, router) = node(api::GetTable::ROUTE).await;
     router.fail(api::GetTable::ROUTE, Fault::LoseResponse, 1);

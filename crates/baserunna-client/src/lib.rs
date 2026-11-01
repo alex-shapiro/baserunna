@@ -406,6 +406,14 @@ impl Db {
         if ops.is_empty() {
             return Ok(None);
         }
+        // An aborted key can never apply, so a new key safely learns why the server refused it.
+        match self.write_once(ops).await {
+            Err(e) if e.code() == Some(api::ErrorCode::Aborted) => self.write_once(ops).await,
+            r => r,
+        }
+    }
+
+    async fn write_once(&self, ops: &[Op]) -> Result<Option<Committed>, Error> {
         let key = self.client.random_id();
         let started = tokio::time::Instant::now();
         let e = api::Txn { db: self.name.clone() };

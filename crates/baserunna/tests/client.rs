@@ -405,3 +405,13 @@ async fn a_begin_that_arrives_after_its_abort_does_not_open() {
     assert!(begun.is_ok(), "a new transaction begins: {begun:?}");
     txn.abort().await;
 }
+
+#[tokio::test]
+async fn a_table_with_a_column_type_the_server_does_not_know_is_rejected() {
+    let (db, _) = node("").await;
+    let mut t = table();
+    t.name = "later".into();
+    t.columns[0].ty = api::ColumnType::Unknown;
+    let e = db.create_table(&t).await.unwrap_err();
+    assert_eq!(e.code(), Some(api::ErrorCode::InvalidArgument), "{e}");
+}

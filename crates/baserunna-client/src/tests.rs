@@ -849,3 +849,16 @@ async fn a_rejected_begin_sends_no_abort() {
     txn.abort().await;
     assert_eq!(sent(&s), 1, "nothing began, so nothing is aborted");
 }
+
+#[tokio::test(start_paused = true)]
+async fn table_listings_decode_column_types_and_index_states_added_by_newer_servers() {
+    let body = r#"{"tables":[
+        {"name":"old","columns":[{"name":"id","type":"int","nullable":false}],"primary_key":["id"],"indexes":[]},
+        {"name":"new","columns":[{"name":"at","type":"timestamp","nullable":false}],"primary_key":["at"],
+         "indexes":[{"name":"i","columns":["at"],"unique":false,"state":"failed"}]}
+    ],"next_cursor":null,"version":3}"#;
+    let (c, _) = script(vec![resp(200, &[], body)]);
+    let page = c.db("app").list_tables(api::ListTablesQuery::default()).await.unwrap();
+    assert_eq!(page.tables[1].columns[0].ty, api::ColumnType::Unknown);
+    assert_eq!(page.tables[1].indexes[0].state, api::IndexState::Unknown);
+}

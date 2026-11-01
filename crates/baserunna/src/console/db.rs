@@ -7,12 +7,13 @@ use super::{
 use crate::engine::DbStats;
 use crate::meta::{DbRef, Role};
 use crate::node::Node;
+use crate::table::schema::{ColType, IndexState};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::Path;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use baserunna_api::{ColumnType, IndexState, b64};
+use baserunna_api::b64;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::Deserialize;
 use serde_json::{Map, Value as Json, json};
@@ -101,7 +102,7 @@ struct Scan {
 struct Column {
     name: String,
     #[serde(rename = "type")]
-    ty: ColumnType,
+    ty: ColType,
     nullable: bool,
     default: Option<Json>,
 }
@@ -646,7 +647,7 @@ async fn table_page(Path((db, t)): Path<(String, String)>, s: Session, q: Params
         .collect();
     let edit = if can_write {
         {
-            let types: String = ColumnType::ALL.iter().map(|t| format!("<option>{}</option>", t.name())).collect();
+            let types: String = ColType::ALL.iter().map(|t| format!("<option>{}</option>", t.name())).collect();
             format!(
                 r#"<h2>Change the schema</h2><div class="card">
 <form class="row" method="post" action="{tp}/columns">{csrf}<input name="name" placeholder="column" required><select name="type">{types}</select>

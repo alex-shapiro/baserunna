@@ -308,9 +308,12 @@ fn table_definitions_default_to_nullable_columns() {
     };
     assert!(CreateTable::is_idempotent(&def));
     assert_eq!(NewTable::decode(def.encode()).unwrap(), def);
-    for ty in ColumnType::ALL {
-        assert_eq!(serde_json::to_value(ty).unwrap(), json!(ty.name()));
-    }
+    let names = ["string", "int", "float", "bool", "bytes", "json", "blob"];
+    let types: Vec<ColumnType> = names.iter().map(|n| serde_json::from_value(json!(n)).unwrap()).collect();
+    assert!(!types.contains(&ColumnType::Unknown));
+    assert_eq!(serde_json::to_value(&types).unwrap(), json!(names));
+    let later: (ColumnType, IndexState) = serde_json::from_value(json!(["timestamp", "failed"])).unwrap();
+    assert_eq!(later, (ColumnType::Unknown, IndexState::Unknown), "values added by newer servers decode");
     let created = r#"{"name":"t","columns":[],"primary_key":["id"],"indexes":[{"name":"i","columns":["n"],"unique":false,"state":"building"}],"version":4}"#;
     let c = CreatedTable::decode(created.into()).unwrap();
     assert_eq!((c.version, c.table.indexes[0].state), (4, IndexState::Building));

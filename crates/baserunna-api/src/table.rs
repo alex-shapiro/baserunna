@@ -89,35 +89,9 @@ pub enum ColumnType {
     Json,
     /// Binary value stored out of band, written as a staged `blob_id` and read as blob metadata.
     Blob,
-}
-
-impl ColumnType {
-    pub const ALL: [ColumnType; 7] = [
-        ColumnType::String,
-        ColumnType::Int,
-        ColumnType::Float,
-        ColumnType::Bool,
-        ColumnType::Bytes,
-        ColumnType::Json,
-        ColumnType::Blob,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            ColumnType::String => "string",
-            ColumnType::Int => "int",
-            ColumnType::Float => "float",
-            ColumnType::Bool => "bool",
-            ColumnType::Bytes => "bytes",
-            ColumnType::Json => "json",
-            ColumnType::Blob => "blob",
-        }
-    }
-
-    /// Returns true if the column can be part of a primary key or index.
-    pub fn indexable(self) -> bool {
-        !matches!(self, ColumnType::Json | ColumnType::Blob)
-    }
+    /// Type added by a newer server.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Column to create, in a new table or added to an existing one.
@@ -207,6 +181,9 @@ pub enum IndexState {
     Ready,
     /// Being backfilled from the table's rows.
     Building,
+    /// State added by a newer server.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -8,9 +8,9 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use crate::filter::{self, Target, Test};
-use baserunna_api::{self as api, ColumnType, IndexState, b64};
+use baserunna_api::{self as api, b64};
 use bytes::Bytes;
-use schema::{Column, Datum, IndexDef, Row, TableSchema, datum_from_json, key_from_json};
+use schema::{ColType, Column, Datum, IndexDef, IndexState, Row, TableSchema, datum_from_json, key_from_json};
 use serde::Deserialize;
 use serde_json::{Map, Value as Json};
 use std::collections::BTreeSet;
@@ -136,7 +136,7 @@ pub async fn create_table(txn: &mut Txn, def: &api::NewTable) -> Result<TableSch
         s.columns.push(Column {
             id: s.next_column_id,
             name: c.name.clone(),
-            ty: c.ty,
+            ty: ColType::from_api(c.ty)?,
             nullable: c.nullable && !def.primary_key.contains(&c.name),
             default: c.default.clone(),
         });
@@ -192,7 +192,7 @@ pub async fn add_column(txn: &mut Txn, table: &str, c: &api::NewColumn) -> Resul
     s.columns.push(Column {
         id: s.next_column_id,
         name: c.name.clone(),
-        ty: c.ty,
+        ty: ColType::from_api(c.ty)?,
         nullable: c.nullable,
         default: c.default.clone(),
     });
@@ -211,7 +211,7 @@ pub async fn drop_column(txn: &mut Txn, table: &str, name: &str) -> Result<Table
     if let Some(i) = s.indexes.iter().find(|i| i.columns.iter().any(|c| c == name)) {
         return Err(Error::invalid(format!("column is used by index {:?}; drop it first", i.name)));
     }
-    if col.ty == ColumnType::Blob {
+    if col.ty == ColType::Blob {
         let mut pages = Pages::new(KeyRange::prefix(&table_prefix(SPACE_ROW_BLOBS, s.id)));
         while let Some(page) = pages.next(txn).await? {
             for it in page.iter().filter(|it| it.key.ends_with(&col.id.to_be_bytes())) {
@@ -464,7 +464,7 @@ async fn row_from_json(s: &TableSchema, obj: &Json, blobs: &BlobResolver<'_>, ba
             Some(v) => {
                 let d = datum_from_json(c.ty, v, &c.name)?;
                 match (c.ty, d) {
-                    (ColumnType::Blob, Datum::Str(id)) => Datum::Blob(blobs.resolve(&id).await?),
+                    (ColType::Blob, Datum::Str(id)) => Datum::Blob(blobs.resolve(&id).await?),
                     (_, d) => d,
                 }
             }
@@ -486,7 +486,7 @@ async fn row_from_json(s: &TableSchema, obj: &Json, blobs: &BlobResolver<'_>, ba
 
 fn fill_defaults(s: &TableSchema, row: &mut Row) -> Result<()> {
     for c in &s.columns {
-        if !row.contains_key(&c.id) && c.ty != ColumnType::Blob {
+        if !row.contains_key(&c.id) && c.ty != ColType::Blob {
             let d = match &c.default {
                 Some(dv) => datum_from_json(c.ty, dv, &c.name)?,
                 None => Datum::Null,
@@ -516,7 +516,7 @@ async fn load_row(txn: &mut Txn, s: &TableSchema, pk: &[Key]) -> Result<Option<S
 
 async fn load_blob_columns(txn: &mut Txn, s: &TableSchema, pk: &[Key], row: &mut Row) -> Result<()> {
     for c in &s.columns {
-        if c.ty == ColumnType::Blob {
+        if c.ty == ColType::Blob {
             let d = match txn.get(&blob_side_key(s.id, pk, c.id)).await? {
                 Some(ReadValue { value: Value::Blob(b), .. }) => Datum::Blob(b),
                 _ => Datum::Null,
@@ -537,7 +537,7 @@ fn write_row(
 ) -> Result<()> {
     txn.put_expiring(row_key(s.id, pk), Value::Inline(Bytes::from(schema::encode_row(row))), ttl)?;
     for c in &s.columns {
-        if c.ty != ColumnType::Blob {
+        if c.ty != ColType::Blob {
             continue;
         }
         let new = row.get(&c.id);
@@ -695,7 +695,7 @@ pub async fn delete(txn: &mut Txn, table: &str, pk: &Json) -> Result<bool> {
 async fn delete_stored(txn: &mut Txn, s: &TableSchema, pk: &[Key], old: &Stored) -> Result<()> {
     update_indexes(txn, s, pk, Some((&old.0, old.1)), None).await?;
     txn.delete(row_key(s.id, pk))?;
-    if s.columns.iter().any(|c| c.ty == ColumnType::Blob) {
+    if s.columns.iter().any(|c| c.ty == ColType::Blob) {
         txn.delete_range(KeyRange::prefix(&blob_side_prefix(s.id, pk)))?;
     }
     Ok(())
@@ -914,9 +914,9 @@ fn bind_filter(s: &TableSchema, f: &Filter) -> Result<RowFilter> {
         let c = s.column(name).ok_or_else(|| Error::invalid(format!("unknown column {name:?}")))?;
         let fits = match (test, c.ty) {
             (Test::Exists, _) => true,
-            (_, ColumnType::Blob) => false,
+            (_, ColType::Blob) => false,
             (Test::Prefix(_) | Test::Contains(_), ty) => {
-                matches!(ty, ColumnType::String | ColumnType::Bytes | ColumnType::Json)
+                matches!(ty, ColType::String | ColType::Bytes | ColType::Json)
             }
             _ => true,
         };
@@ -929,8 +929,8 @@ fn bind_filter(s: &TableSchema, f: &Filter) -> Result<RowFilter> {
 
 /// Converts a JSON filter argument to a [`Datum`] of `ty`, rejecting integer
 /// literals that cannot be represented losslessly as `f64` for float columns.
-fn filter_arg(ty: ColumnType, v: &Json, name: &str) -> Result<Datum> {
-    if ty == ColumnType::Float
+fn filter_arg(ty: ColType, v: &Json, name: &str) -> Result<Datum> {
+    if ty == ColType::Float
         && let Json::Number(n) = v
         && let Some(i) = n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from))
         && (i as f64) as i128 != i
@@ -1280,10 +1280,8 @@ pub async fn check_no_orphans(txn: &mut Txn) -> Result<()> {
     let tables = all_tables(txn).await?;
     let live: BTreeSet<u32> = tables.iter().map(|s| s.id).collect();
     let live_idx: BTreeSet<(u32, u32)> = tables.iter().flat_map(|s| s.indexes.iter().map(|i| (s.id, i.id))).collect();
-    let blob_cols: BTreeSet<(u32, u32)> = tables
-        .iter()
-        .flat_map(|s| s.columns.iter().filter(|c| c.ty == ColumnType::Blob).map(|c| (s.id, c.id)))
-        .collect();
+    let blob_cols: BTreeSet<(u32, u32)> =
+        tables.iter().flat_map(|s| s.columns.iter().filter(|c| c.ty == ColType::Blob).map(|c| (s.id, c.id))).collect();
     let building: BTreeSet<Bytes> = tables
         .iter()
         .flat_map(|s| s.indexes.iter().filter(|i| i.state == IndexState::Building).map(|i| backfill_key(s.id, i.id)))

@@ -145,7 +145,7 @@ impl Txn {
             return Err(Error::NotApplied(Box::new(err)));
         }
         let started = self.started.unwrap_or_else(tokio::time::Instant::now);
-        let resolved = self.db.resolve(&commit_id, started, err).await?;
+        let resolved = self.db.resolve(&commit_id, started, err, None).await?;
         self.open = None;
         Ok(Some(resolved))
     }

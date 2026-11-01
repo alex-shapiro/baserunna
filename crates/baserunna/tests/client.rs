@@ -540,3 +540,26 @@ async fn a_failed_operation_is_named_by_its_index_in_the_run() {
     let Error::Api { error, .. } = &e else { panic!("{e:?}") };
     assert_eq!(error.details.as_ref().and_then(|d| d.op_index), Some(1), "{e}");
 }
+
+#[tokio::test]
+async fn a_write_whose_first_attempt_never_arrived_reports_the_servers_refusal() {
+    let (db, router) = node(api::Txn::ROUTE).await;
+    db.write(&[Op::insert(&item("a", 1))]).await.unwrap();
+    router.fail(api::Txn::ROUTE, Fault::Drop, 1);
+    let e = db.write(&[Op::insert(&item("a", 1))]).await.unwrap_err();
+    assert_eq!(e.code(), Some(api::ErrorCode::AlreadyExists), "{e:?}");
+    router.fail(api::Txn::ROUTE, Fault::Drop, 1);
+    let mut retry = db.retry();
+    let mut passes = 0;
+    let r = loop {
+        passes += 1;
+        let txn = db.begin();
+        let w = db.write(&[Op::insert(&item("a", 1))]).await;
+        match retry.finish(txn, w).await {
+            Ok(Some(_)) => break Ok(()),
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+    };
+    assert_eq!(passes, 1, "a refused write is not run again: {r:?}");
+}

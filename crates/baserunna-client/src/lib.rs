@@ -155,6 +155,17 @@ impl Client {
         body: &E::Body,
         allowed_error: Option<api::ErrorCode>,
     ) -> Result<Option<E::Response>, Error> {
+        self.attempts(endpoint, body, allowed_error).await.map_err(|f| f.error)
+    }
+
+    /// Sends a request like [`Client::send_allowing`], and also returns the final attempt's error
+    /// when an earlier attempt's error is reported instead.
+    async fn attempts<E: Endpoint>(
+        &self,
+        endpoint: &E,
+        body: &E::Body,
+        allowed_error: Option<api::ErrorCode>,
+    ) -> Result<Option<E::Response>, Box<Failed>> {
         let idempotent = E::is_idempotent(body) || allowed_error.is_some();
         let path = endpoint.path();
         let body = body.encode();
@@ -175,8 +186,10 @@ impl Client {
                 // Only `PreconditionFailed` and `Aborted` fence earlier attempts for the idempotency key.
                 let resolved = matches!(err.code(), Some(api::ErrorCode::PreconditionFailed | api::ErrorCode::Aborted));
                 return Err(match (err.outcome(), unresolved) {
-                    (api::Outcome::NotApplied, Some(earlier)) if !resolved => earlier,
-                    _ => err,
+                    (api::Outcome::NotApplied, Some(earlier)) if !resolved => {
+                        Box::new(Failed { error: earlier, refusal: Some(err) })
+                    }
+                    _ => Box::new(Failed { error: err, refusal: None }),
                 });
             }
             match err.retry_after_ms() {
@@ -274,6 +287,14 @@ impl Client {
     }
 }
 
+/// Failure of a request after its final attempt.
+struct Failed {
+    /// Error to report: the final attempt's, or an earlier attempt's whose outcome is unknown.
+    error: Error,
+    /// Final attempt's error, which applied nothing, if `error` is an earlier attempt's.
+    refusal: Option<Error>,
+}
+
 fn decode<T: Body>(path: &str, resp: http::Response<Bytes>) -> Result<T, Error> {
     let (parts, body) = resp.into_parts();
     let status = parts.status.as_u16();
@@ -300,6 +321,15 @@ fn decode<T: Body>(path: &str, resp: http::Response<Bytes>) -> Result<T, Error> 
             Err(Error::Api { status, error, retry_after_ms })
         }
         Err(_) => Err(foreign()),
+    }
+}
+
+fn txn_request(ops: &[Op], idempotency_key: Option<&str>) -> api::TxnRequest {
+    api::TxnRequest {
+        ops: ops.iter().map(Op::to_api).collect(),
+        encoding: api::Encoding::Base64,
+        idempotency_key: idempotency_key.map(Into::into),
+        ..api::TxnRequest::default()
     }
 }
 
@@ -377,23 +407,36 @@ impl Db {
         }
         let key = self.client.random_id();
         let started = tokio::time::Instant::now();
-        match self.txn(ops, Some(&key)).await {
+        let e = api::Txn { db: self.name.clone() };
+        let sent = self.client.attempts(&e, &txn_request(ops, Some(&key)), None).await;
+        let out = sent.and_then(|resp| {
+            let resp = resp.expect("no error is allowed");
+            let malformed =
+                |reason| Box::new(Failed { error: Error::Malformed { path: e.path(), reason }, refusal: None });
+            TxnOutcome::decode(ops, resp).map_err(malformed)
+        });
+        match out {
             Ok(out) => {
                 Ok(out.commit_id.map(|commit_id| Committed { version: out.version, commit_id, appends: out.appends }))
             }
-            Err(e) if e.outcome() == api::Outcome::Unknown => {
-                self.resolve(&format!("key:{key}"), started, e).await.map(Some)
+            Err(f) if f.error.outcome() == api::Outcome::Unknown => {
+                let Failed { error, refusal } = *f;
+                self.resolve(&format!("key:{key}"), started, error, refusal).await.map(Some)
             }
-            Err(e) => Err(e),
+            Err(f) => Err(f.error),
         }
     }
 
     /// Resolves commit `id`, first attempted at `started`, after `err` left its outcome unknown.
+    ///
+    /// If the commit was not applied, returns `refusal`, the error of a later attempt that applied
+    /// nothing, or else `err` as [`Error::NotApplied`].
     pub(crate) async fn resolve(
         &self,
         id: &str,
         started: tokio::time::Instant,
         err: Error,
+        refusal: Option<Error>,
     ) -> Result<Committed, Error> {
         let e = api::GetCommit { db: self.name.clone(), id: id.into() };
         match self.client.send(&e, &api::NoBody {}).await {
@@ -404,7 +447,7 @@ impl Db {
             Ok(api::CommitStatus::NotCommitted { retention_ms, .. })
                 if started.elapsed() < Duration::from_millis(retention_ms) / 2 =>
             {
-                Err(Error::NotApplied(Box::new(err)))
+                Err(refusal.unwrap_or_else(|| Error::NotApplied(Box::new(err))))
             }
             _ => Err(err),
         }
@@ -416,15 +459,9 @@ impl Db {
     /// [`api::Outcome::Unknown`]. Generate a new key for each distinct transaction, including after
     /// [`api::ErrorCode::Aborted`]. [`Db::write`] generates the key and resolves unknown outcomes.
     pub async fn txn(&self, ops: &[Op], idempotency_key: Option<&str>) -> Result<TxnOutcome, Error> {
-        let req = api::TxnRequest {
-            ops: ops.iter().map(Op::to_api).collect(),
-            encoding: api::Encoding::Base64,
-            idempotency_key: idempotency_key.map(Into::into),
-            ..api::TxnRequest::default()
-        };
         let e = api::Txn { db: self.name.clone() };
         let path = e.path();
-        let resp = self.client.send(&e, &req).await?;
+        let resp = self.client.send(&e, &txn_request(ops, idempotency_key)).await?;
         TxnOutcome::decode(ops, resp).map_err(|reason| Error::Malformed { path, reason })
     }
 

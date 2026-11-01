@@ -88,6 +88,10 @@ impl Txn {
             }
         };
         self.failed = sent.as_ref().err().cloned();
+        // A begin that was not applied opened nothing to abort.
+        if self.commit_id.is_none() && self.failed.as_ref().is_some_and(|e| e.outcome() == Outcome::NotApplied) {
+            self.id = None;
+        }
         let results = sent?;
         decode_results(ops, &results).map_err(|reason| Error::Malformed { path, reason })
     }

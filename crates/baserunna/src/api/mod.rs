@@ -809,16 +809,29 @@ fn snapshot_staleness(query: Option<&str>) -> Option<u64> {
 }
 
 pub fn consistency_of(q: &std::collections::BTreeMap<String, String>) -> Result<Consistency> {
-    match q.get("consistency").map(|s| s.as_str()) {
-        None | Some("strong") => Ok(Consistency::Strong),
-        Some("snapshot") => Ok(Consistency::Snapshot {
-            max_staleness_ms: q
-                .get("max_staleness_ms")
-                .map(|s| s.parse().map_err(|_| Error::invalid("bad max_staleness_ms")))
-                .transpose()?
-                .unwrap_or(5000),
-        }),
-        Some(o) => Err(Error::invalid(format!("unknown consistency {o:?}"))),
+    let c = match q.get("consistency").map(|s| s.as_str()) {
+        None => None,
+        Some("strong") => Some(api::Consistency::Strong),
+        Some("snapshot") => Some(api::Consistency::Snapshot),
+        Some(o) => return Err(Error::invalid(format!("unknown consistency {o:?}"))),
+    };
+    let max_staleness_ms = match c {
+        Some(api::Consistency::Snapshot) => {
+            let ms = q.get("max_staleness_ms");
+            ms.map(|s| s.parse().map_err(|_| Error::invalid("bad max_staleness_ms"))).transpose()?
+        }
+        _ => None,
+    };
+    Ok(consistency_from(c, max_staleness_ms))
+}
+
+/// Converts a typed `consistency` query, defaulting to strong reads and a 5 s snapshot staleness.
+pub(crate) fn consistency_from(c: Option<api::Consistency>, max_staleness_ms: Option<u64>) -> Consistency {
+    match c {
+        None | Some(api::Consistency::Strong) => Consistency::Strong,
+        Some(api::Consistency::Snapshot) => {
+            Consistency::Snapshot { max_staleness_ms: max_staleness_ms.unwrap_or(5000) }
+        }
     }
 }
 

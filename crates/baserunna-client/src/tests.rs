@@ -840,3 +840,12 @@ async fn table_responses_ignore_fields_added_by_newer_servers() {
     let got = c.db("app").get_table("items").await;
     assert!(got.is_ok(), "{got:?}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_rejected_begin_sends_no_abort() {
+    let (c, s) = script(vec![api_err(400, "invalid_argument", "null"), resp(200, &[], "{}")]);
+    let mut txn = c.db("s").begin();
+    assert!(txn.run_one(Op::get("k")).await.is_err());
+    txn.abort().await;
+    assert_eq!(sent(&s), 1, "nothing began, so nothing is aborted");
+}

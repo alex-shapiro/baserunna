@@ -187,7 +187,7 @@ impl Client {
                 Ok(r) => format!(
                     "{} {}{}{}",
                     r.status,
-                    crate::util::b64::hex(&crate::util::sha256(&r.body)[..6]),
+                    baserunna_api::b64::hex(&crate::util::sha256(&r.body)[..6]),
                     match r.status >= 400 {
                         true => format!(" {}", String::from_utf8_lossy(&r.body[..r.body.len().min(160)])),
                         false => String::new(),

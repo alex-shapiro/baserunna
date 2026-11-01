@@ -3,20 +3,19 @@
 use super::tuple::Key;
 use crate::engine::BlobRef;
 use crate::error::{Error, Result};
-use crate::util::b64;
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
+use baserunna_api::b64;
+use baserunna_api::{ColumnType, IndexState};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
-
-pub use baserunna_api::{ColumnType as ColType, IndexState};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Column {
     pub id: u32,
     pub name: String,
     #[serde(rename = "type")]
-    pub ty: ColType,
+    pub ty: ColumnType,
     pub nullable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Json>,
@@ -103,30 +102,30 @@ pub fn blob_json(r: &BlobRef) -> Json {
 
 /// Convert a JSON value to a datum of `ty`. Blob columns return the staged
 /// blob ID as `Datum::Str`.
-pub fn datum_from_json(ty: ColType, v: &Json, col: &str) -> Result<Datum> {
+pub fn datum_from_json(ty: ColumnType, v: &Json, col: &str) -> Result<Datum> {
     if v.is_null() {
         return Ok(Datum::Null);
     }
     let bad = || Error::invalid(format!("column {col:?} expects {ty:?}, got {v}"));
     Ok(match ty {
-        ColType::String => Datum::Str(v.as_str().ok_or_else(bad)?.to_string()),
-        ColType::Int => Datum::Int(v.as_i64().ok_or_else(bad)?),
-        ColType::Float => {
+        ColumnType::String => Datum::Str(v.as_str().ok_or_else(bad)?.to_string()),
+        ColumnType::Int => Datum::Int(v.as_i64().ok_or_else(bad)?),
+        ColumnType::Float => {
             let f = v.as_f64().ok_or_else(bad)?;
             if !f.is_finite() {
                 return Err(bad());
             }
             Datum::Float(f)
         }
-        ColType::Bool => Datum::Bool(v.as_bool().ok_or_else(bad)?),
-        ColType::Bytes => Datum::Bytes(b64::decode(v.as_str().ok_or_else(bad)?).ok_or_else(bad)?),
-        ColType::Json => Datum::Json(v.clone()),
-        ColType::Blob => Datum::Str(v.as_str().ok_or_else(bad)?.to_string()),
+        ColumnType::Bool => Datum::Bool(v.as_bool().ok_or_else(bad)?),
+        ColumnType::Bytes => Datum::Bytes(b64::decode(v.as_str().ok_or_else(bad)?).ok_or_else(bad)?),
+        ColumnType::Json => Datum::Json(v.clone()),
+        ColumnType::Blob => Datum::Str(v.as_str().ok_or_else(bad)?.to_string()),
     })
 }
 
 /// Convert a JSON value to an indexable [`Key`] for `ty`.
-pub fn key_from_json(ty: ColType, v: &Json, col: &str) -> Result<Key> {
+pub fn key_from_json(ty: ColumnType, v: &Json, col: &str) -> Result<Key> {
     if !ty.indexable() {
         return Err(Error::invalid(format!("column {col:?} is not indexable")));
     }
@@ -165,7 +164,7 @@ impl TableSchema {
                 return Err(Error::invalid(format!("duplicate column {:?}", c.name)));
             }
             if let Some(d) = &c.default {
-                if c.ty == ColType::Blob {
+                if c.ty == ColumnType::Blob {
                     return Err(Error::invalid("blob columns cannot have defaults"));
                 }
                 datum_from_json(c.ty, d, &c.name)?;
@@ -323,7 +322,7 @@ mod col_type_tests {
 
     #[test]
     fn names_are_the_serialized_ones() {
-        for t in ColType::ALL {
+        for t in ColumnType::ALL {
             assert_eq!(serde_json::to_value(t).unwrap(), Json::from(t.name()));
         }
     }
@@ -369,9 +368,9 @@ mod tests {
             id: 1,
             name: "users".into(),
             columns: vec![
-                Column { id: 1, name: "id".into(), ty: ColType::Int, nullable: false, default: None },
-                Column { id: 2, name: "email".into(), ty: ColType::String, nullable: true, default: None },
-                Column { id: 3, name: "meta".into(), ty: ColType::Json, nullable: true, default: None },
+                Column { id: 1, name: "id".into(), ty: ColumnType::Int, nullable: false, default: None },
+                Column { id: 2, name: "email".into(), ty: ColumnType::String, nullable: true, default: None },
+                Column { id: 3, name: "meta".into(), ty: ColumnType::Json, nullable: true, default: None },
             ],
             primary_key: vec!["id".into()],
             indexes: vec![IndexDef {

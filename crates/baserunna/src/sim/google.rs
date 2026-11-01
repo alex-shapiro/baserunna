@@ -3,9 +3,9 @@
 use crate::auth::OidcProvider;
 use crate::error::{Error, Result};
 use crate::store::BoxFut;
-use crate::util::b64;
 use aws_lc_rs::rsa::KeyPair;
 use aws_lc_rs::signature::{KeyPair as _, RSA_PKCS1_SHA256, RsaPublicKeyComponents};
+use baserunna_api::b64;
 use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;

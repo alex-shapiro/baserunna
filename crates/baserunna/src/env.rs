@@ -177,7 +177,7 @@ impl Env {
 
     /// Generates `nbytes` random bytes encoded as lowercase hex.
     pub fn random_hex(&self, nbytes: usize) -> String {
-        crate::util::b64::hex(&self.random_bytes(nbytes))
+        baserunna_api::b64::hex(&self.random_bytes(nbytes))
     }
 
     /// Spawns a background task aborted on [`Env::shutdown`].

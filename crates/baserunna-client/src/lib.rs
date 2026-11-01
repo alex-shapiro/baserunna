@@ -35,7 +35,7 @@ pub use baserunna_api as api;
 pub use changes::{Change, ChangePage, ChangesRequest};
 pub use error::Error;
 pub use op::{Expect, KeyRange, NewRecord, Op, Row};
-pub use result::{Body as RecordBody, Entry, OpResult, Record, RecordPage, RowPage, ScanPage, TxnOutcome, Value};
+pub use result::{Entry, OpResult, Record, RecordBody, RecordPage, RowPage, ScanPage, TxnOutcome, Value};
 #[cfg(feature = "reqwest")]
 pub use transport::HttpTransport;
 pub use transport::{BoxFuture, Route, Transport, TransportError};

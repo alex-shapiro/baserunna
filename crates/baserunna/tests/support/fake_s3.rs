@@ -208,7 +208,7 @@ fn serve(s: &FakeS3, method: &Method, uri: &Uri, headers: &HeaderMap, body: Byte
             }
             g.writes += 1;
             let digest = baserunna::util::sha256(&body);
-            let etag = format!("\"{}\"", baserunna::util::b64::hex(&digest[..16]));
+            let etag = format!("\"{}\"", baserunna_api::b64::hex(&digest[..16]));
             g.objects.insert(key, Obj { data: body, etag: etag.clone(), modified_s: now_s() });
             Response::builder().status(200).header(header::ETAG, etag).body(Body::empty()).unwrap()
         }

@@ -486,7 +486,7 @@ impl Node {
             *self.cluster_key.lock() = Some(k);
         }
         let key: String = retry_unavailable(|| self.run_meta_as(ensure("cookie_key"))).await?;
-        *self.cookie_key.lock() = crate::util::b64::unhex(&key).unwrap_or_else(|| key.into_bytes());
+        *self.cookie_key.lock() = baserunna_api::b64::unhex(&key).unwrap_or_else(|| key.into_bytes());
         if let (Some(e), Some(p)) = (&self.cfg.admin_email, &self.cfg.admin_password) {
             let email = auth::normalize_email(e)?;
             let mut t = self.sys_read().await?;
@@ -865,8 +865,10 @@ impl Node {
             let rs = match forward_to {
                 Some((addr, holder)) => {
                     crate::probe::hit(crate::probe::Probe::BindForwarded);
-                    let body =
-                        crate::api::ForwardedBind { db: db.id.clone(), bind: crate::util::b64::encode(&bind.encode()) };
+                    let body = crate::api::ForwardedBind {
+                        db: db.id.clone(),
+                        bind: baserunna_api::b64::encode(&bind.encode()),
+                    };
                     match self.forward_internal(&holder, &addr, "/internal/v1/events/bind", &body).await {
                         Ok(j) => crate::api::bind_results_from_json(&j, n)?,
                         Err(Ok(e @ Error::Unavailable { outcome_unknown: false, .. }))

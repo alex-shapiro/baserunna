@@ -150,7 +150,7 @@ pub(super) async fn create_db(eng: &Arc<Engine>, id: &str) -> Arc<Db> {
     db.open(true).await.unwrap();
     txn_do(&db, async |t| create(t, &table_def()).await).await.unwrap();
     for (name, key_ty) in [("people", "string"), ("nums", "int")] {
-        let tdef: crate::table::CreateTable = serde_json::from_value(json!({"name": name,
+        let tdef: baserunna_api::NewTable = serde_json::from_value(json!({"name": name,
             "columns": [{"name": "id", "type": key_ty}, {"name": "plan", "type": "string"},
                 {"name": "score", "type": "float"}, {"name": "meta", "type": "json"}],
             "primary_key": ["id"]}))

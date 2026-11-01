@@ -3,7 +3,8 @@
 use crate::env::Env;
 use crate::error::{Error, Result};
 use crate::store::BoxFut;
-use crate::util::{b64, ct_eq, hmac_sha256, sha256};
+use crate::util::{ct_eq, hmac_sha256, sha256};
+use baserunna_api::b64;
 use serde_json::Value as Json;
 use std::num::NonZeroU32;
 

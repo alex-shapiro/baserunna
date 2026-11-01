@@ -74,7 +74,7 @@ async fn run(seed: u64, ops: &[Op]) -> Result<(), String> {
     db.open(true).await.map_err(|e| e.to_string())?;
     let blobs = BlobResolver { db: &db };
     let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-    let def: CreateTable = serde_json::from_value(json!({
+    let def: api::NewTable = serde_json::from_value(json!({
         "name": "t",
         "columns": [
             {"name": "id", "type": "int", "nullable": false},
@@ -310,7 +310,7 @@ fn schema_changes_and_blobs() {
         db.open(true).await.unwrap();
         let blobs = BlobResolver { db: &db };
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-        let def: CreateTable = serde_json::from_value(json!({
+        let def: api::NewTable = serde_json::from_value(json!({
             "name": "docs",
             "columns": [
                 {"name": "org", "type": "string", "nullable": false},
@@ -378,7 +378,7 @@ fn checkers_reject_corruption() {
         db.open(true).await.unwrap();
         let blobs = BlobResolver { db: &db };
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-        let def: CreateTable = serde_json::from_value(json!({
+        let def: api::NewTable = serde_json::from_value(json!({
             "name": "t",
             "columns": [
                 {"name": "id", "type": "int", "nullable": false},
@@ -440,11 +440,11 @@ async fn begin(db: &Arc<Db>) -> Txn {
     db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap()
 }
 
-fn table_def(v: Json) -> CreateTable {
+fn table_def(v: Json) -> api::NewTable {
     serde_json::from_value(v).unwrap()
 }
 
-fn index_spec(v: Json) -> IndexSpec {
+fn index_spec(v: Json) -> api::NewIndex {
     serde_json::from_value(v).unwrap()
 }
 
@@ -452,7 +452,7 @@ fn small() -> Backfill {
     Backfill { batch_rows: 7, ..Backfill::default() }
 }
 
-fn column(v: Json) -> ColumnSpec {
+fn column(v: Json) -> api::Column {
     serde_json::from_value(v).unwrap()
 }
 
@@ -875,7 +875,7 @@ async fn put_rows(t: &mut Txn, table: &str, ids: std::ops::Range<i64>) {
     }
 }
 
-fn rg_table() -> CreateTable {
+fn rg_table() -> api::NewTable {
     table_def(json!({
         "name": "r",
         "columns": [{"name": "id", "type": "int"}, {"name": "g", "type": "int"}],
@@ -956,7 +956,7 @@ fn index_backfill_reads_every_row() {
     });
 }
 
-fn people_table() -> CreateTable {
+fn people_table() -> api::NewTable {
     table_def(json!({
         "name": "p",
         "columns": [
@@ -983,7 +983,7 @@ async fn people(seed: u64, n: i64) -> Arc<Db> {
     db
 }
 
-async fn start_build(db: &Arc<Db>, spec: &IndexSpec) -> IndexDef {
+async fn start_build(db: &Arc<Db>, spec: &api::NewIndex) -> IndexDef {
     let mut t = begin(db).await;
     let idx = begin_index(&mut t, "p", spec).await.unwrap();
     db.commit(t.into_request()).await.unwrap();
@@ -1253,7 +1253,7 @@ fn building_index_checker_rejects_corruption() {
     });
 }
 
-fn members_table() -> CreateTable {
+fn members_table() -> api::NewTable {
     table_def(json!({
         "name": "people",
         "columns": [

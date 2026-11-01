@@ -11,7 +11,8 @@ mod common;
 
 use baserunna::client::Client;
 use baserunna::meta::SignupPolicy;
-use baserunna::util::{b64, sha256};
+use baserunna::util::sha256;
+use baserunna_api::b64;
 use bytes::Bytes;
 use common::step;
 use serde_json::json;

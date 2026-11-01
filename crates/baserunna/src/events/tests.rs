@@ -879,7 +879,7 @@ mod query_semantics {
                 {"name": "time", "type": "time"}, {"name": "uid", "type": "int"}, {"name": "alias", "type": "string"}
             ])))
             .await;
-            let tdef: crate::table::CreateTable = serde_json::from_value(json!({"name": "people",
+            let tdef: baserunna_api::NewTable = serde_json::from_value(json!({"name": "people",
                 "columns": [{"name": "id", "type": "int"}, {"name": "plan", "type": "string"}],
                 "primary_key": ["id"]}))
             .unwrap();
@@ -918,7 +918,7 @@ mod query_semantics {
             let (_e, db, _id) =
                 setup(def(json!([{"name": "time", "type": "time"}, {"name": "uid", "type": "int"}]))).await;
             for name in ["people", "teams"] {
-                let tdef: crate::table::CreateTable = serde_json::from_value(json!({"name": name,
+                let tdef: baserunna_api::NewTable = serde_json::from_value(json!({"name": name,
                     "columns": [{"name": "id", "type": "int"}, {"name": "plan", "type": "string"}],
                     "primary_key": ["id"]}))
                 .unwrap();
@@ -2981,7 +2981,7 @@ mod answers {
         rt().block_on(async {
             let (eng, _store, _env) = engine(1, cfg());
             let db = create_db(&eng, "d").await;
-            let tdef: crate::table::CreateTable = serde_json::from_value(json!({"name": "people",
+            let tdef: baserunna_api::NewTable = serde_json::from_value(json!({"name": "people",
                 "columns": [{"name": "id", "type": "string"}, {"name": "score", "type": "json"}],
                 "primary_key": ["id"]}))
             .unwrap();

@@ -1196,7 +1196,8 @@ fn handles_are_shared_until_idle_and_gone_after_purge() {
 
 #[test]
 fn op_batches_limits_and_defaults() {
-    use crate::ops::{Encoding, Op, OpCtx, exec_ops, make_value};
+    use crate::ops::{Op, OpCtx, exec_ops, make_value};
+    use baserunna_api::Encoding;
     rt().block_on(async {
         let (eng, _store) = delayed_engine("a");
         let db = eng.db("d");

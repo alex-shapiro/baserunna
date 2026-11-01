@@ -55,26 +55,26 @@ pub struct Record {
     /// Append time in milliseconds since the Unix epoch.
     pub time_ms: u64,
     pub headers: BTreeMap<String, String>,
-    pub body: Body,
+    pub body: RecordBody,
 }
 
 #[derive(Clone, Debug)]
-pub enum Body {
+pub enum RecordBody {
     Json(Box<RawValue>),
     Bytes(Bytes),
 }
 
-impl PartialEq for Body {
-    fn eq(&self, other: &Body) -> bool {
+impl PartialEq for RecordBody {
+    fn eq(&self, other: &RecordBody) -> bool {
         match (self, other) {
-            (Body::Json(a), Body::Json(b)) => a.get() == b.get(),
-            (Body::Bytes(a), Body::Bytes(b)) => a == b,
+            (RecordBody::Json(a), RecordBody::Json(b)) => a.get() == b.get(),
+            (RecordBody::Bytes(a), RecordBody::Bytes(b)) => a == b,
             _ => false,
         }
     }
 }
 
-impl Eq for Body {}
+impl Eq for RecordBody {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordPage {
@@ -193,8 +193,8 @@ impl OpResult {
             other => return Err(mismatch("read_stream", &other)),
         };
         let json = |r: &Record| match &r.body {
-            Body::Json(j) => decode("stream record", j),
-            Body::Bytes(_) => {
+            RecordBody::Json(j) => decode("stream record", j),
+            RecordBody::Bytes(_) => {
                 Err(Error::Decode { what: "stream record".into(), reason: "the record is not JSON".into() })
             }
         };
@@ -292,8 +292,8 @@ fn decode_result(op: &Op, r: &api::OpResult) -> Result<OpResult, String> {
 
 fn record(r: api::StreamRecord<Box<RawValue>>) -> Result<Record, String> {
     let body = match (r.json, r.value) {
-        (Some(j), None) => Body::Json(j),
-        (None, Some(v)) => Body::Bytes(bytes(&v)?),
+        (Some(j), None) => RecordBody::Json(j),
+        (None, Some(v)) => RecordBody::Bytes(bytes(&v)?),
         _ => return Err(format!("record {} needs exactly one of json and value", r.seq)),
     };
     Ok(Record { seq: r.seq, time_ms: r.time, headers: r.headers, body })

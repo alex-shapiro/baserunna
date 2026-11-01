@@ -10,12 +10,12 @@ use super::{
 use crate::engine::{Committed, Consistency, Db, Isolation, Retention, StreamState};
 use crate::error::{Error, Result};
 use crate::node::Node;
-use crate::ops::Encoding;
-use crate::stream::{self, AppendTo, Body, NewRecord, ReadOut, ReadSpec};
+use crate::stream::{self, AppendTo, Body, ReadOut, ReadSpec};
 use axum::Router;
 use axum::extract::{Extension, Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use baserunna_api::{Encoding, NewRecord};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::Deserialize;

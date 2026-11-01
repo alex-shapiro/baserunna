@@ -10,8 +10,8 @@ use crate::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn
 use crate::error::{Error, Result};
 use crate::meta::{self, DbRecord, DbRef, MetaCmd};
 use crate::node::Node;
-use crate::ops::{self, Encoding, EncodingExt, Op, OpCtx, exec_ops, user_key};
-use crate::table::{self, BlobResolver, ColumnSpec, IndexSpec, InsertMode, Query, Selection};
+use crate::ops::{self, EncodingExt, Op, OpCtx, exec_ops, user_key};
+use crate::table::{self, BlobResolver, InsertMode, Query, Selection};
 use crate::txns::OpenTxn;
 use axum::Router;
 use axum::body::Body;
@@ -63,7 +63,7 @@ pub(super) fn param<'a>(p: &'a HashMap<String, String>, k: &str) -> Result<&'a s
     p.get(k).map(|s| s.as_str()).ok_or_else(|| Error::invalid(format!("missing path parameter {k}")))
 }
 
-fn op_ctx<'a>(node: &Node, ctx: &'a DbCtx, enc: Encoding) -> OpCtx<'a> {
+fn op_ctx<'a>(node: &Node, ctx: &'a DbCtx, enc: api::Encoding) -> OpCtx<'a> {
     OpCtx {
         db: &ctx.db,
         encoding: enc,
@@ -198,10 +198,10 @@ async fn delete_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
     Ok(axum::Json(json!({})))
 }
 
-pub(super) fn encoding_param(q: &Params) -> Result<Encoding> {
+pub(super) fn encoding_param(q: &Params) -> Result<api::Encoding> {
     match q.get("encoding").map(|s| s.as_str()) {
-        None | Some("utf8") => Ok(Encoding::Utf8),
-        Some("base64") => Ok(Encoding::Base64),
+        None | Some("utf8") => Ok(api::Encoding::Utf8),
+        Some("base64") => Ok(api::Encoding::Base64),
         Some(o) => Err(Error::invalid(format!("unknown encoding {o:?}"))),
     }
 }
@@ -790,7 +790,7 @@ async fn add_column(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
-    JsonBody(c): JsonBody<ColumnSpec>,
+    JsonBody(c): JsonBody<api::Column>,
 ) -> Result<J> {
     let name = param(&p, "t")?.to_string();
     let (s, v) = with_txn!(node, ctx, |t| table::add_column(t, &name, &c).await);
@@ -812,7 +812,7 @@ async fn add_index(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
-    JsonBody(i): JsonBody<IndexSpec>,
+    JsonBody(i): JsonBody<api::NewIndex>,
 ) -> Result<J> {
     ctx.require_write()?;
     let name = param(&p, "t")?.to_string();

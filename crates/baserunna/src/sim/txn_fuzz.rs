@@ -2,10 +2,9 @@
 
 use super::{Sim, SimConfig, SimResponse, openapi_check};
 use crate::engine::KeyRange;
-use crate::ops::Encoding;
-use crate::table::RangeSpec;
 use crate::table::tuple::Key as TKey;
-use crate::util::{b64, sha256};
+use crate::util::sha256;
+use baserunna_api::{Encoding, RangeSpec, b64};
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{Map, Value as Json, json};

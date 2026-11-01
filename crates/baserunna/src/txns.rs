@@ -4,8 +4,8 @@
 use crate::engine::memory::{self, Held, MemoryGate};
 use crate::engine::{Engine, Txn, Version};
 use crate::error::{Error, Result};
-use crate::ops::Encoding;
 use crate::util::{DetHashMap, TtlCache};
+use baserunna_api::Encoding;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Weak};

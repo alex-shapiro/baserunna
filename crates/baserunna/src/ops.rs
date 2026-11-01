@@ -2,10 +2,9 @@
 
 use crate::engine::{Appended, BlobRef, Db, KeyRange, ReadValue, Ttl, Txn, Value, blob};
 use crate::error::{Error, Result};
-use crate::stream::{self, AppendTo, NewRecord, ReadSpec};
+use crate::stream::{self, AppendTo, ReadSpec};
 use crate::table::{self, BlobResolver, Expiry, InsertMode, Query, SPACE_KV, Selection};
-use crate::util::b64;
-use baserunna_api::{self as api, OpResult};
+use baserunna_api::{self as api, OpResult, b64};
 use bytes::Bytes;
 use serde_json::{Value as Json, json};
 use std::ops::Bound;
@@ -15,8 +14,6 @@ pub const MAX_USER_KEY: usize = 4096;
 pub const MAX_SCAN_LIMIT: usize = api::PAGE_MAX;
 pub const MAX_TXN_OPS: usize = 10_000;
 pub const MAX_TTL_MS: u64 = 10 * 365 * 24 * 3_600_000;
-
-pub use baserunna_api::Encoding;
 
 pub trait EncodingExt {
     fn decode(&self, s: &str, what: &str) -> Result<Vec<u8>>;
@@ -29,11 +26,13 @@ pub trait EncodingExt {
     fn text(&self, b: &[u8]) -> (Option<String>, Option<String>);
 }
 
-impl EncodingExt for Encoding {
+impl EncodingExt for api::Encoding {
     fn decode(&self, s: &str, what: &str) -> Result<Vec<u8>> {
         match self {
-            Encoding::Utf8 => Ok(s.as_bytes().to_vec()),
-            Encoding::Base64 => b64::decode(s).ok_or_else(|| Error::invalid(format!("{what} is not valid base64"))),
+            api::Encoding::Utf8 => Ok(s.as_bytes().to_vec()),
+            api::Encoding::Base64 => {
+                b64::decode(s).ok_or_else(|| Error::invalid(format!("{what} is not valid base64")))
+            }
         }
     }
 
@@ -46,11 +45,11 @@ impl EncodingExt for Encoding {
 
     fn text(&self, b: &[u8]) -> (Option<String>, Option<String>) {
         match self {
-            Encoding::Utf8 => match std::str::from_utf8(b) {
+            api::Encoding::Utf8 => match std::str::from_utf8(b) {
                 Ok(s) => (Some(s.to_string()), None),
                 Err(_) => (None, Some(b64::encode(b))),
             },
-            Encoding::Base64 => (Some(b64::encode(b)), None),
+            api::Encoding::Base64 => (Some(b64::encode(b)), None),
         }
     }
 }
@@ -147,7 +146,7 @@ pub enum Op {
     },
     Append {
         stream: String,
-        records: Vec<NewRecord>,
+        records: Vec<api::NewRecord>,
         expect_seq: Option<u64>,
         create: bool,
     },
@@ -303,7 +302,7 @@ fn batch_limit(limit: Option<usize>) -> Result<Option<usize>> {
 /// Context for executing ops.
 pub struct OpCtx<'a> {
     pub db: &'a Arc<Db>,
-    pub encoding: Encoding,
+    pub encoding: api::Encoding,
     pub access: crate::meta::Access,
     /// Blob values up to this size are returned inline in JSON.
     pub json_value_max: u64,
@@ -325,7 +324,12 @@ pub fn user_key(k: &[u8]) -> Result<Bytes> {
 }
 
 /// Builds an internal [`KeyRange`] in the user KV keyspace.
-pub fn user_range(enc: Encoding, prefix: Option<&str>, start: Option<&str>, end: Option<&str>) -> Result<KeyRange> {
+pub fn user_range(
+    enc: api::Encoding,
+    prefix: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> Result<KeyRange> {
     let space = [SPACE_KV];
     let space_end = Bytes::from_static(&[SPACE_KV + 1]);
     let mk = |b: &[u8]| -> Bytes {

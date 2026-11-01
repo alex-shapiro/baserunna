@@ -5,7 +5,8 @@
 
 use super::super::client::{Client, ZOMBIE_WAIT_MS};
 use super::super::{Sim, SimConfig};
-use crate::util::{b64, sha256};
+use crate::util::sha256;
+use baserunna_api::b64;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use serde_json::json;

@@ -738,7 +738,7 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
     scope.extend_from_slice(req.method().as_str().as_bytes());
     scope.push(0);
     scope.extend_from_slice(req.uri().to_string().as_bytes());
-    let key = format!("{id}:{}", crate::util::b64::hex(&crate::util::sha256(&scope)));
+    let key = format!("{id}:{}", api::b64::hex(&crate::util::sha256(&scope)));
     match node.forwards.deliver(&key) {
         Delivery::First(slot) => {
             let (parts, body) = next.run(req).await.into_parts();

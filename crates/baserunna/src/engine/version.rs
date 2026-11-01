@@ -1131,8 +1131,8 @@ impl ChangeCursor {
         let p = &self.pos;
         match (p.kind, self.floor) {
             (ChangePos::END, _) => p.seq.to_string(),
-            (k, 0) => format!("{}.{k}.{}", p.seq, crate::util::b64::encode_url(&p.key)),
-            (k, f) => format!("{}.{k}.{}.{f}", p.seq, crate::util::b64::encode_url(&p.key)),
+            (k, 0) => format!("{}.{k}.{}", p.seq, baserunna_api::b64::encode_url(&p.key)),
+            (k, f) => format!("{}.{k}.{}.{f}", p.seq, baserunna_api::b64::encode_url(&p.key)),
         }
     }
 
@@ -1147,7 +1147,7 @@ impl ChangeCursor {
                     None => 0,
                     Some(f) => f.parse().ok().filter(|f| *f > 0)?,
                 };
-                let key = Bytes::from(crate::util::b64::decode_url(key)?);
+                let key = Bytes::from(baserunna_api::b64::decode_url(key)?);
                 Some(ChangeCursor { pos: ChangePos { seq, kind, key }, floor })
             }
             _ => None,

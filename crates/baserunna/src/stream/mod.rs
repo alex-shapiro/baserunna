@@ -9,17 +9,15 @@ use crate::catalog::names_page;
 use crate::engine::stream::{self as es, StreamIter};
 use crate::engine::{KeyRange, Record, Retention, Seek, StreamOp, StreamState, Txn, Value};
 use crate::error::{Error, Result};
-use crate::ops::{Encoding, EncodingExt};
-use crate::util::b64;
+use crate::ops::EncodingExt;
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
-use baserunna_api as api;
+use baserunna_api::{self as api, b64};
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json, json};
 use std::collections::BTreeMap;
 
-pub use baserunna_api::NewRecord;
 pub use filter::Filter;
 
 pub const SPACE_CATALOG: u8 = 0x05;
@@ -164,7 +162,7 @@ impl Body {
 }
 
 /// Converts a record as a client writes it into its stored body.
-pub fn record_body(r: NewRecord, enc: Encoding) -> Result<Body> {
+pub fn record_body(r: api::NewRecord, enc: api::Encoding) -> Result<Body> {
     let mut b = match (r.value, r.json) {
         (Some(v), None) => Body::text(enc.decode(&v, "value")?),
         (None, Some(j)) => Body::json(&j),
@@ -213,7 +211,7 @@ pub fn parse_lines(data: &Bytes, json: bool) -> Result<Vec<Body>> {
 }
 
 /// A record as reads return it.
-pub fn record(r: &Record, b: &Body, enc: Encoding) -> api::StreamRecord {
+pub fn record(r: &Record, b: &Body, enc: api::Encoding) -> api::StreamRecord {
     let mut out = api::StreamRecord {
         seq: r.seq,
         time: r.time_ms,
@@ -230,7 +228,7 @@ pub fn record(r: &Record, b: &Body, enc: Encoding) -> api::StreamRecord {
     out
 }
 
-pub fn record_json(r: &Record, b: &Body, enc: Encoding) -> Json {
+pub fn record_json(r: &Record, b: &Body, enc: api::Encoding) -> Json {
     serde_json::to_value(record(r, b, enc)).expect("stream records serialize")
 }
 

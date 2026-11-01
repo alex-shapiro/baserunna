@@ -177,7 +177,7 @@ async fn tables_rows_streams_and_keys_round_trip_through_the_server() {
         pages(&db, Op::query::<Item>("a")).await.into_iter().flat_map(|r| r.rows::<Item>().unwrap()).collect();
     assert_eq!(a.len(), 1250, "a prefix query pages through every matching row");
     assert!(a.iter().all(|i| i.owner == "a") && a.windows(2).all(|w| w[0].id < w[1].id));
-    let all = pages(&db, Op::query::<Item>(())).await;
+    let all = pages(&db, Op::query_all::<Item>()).await;
     assert_eq!((all.len(), all.into_iter().map(|r| r.rows::<Item>().unwrap().len()).sum::<usize>()), (3, 2500));
 
     let set = serde_json::json!({"label": "x"});
@@ -466,4 +466,16 @@ async fn a_cancelled_abort_still_frees_the_open_transaction_slot() {
     let begun = txn.run_one(Op::get("k")).await;
     assert!(begun.is_ok(), "a new transaction begins: {begun:?}");
     txn.abort().await;
+}
+
+#[tokio::test]
+async fn a_prefix_of_none_matches_only_rows_whose_key_is_null() {
+    let (db, _) = node("").await;
+    db.write(&[Op::insert(&item("a", 1)), Op::insert(&item("b", 2))]).await.unwrap();
+    let owner: Option<&str> = None;
+    let none = db.read_one(Op::query::<Item>(owner)).await.unwrap().rows::<Item>().unwrap();
+    assert!(none.is_empty(), "a query for a missing owner read {none:?}");
+    db.write(&[Op::delete_rows::<Item>(owner)]).await.unwrap();
+    let left = db.read_one(Op::query::<Item>("a")).await.unwrap().rows::<Item>().unwrap();
+    assert_eq!(left.len(), 1, "deleting the rows of a missing owner deleted other rows");
 }

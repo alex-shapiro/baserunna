@@ -136,17 +136,13 @@ fn json(v: &impl Serialize) -> Json {
     serde_json::to_value(v).expect("rows and keys serialize to JSON")
 }
 
-/// Converts a key prefix to its column values, treating `()` as an empty prefix.
-fn columns(v: &impl Serialize) -> Vec<Json> {
-    match json(v) {
-        Json::Null => Vec::new(),
+/// Converts a key prefix, one value or a tuple of the leading key columns, to its column values.
+fn prefix(eq: &impl Serialize) -> api::Selection {
+    let eq = match json(eq) {
         Json::Array(a) => a,
         one => vec![one],
-    }
-}
-
-fn prefix(eq: &impl Serialize) -> api::Selection {
-    api::Selection { eq: columns(eq), ..api::Selection::default() }
+    };
+    api::Selection { eq, ..api::Selection::default() }
 }
 
 impl Op {
@@ -197,16 +193,27 @@ impl Op {
         Op::DeleteRow { table: R::TABLE.into(), pk: json(&pk) }
     }
 
-    /// Deletes the rows of `R` whose leading primary key columns equal `eq`, a value, a tuple, or
-    /// `()` for every row.
+    /// Deletes the rows of `R` whose leading primary key columns equal `eq`, a value or a tuple.
     pub fn delete_rows<R: Row>(eq: impl Serialize) -> Op {
         Op::DeleteRows { table: R::TABLE.into(), selection: prefix(&eq) }
     }
 
-    /// Reads the first page of rows of `R` whose leading primary key columns equal `eq`, a value,
-    /// a tuple, or `()` for every row.
+    pub fn delete_all_rows<R: Row>() -> Op {
+        Op::DeleteRows { table: R::TABLE.into(), selection: api::Selection::default() }
+    }
+
+    /// Reads the first page of rows of `R` whose leading primary key columns equal `eq`, a value
+    /// or a tuple.
     pub fn query<R: Row>(eq: impl Serialize) -> Op {
-        let selection = prefix(&eq);
+        Op::query_rows::<R>(prefix(&eq))
+    }
+
+    /// Reads the first page of every row of `R`.
+    pub fn query_all<R: Row>() -> Op {
+        Op::query_rows::<R>(api::Selection::default())
+    }
+
+    fn query_rows<R: Row>(selection: api::Selection) -> Op {
         Op::QueryRows { table: R::TABLE.into(), selection, limit: api::PAGE_MAX, reverse: false, cursor: None }
     }
 

@@ -315,7 +315,7 @@ async fn read_ledger(db: &Db) -> Result<(Vec<Account>, Vec<Transfer>, u64), Erro
 
 async fn ledger(txn: &mut Txn) -> Result<(Vec<Account>, Vec<Transfer>, u64), Error> {
     let (mut accounts, mut transfers, mut count) = (Vec::new(), Vec::new(), 0);
-    let mut pending = vec![Op::query::<Account>(()), Op::read_stream(TRANSFERS, 0), Op::get(TRANSFER_COUNT)];
+    let mut pending = vec![Op::query_all::<Account>(), Op::read_stream(TRANSFERS, 0), Op::get(TRANSFER_COUNT)];
     while !pending.is_empty() {
         let results = txn.run(&pending).await?;
         let mut next = Vec::new();

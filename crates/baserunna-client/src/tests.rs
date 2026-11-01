@@ -485,7 +485,8 @@ fn row_and_stream_ops_serialize_as_the_api_takes_them() {
         ),
         (Op::delete_rows::<Thing>(["a"]), json!({"op": "delete_rows", "table": "things", "where": {"eq": ["a"]}})),
         (Op::delete_rows::<Thing>("a"), json!({"op": "delete_rows", "table": "things", "where": {"eq": ["a"]}})),
-        (Op::query::<Thing>(()), json!({"op": "query_rows", "table": "things", "limit": 1000})),
+        (Op::query_all::<Thing>(), json!({"op": "query_rows", "table": "things", "limit": 1000})),
+        (Op::query::<Thing>(None::<&str>), json!({"op": "query_rows", "table": "things", "eq": [null], "limit": 1000})),
         (
             Op::append("s", &[&row]),
             json!({"op": "append", "stream": "s", "records": [{"json": {"id": "a", "n": 1}}], "create": true}),
@@ -499,7 +500,7 @@ fn row_and_stream_ops_serialize_as_the_api_takes_them() {
         let back: api::Op = serde_json::from_value(want).unwrap();
         assert_eq!(back, op.to_api(), "the server parses what the client sends");
     }
-    assert!(Op::upsert(&row).is_write() && !Op::query::<Thing>(()).is_write() && !Op::read_stream("s", 0).is_write());
+    assert!(Op::upsert(&row).is_write() && !Op::query_all::<Thing>().is_write() && !Op::read_stream("s", 0).is_write());
 }
 
 #[test]
@@ -539,7 +540,7 @@ async fn rows_and_records_decode_into_their_types_and_name_what_is_malformed() {
         {"records":[{"seq":0,"time":5,"json":{"id":"d","n":4}},{"seq":1,"time":6,"value":"aGk="}],"next_seq":2,"done":true}
     ]}"#;
     let (c, _) = script(vec![resp(200, &[], body)]);
-    let ops = [Op::get_row::<Thing>("a"), Op::get_row::<Thing>("z"), Op::query::<Thing>(()), Op::read_stream("s", 0)];
+    let ops = [Op::get_row::<Thing>("a"), Op::get_row::<Thing>("z"), Op::query_all::<Thing>(), Op::read_stream("s", 0)];
     let [found, missing, rows, records]: [OpResult; 4] = c.db("s").read(&ops).await.unwrap().try_into().unwrap();
     assert_eq!(found.clone().row::<Thing>().unwrap(), Some(Thing { id: "a".into(), n: 2 }));
     assert_eq!(missing.row::<Thing>().unwrap(), None);

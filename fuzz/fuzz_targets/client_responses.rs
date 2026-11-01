@@ -62,9 +62,9 @@ fuzz_target!(|data: &[u8]| {
         Op::Check { key: Bytes::from_static(b"a"), expect: Expect::Absent },
         Op::Increment { key: Bytes::from_static(b"n"), by: 1 },
         Op::get_row::<Item>(1),
-        Op::query::<Item>(()),
+        Op::query_all::<Item>(),
         Op::update::<Item>(1, &serde_json::json!({"label": "x"})),
-        Op::delete_rows::<Item>(()),
+        Op::delete_all_rows::<Item>(),
         Op::Append { stream: "s".into(), records: vec![NewRecord::Bytes(Bytes::from_static(b"r"))], create: true },
         Op::read_stream("s", 0),
     ];

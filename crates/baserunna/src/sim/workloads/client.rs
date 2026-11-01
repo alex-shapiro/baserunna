@@ -16,10 +16,10 @@ use baserunna_client::{
     Change, ChangesRequest, Client, Db, Entry, Error, Expect, KeyRange, Op, OpResult, Row, Txn, TxnError, Value,
 };
 use bytes::Bytes;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const DB: &str = "client";
 const ACCOUNTS: u64 = 4;
@@ -188,8 +188,8 @@ struct Transfer {
 /// Outcomes of ledger transactions.
 #[derive(Default)]
 struct Tally {
-    committed: AtomicU64,
-    unknown: AtomicU64,
+    committed: Mutex<BTreeSet<String>>,
+    unknown: Mutex<BTreeSet<String>>,
 }
 
 #[derive(Debug)]
@@ -247,11 +247,11 @@ async fn transfer(sim: Arc<Sim>, db: Db, i: usize, steps: usize, tally: Arc<Tall
         };
         match r {
             Ok(()) => {
-                tally.committed.fetch_add(1, Ordering::Relaxed);
+                tally.committed.lock().insert(t.id.clone());
             }
             Err(LedgerError::Overdrawn) => {}
             Err(LedgerError::Client(e)) if e.outcome() == Outcome::Unknown => {
-                tally.unknown.fetch_add(1, Ordering::Relaxed);
+                tally.unknown.lock().insert(t.id.clone());
             }
             Err(LedgerError::Client(e)) if e.is_transient(false) || e.code() == Some(ErrorCode::TxnNotFound) => {}
             Err(LedgerError::Client(e)) => return Err(format!("ledger {i} transfer {}: {e}", t.id)),
@@ -277,21 +277,28 @@ async fn move_funds(txn: &mut Txn, t: &Transfer) -> Result<(), LedgerError> {
     Ok(())
 }
 
-/// Checks that balances are conserved and that each acknowledged transfer applied exactly once.
+/// Checks that balances are conserved, that each acknowledged transfer applied exactly once, and
+/// that no transfer applied unless it was acknowledged or its outcome was unknown.
 async fn audit(sim: &Arc<Sim>, db: &Db, tally: &Tally) -> Result<(), String> {
     let (accounts, transfers, count) = retry(sim, || read_ledger(db)).await?;
     let total: i64 = accounts.iter().map(|a| a.balance).sum();
     expect(accounts.len() as u64 == ACCOUNTS, format!("{} of {ACCOUNTS} accounts", accounts.len()))?;
     expect(total == ACCOUNTS as i64 * OPENING_BALANCE, format!("balances sum to {total}"))?;
     expect(accounts.iter().all(|a| a.balance >= 0), format!("an account is overdrawn: {accounts:?}"))?;
-    let ids: BTreeSet<&str> = transfers.iter().map(|t| t.id.as_str()).collect();
-    expect(ids.len() == transfers.len(), "a transfer was logged twice")?;
     expect(count == transfers.len() as u64, format!("{count} counted transfers but {} logged", transfers.len()))?;
-    let (committed, unknown) = (tally.committed.load(Ordering::Relaxed), tally.unknown.load(Ordering::Relaxed));
-    expect(
-        (committed..=committed + unknown).contains(&count),
-        format!("{count} transfers applied, {committed} acknowledged and {unknown} unknown"),
-    )
+    let logged: Vec<&str> = transfers.iter().map(|t| t.id.as_str()).collect();
+    check_transfers(&tally.committed.lock(), &tally.unknown.lock(), &logged)
+}
+
+/// Checks that the `logged` transfer IDs hold each `committed` ID once, and otherwise only IDs whose
+/// outcome was `unknown`.
+fn check_transfers(committed: &BTreeSet<String>, unknown: &BTreeSet<String>, logged: &[&str]) -> Result<(), String> {
+    let ids: BTreeSet<&str> = logged.iter().copied().collect();
+    expect(ids.len() == logged.len(), "a transfer was logged twice")?;
+    let lost: Vec<&String> = committed.iter().filter(|id| !ids.contains(id.as_str())).collect();
+    expect(lost.is_empty(), format!("acknowledged transfers {lost:?} were not applied"))?;
+    let stray: Vec<&&str> = ids.iter().filter(|id| !committed.contains(**id) && !unknown.contains(**id)).collect();
+    expect(stray.is_empty(), format!("transfers {stray:?} applied after they failed"))
 }
 
 /// Reads the accounts, the logged transfers after the opening record, and the transfer count.
@@ -519,4 +526,23 @@ async fn accounts(sim: &Arc<Sim>, owner: &Client) -> Result<(), String> {
         matches!(code, Some(ErrorCode::PermissionDenied | ErrorCode::NotFound)),
         format!("a removed member's write fails with {code:?}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_transfers;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn the_ledger_audit_finds_lost_stray_and_repeated_transfers() {
+        let set = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        let (committed, unknown) = (set(&["a"]), set(&["b"]));
+        assert!(check_transfers(&committed, &unknown, &["a"]).is_ok());
+        assert!(check_transfers(&committed, &unknown, &["a", "b"]).is_ok());
+        let lost = check_transfers(&committed, &unknown, &["b"]).unwrap_err();
+        assert!(lost.contains("[\"a\"] were not applied"), "{lost}");
+        let stray = check_transfers(&committed, &unknown, &["a", "c"]).unwrap_err();
+        assert!(stray.contains("[\"c\"] applied after they failed"), "{stray}");
+        assert!(check_transfers(&committed, &unknown, &["a", "a"]).is_err());
+    }
 }

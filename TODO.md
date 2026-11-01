@@ -286,11 +286,6 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       live members. When views differ, such as after a node joins or while a
       peer is suspect, a commit reaches another node and fails with
       `txn_not_found`. Encode the node in the transaction ID and forward by it.
-- [ ] **Let a client abort a transaction whose begin outcome is unknown.** The
-      server assigns the transaction ID in the `begin` response, so if that
-      response is lost, `baserunna_client::Txn` cannot abort the transaction and
-      it holds one of the user's open transaction slots until its idle timeout.
-      Accept a client-chosen transaction ID on `begin`.
 - [ ] **Fix the `events` fuzz target**, which no longer compiles because
       `PartRef` has no `min_version` and `max_version` fields.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the

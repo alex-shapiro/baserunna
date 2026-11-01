@@ -140,6 +140,12 @@ impl OpenTxns {
         let guard = open.txn.clone().try_lock_owned().map_err(|_| Error::internal("a new transaction is in use"))?;
         let mut g = self.open.lock();
         self.check_per_user(&g, user_id)?;
+        if g.contains_key(&id) {
+            return Err(Error::AlreadyExists(format!("transaction {id} is already open")));
+        }
+        if let Some(reason) = self.aborted.get(&id) {
+            return Err(Error::TxnNotFound(format!("transaction was aborted because {reason}")));
+        }
         g.insert(id, open.clone());
         Ok(TxnGuard { txns: self, open, guard, finished: false })
     }
@@ -167,6 +173,15 @@ impl OpenTxns {
             return Err(self.lost(id));
         }
         Ok(open)
+    }
+
+    /// Records that transaction `id` was aborted before it opened, so that a begin that arrives after
+    /// the abort fails instead of opening it.
+    pub fn abort_unopened(&self, id: &str) {
+        let open = self.open.lock();
+        if !open.contains_key(id) {
+            self.aborted.store(id.to_string(), Some("it was aborted before it began"), Instant::now());
+        }
     }
 
     fn lost(&self, id: &str) -> Error {

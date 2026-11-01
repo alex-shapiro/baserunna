@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tower::ServiceExt;
 
 /// How [`Router`] fails the next request to `fail_route`.
@@ -21,6 +22,8 @@ enum Fault {
     Drop,
     /// Sends the request and drops the response, reporting an unknown outcome.
     LoseResponse,
+    /// Sends the request and never returns its response, as if the caller cancelled the request.
+    Hang,
 }
 
 /// Transport that sends requests to an in-process router and can fail one route.
@@ -69,6 +72,10 @@ impl Transport for Router {
                 Fault::LoseResponse => {
                     Router::call(self.app.clone(), req).await;
                     Err(TransportError::Unknown("response lost".into()))
+                }
+                Fault::Hang => {
+                    Router::call(self.app.clone(), req).await;
+                    std::future::pending().await
                 }
             }
         })
@@ -306,6 +313,19 @@ async fn a_dropped_transaction_is_aborted_and_frees_its_open_transaction_slot() 
 }
 
 #[tokio::test]
+async fn a_cancelled_request_keeps_its_transaction_from_committing() {
+    let (db, router) = node(api::TxnOps::ROUTE).await;
+    let mut txn = db.begin();
+    txn.run_one(Op::get("k")).await.unwrap();
+    router.fail(api::TxnOps::ROUTE, Fault::Hang, 1);
+    let cancelled = tokio::time::timeout(Duration::from_millis(200), txn.run(&[Op::put("k", "cancelled")])).await;
+    assert!(cancelled.is_err(), "the request was cancelled");
+    let committed = txn.commit().await;
+    assert!(committed.is_err(), "a transaction with a cancelled request commits: {committed:?}");
+    assert_eq!(db.read_one(Op::get("k")).await.unwrap().entry().unwrap(), None);
+}
+
+#[tokio::test]
 async fn a_write_without_write_operations_checks_its_preconditions_and_commits_nothing() {
     let (db, _) = node("").await;
     assert_eq!(db.write(&[]).await.unwrap(), None);
@@ -315,6 +335,7 @@ async fn a_write_without_write_operations_checks_its_preconditions_and_commits_n
     let e = db.write(&[absent]).await.unwrap_err();
     assert_eq!(e.code(), Some(api::ErrorCode::PreconditionFailed), "{e}");
 }
+
 #[tokio::test]
 async fn a_write_that_changes_nothing_commits_nothing() {
     let (db, _) = node("").await;
@@ -330,4 +351,56 @@ async fn a_write_that_changes_nothing_commits_nothing() {
         txn.write([op]);
         assert_eq!(txn.commit().await, Ok(None));
     }
+}
+
+#[tokio::test]
+async fn a_transaction_whose_begin_response_never_arrives_is_aborted() {
+    for fault in [Fault::LoseResponse, Fault::Hang] {
+        let (db, router) = node_with(api::BeginTxn::ROUTE, |c| c.txns_per_user = 1).await;
+        let client = db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() });
+        let db = client.db(db.name());
+        router.fail(api::BeginTxn::ROUTE, fault, 1);
+        let mut txn = db.begin();
+        let begun = tokio::time::timeout(Duration::from_millis(200), txn.run_one(Op::get("k"))).await;
+        assert!(!matches!(begun, Ok(Ok(_))), "the begin response never arrives: {begun:?}");
+        txn.abort().await;
+        let mut txn = db.begin();
+        let begun = txn.run_one(Op::get("k")).await;
+        assert!(begun.is_ok(), "a new transaction begins after the lost one is aborted: {begun:?}");
+        txn.abort().await;
+    }
+}
+
+#[tokio::test]
+async fn a_client_chosen_transaction_id_is_unique_and_hex() {
+    let (db, _) = node("").await;
+    let begin = |id: &str| {
+        let b = api::BeginRequest { txn_id: Some(id.into()), ..api::BeginRequest::default() };
+        let db = db.clone();
+        async move { db.client().send(&api::BeginTxn { db: db.name().into() }, &b).await }
+    };
+    let id = "0123456789abcdef0123456789abcdef";
+    assert_eq!(begin(id).await.unwrap().txn_id, id);
+    assert_eq!(begin(id).await.unwrap_err().code(), Some(api::ErrorCode::AlreadyExists));
+    for bad in ["0123456789ABCDEF0123456789ABCDEF", "abc", "../../commit"] {
+        assert_eq!(begin(bad).await.unwrap_err().code(), Some(api::ErrorCode::InvalidArgument), "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn a_begin_that_arrives_after_its_abort_does_not_open() {
+    let (db, router) = node_with(api::BeginTxn::ROUTE, |c| c.txns_per_user = 1).await;
+    let client = db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() });
+    let db = client.db(db.name());
+    router.fail(api::BeginTxn::ROUTE, Fault::Drop, 1);
+    let mut txn = db.begin();
+    assert!(txn.run_one(Op::get("k")).await.is_err());
+    txn.abort().await;
+    let late = router.dropped.lock().pop().unwrap();
+    let resp = Router::call(router.app.clone(), late).await;
+    assert_eq!(resp.status(), 404, "a begin delivered after its abort: {:?}", resp.body());
+    let mut txn = db.begin();
+    let begun = txn.run_one(Op::get("k")).await;
+    assert!(begun.is_ok(), "a new transaction begins: {begun:?}");
+    txn.abort().await;
 }

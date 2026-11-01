@@ -1268,7 +1268,7 @@ GET|PUT|DELETE /v1/dbs/{db}/kv/{*key} raw bytes; Range, If-Match, If-None-Match
 POST /v1/dbs/{db}/blobs stage a blob (streamed body)
 GET /v1/dbs/{db}/blobs/{blob_id} read a blob (Range)
 POST /v1/dbs/{db}/txn one-shot transaction
-POST /v1/dbs/{db}/transactions begin
+POST /v1/dbs/{db}/transactions begin (txn_id? chosen by the client to abort a lost begin)
 POST /v1/dbs/{db}/transactions/{id}/ops
 POST /v1/dbs/{db}/transactions/{id}/commit
 DELETE /v1/dbs/{db}/transactions/{id} abort

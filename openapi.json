@@ -155,7 +155,7 @@
       },
       "BeginRequest": {
         "additionalProperties": false,
-        "description": "Optional operations to execute in the new transaction.",
+        "description": "Optional operations to execute in the new transaction, and an optional client-chosen `txn_id` of 32 lowercase hex digits so that the client can abort the transaction if the response is lost.",
         "properties": {
           "encoding": {
             "enum": [
@@ -176,6 +176,9 @@
               "$ref": "#/components/schemas/Op"
             },
             "type": "array"
+          },
+          "txn_id": {
+            "type": "string"
           }
         },
         "required": [],

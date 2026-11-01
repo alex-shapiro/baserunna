@@ -2,7 +2,7 @@
 
 use crate::api::{self, Endpoint as _, ErrorCode, Outcome};
 use crate::result::decode_results;
-use crate::{Db, Error, Op, OpResult};
+use crate::{Db, Error, Op, OpResult, TransportError};
 
 /// Interactive serializable transaction on a [`Db`], begun by the first [`Txn::run`] that has
 /// operations.
@@ -13,18 +13,16 @@ use crate::{Db, Error, Op, OpResult};
 #[derive(Debug)]
 pub struct Txn {
     db: Db,
-    open: Option<Open>,
+    /// ID of the transaction once a request may have begun it on the server: the ID the client
+    /// chose, then the ID the server returned.
+    id: Option<String>,
+    /// Commit ID once the transaction began.
+    commit_id: Option<String>,
     writes: Vec<Op>,
     wrote: bool,
     failed: Option<Error>,
     /// Time of the first request, which bounds how long a commit status remains definitive.
     started: Option<tokio::time::Instant>,
-}
-
-#[derive(Debug)]
-struct Open {
-    id: String,
-    commit_id: String,
 }
 
 /// Commit of a write transaction.
@@ -49,7 +47,7 @@ impl TxnError for Error {
 
 impl Txn {
     pub(crate) fn new(db: Db) -> Txn {
-        Txn { db, open: None, writes: Vec::new(), wrote: false, failed: None, started: None }
+        Txn { db, id: None, commit_id: None, writes: Vec::new(), wrote: false, failed: None, started: None }
     }
 
     /// Executes `ops` and returns one result per operation.
@@ -63,23 +61,34 @@ impl Txn {
         self.wrote |= ops.iter().any(Op::is_write);
         self.started.get_or_insert_with(tokio::time::Instant::now);
         let api_ops = ops.iter().map(Op::to_api).collect();
-        let (path, sent) = match &self.open {
+        // The transaction counts as failed until the request completes, so that it cannot commit
+        // operations of a request that its caller cancelled.
+        let cancelled = TransportError::Unknown("a request on the transaction was cancelled".into());
+        self.failed = Some(Error::Transport(cancelled));
+        let (path, sent) = match &self.commit_id {
             None => {
+                let id = self.id.insert(self.db.client().random_id()).clone();
                 let e = api::BeginTxn { db: self.db.name().into() };
-                let b =
-                    api::BeginRequest { encoding: api::Encoding::Base64, ops: api_ops, ..api::BeginRequest::default() };
+                let b = api::BeginRequest {
+                    encoding: api::Encoding::Base64,
+                    ops: api_ops,
+                    txn_id: Some(id),
+                    ..api::BeginRequest::default()
+                };
                 let r = self.db.client().send(&e, &b).await.map(|r| {
-                    self.open = Some(Open { id: r.txn_id, commit_id: r.commit_id });
+                    (self.id, self.commit_id) = (Some(r.txn_id), Some(r.commit_id));
                     r.results
                 });
                 (e.path(), r)
             }
-            Some(o) => {
-                let e = api::TxnOps { db: self.db.name().into(), id: o.id.clone() };
+            Some(_) => {
+                let id = self.id.clone().expect("a begun transaction has an ID");
+                let e = api::TxnOps { db: self.db.name().into(), id };
                 (e.path(), self.db.client().send(&e, &api::OpsRequest { ops: api_ops }).await.map(|r| r.results))
             }
         };
-        let results = sent.inspect_err(|e| self.failed = Some(e.clone()))?;
+        self.failed = sent.as_ref().err().cloned();
+        let results = sent?;
         decode_results(ops, &results).map_err(|reason| Error::Malformed { path, reason })
     }
 
@@ -105,15 +114,15 @@ impl Txn {
             return Err(e);
         }
         let writes = std::mem::take(&mut self.writes);
-        let Some(open) = &self.open else {
+        let Some(commit_id) = self.commit_id.clone() else {
             return self.db.write(&writes).await;
         };
-        let e = api::CommitTxn { db: self.db.name().into(), id: open.id.clone() };
-        let commit_id = open.commit_id.clone();
+        let id = self.id.clone().expect("a begun transaction has an ID");
+        let e = api::CommitTxn { db: self.db.name().into(), id };
         let body = api::CommitRequest { ops: writes.iter().map(Op::to_api).collect() };
         let err = match self.db.client().send(&e, &body).await {
             Ok(c) => {
-                self.open = None;
+                self.id = None;
                 return Ok(Some(Committed { version: c.version, commit_id: c.commit_id, appends: c.appends }));
             }
             Err(e) if e.outcome() == Outcome::NotApplied => {
@@ -139,15 +148,10 @@ impl Txn {
         }
     }
 
-    /// Returns the ID of the transaction if it is still open on the server, and forgets it.
+    /// Returns the ID of the transaction if it may be open on the server, and forgets it.
     fn take_open(&mut self) -> Option<String> {
-        let open = self.open.take()?;
-        (!self.failed.as_ref().is_some_and(ends_txn)).then_some(open.id)
-    }
-
-    /// Returns true if a request on the transaction failed, so that nothing it ran can commit.
-    fn has_failed(&self) -> bool {
-        self.failed.is_some()
+        let id = self.id.take()?;
+        (!self.failed.as_ref().is_some_and(ends_txn)).then_some(id)
     }
 }
 
@@ -214,8 +218,9 @@ impl Retry {
     /// Returns the committed result, `Ok(None)` after a backoff if the transaction should run
     /// again, or the error that ends the loop.
     pub async fn finish<T, E: TxnError>(&mut self, txn: Txn, result: Result<T, E>) -> Result<Option<T>, E> {
-        // Only a failed request on `txn` is known to have applied nothing, whatever its outcome.
-        let applied_nothing = txn.has_failed();
+        // Only the error of a failed request on `txn` is known to have applied nothing, whatever its
+        // outcome, because the transaction never commits after it.
+        let failed = txn.failed.clone();
         let err = match result {
             Ok(v) => match txn.commit().await {
                 Ok(_) => return Ok(Some(v)),
@@ -226,7 +231,7 @@ impl Retry {
                 e
             }
         };
-        let restart = err.client_error().is_some_and(|e| restarts(e, applied_nothing));
+        let restart = err.client_error().is_some_and(|e| restarts(e, failed.as_ref() == Some(e)));
         let client = self.db.client();
         if !restart || self.attempt >= client.retry_policy().txn_attempts {
             return Err(err);

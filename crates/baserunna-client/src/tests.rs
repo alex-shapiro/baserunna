@@ -810,3 +810,24 @@ async fn a_replayed_read_is_malformed() {
     let (c, _) = script(vec![resp(200, &[], replayed)]);
     assert!(matches!(c.db("s").read_one(Op::get("k")).await, Err(Error::Malformed { .. })));
 }
+
+#[tokio::test(start_paused = true)]
+async fn retry_does_not_restart_after_an_unknown_outcome_outside_a_failed_transaction() {
+    let (c, s) = script(vec![
+        resp(201, &[], BEGUN),
+        api_err(503, "unavailable", "null"),
+        Err(TransportError::Unknown("lost".into())),
+        Err(TransportError::NotSent("down".into())),
+        resp(200, &[], "{}"),
+    ]);
+    let db = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() }).db("s");
+    let mut retry = db.retry();
+    let mut txn = db.begin();
+    txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
+    assert!(txn.run_one(Op::get("k")).await.is_err());
+    let outside = db.write(&put()).await.unwrap_err();
+    assert_eq!(outside.outcome(), Outcome::Unknown);
+    let r: Result<Option<()>, Error> = retry.finish(txn, Err(outside.clone())).await;
+    assert_eq!(r, Err(outside), "the outside write may have applied, so the loop must not run it again");
+    assert_eq!(sent(&s), 5);
+}

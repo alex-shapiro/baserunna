@@ -90,7 +90,11 @@ impl Txn {
         let Ok(results) = sent else {
             return Err(self.failed.clone().expect("a failed request is recorded"));
         };
-        let mut results = decode_results(&ops, &results).map_err(|reason| Error::Malformed { path, reason })?;
+        let mut results = decode_results(&ops, &results).map_err(|reason| {
+            let e = not_applied(&Error::Malformed { path, reason });
+            self.failed = Some(e.clone());
+            e
+        })?;
         Ok(results.split_off(queued))
     }
 

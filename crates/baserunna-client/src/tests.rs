@@ -896,3 +896,15 @@ async fn retry_restarts_after_a_request_of_its_transaction_times_out() {
     }
     assert_eq!(attempts, 2, "a transaction whose request timed out never commits, so it restarts");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_transaction_whose_results_do_not_decode_cannot_commit() {
+    let (c, s) = script(vec![resp(201, &[], BEGUN), resp(200, &[], r#"{"results":[]}"#), resp(200, &[], "{}")]);
+    let mut txn = c.db("s").begin();
+    txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
+    let e = txn.run_one(Op::put("k", "v")).await.unwrap_err();
+    assert!(matches!(&e, Error::NotApplied(cause) if matches!(**cause, Error::Malformed { .. })), "{e:?}");
+    assert_eq!(txn.commit().await.unwrap_err(), e, "a transaction with an undecodable response does not commit");
+    let methods: Vec<_> = requests(&s).into_iter().map(|r| r.0).collect();
+    assert_eq!(methods, ["POST", "POST", "DELETE"], "the transaction is aborted, not committed");
+}

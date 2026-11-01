@@ -167,6 +167,7 @@ impl Client {
         allowed_error: Option<api::ErrorCode>,
     ) -> Result<Option<E::Response>, Box<Failed>> {
         let idempotent = E::is_idempotent(body) || allowed_error.is_some();
+        let read_only = E::is_read_only(body);
         let path = endpoint.path();
         let body = body.encode();
         let mut attempt = 1;
@@ -179,7 +180,7 @@ impl Client {
             };
             let transient = err.is_transient(idempotent)
                 && !(E::conflict_ends_txn() && err.code() == Some(api::ErrorCode::Conflict));
-            if unresolved.is_none() && err.outcome() == api::Outcome::Unknown {
+            if unresolved.is_none() && err.outcome() == api::Outcome::Unknown && !read_only {
                 unresolved = Some(err.clone());
             }
             if !transient || attempt >= self.retry_policy.attempts {

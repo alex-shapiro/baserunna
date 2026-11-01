@@ -563,3 +563,11 @@ async fn a_write_whose_first_attempt_never_arrived_reports_the_servers_refusal()
     };
     assert_eq!(passes, 1, "a refused write is not run again: {r:?}");
 }
+
+#[tokio::test]
+async fn a_retried_read_reports_the_servers_answer() {
+    let (db, router) = node(api::GetTable::ROUTE).await;
+    router.fail(api::GetTable::ROUTE, Fault::LoseResponse, 1);
+    let e = db.get_table("missing").await.unwrap_err();
+    assert_eq!(e.code(), Some(api::ErrorCode::NotFound), "{e:?}");
+}

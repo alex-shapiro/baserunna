@@ -55,6 +55,11 @@ pub trait Endpoint {
     /// Returns true if repeating a successful request has no effect.
     fn is_idempotent(body: &Self::Body) -> bool;
 
+    /// Returns true if the request changes nothing, so that no failed attempt of it applied.
+    fn is_read_only(_body: &Self::Body) -> bool {
+        Self::METHOD == Method::GET
+    }
+
     /// Returns true if the request ends its transaction even if it fails with `conflict`, so that
     /// only a new transaction can succeed.
     fn conflict_ends_txn() -> bool {

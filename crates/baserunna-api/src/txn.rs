@@ -21,6 +21,10 @@ impl Endpoint for Txn {
         body.is_idempotent()
     }
 
+    fn is_read_only(body: &TxnRequest) -> bool {
+        !body.ops.iter().any(Op::is_write)
+    }
+
     fn path(&self) -> String {
         fill_route(Self::ROUTE, &[&self.db])
     }

@@ -122,7 +122,9 @@ async fn definitive<T: std::fmt::Debug, F: Future<Output = Result<T, Error>>>(
     for _ in 0..400 {
         match f().await {
             Ok(v) => return Err(format!("unexpected success {v:?}")),
-            Err(e) if e.is_transient(true) || matches!(e, Error::Transport(_)) => sim.sleep(1_000).await,
+            Err(e) if e.is_transient(true) || e.restarts_txn() || matches!(e, Error::Transport(_)) => {
+                sim.sleep(1_000).await
+            }
             Err(e) => return Ok(e.code()),
         }
     }
@@ -133,7 +135,9 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(sim: &Arc<Sim>, mut f: i
     for _ in 0..400 {
         match f().await {
             Ok(v) => return Ok(v),
-            Err(e) if e.is_transient(true) || matches!(e, Error::Transport(_)) => sim.sleep(1_000).await,
+            Err(e) if e.is_transient(true) || e.restarts_txn() || matches!(e, Error::Transport(_)) => {
+                sim.sleep(1_000).await
+            }
             Err(e) => return Err(e.to_string()),
         }
     }
@@ -253,7 +257,7 @@ async fn transfer(sim: Arc<Sim>, db: Db, i: usize, steps: usize, tally: Arc<Tall
             Err(LedgerError::Client(e)) if e.outcome() == Outcome::Unknown => {
                 tally.unknown.lock().insert(t.id.clone());
             }
-            Err(LedgerError::Client(e)) if e.is_transient(false) || e.code() == Some(ErrorCode::TxnNotFound) => {}
+            Err(LedgerError::Client(e)) if e.restarts_txn() => {}
             Err(LedgerError::Client(e)) => return Err(format!("ledger {i} transfer {}: {e}", t.id)),
         }
     }

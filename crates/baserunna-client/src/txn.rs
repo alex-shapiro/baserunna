@@ -278,7 +278,7 @@ impl Retry {
                 e
             }
         };
-        let restart = err.client_error().is_some_and(restarts);
+        let restart = err.client_error().is_some_and(Error::restarts_txn);
         let client = self.db.client();
         if !restart || self.attempt >= client.retry_policy().txn_attempts {
             return Err(err);
@@ -287,10 +287,4 @@ impl Retry {
         self.attempt += 1;
         Ok(None)
     }
-}
-
-/// Returns true if a new attempt of a transaction that failed with `e` can succeed without
-/// applying its writes twice.
-fn restarts(e: &Error) -> bool {
-    matches!(e.code(), Some(ErrorCode::TxnNotFound | ErrorCode::Aborted)) || e.is_transient(false)
 }

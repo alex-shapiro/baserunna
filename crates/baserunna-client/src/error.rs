@@ -81,10 +81,7 @@ impl Error {
             },
             Error::Foreign { status, .. } => matches!(status, 200..=299 | 407 | 408 | 429 | 500..) && may_repeat,
             Error::Malformed { .. } | Error::Decode { .. } => false,
-            // A request that timed out may run again in a new transaction, with a new deadline.
-            Error::NotApplied(e) => {
-                e.is_transient(true) || matches!(**e, Error::Transport(TransportError::TimedOut(_)))
-            }
+            Error::NotApplied(e) => e.is_transient(true),
             Error::Transport(TransportError::TimedOut(_)) => false,
             Error::Transport(_) => may_repeat,
         }
@@ -92,6 +89,17 @@ impl Error {
 }
 
 impl Error {
+    /// Returns true if a transaction loop of [`Db::retry`](crate::Db::retry) restarts after this
+    /// error: the transaction applied nothing and a new attempt can succeed.
+    pub fn restarts_txn(&self) -> bool {
+        // A transaction whose request timed out can run again, with a new deadline.
+        let timed_out =
+            matches!(self, Error::NotApplied(c) if matches!(**c, Error::Transport(TransportError::TimedOut(_))));
+        matches!(self.code(), Some(ErrorCode::TxnNotFound | ErrorCode::Aborted))
+            || self.is_transient(false)
+            || timed_out
+    }
+
     /// Returns the error of a request whose first `n` operations the caller did not pass, with
     /// `op_index` counted from the caller's first operation, or cleared if the failed operation was
     /// one of the first `n`.

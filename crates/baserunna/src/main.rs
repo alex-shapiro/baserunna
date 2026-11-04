@@ -74,6 +74,7 @@ fn config() -> Result<(NodeConfig, String, String, Shutdown), String> {
         admin_email: var("BASERUNNA_ADMIN_EMAIL"),
         admin_password: var("BASERUNNA_ADMIN_PASSWORD"),
         pbkdf2_iterations: parse("BASERUNNA_PBKDF2_ITERATIONS", 600_000u32)?,
+        max_dbs_per_owner: parse("BASERUNNA_MAX_DBS_PER_OWNER", 1_000usize)?,
         ..NodeConfig::default()
     };
     cfg.engine.cache_bytes = parse("BASERUNNA_CACHE_MB", 512usize)? * 1024 * 1024;

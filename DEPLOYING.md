@@ -250,6 +250,8 @@ from users at or above their fair share with `503` and aborts idle transactions
 from users above their fair share (SPEC §5.12).
 
 - `BASERUNNA_DB_MAX_MB` (default `10240`): maximum size of each database in MiB (segments and blobs).
+- `BASERUNNA_MAX_DBS_PER_OWNER` (default `1000`): maximum number of databases that one user or
+  organization owns. Raise it for a service that keeps a database per tenant, such as Sahara.
 - `BASERUNNA_DB_MEMORY_MB` (default `256`): per-node memory budget in MiB for open databases and transactions.
 - `BASERUNNA_USER_RPS` (default `500`): requests per second per user.
 - `BASERUNNA_API_KEY_RPS` (default `500`): requests per second per API key.

@@ -1386,6 +1386,7 @@ content security policy.
 | `BASERUNNA_LEASE_MS`                     | 5000                            | lease renewed by commits; leases renewed for reads last 3×   |
 | `BASERUNNA_PUT_HEDGE_MS`                 | 250                             | manifest `PUT` hedge delay in ms (§5.5); 0 disables hedging  |
 | `BASERUNNA_DB_MAX_MB`                    | 10240                           | size quota of each database (§5.10); 0 for none              |
+| `BASERUNNA_MAX_DBS_PER_OWNER`            | 1000                            | databases that one user or organization may own              |
 | `BASERUNNA_USER_RPS`                     | 500                             | requests per second per user, per node; 0 for no limit       |
 | `BASERUNNA_API_KEY_RPS`                  | 500                             | requests per second per API key without its own `rate_limit` |
 | `BASERUNNA_AUTH_RPS_PER_CLIENT`          | 1                               | sign-ins and sign-ups per second per client address          |

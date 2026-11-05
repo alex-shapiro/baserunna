@@ -5,15 +5,12 @@ use crate::error::{Error, Result};
 use crate::stream::{self, AppendTo, NewRecord, ReadSpec};
 use crate::table::{self, BlobResolver, Expiry, InsertMode, Query, SPACE_KV, Selection};
 use crate::util::b64;
-use baserunna_api::{self as api, OpResult};
+use baserunna_api::{self as api, MAX_SCAN_LIMIT, MAX_TXN_OPS, MAX_USER_KEY, OpResult};
 use bytes::Bytes;
 use serde_json::{Value as Json, json};
 use std::ops::Bound;
 use std::sync::Arc;
 
-pub const MAX_USER_KEY: usize = 4096;
-pub const MAX_SCAN_LIMIT: usize = 1000;
-pub const MAX_TXN_OPS: usize = 10_000;
 pub const MAX_TTL_MS: u64 = 10 * 365 * 24 * 3_600_000;
 
 pub use baserunna_api::Encoding;

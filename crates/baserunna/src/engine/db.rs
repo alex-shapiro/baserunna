@@ -2382,7 +2382,7 @@ impl Db {
                 Some(id) => (ObjKind::Levels, id),
                 None => (ObjKind::Segment, name),
             };
-            if super::types::valid_object_id(id)
+            if baserunna_api::valid_object_id(id)
                 && !referenced.contains(&(kind, id.to_string()))
                 && o.last_modified_ms + cfg.orphan_grace_ms <= now_ms
             {
@@ -2392,7 +2392,7 @@ impl Db {
         let blob_of = |key: &str| key.rsplit('/').nth(1).map(|s| s.to_string());
         let found = |id: String, mtime: u64, items: &mut Vec<Obsolete>| {
             let created = super::types::blob_id_time(&id).unwrap_or(0);
-            if super::types::valid_object_id(&id)
+            if baserunna_api::valid_object_id(&id)
                 && !referenced_blobs.contains(&id)
                 && mtime + cfg.orphan_grace_ms <= now_ms
                 && created + cfg.blob_stage_ttl_ms + bind_margin_ms(&cfg) <= now_ms
@@ -2421,7 +2421,7 @@ impl Db {
         let mut cur: Option<(String, u64)> = None;
         let part_found = |id: String, mtime: u64, items: &mut Vec<Obsolete>| {
             let created = super::types::blob_id_time(&id).unwrap_or(0);
-            if super::types::valid_object_id(&id)
+            if baserunna_api::valid_object_id(&id)
                 && !referenced_parts.contains(&id)
                 && mtime + cfg.orphan_grace_ms <= now_ms
                 && created + cfg.blob_stage_ttl_ms + bind_margin_ms(&cfg) <= now_ms

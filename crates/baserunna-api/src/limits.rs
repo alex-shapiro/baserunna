@@ -1,4 +1,23 @@
 use crate::{Endpoint, NoBody, json_body};
+
+/// Largest key, in bytes.
+pub const MAX_USER_KEY: usize = 4096;
+/// Largest `limit` of a scan.
+pub const MAX_SCAN_LIMIT: usize = 1000;
+/// Most operations in one transaction.
+pub const MAX_TXN_OPS: usize = 10_000;
+/// Default of [`Limits::value_inline_max`].
+pub const DEFAULT_VALUE_INLINE_MAX: usize = 32 * 1024;
+/// Default of [`Limits::json_value_max`].
+pub const DEFAULT_JSON_VALUE_MAX: u64 = 1024 * 1024;
+/// Default of [`Limits::txn_max_write_bytes`].
+pub const DEFAULT_TXN_MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Returns true if `id` is 32 lowercase ASCII hex characters, the form of blob ids and other
+/// object ids.
+pub fn valid_object_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 

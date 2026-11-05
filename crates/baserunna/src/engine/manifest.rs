@@ -7,10 +7,11 @@
 //! during compaction, avoiding rewriting them on regular commits.
 
 use super::range_delete::RangeTombstone;
-use super::types::{Entry, Seq, is_commit_key, valid_object_id};
+use super::types::{Entry, Seq, is_commit_key};
 use crate::util::bloom::key_hash;
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
 use crate::util::crc32c::crc32c;
+use baserunna_api::valid_object_id;
 use bytes::Bytes;
 
 const MAGIC: &[u8; 4] = b"BRMF";

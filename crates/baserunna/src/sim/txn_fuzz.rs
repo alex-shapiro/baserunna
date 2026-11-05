@@ -1033,7 +1033,7 @@ fn decode(enc: Encoding, s: &str) -> MResult<Vec<u8>> {
 }
 
 fn user_key(k: Vec<u8>) -> MResult<Vec<u8>> {
-    if k.is_empty() || k.len() > crate::ops::MAX_USER_KEY { Err(Fail::Invalid) } else { Ok(k) }
+    if k.is_empty() || k.len() > baserunna_api::MAX_USER_KEY { Err(Fail::Invalid) } else { Ok(k) }
 }
 
 fn user_range(
@@ -1127,7 +1127,7 @@ impl World {
             }
             Op::Scan { prefix, start, end, limit, reverse, keys_only, cursor } => {
                 let limit = limit.unwrap_or(100);
-                if limit == 0 || limit > crate::ops::MAX_SCAN_LIMIT {
+                if limit == 0 || limit > baserunna_api::MAX_SCAN_LIMIT {
                     return Err(Fail::Invalid);
                 }
                 let mut range = user_range(enc, prefix, start, end)?;
@@ -1150,7 +1150,7 @@ impl World {
                 let v = match (value, blob_id) {
                     (Some(v), None) => self.make_value(decode(enc, v)?),
                     (None, Some(id)) => {
-                        if !crate::engine::types::valid_object_id(id) {
+                        if !baserunna_api::valid_object_id(id) {
                             return Err(Fail::Invalid);
                         }
                         let (data, ct) = self.staged.get(id).ok_or(Fail::NotFound)?;

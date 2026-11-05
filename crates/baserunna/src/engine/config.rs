@@ -124,7 +124,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         EngineConfig {
             tail_max_bytes: 256 * 1024,
-            value_inline_max: 32 * 1024,
+            value_inline_max: baserunna_api::DEFAULT_VALUE_INLINE_MAX,
             block_target: 64 * 1024,
             compression: Compression::Zstd(3),
             segment_whole_fetch_max: 1024 * 1024,
@@ -144,7 +144,7 @@ impl Default for EngineConfig {
             lease_margin_ms: 500,
             lease_read_threshold: 16,
             txn_max_lifetime_ms: 5 * 60_000,
-            txn_max_write_bytes: 16 * 1024 * 1024,
+            txn_max_write_bytes: baserunna_api::DEFAULT_TXN_MAX_WRITE_BYTES,
             txn_max_read_bytes: 16 * 1024 * 1024,
             gc_grace_ms: 30 * 60_000,
             orphan_grace_ms: 2 * 3_600_000,

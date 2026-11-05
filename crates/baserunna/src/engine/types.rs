@@ -2,6 +2,7 @@
 
 use super::stream::Appended;
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
+use baserunna_api::valid_object_id;
 use bytes::Bytes;
 
 /// A database version / commit sequence number.
@@ -91,11 +92,6 @@ pub fn commit_key(id: u64) -> Bytes {
 
 pub fn is_commit_key(k: &[u8]) -> bool {
     k.first() == Some(&COMMIT_SPACE)
-}
-
-/// Returns true if `id` is 32 lowercase ASCII hex characters.
-pub fn valid_object_id(id: &str) -> bool {
-    id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn blob_id_time(id: &str) -> Option<u64> {

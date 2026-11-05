@@ -124,7 +124,7 @@ pub fn blob_meta_key(db: &str, id: &str) -> String {
 
 /// Load the descriptor of a blob by id.
 pub async fn load_staged(shared: &Shared, db: &str, id: &str) -> Result<BlobRef> {
-    if !super::types::valid_object_id(id) {
+    if !baserunna_api::valid_object_id(id) {
         return Err(Error::invalid(format!("invalid blob id {id:?}")));
     }
     let key = blob_meta_key(db, id);

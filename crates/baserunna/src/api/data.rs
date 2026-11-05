@@ -678,7 +678,7 @@ fn feed_params(q: &Params) -> Result<(ChangeCursor, usize, Duration)> {
 fn feed_args(after: &str, limit: Option<usize>, wait_ms: Option<u64>) -> Result<(ChangeCursor, usize, Duration)> {
     let after = ChangeCursor::decode(after).ok_or_else(|| Error::invalid("bad after"))?;
     let limit = limit.unwrap_or(100);
-    if !(1..=ops::MAX_SCAN_LIMIT).contains(&limit) {
+    if !(1..=baserunna_api::MAX_SCAN_LIMIT).contains(&limit) {
         return Err(limit_error());
     }
     let wait = wait_ms.unwrap_or(0);
@@ -689,7 +689,7 @@ fn feed_args(after: &str, limit: Option<usize>, wait_ms: Option<u64>) -> Result<
 }
 
 fn limit_error() -> Error {
-    Error::invalid(format!("limit must be in 1..={}", ops::MAX_SCAN_LIMIT))
+    Error::invalid(format!("limit must be in 1..={}", baserunna_api::MAX_SCAN_LIMIT))
 }
 
 fn wait_error() -> Error {

@@ -2,10 +2,11 @@
 
 use super::manifest::ObjKind;
 use super::stream::Pending;
-use super::types::{Entry, Seq, Value, blob_id_time, valid_object_id};
+use super::types::{Entry, Seq, Value, blob_id_time};
 use super::version::KeyRange;
 use crate::error::{Error, Result};
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
+use baserunna_api::valid_object_id;
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::ops::Bound;

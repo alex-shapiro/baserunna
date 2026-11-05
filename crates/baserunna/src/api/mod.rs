@@ -1085,12 +1085,12 @@ async fn healthz(State(node): State<Arc<Node>>) -> Response {
 async fn limits(State(node): State<Arc<Node>>, _: Req<api::GetLimits>) -> Result<Reply<api::GetLimits>> {
     let engine_cfg = &node.engine.shared.cfg;
     Ok(Reply::new(api::Limits {
-        txn_max_ops: crate::ops::MAX_TXN_OPS as u64,
+        txn_max_ops: baserunna_api::MAX_TXN_OPS as u64,
         txn_max_write_bytes: engine_cfg.txn_max_write_bytes as u64,
         txn_max_read_bytes: engine_cfg.txn_max_read_bytes as u64,
         txn_max_open_per_user: node.cfg.txns_per_user as u64,
         value_inline_max: engine_cfg.value_inline_max as u64,
-        scan_limit_max: crate::ops::MAX_SCAN_LIMIT as u64,
+        scan_limit_max: baserunna_api::MAX_SCAN_LIMIT as u64,
         long_poll_max_ms: LONG_POLL_MAX_MS,
         json_value_max: node.cfg.json_value_max,
         json_body_max: node.cfg.max_json_body as u64,

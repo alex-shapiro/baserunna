@@ -61,6 +61,7 @@ fn config() -> Result<(NodeConfig, String, String, Shutdown), String> {
     let port = listen.rsplit(':').next().unwrap_or("8080").to_string();
     let advertise = var("BASERUNNA_ADVERTISE").unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
     let public_url = var("BASERUNNA_PUBLIC_URL").unwrap_or_else(|| advertise.clone());
+    let d = NodeConfig::default();
     let mut cfg = NodeConfig {
         name: var("BASERUNNA_NODE_ID").unwrap_or_else(|| "node".into()),
         addr: advertise,
@@ -73,28 +74,30 @@ fn config() -> Result<(NodeConfig, String, String, Shutdown), String> {
         },
         admin_email: var("BASERUNNA_ADMIN_EMAIL"),
         admin_password: var("BASERUNNA_ADMIN_PASSWORD"),
-        pbkdf2_iterations: parse("BASERUNNA_PBKDF2_ITERATIONS", 600_000u32)?,
-        max_dbs_per_owner: parse("BASERUNNA_MAX_DBS_PER_OWNER", 1_000usize)?,
-        ..NodeConfig::default()
+        pbkdf2_iterations: parse("BASERUNNA_PBKDF2_ITERATIONS", d.pbkdf2_iterations)?,
+        max_dbs_per_owner: parse("BASERUNNA_MAX_DBS_PER_OWNER", d.max_dbs_per_owner)?,
+        ..d.clone()
     };
-    cfg.engine.cache_bytes = parse("BASERUNNA_CACHE_MB", 512usize)? * 1024 * 1024;
-    cfg.engine.memory_bytes = parse("BASERUNNA_DB_MEMORY_MB", 256usize)? * 1024 * 1024;
+    const MIB: usize = 1024 * 1024;
+    cfg.engine.cache_bytes = parse("BASERUNNA_CACHE_MB", d.engine.cache_bytes / MIB)? * MIB;
+    cfg.engine.memory_bytes = parse("BASERUNNA_DB_MEMORY_MB", d.engine.memory_bytes / MIB)? * MIB;
     if let Some(dir) = var("BASERUNNA_DISK_CACHE_DIR") {
         let bytes = parse("BASERUNNA_DISK_CACHE_MB", 10_240u64)? * 1024 * 1024;
         let tier = DiskCache::open(&dir, bytes).map_err(|e| format!("cannot open disk cache {dir}: {e}"))?;
         cfg.engine.local_tier = Some(LocalTier(Arc::new(tier)));
     }
-    cfg.engine.lease_ms = parse("BASERUNNA_LEASE_MS", 5_000u64)?;
+    cfg.engine.lease_ms = parse("BASERUNNA_LEASE_MS", d.engine.lease_ms)?;
     cfg.engine.read_lease_ms = 3 * cfg.engine.lease_ms;
-    cfg.engine.manifest_put_hedge_ms = parse("BASERUNNA_PUT_HEDGE_MS", 250u64)?;
-    cfg.engine.db_max_bytes = parse("BASERUNNA_DB_MAX_MB", 10_240u64)? * 1024 * 1024;
-    let l = &mut cfg.limits;
-    l.user = Rate::per_sec(parse("BASERUNNA_USER_RPS", 500.0)?);
-    l.api_key = Rate::per_sec(parse("BASERUNNA_API_KEY_RPS", 500.0)?);
-    l.auth_per_client = Rate { per_sec: parse("BASERUNNA_AUTH_RPS_PER_CLIENT", 1.0)?, burst: 20.0 };
-    l.signup_per_client = Rate::per_hour(parse("BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT", 20.0)?, 5.0);
-    l.trusted_proxy_hops = parse("BASERUNNA_TRUSTED_PROXY_HOPS", 0usize)?;
-    l.hash_concurrency = parse("BASERUNNA_HASH_CONCURRENCY", l.hash_concurrency)?;
+    cfg.engine.manifest_put_hedge_ms = parse("BASERUNNA_PUT_HEDGE_MS", d.engine.manifest_put_hedge_ms)?;
+    cfg.engine.db_max_bytes = parse("BASERUNNA_DB_MAX_MB", d.engine.db_max_bytes / MIB as u64)? * MIB as u64;
+    let (l, dl) = (&mut cfg.limits, &d.limits);
+    l.user = Rate::per_sec(parse("BASERUNNA_USER_RPS", dl.user.per_sec)?);
+    l.api_key = Rate::per_sec(parse("BASERUNNA_API_KEY_RPS", dl.api_key.per_sec)?);
+    l.auth_per_client.per_sec = parse("BASERUNNA_AUTH_RPS_PER_CLIENT", dl.auth_per_client.per_sec)?;
+    let signups = parse("BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT", dl.signup_per_client.per_sec * 3600.0)?;
+    l.signup_per_client = Rate::per_hour(signups, dl.signup_per_client.burst);
+    l.trusted_proxy_hops = parse("BASERUNNA_TRUSTED_PROXY_HOPS", dl.trusted_proxy_hops)?;
+    l.hash_concurrency = parse("BASERUNNA_HASH_CONCURRENCY", dl.hash_concurrency)?;
     let shutdown = Shutdown {
         drain_delay: Duration::from_millis(parse("BASERUNNA_DRAIN_DELAY_MS", 0u64)?),
         timeout: Duration::from_millis(parse("BASERUNNA_SHUTDOWN_TIMEOUT_MS", 20_000u64)?),
@@ -209,4 +212,27 @@ async fn run() -> Result<(), String> {
     baserunna::info!("shutting down: releasing leases");
     node.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unset_variables_keep_node_defaults() {
+        if std::env::vars().any(|(k, _)| k.starts_with("BASERUNNA_")) {
+            return;
+        }
+        let (cfg, ..) = config().unwrap();
+        let d = NodeConfig::default();
+        assert_eq!(cfg.max_dbs_per_owner, d.max_dbs_per_owner);
+        assert_eq!(cfg.pbkdf2_iterations, d.pbkdf2_iterations);
+        assert_eq!(cfg.engine.cache_bytes, d.engine.cache_bytes);
+        assert_eq!(cfg.engine.memory_bytes, d.engine.memory_bytes);
+        assert_eq!(cfg.engine.lease_ms, d.engine.lease_ms);
+        assert_eq!(cfg.engine.db_max_bytes, d.engine.db_max_bytes);
+        assert_eq!(cfg.limits.user.per_sec, d.limits.user.per_sec);
+        assert_eq!(cfg.limits.auth_per_client.burst, d.limits.auth_per_client.burst);
+        assert!((cfg.limits.signup_per_client.per_sec - d.limits.signup_per_client.per_sec).abs() < 1e-12);
+    }
 }

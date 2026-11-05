@@ -156,20 +156,43 @@ pub struct TxnOutcome {
     /// Commit version for a write transaction, or snapshot version for a read transaction.
     pub version: u64,
     pub commit_id: Option<String>,
-    /// Per-operation results, or `None` if an earlier request with the same idempotency key
-    /// already committed the transaction.
-    pub results: Option<Vec<OpResult>>,
+    pub results: TxnResults,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TxnResults {
+    /// The request executed the operations. Holds one result per operation, in order, and the
+    /// variant of each result matches its operation: [`OpResult::Get`] for [`Op::Get`],
+    /// [`OpResult::Scan`] for [`Op::Scan`], [`OpResult::Counter`] for [`Op::Increment`], and
+    /// [`OpResult::Done`] for the others.
+    Executed(Vec<OpResult>),
+    /// An earlier request with the same idempotency key committed the transaction at `version`.
+    /// The server does not keep the results of that request. Only a write transaction with an
+    /// idempotency key can be replayed.
+    Replayed,
+}
+
+impl TxnResults {
+    /// The results of an executed transaction, or `None` if it was replayed.
+    pub fn executed(self) -> Option<Vec<OpResult>> {
+        match self {
+            TxnResults::Executed(r) => Some(r),
+            TxnResults::Replayed => None,
+        }
+    }
 }
 
 impl TxnOutcome {
     pub(crate) fn decode(ops: &[Op], r: api::TxnResponse) -> Result<TxnOutcome, String> {
         let results = match r.results {
-            _ if r.replayed => None,
+            _ if r.replayed => TxnResults::Replayed,
             None => return Err("missing results".into()),
             Some(rs) if rs.len() != ops.len() => {
                 return Err(format!("{} results for {} operations", rs.len(), ops.len()));
             }
-            Some(rs) => Some(ops.iter().zip(&rs).map(|(op, r)| decode_result(op, r)).collect::<Result<_, _>>()?),
+            Some(rs) => {
+                TxnResults::Executed(ops.iter().zip(&rs).map(|(op, r)| decode_result(op, r)).collect::<Result<_, _>>()?)
+            }
         };
         Ok(TxnOutcome { version: r.version, commit_id: r.commit_id, results })
     }

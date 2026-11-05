@@ -53,7 +53,11 @@ async fn requests_include_endpoint_route_method_token_and_body() {
     let out = c.db("team.tools").txn(&put(), Some("key-1")).await.unwrap();
     assert_eq!(
         out,
-        TxnOutcome { version: 3, commit_id: Some("00000000000000aa".into()), results: Some(vec![OpResult::Done]) }
+        TxnOutcome {
+            version: 3,
+            commit_id: Some("00000000000000aa".into()),
+            results: TxnResults::Executed(vec![OpResult::Done])
+        }
     );
     let r = &s.requests.lock().unwrap()[0];
     assert_eq!((r.method().as_str(), r.uri().to_string()), ("POST", "/v1/dbs/team.tools/txn".to_string()));
@@ -139,7 +143,7 @@ async fn results_are_decoded_by_the_type_of_their_operation() {
     let meta = api::BlobMeta { blob_id: "b".into(), size: 9, sha256: "00".into(), content_type: "x".into() };
     let entry = |k: &'static str, version, value| Entry { key: k.into(), version, value };
     assert_eq!(
-        out.results.unwrap(),
+        out.results.executed().unwrap(),
         [
             OpResult::Get(Some(entry("a", 5, Value::Inline("hi".into())))),
             OpResult::Get(None),
@@ -159,7 +163,7 @@ async fn replayed_transactions_omit_results() {
     let body =
         r#"{"version":4,"committed":true,"replayed":true,"commit_id":"0000000000000001","results":null,"appends":[]}"#;
     let (c, _) = script(vec![resp(200, &[], body)]);
-    assert_eq!(c.db("s").txn(&put(), Some("k")).await.unwrap().results, None);
+    assert_eq!(c.db("s").txn(&put(), Some("k")).await.unwrap().results, TxnResults::Replayed);
 }
 
 #[tokio::test(start_paused = true)]
@@ -419,7 +423,7 @@ async fn increments_return_the_new_value() {
     let (c, s) = script(vec![resp(200, &[], ok)]);
     let ops = [Op::Increment { key: Bytes::from_static(b"n"), by: 2, ttl_ms: Some(60_000) }];
     let out = c.db("d").txn(&ops, Some("key-2")).await.unwrap();
-    assert_eq!(out.results, Some(vec![OpResult::Counter(7)]));
+    assert_eq!(out.results, TxnResults::Executed(vec![OpResult::Counter(7)]));
     let body: serde_json::Value = serde_json::from_slice(s.requests.lock().unwrap()[0].body()).unwrap();
     assert_eq!(body["ops"][0], serde_json::json!({"op": "increment", "key": "bg==", "by": 2, "ttl_ms": 60_000}));
 }

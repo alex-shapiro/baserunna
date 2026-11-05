@@ -139,7 +139,7 @@ async fn count(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Stri
 async fn read_counter(sim: &Arc<Sim>, db: &Db, key: &Bytes) -> Result<(u64, Option<u64>), String> {
     let get = [Op::Get { key: key.clone() }];
     let out = retry(sim, || db.txn(&get, None)).await?;
-    match out.results.as_deref() {
+    match out.results.executed().as_deref() {
         Some([OpResult::Get(None)]) => Ok((0, None)),
         Some([OpResult::Get(Some(e))]) => match &e.value {
             Value::Inline(b) => {
@@ -176,7 +176,9 @@ async fn mutate(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Str
             _ => Op::Put { key, value: Bytes::from(format!("{i}-{step}")) },
         };
         match db.txn(std::slice::from_ref(&op), Some(&format!("m{i}-{step}"))).await {
-            Ok(out) => expect(out.results.is_none_or(|r| r == [OpResult::Done]), "write operations return Done")?,
+            Ok(out) => {
+                expect(out.results.executed().is_none_or(|r| r == [OpResult::Done]), "write operations return Done")?
+            }
             Err(e) if e.code() == Some(ErrorCode::PreconditionFailed) && matches!(op, Op::Copy { .. }) => {}
             Err(e) if e.code() == Some(ErrorCode::Aborted) => {}
             Err(e) if e.outcome() == Outcome::Unknown || e.is_transient(true) => {}
@@ -261,7 +263,8 @@ async fn catch_up(sim: &Arc<Sim>, db: &Db, mut r: Replica) -> Result<Replica, St
 async fn rescan(sim: &Arc<Sim>, db: &Db) -> Result<Replica, String> {
     let ops = [Op::Scan { range: KeyRange::Prefix(Bytes::new()), limit: 1000, reverse: false, keys_only: false }];
     let out = retry(sim, || db.txn(&ops, None)).await?;
-    let Some([OpResult::Scan(page)]) = out.results.as_deref() else {
+    let results = out.results.executed();
+    let Some([OpResult::Scan(page)]) = results.as_deref() else {
         return Err("unexpected scan result".into());
     };
     expect(page.cursor.is_none(), "the key space fits in a single page")?;

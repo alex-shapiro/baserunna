@@ -105,7 +105,7 @@ impl Default for NodeConfig {
             max_members_per_org: 1000,
             index_backfill_batch_rows: 1000,
             json_value_max: baserunna_api::DEFAULT_JSON_VALUE_MAX,
-            max_json_body: 32 * 1024 * 1024,
+            max_json_body: baserunna_api::DEFAULT_JSON_BODY_MAX,
             txn_idle_ms: 30_000,
             txns_per_user: 100,
             txn_max_ms: 5 * 60_000,

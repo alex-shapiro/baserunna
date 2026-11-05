@@ -12,6 +12,8 @@ pub const DEFAULT_VALUE_INLINE_MAX: usize = 32 * 1024;
 pub const DEFAULT_JSON_VALUE_MAX: u64 = 1024 * 1024;
 /// Default of [`Limits::txn_max_write_bytes`].
 pub const DEFAULT_TXN_MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
+/// Default of [`Limits::json_body_max`].
+pub const DEFAULT_JSON_BODY_MAX: usize = 32 * 1024 * 1024;
 
 /// Returns true if `id` is 32 lowercase ASCII hex characters, the form of blob ids and other
 /// object ids.
@@ -53,6 +55,7 @@ pub struct Limits {
     pub long_poll_max_ms: u64,
     /// Maximum blob size included inline in a JSON response.
     pub json_value_max: u64,
+    /// Largest body of a JSON request, such as a transaction.
     pub json_body_max: u64,
     pub blob_max: u64,
     /// Time in milliseconds before an unreferenced staged blob is deleted.

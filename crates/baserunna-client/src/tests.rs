@@ -412,3 +412,14 @@ async fn ensure_db_retries_unknown_outcomes_and_accepts_an_existing_database() {
     let (c, _) = script(vec![api_err(403, "permission_denied", "null")]);
     assert_eq!(c.ensure_db("a", None).await.unwrap_err().code(), Some(ErrorCode::PermissionDenied));
 }
+
+#[tokio::test(start_paused = true)]
+async fn increments_return_the_new_value() {
+    let ok = r#"{"version":4,"committed":true,"commit_id":"00000000000000ab","results":[{"value":7}],"appends":[]}"#;
+    let (c, s) = script(vec![resp(200, &[], ok)]);
+    let ops = [Op::Increment { key: Bytes::from_static(b"n"), by: 2 }];
+    let out = c.db("d").txn(&ops, Some("key-2")).await.unwrap();
+    assert_eq!(out.results, Some(vec![OpResult::Counter(7)]));
+    let body: serde_json::Value = serde_json::from_slice(s.requests.lock().unwrap()[0].body()).unwrap();
+    assert_eq!(body["ops"][0], serde_json::json!({"op": "increment", "key": "bg==", "by": 2}));
+}

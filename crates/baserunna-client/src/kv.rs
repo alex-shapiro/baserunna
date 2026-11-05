@@ -42,6 +42,12 @@ pub enum Op {
         key: Bytes,
         expect: Expect,
     },
+    /// Adds `by` to the ASCII decimal integer stored at `key`, treating a missing key as 0, and
+    /// returns the new value as [`OpResult::Counter`].
+    Increment {
+        key: Bytes,
+        by: i64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,6 +105,7 @@ impl Op {
             Op::Check { key, expect: Expect::Version(v) } => {
                 api::Op::Check { key: k(key), exists: None, version: Some(*v), value: None }
             }
+            Op::Increment { key, by } => api::Op::Increment { key: k(key), by: *by, ttl_ms: None },
         }
     }
 }
@@ -137,6 +144,8 @@ pub struct ScanPage {
 pub enum OpResult {
     Get(Option<Entry>),
     Scan(ScanPage),
+    /// The new value of an [`Op::Increment`].
+    Counter(i64),
     Done,
 }
 
@@ -186,6 +195,13 @@ fn decode_result(op: &Op, r: &api::OpResult) -> Result<OpResult, String> {
                 entries.push(Entry { key: bytes(key)?, version, value: value(it.value.as_deref(), it.blob)? });
             }
             OpResult::Scan(ScanPage { entries, cursor: s.next_cursor })
+        }
+        Op::Increment { .. } => {
+            #[derive(serde::Deserialize)]
+            struct Incremented {
+                value: i64,
+            }
+            OpResult::Counter(r.decode::<Incremented>()?.value)
         }
         _ => OpResult::Done,
     })

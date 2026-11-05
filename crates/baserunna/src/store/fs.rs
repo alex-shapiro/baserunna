@@ -11,6 +11,10 @@ use std::sync::Mutex;
 const ETAG_LEN: usize = 16;
 const LOCK_FILE: &str = ".lock";
 
+/// Bound on how far a file's `last_modified_ms` trails its write: one 10 ms kernel tick plus
+/// truncation to milliseconds.
+const FS_TIME_PRECISION_MS: u64 = 11;
+
 pub struct FsStore {
     root: PathBuf,
     cas_lock: Arc<Mutex<()>>,
@@ -219,8 +223,11 @@ impl ObjectStore for FsStore {
         })
     }
 
+    /// Linux stamps a file's mtime from the coarse kernel clock, which advances once per tick
+    /// (1 to 10 ms for `CONFIG_HZ` 1000 to 100), so an mtime can trail the moment of the write by
+    /// up to one tick, and truncation to milliseconds loses up to 1 ms more.
     fn time_precision_ms(&self) -> u64 {
-        1
+        FS_TIME_PRECISION_MS
     }
 }
 

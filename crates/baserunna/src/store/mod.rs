@@ -114,8 +114,9 @@ pub trait ObjectStore: Send + Sync + 'static {
     /// must be empty or end with `/`.
     fn list<'a>(&'a self, prefix: &'a str, start_after: Option<&'a str>, limit: usize)
     -> BoxFut<'a, SResult<ListPage>>;
-    /// Granularity of `last_modified_ms` in milliseconds. Timestamps are rounded down to a
-    /// multiple of this value on a single store clock.
+    /// Granularity of `last_modified_ms` in milliseconds: a timestamp is at most the store
+    /// clock's time of the write and trails it by less than this value, as when the store
+    /// rounds down to a multiple of it or stamps writes from a coarse clock.
     fn time_precision_ms(&self) -> u64 {
         1_000
     }

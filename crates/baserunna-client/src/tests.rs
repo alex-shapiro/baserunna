@@ -131,12 +131,14 @@ async fn results_are_decoded_by_the_type_of_their_operation() {
     let body = r#"{"version":9,"committed":false,"results":[
         {"found":true,"value":"aGk=","version":5},
         {"found":false},
-        {"items":[{"key":"dC94","version":2},{"key":"dC95","version":3,"blob":{"blob_id":"b","size":9,"sha256":"00","content_type":"x"},"value":"YmxvYg=="}],"next_cursor":"dC95"}
+        {"found":true,"value":"bmV3"},
+        {"items":[{"key":"dC93","value":"dw=="},{"key":"dC94","version":2},{"key":"dC95","version":3,"blob":{"blob_id":"b","size":9,"sha256":"00","content_type":"x"},"value":"YmxvYg=="}],"next_cursor":"dC95"}
     ]}"#;
     let (c, _) = script(vec![resp(200, &[], body)]);
     let ops = [
         Op::Get { key: "a".into() },
         Op::Get { key: "b".into() },
+        Op::Get { key: "c".into() },
         Op::Scan { range: KeyRange::Prefix("t/".into()), limit: 2, reverse: false, keys_only: true, cursor: None },
     ];
     let out = c.db("s").txn(&ops, None).await.unwrap();
@@ -145,12 +147,14 @@ async fn results_are_decoded_by_the_type_of_their_operation() {
     assert_eq!(
         out.results.executed().unwrap(),
         [
-            OpResult::Get(Some(entry("a", 5, Value::Inline("hi".into())))),
+            OpResult::Get(Some(entry("a", Some(5), Value::Inline("hi".into())))),
             OpResult::Get(None),
+            OpResult::Get(Some(entry("c", None, Value::Inline("new".into())))),
             OpResult::Scan(ScanPage {
                 entries: vec![
-                    entry("t/x", 2, Value::Inline(Bytes::new())),
-                    entry("t/y", 3, Value::Blob { meta, data: Some("blob".into()) }),
+                    entry("t/w", None, Value::Inline("w".into())),
+                    entry("t/x", Some(2), Value::Inline(Bytes::new())),
+                    entry("t/y", Some(3), Value::Blob { meta, data: Some("blob".into()) }),
                 ],
                 cursor: Some("dC95".into()),
             }),
@@ -171,7 +175,6 @@ async fn responses_that_do_not_match_their_operations_are_malformed() {
     for body in [
         r#"{"version":1,"committed":false,"results":[]}"#,
         r#"{"version":1,"committed":false,"results":null}"#,
-        r#"{"version":1,"committed":false,"results":[{"found":true,"value":"aGk=","version":null}]}"#,
         r#"{"version":1,"committed":false,"results":[{"found":true,"value":"not base64!","version":1}]}"#,
         r#"{"version":1,"committed":false,"results":[{"items":[]}]}"#,
         r#"{"unexpected":true}"#,

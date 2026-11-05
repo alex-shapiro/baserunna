@@ -134,7 +134,8 @@ pub enum Value {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub key: Bytes,
-    pub version: u64,
+    /// Commit version of the value, or `None` if this transaction wrote it.
+    pub version: Option<u64>,
     pub value: Value,
 }
 
@@ -209,7 +210,7 @@ fn decode_result(op: &Op, r: &api::OpResult) -> Result<OpResult, String> {
                 false => None,
                 true => Some(Entry {
                     key: key.clone(),
-                    version: g.version.flatten().ok_or("get result is missing a committed version")?,
+                    version: g.version.flatten(),
                     value: value(g.value.as_deref(), g.blob)?,
                 }),
             })
@@ -219,8 +220,11 @@ fn decode_result(op: &Op, r: &api::OpResult) -> Result<OpResult, String> {
             let mut entries = Vec::with_capacity(s.items.len());
             for it in s.items {
                 let key = it.key.as_deref().ok_or("scan item is missing a key")?;
-                let version = it.version.ok_or("scan item is missing a committed version")?;
-                entries.push(Entry { key: bytes(key)?, version, value: value(it.value.as_deref(), it.blob)? });
+                entries.push(Entry {
+                    key: bytes(key)?,
+                    version: it.version,
+                    value: value(it.value.as_deref(), it.blob)?,
+                });
             }
             OpResult::Scan(ScanPage { entries, cursor: s.next_cursor })
         }

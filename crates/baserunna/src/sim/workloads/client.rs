@@ -144,7 +144,7 @@ async fn read_counter(sim: &Arc<Sim>, db: &Db, key: &Bytes) -> Result<(u64, Opti
         Some([OpResult::Get(Some(e))]) => match &e.value {
             Value::Inline(b) => {
                 let n = std::str::from_utf8(b).ok().and_then(|s| s.parse().ok()).ok_or("counter is not a number")?;
-                Ok((n, Some(e.version)))
+                Ok((n, e.version))
             }
             v => Err(format!("counter holds {v:?}")),
         },
@@ -277,7 +277,7 @@ async fn rescan(sim: &Arc<Sim>, db: &Db) -> Result<Replica, String> {
     let keys = page
         .entries
         .iter()
-        .map(|e| Ok((e.key.clone(), (e.version, data(&e.value)?))))
+        .map(|e| Ok((e.key.clone(), (e.version.ok_or("a read returned an uncommitted value")?, data(&e.value)?))))
         .collect::<Result<_, String>>()?;
     Ok(Replica { keys, cursor: out.version.to_string() })
 }

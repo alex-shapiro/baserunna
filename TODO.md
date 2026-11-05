@@ -307,8 +307,6 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 - [ ] **Cover tables, streams, and event tables in `baserunna-client`.** The client sends only
       key-value operations, so services that use it (Sahara, Commitment) cannot use secondary
       indexes, stream tails, or event analytics without writing raw HTTP.
-- [ ] **Add a cursor to `Op::Scan` in `baserunna-client`.** Callers page by moving the range
-      start past the last key.
 - [ ] **Per-owner database limits.** `BASERUNNA_MAX_DBS_PER_OWNER` applies to every owner; a
       service account that keeps a database per tenant needs a higher limit than users.
 

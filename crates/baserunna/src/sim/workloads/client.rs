@@ -261,7 +261,13 @@ async fn catch_up(sim: &Arc<Sim>, db: &Db, mut r: Replica) -> Result<Replica, St
 }
 
 async fn rescan(sim: &Arc<Sim>, db: &Db) -> Result<Replica, String> {
-    let ops = [Op::Scan { range: KeyRange::Prefix(Bytes::new()), limit: 1000, reverse: false, keys_only: false }];
+    let ops = [Op::Scan {
+        range: KeyRange::Prefix(Bytes::new()),
+        limit: 1000,
+        reverse: false,
+        keys_only: false,
+        cursor: None,
+    }];
     let out = retry(sim, || db.txn(&ops, None)).await?;
     let results = out.results.executed();
     let Some([OpResult::Scan(page)]) = results.as_deref() else {

@@ -137,7 +137,7 @@ async fn results_are_decoded_by_the_type_of_their_operation() {
     let ops = [
         Op::Get { key: "a".into() },
         Op::Get { key: "b".into() },
-        Op::Scan { range: KeyRange::Prefix("t/".into()), limit: 2, reverse: false, keys_only: true },
+        Op::Scan { range: KeyRange::Prefix("t/".into()), limit: 2, reverse: false, keys_only: true, cursor: None },
     ];
     let out = c.db("s").txn(&ops, None).await.unwrap();
     let meta = api::BlobMeta { blob_id: "b".into(), size: 9, sha256: "00".into(), content_type: "x".into() };
@@ -357,7 +357,13 @@ fn arbitrary_responses_never_panic_the_client() {
             let db = c.db("s");
             let ops = [
                 Op::Get { key: "a".into() },
-                Op::Scan { range: KeyRange::Prefix("t/".into()), limit: 10, reverse: false, keys_only: false },
+                Op::Scan {
+                    range: KeyRange::Prefix("t/".into()),
+                    limit: 10,
+                    reverse: false,
+                    keys_only: false,
+                    cursor: None,
+                },
                 Op::Check { key: "a".into(), expect: Expect::Absent },
             ];
             let req = ChangesRequest {
@@ -440,4 +446,18 @@ async fn results_that_do_not_match_their_operation_are_malformed() {
         let err = c.db("d").txn(&[op], Some("k")).await.unwrap_err();
         assert!(matches!(err, Error::Malformed { .. }), "{result}: {err:?}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn scans_send_their_cursor() {
+    let ok = r#"{"version":4,"committed":false,"results":[{"items":[],"next_cursor":null}]}"#;
+    let (c, s) = script(vec![resp(200, &[], ok)]);
+    let range = KeyRange::Span { start: "a".into(), end: "b".into() };
+    let ops = [Op::Scan { range, limit: 5, reverse: true, keys_only: false, cursor: Some("YWE".into()) }];
+    let out = c.db("d").txn(&ops, None).await.unwrap();
+    assert_eq!(out.results, TxnResults::Executed(vec![OpResult::Scan(ScanPage { entries: vec![], cursor: None })]));
+    let body: serde_json::Value = serde_json::from_slice(s.requests.lock().unwrap()[0].body()).unwrap();
+    let want =
+        serde_json::json!({"op": "scan", "start": "YQ==", "end": "Yg==", "limit": 5, "reverse": true, "cursor": "YWE"});
+    assert_eq!(body["ops"][0], want);
 }

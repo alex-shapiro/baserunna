@@ -9,12 +9,14 @@ pub enum Op {
         key: Bytes,
     },
     /// Reads up to `limit` entries in `range` in ascending order, or descending if `reverse` is
-    /// true. If `keys_only` is true, entries omit inline values and blob data.
+    /// true. If `keys_only` is true, entries omit inline values and blob data. To read the next
+    /// page, repeat the scan with `cursor` set to [`ScanPage::cursor`] of the previous page.
     Scan {
         range: KeyRange,
         limit: usize,
         reverse: bool,
         keys_only: bool,
+        cursor: Option<String>,
     },
     Put {
         key: Bytes,
@@ -77,7 +79,7 @@ impl Op {
         let k = |b: &Bytes| b64::encode(b);
         match self {
             Op::Get { key } => api::Op::Get { key: k(key) },
-            Op::Scan { range, limit, reverse, keys_only } => {
+            Op::Scan { range, limit, reverse, keys_only, cursor } => {
                 let (prefix, start, end) = prefix_start_end(range);
                 api::Op::Scan {
                     prefix,
@@ -86,7 +88,7 @@ impl Op {
                     limit: Some(*limit),
                     reverse: *reverse,
                     keys_only: *keys_only,
-                    cursor: None,
+                    cursor: cursor.clone(),
                 }
             }
             Op::Put { key, value } => {
@@ -139,6 +141,7 @@ pub struct Entry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanPage {
     pub entries: Vec<Entry>,
+    /// Opaque position after the last entry, or `None` if the range has no more entries.
     pub cursor: Option<String>,
 }
 

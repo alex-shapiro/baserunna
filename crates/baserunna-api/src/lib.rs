@@ -19,8 +19,9 @@ pub use account::{
 pub use db::{CreateDb, Db, NewDb};
 pub use error::{ApiError, ErrorBody, ErrorCode, ErrorDetails, Outcome};
 pub use kv::{
-    BlobMeta, Change, ChangePage, Changes, ChangesQuery, Consistency, DeletedRange, Encoding, GetResult, Isolation, Op,
-    OpResult, QueryEvents, ReadBlob, ReadStream, ScanItem, ScanResult, StageBlob, Txn, TxnRequest, TxnResponse,
+    BlobMeta, Change, ChangePage, Changes, ChangesQuery, Consistency, DeletedRange, Encoding, GetResult,
+    IncrementResult, Isolation, Op, OpResult, QueryEvents, ReadBlob, ReadStream, ScanItem, ScanResult, StageBlob, Txn,
+    TxnRequest, TxnResponse,
 };
 pub use limits::{GetLimits, Limits};
 

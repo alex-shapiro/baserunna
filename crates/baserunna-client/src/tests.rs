@@ -417,9 +417,23 @@ async fn ensure_db_retries_unknown_outcomes_and_accepts_an_existing_database() {
 async fn increments_return_the_new_value() {
     let ok = r#"{"version":4,"committed":true,"commit_id":"00000000000000ab","results":[{"value":7}],"appends":[]}"#;
     let (c, s) = script(vec![resp(200, &[], ok)]);
-    let ops = [Op::Increment { key: Bytes::from_static(b"n"), by: 2 }];
+    let ops = [Op::Increment { key: Bytes::from_static(b"n"), by: 2, ttl_ms: Some(60_000) }];
     let out = c.db("d").txn(&ops, Some("key-2")).await.unwrap();
     assert_eq!(out.results, Some(vec![OpResult::Counter(7)]));
     let body: serde_json::Value = serde_json::from_slice(s.requests.lock().unwrap()[0].body()).unwrap();
-    assert_eq!(body["ops"][0], serde_json::json!({"op": "increment", "key": "bg==", "by": 2}));
+    assert_eq!(body["ops"][0], serde_json::json!({"op": "increment", "key": "bg==", "by": 2, "ttl_ms": 60_000}));
+}
+
+#[tokio::test(start_paused = true)]
+async fn results_that_do_not_match_their_operation_are_malformed() {
+    for (op, result) in [
+        (Op::Increment { key: "n".into(), by: 1, ttl_ms: None }, "{}"),
+        (Op::Delete { key: "n".into() }, "1"),
+        (Op::Get { key: "n".into() }, r#"{"value":1}"#),
+    ] {
+        let body = format!(r#"{{"version":4,"committed":true,"results":[{result}]}}"#);
+        let (c, _) = script(vec![resp(200, &[], &body)]);
+        let err = c.db("d").txn(&[op], Some("k")).await.unwrap_err();
+        assert!(matches!(err, Error::Malformed { .. }), "{result}: {err:?}");
+    }
 }

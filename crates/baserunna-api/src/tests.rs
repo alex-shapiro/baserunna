@@ -176,6 +176,9 @@ fn transaction_results_keep_their_json() {
     assert_eq!(serde_json::from_slice::<Json>(&r.encode()).unwrap(), serde_json::from_str::<Json>(body).unwrap());
     let typed = OpResult::Get(get.clone());
     assert_eq!(typed.decode::<GetResult>().unwrap(), get);
+    let inc = OpResult::Increment(IncrementResult { value: -3 });
+    assert_eq!(serde_json::to_value(&inc).unwrap(), serde_json::json!({"value": -3}));
+    assert_eq!(inc.decode::<IncrementResult>().unwrap(), IncrementResult { value: -3 });
 }
 
 #[test]

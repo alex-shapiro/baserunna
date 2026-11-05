@@ -569,7 +569,7 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
             };
             let n = cur.checked_add(*by).ok_or_else(|| Error::invalid("increment overflows i64"))?;
             txn.put_expiring(k, Value::Inline(Bytes::from(n.to_string())), set.or(kept))?;
-            Ok(OpResult::Other(json!({"value": n})))
+            Ok(OpResult::Increment(api::IncrementResult { value: n }))
         }
         Op::GetRow { table, pk } => {
             let row = table::get_expiring(txn, table, pk).await?;

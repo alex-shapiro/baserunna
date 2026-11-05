@@ -435,6 +435,7 @@ json_body!(TxnRequest, TxnResponse);
 pub enum OpResult {
     Get(GetResult),
     Scan(ScanResult),
+    Increment(IncrementResult),
     Done(crate::Empty),
     Other(Json),
     Raw(Box<RawValue>),
@@ -501,7 +502,14 @@ pub struct ScanItem {
     pub expires_at: Option<u64>,
 }
 
-json_body!(GetResult, ScanResult);
+/// Result of an `increment` operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncrementResult {
+    /// Value of the key after the increment.
+    pub value: i64,
+}
+
+json_body!(GetResult, ScanResult, IncrementResult);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobMeta {

@@ -43,10 +43,12 @@ pub enum Op {
         expect: Expect,
     },
     /// Adds `by` to the ASCII decimal integer stored at `key`, treating a missing key as 0, and
-    /// returns the new value as [`OpResult::Counter`].
+    /// returns the new value as [`OpResult::Counter`]. If `ttl_ms` is `None`, the key keeps its
+    /// current expiration.
     Increment {
         key: Bytes,
         by: i64,
+        ttl_ms: Option<u64>,
     },
 }
 
@@ -105,7 +107,7 @@ impl Op {
             Op::Check { key, expect: Expect::Version(v) } => {
                 api::Op::Check { key: k(key), exists: None, version: Some(*v), value: None }
             }
-            Op::Increment { key, by } => api::Op::Increment { key: k(key), by: *by, ttl_ms: None },
+            Op::Increment { key, by, ttl_ms } => api::Op::Increment { key: k(key), by: *by, ttl_ms: *ttl_ms },
         }
     }
 }
@@ -196,14 +198,16 @@ fn decode_result(op: &Op, r: &api::OpResult) -> Result<OpResult, String> {
             }
             OpResult::Scan(ScanPage { entries, cursor: s.next_cursor })
         }
-        Op::Increment { .. } => {
-            #[derive(serde::Deserialize)]
-            struct Incremented {
-                value: i64,
-            }
-            OpResult::Counter(r.decode::<Incremented>()?.value)
+        Op::Increment { .. } => OpResult::Counter(r.decode::<api::IncrementResult>()?.value),
+        Op::Put { .. }
+        | Op::PutBlob { .. }
+        | Op::Delete { .. }
+        | Op::DeleteRange { .. }
+        | Op::Copy { .. }
+        | Op::Check { .. } => {
+            r.decode::<api::Empty>()?;
+            OpResult::Done
         }
-        _ => OpResult::Done,
     })
 }
 

@@ -25,8 +25,8 @@ pub use kv::{
 };
 pub use limits::{
     DEFAULT_JSON_BODY_MAX, DEFAULT_JSON_VALUE_MAX, DEFAULT_TXN_MAX_WRITE_BYTES, DEFAULT_VALUE_INLINE_MAX, GetLimits,
-    KvWrite, Limits, MAX_SCAN_LIMIT, MAX_TXN_OPS, MAX_USER_KEY, PUT_VALUE_CONTENT_TYPE, StoredValue, txn_write_cost,
-    valid_object_id,
+    KV_KEY_PREFIX_LEN, KvWrite, Limits, MAX_SCAN_LIMIT, MAX_TXN_OPS, MAX_USER_KEY, PUT_VALUE_CONTENT_TYPE, StoredValue,
+    txn_write_cost, valid_object_id,
 };
 
 use bytes::Bytes;

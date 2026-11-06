@@ -315,7 +315,7 @@ pub fn user_key(k: &[u8]) -> Result<Bytes> {
     if k.len() > MAX_USER_KEY {
         return Err(Error::invalid(format!("keys are limited to {MAX_USER_KEY} bytes")));
     }
-    let mut v = Vec::with_capacity(k.len() + 1);
+    let mut v = Vec::with_capacity(k.len() + api::KV_KEY_PREFIX_LEN);
     v.push(SPACE_KV);
     v.extend_from_slice(k);
     Ok(Bytes::from(v))
@@ -704,4 +704,16 @@ pub fn blob_meta(r: &BlobRef) -> api::BlobMeta {
 
 fn done() -> OpResult {
     OpResult::Done(api::Empty {})
+}
+
+#[cfg(test)]
+mod key_tests {
+    /// Clients charge a key-value write by its user key plus `KV_KEY_PREFIX_LEN`, so the stored key
+    /// must be exactly that long.
+    #[test]
+    fn a_stored_key_is_the_user_key_after_its_documented_prefix() {
+        let k = super::user_key(b"abc").unwrap();
+        assert_eq!(k.len(), 3 + baserunna_api::KV_KEY_PREFIX_LEN);
+        assert_eq!(&k[baserunna_api::KV_KEY_PREFIX_LEN..], b"abc");
+    }
 }

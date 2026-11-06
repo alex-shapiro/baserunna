@@ -15,6 +15,10 @@ pub const DEFAULT_TXN_MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
 /// Default of [`Limits::json_body_max`].
 pub const DEFAULT_JSON_BODY_MAX: usize = 32 * 1024 * 1024;
 
+/// Bytes that Baserunna adds before a user key to store it: the key-value keyspace prefix. The
+/// `key_len` of a [`KvWrite`] of a key-value operation is the user key's length plus this.
+pub const KV_KEY_PREFIX_LEN: usize = 1;
+
 /// Content type of the blob that a transaction put creates for a value larger than
 /// [`Limits::value_inline_max`].
 pub const PUT_VALUE_CONTENT_TYPE: &str = "application/octet-stream";
@@ -38,7 +42,8 @@ impl StoredValue {
     }
 }
 
-/// One key-value write of a transaction.
+/// One key-value write of a transaction. Each `key_len` is the length of the stored key, which
+/// for a key-value operation is [`KV_KEY_PREFIX_LEN`] more than the user key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvWrite {
     /// A put, an increment, or the destination of a copy. `value_size` is the

@@ -11,14 +11,28 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn var(k: &str) -> Option<String> {
-    std::env::var(k).ok().filter(|v| !v.is_empty())
+/// Reads the value of a configuration variable.
+type Lookup = dyn Fn(&str) -> Option<String>;
+
+/// Configuration variables. An empty value counts as unset.
+struct Vars {
+    lookup: Box<Lookup>,
 }
 
-fn parse<T: std::str::FromStr>(k: &str, default: T) -> Result<T, String> {
-    match var(k) {
-        None => Ok(default),
-        Some(v) => v.parse().map_err(|_| format!("invalid value for {k}: {v:?}")),
+impl Vars {
+    fn from_env() -> Vars {
+        Vars { lookup: Box::new(|k| std::env::var(k).ok()) }
+    }
+
+    fn get(&self, k: &str) -> Option<String> {
+        (self.lookup)(k).filter(|v| !v.is_empty())
+    }
+
+    fn parse<T: std::str::FromStr>(&self, k: &str, default: T) -> Result<T, String> {
+        match self.get(k) {
+            None => Ok(default),
+            Some(v) => v.parse().map_err(|_| format!("invalid value for {k}: {v:?}")),
+        }
     }
 }
 
@@ -56,53 +70,53 @@ struct Shutdown {
     timeout: Duration,
 }
 
-fn config() -> Result<(NodeConfig, String, String, Shutdown), String> {
-    let listen = var("BASERUNNA_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into());
+fn config(vars: &Vars) -> Result<(NodeConfig, String, String, Shutdown), String> {
+    let listen = vars.get("BASERUNNA_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into());
     let port = listen.rsplit(':').next().unwrap_or("8080").to_string();
-    let advertise = var("BASERUNNA_ADVERTISE").unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
-    let public_url = var("BASERUNNA_PUBLIC_URL").unwrap_or_else(|| advertise.clone());
+    let advertise = vars.get("BASERUNNA_ADVERTISE").unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
+    let public_url = vars.get("BASERUNNA_PUBLIC_URL").unwrap_or_else(|| advertise.clone());
     let d = NodeConfig::default();
     let mut cfg = NodeConfig {
-        name: var("BASERUNNA_NODE_ID").unwrap_or_else(|| "node".into()),
+        name: vars.get("BASERUNNA_NODE_ID").unwrap_or_else(|| "node".into()),
         addr: advertise,
         secure_cookies: public_url.starts_with("https://"),
         public_url,
-        cluster_secret: var("BASERUNNA_CLUSTER_SECRET"),
-        signup: match var("BASERUNNA_SIGNUP") {
+        cluster_secret: vars.get("BASERUNNA_CLUSTER_SECRET"),
+        signup: match vars.get("BASERUNNA_SIGNUP") {
             None => SignupPolicy::FirstUserOnly,
             Some(s) => SignupPolicy::parse(&s).ok_or_else(|| format!("invalid BASERUNNA_SIGNUP {s:?}"))?,
         },
-        admin_email: var("BASERUNNA_ADMIN_EMAIL"),
-        admin_password: var("BASERUNNA_ADMIN_PASSWORD"),
-        pbkdf2_iterations: parse("BASERUNNA_PBKDF2_ITERATIONS", d.pbkdf2_iterations)?,
-        max_dbs_per_owner: parse("BASERUNNA_MAX_DBS_PER_OWNER", d.max_dbs_per_owner)?,
+        admin_email: vars.get("BASERUNNA_ADMIN_EMAIL"),
+        admin_password: vars.get("BASERUNNA_ADMIN_PASSWORD"),
+        pbkdf2_iterations: vars.parse("BASERUNNA_PBKDF2_ITERATIONS", d.pbkdf2_iterations)?,
+        max_dbs_per_owner: vars.parse("BASERUNNA_MAX_DBS_PER_OWNER", d.max_dbs_per_owner)?,
         ..d.clone()
     };
     const MIB: usize = 1024 * 1024;
-    cfg.engine.cache_bytes = parse("BASERUNNA_CACHE_MB", d.engine.cache_bytes / MIB)? * MIB;
-    cfg.engine.memory_bytes = parse("BASERUNNA_DB_MEMORY_MB", d.engine.memory_bytes / MIB)? * MIB;
-    if let Some(dir) = var("BASERUNNA_DISK_CACHE_DIR") {
-        let bytes = parse("BASERUNNA_DISK_CACHE_MB", 10_240u64)? * 1024 * 1024;
+    cfg.engine.cache_bytes = vars.parse("BASERUNNA_CACHE_MB", d.engine.cache_bytes / MIB)? * MIB;
+    cfg.engine.memory_bytes = vars.parse("BASERUNNA_DB_MEMORY_MB", d.engine.memory_bytes / MIB)? * MIB;
+    if let Some(dir) = vars.get("BASERUNNA_DISK_CACHE_DIR") {
+        let bytes = vars.parse("BASERUNNA_DISK_CACHE_MB", 10_240u64)? * 1024 * 1024;
         let tier = DiskCache::open(&dir, bytes).map_err(|e| format!("cannot open disk cache {dir}: {e}"))?;
         cfg.engine.local_tier = Some(LocalTier(Arc::new(tier)));
     }
-    cfg.engine.lease_ms = parse("BASERUNNA_LEASE_MS", d.engine.lease_ms)?;
+    cfg.engine.lease_ms = vars.parse("BASERUNNA_LEASE_MS", d.engine.lease_ms)?;
     cfg.engine.read_lease_ms = 3 * cfg.engine.lease_ms;
-    cfg.engine.manifest_put_hedge_ms = parse("BASERUNNA_PUT_HEDGE_MS", d.engine.manifest_put_hedge_ms)?;
-    cfg.engine.db_max_bytes = parse("BASERUNNA_DB_MAX_MB", d.engine.db_max_bytes / MIB as u64)? * MIB as u64;
+    cfg.engine.manifest_put_hedge_ms = vars.parse("BASERUNNA_PUT_HEDGE_MS", d.engine.manifest_put_hedge_ms)?;
+    cfg.engine.db_max_bytes = vars.parse("BASERUNNA_DB_MAX_MB", d.engine.db_max_bytes / MIB as u64)? * MIB as u64;
     let (l, dl) = (&mut cfg.limits, &d.limits);
-    l.user = Rate::per_sec(parse("BASERUNNA_USER_RPS", dl.user.per_sec)?);
-    l.api_key = Rate::per_sec(parse("BASERUNNA_API_KEY_RPS", dl.api_key.per_sec)?);
-    l.auth_per_client.per_sec = parse("BASERUNNA_AUTH_RPS_PER_CLIENT", dl.auth_per_client.per_sec)?;
-    let signups = parse("BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT", dl.signup_per_client.per_sec * 3600.0)?;
+    l.user = Rate::per_sec(vars.parse("BASERUNNA_USER_RPS", dl.user.per_sec)?);
+    l.api_key = Rate::per_sec(vars.parse("BASERUNNA_API_KEY_RPS", dl.api_key.per_sec)?);
+    l.auth_per_client.per_sec = vars.parse("BASERUNNA_AUTH_RPS_PER_CLIENT", dl.auth_per_client.per_sec)?;
+    let signups = vars.parse("BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT", dl.signup_per_client.per_sec * 3600.0)?;
     l.signup_per_client = Rate::per_hour(signups, dl.signup_per_client.burst);
-    l.trusted_proxy_hops = parse("BASERUNNA_TRUSTED_PROXY_HOPS", dl.trusted_proxy_hops)?;
-    l.hash_concurrency = parse("BASERUNNA_HASH_CONCURRENCY", dl.hash_concurrency)?;
+    l.trusted_proxy_hops = vars.parse("BASERUNNA_TRUSTED_PROXY_HOPS", dl.trusted_proxy_hops)?;
+    l.hash_concurrency = vars.parse("BASERUNNA_HASH_CONCURRENCY", dl.hash_concurrency)?;
     let shutdown = Shutdown {
-        drain_delay: Duration::from_millis(parse("BASERUNNA_DRAIN_DELAY_MS", 0u64)?),
-        timeout: Duration::from_millis(parse("BASERUNNA_SHUTDOWN_TIMEOUT_MS", 20_000u64)?),
+        drain_delay: Duration::from_millis(vars.parse("BASERUNNA_DRAIN_DELAY_MS", 0u64)?),
+        timeout: Duration::from_millis(vars.parse("BASERUNNA_SHUTDOWN_TIMEOUT_MS", 20_000u64)?),
     };
-    let store = var("BASERUNNA_STORE").unwrap_or_else(|| "fs:./data".into());
+    let store = vars.get("BASERUNNA_STORE").unwrap_or_else(|| "fs:./data".into());
     Ok((cfg, listen, store, shutdown))
 }
 
@@ -144,24 +158,25 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    let (cfg, listen, store_url, shutdown) = config()?;
+    let vars = Vars::from_env();
+    let (cfg, listen, store_url, shutdown) = config(&vars)?;
     let store = store_from_url(&store_url)?;
     #[cfg(feature = "cloud")]
     if store_url.starts_with("s3://") {
         verify_store_conditional_writes(&store_url).await?;
     }
     let oidc: Option<Arc<dyn baserunna::auth::OidcProvider>> =
-        match (var("BASERUNNA_GOOGLE_CLIENT_ID"), var("BASERUNNA_GOOGLE_CLIENT_SECRET")) {
+        match (vars.get("BASERUNNA_GOOGLE_CLIENT_ID"), vars.get("BASERUNNA_GOOGLE_CLIENT_SECRET")) {
             #[cfg(feature = "cloud")]
             (Some(id), Some(secret)) => Some(Arc::new(baserunna::auth::GoogleOidc::new(id, secret))),
             _ => None,
         };
-    let mailer: Option<Arc<dyn baserunna::mail::Mailer>> = match var("BASERUNNA_MAIL_WEBHOOK_URL") {
+    let mailer: Option<Arc<dyn baserunna::mail::Mailer>> = match vars.get("BASERUNNA_MAIL_WEBHOOK_URL") {
         #[cfg(feature = "cloud")]
         Some(url) => Some(Arc::new(baserunna::mail::WebhookMailer::new(
             url,
-            var("BASERUNNA_MAIL_WEBHOOK_TOKEN"),
-            var("BASERUNNA_MAIL_FROM").unwrap_or_else(|| "Baserunna <noreply@localhost>".into()),
+            vars.get("BASERUNNA_MAIL_WEBHOOK_TOKEN"),
+            vars.get("BASERUNNA_MAIL_FROM").unwrap_or_else(|| "Baserunna <noreply@localhost>".into()),
         ))),
         #[cfg(not(feature = "cloud"))]
         Some(_) => return Err("BASERUNNA_MAIL_WEBHOOK_URL needs the `cloud` feature".into()),
@@ -220,10 +235,7 @@ mod tests {
 
     #[test]
     fn unset_variables_keep_node_defaults() {
-        if std::env::vars().any(|(k, _)| k.starts_with("BASERUNNA_")) {
-            return;
-        }
-        let (cfg, ..) = config().unwrap();
+        let (cfg, ..) = config(&Vars { lookup: Box::new(|_| None) }).unwrap();
         let d = NodeConfig::default();
         assert_eq!(cfg.max_dbs_per_owner, d.max_dbs_per_owner);
         assert_eq!(cfg.pbkdf2_iterations, d.pbkdf2_iterations);
@@ -234,5 +246,21 @@ mod tests {
         assert_eq!(cfg.limits.user.per_sec, d.limits.user.per_sec);
         assert_eq!(cfg.limits.auth_per_client.burst, d.limits.auth_per_client.burst);
         assert!((cfg.limits.signup_per_client.per_sec - d.limits.signup_per_client.per_sec).abs() < 1e-12);
+    }
+
+    #[test]
+    fn set_variables_override_node_defaults() {
+        let vars = Vars {
+            lookup: Box::new(|k| match k {
+                "BASERUNNA_LEASE_MS" => Some("1234".into()),
+                "BASERUNNA_CACHE_MB" => Some(String::new()),
+                _ => None,
+            }),
+        };
+        let (cfg, ..) = config(&vars).unwrap();
+        assert_eq!(cfg.engine.lease_ms, 1234);
+        assert_eq!(cfg.engine.cache_bytes, NodeConfig::default().engine.cache_bytes, "an empty value is unset");
+        let bad = Vars { lookup: Box::new(|k| (k == "BASERUNNA_LEASE_MS").then(|| "soon".into())) };
+        assert!(config(&bad).is_err());
     }
 }

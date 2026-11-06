@@ -163,6 +163,79 @@ async fn results_are_decoded_by_the_type_of_their_operation() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn get_many_returns_committed_entries_in_key_order() {
+    let body = r#"{"version":9,"committed":false,"results":[
+        {"found":true,"value":"aGk=","version":5},
+        {"found":false},
+        {"found":true,"blob":{"blob_id":"b","size":9,"sha256":"00","content_type":"x"},"version":7}
+    ]}"#;
+    let (c, s) = script(vec![resp(200, &[], body)]);
+    let keys = [Bytes::from_static(b"a"), Bytes::from_static(b"b"), Bytes::from_static(b"c")];
+    let got = c.db("s").get_many(&keys).await.unwrap();
+    let meta = api::BlobMeta { blob_id: "b".into(), size: 9, sha256: "00".into(), content_type: "x".into() };
+    assert_eq!(
+        got,
+        [
+            Some(CommittedEntry { key: "a".into(), version: 5, value: Value::Inline("hi".into()) }),
+            None,
+            Some(CommittedEntry { key: "c".into(), version: 7, value: Value::Blob { meta, data: None } }),
+        ]
+    );
+    let body: serde_json::Value = serde_json::from_slice(s.requests.lock().unwrap()[0].body()).unwrap();
+    let get = |k: &str| serde_json::json!({"op": "get", "key": k});
+    let want = serde_json::json!({"ops": [get("YQ=="), get("Yg=="), get("Yw==")], "encoding": "base64"});
+    assert_eq!(body, want, "a read carries no idempotency key");
+    assert_eq!(c.db("s").get_many(&[]).await.unwrap(), [], "no keys need no request");
+    assert_eq!(sent(&s), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn scan_returns_a_committed_page_with_its_snapshot_version() {
+    let body = r#"{"version":9,"committed":false,"results":[
+        {"items":[{"key":"dC94","value":"aGk=","version":2}],"next_cursor":"dC94"}
+    ]}"#;
+    let (c, s) = script(vec![resp(200, &[], body)]);
+    let req =
+        ScanRequest { range: KeyRange::Prefix("t/".into()), limit: 1, reverse: true, keys_only: false, cursor: None };
+    let page = c.db("s").scan(&req).await.unwrap();
+    assert_eq!(
+        page,
+        CommittedPage {
+            version: 9,
+            entries: vec![CommittedEntry { key: "t/x".into(), version: 2, value: Value::Inline("hi".into()) }],
+            cursor: Some("dC94".into()),
+        }
+    );
+    let body: serde_json::Value = serde_json::from_slice(s.requests.lock().unwrap()[0].body()).unwrap();
+    let want = serde_json::json!({"ops": [{"op": "scan", "prefix": "dC8=", "limit": 1, "reverse": true}], "encoding": "base64"});
+    assert_eq!(body, want);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reads_that_return_uncommitted_or_misaligned_results_are_malformed() {
+    let req =
+        ScanRequest { range: KeyRange::Prefix("t/".into()), limit: 1, reverse: false, keys_only: false, cursor: None };
+    let get = [Bytes::from_static(b"k")];
+    for (scan, body) in [
+        (false, r#"{"version":1,"committed":false,"results":[{"found":true,"value":"aGk=","version":null}]}"#),
+        (false, r#"{"version":1,"committed":false,"results":[{"found":true,"value":"aGk="}]}"#),
+        (false, r#"{"version":1,"committed":false,"results":[]}"#),
+        (false, r#"{"version":1,"committed":false,"results":[{"items":[]}]}"#),
+        (true, r#"{"version":1,"committed":false,"results":[{"items":[{"key":"dC94","version":null}]}]}"#),
+        (true, r#"{"version":1,"committed":false,"results":[{"found":false}]}"#),
+        (true, r#"{"version":1,"committed":false,"results":null}"#),
+    ] {
+        let (c, s) = script(vec![resp(200, &[], body)]);
+        let e = match scan {
+            false => c.db("s").get_many(&get).await.unwrap_err(),
+            true => c.db("s").scan(&req).await.unwrap_err(),
+        };
+        assert!(matches!(e, Error::Malformed { .. }), "{body}: {e:?}");
+        assert_eq!(sent(&s), 1, "{body}: a malformed response is not retried");
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn replayed_transactions_omit_results() {
     let body =
         r#"{"version":4,"committed":true,"replayed":true,"commit_id":"0000000000000001","results":null,"appends":[]}"#;

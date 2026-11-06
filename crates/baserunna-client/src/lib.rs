@@ -22,7 +22,8 @@ mod transport;
 pub use baserunna_api as api;
 pub use error::Error;
 pub use kv::{
-    Change, ChangePage, ChangesRequest, Entry, Expect, KeyRange, Op, OpResult, ScanPage, TxnOutcome, TxnResults, Value,
+    Change, ChangePage, ChangesRequest, CommittedEntry, CommittedPage, Entry, Expect, KeyRange, Op, OpResult, ScanPage,
+    ScanRequest, TxnOutcome, TxnResults, Value,
 };
 #[cfg(feature = "reqwest")]
 pub use transport::HttpTransport;
@@ -272,6 +273,36 @@ impl Db {
         let path = e.path();
         let resp = self.client.send(&e, &req).await?;
         TxnOutcome::decode(ops, resp).map_err(|reason| Error::Malformed { path, reason })
+    }
+
+    /// Reads `keys` in one snapshot and returns one result per key, in order.
+    pub async fn get_many(&self, keys: &[Bytes]) -> Result<Vec<Option<CommittedEntry>>, Error> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ops = keys.iter().map(|k| api::Op::Get { key: api::b64::encode(k) }).collect();
+        self.read(ops, |_, results| keys.iter().zip(results).map(|(k, r)| kv::committed_get(k, r)).collect()).await
+    }
+
+    /// Reads one page of a scan in a snapshot.
+    pub async fn scan(&self, req: &ScanRequest) -> Result<CommittedPage, Error> {
+        self.read(vec![req.to_api()], |version, results| kv::committed_page(version, &results[0])).await
+    }
+
+    /// Runs read-only `ops` in one snapshot, and decodes the snapshot version and the results,
+    /// one per operation.
+    async fn read<T>(
+        &self,
+        ops: Vec<api::Op>,
+        decode: impl FnOnce(u64, &[api::OpResult]) -> Result<T, String>,
+    ) -> Result<T, Error> {
+        let n = ops.len();
+        let req = api::TxnRequest { ops, encoding: api::Encoding::Base64, ..api::TxnRequest::default() };
+        let e = api::Txn { db: self.name.clone() };
+        let resp = self.client.send(&e, &req).await?;
+        kv::executed(resp.results, n)
+            .and_then(|results| decode(resp.version, &results))
+            .map_err(|reason| Error::Malformed { path: e.path(), reason })
     }
 
     pub async fn changes(&self, req: &ChangesRequest) -> Result<ChangePage, Error> {

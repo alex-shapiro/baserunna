@@ -9,7 +9,7 @@ use super::super::Sim;
 use super::super::client::{Client as SimClient, ZOMBIE_WAIT_MS};
 use super::{chaos_phase, expect, settle};
 use baserunna_api::{ErrorCode, Outcome, Role};
-use baserunna_client::{Change, ChangesRequest, Client, Db, Error, Expect, KeyRange, Op, OpResult, Value};
+use baserunna_client::{Change, ChangesRequest, Client, Db, Error, Expect, KeyRange, Op, OpResult, ScanRequest, Value};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -137,18 +137,18 @@ async fn count(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Stri
 }
 
 async fn read_counter(sim: &Arc<Sim>, db: &Db, key: &Bytes) -> Result<(u64, Option<u64>), String> {
-    let get = [Op::Get { key: key.clone() }];
-    let out = retry(sim, || db.txn(&get, None)).await?;
-    match out.results.executed().as_deref() {
-        Some([OpResult::Get(None)]) => Ok((0, None)),
-        Some([OpResult::Get(Some(e))]) => match &e.value {
+    let keys = [key.clone()];
+    let got = retry(sim, || db.get_many(&keys)).await?;
+    match got.as_slice() {
+        [None] => Ok((0, None)),
+        [Some(e)] => match &e.value {
             Value::Inline(b) => {
                 let n = std::str::from_utf8(b).ok().and_then(|s| s.parse().ok()).ok_or("counter is not a number")?;
-                Ok((n, e.version))
+                Ok((n, Some(e.version)))
             }
             v => Err(format!("counter holds {v:?}")),
         },
-        r => Err(format!("unexpected get result {r:?}")),
+        r => Err(format!("{} results for one key", r.len())),
     }
 }
 
@@ -261,25 +261,21 @@ async fn catch_up(sim: &Arc<Sim>, db: &Db, mut r: Replica) -> Result<Replica, St
 }
 
 async fn rescan(sim: &Arc<Sim>, db: &Db) -> Result<Replica, String> {
-    let ops = [Op::Scan {
+    let req = ScanRequest {
         range: KeyRange::Prefix(Bytes::new()),
         limit: 1000,
         reverse: false,
         keys_only: false,
         cursor: None,
-    }];
-    let out = retry(sim, || db.txn(&ops, None)).await?;
-    let results = out.results.executed();
-    let Some([OpResult::Scan(page)]) = results.as_deref() else {
-        return Err("unexpected scan result".into());
     };
+    let page = retry(sim, || db.scan(&req)).await?;
     expect(page.cursor.is_none(), "the key space fits in a single page")?;
     let keys = page
         .entries
         .iter()
-        .map(|e| Ok((e.key.clone(), (e.version.ok_or("a read returned an uncommitted value")?, data(&e.value)?))))
+        .map(|e| Ok((e.key.clone(), (e.version, data(&e.value)?))))
         .collect::<Result<_, String>>()?;
-    Ok(Replica { keys, cursor: out.version.to_string() })
+    Ok(Replica { keys, cursor: page.version.to_string() })
 }
 
 async fn scan_all(sim: &Arc<Sim>, db: &Db) -> Result<BTreeMap<Bytes, (u64, Bytes)>, String> {
@@ -293,9 +289,9 @@ async fn accounts(sim: &Arc<Sim>, owner: &Client) -> Result<(), String> {
     let bad = member.with_token("not-a-token");
     let code = definitive(sim, || bad.me()).await?;
     expect(code == Some(ErrorCode::Unauthenticated), format!("a bad token fails with {code:?}"))?;
-    let get = [Op::Get { key: "k".into() }];
+    let keys = [Bytes::from_static(b"k")];
     let missing = owner.db("no-such-db");
-    let code = definitive(sim, || missing.txn(&get, None)).await?;
+    let code = definitive(sim, || missing.get_many(&keys)).await?;
     expect(code == Some(ErrorCode::NotFound), format!("a missing database fails with {code:?}"))?;
     let code = definitive(sim, || owner.create_db(DB, None)).await?;
     expect(code == Some(ErrorCode::AlreadyExists), format!("a second create fails with {code:?}"))?;

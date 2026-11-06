@@ -208,6 +208,17 @@ impl Client {
     }
 }
 
+/// The request body that [`Db::txn`] sends for `ops`. A server rejects a body larger than
+/// [`api::Limits::json_body_max`].
+pub fn txn_request(ops: &[Op], idempotency_key: Option<&str>) -> api::TxnRequest {
+    api::TxnRequest {
+        ops: ops.iter().map(Op::to_api).collect(),
+        encoding: api::Encoding::Base64,
+        idempotency_key: idempotency_key.map(Into::into),
+        ..api::TxnRequest::default()
+    }
+}
+
 fn decode<T: Body>(path: &str, resp: http::Response<Bytes>) -> Result<T, Error> {
     let (parts, body) = resp.into_parts();
     let status = parts.status.as_u16();
@@ -263,15 +274,9 @@ impl Db {
     /// [`api::Outcome::Unknown`]. Generate a new key for each distinct transaction, including after
     /// [`api::ErrorCode::Aborted`].
     pub async fn txn(&self, ops: &[Op], idempotency_key: Option<&str>) -> Result<TxnOutcome, Error> {
-        let req = api::TxnRequest {
-            ops: ops.iter().map(Op::to_api).collect(),
-            encoding: api::Encoding::Base64,
-            idempotency_key: idempotency_key.map(Into::into),
-            ..api::TxnRequest::default()
-        };
         let e = api::Txn { db: self.name.clone() };
         let path = e.path();
-        let resp = self.client.send(&e, &req).await?;
+        let resp = self.client.send(&e, &txn_request(ops, idempotency_key)).await?;
         TxnOutcome::decode(ops, resp).map_err(|reason| Error::Malformed { path, reason })
     }
 

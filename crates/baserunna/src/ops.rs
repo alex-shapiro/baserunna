@@ -486,7 +486,7 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
             let k = user_key(&enc.decode(key, "key")?)?;
             let ttl = expiry(*ttl_ms)?;
             let v = match (value, blob_id) {
-                (Some(v), None) => make_value(ctx.db, &enc.decode(v, "value")?, "application/octet-stream").await?,
+                (Some(v), None) => make_value(ctx.db, &enc.decode(v, "value")?, api::PUT_VALUE_CONTENT_TYPE).await?,
                 (None, Some(id)) => Value::Blob(blob::load_staged(ctx.db.shared(), &ctx.db.id, id).await?),
                 _ => return Err(Error::invalid("put needs exactly one of value or blob_id")),
             };

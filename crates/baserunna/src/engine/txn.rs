@@ -8,6 +8,7 @@ use super::stream::{self, StreamOp, StreamState};
 use super::types::{BlobRef, Seq, Value, is_commit_key};
 use super::version::{KeyRange, Snapshot, Version};
 use crate::error::{Error, Result};
+use baserunna_api::{KvWrite, txn_write_cost};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -432,14 +433,14 @@ impl Txn {
     /// Writes `value` with an optional expiration policy `ttl`.
     pub fn put_expiring(&mut self, key: Bytes, value: Value, ttl: Option<Ttl>) -> Result<()> {
         Txn::writable(&key)?;
-        self.account(key.len() + value.size() + if ttl.is_some() { 8 } else { 0 })?;
+        self.account(txn_write_cost(KvWrite::Put { key_len: key.len(), value_size: value.size(), expires: ttl.is_some() }))?;
         self.writes.puts.insert(key, Some(Put { value, ttl }));
         Ok(())
     }
 
     pub fn delete(&mut self, key: Bytes) -> Result<()> {
         Txn::writable(&key)?;
-        self.account(key.len() + 8)?;
+        self.account(txn_write_cost(KvWrite::Delete { key_len: key.len() }))?;
         self.writes.puts.insert(key, None);
         Ok(())
     }
@@ -450,7 +451,7 @@ impl Txn {
         if range.is_empty() {
             return Ok(());
         }
-        self.account(64)?;
+        self.account(txn_write_cost(KvWrite::DeleteRange))?;
         let doomed: Vec<Bytes> = self.writes.puts.keys().filter(|k| range.contains(k)).cloned().collect();
         for k in doomed {
             self.writes.puts.remove(&k);

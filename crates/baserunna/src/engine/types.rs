@@ -2,7 +2,7 @@
 
 use super::stream::Appended;
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
-use baserunna_api::valid_object_id;
+use baserunna_api::{StoredValue, valid_object_id};
 use bytes::Bytes;
 
 /// A database version / commit sequence number.
@@ -131,8 +131,8 @@ impl Value {
     /// Approximate encoded size.
     pub fn size(&self) -> usize {
         match self {
-            Value::Inline(b) => b.len() + 4,
-            Value::Blob(r) => r.id.len() + r.content_type.len() + 48,
+            Value::Inline(b) => StoredValue::Inline { len: b.len() }.size(),
+            Value::Blob(r) => StoredValue::Blob { blob_id_len: r.id.len(), content_type_len: r.content_type.len() }.size(),
             Value::Tombstone => 1,
         }
     }

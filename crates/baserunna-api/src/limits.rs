@@ -15,6 +15,51 @@ pub const DEFAULT_TXN_MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
 /// Default of [`Limits::json_body_max`].
 pub const DEFAULT_JSON_BODY_MAX: usize = 32 * 1024 * 1024;
 
+/// Content type of the blob that a transaction put creates for a value larger than
+/// [`Limits::value_inline_max`].
+pub const PUT_VALUE_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// A stored value, by the sizes that its encoding uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredValue {
+    /// A value of `len` bytes that is stored in the key.
+    Inline { len: usize },
+    /// A reference to a blob.
+    Blob { blob_id_len: usize, content_type_len: usize },
+}
+
+impl StoredValue {
+    /// The approximate encoded size of the value.
+    pub const fn size(self) -> usize {
+        match self {
+            StoredValue::Inline { len } => len + 4,
+            StoredValue::Blob { blob_id_len, content_type_len } => blob_id_len + content_type_len + 48,
+        }
+    }
+}
+
+/// One key-value write of a transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvWrite {
+    /// A put, an increment, or the destination of a copy. `value_size` is the
+    /// [`StoredValue::size`] of the written value, and `expires` is true if the key has an
+    /// expiration time.
+    Put { key_len: usize, value_size: usize, expires: bool },
+    Delete { key_len: usize },
+    DeleteRange,
+}
+
+/// The bytes that `w` adds to the written bytes of its transaction, which
+/// [`Limits::txn_max_write_bytes`] limits. Each write counts, also a write to a key that the
+/// transaction wrote before.
+pub const fn txn_write_cost(w: KvWrite) -> usize {
+    match w {
+        KvWrite::Put { key_len, value_size, expires } => key_len + value_size + if expires { 8 } else { 0 },
+        KvWrite::Delete { key_len } => key_len + 8,
+        KvWrite::DeleteRange => 64,
+    }
+}
+
 /// Returns true if `id` is 32 lowercase ASCII hex characters, the form of blob ids and other
 /// object ids.
 pub fn valid_object_id(id: &str) -> bool {

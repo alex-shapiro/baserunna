@@ -40,7 +40,7 @@ fn api_err(status: u16, code: &str, details: &str) -> Result<http::Response<Byte
     resp(status, &[], &ERR.replace("CODE", code).replace("DETAILS", details))
 }
 
-const GET: [Op; 1] = [Op::Get { key: Bytes::from_static(b"k") }];
+const CHECK: [Op; 1] = [Op::Check { key: Bytes::from_static(b"k"), expect: Expect::Absent }];
 
 fn put() -> Vec<Op> {
     vec![Op::Put { key: Bytes::from_static(b"k"), value: Bytes::from_static(b"v") }]
@@ -127,42 +127,6 @@ async fn change_requests_encode_the_range_and_wait() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn results_are_decoded_by_the_type_of_their_operation() {
-    let body = r#"{"version":9,"committed":false,"results":[
-        {"found":true,"value":"aGk=","version":5},
-        {"found":false},
-        {"found":true,"value":"bmV3","version":null},
-        {"items":[{"key":"dC93","value":"dw==","version":null},{"key":"dC94","version":2},{"key":"dC95","version":3,"blob":{"blob_id":"b","size":9,"sha256":"00","content_type":"x"},"value":"YmxvYg=="}],"next_cursor":"dC95"}
-    ]}"#;
-    let (c, _) = script(vec![resp(200, &[], body)]);
-    let ops = [
-        Op::Get { key: "a".into() },
-        Op::Get { key: "b".into() },
-        Op::Get { key: "c".into() },
-        Op::Scan { range: KeyRange::Prefix("t/".into()), limit: 2, reverse: false, keys_only: true, cursor: None },
-    ];
-    let out = c.db("s").txn(&ops, None).await.unwrap();
-    let meta = api::BlobMeta { blob_id: "b".into(), size: 9, sha256: "00".into(), content_type: "x".into() };
-    let entry = |k: &'static str, version, value| Entry { key: k.into(), version, value };
-    assert_eq!(
-        out.results.executed().unwrap(),
-        [
-            OpResult::Get(Some(entry("a", Some(5), Value::Inline("hi".into())))),
-            OpResult::Get(None),
-            OpResult::Get(Some(entry("c", None, Value::Inline("new".into())))),
-            OpResult::Scan(ScanPage {
-                entries: vec![
-                    entry("t/w", None, Value::Inline("w".into())),
-                    entry("t/x", Some(2), Value::Inline(Bytes::new())),
-                    entry("t/y", Some(3), Value::Blob { meta, data: Some("blob".into()) }),
-                ],
-                cursor: Some("dC95".into()),
-            }),
-        ]
-    );
-}
-
-#[tokio::test(start_paused = true)]
 async fn get_many_returns_committed_entries_in_key_order() {
     let body = r#"{"version":9,"committed":false,"results":[
         {"found":true,"value":"aGk=","version":5},
@@ -221,6 +185,9 @@ async fn reads_that_return_uncommitted_or_misaligned_results_are_malformed() {
         (false, r#"{"version":1,"committed":false,"results":[{"found":true,"value":"aGk="}]}"#),
         (false, r#"{"version":1,"committed":false,"results":[]}"#),
         (false, r#"{"version":1,"committed":false,"results":[{"items":[]}]}"#),
+        (false, r#"{"version":1,"committed":false,"results":[{"found":true,"value":"not base64!","version":1}]}"#),
+        (true, r#"{"version":1,"committed":false,"results":[{"items":[{"key":"dC94","value":"aGk="}]}]}"#),
+        (true, r#"{"unexpected":true}"#),
         (true, r#"{"version":1,"committed":false,"results":[{"items":[{"key":"dC94","version":null}]}]}"#),
         (true, r#"{"version":1,"committed":false,"results":[{"found":false}]}"#),
         (true, r#"{"version":1,"committed":false,"results":null}"#),
@@ -245,19 +212,14 @@ async fn replayed_transactions_omit_results() {
 
 #[tokio::test(start_paused = true)]
 async fn responses_that_do_not_match_their_operations_are_malformed() {
-    let scan =
-        [Op::Scan { range: KeyRange::Prefix("t/".into()), limit: 1, reverse: false, keys_only: false, cursor: None }];
-    for (ops, body) in [
-        (&GET[..], r#"{"version":1,"committed":false,"results":[]}"#),
-        (&GET, r#"{"version":1,"committed":false,"results":null}"#),
-        (&GET, r#"{"version":1,"committed":false,"results":[{"found":true,"value":"aGk="}]}"#),
-        (&GET, r#"{"version":1,"committed":false,"results":[{"found":true,"value":"not base64!","version":1}]}"#),
-        (&GET, r#"{"version":1,"committed":false,"results":[{"items":[]}]}"#),
-        (&scan, r#"{"version":1,"committed":false,"results":[{"items":[{"key":"dC94","value":"aGk="}]}]}"#),
-        (&GET, r#"{"unexpected":true}"#),
+    for body in [
+        r#"{"version":1,"committed":false,"results":[]}"#,
+        r#"{"version":1,"committed":false,"results":null}"#,
+        r#"{"version":1,"committed":false,"results":["not an object"]}"#,
+        r#"{"unexpected":true}"#,
     ] {
         let (c, s) = script(vec![resp(200, &[], body)]);
-        let e = c.db("s").txn(ops, None).await.unwrap_err();
+        let e = c.db("s").txn(&CHECK, None).await.unwrap_err();
         assert!(matches!(e, Error::Malformed { .. }), "{body}: {e:?}");
         assert_eq!(sent(&s), 1, "{body}: a malformed response is not retried");
     }
@@ -277,7 +239,7 @@ async fn api_errors_preserve_code_details_and_outcome() {
     ];
     for (status, code, details, outcome, attempts) in cases {
         let (c, s) = script(vec![api_err(status, code, details)]);
-        let e = c.db("s").txn(&GET, None).await.unwrap_err();
+        let e = c.db("s").txn(&CHECK, None).await.unwrap_err();
         assert_eq!(e.outcome(), outcome, "{code} {details}");
         assert_eq!(sent(&s), attempts, "{code} {details}: attempts");
         let Error::Api { status: got, error, .. } = &e else { panic!("{e:?}") };
@@ -320,7 +282,7 @@ async fn proxy_pages_are_foreign_and_retried_only_if_transient() {
     for (status, attempts) in [(401, 1), (403, 1), (404, 1), (413, 1), (407, 4), (408, 4), (429, 4), (502, 4), (200, 4)]
     {
         let (c, s) = script(vec![resp(status, &[], "<html>Error</html>")]);
-        let e = c.db("s").txn(&GET, None).await.unwrap_err();
+        let e = c.db("s").txn(&CHECK, None).await.unwrap_err();
         assert!(matches!(e, Error::Foreign { status: got, .. } if got == status), "{status}: {e:?}");
         assert_eq!(sent(&s), attempts, "HTTP {status}");
     }
@@ -330,12 +292,12 @@ async fn proxy_pages_are_foreign_and_retried_only_if_transient() {
 async fn retries_back_off_and_follow_retry_after_up_to_a_bound() {
     let began = tokio::time::Instant::now();
     let (c, _) = script(vec![resp(503, &[], "<html>Busy</html>")]);
-    c.db("s").txn(&GET, None).await.unwrap_err();
+    c.db("s").txn(&CHECK, None).await.unwrap_err();
     assert_eq!(began.elapsed().as_millis(), 100 + 300 + 900, "backoff triples");
 
     let began = tokio::time::Instant::now();
     let (c, _) = script(vec![resp(503, &[("retry-after", "3")], "<html>Busy</html>")]);
-    c.db("s").txn(&GET, None).await.unwrap_err();
+    c.db("s").txn(&CHECK, None).await.unwrap_err();
     assert_eq!(began.elapsed().as_millis(), 9_000, "each of 3 retries waits 3 s");
 
     let began = tokio::time::Instant::now();
@@ -345,14 +307,14 @@ async fn retries_back_off_and_follow_retry_after_up_to_a_bound() {
 
     let (c, s) = script(vec![resp(503, &[], "<html>Busy</html>")]);
     let one = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() });
-    one.db("s").txn(&GET, None).await.unwrap_err();
+    one.db("s").txn(&CHECK, None).await.unwrap_err();
     assert_eq!(sent(&s), 1);
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_request_that_times_out_is_not_sent_again() {
     let (c, s) = script(vec![Err(TransportError::TimedOut("deadline".into()))]);
-    let e = c.db("s").txn(&GET, None).await.unwrap_err();
+    let e = c.db("s").txn(&CHECK, None).await.unwrap_err();
     assert_eq!((e.outcome(), sent(&s)), (Outcome::Unknown, 1));
 }
 
@@ -436,16 +398,16 @@ fn arbitrary_responses_never_panic_the_client() {
             let c = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() });
             let db = c.db("s");
             let ops = [
-                Op::Get { key: "a".into() },
-                Op::Scan {
-                    range: KeyRange::Prefix("t/".into()),
-                    limit: 10,
-                    reverse: false,
-                    keys_only: false,
-                    cursor: None,
-                },
+                Op::Increment { key: "a".into(), by: 1, ttl_ms: None },
                 Op::Check { key: "a".into(), expect: Expect::Absent },
             ];
+            let scan = ScanRequest {
+                range: KeyRange::Prefix("t/".into()),
+                limit: 10,
+                reverse: false,
+                keys_only: false,
+                cursor: None,
+            };
             let req = ChangesRequest {
                 range: KeyRange::Prefix("t/".into()),
                 after: "0".into(),
@@ -453,8 +415,10 @@ fn arbitrary_responses_never_panic_the_client() {
                 wait_ms: 0,
                 max_staleness_ms: None,
             };
-            match r.below(5) {
+            match r.below(7) {
                 0 => drop(db.txn(&ops, None).await),
+                5 => drop(db.get_many(&[Bytes::from_static(b"a")]).await),
+                6 => drop(db.scan(&scan).await),
                 1 => drop(db.changes(&req).await),
                 2 => drop(db.stage_blob(Bytes::from_static(b"x")).await),
                 3 => drop(c.sign_up("e", "p").await),
@@ -516,11 +480,9 @@ async fn increments_return_the_new_value() {
 
 #[tokio::test(start_paused = true)]
 async fn results_that_do_not_match_their_operation_are_malformed() {
-    for (op, result) in [
-        (Op::Increment { key: "n".into(), by: 1, ttl_ms: None }, "{}"),
-        (Op::Delete { key: "n".into() }, "1"),
-        (Op::Get { key: "n".into() }, r#"{"value":1}"#),
-    ] {
+    for (op, result) in
+        [(Op::Increment { key: "n".into(), by: 1, ttl_ms: None }, "{}"), (Op::Delete { key: "n".into() }, "1")]
+    {
         let body = format!(r#"{{"version":4,"committed":true,"results":[{result}]}}"#);
         let (c, _) = script(vec![resp(200, &[], &body)]);
         let err = c.db("d").txn(&[op], Some("k")).await.unwrap_err();
@@ -533,9 +495,9 @@ async fn scans_send_their_cursor() {
     let ok = r#"{"version":4,"committed":false,"results":[{"items":[],"next_cursor":null}]}"#;
     let (c, s) = script(vec![resp(200, &[], ok)]);
     let range = KeyRange::Span { start: "a".into(), end: "b".into() };
-    let ops = [Op::Scan { range, limit: 5, reverse: true, keys_only: false, cursor: Some("YWE".into()) }];
-    let out = c.db("d").txn(&ops, None).await.unwrap();
-    assert_eq!(out.results, TxnResults::Executed(vec![OpResult::Scan(ScanPage { entries: vec![], cursor: None })]));
+    let req = ScanRequest { range, limit: 5, reverse: true, keys_only: false, cursor: Some("YWE".into()) };
+    let page = c.db("d").scan(&req).await.unwrap();
+    assert_eq!(page, CommittedPage { version: 4, entries: vec![], cursor: None });
     let body: serde_json::Value = serde_json::from_slice(s.requests.lock().unwrap()[0].body()).unwrap();
     let want =
         serde_json::json!({"op": "scan", "start": "YQ==", "end": "Yg==", "limit": 5, "reverse": true, "cursor": "YWE"});

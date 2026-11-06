@@ -4,23 +4,9 @@ use crate::api::{self, b64};
 use bytes::Bytes;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// An operation of a [`Db::txn`](crate::Db::txn). Reads use
+/// [`Db::get_many`](crate::Db::get_many) and [`Db::scan`](crate::Db::scan).
 pub enum Op {
-    /// Reads `key` inside a transaction. A read-only read uses
-    /// [`Db::get_many`](crate::Db::get_many), which returns committed versions.
-    Get {
-        key: Bytes,
-    },
-    /// Reads up to `limit` entries in `range` in ascending order, or descending if `reverse` is
-    /// true. If `keys_only` is true, entries omit inline values and blob data. To read the next
-    /// page, repeat the scan with `cursor` set to [`ScanPage::cursor`] of the previous page. A
-    /// read-only scan uses [`Db::scan`](crate::Db::scan), which returns committed versions.
-    Scan {
-        range: KeyRange,
-        limit: usize,
-        reverse: bool,
-        keys_only: bool,
-        cursor: Option<String>,
-    },
     Put {
         key: Bytes,
         value: Bytes,
@@ -75,21 +61,12 @@ pub enum Expect {
 
 impl Op {
     pub fn is_write(&self) -> bool {
-        !matches!(self, Op::Get { .. } | Op::Scan { .. } | Op::Check { .. })
+        !matches!(self, Op::Check { .. })
     }
 
     pub(crate) fn to_api(&self) -> api::Op {
         let k = |b: &Bytes| b64::encode(b);
         match self {
-            Op::Get { key } => api::Op::Get { key: k(key) },
-            Op::Scan { range, limit, reverse, keys_only, cursor } => ScanRequest {
-                range: range.clone(),
-                limit: *limit,
-                reverse: *reverse,
-                keys_only: *keys_only,
-                cursor: cursor.clone(),
-            }
-            .to_api(),
             Op::Put { key, value } => {
                 api::Op::Put { key: k(key), value: Some(b64::encode(value)), blob_id: None, ttl_ms: None }
             }
@@ -157,14 +134,6 @@ pub enum Value {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Entry {
-    pub key: Bytes,
-    /// Commit version of the value, or `None` if this transaction wrote it.
-    pub version: Option<u64>,
-    pub value: Value,
-}
-
 /// A value that a read-only snapshot returned. Every value in a snapshot is committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommittedEntry {
@@ -174,12 +143,7 @@ pub struct CommittedEntry {
     pub value: Value,
 }
 
-impl Entry {
-    fn committed(self) -> Result<CommittedEntry, String> {
-        let version = self.version.ok_or("a read-only transaction returned an uncommitted value")?;
-        Ok(CommittedEntry { key: self.key, version, value: self.value })
-    }
-}
+const UNCOMMITTED: &str = "a read-only transaction returned an uncommitted value";
 
 /// One page of a [`Db::scan`](crate::Db::scan).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,16 +156,7 @@ pub struct CommittedPage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScanPage {
-    pub entries: Vec<Entry>,
-    /// Opaque position after the last entry, or `None` if the range has no more entries.
-    pub cursor: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpResult {
-    Get(Option<Entry>),
-    Scan(ScanPage),
     /// The new value of an [`Op::Increment`].
     Counter(i64),
     Done,
@@ -217,10 +172,8 @@ pub struct TxnOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TxnResults {
-    /// The request executed the operations. Holds one result per operation, in order, and the
-    /// variant of each result matches its operation: [`OpResult::Get`] for [`Op::Get`],
-    /// [`OpResult::Scan`] for [`Op::Scan`], [`OpResult::Counter`] for [`Op::Increment`], and
-    /// [`OpResult::Done`] for the others.
+    /// The request executed the operations. Holds one result per operation, in order:
+    /// [`OpResult::Counter`] for [`Op::Increment`], and [`OpResult::Done`] for the others.
     Executed(Vec<OpResult>),
     /// An earlier request with the same idempotency key committed the transaction at `version`.
     /// The server does not keep the results of that request. Only a write transaction with an
@@ -264,42 +217,31 @@ pub(crate) fn executed(results: Option<Vec<api::OpResult>>, ops: usize) -> Resul
 
 /// Decodes the result of a read-only get of `key`.
 pub(crate) fn committed_get(key: &Bytes, r: &api::OpResult) -> Result<Option<CommittedEntry>, String> {
-    get_entry(key, r)?.map(Entry::committed).transpose()
-}
-
-/// Decodes the result of a read-only scan in the snapshot at `version`.
-pub(crate) fn committed_page(version: u64, r: &api::OpResult) -> Result<CommittedPage, String> {
-    let page = scan_page(r)?;
-    let entries = page.entries.into_iter().map(Entry::committed).collect::<Result<_, _>>()?;
-    Ok(CommittedPage { version, entries, cursor: page.cursor })
-}
-
-fn get_entry(key: &Bytes, r: &api::OpResult) -> Result<Option<Entry>, String> {
     let g: api::GetResult = r.decode()?;
     if !g.found {
         return Ok(None);
     }
-    Ok(Some(Entry {
+    Ok(Some(CommittedEntry {
         key: key.clone(),
-        version: g.version.ok_or("get result is missing its version")?,
+        version: g.version.ok_or("get result is missing its version")?.ok_or(UNCOMMITTED)?,
         value: value(g.value.as_deref(), g.blob)?,
     }))
 }
 
-fn scan_page(r: &api::OpResult) -> Result<ScanPage, String> {
+/// Decodes the result of a read-only scan in the snapshot at `version`.
+pub(crate) fn committed_page(version: u64, r: &api::OpResult) -> Result<CommittedPage, String> {
     let s: api::ScanResult = r.decode()?;
     let mut entries = Vec::with_capacity(s.items.len());
     for it in s.items {
         let key = it.key.as_deref().ok_or("scan item is missing a key")?;
-        entries.push(Entry { key: bytes(key)?, version: it.version, value: value(it.value.as_deref(), it.blob)? });
+        let v = it.version.ok_or(UNCOMMITTED)?;
+        entries.push(CommittedEntry { key: bytes(key)?, version: v, value: value(it.value.as_deref(), it.blob)? });
     }
-    Ok(ScanPage { entries, cursor: s.next_cursor })
+    Ok(CommittedPage { version, entries, cursor: s.next_cursor })
 }
 
 fn decode_result(op: &Op, r: &api::OpResult) -> Result<OpResult, String> {
     Ok(match op {
-        Op::Get { key } => OpResult::Get(get_entry(key, r)?),
-        Op::Scan { .. } => OpResult::Scan(scan_page(r)?),
         Op::Increment { .. } => OpResult::Counter(r.decode::<api::IncrementResult>()?.value),
         Op::Put { .. }
         | Op::PutBlob { .. }

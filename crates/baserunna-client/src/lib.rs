@@ -22,8 +22,8 @@ mod transport;
 pub use baserunna_api as api;
 pub use error::Error;
 pub use kv::{
-    Change, ChangePage, ChangesRequest, CommittedEntry, CommittedPage, Entry, Expect, KeyRange, Op, OpResult, ScanPage,
-    ScanRequest, TxnOutcome, TxnResults, Value,
+    Change, ChangePage, ChangesRequest, CommittedEntry, CommittedPage, Expect, KeyRange, Op, OpResult, ScanRequest,
+    TxnOutcome, TxnResults, Value,
 };
 #[cfg(feature = "reqwest")]
 pub use transport::HttpTransport;

@@ -223,3 +223,26 @@ fn change_queries_parse_flags_like_the_server() {
     let back: ChangesQuery = serde_urlencoded::from_str(&serde_urlencoded::to_string(&q).unwrap()).unwrap();
     assert_eq!(back, q);
 }
+
+#[test]
+fn json_bodies_read_an_empty_body_as_the_empty_object() {
+    #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+    struct Opts {
+        #[serde(default)]
+        n: u32,
+    }
+    assert_eq!(crate::Json::<Opts>::decode(Bytes::new()), Ok(crate::Json(Opts::default())));
+    assert_eq!(crate::Json(Opts { n: 2 }).encode(), Bytes::from_static(br#"{"n":2}"#));
+    assert!(crate::Json::<Opts>::decode(Bytes::from_static(b"[")).is_err());
+}
+
+#[test]
+fn with_query_omits_an_empty_query() {
+    #[derive(Serialize)]
+    struct Q {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        a: Option<&'static str>,
+    }
+    assert_eq!(with_query("/x".into(), &Q { a: None }), "/x");
+    assert_eq!(with_query("/x".into(), &Q { a: Some("b c&") }), "/x?a=b+c%26");
+}

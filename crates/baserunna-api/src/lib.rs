@@ -94,6 +94,25 @@ impl Body for Octets {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Empty {}
 
+/// An `application/json` request or response body of type `T`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Json<T>(pub T);
+
+impl<T: Serialize + serde::de::DeserializeOwned> Body for Json<T> {
+    const CONTENT_TYPE: Option<&'static str> = Some("application/json");
+
+    fn encode(&self) -> Bytes {
+        serde_json::to_vec(&self.0).expect("API types serialize to JSON").into()
+    }
+
+    /// An empty body is the empty object, so a request whose fields all have defaults can omit
+    /// its body.
+    fn decode(b: Bytes) -> Result<Json<T>, String> {
+        let b: &[u8] = if b.is_empty() { b"{}" } else { &b };
+        serde_json::from_slice(b).map(Json).map_err(|e| e.to_string())
+    }
+}
+
 /// Implements [`Body`] as `application/json` for each type.
 macro_rules! json_body {
     ($($t:ty),* $(,)?) => {$(
@@ -150,7 +169,8 @@ pub fn percent_encode(s: &str, out: &mut String) {
     }
 }
 
-pub(crate) fn with_query<Q: Serialize>(mut path: String, query: &Q) -> String {
+/// Appends the URL-encoded `query` to `path`, with a `?` if the query is not empty.
+pub fn with_query<Q: Serialize>(mut path: String, query: &Q) -> String {
     let q = serde_urlencoded::to_string(query).expect("API query types serialize");
     if !q.is_empty() {
         path.push('?');

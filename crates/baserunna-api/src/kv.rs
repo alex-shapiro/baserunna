@@ -496,7 +496,9 @@ pub struct ScanItem {
     pub value_b64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob: Option<BlobMeta>,
-    /// Key version, or `None` if the key was written earlier in the same transaction.
+    /// Key version, or `None` if the key was written earlier in the same transaction. The field
+    /// is required: a missing field is a decode error, not `None`.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub version: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,

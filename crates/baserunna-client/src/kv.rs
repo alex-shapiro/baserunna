@@ -210,7 +210,7 @@ fn decode_result(op: &Op, r: &api::OpResult) -> Result<OpResult, String> {
                 false => None,
                 true => Some(Entry {
                     key: key.clone(),
-                    version: g.version.flatten(),
+                    version: g.version.ok_or("get result is missing its version")?,
                     value: value(g.value.as_deref(), g.blob)?,
                 }),
             })

@@ -131,8 +131,8 @@ async fn results_are_decoded_by_the_type_of_their_operation() {
     let body = r#"{"version":9,"committed":false,"results":[
         {"found":true,"value":"aGk=","version":5},
         {"found":false},
-        {"found":true,"value":"bmV3"},
-        {"items":[{"key":"dC93","value":"dw=="},{"key":"dC94","version":2},{"key":"dC95","version":3,"blob":{"blob_id":"b","size":9,"sha256":"00","content_type":"x"},"value":"YmxvYg=="}],"next_cursor":"dC95"}
+        {"found":true,"value":"bmV3","version":null},
+        {"items":[{"key":"dC93","value":"dw==","version":null},{"key":"dC94","version":2},{"key":"dC95","version":3,"blob":{"blob_id":"b","size":9,"sha256":"00","content_type":"x"},"value":"YmxvYg=="}],"next_cursor":"dC95"}
     ]}"#;
     let (c, _) = script(vec![resp(200, &[], body)]);
     let ops = [
@@ -172,15 +172,19 @@ async fn replayed_transactions_omit_results() {
 
 #[tokio::test(start_paused = true)]
 async fn responses_that_do_not_match_their_operations_are_malformed() {
-    for body in [
-        r#"{"version":1,"committed":false,"results":[]}"#,
-        r#"{"version":1,"committed":false,"results":null}"#,
-        r#"{"version":1,"committed":false,"results":[{"found":true,"value":"not base64!","version":1}]}"#,
-        r#"{"version":1,"committed":false,"results":[{"items":[]}]}"#,
-        r#"{"unexpected":true}"#,
+    let scan =
+        [Op::Scan { range: KeyRange::Prefix("t/".into()), limit: 1, reverse: false, keys_only: false, cursor: None }];
+    for (ops, body) in [
+        (&GET[..], r#"{"version":1,"committed":false,"results":[]}"#),
+        (&GET, r#"{"version":1,"committed":false,"results":null}"#),
+        (&GET, r#"{"version":1,"committed":false,"results":[{"found":true,"value":"aGk="}]}"#),
+        (&GET, r#"{"version":1,"committed":false,"results":[{"found":true,"value":"not base64!","version":1}]}"#),
+        (&GET, r#"{"version":1,"committed":false,"results":[{"items":[]}]}"#),
+        (&scan, r#"{"version":1,"committed":false,"results":[{"items":[{"key":"dC94","value":"aGk="}]}]}"#),
+        (&GET, r#"{"unexpected":true}"#),
     ] {
         let (c, s) = script(vec![resp(200, &[], body)]);
-        let e = c.db("s").txn(&GET, None).await.unwrap_err();
+        let e = c.db("s").txn(ops, None).await.unwrap_err();
         assert!(matches!(e, Error::Malformed { .. }), "{body}: {e:?}");
         assert_eq!(sent(&s), 1, "{body}: a malformed response is not retried");
     }

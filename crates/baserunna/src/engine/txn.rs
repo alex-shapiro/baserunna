@@ -433,7 +433,11 @@ impl Txn {
     /// Writes `value` with an optional expiration policy `ttl`.
     pub fn put_expiring(&mut self, key: Bytes, value: Value, ttl: Option<Ttl>) -> Result<()> {
         Txn::writable(&key)?;
-        self.account(txn_write_cost(KvWrite::Put { key_len: key.len(), value_size: value.size(), expires: ttl.is_some() }))?;
+        self.account(txn_write_cost(KvWrite::Put {
+            key_len: key.len(),
+            value_size: value.size(),
+            expires: ttl.is_some(),
+        }))?;
         self.writes.puts.insert(key, Some(Put { value, ttl }));
         Ok(())
     }

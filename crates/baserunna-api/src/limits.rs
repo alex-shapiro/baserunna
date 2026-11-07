@@ -49,8 +49,14 @@ pub enum KvWrite {
     /// A put, an increment, or the destination of a copy. `value_size` is the
     /// [`StoredValue::size`] of the written value, and `expires` is true if the key has an
     /// expiration time.
-    Put { key_len: usize, value_size: usize, expires: bool },
-    Delete { key_len: usize },
+    Put {
+        key_len: usize,
+        value_size: usize,
+        expires: bool,
+    },
+    Delete {
+        key_len: usize,
+    },
     DeleteRange,
 }
 

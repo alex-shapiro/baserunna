@@ -132,7 +132,9 @@ impl Value {
     pub fn size(&self) -> usize {
         match self {
             Value::Inline(b) => StoredValue::Inline { len: b.len() }.size(),
-            Value::Blob(r) => StoredValue::Blob { blob_id_len: r.id.len(), content_type_len: r.content_type.len() }.size(),
+            Value::Blob(r) => {
+                StoredValue::Blob { blob_id_len: r.id.len(), content_type_len: r.content_type.len() }.size()
+            }
             Value::Tombstone => 1,
         }
     }

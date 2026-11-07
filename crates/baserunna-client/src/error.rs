@@ -60,9 +60,11 @@ impl Error {
         if unknown { Outcome::Unknown } else { Outcome::NotApplied }
     }
 
+    /// Returns the delay that the server or a proxy asked for before the next request.
     pub fn retry_after_ms(&self) -> Option<u64> {
         match self {
             Error::Api { retry_after_ms, .. } | Error::Foreign { retry_after_ms, .. } => *retry_after_ms,
+            Error::NotApplied(e) => e.retry_after_ms(),
             _ => None,
         }
     }

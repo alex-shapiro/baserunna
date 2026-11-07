@@ -237,7 +237,26 @@ impl Op {
     }
 
     pub fn is_write(&self) -> bool {
-        self.to_api().is_write()
+        match self {
+            Op::Get { .. }
+            | Op::Scan { .. }
+            | Op::Check { .. }
+            | Op::GetRow { .. }
+            | Op::QueryRows { .. }
+            | Op::ReadStream(_) => false,
+            Op::Put { .. }
+            | Op::PutBlob { .. }
+            | Op::Delete { .. }
+            | Op::DeleteRange { .. }
+            | Op::Copy { .. }
+            | Op::Increment { .. }
+            | Op::InsertRow { .. }
+            | Op::UpsertRow { .. }
+            | Op::UpdateRow { .. }
+            | Op::DeleteRow { .. }
+            | Op::DeleteRows { .. }
+            | Op::Append { .. } => true,
+        }
     }
 
     /// Returns the operation that reads the page after `result`, or `None` if `result` is the
@@ -261,8 +280,12 @@ impl Op {
     }
 
     pub(crate) fn to_api(&self) -> api::Op {
+        self.clone().into_api()
+    }
+
+    pub(crate) fn into_api(self) -> api::Op {
         let k = |b: &Bytes| b64::encode(b);
-        match self.clone() {
+        match self {
             Op::Get { key } => api::Op::Get { key: k(&key) },
             Op::Scan { range, limit, reverse, keys_only, cursor } => {
                 let (prefix, start, end) = prefix_start_end(&range);

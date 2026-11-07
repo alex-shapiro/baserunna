@@ -193,21 +193,20 @@ impl Client {
                     _ => Box::new(Failed { error: err, refusal: None }),
                 });
             }
-            match err.retry_after_ms() {
-                Some(ms) => {
-                    tokio::time::sleep(Duration::from_millis(ms.min(self.retry_policy.max_retry_after_ms))).await
-                }
-                None => self.backoff(attempt).await,
-            }
+            self.backoff(attempt, &err).await;
             attempt += 1;
         }
     }
 
-    /// Sleeps for a random delay up to the backoff bound of failed attempt `attempt`, so that
+    /// Sleeps before the attempt after failed attempt `attempt`, which ended with `err`: for the
+    /// delay the server asked for, or else for a random delay up to the backoff bound, so that
     /// clients that failed together do not retry together.
-    pub(crate) async fn backoff(&self, attempt: u32) {
-        let bound = self.retry_policy.backoff_ms(attempt);
-        tokio::time::sleep(Duration::from_millis(1 + (self.entropy)() % bound.max(1))).await;
+    pub(crate) async fn backoff(&self, attempt: u32, err: &Error) {
+        let ms = match err.retry_after_ms() {
+            Some(ms) => ms.min(self.retry_policy.max_retry_after_ms),
+            None => 1 + (self.entropy)() % self.retry_policy.backoff_ms(attempt).max(1),
+        };
+        tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 
     /// Returns a random 128-bit idempotency key as 32 lowercase hex digits.
@@ -417,16 +416,14 @@ impl Db {
         let key = self.client.random_id();
         let started = tokio::time::Instant::now();
         let e = api::Txn { db: self.name.clone() };
-        let sent = self.client.attempts(&e, &txn_request(ops, Some(&key)), None).await;
-        let out = sent.and_then(|resp| {
-            let resp = resp.expect("no error is allowed");
-            let malformed =
-                |reason| Box::new(Failed { error: Error::Malformed { path: e.path(), reason }, refusal: None });
-            TxnOutcome::decode(ops, resp).map_err(malformed)
-        });
-        match out {
-            Ok(out) => {
-                Ok(out.commit_id.map(|commit_id| Committed { version: out.version, commit_id, appends: out.appends }))
+        match self.client.attempts(&e, &txn_request(ops, Some(&key)), None).await {
+            Ok(resp) => {
+                let resp = resp.expect("no error is allowed");
+                Ok(resp.commit_id.map(|commit_id| Committed {
+                    version: resp.version,
+                    commit_id,
+                    appends: resp.appends.unwrap_or_default(),
+                }))
             }
             Err(f) if f.error.outcome() == api::Outcome::Unknown => {
                 let Failed { error, refusal } = *f;

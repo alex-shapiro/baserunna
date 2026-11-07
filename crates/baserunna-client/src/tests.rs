@@ -768,6 +768,20 @@ async fn retry_restarts_a_transaction_that_the_server_lost() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn retry_restarts_a_transaction_after_the_delay_the_server_asked_for() {
+    let (c, _) = script(vec![api_err(429, "rate_limited", r#"{"retry_after_ms":5000}"#)]);
+    let db = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() }).db("s");
+    let limited = db.write(&put()).await.unwrap_err();
+    for e in [limited.clone(), Error::NotApplied(Box::new(limited))] {
+        assert_eq!(e.retry_after_ms(), Some(5000), "{e:?}");
+        let mut retry = db.retry();
+        let began = tokio::time::Instant::now();
+        let r: Result<Option<()>, Error> = retry.finish(db.begin(), Err(e)).await;
+        assert_eq!((r, began.elapsed().as_millis()), (Ok(None), 5000));
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_not_committed_status_older_than_its_retention_leaves_the_outcome_unknown() {
     let lost = Err(TransportError::Unknown("response lost".into()));
     let expired = r#"{"status":"not_committed","commit_id":"0000000000000001","retention_ms":1}"#;

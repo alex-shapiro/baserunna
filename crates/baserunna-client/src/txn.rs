@@ -62,10 +62,9 @@ impl Txn {
             return Ok(Vec::new());
         }
         let queued = self.writes.len();
-        let ops: Vec<Op> = self.writes.drain(..).chain(ops.iter().cloned()).collect();
+        self.wrote |= self.writes.iter().chain(ops).any(Op::is_write);
         self.started.get_or_insert_with(tokio::time::Instant::now);
-        let api_ops: Vec<api::Op> = ops.iter().map(Op::to_api).collect();
-        self.wrote |= api_ops.iter().any(api::Op::is_write);
+        let api_ops: Vec<api::Op> = self.writes.drain(..).map(Op::into_api).chain(ops.iter().map(Op::to_api)).collect();
         // The transaction counts as failed until the request completes, so that it cannot commit
         // operations of a request that its caller cancelled.
         let cancelled = TransportError::Unknown("a request on the transaction was cancelled".into());
@@ -90,12 +89,15 @@ impl Txn {
         let Ok(results) = sent else {
             return Err(self.failed.clone().expect("a failed request is recorded"));
         };
-        let mut results = decode_results(&ops, &results).map_err(|reason| {
+        let results = match results.len() == queued + ops.len() {
+            true => decode_results(ops, &results[queued..]),
+            false => Err(format!("{} results for {} operations", results.len(), queued + ops.len())),
+        };
+        results.map_err(|reason| {
             let e = not_applied(&Error::Malformed { path, reason });
             self.failed = Some(e.clone());
             e
-        })?;
-        Ok(results.split_off(queued))
+        })
     }
 
     pub async fn run_one(&mut self, op: Op) -> Result<OpResult, Error> {
@@ -116,8 +118,17 @@ impl Txn {
     /// the commit, an [`Error::NotApplied`], or the original error if the server cannot be
     /// reached.
     pub async fn commit(mut self) -> Result<Option<Committed>, Error> {
+        let r = self.try_commit().await;
+        if r.is_err() {
+            self.end().await;
+        }
+        r
+    }
+
+    /// Commits like [`Txn::commit`], but leaves a transaction whose commit was refused open for the
+    /// caller to abort.
+    async fn try_commit(&mut self) -> Result<Option<Committed>, Error> {
         if let Some(e) = self.failed.clone() {
-            self.abort().await;
             return Err(e);
         }
         let writes = std::mem::take(&mut self.writes);
@@ -126,7 +137,8 @@ impl Txn {
         };
         let e = api::CommitTxn { db: self.db.name().into(), id: id.clone() };
         let commit_id = commit_id.clone();
-        let body = api::CommitRequest { ops: writes.iter().map(Op::to_api).collect() };
+        let wrote = self.wrote || !writes.is_empty();
+        let body = api::CommitRequest { ops: writes.into_iter().map(Op::into_api).collect() };
         let err = match self.db.client().send(&e, &body).await {
             Ok(c) => {
                 self.open = None;
@@ -136,25 +148,43 @@ impl Txn {
             Err(e) if e.outcome() == Outcome::NotApplied => {
                 // A commit rejected before it reached the transaction, such as by a rate limit, leaves it open.
                 self.failed = Some(e.clone());
-                self.abort().await;
                 return Err(e);
             }
             Err(e) => e,
         };
-        if !self.wrote && writes.is_empty() {
+        // The server ends a transaction once its commit arrives, so after an unknown outcome an
+        // abort matters only if the commit was lost on the way, and is not waited for.
+        if !wrote {
+            self.end_later();
             return Err(Error::NotApplied(Box::new(err)));
         }
         let started = self.started.unwrap_or_else(tokio::time::Instant::now);
-        let resolved = self.db.resolve(&commit_id, started, err, None).await?;
-        self.open = None;
-        Ok(Some(resolved))
+        let resolved = self.db.resolve(&commit_id, started, err, None).await;
+        match resolved {
+            Ok(_) => self.open = None,
+            Err(_) => self.end_later(),
+        }
+        resolved.map(Some)
     }
 
     /// Aborts the transaction, ignoring failures because the server aborts an idle transaction
     /// after its timeout. If the abort is cancelled, dropping the transaction aborts it again.
     pub async fn abort(mut self) {
+        self.end().await;
+    }
+
+    /// Aborts the transaction if it is still open on the server.
+    async fn end(&mut self) {
         if let Some(id) = self.open_id() {
             abort(&self.db, id).await;
+        }
+        self.open = None;
+    }
+
+    /// Aborts the transaction in the background on the current Tokio runtime.
+    fn end_later(&mut self) {
+        if let Some(id) = self.open_id() {
+            abort_later(self.db.clone(), id);
         }
         self.open = None;
     }
@@ -168,9 +198,7 @@ impl Txn {
 
 impl Drop for Txn {
     fn drop(&mut self) {
-        if let Some(id) = self.open_id() {
-            abort_later(self.db.clone(), id);
-        }
+        self.end_later();
     }
 }
 
@@ -263,27 +291,29 @@ pub struct Retry {
 }
 
 impl Retry {
-    /// Commits `txn` if `result` is `Ok`, or aborts it otherwise.
+    /// Commits `txn` if `result` is `Ok`, or aborts it otherwise, during the backoff if the
+    /// transaction runs again.
     ///
     /// Returns the committed result, `Ok(None)` after a backoff if the transaction should run
     /// again, or the error that ends the loop.
-    pub async fn finish<T, E: TxnError>(&mut self, txn: Txn, result: Result<T, E>) -> Result<Option<T>, E> {
+    pub async fn finish<T, E: TxnError>(&mut self, mut txn: Txn, result: Result<T, E>) -> Result<Option<T>, E> {
         let err = match result {
-            Ok(v) => match txn.commit().await {
+            Ok(v) => match txn.try_commit().await {
                 Ok(_) => return Ok(Some(v)),
                 Err(e) => E::from(e),
             },
-            Err(e) => {
-                txn.abort().await;
-                e
-            }
+            Err(e) => e,
         };
-        let restart = err.client_error().is_some_and(Error::restarts_txn);
         let client = self.db.client();
-        if !restart || self.attempt >= client.retry_policy().txn_attempts {
-            return Err(err);
+        match err.client_error() {
+            Some(e) if e.restarts_txn() && self.attempt < client.retry_policy().txn_attempts => {
+                tokio::join!(txn.end(), client.backoff(self.attempt, e));
+            }
+            _ => {
+                txn.end().await;
+                return Err(err);
+            }
         }
-        client.backoff(self.attempt).await;
         self.attempt += 1;
         Ok(None)
     }

@@ -9,13 +9,42 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use baserunna::client::Client;
 use baserunna::meta::SignupPolicy;
 use baserunna::util::sha256;
-use baserunna_api::b64;
+use baserunna_client::api::{self, BlobMeta, ByteRange, ColumnType, NewColumn, NewIndex, NewTable, Selection, b64};
+use baserunna_client::{Client, HttpTransport, Op, Row};
 use bytes::Bytes;
 use common::step;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+/// Asset row as read: the `file` column holds the blob's metadata.
+#[derive(Serialize, Deserialize)]
+struct Asset {
+    id: String,
+    title: String,
+    kind: String,
+    width: Option<i64>,
+    file: Option<BlobMeta>,
+}
+
+impl Row for Asset {
+    const TABLE: &str = "assets";
+}
+
+/// Asset row as written: the `file` column takes the `blob_id` of a staged blob.
+#[derive(Serialize, Deserialize)]
+struct NewAsset {
+    id: String,
+    title: String,
+    kind: String,
+    width: Option<i64>,
+    file: Option<String>,
+}
+
+impl Row for NewAsset {
+    const TABLE: &str = Asset::TABLE;
+}
 
 fn fake_image(seed: u8, len: usize) -> Bytes {
     let mut x: u32 = (seed as u32).wrapping_mul(2654435761);
@@ -34,24 +63,29 @@ fn fake_image(seed: u8, len: usize) -> Bytes {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = common::start(common::shared_store(), "media", SignupPolicy::FirstUserOnly).await;
-    let me = Client::new(&server.url).signup("studio@example.com", "film-grain-42").await?;
-    me.create_db("media").await?;
-    me.post(
-        "/v1/dbs/media/tables",
-        json!({
-            "name": "assets",
-            "columns": [
-                {"name": "id", "type": "string", "nullable": false},
-                {"name": "title", "type": "string", "nullable": false},
-                {"name": "kind", "type": "string", "nullable": false},
-                {"name": "width", "type": "int"},
-                {"name": "file", "type": "blob"}
+    let anon = Client::new(HttpTransport::new(&server.url));
+    let me = anon.with_token(&anon.sign_up("studio@example.com", "film-grain-42").await?.token);
+    me.create_db("media", None).await?;
+    let media = me.db("media");
+    media
+        .create_table(&NewTable {
+            name: Asset::TABLE.into(),
+            columns: vec![
+                NewColumn::new("id", ColumnType::String),
+                NewColumn::new("title", ColumnType::String),
+                NewColumn::new("kind", ColumnType::String),
+                NewColumn::nullable("width", ColumnType::Int),
+                NewColumn::nullable("file", ColumnType::Blob),
             ],
-            "primary_key": ["id"],
-            "indexes": [{"name": "by_kind", "columns": ["kind", "title"]}]
-        }),
-    )
-    .await?;
+            primary_key: vec!["id".into()],
+            indexes: vec![NewIndex {
+                name: "by_kind".into(),
+                columns: vec!["kind".into(), "title".into()],
+                unique: false,
+            }],
+            if_not_exists: false,
+        })
+        .await?;
 
     step(1, "Upload three assets (staged blobs), then register them transactionally");
     let files = [("sunset", "photo", 3_000_000), ("intro", "video", 12_000_000), ("logo", "photo", 40_000)];
@@ -59,57 +93,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, (title, kind, size)) in files.iter().enumerate() {
         let data = fake_image(i as u8, *size);
         let ct = if *kind == "video" { "video/mp4" } else { "image/png" };
-        let blob = me.stage_blob("media", data.clone(), ct).await?;
-        println!("    staged {title}: {} bytes, sha256 {}…", blob["size"], &blob["sha256"].as_str().unwrap()[..16]);
-        assert_eq!(blob["sha256"], json!(b64::hex(&sha256(&data))));
-        rows.push(json!({"id": title, "title": title, "kind": kind, "width": 1920, "file": blob["blob_id"]}));
+        let blob = media.stage_blob(data.clone(), ct).await?;
+        println!("    staged {title}: {} bytes, sha256 {}…", blob.size, &blob.sha256[..16]);
+        assert_eq!(blob.sha256, b64::hex(&sha256(&data)));
+        rows.push(Op::insert(&NewAsset {
+            id: title.to_string(),
+            title: title.to_string(),
+            kind: kind.to_string(),
+            width: Some(1920),
+            file: Some(blob.blob_id),
+        }));
     }
-    me.post("/v1/dbs/media/tables/assets/rows", json!({"rows": rows})).await?;
+    media.write(&rows).await?;
 
     step(2, "Search metadata through the index; blobs come back as references");
-    let r = me.post("/v1/dbs/media/tables/assets/rows/query", json!({"index": "by_kind", "eq": ["photo"]})).await?;
-    for a in r["rows"].as_array().unwrap() {
-        println!(
-            "    {} -> blob {} ({} bytes, {})",
-            a["title"], a["file"]["blob_id"], a["file"]["size"], a["file"]["content_type"]
-        );
+    let photos = Selection { index: Some("by_kind".into()), eq: vec![json!("photo")], ..Selection::default() };
+    for a in media.read_one(Op::query_where::<Asset>(photos)).await?.rows::<Asset>()? {
+        let f = a.file.unwrap_or_default();
+        println!("    {:?} -> blob {:?} ({} bytes, {:?})", a.title, f.blob_id, f.size, f.content_type);
     }
 
     step(3, "Stream a download and verify it end to end");
-    let intro = me.post("/v1/dbs/media/tables/assets/rows/get", json!({"pk": "intro"})).await?;
-    let blob_id = intro["row"]["file"]["blob_id"].as_str().unwrap().to_string();
-    let (st, headers, data) = me.raw("GET", &format!("/v1/dbs/media/blobs/{blob_id}"), &[], Bytes::new()).await?;
+    let intro = media.read_one(Op::get_row::<Asset>("intro")).await?.row::<Asset>()?.expect("intro was inserted");
+    let file = intro.file.expect("intro has a file");
+    let data = media.read_blob(&file.blob_id, None).await?;
     println!(
-        "    status {st}, {} bytes, content-type {:?}, intact: {}",
-        data.len(),
-        headers.get("content-type").unwrap(),
-        b64::hex(&sha256(&data)) == intro["row"]["file"]["sha256"].as_str().unwrap()
+        "    {} bytes, content-type {:?}, intact: {}",
+        data.data.len(),
+        data.content_type.unwrap_or_default(),
+        b64::hex(&sha256(&data.data)) == file.sha256
     );
 
     step(4, "Seek into the video with a Range request (bytes 8,000,000-8,000,099)");
-    let (st, headers, part) = me
-        .raw("GET", &format!("/v1/dbs/media/blobs/{blob_id}"), &[("range", "bytes=8000000-8000099")], Bytes::new())
-        .await?;
+    let part = media.read_blob(&file.blob_id, Some(ByteRange::Span { start: 8_000_000, end: 8_000_099 })).await?;
     let full = fake_image(1, 12_000_000);
     println!(
-        "    status {st}, {:?}, matches: {}",
-        headers.get("content-range").unwrap(),
-        part == full.slice(8_000_000..8_000_100)
+        "    content-range {:?}, matches: {}",
+        part.content_range.unwrap_or_default(),
+        part.data == full.slice(8_000_000..8_000_100)
     );
 
     step(5, "Plain key-value API for files: PUT a 5 MB file, read a slice back");
     let doc = fake_image(9, 5_000_000);
-    let v = me.put_bytes("media", "exports/report.pdf", doc.clone(), "application/pdf").await?;
-    let slice = me.get_bytes("media", "exports/report.pdf", Some("bytes=-1000")).await?.unwrap();
-    println!("    stored at version {v}; last 1000 bytes match: {}", slice == doc.slice(doc.len() - 1000..));
+    let pdf = api::PutOptions { content_type: Some("application/pdf".into()), ..api::PutOptions::default() };
+    let w = media.put_value("exports/report.pdf", doc.clone(), pdf).await?;
+    let slice = media.get_value("exports/report.pdf", Some(ByteRange::Last(1000))).await?.expect("the file was put");
+    println!(
+        "    stored at version {}; last 1000 bytes match: {}",
+        w.version,
+        slice.content.data == doc.slice(doc.len() - 1000..)
+    );
 
     step(6, "Replace and delete assets; unreferenced blobs are garbage collected later");
-    let new_logo = me.stage_blob("media", fake_image(7, 50_000), "image/svg+xml").await?;
-    me.post("/v1/dbs/media/tables/assets/rows/update", json!({"pk": "logo", "set": {"file": new_logo["blob_id"]}}))
+    let new_logo = media.stage_blob(fake_image(7, 50_000), "image/svg+xml").await?;
+    media
+        .write(&[Op::update::<NewAsset>("logo", &json!({"file": new_logo.blob_id})), Op::delete_row::<Asset>("sunset")])
         .await?;
-    me.post("/v1/dbs/media/tables/assets/rows/delete", json!({"pk": "sunset"})).await?;
-    let info = me.get("/v1/dbs/media").await?;
-    println!("    database stats: {}", info["stats"]);
+    let info = media.info().await?;
+    println!("    database stats: {}", serde_json::to_string(&info.stats)?);
     println!("    (the old logo and the sunset photo become garbage; a background sweep deletes");
     println!("     them after the grace period, never while an open snapshot could still read them)");
 

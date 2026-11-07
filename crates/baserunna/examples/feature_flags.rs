@@ -11,18 +11,35 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use baserunna::client::Client;
 use baserunna::meta::SignupPolicy;
+use baserunna_client::api::{self, ErrorCode, Expect, PutOptions, Written};
+use baserunna_client::{Change, ChangesRequest, Client, Error, HttpTransport, KeyRange, Op};
 use bytes::Bytes;
 use common::step;
 use serde_json::json;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+fn json_value() -> PutOptions {
+    PutOptions { content_type: Some("application/json".into()), ..PutOptions::default() }
+}
+
+/// Describes the outcome of a conditional write, propagating errors other than a failed
+/// precondition.
+fn conditional(r: Result<Written, Error>) -> Result<String, Error> {
+    match r {
+        Ok(w) => Ok(format!("written at version {}", w.version)),
+        Err(e) if e.code() == Some(ErrorCode::PreconditionFailed) => Ok(format!("rejected ({e})")),
+        Err(e) => Err(e),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = common::start(common::shared_store(), "flags", SignupPolicy::FirstUserOnly).await;
-    let admin = Client::new(&server.url).signup("platform@example.com", "flags-admin-1").await?;
-    admin.create_db("flags").await?;
+    let anon = Client::new(HttpTransport::new(&server.url));
+    let admin = anon.with_token(&anon.sign_up("platform@example.com", "flags-admin-1").await?.token);
+    admin.create_db("flags", None).await?;
+    let flags_db = admin.db("flags");
 
     step(1, "Seed flags (values are JSON documents stored as bytes)");
     let flags = [
@@ -31,93 +48,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("ui.dark_mode", json!({"enabled": true, "rollout": 1.0})),
     ];
     for (k, v) in &flags {
-        admin.put_bytes("flags", k, Bytes::from(v.to_string()), "application/json").await?;
+        flags_db.put_value(*k, v.to_string(), json_value()).await?;
     }
 
     step(2, "A read key for application servers");
-    let k = admin.post("/v1/api-keys", json!({"name": "app-servers", "db": "flags", "read_only": true})).await?;
-    let app = admin.with_token(k["key"].as_str().unwrap());
+    let key =
+        api::NewApiKey { name: "app-servers".into(), db: Some("flags".into()), read_only: true, rate_limit: None };
+    let app = admin.with_token(&admin.create_api_key(&key).await?.key);
+    let app_db = app.db("flags");
 
     step(3, "Hot read path: 2000 strong (linearizable) reads");
     let t = Instant::now();
     for i in 0..2000 {
         let key = flags[i % flags.len()].0;
-        let v = app.get_bytes("flags", key, None).await?.unwrap();
-        let _: serde_json::Value = serde_json::from_slice(&v)?;
+        let v = app_db.get_value(key, None).await?.expect("flags were seeded");
+        let _: serde_json::Value = serde_json::from_slice(&v.content.data)?;
     }
     let el = t.elapsed();
-    let info = admin.get("/v1/dbs/flags").await?;
+    let info = flags_db.info().await?;
     println!("    {:.0} reads/s over HTTP from one sequential client", 2000.0 / el.as_secs_f64());
     println!(
-        "    lease holder {}: while it holds the lease, strong reads are answered from its in-memory snapshot with no object-store requests",
-        info["stats"]["lease_holder"]
+        "    lease holder {:?}: while it holds the lease, strong reads are answered from its in-memory snapshot with no object-store requests",
+        info.stats.lease_holder.unwrap_or_default()
     );
 
     step(4, "Compare-and-set: two admins edit the same flag concurrently");
-    let path = "/v1/dbs/flags/kv/checkout.new_flow";
-    let (_, headers, _) = admin.raw("GET", path, &[], Bytes::new()).await?;
-    let etag = headers.get("etag").unwrap().to_str()?.to_string();
-    println!("    both admins read version {etag}");
-    let a = admin
-        .raw("PUT", path, &[("if-match", &etag)], Bytes::from(json!({"enabled": true, "rollout": 0.5}).to_string()))
-        .await?;
-    let b = admin.raw("PUT", path, &[("if-match", &etag)], Bytes::from(json!({"enabled": false}).to_string())).await?;
-    println!("    admin A (rollout to 50%): HTTP {}", a.0);
-    println!("    admin B (disable):        HTTP {} -> must re-read and retry", b.0);
+    let read = flags_db.get_value("checkout.new_flow", None).await?.expect("the flag was seeded");
+    println!("    both admins read version {}", read.version);
+    let cas = PutOptions { expect: Some(Expect::Version(read.version)), ..json_value() };
+    let a = flags_db.put_value("checkout.new_flow", json!({"enabled": true, "rollout": 0.5}).to_string(), cas.clone());
+    let a = conditional(a.await)?;
+    let b = conditional(flags_db.put_value("checkout.new_flow", json!({"enabled": false}).to_string(), cas).await)?;
+    println!("    admin A (rollout to 50%): {a}");
+    println!("    admin B (disable):        {b} -> must re-read and retry");
 
     step(5, "Create-only writes: If-None-Match: *");
-    let r = admin.raw("PUT", "/v1/dbs/flags/kv/ui.dark_mode", &[("if-none-match", "*")], Bytes::from("{}")).await?;
-    println!("    overwrite an existing flag with If-None-Match: HTTP {}", r.0);
+    let create = PutOptions { expect: Some(Expect::Absent), ..json_value() };
+    let r = conditional(flags_db.put_value("ui.dark_mode", "{}", create).await)?;
+    println!("    overwrite an existing flag with If-None-Match: {r}");
 
     step(6, "Snapshot reads (bounded staleness) and a consistent multi-key read");
-    let r = app
-        .post(
-            "/v1/dbs/flags/txn",
-            json!({"ops": [{"op": "scan", "prefix": "", "limit": 100}], "consistency": "snapshot", "max_staleness_ms": 1000}),
-        )
-        .await?;
-    for it in r["results"][0]["items"].as_array().unwrap() {
-        println!("    {} = {} (v{})", it["key"].as_str().unwrap(), it["value"].as_str().unwrap(), it["version"]);
+    let page = app
+        .db("flags")
+        .read_snapshot(&[Op::scan("")], Duration::from_millis(1000))
+        .await?
+        .swap_remove(0)
+        .scan_page()?;
+    for e in page.entries {
+        let value = e.value.data().map(|d| String::from_utf8_lossy(d).into_owned()).unwrap_or_default();
+        println!("    {} = {value} (v{})", String::from_utf8_lossy(&e.key), e.version.unwrap_or_default());
     }
 
     step(7, "A temporary override that expires by itself");
-    let path = "/v1/dbs/flags/kv/override%2Fsearch.semantic";
-    let (st, _, _) = admin
-        .raw("PUT", &format!("{path}?ttl_ms=1500"), &[], Bytes::from(json!({"enabled": true}).to_string()))
-        .await?;
-    let (_, headers, _) = admin.raw("GET", path, &[], Bytes::new()).await?;
-    println!(
-        "    override written (HTTP {st}), expires at {:?} (cluster time, ms)",
-        headers.get("x-baserunna-expires-at")
-    );
-    tokio::time::sleep(std::time::Duration::from_millis(1_600)).await;
-    let gone = app.get_bytes("flags", "override/search.semantic", None).await?;
+    let ttl = PutOptions { ttl_ms: Some(1500), ..json_value() };
+    let w = flags_db.put_value("override/search.semantic", json!({"enabled": true}).to_string(), ttl).await?;
+    let v = flags_db.get_value("override/search.semantic", None).await?.expect("the override was just written");
+    println!("    override written at version {}, expires at {:?} (cluster time, ms)", w.version, v.expires_at);
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    let gone = app_db.get_value("override/search.semantic", None).await?;
     println!(
         "    after 1.6 s: {}",
         if gone.is_none() { "expired, the flag's own value applies again" } else { "still there?!" }
     );
 
     step(8, "App servers follow flag changes with a long poll");
-    let info = admin.get("/v1/dbs/flags").await?;
-    let since = info["stats"]["version"].to_string();
+    let since = flags_db.info().await?.stats.version.to_string();
     let watcher = {
-        let app = app.clone();
-        tokio::spawn(async move { app.changes("flags", &since, 10_000).await })
+        let req = ChangesRequest {
+            range: KeyRange::Prefix(Bytes::new()),
+            after: since,
+            limit: api::PAGE_MAX,
+            wait_ms: 10_000,
+            max_staleness_ms: None,
+        };
+        let app_db = app_db.clone();
+        tokio::spawn(async move { app_db.changes(&req).await })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    admin
-        .put_bytes("flags", "ui.dark_mode", Bytes::from(json!({"enabled": false}).to_string()), "application/json")
-        .await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    flags_db.put_value("ui.dark_mode", json!({"enabled": false}).to_string(), json_value()).await?;
     let page = watcher.await??;
-    for ch in page["changes"].as_array().unwrap() {
-        println!(
-            "    v{}: {} = {}",
-            ch["version"],
-            ch["key"].as_str().unwrap(),
-            ch["value"].as_str().unwrap_or("(deleted)")
-        );
+    for ch in &page.changes {
+        let text = |b: &Bytes| String::from_utf8_lossy(b).into_owned();
+        match ch {
+            Change::Put { key, version, value } => {
+                let value = value.data().map_or("(blob)".into(), text);
+                println!("    v{version}: {} = {value}", text(key));
+            }
+            Change::Delete { key, version } => println!("    v{version}: {} = (deleted)", text(key)),
+            Change::DeleteRange { start, end, version } => {
+                println!("    v{version}: deleted {}..{}", text(start), end.as_ref().map_or(String::new(), text));
+            }
+        }
     }
-    println!("    continue from cursor {}", page["next_cursor"]);
+    println!("    continue from cursor {}", page.cursor);
 
     server.stop().await;
     println!("\ndone.");

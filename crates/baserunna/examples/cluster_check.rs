@@ -10,10 +10,11 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use baserunna::client::{ApiError, Client};
 use baserunna::store::{DynStore, MemStore, Retry, list_all};
+use baserunna_client::{
+    Client, Db, Error, HttpTransport, KeyRange, Op, OpResult, RetryPolicy, TransportError, Value, api,
+};
 use parking_lot::Mutex;
-use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
@@ -29,7 +30,7 @@ const DB: &str = "check";
 struct Cluster {
     open: Box<dyn Fn() -> DynStore + Send + Sync>,
     nodes: Mutex<Vec<Option<common::Isolated>>>,
-    urls: Mutex<Vec<Option<String>>>,
+    clients: Mutex<Vec<Option<Client>>>,
     token: Mutex<String>,
     rng: AtomicU64,
     kills: AtomicU64,
@@ -43,20 +44,22 @@ impl Cluster {
         (x ^ (x >> 31)) % n
     }
 
-    fn random_client(&self) -> Client {
-        let urls: Vec<String> = self.urls.lock().iter().flatten().cloned().collect();
-        let url = &urls[self.random(urls.len() as u64) as usize];
-        Client::new(url).with_token(&self.token.lock())
+    fn random_db(&self) -> Db {
+        let clients: Vec<Client> = self.clients.lock().iter().flatten().cloned().collect();
+        let client = &clients[self.random(clients.len() as u64) as usize];
+        client.with_token(&self.token.lock()).db(DB)
     }
 
     async fn start(&self, slot: usize) {
         let node = common::start_isolated((self.open)(), &format!("node{slot}")).await;
-        self.urls.lock()[slot] = Some(node.url.clone());
+        // The checker retries on random nodes itself, so each request is one attempt on one node.
+        let policy = RetryPolicy { attempts: 1, ..RetryPolicy::default() };
+        self.clients.lock()[slot] = Some(Client::new(HttpTransport::new(&node.url)).with_retry_policy(policy));
         self.nodes.lock()[slot] = Some(node);
     }
 
     fn kill(&self, slot: usize) {
-        self.urls.lock()[slot] = None;
+        self.clients.lock()[slot] = None;
         if let Some(n) = self.nodes.lock()[slot].take() {
             n.kill();
             self.kills.fetch_add(1, SeqCst);
@@ -64,47 +67,72 @@ impl Cluster {
     }
 }
 
-async fn send_request(c: &Cluster, method: &str, path: &str, body: Option<Value>) -> Result<Value, ApiError> {
-    let client = c.random_client();
-    match tokio::time::timeout(Duration::from_secs(20), client.call(method, path, body)).await {
+/// Sends `request` to a random node, failing with a transport timeout after 20 s.
+async fn send_request<T, F>(c: &Cluster, request: impl FnOnce(Db) -> F) -> Result<T, Error>
+where
+    F: Future<Output = Result<T, Error>>,
+{
+    match tokio::time::timeout(Duration::from_secs(20), request(c.random_db())).await {
         Ok(r) => r,
-        Err(_) => Err(ApiError { status: 0, code: "timeout".into(), message: "timed out".into(), body: Value::Null }),
+        Err(_) => Err(TransportError::TimedOut("no response within 20 s".into()).into()),
     }
 }
 
-async fn call_with_retry(c: &Cluster, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+/// Returns true if repeating a request can succeed: it failed in transit, with a 503, or with an
+/// error that the server marks retryable.
+fn retryable(e: &Error) -> bool {
+    match e {
+        Error::Transport(_) => true,
+        Error::Api { status, error, .. } => *status == 503 || error.retryable,
+        Error::Foreign { status, .. } => *status == 503,
+        _ => false,
+    }
+}
+
+/// Returns the response of a request whose failure is tolerated, or `None` if it failed, or an
+/// error if the server answered with a body that does not decode.
+fn answered<T>(what: &str, r: Result<T, Error>) -> Result<Option<T>, String> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e @ (Error::Malformed { .. } | Error::Decode { .. })) => Err(format!("{what}: {e}")),
+        Err(_) => Ok(None),
+    }
+}
+
+async fn call_with_retry<T, F>(c: &Cluster, what: &str, request: impl Fn(Db) -> F) -> Result<T, String>
+where
+    F: Future<Output = Result<T, Error>>,
+{
     let started = Instant::now();
     loop {
-        match send_request(c, method, path, body.clone()).await {
+        match send_request(c, &request).await {
             Ok(v) => return Ok(v),
-            Err(e) if e.status == 0 || e.retryable() || e.status == 503 => {
+            Err(e) if retryable(&e) => {
                 if started.elapsed() > Duration::from_secs(120) {
-                    return Err(format!("{method} {path} kept failing: {e}"));
+                    return Err(format!("{what} kept failing: {e}"));
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            Err(e) => return Err(format!("{method} {path} failed: {e}")),
+            Err(e) => return Err(format!("{what} failed: {e}")),
         }
     }
 }
 
 async fn resolve_commit(c: &Cluster, id: &str) -> Result<bool, String> {
-    let v = call_with_retry(c, "GET", &format!("/v1/dbs/{DB}/commits/{id}"), None).await?;
-    match v["status"].as_str() {
-        Some("committed") => Ok(true),
-        Some("not_committed") => Ok(false),
-        _ => Err(format!("unexpected commit status {v}")),
-    }
+    let status = call_with_retry(c, &format!("GET commit {id}"), |db| async move {
+        db.client().send(&api::GetCommit { db: DB.into(), id: id.into() }, &api::NoBody {}).await
+    })
+    .await?;
+    Ok(matches!(status, api::CommitStatus::Committed { .. }))
 }
 
 fn parse_i64(v: &Value) -> Option<i64> {
-    v.as_i64().or_else(|| v.as_str()?.parse().ok())
+    std::str::from_utf8(v.data()?).ok()?.parse().ok()
 }
 
-async fn strong_get(c: &Cluster, key: &str) -> Result<Option<i64>, ApiError> {
-    let r = send_request(c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(json!({"ops": [{"op": "get", "key": key}]})))
-        .await?;
-    Ok(parse_i64(&r["results"][0]["value"]))
+async fn strong_get(c: &Cluster, key: &str) -> Result<Option<i64>, Error> {
+    let entry = send_request(c, |db| async move { db.read_one(Op::get(key.to_owned())).await?.entry() }).await?;
+    Ok(entry.and_then(|e| parse_i64(&e.value)))
 }
 
 #[derive(Default)]
@@ -124,14 +152,11 @@ async fn increment_worker(
     let mut n = 0;
     while !stop.load(SeqCst) {
         n += 1;
-        let key = format!("w{i}-{n}");
-        let body = json!({
-            "ops": [{"op": "increment", "key": format!("w{i}"), "by": 1}, {"op": "put", "key": format!("log/w{i}/{n:06}"), "value": "1"}],
-            "idempotency_key": key,
-        });
-        let applied = match send_request(&c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(body)).await {
-            Ok(r) if r["committed"] == true => true,
-            Ok(r) => return Err(format!("increment {key} was not committed: {r}")),
+        let key = &format!("w{i}-{n}");
+        let ops = &[Op::increment(format!("w{i}"), 1), Op::put(format!("log/w{i}/{n:06}"), "1")];
+        let applied = match send_request(&c, |db| async move { db.txn(ops, Some(key)).await }).await {
+            Ok(r) if r.commit_id.is_some() => true,
+            Ok(r) => return Err(format!("increment {key} was not committed: {r:?}")),
             Err(_) => {
                 t.unknown.fetch_add(1, SeqCst);
                 resolve_commit(&c, &format!("key:{key}")).await?
@@ -141,7 +166,7 @@ async fn increment_worker(
             done.insert(n);
             t.commits.fetch_add(1, SeqCst);
         }
-        if let Ok(v) = strong_get(&c, &format!("w{i}")).await {
+        if let Some(v) = answered(&format!("strong read of w{i}"), strong_get(&c, &format!("w{i}")).await)? {
             t.reads.fetch_add(1, SeqCst);
             let want = done.len() as i64;
             if v.unwrap_or(0) != want {
@@ -156,43 +181,56 @@ fn account_key(i: usize) -> String {
     format!("acct/{i}")
 }
 
+fn balance(r: &api::OpResult) -> Option<i64> {
+    r.decode::<api::GetResult>().ok()?.value?.parse().ok()
+}
+
+/// Transfers between random accounts in interactive transactions. Each request of a transaction
+/// goes to a random node, which forwards it to the lease holder, so the worker calls the
+/// transaction endpoints rather than a [`baserunna_client::Txn`], which keeps to one node.
 async fn transfer_worker(c: Arc<Cluster>, stop: Arc<AtomicBool>, t: Arc<Stats>) -> Result<(), String> {
-    let base = format!("/v1/dbs/{DB}");
     while !stop.load(SeqCst) {
         let (a, b) = (c.random(ACCOUNTS as u64) as usize, c.random(ACCOUNTS as u64) as usize);
         if a == b {
             continue;
         }
-        let reads = json!([{"op": "get", "key": account_key(a)}, {"op": "get", "key": account_key(b)}]);
-        let Ok(r) = send_request(&c, "POST", &format!("{base}/transactions"), Some(json!({"ops": reads}))).await else {
+        let reads = vec![api::Op::Get { key: account_key(a) }, api::Op::Get { key: account_key(b) }];
+        let begin = &api::BeginRequest { ops: reads, ..api::BeginRequest::default() };
+        let begun =
+            send_request(&c, |db| async move { db.client().send(&api::BeginTxn { db: DB.into() }, begin).await });
+        let Ok(r) = begun.await else {
             continue;
         };
-        let (id, cid) =
-            (r["txn_id"].as_str().unwrap_or("").to_string(), r["commit_id"].as_str().unwrap_or("").to_string());
-        let (Some(ba), Some(bb)) = (parse_i64(&r["results"][0]["value"]), parse_i64(&r["results"][1]["value"])) else {
-            return Err(format!("missing balances: {r}"));
+        let (Some(ba), Some(bb)) = (r.results.first().and_then(balance), r.results.get(1).and_then(balance)) else {
+            return Err(format!("missing balances: {:?}", r.results));
         };
+        let id = &r.txn_id;
         let amount = 1 + c.random(20) as i64;
         if ba < amount {
-            let _ = send_request(&c, "DELETE", &format!("{base}/transactions/{id}"), None).await;
+            let abort = |db: Db| async move {
+                db.client().send(&api::AbortTxn { db: DB.into(), id: id.clone() }, &api::NoBody {}).await
+            };
+            let _ = send_request(&c, abort).await;
             continue;
         }
-        let writes = json!([
-            {"op": "put", "key": account_key(a), "value": (ba - amount).to_string()},
-            {"op": "put", "key": account_key(b), "value": (bb + amount).to_string()},
-        ]);
-        let applied =
-            match send_request(&c, "POST", &format!("{base}/transactions/{id}/commit"), Some(json!({"ops": writes})))
-                .await
-            {
-                Ok(_) => true,
-                Err(e) if e.status == 409 || e.status == 404 => false,
-                Err(e) if e.status == 0 || e.status == 503 || e.retryable() => {
-                    t.unknown.fetch_add(1, SeqCst);
-                    resolve_commit(&c, &cid).await?
-                }
-                Err(e) => return Err(format!("commit failed: {e}")),
-            };
+        let put = |i: usize, v: i64| api::Op::Put {
+            key: account_key(i),
+            value: Some(v.to_string()),
+            blob_id: None,
+            ttl_ms: None,
+        };
+        let writes = &api::CommitRequest { ops: vec![put(a, ba - amount), put(b, bb + amount)] };
+        let commit =
+            |db: Db| async move { db.client().send(&api::CommitTxn { db: DB.into(), id: id.clone() }, writes).await };
+        let applied = match send_request(&c, commit).await {
+            Ok(_) => true,
+            Err(Error::Api { status: 404 | 409, .. }) => false,
+            Err(e) if retryable(&e) => {
+                t.unknown.fetch_add(1, SeqCst);
+                resolve_commit(&c, &r.commit_id).await?
+            }
+            Err(e) => return Err(format!("commit failed: {e}")),
+        };
         if applied {
             t.commits.fetch_add(1, SeqCst);
         }
@@ -200,11 +238,9 @@ async fn transfer_worker(c: Arc<Cluster>, stop: Arc<AtomicBool>, t: Arc<Stats>) 
     Ok(())
 }
 
-async fn read_balances(c: &Cluster) -> Result<Vec<i64>, String> {
-    let body = json!({"ops": [{"op": "scan", "prefix": "acct/", "limit": 100}]});
-    let r = call_with_retry(c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(body)).await?;
-    let items = r["results"][0]["items"].as_array().ok_or_else(|| format!("bad scan: {r}"))?;
-    Ok(items.iter().map(|it| parse_i64(&it["value"]).unwrap_or(i64::MIN)).collect())
+async fn scan_balances(db: Db) -> Result<Vec<i64>, Error> {
+    let page = db.read_one(Op::scan("acct/")).await?.scan_page()?;
+    Ok(page.entries.iter().map(|e| parse_i64(&e.value).unwrap_or(i64::MIN)).collect())
 }
 
 fn verify_balances(b: &[i64]) -> Result<(), String> {
@@ -220,10 +256,8 @@ fn verify_balances(b: &[i64]) -> Result<(), String> {
 async fn audit_worker(c: Arc<Cluster>, stop: Arc<AtomicBool>, t: Arc<Stats>) -> Result<(), String> {
     while !stop.load(SeqCst) {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let body = json!({"ops": [{"op": "scan", "prefix": "acct/", "limit": 100}]});
-        if let Ok(r) = send_request(&c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(body)).await {
-            let items = r["results"][0]["items"].as_array().cloned().unwrap_or_default();
-            verify_balances(&items.iter().map(|it| parse_i64(&it["value"]).unwrap_or(i64::MIN)).collect::<Vec<_>>())?;
+        if let Some(balances) = answered("audit scan", send_request(&c, scan_balances).await)? {
+            verify_balances(&balances)?;
             t.reads.fetch_add(1, SeqCst);
         }
     }
@@ -247,15 +281,12 @@ async fn run_check(c: Arc<Cluster>, seconds: u64) -> Result<(), String> {
     for slot in 0..NODES {
         c.start(slot).await;
     }
-    let first = Client::new(c.urls.lock()[0].as_ref().unwrap());
-    let user = first.signup("check@example.com", "cluster-check-1").await.map_err(|e| e.to_string())?;
-    *c.token.lock() = user.token().unwrap_or_default().to_string();
-    user.create_db(DB).await.map_err(|e| e.to_string())?;
-    let init: Vec<Value> = (0..ACCOUNTS)
-        .map(|i| json!({"op": "put", "key": account_key(i), "value": INITIAL_BALANCE.to_string()}))
-        .collect();
-    call_with_retry(&c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(json!({"ops": init, "idempotency_key": "init"})))
-        .await?;
+    let first = c.clients.lock()[0].clone().expect("node 0 is running");
+    let session = first.sign_up("check@example.com", "cluster-check-1").await.map_err(|e| e.to_string())?;
+    *c.token.lock() = session.token.clone();
+    first.with_token(&session.token).create_db(DB, None).await.map_err(|e| e.to_string())?;
+    let init = &(0..ACCOUNTS).map(|i| Op::put(account_key(i), INITIAL_BALANCE.to_string())).collect::<Vec<_>>();
+    call_with_retry(&c, "initial balances", |db| async move { db.txn(init, Some("init")).await }).await?;
     tokio::time::sleep(Duration::from_millis(1_500)).await;
 
     let (stop, tally) = (Arc::new(AtomicBool::new(false)), Arc::new(Stats::default()));
@@ -287,17 +318,29 @@ async fn run_check(c: Arc<Cluster>, seconds: u64) -> Result<(), String> {
             return Err(format!("counter w{i} is {value}, but {} increments committed", done.len()));
         }
         let mut logged = BTreeSet::new();
-        let mut cursor = Value::Null;
+        let prefix = format!("log/w{i}/");
+        let mut scan = Op::Scan {
+            range: KeyRange::Prefix(prefix.clone().into()),
+            limit: api::PAGE_MAX,
+            reverse: false,
+            keys_only: true,
+            cursor: None,
+        };
         loop {
-            let scan = json!({"op": "scan", "prefix": format!("log/w{i}/"), "limit": 1000, "keys_only": true, "cursor": cursor});
-            let r = call_with_retry(&c, "POST", &format!("/v1/dbs/{DB}/txn"), Some(json!({"ops": [scan]}))).await?;
-            let page = &r["results"][0];
-            for it in page["items"].as_array().into_iter().flatten() {
-                logged.extend(it["key"].as_str().and_then(|k| k.rsplit('/').next()?.parse::<u64>().ok()));
+            let op = &scan;
+            let page =
+                call_with_retry(&c, &format!("scan {prefix}"), |db| async move { db.read_one(op.clone()).await })
+                    .await?;
+            if let OpResult::Scan(p) = &page {
+                for e in &p.entries {
+                    logged.extend(
+                        std::str::from_utf8(&e.key).ok().and_then(|k| k.rsplit('/').next()?.parse::<u64>().ok()),
+                    );
+                }
             }
-            cursor = page["next_cursor"].clone();
-            if cursor.is_null() {
-                break;
+            match scan.next_page(&page) {
+                Some(next) => scan = next,
+                None => break,
             }
         }
         if logged != *done {
@@ -306,7 +349,7 @@ async fn run_check(c: Arc<Cluster>, seconds: u64) -> Result<(), String> {
             return Err(format!("w{i}: committed increments {missing:?} are missing and {extra:?} were not committed"));
         }
     }
-    verify_balances(&read_balances(&c).await?)?;
+    verify_balances(&call_with_retry(&c, "scan acct/", scan_balances).await?)?;
     println!(
         "ok: {} commits ({} with unknown outcomes, settled), {} checked reads, {} node kills",
         tally.commits.load(SeqCst),
@@ -339,7 +382,7 @@ async fn main() {
     let c = Arc::new(Cluster {
         open,
         nodes: Mutex::new((0..NODES).map(|_| None).collect()),
-        urls: Mutex::new(vec![None; NODES]),
+        clients: Mutex::new(vec![None; NODES]),
         token: Mutex::new(String::new()),
         rng: AtomicU64::new(nonce as u64),
         kills: AtomicU64::new(0),

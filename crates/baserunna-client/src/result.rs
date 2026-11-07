@@ -102,7 +102,7 @@ pub enum OpResult {
     QueryRows(RowPage),
     /// Whether an `update_row` or `delete_row` found its row.
     Found(bool),
-    /// Number of rows that a `delete_rows` deleted.
+    /// Number of rows that an `update_where` updated or a `delete_rows` deleted.
     Count(u64),
     /// Sequence number of the first appended record, or `None` before the transaction commits.
     Append {
@@ -269,7 +269,7 @@ fn decode_result(op: &Op, r: &api::OpResult) -> Result<OpResult, String> {
             OpResult::QueryRows(RowPage { table: table.clone(), rows: q.rows, cursor: q.next_cursor })
         }
         Op::UpdateRow { .. } | Op::DeleteRow { .. } => OpResult::Found(r.decode::<api::FoundResult>()?.found),
-        Op::DeleteRows { .. } => OpResult::Count(r.decode::<api::CountResult>()?.count),
+        Op::UpdateRows { .. } | Op::DeleteRows { .. } => OpResult::Count(r.decode::<api::CountResult>()?.count),
         Op::Append { .. } => OpResult::Append { first_seq: r.decode::<api::AppendResult>()?.first_seq },
         Op::ReadStream(_) => {
             let p: api::RecordsResult<Box<RawValue>> = r.decode()?;
@@ -283,7 +283,9 @@ fn decode_result(op: &Op, r: &api::OpResult) -> Result<OpResult, String> {
         | Op::Copy { .. }
         | Op::Check { .. }
         | Op::InsertRow { .. }
-        | Op::UpsertRow { .. } => {
+        | Op::UpsertRow { .. }
+        | Op::SetConsumer { .. }
+        | Op::TrimStream { .. } => {
             r.decode::<api::Empty>()?;
             OpResult::Done
         }

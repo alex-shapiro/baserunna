@@ -89,8 +89,8 @@ fn routes() -> Vec<Route> {
             Box::new(|p| GetTable { db: p[0].clone(), table: p[1].clone(), query: GetTableQuery::default() }.path()),
         ),
         (Changes::ROUTE, 1, Box::new(|p| Changes { db: p[0].clone(), query: ChangesQuery::default() }.path())),
-        (StageBlob::ROUTE, 1, Box::new(|p| StageBlob { db: p[0].clone() }.path())),
-        (ReadBlob::ROUTE, 2, Box::new(|p| ReadBlob { db: p[0].clone(), blob_id: p[1].clone() }.path())),
+        (StageBlob::ROUTE, 1, Box::new(|p| StageBlob { db: p[0].clone(), content_type: None }.path())),
+        (ReadBlob::ROUTE, 2, Box::new(|p| ReadBlob { db: p[0].clone(), blob_id: p[1].clone(), range: None }.path())),
     ]
 }
 

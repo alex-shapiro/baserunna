@@ -148,7 +148,6 @@ fn item(owner: &str, id: i64) -> Item {
     Item { owner: owner.into(), id, label: None }
 }
 
-/// Reads every page of `op` in one-shot reads.
 /// Returns `db` on a client that sends each request once.
 fn once(db: &Db) -> Db {
     db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() }).db(db.name())
@@ -164,6 +163,7 @@ async fn next_request(router: &Router, sent: usize, within: Duration) -> bool {
     tokio::time::timeout(within, next).await.is_ok()
 }
 
+/// Reads every page of `op` in one-shot reads.
 async fn pages(db: &Db, mut op: Op) -> Vec<OpResult> {
     let mut out = Vec::new();
     loop {
@@ -554,4 +554,103 @@ async fn a_retried_read_reports_the_servers_answer() {
     router.fail(api::GetTable::ROUTE, Fault::LoseResponse, 1);
     let e = db.get_table("missing").await.unwrap_err();
     assert_eq!(e.code(), Some(api::ErrorCode::NotFound), "{e:?}");
+}
+
+#[tokio::test]
+async fn raw_values_and_blobs_report_their_version_type_range_and_expiry() {
+    let (db, _) = node("").await;
+    let opts = |expect| api::PutOptions { content_type: Some("text/plain".into()), ttl_ms: Some(60_000), expect };
+    let w = db.put_value("k", "hello world", opts(Some(Expect::Absent))).await.unwrap();
+    let v = db.get_value("k", Some(api::ByteRange::Span { start: 0, end: 4 })).await.unwrap().unwrap();
+    assert_eq!((v.content.data.as_ref(), v.version), (&b"hello"[..], w.version));
+    assert_eq!(v.content.content_range.as_deref(), Some("bytes 0-4/11"));
+    assert!(v.expires_at.is_some(), "{v:?}");
+    let e = db.put_value("k", "again", opts(Some(Expect::Absent))).await.unwrap_err();
+    assert_eq!(e.code(), Some(api::ErrorCode::PreconditionFailed), "{e}");
+    db.put_value("k", "again", opts(Some(Expect::Version(w.version)))).await.unwrap();
+    assert_eq!(db.get_value("missing", None).await.unwrap(), None);
+
+    let blob = db.stage_blob(Bytes::from_static(b"\x89PNG-data"), "image/png").await.unwrap();
+    let tail = db.read_blob(&blob.blob_id, Some(api::ByteRange::Last(4))).await.unwrap();
+    assert_eq!((tail.data.as_ref(), tail.content_type.as_deref()), (&b"data"[..], Some("image/png")));
+}
+
+#[tokio::test]
+async fn streams_append_wait_read_and_query_over_http() {
+    let (db, _) = node("").await;
+    let stream = api::NewStream { name: "log".into(), retention_ms: Some(60_000), max_bytes: None };
+    assert_eq!(db.create_stream(&stream).await.unwrap().stream.retention_ms, Some(60_000));
+    let record = |text: &str, from: &str| api::NewRecord {
+        json: Some(serde_json::json!({"text": text})),
+        headers: [("from".to_string(), from.to_string())].into(),
+        ..api::NewRecord::default()
+    };
+    let append = api::AppendRequest { records: vec![record("a", "ann")], expect_seq: Some(0), ..Default::default() };
+    assert_eq!(db.append_records("log", &append).await.unwrap().next_seq, 1);
+    let e = db.append_records("log", &append).await.unwrap_err();
+    assert_eq!(e.code(), Some(api::ErrorCode::PreconditionFailed), "{e}");
+    let lines = db.append_lines("log", Bytes::from_static(b"{\"text\":\"b\"}\n{\"text\":\"c\"}\n")).await.unwrap();
+    assert_eq!((lines.first_seq, lines.count), (1, 2));
+
+    let waiter = {
+        let db = db.clone();
+        let query = api::ReadRecordsQuery { from_seq: Some(3), wait_ms: Some(10_000), ..Default::default() };
+        tokio::spawn(async move { db.read_records("log", query).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    db.append_records("log", &api::AppendRequest { records: vec![record("d", "bob")], ..Default::default() })
+        .await
+        .unwrap();
+    let woken = waiter.await.unwrap().unwrap();
+    assert_eq!(woken.records.iter().map(|r| r.seq).collect::<Vec<_>>(), [3]);
+
+    let last = api::ReadRecordsQuery { tail: Some(2), reverse: true, ..Default::default() };
+    let page = db.read_records("log", last).await.unwrap();
+    assert_eq!(page.records.iter().map(|r| r.seq).collect::<Vec<_>>(), [3, 2]);
+    let filter = Some(serde_json::json!({"header": "from", "op": "eq", "value": "ann"}));
+    let anns = db.query_records("log", &api::RecordQuery { filter, ..Default::default() }).await.unwrap();
+    assert_eq!(anns.records.iter().map(|r| r.seq).collect::<Vec<_>>(), [0]);
+
+    db.write(&[Op::set_consumer("log", "reader", 2), Op::trim_stream("log", 1)]).await.unwrap();
+    let info = db.stream_info("log").await.unwrap();
+    assert_eq!((info.stream.state.first_seq, info.consumers[0].lag), (1, 2), "{info:?}");
+    let listed = db.list_streams(api::ListStreamsQuery { prefix: Some("lo".into()), ..Default::default() }).await;
+    assert_eq!(listed.unwrap().streams.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["log"]);
+}
+
+#[tokio::test]
+async fn databases_api_keys_and_schema_changes_round_trip() {
+    let (db, _) = node("").await;
+    let info = db.info().await.unwrap();
+    assert_eq!((info.name.as_str(), info.role), ("app", api::Role::Owner));
+    let dbs = db.client().list_dbs(api::ListDbsQuery::default()).await.unwrap();
+    assert_eq!(dbs.databases.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["app"]);
+
+    let new_key = api::NewApiKey { name: "reader".into(), db: Some("app".into()), read_only: true, rate_limit: None };
+    let created = db.client().create_api_key(&new_key).await.unwrap();
+    let reader = db.client().with_token(&created.key).db("app");
+    reader.read_one(Op::get("k")).await.unwrap();
+    let e = reader.write(&[Op::put("k", "v")]).await.unwrap_err();
+    assert_eq!(e.code(), Some(api::ErrorCode::PermissionDenied), "{e}");
+    let keys = db.client().list_api_keys(api::PageQuery::default()).await.unwrap();
+    assert_eq!(keys.api_keys, std::slice::from_ref(&created.api_key));
+    db.client().delete_api_key(&created.api_key.id).await.unwrap();
+    assert!(reader.read_one(Op::get("k")).await.is_err(), "a deleted key no longer authenticates");
+
+    db.write(&[Op::insert(&item("a", 1)), Op::insert(&item("a", 2))]).await.unwrap();
+    let label = NewColumn { default: Some(serde_json::json!("new")), ..NewColumn::nullable("tag", ColumnType::String) };
+    db.add_column(Item::TABLE, &label).await.unwrap();
+    let index = api::NewIndex { name: "by_id".into(), columns: vec!["id".into()], unique: false };
+    assert!(db.add_index(Item::TABLE, &index).await.unwrap().table.indexes.iter().any(|i| i.name == "by_id"));
+    let high = api::Selection {
+        index: Some("by_id".into()),
+        range: Some(api::RangeSpec { gte: Some(serde_json::json!(2)), ..Default::default() }),
+        ..Default::default()
+    };
+    let out = db.txn(&[Op::update_where::<Item>(high.clone(), &serde_json::json!({"label": "x"}))], Some("k1")).await;
+    assert_eq!(out.unwrap().results.unwrap(), [OpResult::Count(1)]);
+    let rows = db.read_one(Op::query_where::<Item>(high)).await.unwrap().rows::<Item>().unwrap();
+    assert_eq!(rows, [Item { label: Some("x".into()), ..item("a", 2) }]);
+    db.delete().await.unwrap();
+    assert!(db.info().await.is_err(), "the database is gone");
 }

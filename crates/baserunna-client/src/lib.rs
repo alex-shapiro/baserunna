@@ -34,7 +34,7 @@ mod txn;
 pub use baserunna_api as api;
 pub use changes::{Change, ChangePage, ChangesRequest};
 pub use error::Error;
-pub use op::{Expect, KeyRange, NewRecord, Op, Row};
+pub use op::{Expect, KeyRange, NewBody, NewRecord, Op, Row};
 pub use result::{Entry, OpResult, Record, RecordBody, RecordPage, RowPage, ScanPage, TxnOutcome, Value};
 #[cfg(feature = "reqwest")]
 pub use transport::HttpTransport;
@@ -163,7 +163,7 @@ impl Client {
         let mut attempt = 1;
         let mut unresolved = None;
         loop {
-            let err = match self.attempt::<E>(&path, &body).await {
+            let err = match self.attempt(endpoint, &path, &body).await {
                 Ok(r) => return Ok(Some(r)),
                 Err(e) if allowed_error.is_some() && e.code() == allowed_error => return Ok(None),
                 Err(e) => e,
@@ -204,7 +204,7 @@ impl Client {
         format!("{:016x}{:016x}", (self.entropy)(), (self.entropy)())
     }
 
-    async fn attempt<E: Endpoint>(&self, path: &str, body: &Bytes) -> Result<E::Response, Error> {
+    async fn attempt<E: Endpoint>(&self, endpoint: &E, path: &str, body: &Bytes) -> Result<E::Response, Error> {
         let mut req = http::Request::builder().method(E::METHOD).uri(path).extension(Route(E::ROUTE));
         if let Some(t) = &self.token {
             req = req.header(http::header::AUTHORIZATION, format!("Bearer {t}"));
@@ -212,8 +212,11 @@ impl Client {
         if let Some(ct) = <E::Body as Body>::CONTENT_TYPE {
             req = req.header(http::header::CONTENT_TYPE, ct);
         }
+        if let Some(h) = req.headers_mut() {
+            h.extend(endpoint.headers());
+        }
         let req = req.body(body.clone()).map_err(|e| TransportError::NotSent(e.to_string()))?;
-        decode(path, self.transport.send(req).await?)
+        decode::<E>(path, self.transport.send(req).await?)
     }
 
     pub async fn limits(&self) -> Result<api::Limits, Error> {
@@ -246,6 +249,23 @@ impl Client {
         let b = api::NewDb { name: name.into(), org: org.map(Into::into) };
         let r = self.attempts(&api::CreateDb, &b, Some(api::ErrorCode::AlreadyExists)).await;
         r.map(drop).map_err(|f| f.error)
+    }
+
+    pub async fn list_dbs(&self, query: api::ListDbsQuery) -> Result<api::DbPage, Error> {
+        self.send(&api::ListDbs { query }, &api::NoBody {}).await
+    }
+
+    /// Creates an API key; requires a session rather than another API key.
+    pub async fn create_api_key(&self, key: &api::NewApiKey) -> Result<api::CreatedApiKey, Error> {
+        self.send(&api::CreateApiKey, key).await
+    }
+
+    pub async fn list_api_keys(&self, query: api::PageQuery) -> Result<api::ApiKeyPage, Error> {
+        self.send(&api::ListApiKeys { query }, &api::NoBody {}).await
+    }
+
+    pub async fn delete_api_key(&self, id: &str) -> Result<(), Error> {
+        self.send(&api::DeleteApiKey { id: id.into() }, &api::NoBody {}).await.map(drop)
     }
 
     pub async fn create_org(&self, name: &str) -> Result<api::Org, Error> {
@@ -286,7 +306,7 @@ struct Failed {
     refusal: Option<Error>,
 }
 
-fn decode<T: Body>(path: &str, resp: http::Response<Bytes>) -> Result<T, Error> {
+fn decode<E: Endpoint>(path: &str, resp: http::Response<Bytes>) -> Result<E::Response, Error> {
     let (parts, body) = resp.into_parts();
     let status = parts.status.as_u16();
     let declared = parts.headers.get(http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<usize>().ok());
@@ -301,7 +321,7 @@ fn decode<T: Body>(path: &str, resp: http::Response<Bytes>) -> Result<T, Error> 
         .map(|s| s.saturating_mul(1000));
     let foreign = || Error::Foreign { status, retry_after_ms, path: path.into() };
     if parts.status.is_success() {
-        return T::decode(body.clone()).map_err(|reason| match is_json(&body) {
+        return E::response(&parts, body.clone()).map_err(|reason| match is_json(&body) {
             true => Error::Malformed { path: path.into(), reason },
             false => foreign(),
         });
@@ -360,8 +380,65 @@ impl Db {
         }
     }
 
+    /// Reads the database's metadata, the caller's role, and storage statistics.
+    pub async fn info(&self) -> Result<api::DbInfo, Error> {
+        self.client.send(&api::GetDb { db: self.name.clone() }, &api::NoBody {}).await
+    }
+
+    /// Deletes the database and all of its data.
+    pub async fn delete(&self) -> Result<(), Error> {
+        self.client.send(&api::DeleteDb { db: self.name.clone() }, &api::NoBody {}).await.map(drop)
+    }
+
+    pub async fn list_streams(&self, query: api::ListStreamsQuery) -> Result<api::StreamPage, Error> {
+        self.client.send(&api::ListStreams { db: self.name.clone(), query }, &api::NoBody {}).await
+    }
+
+    pub async fn create_stream(&self, stream: &api::NewStream) -> Result<api::CreatedStream, Error> {
+        self.client.send(&api::CreateStream { db: self.name.clone() }, stream).await
+    }
+
+    /// Reads a stream's state and its first consumers.
+    pub async fn stream_info(&self, stream: &str) -> Result<api::StreamInfo, Error> {
+        self.client.send(&api::GetStream { db: self.name.clone(), stream: stream.into() }, &api::NoBody {}).await
+    }
+
+    /// Appends records to `stream` in one commit, exactly once if `append` has an
+    /// `idempotency_key`.
+    pub async fn append_records(&self, stream: &str, append: &api::AppendRequest) -> Result<api::Appended, Error> {
+        self.client.send(&api::AppendRecords { db: self.name.clone(), stream: stream.into() }, append).await
+    }
+
+    /// Appends one JSON record per line of `lines` to `stream` in one commit.
+    pub async fn append_lines(&self, stream: &str, lines: Bytes) -> Result<api::Appended, Error> {
+        let e = api::AppendLines { db: self.name.clone(), stream: stream.into() };
+        self.client.send(&e, &api::JsonLines(lines)).await
+    }
+
+    /// Reads a page of records of `stream`, waiting up to `query.wait_ms` for appends if a forward
+    /// read finds none.
+    pub async fn read_records(&self, stream: &str, query: api::ReadRecordsQuery) -> Result<api::RecordPage, Error> {
+        let e = api::ReadRecords { db: self.name.clone(), stream: stream.into(), query };
+        self.client.send(&e, &api::NoBody {}).await
+    }
+
+    /// Reads a page of the records of `stream` that `query.filter` matches.
+    pub async fn query_records(&self, stream: &str, query: &api::RecordQuery) -> Result<api::RecordPage, Error> {
+        self.client.send(&api::QueryRecords { db: self.name.clone(), stream: stream.into() }, query).await
+    }
+
     pub async fn create_table(&self, table: &api::NewTable) -> Result<api::CreatedTable, Error> {
         self.client.send(&api::CreateTable { db: self.name.clone() }, table).await
+    }
+
+    /// Adds a column to `table`, which reads as the column's `default` in existing rows.
+    pub async fn add_column(&self, table: &str, column: &api::NewColumn) -> Result<api::CreatedTable, Error> {
+        self.client.send(&api::AddColumn { db: self.name.clone(), table: table.into() }, column).await
+    }
+
+    /// Adds a secondary index to `table` and backfills it from existing rows.
+    pub async fn add_index(&self, table: &str, index: &api::NewIndex) -> Result<api::CreatedTable, Error> {
+        self.client.send(&api::AddIndex { db: self.name.clone(), table: table.into() }, index).await
     }
 
     pub async fn get_table(&self, name: &str) -> Result<api::Table, Error> {
@@ -380,6 +457,21 @@ impl Db {
             path: api::Txn { db: self.name.clone() }.path(),
             reason: "a read was replayed".into(),
         })
+    }
+
+    /// Executes read operations at a version at most `max_staleness` old, which any node can serve
+    /// from its cache without asking the lease holder.
+    pub async fn read_snapshot(&self, ops: &[Op], max_staleness: Duration) -> Result<Vec<OpResult>, Error> {
+        let req = api::TxnRequest {
+            consistency: Some(api::Consistency::Snapshot),
+            max_staleness_ms: Some(u64::try_from(max_staleness.as_millis()).unwrap_or(u64::MAX)),
+            ..txn_request(ops, None)
+        };
+        let e = api::Txn { db: self.name.clone() };
+        let path = e.path();
+        let out = TxnOutcome::decode(ops, self.client.send(&e, &req).await?);
+        let out = out.map_err(|reason| Error::Malformed { path: path.clone(), reason })?;
+        out.results.ok_or_else(|| Error::Malformed { path, reason: "a read was replayed".into() })
     }
 
     pub async fn read_one(&self, op: Op) -> Result<OpResult, Error> {
@@ -469,13 +561,38 @@ impl Db {
     }
 
     /// Uploads a blob to reference in [`Op::PutBlob`].
-    pub async fn stage_blob(&self, data: Bytes) -> Result<api::BlobMeta, Error> {
-        self.client.send(&api::StageBlob { db: self.name.clone() }, &api::Octets(data)).await
+    /// Uploads a blob to reference in a later write; reads of it report `content_type`.
+    pub async fn stage_blob(&self, data: Bytes, content_type: &str) -> Result<api::BlobMeta, Error> {
+        let e = api::StageBlob { db: self.name.clone(), content_type: Some(content_type.into()) };
+        self.client.send(&e, &api::Octets(data)).await
     }
 
-    pub async fn read_blob(&self, blob_id: &str) -> Result<Bytes, Error> {
-        let e = api::ReadBlob { db: self.name.clone(), blob_id: blob_id.into() };
-        Ok(self.client.send(&e, &api::NoBody {}).await?.0)
+    /// Reads a blob, or `range` of it.
+    pub async fn read_blob(&self, blob_id: &str, range: Option<api::ByteRange>) -> Result<api::Content, Error> {
+        let e = api::ReadBlob { db: self.name.clone(), blob_id: blob_id.into(), range };
+        self.client.send(&e, &api::NoBody {}).await
+    }
+
+    /// Reads the bytes of `key`, or `range` of them, or returns `None` if `key` is absent.
+    pub async fn get_value(
+        &self,
+        key: impl Into<Bytes>,
+        range: Option<api::ByteRange>,
+    ) -> Result<Option<api::KvValue>, Error> {
+        let e = api::GetValue { db: self.name.clone(), key: key.into(), range };
+        let r = self.client.attempts(&e, &api::NoBody {}, Some(api::ErrorCode::NotFound)).await;
+        r.map_err(|f| f.error)
+    }
+
+    /// Writes `data` to `key` in one commit outside any transaction.
+    pub async fn put_value(
+        &self,
+        key: impl Into<Bytes>,
+        data: impl Into<Bytes>,
+        options: api::PutOptions,
+    ) -> Result<api::Written, Error> {
+        let e = api::PutValue { db: self.name.clone(), key: key.into(), options };
+        self.client.send(&e, &api::Octets(data.into())).await
     }
 }
 

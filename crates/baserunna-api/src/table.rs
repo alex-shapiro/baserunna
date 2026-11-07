@@ -29,6 +29,54 @@ impl Endpoint for CreateTable {
     }
 }
 
+/// `POST /v1/dbs/{db}/tables/{table}/columns`: adds a column, which reads as its `default` in
+/// existing rows.
+#[derive(Clone, Debug)]
+pub struct AddColumn {
+    pub db: String,
+    pub table: String,
+}
+
+impl Endpoint for AddColumn {
+    const METHOD: Method = Method::POST;
+    const ROUTE: &'static str = "/v1/dbs/{db}/tables/{t}/columns";
+    const STATUS: StatusCode = StatusCode::OK;
+    type Body = NewColumn;
+    type Response = CreatedTable;
+
+    fn is_idempotent(_: &NewColumn) -> bool {
+        false
+    }
+
+    fn path(&self) -> String {
+        fill_route(Self::ROUTE, &[&self.db, &self.table])
+    }
+}
+
+/// `POST /v1/dbs/{db}/tables/{table}/indexes`: adds a secondary index and backfills it from
+/// existing rows.
+#[derive(Clone, Debug)]
+pub struct AddIndex {
+    pub db: String,
+    pub table: String,
+}
+
+impl Endpoint for AddIndex {
+    const METHOD: Method = Method::POST;
+    const ROUTE: &'static str = "/v1/dbs/{db}/tables/{t}/indexes";
+    const STATUS: StatusCode = StatusCode::OK;
+    type Body = NewIndex;
+    type Response = CreatedTable;
+
+    fn is_idempotent(_: &NewIndex) -> bool {
+        false
+    }
+
+    fn path(&self) -> String {
+        fill_route(Self::ROUTE, &[&self.db, &self.table])
+    }
+}
+
 /// `GET /v1/dbs/{db}/tables`: lists tables in name order.
 #[derive(Clone, Debug)]
 pub struct ListTables {
@@ -224,4 +272,4 @@ pub struct TablePage {
     pub version: u64,
 }
 
-json_body!(NewTable, Table, CreatedTable, TablePage);
+json_body!(NewTable, NewColumn, NewIndex, Table, CreatedTable, TablePage);

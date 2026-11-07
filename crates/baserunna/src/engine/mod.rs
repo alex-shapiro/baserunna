@@ -25,8 +25,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
+pub use baserunna_api::{DbStats, LevelStats};
 pub use config::EngineConfig;
-pub use db::{CommitState, Committed, Consistency, Db, DbStats, LevelStats};
+pub use db::{CommitState, Committed, Consistency, Db};
 pub use stream::{Appended, Record, Retention, Seek, StreamOp, StreamState};
 pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
 pub use types::{BlobRef, Entry, Seq, Value};

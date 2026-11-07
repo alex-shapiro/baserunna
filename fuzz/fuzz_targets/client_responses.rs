@@ -65,7 +65,7 @@ fuzz_target!(|data: &[u8]| {
         Op::query_all::<Item>(),
         Op::update::<Item>(1, &serde_json::json!({"label": "x"})),
         Op::delete_all_rows::<Item>(),
-        Op::Append { stream: "s".into(), records: vec![NewRecord::Bytes(Bytes::from_static(b"r"))], create: true },
+        Op::Append { stream: "s".into(), records: vec![NewRecord::bytes(Bytes::from_static(b"r"))], create: true },
         Op::read_stream("s", 0),
     ];
     let pick = &ops[..usize::from(*call / 10) % (ops.len() + 1)];
@@ -85,8 +85,8 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             1 => drop(db.changes(&changes).await),
-            2 => drop(db.stage_blob(Bytes::from_static(b"x")).await),
-            3 => drop(db.read_blob("b").await),
+            2 => drop(db.stage_blob(Bytes::from_static(b"x"), "application/octet-stream").await),
+            3 => drop(db.read_blob("b", None).await),
             4 => drop(client.me().await),
             5 => drop(client.limits().await),
             6 => {

@@ -1688,7 +1688,7 @@ fn stats_describe_the_current_version() {
         let s = db.stats(&db.current().unwrap());
         assert_eq!((s.version, s.levels.len(), s.tail_entries), (v, 0, 2), "the value and its commit record");
         assert_eq!(s.lease_holder.as_deref(), Some("a"));
-        assert_eq!(s.lease_expires_ms, Some(eng.shared.env.now_ms() + eng.shared.cfg.lease_ms));
+        assert_eq!(s.lease_expires_at, Some(eng.shared.env.now_ms() + eng.shared.cfg.lease_ms));
     });
 }
 

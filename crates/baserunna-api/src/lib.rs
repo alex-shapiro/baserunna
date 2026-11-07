@@ -13,26 +13,36 @@ mod error;
 mod kv;
 mod limits;
 mod op;
+mod stream;
 mod table;
 mod txn;
 
 pub use account::{
-    AddMember, CreateOrg, Credential, Credentials, GetMe, LogIn, Me, Member, NewMember, NewOrg, Org, RemoveMember,
-    Role, Session, SignUp, User,
+    AddMember, ApiKey, ApiKeyPage, CreateApiKey, CreateOrg, CreatedApiKey, Credential, Credentials, DeleteApiKey,
+    GetMe, ListApiKeys, LogIn, Me, Member, NewApiKey, NewMember, NewOrg, Org, PageQuery, RemoveMember, Role, Session,
+    SignUp, User,
 };
 pub use admin::{CommitMetrics, Cpu, GetMetrics, Histogram, Metrics, ResetMetrics};
-pub use db::{CreateDb, Db, NewDb};
+pub use db::{CreateDb, Db, DbInfo, DbPage, DbStats, DeleteDb, GetDb, LevelStats, ListDbs, ListDbsQuery, NewDb};
 pub use error::{ApiError, ErrorBody, ErrorCode, ErrorDetails, Outcome};
-pub use kv::{BlobMeta, Change, ChangePage, Changes, ChangesQuery, DeletedRange, ReadBlob, StageBlob};
+pub use kv::{
+    BlobMeta, ByteRange, Change, ChangePage, Changes, ChangesQuery, Content, DeletedRange, Expect, GetValue, KvValue,
+    PutOptions, PutValue, ReadBlob, StageBlob, Written,
+};
 pub use limits::{GetLimits, Limits};
 pub use op::{
     AppendResult, ConsumerResult, CountResult, DeletedResult, FoundResult, GetResult, IncrementResult, NewRecord, Op,
     OpResult, PAGE_MAX, QueryEvents, RangeSpec, ReadStream, RecordsResult, RowResult, RowsResult, ScanItem, ScanResult,
     Selection, StreamRecord, StreamState,
 };
+pub use stream::{
+    AppendLines, AppendRecords, AppendRequest, Appended, Consumer, CreateStream, CreatedStream, GetStream, JsonLines,
+    ListStreams, ListStreamsQuery, NewStream, QueryRecords, ReadRecords, ReadRecordsQuery, RecordPage, RecordQuery,
+    Stream, StreamInfo, StreamPage,
+};
 pub use table::{
-    Column, ColumnType, CreateTable, CreatedTable, GetTable, GetTableQuery, Index, IndexState, ListTables,
-    ListTablesQuery, NewColumn, NewIndex, NewTable, Table, TablePage,
+    AddColumn, AddIndex, Column, ColumnType, CreateTable, CreatedTable, GetTable, GetTableQuery, Index, IndexState,
+    ListTables, ListTablesQuery, NewColumn, NewIndex, NewTable, Table, TablePage,
 };
 pub use txn::{
     AbortTxn, BeginRequest, BeginTxn, Begun, CommitRequest, CommitStatus, CommitTxn, Committed, Consistency, Encoding,
@@ -67,6 +77,17 @@ pub trait Endpoint {
     }
 
     fn path(&self) -> String;
+
+    /// Returns request headers besides `Authorization`. A `Content-Type` here replaces the body's.
+    fn headers(&self) -> http::HeaderMap {
+        http::HeaderMap::new()
+    }
+
+    /// Decodes a successful response from its body and, for endpoints that answer in headers, its
+    /// head.
+    fn response(_head: &http::response::Parts, body: Bytes) -> Result<Self::Response, String> {
+        Self::Response::decode(body)
+    }
 }
 
 /// Request or response body encoding.
@@ -148,7 +169,7 @@ pub fn fill_route(route: &str, params: &[&str]) -> String {
         }
         if seg.starts_with('{') && seg.ends_with('}') {
             let p = params.next().unwrap_or_else(|| panic!("{route} needs more parameters"));
-            percent_encode(p, &mut out);
+            percent_encode(p.as_bytes(), &mut out);
         } else {
             out.push_str(seg);
         }
@@ -158,9 +179,9 @@ pub fn fill_route(route: &str, params: &[&str]) -> String {
 }
 
 /// Appends `s` to `out`, percent-encoding all bytes except RFC 3986 unreserved characters.
-pub fn percent_encode(s: &str, out: &mut String) {
+pub fn percent_encode(s: &[u8], out: &mut String) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    for b in s.bytes() {
+    for &b in s {
         if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
             out.push(b as char);
         } else {

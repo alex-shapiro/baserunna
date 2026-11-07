@@ -143,15 +143,16 @@ pub struct ApiKey {
 }
 
 impl ApiKey {
-    pub fn public_json(&self, db_ref: Option<&str>) -> Json {
-        json!({
-            "id": self.id,
-            "name": self.name,
-            "db": db_ref,
-            "read_only": self.read_only,
-            "rate_limit": self.rate_limit,
-            "created_at": self.created_at,
-        })
+    /// Returns the key as the API shows it, restricted to the database that `db` names.
+    pub fn public(&self, db: Option<String>) -> baserunna_api::ApiKey {
+        baserunna_api::ApiKey {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            db,
+            read_only: self.read_only,
+            rate_limit: self.rate_limit,
+            created_at: self.created_at,
+        }
     }
 }
 

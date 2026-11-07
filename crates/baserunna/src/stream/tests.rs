@@ -6,6 +6,7 @@ use crate::engine::{Appended, Committed, Consistency, Db, Engine, EngineConfig, 
 use crate::probe::{self, Probe};
 use crate::util::prop;
 use crate::util::rng::Rng;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;

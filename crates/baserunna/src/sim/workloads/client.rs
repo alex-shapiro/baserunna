@@ -360,7 +360,7 @@ async fn mutate(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Str
             2 => Op::Copy { from: mutator_key(i, sim.rand_below(12)), to: key },
             3 => {
                 let data = Bytes::from(vec![step as u8; 1 + sim.rand_below(3000) as usize]);
-                match db.stage_blob(data).await {
+                match db.stage_blob(data, "application/octet-stream").await {
                     Ok(b) => Op::PutBlob { key, blob_id: b.blob_id },
                     Err(_) => continue,
                 }

@@ -237,7 +237,7 @@ fn metrics(info: &DbInfo) -> String {
         })
         .collect();
     let lease = match &st.lease_holder {
-        Some(h) => format!("{} until {}", esc(h), st.lease_expires_ms.map_or_else(|| "—".into(), when)),
+        Some(h) => format!("{} until {}", esc(h), st.lease_expires_at.map_or_else(|| "—".into(), when)),
         None => "none".into(),
     };
     format!(
@@ -261,7 +261,7 @@ fn metrics(info: &DbInfo) -> String {
         tb = format_bytes(st.tail_bytes as u64),
         rt = st.range_tombstones,
         gc = st.pending_gc_objects,
-        upd = when(st.updated_ms),
+        upd = when(st.updated_at),
         levels = table(
             &["Level", "Segments", "Bytes", "Entries"],
             &levels,

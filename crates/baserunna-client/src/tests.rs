@@ -289,7 +289,7 @@ async fn a_request_that_times_out_is_not_sent_again() {
 async fn a_truncated_body_is_a_network_failure_and_is_retried() {
     let short = resp(200, &[("content-length", "5")], "abc");
     let (c, s) = script(vec![short, resp(200, &[("content-length", "5")], "abcde")]);
-    assert_eq!(c.db("s").read_blob("b").await.unwrap(), "abcde");
+    assert_eq!(c.db("s").read_blob("b", None).await.unwrap().data, "abcde");
     assert_eq!(sent(&s), 2);
 }
 
@@ -300,7 +300,7 @@ async fn the_first_success_ends_the_retries() {
         api_err(409, "conflict", "null"),
         resp(201, &[], r#"{"blob_id":"b","size":1,"sha256":"00","content_type":"application/octet-stream"}"#),
     ]);
-    assert_eq!(c.db("s").stage_blob(Bytes::from_static(b"x")).await.unwrap().blob_id, "b");
+    assert_eq!(c.db("s").stage_blob(Bytes::from_static(b"x"), "application/octet-stream").await.unwrap().blob_id, "b");
     assert_eq!(sent(&s), 3);
     let r = &s.requests.lock()[2];
     assert_eq!(
@@ -385,9 +385,9 @@ fn arbitrary_responses_never_panic_the_client() {
             match r.below(5) {
                 0 => drop(db.txn(&ops, None).await),
                 1 => drop(db.changes(&req).await),
-                2 => drop(db.stage_blob(Bytes::from_static(b"x")).await),
+                2 => drop(db.stage_blob(Bytes::from_static(b"x"), "application/octet-stream").await),
                 3 => drop(c.sign_up("e", "p").await),
-                _ => drop(db.read_blob("b").await),
+                _ => drop(db.read_blob("b", None).await),
             }
         }
     });

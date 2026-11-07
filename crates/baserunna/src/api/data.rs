@@ -3,7 +3,7 @@
 use super::body::{BlobBody, Upload, parse_range, read_upload};
 use super::{
     Auth, DbCtx, Endpoints as _, Found, JsonBody, LONG_POLL_MAX_MS, Params, QueryOf, Ran, Reply, Req, consistency_from,
-    consistency_of, naming_commit, paging, percent_decode, run_txn, watch, with_read, with_txn,
+    consistency_of, naming_commit, percent_decode, run_txn, watch, with_read, with_txn,
 };
 use crate::engine::manifest::ObjKind;
 use crate::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn, Value, blob};
@@ -30,7 +30,8 @@ type J = axum::Json<Json>;
 
 pub fn routes() -> Router<Arc<Node>> {
     Router::new()
-        .route("/v1/dbs/{db}", get(get_db).delete(delete_db))
+        .endpoint::<api::GetDb, _>(get_db)
+        .endpoint::<api::DeleteDb, _>(delete_db)
         .route("/v1/dbs/{db}/kv", get(scan_kv))
         .endpoint::<api::Changes, _>(kv_changes)
         .route("/v1/dbs/{db}/kv/{*key}", get(get_kv).put(put_kv).delete(delete_kv))
@@ -46,9 +47,9 @@ pub fn routes() -> Router<Arc<Node>> {
         .endpoint::<api::CreateTable, _>(create_table)
         .endpoint::<api::GetTable, _>(get_table)
         .route(api::GetTable::ROUTE, delete(drop_table))
-        .route("/v1/dbs/{db}/tables/{t}/columns", post(add_column))
+        .endpoint::<api::AddColumn, _>(add_column)
         .route("/v1/dbs/{db}/tables/{t}/columns/{c}", delete(drop_column))
-        .route("/v1/dbs/{db}/tables/{t}/indexes", post(add_index))
+        .endpoint::<api::AddIndex, _>(add_index)
         .route("/v1/dbs/{db}/tables/{t}/indexes/{i}", delete(drop_index))
         .route("/v1/dbs/{db}/tables/{t}/rows", post(insert_rows))
         .route("/v1/dbs/{db}/tables/{t}/rows/get", post(get_row))
@@ -74,20 +75,6 @@ fn op_ctx<'a>(node: &Node, ctx: &'a DbCtx, enc: api::Encoding) -> OpCtx<'a> {
     }
 }
 
-#[derive(Serialize)]
-struct DbSummary<'a> {
-    id: &'a str,
-    name: &'a str,
-    org: Option<&'a str>,
-    created_at: i64,
-}
-
-impl<'a> DbSummary<'a> {
-    fn new(db: &'a DbRecord, org: Option<&'a str>) -> DbSummary<'a> {
-        DbSummary { id: &db.id, name: &db.name, org, created_at: db.created_at }
-    }
-}
-
 async fn org_name(t: &mut Txn, owner_id: &str) -> Result<Option<String>> {
     if !meta::is_org_id(owner_id) {
         return Ok(None);
@@ -102,29 +89,33 @@ pub async fn db_ref(t: &mut Txn, d: &DbRecord) -> Result<String> {
 }
 
 /// Lists databases for the authenticated user or the specified `org`.
-pub async fn list_dbs(State(node): State<Arc<Node>>, Auth(p): Auth, q: Params) -> Result<J> {
-    let (limit, cursor) = paging(&q)?;
-    let org = q.get("org");
+pub async fn list_dbs(
+    State(node): State<Arc<Node>>,
+    Auth(p): Auth,
+    QueryOf(q): QueryOf<api::ListDbsQuery>,
+    _: Req<api::ListDbs>,
+) -> Result<Reply<api::ListDbs>> {
+    let limit = ops::page_limit(q.limit)?;
+    let cursor = q.cursor.filter(|c| !c.is_empty());
     let mut t = node.sys_read_strong().await?;
-    let (dbs, next_cursor) = match (p.scoped_db(), org) {
+    let (dbs, next_cursor) = match (p.scoped_db(), &q.org) {
         (Some(_), Some(_)) => return Err(Error::PermissionDenied("this API key is limited to one database".into())),
         (Some(scope), None) => (meta::get_db(&mut t, scope).await?.into_iter().collect(), None),
-        (None, Some(name)) => {
-            let owner = node.resolve_org(&p, name).await?.0.id;
+        (None, owner) => {
+            let owner = match owner {
+                Some(name) => node.resolve_org(&p, name).await?.0.id,
+                None => p.user.id.clone(),
+            };
             let page = meta::dbs_page(&mut t, &owner, limit, cursor).await?;
             (page.items, page.next_cursor)
         }
-        (None, None) => {
-            let page = meta::dbs_page(&mut t, &p.user.id, limit, cursor).await?;
-            (page.items, page.next_cursor)
-        }
     };
-    let mut out = Vec::with_capacity(dbs.len());
-    for db in &dbs {
+    let mut databases = Vec::with_capacity(dbs.len());
+    for db in dbs {
         let org = org_name(&mut t, &db.owner_id).await?;
-        out.push(to_json(&DbSummary::new(db, org.as_deref()))?);
+        databases.push(api::Db { id: db.id, name: db.name, org, created_at: db.created_at });
     }
-    Ok(axum::Json(json!({"databases": out, "next_cursor": next_cursor})))
+    Ok(Reply::new(api::DbPage { databases, next_cursor }))
 }
 
 fn to_json<T: Serialize>(v: &T) -> Result<Json> {
@@ -169,20 +160,28 @@ pub async fn create_db(
     Ok(Reply::new(api::Db { id: db.id, name: db.name, org: c.org, created_at: db.created_at }))
 }
 
-async fn get_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>) -> Result<J> {
+async fn get_db(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    _: Req<api::GetDb>,
+) -> Result<Reply<api::GetDb>> {
     let v = ctx.db.read_version(Consistency::Snapshot { max_staleness_ms: 5000 }).await?;
     let mut t = node.sys_read().await?;
-    Ok(axum::Json(json!({
-        "id": ctx.rec.id,
-        "name": ctx.rec.name,
-        "org": org_name(&mut t, &ctx.rec.owner_id).await?,
-        "role": ctx.access.role,
-        "created_at": ctx.rec.created_at,
-        "stats": ctx.db.stats(&v),
-    })))
+    Ok(Reply::new(api::DbInfo {
+        id: ctx.rec.id.clone(),
+        name: ctx.rec.name.clone(),
+        org: org_name(&mut t, &ctx.rec.owner_id).await?,
+        role: ctx.access.role.into(),
+        created_at: ctx.rec.created_at,
+        stats: ctx.db.stats(&v),
+    }))
 }
 
-async fn delete_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>) -> Result<J> {
+async fn delete_db(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    _: Req<api::DeleteDb>,
+) -> Result<Reply<api::DeleteDb>> {
     ctx.principal.require_unscoped()?;
     node.access_strong(&ctx.principal, &ctx.rec).await?.require_admin()?;
     ctx.db.mark_deleted().await?;
@@ -196,7 +195,7 @@ async fn delete_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
     }
     node.forget_db_name(&ctx.rec.owner_id, &ctx.rec.name);
     node.engine.forget(&ctx.rec.id);
-    Ok(axum::Json(json!({})))
+    Ok(Reply::new(api::Empty {}))
 }
 
 pub(super) fn encoding_param(q: &Params) -> Result<api::Encoding> {
@@ -340,7 +339,7 @@ async fn put_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>,
         }
         t.put_expiring(key.clone(), value.clone(), ops::expiry(ttl_ms)?)
     });
-    Ok(axum::Json(json!({"version": v})))
+    Ok(axum::Json(serde_json::to_value(api::Written { version: v }).expect("writes serialize")))
 }
 
 async fn delete_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, req: Request) -> Result<J> {
@@ -783,13 +782,11 @@ async fn add_column(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
-    JsonBody(c): JsonBody<api::NewColumn>,
-) -> Result<J> {
+    Req(c): Req<api::AddColumn>,
+) -> Result<Reply<api::AddColumn>> {
     let name = param(&p, "t")?.to_string();
-    let (s, v) = with_txn!(node, ctx, |t| table::add_column(t, &name, &c).await);
-    let mut out = s.to_json();
-    out["version"] = json!(v);
-    Ok(axum::Json(out))
+    let (s, version) = with_txn!(node, ctx, |t| table::add_column(t, &name, &c).await);
+    Ok(Reply::new(api::CreatedTable { table: s.to_api(), version }))
 }
 
 async fn drop_column(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
@@ -805,15 +802,13 @@ async fn add_index(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
-    JsonBody(i): JsonBody<api::NewIndex>,
-) -> Result<J> {
+    Req(i): Req<api::AddIndex>,
+) -> Result<Reply<api::AddIndex>> {
     ctx.require_write()?;
     let name = param(&p, "t")?.to_string();
     let opts = table::Backfill { batch_rows: node.cfg.index_backfill_batch_rows, ..Default::default() };
-    let (s, v) = table::add_index(&ctx.db, &name, &i, opts).await?;
-    let mut out = s.to_json();
-    out["version"] = json!(v);
-    Ok(axum::Json(out))
+    let (s, version) = table::add_index(&ctx.db, &name, &i, opts).await?;
+    Ok(Reply::new(api::CreatedTable { table: s.to_api(), version }))
 }
 
 async fn drop_index(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {

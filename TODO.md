@@ -23,7 +23,8 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 - [ ] **Fix stream reads that exceed the request deadline.** Requests are
       canceled at `commit_timeout_ms`, which can cause large stream reads to
       fail repeatedly with `503 request deadline exceeded`
-      (`sim_tool trace streams 2601188`).
+      (`sim_tool trace streams 2601188`, and the checker reads of `streams` seeds
+      9102146 and 9107143).
 - [ ] **Run garbage collection sweeps even if the lease duration is short.** A
       post-commit sweep skips execution if the lease expires while reading the
       store clock and refreshing the manifest, leaving the database unswept
@@ -236,23 +237,22 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       response types into `baserunna-api`, derive JSON Schema for them, and
       generate `openapi.json` from the `Endpoint` definitions instead of
       maintaining `api/openapi.rs` by hand.
-- [ ] **Replace `baserunna::client` with `baserunna-client`.** Add event-table
-      operations and schema routes to `baserunna-client`, migrate the examples,
-      and delete `crates/baserunna/src/client.rs`.
 - [ ] **Cover every transaction operation in `baserunna_client::Op`.** It lacks
-      `update_rows`, `stream_info`, `trim_stream`, `get_consumer`,
-      `set_consumer`, the event operations, `ttl_ms` on writes, `expect_seq` on
-      `append`, and `check` by value, so stream consumers cannot be used from
-      the client at all.
+      `stream_info`, `get_consumer`, the event operations, `ttl_ms` on writes,
+      `expect_seq` on `append`, and `check` by value.
 - [ ] **Return operation results from client writes.** `Db::write` and
       `Txn::commit` drop the per-operation results that the server returns, so
       a caller cannot read, for example, the value of an `increment` or the
       count of a `delete_rows` with exactly-once semantics.
-- [ ] **Type the remaining JSON in `baserunna-api`.** `query_events` results,
-      row and stream `filter`s, and the routes outside `Endpoint` (KV, table
-      schema changes, row routes, streams, events, organizations) are still
-      built or parsed as untyped JSON on the server, so the compiler cannot
-      check them against `baserunna-client`.
+- [ ] **Type the remaining JSON in `baserunna-api`.** The compiler cannot check
+      these against `baserunna-client`, because the server still builds or
+      parses them as untyped JSON: `query_events` results; row and stream
+      `filter`s; the request side of the KV, blob, stream append, stream read,
+      and stream query routes, which the server parses by hand to stream bodies
+      and accept several formats; and the routes outside `Endpoint`, which are
+      KV scans and deletes, schema drops, the row routes, stream configuration,
+      trims, and consumers, events, organization management, account
+      self-service, and admin.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`.
 - [ ] **Validate additional S3-compatible object stores.** Run the conformance

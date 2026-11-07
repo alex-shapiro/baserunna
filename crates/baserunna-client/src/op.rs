@@ -1,11 +1,13 @@
 //! Transaction operations.
 
 use crate::OpResult;
+pub use crate::api::Expect;
 use crate::api::{self, b64};
 use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value as Json;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Table row type whose fields are the table's columns.
@@ -87,6 +89,12 @@ pub enum Op {
         table: String,
         pk: Json,
     },
+    /// Sets the columns in `set` on every row that `selection` matches.
+    UpdateRows {
+        table: String,
+        selection: api::Selection,
+        set: Json,
+    },
     DeleteRows {
         table: String,
         selection: api::Selection,
@@ -107,6 +115,15 @@ pub enum Op {
         create: bool,
     },
     ReadStream(api::ReadStream),
+    SetConsumer {
+        stream: String,
+        consumer: String,
+        seq: u64,
+    },
+    TrimStream {
+        stream: String,
+        before_seq: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,17 +136,32 @@ pub enum KeyRange {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Expect {
-    Absent,
-    Version(u64),
+/// Stream record to append: a JSON or binary body and headers that filters can match.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewRecord {
+    pub body: NewBody,
+    pub headers: BTreeMap<String, String>,
 }
 
-/// Stream record to append.
 #[derive(Clone, Debug, PartialEq)]
-pub enum NewRecord {
+pub enum NewBody {
     Json(Json),
     Bytes(Bytes),
+}
+
+impl NewRecord {
+    pub fn json(body: &impl Serialize) -> NewRecord {
+        NewRecord { body: NewBody::Json(json(body)), headers: BTreeMap::new() }
+    }
+
+    pub fn bytes(body: impl Into<Bytes>) -> NewRecord {
+        NewRecord { body: NewBody::Bytes(body.into()), headers: BTreeMap::new() }
+    }
+
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> NewRecord {
+        self.headers.insert(name.into(), value.into());
+        self
+    }
 }
 
 fn json(v: &impl Serialize) -> Json {
@@ -198,32 +230,57 @@ impl Op {
     /// Deletes the rows of `R` whose leading primary key columns equal `eq`, a value or a tuple. An
     /// empty or `None` prefix matches no rows.
     pub fn delete_rows<R: Row>(eq: impl Serialize) -> Op {
-        Op::DeleteRows { table: R::TABLE.into(), selection: prefix(&eq) }
+        Op::delete_where::<R>(prefix(&eq))
     }
 
     pub fn delete_all_rows<R: Row>() -> Op {
-        Op::DeleteRows { table: R::TABLE.into(), selection: api::Selection::default() }
+        Op::delete_where::<R>(api::Selection::default())
+    }
+
+    /// Deletes every row of `R` that `selection` matches.
+    pub fn delete_where<R: Row>(selection: api::Selection) -> Op {
+        Op::DeleteRows { table: R::TABLE.into(), selection }
+    }
+
+    /// Sets the columns that `set` serializes on every row of `R` that `selection` matches.
+    pub fn update_where<R: Row>(selection: api::Selection, set: &impl Serialize) -> Op {
+        Op::UpdateRows { table: R::TABLE.into(), selection, set: json(set) }
     }
 
     /// Reads the first page of rows of `R` whose leading primary key columns equal `eq`, a value
     /// or a tuple. An empty or `None` prefix matches no rows.
     pub fn query<R: Row>(eq: impl Serialize) -> Op {
-        Op::query_rows::<R>(prefix(&eq))
+        Op::query_where::<R>(prefix(&eq))
     }
 
     /// Reads the first page of every row of `R`.
     pub fn query_all<R: Row>() -> Op {
-        Op::query_rows::<R>(api::Selection::default())
+        Op::query_where::<R>(api::Selection::default())
     }
 
-    fn query_rows<R: Row>(selection: api::Selection) -> Op {
+    /// Reads the first page of the rows of `R` that `selection` matches, in the order of its index.
+    pub fn query_where<R: Row>(selection: api::Selection) -> Op {
         Op::QueryRows { table: R::TABLE.into(), selection, limit: api::PAGE_MAX, reverse: false, cursor: None }
     }
 
     /// Appends each of `records` as a JSON record, creating `stream` if it does not exist.
     pub fn append<T: Serialize>(stream: impl Into<String>, records: &[T]) -> Op {
-        let records = records.iter().map(|r| NewRecord::Json(json(r))).collect();
+        Op::append_records(stream, records.iter().map(NewRecord::json).collect())
+    }
+
+    /// Appends `records`, creating `stream` if it does not exist.
+    pub fn append_records(stream: impl Into<String>, records: Vec<NewRecord>) -> Op {
         Op::Append { stream: stream.into(), records, create: true }
+    }
+
+    /// Sets the sequence number that consumer `consumer` of `stream` reads from next.
+    pub fn set_consumer(stream: impl Into<String>, consumer: impl Into<String>, seq: u64) -> Op {
+        Op::SetConsumer { stream: stream.into(), consumer: consumer.into(), seq }
+    }
+
+    /// Deletes the records of `stream` before sequence number `before_seq`.
+    pub fn trim_stream(stream: impl Into<String>, before_seq: u64) -> Op {
+        Op::TrimStream { stream: stream.into(), before_seq }
     }
 
     /// Reads the first page of records of `stream` from sequence number `from_seq`.
@@ -292,6 +349,9 @@ impl Op {
             Op::UpsertRow { table, row } => api::Op::UpsertRow { table, row, ttl_ms: None },
             Op::UpdateRow { table, pk, set } => api::Op::UpdateRow { table, pk, set, ttl_ms: None },
             Op::DeleteRow { table, pk } => api::Op::DeleteRow { table, pk },
+            Op::UpdateRows { table, selection, set } => {
+                api::Op::UpdateRows { table, selection, set, ttl_ms: None, limit: None }
+            }
             Op::DeleteRows { table, selection } => api::Op::DeleteRows { table, selection, limit: None },
             Op::QueryRows { table, selection, limit, reverse, cursor } => {
                 let api::Selection { index, eq, range, filter } = selection;
@@ -302,14 +362,18 @@ impl Op {
                 api::Op::Append { stream, records, expect_seq: None, create }
             }
             Op::ReadStream(r) => api::Op::ReadStream(r),
+            Op::SetConsumer { stream, consumer, seq } => api::Op::SetConsumer { stream, consumer, seq },
+            Op::TrimStream { stream, before_seq } => {
+                api::Op::TrimStream { stream, before_seq: Some(before_seq), before_time: None }
+            }
         }
     }
 }
 
-fn new_record(r: NewRecord) -> api::NewRecord {
-    match r {
-        NewRecord::Json(j) => api::NewRecord { json: Some(j), ..api::NewRecord::default() },
-        NewRecord::Bytes(b) => api::NewRecord { value: Some(b64::encode(&b)), ..api::NewRecord::default() },
+fn new_record(NewRecord { body, headers }: NewRecord) -> api::NewRecord {
+    match body {
+        NewBody::Json(j) => api::NewRecord { json: Some(j), value: None, headers },
+        NewBody::Bytes(b) => api::NewRecord { json: None, value: Some(b64::encode(&b)), headers },
     }
 }
 

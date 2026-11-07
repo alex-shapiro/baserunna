@@ -1,6 +1,6 @@
 //! Account, session, and organization types.
 
-use crate::{Empty, Endpoint, NoBody, fill_route, json_body};
+use crate::{Empty, Endpoint, NoBody, fill_route, is_false, json_body, with_query};
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
@@ -214,3 +214,115 @@ pub struct Member {
 }
 
 json_body!(Credentials, Session, Me, NewOrg, Org, NewMember, Member);
+
+/// `POST /v1/api-keys`: creates an API key for the session's user. Only a session can manage keys.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateApiKey;
+
+impl Endpoint for CreateApiKey {
+    const METHOD: Method = Method::POST;
+    const ROUTE: &'static str = "/v1/api-keys";
+    const STATUS: StatusCode = StatusCode::CREATED;
+    type Body = NewApiKey;
+    type Response = CreatedApiKey;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        false
+    }
+
+    fn path(&self) -> String {
+        Self::ROUTE.into()
+    }
+}
+
+/// `GET /v1/api-keys`: lists the session user's API keys.
+#[derive(Clone, Debug, Default)]
+pub struct ListApiKeys {
+    pub query: PageQuery,
+}
+
+impl Endpoint for ListApiKeys {
+    const METHOD: Method = Method::GET;
+    const ROUTE: &'static str = "/v1/api-keys";
+    const STATUS: StatusCode = StatusCode::OK;
+    type Body = NoBody;
+    type Response = ApiKeyPage;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        true
+    }
+
+    fn path(&self) -> String {
+        with_query(Self::ROUTE.into(), &self.query)
+    }
+}
+
+/// `DELETE /v1/api-keys/{id}`: revokes an API key.
+#[derive(Clone, Debug)]
+pub struct DeleteApiKey {
+    pub id: String,
+}
+
+impl Endpoint for DeleteApiKey {
+    const METHOD: Method = Method::DELETE;
+    const ROUTE: &'static str = "/v1/api-keys/{id}";
+    const STATUS: StatusCode = StatusCode::OK;
+    type Body = NoBody;
+    type Response = Empty;
+
+    fn is_idempotent(_: &Self::Body) -> bool {
+        false
+    }
+
+    fn path(&self) -> String {
+        fill_route(Self::ROUTE, &[&self.id])
+    }
+}
+
+/// Page size and position of a listing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewApiKey {
+    pub name: String,
+    /// Database to restrict the key to, or `None` for all of the user's databases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+    /// Maximum requests per second per node, or `None` for the default limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedApiKey {
+    /// Secret to authenticate with, returned only once.
+    pub key: String,
+    pub api_key: ApiKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKey {
+    pub id: String,
+    pub name: String,
+    pub db: Option<String>,
+    pub read_only: bool,
+    pub rate_limit: Option<u32>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyPage {
+    pub api_keys: Vec<ApiKey>,
+    pub next_cursor: Option<String>,
+}
+
+json_body!(NewApiKey, CreatedApiKey, ApiKeyPage);

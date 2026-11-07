@@ -1137,7 +1137,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .endpoint::<api::GetLimits, _>(limits)
         .merge(account::routes())
         .merge(orgs::routes())
-        .route("/v1/dbs", get(data::list_dbs).post(data::create_db))
+        .route(api::ListDbs::ROUTE, get(data::list_dbs).post(data::create_db))
         .merge(db_routes)
         .merge(internal)
         .merge(crate::console::routes())

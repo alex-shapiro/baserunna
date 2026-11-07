@@ -1,10 +1,15 @@
-//! Change-feed and blob types.
+//! Raw key-value, change-feed, and blob types.
 //!
 //! Keys and values are encoded as UTF-8 strings or as padded standard base64.
 //! If a response uses `utf8` encoding and a byte slice is not valid UTF-8, the server omits the
 //! plain field and writes base64 to the corresponding `_b64` field.
 
-use crate::{Consistency, Encoding, Endpoint, NoBody, Octets, fill_route, is_false, json_body, present, with_query};
+use crate::{
+    Body, Consistency, Encoding, Endpoint, NoBody, Octets, fill_route, is_false, json_body, percent_encode, present,
+    with_query,
+};
+use bytes::Bytes;
+use http::header::{CONTENT_RANGE, CONTENT_TYPE, HeaderMap, HeaderValue, IF_MATCH, IF_NONE_MATCH, RANGE};
 use http::{Method, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -31,12 +36,197 @@ impl Endpoint for Changes {
     }
 }
 
+/// `GET /v1/dbs/{db}/kv/{key}`: reads the bytes of a key, or a range of them.
+#[derive(Clone, Debug)]
+pub struct GetValue {
+    pub db: String,
+    pub key: Bytes,
+    pub range: Option<ByteRange>,
+}
+
+impl Endpoint for GetValue {
+    const METHOD: Method = Method::GET;
+    const ROUTE: &'static str = "/v1/dbs/{db}/kv/{*key}";
+    const STATUS: StatusCode = StatusCode::OK;
+    type Body = NoBody;
+    type Response = KvValue;
+
+    fn is_idempotent(_: &NoBody) -> bool {
+        true
+    }
+
+    fn path(&self) -> String {
+        kv_path(&self.db, &self.key)
+    }
+
+    fn headers(&self) -> HeaderMap {
+        range_header(self.range)
+    }
+
+    fn response(head: &http::response::Parts, body: Bytes) -> Result<KvValue, String> {
+        let h = &head.headers;
+        let version = number(h, "x-baserunna-version")?.ok_or("the response has no x-baserunna-version")?;
+        let expires_at = number(h, "x-baserunna-expires-at")?;
+        Ok(KvValue { content: Content::new(h, body), version, expires_at })
+    }
+}
+
+/// `PUT /v1/dbs/{db}/kv/{key}`: writes the bytes of a key.
+#[derive(Clone, Debug)]
+pub struct PutValue {
+    pub db: String,
+    pub key: Bytes,
+    pub options: PutOptions,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PutOptions {
+    /// Type that reads of the value report if it is large enough to be stored out of band as a
+    /// blob. Reads of smaller values report `application/octet-stream`.
+    pub content_type: Option<String>,
+    /// Deletes the value this many milliseconds after the write.
+    pub ttl_ms: Option<u64>,
+    /// Fails with `precondition_failed` unless the key's current state matches.
+    pub expect: Option<Expect>,
+}
+
+impl Endpoint for PutValue {
+    const METHOD: Method = Method::PUT;
+    const ROUTE: &'static str = "/v1/dbs/{db}/kv/{*key}";
+    const STATUS: StatusCode = StatusCode::OK;
+    type Body = Octets;
+    type Response = Written;
+
+    fn is_idempotent(_: &Octets) -> bool {
+        false
+    }
+
+    fn path(&self) -> String {
+        let mut path = kv_path(&self.db, &self.key);
+        if let Some(t) = self.options.ttl_ms {
+            path.push_str(&format!("?ttl_ms={t}"));
+        }
+        path
+    }
+
+    fn headers(&self) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(ct) = self.options.content_type.as_deref().and_then(|c| HeaderValue::from_str(c).ok()) {
+            h.insert(CONTENT_TYPE, ct);
+        }
+        match self.options.expect {
+            Some(Expect::Absent) => h.insert(IF_NONE_MATCH, HeaderValue::from_static("*")),
+            Some(Expect::Version(v)) => h.insert(IF_MATCH, HeaderValue::from(v)),
+            None => None,
+        };
+        h
+    }
+}
+
+/// State a key must be in for a conditional write to apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expect {
+    Absent,
+    /// The key holds the value written at this version.
+    Version(u64),
+}
+
+/// Bytes of a value or blob to read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByteRange {
+    /// Bytes `start..=end`.
+    Span { start: u64, end: u64 },
+    /// Bytes from `start` to the end.
+    From(u64),
+    /// The last `n` bytes.
+    Last(u64),
+}
+
+/// A key's bytes and the version that wrote them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvValue {
+    pub content: Content,
+    pub version: u64,
+    /// Time in milliseconds since the Unix epoch after which the value is deleted.
+    pub expires_at: Option<u64>,
+}
+
+/// Bytes of a value or blob, or of the requested range of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Content {
+    pub data: Bytes,
+    pub content_type: Option<String>,
+    /// `Content-Range` of a range read, such as `bytes 0-99/1000`.
+    pub content_range: Option<String>,
+}
+
+impl Content {
+    fn new(h: &HeaderMap, data: Bytes) -> Content {
+        let text = |name| h.get(name).and_then(|v: &HeaderValue| v.to_str().ok()).map(str::to_string);
+        Content { data, content_type: text(CONTENT_TYPE), content_range: text(CONTENT_RANGE) }
+    }
+}
+
+impl Body for Content {
+    const CONTENT_TYPE: Option<&'static str> = None;
+
+    fn encode(&self) -> Bytes {
+        self.data.clone()
+    }
+
+    fn decode(data: Bytes) -> Result<Content, String> {
+        Ok(Content { data, ..Content::default() })
+    }
+}
+
+impl Body for KvValue {
+    const CONTENT_TYPE: Option<&'static str> = None;
+
+    fn encode(&self) -> Bytes {
+        self.content.data.clone()
+    }
+
+    fn decode(_: Bytes) -> Result<KvValue, String> {
+        Err("a value is read from its response headers".into())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Written {
+    pub version: u64,
+}
+
+fn kv_path(db: &str, key: &[u8]) -> String {
+    let mut path = fill_route("/v1/dbs/{db}/kv/", &[db]);
+    percent_encode(key, &mut path);
+    path
+}
+
+fn range_header(range: Option<ByteRange>) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    let value = match range {
+        None => return h,
+        Some(ByteRange::Span { start, end }) => format!("bytes={start}-{end}"),
+        Some(ByteRange::From(start)) => format!("bytes={start}-"),
+        Some(ByteRange::Last(n)) => format!("bytes=-{n}"),
+    };
+    h.insert(RANGE, HeaderValue::from_str(&value).expect("ranges are ASCII"));
+    h
+}
+
+fn number(h: &HeaderMap, name: &str) -> Result<Option<u64>, String> {
+    let Some(v) = h.get(name) else { return Ok(None) };
+    v.to_str().ok().and_then(|s| s.trim_matches('"').parse().ok()).map(Some).ok_or(format!("bad {name} header"))
+}
+
 /// `POST /v1/dbs/{db}/blobs`: uploads a blob to reference by `blob_id` in a later `put`.
 ///
 /// Unreferenced staged blobs expire after `blob_stage_ttl_ms`.
 #[derive(Clone, Debug)]
 pub struct StageBlob {
     pub db: String,
+    /// Type that reads of the blob report, defaulting to `application/octet-stream`.
+    pub content_type: Option<String>,
 }
 
 impl Endpoint for StageBlob {
@@ -53,13 +243,22 @@ impl Endpoint for StageBlob {
     fn path(&self) -> String {
         fill_route(Self::ROUTE, &[&self.db])
     }
+
+    fn headers(&self) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(ct) = self.content_type.as_deref().and_then(|c| HeaderValue::from_str(c).ok()) {
+            h.insert(CONTENT_TYPE, ct);
+        }
+        h
+    }
 }
 
-/// `GET /v1/dbs/{db}/blobs/{blob_id}`: downloads a blob.
+/// `GET /v1/dbs/{db}/blobs/{blob_id}`: downloads a blob, or a range of it.
 #[derive(Clone, Debug)]
 pub struct ReadBlob {
     pub db: String,
     pub blob_id: String,
+    pub range: Option<ByteRange>,
 }
 
 impl Endpoint for ReadBlob {
@@ -67,7 +266,7 @@ impl Endpoint for ReadBlob {
     const ROUTE: &'static str = "/v1/dbs/{db}/blobs/{blob_id}";
     const STATUS: StatusCode = StatusCode::OK;
     type Body = NoBody;
-    type Response = Octets;
+    type Response = Content;
 
     fn is_idempotent(_: &Self::Body) -> bool {
         true
@@ -75,6 +274,14 @@ impl Endpoint for ReadBlob {
 
     fn path(&self) -> String {
         fill_route(Self::ROUTE, &[&self.db, &self.blob_id])
+    }
+
+    fn headers(&self) -> HeaderMap {
+        range_header(self.range)
+    }
+
+    fn response(head: &http::response::Parts, body: Bytes) -> Result<Content, String> {
+        Ok(Content::new(&head.headers, body))
     }
 }
 
@@ -87,7 +294,7 @@ pub struct BlobMeta {
     pub content_type: String,
 }
 
-json_body!(BlobMeta);
+json_body!(BlobMeta, Written);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangesQuery {

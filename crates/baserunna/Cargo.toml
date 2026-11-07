@@ -33,6 +33,7 @@ object_store = { version = "0.14", default-features = false, features = ["aws"],
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"], optional = true }
 
 [dev-dependencies]
+baserunna-client = { workspace = true, features = ["reqwest"] }
 libc = "0.2"
 
 [[bench]]

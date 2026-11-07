@@ -257,38 +257,6 @@ pub struct Committed {
     pub inserted: Option<u64>,
 }
 
-/// Database storage statistics at a single version.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct DbStats {
-    pub version: Seq,
-    /// Non-empty segment levels, shallowest first.
-    pub levels: Vec<LevelStats>,
-    pub tail_entries: usize,
-    pub tail_bytes: usize,
-    pub range_tombstones: usize,
-    /// Referenced blob bytes.
-    pub blob_bytes: u64,
-    /// Segments and blobs no longer referenced, awaiting collection.
-    pub pending_gc_objects: usize,
-    pub lease_holder: Option<String>,
-    #[serde(rename = "lease_expires_at")]
-    pub lease_expires_ms: Option<u64>,
-    /// Store time of the last commit or maintenance write.
-    #[serde(rename = "updated_at")]
-    pub updated_ms: u64,
-    /// Total stored bytes tracked against the database quota.
-    pub size_bytes: u64,
-    pub quota_bytes: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct LevelStats {
-    pub level: u8,
-    pub segments: usize,
-    pub bytes: u64,
-    pub entries: u64,
-}
-
 impl Db {
     pub(crate) fn new(id: String, shared: Arc<Shared>) -> Arc<Db> {
         let now = Instant::now();
@@ -479,9 +447,9 @@ impl Db {
     }
 
     /// Storage statistics at version `v`.
-    pub fn stats(&self, v: &Version) -> DbStats {
+    pub fn stats(&self, v: &Version) -> baserunna_api::DbStats {
         let m = &v.m;
-        let mut levels: Vec<LevelStats> = Vec::new();
+        let mut levels: Vec<baserunna_api::LevelStats> = Vec::new();
         for s in &m.segments {
             match levels.last_mut() {
                 Some(l) if l.level == s.level => {
@@ -489,10 +457,15 @@ impl Db {
                     l.bytes += s.size;
                     l.entries += s.entries;
                 }
-                _ => levels.push(LevelStats { level: s.level, segments: 1, bytes: s.size, entries: s.entries }),
+                _ => levels.push(baserunna_api::LevelStats {
+                    level: s.level,
+                    segments: 1,
+                    bytes: s.size,
+                    entries: s.entries,
+                }),
             }
         }
-        DbStats {
+        baserunna_api::DbStats {
             version: m.version,
             levels,
             tail_entries: m.tail.len(),
@@ -501,8 +474,8 @@ impl Db {
             blob_bytes: m.blob_bytes.total(),
             pending_gc_objects: m.obsolete.len(),
             lease_holder: m.lease.as_ref().map(|l| l.node.clone()),
-            lease_expires_ms: m.lease.as_ref().map(|l| l.expires_ms),
-            updated_ms: m.time_ms,
+            lease_expires_at: m.lease.as_ref().map(|l| l.expires_ms),
+            updated_at: m.time_ms,
             size_bytes: m.stored_bytes(),
             quota_bytes: self.quota(),
         }

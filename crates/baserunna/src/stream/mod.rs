@@ -15,7 +15,7 @@ use baserunna_api::{self as api, b64};
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value as Json, json};
+use serde_json::Value as Json;
 use std::collections::BTreeMap;
 
 pub use filter::Filter;
@@ -365,21 +365,15 @@ pub fn public_state(st: &StreamState) -> api::StreamState {
     }
 }
 
-pub fn state_json(st: &StreamState) -> Map<String, Json> {
-    match serde_json::to_value(public_state(st)) {
-        Ok(Json::Object(m)) => m,
-        _ => unreachable!("stream states serialize to objects"),
-    }
-}
-
 /// A stream as listings and info describe it.
-pub fn stream_json(name: &str, c: &Catalog, st: &StreamState) -> Json {
-    let mut m = state_json(st);
-    m.insert("name".into(), json!(name));
-    m.insert("created_at".into(), json!(c.created_at));
-    m.insert("retention_ms".into(), json!(c.retention_ms));
-    m.insert("max_bytes".into(), json!(c.max_bytes));
-    Json::Object(m)
+pub fn public_stream(name: &str, c: &Catalog, st: &StreamState) -> api::Stream {
+    api::Stream {
+        name: name.into(),
+        created_at: c.created_at,
+        retention_ms: c.retention_ms,
+        max_bytes: c.max_bytes,
+        state: public_state(st),
+    }
 }
 
 /// A page of streams whose names start with `prefix`, after `cursor`.

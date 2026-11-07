@@ -143,23 +143,13 @@ impl Client {
     /// have been applied. If the server returns `precondition_failed` or `aborted`, that error is
     /// returned directly because the server fences earlier attempts for the idempotency key first.
     pub async fn send<E: Endpoint>(&self, endpoint: &E, body: &E::Body) -> Result<E::Response, Error> {
-        let r = self.send_allowing(endpoint, body, None).await?;
+        let r = self.attempts(endpoint, body, None).await.map_err(|f| f.error)?;
         Ok(r.expect("an allowed error is not configured"))
     }
 
     /// Sends a request like [`Client::send`], but returns `Ok(None)` if the server responds with
-    /// `allowed_error`. If `allowed_error` is set, the request is treated as idempotent.
-    async fn send_allowing<E: Endpoint>(
-        &self,
-        endpoint: &E,
-        body: &E::Body,
-        allowed_error: Option<api::ErrorCode>,
-    ) -> Result<Option<E::Response>, Error> {
-        self.attempts(endpoint, body, allowed_error).await.map_err(|f| f.error)
-    }
-
-    /// Sends a request like [`Client::send_allowing`], and also returns the final attempt's error
-    /// when an earlier attempt's error is reported instead.
+    /// `allowed_error`, in which case the request is treated as idempotent. If an earlier
+    /// attempt's error is reported, the final attempt's error is returned too.
     async fn attempts<E: Endpoint>(
         &self,
         endpoint: &E,
@@ -254,7 +244,8 @@ impl Client {
     /// Unlike [`Client::create_db`], this method retries failures with [`api::Outcome::Unknown`].
     pub async fn ensure_db(&self, name: &str, org: Option<&str>) -> Result<(), Error> {
         let b = api::NewDb { name: name.into(), org: org.map(Into::into) };
-        self.send_allowing(&api::CreateDb, &b, Some(api::ErrorCode::AlreadyExists)).await.map(drop)
+        let r = self.attempts(&api::CreateDb, &b, Some(api::ErrorCode::AlreadyExists)).await;
+        r.map(drop).map_err(|f| f.error)
     }
 
     pub async fn create_org(&self, name: &str) -> Result<api::Org, Error> {

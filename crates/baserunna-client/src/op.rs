@@ -236,29 +236,6 @@ impl Op {
         })
     }
 
-    pub fn is_write(&self) -> bool {
-        match self {
-            Op::Get { .. }
-            | Op::Scan { .. }
-            | Op::Check { .. }
-            | Op::GetRow { .. }
-            | Op::QueryRows { .. }
-            | Op::ReadStream(_) => false,
-            Op::Put { .. }
-            | Op::PutBlob { .. }
-            | Op::Delete { .. }
-            | Op::DeleteRange { .. }
-            | Op::Copy { .. }
-            | Op::Increment { .. }
-            | Op::InsertRow { .. }
-            | Op::UpsertRow { .. }
-            | Op::UpdateRow { .. }
-            | Op::DeleteRow { .. }
-            | Op::DeleteRows { .. }
-            | Op::Append { .. } => true,
-        }
-    }
-
     /// Returns the operation that reads the page after `result`, or `None` if `result` is the
     /// last page or this operation is not paginated.
     pub fn next_page(&self, result: &OpResult) -> Option<Op> {

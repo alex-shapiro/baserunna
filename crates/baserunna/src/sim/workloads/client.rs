@@ -29,16 +29,14 @@ const TRANSFER_COUNT: &str = "transfer_count";
 /// ID of the record that creates the transfer log.
 const OPENING: &str = "opening";
 
-/// Workload size.
-pub struct Size {
-    pub counters: usize,
-    pub mutators: usize,
-    pub ledgers: usize,
-    pub steps: usize,
-}
-
-pub async fn run(sim: Arc<Sim>, size: Size, chaos: bool) -> Result<(), String> {
-    let Size { counters, mutators, ledgers, steps } = size;
+pub async fn run(
+    sim: Arc<Sim>,
+    counters: usize,
+    mutators: usize,
+    ledgers: usize,
+    steps: usize,
+    chaos: bool,
+) -> Result<(), String> {
     let client = signed_up(&sim, "client-admin", "client@client.test").await?;
     let db = client.db(DB);
     retry(&sim, || db.ensure()).await?;
@@ -67,7 +65,7 @@ pub async fn run(sim: Arc<Sim>, size: Size, chaos: bool) -> Result<(), String> {
     let replica = watcher.await.map_err(|e| e.to_string())??;
     let db = client.db(DB);
     let replica = catch_up(&sim, &db, replica).await?;
-    let state = scan_all(&sim, &db).await?;
+    let state = rescan(&sim, &db).await?.keys;
     expect(replica.keys == state, format!("change feed replica {:?} differs from scan {state:?}", replica.keys))?;
     accounts(&sim, &client).await
 }
@@ -243,10 +241,8 @@ async fn transfer(sim: Arc<Sim>, db: Db, i: usize, steps: usize, tally: Arc<Tall
         let r = loop {
             let mut txn = db.begin();
             let r = move_funds(&mut txn, &t).await;
-            match retry.finish(txn, r).await {
-                Ok(None) => {}
-                Ok(Some(())) => break Ok(()),
-                Err(e) => break Err(e),
+            if let Some(r) = retry.finish(txn, r).await.transpose() {
+                break r;
             }
         };
         match r {
@@ -270,8 +266,7 @@ async fn move_funds(txn: &mut Txn, t: &Transfer) -> Result<(), LedgerError> {
     if from.balance < t.amount {
         return Err(LedgerError::Overdrawn);
     }
-    let to = txn.run(&[Op::get_row::<Account>(&t.to)]).await?.swap_remove(0).row::<Account>()?;
-    let to = to.ok_or_else(|| missing(&t.to))?;
+    let to = txn.run_one(Op::get_row::<Account>(&t.to)).await?.row::<Account>()?.ok_or_else(|| missing(&t.to))?;
     let moved = |a: Account, by: i64| Account { balance: a.balance + by, ..a };
     match t.from == t.to {
         true => txn.write([Op::upsert(&from)]),
@@ -345,19 +340,8 @@ fn counter(e: Option<&Entry>) -> Result<u64, Error> {
 }
 
 async fn read_counter(sim: &Arc<Sim>, db: &Db, key: &Bytes) -> Result<(u64, Option<u64>), String> {
-    let get = [Op::Get { key: key.clone() }];
-    let out = retry(sim, || db.txn(&get, None)).await?;
-    match out.results.as_deref() {
-        Some([OpResult::Get(None)]) => Ok((0, None)),
-        Some([OpResult::Get(Some(e))]) => match &e.value {
-            Value::Inline(b) => {
-                let n = std::str::from_utf8(b).ok().and_then(|s| s.parse().ok()).ok_or("counter is not a number")?;
-                Ok((n, Some(e.version.ok_or("counter has no committed version")?)))
-            }
-            v => Err(format!("counter holds {v:?}")),
-        },
-        r => Err(format!("unexpected get result {r:?}")),
-    }
+    let e = retry(sim, || db.read_one(Op::Get { key: key.clone() })).await?.entry().map_err(|e| e.to_string())?;
+    Ok((counter(e.as_ref()).map_err(|e| e.to_string())?, e.and_then(|e| e.version)))
 }
 
 fn mutator_key(i: usize, k: u64) -> Bytes {
@@ -418,10 +402,7 @@ impl Replica {
 }
 
 fn data(v: &Value) -> Result<Bytes, String> {
-    match v {
-        Value::Inline(b) | Value::Blob { data: Some(b), .. } => Ok(b.clone()),
-        Value::Blob { meta, data: None } => Err(format!("blob {} is missing inline data", meta.blob_id)),
-    }
+    v.data().cloned().ok_or_else(|| format!("{v:?} is missing inline data"))
 }
 
 async fn watch(sim: Arc<Sim>, db: Db, steps: usize) -> Result<Replica, String> {
@@ -485,10 +466,6 @@ async fn rescan(sim: &Arc<Sim>, db: &Db) -> Result<Replica, String> {
         .map(|e| Ok((e.key.clone(), (e.version.ok_or("scan entry has no committed version")?, data(&e.value)?))))
         .collect::<Result<_, String>>()?;
     Ok(Replica { keys, cursor: out.version.to_string() })
-}
-
-async fn scan_all(sim: &Arc<Sim>, db: &Db) -> Result<BTreeMap<Bytes, (u64, Bytes)>, String> {
-    Ok(rescan(sim, db).await?.keys)
 }
 
 async fn accounts(sim: &Arc<Sim>, owner: &Client) -> Result<(), String> {

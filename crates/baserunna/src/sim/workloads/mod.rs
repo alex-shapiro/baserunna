@@ -505,13 +505,10 @@ pub fn scenarios() -> Vec<Scenario> {
             config: |k| world(k, faulty((1, 4))),
             run: |s| {
                 let k = &s.knobs;
-                let size = client::Size {
-                    counters: k.range("client.counters", 1, 3) as usize,
-                    mutators: k.range("client.mutators", 1, 3) as usize,
-                    ledgers: k.range("client.ledgers", 1, 3) as usize,
-                    steps: k.range("client.steps", 20, 60) as usize,
-                };
-                Box::pin(client::run(s.clone(), size, true))
+                let n = |name, lo, hi| k.range(name, lo, hi) as usize;
+                let (counters, mutators) = (n("client.counters", 1, 3), n("client.mutators", 1, 3));
+                let (ledgers, steps) = (n("client.ledgers", 1, 3), n("client.steps", 20, 60));
+                Box::pin(client::run(s.clone(), counters, mutators, ledgers, steps, true))
             },
         },
     ]

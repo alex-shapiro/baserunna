@@ -51,6 +51,8 @@ pub enum KeyRange {
         start: Bytes,
         end: Bytes,
     },
+    /// Keys at or after the key.
+    AtOrAfter(Bytes),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +123,7 @@ fn prefix_start_end(r: &KeyRange) -> (Option<String>, Option<String>, Option<Str
     match r {
         KeyRange::Prefix(p) => (Some(b64::encode(p)), None, None),
         KeyRange::Span { start, end } => (None, Some(b64::encode(start)), Some(b64::encode(end))),
+        KeyRange::AtOrAfter(start) => (None, Some(b64::encode(start)), None),
     }
 }
 

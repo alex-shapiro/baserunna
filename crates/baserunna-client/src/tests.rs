@@ -503,3 +503,19 @@ async fn scans_send_their_cursor() {
         serde_json::json!({"op": "scan", "start": "YQ==", "end": "Yg==", "limit": 5, "reverse": true, "cursor": "YWE"});
     assert_eq!(body["ops"][0], want);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_range_at_or_after_a_key_sends_only_its_start() {
+    let ok = r#"{"version":4,"committed":false,"results":[{"items":[],"next_cursor":null}]}"#;
+    let (c, s) = script(vec![resp(200, &[], ok)]);
+    let req = ScanRequest {
+        range: KeyRange::AtOrAfter("a".into()),
+        limit: 5,
+        reverse: false,
+        keys_only: false,
+        cursor: None,
+    };
+    c.db("d").scan(&req).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(s.requests.lock().unwrap()[0].body()).unwrap();
+    assert_eq!(body["ops"][0], serde_json::json!({"op": "scan", "start": "YQ==", "limit": 5}));
+}

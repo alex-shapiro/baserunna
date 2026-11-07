@@ -246,3 +246,14 @@ fn with_query_omits_an_empty_query() {
     assert_eq!(with_query("/x".into(), &Q { a: None }), "/x");
     assert_eq!(with_query("/x".into(), &Q { a: Some("b c&") }), "/x?a=b+c%26");
 }
+
+#[test]
+fn counters_decode_what_increments_write() {
+    for n in [0, -7, 41, i64::MAX, i64::MIN] {
+        assert_eq!(crate::decode_counter(&crate::encode_counter(n)), Some(n));
+    }
+    assert_eq!(crate::decode_counter(b" 41 "), Some(41));
+    for bad in [&b""[..], b"x", b"1.5", b"9223372036854775808", b"\xff"] {
+        assert_eq!(crate::decode_counter(bad), None, "{bad:?}");
+    }
+}

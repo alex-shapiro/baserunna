@@ -71,6 +71,17 @@ pub const fn txn_write_cost(w: KvWrite) -> usize {
     }
 }
 
+/// The stored value of a counter with value `n`, as an increment writes it: decimal text.
+pub fn encode_counter(n: i64) -> bytes::Bytes {
+    bytes::Bytes::from(n.to_string())
+}
+
+/// The value of a counter, as an increment reads it: decimal `i64` text, with optional spaces
+/// around it. Returns `None` for any other value, which an increment refuses.
+pub fn decode_counter(value: &[u8]) -> Option<i64> {
+    std::str::from_utf8(value).ok()?.trim().parse().ok()
+}
+
 /// Returns true if `id` is 32 lowercase ASCII hex characters, the form of blob ids and other
 /// object ids.
 pub fn valid_object_id(id: &str) -> bool {

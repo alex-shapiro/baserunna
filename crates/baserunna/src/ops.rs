@@ -557,15 +557,13 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
                 None => (0i64, None),
                 Some(rv) => {
                     let b = value_bytes(ctx.db, &rv.value).await?;
-                    let n = std::str::from_utf8(&b)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<i64>().ok())
+                    let n = api::decode_counter(&b)
                         .ok_or_else(|| Error::invalid(format!("value of {key} is not a decimal integer")))?;
                     (n, rv.ttl)
                 }
             };
             let n = cur.checked_add(*by).ok_or_else(|| Error::invalid("increment overflows i64"))?;
-            txn.put_expiring(k, Value::Inline(Bytes::from(n.to_string())), set.or(kept))?;
+            txn.put_expiring(k, Value::Inline(api::encode_counter(n)), set.or(kept))?;
             Ok(OpResult::Increment(api::IncrementResult { value: n }))
         }
         Op::GetRow { table, pk } => {

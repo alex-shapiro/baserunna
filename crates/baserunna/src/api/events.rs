@@ -169,7 +169,11 @@ const BODY_SHAPE: &str = "the body is {\"rows\": [...]}, an array of events, or 
 
 /// Streams events from a JSON or NDJSON insert body into `f` without buffering
 /// the parsed array, and returns the body's `idempotency_key` if present.
-fn each_event(content_type: &str, data: &[u8], f: &mut dyn FnMut(Json) -> Result<()>) -> Result<Option<String>> {
+fn each_event(
+    content_type: &str,
+    data: &[u8],
+    f: &mut dyn FnMut(Json) -> Result<()>,
+) -> Result<Option<baserunna_api::IdempotencyKey>> {
     crate::util::json::reject_inexact_integers(data).map_err(Error::invalid)?;
     match content_type {
         "" | "application/json" => {
@@ -179,7 +183,7 @@ fn each_event(content_type: &str, data: &[u8], f: &mut dyn FnMut(Json) -> Result
                 .and_then(|key| de.end().map(|()| key));
             match (failed, parsed) {
                 (Some(e), _) => Err(e),
-                (None, Ok(key)) => Ok(key),
+                (None, Ok(key)) => key.map(|k| k.parse().map_err(Error::invalid)).transpose(),
                 (None, Err(e)) => Err(Error::invalid(format!("invalid JSON body: {e}"))),
             }
         }
@@ -298,8 +302,8 @@ async fn insert(
     // Extract the idempotency key first so a replay returns before validating rows.
     let body_key = each_event(&ct, &data, &mut |_| Ok(()))?;
     let key = one_idempotency_key(header_key, body_key)?;
-    let commit_id = super::commit_id_for(&node, &ctx, key.as_deref())?;
-    if let Some(c) = super::earlier_attempt(&ctx, commit_id, key.as_deref()).await? {
+    let commit_id = super::commit_id_for(&node, &ctx, key.as_ref())?;
+    if let Some(c) = super::earlier_attempt(&ctx, commit_id, key.as_ref()).await? {
         return inserted(&c, commit_id);
     }
     let (schema, _) = with_read!(ctx.db, Consistency::Strong, |t| events::get_schema(t, &name).await);

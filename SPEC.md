@@ -843,7 +843,8 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
 
 1. **One-shot** (`POST /v1/dbs/{db}/txn`): a list of ops executed atomically
    in one request. Supports `check` precondition ops and an optional
-   `idempotency_key`. Retrying with the same key never applies twice within
+   `idempotency_key` (1 to 200 visible ASCII characters without spaces, in
+   the body or the `Idempotency-Key` header). Retrying with the same key never applies twice within
    `commit_retention_ms` (10 minutes) of the first attempt, nor when two
    attempts reach the committer together. A retry that finds the earlier
    attempt applied returns `replayed: true` with `results: null`, and the

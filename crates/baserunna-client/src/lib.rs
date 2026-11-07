@@ -8,7 +8,8 @@
 //! let client = Client::new(HttpTransport::new("https://example.com")).with_token("TOKEN");
 //! let db = client.db("notes");
 //! let put = [Op::Put { key: "a".into(), value: "1".into() }];
-//! let out = db.txn(&put, Some("key-1"), baserunna_client::api::SizeLimit::Quota).await?;
+//! let key = "key-1".parse().expect("a valid key");
+//! let out = db.txn(&put, Some(&key), baserunna_client::api::SizeLimit::Quota).await?;
 //! println!("committed at version {}", out.version);
 //! # Ok(())
 //! # }
@@ -21,7 +22,7 @@ mod kv;
 mod transport;
 
 pub use baserunna_api as api;
-pub use error::Error;
+pub use error::{Error, ErrorExtra};
 pub use kv::{
     Change, ChangePage, ChangesRequest, CommittedEntry, CommittedPage, Expect, KeyRange, Op, OpResult, ScanRequest,
     TxnOutcome, TxnResults, Value,
@@ -101,28 +102,36 @@ impl Client {
     /// If the final attempt fails with [`api::Outcome::NotApplied`] after an earlier attempt failed
     /// with [`api::Outcome::Unknown`], the earlier error is returned because that attempt might
     /// have been applied, unless the server's error fences earlier attempts for the idempotency key
-    /// ([`api::ErrorCode::fences_earlier_attempts`]).
+    /// ([`api::Code::fences_earlier_attempts`]).
     pub async fn send<E: Endpoint>(&self, endpoint: &E, body: &E::Body) -> Result<E::Response, Error> {
-        let r = self.send_allowing(endpoint, body, None).await?;
+        self.call(Request::new(endpoint, body)).await
+    }
+
+    /// Sends `req` to an API built on [`Endpoint`] whose errors have the code `C` and the details
+    /// `X`, and retries as [`Client::send`] does. Baserunna's own requests go through
+    /// [`Client::send`]; another API's client calls this.
+    pub async fn call<C: api::Code, X: ErrorExtra, E: Endpoint>(
+        &self,
+        req: Request<'_, E>,
+    ) -> Result<E::Response, Error<C, X>> {
+        let r = self.call_allowing(req, None).await?;
         Ok(r.expect("an allowed error is not configured"))
     }
 
-    /// Sends a request like [`Client::send`], but returns `Ok(None)` if the server responds with
+    /// Sends a request like [`Client::call`], but returns `Ok(None)` if the server responds with
     /// `allowed_error`. If `allowed_error` is set, the request is treated as idempotent.
-    async fn send_allowing<E: Endpoint>(
+    async fn call_allowing<C: api::Code, X: ErrorExtra, E: Endpoint>(
         &self,
-        endpoint: &E,
-        body: &E::Body,
-        allowed_error: Option<api::ErrorCode>,
-    ) -> Result<Option<E::Response>, Error> {
-        let idempotent = E::is_idempotent(body) || allowed_error.is_some();
-        let path = endpoint.path();
-        let body = body.encode();
+        req: Request<'_, E>,
+        allowed_error: Option<C>,
+    ) -> Result<Option<E::Response>, Error<C, X>> {
+        let idempotent = req.idempotent || allowed_error.is_some();
+        let body = req.body.encode();
         let mut backoff = self.retry_policy.initial_backoff_ms;
         let mut attempt = 1;
         let mut unresolved = None;
         loop {
-            let err = match self.attempt::<E>(&path, &body).await {
+            let err = match self.attempt::<C, X, E>(&req.uri, &body, req.idempotency_key).await {
                 Ok(r) => return Ok(Some(r)),
                 Err(e) if allowed_error.is_some() && e.code() == allowed_error => return Ok(None),
                 Err(e) => e,
@@ -132,7 +141,7 @@ impl Client {
                 unresolved = Some(err.clone());
             }
             if !transient || attempt >= self.retry_policy.attempts {
-                let resolved = err.code().is_some_and(api::ErrorCode::fences_earlier_attempts);
+                let resolved = err.code().is_some_and(api::Code::fences_earlier_attempts);
                 return Err(match (err.outcome(), unresolved) {
                     (api::Outcome::NotApplied, Some(earlier)) if !resolved => earlier,
                     _ => err,
@@ -145,16 +154,24 @@ impl Client {
         }
     }
 
-    async fn attempt<E: Endpoint>(&self, path: &str, body: &Bytes) -> Result<E::Response, Error> {
-        let mut req = http::Request::builder().method(E::METHOD).uri(path);
+    async fn attempt<C: api::Code, X: ErrorExtra, E: Endpoint>(
+        &self,
+        uri: &str,
+        body: &Bytes,
+        key: Option<&api::IdempotencyKey>,
+    ) -> Result<E::Response, Error<C, X>> {
+        let mut req = http::Request::builder().method(E::METHOD).uri(uri);
         if let Some(t) = &self.token {
             req = req.header(http::header::AUTHORIZATION, format!("Bearer {t}"));
         }
         if let Some(ct) = <E::Body as Body>::CONTENT_TYPE {
             req = req.header(http::header::CONTENT_TYPE, ct);
         }
+        if let Some(k) = key {
+            req = req.header(api::IDEMPOTENCY_KEY, k.as_str());
+        }
         let req = req.body(body.clone()).map_err(|e| TransportError::NotSent(e.to_string()))?;
-        decode(path, self.transport.send(req).await?)
+        decode(uri, self.transport.send(req).await?)
     }
 
     pub async fn limits(&self) -> Result<api::Limits, Error> {
@@ -185,7 +202,7 @@ impl Client {
     /// Unlike [`Client::create_db`], this method retries failures with [`api::Outcome::Unknown`].
     pub async fn ensure_db(&self, name: &str, org: Option<&str>) -> Result<(), Error> {
         let b = api::NewDb { name: name.into(), org: org.map(Into::into) };
-        self.send_allowing(&api::CreateDb, &b, Some(api::ErrorCode::AlreadyExists)).await.map(drop)
+        self.call_allowing(Request::new(&api::CreateDb, &b), Some(api::ErrorCode::AlreadyExists)).await.map(drop)
     }
 
     pub async fn create_org(&self, name: &str) -> Result<api::Org, Error> {
@@ -208,19 +225,44 @@ impl Client {
     }
 }
 
+/// A request to endpoint `E`: its path and query, body, idempotency key, and whether a repeat
+/// has no further effect.
+pub struct Request<'a, E: Endpoint> {
+    /// The path and query string.
+    pub uri: String,
+    pub body: &'a E::Body,
+    /// The [`api::IDEMPOTENCY_KEY`] header.
+    pub idempotency_key: Option<&'a api::IdempotencyKey>,
+    /// Whether a repeat of the request has no further effect, so that a retry may send a request
+    /// that may have been applied.
+    pub idempotent: bool,
+}
+
+impl<'a, E: Endpoint> Request<'a, E> {
+    /// The request with `body` to the path of `endpoint`, without a key, idempotent as
+    /// [`Endpoint::is_idempotent`] says.
+    pub fn new(endpoint: &E, body: &'a E::Body) -> Request<'a, E> {
+        Request { uri: endpoint.path(), body, idempotency_key: None, idempotent: E::is_idempotent(body) }
+    }
+}
+
 /// The request body that [`Db::txn`] sends for `ops`. A server rejects a body larger than
 /// [`api::Limits::json_body_max`].
-pub fn txn_request(ops: &[Op], idempotency_key: Option<&str>, size_limit: api::SizeLimit) -> api::TxnRequest {
+pub fn txn_request(
+    ops: &[Op],
+    idempotency_key: Option<&api::IdempotencyKey>,
+    size_limit: api::SizeLimit,
+) -> api::TxnRequest {
     api::TxnRequest {
         ops: ops.iter().map(Op::to_api).collect(),
         encoding: api::Encoding::Base64,
-        idempotency_key: idempotency_key.map(Into::into),
+        idempotency_key: idempotency_key.cloned(),
         size_limit,
         ..api::TxnRequest::default()
     }
 }
 
-fn decode<T: Body>(path: &str, resp: http::Response<Bytes>) -> Result<T, Error> {
+fn decode<T: Body, C: api::Code, X: ErrorExtra>(path: &str, resp: http::Response<Bytes>) -> Result<T, Error<C, X>> {
     let (parts, body) = resp.into_parts();
     let status = parts.status.as_u16();
     let declared = parts.headers.get(http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<usize>().ok());
@@ -240,7 +282,7 @@ fn decode<T: Body>(path: &str, resp: http::Response<Bytes>) -> Result<T, Error> 
             false => foreign(),
         });
     }
-    match ErrorBody::decode(body) {
+    match ErrorBody::<C, X>::decode(body) {
         Ok(ErrorBody { error }) => {
             let retry_after_ms = error.details.as_ref().and_then(|d| d.retry_after_ms).or(retry_after_ms);
             Err(Error::Api { status, error, retry_after_ms })
@@ -278,7 +320,7 @@ impl Db {
     pub async fn txn(
         &self,
         ops: &[Op],
-        idempotency_key: Option<&str>,
+        idempotency_key: Option<&api::IdempotencyKey>,
         size_limit: api::SizeLimit,
     ) -> Result<TxnOutcome, Error> {
         let e = api::Txn { db: self.name.clone() };

@@ -5003,7 +5003,7 @@
             }
           },
           {
-            "description": "Retries with the same key are applied once (within 10 minutes)",
+            "description": "1 to 200 visible ASCII characters, without spaces. Retries with the same key are applied once (within 10 minutes)",
             "in": "header",
             "name": "Idempotency-Key",
             "required": false,
@@ -6494,7 +6494,7 @@
             }
           },
           {
-            "description": "Retries with the same key are applied once (within 10 minutes)",
+            "description": "1 to 200 visible ASCII characters, without spaces. Retries with the same key are applied once (within 10 minutes)",
             "in": "header",
             "name": "Idempotency-Key",
             "required": false,

@@ -458,18 +458,21 @@ pub(super) fn content_type(h: &HeaderMap) -> String {
     ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
 }
 
-pub(super) fn idempotency_header(h: &HeaderMap) -> Result<Option<String>> {
-    match h.get("idempotency-key") {
+pub(super) fn idempotency_header(h: &HeaderMap) -> Result<Option<api::IdempotencyKey>> {
+    match h.get(api::IDEMPOTENCY_KEY) {
         None => Ok(None),
         Some(v) => match v.to_str() {
-            Ok(k) => Ok(Some(k.to_string())),
+            Ok(k) => k.parse().map(Some).map_err(Error::invalid),
             Err(_) => Err(Error::invalid("Idempotency-Key must be visible ASCII")),
         },
     }
 }
 
 /// Returns the idempotency key from the header or body, or an error if both are present and differ.
-pub(super) fn one_idempotency_key(header: Option<String>, body: Option<String>) -> Result<Option<String>> {
+pub(super) fn one_idempotency_key(
+    header: Option<api::IdempotencyKey>,
+    body: Option<api::IdempotencyKey>,
+) -> Result<Option<api::IdempotencyKey>> {
     match (header, body) {
         (Some(h), Some(b)) if h != b => {
             Err(Error::invalid("the Idempotency-Key header and the body's idempotency_key differ"))
@@ -498,7 +501,7 @@ async fn one_shot(
     }
     let octx = op_ctx(&node, &ctx, req.encoding);
     // Ignore idempotency keys on read-only requests so a failed check cannot abort a write key without write permission.
-    let key = req.idempotency_key.as_deref().filter(|_| writes);
+    let key = req.idempotency_key.as_ref().filter(|_| writes);
     let (commit_id, ran) =
         run_txn!(node, ctx, isolation(req.isolation), c, req.size_limit, key, |t| exec_ops(&octx, t, &ops).await);
     node.env.crash_point().await;

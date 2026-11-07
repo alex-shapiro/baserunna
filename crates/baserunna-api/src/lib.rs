@@ -9,6 +9,7 @@ mod account;
 pub mod b64;
 mod db;
 mod error;
+mod idempotency;
 mod kv;
 mod limits;
 
@@ -17,7 +18,8 @@ pub use account::{
     Role, Session, SignUp, User,
 };
 pub use db::{CreateDb, Db, NewDb};
-pub use error::{ApiError, ErrorBody, ErrorCode, ErrorDetails, Outcome};
+pub use error::{ApiError, Code, DbDetails, ErrorBody, ErrorCode, ErrorDetails, Outcome};
+pub use idempotency::{IDEMPOTENCY_KEY, IdempotencyKey, MAX_IDEMPOTENCY_KEY};
 pub use kv::{
     BlobMeta, Change, ChangePage, Changes, ChangesQuery, Consistency, DeletedRange, Encoding, GetResult,
     IncrementResult, Isolation, Op, OpResult, QueryEvents, ReadBlob, ReadStream, ScanItem, ScanResult, SizeLimit,
@@ -131,7 +133,21 @@ macro_rules! json_body {
 }
 pub(crate) use json_body;
 
-json_body!(Empty, ErrorBody);
+json_body!(Empty);
+
+impl<C: Serialize + serde::de::DeserializeOwned, X: Default + Serialize + serde::de::DeserializeOwned> Body
+    for ErrorBody<C, X>
+{
+    const CONTENT_TYPE: Option<&'static str> = Some("application/json");
+
+    fn encode(&self) -> Bytes {
+        serde_json::to_vec(self).expect("API types serialize to JSON").into()
+    }
+
+    fn decode(b: Bytes) -> Result<Self, String> {
+        serde_json::from_slice(&b).map_err(|e| e.to_string())
+    }
+}
 
 /// Replaces each `{name}` segment in `route` with the corresponding percent-encoded value from
 /// `params`.

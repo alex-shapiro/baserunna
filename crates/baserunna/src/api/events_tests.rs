@@ -824,6 +824,25 @@ mod requests {
         });
     }
 
+    /// A key with a space or longer than 200 bytes fails, in the header and in each body.
+    #[test]
+    fn idempotency_keys_have_one_grammar() {
+        run_paused(async {
+            let (w, t) = setup(1).await;
+            let long = "k".repeat(201);
+            let rows = "/v1/dbs/d/events/ev/rows";
+            for key in ["a b", long.as_str()] {
+                let (s, r) = send(&w, 0, &t, "POST", rows, &[("idempotency-key", key)], r#"[{"event": "a"}]"#).await;
+                assert_eq!(s, 400, "{key:?}: {r}");
+                let b = json!({"rows": [{"event": "a"}], "idempotency_key": key}).to_string();
+                assert_eq!(send(&w, 0, &t, "POST", rows, &[], &b).await.0, 400, "{key:?}");
+                let b = json!({"ops": [{"op": "put", "key": "x", "value": "y"}], "idempotency_key": key}).to_string();
+                assert_eq!(send(&w, 0, &t, "POST", "/v1/dbs/d/txn", &[], &b).await.0, 400, "{key:?}");
+            }
+            w.shutdown();
+        });
+    }
+
     #[test]
     fn header_and_body_idempotency_keys_must_agree() {
         run_paused(async {

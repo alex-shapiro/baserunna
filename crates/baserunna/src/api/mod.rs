@@ -63,12 +63,13 @@ impl IntoResponse for Error {
 /// Converts an [`Error`] to the `error` object of an HTTP error response.
 pub fn api_error(e: &Error) -> api::ApiError {
     let details = |d: api::ErrorDetails| Some(d);
+    let db = |api: api::DbDetails| details(api::ErrorDetails { api, ..api::ErrorDetails::default() });
     let details = match e {
         Error::PreconditionFailed { op_index: Some(i), .. } => {
-            details(api::ErrorDetails { op_index: Some(*i), ..api::ErrorDetails::default() })
+            db(api::DbDetails { op_index: Some(*i), ..api::DbDetails::default() })
         }
         Error::NotOwner { holder, .. } => {
-            details(api::ErrorDetails { lease_holder: Some(holder.clone()), ..api::ErrorDetails::default() })
+            db(api::DbDetails { lease_holder: Some(holder.clone()), ..api::DbDetails::default() })
         }
         Error::Unavailable { outcome_unknown, .. } => {
             let outcome = if *outcome_unknown { api::Outcome::Unknown } else { api::Outcome::NotApplied };
@@ -125,12 +126,12 @@ fn error_from_api(status: u16, e: api::ApiError) -> Error {
         C::Conflict => Error::Conflict(m),
         C::AlreadyExists => Error::AlreadyExists(m),
         C::Aborted => Error::Aborted(m),
-        C::PreconditionFailed => Error::PreconditionFailed { message: m, op_index: d.op_index },
+        C::PreconditionFailed => Error::PreconditionFailed { message: m, op_index: d.api.op_index },
         C::TooLarge => Error::TooLarge(m),
         C::CursorExpired => Error::CursorExpired(m),
         C::QuotaExceeded => Error::QuotaExceeded(m),
         C::RateLimited => Error::RateLimited { message: m, retry_after_ms: d.retry_after_ms.unwrap_or(1_000) },
-        C::Unavailable => match d.lease_holder {
+        C::Unavailable => match d.api.lease_holder {
             Some(holder) => Error::NotOwner { holder, retry_after_ms: 500 },
             None => Error::Unavailable {
                 message: m,
@@ -830,12 +831,13 @@ pub(crate) enum Ran<T> {
 
 /// Executes `$body` in a transaction, retrying on conflict until it is
 /// committed, and evaluates to `(commit_id, Ran)`. If an idempotency key
-/// (`$key`, an `Option<&str>`) is provided, the commit ID is derived from the
+/// (`$key`, an `Option<&IdempotencyKey>`) is provided, the commit ID is derived from the
 /// key and any previously committed result for that key is replayed without
 /// re-executing (SPEC §6.2).
 macro_rules! run_txn {
     ($node:expr, $ctx:expr, $isolation:expr, $consistency:expr, $size_limit:expr, $key:expr, |$t:ident| $body:expr) => {{
-        let (node_, ctx_, key_): (&crate::node::Node, &crate::api::DbCtx, Option<&str>) = (&$node, &$ctx, $key);
+        let (node_, ctx_, key_): (&crate::node::Node, &crate::api::DbCtx, Option<&baserunna_api::IdempotencyKey>) =
+            (&$node, &$ctx, $key);
         let commit_id_ = crate::api::commit_id_for(node_, ctx_, key_)?;
         let ran_ = match crate::api::earlier_attempt(ctx_, commit_id_, key_).await? {
             Some(c) => crate::api::Ran::Replayed(c),
@@ -859,7 +861,9 @@ macro_rules! run_txn {
                         t => match ctx_.db.revalidate(t).await? {
                             Some(version) => match out_ {
                                 Ok(out) => break crate::api::Ran::Read { out, version },
-                                Err(e) => break crate::api::failed(ctx_, commit_id_, key_, e).await?,
+                                Err(e) => {
+                                    break crate::api::failed(ctx_, commit_id_, key_.map(|k| k.as_str()), e).await?;
+                                }
                             },
                             None => {
                                 optimistic_ = false;
@@ -869,9 +873,11 @@ macro_rules! run_txn {
                     };
                     let out_ = match out_ {
                         Ok(o) => o,
-                        Err(e) => break crate::api::failed(ctx_, commit_id_, key_, e).await?,
+                        Err(e) => break crate::api::failed(ctx_, commit_id_, key_.map(|k| k.as_str()), e).await?,
                     };
-                    if let Some(ran) = crate::api::finish(node_, ctx_, txn_, out_, key_, &mut attempt_).await? {
+                    if let Some(ran) =
+                        crate::api::finish(node_, ctx_, txn_, out_, key_.map(|k| k.as_str()), &mut attempt_).await?
+                    {
                         break ran;
                     }
                 }
@@ -899,16 +905,19 @@ pub(crate) async fn begin_txn(
     Ok(t?.with_size_limit(size_limit))
 }
 
-pub(crate) fn commit_id_for(node: &Node, ctx: &DbCtx, key: Option<&str>) -> Result<u64> {
+pub(crate) fn commit_id_for(node: &Node, ctx: &DbCtx, key: Option<&api::IdempotencyKey>) -> Result<u64> {
     match key {
-        Some(k) if k.is_empty() || k.len() > 200 => Err(Error::invalid("idempotency keys are 1-200 characters")),
         Some(k) => Ok(data::commit_id_for_key(&ctx.rec.id, k)),
         None => Ok(node.env.random_u64()),
     }
 }
 
 /// Checks whether an idempotent request was already committed or aborted.
-pub(crate) async fn earlier_attempt(ctx: &DbCtx, commit_id: u64, key: Option<&str>) -> Result<Option<Committed>> {
+pub(crate) async fn earlier_attempt(
+    ctx: &DbCtx,
+    commit_id: u64,
+    key: Option<&api::IdempotencyKey>,
+) -> Result<Option<Committed>> {
     if key.is_none() {
         return Ok(None);
     }

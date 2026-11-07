@@ -167,7 +167,7 @@ pub struct TxnRequest {
     /// Deduplication key for write transactions. The server applies a transaction at most once per
     /// key and sets `replayed: true` on repeated requests. Ignored for read-only transactions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<String>,
+    pub idempotency_key: Option<crate::IdempotencyKey>,
     /// Consistency level for read-only transactions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consistency: Option<Consistency>,

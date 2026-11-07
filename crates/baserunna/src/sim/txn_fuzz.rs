@@ -2544,6 +2544,11 @@ impl<'a> Session<'a> {
             self.expect("POST", &path, bytes, &Expect::Any4xx).await?;
             return Ok(());
         };
+        // Every key has one grammar; a transaction without writes ignores a valid key.
+        if req.idempotency_key.as_deref().is_some_and(|k| k.parse::<baserunna_api::IdempotencyKey>().is_err()) {
+            self.expect("POST", &path, bytes, &Expect::Err(Fail::Invalid, None)).await?;
+            return Ok(());
+        }
         let writes = req.ops.iter().any(|o| o.is_write());
         let snapshot = match req.consistency.as_deref() {
             None | Some("strong") => false,
@@ -2557,13 +2562,8 @@ impl<'a> Session<'a> {
             self.expect("POST", &path, bytes, &Expect::Err(Fail::Invalid, None)).await?;
             return Ok(());
         }
-        // A transaction without writes ignores its idempotency key.
         let key = req.idempotency_key.as_deref().filter(|_| writes);
         if let Some(k) = key {
-            if k.is_empty() || k.len() > 200 {
-                self.expect("POST", &path, bytes, &Expect::Err(Fail::Invalid, None)).await?;
-                return Ok(());
-            }
             if let Some((v, appends)) = self.w.idem.get(k) {
                 let want = json!({"version": v, "committed": true, "replayed": true, "commit_id": ANY,
                     "results": null, "appends": appends});

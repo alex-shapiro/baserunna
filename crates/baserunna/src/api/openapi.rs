@@ -1426,7 +1426,10 @@ fn paths() -> Value {
                 query("expect_seq", i(), "Append only if the stream's next seq is this (else 412)"),
                 query("create", b(), "Create the stream if it does not exist"),
                 query("encoding", enum_of(&["utf8", "base64"]), "Encoding of JSON `value`s"),
-                header("Idempotency-Key", "Retries with the same key are applied once (within 10 minutes)"),
+                header(
+                    "Idempotency-Key",
+                    "1 to 200 visible ASCII characters, without spaces. Retries with the same key are applied once (within 10 minutes)",
+                ),
             ],
             desc: Some(
                 "Appends records atomically at the stream's next sequence numbers; concurrent appends do not conflict. \
@@ -1664,7 +1667,10 @@ fn paths() -> Value {
             params: vec![
                 db(),
                 evt(),
-                header("Idempotency-Key", "Retries with the same key are applied once (within 10 minutes)"),
+                header(
+                    "Idempotency-Key",
+                    "1 to 200 visible ASCII characters, without spaces. Retries with the same key are applied once (within 10 minutes)",
+                ),
             ],
             desc: Some(
                 "Buffers requests on the receiving node for up to 200 ms, writes staged parts, and binds \

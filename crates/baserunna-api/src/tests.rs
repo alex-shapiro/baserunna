@@ -110,12 +110,45 @@ fn ops_round_trip_through_json() {
         let req = TxnRequest {
             ops,
             encoding: if r.below(2) == 0 { Encoding::Base64 } else { Encoding::Utf8 },
-            idempotency_key: r.opt(),
+            idempotency_key: r.opt().map(|k| format!("k{}", k.len())).map(|k| k.parse().unwrap()),
             ..TxnRequest::default()
         };
         let back = TxnRequest::decode(req.encode()).unwrap();
         assert_eq!(back, req);
     }
+}
+
+#[test]
+fn idempotency_keys_are_visible_ascii_without_spaces() {
+    assert_eq!("order-7".parse::<IdempotencyKey>().map(String::from), Ok("order-7".to_string()));
+    let long = "k".repeat(MAX_IDEMPOTENCY_KEY + 1);
+    for bad in ["", "a b", "é", long.as_str()] {
+        assert!(bad.parse::<IdempotencyKey>().is_err(), "{bad:?}");
+    }
+    let req = json!({"ops": [], "idempotency_key": "a b"});
+    assert!(serde_json::from_value::<TxnRequest>(req).is_err());
+}
+
+#[test]
+fn errors_carry_the_details_of_their_api() {
+    #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+    struct Mine {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notes: Vec<String>,
+    }
+    let mut e: ApiError<ErrorCode, Mine> = ApiError::new(ErrorCode::Unavailable, "busy");
+    assert!(e.retryable);
+    assert_eq!(e.outcome(), Outcome::NotApplied);
+    e.details_mut().outcome = Some(Outcome::Unknown);
+    e.details_mut().api.notes.push("n".into());
+    let v = serde_json::to_value(&e).unwrap();
+    let want = json!({"code": "unavailable", "message": "busy", "retryable": true,
+        "details": {"outcome": "unknown", "notes": ["n"]}});
+    assert_eq!(v, want);
+    let back: ApiError<ErrorCode, Mine> = serde_json::from_value(v).unwrap();
+    assert_eq!((back.outcome(), back.details.unwrap().api.notes), (Outcome::Unknown, vec!["n".to_string()]));
+    let plain: ApiError = serde_json::from_value(json!({"code": "internal"})).unwrap();
+    assert_eq!(plain.outcome(), Outcome::Unknown);
 }
 
 #[test]

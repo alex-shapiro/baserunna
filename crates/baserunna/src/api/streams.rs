@@ -150,7 +150,7 @@ struct AppendBody {
     #[serde(default)]
     create: bool,
     #[serde(default)]
-    idempotency_key: Option<String>,
+    idempotency_key: Option<baserunna_api::IdempotencyKey>,
     #[serde(default)]
     encoding: Option<Encoding>,
 }
@@ -201,7 +201,7 @@ async fn append(
         Isolation::Serializable,
         Consistency::Strong,
         baserunna_api::SizeLimit::Quota,
-        key.as_deref(),
+        key.as_ref(),
         |t| {
             let to = AppendTo {
                 name: &name,

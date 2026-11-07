@@ -100,8 +100,8 @@ impl Client {
     ///
     /// If the final attempt fails with [`api::Outcome::NotApplied`] after an earlier attempt failed
     /// with [`api::Outcome::Unknown`], the earlier error is returned because that attempt might
-    /// have been applied. If the server returns `precondition_failed` or `aborted`, that error is
-    /// returned directly because the server fences earlier attempts for the idempotency key first.
+    /// have been applied, unless the server's error fences earlier attempts for the idempotency key
+    /// ([`api::ErrorCode::fences_earlier_attempts`]).
     pub async fn send<E: Endpoint>(&self, endpoint: &E, body: &E::Body) -> Result<E::Response, Error> {
         let r = self.send_allowing(endpoint, body, None).await?;
         Ok(r.expect("an allowed error is not configured"))
@@ -132,8 +132,7 @@ impl Client {
                 unresolved = Some(err.clone());
             }
             if !transient || attempt >= self.retry_policy.attempts {
-                // Only `PreconditionFailed` and `Aborted` fence earlier attempts for the idempotency key.
-                let resolved = matches!(err.code(), Some(api::ErrorCode::PreconditionFailed | api::ErrorCode::Aborted));
+                let resolved = err.code().is_some_and(api::ErrorCode::fences_earlier_attempts);
                 return Err(match (err.outcome(), unresolved) {
                     (api::Outcome::NotApplied, Some(earlier)) if !resolved => earlier,
                     _ => err,

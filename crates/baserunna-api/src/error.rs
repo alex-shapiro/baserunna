@@ -73,6 +73,15 @@ impl ErrorCode {
             ErrorCode::Unknown => "unknown",
         }
     }
+
+    /// Whether this refusal of a write with an idempotency key proves that no earlier attempt
+    /// with the key can still apply. Before it answers `precondition_failed` for a keyed write,
+    /// the server replays an earlier attempt that committed or aborts the key, and `aborted`
+    /// names an aborted key. Every other error leaves the outcome of an earlier attempt with an
+    /// unknown outcome unknown: that attempt may still commit.
+    pub const fn fences_earlier_attempts(self) -> bool {
+        matches!(self, ErrorCode::PreconditionFailed | ErrorCode::Aborted)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

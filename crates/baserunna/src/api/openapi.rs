@@ -423,6 +423,7 @@ fn schemas() -> Value {
             "idempotency_key": s(),
             "consistency": enum_of(&["strong", "snapshot"]),
             "max_staleness_ms": i(),
+            "size_limit": enum_of(&["quota", "reserve"]),
         }), &["ops"]),
         "TxnResult": obj_desc(json!({
             "version": i(), "committed": b(), "replayed": b(), "commit_id": s(),

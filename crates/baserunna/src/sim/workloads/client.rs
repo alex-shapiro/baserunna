@@ -8,7 +8,7 @@
 use super::super::Sim;
 use super::super::client::{Client as SimClient, ZOMBIE_WAIT_MS};
 use super::{chaos_phase, expect, settle};
-use baserunna_api::{ErrorCode, Outcome, Role};
+use baserunna_api::{ErrorCode, Outcome, Role, SizeLimit};
 use baserunna_client::{Change, ChangesRequest, Client, Db, Error, Expect, KeyRange, Op, OpResult, ScanRequest, Value};
 use bytes::Bytes;
 use std::collections::BTreeMap;
@@ -119,7 +119,7 @@ async fn count(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Stri
             Op::Check { key: key.clone(), expect: cond },
             Op::Put { key: key.clone(), value: (n + 1).to_string().into() },
         ];
-        match db.txn(&ops, Some(&format!("ctr{i}-{step}"))).await {
+        match db.txn(&ops, Some(&format!("ctr{i}-{step}")), SizeLimit::Quota).await {
             Ok(out) => (n, version) = (n + 1, Some(out.version)),
             Err(e) if e.outcome() == Outcome::NotApplied && e.code() != Some(ErrorCode::PreconditionFailed) => {}
             Err(e) if e.outcome() == Outcome::Unknown => {
@@ -175,7 +175,7 @@ async fn mutate(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Str
             }
             _ => Op::Put { key, value: Bytes::from(format!("{i}-{step}")) },
         };
-        match db.txn(std::slice::from_ref(&op), Some(&format!("m{i}-{step}"))).await {
+        match db.txn(std::slice::from_ref(&op), Some(&format!("m{i}-{step}")), SizeLimit::Quota).await {
             Ok(out) => {
                 expect(out.results.executed().is_none_or(|r| r == [OpResult::Done]), "write operations return Done")?
             }
@@ -313,10 +313,10 @@ async fn accounts(sim: &Arc<Sim>, owner: &Client) -> Result<(), String> {
     .await?;
     let put = [Op::Put { key: "k".into(), value: "v".into() }];
     let shared = member.db("clientorg.shared");
-    retry(sim, || shared.txn(&put, Some("member-put"))).await?;
+    retry(sim, || shared.txn(&put, Some("member-put"), SizeLimit::Quota)).await?;
     at_least_once(sim, ErrorCode::NotFound, || owner.remove_member("clientorg", &me.user.id)).await?;
     super::cache_expiry(sim).await;
-    let code = definitive(sim, || shared.txn(&put, Some("member-put-2"))).await?;
+    let code = definitive(sim, || shared.txn(&put, Some("member-put-2"), SizeLimit::Quota)).await?;
     expect(
         matches!(code, Some(ErrorCode::PermissionDenied | ErrorCode::NotFound)),
         format!("a removed member's write fails with {code:?}"),

@@ -15,6 +15,10 @@ pub const DEFAULT_TXN_MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
 /// Default of [`Limits::json_body_max`].
 pub const DEFAULT_JSON_BODY_MAX: usize = 32 * 1024 * 1024;
 
+/// The bytes past its size quota that a database may grow by in transactions with
+/// [`crate::SizeLimit::Reserve`].
+pub const QUOTA_RESERVE_BYTES: u64 = 16 << 20;
+
 /// Bytes that Baserunna adds before a user key to store it: the key-value keyspace prefix. The
 /// `key_len` of a [`KvWrite`] of a key-value operation is the user key's length plus this.
 pub const KV_KEY_PREFIX_LEN: usize = 1;

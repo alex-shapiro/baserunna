@@ -8,7 +8,7 @@ use super::stream::{self, StreamOp, StreamState};
 use super::types::{BlobRef, Seq, Value, is_commit_key};
 use super::version::{KeyRange, Snapshot, Version};
 use crate::error::{Error, Result};
-use baserunna_api::{KvWrite, txn_write_cost};
+use baserunna_api::{KvWrite, SizeLimit, txn_write_cost};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -121,6 +121,7 @@ pub struct CommitRequest {
     /// Reads validated under every isolation level; see [`Txn::get_pinned`].
     pub pinned_reads: Vec<Bytes>,
     pub writes: WriteSet,
+    pub size_limit: SizeLimit,
     pub charge: Charge,
 }
 
@@ -157,6 +158,8 @@ pub struct Txn {
     pinned_expiry: Option<u64>,
     pub writes: WriteSet,
     pub commit_id: u64,
+    /// How far the commit may grow the database past its size quota.
+    pub size_limit: SizeLimit,
     write_bytes: usize,
     max_write_bytes: usize,
     read_bytes: usize,
@@ -190,6 +193,7 @@ impl Txn {
             pinned_expiry: None,
             writes: WriteSet::default(),
             commit_id,
+            size_limit: SizeLimit::Quota,
             write_bytes: 0,
             max_write_bytes,
             read_bytes: 0,
@@ -567,6 +571,7 @@ impl Txn {
             reads: self.reads,
             pinned_reads: self.pinned_reads,
             writes: self.writes,
+            size_limit: self.size_limit,
             charge: self.charge,
         }
     }

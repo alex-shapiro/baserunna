@@ -128,6 +128,20 @@ pub enum Consistency {
     Snapshot,
 }
 
+/// How far a write transaction may grow its database.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SizeLimit {
+    /// Up to the database's size quota.
+    #[default]
+    Quota,
+    /// Up to [`crate::QUOTA_RESERVE_BYTES`] past the quota. This is for the few writes that
+    /// must commit while a database is full, such as the write that ends a job in progress.
+    /// Every writer of the database may use it, so the database can hold up to the reserve
+    /// more than its quota.
+    Reserve,
+}
+
 fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     *t == T::default()
 }
@@ -149,6 +163,9 @@ pub struct TxnRequest {
     pub consistency: Option<Consistency>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_staleness_ms: Option<u64>,
+    /// How far a write transaction may grow the database.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub size_limit: SizeLimit,
 }
 
 impl TxnRequest {

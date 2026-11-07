@@ -4,6 +4,7 @@ use super::tests::{delayed_engine, delayed_engine_with, known_objects, opened, p
 use super::*;
 use crate::error::Error;
 use crate::probe::{self, Probe};
+use baserunna_api::{QUOTA_RESERVE_BYTES, SizeLimit};
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -266,6 +267,54 @@ fn quotas_refuse_growth_but_allow_deletes() {
         let stats = db.stats(&db.current().unwrap());
         assert_eq!(stats.quota_bytes, Some(30_000));
         assert_eq!(stats.size_bytes, db.current().unwrap().m.stored_bytes());
+    });
+}
+
+/// Commits a put of `v` to `k` that may use the reserve past the quota.
+async fn try_put_in_reserve(db: &Arc<Db>, k: Bytes, v: Value) -> crate::error::Result<Seq> {
+    let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await?;
+    t.size_limit = SizeLimit::Reserve;
+    t.put(k, v)?;
+    db.commit(t.into_request()).await
+}
+
+#[test]
+fn a_write_in_the_reserve_commits_at_the_quota_until_the_reserve_is_full() {
+    rt().block_on(async {
+        let (eng, _store) = quota_engine(30_000);
+        let db = opened(&eng, "d").await;
+        let value = || Value::Inline(Bytes::from(vec![b'q'; 400]));
+        let mut written = 0;
+        while try_put(&db, key(written), value()).await.is_ok() {
+            written += 1;
+            assert!(written < 1000);
+        }
+        try_put_in_reserve(&db, key(written), value()).await.unwrap();
+        // Bytes that do not compress, because the quota counts compressed segments.
+        let mut x = 1u64;
+        let mut mib = || {
+            let data: Vec<u8> = (0..1 << 20)
+                .map(|_| {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (x >> 56) as u8
+                })
+                .collect();
+            Value::Inline(Bytes::from(data))
+        };
+        let mut in_reserve = 0;
+        let refused = loop {
+            match try_put_in_reserve(&db, key(written + 1 + in_reserve), mib()).await {
+                Ok(_) => in_reserve += 1,
+                Err(e) => break e,
+            }
+            assert!(in_reserve < 100);
+        };
+        assert!(matches!(refused, Error::QuotaExceeded(_)), "{refused:?}");
+        let size = db.current().unwrap().m.stored_bytes();
+        let most = 30_000 + QUOTA_RESERVE_BYTES;
+        // The size also counts the framing of stored entries, which a commit does not.
+        assert!(in_reserve > 10 && size < most + 4096 && size + (1 << 20) > most, "{in_reserve} values, {size} bytes");
+        assert!(matches!(try_put(&db, key(0), value()).await, Err(Error::QuotaExceeded(_))));
     });
 }
 

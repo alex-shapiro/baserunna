@@ -21,7 +21,7 @@ use crate::probe::{self, Probe};
 use crate::store::{GetOpts, PutMode, StoreError};
 use crate::timing::{self, StoreOp, Tally};
 use crate::util::{Either, race};
-use baserunna_api::{KvWrite, quota_growth};
+use baserunna_api::{KvWrite, QUOTA_RESERVE_BYTES, SizeLimit, quota_growth};
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
@@ -1540,9 +1540,13 @@ impl Db {
                         continue;
                     }
                     let (added, blob_bytes) = growth(&req.writes);
+                    let reserve = match req.size_limit {
+                        SizeLimit::Quota => 0,
+                        SizeLimit::Reserve => QUOTA_RESERVE_BYTES,
+                    };
                     if let Some(limit) = quota
                         && added > 0
-                        && size + added > limit
+                        && size + added > limit + reserve
                     {
                         quota_refused = true;
                         outcomes.push(Outcome::Seq(Err(quota_exceeded(limit))));
@@ -2238,6 +2242,7 @@ impl Db {
             reads: Vec::new(),
             pinned_reads: Vec::new(),
             writes,
+            size_limit: SizeLimit::Quota,
             charge: Charge::default(),
         };
         match self.commit(req).await {

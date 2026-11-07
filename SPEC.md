@@ -710,6 +710,7 @@ Accounted bytes are `swept + (bound - swept_at)`, which is exact after a sweep a
 Quota limits are enforced on commits and uploads:
 
 - Any transaction that writes data is rejected with `507 quota_exceeded` if its keys, values, bound blobs, and stream appends would push the database size past the quota. Transactions that only delete keys or trim streams are always allowed so a full database can be emptied.
+- A one-shot transaction with `size_limit: "reserve"` is checked against the quota plus a fixed reserve of 16 MiB (`QUOTA_RESERVE_BYTES` in `baserunna-api`) instead. It is for the few writes that must commit while a database is full, such as the write that ends a job in progress, and that would otherwise be refused until data is deleted and compacted. Every writer of the database may use the reserve, so a database can store up to the quota plus the reserve.
 - A node serving a blob upload counts in-flight uploads and staged blobs not yet bound to a key, rejecting the upload with `507` if they would push the database past the quota.
 - Deleted LSM data counts toward the quota until compaction removes it, and overwritten blobs count until the next GC sweep. When a commit is rejected for exceeding the quota, the lease holder runs the next sweep after 1 min instead of waiting for the hourly schedule.
 
@@ -853,7 +854,8 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
    committed, the server returns the replayed result; otherwise it writes an
    abort record so that any in-flight attempt cannot be applied later.
    Read-only requests ignore idempotency keys. Conflicts are retried
-   server-side.
+   server-side. A write with `size_limit: "reserve"` may grow the database
+   past its size quota by up to 16 MiB (§5.10).
 2. **Interactive** (`/v1/dbs/{db}/transactions…`): begin, ops, commit,
    abort. `begin` and `commit` also accept `ops`, so a read-write transaction
    can be executed in two requests. If an `ops` request fails or is canceled,

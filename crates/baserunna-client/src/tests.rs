@@ -1,5 +1,5 @@
 use super::*;
-use crate::api::{ErrorCode, Outcome};
+use crate::api::{ErrorCode, Outcome, SizeLimit};
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -50,7 +50,7 @@ fn put() -> Vec<Op> {
 async fn requests_include_endpoint_route_method_token_and_body() {
     let ok = r#"{"version":3,"committed":true,"commit_id":"00000000000000aa","results":[{}],"appends":[]}"#;
     let (c, s) = script(vec![resp(200, &[], ok)]);
-    let out = c.db("team.tools").txn(&put(), Some("key-1")).await.unwrap();
+    let out = c.db("team.tools").txn(&put(), Some("key-1"), SizeLimit::Quota).await.unwrap();
     assert_eq!(
         out,
         TxnOutcome {
@@ -207,7 +207,7 @@ async fn replayed_transactions_omit_results() {
     let body =
         r#"{"version":4,"committed":true,"replayed":true,"commit_id":"0000000000000001","results":null,"appends":[]}"#;
     let (c, _) = script(vec![resp(200, &[], body)]);
-    assert_eq!(c.db("s").txn(&put(), Some("k")).await.unwrap().results, TxnResults::Replayed);
+    assert_eq!(c.db("s").txn(&put(), Some("k"), SizeLimit::Quota).await.unwrap().results, TxnResults::Replayed);
 }
 
 #[tokio::test(start_paused = true)]
@@ -219,7 +219,7 @@ async fn responses_that_do_not_match_their_operations_are_malformed() {
         r#"{"unexpected":true}"#,
     ] {
         let (c, s) = script(vec![resp(200, &[], body)]);
-        let e = c.db("s").txn(&CHECK, None).await.unwrap_err();
+        let e = c.db("s").txn(&CHECK, None, SizeLimit::Quota).await.unwrap_err();
         assert!(matches!(e, Error::Malformed { .. }), "{body}: {e:?}");
         assert_eq!(sent(&s), 1, "{body}: a malformed response is not retried");
     }
@@ -239,7 +239,7 @@ async fn api_errors_preserve_code_details_and_outcome() {
     ];
     for (status, code, details, outcome, attempts) in cases {
         let (c, s) = script(vec![api_err(status, code, details)]);
-        let e = c.db("s").txn(&CHECK, None).await.unwrap_err();
+        let e = c.db("s").txn(&CHECK, None, SizeLimit::Quota).await.unwrap_err();
         assert_eq!(e.outcome(), outcome, "{code} {details}");
         assert_eq!(sent(&s), attempts, "{code} {details}: attempts");
         let Error::Api { status: got, error, .. } = &e else { panic!("{e:?}") };
@@ -264,15 +264,15 @@ async fn a_write_without_an_idempotency_key_is_not_sent_twice_after_an_unknown_o
     ];
     for r in unknowns {
         let (c, s) = script(vec![r.clone()]);
-        let e = c.db("s").txn(&put(), None).await.unwrap_err();
+        let e = c.db("s").txn(&put(), None, SizeLimit::Quota).await.unwrap_err();
         assert_eq!((e.outcome(), sent(&s)), (Outcome::Unknown, 1), "{r:?}");
         let (c, s) = script(vec![r.clone()]);
-        c.db("s").txn(&put(), Some("key")).await.unwrap_err();
+        c.db("s").txn(&put(), Some("key"), SizeLimit::Quota).await.unwrap_err();
         assert_eq!(sent(&s), 4, "{r:?}: a write with a key is retried");
     }
     for r in [Err(TransportError::NotSent("refused".into())), resp(407, &[], "<html>Proxy</html>")] {
         let (c, s) = script(vec![r.clone()]);
-        c.db("s").txn(&put(), None).await.unwrap_err();
+        c.db("s").txn(&put(), None, SizeLimit::Quota).await.unwrap_err();
         assert_eq!(sent(&s), 4, "{r:?}: a request that was not applied is retried");
     }
 }
@@ -282,7 +282,7 @@ async fn proxy_pages_are_foreign_and_retried_only_if_transient() {
     for (status, attempts) in [(401, 1), (403, 1), (404, 1), (413, 1), (407, 4), (408, 4), (429, 4), (502, 4), (200, 4)]
     {
         let (c, s) = script(vec![resp(status, &[], "<html>Error</html>")]);
-        let e = c.db("s").txn(&CHECK, None).await.unwrap_err();
+        let e = c.db("s").txn(&CHECK, None, SizeLimit::Quota).await.unwrap_err();
         assert!(matches!(e, Error::Foreign { status: got, .. } if got == status), "{status}: {e:?}");
         assert_eq!(sent(&s), attempts, "HTTP {status}");
     }
@@ -292,29 +292,29 @@ async fn proxy_pages_are_foreign_and_retried_only_if_transient() {
 async fn retries_back_off_and_follow_retry_after_up_to_a_bound() {
     let began = tokio::time::Instant::now();
     let (c, _) = script(vec![resp(503, &[], "<html>Busy</html>")]);
-    c.db("s").txn(&CHECK, None).await.unwrap_err();
+    c.db("s").txn(&CHECK, None, SizeLimit::Quota).await.unwrap_err();
     assert_eq!(began.elapsed().as_millis(), 100 + 300 + 900, "backoff triples");
 
     let began = tokio::time::Instant::now();
     let (c, _) = script(vec![resp(503, &[("retry-after", "3")], "<html>Busy</html>")]);
-    c.db("s").txn(&CHECK, None).await.unwrap_err();
+    c.db("s").txn(&CHECK, None, SizeLimit::Quota).await.unwrap_err();
     assert_eq!(began.elapsed().as_millis(), 9_000, "each of 3 retries waits 3 s");
 
     let began = tokio::time::Instant::now();
     let (c, _) = script(vec![api_err(429, "rate_limited", r#"{"retry_after_ms":99999999}"#)]);
-    c.db("s").txn(&put(), None).await.unwrap_err();
+    c.db("s").txn(&put(), None, SizeLimit::Quota).await.unwrap_err();
     assert_eq!(began.elapsed().as_millis(), 30_000, "Retry-After is capped at 10 s");
 
     let (c, s) = script(vec![resp(503, &[], "<html>Busy</html>")]);
     let one = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() });
-    one.db("s").txn(&CHECK, None).await.unwrap_err();
+    one.db("s").txn(&CHECK, None, SizeLimit::Quota).await.unwrap_err();
     assert_eq!(sent(&s), 1);
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_request_that_times_out_is_not_sent_again() {
     let (c, s) = script(vec![Err(TransportError::TimedOut("deadline".into()))]);
-    let e = c.db("s").txn(&CHECK, None).await.unwrap_err();
+    let e = c.db("s").txn(&CHECK, None, SizeLimit::Quota).await.unwrap_err();
     assert_eq!((e.outcome(), sent(&s)), (Outcome::Unknown, 1));
 }
 
@@ -416,7 +416,7 @@ fn arbitrary_responses_never_panic_the_client() {
                 max_staleness_ms: None,
             };
             match r.below(7) {
-                0 => drop(db.txn(&ops, None).await),
+                0 => drop(db.txn(&ops, None, SizeLimit::Quota).await),
                 5 => drop(db.get_many(&[Bytes::from_static(b"a")]).await),
                 6 => drop(db.scan(&scan).await),
                 1 => drop(db.changes(&req).await),
@@ -433,25 +433,25 @@ async fn an_unknown_outcome_of_an_earlier_attempt_is_not_hidden_by_later_failure
     let lost = Err(TransportError::Unknown("response lost".into()));
     let refused = Err(TransportError::NotSent("refused".into()));
     let (c, s) = script(vec![lost.clone(), refused.clone(), refused.clone(), refused.clone()]);
-    let e = c.db("s").txn(&put(), Some("key")).await.unwrap_err();
+    let e = c.db("s").txn(&put(), Some("key"), SizeLimit::Quota).await.unwrap_err();
     assert_eq!((e, sent(&s)), (Error::Transport(TransportError::Unknown("response lost".into())), 4));
 
     let not_applied = api_err(503, "unavailable", r#"{"outcome":"not_applied"}"#);
     let (c, _) = script(vec![lost.clone(), not_applied.clone()]);
-    assert_eq!(c.db("s").txn(&put(), Some("key")).await.unwrap_err().outcome(), Outcome::Unknown);
+    assert_eq!(c.db("s").txn(&put(), Some("key"), SizeLimit::Quota).await.unwrap_err().outcome(), Outcome::Unknown);
 
     let denied = api_err(401, "unauthenticated", "null");
     let (c, _) = script(vec![lost.clone(), denied]);
-    let e = c.db("s").txn(&put(), Some("key")).await.unwrap_err();
+    let e = c.db("s").txn(&put(), Some("key"), SizeLimit::Quota).await.unwrap_err();
     assert_eq!(e.outcome(), Outcome::Unknown, "a rejected retry does not resolve an earlier attempt");
 
     let resolved = api_err(412, "precondition_failed", r#"{"op_index":0}"#);
     let (c, _) = script(vec![lost, resolved]);
-    let e = c.db("s").txn(&put(), Some("key")).await.unwrap_err();
+    let e = c.db("s").txn(&put(), Some("key"), SizeLimit::Quota).await.unwrap_err();
     assert_eq!(e.code(), Some(ErrorCode::PreconditionFailed), "a definitive response resolves earlier attempts");
 
     let (c, _) = script(vec![refused]);
-    assert_eq!(c.db("s").txn(&put(), Some("key")).await.unwrap_err().outcome(), Outcome::NotApplied);
+    assert_eq!(c.db("s").txn(&put(), Some("key"), SizeLimit::Quota).await.unwrap_err().outcome(), Outcome::NotApplied);
 }
 
 #[tokio::test(start_paused = true)]
@@ -472,7 +472,7 @@ async fn increments_return_the_new_value() {
     let ok = r#"{"version":4,"committed":true,"commit_id":"00000000000000ab","results":[{"value":7}],"appends":[]}"#;
     let (c, s) = script(vec![resp(200, &[], ok)]);
     let ops = [Op::Increment { key: Bytes::from_static(b"n"), by: 2, ttl_ms: Some(60_000) }];
-    let out = c.db("d").txn(&ops, Some("key-2")).await.unwrap();
+    let out = c.db("d").txn(&ops, Some("key-2"), SizeLimit::Quota).await.unwrap();
     assert_eq!(out.results, TxnResults::Executed(vec![OpResult::Counter(7)]));
     let body: serde_json::Value = serde_json::from_slice(s.requests.lock().unwrap()[0].body()).unwrap();
     assert_eq!(body["ops"][0], serde_json::json!({"op": "increment", "key": "bg==", "by": 2, "ttl_ms": 60_000}));
@@ -485,7 +485,7 @@ async fn results_that_do_not_match_their_operation_are_malformed() {
     {
         let body = format!(r#"{{"version":4,"committed":true,"results":[{result}]}}"#);
         let (c, _) = script(vec![resp(200, &[], &body)]);
-        let err = c.db("d").txn(&[op], Some("k")).await.unwrap_err();
+        let err = c.db("d").txn(&[op], Some("k"), SizeLimit::Quota).await.unwrap_err();
         assert!(matches!(err, Error::Malformed { .. }), "{result}: {err:?}");
     }
 }

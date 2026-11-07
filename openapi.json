@@ -3260,6 +3260,13 @@
               "$ref": "#/components/schemas/Op"
             },
             "type": "array"
+          },
+          "size_limit": {
+            "enum": [
+              "quota",
+              "reserve"
+            ],
+            "type": "string"
           }
         },
         "required": [

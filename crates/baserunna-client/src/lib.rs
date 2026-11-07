@@ -7,7 +7,8 @@
 //! use baserunna_client::{Client, HttpTransport, Op};
 //! let client = Client::new(HttpTransport::new("https://example.com")).with_token("TOKEN");
 //! let db = client.db("notes");
-//! let out = db.txn(&[Op::Put { key: "a".into(), value: "1".into() }], Some("key-1")).await?;
+//! let put = [Op::Put { key: "a".into(), value: "1".into() }];
+//! let out = db.txn(&put, Some("key-1"), baserunna_client::api::SizeLimit::Quota).await?;
 //! println!("committed at version {}", out.version);
 //! # Ok(())
 //! # }
@@ -210,11 +211,12 @@ impl Client {
 
 /// The request body that [`Db::txn`] sends for `ops`. A server rejects a body larger than
 /// [`api::Limits::json_body_max`].
-pub fn txn_request(ops: &[Op], idempotency_key: Option<&str>) -> api::TxnRequest {
+pub fn txn_request(ops: &[Op], idempotency_key: Option<&str>, size_limit: api::SizeLimit) -> api::TxnRequest {
     api::TxnRequest {
         ops: ops.iter().map(Op::to_api).collect(),
         encoding: api::Encoding::Base64,
         idempotency_key: idempotency_key.map(Into::into),
+        size_limit,
         ..api::TxnRequest::default()
     }
 }
@@ -268,15 +270,21 @@ impl Db {
         &self.client
     }
 
-    /// Executes `ops` in a single serializable transaction.
+    /// Executes `ops` in a single serializable transaction, which may grow the database up to
+    /// `size_limit`.
     ///
     /// Write transactions require an `idempotency_key` to retry after a failure with
     /// [`api::Outcome::Unknown`]. Generate a new key for each distinct transaction, including after
     /// [`api::ErrorCode::Aborted`].
-    pub async fn txn(&self, ops: &[Op], idempotency_key: Option<&str>) -> Result<TxnOutcome, Error> {
+    pub async fn txn(
+        &self,
+        ops: &[Op],
+        idempotency_key: Option<&str>,
+        size_limit: api::SizeLimit,
+    ) -> Result<TxnOutcome, Error> {
         let e = api::Txn { db: self.name.clone() };
         let path = e.path();
-        let resp = self.client.send(&e, &txn_request(ops, idempotency_key)).await?;
+        let resp = self.client.send(&e, &txn_request(ops, idempotency_key, size_limit)).await?;
         TxnOutcome::decode(ops, resp).map_err(|reason| Error::Malformed { path, reason })
     }
 

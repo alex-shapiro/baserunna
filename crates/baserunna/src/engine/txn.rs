@@ -159,7 +159,7 @@ pub struct Txn {
     pub writes: WriteSet,
     pub commit_id: u64,
     /// How far the commit may grow the database past its size quota.
-    pub size_limit: SizeLimit,
+    size_limit: SizeLimit,
     write_bytes: usize,
     max_write_bytes: usize,
     read_bytes: usize,
@@ -230,6 +230,12 @@ impl Txn {
 
     pub fn with_read_limit(mut self, max_read_bytes: usize) -> Txn {
         self.max_read_bytes = max_read_bytes;
+        self
+    }
+
+    /// Lets the commit grow the database up to `size_limit` instead of its quota.
+    pub fn with_size_limit(mut self, size_limit: SizeLimit) -> Txn {
+        self.size_limit = size_limit;
         self
     }
 

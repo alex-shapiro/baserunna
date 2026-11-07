@@ -834,7 +834,7 @@ pub(crate) enum Ran<T> {
 /// key and any previously committed result for that key is replayed without
 /// re-executing (SPEC §6.2).
 macro_rules! run_txn {
-    ($node:expr, $ctx:expr, $isolation:expr, $consistency:expr, $key:expr, |$t:ident| $body:expr) => {{
+    ($node:expr, $ctx:expr, $isolation:expr, $consistency:expr, $size_limit:expr, $key:expr, |$t:ident| $body:expr) => {{
         let (node_, ctx_, key_): (&crate::node::Node, &crate::api::DbCtx, Option<&str>) = (&$node, &$ctx, $key);
         let commit_id_ = crate::api::commit_id_for(node_, ctx_, key_)?;
         let ran_ = match crate::api::earlier_attempt(ctx_, commit_id_, key_).await? {
@@ -847,7 +847,8 @@ macro_rules! run_txn {
                 let mut attempt_ = 0u32;
                 let mut optimistic_ = true;
                 loop {
-                    let mut txn_ = crate::api::begin_txn(ctx_, $isolation, $consistency, optimistic_).await?;
+                    let mut txn_ =
+                        crate::api::begin_txn(ctx_, $isolation, $consistency, $size_limit, optimistic_).await?;
                     txn_.commit_id = commit_id_;
                     let out_ = {
                         let $t: &mut crate::engine::Txn = &mut txn_;
@@ -881,19 +882,21 @@ macro_rules! run_txn {
 }
 pub(crate) use run_txn;
 
-/// Begins a transaction for [`run_txn!`], starting optimistically for strong
-/// serializable transactions when `optimistic` is true.
+/// Begins a transaction for [`run_txn!`] that may grow the database up to `size_limit`,
+/// starting optimistically for strong serializable transactions when `optimistic` is true.
 pub(crate) async fn begin_txn(
     ctx: &DbCtx,
     isolation: crate::engine::Isolation,
     c: Consistency,
+    size_limit: baserunna_api::SizeLimit,
     optimistic: bool,
 ) -> Result<Txn> {
-    if optimistic && c == Consistency::Strong && isolation == crate::engine::Isolation::Serializable {
+    let t = if optimistic && c == Consistency::Strong && isolation == crate::engine::Isolation::Serializable {
         ctx.db.begin_optimistic().await
     } else {
         ctx.db.begin(isolation, c).await
-    }
+    };
+    Ok(t?.with_size_limit(size_limit))
 }
 
 pub(crate) fn commit_id_for(node: &Node, ctx: &DbCtx, key: Option<&str>) -> Result<u64> {
@@ -984,6 +987,7 @@ macro_rules! with_txn {
             $ctx,
             crate::engine::Isolation::Serializable,
             crate::engine::Consistency::Strong,
+            baserunna_api::SizeLimit::Quota,
             None,
             |$t| $body
         );

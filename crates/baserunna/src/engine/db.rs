@@ -21,7 +21,7 @@ use crate::probe::{self, Probe};
 use crate::store::{GetOpts, PutMode, StoreError};
 use crate::timing::{self, StoreOp, Tally};
 use crate::util::{Either, race};
-use baserunna_api::{KvWrite, QUOTA_RESERVE_BYTES, SizeLimit, quota_growth};
+use baserunna_api::{KvWrite, SizeLimit, quota_growth};
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
@@ -539,7 +539,7 @@ impl Db {
         let mut g = self.staging();
         let pending = g.uploading + g.staged.values().map(|(n, _)| n).sum::<u64>();
         if stored + pending + n > limit {
-            return Err(quota_exceeded(limit));
+            return Err(quota_exceeded(limit, SizeLimit::Quota));
         }
         g.uploading += n;
         Ok(())
@@ -1540,16 +1540,12 @@ impl Db {
                         continue;
                     }
                     let (added, blob_bytes) = growth(&req.writes);
-                    let reserve = match req.size_limit {
-                        SizeLimit::Quota => 0,
-                        SizeLimit::Reserve => QUOTA_RESERVE_BYTES,
-                    };
                     if let Some(limit) = quota
                         && added > 0
-                        && size + added > limit + reserve
+                        && size + added > limit + req.size_limit.past_quota_bytes()
                     {
                         quota_refused = true;
-                        outcomes.push(Outcome::Seq(Err(quota_exceeded(limit))));
+                        outcomes.push(Outcome::Seq(Err(quota_exceeded(limit, req.size_limit))));
                         continue;
                     }
                     let new_seq = last_seq + 1;
@@ -1828,7 +1824,7 @@ impl Db {
                             && size + added > limit =>
                         {
                             quota_refused = true;
-                            Some(quota_exceeded(limit))
+                            Some(quota_exceeded(limit, SizeLimit::Quota))
                         }
                         _ => None,
                     };
@@ -2697,8 +2693,16 @@ struct Plan {
     events: BTreeSet<u32>,
 }
 
-pub(crate) fn quota_exceeded(limit: u64) -> Error {
-    Error::QuotaExceeded(format!("the database is at its size quota of {limit} bytes; delete data to make room"))
+/// The refusal of a write that would grow a database past its quota `limit` and the bytes that
+/// `size_limit` allows past it.
+pub(crate) fn quota_exceeded(limit: u64, size_limit: SizeLimit) -> Error {
+    let reach = match size_limit {
+        SizeLimit::Quota => format!("its size quota of {limit} bytes"),
+        SizeLimit::Reserve => {
+            format!("its size quota of {limit} bytes and its reserve of {} bytes", size_limit.past_quota_bytes())
+        }
+    };
+    Error::QuotaExceeded(format!("the database is at {reach}; delete data to make room"))
 }
 
 /// Returns `(total_added_bytes, newly_bound_blob_bytes)` for a commit write set.

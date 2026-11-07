@@ -142,6 +142,16 @@ pub enum SizeLimit {
     Reserve,
 }
 
+impl SizeLimit {
+    /// The bytes by which a transaction with this limit may grow its database past the quota.
+    pub const fn past_quota_bytes(self) -> u64 {
+        match self {
+            SizeLimit::Quota => 0,
+            SizeLimit::Reserve => crate::QUOTA_RESERVE_BYTES,
+        }
+    }
+}
+
 fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     *t == T::default()
 }

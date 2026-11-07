@@ -272,8 +272,7 @@ fn quotas_refuse_growth_but_allow_deletes() {
 
 /// Commits a put of `v` to `k` that may use the reserve past the quota.
 async fn try_put_in_reserve(db: &Arc<Db>, k: Bytes, v: Value) -> crate::error::Result<Seq> {
-    let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await?;
-    t.size_limit = SizeLimit::Reserve;
+    let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await?.with_size_limit(SizeLimit::Reserve);
     t.put(k, v)?;
     db.commit(t.into_request()).await
 }

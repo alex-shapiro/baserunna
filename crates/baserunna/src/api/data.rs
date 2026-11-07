@@ -499,10 +499,8 @@ async fn one_shot(
     let octx = op_ctx(&node, &ctx, req.encoding);
     // Ignore idempotency keys on read-only requests so a failed check cannot abort a write key without write permission.
     let key = req.idempotency_key.as_deref().filter(|_| writes);
-    let (commit_id, ran) = run_txn!(node, ctx, isolation(req.isolation), c, key, |t| {
-        t.size_limit = req.size_limit;
-        exec_ops(&octx, t, &ops).await
-    });
+    let (commit_id, ran) =
+        run_txn!(node, ctx, isolation(req.isolation), c, req.size_limit, key, |t| exec_ops(&octx, t, &ops).await);
     node.env.crash_point().await;
     let reply = |version: u64, committed: bool, replayed: bool, results, appends| {
         let commit_id = committed.then(|| commit_hex(commit_id));

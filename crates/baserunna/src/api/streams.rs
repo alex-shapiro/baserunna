@@ -195,16 +195,24 @@ async fn append(
         }
     };
     let record_max = ctx.db.shared().cfg.stream_record_max;
-    let (commit_id, ran) = run_txn!(node, ctx, Isolation::Serializable, Consistency::Strong, key.as_deref(), |t| {
-        let to = AppendTo {
-            name: &name,
-            create: create.then(|| (node.env.random_u64(), node.now_ms())),
-            expect,
-            op_index: None,
-            record_max,
-        };
-        stream::append(t, &to, &bodies).await
-    });
+    let (commit_id, ran) = run_txn!(
+        node,
+        ctx,
+        Isolation::Serializable,
+        Consistency::Strong,
+        baserunna_api::SizeLimit::Quota,
+        key.as_deref(),
+        |t| {
+            let to = AppendTo {
+                name: &name,
+                create: create.then(|| (node.env.random_u64(), node.now_ms())),
+                expect,
+                op_index: None,
+                record_max,
+            };
+            stream::append(t, &to, &bodies).await
+        }
+    );
     match ran {
         Ran::Committed { commit, .. } => appended(&commit, false, commit_id),
         Ran::Replayed(commit) => appended(&commit, true, commit_id),

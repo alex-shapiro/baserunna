@@ -28,9 +28,11 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       post-commit sweep skips execution if the lease expires while reading the
       store clock and refreshing the manifest, leaving the database unswept
       until the next commit (`sim_tool trace blobs 5000231`).
-- [ ] **Fix `streams` seed 202835: expired stream records are returned after
-      `retention_ms`.** Stream reads return records older than `retention_ms`
-      (`sim_tool trace streams 202835`).
+- [ ] **Schedule retention trims after an ambiguous manifest write.** A commit
+      that makes a stream's trim due schedules the trim only once its manifest
+      `PUT` succeeds. If the `PUT` fails with an unknown outcome but applied, no
+      trim is scheduled until a later commit or sweep, so an idle stream keeps
+      records past `retention_ms` (`sim_tool trace streams 8100221`).
 - [ ] **Abort open interactive transactions if a database is deleted.**
       Interactive transactions on a deleted database currently remain open
       until their 30 s idle timeout expires, consuming memory and counting

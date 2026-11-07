@@ -149,6 +149,21 @@ fn item(owner: &str, id: i64) -> Item {
 }
 
 /// Reads every page of `op` in one-shot reads.
+/// Returns `db` on a client that sends each request once.
+fn once(db: &Db) -> Db {
+    db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() }).db(db.name())
+}
+
+/// Waits up to `within` for `router` to receive a request after its first `sent`.
+async fn next_request(router: &Router, sent: usize, within: Duration) -> bool {
+    let next = async {
+        while router.sent.load(Ordering::Relaxed) == sent {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(within, next).await.is_ok()
+}
+
 async fn pages(db: &Db, mut op: Op) -> Vec<OpResult> {
     let mut out = Vec::new();
     loop {
@@ -303,20 +318,14 @@ async fn concurrent_read_modify_writes_serialize_through_retries() {
 #[tokio::test]
 async fn a_dropped_transaction_is_aborted_and_frees_its_open_transaction_slot() {
     let (db, router) = node_with("", |c| c.txns_per_user = 2).await;
-    let client = db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() });
-    let db = client.db(db.name());
+    let db = once(&db);
     for i in 0..5 {
         let mut txn = db.begin();
         let begun = txn.run_one(Op::get("k")).await;
         assert!(begun.is_ok(), "transaction {i} begins after earlier ones were dropped: {begun:?}");
         let sent = router.sent.load(Ordering::Relaxed);
         drop(txn);
-        let aborted = async {
-            while router.sent.load(Ordering::Relaxed) == sent {
-                tokio::task::yield_now().await;
-            }
-        };
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), aborted).await;
+        next_request(&router, sent, Duration::from_millis(500)).await;
     }
 }
 
@@ -353,45 +362,57 @@ async fn a_write_that_changes_nothing_commits_nothing() {
         Op::update::<Item>(("nobody", 1), &set),
         Op::delete_row::<Item>(("nobody", 1)),
     ] {
-        let r = db.write(std::slice::from_ref(&op)).await;
-        assert_eq!(r, Ok(None), "{op:?}");
-        let mut txn = db.begin();
-        txn.write([op]);
-        assert_eq!(txn.commit().await, Ok(None));
+        assert_eq!(db.write(std::slice::from_ref(&op)).await, Ok(None), "{op:?}");
+        for begun in [false, true] {
+            let mut txn = db.begin();
+            if begun {
+                txn.run_one(Op::get("k")).await.unwrap();
+            }
+            txn.write([op.clone()]);
+            assert_eq!(txn.commit().await, Ok(None), "{op:?} in a transaction that began: {begun}");
+        }
     }
+    let mut txn = db.begin();
+    txn.run_one(Op::get("k")).await.unwrap();
+    assert_eq!(txn.commit().await, Ok(None), "a begun transaction without writes");
 }
 
 #[tokio::test]
 async fn a_begin_whose_caller_stops_waiting_is_aborted() {
-    let (db, router) = node_with(api::BeginTxn::ROUTE, |c| c.txns_per_user = 1).await;
-    let client = db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() });
-    let db = client.db(db.name());
-    router.fail(api::BeginTxn::ROUTE, Fault::Slow, 1);
-    let mut txn = db.begin();
-    let begun = tokio::time::timeout(Duration::from_millis(200), txn.run_one(Op::get("k"))).await;
-    assert!(begun.is_err(), "the caller stopped waiting: {begun:?}");
-    drop(txn);
-    let sent = router.sent.load(Ordering::Relaxed);
-    let aborted = async {
-        while router.sent.load(Ordering::Relaxed) == sent {
-            tokio::task::yield_now().await;
+    use std::future::Future;
+    use std::task::Poll;
+    // The caller leaves before the 500 ms slow response arrives, or after a fast one arrives but
+    // before it reads it.
+    for slow in [true, false] {
+        let (db, router) = node_with(api::BeginTxn::ROUTE, |c| c.txns_per_user = 1).await;
+        let db = once(&db);
+        if slow {
+            router.fail(api::BeginTxn::ROUTE, Fault::Slow, 1);
         }
-    };
-    tokio::time::timeout(Duration::from_secs(5), aborted).await.expect("the begun transaction is aborted");
-    let mut txn = db.begin();
-    let begun = txn.run_one(Op::get("k")).await;
-    assert!(begun.is_ok(), "a new transaction begins: {begun:?}");
-    txn.abort().await;
+        let mut txn = db.begin();
+        {
+            let mut run = std::pin::pin!(txn.run_one(Op::get("k")));
+            let pending = std::future::poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx).is_pending())).await;
+            assert!(pending, "the begin is in flight");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        let sent = router.sent.load(Ordering::Relaxed);
+        drop(txn);
+        assert!(next_request(&router, sent, Duration::from_secs(5)).await, "the begun transaction is aborted");
+        let mut txn = db.begin();
+        let begun = txn.run_one(Op::get("k")).await;
+        assert!(begun.is_ok(), "a new transaction begins after a slow begin ({slow}): {begun:?}");
+        txn.abort().await;
+    }
 }
 
 #[tokio::test]
 async fn a_begin_retried_after_memory_pressure_eases_succeeds() {
     let (db, _) = node_with("", |c| c.engine.memory_bytes = 16 << 20).await;
     let big = |tag: &str| -> Vec<Op> { (0..120).map(|i| Op::put(format!("{tag}{i}"), vec![b'v'; 20_000])).collect() };
-    let once = db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() });
     let mut fillers = Vec::new();
     loop {
-        let mut t = once.db(db.name()).begin();
+        let mut t = once(&db).begin();
         if t.run(&big(&format!("f{}-", fillers.len()))).await.is_err() {
             break;
         }
@@ -411,46 +432,15 @@ async fn a_begin_retried_after_memory_pressure_eases_succeeds() {
 }
 
 #[tokio::test]
-async fn a_begun_transaction_that_writes_nothing_commits_nothing() {
+async fn a_table_with_a_column_type_the_server_does_not_know_is_rejected_even_if_it_exists() {
     let (db, _) = node("").await;
-    for writes in [vec![], vec![Op::delete_row::<Item>(("nobody", 1))]] {
-        let mut txn = db.begin();
-        txn.run_one(Op::get("k")).await.unwrap();
-        txn.write(writes);
-        assert_eq!(txn.commit().await, Ok(None), "like Db::write and a transaction that never began");
+    for name in ["later", &table().name] {
+        let mut t = table();
+        t.name = name.into();
+        t.columns[0].ty = api::ColumnType::Unknown;
+        let e = db.create_table(&t).await.unwrap_err();
+        assert_eq!(e.code(), Some(api::ErrorCode::InvalidArgument), "{name}: {e}");
     }
-}
-
-#[tokio::test]
-async fn a_table_with_a_column_type_the_server_does_not_know_is_rejected() {
-    let (db, _) = node("").await;
-    let mut t = table();
-    t.name = "later".into();
-    t.columns[0].ty = api::ColumnType::Unknown;
-    let e = db.create_table(&t).await.unwrap_err();
-    assert_eq!(e.code(), Some(api::ErrorCode::InvalidArgument), "{e}");
-}
-
-#[tokio::test]
-async fn a_begin_whose_caller_leaves_after_the_response_arrives_is_aborted() {
-    use std::future::Future;
-    use std::task::Poll;
-    let (db, _) = node_with("", |c| c.txns_per_user = 1).await;
-    let client = db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() });
-    let db = client.db(db.name());
-    let mut txn = db.begin();
-    {
-        let mut run = std::pin::pin!(txn.run_one(Op::get("k")));
-        let pending = std::future::poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx).is_pending())).await;
-        assert!(pending, "the begin is in flight");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-    drop(txn);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let mut txn = db.begin();
-    let begun = txn.run_one(Op::get("k")).await;
-    assert!(begun.is_ok(), "a new transaction begins: {begun:?}");
-    txn.abort().await;
 }
 
 #[tokio::test]
@@ -469,26 +459,19 @@ async fn a_cancelled_abort_still_frees_the_open_transaction_slot() {
 }
 
 #[tokio::test]
-async fn a_prefix_of_none_matches_only_rows_whose_key_is_null() {
+async fn a_prefix_of_none_or_of_no_columns_selects_no_rows() {
     let (db, _) = node("").await;
     db.write(&[Op::insert(&item("a", 1)), Op::insert(&item("b", 2))]).await.unwrap();
-    let owner: Option<&str> = None;
-    let none = db.read_one(Op::query::<Item>(owner)).await.unwrap().rows::<Item>().unwrap();
-    assert!(none.is_empty(), "a query for a missing owner read {none:?}");
-    db.write(&[Op::delete_rows::<Item>(owner)]).await.unwrap();
-    let left = db.read_one(Op::query::<Item>("a")).await.unwrap().rows::<Item>().unwrap();
-    assert_eq!(left.len(), 1, "deleting the rows of a missing owner deleted other rows");
-}
-
-#[tokio::test]
-async fn an_empty_prefix_selects_no_rows() {
-    let (db, _) = node("").await;
-    db.write(&[Op::insert(&item("a", 1)), Op::insert(&item("b", 2))]).await.unwrap();
-    let prefix: Vec<String> = Vec::new();
-    let read = db.read_one(Op::query::<Item>(&prefix)).await.unwrap().rows::<Item>().unwrap();
-    db.write(&[Op::delete_rows::<Item>(&prefix)]).await.unwrap();
-    let left = db.read_one(Op::query_all::<Item>()).await.unwrap().rows::<Item>().unwrap();
-    assert_eq!((read.len(), left.len()), (0, 2), "an empty prefix read {read:?} and left {left:?}");
+    let (none, empty): (Option<&str>, Vec<String>) = (None, Vec::new());
+    for (query, delete) in [
+        (Op::query::<Item>(none), Op::delete_rows::<Item>(none)),
+        (Op::query::<Item>(&empty), Op::delete_rows::<Item>(&empty)),
+    ] {
+        let read = db.read_one(query).await.unwrap().rows::<Item>().unwrap();
+        db.write(&[delete]).await.unwrap();
+        let left = db.read_one(Op::query_all::<Item>()).await.unwrap().rows::<Item>().unwrap();
+        assert_eq!((read.len(), left.len()), (0, 2), "the prefix read {read:?} and left {left:?}");
+    }
 }
 
 #[tokio::test]
@@ -502,15 +485,6 @@ async fn queued_writes_run_in_order_with_later_operations() {
     let k = db.read_one(Op::get("k")).await.unwrap().entry().unwrap().unwrap();
     assert_eq!(seen.as_ref().and_then(|v| v.data()).map(|d| d.as_ref()), Some(&b"first"[..]));
     assert_eq!(k.value.data().unwrap().as_ref(), b"second");
-}
-
-#[tokio::test]
-async fn creating_an_existing_table_still_checks_its_column_types() {
-    let (db, _) = node("").await;
-    let mut t = table();
-    t.columns[0].ty = api::ColumnType::Unknown;
-    let e = db.create_table(&t).await.unwrap_err();
-    assert_eq!(e.code(), Some(api::ErrorCode::InvalidArgument), "{e}");
 }
 
 #[tokio::test]
@@ -555,10 +529,8 @@ async fn a_write_whose_first_attempt_never_arrived_reports_the_servers_refusal()
         passes += 1;
         let txn = db.begin();
         let w = db.write(&[Op::insert(&item("a", 1))]).await;
-        match retry.finish(txn, w).await {
-            Ok(Some(_)) => break Ok(()),
-            Ok(None) => {}
-            Err(e) => break Err(e),
+        if let Some(r) = retry.finish(txn, w).await.transpose() {
+            break r;
         }
     };
     assert_eq!(passes, 1, "a refused write is not run again: {r:?}");

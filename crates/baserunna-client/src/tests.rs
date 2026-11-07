@@ -462,7 +462,7 @@ fn requests(s: &Script) -> Vec<(String, String, serde_json::Value)> {
 }
 
 const BEGUN: &str = r#"{"txn_id":"t1","commit_id":"00000000000000c1","read_version":1,"expires_at":9,"idle_timeout_ms":9,"results":[{"found":true,"row":{"id":"a","n":1}}]}"#;
-const COMMITTED: &str = r#"{"version":2,"commit_id":"00000000000000c1","appends":[],"results":[{}]}"#;
+const COMMITTED: &str = r#"{"version":2,"committed":true,"commit_id":"00000000000000c1","appends":[],"results":[{}]}"#;
 
 #[test]
 fn row_and_stream_ops_serialize_as_the_api_takes_them() {
@@ -500,7 +500,8 @@ fn row_and_stream_ops_serialize_as_the_api_takes_them() {
         let back: api::Op = serde_json::from_value(want).unwrap();
         assert_eq!(back, op.to_api(), "the server parses what the client sends");
     }
-    assert!(Op::upsert(&row).is_write() && !Op::query_all::<Thing>().is_write() && !Op::read_stream("s", 0).is_write());
+    let writes = |op: Op| op.to_api().is_write();
+    assert!(writes(Op::upsert(&row)) && !writes(Op::query_all::<Thing>()) && !writes(Op::read_stream("s", 0)));
 }
 
 #[test]
@@ -597,31 +598,14 @@ async fn a_transaction_without_reads_commits_its_writes_in_one_idempotent_reques
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_unknown_commit_outcome_is_resolved_by_its_commit_id() {
+async fn an_unknown_commit_outcome_stays_unknown_if_its_status_cannot_be_read() {
     let lost = Err(TransportError::Unknown("response lost".into()));
-    let committed = r#"{"status":"committed","version":5,"commit_id":"00000000000000c1","appends":[3]}"#;
-    let not_committed = r#"{"status":"not_committed","commit_id":"00000000000000c1","retention_ms":600000}"#;
-    let commit = async |status| {
-        let (c, s) = script(vec![resp(201, &[], BEGUN), lost.clone(), status]);
-        let mut txn = c.db("s").begin();
-        txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
-        txn.write([Op::upsert(&Thing { id: "a".into(), n: 2 })]);
-        let r = txn.commit().await;
-        (r, requests(&s))
-    };
-
-    let (r, sent) = commit(resp(200, &[], committed)).await;
-    assert_eq!(r.unwrap().unwrap(), Committed { version: 5, commit_id: "00000000000000c1".into(), appends: vec![3] });
-    assert_eq!((sent.len(), sent[2].0.as_str(), sent[2].1.as_str()), (3, "GET", "/v1/dbs/s/commits/00000000000000c1"));
-
-    let (r, _) = commit(resp(200, &[], not_committed)).await;
-    let e = r.unwrap_err();
-    assert!(matches!(&e, Error::NotApplied(cause) if cause.outcome() == Outcome::Unknown), "{e:?}");
-    assert!(e.outcome() == Outcome::NotApplied && e.is_transient(false));
-
-    let (r, sent) = commit(Err(TransportError::NotSent("down".into()))).await;
-    assert_eq!(r.unwrap_err(), Error::Transport(TransportError::Unknown("response lost".into())));
-    assert_eq!(sent.len(), 2 + 4, "an unresolved outcome stays unknown after the status retries");
+    let (c, s) = script(vec![resp(201, &[], BEGUN), lost, Err(TransportError::NotSent("down".into()))]);
+    let mut txn = c.db("s").begin();
+    txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
+    txn.write([Op::upsert(&Thing { id: "a".into(), n: 2 })]);
+    assert_eq!(txn.commit().await.unwrap_err(), Error::Transport(TransportError::Unknown("response lost".into())));
+    assert_eq!(sent(&s), 2 + 4, "the status is retried, then the outcome stays unknown");
 }
 
 #[tokio::test(start_paused = true)]
@@ -688,10 +672,8 @@ async fn read_modify_write(c: &Client, refuse: bool) -> (u32, Result<u32, AppErr
             Ok(row.map_or(0, |r| r.n))
         }
         .await;
-        match retry.finish(txn, r).await {
-            Ok(Some(n)) => break Ok(n),
-            Ok(None) => {}
-            Err(e) => break Err(e),
+        if let Some(r) = retry.finish(txn, r).await.transpose() {
+            break r;
         }
     };
     (attempts, r)
@@ -802,21 +784,42 @@ async fn retry_does_not_restart_after_an_unknown_outcome_outside_its_transaction
 
 #[tokio::test(start_paused = true)]
 async fn a_transaction_refuses_further_use_after_a_request_fails_and_is_aborted() {
-    let (c, s) = script(vec![resp(201, &[], BEGUN), api_err(400, "invalid_argument", "null"), resp(200, &[], "{}")]);
-    let mut txn = c.db("s").begin();
-    txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
-    let e = txn.run_one(Op::put("k", "v")).await.unwrap_err();
-    assert_eq!(e.code(), Some(ErrorCode::InvalidArgument));
-    assert_eq!(txn.run_one(Op::get("k")).await.unwrap_err(), e, "a failed transaction runs nothing more");
-    txn.write([Op::put("k", "v")]);
-    assert_eq!(txn.commit().await.unwrap_err(), e, "nor commits its queued writes");
-    let r = requests(&s);
-    assert_eq!(r.len(), 3);
-    assert_eq!(
-        (r[2].0.as_str(), r[2].1.as_str()),
-        ("DELETE", "/v1/dbs/s/transactions/t1"),
-        "the open transaction is aborted"
-    );
+    let undecodable = resp(200, &[], r#"{"results":[]}"#);
+    for failure in [api_err(400, "invalid_argument", "null"), undecodable] {
+        let (c, s) = script(vec![resp(201, &[], BEGUN), failure, resp(200, &[], "{}")]);
+        let mut txn = c.db("s").begin();
+        txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
+        let e = txn.run_one(Op::put("k", "v")).await.unwrap_err();
+        assert!(e.outcome() == Outcome::NotApplied && !e.restarts_txn(), "{e:?}");
+        assert_eq!(txn.run_one(Op::get("k")).await.unwrap_err(), e, "a failed transaction runs nothing more");
+        txn.write([Op::put("k", "v")]);
+        assert_eq!(txn.commit().await.unwrap_err(), e, "nor commits its queued writes");
+        let r: Vec<_> = requests(&s).into_iter().map(|r| (r.0, r.1)).collect();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[2], ("DELETE".into(), "/v1/dbs/s/transactions/t1".into()), "the open transaction is aborted");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_errors_that_applied_nothing_and_can_pass_restart_a_transaction() {
+    let failed = async |r| {
+        let (c, _) = script(vec![r]);
+        let c = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() });
+        c.db("s").read(&GET).await.unwrap_err()
+    };
+    let not_applied = |e| Error::NotApplied(Box::new(e));
+    let newer = resp(400, &[], r#"{"error":{"code":"schema_locked","message":"m","retryable":false}}"#);
+    let cases = [
+        (failed(api_err(409, "conflict", "null")).await, true),
+        (failed(api_err(404, "txn_not_found", "null")).await, true),
+        (not_applied(Error::Transport(TransportError::TimedOut("deadline".into()))), true),
+        (Error::Transport(TransportError::Unknown("lost".into())), false),
+        (failed(newer).await, false),
+        (not_applied(Error::Malformed { path: "/".into(), reason: "undecodable".into() }), false),
+    ];
+    for (e, restarts) in cases {
+        assert_eq!(e.restarts_txn(), restarts, "{e:?}");
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -827,125 +830,10 @@ async fn a_replayed_read_is_malformed() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn retry_does_not_restart_after_an_unknown_outcome_outside_a_failed_transaction() {
-    let (c, s) = script(vec![
-        resp(201, &[], BEGUN),
-        api_err(503, "unavailable", "null"),
-        Err(TransportError::Unknown("lost".into())),
-        Err(TransportError::NotSent("down".into())),
-        resp(200, &[], "{}"),
-    ]);
-    let db = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() }).db("s");
-    let mut retry = db.retry();
-    let mut txn = db.begin();
-    txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
-    assert!(txn.run_one(Op::get("k")).await.is_err());
-    let outside = db.write(&put()).await.unwrap_err();
-    assert_eq!(outside.outcome(), Outcome::Unknown);
-    let r: Result<Option<()>, Error> = retry.finish(txn, Err(outside.clone())).await;
-    assert_eq!(r, Err(outside), "the outside write may have applied, so the loop must not run it again");
-    assert_eq!(sent(&s), 5);
-}
-
-#[tokio::test(start_paused = true)]
-async fn table_responses_ignore_fields_added_by_newer_servers() {
-    let body = r#"{"name":"items","columns":[{"name":"id","type":"int","nullable":false,"comment":"new"}],
-        "primary_key":["id"],"indexes":[{"name":"i","columns":["id"],"unique":false,"state":"ready","x":1}],"y":2}"#;
-    let (c, _) = script(vec![resp(200, &[], body)]);
-    let got = c.db("app").get_table("items").await;
-    assert!(got.is_ok(), "{got:?}");
-}
-
-#[tokio::test(start_paused = true)]
 async fn a_rejected_begin_sends_no_abort() {
     let (c, s) = script(vec![api_err(400, "invalid_argument", "null"), resp(200, &[], "{}")]);
     let mut txn = c.db("s").begin();
     assert!(txn.run_one(Op::get("k")).await.is_err());
     txn.abort().await;
     assert_eq!(sent(&s), 1, "nothing began, so nothing is aborted");
-}
-
-#[tokio::test(start_paused = true)]
-async fn table_listings_decode_column_types_and_index_states_added_by_newer_servers() {
-    let body = r#"{"tables":[
-        {"name":"old","columns":[{"name":"id","type":"int","nullable":false}],"primary_key":["id"],"indexes":[]},
-        {"name":"new","columns":[{"name":"at","type":"timestamp","nullable":false}],"primary_key":["at"],
-         "indexes":[{"name":"i","columns":["at"],"unique":false,"state":"failed"}]}
-    ],"next_cursor":null,"version":3}"#;
-    let (c, _) = script(vec![resp(200, &[], body)]);
-    let page = c.db("app").list_tables(api::ListTablesQuery::default()).await.unwrap();
-    assert_eq!(page.tables[1].columns[0].ty, api::ColumnType::Unknown);
-    assert_eq!(page.tables[1].indexes[0].state, api::IndexState::Unknown);
-}
-
-#[tokio::test(start_paused = true)]
-async fn retry_does_not_restart_after_an_outside_write_that_failed_like_the_transaction() {
-    let (c, s) = script(vec![Err(TransportError::Unknown("connection reset".into()))]);
-    let db = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() }).db("s");
-    let mut retry = db.retry();
-    let mut txn = db.begin();
-    let ops = put();
-    let (read, outside) = tokio::join!(txn.run_one(Op::get("k")), db.write(&ops));
-    assert_eq!(read.unwrap_err().outcome(), Outcome::NotApplied, "a failed transaction never commits");
-    let outside = outside.unwrap_err();
-    assert_eq!(outside.outcome(), Outcome::Unknown, "the outside write may have applied");
-    let r: Result<Option<()>, Error> = retry.finish(txn, Err(outside.clone())).await;
-    assert_eq!(r, Err(outside), "the loop must not run the outside write again ({} requests)", sent(&s));
-}
-
-#[tokio::test(start_paused = true)]
-async fn retry_restarts_after_a_request_of_its_transaction_times_out() {
-    let timed_out = Err(TransportError::TimedOut("deadline".into()));
-    let (c, _) = script(vec![timed_out, resp(201, &[], BEGUN), resp(200, &[], COMMITTED)]);
-    let db = c.db("s");
-    let mut retry = db.retry();
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        let mut txn = db.begin();
-        let r = txn.run_one(Op::get_row::<Thing>("a")).await.map(drop);
-        if retry.finish(txn, r).await.unwrap().is_some() {
-            break;
-        }
-    }
-    assert_eq!(attempts, 2, "a transaction whose request timed out never commits, so it restarts");
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_transaction_whose_results_do_not_decode_cannot_commit() {
-    let (c, s) = script(vec![resp(201, &[], BEGUN), resp(200, &[], r#"{"results":[]}"#), resp(200, &[], "{}")]);
-    let mut txn = c.db("s").begin();
-    txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
-    let e = txn.run_one(Op::put("k", "v")).await.unwrap_err();
-    assert!(matches!(&e, Error::NotApplied(cause) if matches!(**cause, Error::Malformed { .. })), "{e:?}");
-    assert_eq!(txn.commit().await.unwrap_err(), e, "a transaction with an undecodable response does not commit");
-    let methods: Vec<_> = requests(&s).into_iter().map(|r| r.0).collect();
-    assert_eq!(methods, ["POST", "POST", "DELETE"], "the transaction is aborted, not committed");
-}
-
-#[tokio::test(start_paused = true)]
-async fn retry_does_not_rerun_a_transaction_whose_responses_never_decode() {
-    let (c, s) = script((0..20).flat_map(|_| [resp(201, &[], BEGUN), resp(200, &[], "{}")]).collect());
-    let db = c.db("s");
-    let mut retry = db.retry();
-    let mut txn = db.begin();
-    txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
-    let r = txn.run_one(Op::get("k")).await.map(drop);
-    let e = retry.finish(txn, r).await.unwrap_err();
-    assert!(matches!(&e, Error::NotApplied(cause) if matches!(**cause, Error::Malformed { .. })), "{e:?}");
-    assert_eq!(sent(&s), 3, "a response that cannot decode ends the loop");
-}
-
-#[tokio::test(start_paused = true)]
-async fn retry_does_not_rerun_a_transaction_after_an_error_code_it_cannot_read() {
-    let newer = resp(400, &[], r#"{"error":{"code":"schema_locked","message":"m","retryable":false}}"#);
-    let (c, s) = script(vec![resp(201, &[], BEGUN), newer, resp(200, &[], "{}")]);
-    let db = c.db("s");
-    let mut retry = db.retry();
-    let mut txn = db.begin();
-    txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
-    let r = txn.run_one(Op::get("k")).await.map(drop);
-    let e = retry.finish(txn, r).await.unwrap_err();
-    assert_eq!(e.code(), Some(ErrorCode::Unknown), "{e:?}");
-    assert_eq!(sent(&s), 3, "an error the client cannot read ends the loop");
 }

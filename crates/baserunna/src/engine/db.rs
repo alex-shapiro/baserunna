@@ -21,7 +21,7 @@ use crate::probe::{self, Probe};
 use crate::store::{GetOpts, PutMode, StoreError};
 use crate::timing::{self, StoreOp, Tally};
 use crate::util::{Either, race};
-use baserunna_api::{KvWrite, SizeLimit, quota_growth};
+use baserunna_api::{SizeLimit, quota_growth};
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
@@ -2715,11 +2715,7 @@ fn growth(w: &WriteSet) -> (u64, u64) {
         + w.puts
             .iter()
             .filter(|(k, _)| !event_meta(k))
-            .filter_map(|(k, p)| {
-                let p = p.as_ref()?;
-                let w = KvWrite::Put { key_len: k.len(), value_size: p.value.size(), expires: p.ttl.is_some() };
-                Some(quota_growth(w) as u64)
-            })
+            .filter_map(|(k, p)| Some(quota_growth(k.len(), p.as_ref()?.value.stored()?) as u64))
             .sum::<u64>();
     let blobs: u64 = w.staged_blobs().map(|b| b.size).sum();
     (added + blobs, blobs)

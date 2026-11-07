@@ -75,16 +75,13 @@ pub const fn txn_write_cost(w: KvWrite) -> usize {
     }
 }
 
-/// The bytes by which `w` grows its database against the database's size quota: the stored key
-/// and the value of a put, and nothing for a delete. A transaction counts each key once, by the
-/// last write to it, and adds the data of each blob that its puts bind. The quota compares the
-/// growth with the bytes that the database stores, which include old versions of keys until
-/// compaction removes them, so an overwrite counts in full.
-pub const fn quota_growth(w: KvWrite) -> usize {
-    match w {
-        KvWrite::Put { key_len, value_size, .. } => key_len + value_size,
-        KvWrite::Delete { .. } | KvWrite::DeleteRange => 0,
-    }
+/// The bytes by which a put of `value` to a stored key of `key_len` bytes grows its database
+/// against the database's size quota. A delete grows it by nothing. A transaction counts each
+/// key once, by the last write to it, and adds the data of each blob that its puts bind. The
+/// quota compares the growth with the bytes that the database stores, which include old versions
+/// of keys until compaction removes them, so an overwrite counts in full.
+pub const fn quota_growth(key_len: usize, value: StoredValue) -> usize {
+    key_len + value.size()
 }
 
 /// The stored value of a counter with value `n`, as an increment writes it: decimal text.

@@ -259,9 +259,8 @@ fn counters_decode_what_increments_write() {
 }
 
 #[test]
-fn only_puts_grow_a_database() {
-    use crate::{KvWrite, quota_growth};
-    assert_eq!(quota_growth(KvWrite::Put { key_len: 3, value_size: 10, expires: true }), 13);
-    assert_eq!(quota_growth(KvWrite::Delete { key_len: 3 }), 0);
-    assert_eq!(quota_growth(KvWrite::DeleteRange), 0);
+fn a_put_grows_a_database_by_its_stored_key_and_value() {
+    use crate::{StoredValue, quota_growth};
+    assert_eq!(quota_growth(3, StoredValue::Inline { len: 6 }), 13);
+    assert_eq!(quota_growth(3, StoredValue::Blob { blob_id_len: 32, content_type_len: 24 }), 107);
 }

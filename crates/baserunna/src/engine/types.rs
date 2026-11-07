@@ -128,15 +128,20 @@ impl Value {
         }
     }
 
+    /// The sizes of the stored value, or `None` for a tombstone.
+    pub fn stored(&self) -> Option<StoredValue> {
+        match self {
+            Value::Inline(b) => Some(StoredValue::Inline { len: b.len() }),
+            Value::Blob(r) => {
+                Some(StoredValue::Blob { blob_id_len: r.id.len(), content_type_len: r.content_type.len() })
+            }
+            Value::Tombstone => None,
+        }
+    }
+
     /// Approximate encoded size.
     pub fn size(&self) -> usize {
-        match self {
-            Value::Inline(b) => StoredValue::Inline { len: b.len() }.size(),
-            Value::Blob(r) => {
-                StoredValue::Blob { blob_id_len: r.id.len(), content_type_len: r.content_type.len() }.size()
-            }
-            Value::Tombstone => 1,
-        }
+        self.stored().map_or(1, StoredValue::size)
     }
 
     pub fn encode(&self, w: &mut Writer) {

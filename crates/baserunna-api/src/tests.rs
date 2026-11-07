@@ -257,3 +257,11 @@ fn counters_decode_what_increments_write() {
         assert_eq!(crate::decode_counter(bad), None, "{bad:?}");
     }
 }
+
+#[test]
+fn only_puts_grow_a_database() {
+    use crate::{KvWrite, quota_growth};
+    assert_eq!(quota_growth(KvWrite::Put { key_len: 3, value_size: 10, expires: true }), 13);
+    assert_eq!(quota_growth(KvWrite::Delete { key_len: 3 }), 0);
+    assert_eq!(quota_growth(KvWrite::DeleteRange), 0);
+}

@@ -515,26 +515,31 @@ impl Node {
         // Peers count a node as live for 3 heartbeat intervals after the heartbeat they last read,
         // so heartbeats and reads each happen at least once per interval.
         let period = Duration::from_millis(self.cfg.members_refresh_ms).min(hb);
+        // Each loop runs on a fixed schedule, so the time a heartbeat or read takes does not delay
+        // the next one, and runs at once if it fell behind.
+        let after = |at: Instant, d: Duration| (at + d).max(Instant::now());
         self.env.spawn(async move {
-            let mut wait = hb;
+            let mut at = Instant::now() + hb;
             loop {
-                tokio::time::sleep(wait).await;
+                tokio::time::sleep_until(at).await;
                 let Some(n) = me.upgrade() else { return };
-                wait = match n.heartbeat().await {
-                    Ok(()) => hb,
+                at = match n.heartbeat().await {
+                    Ok(()) => after(at, hb),
                     Err(e) => {
                         crate::debug!("{}: heartbeat failed: {e}", n.id);
-                        period
+                        Instant::now() + period
                     }
                 };
             }
         });
         let me = Arc::downgrade(self);
         self.env.spawn(async move {
+            let mut at = Instant::now() + period;
             loop {
-                tokio::time::sleep(period).await;
+                tokio::time::sleep_until(at).await;
                 let Some(n) = me.upgrade() else { return };
                 let _ = n.refresh_members().await;
+                at = after(at, period);
             }
         });
         let me = Arc::downgrade(self);

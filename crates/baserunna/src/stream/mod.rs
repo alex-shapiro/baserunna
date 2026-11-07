@@ -23,7 +23,7 @@ pub use filter::Filter;
 pub const SPACE_CATALOG: u8 = 0x05;
 pub const SPACE_CONSUMERS: u8 = 0x08;
 pub const NAME_MAX: usize = 128;
-pub const READ_LIMIT_MAX: usize = 1000;
+pub const READ_LIMIT_MAX: usize = api::PAGE_MAX;
 pub const READ_BYTES_DEFAULT: usize = 4 << 20;
 pub const READ_BYTES_MAX: usize = 16 << 20;
 pub const SCAN_LIMIT_DEFAULT: usize = 10_000;
@@ -220,10 +220,7 @@ pub fn record(r: &Record, b: &Body, enc: api::Encoding) -> api::StreamRecord {
     };
     match b.json_value() {
         Some(v) => out.json = Some(v),
-        None => match enc.text(&b.data) {
-            (Some(t), _) => out.value = Some(t),
-            (None, _) => out.value_b64 = Some(b64::encode(&b.data)),
-        },
+        None => (out.value, out.value_b64) = enc.text(&b.data),
     }
     out
 }
@@ -453,10 +450,7 @@ impl ReadSpec {
             filter,
             scan_limit,
         } = r;
-        let filter = filter
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))?;
+        let filter = filter.map(crate::ops::parse).transpose()?;
         let spec = ReadSpec {
             from_seq,
             from_time,

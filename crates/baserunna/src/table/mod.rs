@@ -1023,11 +1023,7 @@ impl TryFrom<baserunna_api::Selection> for Selection {
 
     fn try_from(s: baserunna_api::Selection) -> Result<Selection> {
         let baserunna_api::Selection { index, eq, range, filter } = s;
-        let filter = filter
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))?;
-        Ok(Selection { index, eq, range, filter })
+        Ok(Selection { index, eq, range, filter: filter.map(crate::ops::parse).transpose()? })
     }
 }
 
@@ -1120,8 +1116,8 @@ fn access_path(s: &TableSchema, sel: &Selection) -> Result<AccessPath> {
 pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult> {
     let s = get_schema(txn, table).await?;
     let limit = q.limit.unwrap_or(100);
-    if limit == 0 || limit > 1000 {
-        return Err(Error::invalid("limit must be in 1..=1000"));
+    if limit == 0 || limit > api::PAGE_MAX {
+        return Err(Error::invalid(format!("limit must be in 1..={}", api::PAGE_MAX)));
     }
     let sel = Selection { index: q.index.clone(), eq: q.eq.clone(), range: q.range.clone(), filter: q.filter.clone() };
     let path = access_path(&s, &sel)?;

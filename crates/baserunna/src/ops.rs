@@ -194,7 +194,8 @@ pub struct StreamRead {
     pub spec: ReadSpec,
 }
 
-fn parse<T: serde::de::DeserializeOwned>(v: Json) -> Result<T> {
+/// Decodes a JSON value of a request body, failing with `invalid_argument` if it does not match `T`.
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(v: Json) -> Result<T> {
     serde_json::from_value(v).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))
 }
 

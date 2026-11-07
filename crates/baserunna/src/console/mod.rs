@@ -366,7 +366,7 @@ struct Pager {
 
 impl Pager {
     fn of(q: &Fields, param: &'static str) -> Pager {
-        let max = crate::meta::PAGE_MAX;
+        let max = baserunna_api::PAGE_MAX;
         let limit = q.get("limit").and_then(|l| l.parse().ok()).filter(|l| (1..=max).contains(l)).unwrap_or(PAGE);
         Pager { limit, param, cursor: q.get(param).filter(|c| !c.is_empty()).cloned() }
     }

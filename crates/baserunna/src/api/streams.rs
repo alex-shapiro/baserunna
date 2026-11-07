@@ -382,7 +382,7 @@ fn events(node: Arc<Node>, f: Follow, spec: ReadSpec, first: (ReadOut, u64)) -> 
                 Some(p) => p,
                 None => {
                     spec.limit =
-                        Some(left.map_or(stream::READ_LIMIT_MAX, |l| (l as usize).min(stream::READ_LIMIT_MAX)));
+                        Some(left.map_or(baserunna_api::PAGE_MAX, |l| (l as usize).min(baserunna_api::PAGE_MAX)));
                     match read_once(&db, c, &name, &spec).await {
                         Ok(r) => r,
                         Err(e) => {

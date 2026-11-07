@@ -163,8 +163,8 @@ fn paging() -> Vec<Value> {
     vec![
         query(
             "limit",
-            json!({"type": "integer", "minimum": 1, "maximum": crate::meta::PAGE_MAX}),
-            &format!("Page size (default {})", crate::meta::PAGE_DEFAULT),
+            json!({"type": "integer", "minimum": 1, "maximum": baserunna_api::PAGE_MAX}),
+            &format!("Page size (default {})", crate::ops::PAGE_DEFAULT),
         ),
         query("cursor", s(), "From a previous next_cursor"),
     ]
@@ -439,7 +439,7 @@ fn schemas() -> Value {
         "OpsRequest": obj(json!({"ops": arr(r("Op"))}), &["ops"]),
         "OpsResult": obj(json!({"results": arr(r("OpResult"))}), &["results"]),
         "Committed": obj(json!({"version": i(), "committed": b(), "commit_id": s(), "appends": arr(i()), "results": arr(r("OpResult"))}),
-            &["version", "commit_id"]),
+            &["version", "committed", "commit_id"]),
         "Metrics": obj(json!({"node": s(), "store": {"type": "object"}, "commits": {"type": "object"},
             "routes": {"type": "object"}, "lag": {"type": "object"}, "cpu": {"type": "object"}}),
             &["node", "store", "commits", "routes", "lag", "cpu"]),

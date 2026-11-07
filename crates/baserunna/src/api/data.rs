@@ -3,7 +3,7 @@
 use super::body::{BlobBody, Upload, parse_range, read_upload};
 use super::{
     Auth, DbCtx, Endpoints as _, Found, JsonBody, LONG_POLL_MAX_MS, Params, QueryOf, Ran, Reply, Req, consistency_from,
-    consistency_of, naming_commit, page_limit, paging, percent_decode, run_txn, watch, with_read, with_txn,
+    consistency_of, naming_commit, paging, percent_decode, run_txn, watch, with_read, with_txn,
 };
 use crate::engine::manifest::ObjKind;
 use crate::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn, Value, blob};
@@ -639,7 +639,7 @@ fn bad_commit_id() -> Error {
 
 fn feed_params(q: &Params) -> Result<(ChangeCursor, usize, Duration)> {
     let after = q.get("after").ok_or_else(|| Error::invalid("after is required (a version or a next_cursor)"))?;
-    let limit = q.get("limit").map(|l| l.parse().map_err(|_| limit_error())).transpose()?;
+    let limit = q.get("limit").map(|l| l.parse().map_err(|_| ops::limit_error())).transpose()?;
     let wait = q.get("wait_ms").map(|w| w.parse().map_err(|_| wait_error())).transpose()?;
     feed_args(after, limit, wait)
 }
@@ -647,19 +647,12 @@ fn feed_params(q: &Params) -> Result<(ChangeCursor, usize, Duration)> {
 /// Validates the cursor, page size, and wait time of a change-feed read.
 fn feed_args(after: &str, limit: Option<usize>, wait_ms: Option<u64>) -> Result<(ChangeCursor, usize, Duration)> {
     let after = ChangeCursor::decode(after).ok_or_else(|| Error::invalid("bad after"))?;
-    let limit = limit.unwrap_or(100);
-    if !(1..=ops::MAX_SCAN_LIMIT).contains(&limit) {
-        return Err(limit_error());
-    }
+    let limit = ops::page_limit(limit)?;
     let wait = wait_ms.unwrap_or(0);
     if wait > LONG_POLL_MAX_MS {
         return Err(wait_error());
     }
     Ok((after, limit, Duration::from_millis(wait)))
-}
-
-fn limit_error() -> Error {
-    Error::invalid(format!("limit must be in 1..={}", ops::MAX_SCAN_LIMIT))
 }
 
 fn wait_error() -> Error {
@@ -751,7 +744,7 @@ async fn list_tables(
     QueryOf(q): QueryOf<api::ListTablesQuery>,
     _: Req<api::ListTables>,
 ) -> Result<Reply<api::ListTables>> {
-    let limit = page_limit(q.limit)?;
+    let limit = ops::page_limit(q.limit)?;
     let (prefix, cursor) = (q.prefix.unwrap_or_default(), q.cursor.filter(|c| !c.is_empty()));
     let c = consistency_from(q.consistency, q.max_staleness_ms);
     let ((ts, next), v) = with_read!(ctx.db, c, |t| table::list_tables(t, &prefix, limit, cursor.as_deref()).await);

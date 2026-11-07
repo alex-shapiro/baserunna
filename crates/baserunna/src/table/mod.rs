@@ -1115,10 +1115,7 @@ fn access_path(s: &TableSchema, sel: &Selection) -> Result<AccessPath> {
 
 pub async fn query(txn: &mut Txn, table: &str, q: &Query) -> Result<QueryResult> {
     let s = get_schema(txn, table).await?;
-    let limit = q.limit.unwrap_or(100);
-    if limit == 0 || limit > api::PAGE_MAX {
-        return Err(Error::invalid(format!("limit must be in 1..={}", api::PAGE_MAX)));
-    }
+    let limit = crate::ops::page_limit(q.limit)?;
     let sel = Selection { index: q.index.clone(), eq: q.eq.clone(), range: q.range.clone(), filter: q.filter.clone() };
     let path = access_path(&s, &sel)?;
     let Some(mut range) = path.range.clone() else {

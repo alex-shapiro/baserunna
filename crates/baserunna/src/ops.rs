@@ -11,7 +11,6 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 pub const MAX_USER_KEY: usize = 4096;
-pub const MAX_SCAN_LIMIT: usize = api::PAGE_MAX;
 pub const MAX_TXN_OPS: usize = 10_000;
 pub const MAX_TTL_MS: u64 = 10 * 365 * 24 * 3_600_000;
 
@@ -194,6 +193,22 @@ pub struct StreamRead {
     pub spec: ReadSpec,
 }
 
+/// Number of items in a page if a request does not give a `limit`.
+pub const PAGE_DEFAULT: usize = 100;
+
+/// Validates a page size, defaulting to [`PAGE_DEFAULT`].
+pub fn page_limit(limit: Option<usize>) -> Result<usize> {
+    match limit {
+        None => Ok(PAGE_DEFAULT),
+        Some(l) if (1..=api::PAGE_MAX).contains(&l) => Ok(l),
+        Some(_) => Err(limit_error()),
+    }
+}
+
+pub fn limit_error() -> Error {
+    Error::invalid(format!("limit must be in 1..={}", api::PAGE_MAX))
+}
+
 /// Decodes a JSON value of a request body, failing with `invalid_argument` if it does not match `T`.
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(v: Json) -> Result<T> {
     serde_json::from_value(v).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))
@@ -237,9 +252,11 @@ impl TryFrom<api::Op> for Op {
                 cursor,
             },
             A::Append { stream, records, expect_seq, create } => Op::Append { stream, records, expect_seq, create },
-            A::ReadStream(r) => {
-                let (stream, spec) = ReadSpec::split(r)?;
-                Op::ReadStream(StreamRead { stream, spec })
+            A::ReadStream(mut r) => {
+                let stream = std::mem::take(&mut r.stream);
+                let mut spec = serde_json::to_value(r).expect("a read_stream serializes");
+                spec.as_object_mut().map(|o| o.remove("stream"));
+                Op::ReadStream(StreamRead { stream, spec: parse(spec)? })
             }
             A::StreamInfo { stream } => Op::StreamInfo { stream },
             A::TrimStream { stream, before_seq, before_time } => Op::TrimStream { stream, before_seq, before_time },
@@ -463,10 +480,7 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
             Ok(OpResult::Get(get_result(ctx, r).await?))
         }
         Op::Scan { prefix, start, end, limit, reverse, keys_only, cursor } => {
-            let limit = limit.unwrap_or(100);
-            if limit == 0 || limit > MAX_SCAN_LIMIT {
-                return Err(Error::invalid(format!("limit must be in 1..={MAX_SCAN_LIMIT}")));
-            }
+            let limit = page_limit(*limit)?;
             let mut range = user_range(enc, prefix.as_deref(), start.as_deref(), end.as_deref())?;
             if let Some(c) = cursor {
                 let ck = user_key(&b64::decode_url(c).ok_or_else(|| Error::invalid("bad cursor"))?)?;

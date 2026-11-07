@@ -23,7 +23,6 @@ pub use filter::Filter;
 pub const SPACE_CATALOG: u8 = 0x05;
 pub const SPACE_CONSUMERS: u8 = 0x08;
 pub const NAME_MAX: usize = 128;
-pub const READ_LIMIT_MAX: usize = api::PAGE_MAX;
 pub const READ_BYTES_DEFAULT: usize = 4 << 20;
 pub const READ_BYTES_MAX: usize = 16 << 20;
 pub const SCAN_LIMIT_DEFAULT: usize = 10_000;
@@ -434,39 +433,6 @@ pub struct ReadSpec {
 }
 
 impl ReadSpec {
-    /// Splits a `read_stream` operation into its stream name and read spec.
-    pub fn split(r: api::ReadStream) -> Result<(String, ReadSpec)> {
-        let api::ReadStream {
-            stream,
-            from_seq,
-            from_time,
-            tail,
-            consumer,
-            until_seq,
-            until_time,
-            reverse,
-            limit,
-            max_bytes,
-            filter,
-            scan_limit,
-        } = r;
-        let filter = filter.map(crate::ops::parse).transpose()?;
-        let spec = ReadSpec {
-            from_seq,
-            from_time,
-            tail,
-            consumer,
-            until_seq,
-            until_time,
-            reverse,
-            limit,
-            max_bytes,
-            filter,
-            scan_limit,
-        };
-        Ok((stream, spec))
-    }
-
     pub fn validate(&self) -> Result<()> {
         let starts = [self.from_seq.is_some(), self.from_time.is_some(), self.tail.is_some(), self.consumer.is_some()];
         if starts.iter().filter(|s| **s).count() > 1 {
@@ -475,9 +441,7 @@ impl ReadSpec {
         if self.until_seq.is_some() && self.until_time.is_some() {
             return Err(Error::invalid("give at most one of until_seq and until_time"));
         }
-        if self.limit.is_some_and(|l| !(1..=READ_LIMIT_MAX).contains(&l)) {
-            return Err(Error::invalid(format!("limit must be in 1..={READ_LIMIT_MAX}")));
-        }
+        crate::ops::page_limit(self.limit)?;
         if self.max_bytes.is_some_and(|b| !(1..=READ_BYTES_MAX).contains(&b)) {
             return Err(Error::invalid(format!("max_bytes must be in 1..={READ_BYTES_MAX}")));
         }

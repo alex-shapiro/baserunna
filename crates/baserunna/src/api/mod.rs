@@ -1103,7 +1103,7 @@ async fn limits(State(node): State<Arc<Node>>, _: Req<api::GetLimits>) -> Result
         txn_max_read_bytes: engine_cfg.txn_max_read_bytes as u64,
         txn_max_open_per_user: node.cfg.txns_per_user as u64,
         value_inline_max: engine_cfg.value_inline_max as u64,
-        scan_limit_max: crate::ops::MAX_SCAN_LIMIT as u64,
+        scan_limit_max: api::PAGE_MAX as u64,
         long_poll_max_ms: LONG_POLL_MAX_MS,
         json_value_max: node.cfg.json_value_max,
         json_body_max: node.cfg.max_json_body as u64,
@@ -1156,23 +1156,10 @@ pub(crate) use axum::extract::Query as QueryParams;
 
 pub(crate) type Params = QueryParams<std::collections::BTreeMap<String, String>>;
 
-/// Extracts `limit` (default [`PAGE_DEFAULT`](crate::meta::PAGE_DEFAULT), in `1..=PAGE_MAX`) and `cursor` query parameters.
+/// Extracts the `limit` and `cursor` query parameters of a listing.
 pub(crate) fn paging(q: &Params) -> Result<(usize, Option<String>)> {
-    let limit = q.get("limit").map(|l| l.parse().map_err(|_| limit_error())).transpose()?;
-    Ok((page_limit(limit)?, q.get("cursor").filter(|c| !c.is_empty()).cloned()))
-}
-
-/// Validates a listing page size, defaulting to `PAGE_DEFAULT`.
-pub(crate) fn page_limit(limit: Option<usize>) -> Result<usize> {
-    match limit {
-        None => Ok(crate::meta::PAGE_DEFAULT),
-        Some(l) if (1..=crate::meta::PAGE_MAX).contains(&l) => Ok(l),
-        Some(_) => Err(limit_error()),
-    }
-}
-
-fn limit_error() -> Error {
-    Error::invalid(format!("limit must be in 1..={}", crate::meta::PAGE_MAX))
+    let limit = q.get("limit").map(|l| l.parse().map_err(|_| crate::ops::limit_error())).transpose()?;
+    Ok((crate::ops::page_limit(limit)?, q.get("cursor").filter(|c| !c.is_empty()).cloned()))
 }
 
 /// Extracts `prefix`, `limit`, and `cursor` query parameters.

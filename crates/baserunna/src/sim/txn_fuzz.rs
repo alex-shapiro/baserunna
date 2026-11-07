@@ -1126,7 +1126,7 @@ impl World {
             }
             Op::Scan { prefix, start, end, limit, reverse, keys_only, cursor } => {
                 let limit = limit.unwrap_or(100);
-                if limit == 0 || limit > crate::ops::MAX_SCAN_LIMIT {
+                if limit == 0 || limit > baserunna_api::PAGE_MAX {
                     return Err(Fail::Invalid);
                 }
                 let mut range = user_range(enc, prefix, start, end)?;

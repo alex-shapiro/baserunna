@@ -1877,7 +1877,7 @@ mod tests {
             let limits = world.json(0, "GET", "/v1/limits", "", serde_json::Value::Null).await;
             assert_eq!(limits["long_poll_max_ms"], crate::api::LONG_POLL_MAX_MS, "{limits}");
             assert_eq!(limits["txn_max_ops"], crate::ops::MAX_TXN_OPS);
-            assert_eq!(limits["scan_limit_max"], crate::ops::MAX_SCAN_LIMIT);
+            assert_eq!(limits["scan_limit_max"], baserunna_api::PAGE_MAX);
             assert_eq!(limits["value_inline_max"], node.engine.shared.cfg.value_inline_max);
             assert_eq!(limits["txn_max_write_bytes"], node.engine.shared.cfg.txn_max_write_bytes);
             assert_eq!(limits["txn_max_read_bytes"], node.engine.shared.cfg.txn_max_read_bytes);

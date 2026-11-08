@@ -4,15 +4,17 @@
 Starts MinIO and N baserunna processes, runs concurrent list-append
 transactions against random nodes while a nemesis kills, pauses, and
 partitions nodes and the object store, then heals the cluster, reads every
-key, and writes the history in EDN for Elle.
+key, writes the history in EDN, and checks it with the `elle_check` example
+(build it first). The run fails if the history is invalid or a client saw an
+unexpected response. Elle can check the same file.
 
 Each node reaches MinIO through its own TCP proxy, and peers forward to a node
 through another proxy, so the nemesis can cut a node off from storage or from
 its peers. A proxy in "drop" mode accepts connections and discards their bytes,
 so requests time out instead of failing fast.
 
+    cargo build --release -p baserunna --bin baserunna --example elle_check
     scripts/jepsen/run.py --minutes 10 --out runs/1
-    cargo run --release --example elle_check -- runs/1/history.edn
     java -jar elle-cli.jar -m list-append -f edn -c strict-serializable runs/1/history.edn
 """
 
@@ -500,32 +502,6 @@ def final_reads(w, ports, token):
     return finals
 
 
-def check(events, finals):
-    """Checks properties that need no dependency graph; Elle checks the rest."""
-    appended, problems = {}, []
-    for kind, _, _, mops in events:
-        if kind == "invoke":
-            for m in mops:
-                if m[0] == "append":
-                    appended[m[2]] = m[1]
-    for k, l in finals.items():
-        if len(set(l)) != len(l):
-            problems.append(f"key {k} has duplicates: {l}")
-        for v in l:
-            if appended.get(v) != k:
-                problems.append(f"key {k} holds {v}, never appended to it")
-    for kind, p, _, mops in events:
-        for m in mops:
-            fin = finals.get(m[1], [])
-            if kind == "ok" and m[0] == "r" and m[2] is not None and fin[:len(m[2])] != m[2]:
-                problems.append(f"process {p} read key {m[1]} as {m[2]}, not a prefix of final {fin}")
-            if kind == "ok" and m[0] == "append" and m[2] not in fin:
-                problems.append(f"process {p} committed append {m[2]} to key {m[1]}, missing from final {fin}")
-            if kind == "fail" and m[0] == "append" and m[2] in fin:
-                problems.append(f"process {p} failed append {m[2]} to key {m[1]}, present in final {fin}")
-    return problems
-
-
 def edn(events):
     out = []
     for i, (kind, p, t, mops) in enumerate(events):
@@ -554,6 +530,7 @@ def main():
     ap.add_argument("--seed", type=int, default=int(time.time()))
     ap.add_argument("--no-nemesis", action="store_true")
     ap.add_argument("--binary", default=os.path.join(ROOT, "target/release/baserunna"))
+    ap.add_argument("--elle-check", default=os.path.join(ROOT, "target/release/examples/elle_check"))
     ap.add_argument("--minio", default=shutil.which("minio") or "minio")
     ap.add_argument("--mc", default=shutil.which("mc") or "mc")
     args = ap.parse_args()
@@ -586,16 +563,19 @@ def main():
         cluster.heal()
         time.sleep(3 * args.lease_ms / 1000 + 5)
         finals = final_reads(w, ports, token)
-        with open(os.path.join(args.out, "history.edn"), "w") as f:
+        history = os.path.join(args.out, "history.edn")
+        with open(history, "w") as f:
             f.write(edn(w.events))
         counts = {}
         for e in w.events:
             counts[e[0]] = counts.get(e[0], 0) + 1
-        problems = check(w.events, finals)
+        verdict = subprocess.run([args.elle_check, history], capture_output=True, text=True)
+        problems = [] if verdict.returncode == 0 else [(verdict.stdout + verdict.stderr).strip()]
+        problems += errors
         summary = {"counts": counts, "keys": len(finals), "client_errors": errors[:20], "problems": problems[:50]}
         with open(os.path.join(args.out, "summary.json"), "w") as f:
             json.dump(summary, f, indent=1)
-        cluster.note(json.dumps({"counts": counts, "problems": len(problems), "client_errors": len(errors)}))
+        cluster.note(json.dumps({"counts": counts, "problems": len(problems), "verdict": verdict.stdout.strip()[-300:]}))
         return 1 if problems else 0
     finally:
         cluster.stop()

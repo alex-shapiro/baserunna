@@ -6,8 +6,8 @@ deterministic simulation, Jepsen's Elle checker, a real-cluster fault-injection
 harness on MinIO, and targeted code audits. We also compared Baserunna against
 the pathology classes in Jepsen's analysis of ParticleDB 1.1.4.
 
-Every test history satisfied strict serializability across 1.24 million
-real-cluster transactions and more than 120,000 simulated runs. However, the
+Every test history satisfied strict serializability across 1.6 million
+real-cluster transactions and more than 135,000 simulated runs. However, the
 audits and real-cluster tests exposed six bugs and documentation gaps:
 
 - If a database's manifest object was missing, Baserunna created an empty
@@ -246,6 +246,8 @@ The simulation campaigns ran as follows:
 - `elle` seeds 1000–2999 after each of three checker updates: 0 failures.
 - `campaign all` on the final code for 20 minutes across 4 threads: 28,029 runs
   (about 57 simulated days), 0 failures.
+- Guided exploration (`explore all`) on the final code for 30 minutes: 9,388
+  runs, 4,713 of them branched from rare probes, 0 failures.
 
 Three 60-to-90-minute campaigns ran concurrently with large real-cluster tests
 and were terminated by the OS (`SIGKILL`, exit code 137) under memory pressure.
@@ -272,9 +274,11 @@ The five real-cluster runs on MinIO tested three binary revisions:
 | r3 | fixed | 3 | 1 s | 30 | 182 | 268,679 | 613 | valid |
 | r4 | fixed | 5 | 5 s | 60 | 354 | 465,539 | 3,379 | valid |
 | r5 | final | 3 | 1 s | 40 | 228 | 328,164 | 1,502 | valid |
+| r6 | `07a7f79` | 5 | 1 s | 40 | 237 | 370,842 | 933 | valid |
 
-In the table, `ok` is the number of committed transactions, and `info` is the
-number of transactions with an unknown outcome. Both `elle_check` and
+In the table, `ok` is the number of successful transactions, including
+read-only ones, and `info` is the number of transactions with an unknown
+outcome. Both `elle_check` and
 `elle-cli` accepted every history. Run r3 used 30 clients across 4 active keys
 with a 1 s lease so that process pauses frequently exceeded the lease duration.
 Appendix A lists the exact command and seed for each run.
@@ -661,6 +665,9 @@ macOS machine with MinIO `2025-10-15`. Both `elle_check` (`3514ff1`) and
   coincided with injected storage faults, and the supervisor restarted them.
 - **r5:** `--minutes 40 --seed 5 --lease-ms 1000 --clients 12 --active-keys 6`,
   binary `cd30b18`. 0 client errors.
+- **r6:** `--minutes 40 --seed 6 --nodes 5 --lease-ms 1000 --clients 15
+  --active-keys 5`, binary `07a7f79`, which has every fix. 0 client errors,
+  and the harness ran `elle_check` itself and exited with status 0.
 
 The bug-zoo comparisons used commits `7ab104b` and `cd30b18`:
 

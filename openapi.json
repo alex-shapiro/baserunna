@@ -1,5 +1,8 @@
-wrote /Users/alex/projects/baserunna/crates/baserunna/../../openapi.json
-: {
+{
+  "components": {
+    "responses": {
+      "Error": {
+        "content": {
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/Error"

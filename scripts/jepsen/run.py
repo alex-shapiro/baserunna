@@ -534,6 +534,9 @@ def main():
     ap.add_argument("--minio", default=shutil.which("minio") or "minio")
     ap.add_argument("--mc", default=shutil.which("mc") or "mc")
     args = ap.parse_args()
+    for tool in (args.binary, args.elle_check):
+        if not os.access(tool, os.X_OK):
+            sys.exit(f"{tool} is missing: cargo build --release -p baserunna --bin baserunna --example elle_check")
     os.makedirs(args.out, exist_ok=True)
     rng = random.Random(args.seed)
     cluster = Cluster(args)

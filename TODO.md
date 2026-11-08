@@ -206,6 +206,13 @@ correct S3 store, but each one turns a store fault into silent wrong data.
       retries exhausted) mark every commit of the batch unknown once an
       ambiguous write happened, even a commit that no ambiguous write
       included. This is safe but loses definite answers.
+- [ ] **Forget an unsent interactive commit with a guard.** `commit_txn` must
+      call `forget_commit` on each exit path before the commit is sent, and a
+      client that disconnects during its ops keeps the record. Return a guard
+      from `take_for_commit` that forgets on drop unless the commit was sent.
+- [ ] **Restart nodes that start during a store outage.** A node that cannot
+      reach the store at start-up fails its conditional-write check and
+      exits, so it needs a process supervisor. Retry the check with backoff.
 - [ ] **Show `outcome: "unknown"` in the console.** The console shows only the
       error message, so a write that may have been applied looks failed.
 - [ ] **Return the outcome of a repaired database deletion.** A retried

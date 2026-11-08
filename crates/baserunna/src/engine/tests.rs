@@ -844,8 +844,7 @@ fn a_rejection_after_an_ambiguous_write_is_not_definite() {
         let env = Arc::new(Env::sim(9, 1_700_000_000_000, Instant::now(), 0));
         let clock = env.clone();
         let mem = Arc::new(MemStore::new(Box::new(move || clock.now_ms())));
-        let store =
-            Arc::new(LateStore { mem, late_manifest_puts: 0.into(), timeout_ms: 3_000, land_after_ms: 3_500 });
+        let store = Arc::new(LateStore { mem, late_manifest_puts: 0.into(), timeout_ms: 3_000, land_after_ms: 3_500 });
         let cfg = EngineConfig { manifest_put_hedge_ms: 0, ..EngineConfig::small_for_tests() };
         let ttl = cfg.blob_stage_ttl_ms;
         let eng = Engine::new(store.clone(), env, cfg, "a".into());
@@ -860,6 +859,20 @@ fn a_rejection_after_an_ambiguous_write_is_not_definite() {
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(strong_get(&db, "k").await.is_some(), "the late write did not land");
         assert!(matches!(r, Err(Error::Unavailable { outcome_unknown: true, .. })), "applied, but answered {r:?}");
+    });
+}
+
+#[test]
+fn a_commit_whose_lost_reply_landed_is_not_a_replay() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        t.put(Bytes::from_static(b"k"), inline("v")).unwrap();
+        store.manifest_put_lost.store(1, SeqCst);
+        let c = db.commit_detailed(t.into_request()).await.unwrap();
+        assert!(!c.replayed, "the request's own commit was reported as a replay of an earlier one");
+        assert_eq!(strong_get(&db, "k").await, Some(inline("v")));
     });
 }
 

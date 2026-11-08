@@ -6,7 +6,7 @@ Bring this branch to a shippable state. You own every subsystem that the branch 
 
 Review at three levels, in this order of importance:
 
-1. **Product:** what host developers and script authors can do, and what can surprise them.
+1. **Product:** what application developers and operators can do, and what can surprise them.
 2. **System design:** how the parts fit together.
 3. **Code:** how readable and how small the code is.
 

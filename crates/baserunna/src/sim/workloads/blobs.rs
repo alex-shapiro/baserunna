@@ -248,8 +248,11 @@ async fn stage_and_bind(
         };
         let (path, body) = bind(&staged)?;
         let r = c.call_settled("POST", &path, Some(body)).await;
-        if !(r.status == 400 && r.json["error"]["message"].as_str().is_some_and(|m| m.contains("staged blob expired")))
-        {
+        let expired =
+            r.status == 400 && r.json["error"]["message"].as_str().is_some_and(|m| m.contains("staged blob expired"));
+        // An attempt whose response was lost failed, such as on an expired blob, and fenced its key.
+        let fenced = r.status == 409 && r.code() == "aborted";
+        if !expired && !fenced {
             return Ok(r);
         }
     }

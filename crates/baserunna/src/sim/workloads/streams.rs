@@ -82,6 +82,7 @@ async fn settle_call(
     body: Bytes,
     key: &str,
 ) -> Result<Settled, String> {
+    let base = key;
     let (mut key, mut headers, mut body) = (key.to_string(), headers.to_vec(), body);
     let mut first = c.sim.now_ms();
     for attempt in 0..200 {
@@ -110,7 +111,7 @@ async fn settle_call(
                 Status::NotCommitted => {}
             }
         }
-        let fresh = format!("{key}.{attempt}");
+        let fresh = format!("{base}.{attempt}");
         for (_, v) in headers.iter_mut().filter(|(h, _)| *h == "idempotency-key") {
             *v = fresh.clone();
         }

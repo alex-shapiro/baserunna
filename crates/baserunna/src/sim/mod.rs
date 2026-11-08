@@ -702,7 +702,7 @@ impl Sim {
         if let Some(n) = n {
             self.crashes.fetch_add(1, Ordering::SeqCst);
             self.trace.event(&format!("crash n{i} ({})", n.node.id));
-            n.node.env.shutdown();
+            n.node.stop();
         }
     }
 
@@ -868,7 +868,7 @@ impl Sim {
         for i in 0..self.slots.len() {
             let n = self.slots[i].lock().take();
             if let Some(n) = n {
-                n.node.env.shutdown();
+                n.node.stop();
             }
         }
     }

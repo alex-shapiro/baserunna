@@ -361,7 +361,7 @@ impl World {
 
     pub fn shutdown(&self) {
         for n in &self.nodes {
-            n.env.shutdown();
+            n.stop();
         }
     }
 }

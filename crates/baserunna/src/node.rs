@@ -301,7 +301,8 @@ pub struct Node {
     cluster_key: Mutex<Option<String>>,
     pub forwards: cluster::ForwardDedup,
     pub started_ms: u64,
-    router: OnceLock<axum::Router>,
+    /// The node's HTTP router, which holds the node: [`Node::stop`] drops it to free the node.
+    router: Mutex<Option<axum::Router>>,
     pub limiter: Limiter,
     pub metrics: crate::metrics::ServerMetrics,
     hash_slots: tokio::sync::Semaphore,
@@ -354,7 +355,7 @@ impl Node {
             cookie_key: Mutex::new(Vec::new()),
             cluster_key: Mutex::new(None),
             forwards: cluster::ForwardDedup::new(Duration::from_secs(60)),
-            router: OnceLock::new(),
+            router: Mutex::new(None),
             limiter: Limiter::default(),
             metrics: Default::default(),
             hash_slots: tokio::sync::Semaphore::new(cfg.limits.hash_concurrency.max(1)),
@@ -563,12 +564,19 @@ impl Node {
     }
 
     pub fn set_router(&self, r: axum::Router) {
-        let _ = self.router.set(r);
+        *self.router.lock() = Some(r);
     }
 
-    /// Returns the node's HTTP router.
+    /// Returns the node's HTTP router, or `None` before it is set or after [`Node::stop`].
     pub fn router(&self) -> Option<axum::Router> {
-        self.router.get().cloned()
+        self.router.lock().clone()
+    }
+
+    /// Stops the node at once: aborts its background tasks and drops its router, so that the node
+    /// is freed once its callers drop it. [`Node::shutdown`] first leaves the cluster gracefully.
+    pub fn stop(&self) {
+        self.env.shutdown();
+        self.router.lock().take();
     }
 
     /// Returns the shared cluster secret for internal endpoints.
@@ -603,7 +611,7 @@ impl Node {
         let leave = self.run_meta(MetaCmd::Leave { id: self.id.clone() });
         let _ = tokio::time::timeout(Duration::from_secs(2), leave).await;
         let released = self.engine.release_leases(Duration::from_secs(2)).await;
-        self.env.shutdown();
+        self.stop();
         released
     }
 
@@ -1654,6 +1662,28 @@ mod tests {
     use crate::sim::cost::{World, run_paused};
     use bytes::Bytes;
     use std::time::Duration;
+
+    /// A node's router holds the node, so a node that kept its router after stopping would never be
+    /// freed, and each simulation run would leak its nodes.
+    #[test]
+    fn a_stopped_node_is_freed() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            use super::{Env, Node, NodeConfig, Services};
+            use std::sync::Arc;
+            let store = Arc::new(crate::store::MemStore::with_system_clock());
+            let cfg = NodeConfig { pbkdf2_iterations: 1000, ..NodeConfig::default() };
+            let node = Node::start(cfg, Arc::new(Env::real()), store, Services::local()).await.unwrap();
+            drop(crate::api::router(node.clone()));
+            let freed = Arc::downgrade(&node);
+            node.stop();
+            drop(node);
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert!(freed.upgrade().is_none(), "a stopped node is still referenced");
+        });
+    }
 
     #[test]
     fn password_hashing_is_bounded() {

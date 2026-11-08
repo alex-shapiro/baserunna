@@ -156,7 +156,9 @@ async fn permissions(sim: &Arc<Sim>, owner: &User, u: &User, other: &User) -> Re
             let want = if role == Some(Role::Owner) { 201 } else { 403 };
             expect(r.status == want || (ambiguous && r.status == 409), format!("{tag}: add an owner {}", r.status))?;
             set_role(&owner.c, "acme", other, None).await?;
-            let r = u.c.call_retry("POST", &member(owner), Some(json!({"role": "reader"}))).await;
+            // A demotion that is retried before its lost attempt times out can land after the
+            // restore below, so wait out lost attempts.
+            let r = u.c.call_settled("POST", &member(owner), Some(json!({"role": "reader"}))).await;
             let want = if role == Some(Role::Owner) { 200 } else { 403 };
             expect(r.status == want, format!("{tag}: demote the owner {}", r.status))?;
             if role == Some(Role::Owner) {

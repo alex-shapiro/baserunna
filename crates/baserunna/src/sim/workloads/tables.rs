@@ -104,14 +104,19 @@ pub async fn check_all_indexes(sim: &Arc<Sim>, db_id: &str) -> Result<(), String
     let n = sim.up_nodes().first().copied().ok_or("all nodes are down")?;
     let node = sim.node(n).ok_or("node is down")?.node.clone();
     let db = node.engine.db(db_id);
-    let mut t = crate::node::retry_unavailable(|| db.begin(Isolation::Serializable, Consistency::Strong))
-        .await
-        .map_err(|e| e.to_string())?;
-    let tables = crate::table::all_tables(&mut t).await.map_err(|e| e.to_string())?;
-    for s in tables {
-        crate::table::check_indexes(&mut t, &s.name).await.map_err(|e| format!("table {}: {e}", s.name))?;
-    }
-    crate::table::check_no_orphans(&mut t).await.map_err(|e| e.to_string())
+    // Injected storage faults are still active, so retry reads that fail on them.
+    crate::node::retry_unavailable(|| async {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await?;
+        for s in crate::table::all_tables(&mut t).await? {
+            crate::table::check_indexes(&mut t, &s.name).await.map_err(|e| match e.retryable() {
+                true => e,
+                false => crate::error::Error::internal(format!("table {}: {e}", s.name)),
+            })?;
+        }
+        crate::table::check_no_orphans(&mut t).await
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) -> Result<(), String> {

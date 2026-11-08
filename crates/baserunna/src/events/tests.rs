@@ -3280,6 +3280,12 @@ mod maintenance_robustness {
             let (_, refs) = schema_and_refs(&db).await;
             assert_eq!(refs.len(), 1, "maintenance dropped a part within retention");
             let q = json!({"from": 0, "to": T0 * 2, "aggregates": {"n": {"fn": "count"}}});
+            let r = query(&db, &q).await;
+            assert!(
+                matches!(r, Err(crate::error::Error::Unavailable { .. })),
+                "a query without a store clock neither hides retained events nor returns expired ones: {r:?}"
+            );
+            store.fail.store(false, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(query(&db, &q).await.unwrap().rows, vec![vec![json!(1)]], "a query hid a retained event");
         });
     }

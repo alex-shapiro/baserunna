@@ -23,7 +23,7 @@ impl Server {
 
     /// Abruptly stops the server without releasing leases.
     pub fn kill(self) {
-        self.node.env.shutdown();
+        self.node.stop();
         self.task.abort();
     }
 }

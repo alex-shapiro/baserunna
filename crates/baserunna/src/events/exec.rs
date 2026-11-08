@@ -1938,7 +1938,11 @@ async fn run_within(
     };
     let by_time = ByTime::of(&kind, &time);
     let past = by_time.and(cursor_at(&kind));
-    let mut from = shared.store_now_ms().map_or(q.from, |now| q.from.max(s.retained_from(now as i64)));
+    // Without a store clock, expired events cannot be told apart from retained ones.
+    let mut from = match s.retention_ms {
+        Some(_) => q.from.max(s.retained_from(shared.store_time_ms().await? as i64)),
+        None => q.from,
+    };
     let mut to = q.to;
     if let (Some(by), Some((t, _))) = (by_time, past) {
         if by.desc {

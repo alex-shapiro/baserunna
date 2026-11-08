@@ -168,5 +168,5 @@ async fn bench(threads: usize) {
     println!("  store requests   {:.3} per op", reqs / lat.len().max(1) as f64);
     println!("  open handles     {}", node.engine.open_count());
     println!("  cache            {} bytes in {} entries", cache.bytes, cache.entries);
-    node.env.shutdown();
+    node.stop();
 }

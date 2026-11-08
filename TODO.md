@@ -25,16 +25,26 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       fail repeatedly with `503 request deadline exceeded`
       (`sim_tool trace streams 2601188`, and the checker reads of `streams` seeds
       9102146, 9107143 and 11000150).
-- [ ] **Fix `history` seed 9527230: a read is serialized before a version that
-      finished before it began.** A strong read returns version 16 although
-      version 17 committed before the read started, violating strict
-      serializability; the seed fails the same way on `main`
-      (`sim_tool trace history 9527230`).
-- [ ] **Fix `accounts` seed 9506242: a re-enabled account stays disabled.** An
-      admin `disable` request with an unknown outcome is retried and succeeds,
-      the account is re-enabled, and a fresh session then gets `401`,
-      consistent with the first `disable` applying after the re-enable
-      (`sim_tool trace accounts 9506242`).
+- [ ] **Stop the lease holder serving its cache while its manifest write may
+      have landed.** While a lease holder's manifest `PUT` is unacknowledged,
+      the write may already be visible in storage, and other nodes then serve
+      the new version, but the lease holder keeps serving its cached older
+      version to strong and bounded-staleness reads as if it were current. A
+      client can then read a version and a later client the version before it,
+      which violates strict serializability. Reads on the lease holder should
+      validate the manifest from storage while any manifest `PUT` is in flight,
+      as they already do after a rejected duplicate `PUT`
+      (`sim_tool trace history 25000443`, and `history` seed 9527230 on
+      `main`).
+- [ ] **Let the console workload tolerate transient form failures.** A
+      password change through `/console/account/password` can fail with
+      `request deadline exceeded` under storage stalls, and the workload
+      treats any error redirect as a failure (`sim_tool trace console
+      24010902`).
+- [ ] **Fix `accounts`: a session stops working after its account is disabled
+      and re-enabled.** Seen on this branch in `accounts` seed 9506242 and
+      `mix` seed 26006111; both pass on `main`, and the cause is not yet known,
+      so the branch is not ruled out (`sim_tool trace mix 26006111`).
 - [ ] **Run garbage collection sweeps even if the lease duration is short.** A
       post-commit sweep skips execution if the lease expires while reading the
       store clock and refreshing the manifest, leaving the database unswept

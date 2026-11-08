@@ -1529,7 +1529,7 @@ Every 20 ms of virtual time, global oracles verify that at most 1 node relies on
 - **Mutation testing** (`scripts/mutants.sh`): runs `cargo-mutants` against the storage engine, table layer, transaction operations, and simulation checkers.
 - **Object-store conformance** (`store::conformance`, `crates/baserunna/tests/store_conformance.rs`): Verifies the object-store contract using 2 independent clients of the same store: conditional writes (including 16-writer races), cross-client visibility, etag uniqueness, byte ranges, pagination, store-clock coherence, and randomized model checking against `MemStore`. Runs against `MemStore`, `FsStore`, `CloudStore` backed by a fault-injecting in-process S3 server, and a live S3 store if `BASERUNNA_TEST_STORE` is set. Also verifies that each check detects synthetic contract violations, and that nodes run conditional-write preflight checks before serving.
 - **Failover check** (`crates/baserunna/examples/cluster_check.rs`): Runs multiple nodes against a shared store while killing and restarting nodes at random. Concurrent clients execute counter increments with idempotency keys and bank transfers with commit IDs, verifying that all committed writes are durable, strong reads match settled writes, and total account balances are conserved.
-- **Real-cluster test** (`scripts/jepsen/run.py`): Runs MinIO and several `baserunna` processes with the `elle` workload over real HTTP. A nemesis kills (`SIGKILL`) and pauses (`SIGSTOP`) nodes and MinIO, and cuts nodes off from storage or from their peers through TCP proxies. After it heals the cluster, it reads every key and writes the history in EDN for Elle.
+- **Real-cluster test** (`scripts/jepsen/run.py`): Runs MinIO and several `baserunna` processes with the `elle` workload over real HTTP. A nemesis kills (`SIGKILL`) and pauses (`SIGSTOP`) nodes and MinIO, and cuts nodes off from storage or from their peers through TCP proxies. After it heals the cluster, it reads every key and writes the history in EDN, which `elle_check` (the checks of the `elle` workload) and Elle can verify.
 - **Memory bound** (`crates/baserunna/tests/memory_bound.rs`): Uses a counting global allocator to verify that memory charges cover actual heap allocations for decoded manifests and that opening hundreds of databases with retained handles stays within the configured memory budget.
 - **Cost model** (`sim::cost`, `crates/baserunna/tests/cost.rs`): measures object-store `GET`, `PUT`, `HEAD`, and `LIST` request counts per operation in virtual time and enforces per-operation and monthly workload cost budgets:
 
@@ -1657,6 +1657,7 @@ Tools:
 - `amplification` the write, space and read amplification of compaction and of streams
 - `commit_latency` measures commit and object-store request latency across manifest tail limits
 - `gen_openapi` regenerates `openapi.json`
+- `elle_check` checks EDN list-append histories, such as those of `scripts/jepsen/run.py`, with the checks of the `elle` workload
 
 ## 15. Known limitations (v1)
 

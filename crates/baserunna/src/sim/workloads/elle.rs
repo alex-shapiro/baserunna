@@ -506,10 +506,14 @@ fn check_cycles(events: &[Event], finals: &BTreeMap<u64, Vec<u64>>) -> Result<()
             }
         }
     }
-    let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); nodes.len()];
+    // Real-time order goes through a chain of time nodes after the transactions: a completion
+    // starts a new time node, and an invocation follows the latest one. So a path leads from
+    // transaction a to transaction b exactly if a completed before b began.
+    let completions = nodes.iter().filter(|n| n.completed.is_some()).count();
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); nodes.len() + completions];
     let mut edge = |a: usize, b: usize| {
         if a != b {
-            edges[a].insert(b);
+            edges[a].push(b);
         }
     };
     for list in finals.values() {
@@ -534,27 +538,42 @@ fn check_cycles(events: &[Event], finals: &BTreeMap<u64, Vec<u64>>) -> Result<()
             }
         }
     }
-    // Real-time edges: from each transaction to those invoked after it completed.
-    let mut by_invoke: Vec<usize> = (0..nodes.len()).collect();
-    by_invoke.sort_by_key(|n| nodes[*n].invoked);
-    for (a, node) in nodes.iter().enumerate() {
-        let Some(done) = node.completed else { continue };
-        let first = by_invoke.partition_point(|n| nodes[*n].invoked < done);
-        for b in &by_invoke[first..] {
-            edge(a, *b);
+    let mut order: Vec<(usize, bool, usize)> = Vec::new();
+    for (n, node) in nodes.iter().enumerate() {
+        order.push((node.invoked, false, n));
+        if let Some(done) = node.completed {
+            order.push((done, true, n));
+        }
+    }
+    order.sort();
+    let mut time: Option<usize> = None;
+    let mut next_time = nodes.len();
+    for (_, completion, n) in order {
+        match (completion, time) {
+            (true, prev) => {
+                edge(n, next_time);
+                if let Some(t) = prev {
+                    edge(t, next_time);
+                }
+                time = Some(next_time);
+                next_time += 1;
+            }
+            (false, Some(t)) => edge(t, n),
+            (false, None) => {}
         }
     }
     match find_cycle(&edges) {
         None => Ok(()),
         Some(cycle) => {
-            let steps: Vec<String> = cycle.iter().map(|n| format!("{:?}", nodes[*n].mops)).collect();
+            let steps: Vec<String> =
+                cycle.iter().filter(|n| **n < nodes.len()).map(|n| format!("{:?}", nodes[*n].mops)).collect();
             Err(format!("dependency cycle among committed transactions: {}", steps.join(" -> ")))
         }
     }
 }
 
 /// Returns the nodes of a cycle in the directed graph `edges`, if there is one.
-fn find_cycle(edges: &[BTreeSet<usize>]) -> Option<Vec<usize>> {
+fn find_cycle(edges: &[Vec<usize>]) -> Option<Vec<usize>> {
     #[derive(Clone, Copy, PartialEq)]
     enum Mark {
         New,
@@ -566,7 +585,7 @@ fn find_cycle(edges: &[BTreeSet<usize>]) -> Option<Vec<usize>> {
         if mark[start] != Mark::New {
             continue;
         }
-        let mut path: Vec<(usize, std::collections::btree_set::Iter<usize>)> = vec![(start, edges[start].iter())];
+        let mut path: Vec<(usize, std::slice::Iter<usize>)> = vec![(start, edges[start].iter())];
         mark[start] = Mark::OnPath;
         while let Some((n, next)) = path.last_mut() {
             match next.next() {
@@ -592,6 +611,54 @@ fn find_cycle(edges: &[BTreeSet<usize>]) -> Option<Vec<usize>> {
 /// Returns the position of `v` in the final value of `key`.
 fn fin_pos(finals: &BTreeMap<u64, Vec<u64>>, key: u64, v: u64) -> Option<usize> {
     finals.get(&key)?.iter().position(|x| *x == v)
+}
+
+/// Checks an EDN history in the format of [`edn`], such as one that `scripts/jepsen/run.py`
+/// writes, with the checks of a simulation run. Final reads are the transactions of processes at
+/// or above 1,000,000.
+pub fn check_edn(text: &str) -> Result<usize, String> {
+    let events: Vec<Event> =
+        text.lines().filter(|l| !l.trim().is_empty()).map(parse_edn_event).collect::<Result<_, _>>()?;
+    let mut finals = BTreeMap::new();
+    for e in events.iter().filter(|e| e.kind == Kind::Ok && e.process >= FINAL_PROCESS) {
+        for m in &e.mops {
+            if let Mop::Read(k, l) = m {
+                finals.insert(*k, l.clone().unwrap_or_default());
+            }
+        }
+    }
+    check(&events, &finals)?;
+    check_cycles(&events, &finals)?;
+    Ok(events.len())
+}
+
+fn parse_edn_event(line: &str) -> Result<Event, String> {
+    let bad = || format!("malformed history line: {line}");
+    let field = |name: &str| -> Option<&str> {
+        let rest = &line[line.find(name)? + name.len()..];
+        Some(rest[..rest.find([',', '}'])?].trim())
+    };
+    let kind = match field(":type").ok_or_else(bad)? {
+        ":invoke" => Kind::Invoke,
+        ":ok" => Kind::Ok,
+        ":fail" => Kind::Fail,
+        ":info" => Kind::Info,
+        _ => return Err(bad()),
+    };
+    let process = field(":process").and_then(|p| p.parse().ok()).ok_or_else(bad)?;
+    let value = &line[line.find(":value [").ok_or_else(bad)? + ":value [".len()..];
+    let mut mops = Vec::new();
+    for part in value.split("[:").skip(1) {
+        let words: Vec<&str> = part.split([' ', '[', ']']).filter(|w| !w.is_empty() && *w != "}").collect();
+        let num = |w: &str| w.parse::<u64>().map_err(|_| bad());
+        mops.push(match words.as_slice() {
+            ["append", k, v] => Mop::Append(num(k)?, num(v)?),
+            ["r", k, "nil"] => Mop::Read(num(k)?, None),
+            ["r", k, list @ ..] => Mop::Read(num(k)?, Some(list.iter().map(|w| num(w)).collect::<Result<_, _>>()?)),
+            _ => return Err(bad()),
+        });
+    }
+    Ok(Event { kind, process, time_ms: 0, mops })
 }
 
 /// Formats `events` as an EDN history for Elle's list-append checker.
@@ -756,6 +823,20 @@ mod tests {
         ];
         check_cycles(&order, &[(4, vec![1, 2])].into()).unwrap();
         assert!(check_cycles(&order, &[(4, vec![2, 1])].into()).unwrap_err().contains("dependency cycle"));
+    }
+
+    #[test]
+    fn checks_edn_histories() {
+        let h = edn(&[
+            ev(Kind::Invoke, vec![Mop::Append(3, 4)]),
+            ev(Kind::Ok, vec![Mop::Append(3, 4)]),
+            Event { kind: Kind::Invoke, process: FINAL_PROCESS, time_ms: 0, mops: vec![Mop::Read(3, None)] },
+            Event { kind: Kind::Ok, process: FINAL_PROCESS, time_ms: 0, mops: vec![Mop::Read(3, Some(vec![4]))] },
+        ]);
+        assert_eq!(check_edn(&h), Ok(4));
+        let lost = h.replace("[:r 3 [4]]", "[:r 3 []]");
+        assert!(check_edn(&lost).unwrap_err().contains("lacks it"));
+        assert!(check_edn("{:index 0, :type :ok}").unwrap_err().contains("malformed"));
     }
 
     #[test]

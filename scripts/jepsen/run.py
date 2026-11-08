@@ -12,6 +12,7 @@ its peers. A proxy in "drop" mode accepts connections and discards their bytes,
 so requests time out instead of failing fast.
 
     scripts/jepsen/run.py --minutes 10 --out runs/1
+    cargo run --release --example elle_check -- runs/1/history.edn
     java -jar elle-cli.jar -m list-append -f edn -c strict-serializable runs/1/history.edn
 """
 

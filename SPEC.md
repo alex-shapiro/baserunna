@@ -12,7 +12,7 @@ scope for v1.
 1. **Safety**
 
 - Commited data is never lost or reordered.
-- Transactions are strictly serializable.
+- Transactions are strictly serializable by default. Snapshot isolation (§6.1) and `snapshot` consistency reads (§5.9) are weaker options that a client must request.
 - Committed data correctness relies on object storage guarantees.
 
 2. **Low cost**
@@ -312,8 +312,12 @@ and a stream record may be committed alongside a row update.
   shortly after an append or during a sweep (§5.11). A stream may so hold
   up to a sixteenth more than its limits, and briefly more.
 - **Consumers** are named cursors stored with a stream, at most at its next
-  seq. A consumer that advances its cursor in the transaction that writes
-  what it made of the records processes each record exactly once. Stream
+  seq. A consumer that reads its cursor and advances it in the transaction
+  that writes what it made of the records processes each record at most
+  once, and exactly once while retention keeps the records. Retention does
+  not wait for consumers: a read from a cursor before the stream's first seq
+  starts at the first seq without an error, so a consumer can find a gap
+  by comparing the first record's seq with its cursor. Stream
   info reports the lag of its first 100 consumers; the consumers route pages
   through all of them.
 
@@ -692,7 +696,7 @@ Deleting a database marks its record as deleted in the system database. After a 
 
 There are two read consistency modes:
 
-- `snapshot` consistency reads from a serializable snapshot that is at most 5 seconds old.
+- `snapshot` consistency reads from a serializable snapshot that is at most `max_staleness_ms` old (5 s by default). Each node keeps its own cached snapshot, so successive snapshot reads through different nodes can go back in time.
 - `strong` consistency guarantees linearizability. It is served from cache if the serving node holds a valid lease and has no manifest write in flight; otherwise it requests `GET manifest If-None-Match: etag` first.
 
 ### 5.10 Size Quotas
@@ -804,7 +808,9 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
 
 ### 6.1 Semantics
 
-- Default isolation is serializable, strictly serializable for committed read-write transactions.
+- Default isolation is serializable. With `strong` consistency, the default, it is strictly serializable: a transaction
+  observes every transaction that committed before it began. An interactive transaction has this guarantee for its reads
+  only if it commits.
   It uses optimistic concurrency control with backward validation:
   - the read set holds point keys (including misses) and scanned intervals.
     A scan that stopped at `limit` records only the interval it actually
@@ -826,8 +832,10 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
   it was derived from, so a concurrent schema change (a new index, a
   dropped column or table) makes it fail with a retryable `409 conflict`
   rather than miss index maintenance.
-- Read-only transactions always succeed and are serialized at `read_version`.
-- Blind-write transactions never conflict, appends included.
+- A one-shot read-only transaction always succeeds. An interactive read-only transaction must commit to validate its
+  reads, and the commit fails with a retryable `409 conflict` if a concurrent commit changed them (§5.5).
+- Under serializable isolation, a transaction that only writes never conflicts, appends included. Under snapshot
+  isolation, two transactions that write the same key conflict, and the first to commit wins.
 - Reads within a transaction see its own earlier writes, except stream appends and
   event inserts: because event positions are assigned at commit time, a
   transaction that inserts into an event table cannot query or delete from that

@@ -613,12 +613,10 @@ async fn commit_txn(
     let ops = ops::parse_ops(b.unwrap_or_default().ops)?;
     let txn = node.txns.lock(get_open(&node, &ctx, &id)?).await?;
     let enc = txn.encoding();
-    let mut t = txn.take();
+    let mut t = txn.take_for_commit();
     let cid = t.commit_id;
-    // Until the commit is known not to be applied, a retry must not learn that it can restart.
-    node.txns.note_commit(&id, cid);
     let definite = |e: Error| {
-        if !matches!(e, Error::Unavailable { outcome_unknown: true, .. } | Error::Internal(_)) {
+        if !e.may_have_applied() {
             node.txns.forget_commit(&id);
         }
         e

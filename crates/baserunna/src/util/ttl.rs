@@ -32,6 +32,9 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
         match v {
             Some(v) => {
                 if m.len() >= self.max {
+                    m.retain(|_, (at, _)| at.elapsed() < self.ttl);
+                }
+                if m.len() >= self.max {
                     m.clear();
                 }
                 m.insert(k, (read_at, v));

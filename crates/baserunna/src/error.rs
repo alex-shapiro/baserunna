@@ -108,6 +108,11 @@ impl Error {
         }
     }
 
+    /// Returns true if the failed request may have been applied.
+    pub fn may_have_applied(&self) -> bool {
+        matches!(self, Error::Unavailable { outcome_unknown: true, .. } | Error::Internal(_))
+    }
+
     pub fn retryable(&self) -> bool {
         matches!(
             self,

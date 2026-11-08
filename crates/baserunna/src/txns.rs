@@ -175,12 +175,6 @@ impl OpenTxns {
         Ok(open)
     }
 
-    /// Records that the commit of transaction `id` has started, so that a later request on it
-    /// learns that the commit may have been applied rather than that it can restart.
-    pub fn note_commit(&self, id: &str, commit_id: u64) {
-        self.committed.store(id.to_string(), Some(commit_id), Instant::now());
-    }
-
     /// Forgets a commit recorded by [`OpenTxns::note_commit`] that certainly was not applied.
     pub fn forget_commit(&self, id: &str) {
         self.committed.remove(&id.to_string());
@@ -300,6 +294,14 @@ impl TxnGuard<'_> {
     pub fn finish<T>(mut self, result: Result<T>) -> Result<T> {
         self.finished = result.is_ok();
         result
+    }
+
+    /// Takes the transaction to commit it. Until [`OpenTxns::forget_commit`], a later request on it
+    /// learns that the commit may have been applied, not that it can restart the transaction.
+    pub fn take_for_commit(self) -> Txn {
+        let commit_id = self.guard.as_ref().expect("open transaction must be present while guard is active").commit_id;
+        self.txns.committed.store(self.open.id.clone(), Some(commit_id), Instant::now());
+        self.take()
     }
 
     pub fn take(mut self) -> Txn {

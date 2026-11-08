@@ -251,8 +251,17 @@ impl Shared {
         }
     }
 
-    fn cache_whole(&self, db: &str, seg: &str, data: &Bytes) -> Result<(Arc<SegmentIndex>, Vec<Block>)> {
+    fn cache_whole(
+        &self,
+        db: &str,
+        seg: &str,
+        data: &Bytes,
+        expected_meta: Option<&SegmentMeta>,
+    ) -> Result<(Arc<SegmentIndex>, Vec<Block>)> {
         let idx = Arc::new(SegmentIndex::decode_whole(data)?);
+        if let Some(m) = expected_meta {
+            verify_segment_matches_manifest(&idx, m)?;
+        }
         let blocks = segment::decode_blocks(&idx, 0, data)?;
         for (bi, b) in blocks.iter().enumerate() {
             self.cache.insert(CacheKey::block(db, seg, bi), CacheVal::Block(b.clone()));
@@ -265,7 +274,7 @@ impl Shared {
     /// decoded blocks in memory if `hot` is true.
     pub(crate) fn remember_segment(&self, db: &str, seg: &str, data: &Bytes, hot: bool) -> Result<()> {
         let idx = if hot {
-            self.cache_whole(db, seg, data)?.0
+            self.cache_whole(db, seg, data, None)?.0
         } else {
             let idx = Arc::new(SegmentIndex::decode_whole(data)?);
             self.cache.insert(CacheKey::index(db, seg), CacheVal::Index(idx.clone()));
@@ -315,12 +324,12 @@ impl Shared {
                 return self.read_whole_segment(db, seg).await.map(|(i, b)| (i, Some(b)));
             }
             if let Some(d) = self.local_get(db, &seg.id, "all").await
-                && let Ok((idx, blocks)) = self.cache_whole(db, &seg.id, &d)
+                && let Ok((idx, blocks)) = self.cache_whole(db, &seg.id, &d, Some(seg))
             {
                 return Ok((idx, Some(blocks)));
             }
             let g = self.seg_get(db, &seg.id, GetOpts::default()).await?;
-            let (idx, blocks) = self.cache_whole(db, &seg.id, &g.data)?;
+            let (idx, blocks) = self.cache_whole(db, &seg.id, &g.data, Some(seg))?;
             self.local_put(db, &seg.id, "all", g.data);
             return Ok((idx, Some(blocks)));
         }
@@ -347,7 +356,9 @@ impl Shared {
             let bloom = &meta[..footer.bloom_len as usize];
             let index = &meta
                 [(footer.index_off - start) as usize..(footer.index_off - start) as usize + footer.index_len as usize];
-            Ok(SegmentIndex::decode(footer, index, bloom, size)?)
+            let idx = SegmentIndex::decode(footer, index, bloom, size)?;
+            verify_segment_matches_manifest(&idx, seg)?;
+            Ok(idx)
         };
         if let Some(meta) = self.local_get(db, &seg.id, "meta").await
             && let Ok(idx) = parse(&meta)
@@ -373,6 +384,7 @@ impl Shared {
     async fn read_whole_segment(&self, db: &str, seg: &SegmentMeta) -> Result<(Arc<SegmentIndex>, Vec<Block>)> {
         let decode = |d: &Bytes| -> Result<(Arc<SegmentIndex>, Vec<Block>)> {
             let idx = Arc::new(SegmentIndex::decode_whole(d)?);
+            verify_segment_matches_manifest(&idx, seg)?;
             let blocks = segment::decode_blocks(&idx, 0, d)?;
             Ok((idx, blocks))
         };
@@ -451,9 +463,10 @@ impl Shared {
         if self.is_small_segment(seg) {
             let data = self.local_get(db, &seg.id, "all").await?;
             if keep {
-                return self.cache_whole(db, &seg.id, &data).ok()?.1.into_iter().nth(bi);
+                return self.cache_whole(db, &seg.id, &data, Some(seg)).ok()?.1.into_iter().nth(bi);
             }
             let idx = SegmentIndex::decode_whole(&data).ok()?;
+            verify_segment_matches_manifest(&idx, seg).ok()?;
             let (_, off, len) = *idx.blocks.get(bi)?;
             return segment::decode_block(data.slice(off as usize..(off + len as u64) as usize)).ok();
         }
@@ -1200,6 +1213,17 @@ pub struct ChangePage {
     pub more: bool,
     /// Cursor for the next page.
     pub next: ChangeCursor,
+}
+
+/// Verifies that `index` matches the byte size and entry count in `meta`.
+fn verify_segment_matches_manifest(index: &SegmentIndex, meta: &SegmentMeta) -> Result<()> {
+    if index.size != meta.size || index.footer.entries != meta.entries {
+        return Err(Error::internal(format!(
+            "segment {} holds {} entries in {} bytes, but its manifest lists {} entries in {} bytes",
+            meta.id, index.footer.entries, index.size, meta.entries, meta.size
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

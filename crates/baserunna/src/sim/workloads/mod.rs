@@ -10,6 +10,7 @@ pub mod blobs;
 pub mod client;
 pub mod console;
 pub mod db_churn;
+pub mod elle;
 pub mod events;
 pub mod events_churn;
 pub mod events_retention;
@@ -268,6 +269,7 @@ pub async fn settle(sim: &Arc<Sim>, phase: Option<ChaosPhase>) {
 const MIX: &[(&str, &str)] = &[
     ("kv_model", "mix.kv_model"),
     ("history", "mix.history"),
+    ("elle", "mix.elle"),
     ("bank", "mix.bank"),
     ("register", "mix.register"),
     ("tables", "mix.tables"),
@@ -373,6 +375,11 @@ pub fn scenarios() -> Vec<Scenario> {
             name: "history",
             config: |k| world(k, faulty((1, 5))),
             run: |s| Box::pin(history::run(s.clone(), history::Shape::draw(&s.knobs), true)),
+        },
+        Scenario {
+            name: "elle",
+            config: |k| world(k, faulty((1, 5))),
+            run: |s| Box::pin(elle::run(s.clone(), elle::Shape::draw(&s.knobs), true)),
         },
         Scenario {
             name: "bank",

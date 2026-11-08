@@ -49,6 +49,8 @@ pub struct OpenTxns {
     limits: TxnLimits,
     open: Mutex<DetHashMap<String, Arc<OpenTxn>>>,
     aborted: TtlCache<String, &'static str>,
+    /// Maps transaction IDs whose commit has started to their commit IDs.
+    started_commits: TtlCache<String, u64>,
 }
 
 impl OpenTxns {
@@ -58,6 +60,7 @@ impl OpenTxns {
             limits,
             open: Mutex::new(DetHashMap::default()),
             aborted: TtlCache::new(limits.lifetime, 100_000),
+            started_commits: TtlCache::new(limits.lifetime, 100_000),
         })
     }
 
@@ -169,8 +172,24 @@ impl OpenTxns {
         Ok(open)
     }
 
+    /// Removes a transaction ID recorded by [`TxnGuard::take_for_commit`] after its commit fails
+    /// without being applied.
+    pub fn forget_started_commit(&self, txn_id: &str) {
+        self.started_commits.remove(&txn_id.to_string());
+    }
+
     fn lost(&self, id: &str) -> Error {
         crate::probe::hit(crate::probe::Probe::InteractiveTxnLost);
+        if let Some(commit_id) = self.started_commits.get(&id.to_string()) {
+            return Error::Unavailable {
+                message: format!(
+                    "the transaction's commit was already sent and may have been applied. Check its status at \
+                     /commits/{commit_id:016x}"
+                ),
+                retry_after_ms: None,
+                outcome_unknown: true,
+            };
+        }
         match self.aborted.get(&id.to_string()) {
             Some(reason) => Error::TxnNotFound(format!("transaction was aborted because {reason}; retry it")),
             None => Error::txn_not_found(),
@@ -215,6 +234,7 @@ impl OpenTxns {
             })
             .collect();
         self.aborted.prune();
+        self.started_commits.prune();
         for (t, reason) in expired {
             self.abort(&t, reason);
         }
@@ -274,6 +294,13 @@ impl TxnGuard<'_> {
     pub fn finish<T>(mut self, result: Result<T>) -> Result<T> {
         self.finished = result.is_ok();
         result
+    }
+
+    /// Takes the transaction for committing and records its commit ID in [`OpenTxns`].
+    pub fn take_for_commit(self) -> Txn {
+        let commit_id = self.guard.as_ref().expect("open transaction must be present while guard is active").commit_id;
+        self.txns.started_commits.store(self.open.id.clone(), Some(commit_id), Instant::now());
+        self.take()
     }
 
     pub fn take(mut self) -> Txn {
@@ -385,6 +412,40 @@ mod tests {
             let r = w.call(0, "DELETE", &format!("/v1/dbs/a/transactions/{}", ids[0]), &alice, Bytes::new()).await;
             assert_eq!(r.status, 200);
             assert_eq!(begin(&w, &alice, "a").await.status, 201, "an aborted transaction still counted");
+        });
+    }
+
+    #[test]
+    fn retried_interactive_commit_returns_unknown_outcome() {
+        run_paused(async {
+            let world = World::new(1, 1).await;
+            let token = world.signup(0, "a@x.io").await;
+            world.create_db(0, &token, "a").await;
+            let begun = begin(&world, &token, "a").await.json();
+            let (txn_id, commit_id) = (begun["txn_id"].as_str().unwrap(), begun["commit_id"].as_str().unwrap());
+            ops(&world, &token, "a", txn_id, json!([{"op": "put", "key": "k", "value": "v"}])).await;
+            let commit = format!("/v1/dbs/a/transactions/{txn_id}/commit");
+            assert_eq!(world.call(0, "POST", &commit, &token, Bytes::from("{}")).await.status, 200);
+            // A duplicate commit request after a lost response receives 503 with an unknown outcome.
+            let again = world.call(0, "POST", &commit, &token, Bytes::from("{}")).await.json();
+            assert_eq!(again["error"]["code"], "unavailable", "{again}");
+            assert_eq!(again["error"]["details"]["outcome"], "unknown", "{again}");
+            assert!(again["error"]["message"].as_str().unwrap().contains(commit_id), "{again}");
+        });
+    }
+
+    #[test]
+    fn failed_interactive_commit_returns_txn_not_found_on_retry() {
+        run_paused(async {
+            let world = World::new(1, 1).await;
+            let token = world.signup(0, "a@x.io").await;
+            world.create_db(0, &token, "a").await;
+            let txn_id = begin(&world, &token, "a").await.json()["txn_id"].as_str().unwrap().to_string();
+            let commit = format!("/v1/dbs/a/transactions/{txn_id}/commit");
+            let bad = Bytes::from(r#"{"ops": [{"op": "check", "key": "missing", "exists": true}]}"#);
+            assert_eq!(world.call(0, "POST", &commit, &token, bad).await.status, 412);
+            let again = world.call(0, "POST", &commit, &token, Bytes::from("{}")).await.json();
+            assert_eq!(again["error"]["code"], "txn_not_found", "{again}");
         });
     }
 

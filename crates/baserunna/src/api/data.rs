@@ -613,41 +613,41 @@ async fn commit_txn(
     let ops = ops::parse_ops(b.unwrap_or_default().ops)?;
     let txn = node.txns.lock(get_open(&node, &ctx, &id)?).await?;
     let enc = txn.encoding();
-    let mut t = txn.take_for_commit();
-    let cid = t.commit_id;
+    let mut open_txn = txn.take_for_commit();
+    let commit_id = open_txn.commit_id;
     // Only `commit_detailed` sends the commit to the committer. If an earlier step fails, or if
     // the transaction has no writes, remove the recorded commit ID.
-    let forget_unsent_commit = |e: Error| {
+    let forget_unsent_commit = |err: Error| {
         node.txns.forget_started_commit(&id);
-        e
+        err
     };
-    let mut results = exec_ops(&op_ctx(&node, &ctx, enc), &mut t, &ops).await.map_err(forget_unsent_commit)?;
-    if t.is_read_only() {
+    let mut results = exec_ops(&op_ctx(&node, &ctx, enc), &mut open_txn, &ops).await.map_err(forget_unsent_commit)?;
+    if open_txn.is_read_only() {
         node.txns.forget_started_commit(&id);
     } else {
         ctx.require_write().map_err(forget_unsent_commit)?;
     }
-    if t.needs_revalidation(!t.is_read_only()) {
+    if open_txn.needs_revalidation(!open_txn.is_read_only()) {
         node.txns.forget_started_commit(&id);
-        let Some(version) = ctx.db.revalidate(t).await? else {
+        let Some(version) = ctx.db.revalidate(open_txn).await? else {
             return Err(Error::Conflict("transaction conflicts with a concurrent commit".into()));
         };
         return Ok(axum::Json(json!({
-            "version": version, "commit_id": commit_hex(cid), "appends": [], "results": results,
+            "version": version, "commit_id": commit_hex(commit_id), "appends": [], "results": results,
         })));
     }
-    let mut creq = t.into_request();
-    creq.deadline = Some(ctx.deadline.instant());
-    let c = ctx.db.commit_detailed(creq).await.map_err(|e| {
-        if !e.may_have_been_applied() {
+    let mut commit_req = open_txn.into_request();
+    commit_req.deadline = Some(ctx.deadline.instant());
+    let committed = ctx.db.commit_detailed(commit_req).await.map_err(|err| {
+        if !err.may_have_been_applied() {
             node.txns.forget_started_commit(&id);
         }
-        naming_commit(e, cid)
+        naming_commit(err, commit_id)
     })?;
-    let own_appends = ops.iter().filter(|o| matches!(o, Op::Append { .. })).count();
-    ops::fill_appends(&ops, &mut results, &c.appends[c.appends.len().saturating_sub(own_appends)..]);
+    let own_appends = ops.iter().filter(|op| matches!(op, Op::Append { .. })).count();
+    ops::fill_appends(&ops, &mut results, &committed.appends[committed.appends.len().saturating_sub(own_appends)..]);
     Ok(axum::Json(json!({
-        "version": c.version, "commit_id": commit_hex(cid), "appends": first_seqs(&c), "results": results,
+        "version": committed.version, "commit_id": commit_hex(commit_id), "appends": first_seqs(&committed), "results": results,
     })))
 }
 

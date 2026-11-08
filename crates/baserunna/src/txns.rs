@@ -419,33 +419,33 @@ mod tests {
     #[test]
     fn retried_interactive_commit_returns_unknown_outcome() {
         run_paused(async {
-            let w = World::new(1, 1).await;
-            let token = w.signup(0, "a@x.io").await;
-            w.create_db(0, &token, "a").await;
-            let begun = begin(&w, &token, "a").await.json();
-            let (id, cid) = (begun["txn_id"].as_str().unwrap(), begun["commit_id"].as_str().unwrap());
-            ops(&w, &token, "a", id, json!([{"op": "put", "key": "k", "value": "v"}])).await;
-            let commit = format!("/v1/dbs/a/transactions/{id}/commit");
-            assert_eq!(w.call(0, "POST", &commit, &token, Bytes::from("{}")).await.status, 200);
+            let world = World::new(1, 1).await;
+            let token = world.signup(0, "a@x.io").await;
+            world.create_db(0, &token, "a").await;
+            let begun = begin(&world, &token, "a").await.json();
+            let (txn_id, commit_id) = (begun["txn_id"].as_str().unwrap(), begun["commit_id"].as_str().unwrap());
+            ops(&world, &token, "a", txn_id, json!([{"op": "put", "key": "k", "value": "v"}])).await;
+            let commit = format!("/v1/dbs/a/transactions/{txn_id}/commit");
+            assert_eq!(world.call(0, "POST", &commit, &token, Bytes::from("{}")).await.status, 200);
             // A duplicate commit request after a lost response receives 503 with an unknown outcome.
-            let again = w.call(0, "POST", &commit, &token, Bytes::from("{}")).await.json();
+            let again = world.call(0, "POST", &commit, &token, Bytes::from("{}")).await.json();
             assert_eq!(again["error"]["code"], "unavailable", "{again}");
             assert_eq!(again["error"]["details"]["outcome"], "unknown", "{again}");
-            assert!(again["error"]["message"].as_str().unwrap().contains(cid), "{again}");
+            assert!(again["error"]["message"].as_str().unwrap().contains(commit_id), "{again}");
         });
     }
 
     #[test]
     fn failed_interactive_commit_returns_txn_not_found_on_retry() {
         run_paused(async {
-            let w = World::new(1, 1).await;
-            let token = w.signup(0, "a@x.io").await;
-            w.create_db(0, &token, "a").await;
-            let id = begin(&w, &token, "a").await.json()["txn_id"].as_str().unwrap().to_string();
-            let commit = format!("/v1/dbs/a/transactions/{id}/commit");
+            let world = World::new(1, 1).await;
+            let token = world.signup(0, "a@x.io").await;
+            world.create_db(0, &token, "a").await;
+            let txn_id = begin(&world, &token, "a").await.json()["txn_id"].as_str().unwrap().to_string();
+            let commit = format!("/v1/dbs/a/transactions/{txn_id}/commit");
             let bad = Bytes::from(r#"{"ops": [{"op": "check", "key": "missing", "exists": true}]}"#);
-            assert_eq!(w.call(0, "POST", &commit, &token, bad).await.status, 412);
-            let again = w.call(0, "POST", &commit, &token, Bytes::from("{}")).await.json();
+            assert_eq!(world.call(0, "POST", &commit, &token, bad).await.status, 412);
+            let again = world.call(0, "POST", &commit, &token, Bytes::from("{}")).await.json();
             assert_eq!(again["error"]["code"], "txn_not_found", "{again}");
         });
     }

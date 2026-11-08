@@ -559,11 +559,11 @@ def main():
         token = create_user_and_db(ports)
         state = WorkloadState(args)
         stop_event, errors, threads = threading.Event(), [], []
-        for ci in range(args.clients):
-            t = threading.Thread(
-                target=run_client, args=(state, ci, ports, token, stop_event, random.Random(rng.random()), errors))
-            t.start()
-            threads.append(t)
+        for client_idx in range(args.clients):
+            thread = threading.Thread(
+                target=run_client, args=(state, client_idx, ports, token, stop_event, random.Random(rng.random()), errors))
+            thread.start()
+            threads.append(thread)
         nemesis_thread = None
         if not args.no_nemesis:
             nemesis_thread = threading.Thread(
@@ -571,19 +571,19 @@ def main():
             nemesis_thread.start()
         time.sleep(args.minutes * 60)
         stop_event.set()
-        for t in threads:
-            t.join()
+        for thread in threads:
+            thread.join()
         if nemesis_thread:
             nemesis_thread.join()
         cluster.heal()
         time.sleep(3 * args.lease_ms / 1000 + 5)
         final_lists = read_final_lists(state, ports, token)
         history_path = os.path.join(args.out, "history.edn")
-        with open(history_path, "w") as f:
-            f.write(format_edn_history(state.events))
+        with open(history_path, "w") as history_file:
+            history_file.write(format_edn_history(state.events))
         counts = {}
-        for e in state.events:
-            counts[e[0]] = counts.get(e[0], 0) + 1
+        for event in state.events:
+            counts[event[0]] = counts.get(event[0], 0) + 1
         verdict = subprocess.run([args.elle_check, history_path], capture_output=True, text=True)
         problems = [] if verdict.returncode == 0 else [(verdict.stdout + verdict.stderr).strip()]
         problems += errors
@@ -593,8 +593,8 @@ def main():
             "client_errors": errors[:20],
             "problems": problems[:50],
         }
-        with open(os.path.join(args.out, "summary.json"), "w") as f:
-            json.dump(summary, f, indent=1)
+        with open(os.path.join(args.out, "summary.json"), "w") as summary_file:
+            json.dump(summary, summary_file, indent=1)
         cluster.log_event(json.dumps({
             "counts": counts,
             "problems": len(problems),

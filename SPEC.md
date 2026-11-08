@@ -12,7 +12,7 @@ scope for v1.
 1. **Safety**
 
 - Commited data is never lost or reordered.
-- Transactions are strictly serializable by default. A client can request snapshot isolation (§6.1) or `snapshot` consistency reads (§5.9) for weaker guarantees.
+- Transactions are strictly serializable by default. A client can request snapshot isolation (§6.1) or `snapshot` read consistency (§5.9) for weaker guarantees.
 - Committed data correctness relies on object storage guarantees.
 
 2. **Low cost**
@@ -873,10 +873,10 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
    database's owner node. If the owner changes or crashes, or if the node
    aborts the transaction for timeout or memory pressure (§5.12), uncommitted
    writes are discarded and subsequent requests return a retryable
-   `404 txn_not_found` with the abort reason. Once a node starts to commit a
+   `404 txn_not_found` with the abort reason. When a node begins to commit a
    transaction, the node caches the transaction's commit ID for
-   `txn_max_lifetime` unless the commit fails before applying. If that node
-   receives another request for the transaction, it returns `503` with
+   `txn_max_lifetime` unless the commit fails before it is applied. If that
+   node receives another request for the transaction, it returns `503` with
    `outcome: "unknown"` and the commit ID. A client that loses the commit
    response must check `/commits/{id}` instead of restarting the transaction.
    `begin` returns the transaction's
@@ -1484,7 +1484,14 @@ Each simulation parameter is drawn independently from a hash of the run seed and
 Workloads run concurrently with a shared chaos loop (`ChaosPhase`). When all active workloads finish their chaos phase, fault injection stops, the cluster heals, and each workload runs its final consistency and invariant checks. The `mix` scenario runs a random subset of at least two workloads concurrently in the same cluster. Any run that exceeds 6 hours of virtual time fails as a liveness violation.
 
 - `history`: Concurrent clients execute random multi-key transactions (single-request and interactive, serializable and snapshot-isolated, strong and snapshot reads, with and without idempotency keys). Each write records a unique marker key. At the end of the run, committed transactions are ordered by version and replayed to verify strict serializability, snapshot isolation, and read-your-writes.
-- `elle`: Concurrent one-shot and interactive transactions read lists of unique integers and append to them. Even keys store lists as KV values updated by read-modify-write transactions, and odd keys store lists as streams. The checker infers the transaction order from client observations alone, without using server version numbers. It verifies that reads are prefixes of the final lists, committed appends appear once, aborted appends are absent, transactions read their own KV appends, real-time order is preserved, and the transaction dependency graph is acyclic. If `SIM_ELLE_DIR` is set, the workload also writes the history in EDN format for Jepsen's Elle checker.
+- `elle`: Concurrent one-shot and interactive transactions read and append to lists of unique integers. Even keys store lists as KV values updated by read-modify-write transactions, and odd keys store lists as streams. The checker infers the transaction order from client observations alone, without server version numbers. It verifies that:
+  - each read returns a prefix of the key's final list
+  - each committed append appears once in the final list, and aborted appends are absent
+  - each transaction reads its own earlier KV appends
+  - each transaction observes all appends from transactions that completed before it began
+  - the transaction dependency graph is acyclic
+
+  If `SIM_ELLE_DIR` is set, the workload also writes the history in EDN format for Jepsen's Elle checker.
 - `kv_model`: Exercises all KV endpoints under faults and compares every response against a reference model. Ambiguous commits are resolved via `/commits/{id}` or database state inspection. Verifies range tombstones, size quota enforcement, and KV change feed reconstruction.
 - `bank`: Concurrent account transfers across nodes. Verifies conservation of total balance and non-negative balances throughout the run and at completion.
 - `register`: Concurrent writers and strong readers on a small key set, verified for real-time linearizability across `GET`, unforwarded `GET`, and read-only and read-write transactions.

@@ -128,8 +128,8 @@ impl WorkloadState {
         }
     }
 
-    /// Generates a list-append transaction. KV appends require an interactive transaction, and
-    /// stream reads after an append to the same stream in the same transaction are omitted because
+    /// Generates a list-append transaction. KV appends require an interactive transaction.
+    /// Stream reads after an append to the same stream in the same transaction are omitted because
     /// a transaction does not read its own uncommitted stream appends.
     fn generate_txn(&mut self, rng: &mut Rng, shape: &Shape, interactive: bool) -> Vec<ListOp> {
         let count = 1 + rng.usize(shape.max_mops);
@@ -848,14 +848,14 @@ mod tests {
     fn rejects_dependency_cycles() {
         let event = |kind, process, ops| HistoryEvent { kind, process, time_ms: 0, ops };
         // Write skew: each transaction reads the key that the other transaction appends to.
-        let t1 = vec![ListOp::Read(2, None), ListOp::Append(3, 1)];
-        let t2 = vec![ListOp::Read(3, None), ListOp::Append(2, 2)];
-        let skew_history = |r1: Option<Vec<u64>>, r2: Option<Vec<u64>>| {
+        let txn_a = vec![ListOp::Read(2, None), ListOp::Append(3, 1)];
+        let txn_b = vec![ListOp::Read(3, None), ListOp::Append(2, 2)];
+        let skew_history = |read_a: Option<Vec<u64>>, read_b: Option<Vec<u64>>| {
             vec![
-                event(EventKind::Invoke, 0, t1.clone()),
-                event(EventKind::Invoke, 1, t2.clone()),
-                event(EventKind::Ok, 0, vec![ListOp::Read(2, r1), ListOp::Append(3, 1)]),
-                event(EventKind::Ok, 1, vec![ListOp::Read(3, r2), ListOp::Append(2, 2)]),
+                event(EventKind::Invoke, 0, txn_a.clone()),
+                event(EventKind::Invoke, 1, txn_b.clone()),
+                event(EventKind::Ok, 0, vec![ListOp::Read(2, read_a), ListOp::Append(3, 1)]),
+                event(EventKind::Ok, 1, vec![ListOp::Read(3, read_b), ListOp::Append(2, 2)]),
             ]
         };
         let final_lists: BTreeMap<u64, Vec<u64>> = [(2, vec![2]), (3, vec![1])].into();

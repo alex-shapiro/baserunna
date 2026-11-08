@@ -1188,9 +1188,8 @@ impl Db {
                 self.schedule_trims(plan.due);
                 self.clear_lease_flag(&batch);
                 for (w, o) in batch.into_iter().zip(plan.outcomes) {
-                    // If a commit was sent in an unfenced ambiguous write and fails on a rebuild
-                    // (for example, after its deadline, staged blob, or read expires), report its
-                    // outcome as unknown.
+                    // If a commit was sent in an unfenced ambiguous write and fails on a rebuild,
+                    // report its outcome as unknown.
                     let o = map_work_commits(&w, o, |id, r| match r {
                         Err(e)
                             if maybe_applied
@@ -2616,26 +2615,30 @@ async fn flush_tail(shared: &Shared, db: &str, tail: &[Entry], version: Seq) -> 
 /// Returns the non-replayed commit IDs that `outcome` accepted for `work`.
 fn newly_committed_ids(work: &Work, outcome: &Outcome) -> Vec<u64> {
     match (work, outcome) {
-        (Work::Commit { req, .. }, Outcome::Seq(Ok(c))) if !c.replayed => vec![req.commit_id],
-        (Work::Bind { bind, .. }, Outcome::Binds(rs)) => bind
+        (Work::Commit { req, .. }, Outcome::Seq(Ok(committed))) if !committed.replayed => vec![req.commit_id],
+        (Work::Bind { bind, .. }, Outcome::Binds(results)) => bind
             .slots
             .iter()
-            .zip(rs)
-            .filter(|(_, r)| matches!(r, Ok(c) if !c.replayed))
-            .map(|(s, _)| s.commit_id)
+            .zip(results)
+            .filter(|(_, res)| matches!(res, Ok(committed) if !committed.replayed))
+            .map(|(slot, _)| slot.commit_id)
             .collect(),
         _ => Vec::new(),
     }
 }
 
-/// Applies `f` to each commit result in `outcome` with its commit ID.
-fn map_work_commits(work: &Work, outcome: Outcome, f: impl Fn(u64, Result<Committed>) -> Result<Committed>) -> Outcome {
+/// Applies `map_fn` to each commit result in `outcome` with its commit ID.
+fn map_work_commits(
+    work: &Work,
+    outcome: Outcome,
+    map_fn: impl Fn(u64, Result<Committed>) -> Result<Committed>,
+) -> Outcome {
     match (work, outcome) {
-        (Work::Commit { req, .. }, Outcome::Seq(r)) => Outcome::Seq(f(req.commit_id, r)),
-        (Work::Bind { bind, .. }, Outcome::Binds(rs)) => {
-            Outcome::Binds(bind.slots.iter().zip(rs).map(|(s, r)| f(s.commit_id, r)).collect())
+        (Work::Commit { req, .. }, Outcome::Seq(res)) => Outcome::Seq(map_fn(req.commit_id, res)),
+        (Work::Bind { bind, .. }, Outcome::Binds(results)) => {
+            Outcome::Binds(bind.slots.iter().zip(results).map(|(slot, res)| map_fn(slot.commit_id, res)).collect())
         }
-        (_, o) => o,
+        (_, other) => other,
     }
 }
 
@@ -2646,8 +2649,10 @@ fn clear_replay_if_sent_in_batch(
     ambiguous_commit_ids: &BTreeSet<u64>,
 ) -> Result<Committed> {
     match result {
-        Ok(c) if c.replayed && ambiguous_commit_ids.contains(&commit_id) => Ok(Committed { replayed: false, ..c }),
-        r => r,
+        Ok(committed) if committed.replayed && ambiguous_commit_ids.contains(&commit_id) => {
+            Ok(Committed { replayed: false, ..committed })
+        }
+        other => other,
     }
 }
 

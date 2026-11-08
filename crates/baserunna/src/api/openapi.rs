@@ -1718,7 +1718,7 @@ pub fn document() -> &'static Value {
                     `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the \
                     Error schema with a stable `code`; `retryable` errors may be retried. A `503` response with \
                     `details.outcome: \"unknown\"` or a `500` response indicates that the write may have been \
-                    applied; retry the write with its idempotency key or check `/commits/{id}` first. Requests over a \
+                    applied; retry the write with its idempotency key or check `/commits/{id}` before retrying. Requests over a \
                     rate limit return 429 `rate_limited` with `Retry-After` and are not \
                     applied; writes that would exceed a database's size quota return 507 `quota_exceeded`. Every response \
                     includes an `x-request-id` header containing the client-supplied value (1-64 characters of \

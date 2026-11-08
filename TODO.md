@@ -201,11 +201,10 @@ data corruption through any of them.
       `baserunna-client` checks `outcome` before retrying, but a client that
       inspects only `retryable` can apply a non-idempotent write twice.
 - [ ] **Track ambiguity per commit on batch-abort paths.** If the committer
-      aborts a batch after an ambiguous manifest `PUT` (for example, on lease
-      loss, shutdown, build failure, store error, or retry exhaustion), it
-      marks every commit in the batch as `outcome: "unknown"`, including
-      commits that joined the batch after the ambiguous `PUT`. Return definite
-      errors for commits that were never sent in an ambiguous `PUT`.
+      aborts a batch after an ambiguous manifest `PUT`, it marks every commit in
+      the batch as `outcome: "unknown"`, including commits that joined the batch
+      after the ambiguous `PUT`. Return definite errors for commits that were
+      not sent in an ambiguous `PUT`.
 - [ ] **Clear unsent interactive commits with a drop guard.** `commit_txn`
       calls `forget_started_commit` on each error path before sending the
       commit. If a client disconnects while `exec_ops` is running, the entry

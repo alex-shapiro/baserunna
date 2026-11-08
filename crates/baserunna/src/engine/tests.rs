@@ -756,15 +756,15 @@ fn open_rejects_missing_manifest_if_database_objects_exist() {
         }
         tokio::time::sleep(Duration::from_millis(2_000)).await;
         db.maintenance_now().await.unwrap();
-        let segments: Vec<String> = db.current().unwrap().m.segments.iter().map(|s| seg_key("d", &s.id)).collect();
+        let segments: Vec<String> = db.current().unwrap().m.segments.iter().map(|seg| seg_key("d", &seg.id)).collect();
         assert!(!segments.is_empty(), "expected the tail to flush to a segment");
         store.delete_sync(&manifest_key("d"));
         let other = Engine::new(store.clone(), env.clone(), cfg.clone(), "node-b".into());
         let err = other.db("d").open(true).await.map(|_| ()).expect_err("an empty manifest replaced the lost manifest");
         assert!(err.to_string().contains("manifest of database d is missing"), "{err}");
         assert!(store.get_sync(&manifest_key("d"), &GetOpts::default()).is_err(), "a manifest was created");
-        for s in &segments {
-            assert!(store.get_sync(s, &GetOpts::default()).is_ok(), "{s} was deleted");
+        for seg in &segments {
+            assert!(store.get_sync(seg, &GetOpts::default()).is_ok(), "{seg} was deleted");
         }
     });
 }
@@ -782,17 +782,19 @@ fn scan_rejects_segment_that_mismatches_manifest_metadata() {
             tokio::time::sleep(Duration::from_millis(2_000)).await;
             db.maintenance_now().await.unwrap();
         }
-        let m = db.current().unwrap().m.clone();
-        let segment_with_prefix = |p: u8| m.segments.iter().find(|s| s.min_key[0] == p && s.max_key[0] == p).unwrap();
-        let (a, b) = (segment_with_prefix(b'a'), segment_with_prefix(b'b'));
-        let a_bytes = store.get_sync(&seg_key("d", &a.id), &GetOpts::default()).unwrap().data;
-        store.put_sync(&seg_key("d", &b.id), a_bytes, &PutMode::Overwrite).unwrap();
+        let manifest = db.current().unwrap().m.clone();
+        let segment_with_prefix = |prefix: u8| {
+            manifest.segments.iter().find(|seg| seg.min_key[0] == prefix && seg.max_key[0] == prefix).unwrap()
+        };
+        let (seg_a, seg_b) = (segment_with_prefix(b'a'), segment_with_prefix(b'b'));
+        let seg_a_bytes = store.get_sync(&seg_key("d", &seg_a.id), &GetOpts::default()).unwrap().data;
+        store.put_sync(&seg_key("d", &seg_b.id), seg_a_bytes, &PutMode::Overwrite).unwrap();
         let other = Engine::new(store.clone(), env.clone(), cfg.clone(), "node-b".into());
         let replica = other.db("d");
         replica.open(false).await.unwrap();
         let snap = replica.snapshot(Consistency::Strong).await.unwrap();
         let scan = snap.scan(&KeyRange::data(), false, usize::MAX).await;
-        let err = scan.map(|e| e.len()).expect_err("the substituted segment was accepted");
+        let err = scan.map(|entries| entries.len()).expect_err("the substituted segment was accepted");
         assert!(err.to_string().contains("but its manifest lists"), "{err}");
     });
 }
@@ -858,13 +860,13 @@ fn rejection_after_ambiguous_manifest_put_returns_unknown_outcome() {
         let blob = blob::write_blob(&eng.shared, "d", b"payload", "x/y").await.unwrap();
         // The staged blob expires while the first manifest write is in flight.
         tokio::time::sleep(Duration::from_millis(ttl - 1_000)).await;
-        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-        t.put(Bytes::from_static(b"k"), Value::Blob(blob)).unwrap();
+        let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        txn.put(Bytes::from_static(b"k"), Value::Blob(blob)).unwrap();
         store.delayed_manifest_puts.store(1, SeqCst);
-        let r = db.commit(t.into_request()).await;
+        let res = db.commit(txn.into_request()).await;
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(strong_get(&db, "k").await.is_some(), "expected the delayed manifest write to be applied");
-        assert!(matches!(r, Err(Error::Unavailable { outcome_unknown: true, .. })), "applied, but answered {r:?}");
+        assert!(matches!(res, Err(Error::Unavailable { outcome_unknown: true, .. })), "applied, but answered {res:?}");
     });
 }
 
@@ -883,17 +885,23 @@ fn conflict_excluded_from_ambiguous_manifest_put_remains_definite() {
         let cfg = EngineConfig { manifest_put_hedge_ms: 0, ..EngineConfig::small_for_tests() };
         let eng = Engine::new(store.clone(), env, cfg, "a".into());
         let db = opened(&eng, "d").await;
-        let mut a = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-        a.put(Bytes::from_static(b"k"), inline("a")).unwrap();
-        let mut c = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-        assert!(c.get(b"k").await.unwrap().is_none());
-        c.put(Bytes::from_static(b"j"), inline("c")).unwrap();
+        let mut winning_txn = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        winning_txn.put(Bytes::from_static(b"k"), inline("a")).unwrap();
+        let mut conflicting_txn = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        assert!(conflicting_txn.get(b"k").await.unwrap().is_none());
+        conflicting_txn.put(Bytes::from_static(b"j"), inline("c")).unwrap();
         store.delayed_manifest_puts.store(1, SeqCst);
-        // Both commits join the same batch; `c` conflicts with `a` and is excluded from the manifest write.
-        let (ra, rc) = tokio::join!(db.commit_detailed(a.into_request()), db.commit_detailed(c.into_request()));
-        let ra = ra.unwrap();
-        assert!(!ra.replayed, "the batch's own commit was reported as a replay");
-        assert!(matches!(rc, Err(Error::Conflict(_))), "expected a definite conflict, got {rc:?}");
+        // Both commits join the same batch; `conflicting_txn` conflicts with `winning_txn` and is excluded from the manifest write.
+        let (winning_res, conflicting_res) = tokio::join!(
+            db.commit_detailed(winning_txn.into_request()),
+            db.commit_detailed(conflicting_txn.into_request())
+        );
+        let winning_committed = winning_res.unwrap();
+        assert!(!winning_committed.replayed, "the batch's own commit was reported as a replay");
+        assert!(
+            matches!(conflicting_res, Err(Error::Conflict(_))),
+            "expected a definite conflict, got {conflicting_res:?}"
+        );
     });
 }
 
@@ -902,11 +910,11 @@ fn commit_applied_by_ambiguous_manifest_put_is_not_marked_replayed() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
-        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-        t.put(Bytes::from_static(b"k"), inline("v")).unwrap();
+        let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        txn.put(Bytes::from_static(b"k"), inline("v")).unwrap();
         store.manifest_put_lost.store(1, SeqCst);
-        let c = db.commit_detailed(t.into_request()).await.unwrap();
-        assert!(!c.replayed, "the request's own commit was reported as a replay");
+        let committed = db.commit_detailed(txn.into_request()).await.unwrap();
+        assert!(!committed.replayed, "the request's own commit was reported as a replay");
         assert_eq!(strong_get(&db, "k").await, Some(inline("v")));
     });
 }

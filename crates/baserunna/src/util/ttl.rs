@@ -106,16 +106,16 @@ mod tests {
     fn full_cache_evicts_oldest_eighth_on_insert() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
         rt.block_on(async {
-            let c: TtlCache<u32, u32> = TtlCache::new(Duration::from_secs(3600), 16);
-            for k in 0..17 {
-                c.store(k, Some(k), Instant::now());
+            let cache: TtlCache<u32, u32> = TtlCache::new(Duration::from_secs(3600), 16);
+            for key in 0..17 {
+                cache.store(key, Some(key), Instant::now());
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            assert_eq!(c.len(), 15, "an insert into a full cache evicts its oldest eighth");
-            for k in 2..17 {
-                assert_eq!(c.get(&k), Some(k), "a recent entry was evicted");
+            assert_eq!(cache.len(), 15, "an insert into a full cache evicts its oldest eighth");
+            for key in 2..17 {
+                assert_eq!(cache.get(&key), Some(key), "a recent entry was evicted");
             }
-            assert_eq!((c.get(&0), c.get(&1)), (None, None));
+            assert_eq!((cache.get(&0), cache.get(&1)), (None, None));
         });
     }
 }

@@ -768,7 +768,7 @@ mod tests {
         let aborted = check(&[invoke.clone(), ev(Kind::Fail, vec![Mop::Append(1, 2)])], &finals).unwrap_err();
         assert!(aborted.contains("failed"), "{aborted}");
         let twice: BTreeMap<u64, Vec<u64>> = [(1, vec![1, 1])].into();
-        assert!(check(&[invoke.clone()], &twice).unwrap_err().contains("twice"));
+        assert!(check(std::slice::from_ref(&invoke), &twice).unwrap_err().contains("twice"));
         let garbage: BTreeMap<u64, Vec<u64>> = [(1, vec![9])].into();
         assert!(check(&[invoke], &garbage).unwrap_err().contains("never appended"));
     }

@@ -25,10 +25,16 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       fail repeatedly with `503 request deadline exceeded`
       (`sim_tool trace streams 2601188`, and the checker reads of `streams` seeds
       9102146 and 9107143).
-- [ ] **Fix `watch` seed 9301453: a change-feed cursor expires within a
-      transaction lifetime.** A cursor issued at store time 1750519595155
-      reports `cursor_expired` 28 s later, although cursors stay valid for
-      `txn_max_lifetime_ms` (`sim_tool trace watch 9301453`).
+- [ ] **Fix `history` seed 9527230: a read is serialized before a version that
+      finished before it began.** A strong read returns version 16 although
+      version 17 committed before the read started, violating strict
+      serializability; the seed fails the same way on `main`
+      (`sim_tool trace history 9527230`).
+- [ ] **Fix `accounts` seed 9506242: a re-enabled account stays disabled.** An
+      admin `disable` request with an unknown outcome is retried and succeeds,
+      the account is re-enabled, and a fresh session then gets `401`,
+      consistent with the first `disable` applying after the re-enable
+      (`sim_tool trace accounts 9506242`).
 - [ ] **Run garbage collection sweeps even if the lease duration is short.** A
       post-commit sweep skips execution if the lease expires while reading the
       store clock and refreshing the manifest, leaving the database unswept

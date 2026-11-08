@@ -594,15 +594,18 @@ Compaction never loads entire segments into memory. Instead, it streams through 
 
 #### Deleting Tombstones
 
-Deleting a key writes a tombstone. The tombstone must remain for two reasons:
+Deleting a key writes a tombstone. The tombstone must remain for three reasons:
 
 1. To shadow older values of the same key that still live in deeper levels of the LSM tree.
 2. To detect conflicts with concurrent transactions.
+3. To report the deletion to change-feed readers (§6.4).
 
-Compaction can permanently drop a tombstone only once both reasons no longer apply:
+Compaction can permanently drop a tombstone only once these reasons no longer apply:
 
 - No older value for the key exists below the tombstone
-- No active transaction started before the delete
+- The tombstone has been visible to readers for at least `txn_max_lifetime`
+
+Version times record when a commit was prepared, which can precede the moment the version becomes visible by however long its manifest `PUT` stalls. A version's time therefore bounds only the versions before it: a commit is prepared on a base version that storage has confirmed, so every older version was visible by then. Compaction finds the newest sampled version whose time is at least `txn_max_lifetime` plus twice `clock_sync_max_error_ms` old, and drops only tombstones from versions before it.
 
 To guard against a stalled transaction trying to commit after 5 minutes, the manifest records `tombstone_horizon`, the highest `seq` of any tombstone that has ever been dropped. Any transaction with `read_version < tombstone_horizon` is rejected at commit time with `409 conflict`.
 
@@ -957,7 +960,7 @@ Change feeds stream modified keys (`GET /v1/dbs/{db}/changes?after=…`, with an
 
 If a poll finds 0 changes and `wait_ms` (up to 50 s) is set, the request waits until a newer version is installed on the node or the timeout expires. A node installs a newer version either by committing locally or by receiving a commit notice from another node. After committing a new data version, a node sends a best-effort `/internal/v1/notice` request with the latest version to the database's rendezvous home node (§7), coalescing concurrent notices so at most 1 request is in flight per database. If the home node has active waiters, it reloads the manifest and wakes them. While waiting without a wakeup, a `strong` read re-checks the manifest every `watch_poll_ms` (1 s), whereas a `snapshot` read (`consistency=snapshot&max_staleness_ms=…`) re-checks the manifest only after its cached snapshot exceeds `max_staleness_ms`.
 
-To compute a page (`Version::changes`), the engine merges only the `tail` and segments with `max_seq` at or above the cursor version. Because compaction retains tombstones for at least `txn_max_lifetime` (5 min, §5.6), a cursor remains valid for at least `txn_max_lifetime` after the snapshot of its oldest page. If tombstones needed by the cursor have been purged, the request fails with `410 cursor_expired` and the client must resynchronize. A client can resynchronize by starting from `after=0` to perform a full state transfer of all live keys. Because a reader starting from version 0 holds only keys returned by earlier pages of that transfer, it only requires tombstones newer than the oldest snapshot version read during the transfer; the cursor records that version as a floor so that purging older tombstones does not expire an in-progress transfer.
+To compute a page (`Version::changes`), the engine merges only the `tail` and segments with `max_seq` at or above the cursor version. Because compaction retains tombstones for at least `txn_max_lifetime` (5 min) after they become visible (§5.6), a cursor remains valid for at least `txn_max_lifetime` after the snapshot of its oldest page. If tombstones needed by the cursor have been purged, the request fails with `410 cursor_expired` and the client must resynchronize. A client can resynchronize by starting from `after=0` to perform a full state transfer of all live keys. Because a reader starting from version 0 holds only keys returned by earlier pages of that transfer, it only requires tombstones newer than the oldest snapshot version read during the transfer; the cursor records that version as a floor so that purging older tombstones does not expire an in-progress transfer.
 
 ## 7. Cluster
 

@@ -1916,11 +1916,11 @@ impl Db {
         let mut retired = 0;
         let mut purged_tombstones = 0;
         if let Some(now_ms) = now.store_ms {
-            let purge = m.version_at_least_age(now_ms, cfg.txn_max_lifetime_ms);
+            let purge_below = m.purgeable_below(now_ms, cfg.txn_max_lifetime_ms, cfg.clock_sync_max_error_ms);
             let mut horizon = m.tombstone_horizon;
             if m.segments.iter().all(compaction::holds_records) {
                 m.tail.retain(|e| {
-                    let purged = e.value.is_tombstone() && e.seq <= purge;
+                    let purged = e.value.is_tombstone() && e.seq < purge_below;
                     if purged {
                         horizon = horizon.max(e.seq);
                         purged_tombstones += 1;
@@ -1931,7 +1931,7 @@ impl Db {
             // Retire range tombstones when no remaining segment overlaps and no active transaction can read them.
             let segments = &m.segments;
             m.range_deletes.retain(|t| {
-                let retire = t.seq <= purge && !segments.iter().any(|s| t.dirties(s));
+                let retire = t.seq < purge_below && !segments.iter().any(|s| t.dirties(s));
                 if retire {
                     horizon = horizon.max(t.seq);
                     retired += 1;
@@ -2258,8 +2258,9 @@ impl Db {
                 Kind::Drop => (Vec::new(), 0, 0, (0, 0)),
                 Kind::DropExpired => (Vec::new(), 0, plan.inputs.iter().map(|s| s.entries).sum(), (0, 0)),
                 Kind::Merge { .. } | Kind::Rewrite | Kind::Expire => {
-                    let purge_seq = v.m.version_at_least_age(store_now, cfg.txn_max_lifetime_ms);
-                    let out = compaction::run(&self.shared, &v.m, &plan, purge_seq).await?;
+                    let purge_below =
+                        v.m.purgeable_below(store_now, cfg.txn_max_lifetime_ms, cfg.clock_sync_max_error_ms);
+                    let out = compaction::run(&self.shared, &v.m, &plan, purge_below).await?;
                     (out.segments, out.purged_max_seq, out.expired, (out.chunks, out.sealed_bytes))
                 }
             };

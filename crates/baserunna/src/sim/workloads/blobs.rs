@@ -123,7 +123,8 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
                     let id = staged["blob_id"].as_str().unwrap_or_default();
                     Ok((
                         format!("{base}/txn"),
-                        json!({"ops": [{"op": "put", "key": key, "blob_id": id}], "idempotency_key": format!("bind-{round}")}),
+                        // Each staged blob gets its own key: a bind that failed for good fences its key.
+                        json!({"ops": [{"op": "put", "key": key, "blob_id": id}], "idempotency_key": format!("bind-{round}-{id}")}),
                     ))
                 })
                 .await?;

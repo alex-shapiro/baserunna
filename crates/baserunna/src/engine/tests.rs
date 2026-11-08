@@ -1611,27 +1611,37 @@ fn version_samples_are_spaced_and_reach_a_lifetime_back() {
     });
 }
 
+/// A tombstone may be purged once the commit after it is older than a transaction lifetime plus
+/// the clock error on both sides: that commit was prepared only after the tombstone's version was
+/// visible, while the tombstone's own version time may precede its visibility.
 #[test]
-fn tail_tombstones_are_dropped_after_a_transaction_lifetime() {
+fn tail_tombstones_are_dropped_once_a_later_commit_is_a_transaction_lifetime_old() {
     rt().block_on(async {
         let (eng, _store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
-        let life = eng.shared.cfg.txn_max_lifetime_ms;
+        let cfg = eng.shared.cfg.clone();
+        let window = Duration::from_millis(cfg.txn_max_lifetime_ms + 2 * cfg.clock_sync_max_error_ms);
+        let sample = Duration::from_millis(cfg.version_sample_ms);
         put(&db, "k", "v").await;
-        tokio::time::sleep(Duration::from_millis(eng.shared.cfg.version_sample_ms)).await;
-        let start = Instant::now();
+        tokio::time::sleep(sample).await;
+        let deleted = Instant::now();
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         t.delete(Bytes::from_static(b"k")).unwrap();
         db.commit(t.into_request()).await.unwrap();
         let tombstone =
             || db.current().unwrap().m.tail.iter().any(|e| e.key.as_ref() == b"k" && e.value.is_tombstone());
-        assert!(tombstone());
-        tokio::time::sleep_until(start + Duration::from_millis(life - 1)).await;
+        tokio::time::sleep(sample).await;
+        let next = Instant::now();
+        put(&db, "y", "1").await;
+        tokio::time::sleep_until(deleted + window + sample / 2).await;
         put(&db, "x", "1").await;
-        assert!(tombstone(), "dropped within a transaction lifetime");
-        tokio::time::sleep_until(start + Duration::from_millis(life)).await;
+        assert!(tombstone(), "the tombstone's own version time made it purgeable");
+        tokio::time::sleep_until(next + window - Duration::from_millis(1)).await;
         put(&db, "x", "2").await;
-        assert!(!tombstone(), "kept beyond a transaction lifetime");
+        assert!(tombstone(), "dropped before the next commit was a window old");
+        tokio::time::sleep_until(next + window).await;
+        put(&db, "x", "3").await;
+        assert!(!tombstone(), "kept after the next commit was a window old");
     });
 }
 
@@ -1800,7 +1810,9 @@ fn merges_purge_expired_tombstones() {
         assert_eq!(out.purged_max_seq, 4);
         assert_eq!(read(&out.segments), [e("a", 5, t.clone()), e("b", 9, t.clone())]);
         m.segments = vec![newer.clone()];
-        let out = compaction::run(&eng.shared, &m, &plan(vec![newer], 6), 9).await.unwrap();
+        let out = compaction::run(&eng.shared, &m, &plan(vec![newer.clone()], 6), 9).await.unwrap();
+        assert_eq!(read(&out.segments), [e("b", 9, t.clone())], "purged a tombstone at the cutoff version");
+        let out = compaction::run(&eng.shared, &m, &plan(vec![newer], 6), 10).await.unwrap();
         assert!(out.segments.is_empty(), "wrote an empty segment");
         assert_eq!(out.purged_max_seq, 9);
     });

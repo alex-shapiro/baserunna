@@ -578,6 +578,18 @@ impl Manifest {
         let cutoff = now_ms.saturating_sub(age_ms);
         self.version_times.iter().filter(|(_, t)| *t <= cutoff).map(|(v, _)| *v).max().unwrap_or(0)
     }
+
+    /// Returns the version below which tombstones may be purged at `now_ms`, measured on a clock
+    /// within `error_ms` of store time: every tombstone at an older version became visible to
+    /// readers at least `window_ms` earlier.
+    ///
+    /// A version's sampled time is when its commit was prepared, which can precede the moment the
+    /// version became visible by as long as its manifest write stalled. The time therefore bounds
+    /// only older versions: a commit is prepared on a base that storage has confirmed, so every
+    /// version before it was visible by then.
+    pub fn purgeable_below(&self, now_ms: u64, window_ms: u64, error_ms: u64) -> Seq {
+        self.version_at_least_age(now_ms, window_ms + 2 * error_ms)
+    }
 }
 
 /// Immutable levels object storing segment metadata below level 0.

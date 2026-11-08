@@ -863,6 +863,30 @@ fn a_rejection_after_an_ambiguous_write_is_not_definite() {
 }
 
 #[test]
+fn a_rejection_that_no_ambiguous_write_included_stays_definite() {
+    rt().block_on(async {
+        let env = Arc::new(Env::sim(10, 1_700_000_000_000, Instant::now(), 0));
+        let clock = env.clone();
+        let mem = Arc::new(MemStore::new(Box::new(move || clock.now_ms())));
+        let store = Arc::new(LateStore { mem, late_manifest_puts: 0.into(), timeout_ms: 3_000, land_after_ms: 100 });
+        let cfg = EngineConfig { manifest_put_hedge_ms: 0, ..EngineConfig::small_for_tests() };
+        let eng = Engine::new(store.clone(), env, cfg, "a".into());
+        let db = opened(&eng, "d").await;
+        let mut a = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        a.put(Bytes::from_static(b"k"), inline("a")).unwrap();
+        let mut c = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        assert!(c.get(b"k").await.unwrap().is_none());
+        c.put(Bytes::from_static(b"j"), inline("c")).unwrap();
+        store.late_manifest_puts.store(1, SeqCst);
+        // Both commits join one batch, in which `c` conflicts with `a` and is never written.
+        let (ra, rc) = tokio::join!(db.commit_detailed(a.into_request()), db.commit_detailed(c.into_request()));
+        let ra = ra.unwrap();
+        assert!(!ra.replayed, "the batch's own commit was reported as a replay");
+        assert!(matches!(rc, Err(Error::Conflict(_))), "a commit that no write included was answered {rc:?}");
+    });
+}
+
+#[test]
 fn a_commit_whose_lost_reply_landed_is_not_a_replay() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");

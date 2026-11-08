@@ -932,8 +932,7 @@ pub(crate) async fn finish<T>(
     let mut req = t.into_request();
     req.deadline = Some(ctx.deadline.instant());
     match ctx.db.commit_detailed(req).await {
-        // Without an idempotency key, `replayed` is true only if the committer
-        // retried an ambiguous manifest PUT that had already succeeded.
+        // `replayed` is true only if an earlier request with the same idempotency key committed.
         Ok(c) if c.replayed && key.is_some() => Ok(Some(Ran::Replayed(c))),
         Ok(commit) => Ok(Some(Ran::Committed { out, commit })),
         Err(Error::Conflict(_)) if *attempt < node.cfg.txn_retries => {

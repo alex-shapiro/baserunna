@@ -61,7 +61,8 @@ impl CloudStore {
         url: &str,
         settings: impl IntoIterator<Item = (impl AsRef<str>, impl Into<String>)>,
     ) -> Result<CloudStore, String> {
-        CloudStore::from_env_with(url, std::env::vars(), settings)
+        let env = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+        CloudStore::from_env_with(url, env, settings)
     }
 
     /// Parses `s3://bucket[/prefix]` with the `AWS_*` variables of `env`, then `settings`.

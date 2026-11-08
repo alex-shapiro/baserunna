@@ -1717,8 +1717,8 @@ pub fn document() -> &'static Value {
                 "description": "Transactional key-value, table, stream, and event-table databases on object storage. Authenticate with \
                     `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the \
                     Error schema with a stable `code`; `retryable` errors may be retried. A `503` with \
-                    `details.outcome: \"unknown\"` may have been applied, so retry a write only with its idempotency \
-                    key, or check `/commits/{id}` first. Requests over a rate limit return 429 `rate_limited` with `Retry-After` and are not \
+                    `details.outcome: \"unknown\"`, or a `500`, may have been applied, so retry a write only with its \
+                    idempotency key, or check `/commits/{id}` first. Requests over a rate limit return 429 `rate_limited` with `Retry-After` and are not \
                     applied; writes that would exceed a database's size quota return 507 `quota_exceeded`. Every response \
                     includes an `x-request-id` header containing the client-supplied value (1-64 characters of \
                     `[A-Za-z0-9._:-]`) or a generated ID recorded in server logs.",

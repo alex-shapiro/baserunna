@@ -175,7 +175,7 @@ impl OpenTxns {
         Ok(open)
     }
 
-    /// Forgets a commit recorded by [`OpenTxns::note_commit`] that certainly was not applied.
+    /// Forgets a commit recorded by [`TxnGuard::take_for_commit`] that certainly was not applied.
     pub fn forget_commit(&self, id: &str) {
         self.committed.remove(&id.to_string());
     }

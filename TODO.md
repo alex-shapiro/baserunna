@@ -195,6 +195,17 @@ correct S3 store, but each one turns a store fault into silent wrong data.
       another node, the request gets a retryable `404 txn_not_found`, which
       tells a client to restart the transaction. Derive the transaction ID
       from its commit ID so that any node can look up the commit record.
+- [ ] **Decide whether `retryable` is true for an unknown outcome.** A `503`
+      with `outcome: "unknown"` is marked `retryable: true`, so a client that
+      follows `retryable` can apply a write without an idempotency key twice.
+      `baserunna-client` ignores the flag and is safe. Making the flag false
+      for unknown outcomes is safer for naive clients, but they would then
+      surface errors that a retry with an idempotency key could resolve.
+- [ ] **Decide ambiguity per commit on every failure path.** The paths that
+      give up on a batch (lease moved, shutdown, build error, store error,
+      retries exhausted) mark every commit of the batch unknown once an
+      ambiguous write happened, even a commit that no ambiguous write
+      included. This is safe but loses definite answers.
 - [ ] **Show `outcome: "unknown"` in the console.** The console shows only the
       error message, so a write that may have been applied looks failed.
 - [ ] **Return the outcome of a repaired database deletion.** A retried

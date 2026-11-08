@@ -797,6 +797,72 @@ fn a_segment_stored_under_another_segments_key_is_rejected() {
     });
 }
 
+/// Store whose next `late_manifest_puts` manifest writes time out for the caller and land later.
+struct LateStore {
+    mem: Arc<MemStore>,
+    late_manifest_puts: AtomicU32,
+    timeout_ms: u64,
+    land_after_ms: u64,
+}
+
+impl ObjectStore for LateStore {
+    fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
+        self.mem.get(key, opts)
+    }
+
+    fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
+        Box::pin(async move {
+            if key.ends_with("/manifest") && take_fault(&self.late_manifest_puts) {
+                let (mem, key, land_after_ms) = (self.mem.clone(), key.to_string(), self.land_after_ms);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(land_after_ms)).await;
+                    let _ = mem.put_sync(&key, data, &mode);
+                });
+                tokio::time::sleep(Duration::from_millis(self.timeout_ms)).await;
+                return Err(StoreError::Unavailable("request timed out".into()));
+            }
+            self.mem.put_sync(key, data, &mode)
+        })
+    }
+
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFut<'a, SResult<()>> {
+        self.mem.delete(key)
+    }
+
+    fn list<'a>(&'a self, prefix: &'a str, after: Option<&'a str>, limit: usize) -> BoxFut<'a, SResult<ListPage>> {
+        self.mem.list(prefix, after, limit)
+    }
+
+    fn time_precision_ms(&self) -> u64 {
+        self.mem.time_precision_ms()
+    }
+}
+
+#[test]
+fn a_rejection_after_an_ambiguous_write_is_not_definite() {
+    rt().block_on(async {
+        let env = Arc::new(Env::sim(9, 1_700_000_000_000, Instant::now(), 0));
+        let clock = env.clone();
+        let mem = Arc::new(MemStore::new(Box::new(move || clock.now_ms())));
+        let store =
+            Arc::new(LateStore { mem, late_manifest_puts: 0.into(), timeout_ms: 3_000, land_after_ms: 3_500 });
+        let cfg = EngineConfig { manifest_put_hedge_ms: 0, ..EngineConfig::small_for_tests() };
+        let ttl = cfg.blob_stage_ttl_ms;
+        let eng = Engine::new(store.clone(), env, cfg, "a".into());
+        let db = opened(&eng, "d").await;
+        let blob = blob::write_blob(&eng.shared, "d", b"payload", "x/y").await.unwrap();
+        // The staged blob expires while the first manifest write is in flight.
+        tokio::time::sleep(Duration::from_millis(ttl - 1_000)).await;
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        t.put(Bytes::from_static(b"k"), Value::Blob(blob)).unwrap();
+        store.late_manifest_puts.store(1, SeqCst);
+        let r = db.commit(t.into_request()).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(strong_get(&db, "k").await.is_some(), "the late write did not land");
+        assert!(matches!(r, Err(Error::Unavailable { outcome_unknown: true, .. })), "applied, but answered {r:?}");
+    });
+}
+
 #[test]
 fn obsolete_segments_outlive_snapshots_then_go() {
     rt().block_on(async {

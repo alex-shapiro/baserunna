@@ -1186,15 +1186,17 @@ impl Db {
                 self.schedule_trims(plan.due);
                 self.clear_lease_flag(&batch);
                 for (w, o) in batch.into_iter().zip(plan.outcomes) {
-                    // If a prior attempt in this batch was ambiguous and is not yet fenced, mark the outcome as unknown.
+                    // If a prior attempt in this batch was ambiguous and is not yet fenced, it may still land,
+                    // so a rejection now (for example, of a transaction whose deadline, staged blob, or read
+                    // has since expired) does not show that the transaction was not applied.
                     let o = match o {
-                        Outcome::Seq(Err(e @ Error::Unavailable { .. })) if maybe_applied => {
+                        Outcome::Seq(Err(e)) if maybe_applied && !matches!(e, Error::Aborted(_)) => {
                             Outcome::Seq(Err(unknown(e)))
                         }
                         Outcome::Binds(v) if maybe_applied => Outcome::Binds(
                             v.into_iter()
                                 .map(|r| match r {
-                                    Err(e @ Error::Unavailable { .. }) => Err(unknown(e)),
+                                    Err(e) if !matches!(e, Error::Aborted(_)) => Err(unknown(e)),
                                     r => r,
                                 })
                                 .collect(),

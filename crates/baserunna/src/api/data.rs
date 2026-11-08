@@ -615,15 +615,17 @@ async fn commit_txn(
     let enc = txn.encoding();
     let mut t = txn.take_for_commit();
     let cid = t.commit_id;
-    let definite = |e: Error| {
-        if !e.may_have_applied() {
-            node.txns.forget_commit(&id);
-        }
+    // The commit is sent only by `commit_detailed`, so a failure before it, or a transaction
+    // without writes, leaves nothing that a later request could find applied.
+    let not_sent = |e: Error| {
+        node.txns.forget_commit(&id);
         e
     };
-    let mut results = exec_ops(&op_ctx(&node, &ctx, enc), &mut t, &ops).await.map_err(definite)?;
-    if !t.is_read_only() {
-        ctx.require_write().map_err(definite)?;
+    let mut results = exec_ops(&op_ctx(&node, &ctx, enc), &mut t, &ops).await.map_err(not_sent)?;
+    if t.is_read_only() {
+        node.txns.forget_commit(&id);
+    } else {
+        ctx.require_write().map_err(not_sent)?;
     }
     if t.needs_revalidation(!t.is_read_only()) {
         node.txns.forget_commit(&id);
@@ -636,7 +638,12 @@ async fn commit_txn(
     }
     let mut creq = t.into_request();
     creq.deadline = Some(ctx.deadline.instant());
-    let c = ctx.db.commit_detailed(creq).await.map_err(|e| naming_commit(definite(e), cid))?;
+    let c = ctx.db.commit_detailed(creq).await.map_err(|e| {
+        if !e.may_have_applied() {
+            node.txns.forget_commit(&id);
+        }
+        naming_commit(e, cid)
+    })?;
     let own_appends = ops.iter().filter(|o| matches!(o, Op::Append { .. })).count();
     ops::fill_appends(&ops, &mut results, &c.appends[c.appends.len().saturating_sub(own_appends)..]);
     Ok(axum::Json(json!({

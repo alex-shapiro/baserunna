@@ -770,6 +770,34 @@ fn a_lost_manifest_is_not_recreated_over_existing_data() {
 }
 
 #[test]
+fn a_segment_stored_under_another_segments_key_is_rejected() {
+    rt().block_on(async {
+        let cfg = EngineConfig { segment_whole_fetch_max: 1 << 20, ..EngineConfig::small_for_tests() };
+        let (eng, store, env) = engine(2, cfg.clone());
+        let db = opened(&eng, "d").await;
+        for prefix in ["a", "b"] {
+            for i in 0..25 {
+                put(&db, &format!("{prefix}{i:03}"), &"x".repeat(100)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(2_000)).await;
+            db.maintenance_now().await.unwrap();
+        }
+        let m = db.current().unwrap().m.clone();
+        let only = |p: u8| m.segments.iter().find(|s| s.min_key[0] == p && s.max_key[0] == p).unwrap();
+        let (a, b) = (only(b'a'), only(b'b'));
+        let a_bytes = store.get_sync(&seg_key("d", &a.id), &GetOpts::default()).unwrap().data;
+        store.put_sync(&seg_key("d", &b.id), a_bytes, &PutMode::Overwrite).unwrap();
+        let other = Engine::new(store.clone(), env.clone(), cfg.clone(), "node-b".into());
+        let replica = other.db("d");
+        replica.open(false).await.unwrap();
+        let snap = replica.snapshot(Consistency::Strong).await.unwrap();
+        let scan = snap.scan(&KeyRange::data(), false, usize::MAX).await;
+        let err = scan.map(|e| e.len()).expect_err("the substituted segment was read as the listed one");
+        assert!(err.to_string().contains("but its manifest lists"), "{err}");
+    });
+}
+
+#[test]
 fn obsolete_segments_outlive_snapshots_then_go() {
     rt().block_on(async {
         let (a, store) = delayed_engine("a");

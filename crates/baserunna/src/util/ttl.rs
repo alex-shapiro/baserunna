@@ -14,7 +14,7 @@ pub struct TtlCache<K, V> {
     map: Mutex<DetHashMap<K, (Instant, V)>>,
 }
 
-impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
+impl<K: Hash + Eq + Clone, V: Clone> TtlCache<K, V> {
     pub fn new(ttl: Duration, max: usize) -> TtlCache<K, V> {
         TtlCache { ttl, max, map: Mutex::new(DetHashMap::default()) }
     }
@@ -36,10 +36,12 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
                     m.retain(|_, (at, _)| at.elapsed() < self.ttl);
                 }
                 if m.len() >= self.max {
-                    let mut times: Vec<Instant> = m.values().map(|(at, _)| *at).collect();
-                    let k = times.len() / 8;
-                    let cutoff = *times.select_nth_unstable(k).1;
-                    m.retain(|_, (at, _)| *at > cutoff);
+                    let mut by_age: Vec<(Instant, K)> = m.iter().map(|(key, (at, _))| (*at, key.clone())).collect();
+                    let evict_count = (by_age.len() / 8).max(1);
+                    by_age.select_nth_unstable_by_key(evict_count - 1, |(at, _)| *at);
+                    for (_, key) in &by_age[..evict_count] {
+                        m.remove(key);
+                    }
                 }
                 m.insert(k, (read_at, v));
             }
@@ -94,7 +96,7 @@ mod tests {
                 c.store(k, Some("x"), Instant::now());
             }
             c.store(9, Some("y"), Instant::now());
-            assert_eq!((c.len(), c.get(&9)), (1, Some("y")));
+            assert_eq!((c.len(), c.get(&9)), (3, Some("y")));
             c.store(9, None, Instant::now());
             assert_eq!(c.get(&9), None);
         });
@@ -109,11 +111,11 @@ mod tests {
                 c.store(k, Some(k), Instant::now());
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            assert!(c.len() <= 16);
-            for k in 8..17 {
+            assert_eq!(c.len(), 15, "an insert into a full cache evicts its oldest eighth");
+            for k in 2..17 {
                 assert_eq!(c.get(&k), Some(k), "a recent entry was evicted");
             }
-            assert_eq!(c.get(&0), None);
+            assert_eq!((c.get(&0), c.get(&1)), (None, None));
         });
     }
 }

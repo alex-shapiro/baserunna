@@ -613,6 +613,7 @@ impl Db {
         };
         let key = manifest_key(&self.id);
         let mut levels_missing: Option<String> = None;
+        let mut found_objects: Option<String> = None;
         loop {
             let started = Instant::now();
             let res = self
@@ -643,6 +644,20 @@ impl Db {
                     return Ok((self.install(v, started), started));
                 }
                 Err(StoreError::NotFound) if create => {
+                    // A database's first manifest precedes all of its other objects, so a missing
+                    // manifest next to them was lost, and an empty one would let collection delete them.
+                    // Another node may have created the manifest since the read, so a second read decides.
+                    let prefix = super::db_prefix(&self.id);
+                    let page = self.shared.retry.run(|| self.shared.store.list(&prefix, None, 1)).await?;
+                    if let Some(o) = page.objects.first() {
+                        if found_objects.replace(o.key.clone()).is_none() {
+                            continue;
+                        }
+                        return Err(Error::internal(format!(
+                            "the manifest of database {} is missing, but its object {} exists",
+                            self.id, o.key
+                        )));
+                    }
                     let m = Manifest::new(&self.id, self.shared.time_ms(), self.shared.store_now_ms());
                     match self.shared.store.put(&key, m.encode(), PutMode::Create).await {
                         Ok(etag) => {

@@ -746,6 +746,30 @@ fn opening_without_create_never_creates() {
 }
 
 #[test]
+fn a_lost_manifest_is_not_recreated_over_existing_data() {
+    rt().block_on(async {
+        let cfg = EngineConfig::small_for_tests();
+        let (eng, store, env) = engine(1, cfg.clone());
+        let db = opened(&eng, "d").await;
+        for i in 0..60 {
+            put(&db, &format!("k{i:03}"), &"x".repeat(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        db.maintenance_now().await.unwrap();
+        let segments: Vec<String> = db.current().unwrap().m.segments.iter().map(|s| seg_key("d", &s.id)).collect();
+        assert!(!segments.is_empty(), "the tail was not flushed");
+        store.delete_sync(&manifest_key("d"));
+        let other = Engine::new(store.clone(), env.clone(), cfg.clone(), "node-b".into());
+        let err = other.db("d").open(true).await.map(|_| ()).expect_err("an empty manifest replaced the lost one");
+        assert!(err.to_string().contains("manifest of database d is missing"), "{err}");
+        assert!(store.get_sync(&manifest_key("d"), &GetOpts::default()).is_err(), "a manifest was created");
+        for s in &segments {
+            assert!(store.get_sync(s, &GetOpts::default()).is_ok(), "{s} was deleted");
+        }
+    });
+}
+
+#[test]
 fn obsolete_segments_outlive_snapshots_then_go() {
     rt().block_on(async {
         let (a, store) = delayed_engine("a");

@@ -16,7 +16,7 @@ impl Endpoint for GetMetrics {
     type Body = NoBody;
     type Response = Metrics;
 
-    fn is_idempotent(_: &NoBody) -> bool {
+    fn is_idempotent(&self, _: &NoBody) -> bool {
         true
     }
 
@@ -37,7 +37,7 @@ impl Endpoint for ResetMetrics {
     type Body = NoBody;
     type Response = Metrics;
 
-    fn is_idempotent(_: &NoBody) -> bool {
+    fn is_idempotent(&self, _: &NoBody) -> bool {
         false
     }
 

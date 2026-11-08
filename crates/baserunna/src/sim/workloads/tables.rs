@@ -43,6 +43,8 @@ async fn once(c: &Client, ops: Json, key: &str) -> Result<Option<Json>, String> 
     loop {
         match c.call("POST", "/v1/dbs/tdb/txn", Some(body.clone())).await {
             Ok(r) if r.status == 200 => return Ok((r.json["replayed"] != true).then(|| r.json["results"].clone())),
+            // An earlier attempt changed no rows, which fenced the key, and its response was lost.
+            Ok(r) if r.code() == "aborted" => return Ok(Some(json!([{"count": 0}]))),
             Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => c.pause(50).await,
             Ok(r) if r.status != 503 && r.status != 429 => return Err(format!("{key}: {} {}", r.status, r.json)),
             _ => c.pause(super::super::client::ZOMBIE_WAIT_MS).await,

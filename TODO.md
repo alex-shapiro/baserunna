@@ -25,6 +25,10 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       fail repeatedly with `503 request deadline exceeded`
       (`sim_tool trace streams 2601188`, and the checker reads of `streams` seeds
       9102146 and 9107143).
+- [ ] **Fix `watch` seed 9301453: a change-feed cursor expires within a
+      transaction lifetime.** A cursor issued at store time 1750519595155
+      reports `cursor_expired` 28 s later, although cursors stay valid for
+      `txn_max_lifetime_ms` (`sim_tool trace watch 9301453`).
 - [ ] **Run garbage collection sweeps even if the lease duration is short.** A
       post-commit sweep skips execution if the lease expires while reading the
       store clock and refreshing the manifest, leaving the database unswept
@@ -258,10 +262,9 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 - [ ] **Validate additional S3-compatible object stores.** Run the conformance
       suite and failover check against AWS S3, Cloudflare R2, MinIO, Azure Blob
       Storage, and Google Cloud Storage.
-- [ ] **Support idempotency keys for raw KV writes.** Accept an
-      `Idempotency-Key` header on `PUT` and `DELETE /v1/dbs/{db}/kv/{key}` and
-      return the commit ID in a response header so clients can resolve
-      ambiguous writes via `GET /commits/{id}`.
+- [ ] **Support idempotency keys for raw KV deletes.** `PUT
+      /v1/dbs/{db}/kv/{key}` accepts an `Idempotency-Key` header, but `DELETE`
+      does not, so a client cannot resolve an ambiguous raw delete.
 - [ ] **Support filtering whole JSON columns and reading nested JSON objects by
       path.** Event parts store only leaf JSON paths, so filtering on a root
       JSON column is rejected (`exec::Binder::filter`) and querying a non-leaf

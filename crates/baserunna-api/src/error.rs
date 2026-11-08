@@ -89,6 +89,20 @@ pub struct ErrorDetails {
     /// Delay in milliseconds before the next request (`rate_limited`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    /// What was not found, if the server names it (`not_found`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing: Option<Missing>,
+}
+
+/// Kind of thing that a `not_found` error found missing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Missing {
+    /// The key of a raw key-value read holds no value.
+    Key,
+    /// Kind added by a newer server.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Whether a failed request modified data.

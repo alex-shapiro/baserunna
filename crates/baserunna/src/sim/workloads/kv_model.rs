@@ -415,9 +415,11 @@ impl KvModel {
                     }
                     return Ok(());
                 }
+                // An earlier attempt failed for good, and its response was lost.
                 409 if r.code() == "aborted" => {
-                    if fail_at.is_none() {
-                        return Err(format!("step {}: aborted without a precondition to fail: {}", self.step, r.json));
+                    let rejectable = fail_at.is_some() || sim.writes.values().any(|w| w.is_some());
+                    if !rejectable {
+                        return Err(format!("step {}: aborted without a way to fail: {}", self.step, r.json));
                     }
                     return Ok(());
                 }

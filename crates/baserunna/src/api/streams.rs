@@ -437,14 +437,20 @@ fn events(node: Arc<Node>, f: Follow, spec: ReadSpec, first: (ReadOut, u64)) -> 
 
 async fn query(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, JsonBody(b): JsonBody<Json>) -> Result<J> {
     let name = param(&p, "s")?.to_string();
+    let (spec, c, enc) = query_spec(b)?;
+    let (out, v) = read_once(&ctx.db, c, &name, &spec).await?;
+    Ok(axum::Json(serde_json::to_value(record_page(&out, enc, v)).expect("records serialize")))
+}
+
+/// The read, consistency and encoding of an [`api::RecordQuery`] body.
+fn query_spec(b: Json) -> Result<(ReadSpec, Consistency, Encoding)> {
     let (mut b, c) = split_consistency(b)?;
     let enc = match b.as_object_mut().and_then(|o| o.remove("encoding")) {
         None => Encoding::Utf8,
         Some(e) => serde_json::from_value(e).map_err(|_| Error::invalid("encoding is utf8 or base64"))?,
     };
-    let spec: ReadSpec = serde_json::from_value(b).map_err(|e| Error::invalid(format!("invalid query: {e}")))?;
-    let (out, v) = read_once(&ctx.db, c, &name, &spec).await?;
-    Ok(axum::Json(serde_json::to_value(record_page(&out, enc, v)).expect("records serialize")))
+    let spec = serde_json::from_value(b).map_err(|e| Error::invalid(format!("invalid query: {e}")))?;
+    Ok((spec, c, enc))
 }
 
 #[derive(Deserialize)]
@@ -526,6 +532,65 @@ mod tests {
     use tower::ServiceExt;
 
     const S: &str = "/v1/dbs/logs/streams/app";
+
+    #[test]
+    fn every_field_of_a_client_read_or_query_parses_on_the_server() {
+        let read = api::ReadRecordsQuery {
+            from_seq: Some(1),
+            from_time: Some(2),
+            tail: Some(3),
+            consumer: Some("c".into()),
+            until_seq: Some(4),
+            until_time: Some(5),
+            reverse: true,
+            limit: Some(6),
+            max_bytes: Some(7),
+            scan_limit: Some(8),
+            wait_ms: Some(9),
+            encoding: Some(Encoding::Base64),
+            consistency: Some(api::Consistency::Snapshot),
+            max_staleness_ms: Some(10),
+        };
+        let q = axum::extract::Query(serde_urlencoded::from_str(&serde_urlencoded::to_string(&read).unwrap()).unwrap());
+        let spec = read_spec(&q).unwrap();
+        let want = ReadSpec {
+            from_seq: Some(1),
+            from_time: Some(2),
+            tail: Some(3),
+            consumer: Some("c".into()),
+            until_seq: Some(4),
+            until_time: Some(5),
+            reverse: true,
+            limit: Some(6),
+            max_bytes: Some(7),
+            filter: None,
+            scan_limit: Some(8),
+        };
+        assert_eq!(format!("{spec:?}"), format!("{want:?}"));
+        assert_eq!(number::<u64>(&q, "wait_ms").unwrap(), Some(9));
+        assert!(encoding_param(&q).unwrap() == Encoding::Base64);
+        assert_eq!(consistency_of(&q).unwrap(), Consistency::Snapshot { max_staleness_ms: 10 });
+
+        let query = api::RecordQuery {
+            from_seq: read.from_seq,
+            from_time: read.from_time,
+            tail: read.tail,
+            consumer: read.consumer,
+            until_seq: read.until_seq,
+            until_time: read.until_time,
+            reverse: read.reverse,
+            limit: read.limit,
+            max_bytes: read.max_bytes,
+            filter: Some(json!({"field": "level", "op": "eq", "value": "error"})),
+            scan_limit: read.scan_limit,
+            encoding: read.encoding,
+            consistency: read.consistency,
+            max_staleness_ms: read.max_staleness_ms,
+        };
+        let (spec, c, enc) = query_spec(serde_json::to_value(&query).unwrap()).unwrap();
+        assert!(spec.filter.is_some() && spec.scan_limit == Some(8) && spec.tail == Some(3), "{spec:?}");
+        assert!(c == Consistency::Snapshot { max_staleness_ms: 10 } && enc == Encoding::Base64);
+    }
 
     /// A node with database `logs` holding stream `app`; its router and a token.
     async fn world() -> (World, axum::Router, String) {

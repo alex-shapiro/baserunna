@@ -311,7 +311,6 @@
         },
         "required": [
           "version",
-          "committed",
           "commit_id"
         ],
         "type": "object"
@@ -701,6 +700,12 @@
                 "additionalProperties": false,
                 "properties": {
                   "lease_holder": {
+                    "type": "string"
+                  },
+                  "missing": {
+                    "enum": [
+                      "key"
+                    ],
                     "type": "string"
                   },
                   "op_index": {

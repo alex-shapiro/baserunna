@@ -24,7 +24,7 @@ pub use account::{
 };
 pub use admin::{CommitMetrics, Cpu, GetMetrics, Histogram, Metrics, ResetMetrics};
 pub use db::{CreateDb, Db, DbInfo, DbPage, DbStats, DeleteDb, GetDb, LevelStats, ListDbs, ListDbsQuery, NewDb};
-pub use error::{ApiError, ErrorBody, ErrorCode, ErrorDetails, Outcome};
+pub use error::{ApiError, ErrorBody, ErrorCode, ErrorDetails, Missing, Outcome};
 pub use kv::{
     BlobMeta, ByteRange, Change, ChangePage, Changes, ChangesQuery, Content, DeletedRange, Expect, GetValue, KvValue,
     PutOptions, PutValue, ReadBlob, StageBlob, Written,
@@ -63,7 +63,7 @@ pub trait Endpoint {
     type Response: Body;
 
     /// Returns true if repeating a successful request has no effect.
-    fn is_idempotent(body: &Self::Body) -> bool;
+    fn is_idempotent(&self, body: &Self::Body) -> bool;
 
     /// Returns true if the request changes nothing, so that no failed attempt of it applied.
     fn is_read_only(_body: &Self::Body) -> bool {

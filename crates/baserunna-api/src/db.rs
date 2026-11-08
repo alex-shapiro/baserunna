@@ -13,7 +13,7 @@ impl Endpoint for CreateDb {
     type Body = NewDb;
     type Response = Db;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         false
     }
 
@@ -55,7 +55,7 @@ impl Endpoint for ListDbs {
     type Body = NoBody;
     type Response = DbPage;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         true
     }
 
@@ -93,7 +93,7 @@ impl Endpoint for GetDb {
     type Body = NoBody;
     type Response = DbInfo;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         true
     }
 
@@ -115,7 +115,7 @@ impl Endpoint for DeleteDb {
     type Body = NoBody;
     type Response = Empty;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         false
     }
 

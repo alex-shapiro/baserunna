@@ -306,7 +306,7 @@ fn table_definitions_default_to_nullable_columns() {
         indexes: vec![],
         if_not_exists: true,
     };
-    assert!(CreateTable::is_idempotent(&def));
+    assert!(CreateTable { db: "d".into() }.is_idempotent(&def));
     assert_eq!(NewTable::decode(def.encode()).unwrap(), def);
     let names = ["string", "int", "float", "bool", "bytes", "json", "blob"];
     let types: Vec<ColumnType> = names.iter().map(|n| serde_json::from_value(json!(n)).unwrap()).collect();

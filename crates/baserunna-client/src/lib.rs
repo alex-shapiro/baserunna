@@ -156,7 +156,7 @@ impl Client {
         body: &E::Body,
         allowed_error: Option<api::ErrorCode>,
     ) -> Result<Option<E::Response>, Box<Failed>> {
-        let idempotent = E::is_idempotent(body) || allowed_error.is_some();
+        let idempotent = endpoint.is_idempotent(body) || allowed_error.is_some();
         let read_only = E::is_read_only(body);
         let path = endpoint.path();
         let body = body.encode();
@@ -488,29 +488,47 @@ impl Db {
         if ops.is_empty() {
             return Ok(None);
         }
+        let request = |key: &str| (api::Txn { db: self.name.clone() }, txn_request(ops, Some(key)));
+        let applied = |r: api::TxnResponse| {
+            r.commit_id.map(|commit_id| Committed {
+                version: r.version,
+                commit_id,
+                appends: r.appends.unwrap_or_default(),
+            })
+        };
+        self.exactly_once(request, applied, Some).await
+    }
+
+    /// Sends the request that `request` builds for a new idempotency key, and returns what
+    /// `applied` makes of its response or `resolved` makes of the commit that resolves an unknown
+    /// outcome.
+    async fn exactly_once<E: Endpoint, T>(
+        &self,
+        request: impl Fn(&str) -> (E, E::Body),
+        applied: impl Fn(E::Response) -> T,
+        resolved: impl Fn(Committed) -> T,
+    ) -> Result<T, Error> {
         // An aborted key can never apply, so a new key safely learns why the server refused it.
-        match self.write_once(ops).await {
-            Err(e) if e.code() == Some(api::ErrorCode::Aborted) => self.write_once(ops).await,
+        match self.once(&request, &applied, &resolved).await {
+            Err(e) if e.code() == Some(api::ErrorCode::Aborted) => self.once(&request, &applied, &resolved).await,
             r => r,
         }
     }
 
-    async fn write_once(&self, ops: &[Op]) -> Result<Option<Committed>, Error> {
+    async fn once<E: Endpoint, T>(
+        &self,
+        request: &impl Fn(&str) -> (E, E::Body),
+        applied: &impl Fn(E::Response) -> T,
+        resolved: &impl Fn(Committed) -> T,
+    ) -> Result<T, Error> {
         let key = self.client.random_id();
         let started = tokio::time::Instant::now();
-        let e = api::Txn { db: self.name.clone() };
-        match self.client.attempts(&e, &txn_request(ops, Some(&key)), None).await {
-            Ok(resp) => {
-                let resp = resp.expect("no error is allowed");
-                Ok(resp.commit_id.map(|commit_id| Committed {
-                    version: resp.version,
-                    commit_id,
-                    appends: resp.appends.unwrap_or_default(),
-                }))
-            }
+        let (e, body) = request(&key);
+        match self.client.attempts(&e, &body, None).await {
+            Ok(r) => Ok(applied(r.expect("no error is allowed"))),
             Err(f) if f.error.outcome() == api::Outcome::Unknown => {
                 let Failed { error, refusal } = *f;
-                self.resolve(&format!("key:{key}"), started, error, refusal).await.map(Some)
+                self.resolve(&format!("key:{key}"), started, error, refusal).await.map(resolved)
             }
             Err(f) => Err(f.error),
         }
@@ -580,19 +598,37 @@ impl Db {
         range: Option<api::ByteRange>,
     ) -> Result<Option<api::KvValue>, Error> {
         let e = api::GetValue { db: self.name.clone(), key: key.into(), range };
-        let r = self.client.attempts(&e, &api::NoBody {}, Some(api::ErrorCode::NotFound)).await;
-        r.map_err(|f| f.error)
+        match self.client.send(&e, &api::NoBody {}).await {
+            Ok(v) => Ok(Some(v)),
+            Err(Error::Api { error, .. })
+                if error.details.as_ref().and_then(|d| d.missing) == Some(api::Missing::Key) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    /// Writes `data` to `key` in one commit outside any transaction.
+    /// Writes `data` to `key` exactly once, in one commit outside any transaction.
+    ///
+    /// If the outcome remains unknown after retries, it is resolved like [`Db::write`].
     pub async fn put_value(
         &self,
         key: impl Into<Bytes>,
         data: impl Into<Bytes>,
         options: api::PutOptions,
     ) -> Result<api::Written, Error> {
-        let e = api::PutValue { db: self.name.clone(), key: key.into(), options };
-        self.client.send(&e, &api::Octets(data.into())).await
+        let (key, data) = (key.into(), api::Octets(data.into()));
+        let request = |id: &str| {
+            let e = api::PutValue {
+                db: self.name.clone(),
+                key: key.clone(),
+                options: options.clone(),
+                idempotency_key: Some(id.into()),
+            };
+            (e, data.clone())
+        };
+        self.exactly_once(request, |w| w, |c| api::Written { version: c.version }).await
     }
 }
 

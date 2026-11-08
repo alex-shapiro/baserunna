@@ -506,9 +506,10 @@ pub fn scenarios() -> Vec<Scenario> {
             run: |s| {
                 let k = &s.knobs;
                 let n = |name, lo, hi| k.range(name, lo, hi) as usize;
-                let (counters, mutators) = (n("client.counters", 1, 3), n("client.mutators", 1, 3));
-                let (ledgers, steps) = (n("client.ledgers", 1, 3), n("client.steps", 20, 60));
-                Box::pin(client::run(s.clone(), counters, mutators, ledgers, steps, true))
+                let (counters, mutators) = (n("client.counters", 2, 4), n("client.mutators", 1, 3));
+                let (ledgers, streams) = (n("client.ledgers", 1, 3), n("client.streams", 1, 2));
+                let steps = n("client.steps", 20, 60);
+                Box::pin(client::run(s.clone(), counters, mutators, ledgers, streams, steps, true))
             },
         },
     ]

@@ -17,7 +17,7 @@ impl Endpoint for Txn {
     type Body = TxnRequest;
     type Response = TxnResponse;
 
-    fn is_idempotent(body: &TxnRequest) -> bool {
+    fn is_idempotent(&self, body: &TxnRequest) -> bool {
         body.is_idempotent()
     }
 
@@ -45,7 +45,7 @@ impl Endpoint for BeginTxn {
     type Body = BeginRequest;
     type Response = Begun;
 
-    fn is_idempotent(_: &BeginRequest) -> bool {
+    fn is_idempotent(&self, _: &BeginRequest) -> bool {
         false
     }
 
@@ -71,7 +71,7 @@ impl Endpoint for TxnOps {
     type Body = OpsRequest;
     type Response = OpsResponse;
 
-    fn is_idempotent(_: &OpsRequest) -> bool {
+    fn is_idempotent(&self, _: &OpsRequest) -> bool {
         false
     }
 
@@ -96,7 +96,7 @@ impl Endpoint for CommitTxn {
     type Body = CommitRequest;
     type Response = Committed;
 
-    fn is_idempotent(_: &CommitRequest) -> bool {
+    fn is_idempotent(&self, _: &CommitRequest) -> bool {
         false
     }
 
@@ -123,7 +123,7 @@ impl Endpoint for AbortTxn {
     type Body = NoBody;
     type Response = Empty;
 
-    fn is_idempotent(_: &NoBody) -> bool {
+    fn is_idempotent(&self, _: &NoBody) -> bool {
         true
     }
 
@@ -149,7 +149,7 @@ impl Endpoint for GetCommit {
     type Body = NoBody;
     type Response = CommitStatus;
 
-    fn is_idempotent(_: &NoBody) -> bool {
+    fn is_idempotent(&self, _: &NoBody) -> bool {
         true
     }
 
@@ -286,7 +286,9 @@ pub struct OpsResponse {
 pub struct Committed {
     /// Commit version, or the read version if the transaction wrote nothing.
     pub version: u64,
-    /// False if the transaction wrote nothing, so that no commit was applied.
+    /// False if the transaction wrote nothing, so that no commit was applied. Servers that predate
+    /// the field omit it, and it then reads as true.
+    #[serde(default = "yes")]
     pub committed: bool,
     pub commit_id: String,
     /// First sequence number assigned to each `append` operation in the transaction, in order.
@@ -322,3 +324,7 @@ json_body!(
     Committed,
     CommitStatus
 );
+
+fn yes() -> bool {
+    true
+}

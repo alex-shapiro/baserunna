@@ -20,7 +20,7 @@ impl Endpoint for CreateTable {
     type Body = NewTable;
     type Response = CreatedTable;
 
-    fn is_idempotent(body: &NewTable) -> bool {
+    fn is_idempotent(&self, body: &NewTable) -> bool {
         body.if_not_exists
     }
 
@@ -44,7 +44,7 @@ impl Endpoint for AddColumn {
     type Body = NewColumn;
     type Response = CreatedTable;
 
-    fn is_idempotent(_: &NewColumn) -> bool {
+    fn is_idempotent(&self, _: &NewColumn) -> bool {
         false
     }
 
@@ -68,7 +68,7 @@ impl Endpoint for AddIndex {
     type Body = NewIndex;
     type Response = CreatedTable;
 
-    fn is_idempotent(_: &NewIndex) -> bool {
+    fn is_idempotent(&self, _: &NewIndex) -> bool {
         false
     }
 
@@ -91,7 +91,7 @@ impl Endpoint for ListTables {
     type Body = NoBody;
     type Response = TablePage;
 
-    fn is_idempotent(_: &NoBody) -> bool {
+    fn is_idempotent(&self, _: &NoBody) -> bool {
         true
     }
 
@@ -115,7 +115,7 @@ impl Endpoint for GetTable {
     type Body = NoBody;
     type Response = Table;
 
-    fn is_idempotent(_: &NoBody) -> bool {
+    fn is_idempotent(&self, _: &NoBody) -> bool {
         true
     }
 

@@ -477,7 +477,8 @@ enum Fail {
     NotFound,
     Exists,
     Precondition,
-    /// The idempotency key was resolved as not applied by an earlier failed precondition.
+    /// The idempotency key was resolved as not applied by an earlier attempt that failed or wrote
+    /// nothing.
     Aborted,
     TooLarge,
     /// Valid request with an in-run TTL whose exact expiry is not modeled.
@@ -2588,9 +2589,7 @@ impl<'a> Session<'a> {
                 Err(f) => {
                     let idx = (f == Fail::Precondition).then_some(i);
                     self.expect("POST", &path, bytes, &Expect::Err(f, idx)).await?;
-                    if f == Fail::Precondition {
-                        self.w.abort(key);
-                    }
+                    self.w.abort(key);
                     return Ok(());
                 }
             }
@@ -2598,7 +2597,9 @@ impl<'a> Session<'a> {
         let mut results: Vec<Json> = outs.iter().map(|o| o.json.clone()).collect();
         let r = if !t.is_write() {
             let want = json!({"version": self.w.version, "committed": false, "results": results});
-            self.expect("POST", &path, bytes, &Expect::Ok(200, want)).await?
+            let r = self.expect("POST", &path, bytes, &Expect::Ok(200, want)).await?;
+            self.w.abort(key);
+            r
         } else {
             let firsts = match self.w.stream_outcome(&t) {
                 Ok(f) => f,

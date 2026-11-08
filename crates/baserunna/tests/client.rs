@@ -569,6 +569,8 @@ async fn raw_values_and_blobs_report_their_version_type_range_and_expiry() {
     assert_eq!(e.code(), Some(api::ErrorCode::PreconditionFailed), "{e}");
     db.put_value("k", "again", opts(Some(Expect::Version(w.version)))).await.unwrap();
     assert_eq!(db.get_value("missing", None).await.unwrap(), None);
+    let e = db.client().db("nonexistent").get_value("k", None).await.unwrap_err();
+    assert_eq!(e.code(), Some(api::ErrorCode::NotFound), "a missing database is not a missing key: {e}");
 
     let blob = db.stage_blob(Bytes::from_static(b"\x89PNG-data"), "image/png").await.unwrap();
     let tail = db.read_blob(&blob.blob_id, Some(api::ByteRange::Last(4))).await.unwrap();
@@ -653,4 +655,16 @@ async fn databases_api_keys_and_schema_changes_round_trip() {
     assert_eq!(rows, [Item { label: Some("x".into()), ..item("a", 2) }]);
     db.delete().await.unwrap();
     assert!(db.info().await.is_err(), "the database is gone");
+}
+
+#[tokio::test]
+async fn a_raw_put_applies_once_when_every_response_is_lost() {
+    let (db, router) = node(api::PutValue::ROUTE).await;
+    let expect = |e| api::PutOptions { expect: Some(e), ..Default::default() };
+    let first = db.put_value("k", "1", expect(Expect::Absent)).await.unwrap();
+    router.fail(api::PutValue::ROUTE, Fault::LoseResponse, 4);
+    let second = db.put_value("k", "2", expect(Expect::Version(first.version))).await.unwrap();
+    assert_eq!(router.fault.lock().1, 0, "every attempt lost its response");
+    let v = db.get_value("k", None).await.unwrap().unwrap();
+    assert_eq!((v.content.data.as_ref(), v.version), (&b"2"[..], second.version), "a retry that reapplied would fail");
 }

@@ -23,7 +23,7 @@ impl Endpoint for ListStreams {
     type Body = NoBody;
     type Response = StreamPage;
 
-    fn is_idempotent(_: &NoBody) -> bool {
+    fn is_idempotent(&self, _: &NoBody) -> bool {
         true
     }
 
@@ -45,7 +45,7 @@ impl Endpoint for CreateStream {
     type Body = NewStream;
     type Response = CreatedStream;
 
-    fn is_idempotent(_: &NewStream) -> bool {
+    fn is_idempotent(&self, _: &NewStream) -> bool {
         false
     }
 
@@ -68,7 +68,7 @@ impl Endpoint for GetStream {
     type Body = NoBody;
     type Response = StreamInfo;
 
-    fn is_idempotent(_: &NoBody) -> bool {
+    fn is_idempotent(&self, _: &NoBody) -> bool {
         true
     }
 
@@ -91,7 +91,7 @@ impl Endpoint for AppendRecords {
     type Body = AppendRequest;
     type Response = Appended;
 
-    fn is_idempotent(body: &AppendRequest) -> bool {
+    fn is_idempotent(&self, body: &AppendRequest) -> bool {
         body.idempotency_key.is_some()
     }
 
@@ -115,7 +115,7 @@ impl Endpoint for AppendLines {
     type Body = JsonLines;
     type Response = Appended;
 
-    fn is_idempotent(_: &JsonLines) -> bool {
+    fn is_idempotent(&self, _: &JsonLines) -> bool {
         false
     }
 
@@ -140,7 +140,7 @@ impl Endpoint for ReadRecords {
     type Body = NoBody;
     type Response = RecordPage;
 
-    fn is_idempotent(_: &NoBody) -> bool {
+    fn is_idempotent(&self, _: &NoBody) -> bool {
         true
     }
 
@@ -164,7 +164,7 @@ impl Endpoint for QueryRecords {
     type Body = RecordQuery;
     type Response = RecordPage;
 
-    fn is_idempotent(_: &RecordQuery) -> bool {
+    fn is_idempotent(&self, _: &RecordQuery) -> bool {
         true
     }
 

@@ -60,6 +60,8 @@ async fn one_shot(c: &Client, body: Json, rejected: &[(u16, &str)]) -> Result<Ap
             Ok(r) if r.status == 503 && !r.outcome_unknown() || (r.status == 409 && r.code() == "conflict") => {
                 c.pause(100).await;
             }
+            // An earlier attempt failed or wrote nothing, which fenced the key, and its response was lost.
+            Ok(r) if ambiguous && r.status == 409 && r.code() == "aborted" => return Ok(Applied::No),
             Ok(r) if !r.outcome_unknown() => return judge(&r, rejected),
             _ => {
                 ambiguous = true;

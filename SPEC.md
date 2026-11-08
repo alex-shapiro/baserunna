@@ -848,12 +848,16 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
    attempt applied returns `replayed: true` with `results: null`, and the
    seqs its appends received (`appends`): the commit record keeps the
    commit's time and the first seq and count of each append.
-   If an idempotent write request fails a precondition, the server resolves the
-   commit (§5.5) before returning 412: if a prior attempt was already
-   committed, the server returns the replayed result; otherwise it writes an
-   abort record so that any in-flight attempt cannot be applied later.
+   An idempotent write request whose run fails or writes nothing may have seen
+   the effects of an earlier attempt of itself, such as a row that the earlier
+   attempt inserted or deleted. Before answering, the server therefore resolves
+   the commit (§5.5): if an earlier attempt committed, it returns the replayed
+   result; otherwise it writes an abort record so that no attempt still in
+   flight can apply later, and returns the error, or the result with
+   `committed: false`. A retry with the same key then fails with `409 aborted`.
    Read-only requests ignore idempotency keys. Conflicts are retried
-   server-side.
+   server-side. Raw key-value writes (`PUT /kv/{key}`) and stream appends take
+   the key in an `Idempotency-Key` header, with the same semantics.
 2. **Interactive** (`/v1/dbs/{db}/transactions…`): begin, ops, commit,
    abort. `begin` and `commit` also accept `ops`, so a read-write transaction
    can be executed in two requests. If an `ops` request fails or is canceled,

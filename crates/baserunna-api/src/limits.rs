@@ -13,7 +13,7 @@ impl Endpoint for GetLimits {
     type Body = NoBody;
     type Response = Limits;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         true
     }
 

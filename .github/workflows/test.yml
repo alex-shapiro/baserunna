@@ -21,6 +21,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Build each library crate with only its own features
+        run: |
+          cargo check -p baserunna-api --all-targets
+          cargo check -p baserunna-client --no-default-features --all-targets
+          cargo check -p baserunna-client --all-targets
       - run: cargo test --release
   campaign:
     name: Simulation campaign

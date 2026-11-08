@@ -77,6 +77,9 @@ pub fn api_error(e: &Error) -> api::ApiError {
         Error::RateLimited { retry_after_ms, .. } => {
             details(api::ErrorDetails { retry_after_ms: Some(*retry_after_ms), ..api::ErrorDetails::default() })
         }
+        Error::KeyNotFound => {
+            details(api::ErrorDetails { missing: Some(api::Missing::Key), ..api::ErrorDetails::default() })
+        }
         _ => None,
     };
     api::ApiError { code: e.api_code(), message: e.message(), retryable: e.retryable(), details }
@@ -120,6 +123,7 @@ fn error_from_api(status: u16, e: api::ApiError) -> Error {
         C::InvalidArgument => Error::InvalidArgument(m),
         C::Unauthenticated => Error::Unauthenticated(m),
         C::PermissionDenied => Error::PermissionDenied(m),
+        C::NotFound if d.missing == Some(api::Missing::Key) => Error::KeyNotFound,
         C::NotFound => Error::NotFound(m),
         C::TxnNotFound => Error::TxnNotFound(m),
         C::Conflict => Error::Conflict(m),
@@ -870,7 +874,9 @@ macro_rules! run_txn {
                         t if !t.needs_revalidation(out_.is_ok() && !t.is_read_only()) => t,
                         t => match ctx_.db.revalidate(t).await? {
                             Some(version) => match out_ {
-                                Ok(out) => break crate::api::Ran::Read { out, version },
+                                Ok(out) => {
+                                    break crate::api::wrote_nothing(ctx_, commit_id_, key_, out, version).await?;
+                                }
                                 Err(e) => break crate::api::failed(ctx_, commit_id_, key_, e).await?,
                             },
                             None => {
@@ -929,6 +935,24 @@ pub(crate) async fn earlier_attempt(ctx: &DbCtx, commit_id: u64, key: Option<&st
     }
 }
 
+/// Returns the outcome of a request whose run read version `version` and wrote nothing. With an
+/// idempotency key, an earlier attempt may have applied after [`earlier_attempt`] looked, so that
+/// this run saw its effects, so the key is resolved like a definitive failure in [`failed`].
+pub(crate) async fn wrote_nothing<T>(
+    ctx: &DbCtx,
+    commit_id: u64,
+    key: Option<&str>,
+    out: T,
+    version: u64,
+) -> Result<Ran<T>> {
+    if key.is_some()
+        && let Some(c) = ctx.db.resolve_commit(commit_id).await?
+    {
+        return Ok(Ran::Replayed(c));
+    }
+    Ok(Ran::Read { out, version })
+}
+
 /// Commits `t` with output `out`, or returns `Ok(None)` when `t` must be retried after a conflict.
 pub(crate) async fn finish<T>(
     node: &Node,
@@ -939,7 +963,7 @@ pub(crate) async fn finish<T>(
     attempt: &mut u32,
 ) -> Result<Option<Ran<T>>> {
     if t.is_read_only() {
-        return Ok(Some(Ran::Read { out, version: t.read_version() }));
+        return wrote_nothing(ctx, t.commit_id, key, out, t.read_version()).await.map(Some);
     }
     let commit_id = t.commit_id;
     let mut req = t.into_request();
@@ -960,18 +984,23 @@ pub(crate) async fn finish<T>(
     }
 }
 
-/// Resolves a failed transaction. If an idempotent request failed a precondition, resolves
-/// the commit to return `Ran::Replayed` if a prior attempt succeeded or to abort any in-flight attempt.
+/// Resolves a failed transaction. If a request with an idempotency key failed for good, such as on a
+/// precondition or an existing row that an earlier attempt of it may have written, resolves the
+/// commit: the result is `Ran::Replayed` if an earlier attempt applied, and otherwise the error,
+/// after fencing any attempt still in flight.
 pub(crate) async fn failed<T>(ctx: &DbCtx, commit_id: u64, key: Option<&str>, e: Error) -> Result<Ran<T>> {
-    match e {
-        Error::PreconditionFailed { .. } if key.is_some() => match ctx.db.resolve_commit(commit_id).await? {
-            Some(c) => {
+    let definitive = !e.retryable() && !matches!(e, Error::Internal(_));
+    if key.is_none() || !definitive {
+        return Err(naming_commit(e, commit_id));
+    }
+    match ctx.db.resolve_commit(commit_id).await? {
+        Some(c) => {
+            if matches!(e, Error::PreconditionFailed { .. }) {
                 probe::hit(Probe::PreconditionExplainedByReplay);
-                Ok(Ran::Replayed(c))
             }
-            None => Err(e),
-        },
-        e => Err(naming_commit(e, commit_id)),
+            Ok(Ran::Replayed(c))
+        }
+        None => Err(e),
     }
 }
 
@@ -1227,6 +1256,7 @@ mod tests {
             Error::Unavailable { message: m(), retry_after_ms: Some(500), outcome_unknown: true },
             Error::Unavailable { message: m(), retry_after_ms: Some(500), outcome_unknown: false },
             Error::Internal(m()),
+            Error::KeyNotFound,
         ];
         for e in &all {
             // Exhaustive match so new `Error` variants must be added to `all`.
@@ -1235,6 +1265,7 @@ mod tests {
                 | Error::Unauthenticated(_)
                 | Error::PermissionDenied(_)
                 | Error::NotFound(_)
+                | Error::KeyNotFound
                 | Error::TxnNotFound(_)
                 | Error::Conflict(_)
                 | Error::AlreadyExists(_)

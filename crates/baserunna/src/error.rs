@@ -10,6 +10,8 @@ pub enum Error {
     Unauthenticated(String),
     PermissionDenied(String),
     NotFound(String),
+    /// The key that a raw key-value read names holds no value.
+    KeyNotFound,
     TxnNotFound(String),
     /// Optimistic concurrency conflict; retrying the transaction may succeed.
     Conflict(String),
@@ -76,7 +78,7 @@ impl Error {
             Error::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Error::Unauthenticated(_) => ErrorCode::Unauthenticated,
             Error::PermissionDenied(_) => ErrorCode::PermissionDenied,
-            Error::NotFound(_) => ErrorCode::NotFound,
+            Error::NotFound(_) | Error::KeyNotFound => ErrorCode::NotFound,
             Error::TxnNotFound(_) => ErrorCode::TxnNotFound,
             Error::Conflict(_) => ErrorCode::Conflict,
             Error::AlreadyExists(_) => ErrorCode::AlreadyExists,
@@ -96,7 +98,7 @@ impl Error {
             Error::InvalidArgument(_) => 400,
             Error::Unauthenticated(_) => 401,
             Error::PermissionDenied(_) => 403,
-            Error::NotFound(_) | Error::TxnNotFound(_) => 404,
+            Error::NotFound(_) | Error::KeyNotFound | Error::TxnNotFound(_) => 404,
             Error::Conflict(_) | Error::AlreadyExists(_) | Error::Aborted(_) => 409,
             Error::PreconditionFailed { .. } => 412,
             Error::TooLarge(_) => 413,
@@ -121,6 +123,7 @@ impl Error {
 
     pub fn message(&self) -> String {
         match self {
+            Error::KeyNotFound => "key not found".into(),
             Error::InvalidArgument(m)
             | Error::Unauthenticated(m)
             | Error::PermissionDenied(m)

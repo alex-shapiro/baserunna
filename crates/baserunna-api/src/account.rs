@@ -15,7 +15,7 @@ impl Endpoint for SignUp {
     type Body = Credentials;
     type Response = Session;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         false
     }
 
@@ -35,7 +35,7 @@ impl Endpoint for LogIn {
     type Body = Credentials;
     type Response = Session;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         false
     }
 
@@ -55,7 +55,7 @@ impl Endpoint for GetMe {
     type Body = NoBody;
     type Response = Me;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         true
     }
 
@@ -121,7 +121,7 @@ impl Endpoint for CreateOrg {
     type Body = NewOrg;
     type Response = Org;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         false
     }
 
@@ -143,7 +143,7 @@ impl Endpoint for AddMember {
     type Body = NewMember;
     type Response = Member;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         false
     }
 
@@ -166,7 +166,7 @@ impl Endpoint for RemoveMember {
     type Body = NoBody;
     type Response = Empty;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         false
     }
 
@@ -226,7 +226,7 @@ impl Endpoint for CreateApiKey {
     type Body = NewApiKey;
     type Response = CreatedApiKey;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         false
     }
 
@@ -248,7 +248,7 @@ impl Endpoint for ListApiKeys {
     type Body = NoBody;
     type Response = ApiKeyPage;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         true
     }
 
@@ -270,7 +270,7 @@ impl Endpoint for DeleteApiKey {
     type Body = NoBody;
     type Response = Empty;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         false
     }
 

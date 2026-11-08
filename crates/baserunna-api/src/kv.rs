@@ -27,7 +27,7 @@ impl Endpoint for Changes {
     type Body = NoBody;
     type Response = ChangePage;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         true
     }
 
@@ -51,7 +51,7 @@ impl Endpoint for GetValue {
     type Body = NoBody;
     type Response = KvValue;
 
-    fn is_idempotent(_: &NoBody) -> bool {
+    fn is_idempotent(&self, _: &NoBody) -> bool {
         true
     }
 
@@ -77,6 +77,9 @@ pub struct PutValue {
     pub db: String,
     pub key: Bytes,
     pub options: PutOptions,
+    /// Makes retries of the write apply it at most once, and lets `GET /v1/dbs/{db}/commits/key:{key}`
+    /// report whether it applied.
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -97,8 +100,8 @@ impl Endpoint for PutValue {
     type Body = Octets;
     type Response = Written;
 
-    fn is_idempotent(_: &Octets) -> bool {
-        false
+    fn is_idempotent(&self, _: &Octets) -> bool {
+        self.headers().contains_key("idempotency-key")
     }
 
     fn path(&self) -> String {
@@ -119,6 +122,9 @@ impl Endpoint for PutValue {
             Some(Expect::Version(v)) => h.insert(IF_MATCH, HeaderValue::from(v)),
             None => None,
         };
+        if let Some(k) = self.idempotency_key.as_deref().and_then(|k| HeaderValue::from_str(k).ok()) {
+            h.insert("idempotency-key", k);
+        }
         h
     }
 }
@@ -236,7 +242,7 @@ impl Endpoint for StageBlob {
     type Body = Octets;
     type Response = BlobMeta;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         true
     }
 
@@ -268,7 +274,7 @@ impl Endpoint for ReadBlob {
     type Body = NoBody;
     type Response = Content;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         true
     }
 

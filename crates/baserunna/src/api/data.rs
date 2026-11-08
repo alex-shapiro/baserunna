@@ -251,13 +251,13 @@ async fn get_kv(Extension(ctx): Extension<DbCtx>, q: Params, req: Request) -> Re
     let c = consistency_of(&q)?;
     let snap = ctx.db.snapshot(c).await?;
     let Some(e) = snap.get(&key).await? else {
-        return Err(Error::not_found("key not found"));
+        return Err(Error::KeyNotFound);
     };
     let range_h = req.headers().get(http::header::RANGE).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
     let (size, ct) = match &e.value {
         Value::Inline(b) => (b.len() as u64, "application/octet-stream".to_string()),
         Value::Blob(r) => (r.size, r.content_type.clone()),
-        Value::Tombstone => return Err(Error::not_found("key not found")),
+        Value::Tombstone => return Err(Error::KeyNotFound),
     };
     let range = match parse_range(range_h.as_deref(), size) {
         Ok(r) => r,
@@ -305,6 +305,7 @@ async fn put_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>,
     let ttl_ms = q.get("ttl_ms").map(|v| v.parse::<u64>().map_err(|_| Error::invalid("bad ttl_ms"))).transpose()?;
     let if_match = etag_version(req.headers(), http::header::IF_MATCH);
     let if_none = etag_version(req.headers(), http::header::IF_NONE_MATCH);
+    let key_id = idempotency_header(req.headers())?;
     if if_none.as_deref().is_some_and(|v| v != "*") {
         return Err(Error::invalid("only If-None-Match: * is supported"));
     }
@@ -325,7 +326,7 @@ async fn put_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>,
         Upload::Small(b) => Value::Inline(b),
         Upload::Blob(r) => Value::Blob(r),
     };
-    let ((), v) = with_txn!(node, ctx, |t| {
+    let (_, ran) = run_txn!(node, ctx, Isolation::Serializable, Consistency::Strong, key_id.as_deref(), |t| {
         if want_version.is_some() || if_none.is_some() {
             let cur = t.get(&key).await?;
             if if_none.is_some() && cur.is_some() {
@@ -339,7 +340,11 @@ async fn put_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>,
         }
         t.put_expiring(key.clone(), value.clone(), ops::expiry(ttl_ms)?)
     });
-    Ok(axum::Json(serde_json::to_value(api::Written { version: v }).expect("writes serialize")))
+    let version = match ran {
+        Ran::Committed { commit, .. } | Ran::Replayed(commit) => commit.version,
+        Ran::Read { .. } => return Err(Error::internal("a put committed nothing")),
+    };
+    Ok(axum::Json(serde_json::to_value(api::Written { version }).expect("writes serialize")))
 }
 
 async fn delete_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, req: Request) -> Result<J> {

@@ -1,17 +1,20 @@
 //! Simulation workload for `baserunna-client` under network, process, and storage faults.
 //!
-//! Counter tasks increment keys with a version precondition and an idempotency key per transaction
-//! to verify that retries do not apply a write twice or report an applied write as `NotApplied`.
+//! Counter tasks increment keys with a version precondition, in keyed one-shot transactions or in
+//! raw key-value puts, to verify that retries do not apply a write twice or report an applied write
+//! as `NotApplied`.
 //! Mutator tasks write, copy, and delete binary keys while a watcher task reconstructs the key
 //! space from the change feed and compares the final state against a full scan.
 //! Ledger tasks move balances between table rows in interactive transactions that also count and
 //! log each transfer, to verify that retried and resolved commits apply exactly once.
+//! Stream tasks append keyed records over HTTP while a follower long-polls for them, to verify that
+//! each acknowledged append appears exactly once and that the follower reads every record in order.
 
 use super::super::Sim;
 use super::super::client::{Client as SimClient, ZOMBIE_WAIT_MS};
 use super::{chaos_phase, expect, settle};
+use baserunna_api::{self as api, ErrorCode, Outcome, Role};
 use baserunna_api::{ColumnType, NewColumn, NewTable};
-use baserunna_api::{ErrorCode, Outcome, Role};
 use baserunna_client::{
     Change, ChangesRequest, Client, Db, Entry, Error, Expect, KeyRange, Op, OpResult, Row, Txn, TxnError, Value,
 };
@@ -20,6 +23,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const DB: &str = "client";
 const ACCOUNTS: u64 = 4;
@@ -34,6 +38,7 @@ pub async fn run(
     counters: usize,
     mutators: usize,
     ledgers: usize,
+    streams: usize,
     steps: usize,
     chaos: bool,
 ) -> Result<(), String> {
@@ -56,6 +61,12 @@ pub async fn run(
     for i in 0..ledgers {
         let db = with_name(&sim, &client, &format!("ledger{i}")).db(DB);
         tasks.push(tokio::spawn(transfer(sim.clone(), db, i, steps, tally.clone())));
+    }
+    for i in 0..streams {
+        let db = with_name(&sim, &client, &format!("streamer{i}")).db(DB);
+        tasks.push(tokio::spawn(append(sim.clone(), db, i, steps)));
+        let db = with_name(&sim, &client, &format!("noter{i}")).db(DB);
+        tasks.push(tokio::spawn(note(sim.clone(), db, i, steps)));
     }
     for t in tasks {
         t.await.map_err(|e| e.to_string())??;
@@ -142,31 +153,180 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(sim: &Arc<Sim>, mut f: i
     Err("a request never succeeded".into())
 }
 
+/// Increments counter `i`, through raw key-value puts if `i` is even and keyed transactions otherwise.
 async fn count(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), String> {
     let key = Bytes::from(format!("ctr/{i}"));
+    let raw = i.is_multiple_of(2);
     let (mut n, mut version) = (0u64, None);
     for step in 0..steps {
         sim.sleep(sim.rand_below(500)).await;
         let cond = version.map_or(Expect::Absent, Expect::Version);
-        let ops = [
-            Op::Check { key: key.clone(), expect: cond },
-            Op::Put { key: key.clone(), value: (n + 1).to_string().into() },
-        ];
-        match db.txn(&ops, Some(&format!("ctr{i}-{step}"))).await {
-            Ok(out) => (n, version) = (n + 1, Some(out.version)),
+        let next = Bytes::from((n + 1).to_string());
+        let written = match raw {
+            true => {
+                let put = api::PutOptions { expect: Some(cond), ..Default::default() };
+                db.put_value(key.clone(), next, put).await.map(|w| w.version)
+            }
+            false => {
+                let ops = [Op::Check { key: key.clone(), expect: cond }, Op::Put { key: key.clone(), value: next }];
+                db.txn(&ops, Some(&format!("ctr{i}-{step}"))).await.map(|out| out.version)
+            }
+        };
+        match written {
+            Ok(v) => (n, version) = (n + 1, Some(v)),
             Err(e) if e.outcome() == Outcome::NotApplied && e.code() != Some(ErrorCode::PreconditionFailed) => {}
             Err(e) if e.outcome() == Outcome::Unknown => {
                 // Wait for any in-flight attempt to time out on the server before reading the counter.
                 sim.sleep(ZOMBIE_WAIT_MS).await;
-                let (got, v) = read_counter(&sim, &db, &key).await?;
+                let (got, v) = read_counter(&sim, &db, &key, raw).await?;
                 expect(got == n || got == n + 1, format!("counter {i} is {got} after {n} increments and a failure"))?;
                 (n, version) = (got, v);
             }
             Err(e) => return Err(format!("counter {i} at {n}: {e}")),
         }
     }
-    let (got, _) = read_counter(&sim, &db, &key).await?;
+    let (got, _) = read_counter(&sim, &db, &key, raw).await?;
     expect(got == n, format!("counter {i} is {got}, expected {n}"))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Note {
+    id: String,
+}
+
+impl Row for Note {
+    const TABLE: &'static str = "notes";
+}
+
+/// Inserts and then deletes one note per step with [`Db::write`], whose result must report whether
+/// each write applied, even if the write's first attempt applied unseen and a retry found its
+/// effects.
+async fn note(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), String> {
+    for step in 0..steps {
+        let id = format!("n{i}-{step}");
+        for insert in [true, false] {
+            sim.sleep(sim.rand_below(300)).await;
+            let op = match insert {
+                true => Op::insert(&Note { id: id.clone() }),
+                false => Op::delete_row::<Note>(&id),
+            };
+            let applied = match db.write(&[op]).await {
+                Ok(Some(_)) => Some(true),
+                Ok(None) => return Err(format!("note {id}: a write of a row reported that it wrote nothing")),
+                Err(e) if e.outcome() == Outcome::NotApplied && e.code() != Some(ErrorCode::AlreadyExists) => {
+                    Some(false)
+                }
+                Err(e) if e.outcome() == Outcome::Unknown => None,
+                Err(e) => return Err(format!("note {id}: {e}")),
+            };
+            // A definitive answer resolved the write's key, so no attempt of it can apply later.
+            if applied.is_none() {
+                sim.sleep(ZOMBIE_WAIT_MS).await;
+            }
+            let row = retry(&sim, || db.read_one(Op::get_row::<Note>(&id))).await?;
+            let exists = row.row::<Note>().map_err(|e| e.to_string())?.is_some();
+            let now = match applied {
+                Some(true) => insert,
+                Some(false) => !insert,
+                None => exists,
+            };
+            expect(exists == now, format!("note {id} exists: {exists}, after a write that applied: {applied:?}"))?;
+            if !exists && insert {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Appends one record per step to stream `log{i}` with an idempotency key per step, while a
+/// follower long-polls for the records.
+async fn append(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), String> {
+    let name = format!("log{i}");
+    let length = Arc::new(AtomicU64::new(u64::MAX));
+    let follower = tokio::spawn(follow(sim.clone(), db.clone(), name.clone(), length.clone()));
+    let (mut acked, mut unknown) = (BTreeSet::new(), BTreeSet::new());
+    for step in 0..steps as u64 {
+        sim.sleep(sim.rand_below(500)).await;
+        let append = api::AppendRequest {
+            records: vec![api::NewRecord { json: Some(step.into()), ..Default::default() }],
+            create: true,
+            idempotency_key: Some(format!("log{i}-{step}")),
+            ..Default::default()
+        };
+        match db.append_records(&name, &append).await {
+            Ok(_) => drop(acked.insert(step)),
+            Err(e) if e.outcome() == Outcome::NotApplied => {}
+            Err(e) if e.outcome() == Outcome::Unknown => drop(unknown.insert(step)),
+            Err(e) => return Err(format!("stream {i} step {step}: {e}")),
+        }
+    }
+    sim.sleep(ZOMBIE_WAIT_MS).await;
+    let log = read_log(&sim, &db, &name).await?;
+    length.store(log.len() as u64, Ordering::SeqCst);
+    let followed = follower.await.map_err(|e| e.to_string())??;
+    let steps: Vec<u64> = log.iter().map(|(_, s)| *s).collect();
+    let present: BTreeSet<u64> = steps.iter().copied().collect();
+    expect(present.len() == steps.len(), format!("stream {i} holds a step twice: {steps:?}"))?;
+    expect(acked.is_subset(&present), format!("stream {i} lost acknowledged appends of {acked:?}: {steps:?}"))?;
+    let refused: Vec<_> = present.difference(&acked).filter(|s| !unknown.contains(s)).collect();
+    expect(refused.is_empty(), format!("stream {i} holds appends of steps {refused:?} that failed"))?;
+    expect(followed == log, format!("stream {i} follower read {followed:?}, but the stream is {log:?}"))
+}
+
+/// Reads stream `name` from the start with long polls until it has read `length` records,
+/// returning each record's sequence number and step in the order read.
+async fn follow(sim: Arc<Sim>, db: Db, name: String, length: Arc<AtomicU64>) -> Result<Vec<(u64, u64)>, String> {
+    let mut out = Vec::new();
+    for _ in 0..2_000 {
+        if out.len() as u64 >= length.load(Ordering::SeqCst) {
+            return Ok(out);
+        }
+        let query =
+            api::ReadRecordsQuery { from_seq: Some(out.len() as u64), wait_ms: Some(2_000), ..Default::default() };
+        match db.read_records(&name, query).await {
+            Ok(page) => out.extend(records(&page)?),
+            Err(e)
+                if e.code() == Some(ErrorCode::NotFound)
+                    || e.is_transient(true)
+                    || matches!(e, Error::Transport(_)) =>
+            {
+                sim.sleep(500).await
+            }
+            Err(e) => return Err(format!("stream follower of {name}: {e}")),
+        }
+    }
+    Err(format!("the follower of {name} read {} records and never caught up", out.len()))
+}
+
+async fn read_log(sim: &Arc<Sim>, db: &Db, name: &str) -> Result<Vec<(u64, u64)>, String> {
+    let mut out = Vec::new();
+    loop {
+        let query = api::ReadRecordsQuery { from_seq: Some(out.len() as u64), ..Default::default() };
+        let read = retry(sim, || async {
+            match db.read_records(name, query.clone()).await {
+                // No append created the stream.
+                Err(e) if e.code() == Some(ErrorCode::NotFound) => Ok(None),
+                r => r.map(Some),
+            }
+        });
+        let Some(page) = read.await? else { return Ok(out) };
+        out.extend(records(&page)?);
+        if page.done {
+            return Ok(out);
+        }
+    }
+}
+
+/// Returns the sequence number and step of each record of `page`, failing unless the records follow
+/// each other without gaps.
+fn records(page: &api::RecordPage) -> Result<Vec<(u64, u64)>, String> {
+    let steps = page.records.iter().map(|r| (r.seq, r.json.as_ref().and_then(|j| j.as_u64())));
+    let out: Vec<(u64, u64)> =
+        steps.map(|(seq, step)| Ok((seq, step.ok_or("a record is not a step")?))).collect::<Result<_, String>>()?;
+    let contiguous = out.windows(2).all(|w| w[1].0 == w[0].0 + 1);
+    expect(contiguous, format!("a page skips records: {out:?}"))?;
+    Ok(out)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,6 +384,14 @@ async fn open_accounts(sim: &Arc<Sim>, db: &Db) -> Result<(), String> {
         if_not_exists: true,
     };
     retry(sim, || db.create_table(&table)).await?;
+    let notes = NewTable {
+        name: Note::TABLE.into(),
+        columns: vec![NewColumn::new("id", ColumnType::String)],
+        primary_key: vec!["id".into()],
+        indexes: vec![],
+        if_not_exists: true,
+    };
+    retry(sim, || db.create_table(&notes)).await?;
     let mut opened: Vec<Op> =
         (0..ACCOUNTS).map(|a| Op::upsert(&Account { id: format!("a{a}"), balance: OPENING_BALANCE })).collect();
     let open = Transfer { id: OPENING.into(), from: String::new(), to: String::new(), amount: 0 };
@@ -339,7 +507,13 @@ fn counter(e: Option<&Entry>) -> Result<u64, Error> {
         .ok_or_else(|| Error::Decode { what: TRANSFER_COUNT.into(), reason: format!("{e:?}") })
 }
 
-async fn read_counter(sim: &Arc<Sim>, db: &Db, key: &Bytes) -> Result<(u64, Option<u64>), String> {
+/// Reads counter `key`, as a raw key-value read if `raw` is set.
+async fn read_counter(sim: &Arc<Sim>, db: &Db, key: &Bytes, raw: bool) -> Result<(u64, Option<u64>), String> {
+    if raw {
+        let Some(v) = retry(sim, || db.get_value(key.clone(), None)).await? else { return Ok((0, None)) };
+        let n = std::str::from_utf8(&v.content.data).ok().and_then(|t| t.parse().ok());
+        return Ok((n.ok_or(format!("counter {key:?} holds {v:?}"))?, Some(v.version)));
+    }
     let e = retry(sim, || db.read_one(Op::Get { key: key.clone() })).await?.entry().map_err(|e| e.to_string())?;
     Ok((counter(e.as_ref()).map_err(|e| e.to_string())?, e.and_then(|e| e.version)))
 }

@@ -427,6 +427,24 @@ fn check(events: &[Event], finals: &BTreeMap<u64, Vec<u64>>) -> Result<(), Strin
             }
         }
     }
+    // A transaction reads its own appends to a KV key, after any appends of other transactions.
+    for e in events.iter().filter(|e| e.kind == Kind::Ok) {
+        let mut own: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for m in &e.mops {
+            match m {
+                Mop::Append(k, v) => own.entry(*k).or_default().push(*v),
+                Mop::Read(k, l) => {
+                    let mine = own.get(k).map_or(&[][..], Vec::as_slice);
+                    if !l.as_deref().unwrap_or(&[]).ends_with(mine) {
+                        return Err(format!(
+                            "process {} read key {k} as {l:?} after appending {mine:?} to it",
+                            e.process
+                        ));
+                    }
+                }
+            }
+        }
+    }
     // Every read is a prefix of the final value, so a read's length says which appends it saw. A
     // transaction must see at least what any transaction that completed before it began saw.
     let mut seen: BTreeMap<u64, usize> = BTreeMap::new();
@@ -528,7 +546,9 @@ fn check_cycles(events: &[Event], finals: &BTreeMap<u64, Vec<u64>>) -> Result<()
             continue;
         }
         for m in node.mops {
-            let Mop::Read(k, Some(l)) = m else { continue };
+            // A completed read of an absent key saw the empty first version.
+            let Mop::Read(k, l) = m else { continue };
+            let l = l.as_deref().unwrap_or(&[]);
             let fin = finals.get(k).map_or(&[][..], Vec::as_slice);
             if let Some(w) = l.last().and_then(|v| writer.get(v)) {
                 edge(*w, n);
@@ -813,6 +833,10 @@ mod tests {
         let skewed = skew(Some(vec![]), Some(vec![]));
         check(&skewed, &finals).unwrap();
         assert!(check_cycles(&skewed, &finals).unwrap_err().contains("dependency cycle"));
+        // A KV read of a key that does not exist yet reports `None`.
+        let absent = skew(None, None);
+        check(&absent, &finals).unwrap();
+        assert!(check_cycles(&absent, &finals).unwrap_err().contains("dependency cycle"));
         check_cycles(&skew(Some(vec![]), Some(vec![1])), &finals).unwrap();
         // Two appends ordered against real time: the later transaction's append comes first.
         let order = vec![
@@ -823,6 +847,19 @@ mod tests {
         ];
         check_cycles(&order, &[(4, vec![1, 2])].into()).unwrap();
         assert!(check_cycles(&order, &[(4, vec![2, 1])].into()).unwrap_err().contains("dependency cycle"));
+    }
+
+    #[test]
+    fn rejects_reads_that_miss_their_own_appends() {
+        let finals: BTreeMap<u64, Vec<u64>> = [(2, vec![1, 5])].into();
+        let txn = |read: Vec<u64>| {
+            vec![
+                ev(Kind::Invoke, vec![Mop::Append(2, 1), Mop::Append(2, 5), Mop::Read(2, None)]),
+                ev(Kind::Ok, vec![Mop::Append(2, 1), Mop::Append(2, 5), Mop::Read(2, Some(read))]),
+            ]
+        };
+        check(&txn(vec![1, 5]), &finals).unwrap();
+        assert!(check(&txn(vec![1]), &finals).unwrap_err().contains("after appending"));
     }
 
     #[test]

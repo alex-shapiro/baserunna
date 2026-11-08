@@ -61,6 +61,15 @@ impl CloudStore {
         url: &str,
         settings: impl IntoIterator<Item = (impl AsRef<str>, impl Into<String>)>,
     ) -> Result<CloudStore, String> {
+        CloudStore::from_env_with(url, std::env::vars(), settings)
+    }
+
+    /// Parses `s3://bucket[/prefix]` with the `AWS_*` variables of `env`, then `settings`.
+    fn from_env_with(
+        url: &str,
+        env: impl IntoIterator<Item = (String, String)>,
+        settings: impl IntoIterator<Item = (impl AsRef<str>, impl Into<String>)>,
+    ) -> Result<CloudStore, String> {
         let rest = url.strip_prefix("s3://").ok_or("store url must be s3://bucket[/prefix]")?;
         let (bucket, prefix) = match rest.split_once('/') {
             Some((b, p)) => (b, p.trim_matches('/')),
@@ -70,10 +79,15 @@ impl CloudStore {
             return Err("missing bucket".into());
         }
         let options = ClientOptions::new().with_timeout(REQUEST_TIMEOUT).with_connect_timeout(CONNECT_TIMEOUT);
-        let mut builder = object_store::aws::AmazonS3Builder::from_env()
-            .with_bucket_name(bucket)
+        let mut builder = object_store::aws::AmazonS3Builder::new()
             .with_client_options(options)
             .with_retry(RetryConfig { max_retries: 0, ..Default::default() });
+        for (k, v) in env.into_iter().filter(|(k, _)| k.starts_with("AWS_")) {
+            if let Ok(key) = k.to_ascii_lowercase().parse() {
+                builder = builder.with_config(key, v);
+            }
+        }
+        builder = builder.with_bucket_name(bucket);
         for (k, v) in settings {
             let key = k.as_ref().parse().map_err(|e: object_store::Error| e.to_string())?;
             builder = builder.with_config(key, v);
@@ -199,6 +213,27 @@ impl ObjectStore for CloudStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn client_options_are_read_from_the_environment() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let env = [("AWS_ENDPOINT", endpoint.as_str()), ("AWS_ALLOW_HTTP", "true"), ("AWS_REGION", "us-east-1")]
+            .map(|(k, v)| (k.to_string(), v.to_string()));
+        let creds = [("aws_access_key_id", "k"), ("aws_secret_access_key", "s")];
+        let store = CloudStore::from_env_with("s3://bucket", env, creds).unwrap();
+        let list = store.list("", None, 1);
+        let accepted = listener.accept();
+        tokio::pin!(list, accepted);
+        let connected = std::future::poll_fn(|cx| {
+            if let Poll::Ready(r) = list.as_mut().poll(cx) {
+                return Poll::Ready(Err(r.err()));
+            }
+            accepted.as_mut().poll(cx).map(|r| Ok(r.is_ok()))
+        })
+        .await;
+        assert_eq!(connected, Ok(true), "the store sent no request to the plain-HTTP endpoint");
+    }
 
     #[test]
     fn http_status_is_parsed_from_error_message() {

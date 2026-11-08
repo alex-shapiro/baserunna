@@ -6,7 +6,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// Bounded cache whose entries expire after `ttl` and are cleared when `max` is exceeded.
+/// Bounded cache whose entries expire after `ttl`. Once it holds `max` live entries, an insert evicts
+/// the oldest eighth of them.
 pub struct TtlCache<K, V> {
     ttl: Duration,
     max: usize,
@@ -35,7 +36,10 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
                     m.retain(|_, (at, _)| at.elapsed() < self.ttl);
                 }
                 if m.len() >= self.max {
-                    m.clear();
+                    let mut times: Vec<Instant> = m.values().map(|(at, _)| *at).collect();
+                    let k = times.len() / 8;
+                    let cutoff = *times.select_nth_unstable(k).1;
+                    m.retain(|_, (at, _)| *at > cutoff);
                 }
                 m.insert(k, (read_at, v));
             }
@@ -93,6 +97,23 @@ mod tests {
             assert_eq!((c.len(), c.get(&9)), (1, Some("y")));
             c.store(9, None, Instant::now());
             assert_eq!(c.get(&9), None);
+        });
+    }
+
+    #[test]
+    fn a_full_cache_evicts_its_oldest_entries() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
+        rt.block_on(async {
+            let c: TtlCache<u32, u32> = TtlCache::new(Duration::from_secs(3600), 16);
+            for k in 0..17 {
+                c.store(k, Some(k), Instant::now());
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(c.len() <= 16);
+            for k in 8..17 {
+                assert_eq!(c.get(&k), Some(k), "a recent entry was evicted");
+            }
+            assert_eq!(c.get(&0), None);
         });
     }
 }

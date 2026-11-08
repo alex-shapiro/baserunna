@@ -873,7 +873,12 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
    database's owner node. If the owner changes or crashes, or if the node
    aborts the transaction for timeout or memory pressure (§5.12), uncommitted
    writes are discarded and subsequent requests return a retryable
-   `404 txn_not_found` with the abort reason. `begin` returns the transaction's
+   `404 txn_not_found` with the abort reason. After a node starts a
+   transaction's commit, a later request on the transaction returns `503` with
+   `outcome: "unknown"` and the commit ID, unless the commit certainly failed:
+   a client that did not receive the commit response must check the commit
+   status, not restart the transaction. Only the node that ran the commit
+   remembers it, for `txn_max_lifetime`. `begin` returns the transaction's
    `commit_id` up front, and `commit` returns the sequence numbers assigned to
    its appends.
 

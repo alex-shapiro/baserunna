@@ -614,12 +614,21 @@ async fn commit_txn(
     let txn = node.txns.lock(get_open(&node, &ctx, &id)?).await?;
     let enc = txn.encoding();
     let mut t = txn.take();
-    let mut results = exec_ops(&op_ctx(&node, &ctx, enc), &mut t, &ops).await?;
-    if !t.is_read_only() {
-        ctx.require_write()?;
-    }
     let cid = t.commit_id;
+    // Until the commit is known not to be applied, a retry must not learn that it can restart.
+    node.txns.note_commit(&id, cid);
+    let definite = |e: Error| {
+        if !matches!(e, Error::Unavailable { outcome_unknown: true, .. } | Error::Internal(_)) {
+            node.txns.forget_commit(&id);
+        }
+        e
+    };
+    let mut results = exec_ops(&op_ctx(&node, &ctx, enc), &mut t, &ops).await.map_err(definite)?;
+    if !t.is_read_only() {
+        ctx.require_write().map_err(definite)?;
+    }
     if t.needs_revalidation(!t.is_read_only()) {
+        node.txns.forget_commit(&id);
         let Some(version) = ctx.db.revalidate(t).await? else {
             return Err(Error::Conflict("transaction conflicts with a concurrent commit".into()));
         };
@@ -629,7 +638,7 @@ async fn commit_txn(
     }
     let mut creq = t.into_request();
     creq.deadline = Some(ctx.deadline.instant());
-    let c = ctx.db.commit_detailed(creq).await.map_err(|e| naming_commit(e, cid))?;
+    let c = ctx.db.commit_detailed(creq).await.map_err(|e| naming_commit(definite(e), cid))?;
     let own_appends = ops.iter().filter(|o| matches!(o, Op::Append { .. })).count();
     ops::fill_appends(&ops, &mut results, &c.appends[c.appends.len().saturating_sub(own_appends)..]);
     Ok(axum::Json(json!({

@@ -186,12 +186,12 @@ correct S3 store, but each one turns a store fault into silent wrong data.
 
 ## Ambiguous outcomes
 
-- [ ] **Answer a retried interactive commit with its outcome.** After a commit
-      applies and its response is lost, a retried `POST …/commit` returns a
-      retryable `404 txn_not_found`, which tells a client to restart the
-      transaction and so apply it twice. Keep the commit id of a committed
-      transaction for `commit_retention_ms` and answer retries with the result
-      or with `outcome: "unknown"`.
+- [ ] **Remember started interactive commits across nodes and restarts.** A
+      node answers a request on a transaction whose commit it started with
+      `outcome: "unknown"`, but only from memory. After a restart, or on
+      another node, the request gets a retryable `404 txn_not_found`, which
+      tells a client to restart the transaction. Derive the transaction ID
+      from its commit ID so that any node can look up the commit record.
 - [ ] **Show `outcome: "unknown"` in the console.** The console shows only the
       error message, so a write that may have been applied looks failed.
 - [ ] **Return the outcome of a repaired database deletion.** A retried

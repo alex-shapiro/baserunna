@@ -48,6 +48,8 @@ pub struct OpenTxns {
     limits: TxnLimits,
     open: Mutex<DetHashMap<String, Arc<OpenTxn>>>,
     aborted: TtlCache<String, &'static str>,
+    /// Commit IDs of transactions whose commit has started.
+    committed: TtlCache<String, u64>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -61,6 +63,7 @@ impl OpenTxns {
             limits,
             open: Mutex::new(DetHashMap::default()),
             aborted: TtlCache::new(limits.lifetime, 100_000),
+            committed: TtlCache::new(limits.lifetime, 100_000),
         })
     }
 
@@ -172,8 +175,29 @@ impl OpenTxns {
         Ok(open)
     }
 
+    /// Records that the commit of transaction `id` has started, so that a later request on it
+    /// learns that the commit may have been applied rather than that it can restart.
+    pub fn note_commit(&self, id: &str, commit_id: u64) {
+        self.committed.store(id.to_string(), Some(commit_id), Instant::now());
+    }
+
+    /// Forgets a commit recorded by [`OpenTxns::note_commit`] that certainly was not applied.
+    pub fn forget_commit(&self, id: &str) {
+        self.committed.remove(&id.to_string());
+    }
+
     fn lost(&self, id: &str) -> Error {
         crate::probe::hit(crate::probe::Probe::InteractiveTxnLost);
+        if let Some(cid) = self.committed.get(&id.to_string()) {
+            return Error::Unavailable {
+                message: format!(
+                    "the transaction's commit was already sent and may have been applied; check its status at \
+                     /commits/{cid:016x}"
+                ),
+                retry_after_ms: None,
+                outcome_unknown: true,
+            };
+        }
         match self.aborted.get(&id.to_string()) {
             Some(reason) => Error::TxnNotFound(format!("transaction was aborted because {reason}; retry it")),
             None => Error::txn_not_found(),
@@ -216,6 +240,7 @@ impl OpenTxns {
             })
             .collect();
         self.aborted.prune();
+        self.committed.prune();
         for (t, reason) in expired {
             self.abort(&t, reason);
         }
@@ -386,6 +411,40 @@ mod tests {
             let r = w.call(0, "DELETE", &format!("/v1/dbs/a/transactions/{}", ids[0]), &alice, Bytes::new()).await;
             assert_eq!(r.status, 200);
             assert_eq!(begin(&w, &alice, "a").await.status, 201, "an aborted transaction still counted");
+        });
+    }
+
+    #[test]
+    fn a_retried_commit_does_not_ask_to_restart() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let token = w.signup(0, "a@x.io").await;
+            w.create_db(0, &token, "a").await;
+            let begun = begin(&w, &token, "a").await.json();
+            let (id, cid) = (begun["txn_id"].as_str().unwrap(), begun["commit_id"].as_str().unwrap());
+            ops(&w, &token, "a", id, json!([{"op": "put", "key": "k", "value": "v"}])).await;
+            let commit = format!("/v1/dbs/a/transactions/{id}/commit");
+            assert_eq!(w.call(0, "POST", &commit, &token, Bytes::from("{}")).await.status, 200);
+            // The client did not receive the first response, so it sends the commit again.
+            let again = w.call(0, "POST", &commit, &token, Bytes::from("{}")).await.json();
+            assert_eq!(again["error"]["code"], "unavailable", "{again}");
+            assert_eq!(again["error"]["details"]["outcome"], "unknown", "{again}");
+            assert!(again["error"]["message"].as_str().unwrap().contains(cid), "{again}");
+        });
+    }
+
+    #[test]
+    fn a_failed_commit_still_asks_to_restart() {
+        run_paused(async {
+            let w = World::new(1, 1).await;
+            let token = w.signup(0, "a@x.io").await;
+            w.create_db(0, &token, "a").await;
+            let id = begin(&w, &token, "a").await.json()["txn_id"].as_str().unwrap().to_string();
+            let commit = format!("/v1/dbs/a/transactions/{id}/commit");
+            let bad = Bytes::from(r#"{"ops": [{"op": "check", "key": "missing", "exists": true}]}"#);
+            assert_eq!(w.call(0, "POST", &commit, &token, bad).await.status, 412);
+            let again = w.call(0, "POST", &commit, &token, Bytes::from("{}")).await.json();
+            assert_eq!(again["error"]["code"], "txn_not_found", "{again}");
         });
     }
 

@@ -158,65 +158,65 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
 ## Storage integrity
 
 [`REPORT.md`](REPORT.md) documents these storage-integrity gaps. A compliant S3
-store prevents them, but a store that violates its contract can cause silent
-data corruption through any of them.
+store prevents them. A store that violates its contract can cause silent data
+corruption through any of them.
 
-- [ ] **Verify blob chunks on read.** `blob::read_chunk` checks only the chunk
-      byte length, and full blob reads skip `BlobRef.sha256` verification. If
-      the store flips a bit or returns a different chunk under the requested
-      key, the node returns corrupt blob bytes to the client. Store a CRC32C
-      for each chunk, and verify the SHA-256 digest at the end of a full read.
-- [ ] **Detect sequence gaps during stream reads.** `stream::read` does not
-      verify that record sequence numbers are contiguous. If the store replaces
-      a sealed stream chunk with another chunk of the same stream and byte
-      size, reads skip the replaced records silently.
-- [ ] **Add a checksum to blob metadata objects.** `load_staged` checks only
-      the blob ID. If the store flips a bit in `size` or `sha256`, the commit
-      binds the corrupted metadata into the LSM tree.
-- [ ] **Bind every stored object to its key.** Readers verify that a segment's
-      byte size and entry count match its manifest entry, which still accepts a
-      substituted segment of equal size and entry count. Stream chunks and
-      local disk-cache files lack key checks altogether. Write the object ID
-      into each CRC-protected footer and verify it during decoding.
-- [ ] **Detect manifest rollbacks.** A node without a cached manifest accepts
-      any valid older manifest from the store, commits on top of it, and
-      collects the newer segments as orphans. Store a minimum manifest version
-      in the system database to reject rolled-back manifests.
-- [ ] **Surface permanent segment corruption in metrics and error logs.** If
-      a segment fails CRC verification, compaction and garbage collection fail
-      repeatedly and log only at `debug` level. Increment an error counter in
-      `/v1/admin/metrics` and log the failure at `error` level.
+- [ ] **Verify blob chunks on read.** Store a CRC32C for each blob chunk, and
+      verify `BlobRef.sha256` at the end of a full read. `blob::read_chunk`
+      checks only the chunk byte length, and full blob reads skip SHA-256
+      verification. If the store flips a bit or returns a different chunk under
+      the requested key, the node returns corrupt blob bytes to the client.
+- [ ] **Detect sequence gaps during stream reads.** Verify that record sequence
+      numbers are contiguous during `stream::read`. If the store replaces a
+      sealed stream chunk with another chunk of the same stream and byte size,
+      reads skip the replaced records silently.
+- [ ] **Add a checksum to blob metadata objects.** Include a CRC32C in each
+      staged blob metadata object and verify it in `load_staged`. `load_staged`
+      checks only the blob ID. If the store flips a bit in `size` or `sha256`,
+      the commit binds the corrupted metadata into the LSM tree.
+- [ ] **Bind every stored object to its key.** Write the object ID into each
+      CRC-protected footer and verify it during decoding. Readers verify that a
+      segment's byte size and entry count match its manifest entry, which still
+      accepts a substituted segment of equal size and entry count. Stream
+      chunks and local disk-cache files lack key checks altogether.
+- [ ] **Detect manifest rollbacks.** Store a minimum manifest version in the
+      system database to reject rolled-back manifests. Without a minimum
+      version, a node that has no cached manifest accepts any valid older
+      manifest from the store, commits on top of it, and collects the newer
+      segments as orphans.
+- [ ] **Surface permanent segment corruption in metrics and error logs.**
+      Increment an error counter in `/v1/admin/metrics` and log at `error`
+      level if a segment fails CRC verification. Compaction and garbage
+      collection otherwise fail repeatedly and log only at `debug` level.
 
 ## Ambiguous outcomes
 
-- [ ] **Persist started interactive commits across nodes and restarts.** A node
-      tracks started interactive commits in memory so that a duplicate request
-      receives `503` with `outcome: "unknown"`. After a node restart, or on a
-      peer node, the duplicate request receives a retryable `404 txn_not_found`
-      and can cause the client to re-execute the transaction. Derive the
-      transaction ID from its commit ID so that any node can check the commit
-      record in the manifest.
-- [ ] **Set `retryable: false` if `outcome` is `"unknown"`.** A `503`
-      response with `outcome: "unknown"` sets `retryable: true`.
-      `baserunna-client` checks `outcome` before retrying, but a client that
-      inspects only `retryable` can apply a non-idempotent write twice.
-- [ ] **Track ambiguity per commit on batch-abort paths.** If the committer
-      aborts a batch after an ambiguous manifest `PUT`, it marks every commit in
-      the batch as `outcome: "unknown"`, including commits that joined the batch
-      after the ambiguous `PUT`. Return definite errors for commits that were
-      not sent in an ambiguous `PUT`.
-- [ ] **Clear unsent interactive commits with a drop guard.** `commit_txn`
-      calls `forget_started_commit` on each error path before sending the
-      commit. If a client disconnects while `exec_ops` is running, the entry
-      remains in `started_commits`. Return a guard from `take_for_commit` that
-      removes the entry on drop unless the commit was sent.
-- [ ] **Retry startup preflight checks during store outages.** If a node cannot
-      reach the object store at startup, the conditional-write preflight check
-      fails and the process exits. Retry the preflight check with exponential
-      backoff before exiting.
+- [ ] **Persist started interactive commits across nodes and restarts.** Derive
+      each transaction ID from its commit ID so that any node can check the
+      commit record in the manifest. A node tracks started interactive commits
+      only in memory. After a node restart, or on a peer node, a duplicate
+      request receives a retryable `404 txn_not_found` and can cause the client
+      to re-execute the transaction.
+- [ ] **Set `retryable: false` if `outcome` is `"unknown"`.** A `503` response
+      with `outcome: "unknown"` sets `retryable: true`. `baserunna-client`
+      checks `outcome` before retrying, but a client that inspects only
+      `retryable` can apply a non-idempotent write twice.
+- [ ] **Track ambiguity per commit on batch-abort paths.** Return definite
+      errors for commits that were not sent in an ambiguous manifest `PUT`. If
+      the committer aborts a batch after an ambiguous `PUT`, it marks every
+      commit in the batch as `outcome: "unknown"`, including commits that
+      joined the batch after the ambiguous `PUT`.
+- [ ] **Clear unsent interactive commits with a drop guard.** Return a guard
+      from `take_for_commit` that removes the `started_commits` entry on drop
+      unless the commit was sent. `commit_txn` calls `forget_started_commit` on
+      each error path, so if a client disconnects while `exec_ops` is running,
+      the entry remains in `started_commits`.
+- [ ] **Retry startup preflight checks during store outages.** Retry the
+      conditional-write preflight check with exponential backoff before
+      exiting. If the object store is unreachable at startup, the preflight
+      check fails immediately and the process exits.
 - [ ] **Display `outcome: "unknown"` in the web console.** The console displays
-      only the error message, which makes an ambiguous write appear to have
-      failed.
+      only the error message, so an ambiguous write appears to have failed.
 - [ ] **Return `200` if a retried database deletion completes cleanup.** A
       retried `DELETE /v1/dbs/{db}` that finishes an interrupted database
       deletion returns `404 not_found` even though the request completed the

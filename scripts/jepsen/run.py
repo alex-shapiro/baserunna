@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """Runs a Jepsen-style list-append test against a local Baserunna cluster on MinIO.
 
-Starts MinIO and N `baserunna` processes, runs concurrent list-append transactions
-against random nodes, and injects process kills, process pauses, and network
-partitions. After healing the cluster, the script reads every key, writes the
-history in EDN format, and checks it with the `elle_check` example. The script
-exits with status 1 if `elle_check` rejects the history or if any client observes
-an unexpected response.
-
-Each node connects to MinIO through a dedicated TCP proxy, and peers forward
-requests to each node through a second TCP proxy. In `drop` mode, a proxy accepts
-connections and discards incoming bytes so that requests time out.
+The script:
+- starts MinIO and N `baserunna` processes behind TCP fault proxies
+- runs concurrent list-append transactions against random nodes
+- injects `SIGKILL` and `SIGSTOP` faults on nodes and MinIO
+- partitions nodes from MinIO and from peers by dropping or rejecting TCP connections
+- heals the cluster, reads the final list of every key, and writes `history.edn`
+- checks `history.edn` with `elle_check` and exits with status 1 on any violation or client error
 
     cargo build --release -p baserunna --bin baserunna --example elle_check
     scripts/jepsen/run.py --minutes 10 --out runs/1

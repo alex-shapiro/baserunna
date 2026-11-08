@@ -1,11 +1,13 @@
 //! Simulation workload and strict-serializability checker for list-append transactions over KV
 //! keys and streams.
 //!
-//! Each key stores a list of unique integers. Even keys are KV entries that store
-//! comma-separated integers and are updated by interactive read-modify-write transactions. Odd
-//! keys are streams with one record per integer and are updated by `append` operations in
-//! one-shot or interactive transactions. After a key reaches `max_appends`, the generator
-//! replaces it with a new key to keep lists short.
+//! Each key stores a list of unique integers:
+//! - Even keys are KV entries that store comma-separated integers. Interactive read-modify-write
+//!   transactions update them.
+//! - Odd keys are streams with one record per integer. One-shot or interactive transactions
+//!   append to them.
+//! - After a key reaches `max_appends`, the generator replaces it with a new key to keep lists
+//!   short.
 //!
 //! After fault injection ends, the workload reads the final list for every key and verifies:
 //! - Every read returns a prefix of the key's final list.
@@ -13,7 +15,7 @@
 //! - Every read after a transaction's own KV appends ends with those appends.
 //! - Every read includes all appends from transactions that completed before the reading
 //!   transaction began.
-//! - The write-write, write-read, read-write, and real-time dependency graph is acyclic.
+//! - The transaction dependency graph is acyclic.
 //!
 //! If `SIM_ELLE_DIR` is set, the workload also writes the history to `elle-<seed>.edn` for
 //! Jepsen's Elle checker.
@@ -505,10 +507,9 @@ struct CommittedTxn<'a> {
     ops: &'a [ListOp],
 }
 
-/// Builds the write-write, write-read, read-write, and real-time dependency graph from `events`
-/// and `final_lists`, and returns an error if the graph contains a cycle. Call after
-/// [`verify_history_properties`], which checks that every read is a prefix of its key's final
-/// list.
+/// Verifies that the transaction dependency graph of `events` and `final_lists` is acyclic. Call
+/// after [`verify_history_properties`], which checks that every read is a prefix of its key's
+/// final list.
 fn verify_dependency_graph_acyclic(
     events: &[HistoryEvent],
     final_lists: &BTreeMap<u64, Vec<u64>>,

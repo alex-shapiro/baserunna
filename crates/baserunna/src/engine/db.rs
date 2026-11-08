@@ -623,7 +623,9 @@ impl Db {
                         Err(e) => return Err(e.into()),
                     }
                 }
-                Err(StoreError::NotFound) => return Err(Error::not_found("database not found")),
+                Err(StoreError::NotFound) => {
+                    return Err(Error::not_found("database not found"));
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -1916,11 +1918,11 @@ impl Db {
         let mut retired = 0;
         let mut purged_tombstones = 0;
         if let Some(now_ms) = now.store_ms {
-            let purge_below = m.purgeable_below(now_ms, cfg.txn_max_lifetime_ms, cfg.clock_sync_max_error_ms);
+            let purge_through = m.purgeable_through(now_ms, cfg.txn_max_lifetime_ms, cfg.clock_sync_max_error_ms);
             let mut horizon = m.tombstone_horizon;
             if m.segments.iter().all(compaction::holds_records) {
                 m.tail.retain(|e| {
-                    let purged = e.value.is_tombstone() && e.seq < purge_below;
+                    let purged = e.value.is_tombstone() && e.seq <= purge_through;
                     if purged {
                         horizon = horizon.max(e.seq);
                         purged_tombstones += 1;
@@ -1931,7 +1933,7 @@ impl Db {
             // Retire range tombstones when no remaining segment overlaps and no active transaction can read them.
             let segments = &m.segments;
             m.range_deletes.retain(|t| {
-                let retire = t.seq < purge_below && !segments.iter().any(|s| t.dirties(s));
+                let retire = t.seq <= purge_through && !segments.iter().any(|s| t.dirties(s));
                 if retire {
                     horizon = horizon.max(t.seq);
                     retired += 1;
@@ -1939,10 +1941,13 @@ impl Db {
                 !retire
             });
             m.tombstone_horizon = horizon;
+            // Sample the base rather than this batch's version: storage confirmed the base, so it was
+            // visible by now, while this batch becomes visible only once its manifest write lands.
             if data_changed && m.version_times.last().is_none_or(|(_, t)| *t + cfg.version_sample_ms <= now_ms) {
-                m.version_times.push((m.version, now_ms));
+                m.version_times.push((base.m.version, now_ms));
             }
-            let keep_after = now_ms.saturating_sub(cfg.txn_max_lifetime_ms.max(cfg.commit_retention_ms));
+            let purge_age = cfg.txn_max_lifetime_ms + 2 * cfg.clock_sync_max_error_ms;
+            let keep_after = now_ms.saturating_sub(purge_age.max(cfg.commit_retention_ms));
             while m.version_times.len() >= 2 && m.version_times[1].1 <= keep_after {
                 m.version_times.remove(0);
             }
@@ -2258,9 +2263,9 @@ impl Db {
                 Kind::Drop => (Vec::new(), 0, 0, (0, 0)),
                 Kind::DropExpired => (Vec::new(), 0, plan.inputs.iter().map(|s| s.entries).sum(), (0, 0)),
                 Kind::Merge { .. } | Kind::Rewrite | Kind::Expire => {
-                    let purge_below =
-                        v.m.purgeable_below(store_now, cfg.txn_max_lifetime_ms, cfg.clock_sync_max_error_ms);
-                    let out = compaction::run(&self.shared, &v.m, &plan, purge_below).await?;
+                    let purge_through =
+                        v.m.purgeable_through(store_now, cfg.txn_max_lifetime_ms, cfg.clock_sync_max_error_ms);
+                    let out = compaction::run(&self.shared, &v.m, &plan, purge_through).await?;
                     (out.segments, out.purged_max_seq, out.expired, (out.chunks, out.sealed_bytes))
                 }
             };

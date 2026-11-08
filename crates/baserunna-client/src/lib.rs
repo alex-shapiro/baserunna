@@ -174,7 +174,9 @@ impl Client {
                 unresolved = Some(err.clone());
             }
             if !transient || attempt >= self.retry_policy.attempts {
-                // Only `PreconditionFailed` and `Aborted` fence earlier attempts for the idempotency key.
+                // Every server version fences earlier attempts for the idempotency key before
+                // answering `PreconditionFailed` or `Aborted`; newer servers also fence before
+                // other definitive errors, but a client cannot tell which server answered.
                 let resolved = matches!(err.code(), Some(api::ErrorCode::PreconditionFailed | api::ErrorCode::Aborted));
                 return Err(match (err.outcome(), unresolved) {
                     (api::Outcome::NotApplied, Some(earlier)) if !resolved => {
@@ -350,6 +352,15 @@ fn random_u64() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     RandomState::new().hash_one(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Returns true if `e` reports that the key of a raw key-value read holds no value. Servers that
+/// predate `ErrorDetails::missing` report it only in the message, which they never vary.
+fn missing_key(e: &api::ApiError) -> bool {
+    match e.details.as_ref().and_then(|d| d.missing) {
+        Some(m) => m == api::Missing::Key,
+        None => e.code == api::ErrorCode::NotFound && e.message == "key not found",
+    }
 }
 
 fn is_json(b: &[u8]) -> bool {
@@ -600,11 +611,7 @@ impl Db {
         let e = api::GetValue { db: self.name.clone(), key: key.into(), range };
         match self.client.send(&e, &api::NoBody {}).await {
             Ok(v) => Ok(Some(v)),
-            Err(Error::Api { error, .. })
-                if error.details.as_ref().and_then(|d| d.missing) == Some(api::Missing::Key) =>
-            {
-                Ok(None)
-            }
+            Err(Error::Api { error, .. }) if missing_key(&error) => Ok(None),
             Err(e) => Err(e),
         }
     }

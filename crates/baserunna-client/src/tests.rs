@@ -837,3 +837,23 @@ async fn a_rejected_begin_sends_no_abort() {
     txn.abort().await;
     assert_eq!(sent(&s), 1, "nothing began, so nothing is aborted");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_missing_key_reads_as_none_from_old_and_new_servers_but_a_missing_database_is_an_error() {
+    let not_found = |message: &str, details: &str| {
+        let body = format!(
+            r#"{{"error":{{"code":"not_found","message":"{message}","retryable":false,"details":{details}}}}}"#
+        );
+        resp(404, &[], &body)
+    };
+    let cases = [
+        (not_found("key not found", r#"{"missing":"key"}"#), true),
+        (not_found("key not found", "null"), true),
+        (not_found(r#"database \"s\" not found"#, "null"), false),
+    ];
+    for (r, missing_key) in cases {
+        let (c, _) = script(vec![r]);
+        let got = c.db("s").get_value("k", None).await;
+        assert_eq!(matches!(got, Ok(None)), missing_key, "{got:?}");
+    }
+}

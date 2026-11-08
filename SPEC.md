@@ -402,7 +402,7 @@ compaction_seq: u64                                   incremented by every compa
 tail: [Entry]                                         sorted by key, newest value per key (the inline write log)
 range_deletes: [(start, end?, seq)]                   range tombstones (§5.5)
 tombstone_horizon: u64                                tombstones with seq <= horizon may have been purged
-version_times: [(version, store_ms)]                  sparse samples (≥30 s apart) for time-based policies
+version_times: [(version, store_ms)]                  sparse samples (≥30 s apart) of versions visible by store_ms
 obsolete: [(kind, id, since_store_ms)]                segments, levels objects, blobs and parts awaiting deletion
 blob_bytes: {bound, swept, swept_at}                  blob bytes for the size quota (§5.10)
 chunk_bytes: {bound, swept, swept_at}                 sealed stream chunk bytes, likewise (§5.11)
@@ -605,7 +605,7 @@ Compaction can permanently drop a tombstone only once these reasons no longer ap
 - No older value for the key exists below the tombstone
 - The tombstone has been visible to readers for at least `txn_max_lifetime`
 
-Version times record when a commit was prepared, which can precede the moment the version becomes visible by however long its manifest `PUT` stalls. A version's time therefore bounds only the versions before it: a commit is prepared on a base version that storage has confirmed, so every older version was visible by then. Compaction finds the newest sampled version whose time is at least `txn_max_lifetime` plus twice `clock_sync_max_error_ms` old, and drops only tombstones from versions before it.
+A commit becomes visible only once its manifest `PUT` lands, which can be long after the commit was prepared, and every commit in a batch shares that `PUT`. A batch is prepared on a base version that storage has already confirmed, so each sample in `version_times` records the batch's base version with the batch's preparation time: that version and every older one were visible by then. Compaction finds the newest sample at least `txn_max_lifetime` plus twice `clock_sync_max_error_ms` old, and drops only tombstones from that version and older ones.
 
 To guard against a stalled transaction trying to commit after 5 minutes, the manifest records `tombstone_horizon`, the highest `seq` of any tombstone that has ever been dropped. Any transaction with `read_version < tombstone_horizon` is rejected at commit time with `409 conflict`.
 

@@ -77,9 +77,7 @@ pub fn api_error(e: &Error) -> api::ApiError {
         Error::RateLimited { retry_after_ms, .. } => {
             details(api::ErrorDetails { retry_after_ms: Some(*retry_after_ms), ..api::ErrorDetails::default() })
         }
-        Error::KeyNotFound => {
-            details(api::ErrorDetails { missing: Some(api::Missing::Key), ..api::ErrorDetails::default() })
-        }
+        Error::Missing(what, _) => details(api::ErrorDetails { missing: Some(*what), ..api::ErrorDetails::default() }),
         _ => None,
     };
     api::ApiError { code: e.api_code(), message: e.message(), retryable: e.retryable(), details }
@@ -123,7 +121,7 @@ fn error_from_api(status: u16, e: api::ApiError) -> Error {
         C::InvalidArgument => Error::InvalidArgument(m),
         C::Unauthenticated => Error::Unauthenticated(m),
         C::PermissionDenied => Error::PermissionDenied(m),
-        C::NotFound if d.missing == Some(api::Missing::Key) => Error::KeyNotFound,
+        C::NotFound if let Some(what) = d.missing => Error::Missing(what, m),
         C::NotFound => Error::NotFound(m),
         C::TxnNotFound => Error::TxnNotFound(m),
         C::Conflict => Error::Conflict(m),
@@ -1256,7 +1254,7 @@ mod tests {
             Error::Unavailable { message: m(), retry_after_ms: Some(500), outcome_unknown: true },
             Error::Unavailable { message: m(), retry_after_ms: Some(500), outcome_unknown: false },
             Error::Internal(m()),
-            Error::KeyNotFound,
+            Error::Missing(api::Missing::Key, m()),
         ];
         for e in &all {
             // Exhaustive match so new `Error` variants must be added to `all`.
@@ -1265,7 +1263,7 @@ mod tests {
                 | Error::Unauthenticated(_)
                 | Error::PermissionDenied(_)
                 | Error::NotFound(_)
-                | Error::KeyNotFound
+                | Error::Missing(..)
                 | Error::TxnNotFound(_)
                 | Error::Conflict(_)
                 | Error::AlreadyExists(_)

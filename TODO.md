@@ -24,7 +24,7 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       canceled at `commit_timeout_ms`, which can cause large stream reads to
       fail repeatedly with `503 request deadline exceeded`
       (`sim_tool trace streams 2601188`, and the checker reads of `streams` seeds
-      9102146 and 9107143).
+      9102146, 9107143 and 11000150).
 - [ ] **Fix `history` seed 9527230: a read is serialized before a version that
       finished before it began.** A strong read returns version 16 although
       version 17 committed before the read started, violating strict

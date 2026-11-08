@@ -251,13 +251,13 @@ async fn get_kv(Extension(ctx): Extension<DbCtx>, q: Params, req: Request) -> Re
     let c = consistency_of(&q)?;
     let snap = ctx.db.snapshot(c).await?;
     let Some(e) = snap.get(&key).await? else {
-        return Err(Error::KeyNotFound);
+        return Err(Error::missing(api::Missing::Key, "key not found"));
     };
     let range_h = req.headers().get(http::header::RANGE).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
     let (size, ct) = match &e.value {
         Value::Inline(b) => (b.len() as u64, "application/octet-stream".to_string()),
         Value::Blob(r) => (r.size, r.content_type.clone()),
-        Value::Tombstone => return Err(Error::KeyNotFound),
+        Value::Tombstone => return Err(Error::missing(api::Missing::Key, "key not found")),
     };
     let range = match parse_range(range_h.as_deref(), size) {
         Ok(r) => r,

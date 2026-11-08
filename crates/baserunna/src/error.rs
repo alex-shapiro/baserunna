@@ -10,8 +10,8 @@ pub enum Error {
     Unauthenticated(String),
     PermissionDenied(String),
     NotFound(String),
-    /// The key that a raw key-value read names holds no value.
-    KeyNotFound,
+    /// The thing that a request names does not exist, of a kind that the error reports.
+    Missing(baserunna_api::Missing, String),
     TxnNotFound(String),
     /// Optimistic concurrency conflict; retrying the transaction may succeed.
     Conflict(String),
@@ -57,6 +57,10 @@ impl Error {
         Error::NotFound(m.into())
     }
 
+    pub fn missing(what: baserunna_api::Missing, m: impl Into<String>) -> Error {
+        Error::Missing(what, m.into())
+    }
+
     pub fn internal(m: impl Into<String>) -> Error {
         Error::Internal(m.into())
     }
@@ -78,7 +82,7 @@ impl Error {
             Error::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Error::Unauthenticated(_) => ErrorCode::Unauthenticated,
             Error::PermissionDenied(_) => ErrorCode::PermissionDenied,
-            Error::NotFound(_) | Error::KeyNotFound => ErrorCode::NotFound,
+            Error::NotFound(_) | Error::Missing(..) => ErrorCode::NotFound,
             Error::TxnNotFound(_) => ErrorCode::TxnNotFound,
             Error::Conflict(_) => ErrorCode::Conflict,
             Error::AlreadyExists(_) => ErrorCode::AlreadyExists,
@@ -98,7 +102,7 @@ impl Error {
             Error::InvalidArgument(_) => 400,
             Error::Unauthenticated(_) => 401,
             Error::PermissionDenied(_) => 403,
-            Error::NotFound(_) | Error::KeyNotFound | Error::TxnNotFound(_) => 404,
+            Error::NotFound(_) | Error::Missing(..) | Error::TxnNotFound(_) => 404,
             Error::Conflict(_) | Error::AlreadyExists(_) | Error::Aborted(_) => 409,
             Error::PreconditionFailed { .. } => 412,
             Error::TooLarge(_) => 413,
@@ -123,7 +127,7 @@ impl Error {
 
     pub fn message(&self) -> String {
         match self {
-            Error::KeyNotFound => "key not found".into(),
+            Error::Missing(_, m) => m.clone(),
             Error::InvalidArgument(m)
             | Error::Unauthenticated(m)
             | Error::PermissionDenied(m)

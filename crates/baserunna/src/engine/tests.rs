@@ -1645,6 +1645,50 @@ fn tail_tombstones_are_dropped_once_a_later_commit_is_a_transaction_lifetime_old
     });
 }
 
+/// Commits that share a batch become visible together, once the batch's manifest write lands, so a
+/// tombstone written early in a stalled batch is kept a full window after the stall too.
+#[test]
+fn tombstones_of_a_stalled_batch_outlive_the_stall() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        let cfg = eng.shared.cfg.clone();
+        let window = Duration::from_millis(cfg.txn_max_lifetime_ms + 2 * cfg.clock_sync_max_error_ms);
+        let sample = Duration::from_millis(cfg.version_sample_ms);
+        let stall = 4 * sample;
+        put(&db, "k", "v").await;
+        tokio::time::sleep(sample).await;
+        let begin = || db.begin(Isolation::Serializable, Consistency::Strong);
+        let commit = |t: Txn| {
+            let db = db.clone();
+            tokio::spawn(async move { db.commit(t.into_request()).await.unwrap() })
+        };
+        let written = db.current().unwrap().m.write_seq;
+        store.put_reply_ms.store(stall.as_millis() as u64, std::sync::atomic::Ordering::SeqCst);
+        let mut first = begin().await.unwrap();
+        first.put(Bytes::from_static(b"f"), Value::Inline(Bytes::from_static(b"1"))).unwrap();
+        let first = commit(first);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let mut delete = begin().await.unwrap();
+        delete.delete(Bytes::from_static(b"k")).unwrap();
+        let mut later = begin().await.unwrap();
+        later.put(Bytes::from_static(b"x"), Value::Inline(Bytes::from_static(b"1"))).unwrap();
+        let prepared = Instant::now() + stall;
+        let (delete, later) = (commit(delete), commit(later));
+        for h in [first, delete, later] {
+            h.await.unwrap();
+        }
+        store.put_reply_ms.store(0, std::sync::atomic::Ordering::SeqCst);
+        let batches = db.current().unwrap().m.write_seq - written;
+        assert_eq!(batches, 2, "setup: the delete and the later write did not share a batch");
+        let tombstone =
+            || db.current().unwrap().m.tail.iter().any(|e| e.key.as_ref() == b"k" && e.value.is_tombstone());
+        tokio::time::sleep_until(prepared + window + stall / 2).await;
+        put(&db, "y", "1").await;
+        assert!(tombstone(), "dropped before readers had seen its batch for a window");
+    });
+}
+
 pub(super) fn known_objects(m: &manifest::Manifest) -> Vec<String> {
     let db = &m.db_id;
     m.segments
@@ -1810,9 +1854,7 @@ fn merges_purge_expired_tombstones() {
         assert_eq!(out.purged_max_seq, 4);
         assert_eq!(read(&out.segments), [e("a", 5, t.clone()), e("b", 9, t.clone())]);
         m.segments = vec![newer.clone()];
-        let out = compaction::run(&eng.shared, &m, &plan(vec![newer.clone()], 6), 9).await.unwrap();
-        assert_eq!(read(&out.segments), [e("b", 9, t.clone())], "purged a tombstone at the cutoff version");
-        let out = compaction::run(&eng.shared, &m, &plan(vec![newer], 6), 10).await.unwrap();
+        let out = compaction::run(&eng.shared, &m, &plan(vec![newer], 6), 9).await.unwrap();
         assert!(out.segments.is_empty(), "wrote an empty segment");
         assert_eq!(out.purged_max_seq, 9);
     });

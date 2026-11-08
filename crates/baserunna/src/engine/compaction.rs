@@ -181,16 +181,16 @@ fn covered_below(m: &Manifest, level: u8, key: &[u8]) -> bool {
 }
 
 /// Executes a compaction plan, writing output segments and purging obsolete entries.
-pub async fn run(shared: &Arc<Shared>, m: &Manifest, plan: &Plan, purge_below: Seq) -> Result<Output> {
+pub async fn run(shared: &Arc<Shared>, m: &Manifest, plan: &Plan, purge_through: Seq) -> Result<Output> {
     let deletes = Arc::new(RangeDeletes::new(&m.range_deletes));
     let mut out = Output { segments: Vec::new(), purged_max_seq: 0, expired: 0, chunks: 0, sealed_bytes: 0 };
     match plan.kind {
         Kind::Merge { level } => {
-            merge(shared, m, sorted_runs(&plan.inputs), level, &deletes, purge_below, &mut out).await?
+            merge(shared, m, sorted_runs(&plan.inputs), level, &deletes, purge_through, &mut out).await?
         }
         Kind::Rewrite | Kind::Expire => {
             for s in &plan.inputs {
-                merge(shared, m, vec![vec![s.clone()]], s.level, &deletes, purge_below, &mut out).await?;
+                merge(shared, m, vec![vec![s.clone()]], s.level, &deletes, purge_through, &mut out).await?;
             }
         }
         Kind::Move { .. } | Kind::Drop | Kind::DropExpired => {}
@@ -204,7 +204,7 @@ async fn merge(
     runs: Vec<Vec<SegmentMeta>>,
     level: u8,
     deletes: &Arc<RangeDeletes>,
-    purge_below: Seq,
+    purge_through: Seq,
     out: &mut Output,
 ) -> Result<()> {
     let cfg = &shared.cfg;
@@ -235,7 +235,7 @@ async fn merge(
                 Entry::tombstone(e.key, e.seq)
             }
         };
-        if e.value.is_tombstone() && e.seq < purge_below && !covered_below(m, level, &e.key) {
+        if e.value.is_tombstone() && e.seq <= purge_through && !covered_below(m, level, &e.key) {
             out.purged_max_seq = out.purged_max_seq.max(e.seq);
             continue;
         }

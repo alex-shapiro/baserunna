@@ -834,8 +834,8 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
   rather than miss index maintenance.
 - A one-shot read-only transaction always succeeds. An interactive read-only transaction must commit to validate its
   reads, and the commit fails with a retryable `409 conflict` if a concurrent commit changed them (§5.5).
-- Under serializable isolation, a transaction that only writes never conflicts, appends included. Under snapshot
-  isolation, two transactions that write the same key conflict, and the first to commit wins.
+- Under serializable isolation, a transaction that only writes KV keys or appends to streams never conflicts. Under
+  snapshot isolation, two transactions that write the same key conflict, and the first to commit wins.
 - Reads within a transaction see its own earlier writes, except stream appends and
   event inserts: because event positions are assigned at commit time, a
   transaction that inserts into an event table cannot query or delete from that
@@ -1073,6 +1073,15 @@ A DB's manifest is created lazily on first access (`If-None-Match: *`), so
 creating a DB is a single system-DB transaction that reads the owner's
 counter and, for an organization, the creator's membership; the unique
 `(owner_id, name)` index rejects duplicate names.
+
+A database's first manifest is written before any of its other objects. So
+if a node finds no manifest but finds other objects under the database's
+prefix, the manifest was lost. The node then fails the request with
+`500 internal` and writes nothing, because an empty manifest would let
+garbage collection delete the old objects. This applies to the system
+database too, so a node whose system database lost its manifest does not
+start. An operator must restore the manifest from a backup or a bucket
+version.
 
 Metadata commands that act for a user (creating databases and
 organizations, changing members, disabling users, creating sessions and

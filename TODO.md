@@ -171,9 +171,12 @@ correct S3 store, but each one turns a store fault into silent wrong data.
       contiguous.
 - [ ] **Checksum blob meta objects.** `load_staged` checks only the blob id, so
       a flipped bit in `size` or `sha256` is bound into the LSM tree.
-- [ ] **Bind local cache files to their keys.** The CRC32C of a local tier file
-      does not cover its cache key, so a file stored under another key is read
-      as that key's data, and compaction can persist it.
+- [ ] **Bind every stored object to its key.** A segment, a stream chunk, or a
+      local tier file stored under another object's key is read as that
+      object, and compaction can persist it. Readers compare a segment's size
+      and entry count with its manifest entry, but a substitute with the same
+      size and count passes. Write the object ID into each CRC-protected footer
+      and check it on decode.
 - [ ] **Detect a manifest rolled back to an older version.** A node that has no
       cached version accepts any valid older manifest, commits on top of it,
       and later collects the newer segments. Only an anchor outside the

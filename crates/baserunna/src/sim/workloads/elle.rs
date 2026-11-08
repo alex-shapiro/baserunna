@@ -10,10 +10,11 @@
 //!
 //! The checker in this module verifies the properties that need no dependency graph: every read
 //! of a key is a prefix of the key's final value, every acknowledged append appears in the final
-//! value exactly once, no failed append is ever read, and no read contains a value that was never
-//! appended to its key. If `SIM_ELLE_DIR` is set, the run also writes its history in EDN to
-//! `elle-<seed>.edn`, so that Elle can search the history for dependency cycles under strict
-//! serializability.
+//! value exactly once, no failed append is ever read, no read contains a value that was never
+//! appended to its key, and no read sees less of a key than a transaction that completed before
+//! it began. It then searches the dependency graph for cycles, as Elle does under strict
+//! serializability. If `SIM_ELLE_DIR` is set, the run also writes its history in EDN to
+//! `elle-<seed>.edn`, so that Elle itself can check it.
 
 use super::super::client::Client;
 use super::super::{NetError, Sim};
@@ -426,7 +427,171 @@ fn check(events: &[Event], finals: &BTreeMap<u64, Vec<u64>>) -> Result<(), Strin
             }
         }
     }
+    // Every read is a prefix of the final value, so a read's length says which appends it saw. A
+    // transaction must see at least what any transaction that completed before it began saw.
+    let mut seen: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut floors: BTreeMap<u64, BTreeMap<u64, usize>> = BTreeMap::new();
+    for e in events {
+        if e.kind == Kind::Invoke {
+            floors.insert(
+                e.process,
+                e.mops.iter().map(|m| (m.key(), seen.get(&m.key()).copied().unwrap_or(0))).collect(),
+            );
+            continue;
+        }
+        let floor = floors.remove(&e.process).unwrap_or_default();
+        if e.kind != Kind::Ok {
+            continue;
+        }
+        for m in &e.mops {
+            let len = match m {
+                Mop::Read(k, l) => {
+                    let len = l.as_ref().map_or(0, Vec::len);
+                    let need = floor.get(k).copied().unwrap_or(0);
+                    if len < need {
+                        return Err(format!(
+                            "process {} read key {k} as {l:?}, but a transaction that completed before it began saw \
+                             {need} elements",
+                            e.process
+                        ));
+                    }
+                    len
+                }
+                Mop::Append(k, v) => fin_pos(finals, *k, *v).map_or(0, |i| i + 1),
+            };
+            let s = seen.entry(m.key()).or_default();
+            *s = (*s).max(len);
+        }
+    }
     Ok(())
+}
+
+/// A committed transaction in the dependency graph.
+struct Node<'a> {
+    invoked: usize,
+    /// Index of the completion event, or `None` if the outcome is unknown.
+    completed: Option<usize>,
+    mops: &'a [Mop],
+}
+
+/// Searches for a cycle of write-write, write-read, read-write, and real-time dependencies, as
+/// Elle does for list-append histories under strict serializability. Each key's final value gives
+/// its version order. Run after [`check`], which ensures that every read is a prefix of it.
+fn check_cycles(events: &[Event], finals: &BTreeMap<u64, Vec<u64>>) -> Result<(), String> {
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut running: BTreeMap<u64, usize> = BTreeMap::new();
+    for (i, e) in events.iter().enumerate() {
+        match e.kind {
+            Kind::Invoke => {
+                running.insert(e.process, i);
+            }
+            Kind::Ok => {
+                let invoked = running.remove(&e.process).ok_or("completion without invocation")?;
+                nodes.push(Node { invoked, completed: Some(i), mops: &e.mops });
+            }
+            Kind::Info => {
+                let invoked = running.remove(&e.process).ok_or("completion without invocation")?;
+                nodes.push(Node { invoked, completed: None, mops: &e.mops });
+            }
+            Kind::Fail => {
+                running.remove(&e.process);
+            }
+        }
+    }
+    let mut writer: BTreeMap<u64, usize> = BTreeMap::new();
+    for (n, node) in nodes.iter().enumerate() {
+        for m in node.mops {
+            if let Mop::Append(_, v) = m {
+                writer.insert(*v, n);
+            }
+        }
+    }
+    let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); nodes.len()];
+    let mut edge = |a: usize, b: usize| {
+        if a != b {
+            edges[a].insert(b);
+        }
+    };
+    for list in finals.values() {
+        for w in list.windows(2) {
+            if let (Some(a), Some(b)) = (writer.get(&w[0]), writer.get(&w[1])) {
+                edge(*a, *b);
+            }
+        }
+    }
+    for (n, node) in nodes.iter().enumerate() {
+        if node.completed.is_none() {
+            continue;
+        }
+        for m in node.mops {
+            let Mop::Read(k, Some(l)) = m else { continue };
+            let fin = finals.get(k).map_or(&[][..], Vec::as_slice);
+            if let Some(w) = l.last().and_then(|v| writer.get(v)) {
+                edge(*w, n);
+            }
+            if let Some(w) = fin.get(l.len()).and_then(|v| writer.get(v)) {
+                edge(n, *w);
+            }
+        }
+    }
+    // Real-time edges: from each transaction to those invoked after it completed.
+    let mut by_invoke: Vec<usize> = (0..nodes.len()).collect();
+    by_invoke.sort_by_key(|n| nodes[*n].invoked);
+    for (a, node) in nodes.iter().enumerate() {
+        let Some(done) = node.completed else { continue };
+        let first = by_invoke.partition_point(|n| nodes[*n].invoked < done);
+        for b in &by_invoke[first..] {
+            edge(a, *b);
+        }
+    }
+    match find_cycle(&edges) {
+        None => Ok(()),
+        Some(cycle) => {
+            let steps: Vec<String> = cycle.iter().map(|n| format!("{:?}", nodes[*n].mops)).collect();
+            Err(format!("dependency cycle among committed transactions: {}", steps.join(" -> ")))
+        }
+    }
+}
+
+/// Returns the nodes of a cycle in the directed graph `edges`, if there is one.
+fn find_cycle(edges: &[BTreeSet<usize>]) -> Option<Vec<usize>> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        New,
+        OnPath,
+        Done,
+    }
+    let mut mark = vec![Mark::New; edges.len()];
+    for start in 0..edges.len() {
+        if mark[start] != Mark::New {
+            continue;
+        }
+        let mut path: Vec<(usize, std::collections::btree_set::Iter<usize>)> = vec![(start, edges[start].iter())];
+        mark[start] = Mark::OnPath;
+        while let Some((n, next)) = path.last_mut() {
+            match next.next() {
+                Some(&m) if mark[m] == Mark::OnPath => {
+                    let from = path.iter().position(|(p, _)| *p == m).expect("node on path");
+                    return Some(path[from..].iter().map(|(p, _)| *p).collect());
+                }
+                Some(&m) if mark[m] == Mark::New => {
+                    mark[m] = Mark::OnPath;
+                    path.push((m, edges[m].iter()));
+                }
+                Some(_) => {}
+                None => {
+                    mark[*n] = Mark::Done;
+                    path.pop();
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Returns the position of `v` in the final value of `key`.
+fn fin_pos(finals: &BTreeMap<u64, Vec<u64>>, key: u64, v: u64) -> Option<usize> {
+    finals.get(&key)?.iter().position(|x| *x == v)
 }
 
 /// Formats `events` as an EDN history for Elle's list-append checker.
@@ -510,7 +675,9 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
         let path = std::path::Path::new(&dir).join(format!("elle-{}.edn", sim.seed));
         std::fs::write(&path, edn(&events)).map_err(|e| format!("write {}: {e}", path.display()))?;
     }
-    check(&events, &finals).map_err(|e| format!("list-append history of {} events: {e}", events.len()))
+    check(&events, &finals)
+        .and_then(|()| check_cycles(&events, &finals))
+        .map_err(|e| format!("list-append history of {} events: {e}", events.len()))
 }
 
 #[cfg(test)]
@@ -537,6 +704,58 @@ mod tests {
         assert!(check(&[invoke.clone()], &twice).unwrap_err().contains("twice"));
         let garbage: BTreeMap<u64, Vec<u64>> = [(1, vec![9])].into();
         assert!(check(&[invoke], &garbage).unwrap_err().contains("never appended"));
+    }
+
+    #[test]
+    fn rejects_reads_that_miss_earlier_transactions() {
+        let finals: BTreeMap<u64, Vec<u64>> = [(1, vec![1, 2])].into();
+        let at = |kind, process, mops| Event { kind, process, time_ms: 0, mops };
+        let append = vec![Mop::Append(1, 1), Mop::Append(1, 2)];
+        let read = |l: Option<Vec<u64>>| vec![Mop::Read(1, l)];
+        let history = |second: Option<Vec<u64>>| {
+            vec![
+                at(Kind::Invoke, 0, append.clone()),
+                at(Kind::Ok, 0, append.clone()),
+                at(Kind::Invoke, 1, read(None)),
+                at(Kind::Ok, 1, read(second)),
+            ]
+        };
+        check(&history(Some(vec![1, 2])), &finals).unwrap();
+        let stale = check(&history(Some(vec![1])), &finals).unwrap_err();
+        assert!(stale.contains("completed before it began"), "{stale}");
+        let mut concurrent = history(Some(vec![1]));
+        concurrent.swap(1, 2);
+        check(&concurrent, &finals).unwrap();
+    }
+
+    #[test]
+    fn rejects_dependency_cycles() {
+        let at = |kind, process, mops| Event { kind, process, time_ms: 0, mops };
+        // Write skew: each transaction reads the key that the other appends to, and misses it.
+        let t1 = vec![Mop::Read(2, None), Mop::Append(3, 1)];
+        let t2 = vec![Mop::Read(3, None), Mop::Append(2, 2)];
+        let skew = |r1: Option<Vec<u64>>, r2: Option<Vec<u64>>| {
+            vec![
+                at(Kind::Invoke, 0, t1.clone()),
+                at(Kind::Invoke, 1, t2.clone()),
+                at(Kind::Ok, 0, vec![Mop::Read(2, r1), Mop::Append(3, 1)]),
+                at(Kind::Ok, 1, vec![Mop::Read(3, r2), Mop::Append(2, 2)]),
+            ]
+        };
+        let finals: BTreeMap<u64, Vec<u64>> = [(2, vec![2]), (3, vec![1])].into();
+        let skewed = skew(Some(vec![]), Some(vec![]));
+        check(&skewed, &finals).unwrap();
+        assert!(check_cycles(&skewed, &finals).unwrap_err().contains("dependency cycle"));
+        check_cycles(&skew(Some(vec![]), Some(vec![1])), &finals).unwrap();
+        // Two appends ordered against real time: the later transaction's append comes first.
+        let order = vec![
+            at(Kind::Invoke, 0, vec![Mop::Append(4, 1)]),
+            at(Kind::Ok, 0, vec![Mop::Append(4, 1)]),
+            at(Kind::Invoke, 1, vec![Mop::Append(4, 2)]),
+            at(Kind::Ok, 1, vec![Mop::Append(4, 2)]),
+        ];
+        check_cycles(&order, &[(4, vec![1, 2])].into()).unwrap();
+        assert!(check_cycles(&order, &[(4, vec![2, 1])].into()).unwrap_err().contains("dependency cycle"));
     }
 
     #[test]

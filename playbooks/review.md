@@ -46,7 +46,7 @@ Audit the branch and its dependent code paths against this brief.
 
 A bug is usually a symptom of an underlying cause. For each finding, identify the cause and check for other instances of it. Report the cause.
 
-Example from the `deny_private_net` review:
+Example:
 
 - **Symptom:** "An IP literal skips the stage-2 check in `check_resolved`."
 - **Cause:** "Network checks use two precedence orders. Stage 2 ignores tiers and ports, so the same connection can receive different decisions."
@@ -65,7 +65,7 @@ Commit each fix separately. In the commit message, state the problem, the fix, a
 
 ## Tradeoffs
 
-Before making a change that affects the product, ask the user to decide. Document the problem, the options, and their tradeoffs in a short section of `docs/TRADEOFFS.md`. Include only real product or system tradeoffs. Breaking backward compatibility is not a tradeoff.
+Before making a change that requires a product tradeoff, ask the user to decide. Document the problem, the options, and their tradeoffs in a short section of `TRADEOFFS.md`. Include only real product or system tradeoffs. Breaking backward compatibility is not a tradeoff.
 
 After the user decides, remove the section and record the decision and rationale in the commit message.
 
@@ -73,17 +73,17 @@ If the branch relies on a significant preexisting problem that is out of scope t
 
 ## Review Loop
 
-Repeat the audit and fix cycle. Each audit covers the full branch and receives the prior fixes and `docs/TRADEOFFS.md`. Stop if an audit finds only minor problems, or after five audits. Report any remaining problems to the user.
+Repeat the audit and fix cycle. Each audit covers the full branch and receives the prior fixes and `TRADEOFFS.md`. Stop if an audit finds only minor problems, or after five audits. Report any remaining problems to the user.
 
-At the end of the review, report open tradeoffs to the user, move them to `TODO.md`, and delete `docs/TRADEOFFS.md`.
+At the end of the review, report open tradeoffs to the user, move them to `TODO.md`, and delete `TRADEOFFS.md`.
 
 Run each audit in a sub-agent to keep the reviewer independent from the fixer. Give each sub-agent full context. A restarted sub-agent with partial context makes poor design decisions. Start each reviewer with this prompt:
 
 ```
 You own every subsystem that this branch touches. Run the audit in
-docs/playbook_reviewing.md on this branch against origin/main. Report what you
+playbooks/review.md on this branch against origin/main. Report what you
 would change before you ship it. Read AGENTS.md and, if it exists,
-docs/TRADEOFFS.md. Do not edit files, commit, or push.
+TRADEOFFS.md. Do not edit files, commit, or push.
 
 Start with the product brief. Report the findings from most to least important,
 and label each finding "significant" or "minor". For each finding, give its

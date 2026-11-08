@@ -16,7 +16,9 @@ In some cases, the request may be misguided: even the best solution would degrad
 
 ## Implementation
 
-Think through all possible ways to attack the problem. If there are multiple plausible alternatives, build the best possible, fully baked version of each and test them against each other in a _fair_ contest whose winner best fulfills the key criteria.
+Think through all possible ways to attack the problem. If there are multiple plausible candidates, build the best possible, fully baked version of each and test them against each other in a fair contest. The winner is the candidate that best fulfills the key criteria.
+
+A contest is fair if all candidates can win. Pre-register the result that would make each candidate the winner. If you cannot describe a result in which your favorite loses, you have already chosen, and the contest is only a formality. Build each candidate as its strongest advocate would, preferably in a separate sub-agent. Use a separate sub-agent as judge. In the commit message, record the criteria, the results, and the reason each losing candidate lost.
 
 Ensure all claims are backed by solid evidence. Where useful, use property, fuzz, load, or other testing techniques. Make changes to testing infra as appropriate.
 

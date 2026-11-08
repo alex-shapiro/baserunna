@@ -6,8 +6,8 @@ deterministic simulation, Jepsen's Elle checker, a real-cluster fault-injection
 harness on MinIO, and targeted code audits. We also compared Baserunna against
 the pathology classes in Jepsen's analysis of ParticleDB 1.1.4.
 
-Every test history satisfied strict serializability across 1.6 million
-real-cluster transactions and more than 135,000 simulated runs. However, the
+Every test history satisfied strict serializability across 1.8 million
+real-cluster transactions and more than 180,000 simulated runs. However, the
 audits and real-cluster tests exposed six bugs and documentation gaps:
 
 - If a database's manifest object was missing, Baserunna created an empty
@@ -248,6 +248,12 @@ The simulation campaigns ran as follows:
   (about 57 simulated days), 0 failures.
 - Guided exploration (`explore all`) on the final code for 30 minutes: 9,388
   runs, 4,713 of them branched from rare probes, 0 failures.
+- `campaign all` on commit `63c268f` for 25 minutes across 4 threads: 42,998
+  runs (about 86 simulated days), 1 failure. Seed 140001448 of `streams`
+  never finished its final stream read, because the read hit the request
+  deadline 402 times. The same seed fails on the original code (`609bc87`).
+  This is the known liveness problem "stream reads that exceed the request
+  deadline" in TODO.md, not a safety violation.
 
 Three 60-to-90-minute campaigns ran concurrently with large real-cluster tests
 and were terminated by the OS (`SIGKILL`, exit code 137) under memory pressure.
@@ -275,11 +281,12 @@ The five real-cluster runs on MinIO tested three binary revisions:
 | r4 | fixed | 5 | 5 s | 60 | 354 | 465,539 | 3,379 | valid |
 | r5 | final | 3 | 1 s | 40 | 228 | 328,164 | 1,502 | valid |
 | r6 | `07a7f79` | 5 | 1 s | 40 | 237 | 370,842 | 933 | valid |
+| r7 | `63c268f` | 3 | 1 s | 22 | 127 | 187,315 | 484 | not run |
 
 In the table, `ok` is the number of successful transactions, including
 read-only ones, and `info` is the number of transactions with an unknown
-outcome. Both `elle_check` and
-`elle-cli` accepted every history. Run r3 used 30 clients across 4 active keys
+outcome. `elle_check` accepted every history, and `elle-cli` accepted every
+history that it checked (all except r7). Run r3 used 30 clients across 4 active keys
 with a 1 s lease so that process pauses frequently exceeded the lease duration.
 Appendix A lists the exact command and seed for each run.
 
@@ -652,8 +659,9 @@ git apply -R bugzoo/04-in-flight-write-barrier.patch
 ## Appendix A. Test Runs
 
 All real-cluster runs executed `scripts/jepsen/run.py` on an 8-core, 16 GB
-macOS machine with MinIO `2025-10-15`. Both `elle_check` (`3514ff1`) and
-`elle-cli` 0.1.11 accepted every history:
+macOS machine with MinIO `2025-10-15`. `elle_check` (`3514ff1` or later)
+accepted every history, and `elle-cli` 0.1.11 accepted every history that it
+checked (r1 to r6):
 
 - **r1:** `--minutes 10 --seed 1`, binary `76c411c`. Recorded 7 client errors
   caused by the stream-creation harness bug described in section 3.11.
@@ -668,6 +676,9 @@ macOS machine with MinIO `2025-10-15`. Both `elle_check` (`3514ff1`) and
 - **r6:** `--minutes 40 --seed 6 --nodes 5 --lease-ms 1000 --clients 15
   --active-keys 5`, binary `07a7f79`, which has every fix. 0 client errors,
   and the harness ran `elle_check` itself and exited with status 0.
+- **r7:** `--minutes 22 --seed 8 --lease-ms 1000 --clients 20 --active-keys 3
+  --max-appends 12`, binary `63c268f`. 0 client errors, and `elle_check`
+  accepted the history. We did not run `elle-cli` on it.
 
 The bug-zoo comparisons used commits `7ab104b` and `cd30b18`:
 

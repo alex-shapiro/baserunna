@@ -521,6 +521,8 @@ Each open database has a per-node commit queue drained by a single committer tas
 
 While a manifest `PUT` is in flight, strong reads on the committing node wait for that `PUT` to finish, since another node may already observe the new manifest in object storage. A read waits only for the `PUT` that was in flight when the read arrived, so back-to-back commits cannot starve readers.
 
+Snapshot reads on the committing node do not wait. While a manifest `PUT` is in flight, the node treats its cached manifest as current only at the time when the `PUT` started. If that time is older than the read's `max_staleness_ms`, the node reads the manifest from storage. If that read returns the manifest of the in-flight `PUT`, the node does not request a lease, because the `PUT` reply restores the lease that the manifest grants.
+
 Single-request serializable transactions begin immediately on the node's latest cached version without waiting for an in-flight manifest `PUT`, so concurrent writes are batched into the next commit. If the transaction contains writes, commit validation checks its read set against the in-flight commit. If the transaction is read-only or fails before committing, the node waits for the in-flight `PUT` to finish, validates the read set against a strong snapshot, and re-executes the transaction on conflict. Interactive serializable transactions also begin on the latest cached version. Because their read results have already been returned to the client, a read-only commit that fails validation returns `409 conflict` instead of re-executing. Snapshot-isolation transactions wait for a strong snapshot before starting.
 
 #### Range Deletes

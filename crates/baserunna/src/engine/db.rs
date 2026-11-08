@@ -177,6 +177,8 @@ struct State {
     /// Hedged manifest `PUT` requests that remain in flight in the background.
     /// Lease-based reads are disabled while this count is non-zero.
     in_flight_hedged_puts: u32,
+    /// Start of this node's manifest write that is in flight, if any.
+    manifest_write_started_at: Option<Instant>,
     compacting: bool,
     flushing: bool,
     sweeping: bool,
@@ -274,6 +276,7 @@ impl Db {
                 lease_requested: false,
                 own_lease: None,
                 in_flight_hedged_puts: 0,
+                manifest_write_started_at: None,
                 compacting: false,
                 flushing: false,
                 sweeping: false,
@@ -719,7 +722,7 @@ impl Db {
         let hot = {
             let mut st = self.st.lock();
             let hot = st.hot(self.shared.cfg.lease_read_threshold) && !st.lease_requested;
-            if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v).is_none() {
+            if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v).is_none() && !self.has_in_flight_write() {
                 st.lease_requested = true;
                 true
             } else {
@@ -755,21 +758,17 @@ impl Db {
             false => Duration::ZERO,
         };
         let leased = !lease_left.is_zero();
+        let current_at = leased.then(|| st.manifest_write_started_at.unwrap_or(now)).max(st.verified_at);
         let fresh = match c {
             Consistency::Strong => leased,
             Consistency::Snapshot { max_staleness_ms } => {
-                leased
-                    || st.verified_at.is_some_and(|v| now.duration_since(v) <= Duration::from_millis(max_staleness_ms))
+                current_at.is_some_and(|t| now.duration_since(t) <= Duration::from_millis(max_staleness_ms))
             }
         };
         let want_lease = leased && hot && !st.lease_requested && lease_left < Duration::from_millis(cfg.lease_ms / 5);
         if want_lease {
             st.lease_requested = true;
         }
-        let current_at = match (leased, st.verified_at) {
-            (false, Some(va)) => va,
-            _ => now,
-        };
         drop(st);
         if want_lease {
             self.enqueue(Work::Lease { release: false, for_reads: true, tx: None });
@@ -780,7 +779,7 @@ impl Db {
         self.shared.env.trace(|| {
             format!("{} read v{} from cache (leased={leased}, lease={:?})", self.id, cur.m.version, cur.m.lease)
         });
-        Some((cur, current_at))
+        Some((cur, current_at?))
     }
 
     /// Pairs `v` with the store time corresponding to `at`, syncing the store
@@ -1178,9 +1177,8 @@ impl Db {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
             }
             self.shared.env.crash_point().await;
-            let started = Instant::now();
             self.limit_own_lease(&m, attempt_started);
-            self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let started = self.write_started();
             let data = {
                 let mut pages = self.pages.lock();
                 let data = m.encode_with(&mut pages.0);
@@ -1425,7 +1423,16 @@ impl Db {
         }
     }
 
+    /// Records the start of a manifest write and returns its start instant.
+    fn write_started(&self) -> Instant {
+        let started = Instant::now();
+        self.st.lock().manifest_write_started_at = Some(started);
+        self.writes_started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        started
+    }
+
     fn write_finished(&self) {
+        self.st.lock().manifest_write_started_at = None;
         self.writes_finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.write_done.notify_waiters();
     }
@@ -2930,6 +2937,30 @@ mod tests {
             put(&db, "k", "2").await;
             let cur = db.current().unwrap();
             assert!(db.holds_lease(&db.st.lock(), &cur.m));
+        });
+    }
+
+    #[test]
+    fn leased_cache_is_current_until_the_in_flight_write_started() {
+        use crate::engine::tests::{delayed_engine, opened, put};
+        use std::sync::atomic::Ordering::SeqCst;
+        rt().block_on(async {
+            let (eng, store) = delayed_engine("a");
+            let db = opened(&eng, "d").await;
+            put(&db, "k", "1").await;
+            store.put_reply_ms.store(200, SeqCst);
+            let tight = Consistency::Snapshot { max_staleness_ms: 49 };
+            let reads_during_write = async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let started = db.st.lock().manifest_write_started_at.expect("the write is in flight");
+                let now = Instant::now();
+                let loose = Consistency::Snapshot { max_staleness_ms: 5_000 };
+                assert_eq!(db.cached(loose, now).map(|(_, at)| at), Some(started));
+                assert!(db.cached(tight, now).is_none());
+            };
+            tokio::join!(put(&db, "k", "2"), reads_during_write);
+            assert_eq!(db.st.lock().manifest_write_started_at, None);
+            assert_eq!(db.cached(tight, Instant::now()).map(|(_, at)| at), Some(Instant::now()));
         });
     }
 

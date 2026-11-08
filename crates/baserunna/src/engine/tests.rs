@@ -1863,6 +1863,138 @@ fn tombstones_of_a_stalled_batch_outlive_the_stall() {
     });
 }
 
+/// A lease holder's manifest write can land in storage long before its reply arrives, and another
+/// node can serve the new version from storage meanwhile. A bounded-staleness read on the lease
+/// holder must then not return the older version once the bound has passed.
+#[test]
+fn bounded_staleness_reads_on_the_lease_holder_see_its_landed_write() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        put(&db, "k", "1").await;
+        store.put_reply_ms.store(200, SeqCst);
+        let writer = {
+            let db = db.clone();
+            tokio::spawn(async move { put(&db, "k", "2").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let replica = second_node(&eng, &store, "b").db("d");
+        replica.open(false).await.unwrap();
+        let seen = replica.snapshot(Consistency::Strong).await.unwrap().version.get_entry(b"k").await.unwrap();
+        assert_eq!(seen.map(|e| e.value), Some(inline("2")), "setup: the write did not land before its reply");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stale = Consistency::Snapshot { max_staleness_ms: 56 };
+        let read = db.snapshot(stale).await.unwrap().version.get_entry(b"k").await.unwrap();
+        assert_eq!(read.map(|e| e.value), Some(inline("2")), "the lease holder served a version older than the bound");
+        writer.await.unwrap();
+    });
+}
+
+/// A lease holder that loads its own landed write from storage before the write's reply receives
+/// the lease with that reply, so it must not write the manifest again to request one.
+#[test]
+fn a_lease_holder_that_loads_its_own_write_early_does_not_request_a_lease() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        put(&db, "k", "1").await;
+        for _ in 0..eng.shared.cfg.lease_read_threshold {
+            db.snapshot(Consistency::Strong).await.unwrap();
+        }
+        store.put_reply_ms.store(200, SeqCst);
+        let puts_before = store.manifest_puts.load(SeqCst);
+        let reads_during_write = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let tight = Consistency::Snapshot { max_staleness_ms: 56 };
+            let read = db.snapshot(tight).await.unwrap().version.get_entry(b"k").await.unwrap();
+            assert_eq!(read.map(|e| e.value), Some(inline("2")));
+        };
+        tokio::join!(put(&db, "k", "2"), reads_during_write);
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(store.manifest_puts.load(SeqCst) - puts_before, 1, "the node wrote the manifest to request a lease");
+        assert!(db.leased_view().is_some(), "the node lost its lease");
+    });
+}
+
+/// Measures reads on a lease holder that commits continuously, and checks each read against the
+/// version that storage held when the read's staleness bound began.
+#[test]
+fn lease_holder_reads_during_commits() {
+    let modes = [
+        Consistency::Snapshot { max_staleness_ms: 56 },
+        Consistency::Snapshot { max_staleness_ms: 5_000 },
+        Consistency::Strong,
+    ];
+    let mut violations = Vec::new();
+    for mode in modes {
+        rt().block_on(async {
+            let (eng, store) = delayed_engine("a");
+            let db = opened(&eng, "d").await;
+            put(&db, "k", "0").await;
+            store.get_reply_ms.store(20, SeqCst);
+            store.put_reply_ms.store(60, SeqCst);
+            let stored_version = {
+                let store = store.clone();
+                move || {
+                    let g = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap();
+                    manifest::Manifest::decode(&g.data).unwrap().version
+                }
+            };
+            let samples = Arc::new(Mutex::new(vec![(Instant::now(), stored_version())]));
+            let sampler = {
+                let samples = samples.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        let v = stored_version();
+                        let mut s = samples.lock();
+                        if s.last().unwrap().1 != v {
+                            s.push((Instant::now(), v));
+                        }
+                    }
+                })
+            };
+            let writer = {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    for i in 1..=40 {
+                        put(&db, "k", &i.to_string()).await;
+                    }
+                })
+            };
+            let bound = match mode {
+                Consistency::Snapshot { max_staleness_ms } => Duration::from_millis(max_staleness_ms),
+                Consistency::Strong => Duration::ZERO,
+            };
+            let manifest_gets = || store.gets_matching(|k| k.ends_with("/manifest"));
+            let gets_before = manifest_gets();
+            let mut latencies = Vec::new();
+            while !writer.is_finished() {
+                let invoked = Instant::now();
+                let read = db.snapshot(mode).await.unwrap().version.m.version;
+                latencies.push(invoked.elapsed());
+                let floor = invoked.checked_sub(bound).unwrap_or(invoked);
+                let required = samples.lock().iter().rev().find(|(t, _)| *t <= floor).map_or(0, |(_, v)| *v);
+                if read < required {
+                    violations.push(format!("{mode:?}: read v{read}, storage held v{required} at the bound"));
+                }
+                tokio::time::sleep(Duration::from_millis(7)).await;
+            }
+            sampler.abort();
+            let gets = manifest_gets() - gets_before;
+            latencies.sort();
+            let n = latencies.len();
+            let mean = latencies.iter().sum::<Duration>() / n as u32;
+            eprintln!(
+                "{mode:?}: reads={n} mean={mean:?} p99={:?} max={:?} manifest_gets={gets}",
+                latencies[n * 99 / 100],
+                latencies[n - 1]
+            );
+        });
+    }
+    assert!(violations.is_empty(), "{} stale reads: {:#?}", violations.len(), &violations[..violations.len().min(5)]);
+}
+
 pub(super) fn known_objects(m: &manifest::Manifest) -> Vec<String> {
     let db = &m.db_id;
     m.segments

@@ -7,16 +7,17 @@ pathology by pathology, with Jepsen's analysis of ParticleDB 1.1.4.
 
 We found no transactional anomaly. About 1.24 million transactions succeeded
 on a real cluster with process kills, pauses and partitions, and more than
-100,000 simulated runs passed. However, Baserunna had a ParticleDB-class
+120,000 simulated runs passed. However, Baserunna had a ParticleDB-class
 storage pathology: if a database's manifest went missing, Baserunna recreated
 the database empty, and garbage collection then deleted all of its data. A
 substituted segment was read as the real one and then compacted away. Three
-error paths told clients that applied writes had failed, or that they could
-safely restart. The documentation overclaimed in five places.
+error paths gave clients a wrong answer about an applied write: that it had
+failed, that it was an earlier request's, or that the client could safely
+restart. The documentation overclaimed in five places.
 
 This branch fixes the lost manifest, the three error paths, and the
-documentation. It detects most substituted segments, but not one with the
-same size and entry count. One error path is fixed only on the node that ran
+documentation. It now detects a substituted segment that differs in size or
+entry count, but not one with the same size and count. One error path is fixed only on the node that ran
 the commit. Several storage-integrity gaps remain open, and each needs a
 broken object store to trigger.
 
@@ -46,10 +47,11 @@ streams, and event tables, plus blobs and change feeds.
 
 ### 1.2 Safety claims
 
-SPEC.md §1 makes three safety claims:
+Before this branch, SPEC.md §1 made three safety claims:
 
 - Committed data is never lost or reordered.
-- Transactions are strictly serializable.
+- Transactions are strictly serializable. (Section 3.8 explains why this
+  branch adds "by default".)
 - Committed data correctness relies on object storage guarantees.
 
 Section 6 adds the details. The default isolation is serializable, and
@@ -72,7 +74,7 @@ following pathologies:
    #110).
 2. **Silent damage from corrupt files.** After WAL bitflips, ParticleDB
    replayed a "valid prefix" and kept serving (#108). After 4 KiB chunks of a
-   WAL were shuffled, it logged "No data found in storage — starting fresh",
+   WAL were shuffled to simulate misdirected writes, it logged "No data found in storage — starting fresh",
    and all data was lost (#112).
 3. **Faults that break invariants.** Process kills caused internal anomalies
    and lost update (#107).
@@ -166,9 +168,11 @@ strict-serializable` on every history.
 At first, the workload's own checks covered only properties that need no
 dependency graph: every read is a prefix of the final value, and every
 acknowledged append is present exactly once. Section 4.2 shows that this
-missed stale reads that Elle found. So we added two more checks in Rust,
+missed stale reads that Elle found. So we added three more checks in Rust,
 which run in every simulation run without Java:
 
+- an internal-consistency check: a transaction's read of a key after its own
+  appends to that key ends with those appends;
 - a real-time check: a read sees at least as much of a key as any
   transaction that completed before the read's transaction began;
 - a cycle check: the final values give each key's version order, and the
@@ -217,7 +221,7 @@ Three audits covered paths that no workload exercised:
 - every safety claim in the README, SPEC, OpenAPI document, and client docs.
 
 Each finding that we report as confirmed has a test that fails before the
-fix.
+fix, with two exceptions that section 5 names.
 
 ### 2.5 Detection power
 
@@ -244,8 +248,10 @@ The simulator runs were as follows:
   29 simulated days, 0 failures. Commits 7874096, 901e380 and d284785 all
   cite this one campaign.
 - Runs of the affected scenarios after later fixes: 57,138 runs, 0 failures.
-- `elle` with the new checks, 6,000 more seeds: 0 failures.
-- `campaign all` on the final code: @@HEADCAMPAIGN@@
+- `elle` seeds 1000-2999, run again after each of three changes to the
+  checks: 0 failures each time.
+- `campaign all` on the final code, 20 minutes on 4 threads: 28,029 runs,
+  about 57 simulated days, 0 failures.
 
 Three longer campaigns (60 to 90 minutes) ended with `SIGKILL` (exit code
 137). Each one ran next to a large real-cluster run, so memory pressure is
@@ -254,11 +260,13 @@ not report their run counts, so we do not count them.
 
 The real-cluster runs were as follows. All ran on MinIO. `elle_check` found
 every history valid, and the last column gives Elle's verdict. "Before
-fixes" means commit 76c411c, which has only the fix of section 3.7. "Fixed"
-means commit d32f75a, which adds sections 3.2 to 3.4. "Final" means commit
-cd30b18, which has every fix except b0d3e88 and the fixes of the second
-review (section 3.10). Those fixes change only answers to requests that the
-harness does not send.
+fixes" means commit 76c411c, which has only the first version of the fix in
+section 3.7. "Fixed" means commit d32f75a, which adds 7874096 (section 3.2),
+901e380 (section 3.3), and d284785, the first version of the fix in section
+3.4. "Final" means commit cd30b18, which adds e5091e9, f402025, 15e5ee9, and
+80a1286. The later fixes (b0d3e88, 722635a, 9e2df7b, fb22d2c) change only
+answers to requests that the harness does not send, start-up, and the cache
+limit. Appendix A gives the command and seed of each run.
 
 | run | binary | nodes | lease | minutes | faults | ok | info | Elle |
 | --- | ------ | ----- | ----- | ------- | ------ | -- | ---- | ---- |
@@ -319,8 +327,8 @@ listed segment, so the loss stayed permanent even after the original bytes
 came back.
 
 The reader now checks that the object's size and entry count equal the
-manifest's entry. This is the misdirected-write fault that Jepsen used
-against ParticleDB.
+manifest's entry. A misdirected write, the fault that Jepsen simulated by
+shuffling chunks of ParticleDB's WAL, can cause this kind of substitution.
 
 Commit: 901e380. Test: `a_segment_stored_under_another_segments_key_is_rejected`.
 
@@ -388,12 +396,17 @@ and `fuzz_txn_ops_against_model`.
 replaced the client options that it had loaded. So every client option set
 through the environment, including `AWS_ALLOW_HTTP`, was ignored, and a node
 could not use a plain-HTTP endpoint such as a local MinIO. The store
-conformance tests passed `allow_http` as an explicit setting, so they never
+conformance tests passed `aws_allow_http` as an explicit setting, so they never
 tested the path that production uses. The first real-cluster run found this
 before it sent a single request. The simulator could not have found it,
 because it does not use `CloudStore`.
 
 Commit: 76c411c. Test: `client_options_are_read_from_the_environment`.
+
+The first version of this fix read the environment with `std::env::vars`,
+which panics if any variable is not valid UTF-8, so a node would fail to
+start. Commit 722635a skips such variables, as `object_store` does. It has
+no test.
 
 ### 3.8 The documentation overclaimed (fixed)
 
@@ -443,8 +456,8 @@ These problems remain. TODO.md lists each of them.
 
 ### 3.10 Review of the fixes
 
-The review playbook asks for an independent reviewer of each branch. The
-reviewer found problems in four of our fixes:
+The review playbook asks for independent reviewers. Three reviews ran. The
+first found problems in four of our fixes:
 
 - The ambiguity fix (section 3.4) was too broad, as described above.
 - The replay fix (section 3.5) decided "our write landed" by comparing a
@@ -455,25 +468,34 @@ reviewer found problems in four of our fixes:
   and entry count. Its test passed only because the two segments differed
   in size.
 
-We fixed the first three and recorded the fourth in TODO.md. A second
-review found three more problems:
+We fixed the first three (15e5ee9, 80a1286) and recorded the fourth in
+TODO.md. The second review found these problems:
 
 - The new cycle checker skipped reads of KV keys that did not exist yet,
   so it missed write skew on new keys. Elle treats such a read as an empty
-  list, and now our checker does too.
+  list, and now our checker does too (3514ff1). The workload also lacked an
+  internal-consistency check (3514ff1).
 - The interactive-commit cache still lost every entry when it held 100,000
-  live ones. It now evicts the oldest eighth.
-- A failure before the commit was sent could still be answered as "may have
-  been applied".
+  live ones (9e2df7b, then fb22d2c after the third review).
+- A failure before the commit was sent, or a read-only commit, could still
+  be answered as "may have been applied" (b0d3e88). The transaction fuzzer
+  found the read-only case.
+- `CloudStore` panicked on a non-UTF-8 environment variable (722635a).
+- The harness kept a second copy of the checker and ignored client errors
+  in its exit status (f2881f8).
+
+The third review found mostly problems in this report, which we corrected,
+and minor code problems, two of which are now TODO.md items.
 
 Earlier, a campaign had caught a race in the first version of the
-lost-manifest fix (section 3.2). We report these mistakes because they are the same failure
-that Jepsen describes in ParticleDB: a fix that looks complete, but is not.
-Each one was caught by a test or a review, not by reading the fix.
+lost-manifest fix (section 3.2). We report these mistakes because they are
+the same failure that Jepsen describes in ParticleDB: a fix that looks
+complete, but is not. Tests, campaigns, and independent reviews caught each
+one. The author of the fix caught none of them.
 
 ### 3.11 Harness bugs
 
-Jepsen asks testers to check their own tools, so we report three bugs in our
+Jepsen asks testers to check their own tools, so we report four bugs in our
 harness. Each one would have hidden or invented results:
 
 - The first TCP proxy closed both directions of a connection on the first
@@ -483,11 +505,14 @@ harness. Each one would have hidden or invented results:
   node was down.
 - A client recorded an `:info` completion for a transaction that it never
   invoked. Elle rejected the history as malformed instead of checking it.
+  We removed the 7 such events from the r1 history before we checked it.
+- The exit status ignored client errors, and the harness had a second copy
+  of the checker that could drift from the first.
 
 ## 4. Does the Simulator Match Jepsen?
 
-The task asked whether an existing tool matches or surpasses Jepsen. Our
-answer is yes inside the simulated world and no outside it, so we used both.
+Can the repository's own tools replace Jepsen for Baserunna? Inside the
+simulated world, yes. Outside it, no, so we used both.
 
 ### 4.1 Where the simulator is stronger
 
@@ -576,8 +601,8 @@ Each item below is a ParticleDB pathology and its status in Baserunna.
   test path did differ from production (section 3.7).
 - **Unexplained fixes.** Not found. Each historical bug in SPEC §13.6 has a
   cause, and the bug zoo reproduces 27 of them. Each fix in this branch has a
-  test that fails without it, except the lock race of 80a1286, which we did
-  not reproduce.
+  test that fails without it, with two exceptions: 722635a has no test, and
+  we did not reproduce the lock race that 80a1286 fixes.
 
 ## 6. Discussion
 
@@ -628,15 +653,16 @@ absence.
 Simulator:
 
 ```sh
-SIM_MINUTES=45 cargo run --release --example sim_tool -- campaign all 1000000 70000000
+SIM_MINUTES=20 cargo run --release --example sim_tool -- campaign all 1000000 120000000
 SIM_ELLE_DIR=out cargo run --release --example sim_tool -- campaign elle 2000 1000
+cargo run --release --example elle_check -- out/*.edn
 java -jar elle-cli-0.1.11-standalone.jar -m list-append -f edn -c strict-serializable out/*.edn
 ```
 
-Real cluster (needs `minio`, `mc`, and a release build of `baserunna`):
+Real cluster (needs `minio` and `mc` on the `PATH`):
 
 ```sh
-cargo build --release -p baserunna --bin baserunna
+cargo build --release -p baserunna --bin baserunna --example elle_check
 scripts/jepsen/run.py --minutes 30 --out runs/r3 --seed 3 --lease-ms 1000 --clients 30 --active-keys 4 --max-appends 16
 java -Xmx8g -jar elle-cli-0.1.11-standalone.jar -m list-append -f edn -c strict-serializable runs/r3/history.edn
 ```
@@ -645,7 +671,6 @@ Bug-zoo comparison:
 
 ```sh
 git apply bugzoo/04-in-flight-write-barrier.patch
-cargo build --release --example sim_tool
 SIM_ELLE_DIR=out cargo run --release --example sim_tool -- campaign elle 1000 6000
 cargo run --release --example sim_tool -- campaign history 1000 6000
 git apply -R bugzoo/04-in-flight-write-barrier.patch
@@ -653,3 +678,51 @@ git apply -R bugzoo/04-in-flight-write-barrier.patch
 
 Each fix in this branch is its own commit. Its message gives the bug, the
 fix, and the test results before and after the fix.
+
+## Appendix A. Runs
+
+Real-cluster runs used `scripts/jepsen/run.py` with these arguments, on one
+macOS machine (8 cores, 16 GB) with MinIO 2025-10-15. The harness did not yet
+record client errors in its exit status (section 3.11); the counts below
+come from each run's `summary.json`.
+
+- r1: `--minutes 10 --seed 1`, binary 76c411c. 7 client errors, all from the
+  stream-creation harness bug of section 3.11.
+- r2: `--minutes 20 --seed 2`, binary 76c411c. 0 client errors.
+- r3: `--minutes 30 --seed 3 --lease-ms 1000 --clients 30 --active-keys 4
+  --max-appends 16`, binary d32f75a. 0 client errors.
+- r4: `--minutes 60 --seed 4 --nodes 5 --clients 20`, binary d32f75a. 0
+  client errors. Nodes exited 83 times, each time because the start-up check
+  failed during a store fault, and the supervisor restarted them.
+- r5: `--minutes 40 --seed 5 --lease-ms 1000 --clients 12 --active-keys 6`,
+  binary cd30b18. 0 client errors.
+
+`elle_check` (commit 3514ff1) and elle-cli 0.1.11 found every history valid.
+
+Bug-zoo comparisons ran with the binaries of commits 7ab104b (for Elle and
+`history`) and cd30b18 (for the new checks of the `elle` workload):
+
+- Patch 03, seeds 5000-5299: `history` failed 94, Elle rejected 0.
+- Patch 04, seeds 5000-5299 and 6000-6999: Elle rejected 10, `history`
+  failed 4 (0 and 4), and the new checks of the `elle` workload rejected
+  the same 10 seeds as Elle.
+- Patch 12, seeds 5000-5299: `history` failed 34, and the `elle` workload
+  failed 41, most of them from the lease oracle. Seeds 6000-6999 with the new checks:
+  147 failures.
+- Patches 07, 22 and 27, seeds 5000-5299: no failures from either.
+- Patch 17, seeds 6000-6999 with the new checks: no failures.
+
+The rate of about 600 runs a minute on 4 cores comes from the baseline
+campaign: 27,549 runs in 45 minutes. The 7 bug-zoo bugs that random
+campaigns miss in about 2,800 seeds are from `bugzoo/README.md`.
+
+## Appendix B. References
+
+- Jepsen, "ParticleDB 1.1.4", 2026-10-31: https://jepsen.io/analyses/particledb-1.1.4
+- Jepsen ParticleDB test suite: https://github.com/jepsen-io/particledb
+- Jepsen analyses of Bufstream 0.1.0, NATS 2.12.1, TigerBeetle 0.16.11,
+  etcd 3.4.3, PostgreSQL 12.3, MySQL 8.0.34, Datomic Pro 1.0.7075, and Radix
+  DLT 1.0-beta.35.1: https://jepsen.io/analyses
+- Elle: https://github.com/jepsen-io/elle, and elle-cli 0.1.11:
+  https://github.com/ligurio/elle-cli
+- Consistency models: https://jepsen.io/consistency

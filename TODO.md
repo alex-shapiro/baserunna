@@ -155,6 +155,49 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       part with a partial path directory, `Feed::SharedPath` reparses the shared
       bucket JSON once per output path instead of once per row.
 
+## Storage integrity
+
+These come from the Jepsen-style investigation in [`REPORT.md`](REPORT.md).
+Each one needs a store that breaks its contract, so none can occur on a
+correct S3 store, but each one turns a store fault into silent wrong data.
+
+- [ ] **Verify blob chunks on read.** `blob::read_chunk` checks only a chunk's
+      length, and no read checks `BlobRef.sha256`. A flipped bit or a chunk
+      stored under another chunk's key is returned to clients as blob data.
+      Store a CRC32C per chunk, and verify the SHA-256 at the end of full reads.
+- [ ] **Detect gaps in stream reads.** A sealed chunk replaced by another chunk
+      of the same stream with the same size makes reads skip its records
+      without an error, because `stream::read` does not check that seqs are
+      contiguous.
+- [ ] **Checksum blob meta objects.** `load_staged` checks only the blob id, so
+      a flipped bit in `size` or `sha256` is bound into the LSM tree.
+- [ ] **Bind local cache files to their keys.** The CRC32C of a local tier file
+      does not cover its cache key, so a file stored under another key is read
+      as that key's data, and compaction can persist it.
+- [ ] **Detect a manifest rolled back to an older version.** A node that has no
+      cached version accepts any valid older manifest, commits on top of it,
+      and later collects the newer segments. Only an anchor outside the
+      manifest, such as a version floor in the system database, can detect
+      this.
+- [ ] **Report a permanently corrupt segment.** A segment that fails its CRC
+      makes every compaction and sweep of its database fail, and only debug
+      logs show it. Expose the failure in `/v1/admin/metrics` and in logs at
+      `error` level.
+
+## Ambiguous outcomes
+
+- [ ] **Answer a retried interactive commit with its outcome.** After a commit
+      applies and its response is lost, a retried `POST …/commit` returns a
+      retryable `404 txn_not_found`, which tells a client to restart the
+      transaction and so apply it twice. Keep the commit id of a committed
+      transaction for `commit_retention_ms` and answer retries with the result
+      or with `outcome: "unknown"`.
+- [ ] **Show `outcome: "unknown"` in the console.** The console shows only the
+      error message, so a write that may have been applied looks failed.
+- [ ] **Return the outcome of a repaired database deletion.** A retried
+      `DELETE /v1/dbs/{db}` that finishes an interrupted deletion returns
+      `404 not_found` although the deletion succeeded.
+
 ## Performance
 
 - [ ] **Move event query block decoding and aggregation off Tokio worker

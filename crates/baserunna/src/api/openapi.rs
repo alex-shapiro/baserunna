@@ -1135,10 +1135,10 @@ fn paths() -> Value {
             params: vec![db()],
             desc: Some(
                 "Operations execute in order with read-your-writes, atomically. Serializable by default; conflicts are \
-            retried server-side. With `idempotency_key`, retries are never applied twice (a replay returns \
-            `replayed: true` and null results). Read-only transactions ignore `idempotency_key`. If a commit status \
-            check or failed precondition resolves an `idempotency_key` as not committed, subsequent attempts with \
-            that key fail with `409 aborted`.",
+            retried server-side. With `idempotency_key`, a retry within `commit_retention_ms` (10 minutes) of the \
+            first attempt is applied at most once (a replay returns `replayed: true` and null results). Read-only \
+            transactions ignore `idempotency_key`. If a commit status check or failed precondition resolves an \
+            `idempotency_key` as not committed, subsequent attempts with that key fail with `409 aborted`.",
             ),
             ..op(
                 "Run a one-shot transaction",
@@ -1716,8 +1716,10 @@ pub fn document() -> &'static Value {
                 "version": env!("CARGO_PKG_VERSION"),
                 "description": "Transactional key-value, table, stream, and event-table databases on object storage. Authenticate with \
                     `Authorization: Bearer <session token or API key>` (or the `brs_session` cookie). Errors use the \
-                    Error schema with a stable `code`; `retryable` errors may be retried (use idempotency keys for \
-                    writes). Requests over a rate limit return 429 `rate_limited` with `Retry-After` and are not \
+                    Error schema with a stable `code`; `retryable` errors may be retried. A `503` response with \
+                    `details.outcome: \"unknown\"` or a `500` response indicates that the write may have been \
+                    applied; retry the write with its idempotency key or check `/commits/{id}` before retrying. Requests over a \
+                    rate limit return 429 `rate_limited` with `Retry-After` and are not \
                     applied; writes that would exceed a database's size quota return 507 `quota_exceeded`. Every response \
                     includes an `x-request-id` header containing the client-supplied value (1-64 characters of \
                     `[A-Za-z0-9._:-]`) or a generated ID recorded in server logs.",

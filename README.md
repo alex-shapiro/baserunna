@@ -7,7 +7,7 @@ Baserunna is a web service that hosts databases on object storage. Its goal is t
 
 - Stateless compute nodes that serve thousands of active databases each
 - Idle databases are evicted from compute nodes, minimizing compute overhead
-- Reads and writes use snapshot isolation and serialized transactions
+- Strictly serializable transactions by default, with snapshot isolation as an option
 - KV, table, event stream, and binary blob primitives
 - Event tables for analytics: columnar storage, funnels, retention, and unique counts over time ranges
 - Self service administration

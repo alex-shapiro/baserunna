@@ -6,14 +6,15 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// Bounded cache whose entries expire after `ttl` and are cleared when `max` is exceeded.
+/// Bounded cache whose entries expire after `ttl`. If the cache holds `max` live entries, an
+/// insert evicts the oldest eighth.
 pub struct TtlCache<K, V> {
     ttl: Duration,
     max: usize,
     map: Mutex<DetHashMap<K, (Instant, V)>>,
 }
 
-impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
+impl<K: Hash + Eq + Clone, V: Clone> TtlCache<K, V> {
     pub fn new(ttl: Duration, max: usize) -> TtlCache<K, V> {
         TtlCache { ttl, max, map: Mutex::new(DetHashMap::default()) }
     }
@@ -32,7 +33,15 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
         match v {
             Some(v) => {
                 if m.len() >= self.max {
-                    m.clear();
+                    m.retain(|_, (at, _)| at.elapsed() < self.ttl);
+                }
+                if m.len() >= self.max {
+                    let mut by_age: Vec<(Instant, K)> = m.iter().map(|(key, (at, _))| (*at, key.clone())).collect();
+                    let evict_count = (by_age.len() / 8).max(1);
+                    by_age.select_nth_unstable_by_key(evict_count - 1, |(at, _)| *at);
+                    for (_, key) in &by_age[..evict_count] {
+                        m.remove(key);
+                    }
                 }
                 m.insert(k, (read_at, v));
             }
@@ -87,9 +96,26 @@ mod tests {
                 c.store(k, Some("x"), Instant::now());
             }
             c.store(9, Some("y"), Instant::now());
-            assert_eq!((c.len(), c.get(&9)), (1, Some("y")));
+            assert_eq!((c.len(), c.get(&9)), (3, Some("y")));
             c.store(9, None, Instant::now());
             assert_eq!(c.get(&9), None);
+        });
+    }
+
+    #[test]
+    fn full_cache_evicts_oldest_eighth_on_insert() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
+        rt.block_on(async {
+            let cache: TtlCache<u32, u32> = TtlCache::new(Duration::from_secs(3600), 16);
+            for key in 0..17 {
+                cache.store(key, Some(key), Instant::now());
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(cache.len(), 15, "an insert into a full cache evicts its oldest eighth");
+            for key in 2..17 {
+                assert_eq!(cache.get(&key), Some(key), "a recent entry was evicted");
+            }
+            assert_eq!((cache.get(&0), cache.get(&1)), (None, None));
         });
     }
 }

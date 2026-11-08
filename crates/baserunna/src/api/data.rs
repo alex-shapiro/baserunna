@@ -615,20 +615,20 @@ async fn commit_txn(
     let enc = txn.encoding();
     let mut t = txn.take_for_commit();
     let cid = t.commit_id;
-    // The commit is sent only by `commit_detailed`, so a failure before it, or a transaction
-    // without writes, leaves nothing that a later request could find applied.
-    let not_sent = |e: Error| {
-        node.txns.forget_commit(&id);
+    // Only `commit_detailed` sends the commit to the committer. If an earlier step fails, or if
+    // the transaction has no writes, remove the recorded commit ID.
+    let forget_unsent_commit = |e: Error| {
+        node.txns.forget_started_commit(&id);
         e
     };
-    let mut results = exec_ops(&op_ctx(&node, &ctx, enc), &mut t, &ops).await.map_err(not_sent)?;
+    let mut results = exec_ops(&op_ctx(&node, &ctx, enc), &mut t, &ops).await.map_err(forget_unsent_commit)?;
     if t.is_read_only() {
-        node.txns.forget_commit(&id);
+        node.txns.forget_started_commit(&id);
     } else {
-        ctx.require_write().map_err(not_sent)?;
+        ctx.require_write().map_err(forget_unsent_commit)?;
     }
     if t.needs_revalidation(!t.is_read_only()) {
-        node.txns.forget_commit(&id);
+        node.txns.forget_started_commit(&id);
         let Some(version) = ctx.db.revalidate(t).await? else {
             return Err(Error::Conflict("transaction conflicts with a concurrent commit".into()));
         };
@@ -639,8 +639,8 @@ async fn commit_txn(
     let mut creq = t.into_request();
     creq.deadline = Some(ctx.deadline.instant());
     let c = ctx.db.commit_detailed(creq).await.map_err(|e| {
-        if !e.may_have_applied() {
-            node.txns.forget_commit(&id);
+        if !e.may_have_been_applied() {
+            node.txns.forget_started_commit(&id);
         }
         naming_commit(e, cid)
     })?;

@@ -48,8 +48,8 @@ pub struct OpenTxns {
     limits: TxnLimits,
     open: Mutex<DetHashMap<String, Arc<OpenTxn>>>,
     aborted: TtlCache<String, &'static str>,
-    /// Commit IDs of transactions whose commit has started.
-    committed: TtlCache<String, u64>,
+    /// Maps transaction IDs whose commit has started to their commit IDs.
+    started_commits: TtlCache<String, u64>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -63,7 +63,7 @@ impl OpenTxns {
             limits,
             open: Mutex::new(DetHashMap::default()),
             aborted: TtlCache::new(limits.lifetime, 100_000),
-            committed: TtlCache::new(limits.lifetime, 100_000),
+            started_commits: TtlCache::new(limits.lifetime, 100_000),
         })
     }
 
@@ -175,18 +175,19 @@ impl OpenTxns {
         Ok(open)
     }
 
-    /// Forgets a commit recorded by [`TxnGuard::take_for_commit`] that certainly was not applied.
-    pub fn forget_commit(&self, id: &str) {
-        self.committed.remove(&id.to_string());
+    /// Removes a transaction ID recorded by [`TxnGuard::take_for_commit`] after its commit fails
+    /// without being applied.
+    pub fn forget_started_commit(&self, txn_id: &str) {
+        self.started_commits.remove(&txn_id.to_string());
     }
 
     fn lost(&self, id: &str) -> Error {
         crate::probe::hit(crate::probe::Probe::InteractiveTxnLost);
-        if let Some(cid) = self.committed.get(&id.to_string()) {
+        if let Some(commit_id) = self.started_commits.get(&id.to_string()) {
             return Error::Unavailable {
                 message: format!(
                     "the transaction's commit was already sent and may have been applied; check its status at \
-                     /commits/{cid:016x}"
+                     /commits/{commit_id:016x}"
                 ),
                 retry_after_ms: None,
                 outcome_unknown: true,
@@ -234,7 +235,7 @@ impl OpenTxns {
             })
             .collect();
         self.aborted.prune();
-        self.committed.prune();
+        self.started_commits.prune();
         for (t, reason) in expired {
             self.abort(&t, reason);
         }
@@ -296,11 +297,10 @@ impl TxnGuard<'_> {
         result
     }
 
-    /// Takes the transaction to commit it. Until [`OpenTxns::forget_commit`], a later request on it
-    /// learns that the commit may have been applied, not that it can restart the transaction.
+    /// Takes the transaction for committing and records its commit ID in [`OpenTxns`].
     pub fn take_for_commit(self) -> Txn {
         let commit_id = self.guard.as_ref().expect("open transaction must be present while guard is active").commit_id;
-        self.txns.committed.store(self.open.id.clone(), Some(commit_id), Instant::now());
+        self.txns.started_commits.store(self.open.id.clone(), Some(commit_id), Instant::now());
         self.take()
     }
 
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn a_retried_commit_does_not_ask_to_restart() {
+    fn retried_interactive_commit_returns_unknown_outcome() {
         run_paused(async {
             let w = World::new(1, 1).await;
             let token = w.signup(0, "a@x.io").await;
@@ -427,7 +427,7 @@ mod tests {
             ops(&w, &token, "a", id, json!([{"op": "put", "key": "k", "value": "v"}])).await;
             let commit = format!("/v1/dbs/a/transactions/{id}/commit");
             assert_eq!(w.call(0, "POST", &commit, &token, Bytes::from("{}")).await.status, 200);
-            // The client did not receive the first response, so it sends the commit again.
+            // A duplicate commit request after a lost response receives 503 with an unknown outcome.
             let again = w.call(0, "POST", &commit, &token, Bytes::from("{}")).await.json();
             assert_eq!(again["error"]["code"], "unavailable", "{again}");
             assert_eq!(again["error"]["details"]["outcome"], "unknown", "{again}");
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_commit_still_asks_to_restart() {
+    fn failed_interactive_commit_returns_txn_not_found_on_retry() {
         run_paused(async {
             let w = World::new(1, 1).await;
             let token = w.signup(0, "a@x.io").await;

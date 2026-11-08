@@ -613,7 +613,7 @@ impl Db {
         };
         let key = manifest_key(&self.id);
         let mut levels_missing: Option<String> = None;
-        let mut found_objects: Option<String> = None;
+        let mut existing_object_key: Option<String> = None;
         loop {
             let started = Instant::now();
             let res = self
@@ -644,18 +644,18 @@ impl Db {
                     return Ok((self.install(v, started), started));
                 }
                 Err(StoreError::NotFound) if create => {
-                    // A database's first manifest precedes all of its other objects, so a missing
-                    // manifest next to them was lost, and an empty one would let collection delete them.
-                    // Another node may have created the manifest since the read, so a second read decides.
+                    // A database writes its initial manifest before writing any other object. If
+                    // objects exist under the prefix and a second manifest read still returns
+                    // NotFound, the manifest was lost.
                     let prefix = super::db_prefix(&self.id);
                     let page = self.shared.retry.run(|| self.shared.store.list(&prefix, None, 1)).await?;
-                    if let Some(o) = page.objects.first() {
-                        if found_objects.replace(o.key.clone()).is_none() {
+                    if let Some(obj) = page.objects.first() {
+                        if existing_object_key.replace(obj.key.clone()).is_none() {
                             continue;
                         }
                         return Err(Error::internal(format!(
                             "the manifest of database {} is missing, but its object {} exists",
-                            self.id, o.key
+                            self.id, obj.key
                         )));
                     }
                     let m = Manifest::new(&self.id, self.shared.time_ms(), self.shared.store_now_ms());
@@ -1137,9 +1137,8 @@ impl Db {
         let cfg = self.shared.cfg.clone();
         let mut maybe_applied = false;
         let mut unknown_writes: Vec<(u64, Instant, String)> = Vec::new();
-        // Commit IDs that an ambiguous write of this batch included. While such a write is unfenced,
-        // these commits may still be applied, and a record of one of them is this batch's own commit.
-        let mut sent: BTreeSet<u64> = BTreeSet::new();
+        // Commit IDs included in an unfenced ambiguous manifest PUT from this batch.
+        let mut ambiguous_commit_ids: BTreeSet<u64> = BTreeSet::new();
         let mut attempt = 0u32;
         let mut base = match self.base_for_commit().await {
             Ok(v) => v,
@@ -1160,13 +1159,13 @@ impl Db {
                 let e = Error::NotOwner { holder, retry_after_ms: left.as_millis() as u64 };
                 probe::hit(if maybe_applied { Probe::CommitUnknownAfterLeaseMoved } else { Probe::CommitNotOwner });
                 let e = if maybe_applied { unknown(e) } else { e };
-                self.fail_batch(&base, batch, e, &sent).await;
+                self.fail_batch(&base, batch, e, &ambiguous_commit_ids).await;
                 return;
             }
             if self.shared.stopping() && !base.m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id) {
                 let e = Error::unavailable("this node is shutting down");
                 let e = if maybe_applied { unknown(e) } else { e };
-                self.fail_batch(&base, batch, e, &sent).await;
+                self.fail_batch(&base, batch, e, &ambiguous_commit_ids).await;
                 return;
             }
             let build_started = Instant::now();
@@ -1176,7 +1175,7 @@ impl Db {
                 Ok(p) => p,
                 Err(e) => {
                     let e = if maybe_applied { unknown(e) } else { e };
-                    self.fail_batch(&base, batch, e, &sent).await;
+                    self.fail_batch(&base, batch, e, &ambiguous_commit_ids).await;
                     return;
                 }
             };
@@ -1189,14 +1188,18 @@ impl Db {
                 self.schedule_trims(plan.due);
                 self.clear_lease_flag(&batch);
                 for (w, o) in batch.into_iter().zip(plan.outcomes) {
-                    // An unfenced ambiguous write may still apply the commits it included, so a rejection
-                    // of one of them now (for example, because its deadline, staged blob, or read has
-                    // since expired) does not show that it was not applied.
-                    let o = per_commit(&w, o, |id, r| match r {
-                        Err(e) if maybe_applied && sent.contains(&id) && !matches!(e, Error::Aborted(_)) => {
+                    // If a commit was sent in an unfenced ambiguous write and fails on a rebuild
+                    // (for example, after its deadline, staged blob, or read expires), report its
+                    // outcome as unknown.
+                    let o = map_work_commits(&w, o, |id, r| match r {
+                        Err(e)
+                            if maybe_applied
+                                && ambiguous_commit_ids.contains(&id)
+                                && !matches!(e, Error::Aborted(_)) =>
+                        {
                             Err(unknown(e))
                         }
-                        r => own_commit(id, r, &sent),
+                        r => clear_replay_if_sent_in_batch(id, r, &ambiguous_commit_ids),
                     });
                     let o = mark_superseded_flush_unknown(&w, o, maybe_applied);
                     w.deliver(o);
@@ -1240,7 +1243,9 @@ impl Db {
                     });
                     self.clear_lease_flag(&batch);
                     for (w, o) in batch.into_iter().zip(plan.outcomes) {
-                        let o = per_commit(&w, o, |id, r| own_commit(id, r, &sent));
+                        let o = map_work_commits(&w, o, |id, r| {
+                            clear_replay_if_sent_in_batch(id, r, &ambiguous_commit_ids)
+                        });
                         let o = mark_superseded_flush_unknown(&w, o, maybe_applied);
                         w.deliver(o);
                     }
@@ -1259,7 +1264,7 @@ impl Db {
                     maybe_applied = true;
                     unknown_writes.push((m.write_seq, attempt_started, base.etag.clone()));
                     for (w, o) in batch.iter().zip(&plan.outcomes) {
-                        sent.extend(included(w, o));
+                        ambiguous_commit_ids.extend(newly_committed_ids(w, o));
                     }
                     self.st().distrust();
                     // If the write was applied, `plan.gc` was removed from `obsolete` in the manifest.
@@ -1270,7 +1275,7 @@ impl Db {
                 Err(e) => {
                     let e: Error = e.into();
                     let e = if maybe_applied { unknown(e) } else { e };
-                    self.fail_batch(&base, batch, e, &sent).await;
+                    self.fail_batch(&base, batch, e, &ambiguous_commit_ids).await;
                     return;
                 }
             }
@@ -1281,7 +1286,7 @@ impl Db {
                     retry_after_ms: Some(100),
                     outcome_unknown: maybe_applied,
                 };
-                self.fail_batch(&base, batch, e, &sent).await;
+                self.fail_batch(&base, batch, e, &ambiguous_commit_ids).await;
                 return;
             }
             let delay = 5 * (1u64 << attempt.min(6)) + self.shared.env.random_below(10);
@@ -1311,7 +1316,7 @@ impl Db {
                         attempt += 1;
                         if attempt >= cfg.commit_retry_max {
                             let e = if maybe_applied { unknown(e) } else { e };
-                            self.fail_batch(&base, batch, e, &sent).await;
+                            self.fail_batch(&base, batch, e, &ambiguous_commit_ids).await;
                             return;
                         }
                         tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -1323,14 +1328,22 @@ impl Db {
 
     /// Delivers committed or aborted outcomes already recorded in `base`, and fails the remaining
     /// work with `e`.
-    async fn fail_batch(self: &Arc<Self>, base: &Version, batch: Vec<Work>, e: Error, sent: &BTreeSet<u64>) {
+    async fn fail_batch(
+        self: &Arc<Self>,
+        base: &Version,
+        batch: Vec<Work>,
+        e: Error,
+        ambiguous_commit_ids: &BTreeSet<u64>,
+    ) {
         let mut rest = Vec::with_capacity(batch.len());
         for w in batch {
             if let Work::Bind { bind, .. } = &w {
                 let mut out = Vec::with_capacity(bind.slots.len());
                 for s in &bind.slots {
                     out.push(match commit_state(base, None, s.commit_id).await.ok().flatten() {
-                        Some(CommitState::Applied(c)) => own_commit(s.commit_id, Ok(c), sent),
+                        Some(CommitState::Applied(c)) => {
+                            clear_replay_if_sent_in_batch(s.commit_id, Ok(c), ambiguous_commit_ids)
+                        }
                         Some(CommitState::Aborted) => Err(aborted(s.commit_id)),
                         None => Err(e.clone()),
                     });
@@ -1347,7 +1360,7 @@ impl Db {
                 (Some(CommitState::Applied(c)), Work::Commit { req, .. }) => {
                     probe::hit(Probe::DecidedCommitAnswered);
                     self.schedule_trims(req.writes.streams.iter().map(StreamOp::id).collect());
-                    let r = own_commit(req.commit_id, Ok(c), sent);
+                    let r = clear_replay_if_sent_in_batch(req.commit_id, Ok(c), ambiguous_commit_ids);
                     w.deliver(Outcome::Seq(r));
                 }
                 (Some(CommitState::Aborted), Work::Commit { req, .. }) => {
@@ -2600,9 +2613,9 @@ async fn flush_tail(shared: &Shared, db: &str, tail: &[Entry], version: Seq) -> 
     Ok(FlushOutput { segments, retained_tail: None, chunk_ids, sealed_bytes })
 }
 
-/// Returns the commit IDs that `o` accepted into the manifest planned for `w`.
-fn included(w: &Work, o: &Outcome) -> Vec<u64> {
-    match (w, o) {
+/// Returns the non-replayed commit IDs that `outcome` accepted for `work`.
+fn newly_committed_ids(work: &Work, outcome: &Outcome) -> Vec<u64> {
+    match (work, outcome) {
         (Work::Commit { req, .. }, Outcome::Seq(Ok(c))) if !c.replayed => vec![req.commit_id],
         (Work::Bind { bind, .. }, Outcome::Binds(rs)) => bind
             .slots
@@ -2615,9 +2628,9 @@ fn included(w: &Work, o: &Outcome) -> Vec<u64> {
     }
 }
 
-/// Applies `f` to the result of each commit in `o`, with that commit's ID.
-fn per_commit(w: &Work, o: Outcome, f: impl Fn(u64, Result<Committed>) -> Result<Committed>) -> Outcome {
-    match (w, o) {
+/// Applies `f` to each commit result in `outcome` with its commit ID.
+fn map_work_commits(work: &Work, outcome: Outcome, f: impl Fn(u64, Result<Committed>) -> Result<Committed>) -> Outcome {
+    match (work, outcome) {
         (Work::Commit { req, .. }, Outcome::Seq(r)) => Outcome::Seq(f(req.commit_id, r)),
         (Work::Bind { bind, .. }, Outcome::Binds(rs)) => {
             Outcome::Binds(bind.slots.iter().zip(rs).map(|(s, r)| f(s.commit_id, r)).collect())
@@ -2626,10 +2639,14 @@ fn per_commit(w: &Work, o: Outcome, f: impl Fn(u64, Result<Committed>) -> Result
     }
 }
 
-/// Marks a recorded commit as this batch's own, not a replay, if an ambiguous write of the batch sent it.
-fn own_commit(id: u64, r: Result<Committed>, sent: &BTreeSet<u64>) -> Result<Committed> {
-    match r {
-        Ok(c) if c.replayed && sent.contains(&id) => Ok(Committed { replayed: false, ..c }),
+/// Clears `replayed` if `commit_id` was sent in an earlier ambiguous write of this batch.
+fn clear_replay_if_sent_in_batch(
+    commit_id: u64,
+    result: Result<Committed>,
+    ambiguous_commit_ids: &BTreeSet<u64>,
+) -> Result<Committed> {
+    match result {
+        Ok(c) if c.replayed && ambiguous_commit_ids.contains(&commit_id) => Ok(Committed { replayed: false, ..c }),
         r => r,
     }
 }

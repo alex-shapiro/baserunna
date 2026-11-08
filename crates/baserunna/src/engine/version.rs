@@ -256,11 +256,11 @@ impl Shared {
         db: &str,
         seg: &str,
         data: &Bytes,
-        listed: Option<&SegmentMeta>,
+        expected_meta: Option<&SegmentMeta>,
     ) -> Result<(Arc<SegmentIndex>, Vec<Block>)> {
         let idx = Arc::new(SegmentIndex::decode_whole(data)?);
-        if let Some(m) = listed {
-            check_listed(&idx, m)?;
+        if let Some(m) = expected_meta {
+            verify_segment_matches_manifest(&idx, m)?;
         }
         let blocks = segment::decode_blocks(&idx, 0, data)?;
         for (bi, b) in blocks.iter().enumerate() {
@@ -357,7 +357,7 @@ impl Shared {
             let index = &meta
                 [(footer.index_off - start) as usize..(footer.index_off - start) as usize + footer.index_len as usize];
             let idx = SegmentIndex::decode(footer, index, bloom, size)?;
-            check_listed(&idx, seg)?;
+            verify_segment_matches_manifest(&idx, seg)?;
             Ok(idx)
         };
         if let Some(meta) = self.local_get(db, &seg.id, "meta").await
@@ -384,7 +384,7 @@ impl Shared {
     async fn read_whole_segment(&self, db: &str, seg: &SegmentMeta) -> Result<(Arc<SegmentIndex>, Vec<Block>)> {
         let decode = |d: &Bytes| -> Result<(Arc<SegmentIndex>, Vec<Block>)> {
             let idx = Arc::new(SegmentIndex::decode_whole(d)?);
-            check_listed(&idx, seg)?;
+            verify_segment_matches_manifest(&idx, seg)?;
             let blocks = segment::decode_blocks(&idx, 0, d)?;
             Ok((idx, blocks))
         };
@@ -466,7 +466,7 @@ impl Shared {
                 return self.cache_whole(db, &seg.id, &data, Some(seg)).ok()?.1.into_iter().nth(bi);
             }
             let idx = SegmentIndex::decode_whole(&data).ok()?;
-            check_listed(&idx, seg).ok()?;
+            verify_segment_matches_manifest(&idx, seg).ok()?;
             let (_, off, len) = *idx.blocks.get(bi)?;
             return segment::decode_block(data.slice(off as usize..(off + len as u64) as usize)).ok();
         }
@@ -1215,13 +1215,12 @@ pub struct ChangePage {
     pub next: ChangeCursor,
 }
 
-/// Returns an error unless `idx` has the size and entry count that the manifest lists for `seg`,
-/// so that another segment's bytes stored under its key are not read as its contents.
-fn check_listed(idx: &SegmentIndex, seg: &SegmentMeta) -> Result<()> {
-    if idx.size != seg.size || idx.footer.entries != seg.entries {
+/// Verifies that `index` matches the byte size and entry count in `meta`.
+fn verify_segment_matches_manifest(index: &SegmentIndex, meta: &SegmentMeta) -> Result<()> {
+    if index.size != meta.size || index.footer.entries != meta.entries {
         return Err(Error::internal(format!(
             "segment {} holds {} entries in {} bytes, but its manifest lists {} entries in {} bytes",
-            seg.id, idx.footer.entries, idx.size, seg.entries, seg.size
+            meta.id, index.footer.entries, index.size, meta.entries, meta.size
         )));
     }
     Ok(())

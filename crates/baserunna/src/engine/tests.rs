@@ -746,7 +746,7 @@ fn opening_without_create_never_creates() {
 }
 
 #[test]
-fn a_lost_manifest_is_not_recreated_over_existing_data() {
+fn open_rejects_missing_manifest_if_database_objects_exist() {
     rt().block_on(async {
         let cfg = EngineConfig::small_for_tests();
         let (eng, store, env) = engine(1, cfg.clone());
@@ -757,10 +757,10 @@ fn a_lost_manifest_is_not_recreated_over_existing_data() {
         tokio::time::sleep(Duration::from_millis(2_000)).await;
         db.maintenance_now().await.unwrap();
         let segments: Vec<String> = db.current().unwrap().m.segments.iter().map(|s| seg_key("d", &s.id)).collect();
-        assert!(!segments.is_empty(), "the tail was not flushed");
+        assert!(!segments.is_empty(), "expected the tail to flush to a segment");
         store.delete_sync(&manifest_key("d"));
         let other = Engine::new(store.clone(), env.clone(), cfg.clone(), "node-b".into());
-        let err = other.db("d").open(true).await.map(|_| ()).expect_err("an empty manifest replaced the lost one");
+        let err = other.db("d").open(true).await.map(|_| ()).expect_err("an empty manifest replaced the lost manifest");
         assert!(err.to_string().contains("manifest of database d is missing"), "{err}");
         assert!(store.get_sync(&manifest_key("d"), &GetOpts::default()).is_err(), "a manifest was created");
         for s in &segments {
@@ -770,7 +770,7 @@ fn a_lost_manifest_is_not_recreated_over_existing_data() {
 }
 
 #[test]
-fn a_segment_stored_under_another_segments_key_is_rejected() {
+fn scan_rejects_segment_that_mismatches_manifest_metadata() {
     rt().block_on(async {
         let cfg = EngineConfig { segment_whole_fetch_max: 1 << 20, ..EngineConfig::small_for_tests() };
         let (eng, store, env) = engine(2, cfg.clone());
@@ -783,8 +783,8 @@ fn a_segment_stored_under_another_segments_key_is_rejected() {
             db.maintenance_now().await.unwrap();
         }
         let m = db.current().unwrap().m.clone();
-        let only = |p: u8| m.segments.iter().find(|s| s.min_key[0] == p && s.max_key[0] == p).unwrap();
-        let (a, b) = (only(b'a'), only(b'b'));
+        let segment_with_prefix = |p: u8| m.segments.iter().find(|s| s.min_key[0] == p && s.max_key[0] == p).unwrap();
+        let (a, b) = (segment_with_prefix(b'a'), segment_with_prefix(b'b'));
         let a_bytes = store.get_sync(&seg_key("d", &a.id), &GetOpts::default()).unwrap().data;
         store.put_sync(&seg_key("d", &b.id), a_bytes, &PutMode::Overwrite).unwrap();
         let other = Engine::new(store.clone(), env.clone(), cfg.clone(), "node-b".into());
@@ -792,30 +792,31 @@ fn a_segment_stored_under_another_segments_key_is_rejected() {
         replica.open(false).await.unwrap();
         let snap = replica.snapshot(Consistency::Strong).await.unwrap();
         let scan = snap.scan(&KeyRange::data(), false, usize::MAX).await;
-        let err = scan.map(|e| e.len()).expect_err("the substituted segment was read as the listed one");
+        let err = scan.map(|e| e.len()).expect_err("the substituted segment was accepted");
         assert!(err.to_string().contains("but its manifest lists"), "{err}");
     });
 }
 
-/// Store whose next `late_manifest_puts` manifest writes time out for the caller and land later.
-struct LateStore {
+/// Object store wrapper where the next `delayed_manifest_puts` manifest writes time out and apply
+/// after `apply_delay_ms`.
+struct DelayedManifestPutStore {
     mem: Arc<MemStore>,
-    late_manifest_puts: AtomicU32,
+    delayed_manifest_puts: AtomicU32,
     timeout_ms: u64,
-    land_after_ms: u64,
+    apply_delay_ms: u64,
 }
 
-impl ObjectStore for LateStore {
+impl ObjectStore for DelayedManifestPutStore {
     fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
         self.mem.get(key, opts)
     }
 
     fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
         Box::pin(async move {
-            if key.ends_with("/manifest") && take_fault(&self.late_manifest_puts) {
-                let (mem, key, land_after_ms) = (self.mem.clone(), key.to_string(), self.land_after_ms);
+            if key.ends_with("/manifest") && take_fault(&self.delayed_manifest_puts) {
+                let (mem, key, apply_delay_ms) = (self.mem.clone(), key.to_string(), self.apply_delay_ms);
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(land_after_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(apply_delay_ms)).await;
                     let _ = mem.put_sync(&key, data, &mode);
                 });
                 tokio::time::sleep(Duration::from_millis(self.timeout_ms)).await;
@@ -839,12 +840,17 @@ impl ObjectStore for LateStore {
 }
 
 #[test]
-fn a_rejection_after_an_ambiguous_write_is_not_definite() {
+fn rejection_after_ambiguous_manifest_put_returns_unknown_outcome() {
     rt().block_on(async {
         let env = Arc::new(Env::sim(9, 1_700_000_000_000, Instant::now(), 0));
         let clock = env.clone();
         let mem = Arc::new(MemStore::new(Box::new(move || clock.now_ms())));
-        let store = Arc::new(LateStore { mem, late_manifest_puts: 0.into(), timeout_ms: 3_000, land_after_ms: 3_500 });
+        let store = Arc::new(DelayedManifestPutStore {
+            mem,
+            delayed_manifest_puts: 0.into(),
+            timeout_ms: 3_000,
+            apply_delay_ms: 3_500,
+        });
         let cfg = EngineConfig { manifest_put_hedge_ms: 0, ..EngineConfig::small_for_tests() };
         let ttl = cfg.blob_stage_ttl_ms;
         let eng = Engine::new(store.clone(), env, cfg, "a".into());
@@ -854,21 +860,26 @@ fn a_rejection_after_an_ambiguous_write_is_not_definite() {
         tokio::time::sleep(Duration::from_millis(ttl - 1_000)).await;
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         t.put(Bytes::from_static(b"k"), Value::Blob(blob)).unwrap();
-        store.late_manifest_puts.store(1, SeqCst);
+        store.delayed_manifest_puts.store(1, SeqCst);
         let r = db.commit(t.into_request()).await;
         tokio::time::sleep(Duration::from_secs(5)).await;
-        assert!(strong_get(&db, "k").await.is_some(), "the late write did not land");
+        assert!(strong_get(&db, "k").await.is_some(), "expected the delayed manifest write to be applied");
         assert!(matches!(r, Err(Error::Unavailable { outcome_unknown: true, .. })), "applied, but answered {r:?}");
     });
 }
 
 #[test]
-fn a_rejection_that_no_ambiguous_write_included_stays_definite() {
+fn conflict_excluded_from_ambiguous_manifest_put_remains_definite() {
     rt().block_on(async {
         let env = Arc::new(Env::sim(10, 1_700_000_000_000, Instant::now(), 0));
         let clock = env.clone();
         let mem = Arc::new(MemStore::new(Box::new(move || clock.now_ms())));
-        let store = Arc::new(LateStore { mem, late_manifest_puts: 0.into(), timeout_ms: 3_000, land_after_ms: 100 });
+        let store = Arc::new(DelayedManifestPutStore {
+            mem,
+            delayed_manifest_puts: 0.into(),
+            timeout_ms: 3_000,
+            apply_delay_ms: 100,
+        });
         let cfg = EngineConfig { manifest_put_hedge_ms: 0, ..EngineConfig::small_for_tests() };
         let eng = Engine::new(store.clone(), env, cfg, "a".into());
         let db = opened(&eng, "d").await;
@@ -877,17 +888,17 @@ fn a_rejection_that_no_ambiguous_write_included_stays_definite() {
         let mut c = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         assert!(c.get(b"k").await.unwrap().is_none());
         c.put(Bytes::from_static(b"j"), inline("c")).unwrap();
-        store.late_manifest_puts.store(1, SeqCst);
-        // Both commits join one batch, in which `c` conflicts with `a` and is never written.
+        store.delayed_manifest_puts.store(1, SeqCst);
+        // Both commits join the same batch; `c` conflicts with `a` and is excluded from the manifest write.
         let (ra, rc) = tokio::join!(db.commit_detailed(a.into_request()), db.commit_detailed(c.into_request()));
         let ra = ra.unwrap();
         assert!(!ra.replayed, "the batch's own commit was reported as a replay");
-        assert!(matches!(rc, Err(Error::Conflict(_))), "a commit that no write included was answered {rc:?}");
+        assert!(matches!(rc, Err(Error::Conflict(_))), "expected a definite conflict, got {rc:?}");
     });
 }
 
 #[test]
-fn a_commit_whose_lost_reply_landed_is_not_a_replay() {
+fn commit_applied_by_ambiguous_manifest_put_is_not_marked_replayed() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
@@ -895,7 +906,7 @@ fn a_commit_whose_lost_reply_landed_is_not_a_replay() {
         t.put(Bytes::from_static(b"k"), inline("v")).unwrap();
         store.manifest_put_lost.store(1, SeqCst);
         let c = db.commit_detailed(t.into_request()).await.unwrap();
-        assert!(!c.replayed, "the request's own commit was reported as a replay of an earlier one");
+        assert!(!c.replayed, "the request's own commit was reported as a replay");
         assert_eq!(strong_get(&db, "k").await, Some(inline("v")));
     });
 }

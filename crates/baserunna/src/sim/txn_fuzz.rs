@@ -2376,7 +2376,7 @@ struct OpenTxn {
     iso: Iso,
     enc: Encoding,
     alive: bool,
-    /// The transaction committed, so a later request on it learns that its commit may have been applied.
+    /// True if the transaction committed, so subsequent requests return `503` with `outcome: "unknown"`.
     committed: bool,
 }
 
@@ -2423,15 +2423,14 @@ impl<'a> Session<'a> {
         self.send(method, path, headers, body, false).await
     }
 
-    /// Sends a request, failing on a server error unless `unknown_ok` allows a `503` that reports an
-    /// unknown outcome.
+    /// Sends a request and fails on a `5xx` status unless `allow_unknown_outcome` permits `503`.
     async fn send(
         &self,
         method: &str,
         path: &str,
         headers: &[(&str, &str)],
         body: Vec<u8>,
-        unknown_ok: bool,
+        allow_unknown_outcome: bool,
     ) -> Result<Reply, String> {
         let mut b = http::Request::builder()
             .method(method)
@@ -2450,7 +2449,7 @@ impl<'a> Session<'a> {
             .await
             .map_err(|e| format!("{}\nno response ({e:?}): did the handler panic?", ctx()))?;
         let text = String::from_utf8_lossy(&resp.body).into_owned();
-        if resp.status >= 500 && !(unknown_ok && resp.status == 503) {
+        if resp.status >= 500 && !(allow_unknown_outcome && resp.status == 503) {
             return Err(format!("{}\nserver error {}: {}", ctx(), resp.status, trunc(&text)));
         }
         openapi_check::check_response(method, path, &resp)
@@ -2743,7 +2742,7 @@ impl<'a> Session<'a> {
         };
         let Some(ti) = ti.filter(|i| self.txns[*i].alive) else {
             let committed = ti.is_some_and(|i| self.txns[i].committed);
-            self.call_txn_not_found("POST", &path, bytes, committed).await?;
+            self.call_closed_txn("POST", &path, bytes, committed).await?;
             return Ok(());
         };
         let mut t = self.txns[ti].view.clone();
@@ -2772,9 +2771,9 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    /// Calls a route on a transaction that is no longer open: a committed one answers with an unknown
-    /// outcome (SPEC §6.2), and any other one with `txn_not_found`.
-    async fn call_txn_not_found(&self, method: &str, path: &str, body: Vec<u8>, committed: bool) -> Result<(), String> {
+    /// Calls a route on a closed transaction and verifies that a committed transaction returns `503`
+    /// with `outcome: "unknown"` (SPEC §6.2) and an uncommitted transaction returns `404 txn_not_found`.
+    async fn call_closed_txn(&self, method: &str, path: &str, body: Vec<u8>, committed: bool) -> Result<(), String> {
         let r = self.send(method, path, &[("content-type", "application/json")], body, committed).await?;
         if committed {
             if r.status != 503 || r.json["error"]["details"]["outcome"] != "unknown" {
@@ -2813,7 +2812,7 @@ impl<'a> Session<'a> {
             return Ok(());
         };
         if !self.txns[ti].alive {
-            return self.call_txn_not_found("POST", &path, bytes, self.txns[ti].committed).await;
+            return self.call_closed_txn("POST", &path, bytes, self.txns[ti].committed).await;
         }
         self.txns[ti].alive = false;
         let mut t = self.txns[ti].view.clone();
@@ -2885,7 +2884,7 @@ impl<'a> Session<'a> {
         let Some(ti) = self.pick_txn() else { return Ok(()) };
         let path = self.path(&format!("/transactions/{}", self.txns[ti].id));
         if !self.txns[ti].alive {
-            return self.call_txn_not_found("DELETE", &path, Vec::new(), self.txns[ti].committed).await;
+            return self.call_closed_txn("DELETE", &path, Vec::new(), self.txns[ti].committed).await;
         }
         self.txns[ti].alive = false;
         self.expect("DELETE", &path, Vec::new(), &Expect::Ok(200, json!({}))).await?;

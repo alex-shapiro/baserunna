@@ -6,8 +6,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// Bounded cache whose entries expire after `ttl`. Once it holds `max` live entries, an insert evicts
-/// the oldest eighth of them.
+/// Bounded cache whose entries expire after `ttl`. When the cache holds `max` live entries, an
+/// insert evicts the oldest eighth.
 pub struct TtlCache<K, V> {
     ttl: Duration,
     max: usize,
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_cache_evicts_its_oldest_entries() {
+    fn full_cache_evicts_oldest_eighth_on_insert() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
         rt.block_on(async {
             let c: TtlCache<u32, u32> = TtlCache::new(Duration::from_secs(3600), 16);

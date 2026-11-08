@@ -12,7 +12,7 @@ scope for v1.
 1. **Safety**
 
 - Commited data is never lost or reordered.
-- Transactions are strictly serializable by default. Snapshot isolation (§6.1) and `snapshot` consistency reads (§5.9) are weaker options that a client must request.
+- Transactions are strictly serializable by default. A client can request snapshot isolation (§6.1) or `snapshot` consistency reads (§5.9) for weaker guarantees.
 - Committed data correctness relies on object storage guarantees.
 
 2. **Low cost**
@@ -312,14 +312,13 @@ and a stream record may be committed alongside a row update.
   shortly after an append or during a sweep (§5.11). A stream may so hold
   up to a sixteenth more than its limits, and briefly more.
 - **Consumers** are named cursors stored with a stream, at most at its next
-  seq. A consumer that reads its cursor and advances it in the transaction
-  that writes what it made of the records processes each record at most
-  once, and exactly once while retention keeps the records. Retention does
-  not wait for consumers: a read from a cursor before the stream's first seq
-  starts at the first seq without an error, so a consumer can find a gap
-  by comparing the first record's seq with its cursor. Stream
-  info reports the lag of its first 100 consumers; the consumers route pages
-  through all of them.
+  seq. To process each retained record once, a consumer reads its cursor,
+  writes its output, and advances the cursor in one transaction. Retention
+  trims old records regardless of consumer cursors. If a cursor precedes the
+  stream's first seq, a stream read starts at the first seq. A consumer can
+  detect trimmed records by comparing the first returned seq with its cursor.
+  Stream info reports the lag of the first 100 consumers, and the consumers
+  route paginates all of them.
 
 ### 4.7 Filters
 
@@ -696,7 +695,7 @@ Deleting a database marks its record as deleted in the system database. After a 
 
 There are two read consistency modes:
 
-- `snapshot` consistency reads from a serializable snapshot that is at most `max_staleness_ms` old (5 s by default). Each node keeps its own cached snapshot, so successive snapshot reads through different nodes can go back in time.
+- `snapshot` consistency serves reads from a cached serializable snapshot that is at most `max_staleness_ms` old (5 s by default). Each node caches its own snapshot, so a client that reads from different nodes can observe an older snapshot after a newer snapshot.
 - `strong` consistency guarantees linearizability. It is served from cache if the serving node holds a valid lease and has no manifest write in flight; otherwise it requests `GET manifest If-None-Match: etag` first.
 
 ### 5.10 Size Quotas
@@ -808,9 +807,9 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
 
 ### 6.1 Semantics
 
-- Default isolation is serializable. With `strong` consistency, the default, it is strictly serializable: a transaction
-  observes every transaction that committed before it began. An interactive transaction has this guarantee for its reads
-  only if it commits.
+- The default isolation level is serializable, and the default read consistency is `strong`. Together, they provide
+  strict serializability: a committed transaction includes the effects of every transaction that committed before it
+  began. Reads in an uncommitted interactive transaction are not validated until the transaction commits.
   It uses optimistic concurrency control with backward validation:
   - the read set holds point keys (including misses) and scanned intervals.
     A scan that stopped at `limit` records only the interval it actually
@@ -832,10 +831,11 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
   it was derived from, so a concurrent schema change (a new index, a
   dropped column or table) makes it fail with a retryable `409 conflict`
   rather than miss index maintenance.
-- A one-shot read-only transaction always succeeds. An interactive read-only transaction must commit to validate its
-  reads, and the commit fails with a retryable `409 conflict` if a concurrent commit changed them (§5.5).
-- Under serializable isolation, a transaction that only writes KV keys or appends to streams never conflicts. Under
-  snapshot isolation, two transactions that write the same key conflict, and the first to commit wins.
+- A one-shot read-only transaction is serialized at `read_version` and cannot conflict. An interactive read-only
+  transaction validates its read set at commit time and fails with a retryable `409 conflict` if a concurrent commit
+  modified any key it read (§5.5).
+- Serializable transactions that only write KV keys or append to streams do not conflict. Under snapshot isolation,
+  concurrent writes to the same key conflict, and the first transaction to commit succeeds.
 - Reads within a transaction see its own earlier writes, except stream appends and
   event inserts: because event positions are assigned at commit time, a
   transaction that inserts into an event table cannot query or delete from that
@@ -873,12 +873,13 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
    database's owner node. If the owner changes or crashes, or if the node
    aborts the transaction for timeout or memory pressure (§5.12), uncommitted
    writes are discarded and subsequent requests return a retryable
-   `404 txn_not_found` with the abort reason. After a node starts a
-   transaction's commit, a later request on the transaction returns `503` with
-   `outcome: "unknown"` and the commit ID, unless the commit certainly failed:
-   a client that did not receive the commit response must check the commit
-   status, not restart the transaction. Only the node that ran the commit
-   remembers it, for `txn_max_lifetime`. `begin` returns the transaction's
+   `404 txn_not_found` with the abort reason. Once a node starts to commit a
+   transaction, the node caches the transaction's commit ID for
+   `txn_max_lifetime` unless the commit fails before applying. If that node
+   receives another request for the transaction, it returns `503` with
+   `outcome: "unknown"` and the commit ID. A client that loses the commit
+   response must check `/commits/{id}` instead of restarting the transaction.
+   `begin` returns the transaction's
    `commit_id` up front, and `commit` returns the sequence numbers assigned to
    its appends.
 
@@ -1074,14 +1075,14 @@ creating a DB is a single system-DB transaction that reads the owner's
 counter and, for an organization, the creator's membership; the unique
 `(owner_id, name)` index rejects duplicate names.
 
-A database's first manifest is written before any of its other objects. So
-if a node finds no manifest but finds other objects under the database's
-prefix, the manifest was lost. The node then fails the request with
-`500 internal` and writes nothing, because an empty manifest would let
-garbage collection delete the old objects. This applies to the system
-database too, so a node whose system database lost its manifest does not
-start. An operator must restore the manifest from a backup or a bucket
-version.
+A node writes a database's initial manifest before writing any other object
+for that database. Before creating an initial manifest, the node lists the
+database prefix. If objects already exist under the prefix and a second
+manifest read still returns `NotFound`, the manifest was lost. The node
+returns `500 internal` without creating an empty manifest, which prevents
+garbage collection from deleting the existing objects. If the system database
+loses its manifest, nodes abort startup for the same reason. An operator must
+restore a lost manifest from a backup or an object version.
 
 Metadata commands that act for a user (creating databases and
 organizations, changing members, disabling users, creating sessions and
@@ -1483,7 +1484,7 @@ Each simulation parameter is drawn independently from a hash of the run seed and
 Workloads run concurrently with a shared chaos loop (`ChaosPhase`). When all active workloads finish their chaos phase, fault injection stops, the cluster heals, and each workload runs its final consistency and invariant checks. The `mix` scenario runs a random subset of at least two workloads concurrently in the same cluster. Any run that exceeds 6 hours of virtual time fails as a liveness violation.
 
 - `history`: Concurrent clients execute random multi-key transactions (single-request and interactive, serializable and snapshot-isolated, strong and snapshot reads, with and without idempotency keys). Each write records a unique marker key. At the end of the run, committed transactions are ordered by version and replayed to verify strict serializability, snapshot isolation, and read-your-writes.
-- `elle`: Concurrent one-shot and interactive transactions append unique integers to lists, stored as KV values (read-modify-write) and as streams, and read whole lists. The checker infers the order from observations alone, without the server's versions: every read is a prefix of the key's final value, every acknowledged append is present exactly once, no failed append is present, every read after a transaction's own appends to a key ends with them, no read sees less than a transaction that completed before it began, and the write-write, write-read, read-write, and real-time dependencies have no cycle. With `SIM_ELLE_DIR` set, the run also writes its history in EDN for Elle (Jepsen's checker).
+- `elle`: Concurrent one-shot and interactive transactions read lists of unique integers and append to them. Even keys store lists as KV values updated by read-modify-write transactions, and odd keys store lists as streams. The checker infers the transaction order from client observations alone, without using server version numbers. It verifies that reads are prefixes of the final lists, committed appends appear once, aborted appends are absent, transactions read their own KV appends, real-time order is preserved, and the transaction dependency graph is acyclic. If `SIM_ELLE_DIR` is set, the workload also writes the history in EDN format for Jepsen's Elle checker.
 - `kv_model`: Exercises all KV endpoints under faults and compares every response against a reference model. Ambiguous commits are resolved via `/commits/{id}` or database state inspection. Verifies range tombstones, size quota enforcement, and KV change feed reconstruction.
 - `bank`: Concurrent account transfers across nodes. Verifies conservation of total balance and non-negative balances throughout the run and at completion.
 - `register`: Concurrent writers and strong readers on a small key set, verified for real-time linearizability across `GET`, unforwarded `GET`, and read-only and read-write transactions.
@@ -1529,7 +1530,7 @@ Every 20 ms of virtual time, global oracles verify that at most 1 node relies on
 - **Mutation testing** (`scripts/mutants.sh`): runs `cargo-mutants` against the storage engine, table layer, transaction operations, and simulation checkers.
 - **Object-store conformance** (`store::conformance`, `crates/baserunna/tests/store_conformance.rs`): Verifies the object-store contract using 2 independent clients of the same store: conditional writes (including 16-writer races), cross-client visibility, etag uniqueness, byte ranges, pagination, store-clock coherence, and randomized model checking against `MemStore`. Runs against `MemStore`, `FsStore`, `CloudStore` backed by a fault-injecting in-process S3 server, and a live S3 store if `BASERUNNA_TEST_STORE` is set. Also verifies that each check detects synthetic contract violations, and that nodes run conditional-write preflight checks before serving.
 - **Failover check** (`crates/baserunna/examples/cluster_check.rs`): Runs multiple nodes against a shared store while killing and restarting nodes at random. Concurrent clients execute counter increments with idempotency keys and bank transfers with commit IDs, verifying that all committed writes are durable, strong reads match settled writes, and total account balances are conserved.
-- **Real-cluster test** (`scripts/jepsen/run.py`): Runs MinIO and several `baserunna` processes with the `elle` workload over real HTTP. A nemesis kills (`SIGKILL`) and pauses (`SIGSTOP`) nodes and MinIO, and cuts nodes off from storage or from their peers through TCP proxies. After it heals the cluster, it reads every key, writes the history in EDN, and fails unless `elle_check` (the checks of the `elle` workload) accepts it. Elle can check the same file.
+- **Real-cluster test** (`scripts/jepsen/run.py`): Runs MinIO and multiple `baserunna` processes with the `elle` workload over HTTP. A nemesis sends `SIGKILL` and `SIGSTOP` to nodes and MinIO, and it partitions nodes from storage and peers through TCP proxies. After healing the cluster, the harness reads every key, writes the history in EDN format, and checks it with `elle_check`. Jepsen's Elle CLI can check the same file.
 - **Memory bound** (`crates/baserunna/tests/memory_bound.rs`): Uses a counting global allocator to verify that memory charges cover actual heap allocations for decoded manifests and that opening hundreds of databases with retained handles stays within the configured memory budget.
 - **Cost model** (`sim::cost`, `crates/baserunna/tests/cost.rs`): measures object-store `GET`, `PUT`, `HEAD`, and `LIST` request counts per operation in virtual time and enforces per-operation and monthly workload cost budgets:
 
@@ -1657,7 +1658,7 @@ Tools:
 - `amplification` the write, space and read amplification of compaction and of streams
 - `commit_latency` measures commit and object-store request latency across manifest tail limits
 - `gen_openapi` regenerates `openapi.json`
-- `elle_check` checks EDN list-append histories, such as those of `scripts/jepsen/run.py`, with the checks of the `elle` workload
+- `elle_check` verifies EDN list-append histories using the `elle` workload checker
 
 ## 15. Known limitations (v1)
 

@@ -65,7 +65,7 @@ impl CloudStore {
         CloudStore::from_env_with(url, env, settings)
     }
 
-    /// Parses `s3://bucket[/prefix]` with the `AWS_*` variables of `env`, then `settings`.
+    /// Parses `s3://bucket[/prefix]`, applying `AWS_*` variables from `env` and then `settings`.
     fn from_env_with(
         url: &str,
         env: impl IntoIterator<Item = (String, String)>,
@@ -216,7 +216,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn client_options_are_read_from_the_environment() {
+    async fn reads_client_options_from_environment() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let env = [("AWS_ENDPOINT", endpoint.as_str()), ("AWS_ALLOW_HTTP", "true"), ("AWS_REGION", "us-east-1")]
@@ -233,7 +233,7 @@ mod tests {
             accepted.as_mut().poll(cx).map(|r| Ok(r.is_ok()))
         })
         .await;
-        assert_eq!(connected, Ok(true), "the store sent no request to the plain-HTTP endpoint");
+        assert_eq!(connected, Ok(true), "expected the store to connect to the plain-HTTP endpoint");
     }
 
     #[test]

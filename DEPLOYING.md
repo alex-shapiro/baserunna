@@ -166,12 +166,12 @@ object-store conformance suite and failover check (SPEC §13.5). Other
 S3-compatible stores are untested. Dedicate a separate bucket or key prefix
 (`s3://bucket/prefix`) to each cluster.
 
-Credentials, region, and endpoint are read from standard `AWS_*` environment
-variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and
-`AWS_ENDPOINT_URL_S3`). Client options come from the same variables: set
-`AWS_ALLOW_HTTP=true` for a plain-HTTP endpoint such as a local MinIO, and
-`AWS_TIMEOUT` or `AWS_CONNECT_TIMEOUT` to replace the default request timeout
-(30 s) or connect timeout (5 s).
+Each node reads S3 credentials, the region, the endpoint, and client options
+from standard `AWS_*` environment variables (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and `AWS_ENDPOINT_URL_S3`). Set
+`AWS_ALLOW_HTTP=true` to connect to a plain-HTTP endpoint such as MinIO. Set
+`AWS_TIMEOUT` to override the 30 s request timeout, and set
+`AWS_CONNECT_TIMEOUT` to override the 5 s connect timeout.
 
 At startup, each node runs conditional-write preflight checks against the
 store and refuses to start if they fail. To run the full conformance suite and

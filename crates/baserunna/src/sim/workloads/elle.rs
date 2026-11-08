@@ -311,7 +311,7 @@ async fn run_interactive_txn(client: &Client, ops: &[ListOp]) -> Result<TxnOutco
     let resp = client.call("POST", &format!("{base}/{txn_id}/ops"), Some(json!({"ops": api_ops}))).await;
     let filled = match &resp {
         Ok(ok) if ok.status == 200 => attach_read_results(ops, &ok.json["results"])?,
-        // If `ops` fails, the node aborts the transaction; if the request times out without
+        // If `ops` fails, the node aborts the transaction. If the request times out without
         // reaching `commit`, the transaction expires uncommitted.
         _ => {
             let _ = client.call("DELETE", &format!("{base}/{txn_id}"), None).await;
@@ -390,7 +390,7 @@ async fn read_final_lists(
     Ok(final_lists)
 }
 
-/// Verifies per-key prefix consistency, durability, read-your-writes, and real-time read bounds.
+/// Verifies single-key list-append invariants across `events` and `final_lists`.
 fn verify_history_properties(events: &[HistoryEvent], final_lists: &BTreeMap<u64, Vec<u64>>) -> Result<(), String> {
     let mut appended_key_by_value: BTreeMap<u64, u64> = BTreeMap::new();
     for e in events.iter().filter(|e| e.kind == EventKind::Invoke) {

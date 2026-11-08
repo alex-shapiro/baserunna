@@ -186,7 +186,7 @@ impl OpenTxns {
         if let Some(commit_id) = self.started_commits.get(&id.to_string()) {
             return Error::Unavailable {
                 message: format!(
-                    "the transaction's commit was already sent and may have been applied; check its status at \
+                    "the transaction's commit was already sent and may have been applied. Check its status at \
                      /commits/{commit_id:016x}"
                 ),
                 retry_after_ms: None,

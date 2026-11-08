@@ -57,8 +57,8 @@ tables, streams, and event tables, as well as binary blobs and change feeds.
 Before this branch, [`SPEC.md`](SPEC.md) §1 made three safety claims:
 
 - Committed data is never lost or reordered.
-- Transactions are strictly serializable (amended in this branch to "by
-  default"; see section 3.8).
+- Transactions are strictly serializable. Section 3.8 explains why this branch
+  adds "by default".
 - Committed data correctness relies on object storage guarantees.
 
 `SPEC.md` §6 specifies the transaction contract. Serializable isolation and
@@ -112,7 +112,7 @@ We combined four testing methods:
 
 ### 2.1 The deterministic simulator
 
-The deterministic simulator (`SPEC.md` §13) runs one to five nodes on a single
+The deterministic simulator in `SPEC.md` §13 runs 1 to 5 nodes on a single
 thread in virtual time across 25 scenarios. It injects the following faults:
 
 - node crashes, including crash points inside commits, compactions, and garbage
@@ -146,9 +146,9 @@ serialization order from client observations alone.
 
 ### 2.2 Elle on the simulator
 
-We added the `elle` simulation workload
-([`elle.rs`](crates/baserunna/src/sim/workloads/elle.rs)), which implements
-Jepsen's list-append model:
+We added the `elle` simulation workload in
+[`elle.rs`](crates/baserunna/src/sim/workloads/elle.rs) to implement Jepsen's
+list-append model:
 
 - Each key stores a list of unique integers.
 - Even keys are KV entries that interactive serializable transactions update
@@ -157,18 +157,18 @@ Jepsen's list-append model:
 - After a key receives `max_appends` appends, the generator replaces it with a
   new key to keep lists short.
 
-The workload records invocation and completion events in execution order. When
-a transaction returns an ambiguous outcome, the workload records `:info` and
+The workload records invocation and completion events in execution order. If a
+transaction returns an ambiguous outcome, the workload records `:info` and
 allocates a new process ID for subsequent transactions from that client. After
 fault injection stops and the cluster heals, the workload reads the final list
-of every key, writes the history in EDN format, and checks it. We also ran
-`elle-cli` 0.1.11 (`--model list-append --consistency-models
-strict-serializable`) on the generated EDN files.
+of every key, writes the history in EDN format, and checks it. We also checked
+the generated EDN files with `elle-cli` 0.1.11 using `--model list-append` and
+`--consistency-models strict-serializable`.
 
 The initial Rust checker in `elle.rs` checked only prefix consistency and
-append durability, which missed stale reads that `elle-cli` detected (section
-4.2). We extended `elle.rs` with three additional checks that run in every
-simulation without requiring Java:
+append durability. Section 4.2 shows how that initial checker missed stale
+reads that `elle-cli` detected. We extended `elle.rs` with three additional
+checks that run in every simulation without requiring Java:
 
 - **Internal consistency:** a read of a KV key after appends to that key in the
   same transaction ends with those appends.
@@ -189,14 +189,15 @@ it synthetic histories containing a stale read, write skew, and a lost append.
 
 Because the simulator replaces the S3 client, HTTP stack, multi-threaded
 runtime, and OS processes, we wrote [`scripts/jepsen/run.py`](scripts/jepsen/run.py).
-The harness starts MinIO and three or five `baserunna` release binaries on one
+The harness starts MinIO and 3 or 5 `baserunna` release binaries on a single
 machine and runs the list-append workload over HTTP against random nodes. Every
 2 to 8 seconds, a nemesis injects one of the following faults:
 
-- `SIGKILL` of one node or all nodes, followed by a restart after up to 5 s;
+- `SIGKILL` of a single node or all nodes, followed by a restart after up to
+  5 s;
 - `SIGSTOP` of a node for 0.5 to 20 s, or of MinIO for 0.5 to 7 s;
-- a storage partition on a node via a TCP proxy that either discards bytes (so
-  requests time out) or resets connections;
+- a storage partition on a node via a TCP proxy that either discards bytes to
+  trigger request timeouts or resets connections;
 - a peer partition on a node via a TCP proxy on its advertised address.
 
 A background supervisor restarts any node that exits unexpectedly. After the
@@ -282,10 +283,10 @@ Appendix A lists the exact command and seed for each run.
 
 Baserunna creates a database's manifest lazily on first open. Previously, if
 `GET` on the manifest returned `NotFound`, `Db::refresh_at` created a new empty
-manifest whenever `create` was true. `Node::open_db` passed `create = true` for
+manifest if `create` was true. `Node::open_db` passed `create = true` for
 every database registered in the system database. Consequently, if a manifest
 object was deleted by an operator error or misconfigured lifecycle rule,
-Baserunna initialized an empty manifest (matching ParticleDB #112). After the
+Baserunna initialized an empty manifest, matching ParticleDB #112. After the
 2-hour orphan grace period, the garbage-collection sweep marked all existing
 segments and blobs as obsolete and deleted them 30 minutes later. The system
 database followed the same path at startup, so a missing `sys` manifest erased
@@ -294,12 +295,12 @@ all account, organization, and database records.
 Because a node always writes a database's initial manifest before writing any
 other object for that database, the fix lists the database prefix before
 creating an initial manifest. If any object exists under the prefix, the node
-re-reads the manifest once (in case a peer created the manifest concurrently).
+re-reads the manifest once in case a peer created the manifest concurrently.
 If the manifest is still missing, `Db::refresh_at` returns a `500 internal`
 error without writing or deleting anything.
 
 Our first version of this fix omitted the second manifest read. A 20-minute
-simulation campaign failed 70 runs when a peer node created the manifest
+simulation campaign failed 70 runs because a peer node created the manifest
 between the `GET` and the `LIST`.
 
 Commit: `7874096`. Test: `open_rejects_missing_manifest_if_database_objects_exist`.
@@ -308,9 +309,9 @@ Commit: `7874096`. Test: `open_rejects_missing_manifest_if_database_objects_exis
 
 Each segment block, bloom filter, index, and footer has a CRC32C checksum, but
 readers did not check that the segment object matched the `SegmentMeta` entry
-in the manifest. For segments up to 1 MiB (including all level-0 segments), the
+in the manifest. For level-0 segments and other segments up to 1 MiB, the
 reader decoded any valid segment returned under the requested key. In our test,
-replacing one segment object with another segment's bytes caused a scan to
+replacing a segment object with another segment's bytes caused a scan to
 return 36 of 50 keys silently. Compaction then merged the substitute segment
 and deleted the original segment reference from the manifest.
 
@@ -321,17 +322,17 @@ Commit: `901e380`. Test: `scan_rejects_segment_that_mismatches_manifest_metadata
 
 ### 3.4 Applied commits were reported as definite failures (fixed)
 
-When a manifest `PUT` times out, the committer reloads the manifest. If the
+If a manifest `PUT` times out, the committer reloads the manifest. If the
 manifest ETag has not changed, the timed-out `PUT` can still be applied by the
 object store, so the committer rebuilds the batch on the same base version.
 Previously, if the rebuild rejected a transaction in the batch, the committer
 converted only `Unavailable` errors to `outcome: "unknown"` and returned other
 rejections as definite failures. On an unchanged base version, a transaction
-can succeed on the first build and fail on the second build if a time-dependent
-check expires between builds (such as the 1-hour staged-blob TTL or a read-key
-TTL). In our test, the client received `400 invalid_argument` for a commit that
-the store subsequently applied. A client retrying without an idempotency key
-would then apply the transaction a second time.
+can succeed on the first build and fail on the second build if a staged-blob
+TTL or a read-key TTL expires between builds. In our test, the client received
+`400 invalid_argument` for a commit that the store subsequently applied. A
+client retrying without an idempotency key would then apply the transaction a
+second time.
 
 The initial fix (`d284785`) marked every rejection in a rebuilt batch as
 `unknown`. Code review (section 3.10) showed that this also masked definite
@@ -346,11 +347,11 @@ Commits: `d284785` and `15e5ee9`. Tests:
 
 ### 3.5 Applied commit after a timed-out `PUT` was reported as a replay (fixed)
 
-When a timed-out manifest `PUT` was applied by the store, the committer's
-subsequent manifest reload found the commit record already present and returned
+If the store applied a timed-out manifest `PUT`, the committer's subsequent
+manifest reload found the commit record already present and returned
 `replayed: true`. For a one-shot transaction with an idempotency key, the HTTP
-handler clears `results` to `null` when `replayed` is true, so the client lost
-the read results of its own request. The committer now clears `replayed` if the
+handler sets `results` to `null` if `replayed` is true, so the client lost the
+read results of its own request. The committer now clears `replayed` if the
 commit ID was sent in an ambiguous manifest `PUT` of the current batch.
 
 Commits: `e5091e9` and `15e5ee9`. Test:
@@ -358,9 +359,9 @@ Commits: `e5091e9` and `15e5ee9`. Test:
 
 ### 3.6 Retried interactive commit was told to restart (fixed on the committing node)
 
-`commit_txn` removes an interactive transaction from the open-transaction
-registry when commit processing starts. Previously, if a client lost the commit
-response and resent the commit request, the node returned a retryable
+Before sending a commit, `commit_txn` removes the interactive transaction from
+the open-transaction registry. Previously, if a client lost the commit response
+and resent the commit request, the node returned a retryable
 `404 txn_not_found`. `SPEC.md` instructs clients to handle `txn_not_found` by
 restarting the transaction from `begin`, which applied the transaction twice.
 
@@ -425,14 +426,14 @@ Commit: `d32f75a`.
 The following gaps remain open and are tracked in [`TODO.md`](TODO.md):
 
 - **Storage integrity under broken object stores.** Full blob reads do not
-  verify `BlobRef.sha256`, and individual blob chunks have no CRC. Replacing a
-  sealed stream chunk with another chunk of equal byte size causes stream reads
-  to skip records silently. Staged blob metadata objects lack checksums.
-  Segments, stream chunks, and local disk-cache files do not embed their object
-  IDs in their footers, so a substituted segment with the same byte size and
-  entry count is still accepted. A node with an empty cache accepts a manifest
-  that was rolled back to an older version. Each of these requires an object
-  store that violates its contract.
+  verify `BlobRef.sha256`, and individual blob chunks lack CRC checksums.
+  Replacing a sealed stream chunk with another chunk of equal byte size causes
+  stream reads to skip records silently. Staged blob metadata objects lack
+  checksums. Segments, stream chunks, and local disk-cache files do not embed
+  their object IDs in their footers, so a substituted segment with the same
+  byte size and entry count is still accepted. A node with an empty cache
+  accepts a manifest that was rolled back to an older version. Each of these
+  requires an object store that violates its contract.
 - **Ambiguity across restarts and peers.** `started_commits` (section 3.6) is
   held only in the committing node's memory.
 - **`retryable` flag on unknown outcomes.** `503` responses with
@@ -440,9 +441,8 @@ The following gaps remain open and are tracked in [`TODO.md`](TODO.md):
   `outcome`, but a naive client checking only `retryable` could retry a
   non-idempotent write.
 - **Startup preflight failure during store outages.** If the object store is
-  unreachable when a node starts, the conditional-write preflight check fails
-  and the process exits, requiring an external process supervisor to restart
-  it.
+  unreachable at node startup, the conditional-write preflight check fails and
+  the process exits, requiring an external process supervisor to restart it.
 
 ### 3.10 Independent reviews of the fixes
 
@@ -457,7 +457,7 @@ The first review identified defects in four initial fixes:
   missed multi-attempt batches and ignored event binds.
 - The initial interactive-commit fix (`f402025`) recorded the commit ID after
   releasing the transaction lock, leaving a race window, and cleared the entire
-  `TtlCache` when full.
+  `TtlCache` if it reached capacity.
 - The segment metadata check (`901e380`) compares only byte size and entry
   count, so a substituted segment with identical size and entry count is still
   accepted.
@@ -470,7 +470,7 @@ The second review identified five additional defects:
 - The dependency-cycle checker in `elle.rs` skipped reads of absent KV keys (`None`),
   which missed write-skew cycles on uninitialized keys, and lacked an
   internal-consistency check (`3514ff1`).
-- `TtlCache` still cleared all entries when 100,000 live entries were present;
+- `TtlCache` still cleared all entries if 100,000 live entries were present;
   it now evicts the oldest eighth (`9e2df7b`, refined in `fb22d2c`).
 - Read-only interactive commits and interactive commits that failed before
   reaching the committer remained in `started_commits` (`b0d3e88`, also caught
@@ -493,9 +493,9 @@ We found and fixed four bugs in `scripts/jepsen/run.py` during development:
   connections.
 - Stream-creation retries pinned a single node for 120 s even if that node was
   stopped.
-- When stream creation raised an exception before a transaction was invoked,
-  the client recorded an `:info` completion without a matching `:invoke` event.
-  We stripped 7 such orphan `:info` events from the r1 history before running
+- If stream creation raised an exception before a transaction was invoked, the
+  client recorded an `:info` completion without a matching `:invoke` event. We
+  stripped 7 such orphan `:info` events from the r1 history before running
   `elle-cli`.
 - The harness initially duplicated the checker logic in Python and exited with
   status 0 even if clients recorded unexpected errors.
@@ -514,8 +514,8 @@ We found and fixed four bugs in `scripts/jepsen/run.py` during development:
   organizations, quotas, events, and garbage collection.
 - **Version-number verification.** Because `history` verifies the server's
   reported commit versions, it catches version-numbering bugs that
-  observation-only checkers ignore. Under bug-zoo patch 03 (which assigns the
-  same version to two transactions in a batch), `history` failed 94 of 300
+  observation-only checkers ignore. Under bug-zoo patch 03, which assigns the
+  same version to two transactions in a batch, `history` failed 94 of 300
   seeds, whereas `elle-cli` reported 0 anomalies across 300 seeds.
 - **Checker validation.** The bug zoo, checker unit tests, and mutation testing
   verify that the simulator's checkers detect injected bugs.
@@ -527,9 +527,9 @@ We found and fixed four bugs in `scripts/jepsen/run.py` during development:
   caught the `CloudStore` environment-variable bug (section 3.7) before sending
   a single transaction.
 - **Independent observation-based checking.** `elle-cli` infers serialization
-  orders from read and write observations alone. Under bug-zoo patch 04 (which
+  orders from read and write observations alone. Under bug-zoo patch 04, which
   removes the in-flight write barrier so strong reads can miss a concurrent
-  write), `elle-cli` detected `G-single-item-realtime` in 10 of 1,300 seeds,
+  write, `elle-cli` detected `G-single-item-realtime` in 10 of 1,300 seeds,
   whereas `history` failed in 4 of 1,300 seeds. After we added the real-time
   and cycle checks to `elle.rs`, the Rust checker rejected the exact same 10
   seeds as `elle-cli`.
@@ -544,10 +544,10 @@ Neither testing method covered the following cases:
 
 - clock skew on real cluster nodes;
 - dynamic cluster membership changes beyond restarting fixed node slots;
-- real-cluster fault injection against Tigris (the target production object
-  store);
+- real-cluster fault injection against Tigris, the target production object
+  store;
 - `elle-cli` verification of snapshot isolation, row tables, event tables, or
-  change feeds (which are checked by reference models in the simulator);
+  change feeds, which the simulator checks against reference models instead;
 - monotonic clock drift across nodes exceeding the 0.5 s lease safety margin.
 
 In addition, random simulation campaigns miss 7 of the 27 bug-zoo patches
@@ -572,9 +572,9 @@ from Jepsen's ParticleDB report and related analyses:
   truncated prefixes, and this branch fixes the missing-manifest bug (section
   3.2) and segment size/count verification (section 3.3). Additional
   object-binding and blob-checksum gaps remain open in `TODO.md` (section 3.9).
-- **Acknowledgments before durability:** None. Nodes hold no durable local
-  state and acknowledge commits only after the conditional manifest `PUT`
-  succeeds.
+- **Acknowledgments before durability:** None. Nodes store all durable state in
+  the object store and acknowledge commits only after the conditional manifest
+  `PUT` succeeds.
 - **Errors that misreport applied writes:** Found and fixed on three paths
   (sections 3.4, 3.5, and 3.6).
 - **Overstated documentation:** Found and fixed in five places (section 3.8).
@@ -611,7 +611,7 @@ We recommend five follow-up actions:
    Linux with clock-skew faults enabled.
 3. **Run both `history` and `elle` in CI.** Keep both the version-based
    `history` checker and the observation-based `elle` checker.
-4. **Separate outcome ambiguity from `retryable`.** Set `retryable: false` when
+4. **Separate outcome ambiguity from `retryable`.** Set `retryable: false` if
    `outcome` is `"unknown"` so that clients inspecting only `retryable` do not
    retry non-idempotent writes.
 5. **Expand targeted tests for rare bug-zoo patches.** Add deterministic tests
@@ -657,8 +657,8 @@ macOS machine with MinIO `2025-10-15`. Both `elle_check` (`3514ff1`) and
 - **r3:** `--minutes 30 --seed 3 --lease-ms 1000 --clients 30 --active-keys 4
   --max-appends 16`, binary `d32f75a`. 0 client errors.
 - **r4:** `--minutes 60 --seed 4 --nodes 5 --clients 20`, binary `d32f75a`. 0
-  client errors. Nodes exited 83 times when startup preflight checks coincided
-  with injected storage faults, and the supervisor restarted them.
+  client errors. Nodes exited 83 times because startup preflight checks
+  coincided with injected storage faults, and the supervisor restarted them.
 - **r5:** `--minutes 40 --seed 5 --lease-ms 1000 --clients 12 --active-keys 6`,
   binary `cd30b18`. 0 client errors.
 
@@ -669,7 +669,7 @@ The bug-zoo comparisons used commits `7ab104b` and `cd30b18`:
 - **Patch 04** (seeds 5000–5299 and 6000–6999): `elle-cli` and `elle.rs`
   rejected the same 10 seeds; `history` failed 4 seeds.
 - **Patch 12** (seeds 5000–5299): `history` failed 34 seeds, and `elle.rs`
-  failed 41 seeds (primarily via the lease oracle). Across seeds 6000–6999 with
+  failed 41 seeds, primarily via the lease oracle. Across seeds 6000–6999 with
   the updated `elle.rs` checks, `elle.rs` failed 147 seeds.
 - **Patches 07, 22, and 27** (seeds 5000–5299): 0 failures from either checker.
 - **Patch 17** (seeds 6000–6999): 0 failures from `elle.rs`.
@@ -679,9 +679,7 @@ The bug-zoo comparisons used commits `7ab104b` and `cd30b18`:
 - Kyle Kingsbury, "ParticleDB 1.1.4", Jepsen, 2026-10-31:
   https://jepsen.io/analyses/particledb-1.1.4
 - Jepsen ParticleDB test suite: https://github.com/jepsen-io/particledb
-- Jepsen analyses (Bufstream 0.1.0, NATS 2.12.1, TigerBeetle 0.16.11, etcd
-  3.4.3, PostgreSQL 12.3, MySQL 8.0.34, Datomic Pro 1.0.7075, and Radix DLT
-  1.0-beta.35.1): https://jepsen.io/analyses
+- Jepsen analyses: https://jepsen.io/analyses
 - Elle transactional consistency checker: https://github.com/jepsen-io/elle and
   `elle-cli` 0.1.11: https://github.com/ligurio/elle-cli
 - Jepsen consistency models: https://jepsen.io/consistency

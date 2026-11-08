@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// Bounded cache whose entries expire after `ttl`. When the cache holds `max` live entries, an
+/// Bounded cache whose entries expire after `ttl`. If the cache holds `max` live entries, an
 /// insert evicts the oldest eighth.
 pub struct TtlCache<K, V> {
     ttl: Duration,

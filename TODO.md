@@ -182,7 +182,7 @@ data corruption through any of them.
       any valid older manifest from the store, commits on top of it, and
       collects the newer segments as orphans. Store a minimum manifest version
       in the system database to reject rolled-back manifests.
-- [ ] **Surface permanent segment corruption in metrics and error logs.** When
+- [ ] **Surface permanent segment corruption in metrics and error logs.** If
       a segment fails CRC verification, compaction and garbage collection fail
       repeatedly and log only at `debug` level. Increment an error counter in
       `/v1/admin/metrics` and log the failure at `error` level.
@@ -196,11 +196,11 @@ data corruption through any of them.
       and can cause the client to re-execute the transaction. Derive the
       transaction ID from its commit ID so that any node can check the commit
       record in the manifest.
-- [ ] **Set `retryable: false` when `outcome` is `"unknown"`.** A `503`
+- [ ] **Set `retryable: false` if `outcome` is `"unknown"`.** A `503`
       response with `outcome: "unknown"` sets `retryable: true`.
       `baserunna-client` checks `outcome` before retrying, but a client that
       inspects only `retryable` can apply a non-idempotent write twice.
-- [ ] **Track ambiguity per commit on batch-abort paths.** When the committer
+- [ ] **Track ambiguity per commit on batch-abort paths.** If the committer
       aborts a batch after an ambiguous manifest `PUT` (for example, on lease
       loss, shutdown, build failure, store error, or retry exhaustion), it
       marks every commit in the batch as `outcome: "unknown"`, including
@@ -218,7 +218,7 @@ data corruption through any of them.
 - [ ] **Display `outcome: "unknown"` in the web console.** The console displays
       only the error message, which makes an ambiguous write appear to have
       failed.
-- [ ] **Return `200` when a retried database deletion completes cleanup.** A
+- [ ] **Return `200` if a retried database deletion completes cleanup.** A
       retried `DELETE /v1/dbs/{db}` that finishes an interrupted database
       deletion returns `404 not_found` even though the request completed the
       deletion.

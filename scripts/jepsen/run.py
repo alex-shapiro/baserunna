@@ -252,11 +252,11 @@ def run_nemesis(cluster, stop_event, rng):
 
 
 class UnknownOutcomeError(Exception):
-    """Raised when a request may have been applied."""
+    """Exception raised if a request may have been applied."""
 
 
 class DefiniteFailureError(Exception):
-    """Raised when a request was not applied."""
+    """Exception raised if a request was not applied."""
 
 
 def send_http_request(port, method, path, body=None, token=None, timeout=12.0):

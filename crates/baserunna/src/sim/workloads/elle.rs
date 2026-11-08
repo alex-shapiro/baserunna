@@ -15,7 +15,7 @@
 //!   transaction began.
 //! - The write-write, write-read, read-write, and real-time dependency graph is acyclic.
 //!
-//! When `SIM_ELLE_DIR` is set, the workload also writes the history to `elle-<seed>.edn` for
+//! If `SIM_ELLE_DIR` is set, the workload also writes the history to `elle-<seed>.edn` for
 //! Jepsen's Elle checker.
 
 use super::super::client::Client;
@@ -543,7 +543,7 @@ fn verify_dependency_graph_acyclic(
     }
     // Represent real-time order with a chain of time nodes after the transaction nodes. Each
     // completion advances to a new time node, and each invocation depends on the latest time node,
-    // creating a path from transaction A to transaction B whenever A completed before B began.
+    // creating a path from transaction A to transaction B if A completed before B began.
     let completion_count = txns.iter().filter(|t| t.complete_index.is_some()).count();
     let mut edges: Vec<Vec<usize>> = vec![Vec::new(); txns.len() + completion_count];
     let mut add_edge = |from: usize, to: usize| {

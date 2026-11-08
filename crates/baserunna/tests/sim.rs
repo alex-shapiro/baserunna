@@ -30,6 +30,7 @@ macro_rules! scenario_tests {
 scenario_tests! {
     sim_kv_model: "kv_model", 1, 4;
     sim_history: "history", 23, 4;
+    sim_elle: "elle", 26, 4;
     sim_bank: "bank", 3, 4;
     sim_register: "register", 4, 4;
     sim_tables: "tables", 5, 3;

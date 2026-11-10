@@ -385,8 +385,7 @@ async fn a_write_that_does_not_modify_rows_does_not_commit() {
 async fn a_begin_whose_caller_stops_waiting_is_aborted() {
     use std::future::Future;
     use std::task::Poll;
-    // Test dropping the future both before the response arrives (`slow = true`) and after the
-    // response arrives (`slow = false`).
+    // Test dropping the future before and after the response arrives.
     for slow in [true, false] {
         let (db, router) = node_with(api::BeginTxn::ROUTE, |c| c.txns_per_user = 1).await;
         let db = without_retries(&db);

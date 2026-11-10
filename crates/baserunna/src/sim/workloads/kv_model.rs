@@ -415,7 +415,7 @@ impl KvModel {
                     }
                     return Ok(());
                 }
-                // An earlier attempt failed and fenced the key, and its response was lost.
+                // An earlier attempt failed and fenced the key. Its response was lost.
                 409 if r.code() == "aborted" => {
                     let rejectable = fail_at.is_some() || sim.writes.values().any(|w| w.is_some());
                     if !rejectable {

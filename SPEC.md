@@ -860,8 +860,9 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
    `commit_retention_ms`. `PUT /kv/{key}` and stream appends accept this key in
    the `Idempotency-Key` header. Each commit record stores the commit timestamp
    along with the first sequence number and count of each `append`. If a retry
-   finds that an earlier attempt committed, the server returns `replayed: true`,
-   `results: null`, and the `appends` sequence numbers from the commit record. If
+   finds that an earlier attempt was committed, the server returns
+   `replayed: true`, `results: null`, and the `appends` sequence numbers from
+   the commit record. If
    an idempotent write request fails or does not modify data, it may have
    observed writes from an earlier attempt with the same key. Before responding,
    the server checks the commit record (§5.5). It returns the replayed result if

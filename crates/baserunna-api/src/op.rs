@@ -464,7 +464,7 @@ pub struct CountResult {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendResult {
     pub count: u64,
-    /// Sequence number of the first appended record, set once the transaction commits.
+    /// Sequence number of the first appended record, set once the transaction is committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_seq: Option<u64>,
 }

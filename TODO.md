@@ -1,446 +1,620 @@
 # TODO
 
-Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
-§15 (known limitations) and §16 (future work) for design context.
+Planned work, grouped by triage tier. See [`SPEC.md`](SPEC.md) §15 (known
+limitations) and §16 (future work) for design context.
 
-## Reliability and operations
+Each item has a major tag and, where it helps, a minor tag that names its
+topic: `[major · minor]`. The major tags are:
 
-- [ ] **Report `outcome: "unknown"` on stale-target rejections if a forward was
-      retried.** If a node receives `x-baserunna-stale-target`, it executes the
-      request locally, assuming the peer never executed it. If a proxy or
-      network duplicated the forwarded request, an earlier copy could have been
-      executed by the peer's previous process (`sim_tool trace tables 7344`).
-      Execute locally only if the forward was sent once; otherwise return
-      `outcome: "unknown"`.
-- [ ] **Fix `db_churn` seed 202681: `GET` returns `404 not_found` for an
-      existing database.** During database churn, a `get` operation returns
+- **blocker**: The defect can break a transaction guarantee, lose or corrupt
+  data, return wrong data without an error, or let one tenant crash a node or
+  starve other tenants. A store that returns a corrupt object is in scope
+  (SPEC §1). Fix these items before production use.
+- **nice-to-have**: The item is correct and a user or operator would notice the
+  improvement, but one of these conditions applies. The damage has a fixed
+  ceiling. The system recovers without operator action. The defect needs a
+  proxy that breaks its contract, or a store that fails in durability,
+  availability, or consistency. The item adds a capability that the product
+  goals do not require.
+- **tangential**: The item has no demonstrated effect on users or operators. It
+  is a simulator artifact, an unmeasured optimization, a refactor, or a
+  cosmetic change.
+
+Each blocker names a test that asserts the correct behavior. The test fails
+today and is marked `#[ignore]`; remove the attribute with the fix. Numbers in
+blocker items are measured unless the item says "extrapolated" or
+"calculated". Run the heavy tests one at a time: one test uses up to 5 GB of
+memory. Items in the other tiers are verified by code reading only.
+
+## Blocker
+
+- [ ] [blocker · Stale strong read] **Keep the cached manifest distrusted after
+      an ambiguous manifest `PUT`.** A manifest `PUT` that returns an error can
+      still be applied by the store later. The committer distrusts its cache on
+      the error, but the next manifest read that returns the old version
+      restores trust (`install`) and the node's own lease (`own_lease`). If the
+      `PUT` then lands, the lease holder serves strong reads from the old
+      manifest for 2.6 s to 3.5 s. A client observes newer data and then older
+      data in two cases: a strong event query on another node followed by any
+      strong read on the lease holder, and a change feed long poll on a home
+      node that is not the lease holder followed by a strong `GET`. A plain
+      strong `GET` on another node is forwarded to the lease holder, so it
+      returns a consistent history. A `412` on the commit retry is the same
+      case with a window of about 21 ms. Clear `own_lease` on an ambiguous
+      `PUT` and on a `412`. Restore it only after a landed write or a
+      successful commit confirms the manifest version. Tests:
+      `tests/stale_strong_read.rs` and `late_manifest_put` in
+      `src/engine/tests.rs`.
+- [ ] [blocker · Stale strong read] **Enable the late-apply fault in the swarm
+      profiles.** `StoreFaults::p_late_apply` makes the simulated store return
+      an error for a `PUT` and apply it later. It is 0 in every profile,
+      because campaigns would fail on the defect above. Enable it with the
+      fix.
+- [ ] [blocker · Tenant resource exhaustion] **Charge event query memory to the
+      node `MemoryGate` and fair-share `Node::query_slot`.** Concurrent event
+      queries are not charged against the node's `memory_bytes` budget. Eight
+      concurrent queries held 2,630 MiB against a budget of 768 MiB, and none
+      was refused or queued. One heavy query holds 55 MiB to 550 MiB, and
+      `query_concurrency` defaults to the core count. `Node::query_slot` is not
+      fair-shared: one user held all 16 slots for 12.5 s per query, and another
+      user's query on a 1-row table received `503` after 5 s. A larger table
+      holds a slot for the 60 s query limit. Tests:
+      `concurrent_event_queries_respect_node_memory_budget` and
+      `one_user_cannot_hold_every_query_slot` in `tests/event_query_limits.rs`.
+- [ ] [blocker · Tenant resource exhaustion] **Acquire a query slot for
+      transactional `query_events` ops.** Unlike the event query route
+      (`/events/{t}/rows/query`), `query_events` inside `/txn` does not acquire
+      a `Node::query_slot` permit: 32 concurrent requests held twice the heap of
+      16, while the event query route stayed flat. It also does not extend the
+      request deadline: a query that returned `200` after 12.5 s on the event
+      query route returned `503` after 10 s in `/txn`, with
+      `outcome: "unknown"` for a transaction that only reads. Tests:
+      `transactional_event_queries_take_query_slots` and
+      `transactional_event_queries_get_the_event_query_deadline` in
+      `tests/event_query_limits.rs`.
+- [ ] [blocker · Tenant resource exhaustion] **Estimate granule run memory from
+      actual string lengths.** `Run::run_rows` estimates string columns at 4
+      bytes per row (the dictionary code width), even if a high-cardinality
+      column is stored without a dictionary. The query charges memory only after
+      it decodes a column. A query over 16 merged parts of long unique strings
+      held 1,954 MiB against its 1 GiB limit. Bulk inserts of 30 MB per day and
+      the normal merges produce such parts. Each part read in parallel adds 110
+      MiB to 152 MiB, so 32 parts need about 5 GiB (extrapolated). A node-wide
+      memory gate depends on this estimate. Use the column index byte length.
+      Test: `long_string_queries_respect_memory_limit` in
+      `tests/event_query_limits.rs`.
+- [ ] [blocker · Tenant resource exhaustion] **Stream JSON request bodies and
+      charge bulk insert memory to `MemoryGate`.** `JsonBody` parses the full
+      body into memory before the handler checks `INSERT_MAX_ROWS`. Peak heap
+      was 32 to 54 times the body size for valid small events (1.0 GiB to 1.7
+      GiB for a 32 MiB body) and 87 times for rows with an unknown column. The
+      bulk insert route does not build a JSON tree, but its row buffer and
+      flush hold 7 to 44 times the body size without a memory charge: 4
+      concurrent inserts held 2 GiB against a node budget of 768 MiB. Parse
+      row fields lazily and reserve memory from `Content-Length`. Tests:
+      `txn_event_insert_parse_stays_near_body_size` and
+      `concurrent_bulk_inserts_respect_node_memory_budget` in
+      `tests/event_ingest_limits.rs`.
+- [ ] [blocker · Tenant resource exhaustion] **Time out stalled request
+      bodies.** The request deadline pauses while a body arrives and the server
+      sets no read timeout. A body that stopped halfway was still open after 10
+      minutes with its buffer held, through the router and over TCP. Tests:
+      `stalled_request_body_times_out` and
+      `stalled_request_body_times_out_over_tcp` in
+      `tests/event_ingest_limits.rs`.
+- [ ] [blocker · Tenant resource exhaustion] **Limit event maintenance
+      concurrency across the node and charge its memory.** Event maintenance
+      starts one task for each database and table (`events/maint.rs`). Merges
+      and seals do not acquire a `compaction_slots` permit and are not charged
+      to `MemoryGate`. With 16 tables, 16 merges ran at the same time and held
+      1,248 MiB; one merge of the same size held 99 MiB. Test:
+      `event_merges_share_a_node_wide_limit` in `tests/event_ingest_limits.rs`.
+- [ ] [blocker · Tenant resource exhaustion] **Bound memory usage during part
+      merges.** `merge_parts` holds the sort key of every live input row in
+      memory at once. Peak heap was 172 bytes per input row from 1 million to 8
+      million rows, so a partition with 100 million small rows needs about 16
+      GiB (extrapolated). Merge planning caps only the compressed output size
+      (4 GiB), which such rows reach at about 1.8 billion rows (calculated). A
+      failed merge runs again after a restart, and every hour without one, so
+      the node can crash-loop. Merge sorted runs block by block instead. Tests:
+      `merge_memory_does_not_grow_with_rows` and
+      `failed_merge_is_not_retried_after_restart` in
+      `tests/event_ingest_limits.rs`. Delete the second test if the fix bounds
+      merge memory.
+- [ ] [blocker · Tenant resource exhaustion] **Limit partitions per bulk
+      insert.** A single bulk insert can span an unbounded number of
+      partitions. The flush writes one part per partition in sequence, without
+      a cap or a deadline check. A request with events in 10,000 hourly
+      partitions caused 10,001 `PUT`s; the client received `503` after 10 s, the
+      flush continued for 190 s more, and no rows were bound. At 20 ms per
+      `PUT`, a request with more than about 500 partitions cannot succeed. The
+      quota charges only parts that are bound; the sweeps remove the other
+      parts within 3 hours. One 32 MiB body can name about 1.6 million
+      partitions (calculated). Each `StagedPart` also stores a `Runs` entry for
+      every slot in the bind batch; encode `StagedPart::slot_rows` sparsely.
+      Test: `bulk_insert_partitions_are_limited` in
+      `tests/event_ingest_limits.rs`.
+- [ ] [blocker · Store fault detection] **Verify blob chunks on read.**
+      `blob::read_chunk` checks only the chunk byte length, and full blob reads
+      do not verify `BlobRef.sha256`. Every flipped bit in a blob chunk reached
+      the client as valid data, and so did a substituted chunk and bytes from
+      the wrong offset. A truncated chunk fails only after the node sends `200`,
+      so the client receives a short body, and the node logs no warning. A
+      checksum per chunk does not cover ranged reads, which fetch partial
+      chunks; use checksums per block. Test: `damaged_blob_chunks_are_detected`
+      in `tests/store_integrity.rs`.
+- [ ] [blocker · Store fault detection] **Add a checksum to blob metadata
+      objects.** `load_staged` checks only the blob ID. A flipped bit in `size`,
+      `sha256`, or the content type of a staged blob metadata object is
+      committed into the LSM tree at bind. A smaller size truncates later reads
+      without an error, and a larger size makes the key unreadable. Test:
+      `damaged_staged_blob_metadata_is_detected` in
+      `tests/store_integrity.rs`.
+- [ ] [blocker · Store fault detection] **Report persistent maintenance
+      failures and back off.** With one segment that fails its CRC, compaction
+      failed on every commit (1,204 times in 1,300 commits) without backoff,
+      and the sweep failed on every commit after it became due. Stored bytes
+      grew linearly to 27 times the live data. Both failures log only at
+      `debug` level, and `/v1/admin/metrics` has no counter for maintenance
+      failures or checksum failures. Flush, trim, and event maintenance
+      failures also log at `debug` level (code reading). Increment an error
+      counter, log at `error` level, and back off after a failure. Test:
+      `persistent_segment_corruption_is_reported_and_backed_off` in
+      `tests/store_integrity.rs`.
+- [ ] [blocker · Lost acknowledged write] **Reject binds if a target column was
+      dropped after validation.** `Db::bind` checks that the table still
+      exists, but not its columns. If a column is dropped and re-added within
+      190 ms after a bulk insert request arrives, the insert returns `201` and
+      its rows read `null` for that column. A schema migration during
+      ingestion reaches this window with ordinary requests. Include column IDs
+      in `Bind` and return a retryable conflict if any column was dropped.
+      Test: `bulk_insert_keeps_x_values_after_a_column_drop_and_re_add` in
+      `tests/event_schema_races.rs`.
+- [ ] [blocker · Data recovery] **Provide a backup and restore path for the
+      system database and database manifests.** No undelete, backup, or restore
+      exists. After `DELETE /v1/dbs/{db}`, no route returns the data, and the
+      store holds no object of the database after `db_delete_grace_ms` (10
+      minutes, not configurable). `SPEC.md` §8 tells operators to restore a
+      lost manifest from a backup or an object version, but `DEPLOYING.md`
+      tells them to disable bucket versioning. Document and test a restore
+      procedure, resolve the contradiction, and add an undelete route or a
+      longer delete grace period. This item has no failing test: a temporary
+      test confirmed the behavior.
+
+## Nice-to-have
+
+- [ ] [nice-to-have · Verification] **Enable the CI triggers.**
+      `.github/workflows/test.yml` and `deploy.yml` run only on
+      `workflow_dispatch`, because their pull request, push, and schedule
+      triggers are commented out. The test suite, simulation campaigns,
+      rare-probe enforcement, and guided exploration run only if a developer
+      starts them.
+- [ ] [nice-to-have · Verification] **Add targeted simulation tests for all
+      rare probes.** Only 5 of the 28 probes in `Probe::RARE` have a targeted
+      test. `SIM_REQUIRE_PROBES` enforces the others only on the scheduled
+      campaign, which does not run.
+- [ ] [nice-to-have · Verification] **Verify event merge liveness and
+      part-internal invariants in simulation.** Check in the `events` workload
+      that part counts remain bounded and completed partitions settle into a
+      single part, and verify part sort order, granule statistics, bloom
+      filters, and path directories in `storage_check`.
+- [ ] [nice-to-have · Verification] **Run libFuzzer targets in CI** with a
+      persistent corpus, including the model-checked `http_txn` target.
+- [ ] [nice-to-have · Verification] **Derive simulation settlement timeouts
+      from fault parameters and separate liveness from safety failures.** Fixed
+      settlement timeouts can fail if a simulated store stall exceeds the wait
+      duration.
+- [ ] [nice-to-have · Unexplained simulator failure] **Find the cause of
+      `db_churn` seed 202681: `GET` returns `404 not_found` for an existing
+      database.** During database churn, a `get` operation returned
       `404 not_found` for a database that was created and not deleted
-      (`sim_tool trace db_churn 202681`).
-- [ ] **Fix `db_churn` timeouts if a node crash-loops under memory pressure.**
-      Under a small cache budget, a restarted node repeatedly re-reads the same
-      system segments before serving requests, and fault injection can crash the
-      node again before the workload finishes (`sim_tool trace db_churn 606688`).
-- [ ] **Fix stream reads that exceed the request deadline.** Requests are
-      canceled at `commit_timeout_ms`, so large stream reads can fail
-      repeatedly with `503 request deadline exceeded`
-      (`sim_tool trace streams 2601188`).
-- [ ] **Invalidate the cached manifest if an ambiguous `PUT` completes after a
-      refresh.** A manifest `PUT` that fails with `503 unavailable` can still
-      be applied in storage. If a commit retry refreshes the manifest before
-      that `PUT` completes, it observes the old version. The lease holder then
-      serves the old cached version while other nodes serve the new version.
-      Bypass the local lease for strong reads until all ambiguous `PUT`s from
-      the commit attempt are resolved.
-- [ ] **Invalidate the cached manifest immediately if a manifest `PUT` fails
-      with `412`.** A `412 Precondition Failed` response means another node
-      updated the manifest. The lease holder currently continues serving its
-      cached version until the commit retry reloads the manifest. Invalidate
-      the local lease as soon as `412` is received.
-- [ ] **Tolerate transient form errors in the `console` workload.** A password
-      change at `/console/account/password` can time out during storage stalls.
-      The workload currently treats any error redirect as a test failure
-      (`sim_tool trace console 24010902`).
-- [ ] **Fix `accounts` session failures after an account is disabled and
-      re-enabled.** A valid session can be rejected after its account is
-      disabled and re-enabled (`sim_tool trace accounts 9506242`).
-- [ ] **Run garbage collection sweeps even if the lease duration is short.** A
-      post-commit sweep skips execution if the lease expires while reading the
-      store clock and refreshing the manifest. This leaves the database unswept
-      until the next commit (`sim_tool trace blobs 5000231`).
-- [ ] **Schedule stream retention trims after ambiguous manifest writes.** The
-      committer schedules a retention trim only if a manifest `PUT` returns
-      success. If storage applies the `PUT` but returns an unknown outcome, the
-      node does not schedule a trim until the next commit or sweep. This leaves
-      expired records in an idle stream (`sim_tool trace streams 8100221`).
-- [ ] **Abort open interactive transactions if a database is deleted.**
-      Interactive transactions on a deleted database currently remain open
-      until their 30 s idle timeout expires. They consume memory and count
-      against the 100-transaction per-user limit during that time.
-- [ ] **Test Google OAuth against Google's production endpoints.** Only
-      `FakeGoogle` is tested in simulation. Refresh the cached JWKS if an ID
-      token contains an unknown `kid` instead of waiting for the 1-hour cache
-      TTL, and add PKCE (`code_verifier`) and an OIDC `nonce`.
-- [ ] **Prometheus metrics endpoint.** Expose `/metrics` in Prometheus text
-      format including the histograms from `/v1/admin/metrics`, object-store
-      byte counters, CAS conflicts, lease acquisitions and steals, cache hit
-      rates, open database handles, compaction and GC counters, forwarded
-      requests, and rate-limit rejections.
-- [ ] **Publish release binaries and a container image.** Build and publish
-      release binaries and a container image so external test suites can run
-      a local node in CI.
-- [ ] **Reschedule retention trims if the store clock is unknown.**
-      `trim_for_retention` returns early if the node lacks a store-clock
-      measurement, delaying retention trimming until the next append or sweep.
-- [ ] **Measure local lease duration from the manifest `PUT` start time.** The
-      committer currently starts its local lease timer at the beginning of the
-      commit attempt rather than at the start of the manifest `PUT`, subtracting
-      synchronous pre-`PUT` work (such as synchronous tail flushes) from the
-      local lease duration.
-- [ ] **Release database leases concurrently on shutdown.**
-      `Engine::release_leases` currently releases leases sequentially with a
-      2 s timeout per database.
-- [ ] **Await in-flight hedged manifest `PUT`s before returning an unknown
-      outcome.** If a hedged duplicate `PUT` fails with `412` while the primary
-      `PUT` is still in flight and retries are exhausted, awaiting the primary
-      `PUT` can resolve the commit outcome instead of returning
-      `outcome: "unknown"`.
-- [ ] **Prevent event deletes from conflicting with concurrent inserts.** An
-      event delete adds all unsealed rows and part references in its time range
-      to the transaction read set, causing serializable conflicts with
-      concurrent inserts and binds (`sim_tool trace events 2126696`). Evaluate
-      the delete filter against rows and part references added after the
-      snapshot inside the committer instead of tracking them in the read set.
-- [ ] **Execute large event deletes asynchronously.** An event delete reads all
-      candidate parts within its transaction and fails with `503` if those reads
-      exceed `commit_timeout_ms` (10 s). Run large deletes as background
-      operations that update part masks incrementally.
-- [ ] **Bound inline deletion masks on bound parts.** The committer stores masks
-      for rejected or duplicate bind slots inline regardless of size. Rewrite
-      parts in background maintenance if their inline mask exceeds
-      `event_mask_inline_bytes`.
-- [ ] **Decode rows directly into column vectors during part builds.** Seals and
-      bulk inserts decode each row into a `BTreeMap` before transposing columns,
-      causing a 32 MiB bulk insert of small events to peak at roughly 11x the
-      request body size (`crates/baserunna/tests/memory_bound.rs`).
-- [ ] **Read masked merge inputs in a single pass.** Before merging a part that
-      has deletions, `maint::census` reads its string and JSON columns to plan
-      output dictionaries and paths, and the merge then fetches the same blocks
-      a second time. Plan each output column during the merge pass instead.
-- [ ] **Estimate granule run memory from actual string lengths.**
-      `Run::run_rows` estimates string columns at 4 bytes per row (the
-      dictionary code width), even if a high-cardinality column is stored
-      without a dictionary. Use the column index byte length so concurrent reads
-      of high-cardinality string columns do not exceed their memory share and
-      fall back to serial re-reads.
-- [ ] **Account for object overhead in the segment block cache.**
-      `CacheVal::size` charges key and value bytes plus 48 bytes per entry,
-      undercounting small entries by roughly half of their heap allocation.
-- [ ] **Bound memory usage during part merges.** `merge_parts` holds the sort
-      key of every live input row in memory at once. Merge sorted runs block by
-      block instead.
-- [ ] **Enforce `event_max_bytes` on transactional event inserts.**
-      `event_max_bytes` is checked during bulk-insert binds (`Db::bind`), but
-      transactional inserts are sealed in the background without checking the
-      table cap. Count unsealed event bytes toward `event_max_bytes` at commit
-      time.
-- [ ] **Purge deleted events on idle databases and in unsealed segments.**
-      Unsealed events deleted before sealing remain in LSM segments until
-      compaction rewrites them, and part deletion purges only run after a
-      commit. Trigger periodic flushes, compactions, and event maintenance from
-      node housekeeping.
-- [ ] **Account for minimum part overhead during event inserts.** Sealing writes
-      at least 330 bytes per partition without checking the database quota, so
-      sparse inserts across many partitions can exceed the quota after sealing.
-      Charge the per-partition metadata overhead if an insert opens a partition.
-- [ ] **Charge event query memory to the node `MemoryGate`.** Event query state,
-      column batches, and lookup maps are bounded per query (`exec::Limits`),
-      but concurrent queries are not charged against the node's global
-      `memory_bytes` budget and `Node::query_slot` is not fair-shared across
+      (`sim_tool trace db_churn 202681`). The seed passes on the current tree
+      and the cause is unknown. If a delayed `DELETE` ran against the recreated
+      database, this item is a blocker.
+- [ ] [nice-to-have · Unexplained simulator failure] **Find the cause of
+      `accounts` session failures after an account is disabled and
+      re-enabled.** A valid session was rejected after its account was disabled
+      and re-enabled (`sim_tool trace accounts 9506242`). The seed passes on the
+      current tree and the cause is unknown. If a delayed duplicate disable ran
+      after the re-enable, this item is a blocker.
+- [ ] [nice-to-have · Duplicate requests] **Do not execute keyless writes
+      locally after a stale-target rejection.** If a node receives
+      `x-baserunna-stale-target`, it executes the request locally, assuming the
+      peer never executed it. If a proxy duplicated the forwarded request, an
+      earlier copy could have been executed by the peer's previous process
+      (`sim_tool trace tables 7344`). The node transport sends each forward
+      once, so this needs a retrying proxy between nodes. Execute locally only
+      if the request is a `GET` or has an idempotency key; otherwise return
+      `outcome: "unknown"`. State in `DEPLOYING.md` that proxies must not retry
+      peer traffic.
+- [ ] [nice-to-have · Duplicate requests] **Persist started interactive commits
+      across nodes and restarts.** Derive each transaction ID from its commit ID
+      so that any node can check the commit record in the manifest. A node
+      tracks started interactive commits only in memory. After a node restart,
+      or on a peer node, a duplicate request receives a retryable
+      `404 txn_not_found` and can cause the client to re-execute the
+      transaction. `baserunna-client` does not send duplicate commits, so this
+      needs a proxy that retries a delivered `POST`.
+- [ ] [nice-to-have · Duplicate requests] **Set `retryable: false` if `outcome`
+      is `"unknown"` and the write has no idempotency key.** A `503` response
+      with `outcome: "unknown"` sets `retryable: true`. The API docs and
+      `baserunna-client` resolve the outcome first, but a client that inspects
+      only `retryable` can apply a non-idempotent write twice.
+- [ ] [nice-to-have · Duplicate requests] **Reject `Idempotency-Key` on routes
+      that ignore it, and support it on `DELETE /v1/dbs/{db}/kv/{key}`.** Raw
+      key-value deletes and the row routes ignore the header without an error,
+      so `GET /commits/{id}` reports `not_committed` for a delete that was
+      applied.
+- [ ] [nice-to-have · Duplicate requests] **Display `outcome: "unknown"` in the
+      web console.** The console displays only the error message, so an
+      ambiguous write appears to have failed.
+- [ ] [nice-to-have · Event tables] **Prevent event deletes from conflicting
+      with concurrent inserts.** An event delete adds all unsealed rows of the
+      table and all part references in its time range to the transaction read
+      set, causing serializable conflicts with concurrent inserts and binds
+      (`sim_tool trace events 2126696`). Evaluate the delete filter against
+      rows and part references added after the snapshot inside the committer
+      instead of tracking them in the read set.
+- [ ] [nice-to-have · Event tables] **Execute large event deletes
+      asynchronously.** An event delete reads all candidate parts within its
+      transaction and fails with `503` if those reads exceed
+      `commit_timeout_ms` (10 s). Run large deletes as background operations
+      that update part masks incrementally.
+- [ ] [nice-to-have · Event tables] **Recheck table retention before committing
+      expired-part drops.** `drop_expired` commits its planned part drops
+      without verifying that `retention_ms` is unchanged. If maintenance seals
+      rows between the plan and the drop, a retention change that is
+      acknowledged in that window (10 ms to 40 ms in the test) does not protect
+      the expired parts: a strong query returned their rows after the change,
+      and a later query did not. Read the schema key inside the drop
+      transaction. Test:
+      `clearing_retention_during_a_sealing_maintenance_round_keeps_the_rows`
+      in `tests/event_schema_races.rs`.
+- [ ] [nice-to-have · Event tables] **Bound inline deletion masks on bound
+      parts.** The committer stores masks for rejected or duplicate bind slots
+      inline regardless of size. Rewrite parts in background maintenance if
+      their inline mask exceeds `event_mask_inline_bytes`.
+- [ ] [nice-to-have · Event tables] **Decode rows directly into column vectors
+      during part builds.** Seals and bulk inserts decode each row into a
+      `BTreeMap` before transposing columns, causing a 32 MiB bulk insert of
+      small events to peak at roughly 11x the request body size
+      (`crates/baserunna/tests/memory_bound.rs`). `build_cost` also
+      underestimates small rows by about 4x.
+- [ ] [nice-to-have · Event tables] **Enforce `event_max_bytes` on
+      transactional event inserts.** `event_max_bytes` is checked during
+      bulk-insert binds (`Db::bind`), but transactional inserts are sealed in
+      the background without checking the table cap. Count unsealed event bytes
+      toward `event_max_bytes` at commit time.
+- [ ] [nice-to-have · Event tables] **Account for minimum part overhead during
+      event inserts.** Sealing writes at least 330 bytes per partition without
+      checking the database quota, so sparse inserts across many partitions can
+      exceed the quota after sealing. Charge the per-partition metadata overhead
+      if an insert opens a partition.
+- [ ] [nice-to-have · Event tables] **Check the 4 GiB query read limit during
+      in-flight part reads.** The read byte limit is only checked after each
+      part finishes, allowing up to `event_read_concurrency` concurrent part
+      reads to overshoot the limit.
+- [ ] [nice-to-have · Event tables] **Retry snapshot event queries only on
+      missing table or column errors.** `api::events::query` retries any `400`
+      or `404` failure at strong consistency, which executes invalid queries
+      twice.
+- [ ] [nice-to-have · Event tables] **Refresh the database name cache on `404`
+      during strong event queries.** Event queries resolve the database name
+      using a 5 s cached snapshot even if `consistency` is `strong`, causing a
+      strong query to fail once with `404` if the database was recently
+      recreated on another node.
+- [ ] [nice-to-have · Event tables] **Parse shared JSON buckets once per row
+      during merges.** While merging a part with a partial path directory,
+      `Feed::SharedPath` reparses the shared bucket JSON once per output path
+      instead of once per row.
+- [ ] [nice-to-have · Event tables] **Move event query block decoding and
+      aggregation off Tokio worker threads.** Execute CPU-bound granule
+      decoding and aggregation on a dedicated thread pool bounded by
+      `query_concurrency` so large queries do not stall async workers.
+- [ ] [nice-to-have · Event tables] **Cache event parts in the local disk cache
+      tier.** Event parts are currently cached only in memory, so node restarts
+      and working sets larger than RAM must re-fetch parts from object storage.
+- [ ] [nice-to-have · Event tables] **Expose environment variables for event
+      query and bulk insert limits.** Add `BASERUNNA_*` environment variables
+      for `query_limits`, `query_concurrency`, `event_max_bytes`, and bulk
+      insert buffer settings in `NodeConfig`.
+- [ ] [nice-to-have · Event tables] **Support filtering whole JSON columns and
+      reading nested JSON objects by path.** Event parts store only leaf JSON
+      paths, so filtering on a root JSON column is rejected
+      (`exec::Binder::filter`) and querying a non-leaf path returns `null`
+      (`json::leaf`). Support `exists` on root JSON columns and reconstruct
+      nested objects from their leaf paths.
+- [ ] [nice-to-have · Idle databases] **Run maintenance on idle databases from
+      node housekeeping.** Stream retention trims, event retention drops, event
+      merges, and purges of deleted events run only after a commit or a sweep
+      on an active database. An idle database keeps expired stream records,
+      expired event partitions, and deleted events in storage. Trigger periodic
+      flushes, compactions, retention trims, and event maintenance from node
+      housekeeping. This also covers trims that are skipped after an ambiguous
+      manifest write (`sim_tool trace streams 8100221`) or while the store
+      clock is unknown.
+- [ ] [nice-to-have · Store fault detection] **Detect sequence gaps during
+      stream reads.** Verify that record sequence numbers are contiguous during
+      `stream::read`. If the store returns another chunk of the same byte size
+      and record count, a read returns the wrong records without an error.
+      Test: `substituted_stream_chunk_of_equal_shape_is_detected` in
+      `tests/store_integrity.rs`.
+- [ ] [nice-to-have · Store fault detection] **Bind every stored object to
+      its key.** Write the object ID into each CRC-protected footer and verify
+      it during decoding. Readers verify byte size and entry count against the
+      manifest, which accepts a substituted object of equal size and entry
+      count. This applies to segments, stream chunks, event parts (equal row
+      count), and deletion masks (equal deleted count). After a segment
+      substitution, compaction commits the wrong data and the original keys
+      are lost. Tests: the `substituted_*` tests in `tests/store_integrity.rs`.
+- [ ] [nice-to-have · Store fault detection] **Check ranged block reads against
+      the block index.** A segment block fetched by byte range is not checked
+      against its index entry. If the store returns another block of equal
+      length, the block passes its own CRC and a point read returns "not
+      found" for a key that exists. Test:
+      `segment_block_served_from_wrong_offset_is_detected` in
+      `tests/store_integrity.rs`.
+- [ ] [nice-to-have · Store dependencies] **Detect manifest rollbacks.** A node
+      that has no cached manifest accepts any valid older manifest from the
+      store, commits on top of it, and collects the newer segments as orphans.
+      A store that breaks its contract, an operator restore from an object
+      version, or a failover to a lagging replica can cause a rollback. A
+      minimum manifest version in the system database would reject a rolled-back
+      manifest, but updating it on every commit would add a `PUT` per commit.
+- [ ] [nice-to-have · Store dependencies] **Check store clock coherence in the
+      startup preflight.** Garbage collection depends on a coherent store clock
+      (SPEC §15), but the preflight runs only the conditional-write checks.
+- [ ] [nice-to-have · Store dependencies] **Validate additional S3-compatible
+      object stores.** Run the conformance suite and failover check against AWS
+      S3, Cloudflare R2, MinIO, and Google Cloud Storage. Azure Blob Storage
+      needs a new store backend, because `CloudStore` accepts only `s3://`.
+- [ ] [nice-to-have · Operations] **Prometheus metrics endpoint.** Expose
+      `/metrics` in Prometheus text format including the histograms from
+      `/v1/admin/metrics`, object-store byte counters, CAS conflicts, lease
+      acquisitions and steals, cache hit rates, open database handles,
+      compaction and GC counters, forwarded requests, and rate-limit
+      rejections.
+- [ ] [nice-to-have · Operations] **Publish release binaries and a container
+      image.** Build and publish release binaries and a container image so
+      external test suites can run a local node in CI.
+- [ ] [nice-to-have · Operations] **Release database leases concurrently on
+      shutdown.** `Engine::release_leases` currently releases leases
+      sequentially with a 2 s timeout per database, so a node with many leased
+      databases can exceed the shutdown grace period.
+- [ ] [nice-to-have · Operations] **Retry startup preflight checks during store
+      outages.** Retry the conditional-write preflight check with exponential
+      backoff before exiting. If the object store is unreachable at startup,
+      the preflight check fails immediately and the process exits.
+- [ ] [nice-to-have · Operations] **Await in-flight hedged manifest `PUT`s
+      before returning an unknown outcome.** If a hedged duplicate `PUT` fails
+      with `412` while the primary `PUT` is still in flight and retries are
+      exhausted, awaiting the primary `PUT` can resolve the commit outcome
+      instead of returning `outcome: "unknown"`.
+- [ ] [nice-to-have · Operations] **Account for object overhead in the segment
+      block cache.** `CacheVal::size` charges key and value bytes plus 48 bytes
+      per entry, undercounting small entries by roughly half of their heap
+      allocation.
+- [ ] [nice-to-have · Operations] **Direct SMTP delivery and durable mail
+      queue.** Support SMTP in addition to the HTTP mail webhook, and persist
+      outbound mail so node restarts do not drop pending messages.
+- [ ] [nice-to-have · Accounts] **Harden Google OAuth and test it against
+      Google's production endpoints.** Only `FakeGoogle` is tested in
+      simulation. Refresh the cached JWKS if an ID token contains an unknown
+      `kid` instead of waiting for the 1-hour cache TTL, and add PKCE
+      (`code_verifier`) and an OIDC `nonce`.
+- [ ] [nice-to-have · Accounts] **Clear cached logins on all nodes if a user is
+      disabled.** Disabling a user clears cached credentials only on the node
+      that ran the command. Other nodes accept the user's credentials for up to
+      `auth_cache_ms` (30 s).
+- [ ] [nice-to-have · Accounts] **Organization access controls.** Add
+      per-database role grants within an organization, organization-owned
+      service accounts (API keys), and email invitations for unregistered
       users.
-- [ ] **Stream `/txn` request bodies and charge bulk insert buffers to
-      `MemoryGate`.** Transaction requests parse the full JSON body into memory
-      before checking `INSERT_MAX_ROWS`, and bulk insert buffers are not charged
-      against the node memory budget.
-- [ ] **Recheck table retention before committing expired-part drops.**
-      `drop_expired` commits its planned part drops without verifying that
-      `retention_ms` is unchanged, so clearing retention while a drop is in
-      flight still deletes the parts.
-- [ ] **Check the 4 GiB query read limit during in-flight part reads.** The read
-      byte limit is only checked after each part finishes, allowing up to
-      `event_read_concurrency` concurrent part reads to overshoot the limit.
-- [ ] **Retry snapshot event queries only on missing table or column errors.**
-      `api::events::query` retries any `400` or `404` failure at strong
-      consistency, which executes invalid queries twice.
-- [ ] **Acquire a query slot and extend deadlines for transactional
-      `query_events` ops.** Unlike the `/rows/query` endpoint, `query_events`
-      inside a transaction does not acquire a `Node::query_slot` permit or
-      extend the request deadline.
-- [ ] **Encode `StagedPart::slot_rows` sparsely and limit partitions per bulk
-      insert.** Each `StagedPart` stores a `Runs` entry for every slot in the
-      bind batch, scaling bind encoding size with `slots * parts`, and a single
-      bulk insert can span an unbounded number of partitions.
-- [ ] **Skip referenced parts during orphan sweep installation.** If a bind
-      commit is delayed past `4 * clock_sync_max_error_ms`, a concurrent sweep
-      can mark its staged parts as obsolete. Filter out parts that are
-      referenced in the manifest at sweep install time.
-- [ ] **Reject binds if a target column was dropped after validation.**
-      `Db::bind` checks that the table still exists, but if a column is dropped
-      and re-added while a bulk insert is buffered, rows are bound under the old
-      column ID. Include column IDs in `Bind` and return a retryable conflict if
-      any column was dropped.
-- [ ] **Refresh the database name cache on `404` during strong event queries.**
-      Event queries resolve the database name using a 5 s cached snapshot even
-      if `consistency` is `strong`, causing a strong query to fail once with
-      `404` if the database was recently recreated on another node.
-- [ ] **Parse shared JSON buckets once per row during merges.** While merging a
-      part with a partial path directory, `Feed::SharedPath` reparses the shared
-      bucket JSON once per output path instead of once per row.
+- [ ] [nice-to-have · Accounts] **Database rename and ownership transfer**
+      between users and organizations.
+- [ ] [nice-to-have · Data recovery] **Point-in-time restore, clone, and
+      export.** Retain historical manifests and delay GC of referenced
+      segments. Add database snapshot/clone via manifest copy-on-write and
+      export/import.
+- [ ] [nice-to-have · Data recovery] **Require an explicit flag for full
+      deletes in `where` and `delete_range`.** An empty `where` selector
+      deletes all rows of a table, and an empty `prefix` in `delete_range`
+      deletes every key in the key-value keyspace. Both behaviors are
+      documented. Require an explicit full-delete flag so that an accidentally
+      empty selector is rejected.
+- [ ] [nice-to-have · Streams] **Fix stream reads that exceed the request
+      deadline.** Requests are canceled at `commit_timeout_ms`, so a cold
+      filtered stream read on a slow store can fail repeatedly with
+      `503 request deadline exceeded` (`sim_tool trace streams 2601188`).
+- [ ] [nice-to-have · Streams] **Pin the lower bound of a reverse `read_stream`
+      that uses `tail`.** On each page of a reverse read with `tail`, the
+      server recomputes the lower bound from the end of the stream. If records
+      are appended between pages, the oldest records of the original window are
+      omitted. On the first page, have `Op::next_page` replace `tail` with
+      `from_seq`.
+- [ ] [nice-to-have · Streams] **Stream consumer groups and storage
+      optimizations.** Add consumer groups with record acknowledgements and
+      redelivery, multi-chunk read-ahead for cold sequential reads, per-block
+      field summaries for filter pruning, and small-chunk compaction.
+- [ ] [nice-to-have · Cluster] **Deliver commit notices across membership
+      transitions.** If nodes have different cached views of live cluster
+      members, a long-poll request can be routed to a rendezvous home node that
+      does not receive commit notices. The waiter then falls back to polling
+      the manifest every `watch_poll_ms`. Views can differ for up to
+      `members_refresh_ms` (30 s) after a node joins.
+- [ ] [nice-to-have · Cluster] **Route interactive transaction requests to the
+      node that holds the transaction.** The node that begins an interactive
+      transaction stores it in memory. Receiving nodes route follow-up requests
+      using their cached membership view. If membership views differ across
+      nodes, a request can be routed to a different node and fail with
+      `txn_not_found`. Encode the owning node ID in the transaction ID. Route
+      follow-up requests directly to that node.
+- [ ] [nice-to-have · Client] **Preserve the failure reason if an interactive
+      commit is retried.** The commit handler removes the transaction from
+      memory before committing. If the commit fails with a retryable error such
+      as `503`, a client retry receives `404 txn_not_found` without the original
+      failure reason. Stop `baserunna-client` from retrying `CommitTxn` after a
+      not-applied failure, and correct the comment in `txn.rs` that says the
+      transaction remains open.
+- [ ] [nice-to-have · Client] **Add the remaining transaction operations and
+      options to `baserunna_client::Op`.** Add `stream_info`, `get_consumer`,
+      event-table operations, `ttl_ms` on writes, `expect_seq` on `append`, and
+      value checks on `check`.
+- [ ] [nice-to-have · Client] **Return operation results from `Db::write` and
+      `Txn::commit`.** Both methods currently discard the per-operation results
+      returned by the server, such as the new value from `increment` or the row
+      count from `delete_rows`.
+- [ ] [nice-to-have · Client] **Client SDKs.** Generate TypeScript and Python
+      clients from `openapi.json`.
+- [ ] [nice-to-have · Queries] **Query projections, ordering, and aggregates.**
+      Support server-side projections, ordering by non-indexed columns, and
+      aggregates (`count`, `sum`).
+- [ ] [nice-to-have · Queries] **Use exact numeric comparisons for row-table
+      float columns.** Row-table filters convert integer filter arguments to
+      `f64` (`table::filter_arg`) and reject integers that are not exactly
+      representable as `f64`. Index `eq` and `range` arguments on float columns
+      round such integers without an error (`key_from_json`). Compare `f64`
+      columns against integer arguments using exact numeric ordering as event
+      tables do.
+- [ ] [nice-to-have · Queries] **Configurable change feed retention and SSE.**
+      Change feed cursors are currently valid for `txn_max_lifetime_ms` (5
+      minutes), matching tombstone retention. Per-database retention settings
+      would allow consumers to resume after longer outages, and SSE streaming
+      would avoid repeated long polls.
 
-## Storage integrity
+## Tangential
 
-[`REPORT.md`](REPORT.md) documents these storage-integrity gaps. A compliant S3
-store prevents them. A store that violates its contract can cause silent data
-corruption through any of them.
-
-- [ ] **Verify blob chunks on read.** Store a CRC32C for each blob chunk, and
-      verify `BlobRef.sha256` at the end of a full read. `blob::read_chunk`
-      checks only the chunk byte length, and full blob reads skip SHA-256
-      verification. If the store flips a bit or returns a different chunk under
-      the requested key, the node returns corrupt blob bytes to the client.
-- [ ] **Detect sequence gaps during stream reads.** Verify that record sequence
-      numbers are contiguous during `stream::read`. If the store replaces a
-      sealed stream chunk with another chunk of the same stream and byte size,
-      reads skip the replaced records silently.
-- [ ] **Add a checksum to blob metadata objects.** Include a CRC32C in each
-      staged blob metadata object and verify it in `load_staged`. `load_staged`
-      checks only the blob ID. If the store flips a bit in `size` or `sha256`,
-      the commit binds the corrupted metadata into the LSM tree.
-- [ ] **Bind every stored object to its key.** Write the object ID into each
-      CRC-protected footer and verify it during decoding. Readers verify that a
-      segment's byte size and entry count match its manifest entry, which still
-      accepts a substituted segment of equal size and entry count. Stream
-      chunks and local disk-cache files lack key checks altogether.
-- [ ] **Detect manifest rollbacks.** Store a minimum manifest version in the
-      system database to reject rolled-back manifests. Without a minimum
-      version, a node that has no cached manifest accepts any valid older
-      manifest from the store, commits on top of it, and collects the newer
-      segments as orphans.
-- [ ] **Surface permanent segment corruption in metrics and error logs.**
-      Increment an error counter in `/v1/admin/metrics` and log at `error`
-      level if a segment fails CRC verification. Compaction and garbage
-      collection otherwise fail repeatedly and log only at `debug` level.
-
-## Ambiguous outcomes
-
-- [ ] **Persist started interactive commits across nodes and restarts.** Derive
-      each transaction ID from its commit ID so that any node can check the
-      commit record in the manifest. A node tracks started interactive commits
-      only in memory. After a node restart, or on a peer node, a duplicate
-      request receives a retryable `404 txn_not_found` and can cause the client
-      to re-execute the transaction.
-- [ ] **Set `retryable: false` if `outcome` is `"unknown"`.** A `503` response
-      with `outcome: "unknown"` sets `retryable: true`. `baserunna-client`
-      checks `outcome` before retrying, but a client that inspects only
-      `retryable` can apply a non-idempotent write twice.
-- [ ] **Track ambiguity per commit on batch-abort paths.** Return definite
-      errors for commits that were not sent in an ambiguous manifest `PUT`. If
-      the committer aborts a batch after an ambiguous `PUT`, it marks every
-      commit in the batch as `outcome: "unknown"`, including commits that
-      joined the batch after the ambiguous `PUT`.
-- [ ] **Clear unsent interactive commits with a drop guard.** Return a guard
-      from `take_for_commit` that removes the `started_commits` entry on drop
-      unless the commit was sent. `commit_txn` calls `forget_started_commit` on
-      each error path, so if a client disconnects while `exec_ops` is running,
-      the entry remains in `started_commits`.
-- [ ] **Retry startup preflight checks during store outages.** Retry the
-      conditional-write preflight check with exponential backoff before
-      exiting. If the object store is unreachable at startup, the preflight
-      check fails immediately and the process exits.
-- [ ] **Display `outcome: "unknown"` in the web console.** The console displays
-      only the error message, so an ambiguous write appears to have failed.
-- [ ] **Return `200` if a retried database deletion completes cleanup.** A
-      retried `DELETE /v1/dbs/{db}` that finishes an interrupted database
-      deletion returns `404 not_found` even though the request completed the
-      deletion.
-
-## Performance
-
-- [ ] **Move event query block decoding and aggregation off Tokio worker
-      threads.** Execute CPU-bound granule decoding and aggregation on a
-      dedicated thread pool bounded by `query_concurrency` so large queries do
-      not stall async workers.
-- [ ] **Distribute event part reads across cluster nodes.** Route part reads to
-      peers by rendezvous hashing to utilize cluster-wide memory caches and CPU,
-      then merge partial aggregate states on the entry node.
-- [ ] **Cache event query lookup maps across queries.** Queries currently
-      rebuild lookup maps by scanning the target table on every execution. Cache
-      lookup maps by table version and update them from the table change feed.
-- [ ] **Cache event parts in the local disk cache tier.** Event parts are
-      currently cached only in memory, so node restarts and working sets larger
-      than RAM must re-fetch parts from object storage.
-- [ ] **Offload event part merges from the lease holder.** Background part
-      merges currently run on the database lease holder and contend with commit
-      batches for CPU and network bandwidth.
-- [ ] **Immediately delete output segments of rejected compactions.** Rejected
-      compactions currently leave their output segments for the orphan sweep to
-      delete after `orphan_grace_ms` (2 hours).
-- [ ] **Flush idle database tails to reduce next-commit manifest size.**
-      Flushing a non-empty tail after a database becomes idle reduces the size
-      of the next manifest `PUT` at the cost of an extra segment `PUT`.
-- [ ] **Box `BlobRef` in `Value` to reduce in-memory tail entry size.** `Entry`
-      currently occupies 144 bytes on the stack because `Value` stores
-      `BlobRef` inline. Boxing `BlobRef` shrinks `Entry` to 96 bytes and
-      reduces memory usage for tails with small inline values by 20–35%.
-- [ ] **Keep the manifest tail as a sorted vector across a batch.** Commit
-      batches currently move the manifest tail into a `BTreeMap` and back into
-      a `Vec` on every commit. Merging sorted batch writes into the sorted tail
-      vector makes CPU cost proportional to batch size instead of tail size.
-- [ ] **Suppress commit notices if the home node has 0 waiters.** If the lease
-      holder is not the database's rendezvous home, it sends a commit notice to
-      the home node on every commit batch even if 0 requests are waiting there.
-      Have the home node indicate in its response whether any requests are
-      waiting so the lease holder can pause notices for a bounded interval,
-      during which new waiters on the home node poll the manifest every
-      `watch_poll_ms`.
-
-## Features
-
-- [ ] **Event table rollups and projections.** Allow event tables to declare
-      pre-aggregated rollups or alternate sort orders maintained automatically
-      during seals and merges.
-- [ ] **Expose environment variables for event query and bulk insert limits.**
-      Add `BASERUNNA_*` environment variables for `query_limits`,
-      `query_concurrency`, and bulk insert buffer settings in `NodeConfig`.
-- [ ] **Run event retention and merges on idle databases.** Event maintenance
-      is currently triggered only by a commit or sweep on an active database,
-      leaving expired partitions in storage if a database is idle.
-- [ ] **Point-in-time restore and backups.** Retain historical manifests and
-      delay GC of referenced segments. Add database snapshot/clone via
-      manifest copy-on-write and export/import.
-- [ ] **Database rename and ownership transfer** between users and
-      organizations.
-- [ ] **Organization access controls.** Add per-database role grants within an
-      organization, organization-owned service accounts (API keys), and email
-      invitations for unregistered users.
-- [ ] **Direct SMTP delivery and durable mail queue.** Support SMTP in addition
-      to the HTTP mail webhook, and persist outbound mail so node restarts do
-      not drop pending messages.
-- [ ] **Query projections, ordering, and aggregates.** Support server-side
-      projections, ordering by non-indexed columns, and aggregates (`count`,
-      `sum`).
-- [ ] **Configurable change feed retention and SSE.** Change feed cursors are
-      currently valid for `txn_max_lifetime_ms` (5 minutes), matching tombstone
-      retention. Per-database retention settings would allow consumers to
-      resume after longer outages, and SSE streaming would avoid repeated long
-      polls.
-- [ ] **Stream consumer groups and storage optimizations.** Add consumer
-      groups with record acknowledgements and redelivery, multi-chunk
-      read-ahead for cold sequential reads, per-block field summaries for
-      filter pruning, small-chunk compaction, and background retention trimming
-      for idle databases.
-- [ ] **Generate `openapi.json` from the API types.** Move all route request and
-      response types into `baserunna-api`, derive JSON Schema for them, and
-      generate `openapi.json` from the `Endpoint` definitions instead of
-      maintaining `api/openapi.rs` by hand.
-- [ ] **Add the remaining transaction operations and options to
-      `baserunna_client::Op`.** Add `stream_info`, `get_consumer`, event-table
-      operations, `ttl_ms` on writes, `expect_seq` on `append`, and value
-      checks on `check`.
-- [ ] **Return operation results from `Db::write` and `Txn::commit`.** Both
-      methods currently discard the per-operation results returned by the
-      server, such as the new value from `increment` or the row count from
-      `delete_rows`.
-- [ ] **Add typed request, response, and filter definitions for the remaining
-      routes in `baserunna-api`.** Several routes and sub-schemas still use
-      untyped JSON on the server, including `filter` expressions, `query_events`
-      results, and routes not yet used by `baserunna-client`.
-- [ ] **Client SDKs.** Generate TypeScript and Python clients from
-      `openapi.json`.
-- [ ] **Validate additional S3-compatible object stores.** Run the conformance
-      suite and failover check against AWS S3, Cloudflare R2, MinIO, Azure Blob
-      Storage, and Google Cloud Storage.
-- [ ] **Support `Idempotency-Key` on `DELETE /v1/dbs/{db}/kv/{key}`.** Accept
-      an idempotency key on raw key-value deletes so that clients can resolve
-      ambiguous delete outcomes via `GET /commits/{id}`.
-- [ ] **Support filtering whole JSON columns and reading nested JSON objects by
-      path.** Event parts store only leaf JSON paths, so filtering on a root
-      JSON column is rejected (`exec::Binder::filter`) and querying a non-leaf
-      path returns `null` (`json::leaf`). Support `exists` on root JSON columns
-      and reconstruct nested objects from their leaf paths.
-- [ ] **Use exact numeric comparisons for row-table float filters.** Row-table
-      filters convert integer filter arguments to `f64` (`table::filter_arg`)
-      and reject integers that are not exactly representable as `f64`. Compare
-      `f64` columns against integer arguments using exact numeric ordering as
-      event tables do.
-
-## Testing
-
-- [ ] **Regenerate stale bug zoo patches.** Update patches 09, 11, 16, and 18 so
-      they apply to the current tree.
-- [ ] **Verify event merge liveness and part-internal invariants in
-      simulation.** Check in the `events` workload that part counts remain
-      bounded and completed partitions settle into a single part, and verify
-      part sort order, granule statistics, bloom filters, and path directories
-      in `storage_check`.
-- [ ] **Run an extended multi-thousand-seed `sim_events` campaign** with larger
-      tables and node counts.
-- [ ] **Deliver commit notices across membership transitions.** If nodes have
-      different cached views of live cluster members, a long-poll request can be
-      routed to a rendezvous home node that does not receive commit notices.
-      Peers can hold different membership views before all peers refresh after a
-      node joins. Send commit notices to the home nodes of both previous and
-      current membership views.
-- [ ] **Route interactive transaction requests to the node that holds the
-      transaction.** The node that begins an interactive transaction stores it
-      in memory. Receiving nodes route follow-up requests using their cached
-      membership view. If membership views differ across nodes, a request can
-      be routed to a different node and fail with `txn_not_found`. Encode the
-      owning node ID in the transaction ID. Route follow-up requests directly
-      to that node.
-- [ ] **Abort interactive transactions whose `begin` response is lost.** The
-      server assigns the transaction ID in the `begin` response. If that
-      response is lost after the server opens the transaction, the client
-      cannot abort it. The transaction then occupies a per-user slot until its
-      idle timeout expires.
-- [ ] **Preserve the failure reason if an interactive commit is retried.** The
-      commit handler removes the transaction from memory before committing. If
-      the commit fails with a retryable error such as `503`, a client retry
-      receives `404 txn_not_found` without the original failure reason. Record
-      the failure reason in the node's abort log so that retries report the
-      cause.
-- [ ] **Reject write operations in `baserunna_client::Db::read`.** `Db::read`
-      omits the idempotency key, so write operations passed to it can be
-      applied more than once on retry.
-- [ ] **Add an `Unknown` fallback variant to `baserunna_api::Role`.** Adding
-      `#[serde(other)]` lets `baserunna-client` deserialize `Me` and `Member`
-      responses from newer servers that define additional roles.
-- [ ] **Pin the lower bound of a reverse `read_stream` that uses `tail`.** On
-      each page of a reverse read with `tail`, the server recomputes the lower
-      bound from the end of the stream. If records are appended between pages,
-      `Op::next_page` shifts the range.
-- [ ] **Reject empty selectors in `where`, `query_rows`, and `delete_range` on
-      the server.** The server currently treats an empty `where` or
-      `query_rows` selector as a full-table scan or delete. It also treats an
-      empty `prefix` in `delete_range` as a full-database delete. Require an
-      explicit full-scan flag so that an accidentally empty prefix is
-      rejected.
-- [ ] **Update the `events` fuzz target for the current `PartRef` fields.**
-      `fuzz/fuzz_targets/events.rs` still references the removed
-      `min_version` and `max_version` fields on `PartRef`.
-- [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the
-      model-checked `http_txn` target, and fuzz `PartMeta::decode` and
-      `ColIndex::decode` on unframed byte slices instead of CRC-framed inputs.
-- [ ] **Run mutation testing in CI**, running `scripts/mutants.sh --in-diff` on
-      pull requests and the full suite weekly.
-- [ ] **Track cost and throughput benchmarks in CI** across commits.
-- [ ] **Derive simulation settlement timeouts from fault parameters and
-      separate liveness from safety failures.** Fixed settlement timeouts can
-      fail if a simulated store stall exceeds the wait duration.
-- [ ] **Add targeted simulation tests for all rare probes.** Ensure every probe
-      in `Probe::RARE` is reached in CI.
-- [ ] **Log scenario-overridden knob values in simulation traces.** Scenarios
-      that override swarm configuration after generation currently log the
-      pre-override values.
-- [ ] **Improve guided exploration breadth.** At equal run counts, guided
-      exploration reaches rare probes more frequently than a random campaign
-      but covers fewer distinct features (SPEC §13.4), and failures cluster in
-      a small number of seeds. Deduplicating failures by normalized message,
-      weighting corpus entries by novelty, and incorporating probe-ordering
-      and buggify-site features would preserve depth while improving breadth.
-
-- [ ] **Rebase stale bug-zoo patches onto `main`.** Update
-      `09-stale-names-after-purge`, `11-duplicated-forwards`, and
-      `16-duplicated-forwards-across-restart` so that they can be applied to
-      `main`.
-
-## API
-
-- [ ] **Unify internal request forwarding retry loops.** Consolidate the retry
-      and lease-refresh logic shared by `Node::bind_events`,
-      `Node::forward_internal`, and `Node::meta`.
-
-## Docs
-
-- [ ] **Replace remaining wide tables in `SPEC.md`.** The tables in §8 (system
-      database), §9 (organization roles), §10 (error codes), and §12
+- [ ] [tangential · Simulator] **Fix `db_churn` timeouts if a node crash-loops
+      under memory pressure.** Under a small cache budget, a restarted node
+      repeatedly re-reads the same system segments before serving requests, and
+      fault injection can crash the node again before the workload finishes
+      (`sim_tool trace db_churn 606688`). The seed uses 2 KiB segments and a 4
+      KiB disk cache; the default settings load the system database in a few
+      requests.
+- [ ] [tangential · Simulator] **Tolerate transient form errors in the
+      `console` workload.** A password change at `/console/account/password`
+      can time out during storage stalls. The workload currently treats any
+      error redirect as a test failure (`sim_tool trace console 24010902`).
+- [ ] [tangential · Simulator] **Run garbage collection sweeps even if the
+      lease duration is short.** A post-commit sweep skips execution if the
+      lease expires while reading the store clock and refreshing the manifest.
+      This leaves the database unswept until the next commit
+      (`sim_tool trace blobs 5000231`). The skip needs a simulator-sized lease
+      or a long store stall.
+- [ ] [tangential · Simulator] **Log scenario-overridden knob values in
+      simulation traces.** Scenarios that override swarm configuration after
+      generation currently log the pre-override values.
+- [ ] [tangential · Simulator] **Improve guided exploration breadth.** No
+      measurement in the repository compares guided exploration with a random
+      campaign. Measure it with `SIM_COMPARE` first. Deduplicating failures by
+      normalized message, weighting corpus entries by novelty, and
+      incorporating probe-ordering and buggify-site features are candidate
+      improvements.
+- [ ] [tangential · Simulator] **Run an extended multi-thousand-seed
+      `sim_events` campaign** with larger tables and node counts.
+- [ ] [tangential · Test infrastructure] **Regenerate stale bug zoo patches.**
+      Patches 08, 09, 11, 13, 16, 17, 18, 22, 24, and 25 do not apply to the
+      current tree. Update them, and correct the statement in
+      `bugzoo/README.md` that all patches apply.
+- [ ] [tangential · Test infrastructure] **Update the `events` fuzz target for
+      the current `PartRef` fields.** `fuzz/fuzz_targets/events.rs` still
+      references the removed `min_version` and `max_version` fields on
+      `PartRef` and lacks `min_pos`, `max_pos`, and `masked_ms`.
+- [ ] [tangential · Test infrastructure] **Run mutation testing in CI**,
+      running `scripts/mutants.sh --in-diff` on pull requests and the full
+      suite weekly.
+- [ ] [tangential · Test infrastructure] **Track throughput benchmarks in CI**
+      across commits. `tests/cost.rs` already enforces request cost budgets.
+- [ ] [tangential · Transactions] **Abort open interactive transactions if a
+      database is deleted.** Interactive transactions on a deleted database
+      currently remain open until their 30 s idle timeout expires. They count
+      against the 100-transaction per-user limit during that time.
+- [ ] [tangential · Transactions] **Abort interactive transactions whose
+      `begin` response is lost.** The server assigns the transaction ID in the
+      `begin` response. If that response is lost after the server opens the
+      transaction, the client cannot abort it. The transaction then occupies a
+      per-user slot until its 30 s idle timeout expires.
+- [ ] [tangential · Transactions] **Clear unsent interactive commits with a
+      drop guard.** Return a guard from `take_for_commit` that removes the
+      `started_commits` entry on drop unless the commit was sent. `commit_txn`
+      calls `forget_started_commit` on each error path, so if a client
+      disconnects while `exec_ops` is running, the entry remains in
+      `started_commits` for up to 5 minutes.
+- [ ] [tangential · Transactions] **Track ambiguity per commit on batch-abort
+      paths.** Return definite errors for commits that were not sent in an
+      ambiguous manifest `PUT`. If the committer aborts a batch through
+      `fail_batch` after an ambiguous `PUT`, it marks every undecided commit in
+      the batch as `outcome: "unknown"`.
+- [ ] [tangential · API] **Return `200` if a retried database deletion
+      completes cleanup.** A retried `DELETE /v1/dbs/{db}` that finishes an
+      interrupted database deletion returns `404 not_found` even though the
+      request completed the deletion.
+- [ ] [tangential · API] **Add an `Unknown` fallback variant to
+      `baserunna_api::Role`.** Adding `#[serde(other)]` lets `baserunna-client`
+      deserialize `Me` and `Member` responses from newer servers that define
+      additional roles.
+- [ ] [tangential · API] **Generate `openapi.json` from the API types.** Move
+      all route request and response types into `baserunna-api`, derive JSON
+      Schema for them, and generate `openapi.json` from the `Endpoint`
+      definitions instead of maintaining `api/openapi.rs` by hand.
+- [ ] [tangential · API] **Add typed request, response, and filter definitions
+      for the remaining routes in `baserunna-api`.** Several routes and
+      sub-schemas still use untyped JSON on the server, including `filter`
+      expressions, `query_events` results, and routes not yet used by
+      `baserunna-client`.
+- [ ] [tangential · Refactor] **Unify internal request forwarding retry
+      loops.** Consolidate the retry and lease-refresh logic shared by
+      `Node::bind_events`, `Node::forward_internal`, and `Node::meta`.
+- [ ] [tangential · Optimization] **Measure local lease duration from the
+      manifest `PUT` start time.** The committer currently starts its local
+      lease timer at the beginning of the commit attempt rather than at the
+      start of the manifest `PUT`, subtracting synchronous pre-`PUT` work (such
+      as synchronous tail flushes) from the local lease duration.
+- [ ] [tangential · Optimization] **Read masked merge inputs in a single
+      pass.** Before merging a part that has deletions, `maint::census` reads
+      its string and JSON columns to plan output dictionaries and paths, and
+      the merge then fetches the same blocks a second time. Plan each output
+      column during the merge pass instead.
+- [ ] [tangential · Optimization] **Distribute event part reads across cluster
+      nodes.** Route part reads to peers by rendezvous hashing to utilize
+      cluster-wide memory caches and CPU, then merge partial aggregate states
+      on the entry node.
+- [ ] [tangential · Optimization] **Cache event query lookup maps across
+      queries.** Queries currently rebuild lookup maps by scanning the target
+      table on every execution. Cache lookup maps by table version and update
+      them from the table change feed.
+- [ ] [tangential · Optimization] **Offload event part merges from the lease
+      holder.** Background part merges currently run on the database lease
+      holder and contend with commit batches for CPU and network bandwidth.
+- [ ] [tangential · Optimization] **Immediately delete output segments of
+      rejected compactions.** Rejected compactions currently leave their output
+      segments for the orphan sweep to delete after `orphan_grace_ms` (2
+      hours).
+- [ ] [tangential · Optimization] **Flush idle database tails to reduce
+      next-commit manifest size.** Flushing a non-empty tail after a database
+      becomes idle reduces the size of the next manifest `PUT` at the cost of
+      an extra segment `PUT`.
+- [ ] [tangential · Optimization] **Box `BlobRef` in `Value` to reduce
+      in-memory tail entry size.** `Entry` currently occupies 144 bytes on the
+      stack because `Value` stores `BlobRef` inline. Boxing `BlobRef` shrinks
+      `Entry` to 96 bytes.
+- [ ] [tangential · Optimization] **Keep the manifest tail as a sorted vector
+      across a batch.** Commit batches currently move the manifest tail into a
+      `BTreeMap` and back into a `Vec` on every commit. Each commit still
+      encodes the full manifest, so the gain is limited.
+- [ ] [tangential · Optimization] **Suppress commit notices if the home node
+      has 0 waiters.** If the lease holder is not the database's rendezvous
+      home, it sends a commit notice to the home node on every commit batch
+      even if 0 requests are waiting there. Have the home node indicate in its
+      response whether any requests are waiting so the lease holder can pause
+      notices for a bounded interval, during which new waiters on the home node
+      poll the manifest every `watch_poll_ms`.
+- [ ] [tangential · Optimization] **Event table rollups and projections.**
+      Allow event tables to declare pre-aggregated rollups or alternate sort
+      orders maintained automatically during seals and merges.
+- [ ] [tangential · Docs] **Replace remaining wide tables in `SPEC.md`.** The
+      tables in §8 (system database), §10 (error codes), and §12
       (configuration) have rows wider than 100 characters.
+- [ ] [tangential · Docs] **Correct the deploy trigger statement in
+      `DEPLOYING.md`.** The guide says that every push to `main` deploys, but
+      the push trigger in `deploy.yml` is commented out.

@@ -1977,8 +1977,8 @@ impl Db {
                 !retire
             });
             m.tombstone_horizon = horizon;
-            // Record `base.m.version` because object storage has already confirmed it.
-            // `m.version` is not visible to readers until this manifest write completes.
+            // Record `base.m.version` because object storage has already applied it.
+            // Readers can observe `m.version` only after object storage applies this manifest.
             if data_changed && m.version_times.last().is_none_or(|(_, t)| *t + cfg.version_sample_ms <= now_ms) {
                 m.version_times.push((base.m.version, now_ms));
             }

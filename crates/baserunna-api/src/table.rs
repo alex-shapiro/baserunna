@@ -217,7 +217,7 @@ pub struct Index {
     pub state: IndexState,
 }
 
-/// Backfill state of a secondary index. Queries can use an index only when it is
+/// Backfill state of a secondary index. Queries can use an index only if its state is
 /// [`IndexState::Ready`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

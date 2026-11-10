@@ -10,7 +10,7 @@ use serde_json::Value as Json;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-/// Table row type whose fields are the table's columns.
+/// Table row type.
 pub trait Row: Serialize + DeserializeOwned {
     const TABLE: &'static str;
 }
@@ -61,7 +61,9 @@ pub enum Op {
         key: Bytes,
         expect: Expect,
     },
-    /// Adds `by` to the decimal integer at `key`, treating an absent key as 0.
+    /// Adds `by` to the decimal integer at `key`.
+    ///
+    /// Treats an absent key as 0.
     Increment {
         key: Bytes,
         by: i64,
@@ -83,7 +85,7 @@ pub enum Op {
         table: String,
         row: Json,
     },
-    /// Sets the columns in `set` on the row with primary key `pk`, if it exists.
+    /// Updates the columns in `set` on the row at primary key `pk`.
     UpdateRow {
         table: String,
         pk: Json,
@@ -111,7 +113,7 @@ pub enum Op {
         reverse: bool,
         cursor: Option<String>,
     },
-    /// Appends `records` to `stream`, creating the stream if `create` is true.
+    /// Appends `records` to `stream`.
     Append {
         stream: String,
         records: Vec<NewRecord>,
@@ -264,12 +266,12 @@ impl Op {
         Op::QueryRows { table: R::TABLE.into(), selection, limit: api::PAGE_MAX, reverse: false, cursor: None }
     }
 
-    /// Appends JSON `records` to `stream`, creating the stream if needed.
+    /// Appends JSON `records` to `stream`.
     pub fn append<T: Serialize>(stream: impl Into<String>, records: &[T]) -> Op {
         Op::append_records(stream, records.iter().map(NewRecord::json).collect())
     }
 
-    /// Appends `records` to `stream`, creating the stream if needed.
+    /// Appends `records` to `stream`.
     pub fn append_records(stream: impl Into<String>, records: Vec<NewRecord>) -> Op {
         Op::Append { stream: stream.into(), records, create: true }
     }

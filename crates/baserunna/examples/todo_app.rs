@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("    {:?} due {} tags {:?}", t.title, t.due.unwrap_or_default(), t.tags.unwrap_or_default());
     }
 
-    step(6, "Users are isolated: Bob sees only his own data");
+    step(6, "Users are isolated: Bob sees only Bob's data");
     let rows = bob.read_one(Op::query_all::<Todo>()).await?.rows::<Todo>()?;
     println!("    Bob has {} todo(s): {:?}", rows.len(), rows[0].title);
 

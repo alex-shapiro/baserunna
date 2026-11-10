@@ -183,7 +183,7 @@ pub struct TxnRequest {
     #[serde(default, skip_serializing_if = "is_default")]
     pub isolation: Isolation,
     /// Deduplication key for write transactions. The server applies a transaction at most once per
-    /// key and sets `replayed: true` on repeated requests. Ignored for read-only transactions.
+    /// key. Repeated requests return `replayed: true`. Ignored for read-only transactions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     /// Consistency level for read-only transactions.
@@ -247,8 +247,7 @@ pub struct OpsRequest {
     pub ops: Vec<Op>,
 }
 
-/// Operations to execute before committing. An empty or `null` body commits without additional
-/// operations.
+/// Operations to execute before committing. Omit the body to commit without additional operations.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(from = "Option<CommitBody>")]
 pub struct CommitRequest {
@@ -263,8 +262,8 @@ struct CommitBody {
 }
 
 impl From<Option<CommitBody>> for CommitRequest {
-    fn from(b: Option<CommitBody>) -> CommitRequest {
-        CommitRequest { ops: b.map(|b| b.ops).unwrap_or_default() }
+    fn from(body: Option<CommitBody>) -> CommitRequest {
+        CommitRequest { ops: body.map(|body| body.ops).unwrap_or_default() }
     }
 }
 

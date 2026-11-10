@@ -19,8 +19,7 @@ impl<T: Transport + ?Sized> Transport for Arc<T> {
     }
 }
 
-/// Request extension that holds the endpoint route template, such as
-/// `/v1/dbs/{db}/transactions/{id}/commit`.
+/// Request extension that holds the endpoint route template.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Route(pub &'static str);
 
@@ -63,8 +62,7 @@ mod http_transport {
     }
 
     impl HttpTransport {
-        /// Creates a transport for `base_url` with a 10 s connect timeout and a 90 s request
-        /// timeout.
+        /// Creates a transport for `base_url`.
         pub fn new(base_url: &str) -> HttpTransport {
             let client = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))

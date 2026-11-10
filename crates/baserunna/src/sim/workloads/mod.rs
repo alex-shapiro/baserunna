@@ -159,7 +159,7 @@ pub async fn cache_expiry(sim: &Arc<Sim>) {
     sim.sleep(cache_lag(sim)).await;
 }
 
-/// Spawns a background chaos loop when fault injection is enabled.
+/// Spawns a background chaos loop if fault injection is enabled.
 pub fn spawn_chaos(sim: &Arc<Sim>) -> tokio::task::JoinHandle<()> {
     let sim = sim.clone();
     tokio::spawn(async move {

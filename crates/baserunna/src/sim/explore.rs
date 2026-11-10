@@ -59,7 +59,7 @@ pub struct Exploration {
 }
 
 /// Explores `scenarios` starting from `first_seed` within `budget`.
-/// When `budget.deadline` is `None`, the sequence of jobs is deterministic.
+/// If `budget.deadline` is `None`, the sequence of jobs is deterministic.
 pub fn explore(
     scenarios: &[Scenario],
     first_seed: u64,

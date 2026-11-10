@@ -1,6 +1,8 @@
-//! Concurrent transfers via interactive serializable transactions. Verifies
-//! that total balance is conserved, no account goes negative under continuous
-//! strong and snapshot reads, and final balances match committed transfers.
+//! Concurrent transfers via interactive serializable transactions.
+//!
+//! Verifies that total balance is conserved and that account balances stay
+//! non-negative under continuous strong and snapshot reads. Checks that final
+//! balances match committed transfers.
 
 use super::super::Sim;
 use super::super::client::Client;

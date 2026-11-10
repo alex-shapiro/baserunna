@@ -37,26 +37,26 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       cached version until the commit retry reloads the manifest. Invalidate
       the local lease as soon as `412` is received.
 - [ ] **Tolerate transient form errors in the `console` workload.** A password
-      change at `/console/account/password` can time out during storage stalls,
-      and the workload currently treats any error redirect as a test failure
+      change at `/console/account/password` can time out during storage stalls.
+      The workload currently treats any error redirect as a test failure
       (`sim_tool trace console 24010902`).
 - [ ] **Fix `accounts` session failures after an account is disabled and
       re-enabled.** A valid session can be rejected after its account is
       disabled and re-enabled (`sim_tool trace accounts 9506242`).
 - [ ] **Run garbage collection sweeps even if the lease duration is short.** A
       post-commit sweep skips execution if the lease expires while reading the
-      store clock and refreshing the manifest, leaving the database unswept
+      store clock and refreshing the manifest. This leaves the database unswept
       until the next commit (`sim_tool trace blobs 5000231`).
 - [ ] **Schedule stream retention trims after ambiguous manifest writes.** The
-      committer schedules a retention trim only when a manifest `PUT` returns
+      committer schedules a retention trim only if a manifest `PUT` returns
       success. If the `PUT` returns an unknown outcome after being applied in
       storage, the node does not schedule a trim until the next commit or
-      sweep, leaving expired records in an idle stream
+      sweep. This leaves expired records in an idle stream
       (`sim_tool trace streams 8100221`).
 - [ ] **Abort open interactive transactions if a database is deleted.**
       Interactive transactions on a deleted database currently remain open
-      until their 30 s idle timeout expires, consuming memory and counting
-      against the 100-transaction per-user limit.
+      until their 30 s idle timeout expires. They consume memory and count
+      against the 100-transaction per-user limit during that time.
 - [ ] **Test Google OAuth against Google's production endpoints.** Only
       `FakeGoogle` is tested in simulation. Refresh the cached JWKS if an ID
       token contains an unknown `kid` instead of waiting for the 1-hour cache
@@ -332,9 +332,9 @@ corruption through any of them.
       server, such as the new value from `increment` or the row count from
       `delete_rows`.
 - [ ] **Add typed request, response, and filter definitions for the remaining
-      routes in `baserunna-api`.** Several routes and sub-schemas (`filter`
-      expressions, `query_events` results, and routes not yet used by
-      `baserunna-client`) still use untyped JSON on the server.
+      routes in `baserunna-api`.** Several routes and sub-schemas still use
+      untyped JSON on the server, including `filter` expressions, `query_events`
+      results, and routes not yet used by `baserunna-client`.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`.
 - [ ] **Validate additional S3-compatible object stores.** Run the conformance

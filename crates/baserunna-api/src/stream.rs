@@ -100,7 +100,7 @@ impl Endpoint for AppendRecords {
     }
 }
 
-/// `POST /v1/dbs/{db}/streams/{s}/records` (`application/x-ndjson`).
+/// `POST /v1/dbs/{db}/streams/{s}/records` with `application/x-ndjson`.
 #[derive(Clone, Debug)]
 pub struct AppendLines {
     pub db: String,
@@ -263,7 +263,7 @@ pub struct AppendRequest {
     pub encoding: Option<Encoding>,
 }
 
-/// Newline-delimited JSON request body (`application/x-ndjson`).
+/// Newline-delimited JSON request body with content type `application/x-ndjson`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JsonLines(pub Bytes);
 
@@ -274,8 +274,8 @@ impl Body for JsonLines {
         self.0.clone()
     }
 
-    fn decode(b: Bytes) -> Result<JsonLines, String> {
-        Ok(JsonLines(b))
+    fn decode(bytes: Bytes) -> Result<JsonLines, String> {
+        Ok(JsonLines(bytes))
     }
 }
 
@@ -293,8 +293,8 @@ pub struct Appended {
     pub replayed: bool,
 }
 
-/// Query parameters for [`ReadRecords`]. Specify at most one start position (`from_seq`,
-/// `from_time`, `tail`, or `consumer`).
+/// Query parameters for [`ReadRecords`]. Specify at most one start position: `from_seq`,
+/// `from_time`, `tail`, or `consumer`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadRecordsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -431,7 +431,7 @@ async fn transfer(sim: Arc<Sim>, db: Db, i: usize, steps: usize, tally: Arc<Tall
 }
 
 async fn move_funds(txn: &mut Txn, t: &Transfer) -> Result<(), LedgerError> {
-    let missing = |id: &str| Error::Decode { what: id.into(), reason: "missing account".into() };
+    let missing = |id: &str| Error::Decode { target: id.into(), reason: "missing account".into() };
     let from = txn.run_one(Op::get_row::<Account>(&t.from)).await?.row::<Account>()?.ok_or_else(|| missing(&t.from))?;
     if from.balance < t.amount {
         return Err(LedgerError::Overdrawn);
@@ -505,7 +505,7 @@ fn parse_counter(e: Option<&Entry>) -> Result<u64, Error> {
     let Some(e) = e else { return Ok(0) };
     let text = e.value.data().and_then(|d| std::str::from_utf8(d).ok());
     text.and_then(|t| t.parse().ok())
-        .ok_or_else(|| Error::Decode { what: TRANSFER_COUNT.into(), reason: format!("{e:?}") })
+        .ok_or_else(|| Error::Decode { target: TRANSFER_COUNT.into(), reason: format!("{e:?}") })
 }
 
 /// Reads counter `key` using a raw key-value read if `raw` is true, or a transaction otherwise.

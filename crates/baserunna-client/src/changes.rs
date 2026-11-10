@@ -9,7 +9,7 @@ use bytes::Bytes;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangesRequest {
     pub range: KeyRange,
-    /// `cursor` from the previous page, or `"0"` for the start of retained history.
+    /// Cursor from the previous page, or `"0"` for the start of retained history.
     pub after: String,
     pub limit: usize,
     /// Maximum wait time in milliseconds for new changes, up to `long_poll_max_ms`.
@@ -65,22 +65,24 @@ pub struct ChangePage {
 }
 
 impl ChangePage {
-    pub(crate) fn decode(p: api::ChangePage) -> Result<ChangePage, String> {
-        let mut changes = Vec::with_capacity(p.changes.len());
-        for c in p.changes {
-            changes.push(match (c.deleted_range, c.key) {
-                (Some(r), _) => Change::DeleteRange {
-                    start: bytes(r.start.as_deref().ok_or("deleted range is missing a start")?)?,
-                    end: r.end.flatten().as_deref().map(bytes).transpose()?,
-                    version: c.version,
+    pub(crate) fn decode(page: api::ChangePage) -> Result<ChangePage, String> {
+        let mut changes = Vec::with_capacity(page.changes.len());
+        for change in page.changes {
+            changes.push(match (change.deleted_range, change.key) {
+                (Some(range), _) => Change::DeleteRange {
+                    start: bytes(range.start.as_deref().ok_or("deleted range is missing a start")?)?,
+                    end: range.end.flatten().as_deref().map(bytes).transpose()?,
+                    version: change.version,
                 },
                 (None, None) => return Err("change is missing a key".into()),
-                (None, Some(k)) if c.deleted => Change::Delete { key: bytes(&k)?, version: c.version },
-                (None, Some(k)) => {
-                    Change::Put { key: bytes(&k)?, version: c.version, value: value(c.value.as_deref(), c.blob)? }
-                }
+                (None, Some(key)) if change.deleted => Change::Delete { key: bytes(&key)?, version: change.version },
+                (None, Some(key)) => Change::Put {
+                    key: bytes(&key)?,
+                    version: change.version,
+                    value: value(change.value.as_deref(), change.blob)?,
+                },
             });
         }
-        Ok(ChangePage { changes, more: p.more, cursor: p.next_cursor })
+        Ok(ChangePage { changes, more: page.more, cursor: page.next_cursor })
     }
 }

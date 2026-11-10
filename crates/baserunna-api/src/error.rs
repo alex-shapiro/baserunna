@@ -79,19 +79,19 @@ impl ErrorCode {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorDetails {
-    /// Index of the failed operation in a transaction (`precondition_failed`).
+    /// For `precondition_failed`, the index of the failed operation in a transaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_index: Option<usize>,
-    /// Node that holds the database lease (`unavailable`).
+    /// For `unavailable`, the node that holds the database lease.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_holder: Option<String>,
-    /// Whether a write was applied before the failure (`unavailable`).
+    /// For `unavailable`, whether a write was applied before the failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
-    /// Delay in milliseconds before the next request (`rate_limited`).
+    /// For `rate_limited`, the delay in milliseconds before the next request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
-    /// Resource kind that was not found (`not_found`).
+    /// For `not_found`, the resource kind that was not found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missing: Option<Missing>,
 }

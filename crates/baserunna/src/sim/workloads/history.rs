@@ -476,7 +476,7 @@ fn ops_json(ops: &[Op]) -> Json {
     Json::Array(ops.iter().map(Op::json).collect())
 }
 
-/// Serializes `ops` and appends `t`'s marker write when `last` is true.
+/// Serializes `ops` and appends `t`'s marker write if `last` is true.
 fn request_ops(t: &Txn, ops: &[Op], last: bool) -> Json {
     let mut j = ops_json(ops);
     if last && t.writes() {
@@ -495,7 +495,7 @@ fn parse_sent(t: &Txn, ops: &[Op], r: &Json, last: bool) -> Result<Vec<Observed>
     parse_results(ops, &r)
 }
 
-/// Queries the fenced commit status for an ambiguous transaction when `resolve` is true.
+/// Queries the fenced commit status for an ambiguous transaction if `resolve` is true.
 async fn resolve(c: &Client, db: &str, id: &str, t: &Txn, resolve: bool) -> Result<Outcome, String> {
     if !resolve {
         return Ok(Outcome::Unknown);

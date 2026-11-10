@@ -64,10 +64,10 @@ impl Endpoint for GetValue {
     }
 
     fn response(head: &http::response::Parts, body: Bytes) -> Result<KvValue, String> {
-        let h = &head.headers;
-        let version = header_u64(h, "x-baserunna-version")?.ok_or("missing x-baserunna-version header")?;
-        let expires_at = header_u64(h, "x-baserunna-expires-at")?;
-        Ok(KvValue { content: Content::new(h, body), version, expires_at })
+        let headers = &head.headers;
+        let version = header_u64(headers, "x-baserunna-version")?.ok_or("missing x-baserunna-version header")?;
+        let expires_at = header_u64(headers, "x-baserunna-expires-at")?;
+        Ok(KvValue { content: Content::new(headers, body), version, expires_at })
     }
 }
 
@@ -77,8 +77,7 @@ pub struct PutValue {
     pub db: String,
     pub key: Bytes,
     pub options: PutOptions,
-    /// Deduplication key for the write. The server applies the write at most once per key, and
-    /// `GET /v1/dbs/{db}/commits/key:{key}` resolves its status.
+    /// Deduplication key for the write. The server applies the write at most once per key.
     pub idempotency_key: Option<String>,
 }
 

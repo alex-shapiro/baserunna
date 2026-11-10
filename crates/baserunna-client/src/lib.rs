@@ -86,7 +86,9 @@ impl RetryPolicy {
 /// Source of random 64-bit values.
 type Entropy = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-/// Client for a Baserunna server. Clones share the underlying transport.
+/// Client for a Baserunna server.
+///
+/// Clones share the underlying transport.
 #[derive(Clone)]
 pub struct Client {
     transport: Arc<dyn Transport>,
@@ -105,8 +107,7 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    /// Creates a client that sends requests through `transport`. Pass an `Arc` to retain a
-    /// handle to the transport.
+    /// Creates a client that sends requests through `transport`.
     pub fn new(transport: impl Transport + 'static) -> Client {
         let entropy = Arc::new(random_u64);
         Client { transport: Arc::new(transport), token: None, retry_policy: RetryPolicy::default(), entropy }
@@ -289,7 +290,7 @@ impl Client {
         self.send(&api::ResetMetrics, &api::NoBody {}).await
     }
 
-    /// Returns a handle to database `name`, such as `"notes"` or `"org.notes"`.
+    /// Returns a handle to database `name`.
     pub fn db(&self, name: &str) -> Db {
         Db { client: self.clone(), name: name.into() }
     }
@@ -299,7 +300,7 @@ impl Client {
 struct Failed {
     /// Error to report to the caller.
     error: Error,
-    /// Final attempt's error if `error` came from an earlier attempt with an unknown outcome.
+    /// Error from the final attempt if `error` came from an earlier attempt.
     rejected: Option<Error>,
 }
 
@@ -390,7 +391,7 @@ impl Db {
         self.client.send(&api::GetDb { db: self.name.clone() }, &api::NoBody {}).await
     }
 
-    /// Deletes the database and all of its data.
+    /// Deletes the database.
     pub async fn delete(&self) -> Result<(), Error> {
         self.client.send(&api::DeleteDb { db: self.name.clone() }, &api::NoBody {}).await.map(drop)
     }
@@ -403,7 +404,7 @@ impl Db {
         self.client.send(&api::CreateStream { db: self.name.clone() }, stream).await
     }
 
-    /// Reads a stream's state and its first consumers.
+    /// Reads state and consumer offsets for `stream`.
     pub async fn stream_info(&self, stream: &str) -> Result<api::StreamInfo, Error> {
         self.client.send(&api::GetStream { db: self.name.clone(), stream: stream.into() }, &api::NoBody {}).await
     }
@@ -436,12 +437,12 @@ impl Db {
         self.client.send(&api::CreateTable { db: self.name.clone() }, table).await
     }
 
-    /// Adds a column to `table`. Existing rows receive the column's default value.
+    /// Adds a column to `table`.
     pub async fn add_column(&self, table: &str, column: &api::NewColumn) -> Result<api::CreatedTable, Error> {
         self.client.send(&api::AddColumn { db: self.name.clone(), table: table.into() }, column).await
     }
 
-    /// Adds a secondary index to `table` and backfills it from existing rows.
+    /// Adds a secondary index to `table`.
     pub async fn add_index(&self, table: &str, index: &api::NewIndex) -> Result<api::CreatedTable, Error> {
         self.client.send(&api::AddIndex { db: self.name.clone(), table: table.into() }, index).await
     }
@@ -561,9 +562,10 @@ impl Db {
 
     /// Executes `ops` in a single serializable transaction.
     ///
-    /// Write transactions require an `idempotency_key` to retry after a failure with
-    /// [`api::Outcome::Unknown`]. Generate a new key for each distinct transaction, including after
-    /// [`api::ErrorCode::Aborted`]. [`Db::write`] generates the key and resolves unknown outcomes.
+    /// Pass an `idempotency_key` to retry write transactions after [`api::Outcome::Unknown`].
+    /// Generate a new key for each distinct transaction, including after
+    /// [`api::ErrorCode::Aborted`]. [`Db::write`] generates keys and resolves unknown outcomes
+    /// automatically.
     pub async fn txn(&self, ops: &[Op], idempotency_key: Option<&str>) -> Result<TxnOutcome, Error> {
         let e = api::Txn { db: self.name.clone() };
         let path = e.path();

@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keys.push(ops.with_token(&k.key));
     }
 
-    step(2, "Each tenant's service writes its own data with its own key");
+    step(2, "Each tenant service writes tenant data with a scoped key");
     for (t, svc) in tenants.iter().zip(&keys) {
         svc.db(&format!("tenant-{t}"))
             .write(&[

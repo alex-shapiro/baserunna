@@ -104,7 +104,7 @@ pub enum OpResult {
     Found(bool),
     /// Number of rows modified or deleted.
     Count(u64),
-    /// Sequence number of the first appended record, or `None` before the transaction commits.
+    /// Sequence number of the first appended record, or `None` before commit.
     Append {
         first_seq: Option<u64>,
     },
@@ -135,18 +135,18 @@ impl PartialEq for OpResult {
 }
 
 fn mismatch(want: &str, got: &OpResult) -> Error {
-    Error::Decode { what: format!("{want} result"), reason: format!("the result is {got:?}") }
+    Error::Decode { target: format!("{want} result"), reason: format!("the result is {got:?}") }
 }
 
 fn table<R: Row>(table: &str) -> Result<(), Error> {
     match table == R::TABLE {
         true => Ok(()),
-        false => Err(Error::Decode { what: format!("{table} rows"), reason: format!("read as {} rows", R::TABLE) }),
+        false => Err(Error::Decode { target: format!("{table} rows"), reason: format!("read as {} rows", R::TABLE) }),
     }
 }
 
-fn decode<T: DeserializeOwned>(what: &str, r: &RawValue) -> Result<T, Error> {
-    serde_json::from_str(r.get()).map_err(|e| Error::Decode { what: what.into(), reason: e.to_string() })
+fn decode<T: DeserializeOwned>(target: &str, r: &RawValue) -> Result<T, Error> {
+    serde_json::from_str(r.get()).map_err(|e| Error::Decode { target: target.into(), reason: e.to_string() })
 }
 
 impl OpResult {
@@ -195,7 +195,7 @@ impl OpResult {
         let json = |r: &Record| match &r.body {
             RecordBody::Json(j) => decode("stream record", j),
             RecordBody::Bytes(_) => {
-                Err(Error::Decode { what: "stream record".into(), reason: "the record is not JSON".into() })
+                Err(Error::Decode { target: "stream record".into(), reason: "the record is not JSON".into() })
             }
         };
         page.records.iter().map(json).collect()
@@ -209,8 +209,7 @@ pub struct TxnOutcome {
     pub commit_id: Option<String>,
     /// First sequence number assigned to each [`Op::Append`] in the transaction.
     pub appends: Vec<u64>,
-    /// Per-operation results, or `None` if an earlier request with the same idempotency key
-    /// already committed the transaction.
+    /// Per-operation results, or `None` if the transaction was replayed.
     pub results: Option<Vec<OpResult>>,
 }
 
@@ -295,7 +294,7 @@ fn record(r: api::StreamRecord<Box<RawValue>>) -> Result<Record, String> {
     let body = match (r.json, r.value) {
         (Some(j), None) => RecordBody::Json(j),
         (None, Some(v)) => RecordBody::Bytes(bytes(&v)?),
-        _ => return Err(format!("record {} needs exactly one of json and value", r.seq)),
+        _ => return Err(format!("record {} must have either json or value", r.seq)),
     };
     Ok(Record { seq: r.seq, time_ms: r.time, headers: r.headers, body })
 }

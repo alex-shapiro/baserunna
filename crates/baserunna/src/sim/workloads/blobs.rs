@@ -209,7 +209,7 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
         }
     }
     if let Some(g) = unlisted_garbage()? {
-        return Err(format!("garbage {g} survived a full GC cycle"));
+        return Err(format!("garbage {g} remained after a full GC cycle"));
     }
     let (referenced, _, _) = db_objects(&sim, &db_id)?;
     let stored_blobs = stored_ids(&sim, &db_id, "blob");

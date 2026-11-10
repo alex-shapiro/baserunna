@@ -258,8 +258,8 @@ pub struct RangeSpec {
     pub lte: Option<Json>,
 }
 
-/// Stream record to append. Set either `value` (using the request [`Encoding`](crate::Encoding))
-/// or `json`.
+/// Stream record to append. Set either `value` or `json`. `value` uses the request
+/// [`Encoding`](crate::Encoding).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewRecord {
@@ -272,8 +272,8 @@ pub struct NewRecord {
     pub headers: BTreeMap<String, String>,
 }
 
-/// Stream read parameters. Specify at most one start position (`from_seq`, `from_time`, `tail`,
-/// or `consumer`).
+/// Stream read parameters. Specify at most one start position: `from_seq`, `from_time`, `tail`,
+/// or `consumer`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadStream {

@@ -6,7 +6,7 @@ use crate::{Db, Error, Op, OpResult, TransportError};
 
 /// Interactive serializable transaction on a [`Db`].
 ///
-/// The transaction begins on the server with the first non-empty [`Txn::run`]. After a request
+/// The first non-empty [`Txn::run`] begins the transaction on the server. After a request
 /// fails, subsequent calls return the same error. If an open transaction is dropped before
 /// [`Txn::commit`] or [`Txn::abort`], it is aborted in the background on the current Tokio
 /// runtime.
@@ -66,7 +66,7 @@ impl Txn {
         let api_ops: Vec<api::Op> = self.writes.drain(..).map(Op::into_api).chain(ops.iter().map(Op::to_api)).collect();
         self.wrote |= api_ops.iter().any(api::Op::is_write);
         // Mark the transaction as failed while the request is in flight so a canceled request
-        // prevents a later commit.
+        // cannot be committed.
         let canceled = TransportError::Unknown("a request on the transaction was canceled".into());
         self.failed = Some(not_applied(&Error::Transport(canceled)));
         let (path, sent) = match &self.open {
@@ -221,7 +221,8 @@ async fn begin(db: Db, body: api::BeginRequest) -> Result<Begun, Error> {
     rx.await.unwrap_or_else(|_| Err(stopped()))
 }
 
-/// Wraps an unknown error in [`Error::NotApplied`] because a failed transaction cannot commit.
+/// Wraps an unknown error in [`Error::NotApplied`] because a failed transaction is never
+/// committed.
 fn not_applied(e: &Error) -> Error {
     match e.outcome() {
         Outcome::Unknown => Error::NotApplied(Box::new(e.clone())),
@@ -247,7 +248,7 @@ fn abort_later(db: Db, id: String) {
 }
 
 impl Db {
-    /// Returns an interactive transaction that begins with its first operations.
+    /// Creates an interactive transaction on this database.
     pub fn begin(&self) -> Txn {
         Txn::new(self.clone())
     }

@@ -98,8 +98,7 @@ impl Follower {
     }
 }
 
-/// Verifies all table indexes and checks that no orphaned data remains from
-/// dropped tables or indexes.
+/// Verifies all table indexes and checks for orphaned data from dropped tables or indexes.
 pub async fn check_all_indexes(sim: &Arc<Sim>, db_id: &str) -> Result<(), String> {
     let n = sim.up_nodes().first().copied().ok_or("all nodes are down")?;
     let node = sim.node(n).ok_or("node is down")?.node.clone();

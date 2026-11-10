@@ -1785,10 +1785,10 @@ fn version_samples_are_spaced_and_reach_a_lifetime_back() {
     });
 }
 
-/// A tombstone can be purged only after a subsequent commit exceeds the purge window.
-/// The tombstone's own version timestamp can precede the time when its manifest write completed.
+/// A tombstone can be purged only after a later commit is older than the purge window.
+/// The tombstone version timestamp is recorded before object storage applies the manifest.
 #[test]
-fn tail_tombstones_are_purged_after_subsequent_commit_ages() {
+fn tail_tombstones_wait_for_later_commit_age() {
     rt().block_on(async {
         let (eng, _store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
@@ -1808,7 +1808,7 @@ fn tail_tombstones_are_purged_after_subsequent_commit_ages() {
         put(&db, "y", "1").await;
         tokio::time::sleep_until(deleted + window + sample / 2).await;
         put(&db, "x", "1").await;
-        assert!(tombstone(), "the tombstone's own version time made it purgeable");
+        assert!(tombstone(), "purged using the tombstone version timestamp");
         tokio::time::sleep_until(next + window - Duration::from_millis(1)).await;
         put(&db, "x", "2").await;
         assert!(tombstone(), "dropped before the next commit was a window old");
@@ -1818,10 +1818,10 @@ fn tail_tombstones_are_purged_after_subsequent_commit_ages() {
     });
 }
 
-/// All commits in a batch become visible when the batch manifest write completes.
-/// A tombstone in a stalled batch is retained for a full purge window after the write completes.
+/// Commits in a batch become visible when object storage applies the batch manifest.
+/// A tombstone in a stalled batch is kept for a full purge window after that manifest write.
 #[test]
-fn tombstones_in_stalled_batch_wait_for_write_completion() {
+fn tombstones_in_stalled_batch_wait_for_manifest_write() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
@@ -1862,10 +1862,10 @@ fn tombstones_in_stalled_batch_wait_for_write_completion() {
     });
 }
 
-/// Object storage can apply a manifest write from the lease holder before the response returns.
-/// Once the staleness bound elapses, a snapshot read on the lease holder must load the new version.
+/// Object storage can apply a manifest write before the lease holder receives the response.
+/// A snapshot read on the lease holder after the staleness bound must load the new version.
 #[test]
-fn snapshot_reads_on_lease_holder_load_completed_write() {
+fn snapshot_reads_on_lease_holder_load_applied_write() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
@@ -1888,10 +1888,10 @@ fn snapshot_reads_on_lease_holder_load_completed_write() {
     });
 }
 
-/// A lease holder that refreshes its own in-flight write from storage receives the lease when the
-/// write completes. It does not issue an extra manifest write to acquire a lease.
+/// A lease holder that loads its in-flight manifest write from storage reuses the lease from that
+/// write. The commit and the read together issue a single manifest write.
 #[test]
-fn lease_holder_refreshing_own_write_reuses_in_flight_lease() {
+fn lease_holder_refreshing_in_flight_write_reuses_lease() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;

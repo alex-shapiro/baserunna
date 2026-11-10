@@ -1,7 +1,7 @@
 //! HTTP API routes, requests, and responses.
 //!
-//! Response types ignore unknown fields and new request fields are optional so that clients and
-//! servers from different releases remain compatible.
+//! Response types ignore unknown fields so that clients remain compatible with newer servers. New
+//! request fields are optional.
 
 #![forbid(unsafe_code)]
 

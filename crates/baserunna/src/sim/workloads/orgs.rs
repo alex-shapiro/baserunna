@@ -38,7 +38,7 @@ fn tag(role: Option<Role>) -> String {
     role.map_or_else(|| "outsider".into(), |r| wire(r).as_str().unwrap_or("?").to_string())
 }
 
-/// Expected HTTP status for a request requiring `can` when made with `role`.
+/// Expected HTTP status for a request that requires `can` and is sent with `role`.
 fn answer(role: Option<Role>, can: impl Fn(Role) -> bool, granted: u16) -> u16 {
     match role {
         None => 404,
@@ -47,7 +47,7 @@ fn answer(role: Option<Role>, can: impl Fn(Role) -> bool, granted: u16) -> u16 {
     }
 }
 
-/// Sets `u`'s role in `org` (`None` removes membership).
+/// Sets `u`'s role in `org`. Passing `None` removes membership.
 async fn set_role(by: &Client, org: &str, u: &User, role: Option<Role>) -> Result<(), String> {
     let current = members(by, org).await?.get(&u.id).copied();
     if current == role {
@@ -222,7 +222,7 @@ struct Attempt {
     key: String,
     start: u64,
     end: u64,
-    /// 0 when the outcome is unknown.
+    /// 0 if the outcome is unknown.
     status: u16,
 }
 
@@ -296,13 +296,13 @@ async fn role_changes(sim: &Arc<Sim>, owner: &User, others: &[User; 3]) -> Resul
     for a in &attempts {
         match a.status {
             200 => expect(stored.contains(a.key.as_str()), format!("acknowledged write {} lost", a.key))?,
-            403 | 404 => expect(!stored.contains(a.key.as_str()), format!("refused write {} applied", a.key))?,
+            403 | 404 => expect(!stored.contains(a.key.as_str()), format!("rejected write {} was applied", a.key))?,
             _ => {}
         }
     }
     let granted = attempts.iter().filter(|a| a.status == 200).count();
-    let refused = attempts.iter().filter(|a| a.status == 403 || a.status == 404).count();
-    expect(granted + refused > 0, format!("expected at least 1 decision, got {granted} granted, {refused} refused"))
+    let rejected = attempts.iter().filter(|a| a.status == 403 || a.status == 404).count();
+    expect(granted + rejected > 0, format!("expected at least 1 decision, got {granted} granted, {rejected} rejected"))
 }
 
 /// Verifies that each write response matches a role held within `lag` before

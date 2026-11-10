@@ -273,13 +273,13 @@ async fn retries_back_off_and_follow_retry_after_up_to_a_bound() {
     assert_eq!(began.elapsed().as_millis(), 30_000, "Retry-After is capped at 10 s");
 
     let (c, s) = script(vec![resp(503, &[], "<html>Busy</html>")]);
-    let one = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() });
-    one.db("s").txn(&GET, None).await.unwrap_err();
+    let single_attempt = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() });
+    single_attempt.db("s").txn(&GET, None).await.unwrap_err();
     assert_eq!(sent(&s), 1);
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_request_that_times_out_is_not_sent_again() {
+async fn timed_out_request_is_not_retried() {
     let (c, s) = script(vec![Err(TransportError::TimedOut("deadline".into()))]);
     let e = c.db("s").txn(&GET, None).await.unwrap_err();
     assert_eq!((e.outcome(), sent(&s)), (Outcome::Unknown, 1));
@@ -559,7 +559,7 @@ async fn row_and_record_decoders_report_malformed_data() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_transaction_begins_with_its_first_operations_and_commits_its_writes() {
+async fn transaction_is_begun_on_first_run_and_committed_with_queued_writes() {
     let (c, s) =
         script(vec![resp(201, &[], BEGUN), resp(200, &[], r#"{"results":[{"value":3}]}"#), resp(200, &[], COMMITTED)]);
     let db = c.db("s");
@@ -578,7 +578,7 @@ async fn a_transaction_begins_with_its_first_operations_and_commits_its_writes()
     assert_eq!(r[0].2["encoding"], "base64");
     assert_eq!(r[1].1, "/v1/dbs/s/transactions/t1/ops");
     assert_eq!(r[2].1, "/v1/dbs/s/transactions/t1/commit");
-    assert_eq!(r[2].2["ops"][0]["op"], "delete_row", "queued writes execute with the commit");
+    assert_eq!(r[2].2["ops"][0]["op"], "delete_row", "queued writes are sent with the commit");
     let routes: Vec<_> = s.requests.lock().iter().map(|r| r.extensions().get::<Route>().unwrap().0).collect();
     assert_eq!(routes, [api::BeginTxn::ROUTE, api::TxnOps::ROUTE, api::CommitTxn::ROUTE]);
 }
@@ -655,7 +655,6 @@ impl TxnError for AppError {
     }
 }
 
-/// Runs a read-then-write transaction loop and returns the attempts and the result.
 async fn read_modify_write(c: &Client, reject: bool) -> (u32, Result<u32, AppError>) {
     let db = c.db("s");
     let mut retry = db.retry();
@@ -699,7 +698,7 @@ async fn retry_stops_on_unresolved_commits_application_errors_and_exhausted_atte
     let down = Err(TransportError::NotSent("down".into()));
     let (c, s) = script(vec![resp(201, &[], BEGUN), lost, down]);
     let (attempts, r) = read_modify_write(&c, false).await;
-    assert_eq!(attempts, 1, "an unknown commit outcome never runs the transaction again");
+    assert_eq!(attempts, 1, "an unknown commit outcome stops the retry loop");
     assert!(matches!(r, Err(AppError::Client(e)) if e.outcome() == Outcome::Unknown));
     assert_eq!(requests(&s)[2].1, "/v1/dbs/s/commits/00000000000000c1");
 
@@ -719,7 +718,7 @@ async fn retry_stops_on_unresolved_commits_application_errors_and_exhausted_atte
     let (attempts, r) = read_modify_write(&c, false).await;
     assert_eq!(attempts, 3);
     assert!(matches!(r, Err(AppError::Client(e)) if e.code() == Some(ErrorCode::Conflict)));
-    assert_eq!(sent(&s), 3 * 2, "each attempt begins and commits once");
+    assert_eq!(sent(&s), 3 * 2, "each attempt sends a begin and a commit");
 }
 
 #[tokio::test(start_paused = true)]
@@ -754,7 +753,7 @@ async fn retry_restarts_a_transaction_that_the_server_lost() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn retry_restarts_a_transaction_after_the_delay_the_server_asked_for() {
+async fn retry_waits_for_server_retry_after_delay() {
     let (c, _) = script(vec![api_err(429, "rate_limited", r#"{"retry_after_ms":5000}"#)]);
     let db = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() }).db("s");
     let limited = db.write(&put()).await.unwrap_err();

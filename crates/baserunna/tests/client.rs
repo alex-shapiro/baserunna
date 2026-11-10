@@ -222,12 +222,12 @@ async fn tables_rows_streams_and_keys_are_written_and_read_back() {
 }
 
 #[tokio::test]
-async fn a_transaction_reads_its_own_writes_and_commits_its_queued_writes() {
+async fn a_transaction_reads_uncommitted_writes_and_commits_queued_writes() {
     let (db, _) = node("").await;
     let mut txn = db.begin();
     txn.run(&[Op::put("k", "v"), Op::insert(&item("a", 1))]).await.unwrap();
-    let own = txn.run(&[Op::get("k"), Op::get_row::<Item>(("a", 1))]).await.unwrap();
-    let OpResult::Get(Some(e)) = &own[0] else { panic!("{own:?}") };
+    let uncommitted = txn.run(&[Op::get("k"), Op::get_row::<Item>(("a", 1))]).await.unwrap();
+    let OpResult::Get(Some(e)) = &uncommitted[0] else { panic!("{uncommitted:?}") };
     assert_eq!(
         (e.version, e.value.data().map(|d| d.as_ref())),
         (None, Some(&b"v"[..])),

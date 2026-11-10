@@ -143,7 +143,7 @@ pub struct ApiKey {
 }
 
 impl ApiKey {
-    /// Converts this key to its public API representation.
+    /// Converts this key to [`baserunna_api::ApiKey`].
     pub fn public(&self, db: Option<String>) -> baserunna_api::ApiKey {
         baserunna_api::ApiKey {
             id: self.id.clone(),

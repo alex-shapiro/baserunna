@@ -9,11 +9,10 @@ pub enum Error {
     Api {
         status: u16,
         error: ApiError,
-        /// Delay before the next request, from `details.retry_after_ms` or the `Retry-After`
-        /// header.
+        /// Retry delay in milliseconds from `details.retry_after_ms` or the `Retry-After` header.
         retry_after_ms: Option<u64>,
     },
-    /// Non-API HTTP response, such as a proxy error page or captive portal.
+    /// Non-API HTTP response.
     Foreign {
         status: u16,
         retry_after_ms: Option<u64>,
@@ -26,7 +25,7 @@ pub enum Error {
     },
     /// Operation result that cannot be decoded as the requested type.
     Decode {
-        what: String,
+        target: String,
         reason: String,
     },
     /// Request error whose unknown outcome was resolved as not applied.
@@ -43,7 +42,7 @@ impl Error {
         }
     }
 
-    /// Returns whether the failed request might have been applied.
+    /// Returns whether the server may have applied the failed request.
     pub fn outcome(&self) -> Outcome {
         let unknown = match self {
             Error::Api { error, .. } => match error.code {
@@ -68,7 +67,7 @@ impl Error {
         }
     }
 
-    /// Returns true if repeating the request later can succeed.
+    /// Returns true if the client can retry the failed request.
     ///
     /// Returns false for [`Outcome::Unknown`] if `idempotent` is false.
     pub fn is_transient(&self, idempotent: bool) -> bool {
@@ -93,8 +92,10 @@ impl Error {
     /// Returns true if [`Db::retry`](crate::Db::retry) can restart the transaction after this
     /// error.
     pub fn restarts_txn(&self) -> bool {
-        let timed_out =
-            matches!(self, Error::NotApplied(c) if matches!(**c, Error::Transport(TransportError::TimedOut(_))));
+        let timed_out = matches!(
+            self,
+            Error::NotApplied(inner) if matches!(**inner, Error::Transport(TransportError::TimedOut(_)))
+        );
         matches!(self.code(), Some(ErrorCode::TxnNotFound | ErrorCode::Aborted))
             || self.is_transient(false)
             || timed_out
@@ -124,7 +125,7 @@ impl fmt::Display for Error {
             }
             Error::Foreign { status, path, .. } => write!(f, "HTTP {status} from {path} without an API response"),
             Error::Malformed { path, reason } => write!(f, "unexpected response from {path}: {reason}"),
-            Error::Decode { what, reason } => write!(f, "cannot decode {what}: {reason}"),
+            Error::Decode { target, reason } => write!(f, "cannot decode {target}: {reason}"),
             Error::NotApplied(e) => write!(f, "{e} (confirmed not applied)"),
             Error::Transport(t) => t.fmt(f),
         }

@@ -130,6 +130,7 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
             list_lag_ms: k.pick("store.list_lag_ms", &[0, 0, 500, 5_000]),
             p_late_reply: k.rate("store.p_late_reply", 0.05),
             late_reply_ms: (50, k.log_range("store.late_reply_max_ms", 100, 2_000)),
+            ..StoreFaults::none()
         };
         c.net = NetFaults {
             latency_min_ms: k.range("net.latency_min_ms", 0, 2),

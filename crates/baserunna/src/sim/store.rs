@@ -31,6 +31,9 @@ pub struct StoreFaults {
     /// Probability that a write response is delayed by `late_reply_ms` after the write is applied.
     pub p_late_reply: f64,
     pub late_reply_ms: (u64, u64),
+    /// Probability that a write fails with an error and is applied `late_apply_ms` later.
+    pub p_late_apply: f64,
+    pub late_apply_ms: (u64, u64),
 }
 
 impl StoreFaults {
@@ -47,6 +50,8 @@ impl StoreFaults {
             list_lag_ms: 0,
             p_late_reply: 0.0,
             late_reply_ms: (0, 0),
+            p_late_apply: 0.0,
+            late_apply_ms: (0, 0),
         }
     }
 }
@@ -54,6 +59,7 @@ impl StoreFaults {
 struct Draw {
     latency_ms: u64,
     late_reply_ms: u64,
+    late_apply_ms: u64,
     fail_before: bool,
     fail_after: bool,
     list_lag_ms: u64,
@@ -157,9 +163,15 @@ impl SimStore {
         } else {
             0
         };
+        let late_apply_ms = if on && f.p_late_apply > 0.0 && r.chance(f.p_late_apply) {
+            r.range(f.late_apply_ms.0, f.late_apply_ms.1.max(f.late_apply_ms.0) + 1)
+        } else {
+            0
+        };
         Draw {
             latency_ms,
             late_reply_ms,
+            late_apply_ms,
             fail_before: on && r.chance(f.p_fail_before),
             fail_after: on && r.chance(f.p_fail_after),
             list_lag_ms: if on && f.list_lag_ms > 0 { r.below(f.list_lag_ms + 1) } else { 0 },
@@ -238,11 +250,19 @@ impl ObjectStore for SimStore {
     fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
         Box::pin(async move {
             self.stats.puts.fetch_add(1, Ordering::Relaxed);
-            let Draw { latency_ms: lat, late_reply_ms, fail_before: before, fail_after: after, list_lag_ms } =
-                self.draw();
+            let Draw {
+                latency_ms: lat,
+                late_reply_ms,
+                late_apply_ms,
+                fail_before: before,
+                fail_after: after,
+                list_lag_ms,
+            } = self.draw();
+            let late_apply = late_apply_ms > 0 && !before;
             let lat = lat + self.transfer_time(data.len()).as_millis() as u64;
             let held_replies = self.held_replies.clone();
             let (tx, rx) = tokio::sync::oneshot::channel();
+            let mut reply = Some(tx);
             let mem = self.mem.clone();
             let trace = self.trace.clone();
             let view = self.view.clone();
@@ -250,6 +270,11 @@ impl ObjectStore for SimStore {
             // Detached so in-flight writes can still land if the caller crashes.
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(lat / 2 + 1)).await;
+                if late_apply && let Some(tx) = reply.take() {
+                    let _ = tx.send(Err(unavailable("injected: put failed, applies later")));
+                    trace.event(&format!("store put {key2} fails now, applies in {late_apply_ms}ms"));
+                    tokio::time::sleep(Duration::from_millis(late_apply_ms)).await;
+                }
                 let existed = mem.get_sync(&key2, &GetOpts::default()).is_ok();
                 let r =
                     if before { Err(unavailable("injected put failure")) } else { mem.put_sync(&key2, data, &mode) };
@@ -267,6 +292,7 @@ impl ObjectStore for SimStore {
                         Err(e) => e.to_string(),
                     }
                 ));
+                let Some(tx) = reply else { return };
                 tokio::time::sleep(Duration::from_millis(lat / 2 + 1)).await;
                 if r.is_ok() && late_reply_ms > 0 {
                     trace.event(&format!("store put {key2} reply delayed {late_reply_ms}ms"));
@@ -280,7 +306,7 @@ impl ObjectStore for SimStore {
                 let _ = tx.send(r);
             });
             let r = rx.await.unwrap_or_else(|_| Err(unavailable("store task dropped")));
-            if before || after {
+            if before || after || late_apply {
                 self.injected();
             }
             r
@@ -338,5 +364,31 @@ impl ObjectStore for SimStore {
 
     fn time_precision_ms(&self) -> u64 {
         self.mem.time_precision_ms()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_applied_puts_fail_then_apply_with_their_precondition() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
+        rt.block_on(async {
+            let origin = Instant::now();
+            let mem = Arc::new(MemStore::new(Box::new(move || origin.elapsed().as_millis() as u64)));
+            let faults = StoreFaults { p_late_apply: 1.0, late_apply_ms: (1_000, 1_000), ..StoreFaults::none() };
+            let store = SimStore::new(mem.clone(), Rng::new(1), faults, Arc::new(super::super::Trace::new(false)));
+            let etag = mem.put_sync("k", Bytes::from_static(b"v1"), &PutMode::Overwrite).unwrap();
+            let put = |data: &'static [u8], etag: &str| {
+                store.put("k", Bytes::from_static(data), PutMode::IfMatch(etag.into()))
+            };
+            assert!(matches!(put(b"v2", &etag).await, Err(StoreError::Unavailable(_))));
+            assert!(matches!(put(b"v3", &etag).await, Err(StoreError::Unavailable(_))));
+            let read = || mem.get_sync("k", &GetOpts::default()).unwrap().data;
+            assert_eq!(read(), Bytes::from_static(b"v1"), "a late put applied before its delay");
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            assert_eq!(read(), Bytes::from_static(b"v2"), "the first late put applies; the second fails its If-Match");
+        });
     }
 }

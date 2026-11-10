@@ -1,11 +1,10 @@
 //! Application logs in a stream.
 //!
-//! Services ship JSON lines straight from their log files; the stream keeps
-//! a day of them within a size cap. Queries find the latest errors newest
-//! first, filtered by field, by bounded scans that say where to continue;
-//! `tail -f` is a forward read that waits for new lines; and a log shipper
-//! forwards every line exactly once by advancing its cursor in the same
-//! transaction that records what it shipped.
+//! Services append JSON lines from their log files into a stream with a time
+//! and size cap. Bounded scans filter by field and return the newest errors
+//! first with a continuation sequence number. Forward reads wait for new
+//! lines like `tail -f`. A log shipper forwards each line once by advancing
+//! its consumer cursor in the same transaction that records the batch.
 //!
 //! Run: `cargo run --example app_logs`
 
@@ -33,7 +32,7 @@ struct Http {
     ms: u64,
 }
 
-fn log_line(r: &api::StreamRecord) -> Result<LogLine, serde_json::Error> {
+fn parse_log_line(r: &api::StreamRecord) -> Result<LogLine, serde_json::Error> {
     serde_json::from_value(r.json.clone().unwrap_or_default())
 }
 
@@ -120,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         until = Some(page.next_seq);
     }
     for r in found.iter().take(5) {
-        let line = log_line(r)?;
+        let line = parse_log_line(r)?;
         println!("    #{} {}: {}", r.seq, line.service, line.msg);
     }
 
@@ -144,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.append_lines("app", log_lines(10_000, 3)).await?;
     let page = follower.await??;
     for r in &page.records {
-        let line = log_line(r)?;
+        let line = parse_log_line(r)?;
         println!("    #{} [{}] {}", r.seq, line.level, line.msg);
     }
     println!(
@@ -161,9 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut shipped = 0;
     loop {
-        // Read a batch from the cursor, "ship" it, and advance the cursor and
-        // a counter of shipped lines atomically: a crash anywhere repeats
-        // nothing and skips nothing.
+        // Advance the consumer cursor and the shipped counter in the same
+        // transaction so a crash cannot duplicate or skip a batch.
         let mut txn = db.begin();
         let OpResult::ReadStream(page) = txn.run_one(read.clone()).await? else {
             return Err("read_stream returns a page of records".into());

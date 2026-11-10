@@ -37,7 +37,7 @@ impl Rng {
         }
     }
 
-    /// Returns a non-null JSON value, because a `null` optional field decodes as absent.
+    /// Returns a non-null JSON value so that optional fields are not deserialized as `None`.
     fn value(&mut self) -> Json {
         match self.below(4) {
             0 => json!(self.next() as i64),
@@ -217,12 +217,12 @@ fn transaction_bodies_round_trip_through_json() {
     for empty in ["{}", "null"] {
         assert_eq!(CommitRequest::decode(empty.into()).unwrap(), CommitRequest::default(), "commit ops are optional");
     }
-    assert!(OpsRequest::decode("{}".into()).is_err(), "ops requests name their ops");
+    assert!(OpsRequest::decode("{}".into()).is_err(), "ops field is required");
     assert!(CommitRequest::decode(r#"{"ops":[],"nope":1}"#.into()).is_err());
 }
 
 #[test]
-fn null_record_bodies_stay_apart_from_absent_ones() {
+fn null_record_bodies_are_distinguished_from_absent_fields() {
     let null: NewRecord = serde_json::from_value(json!({"json": null})).unwrap();
     assert_eq!(null.json, Some(Json::Null));
     assert_eq!(serde_json::to_value(&null).unwrap(), json!({"json": null}));
@@ -233,7 +233,7 @@ fn null_record_bodies_stay_apart_from_absent_ones() {
 }
 
 #[test]
-fn row_results_decode_directly_into_row_types() {
+fn row_results_deserialize_into_row_types() {
     #[derive(Deserialize, Debug, PartialEq)]
     struct Thing {
         id: String,
@@ -248,7 +248,7 @@ fn row_results_decode_directly_into_row_types() {
 }
 
 #[test]
-fn results_serialize_as_the_server_has_always_written_them() {
+fn op_results_match_wire_format() {
     let cases = [
         (OpResult::GetRow(RowResult::default()), json!({"found": false})),
         (
@@ -313,7 +313,7 @@ fn table_definitions_default_to_nullable_columns() {
     assert!(!types.contains(&ColumnType::Unknown));
     assert_eq!(serde_json::to_value(&types).unwrap(), json!(names));
     let later: (ColumnType, IndexState) = serde_json::from_value(json!(["timestamp", "failed"])).unwrap();
-    assert_eq!(later, (ColumnType::Unknown, IndexState::Unknown), "values added by newer servers decode");
+    assert_eq!(later, (ColumnType::Unknown, IndexState::Unknown));
     let created = r#"{"name":"t","columns":[],"primary_key":["id"],"indexes":[{"name":"i","columns":["n"],"unique":false,"state":"building"}],"version":4}"#;
     let c = CreatedTable::decode(created.into()).unwrap();
     assert_eq!((c.version, c.table.indexes[0].state), (4, IndexState::Building));
@@ -357,7 +357,7 @@ fn requests_reject_unknown_fields_and_responses_ignore_them() {
 }
 
 #[test]
-fn nullable_fields_keep_null_apart_from_absent() {
+fn nullable_fields_distinguish_null_from_absent() {
     let r: DeletedRange = serde_json::from_value(json!({"start": "a", "end": null})).unwrap();
     assert_eq!(r.end, Some(None));
     let r: DeletedRange = serde_json::from_value(json!({"start": "a", "end_b64": "/w=="})).unwrap();
@@ -377,7 +377,7 @@ fn nullable_fields_keep_null_apart_from_absent() {
 }
 
 #[test]
-fn transaction_results_keep_their_json() {
+fn transaction_results_preserve_raw_json() {
     let body = r#"{"version":1,"committed":true,"commit_id":"00000000000000aa","results":[{"found":true,"value":"v","version":null},{}],"appends":[]}"#;
     let r = TxnResponse::decode(body.into()).unwrap();
     let results = r.results.as_ref().unwrap();

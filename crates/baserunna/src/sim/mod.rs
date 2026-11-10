@@ -688,7 +688,7 @@ impl Sim {
             let Ok(g) = self.mem.get_sync(&crate::engine::manifest_key(&db), &GetOpts::default()) else { continue };
             let lease = crate::engine::manifest::Manifest::decode(&g.data).ok().and_then(|m| m.lease);
             if lease.is_some_and(|l| l.node == n.node.id) {
-                let e = format!("n{i} released its lease on {db} as it stopped, but storage names it again");
+                let e = format!("n{i} released its lease on {db} as it stopped, but storage still holds it");
                 self.trace.event(&format!("oracle: {e}"));
                 self.violation.lock().get_or_insert(e);
             }

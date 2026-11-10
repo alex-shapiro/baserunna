@@ -301,7 +301,7 @@ pub struct Node {
     cluster_key: Mutex<Option<String>>,
     pub forwards: cluster::ForwardDedup,
     pub started_ms: u64,
-    /// The node's HTTP router, which holds the node: [`Node::stop`] drops it to free the node.
+    /// HTTP router for this node. [`Node::stop`] clears this field to break the reference cycle.
     router: Mutex<Option<axum::Router>>,
     pub limiter: Limiter,
     pub metrics: crate::metrics::ServerMetrics,
@@ -513,19 +513,17 @@ impl Node {
     fn spawn_background(self: &Arc<Self>) {
         let me = Arc::downgrade(self);
         let hb = Duration::from_millis(self.cfg.heartbeat_ms);
-        // Peers count a node as live for 3 heartbeat intervals after the heartbeat they last read,
-        // so heartbeats and reads each happen at least once per interval.
+        // Peers treat a node as live for 3 heartbeat intervals after its last read heartbeat.
+        // Refresh membership at least once per heartbeat interval.
         let period = Duration::from_millis(self.cfg.members_refresh_ms).min(hb);
-        // Each loop runs on a fixed schedule, so the time a heartbeat or read takes does not delay
-        // the next one, and runs at once if it fell behind.
-        let after = |at: Instant, d: Duration| (at + d).max(Instant::now());
+        let next_tick = |at: Instant, d: Duration| (at + d).max(Instant::now());
         self.env.spawn(async move {
             let mut at = Instant::now() + hb;
             loop {
                 tokio::time::sleep_until(at).await;
                 let Some(n) = me.upgrade() else { return };
                 at = match n.heartbeat().await {
-                    Ok(()) => after(at, hb),
+                    Ok(()) => next_tick(at, hb),
                     Err(e) => {
                         crate::debug!("{}: heartbeat failed: {e}", n.id);
                         Instant::now() + period
@@ -540,7 +538,7 @@ impl Node {
                 tokio::time::sleep_until(at).await;
                 let Some(n) = me.upgrade() else { return };
                 let _ = n.refresh_members().await;
-                at = after(at, period);
+                at = next_tick(at, period);
             }
         });
         let me = Arc::downgrade(self);
@@ -567,13 +565,14 @@ impl Node {
         *self.router.lock() = Some(r);
     }
 
-    /// Returns the node's HTTP router, or `None` before it is set or after [`Node::stop`].
+    /// Returns the node's HTTP router.
     pub fn router(&self) -> Option<axum::Router> {
         self.router.lock().clone()
     }
 
-    /// Stops the node at once: aborts its background tasks and drops its router, so that the node
-    /// is freed once its callers drop it. [`Node::shutdown`] first leaves the cluster gracefully.
+    /// Aborts background tasks and drops the HTTP router immediately.
+    ///
+    /// Use [`Node::shutdown`] to leave the cluster and release leases before stopping.
     pub fn stop(&self) {
         self.env.shutdown();
         self.router.lock().take();
@@ -1663,10 +1662,8 @@ mod tests {
     use bytes::Bytes;
     use std::time::Duration;
 
-    /// A node's router holds the node, so a node that kept its router after stopping would never be
-    /// freed, and each simulation run would leak its nodes.
     #[test]
-    fn a_stopped_node_is_freed() {
+    fn stopped_node_is_freed() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             use super::{Env, Node, NodeConfig, Services};
@@ -1971,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn peers_stay_live_whatever_the_refresh_interval() {
+    fn peers_stay_live_across_refresh_intervals() {
         fn check(latency_ms: u64, configure: fn(&mut super::NodeConfig)) {
             run_paused(async move {
                 let w = World::with_config(2, latency_ms, configure).await;

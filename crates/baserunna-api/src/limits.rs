@@ -1,8 +1,10 @@
+//! Server request and size limits.
+
 use crate::{Endpoint, NoBody, json_body};
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
-/// `GET /v1/limits`: reads the server request limits.
+/// `GET /v1/limits`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GetLimits;
 
@@ -28,7 +30,7 @@ pub struct Limits {
     pub txn_max_write_bytes: u64,
     pub txn_max_read_bytes: u64,
     pub txn_max_open_per_user: u64,
-    /// Maximum size of an inline value; larger values are stored as blobs.
+    /// Maximum inline value size in bytes. Larger values are stored as blobs.
     pub value_inline_max: u64,
     pub scan_limit_max: u64,
     pub long_poll_max_ms: u64,

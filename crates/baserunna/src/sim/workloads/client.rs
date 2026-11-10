@@ -1,14 +1,17 @@
 //! Simulation workload for `baserunna-client` under network, process, and storage faults.
 //!
-//! Counter tasks increment keys with a version precondition, in keyed one-shot transactions or in
-//! raw key-value puts, to verify that retries do not apply a write twice or report an applied write
-//! as `NotApplied`.
-//! Mutator tasks write, copy, and delete binary keys while a watcher task reconstructs the key
-//! space from the change feed and compares the final state against a full scan.
-//! Ledger tasks move balances between table rows in interactive transactions that also count and
-//! log each transfer, to verify that retried and resolved commits apply exactly once.
-//! Stream tasks append keyed records over HTTP while a follower long-polls for them, to verify that
-//! each acknowledged append appears exactly once and that the follower reads every record in order.
+//! - Counter tasks increment keys with version preconditions in keyed transactions and raw puts.
+//!   They verify that retries apply each write at most once and never report an applied write as
+//!   `NotApplied`.
+//! - Mutator tasks write, copy, and delete binary keys. A watcher task rebuilds the key space from
+//!   the change feed and compares it against a full scan.
+//! - Note tasks insert and delete rows with [`Db::write`] and check that the reported outcome
+//!   matches the stored row.
+//! - Ledger tasks transfer funds between table rows in interactive transactions and log each
+//!   transfer. An audit verifies that balances are conserved and that retried commits are applied
+//!   at most once.
+//! - Stream tasks append keyed records over HTTP while a follower reads them with long polling.
+//!   They verify that each acknowledged append is stored once and read in order.
 
 use super::super::Sim;
 use super::super::client::{Client as SimClient, ZOMBIE_WAIT_MS};
@@ -153,7 +156,8 @@ async fn retry<T, F: Future<Output = Result<T, Error>>>(sim: &Arc<Sim>, mut f: i
     Err("a request never succeeded".into())
 }
 
-/// Increments counter `i`, through raw key-value puts if `i` is even and keyed transactions otherwise.
+/// Increments counter `i` at each step.
+/// Uses raw key-value puts for even `i` and keyed transactions for odd `i`.
 async fn count(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), String> {
     let key = Bytes::from(format!("ctr/{i}"));
     let raw = i.is_multiple_of(2);
@@ -198,9 +202,9 @@ impl Row for Note {
     const TABLE: &'static str = "notes";
 }
 
-/// Inserts and then deletes one note per step with [`Db::write`], whose result must report whether
-/// each write applied, even if the write's first attempt applied unseen and a retry found its
-/// effects.
+/// Inserts and deletes a note per step with [`Db::write`].
+/// Verifies that [`Db::write`] reports whether the write was applied, even if an earlier attempt
+/// succeeded after its response was lost.
 async fn note(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), String> {
     for step in 0..steps {
         let id = format!("n{i}-{step}");
@@ -212,14 +216,14 @@ async fn note(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Strin
             };
             let applied = match db.write(&[op]).await {
                 Ok(Some(_)) => Some(true),
-                Ok(None) => return Err(format!("note {id}: a write of a row reported that it wrote nothing")),
+                Ok(None) => return Err(format!("note {id}: row write reported zero modified rows")),
                 Err(e) if e.outcome() == Outcome::NotApplied && e.code() != Some(ErrorCode::AlreadyExists) => {
                     Some(false)
                 }
                 Err(e) if e.outcome() == Outcome::Unknown => None,
                 Err(e) => return Err(format!("note {id}: {e}")),
             };
-            // A definitive answer resolved the write's key, so no attempt of it can apply later.
+            // If the outcome is unknown, wait for any in-flight attempt to finish.
             if applied.is_none() {
                 sim.sleep(ZOMBIE_WAIT_MS).await;
             }
@@ -230,7 +234,7 @@ async fn note(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Strin
                 Some(false) => !insert,
                 None => exists,
             };
-            expect(exists == now, format!("note {id} exists: {exists}, after a write that applied: {applied:?}"))?;
+            expect(exists == now, format!("note {id} exists: {exists}, after applied={applied:?}"))?;
             if !exists && insert {
                 break;
             }
@@ -239,8 +243,7 @@ async fn note(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Strin
     Ok(())
 }
 
-/// Appends one record per step to stream `log{i}` with an idempotency key per step, while a
-/// follower long-polls for the records.
+/// Appends one keyed record per step to stream `log{i}` while a follower reads the stream.
 async fn append(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), String> {
     let name = format!("log{i}");
     let length = Arc::new(AtomicU64::new(u64::MAX));
@@ -269,13 +272,13 @@ async fn append(sim: Arc<Sim>, db: Db, i: usize, steps: usize) -> Result<(), Str
     let present: BTreeSet<u64> = steps.iter().copied().collect();
     expect(present.len() == steps.len(), format!("stream {i} holds a step twice: {steps:?}"))?;
     expect(acked.is_subset(&present), format!("stream {i} lost acknowledged appends of {acked:?}: {steps:?}"))?;
-    let refused: Vec<_> = present.difference(&acked).filter(|s| !unknown.contains(s)).collect();
-    expect(refused.is_empty(), format!("stream {i} holds appends of steps {refused:?} that failed"))?;
+    let rejected: Vec<_> = present.difference(&acked).filter(|s| !unknown.contains(s)).collect();
+    expect(rejected.is_empty(), format!("stream {i} holds appends of steps {rejected:?} that failed"))?;
     expect(followed == log, format!("stream {i} follower read {followed:?}, but the stream is {log:?}"))
 }
 
-/// Reads stream `name` from the start with long polls until it has read `length` records,
-/// returning each record's sequence number and step in the order read.
+/// Long-polls stream `name` from the start until `length` records are read.
+/// Returns the sequence number and step of each record.
 async fn follow(sim: Arc<Sim>, db: Db, name: String, length: Arc<AtomicU64>) -> Result<Vec<(u64, u64)>, String> {
     let mut out = Vec::new();
     for _ in 0..2_000 {
@@ -285,7 +288,7 @@ async fn follow(sim: Arc<Sim>, db: Db, name: String, length: Arc<AtomicU64>) -> 
         let query =
             api::ReadRecordsQuery { from_seq: Some(out.len() as u64), wait_ms: Some(2_000), ..Default::default() };
         match db.read_records(&name, query).await {
-            Ok(page) => out.extend(records(&page)?),
+            Ok(page) => out.extend(parse_records(&page)?),
             Err(e)
                 if e.code() == Some(ErrorCode::NotFound)
                     || e.is_transient(true)
@@ -305,22 +308,21 @@ async fn read_log(sim: &Arc<Sim>, db: &Db, name: &str) -> Result<Vec<(u64, u64)>
         let query = api::ReadRecordsQuery { from_seq: Some(out.len() as u64), ..Default::default() };
         let read = retry(sim, || async {
             match db.read_records(name, query.clone()).await {
-                // No append created the stream.
+                // The stream has not been created yet.
                 Err(e) if e.code() == Some(ErrorCode::NotFound) => Ok(None),
                 r => r.map(Some),
             }
         });
         let Some(page) = read.await? else { return Ok(out) };
-        out.extend(records(&page)?);
+        out.extend(parse_records(&page)?);
         if page.done {
             return Ok(out);
         }
     }
 }
 
-/// Returns the sequence number and step of each record of `page`, failing unless the records follow
-/// each other without gaps.
-fn records(page: &api::RecordPage) -> Result<Vec<(u64, u64)>, String> {
+/// Extracts `(seq, step)` pairs from `page` and checks that sequence numbers are contiguous.
+fn parse_records(page: &api::RecordPage) -> Result<Vec<(u64, u64)>, String> {
     let steps = page.records.iter().map(|r| (r.seq, r.json.as_ref().and_then(|j| j.as_u64())));
     let out: Vec<(u64, u64)> =
         steps.map(|(seq, step)| Ok((seq, step.ok_or("a record is not a step")?))).collect::<Result<_, String>>()?;
@@ -429,7 +431,7 @@ async fn transfer(sim: Arc<Sim>, db: Db, i: usize, steps: usize, tally: Arc<Tall
 }
 
 async fn move_funds(txn: &mut Txn, t: &Transfer) -> Result<(), LedgerError> {
-    let missing = |id: &str| Error::Decode { what: id.into(), reason: "no account".into() };
+    let missing = |id: &str| Error::Decode { what: id.into(), reason: "missing account".into() };
     let from = txn.run_one(Op::get_row::<Account>(&t.from)).await?.row::<Account>()?.ok_or_else(|| missing(&t.from))?;
     if from.balance < t.amount {
         return Err(LedgerError::Overdrawn);
@@ -444,8 +446,7 @@ async fn move_funds(txn: &mut Txn, t: &Transfer) -> Result<(), LedgerError> {
     Ok(())
 }
 
-/// Checks that balances are conserved, that each acknowledged transfer applied exactly once, and
-/// that no transfer applied unless it was acknowledged or its outcome was unknown.
+/// Verifies that account balances are conserved and that the transfer log matches `tally`.
 async fn audit(sim: &Arc<Sim>, db: &Db, tally: &Tally) -> Result<(), String> {
     let (accounts, transfers, count) = retry(sim, || read_ledger(db)).await?;
     let total: i64 = accounts.iter().map(|a| a.balance).sum();
@@ -457,15 +458,15 @@ async fn audit(sim: &Arc<Sim>, db: &Db, tally: &Tally) -> Result<(), String> {
     check_transfers(&tally.committed.lock(), &tally.unknown.lock(), &logged)
 }
 
-/// Checks that the `logged` transfer IDs hold each `committed` ID once, and otherwise only IDs whose
-/// outcome was `unknown`.
+/// Verifies that `logged` contains each `committed` transfer ID once and that any other logged ID
+/// is in `unknown`.
 fn check_transfers(committed: &BTreeSet<String>, unknown: &BTreeSet<String>, logged: &[&str]) -> Result<(), String> {
     let ids: BTreeSet<&str> = logged.iter().copied().collect();
     expect(ids.len() == logged.len(), "a transfer was logged twice")?;
     let lost: Vec<&String> = committed.iter().filter(|id| !ids.contains(id.as_str())).collect();
     expect(lost.is_empty(), format!("acknowledged transfers {lost:?} were not applied"))?;
     let stray: Vec<&&str> = ids.iter().filter(|id| !committed.contains(**id) && !unknown.contains(**id)).collect();
-    expect(stray.is_empty(), format!("transfers {stray:?} applied after they failed"))
+    expect(stray.is_empty(), format!("failed transfers {stray:?} were applied"))
 }
 
 /// Reads the accounts, the logged transfers after the opening record, and the transfer count.
@@ -473,14 +474,14 @@ async fn read_ledger(db: &Db) -> Result<(Vec<Account>, Vec<Transfer>, u64), Erro
     let mut retry = db.retry();
     loop {
         let mut txn = db.begin();
-        let r = ledger(&mut txn).await;
+        let r = read_ledger_in_txn(&mut txn).await;
         if let Some(r) = retry.finish(txn, r).await? {
             return Ok(r);
         }
     }
 }
 
-async fn ledger(txn: &mut Txn) -> Result<(Vec<Account>, Vec<Transfer>, u64), Error> {
+async fn read_ledger_in_txn(txn: &mut Txn) -> Result<(Vec<Account>, Vec<Transfer>, u64), Error> {
     let (mut accounts, mut transfers, mut count) = (Vec::new(), Vec::new(), 0);
     let mut pending = vec![Op::query_all::<Account>(), Op::read_stream(TRANSFERS, 0), Op::get(TRANSFER_COUNT)];
     while !pending.is_empty() {
@@ -491,7 +492,7 @@ async fn ledger(txn: &mut Txn) -> Result<(Vec<Account>, Vec<Transfer>, u64), Err
             match r {
                 r @ OpResult::QueryRows(_) => accounts.extend(r.rows::<Account>()?),
                 r @ OpResult::ReadStream(_) => transfers.extend(r.records::<Transfer>()?),
-                r => count = counter(r.entry()?.as_ref())?,
+                r => count = parse_counter(r.entry()?.as_ref())?,
             }
         }
         pending = next;
@@ -500,14 +501,14 @@ async fn ledger(txn: &mut Txn) -> Result<(Vec<Account>, Vec<Transfer>, u64), Err
     Ok((accounts, transfers, count))
 }
 
-fn counter(e: Option<&Entry>) -> Result<u64, Error> {
+fn parse_counter(e: Option<&Entry>) -> Result<u64, Error> {
     let Some(e) = e else { return Ok(0) };
     let text = e.value.data().and_then(|d| std::str::from_utf8(d).ok());
     text.and_then(|t| t.parse().ok())
         .ok_or_else(|| Error::Decode { what: TRANSFER_COUNT.into(), reason: format!("{e:?}") })
 }
 
-/// Reads counter `key`, as a raw key-value read if `raw` is set.
+/// Reads counter `key` using a raw key-value read if `raw` is true, or a transaction otherwise.
 async fn read_counter(sim: &Arc<Sim>, db: &Db, key: &Bytes, raw: bool) -> Result<(u64, Option<u64>), String> {
     if raw {
         let Some(v) = retry(sim, || db.get_value(key.clone(), None)).await? else { return Ok((0, None)) };
@@ -515,7 +516,7 @@ async fn read_counter(sim: &Arc<Sim>, db: &Db, key: &Bytes, raw: bool) -> Result
         return Ok((n.ok_or(format!("counter {key:?} holds {v:?}"))?, Some(v.version)));
     }
     let e = retry(sim, || db.read_one(Op::Get { key: key.clone() })).await?.entry().map_err(|e| e.to_string())?;
-    Ok((counter(e.as_ref()).map_err(|e| e.to_string())?, e.and_then(|e| e.version)))
+    Ok((parse_counter(e.as_ref()).map_err(|e| e.to_string())?, e.and_then(|e| e.version)))
 }
 
 fn mutator_key(i: usize, k: u64) -> Bytes {
@@ -637,7 +638,7 @@ async fn rescan(sim: &Arc<Sim>, db: &Db) -> Result<Replica, String> {
     let keys = page
         .entries
         .iter()
-        .map(|e| Ok((e.key.clone(), (e.version.ok_or("scan entry has no committed version")?, data(&e.value)?))))
+        .map(|e| Ok((e.key.clone(), (e.version.ok_or("scan entry is missing a committed version")?, data(&e.value)?))))
         .collect::<Result<_, String>>()?;
     Ok(Replica { keys, cursor: out.version.to_string() })
 }
@@ -697,7 +698,7 @@ mod tests {
         let lost = check_transfers(&committed, &unknown, &["b"]).unwrap_err();
         assert!(lost.contains("[\"a\"] were not applied"), "{lost}");
         let stray = check_transfers(&committed, &unknown, &["a", "c"]).unwrap_err();
-        assert!(stray.contains("[\"c\"] applied after they failed"), "{stray}");
+        assert!(stray.contains("[\"c\"] were applied"), "{stray}");
         assert!(check_transfers(&committed, &unknown, &["a", "a"]).is_err());
     }
 }

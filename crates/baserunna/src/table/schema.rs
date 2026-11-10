@@ -43,7 +43,7 @@ impl ColType {
         !matches!(self, ColType::Json | ColType::Blob)
     }
 
-    /// Converts a requested column type, failing if this server does not know it.
+    /// Converts [`api::ColumnType`] into [`ColType`].
     pub fn from_api(t: api::ColumnType) -> Result<ColType> {
         let names = || ColType::ALL.map(ColType::name).join(", ");
         ColType::ALL
@@ -65,14 +65,15 @@ impl ColType {
     }
 }
 
-/// Every row write maintains an index in either state, but only a `Ready`
-/// index can serve queries.
+/// Lifecycle state of a secondary index.
+///
+/// Row writes update indexes in both states. Only `Ready` indexes serve queries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexState {
     #[default]
     Ready,
-    /// Being backfilled from the table's rows.
+    /// Backfill from existing table rows is in progress.
     Building,
 }
 

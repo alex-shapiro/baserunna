@@ -52,7 +52,7 @@ impl Cluster {
 
     async fn start(&self, slot: usize) {
         let node = common::start_isolated((self.open)(), &format!("node{slot}")).await;
-        // The checker retries on random nodes itself, so each request is one attempt on one node.
+        // The checker retries across random nodes, so each client sends at most one attempt per request.
         let policy = RetryPolicy { attempts: 1, ..RetryPolicy::default() };
         self.clients.lock()[slot] = Some(Client::new(HttpTransport::new(&node.url)).with_retry_policy(policy));
         self.nodes.lock()[slot] = Some(node);
@@ -67,20 +67,19 @@ impl Cluster {
     }
 }
 
-/// Sends `request` to a random node, failing with a transport timeout after 20 s.
+/// Sends `request` to a random node with a 20 s timeout.
 async fn send_request<T, F>(c: &Cluster, request: impl FnOnce(Db) -> F) -> Result<T, Error>
 where
     F: Future<Output = Result<T, Error>>,
 {
     match tokio::time::timeout(Duration::from_secs(20), request(c.random_db())).await {
         Ok(r) => r,
-        Err(_) => Err(TransportError::TimedOut("no response within 20 s".into()).into()),
+        Err(_) => Err(TransportError::TimedOut("request timed out after 20 s".into()).into()),
     }
 }
 
-/// Returns true if repeating a request can succeed: it failed in transit, with a 503, or with an
-/// error that the server marks retryable.
-fn retryable(e: &Error) -> bool {
+/// Returns true if `e` is a transient transport or server error.
+fn is_retryable(e: &Error) -> bool {
     match e {
         Error::Transport(_) => true,
         Error::Api { status, error, .. } => *status == 503 || error.retryable,
@@ -89,9 +88,9 @@ fn retryable(e: &Error) -> bool {
     }
 }
 
-/// Returns the response of a request whose failure is tolerated, or `None` if it failed, or an
-/// error if the server answered with a body that does not decode.
-fn answered<T>(what: &str, r: Result<T, Error>) -> Result<Option<T>, String> {
+/// Extracts an optional response from `r`.
+/// Rejects malformed responses and ignores other errors.
+fn optional_response<T>(what: &str, r: Result<T, Error>) -> Result<Option<T>, String> {
     match r {
         Ok(v) => Ok(Some(v)),
         Err(e @ (Error::Malformed { .. } | Error::Decode { .. })) => Err(format!("{what}: {e}")),
@@ -107,7 +106,7 @@ where
     loop {
         match send_request(c, &request).await {
             Ok(v) => return Ok(v),
-            Err(e) if retryable(&e) => {
+            Err(e) if is_retryable(&e) => {
                 if started.elapsed() > Duration::from_secs(120) {
                     return Err(format!("{what} kept failing: {e}"));
                 }
@@ -166,7 +165,7 @@ async fn increment_worker(
             done.insert(n);
             t.commits.fetch_add(1, SeqCst);
         }
-        if let Some(v) = answered(&format!("strong read of w{i}"), strong_get(&c, &format!("w{i}")).await)? {
+        if let Some(v) = optional_response(&format!("strong read of w{i}"), strong_get(&c, &format!("w{i}")).await)? {
             t.reads.fetch_add(1, SeqCst);
             let want = done.len() as i64;
             if v.unwrap_or(0) != want {
@@ -185,9 +184,9 @@ fn balance(r: &api::OpResult) -> Option<i64> {
     r.decode::<api::GetResult>().ok()?.value?.parse().ok()
 }
 
-/// Transfers between random accounts in interactive transactions. Each request of a transaction
-/// goes to a random node, which forwards it to the lease holder, so the worker calls the
-/// transaction endpoints rather than a [`baserunna_client::Txn`], which keeps to one node.
+/// Transfers funds between random accounts in interactive transactions.
+/// Calls the transaction endpoints directly so each step can hit a different node instead of
+/// staying on one node like [`baserunna_client::Txn`].
 async fn transfer_worker(c: Arc<Cluster>, stop: Arc<AtomicBool>, t: Arc<Stats>) -> Result<(), String> {
     while !stop.load(SeqCst) {
         let (a, b) = (c.random(ACCOUNTS as u64) as usize, c.random(ACCOUNTS as u64) as usize);
@@ -225,7 +224,7 @@ async fn transfer_worker(c: Arc<Cluster>, stop: Arc<AtomicBool>, t: Arc<Stats>) 
         let applied = match send_request(&c, commit).await {
             Ok(_) => true,
             Err(Error::Api { status: 404 | 409, .. }) => false,
-            Err(e) if retryable(&e) => {
+            Err(e) if is_retryable(&e) => {
                 t.unknown.fetch_add(1, SeqCst);
                 resolve_commit(&c, &r.commit_id).await?
             }
@@ -256,7 +255,7 @@ fn verify_balances(b: &[i64]) -> Result<(), String> {
 async fn audit_worker(c: Arc<Cluster>, stop: Arc<AtomicBool>, t: Arc<Stats>) -> Result<(), String> {
     while !stop.load(SeqCst) {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if let Some(balances) = answered("audit scan", send_request(&c, scan_balances).await)? {
+        if let Some(balances) = optional_response("audit scan", send_request(&c, scan_balances).await)? {
             verify_balances(&balances)?;
             t.reads.fetch_add(1, SeqCst);
         }

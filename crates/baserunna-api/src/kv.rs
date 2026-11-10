@@ -13,7 +13,7 @@ use http::header::{CONTENT_RANGE, CONTENT_TYPE, HeaderMap, HeaderValue, IF_MATCH
 use http::{Method, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// `GET /v1/dbs/{db}/changes`: reads changes after a cursor, optionally waiting for new changes.
+/// `GET /v1/dbs/{db}/changes`.
 #[derive(Clone, Debug)]
 pub struct Changes {
     pub db: String,
@@ -36,7 +36,7 @@ impl Endpoint for Changes {
     }
 }
 
-/// `GET /v1/dbs/{db}/kv/{key}`: reads the bytes of a key, or a range of them.
+/// `GET /v1/dbs/{db}/kv/{*key}`.
 #[derive(Clone, Debug)]
 pub struct GetValue {
     pub db: String,
@@ -65,31 +65,31 @@ impl Endpoint for GetValue {
 
     fn response(head: &http::response::Parts, body: Bytes) -> Result<KvValue, String> {
         let h = &head.headers;
-        let version = number(h, "x-baserunna-version")?.ok_or("the response has no x-baserunna-version")?;
-        let expires_at = number(h, "x-baserunna-expires-at")?;
+        let version = header_u64(h, "x-baserunna-version")?.ok_or("missing x-baserunna-version header")?;
+        let expires_at = header_u64(h, "x-baserunna-expires-at")?;
         Ok(KvValue { content: Content::new(h, body), version, expires_at })
     }
 }
 
-/// `PUT /v1/dbs/{db}/kv/{key}`: writes the bytes of a key.
+/// `PUT /v1/dbs/{db}/kv/{*key}`.
 #[derive(Clone, Debug)]
 pub struct PutValue {
     pub db: String,
     pub key: Bytes,
     pub options: PutOptions,
-    /// Makes retries of the write apply it at most once, and lets `GET /v1/dbs/{db}/commits/key:{key}`
-    /// report whether it applied.
+    /// Deduplication key for the write. The server applies the write at most once per key, and
+    /// `GET /v1/dbs/{db}/commits/key:{key}` resolves its status.
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PutOptions {
-    /// Type that reads of the value report if it is large enough to be stored out of band as a
-    /// blob. Reads of smaller values report `application/octet-stream`.
+    /// `Content-Type` stored if the value exceeds `value_inline_max` and is written as a blob.
+    /// Inline values are served as `application/octet-stream`.
     pub content_type: Option<String>,
-    /// Deletes the value this many milliseconds after the write.
+    /// Time-to-live in milliseconds.
     pub ttl_ms: Option<u64>,
-    /// Fails with `precondition_failed` unless the key's current state matches.
+    /// Precondition on the current state of the key.
     pub expect: Option<Expect>,
 }
 
@@ -129,15 +129,15 @@ impl Endpoint for PutValue {
     }
 }
 
-/// State a key must be in for a conditional write to apply.
+/// Key precondition for [`PutValue`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Expect {
     Absent,
-    /// The key holds the value written at this version.
+    /// The key exists at this version.
     Version(u64),
 }
 
-/// Bytes of a value or blob to read.
+/// Byte range for a partial value or blob read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ByteRange {
     /// Bytes `start..=end`.
@@ -148,16 +148,16 @@ pub enum ByteRange {
     Last(u64),
 }
 
-/// A key's bytes and the version that wrote them.
+/// Value and metadata returned by [`GetValue`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KvValue {
     pub content: Content,
     pub version: u64,
-    /// Time in milliseconds since the Unix epoch after which the value is deleted.
+    /// Expiration time in milliseconds since the Unix epoch.
     pub expires_at: Option<u64>,
 }
 
-/// Bytes of a value or blob, or of the requested range of them.
+/// Payload and content headers of a value or blob read.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Content {
     pub data: Bytes,
@@ -193,7 +193,7 @@ impl Body for KvValue {
     }
 
     fn decode(_: Bytes) -> Result<KvValue, String> {
-        Err("a value is read from its response headers".into())
+        Err("KvValue must be decoded with Endpoint::response".into())
     }
 }
 
@@ -220,18 +220,16 @@ fn range_header(range: Option<ByteRange>) -> HeaderMap {
     h
 }
 
-fn number(h: &HeaderMap, name: &str) -> Result<Option<u64>, String> {
+fn header_u64(h: &HeaderMap, name: &str) -> Result<Option<u64>, String> {
     let Some(v) = h.get(name) else { return Ok(None) };
     v.to_str().ok().and_then(|s| s.trim_matches('"').parse().ok()).map(Some).ok_or(format!("bad {name} header"))
 }
 
-/// `POST /v1/dbs/{db}/blobs`: uploads a blob to reference by `blob_id` in a later `put`.
-///
-/// Unreferenced staged blobs expire after `blob_stage_ttl_ms`.
+/// `POST /v1/dbs/{db}/blobs`.
 #[derive(Clone, Debug)]
 pub struct StageBlob {
     pub db: String,
-    /// Type that reads of the blob report, defaulting to `application/octet-stream`.
+    /// `Content-Type` returned when the blob is read, defaulting to `application/octet-stream`.
     pub content_type: Option<String>,
 }
 
@@ -259,7 +257,7 @@ impl Endpoint for StageBlob {
     }
 }
 
-/// `GET /v1/dbs/{db}/blobs/{blob_id}`: downloads a blob, or a range of it.
+/// `GET /v1/dbs/{db}/blobs/{blob_id}`.
 #[derive(Clone, Debug)]
 pub struct ReadBlob {
     pub db: String,
@@ -315,12 +313,12 @@ pub struct ChangesQuery {
     pub start: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false", deserialize_with = "flag")]
+    #[serde(default, skip_serializing_if = "is_false", deserialize_with = "deserialize_bool_param")]
     pub keys_only: bool,
     /// Maximum number of changes, defaulting to 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
-    /// Maximum time in milliseconds to wait if no changes are available.
+    /// Maximum time in milliseconds to wait for new changes if the page is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,7 +327,7 @@ pub struct ChangesQuery {
     pub max_staleness_ms: Option<u64>,
 }
 
-fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+fn deserialize_bool_param<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
     match String::deserialize(d)?.as_str() {
         "true" | "1" | "" => Ok(true),
         "false" | "0" => Ok(false),

@@ -1785,11 +1785,10 @@ fn version_samples_are_spaced_and_reach_a_lifetime_back() {
     });
 }
 
-/// A tombstone may be purged once the commit after it is older than a transaction lifetime plus
-/// the clock error on both sides: that commit was prepared only after the tombstone's version was
-/// visible, while the tombstone's own version time may precede its visibility.
+/// A tombstone can be purged only after a subsequent commit exceeds the purge window.
+/// The tombstone's own version timestamp can precede the time when its manifest write completed.
 #[test]
-fn tail_tombstones_are_dropped_once_a_later_commit_is_a_transaction_lifetime_old() {
+fn tail_tombstones_are_purged_after_subsequent_commit_ages() {
     rt().block_on(async {
         let (eng, _store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
@@ -1819,10 +1818,10 @@ fn tail_tombstones_are_dropped_once_a_later_commit_is_a_transaction_lifetime_old
     });
 }
 
-/// Commits that share a batch become visible together, once the batch's manifest write lands, so a
-/// tombstone written early in a stalled batch is kept a full window after the stall too.
+/// All commits in a batch become visible when the batch manifest write completes.
+/// A tombstone in a stalled batch is retained for a full purge window after the write completes.
 #[test]
-fn tombstones_of_a_stalled_batch_outlive_the_stall() {
+fn tombstones_in_stalled_batch_wait_for_write_completion() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
@@ -1863,11 +1862,10 @@ fn tombstones_of_a_stalled_batch_outlive_the_stall() {
     });
 }
 
-/// A lease holder's manifest write can land in storage long before its reply arrives, and another
-/// node can serve the new version from storage meanwhile. A bounded-staleness read on the lease
-/// holder must then not return the older version once the bound has passed.
+/// Object storage can apply a manifest write from the lease holder before the response returns.
+/// Once the staleness bound elapses, a snapshot read on the lease holder must load the new version.
 #[test]
-fn bounded_staleness_reads_on_the_lease_holder_see_its_landed_write() {
+fn snapshot_reads_on_lease_holder_load_completed_write() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
@@ -1881,7 +1879,7 @@ fn bounded_staleness_reads_on_the_lease_holder_see_its_landed_write() {
         let replica = second_node(&eng, &store, "b").db("d");
         replica.open(false).await.unwrap();
         let seen = replica.snapshot(Consistency::Strong).await.unwrap().version.get_entry(b"k").await.unwrap();
-        assert_eq!(seen.map(|e| e.value), Some(inline("2")), "setup: the write did not land before its reply");
+        assert_eq!(seen.map(|e| e.value), Some(inline("2")), "setup: the write was not applied before its response");
         tokio::time::sleep(Duration::from_millis(100)).await;
         let stale = Consistency::Snapshot { max_staleness_ms: 56 };
         let read = db.snapshot(stale).await.unwrap().version.get_entry(b"k").await.unwrap();
@@ -1890,10 +1888,10 @@ fn bounded_staleness_reads_on_the_lease_holder_see_its_landed_write() {
     });
 }
 
-/// A lease holder that loads its own landed write from storage before the write's reply receives
-/// the lease with that reply, so it must not write the manifest again to request one.
+/// A lease holder that refreshes its own in-flight write from storage receives the lease when the
+/// write completes. It does not issue an extra manifest write to acquire a lease.
 #[test]
-fn a_lease_holder_that_loads_its_own_write_early_does_not_request_a_lease() {
+fn lease_holder_refreshing_own_write_reuses_in_flight_lease() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
@@ -1916,8 +1914,8 @@ fn a_lease_holder_that_loads_its_own_write_early_does_not_request_a_lease() {
     });
 }
 
-/// Measures reads on a lease holder that commits continuously, and checks each read against the
-/// version that storage held when the read's staleness bound began.
+/// Reads from a lease holder during continuous commits must return versions within the requested
+/// staleness bound.
 #[test]
 fn lease_holder_reads_during_commits() {
     let modes = [

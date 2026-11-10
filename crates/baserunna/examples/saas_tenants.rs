@@ -12,7 +12,7 @@ use baserunna::meta::SignupPolicy;
 use baserunna_client::{Client, HttpTransport, Op, api};
 use common::step;
 
-/// Returns the names of the databases that `client` can list.
+/// Lists the database names visible to `client`.
 async fn db_names(client: &Client) -> Result<Vec<String>, baserunna_client::Error> {
     let page = client.list_dbs(api::ListDbsQuery::default()).await?;
     Ok(page.databases.into_iter().map(|d| d.name).collect())

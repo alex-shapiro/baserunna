@@ -4,21 +4,21 @@ use crate::api::{self, Endpoint as _, ErrorCode, Outcome};
 use crate::result::decode_results;
 use crate::{Db, Error, Op, OpResult, TransportError};
 
-/// Interactive serializable transaction on a [`Db`], begun by the first [`Txn::run`] that has
-/// operations.
+/// Interactive serializable transaction on a [`Db`].
 ///
-/// After a request on the transaction fails, later calls return the same error. Dropping a begun
-/// transaction without [`Txn::commit`] or [`Txn::abort`], such as when its task is cancelled,
-/// aborts it in the background on the current Tokio runtime.
+/// The transaction begins on the server with the first non-empty [`Txn::run`]. After a request
+/// fails, subsequent calls return the same error. If an open transaction is dropped before
+/// [`Txn::commit`] or [`Txn::abort`], it is aborted in the background on the current Tokio
+/// runtime.
 #[derive(Debug)]
 pub struct Txn {
     db: Db,
-    /// The transaction on the server once it began, until it ends.
+    /// Server transaction IDs once begun.
     open: Option<Open>,
     writes: Vec<Op>,
     wrote: bool,
     failed: Option<Error>,
-    /// Time of the first request, which bounds how long a commit status remains definitive.
+    /// Start time of the first request.
     started: Option<tokio::time::Instant>,
 }
 
@@ -33,11 +33,11 @@ struct Open {
 pub struct Committed {
     pub version: u64,
     pub commit_id: String,
-    /// First sequence number assigned to each `append` operation, in order.
+    /// First sequence number assigned to each [`Op::Append`] in the transaction.
     pub appends: Vec<u64>,
 }
 
-/// Error type of a transaction loop that can carry a client [`Error`].
+/// Error type for a [`Retry`] loop that can wrap a client [`Error`].
 pub trait TxnError: From<Error> {
     fn client_error(&self) -> Option<&Error>;
 }
@@ -53,7 +53,7 @@ impl Txn {
         Txn { db, open: None, writes: Vec::new(), wrote: false, failed: None, started: None }
     }
 
-    /// Executes `ops` and returns one result per operation.
+    /// Executes `ops` in the transaction.
     pub async fn run(&mut self, ops: &[Op]) -> Result<Vec<OpResult>, Error> {
         if let Some(e) = &self.failed {
             return Err(e.clone());
@@ -65,16 +65,16 @@ impl Txn {
         self.started.get_or_insert_with(tokio::time::Instant::now);
         let api_ops: Vec<api::Op> = self.writes.drain(..).map(Op::into_api).chain(ops.iter().map(Op::to_api)).collect();
         self.wrote |= api_ops.iter().any(api::Op::is_write);
-        // The transaction counts as failed until the request completes, so that it cannot commit
-        // operations of a request that its caller cancelled.
-        let cancelled = TransportError::Unknown("a request on the transaction was cancelled".into());
-        self.failed = Some(not_applied(&Error::Transport(cancelled)));
+        // Mark the transaction as failed while the request is in flight so a canceled request
+        // prevents a later commit.
+        let canceled = TransportError::Unknown("a request on the transaction was canceled".into());
+        self.failed = Some(not_applied(&Error::Transport(canceled)));
         let (path, sent) = match &self.open {
             None => {
                 let b =
                     api::BeginRequest { encoding: api::Encoding::Base64, ops: api_ops, ..api::BeginRequest::default() };
                 let r = begin(self.db.clone(), b).await.map(|mut g| {
-                    let r = g.begun.take().expect("a begin guard holds its transaction until taken");
+                    let r = g.begun.take().expect("response is present");
                     self.open = Some(Open { id: r.txn_id, commit_id: r.commit_id });
                     r.results
                 });
@@ -104,19 +104,15 @@ impl Txn {
         Ok(self.run(std::slice::from_ref(&op)).await?.swap_remove(0))
     }
 
-    /// Queues `ops` to execute with the next request on the transaction, a [`Txn::run`] or the
-    /// commit, before that request's own operations.
+    /// Queues write operations to send with the next [`Txn::run`] or [`Txn::commit`].
     pub fn write(&mut self, ops: impl IntoIterator<Item = Op>) {
         self.writes.extend(ops);
     }
 
-    /// Executes the queued writes and commits, which validates the reads of a read-only
-    /// transaction, and returns `None` if the transaction wrote nothing. A transaction that never
-    /// began commits its writes in one request.
+    /// Flushes queued writes and commits the transaction.
     ///
-    /// If the commit outcome is unknown, the commit is resolved through the server: the result is
-    /// the commit, an [`Error::NotApplied`], or the original error if the server cannot be
-    /// reached.
+    /// Returns `None` if the transaction did not modify any data. If the commit outcome is
+    /// unknown, this method queries the commit status on the server.
     pub async fn commit(mut self) -> Result<Option<Committed>, Error> {
         let r = self.try_commit().await;
         if r.is_err() {
@@ -125,8 +121,7 @@ impl Txn {
         r
     }
 
-    /// Commits like [`Txn::commit`], but leaves a transaction whose commit was refused open for the
-    /// caller to abort.
+    /// Commits like [`Txn::commit`], leaving the transaction open for the caller to abort on error.
     async fn try_commit(&mut self) -> Result<Option<Committed>, Error> {
         if let Some(e) = self.failed.clone() {
             return Err(e);
@@ -146,14 +141,13 @@ impl Txn {
                 return Ok(c.committed.then_some(done));
             }
             Err(e) if e.outcome() == Outcome::NotApplied => {
-                // A commit rejected before it reached the transaction, such as by a rate limit, leaves it open.
+                // The transaction remains open on the server if the commit was not applied.
                 self.failed = Some(e.clone());
                 return Err(e);
             }
             Err(e) => e,
         };
-        // The server ends a transaction once its commit arrives, so after an unknown outcome an
-        // abort matters only if the commit was lost on the way, and is not waited for.
+        // Spawn the abort in the background in case the commit request never reached the server.
         if !wrote {
             self.end_later();
             return Err(Error::NotApplied(Box::new(err)));
@@ -167,8 +161,7 @@ impl Txn {
         resolved.map(Some)
     }
 
-    /// Aborts the transaction, ignoring failures because the server aborts an idle transaction
-    /// after its timeout. If the abort is cancelled, dropping the transaction aborts it again.
+    /// Aborts the transaction on the server.
     pub async fn abort(mut self) {
         self.end().await;
     }
@@ -202,7 +195,7 @@ impl Drop for Txn {
     }
 }
 
-/// Transaction that a begin opened, which is aborted when dropped unless [`Txn::run`] takes it.
+/// Guard that aborts a newly begun transaction if dropped before [`Txn::run`] takes it.
 struct Begun {
     db: Db,
     begun: Option<api::Begun>,
@@ -216,8 +209,8 @@ impl Drop for Begun {
     }
 }
 
-/// Begins a transaction on `db` in a task of its own, so that if the caller stops waiting, such as
-/// when its task is cancelled, the transaction is aborted once the server returns it.
+/// Spawns the begin request in a separate task so [`Begun`] aborts the transaction if the
+/// caller is canceled.
 async fn begin(db: Db, body: api::BeginRequest) -> Result<Begun, Error> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -228,8 +221,7 @@ async fn begin(db: Db, body: api::BeginRequest) -> Result<Begun, Error> {
     rx.await.unwrap_or_else(|_| Err(stopped()))
 }
 
-/// Returns the error of a failed request on a transaction, which is [`Error::NotApplied`] even if
-/// the request's outcome is unknown, because the transaction never commits after it fails.
+/// Wraps an unknown error in [`Error::NotApplied`] because a failed transaction cannot commit.
 fn not_applied(e: &Error) -> Error {
     match e.outcome() {
         Outcome::Unknown => Error::NotApplied(Box::new(e.clone())),
@@ -237,7 +229,7 @@ fn not_applied(e: &Error) -> Error {
     }
 }
 
-/// Returns true if the server discarded the transaction when it returned `e`.
+/// Returns true if `e` indicates that the transaction is already closed on the server.
 fn ends_txn(e: &Error) -> bool {
     matches!(e.code(), Some(ErrorCode::TxnNotFound | ErrorCode::Conflict))
 }
@@ -247,7 +239,7 @@ async fn abort(db: &Db, id: String) {
     let _ = db.client().send(&e, &api::NoBody {}).await;
 }
 
-/// Aborts transaction `id` in the background on the current Tokio runtime, if there is one.
+/// Spawns a background task on the current Tokio runtime to abort transaction `id`.
 fn abort_later(db: Db, id: String) {
     if let Ok(rt) = tokio::runtime::Handle::try_current() {
         rt.spawn(async move { abort(&db, id).await });
@@ -281,9 +273,10 @@ impl Db {
     }
 }
 
-/// Retry state of a transaction loop, which restarts a transaction up to
-/// [`RetryPolicy::txn_attempts`](crate::RetryPolicy::txn_attempts) times if it conflicts or
-/// fails before it could apply.
+/// Retry state for an interactive transaction loop.
+///
+/// Restarts the transaction up to [`RetryPolicy::txn_attempts`](crate::RetryPolicy::txn_attempts)
+/// times on conflict or transient failure.
 #[derive(Debug)]
 pub struct Retry {
     db: Db,
@@ -291,11 +284,10 @@ pub struct Retry {
 }
 
 impl Retry {
-    /// Commits `txn` if `result` is `Ok`, or aborts it otherwise, during the backoff if the
-    /// transaction runs again.
+    /// Commits `txn` if `result` is `Ok`, or aborts it on error.
     ///
-    /// Returns the committed result, `Ok(None)` after a backoff if the transaction should run
-    /// again, or the error that ends the loop.
+    /// Returns `Ok(Some(value))` on commit, `Ok(None)` after backing off to retry the
+    /// transaction, or `Err` on a terminal error.
     pub async fn finish<T, E: TxnError>(&mut self, mut txn: Txn, result: Result<T, E>) -> Result<Option<T>, E> {
         let err = match result {
             Ok(v) => match txn.try_commit().await {

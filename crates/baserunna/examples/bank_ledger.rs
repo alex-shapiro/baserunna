@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const ACCOUNTS: usize = 8;
 
-/// Decodes the decimal integer that `e` holds.
+/// Parses the decimal integer in `e`.
 fn amount(e: &Entry) -> i64 {
     e.value
         .data()
@@ -30,8 +30,8 @@ fn balance(r: OpResult) -> Result<i64, Error> {
     Ok(amount(&r.entry()?.expect("accounts exist")))
 }
 
-/// Moves `amount` from account `from` to `to` if `from` holds enough, and logs the transfer as
-/// transfer `n` of `teller`.
+/// Moves `amount` from account `from` to `to` if `from` has enough funds.
+/// Logs the transfer under `log/{teller}/{n}`.
 async fn transfer(
     db: &Db,
     (teller, n): (u64, u32),
@@ -59,8 +59,8 @@ async fn transfer(
             Ok(true)
         }
         .await;
-        // The commit fails with a conflict if another teller changed either balance after this
-        // transaction read it; `finish` then backs off and the loop runs the transfer again.
+        // A concurrent update to either account causes a commit conflict.
+        // On conflict, `finish` backs off and returns `None` so the loop retries.
         if let Some(moved) = retry.finish(txn, moved).await? {
             return Ok(moved);
         }

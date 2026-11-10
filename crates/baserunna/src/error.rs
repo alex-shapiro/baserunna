@@ -10,7 +10,7 @@ pub enum Error {
     Unauthenticated(String),
     PermissionDenied(String),
     NotFound(String),
-    /// The thing that a request names does not exist, of a kind that the error reports.
+    /// Resource not found, with the missing resource kind.
     Missing(baserunna_api::Missing, String),
     TxnNotFound(String),
     /// Optimistic concurrency conflict; retrying the transaction may succeed.
@@ -57,8 +57,8 @@ impl Error {
         Error::NotFound(m.into())
     }
 
-    pub fn missing(what: baserunna_api::Missing, m: impl Into<String>) -> Error {
-        Error::Missing(what, m.into())
+    pub fn missing(kind: baserunna_api::Missing, m: impl Into<String>) -> Error {
+        Error::Missing(kind, m.into())
     }
 
     pub fn internal(m: impl Into<String>) -> Error {

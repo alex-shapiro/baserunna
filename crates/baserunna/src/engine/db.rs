@@ -177,7 +177,7 @@ struct State {
     /// Hedged manifest `PUT` requests that remain in flight in the background.
     /// Lease-based reads are disabled while this count is non-zero.
     in_flight_hedged_puts: u32,
-    /// Start of this node's manifest write that is in flight, if any.
+    /// Start instant of this node's in-flight manifest write.
     manifest_write_started_at: Option<Instant>,
     compacting: bool,
     flushing: bool,
@@ -1423,7 +1423,6 @@ impl Db {
         }
     }
 
-    /// Records the start of a manifest write and returns its start instant.
     fn write_started(&self) -> Instant {
         let started = Instant::now();
         self.st.lock().manifest_write_started_at = Some(started);
@@ -1978,8 +1977,8 @@ impl Db {
                 !retire
             });
             m.tombstone_horizon = horizon;
-            // Sample the base rather than this batch's version: storage confirmed the base, so it was
-            // visible by now, while this batch becomes visible only once its manifest write lands.
+            // Record `base.m.version` because object storage has already confirmed it.
+            // `m.version` is not visible to readers until this manifest write completes.
             if data_changed && m.version_times.last().is_none_or(|(_, t)| *t + cfg.version_sample_ms <= now_ms) {
                 m.version_times.push((base.m.version, now_ms));
             }
@@ -2941,7 +2940,7 @@ mod tests {
     }
 
     #[test]
-    fn leased_cache_is_current_until_the_in_flight_write_started() {
+    fn leased_cache_age_tracks_in_flight_manifest_write() {
         use crate::engine::tests::{delayed_engine, opened, put};
         use std::sync::atomic::Ordering::SeqCst;
         rt().block_on(async {

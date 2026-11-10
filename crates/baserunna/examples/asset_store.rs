@@ -18,7 +18,7 @@ use common::step;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-/// Asset row as read: the `file` column holds the blob's metadata.
+/// Asset row read from the table. The `file` column holds the blob metadata.
 #[derive(Serialize, Deserialize)]
 struct Asset {
     id: String,
@@ -32,7 +32,7 @@ impl Row for Asset {
     const TABLE: &str = "assets";
 }
 
-/// Asset row as written: the `file` column takes the `blob_id` of a staged blob.
+/// Asset row written to the table. The `file` column holds a staged `blob_id`.
 #[derive(Serialize, Deserialize)]
 struct NewAsset {
     id: String,

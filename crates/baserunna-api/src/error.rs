@@ -1,3 +1,5 @@
+//! API error response types.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,7 +12,7 @@ pub struct ApiError {
     pub code: ErrorCode,
     #[serde(default)]
     pub message: String,
-    /// True if repeating the same request later can succeed.
+    /// True if the request can succeed on retry.
     #[serde(default)]
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -27,12 +29,12 @@ pub enum ErrorCode {
     Unauthenticated,
     PermissionDenied,
     NotFound,
-    /// 404: the interactive transaction expired, was aborted, or its node changed.
+    /// 404: the interactive transaction expired, was aborted, or is held by another node.
     TxnNotFound,
-    /// 409: a concurrent transaction conflicted; a retry can succeed.
+    /// 409: a concurrent transaction conflicted.
     Conflict,
     AlreadyExists,
-    /// 409: an earlier attempt with the same idempotency key was aborted; retry with a new key.
+    /// 409: an earlier attempt with the same idempotency key was aborted.
     Aborted,
     /// 412: a `check` or `copy` operation failed at `details.op_index`.
     PreconditionFailed,
@@ -43,11 +45,11 @@ pub enum ErrorCode {
     QuotaExceeded,
     /// 429: wait `details.retry_after_ms` before the next request.
     RateLimited,
-    /// 503: the service cannot complete the request now; `details.outcome` indicates whether a
-    /// write was applied.
+    /// 503: the server cannot complete the request. `details.outcome` reports whether a write was
+    /// applied.
     Unavailable,
     Internal,
-    /// Error code from a newer server release.
+    /// Error code added by a newer server.
     #[serde(other)]
     Unknown,
 }
@@ -89,18 +91,18 @@ pub struct ErrorDetails {
     /// Delay in milliseconds before the next request (`rate_limited`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
-    /// What was not found, if the server names it (`not_found`).
+    /// Resource kind that was not found (`not_found`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missing: Option<Missing>,
 }
 
-/// Kind of thing that a `not_found` error found missing.
+/// Resource kind reported by a `not_found` error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Missing {
-    /// The key of a raw key-value read holds no value.
+    /// Key requested by a raw key-value read.
     Key,
-    /// Kind added by a newer server.
+    /// Resource kind added by a newer server.
     #[serde(other)]
     Unknown,
 }

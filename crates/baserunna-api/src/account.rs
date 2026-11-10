@@ -4,7 +4,7 @@ use crate::{Empty, Endpoint, NoBody, fill_route, is_false, json_body, with_query
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
-/// `POST /v1/auth/signup`: registers an account and starts a session.
+/// `POST /v1/auth/signup`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SignUp;
 
@@ -24,7 +24,7 @@ impl Endpoint for SignUp {
     }
 }
 
-/// `POST /v1/auth/login`: starts a session with an email and password.
+/// `POST /v1/auth/login`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LogIn;
 
@@ -44,7 +44,7 @@ impl Endpoint for LogIn {
     }
 }
 
-/// `GET /v1/me`: reads the authenticated user and credential.
+/// `GET /v1/me`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GetMe;
 
@@ -102,7 +102,7 @@ pub enum Credential {
     Session,
     ApiKey {
         id: String,
-        /// Database that the key is restricted to, or `None` for all user databases.
+        /// Database that the key is scoped to, or `None` for all of the user's databases.
         db: Option<String>,
         read_only: bool,
         /// Maximum requests per second per node, or `None` for the default limit.
@@ -110,7 +110,7 @@ pub enum Credential {
     },
 }
 
-/// `POST /v1/orgs`: creates an organization owned by the authenticated user.
+/// `POST /v1/orgs`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CreateOrg;
 
@@ -130,7 +130,7 @@ impl Endpoint for CreateOrg {
     }
 }
 
-/// `POST /v1/orgs/{org}/members`: adds a registered user to an organization.
+/// `POST /v1/orgs/{org}/members`.
 #[derive(Clone, Debug)]
 pub struct AddMember {
     pub org: String,
@@ -152,7 +152,7 @@ impl Endpoint for AddMember {
     }
 }
 
-/// `DELETE /v1/orgs/{org}/members/{user}`: removes a member from an organization.
+/// `DELETE /v1/orgs/{org}/members/{user}`.
 #[derive(Clone, Debug)]
 pub struct RemoveMember {
     pub org: String,
@@ -215,7 +215,7 @@ pub struct Member {
 
 json_body!(Credentials, Session, Me, NewOrg, Org, NewMember, Member);
 
-/// `POST /v1/api-keys`: creates an API key for the session's user. Only a session can manage keys.
+/// `POST /v1/api-keys`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CreateApiKey;
 
@@ -235,7 +235,7 @@ impl Endpoint for CreateApiKey {
     }
 }
 
-/// `GET /v1/api-keys`: lists the session user's API keys.
+/// `GET /v1/api-keys`.
 #[derive(Clone, Debug, Default)]
 pub struct ListApiKeys {
     pub query: PageQuery,
@@ -257,7 +257,7 @@ impl Endpoint for ListApiKeys {
     }
 }
 
-/// `DELETE /v1/api-keys/{id}`: revokes an API key.
+/// `DELETE /v1/api-keys/{id}`.
 #[derive(Clone, Debug)]
 pub struct DeleteApiKey {
     pub id: String,
@@ -279,7 +279,7 @@ impl Endpoint for DeleteApiKey {
     }
 }
 
-/// Page size and position of a listing.
+/// Pagination parameters for a list request.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,7 +292,7 @@ pub struct PageQuery {
 #[serde(deny_unknown_fields)]
 pub struct NewApiKey {
     pub name: String,
-    /// Database to restrict the key to, or `None` for all of the user's databases.
+    /// Database to scope the key to, or `None` for all of the user's databases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -304,7 +304,7 @@ pub struct NewApiKey {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreatedApiKey {
-    /// Secret to authenticate with, returned only once.
+    /// Secret bearer token, returned only at creation.
     pub key: String,
     pub api_key: ApiKey,
 }

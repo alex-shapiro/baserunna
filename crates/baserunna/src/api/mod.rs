@@ -77,7 +77,7 @@ pub fn api_error(e: &Error) -> api::ApiError {
         Error::RateLimited { retry_after_ms, .. } => {
             details(api::ErrorDetails { retry_after_ms: Some(*retry_after_ms), ..api::ErrorDetails::default() })
         }
-        Error::Missing(what, _) => details(api::ErrorDetails { missing: Some(*what), ..api::ErrorDetails::default() }),
+        Error::Missing(kind, _) => details(api::ErrorDetails { missing: Some(*kind), ..api::ErrorDetails::default() }),
         _ => None,
     };
     api::ApiError { code: e.api_code(), message: e.message(), retryable: e.retryable(), details }
@@ -121,7 +121,7 @@ fn error_from_api(status: u16, e: api::ApiError) -> Error {
         C::InvalidArgument => Error::InvalidArgument(m),
         C::Unauthenticated => Error::Unauthenticated(m),
         C::PermissionDenied => Error::PermissionDenied(m),
-        C::NotFound if let Some(what) = d.missing => Error::Missing(what, m),
+        C::NotFound if let Some(kind) = d.missing => Error::Missing(kind, m),
         C::NotFound => Error::NotFound(m),
         C::TxnNotFound => Error::TxnNotFound(m),
         C::Conflict => Error::Conflict(m),
@@ -827,7 +827,7 @@ pub fn consistency_of(q: &std::collections::BTreeMap<String, String>) -> Result<
     Ok(consistency_from(c, max_staleness_ms))
 }
 
-/// Converts a typed `consistency` query, defaulting to strong reads and a 5 s snapshot staleness.
+/// Converts query parameters into [`Consistency`].
 pub(crate) fn consistency_from(c: Option<api::Consistency>, max_staleness_ms: Option<u64>) -> Consistency {
     match c {
         None | Some(api::Consistency::Strong) => Consistency::Strong,
@@ -873,7 +873,7 @@ macro_rules! run_txn {
                         t => match ctx_.db.revalidate(t).await? {
                             Some(version) => match out_ {
                                 Ok(out) => {
-                                    break crate::api::wrote_nothing(ctx_, commit_id_, key_, out, version).await?;
+                                    break crate::api::finish_read_only(ctx_, commit_id_, key_, out, version).await?;
                                 }
                                 Err(e) => break crate::api::failed(ctx_, commit_id_, key_, e).await?,
                             },
@@ -933,10 +933,10 @@ pub(crate) async fn earlier_attempt(ctx: &DbCtx, commit_id: u64, key: Option<&st
     }
 }
 
-/// Returns the outcome of a request whose run read version `version` and wrote nothing. With an
-/// idempotency key, an earlier attempt may have applied after [`earlier_attempt`] looked, so that
-/// this run saw its effects, so the key is resolved like a definitive failure in [`failed`].
-pub(crate) async fn wrote_nothing<T>(
+/// Finishes a read-only transaction at `version`.
+///
+/// If `key` is set, checks whether an earlier attempt was committed after [`earlier_attempt`] ran.
+pub(crate) async fn finish_read_only<T>(
     ctx: &DbCtx,
     commit_id: u64,
     key: Option<&str>,
@@ -961,7 +961,7 @@ pub(crate) async fn finish<T>(
     attempt: &mut u32,
 ) -> Result<Option<Ran<T>>> {
     if t.is_read_only() {
-        return wrote_nothing(ctx, t.commit_id, key, out, t.read_version()).await.map(Some);
+        return finish_read_only(ctx, t.commit_id, key, out, t.read_version()).await.map(Some);
     }
     let commit_id = t.commit_id;
     let mut req = t.into_request();
@@ -981,10 +981,10 @@ pub(crate) async fn finish<T>(
     }
 }
 
-/// Resolves a failed transaction. If a request with an idempotency key failed for good, such as on a
-/// precondition or an existing row that an earlier attempt of it may have written, resolves the
-/// commit: the result is `Ran::Replayed` if an earlier attempt applied, and otherwise the error,
-/// after fencing any attempt still in flight.
+/// Resolves a failed transaction.
+///
+/// If an idempotent request fails with a non-retryable error, resolves `commit_id` to replay a
+/// committed attempt or fence an in-flight attempt.
 pub(crate) async fn failed<T>(ctx: &DbCtx, commit_id: u64, key: Option<&str>, e: Error) -> Result<Ran<T>> {
     let definitive = !e.retryable() && !matches!(e, Error::Internal(_));
     if key.is_none() || !definitive {
@@ -1182,7 +1182,7 @@ pub(crate) use axum::extract::Query as QueryParams;
 
 pub(crate) type Params = QueryParams<std::collections::BTreeMap<String, String>>;
 
-/// Extracts the `limit` and `cursor` query parameters of a listing.
+/// Extracts `limit` and `cursor` query parameters.
 pub(crate) fn paging(q: &Params) -> Result<(usize, Option<String>)> {
     let limit = q.get("limit").map(|l| l.parse().map_err(|_| crate::ops::limit_error())).transpose()?;
     Ok((crate::ops::page_limit(limit)?, q.get("cursor").filter(|c| !c.is_empty()).cloned()))

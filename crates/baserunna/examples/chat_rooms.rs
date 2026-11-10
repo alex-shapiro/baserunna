@@ -1,11 +1,11 @@
 //! Chat rooms on streams.
 //!
-//! Each room is a stream, created by its first message. Posting a message
-//! appends to the room and bumps the poster's message count in one
-//! transaction; members receive new messages by waiting on the room;
-//! `expect_seq` lets a client post only if it has seen everything before;
-//! and each member's read position is a consumer cursor, so unread counts
-//! come from the stream itself.
+//! Each room is a stream created by its first message. Posting a message
+//! appends to the room and increments the poster's message count in a single
+//! transaction. Members wait on the room to receive new messages. With
+//! `expect_seq`, a client posts only if it has read all prior messages. Each
+//! member's read position is stored as a consumer cursor, which tracks unread
+//! counts in the stream.
 //!
 //! Run: `cargo run --example chat_rooms`
 
@@ -30,7 +30,7 @@ impl Message {
     }
 }
 
-fn message(r: &api::StreamRecord) -> Result<Message, serde_json::Error> {
+fn parse_message(r: &api::StreamRecord) -> Result<Message, serde_json::Error> {
     serde_json::from_value(r.json.clone().unwrap_or_default())
 }
 
@@ -43,7 +43,7 @@ async fn post(db: &Db, room: &str, from: &str, text: &str) -> Result<u64, Box<dy
 
 fn print_messages(prefix: &str, page: &api::RecordPage) -> Result<(), serde_json::Error> {
     for r in &page.records {
-        let m = message(r)?;
+        let m = parse_message(r)?;
         println!("    {prefix}#{} {}: {}", r.seq, m.from, m.text);
     }
     Ok(())
@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let unread = db
         .read_records("room:general", api::ReadRecordsQuery { consumer: Some("ann".into()), ..Default::default() })
         .await?;
-    let texts = unread.records.iter().map(|r| message(r).map(|m| m.text)).collect::<Result<Vec<_>, _>>()?;
+    let texts = unread.records.iter().map(|r| parse_message(r).map(|m| m.text)).collect::<Result<Vec<_>, _>>()?;
     println!("    ann's unread: {texts:?}");
 
     step(5, "History: the last three messages, newest first, and messages from Ann");

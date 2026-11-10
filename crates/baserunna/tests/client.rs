@@ -1,5 +1,5 @@
-//! End-to-end tests of `baserunna-client` against an in-process node, including responses lost
-//! before or after the server applied a commit.
+//! End-to-end tests for `baserunna-client` against an in-process node.
+//! Covers dropped requests, lost responses, slow responses, and concurrent transactions.
 
 use baserunna::env::Env;
 use baserunna::node::{Node, NodeConfig, Services};
@@ -14,21 +14,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tower::ServiceExt;
 
-/// How [`Router`] fails the next request to `fail_route`.
+/// Fault injected by [`Router`] on requests to `fail_route`.
 #[derive(Clone, Copy, PartialEq)]
 enum Fault {
     None,
-    /// Drops the request without sending it, reporting an unknown outcome.
+    /// Drops the request before it reaches the server and returns an unknown transport error.
     Drop,
-    /// Sends the request and drops the response, reporting an unknown outcome.
+    /// Executes the request on the server and drops the response.
     LoseResponse,
-    /// Sends the request and never returns its response.
+    /// Executes the request on the server and hangs without returning.
     Hang,
-    /// Sends the request and returns its response after 500 ms.
+    /// Executes the request on the server and delays the response by 500 ms.
     Slow,
 }
 
-/// Transport that sends requests to an in-process router and can fail one route.
+/// In-process transport that injects faults on a target route.
 struct Router {
     app: axum::Router,
     fail_route: &'static str,
@@ -148,23 +148,23 @@ fn item(owner: &str, id: i64) -> Item {
     Item { owner: owner.into(), id, label: None }
 }
 
-/// Returns `db` on a client that sends each request once.
-fn once(db: &Db) -> Db {
+/// Returns a handle to `db` that sends each request at most once without retrying.
+fn without_retries(db: &Db) -> Db {
     db.client().with_retry_policy(baserunna_client::RetryPolicy { attempts: 1, ..Default::default() }).db(db.name())
 }
 
-/// Waits up to `within` for `router` to receive a request after its first `sent`.
-async fn next_request(router: &Router, sent: usize, within: Duration) -> bool {
+/// Waits up to `timeout` for `router` to receive a request beyond `sent`.
+async fn wait_for_next_request(router: &Router, sent: usize, timeout: Duration) -> bool {
     let next = async {
         while router.sent.load(Ordering::Relaxed) == sent {
             tokio::task::yield_now().await;
         }
     };
-    tokio::time::timeout(within, next).await.is_ok()
+    tokio::time::timeout(timeout, next).await.is_ok()
 }
 
-/// Reads every page of `op` in one-shot reads.
-async fn pages(db: &Db, mut op: Op) -> Vec<OpResult> {
+/// Reads every page of `op` using one-shot reads.
+async fn read_all_pages(db: &Db, mut op: Op) -> Vec<OpResult> {
     let mut out = Vec::new();
     loop {
         let r = db.read_one(op.clone()).await.unwrap();
@@ -178,7 +178,7 @@ async fn pages(db: &Db, mut op: Op) -> Vec<OpResult> {
 }
 
 #[tokio::test]
-async fn tables_rows_streams_and_keys_round_trip_through_the_server() {
+async fn tables_rows_streams_and_keys_are_written_and_read_back() {
     let (db, _) = node("").await;
     let again = db.create_table(&table()).await.unwrap();
     assert_eq!(again.table.primary_key, ["owner", "id"], "creating an existing table returns its schema");
@@ -189,10 +189,10 @@ async fn tables_rows_streams_and_keys_round_trip_through_the_server() {
     let rows: Vec<Op> = (0..2500).map(|i| Op::insert(&item(if i % 2 == 0 { "a" } else { "b" }, i))).collect();
     db.write(&rows).await.unwrap();
     let a: Vec<Item> =
-        pages(&db, Op::query::<Item>("a")).await.into_iter().flat_map(|r| r.rows::<Item>().unwrap()).collect();
-    assert_eq!(a.len(), 1250, "a prefix query pages through every matching row");
+        read_all_pages(&db, Op::query::<Item>("a")).await.into_iter().flat_map(|r| r.rows::<Item>().unwrap()).collect();
+    assert_eq!(a.len(), 1250, "a prefix query returns every matching row across pages");
     assert!(a.iter().all(|i| i.owner == "a") && a.windows(2).all(|w| w[0].id < w[1].id));
-    let all = pages(&db, Op::query_all::<Item>()).await;
+    let all = read_all_pages(&db, Op::query_all::<Item>()).await;
     assert_eq!((all.len(), all.into_iter().map(|r| r.rows::<Item>().unwrap().len()).sum::<usize>()), (3, 2500));
 
     let set = serde_json::json!({"label": "x"});
@@ -209,15 +209,15 @@ async fn tables_rows_streams_and_keys_round_trip_through_the_server() {
         db.write(&[Op::append("log", &events[..1500]), Op::append("log", &events[1500..])]).await.unwrap().unwrap();
     assert_eq!(appended.appends, [0, 1500]);
     let read: Vec<u64> =
-        pages(&db, Op::read_stream("log", 0)).await.into_iter().flat_map(|r| r.records().unwrap()).collect();
+        read_all_pages(&db, Op::read_stream("log", 0)).await.into_iter().flat_map(|r| r.records().unwrap()).collect();
     assert_eq!(read, events);
 
     let keys: Vec<Op> = (0..1500).map(|i| Op::put(format!("k/{i:04}"), vec![0xff, i as u8])).collect();
     db.write(&keys).await.unwrap();
-    let scanned = pages(&db, Op::scan("k/")).await;
+    let scanned = read_all_pages(&db, Op::scan("k/")).await;
     let entries: Vec<_> = scanned.into_iter().flat_map(|r| r.scan_page().unwrap().entries).collect();
     assert_eq!(entries.len(), 1500);
-    assert_eq!(entries[1].value.data().unwrap().as_ref(), [0xff, 1], "binary values round trip");
+    assert_eq!(entries[1].value.data().unwrap().as_ref(), [0xff, 1], "binary values are preserved");
     assert_eq!(db.read_one(Op::increment("n", 5)).await.unwrap(), OpResult::Increment(5));
 }
 
@@ -228,7 +228,11 @@ async fn a_transaction_reads_its_own_writes_and_commits_its_queued_writes() {
     txn.run(&[Op::put("k", "v"), Op::insert(&item("a", 1))]).await.unwrap();
     let own = txn.run(&[Op::get("k"), Op::get_row::<Item>(("a", 1))]).await.unwrap();
     let OpResult::Get(Some(e)) = &own[0] else { panic!("{own:?}") };
-    assert_eq!((e.version, e.value.data().map(|d| d.as_ref())), (None, Some(&b"v"[..])), "an own write has no version");
+    assert_eq!(
+        (e.version, e.value.data().map(|d| d.as_ref())),
+        (None, Some(&b"v"[..])),
+        "uncommitted write does not have a version"
+    );
     txn.write([Op::append("log", &["one"])]);
     let done = txn.commit().await.unwrap().unwrap();
     assert_eq!(done.appends, [0]);
@@ -238,7 +242,7 @@ async fn a_transaction_reads_its_own_writes_and_commits_its_queued_writes() {
 }
 
 #[tokio::test]
-async fn a_commit_whose_response_is_lost_resolves_as_committed() {
+async fn a_commit_whose_response_is_lost_is_resolved_as_committed() {
     let (db, router) = node(api::CommitTxn::ROUTE).await;
     let mut txn = db.begin();
     txn.run_one(Op::get("n")).await.unwrap();
@@ -250,7 +254,7 @@ async fn a_commit_whose_response_is_lost_resolves_as_committed() {
 }
 
 #[tokio::test]
-async fn a_commit_that_never_arrived_is_fenced_so_a_late_copy_cannot_apply() {
+async fn a_commit_that_never_arrived_is_fenced_so_a_late_copy_is_rejected() {
     let (db, router) = node(api::CommitTxn::ROUTE).await;
     let mut txn = db.begin();
     txn.run_one(Op::get("n")).await.unwrap();
@@ -261,11 +265,11 @@ async fn a_commit_that_never_arrived_is_fenced_so_a_late_copy_cannot_apply() {
     let late = router.dropped.lock().pop().unwrap();
     let resp = Router::call(router.app.clone(), late).await;
     assert_eq!(resp.status(), 409, "{:?}", resp.body());
-    assert_eq!(db.read_one(Op::get("n")).await.unwrap().entry().unwrap(), None, "the fenced commit never applies");
+    assert_eq!(db.read_one(Op::get("n")).await.unwrap().entry().unwrap(), None, "the fenced commit is rejected");
 }
 
 #[tokio::test]
-async fn a_write_applies_once_when_every_response_is_lost() {
+async fn a_write_is_applied_once_if_every_response_is_lost() {
     let (db, router) = node(api::Txn::ROUTE).await;
     router.fail(api::Txn::ROUTE, Fault::LoseResponse, 4);
     let done = db.write(&[Op::increment("n", 1), Op::append("log", &["x"])]).await.unwrap().unwrap();
@@ -283,7 +287,7 @@ async fn a_write_applies_once_when_every_response_is_lost() {
 }
 
 #[tokio::test]
-async fn concurrent_read_modify_writes_serialize_through_retries() {
+async fn concurrent_read_modify_writes_are_serialized_through_retries() {
     let (db, router) = node("").await;
     db.write(&[Op::insert(&Item { label: Some("0".into()), ..item("c", 0) })]).await.unwrap();
     let tasks: Vec<_> = (0..16)
@@ -311,39 +315,39 @@ async fn concurrent_read_modify_writes_serialize_through_retries() {
         t.await.unwrap();
     }
     let c = db.read_one(Op::get_row::<Item>(("c", 0))).await.unwrap().row::<Item>().unwrap().unwrap();
-    assert_eq!(c.label.as_deref(), Some("16"), "every increment applied exactly once");
+    assert_eq!(c.label.as_deref(), Some("16"), "every increment was applied exactly once");
     assert!(router.sent.load(Ordering::Relaxed) >= 16 * 2);
 }
 
 #[tokio::test]
 async fn a_dropped_transaction_is_aborted_and_frees_its_open_transaction_slot() {
     let (db, router) = node_with("", |c| c.txns_per_user = 2).await;
-    let db = once(&db);
+    let db = without_retries(&db);
     for i in 0..5 {
         let mut txn = db.begin();
         let begun = txn.run_one(Op::get("k")).await;
         assert!(begun.is_ok(), "transaction {i} begins after earlier ones were dropped: {begun:?}");
         let sent = router.sent.load(Ordering::Relaxed);
         drop(txn);
-        next_request(&router, sent, Duration::from_millis(500)).await;
+        wait_for_next_request(&router, sent, Duration::from_millis(500)).await;
     }
 }
 
 #[tokio::test]
-async fn a_cancelled_request_keeps_its_transaction_from_committing() {
+async fn a_canceled_request_keeps_its_transaction_from_committing() {
     let (db, router) = node(api::TxnOps::ROUTE).await;
     let mut txn = db.begin();
     txn.run_one(Op::get("k")).await.unwrap();
     router.fail(api::TxnOps::ROUTE, Fault::Hang, 1);
-    let cancelled = tokio::time::timeout(Duration::from_millis(200), txn.run(&[Op::put("k", "cancelled")])).await;
-    assert!(cancelled.is_err(), "the request was cancelled");
+    let canceled = tokio::time::timeout(Duration::from_millis(200), txn.run(&[Op::put("k", "canceled")])).await;
+    assert!(canceled.is_err(), "the request was canceled");
     let committed = txn.commit().await;
-    assert!(committed.is_err(), "a transaction with a cancelled request commits: {committed:?}");
+    assert!(committed.is_err(), "a transaction with a canceled request commits: {committed:?}");
     assert_eq!(db.read_one(Op::get("k")).await.unwrap().entry().unwrap(), None);
 }
 
 #[tokio::test]
-async fn a_write_without_write_operations_checks_its_preconditions_and_commits_nothing() {
+async fn a_write_with_only_checks_validates_preconditions_without_committing() {
     let (db, _) = node("").await;
     assert_eq!(db.write(&[]).await.unwrap(), None);
     let absent = Op::Check { key: "k".into(), expect: Expect::Absent };
@@ -354,7 +358,7 @@ async fn a_write_without_write_operations_checks_its_preconditions_and_commits_n
 }
 
 #[tokio::test]
-async fn a_write_that_changes_nothing_commits_nothing() {
+async fn a_write_that_does_not_modify_rows_does_not_commit() {
     let (db, _) = node("").await;
     let set = serde_json::json!({"label": "x"});
     for op in [
@@ -381,11 +385,11 @@ async fn a_write_that_changes_nothing_commits_nothing() {
 async fn a_begin_whose_caller_stops_waiting_is_aborted() {
     use std::future::Future;
     use std::task::Poll;
-    // The caller leaves before the 500 ms slow response arrives, or after a fast one arrives but
-    // before it reads it.
+    // Test dropping the future both before the response arrives (`slow = true`) and after the
+    // response arrives (`slow = false`).
     for slow in [true, false] {
         let (db, router) = node_with(api::BeginTxn::ROUTE, |c| c.txns_per_user = 1).await;
-        let db = once(&db);
+        let db = without_retries(&db);
         if slow {
             router.fail(api::BeginTxn::ROUTE, Fault::Slow, 1);
         }
@@ -398,7 +402,7 @@ async fn a_begin_whose_caller_stops_waiting_is_aborted() {
         }
         let sent = router.sent.load(Ordering::Relaxed);
         drop(txn);
-        assert!(next_request(&router, sent, Duration::from_secs(5)).await, "the begun transaction is aborted");
+        assert!(wait_for_next_request(&router, sent, Duration::from_secs(5)).await, "the begun transaction is aborted");
         let mut txn = db.begin();
         let begun = txn.run_one(Op::get("k")).await;
         assert!(begun.is_ok(), "a new transaction begins after a slow begin ({slow}): {begun:?}");
@@ -407,12 +411,12 @@ async fn a_begin_whose_caller_stops_waiting_is_aborted() {
 }
 
 #[tokio::test]
-async fn a_begin_retried_after_memory_pressure_eases_succeeds() {
+async fn a_begin_retried_after_memory_is_freed_succeeds() {
     let (db, _) = node_with("", |c| c.engine.memory_bytes = 16 << 20).await;
     let big = |tag: &str| -> Vec<Op> { (0..120).map(|i| Op::put(format!("{tag}{i}"), vec![b'v'; 20_000])).collect() };
     let mut fillers = Vec::new();
     loop {
-        let mut t = once(&db).begin();
+        let mut t = without_retries(&db).begin();
         if t.run(&big(&format!("f{}-", fillers.len()))).await.is_err() {
             break;
         }
@@ -432,7 +436,7 @@ async fn a_begin_retried_after_memory_pressure_eases_succeeds() {
 }
 
 #[tokio::test]
-async fn a_table_with_a_column_type_the_server_does_not_know_is_rejected_even_if_it_exists() {
+async fn a_table_with_an_unknown_column_type_is_rejected_even_if_it_exists() {
     let (db, _) = node("").await;
     for name in ["later", &table().name] {
         let mut t = table();
@@ -444,13 +448,13 @@ async fn a_table_with_a_column_type_the_server_does_not_know_is_rejected_even_if
 }
 
 #[tokio::test]
-async fn a_cancelled_abort_still_frees_the_open_transaction_slot() {
+async fn a_canceled_abort_still_frees_the_open_transaction_slot() {
     let (db, router) = node_with(api::AbortTxn::ROUTE, |c| c.txns_per_user = 1).await;
     let mut txn = db.begin();
     txn.run_one(Op::get("k")).await.unwrap();
     router.fail(api::AbortTxn::ROUTE, Fault::Drop, 1);
     let r = tokio::time::timeout(Duration::from_millis(0), txn.abort()).await;
-    assert!(r.is_err(), "the abort was cancelled");
+    assert!(r.is_err(), "the abort was canceled");
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut txn = db.begin();
     let begun = txn.run_one(Op::get("k")).await;
@@ -459,7 +463,7 @@ async fn a_cancelled_abort_still_frees_the_open_transaction_slot() {
 }
 
 #[tokio::test]
-async fn a_prefix_of_none_or_of_no_columns_selects_no_rows() {
+async fn an_empty_or_null_key_prefix_does_not_match_any_rows() {
     let (db, _) = node("").await;
     db.write(&[Op::insert(&item("a", 1)), Op::insert(&item("b", 2))]).await.unwrap();
     let (none, empty): (Option<&str>, Vec<String>) = (None, Vec::new());
@@ -475,7 +479,7 @@ async fn a_prefix_of_none_or_of_no_columns_selects_no_rows() {
 }
 
 #[tokio::test]
-async fn queued_writes_run_in_order_with_later_operations() {
+async fn queued_writes_are_executed_before_later_operations() {
     let (db, _) = node("").await;
     let mut txn = db.begin();
     txn.write([Op::put("k", "first")]);
@@ -488,7 +492,7 @@ async fn queued_writes_run_in_order_with_later_operations() {
 }
 
 #[tokio::test]
-async fn reverse_stream_reads_bounded_by_time_page_through_every_record() {
+async fn reverse_stream_reads_bounded_by_time_return_every_record_across_pages() {
     let (db, _) = node("").await;
     let events: Vec<u64> = (0..5).collect();
     db.write(&[Op::append("log", &events)]).await.unwrap();
@@ -499,12 +503,12 @@ async fn reverse_stream_reads_bounded_by_time_page_through_every_record() {
         limit: Some(2),
         ..api::ReadStream::default()
     });
-    let read: Vec<u64> = pages(&db, op).await.into_iter().flat_map(|r| r.records::<u64>().unwrap()).collect();
+    let read: Vec<u64> = read_all_pages(&db, op).await.into_iter().flat_map(|r| r.records::<u64>().unwrap()).collect();
     assert_eq!(read, [4, 3, 2, 1, 0]);
 }
 
 #[tokio::test]
-async fn a_failed_operation_is_named_by_its_index_in_the_run() {
+async fn a_failed_operation_reports_its_index_in_the_batch() {
     let (db, _) = node("").await;
     db.write(&[Op::put("k", "v")]).await.unwrap();
     let mut txn = db.begin();
@@ -516,7 +520,7 @@ async fn a_failed_operation_is_named_by_its_index_in_the_run() {
 }
 
 #[tokio::test]
-async fn a_write_whose_first_attempt_never_arrived_reports_the_servers_refusal() {
+async fn a_write_whose_first_attempt_was_dropped_reports_the_server_rejection() {
     let (db, router) = node(api::Txn::ROUTE).await;
     db.write(&[Op::insert(&item("a", 1))]).await.unwrap();
     router.fail(api::Txn::ROUTE, Fault::Drop, 1);
@@ -533,7 +537,7 @@ async fn a_write_whose_first_attempt_never_arrived_reports_the_servers_refusal()
             break r;
         }
     };
-    assert_eq!(passes, 1, "a refused write is not run again: {r:?}");
+    assert_eq!(passes, 1, "a rejected write is not retried: {r:?}");
 }
 
 #[tokio::test]
@@ -545,7 +549,7 @@ async fn a_failed_check_whose_response_is_lost_reports_precondition_failed() {
     let e = db.write(&cas).await.unwrap_err();
     assert_eq!(e.code(), Some(api::ErrorCode::PreconditionFailed), "{e}");
     let k = db.read_one(Op::get("k")).await.unwrap().entry().unwrap().unwrap();
-    assert_eq!(k.value.data().unwrap().as_ref(), b"v", "the refused write never applied");
+    assert_eq!(k.value.data().unwrap().as_ref(), b"v", "the rejected write was not applied");
 }
 
 #[tokio::test]
@@ -557,7 +561,7 @@ async fn a_retried_read_reports_the_servers_answer() {
 }
 
 #[tokio::test]
-async fn raw_values_and_blobs_report_their_version_type_range_and_expiry() {
+async fn raw_values_and_blobs_return_their_version_type_range_and_expiry() {
     let (db, _) = node("").await;
     let opts = |expect| api::PutOptions { content_type: Some("text/plain".into()), ttl_ms: Some(60_000), expect };
     let w = db.put_value("k", "hello world", opts(Some(Expect::Absent))).await.unwrap();
@@ -578,7 +582,7 @@ async fn raw_values_and_blobs_report_their_version_type_range_and_expiry() {
 }
 
 #[tokio::test]
-async fn streams_append_wait_read_and_query_over_http() {
+async fn stream_endpoints_append_wait_read_and_query_records() {
     let (db, _) = node("").await;
     let stream = api::NewStream { name: "log".into(), retention_ms: Some(60_000), max_bytes: None };
     assert_eq!(db.create_stream(&stream).await.unwrap().stream.retention_ms, Some(60_000));
@@ -621,7 +625,7 @@ async fn streams_append_wait_read_and_query_over_http() {
 }
 
 #[tokio::test]
-async fn databases_api_keys_and_schema_changes_round_trip() {
+async fn databases_api_keys_and_schema_changes_are_applied_and_read_back() {
     let (db, _) = node("").await;
     let info = db.info().await.unwrap();
     assert_eq!((info.name.as_str(), info.role), ("app", api::Role::Owner));
@@ -637,7 +641,7 @@ async fn databases_api_keys_and_schema_changes_round_trip() {
     let keys = db.client().list_api_keys(api::PageQuery::default()).await.unwrap();
     assert_eq!(keys.api_keys, std::slice::from_ref(&created.api_key));
     db.client().delete_api_key(&created.api_key.id).await.unwrap();
-    assert!(reader.read_one(Op::get("k")).await.is_err(), "a deleted key no longer authenticates");
+    assert!(reader.read_one(Op::get("k")).await.is_err(), "a deleted key is rejected");
 
     db.write(&[Op::insert(&item("a", 1)), Op::insert(&item("a", 2))]).await.unwrap();
     let label = NewColumn { default: Some(serde_json::json!("new")), ..NewColumn::nullable("tag", ColumnType::String) };
@@ -658,7 +662,7 @@ async fn databases_api_keys_and_schema_changes_round_trip() {
 }
 
 #[tokio::test]
-async fn a_raw_put_applies_once_when_every_response_is_lost() {
+async fn a_raw_put_is_applied_once_if_every_response_is_lost() {
     let (db, router) = node(api::PutValue::ROUTE).await;
     let expect = |e| api::PutOptions { expect: Some(e), ..Default::default() };
     let first = db.put_value("k", "1", expect(Expect::Absent)).await.unwrap();

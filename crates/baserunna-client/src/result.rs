@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
     Inline(Bytes),
-    /// Blob metadata, plus the blob content if its size is at most `json_value_max`.
+    /// Blob metadata and optional inline content.
     Blob {
         meta: api::BlobMeta,
         data: Option<Bytes>,
@@ -18,7 +18,7 @@ pub enum Value {
 }
 
 impl Value {
-    /// Returns the inline value or the blob content, or `None` if the blob content was omitted.
+    /// Returns the value bytes if present in the response.
     pub fn data(&self) -> Option<&Bytes> {
         match self {
             Value::Inline(b) | Value::Blob { data: Some(b), .. } => Some(b),
@@ -41,7 +41,7 @@ pub struct ScanPage {
     pub cursor: Option<String>,
 }
 
-/// Rows of a table as raw JSON, decoded by [`OpResult::rows`].
+/// Page of table rows in raw JSON format.
 #[derive(Clone, Debug)]
 pub struct RowPage {
     pub table: String,
@@ -85,24 +85,24 @@ pub struct RecordPage {
     pub done: bool,
 }
 
-/// Result of an [`Op`], in the variant named after the operation.
+/// Result of a transaction operation.
 #[derive(Clone, Debug)]
 pub enum OpResult {
     Get(Option<Entry>),
     Scan(ScanPage),
-    /// Result of an operation that returns no data.
+    /// Empty result for an operation without a return value.
     Done,
-    /// Value after an `increment`.
+    /// New value after [`Op::Increment`].
     Increment(i64),
-    /// Row of `table` as raw JSON, decoded by [`OpResult::row`].
+    /// Single row of `table` in raw JSON format.
     GetRow {
         table: String,
         row: Option<Box<RawValue>>,
     },
     QueryRows(RowPage),
-    /// Whether an `update_row` or `delete_row` found its row.
+    /// Whether the target row existed.
     Found(bool),
-    /// Number of rows that an `update_where` updated or a `delete_rows` deleted.
+    /// Number of rows modified or deleted.
     Count(u64),
     /// Sequence number of the first appended record, or `None` before the transaction commits.
     Append {
@@ -164,7 +164,7 @@ impl OpResult {
         }
     }
 
-    /// Decodes the row of a [`Op::get_row`] on `R`.
+    /// Decodes the row from an [`Op::GetRow`] result.
     pub fn row<R: Row>(self) -> Result<Option<R>, Error> {
         match self {
             OpResult::GetRow { table: t, row } => {
@@ -175,7 +175,7 @@ impl OpResult {
         }
     }
 
-    /// Decodes the rows of a [`Op::query`] on `R`.
+    /// Decodes the rows from an [`Op::QueryRows`] result.
     pub fn rows<R: Row>(self) -> Result<Vec<R>, Error> {
         match self {
             OpResult::QueryRows(p) => {
@@ -186,7 +186,7 @@ impl OpResult {
         }
     }
 
-    /// Decodes the JSON records of a [`Op::read_stream`].
+    /// Decodes the JSON records from an [`Op::ReadStream`] result.
     pub fn records<T: DeserializeOwned>(self) -> Result<Vec<T>, Error> {
         let page = match self {
             OpResult::ReadStream(p) => p,
@@ -207,7 +207,7 @@ pub struct TxnOutcome {
     /// Commit version for a write transaction, or snapshot version for a read transaction.
     pub version: u64,
     pub commit_id: Option<String>,
-    /// First sequence number assigned to each `append` operation of a write, in order.
+    /// First sequence number assigned to each [`Op::Append`] in the transaction.
     pub appends: Vec<u64>,
     /// Per-operation results, or `None` if an earlier request with the same idempotency key
     /// already committed the transaction.
@@ -225,7 +225,6 @@ impl TxnOutcome {
     }
 }
 
-/// Decodes one result per operation.
 pub(crate) fn decode_results(ops: &[Op], results: &[api::OpResult]) -> Result<Vec<OpResult>, String> {
     if results.len() != ops.len() {
         return Err(format!("{} results for {} operations", results.len(), ops.len()));

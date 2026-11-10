@@ -1938,7 +1938,7 @@ async fn run_within(
     };
     let by_time = ByTime::of(&kind, &time);
     let past = by_time.and(cursor_at(&kind));
-    // Without a store clock, expired events cannot be told apart from retained ones.
+    // Enforcing event retention requires a synchronized store clock.
     let mut from = match s.retention_ms {
         Some(_) => q.from.max(s.retained_from(shared.store_time_ms().await? as i64)),
         None => q.from,

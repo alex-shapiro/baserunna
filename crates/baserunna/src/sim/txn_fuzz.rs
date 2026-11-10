@@ -477,8 +477,8 @@ enum Fail {
     NotFound,
     Exists,
     Precondition,
-    /// The idempotency key was resolved as not applied by an earlier attempt that failed or wrote
-    /// nothing.
+    /// The idempotency key was resolved as not applied by an earlier attempt that failed or did not
+    /// write.
     Aborted,
     TooLarge,
     /// Valid request with an in-run TTL whose exact expiry is not modeled.

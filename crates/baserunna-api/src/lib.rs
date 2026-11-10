@@ -1,7 +1,7 @@
-//! HTTP API request and response types.
+//! HTTP API routes, requests, and responses.
 //!
-//! If the API changes only by addition, different releases of the server and the client stay
-//! compatible: response types ignore unknown fields, and new request fields must be optional.
+//! Response types ignore unknown fields and new request fields are optional so that clients and
+//! servers from different releases remain compatible.
 
 #![forbid(unsafe_code)]
 
@@ -56,35 +56,34 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// An HTTP route and its request and response types.
 pub trait Endpoint {
     const METHOD: Method;
-    /// Route in axum syntax, with a `{name}` segment for each path parameter.
+    /// Route template with `{name}` path parameters.
     const ROUTE: &'static str;
     const STATUS: StatusCode;
     type Body: Body;
     type Response: Body;
 
-    /// Returns true if repeating a successful request has no effect.
+    /// Returns true if the request can be safely retried after an ambiguous failure.
     fn is_idempotent(&self, body: &Self::Body) -> bool;
 
-    /// Returns true if the request changes nothing, so that no failed attempt of it applied.
+    /// Returns true if the request does not modify data.
     fn is_read_only(_body: &Self::Body) -> bool {
         Self::METHOD == Method::GET
     }
 
-    /// Returns true if the request ends its transaction even if it fails with `conflict`, so that
-    /// only a new transaction can succeed.
+    /// Returns true if a `conflict` error on this request terminates the transaction.
     fn conflict_ends_txn() -> bool {
         false
     }
 
     fn path(&self) -> String;
 
-    /// Returns request headers besides `Authorization`. A `Content-Type` here replaces the body's.
+    /// Returns request headers other than `Authorization`. A `Content-Type` header here overrides
+    /// [`Body::CONTENT_TYPE`].
     fn headers(&self) -> http::HeaderMap {
         http::HeaderMap::new()
     }
 
-    /// Decodes a successful response from its body and, for endpoints that answer in headers, its
-    /// head.
+    /// Decodes a successful response from the response headers and body.
     fn response(_head: &http::response::Parts, body: Bytes) -> Result<Self::Response, String> {
         Self::Response::decode(body)
     }
@@ -209,7 +208,7 @@ pub(crate) fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     *t == T::default()
 }
 
-/// Wraps a present field value, including JSON `null`, in `Some`.
+/// Deserializes a present field value, including JSON `null`, as `Some`.
 pub(crate) fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
     T::deserialize(d).map(Some)
 }

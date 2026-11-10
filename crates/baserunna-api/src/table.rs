@@ -1,13 +1,11 @@
-//! Table schemas.
+//! Table schema endpoints and types.
 
 use crate::{Consistency, Endpoint, NoBody, fill_route, is_false, json_body, with_query};
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
-/// `POST /v1/dbs/{db}/tables`: creates a table.
-///
-/// Fails with `already_exists` if the table exists, unless `if_not_exists` is set.
+/// `POST /v1/dbs/{db}/tables`.
 #[derive(Clone, Debug)]
 pub struct CreateTable {
     pub db: String,
@@ -29,8 +27,7 @@ impl Endpoint for CreateTable {
     }
 }
 
-/// `POST /v1/dbs/{db}/tables/{table}/columns`: adds a column, which reads as its `default` in
-/// existing rows.
+/// `POST /v1/dbs/{db}/tables/{t}/columns`.
 #[derive(Clone, Debug)]
 pub struct AddColumn {
     pub db: String,
@@ -53,8 +50,7 @@ impl Endpoint for AddColumn {
     }
 }
 
-/// `POST /v1/dbs/{db}/tables/{table}/indexes`: adds a secondary index and backfills it from
-/// existing rows.
+/// `POST /v1/dbs/{db}/tables/{t}/indexes`.
 #[derive(Clone, Debug)]
 pub struct AddIndex {
     pub db: String,
@@ -77,7 +73,7 @@ impl Endpoint for AddIndex {
     }
 }
 
-/// `GET /v1/dbs/{db}/tables`: lists tables in name order.
+/// `GET /v1/dbs/{db}/tables`.
 #[derive(Clone, Debug)]
 pub struct ListTables {
     pub db: String,
@@ -100,7 +96,7 @@ impl Endpoint for ListTables {
     }
 }
 
-/// `GET /v1/dbs/{db}/tables/{table}`: reads a table schema.
+/// `GET /v1/dbs/{db}/tables/{t}`.
 #[derive(Clone, Debug)]
 pub struct GetTable {
     pub db: String,
@@ -132,7 +128,7 @@ pub enum ColumnType {
     Int,
     Float,
     Bool,
-    /// Binary value, as base64 in JSON.
+    /// Binary value encoded as base64 in JSON.
     Bytes,
     Json,
     /// Binary value stored out of band, written as a staged `blob_id` and read as blob metadata.
@@ -142,16 +138,16 @@ pub enum ColumnType {
     Unknown,
 }
 
-/// Column to create, in a new table or added to an existing one.
+/// Column definition for [`CreateTable`] or [`AddColumn`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewColumn {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: ColumnType,
-    #[serde(default = "yes")]
+    #[serde(default = "default_true")]
     pub nullable: bool,
-    /// Value of the column in rows written before the column was added.
+    /// Default value returned for rows written before the column was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Json>,
 }
@@ -174,12 +170,12 @@ pub struct Column {
     #[serde(rename = "type")]
     pub ty: ColumnType,
     pub nullable: bool,
-    /// Value of the column in rows written before the column was added.
+    /// Default value returned for rows written before the column was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Json>,
 }
 
-fn yes() -> bool {
+fn default_true() -> bool {
     true
 }
 
@@ -221,7 +217,8 @@ pub struct Index {
     pub state: IndexState,
 }
 
-/// Every row write maintains an index in either state, but only a `Ready` index serves queries.
+/// Backfill state of a secondary index. Queries can use an index only when it is
+/// [`IndexState::Ready`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexState {

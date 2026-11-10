@@ -21,41 +21,38 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       system segments before serving requests, and fault injection can crash the
       node again before the workload finishes (`sim_tool trace db_churn 606688`).
 - [ ] **Fix stream reads that exceed the request deadline.** Requests are
-      canceled at `commit_timeout_ms`, which can cause large stream reads to
-      fail repeatedly with `503 request deadline exceeded`
-      (`sim_tool trace streams 2601188`, and the checker reads of `streams` seeds
-      9102146, 9107143, 11000150 and 34001356, and of `mix` seed 33000571).
-- [ ] **Distrust the cache when a manifest write lands after its error
-      reply.** A manifest `PUT` that returns `Unavailable` can still land after
-      the commit retry has refreshed the manifest and seen the old version.
-      The lease holder then trusts its cache again and serves the old version
-      as current while other nodes serve the new one. Reads on the lease
-      holder should not trust the lease until every ambiguous `PUT` of the
-      current attempt has settled.
-- [ ] **Distrust the cache when a manifest write is rejected while this node
-      holds the lease.** A `PreconditionFailed` reply means that another
-      writer changed the manifest, but the lease holder keeps serving its
-      cache as current until the commit retry refreshes it. This can occur
-      only if another node writes while the lease is valid, which is itself a
-      bug, so the lease holder should distrust its cache at once.
-- [ ] **Let the console workload tolerate transient form failures.** A
-      password change through `/console/account/password` can fail with
-      `request deadline exceeded` under storage stalls, and the workload
-      treats any error redirect as a failure (`sim_tool trace console
-      24010902`).
-- [ ] **Fix `accounts`: a session stops working after its account is disabled
-      and re-enabled.** Seen on this branch in `accounts` seed 9506242 and
-      `mix` seed 26006111; both pass on `main`, and the cause is not yet known,
-      so the branch is not ruled out (`sim_tool trace mix 26006111`).
+      canceled at `commit_timeout_ms`, so large stream reads can fail
+      repeatedly with `503 request deadline exceeded`
+      (`sim_tool trace streams 2601188`).
+- [ ] **Invalidate the cached manifest if an ambiguous `PUT` completes after a
+      refresh.** A manifest `PUT` that fails with `503 unavailable` can still
+      be applied in storage after a commit retry refreshes the manifest and
+      observes the old version. The lease holder then serves the old cached
+      version while other nodes serve the new version. Bypass the local lease
+      for strong reads until all ambiguous `PUT`s from the commit attempt are
+      resolved.
+- [ ] **Invalidate the cached manifest immediately if a manifest `PUT` fails
+      with `412`.** A `412 Precondition Failed` response means another node
+      updated the manifest. The lease holder currently continues serving its
+      cached version until the commit retry reloads the manifest. Invalidate
+      the local lease as soon as `412` is received.
+- [ ] **Tolerate transient form errors in the `console` workload.** A password
+      change at `/console/account/password` can time out during storage stalls,
+      and the workload currently treats any error redirect as a test failure
+      (`sim_tool trace console 24010902`).
+- [ ] **Fix `accounts` session failures after an account is disabled and
+      re-enabled.** A valid session can be rejected after its account is
+      disabled and re-enabled (`sim_tool trace accounts 9506242`).
 - [ ] **Run garbage collection sweeps even if the lease duration is short.** A
       post-commit sweep skips execution if the lease expires while reading the
       store clock and refreshing the manifest, leaving the database unswept
       until the next commit (`sim_tool trace blobs 5000231`).
-- [ ] **Schedule retention trims after an ambiguous manifest write.** A commit
-      that makes a stream's trim due schedules the trim only once its manifest
-      `PUT` succeeds. If the `PUT` fails with an unknown outcome but applied, no
-      trim is scheduled until a later commit or sweep, so an idle stream keeps
-      records past `retention_ms` (`sim_tool trace streams 8100221`).
+- [ ] **Schedule stream retention trims after ambiguous manifest writes.** The
+      committer schedules a retention trim only when a manifest `PUT` returns
+      success. If the `PUT` returns an unknown outcome after being applied in
+      storage, the node does not schedule a trim until the next commit or
+      sweep, leaving expired records in an idle stream
+      (`sim_tool trace streams 8100221`).
 - [ ] **Abort open interactive transactions if a database is deleted.**
       Interactive transactions on a deleted database currently remain open
       until their 30 s idle timeout expires, consuming memory and counting
@@ -326,30 +323,26 @@ corruption through any of them.
       response types into `baserunna-api`, derive JSON Schema for them, and
       generate `openapi.json` from the `Endpoint` definitions instead of
       maintaining `api/openapi.rs` by hand.
-- [ ] **Cover every transaction operation in `baserunna_client::Op`.** It lacks
-      `stream_info`, `get_consumer`, the event operations, `ttl_ms` on writes,
-      `expect_seq` on `append`, and `check` by value.
-- [ ] **Return operation results from client writes.** `Db::write` and
-      `Txn::commit` drop the per-operation results that the server returns, so
-      a caller cannot read, for example, the value of an `increment` or the
-      count of a `delete_rows` with exactly-once semantics.
-- [ ] **Type the remaining JSON in `baserunna-api`.** The compiler cannot check
-      these against `baserunna-client`, because the server still builds or
-      parses them as untyped JSON: `query_events` results; row and stream
-      `filter`s; the request side of the KV, blob, stream append, stream read,
-      and stream query routes, which the server parses by hand to stream bodies
-      and accept several formats; and the routes outside `Endpoint`, which are
-      KV scans and deletes, schema drops, the row routes, stream configuration,
-      trims, and consumers, events, organization management, account
-      self-service, and admin.
+- [ ] **Add the remaining transaction operations and options to
+      `baserunna_client::Op`.** Add `stream_info`, `get_consumer`, event-table
+      operations, `ttl_ms` on writes, `expect_seq` on `append`, and value
+      checks on `check`.
+- [ ] **Return operation results from `Db::write` and `Txn::commit`.** Both
+      methods currently discard the per-operation results returned by the
+      server, such as the new value from `increment` or the row count from
+      `delete_rows`.
+- [ ] **Add typed request, response, and filter definitions for the remaining
+      routes in `baserunna-api`.** Several routes and sub-schemas (`filter`
+      expressions, `query_events` results, and routes not yet used by
+      `baserunna-client`) still use untyped JSON on the server.
 - [ ] **Client SDKs.** Generate TypeScript and Python clients from
       `openapi.json`.
 - [ ] **Validate additional S3-compatible object stores.** Run the conformance
       suite and failover check against AWS S3, Cloudflare R2, MinIO, Azure Blob
       Storage, and Google Cloud Storage.
-- [ ] **Support idempotency keys for raw KV deletes.** `PUT
-      /v1/dbs/{db}/kv/{key}` accepts an `Idempotency-Key` header, but `DELETE`
-      does not, so a client cannot resolve an ambiguous raw delete.
+- [ ] **Support `Idempotency-Key` on `DELETE /v1/dbs/{db}/kv/{key}`.** Accept
+      an idempotency key on raw key-value deletes so that clients can resolve
+      ambiguous delete outcomes via `GET /commits/{id}`.
 - [ ] **Support filtering whole JSON columns and reading nested JSON objects by
       path.** Event parts store only leaf JSON paths, so filtering on a root
       JSON column is rejected (`exec::Binder::filter`) and querying a non-leaf
@@ -379,46 +372,42 @@ corruption through any of them.
       node joins. Send commit notices to the home nodes of both previous and
       current membership views.
 - [ ] **Route interactive transaction requests to the node that holds the
-      transaction.** An open transaction lives in the memory of the node that
-      began it, but later requests on it are routed like any database request,
-      to the lease holder or the rendezvous home in the receiving node's view of
-      live members. When views differ, such as after a node joins or while a
-      peer is suspect, a commit reaches another node and fails with
-      `txn_not_found`. Encode the node in the transaction ID and forward by it.
-- [ ] **Let a client abort a transaction whose begin response is lost.** The
-      server assigns the transaction ID in the `begin` response, so if the
-      network loses that response or the request times out after the server
-      opened the transaction, `baserunna_client::Txn` cannot abort it and it
-      holds one of the user's open transaction slots until its idle timeout. A
-      client-chosen ID with abort tombstones was tried and rejected: tombstones
-      for arbitrary IDs need a per-user bound, a retried begin must not hit the
-      tombstone of its own failed attempt, and older servers reject the new
-      field.
-- [ ] **Report why an interactive commit failed when its retry finds no
-      transaction.** The commit handler removes the transaction before it can
-      fail, so after a transient failure such as `503 commit deadline exceeded`,
-      `baserunna_client::Client` retries the commit and reports the retry's
-      `txn_not_found` instead of the cause. Record the cause with the abort
-      reasons that `txn_not_found` reports, or end the transaction only once the
-      commit cannot be retried.
-- [ ] **Reject writes in `baserunna_client::Db::read`.** It sends write
-      operations without an idempotency key, so they are not exactly-once and a
-      lost response leaves their outcome unknown.
-- [ ] **Decode roles added by newer servers.** `api::Role` has no fallback for
-      unknown values, so `Me` and `Member` responses from a newer server with a
-      new role fail to decode in `baserunna-client`.
-- [ ] **Page reverse stream reads from a fixed lower bound.** A reverse
-      `read_stream` that starts from `tail` recomputes its lower bound from the
-      stream's end on each page, so `Op::next_page` returns a different range if
-      records are appended between pages.
-- [ ] **Require an explicit request to select every row.** The server reads a
-      `where` or `query_rows` without `eq`, `range` or `filter` as every row,
-      so a raw HTTP client or a generated SDK that builds an empty prefix at
-      runtime deletes or reads the whole table. `baserunna-client` guards
-      against this on its side. A `delete_range` with an empty `prefix` likewise
-      deletes every key.
-- [ ] **Fix the `events` fuzz target**, which no longer compiles because
-      `PartRef` has no `min_version` and `max_version` fields.
+      transaction.** An open transaction is stored in memory on the node that
+      began it, whereas follow-up requests are routed by the receiving node's
+      membership view. If membership views differ across nodes, a request can
+      be routed to a different node and fail with `txn_not_found`. Encode the
+      owning node ID in the transaction ID and route requests directly to that
+      node.
+- [ ] **Abort interactive transactions whose `begin` response is lost.** The
+      server assigns the transaction ID in the `begin` response. If that
+      response is lost after the server opens the transaction, the client
+      cannot abort the transaction, which occupies a per-user transaction slot
+      until its idle timeout expires.
+- [ ] **Preserve the failure reason if an interactive commit is retried.** The
+      commit handler removes the transaction from memory before committing. If
+      the commit fails with a retryable error such as `503`, a client retry
+      receives `404 txn_not_found` without the original failure reason. Record
+      the failure reason in the node's abort log so that retries report the
+      cause.
+- [ ] **Reject write operations in `baserunna_client::Db::read`.** `Db::read`
+      omits the idempotency key, so write operations passed to it can be
+      applied more than once on retry.
+- [ ] **Add an `Unknown` fallback variant to `baserunna_api::Role`.** Adding
+      `#[serde(other)]` lets `baserunna-client` deserialize `Me` and `Member`
+      responses from newer servers that define additional roles.
+- [ ] **Pin the lower bound of a reverse `read_stream` that uses `tail`.** A
+      reverse read with `tail` recomputes its lower bound from the end of the
+      stream on each page. If records are appended between pages,
+      `Op::next_page` shifts the range.
+- [ ] **Reject empty selectors in `where`, `query_rows`, and `delete_range` on
+      the server.** The server currently treats an empty `where` or
+      `query_rows` selector as a full-table scan or delete, and treats an
+      empty `prefix` in `delete_range` as a full-database delete. Require an
+      explicit full-scan flag so that an accidentally empty prefix is
+      rejected.
+- [ ] **Update the `events` fuzz target for the current `PartRef` fields.**
+      `fuzz/fuzz_targets/events.rs` still references the removed
+      `min_version` and `max_version` fields on `PartRef`.
 - [ ] **Run libFuzzer targets in CI** with a persistent corpus, including the
       model-checked `http_txn` target, and fuzz `PartMeta::decode` and
       `ColIndex::decode` on unframed byte slices instead of CRC-framed inputs.

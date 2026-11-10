@@ -15,16 +15,18 @@ pub trait Row: Serialize + DeserializeOwned {
     const TABLE: &'static str;
 }
 
-/// Transaction operation. Constructors that take rows or keys panic if they do not serialize to
-/// JSON, such as a map with non-string keys.
+/// Transaction operation.
+///
+/// Constructors that accept serializable rows or keys panic if JSON serialization fails.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     Get {
         key: Bytes,
     },
-    /// Reads up to `limit` entries in `range` in ascending order, or descending if `reverse` is
-    /// true, starting after `cursor`. If `keys_only` is true, entries omit inline values and blob
-    /// data.
+    /// Scans up to `limit` entries in `range` after `cursor`.
+    ///
+    /// Scans in descending order if `reverse` is true. Omits inline values and blob data if
+    /// `keys_only` is true.
     Scan {
         range: KeyRange,
         limit: usize,
@@ -47,13 +49,14 @@ pub enum Op {
     DeleteRange {
         range: KeyRange,
     },
-    /// Copies the value of `from` to `to` without re-uploading blob data, or fails with
-    /// `precondition_failed` if `from` is absent.
+    /// Copies the value at `from` to `to`.
+    ///
+    /// Fails with `precondition_failed` if `from` is absent.
     Copy {
         from: Bytes,
         to: Bytes,
     },
-    /// Fails the transaction with `precondition_failed` unless `key` satisfies `expect`.
+    /// Verifies that `key` satisfies `expect`, or fails with `precondition_failed`.
     Check {
         key: Bytes,
         expect: Expect,
@@ -63,13 +66,14 @@ pub enum Op {
         key: Bytes,
         by: i64,
     },
-    /// Reads the row with primary key `pk`, a single value or an array for a composite key.
+    /// Reads the row at primary key `pk`.
     GetRow {
         table: String,
         pk: Json,
     },
-    /// Inserts `row`, failing the transaction with `already_exists` if its primary key exists.
-    /// The server deletes the row `ttl_ms` milliseconds after the commit.
+    /// Inserts `row`, or fails with `already_exists` if its primary key exists.
+    ///
+    /// If `ttl_ms` is set, the server deletes the row after `ttl_ms` milliseconds.
     InsertRow {
         table: String,
         row: Json,
@@ -89,7 +93,7 @@ pub enum Op {
         table: String,
         pk: Json,
     },
-    /// Sets the columns in `set` on every row that `selection` matches.
+    /// Updates the columns in `set` on all rows that match `selection`.
     UpdateRows {
         table: String,
         selection: api::Selection,
@@ -99,8 +103,7 @@ pub enum Op {
         table: String,
         selection: api::Selection,
     },
-    /// Reads up to `limit` rows in key order, or in descending order if `reverse` is true,
-    /// starting after `cursor`.
+    /// Queries up to `limit` rows that match `selection` after `cursor`.
     QueryRows {
         table: String,
         selection: api::Selection,
@@ -136,7 +139,7 @@ pub enum KeyRange {
     },
 }
 
-/// Stream record to append: a JSON or binary body and headers that filters can match.
+/// Stream record to append.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewRecord {
     pub body: NewBody,
@@ -165,16 +168,16 @@ impl NewRecord {
 }
 
 fn json(v: &impl Serialize) -> Json {
-    serde_json::to_value(v).expect("rows and keys serialize to JSON")
+    serde_json::to_value(v).expect("value is serializable to JSON")
 }
 
-/// Converts a key prefix, one value or a tuple of the leading key columns, to its column values.
+/// Builds a selection that matches the key prefix `eq`.
 fn prefix(eq: &impl Serialize) -> api::Selection {
     let eq = match json(eq) {
-        // The server reads an empty prefix as every row, which must be asked for explicitly.
+        // An empty `eq` array selects all rows on the server, so use `[null]` to match none.
         Json::Array(a) if a.is_empty() => vec![Json::Null],
         Json::Array(a) => a,
-        one => vec![one],
+        val => vec![val],
     };
     api::Selection { eq, ..api::Selection::default() }
 }
@@ -198,17 +201,17 @@ impl Op {
         Op::Scan { range, limit: api::PAGE_MAX, reverse: false, keys_only: false, cursor: None }
     }
 
-    /// Reads the row of `R` with primary key `pk`, a single value or a tuple for a composite key.
+    /// Reads the row of `R` with primary key `pk`.
     pub fn get_row<R: Row>(pk: impl Serialize) -> Op {
         Op::GetRow { table: R::TABLE.into(), pk: json(&pk) }
     }
 
-    /// Inserts `row`, failing the transaction with `already_exists` if its primary key exists.
+    /// Inserts `row`, or fails with `already_exists` if its primary key exists.
     pub fn insert<R: Row>(row: &R) -> Op {
         Op::InsertRow { table: R::TABLE.into(), row: json(row), ttl_ms: None }
     }
 
-    /// Inserts `row` and deletes it `ttl` after the commit.
+    /// Inserts `row` with a time-to-live of `ttl`.
     pub fn insert_expiring<R: Row>(row: &R, ttl: Duration) -> Op {
         let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX).max(1);
         Op::InsertRow { table: R::TABLE.into(), row: json(row), ttl_ms: Some(ttl_ms) }
@@ -218,7 +221,7 @@ impl Op {
         Op::UpsertRow { table: R::TABLE.into(), row: json(row) }
     }
 
-    /// Sets the columns that `set` serializes on the row of `R` with primary key `pk`.
+    /// Updates the columns in `set` on the row of `R` with primary key `pk`.
     pub fn update<R: Row>(pk: impl Serialize, set: &impl Serialize) -> Op {
         Op::UpdateRow { table: R::TABLE.into(), pk: json(&pk), set: json(set) }
     }
@@ -227,8 +230,7 @@ impl Op {
         Op::DeleteRow { table: R::TABLE.into(), pk: json(&pk) }
     }
 
-    /// Deletes the rows of `R` whose leading primary key columns equal `eq`, a value or a tuple. An
-    /// empty or `None` prefix matches no rows.
+    /// Deletes the rows of `R` whose primary key starts with `eq`.
     pub fn delete_rows<R: Row>(eq: impl Serialize) -> Op {
         Op::delete_where::<R>(prefix(&eq))
     }
@@ -237,53 +239,52 @@ impl Op {
         Op::delete_where::<R>(api::Selection::default())
     }
 
-    /// Deletes every row of `R` that `selection` matches.
+    /// Deletes all rows of `R` that match `selection`.
     pub fn delete_where<R: Row>(selection: api::Selection) -> Op {
         Op::DeleteRows { table: R::TABLE.into(), selection }
     }
 
-    /// Sets the columns that `set` serializes on every row of `R` that `selection` matches.
+    /// Updates the columns in `set` on all rows of `R` that match `selection`.
     pub fn update_where<R: Row>(selection: api::Selection, set: &impl Serialize) -> Op {
         Op::UpdateRows { table: R::TABLE.into(), selection, set: json(set) }
     }
 
-    /// Reads the first page of rows of `R` whose leading primary key columns equal `eq`, a value
-    /// or a tuple. An empty or `None` prefix matches no rows.
+    /// Reads the first page of rows of `R` whose primary key starts with `eq`.
     pub fn query<R: Row>(eq: impl Serialize) -> Op {
         Op::query_where::<R>(prefix(&eq))
     }
 
-    /// Reads the first page of every row of `R`.
+    /// Reads the first page of rows in `R`.
     pub fn query_all<R: Row>() -> Op {
         Op::query_where::<R>(api::Selection::default())
     }
 
-    /// Reads the first page of the rows of `R` that `selection` matches, in the order of its index.
+    /// Reads the first page of rows in `R` that match `selection`.
     pub fn query_where<R: Row>(selection: api::Selection) -> Op {
         Op::QueryRows { table: R::TABLE.into(), selection, limit: api::PAGE_MAX, reverse: false, cursor: None }
     }
 
-    /// Appends each of `records` as a JSON record, creating `stream` if it does not exist.
+    /// Appends JSON `records` to `stream`, creating the stream if needed.
     pub fn append<T: Serialize>(stream: impl Into<String>, records: &[T]) -> Op {
         Op::append_records(stream, records.iter().map(NewRecord::json).collect())
     }
 
-    /// Appends `records`, creating `stream` if it does not exist.
+    /// Appends `records` to `stream`, creating the stream if needed.
     pub fn append_records(stream: impl Into<String>, records: Vec<NewRecord>) -> Op {
         Op::Append { stream: stream.into(), records, create: true }
     }
 
-    /// Sets the sequence number that consumer `consumer` of `stream` reads from next.
+    /// Sets the next sequence number for `consumer` on `stream`.
     pub fn set_consumer(stream: impl Into<String>, consumer: impl Into<String>, seq: u64) -> Op {
         Op::SetConsumer { stream: stream.into(), consumer: consumer.into(), seq }
     }
 
-    /// Deletes the records of `stream` before sequence number `before_seq`.
+    /// Deletes records in `stream` before `before_seq`.
     pub fn trim_stream(stream: impl Into<String>, before_seq: u64) -> Op {
         Op::TrimStream { stream: stream.into(), before_seq }
     }
 
-    /// Reads the first page of records of `stream` from sequence number `from_seq`.
+    /// Reads the first page of records in `stream` starting at `from_seq`.
     pub fn read_stream(stream: impl Into<String>, from_seq: u64) -> Op {
         Op::ReadStream(api::ReadStream {
             stream: stream.into(),
@@ -293,8 +294,7 @@ impl Op {
         })
     }
 
-    /// Returns the operation that reads the page after `result`, or `None` if `result` is the
-    /// last page or this operation is not paginated.
+    /// Returns the operation for the page after `result`, or `None` if pagination is complete.
     pub fn next_page(&self, result: &OpResult) -> Option<Op> {
         let mut next = self.clone();
         match (&mut next, result) {

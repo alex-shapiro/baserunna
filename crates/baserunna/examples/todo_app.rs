@@ -29,7 +29,7 @@ impl Row for Todo {
     const TABLE: &str = "todos";
 }
 
-/// Selects open (`done == false`) or finished todos through the `open_by_due` index.
+/// Selects todos with the given `done` status using the `open_by_due` index.
 fn by_due(done: bool) -> Selection {
     Selection { index: Some("open_by_due".into()), eq: vec![json!(done)], ..Selection::default() }
 }
@@ -43,8 +43,8 @@ fn open_home_before(due: i64) -> Selection {
     }
 }
 
-/// Runs `op` in its own transaction and returns the number of rows it changed and the commit
-/// version, if it wrote anything.
+/// Runs `op` in a transaction.
+/// Returns the modified row count and the commit version.
 async fn count_rows(db: &Db, op: Op) -> Result<(u64, Option<u64>), baserunna_client::Error> {
     let mut txn = db.begin();
     let OpResult::Count(n) = txn.run_one(op).await? else { unreachable!("bulk row writes return a count") };

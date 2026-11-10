@@ -43,7 +43,7 @@ async fn once(c: &Client, ops: Json, key: &str) -> Result<Option<Json>, String> 
     loop {
         match c.call("POST", "/v1/dbs/tdb/txn", Some(body.clone())).await {
             Ok(r) if r.status == 200 => return Ok((r.json["replayed"] != true).then(|| r.json["results"].clone())),
-            // An earlier attempt changed no rows, which fenced the key, and its response was lost.
+            // An earlier attempt did not modify any rows and fenced the key, and its response was lost.
             Ok(r) if r.code() == "aborted" => return Ok(Some(json!([{"count": 0}]))),
             Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => c.pause(50).await,
             Ok(r) if r.status != 503 && r.status != 429 => return Err(format!("{key}: {} {}", r.status, r.json)),
@@ -104,7 +104,7 @@ pub async fn check_all_indexes(sim: &Arc<Sim>, db_id: &str) -> Result<(), String
     let n = sim.up_nodes().first().copied().ok_or("all nodes are down")?;
     let node = sim.node(n).ok_or("node is down")?.node.clone();
     let db = node.engine.db(db_id);
-    // Injected storage faults are still active, so retry reads that fail on them.
+    // Storage faults are still active, so retry transient read errors.
     crate::node::retry_unavailable(|| async {
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await?;
         for s in crate::table::all_tables(&mut t).await? {

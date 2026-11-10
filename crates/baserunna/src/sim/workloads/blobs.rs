@@ -123,7 +123,7 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
                     let id = staged["blob_id"].as_str().unwrap_or_default();
                     Ok((
                         format!("{base}/txn"),
-                        // Each staged blob gets its own key: a bind that failed for good fences its key.
+                        // Use a distinct idempotency key per staged blob because a failed bind fences its key.
                         json!({"ops": [{"op": "put", "key": key, "blob_id": id}], "idempotency_key": format!("bind-{round}-{id}")}),
                     ))
                 })
@@ -250,7 +250,7 @@ async fn stage_and_bind(
         let r = c.call_settled("POST", &path, Some(body)).await;
         let expired =
             r.status == 400 && r.json["error"]["message"].as_str().is_some_and(|m| m.contains("staged blob expired"));
-        // An attempt whose response was lost failed, such as on an expired blob, and fenced its key.
+        // If an earlier attempt failed on an expired blob and its response was lost, the server fenced the key.
         let fenced = r.status == 409 && r.code() == "aborted";
         if !expired && !fenced {
             return Ok(r);

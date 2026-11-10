@@ -1,8 +1,10 @@
+//! Database management endpoints and types.
+
 use crate::{Empty, Endpoint, NoBody, Role, fill_route, json_body, with_query};
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
-/// `POST /v1/dbs`: creates a database owned by the user or by an organization.
+/// `POST /v1/dbs`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CreateDb;
 
@@ -42,7 +44,7 @@ pub struct Db {
 
 json_body!(NewDb, Db);
 
-/// `GET /v1/dbs`: lists the caller's databases, or those of organization `org`.
+/// `GET /v1/dbs`.
 #[derive(Clone, Debug, Default)]
 pub struct ListDbs {
     pub query: ListDbsQuery,
@@ -80,7 +82,7 @@ pub struct DbPage {
     pub next_cursor: Option<String>,
 }
 
-/// `GET /v1/dbs/{db}`: reads a database's metadata, the caller's role, and storage statistics.
+/// `GET /v1/dbs/{db}`.
 #[derive(Clone, Debug)]
 pub struct GetDb {
     pub db: String,
@@ -102,7 +104,7 @@ impl Endpoint for GetDb {
     }
 }
 
-/// `DELETE /v1/dbs/{db}`: deletes a database and all of its data.
+/// `DELETE /v1/dbs/{db}`.
 #[derive(Clone, Debug)]
 pub struct DeleteDb {
     pub db: String,
@@ -134,7 +136,7 @@ pub struct DbInfo {
     pub stats: DbStats,
 }
 
-/// Storage statistics of a database at one version.
+/// Storage statistics for a database snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbStats {
     pub version: u64,
@@ -145,9 +147,9 @@ pub struct DbStats {
     pub range_tombstones: usize,
     /// Referenced blob bytes.
     pub blob_bytes: u64,
-    /// Segments and blobs no longer referenced, awaiting collection.
+    /// Unreferenced segments and blobs awaiting garbage collection.
     pub pending_gc_objects: usize,
-    /// Node that holds the database's write lease, if any.
+    /// Node that holds the write lease.
     pub lease_holder: Option<String>,
     pub lease_expires_at: Option<u64>,
     /// Store time of the last commit or maintenance write.

@@ -1,10 +1,10 @@
-//! One-shot and interactive transactions.
+//! One-shot and interactive transaction endpoints and types.
 
 use crate::{Empty, Endpoint, NoBody, Op, OpResult, fill_route, is_default, is_false, json_body};
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
-/// `POST /v1/dbs/{db}/txn`: executes operations in a single transaction.
+/// `POST /v1/dbs/{db}/txn`.
 #[derive(Clone, Debug)]
 pub struct Txn {
     pub db: String,
@@ -30,9 +30,7 @@ impl Endpoint for Txn {
     }
 }
 
-/// `POST /v1/dbs/{db}/transactions`: begins an interactive transaction and executes `ops` in it.
-///
-/// The transaction expires after `expires_at` or after `idle_timeout_ms` without a request.
+/// `POST /v1/dbs/{db}/transactions`.
 #[derive(Clone, Debug)]
 pub struct BeginTxn {
     pub db: String,
@@ -54,10 +52,7 @@ impl Endpoint for BeginTxn {
     }
 }
 
-/// `POST /v1/dbs/{db}/transactions/{id}/ops`: executes operations in an open transaction.
-///
-/// If the request fails, the server aborts the transaction and later requests on it fail with
-/// `txn_not_found`.
+/// `POST /v1/dbs/{db}/transactions/{id}/ops`.
 #[derive(Clone, Debug)]
 pub struct TxnOps {
     pub db: String,
@@ -80,9 +75,7 @@ impl Endpoint for TxnOps {
     }
 }
 
-/// `POST /v1/dbs/{db}/transactions/{id}/commit`: executes `ops` and commits the transaction.
-///
-/// A read-only transaction must be committed to validate its reads.
+/// `POST /v1/dbs/{db}/transactions/{id}/commit`.
 #[derive(Clone, Debug)]
 pub struct CommitTxn {
     pub db: String,
@@ -109,7 +102,7 @@ impl Endpoint for CommitTxn {
     }
 }
 
-/// `DELETE /v1/dbs/{db}/transactions/{id}`: aborts an open transaction.
+/// `DELETE /v1/dbs/{db}/transactions/{id}`.
 #[derive(Clone, Debug)]
 pub struct AbortTxn {
     pub db: String,
@@ -132,10 +125,7 @@ impl Endpoint for AbortTxn {
     }
 }
 
-/// `GET /v1/dbs/{db}/commits/{id}`: resolves whether a commit was applied.
-///
-/// `id` is a 16-character commit ID or `key:` followed by an idempotency key. If the commit was
-/// not applied, the server fences it so that it can never be applied later.
+/// `GET /v1/dbs/{db}/commits/{id}`.
 #[derive(Clone, Debug)]
 pub struct GetCommit {
     pub db: String,
@@ -257,7 +247,8 @@ pub struct OpsRequest {
     pub ops: Vec<Op>,
 }
 
-/// Operations to execute before committing; a `null` or empty body has none.
+/// Operations to execute before committing. An empty or `null` body commits without additional
+/// operations.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(from = "Option<CommitBody>")]
 pub struct CommitRequest {
@@ -284,11 +275,11 @@ pub struct OpsResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Committed {
-    /// Commit version, or the read version if the transaction wrote nothing.
+    /// Commit version, or the read version if the transaction did not modify data.
     pub version: u64,
-    /// False if the transaction wrote nothing, so that no commit was applied. Servers that predate
-    /// the field omit it, and it then reads as true.
-    #[serde(default = "yes")]
+    /// True if the transaction modified data and wrote a commit version. Defaults to `true` if
+    /// omitted by an older server.
+    #[serde(default = "default_true")]
     pub committed: bool,
     pub commit_id: String,
     /// First sequence number assigned to each `append` operation in the transaction, in order.
@@ -305,8 +296,8 @@ pub enum CommitStatus {
         commit_id: String,
         appends: Vec<u64>,
     },
-    /// The commit was not applied and never will be. This is definitive only if the commit began
-    /// less than `retention_ms` ago.
+    /// The commit was not applied and is fenced against later application. This status is
+    /// definitive only if the commit started within `retention_ms`.
     NotCommitted {
         commit_id: String,
         retention_ms: u64,
@@ -325,6 +316,6 @@ json_body!(
     CommitStatus
 );
 
-fn yes() -> bool {
+fn default_true() -> bool {
     true
 }

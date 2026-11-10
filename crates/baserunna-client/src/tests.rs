@@ -229,7 +229,7 @@ async fn a_write_without_an_idempotency_key_is_not_sent_twice_after_an_unknown_o
         c.db("s").txn(&put(), Some("key")).await.unwrap_err();
         assert_eq!(sent(&s), 4, "{r:?}: a write with a key is retried");
     }
-    for r in [Err(TransportError::NotSent("refused".into())), resp(407, &[], "<html>Proxy</html>")] {
+    for r in [Err(TransportError::NotSent("unreachable".into())), resp(407, &[], "<html>Proxy</html>")] {
         let (c, s) = script(vec![r.clone()]);
         c.db("s").txn(&put(), None).await.unwrap_err();
         assert_eq!(sent(&s), 4, "{r:?}: a request that was not applied is retried");
@@ -296,7 +296,7 @@ async fn a_truncated_body_is_a_network_failure_and_is_retried() {
 #[tokio::test(start_paused = true)]
 async fn the_first_success_ends_the_retries() {
     let (c, s) = script(vec![
-        Err(TransportError::NotSent("refused".into())),
+        Err(TransportError::NotSent("unreachable".into())),
         api_err(409, "conflict", "null"),
         resp(201, &[], r#"{"blob_id":"b","size":1,"sha256":"00","content_type":"application/octet-stream"}"#),
     ]);
@@ -396,8 +396,8 @@ fn arbitrary_responses_never_panic_the_client() {
 #[tokio::test(start_paused = true)]
 async fn an_unknown_outcome_of_an_earlier_attempt_is_not_hidden_by_later_failures() {
     let lost = Err(TransportError::Unknown("response lost".into()));
-    let refused = Err(TransportError::NotSent("refused".into()));
-    let (c, s) = script(vec![lost.clone(), refused.clone(), refused.clone(), refused.clone()]);
+    let not_sent = Err(TransportError::NotSent("unreachable".into()));
+    let (c, s) = script(vec![lost.clone(), not_sent.clone(), not_sent.clone(), not_sent.clone()]);
     let e = c.db("s").txn(&put(), Some("key")).await.unwrap_err();
     assert_eq!((e, sent(&s)), (Error::Transport(TransportError::Unknown("response lost".into())), 4));
 
@@ -413,9 +413,9 @@ async fn an_unknown_outcome_of_an_earlier_attempt_is_not_hidden_by_later_failure
     let resolved = api_err(412, "precondition_failed", r#"{"op_index":0}"#);
     let (c, _) = script(vec![lost, resolved]);
     let e = c.db("s").txn(&put(), Some("key")).await.unwrap_err();
-    assert_eq!(e.code(), Some(ErrorCode::PreconditionFailed), "a definitive response resolves earlier attempts");
+    assert_eq!(e.code(), Some(ErrorCode::PreconditionFailed), "a definitive error fences earlier attempts");
 
-    let (c, _) = script(vec![refused]);
+    let (c, _) = script(vec![not_sent]);
     assert_eq!(c.db("s").txn(&put(), Some("key")).await.unwrap_err().outcome(), Outcome::NotApplied);
 }
 
@@ -465,7 +465,7 @@ const BEGUN: &str = r#"{"txn_id":"t1","commit_id":"00000000000000c1","read_versi
 const COMMITTED: &str = r#"{"version":2,"committed":true,"commit_id":"00000000000000c1","appends":[],"results":[{}]}"#;
 
 #[test]
-fn row_and_stream_ops_serialize_as_the_api_takes_them() {
+fn row_and_stream_ops_match_wire_format() {
     use serde_json::json;
     let row = Thing { id: "a".into(), n: 1 };
     let cases = [
@@ -529,11 +529,11 @@ fn next_page_follows_cursors_and_stream_positions() {
     );
     let back = Op::ReadStream(api::ReadStream { stream: "s".into(), reverse: true, ..api::ReadStream::default() });
     assert_eq!(wire(&back.next_page(&records(4, false)).unwrap())["until_seq"], 4, "reverse reads page backward");
-    assert_eq!(Op::get("k").next_page(&rows(Some("c"))), None, "a result of another operation has no next page");
+    assert_eq!(Op::get("k").next_page(&rows(Some("c"))), None, "a non-paginated operation returns None");
 }
 
 #[tokio::test(start_paused = true)]
-async fn rows_and_records_decode_into_their_types_and_name_what_is_malformed() {
+async fn row_and_record_decoders_report_malformed_data() {
     let body = r#"{"version":1,"committed":false,"results":[
         {"found":true,"row":{"id":"a","n":2}},
         {"found":false},
@@ -584,7 +584,7 @@ async fn a_transaction_begins_with_its_first_operations_and_commits_its_writes()
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_transaction_without_reads_commits_its_writes_in_one_idempotent_request() {
+async fn write_only_txn_commits_in_a_single_idempotent_request() {
     let ok = r#"{"version":3,"committed":true,"commit_id":"00000000000000aa","results":[{}],"appends":[]}"#;
     let (c, s) = script(vec![resp(200, &[], ok)]);
     assert_eq!(c.db("s").begin().commit().await.unwrap(), None);
@@ -609,7 +609,7 @@ async fn an_unknown_commit_outcome_stays_unknown_if_its_status_cannot_be_read() 
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_read_only_commit_with_an_unknown_outcome_applied_nothing() {
+async fn read_only_commit_with_unknown_outcome_is_not_applied() {
     let (c, s) = script(vec![resp(201, &[], BEGUN), Err(TransportError::Unknown("lost".into()))]);
     let mut txn = c.db("s").begin();
     txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
@@ -618,7 +618,7 @@ async fn a_read_only_commit_with_an_unknown_outcome_applied_nothing() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn writes_apply_exactly_once_by_resolving_their_idempotency_key() {
+async fn writes_are_applied_exactly_once_by_resolving_idempotency_key() {
     let lost = Err(TransportError::Unknown("response lost".into()));
     let committed = r#"{"status":"committed","version":5,"commit_id":"0000000000000001","appends":[]}"#;
     let (c, s) = script(vec![lost.clone(), lost.clone(), lost.clone(), lost, resp(200, &[], committed)]);
@@ -637,7 +637,7 @@ async fn writes_apply_exactly_once_by_resolving_their_idempotency_key() {
 #[derive(Debug, PartialEq)]
 enum AppError {
     Client(Error),
-    Refused,
+    Rejected,
 }
 
 impl From<Error> for AppError {
@@ -650,13 +650,13 @@ impl TxnError for AppError {
     fn client_error(&self) -> Option<&Error> {
         match self {
             AppError::Client(e) => Some(e),
-            AppError::Refused => None,
+            AppError::Rejected => None,
         }
     }
 }
 
 /// Runs a read-then-write transaction loop and returns the attempts and the result.
-async fn read_modify_write(c: &Client, refuse: bool) -> (u32, Result<u32, AppError>) {
+async fn read_modify_write(c: &Client, reject: bool) -> (u32, Result<u32, AppError>) {
     let db = c.db("s");
     let mut retry = db.retry();
     let mut attempts = 0;
@@ -665,8 +665,8 @@ async fn read_modify_write(c: &Client, refuse: bool) -> (u32, Result<u32, AppErr
         let mut txn = db.begin();
         let r = async {
             let row = txn.run_one(Op::get_row::<Thing>("a")).await?.row::<Thing>()?;
-            if refuse {
-                return Err(AppError::Refused);
+            if reject {
+                return Err(AppError::Rejected);
             }
             txn.write([Op::upsert(&Thing { id: "a".into(), n: 2 })]);
             Ok(row.map_or(0, |r| r.n))
@@ -694,7 +694,7 @@ async fn retry_restarts_a_conflicting_transaction() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn retry_gives_up_on_unresolved_commits_refusals_and_exhausted_attempts() {
+async fn retry_stops_on_unresolved_commits_application_errors_and_exhausted_attempts() {
     let lost = Err(TransportError::Unknown("response lost".into()));
     let down = Err(TransportError::NotSent("down".into()));
     let (c, s) = script(vec![resp(201, &[], BEGUN), lost, down]);
@@ -705,9 +705,13 @@ async fn retry_gives_up_on_unresolved_commits_refusals_and_exhausted_attempts() 
 
     let (c, s) = script(vec![resp(201, &[], BEGUN), resp(200, &[], "{}")]);
     let (attempts, r) = read_modify_write(&c, true).await;
-    assert_eq!((attempts, r), (1, Err(AppError::Refused)));
+    assert_eq!((attempts, r), (1, Err(AppError::Rejected)));
     let r = requests(&s);
-    assert_eq!((r[1].0.as_str(), r[1].1.as_str()), ("DELETE", "/v1/dbs/s/transactions/t1"), "a refusal aborts");
+    assert_eq!(
+        (r[1].0.as_str(), r[1].1.as_str()),
+        ("DELETE", "/v1/dbs/s/transactions/t1"),
+        "an application error aborts the transaction"
+    );
 
     let conflicts = (0..3).flat_map(|_| [resp(201, &[], BEGUN), api_err(409, "conflict", "null")]).collect();
     let (c, s) = script(conflicts);
@@ -764,12 +768,12 @@ async fn retry_restarts_a_transaction_after_the_delay_the_server_asked_for() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_not_committed_status_older_than_its_retention_leaves_the_outcome_unknown() {
+async fn expired_not_committed_status_leaves_outcome_unknown() {
     let lost = Err(TransportError::Unknown("response lost".into()));
     let expired = r#"{"status":"not_committed","commit_id":"0000000000000001","retention_ms":1}"#;
     let (c, _) = script(vec![lost.clone(), lost.clone(), lost.clone(), lost, resp(200, &[], expired)]);
     let e = c.db("s").write(&put()).await.unwrap_err();
-    assert_eq!(e.outcome(), Outcome::Unknown, "the commit record may have expired after it applied: {e:?}");
+    assert_eq!(e.outcome(), Outcome::Unknown, "the commit record may have expired after commit: {e:?}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -779,11 +783,11 @@ async fn retry_does_not_restart_after_an_unknown_outcome_outside_its_transaction
     let mut retry = db.retry();
     let lost = Error::Transport(TransportError::Unknown("lost".into()));
     let r: Result<Option<()>, Error> = retry.finish(db.begin(), Err(lost.clone())).await;
-    assert_eq!((r, sent(&s)), (Err(lost), 0), "another request's write may have applied");
+    assert_eq!((r, sent(&s)), (Err(lost), 0), "another request's write may have been applied");
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_transaction_refuses_further_use_after_a_request_fails_and_is_aborted() {
+async fn failed_transaction_rejects_further_calls_and_is_aborted() {
     let undecodable = resp(200, &[], r#"{"results":[]}"#);
     for failure in [api_err(400, "invalid_argument", "null"), undecodable] {
         let (c, s) = script(vec![resp(201, &[], BEGUN), failure, resp(200, &[], "{}")]);
@@ -791,9 +795,9 @@ async fn a_transaction_refuses_further_use_after_a_request_fails_and_is_aborted(
         txn.run_one(Op::get_row::<Thing>("a")).await.unwrap();
         let e = txn.run_one(Op::put("k", "v")).await.unwrap_err();
         assert!(e.outcome() == Outcome::NotApplied && !e.restarts_txn(), "{e:?}");
-        assert_eq!(txn.run_one(Op::get("k")).await.unwrap_err(), e, "a failed transaction runs nothing more");
+        assert_eq!(txn.run_one(Op::get("k")).await.unwrap_err(), e, "a failed transaction rejects further operations");
         txn.write([Op::put("k", "v")]);
-        assert_eq!(txn.commit().await.unwrap_err(), e, "nor commits its queued writes");
+        assert_eq!(txn.commit().await.unwrap_err(), e, "a failed transaction rejects commit");
         let r: Vec<_> = requests(&s).into_iter().map(|r| (r.0, r.1)).collect();
         assert_eq!(r.len(), 3);
         assert_eq!(r[2], ("DELETE".into(), "/v1/dbs/s/transactions/t1".into()), "the open transaction is aborted");
@@ -801,7 +805,7 @@ async fn a_transaction_refuses_further_use_after_a_request_fails_and_is_aborted(
 }
 
 #[tokio::test(start_paused = true)]
-async fn only_errors_that_applied_nothing_and_can_pass_restart_a_transaction() {
+async fn only_transient_unapplied_errors_restart_a_transaction() {
     let failed = async |r| {
         let (c, _) = script(vec![r]);
         let c = c.with_retry_policy(RetryPolicy { attempts: 1, ..RetryPolicy::default() });
@@ -830,7 +834,7 @@ async fn a_replayed_read_is_malformed() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_rejected_begin_sends_no_abort() {
+async fn rejected_begin_does_not_abort() {
     let (c, s) = script(vec![api_err(400, "invalid_argument", "null"), resp(200, &[], "{}")]);
     let mut txn = c.db("s").begin();
     assert!(txn.run_one(Op::get("k")).await.is_err());
@@ -839,7 +843,7 @@ async fn a_rejected_begin_sends_no_abort() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_missing_key_reads_as_none_from_old_and_new_servers_but_a_missing_database_is_an_error() {
+async fn missing_key_returns_none_and_missing_database_returns_error() {
     let not_found = |message: &str, details: &str| {
         let body = format!(
             r#"{{"error":{{"code":"not_found","message":"{message}","retryable":false,"details":{details}}}}}"#

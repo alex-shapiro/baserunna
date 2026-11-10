@@ -160,7 +160,7 @@ impl Body {
     }
 }
 
-/// Converts a record as a client writes it into its stored body.
+/// Validates and encodes [`api::NewRecord`] into a stored [`Body`].
 pub fn record_body(r: api::NewRecord, enc: api::Encoding) -> Result<Body> {
     let mut b = match (r.value, r.json) {
         (Some(v), None) => Body::text(enc.decode(&v, "value")?),
@@ -209,7 +209,7 @@ pub fn parse_lines(data: &Bytes, json: bool) -> Result<Vec<Body>> {
     Ok(out)
 }
 
-/// A record as reads return it.
+/// Formats a stored stream record for API responses.
 pub fn record(r: &Record, b: &Body, enc: api::Encoding) -> api::StreamRecord {
     let mut out = api::StreamRecord {
         seq: r.seq,
@@ -365,7 +365,7 @@ pub fn public_state(st: &StreamState) -> api::StreamState {
     }
 }
 
-/// A stream as listings and info describe it.
+/// Formats stream metadata and state as [`api::Stream`].
 pub fn public_stream(name: &str, c: &Catalog, st: &StreamState) -> api::Stream {
     api::Stream {
         name: name.into(),

@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 /// Maximum number of items in a page of a `scan`, `query_rows`, or `read_stream` result.
 pub const PAGE_MAX: usize = 1000;
 
-/// Key and value fields use the request `encoding`.
+/// Transaction operation. Key and value fields use the transaction's [`Encoding`](crate::Encoding).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Op {
@@ -40,8 +40,7 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
     },
-    /// Writes `value` or a staged `blob_id` to `key`. Exactly one of `value` or `blob_id` must be
-    /// set.
+    /// Writes `value` or a staged `blob_id` to `key`.
     Put {
         key: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,8 +70,7 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         end: Option<String>,
     },
-    /// Fails the transaction with `precondition_failed` unless `key` satisfies all specified
-    /// conditions.
+    /// Requires `key` to satisfy all specified conditions, or aborts with `precondition_failed`.
     Check {
         key: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,7 +83,7 @@ pub enum Op {
     /// Adds `by` to the base-10 integer at `key`, treating an absent key as 0.
     Increment {
         key: String,
-        #[serde(default = "one")]
+        #[serde(default = "default_increment")]
         by: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ttl_ms: Option<u64>,
@@ -195,7 +193,7 @@ pub enum Op {
     },
 }
 
-fn one() -> i64 {
+fn default_increment() -> i64 {
     1
 }
 
@@ -260,7 +258,8 @@ pub struct RangeSpec {
     pub lte: Option<Json>,
 }
 
-/// Stream record to append, with exactly one of `value` (in the request `encoding`) or `json`.
+/// Stream record to append. Set either `value` (using the request [`Encoding`](crate::Encoding))
+/// or `json`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewRecord {
@@ -273,8 +272,8 @@ pub struct NewRecord {
     pub headers: BTreeMap<String, String>,
 }
 
-/// Reads records from `stream`, starting at no more than one of `from_seq`, `from_time`, `tail`, or
-/// `consumer`.
+/// Stream read parameters. Specify at most one start position (`from_seq`, `from_time`, `tail`,
+/// or `consumer`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadStream {
@@ -293,18 +292,18 @@ pub struct ReadStream {
     pub until_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_time: Option<u64>,
-    /// Returns the newest records first, from the end of the range.
+    /// Reads backward from the end of the range, returning the newest records first.
     #[serde(default, skip_serializing_if = "is_false")]
     pub reverse: bool,
     /// Maximum number of records, defaulting to 100 and at most [`PAGE_MAX`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
-    /// Stops once the returned records hold this many body bytes.
+    /// Maximum total body bytes to return.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Json>,
-    /// Examines at most this many records.
+    /// Maximum number of records to scan before returning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_limit: Option<usize>,
 }
@@ -336,10 +335,10 @@ impl<'de> Deserialize<'de> for QueryEvents {
     }
 }
 
-/// Result of one operation.
+/// Result of a transaction operation.
 ///
-/// Because results are untagged in JSON, deserialization stores each result as
-/// [`OpResult::Raw`]; call [`OpResult::decode`] to parse it as the type its operation returns.
+/// Deserialization stores each untagged JSON element as [`OpResult::Raw`]. Call
+/// [`OpResult::decode`] to parse it into the result type for the operation.
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub enum OpResult {
@@ -430,11 +429,11 @@ pub struct IncrementResult {
     pub value: i64,
 }
 
-/// Row read by `get_row`, with each row type `R` decoding the row object.
+/// Result of a `get_row` operation.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RowResult<R = Json> {
     pub found: bool,
-    #[serde(default = "none", skip_serializing_if = "Option::is_none")]
+    #[serde(default = "default_none", skip_serializing_if = "Option::is_none")]
     pub row: Option<R>,
     /// Expiration time in milliseconds since the Unix epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -448,7 +447,7 @@ pub struct RowsResult<R = Json> {
     pub next_cursor: Option<String>,
 }
 
-fn none<T>() -> Option<T> {
+fn default_none<T>() -> Option<T> {
     None
 }
 
@@ -479,7 +478,7 @@ pub struct RecordsResult<J = Json> {
     pub done: bool,
 }
 
-/// Stream record with exactly one of `json`, `value`, or `value_b64`.
+/// Stream record returned by a read or query.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(bound(deserialize = "J: Deserialize<'de>"))]
 pub struct StreamRecord<J = Json> {
@@ -488,7 +487,7 @@ pub struct StreamRecord<J = Json> {
     pub time: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
-    #[serde(default = "none", skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    #[serde(default = "default_none", skip_serializing_if = "Option::is_none", deserialize_with = "present")]
     pub json: Option<J>,
     /// Text body in the request `encoding`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

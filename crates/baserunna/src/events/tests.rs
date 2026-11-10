@@ -3283,7 +3283,7 @@ mod maintenance_robustness {
             let r = query(&db, &q).await;
             assert!(
                 matches!(r, Err(crate::error::Error::Unavailable { .. })),
-                "a query without a store clock neither hides retained events nor returns expired ones: {r:?}"
+                "a query without a store clock must fail: {r:?}"
             );
             store.fail.store(false, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(query(&db, &q).await.unwrap().rows, vec![vec![json!(1)]], "a query hid a retained event");

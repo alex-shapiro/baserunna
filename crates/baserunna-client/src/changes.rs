@@ -12,7 +12,7 @@ pub struct ChangesRequest {
     /// `cursor` from the previous page, or `"0"` for the start of retained history.
     pub after: String,
     pub limit: usize,
-    /// Maximum time in milliseconds to wait if no changes are available, up to `long_poll_max_ms`.
+    /// Maximum wait time in milliseconds for new changes, up to `long_poll_max_ms`.
     pub wait_ms: u64,
     /// Maximum snapshot staleness in milliseconds, or `None` for a strong read.
     pub max_staleness_ms: Option<u64>,

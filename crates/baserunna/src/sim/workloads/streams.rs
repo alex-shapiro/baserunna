@@ -1009,7 +1009,7 @@ async fn check_integrity(sim: &Arc<Sim>) -> Result<(), String> {
     let r = c.call_retry("GET", DB, None).await;
     let id = r.json["id"].as_str().ok_or("missing database id")?.to_string();
     let db = node.engine.db(&id);
-    // Injected storage faults are still active, so retry reads that fail on them.
+    // Storage faults are still active, so retry transient read errors.
     crate::node::retry_unavailable(|| async {
         let mut t = db.begin(crate::engine::Isolation::Serializable, crate::engine::Consistency::Strong).await?;
         crate::stream::check_integrity(&mut t).await

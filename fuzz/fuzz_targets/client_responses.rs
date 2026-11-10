@@ -17,7 +17,7 @@ impl Row for Item {
     const TABLE: &'static str = "t";
 }
 
-/// Decodes `r` as each typed result its operation can hold.
+/// Exercises all typed result decoders on `r`.
 fn decode(r: OpResult) {
     drop(r.clone().entry());
     drop(r.clone().scan_page());

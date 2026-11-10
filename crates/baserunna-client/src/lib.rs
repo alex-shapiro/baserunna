@@ -1,7 +1,7 @@
 //! Typed client for the Baserunna HTTP API.
 //!
-//! [`Client`] retries transient failures if the request was not applied or is idempotent, and
-//! [`Db::retry`] restarts interactive transactions that conflict.
+//! [`Client`] retries transient failures if the request is idempotent or was not applied.
+//! [`Db::retry`] restarts interactive transactions that fail with a conflict.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), baserunna_client::Error> {
@@ -49,17 +49,17 @@ use std::time::Duration;
 
 /// Retry policy for failed requests.
 ///
-/// Each retry waits a random delay up to a bound that starts at `initial_backoff_ms` and triples
-/// after each attempt, up to `max_backoff_ms`.
+/// Before each retry, the client waits a random delay up to a bound. The bound starts at
+/// `initial_backoff_ms` and triples after each attempt, up to `max_backoff_ms`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetryPolicy {
-    /// Maximum number of attempts per request; must be at least 1.
+    /// Maximum attempts per request. Must be at least 1.
     pub attempts: u32,
     pub initial_backoff_ms: u64,
     pub max_backoff_ms: u64,
     /// Maximum delay if a server or proxy returns `Retry-After`.
     pub max_retry_after_ms: u64,
-    /// Maximum number of attempts of a transaction loop of [`Db::retry`]; must be at least 1.
+    /// Maximum attempts for a [`Db::retry`] loop. Must be at least 1.
     pub txn_attempts: u32,
 }
 
@@ -76,7 +76,7 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// Returns the bound on the delay after failed attempt `attempt`, starting at 1.
+    /// Returns the maximum backoff delay for 1-based `attempt`.
     fn backoff_ms(&self, attempt: u32) -> u64 {
         let growth = 3u64.saturating_pow(attempt.saturating_sub(1));
         self.initial_backoff_ms.saturating_mul(growth).min(self.max_backoff_ms)
@@ -121,8 +121,7 @@ impl Client {
         Client { retry_policy, ..self.clone() }
     }
 
-    /// Returns a client that draws backoff jitter and idempotency keys from `entropy` instead of
-    /// the operating system, such as to make retries reproducible in a simulation.
+    /// Returns a client that uses `entropy` for backoff jitter and idempotency keys.
     pub fn with_entropy(&self, entropy: impl Fn() -> u64 + Send + Sync + 'static) -> Client {
         Client { entropy: Arc::new(entropy), ..self.clone() }
     }
@@ -135,21 +134,20 @@ impl Client {
         self.retry_policy
     }
 
-    /// Sends a request to endpoint `E`, retrying transient failures if the request was not applied
-    /// or is idempotent.
+    /// Sends a request to endpoint `E`.
     ///
-    /// If the final attempt fails with [`api::Outcome::NotApplied`] after an earlier attempt failed
-    /// with [`api::Outcome::Unknown`], the earlier error is returned because that attempt might
-    /// have been applied. If the server returns `precondition_failed` or `aborted`, that error is
-    /// returned directly because the server fences earlier attempts for the idempotency key first.
+    /// Transient failures are retried if the request is idempotent or was not applied. If an
+    /// attempt fails with [`api::Outcome::Unknown`] and a later attempt fails with
+    /// [`api::Outcome::NotApplied`], this method returns the earlier error unless the server
+    /// fenced earlier attempts with `precondition_failed` or `aborted`.
     pub async fn send<E: Endpoint>(&self, endpoint: &E, body: &E::Body) -> Result<E::Response, Error> {
         let r = self.attempts(endpoint, body, None).await.map_err(|f| f.error)?;
-        Ok(r.expect("an allowed error is not configured"))
+        Ok(r.expect("response is present"))
     }
 
-    /// Sends a request like [`Client::send`], but returns `Ok(None)` if the server responds with
-    /// `allowed_error`, in which case the request is treated as idempotent. If an earlier
-    /// attempt's error is reported, the final attempt's error is returned too.
+    /// Sends a request like [`Client::send`], or returns `Ok(None)` on `allowed_error`.
+    ///
+    /// Requests with an `allowed_error` are treated as idempotent.
     async fn attempts<E: Endpoint>(
         &self,
         endpoint: &E,
@@ -174,15 +172,14 @@ impl Client {
                 unresolved = Some(err.clone());
             }
             if !transient || attempt >= self.retry_policy.attempts {
-                // Every server version fences earlier attempts for the idempotency key before
-                // answering `PreconditionFailed` or `Aborted`; newer servers also fence before
-                // other definitive errors, but a client cannot tell which server answered.
+                // The server fences earlier attempts for the idempotency key before returning
+                // `PreconditionFailed` or `Aborted`.
                 let resolved = matches!(err.code(), Some(api::ErrorCode::PreconditionFailed | api::ErrorCode::Aborted));
                 return Err(match (err.outcome(), unresolved) {
                     (api::Outcome::NotApplied, Some(earlier)) if !resolved => {
-                        Box::new(Failed { error: earlier, refusal: Some(err) })
+                        Box::new(Failed { error: earlier, rejected: Some(err) })
                     }
-                    _ => Box::new(Failed { error: err, refusal: None }),
+                    _ => Box::new(Failed { error: err, rejected: None }),
                 });
             }
             self.backoff(attempt, &err).await;
@@ -190,9 +187,7 @@ impl Client {
         }
     }
 
-    /// Sleeps before the attempt after failed attempt `attempt`, which ended with `err`: for the
-    /// delay the server asked for, or else for a random delay up to the backoff bound, so that
-    /// clients that failed together do not retry together.
+    /// Sleeps for the server-requested delay or a random backoff delay after `attempt` fails.
     pub(crate) async fn backoff(&self, attempt: u32, err: &Error) {
         let ms = match err.retry_after_ms() {
             Some(ms) => ms.min(self.retry_policy.max_retry_after_ms),
@@ -257,7 +252,7 @@ impl Client {
         self.send(&api::ListDbs { query }, &api::NoBody {}).await
     }
 
-    /// Creates an API key; requires a session rather than another API key.
+    /// Creates an API key. Requires a user session token.
     pub async fn create_api_key(&self, key: &api::NewApiKey) -> Result<api::CreatedApiKey, Error> {
         self.send(&api::CreateApiKey, key).await
     }
@@ -284,12 +279,12 @@ impl Client {
         self.send(&e, &api::NoBody {}).await.map(|_| ())
     }
 
-    /// Reads the metrics of the node that serves the request; requires an admin.
+    /// Reads the metrics of the serving node. Requires an admin token.
     pub async fn metrics(&self) -> Result<api::Metrics, Error> {
         self.send(&api::GetMetrics, &api::NoBody {}).await
     }
 
-    /// Reads and then resets the metrics of the node that serves the request; requires an admin.
+    /// Reads and resets the metrics of the serving node. Requires an admin token.
     pub async fn reset_metrics(&self) -> Result<api::Metrics, Error> {
         self.send(&api::ResetMetrics, &api::NoBody {}).await
     }
@@ -302,10 +297,10 @@ impl Client {
 
 /// Failure of a request after its final attempt.
 struct Failed {
-    /// Error to report: the final attempt's, or an earlier attempt's whose outcome is unknown.
+    /// Error to report to the caller.
     error: Error,
-    /// Final attempt's error, which applied nothing, if `error` is an earlier attempt's.
-    refusal: Option<Error>,
+    /// Final attempt's error if `error` came from an earlier attempt with an unknown outcome.
+    rejected: Option<Error>,
 }
 
 fn decode<E: Endpoint>(path: &str, resp: http::Response<Bytes>) -> Result<E::Response, Error> {
@@ -354,8 +349,7 @@ fn random_u64() -> u64 {
     RandomState::new().hash_one(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Returns true if `e` reports that the key of a raw key-value read holds no value. Servers that
-/// predate `ErrorDetails::missing` report it only in the message, which they never vary.
+/// Returns true if `e` reports that the requested key is absent.
 fn missing_key(e: &api::ApiError) -> bool {
     match e.details.as_ref().and_then(|d| d.missing) {
         Some(m) => m == api::Missing::Key,
@@ -391,7 +385,7 @@ impl Db {
         }
     }
 
-    /// Reads the database's metadata, the caller's role, and storage statistics.
+    /// Reads metadata, the caller's role, and storage statistics for the database.
     pub async fn info(&self) -> Result<api::DbInfo, Error> {
         self.client.send(&api::GetDb { db: self.name.clone() }, &api::NoBody {}).await
     }
@@ -414,26 +408,26 @@ impl Db {
         self.client.send(&api::GetStream { db: self.name.clone(), stream: stream.into() }, &api::NoBody {}).await
     }
 
-    /// Appends records to `stream` in one commit, exactly once if `append` has an
-    /// `idempotency_key`.
+    /// Appends records to `stream`.
+    ///
+    /// The records are appended at most once if `append` includes an `idempotency_key`.
     pub async fn append_records(&self, stream: &str, append: &api::AppendRequest) -> Result<api::Appended, Error> {
         self.client.send(&api::AppendRecords { db: self.name.clone(), stream: stream.into() }, append).await
     }
 
-    /// Appends one JSON record per line of `lines` to `stream` in one commit.
+    /// Appends newline-delimited JSON records to `stream`.
     pub async fn append_lines(&self, stream: &str, lines: Bytes) -> Result<api::Appended, Error> {
         let e = api::AppendLines { db: self.name.clone(), stream: stream.into() };
         self.client.send(&e, &api::JsonLines(lines)).await
     }
 
-    /// Reads a page of records of `stream`, waiting up to `query.wait_ms` for appends if a forward
-    /// read finds none.
+    /// Reads a page of records from `stream`.
     pub async fn read_records(&self, stream: &str, query: api::ReadRecordsQuery) -> Result<api::RecordPage, Error> {
         let e = api::ReadRecords { db: self.name.clone(), stream: stream.into(), query };
         self.client.send(&e, &api::NoBody {}).await
     }
 
-    /// Reads a page of the records of `stream` that `query.filter` matches.
+    /// Queries a page of records from `stream` that match `query`.
     pub async fn query_records(&self, stream: &str, query: &api::RecordQuery) -> Result<api::RecordPage, Error> {
         self.client.send(&api::QueryRecords { db: self.name.clone(), stream: stream.into() }, query).await
     }
@@ -442,7 +436,7 @@ impl Db {
         self.client.send(&api::CreateTable { db: self.name.clone() }, table).await
     }
 
-    /// Adds a column to `table`, which reads as the column's `default` in existing rows.
+    /// Adds a column to `table`. Existing rows receive the column's default value.
     pub async fn add_column(&self, table: &str, column: &api::NewColumn) -> Result<api::CreatedTable, Error> {
         self.client.send(&api::AddColumn { db: self.name.clone(), table: table.into() }, column).await
     }
@@ -461,8 +455,7 @@ impl Db {
         self.client.send(&api::ListTables { db: self.name.clone(), query }, &api::NoBody {}).await
     }
 
-    /// Executes read operations at the latest committed version and returns one result per
-    /// operation.
+    /// Executes read operations at the latest committed version.
     pub async fn read(&self, ops: &[Op]) -> Result<Vec<OpResult>, Error> {
         self.txn(ops, None).await?.results.ok_or_else(|| Error::Malformed {
             path: api::Txn { db: self.name.clone() }.path(),
@@ -470,8 +463,7 @@ impl Db {
         })
     }
 
-    /// Executes read operations at a version at most `max_staleness` old, which any node can serve
-    /// from its cache without asking the lease holder.
+    /// Executes read operations against a snapshot that is at most `max_staleness` old.
     pub async fn read_snapshot(&self, ops: &[Op], max_staleness: Duration) -> Result<Vec<OpResult>, Error> {
         let req = api::TxnRequest {
             consistency: Some(api::Consistency::Snapshot),
@@ -489,12 +481,10 @@ impl Db {
         Ok(self.read(std::slice::from_ref(&op)).await?.swap_remove(0))
     }
 
-    /// Executes `ops` in a single transaction that applies exactly once, or returns `None` if the
-    /// transaction wrote nothing, such as one of only checks or a delete of a missing row.
+    /// Executes write operations in a single transaction with exactly-once delivery.
     ///
-    /// If the outcome remains unknown after retries, the commit is resolved through the server: the
-    /// result is the commit, an [`Error::NotApplied`], or the original error if the server cannot
-    /// be reached.
+    /// Returns `None` if the transaction did not modify any data. If the outcome remains unknown
+    /// after retries, this method queries the commit status on the server.
     pub async fn write(&self, ops: &[Op]) -> Result<Option<Committed>, Error> {
         if ops.is_empty() {
             return Ok(None);
@@ -510,16 +500,14 @@ impl Db {
         self.exactly_once(request, applied, Some).await
     }
 
-    /// Sends the request that `request` builds for a new idempotency key, and returns what
-    /// `applied` makes of its response or `resolved` makes of the commit that resolves an unknown
-    /// outcome.
+    /// Sends a request with a new idempotency key and resolves unknown outcomes on the server.
     async fn exactly_once<E: Endpoint, T>(
         &self,
         request: impl Fn(&str) -> (E, E::Body),
         applied: impl Fn(E::Response) -> T,
         resolved: impl Fn(Committed) -> T,
     ) -> Result<T, Error> {
-        // An aborted key can never apply, so a new key safely learns why the server refused it.
+        // An aborted idempotency key cannot be committed, so retry once with a fresh key.
         match self.once(&request, &applied, &resolved).await {
             Err(e) if e.code() == Some(api::ErrorCode::Aborted) => self.once(&request, &applied, &resolved).await,
             r => r,
@@ -536,36 +524,36 @@ impl Db {
         let started = tokio::time::Instant::now();
         let (e, body) = request(&key);
         match self.client.attempts(&e, &body, None).await {
-            Ok(r) => Ok(applied(r.expect("no error is allowed"))),
+            Ok(r) => Ok(applied(r.expect("response is present"))),
             Err(f) if f.error.outcome() == api::Outcome::Unknown => {
-                let Failed { error, refusal } = *f;
-                self.resolve(&format!("key:{key}"), started, error, refusal).await.map(resolved)
+                let Failed { error, rejected } = *f;
+                self.resolve(&format!("key:{key}"), started, error, rejected).await.map(resolved)
             }
             Err(f) => Err(f.error),
         }
     }
 
-    /// Resolves commit `id`, first attempted at `started`, after `err` left its outcome unknown.
+    /// Queries the server for the status of commit `id` after `err` left its outcome unknown.
     ///
-    /// If the commit was not applied, returns `refusal`, the error of a later attempt that applied
-    /// nothing, or else `err` as [`Error::NotApplied`].
+    /// If the commit was not applied, this method returns `rejected` or wraps `err` in
+    /// [`Error::NotApplied`].
     pub(crate) async fn resolve(
         &self,
         id: &str,
         started: tokio::time::Instant,
         err: Error,
-        refusal: Option<Error>,
+        rejected: Option<Error>,
     ) -> Result<Committed, Error> {
         let e = api::GetCommit { db: self.name.clone(), id: id.into() };
         match self.client.send(&e, &api::NoBody {}).await {
             Ok(api::CommitStatus::Committed { version, commit_id, appends }) => {
                 Ok(Committed { version, commit_id, appends })
             }
-            // The server forgets commits after `retention_ms`, so an older commit may have applied.
+            // The server expires commit records after `retention_ms`.
             Ok(api::CommitStatus::NotCommitted { retention_ms, .. })
                 if started.elapsed() < Duration::from_millis(retention_ms) / 2 =>
             {
-                Err(refusal.unwrap_or_else(|| Error::NotApplied(Box::new(err))))
+                Err(rejected.unwrap_or_else(|| Error::NotApplied(Box::new(err))))
             }
             _ => Err(err),
         }
@@ -589,20 +577,19 @@ impl Db {
         ChangePage::decode(page).map_err(|reason| Error::Malformed { path: e.path(), reason })
     }
 
-    /// Uploads a blob to reference in [`Op::PutBlob`].
-    /// Uploads a blob to reference in a later write; reads of it report `content_type`.
+    /// Uploads a blob with `content_type` to reference in [`Op::PutBlob`].
     pub async fn stage_blob(&self, data: Bytes, content_type: &str) -> Result<api::BlobMeta, Error> {
         let e = api::StageBlob { db: self.name.clone(), content_type: Some(content_type.into()) };
         self.client.send(&e, &api::Octets(data)).await
     }
 
-    /// Reads a blob, or `range` of it.
+    /// Reads a blob or a byte range of a blob.
     pub async fn read_blob(&self, blob_id: &str, range: Option<api::ByteRange>) -> Result<api::Content, Error> {
         let e = api::ReadBlob { db: self.name.clone(), blob_id: blob_id.into(), range };
         self.client.send(&e, &api::NoBody {}).await
     }
 
-    /// Reads the bytes of `key`, or `range` of them, or returns `None` if `key` is absent.
+    /// Reads the value at `key`, or returns `None` if `key` is absent.
     pub async fn get_value(
         &self,
         key: impl Into<Bytes>,
@@ -616,9 +603,10 @@ impl Db {
         }
     }
 
-    /// Writes `data` to `key` exactly once, in one commit outside any transaction.
+    /// Writes `data` to `key` with exactly-once delivery.
     ///
-    /// If the outcome remains unknown after retries, it is resolved like [`Db::write`].
+    /// If the outcome remains unknown after retries, this method queries the commit status on the
+    /// server.
     pub async fn put_value(
         &self,
         key: impl Into<Bytes>,

@@ -8,7 +8,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// HTTP transport for sending requests to a Baserunna server.
 ///
-/// Request URIs contain only the path and query string; the transport prepends the server URL.
+/// Request URIs contain only the path and query string. The transport prepends the server URL.
 pub trait Transport: Send + Sync {
     fn send(&self, req: http::Request<Bytes>) -> BoxFuture<'_, Result<http::Response<Bytes>, TransportError>>;
 }
@@ -19,19 +19,19 @@ impl<T: Transport + ?Sized> Transport for Arc<T> {
     }
 }
 
-/// Request extension with the route template of the endpoint, such as
-/// `/v1/dbs/{db}/transactions/{id}/commit`, for transports that record per-endpoint metrics.
+/// Request extension that holds the endpoint route template, such as
+/// `/v1/dbs/{db}/transactions/{id}/commit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Route(pub &'static str);
 
 /// Transport-level failure before receiving a complete HTTP response.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransportError {
-    /// The request was not sent to the server, for example because the connection failed.
+    /// The request failed before it was sent to the server.
     NotSent(String),
-    /// The request might have reached the server before failing.
+    /// The request failed after it may have reached the server.
     Unknown(String),
-    /// The request exceeded the transport timeout and is not retried.
+    /// The request timed out.
     TimedOut(String),
 }
 
@@ -88,7 +88,7 @@ mod http_transport {
                 let resp =
                     self.client.request(parts.method, url).headers(parts.headers).body(body).send().await.map_err(
                         |e| {
-                            // Check `is_connect` before `is_timeout` because a connect timeout is also a timeout, but nothing was sent.
+                            // A connect timeout reports `is_timeout()`, so check `is_connect()` first.
                             if e.is_connect() || e.is_builder() {
                                 TransportError::NotSent(e.to_string())
                             } else if e.is_timeout() {

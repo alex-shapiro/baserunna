@@ -1,4 +1,4 @@
-//! Stream routes: append-only logs of records, read by sequence number, time, tail, or consumer.
+//! Stream endpoints and types.
 
 use crate::{
     Body, Consistency, Encoding, Endpoint, NewRecord, NoBody, StreamRecord, StreamState, fill_route, is_false,
@@ -9,7 +9,7 @@ use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
-/// `GET /v1/dbs/{db}/streams`: lists streams in name order.
+/// `GET /v1/dbs/{db}/streams`.
 #[derive(Clone, Debug)]
 pub struct ListStreams {
     pub db: String,
@@ -32,7 +32,7 @@ impl Endpoint for ListStreams {
     }
 }
 
-/// `POST /v1/dbs/{db}/streams`: creates a stream.
+/// `POST /v1/dbs/{db}/streams`.
 #[derive(Clone, Debug)]
 pub struct CreateStream {
     pub db: String,
@@ -54,7 +54,7 @@ impl Endpoint for CreateStream {
     }
 }
 
-/// `GET /v1/dbs/{db}/streams/{stream}`: reads a stream's state and its first consumers.
+/// `GET /v1/dbs/{db}/streams/{s}`.
 #[derive(Clone, Debug)]
 pub struct GetStream {
     pub db: String,
@@ -77,7 +77,7 @@ impl Endpoint for GetStream {
     }
 }
 
-/// `POST /v1/dbs/{db}/streams/{stream}/records`: appends records in one commit.
+/// `POST /v1/dbs/{db}/streams/{s}/records`.
 #[derive(Clone, Debug)]
 pub struct AppendRecords {
     pub db: String,
@@ -100,8 +100,7 @@ impl Endpoint for AppendRecords {
     }
 }
 
-/// `POST /v1/dbs/{db}/streams/{stream}/records` with a body of JSON lines: appends one JSON record
-/// per line in one commit.
+/// `POST /v1/dbs/{db}/streams/{s}/records` (`application/x-ndjson`).
 #[derive(Clone, Debug)]
 pub struct AppendLines {
     pub db: String,
@@ -124,8 +123,7 @@ impl Endpoint for AppendLines {
     }
 }
 
-/// `GET /v1/dbs/{db}/streams/{stream}/records`: reads a page of records, and with `wait_ms`,
-/// waits for appends if the read finds none.
+/// `GET /v1/dbs/{db}/streams/{s}/records`.
 #[derive(Clone, Debug)]
 pub struct ReadRecords {
     pub db: String,
@@ -149,8 +147,7 @@ impl Endpoint for ReadRecords {
     }
 }
 
-/// `POST /v1/dbs/{db}/streams/{stream}/records/query`: reads a page of the records that a filter
-/// matches.
+/// `POST /v1/dbs/{db}/streams/{s}/records/query`.
 #[derive(Clone, Debug)]
 pub struct QueryRecords {
     pub db: String,
@@ -195,10 +192,10 @@ pub struct ListStreamsQuery {
 #[serde(deny_unknown_fields)]
 pub struct NewStream {
     pub name: String,
-    /// Deletes records older than this many milliseconds.
+    /// Retention period in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_ms: Option<u64>,
-    /// Deletes the oldest records while the stream holds more than this many body bytes.
+    /// Maximum total record bytes retained before the oldest records are trimmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
 }
@@ -232,7 +229,7 @@ pub struct CreatedStream {
 pub struct StreamInfo {
     #[serde(flatten)]
     pub stream: Stream,
-    /// Consumers in name order, up to 100; `consumers_next_cursor` continues the list.
+    /// Up to 100 consumers in name order. `consumers_next_cursor` continues the listing.
     pub consumers: Vec<Consumer>,
     pub consumers_next_cursor: Option<String>,
     pub version: u64,
@@ -242,7 +239,7 @@ pub struct StreamInfo {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Consumer {
     pub name: String,
-    /// Sequence number the consumer reads from next.
+    /// Next sequence number for the consumer to read.
     pub seq: u64,
     /// Number of retained records at or after `seq`.
     pub lag: u64,
@@ -253,7 +250,7 @@ pub struct Consumer {
 #[serde(deny_unknown_fields)]
 pub struct AppendRequest {
     pub records: Vec<NewRecord>,
-    /// Fails with `precondition_failed` unless the first record would get this sequence number.
+    /// Expected sequence number of the first appended record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_seq: Option<u64>,
     /// Creates the stream if it does not exist.
@@ -261,12 +258,12 @@ pub struct AppendRequest {
     pub create: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
-    /// Encoding of the records' `value` fields, defaulting to `utf8`.
+    /// Encoding of record `value` fields, defaulting to `utf8`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<Encoding>,
 }
 
-/// Body of newline-separated JSON values, one record each.
+/// Newline-delimited JSON request body (`application/x-ndjson`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JsonLines(pub Bytes);
 
@@ -292,12 +289,12 @@ pub struct Appended {
     pub time: u64,
     pub version: u64,
     pub commit_id: String,
-    /// True if the idempotency key matched an earlier append, whose result this is.
+    /// True if an earlier request with the same idempotency key already appended the records.
     pub replayed: bool,
 }
 
-/// Where a read starts and stops, for [`ReadRecords`] and [`QueryRecords`]. A read starts at no
-/// more than one of `from_seq`, `from_time`, `tail`, and `consumer`.
+/// Query parameters for [`ReadRecords`]. Specify at most one start position (`from_seq`,
+/// `from_time`, `tail`, or `consumer`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadRecordsQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -314,17 +311,17 @@ pub struct ReadRecordsQuery {
     pub until_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_time: Option<u64>,
-    /// Returns the newest records first, from the end of the range.
+    /// Reads backward from the end of the range, returning the newest records first.
     #[serde(default, skip_serializing_if = "is_false")]
     pub reverse: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<usize>,
-    /// Examines at most this many records.
+    /// Maximum number of records to scan before returning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_limit: Option<usize>,
-    /// Waits up to this many milliseconds for an append if a forward read finds no records.
+    /// Maximum time in milliseconds to wait for new records if a forward read is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,7 +356,7 @@ pub struct RecordQuery {
     /// Record filter, such as `{"field": "level", "op": "eq", "value": "error"}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Json>,
-    /// Examines at most this many records, so that a selective filter returns a partial page.
+    /// Maximum number of records to scan before returning a partial page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

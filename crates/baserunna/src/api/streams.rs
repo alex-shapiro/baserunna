@@ -442,7 +442,7 @@ async fn query(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, JsonBody(b): 
     Ok(axum::Json(serde_json::to_value(record_page(&out, enc, v)).expect("records serialize")))
 }
 
-/// The read, consistency and encoding of an [`api::RecordQuery`] body.
+/// Parses [`ReadSpec`], [`Consistency`], and [`Encoding`] from an [`api::RecordQuery`] body.
 fn query_spec(b: Json) -> Result<(ReadSpec, Consistency, Encoding)> {
     let (mut b, c) = split_consistency(b)?;
     let enc = match b.as_object_mut().and_then(|o| o.remove("encoding")) {
@@ -534,7 +534,7 @@ mod tests {
     const S: &str = "/v1/dbs/logs/streams/app";
 
     #[test]
-    fn every_field_of_a_client_read_or_query_parses_on_the_server() {
+    fn client_read_and_query_fields_are_parsed() {
         let read = api::ReadRecordsQuery {
             from_seq: Some(1),
             from_time: Some(2),

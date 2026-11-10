@@ -193,10 +193,10 @@ pub struct StreamRead {
     pub spec: ReadSpec,
 }
 
-/// Number of items in a page if a request does not give a `limit`.
+/// Default page size.
 pub const PAGE_DEFAULT: usize = 100;
 
-/// Validates a page size, defaulting to [`PAGE_DEFAULT`].
+/// Validates `limit`, or returns [`PAGE_DEFAULT`] if `limit` is `None`.
 pub fn page_limit(limit: Option<usize>) -> Result<usize> {
     match limit {
         None => Ok(PAGE_DEFAULT),
@@ -209,7 +209,7 @@ pub fn limit_error() -> Error {
     Error::invalid(format!("limit must be in 1..={}", api::PAGE_MAX))
 }
 
-/// Decodes a JSON value of a request body, failing with `invalid_argument` if it does not match `T`.
+/// Deserializes `v` from a JSON request body.
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(v: Json) -> Result<T> {
     serde_json::from_value(v).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))
 }

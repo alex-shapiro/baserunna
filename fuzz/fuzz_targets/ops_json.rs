@@ -1,5 +1,5 @@
 #![no_main]
-//! The JSON op language and query/filter parsers must never panic.
+//! Verifies that the JSON operation, query, and metadata parsers do not panic.
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

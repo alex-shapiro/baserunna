@@ -1,10 +1,10 @@
 //! Read-heavy feature-flag and configuration store example.
 //!
 //! Strong reads are served from the lease holder's memory without object-store
-//! requests, compare-and-set prevents concurrent admins from overwriting each
-//! other, and `snapshot` reads trade bounded staleness for local reads on any
-//! node. Temporary overrides expire automatically via TTLs, and application
-//! servers follow flag updates through the change feed.
+//! requests. Compare-and-set prevents concurrent admins from overwriting each
+//! other. Snapshot reads allow bounded staleness for local reads on any node.
+//! Temporary overrides expire automatically via TTLs. Application servers
+//! follow flag updates through the change feed.
 //!
 //! Run: `cargo run --example feature_flags`
 
@@ -19,13 +19,13 @@ use common::step;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
-fn json_value() -> PutOptions {
+fn json_put_options() -> PutOptions {
     PutOptions { content_type: Some("application/json".into()), ..PutOptions::default() }
 }
 
-/// Describes the outcome of a conditional write, propagating errors other than a failed
-/// precondition.
-fn conditional(r: Result<Written, Error>) -> Result<String, Error> {
+/// Formats a conditional write result for display.
+/// Propagates errors other than `PreconditionFailed`.
+fn format_cas_result(r: Result<Written, Error>) -> Result<String, Error> {
     match r {
         Ok(w) => Ok(format!("written at version {}", w.version)),
         Err(e) if e.code() == Some(ErrorCode::PreconditionFailed) => Ok(format!("rejected ({e})")),
@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("ui.dark_mode", json!({"enabled": true, "rollout": 1.0})),
     ];
     for (k, v) in &flags {
-        flags_db.put_value(*k, v.to_string(), json_value()).await?;
+        flags_db.put_value(*k, v.to_string(), json_put_options()).await?;
     }
 
     step(2, "A read key for application servers");
@@ -68,23 +68,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let info = flags_db.info().await?;
     println!("    {:.0} reads/s over HTTP from one sequential client", 2000.0 / el.as_secs_f64());
     println!(
-        "    lease holder {:?}: while it holds the lease, strong reads are answered from its in-memory snapshot with no object-store requests",
+        "    lease holder {:?}: while it holds the lease, strong reads are answered from its in-memory snapshot without object-store requests",
         info.stats.lease_holder.unwrap_or_default()
     );
 
     step(4, "Compare-and-set: two admins edit the same flag concurrently");
     let read = flags_db.get_value("checkout.new_flow", None).await?.expect("the flag was seeded");
     println!("    both admins read version {}", read.version);
-    let cas = PutOptions { expect: Some(Expect::Version(read.version)), ..json_value() };
+    let cas = PutOptions { expect: Some(Expect::Version(read.version)), ..json_put_options() };
     let a = flags_db.put_value("checkout.new_flow", json!({"enabled": true, "rollout": 0.5}).to_string(), cas.clone());
-    let a = conditional(a.await)?;
-    let b = conditional(flags_db.put_value("checkout.new_flow", json!({"enabled": false}).to_string(), cas).await)?;
+    let a = format_cas_result(a.await)?;
+    let b =
+        format_cas_result(flags_db.put_value("checkout.new_flow", json!({"enabled": false}).to_string(), cas).await)?;
     println!("    admin A (rollout to 50%): {a}");
     println!("    admin B (disable):        {b} -> must re-read and retry");
 
     step(5, "Create-only writes: If-None-Match: *");
-    let create = PutOptions { expect: Some(Expect::Absent), ..json_value() };
-    let r = conditional(flags_db.put_value("ui.dark_mode", "{}", create).await)?;
+    let create = PutOptions { expect: Some(Expect::Absent), ..json_put_options() };
+    let r = format_cas_result(flags_db.put_value("ui.dark_mode", "{}", create).await)?;
     println!("    overwrite an existing flag with If-None-Match: {r}");
 
     step(6, "Snapshot reads (bounded staleness) and a consistent multi-key read");
@@ -100,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     step(7, "A temporary override that expires by itself");
-    let ttl = PutOptions { ttl_ms: Some(1500), ..json_value() };
+    let ttl = PutOptions { ttl_ms: Some(1500), ..json_put_options() };
     let w = flags_db.put_value("override/search.semantic", json!({"enabled": true}).to_string(), ttl).await?;
     let v = flags_db.get_value("override/search.semantic", None).await?.expect("the override was just written");
     println!("    override written at version {}, expires at {:?} (cluster time, ms)", w.version, v.expires_at);
@@ -125,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move { app_db.changes(&req).await })
     };
     tokio::time::sleep(Duration::from_millis(200)).await;
-    flags_db.put_value("ui.dark_mode", json!({"enabled": false}).to_string(), json_value()).await?;
+    flags_db.put_value("ui.dark_mode", json!({"enabled": false}).to_string(), json_put_options()).await?;
     let page = watcher.await??;
     for ch in &page.changes {
         let text = |b: &Bytes| String::from_utf8_lossy(b).into_owned();

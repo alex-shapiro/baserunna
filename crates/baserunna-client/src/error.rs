@@ -24,13 +24,12 @@ pub enum Error {
         path: String,
         reason: String,
     },
-    /// An operation result does not decode as the requested type.
+    /// Operation result that cannot be decoded as the requested type.
     Decode {
         what: String,
         reason: String,
     },
-    /// A request failed with an unknown outcome but is known not to have applied and never to apply,
-    /// because the server fenced it or because it ran in a transaction that can no longer commit.
+    /// Request error whose unknown outcome was resolved as not applied.
     NotApplied(Box<Error>),
     Transport(TransportError),
 }
@@ -60,7 +59,7 @@ impl Error {
         if unknown { Outcome::Unknown } else { Outcome::NotApplied }
     }
 
-    /// Returns the delay that the server or a proxy asked for before the next request.
+    /// Returns the retry delay in milliseconds requested by the server or proxy.
     pub fn retry_after_ms(&self) -> Option<u64> {
         match self {
             Error::Api { retry_after_ms, .. } | Error::Foreign { retry_after_ms, .. } => *retry_after_ms,
@@ -71,7 +70,7 @@ impl Error {
 
     /// Returns true if repeating the request later can succeed.
     ///
-    /// If `idempotent` is false, errors with [`Outcome::Unknown`] return false.
+    /// Returns false for [`Outcome::Unknown`] if `idempotent` is false.
     pub fn is_transient(&self, idempotent: bool) -> bool {
         let may_repeat = idempotent || self.outcome() == Outcome::NotApplied;
         match self {
@@ -91,10 +90,9 @@ impl Error {
 }
 
 impl Error {
-    /// Returns true if a transaction loop of [`Db::retry`](crate::Db::retry) restarts after this
-    /// error: the transaction applied nothing and a new attempt can succeed.
+    /// Returns true if [`Db::retry`](crate::Db::retry) can restart the transaction after this
+    /// error.
     pub fn restarts_txn(&self) -> bool {
-        // A transaction whose request timed out can run again, with a new deadline.
         let timed_out =
             matches!(self, Error::NotApplied(c) if matches!(**c, Error::Transport(TransportError::TimedOut(_))));
         matches!(self.code(), Some(ErrorCode::TxnNotFound | ErrorCode::Aborted))
@@ -102,9 +100,8 @@ impl Error {
             || timed_out
     }
 
-    /// Returns the error of a request whose first `n` operations the caller did not pass, with
-    /// `op_index` counted from the caller's first operation, or cleared if the failed operation was
-    /// one of the first `n`.
+    /// Shifts `op_index` back by `n` queued operations, or clears it if it points into the first
+    /// `n`.
     pub(crate) fn without_ops(self, n: usize) -> Error {
         match self {
             Error::Api { status, mut error, retry_after_ms } => {

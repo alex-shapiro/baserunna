@@ -61,7 +61,7 @@ async fn one_shot(c: &Client, body: Json, rejected: &[(u16, &str)]) -> Result<Ap
                 retried = true;
                 c.pause(100).await;
             }
-            // An earlier attempt failed or wrote nothing, which fenced the key.
+            // An earlier attempt failed or did not write, which fenced the key.
             Ok(r) if retried && r.status == 409 && r.code() == "aborted" => return Ok(Applied::No),
             Ok(r) if !r.outcome_unknown() => return judge(&r, rejected),
             _ => {

@@ -12,8 +12,8 @@ scope for v1.
 1. **Safety**
 
 - Commited data is never lost or reordered.
-- Transactions are strictly serializable by default. A client can request snapshot isolation (§6.1) or `snapshot` read consistency (§5.9) for weaker guarantees.
-- Committed data correctness relies on object storage guarantees.
+- Transactions are strictly serializable by default. A client can request weaker guarantees.
+- Depends on object storage for durability, availability, and consistency, but verifies integrity independently.
 
 2. **Low cost**
 

@@ -16,7 +16,7 @@ pub use org::{
 
 use crate::engine::Txn;
 use crate::error::{Error, Result};
-use crate::table::{self, BlobResolver, CreateTable, InsertMode, Query};
+use crate::table::{self, BlobResolver, InsertMode, Query};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
@@ -143,15 +143,16 @@ pub struct ApiKey {
 }
 
 impl ApiKey {
-    pub fn public_json(&self, db_ref: Option<&str>) -> Json {
-        json!({
-            "id": self.id,
-            "name": self.name,
-            "db": db_ref,
-            "read_only": self.read_only,
-            "rate_limit": self.rate_limit,
-            "created_at": self.created_at,
-        })
+    /// Converts this key to [`baserunna_api::ApiKey`].
+    pub fn public(&self, db: Option<String>) -> baserunna_api::ApiKey {
+        baserunna_api::ApiKey {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            db,
+            read_only: self.read_only,
+            rate_limit: self.rate_limit,
+            created_at: self.created_at,
+        }
     }
 }
 
@@ -506,7 +507,7 @@ fn to_row<T: Serialize>(v: &T) -> Json {
 
 async fn query_all<T: DeserializeOwned>(txn: &mut Txn, t: &str, mut q: Query) -> Result<Vec<T>> {
     let mut out = Vec::new();
-    q.limit = Some(PAGE_MAX);
+    q.limit = Some(baserunna_api::PAGE_MAX);
     loop {
         let r = table::query(txn, t, &q).await?;
         for row in r.rows {
@@ -555,9 +556,6 @@ pub struct Page<T> {
     pub next_cursor: Option<String>,
 }
 
-pub const PAGE_DEFAULT: usize = 100;
-pub const PAGE_MAX: usize = 1000;
-
 async fn page<T: DeserializeOwned>(
     txn: &mut Txn,
     t: &str,
@@ -565,9 +563,7 @@ async fn page<T: DeserializeOwned>(
     limit: usize,
     cursor: Option<String>,
 ) -> Result<Page<T>> {
-    if !(1..=PAGE_MAX).contains(&limit) {
-        return Err(Error::invalid(format!("limit must be in 1..={PAGE_MAX}")));
-    }
+    crate::ops::page_limit(Some(limit))?;
     q.limit = Some(limit);
     q.cursor = cursor;
     let r = table::query(txn, t, &q).await?;
@@ -607,7 +603,7 @@ async fn other_enabled_admin(txn: &mut Txn, user_id: &str) -> Result<bool> {
 }
 
 fn expired_sessions(before_ms: i64) -> Query {
-    let range = crate::table::RangeSpec { lt: Some(json!(before_ms)), ..Default::default() };
+    let range = baserunna_api::RangeSpec { lt: Some(json!(before_ms)), ..Default::default() };
     Query { index: Some("by_expiry".into()), range: Some(range), ..Default::default() }
 }
 
@@ -791,7 +787,7 @@ async fn active_user(txn: &mut Txn, id: &str) -> Result<User> {
 }
 
 async fn first_rows<T: DeserializeOwned>(txn: &mut Txn, t: &str, q: Query, limit: usize) -> Result<(Vec<T>, bool)> {
-    let p = page(txn, t, q, limit.clamp(1, PAGE_MAX), None).await?;
+    let p = page(txn, t, q, limit.clamp(1, baserunna_api::PAGE_MAX), None).await?;
     Ok((p.items, p.next_cursor.is_some()))
 }
 
@@ -811,7 +807,7 @@ async fn migrate(w: &mut Write<'_, '_>) -> Result<bool> {
         return Ok(false);
     }
     for t in tables() {
-        let mut def: CreateTable = serde_json::from_value(t).map_err(|e| Error::internal(e.to_string()))?;
+        let mut def: baserunna_api::NewTable = serde_json::from_value(t).map_err(|e| Error::internal(e.to_string()))?;
         def.if_not_exists = true;
         table::create_table(w.txn, &def).await?;
     }
@@ -1028,8 +1024,9 @@ async fn delete_user(w: &mut Write<'_, '_>, user_id: &str) -> Result<UserDeletio
             )));
         }
     }
-    let (sessions, more_sessions) = first_rows::<Session>(w.txn, "sessions", by_user(user_id), PAGE_MAX).await?;
-    let (keys, more_keys) = first_rows::<ApiKey>(w.txn, "api_keys", by_user(user_id), PAGE_MAX).await?;
+    let (sessions, more_sessions) =
+        first_rows::<Session>(w.txn, "sessions", by_user(user_id), baserunna_api::PAGE_MAX).await?;
+    let (keys, more_keys) = first_rows::<ApiKey>(w.txn, "api_keys", by_user(user_id), baserunna_api::PAGE_MAX).await?;
     if more_sessions || more_keys {
         return Ok(UserDeletion::TooManyCredentials);
     }

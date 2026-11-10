@@ -296,6 +296,9 @@
           "commit_id": {
             "type": "string"
           },
+          "committed": {
+            "type": "boolean"
+          },
           "results": {
             "items": {
               "$ref": "#/components/schemas/OpResult"
@@ -697,6 +700,12 @@
                 "additionalProperties": false,
                 "properties": {
                   "lease_holder": {
+                    "type": "string"
+                  },
+                  "missing": {
+                    "enum": [
+                      "key"
+                    ],
                     "type": "string"
                   },
                   "op_index": {

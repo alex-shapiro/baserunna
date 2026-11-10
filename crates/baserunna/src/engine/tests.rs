@@ -9,10 +9,11 @@ use crate::store::{BoxFut, DynStore, GetOpts, GetResult, ListPage, MemStore, Obj
 use crate::util::prop;
 use crate::util::rng::Rng;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -481,7 +482,7 @@ fn lease_sightings_outlive_handles_and_prune_when_full() {
         assert!(sh.lease_seen("a", &lease("y"), 6) > first);
         let a_seen = sh.lease_seen("a", &lease("y"), 6);
         let v = sh.cfg.read_lease_ms + sh.cfg.lease_margin_ms;
-        let present = |id: &str| sh.observed_leases.lock().unwrap().contains_key(id);
+        let present = |id: &str| sh.observed_leases.lock().contains_key(id);
         let age_to = |x: u64| async move {
             let now = tokio::time::Instant::now();
             tokio::time::advance((a_seen + std::time::Duration::from_millis(x * v / 100)) - now).await;
@@ -542,26 +543,26 @@ fn take_fault(n: &AtomicU32) -> bool {
 
 impl DelayStore {
     fn gets_matching(&self, f: impl Fn(&str) -> bool) -> usize {
-        self.gets.lock().unwrap().iter().filter(|(k, _)| f(k)).count()
+        self.gets.lock().iter().filter(|(k, _)| f(k)).count()
     }
 }
 
 impl ObjectStore for DelayStore {
     fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
         Box::pin(async move {
-            self.gets.lock().unwrap().push((key.to_string(), opts.if_none_match.is_some()));
+            self.gets.lock().push((key.to_string(), opts.if_none_match.is_some()));
             if key.ends_with("/manifest") && take_fault(&self.manifest_get_outages) {
                 return Err(StoreError::Unavailable("injected".into()));
             }
             if key.ends_with("/manifest")
-                && let Some(data) = self.stale_manifest.lock().unwrap().take()
+                && let Some(data) = self.stale_manifest.lock().take()
             {
                 let size = data.len() as u64;
                 return Ok(GetResult { data, etag: "stale".into(), size, last_modified_ms: 0 });
             }
             let r = self.mem.get_sync(key, &opts);
             if let (true, Ok(g)) = (key.contains("/seg/"), &r) {
-                self.seg_get_bytes.lock().unwrap().push(g.data.len());
+                self.seg_get_bytes.lock().push(g.data.len());
             }
             let mut delay = self.get_reply_ms.load(SeqCst);
             if key == super::clock::PROBE_KEY {
@@ -1124,7 +1125,7 @@ fn a_manifest_whose_levels_object_was_collected_is_read_again() {
         store.mem.delete(&levels_key("d", &old)).await.unwrap();
 
         let b = second_node(&a, &store, "b");
-        *store.stale_manifest.lock().unwrap() = Some(stale.clone());
+        *store.stale_manifest.lock() = Some(stale.clone());
         let before = crate::probe::count(crate::probe::Probe::LevelsCollectedUnderRead);
         let v = b.db("d").refresh(Instant::now(), false).await.unwrap();
         assert_eq!(v.m.levels, levels(), "read the replacing manifest");
@@ -1133,7 +1134,7 @@ fn a_manifest_whose_levels_object_was_collected_is_read_again() {
         let c = second_node(&a, &store, "c");
         let current = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap().data;
         store.mem.delete(&levels_key("d", levels().as_deref().unwrap())).await.unwrap();
-        *store.stale_manifest.lock().unwrap() = Some(current);
+        *store.stale_manifest.lock() = Some(current);
         let r = c.db("d").refresh(Instant::now(), false).await;
         assert!(matches!(r, Err(Error::Internal(_))), "{:?}", r.err());
     });
@@ -1369,7 +1370,8 @@ fn handles_are_shared_until_idle_and_gone_after_purge() {
 
 #[test]
 fn op_batches_limits_and_defaults() {
-    use crate::ops::{Encoding, Op, OpCtx, exec_ops, make_value};
+    use crate::ops::{Op, OpCtx, exec_ops, make_value};
+    use baserunna_api::Encoding;
     rt().block_on(async {
         let (eng, _store) = delayed_engine("a");
         let db = eng.db("d");
@@ -1783,28 +1785,212 @@ fn version_samples_are_spaced_and_reach_a_lifetime_back() {
     });
 }
 
+/// A tombstone can be purged only after a later commit is older than the purge window.
+/// The tombstone version timestamp is recorded before object storage applies the manifest.
 #[test]
-fn tail_tombstones_are_dropped_after_a_transaction_lifetime() {
+fn tail_tombstones_wait_for_later_commit_age() {
     rt().block_on(async {
         let (eng, _store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
-        let life = eng.shared.cfg.txn_max_lifetime_ms;
+        let cfg = eng.shared.cfg.clone();
+        let window = Duration::from_millis(cfg.txn_max_lifetime_ms + 2 * cfg.clock_sync_max_error_ms);
+        let sample = Duration::from_millis(cfg.version_sample_ms);
         put(&db, "k", "v").await;
-        tokio::time::sleep(Duration::from_millis(eng.shared.cfg.version_sample_ms)).await;
-        let start = Instant::now();
+        tokio::time::sleep(sample).await;
+        let deleted = Instant::now();
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         t.delete(Bytes::from_static(b"k")).unwrap();
         db.commit(t.into_request()).await.unwrap();
         let tombstone =
             || db.current().unwrap().m.tail.iter().any(|e| e.key.as_ref() == b"k" && e.value.is_tombstone());
-        assert!(tombstone());
-        tokio::time::sleep_until(start + Duration::from_millis(life - 1)).await;
+        tokio::time::sleep(sample).await;
+        let next = Instant::now();
+        put(&db, "y", "1").await;
+        tokio::time::sleep_until(deleted + window + sample / 2).await;
         put(&db, "x", "1").await;
-        assert!(tombstone(), "dropped within a transaction lifetime");
-        tokio::time::sleep_until(start + Duration::from_millis(life)).await;
+        assert!(tombstone(), "purged using the tombstone version timestamp");
+        tokio::time::sleep_until(next + window - Duration::from_millis(1)).await;
         put(&db, "x", "2").await;
-        assert!(!tombstone(), "kept beyond a transaction lifetime");
+        assert!(tombstone(), "dropped before the next commit was a window old");
+        tokio::time::sleep_until(next + window).await;
+        put(&db, "x", "3").await;
+        assert!(!tombstone(), "kept after the next commit was a window old");
     });
+}
+
+/// Commits in a batch become visible when object storage applies the batch manifest.
+/// A tombstone in a stalled batch is kept for a full purge window after that manifest write.
+#[test]
+fn tombstones_in_stalled_batch_wait_for_manifest_write() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        let cfg = eng.shared.cfg.clone();
+        let window = Duration::from_millis(cfg.txn_max_lifetime_ms + 2 * cfg.clock_sync_max_error_ms);
+        let sample = Duration::from_millis(cfg.version_sample_ms);
+        let stall = 4 * sample;
+        put(&db, "k", "v").await;
+        tokio::time::sleep(sample).await;
+        let begin = || db.begin(Isolation::Serializable, Consistency::Strong);
+        let commit = |t: Txn| {
+            let db = db.clone();
+            tokio::spawn(async move { db.commit(t.into_request()).await.unwrap() })
+        };
+        let written = db.current().unwrap().m.write_seq;
+        store.put_reply_ms.store(stall.as_millis() as u64, std::sync::atomic::Ordering::SeqCst);
+        let mut first = begin().await.unwrap();
+        first.put(Bytes::from_static(b"f"), Value::Inline(Bytes::from_static(b"1"))).unwrap();
+        let first = commit(first);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let mut delete = begin().await.unwrap();
+        delete.delete(Bytes::from_static(b"k")).unwrap();
+        let mut later = begin().await.unwrap();
+        later.put(Bytes::from_static(b"x"), Value::Inline(Bytes::from_static(b"1"))).unwrap();
+        let prepared = Instant::now() + stall;
+        let (delete, later) = (commit(delete), commit(later));
+        for h in [first, delete, later] {
+            h.await.unwrap();
+        }
+        store.put_reply_ms.store(0, std::sync::atomic::Ordering::SeqCst);
+        let batches = db.current().unwrap().m.write_seq - written;
+        assert_eq!(batches, 2, "setup: the delete and the later write did not share a batch");
+        let tombstone =
+            || db.current().unwrap().m.tail.iter().any(|e| e.key.as_ref() == b"k" && e.value.is_tombstone());
+        tokio::time::sleep_until(prepared + window + stall / 2).await;
+        put(&db, "y", "1").await;
+        assert!(tombstone(), "dropped before readers had seen its batch for a window");
+    });
+}
+
+/// Object storage can apply a manifest write before the lease holder receives the response.
+/// A snapshot read on the lease holder after the staleness bound must load the new version.
+#[test]
+fn snapshot_reads_on_lease_holder_load_applied_write() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        put(&db, "k", "1").await;
+        store.put_reply_ms.store(200, SeqCst);
+        let writer = {
+            let db = db.clone();
+            tokio::spawn(async move { put(&db, "k", "2").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let replica = second_node(&eng, &store, "b").db("d");
+        replica.open(false).await.unwrap();
+        let seen = replica.snapshot(Consistency::Strong).await.unwrap().version.get_entry(b"k").await.unwrap();
+        assert_eq!(seen.map(|e| e.value), Some(inline("2")), "setup: the write was not applied before its response");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stale = Consistency::Snapshot { max_staleness_ms: 56 };
+        let read = db.snapshot(stale).await.unwrap().version.get_entry(b"k").await.unwrap();
+        assert_eq!(read.map(|e| e.value), Some(inline("2")), "the lease holder served a version older than the bound");
+        writer.await.unwrap();
+    });
+}
+
+/// A lease holder that loads its in-flight manifest write from storage reuses the lease from that
+/// write. The commit and the read together issue a single manifest write.
+#[test]
+fn lease_holder_refreshing_in_flight_write_reuses_lease() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        put(&db, "k", "1").await;
+        for _ in 0..eng.shared.cfg.lease_read_threshold {
+            db.snapshot(Consistency::Strong).await.unwrap();
+        }
+        store.put_reply_ms.store(200, SeqCst);
+        let puts_before = store.manifest_puts.load(SeqCst);
+        let reads_during_write = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let tight = Consistency::Snapshot { max_staleness_ms: 56 };
+            let read = db.snapshot(tight).await.unwrap().version.get_entry(b"k").await.unwrap();
+            assert_eq!(read.map(|e| e.value), Some(inline("2")));
+        };
+        tokio::join!(put(&db, "k", "2"), reads_during_write);
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(store.manifest_puts.load(SeqCst) - puts_before, 1, "the node wrote the manifest to request a lease");
+        assert!(db.leased_view().is_some(), "the node lost its lease");
+    });
+}
+
+/// Reads from a lease holder during continuous commits must return versions within the requested
+/// staleness bound.
+#[test]
+fn lease_holder_reads_during_commits() {
+    let modes = [
+        Consistency::Snapshot { max_staleness_ms: 56 },
+        Consistency::Snapshot { max_staleness_ms: 5_000 },
+        Consistency::Strong,
+    ];
+    let mut violations = Vec::new();
+    for mode in modes {
+        rt().block_on(async {
+            let (eng, store) = delayed_engine("a");
+            let db = opened(&eng, "d").await;
+            put(&db, "k", "0").await;
+            store.get_reply_ms.store(20, SeqCst);
+            store.put_reply_ms.store(60, SeqCst);
+            let stored_version = {
+                let store = store.clone();
+                move || {
+                    let g = store.mem.get_sync(&manifest_key("d"), &GetOpts::default()).unwrap();
+                    manifest::Manifest::decode(&g.data).unwrap().version
+                }
+            };
+            let samples = Arc::new(Mutex::new(vec![(Instant::now(), stored_version())]));
+            let sampler = {
+                let samples = samples.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        let v = stored_version();
+                        let mut s = samples.lock();
+                        if s.last().unwrap().1 != v {
+                            s.push((Instant::now(), v));
+                        }
+                    }
+                })
+            };
+            let writer = {
+                let db = db.clone();
+                tokio::spawn(async move {
+                    for i in 1..=40 {
+                        put(&db, "k", &i.to_string()).await;
+                    }
+                })
+            };
+            let bound = match mode {
+                Consistency::Snapshot { max_staleness_ms } => Duration::from_millis(max_staleness_ms),
+                Consistency::Strong => Duration::ZERO,
+            };
+            let manifest_gets = || store.gets_matching(|k| k.ends_with("/manifest"));
+            let gets_before = manifest_gets();
+            let mut latencies = Vec::new();
+            while !writer.is_finished() {
+                let invoked = Instant::now();
+                let read = db.snapshot(mode).await.unwrap().version.m.version;
+                latencies.push(invoked.elapsed());
+                let floor = invoked.checked_sub(bound).unwrap_or(invoked);
+                let required = samples.lock().iter().rev().find(|(t, _)| *t <= floor).map_or(0, |(_, v)| *v);
+                if read < required {
+                    violations.push(format!("{mode:?}: read v{read}, storage held v{required} at the bound"));
+                }
+                tokio::time::sleep(Duration::from_millis(7)).await;
+            }
+            sampler.abort();
+            let gets = manifest_gets() - gets_before;
+            latencies.sort();
+            let n = latencies.len();
+            let mean = latencies.iter().sum::<Duration>() / n as u32;
+            eprintln!(
+                "{mode:?}: reads={n} mean={mean:?} p99={:?} max={:?} manifest_gets={gets}",
+                latencies[n * 99 / 100],
+                latencies[n - 1]
+            );
+        });
+    }
+    assert!(violations.is_empty(), "{} stale reads: {:#?}", violations.len(), &violations[..violations.len().min(5)]);
 }
 
 pub(super) fn known_objects(m: &manifest::Manifest) -> Vec<String> {
@@ -1860,7 +2046,7 @@ fn stats_describe_the_current_version() {
         let s = db.stats(&db.current().unwrap());
         assert_eq!((s.version, s.levels.len(), s.tail_entries), (v, 0, 2), "the value and its commit record");
         assert_eq!(s.lease_holder.as_deref(), Some("a"));
-        assert_eq!(s.lease_expires_ms, Some(eng.shared.env.now_ms() + eng.shared.cfg.lease_ms));
+        assert_eq!(s.lease_expires_at, Some(eng.shared.env.now_ms() + eng.shared.cfg.lease_ms));
     });
 }
 
@@ -1869,12 +2055,12 @@ fn unchanged_manifests_are_revalidated_conditionally() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
-        let after_open = store.gets.lock().unwrap().len();
+        let after_open = store.gets.lock().len();
         for _ in 0..2 {
             tokio::time::sleep(Duration::from_millis(1)).await;
             db.read_version(Consistency::Strong).await.unwrap();
         }
-        let gets = store.gets.lock().unwrap()[after_open..].to_vec();
+        let gets = store.gets.lock()[after_open..].to_vec();
         assert!(
             gets.len() == 2 && gets.iter().all(|(k, conditional)| k.ends_with("/manifest") && *conditional),
             "{gets:?}"
@@ -2003,7 +2189,7 @@ fn large_databases_compact_in_bounded_requests() {
         let total: u64 = v.m.segments.iter().map(|s| s.size).sum();
         assert!(total > 30 * cfg.segment_target_bytes as u64, "setup: only {total} bytes of segments");
         assert!(v.m.compaction_seq > 10, "setup: little compaction");
-        let largest_read = store.seg_get_bytes.lock().unwrap().iter().copied().max().unwrap_or(0);
+        let largest_read = store.seg_get_bytes.lock().iter().copied().max().unwrap_or(0);
         let bound = cfg.segment_whole_fetch_max.max(cfg.bulk_read_bytes) as usize;
         assert!(largest_read <= bound, "a {largest_read}-byte segment read");
         for s in v.m.segments.iter().filter(|s| s.level > 0) {
@@ -2037,12 +2223,12 @@ fn long_scans_read_ahead() {
         let mut m = manifest::Manifest::new("d", 0, None);
         m.segments = vec![seg.clone()];
         let v = Version::new(m, String::new(), eng.shared.clone());
-        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        let gets = || store.seg_get_bytes.lock().len();
         v.scan(&KeyRange::data(), false, 3, v.read_time()).await.unwrap();
         let short = gets();
         assert!(short <= 3, "a short scan made {short} requests (index and one block)");
         let largest_block = eng.shared.seg_index("d", &seg).await.unwrap().blocks.iter().map(|b| b.2).max().unwrap();
-        let last_read = *store.seg_get_bytes.lock().unwrap().last().unwrap();
+        let last_read = *store.seg_get_bytes.lock().last().unwrap();
         assert!(last_read <= largest_block as usize, "a short scan read {last_read} bytes ahead");
         let cold = second_node(&eng, &store, "b");
         let v2 = Version::new(v.m.clone(), String::new(), cold.shared.clone());
@@ -2067,7 +2253,7 @@ fn written_segments_are_read_without_requests() {
         put_many(&db, "k", 5, 500).await;
         flushed(&db).await;
         assert!(db.current().unwrap().m.tail.is_empty());
-        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        let gets = || store.seg_get_bytes.lock().len();
         let before = gets();
         assert!(strong_get(&db, "k03").await.is_some());
         assert_eq!(gets(), before, "a flushed segment was fetched back");
@@ -2119,7 +2305,7 @@ fn restarted_nodes_read_what_they_wrote_locally() {
         let whole = |s: &manifest::SegmentMeta| s.size <= cfg.segment_whole_fetch_max;
         assert!(m.segments.iter().any(whole) && !m.segments.iter().all(whole), "setup: segment sizes");
         let restarted = Engine::new(store.clone(), a.shared.env.clone(), cfg, "a2".into());
-        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        let gets = || store.seg_get_bytes.lock().len();
         let before = gets();
         let v = restarted.db("d").read_version(Consistency::Strong).await.unwrap();
         assert_eq!(v.all_entries(false).await.unwrap().len(), 300);
@@ -2133,7 +2319,7 @@ fn bulk_reads_use_the_caches_without_filling_them() {
         let tier = local::LocalTier(Arc::new(local::MemLocal::new(64 << 20)));
         let cfg = EngineConfig { local_tier: Some(tier), ..EngineConfig::small_for_tests() };
         let (a, store) = delayed_engine_with("a", cfg.clone());
-        let gets = || store.seg_get_bytes.lock().unwrap().len();
+        let gets = || store.seg_get_bytes.lock().len();
         let db = opened(&a, "d").await;
         let mut r = Rng::new(5);
         for i in 0..80 {
@@ -2201,14 +2387,14 @@ fn bulk_reads_take_whole_blocks() {
             let idx = eng.shared.seg_index("d", &v.m.segments[0]).await.unwrap();
             let largest = idx.blocks.iter().map(|b| b.2 as u64).max().unwrap();
             assert!(window == 1 || window >= 2 * largest, "setup: blocks of up to {largest} bytes");
-            let before = store.seg_get_bytes.lock().unwrap().len();
+            let before = store.seg_get_bytes.lock().len();
             let mut it = v.iter_bulk(true);
             let mut got = Vec::new();
             while let Some(e) = it.next().await.unwrap() {
                 got.push(e);
             }
             assert_eq!(got, entries);
-            let reads: Vec<usize> = store.seg_get_bytes.lock().unwrap()[before..].to_vec();
+            let reads: Vec<usize> = store.seg_get_bytes.lock()[before..].to_vec();
             if window == 1 {
                 assert_eq!(reads.len(), idx.blocks.len(), "one block per request");
             } else {
@@ -2697,7 +2883,7 @@ fn commit_notices_wake_waiting_requests() {
         assert!(waiting.await.unwrap());
         assert_eq!(seen(&reader), v3);
         // A notice for an unavailable version triggers at most 1 manifest read.
-        let manifest_gets = || store.gets.lock().unwrap().iter().filter(|(k, _)| k.ends_with("/manifest")).count();
+        let manifest_gets = || store.gets.lock().iter().filter(|(k, _)| k.ends_with("/manifest")).count();
         let before = manifest_gets();
         reader.notice_commit(v3 + 100);
         tokio::time::sleep(Duration::from_secs(1)).await;

@@ -2,7 +2,7 @@
 
 use crate::engine::{KeyRange, ReadValue, Txn};
 use crate::error::{Error, Result};
-use crate::util::b64;
+use baserunna_api::b64;
 use bytes::Bytes;
 use std::ops::Bound;
 

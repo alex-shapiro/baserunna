@@ -2,16 +2,16 @@
 
 use super::body::{BlobBody, Upload, parse_range, read_upload};
 use super::{
-    Auth, DbCtx, Endpoints as _, Found, JsonBody, LONG_POLL_MAX_MS, Params, QueryOf, Ran, Reply, Req, consistency_of,
-    name_paging, naming_commit, paging, percent_decode, run_txn, watch, with_read, with_txn,
+    Auth, DbCtx, Endpoints as _, Found, JsonBody, LONG_POLL_MAX_MS, Params, QueryOf, Ran, Reply, Req, consistency_from,
+    consistency_of, naming_commit, percent_decode, run_txn, watch, with_read, with_txn,
 };
 use crate::engine::manifest::ObjKind;
 use crate::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn, Value, blob};
 use crate::error::{Error, Result};
 use crate::meta::{self, DbRecord, DbRef, MetaCmd};
 use crate::node::Node;
-use crate::ops::{self, Encoding, EncodingExt, Op, OpCtx, exec_ops, user_key};
-use crate::table::{self, BlobResolver, ColumnSpec, CreateTable, IndexSpec, InsertMode, Query, Selection};
+use crate::ops::{self, EncodingExt, Op, OpCtx, exec_ops, user_key};
+use crate::table::{self, BlobResolver, InsertMode, Query, Selection};
 use crate::txns::OpenTxn;
 use axum::Router;
 use axum::body::Body;
@@ -28,28 +28,28 @@ use std::time::Duration;
 
 type J = axum::Json<Json>;
 
-pub(super) const TXN_ROUTE: &str = "/v1/dbs/{db}/transactions/{id}";
-pub(super) const COMMIT_ROUTE: &str = "/v1/dbs/{db}/transactions/{id}/commit";
-
 pub fn routes() -> Router<Arc<Node>> {
     Router::new()
-        .route("/v1/dbs/{db}", get(get_db).delete(delete_db))
+        .endpoint::<api::GetDb, _>(get_db)
+        .endpoint::<api::DeleteDb, _>(delete_db)
         .route("/v1/dbs/{db}/kv", get(scan_kv))
         .endpoint::<api::Changes, _>(kv_changes)
         .route("/v1/dbs/{db}/kv/{*key}", get(get_kv).put(put_kv).delete(delete_kv))
         .route(api::StageBlob::ROUTE, post(stage_blob))
         .route(api::ReadBlob::ROUTE, get(get_blob))
         .endpoint::<api::Txn, _>(one_shot)
-        .route("/v1/dbs/{db}/transactions", post(begin_txn))
-        .route(TXN_ROUTE, delete(abort_txn))
-        .route("/v1/dbs/{db}/transactions/{id}/ops", post(txn_ops))
-        .route(COMMIT_ROUTE, post(commit_txn))
-        .route("/v1/dbs/{db}/commits/{id}", get(commit_status))
-        .route("/v1/dbs/{db}/tables", get(list_tables).post(create_table))
-        .route("/v1/dbs/{db}/tables/{t}", get(get_table).delete(drop_table))
-        .route("/v1/dbs/{db}/tables/{t}/columns", post(add_column))
+        .endpoint::<api::BeginTxn, _>(begin_txn)
+        .endpoint::<api::AbortTxn, _>(abort_txn)
+        .endpoint::<api::TxnOps, _>(txn_ops)
+        .endpoint::<api::CommitTxn, _>(commit_txn)
+        .endpoint::<api::GetCommit, _>(commit_status)
+        .endpoint::<api::ListTables, _>(list_tables)
+        .endpoint::<api::CreateTable, _>(create_table)
+        .endpoint::<api::GetTable, _>(get_table)
+        .route(api::GetTable::ROUTE, delete(drop_table))
+        .endpoint::<api::AddColumn, _>(add_column)
         .route("/v1/dbs/{db}/tables/{t}/columns/{c}", delete(drop_column))
-        .route("/v1/dbs/{db}/tables/{t}/indexes", post(add_index))
+        .endpoint::<api::AddIndex, _>(add_index)
         .route("/v1/dbs/{db}/tables/{t}/indexes/{i}", delete(drop_index))
         .route("/v1/dbs/{db}/tables/{t}/rows", post(insert_rows))
         .route("/v1/dbs/{db}/tables/{t}/rows/get", post(get_row))
@@ -65,27 +65,13 @@ pub(super) fn param<'a>(p: &'a HashMap<String, String>, k: &str) -> Result<&'a s
     p.get(k).map(|s| s.as_str()).ok_or_else(|| Error::invalid(format!("missing path parameter {k}")))
 }
 
-fn op_ctx<'a>(node: &Node, ctx: &'a DbCtx, enc: Encoding) -> OpCtx<'a> {
+fn op_ctx<'a>(node: &Node, ctx: &'a DbCtx, enc: api::Encoding) -> OpCtx<'a> {
     OpCtx {
         db: &ctx.db,
         encoding: enc,
         access: ctx.access,
         json_value_max: node.cfg.json_value_max,
         query_limits: node.cfg.query_limits,
-    }
-}
-
-#[derive(Serialize)]
-struct DbSummary<'a> {
-    id: &'a str,
-    name: &'a str,
-    org: Option<&'a str>,
-    created_at: i64,
-}
-
-impl<'a> DbSummary<'a> {
-    fn new(db: &'a DbRecord, org: Option<&'a str>) -> DbSummary<'a> {
-        DbSummary { id: &db.id, name: &db.name, org, created_at: db.created_at }
     }
 }
 
@@ -103,29 +89,33 @@ pub async fn db_ref(t: &mut Txn, d: &DbRecord) -> Result<String> {
 }
 
 /// Lists databases for the authenticated user or the specified `org`.
-pub async fn list_dbs(State(node): State<Arc<Node>>, Auth(p): Auth, q: Params) -> Result<J> {
-    let (limit, cursor) = paging(&q)?;
-    let org = q.get("org");
+pub async fn list_dbs(
+    State(node): State<Arc<Node>>,
+    Auth(p): Auth,
+    QueryOf(q): QueryOf<api::ListDbsQuery>,
+    _: Req<api::ListDbs>,
+) -> Result<Reply<api::ListDbs>> {
+    let limit = ops::page_limit(q.limit)?;
+    let cursor = q.cursor.filter(|c| !c.is_empty());
     let mut t = node.sys_read_strong().await?;
-    let (dbs, next_cursor) = match (p.scoped_db(), org) {
+    let (dbs, next_cursor) = match (p.scoped_db(), &q.org) {
         (Some(_), Some(_)) => return Err(Error::PermissionDenied("this API key is limited to one database".into())),
         (Some(scope), None) => (meta::get_db(&mut t, scope).await?.into_iter().collect(), None),
-        (None, Some(name)) => {
-            let owner = node.resolve_org(&p, name).await?.0.id;
+        (None, owner) => {
+            let owner = match owner {
+                Some(name) => node.resolve_org(&p, name).await?.0.id,
+                None => p.user.id.clone(),
+            };
             let page = meta::dbs_page(&mut t, &owner, limit, cursor).await?;
             (page.items, page.next_cursor)
         }
-        (None, None) => {
-            let page = meta::dbs_page(&mut t, &p.user.id, limit, cursor).await?;
-            (page.items, page.next_cursor)
-        }
     };
-    let mut out = Vec::with_capacity(dbs.len());
-    for db in &dbs {
+    let mut databases = Vec::with_capacity(dbs.len());
+    for db in dbs {
         let org = org_name(&mut t, &db.owner_id).await?;
-        out.push(to_json(&DbSummary::new(db, org.as_deref()))?);
+        databases.push(api::Db { id: db.id, name: db.name, org, created_at: db.created_at });
     }
-    Ok(axum::Json(json!({"databases": out, "next_cursor": next_cursor})))
+    Ok(Reply::new(api::DbPage { databases, next_cursor }))
 }
 
 fn to_json<T: Serialize>(v: &T) -> Result<Json> {
@@ -170,20 +160,28 @@ pub async fn create_db(
     Ok(Reply::new(api::Db { id: db.id, name: db.name, org: c.org, created_at: db.created_at }))
 }
 
-async fn get_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>) -> Result<J> {
+async fn get_db(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    _: Req<api::GetDb>,
+) -> Result<Reply<api::GetDb>> {
     let v = ctx.db.read_version(Consistency::Snapshot { max_staleness_ms: 5000 }).await?;
     let mut t = node.sys_read().await?;
-    Ok(axum::Json(json!({
-        "id": ctx.rec.id,
-        "name": ctx.rec.name,
-        "org": org_name(&mut t, &ctx.rec.owner_id).await?,
-        "role": ctx.access.role,
-        "created_at": ctx.rec.created_at,
-        "stats": ctx.db.stats(&v),
-    })))
+    Ok(Reply::new(api::DbInfo {
+        id: ctx.rec.id.clone(),
+        name: ctx.rec.name.clone(),
+        org: org_name(&mut t, &ctx.rec.owner_id).await?,
+        role: ctx.access.role.into(),
+        created_at: ctx.rec.created_at,
+        stats: ctx.db.stats(&v),
+    }))
 }
 
-async fn delete_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>) -> Result<J> {
+async fn delete_db(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    _: Req<api::DeleteDb>,
+) -> Result<Reply<api::DeleteDb>> {
     ctx.principal.require_unscoped()?;
     node.access_strong(&ctx.principal, &ctx.rec).await?.require_admin()?;
     ctx.db.mark_deleted().await?;
@@ -197,13 +195,13 @@ async fn delete_db(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCt
     }
     node.forget_db_name(&ctx.rec.owner_id, &ctx.rec.name);
     node.engine.forget(&ctx.rec.id);
-    Ok(axum::Json(json!({})))
+    Ok(Reply::new(api::Empty {}))
 }
 
-pub(super) fn encoding_param(q: &Params) -> Result<Encoding> {
+pub(super) fn encoding_param(q: &Params) -> Result<api::Encoding> {
     match q.get("encoding").map(|s| s.as_str()) {
-        None | Some("utf8") => Ok(Encoding::Utf8),
-        Some("base64") => Ok(Encoding::Base64),
+        None | Some("utf8") => Ok(api::Encoding::Utf8),
+        Some("base64") => Ok(api::Encoding::Base64),
         Some(o) => Err(Error::invalid(format!("unknown encoding {o:?}"))),
     }
 }
@@ -253,13 +251,13 @@ async fn get_kv(Extension(ctx): Extension<DbCtx>, q: Params, req: Request) -> Re
     let c = consistency_of(&q)?;
     let snap = ctx.db.snapshot(c).await?;
     let Some(e) = snap.get(&key).await? else {
-        return Err(Error::not_found("key not found"));
+        return Err(Error::missing(api::Missing::Key, "key not found"));
     };
     let range_h = req.headers().get(http::header::RANGE).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
     let (size, ct) = match &e.value {
         Value::Inline(b) => (b.len() as u64, "application/octet-stream".to_string()),
         Value::Blob(r) => (r.size, r.content_type.clone()),
-        Value::Tombstone => return Err(Error::not_found("key not found")),
+        Value::Tombstone => return Err(Error::missing(api::Missing::Key, "key not found")),
     };
     let range = match parse_range(range_h.as_deref(), size) {
         Ok(r) => r,
@@ -307,6 +305,7 @@ async fn put_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>,
     let ttl_ms = q.get("ttl_ms").map(|v| v.parse::<u64>().map_err(|_| Error::invalid("bad ttl_ms"))).transpose()?;
     let if_match = etag_version(req.headers(), http::header::IF_MATCH);
     let if_none = etag_version(req.headers(), http::header::IF_NONE_MATCH);
+    let key_id = idempotency_header(req.headers())?;
     if if_none.as_deref().is_some_and(|v| v != "*") {
         return Err(Error::invalid("only If-None-Match: * is supported"));
     }
@@ -327,7 +326,7 @@ async fn put_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>,
         Upload::Small(b) => Value::Inline(b),
         Upload::Blob(r) => Value::Blob(r),
     };
-    let ((), v) = with_txn!(node, ctx, |t| {
+    let (_, ran) = run_txn!(node, ctx, Isolation::Serializable, Consistency::Strong, key_id.as_deref(), |t| {
         if want_version.is_some() || if_none.is_some() {
             let cur = t.get(&key).await?;
             if if_none.is_some() && cur.is_some() {
@@ -341,7 +340,11 @@ async fn put_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>,
         }
         t.put_expiring(key.clone(), value.clone(), ops::expiry(ttl_ms)?)
     });
-    Ok(axum::Json(json!({"version": v})))
+    let version = match ran {
+        Ran::Committed { commit, .. } | Ran::Replayed(commit) => commit.version,
+        Ran::Read { .. } => return Err(Error::internal("a put committed nothing")),
+    };
+    Ok(axum::Json(serde_json::to_value(api::Written { version }).expect("writes serialize")))
 }
 
 async fn delete_kv(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, req: Request) -> Result<J> {
@@ -432,15 +435,6 @@ fn isolation(i: api::Isolation) -> Isolation {
     }
 }
 
-fn consistency_from(c: Option<api::Consistency>, max_staleness_ms: Option<u64>) -> Consistency {
-    match c {
-        None | Some(api::Consistency::Strong) => Consistency::Strong,
-        Some(api::Consistency::Snapshot) => {
-            Consistency::Snapshot { max_staleness_ms: max_staleness_ms.unwrap_or(5000) }
-        }
-    }
-}
-
 pub(super) fn commit_id_for_key(db_id: &str, key: &str) -> u64 {
     let mut d = Vec::with_capacity(db_id.len() + key.len() + 1);
     d.extend_from_slice(db_id.as_bytes());
@@ -522,22 +516,11 @@ fn first_seqs(c: &Committed) -> Vec<u64> {
     c.appends.iter().map(|a| a.first_seq).collect()
 }
 
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct Begin {
-    #[serde(default)]
-    isolation: api::Isolation,
-    #[serde(default)]
-    encoding: Encoding,
-    #[serde(default)]
-    ops: Vec<api::Op>,
-}
-
 async fn begin_txn(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
-    JsonBody(b): JsonBody<Begin>,
-) -> Result<Response> {
+    Req(b): Req<api::BeginTxn>,
+) -> Result<Reply<api::BeginTxn>> {
     let ops = ops::parse_ops(b.ops)?;
     let user = &ctx.principal.user.id;
     node.txns.admit_begin(user, &ctx.db.id)?;
@@ -550,36 +533,26 @@ async fn begin_txn(
     let mut txn = node.txns.open(id.clone(), user, &ctx.rec.id, t, b.encoding)?;
     let results = exec_ops(&op_ctx(&node, &ctx, b.encoding), txn.txn(), &ops).await;
     let results = txn.finish(results)?;
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(json!({
-            "txn_id": id,
-            "commit_id": commit_hex(cid),
-            "read_version": rv,
-            "expires_at": node.now_ms() + node.cfg.txn_max_ms,
-            "idle_timeout_ms": node.cfg.txn_idle_ms,
-            "results": results,
-        })),
-    )
-        .into_response())
+    Ok(Reply::new(api::Begun {
+        txn_id: id,
+        commit_id: commit_hex(cid),
+        read_version: rv,
+        expires_at: node.now_ms() + node.cfg.txn_max_ms,
+        idle_timeout_ms: node.cfg.txn_idle_ms,
+        results,
+    }))
 }
 
 fn get_open(node: &Node, ctx: &DbCtx, id: &str) -> Result<Arc<OpenTxn>> {
     node.txns.get(id, &ctx.principal.user.id, &ctx.rec.id)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OpsBody {
-    ops: Vec<api::Op>,
-}
-
 async fn txn_ops(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
-    JsonBody(b): JsonBody<OpsBody>,
-) -> Result<J> {
+    Req(b): Req<api::TxnOps>,
+) -> Result<Reply<api::TxnOps>> {
     let id = param(&p, "id")?.to_string();
     let ops = ops::parse_ops(b.ops)?;
     let open = get_open(&node, &ctx, &id)?;
@@ -593,24 +566,17 @@ async fn txn_ops(
         )),
         false => e,
     })?;
-    Ok(axum::Json(json!({"results": results})))
-}
-
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct CommitBody {
-    #[serde(default)]
-    ops: Vec<api::Op>,
+    Ok(Reply::new(api::OpsResponse { results }))
 }
 
 async fn commit_txn(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
-    JsonBody(b): JsonBody<Option<CommitBody>>,
-) -> Result<J> {
+    Req(b): Req<api::CommitTxn>,
+) -> Result<Reply<api::CommitTxn>> {
     let id = param(&p, "id")?.to_string();
-    let ops = ops::parse_ops(b.unwrap_or_default().ops)?;
+    let ops = ops::parse_ops(b.ops)?;
     let txn = node.txns.lock(get_open(&node, &ctx, &id)?).await?;
     let enc = txn.encoding();
     let mut open_txn = txn.take_for_commit();
@@ -632,32 +598,41 @@ async fn commit_txn(
         let Some(version) = ctx.db.revalidate(open_txn).await? else {
             return Err(Error::Conflict("transaction conflicts with a concurrent commit".into()));
         };
-        return Ok(axum::Json(json!({
-            "version": version, "commit_id": commit_hex(commit_id), "appends": [], "results": results,
-        })));
+        let commit_id = commit_hex(commit_id);
+        return Ok(Reply::new(api::Committed { version, committed: false, commit_id, appends: Vec::new(), results }));
     }
+    let committed = !open_txn.is_read_only();
     let mut commit_req = open_txn.into_request();
     commit_req.deadline = Some(ctx.deadline.instant());
-    let committed = ctx.db.commit_detailed(commit_req).await.map_err(|err| {
+    let c = ctx.db.commit_detailed(commit_req).await.map_err(|err| {
         if !err.may_have_been_applied() {
             node.txns.forget_started_commit(&id);
         }
         naming_commit(err, commit_id)
     })?;
     let own_appends = ops.iter().filter(|op| matches!(op, Op::Append { .. })).count();
-    ops::fill_appends(&ops, &mut results, &committed.appends[committed.appends.len().saturating_sub(own_appends)..]);
-    Ok(axum::Json(json!({
-        "version": committed.version, "commit_id": commit_hex(commit_id), "appends": first_seqs(&committed), "results": results,
-    })))
+    ops::fill_appends(&ops, &mut results, &c.appends[c.appends.len().saturating_sub(own_appends)..]);
+    let (commit_id, appends) = (commit_hex(commit_id), first_seqs(&c));
+    Ok(Reply::new(api::Committed { version: c.version, committed, commit_id, appends, results }))
 }
 
-async fn abort_txn(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
+async fn abort_txn(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+    _: Req<api::AbortTxn>,
+) -> Result<Reply<api::AbortTxn>> {
     let id = param(&p, "id")?.to_string();
     drop(node.txns.lock(get_open(&node, &ctx, &id)?).await?.take());
-    Ok(axum::Json(json!({})))
+    Ok(Reply::new(api::Empty {}))
 }
 
-async fn commit_status(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
+async fn commit_status(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+    _: Req<api::GetCommit>,
+) -> Result<Reply<api::GetCommit>> {
     ctx.require_write()?;
     let id = param(&p, "id")?;
     let cid = match id.strip_prefix("key:") {
@@ -665,15 +640,14 @@ async fn commit_status(State(node): State<Arc<Node>>, Extension(ctx): Extension<
         None if id.len() == 16 => u64::from_str_radix(id, 16).map_err(|_| bad_commit_id())?,
         None => return Err(bad_commit_id()),
     };
-    Ok(axum::Json(match ctx.db.resolve_commit(cid).await? {
+    Ok(Reply::new(match ctx.db.resolve_commit(cid).await? {
         Some(c) => {
-            json!({"status": "committed", "version": c.version, "commit_id": commit_hex(cid), "appends": first_seqs(&c)})
+            api::CommitStatus::Committed { version: c.version, commit_id: commit_hex(cid), appends: first_seqs(&c) }
         }
-        None => json!({
-            "status": "not_committed",
-            "commit_id": commit_hex(cid),
-            "retention_ms": node.cfg.engine.commit_retention_ms,
-        }),
+        None => api::CommitStatus::NotCommitted {
+            commit_id: commit_hex(cid),
+            retention_ms: node.cfg.engine.commit_retention_ms,
+        },
     }))
 }
 
@@ -683,7 +657,7 @@ fn bad_commit_id() -> Error {
 
 fn feed_params(q: &Params) -> Result<(ChangeCursor, usize, Duration)> {
     let after = q.get("after").ok_or_else(|| Error::invalid("after is required (a version or a next_cursor)"))?;
-    let limit = q.get("limit").map(|l| l.parse().map_err(|_| limit_error())).transpose()?;
+    let limit = q.get("limit").map(|l| l.parse().map_err(|_| ops::limit_error())).transpose()?;
     let wait = q.get("wait_ms").map(|w| w.parse().map_err(|_| wait_error())).transpose()?;
     feed_args(after, limit, wait)
 }
@@ -691,19 +665,12 @@ fn feed_params(q: &Params) -> Result<(ChangeCursor, usize, Duration)> {
 /// Validates the cursor, page size, and wait time of a change-feed read.
 fn feed_args(after: &str, limit: Option<usize>, wait_ms: Option<u64>) -> Result<(ChangeCursor, usize, Duration)> {
     let after = ChangeCursor::decode(after).ok_or_else(|| Error::invalid("bad after"))?;
-    let limit = limit.unwrap_or(100);
-    if !(1..=ops::MAX_SCAN_LIMIT).contains(&limit) {
-        return Err(limit_error());
-    }
+    let limit = ops::page_limit(limit)?;
     let wait = wait_ms.unwrap_or(0);
     if wait > LONG_POLL_MAX_MS {
         return Err(wait_error());
     }
     Ok((after, limit, Duration::from_millis(wait)))
-}
-
-fn limit_error() -> Error {
-    Error::invalid(format!("limit must be in 1..={}", ops::MAX_SCAN_LIMIT))
 }
 
 fn wait_error() -> Error {
@@ -790,30 +757,38 @@ async fn row_changes(
     Ok(axum::Json(json!({"changes": changes, "more": more, "next_cursor": next.encode(), "version": v})))
 }
 
-async fn list_tables(Extension(ctx): Extension<DbCtx>, q: Params) -> Result<J> {
-    let (prefix, limit, cursor) = name_paging(&q)?;
-    let c = consistency_of(&q)?;
+async fn list_tables(
+    Extension(ctx): Extension<DbCtx>,
+    QueryOf(q): QueryOf<api::ListTablesQuery>,
+    _: Req<api::ListTables>,
+) -> Result<Reply<api::ListTables>> {
+    let limit = ops::page_limit(q.limit)?;
+    let (prefix, cursor) = (q.prefix.unwrap_or_default(), q.cursor.filter(|c| !c.is_empty()));
+    let c = consistency_from(q.consistency, q.max_staleness_ms);
     let ((ts, next), v) = with_read!(ctx.db, c, |t| table::list_tables(t, &prefix, limit, cursor.as_deref()).await);
-    let tables: Vec<Json> = ts.iter().map(|s| s.to_json()).collect();
-    Ok(axum::Json(json!({"tables": tables, "next_cursor": next, "version": v})))
+    let tables = ts.iter().map(|s| s.to_api()).collect();
+    Ok(Reply::new(api::TablePage { tables, next_cursor: next, version: v }))
 }
 
 async fn create_table(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
-    JsonBody(def): JsonBody<CreateTable>,
-) -> Result<Response> {
-    let (s, v) = with_txn!(node, ctx, |t| table::create_table(t, &def).await);
-    let mut out = s.to_json();
-    out["version"] = json!(v);
-    Ok((StatusCode::CREATED, axum::Json(out)).into_response())
+    Req(def): Req<api::CreateTable>,
+) -> Result<Reply<api::CreateTable>> {
+    let (s, version) = with_txn!(node, ctx, |t| table::create_table(t, &def).await);
+    Ok(Reply::new(api::CreatedTable { table: s.to_api(), version }))
 }
 
-async fn get_table(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, q: Params) -> Result<J> {
+async fn get_table(
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+    QueryOf(q): QueryOf<api::GetTableQuery>,
+    _: Req<api::GetTable>,
+) -> Result<Reply<api::GetTable>> {
     let name = param(&p, "t")?.to_string();
-    let c = consistency_of(&q)?;
+    let c = consistency_from(q.consistency, q.max_staleness_ms);
     let (s, _) = with_read!(ctx.db, c, |t| table::get_schema(t, &name).await);
-    Ok(axum::Json(s.to_json()))
+    Ok(Reply::new(s.to_api()))
 }
 
 async fn drop_table(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
@@ -826,13 +801,11 @@ async fn add_column(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
-    JsonBody(c): JsonBody<ColumnSpec>,
-) -> Result<J> {
+    Req(c): Req<api::AddColumn>,
+) -> Result<Reply<api::AddColumn>> {
     let name = param(&p, "t")?.to_string();
-    let (s, v) = with_txn!(node, ctx, |t| table::add_column(t, &name, &c).await);
-    let mut out = s.to_json();
-    out["version"] = json!(v);
-    Ok(axum::Json(out))
+    let (s, version) = with_txn!(node, ctx, |t| table::add_column(t, &name, &c).await);
+    Ok(Reply::new(api::CreatedTable { table: s.to_api(), version }))
 }
 
 async fn drop_column(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
@@ -848,15 +821,13 @@ async fn add_index(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
-    JsonBody(i): JsonBody<IndexSpec>,
-) -> Result<J> {
+    Req(i): Req<api::AddIndex>,
+) -> Result<Reply<api::AddIndex>> {
     ctx.require_write()?;
     let name = param(&p, "t")?.to_string();
     let opts = table::Backfill { batch_rows: node.cfg.index_backfill_batch_rows, ..Default::default() };
-    let (s, v) = table::add_index(&ctx.db, &name, &i, opts).await?;
-    let mut out = s.to_json();
-    out["version"] = json!(v);
-    Ok(axum::Json(out))
+    let (s, version) = table::add_index(&ctx.db, &name, &i, opts).await?;
+    Ok(Reply::new(api::CreatedTable { table: s.to_api(), version }))
 }
 
 async fn drop_index(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {

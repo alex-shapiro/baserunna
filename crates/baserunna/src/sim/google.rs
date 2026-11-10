@@ -3,12 +3,12 @@
 use crate::auth::OidcProvider;
 use crate::error::{Error, Result};
 use crate::store::BoxFut;
-use crate::util::b64;
 use aws_lc_rs::rsa::KeyPair;
 use aws_lc_rs::signature::{KeyPair as _, RSA_PKCS1_SHA256, RsaPublicKeyComponents};
+use baserunna_api::b64;
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 const KEY_DER: &[u8] = include_bytes!("test_rsa_key.der");
 pub const CLIENT_ID: &str = "sim-client.apps.googleusercontent.com";
@@ -54,10 +54,10 @@ impl FakeGoogle {
 
     /// Issues a single-use authorization code for `id`.
     pub fn issue_code(&self, id: Identity) -> String {
-        let mut n = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut n = self.next.lock();
         *n += 1;
         let code = format!("code-{}", *n);
-        self.codes.lock().unwrap_or_else(|e| e.into_inner()).insert(code.clone(), id);
+        self.codes.lock().insert(code.clone(), id);
         code
     }
 
@@ -106,7 +106,6 @@ impl OidcProvider for FakeGoogle {
             let id = self
                 .codes
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
                 .remove(code)
                 .ok_or_else(|| Error::Unauthenticated("invalid authorization code".into()))?;
             Ok(self.sign(&id))

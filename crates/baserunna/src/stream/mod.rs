@@ -9,13 +9,13 @@ use crate::catalog::names_page;
 use crate::engine::stream::{self as es, StreamIter};
 use crate::engine::{KeyRange, Record, Retention, Seek, StreamOp, StreamState, Txn, Value};
 use crate::error::{Error, Result};
-use crate::ops::{Encoding, EncodingExt};
-use crate::util::b64;
+use crate::ops::EncodingExt;
 use crate::util::codec::{DResult, DecodeError, Reader, Writer};
+use baserunna_api::{self as api, b64};
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value as Json, json};
+use serde_json::Value as Json;
 use std::collections::BTreeMap;
 
 pub use filter::Filter;
@@ -23,7 +23,6 @@ pub use filter::Filter;
 pub const SPACE_CATALOG: u8 = 0x05;
 pub const SPACE_CONSUMERS: u8 = 0x08;
 pub const NAME_MAX: usize = 128;
-pub const READ_LIMIT_MAX: usize = 1000;
 pub const READ_BYTES_DEFAULT: usize = 4 << 20;
 pub const READ_BYTES_MAX: usize = 16 << 20;
 pub const SCAN_LIMIT_DEFAULT: usize = 10_000;
@@ -161,43 +160,25 @@ impl Body {
     }
 }
 
-/// A record as a client writes it: exactly one of `value` and `json`.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NewRecord {
-    #[serde(default)]
-    pub value: Option<String>,
-    #[serde(default, deserialize_with = "present")]
-    pub json: Option<Json>,
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-}
-
-/// Deserializes a field that may hold JSON `null` as `Some`.
-fn present<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Json>, D::Error> {
-    Json::deserialize(d).map(Some)
-}
-
-impl NewRecord {
-    pub fn into_body(self, enc: Encoding) -> Result<Body> {
-        let mut b = match (self.value, self.json) {
-            (Some(v), None) => Body::text(enc.decode(&v, "value")?),
-            (None, Some(j)) => Body::json(&j),
-            _ => return Err(Error::invalid("a record has exactly one of value and json")),
-        };
-        if self.headers.len() > HEADERS_MAX {
-            return Err(Error::invalid(format!("a record has at most {HEADERS_MAX} headers")));
-        }
-        for (k, v) in &self.headers {
-            if k.is_empty() || k.len() > HEADER_NAME_MAX || v.len() > HEADER_VALUE_MAX {
-                return Err(Error::invalid(format!(
-                    "header names are 1-{HEADER_NAME_MAX} bytes and values at most {HEADER_VALUE_MAX}"
-                )));
-            }
-        }
-        b.headers = self.headers.into_iter().collect();
-        Ok(b)
+/// Validates and encodes [`api::NewRecord`] into a stored [`Body`].
+pub fn record_body(r: api::NewRecord, enc: api::Encoding) -> Result<Body> {
+    let mut b = match (r.value, r.json) {
+        (Some(v), None) => Body::text(enc.decode(&v, "value")?),
+        (None, Some(j)) => Body::json(&j),
+        _ => return Err(Error::invalid("a record has exactly one of value and json")),
+    };
+    if r.headers.len() > HEADERS_MAX {
+        return Err(Error::invalid(format!("a record has at most {HEADERS_MAX} headers")));
     }
+    for (k, v) in &r.headers {
+        if k.is_empty() || k.len() > HEADER_NAME_MAX || v.len() > HEADER_VALUE_MAX {
+            return Err(Error::invalid(format!(
+                "header names are 1-{HEADER_NAME_MAX} bytes and values at most {HEADER_VALUE_MAX}"
+            )));
+        }
+    }
+    b.headers = r.headers.into_iter().collect();
+    Ok(b)
 }
 
 /// Splits a body of lines into records: each line JSON with `json`, text
@@ -228,33 +209,26 @@ pub fn parse_lines(data: &Bytes, json: bool) -> Result<Vec<Body>> {
     Ok(out)
 }
 
-/// A record as reads return it.
-pub fn record_json(r: &Record, b: &Body, enc: Encoding) -> Json {
-    let mut m = Map::new();
-    m.insert("seq".into(), json!(r.seq));
-    m.insert("time".into(), json!(r.time_ms));
-    if !b.headers.is_empty() {
-        let h: Map<String, Json> = b.headers.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
-        m.insert("headers".into(), Json::Object(h));
-    }
+/// Formats a stored stream record for API responses.
+pub fn record(r: &Record, b: &Body, enc: api::Encoding) -> api::StreamRecord {
+    let mut out = api::StreamRecord {
+        seq: r.seq,
+        time: r.time_ms,
+        headers: b.headers.iter().cloned().collect(),
+        ..api::StreamRecord::default()
+    };
     match b.json_value() {
-        Some(v) => {
-            m.insert("json".into(), v);
-        }
-        None => match enc.encode(&b.data) {
-            Json::Null => {
-                m.insert("value_b64".into(), json!(b64::encode(&b.data)));
-            }
-            v => {
-                m.insert("value".into(), v);
-            }
-        },
+        Some(v) => out.json = Some(v),
+        None => (out.value, out.value_b64) = enc.text(&b.data),
     }
-    Json::Object(m)
+    out
 }
 
-/// Reads `name`'s catalog entry, pinned so that the transaction conflicts
-/// with the stream's deletion or reconfiguration.
+pub fn record_json(r: &Record, b: &Body, enc: api::Encoding) -> Json {
+    serde_json::to_value(record(r, b, enc)).expect("stream records serialize")
+}
+
+/// Reads the catalog entry for `name` and pins it in `txn`'s read set.
 pub async fn lookup(txn: &mut Txn, name: &str) -> Result<Option<Catalog>> {
     check_name(name, "stream")?;
     txn.get_pinned(&catalog_key(name)).await?.map(|rv| decode(&rv.value, "stream catalog")).transpose()
@@ -379,26 +353,26 @@ pub async fn info(txn: &mut Txn, name: &str) -> Result<(Catalog, StreamState)> {
     Ok((c, st))
 }
 
-pub fn state_json(st: &StreamState) -> Map<String, Json> {
-    let mut m = Map::new();
-    m.insert("first_seq".into(), json!(st.first_seq));
-    m.insert("next_seq".into(), json!(st.next_seq));
-    m.insert("bytes".into(), json!(st.bytes()));
-    if st.records() > 0 {
-        m.insert("first_time".into(), json!(st.first_time));
-        m.insert("last_time".into(), json!(st.last_time));
+pub fn public_state(st: &StreamState) -> api::StreamState {
+    let times = st.records() > 0;
+    api::StreamState {
+        first_seq: st.first_seq,
+        next_seq: st.next_seq,
+        bytes: st.bytes(),
+        first_time: times.then_some(st.first_time),
+        last_time: times.then_some(st.last_time),
     }
-    m
 }
 
-/// A stream as listings and info describe it.
-pub fn stream_json(name: &str, c: &Catalog, st: &StreamState) -> Json {
-    let mut m = state_json(st);
-    m.insert("name".into(), json!(name));
-    m.insert("created_at".into(), json!(c.created_at));
-    m.insert("retention_ms".into(), json!(c.retention_ms));
-    m.insert("max_bytes".into(), json!(c.max_bytes));
-    Json::Object(m)
+/// Formats stream metadata and state as [`api::Stream`].
+pub fn public_stream(name: &str, c: &Catalog, st: &StreamState) -> api::Stream {
+    api::Stream {
+        name: name.into(),
+        created_at: c.created_at,
+        retention_ms: c.retention_ms,
+        max_bytes: c.max_bytes,
+        state: public_state(st),
+    }
 }
 
 /// A page of streams whose names start with `prefix`, after `cursor`.
@@ -460,9 +434,7 @@ impl ReadSpec {
         if self.until_seq.is_some() && self.until_time.is_some() {
             return Err(Error::invalid("give at most one of until_seq and until_time"));
         }
-        if self.limit.is_some_and(|l| !(1..=READ_LIMIT_MAX).contains(&l)) {
-            return Err(Error::invalid(format!("limit must be in 1..={READ_LIMIT_MAX}")));
-        }
+        crate::ops::page_limit(self.limit)?;
         if self.max_bytes.is_some_and(|b| !(1..=READ_BYTES_MAX).contains(&b)) {
             return Err(Error::invalid(format!("max_bytes must be in 1..={READ_BYTES_MAX}")));
         }

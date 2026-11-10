@@ -14,9 +14,10 @@
 use super::super::Sim;
 use super::super::client::{Client, ZOMBIE_WAIT_MS, url_escape};
 use crate::util::rng::Rng;
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Expected state of a value: data, commit version, and expiration window in
 /// simulation milliseconds.
@@ -392,7 +393,7 @@ async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Re
         Err(_) => return Ok(()),
     };
     let expires = lock_expiry(c, version).await;
-    out.lock().unwrap_or_else(|e| e.into_inner()).push(LockWrite { version, expires, renewal: None });
+    out.lock().push(LockWrite { version, expires, renewal: None });
     let d = LOCK_TTL_MS - 400 + c.rng().below(500);
     c.pause(d).await;
     let renew = json!([
@@ -403,14 +404,14 @@ async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Re
     if let Ok((version, r)) = lock_txn(c, renew, &format!("{me}/renew")).await? {
         let seen = r["results"].get(0).and_then(|g| g["expires_at"].as_u64());
         let expires = lock_expiry(c, version).await;
-        out.lock().unwrap_or_else(|e| e.into_inner()).push(LockWrite { version, expires, renewal: Some(seen) });
+        out.lock().push(LockWrite { version, expires, renewal: Some(seen) });
     }
     Ok(())
 }
 
-/// Verifies that in version order, each acquisition is committed at or after
-/// the previous lock's expiry, and each renewal is committed before the lock it read
-/// expired.
+/// Verifies that each lock acquisition in version order is committed at or after
+/// the previous lock's expiry. Also checks that each renewal is committed before
+/// the lock it read expired.
 fn check_locks(writes: &[LockWrite]) -> Result<(), String> {
     let mut sorted = writes.to_vec();
     sorted.sort();
@@ -510,7 +511,7 @@ pub async fn run(sim: Arc<Sim>, owners: usize, steps: usize, chaos: bool) -> Res
         return Err(e);
     }
     super::settle(&sim, phase).await;
-    let writes = lock_writes.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let writes = lock_writes.lock().clone();
     check_locks(&writes)?;
     let acquired = writes.iter().filter(|w| w.renewal.is_none()).count();
     let r =

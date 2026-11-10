@@ -3,7 +3,7 @@
 use crate::error::Result;
 use crate::mail::{Mail, Mailer};
 use crate::store::BoxFut;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 #[derive(Default)]
 pub struct Mailbox {
@@ -12,7 +12,7 @@ pub struct Mailbox {
 
 impl Mailbox {
     pub fn sent(&self) -> Vec<Mail> {
-        self.sent.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.sent.lock().clone()
     }
 
     pub fn count(&self, to: &str) -> usize {
@@ -42,7 +42,7 @@ pub fn link_token(text: &str, path: &str) -> Option<String> {
 
 impl Mailer for Mailbox {
     fn send(&self, mail: &Mail) -> BoxFut<'static, Result<()>> {
-        self.sent.lock().unwrap_or_else(|e| e.into_inner()).push(mail.clone());
+        self.sent.lock().push(mail.clone());
         Box::pin(async { Ok(()) })
     }
 }

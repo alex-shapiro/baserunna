@@ -1,3 +1,5 @@
+//! API error response types.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,7 +12,7 @@ pub struct ApiError {
     pub code: ErrorCode,
     #[serde(default)]
     pub message: String,
-    /// True if repeating the same request later can succeed.
+    /// True if the request can succeed on retry.
     #[serde(default)]
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -27,12 +29,12 @@ pub enum ErrorCode {
     Unauthenticated,
     PermissionDenied,
     NotFound,
-    /// 404: the interactive transaction expired, was aborted, or its node changed.
+    /// 404: the interactive transaction expired, was aborted, or is held by another node.
     TxnNotFound,
-    /// 409: a concurrent transaction conflicted; a retry can succeed.
+    /// 409: a concurrent transaction conflicted.
     Conflict,
     AlreadyExists,
-    /// 409: an earlier attempt with the same idempotency key was aborted; retry with a new key.
+    /// 409: an earlier attempt with the same idempotency key was aborted.
     Aborted,
     /// 412: a `check` or `copy` operation failed at `details.op_index`.
     PreconditionFailed,
@@ -43,11 +45,11 @@ pub enum ErrorCode {
     QuotaExceeded,
     /// 429: wait `details.retry_after_ms` before the next request.
     RateLimited,
-    /// 503: the service cannot complete the request now; `details.outcome` indicates whether a
-    /// write was applied.
+    /// 503: the server cannot complete the request. `details.outcome` reports whether a write was
+    /// applied.
     Unavailable,
     Internal,
-    /// Error code from a newer server release.
+    /// Error code added by a newer server.
     #[serde(other)]
     Unknown,
 }
@@ -77,18 +79,32 @@ impl ErrorCode {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorDetails {
-    /// Index of the failed operation in a transaction (`precondition_failed`).
+    /// For `precondition_failed`, the index of the failed operation in a transaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_index: Option<usize>,
-    /// Node that holds the database lease (`unavailable`).
+    /// For `unavailable`, the node that holds the database lease.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_holder: Option<String>,
-    /// Whether a write was applied before the failure (`unavailable`).
+    /// For `unavailable`, whether a write was applied before the failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
-    /// Delay in milliseconds before the next request (`rate_limited`).
+    /// For `rate_limited`, the delay in milliseconds before the next request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    /// For `not_found`, the resource kind that was not found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing: Option<Missing>,
+}
+
+/// Resource kind reported by a `not_found` error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Missing {
+    /// Key requested by a raw key-value read.
+    Key,
+    /// Resource kind added by a newer server.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Whether a failed request modified data.

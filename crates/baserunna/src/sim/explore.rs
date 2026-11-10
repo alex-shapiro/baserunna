@@ -1,4 +1,4 @@
-//! Coverage-guided simulation exploration (SPEC §13.4).
+//! Coverage-guided simulation exploration.
 //!
 //! Runs that discover new probe features are added to a corpus and branched
 //! immediately after their rarest probes. A branched run replays its parent
@@ -10,11 +10,10 @@ use super::campaign::{Job, Report, default_threads, run_jobs};
 use super::workloads::Scenario;
 use crate::probe::{Hits, Probe};
 use crate::util::rng::Rng;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::Instant;
 
-/// Number of jobs scheduled per batch before updating the corpus. Kept
-/// constant so exploration is independent of the host CPU core count.
+/// Number of jobs scheduled per batch before updating the corpus.
 const ROUND: usize = 32;
 
 /// Maximum virtual time offset after a probe hit at which a branch point is placed.
@@ -59,7 +58,7 @@ pub struct Exploration {
 }
 
 /// Explores `scenarios` starting from `first_seed` within `budget`.
-/// When `budget.deadline` is `None`, the sequence of jobs is deterministic.
+/// If `budget.deadline` is `None`, the sequence of jobs is deterministic.
 pub fn explore(
     scenarios: &[Scenario],
     first_seed: u64,
@@ -91,10 +90,10 @@ pub fn explore(
             |i| jobs.get(i).cloned(),
             |i, j, out| {
                 progress(j, &out);
-                outs.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(out);
+                outs.lock()[i] = Some(out);
             },
         );
-        let outs = outs.into_inner().unwrap_or_else(|e| e.into_inner());
+        let outs = outs.into_inner();
         for (job, out) in jobs.into_iter().zip(outs) {
             let Some(out) = out else { continue };
             if report.add(scenarios, &job, &out) {

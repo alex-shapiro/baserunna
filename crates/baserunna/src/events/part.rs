@@ -1043,7 +1043,7 @@ pub struct ReadStats {
 }
 
 /// Per-operation cache for decoded part metadata and indexes during maintenance reads.
-pub type Memo = std::sync::Mutex<std::collections::HashMap<CacheKey, CacheVal>>;
+pub type Memo = parking_lot::Mutex<std::collections::HashMap<CacheKey, CacheVal>>;
 
 /// Cache policy for reading event parts.
 pub enum Caching<'a> {
@@ -1066,7 +1066,7 @@ impl Reading<'_> {
         let v = match self.cache {
             Caching::Shared => self.shared.cache.get(k),
             Caching::Private(m) => {
-                let kept = m.lock().unwrap_or_else(|e| e.into_inner()).get(k).cloned();
+                let kept = m.lock().get(k).cloned();
                 kept.or_else(|| self.shared.cache.peek(k))
             }
         };
@@ -1080,7 +1080,7 @@ impl Reading<'_> {
         match self.cache {
             Caching::Shared => self.shared.cache.insert(k, CacheVal::Any(v, size)),
             Caching::Private(m) => {
-                m.lock().unwrap_or_else(|e| e.into_inner()).insert(k, CacheVal::Any(v, size));
+                m.lock().insert(k, CacheVal::Any(v, size));
             }
         }
     }

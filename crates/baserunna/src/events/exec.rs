@@ -19,15 +19,16 @@ use crate::filter::{self, Plain, Target, Test};
 use crate::probe::{self, Probe};
 use crate::table::schema::{Datum, Row, decode_row};
 use crate::util::DetHashMap;
-use crate::util::b64;
 use crate::util::codec::{Reader, Writer};
+use baserunna_api::b64;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesOrdered;
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex, PoisonError};
 
 /// Resource limits for a single query.
 #[derive(Clone, Copy, Debug)]
@@ -581,7 +582,7 @@ impl<'r> Batch<'r> {
                     _ => None,
                 };
                 if let Some(ColData::Vec { v: Vector::Str(s), json }) = dict {
-                    let mut memos = self.memos.lock().unwrap_or_else(PoisonError::into_inner);
+                    let mut memos = self.memos.lock();
                     let memo = memos.entry(test_addr(t)).or_insert_with(|| vec![None; s.dict.len()]);
                     return sel
                         .iter()
@@ -1937,7 +1938,11 @@ async fn run_within(
     };
     let by_time = ByTime::of(&kind, &time);
     let past = by_time.and(cursor_at(&kind));
-    let mut from = shared.store_now_ms().map_or(q.from, |now| q.from.max(s.retained_from(now as i64)));
+    // Enforcing event retention requires a synchronized store clock.
+    let mut from = match s.retention_ms {
+        Some(_) => q.from.max(s.retained_from(shared.store_time_ms().await? as i64)),
+        None => q.from,
+    };
     let mut to = q.to;
     if let (Some(by), Some((t, _))) = (by_time, past) {
         if by.desc {

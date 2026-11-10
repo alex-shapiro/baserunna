@@ -197,7 +197,8 @@ pub struct Manifest {
     pub range_deletes: Vec<RangeTombstone>,
     /// Sequence number at or below which point and range tombstones may have been purged.
     pub tombstone_horizon: Seq,
-    /// `(version, time_ms)` samples, oldest first.
+    /// `(version, time_ms)` samples in ascending order.
+    /// Object storage confirmed `version` at or before `time_ms`.
     pub version_times: Vec<(Seq, u64)>,
     pub obsolete: Vec<Obsolete>,
     pub last_sweep_ms: u64,
@@ -577,6 +578,14 @@ impl Manifest {
     pub fn version_at_least_age(&self, now_ms: u64, age_ms: u64) -> Seq {
         let cutoff = now_ms.saturating_sub(age_ms);
         self.version_times.iter().filter(|(_, t)| *t <= cutoff).map(|(v, _)| *v).max().unwrap_or(0)
+    }
+
+    /// Returns the newest version whose tombstones can be purged at `now_ms`.
+    ///
+    /// The returned version has been visible to readers for at least `window_ms`. `now_ms` is
+    /// measured on a clock within `error_ms` of store time.
+    pub fn purgeable_through(&self, now_ms: u64, window_ms: u64, error_ms: u64) -> Seq {
+        self.version_at_least_age(now_ms, window_ms + 2 * error_ms)
     }
 }
 

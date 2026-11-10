@@ -8,10 +8,11 @@
 use super::super::Sim;
 use super::super::client::{Client, Resp, Status};
 use bytes::Bytes;
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 const DB: &str = "/v1/dbs/streams";
 const LEVELS: [&str; 3] = ["info", "warn", "error"];
@@ -62,10 +63,6 @@ struct Uncertain {
 
 type Shared = Arc<Mutex<World>>;
 
-fn world(w: &Shared) -> std::sync::MutexGuard<'_, World> {
-    w.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// Outcome of an idempotent request.
 enum Settled {
     Answer(Resp),
@@ -75,8 +72,8 @@ enum Settled {
     Unknown,
 }
 
-/// Retries an idempotent request until it receives a definitive response, rotating
-/// the idempotency key if an unapplied attempt is aborted.
+/// Retries an idempotent request until it receives a definitive response.
+/// Rotates the idempotency key if an unapplied attempt is aborted.
 async fn settle_call(
     c: &Client,
     method: &str,
@@ -85,6 +82,7 @@ async fn settle_call(
     body: Bytes,
     key: &str,
 ) -> Result<Settled, String> {
+    let base = key;
     let (mut key, mut headers, mut body) = (key.to_string(), headers.to_vec(), body);
     let mut first = c.sim.now_ms();
     for attempt in 0..200 {
@@ -113,7 +111,7 @@ async fn settle_call(
                 Status::NotCommitted => {}
             }
         }
-        let fresh = format!("{key}.{attempt}");
+        let fresh = format!("{base}.{attempt}");
         for (_, v) in headers.iter_mut().filter(|(h, _)| *h == "idempotency-key") {
             *v = fresh.clone();
         }
@@ -169,7 +167,7 @@ async fn append(
     };
     let key = format!("{}-{stream}-{step}", c.name);
     let start = c.sim.now_ms();
-    world(w).sent.push((stream.to_string(), k as u64, start));
+    w.lock().sent.push((stream.to_string(), k as u64, start));
     let headers = [("content-type", ct.to_string()), ("idempotency-key", key.clone())];
     let query = match (expect_seq, stream.starts_with("chat:")) {
         (Some(n), _) => format!("?expect_seq={n}"),
@@ -194,7 +192,7 @@ async fn append(
         Settled::Answer(r) if r.status == 412 => return Ok(None),
         Settled::Unknown => {
             let cas = expect_seq.map(|n| ((c.name.clone(), step as u64), n));
-            world(w).uncertain.push(Uncertain { stream: stream.to_string(), records: expect, cas });
+            w.lock().uncertain.push(Uncertain { stream: stream.to_string(), records: expect, cas });
             return Ok(None);
         }
         Settled::Answer(r) if r.status == 200 => {
@@ -206,7 +204,7 @@ async fn append(
         }
         Settled::Answer(r) => return Err(format!("append to {stream}: {} {}", r.status, r.json)),
     };
-    let mut g = world(w);
+    let mut g = w.lock();
     insert(&mut g, stream, first, expect)?;
     g.acked.push((stream.to_string(), first + k as u64, end));
     Ok(Some(first))
@@ -275,7 +273,7 @@ async fn cas_writer(c: Client, w: Shared, steps: usize) -> Result<(), String> {
             if first != next {
                 return Err(format!("an append expecting {next} took {first}"));
             }
-            world(&w).cas.insert((c.name.clone(), step as u64), first);
+            w.lock().cas.insert((c.name.clone(), step as u64), first);
         }
         let d = c.rng().below(200);
         c.pause(d).await;
@@ -310,7 +308,7 @@ async fn tx_writer(c: Client, w: Shared, steps: usize) -> Result<(), String> {
                 return Err(format!("tx append results: {r}"));
             }
             Some(_) => {}
-            None => world(&w).tx_unknown += 1,
+            None => w.lock().tx_unknown += 1,
         }
         let check = json!({"ops": [{"op": "get", "key": "tx/n"}, {"op": "stream_info", "stream": "tx"}]});
         let r = c.call_retry("POST", &format!("{DB}/txn"), Some(check)).await;
@@ -364,7 +362,7 @@ async fn reader(c: Client, w: Shared, done: Arc<AtomicBool>) -> Result<(), Strin
         };
         let end = c.sim.now_ms();
         match r {
-            Ok(r) if r.status == 200 => world(&w).reads.push(Read {
+            Ok(r) if r.status == 200 => w.lock().reads.push(Read {
                 stream: stream.into(),
                 spec: Json::Object(spec),
                 resp: r.json,
@@ -475,7 +473,7 @@ async fn consumer(c: Client, w: Shared, done: Arc<AtomicBool>) -> Result<(), Str
         };
         let read = r.json["results"][0].clone();
         let records = read["records"].as_array().cloned().unwrap_or_default();
-        world(&w).reads.push(Read {
+        w.lock().reads.push(Read {
             stream: "log".into(),
             spec: json!({"consumer": "proc"}),
             resp: read.clone(),
@@ -534,7 +532,7 @@ async fn trimmer(c: Client, w: Shared, steps: usize) -> Result<(), String> {
             if r.status != 200 {
                 return Err(format!("trim: {} {}", r.status, r.json));
             }
-            world(&w).trims.push(("ret".into(), before, c.sim.now_ms()));
+            w.lock().trims.push(("ret".into(), before, c.sim.now_ms()));
         }
         let k = 1 + c.rng().usize(3);
         append(&c, &w, "ret", step, k, Format::Json, None).await?;
@@ -931,7 +929,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
         finals.push((stream, read_stream_fully(&c, stream).await?));
     }
     let (log, cas, tx_unknown) = {
-        let mut g = world(&w);
+        let mut g = w.lock();
         let mut seen: BTreeMap<String, BTreeMap<u64, Json>> = BTreeMap::new();
         let read = g
             .reads
@@ -1011,12 +1009,13 @@ async fn check_integrity(sim: &Arc<Sim>) -> Result<(), String> {
     let r = c.call_retry("GET", DB, None).await;
     let id = r.json["id"].as_str().ok_or("missing database id")?.to_string();
     let db = node.engine.db(&id);
-    let mut t = crate::node::retry_unavailable(|| {
-        db.begin(crate::engine::Isolation::Serializable, crate::engine::Consistency::Strong)
+    // Storage faults are still active, so retry transient read errors.
+    crate::node::retry_unavailable(|| async {
+        let mut t = db.begin(crate::engine::Isolation::Serializable, crate::engine::Consistency::Strong).await?;
+        crate::stream::check_integrity(&mut t).await
     })
     .await
-    .map_err(|e| e.to_string())?;
-    crate::stream::check_integrity(&mut t).await.map_err(|e| format!("stream integrity: {e}"))
+    .map_err(|e| format!("stream integrity: {e}"))
 }
 
 #[cfg(test)]

@@ -1,12 +1,14 @@
-//! Out-of-band blob storage via raw PUT, staged upload with transactional bind,
-//! and blob table columns, verified with full and ranged reads and followed by
-//! a full GC cycle.
+//! Simulation workload for out-of-band blob storage.
+//!
+//! Writes blobs via raw PUTs, staged uploads bound in transactions, and blob
+//! table columns. Verifies full and ranged reads, then runs a full GC cycle.
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
 use crate::engine::manifest::{Levels, Manifest, ObjKind};
 use crate::engine::{Value, segment};
-use crate::util::{b64, sha256};
+use crate::util::sha256;
+use baserunna_api::b64;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -122,7 +124,8 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
                     let id = staged["blob_id"].as_str().unwrap_or_default();
                     Ok((
                         format!("{base}/txn"),
-                        json!({"ops": [{"op": "put", "key": key, "blob_id": id}], "idempotency_key": format!("bind-{round}")}),
+                        // Use a distinct idempotency key per staged blob because a failed bind fences its key.
+                        json!({"ops": [{"op": "put", "key": key, "blob_id": id}], "idempotency_key": format!("bind-{round}-{id}")}),
                     ))
                 })
                 .await?;
@@ -207,7 +210,7 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
         }
     }
     if let Some(g) = unlisted_garbage()? {
-        return Err(format!("garbage {g} survived a full GC cycle"));
+        return Err(format!("garbage {g} remained after a full GC cycle"));
     }
     let (referenced, _, _) = db_objects(&sim, &db_id)?;
     let stored_blobs = stored_ids(&sim, &db_id, "blob");
@@ -226,7 +229,7 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
     verify(&c, base, &kv, &rows, &mut rng).await
 }
 
-/// Stages `data` and binds it using `bind`, re-staging if retries exceed the staging TTL.
+/// Stages `data` and binds it using `bind`. Re-stages `data` if retries exceed the staging TTL.
 async fn stage_and_bind(
     c: &Client,
     base: &str,
@@ -246,8 +249,11 @@ async fn stage_and_bind(
         };
         let (path, body) = bind(&staged)?;
         let r = c.call_settled("POST", &path, Some(body)).await;
-        if !(r.status == 400 && r.json["error"]["message"].as_str().is_some_and(|m| m.contains("staged blob expired")))
-        {
+        let expired =
+            r.status == 400 && r.json["error"]["message"].as_str().is_some_and(|m| m.contains("staged blob expired"));
+        // If an earlier attempt failed on an expired blob and its response was lost, the server fenced the key.
+        let fenced = r.status == 409 && r.code() == "aborted";
+        if !expired && !fenced {
             return Ok(r);
         }
     }

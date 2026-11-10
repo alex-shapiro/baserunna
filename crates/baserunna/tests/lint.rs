@@ -27,6 +27,7 @@ const RULES: &[(&str, &[&str], &str)] = &[
             "src/engine/memory_tests.rs",
             "src/stream/tests.rs",
             "src/store/conformance.rs",
+            "../baserunna-client/src/",
         ],
         "spawn tasks through Env so node crashes abort them",
     ),

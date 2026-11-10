@@ -36,13 +36,14 @@ fn select(model: &BTreeMap<i64, Row>, team: &str, min: i64, limit: Option<usize>
     hits.into_iter().map(|(_, i)| i).take(limit.unwrap_or(usize::MAX)).collect()
 }
 
-/// Runs one-shot `ops` with an idempotency key until definitive, returning
-/// `None` if replayed.
+/// Runs one-shot `ops` with an idempotency key and returns `None` if the response was replayed.
 async fn once(c: &Client, ops: Json, key: &str) -> Result<Option<Json>, String> {
     let body = json!({"ops": ops, "idempotency_key": key});
     loop {
         match c.call("POST", "/v1/dbs/tdb/txn", Some(body.clone())).await {
             Ok(r) if r.status == 200 => return Ok((r.json["replayed"] != true).then(|| r.json["results"].clone())),
+            // An earlier attempt did not modify any rows and fenced the key. Its response was lost.
+            Ok(r) if r.code() == "aborted" => return Ok(Some(json!([{"count": 0}]))),
             Ok(r) if r.code() == "conflict" || r.retryable_not_applied() => c.pause(50).await,
             Ok(r) if r.status != 503 && r.status != 429 => return Err(format!("{key}: {} {}", r.status, r.json)),
             _ => c.pause(super::super::client::ZOMBIE_WAIT_MS).await,
@@ -96,20 +97,24 @@ impl Follower {
     }
 }
 
-/// Verifies all table indexes and checks that no orphaned data remains from
-/// dropped tables or indexes.
+/// Verifies all table indexes and checks for orphaned data from dropped tables or indexes.
 pub async fn check_all_indexes(sim: &Arc<Sim>, db_id: &str) -> Result<(), String> {
     let n = sim.up_nodes().first().copied().ok_or("all nodes are down")?;
     let node = sim.node(n).ok_or("node is down")?.node.clone();
     let db = node.engine.db(db_id);
-    let mut t = crate::node::retry_unavailable(|| db.begin(Isolation::Serializable, Consistency::Strong))
-        .await
-        .map_err(|e| e.to_string())?;
-    let tables = crate::table::all_tables(&mut t).await.map_err(|e| e.to_string())?;
-    for s in tables {
-        crate::table::check_indexes(&mut t, &s.name).await.map_err(|e| format!("table {}: {e}", s.name))?;
-    }
-    crate::table::check_no_orphans(&mut t).await.map_err(|e| e.to_string())
+    // Storage faults are still active, so retry transient read errors.
+    crate::node::retry_unavailable(|| async {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await?;
+        for s in crate::table::all_tables(&mut t).await? {
+            crate::table::check_indexes(&mut t, &s.name).await.map_err(|e| match e.retryable() {
+                true => e,
+                false => crate::error::Error::internal(format!("table {}: {e}", s.name)),
+            })?;
+        }
+        crate::table::check_no_orphans(&mut t).await
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 pub async fn run(sim: Arc<Sim>, steps: usize, contenders: usize, chaos: bool) -> Result<(), String> {

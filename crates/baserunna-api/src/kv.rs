@@ -1,38 +1,19 @@
-//! Transaction, change-feed, and blob types.
+//! Raw key-value, change-feed, and blob types.
 //!
 //! Keys and values are encoded as UTF-8 strings or as padded standard base64.
 //! If a response uses `utf8` encoding and a byte slice is not valid UTF-8, the server omits the
 //! plain field and writes base64 to the corresponding `_b64` field.
 
-use crate::{Endpoint, NoBody, Octets, fill_route, is_false, json_body, with_query};
+use crate::{
+    Body, Consistency, Encoding, Endpoint, NoBody, Octets, fill_route, is_false, json_body, percent_encode, present,
+    with_query,
+};
+use bytes::Bytes;
+use http::header::{CONTENT_RANGE, CONTENT_TYPE, HeaderMap, HeaderValue, IF_MATCH, IF_NONE_MATCH, RANGE};
 use http::{Method, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value as Json;
-use serde_json::value::RawValue;
 
-/// `POST /v1/dbs/{db}/txn`: executes operations in a single transaction.
-#[derive(Clone, Debug)]
-pub struct Txn {
-    pub db: String,
-}
-
-impl Endpoint for Txn {
-    const METHOD: Method = Method::POST;
-    const ROUTE: &'static str = "/v1/dbs/{db}/txn";
-    const STATUS: StatusCode = StatusCode::OK;
-    type Body = TxnRequest;
-    type Response = TxnResponse;
-
-    fn is_idempotent(body: &TxnRequest) -> bool {
-        body.is_idempotent()
-    }
-
-    fn path(&self) -> String {
-        fill_route(Self::ROUTE, &[&self.db])
-    }
-}
-
-/// `GET /v1/dbs/{db}/changes`: reads changes after a cursor, optionally waiting for new changes.
+/// `GET /v1/dbs/{db}/changes`.
 #[derive(Clone, Debug)]
 pub struct Changes {
     pub db: String,
@@ -46,7 +27,7 @@ impl Endpoint for Changes {
     type Body = NoBody;
     type Response = ChangePage;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         true
     }
 
@@ -55,12 +36,200 @@ impl Endpoint for Changes {
     }
 }
 
-/// `POST /v1/dbs/{db}/blobs`: uploads a blob to reference by `blob_id` in a later `put`.
-///
-/// Unreferenced staged blobs expire after `blob_stage_ttl_ms`.
+/// `GET /v1/dbs/{db}/kv/{*key}`.
+#[derive(Clone, Debug)]
+pub struct GetValue {
+    pub db: String,
+    pub key: Bytes,
+    pub range: Option<ByteRange>,
+}
+
+impl Endpoint for GetValue {
+    const METHOD: Method = Method::GET;
+    const ROUTE: &'static str = "/v1/dbs/{db}/kv/{*key}";
+    const STATUS: StatusCode = StatusCode::OK;
+    type Body = NoBody;
+    type Response = KvValue;
+
+    fn is_idempotent(&self, _: &NoBody) -> bool {
+        true
+    }
+
+    fn path(&self) -> String {
+        kv_path(&self.db, &self.key)
+    }
+
+    fn headers(&self) -> HeaderMap {
+        range_header(self.range)
+    }
+
+    fn response(head: &http::response::Parts, body: Bytes) -> Result<KvValue, String> {
+        let headers = &head.headers;
+        let version = header_u64(headers, "x-baserunna-version")?.ok_or("missing x-baserunna-version header")?;
+        let expires_at = header_u64(headers, "x-baserunna-expires-at")?;
+        Ok(KvValue { content: Content::new(headers, body), version, expires_at })
+    }
+}
+
+/// `PUT /v1/dbs/{db}/kv/{*key}`.
+#[derive(Clone, Debug)]
+pub struct PutValue {
+    pub db: String,
+    pub key: Bytes,
+    pub options: PutOptions,
+    /// Deduplication key for the write. The server applies the write at most once per key.
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PutOptions {
+    /// `Content-Type` stored if the value exceeds `value_inline_max` and is written as a blob.
+    /// Inline values are served as `application/octet-stream`.
+    pub content_type: Option<String>,
+    /// Time-to-live in milliseconds.
+    pub ttl_ms: Option<u64>,
+    /// Precondition on the current state of the key.
+    pub expect: Option<Expect>,
+}
+
+impl Endpoint for PutValue {
+    const METHOD: Method = Method::PUT;
+    const ROUTE: &'static str = "/v1/dbs/{db}/kv/{*key}";
+    const STATUS: StatusCode = StatusCode::OK;
+    type Body = Octets;
+    type Response = Written;
+
+    fn is_idempotent(&self, _: &Octets) -> bool {
+        self.headers().contains_key("idempotency-key")
+    }
+
+    fn path(&self) -> String {
+        let mut path = kv_path(&self.db, &self.key);
+        if let Some(ttl_ms) = self.options.ttl_ms {
+            path.push_str(&format!("?ttl_ms={ttl_ms}"));
+        }
+        path
+    }
+
+    fn headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(content_type) = self.options.content_type.as_deref().and_then(|ct| HeaderValue::from_str(ct).ok()) {
+            headers.insert(CONTENT_TYPE, content_type);
+        }
+        match self.options.expect {
+            Some(Expect::Absent) => headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*")),
+            Some(Expect::Version(version)) => headers.insert(IF_MATCH, HeaderValue::from(version)),
+            None => None,
+        };
+        if let Some(key) = self.idempotency_key.as_deref().and_then(|key| HeaderValue::from_str(key).ok()) {
+            headers.insert("idempotency-key", key);
+        }
+        headers
+    }
+}
+
+/// Key precondition for [`PutValue`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expect {
+    Absent,
+    /// The key exists at this version.
+    Version(u64),
+}
+
+/// Byte range for a partial value or blob read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByteRange {
+    /// Bytes `start..=end`.
+    Span { start: u64, end: u64 },
+    /// Bytes from `start` to the end.
+    From(u64),
+    /// The last `n` bytes.
+    Last(u64),
+}
+
+/// Value and metadata returned by [`GetValue`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvValue {
+    pub content: Content,
+    pub version: u64,
+    /// Expiration time in milliseconds since the Unix epoch.
+    pub expires_at: Option<u64>,
+}
+
+/// Payload and content headers of a value or blob read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Content {
+    pub data: Bytes,
+    pub content_type: Option<String>,
+    /// `Content-Range` of a range read, such as `bytes 0-99/1000`.
+    pub content_range: Option<String>,
+}
+
+impl Content {
+    fn new(headers: &HeaderMap, data: Bytes) -> Content {
+        let text = |name| headers.get(name).and_then(|val: &HeaderValue| val.to_str().ok()).map(str::to_string);
+        Content { data, content_type: text(CONTENT_TYPE), content_range: text(CONTENT_RANGE) }
+    }
+}
+
+impl Body for Content {
+    const CONTENT_TYPE: Option<&'static str> = None;
+
+    fn encode(&self) -> Bytes {
+        self.data.clone()
+    }
+
+    fn decode(data: Bytes) -> Result<Content, String> {
+        Ok(Content { data, ..Content::default() })
+    }
+}
+
+impl Body for KvValue {
+    const CONTENT_TYPE: Option<&'static str> = None;
+
+    fn encode(&self) -> Bytes {
+        self.content.data.clone()
+    }
+
+    fn decode(_: Bytes) -> Result<KvValue, String> {
+        Err("KvValue must be decoded with Endpoint::response".into())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Written {
+    pub version: u64,
+}
+
+fn kv_path(db: &str, key: &[u8]) -> String {
+    let mut path = fill_route("/v1/dbs/{db}/kv/", &[db]);
+    percent_encode(key, &mut path);
+    path
+}
+
+fn range_header(range: Option<ByteRange>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let value = match range {
+        None => return headers,
+        Some(ByteRange::Span { start, end }) => format!("bytes={start}-{end}"),
+        Some(ByteRange::From(start)) => format!("bytes={start}-"),
+        Some(ByteRange::Last(len)) => format!("bytes=-{len}"),
+    };
+    headers.insert(RANGE, HeaderValue::from_str(&value).expect("ranges are ASCII"));
+    headers
+}
+
+fn header_u64(headers: &HeaderMap, name: &str) -> Result<Option<u64>, String> {
+    let Some(val) = headers.get(name) else { return Ok(None) };
+    val.to_str().ok().and_then(|raw| raw.trim_matches('"').parse().ok()).map(Some).ok_or(format!("bad {name} header"))
+}
+
+/// `POST /v1/dbs/{db}/blobs`.
 #[derive(Clone, Debug)]
 pub struct StageBlob {
     pub db: String,
+    /// `Content-Type` returned when the blob is read, defaulting to `application/octet-stream`.
+    pub content_type: Option<String>,
 }
 
 impl Endpoint for StageBlob {
@@ -70,20 +239,29 @@ impl Endpoint for StageBlob {
     type Body = Octets;
     type Response = BlobMeta;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         true
     }
 
     fn path(&self) -> String {
         fill_route(Self::ROUTE, &[&self.db])
     }
+
+    fn headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(content_type) = self.content_type.as_deref().and_then(|ct| HeaderValue::from_str(ct).ok()) {
+            headers.insert(CONTENT_TYPE, content_type);
+        }
+        headers
+    }
 }
 
-/// `GET /v1/dbs/{db}/blobs/{blob_id}`: downloads a blob.
+/// `GET /v1/dbs/{db}/blobs/{blob_id}`.
 #[derive(Clone, Debug)]
 pub struct ReadBlob {
     pub db: String,
     pub blob_id: String,
+    pub range: Option<ByteRange>,
 }
 
 impl Endpoint for ReadBlob {
@@ -91,417 +269,24 @@ impl Endpoint for ReadBlob {
     const ROUTE: &'static str = "/v1/dbs/{db}/blobs/{blob_id}";
     const STATUS: StatusCode = StatusCode::OK;
     type Body = NoBody;
-    type Response = Octets;
+    type Response = Content;
 
-    fn is_idempotent(_: &Self::Body) -> bool {
+    fn is_idempotent(&self, _: &Self::Body) -> bool {
         true
     }
 
     fn path(&self) -> String {
         fill_route(Self::ROUTE, &[&self.db, &self.blob_id])
     }
-}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Encoding {
-    #[default]
-    Utf8,
-    Base64,
-}
+    fn headers(&self) -> HeaderMap {
+        range_header(self.range)
+    }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Isolation {
-    #[default]
-    Serializable,
-    Snapshot,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Consistency {
-    /// Reads the latest committed version.
-    #[default]
-    Strong,
-    /// Reads a cached version that is at most `max_staleness_ms` old, defaulting to 5000 ms.
-    Snapshot,
-}
-
-fn is_default<T: Default + PartialEq>(t: &T) -> bool {
-    *t == T::default()
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TxnRequest {
-    pub ops: Vec<Op>,
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub encoding: Encoding,
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub isolation: Isolation,
-    /// Deduplication key for write transactions. The server applies a transaction at most once per
-    /// key and sets `replayed: true` on repeated requests. Ignored for read-only transactions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<String>,
-    /// Consistency level for read-only transactions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub consistency: Option<Consistency>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_staleness_ms: Option<u64>,
-}
-
-impl TxnRequest {
-    pub fn is_idempotent(&self) -> bool {
-        self.idempotency_key.is_some() || !self.ops.iter().any(Op::is_write)
+    fn response(head: &http::response::Parts, body: Bytes) -> Result<Content, String> {
+        Ok(Content::new(&head.headers, body))
     }
 }
-
-/// Key and value fields use the request `encoding`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Op {
-    Get {
-        key: String,
-    },
-    /// Reads keys matching `prefix` or in `[start, end)`.
-    Scan {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        prefix: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        start: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        end: Option<String>,
-        /// Maximum number of items, defaulting to 100.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<usize>,
-        #[serde(default, skip_serializing_if = "is_false")]
-        reverse: bool,
-        /// If true, omits values from the returned items.
-        #[serde(default, skip_serializing_if = "is_false")]
-        keys_only: bool,
-        /// `next_cursor` from the previous page.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cursor: Option<String>,
-    },
-    /// Writes `value` or a staged `blob_id` to `key`. Exactly one of `value` or `blob_id` must be
-    /// set.
-    Put {
-        key: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        value: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        blob_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ttl_ms: Option<u64>,
-    },
-    Delete {
-        key: String,
-    },
-    /// Copies the value of `from` to `to`, or fails with `precondition_failed` if `from` is
-    /// absent.
-    Copy {
-        from: String,
-        to: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ttl_ms: Option<u64>,
-    },
-    /// Deletes keys matching `prefix` or in `[start, end)`.
-    DeleteRange {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        prefix: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        start: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        end: Option<String>,
-    },
-    /// Fails the transaction with `precondition_failed` unless `key` satisfies all specified
-    /// conditions.
-    Check {
-        key: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        exists: Option<bool>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        version: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        value: Option<String>,
-    },
-    /// Adds `by` to the base-10 integer at `key`, treating an absent key as 0.
-    Increment {
-        key: String,
-        #[serde(default = "one")]
-        by: i64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ttl_ms: Option<u64>,
-    },
-    GetRow {
-        table: String,
-        pk: Json,
-    },
-    InsertRow {
-        table: String,
-        row: Json,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ttl_ms: Option<u64>,
-    },
-    UpsertRow {
-        table: String,
-        row: Json,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ttl_ms: Option<u64>,
-    },
-    UpdateRow {
-        table: String,
-        pk: Json,
-        set: Json,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ttl_ms: Option<u64>,
-    },
-    DeleteRow {
-        table: String,
-        pk: Json,
-    },
-    UpdateRows {
-        table: String,
-        #[serde(rename = "where")]
-        selection: Json,
-        set: Json,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        ttl_ms: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<usize>,
-    },
-    DeleteRows {
-        table: String,
-        #[serde(rename = "where")]
-        selection: Json,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<usize>,
-    },
-    QueryRows {
-        table: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        index: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        eq: Vec<Json>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        range: Option<Json>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        filter: Option<Json>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<usize>,
-        #[serde(default, skip_serializing_if = "is_false")]
-        reverse: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cursor: Option<String>,
-    },
-    Append {
-        stream: String,
-        records: Vec<Json>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expect_seq: Option<u64>,
-        #[serde(default, skip_serializing_if = "is_false")]
-        create: bool,
-    },
-    ReadStream(ReadStream),
-    StreamInfo {
-        stream: String,
-    },
-    TrimStream {
-        stream: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        before_seq: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        before_time: Option<u64>,
-    },
-    GetConsumer {
-        stream: String,
-        consumer: String,
-    },
-    SetConsumer {
-        stream: String,
-        consumer: String,
-        seq: u64,
-    },
-    InsertEvents {
-        table: String,
-        rows: Vec<Json>,
-    },
-    QueryEvents(QueryEvents),
-    DeleteEvents {
-        table: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        from: Option<Json>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        to: Option<Json>,
-        #[serde(rename = "where")]
-        filter: Json,
-    },
-}
-
-fn one() -> i64 {
-    1
-}
-
-impl Op {
-    pub fn is_write(&self) -> bool {
-        matches!(
-            self,
-            Op::Put { .. }
-                | Op::Delete { .. }
-                | Op::Copy { .. }
-                | Op::DeleteRange { .. }
-                | Op::Increment { .. }
-                | Op::InsertRow { .. }
-                | Op::UpsertRow { .. }
-                | Op::UpdateRow { .. }
-                | Op::DeleteRow { .. }
-                | Op::UpdateRows { .. }
-                | Op::DeleteRows { .. }
-                | Op::Append { .. }
-                | Op::TrimStream { .. }
-                | Op::SetConsumer { .. }
-                | Op::InsertEvents { .. }
-                | Op::DeleteEvents { .. }
-        )
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReadStream {
-    pub stream: String,
-    pub spec: serde_json::Map<String, Json>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct QueryEvents {
-    pub table: String,
-    pub query: serde_json::Map<String, Json>,
-}
-
-macro_rules! named_map {
-    ($t:ident, $name:ident, $rest:ident) => {
-        impl Serialize for $t {
-            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-                use serde::ser::SerializeMap;
-                let mut m = s.serialize_map(Some(self.$rest.len() + 1))?;
-                m.serialize_entry(stringify!($name), &self.$name)?;
-                for (k, v) in &self.$rest {
-                    m.serialize_entry(k, v)?;
-                }
-                m.end()
-            }
-        }
-
-        impl<'de> Deserialize<'de> for $t {
-            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<$t, D::Error> {
-                use serde::de::Error;
-                let mut $rest = serde_json::Map::deserialize(d)?;
-                let $name =
-                    $rest.remove(stringify!($name)).ok_or_else(|| D::Error::missing_field(stringify!($name)))?;
-                Ok($t { $name: serde_json::from_value($name).map_err(D::Error::custom)?, $rest })
-            }
-        }
-    };
-}
-
-named_map!(ReadStream, stream, spec);
-named_map!(QueryEvents, table, query);
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TxnResponse {
-    /// Commit version for a write transaction, or snapshot version for a read transaction.
-    pub version: u64,
-    pub committed: bool,
-    /// Commit ID for checking commit status at `GET /v1/dbs/{db}/commits/{id}`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub commit_id: Option<String>,
-    /// True if an earlier request with the same idempotency key already committed the transaction.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub replayed: bool,
-    /// Per-operation results, or `None` if `replayed` is true.
-    pub results: Option<Vec<OpResult>>,
-    /// First sequence number assigned to each `append` operation, in order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub appends: Option<Vec<u64>>,
-}
-
-json_body!(TxnRequest, TxnResponse);
-
-/// Because operation results are untagged in JSON, deserialization stores each result as
-/// [`OpResult::Raw`]; call [`OpResult::decode`] to parse it as the expected type.
-#[derive(Clone, Debug, Serialize)]
-#[serde(untagged)]
-pub enum OpResult {
-    Get(GetResult),
-    Scan(ScanResult),
-    Done(crate::Empty),
-    Other(Json),
-    Raw(Box<RawValue>),
-}
-
-impl OpResult {
-    pub fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, String> {
-        let r = match self {
-            OpResult::Raw(r) => serde_json::from_str(r.get()),
-            other => serde_json::to_value(other).and_then(serde_json::from_value),
-        };
-        r.map_err(|e| e.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for OpResult {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<OpResult, D::Error> {
-        Box::<RawValue>::deserialize(d).map(OpResult::Raw)
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GetResult {
-    pub found: bool,
-    /// Value, omitted if the value is a blob larger than `json_value_max`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value_b64: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blob: Option<BlobMeta>,
-    /// Key version if `found` is true, or `Some(None)` if the key was written earlier in the same
-    /// transaction.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
-    pub version: Option<Option<u64>>,
-    /// Expiration time in milliseconds since the Unix epoch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<u64>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScanResult {
-    pub items: Vec<ScanItem>,
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScanItem {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key_b64: Option<String>,
-    /// Value, omitted if `keys_only` is true or if the value is a blob larger than
-    /// `json_value_max`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value_b64: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blob: Option<BlobMeta>,
-    /// Key version, or `None` if the key was written earlier in the same transaction.
-    pub version: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<u64>,
-}
-
-json_body!(GetResult, ScanResult);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobMeta {
@@ -512,7 +297,7 @@ pub struct BlobMeta {
     pub content_type: String,
 }
 
-json_body!(BlobMeta);
+json_body!(BlobMeta, Written);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangesQuery {
@@ -527,12 +312,12 @@ pub struct ChangesQuery {
     pub start: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false", deserialize_with = "flag")]
+    #[serde(default, skip_serializing_if = "is_false", deserialize_with = "deserialize_bool_param")]
     pub keys_only: bool,
     /// Maximum number of changes, defaulting to 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
-    /// Maximum time in milliseconds to wait if no changes are available.
+    /// Maximum time in milliseconds to wait for new changes if the page is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -541,11 +326,11 @@ pub struct ChangesQuery {
     pub max_staleness_ms: Option<u64>,
 }
 
-fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
-    match String::deserialize(d)?.as_str() {
+fn deserialize_bool_param<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    match String::deserialize(deserializer)?.as_str() {
         "true" | "1" | "" => Ok(true),
         "false" | "0" => Ok(false),
-        o => Err(serde::de::Error::custom(format!("bad boolean {o:?}"))),
+        other => Err(serde::de::Error::custom(format!("bad boolean {other:?}"))),
     }
 }
 
@@ -596,9 +381,4 @@ pub struct DeletedRange {
     pub end: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_b64: Option<String>,
-}
-
-/// Wraps a present field value, including JSON `null`, in `Some`.
-fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
-    T::deserialize(d).map(Some)
 }

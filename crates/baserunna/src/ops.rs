@@ -2,21 +2,17 @@
 
 use crate::engine::{Appended, BlobRef, Db, KeyRange, ReadValue, Ttl, Txn, Value, blob};
 use crate::error::{Error, Result};
-use crate::stream::{self, AppendTo, NewRecord, ReadSpec};
+use crate::stream::{self, AppendTo, ReadSpec};
 use crate::table::{self, BlobResolver, Expiry, InsertMode, Query, SPACE_KV, Selection};
-use crate::util::b64;
-use baserunna_api::{self as api, OpResult};
+use baserunna_api::{self as api, OpResult, b64};
 use bytes::Bytes;
 use serde_json::{Value as Json, json};
 use std::ops::Bound;
 use std::sync::Arc;
 
 pub const MAX_USER_KEY: usize = 4096;
-pub const MAX_SCAN_LIMIT: usize = 1000;
 pub const MAX_TXN_OPS: usize = 10_000;
 pub const MAX_TTL_MS: u64 = 10 * 365 * 24 * 3_600_000;
-
-pub use baserunna_api::Encoding;
 
 pub trait EncodingExt {
     fn decode(&self, s: &str, what: &str) -> Result<Vec<u8>>;
@@ -29,11 +25,13 @@ pub trait EncodingExt {
     fn text(&self, b: &[u8]) -> (Option<String>, Option<String>);
 }
 
-impl EncodingExt for Encoding {
+impl EncodingExt for api::Encoding {
     fn decode(&self, s: &str, what: &str) -> Result<Vec<u8>> {
         match self {
-            Encoding::Utf8 => Ok(s.as_bytes().to_vec()),
-            Encoding::Base64 => b64::decode(s).ok_or_else(|| Error::invalid(format!("{what} is not valid base64"))),
+            api::Encoding::Utf8 => Ok(s.as_bytes().to_vec()),
+            api::Encoding::Base64 => {
+                b64::decode(s).ok_or_else(|| Error::invalid(format!("{what} is not valid base64")))
+            }
         }
     }
 
@@ -46,11 +44,11 @@ impl EncodingExt for Encoding {
 
     fn text(&self, b: &[u8]) -> (Option<String>, Option<String>) {
         match self {
-            Encoding::Utf8 => match std::str::from_utf8(b) {
+            api::Encoding::Utf8 => match std::str::from_utf8(b) {
                 Ok(s) => (Some(s.to_string()), None),
                 Err(_) => (None, Some(b64::encode(b))),
             },
-            Encoding::Base64 => (Some(b64::encode(b)), None),
+            api::Encoding::Base64 => (Some(b64::encode(b)), None),
         }
     }
 }
@@ -139,7 +137,7 @@ pub enum Op {
         table: String,
         index: Option<String>,
         eq: Vec<Json>,
-        range: Option<crate::table::RangeSpec>,
+        range: Option<api::RangeSpec>,
         filter: Option<crate::table::Filter>,
         limit: Option<usize>,
         reverse: bool,
@@ -147,7 +145,7 @@ pub enum Op {
     },
     Append {
         stream: String,
-        records: Vec<NewRecord>,
+        records: Vec<api::NewRecord>,
         expect_seq: Option<u64>,
         create: bool,
     },
@@ -195,7 +193,24 @@ pub struct StreamRead {
     pub spec: ReadSpec,
 }
 
-fn parse<T: serde::de::DeserializeOwned>(v: Json) -> Result<T> {
+/// Default page size.
+pub const PAGE_DEFAULT: usize = 100;
+
+/// Validates `limit`, or returns [`PAGE_DEFAULT`] if `limit` is `None`.
+pub fn page_limit(limit: Option<usize>) -> Result<usize> {
+    match limit {
+        None => Ok(PAGE_DEFAULT),
+        Some(l) if (1..=api::PAGE_MAX).contains(&l) => Ok(l),
+        Some(_) => Err(limit_error()),
+    }
+}
+
+pub fn limit_error() -> Error {
+    Error::invalid(format!("limit must be in 1..={}", api::PAGE_MAX))
+}
+
+/// Deserializes `v` from a JSON request body.
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(v: Json) -> Result<T> {
     serde_json::from_value(v).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))
 }
 
@@ -221,26 +236,28 @@ impl TryFrom<api::Op> for Op {
             A::UpdateRow { table, pk, set, ttl_ms } => Op::UpdateRow { table, pk, set, ttl_ms },
             A::DeleteRow { table, pk } => Op::DeleteRow { table, pk },
             A::UpdateRows { table, selection, set, ttl_ms, limit } => {
-                Op::UpdateRows { table, selection: parse(selection)?, set, ttl_ms, limit }
+                Op::UpdateRows { table, selection: Selection::try_from(selection)?, set, ttl_ms, limit }
             }
-            A::DeleteRows { table, selection, limit } => Op::DeleteRows { table, selection: parse(selection)?, limit },
+            A::DeleteRows { table, selection, limit } => {
+                Op::DeleteRows { table, selection: Selection::try_from(selection)?, limit }
+            }
             A::QueryRows { table, index, eq, range, filter, limit, reverse, cursor } => Op::QueryRows {
                 table,
                 index,
                 eq,
-                range: range.map(parse).transpose()?,
+                range,
                 filter: filter.map(parse).transpose()?,
                 limit,
                 reverse,
                 cursor,
             },
-            A::Append { stream, records, expect_seq, create } => Op::Append {
-                stream,
-                records: records.into_iter().map(parse).collect::<Result<_>>()?,
-                expect_seq,
-                create,
-            },
-            A::ReadStream(r) => Op::ReadStream(StreamRead { stream: r.stream, spec: parse(Json::Object(r.spec))? }),
+            A::Append { stream, records, expect_seq, create } => Op::Append { stream, records, expect_seq, create },
+            A::ReadStream(mut r) => {
+                let stream = std::mem::take(&mut r.stream);
+                let mut spec = serde_json::to_value(r).expect("a read_stream serializes");
+                spec.as_object_mut().map(|o| o.remove("stream"));
+                Op::ReadStream(StreamRead { stream, spec: parse(spec)? })
+            }
             A::StreamInfo { stream } => Op::StreamInfo { stream },
             A::TrimStream { stream, before_seq, before_time } => Op::TrimStream { stream, before_seq, before_time },
             A::GetConsumer { stream, consumer } => Op::GetConsumer { stream, consumer },
@@ -262,25 +279,33 @@ pub fn parse_ops(ops: Vec<api::Op>) -> Result<Vec<Op>> {
 
 impl Op {
     pub fn is_write(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            Op::Get { .. }
+            | Op::Scan { .. }
+            | Op::Check { .. }
+            | Op::GetRow { .. }
+            | Op::QueryRows { .. }
+            | Op::ReadStream(_)
+            | Op::StreamInfo { .. }
+            | Op::GetConsumer { .. }
+            | Op::QueryEvents(_) => false,
             Op::Put { .. }
-                | Op::Delete { .. }
-                | Op::Copy { .. }
-                | Op::DeleteRange { .. }
-                | Op::Increment { .. }
-                | Op::InsertRow { .. }
-                | Op::UpsertRow { .. }
-                | Op::UpdateRow { .. }
-                | Op::DeleteRow { .. }
-                | Op::UpdateRows { .. }
-                | Op::DeleteRows { .. }
-                | Op::Append { .. }
-                | Op::TrimStream { .. }
-                | Op::SetConsumer { .. }
-                | Op::InsertEvents { .. }
-                | Op::DeleteEvents { .. }
-        )
+            | Op::Delete { .. }
+            | Op::Copy { .. }
+            | Op::DeleteRange { .. }
+            | Op::Increment { .. }
+            | Op::InsertRow { .. }
+            | Op::UpsertRow { .. }
+            | Op::UpdateRow { .. }
+            | Op::DeleteRow { .. }
+            | Op::UpdateRows { .. }
+            | Op::DeleteRows { .. }
+            | Op::Append { .. }
+            | Op::TrimStream { .. }
+            | Op::SetConsumer { .. }
+            | Op::InsertEvents { .. }
+            | Op::DeleteEvents { .. } => true,
+        }
     }
 }
 
@@ -303,7 +328,7 @@ fn batch_limit(limit: Option<usize>) -> Result<Option<usize>> {
 /// Context for executing ops.
 pub struct OpCtx<'a> {
     pub db: &'a Arc<Db>,
-    pub encoding: Encoding,
+    pub encoding: api::Encoding,
     pub access: crate::meta::Access,
     /// Blob values up to this size are returned inline in JSON.
     pub json_value_max: u64,
@@ -325,7 +350,12 @@ pub fn user_key(k: &[u8]) -> Result<Bytes> {
 }
 
 /// Builds an internal [`KeyRange`] in the user KV keyspace.
-pub fn user_range(enc: Encoding, prefix: Option<&str>, start: Option<&str>, end: Option<&str>) -> Result<KeyRange> {
+pub fn user_range(
+    enc: api::Encoding,
+    prefix: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> Result<KeyRange> {
     let space = [SPACE_KV];
     let space_end = Bytes::from_static(&[SPACE_KV + 1]);
     let mk = |b: &[u8]| -> Bytes {
@@ -450,10 +480,7 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
             Ok(OpResult::Get(get_result(ctx, r).await?))
         }
         Op::Scan { prefix, start, end, limit, reverse, keys_only, cursor } => {
-            let limit = limit.unwrap_or(100);
-            if limit == 0 || limit > MAX_SCAN_LIMIT {
-                return Err(Error::invalid(format!("limit must be in 1..={MAX_SCAN_LIMIT}")));
-            }
+            let limit = page_limit(*limit)?;
             let mut range = user_range(enc, prefix.as_deref(), start.as_deref(), end.as_deref())?;
             if let Some(c) = cursor {
                 let ck = user_key(&b64::decode_url(c).ok_or_else(|| Error::invalid("bad cursor"))?)?;
@@ -569,19 +596,13 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
             };
             let n = cur.checked_add(*by).ok_or_else(|| Error::invalid("increment overflows i64"))?;
             txn.put_expiring(k, Value::Inline(Bytes::from(n.to_string())), set.or(kept))?;
-            Ok(OpResult::Other(json!({"value": n})))
+            Ok(OpResult::Increment(api::IncrementResult { value: n }))
         }
         Op::GetRow { table, pk } => {
             let row = table::get_expiring(txn, table, pk).await?;
-            Ok(OpResult::Other(match row {
-                Some((r, expires)) => {
-                    let mut m = serde_json::Map::new();
-                    m.insert("found".into(), json!(true));
-                    m.insert("row".into(), r);
-                    put_expiry(expires, &mut m);
-                    Json::Object(m)
-                }
-                None => json!({"found": false}),
+            Ok(OpResult::GetRow(match row {
+                Some((r, expires_at)) => api::RowResult { found: true, row: Some(r), expires_at },
+                None => api::RowResult::default(),
             }))
         }
         Op::InsertRow { table, row, ttl_ms } => {
@@ -595,20 +616,20 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
         Op::UpdateRow { table, pk, set, ttl_ms } => {
             let e = row_expiry(*ttl_ms)?;
             let found = table::update_expiring(txn, &blobs, table, pk, set, e).await?;
-            Ok(OpResult::Other(json!({"found": found})))
+            Ok(OpResult::Found(api::FoundResult { found }))
         }
         Op::DeleteRow { table, pk } => {
             let found = table::delete(txn, table, pk).await?;
-            Ok(OpResult::Other(json!({"found": found})))
+            Ok(OpResult::Found(api::FoundResult { found }))
         }
         Op::UpdateRows { table, selection, set, ttl_ms, limit } => {
             let e = row_expiry(*ttl_ms)?;
             let n = table::update_where(txn, &blobs, table, selection, set, e, batch_limit(*limit)?).await?;
-            Ok(OpResult::Other(json!({"count": n})))
+            Ok(OpResult::Count(api::CountResult { count: n as u64 }))
         }
         Op::DeleteRows { table, selection, limit } => {
             let n = table::delete_where(txn, table, selection, batch_limit(*limit)?).await?;
-            Ok(OpResult::Other(json!({"count": n})))
+            Ok(OpResult::Count(api::CountResult { count: n as u64 }))
         }
         Op::QueryRows { table, index, eq, range, filter, limit, reverse, cursor } => {
             let query = Query {
@@ -621,10 +642,10 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
                 cursor: cursor.clone(),
             };
             let r = table::query(txn, table, &query).await?;
-            Ok(OpResult::Other(json!({"rows": r.rows, "next_cursor": r.next_cursor})))
+            Ok(OpResult::QueryRows(api::RowsResult { rows: r.rows, next_cursor: r.next_cursor }))
         }
         Op::Append { stream: name, records, expect_seq, create } => {
-            let bodies = records.iter().cloned().map(|r| r.into_body(enc)).collect::<Result<Vec<_>>>()?;
+            let bodies = records.iter().cloned().map(|r| stream::record_body(r, enc)).collect::<Result<Vec<_>>>()?;
             let shared = ctx.db.shared();
             let to = AppendTo {
                 name,
@@ -634,26 +655,24 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
                 record_max: shared.cfg.stream_record_max,
             };
             stream::append(txn, &to, &bodies).await?;
-            Ok(OpResult::Other(json!({"count": bodies.len()})))
+            Ok(OpResult::Append(api::AppendResult { count: bodies.len() as u64, first_seq: None }))
         }
         Op::ReadStream(StreamRead { stream: name, spec }) => {
             let out = stream::read(txn, name, spec).await?;
-            let records: Vec<Json> = out.records.iter().map(|(r, b)| stream::record_json(r, b, enc)).collect();
-            Ok(OpResult::Other(json!({"records": records, "next_seq": out.next_seq, "done": out.done})))
+            let records = out.records.iter().map(|(r, b)| stream::record(r, b, enc)).collect();
+            Ok(OpResult::ReadStream(api::RecordsResult { records, next_seq: out.next_seq, done: out.done }))
         }
         Op::StreamInfo { stream: name } => {
             let (_, st) = stream::info(txn, name).await?;
-            Ok(OpResult::Other(Json::Object(stream::state_json(&st))))
+            Ok(OpResult::StreamInfo(stream::public_state(&st)))
         }
         Op::TrimStream { stream: name, before_seq, before_time } => {
             stream::trim(txn, name, *before_seq, *before_time).await?;
             Ok(done())
         }
         Op::GetConsumer { stream: name, consumer } => {
-            Ok(OpResult::Other(match stream::consumer(txn, name, consumer).await? {
-                Some(c) => json!({"found": true, "seq": c.seq}),
-                None => json!({"found": false}),
-            }))
+            let c = stream::consumer(txn, name, consumer).await?;
+            Ok(OpResult::GetConsumer(api::ConsumerResult { found: c.is_some(), seq: c.map(|c| c.seq) }))
         }
         Op::SetConsumer { stream: name, consumer, seq } => {
             stream::set_consumer(txn, name, consumer, *seq, ctx.db.shared().time_ms()).await?;
@@ -661,29 +680,29 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
         }
         Op::InsertEvents { table, rows } => {
             let n = crate::events::insert(txn, table, rows, ctx.db.shared().time_ms() as i64).await?;
-            Ok(OpResult::Other(json!({"count": n})))
+            Ok(OpResult::Count(api::CountResult { count: n as u64 }))
         }
         Op::QueryEvents(EventsQuery { table, query }) => {
             let s = crate::events::get_schema(txn, table).await?;
             let out = crate::events::exec::run(ctx.db.shared(), &ctx.db.id, txn, &s, query, &ctx.query_limits).await?;
-            Ok(OpResult::Other(
+            Ok(OpResult::QueryEvents(
                 json!({"columns": out.columns, "rows": out.rows, "next_cursor": out.next_cursor, "stats": out.stats}),
             ))
         }
         Op::DeleteEvents { table, from, to, filter } => {
             let (from, to) = crate::events::time_bounds(from, to)?;
             let n = crate::events::maint::delete(ctx.db, txn, table, from, to, filter).await?;
-            Ok(OpResult::Other(json!({"deleted": n})))
+            Ok(OpResult::DeleteEvents(api::DeletedResult { deleted: n as u64 }))
         }
     }
 }
 
-/// Adds the first seq each append received to the results of its op.
+/// Sets `first_seq` on each [`OpResult::Append`] from `appends`.
 pub fn fill_appends(ops: &[Op], results: &mut [OpResult], appends: &[Appended]) {
     let appended = ops.iter().zip(results.iter_mut()).filter(|(o, _)| matches!(o, Op::Append { .. }));
     for ((_, r), a) in appended.zip(appends) {
-        if let OpResult::Other(j) = r {
-            j["first_seq"] = json!(a.first_seq);
+        if let OpResult::Append(r) = r {
+            r.first_seq = Some(a.first_seq);
         }
     }
 }

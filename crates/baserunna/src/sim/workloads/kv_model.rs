@@ -6,8 +6,8 @@
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, Status, url_escape};
-use crate::util::b64;
 use crate::util::rng::Rng;
+use baserunna_api::b64;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -357,8 +357,8 @@ impl KvModel {
         let path = self.path("/txn");
         let (mut began, mut ambiguous) = (self.c.sim.now_ms(), false);
         loop {
-            // Retry with the same idempotency key while the commit record is still retained;
-            // otherwise reconcile the outcome from the database state.
+            // Retry with the same idempotency key while the commit record is still retained.
+            // Reconcile the outcome from the database state if the commit record expired.
             if ambiguous && writes && !self.c.dedups(began) {
                 if let Some(v) = self.reconcile(&sim).await? {
                     sim.apply(&mut self.model, v);
@@ -415,14 +415,16 @@ impl KvModel {
                     }
                     return Ok(());
                 }
+                // An earlier attempt failed and fenced the key. Its response was lost.
                 409 if r.code() == "aborted" => {
-                    if fail_at.is_none() {
-                        return Err(format!("step {}: aborted without a precondition to fail: {}", self.step, r.json));
+                    let rejectable = fail_at.is_some() || sim.writes.values().any(|w| w.is_some());
+                    if !rejectable {
+                        return Err(format!("step {}: aborted without a way to fail: {}", self.step, r.json));
                     }
                     return Ok(());
                 }
                 503 | 409 => {
-                    // Safe to retry with the same idempotency key (409 indicates an OCC conflict with a zombie).
+                    // Safe to retry with the same idempotency key because 409 indicates a conflict with an in-flight attempt.
                     self.c.pause(100).await;
                 }
                 // Rejected due to storage quota; deletions are never rejected.
@@ -432,7 +434,7 @@ impl KvModel {
         }
     }
 
-    /// Determines whether `txn` committed by comparing the database state against the model.
+    /// Determines whether `txn` was committed by comparing the database state against the model.
     async fn reconcile(&mut self, txn: &TxnSim) -> Result<Option<u64>, String> {
         let (got, version) = self.read_all().await?;
         let matches = |m: &Model, versions: bool| {

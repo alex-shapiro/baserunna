@@ -2,9 +2,10 @@
 //! deterministic simulation.
 
 use crate::util::rng::Rng;
+use parking_lot::Mutex;
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
@@ -44,7 +45,7 @@ impl<F: Future<Output = ()>> Future for SimTask<F> {
 
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         if self.gate.paused.load(Ordering::SeqCst) {
-            self.gate.waiting.lock().unwrap_or_else(|e| e.into_inner()).push(cx.waker().clone());
+            self.gate.waiting.lock().push(cx.waker().clone());
             return std::task::Poll::Pending;
         }
         if crate::buggify::reorder() {
@@ -81,7 +82,7 @@ impl Env {
     }
 
     pub fn set_crash_hook(&self, h: CrashHook) {
-        *self.crash_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+        *self.crash_hook.lock() = Some(h);
     }
 
     /// Simulates a crash point between operations. If triggered, the node crashes
@@ -90,7 +91,7 @@ impl Env {
     pub fn crash_point(&self) -> impl Future<Output = ()> + use<> {
         let loc = std::panic::Location::caller();
         let crash = match crate::buggify::crash_fires(0.01) {
-            true => self.crash_hook.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            true => self.crash_hook.lock().clone(),
             false => None,
         };
         async move {
@@ -104,16 +105,16 @@ impl Env {
 
     /// Installs a trace callback for engine events.
     pub fn set_tracer(&self, t: Tracer) {
-        *self.tracer.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
+        *self.tracer.lock() = Some(t);
     }
 
     pub fn tracing(&self) -> bool {
-        self.tracer.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.tracer.lock().is_some()
     }
 
     /// Emits a trace event if a tracer is installed.
     pub fn trace(&self, f: impl FnOnce() -> String) {
-        let t = self.tracer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let t = self.tracer.lock().clone();
         if let Some(t) = t {
             t(&f());
         }
@@ -146,7 +147,7 @@ impl Env {
 
     pub fn fill_random(&self, out: &mut [u8]) {
         match &self.rng {
-            Some(r) => r.lock().unwrap_or_else(|e| e.into_inner()).fill(out),
+            Some(r) => r.lock().fill(out),
             None => os_random(out),
         }
     }
@@ -176,7 +177,7 @@ impl Env {
 
     /// Generates `nbytes` random bytes encoded as lowercase hex.
     pub fn random_hex(&self, nbytes: usize) -> String {
-        crate::util::b64::hex(&self.random_bytes(nbytes))
+        baserunna_api::b64::hex(&self.random_bytes(nbytes))
     }
 
     /// Spawns a background task aborted on [`Env::shutdown`].
@@ -184,7 +185,7 @@ impl Env {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut t = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = self.tasks.lock();
         while t.try_join_next().is_some() {}
         match self.clock {
             Clock::Sim { .. } => t.spawn(SimTask { inner: Box::pin(fut), gate: self.gate.clone() }),
@@ -199,7 +200,7 @@ impl Env {
 
     pub fn resume(&self) {
         self.gate.paused.store(false, Ordering::SeqCst);
-        for w in self.gate.waiting.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        for w in self.gate.waiting.lock().drain(..) {
             w.wake();
         }
     }
@@ -217,12 +218,12 @@ impl Env {
 
     /// Aborts all tasks spawned in this environment.
     pub fn shutdown(&self) {
-        let mut t = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = self.tasks.lock();
         t.abort_all();
     }
 
     pub fn task_count(&self) -> usize {
-        let mut t = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = self.tasks.lock();
         while t.try_join_next().is_some() {}
         t.len()
     }
@@ -230,9 +231,7 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        if let Ok(t) = self.tasks.get_mut() {
-            t.abort_all();
-        }
+        self.tasks.get_mut().abort_all();
     }
 }
 

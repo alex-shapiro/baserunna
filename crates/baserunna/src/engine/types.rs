@@ -107,7 +107,7 @@ pub fn blob_id_time(id: &str) -> Option<u64> {
 
 pub fn make_blob_id(now_ms: u64, random: &[u8]) -> String {
     let mut s = format!("{:012x}", now_ms & 0xFFFF_FFFF_FFFF);
-    s.push_str(&crate::util::b64::hex(&random[..10]));
+    s.push_str(&baserunna_api::b64::hex(&random[..10]));
     s
 }
 

@@ -1,13 +1,13 @@
 //! Authentication, account self-service, API key, admin and internal routes.
 
 use super::{
-    Auth, ClientAddr, Endpoints as _, JsonBody, Params, Reply, Req, SESSION_COOKIE, cookie, credential, paging,
+    Auth, ClientAddr, Endpoints as _, JsonBody, Params, QueryOf, Reply, Req, SESSION_COOKIE, cookie, credential, paging,
 };
 use crate::auth;
 use crate::engine::Txn;
 use crate::error::{Error, Result};
 use crate::meta::{self, ApiKey, MetaCmd, SignInMethod, SignedUp};
-use crate::node::{Credential, Node};
+use crate::node::{Credential, Node, Principal};
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
@@ -34,12 +34,14 @@ pub fn routes() -> Router<Arc<Node>> {
         .route("/v1/me/verify-email", post(send_verification))
         .route("/v1/me/sessions", get(list_sessions).delete(revoke_other_sessions))
         .route("/v1/me/sessions/{id}", delete(revoke_session))
-        .route("/v1/api-keys", get(list_keys).post(create_key))
-        .route("/v1/api-keys/{id}", delete(delete_key))
+        .endpoint::<api::ListApiKeys, _>(list_keys)
+        .endpoint::<api::CreateApiKey, _>(create_key)
+        .endpoint::<api::DeleteApiKey, _>(delete_key)
         .route("/v1/admin/users", get(admin_users))
         .route("/v1/admin/users/{id}/disable", post(admin_disable))
         .route("/v1/admin/nodes", get(admin_nodes))
-        .route("/v1/admin/metrics", get(admin_metrics).delete(reset_metrics))
+        .endpoint::<api::GetMetrics, _>(admin_metrics)
+        .endpoint::<api::ResetMetrics, _>(reset_metrics)
 }
 
 /// Formats the `Set-Cookie` header value for a session cookie.
@@ -291,36 +293,29 @@ async fn revoke_session(State(node): State<Arc<Node>>, Auth(p): Auth, Path(id): 
     Ok(if current { with_cookie(resp, session_cookie(&node, "", 0)) } else { resp })
 }
 
-async fn list_keys(State(node): State<Arc<Node>>, Auth(p): Auth, q: Params) -> Result<axum::Json<Json>> {
+async fn list_keys(
+    State(node): State<Arc<Node>>,
+    Auth(p): Auth,
+    QueryOf(q): QueryOf<api::PageQuery>,
+    _: Req<api::ListApiKeys>,
+) -> Result<Reply<api::ListApiKeys>> {
     p.require_session()?;
-    let (limit, cursor) = paging(&q)?;
+    let limit = crate::ops::page_limit(q.limit)?;
     let mut t = node.sys_read_strong().await?;
-    let page = meta::api_keys_page(&mut t, &p.user.id, limit, cursor).await?;
-    let mut out = Vec::new();
+    let page = meta::api_keys_page(&mut t, &p.user.id, limit, q.cursor.filter(|c| !c.is_empty())).await?;
+    let mut api_keys = Vec::new();
     for k in page.items {
         let db = key_db_ref(&mut t, k.db_id.as_deref()).await?;
-        out.push(k.public_json(db.as_deref()));
+        api_keys.push(k.public(db));
     }
-    Ok(axum::Json(json!({"api_keys": out, "next_cursor": page.next_cursor})))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CreateKey {
-    name: String,
-    #[serde(default)]
-    db: Option<String>,
-    #[serde(default)]
-    read_only: bool,
-    #[serde(default)]
-    rate_limit: Option<u32>,
+    Ok(Reply::new(api::ApiKeyPage { api_keys, next_cursor: page.next_cursor }))
 }
 
 async fn create_key(
     State(node): State<Arc<Node>>,
     Auth(p): Auth,
-    JsonBody(c): JsonBody<CreateKey>,
-) -> Result<Response> {
+    Req(c): Req<api::CreateApiKey>,
+) -> Result<Reply<api::CreateApiKey>> {
     p.require_session()?;
     if c.name.trim().is_empty() || c.name.len() > 100 {
         return Err(Error::invalid("key names are 1-100 characters"));
@@ -344,15 +339,19 @@ async fn create_key(
         created_at: node.now_ms() as i64,
     };
     node.run_meta(MetaCmd::CreateApiKey { key: key.clone() }).await?;
-    Ok((StatusCode::CREATED, axum::Json(json!({"key": full, "api_key": key.public_json(c.db.as_deref())})))
-        .into_response())
+    Ok(Reply::new(api::CreatedApiKey { key: full, api_key: key.public(c.db) }))
 }
 
-async fn delete_key(State(node): State<Arc<Node>>, Auth(p): Auth, Path(id): Path<String>) -> Result<axum::Json<Json>> {
+async fn delete_key(
+    State(node): State<Arc<Node>>,
+    Auth(p): Auth,
+    Path(id): Path<String>,
+    _: Req<api::DeleteApiKey>,
+) -> Result<Reply<api::DeleteApiKey>> {
     p.require_session()?;
     node.run_meta(MetaCmd::DeleteApiKey { id: id.clone(), user_id: p.user.id.clone() }).await?;
     node.forget_api_key(&id);
-    Ok(axum::Json(json!({})))
+    Ok(Reply::new(api::Empty {}))
 }
 
 async fn admin_users(State(node): State<Arc<Node>>, Auth(p): Auth, q: Params) -> Result<axum::Json<Json>> {
@@ -390,20 +389,31 @@ async fn admin_disable(
     Ok(axum::Json(json!({})))
 }
 
-async fn admin_metrics(State(node): State<Arc<Node>>, Auth(p): Auth) -> Result<axum::Json<Json>> {
-    p.require_admin()?;
-    p.require_unscoped()?;
-    let mut out = serde_json::Map::new();
-    out.insert("node".into(), json!(node.id));
-    node.engine.shared.metrics.json_into(&mut out);
-    node.metrics.json_into(&mut out);
-    Ok(axum::Json(Json::Object(out)))
+async fn admin_metrics(
+    State(node): State<Arc<Node>>,
+    Auth(p): Auth,
+    _: Req<api::GetMetrics>,
+) -> Result<Reply<api::GetMetrics>> {
+    Ok(Reply::new(metrics(&node, &p)?))
 }
 
-async fn reset_metrics(State(node): State<Arc<Node>>, auth: Auth) -> Result<axum::Json<Json>> {
-    let out = admin_metrics(State(node.clone()), auth).await?;
+async fn reset_metrics(
+    State(node): State<Arc<Node>>,
+    Auth(p): Auth,
+    _: Req<api::ResetMetrics>,
+) -> Result<Reply<api::ResetMetrics>> {
+    let out = metrics(&node, &p)?;
     node.engine.shared.metrics.reset();
     node.metrics.reset();
+    Ok(Reply::new(out))
+}
+
+fn metrics(node: &Node, p: &Principal) -> Result<api::Metrics> {
+    p.require_admin()?;
+    p.require_unscoped()?;
+    let mut out = api::Metrics { node: node.id.clone(), ..api::Metrics::default() };
+    node.engine.shared.metrics.fill(&mut out);
+    node.metrics.fill(&mut out);
     Ok(out)
 }
 

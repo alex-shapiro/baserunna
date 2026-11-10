@@ -1,23 +1,24 @@
-//! HTTP routes for streams (SPEC §4.6, §10).
+//! HTTP routes for streams.
 
 use super::data::{
     PathMap, bool_param, commit_hex, content_type, encoding_param, idempotency_header, one_idempotency_key, param,
     split_consistency,
 };
 use super::{
-    DbCtx, Found, JsonBody, Params, Ran, consistency_of, name_paging, paging, run_txn, watch, with_read, with_txn,
+    DbCtx, Endpoints as _, Found, JsonBody, Params, QueryOf, Ran, Reply, Req, consistency_from, consistency_of, paging,
+    run_txn, watch, with_read, with_txn,
 };
 use crate::engine::{Committed, Consistency, Db, Isolation, Retention, StreamState};
 use crate::error::{Error, Result};
 use crate::node::Node;
-use crate::ops::Encoding;
-use crate::stream::{self, AppendTo, Body, NewRecord, ReadOut, ReadSpec};
+use crate::stream::{self, AppendTo, Body, ReadOut, ReadSpec};
 use axum::Router;
 use axum::extract::{Extension, Path, Request, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
+use baserunna_api::{self as api, Encoding, Endpoint as _};
 use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
 use std::pin::Pin;
@@ -30,13 +31,15 @@ type J = axum::Json<Json>;
 
 pub(super) const EVENTS_WAIT_MAX_MS: u64 = 300_000;
 const KEEPALIVE: Duration = Duration::from_secs(15);
-/// Consumers stream info lists; the consumers route pages through the rest.
+/// Maximum number of consumers returned by `GET /v1/dbs/{db}/streams/{s}`.
 const INFO_CONSUMERS: usize = 100;
 
 pub fn routes() -> Router<Arc<Node>> {
     Router::new()
-        .route("/v1/dbs/{db}/streams", get(list).post(create))
-        .route("/v1/dbs/{db}/streams/{s}", get(info).patch(configure).delete(delete))
+        .endpoint::<api::ListStreams, _>(list)
+        .endpoint::<api::CreateStream, _>(create)
+        .endpoint::<api::GetStream, _>(info)
+        .route(api::GetStream::ROUTE, patch(configure).delete(delete))
         .route("/v1/dbs/{db}/streams/{s}/records", get(read).post(append))
         .route("/v1/dbs/{db}/streams/{s}/records/query", post(query))
         .route("/v1/dbs/{db}/streams/{s}/trim", post(trim))
@@ -48,53 +51,60 @@ fn number<T: std::str::FromStr>(q: &Params, k: &str) -> Result<Option<T>> {
     q.get(k).map(|v| v.parse().map_err(|_| Error::invalid(format!("{k} must be a number")))).transpose()
 }
 
-async fn list(Extension(ctx): Extension<DbCtx>, q: Params) -> Result<J> {
-    let (prefix, limit, cursor) = name_paging(&q)?;
-    let c = consistency_of(&q)?;
-    let ((page, next), v) = with_read!(ctx.db, c, |t| stream::list(t, &prefix, limit, cursor.as_deref()).await);
-    let streams: Vec<Json> = page.iter().map(|(n, c, st)| stream::stream_json(n, c, st)).collect();
-    Ok(axum::Json(json!({"streams": streams, "next_cursor": next, "version": v})))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CreateBody {
-    name: String,
-    #[serde(default)]
-    retention_ms: Option<u64>,
-    #[serde(default)]
-    max_bytes: Option<u64>,
+async fn list(
+    Extension(ctx): Extension<DbCtx>,
+    QueryOf(q): QueryOf<api::ListStreamsQuery>,
+    _: Req<api::ListStreams>,
+) -> Result<Reply<api::ListStreams>> {
+    let limit = crate::ops::page_limit(q.limit)?;
+    let (prefix, cursor) = (q.prefix.unwrap_or_default(), q.cursor.filter(|c| !c.is_empty()));
+    let c = consistency_from(q.consistency, q.max_staleness_ms);
+    let ((page, next_cursor), version) =
+        with_read!(ctx.db, c, |t| stream::list(t, &prefix, limit, cursor.as_deref()).await);
+    let streams = page.iter().map(|(n, c, st)| stream::public_stream(n, c, st)).collect();
+    Ok(Reply::new(api::StreamPage { streams, next_cursor, version }))
 }
 
 async fn create(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
-    JsonBody(b): JsonBody<CreateBody>,
-) -> Result<Response> {
+    Req(b): Req<api::CreateStream>,
+) -> Result<Reply<api::CreateStream>> {
     let r = Retention { retention_ms: b.retention_ms, max_bytes: b.max_bytes };
-    let (c, v) = with_txn!(node, ctx, |t| stream::create(t, &b.name, r, node.env.random_u64(), node.now_ms()).await);
-    let mut out = stream::stream_json(&b.name, &c, &StreamState::new(r));
-    out["version"] = json!(v);
-    Ok((StatusCode::CREATED, axum::Json(out)).into_response())
+    let (c, version) =
+        with_txn!(node, ctx, |t| stream::create(t, &b.name, r, node.env.random_u64(), node.now_ms()).await);
+    let stream = stream::public_stream(&b.name, &c, &StreamState::new(r));
+    Ok(Reply::new(api::CreatedStream { stream, version }))
 }
 
-async fn info(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, q: Params) -> Result<J> {
+async fn info(
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+    q: Params,
+    _: Req<api::GetStream>,
+) -> Result<Reply<api::GetStream>> {
     let name = param(&p, "s")?.to_string();
     let c = consistency_of(&q)?;
-    let ((cat, st, (consumers, next)), v) = with_read!(ctx.db, c, |t| {
+    let ((cat, st, (consumers, consumers_next_cursor)), version) = with_read!(ctx.db, c, |t| {
         let (cat, st) = stream::info(t, &name).await?;
         let consumers = stream::list_consumers(t, &name, INFO_CONSUMERS, None).await?;
         Ok::<_, Error>((cat, st, consumers))
     });
-    let mut out = stream::stream_json(&name, &cat, &st);
-    out["consumers"] = Json::Array(consumers.iter().map(|(n, x)| consumer_json(n, x, &st)).collect());
-    out["consumers_next_cursor"] = json!(next);
-    out["version"] = json!(v);
-    Ok(axum::Json(out))
+    Ok(Reply::new(api::StreamInfo {
+        stream: stream::public_stream(&name, &cat, &st),
+        consumers: consumers.iter().map(|(n, x)| consumer(n, x, &st)).collect(),
+        consumers_next_cursor,
+        version,
+    }))
+}
+
+fn consumer(name: &str, c: &stream::Consumer, st: &StreamState) -> api::Consumer {
+    let lag = st.next_seq.saturating_sub(c.seq.max(st.first_seq));
+    api::Consumer { name: name.into(), seq: c.seq, lag, updated_at: c.updated_at }
 }
 
 fn consumer_json(name: &str, c: &stream::Consumer, st: &StreamState) -> Json {
-    json!({"name": name, "seq": c.seq, "lag": st.next_seq.saturating_sub(c.seq.max(st.first_seq)), "updated_at": c.updated_at})
+    serde_json::to_value(consumer(name, c, st)).expect("consumers serialize")
 }
 
 /// Reads a field of a partial update: absent, `null`, or a number.
@@ -130,29 +140,14 @@ async fn configure(
         let st = t.untracked_snapshot().stream_state(c.id).await?.unwrap_or(StreamState::new(r));
         Ok::<_, Error>((c, StreamState { retention: r, ..st }))
     });
-    let mut out = stream::stream_json(&name, &c, &st);
-    out["version"] = json!(v);
-    Ok(axum::Json(out))
+    let stream = stream::public_stream(&name, &c, &st);
+    Ok(axum::Json(serde_json::to_value(api::CreatedStream { stream, version: v }).expect("streams serialize")))
 }
 
 async fn delete(State(node): State<Arc<Node>>, Extension(ctx): Extension<DbCtx>, Path(p): PathMap) -> Result<J> {
     let name = param(&p, "s")?.to_string();
     let ((), v) = with_txn!(node, ctx, |t| stream::delete(t, &name).await);
     Ok(axum::Json(json!({"version": v})))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AppendBody {
-    records: Vec<NewRecord>,
-    #[serde(default)]
-    expect_seq: Option<u64>,
-    #[serde(default)]
-    create: bool,
-    #[serde(default)]
-    idempotency_key: Option<String>,
-    #[serde(default)]
-    encoding: Option<Encoding>,
 }
 
 async fn append(
@@ -174,7 +169,7 @@ async fn append(
         .map_err(|_| Error::TooLarge(format!("appends are limited to {limit} bytes")))?;
     let bodies: Vec<Body> = match ct.as_str() {
         "" | "application/json" => {
-            let b: AppendBody =
+            let b: api::AppendRequest =
                 super::parse_json(&data).map_err(|e| Error::invalid(format!("invalid JSON body: {e}")))?;
             expect = expect.or(b.expect_seq);
             create |= b.create;
@@ -183,7 +178,7 @@ async fn append(
                 Some(e) => e,
                 None => encoding_param(&q)?,
             };
-            b.records.into_iter().map(|r| r.into_body(enc)).collect::<Result<_>>()?
+            b.records.into_iter().map(|r| stream::record_body(r, enc)).collect::<Result<_>>()?
         }
         "application/x-ndjson" | "application/jsonl" | "application/json-lines" => stream::parse_lines(&data, true)?,
         "text/plain" => stream::parse_lines(&data, false)?,
@@ -212,15 +207,20 @@ async fn append(
     }
 }
 
-/// The answer to an append, from the commit that applied it.
+/// Builds the HTTP response for a committed or replayed append.
 fn appended(c: &Committed, replayed: bool, commit_id: u64) -> Result<Response> {
     let [a] = c.appends[..] else {
         return Err(Error::invalid("the idempotency key was used by a request other than an append"));
     };
-    Ok(axum::Json(json!({
-        "first_seq": a.first_seq, "next_seq": a.first_seq + a.count, "count": a.count, "time": c.time_ms,
-        "version": c.version, "commit_id": commit_hex(commit_id), "replayed": replayed,
-    }))
+    Ok(axum::Json(api::Appended {
+        first_seq: a.first_seq,
+        next_seq: a.first_seq + a.count,
+        count: a.count,
+        time: c.time_ms,
+        version: c.version,
+        commit_id: commit_hex(commit_id),
+        replayed,
+    })
     .into_response())
 }
 
@@ -259,11 +259,10 @@ impl Found for ReadOut {
     }
 }
 
-/// The parameters a read takes besides those of its [`ReadSpec`].
+/// Query parameters handled outside [`ReadSpec`].
 const READ_PARAMS: [&str; 5] = ["format", "wait_ms", "encoding", "consistency", "max_staleness_ms"];
 
-/// The read a query string describes, every parameter not in
-/// [`READ_PARAMS`] being a field of [`ReadSpec`].
+/// Deserializes [`ReadSpec`] from the query parameters outside [`READ_PARAMS`].
 fn read_spec(q: &Params) -> Result<ReadSpec> {
     let fields: Vec<(&String, &String)> = q.iter().filter(|(k, _)| !READ_PARAMS.contains(&k.as_str())).collect();
     let query = serde_urlencoded::to_string(fields).map_err(|e| Error::internal(e.to_string()))?;
@@ -306,11 +305,10 @@ async fn read(
         return Ok(events(node, follow, spec, first));
     }
     let (out, v) = watch!(node, ctx.db, c, Duration::from_millis(wait), |t| stream::read(t, &name, &spec).await);
-    let records = out.records.iter().map(|(r, b)| stream::record_json(r, b, enc));
     if format == Format::Ndjson {
         let mut body = Vec::new();
-        for r in records {
-            body.extend_from_slice(r.to_string().as_bytes());
+        for (r, b) in &out.records {
+            body.extend_from_slice(stream::record_json(r, b, enc).to_string().as_bytes());
             body.push(b'\n');
         }
         let mut resp = Response::new(axum::body::Body::from(body));
@@ -323,22 +321,26 @@ async fn read(
         h.insert("x-baserunna-version", HeaderValue::from(v));
         return Ok(resp);
     }
-    Ok(axum::Json(read_json(records.collect(), &out, v)).into_response())
+    Ok(axum::Json(record_page(&out, enc, v)).into_response())
 }
 
-/// `spec` without where it starts.
+/// Clears the starting position fields of `spec`.
 fn starting_anywhere(spec: ReadSpec) -> ReadSpec {
     ReadSpec { from_seq: None, from_time: None, tail: None, consumer: None, ..spec }
 }
 
-fn read_json(records: Vec<Json>, out: &ReadOut, version: u64) -> Json {
-    json!({
-        "records": records, "next_seq": out.next_seq, "first_seq": out.first_seq,
-        "tail_seq": out.tail_seq, "done": out.done, "version": version,
-    })
+fn record_page(out: &ReadOut, enc: Encoding, version: u64) -> api::RecordPage {
+    api::RecordPage {
+        records: out.records.iter().map(|(r, b)| stream::record(r, b, enc)).collect(),
+        next_seq: out.next_seq,
+        first_seq: out.first_seq,
+        tail_seq: out.tail_seq,
+        done: out.done,
+        version,
+    }
 }
 
-/// A response body fed by a task, chunk by chunk.
+/// Streaming HTTP response body backed by a channel.
 struct ChannelBody(tokio::sync::mpsc::Receiver<Bytes>);
 
 impl http_body::Body for ChannelBody {
@@ -363,10 +365,10 @@ struct Follow {
     wait: Duration,
 }
 
-/// Serves a forward read as server-sent events, starting with `first`, its
-/// first page: records as they are appended for up to `f.wait`, until
-/// `limit` records or the end of the read's range, or until the node drains
-/// (the client resumes elsewhere with `Last-Event-ID`).
+/// Streams a forward read as server-sent events starting from `first`.
+///
+/// Sends new records for up to `f.wait` until the read reaches `limit`, reaches the end of its
+/// range, or the node starts draining.
 fn events(node: Arc<Node>, f: Follow, spec: ReadSpec, first: (ReadOut, u64)) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
     let env = node.env.clone();
@@ -382,7 +384,7 @@ fn events(node: Arc<Node>, f: Follow, spec: ReadSpec, first: (ReadOut, u64)) -> 
                 Some(p) => p,
                 None => {
                     spec.limit =
-                        Some(left.map_or(stream::READ_LIMIT_MAX, |l| (l as usize).min(stream::READ_LIMIT_MAX)));
+                        Some(left.map_or(baserunna_api::PAGE_MAX, |l| (l as usize).min(baserunna_api::PAGE_MAX)));
                     match read_once(&db, c, &name, &spec).await {
                         Ok(r) => r,
                         Err(e) => {
@@ -434,15 +436,20 @@ fn events(node: Arc<Node>, f: Follow, spec: ReadSpec, first: (ReadOut, u64)) -> 
 
 async fn query(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, JsonBody(b): JsonBody<Json>) -> Result<J> {
     let name = param(&p, "s")?.to_string();
+    let (spec, c, enc) = query_spec(b)?;
+    let (out, v) = read_once(&ctx.db, c, &name, &spec).await?;
+    Ok(axum::Json(serde_json::to_value(record_page(&out, enc, v)).expect("records serialize")))
+}
+
+/// Parses [`ReadSpec`], [`Consistency`], and [`Encoding`] from an [`api::RecordQuery`] body.
+fn query_spec(b: Json) -> Result<(ReadSpec, Consistency, Encoding)> {
     let (mut b, c) = split_consistency(b)?;
     let enc = match b.as_object_mut().and_then(|o| o.remove("encoding")) {
         None => Encoding::Utf8,
         Some(e) => serde_json::from_value(e).map_err(|_| Error::invalid("encoding is utf8 or base64"))?,
     };
-    let spec: ReadSpec = serde_json::from_value(b).map_err(|e| Error::invalid(format!("invalid query: {e}")))?;
-    let (out, v) = read_once(&ctx.db, c, &name, &spec).await?;
-    let records = out.records.iter().map(|(r, b)| stream::record_json(r, b, enc)).collect();
-    Ok(axum::Json(read_json(records, &out, v)))
+    let spec = serde_json::from_value(b).map_err(|e| Error::invalid(format!("invalid query: {e}")))?;
+    Ok((spec, c, enc))
 }
 
 #[derive(Deserialize)]
@@ -524,6 +531,65 @@ mod tests {
     use tower::ServiceExt;
 
     const S: &str = "/v1/dbs/logs/streams/app";
+
+    #[test]
+    fn client_read_and_query_fields_are_parsed() {
+        let read = api::ReadRecordsQuery {
+            from_seq: Some(1),
+            from_time: Some(2),
+            tail: Some(3),
+            consumer: Some("c".into()),
+            until_seq: Some(4),
+            until_time: Some(5),
+            reverse: true,
+            limit: Some(6),
+            max_bytes: Some(7),
+            scan_limit: Some(8),
+            wait_ms: Some(9),
+            encoding: Some(Encoding::Base64),
+            consistency: Some(api::Consistency::Snapshot),
+            max_staleness_ms: Some(10),
+        };
+        let q = axum::extract::Query(serde_urlencoded::from_str(&serde_urlencoded::to_string(&read).unwrap()).unwrap());
+        let spec = read_spec(&q).unwrap();
+        let want = ReadSpec {
+            from_seq: Some(1),
+            from_time: Some(2),
+            tail: Some(3),
+            consumer: Some("c".into()),
+            until_seq: Some(4),
+            until_time: Some(5),
+            reverse: true,
+            limit: Some(6),
+            max_bytes: Some(7),
+            filter: None,
+            scan_limit: Some(8),
+        };
+        assert_eq!(format!("{spec:?}"), format!("{want:?}"));
+        assert_eq!(number::<u64>(&q, "wait_ms").unwrap(), Some(9));
+        assert!(encoding_param(&q).unwrap() == Encoding::Base64);
+        assert_eq!(consistency_of(&q).unwrap(), Consistency::Snapshot { max_staleness_ms: 10 });
+
+        let query = api::RecordQuery {
+            from_seq: read.from_seq,
+            from_time: read.from_time,
+            tail: read.tail,
+            consumer: read.consumer,
+            until_seq: read.until_seq,
+            until_time: read.until_time,
+            reverse: read.reverse,
+            limit: read.limit,
+            max_bytes: read.max_bytes,
+            filter: Some(json!({"field": "level", "op": "eq", "value": "error"})),
+            scan_limit: read.scan_limit,
+            encoding: read.encoding,
+            consistency: read.consistency,
+            max_staleness_ms: read.max_staleness_ms,
+        };
+        let (spec, c, enc) = query_spec(serde_json::to_value(&query).unwrap()).unwrap();
+        assert!(spec.filter.is_some() && spec.scan_limit == Some(8) && spec.tail == Some(3), "{spec:?}");
+        assert!(c == Consistency::Snapshot { max_staleness_ms: 10 } && enc == Encoding::Base64);
+    }
 
     /// A node with database `logs` holding stream `app`; its router and a token.
     async fn world() -> (World, axum::Router, String) {

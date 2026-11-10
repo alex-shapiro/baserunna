@@ -11,8 +11,9 @@ use crate::engine::events::{Bind, BindSlot, Pos, Runs, StagedPart};
 use crate::engine::{Committed, Db};
 use crate::error::{Error, Result};
 use crate::store::BoxFut;
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
@@ -74,7 +75,7 @@ impl Buffers {
             let mut full = None;
             let mut timer = None;
             {
-                let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = self.map.lock();
                 let b = g.entry(key.clone()).or_insert_with(|| Buffer {
                     db: db.clone(),
                     schema: schema.clone(),
@@ -101,7 +102,7 @@ impl Buffers {
                 db.shared().env.spawn(async move {
                     tokio::time::sleep(wait).await;
                     let b = {
-                        let mut g = me.map.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut g = me.map.lock();
                         match g.get(&key) {
                             Some(b) if b.generation == generation => g.remove(&key),
                             _ => None,
@@ -194,6 +195,6 @@ impl Buffers {
 
     /// Returns the number of requests waiting in buffers.
     pub fn pending(&self) -> usize {
-        self.map.lock().unwrap_or_else(|e| e.into_inner()).values().map(|b| b.slots.len()).sum()
+        self.map.lock().values().map(|b| b.slots.len()).sum()
     }
 }

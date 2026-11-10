@@ -20,7 +20,7 @@ The repository is a Cargo workspace:
 
 - `crates/baserunna`: server
 - `crates/baserunna-api`: HTTP API request and response types
-- `crates/baserunna-client`: typed HTTP client with retries
+- `crates/baserunna-client`: typed HTTP client with retries, interactive transactions, and exactly-once writes
 
 ## Quick start
 

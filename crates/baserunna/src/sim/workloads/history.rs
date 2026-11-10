@@ -3,7 +3,7 @@
 //! Concurrent clients run random one-shot and interactive transactions at serializable and
 //! snapshot isolation levels, with strong and bounded-staleness reads. Each write transaction
 //! writes a unique marker key so the final database state identifies which transactions
-//! committed and at which version.
+//! were committed and at which version.
 //!
 //! The history checker verifies:
 //! - Replaying committed write transactions in commit-version order reproduces the values
@@ -16,9 +16,10 @@
 use super::super::Sim;
 use super::super::client::{Client, Status, ZOMBIE_WAIT_MS};
 use crate::util::rng::Rng;
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
@@ -59,7 +60,7 @@ fn key_of(s: &str) -> Option<usize> {
     s.strip_prefix("h/")?.parse().ok()
 }
 
-/// Value and version observed by a read (`version` is `None` for uncommitted writes in the same transaction).
+/// Value and version observed by a read. The version is `None` for uncommitted writes in the same transaction.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Seen {
     pub value: String,
@@ -110,7 +111,7 @@ impl Txn {
     }
 }
 
-/// Per-key version history (`None` represents a deletion).
+/// Per-key version history, where `None` represents a deletion.
 #[derive(Default)]
 struct Model {
     keys: BTreeMap<usize, Vec<(u64, Option<String>)>>,
@@ -475,7 +476,7 @@ fn ops_json(ops: &[Op]) -> Json {
     Json::Array(ops.iter().map(Op::json).collect())
 }
 
-/// Serializes `ops` and appends `t`'s marker write when `last` is true.
+/// Serializes `ops` and appends `t`'s marker write if `last` is true.
 fn request_ops(t: &Txn, ops: &[Op], last: bool) -> Json {
     let mut j = ops_json(ops);
     if last && t.writes() {
@@ -494,7 +495,7 @@ fn parse_sent(t: &Txn, ops: &[Op], r: &Json, last: bool) -> Result<Vec<Observed>
     parse_results(ops, &r)
 }
 
-/// Queries the fenced commit status for an ambiguous transaction when `resolve` is true.
+/// Queries the fenced commit status for an ambiguous transaction if `resolve` is true.
 async fn resolve(c: &Client, db: &str, id: &str, t: &Txn, resolve: bool) -> Result<Outcome, String> {
     if !resolve {
         return Ok(Outcome::Unknown);
@@ -527,8 +528,8 @@ async fn one_shot(c: &Client, db: &str, t: &mut Txn, key: String, settle: bool, 
     let (mut ambiguous, mut raced) = (false, false);
     loop {
         let r = c.call("POST", &format!("/v1/dbs/{db}/txn"), Some(body.clone())).await;
-        // An immediate retry can conflict with the in-flight first attempt, whereas a
-        // 412 response is always definitive because the server fences prior attempts first.
+        // An immediate retry can conflict with the in-flight first attempt. A 412
+        // response is always definitive because the server fences prior attempts first.
         let unknown = match &r {
             Ok(r) => r.outcome_unknown() || (ambiguous && r.status == 503) || (raced && r.status == 409),
             Err(e) => *e != super::super::NetError::Refused || ambiguous,
@@ -699,7 +700,7 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
                 }
                 t.end = sim.now_ms();
                 sim.trace.event(&format!("history {t:?}"));
-                history.lock().unwrap_or_else(|e| e.into_inner()).push(t);
+                history.lock().push(t);
             }
             Ok::<(), String>(())
         }));
@@ -714,7 +715,7 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
         return Err(e);
     }
     super::settle(&sim, phase).await;
-    let mut h = history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut h = history.lock().clone();
     h.push(final_read(&sim, &owner, db, shape.keys).await?);
     let markers = owner.paginate(&format!("/v1/dbs/{db}/kv?prefix=m/&limit=100"), "items").await?;
     let mut markers: BTreeMap<String, u64> = markers
@@ -728,7 +729,7 @@ pub async fn run(sim: Arc<Sim>, shape: Shape, chaos: bool) -> Result<(), String>
             (Outcome::Committed(v), Some(m)) if v == m => t.outcome,
             (Outcome::NotCommitted, None) | (Outcome::Unknown, None) => Outcome::NotCommitted,
             (Outcome::Unknown, Some(m)) => {
-                // The transaction may have committed after the client stopped waiting.
+                // The transaction may have been committed after the client stopped waiting.
                 t.end = u64::MAX;
                 Outcome::Committed(m)
             }

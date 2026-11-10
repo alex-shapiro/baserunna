@@ -11,9 +11,10 @@
 use super::super::Sim;
 use super::super::client::Client;
 use super::events::{Settled, settle};
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const DB: &str = "/v1/dbs/events";
 const TABLE: &str = "/v1/dbs/events/events/churn";
@@ -75,10 +76,6 @@ struct World {
 }
 
 type Shared = Arc<Mutex<World>>;
-
-fn world(w: &Shared) -> std::sync::MutexGuard<'_, World> {
-    w.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 struct State {
     exists: bool,
@@ -219,7 +216,7 @@ impl World {
 
 // Caps iterations at `10 * steps` so a blocked churner does not stall workers.
 fn is_done(w: &Shared, step: usize, steps: usize, after: &mut usize) -> bool {
-    if !world(w).churning {
+    if !w.lock().churning {
         *after += 1;
     }
     (step >= steps && *after > 3) || step >= 10 * steps.max(10)
@@ -231,7 +228,7 @@ async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: 
         if is_done(&w, step, steps, &mut after) {
             break;
         }
-        let col = world(&w).col;
+        let col = w.lock().col;
         let n = 1 + c.rng().usize(8);
         let mut rows = Vec::new();
         let mut evs = Vec::new();
@@ -248,7 +245,7 @@ async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: 
             evs.push((uid, (k, given)));
         }
         let uids: Vec<String> = evs.iter().map(|e| e.0.clone()).collect();
-        world(&w).evs.extend(evs);
+        w.lock().evs.extend(evs);
         let (path, body, ndjson) = if transactional {
             (format!("{DB}/txn"), json!({"ops": [{"op": "insert_events", "table": "churn", "rows": rows}]}), false)
         } else {
@@ -259,11 +256,11 @@ async fn inserter(c: Client, w: Shared, base: i64, steps: usize, transactional: 
         match settle(&c, &path, ndjson, &body, &format!("{}-{step}", c.name)).await? {
             Settled::Done(j) => {
                 let v = j["version"].as_u64().ok_or(format!("{}: missing version in {j}", c.name))?;
-                let mut g = world(&w);
+                let mut g = w.lock();
                 g.observe(&j);
                 g.inserts.push(Insert { sent_ms, version: Some(v), uids });
             }
-            Settled::Unknown => world(&w).inserts.push(Insert { sent_ms, version: None, uids }),
+            Settled::Unknown => w.lock().inserts.push(Insert { sent_ms, version: None, uids }),
             Settled::Rejected(r) if r.status == 404 => {}
             Settled::Rejected(r) if r.status == 400 && r.json.to_string().contains("unknown column") => {}
             Settled::Rejected(r) => return Err(format!("{}: churn insert rejected: {} {}", c.name, r.status, r.json)),
@@ -283,7 +280,7 @@ async fn deleter(c: Client, w: Shared, steps: usize) -> Result<(), String> {
         let ms = 500 + c.rng().below(2_000);
         c.pause(ms).await;
         let victims: Vec<String> = {
-            let g = world(&w);
+            let g = w.lock();
             let acked: Vec<&String> = g.inserts.iter().filter(|x| x.version.is_some()).flat_map(|x| &x.uids).collect();
             let mut r = c.rng();
             match acked.is_empty() {
@@ -295,14 +292,14 @@ async fn deleter(c: Client, w: Shared, steps: usize) -> Result<(), String> {
             "where": {"col": "uid", "op": "in", "value": victims}}]});
         let d = match settle(&c, &format!("{DB}/txn"), false, &body, &format!("{}-{step}", c.name)).await? {
             Settled::Done(j) => {
-                world(&w).observe(&j);
+                w.lock().observe(&j);
                 Some(j["version"].as_u64().ok_or(format!("{}: missing version in {j}", c.name))?)
             }
             Settled::Unknown => None,
             Settled::Rejected(r) if r.status == 404 => continue,
             Settled::Rejected(r) => return Err(format!("{}: churn delete rejected: {} {}", c.name, r.status, r.json)),
         };
-        world(&w).deletes.push((d, victims));
+        w.lock().deletes.push((d, victims));
     }
     Ok(())
 }
@@ -313,10 +310,10 @@ async fn ddl(c: &Client, w: &Shared, kind: Kind, method: &str, path: &str, body:
         Kind::Drop | Kind::DropCol(_) => (200, 404),
         Kind::AddCol(_) => (200, 409),
     };
-    let lo = world(w).seen;
+    let lo = w.lock().seen;
     let (r, ambiguous) = c.settle(method, path, body).await?;
     let done_ms = c.sim.now_ms();
-    let mut g = world(w);
+    let mut g = w.lock();
     let hi = match r.status {
         s if s == ok => {
             g.observe(&r.json);
@@ -333,7 +330,7 @@ async fn ddl(c: &Client, w: &Shared, kind: Kind, method: &str, path: &str, body:
 
 async fn churner(c: Client, w: Shared, steps: usize) -> Result<(), String> {
     let r = churn(&c, &w, steps).await;
-    world(&w).churning = false;
+    w.lock().churning = false;
     r
 }
 
@@ -346,12 +343,12 @@ async fn churn(c: &Client, w: &Shared, steps: usize) -> Result<(), String> {
         c.pause(ms).await;
         let recreate = c.rng().chance(0.4);
         if recreate {
-            world(&w).col = None;
+            w.lock().col = None;
             ddl(c, &w, Kind::Drop, "DELETE", TABLE, None).await?;
             ddl(c, &w, Kind::Create, "POST", &format!("{DB}/events"), Some(definition())).await?;
             col = None;
         } else if let Some(n) = col {
-            world(&w).col = None;
+            w.lock().col = None;
             ddl(c, &w, Kind::DropCol(n), "DELETE", &format!("{TABLE}/columns/c{n}"), None).await?;
             col = None;
         } else {
@@ -359,7 +356,7 @@ async fn churn(c: &Client, w: &Shared, steps: usize) -> Result<(), String> {
             next += 1;
             let spec = json!({"name": format!("c{n}"), "type": "int", "default": default_of(n)});
             ddl(c, &w, Kind::AddCol(n), "POST", &format!("{TABLE}/columns"), Some(spec)).await?;
-            world(&w).col = Some(n);
+            w.lock().col = Some(n);
             col = Some(n);
         }
     }
@@ -398,7 +395,7 @@ async fn querier(c: Client, w: Shared, steps: usize) -> Result<(), String> {
         }
         let ms = 200 + c.rng().below(800);
         c.pause(ms).await;
-        let col = world(&w).col.filter(|_| c.rng().chance(0.8));
+        let col = w.lock().col.filter(|_| c.rng().chance(0.8));
         let (q, aggregate) = query(&c, col);
         let sent_ms = c.sim.now_ms();
         match c.call("POST", &format!("{TABLE}/rows/query"), Some(q.clone())).await {
@@ -407,7 +404,7 @@ async fn querier(c: Client, w: Shared, steps: usize) -> Result<(), String> {
                     continue;
                 }
                 let strong = q["consistency"] == "strong";
-                let mut g = world(&w);
+                let mut g = w.lock();
                 g.observe(&r.json);
                 g.answers.push(Answer { sent_ms, strong, col, aggregate, json: r.json });
             }
@@ -436,7 +433,7 @@ impl Churn {
         steps: usize,
     ) -> Result<(Churn, Vec<tokio::task::JoinHandle<Result<(), String>>>), String> {
         let w: Shared = Arc::default();
-        world(&w).churning = true;
+        w.lock().churning = true;
         setup(&client("churn-setup"), &w).await?;
         sim.trace.event("events: churning table churn");
         let tasks = vec![
@@ -453,12 +450,12 @@ impl Churn {
     pub async fn check(&self, c: &Client) -> Result<(), String> {
         let mut checked = 0;
         {
-            let g = world(&self.w);
+            let g = self.w.lock();
             for a in &g.answers {
                 checked += g.check(a)? as usize;
             }
         }
-        let col = world(&self.w).col;
+        let col = self.w.lock().col;
         let sent_ms = c.sim.now_ms();
         let mut got: BTreeMap<String, Option<i64>> = BTreeMap::new();
         let mut cursor: Option<String> = None;
@@ -487,7 +484,7 @@ impl Churn {
                 None => break,
             }
         }
-        let g = world(&self.w);
+        let g = self.w.lock();
         let st = g.state_at(version, Some(sent_ms)).ok_or("churn: final state unknown")?;
         if !st.exists || st.col != col {
             return Err(format!("churn: final table exists={} col={:?}, expected col={col:?}", st.exists, st.col));

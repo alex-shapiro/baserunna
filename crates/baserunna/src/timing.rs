@@ -326,9 +326,9 @@ mod tests {
             })
             .await;
             assert_eq!(tally.store_json(), Some(json!({"manifest.put": {"n": 1, "ms": 400, "bytes": 3}})));
-            let mut out = serde_json::Map::new();
-            store.metrics.json_into(&mut out);
-            assert_eq!(out["store"]["manifest.put"]["max_ms"], 400.0);
+            let mut out = baserunna_api::Metrics::default();
+            store.metrics.fill(&mut out);
+            assert_eq!(out.store["manifest.put"].max_ms, Some(400.0));
         });
     }
 }

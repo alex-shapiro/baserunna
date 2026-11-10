@@ -1,46 +1,92 @@
-//! HTTP API request and response types.
+//! HTTP API routes, requests, and responses.
 //!
-//! If the API changes only by addition, different releases of the server and the client stay
-//! compatible: response types ignore unknown fields, and new request fields must be optional.
+//! Response types ignore unknown fields so that clients remain compatible with newer servers. New
+//! request fields are optional.
 
 #![forbid(unsafe_code)]
 
 mod account;
+mod admin;
 pub mod b64;
 mod db;
 mod error;
 mod kv;
 mod limits;
+mod op;
+mod stream;
+mod table;
+mod txn;
 
 pub use account::{
-    AddMember, CreateOrg, Credential, Credentials, GetMe, LogIn, Me, Member, NewMember, NewOrg, Org, RemoveMember,
-    Role, Session, SignUp, User,
+    AddMember, ApiKey, ApiKeyPage, CreateApiKey, CreateOrg, CreatedApiKey, Credential, Credentials, DeleteApiKey,
+    GetMe, ListApiKeys, LogIn, Me, Member, NewApiKey, NewMember, NewOrg, Org, PageQuery, RemoveMember, Role, Session,
+    SignUp, User,
 };
-pub use db::{CreateDb, Db, NewDb};
-pub use error::{ApiError, ErrorBody, ErrorCode, ErrorDetails, Outcome};
+pub use admin::{CommitMetrics, Cpu, GetMetrics, Histogram, Metrics, ResetMetrics};
+pub use db::{CreateDb, Db, DbInfo, DbPage, DbStats, DeleteDb, GetDb, LevelStats, ListDbs, ListDbsQuery, NewDb};
+pub use error::{ApiError, ErrorBody, ErrorCode, ErrorDetails, Missing, Outcome};
 pub use kv::{
-    BlobMeta, Change, ChangePage, Changes, ChangesQuery, Consistency, DeletedRange, Encoding, GetResult, Isolation, Op,
-    OpResult, QueryEvents, ReadBlob, ReadStream, ScanItem, ScanResult, StageBlob, Txn, TxnRequest, TxnResponse,
+    BlobMeta, ByteRange, Change, ChangePage, Changes, ChangesQuery, Content, DeletedRange, Expect, GetValue, KvValue,
+    PutOptions, PutValue, ReadBlob, StageBlob, Written,
 };
 pub use limits::{GetLimits, Limits};
+pub use op::{
+    AppendResult, ConsumerResult, CountResult, DeletedResult, FoundResult, GetResult, IncrementResult, NewRecord, Op,
+    OpResult, PAGE_MAX, QueryEvents, RangeSpec, ReadStream, RecordsResult, RowResult, RowsResult, ScanItem, ScanResult,
+    Selection, StreamRecord, StreamState,
+};
+pub use stream::{
+    AppendLines, AppendRecords, AppendRequest, Appended, Consumer, CreateStream, CreatedStream, GetStream, JsonLines,
+    ListStreams, ListStreamsQuery, NewStream, QueryRecords, ReadRecords, ReadRecordsQuery, RecordPage, RecordQuery,
+    Stream, StreamInfo, StreamPage,
+};
+pub use table::{
+    AddColumn, AddIndex, Column, ColumnType, CreateTable, CreatedTable, GetTable, GetTableQuery, Index, IndexState,
+    ListTables, ListTablesQuery, NewColumn, NewIndex, NewTable, Table, TablePage,
+};
+pub use txn::{
+    AbortTxn, BeginRequest, BeginTxn, Begun, CommitRequest, CommitStatus, CommitTxn, Committed, Consistency, Encoding,
+    GetCommit, Isolation, OpsRequest, OpsResponse, Txn, TxnOps, TxnRequest, TxnResponse,
+};
 
 use bytes::Bytes;
 use http::{Method, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// An HTTP route and its request and response types.
 pub trait Endpoint {
     const METHOD: Method;
-    /// Route in axum syntax, with a `{name}` segment for each path parameter.
+    /// Route template with `{name}` path parameters.
     const ROUTE: &'static str;
     const STATUS: StatusCode;
     type Body: Body;
     type Response: Body;
 
-    /// Returns true if repeating a successful request has no effect.
-    fn is_idempotent(body: &Self::Body) -> bool;
+    /// Returns true if the request can be safely retried after an ambiguous failure.
+    fn is_idempotent(&self, body: &Self::Body) -> bool;
+
+    /// Returns true if the request does not modify data.
+    fn is_read_only(_body: &Self::Body) -> bool {
+        Self::METHOD == Method::GET
+    }
+
+    /// Returns true if a `conflict` error on this request terminates the transaction.
+    fn conflict_ends_txn() -> bool {
+        false
+    }
 
     fn path(&self) -> String;
+
+    /// Returns request headers other than `Authorization`. A `Content-Type` header here overrides
+    /// [`Body::CONTENT_TYPE`].
+    fn headers(&self) -> http::HeaderMap {
+        http::HeaderMap::new()
+    }
+
+    /// Decodes a successful response from the response headers and body.
+    fn response(_head: &http::response::Parts, body: Bytes) -> Result<Self::Response, String> {
+        Self::Response::decode(body)
+    }
 }
 
 /// Request or response body encoding.
@@ -122,7 +168,7 @@ pub fn fill_route(route: &str, params: &[&str]) -> String {
         }
         if seg.starts_with('{') && seg.ends_with('}') {
             let p = params.next().unwrap_or_else(|| panic!("{route} needs more parameters"));
-            percent_encode(p, &mut out);
+            percent_encode(p.as_bytes(), &mut out);
         } else {
             out.push_str(seg);
         }
@@ -132,9 +178,9 @@ pub fn fill_route(route: &str, params: &[&str]) -> String {
 }
 
 /// Appends `s` to `out`, percent-encoding all bytes except RFC 3986 unreserved characters.
-pub fn percent_encode(s: &str, out: &mut String) {
+pub fn percent_encode(s: &[u8], out: &mut String) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    for b in s.bytes() {
+    for &b in s {
         if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
             out.push(b as char);
         } else {
@@ -156,6 +202,15 @@ pub(crate) fn with_query<Q: Serialize>(mut path: String, query: &Q) -> String {
 
 pub(crate) fn is_false(b: &bool) -> bool {
     !*b
+}
+
+pub(crate) fn is_default<T: Default + PartialEq>(t: &T) -> bool {
+    *t == T::default()
+}
+
+/// Deserializes a present field value, including JSON `null`, as `Some`.
+pub(crate) fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
 }
 
 #[cfg(test)]

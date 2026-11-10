@@ -51,18 +51,21 @@ fn judge(r: &Resp, rejected: &[(u16, &str)]) -> Result<Applied, String> {
 
 async fn one_shot(c: &Client, body: Json, rejected: &[(u16, &str)]) -> Result<Applied, String> {
     let path = format!("{BASE}/txn");
-    let (began, mut ambiguous) = (c.sim.now_ms(), false);
+    let (began, mut ambiguous, mut retried) = (c.sim.now_ms(), false, false);
     loop {
         if ambiguous && !c.dedups(began) {
             return Ok(Applied::Unknown);
         }
         match c.call("POST", &path, Some(body.clone())).await {
             Ok(r) if r.status == 503 && !r.outcome_unknown() || (r.status == 409 && r.code() == "conflict") => {
+                retried = true;
                 c.pause(100).await;
             }
+            // An earlier attempt failed or did not write, which fenced the key.
+            Ok(r) if retried && r.status == 409 && r.code() == "aborted" => return Ok(Applied::No),
             Ok(r) if !r.outcome_unknown() => return judge(&r, rejected),
             _ => {
-                ambiguous = true;
+                (ambiguous, retried) = (true, true);
                 c.pause(ZOMBIE_WAIT_MS).await;
             }
         }
@@ -84,9 +87,8 @@ async fn query_writer_rows(c: &Client, w: i64) -> Result<BTreeMap<i64, Row>, Str
         .collect())
 }
 
-/// Upserts `row` in an interactive transaction, resolving commit ambiguity via
-/// the commit-status endpoint, or from the row itself once the commit record
-/// may have outlived its retention.
+/// Upserts `row` in an interactive transaction.
+/// Resolves commit ambiguity via the commit-status endpoint or by reading the row if the commit record expired.
 async fn interactive(
     c: &Client,
     isolation: &str,

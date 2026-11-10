@@ -99,13 +99,13 @@ fn unloaded_lease_holder_retains_lease() {
         t.put(Bytes::from_static(b"k"), Value::Inline(Bytes::from_static(b"b"))).unwrap();
         assert!(matches!(other.commit(t.into_request()).await, Err(Error::NotOwner { .. })));
         put(&db, "k", "a2").await;
-        let gets = store.gets.lock().unwrap().len();
+        let gets = store.gets.lock().len();
         let v = db.read_version(Consistency::Strong).await.unwrap();
         assert_eq!(
             v.get(b"k", v.read_time()).await.unwrap().map(|e| e.value),
             Some(Value::Inline(Bytes::from_static(b"a2")))
         );
-        assert_eq!(store.gets.lock().unwrap().len(), gets);
+        assert_eq!(store.gets.lock().len(), gets);
         assert!(db.unload());
         assert!(db.release_lease().await.unwrap());
         tokio::time::sleep(Duration::from_millis(1)).await;

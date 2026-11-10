@@ -2,10 +2,9 @@
 
 use super::{Sim, SimConfig, SimResponse, openapi_check};
 use crate::engine::KeyRange;
-use crate::ops::Encoding;
-use crate::table::RangeSpec;
 use crate::table::tuple::Key as TKey;
-use crate::util::{b64, sha256};
+use crate::util::sha256;
+use baserunna_api::{Encoding, RangeSpec, b64};
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{Map, Value as Json, json};
@@ -478,7 +477,8 @@ enum Fail {
     NotFound,
     Exists,
     Precondition,
-    /// The idempotency key was resolved as not applied by an earlier failed precondition.
+    /// The idempotency key was resolved as not applied by an earlier attempt that failed or did not
+    /// write.
     Aborted,
     TooLarge,
     /// Valid request with an in-run TTL whose exact expiry is not modeled.
@@ -1127,7 +1127,7 @@ impl World {
             }
             Op::Scan { prefix, start, end, limit, reverse, keys_only, cursor } => {
                 let limit = limit.unwrap_or(100);
-                if limit == 0 || limit > crate::ops::MAX_SCAN_LIMIT {
+                if limit == 0 || limit > baserunna_api::PAGE_MAX {
                     return Err(Fail::Invalid);
                 }
                 let mut range = user_range(enc, prefix, start, end)?;
@@ -2376,7 +2376,7 @@ struct OpenTxn {
     iso: Iso,
     enc: Encoding,
     alive: bool,
-    /// True if the transaction committed, so subsequent requests return `503` with `outcome: "unknown"`.
+    /// True if the transaction was committed.
     committed: bool,
 }
 
@@ -2603,9 +2603,7 @@ impl<'a> Session<'a> {
                 Err(f) => {
                     let idx = (f == Fail::Precondition).then_some(i);
                     self.expect("POST", &path, bytes, &Expect::Err(f, idx)).await?;
-                    if f == Fail::Precondition {
-                        self.w.abort(key);
-                    }
+                    self.w.abort(key);
                     return Ok(());
                 }
             }
@@ -2613,7 +2611,9 @@ impl<'a> Session<'a> {
         let mut results: Vec<Json> = outs.iter().map(|o| o.json.clone()).collect();
         let r = if !t.is_write() {
             let want = json!({"version": self.w.version, "committed": false, "results": results});
-            self.expect("POST", &path, bytes, &Expect::Ok(200, want)).await?
+            let r = self.expect("POST", &path, bytes, &Expect::Ok(200, want)).await?;
+            self.w.abort(key);
+            r
         } else {
             let firsts = match self.w.stream_outcome(&t) {
                 Ok(f) => f,
@@ -2772,8 +2772,7 @@ impl<'a> Session<'a> {
     }
 
     /// Calls a route on a closed transaction. Verifies that a committed transaction returns `503`
-    /// with `outcome: "unknown"` (SPEC §6.2) and that an uncommitted transaction returns
-    /// `404 txn_not_found`.
+    /// with `outcome: "unknown"` and that an uncommitted transaction returns `404 txn_not_found`.
     async fn call_closed_txn(&self, method: &str, path: &str, body: Vec<u8>, committed: bool) -> Result<(), String> {
         let r = self.send(method, path, &[("content-type", "application/json")], body, committed).await?;
         if committed {
@@ -2823,7 +2822,8 @@ impl<'a> Session<'a> {
         };
         let mut results: Vec<Json> = outs.iter().map(|o| o.json.clone()).collect();
         if !t.is_write() {
-            let want = json!({"version": t.rv, "commit_id": ANY, "appends": [], "results": results});
+            let want =
+                json!({"version": t.rv, "committed": false, "commit_id": ANY, "appends": [], "results": results});
             let r = self.expect("POST", &path, bytes, &Expect::Ok(200, want)).await?;
             self.learn_cursors(&outs, &r.json["results"]);
             return Ok(());
@@ -2836,7 +2836,8 @@ impl<'a> Session<'a> {
         for ((_, r), f) in appended.zip(&firsts[firsts.len().saturating_sub(own)..]) {
             r["first_seq"] = json!(f);
         }
-        let committed = json!({"version": v, "commit_id": ANY, "appends": firsts, "results": results});
+        let committed =
+            json!({"version": v, "committed": true, "commit_id": ANY, "appends": firsts, "results": results});
         match self.w.conflicts(&t, iso) {
             Some(false) => {
                 if let Err(i) = outcome {

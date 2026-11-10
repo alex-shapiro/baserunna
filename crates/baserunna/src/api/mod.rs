@@ -77,6 +77,7 @@ pub fn api_error(e: &Error) -> api::ApiError {
         Error::RateLimited { retry_after_ms, .. } => {
             details(api::ErrorDetails { retry_after_ms: Some(*retry_after_ms), ..api::ErrorDetails::default() })
         }
+        Error::Missing(kind, _) => details(api::ErrorDetails { missing: Some(*kind), ..api::ErrorDetails::default() }),
         _ => None,
     };
     api::ApiError { code: e.api_code(), message: e.message(), retryable: e.retryable(), details }
@@ -120,6 +121,7 @@ fn error_from_api(status: u16, e: api::ApiError) -> Error {
         C::InvalidArgument => Error::InvalidArgument(m),
         C::Unauthenticated => Error::Unauthenticated(m),
         C::PermissionDenied => Error::PermissionDenied(m),
+        C::NotFound if let Some(kind) = d.missing => Error::Missing(kind, m),
         C::NotFound => Error::NotFound(m),
         C::TxnNotFound => Error::TxnNotFound(m),
         C::Conflict => Error::Conflict(m),
@@ -415,8 +417,8 @@ pub(crate) const LONG_POLL_MAX_MS: u64 = 50_000;
 fn finishes_txn(req: &Request) -> bool {
     let route = req.extensions().get::<MatchedPath>().map(MatchedPath::as_str);
     match *req.method() {
-        http::Method::POST => route == Some(data::COMMIT_ROUTE),
-        http::Method::DELETE => route == Some(data::TXN_ROUTE),
+        http::Method::POST => route == Some(api::CommitTxn::ROUTE),
+        http::Method::DELETE => route == Some(api::AbortTxn::ROUTE),
         _ => false,
     }
 }
@@ -738,7 +740,7 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
     scope.extend_from_slice(req.method().as_str().as_bytes());
     scope.push(0);
     scope.extend_from_slice(req.uri().to_string().as_bytes());
-    let key = format!("{id}:{}", crate::util::b64::hex(&crate::util::sha256(&scope)));
+    let key = format!("{id}:{}", api::b64::hex(&crate::util::sha256(&scope)));
     match node.forwards.deliver(&key) {
         Delivery::First(slot) => {
             let (parts, body) = next.run(req).await.into_parts();
@@ -809,16 +811,29 @@ fn snapshot_staleness(query: Option<&str>) -> Option<u64> {
 }
 
 pub fn consistency_of(q: &std::collections::BTreeMap<String, String>) -> Result<Consistency> {
-    match q.get("consistency").map(|s| s.as_str()) {
-        None | Some("strong") => Ok(Consistency::Strong),
-        Some("snapshot") => Ok(Consistency::Snapshot {
-            max_staleness_ms: q
-                .get("max_staleness_ms")
-                .map(|s| s.parse().map_err(|_| Error::invalid("bad max_staleness_ms")))
-                .transpose()?
-                .unwrap_or(5000),
-        }),
-        Some(o) => Err(Error::invalid(format!("unknown consistency {o:?}"))),
+    let c = match q.get("consistency").map(|s| s.as_str()) {
+        None => None,
+        Some("strong") => Some(api::Consistency::Strong),
+        Some("snapshot") => Some(api::Consistency::Snapshot),
+        Some(o) => return Err(Error::invalid(format!("unknown consistency {o:?}"))),
+    };
+    let max_staleness_ms = match c {
+        Some(api::Consistency::Snapshot) => {
+            let ms = q.get("max_staleness_ms");
+            ms.map(|s| s.parse().map_err(|_| Error::invalid("bad max_staleness_ms"))).transpose()?
+        }
+        _ => None,
+    };
+    Ok(consistency_from(c, max_staleness_ms))
+}
+
+/// Converts query parameters into [`Consistency`].
+pub(crate) fn consistency_from(c: Option<api::Consistency>, max_staleness_ms: Option<u64>) -> Consistency {
+    match c {
+        None | Some(api::Consistency::Strong) => Consistency::Strong,
+        Some(api::Consistency::Snapshot) => {
+            Consistency::Snapshot { max_staleness_ms: max_staleness_ms.unwrap_or(5000) }
+        }
     }
 }
 
@@ -828,11 +843,10 @@ pub(crate) enum Ran<T> {
     Replayed(Committed),
 }
 
-/// Executes `$body` in a transaction, retrying on conflict until it is
-/// committed, and evaluates to `(commit_id, Ran)`. If an idempotency key
-/// (`$key`, an `Option<&str>`) is provided, the commit ID is derived from the
-/// key and any previously committed result for that key is replayed without
-/// re-executing (SPEC §6.2).
+/// Executes `$body` in a transaction and evaluates to `(commit_id, Ran)`.
+///
+/// Retries on conflict until the transaction is committed. If `$key` is `Some`, derives the commit
+/// ID from the key and replays any earlier committed result.
 macro_rules! run_txn {
     ($node:expr, $ctx:expr, $isolation:expr, $consistency:expr, $key:expr, |$t:ident| $body:expr) => {{
         let (node_, ctx_, key_): (&crate::node::Node, &crate::api::DbCtx, Option<&str>) = (&$node, &$ctx, $key);
@@ -857,7 +871,9 @@ macro_rules! run_txn {
                         t if !t.needs_revalidation(out_.is_ok() && !t.is_read_only()) => t,
                         t => match ctx_.db.revalidate(t).await? {
                             Some(version) => match out_ {
-                                Ok(out) => break crate::api::Ran::Read { out, version },
+                                Ok(out) => {
+                                    break crate::api::finish_read_only(ctx_, commit_id_, key_, out, version).await?;
+                                }
                                 Err(e) => break crate::api::failed(ctx_, commit_id_, key_, e).await?,
                             },
                             None => {
@@ -881,8 +897,9 @@ macro_rules! run_txn {
 }
 pub(crate) use run_txn;
 
-/// Begins a transaction for [`run_txn!`], starting optimistically for strong
-/// serializable transactions when `optimistic` is true.
+/// Begins a transaction for [`run_txn!`].
+///
+/// Starts optimistically for strong serializable transactions if `optimistic` is true.
 pub(crate) async fn begin_txn(
     ctx: &DbCtx,
     isolation: crate::engine::Isolation,
@@ -916,7 +933,25 @@ pub(crate) async fn earlier_attempt(ctx: &DbCtx, commit_id: u64, key: Option<&st
     }
 }
 
-/// Commits `t` with output `out`, or returns `Ok(None)` when `t` must be retried after a conflict.
+/// Finishes a read-only transaction at `version`.
+///
+/// If `key` is set, resolves `commit_id` in case an earlier attempt was committed concurrently.
+pub(crate) async fn finish_read_only<T>(
+    ctx: &DbCtx,
+    commit_id: u64,
+    key: Option<&str>,
+    out: T,
+    version: u64,
+) -> Result<Ran<T>> {
+    if key.is_some()
+        && let Some(c) = ctx.db.resolve_commit(commit_id).await?
+    {
+        return Ok(Ran::Replayed(c));
+    }
+    Ok(Ran::Read { out, version })
+}
+
+/// Commits `t` with output `out`. Returns `Ok(None)` if `t` must be retried after a conflict.
 pub(crate) async fn finish<T>(
     node: &Node,
     ctx: &DbCtx,
@@ -926,13 +961,13 @@ pub(crate) async fn finish<T>(
     attempt: &mut u32,
 ) -> Result<Option<Ran<T>>> {
     if t.is_read_only() {
-        return Ok(Some(Ran::Read { out, version: t.read_version() }));
+        return finish_read_only(ctx, t.commit_id, key, out, t.read_version()).await.map(Some);
     }
     let commit_id = t.commit_id;
     let mut req = t.into_request();
     req.deadline = Some(ctx.deadline.instant());
     match ctx.db.commit_detailed(req).await {
-        // `replayed` is true only if an earlier request with the same idempotency key committed.
+        // `replayed` is true only if an earlier request with the same idempotency key was committed.
         Ok(c) if c.replayed && key.is_some() => Ok(Some(Ran::Replayed(c))),
         Ok(commit) => Ok(Some(Ran::Committed { out, commit })),
         Err(Error::Conflict(_)) if *attempt < node.cfg.txn_retries => {
@@ -946,22 +981,27 @@ pub(crate) async fn finish<T>(
     }
 }
 
-/// Resolves a failed transaction. If an idempotent request failed a precondition, resolves
-/// the commit to return `Ran::Replayed` if a prior attempt succeeded or to abort any in-flight attempt.
+/// Resolves a failed transaction.
+///
+/// If an idempotent request fails with a non-retryable error, resolves `commit_id`. This replays a
+/// committed attempt or fences an in-flight attempt.
 pub(crate) async fn failed<T>(ctx: &DbCtx, commit_id: u64, key: Option<&str>, e: Error) -> Result<Ran<T>> {
-    match e {
-        Error::PreconditionFailed { .. } if key.is_some() => match ctx.db.resolve_commit(commit_id).await? {
-            Some(c) => {
+    let definitive = !e.retryable() && !matches!(e, Error::Internal(_));
+    if key.is_none() || !definitive {
+        return Err(naming_commit(e, commit_id));
+    }
+    match ctx.db.resolve_commit(commit_id).await? {
+        Some(c) => {
+            if matches!(e, Error::PreconditionFailed { .. }) {
                 probe::hit(Probe::PreconditionExplainedByReplay);
-                Ok(Ran::Replayed(c))
             }
-            None => Err(e),
-        },
-        e => Err(naming_commit(e, commit_id)),
+            Ok(Ran::Replayed(c))
+        }
+        None => Err(e),
     }
 }
 
-/// Attaches `commit_id` to an error with an unknown commit outcome (SPEC §6.2).
+/// Attaches `commit_id` to an error with an unknown commit outcome.
 pub(crate) fn naming_commit(e: Error, commit_id: u64) -> Error {
     match e {
         Error::Unavailable { message, retry_after_ms, outcome_unknown: true } => Error::Unavailable {
@@ -1089,7 +1129,7 @@ async fn limits(State(node): State<Arc<Node>>, _: Req<api::GetLimits>) -> Result
         txn_max_read_bytes: engine_cfg.txn_max_read_bytes as u64,
         txn_max_open_per_user: node.cfg.txns_per_user as u64,
         value_inline_max: engine_cfg.value_inline_max as u64,
-        scan_limit_max: crate::ops::MAX_SCAN_LIMIT as u64,
+        scan_limit_max: api::PAGE_MAX as u64,
         long_poll_max_ms: LONG_POLL_MAX_MS,
         json_value_max: node.cfg.json_value_max,
         json_body_max: node.cfg.max_json_body as u64,
@@ -1123,7 +1163,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .endpoint::<api::GetLimits, _>(limits)
         .merge(account::routes())
         .merge(orgs::routes())
-        .route("/v1/dbs", get(data::list_dbs).post(data::create_db))
+        .route(api::ListDbs::ROUTE, get(data::list_dbs).post(data::create_db))
         .merge(db_routes)
         .merge(internal)
         .merge(crate::console::routes())
@@ -1142,18 +1182,10 @@ pub(crate) use axum::extract::Query as QueryParams;
 
 pub(crate) type Params = QueryParams<std::collections::BTreeMap<String, String>>;
 
-/// Extracts `limit` (default [`PAGE_DEFAULT`](crate::meta::PAGE_DEFAULT), in `1..=PAGE_MAX`) and `cursor` query parameters.
+/// Extracts `limit` and `cursor` query parameters.
 pub(crate) fn paging(q: &Params) -> Result<(usize, Option<String>)> {
-    let max = crate::meta::PAGE_MAX;
-    let limit = match q.get("limit") {
-        None => crate::meta::PAGE_DEFAULT,
-        Some(l) => l
-            .parse()
-            .ok()
-            .filter(|l| (1..=max).contains(l))
-            .ok_or_else(|| Error::invalid(format!("limit must be in 1..={max}")))?,
-    };
-    Ok((limit, q.get("cursor").filter(|c| !c.is_empty()).cloned()))
+    let limit = q.get("limit").map(|l| l.parse().map_err(|_| crate::ops::limit_error())).transpose()?;
+    Ok((crate::ops::page_limit(limit)?, q.get("cursor").filter(|c| !c.is_empty()).cloned()))
 }
 
 /// Extracts `prefix`, `limit`, and `cursor` query parameters.
@@ -1173,9 +1205,9 @@ mod tests {
         rt.block_on(async {
             let app = axum::Router::new()
                 .route("/v1/dbs/{db}/transactions", post(|| async {}))
-                .route(data::TXN_ROUTE, axum::routing::delete(|| async {}))
+                .route(api::AbortTxn::ROUTE, axum::routing::delete(|| async {}))
                 .route("/v1/dbs/{db}/transactions/{id}/ops", post(|| async {}))
-                .route(data::COMMIT_ROUTE, post(|| async {}))
+                .route(api::CommitTxn::ROUTE, post(|| async {}))
                 .route("/v1/dbs/{db}/kv/{*key}", axum::routing::delete(|| async {}))
                 .route_layer(middleware::from_fn(|req: Request, _: Next| async move {
                     super::finishes_txn(&req).to_string().into_response()
@@ -1221,6 +1253,7 @@ mod tests {
             Error::Unavailable { message: m(), retry_after_ms: Some(500), outcome_unknown: true },
             Error::Unavailable { message: m(), retry_after_ms: Some(500), outcome_unknown: false },
             Error::Internal(m()),
+            Error::Missing(api::Missing::Key, m()),
         ];
         for e in &all {
             // Exhaustive match so new `Error` variants must be added to `all`.
@@ -1229,6 +1262,7 @@ mod tests {
                 | Error::Unauthenticated(_)
                 | Error::PermissionDenied(_)
                 | Error::NotFound(_)
+                | Error::Missing(..)
                 | Error::TxnNotFound(_)
                 | Error::Conflict(_)
                 | Error::AlreadyExists(_)

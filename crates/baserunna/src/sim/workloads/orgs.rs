@@ -11,9 +11,10 @@ use super::super::{NetError, Sim};
 use super::steps::{add_member, create_key, create_org, members};
 use super::{cache_expiry, cache_lag, expect};
 use crate::meta::Role;
+use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 struct User {
     c: Client,
@@ -37,7 +38,7 @@ fn tag(role: Option<Role>) -> String {
     role.map_or_else(|| "outsider".into(), |r| wire(r).as_str().unwrap_or("?").to_string())
 }
 
-/// Expected HTTP status for a request requiring `can` when made with `role`.
+/// Expected HTTP status for a request that requires `can` and is sent with `role`.
 fn answer(role: Option<Role>, can: impl Fn(Role) -> bool, granted: u16) -> u16 {
     match role {
         None => 404,
@@ -46,7 +47,7 @@ fn answer(role: Option<Role>, can: impl Fn(Role) -> bool, granted: u16) -> u16 {
     }
 }
 
-/// Sets `u`'s role in `org` (`None` removes membership).
+/// Sets `u`'s role in `org`. Passing `None` removes membership.
 async fn set_role(by: &Client, org: &str, u: &User, role: Option<Role>) -> Result<(), String> {
     let current = members(by, org).await?.get(&u.id).copied();
     if current == role {
@@ -155,7 +156,9 @@ async fn permissions(sim: &Arc<Sim>, owner: &User, u: &User, other: &User) -> Re
             let want = if role == Some(Role::Owner) { 201 } else { 403 };
             expect(r.status == want || (ambiguous && r.status == 409), format!("{tag}: add an owner {}", r.status))?;
             set_role(&owner.c, "acme", other, None).await?;
-            let r = u.c.call_retry("POST", &member(owner), Some(json!({"role": "reader"}))).await;
+            // Wait for any lost attempt to time out so a late retry does not overwrite the
+            // role restoration below.
+            let r = u.c.call_settled("POST", &member(owner), Some(json!({"role": "reader"}))).await;
             let want = if role == Some(Role::Owner) { 200 } else { 403 };
             expect(r.status == want, format!("{tag}: demote the owner {}", r.status))?;
             if role == Some(Role::Owner) {
@@ -219,7 +222,7 @@ struct Attempt {
     key: String,
     start: u64,
     end: u64,
-    /// 0 when the outcome is unknown.
+    /// 0 if the outcome is unknown.
     status: u16,
 }
 
@@ -228,11 +231,11 @@ async fn role_changes(sim: &Arc<Sim>, owner: &User, others: &[User; 3]) -> Resul
     cache_expiry(sim).await;
     let history: Arc<Mutex<Vec<History>>> = Arc::default();
     let change = |i: usize, sent: u64, role: Option<Role>| {
-        history.lock().unwrap_or_else(|e| e.into_inner())[i].0.push((sent, sim.now_ms(), role));
+        history.lock()[i].0.push((sent, sim.now_ms(), role));
     };
     for (i, u) in others.iter().enumerate() {
         let current = members(&owner.c, "acme").await?.get(&u.id).copied();
-        history.lock().unwrap_or_else(|e| e.into_inner()).push(History(vec![(0, 0, current)]));
+        history.lock().push(History(vec![(0, 0, current)]));
         let sent = sim.now_ms();
         set_role(&owner.c, "acme", u, Some(Role::Writer)).await?;
         change(i, sent, Some(Role::Writer));
@@ -255,7 +258,7 @@ async fn role_changes(sim: &Arc<Sim>, owner: &User, others: &[User; 3]) -> Resul
                     Err(_) => 0,
                 };
                 let a = Attempt { user: i, key, start, end: sim.now_ms(), status };
-                attempts.lock().unwrap_or_else(|e| e.into_inner()).push(a);
+                attempts.lock().push(a);
                 sim.sleep(50 + sim.rand_below(300)).await;
             }
         }));
@@ -277,7 +280,7 @@ async fn role_changes(sim: &Arc<Sim>, owner: &User, others: &[User; 3]) -> Resul
     }
     let decided = |a: &Attempt| matches!(a.status, 200 | 403 | 404);
     let until = sim.now_ms() + 60_000;
-    while sim.now_ms() < until && !attempts.lock().unwrap_or_else(|e| e.into_inner()).iter().any(decided) {
+    while sim.now_ms() < until && !attempts.lock().iter().any(decided) {
         sim.sleep(500).await;
     }
     done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -285,21 +288,21 @@ async fn role_changes(sim: &Arc<Sim>, owner: &User, others: &[User; 3]) -> Resul
         w.await.map_err(|e| format!("writer panicked: {e}"))?;
     }
     sim.sleep(ZOMBIE_WAIT_MS).await;
-    let history = std::mem::take(&mut *history.lock().unwrap_or_else(|e| e.into_inner()));
-    let attempts = std::mem::take(&mut *attempts.lock().unwrap_or_else(|e| e.into_inner()));
+    let history = std::mem::take(&mut *history.lock());
+    let attempts = std::mem::take(&mut *attempts.lock());
     check_attempts(&history, &attempts, cache_lag(sim))?;
     let items = owner.c.paginate("/v1/dbs/acme.main/kv?prefix=w&keys_only=true&limit=1000", "items").await?;
     let stored: std::collections::BTreeSet<&str> = items.iter().filter_map(|i| i["key"].as_str()).collect();
     for a in &attempts {
         match a.status {
             200 => expect(stored.contains(a.key.as_str()), format!("acknowledged write {} lost", a.key))?,
-            403 | 404 => expect(!stored.contains(a.key.as_str()), format!("refused write {} applied", a.key))?,
+            403 | 404 => expect(!stored.contains(a.key.as_str()), format!("rejected write {} was applied", a.key))?,
             _ => {}
         }
     }
     let granted = attempts.iter().filter(|a| a.status == 200).count();
-    let refused = attempts.iter().filter(|a| a.status == 403 || a.status == 404).count();
-    expect(granted + refused > 0, format!("expected at least 1 decision, got {granted} granted, {refused} refused"))
+    let rejected = attempts.iter().filter(|a| a.status == 403 || a.status == 404).count();
+    expect(granted + rejected > 0, format!("expected at least 1 decision, got {granted} granted, {rejected} rejected"))
 }
 
 /// Verifies that each write response matches a role held within `lag` before

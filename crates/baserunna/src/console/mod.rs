@@ -14,12 +14,13 @@ use crate::api::{ClientAddr, SESSION_COOKIE, cookie};
 use crate::auth;
 use crate::meta::SignInMethod;
 use crate::node::Node;
-use crate::util::{b64, hmac_sha256};
+use crate::util::hmac_sha256;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Form, FromRequest, FromRequestParts, Query, Request, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
+use baserunna_api::b64;
 use http::StatusCode;
 use serde::de::DeserializeOwned;
 use serde_json::{Value as Json, json};
@@ -365,7 +366,7 @@ struct Pager {
 
 impl Pager {
     fn of(q: &Fields, param: &'static str) -> Pager {
-        let max = crate::meta::PAGE_MAX;
+        let max = baserunna_api::PAGE_MAX;
         let limit = q.get("limit").and_then(|l| l.parse().ok()).filter(|l| (1..=max).contains(l)).unwrap_or(PAGE);
         Pager { limit, param, cursor: q.get(param).filter(|c| !c.is_empty()).cloned() }
     }

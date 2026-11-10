@@ -12,7 +12,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-static ERRS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static ERRS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
 const EVS: [&str; 10] = [
     "a",
     "b",
@@ -150,7 +150,7 @@ pub(super) async fn create_db(eng: &Arc<Engine>, id: &str) -> Arc<Db> {
     db.open(true).await.unwrap();
     txn_do(&db, async |t| create(t, &table_def()).await).await.unwrap();
     for (name, key_ty) in [("people", "string"), ("nums", "int")] {
-        let tdef: crate::table::CreateTable = serde_json::from_value(json!({"name": name,
+        let tdef: baserunna_api::NewTable = serde_json::from_value(json!({"name": name,
             "columns": [{"name": "id", "type": key_ty}, {"name": "plan", "type": "string"},
                 {"name": "score", "type": "float"}, {"name": "meta", "type": "json"}],
             "primary_key": ["id"]}))
@@ -593,7 +593,7 @@ async fn compare(a: &Arc<Db>, b: &Arc<Db>, q: &Json) -> std::result::Result<bool
         let (oa, ob) = match (ra, rb) {
             (Ok(x), Ok(y)) => (x, y),
             (Err(x), Err(y)) if x.to_string() == y.to_string() => {
-                ERRS.lock().unwrap().push(x.to_string());
+                ERRS.lock().push(x.to_string());
                 return Ok(false);
             }
             (x, y) => {
@@ -852,7 +852,7 @@ fn diff_unsealed_and_sealed_queries() {
         eprintln!("FAIL {}\n", &f[..f.len().min(3000)]);
     }
     assert!(fails.is_empty(), "{} failing seeds; {answered} answered", fails.len());
-    let mut errs = ERRS.lock().unwrap().clone();
+    let mut errs = ERRS.lock().clone();
     errs.sort();
     errs.dedup_by(|a, b| a[..a.len().min(40)] == b[..b.len().min(40)]);
     eprintln!("answered {answered}; errors {:?}", errs);

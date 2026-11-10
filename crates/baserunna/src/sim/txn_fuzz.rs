@@ -2376,7 +2376,7 @@ struct OpenTxn {
     iso: Iso,
     enc: Encoding,
     alive: bool,
-    /// True if the transaction committed, so subsequent requests return `503` with `outcome: "unknown"`.
+    /// True if the transaction was committed.
     committed: bool,
 }
 
@@ -2772,8 +2772,7 @@ impl<'a> Session<'a> {
     }
 
     /// Calls a route on a closed transaction. Verifies that a committed transaction returns `503`
-    /// with `outcome: "unknown"` (SPEC §6.2) and that an uncommitted transaction returns
-    /// `404 txn_not_found`.
+    /// with `outcome: "unknown"` and that an uncommitted transaction returns `404 txn_not_found`.
     async fn call_closed_txn(&self, method: &str, path: &str, body: Vec<u8>, committed: bool) -> Result<(), String> {
         let r = self.send(method, path, &[("content-type", "application/json")], body, committed).await?;
         if committed {

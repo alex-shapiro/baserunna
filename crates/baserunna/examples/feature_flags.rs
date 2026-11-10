@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gone = app_db.get_value("override/search.semantic", None).await?;
     println!(
         "    after 1.6 s: {}",
-        if gone.is_none() { "expired, the flag's own value applies again" } else { "still there?!" }
+        if gone.is_none() { "expired, the default flag value is used again" } else { "still there?!" }
     );
 
     step(8, "App servers follow flag changes with a long poll");

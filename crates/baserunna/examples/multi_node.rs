@@ -35,7 +35,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = |i: usize| Client::new(HttpTransport::new(&nodes[i].as_ref().unwrap().url));
     let token = client(0).sign_up("sre@example.com", "pager-duty-1").await?.token;
     let clients: Vec<Client> = (0..3).map(|i| client(i).with_token(&token)).collect();
-    tokio::time::sleep(Duration::from_millis(1500)).await; // let heartbeats spread membership
+    // Wait for heartbeats to share cluster membership.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     step(2, "Create databases through different nodes; write via any node");
     for i in 0..6 {

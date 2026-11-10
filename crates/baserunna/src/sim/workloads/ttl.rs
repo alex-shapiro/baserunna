@@ -409,9 +409,9 @@ async fn take_and_renew(c: &Client, me: &str, out: &Mutex<Vec<LockWrite>>) -> Re
     Ok(())
 }
 
-/// Verifies that in version order, each acquisition is committed at or after
-/// the previous lock's expiry, and each renewal is committed before the lock it read
-/// expired.
+/// Verifies that each lock acquisition in version order is committed at or after
+/// the previous lock's expiry. Also checks that each renewal is committed before
+/// the lock it read expired.
 fn check_locks(writes: &[LockWrite]) -> Result<(), String> {
     let mut sorted = writes.to_vec();
     sorted.sort();

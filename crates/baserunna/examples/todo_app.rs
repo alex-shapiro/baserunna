@@ -1,8 +1,8 @@
 //! Multi-user todo service example.
 //!
-//! Each user gets an isolated database with a `todos` table, a secondary index
-//! for open tasks by due date, JSON tags, filters, pagination, and bulk row
-//! updates and deletes.
+//! Each user gets an isolated database with a `todos` table and a secondary
+//! index on `(done, due)`. Queries filter by JSON tags and paginate through
+//! index ranges. Transactions update and delete matching rows in bulk.
 //!
 //! Run: `cargo run --example todo_app`
 

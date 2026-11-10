@@ -1,4 +1,4 @@
-//! HTTP routes for streams (SPEC §4.6, §10).
+//! HTTP routes for streams.
 
 use super::data::{
     PathMap, bool_param, commit_hex, content_type, encoding_param, idempotency_header, one_idempotency_key, param,
@@ -31,7 +31,7 @@ type J = axum::Json<Json>;
 
 pub(super) const EVENTS_WAIT_MAX_MS: u64 = 300_000;
 const KEEPALIVE: Duration = Duration::from_secs(15);
-/// Consumers stream info lists; the consumers route pages through the rest.
+/// Maximum number of consumers returned by `GET /v1/dbs/{db}/streams/{s}`.
 const INFO_CONSUMERS: usize = 100;
 
 pub fn routes() -> Router<Arc<Node>> {
@@ -207,7 +207,7 @@ async fn append(
     }
 }
 
-/// The answer to an append, from the commit that applied it.
+/// Builds the HTTP response for a committed or replayed append.
 fn appended(c: &Committed, replayed: bool, commit_id: u64) -> Result<Response> {
     let [a] = c.appends[..] else {
         return Err(Error::invalid("the idempotency key was used by a request other than an append"));
@@ -259,11 +259,10 @@ impl Found for ReadOut {
     }
 }
 
-/// The parameters a read takes besides those of its [`ReadSpec`].
+/// Query parameters handled outside [`ReadSpec`].
 const READ_PARAMS: [&str; 5] = ["format", "wait_ms", "encoding", "consistency", "max_staleness_ms"];
 
-/// The read a query string describes, every parameter not in
-/// [`READ_PARAMS`] being a field of [`ReadSpec`].
+/// Deserializes [`ReadSpec`] from the query parameters outside [`READ_PARAMS`].
 fn read_spec(q: &Params) -> Result<ReadSpec> {
     let fields: Vec<(&String, &String)> = q.iter().filter(|(k, _)| !READ_PARAMS.contains(&k.as_str())).collect();
     let query = serde_urlencoded::to_string(fields).map_err(|e| Error::internal(e.to_string()))?;
@@ -325,7 +324,7 @@ async fn read(
     Ok(axum::Json(record_page(&out, enc, v)).into_response())
 }
 
-/// `spec` without where it starts.
+/// Clears the starting position fields of `spec`.
 fn starting_anywhere(spec: ReadSpec) -> ReadSpec {
     ReadSpec { from_seq: None, from_time: None, tail: None, consumer: None, ..spec }
 }
@@ -341,7 +340,7 @@ fn record_page(out: &ReadOut, enc: Encoding, version: u64) -> api::RecordPage {
     }
 }
 
-/// A response body fed by a task, chunk by chunk.
+/// Streaming HTTP response body backed by a channel.
 struct ChannelBody(tokio::sync::mpsc::Receiver<Bytes>);
 
 impl http_body::Body for ChannelBody {
@@ -366,10 +365,10 @@ struct Follow {
     wait: Duration,
 }
 
-/// Serves a forward read as server-sent events, starting with `first`, its
-/// first page: records as they are appended for up to `f.wait`, until
-/// `limit` records or the end of the read's range, or until the node drains
-/// (the client resumes elsewhere with `Last-Event-ID`).
+/// Streams a forward read as server-sent events starting from `first`.
+///
+/// Sends new records for up to `f.wait` until the read reaches `limit`, reaches the end of its
+/// range, or the node starts draining.
 fn events(node: Arc<Node>, f: Follow, spec: ReadSpec, first: (ReadOut, u64)) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
     let env = node.env.clone();

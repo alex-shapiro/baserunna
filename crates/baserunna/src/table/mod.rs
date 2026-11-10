@@ -266,11 +266,10 @@ macro_rules! retrying_txn {
     }};
 }
 
-/// Add an index to `table` in batched background transactions without blocking row writes.
+/// Adds an index to `table` in batched background transactions.
 ///
-/// Resumes an interrupted build if an identical `building` index already exists.
-/// If a unique index encounters duplicate values during backfill, the index is
-/// removed and `AlreadyExists` is returned.
+/// Resumes an interrupted build if an identical `building` index already exists. If a unique index
+/// has duplicate values during backfill, removes the index and returns `AlreadyExists`.
 pub async fn add_index(db: &Arc<Db>, table: &str, spec: &api::NewIndex, opts: Backfill) -> Result<(TableSchema, Seq)> {
     let (idx, _) = retrying_txn!(db, |t| begin_index(t, table, spec).await);
     match backfill(db, table, &idx, opts).await {
@@ -869,7 +868,7 @@ async fn all_rows(txn: &mut Txn, s: &TableSchema) -> Result<Vec<(Bytes, Vec<Key>
     Ok(out)
 }
 
-/// Row filter (SPEC §4.7) over table columns (`{"col": name, "op": ..}`).
+/// Row filter over table columns.
 pub type Filter = filter::Filter<Col>;
 
 #[derive(Debug, Clone, PartialEq)]

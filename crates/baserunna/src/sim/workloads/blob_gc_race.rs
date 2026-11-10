@@ -1,7 +1,8 @@
 //! Blob reads racing GC with grace periods shorter than a download. Writers
 //! overwrite and delete blobs while readers stream full and ranged reads by key
-//! and by ID. Reads that lose the race must fail with a broken stream, 404, or
-//! 503—never wrong bytes—and a final GC cycle must preserve every referenced blob.
+//! and by ID. Reads that lose the race must return the expected bytes or fail
+//! with a broken stream, 404, or 503. A final GC cycle must preserve every
+//! referenced blob.
 
 use super::super::client::{Client, ZOMBIE_WAIT_MS};
 use super::super::{Sim, SimConfig};

@@ -370,7 +370,7 @@ Event tables store append-mostly, timestamped records in columnar parts and exec
   ```
 
 - **Deletes**: `POST /v1/dbs/{db}/events/{t}/rows/delete` (or `delete_events` in `/txn`) transactionally removes events matching a filter within `[from, to)`. If a delete produces a mask larger than the per-partition limit, the request fails with `413` so the caller can delete narrower time ranges. Masked rows are physically purged from object storage within roughly 26 hours on active databases: background maintenance rewrites parts whose oldest deletion exceeds `event_purge_ms` (24 hours), and garbage collection removes the replaced part objects 30 minutes later (§5.8). Events deleted while still unsealed in the LSM tree become standard LSM tombstones and are reclaimed during segment compaction.
-- **Retention**: If `retention_ms` is configured on an event table, queries exclude events older than `store_clock - retention_ms`. Background maintenance drops parts whose `max_time` is older than that cutoff (§5.8). If the node does not have a valid store-clock measurement, queries fail with `503` and background drops are paused.
+- **Retention**: If `retention_ms` is configured on an event table, queries exclude events older than `store_clock - retention_ms`. Background maintenance drops parts whose `max_time` is older than that cutoff (§5.8). If the node does not have a valid store-clock measurement, it rejects queries with `503` and pauses background drops.
 - **Dropping tables**: Dropping an event table executes in constant time by writing range tombstones over the table's unsealed rows and part references without scanning existing parts, avoiding conflicts with concurrent inserts or merges. Unreferenced part objects are reclaimed asynchronously by the orphan sweep (§5.8).
 - **Quotas**: Unsealed event bytes and referenced part bytes count toward the database size quota (§5.10), and total event part storage per database is capped at 1 TiB. Background seals, merges, deletes, and retention drops bypass quota checks so a full database can still compact and free space. Sealing unsealed events creates at least one ~330-byte part per partition, which can increase accounted size if events are sparsely distributed across many partitions.
 
@@ -864,12 +864,12 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
    `results: null`, and the `appends` sequence numbers from the commit record. If
    an idempotent write request fails or does not modify data, it may have
    observed writes from an earlier attempt with the same key. Before responding,
-   the server checks the commit record (§5.5) and returns the replayed result if
-   an earlier attempt committed. Otherwise, the server writes an abort record to
-   reject any in-flight attempt. It then returns the error or
-   `committed: false`. Later retries with the same key fail with `409 aborted`.
-   Read-only requests ignore idempotency keys. The server automatically retries
-   read-only conflicts.
+   the server checks the commit record (§5.5). It returns the replayed result if
+   an earlier attempt was committed. Otherwise, the server writes an abort record
+   to reject any in-flight attempt. It then returns the error or
+   `committed: false`. The server rejects later retries with the same key with
+   `409 aborted`. Read-only requests ignore idempotency keys. The server
+   automatically retries read-only conflicts.
 2. **Interactive** (`/v1/dbs/{db}/transactions…`): executes across `begin`,
    `ops`, `commit`, and `abort` requests. `begin` and `commit` also accept `ops`,
    so a client can complete a read-write transaction in two requests. `begin`
@@ -880,7 +880,7 @@ Dropping an event table writes range tombstones over the table's unsealed rows a
    validate its read set. The database's owner node stores transaction state in
    memory. If an `ops` request fails or is canceled, if the owner changes or
    crashes, or if the transaction is evicted for timeout or memory pressure
-   (§5.12), the node discards uncommitted writes and returns a retryable
+   (§5.12), the node discards uncommitted writes. It returns a retryable
    `404 txn_not_found` with the abort reason. Once a node starts committing a
    transaction, it caches the commit ID for `txn_max_lifetime` unless the commit
    fails before being applied. The node returns `503` with `outcome: "unknown"`
@@ -969,9 +969,9 @@ on the request, every key and value in the request and response is standard base
 
 Change feeds stream modified keys at `GET /v1/dbs/{db}/changes?after=…` or table rows at `GET /v1/dbs/{db}/tables/{t}/changes`. Applying pages in order reconstructs the current state. Key change feeds accept an optional `prefix` or `start` and `end` range. For each key modified after the `after` cursor, a page reports the key's latest state in the page snapshot: its current value, `deleted` for deleted or expired keys, or a `deleted_range` entry for a large range deletion. Live entries include `expires_at` if a TTL is set. Intermediate values are omitted. Changes are ordered by version, with range deletions before key entries at the same version. Each page returns up to `limit` changes and a `next_cursor` to pass as the next `after` parameter. If `more` is true, additional changes are immediately available.
 
-If a poll finds 0 changes and `wait_ms` is set, the request waits up to 50 s until the node installs a newer version or the timeout expires. A node installs a newer version either by committing locally or by receiving a commit notice from another node. After committing a new data version, a node sends a best-effort `/internal/v1/notice` request with the latest version to the database's rendezvous home node (§7). The sender coalesces concurrent notices so at most 1 request is in flight per database. If the home node has active waiters, it reloads the manifest and wakes them. While waiting without a wakeup, a `strong` read re-checks the manifest every `watch_poll_ms`. A `snapshot` read re-checks the manifest only after its cached snapshot exceeds `max_staleness_ms`.
+If a poll finds 0 changes and `wait_ms` is set, the node waits up to 50 s for a newer version. A node installs a newer version either by committing locally or by receiving a commit notice from another node. After committing a new data version, a node sends a best-effort `/internal/v1/notice` request with the latest version to the database's rendezvous home node (§7). The sender coalesces concurrent notices so at most 1 request is in flight per database. If the home node has active waiters, it reloads the manifest and wakes them. While waiting without a wakeup, a `strong` read re-checks the manifest every `watch_poll_ms`. A `snapshot` read re-checks the manifest only after its cached snapshot exceeds `max_staleness_ms`.
 
-To compute a page in `Version::changes`, the engine merges only the `tail` and segments with `max_seq` at or above the cursor version. Because compaction retains tombstones for at least `txn_max_lifetime` after they become visible (§5.6), a cursor remains valid for at least `txn_max_lifetime` after the snapshot of its oldest page. If tombstones needed by the cursor have been purged, the request fails with `410 cursor_expired` and the client must resynchronize. A client can resynchronize by starting from `after=0` to perform a full state transfer of all live keys. A reader starting from version 0 holds only keys returned by earlier pages of that transfer, so it requires only tombstones newer than the oldest snapshot version read during the transfer. The cursor records that version as a floor so that purging older tombstones does not expire an in-progress transfer.
+To compute a page in `Version::changes`, the engine merges only the `tail` and segments with `max_seq` at or above the cursor version. Because compaction retains tombstones for at least `txn_max_lifetime` after they become visible (§5.6), a cursor remains valid for at least `txn_max_lifetime` after the snapshot of its oldest page. If compaction has purged tombstones needed by the cursor, the server returns `410 cursor_expired`. The client must then resynchronize. A client can resynchronize by starting from `after=0` to perform a full state transfer of all live keys. A reader starting from version 0 holds only keys returned by earlier pages of that transfer. It therefore requires only tombstones newer than the oldest snapshot version read during the transfer. The cursor records that version as a floor so that purging older tombstones does not expire an in-progress transfer.
 
 ## 7. Cluster
 
@@ -1233,10 +1233,10 @@ recreate a purged database.
 The API is JSON over HTTP. All routes are under `/v1`. The full schema is in
 `openapi.json` (OpenAPI 3.1, generated by `crates/baserunna/src/api/openapi.rs`), served at `GET /v1/openapi.json`.
 
-`baserunna-api` defines `Endpoint`, request, and response types for the HTTP API, along with
-transaction operation and result types. `Router::endpoint` binds a route handler only if its
-request and response types match the `Endpoint`. Response types ignore unknown fields so that
-clients remain compatible with newer servers.
+`baserunna-api` defines `Endpoint`, request, response, and transaction operation types for the
+HTTP API. `Router::endpoint` binds a route handler only if its request and response types match
+the `Endpoint`. Response types ignore unknown fields so that clients remain compatible with newer
+servers.
 
 DB-scoped routes take `{db}`, a reference: `name` (a database of the caller's),
 `org.name` (an organization's), or `id:<db_id>` (administrators).

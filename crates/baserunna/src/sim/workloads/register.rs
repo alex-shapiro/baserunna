@@ -105,7 +105,7 @@ enum ReadKind {
     Interactive { write: bool },
 }
 
-/// Reads `r{key}` via `kind` and returns `(version, value)` (or `(0, "")` if not found).
+/// Reads `r{key}` via `kind` and returns `(version, value)`, or `(0, "")` if not found.
 async fn read_once(c: &Client, db: &str, key: usize, kind: ReadKind) -> Option<(u64, String)> {
     match kind {
         ReadKind::Get | ReadKind::LocalGet => {

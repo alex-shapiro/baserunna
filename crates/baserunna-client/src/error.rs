@@ -101,8 +101,7 @@ impl Error {
             || timed_out
     }
 
-    /// Shifts `op_index` back by `n` queued operations, or clears it if it points into the first
-    /// `n`.
+    /// Subtracts `n` from `op_index`, or clears `op_index` if it is less than `n`.
     pub(crate) fn without_ops(self, n: usize) -> Error {
         match self {
             Error::Api { status, mut error, retry_after_ms } => {

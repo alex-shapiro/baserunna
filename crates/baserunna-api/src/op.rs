@@ -80,7 +80,7 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         value: Option<String>,
     },
-    /// Adds `by` to the base-10 integer at `key`, treating an absent key as 0.
+    /// Adds `by` to the base-10 integer at `key`. Treats an absent key as 0.
     Increment {
         key: String,
         #[serde(default = "default_increment")]
@@ -292,7 +292,7 @@ pub struct ReadStream {
     pub until_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_time: Option<u64>,
-    /// Reads backward from the end of the range, returning the newest records first.
+    /// Reads backward from the end of the range, newest records first.
     #[serde(default, skip_serializing_if = "is_false")]
     pub reverse: bool,
     /// Maximum number of records, defaulting to 100 and at most [`PAGE_MAX`].
@@ -315,21 +315,21 @@ pub struct QueryEvents {
 }
 
 impl Serialize for QueryEvents {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        let mut m = s.serialize_map(Some(self.query.len() + 1))?;
-        m.serialize_entry("table", &self.table)?;
-        for (k, v) in &self.query {
-            m.serialize_entry(k, v)?;
+        let mut map = serializer.serialize_map(Some(self.query.len() + 1))?;
+        map.serialize_entry("table", &self.table)?;
+        for (key, val) in &self.query {
+            map.serialize_entry(key, val)?;
         }
-        m.end()
+        map.end()
     }
 }
 
 impl<'de> Deserialize<'de> for QueryEvents {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<QueryEvents, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<QueryEvents, D::Error> {
         use serde::de::Error;
-        let mut query = serde_json::Map::deserialize(d)?;
+        let mut query = serde_json::Map::deserialize(deserializer)?;
         let table = query.remove("table").ok_or_else(|| D::Error::missing_field("table"))?;
         Ok(QueryEvents { table: serde_json::from_value(table).map_err(D::Error::custom)?, query })
     }
@@ -365,17 +365,17 @@ pub enum OpResult {
 
 impl OpResult {
     pub fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, String> {
-        let r = match self {
-            OpResult::Raw(r) => serde_json::from_str(r.get()),
+        let parsed = match self {
+            OpResult::Raw(raw) => serde_json::from_str(raw.get()),
             other => serde_json::to_value(other).and_then(serde_json::from_value),
         };
-        r.map_err(|e| e.to_string())
+        parsed.map_err(|err| err.to_string())
     }
 }
 
 impl<'de> Deserialize<'de> for OpResult {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<OpResult, D::Error> {
-        Box::<RawValue>::deserialize(d).map(OpResult::Raw)
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<OpResult, D::Error> {
+        Box::<RawValue>::deserialize(deserializer).map(OpResult::Raw)
     }
 }
 

@@ -131,7 +131,7 @@ pub enum ColumnType {
     /// Binary value encoded as base64 in JSON.
     Bytes,
     Json,
-    /// Binary value stored out of band, written as a staged `blob_id` and read as blob metadata.
+    /// Binary value stored out of band. Written as a staged `blob_id` and read as blob metadata.
     Blob,
     /// Type added by a newer server.
     #[serde(other)]

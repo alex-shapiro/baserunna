@@ -697,7 +697,7 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
     }
 }
 
-/// Adds the first seq each append received to the results of its op.
+/// Sets `first_seq` on each [`OpResult::Append`] from `appends`.
 pub fn fill_appends(ops: &[Op], results: &mut [OpResult], appends: &[Appended]) {
     let appended = ops.iter().zip(results.iter_mut()).filter(|(o, _)| matches!(o, Op::Append { .. }));
     for ((_, r), a) in appended.zip(appends) {

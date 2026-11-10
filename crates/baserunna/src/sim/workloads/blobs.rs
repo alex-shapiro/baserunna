@@ -1,6 +1,7 @@
-//! Out-of-band blob storage via raw PUT, staged upload with transactional bind,
-//! and blob table columns, verified with full and ranged reads and followed by
-//! a full GC cycle.
+//! Simulation workload for out-of-band blob storage.
+//!
+//! Writes blobs via raw PUTs, staged uploads bound in transactions, and blob
+//! table columns. Verifies full and ranged reads, then runs a full GC cycle.
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
@@ -228,7 +229,7 @@ pub async fn run(sim: Arc<Sim>, rounds: usize, chaos: bool) -> Result<(), String
     verify(&c, base, &kv, &rows, &mut rng).await
 }
 
-/// Stages `data` and binds it using `bind`, re-staging if retries exceed the staging TTL.
+/// Stages `data` and binds it using `bind`. Re-stages `data` if retries exceed the staging TTL.
 async fn stage_and_bind(
     c: &Client,
     base: &str,

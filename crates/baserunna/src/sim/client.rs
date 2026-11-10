@@ -48,7 +48,7 @@ pub struct Client {
 /// Result of a commit status query.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
-    /// The commit was applied; contains the status response payload.
+    /// The commit was applied with the given status response.
     Committed(Json),
     NotCommitted,
     /// The commit record retention window may have elapsed, so the outcome is indeterminate.
@@ -240,9 +240,9 @@ impl Client {
         panic!("{}: {method} {path} never succeeded", self.name);
     }
 
-    /// Retries a request until it receives a definitive response, waiting out
-    /// in-flight attempts after any ambiguous failure. The boolean indicates
-    /// whether an earlier attempt may have already taken effect.
+    /// Retries a request until it receives a definitive response. Waits out
+    /// in-flight attempts after an ambiguous failure. The boolean indicates
+    /// whether an earlier attempt may have been applied.
     pub async fn settle(&self, method: &str, path: &str, body: Option<Json>) -> Result<(Resp, bool), String> {
         let mut ambiguous = false;
         for _ in 0..400 {
@@ -265,8 +265,7 @@ impl Client {
         }
     }
 
-    /// Queries and fences the status of commit `id` (a commit ID or `key:<idempotency_key>`)
-    /// in `db` that was first attempted at `began` (SPEC §6.2).
+    /// Queries and fences the status of commit `id` in `db` for a write started at `began`.
     pub async fn commit_status(&self, db: &str, id: &str, began: u64) -> Result<Status, String> {
         let r = self.call_retry("GET", &format!("/v1/dbs/{db}/commits/{id}"), None).await;
         match r.json["status"].as_str() {
@@ -283,14 +282,14 @@ impl Client {
         }
     }
 
-    /// Fences commit `id` in `db` so that subsequent attempts cannot be applied (SPEC §6.2).
+    /// Fences commit `id` in `db` so that later attempts cannot be applied.
     pub async fn fence(&self, db: &str, id: &str) -> Result<(), String> {
         self.commit_status(db, id, 0).await.map(|_| ())
     }
 
-    /// Determines whether an ambiguous commit `id` in `db` (first attempted at `began`)
-    /// was applied. Checks the fenced commit status first, and falls back to reading
-    /// `marker` if the commit retention window has elapsed.
+    /// Determines whether an ambiguous commit `id` in `db` started at `began` was applied.
+    /// Checks the fenced commit status first. Reads `marker` if the commit retention window
+    /// has elapsed.
     pub async fn resolve(&self, db: &str, id: &str, began: u64, marker: &str) -> Result<bool, String> {
         match self.commit_status(db, id, began).await? {
             Status::Committed(_) => Ok(true),

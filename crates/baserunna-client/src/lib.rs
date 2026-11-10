@@ -137,10 +137,10 @@ impl Client {
 
     /// Sends a request to endpoint `E`.
     ///
-    /// Transient failures are retried if the request is idempotent or was not applied. If an
-    /// attempt fails with [`api::Outcome::Unknown`] and a later attempt fails with
-    /// [`api::Outcome::NotApplied`], this method returns the earlier error unless the server
-    /// fenced earlier attempts with `precondition_failed` or `aborted`.
+    /// Transient failures are retried if the request is idempotent or was not applied. If a
+    /// retry fails with [`api::Outcome::NotApplied`] after an [`api::Outcome::Unknown`] error,
+    /// this method returns the earlier error. It returns the final error if the server fenced
+    /// earlier attempts with `precondition_failed` or `aborted`.
     pub async fn send<E: Endpoint>(&self, endpoint: &E, body: &E::Body) -> Result<E::Response, Error> {
         let r = self.attempts(endpoint, body, None).await.map_err(|f| f.error)?;
         Ok(r.expect("response is present"))

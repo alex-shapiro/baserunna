@@ -73,8 +73,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initech_key = list.api_keys.iter().find(|k| k.name == "initech-service").unwrap();
     ops.delete_api_key(&initech_key.id).await?;
     ops.db("tenant-initech").delete().await?;
-    // Revocation is immediate on the handling node and propagates to other
-    // nodes within the credential cache TTL.
+    // The handling node revokes the key immediately. Other nodes drop the key
+    // when their credential caches expire.
     let err = keys[2].db("tenant-initech").read_one(Op::get("settings/plan")).await.unwrap_err();
     println!("    offboarded tenant's service: {err}");
     println!("    remaining: {:?}", db_names(&ops).await?);

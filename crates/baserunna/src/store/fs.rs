@@ -1,8 +1,7 @@
 //! Local filesystem object store for single-node development.
 //!
-//! Each object is a file prefixed with a 16-byte random etag. Writes rename a
-//! temporary file into place under a store-owned mutex, and the store holds an
-//! exclusive lock on its root directory so no second `FsStore` can open it.
+//! Each object is a file prefixed with a 16-byte random etag. Writes rename a temporary file into
+//! place under a store-owned mutex. The store holds an exclusive lock on its root directory.
 
 use super::*;
 use parking_lot::Mutex;

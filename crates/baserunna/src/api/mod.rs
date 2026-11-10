@@ -843,11 +843,10 @@ pub(crate) enum Ran<T> {
     Replayed(Committed),
 }
 
-/// Executes `$body` in a transaction, retrying on conflict until it is
-/// committed, and evaluates to `(commit_id, Ran)`. If an idempotency key
-/// (`$key`, an `Option<&str>`) is provided, the commit ID is derived from the
-/// key and any previously committed result for that key is replayed without
-/// re-executing (SPEC §6.2).
+/// Executes `$body` in a transaction and evaluates to `(commit_id, Ran)`.
+///
+/// Retries on conflict until the transaction is committed. If `$key` is `Some`, derives the commit
+/// ID from the key and replays any earlier committed result.
 macro_rules! run_txn {
     ($node:expr, $ctx:expr, $isolation:expr, $consistency:expr, $key:expr, |$t:ident| $body:expr) => {{
         let (node_, ctx_, key_): (&crate::node::Node, &crate::api::DbCtx, Option<&str>) = (&$node, &$ctx, $key);
@@ -898,8 +897,9 @@ macro_rules! run_txn {
 }
 pub(crate) use run_txn;
 
-/// Begins a transaction for [`run_txn!`], starting optimistically for strong
-/// serializable transactions when `optimistic` is true.
+/// Begins a transaction for [`run_txn!`].
+///
+/// Starts optimistically for strong serializable transactions if `optimistic` is true.
 pub(crate) async fn begin_txn(
     ctx: &DbCtx,
     isolation: crate::engine::Isolation,
@@ -935,7 +935,7 @@ pub(crate) async fn earlier_attempt(ctx: &DbCtx, commit_id: u64, key: Option<&st
 
 /// Finishes a read-only transaction at `version`.
 ///
-/// If `key` is set, checks whether an earlier attempt was committed after [`earlier_attempt`] ran.
+/// If `key` is set, resolves `commit_id` in case an earlier attempt was committed concurrently.
 pub(crate) async fn finish_read_only<T>(
     ctx: &DbCtx,
     commit_id: u64,
@@ -951,7 +951,7 @@ pub(crate) async fn finish_read_only<T>(
     Ok(Ran::Read { out, version })
 }
 
-/// Commits `t` with output `out`, or returns `Ok(None)` when `t` must be retried after a conflict.
+/// Commits `t` with output `out`. Returns `Ok(None)` if `t` must be retried after a conflict.
 pub(crate) async fn finish<T>(
     node: &Node,
     ctx: &DbCtx,
@@ -967,7 +967,7 @@ pub(crate) async fn finish<T>(
     let mut req = t.into_request();
     req.deadline = Some(ctx.deadline.instant());
     match ctx.db.commit_detailed(req).await {
-        // `replayed` is true only if an earlier request with the same idempotency key committed.
+        // `replayed` is true only if an earlier request with the same idempotency key was committed.
         Ok(c) if c.replayed && key.is_some() => Ok(Some(Ran::Replayed(c))),
         Ok(commit) => Ok(Some(Ran::Committed { out, commit })),
         Err(Error::Conflict(_)) if *attempt < node.cfg.txn_retries => {
@@ -983,8 +983,8 @@ pub(crate) async fn finish<T>(
 
 /// Resolves a failed transaction.
 ///
-/// If an idempotent request fails with a non-retryable error, resolves `commit_id` to replay a
-/// committed attempt or fence an in-flight attempt.
+/// If an idempotent request fails with a non-retryable error, resolves `commit_id`. This replays a
+/// committed attempt or fences an in-flight attempt.
 pub(crate) async fn failed<T>(ctx: &DbCtx, commit_id: u64, key: Option<&str>, e: Error) -> Result<Ran<T>> {
     let definitive = !e.retryable() && !matches!(e, Error::Internal(_));
     if key.is_none() || !definitive {
@@ -1001,7 +1001,7 @@ pub(crate) async fn failed<T>(ctx: &DbCtx, commit_id: u64, key: Option<&str>, e:
     }
 }
 
-/// Attaches `commit_id` to an error with an unknown commit outcome (SPEC §6.2).
+/// Attaches `commit_id` to an error with an unknown commit outcome.
 pub(crate) fn naming_commit(e: Error, commit_id: u64) -> Error {
     match e {
         Error::Unavailable { message, retry_after_ms, outcome_unknown: true } => Error::Unavailable {

@@ -1,8 +1,9 @@
 //! Media library example with large binary assets.
 //!
-//! Large files are streamed into out-of-band chunked blobs, referenced from
-//! table rows alongside searchable metadata, and served with HTTP range
-//! requests. Overwritten and deleted assets are garbage collected automatically.
+//! Large files are stored as out-of-band chunked blobs. Table rows reference
+//! these blobs alongside searchable metadata. Clients read blobs with HTTP
+//! range requests. Overwritten and deleted blobs are garbage collected
+//! automatically.
 //!
 //! Run: `cargo run --example asset_store`
 

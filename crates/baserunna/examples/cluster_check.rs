@@ -1,9 +1,9 @@
 //! Failover workload and consistency checker for a live object store.
 //!
 //! Runs multiple nodes against a shared store while killing and restarting nodes at random.
-//! Concurrent workers execute counter increments with idempotency keys and bank transfers with
-//! commit IDs across random nodes, then verify that all committed writes are durable, strong reads
-//! observe all settled writes, and total account balances remain constant.
+//! Concurrent workers increment counters with idempotency keys and transfer funds across random
+//! nodes. The checker verifies that committed writes are durable, strong reads observe settled
+//! writes, and total account balances are conserved.
 //!
 //! Run: `BASERUNNA_STORE=s3://bucket[/prefix] cargo run --release --example cluster_check -- [seconds]`
 
@@ -185,8 +185,7 @@ fn balance(r: &api::OpResult) -> Option<i64> {
 }
 
 /// Transfers funds between random accounts in interactive transactions.
-/// Calls the transaction endpoints directly so each step can hit a different node instead of
-/// staying on one node like [`baserunna_client::Txn`].
+/// Calls the transaction endpoints directly so each step can reach a different node.
 async fn transfer_worker(c: Arc<Cluster>, stop: Arc<AtomicBool>, t: Arc<Stats>) -> Result<(), String> {
     while !stop.load(SeqCst) {
         let (a, b) = (c.random(ACCOUNTS as u64) as usize, c.random(ACCOUNTS as u64) as usize);
@@ -314,7 +313,7 @@ async fn run_check(c: Arc<Cluster>, seconds: u64) -> Result<(), String> {
             }
         };
         if value != done.len() as i64 {
-            return Err(format!("counter w{i} is {value}, but {} increments committed", done.len()));
+            return Err(format!("counter w{i} is {value}, but {} increments were committed", done.len()));
         }
         let mut logged = BTreeSet::new();
         let prefix = format!("log/w{i}/");

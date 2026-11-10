@@ -1,10 +1,10 @@
 //! Application logs in a stream.
 //!
-//! Services append JSON lines from their log files into a stream with a time
-//! and size cap. Bounded scans filter by field and return the newest errors
-//! first with a continuation sequence number. Forward reads wait for new
-//! lines like `tail -f`. A log shipper forwards each line once by advancing
-//! its consumer cursor in the same transaction that records the batch.
+//! Services append JSON lines from their log files into a bounded stream.
+//! Reverse scans filter records by field and return the newest errors first.
+//! Forward reads wait for new lines like `tail -f`. A log shipper forwards
+//! each line once by updating its cursor in the same transaction that records
+//! the batch.
 //!
 //! Run: `cargo run --example app_logs`
 
@@ -57,7 +57,7 @@ fn log_lines(start: usize, n: usize) -> Bytes {
             },
             http: Http { status: if level == "error" { 503 } else { 200 }, ms: (i % 250) as u64 },
         };
-        out.push_str(&serde_json::to_string(&line).expect("log lines serialize"));
+        out.push_str(&serde_json::to_string(&line).expect("serialize log line"));
         out.push('\n');
     }
     Bytes::from(out)

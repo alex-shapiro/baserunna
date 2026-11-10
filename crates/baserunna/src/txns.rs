@@ -241,7 +241,7 @@ impl OpenTxns {
     }
 
     /// Returns open transactions ordered from least to most recently used, paired with their
-    /// memory usage (read set, write set, and an equal share of any non-current snapshot version).
+    /// memory usage.
     fn held_memory(&self) -> Vec<(Arc<OpenTxn>, Held<String>)> {
         let idle_since = |t: &OpenTxn| t.txn.try_lock().ok().filter(|g| g.is_some()).map(|_| t.last_used());
         let mut open: Vec<(Option<Instant>, Arc<OpenTxn>)> =

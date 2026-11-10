@@ -85,8 +85,8 @@ pub(super) enum Settled {
     Rejected(Resp),
 }
 
-/// Retries an idempotent write until its outcome is known, rotating the
-/// idempotency key if an unapplied attempt is fenced.
+/// Retries an idempotent write until its outcome is known.
+/// Rotates the idempotency key if an unapplied attempt is fenced.
 pub(super) async fn settle(c: &Client, path: &str, ndjson: bool, body: &Json, base: &str) -> Result<Settled, String> {
     let mut key = base.to_string();
     let mut first = c.sim.now_ms();
@@ -529,8 +529,8 @@ fn check_answers(g: &World) -> Result<usize, String> {
     Ok(checked)
 }
 
-// Rows with equal timestamps are ordered by insertion position, which is not
-// tracked by the model, so any matching event at that timestamp is valid.
+// Rows with equal timestamps are ordered by insertion position. Because the model
+// does not track insertion position, any matching event at that timestamp is valid.
 fn time_page_matches(q: &Json, got: &[Vec<Json>], want: &[Vec<Json>]) -> Result<(), String> {
     let limit = q["limit"].as_u64().unwrap_or(100) as usize;
     let times = |rows: &[Vec<Json>]| rows.iter().map(|r| r[0].as_i64()).collect::<Vec<_>>();
@@ -627,8 +627,8 @@ fn gc_is_short(sim: &Sim) -> bool {
 }
 
 // A part removed from `obsolete` by a commit can appear as an orphan while its
-// object store deletion is in flight, so only parts that remain uncollected
-// past `limit` fail the check.
+// object store deletion is in flight. Only parts that remain uncollected past
+// `limit` fail the check.
 async fn idle(c: &Client) -> Result<(), String> {
     let e = &c.sim.cfg.engine;
     let start = c.sim.now_ms();

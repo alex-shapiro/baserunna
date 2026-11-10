@@ -13,12 +13,10 @@ use crate::{Db, Error, Op, OpResult, TransportError};
 #[derive(Debug)]
 pub struct Txn {
     db: Db,
-    /// Server transaction IDs once begun.
     open: Option<Open>,
     writes: Vec<Op>,
     wrote: bool,
     failed: Option<Error>,
-    /// Start time of the first request.
     started: Option<tokio::time::Instant>,
 }
 

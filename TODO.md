@@ -26,11 +26,11 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       (`sim_tool trace streams 2601188`).
 - [ ] **Invalidate the cached manifest if an ambiguous `PUT` completes after a
       refresh.** A manifest `PUT` that fails with `503 unavailable` can still
-      be applied in storage after a commit retry refreshes the manifest and
-      observes the old version. The lease holder then serves the old cached
-      version while other nodes serve the new version. Bypass the local lease
-      for strong reads until all ambiguous `PUT`s from the commit attempt are
-      resolved.
+      be applied in storage. If a commit retry refreshes the manifest before
+      that `PUT` completes, it observes the old version. The lease holder then
+      serves the old cached version while other nodes serve the new version.
+      Bypass the local lease for strong reads until all ambiguous `PUT`s from
+      the commit attempt are resolved.
 - [ ] **Invalidate the cached manifest immediately if a manifest `PUT` fails
       with `412`.** A `412 Precondition Failed` response means another node
       updated the manifest. The lease holder currently continues serving its
@@ -49,10 +49,9 @@ Planned work, ordered by priority within each section. See [`SPEC.md`](SPEC.md)
       until the next commit (`sim_tool trace blobs 5000231`).
 - [ ] **Schedule stream retention trims after ambiguous manifest writes.** The
       committer schedules a retention trim only if a manifest `PUT` returns
-      success. If the `PUT` returns an unknown outcome after being applied in
-      storage, the node does not schedule a trim until the next commit or
-      sweep. This leaves expired records in an idle stream
-      (`sim_tool trace streams 8100221`).
+      success. If storage applies the `PUT` but returns an unknown outcome, the
+      node does not schedule a trim until the next commit or sweep. This leaves
+      expired records in an idle stream (`sim_tool trace streams 8100221`).
 - [ ] **Abort open interactive transactions if a database is deleted.**
       Interactive transactions on a deleted database currently remain open
       until their 30 s idle timeout expires. They consume memory and count
@@ -372,17 +371,17 @@ corruption through any of them.
       node joins. Send commit notices to the home nodes of both previous and
       current membership views.
 - [ ] **Route interactive transaction requests to the node that holds the
-      transaction.** An open transaction is stored in memory on the node that
-      began it, whereas follow-up requests are routed by the receiving node's
+      transaction.** The node that begins an interactive transaction stores it
+      in memory. Receiving nodes route follow-up requests using their cached
       membership view. If membership views differ across nodes, a request can
       be routed to a different node and fail with `txn_not_found`. Encode the
-      owning node ID in the transaction ID and route requests directly to that
-      node.
+      owning node ID in the transaction ID. Route follow-up requests directly
+      to that node.
 - [ ] **Abort interactive transactions whose `begin` response is lost.** The
       server assigns the transaction ID in the `begin` response. If that
       response is lost after the server opens the transaction, the client
-      cannot abort the transaction, which occupies a per-user transaction slot
-      until its idle timeout expires.
+      cannot abort it. The transaction then occupies a per-user slot until its
+      idle timeout expires.
 - [ ] **Preserve the failure reason if an interactive commit is retried.** The
       commit handler removes the transaction from memory before committing. If
       the commit fails with a retryable error such as `503`, a client retry
@@ -395,13 +394,13 @@ corruption through any of them.
 - [ ] **Add an `Unknown` fallback variant to `baserunna_api::Role`.** Adding
       `#[serde(other)]` lets `baserunna-client` deserialize `Me` and `Member`
       responses from newer servers that define additional roles.
-- [ ] **Pin the lower bound of a reverse `read_stream` that uses `tail`.** A
-      reverse read with `tail` recomputes its lower bound from the end of the
-      stream on each page. If records are appended between pages,
+- [ ] **Pin the lower bound of a reverse `read_stream` that uses `tail`.** On
+      each page of a reverse read with `tail`, the server recomputes the lower
+      bound from the end of the stream. If records are appended between pages,
       `Op::next_page` shifts the range.
 - [ ] **Reject empty selectors in `where`, `query_rows`, and `delete_range` on
       the server.** The server currently treats an empty `where` or
-      `query_rows` selector as a full-table scan or delete, and treats an
+      `query_rows` selector as a full-table scan or delete. It also treats an
       empty `prefix` in `delete_range` as a full-database delete. Require an
       explicit full-scan flag so that an accidentally empty prefix is
       rejected.

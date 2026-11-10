@@ -228,8 +228,7 @@ pub fn record_json(r: &Record, b: &Body, enc: api::Encoding) -> Json {
     serde_json::to_value(record(r, b, enc)).expect("stream records serialize")
 }
 
-/// Reads `name`'s catalog entry, pinned so that the transaction conflicts
-/// with the stream's deletion or reconfiguration.
+/// Reads the catalog entry for `name` and pins it in `txn`'s read set.
 pub async fn lookup(txn: &mut Txn, name: &str) -> Result<Option<Catalog>> {
     check_name(name, "stream")?;
     txn.get_pinned(&catalog_key(name)).await?.map(|rv| decode(&rv.value, "stream catalog")).transpose()

@@ -1966,7 +1966,7 @@ impl Db {
                     !purged
                 });
             }
-            // Retire range tombstones when no remaining segment overlaps and no active transaction can read them.
+            // Retire range tombstones that are older than the purge window and have been compacted out of all segments.
             let segments = &m.segments;
             m.range_deletes.retain(|t| {
                 let retire = t.seq <= purge_through && !segments.iter().any(|s| t.dirties(s));

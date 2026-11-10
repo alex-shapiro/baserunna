@@ -3,9 +3,8 @@
 //! Each room is a stream created by its first message. Posting a message
 //! appends to the room and increments the poster's message count in a single
 //! transaction. Members wait on the room to receive new messages. With
-//! `expect_seq`, a client posts only if it has read all prior messages. Each
-//! member's read position is stored as a consumer cursor, which tracks unread
-//! counts in the stream.
+//! `expect_seq`, a client posts only if it has read all prior messages.
+//! Consumer cursors store each member's read position and track unread counts.
 //!
 //! Run: `cargo run --example chat_rooms`
 
@@ -37,7 +36,7 @@ fn parse_message(r: &api::StreamRecord) -> Result<Message, serde_json::Error> {
 async fn post(db: &Db, room: &str, from: &str, text: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let record = NewRecord::json(&Message::new(from, text)).header("from", from);
     let ops = [Op::append_records(room, vec![record]), Op::increment(format!("posts/{from}"), 1)];
-    let c = db.write(&ops).await?.expect("appends commit");
+    let c = db.write(&ops).await?.expect("appends are committed");
     Ok(c.appends[0])
 }
 

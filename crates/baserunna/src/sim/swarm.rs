@@ -1,4 +1,4 @@
-//! Swarm configuration generator (SPEC §13.2).
+//! Swarm configuration generator.
 //!
 //! Each simulation seed derives randomized cluster topology, fault rates, and
 //! engine parameters so that campaigns test a wide variety of configurations.

@@ -36,8 +36,7 @@ fn select(model: &BTreeMap<i64, Row>, team: &str, min: i64, limit: Option<usize>
     hits.into_iter().map(|(_, i)| i).take(limit.unwrap_or(usize::MAX)).collect()
 }
 
-/// Runs one-shot `ops` with an idempotency key until definitive, returning
-/// `None` if replayed.
+/// Runs one-shot `ops` with an idempotency key and returns `None` if the response was replayed.
 async fn once(c: &Client, ops: Json, key: &str) -> Result<Option<Json>, String> {
     let body = json!({"ops": ops, "idempotency_key": key});
     loop {

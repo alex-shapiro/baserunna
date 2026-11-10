@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     step(1, "Open accounts with 1000 each (one atomic transaction)");
     let ops: Vec<_> = (0..ACCOUNTS).map(|i| Op::put(format!("acct/{i}"), "1000")).collect();
-    let c = db.write(&ops).await?.expect("puts commit");
+    let c = db.write(&ops).await?.expect("puts are committed");
     println!("    committed at version {}", c.version);
 
     step(2, "8 tellers run 25 random transfers each, concurrently");

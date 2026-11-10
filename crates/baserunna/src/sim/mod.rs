@@ -651,8 +651,8 @@ impl Sim {
         }
     }
 
-    /// Crashes node `i` at a crash point if it is still running instance `n`,
-    /// and schedules a restart after a random delay.
+    /// Crashes node `i` at a crash point if it is still running instance `n`.
+    /// Schedules a restart after a random delay.
     fn crash_at_point(self: &Arc<Self>, i: usize, n: u64, why: &str) -> bool {
         let current = self.slots[i].lock().as_ref().map(|s| s.start);
         if current != Some(n) {
@@ -706,8 +706,8 @@ impl Sim {
         }
     }
 
-    /// Verifies cluster-wide lease invariants: at most one node holds an active
-    /// lease per database, and any leased node without an in-flight manifest write
+    /// Verifies that at most one node holds an active lease per database.
+    /// Also checks that any leased node without an in-flight manifest write
     /// matches the latest manifest in object storage.
     fn check_oracles(&self) -> Result<(), String> {
         let mut holders: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -1029,8 +1029,8 @@ pub fn seeds(base: u64, default_count: u64) -> Vec<u64> {
     (0..n).map(|i| base.wrapping_mul(1_000_003).wrapping_add(i)).collect()
 }
 
-/// Runs `scenario` with the seeds from [`seeds`], panicking with a
-/// reproduction command on the first failure.
+/// Runs `scenario` with the seeds from [`seeds`].
+/// Panics with a reproduction command on the first failure.
 pub fn run_seeds(scenario: &workloads::Scenario, base: u64, default_count: u64) {
     let name = scenario.name;
     for seed in seeds(base, default_count) {

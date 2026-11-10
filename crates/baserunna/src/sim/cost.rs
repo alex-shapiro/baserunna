@@ -687,8 +687,7 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     segs
 }
 
-/// Appends, tail reads, steady log ingestion, and a cold node reading a
-/// sealed log (SPEC §5.11).
+/// Appends, tail reads, steady log ingestion, and a cold node reading a sealed log.
 async fn streams(w: &mut World, out: &mut Vec<Measurement>) {
     let t = w.signup(0, "streams@cost.test").await;
     let id = w.create_db(0, &t, "logs").await;
@@ -718,7 +717,7 @@ async fn streams(w: &mut World, out: &mut Vec<Measurement>) {
     }
     out.push(r.stop("stream_tail_read_leased", "read", 100.0, true));
 
-    // Steady ingestion: a request of 100 log lines (about 20 KB) a second.
+    // Steady ingestion: 100 log lines per second, or about 20 KB/s.
     let r = Recorder::start(s, &id);
     let requests = 1200;
     for i in 0..requests {

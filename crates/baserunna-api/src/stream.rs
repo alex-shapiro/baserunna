@@ -229,7 +229,7 @@ pub struct CreatedStream {
 pub struct StreamInfo {
     #[serde(flatten)]
     pub stream: Stream,
-    /// Up to 100 consumers in name order. `consumers_next_cursor` continues the listing.
+    /// Up to 100 consumers in name order.
     pub consumers: Vec<Consumer>,
     pub consumers_next_cursor: Option<String>,
     pub version: u64,
@@ -311,7 +311,7 @@ pub struct ReadRecordsQuery {
     pub until_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_time: Option<u64>,
-    /// Reads backward from the end of the range, returning the newest records first.
+    /// Reads backward from the end of the range, newest records first.
     #[serde(default, skip_serializing_if = "is_false")]
     pub reverse: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -72,8 +72,8 @@ enum Settled {
     Unknown,
 }
 
-/// Retries an idempotent request until it receives a definitive response, rotating
-/// the idempotency key if an unapplied attempt is aborted.
+/// Retries an idempotent request until it receives a definitive response.
+/// Rotates the idempotency key if an unapplied attempt is aborted.
 async fn settle_call(
     c: &Client,
     method: &str,

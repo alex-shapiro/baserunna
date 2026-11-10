@@ -2,9 +2,9 @@
 //! expirations, point deletes, and range deletes.
 //!
 //! Every change returned by the feed must match the write committed at that
-//! version, cursors must not expire within the transaction lifetime window,
-//! and the state reconstructed from the feed must match the final database
-//! state after all TTL entries expire.
+//! version. Cursors must not expire within the transaction lifetime window.
+//! The state reconstructed from the feed must match the final database state
+//! after all TTL entries expire.
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};

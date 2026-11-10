@@ -1,4 +1,4 @@
-//! Coverage-guided simulation exploration (SPEC §13.4).
+//! Coverage-guided simulation exploration.
 //!
 //! Runs that discover new probe features are added to a corpus and branched
 //! immediately after their rarest probes. A branched run replays its parent
@@ -13,8 +13,7 @@ use crate::util::rng::Rng;
 use parking_lot::Mutex;
 use std::time::Instant;
 
-/// Number of jobs scheduled per batch before updating the corpus. Kept
-/// constant so exploration is independent of the host CPU core count.
+/// Number of jobs scheduled per batch before updating the corpus.
 const ROUND: usize = 32;
 
 /// Maximum virtual time offset after a probe hit at which a branch point is placed.

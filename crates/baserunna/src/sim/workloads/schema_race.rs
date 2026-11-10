@@ -87,9 +87,8 @@ async fn query_writer_rows(c: &Client, w: i64) -> Result<BTreeMap<i64, Row>, Str
         .collect())
 }
 
-/// Upserts `row` in an interactive transaction, resolving commit ambiguity via
-/// the commit-status endpoint, or from the row itself once the commit record
-/// may have outlived its retention.
+/// Upserts `row` in an interactive transaction.
+/// Resolves commit ambiguity via the commit-status endpoint or by reading the row if the commit record expired.
 async fn interactive(
     c: &Client,
     isolation: &str,

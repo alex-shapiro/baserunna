@@ -357,8 +357,8 @@ impl KvModel {
         let path = self.path("/txn");
         let (mut began, mut ambiguous) = (self.c.sim.now_ms(), false);
         loop {
-            // Retry with the same idempotency key while the commit record is still retained;
-            // otherwise reconcile the outcome from the database state.
+            // Retry with the same idempotency key while the commit record is still retained.
+            // Reconcile the outcome from the database state if the commit record expired.
             if ambiguous && writes && !self.c.dedups(began) {
                 if let Some(v) = self.reconcile(&sim).await? {
                     sim.apply(&mut self.model, v);
@@ -424,7 +424,7 @@ impl KvModel {
                     return Ok(());
                 }
                 503 | 409 => {
-                    // Safe to retry with the same idempotency key (409 indicates an OCC conflict with a zombie).
+                    // Safe to retry with the same idempotency key because 409 indicates a conflict with an in-flight attempt.
                     self.c.pause(100).await;
                 }
                 // Rejected due to storage quota; deletions are never rejected.
@@ -434,7 +434,7 @@ impl KvModel {
         }
     }
 
-    /// Determines whether `txn` committed by comparing the database state against the model.
+    /// Determines whether `txn` was committed by comparing the database state against the model.
     async fn reconcile(&mut self, txn: &TxnSim) -> Result<Option<u64>, String> {
         let (got, version) = self.read_all().await?;
         let matches = |m: &Model, versions: bool| {

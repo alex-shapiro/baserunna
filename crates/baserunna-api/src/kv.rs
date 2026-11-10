@@ -105,26 +105,26 @@ impl Endpoint for PutValue {
 
     fn path(&self) -> String {
         let mut path = kv_path(&self.db, &self.key);
-        if let Some(t) = self.options.ttl_ms {
-            path.push_str(&format!("?ttl_ms={t}"));
+        if let Some(ttl_ms) = self.options.ttl_ms {
+            path.push_str(&format!("?ttl_ms={ttl_ms}"));
         }
         path
     }
 
     fn headers(&self) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        if let Some(ct) = self.options.content_type.as_deref().and_then(|c| HeaderValue::from_str(c).ok()) {
-            h.insert(CONTENT_TYPE, ct);
+        let mut headers = HeaderMap::new();
+        if let Some(content_type) = self.options.content_type.as_deref().and_then(|ct| HeaderValue::from_str(ct).ok()) {
+            headers.insert(CONTENT_TYPE, content_type);
         }
         match self.options.expect {
-            Some(Expect::Absent) => h.insert(IF_NONE_MATCH, HeaderValue::from_static("*")),
-            Some(Expect::Version(v)) => h.insert(IF_MATCH, HeaderValue::from(v)),
+            Some(Expect::Absent) => headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*")),
+            Some(Expect::Version(version)) => headers.insert(IF_MATCH, HeaderValue::from(version)),
             None => None,
         };
-        if let Some(k) = self.idempotency_key.as_deref().and_then(|k| HeaderValue::from_str(k).ok()) {
-            h.insert("idempotency-key", k);
+        if let Some(key) = self.idempotency_key.as_deref().and_then(|key| HeaderValue::from_str(key).ok()) {
+            headers.insert("idempotency-key", key);
         }
-        h
+        headers
     }
 }
 
@@ -166,8 +166,8 @@ pub struct Content {
 }
 
 impl Content {
-    fn new(h: &HeaderMap, data: Bytes) -> Content {
-        let text = |name| h.get(name).and_then(|v: &HeaderValue| v.to_str().ok()).map(str::to_string);
+    fn new(headers: &HeaderMap, data: Bytes) -> Content {
+        let text = |name| headers.get(name).and_then(|val: &HeaderValue| val.to_str().ok()).map(str::to_string);
         Content { data, content_type: text(CONTENT_TYPE), content_range: text(CONTENT_RANGE) }
     }
 }
@@ -208,20 +208,20 @@ fn kv_path(db: &str, key: &[u8]) -> String {
 }
 
 fn range_header(range: Option<ByteRange>) -> HeaderMap {
-    let mut h = HeaderMap::new();
+    let mut headers = HeaderMap::new();
     let value = match range {
-        None => return h,
+        None => return headers,
         Some(ByteRange::Span { start, end }) => format!("bytes={start}-{end}"),
         Some(ByteRange::From(start)) => format!("bytes={start}-"),
-        Some(ByteRange::Last(n)) => format!("bytes=-{n}"),
+        Some(ByteRange::Last(len)) => format!("bytes=-{len}"),
     };
-    h.insert(RANGE, HeaderValue::from_str(&value).expect("ranges are ASCII"));
-    h
+    headers.insert(RANGE, HeaderValue::from_str(&value).expect("ranges are ASCII"));
+    headers
 }
 
-fn header_u64(h: &HeaderMap, name: &str) -> Result<Option<u64>, String> {
-    let Some(v) = h.get(name) else { return Ok(None) };
-    v.to_str().ok().and_then(|s| s.trim_matches('"').parse().ok()).map(Some).ok_or(format!("bad {name} header"))
+fn header_u64(headers: &HeaderMap, name: &str) -> Result<Option<u64>, String> {
+    let Some(val) = headers.get(name) else { return Ok(None) };
+    val.to_str().ok().and_then(|raw| raw.trim_matches('"').parse().ok()).map(Some).ok_or(format!("bad {name} header"))
 }
 
 /// `POST /v1/dbs/{db}/blobs`.
@@ -248,11 +248,11 @@ impl Endpoint for StageBlob {
     }
 
     fn headers(&self) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        if let Some(ct) = self.content_type.as_deref().and_then(|c| HeaderValue::from_str(c).ok()) {
-            h.insert(CONTENT_TYPE, ct);
+        let mut headers = HeaderMap::new();
+        if let Some(content_type) = self.content_type.as_deref().and_then(|ct| HeaderValue::from_str(ct).ok()) {
+            headers.insert(CONTENT_TYPE, content_type);
         }
-        h
+        headers
     }
 }
 
@@ -326,11 +326,11 @@ pub struct ChangesQuery {
     pub max_staleness_ms: Option<u64>,
 }
 
-fn deserialize_bool_param<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
-    match String::deserialize(d)?.as_str() {
+fn deserialize_bool_param<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    match String::deserialize(deserializer)?.as_str() {
         "true" | "1" | "" => Ok(true),
         "false" | "0" => Ok(false),
-        o => Err(serde::de::Error::custom(format!("bad boolean {o:?}"))),
+        other => Err(serde::de::Error::custom(format!("bad boolean {other:?}"))),
     }
 }
 

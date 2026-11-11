@@ -163,9 +163,10 @@ impl Work {
 struct State {
     current: Option<Arc<Version>>,
     verified_at: Option<Instant>,
-    /// True from a failed manifest `PUT` until [`Db::confirm_own_write`], because the failed `PUT`
-    /// can still replace the stored manifest, or its `412` showed that `current` is old.
-    manifest_unconfirmed: bool,
+    /// Send instant of the earliest manifest `PUT` from this node that failed after the last
+    /// [`Db::confirm_own_write`]. While it is set, a failed `PUT` can still replace the stored
+    /// manifest, or its `412` showed that `current` is old.
+    earliest_failed_put_at: Option<Instant>,
     last_access: Instant,
     last_access_seq: u64,
     window_start: Instant,
@@ -173,7 +174,7 @@ struct State {
     reads_last_window: u32,
     lease_requested: bool,
     /// `(write_seq, expires_at)` for the lease that lets this node serve strong reads from cache.
-    /// It is `None` while `manifest_unconfirmed` is true.
+    /// It is `None` while `earliest_failed_put_at` is set.
     own_lease: Option<(u64, Instant)>,
     /// Hedged manifest `PUT` requests that remain in flight in the background.
     /// The database stays loaded while this count is non-zero.
@@ -262,7 +263,7 @@ impl Db {
             st: Mutex::new(State {
                 current: None,
                 verified_at: None,
-                manifest_unconfirmed: false,
+                earliest_failed_put_at: None,
                 last_access: now,
                 last_access_seq: 0,
                 window_start: now,
@@ -381,10 +382,20 @@ impl Db {
     /// `PUT` from this node can replace it. Takes the lease in `m` if it names this node.
     fn confirm_own_write(&self, m: &Manifest, sent: Instant) {
         let mut st = self.st.lock();
-        st.manifest_unconfirmed = false;
+        st.earliest_failed_put_at = None;
         if let Some(l) = m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
             let margin = self.shared.cfg.lease_margin_ms.min(l.ms);
             st.own_lease = Some((m.write_seq, sent + Duration::from_millis(l.ms - margin)));
+        }
+    }
+
+    /// Records that the store holds `m`, which a failed `PUT` from this node wrote, as
+    /// [`Db::confirm_own_write`] does. Times the lease in `m` from the earliest failed `PUT`, because
+    /// a manifest read cannot tell which failed `PUT` wrote `m`.
+    fn confirm_landed_write(&self, m: &Manifest) {
+        let earliest_failed_put_at = self.st.lock().earliest_failed_put_at;
+        if let Some(sent) = earliest_failed_put_at {
+            self.confirm_own_write(m, sent);
         }
     }
 
@@ -570,7 +581,7 @@ impl Db {
             // Equal instants do not order the verification and the request. A tie counts as
             // verified only while no failed `PUT` from this node can change the stored manifest.
             if let (Some(c), Some(va)) = (&st.current, st.verified_at)
-                && (va > not_before || va == not_before && !st.manifest_unconfirmed)
+                && (va > not_before || va == not_before && st.earliest_failed_put_at.is_none())
             {
                 return Ok((c.clone(), va));
             }
@@ -1092,7 +1103,8 @@ impl Db {
     async fn process(self: &Arc<Self>, batch: Vec<Work>) {
         let cfg = self.shared.cfg.clone();
         let mut maybe_applied = false;
-        let mut unknown_writes: Vec<(u64, Instant, String)> = Vec::new();
+        // `(write_seq, base_etag)` of each manifest `PUT` from this batch with an unknown outcome.
+        let mut unknown_writes: Vec<(u64, String)> = Vec::new();
         // Commit IDs included in an unfenced ambiguous manifest PUT from this batch.
         let mut ambiguous_commit_ids: BTreeSet<u64> = BTreeSet::new();
         let mut attempt = 0u32;
@@ -1178,7 +1190,7 @@ impl Db {
             let res = self.put_manifest(data, &base.etag).await;
             if !res.is_ok() {
                 let mut st = self.st.lock();
-                st.manifest_unconfirmed = true;
+                st.earliest_failed_put_at.get_or_insert(attempt_started);
                 st.own_lease = None;
                 drop(st);
                 self.write_finished();
@@ -1217,7 +1229,7 @@ impl Db {
                         probe::hit(Probe::ObsoleteDeletedAfterAmbiguousWrite);
                     }
                     maybe_applied = true;
-                    unknown_writes.push((m.write_seq, attempt_started, base.etag.clone()));
+                    unknown_writes.push((m.write_seq, base.etag.clone()));
                     for (w, o) in batch.iter().zip(&plan.outcomes) {
                         ambiguous_commit_ids.extend(newly_committed_ids(w, o));
                     }
@@ -1248,20 +1260,16 @@ impl Db {
             loop {
                 match self.refresh(Instant::now(), false).await {
                     Ok(v) => {
-                        let sent =
-                            unknown_writes.iter().filter(|(ws, ..)| *ws == v.m.write_seq).map(|(_, s, _)| *s).min();
-                        if let Some(sent) = sent {
+                        let replaceable_by_unknown_write = unknown_writes.iter().any(|(_, etag)| *etag == v.etag);
+                        if unknown_writes.iter().any(|(ws, _)| *ws == v.m.write_seq) {
                             probe::hit(Probe::AmbiguousWriteLanded);
-                            if !unknown_writes.iter().any(|(.., etag)| *etag == v.etag) {
-                                self.confirm_own_write(&v.m, sent);
+                            if !replaceable_by_unknown_write {
+                                self.confirm_landed_write(&v.m);
                             }
                         }
                         // Once the manifest moves past every ETag targeted by an ambiguous write,
                         // any write that was not applied cannot succeed.
-                        if maybe_applied
-                            && !unknown_writes.iter().any(|(.., etag)| *etag == v.etag)
-                            && !self.has_applied_work(&v, &batch).await
-                        {
+                        if maybe_applied && !replaceable_by_unknown_write && !self.has_applied_work(&v, &batch).await {
                             probe::hit(Probe::AmbiguousWriteSettled);
                             maybe_applied = false;
                         }

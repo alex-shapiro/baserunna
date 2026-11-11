@@ -1227,6 +1227,41 @@ fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_answers() {
     });
 }
 
+/// Tests strong reads if the retry read of a failed commit finds a late manifest write from an
+/// earlier batch. Other nodes time the lease in that write from when they first read it, so the
+/// holder must not time it from the later failed `PUT`.
+#[test]
+fn strong_read_after_late_manifest_put_from_an_earlier_batch_is_new() {
+    rt().block_on(async {
+        let (a, b, store) = late_manifest_put_nodes();
+        let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
+        put(&db_a, "k", "old").await;
+        store.failed_manifest_puts.store(a.shared.cfg.commit_retry_max, SeqCst);
+        let outcome = commit_new(db_a.clone()).await;
+        assert!(
+            matches!(outcome, Err(Error::Unavailable { outcome_unknown: true, .. })),
+            "setup: answered {outcome:?}"
+        );
+        let mut t = db_a.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        assert!(t.get(b"k").await.unwrap().is_some());
+        let applied = store.apply_late_puts();
+        assert!(applied[0].is_ok(), "setup: the first late write is applied, got {applied:?}");
+        db_b.open(false).await.unwrap();
+        assert_eq!(strong_get(&db_b, "k").await, Some(inline("new")), "setup: B reads the late write and A's lease");
+        sleep_ms(3000).await;
+        store.failed_manifest_puts.store(1, SeqCst);
+        t.put(Bytes::from_static(b"k"), inline("mine")).unwrap();
+        let outcome = db_a.commit_detailed(t.into_request()).await;
+        assert!(outcome.is_err(), "setup: A's commit on the old manifest answered {outcome:?}");
+        sleep_ms(2600).await;
+        let mut t = db_b.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        t.put(Bytes::from_static(b"k"), inline("newer")).unwrap();
+        db_b.commit_detailed(t.into_request()).await.expect("setup: B could not commit");
+        let got = strong_get(&db_a, "k").await;
+        assert_eq!(got, Some(inline("newer")), "A served a strong read from cache after B committed");
+    });
+}
+
 async fn sleep_ms(ms: u64) {
     tokio::time::sleep(Duration::from_millis(ms)).await;
 }

@@ -17,6 +17,7 @@ The major tags are:
 - **tangential**: The item has no demonstrated effect on users or operators. It
   is a simulator artifact, an unmeasured optimization, a refactor, or a
   cosmetic change.
+- **untriaged**: The item has not yet been triaged.
 
 Each blocker identifies a failing test marked `#[ignore]`. Remove the attribute
 with the fix. Numbers in blocker items are measured unless marked "extrapolated"

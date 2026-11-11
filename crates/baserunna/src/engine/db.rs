@@ -200,6 +200,15 @@ impl OwnLease {
     }
 }
 
+/// Manifest `PUT` from the current commit batch whose outcome is unknown.
+struct UnknownWrite {
+    /// `write_seq` of the manifest that the `PUT` carried.
+    write_seq: u64,
+    /// `If-Match` ETag of the `PUT`. The store can still apply the `PUT` while the stored manifest
+    /// has this ETag.
+    base_etag: String,
+}
+
 struct State {
     current: Option<Arc<Version>>,
     verified_at: Option<Instant>,
@@ -1139,8 +1148,7 @@ impl Db {
     async fn process(self: &Arc<Self>, batch: Vec<Work>) {
         let cfg = self.shared.cfg.clone();
         let mut maybe_applied = false;
-        // `(write_seq, base_etag)` of each manifest `PUT` from this batch with an unknown outcome.
-        let mut unknown_writes: Vec<(u64, String)> = Vec::new();
+        let mut unknown_writes: Vec<UnknownWrite> = Vec::new();
         // Commit IDs included in an unfenced ambiguous manifest PUT from this batch.
         let mut ambiguous_commit_ids: BTreeSet<u64> = BTreeSet::new();
         let mut attempt = 0u32;
@@ -1262,7 +1270,7 @@ impl Db {
                         probe::hit(Probe::ObsoleteDeletedAfterAmbiguousWrite);
                     }
                     maybe_applied = true;
-                    unknown_writes.push((m.write_seq, base.etag.clone()));
+                    unknown_writes.push(UnknownWrite { write_seq: m.write_seq, base_etag: base.etag.clone() });
                     for (w, o) in batch.iter().zip(&plan.outcomes) {
                         ambiguous_commit_ids.extend(newly_committed_ids(w, o));
                     }
@@ -1293,8 +1301,8 @@ impl Db {
             loop {
                 match self.refresh(Instant::now(), false).await {
                     Ok(v) => {
-                        let replaceable_by_unknown_write = unknown_writes.iter().any(|(_, etag)| *etag == v.etag);
-                        if unknown_writes.iter().any(|(ws, _)| *ws == v.m.write_seq) {
+                        let replaceable_by_unknown_write = unknown_writes.iter().any(|w| w.base_etag == v.etag);
+                        if unknown_writes.iter().any(|w| w.write_seq == v.m.write_seq) {
                             probe::hit(Probe::AmbiguousWriteLanded);
                             if !replaceable_by_unknown_write {
                                 self.confirm_landed_write(&v.m);

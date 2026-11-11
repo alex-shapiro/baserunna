@@ -2553,6 +2553,26 @@ fn released_leases_hand_over_immediately() {
     });
 }
 
+/// Tests that a node releases a lease that the stored manifest names, also after the node stopped
+/// relying on it. Another node honors that lease for longer, so only the release lets it commit at
+/// once. A node that the manifest does not name has no lease to release.
+#[test]
+fn released_leases_hand_over_after_the_holder_stops_relying_on_them() {
+    rt().block_on(async {
+        let (a, store) = delayed_engine("a");
+        let da = opened(&a, "d").await;
+        put(&da, "k", "a").await;
+        sleep_ms(a.shared.cfg.lease_ms).await;
+        assert_eq!(da.leased_view(), None, "setup: A still relies on its lease");
+        let db = second_node(&a, &store, "b").db("d");
+        db.open(false).await.unwrap();
+        assert!(!db.release_lease().await.unwrap(), "B released the lease of A");
+        assert!(da.release_lease().await.unwrap(), "A did not release the lease that the manifest names");
+        sleep_ms(1).await;
+        put(&db, "k", "b").await;
+    });
+}
+
 #[test]
 fn decided_commits_are_answered_on_write_failure() {
     rt().block_on(async {
@@ -2958,6 +2978,30 @@ fn lease_holder_refreshing_in_flight_write_reuses_lease() {
         tokio::time::sleep(Duration::from_millis(1_000)).await;
         assert_eq!(store.manifest_puts.load(SeqCst) - puts_before, 1, "the node wrote the manifest to request a lease");
         assert!(db.leased_view().is_some(), "the node lost its lease");
+    });
+}
+
+/// Tests that a holder takes no lease from its in-flight manifest write after a refresh loaded that
+/// write from storage. Only the successful response of the `PUT` gives the lease.
+#[test]
+fn loaded_in_flight_manifest_put_gives_no_lease_until_it_succeeds() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        put(&db, "k", "1").await;
+        let held = db.leased_view().expect("setup: the node holds its lease");
+        store.put_reply_ms.store(200, SeqCst);
+        let writer = tokio::spawn({
+            let db = db.clone();
+            async move { put(&db, "k", "2").await }
+        });
+        sleep_ms(100).await;
+        let tight = Consistency::Snapshot { max_staleness_ms: 56 };
+        let loaded = db.snapshot(tight).await.unwrap().version;
+        assert_eq!(loaded.m.write_seq, held.write_seq + 1, "setup: the refresh did not load the in-flight write");
+        assert_eq!(db.leased_view(), None, "the node took its lease from a write that is in flight");
+        writer.await.unwrap();
+        assert_eq!(db.leased_view().map(|v| v.write_seq), Some(held.write_seq + 1), "the PUT gave no lease");
     });
 }
 

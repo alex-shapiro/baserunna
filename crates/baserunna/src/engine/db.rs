@@ -3015,6 +3015,43 @@ mod tests {
         });
     }
 
+    /// Tests that a database is not unloaded while one kind of work runs or waits, and that it is
+    /// unloaded after that work ends.
+    #[test]
+    fn databases_with_work_in_progress_are_not_unloaded() {
+        use std::sync::atomic::Ordering::SeqCst;
+        fn parked_flush() -> QueuedWork {
+            QueuedWork {
+                work: Work::Lease { release: false, for_reads: true, tx: None },
+                enqueued_at: Instant::now(),
+                request_id: None,
+            }
+        }
+        /// Starts (`true`) or ends (`false`) one kind of work on a database.
+        type SetWorkInProgress = fn(&Db, bool);
+        let work: [(&str, SetWorkInProgress); 7] = [
+            ("a reload of a noticed version", |db, on| db.refreshing.store(on, SeqCst)),
+            ("a commit batch", |db, on| db.q.lock().running = on),
+            ("a parked flush install", |db, on| db.q.lock().parked_flush = on.then(parked_flush)),
+            ("a compaction", |db, on| db.st.lock().compacting = on),
+            ("a tail flush", |db, on| db.st.lock().flushing = on),
+            ("a sweep", |db, on| db.st.lock().sweeping = on),
+            ("a retention trim", |db, on| db.st.lock().trimming = on),
+        ];
+        rt().block_on(async {
+            let (eng, _, _) = engine(1, EngineConfig::small_for_tests());
+            let db = eng.db("d");
+            db.open(true).await.unwrap();
+            for (name, set) in work {
+                set(&db, true);
+                assert!(!db.unload(), "unloaded a database during {name}");
+                set(&db, false);
+                assert!(db.unload(), "setup: the database stayed loaded after {name}");
+                db.open(false).await.unwrap();
+            }
+        });
+    }
+
     #[test]
     fn hedged_write_outcomes() {
         use StoreError::{Fatal, PreconditionFailed as Refused, Unavailable};

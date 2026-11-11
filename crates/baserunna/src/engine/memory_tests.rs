@@ -132,6 +132,21 @@ fn databases_with_in_flight_work_are_not_unloaded() {
     });
 }
 
+/// Tests that a database stays loaded while a blob upload holds a reservation against its quota.
+#[test]
+fn databases_with_a_blob_upload_in_flight_are_not_unloaded() {
+    rt().block_on(async {
+        let (a, _store) =
+            delayed_engine_with("a", EngineConfig { db_max_bytes: MIB as u64, ..EngineConfig::default() });
+        let db = opened(&a, "d").await;
+        let mut upload = db.blob_writer("application/octet-stream").await;
+        upload.write(b"partial").await.unwrap();
+        assert!(!db.unload(), "unloaded a database with a blob upload in flight");
+        drop(upload);
+        assert!(db.unload());
+    });
+}
+
 #[test]
 fn transactions_charge_snapshot_read_set_and_write_set() {
     rt().block_on(async {

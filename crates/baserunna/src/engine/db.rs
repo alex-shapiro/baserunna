@@ -570,6 +570,8 @@ impl Db {
 
     /// Returns a version validated after `not_before`, fetching the manifest from storage
     /// if needed. Creates the database if `create` is true and the manifest does not exist.
+    /// A validation at the instant `not_before` counts only while no failed manifest `PUT` from
+    /// this node is unconfirmed, because equal instants do not order the validation and the call.
     pub async fn refresh(self: &Arc<Self>, not_before: Instant, create: bool) -> Result<Arc<Version>> {
         Ok(self.refresh_at(not_before, create).await?.0)
     }
@@ -578,8 +580,6 @@ impl Db {
         let _g = self.load_lock.lock().await;
         let (etag, cur) = {
             let st = self.st.lock();
-            // Equal instants do not order the verification and the request. A tie counts as
-            // verified only while no failed `PUT` from this node can change the stored manifest.
             if let (Some(c), Some(va)) = (&st.current, st.verified_at)
                 && (va > not_before || va == not_before && st.earliest_failed_put_at.is_none())
             {
@@ -1093,13 +1093,6 @@ impl Db {
         log::event(Level::Info, "commit", &fields);
     }
 
-    async fn base_for_commit(self: &Arc<Self>) -> Result<Arc<Version>> {
-        match self.current() {
-            Some(c) => Ok(c),
-            None => self.refresh(Instant::now(), false).await,
-        }
-    }
-
     async fn process(self: &Arc<Self>, batch: Vec<Work>) {
         let cfg = self.shared.cfg.clone();
         let mut maybe_applied = false;
@@ -1108,7 +1101,7 @@ impl Db {
         // Commit IDs included in an unfenced ambiguous manifest PUT from this batch.
         let mut ambiguous_commit_ids: BTreeSet<u64> = BTreeSet::new();
         let mut attempt = 0u32;
-        let mut base = match self.base_for_commit().await {
+        let mut base = match self.open(false).await {
             Ok(v) => v,
             Err(e) => {
                 self.clear_lease_flag(&batch);

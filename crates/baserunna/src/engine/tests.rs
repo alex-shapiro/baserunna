@@ -4,6 +4,7 @@ use super::*;
 use crate::engine::types::commit_key;
 use crate::env::Env;
 use crate::error::Error;
+use crate::sim::lease_check::{ManifestHistory, check_lease_view};
 use crate::store::StoreError;
 use crate::store::{BoxFut, DynStore, GetOpts, GetResult, ListPage, MemStore, ObjectStore, PutMode, SResult};
 use crate::util::prop;
@@ -992,18 +993,6 @@ impl LateManifestPutStore {
         Some(self.apply_manifest_put(&key, data, &mode))
     }
 
-    /// Returns the `If-Match` ETags of the buffered writes.
-    fn late_put_targets(&self) -> Vec<String> {
-        let late = self.late_puts.lock();
-        late.iter()
-            .filter_map(|(.., mode)| if let PutMode::IfMatch(e) = mode { Some(e.clone()) } else { None })
-            .collect()
-    }
-
-    fn stored_manifest_etag(&self, db: &str) -> Option<String> {
-        self.mem.get_sync(&manifest_key(db), &GetOpts::default()).ok().map(|g| g.etag)
-    }
-
     fn apply_manifest_put(&self, key: &str, data: Bytes, mode: &PutMode) -> SResult<String> {
         let r = self.mem.put_sync(key, data, mode);
         if let Ok(etag) = &r {
@@ -1032,6 +1021,26 @@ impl LateManifestPutStore {
 
     fn manifest_get_latency(&self) -> Duration {
         self.manifest_fault_script.lock().as_mut().map_or(Duration::ZERO, ManifestFaultScript::latency)
+    }
+}
+
+impl ManifestHistory for LateManifestPutStore {
+    fn stored_manifest_etag(&self, db: &str) -> Option<String> {
+        self.mem.get_sync(&manifest_key(db), &GetOpts::default()).ok().map(|g| g.etag)
+    }
+
+    fn manifest_applied_at(&self, _db: &str, etag: &str) -> Option<Instant> {
+        self.manifest_applied_at.lock().get(etag).copied()
+    }
+
+    /// Returns the `If-Match` ETags of the buffered writes to the manifest of `db`.
+    fn late_manifest_put_targets(&self, db: &str) -> Vec<String> {
+        let key = manifest_key(db);
+        let late = self.late_puts.lock();
+        late.iter()
+            .filter(|(k, ..)| *k == key)
+            .filter_map(|(.., mode)| if let PutMode::IfMatch(e) = mode { Some(e.clone()) } else { None })
+            .collect()
     }
 }
 
@@ -1589,33 +1598,10 @@ impl Drop for BuggifyScope {
 /// Node name and database handle that [`check_lease_views`] checks.
 type NodeDb<'a> = (&'a str, &'a Arc<Db>);
 
-/// Checks that each node stops relying on its lease before its lease term ends.
-/// Also checks that each lease-served view without an in-flight write is the stored manifest and
-/// that no buffered write can replace it.
+/// Checks each node's lease view with [`check_lease_view`].
 fn check_lease_views(dbs: &[NodeDb], store: &LateManifestPutStore) -> Result<(), String> {
     for (node, db) in dbs {
-        let Some(view) = db.leased_view() else { continue };
-        let applied_at = store.manifest_applied_at.lock().get(&view.etag).copied();
-        if let Some(applied_at) = applied_at {
-            let overrun = view.lease_overrun(applied_at, db.shared().cfg.lease_margin_ms);
-            if !overrun.is_zero() {
-                return Err(format!(
-                    "{node} relies on its lease at write {} for {} ms after its lease term ends",
-                    view.write_seq,
-                    overrun.as_millis()
-                ));
-            }
-        }
-        let LeasedView { write_seq, etag, write_in_flight: false, .. } = view else { continue };
-        let stored = store.stored_manifest_etag(&db.id);
-        if stored.as_ref() != Some(&etag) {
-            return Err(format!(
-                "{node} serves lease reads at write {write_seq} ({etag}), but the store has {stored:?}"
-            ));
-        }
-        if store.late_put_targets().contains(&etag) {
-            return Err(format!("{node} serves lease reads at write {write_seq} ({etag}), but a late PUT targets it"));
-        }
+        check_lease_view(db, store).map_err(|e| format!("{node} {e}"))?;
     }
     Ok(())
 }

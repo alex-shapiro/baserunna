@@ -157,11 +157,6 @@ impl SimStore {
         self.late_put_targets.lock().iter().filter(|(k, _)| k == key).map(|(_, e)| e.clone()).collect()
     }
 
-    /// Returns the ETag of the last write applied to the manifest at `key`, and when it was applied.
-    pub fn manifest_applied_at(&self, key: &str) -> Option<(String, Instant)> {
-        self.manifest_applied_at.lock().get(key).cloned()
-    }
-
     fn draw(&self) -> Draw {
         let f = self.faults.lock().clone();
         let mut r = self.rng.lock();
@@ -398,6 +393,21 @@ impl ObjectStore for SimStore {
 
     fn time_precision_ms(&self) -> u64 {
         self.mem.time_precision_ms()
+    }
+}
+
+impl super::lease_check::ManifestHistory for SimStore {
+    fn stored_manifest_etag(&self, db: &str) -> Option<String> {
+        self.mem.get_sync(&crate::engine::manifest_key(db), &GetOpts::default()).ok().map(|g| g.etag)
+    }
+
+    fn manifest_applied_at(&self, db: &str, etag: &str) -> Option<Instant> {
+        let applied = self.manifest_applied_at.lock();
+        applied.get(&crate::engine::manifest_key(db)).filter(|(e, _)| e == etag).map(|(_, at)| *at)
+    }
+
+    fn late_manifest_put_targets(&self, db: &str) -> Vec<String> {
+        self.late_put_targets(&crate::engine::manifest_key(db))
     }
 }
 

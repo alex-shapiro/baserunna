@@ -6,6 +6,7 @@ pub mod client;
 pub mod cost;
 pub mod explore;
 pub mod google;
+pub(crate) mod lease_check;
 pub mod mail;
 pub mod openapi_check;
 mod storage_check;
@@ -707,47 +708,17 @@ impl Sim {
     }
 
     /// Verifies that at most one node holds an active lease per database, and that each holder
-    /// stops relying on its lease before its lease term ends. Also checks that any
-    /// leased node without an in-flight manifest write matches the latest manifest in object
-    /// storage, and that no late write can replace it.
+    /// passes [`lease_check::check_lease_view`].
     fn check_oracles(&self) -> Result<(), String> {
         let mut holders: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for i in self.up_nodes() {
             let Some(n) = self.node(i) else { continue };
             for db in n.node.engine.open_dbs() {
-                let Some(view) = db.leased_view() else { continue };
+                if db.leased_view().is_none() {
+                    continue;
+                }
                 holders.entry(db.id.clone()).or_default().push(i);
-                let key = crate::engine::manifest_key(&db.id);
-                if let Some((etag, applied_at)) = self.store.manifest_applied_at(&key)
-                    && etag == view.etag
-                {
-                    let overrun = view.lease_overrun(applied_at, db.shared().cfg.lease_margin_ms);
-                    if !overrun.is_zero() {
-                        return Err(format!(
-                            "n{i} relies on its lease on {} at write {} for {} ms after its lease term ends",
-                            db.id,
-                            view.write_seq,
-                            overrun.as_millis()
-                        ));
-                    }
-                }
-                let crate::engine::LeasedView { write_seq, etag, write_in_flight: false, .. } = view else { continue };
-                if self.store.late_put_targets(&key).contains(&etag) {
-                    return Err(format!(
-                        "n{i} holds lease on {} at write {write_seq}, but a late write can replace it",
-                        db.id
-                    ));
-                }
-                let stored = self.mem.get_sync(&key, &GetOpts::default());
-                if let Ok(g) = stored
-                    && g.etag != etag
-                {
-                    let ws = crate::engine::manifest::Manifest::decode(&g.data).map_or(0, |m| m.write_seq);
-                    return Err(format!(
-                        "n{i} holds lease on {} at write {write_seq}, but store has write {ws}",
-                        db.id
-                    ));
-                }
+                lease_check::check_lease_view(&db, &*self.store).map_err(|e| format!("n{i} {e}"))?;
             }
         }
         match holders.into_iter().find(|(_, ns)| ns.len() > 1) {

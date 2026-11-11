@@ -2956,10 +2956,10 @@ fn snapshot_reads_on_lease_holder_load_applied_write() {
     });
 }
 
-/// A lease holder that loads its in-flight manifest write from storage reuses the lease from that
-/// write. The commit and the read together issue a single manifest write.
+/// Tests that a hot lease holder that loads its in-flight manifest write from storage sends no
+/// lease-only `PUT`. The commit sends the only manifest write, and its success gives the lease.
 #[test]
-fn lease_holder_refreshing_in_flight_write_reuses_lease() {
+fn lease_holder_refreshing_in_flight_write_sends_no_lease_put() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;

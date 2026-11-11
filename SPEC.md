@@ -25,7 +25,7 @@ scope for v1.
 
 - Nodes are stateless and interchangeable.
 - A node can be killed any time without losing committed data.
-- If a node is killed, another node can serve reads immediately or writes within one lease period.
+- If a node is killed, another node can serve reads immediately. It can serve writes within 11 s, or within 31 s if the killed node renewed its lease for reads (§5.7).
 
 4. **Testability.**
 

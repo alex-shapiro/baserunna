@@ -88,9 +88,11 @@ pub struct CommitMetrics {
     pub max_txns_per_batch: u64,
     /// Failed manifest `PUT`s that stopped strong reads from cache on a database. Until this node
     /// confirms a manifest write, each strong read on that database reads the manifest.
+    #[serde(default)]
     pub lease_reads_stopped: u64,
     /// Manifest reloads that found a write from a failed `PUT` of this node, and started strong
     /// reads from cache again.
+    #[serde(default)]
     pub lease_reads_restored_from_landed_writes: u64,
 }
 

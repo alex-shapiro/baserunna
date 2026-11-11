@@ -29,14 +29,16 @@ only.
 
 - [ ] [blocker · Stale strong read] **Enable the late-apply fault in the swarm
       profiles.** Enable `StoreFaults::p_late_apply` in the swarm profiles and
-      list the fault in SPEC §13.2. `StoreFaults::p_late_apply` makes the
-      simulated store return an error for a `PUT` and apply it later. First
-      triage `db_churn` seed 2037. With `p_late_apply` at 0.01 and
-      `late_apply_ms` at `(10, 2 * lease)`, `tests/sim.rs` and
-      `tests/coverage.rs` pass. Campaigns over 25 scenarios had 1 failure in
-      7,170 runs: `db_churn` seed 2037 timed out after a node crash loop. The
-      seed passes without late apply. A second `db_churn` campaign with late
-      apply had 0 failures in 10,592 runs.
+      list the fault in SPEC §13.2. The fault makes the simulated store return
+      an error for a `PUT` and apply the `PUT` later. Today only campaigns
+      inject it, with `SIM_P_LATE_APPLY`. With `SIM_P_LATE_APPLY=0.01`,
+      `tests/sim.rs` and `tests/coverage.rs` pass. At c6987ac, a 5-minute
+      campaign over all 25 scenarios from seed 70000 had 0 failures in 14,532
+      runs. At
+      128aded, 5-minute campaigns from seed 900000 had 0 failures: `register`
+      108,165 runs, `history` 206,667, `kv_model` 52,284, `watch` 87,321, and
+      `events` 27,359. `db_churn` seed 2037 timed out with late apply on main
+      too. The tangential item on system-segment re-reads records it.
 - [ ] [blocker · Tenant resource exhaustion] **Charge event query memory to the
       node `MemoryGate` and fair-share `Node::query_slot`.** Reserve
       `MemoryGate` capacity for event queries and share `Node::query_slot`
@@ -466,7 +468,13 @@ only.
 - [ ] [tangential · Simulator] **Fix `db_churn` timeouts if a node crash-loops
       under memory pressure.** Avoid repeated system-segment re-reads if a node
       restarts under a tiny cache budget (`sim_tool trace db_churn 606688`,
-      which uses 2 KiB segments and a 4 KiB disk cache).
+      which uses 2 KiB segments and a 4 KiB disk cache). `db_churn` seed 2037
+      with late apply also timed out this way, on main and at c6987ac: one node
+      crashed 719 times with a 4 KiB disk cache, and 433,466 of the 463,739
+      trace lines were system-segment re-reads. Without late apply, the seed
+      passed with 291,803 of 335,672 trace lines on the same re-reads. At
+      128aded, the seed passes with `SIM_P_LATE_APPLY=0.01` (17,748 s
+      simulated), because the run changed.
 - [ ] [tangential · Simulator] **Order manifest checks and strong reads that
       share a paused-clock instant.** `Db::refresh` lets a strong read reuse a
       manifest check from the same `Instant`. Under a paused clock, the read

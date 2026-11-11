@@ -490,6 +490,16 @@ only.
       by their start sequence fixes both cases, but increases
       `node_overhead_1_node` from 121 to 151 manifest `GET`s and
       `node_overhead_3_nodes` from 140.3 to 170.3.
+- [ ] [tangential · Simulator] **Merge the manifest-fault store doubles.**
+      Four test doubles inject manifest `PUT` faults: `SimStore`,
+      `LateManifestPutStore` in `engine/tests.rs` (queued and random outcomes,
+      late writes that the test applies), `LateManifestPutStore` in
+      `tests/stale_strong_read.rs` (late writes only), and
+      `DelayedManifestPutStore` (writes that time out and apply after a
+      delay). `DelayStore` also loses replies and injects conflicts. Give
+      `SimStore` queued outcomes and test-applied late writes, and use it in
+      these tests. The integration test cannot use test-only code of the
+      library, so the merged double must be public, as `SimStore` is.
 - [ ] [tangential · Simulator] **Tolerate transient form errors in the
       `console` workload.** Allow transient password-change timeouts at
       `/console/account/password` during simulated storage stalls instead of

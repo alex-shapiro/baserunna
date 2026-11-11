@@ -11,7 +11,7 @@ use crate::util::prop;
 use crate::util::rng::Rng;
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -950,19 +950,30 @@ enum ManifestPutOutcome {
 /// Random outcomes and latencies for the manifest requests of a [`LateManifestPutStore`].
 struct ManifestFaultScript {
     rng: Rng,
-    /// Weights of the outcomes in [`ManifestPutOutcome`] order.
-    outcome_weights: [f64; 5],
+    outcome_weights: [(ManifestPutOutcome, f64); 5],
     max_latency_ms: u64,
 }
 
 impl ManifestFaultScript {
     fn random(r: &mut Rng) -> ManifestFaultScript {
+        use ManifestPutOutcome::*;
         let applied = *r.pick(&[1.0, 3.0, 9.0]);
         ManifestFaultScript {
             rng: r.fork(),
-            outcome_weights: [applied, 1.0, 1.0, 1.0 + r.below(3) as f64, 1.0],
+            outcome_weights: [
+                (Applied, applied),
+                (FailedBeforeApply, 1.0),
+                (AppliedThenFailed, 1.0),
+                (FailedThenAppliedLate, 1.0 + r.below(3) as f64),
+                (AppliedThenRejected, 1.0),
+            ],
             max_latency_ms: *r.pick(&[0, 2, 30]),
         }
+    }
+
+    fn outcome(&mut self) -> ManifestPutOutcome {
+        let weights = self.outcome_weights.map(|(_, w)| w);
+        self.rng.weighted(&weights).map_or(ManifestPutOutcome::Applied, |i| self.outcome_weights[i].0)
     }
 
     fn latency(&mut self) -> Duration {
@@ -970,15 +981,14 @@ impl ManifestFaultScript {
     }
 }
 
-/// Object store wrapper that fails the next `failed_manifest_puts` manifest writes and buffers them.
-/// [`LateManifestPutStore::apply_late_puts`] applies those writes with their original preconditions.
-/// If `manifest_fault_script` is set, it also draws an outcome for each manifest write.
+/// Object store wrapper that gives each manifest write an outcome: the next queued outcome, else an
+/// outcome from `manifest_fault_script`, else [`ManifestPutOutcome::Applied`]. It buffers writes that
+/// apply late, and [`LateManifestPutStore::apply_late_puts`] applies them with their original
+/// preconditions.
 struct LateManifestPutStore {
     mem: Arc<MemStore>,
-    failed_manifest_puts: AtomicU32,
-    /// Outcomes that manifest writes take in turn, and the number of writes that took an outcome.
-    /// Overrides `manifest_fault_script`.
-    cycled_manifest_put_outcomes: Mutex<Option<(Vec<ManifestPutOutcome>, usize)>>,
+    /// Outcomes that the next manifest writes take, in order.
+    queued_manifest_put_outcomes: Mutex<VecDeque<ManifestPutOutcome>>,
     late_puts: Mutex<Vec<(String, Bytes, PutMode)>>,
     /// True if the next manifest write applies the buffered writes first.
     apply_late_puts_on_next_put: std::sync::atomic::AtomicBool,
@@ -988,13 +998,21 @@ struct LateManifestPutStore {
     /// True if manifest reads fail.
     manifest_get_outage: std::sync::atomic::AtomicBool,
     manifest_puts: AtomicU32,
-    /// ETags of the manifest writes that the store applied, in order.
-    stored_manifest_etags: Mutex<Vec<String>>,
-    /// Instant at which the store applied each manifest write, by ETag.
-    manifest_applied_at: Mutex<BTreeMap<String, Instant>>,
+    /// ETag and instant of each manifest write that the store applied, in order.
+    applied_manifest_puts: Mutex<Vec<(String, Instant)>>,
 }
 
 impl LateManifestPutStore {
+    /// Gives `outcome` to the next `n` manifest writes that have no queued outcome.
+    fn queue_manifest_puts(&self, outcome: ManifestPutOutcome, n: u32) {
+        self.queued_manifest_put_outcomes.lock().extend((0..n).map(|_| outcome));
+    }
+
+    /// Returns the ETags of the manifest writes that the store applied, in order.
+    fn applied_manifest_etags(&self) -> Vec<String> {
+        self.applied_manifest_puts.lock().iter().map(|(etag, _)| etag.clone()).collect()
+    }
+
     fn apply_late_puts(&self) -> Vec<SResult<String>> {
         let late = std::mem::take(&mut *self.late_puts.lock());
         late.into_iter().map(|(key, data, mode)| self.apply_manifest_put(&key, data, &mode)).collect()
@@ -1012,30 +1030,23 @@ impl LateManifestPutStore {
     fn apply_manifest_put(&self, key: &str, data: Bytes, mode: &PutMode) -> SResult<String> {
         let r = self.mem.put_sync(key, data, mode);
         if let Ok(etag) = &r {
-            self.stored_manifest_etags.lock().push(etag.clone());
-            self.manifest_applied_at.lock().insert(etag.clone(), Instant::now());
+            self.applied_manifest_puts.lock().push((etag.clone(), Instant::now()));
         }
         r
     }
 
-    fn draw_manifest_put(&self) -> (ManifestPutOutcome, Duration) {
-        if let Some((outcomes, drawn)) = self.cycled_manifest_put_outcomes.lock().as_mut() {
-            *drawn += 1;
-            return (outcomes[(*drawn - 1) % outcomes.len()], Duration::ZERO);
-        }
+    fn draw_manifest_put(&self) -> ManifestPutOutcome {
+        let queued = self.queued_manifest_put_outcomes.lock().pop_front();
         let mut script = self.manifest_fault_script.lock();
-        let Some(s) = script.as_mut() else { return (ManifestPutOutcome::Applied, Duration::ZERO) };
-        let outcome = match s.rng.weighted(&s.outcome_weights) {
-            Some(1) => ManifestPutOutcome::FailedBeforeApply,
-            Some(2) => ManifestPutOutcome::AppliedThenFailed,
-            Some(3) => ManifestPutOutcome::FailedThenAppliedLate,
-            Some(4) => ManifestPutOutcome::AppliedThenRejected,
-            _ => ManifestPutOutcome::Applied,
-        };
-        (outcome, s.latency())
+        match (queued, script.as_mut()) {
+            (Some(outcome), _) => outcome,
+            (None, Some(s)) => s.outcome(),
+            (None, None) => ManifestPutOutcome::Applied,
+        }
     }
 
-    fn manifest_get_latency(&self) -> Duration {
+    /// Returns a request latency from `manifest_fault_script`, or zero.
+    fn request_latency(&self) -> Duration {
         self.manifest_fault_script.lock().as_mut().map_or(Duration::ZERO, ManifestFaultScript::latency)
     }
 }
@@ -1046,7 +1057,7 @@ impl ManifestHistory for LateManifestPutStore {
     }
 
     fn manifest_applied_at(&self, _db: &str, etag: &str) -> Option<Instant> {
-        self.manifest_applied_at.lock().get(etag).copied()
+        self.applied_manifest_puts.lock().iter().find(|(e, _)| e == etag).map(|(_, at)| *at)
     }
 
     /// Returns the `If-Match` ETags of the buffered writes to the manifest of `db`.
@@ -1065,7 +1076,7 @@ impl ObjectStore for LateManifestPutStore {
         Box::pin(async move {
             if key.ends_with("/manifest") {
                 self.manifest_gets.fetch_add(1, SeqCst);
-                tokio::time::sleep(self.manifest_get_latency()).await;
+                tokio::time::sleep(self.request_latency()).await;
                 if self.manifest_get_outage.load(SeqCst) {
                     return Err(StoreError::Unavailable("connection refused".into()));
                 }
@@ -1080,15 +1091,11 @@ impl ObjectStore for LateManifestPutStore {
                 return self.mem.put_sync(key, data, &mode);
             }
             self.manifest_puts.fetch_add(1, SeqCst);
-            let (outcome, latency) = self.draw_manifest_put();
-            tokio::time::sleep(latency).await;
+            let outcome = self.draw_manifest_put();
+            tokio::time::sleep(self.request_latency()).await;
             if !self.late_puts.lock().is_empty() && self.apply_late_puts_on_next_put.swap(false, SeqCst) {
                 self.apply_late_puts();
             }
-            let outcome = match take_fault(&self.failed_manifest_puts) {
-                true => ManifestPutOutcome::FailedThenAppliedLate,
-                false => outcome,
-            };
             let r = match outcome {
                 ManifestPutOutcome::FailedBeforeApply => {
                     return Err(StoreError::Unavailable("connection refused".into()));
@@ -1101,7 +1108,7 @@ impl ObjectStore for LateManifestPutStore {
                 | ManifestPutOutcome::AppliedThenFailed
                 | ManifestPutOutcome::AppliedThenRejected => self.apply_manifest_put(key, data, &mode),
             };
-            tokio::time::sleep(self.manifest_get_latency()).await;
+            tokio::time::sleep(self.request_latency()).await;
             let r = match outcome {
                 ManifestPutOutcome::AppliedThenRejected => r.and(Err(StoreError::PreconditionFailed)),
                 _ => r,
@@ -1140,8 +1147,7 @@ fn late_manifest_put_nodes_with(seed: u64, cfg: EngineConfig) -> (Arc<Engine>, A
     let mem = Arc::new(MemStore::new(Box::new(move || clock.now_ms())));
     let store = Arc::new(LateManifestPutStore {
         mem,
-        failed_manifest_puts: 0.into(),
-        cycled_manifest_put_outcomes: Mutex::default(),
+        queued_manifest_put_outcomes: Mutex::default(),
         late_puts: Mutex::default(),
         apply_late_puts_on_next_put: false.into(),
         manifest_put_rejected: tokio::sync::Notify::new(),
@@ -1149,8 +1155,7 @@ fn late_manifest_put_nodes_with(seed: u64, cfg: EngineConfig) -> (Arc<Engine>, A
         manifest_gets: 0.into(),
         manifest_get_outage: false.into(),
         manifest_puts: 0.into(),
-        stored_manifest_etags: Mutex::default(),
-        manifest_applied_at: Mutex::default(),
+        applied_manifest_puts: Mutex::default(),
     });
     let a = Engine::new(store.clone(), env.clone(), cfg.clone(), "a".into());
     let b = Engine::new(store.clone(), env, cfg, "b".into());
@@ -1194,7 +1199,7 @@ fn strong_read_after_late_manifest_put_once_unknown(poll_every_ms: u64) {
         put(&db_a, "k", "old").await;
         db_b.open(false).await.unwrap();
         assert_eq!(strong_get(&db_b, "k").await, Some(inline("old")));
-        store.failed_manifest_puts.store(a.shared.cfg.commit_retry_max, SeqCst);
+        store.queue_manifest_puts(ManifestPutOutcome::FailedThenAppliedLate, a.shared.cfg.commit_retry_max);
         let outcome = commit_new(db_a.clone()).await;
         assert!(matches!(outcome, Err(Error::Unavailable { outcome_unknown: true, .. })), "answered {outcome:?}");
         assert_eq!(strong_get(&db_a, "k").await, Some(inline("old")), "setup: the late write was not applied yet");
@@ -1230,7 +1235,7 @@ fn strong_read_after_late_manifest_put_during_retry_is_new() {
         put(&db_a, "k", "old").await;
         db_b.open(false).await.unwrap();
         assert_eq!(strong_get(&db_b, "k").await, Some(inline("old")));
-        store.failed_manifest_puts.store(1, SeqCst);
+        store.queue_manifest_puts(ManifestPutOutcome::FailedThenAppliedLate, 1);
         store.apply_late_puts_on_next_put.store(true, SeqCst);
         let commit = tokio::spawn(commit_new(db_a.clone()));
         store.manifest_put_rejected.notified().await;
@@ -1257,10 +1262,9 @@ fn strong_read_after_an_applied_manifest_put_returns_412_is_new() {
         db_b.open(false).await.unwrap();
         assert!(db_a.leased_view().is_some(), "setup: A holds its lease");
         sleep_ms(100).await;
-        *store.cycled_manifest_put_outcomes.lock() = Some((vec![ManifestPutOutcome::AppliedThenRejected], 0));
+        store.queue_manifest_puts(ManifestPutOutcome::AppliedThenRejected, 1);
         let commit = tokio::spawn(commit_new(db_a.clone()));
         store.manifest_put_rejected.notified().await;
-        *store.cycled_manifest_put_outcomes.lock() = None;
         assert_eq!(strong_get(&db_b, "k").await, Some(inline("new")), "B reads the applied write");
         let (stale_ms, _) = ms_until_strong_read_is_new(&db_a, 1).await;
         let outcome = commit.await.unwrap();
@@ -1281,10 +1285,9 @@ async fn commit_applied_with_a_412(
     put(&db_a, "k", "old").await;
     db_b.open(false).await.unwrap();
     sleep_ms(100).await;
-    *store.cycled_manifest_put_outcomes.lock() = Some((vec![ManifestPutOutcome::AppliedThenRejected], 0));
+    store.queue_manifest_puts(ManifestPutOutcome::AppliedThenRejected, 1);
     let commit = tokio::spawn(commit_new(db_a.clone()));
     store.manifest_put_rejected.notified().await;
-    *store.cycled_manifest_put_outcomes.lock() = None;
     store.manifest_get_outage.store(reads_fail, SeqCst);
     let outcome = commit.await.unwrap();
     store.manifest_get_outage.store(false, SeqCst);
@@ -1347,7 +1350,7 @@ fn commit_applied_by_another_node_after_an_unknown_put_is_replayed() {
             CommitRequest { commit_id: 7, ..t.into_request() }
         };
         let (req_a, req_b) = (request(db_a.clone()).await, request(db_b.clone()).await);
-        *store.cycled_manifest_put_outcomes.lock() = Some((vec![ManifestPutOutcome::FailedBeforeApply], 0));
+        store.queue_manifest_puts(ManifestPutOutcome::FailedBeforeApply, 1);
         let puts = store.manifest_puts.load(SeqCst);
         let commit_a = tokio::spawn({
             let db_a = db_a.clone();
@@ -1356,7 +1359,6 @@ fn commit_applied_by_another_node_after_an_unknown_put_is_replayed() {
         while store.manifest_puts.load(SeqCst) == puts {
             sleep_ms(1).await;
         }
-        *store.cycled_manifest_put_outcomes.lock() = None;
         let outcome_b = db_b.commit_detailed(req_b).await;
         assert!(matches!(outcome_b, Ok(Committed { replayed: false, .. })), "setup: B answered {outcome_b:?}");
         let outcome_a = commit_a.await.unwrap();
@@ -1374,7 +1376,7 @@ fn lease_reads_stay_off_from_a_rejected_retry_until_a_put_succeeds() {
         let (a, _b, store) = late_manifest_put_nodes();
         let db_a = opened(&a, "d").await;
         put(&db_a, "k", "old").await;
-        store.failed_manifest_puts.store(1, SeqCst);
+        store.queue_manifest_puts(ManifestPutOutcome::FailedThenAppliedLate, 1);
         store.apply_late_puts_on_next_put.store(true, SeqCst);
         let puts_before_commit = store.manifest_puts.load(SeqCst);
         let mut commit = Box::pin(commit_new(db_a.clone()));
@@ -1439,7 +1441,7 @@ fn strong_read_after_late_manifest_put_from_an_earlier_batch(handle_drop: IdleHa
         let (a, b, store) = late_manifest_put_nodes();
         let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
         put(&db_a, "k", "old").await;
-        store.failed_manifest_puts.store(a.shared.cfg.commit_retry_max, SeqCst);
+        store.queue_manifest_puts(ManifestPutOutcome::FailedThenAppliedLate, a.shared.cfg.commit_retry_max);
         let outcome = commit_new(db_a.clone()).await;
         assert!(
             matches!(outcome, Err(Error::Unavailable { outcome_unknown: true, .. })),
@@ -1454,7 +1456,7 @@ fn strong_read_after_late_manifest_put_from_an_earlier_batch(handle_drop: IdleHa
         db_b.open(false).await.unwrap();
         assert_eq!(strong_get(&db_b, "k").await, Some(inline("new")), "setup: B reads the late write and A's lease");
         sleep_ms(3000).await;
-        store.failed_manifest_puts.store(1, SeqCst);
+        store.queue_manifest_puts(ManifestPutOutcome::FailedThenAppliedLate, 1);
         t.put(Bytes::from_static(b"k"), inline("mine")).unwrap();
         let outcome = db_a.commit_detailed(t.into_request()).await;
         assert!(outcome.is_err(), "setup: A's commit on the old manifest answered {outcome:?}");
@@ -1484,7 +1486,7 @@ async fn unknown_commit_outcome_nodes() -> (Arc<Db>, Arc<LateManifestPutStore>, 
     let (a, _b, store) = late_manifest_put_nodes();
     let db_a = opened(&a, "d").await;
     put(&db_a, "k", "old").await;
-    store.failed_manifest_puts.store(a.shared.cfg.commit_retry_max, SeqCst);
+    store.queue_manifest_puts(ManifestPutOutcome::FailedThenAppliedLate, a.shared.cfg.commit_retry_max);
     let outcome = commit_new(db_a.clone()).await;
     assert!(matches!(outcome, Err(Error::Unavailable { outcome_unknown: true, .. })), "setup: answered {outcome:?}");
     (db_a, store, a)
@@ -1766,7 +1768,11 @@ fn lease_oracle_reports_a_lease_that_outlives_its_term() {
         let view = db_a.leased_view().expect("setup: A holds its lease");
         assert_eq!(check_lease_view(&db_a, &*store), Ok(()), "setup: the oracle reports a valid lease");
         let applied_at = store.manifest_applied_at("d", &view.etag).expect("setup: the store applied the manifest");
-        store.manifest_applied_at.lock().insert(view.etag.clone(), applied_at - Duration::from_millis(100));
+        for (etag, at) in store.applied_manifest_puts.lock().iter_mut() {
+            if *etag == view.etag {
+                *at = applied_at - Duration::from_millis(100);
+            }
+        }
         let overrun = format!("relies on its lease on d at write {} for 100 ms after the lease term", view.write_seq);
         assert_eq!(check_lease_view(&db_a, &*store), Err(overrun));
     });
@@ -1786,7 +1792,7 @@ async fn check_strong_read(db: &Arc<Db>, waits_for_write: bool, store: &LateMani
     // Paused time does not advance between steps. Advance 1 ms so the read starts at a later
     // instant than earlier store changes.
     sleep_ms(1).await;
-    let first = store.stored_manifest_etags.lock().len() - 1;
+    let first = store.applied_manifest_puts.lock().len() - 1;
     let (snap, write_in_flight) = match waits_for_write {
         true => (db.snapshot(Consistency::Strong).await, false),
         false => match db.latest_snapshot().await {
@@ -1795,7 +1801,7 @@ async fn check_strong_read(db: &Arc<Db>, waits_for_write: bool, store: &LateMani
         },
     };
     let snap = snap.map_err(|e| format!("strong read failed: {e}"))?;
-    let held = store.stored_manifest_etags.lock()[first..].to_vec();
+    let held = store.applied_manifest_etags()[first..].to_vec();
     if !write_in_flight && !held.contains(&snap.version.etag) {
         return Err(format!(
             "strong read returned write {} ({}), but the store held only {held:?} during the read",

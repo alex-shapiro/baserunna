@@ -357,14 +357,18 @@ only.
       a hedged duplicate fails with `412` and retries are exhausted, so the
       committer can determine the outcome instead of returning
       `outcome: "unknown"`.
-- [ ] [nice-to-have · Operations] **Recognize this node's lease in a manifest
-      `PUT` that the store applied after its batch ended.** Keep the write
-      sequence numbers of unknown-outcome manifest `PUT`s after `Db::process`
-      returns, so a later manifest read that finds one restores the lease from
-      `earliest_failed_put_at`. Without this, the holder sends a manifest `GET` for each
-      strong read until its next successful `PUT`, and other nodes forward
-      requests to it for 5.5 s. A hot database sends a lease `PUT` after one
-      `GET`.
+- [ ] [nice-to-have · Lease] **Take the lease only from a successful manifest
+      `PUT`.** Remove the retry-loop restore that takes the lease from a
+      manifest written by one of this node's ambiguous `PUT`s. This product
+      tradeoff needs a decision. The restore has caused three stale strong
+      reads, and it needs the node-wide `Shared::own_leases` map on the
+      strong-read path. Without it, the lease returns to the database handle.
+      The cost is a few manifest `GET`s after a lost response. In the 15 s
+      after a lost response, reads every 1.5 s send 10 `GET`s instead of 8, and
+      reads every 250 ms send 14 `GET`s instead of 0. A hot database sends one
+      lease `PUT` with or without the restore. Recommended. If the restore
+      stays, also restore the lease from a manifest `PUT` that the store
+      applied after its batch ended.
 - [ ] [nice-to-have · Operations] **Account for object overhead in the segment
       block cache.** Increase the per-entry overhead in `CacheVal::size` above
       48 bytes so small block-cache entries are not undercounted by half of

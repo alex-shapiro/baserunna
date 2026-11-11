@@ -10,7 +10,8 @@
 //!
 //! Campaigns and explorations use all available CPU cores unless `SIM_THREADS` is set,
 //! and stop starting new runs after `SIM_MINUTES`. When `SIM_REQUIRE_PROBES` is set,
-//! a campaign exits with a non-zero status if any probe was not reached.
+//! a campaign exits with a non-zero status if any probe was not reached. `SIM_P_LATE_APPLY`
+//! sets the typical rate of store writes that fail and apply later (for example, `0.01`).
 
 use baserunna::probe::Probe;
 use baserunna::sim::campaign::{Job, RARE, Report, campaign, default_threads, parse_branches};

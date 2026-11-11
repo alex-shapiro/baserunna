@@ -1549,7 +1549,7 @@ At the end of every run, storage invariant checks verify that all manifests, lev
 ### 13.4 Coverage, campaigns, and exploration
 
 - **Probes** (`crates/baserunna/src/probe.rs`): instrumentation points in production code record rare execution paths (such as replayed commits, ambiguous manifest writes that succeeded, lease takeovers, duplicate forwards, and rejected compactions). `crates/baserunna/tests/coverage.rs` runs 8 seeds of each scenario and asserts that all documented API operations and all non-rare probes are reached.
-- **Campaigns** (`sim_tool campaign`): executes scenarios across seeds on all available CPU cores and reports failure reproduction commands and probe hit rates.
+- **Campaigns** (`sim_tool campaign`): executes scenarios across seeds on all available CPU cores and reports failure reproduction commands and probe hit rates. `SIM_P_LATE_APPLY` sets the typical rate of store writes that fail and apply later. The swarm profiles do not inject this fault.
 - **Guided exploration** (`sim_tool explore`, `sim::explore`): alternates between fresh seeds and branched runs that fork from existing runs immediately after a rare probe is hit. Runs that discover a new coverage feature (a probe hit-count bucket or a pair of rare probes in the same run) are added to the exploration corpus.
 - **Bug zoo** (`bugzoo/`): 27 patches reintroduce historical concurrency and fault-handling bugs (§13.6), and `bugzoo/run.sh` measures how many simulation runs are required to detect each defect.
 

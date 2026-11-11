@@ -108,6 +108,13 @@ impl Profile {
     pub const FAULTY: Profile = Profile { nodes: (1, 5), faults: true, skew: Skew::Hostile };
 }
 
+/// Returns the typical rate of `StoreFaults::p_late_apply` from `SIM_P_LATE_APPLY`, or 0 if it is
+/// not set. The swarm profiles do not inject late applies yet (TODO.md blocker "Enable the
+/// late-apply fault in the swarm profiles"), but campaigns can.
+fn typical_late_apply_rate() -> f64 {
+    std::env::var("SIM_P_LATE_APPLY").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)
+}
+
 /// Generates a randomized [`SimConfig`] within the bounds of `p`.
 pub fn world(k: &Knobs, p: Profile) -> SimConfig {
     let mut c = SimConfig::basic();
@@ -130,6 +137,8 @@ pub fn world(k: &Knobs, p: Profile) -> SimConfig {
             list_lag_ms: k.pick("store.list_lag_ms", &[0, 0, 500, 5_000]),
             p_late_reply: k.rate("store.p_late_reply", 0.05),
             late_reply_ms: (50, k.log_range("store.late_reply_max_ms", 100, 2_000)),
+            p_late_apply: k.rate("store.p_late_apply", typical_late_apply_rate()),
+            late_apply_ms: (10, 2 * lease),
             ..StoreFaults::none()
         };
         c.net = NetFaults {

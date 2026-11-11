@@ -1757,8 +1757,8 @@ fn merges_fetch_each_small_input_once() {
         assert_eq!(inputs.len(), 4);
         let before = store.scope("db").gets;
         maint::merge(&db, &s, &inputs).await.unwrap();
-        let part_gets = store.scope("db").gets - before;
-        assert_eq!(part_gets, inputs.len() as f64, "GETs for {} small inputs", inputs.len());
+        let gets = store.scope("db").gets - before;
+        assert_eq!(gets, inputs.len() as f64 + 1.0, "GETs for the manifest and {} small inputs", inputs.len());
         let q = json!({"from": T0, "to": T0 + DAY, "aggregates": {"n": {"fn": "count"}}});
         assert_eq!(query(&db, &q).await.unwrap().rows, vec![vec![json!(80)]]);
     });

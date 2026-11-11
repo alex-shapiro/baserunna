@@ -41,13 +41,43 @@ pub enum Consistency {
 }
 
 tokio::task_local! {
-    static INVOKED_AT: Instant;
+    static INVOKED_AT: OrderedInstant;
 }
 
-/// Runs `f` as a single operation invoked at `at` so strong reads within the
-/// scope can reuse a manifest validated at or after `at`.
+/// Runs `f` as a single operation invoked at `at` so strong reads within the scope can reuse a
+/// manifest request that started at or after `at` and finished after the scope started.
 pub async fn invoked_at<F: std::future::Future>(at: Instant, f: F) -> F::Output {
-    INVOKED_AT.scope(at, f).await
+    INVOKED_AT.scope(OrderedInstant::new(at), f).await
+}
+
+/// Monotonic clock reading that orders equal readings by the order in which this process created them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct OrderedInstant {
+    at: Instant,
+    seq: u64,
+}
+
+impl OrderedInstant {
+    /// Creates the reading of `at`, which must not be later than now.
+    fn new(at: Instant) -> OrderedInstant {
+        static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        OrderedInstant { at, seq: NEXT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) }
+    }
+}
+
+/// Manifest read or write that found `current` or an older version.
+#[derive(Clone, Copy)]
+struct ManifestCheck {
+    started: Instant,
+    finished: OrderedInstant,
+}
+
+impl ManifestCheck {
+    /// Returns true if this check can answer a strong read invoked at `invoked`: the check started
+    /// at or after the instant of `invoked`, and finished after `invoked`.
+    fn answers(&self, invoked: OrderedInstant) -> bool {
+        self.started >= invoked.at && self.finished > invoked
+    }
 }
 
 enum Work {
@@ -162,10 +192,11 @@ impl Work {
 
 struct State {
     current: Option<Arc<Version>>,
-    /// False after an ambiguous write until a manifest read that started after the failure completes.
-    trusted: bool,
-    distrusted_at: Option<Instant>,
-    verified_at: Option<Instant>,
+    /// `If-Match` ETag of the last manifest `PUT` from this node that failed. The store replaced
+    /// that manifest, or can still replace it.
+    failed_put_target_etag: Option<String>,
+    /// Manifest check with the latest start.
+    verified: Option<ManifestCheck>,
     last_access: Instant,
     last_access_seq: u64,
     window_start: Instant,
@@ -175,7 +206,6 @@ struct State {
     /// `(write_seq, expires_at)` for the lease held by this node.
     own_lease: Option<(u64, Instant)>,
     /// Hedged manifest `PUT` requests that remain in flight in the background.
-    /// Lease-based reads are disabled while this count is non-zero.
     in_flight_hedged_puts: u32,
     /// Start instant of this node's in-flight manifest write.
     manifest_write_started_at: Option<Instant>,
@@ -191,9 +221,9 @@ struct State {
 }
 
 impl State {
-    fn distrust(&mut self) {
-        self.trusted = false;
-        self.distrusted_at = Some(Instant::now());
+    /// Returns true if a failed manifest `PUT` from this node replaced `v` or can still replace it.
+    fn failed_put_may_replace(&self, v: &Version) -> bool {
+        self.failed_put_target_etag.as_deref() == Some(v.etag.as_str())
     }
 
     fn hot(&self, threshold: u32) -> bool {
@@ -265,9 +295,8 @@ impl Db {
         Arc::new(Db {
             st: Mutex::new(State {
                 current: None,
-                trusted: false,
-                distrusted_at: None,
-                verified_at: None,
+                failed_put_target_etag: None,
+                verified: None,
                 last_access: now,
                 last_access_seq: 0,
                 window_start: now,
@@ -353,7 +382,7 @@ impl Db {
         }
         let Some(cur) = st.current.take() else { return false };
         st.unloaded_stored_bytes = cur.m.stored_bytes();
-        st.verified_at = None;
+        st.verified = None;
         drop(q);
         drop(st);
         let mut pages = self.pages.lock();
@@ -375,6 +404,15 @@ impl Db {
         match st.own_lease {
             Some((ws, until)) if ours && ws == m.write_seq => until.saturating_duration_since(Instant::now()),
             _ => Duration::ZERO,
+        }
+    }
+
+    /// Remaining duration we may serve strong reads of `v` from cache, or zero if we hold no
+    /// lease in `v` or a failed manifest `PUT` can replace `v`.
+    fn lease_read_left(&self, st: &State, v: &Version) -> Duration {
+        match st.failed_put_may_replace(v) {
+            true => Duration::ZERO,
+            false => self.own_lease_left(st, &v.m),
         }
     }
 
@@ -436,7 +474,7 @@ impl Db {
     pub fn leased_view(&self) -> Option<(u64, String, bool)> {
         let st = self.st.lock();
         let cur = st.current.as_ref()?;
-        (st.trusted && st.in_flight_hedged_puts == 0 && self.holds_lease(&st, &cur.m))
+        (!self.lease_read_left(&st, cur).is_zero())
             .then(|| (cur.m.write_seq, cur.etag.clone(), self.has_in_flight_write()))
     }
 
@@ -522,8 +560,8 @@ impl Db {
         }
     }
 
-    /// Installs `v` if it is newer than `current`, and marks `current` as trusted if `verified`
-    /// is not earlier than `distrusted_at`.
+    /// Installs `v` if it is newer than `current`. `verified` is the start of the manifest read or
+    /// write that found `v`.
     fn install(&self, v: Arc<Version>, verified: Instant) -> Arc<Version> {
         let mut st = self.st.lock();
         self.shared.env.trace(|| {
@@ -551,32 +589,29 @@ impl Db {
         if let Some(l) = installed.m.lease.as_ref().filter(|l| l.node != self.shared.node_id) {
             self.shared.lease_seen(&self.id, l, installed.m.write_seq);
         }
-        if st.distrusted_at.is_none_or(|d| verified >= d) {
-            st.trusted = true;
-            if st.verified_at.is_none_or(|old| verified > old) {
-                st.verified_at = Some(verified);
-            }
+        if st.verified.is_none_or(|old| verified >= old.started) {
+            st.verified = Some(ManifestCheck { started: verified, finished: OrderedInstant::new(Instant::now()) });
         }
         drop(st);
         self.shared.unload_idle();
         installed
     }
 
-    /// Returns a version validated at or after `not_before`, fetching the manifest from storage
-    /// if needed. Creates the database if `create` is true and the manifest does not exist.
+    /// Returns a version from a manifest check that started at or after `not_before` and finished
+    /// after this call, fetching the manifest from storage if needed. Creates the database if
+    /// `create` is true and the manifest does not exist.
     pub async fn refresh(self: &Arc<Self>, not_before: Instant, create: bool) -> Result<Arc<Version>> {
-        Ok(self.refresh_at(not_before, create).await?.0)
+        Ok(self.refresh_at(OrderedInstant::new(not_before), create).await?.0)
     }
 
-    async fn refresh_at(self: &Arc<Self>, not_before: Instant, create: bool) -> Result<(Arc<Version>, Instant)> {
+    async fn refresh_at(self: &Arc<Self>, not_before: OrderedInstant, create: bool) -> Result<(Arc<Version>, Instant)> {
         let _g = self.load_lock.lock().await;
         let (etag, cur) = {
             let st = self.st.lock();
-            if let (Some(c), Some(va)) = (&st.current, st.verified_at)
-                && va >= not_before
-                && st.trusted
+            if let (Some(c), Some(check)) = (&st.current, st.verified)
+                && check.answers(not_before)
             {
-                return Ok((c.clone(), va));
+                return Ok((c.clone(), check.started));
             }
             (st.current.as_ref().map(|c| c.etag.clone()), st.current.clone())
         };
@@ -713,6 +748,7 @@ impl Db {
         if let Some((cur, current_at)) = self.cached(c, now) {
             return self.snapshot_at(check_live(cur)?, current_at).await;
         }
+        let now = OrderedInstant::new(now);
         let not_before = match c {
             Consistency::Strong => INVOKED_AT.try_with(|t| *t).unwrap_or(now).min(now),
             Consistency::Snapshot { .. } => now,
@@ -722,7 +758,11 @@ impl Db {
         let hot = {
             let mut st = self.st.lock();
             let hot = st.hot(self.shared.cfg.lease_read_threshold) && !st.lease_requested;
-            if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v).is_none() && !self.has_in_flight_write() {
+            if hot
+                && self.lease_read_left(&st, &v).is_zero()
+                && self.foreign_lease(&v).is_none()
+                && !self.has_in_flight_write()
+            {
                 st.lease_requested = true;
                 true
             } else {
@@ -753,12 +793,10 @@ impl Db {
         if buggify() {
             return None;
         }
-        let lease_left = match st.trusted && st.in_flight_hedged_puts == 0 {
-            true => self.own_lease_left(&st, &cur.m),
-            false => Duration::ZERO,
-        };
+        let lease_left = self.lease_read_left(&st, &cur);
         let leased = !lease_left.is_zero();
-        let current_at = leased.then(|| st.manifest_write_started_at.unwrap_or(now)).max(st.verified_at);
+        let current_at =
+            leased.then(|| st.manifest_write_started_at.unwrap_or(now)).max(st.verified.map(|c| c.started));
         let fresh = match c {
             Consistency::Strong => leased,
             Consistency::Snapshot { max_staleness_ms } => {
@@ -963,7 +1001,7 @@ impl Db {
     /// Returns the instant at which the cached manifest exceeds `max_staleness`, or `None` if
     /// the manifest has not been validated.
     pub fn stale_at(&self, max_staleness: Duration) -> Option<Instant> {
-        self.st.lock().verified_at.map(|v| v + max_staleness)
+        self.st.lock().verified.map(|c| c.started + max_staleness)
     }
 
     /// Records that another node committed `version` and reloads the manifest if any callers
@@ -1089,17 +1127,6 @@ impl Db {
         log::event(Level::Info, "commit", &fields);
     }
 
-    async fn base_for_commit(self: &Arc<Self>) -> Result<Arc<Version>> {
-        let (cur, trusted) = {
-            let st = self.st.lock();
-            (st.current.clone(), st.trusted)
-        };
-        match cur {
-            Some(c) if trusted => Ok(c),
-            _ => self.refresh(Instant::now(), false).await,
-        }
-    }
-
     async fn process(self: &Arc<Self>, batch: Vec<Work>) {
         let cfg = self.shared.cfg.clone();
         let mut maybe_applied = false;
@@ -1107,7 +1134,7 @@ impl Db {
         // Commit IDs included in an unfenced ambiguous manifest PUT from this batch.
         let mut ambiguous_commit_ids: BTreeSet<u64> = BTreeSet::new();
         let mut attempt = 0u32;
-        let mut base = match self.base_for_commit().await {
+        let mut base = match self.open(false).await {
             Ok(v) => v,
             Err(e) => {
                 self.clear_lease_flag(&batch);
@@ -1188,9 +1215,7 @@ impl Db {
             };
             let res = self.put_manifest(data, &base.etag).await;
             if !res.is_ok() {
-                if matches!(res, Err(StoreError::Unavailable(_))) {
-                    self.st.lock().distrust();
-                }
+                self.st.lock().failed_put_target_etag = Some(base.etag.clone());
                 self.write_finished();
             }
             match res {
@@ -1231,7 +1256,6 @@ impl Db {
                     for (w, o) in batch.iter().zip(&plan.outcomes) {
                         ambiguous_commit_ids.extend(newly_committed_ids(w, o));
                     }
-                    self.st.lock().distrust();
                     // If the write was applied, `plan.gc` was removed from `obsolete` in the manifest.
                     // These objects have already passed their grace period, so they can be deleted safely
                     // even if the write failed.
@@ -1405,12 +1429,8 @@ impl Db {
                 self.st.lock().in_flight_hedged_puts += 1;
                 let me = self.clone();
                 self.shared.env.spawn(async move {
-                    let landed = !matches!(first.await, Err(StoreError::PreconditionFailed));
-                    let mut st = me.st.lock();
-                    st.in_flight_hedged_puts -= 1;
-                    if landed {
-                        st.distrust();
-                    }
+                    let _ = first.await;
+                    me.st.lock().in_flight_hedged_puts -= 1;
                 });
                 return Err(ambiguous());
             }

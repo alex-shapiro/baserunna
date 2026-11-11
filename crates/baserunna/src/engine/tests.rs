@@ -1655,6 +1655,23 @@ fn check_lease_views(dbs: &[NodeDb], store: &LateManifestPutStore) -> Result<(),
     Ok(())
 }
 
+/// Tests that the lease oracle reports a holder that relies on its lease after the lease term. The
+/// test moves the instant at which the store applied the holder's manifest 100 ms earlier.
+#[test]
+fn lease_oracle_reports_a_lease_that_outlives_its_term() {
+    rt().block_on(async {
+        let (a, _b, store) = late_manifest_put_nodes();
+        let db_a = opened(&a, "d").await;
+        put(&db_a, "k", "v").await;
+        let view = db_a.leased_view().expect("setup: A holds its lease");
+        assert_eq!(check_lease_view(&db_a, &*store), Ok(()), "setup: the oracle reports a valid lease");
+        let applied_at = store.manifest_applied_at("d", &view.etag).expect("setup: the store applied the manifest");
+        store.manifest_applied_at.lock().insert(view.etag.clone(), applied_at - Duration::from_millis(100));
+        let overrun = format!("relies on its lease on d at write {} for 100 ms after the lease term", view.write_seq);
+        assert_eq!(check_lease_view(&db_a, &*store), Err(overrun));
+    });
+}
+
 /// Advances time by `ms` in steps of at most `every_ms`, and checks the lease views after each step.
 async fn advance_checking(
     ms: u64,

@@ -928,13 +928,15 @@ enum ManifestPutOutcome {
     AppliedThenFailed,
     /// Fails now, and stays pending with its precondition until the test applies it.
     FailedThenAppliedLate,
+    /// Applies, and answers `412`.
+    AppliedThenRejected,
 }
 
 /// Random outcomes and latencies for the manifest requests of a [`LateManifestPutStore`].
 struct ManifestFaultScript {
     rng: Rng,
     /// Weights of the outcomes in [`ManifestPutOutcome`] order.
-    outcome_weights: [f64; 4],
+    outcome_weights: [f64; 5],
     max_latency_ms: u64,
 }
 
@@ -943,7 +945,7 @@ impl ManifestFaultScript {
         let applied = *r.pick(&[1.0, 3.0, 9.0]);
         ManifestFaultScript {
             rng: r.fork(),
-            outcome_weights: [applied, 1.0, 1.0, 1.0 + r.below(3) as f64],
+            outcome_weights: [applied, 1.0, 1.0, 1.0 + r.below(3) as f64, 1.0],
             max_latency_ms: *r.pick(&[0, 2, 30]),
         }
     }
@@ -1022,6 +1024,7 @@ impl LateManifestPutStore {
             Some(1) => ManifestPutOutcome::FailedBeforeApply,
             Some(2) => ManifestPutOutcome::AppliedThenFailed,
             Some(3) => ManifestPutOutcome::FailedThenAppliedLate,
+            Some(4) => ManifestPutOutcome::AppliedThenRejected,
             _ => ManifestPutOutcome::Applied,
         };
         (outcome, s.latency())
@@ -1066,9 +1069,13 @@ impl ObjectStore for LateManifestPutStore {
                     self.late_puts.lock().push((key.to_string(), data, mode));
                     return Err(StoreError::Unavailable("connection reset".into()));
                 }
-                ManifestPutOutcome::Applied | ManifestPutOutcome::AppliedThenFailed => {
-                    self.apply_manifest_put(key, data, &mode)
-                }
+                ManifestPutOutcome::Applied
+                | ManifestPutOutcome::AppliedThenFailed
+                | ManifestPutOutcome::AppliedThenRejected => self.apply_manifest_put(key, data, &mode),
+            };
+            let r = match outcome {
+                ManifestPutOutcome::AppliedThenRejected => r.and(Err(StoreError::PreconditionFailed)),
+                _ => r,
             };
             if matches!(r, Err(StoreError::PreconditionFailed)) {
                 self.manifest_put_rejected.notify_one();
@@ -1203,6 +1210,28 @@ fn strong_read_after_late_manifest_put_during_retry_is_new() {
             outcome.as_ref().map(|c| c.version),
             rejected_at.elapsed().as_millis()
         );
+        assert_eq!(stale_ms, 0, "A read the old value for {stale_ms} ms after B read the new value");
+    });
+}
+
+/// Tests strong reads if the store applies a manifest write from the lease holder and answers `412`.
+#[test]
+fn strong_read_after_an_applied_manifest_put_answers_412_is_new() {
+    rt().block_on(async {
+        let (a, b, store) = late_manifest_put_nodes();
+        let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
+        put(&db_a, "k", "old").await;
+        db_b.open(false).await.unwrap();
+        assert!(db_a.leased_view().is_some(), "setup: A holds its lease");
+        sleep_ms(100).await;
+        *store.cycled_manifest_put_outcomes.lock() = Some((vec![ManifestPutOutcome::AppliedThenRejected], 0));
+        let commit = tokio::spawn(commit_new(db_a.clone()));
+        store.manifest_put_rejected.notified().await;
+        *store.cycled_manifest_put_outcomes.lock() = None;
+        assert_eq!(strong_get(&db_b, "k").await, Some(inline("new")), "B reads the applied write");
+        let (stale_ms, _) = ms_until_strong_read_is_new(&db_a, 1).await;
+        let outcome = commit.await.unwrap();
+        assert!(outcome.is_ok(), "setup: the commit answered {outcome:?}");
         assert_eq!(stale_ms, 0, "A read the old value for {stale_ms} ms after B read the new value");
     });
 }

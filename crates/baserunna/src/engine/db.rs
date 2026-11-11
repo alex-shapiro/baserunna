@@ -211,6 +211,10 @@ impl OwnLease {
         matches!(self, OwnLease::Unconfirmed { .. })
     }
 
+    fn has_time_left(self) -> bool {
+        matches!(self, OwnLease::Held { expires_at, .. } if expires_at > Instant::now())
+    }
+
     /// Returns how long this node can still rely on the lease that the manifest at `write_seq`
     /// gives it.
     fn left_at(self, write_seq: u64) -> Duration {
@@ -450,7 +454,7 @@ impl Db {
     /// Records that a manifest `PUT` from this node, sent at `sent`, failed.
     fn fail_own_write(&self, sent: Instant) {
         self.shared.update_own_lease(&self.id, |l| {
-            if !l.is_unconfirmed() {
+            if l.has_time_left() {
                 probe::hit(Probe::LeaseReadsStopped);
                 self.shared.metrics.lease_reads_stopped();
             }
@@ -472,7 +476,7 @@ impl Db {
         self.shared.update_own_lease(&self.id, |l| match l {
             OwnLease::Unconfirmed { earliest_failed_put_at } => {
                 let granted = self.granted_lease(m, earliest_failed_put_at);
-                if granted != OwnLease::NotHeld {
+                if granted.has_time_left() {
                     probe::hit(Probe::LeaseReadsRestoredFromLandedWrite);
                     self.shared.metrics.lease_reads_restored_from_landed_write();
                 }
@@ -1008,8 +1012,7 @@ impl Db {
             let st = self.st.lock();
             let in_manifest =
                 st.current.as_ref().is_some_and(|c| c.m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id));
-            in_manifest
-                || matches!(self.shared.own_lease(&self.id), OwnLease::Held { expires_at, .. } if expires_at > Instant::now())
+            in_manifest || self.shared.own_lease(&self.id).has_time_left()
         };
         if !held {
             return Ok(false);

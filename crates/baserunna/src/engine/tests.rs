@@ -959,6 +959,9 @@ impl ManifestFaultScript {
 struct LateManifestPutStore {
     mem: Arc<MemStore>,
     failed_manifest_puts: AtomicU32,
+    /// Outcomes that the manifest writes take in turn, repeated, and the number of writes that
+    /// took one. Overrides `manifest_fault_script`.
+    cycled_manifest_put_outcomes: Mutex<Option<(Vec<ManifestPutOutcome>, usize)>>,
     late_puts: Mutex<Vec<(String, Bytes, PutMode)>>,
     /// Applies the buffered writes before the next manifest write.
     apply_late_puts_on_next_put: std::sync::atomic::AtomicBool,
@@ -1009,6 +1012,10 @@ impl LateManifestPutStore {
     }
 
     fn draw_manifest_put(&self) -> (ManifestPutOutcome, Duration) {
+        if let Some((outcomes, drawn)) = self.cycled_manifest_put_outcomes.lock().as_mut() {
+            *drawn += 1;
+            return (outcomes[(*drawn - 1) % outcomes.len()], Duration::ZERO);
+        }
         let mut script = self.manifest_fault_script.lock();
         let Some(s) = script.as_mut() else { return (ManifestPutOutcome::Applied, Duration::ZERO) };
         let outcome = match s.rng.weighted(&s.outcome_weights) {
@@ -1098,6 +1105,7 @@ fn late_manifest_put_nodes_with(seed: u64, cfg: EngineConfig) -> (Arc<Engine>, A
     let store = Arc::new(LateManifestPutStore {
         mem,
         failed_manifest_puts: 0.into(),
+        cycled_manifest_put_outcomes: Mutex::default(),
         late_puts: Mutex::default(),
         apply_late_puts_on_next_put: false.into(),
         manifest_put_rejected: tokio::sync::Notify::new(),
@@ -1228,14 +1236,69 @@ fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_answers() {
             }
         };
         assert!(outcome.is_ok(), "setup: the commit answered {outcome:?}");
-        let mut metrics = baserunna_api::Metrics::default();
-        a.shared.metrics.fill(&mut metrics);
-        let c = metrics.commits;
-        assert_eq!(
-            (c.lease_reads_stopped, c.lease_reads_restored_from_landed_writes),
-            (1, 1),
-            "the metrics do not count the stop and the restore of lease reads"
-        );
+        assert_eq!(lease_read_counters(&a), (1, 1), "the metrics do not count the stop and the restore of lease reads");
+    });
+}
+
+/// Returns `lease_reads_stopped` and `lease_reads_restored_from_landed_writes` of `e`.
+fn lease_read_counters(e: &Engine) -> (u64, u64) {
+    let mut metrics = baserunna_api::Metrics::default();
+    e.shared.metrics.fill(&mut metrics);
+    (metrics.commits.lease_reads_stopped, metrics.commits.lease_reads_restored_from_landed_writes)
+}
+
+/// Tests that a failed manifest `PUT` after the lease ended does not count as stopped lease reads.
+#[test]
+fn lease_reads_stopped_ignores_a_failed_put_after_the_lease_ended() {
+    rt().block_on(async {
+        let (a, _b, store) = late_manifest_put_nodes();
+        let db_a = opened(&a, "d").await;
+        put(&db_a, "k", "old").await;
+        sleep_ms(6_000).await;
+        assert_eq!(db_a.leased_view(), None, "setup: A's lease ended");
+        store.failed_manifest_puts.store(1, SeqCst);
+        put(&db_a, "k", "new").await;
+        assert_eq!(lease_read_counters(&a), (0, 0), "A served no lease reads before the failed PUT");
+    });
+}
+
+/// Tests that a lost manifest CAS on a node without a lease does not count as stopped lease reads.
+#[test]
+fn lease_reads_stopped_ignores_a_lost_cas_without_a_lease() {
+    rt().block_on(async {
+        let (a, b, _store) = late_manifest_put_nodes();
+        let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
+        put(&db_a, "k", "old").await;
+        db_b.open(false).await.unwrap();
+        sleep_ms(6_000).await;
+        put(&db_a, "k", "new").await;
+        let snapshot = Consistency::Snapshot { max_staleness_ms: 600_000 };
+        let mut t = db_b.begin(Isolation::Serializable, snapshot).await.unwrap();
+        t.put(Bytes::from_static(b"j"), inline("b")).unwrap();
+        let outcome = db_b.commit_detailed(t.into_request()).await;
+        assert!(matches!(outcome, Err(Error::NotOwner { .. })), "setup: B's commit answered {outcome:?}");
+        assert_eq!(lease_read_counters(&b), (0, 0), "B served no lease reads before its CAS was lost");
+    });
+}
+
+/// Tests that a restored lease that has already expired does not count as restarted lease reads.
+#[test]
+fn lease_reads_restored_ignores_an_expired_lease() {
+    use ManifestPutOutcome::{Applied, AppliedThenFailed, FailedBeforeApply};
+    rt().block_on(async {
+        let (a, _b, store) = late_manifest_put_nodes();
+        let db_a = opened(&a, "d").await;
+        put(&db_a, "k", "old").await;
+        *store.cycled_manifest_put_outcomes.lock() = Some((vec![FailedBeforeApply], 0));
+        let first = commit_new(db_a.clone()).await;
+        assert!(first.is_err(), "setup: the first commit answered {first:?}");
+        *store.cycled_manifest_put_outcomes.lock() = None;
+        sleep_ms(10_000).await;
+        *store.cycled_manifest_put_outcomes.lock() = Some((vec![AppliedThenFailed, Applied], 0));
+        let second = commit_new(db_a.clone()).await;
+        assert!(second.is_ok(), "setup: the second commit answered {second:?}");
+        assert_eq!(db_a.leased_view(), None, "setup: the lease timed from the first failed PUT expired");
+        assert_eq!(lease_read_counters(&a), (1, 0), "the metrics count a restore of an expired lease");
     });
 }
 

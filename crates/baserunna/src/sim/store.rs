@@ -90,6 +90,8 @@ pub struct SimStore {
     trace: Arc<Trace>,
     view: Arc<Mutex<ListView>>,
     held_replies: Arc<HeldReplies>,
+    /// `(key, If-Match ETag)` of each write that failed and applies late.
+    late_put_targets: Arc<Mutex<Vec<(String, String)>>>,
     pub stats: StoreStats,
 }
 
@@ -124,6 +126,7 @@ impl SimStore {
             trace,
             view: Arc::new(Mutex::new(ListView::default())),
             held_replies: Arc::new(HeldReplies::default()),
+            late_put_targets: Arc::default(),
             stats: StoreStats::default(),
         }
     }
@@ -144,6 +147,11 @@ impl SimStore {
     pub fn release_replies(&self) {
         *self.held_replies.suffix.lock() = None;
         self.held_replies.released.notify_waiters();
+    }
+
+    /// Returns the `If-Match` ETags of the writes to `key` that failed and still apply late.
+    pub fn late_put_targets(&self, key: &str) -> Vec<String> {
+        self.late_put_targets.lock().iter().filter(|(k, _)| k == key).map(|(_, e)| e.clone()).collect()
     }
 
     fn draw(&self) -> Draw {
@@ -266,11 +274,17 @@ impl ObjectStore for SimStore {
             let mem = self.mem.clone();
             let trace = self.trace.clone();
             let view = self.view.clone();
+            let late_put_targets = self.late_put_targets.clone();
+            let late_put_target = match &mode {
+                PutMode::IfMatch(e) if late_apply => Some((key.to_string(), e.clone())),
+                _ => None,
+            };
             let key2 = key.to_string();
             // Detached so in-flight writes can still land if the caller crashes.
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(lat / 2 + 1)).await;
                 if late_apply && let Some(tx) = reply.take() {
+                    late_put_targets.lock().extend(late_put_target.clone());
                     let _ = tx.send(Err(unavailable("injected: put failed, applies later")));
                     trace.event(&format!("store put {key2} fails now, applies in {late_apply_ms}ms"));
                     tokio::time::sleep(Duration::from_millis(late_apply_ms)).await;
@@ -278,6 +292,12 @@ impl ObjectStore for SimStore {
                 let existed = mem.get_sync(&key2, &GetOpts::default()).is_ok();
                 let r =
                     if before { Err(unavailable("injected put failure")) } else { mem.put_sync(&key2, data, &mode) };
+                if let Some(target) = &late_put_target {
+                    let mut targets = late_put_targets.lock();
+                    if let Some(i) = targets.iter().position(|t| t == target) {
+                        targets.remove(i);
+                    }
+                }
                 if r.is_ok() && list_lag_ms > 0 {
                     let mut v = view.lock();
                     v.ghosts.remove(&key2);
@@ -385,6 +405,7 @@ mod tests {
             };
             assert!(matches!(put(b"v2", &etag).await, Err(StoreError::Unavailable(_))));
             assert!(matches!(put(b"v3", &etag).await, Err(StoreError::Unavailable(_))));
+            assert_eq!(store.late_put_targets("k"), [etag.clone(), etag.clone()], "the pending puts are not listed");
             let read = || mem.get_sync("k", &GetOpts::default()).unwrap().data;
             assert_eq!(read(), Bytes::from_static(b"v1"), "a late put was applied before its delay");
             tokio::time::sleep(Duration::from_millis(1_100)).await;
@@ -393,6 +414,7 @@ mod tests {
                 Bytes::from_static(b"v2"),
                 "the first late put is applied; the second fails its If-Match"
             );
+            assert!(store.late_put_targets("k").is_empty(), "applied puts are still listed");
         });
     }
 }

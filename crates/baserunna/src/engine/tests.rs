@@ -920,8 +920,42 @@ fn commit_applied_by_ambiguous_manifest_put_is_not_marked_replayed() {
     });
 }
 
+/// Outcome of one manifest `PUT` in [`LateManifestPutStore`].
+#[derive(Clone, Copy, Debug)]
+enum ManifestPutOutcome {
+    Applied,
+    FailedBeforeApply,
+    AppliedThenFailed,
+    /// Fails now, and stays pending with its precondition until the test applies it.
+    FailedThenAppliedLate,
+}
+
+/// Random outcomes and latencies for the manifest requests of a [`LateManifestPutStore`].
+struct ManifestFaultScript {
+    rng: Rng,
+    /// Weights of the outcomes in [`ManifestPutOutcome`] order.
+    outcome_weights: [f64; 4],
+    max_latency_ms: u64,
+}
+
+impl ManifestFaultScript {
+    fn random(r: &mut Rng) -> ManifestFaultScript {
+        let applied = *r.pick(&[1.0, 3.0, 9.0]);
+        ManifestFaultScript {
+            rng: r.fork(),
+            outcome_weights: [applied, 1.0, 1.0, 1.0 + r.below(3) as f64],
+            max_latency_ms: *r.pick(&[0, 2, 30]),
+        }
+    }
+
+    fn latency(&mut self) -> Duration {
+        Duration::from_millis(self.rng.below(self.max_latency_ms + 1))
+    }
+}
+
 /// Object store wrapper that fails the next `failed_manifest_puts` manifest writes and buffers them.
 /// [`LateManifestPutStore::apply_late_puts`] applies those writes with their original preconditions.
+/// If `manifest_fault_script` is set, it also draws an outcome for each manifest write.
 struct LateManifestPutStore {
     mem: Arc<MemStore>,
     failed_manifest_puts: AtomicU32,
@@ -929,18 +963,74 @@ struct LateManifestPutStore {
     /// Applies the buffered writes before the next manifest write.
     apply_late_puts_on_next_put: std::sync::atomic::AtomicBool,
     manifest_put_rejected: tokio::sync::Notify,
+    manifest_fault_script: Mutex<Option<ManifestFaultScript>>,
+    manifest_gets: AtomicU32,
+    manifest_puts: AtomicU32,
+    /// ETags of the manifest writes that the store applied, in order.
+    stored_manifest_etags: Mutex<Vec<String>>,
 }
 
 impl LateManifestPutStore {
     fn apply_late_puts(&self) -> Vec<SResult<String>> {
         let late = std::mem::take(&mut *self.late_puts.lock());
-        late.into_iter().map(|(key, data, mode)| self.mem.put_sync(&key, data, &mode)).collect()
+        late.into_iter().map(|(key, data, mode)| self.apply_manifest_put(&key, data, &mode)).collect()
+    }
+
+    /// Applies the buffered write at `index`, or returns `None` if no write is buffered there.
+    fn apply_late_put(&self, index: usize) -> Option<SResult<String>> {
+        let (key, data, mode) = {
+            let mut late = self.late_puts.lock();
+            (index < late.len()).then(|| late.remove(index))?
+        };
+        Some(self.apply_manifest_put(&key, data, &mode))
+    }
+
+    /// Returns the `If-Match` ETags of the buffered writes.
+    fn late_put_targets(&self) -> Vec<String> {
+        let late = self.late_puts.lock();
+        late.iter()
+            .filter_map(|(.., mode)| if let PutMode::IfMatch(e) = mode { Some(e.clone()) } else { None })
+            .collect()
+    }
+
+    fn stored_manifest_etag(&self, db: &str) -> Option<String> {
+        self.mem.get_sync(&manifest_key(db), &GetOpts::default()).ok().map(|g| g.etag)
+    }
+
+    fn apply_manifest_put(&self, key: &str, data: Bytes, mode: &PutMode) -> SResult<String> {
+        let r = self.mem.put_sync(key, data, mode);
+        if let Ok(etag) = &r {
+            self.stored_manifest_etags.lock().push(etag.clone());
+        }
+        r
+    }
+
+    fn draw_manifest_put(&self) -> (ManifestPutOutcome, Duration) {
+        let mut script = self.manifest_fault_script.lock();
+        let Some(s) = script.as_mut() else { return (ManifestPutOutcome::Applied, Duration::ZERO) };
+        let outcome = match s.rng.weighted(&s.outcome_weights) {
+            Some(1) => ManifestPutOutcome::FailedBeforeApply,
+            Some(2) => ManifestPutOutcome::AppliedThenFailed,
+            Some(3) => ManifestPutOutcome::FailedThenAppliedLate,
+            _ => ManifestPutOutcome::Applied,
+        };
+        (outcome, s.latency())
+    }
+
+    fn manifest_get_latency(&self) -> Duration {
+        self.manifest_fault_script.lock().as_mut().map_or(Duration::ZERO, ManifestFaultScript::latency)
     }
 }
 
 impl ObjectStore for LateManifestPutStore {
     fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
-        self.mem.get(key, opts)
+        Box::pin(async move {
+            if key.ends_with("/manifest") {
+                self.manifest_gets.fetch_add(1, SeqCst);
+                tokio::time::sleep(self.manifest_get_latency()).await;
+            }
+            self.mem.get_sync(key, &opts)
+        })
     }
 
     fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
@@ -948,18 +1038,35 @@ impl ObjectStore for LateManifestPutStore {
             if !key.ends_with("/manifest") {
                 return self.mem.put_sync(key, data, &mode);
             }
+            self.manifest_puts.fetch_add(1, SeqCst);
+            let (outcome, latency) = self.draw_manifest_put();
+            tokio::time::sleep(latency).await;
             if !self.late_puts.lock().is_empty() && self.apply_late_puts_on_next_put.swap(false, SeqCst) {
                 self.apply_late_puts();
             }
-            if take_fault(&self.failed_manifest_puts) {
-                self.late_puts.lock().push((key.to_string(), data, mode));
-                return Err(StoreError::Unavailable("connection reset".into()));
-            }
-            let r = self.mem.put_sync(key, data, &mode);
+            let outcome = match take_fault(&self.failed_manifest_puts) {
+                true => ManifestPutOutcome::FailedThenAppliedLate,
+                false => outcome,
+            };
+            let r = match outcome {
+                ManifestPutOutcome::FailedBeforeApply => {
+                    return Err(StoreError::Unavailable("connection refused".into()));
+                }
+                ManifestPutOutcome::FailedThenAppliedLate => {
+                    self.late_puts.lock().push((key.to_string(), data, mode));
+                    return Err(StoreError::Unavailable("connection reset".into()));
+                }
+                ManifestPutOutcome::Applied | ManifestPutOutcome::AppliedThenFailed => {
+                    self.apply_manifest_put(key, data, &mode)
+                }
+            };
             if matches!(r, Err(StoreError::PreconditionFailed)) {
                 self.manifest_put_rejected.notify_one();
             }
-            r
+            match outcome {
+                ManifestPutOutcome::AppliedThenFailed => Err(StoreError::Unavailable("response lost".into())),
+                _ => r,
+            }
         })
     }
 
@@ -978,7 +1085,11 @@ impl ObjectStore for LateManifestPutStore {
 
 /// Starts two nodes on a shared [`LateManifestPutStore`].
 fn late_manifest_put_nodes() -> (Arc<Engine>, Arc<Engine>, Arc<LateManifestPutStore>) {
-    let env = Arc::new(Env::sim(11, 1_700_000_000_000, Instant::now(), 0));
+    late_manifest_put_nodes_seeded(11)
+}
+
+fn late_manifest_put_nodes_seeded(seed: u64) -> (Arc<Engine>, Arc<Engine>, Arc<LateManifestPutStore>) {
+    let env = Arc::new(Env::sim(seed, 1_700_000_000_000, Instant::now(), 0));
     let clock = env.clone();
     let mem = Arc::new(MemStore::new(Box::new(move || clock.now_ms())));
     let store = Arc::new(LateManifestPutStore {
@@ -987,6 +1098,10 @@ fn late_manifest_put_nodes() -> (Arc<Engine>, Arc<Engine>, Arc<LateManifestPutSt
         late_puts: Mutex::default(),
         apply_late_puts_on_next_put: false.into(),
         manifest_put_rejected: tokio::sync::Notify::new(),
+        manifest_fault_script: Mutex::default(),
+        manifest_gets: 0.into(),
+        manifest_puts: 0.into(),
+        stored_manifest_etags: Mutex::default(),
     });
     let a = Engine::new(store.clone(), env.clone(), EngineConfig::default(), "a".into());
     let b = Engine::new(store.clone(), env, EngineConfig::default(), "b".into());
@@ -1082,6 +1197,315 @@ fn strong_read_after_late_manifest_put_during_retry_is_new() {
         assert_eq!(stale_ms, 0, "A read the old value for {stale_ms} ms after B read the new value");
     });
 }
+
+/// Tests that a node serves no lease reads from a rejected commit retry until the commit answers.
+#[test]
+#[ignore = "TODO.md blocker: Stale strong read"]
+fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_answers() {
+    use crate::util::{Either, race};
+    rt().block_on(async {
+        let (a, _b, store) = late_manifest_put_nodes();
+        let db_a = opened(&a, "d").await;
+        put(&db_a, "k", "old").await;
+        store.failed_manifest_puts.store(1, SeqCst);
+        store.apply_late_puts_on_next_put.store(true, SeqCst);
+        let mut commit = Box::pin(commit_new(db_a.clone()));
+        let mut rejected = Box::pin(store.manifest_put_rejected.notified());
+        if let Either::Left(outcome) = race(&mut commit, &mut rejected).await {
+            panic!("setup: the commit answered {outcome:?} before a retry was rejected");
+        }
+        let rejected_at = Instant::now();
+        let outcome = loop {
+            if let Some((write_seq, etag, false)) = db_a.leased_view() {
+                panic!(
+                    "A serves lease reads at write {write_seq} ({etag}) {} ms after the rejected retry, \
+                     before the commit answered",
+                    rejected_at.elapsed().as_millis()
+                );
+            }
+            if let Either::Left(outcome) = race(&mut commit, &mut Box::pin(sleep_ms(1))).await {
+                break outcome;
+            }
+        };
+        assert!(outcome.is_ok(), "setup: the commit answered {outcome:?}");
+    });
+}
+
+async fn sleep_ms(ms: u64) {
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+/// Starts two nodes, and commits `new` on A with all manifest writes failing and buffered.
+async fn unknown_commit_outcome_nodes() -> (Arc<Db>, Arc<LateManifestPutStore>, Arc<Engine>) {
+    let (a, _b, store) = late_manifest_put_nodes();
+    let db_a = opened(&a, "d").await;
+    put(&db_a, "k", "old").await;
+    store.failed_manifest_puts.store(a.shared.cfg.commit_retry_max, SeqCst);
+    let outcome = commit_new(db_a.clone()).await;
+    assert!(matches!(outcome, Err(Error::Unavailable { outcome_unknown: true, .. })), "setup: answered {outcome:?}");
+    (db_a, store, a)
+}
+
+/// Returns the number of manifest `GET` and `PUT` requests that `f` sends to `store`, and its output.
+async fn manifest_requests<T>(store: &LateManifestPutStore, f: impl Future<Output = T>) -> (u32, u32, T) {
+    let (gets, puts) = (store.manifest_gets.load(SeqCst), store.manifest_puts.load(SeqCst));
+    let out = f.await;
+    (store.manifest_gets.load(SeqCst) - gets, store.manifest_puts.load(SeqCst) - puts, out)
+}
+
+fn assert_late_puts_rejected(store: &LateManifestPutStore) {
+    let applied = store.apply_late_puts();
+    assert!(!applied.is_empty(), "setup: no late write was buffered");
+    assert!(
+        applied.iter().all(|r| matches!(r, Err(StoreError::PreconditionFailed))),
+        "a late write was not rejected: {applied:?}"
+    );
+}
+
+/// Tests the store requests that strong reads and one commit cost after an unknown commit outcome.
+#[test]
+#[ignore = "TODO.md blocker: Stale strong read"]
+fn strong_reads_after_unknown_outcome_read_the_manifest_until_a_commit() {
+    rt().block_on(async {
+        let (db_a, store, _a) = unknown_commit_outcome_nodes().await;
+        for read in 0..3 {
+            sleep_ms(500).await;
+            let (gets, puts, value) = manifest_requests(&store, strong_get(&db_a, "k")).await;
+            assert_eq!(value, Some(inline("old")), "setup: the late write was not applied yet");
+            assert_eq!((gets, puts), (1, 0), "strong read {read} sent (manifest GETs, PUTs) = {:?}", (gets, puts));
+            assert_eq!(db_a.leased_view(), None, "strong read {read} restored lease reads");
+        }
+        sleep_ms(500).await;
+        let (gets, puts, _) = manifest_requests(&store, put(&db_a, "k", "after")).await;
+        assert_eq!((gets, puts), (1, 1), "the commit sent (manifest GETs, PUTs) = {:?}", (gets, puts));
+        let stored = store.stored_manifest_etag("d").unwrap();
+        assert_eq!(db_a.leased_view().map(|(_, etag, w)| (etag, w)), Some((stored, false)), "lease reads stay off");
+        let (gets, puts, value) = manifest_requests(&store, strong_get(&db_a, "k")).await;
+        assert_eq!(value, Some(inline("after")));
+        assert_eq!((gets, puts), (0, 0), "a strong read after the commit went to the store");
+        assert_late_puts_rejected(&store);
+    });
+}
+
+/// Tests the store requests that hot strong reads cost after an unknown commit outcome.
+#[test]
+#[ignore = "TODO.md blocker: Stale strong read"]
+fn hot_strong_reads_after_unknown_outcome_renew_the_lease_once() {
+    rt().block_on(async {
+        let (db_a, store, a) = unknown_commit_outcome_nodes().await;
+        let mut gets_per_read = Vec::new();
+        let (background_gets, puts, ()) = manifest_requests(&store, async {
+            for _ in 0..16 {
+                sleep_ms(10).await;
+                let (gets, puts, value) = manifest_requests(&store, strong_get(&db_a, "k")).await;
+                assert_eq!(value, Some(inline("old")), "setup: the late write was not applied yet");
+                assert_eq!(puts, 0, "a strong read sent a manifest PUT");
+                gets_per_read.push(gets);
+            }
+            sleep_ms(10).await;
+        })
+        .await;
+        let background_gets = background_gets - gets_per_read.iter().sum::<u32>();
+        let from_store = gets_per_read.iter().take_while(|g| **g == 1).count();
+        eprintln!("manifest GETs per read {gets_per_read:?}, background GETs {background_gets}, PUTs {puts}");
+        assert_eq!(puts, 1, "the hot reads sent {puts} manifest PUTs, want one lease renewal");
+        assert_eq!(background_gets, 0, "the lease renewal sent {background_gets} manifest GETs");
+        assert!(
+            from_store as u32 <= a.shared.cfg.lease_read_threshold
+                && from_store < gets_per_read.len()
+                && gets_per_read[from_store..].iter().all(|g| *g == 0),
+            "manifest GETs per read: {gets_per_read:?}; want one per read until the renewal, then none"
+        );
+        let stored = store.stored_manifest_etag("d").unwrap();
+        assert_eq!(db_a.leased_view().map(|(_, etag, w)| (etag, w)), Some((stored, false)), "lease reads stay off");
+        assert_late_puts_rejected(&store);
+        let (gets, _, value) = manifest_requests(&store, strong_get(&db_a, "k")).await;
+        assert_eq!((gets, value), (0, Some(inline("old"))), "a strong read after the renewal went to the store");
+    });
+}
+
+/// Step of [`prop_lease_reads_match_the_store_under_ambiguous_manifest_puts`].
+#[derive(Clone, Copy, Debug)]
+enum LeaseStep {
+    Commit,
+    AcquireLease,
+    CommitWithLease,
+    StrongRead { on_b: bool, waits_for_write: bool },
+    ApplyLatePut { pick: usize },
+    Advance { ms: u64 },
+}
+
+fn gen_lease_steps(r: &mut Rng, n: usize) -> Vec<LeaseStep> {
+    (0..n)
+        .map(|_| match r.below(100) {
+            0..=17 => LeaseStep::Commit,
+            18..=25 => LeaseStep::AcquireLease,
+            26..=37 => LeaseStep::CommitWithLease,
+            38..=64 => LeaseStep::StrongRead { on_b: r.chance(0.3), waits_for_write: r.chance(0.5) },
+            65..=74 => LeaseStep::ApplyLatePut { pick: r.usize(1 << 16) },
+            _ => LeaseStep::Advance { ms: (6_000f64.powf(r.unit()) as u64).clamp(1, 6_000) },
+        })
+        .collect()
+}
+
+/// Enables buggify on the current thread until dropped.
+struct BuggifyScope;
+
+impl BuggifyScope {
+    fn enable(seed: u64, p_active: f64) -> BuggifyScope {
+        crate::buggify::enable(seed, crate::buggify::Config { p_active, ..Default::default() });
+        BuggifyScope
+    }
+}
+
+impl Drop for BuggifyScope {
+    fn drop(&mut self) {
+        crate::buggify::disable();
+    }
+}
+
+/// Node name and database handle that [`check_lease_views`] checks.
+type NodeDb<'a> = (&'a str, &'a Arc<Db>);
+
+/// Checks that each lease-served view is the stored manifest and that no buffered write can replace it.
+fn check_lease_views(dbs: &[NodeDb], store: &LateManifestPutStore) -> Result<(), String> {
+    for (node, db) in dbs {
+        let Some((write_seq, etag, false)) = db.leased_view() else { continue };
+        let stored = store.stored_manifest_etag(&db.id);
+        if stored.as_ref() != Some(&etag) {
+            return Err(format!(
+                "{node} serves lease reads at write {write_seq} ({etag}), but the store has {stored:?}"
+            ));
+        }
+        if store.late_put_targets().contains(&etag) {
+            return Err(format!("{node} serves lease reads at write {write_seq} ({etag}), but a late PUT targets it"));
+        }
+    }
+    Ok(())
+}
+
+/// Advances time by `ms` in steps of 1 ms, and checks the lease views after each step.
+async fn advance_checking(ms: u64, dbs: &[NodeDb<'_>], store: &LateManifestPutStore) -> Result<(), String> {
+    for _ in 0..ms {
+        sleep_ms(1).await;
+        check_lease_views(dbs, store)?;
+    }
+    Ok(())
+}
+
+/// Checks that a strong read on `db` returns a manifest that the store held during the read.
+async fn check_strong_read(db: &Arc<Db>, waits_for_write: bool, store: &LateManifestPutStore) -> Result<(), String> {
+    // Paused time does not advance between steps. A later read must start at a later instant than
+    // the store changes before it.
+    sleep_ms(1).await;
+    let first = store.stored_manifest_etags.lock().len() - 1;
+    let (snap, write_in_flight) = match waits_for_write {
+        true => (db.snapshot(Consistency::Strong).await, false),
+        false => match db.latest_snapshot().await {
+            Ok((s, w)) => (Ok(s), w),
+            Err(e) => (Err(e), false),
+        },
+    };
+    let snap = snap.map_err(|e| format!("strong read failed: {e}"))?;
+    let held = store.stored_manifest_etags.lock()[first..].to_vec();
+    if !write_in_flight && !held.contains(&snap.version.etag) {
+        return Err(format!(
+            "strong read returned write {} ({}), but the store held only {held:?} during the read",
+            snap.version.m.write_seq, snap.version.etag
+        ));
+    }
+    Ok(())
+}
+
+fn spawn_commit(db: &Arc<Db>, value: String, with_lease: bool) -> tokio::task::JoinHandle<()> {
+    let db = db.clone();
+    tokio::spawn(async move {
+        let Ok(mut t) = db.begin(Isolation::Serializable, Consistency::Strong).await else { return };
+        t.put(Bytes::from_static(b"k"), Value::Inline(Bytes::from(value))).unwrap();
+        let req = t.into_request();
+        match with_lease {
+            true => drop(tokio::join!(db.acquire_lease(), db.commit_detailed(req))),
+            false => drop(db.commit_detailed(req).await),
+        }
+    })
+}
+
+/// Runs `steps` on two nodes whose manifest writes fail at random. Returns the failing step and
+/// the broken invariant.
+async fn run_lease_steps(seed: u64, steps: &[LeaseStep]) -> Result<(), String> {
+    let (a, b, store) = late_manifest_put_nodes_seeded(seed);
+    let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
+    db_b.open(false).await.map_err(|e| e.to_string())?;
+    let mut r = Rng::new(seed ^ 0x1ea5e);
+    *store.manifest_fault_script.lock() = Some(ManifestFaultScript::random(&mut r));
+    let dbs: [NodeDb; 2] = [("A", &db_a), ("B", &db_b)];
+    let mut tasks = Vec::new();
+    for (i, step) in steps.iter().enumerate() {
+        let r = match *step {
+            LeaseStep::Commit => {
+                tasks.push(spawn_commit(&db_a, format!("v{i}"), false));
+                Ok(())
+            }
+            LeaseStep::CommitWithLease => {
+                tasks.push(spawn_commit(&db_a, format!("v{i}"), true));
+                Ok(())
+            }
+            LeaseStep::AcquireLease => {
+                let db = db_a.clone();
+                tasks.push(tokio::spawn(async move { drop(db.acquire_lease().await) }));
+                Ok(())
+            }
+            LeaseStep::StrongRead { on_b, waits_for_write } => {
+                check_strong_read(if on_b { &db_b } else { &db_a }, waits_for_write, &store).await
+            }
+            LeaseStep::ApplyLatePut { pick } => {
+                let n = store.late_puts.lock().len();
+                if n > 0 {
+                    store.apply_late_put(pick % n);
+                }
+                Ok(())
+            }
+            LeaseStep::Advance { ms } => advance_checking(ms, &dbs, &store).await,
+        };
+        r.and_then(|()| check_lease_views(&dbs, &store)).map_err(|e| format!("step {i} {step:?}: {e}"))?;
+    }
+    let mut settled_ms = 0;
+    while tasks.iter().any(|t| !t.is_finished()) {
+        if settled_ms > 120_000 {
+            return Err("background work did not finish within 120 s".into());
+        }
+        advance_checking(10, &dbs, &store).await.map_err(|e| format!("after the steps: {e}"))?;
+        settled_ms += 10;
+    }
+    for t in tasks {
+        t.await.map_err(|e| format!("a task failed: {e}"))?;
+    }
+    for (node, db) in dbs {
+        check_strong_read(db, true, &store).await.map_err(|e| format!("final read on {node}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Tests that lease-served strong reads match the stored manifest while manifest writes fail,
+/// apply after an error, or apply late with their original precondition.
+#[test]
+#[ignore = "TODO.md blocker: Stale strong read"]
+fn prop_lease_reads_match_the_store_under_ambiguous_manifest_puts() {
+    let cases = prop::env_u64("PROP_CASES").unwrap_or(LEASE_PROP_CASES);
+    let first = prop::env_u64("PROP_SEED").unwrap_or(0);
+    let mut failures = Vec::new();
+    for seed in first..first + cases {
+        let steps = gen_lease_steps(&mut Rng::new(seed), LEASE_PROP_STEPS);
+        let _buggify = BuggifyScope::enable(seed, [0.0, 0.5, 1.0][seed as usize % 3]);
+        if let Err(e) = rt().block_on(run_lease_steps(seed, &steps)) {
+            failures.push(format!("PROP_SEED={seed} PROP_CASES=1: {e}"));
+        }
+    }
+    assert!(failures.is_empty(), "{} of {cases} seeds failed:\n{}", failures.len(), failures.join("\n"));
+}
+
+const LEASE_PROP_CASES: u64 = 256;
+const LEASE_PROP_STEPS: usize = 200;
 
 #[test]
 fn obsolete_segments_outlive_snapshots_then_go() {

@@ -708,7 +708,7 @@ impl Sim {
 
     /// Verifies that at most one node holds an active lease per database.
     /// Also checks that any leased node without an in-flight manifest write
-    /// matches the latest manifest in object storage.
+    /// matches the latest manifest in object storage, and that no late write can replace it.
     fn check_oracles(&self) -> Result<(), String> {
         let mut holders: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for i in self.up_nodes() {
@@ -719,7 +719,14 @@ impl Sim {
                 if in_flight {
                     continue;
                 }
-                let stored = self.mem.get_sync(&crate::engine::manifest_key(&db.id), &GetOpts::default());
+                let key = crate::engine::manifest_key(&db.id);
+                if self.store.late_put_targets(&key).contains(&etag) {
+                    return Err(format!(
+                        "n{i} holds lease on {} at write {write_seq}, but a late write can replace it",
+                        db.id
+                    ));
+                }
+                let stored = self.mem.get_sync(&key, &GetOpts::default());
                 if let Ok(g) = stored
                     && g.etag != etag
                 {

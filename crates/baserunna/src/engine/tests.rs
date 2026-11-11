@@ -1160,20 +1160,17 @@ fn strong_read_after_late_manifest_put_once_unknown(poll_every_ms: u64) {
 }
 
 #[test]
-#[ignore = "TODO.md blocker: Stale strong read"]
 fn strong_read_after_late_manifest_put_once_unknown_is_new() {
     strong_read_after_late_manifest_put_once_unknown(500);
 }
 
 #[test]
-#[ignore = "TODO.md blocker: Stale strong read"]
 fn hot_strong_read_after_late_manifest_put_once_unknown_is_new() {
     strong_read_after_late_manifest_put_once_unknown(10);
 }
 
 /// Tests strong reads if a failed manifest write is applied before a commit retry.
 #[test]
-#[ignore = "TODO.md blocker: Stale strong read"]
 fn strong_read_after_late_manifest_put_during_retry_is_new() {
     rt().block_on(async {
         let (a, b, store) = late_manifest_put_nodes();
@@ -1200,7 +1197,6 @@ fn strong_read_after_late_manifest_put_during_retry_is_new() {
 
 /// Tests that a node serves no lease reads from a rejected commit retry until the commit answers.
 #[test]
-#[ignore = "TODO.md blocker: Stale strong read"]
 fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_answers() {
     use crate::util::{Either, race};
     rt().block_on(async {
@@ -1264,7 +1260,6 @@ fn assert_late_puts_rejected(store: &LateManifestPutStore) {
 
 /// Tests the store requests that strong reads and one commit cost after an unknown commit outcome.
 #[test]
-#[ignore = "TODO.md blocker: Stale strong read"]
 fn strong_reads_after_unknown_outcome_read_the_manifest_until_a_commit() {
     rt().block_on(async {
         let (db_a, store, _a) = unknown_commit_outcome_nodes().await;
@@ -1289,7 +1284,6 @@ fn strong_reads_after_unknown_outcome_read_the_manifest_until_a_commit() {
 
 /// Tests the store requests that hot strong reads cost after an unknown commit outcome.
 #[test]
-#[ignore = "TODO.md blocker: Stale strong read"]
 fn hot_strong_reads_after_unknown_outcome_renew_the_lease_once() {
     rt().block_on(async {
         let (db_a, store, a) = unknown_commit_outcome_nodes().await;
@@ -1489,7 +1483,6 @@ async fn run_lease_steps(seed: u64, steps: &[LeaseStep]) -> Result<(), String> {
 /// Tests that lease-served strong reads match the stored manifest while manifest writes fail,
 /// apply after an error, or apply late with their original precondition.
 #[test]
-#[ignore = "TODO.md blocker: Stale strong read"]
 fn prop_lease_reads_match_the_store_under_ambiguous_manifest_puts() {
     let cases = prop::env_u64("PROP_CASES").unwrap_or(LEASE_PROP_CASES);
     let first = prop::env_u64("PROP_SEED").unwrap_or(0);

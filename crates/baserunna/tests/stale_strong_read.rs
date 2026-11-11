@@ -1,6 +1,5 @@
 //! Verifies that strong reads never return older data after a client observes newer data.
-//! This file tests the case where the object store applies a manifest `PUT` after returning an error
-//! (TODO.md blocker "Stale strong read").
+//! This file tests the case where the object store applies a manifest `PUT` after returning an error.
 //!
 //! Each test commits `k = old` and an event row. It then commits `k = new` and a second event row on
 //! the lease holder while [`LateManifestPutStore`] fails every manifest `PUT` of that commit. The
@@ -503,7 +502,6 @@ fn change_feed_then_strong_get_never_go_back_if_the_lease_holder_is_home() {
 }
 
 #[test]
-#[ignore = "TODO.md blocker: Stale strong read"]
 fn change_feed_then_strong_get_never_go_back_after_a_node_joins() {
     check_path(
         "(ii) home = joined node",
@@ -528,7 +526,6 @@ fn writer_reads_its_write_after_commit_status_is_committed() {
 // (iv) Strong event queries, which the receiving node serves locally.
 
 #[test]
-#[ignore = "TODO.md blocker: Stale strong read"]
 fn strong_event_queries_never_go_back() {
     check_path(
         "(iv) strong event query",
@@ -541,7 +538,6 @@ fn strong_event_queries_never_go_back() {
 // (v) Strong `GET` served locally by the other node after a forward to the lease holder fails.
 
 #[test]
-#[ignore = "TODO.md blocker: Stale strong read"]
 fn strong_gets_never_go_back_after_a_failed_forward() {
     check_path(
         "(v) failed forward",

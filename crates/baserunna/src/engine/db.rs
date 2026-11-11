@@ -192,7 +192,7 @@ pub(crate) enum OwnLease {
     /// The store holds the manifest at `write_seq`, which this node wrote with its lease. This node
     /// serves strong reads from cache until `expires_at`.
     Held { write_seq: u64, expires_at: Instant },
-    /// A manifest `PUT` from this node failed, and any later `PUT` also failed. The store can still
+    /// A manifest `PUT` from this node failed, and no later `PUT` succeeded. The store can still
     /// apply a failed `PUT`, or a `412` response showed that the cached manifest is old. Therefore,
     /// this node validates each strong read against storage. `earliest_failed_put_at` is the
     /// send instant of the first of these `PUT`s.

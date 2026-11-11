@@ -541,15 +541,15 @@ A background flush install is rejected and its output objects are deleted if `fl
 
 If a conditional `PUT` on the manifest does not succeed on the first attempt:
 
-- On `412 Precondition Failed`, the stored manifest changed. Another node updated it, or storage applied a `PUT` from this node: an earlier `PUT` that failed, or this `PUT` itself. The committer reloads the manifest. If another node now holds a valid lease, the batch fails with `not_owner`; otherwise the committer re-runs validation and applies the batch against the new `base`.
+- On `412 Precondition Failed`, the stored manifest changed. Another node updated it, or storage applied a `PUT` from this node (an earlier failed `PUT` or this `PUT` itself). The committer reloads the manifest. If another node now holds a valid lease, the batch fails with `not_owner`; otherwise the committer re-runs validation and applies the batch against the new `base`.
 - On a timeout or network error, it is unknown whether the `PUT` succeeded. The committer reloads the manifest and retries against the new `base`. If an earlier `PUT` succeeded, step 4 finds the batch's commit records in the reloaded manifest and returns their committed versions without re-applying the writes. If the reloaded manifest's etag differs from all etags targeted by the batch's ambiguous `PUT`s and contains none of the batch's commit records, none of the ambiguous `PUT`s can succeed, so the batch outcome is settled. If retries are exhausted or the lease is lost while the outcome remains ambiguous, the committer returns `503 unavailable` with `outcome: "unknown"` for undecided transactions, while returning the recorded outcome for any transaction in the batch whose commit record is already present in the latest manifest.
 
-A manifest `PUT` that fails with any error stops strong reads from cache on this node (§5.7, §5.9). Storage can apply a failed `PUT` at any later time while the stored manifest still has the `If-Match` etag, and a `412` shows that the cached manifest is old. A manifest read that returns the cached version does not end this state. Strong reads from cache start again only when this node confirms a manifest version that no failed `PUT` from this node can replace:
+A manifest `PUT` that fails with any error stops strong reads from cache on this node (§5.7, §5.9). Storage can apply a failed `PUT` at a later time while the stored manifest still has the `If-Match` etag. A `412` response also shows that the cached manifest is old. A manifest read that returns the cached version does not end this state. Strong reads from cache start again only if this node confirms a manifest version that no failed `PUT` from this node can replace:
 
 - A manifest `PUT` from this node succeeds.
-- A reload in the same batch finds a manifest that names this node's lease and has the `write_seq` of one of the batch's ambiguous `PUT`s (a timeout or a network error), and no ambiguous `PUT` of the batch targets that manifest's etag. Each manifest write names its writer's lease unless it releases the lease, so a failed `PUT` from this node wrote that manifest. That `PUT` can be from this batch or from an earlier batch that sent the same `write_seq`. A reload cannot show which failed `PUT` wrote the manifest, so the node times the lease in that manifest from the start of the earliest failed `PUT` since the last confirmed version. The node keeps that instant when it evicts or unloads the database handle.
+- A reload in the same batch finds a manifest with this node's lease and the `write_seq` of an ambiguous `PUT` from this batch. In addition, no ambiguous `PUT` of the batch targets that manifest's etag. Each manifest write contains its writer's lease unless it releases the lease, so a failed `PUT` from this node wrote that manifest. That `PUT` can be from this batch or from an earlier batch that sent the same `write_seq`. A reload cannot show which failed `PUT` wrote the manifest. Therefore, the node times the lease in that manifest from the start of the earliest failed `PUT` since the last confirmed version. The node keeps that instant if it evicts or unloads the database handle.
 
-Until then, each strong read on this node sends a conditional `GET` (§5.9). On a read-heavy database, strong reads request a lease-only `PUT` (§5.7), which confirms a version.
+Until then, each strong read on this node sends a conditional `GET` (§5.9). On a read-heavy database, strong reads request a lease-only `PUT` (§5.7). That `PUT` confirms a version.
 
 #### Hedged Manifest Writes
 
@@ -656,11 +656,11 @@ Each node tracks lease timing on its own monotonic clock, with a 0.5 second marg
 - Every other node considers that lease valid until `duration + 0.5 s` after it first observed that renewal. Observed lease timestamps are retained even if an idle database handle is evicted from memory.
 - A node that loads a manifest from object storage also treats its lease as expired if the store's clock (§5.8), minus clock error, exceeds `last_modified + precision + 2 × duration + 0.5 s`. Because the holder started its lease timer before the store recorded `last_modified`, stale leases left behind by crashed nodes can be taken over immediately without waiting for a local timer.
 - A manifest write can shorten the holder's lease (for example, a commit after a longer read renewal) or release it. Because other nodes can observe the write as soon as it is sent, the holder immediately bounds its lease to the duration granted by the sent write regardless of whether the write succeeds.
-- If a manifest `PUT` from the holder fails with any error, the holder stops relying on its lease, because storage can still apply that `PUT`. The holder relies on a lease again only after it confirms a manifest version (§5.5).
+- If a manifest `PUT` from the holder fails with any error, the holder stops relying on its lease. Storage can still apply that `PUT`. The holder relies on a lease again only after it confirms a manifest version (§5.5).
 
 Each commit renews the lease for 5 seconds. On a read-heavy database where at least 16 strong reads occured within the current or previous lease window, the holder issues a lease-only manifest CAS about 1 s before expiry to renew the lease for 15 seconds. At ~$0.005 per 1,000 `PUT` versus ~$0.0004 per 1,000 `GET`s, a read-lease renewal pays for itself if it saves 12 conditional `GET` requests.
 
-Because other nodes refuse to commit while a lease is valid, and the holder stops relying on its lease after a failed manifest `PUT`, the holder's cached `Version` is current while the holder relies on its lease. The holder then serves strong reads directly from memory.
+Other nodes do not commit while a lease is valid, and the holder stops relying on its lease after a failed manifest `PUT`. Therefore, the holder's cached `Version` is current while the holder relies on its lease. The holder then serves strong reads directly from memory.
 
 If a lease holder crashes, database writes pause until `duration + 0.5 s` after another node first observes the dead holder's last renewal, or until the store clock shows the lease has expired, whichever comes first. If another node checks the manifest just before the lease would have expired, failover takes at most `2 * duration + 0.5 s`: up to 11 s after a commit renewal or 31 s after a read renewal. Strong reads remain available on all nodes during failover via conditional `GET` validation (§5.9).
 
@@ -710,7 +710,7 @@ Deleting a database marks its record as deleted in the system database. After a 
 There are two read consistency modes:
 
 - `snapshot` consistency serves reads from a cached serializable snapshot that is at most `max_staleness_ms` old (5 s by default). Each node caches its own snapshot, so a client that reads from different nodes can observe an older snapshot after a newer snapshot.
-- `strong` consistency guarantees linearizability. It is served from cache if the serving node holds a valid lease, has no manifest write in flight, and has no failed manifest `PUT` since its last confirmed manifest version (§5.5); otherwise it requests `GET manifest If-None-Match: etag` first.
+- `strong` consistency guarantees linearizability. A node serves a strong read from cache if it holds a valid lease, has no manifest write in flight, and has no unconfirmed failed manifest `PUT` (§5.5). Otherwise, the node sends `GET manifest If-None-Match: etag` first.
 
 ### 5.10 Size Quotas
 
@@ -1459,8 +1459,8 @@ participating `request_ids`. The mail webhook receives `{"from", "to",
 operations, commit batches, HTTP routes, and tokio scheduler lag, along with
 process CPU time and host steal time on Linux. The commit metrics also count
 failed manifest `PUT`s that stop strong reads from cache under an unexpired
-lease (`lease_reads_stopped`), and manifest reloads that start them again from
-a landed write whose lease has time left
+lease (`lease_reads_stopped`). In addition, they count manifest reloads that
+start strong reads from cache again from a landed write with an unexpired lease
 (`lease_reads_restored_from_landed_writes`, §5.5).
 `DELETE /v1/admin/metrics` returns and resets the metrics.
 
@@ -1537,7 +1537,12 @@ Workloads run concurrently with a shared chaos loop (`ChaosPhase`). When all act
 - `memory`: Exercises many databases under a tight memory budget while long-poll requests wait on unloaded databases and multiple users hold interactive transactions with large write sets. Verifies that strong reads return all settled writes, long-poll requests observe expected writes, and a heavy user cannot starve other users of transaction memory for more than 20 s.
 - `mix`: Runs a random combination of at least two workloads concurrently in a shared cluster and chaos loop.
 
-Every 20 ms of virtual time, global oracles verify that at most 1 node relies on a lease for any database and that any node relying on a lease without an in-flight manifest write holds the latest manifest version in the store. They also verify that no node relies on a lease for longer than `lease_ms` minus the margin after storage applied the manifest that grants the lease. At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, stream chunks, and event parts and masks are intact and consistent, that event positions are unique across unsealed rows and parts, and that `part_bytes` equals the referenced parts' sizes. After a node shuts down gracefully, the simulator verifies that none of the released databases in storage have a lease held by that node.
+Every 20 ms of virtual time, global oracles verify three lease invariants:
+- At most one node relies on a lease for each database.
+- Each node that relies on a lease without an in-flight manifest write holds the latest manifest version in the store.
+- Each node stops relying on its lease within `lease_ms` minus the margin after storage applies the manifest that grants the lease.
+
+At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, stream chunks, and event parts and masks are intact and consistent, that event positions are unique across unsealed rows and parts, and that `part_bytes` equals the referenced parts' sizes. After a node shuts down gracefully, the simulator verifies that storage contains no released database with a lease held by that node.
 
 ### 13.4 Coverage, campaigns, and exploration
 
@@ -1549,7 +1554,7 @@ Every 20 ms of virtual time, global oracles verify that at most 1 node relies on
 ### 13.5 Other test layers
 
 - **Unit tests** in each module.
-- **Property tests** using the in-crate generator and shrinker (`crates/baserunna/src/util/prop.rs`): verifies codec round trips, tuple ordering, segment building and reading, LSM-tree operations and change feeds against a reference model, stream operations and filters, table and index operations, range tombstone fragmentation, max-min fair memory allocation, base64/varint/bloom filters, metadata access-control state machines, and lease reads under ambiguous manifest `PUT`s. A bounded exhaustive search also runs every short sequence of lease steps on 2 nodes (`lease_search` in `engine/tests.rs`).
+- **Property tests** (`crates/baserunna/src/util/prop.rs`): verify codecs, tuple ordering, segments, LSM-tree operations, change feeds, streams, tables, indexes, range tombstones, fair memory allocation, bloom filters, metadata access control, and lease reads under ambiguous manifest `PUT`s. A bounded exhaustive search also runs every short sequence of lease steps on two nodes (`lease_search` in `engine/tests.rs`).
 - **Fuzz tests**: feeds arbitrary and mutated byte inputs to all binary and text decoders and random JSON requests to the HTTP router, verifying that arbitrary inputs do not cause panics or `500` responses.
 - **Transaction-op fuzzing** (`sim/txn_fuzz.rs`): generates random single-request and interactive transactions (including malformed operations) and compares every response against an independent transaction model.
 - **OpenAPI conformance**: validates every simulated HTTP response against `openapi.json` and verifies that `openapi.json` matches the router and generated specification.

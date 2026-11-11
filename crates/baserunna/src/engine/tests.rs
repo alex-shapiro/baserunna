@@ -927,9 +927,9 @@ enum ManifestPutOutcome {
     Applied,
     FailedBeforeApply,
     AppliedThenFailed,
-    /// Fails now, and stays pending with its precondition until the test applies it.
+    /// Fails now, and stays buffered with its precondition until the test applies it.
     FailedThenAppliedLate,
-    /// Applies, and answers `412`.
+    /// Applies the write, and returns `412`.
     AppliedThenRejected,
 }
 
@@ -962,11 +962,11 @@ impl ManifestFaultScript {
 struct LateManifestPutStore {
     mem: Arc<MemStore>,
     failed_manifest_puts: AtomicU32,
-    /// Outcomes that the manifest writes take in turn, repeated, and the number of writes that
-    /// took one. Overrides `manifest_fault_script`.
+    /// Outcomes that manifest writes take in turn, and the number of writes that took an outcome.
+    /// Overrides `manifest_fault_script`.
     cycled_manifest_put_outcomes: Mutex<Option<(Vec<ManifestPutOutcome>, usize)>>,
     late_puts: Mutex<Vec<(String, Bytes, PutMode)>>,
-    /// Applies the buffered writes before the next manifest write.
+    /// True if the next manifest write applies the buffered writes first.
     apply_late_puts_on_next_put: std::sync::atomic::AtomicBool,
     manifest_put_rejected: tokio::sync::Notify,
     manifest_fault_script: Mutex<Option<ManifestFaultScript>>,
@@ -1223,9 +1223,9 @@ fn strong_read_after_late_manifest_put_during_retry_is_new() {
     });
 }
 
-/// Tests strong reads if the store applies a manifest write from the lease holder and answers `412`.
+/// Tests strong reads if the store applies a manifest write from the lease holder and returns `412`.
 #[test]
-fn strong_read_after_an_applied_manifest_put_answers_412_is_new() {
+fn strong_read_after_an_applied_manifest_put_returns_412_is_new() {
     rt().block_on(async {
         let (a, b, store) = late_manifest_put_nodes();
         let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
@@ -1240,14 +1240,14 @@ fn strong_read_after_an_applied_manifest_put_answers_412_is_new() {
         assert_eq!(strong_get(&db_b, "k").await, Some(inline("new")), "B reads the applied write");
         let (stale_ms, _) = ms_until_strong_read_is_new(&db_a, 1).await;
         let outcome = commit.await.unwrap();
-        assert!(outcome.is_ok(), "setup: the commit answered {outcome:?}");
+        assert!(outcome.is_ok(), "setup: the commit returned {outcome:?}");
         assert_eq!(stale_ms, 0, "A read the old value for {stale_ms} ms after B read the new value");
     });
 }
 
-/// Tests that a node serves no lease reads from a rejected commit retry until the commit answers.
+/// Tests that a node serves no lease reads from a rejected commit retry until the commit finishes.
 #[test]
-fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_answers() {
+fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_finishes() {
     use crate::util::{Either, race};
     rt().block_on(async {
         let (a, _b, store) = late_manifest_put_nodes();
@@ -1279,7 +1279,7 @@ fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_answers() {
 }
 
 /// Tests that this node's lease map removes expired leases at its size bound, and that inserts do
-/// not scan the unexpired leases that the last removal kept until the map doubles.
+/// not scan the remaining unexpired leases until the map doubles.
 #[test]
 fn own_leases_remove_expired_leases_at_the_bound() {
     use super::db::OwnLease;
@@ -1397,8 +1397,8 @@ enum IdleHandleDrop {
     UnloadedForMemory,
 }
 
-/// Drops `db`, and lets `engine` drop its handle as `how` says if no task uses it. Returns the
-/// handle for the same database, and whether `engine` dropped the old handle.
+/// Drops `db`, and lets `engine` drop its handle according to `how` if no task uses it. Returns a
+/// new handle for the database, and whether `engine` dropped the old handle.
 async fn drop_idle_handle(engine: &Engine, db: Arc<Db>, how: IdleHandleDrop) -> (Arc<Db>, bool) {
     let (id, old) = (db.id.clone(), Arc::downgrade(&db));
     drop(db);
@@ -1418,8 +1418,9 @@ async fn drop_idle_handle(engine: &Engine, db: Arc<Db>, how: IdleHandleDrop) -> 
 }
 
 /// Tests strong reads if the retry read of a failed commit finds a late manifest write from an
-/// earlier batch. Other nodes time the lease in that write from when they first read it, so the
-/// holder must not time it from the later failed `PUT`, even if it dropped its handle in between.
+/// earlier batch. Other nodes time the lease in that write from their first read of it. Therefore,
+/// the holder must not time the lease from the later failed `PUT`, even if the holder dropped its
+/// handle in between.
 fn strong_read_after_late_manifest_put_from_an_earlier_batch(handle_drop: IdleHandleDrop) {
     rt().block_on(async {
         let (a, b, store) = late_manifest_put_nodes();
@@ -1590,7 +1591,7 @@ enum LeaseStep {
     },
     /// Applies the buffered writes before the next manifest write.
     ApplyLatePutsOnNextPut,
-    /// Drops A's handle as `how` says, and opens a new handle.
+    /// Drops A's handle according to `how`, and opens a new handle.
     DropHandle {
         how: IdleHandleDrop,
     },
@@ -1599,8 +1600,8 @@ enum LeaseStep {
     },
 }
 
-/// Generates `n` steps. Each seed leaves out a random subset of the step kinds other than
-/// `Advance` (swarm testing), so that long step sequences without an interfering write occur.
+/// Generates `n` steps. Each seed disables a random subset of the step kinds other than `Advance`.
+/// This produces long step sequences without an interfering write.
 fn gen_lease_steps(r: &mut Rng, n: usize) -> Vec<LeaseStep> {
     let mut weights = [8.0, 4.0, 6.0, 8.0, 12.0, 27.0, 10.0, 5.0, 5.0, 20.0];
     let advance = weights.len() - 1;
@@ -1676,8 +1677,8 @@ async fn advance_checking(
 
 /// Checks that a strong read on `db` returns a manifest that the store held during the read.
 async fn check_strong_read(db: &Arc<Db>, waits_for_write: bool, store: &LateManifestPutStore) -> Result<(), String> {
-    // Paused time does not advance between steps. A later read must start at a later instant than
-    // the store changes before it.
+    // Paused time does not advance between steps. Advance 1 ms so the read starts at a later
+    // instant than earlier store changes.
     sleep_ms(1).await;
     let first = store.stored_manifest_etags.lock().len() - 1;
     let (snap, write_in_flight) = match waits_for_write {
@@ -1714,7 +1715,7 @@ fn spawn_commit(db: &Arc<Db>, value: String, with_lease: bool) -> tokio::task::J
 /// Manifest `PUT` outcomes of a [`run_lease_steps`] run.
 enum LeaseRunOutcomes {
     Random(ManifestFaultScript),
-    /// Outcomes that the manifest writes take in turn, repeated.
+    /// Outcomes that manifest writes take in turn.
     Cycled(Vec<ManifestPutOutcome>),
 }
 
@@ -1723,9 +1724,9 @@ struct LeaseRun {
     seed: u64,
     cfg: EngineConfig,
     outcomes: LeaseRunOutcomes,
-    /// Milliseconds that pass, with lease checks, after each step that starts background work.
+    /// Milliseconds to advance, with lease checks, after each step that starts background work.
     ms_after_spawn: u64,
-    /// Interval in milliseconds of the lease checks while time passes.
+    /// Interval in milliseconds between lease checks while time advances.
     check_every_ms: u64,
 }
 
@@ -1831,8 +1832,8 @@ async fn run_lease_steps(run: LeaseRun, steps: &[LeaseStep]) -> Result<(), Strin
 }
 
 /// Tests that lease-served strong reads match the stored manifest, and that each lease holder
-/// stops relying on its lease before its lease term ends, while manifest writes fail, apply after
-/// an error, apply and answer `412`, or apply late with their original precondition.
+/// stops relying on its lease before its lease term ends. Manifest writes fail, apply after an
+/// error, apply and return `412`, or apply late with their original precondition.
 #[test]
 fn prop_lease_reads_match_the_store_under_ambiguous_manifest_puts() {
     let cases = prop::env_u64("PROP_CASES").unwrap_or(LEASE_PROP_CASES);
@@ -1851,8 +1852,8 @@ fn prop_lease_reads_match_the_store_under_ambiguous_manifest_puts() {
 const LEASE_PROP_CASES: u64 = 256;
 const LEASE_PROP_STEPS: usize = 200;
 
-/// Steps of [`lease_search`]. Each step that starts a commit or a lease request also lets 60 ms
-/// pass, so the work reaches the store before the next step.
+/// Steps of [`lease_search`]. Each step that starts a commit or a lease request also advances
+/// time by 60 ms, so the work reaches the store before the next step.
 const LEASE_SEARCH_STEPS: [LeaseStep; 12] = [
     LeaseStep::ApplyLatePutsOnNextPut,
     LeaseStep::Commit,
@@ -1869,13 +1870,14 @@ const LEASE_SEARCH_STEPS: [LeaseStep; 12] = [
 ];
 
 /// Runs every sequence of [`LEASE_SEARCH_STEPS`] up to `LEASE_SEARCH_DEPTH` steps (default 4) on
-/// two nodes whose manifest writes take `outcomes` in turn, with 2 and with 3 commit attempts.
+/// two nodes. Manifest writes take `outcomes` in turn, and the search runs with 2 and 3 commit
+/// attempts.
 ///
 /// Limits: the search drives one database on two nodes, drops handles only by eviction, and checks
-/// the lease views between steps and every 20 ms. It does not interleave steps inside a commit
-/// batch, so the property test finds defects that the search misses. Depth 4 also misses a handle
-/// eviction that loses the lease state, which depth 5 finds. Run depth 5 (about 100 s on 16 cores)
-/// with `LEASE_SEARCH_DEPTH=5 cargo test -p baserunna --lib lease_search`.
+/// the lease views between steps and every 20 ms. The search does not interleave steps inside a
+/// commit batch, so the property test finds defects that the search misses. Depth 4 also misses a
+/// handle eviction that loses the lease state, which depth 5 finds. Run depth 5 (about 100 s on 16
+/// cores) with `LEASE_SEARCH_DEPTH=5 cargo test -p baserunna --lib lease_search`.
 fn lease_search(outcomes: &[ManifestPutOutcome]) {
     let depth = prop::env_u64("LEASE_SEARCH_DEPTH").unwrap_or(4) as u32;
     let total = LEASE_SEARCH_STEPS.len().pow(depth);

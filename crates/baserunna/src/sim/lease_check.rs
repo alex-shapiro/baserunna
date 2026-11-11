@@ -11,13 +11,13 @@ pub(crate) trait ManifestHistory {
     /// Returns the instant at which the store applied the manifest of `db` with ETag `etag`.
     fn manifest_applied_at(&self, db: &str, etag: &str) -> Option<Instant>;
 
-    /// Returns the `If-Match` ETags of the failed manifest writes for `db` that can still apply.
+    /// Returns the `If-Match` ETags of the failed manifest writes for `db` that the store can still apply.
     fn late_manifest_put_targets(&self, db: &str) -> Vec<String>;
 }
 
 /// Checks that the node of `db` stops relying on its lease before its lease term ends. Also checks
-/// that a lease-served view without an in-flight manifest write is the stored manifest, and that no
-/// failed write can replace it.
+/// that a lease-served view without an in-flight manifest write matches the stored manifest, and
+/// that no failed write can replace it.
 pub(crate) fn check_lease_view(db: &Db, history: &impl ManifestHistory) -> Result<(), String> {
     let Some(view) = db.leased_view() else { return Ok(()) };
     if let Some(applied_at) = history.manifest_applied_at(&db.id, &view.etag) {

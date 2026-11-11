@@ -175,10 +175,9 @@ pub struct LeasedView {
 
 impl LeasedView {
     /// Returns how long this node relies on its lease after the lease term ends, if the store
-    /// applied the manifest at `applied_at`. The term is `lease_ms - margin_ms` from `applied_at`,
-    /// because the holder times its lease from before it sends the manifest. Another node honors
-    /// the lease for `lease_ms + margin_ms` from its first read of the manifest, so the term ends
-    /// first.
+    /// applied the manifest at `applied_at`. The holder times its lease from before it sends the
+    /// manifest, so the term is `lease_ms - margin_ms` from `applied_at`. Another node honors the
+    /// lease for `lease_ms + margin_ms` from its first read of the manifest, so the term ends first.
     pub fn lease_overrun(&self, applied_at: Instant, margin_ms: u64) -> Duration {
         let term = Duration::from_millis(self.lease_ms - margin_ms.min(self.lease_ms));
         self.expires_at.saturating_duration_since(applied_at + term)
@@ -194,9 +193,9 @@ pub(crate) enum OwnLease {
     /// serves strong reads from cache until `expires_at`.
     Held { write_seq: u64, expires_at: Instant },
     /// A manifest `PUT` from this node failed, and no later `PUT` succeeded. The store can still
-    /// apply a failed `PUT`, or its `412` showed that the cached manifest is old, so this node
-    /// serves no strong reads from cache. `earliest_failed_put_at` is the send instant of the
-    /// first of these `PUT`s.
+    /// apply a failed `PUT`, or a `412` response showed that the cached manifest is old. Therefore,
+    /// this node serves no strong reads from cache. `earliest_failed_put_at` is the send instant of
+    /// the first of these `PUT`s.
     Unconfirmed { earliest_failed_put_at: Instant },
 }
 
@@ -231,7 +230,7 @@ impl OwnLease {
 
 /// Manifest `PUT` from the current commit batch whose outcome is unknown.
 struct UnknownWrite {
-    /// `write_seq` of the manifest that the `PUT` carried.
+    /// `write_seq` of the manifest in the `PUT`.
     write_seq: u64,
     /// `If-Match` ETag of the `PUT`. The store can still apply the `PUT` while the stored manifest
     /// has this ETag.
@@ -463,15 +462,15 @@ impl Db {
     }
 
     /// Records that the store holds `m`, which this node sent at `sent`, and that no failed manifest
-    /// `PUT` from this node can replace it. Takes the lease in `m` if it names this node.
+    /// `PUT` from this node can replace it. Takes the lease in `m` if `m` contains this node's lease.
     fn confirm_own_write(&self, m: &Manifest, sent: Instant) {
         let granted = self.granted_lease(m, sent);
         self.shared.update_own_lease(&self.id, |_| granted);
     }
 
     /// Records that the store holds `m`, which a failed `PUT` from this node wrote, as
-    /// [`Db::confirm_own_write`] does. Times the lease in `m` from the earliest failed `PUT`, because
-    /// a manifest read cannot tell which failed `PUT` wrote `m`.
+    /// [`Db::confirm_own_write`] does. A manifest read cannot show which failed `PUT` wrote `m`, so
+    /// this node times the lease in `m` from the earliest failed `PUT`.
     fn confirm_landed_write(&self, m: &Manifest) {
         let (before, after) = self.shared.update_own_lease(&self.id, |l| match l {
             OwnLease::Unconfirmed { earliest_failed_put_at } => self.granted_lease(m, earliest_failed_put_at),
@@ -663,8 +662,8 @@ impl Db {
 
     /// Returns a version validated after `not_before`, fetching the manifest from storage
     /// if needed. Creates the database if `create` is true and the manifest does not exist.
-    /// A validation at the instant `not_before` counts only while no failed manifest `PUT` from
-    /// this node is unconfirmed, because equal instants do not order the validation and the call.
+    /// Equal instants do not order the validation and the call, so a validation at `not_before`
+    /// counts only if this node has no unconfirmed failed manifest `PUT`.
     pub async fn refresh(self: &Arc<Self>, not_before: Instant, create: bool) -> Result<Arc<Version>> {
         Ok(self.refresh_at(not_before, create).await?.0)
     }

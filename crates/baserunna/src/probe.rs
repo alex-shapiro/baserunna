@@ -69,11 +69,10 @@ probes! {
     ManifestWriteAmbiguous,
     /// A manifest reload confirmed that a previous ambiguous write was applied.
     AmbiguousWriteLanded,
-    /// A failed manifest `PUT` stopped strong reads from cache under an unexpired lease until this
-    /// node confirms a write.
+    /// A failed manifest `PUT` stopped strong reads from cache under an unexpired lease.
     LeaseReadsStopped,
-    /// A manifest reload found a write from a failed `PUT` of this node, and strong reads from
-    /// cache started again with the lease in that write, which has time left.
+    /// A manifest reload restarted strong reads from cache using an unexpired lease from a failed
+    /// `PUT` of this node.
     LeaseReadsRestoredFromLandedWrite,
     /// A commit was rejected because another node held an active lease.
     CommitNotOwner,

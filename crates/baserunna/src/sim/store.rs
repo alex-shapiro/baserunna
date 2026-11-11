@@ -90,7 +90,7 @@ pub struct SimStore {
     trace: Arc<Trace>,
     view: Arc<Mutex<ListView>>,
     held_replies: Arc<HeldReplies>,
-    /// `(key, If-Match ETag)` of each write that failed and applies late.
+    /// `(key, If-Match ETag)` of each failed write that the store will apply late.
     late_put_targets: Arc<Mutex<Vec<(String, String)>>>,
     /// `(ETag, apply instant)` of the last applied write to each manifest key.
     manifest_applied_at: Arc<Mutex<BTreeMap<String, (String, Instant)>>>,
@@ -152,7 +152,7 @@ impl SimStore {
         self.held_replies.released.notify_waiters();
     }
 
-    /// Returns the `If-Match` ETags of the writes to `key` that failed and still apply late.
+    /// Returns the `If-Match` ETags of the failed writes to `key` that the store will still apply late.
     pub fn late_put_targets(&self, key: &str) -> Vec<String> {
         self.late_put_targets.lock().iter().filter(|(k, _)| k == key).map(|(_, e)| e.clone()).collect()
     }

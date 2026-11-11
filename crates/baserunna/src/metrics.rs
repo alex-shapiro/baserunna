@@ -126,8 +126,8 @@ impl StoreMetrics {
         self.lease_reads_stopped.fetch_add(1, Relaxed);
     }
 
-    /// Counts a manifest reload that started strong reads from cache again with the lease in a
-    /// write from a failed `PUT`, if that lease has time left.
+    /// Counts a manifest reload that restarted strong reads from cache using an unexpired lease
+    /// from a failed `PUT`.
     pub fn lease_reads_restored_from_landed_write(&self) {
         self.lease_reads_restored_from_landed_writes.fetch_add(1, Relaxed);
     }

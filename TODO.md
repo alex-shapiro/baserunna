@@ -359,16 +359,16 @@ only.
       `outcome: "unknown"`.
 - [ ] [nice-to-have · Lease] **Take the lease only from a successful manifest
       `PUT`.** Remove the retry-loop restore that takes the lease from a
-      manifest written by one of this node's ambiguous `PUT`s. This product
+      manifest written by an ambiguous `PUT` from this node. This product
       tradeoff needs a decision. The restore has caused three stale strong
-      reads, and it needs the node-wide `Shared::own_leases` map on the
-      strong-read path. Without it, the lease returns to the database handle.
-      The cost is a few manifest `GET`s after a lost response. In the 15 s
-      after a lost response, reads every 1.5 s send 10 `GET`s instead of 8, and
-      reads every 250 ms send 14 `GET`s instead of 0. A hot database sends one
-      lease `PUT` with or without the restore. Recommended. If the restore
-      stays, also restore the lease from a manifest `PUT` that the store
-      applied after its batch ended.
+      reads, and it requires the node-wide `Shared::own_leases` map on the
+      strong-read path. Without the restore, the lease stays on the database
+      handle. The cost is a few manifest `GET`s after a lost response. In the
+      15 s after a lost response, reads every 1.5 s send 10 `GET`s instead of
+      8, and reads every 250 ms send 14 `GET`s instead of 0. A hot database
+      sends one lease `PUT` with or without the restore. Recommended. If the
+      restore stays, also restore the lease from a manifest `PUT` that the
+      store applied after its batch ended.
 - [ ] [nice-to-have · Operations] **Account for object overhead in the segment
       block cache.** Increase the per-entry overhead in `CacheVal::size` above
       48 bytes so small block-cache entries are not undercounted by half of
@@ -462,19 +462,22 @@ only.
 - [ ] [tangential · Simulator] **Order manifest checks and strong reads that
       share a paused-clock instant.** `Db::refresh` lets a strong read reuse a
       manifest check from the same `Instant`. Under a paused clock, the read
-      then returns an old version in two cases. A real clock does not give
-      equal instants. In case 1, node A's `GET` returns version N, node B
-      commits N+1, and a second strong read on A reuses the `GET`. In case 2,
-      A's `GET` reads N at T and its reply arrives at T + 20 ms, B commits N+1
-      at T, and a second strong read on A starts at T, waits for the load lock,
-      and accepts the reply. The losing candidate of the late-apply fix ordered
-      equal instants with an `OrderedInstant` (an `Instant` and a process-wide
-      sequence number). A check answered a read only if the check started at or
-      after the read's instant and finished after the read. That rule fixes
-      case 1 with no change to `tests/cost.rs`, but not case 2. Ordering checks
-      by their start sequence fixes both cases, but `node_overhead_1_node`
-      increases from 121 to 151 manifest `GET`s and `node_overhead_3_nodes`
-      from 140.3 to 170.3.
+      then returns an old version in two cases. A real clock does not produce
+      equal instants:
+      - In case 1, node A's `GET` returns version N, node B commits N+1, and a
+        second strong read on A reuses the `GET`.
+      - In case 2, A's `GET` reads N at T and its reply arrives at T + 20 ms, B
+        commits N+1 at T, and a second strong read on A starts at T, waits for
+        the load lock, and accepts the reply.
+
+      The losing candidate of the late-apply fix ordered equal instants with an
+      `OrderedInstant` (an `Instant` and a process-wide sequence number). A
+      check answered a read only if the check started at or after the read's
+      instant and finished after the read. That rule fixes case 1 with no
+      change to `tests/cost.rs`, but does not fix case 2. Ordering checks by
+      their start sequence fixes both cases, but increases
+      `node_overhead_1_node` from 121 to 151 manifest `GET`s and
+      `node_overhead_3_nodes` from 140.3 to 170.3.
 - [ ] [tangential · Simulator] **Tolerate transient form errors in the
       `console` workload.** Allow transient password-change timeouts at
       `/console/account/password` during simulated storage stalls instead of
@@ -525,10 +528,10 @@ only.
       `fail_batch` after an ambiguous `PUT`, it marks every undecided commit in
       the batch as `outcome: "unknown"`.
 - [ ] [tangential · Change feed] **Notify waiters about a commit that the
-      store applied late.** A commit that the store applies after its manifest
-      `PUT` failed sends no commit notice (`Shared::committed`) and starts no
-      event maintenance (`Shared::events_changed`). Change-feed waiters on
-      other nodes find the commit at their next poll.
+      store applied late.** If the store applies a commit after its manifest
+      `PUT` failed, the node sends no commit notice (`Shared::committed`) and
+      starts no event maintenance (`Shared::events_changed`). Change-feed
+      waiters on other nodes find the commit at their next poll.
 - [ ] [tangential · API] **Return `200` if a retried database deletion
       completes cleanup.** Return `200` instead of `404 not_found` if a
       retried `DELETE /v1/dbs/{db}` finishes an interrupted database deletion.
@@ -608,5 +611,5 @@ only.
       late.
 - [ ] [untriaged · Garbage collection] **Sweep objects that a late `PUT` writes
       after a database deletion.** A non-manifest `PUT` that the store applies
-      after the second deletion pass leaves an orphan object. No sweep removes
-      it.
+      after the second deletion pass leaves an orphan object. The sweep does
+      not remove that object.

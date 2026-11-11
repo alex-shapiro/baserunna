@@ -1,11 +1,11 @@
 //! Verifies that strong reads never return older data after a client observes newer data.
-//! This file tests the case where the object store applies a manifest `PUT` after returning an error.
+//! This file tests an object store that applies a manifest `PUT` after returning an error.
 //!
 //! Each test commits `k = old` and an event row. It then commits `k = new` and a second event row on
 //! the lease holder while [`LateManifestPutStore`] fails every manifest `PUT` of that commit. The
 //! commit returns `503` with `outcome: "unknown"`. The store then applies the first failed `PUT`,
 //! which still matches the manifest ETag. Each test reads through a client-visible path until
-//! every node answers with the new data. The test fails if a response shows the old data after an
+//! every node returns the new data. The test fails if a response shows the old data after an
 //! earlier response showed the new data.
 
 use axum::body::Body;
@@ -28,7 +28,7 @@ const BASE_MS: u64 = 1_750_000_000_000;
 const QUERY_TO_MS: i64 = 9_999_999_999_999;
 /// Interval between two rounds of client requests after the late `PUT` is applied.
 const ROUND_MS: u64 = 100;
-/// Maximum test-clock time for all nodes to answer with the new data.
+/// Maximum test-clock time for all nodes to return the new data.
 const SETTLE_MS: u64 = 30_000;
 
 /// Object store wrapper that fails the next manifest `PUT`s of a database and buffers them.
@@ -228,8 +228,8 @@ enum Probe {
 
 /// Response recorded from a client probe.
 #[derive(Debug)]
-struct Answer {
-    /// Test-clock milliseconds relative to when the late `PUT` is applied.
+struct ProbeResponse {
+    /// Test-clock milliseconds relative to when the store applies the late `PUT`.
     at_ms: i64,
     probe: Probe,
     status: u16,
@@ -247,9 +247,9 @@ struct LateCommit {
     other: usize,
     /// Change-feed cursor after the commit of `k = old`.
     cursor: String,
-    commit_answered_at: Instant,
+    commit_finished_at: Instant,
     applied_at: Option<Instant>,
-    answers: Vec<Answer>,
+    responses: Vec<ProbeResponse>,
 }
 
 const IDEMPOTENCY_KEY: &str = "late-commit";
@@ -336,9 +336,9 @@ async fn late_commit(home: Home) -> LateCommit {
         holder,
         other,
         cursor,
-        commit_answered_at: Instant::now(),
+        commit_finished_at: Instant::now(),
         applied_at: None,
-        answers: Vec::new(),
+        responses: Vec::new(),
     }
 }
 
@@ -356,7 +356,7 @@ impl LateCommit {
         self.applied_at = Some(Instant::now());
         eprintln!(
             "late PUT applied {} ms after the 503; later late PUTs: {:?}",
-            self.commit_answered_at.elapsed().as_millis(),
+            self.commit_finished_at.elapsed().as_millis(),
             applied[1..].iter().map(|r| r.as_ref().map(drop).map_err(ToString::to_string)).collect::<Vec<_>>()
         );
     }
@@ -364,7 +364,7 @@ impl LateCommit {
     fn at_ms(&self) -> i64 {
         match self.applied_at {
             Some(t) => t.elapsed().as_millis() as i64,
-            None => -(self.commit_answered_at.elapsed().as_millis() as i64),
+            None => -(self.commit_finished_at.elapsed().as_millis() as i64),
         }
     }
 
@@ -399,8 +399,8 @@ impl LateCommit {
                 (r, n == Some(2), format!("count {n:?} at version {}", j["version"]))
             }
         };
-        let answer = Answer { at_ms: self.at_ms(), probe, status: r.status, shows_new, detail };
-        self.answers.push(answer);
+        let response = ProbeResponse { at_ms: self.at_ms(), probe, status: r.status, shows_new, detail };
+        self.responses.push(response);
         shows_new
     }
 
@@ -415,16 +415,16 @@ impl LateCommit {
             if all_new {
                 return;
             }
-            assert!(start.elapsed() < Duration::from_millis(SETTLE_MS), "the nodes never answered with the new data");
+            assert!(start.elapsed() < Duration::from_millis(SETTLE_MS), "the nodes never returned the new data");
             tokio::time::sleep(Duration::from_millis(ROUND_MS)).await;
         }
     }
 
     /// Prints all responses and asserts that none returned old data after an earlier response returned new data.
-    fn assert_no_answer_goes_back(&self, path: &str) {
-        let first_new = self.answers.iter().position(|a| a.shows_new);
+    fn assert_no_response_goes_back(&self, path: &str) {
+        let first_new = self.responses.iter().position(|a| a.shows_new);
         let mut went_back = Vec::new();
-        for (i, a) in self.answers.iter().enumerate() {
+        for (i, a) in self.responses.iter().enumerate() {
             let mark = match (a.shows_new, first_new) {
                 (false, Some(f)) if i > f => {
                     went_back.push(a);
@@ -438,9 +438,9 @@ impl LateCommit {
         let holder = self.c.nodes[self.holder].engine.db(&self.db_id).lease_holder();
         eprintln!("{path}: holder n{}, other n{}; lease holder now {holder:?}", self.holder, self.other);
         if let (Some(f), Some(last)) = (first_new, went_back.last()) {
-            let first = &self.answers[f];
+            let first = &self.responses[f];
             panic!(
-                "{path}: {} answers showed the old data after {:?} showed the new data at t={} ms; \
+                "{path}: {} responses showed the old data after {:?} showed the new data at t={} ms; \
                  the last at t={} ms ({:?}), so the client saw old data for {} ms after new data",
                 went_back.len(),
                 first.probe,
@@ -463,7 +463,7 @@ fn check_path(path: &str, home: Home, round: fn(&LateCommit) -> Vec<Probe>, fail
         lc.c.fail_forwards_to(lc.holder, failed_forwards);
         lc.ask_until_new(&probes).await;
         lc.c.shutdown();
-        lc.assert_no_answer_goes_back(path);
+        lc.assert_no_response_goes_back(path);
     });
 }
 

@@ -211,13 +211,13 @@ impl Shared {
 #[derive(Default)]
 struct OwnLeases {
     by_db: DetHashMap<String, OwnLease>,
-    /// Entry count at which an insert removes expired leases, if it is above
-    /// [`OWN_LEASES_PRUNE_LEN`]. Each removal sets it to twice the entries it keeps, so inserts do
-    /// not scan the same unexpired entries again and again.
+    /// Entry count at which an insert removes expired leases, if the count is at least
+    /// [`OWN_LEASES_PRUNE_LEN`]. Each removal sets this threshold to twice the remaining entries,
+    /// so inserts do not repeatedly scan the same unexpired entries.
     prune_at_len: usize,
 }
 
-/// Entry count at which [`Shared::update_own_lease`] starts to remove expired leases.
+/// Minimum entry count at which [`Shared::update_own_lease`] removes expired leases.
 const OWN_LEASES_PRUNE_LEN: usize = 100_000;
 
 pub fn manifest_key(db: &str) -> String {
@@ -449,7 +449,7 @@ impl Engine {
         g.retain(|_, db| Arc::strong_count(db) > 1 || !db.idle_for(idle_ms));
     }
 
-    /// Removes the handle, cached entries and this node's lease state for database `id`.
+    /// Removes the handle, cached entries, and this node's lease state for database `id`.
     pub fn forget(&self, id: &str) {
         self.dbs.lock().remove(id);
         self.shared.cache.evict_db(id);

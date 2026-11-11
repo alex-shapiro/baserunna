@@ -1327,6 +1327,39 @@ fn commit_applied_with_a_412_and_no_reload_has_an_unknown_outcome() {
     });
 }
 
+/// Tests that a commit is reported as replayed if another node applied its commit ID after this
+/// node sent it in a manifest `PUT` with an unknown outcome that the store did not apply.
+#[test]
+fn commit_applied_by_another_node_after_an_unknown_put_is_replayed() {
+    rt().block_on(async {
+        let (a, b, store) = late_manifest_put_nodes();
+        let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
+        put(&db_a, "k", "old").await;
+        db_b.open(false).await.unwrap();
+        sleep_ms(a.shared.cfg.lease_ms + a.shared.cfg.lease_margin_ms + 1).await;
+        let request = |db: Arc<Db>| async move {
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            t.put(Bytes::from_static(b"k"), inline("new")).unwrap();
+            CommitRequest { commit_id: 7, ..t.into_request() }
+        };
+        let (req_a, req_b) = (request(db_a.clone()).await, request(db_b.clone()).await);
+        *store.cycled_manifest_put_outcomes.lock() = Some((vec![ManifestPutOutcome::FailedBeforeApply], 0));
+        let puts = store.manifest_puts.load(SeqCst);
+        let commit_a = tokio::spawn({
+            let db_a = db_a.clone();
+            async move { db_a.commit_detailed(req_a).await }
+        });
+        while store.manifest_puts.load(SeqCst) == puts {
+            sleep_ms(1).await;
+        }
+        *store.cycled_manifest_put_outcomes.lock() = None;
+        let outcome_b = db_b.commit_detailed(req_b).await;
+        assert!(matches!(outcome_b, Ok(Committed { replayed: false, .. })), "setup: B answered {outcome_b:?}");
+        let outcome_a = commit_a.await.unwrap();
+        assert!(matches!(outcome_a, Ok(Committed { replayed: true, .. })), "A answered {outcome_a:?}");
+    });
+}
+
 /// Tests that a node validates each strong read against storage after a rejected commit retry until
 /// a later manifest `PUT` from the node succeeds. The reload that finds the landed write does not
 /// give the lease back. The lease-only `PUT` that the commit batch requests gives it back.

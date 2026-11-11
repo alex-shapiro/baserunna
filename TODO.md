@@ -161,6 +161,26 @@ only.
 
 ## Nice-to-have
 
+- [ ] [nice-to-have · Transactions] **Identify this node's manifest `PUT`s
+      with a unique token.** Put a unique token in each manifest `PUT` and in
+      the commit records that the `PUT` adds. A reload then shows exactly
+      which `PUT` wrote the manifest and each commit record. Today the
+      committer guesses from the error class and from `write_seq`:
+      - A `412` reply counts as an unknown outcome, because storage can apply a
+        `PUT` and answer `412` (SPEC §5.5). The fix for that defect needed one
+        more manifest reload before a batch stops.
+      - The lease-only `PUT` after a landed write (`Db::process`) matches the
+        `write_seq` and the lease node of the reloaded manifest, not the `PUT`.
+      - `clear_replay_if_sent_in_batch` compares the stored commit record with
+        the records that the batch sent. Another node that builds from the
+        same base in the same millisecond writes an equal record, and the
+        commit then reports `replayed: false`. Test:
+        `commit_applied_by_another_node_after_an_unknown_put_is_replayed`.
+      - A commit has two success exits in `Db::process`. The exit after a
+        landed write does not send a commit notice or start event
+        maintenance, and it requests the lease-only `PUT`. With the token,
+        one function can finish a commit for both exits.
+
 - [ ] [nice-to-have · Verification] **Enable the CI triggers.** Uncomment the
       pull request, push, and schedule triggers in `.github/workflows/test.yml`
       and `deploy.yml`. Today both workflows run only on `workflow_dispatch`.

@@ -218,9 +218,6 @@ struct State {
     reads_in_window: u32,
     reads_last_window: u32,
     lease_requested: bool,
-    /// Hedged manifest `PUT` requests that remain in flight in the background.
-    /// The database stays loaded while this count is non-zero.
-    in_flight_hedged_puts: u32,
     /// Start instant of this node's in-flight manifest write.
     manifest_write_started_at: Option<Instant>,
     compacting: bool,
@@ -311,7 +308,6 @@ impl Db {
                 reads_in_window: 0,
                 reads_last_window: 0,
                 lease_requested: false,
-                in_flight_hedged_puts: 0,
                 manifest_write_started_at: None,
                 compacting: false,
                 flushing: false,
@@ -384,7 +380,7 @@ impl Db {
         let mut st = self.st.lock();
         let q = self.q.lock();
         let busy = q.running || !q.items.is_empty() || q.parked_flush.is_some();
-        if busy || st.compacting || st.flushing || st.sweeping || st.trimming || st.in_flight_hedged_puts > 0 {
+        if busy || st.compacting || st.flushing || st.sweeping || st.trimming {
             return false;
         }
         let Some(cur) = st.current.take() else { return false };
@@ -1404,9 +1400,8 @@ impl Db {
 
     /// Writes the manifest with `If-Match: etag`, issuing a hedged `PUT` after `manifest_put_hedge_ms`.
     /// If the hedged `PUT` fails with `PreconditionFailed` while the first `PUT` is still in flight,
-    /// returns `StoreError::Unavailable` and tracks the first `PUT` in `in_flight_hedged_puts` until
-    /// it finishes.
-    async fn put_manifest(self: &Arc<Self>, data: Bytes, etag: &str) -> crate::store::SResult<String> {
+    /// returns `StoreError::Unavailable` without waiting for the first `PUT`.
+    async fn put_manifest(&self, data: Bytes, etag: &str) -> crate::store::SResult<String> {
         let (store, key, etag) = (self.shared.store.clone(), manifest_key(&self.id), etag.to_string());
         let put = || -> crate::store::BoxFut<'static, crate::store::SResult<String>> {
             let (store, key, data, etag) = (store.clone(), key.clone(), data.clone(), etag.clone());
@@ -1442,12 +1437,6 @@ impl Db {
             }
             Err(StoreError::PreconditionFailed) if hedge_won => {
                 probe::hit(Probe::HedgeRejectedFirstInFlight);
-                self.st.lock().in_flight_hedged_puts += 1;
-                let me = self.clone();
-                self.shared.env.spawn(async move {
-                    let _ = first.await;
-                    me.st.lock().in_flight_hedged_puts -= 1;
-                });
                 return Err(ambiguous());
             }
             Err(e) => e,
@@ -3006,15 +2995,15 @@ mod tests {
         let down = || Unavailable("timeout".into());
         let fatal = || Fatal("403".into());
         let cases = [
-            ((100, ok()), None, Ok(()), 100, false),
-            ((1_000, ok()), Some((10, Err(Refused))), Err(down()), 260, true),
-            ((300, Err(Refused)), Some((500, ok())), Ok(()), 750, false),
-            ((300, Err(down())), Some((100, Err(fatal()))), Err(down()), 350, false),
-            ((300, Err(Refused)), Some((200, Err(Refused))), Err(Refused), 450, false),
-            ((300, Err(fatal())), Some((100, Err(Refused))), Err(fatal()), 350, false),
-            ((1_000, Err(down())), Some((100, Err(fatal()))), Err(down()), 1_000, false),
+            ((100, ok()), None, Ok(()), 100),
+            ((1_000, ok()), Some((10, Err(Refused))), Err(down()), 260),
+            ((300, Err(Refused)), Some((500, ok())), Ok(()), 750),
+            ((300, Err(down())), Some((100, Err(fatal()))), Err(down()), 350),
+            ((300, Err(Refused)), Some((200, Err(Refused))), Err(Refused), 450),
+            ((300, Err(fatal())), Some((100, Err(Refused))), Err(fatal()), 350),
+            ((1_000, Err(down())), Some((100, Err(fatal()))), Err(down()), 1_000),
         ];
-        for (first, hedge, want, ms, in_flight) in cases {
+        for (first, hedge, want, ms) in cases {
             rt().block_on(async {
                 let script = Scripted(parking_lot::Mutex::new(
                     [Some(first.clone()), hedge.clone()].into_iter().flatten().collect(),
@@ -3026,7 +3015,6 @@ mod tests {
                 let db = eng.db("d");
                 let got = db.put_manifest(Bytes::from_static(b"m"), "e1").await.map(drop);
                 let case = format!("first {first:?}, hedge {hedge:?}");
-                assert_eq!(db.st.lock().in_flight_hedged_puts, u32::from(in_flight), "{case}");
                 match (&got, &want) {
                     (Err(Unavailable(_)), Err(Unavailable(_))) => {}
                     _ => assert_eq!(got, want, "{case}"),

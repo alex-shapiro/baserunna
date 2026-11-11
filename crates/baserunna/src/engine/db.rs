@@ -160,22 +160,55 @@ impl Work {
     }
 }
 
+/// This node's lease on one database, which lets it serve strong reads from cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum OwnLease {
+    #[default]
+    NotHeld,
+    /// The store holds the manifest at `write_seq`, which this node wrote with its lease. This node
+    /// serves strong reads from cache until `expires_at`.
+    Held { write_seq: u64, expires_at: Instant },
+    /// A manifest `PUT` from this node failed, and no later `PUT` succeeded. The store can still
+    /// apply a failed `PUT`, or its `412` showed that the cached manifest is old, so this node
+    /// serves no strong reads from cache. `earliest_failed_put_at` is the send instant of the
+    /// first of these `PUT`s.
+    Unconfirmed { earliest_failed_put_at: Instant },
+}
+
+impl OwnLease {
+    /// Returns the lease after a manifest `PUT` from this node, sent at `sent`, fails.
+    fn after_failed_put(self, sent: Instant) -> OwnLease {
+        match self {
+            OwnLease::Unconfirmed { .. } => self,
+            _ => OwnLease::Unconfirmed { earliest_failed_put_at: sent },
+        }
+    }
+
+    fn is_unconfirmed(self) -> bool {
+        matches!(self, OwnLease::Unconfirmed { .. })
+    }
+
+    /// Returns how long this node can still rely on the lease that the manifest at `write_seq`
+    /// gives it.
+    fn left_at(self, write_seq: u64) -> Duration {
+        match self {
+            OwnLease::Held { write_seq: ws, expires_at } if ws == write_seq => {
+                expires_at.saturating_duration_since(Instant::now())
+            }
+            _ => Duration::ZERO,
+        }
+    }
+}
+
 struct State {
     current: Option<Arc<Version>>,
     verified_at: Option<Instant>,
-    /// Send instant of the earliest manifest `PUT` from this node that failed after the last
-    /// [`Db::confirm_own_write`]. While it is set, a failed `PUT` can still replace the stored
-    /// manifest, or its `412` showed that `current` is old.
-    earliest_failed_put_at: Option<Instant>,
     last_access: Instant,
     last_access_seq: u64,
     window_start: Instant,
     reads_in_window: u32,
     reads_last_window: u32,
     lease_requested: bool,
-    /// `(write_seq, expires_at)` for the lease that lets this node serve strong reads from cache.
-    /// It is `None` while `earliest_failed_put_at` is set.
-    own_lease: Option<(u64, Instant)>,
     /// Hedged manifest `PUT` requests that remain in flight in the background.
     /// The database stays loaded while this count is non-zero.
     in_flight_hedged_puts: u32,
@@ -263,14 +296,12 @@ impl Db {
             st: Mutex::new(State {
                 current: None,
                 verified_at: None,
-                earliest_failed_put_at: None,
                 last_access: now,
                 last_access_seq: 0,
                 window_start: now,
                 reads_in_window: 0,
                 reads_last_window: 0,
                 lease_requested: false,
-                own_lease: None,
                 in_flight_hedged_puts: 0,
                 manifest_write_started_at: None,
                 compacting: false,
@@ -366,52 +397,64 @@ impl Db {
 
     /// Remaining duration we may rely on our lease in `m`, or zero if `m` is
     /// not the manifest write that last renewed it.
-    fn own_lease_left(&self, st: &State, m: &Manifest) -> Duration {
-        let ours = m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id);
-        match st.own_lease {
-            Some((ws, until)) if ours && ws == m.write_seq => until.saturating_duration_since(Instant::now()),
-            _ => Duration::ZERO,
+    fn own_lease_left(&self, m: &Manifest) -> Duration {
+        match m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id) {
+            true => self.shared.own_lease(&self.id).left_at(m.write_seq),
+            false => Duration::ZERO,
         }
     }
 
-    fn holds_lease(&self, st: &State, m: &Manifest) -> bool {
-        !self.own_lease_left(st, m).is_zero()
+    fn holds_lease(&self, m: &Manifest) -> bool {
+        !self.own_lease_left(m).is_zero()
+    }
+
+    /// Returns the lease that `m` gives this node if this node sent `m` at `sent`.
+    fn granted_lease(&self, m: &Manifest, sent: Instant) -> OwnLease {
+        match m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
+            Some(l) => OwnLease::Held {
+                write_seq: m.write_seq,
+                expires_at: sent + Duration::from_millis(l.ms - self.shared.cfg.lease_margin_ms.min(l.ms)),
+            },
+            None => OwnLease::NotHeld,
+        }
+    }
+
+    /// Records that a manifest `PUT` from this node, sent at `sent`, failed.
+    fn fail_own_write(&self, sent: Instant) {
+        self.shared.update_own_lease(&self.id, |l| l.after_failed_put(sent));
     }
 
     /// Records that the store holds `m`, which this node sent at `sent`, and that no failed manifest
     /// `PUT` from this node can replace it. Takes the lease in `m` if it names this node.
     fn confirm_own_write(&self, m: &Manifest, sent: Instant) {
-        let mut st = self.st.lock();
-        st.earliest_failed_put_at = None;
-        if let Some(l) = m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
-            let margin = self.shared.cfg.lease_margin_ms.min(l.ms);
-            st.own_lease = Some((m.write_seq, sent + Duration::from_millis(l.ms - margin)));
-        }
+        let granted = self.granted_lease(m, sent);
+        self.shared.update_own_lease(&self.id, |_| granted);
     }
 
     /// Records that the store holds `m`, which a failed `PUT` from this node wrote, as
     /// [`Db::confirm_own_write`] does. Times the lease in `m` from the earliest failed `PUT`, because
     /// a manifest read cannot tell which failed `PUT` wrote `m`.
     fn confirm_landed_write(&self, m: &Manifest) {
-        let earliest_failed_put_at = self.st.lock().earliest_failed_put_at;
-        if let Some(sent) = earliest_failed_put_at {
-            self.confirm_own_write(m, sent);
-        }
+        self.shared.update_own_lease(&self.id, |l| match l {
+            OwnLease::Unconfirmed { earliest_failed_put_at } => self.granted_lease(m, earliest_failed_put_at),
+            l => l,
+        });
     }
 
-    /// Caps `own_lease` to the expiration granted by `m` at `sent` because peers can observe `m`
+    /// Caps our lease to the expiration granted by `m` at `sent` because peers can observe `m`
     /// immediately after `sent`.
     fn limit_own_lease(&self, m: &Manifest, sent: Instant) {
-        let mut st = self.st.lock();
-        let Some((ws, until)) = st.own_lease else { return };
-        let granted = match m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
-            Some(l) => sent + Duration::from_millis(l.ms - self.shared.cfg.lease_margin_ms.min(l.ms)),
-            None => sent,
+        let granted = match self.granted_lease(m, sent) {
+            OwnLease::Held { expires_at, .. } => expires_at,
+            _ => sent,
         };
-        if granted < until {
-            probe::hit(Probe::LeaseShortenedInFlight);
-            st.own_lease = Some((ws, granted));
-        }
+        self.shared.update_own_lease(&self.id, |l| match l {
+            OwnLease::Held { write_seq, expires_at } if granted < expires_at => {
+                probe::hit(Probe::LeaseShortenedInFlight);
+                OwnLease::Held { write_seq, expires_at: granted }
+            }
+            l => l,
+        });
     }
 
     fn foreign_lease<'a>(&self, v: &'a Version) -> Option<(&'a Lease, Duration)> {
@@ -446,13 +489,12 @@ impl Db {
     pub fn leased_view(&self) -> Option<(u64, String, bool)> {
         let st = self.st.lock();
         let cur = st.current.as_ref()?;
-        self.holds_lease(&st, &cur.m).then(|| (cur.m.write_seq, cur.etag.clone(), self.has_in_flight_write()))
+        self.holds_lease(&cur.m).then(|| (cur.m.write_seq, cur.etag.clone(), self.has_in_flight_write()))
     }
 
     pub fn lease_holder(&self) -> Option<String> {
-        let st = self.st.lock();
-        let cur = st.current.clone()?;
-        if self.holds_lease(&st, &cur.m) {
+        let cur = self.current()?;
+        if self.holds_lease(&cur.m) {
             return Some(self.shared.node_id.clone());
         }
         self.observed_lease(&cur).map(|(l, _)| l.node.clone())
@@ -581,7 +623,7 @@ impl Db {
         let (etag, cur) = {
             let st = self.st.lock();
             if let (Some(c), Some(va)) = (&st.current, st.verified_at)
-                && (va > not_before || va == not_before && st.earliest_failed_put_at.is_none())
+                && (va > not_before || va == not_before && !self.shared.own_lease(&self.id).is_unconfirmed())
             {
                 return Ok((c.clone(), va));
             }
@@ -729,7 +771,7 @@ impl Db {
         let hot = {
             let mut st = self.st.lock();
             let hot = st.hot(self.shared.cfg.lease_read_threshold) && !st.lease_requested;
-            if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v).is_none() && !self.has_in_flight_write() {
+            if hot && !self.holds_lease(&v.m) && self.foreign_lease(&v).is_none() && !self.has_in_flight_write() {
                 st.lease_requested = true;
                 true
             } else {
@@ -760,7 +802,7 @@ impl Db {
         if buggify() {
             return None;
         }
-        let lease_left = self.own_lease_left(&st, &cur.m);
+        let lease_left = self.own_lease_left(&cur.m);
         let leased = !lease_left.is_zero();
         let current_at = leased.then(|| st.manifest_write_started_at.unwrap_or(now)).max(st.verified_at);
         let fresh = match c {
@@ -918,7 +960,8 @@ impl Db {
             let st = self.st.lock();
             let in_manifest =
                 st.current.as_ref().is_some_and(|c| c.m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id));
-            in_manifest || st.own_lease.is_some_and(|(_, until)| until > Instant::now())
+            in_manifest
+                || matches!(self.shared.own_lease(&self.id), OwnLease::Held { expires_at, .. } if expires_at > Instant::now())
         };
         if !held {
             return Ok(false);
@@ -1182,10 +1225,7 @@ impl Db {
             };
             let res = self.put_manifest(data, &base.etag).await;
             if !res.is_ok() {
-                let mut st = self.st.lock();
-                st.earliest_failed_put_at.get_or_insert(attempt_started);
-                st.own_lease = None;
-                drop(st);
+                self.fail_own_write(attempt_started);
                 self.write_finished();
             }
             match res {
@@ -2066,7 +2106,7 @@ impl Db {
         }
         {
             let mut st = self.st.lock();
-            if st.flushing || !self.holds_lease(&st, &v.m) {
+            if st.flushing || !self.holds_lease(&v.m) {
                 return;
             }
             st.flushing = true;
@@ -2095,7 +2135,7 @@ impl Db {
     /// state lock, clearing `flag` if not.
     fn has_more_work(&self, flag: fn(&mut State) -> &mut bool, due: impl Fn(&Manifest) -> bool) -> bool {
         let mut st = self.st.lock();
-        let again = st.current.as_ref().is_some_and(|c| self.holds_lease(&st, &c.m) && due(&c.m));
+        let again = st.current.as_ref().is_some_and(|c| self.holds_lease(&c.m) && due(&c.m));
         if !again {
             *flag(&mut st) = false;
         }
@@ -2275,7 +2315,7 @@ impl Db {
         loop {
             let store_now = self.shared.store_time_ms().await?;
             let Some(v) = self.current() else { return Ok(()) };
-            if !self.holds_lease(&self.st.lock(), &v.m) {
+            if !self.holds_lease(&v.m) {
                 probe::hit(Probe::CompactionLostLease);
                 return Ok(());
             }
@@ -2332,7 +2372,7 @@ impl Db {
         let cfg = self.shared.cfg.clone();
         let now_ms = self.shared.store_time_ms().await?;
         let v = self.refresh(Instant::now(), false).await?;
-        if !self.holds_lease(&self.st.lock(), &v.m) {
+        if !self.holds_lease(&v.m) {
             return Ok(());
         }
         let mut referenced: BTreeSet<(ObjKind, String)> =
@@ -2923,7 +2963,7 @@ mod tests {
             store.manifest_put_lost.store(1, SeqCst);
             put(&db, "k", "2").await;
             let cur = db.current().unwrap();
-            assert!(db.holds_lease(&db.st.lock(), &cur.m));
+            assert!(db.holds_lease(&cur.m));
         });
     }
 

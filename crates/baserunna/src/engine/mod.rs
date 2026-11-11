@@ -27,6 +27,7 @@ use tokio::sync::Semaphore;
 
 pub use baserunna_api::{DbStats, LevelStats};
 pub use config::EngineConfig;
+use db::OwnLease;
 pub use db::{CommitState, Committed, Consistency, Db};
 pub use stream::{Appended, Record, Retention, Seek, StreamOp, StreamState};
 pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
@@ -48,6 +49,9 @@ pub struct Shared {
     /// Latest observed foreign lease `(holder, write_seq, first_seen)` per
     /// database, retained across `Db` handle evictions.
     pub(crate) observed_leases: Mutex<DetHashMap<String, (String, u64, tokio::time::Instant)>>,
+    /// This node's own lease per database, retained across `Db` handle evictions. A database
+    /// without an entry is [`OwnLease::NotHeld`].
+    own_leases: Mutex<DetHashMap<String, OwnLease>>,
     system: Mutex<std::collections::BTreeSet<String>>,
     pub memory: Arc<memory::Memory>,
     engine: std::sync::OnceLock<std::sync::Weak<Engine>>,
@@ -176,6 +180,30 @@ impl Shared {
         g.insert(db.to_string(), (lease.node.clone(), write_seq, now));
         now
     }
+
+    /// Returns this node's own lease for `db`.
+    pub(crate) fn own_lease(&self, db: &str) -> OwnLease {
+        self.own_leases.lock().get(db).copied().unwrap_or_default()
+    }
+
+    /// Replaces this node's own lease for `db` with `f` applied to it.
+    pub(crate) fn update_own_lease(&self, db: &str, f: impl FnOnce(OwnLease) -> OwnLease) {
+        let mut g = self.own_leases.lock();
+        let next = f(g.get(db).copied().unwrap_or_default());
+        if next == OwnLease::NotHeld {
+            g.remove(db);
+            return;
+        }
+        if let Some(l) = g.get_mut(db) {
+            *l = next;
+            return;
+        }
+        if g.len() >= 100_000 {
+            let now = tokio::time::Instant::now();
+            g.retain(|_, l| !matches!(l, OwnLease::Held { expires_at, .. } if *expires_at <= now));
+        }
+        g.insert(db.to_string(), next);
+    }
 }
 
 pub fn manifest_key(db: &str) -> String {
@@ -291,6 +319,7 @@ impl Engine {
             retry: Retry::default(),
             clock: clock::StoreClock::new(),
             observed_leases: Mutex::new(DetHashMap::default()),
+            own_leases: Mutex::new(DetHashMap::default()),
             system: Mutex::new(Default::default()),
             memory,
             engine: std::sync::OnceLock::new(),

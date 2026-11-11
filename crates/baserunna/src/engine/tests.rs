@@ -1227,11 +1227,19 @@ fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_answers() {
     });
 }
 
+/// How [`strong_read_after_late_manifest_put_from_an_earlier_batch`] drops A's database handle
+/// after the failed commit.
+#[derive(Clone, Copy, Debug)]
+enum IdleHandleDrop {
+    Kept,
+    Evicted { idle_ms: u64 },
+    UnloadedForMemory,
+}
+
 /// Tests strong reads if the retry read of a failed commit finds a late manifest write from an
 /// earlier batch. Other nodes time the lease in that write from when they first read it, so the
-/// holder must not time it from the later failed `PUT`.
-#[test]
-fn strong_read_after_late_manifest_put_from_an_earlier_batch_is_new() {
+/// holder must not time it from the later failed `PUT`, even if it dropped its handle in between.
+fn strong_read_after_late_manifest_put_from_an_earlier_batch(handle_drop: IdleHandleDrop) {
     rt().block_on(async {
         let (a, b, store) = late_manifest_put_nodes();
         let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
@@ -1242,6 +1250,23 @@ fn strong_read_after_late_manifest_put_from_an_earlier_batch_is_new() {
             matches!(outcome, Err(Error::Unavailable { outcome_unknown: true, .. })),
             "setup: answered {outcome:?}"
         );
+        let dropped = Arc::downgrade(&db_a);
+        drop(db_a);
+        match handle_drop {
+            IdleHandleDrop::Kept => {}
+            IdleHandleDrop::Evicted { idle_ms } => {
+                sleep_ms(idle_ms).await;
+                a.evict_idle(idle_ms);
+            }
+            IdleHandleDrop::UnloadedForMemory => {
+                let over_budget = memory::Charge::new(&a.shared.memory, a.shared.memory.limit() + 1);
+                a.unload_idle();
+                drop(over_budget);
+            }
+        }
+        let kept = dropped.upgrade().is_some();
+        assert_eq!(kept, matches!(handle_drop, IdleHandleDrop::Kept), "setup: {handle_drop:?} kept the handle");
+        let db_a = a.db("d");
         let mut t = db_a.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         assert!(t.get(b"k").await.unwrap().is_some());
         let applied = store.apply_late_puts();
@@ -1260,6 +1285,26 @@ fn strong_read_after_late_manifest_put_from_an_earlier_batch_is_new() {
         let got = strong_get(&db_a, "k").await;
         assert_eq!(got, Some(inline("newer")), "A served a strong read from cache after B committed");
     });
+}
+
+#[test]
+fn strong_read_after_late_manifest_put_from_an_earlier_batch_is_new() {
+    strong_read_after_late_manifest_put_from_an_earlier_batch(IdleHandleDrop::Kept);
+}
+
+#[test]
+fn strong_read_after_late_manifest_put_from_before_a_handle_eviction_is_new() {
+    strong_read_after_late_manifest_put_from_an_earlier_batch(IdleHandleDrop::Evicted { idle_ms: 0 });
+}
+
+#[test]
+fn strong_read_after_late_manifest_put_from_before_an_idle_eviction_is_new() {
+    strong_read_after_late_manifest_put_from_an_earlier_batch(IdleHandleDrop::Evicted { idle_ms: 1000 });
+}
+
+#[test]
+fn strong_read_after_late_manifest_put_from_before_a_memory_unload_is_new() {
+    strong_read_after_late_manifest_put_from_an_earlier_batch(IdleHandleDrop::UnloadedForMemory);
 }
 
 async fn sleep_ms(ms: u64) {

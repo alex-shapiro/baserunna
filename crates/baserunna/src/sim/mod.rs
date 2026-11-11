@@ -706,20 +706,32 @@ impl Sim {
         }
     }
 
-    /// Verifies that at most one node holds an active lease per database.
-    /// Also checks that any leased node without an in-flight manifest write
-    /// matches the latest manifest in object storage, and that no late write can replace it.
+    /// Verifies that at most one node holds an active lease per database, and that each holder
+    /// stops relying on its lease before another node's view of it can end. Also checks that any
+    /// leased node without an in-flight manifest write matches the latest manifest in object
+    /// storage, and that no late write can replace it.
     fn check_oracles(&self) -> Result<(), String> {
         let mut holders: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for i in self.up_nodes() {
             let Some(n) = self.node(i) else { continue };
             for db in n.node.engine.open_dbs() {
-                let Some((write_seq, etag, in_flight)) = db.leased_view() else { continue };
+                let Some(view) = db.leased_view() else { continue };
                 holders.entry(db.id.clone()).or_default().push(i);
-                if in_flight {
-                    continue;
-                }
                 let key = crate::engine::manifest_key(&db.id);
+                if let Some((etag, applied_at)) = self.store.manifest_applied_at(&key)
+                    && etag == view.etag
+                {
+                    let overrun = view.lease_overrun(applied_at, db.shared().cfg.lease_margin_ms);
+                    if !overrun.is_zero() {
+                        return Err(format!(
+                            "n{i} relies on its lease on {} at write {} for {} ms after another node's view of it can end",
+                            db.id,
+                            view.write_seq,
+                            overrun.as_millis()
+                        ));
+                    }
+                }
+                let crate::engine::LeasedView { write_seq, etag, write_in_flight: false, .. } = view else { continue };
                 if self.store.late_put_targets(&key).contains(&etag) {
                     return Err(format!(
                         "n{i} holds lease on {} at write {write_seq}, but a late write can replace it",

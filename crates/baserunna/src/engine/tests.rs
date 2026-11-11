@@ -968,6 +968,8 @@ struct LateManifestPutStore {
     manifest_puts: AtomicU32,
     /// ETags of the manifest writes that the store applied, in order.
     stored_manifest_etags: Mutex<Vec<String>>,
+    /// Instant at which the store applied each manifest write, by ETag.
+    manifest_applied_at: Mutex<BTreeMap<String, Instant>>,
 }
 
 impl LateManifestPutStore {
@@ -1001,6 +1003,7 @@ impl LateManifestPutStore {
         let r = self.mem.put_sync(key, data, mode);
         if let Ok(etag) = &r {
             self.stored_manifest_etags.lock().push(etag.clone());
+            self.manifest_applied_at.lock().insert(etag.clone(), Instant::now());
         }
         r
     }
@@ -1085,10 +1088,10 @@ impl ObjectStore for LateManifestPutStore {
 
 /// Starts two nodes on a shared [`LateManifestPutStore`].
 fn late_manifest_put_nodes() -> (Arc<Engine>, Arc<Engine>, Arc<LateManifestPutStore>) {
-    late_manifest_put_nodes_seeded(11)
+    late_manifest_put_nodes_with(11, EngineConfig::default())
 }
 
-fn late_manifest_put_nodes_seeded(seed: u64) -> (Arc<Engine>, Arc<Engine>, Arc<LateManifestPutStore>) {
+fn late_manifest_put_nodes_with(seed: u64, cfg: EngineConfig) -> (Arc<Engine>, Arc<Engine>, Arc<LateManifestPutStore>) {
     let env = Arc::new(Env::sim(seed, 1_700_000_000_000, Instant::now(), 0));
     let clock = env.clone();
     let mem = Arc::new(MemStore::new(Box::new(move || clock.now_ms())));
@@ -1102,9 +1105,10 @@ fn late_manifest_put_nodes_seeded(seed: u64) -> (Arc<Engine>, Arc<Engine>, Arc<L
         manifest_gets: 0.into(),
         manifest_puts: 0.into(),
         stored_manifest_etags: Mutex::default(),
+        manifest_applied_at: Mutex::default(),
     });
-    let a = Engine::new(store.clone(), env.clone(), EngineConfig::default(), "a".into());
-    let b = Engine::new(store.clone(), env, EngineConfig::default(), "b".into());
+    let a = Engine::new(store.clone(), env.clone(), cfg.clone(), "a".into());
+    let b = Engine::new(store.clone(), env, cfg, "b".into());
     (a, b, store)
 }
 
@@ -1212,7 +1216,7 @@ fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_answers() {
         }
         let rejected_at = Instant::now();
         let outcome = loop {
-            if let Some((write_seq, etag, false)) = db_a.leased_view() {
+            if let Some(LeasedView { write_seq, etag, write_in_flight: false, .. }) = db_a.leased_view() {
                 panic!(
                     "A serves lease reads at write {write_seq} ({etag}) {} ms after the rejected retry, \
                      before the commit answered",
@@ -1236,6 +1240,26 @@ enum IdleHandleDrop {
     UnloadedForMemory,
 }
 
+/// Drops `db`, and lets `engine` drop its handle as `how` says if no task uses it. Returns the
+/// handle for the same database, and whether `engine` dropped the old handle.
+async fn drop_idle_handle(engine: &Engine, db: Arc<Db>, how: IdleHandleDrop) -> (Arc<Db>, bool) {
+    let (id, old) = (db.id.clone(), Arc::downgrade(&db));
+    drop(db);
+    match how {
+        IdleHandleDrop::Kept => {}
+        IdleHandleDrop::Evicted { idle_ms } => {
+            sleep_ms(idle_ms).await;
+            engine.evict_idle(idle_ms);
+        }
+        IdleHandleDrop::UnloadedForMemory => {
+            let over_budget = memory::Charge::new(&engine.shared.memory, engine.shared.memory.limit() + 1);
+            engine.unload_idle();
+            drop(over_budget);
+        }
+    }
+    (engine.db(&id), old.upgrade().is_none())
+}
+
 /// Tests strong reads if the retry read of a failed commit finds a late manifest write from an
 /// earlier batch. Other nodes time the lease in that write from when they first read it, so the
 /// holder must not time it from the later failed `PUT`, even if it dropped its handle in between.
@@ -1250,23 +1274,8 @@ fn strong_read_after_late_manifest_put_from_an_earlier_batch(handle_drop: IdleHa
             matches!(outcome, Err(Error::Unavailable { outcome_unknown: true, .. })),
             "setup: answered {outcome:?}"
         );
-        let dropped = Arc::downgrade(&db_a);
-        drop(db_a);
-        match handle_drop {
-            IdleHandleDrop::Kept => {}
-            IdleHandleDrop::Evicted { idle_ms } => {
-                sleep_ms(idle_ms).await;
-                a.evict_idle(idle_ms);
-            }
-            IdleHandleDrop::UnloadedForMemory => {
-                let over_budget = memory::Charge::new(&a.shared.memory, a.shared.memory.limit() + 1);
-                a.unload_idle();
-                drop(over_budget);
-            }
-        }
-        let kept = dropped.upgrade().is_some();
-        assert_eq!(kept, matches!(handle_drop, IdleHandleDrop::Kept), "setup: {handle_drop:?} kept the handle");
-        let db_a = a.db("d");
+        let (db_a, dropped) = drop_idle_handle(&a, db_a, handle_drop).await;
+        assert_eq!(dropped, !matches!(handle_drop, IdleHandleDrop::Kept), "setup: {handle_drop:?} dropped {dropped}");
         let mut t = db_a.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         assert!(t.get(b"k").await.unwrap().is_some());
         let applied = store.apply_late_puts();
@@ -1354,7 +1363,11 @@ fn strong_reads_after_unknown_outcome_read_the_manifest_until_a_commit() {
         let (gets, puts, _) = manifest_requests(&store, put(&db_a, "k", "after")).await;
         assert_eq!((gets, puts), (1, 1), "the commit sent (manifest GETs, PUTs) = {:?}", (gets, puts));
         let stored = store.stored_manifest_etag("d").unwrap();
-        assert_eq!(db_a.leased_view().map(|(_, etag, w)| (etag, w)), Some((stored, false)), "lease reads stay off");
+        assert_eq!(
+            db_a.leased_view().map(|v| (v.etag, v.write_in_flight)),
+            Some((stored, false)),
+            "lease reads stay off"
+        );
         let (gets, puts, value) = manifest_requests(&store, strong_get(&db_a, "k")).await;
         assert_eq!(value, Some(inline("after")));
         assert_eq!((gets, puts), (0, 0), "a strong read after the commit went to the store");
@@ -1391,7 +1404,11 @@ fn hot_strong_reads_after_unknown_outcome_renew_the_lease_once() {
             "manifest GETs per read: {gets_per_read:?}; want one per read until the renewal, then none"
         );
         let stored = store.stored_manifest_etag("d").unwrap();
-        assert_eq!(db_a.leased_view().map(|(_, etag, w)| (etag, w)), Some((stored, false)), "lease reads stay off");
+        assert_eq!(
+            db_a.leased_view().map(|v| (v.etag, v.write_in_flight)),
+            Some((stored, false)),
+            "lease reads stay off"
+        );
         assert_late_puts_rejected(&store);
         let (gets, _, value) = manifest_requests(&store, strong_get(&db_a, "k")).await;
         assert_eq!((gets, value), (0, Some(inline("old"))), "a strong read after the renewal went to the store");
@@ -1402,21 +1419,52 @@ fn hot_strong_reads_after_unknown_outcome_renew_the_lease_once() {
 #[derive(Clone, Copy, Debug)]
 enum LeaseStep {
     Commit,
+    /// Commits on A from a snapshot read, so the commit can start from an old cached manifest.
+    CommitFromSnapshot,
+    CommitOnB,
     AcquireLease,
     CommitWithLease,
-    StrongRead { on_b: bool, waits_for_write: bool },
-    ApplyLatePut { pick: usize },
-    Advance { ms: u64 },
+    StrongRead {
+        on_b: bool,
+        waits_for_write: bool,
+    },
+    ApplyLatePut {
+        pick: usize,
+    },
+    /// Drops A's handle as `how` says, and opens a new handle.
+    DropHandle {
+        how: IdleHandleDrop,
+    },
+    Advance {
+        ms: u64,
+    },
 }
 
+/// Generates `n` steps. Each seed leaves out a random subset of the step kinds other than
+/// `Advance` (swarm testing), so that long step sequences without an interfering write occur.
 fn gen_lease_steps(r: &mut Rng, n: usize) -> Vec<LeaseStep> {
+    let mut weights = [8.0, 4.0, 6.0, 8.0, 12.0, 27.0, 10.0, 5.0, 20.0];
+    let advance = weights.len() - 1;
+    for w in &mut weights[..advance] {
+        if r.chance(0.5) {
+            *w = 0.0;
+        }
+    }
     (0..n)
-        .map(|_| match r.below(100) {
-            0..=17 => LeaseStep::Commit,
-            18..=25 => LeaseStep::AcquireLease,
-            26..=37 => LeaseStep::CommitWithLease,
-            38..=64 => LeaseStep::StrongRead { on_b: r.chance(0.3), waits_for_write: r.chance(0.5) },
-            65..=74 => LeaseStep::ApplyLatePut { pick: r.usize(1 << 16) },
+        .map(|_| match r.weighted(&weights) {
+            Some(0) => LeaseStep::Commit,
+            Some(1) => LeaseStep::CommitFromSnapshot,
+            Some(2) => LeaseStep::CommitOnB,
+            Some(3) => LeaseStep::AcquireLease,
+            Some(4) => LeaseStep::CommitWithLease,
+            Some(5) => LeaseStep::StrongRead { on_b: r.chance(0.3), waits_for_write: r.chance(0.5) },
+            Some(6) => LeaseStep::ApplyLatePut { pick: r.usize(1 << 16) },
+            Some(7) => LeaseStep::DropHandle {
+                how: match r.chance(0.5) {
+                    true => IdleHandleDrop::Evicted { idle_ms: 0 },
+                    false => IdleHandleDrop::UnloadedForMemory,
+                },
+            },
             _ => LeaseStep::Advance { ms: (6_000f64.powf(r.unit()) as u64).clamp(1, 6_000) },
         })
         .collect()
@@ -1441,10 +1489,24 @@ impl Drop for BuggifyScope {
 /// Node name and database handle that [`check_lease_views`] checks.
 type NodeDb<'a> = (&'a str, &'a Arc<Db>);
 
-/// Checks that each lease-served view is the stored manifest and that no buffered write can replace it.
+/// Checks that each node stops relying on its lease before another node's view of it can end.
+/// Also checks that each lease-served view without an in-flight write is the stored manifest and
+/// that no buffered write can replace it.
 fn check_lease_views(dbs: &[NodeDb], store: &LateManifestPutStore) -> Result<(), String> {
     for (node, db) in dbs {
-        let Some((write_seq, etag, false)) = db.leased_view() else { continue };
+        let Some(view) = db.leased_view() else { continue };
+        let applied_at = store.manifest_applied_at.lock().get(&view.etag).copied();
+        if let Some(applied_at) = applied_at {
+            let overrun = view.lease_overrun(applied_at, db.shared().cfg.lease_margin_ms);
+            if !overrun.is_zero() {
+                return Err(format!(
+                    "{node} relies on its lease at write {} for {} ms after another node's view of it can end",
+                    view.write_seq,
+                    overrun.as_millis()
+                ));
+            }
+        }
+        let LeasedView { write_seq, etag, write_in_flight: false, .. } = view else { continue };
         let stored = store.stored_manifest_etag(&db.id);
         if stored.as_ref() != Some(&etag) {
             return Err(format!(
@@ -1507,14 +1569,21 @@ fn spawn_commit(db: &Arc<Db>, value: String, with_lease: bool) -> tokio::task::J
 /// Runs `steps` on two nodes whose manifest writes fail at random. Returns the failing step and
 /// the broken invariant.
 async fn run_lease_steps(seed: u64, steps: &[LeaseStep]) -> Result<(), String> {
-    let (a, b, store) = late_manifest_put_nodes_seeded(seed);
-    let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
-    db_b.open(false).await.map_err(|e| e.to_string())?;
     let mut r = Rng::new(seed ^ 0x1ea5e);
+    // Two attempts make it likely that every manifest `PUT` of a batch fails, and that one of them
+    // applies later.
+    let cfg = EngineConfig { commit_retry_max: *r.pick(&[2, 8]), ..EngineConfig::default() };
+    let (a, b, store) = late_manifest_put_nodes_with(seed, cfg);
+    let (mut db_a, db_b) = (opened(&a, "d").await, b.db("d"));
+    db_b.open(false).await.map_err(|e| e.to_string())?;
     *store.manifest_fault_script.lock() = Some(ManifestFaultScript::random(&mut r));
-    let dbs: [NodeDb; 2] = [("A", &db_a), ("B", &db_b)];
     let mut tasks = Vec::new();
     for (i, step) in steps.iter().enumerate() {
+        if let LeaseStep::DropHandle { how } = *step {
+            db_a = drop_idle_handle(&a, db_a, how).await.0;
+            let _ = db_a.open(false).await;
+        }
+        let dbs: [NodeDb; 2] = [("A", &db_a), ("B", &db_b)];
         let r = match *step {
             LeaseStep::Commit => {
                 tasks.push(spawn_commit(&db_a, format!("v{i}"), false));
@@ -1522,6 +1591,21 @@ async fn run_lease_steps(seed: u64, steps: &[LeaseStep]) -> Result<(), String> {
             }
             LeaseStep::CommitWithLease => {
                 tasks.push(spawn_commit(&db_a, format!("v{i}"), true));
+                Ok(())
+            }
+            LeaseStep::CommitFromSnapshot => {
+                let db = db_a.clone();
+                tasks.push(tokio::spawn(async move {
+                    let snapshot = Consistency::Snapshot { max_staleness_ms: 600_000 };
+                    let Ok(mut t) = db.begin(Isolation::Serializable, snapshot).await else { return };
+                    let _ = t.get(b"k").await;
+                    t.put(Bytes::from_static(b"k"), Value::Inline(Bytes::from(format!("s{i}")))).unwrap();
+                    drop(db.commit_detailed(t.into_request()).await);
+                }));
+                Ok(())
+            }
+            LeaseStep::CommitOnB => {
+                tasks.push(spawn_commit(&db_b, format!("b{i}"), false));
                 Ok(())
             }
             LeaseStep::AcquireLease => {
@@ -1539,10 +1623,12 @@ async fn run_lease_steps(seed: u64, steps: &[LeaseStep]) -> Result<(), String> {
                 }
                 Ok(())
             }
+            LeaseStep::DropHandle { .. } => Ok(()),
             LeaseStep::Advance { ms } => advance_checking(ms, &dbs, &store).await,
         };
         r.and_then(|()| check_lease_views(&dbs, &store)).map_err(|e| format!("step {i} {step:?}: {e}"))?;
     }
+    let dbs: [NodeDb; 2] = [("A", &db_a), ("B", &db_b)];
     let mut settled_ms = 0;
     while tasks.iter().any(|t| !t.is_finished()) {
         if settled_ms > 120_000 {
@@ -1560,7 +1646,8 @@ async fn run_lease_steps(seed: u64, steps: &[LeaseStep]) -> Result<(), String> {
     Ok(())
 }
 
-/// Tests that lease-served strong reads match the stored manifest while manifest writes fail,
+/// Tests that lease-served strong reads match the stored manifest, and that each lease holder
+/// stops relying on its lease before other nodes stop honoring it, while manifest writes fail,
 /// apply after an error, or apply late with their original precondition.
 #[test]
 fn prop_lease_reads_match_the_store_under_ambiguous_manifest_puts() {

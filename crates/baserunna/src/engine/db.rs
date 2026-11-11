@@ -160,6 +160,29 @@ impl Work {
     }
 }
 
+/// Cached manifest from which this node serves strong reads under its own lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeasedView {
+    pub write_seq: u64,
+    pub etag: String,
+    /// True while a manifest write from this node is in flight.
+    pub write_in_flight: bool,
+    /// Lease duration that the manifest grants.
+    pub lease_ms: u64,
+    /// Instant at which this node stops serving strong reads from cache.
+    pub expires_at: Instant,
+}
+
+impl LeasedView {
+    /// Returns how long this node relies on its lease after another node's view of the lease can
+    /// end, if the store applied the manifest at `applied_at`. Another node honors the lease for
+    /// `lease_ms + margin_ms` from its first read of the manifest, which is not earlier than
+    /// `applied_at`.
+    pub fn lease_overrun(&self, applied_at: Instant, margin_ms: u64) -> Duration {
+        self.expires_at.saturating_duration_since(applied_at + Duration::from_millis(self.lease_ms + margin_ms))
+    }
+}
+
 /// This node's lease on one database, which lets it serve strong reads from cache.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum OwnLease {
@@ -490,11 +513,18 @@ impl Db {
         expired
     }
 
-    /// Returns `(write_seq, etag, has_in_flight_write)` if this node holds a valid lease for strong reads.
-    pub fn leased_view(&self) -> Option<(u64, String, bool)> {
+    /// Returns the cached manifest if this node holds a valid lease for strong reads.
+    pub fn leased_view(&self) -> Option<LeasedView> {
         let st = self.st.lock();
         let cur = st.current.as_ref()?;
-        self.holds_lease(&cur.m).then(|| (cur.m.write_seq, cur.etag.clone(), self.has_in_flight_write()))
+        let left = self.own_lease_left(&cur.m);
+        (!left.is_zero()).then(|| LeasedView {
+            write_seq: cur.m.write_seq,
+            etag: cur.etag.clone(),
+            write_in_flight: self.has_in_flight_write(),
+            lease_ms: cur.m.lease.as_ref().map_or(0, |l| l.ms),
+            expires_at: Instant::now() + left,
+        })
     }
 
     pub fn lease_holder(&self) -> Option<String> {

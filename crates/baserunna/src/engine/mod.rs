@@ -28,7 +28,7 @@ use tokio::sync::Semaphore;
 pub use baserunna_api::{DbStats, LevelStats};
 pub use config::EngineConfig;
 use db::OwnLease;
-pub use db::{CommitState, Committed, Consistency, Db};
+pub use db::{CommitState, Committed, Consistency, Db, LeasedView};
 pub use stream::{Appended, Record, Retention, Seek, StreamOp, StreamState};
 pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
 pub use types::{BlobRef, Entry, Seq, Value};

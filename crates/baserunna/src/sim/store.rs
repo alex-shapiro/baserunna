@@ -92,6 +92,8 @@ pub struct SimStore {
     held_replies: Arc<HeldReplies>,
     /// `(key, If-Match ETag)` of each write that failed and applies late.
     late_put_targets: Arc<Mutex<Vec<(String, String)>>>,
+    /// `(ETag, apply instant)` of the last applied write to each manifest key.
+    manifest_applied_at: Arc<Mutex<BTreeMap<String, (String, Instant)>>>,
     pub stats: StoreStats,
 }
 
@@ -127,6 +129,7 @@ impl SimStore {
             view: Arc::new(Mutex::new(ListView::default())),
             held_replies: Arc::new(HeldReplies::default()),
             late_put_targets: Arc::default(),
+            manifest_applied_at: Arc::default(),
             stats: StoreStats::default(),
         }
     }
@@ -152,6 +155,11 @@ impl SimStore {
     /// Returns the `If-Match` ETags of the writes to `key` that failed and still apply late.
     pub fn late_put_targets(&self, key: &str) -> Vec<String> {
         self.late_put_targets.lock().iter().filter(|(k, _)| k == key).map(|(_, e)| e.clone()).collect()
+    }
+
+    /// Returns the ETag of the last write applied to the manifest at `key`, and when it was applied.
+    pub fn manifest_applied_at(&self, key: &str) -> Option<(String, Instant)> {
+        self.manifest_applied_at.lock().get(key).cloned()
     }
 
     fn draw(&self) -> Draw {
@@ -275,6 +283,7 @@ impl ObjectStore for SimStore {
             let trace = self.trace.clone();
             let view = self.view.clone();
             let late_put_targets = self.late_put_targets.clone();
+            let manifest_applied_at = self.manifest_applied_at.clone();
             let late_put_target = match &mode {
                 PutMode::IfMatch(e) if late_apply => Some((key.to_string(), e.clone())),
                 _ => None,
@@ -297,6 +306,11 @@ impl ObjectStore for SimStore {
                     if let Some(i) = targets.iter().position(|t| t == target) {
                         targets.remove(i);
                     }
+                }
+                if let Ok(etag) = &r
+                    && key2.ends_with("/manifest")
+                {
+                    manifest_applied_at.lock().insert(key2.clone(), (etag.clone(), Instant::now()));
                 }
                 if r.is_ok() && list_lag_ms > 0 {
                     let mut v = view.lock();

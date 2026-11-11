@@ -1245,8 +1245,8 @@ fn strong_read_after_an_applied_manifest_put_returns_412_is_new() {
     });
 }
 
-/// Tests that a node serves strong reads from storage after a rejected commit retry until the
-/// commit finishes.
+/// Tests that a node validates each strong read against storage after a rejected commit retry until
+/// the commit finishes.
 #[test]
 fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_finishes() {
     use crate::util::{Either, race};
@@ -1398,8 +1398,8 @@ enum IdleHandleDrop {
     UnloadedForMemory,
 }
 
-/// Drops `db`, and lets `engine` drop its handle according to `how` if no task uses it. Returns a
-/// new handle for the database, and whether `engine` dropped the old handle.
+/// Drops `db`, and lets `engine` drop its handle according to `how` if no task uses it. Returns the
+/// handle for the database, and whether `engine` dropped the old handle.
 async fn drop_idle_handle(engine: &Engine, db: Arc<Db>, how: IdleHandleDrop) -> (Arc<Db>, bool) {
     let (id, old) = (db.id.clone(), Arc::downgrade(&db));
     drop(db);

@@ -1554,7 +1554,7 @@ At the end of every run, storage invariant checks verify that all manifests, lev
 ### 13.5 Other test layers
 
 - **Unit tests** in each module.
-- **Property tests** (`crates/baserunna/src/util/prop.rs`): verify codecs, tuple ordering, segments, LSM-tree operations, change feeds, streams, tables, indexes, range tombstones, fair memory allocation, bloom filters, metadata access control, and lease reads under ambiguous manifest `PUT`s. A bounded exhaustive search also runs every short sequence of lease steps on two nodes (`lease_search` in `engine/tests.rs`).
+- **Property tests** using the in-crate generator and shrinker (`crates/baserunna/src/util/prop.rs`): verify codecs, tuple ordering, segments, LSM-tree operations and change feeds against a reference model, streams, tables, indexes, range tombstones, fair memory allocation, base64, varints, bloom filters, metadata access control, and lease reads under ambiguous manifest `PUT`s. A bounded exhaustive search also runs every short sequence of lease steps on two nodes (`lease_search` in `engine/tests.rs`).
 - **Fuzz tests**: feeds arbitrary and mutated byte inputs to all binary and text decoders and random JSON requests to the HTTP router, verifying that arbitrary inputs do not cause panics or `500` responses.
 - **Transaction-op fuzzing** (`sim/txn_fuzz.rs`): generates random single-request and interactive transactions (including malformed operations) and compares every response against an independent transaction model.
 - **OpenAPI conformance**: validates every simulated HTTP response against `openapi.json` and verifies that `openapi.json` matches the router and generated specification.

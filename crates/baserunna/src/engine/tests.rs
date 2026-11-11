@@ -985,6 +985,8 @@ struct LateManifestPutStore {
     manifest_put_rejected: tokio::sync::Notify,
     manifest_fault_script: Mutex<Option<ManifestFaultScript>>,
     manifest_gets: AtomicU32,
+    /// True if manifest reads fail.
+    manifest_get_outage: std::sync::atomic::AtomicBool,
     manifest_puts: AtomicU32,
     /// ETags of the manifest writes that the store applied, in order.
     stored_manifest_etags: Mutex<Vec<String>>,
@@ -1064,6 +1066,9 @@ impl ObjectStore for LateManifestPutStore {
             if key.ends_with("/manifest") {
                 self.manifest_gets.fetch_add(1, SeqCst);
                 tokio::time::sleep(self.manifest_get_latency()).await;
+                if self.manifest_get_outage.load(SeqCst) {
+                    return Err(StoreError::Unavailable("connection refused".into()));
+                }
             }
             self.mem.get_sync(key, &opts)
         })
@@ -1141,6 +1146,7 @@ fn late_manifest_put_nodes_with(seed: u64, cfg: EngineConfig) -> (Arc<Engine>, A
         manifest_put_rejected: tokio::sync::Notify::new(),
         manifest_fault_script: Mutex::default(),
         manifest_gets: 0.into(),
+        manifest_get_outage: false.into(),
         manifest_puts: 0.into(),
         stored_manifest_etags: Mutex::default(),
         manifest_applied_at: Mutex::default(),
@@ -1256,6 +1262,68 @@ fn strong_read_after_an_applied_manifest_put_returns_412_is_new() {
         let outcome = commit.await.unwrap();
         assert!(outcome.is_ok(), "setup: the commit returned {outcome:?}");
         assert_eq!(stale_ms, 0, "A read the old value for {stale_ms} ms after B read the new value");
+    });
+}
+
+/// Commits `new` on A of two nodes with `cfg`. The store applies the first manifest `PUT` of the
+/// commit and returns `412`. Manifest reads fail after the `412` if `reads_fail` is true, until the
+/// commit answers. Returns the commit outcome, A, B, and the store.
+async fn commit_applied_with_a_412(
+    cfg: EngineConfig,
+    reads_fail: bool,
+) -> (crate::error::Result<Committed>, Arc<Db>, Arc<Db>, Arc<LateManifestPutStore>) {
+    let (a, b, store) = late_manifest_put_nodes_with(11, cfg);
+    let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
+    put(&db_a, "k", "old").await;
+    db_b.open(false).await.unwrap();
+    sleep_ms(100).await;
+    *store.cycled_manifest_put_outcomes.lock() = Some((vec![ManifestPutOutcome::AppliedThenRejected], 0));
+    let commit = tokio::spawn(commit_new(db_a.clone()));
+    store.manifest_put_rejected.notified().await;
+    *store.cycled_manifest_put_outcomes.lock() = None;
+    store.manifest_get_outage.store(reads_fail, SeqCst);
+    let outcome = commit.await.unwrap();
+    store.manifest_get_outage.store(false, SeqCst);
+    assert_eq!(strong_get(&db_b, "k").await, Some(inline("new")), "setup: the store applied the commit, {outcome:?}");
+    (outcome, db_a, db_b, store)
+}
+
+/// Tests that a commit that the store applies with a `412` reply is not reported as replayed, and
+/// that the node then takes its lease from a lease-only `PUT`.
+#[test]
+fn commit_applied_with_a_412_is_not_replayed() {
+    rt().block_on(async {
+        let (outcome, db_a, _db_b, store) = commit_applied_with_a_412(EngineConfig::default(), false).await;
+        assert!(matches!(outcome, Ok(Committed { replayed: false, .. })), "the commit answered {outcome:?}");
+        sleep_ms(50).await;
+        let stored = store.stored_manifest_etag("d");
+        assert_eq!(db_a.leased_view().map(|v| v.etag), stored, "no lease-only PUT gave A its lease");
+        let (gets, puts, value) = manifest_requests(&store, strong_get(&db_a, "k")).await;
+        assert_eq!((gets, puts, value), (0, 0, Some(inline("new"))), "A served no strong read from cache");
+    });
+}
+
+/// Tests that a commit whose last manifest `PUT` the store applies with a `412` reply reports the
+/// commit, because a reload before the batch gives up finds it.
+#[test]
+fn commit_applied_with_a_412_on_the_last_attempt_is_reported() {
+    rt().block_on(async {
+        let cfg = EngineConfig { commit_retry_max: 1, ..EngineConfig::default() };
+        let (outcome, ..) = commit_applied_with_a_412(cfg, false).await;
+        assert!(matches!(outcome, Ok(Committed { replayed: false, .. })), "the commit answered {outcome:?}");
+    });
+}
+
+/// Tests that a commit that the store applies with a `412` reply has an unknown outcome if no
+/// manifest read succeeds before the batch gives up.
+#[test]
+fn commit_applied_with_a_412_and_no_reload_has_an_unknown_outcome() {
+    rt().block_on(async {
+        let (outcome, ..) = commit_applied_with_a_412(EngineConfig::default(), true).await;
+        assert!(
+            matches!(outcome, Err(Error::Unavailable { outcome_unknown: true, .. })),
+            "the commit answered {outcome:?}"
+        );
     });
 }
 

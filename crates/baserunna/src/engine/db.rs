@@ -225,9 +225,10 @@ impl OwnLease {
 struct UnknownWrite {
     /// `write_seq` of the manifest in the `PUT`.
     write_seq: u64,
-    /// `If-Match` ETag of the `PUT`. The store can still apply the `PUT` while the stored manifest
-    /// has this ETag.
-    base_etag: String,
+    /// `If-Match` ETag of the `PUT` if the store can still apply the `PUT`, which it can do while the
+    /// stored manifest has this ETag. `None` after a `412`, because the store sends a `412` only
+    /// after it decided the `PUT`.
+    pending_if_match: Option<String>,
 }
 
 struct State {
@@ -1296,14 +1297,17 @@ impl Db {
                     }
                     return;
                 }
-                Err(StoreError::PreconditionFailed) => probe::hit(Probe::ManifestCasLost),
-                Err(StoreError::Unavailable(_)) => {
-                    probe::hit(Probe::ManifestWriteAmbiguous);
+                // A `412` does not show that the `PUT` was not applied: the store can apply a `PUT`
+                // and still return `412` (SPEC §5.5).
+                Err(e @ (StoreError::PreconditionFailed | StoreError::Unavailable(_))) => {
+                    let pending = matches!(e, StoreError::Unavailable(_));
+                    probe::hit(if pending { Probe::ManifestWriteAmbiguous } else { Probe::ManifestCasLost });
                     if !plan.gc.is_empty() {
                         probe::hit(Probe::ObsoleteDeletedAfterAmbiguousWrite);
                     }
                     maybe_applied = true;
-                    unknown_writes.push(UnknownWrite { write_seq: m.write_seq, base_etag: base.etag.clone() });
+                    let pending_if_match = pending.then(|| base.etag.clone());
+                    unknown_writes.push(UnknownWrite { write_seq: m.write_seq, pending_if_match });
                     for (w, o) in batch.iter().zip(&plan.outcomes) {
                         ambiguous_commit_ids.extend(newly_committed_ids(w, o));
                     }
@@ -1328,25 +1332,19 @@ impl Db {
                     return;
                 }
             }
-            if attempt >= cfg.commit_retry_max {
-                probe::hit(Probe::CommitRetriesExhausted);
-                let e = Error::Unavailable {
-                    message: "could not commit after retries".into(),
-                    retry_after_ms: Some(100),
-                    outcome_unknown: maybe_applied,
-                };
-                self.fail_batch(&base, batch, e, &ambiguous_commit_ids).await;
-                return;
-            }
+            // After the last attempt, one more reload can still settle the outcome of the batch.
+            let exhausted = attempt >= cfg.commit_retry_max;
             let delay = 5 * (1u64 << attempt.min(6)) + self.shared.env.random_below(10);
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            if !exhausted {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             loop {
                 match self.refresh(Instant::now(), false).await {
                     Ok(v) => {
                         // Once the manifest moves past every ETag targeted by an ambiguous write,
                         // any write that was not applied cannot succeed.
                         if maybe_applied
-                            && !unknown_writes.iter().any(|w| w.base_etag == v.etag)
+                            && !unknown_writes.iter().any(|w| w.pending_if_match.as_ref() == Some(&v.etag))
                             && !self.has_applied_work(&v, &batch).await
                         {
                             probe::hit(Probe::AmbiguousWriteSettled);
@@ -1365,6 +1363,16 @@ impl Db {
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
                 }
+            }
+            if exhausted {
+                probe::hit(Probe::CommitRetriesExhausted);
+                let e = Error::Unavailable {
+                    message: "could not commit after retries".into(),
+                    retry_after_ms: Some(100),
+                    outcome_unknown: maybe_applied,
+                };
+                self.fail_batch(&base, batch, e, &ambiguous_commit_ids).await;
+                return;
             }
         }
     }

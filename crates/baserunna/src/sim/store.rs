@@ -26,6 +26,8 @@ pub struct StoreFaults {
     pub p_fail_before: f64,
     /// Probability that a write is applied but its response is lost.
     pub p_fail_after: f64,
+    /// Probability that a conditional write is applied and answered with `412`.
+    pub p_applied_412: f64,
     /// Maximum duration for which `list` may omit new objects or include deleted objects.
     pub list_lag_ms: u64,
     /// Probability that a write response is delayed by `late_reply_ms` after the write is applied.
@@ -47,6 +49,7 @@ impl StoreFaults {
             stall_ms: (0, 0),
             p_fail_before: 0.0,
             p_fail_after: 0.0,
+            p_applied_412: 0.0,
             list_lag_ms: 0,
             p_late_reply: 0.0,
             late_reply_ms: (0, 0),
@@ -62,6 +65,7 @@ struct Draw {
     late_apply_ms: u64,
     fail_before: bool,
     fail_after: bool,
+    applied_412: bool,
     list_lag_ms: u64,
 }
 
@@ -185,6 +189,7 @@ impl SimStore {
             late_apply_ms,
             fail_before: on && r.chance(f.p_fail_before),
             fail_after: on && r.chance(f.p_fail_after),
+            applied_412: on && f.p_applied_412 > 0.0 && r.chance(f.p_applied_412),
             list_lag_ms: if on && f.list_lag_ms > 0 { r.below(f.list_lag_ms + 1) } else { 0 },
         }
     }
@@ -267,8 +272,10 @@ impl ObjectStore for SimStore {
                 late_apply_ms,
                 fail_before: before,
                 fail_after: after,
+                applied_412,
                 list_lag_ms,
             } = self.draw();
+            let applied_412 = applied_412 && matches!(mode, PutMode::IfMatch(_));
             let late_apply = late_apply_ms > 0 && !before;
             let lat = lat + self.transfer_time(data.len()).as_millis() as u64;
             let held_replies = self.held_replies.clone();
@@ -330,12 +337,13 @@ impl ObjectStore for SimStore {
                 held_replies.wait(&key2).await;
                 let r = match r {
                     Ok(_) if after => Err(unavailable("injected: response lost")),
+                    Ok(_) if applied_412 => Err(StoreError::PreconditionFailed),
                     other => other,
                 };
                 let _ = tx.send(r);
             });
             let r = rx.await.unwrap_or_else(|_| Err(unavailable("store task dropped")));
-            if before || after || late_apply {
+            if before || after || late_apply || applied_412 {
                 self.injected();
             }
             r
@@ -439,6 +447,23 @@ mod tests {
                 "the first late put is applied; the second fails its If-Match"
             );
             assert!(store.late_put_targets("k").is_empty(), "applied puts are still listed");
+        });
+    }
+
+    #[test]
+    fn applied_412_puts_apply_then_answer_412() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
+        rt.block_on(async {
+            let origin = Instant::now();
+            let mem = Arc::new(MemStore::new(Box::new(move || origin.elapsed().as_millis() as u64)));
+            let faults = StoreFaults { p_applied_412: 1.0, ..StoreFaults::none() };
+            let store = SimStore::new(mem.clone(), Rng::new(1), faults, Arc::new(super::super::Trace::new(false)));
+            let etag = mem.put_sync("k", Bytes::from_static(b"v1"), &PutMode::Overwrite).unwrap();
+            let r = store.put("k", Bytes::from_static(b"v2"), PutMode::IfMatch(etag)).await;
+            assert!(matches!(r, Err(StoreError::PreconditionFailed)), "the conditional put answered {r:?}");
+            assert_eq!(mem.get_sync("k", &GetOpts::default()).unwrap().data, Bytes::from_static(b"v2"));
+            let r = store.put("k", Bytes::from_static(b"v3"), PutMode::Overwrite).await;
+            assert!(r.is_ok(), "an unconditional put answered {r:?}");
         });
     }
 }

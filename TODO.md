@@ -527,7 +527,8 @@ only.
       before that `PUT`, a read-heavy database sends a second lease-only `PUT`
       about 3.5 s later for the 15 s read lease. One `PUT` with the read lease
       is sufficient. The saving is not measured. It is at most one `PUT` for
-      each landed ambiguous `PUT`.
+      each landed ambiguous `PUT`. `examples/ambiguous_put_cost.rs` can
+      measure it.
 - [ ] [tangential · API] **Return `200` if a retried database deletion
       completes cleanup.** Return `200` instead of `404 not_found` if a
       retried `DELETE /v1/dbs/{db}` finishes an interrupted database deletion.

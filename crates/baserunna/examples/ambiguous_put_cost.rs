@@ -179,35 +179,41 @@ async fn run(w: &Workload, ambiguous_rate: f64, applied_pct: u64, commits: u64, 
     let stats = Arc::new(OpStats::default());
     let mut commit_offsets = Rng::new(seed ^ 0xc0117);
     let start = Instant::now();
-    let reads_per_commit = w.commit_every_ms / w.read_every_ms;
-    for i in 0..commits {
-        let interval_start = start + Duration::from_millis(i * w.commit_every_ms);
-        let commit_at = interval_start + Duration::from_millis(commit_offsets.below(w.commit_every_ms));
-        stats.in_flight.fetch_add(1, Relaxed);
-        tokio::spawn({
-            let (db, stats) = (db.clone(), stats.clone());
-            async move {
-                tokio::time::sleep_until(commit_at).await;
-                if commit(&db, i + 1).await.is_err() {
-                    stats.failed_commits.fetch_add(1, Relaxed);
-                }
-                stats.in_flight.fetch_sub(1, Relaxed);
-            }
-        });
-        for r in 0..reads_per_commit {
-            tokio::time::sleep_until(interval_start + Duration::from_millis(r * w.read_every_ms)).await;
-            let (db, stats) = (db.clone(), stats.clone());
+    let run_ms = commits * w.commit_every_ms;
+    let mut spawned_commits = 0;
+    let mut spawn_commits_until = |until_ms: u64| {
+        while spawned_commits < commits && spawned_commits * w.commit_every_ms <= until_ms {
+            let i = spawned_commits;
+            let commit_at_ms = i * w.commit_every_ms + commit_offsets.below(w.commit_every_ms);
             stats.in_flight.fetch_add(1, Relaxed);
-            tokio::spawn(async move {
-                let invoked = Instant::now();
-                strong_read(&db).await.expect("a strong read succeeds");
-                stats.reads.fetch_add(1, Relaxed);
-                stats.read_micros.fetch_add(invoked.elapsed().as_micros() as u64, Relaxed);
-                stats.in_flight.fetch_sub(1, Relaxed);
+            tokio::spawn({
+                let (db, stats) = (db.clone(), stats.clone());
+                async move {
+                    tokio::time::sleep_until(start + Duration::from_millis(commit_at_ms)).await;
+                    if commit(&db, i + 1).await.is_err() {
+                        stats.failed_commits.fetch_add(1, Relaxed);
+                    }
+                    stats.in_flight.fetch_sub(1, Relaxed);
+                }
             });
+            spawned_commits += 1;
         }
+    };
+    for read_at_ms in (0..run_ms).step_by(w.read_every_ms as usize) {
+        spawn_commits_until(read_at_ms);
+        tokio::time::sleep_until(start + Duration::from_millis(read_at_ms)).await;
+        let (db, stats) = (db.clone(), stats.clone());
+        stats.in_flight.fetch_add(1, Relaxed);
+        tokio::spawn(async move {
+            let invoked = Instant::now();
+            strong_read(&db).await.expect("a strong read succeeds");
+            stats.reads.fetch_add(1, Relaxed);
+            stats.read_micros.fetch_add(invoked.elapsed().as_micros() as u64, Relaxed);
+            stats.in_flight.fetch_sub(1, Relaxed);
+        });
     }
-    tokio::time::sleep_until(start + Duration::from_millis(commits * w.commit_every_ms)).await;
+    spawn_commits_until(run_ms);
+    tokio::time::sleep_until(start + Duration::from_millis(run_ms)).await;
     while stats.in_flight.load(Relaxed) > 0 || db.busy() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

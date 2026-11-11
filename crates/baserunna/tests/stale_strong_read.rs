@@ -229,7 +229,7 @@ enum Probe {
 /// Response recorded from a client probe.
 #[derive(Debug)]
 struct ProbeResponse {
-    /// Test-clock milliseconds relative to when the store applies the late `PUT`.
+    /// Test-clock milliseconds after the store applies the late `PUT`.
     at_ms: i64,
     probe: Probe,
     status: u16,

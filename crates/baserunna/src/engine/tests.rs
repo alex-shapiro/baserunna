@@ -1245,7 +1245,8 @@ fn strong_read_after_an_applied_manifest_put_returns_412_is_new() {
     });
 }
 
-/// Tests that a node serves no lease reads from a rejected commit retry until the commit finishes.
+/// Tests that a node serves strong reads from storage after a rejected commit retry until the
+/// commit finishes.
 #[test]
 fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_finishes() {
     use crate::util::{Either, race};
@@ -1348,7 +1349,7 @@ fn lease_reads_stopped_ignores_a_failed_put_after_the_lease_ended() {
     });
 }
 
-/// Tests that a lost manifest CAS on a node without a lease does not count as stopped lease reads.
+/// Tests that a lost manifest CAS on an unleased node does not count as stopped lease reads.
 #[test]
 fn lease_reads_stopped_ignores_a_lost_cas_without_a_lease() {
     rt().block_on(async {
@@ -1601,7 +1602,7 @@ enum LeaseStep {
 }
 
 /// Generates `n` steps. Each seed disables a random subset of the step kinds other than `Advance`.
-/// This produces long step sequences without an interfering write.
+/// This produces long step sequences that have no interfering write.
 fn gen_lease_steps(r: &mut Rng, n: usize) -> Vec<LeaseStep> {
     let mut weights = [8.0, 4.0, 6.0, 8.0, 12.0, 27.0, 10.0, 5.0, 5.0, 20.0];
     let advance = weights.len() - 1;
@@ -1734,8 +1735,8 @@ impl LeaseRun {
     /// Returns a setup whose manifest writes fail at random.
     fn random(seed: u64) -> LeaseRun {
         let mut r = Rng::new(seed ^ 0x1ea5e);
-        // Two attempts make it likely that every manifest `PUT` of a batch fails, and that one of them
-        // applies later.
+        // Two attempts make it likely that every manifest `PUT` of a batch fails, and that the
+        // store applies one of them later.
         let cfg = EngineConfig { commit_retry_max: *r.pick(&[2, 8]), ..EngineConfig::default() };
         let outcomes = LeaseRunOutcomes::Random(ManifestFaultScript::random(&mut r));
         LeaseRun { seed, cfg, outcomes, ms_after_spawn: 0, check_every_ms: 1 }

@@ -362,13 +362,13 @@ only.
       manifest written by an ambiguous `PUT` from this node. This product
       tradeoff needs a decision. The restore has caused three stale strong
       reads, and it requires the node-wide `Shared::own_leases` map on the
-      strong-read path. Without the restore, the lease stays on the database
-      handle. The cost is a few manifest `GET`s after a lost response. In the
-      15 s after a lost response, reads every 1.5 s send 10 `GET`s instead of
-      8, and reads every 250 ms send 14 `GET`s instead of 0. A hot database
-      sends one lease `PUT` with or without the restore. Recommended. If the
-      restore stays, also restore the lease from a manifest `PUT` that the
-      store applied after its batch ended.
+      strong-read path. If a node takes a lease only from a successful `PUT`,
+      the lease stays on the database handle. The cost is a few manifest `GET`s
+      after a lost response. In the 15 s after a lost response, reads every
+      1.5 s send 10 `GET`s instead of 8, and reads every 250 ms send 14 `GET`s
+      instead of 0. A hot database sends one lease `PUT` in both cases.
+      Recommended. If the restore stays, also restore the lease from a manifest
+      `PUT` that the store applied after its batch ended.
 - [ ] [nice-to-have · Operations] **Account for object overhead in the segment
       block cache.** Increase the per-entry overhead in `CacheVal::size` above
       48 bytes so small block-cache entries are not undercounted by half of

@@ -207,7 +207,7 @@ impl Shared {
     }
 }
 
-/// This node's own lease per database. A database without an entry is [`OwnLease::NotHeld`].
+/// This node's own lease per database. A database without an entry has [`OwnLease::NotHeld`].
 #[derive(Default)]
 struct OwnLeases {
     by_db: DetHashMap<String, OwnLease>,

@@ -1542,7 +1542,7 @@ Every 20 ms of virtual time, global oracles verify three lease invariants:
 - Each node that relies on a lease without an in-flight manifest write holds the latest manifest version in the store.
 - Each node stops relying on its lease within `lease_ms` minus the margin after storage applies the manifest that grants the lease.
 
-At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, stream chunks, and event parts and masks are intact and consistent, that event positions are unique across unsealed rows and parts, and that `part_bytes` equals the referenced parts' sizes. After a node shuts down gracefully, the simulator verifies that storage contains no released database with a lease held by that node.
+At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, stream chunks, and event parts and masks are intact and consistent, that event positions are unique across unsealed rows and parts, and that `part_bytes` equals the referenced parts' sizes. After a node shuts down gracefully, the simulator verifies that the node holds no lease on any released database in storage.
 
 ### 13.4 Coverage, campaigns, and exploration
 

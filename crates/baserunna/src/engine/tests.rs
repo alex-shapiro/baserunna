@@ -920,6 +920,169 @@ fn commit_applied_by_ambiguous_manifest_put_is_not_marked_replayed() {
     });
 }
 
+/// Object store wrapper that fails the next `failed_manifest_puts` manifest writes and buffers them.
+/// [`LateManifestPutStore::apply_late_puts`] applies those writes with their original preconditions.
+struct LateManifestPutStore {
+    mem: Arc<MemStore>,
+    failed_manifest_puts: AtomicU32,
+    late_puts: Mutex<Vec<(String, Bytes, PutMode)>>,
+    /// Applies the buffered writes before the next manifest write.
+    apply_late_puts_on_next_put: std::sync::atomic::AtomicBool,
+    manifest_put_rejected: tokio::sync::Notify,
+}
+
+impl LateManifestPutStore {
+    fn apply_late_puts(&self) -> Vec<SResult<String>> {
+        let late = std::mem::take(&mut *self.late_puts.lock());
+        late.into_iter().map(|(key, data, mode)| self.mem.put_sync(&key, data, &mode)).collect()
+    }
+}
+
+impl ObjectStore for LateManifestPutStore {
+    fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
+        self.mem.get(key, opts)
+    }
+
+    fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
+        Box::pin(async move {
+            if !key.ends_with("/manifest") {
+                return self.mem.put_sync(key, data, &mode);
+            }
+            if !self.late_puts.lock().is_empty() && self.apply_late_puts_on_next_put.swap(false, SeqCst) {
+                self.apply_late_puts();
+            }
+            if take_fault(&self.failed_manifest_puts) {
+                self.late_puts.lock().push((key.to_string(), data, mode));
+                return Err(StoreError::Unavailable("connection reset".into()));
+            }
+            let r = self.mem.put_sync(key, data, &mode);
+            if matches!(r, Err(StoreError::PreconditionFailed)) {
+                self.manifest_put_rejected.notify_one();
+            }
+            r
+        })
+    }
+
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFut<'a, SResult<()>> {
+        self.mem.delete(key)
+    }
+
+    fn list<'a>(&'a self, prefix: &'a str, after: Option<&'a str>, limit: usize) -> BoxFut<'a, SResult<ListPage>> {
+        self.mem.list(prefix, after, limit)
+    }
+
+    fn time_precision_ms(&self) -> u64 {
+        self.mem.time_precision_ms()
+    }
+}
+
+/// Starts two nodes on a shared [`LateManifestPutStore`].
+fn late_manifest_put_nodes() -> (Arc<Engine>, Arc<Engine>, Arc<LateManifestPutStore>) {
+    let env = Arc::new(Env::sim(11, 1_700_000_000_000, Instant::now(), 0));
+    let clock = env.clone();
+    let mem = Arc::new(MemStore::new(Box::new(move || clock.now_ms())));
+    let store = Arc::new(LateManifestPutStore {
+        mem,
+        failed_manifest_puts: 0.into(),
+        late_puts: Mutex::default(),
+        apply_late_puts_on_next_put: false.into(),
+        manifest_put_rejected: tokio::sync::Notify::new(),
+    });
+    let a = Engine::new(store.clone(), env.clone(), EngineConfig::default(), "a".into());
+    let b = Engine::new(store.clone(), env, EngineConfig::default(), "b".into());
+    (a, b, store)
+}
+
+async fn commit_new(db: Arc<Db>) -> crate::error::Result<Committed> {
+    let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await?;
+    t.put(Bytes::from_static(b"k"), inline("new")).unwrap();
+    db.commit_detailed(t.into_request()).await
+}
+
+/// Polls strong reads on `db` every `every_ms` until a read returns `new`.
+/// Returns the elapsed milliseconds and the time at which `db` lost its lease.
+async fn ms_until_strong_read_is_new(db: &Arc<Db>, every_ms: u64) -> (u64, Option<u64>) {
+    let start = Instant::now();
+    let mut lease_lost_ms = None;
+    loop {
+        if strong_get(db, "k").await == Some(inline("new")) {
+            return (start.elapsed().as_millis() as u64, lease_lost_ms);
+        }
+        for _ in 0..every_ms {
+            assert!(start.elapsed() < Duration::from_secs(60), "the strong read never returned the new value");
+            if lease_lost_ms.is_none() && db.leased_view().is_none() {
+                lease_lost_ms = Some(start.elapsed().as_millis() as u64);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
+/// Tests strong reads if a failed manifest write is applied after an unknown commit outcome.
+fn strong_read_after_late_manifest_put_once_unknown(poll_every_ms: u64) {
+    rt().block_on(async {
+        let (a, b, store) = late_manifest_put_nodes();
+        let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
+        let leased_at = Instant::now();
+        put(&db_a, "k", "old").await;
+        db_b.open(false).await.unwrap();
+        assert_eq!(strong_get(&db_b, "k").await, Some(inline("old")));
+        store.failed_manifest_puts.store(a.shared.cfg.commit_retry_max, SeqCst);
+        let outcome = commit_new(db_a.clone()).await;
+        assert!(matches!(outcome, Err(Error::Unavailable { outcome_unknown: true, .. })), "answered {outcome:?}");
+        assert_eq!(strong_get(&db_a, "k").await, Some(inline("old")), "setup: the late write was not applied yet");
+        let landed_after_lease_ms = leased_at.elapsed().as_millis();
+        let applied = store.apply_late_puts();
+        assert!(applied[0].is_ok(), "setup: the first late write is applied, got {applied:?}");
+        assert_eq!(strong_get(&db_b, "k").await, Some(inline("new")), "B reads the late write");
+        let (stale_ms, lease_lost_ms) = ms_until_strong_read_is_new(&db_a, poll_every_ms).await;
+        eprintln!(
+            "unknown outcome {outcome:?}; late write applied {landed_after_lease_ms} ms after A's lease; \
+             polled every {poll_every_ms} ms: A read the old value for {stale_ms} ms, held its lease for {lease_lost_ms:?} ms"
+        );
+        assert_eq!(stale_ms, 0, "A read the old value for {stale_ms} ms after B read the new value");
+    });
+}
+
+#[test]
+#[ignore = "TODO.md blocker: Stale strong read"]
+fn strong_read_after_late_manifest_put_once_unknown_is_new() {
+    strong_read_after_late_manifest_put_once_unknown(500);
+}
+
+#[test]
+#[ignore = "TODO.md blocker: Stale strong read"]
+fn hot_strong_read_after_late_manifest_put_once_unknown_is_new() {
+    strong_read_after_late_manifest_put_once_unknown(10);
+}
+
+/// Tests strong reads if a failed manifest write is applied before a commit retry.
+#[test]
+#[ignore = "TODO.md blocker: Stale strong read"]
+fn strong_read_after_late_manifest_put_during_retry_is_new() {
+    rt().block_on(async {
+        let (a, b, store) = late_manifest_put_nodes();
+        let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
+        put(&db_a, "k", "old").await;
+        db_b.open(false).await.unwrap();
+        assert_eq!(strong_get(&db_b, "k").await, Some(inline("old")));
+        store.failed_manifest_puts.store(1, SeqCst);
+        store.apply_late_puts_on_next_put.store(true, SeqCst);
+        let commit = tokio::spawn(commit_new(db_a.clone()));
+        store.manifest_put_rejected.notified().await;
+        let rejected_at = Instant::now();
+        assert_eq!(strong_get(&db_b, "k").await, Some(inline("new")), "B reads the late write");
+        let (stale_ms, _) = ms_until_strong_read_is_new(&db_a, 1).await;
+        let outcome = commit.await.unwrap();
+        eprintln!(
+            "retry rejected: A read the old value for {stale_ms} ms; commit answered {:?} after {} ms",
+            outcome.as_ref().map(|c| c.version),
+            rejected_at.elapsed().as_millis()
+        );
+        assert_eq!(stale_ms, 0, "A read the old value for {stale_ms} ms after B read the new value");
+    });
+}
+
 #[test]
 fn obsolete_segments_outlive_snapshots_then_go() {
     rt().block_on(async {

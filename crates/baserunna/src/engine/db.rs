@@ -44,8 +44,8 @@ tokio::task_local! {
     static INVOKED_AT: Instant;
 }
 
-/// Runs `f` as a single operation invoked at `at` so strong reads within the
-/// scope can reuse a manifest validated at or after `at`.
+/// Runs `f` as a single operation invoked at `at`. Strong reads within the scope
+/// can reuse a manifest that [`Db::refresh`] accepts as validated after `at`.
 pub async fn invoked_at<F: std::future::Future>(at: Instant, f: F) -> F::Output {
     INVOKED_AT.scope(at, f).await
 }

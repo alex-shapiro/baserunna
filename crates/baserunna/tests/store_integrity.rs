@@ -190,7 +190,7 @@ impl ObjectStore for TamperStore {
 // Single-node deployment
 // ---------------------------------------------------------------------------------------------
 
-/// Peer transport for a single-node deployment, which has no peers.
+/// Peer transport for a single-node deployment.
 struct NoPeers;
 
 impl Transport for NoPeers {
@@ -383,7 +383,7 @@ struct Cell {
     detail: String,
 }
 
-/// Collected cells of one matrix row group.
+/// Collected cells of a matrix row group.
 #[derive(Default)]
 struct Matrix {
     cells: Vec<Cell>,
@@ -464,7 +464,7 @@ fn random_bytes(rng: &mut Rng, n: usize) -> Vec<u8> {
     (0..n).map(|_| rng.below(256) as u8).collect()
 }
 
-/// Writes `entries` with one transaction per 50 entries.
+/// Writes `entries` with a transaction per 50 entries.
 async fn put_all(d: &Deployment, token: &str, db: &str, entries: &[(String, Vec<u8>)]) {
     for batch in entries.chunks(50) {
         let ops: Vec<Json> = batch
@@ -854,7 +854,7 @@ fn segment_block_served_from_wrong_offset_is_detected() {
     });
 }
 
-/// Rows of table `items` in database `t`, stored in one level-0 segment.
+/// Rows of table `items` in database `t`, stored in a level-0 segment.
 async fn write_table(d: &Deployment, token: &str) -> (String, Vec<Json>) {
     let db = d.create_db(token, "t").await;
     let table = json!({"name": "items", "primary_key": ["id"], "columns": [
@@ -1325,9 +1325,9 @@ impl EventData {
         let mut parts = BTreeMap::new();
         for r in part_refs(d, &db).await {
             let day = (r.min_time - EVENTS_FROM_MS).div_euclid(DAY_MS);
-            assert!(parts.insert(day, r.id.clone()).is_none(), "day {day} has more than one part");
+            assert!(parts.insert(day, r.id.clone()).is_none(), "day {day} has more than 1 part");
         }
-        assert_eq!(parts.len(), 4, "expected one part per day: {parts:?}");
+        assert_eq!(parts.len(), 4, "expected a single part per day: {parts:?}");
         EventData { token, db, parts }
     }
 
@@ -1499,7 +1499,7 @@ fn damaged_levels_objects_are_detected() {
 // Local disk cache tier
 // ---------------------------------------------------------------------------------------------
 
-/// Directory for disk cache files of one test, emptied before use.
+/// Directory for disk cache files of a test, emptied before use.
 fn cache_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join("baserunna-store-integrity").join(name);
     let _ = std::fs::remove_dir_all(&dir);

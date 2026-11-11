@@ -573,7 +573,7 @@ fn stalled_request_body_times_out_over_tcp() {
 /// Start of the day that holds every row of a merge measurement.
 const MERGE_DAY_MS: i64 = 1_749_000_000_000 / DAY_MS * DAY_MS;
 
-/// Small event `i` in the merge day, from one of 100,000 users and 8 event names.
+/// Small event `i` in the merge day, from 1 of 100,000 users and 8 event names.
 fn small_event(i: usize) -> String {
     let time = MERGE_DAY_MS + (i as i64 * 7_919) % DAY_MS;
     format!(r#"{{"t":{time},"u":"u{:07}","e":"e{}"}}"#, i % 100_000, i % 8)

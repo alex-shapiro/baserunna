@@ -1000,7 +1000,7 @@ async fn commit_new(db: Arc<Db>) -> crate::error::Result<Committed> {
 }
 
 /// Polls strong reads on `db` every `every_ms` until a read returns `new`.
-/// Returns the elapsed milliseconds and the time when `db` lost its lease.
+/// Returns the elapsed milliseconds and the time at which `db` lost its lease.
 async fn ms_until_strong_read_is_new(db: &Arc<Db>, every_ms: u64) -> (u64, Option<u64>) {
     let start = Instant::now();
     let mut lease_lost_ms = None;

@@ -57,7 +57,7 @@ only.
       `tests/event_query_limits.rs`.
 - [ ] [blocker · Tenant resource exhaustion] **Acquire a query slot for
       transactional `query_events` ops and extend their deadline.** Acquire a
-      `Node::query_slot` permit and apply the event query deadline when `/txn`
+      `Node::query_slot` permit and apply the event query deadline if `/txn`
       executes `query_events`. In `/txn`, 32 concurrent event queries held twice
       the heap of 16, whereas the event query route (`/events/{t}/rows/query`)
       stayed flat. A query that returned `200` after 12.5 s on the event query
@@ -89,9 +89,9 @@ only.
       `tests/event_ingest_limits.rs`.
 - [ ] [blocker · Tenant resource exhaustion] **Time out stalled request
       bodies.** Enforce a read timeout while receiving request bodies. The
-      request deadline pauses while a body arrives, and the server sets no read
-      timeout. A body that stopped halfway remained open after 10 minutes with
-      its buffer held, both through the router and over TCP. Tests:
+      request deadline pauses while a body arrives, and the server does not set
+      a read timeout. A body that stopped halfway remained open after 10 minutes
+      with its buffer held, both through the router and over TCP. Tests:
       `stalled_request_body_times_out` and
       `stalled_request_body_times_out_over_tcp` in
       `tests/event_ingest_limits.rs`.
@@ -140,12 +140,12 @@ only.
       `damaged_staged_blob_metadata_is_detected` in `tests/store_integrity.rs`.
 - [ ] [blocker · Store fault detection] **Report persistent maintenance
       failures and back off.** Increment an error counter, log at `error`
-      level, and back off when background maintenance fails. With a single
+      level, and back off if background maintenance fails. With a single
       corrupt segment, compaction failed on 1,204 of 1,300 commits without
       backoff, and the sweep failed on every commit after becoming due. Stored
       bytes grew to 27 times the live data size. Compaction, sweep, flush, trim,
-      and event maintenance failures log only at `debug` level and record no
-      metric in `/v1/admin/metrics`. Test:
+      and event maintenance failures log only at `debug` level and do not record
+      a metric in `/v1/admin/metrics`. Test:
       `persistent_segment_corruption_is_reported_and_backed_off` in
       `tests/store_integrity.rs`.
 - [ ] [blocker · Lost acknowledged write] **Reject binds if a target column was
@@ -160,11 +160,11 @@ only.
       system database and database manifests.** Document and test a restore
       procedure, add an undelete route or a longer delete grace period, and
       align `SPEC.md` §8 with `DEPLOYING.md` on bucket versioning. After
-      `DELETE /v1/dbs/{db}`, no route returns the data, and all database objects
-      are purged after `db_delete_grace_ms` (10 minutes, not configurable).
-      `SPEC.md` §8 instructs operators to restore a lost manifest from a backup
-      or object version, whereas `DEPLOYING.md` instructs them to disable bucket
-      versioning. This item has no failing test.
+      `DELETE /v1/dbs/{db}`, the data is inaccessible through the API, and all
+      database objects are purged after `db_delete_grace_ms` (10 minutes, not
+      configurable). `SPEC.md` §8 instructs operators to restore a lost manifest
+      from a backup or object version, whereas `DEPLOYING.md` instructs them to
+      disable bucket versioning. This item does not have a failing test.
 
 ## Nice-to-have
 
@@ -214,10 +214,10 @@ only.
       transaction. `baserunna-client` does not send duplicate commits, so this
       needs a proxy that retries a delivered `POST`.
 - [ ] [nice-to-have · Duplicate requests] **Set `retryable: false` if `outcome`
-      is `"unknown"` and the write has no idempotency key.** A `503` response
+      is `"unknown"` and the write omits an idempotency key.** A `503` response
       with `outcome: "unknown"` sets `retryable: true`. The API docs and
-      `baserunna-client` resolve the outcome first, but a client that inspects
-      only `retryable` can apply a non-idempotent write twice.
+      `baserunna-client` check the commit status first, but a client that
+      inspects only `retryable` can apply a non-idempotent write twice.
 - [ ] [nice-to-have · Duplicate requests] **Reject `Idempotency-Key` on routes
       that ignore it, and support it on `DELETE /v1/dbs/{db}/kv/{key}`.** Raw
       key-value deletes and the row routes ignore the header without an error,
@@ -278,7 +278,7 @@ only.
       `api::events::query` to missing-table and missing-column errors instead of
       retrying any `400` or `404` failure.
 - [ ] [nice-to-have · Event tables] **Refresh the database name cache on `404`
-      during strong event queries.** Refresh the 5 s database name cache when a
+      during strong event queries.** Refresh the 5 s database name cache if a
       strong event query receives `404` so that a recently recreated database
       does not fail the first query.
 - [ ] [nice-to-have · Event tables] **Parse shared JSON buckets once per row
@@ -362,7 +362,7 @@ only.
 - [ ] [nice-to-have · Operations] **Await in-flight hedged manifest `PUT`s
       before returning an unknown outcome.** Await the primary manifest `PUT` if
       a hedged duplicate fails with `412` and retries are exhausted, so the
-      committer can resolve the outcome instead of returning
+      committer can determine the outcome instead of returning
       `outcome: "unknown"`.
 - [ ] [nice-to-have · Operations] **Account for object overhead in the segment
       block cache.** Increase the per-entry overhead in `CacheVal::size` above
@@ -451,8 +451,8 @@ only.
 ## Tangential
 
 - [ ] [tangential · Simulator] **Fix `db_churn` timeouts if a node crash-loops
-      under memory pressure.** Avoid repeated system-segment re-reads when a
-      node restarts under a tiny cache budget (`sim_tool trace db_churn 606688`,
+      under memory pressure.** Avoid repeated system-segment re-reads if a node
+      restarts under a tiny cache budget (`sim_tool trace db_churn 606688`,
       which uses 2 KiB segments and a 4 KiB disk cache).
 - [ ] [tangential · Simulator] **Tolerate transient form errors in the
       `console` workload.** Allow transient password-change timeouts at
@@ -485,7 +485,7 @@ only.
 - [ ] [tangential · Test infrastructure] **Track throughput benchmarks in CI**
       across commits. `tests/cost.rs` already enforces request cost budgets.
 - [ ] [tangential · Transactions] **Abort open interactive transactions if a
-      database is deleted.** Abort open interactive transactions when a database
+      database is deleted.** Abort open interactive transactions if a database
       is deleted so they do not occupy per-user transaction slots until the 30 s
       idle timeout expires.
 - [ ] [tangential · Transactions] **Abort interactive transactions whose
@@ -504,7 +504,7 @@ only.
       `fail_batch` after an ambiguous `PUT`, it marks every undecided commit in
       the batch as `outcome: "unknown"`.
 - [ ] [tangential · API] **Return `200` if a retried database deletion
-      completes cleanup.** Return `200` instead of `404 not_found` when a
+      completes cleanup.** Return `200` instead of `404 not_found` if a
       retried `DELETE /v1/dbs/{db}` finishes an interrupted database deletion.
 - [ ] [tangential · API] **Add an `Unknown` fallback variant to
       `baserunna_api::Role`.** Add `#[serde(other)]` to `baserunna_api::Role` so
@@ -522,9 +522,9 @@ only.
       loops.** Consolidate the retry and lease-refresh logic shared by
       `Node::bind_events`, `Node::forward_internal`, and `Node::meta`.
 - [ ] [tangential · Optimization] **Measure local lease duration from the
-      manifest `PUT` start time.** Start the local lease timer when the manifest
-      `PUT` begins instead of at the start of the commit attempt, so synchronous
-      pre-`PUT` work is not subtracted from the lease duration.
+      manifest `PUT` start time.** Start the local lease timer at the start of
+      the manifest `PUT` instead of at the start of the commit attempt, so
+      synchronous pre-`PUT` work is not subtracted from the lease duration.
 - [ ] [tangential · Optimization] **Read masked merge inputs in a single
       pass.** Plan each output column during the merge pass instead of running a
       separate census pass. Before merging a part that has deletions,
@@ -546,7 +546,7 @@ only.
       rejected instead of waiting for the orphan sweep after `orphan_grace_ms`
       (2 hours).
 - [ ] [tangential · Optimization] **Flush idle database tails to reduce
-      next-commit manifest size.** Flush non-empty tails when a database becomes
+      next-commit manifest size.** Flush non-empty tails if a database becomes
       idle to reduce the size of the next manifest `PUT` at the cost of an extra
       segment `PUT`.
 - [ ] [tangential · Optimization] **Box `BlobRef` in `Value` to reduce
@@ -566,7 +566,7 @@ only.
       Allow event tables to declare pre-aggregated rollups or alternate sort
       orders maintained automatically during seals and merges.
 - [ ] [tangential · Docs] **Replace remaining wide tables in `SPEC.md`.**
-      Reformat the tables in `SPEC.md` §8, §10, and §12 so no row exceeds 100
+      Reformat the tables in `SPEC.md` §8, §10, and §12 to fit within 100
       columns.
 - [ ] [tangential · Docs] **Correct the deploy trigger statement in
       `DEPLOYING.md`.** Update `DEPLOYING.md` to reflect that the push trigger

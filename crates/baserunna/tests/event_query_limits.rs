@@ -156,7 +156,7 @@ fn statuses(out: &[Outcome]) -> Vec<u16> {
     out.iter().map(|o| o.status).collect()
 }
 
-/// Event of user `user` at `time_ms` with one of 8 event names.
+/// Event of user `user` at `time_ms` with 1 of 8 event names.
 fn user_event(time_ms: i64, user: usize, i: usize) -> String {
     format!(r#"{{"time": {time_ms}, "user": "user-{user:07}", "event": "e{}"}}"#, i % 8)
 }
@@ -185,7 +185,7 @@ async fn setup_user_events(w: &World, token: &str, rows: usize, users: usize) ->
     settle_parts(w, token, "d", "ev").await
 }
 
-/// Top 100 users by event count between `from` and `to`, a query that holds one group per distinct user.
+/// Top 100 users by event count between `from` and `to`, a query that holds a group per distinct user.
 fn top_users_query(from: i64, to: i64) -> Json {
     json!({"from": from, "to": to, "group_by": ["user"], "aggregates": {"n": {"fn": "count"}},
         "order_by": [{"col": "n", "desc": true}], "limit": 100})

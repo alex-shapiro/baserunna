@@ -322,7 +322,7 @@ fn table_definitions_default_to_nullable_columns() {
 #[test]
 fn metrics_omit_quantiles_of_empty_histograms() {
     let m = Metrics::decode(
-        r#"{"node":"n","store":{},"commits":{"count":2,"p50_ms":1.5,"txns_per_batch":1.0,"max_txns_per_batch":1,"lease_reads_stopped":0},"routes":{"GET /v1/limits":{"count":0}},"lag":{"count":0},"cpu":{"process_ms":null,"steal_ms":null}}"#.into(),
+        r#"{"node":"n","store":{},"commits":{"count":2,"p50_ms":1.5,"txns_per_batch":1.0,"max_txns_per_batch":1},"routes":{"GET /v1/limits":{"count":0}},"lag":{"count":0},"cpu":{"process_ms":null,"steal_ms":null}}"#.into(),
     )
     .unwrap();
     assert_eq!((m.commits.latency.count, m.commits.latency.p50_ms), (2, Some(1.5)));

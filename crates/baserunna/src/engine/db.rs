@@ -460,7 +460,6 @@ impl Db {
         let before = std::mem::replace(&mut self.st.lock().own_lease, OwnLease::NotHeld);
         if before.has_time_left() {
             probe::hit(Probe::LeaseReadsStopped);
-            self.shared.metrics.lease_reads_stopped();
         }
     }
 

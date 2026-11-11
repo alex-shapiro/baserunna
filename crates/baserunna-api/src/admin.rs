@@ -86,10 +86,6 @@ pub struct CommitMetrics {
     pub latency: Histogram,
     pub txns_per_batch: f64,
     pub max_txns_per_batch: u64,
-    /// Failed manifest `PUT`s that stopped strong reads from cache under an unexpired lease. Until
-    /// a manifest `PUT` from this node succeeds, each strong read on that database reads the
-    /// manifest.
-    pub lease_reads_stopped: u64,
 }
 
 /// Process and host-steal CPU time in milliseconds, or `None` if `/proc` is unavailable.

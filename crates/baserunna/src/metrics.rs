@@ -103,7 +103,6 @@ pub struct StoreMetrics {
     commits: Histogram,
     batch_txns: AtomicU64,
     batch_txns_max: AtomicU64,
-    lease_reads_stopped: AtomicU64,
 }
 
 impl StoreMetrics {
@@ -118,11 +117,6 @@ impl StoreMetrics {
         self.commits.record(d);
         self.batch_txns.fetch_add(txns as u64, Relaxed);
         self.batch_txns_max.fetch_max(txns as u64, Relaxed);
-    }
-
-    /// Counts a failed manifest `PUT` that stopped strong reads from cache under an unexpired lease.
-    pub fn lease_reads_stopped(&self) {
-        self.lease_reads_stopped.fetch_add(1, Relaxed);
     }
 
     /// Sets the object store and commit metrics in `out`.
@@ -142,7 +136,6 @@ impl StoreMetrics {
             latency: self.commits.summary(),
             txns_per_batch: (self.batch_txns.load(Relaxed) as f64 / batches * 10.0).round() / 10.0,
             max_txns_per_batch: self.batch_txns_max.load(Relaxed),
-            lease_reads_stopped: self.lease_reads_stopped.load(Relaxed),
         };
     }
 
@@ -152,7 +145,6 @@ impl StoreMetrics {
         self.commits.reset();
         self.batch_txns.store(0, Relaxed);
         self.batch_txns_max.store(0, Relaxed);
-        self.lease_reads_stopped.store(0, Relaxed);
     }
 }
 

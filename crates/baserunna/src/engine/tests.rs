@@ -1396,53 +1396,11 @@ fn lease_reads_stay_off_from_a_rejected_retry_until_a_put_succeeds() {
             }
         };
         assert!(outcome.is_ok(), "setup: the commit answered {outcome:?}");
-        assert_eq!(lease_reads_stopped(&a), 1, "the metrics do not count the stop of lease reads");
         sleep_ms(1).await;
         let puts = store.manifest_puts.load(SeqCst) - puts_before_commit;
         assert_eq!(puts, 3, "want a failed PUT, a rejected PUT, and a lease-only PUT");
         let stored = store.stored_manifest_etag("d").unwrap();
         assert_eq!(db_a.leased_view().map(|v| v.etag), Some(stored), "the lease-only PUT did not give A its lease");
-    });
-}
-
-/// Returns the `lease_reads_stopped` metric of `e`.
-fn lease_reads_stopped(e: &Engine) -> u64 {
-    let mut metrics = baserunna_api::Metrics::default();
-    e.shared.metrics.fill(&mut metrics);
-    metrics.commits.lease_reads_stopped
-}
-
-/// Tests that a failed manifest `PUT` after the lease ended does not count as stopped lease reads.
-#[test]
-fn lease_reads_stopped_ignores_a_failed_put_after_the_lease_ended() {
-    rt().block_on(async {
-        let (a, _b, store) = late_manifest_put_nodes();
-        let db_a = opened(&a, "d").await;
-        put(&db_a, "k", "old").await;
-        sleep_ms(6_000).await;
-        assert_eq!(db_a.leased_view(), None, "setup: A's lease ended");
-        store.failed_manifest_puts.store(1, SeqCst);
-        put(&db_a, "k", "new").await;
-        assert_eq!(lease_reads_stopped(&a), 0, "A served no lease reads before the failed PUT");
-    });
-}
-
-/// Tests that a lost manifest CAS on an unleased node does not count as stopped lease reads.
-#[test]
-fn lease_reads_stopped_ignores_a_lost_cas_without_a_lease() {
-    rt().block_on(async {
-        let (a, b, _store) = late_manifest_put_nodes();
-        let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
-        put(&db_a, "k", "old").await;
-        db_b.open(false).await.unwrap();
-        sleep_ms(6_000).await;
-        put(&db_a, "k", "new").await;
-        let snapshot = Consistency::Snapshot { max_staleness_ms: 600_000 };
-        let mut t = db_b.begin(Isolation::Serializable, snapshot).await.unwrap();
-        t.put(Bytes::from_static(b"j"), inline("b")).unwrap();
-        let outcome = db_b.commit_detailed(t.into_request()).await;
-        assert!(matches!(outcome, Err(Error::NotOwner { .. })), "setup: B's commit answered {outcome:?}");
-        assert_eq!(lease_reads_stopped(&b), 0, "B served no lease reads before its CAS was lost");
     });
 }
 

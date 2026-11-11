@@ -548,10 +548,12 @@ A manifest `PUT` that fails with any error stops strong reads from cache on this
 
 A manifest read does not end this state. A reload can find a manifest that a failed `PUT` from this node wrote, with this node's lease. The reload cannot show which failed `PUT` wrote that manifest or when storage applied it, so the node does not take the lease from it. The node keeps its lease state in the database handle. A new handle holds no lease until one of its `PUT`s succeeds, so a handle eviction cannot start strong reads from cache.
 
-Until a `PUT` succeeds, each strong read on this node sends a conditional `GET` (§5.9). Two rules end this state without a commit:
+Until a `PUT` succeeds, each strong read on this node sends a conditional `GET` (§5.9). Two triggers end this state without a commit. Each trigger requests a lease-only `PUT` that no caller waits for:
 
 - If the reload of a commit batch finds a manifest with this node's lease and the `write_seq` of an ambiguous `PUT` from that batch, and the batch has nothing more to write, the committer requests one lease-only `PUT`. After the failed `PUT`, a lost response then costs the same as a lost request: one manifest `GET` and one `PUT`. The lease-only `PUT` renews the lease, as a commit does (§5.7). If this node stops after that `PUT`, another node that read the manifest of the failed `PUT` can wait up to one more lease term before it takes over: 11 s in place of 5.5 s.
 - On a read-heavy database, strong reads request a lease-only `PUT` (§5.7).
+
+One rule controls both triggers. A stopping node sends no such request. On a read-heavy database, the request renews the lease for reads. The committer sends the request once. If the outcome is unknown, the committer removes the request from the batch, and the node sends no other such request for `lease_ms / 5` (1 s). Thus, while storage applies each manifest `PUT` and loses its reply, each commit sends at most 2 manifest `PUT`s, and strong reads send at most 1 lease-only `PUT` each second.
 
 #### Hedged Manifest Writes
 

@@ -155,6 +155,11 @@ impl Work {
         }
     }
 
+    /// Returns true for a lease request that no caller waits for. Such a request gets one attempt.
+    fn is_best_effort(&self) -> bool {
+        matches!(self, Work::Lease { tx: None, .. })
+    }
+
     fn fail(self, e: Error) {
         self.deliver(Outcome::Unit(Err(e)));
     }
@@ -235,6 +240,9 @@ struct State {
     reads_in_window: u32,
     reads_last_window: u32,
     lease_requested: bool,
+    /// Instant before which this handle sends no lease request without a waiting caller, because
+    /// such a request had an unknown outcome.
+    lease_requests_paused_until: Option<Instant>,
     /// Start instant of this node's in-flight manifest write.
     manifest_write_started_at: Option<Instant>,
     compacting: bool,
@@ -326,6 +334,7 @@ impl Db {
                 reads_in_window: 0,
                 reads_last_window: 0,
                 lease_requested: false,
+                lease_requests_paused_until: None,
                 manifest_write_started_at: None,
                 compacting: false,
                 flushing: false,
@@ -792,18 +801,17 @@ impl Db {
         };
         let (v, current_at) = self.refresh_at(not_before, false).await?;
         self.shared.env.trace(|| format!("{} read v{} after refresh (lease={:?})", self.id, v.m.version, v.m.lease));
-        let hot = {
+        let lease_request = {
             let mut st = self.st.lock();
-            let hot = st.hot(self.shared.cfg.lease_read_threshold) && !st.lease_requested;
-            if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v).is_none() && !self.has_in_flight_write() {
-                st.lease_requested = true;
-                true
-            } else {
-                false
-            }
+            let wanted = st.hot(self.shared.cfg.lease_read_threshold)
+                && !v.m.is_deleted()
+                && !self.holds_lease(&st, &v.m)
+                && self.foreign_lease(&v).is_none()
+                && !self.has_in_flight_write();
+            wanted.then(|| self.lease_request(&mut st)).flatten()
         };
-        if hot && !v.m.is_deleted() {
-            self.enqueue(Work::Lease { release: false, for_reads: true, tx: None });
+        if let Some(w) = lease_request {
+            self.enqueue(w);
         }
         self.snapshot_at(check_live(v)?, current_at).await
     }
@@ -835,13 +843,13 @@ impl Db {
                 current_at.is_some_and(|t| now.duration_since(t) <= Duration::from_millis(max_staleness_ms))
             }
         };
-        let want_lease = leased && hot && !st.lease_requested && lease_left < Duration::from_millis(cfg.lease_ms / 5);
-        if want_lease {
-            st.lease_requested = true;
-        }
+        let lease_request = match leased && hot && lease_left < Duration::from_millis(cfg.lease_ms / 5) {
+            true => self.lease_request(&mut st),
+            false => None,
+        };
         drop(st);
-        if want_lease {
-            self.enqueue(Work::Lease { release: false, for_reads: true, tx: None });
+        if let Some(w) = lease_request {
+            self.enqueue(w);
         }
         if !fresh {
             return None;
@@ -1159,7 +1167,7 @@ impl Db {
         log::event(Level::Info, "commit", &fields);
     }
 
-    async fn process(self: &Arc<Self>, batch: Vec<Work>) {
+    async fn process(self: &Arc<Self>, mut batch: Vec<Work>) {
         let cfg = self.shared.cfg.clone();
         let mut maybe_applied = false;
         let mut unknown_writes: Vec<UnknownWrite> = Vec::new();
@@ -1235,7 +1243,10 @@ impl Db {
                     // The store applied an ambiguous `PUT` with this node's lease. Only a `PUT`
                     // that succeeds gives this handle the lease.
                     probe::hit(Probe::AmbiguousWriteLanded);
-                    self.enqueue(Work::Lease { release: false, for_reads: false, tx: None });
+                    let lease_request = self.lease_request(&mut self.st.lock());
+                    if let Some(w) = lease_request {
+                        self.enqueue(w);
+                    }
                 }
                 return;
             };
@@ -1300,6 +1311,15 @@ impl Db {
                     // These objects have already passed their grace period, so they can be deleted safely
                     // even if the write failed.
                     self.delete_obsolete(plan.gc);
+                    if batch.iter().any(Work::is_best_effort) {
+                        batch.retain(|w| !w.is_best_effort());
+                        let mut st = self.st.lock();
+                        st.lease_requested = false;
+                        st.lease_requests_paused_until = Some(Instant::now() + Duration::from_millis(cfg.lease_ms / 5));
+                    }
+                    if batch.is_empty() {
+                        return;
+                    }
                 }
                 Err(e) => {
                     let e: Error = e.into();
@@ -1481,6 +1501,18 @@ impl Db {
         self.st.lock().manifest_write_started_at = None;
         self.writes_finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.write_done.notify_waiters();
+    }
+
+    /// Returns a lease request that renews this node's lease with no waiting caller. Returns `None`
+    /// if such a request is queued, if requests are paused after an unknown outcome, or if this node
+    /// stops. The request takes the read lease if the database is hot.
+    fn lease_request(&self, st: &mut State) -> Option<Work> {
+        let paused = st.lease_requests_paused_until.is_some_and(|t| Instant::now() < t);
+        if st.lease_requested || paused || self.shared.stopping() {
+            return None;
+        }
+        st.lease_requested = true;
+        Some(Work::Lease { release: false, for_reads: st.hot(self.shared.cfg.lease_read_threshold), tx: None })
     }
 
     fn clear_lease_flag(&self, batch: &[Work]) {
@@ -2970,25 +3002,41 @@ mod tests {
         }
     }
 
+    /// Tests the lease-only `PUT` that follows a commit whose `PUT` the store applied with a lost
+    /// reply. The `PUT` takes the read lease on a hot database, and a stopping node sends none.
     #[test]
     fn ambiguous_write_recovery_renews_lease_with_a_lease_put() {
-        use crate::engine::tests::{delayed_engine_with, opened, put};
+        use crate::engine::tests::{delayed_engine_with, opened, put, strong_get};
         use std::sync::atomic::Ordering::SeqCst;
-        rt().block_on(async {
-            let cfg = EngineConfig { manifest_put_hedge_ms: 0, ..EngineConfig::small_for_tests() };
-            let (eng, store) = delayed_engine_with("a", cfg);
-            let db = opened(&eng, "d").await;
-            put(&db, "k", "1").await;
-            store.put_reply_ms.store(50, SeqCst);
-            store.manifest_put_lost.store(1, SeqCst);
-            put(&db, "k", "2").await;
-            let landed = db.current().unwrap();
-            assert!(!db.holds_lease(&db.st.lock(), &landed.m), "took the lease from a PUT that returned an error");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let renewed = db.current().unwrap();
-            assert_eq!(renewed.m.write_seq, landed.m.write_seq + 1, "no lease-only PUT followed the landed write");
-            assert!(db.holds_lease(&db.st.lock(), &renewed.m));
-        });
+        for (case, hot, stopping) in [("cold", false, false), ("hot", true, false), ("stopping", false, true)] {
+            rt().block_on(async {
+                let cfg = EngineConfig { manifest_put_hedge_ms: 0, ..EngineConfig::small_for_tests() };
+                let (eng, store) = delayed_engine_with("a", cfg.clone());
+                let db = opened(&eng, "d").await;
+                put(&db, "k", "1").await;
+                if hot {
+                    for _ in 0..cfg.lease_read_threshold {
+                        strong_get(&db, "k").await;
+                    }
+                }
+                eng.shared.stopping.store(stopping, SeqCst);
+                store.put_reply_ms.store(50, SeqCst);
+                store.manifest_put_lost.store(1, SeqCst);
+                put(&db, "k", "2").await;
+                let landed = db.current().unwrap();
+                assert!(!db.holds_lease(&db.st.lock(), &landed.m), "{case}: took the lease from a failed PUT");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let renewed = db.current().unwrap();
+                if stopping {
+                    assert_eq!(renewed.m.write_seq, landed.m.write_seq, "{case}: sent a lease-only PUT");
+                    return;
+                }
+                assert_eq!(renewed.m.write_seq, landed.m.write_seq + 1, "{case}: no lease-only PUT followed");
+                assert!(db.holds_lease(&db.st.lock(), &renewed.m), "{case}: the lease-only PUT gave no lease");
+                let want_ms = if hot { cfg.read_lease_ms } else { cfg.lease_ms };
+                assert_eq!(renewed.m.lease.as_ref().map(|l| l.ms), Some(want_ms), "{case}: lease duration");
+            });
+        }
     }
 
     #[test]

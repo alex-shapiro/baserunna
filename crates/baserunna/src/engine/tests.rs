@@ -1570,6 +1570,67 @@ fn hot_strong_reads_after_unknown_outcome_renew_the_lease_once() {
     });
 }
 
+/// Tests the manifest `PUT`s and the latency of commits while the store applies each manifest
+/// `PUT` and loses its reply. Each commit sends its own `PUT` and at most one lease-only `PUT`.
+#[test]
+fn commits_send_at_most_two_manifest_puts_each_while_replies_are_lost() {
+    for gap_ms in [0, 2_000] {
+        rt().block_on(async {
+            let (eng, store) = delayed_engine("a");
+            let db = opened(&eng, "d").await;
+            put(&db, "k", "0").await;
+            store.put_reply_ms.store(20, SeqCst);
+            store.get_reply_ms.store(20, SeqCst);
+            store.manifest_put_lost.store(u32::MAX, SeqCst);
+            let puts_before = store.manifest_puts.load(SeqCst);
+            let mut latency_ms = Vec::new();
+            for i in 0..5 {
+                let started = Instant::now();
+                put(&db, "k", &format!("v{i}")).await;
+                latency_ms.push(started.elapsed().as_millis());
+                sleep_ms(gap_ms).await;
+            }
+            sleep_ms(eng.shared.cfg.read_lease_ms).await;
+            let puts = store.manifest_puts.load(SeqCst) - puts_before;
+            eprintln!("{gap_ms} ms between commits: {puts} manifest PUTs, latency ms {latency_ms:?}");
+            assert!(puts <= 10, "{gap_ms} ms between commits: 5 commits sent {puts} manifest PUTs");
+            assert!(
+                latency_ms.iter().all(|ms| *ms <= 150),
+                "{gap_ms} ms between commits: latency ms {latency_ms:?}, want at most 150 ms each"
+            );
+        });
+    }
+}
+
+/// Tests that hot strong reads on a node without its lease send a bounded number of lease-only
+/// `PUT`s while the store applies each manifest `PUT` and loses its reply.
+#[test]
+fn hot_strong_reads_pause_lease_puts_while_replies_are_lost() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let cfg = eng.shared.cfg.clone();
+        let db = opened(&eng, "d").await;
+        put(&db, "k", "0").await;
+        sleep_ms(cfg.lease_ms).await;
+        assert_eq!(db.leased_view(), None, "setup: the lease ended");
+        store.put_reply_ms.store(20, SeqCst);
+        store.get_reply_ms.store(20, SeqCst);
+        store.manifest_put_lost.store(u32::MAX, SeqCst);
+        let puts_before = store.manifest_puts.load(SeqCst);
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(3) {
+            sleep_ms(10).await;
+            assert_eq!(strong_get(&db, "k").await, Some(inline("0")));
+        }
+        let puts = store.manifest_puts.load(SeqCst) - puts_before;
+        let max_puts = 1 + 3_000 / (cfg.lease_ms / 5);
+        assert!(
+            puts <= max_puts as u32,
+            "3 s of hot strong reads sent {puts} lease-only PUTs, want at most {max_puts}"
+        );
+    });
+}
+
 /// Step of a [`run_lease_steps`] run.
 #[derive(Clone, Copy, Debug)]
 enum LeaseStep {

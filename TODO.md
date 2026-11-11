@@ -520,15 +520,6 @@ only.
       `PUT` failed, the node does not send a commit notice (`Shared::committed`)
       or start event maintenance (`Shared::events_changed`). Change-feed
       waiters on other nodes find the commit at their next poll.
-- [ ] [tangential · Lease] **Request the read lease after a landed ambiguous
-      `PUT` on a read-heavy database.** After the store applies an ambiguous
-      manifest `PUT`, the committer requests a lease-only `PUT` with the 5 s
-      commit lease (SPEC §5.5). If no strong read requests the read lease
-      before that `PUT`, a read-heavy database sends a second lease-only `PUT`
-      about 3.5 s later for the 15 s read lease. One `PUT` with the read lease
-      is sufficient. The saving is not measured. It is at most one `PUT` for
-      each landed ambiguous `PUT`. `examples/ambiguous_put_cost.rs` can
-      measure it.
 - [ ] [tangential · API] **Return `200` if a retried database deletion
       completes cleanup.** Return `200` instead of `404 not_found` if a
       retried `DELETE /v1/dbs/{db}` finishes an interrupted database deletion.

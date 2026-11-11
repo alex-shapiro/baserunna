@@ -1,11 +1,10 @@
-//! Verifies that event data acknowledged by the HTTP API survives schema changes that commit while
-//! a bulk insert or a retention drop is in flight (TODO.md items "Reject binds if a target column
-//! was dropped after validation" and "Recheck table retention before committing expired-part
-//! drops").
+//! Verifies that acknowledged event data is preserved across concurrent schema changes.
+//! This file tests column drops during bulk inserts and retention changes during expired-part drops
+//! (TODO.md items "Reject binds if a target column was dropped after validation" and
+//! "Recheck table retention before committing expired-part drops").
 //!
-//! Each test drives one node with production defaults through the HTTP API. The store adds
-//! [`STORE_LATENCY_MS`] to each request, as an object store does; with 0 ms latency every commit
-//! completes at one instant of the test clock, and no request can arrive inside a window.
+//! Each test drives a single node with production defaults through the HTTP API. The store adds
+//! [`STORE_LATENCY_MS`] to each request so that concurrent requests can overlap in test-clock time.
 
 use baserunna::sim::cost::{Resp, World, call_router, run_paused};
 use bytes::Bytes;
@@ -65,7 +64,7 @@ async fn strong_rows(w: &World, token: &str, columns: &[&str], from: i64, to: i6
 // Bind after a column drop
 // ---------------------------------------------------------------------------------------------
 
-/// Schema change on column `x` while a bulk insert that carries `x` values is buffered.
+/// Schema change on column `x` while a bulk insert that includes `x` values is buffered.
 #[derive(Clone, Copy, Debug)]
 enum ColumnChange {
     None,
@@ -76,35 +75,34 @@ enum ColumnChange {
 const BULK_ROWS: i64 = 4;
 const BULK_TIME_MS: i64 = 1_749_000_000_000;
 
-/// What the client saw after a bulk insert raced with a column change.
+/// Client-observed state after a bulk insert races with a column change.
 #[derive(Debug)]
 struct BindRace {
     insert_status: u16,
     insert_body: String,
     insert_version: Option<u64>,
     insert_answered_ms: u64,
-    /// Arrival time and commit version of the drop response, then of the re-add response.
+    /// Arrival time and commit version of each column change response.
     change_answers: Vec<(u64, u64)>,
     /// `[time, x]` of each row, or `[time]` if `x` is dropped.
     rows: Result<Vec<Json>, String>,
 }
 
 impl BindRace {
-    /// Returns true if the insert committed at a later version than the last column change, so
-    /// its rows were bound while the current column `x` existed.
+    /// Returns true if the insert committed at a version after the last column change.
     fn committed_after_change(&self) -> bool {
         let last_change = self.change_answers.last().map_or(0, |(_, v)| *v);
         (200..300).contains(&self.insert_status) && self.insert_version.is_some_and(|v| v > last_change)
     }
 
-    /// Returns true if the insert committed after the column change and a row reads `x` as null.
+    /// Returns true if the insert committed after the column change and a row returns null for `x`.
     fn lost_values(&self) -> bool {
         let rows = self.rows.as_deref().unwrap_or_default();
         self.committed_after_change() && rows.iter().any(|r| r.get(1).is_some_and(Json::is_null))
     }
 }
 
-/// Sends a bulk insert of [`BULK_ROWS`] rows with `x` values, then `change` after `change_after_ms`.
+/// Sends a bulk insert of [`BULK_ROWS`] rows with `x` values, then applies `change` after `change_after_ms`.
 fn bind_race(latency_ms: u64, change: ColumnChange, change_after_ms: u64) -> BindRace {
     run_paused(async move {
         let table = json!({"name": "ev", "columns": [{"name": "time", "type": "time"}, {"name": "x", "type": "int"}],
@@ -144,8 +142,7 @@ fn bind_race(latency_ms: u64, change: ColumnChange, change_after_ms: u64) -> Bin
     })
 }
 
-/// Asserts the correct outcome: the insert fails, or every inserted row reads back, with its `x`
-/// value if the insert committed after the column change.
+/// Asserts that the insert either fails or preserves every inserted row and its `x` value.
 fn assert_insert_kept_or_rejected(race: &BindRace, change: ColumnChange) {
     eprintln!("{change:?}: {race:?}");
     if !(200..300).contains(&race.insert_status) {
@@ -160,7 +157,7 @@ fn assert_insert_kept_or_rejected(race: &BindRace, change: ColumnChange) {
             xs,
             expected.iter().collect::<Vec<_>>(),
             "the insert committed after the column change {:?} and was acknowledged with {} {}, \
-             but its x values read back as {xs:?}",
+             but its x values were read back as {xs:?}",
             race.change_answers,
             race.insert_status,
             race.insert_body
@@ -188,7 +185,7 @@ fn bulk_insert_keeps_x_values_after_a_column_drop_and_re_add() {
     assert_insert_kept_or_rejected(&race, ColumnChange::DropAndReAdd);
 }
 
-/// Measures the window: the delays after the insert at which a drop and re-add loses `x` values.
+/// Tests column drops and re-adds across a range of delays after a bulk insert starts.
 #[test]
 #[ignore = "TODO.md: Reject binds if a target column was dropped after validation"]
 fn bulk_insert_keeps_x_values_at_every_drop_and_re_add_delay() {
@@ -211,7 +208,7 @@ fn bulk_insert_keeps_x_values_at_every_drop_and_re_add_delay() {
             }
         }
     }
-    assert!(lost.is_empty(), "acknowledged x values read as null at (latency ms, change delay ms) {lost:?}");
+    assert!(lost.is_empty(), "acknowledged x values were read as null at (latency ms, change delay ms) {lost:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -220,23 +217,23 @@ fn bulk_insert_keeps_x_values_at_every_drop_and_re_add_delay() {
 
 const OLD_ROWS: usize = 10;
 
-/// How background maintenance starts in a retention race.
+/// Operation that triggers background maintenance in a retention race.
 #[derive(Clone, Copy, Debug)]
 enum MaintenanceTrigger {
     /// A transactional insert of 1 row.
     SmallInsert,
-    /// A transactional insert of more than `event_seal_bytes` (128 KiB), so maintenance seals the
-    /// unsealed rows between planning and committing the drop.
+    /// A transactional insert exceeding `event_seal_bytes` (128 KiB), which causes maintenance to
+    /// seal rows between planning and committing the expired-part drop.
     SealingInsert,
 }
 
-/// One strong row query and one strong table read that a client sent during a retention race.
+/// Result of a strong row query and a strong table read during a retention race.
 #[derive(Debug)]
 struct RetentionAnswer {
     sent_ms: u64,
     answered_ms: u64,
     old_rows: Result<usize, String>,
-    /// Version of the table read, and whether it listed the part of the old rows.
+    /// Version of the table read and whether it includes the expired part.
     table_version: u64,
     has_old_part: bool,
 }
@@ -250,8 +247,8 @@ struct RetentionRace {
 }
 
 impl RetentionRace {
-    /// Returns `(seen_ms, gone_ms)` if a strong query sent after the retention change was
-    /// answered returned the old rows, and a later one did not.
+    /// Returns `(seen_ms, gone_ms)` if a strong query sent after the retention change returned
+    /// the old rows and a subsequent query did not.
     fn visible_then_gone(&self) -> Option<(u64, u64)> {
         let mut seen = None;
         for a in self.answers.iter().filter(|a| a.sent_ms >= self.clear_answered_ms) {
@@ -268,7 +265,7 @@ impl RetentionRace {
         self.answers.last().is_some_and(|a| a.old_rows == Ok(OLD_ROWS))
     }
 
-    /// Returns the last table version that listed the old part and the first that did not.
+    /// Returns the last table version with the old part and the first table version without it.
     fn drop_bounds(&self) -> (Option<u64>, Option<u64>) {
         let last_with = self.answers.iter().filter(|a| a.has_old_part).map(|a| a.table_version).max();
         let first_without = self.answers.iter().filter(|a| !a.has_old_part).map(|a| a.table_version).min();
@@ -281,8 +278,7 @@ impl RetentionRace {
         first_without.is_some() && last_with.is_some_and(|v| v >= self.clear_version)
     }
 
-    /// Returns true if the drop committed at a version before the retention change. Each commit
-    /// has its own version, so a table read at the change's version without the part proves it.
+    /// Returns true if the drop committed at a version before the retention change.
     fn dropped_before_change(&self) -> bool {
         self.drop_bounds().1.is_some_and(|v| v <= self.clear_version)
     }
@@ -307,9 +303,8 @@ async fn table_has_old_part(w: &World, token: &str, old_to: i64) -> (u64, bool) 
     (j["version"].as_u64().unwrap_or(0), has_old)
 }
 
-/// Bulk-inserts [`OLD_ROWS`] rows into a table with 1 h retention, waits until they expire,
-/// starts maintenance with `trigger`, and clears the retention `clear_after_ms` after the trigger
-/// is answered. A client sends a strong row query and a strong table read every 1 ms for 2 s.
+/// Inserts [`OLD_ROWS`] rows with 1 h retention, waits for them to expire, triggers maintenance,
+/// and clears retention after `clear_after_ms`. Polls strong queries every 1 ms for 2 s.
 fn retention_race(latency_ms: u64, trigger: MaintenanceTrigger, clear_after_ms: u64) -> RetentionRace {
     run_paused(async move {
         let table = json!({"name": "ev", "columns": [{"name": "time", "type": "time"}, {"name": "pad", "type": "string"}],
@@ -379,8 +374,7 @@ fn summary(race: &RetentionRace) -> String {
     )
 }
 
-/// Asserts the correct outcome: the old rows are kept unless the drop committed before the
-/// retention change.
+/// Asserts that the old rows are preserved unless the drop committed before the retention change.
 fn assert_rows_kept_after_change(label: &str, race: &RetentionRace) {
     eprintln!("{label}: {}", summary(race));
     let mut last = None;
@@ -410,7 +404,7 @@ fn clearing_retention_during_a_small_maintenance_round_keeps_the_rows() {
     assert_rows_kept_after_change("small trigger, clear after 0 ms", &race);
 }
 
-/// Measures the window: the delays after the trigger at which clearing retention loses the rows.
+/// Tests clearing retention across a range of delays after maintenance starts.
 #[test]
 #[ignore = "TODO.md: Recheck table retention before committing expired-part drops"]
 fn clearing_retention_at_every_delay_keeps_the_rows() {

@@ -920,13 +920,13 @@ fn commit_applied_by_ambiguous_manifest_put_is_not_marked_replayed() {
     });
 }
 
-/// Object store wrapper where the next `failed_manifest_puts` manifest writes return an error and
-/// apply later, on [`LateManifestPutStore::apply_late_puts`], with their original precondition.
+/// Object store wrapper that fails the next `failed_manifest_puts` manifest writes and buffers them.
+/// [`LateManifestPutStore::apply_late_puts`] applies those writes with their original preconditions.
 struct LateManifestPutStore {
     mem: Arc<MemStore>,
     failed_manifest_puts: AtomicU32,
     late_puts: Mutex<Vec<(String, Bytes, PutMode)>>,
-    /// Applies the late writes when the next manifest write arrives, before that write.
+    /// Applies the buffered writes before the next manifest write.
     apply_late_puts_on_next_put: std::sync::atomic::AtomicBool,
     manifest_put_rejected: tokio::sync::Notify,
 }
@@ -976,7 +976,7 @@ impl ObjectStore for LateManifestPutStore {
     }
 }
 
-/// Nodes A and B share one store. A holds the lease and commits `k=new`.
+/// Starts two nodes on a shared [`LateManifestPutStore`].
 fn late_manifest_put_nodes() -> (Arc<Engine>, Arc<Engine>, Arc<LateManifestPutStore>) {
     let env = Arc::new(Env::sim(11, 1_700_000_000_000, Instant::now(), 0));
     let clock = env.clone();
@@ -999,8 +999,8 @@ async fn commit_new(db: Arc<Db>) -> crate::error::Result<Committed> {
     db.commit_detailed(t.into_request()).await
 }
 
-/// Polls strong reads on `db` every `every_ms` until one returns `new`. Returns the elapsed
-/// milliseconds, and the milliseconds until `db` stopped holding a lease, checked every 1 ms.
+/// Polls strong reads on `db` every `every_ms` until a read returns `new`.
+/// Returns the elapsed milliseconds and the time when `db` lost its lease.
 async fn ms_until_strong_read_is_new(db: &Arc<Db>, every_ms: u64) -> (u64, Option<u64>) {
     let start = Instant::now();
     let mut lease_lost_ms = None;
@@ -1018,8 +1018,7 @@ async fn ms_until_strong_read_is_new(db: &Arc<Db>, every_ms: u64) -> (u64, Optio
     }
 }
 
-/// A manifest write that failed, applied after the commit ended with an unknown outcome and a
-/// strong read revalidated the old manifest.
+/// Tests strong reads if a failed manifest write is applied after an unknown commit outcome.
 fn strong_read_after_late_manifest_put_once_unknown(poll_every_ms: u64) {
     rt().block_on(async {
         let (a, b, store) = late_manifest_put_nodes();
@@ -1031,14 +1030,14 @@ fn strong_read_after_late_manifest_put_once_unknown(poll_every_ms: u64) {
         store.failed_manifest_puts.store(a.shared.cfg.commit_retry_max, SeqCst);
         let outcome = commit_new(db_a.clone()).await;
         assert!(matches!(outcome, Err(Error::Unavailable { outcome_unknown: true, .. })), "answered {outcome:?}");
-        assert_eq!(strong_get(&db_a, "k").await, Some(inline("old")), "setup: the late write has not landed");
+        assert_eq!(strong_get(&db_a, "k").await, Some(inline("old")), "setup: the late write was not applied yet");
         let landed_after_lease_ms = leased_at.elapsed().as_millis();
         let applied = store.apply_late_puts();
-        assert!(applied[0].is_ok(), "setup: the first late write applies, got {applied:?}");
+        assert!(applied[0].is_ok(), "setup: the first late write is applied, got {applied:?}");
         assert_eq!(strong_get(&db_b, "k").await, Some(inline("new")), "B reads the late write");
         let (stale_ms, lease_lost_ms) = ms_until_strong_read_is_new(&db_a, poll_every_ms).await;
         eprintln!(
-            "unknown outcome {outcome:?}; late write landed {landed_after_lease_ms} ms after A's lease; \
+            "unknown outcome {outcome:?}; late write applied {landed_after_lease_ms} ms after A's lease; \
              polled every {poll_every_ms} ms: A read the old value for {stale_ms} ms, held its lease for {lease_lost_ms:?} ms"
         );
         assert_eq!(stale_ms, 0, "A read the old value for {stale_ms} ms after B read the new value");
@@ -1057,8 +1056,7 @@ fn hot_strong_read_after_late_manifest_put_once_unknown_is_new() {
     strong_read_after_late_manifest_put_once_unknown(10);
 }
 
-/// A manifest write that failed, applied after the committer revalidated the old manifest and
-/// before its retry, which the store rejects with `412`.
+/// Tests strong reads if a failed manifest write is applied before a commit retry.
 #[test]
 #[ignore = "TODO.md blocker: Stale strong read"]
 fn strong_read_after_late_manifest_put_during_retry_is_new() {

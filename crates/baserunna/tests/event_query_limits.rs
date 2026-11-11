@@ -249,7 +249,7 @@ fn concurrent_event_queries_respect_node_memory_budget() {
 
 const HOURLY_FROM_MS: i64 = 1_650_000_000_000 / HOUR_MS * HOUR_MS;
 
-/// Creates table `ev` in database `db` with one event in each of `hours` hourly partitions, so it has `hours` parts.
+/// Creates table `ev` in database `db` with an event in each of `hours` hourly partitions.
 async fn setup_hourly_parts(w: &World, token: &str, db: &str, hours: usize) -> Json {
     w.create_db(0, token, db).await;
     create_event_table(
@@ -320,7 +320,7 @@ fn one_user_cannot_hold_every_query_slot() {
         assert_eq!(
             r.status,
             200,
-            "a user with one small query was refused while another user ran {slots} queries: {}",
+            "a user with a small query was rejected while another user ran {slots} queries: {}",
             excerpt(&r)
         );
         w.shutdown();
@@ -411,10 +411,10 @@ fn transactional_event_queries_get_the_event_query_deadline() {
 const BLOB_DAYS_FROM_MS: i64 = 1_740_000_000_000 / DAY_MS * DAY_MS;
 const BLOB_BYTES: usize = 60_000;
 const BLOB_ROWS_PER_INSERT: usize = 500;
-/// Bulk inserts per day; `event_merge_fan_in` of them merge into one part.
+/// Bulk inserts per day. `event_merge_fan_in` parts merge into a single part.
 const BLOB_INSERTS_PER_DAY: usize = 8;
 
-/// Unique string of `BLOB_BYTES` characters drawn from 2 letters, which compresses about 5x.
+/// Generates a unique string of `BLOB_BYTES` characters drawn from 2 letters.
 fn blob(row: u64) -> String {
     let mut s = format!("{row:016x}");
     let mut x = row.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -430,7 +430,7 @@ fn blob(row: u64) -> String {
     s
 }
 
-/// Creates table `blobs` in database `d` with one merged part per day for `days` days.
+/// Creates table `blobs` in database `d` with a merged part per day for `days` days.
 async fn setup_blob_parts(w: &World, token: &str, days: usize) -> Json {
     w.create_db(0, token, "d").await;
     create_event_table(

@@ -1,13 +1,13 @@
-//! Verifies that a client of a multi-node cluster never receives older data from a strong request
-//! than from a strong response it already received, after the object store applies a manifest
-//! `PUT` that returned an error (TODO.md blocker "Stale strong read").
+//! Verifies that strong reads never return older data after a client observes newer data.
+//! This file tests the case where the object store applies a manifest `PUT` after returning an error
+//! (TODO.md blocker "Stale strong read").
 //!
-//! Each test commits `k = old` and one event row, then commits `k = new` and a second event row on
+//! Each test commits `k = old` and an event row. It then commits `k = new` and a second event row on
 //! the lease holder while [`LateManifestPutStore`] fails every manifest `PUT` of that commit. The
 //! commit returns `503` with `outcome: "unknown"`. The store then applies the first failed `PUT`,
-//! which still matches the manifest ETag. Each test reads through one client-visible path until
-//! every node answers with the new data, and fails if an answer shows the old data after an
-//! earlier answer showed the new data.
+//! which still matches the manifest ETag. Each test reads through a client-visible path until
+//! every node answers with the new data. The test fails if a response shows the old data after an
+//! earlier response showed the new data.
 
 use axum::body::Body;
 use baserunna::cluster::{self, Transport, TransportError};
@@ -27,16 +27,16 @@ use tower::ServiceExt;
 
 const BASE_MS: u64 = 1_750_000_000_000;
 const QUERY_TO_MS: i64 = 9_999_999_999_999;
-/// Interval between two rounds of client requests after the late `PUT` applies.
+/// Interval between two rounds of client requests after the late `PUT` is applied.
 const ROUND_MS: u64 = 100;
 /// Maximum test-clock time for all nodes to answer with the new data.
 const SETTLE_MS: u64 = 30_000;
 
-/// Object store where the next manifest `PUT`s of one database return an error and apply later,
-/// on [`LateManifestPutStore::apply_late_puts`], with their original precondition.
+/// Object store wrapper that fails the next manifest `PUT`s of a database and buffers them.
+/// [`LateManifestPutStore::apply_late_puts`] applies those writes with their original preconditions.
 struct LateManifestPutStore {
     mem: Arc<MemStore>,
-    /// Manifest key and the number of its next `PUT`s that fail.
+    /// Manifest key and remaining failed `PUT` count.
     failing: Mutex<Option<(String, u32)>>,
     late_puts: Mutex<Vec<(String, Bytes, PutMode)>>,
 }
@@ -103,8 +103,8 @@ impl ObjectStore for LateManifestPutStore {
 #[derive(Default)]
 struct PeerNet {
     routers: BTreeMap<String, axum::Router>,
-    /// Number of the next forwarded client requests to each address that fail before delivery.
-    refused_forwards: BTreeMap<String, u32>,
+    /// Count of forwarded client requests per address that fail before delivery.
+    failed_forwards: BTreeMap<String, u32>,
 }
 
 struct PeerTransport(Arc<Mutex<PeerNet>>);
@@ -112,18 +112,18 @@ struct PeerTransport(Arc<Mutex<PeerNet>>);
 impl Transport for PeerTransport {
     fn call(&self, addr: &str, req: Request<Body>) -> BoxFut<'static, Result<Response<Body>, TransportError>> {
         let mut net = self.0.lock();
-        let refused = req.uri().path().starts_with("/v1/dbs/")
-            && net.refused_forwards.get_mut(addr).is_some_and(|n| {
-                let refuse = *n > 0;
+        let failed = req.uri().path().starts_with("/v1/dbs/")
+            && net.failed_forwards.get_mut(addr).is_some_and(|n| {
+                let fail = *n > 0;
                 *n = n.saturating_sub(1);
-                refuse
+                fail
             });
         let router = net.routers.get(addr).cloned();
         drop(net);
         Box::pin(async move {
             let undelivered = |m: &str| TransportError { message: m.into(), maybe_delivered: false };
-            if refused {
-                return Err(undelivered("connection refused"));
+            if failed {
+                return Err(undelivered("connection reset"));
             }
             let router = router.ok_or_else(|| undelivered("unknown peer"))?;
             match router.oneshot(req).await {
@@ -138,7 +138,7 @@ fn peer_addr(i: usize) -> String {
     format!("peer://n{i}")
 }
 
-/// Nodes with production defaults that share one [`LateManifestPutStore`].
+/// Nodes with production defaults that share a [`LateManifestPutStore`].
 struct Cluster {
     store: Arc<LateManifestPutStore>,
     net: Arc<Mutex<PeerNet>>,
@@ -183,15 +183,15 @@ impl Cluster {
         self.nodes.iter().position(|n| n.id == holder).expect("the lease holder is a node")
     }
 
-    /// Returns the rendezvous home node of `db_id` in the membership that node `i` sees.
+    /// Returns the rendezvous home node of `db_id` in the membership view of node `i`.
     fn home_seen_by(&self, i: usize, db_id: &str) -> usize {
         let live = self.nodes[i].live_members();
         let home = cluster::rendezvous(db_id, &live).expect("a live node").id.clone();
         self.nodes.iter().position(|n| n.id == home).expect("the home is a node")
     }
 
-    fn refuse_forwards_to(&self, i: usize, n: u32) {
-        self.net.lock().refused_forwards.insert(peer_addr(i), n);
+    fn fail_forwards_to(&self, i: usize, n: u32) {
+        self.net.lock().failed_forwards.insert(peer_addr(i), n);
     }
 
     fn shutdown(&self) {
@@ -205,20 +205,19 @@ fn excerpt(r: &Resp) -> String {
     String::from_utf8_lossy(&r.body[..r.body.len().min(300)]).into_owned()
 }
 
-/// Relation between the lease holder and the rendezvous home node of the database.
+/// Relationship between the lease holder and the rendezvous home node of the database.
 #[derive(Clone, Copy, Debug)]
 enum Home {
-    /// The lease holder is the home node, as after the first request to a database.
+    /// The lease holder is the home node.
     LeaseHolder,
-    /// The second node joined after the first node took the lease and is the home node, as for
-    /// about half of the busy databases after a node joins.
+    /// A newly joined node is the home node while the first node holds the lease.
     JoinedNode,
 }
 
-/// Client request whose answer shows either the old or the new data.
+/// Client request that returns either the old or the new data.
 #[derive(Clone, Copy, Debug)]
 enum Probe {
-    /// `GET /kv/k` with the default strong consistency.
+    /// `GET /kv/k` with strong consistency.
     StrongGet(usize),
     /// Strong change-feed long poll from the cursor after `k = old`.
     ChangeFeed(usize),
@@ -228,10 +227,10 @@ enum Probe {
     StrongEventCount(usize),
 }
 
-/// One answer that a client received.
+/// Response recorded from a client probe.
 #[derive(Debug)]
 struct Answer {
-    /// Test-clock milliseconds since the late `PUT` applied; negative before.
+    /// Test-clock milliseconds relative to when the late `PUT` is applied.
     at_ms: i64,
     probe: Probe,
     status: u16,
@@ -239,8 +238,7 @@ struct Answer {
     detail: String,
 }
 
-/// A database where the lease holder committed `k = new` with an unknown outcome, and the
-/// store has not yet applied the failed manifest `PUT`.
+/// State of a database after `k = new` fails with an unknown outcome.
 struct LateCommit {
     c: Cluster,
     token: String,
@@ -289,7 +287,7 @@ async fn late_commit(home: Home) -> LateCommit {
     let (c, token, db, db_id) = match home {
         Home::LeaseHolder => {
             let c = Cluster::start(2).await;
-            // Waits until each node lists the other as a member, so both agree on the home node.
+            // Wait until both nodes list each other and agree on the home node.
             tokio::time::sleep(Duration::from_millis(c.nodes[0].cfg.members_refresh_ms + 1_000)).await;
             let token = signup(&c).await;
             let db_id = create_db_with_old_data(&c, &token, "d").await;
@@ -307,7 +305,7 @@ async fn late_commit(home: Home) -> LateCommit {
                 .into_iter()
                 .find(|(_, id)| c.home_seen_by(joined, id) == joined)
                 .expect("setup: the joined node is the home node of a database");
-            // Renews the first node's lease, as on a busy database.
+            // Renew the lease on the first node.
             let renew = json!({"ops": [{"op": "put", "key": "k", "value": "old"}]});
             let r = c.call(0, "POST", &format!("/v1/dbs/{db}/txn"), &token, renew).await;
             assert_eq!(r.status, 200, "{}", excerpt(&r));
@@ -352,10 +350,10 @@ async fn signup(c: &Cluster) -> String {
 }
 
 impl LateCommit {
-    /// Applies the first failed manifest `PUT`, which still matches the stored manifest.
+    /// Applies the buffered manifest `PUT`s. The first `PUT` matches the stored manifest ETag.
     fn apply_late_put(&mut self) {
         let applied = self.c.store.apply_late_puts();
-        assert!(applied.first().is_some_and(Result::is_ok), "setup: the first late PUT applies: {applied:?}");
+        assert!(applied.first().is_some_and(Result::is_ok), "setup: the first late PUT is applied: {applied:?}");
         self.applied_at = Some(Instant::now());
         eprintln!(
             "late PUT applied {} ms after the 503; later late PUTs: {:?}",
@@ -407,7 +405,7 @@ impl LateCommit {
         shows_new
     }
 
-    /// Asks `round` every [`ROUND_MS`] until every probe of one round shows the new data.
+    /// Runs `round` every [`ROUND_MS`] until all probes in a round return the new data.
     async fn ask_until_new(&mut self, round: &[Probe]) {
         let start = Instant::now();
         loop {
@@ -423,7 +421,7 @@ impl LateCommit {
         }
     }
 
-    /// Prints the answers and asserts that no answer shows old data after an answer showed new data.
+    /// Prints all responses and asserts that none returned old data after an earlier response returned new data.
     fn assert_no_answer_goes_back(&self, path: &str) {
         let first_new = self.answers.iter().position(|a| a.shows_new);
         let mut went_back = Vec::new();
@@ -456,21 +454,21 @@ impl LateCommit {
     }
 }
 
-/// Runs the late commit for `home`, applies the late `PUT`, and asks `round` until it settles.
-fn check_path(path: &str, home: Home, round: fn(&LateCommit) -> Vec<Probe>, refused_forwards: u32) {
+/// Runs the late commit for `home`, applies the late `PUT`, and polls `round` until all probes return new data.
+fn check_path(path: &str, home: Home, round: fn(&LateCommit) -> Vec<Probe>, failed_forwards: u32) {
     run_paused(async {
         let mut lc = late_commit(home).await;
         let probes = round(&lc);
         lc.ask(Probe::StrongGet(lc.holder)).await;
         lc.apply_late_put();
-        lc.c.refuse_forwards_to(lc.holder, refused_forwards);
+        lc.c.fail_forwards_to(lc.holder, failed_forwards);
         lc.ask_until_new(&probes).await;
         lc.c.shutdown();
         lc.assert_no_answer_goes_back(path);
     });
 }
 
-// (i) Plain strong `GET` on the other node, then on the lease holder.
+// (i) Strong `GET` on the other node, followed by a strong `GET` on the lease holder.
 
 #[test]
 fn strong_gets_never_go_back_when_the_lease_holder_is_home() {
@@ -492,7 +490,7 @@ fn strong_gets_never_go_back_after_a_node_joins() {
     );
 }
 
-// (ii) Strong change-feed long poll, which goes to the home node, then a strong `GET`.
+// (ii) Strong change-feed long poll on the home node, followed by a strong `GET`.
 
 #[test]
 fn change_feed_then_strong_get_never_go_back_when_the_lease_holder_is_home() {
@@ -515,7 +513,7 @@ fn change_feed_then_strong_get_never_go_back_after_a_node_joins() {
     );
 }
 
-// (iii) The writer resolves its unknown outcome, then reads its write.
+// (iii) Commit status check, followed by a strong `GET`.
 
 #[test]
 fn writer_reads_its_write_after_commit_status_is_committed() {
@@ -527,7 +525,7 @@ fn writer_reads_its_write_after_commit_status_is_committed() {
     );
 }
 
-// (iv) Strong event queries, which the receiving node serves without forwarding.
+// (iv) Strong event queries, which the receiving node serves locally.
 
 #[test]
 #[ignore = "TODO.md blocker: Stale strong read"]
@@ -540,7 +538,7 @@ fn strong_event_queries_never_go_back() {
     );
 }
 
-// (v) The other node serves the read itself because one forward to the lease holder failed.
+// (v) Strong `GET` served locally by the other node after a forward to the lease holder fails.
 
 #[test]
 #[ignore = "TODO.md blocker: Stale strong read"]

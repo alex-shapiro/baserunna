@@ -31,7 +31,7 @@ pub struct StoreFaults {
     /// Probability that a write response is delayed by `late_reply_ms` after the write is applied.
     pub p_late_reply: f64,
     pub late_reply_ms: (u64, u64),
-    /// Probability that a write fails with an error and is applied `late_apply_ms` later.
+    /// Probability that a write fails and is applied `late_apply_ms` later.
     pub p_late_apply: f64,
     pub late_apply_ms: (u64, u64),
 }
@@ -386,9 +386,13 @@ mod tests {
             assert!(matches!(put(b"v2", &etag).await, Err(StoreError::Unavailable(_))));
             assert!(matches!(put(b"v3", &etag).await, Err(StoreError::Unavailable(_))));
             let read = || mem.get_sync("k", &GetOpts::default()).unwrap().data;
-            assert_eq!(read(), Bytes::from_static(b"v1"), "a late put applied before its delay");
+            assert_eq!(read(), Bytes::from_static(b"v1"), "a late put was applied before its delay");
             tokio::time::sleep(Duration::from_millis(1_100)).await;
-            assert_eq!(read(), Bytes::from_static(b"v2"), "the first late put applies; the second fails its If-Match");
+            assert_eq!(
+                read(),
+                Bytes::from_static(b"v2"),
+                "the first late put is applied; the second fails its If-Match"
+            );
         });
     }
 }

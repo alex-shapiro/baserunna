@@ -203,15 +203,17 @@ impl GaugeSampler {
     }
 }
 
-/// Event table with a time column that defaults to the insert time, so `{}` is a valid event.
+/// Event table with a time column that defaults to the insert time.
 fn defaulted_time_table(name: &str) -> Json {
     json!({"name": name, "columns": [{"name": "time", "type": "time", "default": "now"},
         {"name": "user", "type": "string"}, {"name": "event", "type": "string"}],
         "time_column": "time", "order_by": ["time"]})
 }
 
-/// Small row shapes of a transactional or bulk event insert, from the smallest valid event upward.
-const ROW_SHAPES: &[(&str, fn(usize) -> String)] = &[
+type RowShape = (&'static str, fn(usize) -> String);
+
+/// Small row shapes for transactional and bulk event inserts.
+const ROW_SHAPES: &[RowShape] = &[
     ("{}", |_| "{}".to_string()),
     ("{\"event\":\"x\"}", |_| r#"{"event":"x"}"#.to_string()),
     ("user event", |i| {
@@ -219,7 +221,7 @@ const ROW_SHAPES: &[(&str, fn(usize) -> String)] = &[
     }),
 ];
 
-/// Body of a `/txn` request with one `insert_events` op whose rows fill at most `max_bytes`.
+/// Body of a `/txn` request with an `insert_events` op whose rows fill at most `max_bytes`.
 fn txn_insert_body(table: &str, max_bytes: usize, row: fn(usize) -> String) -> (String, usize) {
     let head = format!(r#"{{"ops":[{{"op":"insert_events","table":"{table}","rows":"#);
     let (rows, n) = json_rows(max_bytes - head.len() - 3, row);
@@ -237,7 +239,7 @@ fn txn_event_insert_parse_stays_near_body_size() {
         create_event_table(&w, &t, "d", defaulted_time_table("ev")).await;
         let limit = w.node(0).cfg.max_json_body;
         let mut measured = Vec::new();
-        // The body is parsed before its rows are validated, so rows with unknown columns are as costly as valid rows.
+        // The body is parsed before row validation, so unknown columns cost as much as valid rows.
         let unknown_column: (&str, fn(usize) -> String) = ("{\"a\":1}", |_| r#"{"a":1}"#.to_string());
         for &(shape, row) in ROW_SHAPES.iter().chain([&unknown_column]) {
             for size_mib in [4, 8, 16, 32] {
@@ -273,10 +275,10 @@ fn txn_event_insert_parse_stays_near_body_size() {
     });
 }
 
-/// Bulk insert bodies at most this size, just under the 32 MiB body limit.
+/// Maximum bulk insert body size used in tests, below the 32 MiB limit.
 const BULK_BODY_BYTES: usize = 30 * MIB;
 
-/// Runs `f` on a multi-thread runtime with a real clock, as production serves requests.
+/// Runs `f` on a multi-thread runtime with a real clock.
 fn run_threaded<F: std::future::Future>(f: F) -> F::Output {
     let level = baserunna::log::level();
     baserunna::log::set_level(Some(baserunna::log::Level::Error));
@@ -300,7 +302,7 @@ fn concurrent_bulk_inserts_respect_node_memory_budget() {
         );
         let mut measured = Vec::new();
         for &(shape, row) in ROW_SHAPES.iter().filter(|(s, _)| *s != "{\"event\":\"x\"}") {
-            // A 4 MiB request first estimates the heap per body byte so that the larger requests stay in RAM.
+            // Run a 4 MiB request first to estimate the heap usage per body byte.
             let (w, t) = bulk_world().await;
             let (small, _) = json_rows(4 * MIB, row);
             let before = reset_peak();
@@ -316,7 +318,7 @@ fn concurrent_bulk_inserts_respect_node_memory_budget() {
                     eprintln!("rows {shape}: skipping {n} requests, which would need about {:.0} MiB", mib(single * n));
                     continue;
                 }
-                // A fresh node for each round so that merges of earlier parts do not overlap the measurement.
+                // Start a fresh node for each round so that earlier merges do not overlap the measurement.
                 let (w, t) = bulk_world().await;
                 let requests = vec![("/v1/dbs/d/events/ev/rows".to_string(), body.clone()); n];
                 let gate_before = w.node(0).engine.shared.memory.used();
@@ -339,7 +341,7 @@ fn concurrent_bulk_inserts_respect_node_memory_budget() {
                     mib(gate_growth),
                 );
                 if let Some(o) = out.iter().find(|o| o.status != 201) {
-                    eprintln!("  refused: {}", o.body);
+                    eprintln!("  rejected: {}", o.body);
                 }
                 let bound = close_bulk_world(w, &t).await;
                 eprintln!("  the table holds {bound} rows of the {} sent", n * rows);
@@ -361,7 +363,7 @@ fn concurrent_bulk_inserts_respect_node_memory_budget() {
     });
 }
 
-/// Starts a node with database `d` and event table `ev` whose time column defaults to the insert time.
+/// Starts a node with database `d` and event table `ev`.
 async fn bulk_world() -> (World, String) {
     let w = World::with_config(1, STORE_LATENCY_MS, production_limits).await;
     let t = w.signup(0, "d2@ingest.test").await;
@@ -370,7 +372,7 @@ async fn bulk_world() -> (World, String) {
     (w, t)
 }
 
-/// Waits until bulk insert flushes and maintenance stop, stops the node, and returns the rows in table `ev`.
+/// Waits for bulk insert flushes and maintenance to stop, stops the node, and returns the row count.
 async fn close_bulk_world(w: World, token: &str) -> u64 {
     let mut idle_for = 0;
     while idle_for < 3 {
@@ -382,7 +384,7 @@ async fn close_bulk_world(w: World, token: &str) -> u64 {
     rows
 }
 
-/// Request body that yields the frames sent on a channel and waits for more until the sender is dropped.
+/// Request body that yields frames from a channel until the sender is dropped.
 struct StalledBody {
     rx: tokio::sync::mpsc::Receiver<Bytes>,
     remaining: u64,
@@ -413,8 +415,7 @@ const STALLED_BODY_BYTES: usize = 16 * MIB;
 const STALLED_PREFIX_BYTES: usize = 8 * MIB;
 const STALL: Duration = Duration::from_secs(600);
 
-/// Sends `STALLED_PREFIX_BYTES` of a `STALLED_BODY_BYTES` body to `path`, stops sending for `STALL`, and returns
-/// whether a response arrived and how much of the heap the request still held.
+/// Sends a partial body to `path`, pauses for `STALL`, and returns the response status and retained heap bytes.
 async fn stall_request_body(w: &World, token: &str, path: &str) -> (Option<u16>, isize) {
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
     let body = StalledBody { rx, remaining: STALLED_BODY_BYTES as u64 };
@@ -583,10 +584,10 @@ fn small_event_table(name: &str) -> Json {
         {"name": "e", "type": "string"}], "time_column": "t", "order_by": ["t"]})
 }
 
-/// Bulk inserts that each create one part; `event_merge_fan_in` parts of one tier start a merge.
+/// Bulk inserts that each create a single part. `event_merge_fan_in` parts of a tier start a merge.
 const PARTS_BEFORE_TRIGGER: usize = 7;
 
-/// Inserts `rows` events in the merge day into `table` as `PARTS_BEFORE_TRIGGER` parts of one size tier.
+/// Inserts `rows` events into `table` as `PARTS_BEFORE_TRIGGER` parts of a size tier.
 async fn insert_merge_inputs(w: &World, token: &str, db: &str, table: &str, rows: usize, first_row: usize) {
     let per_part = rows.div_ceil(PARTS_BEFORE_TRIGGER);
     for p in 0..PARTS_BEFORE_TRIGGER {
@@ -597,7 +598,7 @@ async fn insert_merge_inputs(w: &World, token: &str, db: &str, table: &str, rows
     }
 }
 
-/// One-row bulk insert that adds the last part needed to start a merge.
+/// Single-row bulk insert that adds the final part needed to trigger a merge.
 fn trigger_body(i: usize) -> String {
     format!("[{}]", small_event(i))
 }
@@ -614,7 +615,7 @@ fn print_parts(info: &Json) {
     }
 }
 
-/// Waits until `PartsMerged` reaches `target` or `limit` of test-clock time passes, and returns the elapsed time.
+/// Waits until `PartsMerged` reaches `target` or `limit` elapses, and returns the elapsed time.
 async fn wait_for_merges(target: u64, limit: Duration) -> Option<Duration> {
     let started = Instant::now();
     while probe::count(Probe::PartsMerged) < target {
@@ -646,11 +647,10 @@ async fn settle_parts(w: &World, token: &str, db: &str, table: &str) -> Json {
     }
 }
 
-/// Rows of each bulk insert that builds a merge measurement; each insert creates exactly one part.
+/// Rows per bulk insert during merge setup. Each insert creates a single part.
 const ROWS_PER_INSERT: usize = 100_000;
 
-/// Builds a table of `rows` small events in one past partition and returns the heap peak of the settling merge
-/// that combines all of them into one part.
+/// Inserts `rows` small events into a past partition and returns the heap peak of the settling merge.
 async fn measure_merge(rows: usize) -> MergePeak {
     let w = World::with_config(1, 0, production_limits).await;
     let t = w.signup(0, "e@merge.test").await;
@@ -664,8 +664,7 @@ async fn measure_merge(rows: usize) -> MergePeak {
     let info = settle_parts(&w, &t, "d", "ev").await;
     eprintln!("{rows} rows after tier merges:");
     print_parts(&info);
-    // Maintenance runs after a bind, so a one-row insert into another day starts the settling merge once the
-    // partition has been quiet for `event_settle_ms`.
+    // Advance past `event_settle_ms` and insert a row into another day to trigger the settling merge.
     tokio::time::sleep(Duration::from_millis(w.node(0).cfg.engine.event_settle_ms) + Duration::from_secs(3600)).await;
     let merged = probe::count(Probe::PartsMerged);
     let before = reset_peak();
@@ -745,14 +744,13 @@ fn merge_memory_does_not_grow_with_rows() {
     });
 }
 
-/// Production limits with a merge time limit short enough that every merge fails.
+/// Production limits with a 1 ms merge timeout so that every merge fails.
 fn merges_time_out(c: &mut NodeConfig) {
     production_limits(c);
     c.engine.event_merge_max_ms = 1;
 }
 
-/// Store requests of database `db_id` caused by a one-row bulk insert into another partition and the
-/// maintenance that the insert schedules.
+/// Triggers maintenance with a single-row bulk insert and returns the store request counts for `db_id`.
 async fn trigger_maintenance(w: &World, token: &str, db_id: &str, row: usize) -> baserunna::sim::cost::Counts {
     let before = w.store.scope(db_id);
     let other_day = format!(r#"[{{"t":{},"u":"x","e":"x"}}]"#, MERGE_DAY_MS - 30 * DAY_MS + row as i64);

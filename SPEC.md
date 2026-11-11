@@ -13,7 +13,7 @@ scope for v1.
 
 - Commited data is never lost or reordered.
 - Transactions are strictly serializable by default. A client can request weaker guarantees.
-- Depends on object storage for durability, availability, and consistency, but verifies integrity independently.
+- Baserunna relies on object storage for durability, availability, and consistency. Baserunna verifies data integrity on its own.
 
 2. **Low cost**
 

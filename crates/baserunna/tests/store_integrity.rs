@@ -1,11 +1,9 @@
-//! Verifies that a node detects objects that the object store returns corrupt, truncated, or
-//! substituted, instead of serving wrong data or committing it (SPEC §1: "verifies integrity
-//! independently").
+//! Verifies that a node detects corrupt, truncated, or substituted objects from the object store.
 //!
-//! Each test stores data through the HTTP API, makes [`TamperStore`] return a damaged copy of one
-//! object, restarts the node so its caches are cold, and reads the data back through the HTTP API.
-//! A cell passes if the read fails or returns the written data. A cell fails if the read succeeds
-//! with other data, or if a write commits the damaged content.
+//! Each test stores data through the HTTP API, configures [`TamperStore`] to return a damaged object,
+//! restarts the node with cold caches, and reads the data back through the HTTP API. A test cell passes
+//! if the read fails or returns the written data. A test cell fails if the read returns wrong data or if
+//! a write commits the damaged content.
 
 use axum::body::Body;
 use baserunna::cluster::{Transport, TransportError};
@@ -36,7 +34,7 @@ use tower::ServiceExt;
 // Tampering object store
 // ---------------------------------------------------------------------------------------------
 
-/// Damage that [`TamperStore`] applies to every `GET` of one object.
+/// Fault that [`TamperStore`] applies to `GET` requests for a target object.
 #[derive(Clone, Debug)]
 enum Fault {
     /// Inverts the lowest bit of the byte at this offset.
@@ -52,7 +50,7 @@ enum Fault {
 }
 
 impl Fault {
-    /// Returns true if a `GET` of `range` of an object of `len` bytes returns damaged bytes.
+    /// Returns true if a `GET` for `range` on an object of `len` bytes returns damaged bytes.
     fn hits(&self, range: &Option<Range<u64>>, len: u64) -> bool {
         let r = range.clone().unwrap_or(0..len);
         match self {
@@ -227,7 +225,7 @@ impl Reply {
     }
 }
 
-/// One node on a [`TamperStore`], restartable with cold memory caches.
+/// Single node backed by [`TamperStore`] that can be restarted with cold memory caches.
 struct Deployment {
     mem: Arc<MemStore>,
     store: Arc<TamperStore>,
@@ -426,8 +424,7 @@ fn logged(capture: &log::Capture) -> String {
     }
 }
 
-/// Reads through the HTTP API after a restart with `fault` applied to `key`, and classifies the result
-/// with `check`, which returns `Err` if a successful reply holds other data than was written.
+/// Restarts the node with `fault` applied to `key`, runs `read`, and classifies the outcome with `check`.
 async fn probe(
     d: &mut Deployment,
     key: &str,
@@ -1205,7 +1202,8 @@ fn damaged_staged_blob_metadata_is_detected() {
         };
         let (other, _) = stage(&mut rng).await;
         let other_meta = d.object(&format!("dbs/{db}/blob/{}/meta", other["blob_id"].as_str().expect("id")));
-        let faults: Vec<(&str, Box<dyn Fn(&BlobMetaLayout, usize) -> Fault>)> = vec![
+        type MetaFault = Box<dyn Fn(&BlobMetaLayout, usize) -> Fault>;
+        let faults: Vec<(&str, MetaFault)> = vec![
             ("(a) flip blob id", Box::new(|l, _| Fault::FlipBit(l.id))),
             ("(a) flip size bit 0 (larger)", Box::new(|l, _| Fault::FlipBit(l.size))),
             ("(a) flip size bit 5 (smaller)", Box::new(|l, _| Fault::FlipBits { at: l.size, mask: 0x20 })),
@@ -1456,9 +1454,7 @@ fn substituted_event_part_of_equal_shape_is_detected() {
 #[test]
 fn damaged_levels_objects_are_detected() {
     run_paused(async {
-        // A levels object holds the deep segment list once it exceeds `levels_inline_max` (16)
-        // segments. Setting the limit to 0 stores every deep segment list in a levels object
-        // without writing 16 segments; the reader decodes and verifies the object the same way.
+        // Set `levels_inline_max` to 0 so that deep segment lists are stored in a levels object.
         let mut d = Deployment::start(|c| c.engine.levels_inline_max = 0, None).await;
         let kv = KvData::write(&d).await;
         let id = Manifest::decode(&d.object(&format!("dbs/{}/manifest", kv.big)))
@@ -1589,10 +1585,8 @@ fn damaged_disk_cache_files_fall_back_to_the_store() {
 // Event deletion masks
 // ---------------------------------------------------------------------------------------------
 
-/// Adds days 4 and 5 with 10,000 rows each and deletes the rows of 12 users from each: users 1, 5,
-/// ..., 45 on day 4, and users 3, 7, ..., 47 on day 5. Each part then has an external mask object
-/// of 2,400 deleted rows, below the half of the rows that starts a rewrite. Returns the mask object
-/// key of each day.
+/// Inserts 10,000 rows each on days 4 and 5, deletes 2,400 rows from each day, and returns the
+/// external mask object key for each day.
 async fn write_masks(d: &Deployment, e: &EventData) -> BTreeMap<i64, String> {
     for day in [4i64, 5] {
         let start = EVENTS_FROM_MS + day * DAY_MS;
@@ -1770,10 +1764,9 @@ fn persistent_segment_corruption_is_reported_and_backed_off() {
         let mut samples = vec![sample(&d, 0)];
         let mut statuses: BTreeMap<u16, u64> = BTreeMap::new();
         let mut live: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        // Phase 1: 1,000 commits at 1 per second that overwrite 50 keys, so the live data stays at
-        // 400 KiB. Phase 2: 1 hour without commits, so that a garbage collection sweep is due
-        // (`sweep_interval_ms`), then 200 more commits. Phase 3: a node restart, so that caches
-        // are cold, then 100 more commits.
+        // Phase 1: 1,000 commits at 1 per second that overwrite 50 keys.
+        // Phase 2: 1 hour without commits so a sweep is due, followed by 200 commits.
+        // Phase 3: a node restart with cold caches, followed by 100 commits.
         for i in 1..=1300u64 {
             if i == 1001 {
                 tokio::time::sleep(Duration::from_secs(3_700)).await;
@@ -1833,12 +1826,12 @@ fn persistent_segment_corruption_is_reported_and_backed_off() {
         eprintln!("metric keys: {:?}", metrics.as_object().map(|o| o.keys().collect::<Vec<_>>()));
 
         let good = live.iter().next().expect("a written key");
-        let good_read = get_key(&d, &token, "w", &good.0).await;
+        let good_read = get_key(&d, &token, "w", good.0).await;
         let bad_read = get_key(&d, &token, "w", "a0150").await;
         eprintln!(
             "read of an undamaged key: {} ({:?}); read of a key in the damaged block: {} {}",
             good_read.status,
-            check_value(&good_read, &good.1),
+            check_value(&good_read, good.1),
             bad_read.status,
             bad_read.excerpt()
         );
@@ -1846,9 +1839,9 @@ fn persistent_segment_corruption_is_reported_and_backed_off() {
         let last = samples.len() - 1;
         let late = (samples[last].corrupt_gets - samples[last - 1].corrupt_gets) as f64
             / (samples[last].commits - samples[last - 1].commits) as f64;
-        let signalled = maintenance_logs.keys().any(|k| k.starts_with("error") || k.starts_with("warn"));
+        let signaled = maintenance_logs.keys().any(|k| k.starts_with("error") || k.starts_with("warn"));
         assert!(
-            signalled && late < 0.1,
+            signaled && late < 0.1,
             "maintenance must report the failure at warn or error level and back off: default-level records \
              {maintenance_logs:?}; {late:.2} GETs of the corrupt segment per commit over the last window"
         );

@@ -716,7 +716,7 @@ Deleting a database marks its record as deleted in the system database. After a 
 There are two read consistency modes:
 
 - `snapshot` consistency serves reads from a cached serializable snapshot that is at most `max_staleness_ms` old (5 s by default). Each node caches its own snapshot, so a client that reads from different nodes can observe an older snapshot after a newer snapshot.
-- `strong` consistency guarantees linearizability. A node serves a strong read from cache if it holds a valid lease from a successful manifest `PUT` (§5.5) and it is not writing the manifest. Otherwise, the node sends `GET manifest If-None-Match: etag` first.
+- `strong` consistency guarantees linearizability. A node serves a strong read from cache if it holds a valid lease from a successful manifest `PUT` (§5.5) and it is not writing the manifest. Otherwise, the node sends `GET manifest If-None-Match: etag` first. A strong read can reuse a manifest check that started at or after the read started.
 
 ### 5.10 Size Quotas
 

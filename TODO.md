@@ -478,6 +478,10 @@ only.
         commits N+1 at T, and a second strong read on A starts at T, waits for
         the load lock, and accepts the reply.
 
+      Tests that hit case 1 advance the paused clock 1 ms before the read:
+      `ms_until_strong_read_is_new` in `engine/tests.rs` and `check_path` in
+      `tests/stale_strong_read.rs`. Without that advance, three lib tests and
+      three `stale_strong_read` tests fail.
       The losing candidate of the late-apply fix ordered equal instants with an
       `OrderedInstant` that pairs an `Instant` with a process-wide sequence
       number. A check answered a read only if the check started at or after the

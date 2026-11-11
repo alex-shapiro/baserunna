@@ -461,6 +461,9 @@ fn check_path(path: &str, home: Home, round: fn(&LateCommit) -> Vec<Probe>, fail
         let probes = round(&lc);
         lc.ask(Probe::StrongGet(lc.holder)).await;
         lc.apply_late_put();
+        // A paused clock does not advance between steps, and a real clock does not produce equal
+        // instants. Advance 1 ms so the next strong read does not reuse an earlier manifest check.
+        tokio::time::sleep(Duration::from_millis(1)).await;
         lc.c.fail_forwards_to(lc.holder, failed_forwards);
         lc.ask_until_new(&probes).await;
         lc.c.shutdown();

@@ -44,8 +44,8 @@ tokio::task_local! {
     static INVOKED_AT: Instant;
 }
 
-/// Runs `f` as a single operation invoked at `at`. Strong reads within the scope
-/// can reuse a manifest that [`Db::refresh`] accepts as validated after `at`.
+/// Runs `f` as a single operation invoked at `at` so strong reads within the scope
+/// can reuse a manifest validated at or after `at`.
 pub async fn invoked_at<F: std::future::Future>(at: Instant, f: F) -> F::Output {
     INVOKED_AT.scope(at, f).await
 }
@@ -193,15 +193,14 @@ impl LeasedView {
 /// A handle takes the lease only from a manifest `PUT` that returned success.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum OwnLease {
+    /// This node validates each strong read against storage. A new handle holds no lease. A manifest
+    /// `PUT` from this handle that fails also ends the lease, because the store can still apply the
+    /// `PUT`, or a `412` response showed that the cached manifest is old.
     #[default]
     NotHeld,
     /// The store holds the manifest at `write_seq`, which this handle wrote with this node's lease.
     /// This node serves strong reads from cache until `expires_at`.
     Held { write_seq: u64, expires_at: Instant },
-    /// A manifest `PUT` from this handle failed, and no later `PUT` succeeded. The store can still
-    /// apply a failed `PUT`, or a `412` response showed that the cached manifest is old. Therefore,
-    /// this node validates each strong read against storage.
-    Unconfirmed,
 }
 
 impl OwnLease {
@@ -458,7 +457,7 @@ impl Db {
 
     /// Records that a manifest `PUT` from this handle failed.
     fn fail_own_write(&self) {
-        let before = std::mem::replace(&mut self.st.lock().own_lease, OwnLease::Unconfirmed);
+        let before = std::mem::replace(&mut self.st.lock().own_lease, OwnLease::NotHeld);
         if before.has_time_left() {
             probe::hit(Probe::LeaseReadsStopped);
             self.shared.metrics.lease_reads_stopped();
@@ -648,10 +647,8 @@ impl Db {
         installed
     }
 
-    /// Returns a version validated after `not_before`, fetching the manifest from storage
+    /// Returns a version validated at or after `not_before`, fetching the manifest from storage
     /// if needed. Creates the database if `create` is true and the manifest does not exist.
-    /// Equal instants do not order the validation and the call, so a validation at `not_before`
-    /// counts only if this handle's lease is not [`OwnLease::Unconfirmed`].
     pub async fn refresh(self: &Arc<Self>, not_before: Instant, create: bool) -> Result<Arc<Version>> {
         Ok(self.refresh_at(not_before, create).await?.0)
     }
@@ -661,7 +658,7 @@ impl Db {
         let (etag, cur) = {
             let st = self.st.lock();
             if let (Some(c), Some(va)) = (&st.current, st.verified_at)
-                && (va > not_before || va == not_before && st.own_lease != OwnLease::Unconfirmed)
+                && va >= not_before
             {
                 return Ok((c.clone(), va));
             }

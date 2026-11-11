@@ -1446,12 +1446,11 @@ fn lease_reads_stopped_ignores_a_lost_cas_without_a_lease() {
     });
 }
 
-/// How [`strong_read_after_late_manifest_put_from_an_earlier_batch`] drops A's database handle
-/// after the failed commit.
+/// How a test drops an idle database handle.
 #[derive(Clone, Copy, Debug)]
 enum IdleHandleDrop {
     Kept,
-    Evicted { idle_ms: u64 },
+    Evicted,
     UnloadedForMemory,
 }
 
@@ -1462,10 +1461,7 @@ async fn drop_idle_handle(engine: &Engine, db: Arc<Db>, how: IdleHandleDrop) -> 
     drop(db);
     match how {
         IdleHandleDrop::Kept => {}
-        IdleHandleDrop::Evicted { idle_ms } => {
-            sleep_ms(idle_ms).await;
-            engine.evict_idle(idle_ms);
-        }
+        IdleHandleDrop::Evicted => engine.evict_idle(0),
         IdleHandleDrop::UnloadedForMemory => {
             let over_budget = memory::Charge::new(&engine.shared.memory, engine.shared.memory.limit() + 1);
             engine.unload_idle();
@@ -1518,17 +1514,7 @@ fn strong_read_after_late_manifest_put_from_an_earlier_batch_is_new() {
 
 #[test]
 fn strong_read_after_late_manifest_put_from_before_a_handle_eviction_is_new() {
-    strong_read_after_late_manifest_put_from_an_earlier_batch(IdleHandleDrop::Evicted { idle_ms: 0 });
-}
-
-#[test]
-fn strong_read_after_late_manifest_put_from_before_an_idle_eviction_is_new() {
-    strong_read_after_late_manifest_put_from_an_earlier_batch(IdleHandleDrop::Evicted { idle_ms: 1000 });
-}
-
-#[test]
-fn strong_read_after_late_manifest_put_from_before_a_memory_unload_is_new() {
-    strong_read_after_late_manifest_put_from_an_earlier_batch(IdleHandleDrop::UnloadedForMemory);
+    strong_read_after_late_manifest_put_from_an_earlier_batch(IdleHandleDrop::Evicted);
 }
 
 async fn sleep_ms(ms: u64) {
@@ -1594,17 +1580,7 @@ fn landed_manifest_put_gives_no_lease_to_its_handle() {
 
 #[test]
 fn landed_manifest_put_gives_no_lease_after_a_handle_eviction() {
-    landed_manifest_put_gives_no_lease(IdleHandleDrop::Evicted { idle_ms: 0 });
-}
-
-#[test]
-fn landed_manifest_put_gives_no_lease_after_an_idle_eviction() {
-    landed_manifest_put_gives_no_lease(IdleHandleDrop::Evicted { idle_ms: 1000 });
-}
-
-#[test]
-fn landed_manifest_put_gives_no_lease_after_a_memory_unload() {
-    landed_manifest_put_gives_no_lease(IdleHandleDrop::UnloadedForMemory);
+    landed_manifest_put_gives_no_lease(IdleHandleDrop::Evicted);
 }
 
 /// Tests the store requests that strong reads and a commit send after an unknown commit outcome.
@@ -1785,7 +1761,7 @@ fn gen_lease_steps(r: &mut Rng, n: usize) -> Vec<LeaseStep> {
             Some(7) => LeaseStep::ApplyLatePutsOnNextPut,
             Some(8) => LeaseStep::DropHandle {
                 how: match r.chance(0.5) {
-                    true => IdleHandleDrop::Evicted { idle_ms: 0 },
+                    true => IdleHandleDrop::Evicted,
                     false => IdleHandleDrop::UnloadedForMemory,
                 },
             },

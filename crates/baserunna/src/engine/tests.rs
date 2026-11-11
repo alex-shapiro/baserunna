@@ -921,7 +921,7 @@ fn commit_applied_by_ambiguous_manifest_put_is_not_marked_replayed() {
     });
 }
 
-/// Outcome of one manifest `PUT` in [`LateManifestPutStore`].
+/// Outcome of a manifest `PUT` in [`LateManifestPutStore`].
 #[derive(Clone, Copy, Debug)]
 enum ManifestPutOutcome {
     Applied,
@@ -984,7 +984,7 @@ impl LateManifestPutStore {
         late.into_iter().map(|(key, data, mode)| self.apply_manifest_put(&key, data, &mode)).collect()
     }
 
-    /// Applies the buffered write at `index`, or returns `None` if no write is buffered there.
+    /// Applies the buffered write at `index`, or returns `None` if `index` is out of bounds.
     fn apply_late_put(&self, index: usize) -> Option<SResult<String>> {
         let (key, data, mode) = {
             let mut late = self.late_puts.lock();
@@ -1398,8 +1398,8 @@ enum IdleHandleDrop {
     UnloadedForMemory,
 }
 
-/// Drops `db`, and lets `engine` drop its handle according to `how` if no task uses it. Returns the
-/// handle for the database, and whether `engine` dropped the old handle.
+/// Drops `db`, and lets `engine` drop its handle according to `how` if the handle is idle. Returns
+/// the handle for the database, and whether `engine` dropped the old handle.
 async fn drop_idle_handle(engine: &Engine, db: Arc<Db>, how: IdleHandleDrop) -> (Arc<Db>, bool) {
     let (id, old) = (db.id.clone(), Arc::downgrade(&db));
     drop(db);
@@ -1506,7 +1506,7 @@ fn assert_late_puts_rejected(store: &LateManifestPutStore) {
     );
 }
 
-/// Tests the store requests that strong reads and one commit cost after an unknown commit outcome.
+/// Tests the store requests that strong reads and a commit send after an unknown commit outcome.
 #[test]
 fn strong_reads_after_unknown_outcome_read_the_manifest_until_a_commit() {
     rt().block_on(async {
@@ -1534,7 +1534,7 @@ fn strong_reads_after_unknown_outcome_read_the_manifest_until_a_commit() {
     });
 }
 
-/// Tests the store requests that hot strong reads cost after an unknown commit outcome.
+/// Tests the store requests that hot strong reads send after an unknown commit outcome.
 #[test]
 fn hot_strong_reads_after_unknown_outcome_renew_the_lease_once() {
     rt().block_on(async {
@@ -1601,8 +1601,8 @@ enum LeaseStep {
     },
 }
 
-/// Generates `n` steps. Each seed disables a random subset of the step kinds other than `Advance`.
-/// This produces long step sequences that have no interfering write.
+/// Generates `n` steps. Each seed disables a random subset of the step kinds other than `Advance`
+/// so that some runs omit commits or lease renewals.
 fn gen_lease_steps(r: &mut Rng, n: usize) -> Vec<LeaseStep> {
     let mut weights = [8.0, 4.0, 6.0, 8.0, 12.0, 27.0, 10.0, 5.0, 5.0, 20.0];
     let advance = weights.len() - 1;

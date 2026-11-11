@@ -16,8 +16,8 @@ pub(crate) trait ManifestHistory {
 }
 
 /// Checks that the node of `db` stops relying on its lease before its lease term ends. Also checks
-/// that a lease-served view without an in-flight manifest write matches the stored manifest, and
-/// that no failed write can replace it.
+/// that a lease-served view without an in-flight manifest write matches the stored manifest and
+/// cannot be replaced by a failed write.
 pub(crate) fn check_lease_view(db: &Db, history: &impl ManifestHistory) -> Result<(), String> {
     let Some(view) = db.leased_view() else { return Ok(()) };
     if let Some(applied_at) = history.manifest_applied_at(&db.id, &view.etag) {

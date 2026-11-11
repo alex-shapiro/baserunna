@@ -471,11 +471,11 @@ only.
         the load lock, and accepts the reply.
 
       The losing candidate of the late-apply fix ordered equal instants with an
-      `OrderedInstant` (an `Instant` and a process-wide sequence number). A
-      check answered a read only if the check started at or after the read's
-      instant and finished after the read. That rule fixes case 1 with no
-      change to `tests/cost.rs`, but does not fix case 2. Ordering checks by
-      their start sequence fixes both cases, but increases
+      `OrderedInstant` that pairs an `Instant` with a process-wide sequence
+      number. A check answered a read only if the check started at or after the
+      read's instant and finished after the read. That rule fixes case 1
+      without changing `tests/cost.rs`, but does not fix case 2. Ordering checks
+      by their start sequence fixes both cases, but increases
       `node_overhead_1_node` from 121 to 151 manifest `GET`s and
       `node_overhead_3_nodes` from 140.3 to 170.3.
 - [ ] [tangential · Simulator] **Tolerate transient form errors in the
@@ -529,8 +529,8 @@ only.
       the batch as `outcome: "unknown"`.
 - [ ] [tangential · Change feed] **Notify waiters about a commit that the
       store applied late.** If the store applies a commit after its manifest
-      `PUT` failed, the node sends no commit notice (`Shared::committed`) and
-      starts no event maintenance (`Shared::events_changed`). Change-feed
+      `PUT` failed, the node does not send a commit notice (`Shared::committed`)
+      or start event maintenance (`Shared::events_changed`). Change-feed
       waiters on other nodes find the commit at their next poll.
 - [ ] [tangential · API] **Return `200` if a retried database deletion
       completes cleanup.** Return `200` instead of `404 not_found` if a

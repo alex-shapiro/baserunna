@@ -184,7 +184,7 @@ impl LeasedView {
     }
 }
 
-/// This node's lease on one database, which lets it serve strong reads from cache.
+/// This node's lease on a database, which lets it serve strong reads from cache.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum OwnLease {
     #[default]
@@ -461,8 +461,9 @@ impl Db {
         }
     }
 
-    /// Records that the store holds `m`, which this node sent at `sent`, and that no failed manifest
-    /// `PUT` from this node can replace it. Takes the lease in `m` if `m` contains this node's lease.
+    /// Records that the store holds `m`, which this node sent at `sent` and which cannot be
+    /// replaced by any failed manifest `PUT` from this node. Takes the lease in `m` if `m`
+    /// contains this node's lease.
     fn confirm_own_write(&self, m: &Manifest, sent: Instant) {
         let granted = self.granted_lease(m, sent);
         self.shared.update_own_lease(&self.id, |_| granted);
@@ -663,7 +664,7 @@ impl Db {
     /// Returns a version validated after `not_before`, fetching the manifest from storage
     /// if needed. Creates the database if `create` is true and the manifest does not exist.
     /// Equal instants do not order the validation and the call, so a validation at `not_before`
-    /// counts only if this node has no unconfirmed failed manifest `PUT`.
+    /// counts only if this node's lease is not [`OwnLease::Unconfirmed`].
     pub async fn refresh(self: &Arc<Self>, not_before: Instant, create: bool) -> Result<Arc<Version>> {
         Ok(self.refresh_at(not_before, create).await?.0)
     }

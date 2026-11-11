@@ -541,13 +541,13 @@ A background flush install is rejected and its output objects are deleted if `fl
 
 If a conditional `PUT` on the manifest does not succeed on the first attempt:
 
-- On `412 Precondition Failed`, the stored manifest changed. Another node updated it, or storage applied a `PUT` from this node (an earlier failed `PUT` or this `PUT` itself). The committer reloads the manifest. If another node now holds a valid lease, the batch fails with `not_owner`; otherwise the committer re-runs validation and applies the batch against the new `base`.
+- On `412 Precondition Failed`, the stored manifest changed. Another node updated it, or storage applied an earlier failed `PUT` from this node or this `PUT` itself. The committer reloads the manifest. If another node now holds a valid lease, the batch fails with `not_owner`; otherwise the committer re-runs validation and applies the batch against the new `base`.
 - On a timeout or network error, it is unknown whether the `PUT` succeeded. The committer reloads the manifest and retries against the new `base`. If an earlier `PUT` succeeded, step 4 finds the batch's commit records in the reloaded manifest and returns their committed versions without re-applying the writes. If the reloaded manifest's etag differs from all etags targeted by the batch's ambiguous `PUT`s and contains none of the batch's commit records, none of the ambiguous `PUT`s can succeed, so the batch outcome is settled. If retries are exhausted or the lease is lost while the outcome remains ambiguous, the committer returns `503 unavailable` with `outcome: "unknown"` for undecided transactions, while returning the recorded outcome for any transaction in the batch whose commit record is already present in the latest manifest.
 
-A manifest `PUT` that fails with any error stops strong reads from cache on this node (§5.7, §5.9). Storage can apply a failed `PUT` at a later time while the stored manifest still has the `If-Match` etag. A `412` response also shows that the cached manifest is old. A manifest read that returns the cached version does not end this state. Strong reads from cache start again only if this node confirms a manifest version that no failed `PUT` from this node can replace:
+A manifest `PUT` that fails with any error stops strong reads from cache on this node (§5.7, §5.9). Storage can apply a failed `PUT` at a later time while the stored manifest still has the `If-Match` etag. A `412` response also shows that the cached manifest is old. A manifest read that returns the cached version does not end this state. Strong reads from cache start again only if this node confirms a manifest version that cannot be replaced by any failed `PUT` from this node:
 
 - A manifest `PUT` from this node succeeds.
-- A reload in the same batch finds a manifest with this node's lease and the `write_seq` of an ambiguous `PUT` from this batch. In addition, no ambiguous `PUT` of the batch targets that manifest's etag. Each manifest write contains its writer's lease unless it releases the lease, so a failed `PUT` from this node wrote that manifest. That `PUT` can be from this batch or from an earlier batch that sent the same `write_seq`. A reload cannot show which failed `PUT` wrote the manifest. Therefore, the node times the lease in that manifest from the start of the earliest failed `PUT` since the last confirmed version. The node keeps that instant if it evicts or unloads the database handle.
+- A reload in the same batch finds a manifest with this node's lease and the `write_seq` of an ambiguous `PUT` from this batch. In addition, that manifest's etag differs from the `If-Match` etags of the batch's ambiguous `PUT`s. Each manifest write contains its writer's lease unless it releases the lease, so a failed `PUT` from this node wrote that manifest. That `PUT` can be from this batch or from an earlier batch that sent the same `write_seq`. A reload cannot show which failed `PUT` wrote the manifest. Therefore, the node times the lease in that manifest from the start of the earliest failed `PUT` since the last confirmed version. The node keeps that instant if it evicts or unloads the database handle.
 
 Until then, each strong read on this node sends a conditional `GET` (§5.9). On a read-heavy database, strong reads request a lease-only `PUT` (§5.7). That `PUT` confirms a version.
 
@@ -710,7 +710,7 @@ Deleting a database marks its record as deleted in the system database. After a 
 There are two read consistency modes:
 
 - `snapshot` consistency serves reads from a cached serializable snapshot that is at most `max_staleness_ms` old (5 s by default). Each node caches its own snapshot, so a client that reads from different nodes can observe an older snapshot after a newer snapshot.
-- `strong` consistency guarantees linearizability. A node serves a strong read from cache if it holds a valid lease, has no manifest write in flight, and has no unconfirmed failed manifest `PUT` (§5.5). Otherwise, the node sends `GET manifest If-None-Match: etag` first.
+- `strong` consistency guarantees linearizability. A node serves a strong read from cache if its lease is valid and confirmed (§5.5) and it is not writing the manifest. Otherwise, the node sends `GET manifest If-None-Match: etag` first.
 
 ### 5.10 Size Quotas
 
@@ -1542,7 +1542,7 @@ Every 20 ms of virtual time, global oracles verify three lease invariants:
 - Each node that relies on a lease without an in-flight manifest write holds the latest manifest version in the store.
 - Each node stops relying on its lease within `lease_ms` minus the margin after storage applies the manifest that grants the lease.
 
-At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, stream chunks, and event parts and masks are intact and consistent, that event positions are unique across unsealed rows and parts, and that `part_bytes` equals the referenced parts' sizes. After a node shuts down gracefully, the simulator verifies that the node holds no lease on any released database in storage.
+At the end of every run, storage invariant checks verify that all manifests, levels objects, segments, blobs, stream chunks, and event parts and masks are intact and consistent, that event positions are unique across unsealed rows and parts, and that `part_bytes` equals the referenced parts' sizes. After a node shuts down gracefully, the simulator verifies that none of the released databases in storage have that node's lease.
 
 ### 13.4 Coverage, campaigns, and exploration
 
@@ -1554,7 +1554,12 @@ At the end of every run, storage invariant checks verify that all manifests, lev
 ### 13.5 Other test layers
 
 - **Unit tests** in each module.
-- **Property tests** using the in-crate generator and shrinker (`crates/baserunna/src/util/prop.rs`): verify codecs, tuple ordering, segments, LSM-tree operations and change feeds against a reference model, streams, tables, indexes, range tombstones, fair memory allocation, base64, varints, bloom filters, metadata access control, and lease reads under ambiguous manifest `PUT`s. A bounded exhaustive search also runs every short sequence of lease steps on two nodes (`lease_search` in `engine/tests.rs`).
+- **Property tests** using the in-crate generator and shrinker (`crates/baserunna/src/util/prop.rs`) verify:
+  - Codecs, base64, varints, bloom filters, and tuple ordering.
+  - Segments, range tombstones, and LSM-tree operations and change feeds against a reference model.
+  - Streams, tables, and indexes.
+  - Fair memory allocation and metadata access control.
+  - Lease reads under ambiguous manifest `PUT`s, alongside a bounded exhaustive search over short sequences of lease steps on two nodes (`lease_search` in `engine/tests.rs`).
 - **Fuzz tests**: feeds arbitrary and mutated byte inputs to all binary and text decoders and random JSON requests to the HTTP router, verifying that arbitrary inputs do not cause panics or `500` responses.
 - **Transaction-op fuzzing** (`sim/txn_fuzz.rs`): generates random single-request and interactive transactions (including malformed operations) and compares every response against an independent transaction model.
 - **OpenAPI conformance**: validates every simulated HTTP response against `openapi.json` and verifies that `openapi.json` matches the router and generated specification.
@@ -1664,7 +1669,7 @@ scripts/mutants.sh                                               # run mutation 
 44. _Duplicate background flushes shadowing sealed stream chunks._ Installing a stale background flush after another flush of the same entries produced duplicate stream records that shadowed sealed stream chunks. Flush installs now verify that `flush_seq` is unchanged (§5.5).
 45. _Referenced stream chunks deleted after ambiguous flush install._ Retrying a flush install after an ambiguous manifest write treated the already-installed flush as superseded and deleted its chunks. Superseded flushes after an ambiguous write now preserve their output objects.
 46. _Precondition failure overtaken by in-flight attempt._ If a retried idempotent request failed a precondition while an earlier attempt was still in flight, the earlier attempt could still be committed after the `412` response. Precondition failures now write an abort record before returning (§6.2).
-47. _Stale leased reads during hedged manifest writes._ If a hedged duplicate `PUT` failed with `412` while the primary `PUT` was still in flight, the node reloaded the prior manifest and served leased reads before the primary `PUT` completed. A failed manifest `PUT` now stops strong reads from cache until this node confirms a manifest write that no failed `PUT` can replace. A manifest read that returns the cached version does not end this state (§5.5).
+47. _Stale leased reads during hedged manifest writes._ If a hedged duplicate `PUT` failed with `412` while the primary `PUT` was still in flight, the node reloaded the prior manifest and served leased reads before the primary `PUT` completed. A failed manifest `PUT` now stops strong reads from cache until this node confirms a manifest write that cannot be replaced by any failed `PUT`. A manifest read that returns the cached version does not end this state (§5.5).
 48. _Levels object garbage-collected during stalled manifest read._ If a manifest read stalled past the GC grace period, its `.levels` object could be deleted before being fetched, causing a `500` error. The node now reloads the manifest if a `.levels` object is not found (§5.8).
 49. _Forwards rejected after a peer restart._ When a node forwarded a request to a peer that had restarted at the same address with a new node ID, the peer returned `503` and the entry node returned that error to the client until its membership cache refreshed. The peer now tags the rejection with `x-baserunna-stale-target`, and the entry node marks the peer as suspect and handles buffered requests locally (§7).
 50. _Event table drops starved by inserts._ Dropping an event table previously scanned all part references into the transaction read set, causing concurrent binds, seals, or merges to trigger serializable conflicts under steady insert load. Dropping an event table now writes range tombstones without reading individual part references and subtracts the table's recorded part bytes in the committer (§5.13).

@@ -550,7 +550,7 @@ A manifest read does not end this state. A reload can find a manifest that a fai
 
 Until a `PUT` succeeds, each strong read on this node sends a conditional `GET` (§5.9). Two rules end this state without a commit:
 
-- If the reload of a commit batch finds a manifest with this node's lease and the `write_seq` of an ambiguous `PUT` from that batch, and the batch has nothing more to write, the committer requests one lease-only `PUT`. After the failed `PUT`, a lost response then costs the same as a lost request: one manifest `GET` and one `PUT`.
+- If the reload of a commit batch finds a manifest with this node's lease and the `write_seq` of an ambiguous `PUT` from that batch, and the batch has nothing more to write, the committer requests one lease-only `PUT`. After the failed `PUT`, a lost response then costs the same as a lost request: one manifest `GET` and one `PUT`. The lease-only `PUT` renews the lease, as a commit does (§5.7). If this node stops after that `PUT`, another node that read the manifest of the failed `PUT` can wait up to one more lease term before it takes over: 11 s in place of 5.5 s.
 - On a read-heavy database, strong reads request a lease-only `PUT` (§5.7).
 
 #### Hedged Manifest Writes

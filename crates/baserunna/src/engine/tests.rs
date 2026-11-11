@@ -1101,6 +1101,7 @@ impl ObjectStore for LateManifestPutStore {
                 | ManifestPutOutcome::AppliedThenFailed
                 | ManifestPutOutcome::AppliedThenRejected => self.apply_manifest_put(key, data, &mode),
             };
+            tokio::time::sleep(self.manifest_get_latency()).await;
             let r = match outcome {
                 ManifestPutOutcome::AppliedThenRejected => r.and(Err(StoreError::PreconditionFailed)),
                 _ => r,
@@ -2782,11 +2783,14 @@ fn background_work_does_not_take_back_a_released_lease() {
     });
 }
 
+/// Tests that a holder relies on its lease until a margin before the lease term ends. The term
+/// starts when the holder sends the manifest `PUT`, not when the reply arrives 100 ms later.
 #[test]
 fn holders_stop_relying_on_their_lease_a_margin_early() {
     rt().block_on(async {
         let (eng, store) = delayed_engine("a");
         let db = opened(&eng, "d").await;
+        store.put_reply_ms.store(100, SeqCst);
         let start = Instant::now();
         put(&db, "k", "v").await;
         let rely = Duration::from_millis(eng.shared.cfg.lease_ms - eng.shared.cfg.lease_margin_ms);

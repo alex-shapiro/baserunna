@@ -1704,7 +1704,6 @@ Tools:
 - `cost_model` prints object-store requests per operation and the cost per database-month
 - `amplification` the write, space and read amplification of compaction and of streams
 - `commit_latency` measures commit and object-store request latency across manifest tail limits
-- `ambiguous_put_cost` measures the store requests and strong-read latency of one node while manifest `PUT`s fail with an unknown outcome
 - `gen_openapi` regenerates `openapi.json`
 - `elle_check` verifies EDN list-append histories using the `elle` workload checker
 

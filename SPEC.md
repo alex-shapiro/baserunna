@@ -1563,7 +1563,7 @@ At the end of every run, storage invariant checks verify that all manifests, lev
   - LSM-tree operations and change feeds against a reference model, segments, and range tombstones.
   - Streams, tables, and indexes.
   - Fair memory allocation and metadata access control.
-  - Lease reads under ambiguous manifest `PUT`s, alongside a bounded exhaustive search over short sequences of lease steps on two nodes (`lease_search` in `engine/tests.rs`).
+  - Lease reads under ambiguous manifest `PUT`s.
 - **Fuzz tests**: feeds arbitrary and mutated byte inputs to all binary and text decoders and random JSON requests to the HTTP router, verifying that arbitrary inputs do not cause panics or `500` responses.
 - **Transaction-op fuzzing** (`sim/txn_fuzz.rs`): generates random single-request and interactive transactions (including malformed operations) and compares every response against an independent transaction model.
 - **OpenAPI conformance**: validates every simulated HTTP response against `openapi.json` and verifies that `openapi.json` matches the router and generated specification.

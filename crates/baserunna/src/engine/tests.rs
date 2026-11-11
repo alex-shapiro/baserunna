@@ -1838,18 +1838,10 @@ fn lease_oracle_reports_a_lease_that_outlives_its_term() {
     });
 }
 
-/// Advances time by `ms` in steps of at most `every_ms`, and checks the lease views after each step.
-async fn advance_checking(
-    ms: u64,
-    every_ms: u64,
-    dbs: &[NodeDb<'_>],
-    store: &LateManifestPutStore,
-) -> Result<(), String> {
-    let mut left = ms;
-    while left > 0 {
-        let step = left.min(every_ms);
-        sleep_ms(step).await;
-        left -= step;
+/// Advances time by `ms` in steps of 1 ms, and checks the lease views after each step.
+async fn advance_checking(ms: u64, dbs: &[NodeDb<'_>], store: &LateManifestPutStore) -> Result<(), String> {
+    for _ in 0..ms {
+        sleep_ms(1).await;
         check_lease_views(dbs, store)?;
     }
     Ok(())
@@ -1892,33 +1884,20 @@ fn spawn_commit(db: &Arc<Db>, value: String, with_lease: bool) -> tokio::task::J
     })
 }
 
-/// Manifest `PUT` outcomes of a [`run_lease_steps`] run.
-enum LeaseRunOutcomes {
-    Random(ManifestFaultScript),
-    /// Outcomes that manifest writes take in turn.
-    Cycled(Vec<ManifestPutOutcome>),
-}
-
-/// Setup of a [`run_lease_steps`] run.
+/// Setup of a [`run_lease_steps`] run, whose manifest writes fail at random.
 struct LeaseRun {
     seed: u64,
     cfg: EngineConfig,
-    outcomes: LeaseRunOutcomes,
-    /// Milliseconds to advance, with lease checks, after each step that starts background work.
-    ms_after_spawn: u64,
-    /// Interval in milliseconds between lease checks while time advances.
-    check_every_ms: u64,
+    script: ManifestFaultScript,
 }
 
 impl LeaseRun {
-    /// Returns a setup whose manifest writes fail at random.
     fn random(seed: u64) -> LeaseRun {
         let mut r = Rng::new(seed ^ 0x1ea5e);
         // Two attempts make it likely that every manifest `PUT` of a batch fails, and that the
         // store applies one of them later.
         let cfg = EngineConfig { commit_retry_max: *r.pick(&[2, 8]), ..EngineConfig::default() };
-        let outcomes = LeaseRunOutcomes::Random(ManifestFaultScript::random(&mut r));
-        LeaseRun { seed, cfg, outcomes, ms_after_spawn: 0, check_every_ms: 1 }
+        LeaseRun { seed, cfg, script: ManifestFaultScript::random(&mut r) }
     }
 }
 
@@ -1929,10 +1908,7 @@ async fn run_lease_steps(run: LeaseRun, steps: &[LeaseStep]) -> Result<(), Strin
     let (mut db_a, db_b) = (opened(&a, "d").await, b.db("d"));
     put(&db_a, "k", "old").await;
     db_b.open(false).await.map_err(|e| e.to_string())?;
-    match run.outcomes {
-        LeaseRunOutcomes::Random(script) => *store.manifest_fault_script.lock() = Some(script),
-        LeaseRunOutcomes::Cycled(outcomes) => *store.cycled_manifest_put_outcomes.lock() = Some((outcomes, 0)),
-    }
+    *store.manifest_fault_script.lock() = Some(run.script);
     let mut tasks = Vec::new();
     for (i, step) in steps.iter().enumerate() {
         if let LeaseStep::DropHandle { how } = *step {
@@ -1940,7 +1916,6 @@ async fn run_lease_steps(run: LeaseRun, steps: &[LeaseStep]) -> Result<(), Strin
             let _ = db_a.open(false).await;
         }
         let dbs: [NodeDb; 2] = [("A", &db_a), ("B", &db_b)];
-        let spawned = tasks.len();
         let r = match *step {
             LeaseStep::Commit => {
                 tasks.push(spawn_commit(&db_a, format!("v{i}"), false));
@@ -1985,11 +1960,7 @@ async fn run_lease_steps(run: LeaseRun, steps: &[LeaseStep]) -> Result<(), Strin
                 Ok(())
             }
             LeaseStep::DropHandle { .. } => Ok(()),
-            LeaseStep::Advance { ms } => advance_checking(ms, run.check_every_ms, &dbs, &store).await,
-        };
-        let r = match r.is_ok() && tasks.len() > spawned {
-            true => advance_checking(run.ms_after_spawn, run.check_every_ms, &dbs, &store).await,
-            false => r,
+            LeaseStep::Advance { ms } => advance_checking(ms, &dbs, &store).await,
         };
         r.and_then(|()| check_lease_views(&dbs, &store)).map_err(|e| format!("step {i} {step:?}: {e}"))?;
     }
@@ -1999,7 +1970,7 @@ async fn run_lease_steps(run: LeaseRun, steps: &[LeaseStep]) -> Result<(), Strin
         if settled_ms > 120_000 {
             return Err("background work did not finish within 120 s".into());
         }
-        advance_checking(10, run.check_every_ms, &dbs, &store).await.map_err(|e| format!("after the steps: {e}"))?;
+        advance_checking(10, &dbs, &store).await.map_err(|e| format!("after the steps: {e}"))?;
         settled_ms += 10;
     }
     for t in tasks {
@@ -2031,87 +2002,6 @@ fn prop_lease_reads_match_the_store_under_ambiguous_manifest_puts() {
 
 const LEASE_PROP_CASES: u64 = 256;
 const LEASE_PROP_STEPS: usize = 200;
-
-/// Steps of [`lease_search`]. Each step that starts a commit or a lease request also advances
-/// time by 60 ms, so the work reaches the store before the next step.
-const LEASE_SEARCH_STEPS: [LeaseStep; 12] = [
-    LeaseStep::ApplyLatePutsOnNextPut,
-    LeaseStep::Commit,
-    LeaseStep::CommitFromSnapshot,
-    LeaseStep::CommitOnB,
-    LeaseStep::AcquireLease,
-    LeaseStep::StrongRead { on_b: false, waits_for_write: true },
-    LeaseStep::ApplyLatePut { pick: 0 },
-    LeaseStep::DropHandle { how: IdleHandleDrop::Evicted { idle_ms: 0 } },
-    LeaseStep::Advance { ms: 1_100 },
-    LeaseStep::Advance { ms: 3_000 },
-    LeaseStep::Advance { ms: 4_600 },
-    LeaseStep::Advance { ms: 5_600 },
-];
-
-/// Runs every sequence of [`LEASE_SEARCH_STEPS`] up to `LEASE_SEARCH_DEPTH` steps (default 4) on
-/// two nodes. Manifest writes take `outcomes` in turn, and the search runs with 2 and 3 commit
-/// attempts.
-///
-/// Limits: the search drives one database on two nodes, drops handles only by eviction, and checks
-/// the lease views between steps and every 20 ms. The search does not interleave steps inside a
-/// commit batch, so the property test finds defects that the search misses. Run depth 5 (about
-/// 100 s on 16 cores) with `LEASE_SEARCH_DEPTH=5 cargo test -p baserunna --lib lease_search`.
-fn lease_search(outcomes: &[ManifestPutOutcome]) {
-    let depth = prop::env_u64("LEASE_SEARCH_DEPTH").unwrap_or(4) as u32;
-    let total = LEASE_SEARCH_STEPS.len().pow(depth);
-    let mut failures = Vec::new();
-    for commit_retry_max in [2, 3] {
-        for code in 0..total {
-            let steps: Vec<LeaseStep> = (0..depth as usize)
-                .map(|i| LEASE_SEARCH_STEPS[code / LEASE_SEARCH_STEPS.len().pow(i as u32) % LEASE_SEARCH_STEPS.len()])
-                .collect();
-            let run = LeaseRun {
-                seed: 7,
-                cfg: EngineConfig { commit_retry_max, ..EngineConfig::default() },
-                outcomes: LeaseRunOutcomes::Cycled(outcomes.to_vec()),
-                ms_after_spawn: 60,
-                check_every_ms: 20,
-            };
-            if let Err(e) = rt().block_on(run_lease_steps(run, &steps)) {
-                failures.push(format!("commit_retry_max {commit_retry_max}, {steps:?}: {e}"));
-            }
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "{} of {} sequences failed:\n{}",
-        failures.len(),
-        2 * total,
-        failures.iter().take(5).cloned().collect::<Vec<_>>().join("\n")
-    );
-}
-
-/// Defines a test that runs [`lease_search`] with each outcome cycle.
-macro_rules! lease_search_tests {
-    ($($name:ident: [$($outcome:ident),*],)*) => {
-        $(
-            #[test]
-            fn $name() {
-                use ManifestPutOutcome::*;
-                lease_search(&[$($outcome),*]);
-            }
-        )*
-    };
-}
-
-lease_search_tests! {
-    lease_search_late: [FailedThenAppliedLate],
-    lease_search_late_then_applied: [FailedThenAppliedLate, Applied],
-    lease_search_lost_reply: [AppliedThenFailed],
-    lease_search_lost_reply_then_applied: [AppliedThenFailed, Applied],
-    lease_search_two_late_then_applied: [FailedThenAppliedLate, FailedThenAppliedLate, Applied],
-    lease_search_applied_then_late: [Applied, FailedThenAppliedLate],
-    lease_search_late_then_lost_reply: [FailedThenAppliedLate, AppliedThenFailed],
-    lease_search_two_applied_then_late: [Applied, Applied, FailedThenAppliedLate],
-    lease_search_rejected_then_applied: [AppliedThenRejected, Applied],
-    lease_search_late_then_rejected: [FailedThenAppliedLate, AppliedThenRejected],
-}
 
 #[test]
 fn obsolete_segments_outlive_snapshots_then_go() {

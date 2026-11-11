@@ -357,6 +357,14 @@ only.
       a hedged duplicate fails with `412` and retries are exhausted, so the
       committer can determine the outcome instead of returning
       `outcome: "unknown"`.
+- [ ] [nice-to-have · Operations] **Recognize this node's lease in a manifest
+      `PUT` that the store applied after its batch ended.** Keep the write
+      sequence numbers of unknown-outcome manifest `PUT`s after `Db::process`
+      returns, so a later manifest read that finds one restores the lease from
+      `earliest_failed_put_at`. Without this, the holder sends a manifest `GET` for each
+      strong read until its next successful `PUT`, and other nodes forward
+      requests to it for 5.5 s. A hot database sends a lease `PUT` after one
+      `GET`.
 - [ ] [nice-to-have · Operations] **Account for object overhead in the segment
       block cache.** Increase the per-entry overhead in `CacheVal::size` above
       48 bytes so small block-cache entries are not undercounted by half of
@@ -447,6 +455,22 @@ only.
       under memory pressure.** Avoid repeated system-segment re-reads if a node
       restarts under a tiny cache budget (`sim_tool trace db_churn 606688`,
       which uses 2 KiB segments and a 4 KiB disk cache).
+- [ ] [tangential · Simulator] **Order manifest checks and strong reads that
+      share a paused-clock instant.** `Db::refresh` lets a strong read reuse a
+      manifest check from the same `Instant`. Under a paused clock, the read
+      then returns an old version in two cases. A real clock does not give
+      equal instants. In case 1, node A's `GET` returns version N, node B
+      commits N+1, and a second strong read on A reuses the `GET`. In case 2,
+      A's `GET` reads N at T and its reply arrives at T + 20 ms, B commits N+1
+      at T, and a second strong read on A starts at T, waits for the load lock,
+      and accepts the reply. The losing candidate of the late-apply fix ordered
+      equal instants with an `OrderedInstant` (an `Instant` and a process-wide
+      sequence number). A check answered a read only if the check started at or
+      after the read's instant and finished after the read. That rule fixes
+      case 1 with no change to `tests/cost.rs`, but not case 2. Ordering checks
+      by their start sequence fixes both cases, but `node_overhead_1_node`
+      increases from 121 to 151 manifest `GET`s and `node_overhead_3_nodes`
+      from 140.3 to 170.3.
 - [ ] [tangential · Simulator] **Tolerate transient form errors in the
       `console` workload.** Allow transient password-change timeouts at
       `/console/account/password` during simulated storage stalls instead of
@@ -496,6 +520,11 @@ only.
       ambiguous manifest `PUT`. If the committer aborts a batch through
       `fail_batch` after an ambiguous `PUT`, it marks every undecided commit in
       the batch as `outcome: "unknown"`.
+- [ ] [tangential · Change feed] **Notify waiters about a commit that the
+      store applied late.** A commit that the store applies after its manifest
+      `PUT` failed sends no commit notice (`Shared::committed`) and starts no
+      event maintenance (`Shared::events_changed`). Change-feed waiters on
+      other nodes find the commit at their next poll.
 - [ ] [tangential · API] **Return `200` if a retried database deletion
       completes cleanup.** Return `200` instead of `404 not_found` if a
       retried `DELETE /v1/dbs/{db}` finishes an interrupted database deletion.
@@ -564,3 +593,16 @@ only.
 - [ ] [tangential · Docs] **Correct the deploy trigger statement in
       `DEPLOYING.md`.** Update `DEPLOYING.md` to reflect that the push trigger
       in `deploy.yml` is commented out.
+
+## Untriaged
+
+- [ ] [untriaged · Garbage collection] **Keep a very late manifest `PUT` from
+      binding a swept blob.** A manifest `PUT` that the store applies more than
+      1 hour late can bind a staged blob after a sweep listed the blob as an
+      orphan. The `Work::Obsolete` install does not check blobs and parts
+      against its base. The defect needs a store that applies a `PUT` hours
+      late.
+- [ ] [untriaged · Garbage collection] **Sweep objects that a late `PUT` writes
+      after a database deletion.** A non-manifest `PUT` that the store applies
+      after the second deletion pass leaves an orphan object. No sweep removes
+      it.

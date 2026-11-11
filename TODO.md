@@ -31,8 +31,15 @@ only.
       profiles.** Enable `StoreFaults::p_late_apply` in the swarm profiles and
       list the fault in SPEC §13.2. `StoreFaults::p_late_apply` makes the
       simulated store return an error for a `PUT` and apply it later. First
-      run the exhaustive lease search (tangential item "Search the lease state
-      space exhaustively"), and triage `db_churn` seed 2037. With
+      search the lease state space exhaustively, and triage `db_churn` seed
+      2037. The search runs every `LeaseStep` sequence up to a fixed length on
+      the two-node harness in `engine/tests.rs`, with the lease oracle in
+      `sim/lease_check.rs`. It uses each manifest `PUT` outcome, each handle
+      drop, and a few `Advance` lengths around `lease_ms` and
+      `lease_margin_ms`. Random search reaches deep states rarely: code review
+      found the last two lease-term defects after 113,000 campaign runs and
+      10,000 property seeds passed, and the property test reached the
+      handle-eviction defect in 2 of 4,096 seeds. With
       `p_late_apply` at 0.01 and `late_apply_ms` at `(10, 2 * lease)`,
       `tests/sim.rs` and `tests/coverage.rs` pass. Campaigns over 25 scenarios
       had 1 failure in 7,170 runs: `db_churn` seed 2037 timed out after a node
@@ -452,15 +459,6 @@ only.
 
 ## Tangential
 
-- [ ] [tangential · Simulator] **Search the lease state space exhaustively.**
-      Run every `LeaseStep` sequence up to a fixed length on the two-node
-      harness in `engine/tests.rs`, with the lease-term oracle in
-      `check_lease_views`. Use each manifest `PUT` outcome, each handle drop,
-      and a few `Advance` lengths around `lease_ms` and `lease_margin_ms`. The
-      state space is small, but random search reaches deep states rarely. Code
-      review found the last two lease-term defects after 113,000 campaign runs
-      and 10,000 property seeds passed. With swarm step weights, the property
-      test reached the handle-eviction defect in 2 of 4,096 seeds.
 - [ ] [tangential · Simulator] **Fix `db_churn` timeouts if a node crash-loops
       under memory pressure.** Avoid repeated system-segment re-reads if a node
       restarts under a tiny cache budget (`sim_tool trace db_churn 606688`,

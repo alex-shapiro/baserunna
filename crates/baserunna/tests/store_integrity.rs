@@ -831,7 +831,7 @@ fn substituted_segment_of_equal_shape_is_detected() {
 }
 
 #[test]
-#[ignore = "TODO (not in TODO.md): verify that a fetched segment block matches its block index entry"]
+#[ignore = "TODO: Check ranged block reads against the block index"]
 fn segment_block_served_from_wrong_offset_is_detected() {
     run_paused(async {
         let mut d = Deployment::start(|_| {}, None).await;
@@ -1278,7 +1278,7 @@ fn damaged_staged_blob_metadata_is_detected() {
 const DAY_MS: i64 = 86_400_000;
 const EVENTS_FROM_MS: i64 = 1_740_000_000_000 / DAY_MS * DAY_MS;
 
-/// Event table `ev` in database `ev` with one part per day. Days 0 and 1 hold identical rows except
+/// Event table `ev` in database `ev` with a part per day. Days 0 and 1 hold identical rows except
 /// for the time; day 2 holds more rows; day 3 holds 100,000 rows with random tags in a part larger
 /// than `segment_whole_fetch_max`, which readers fetch with ranged `GET`s.
 struct EventData {

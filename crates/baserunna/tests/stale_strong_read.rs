@@ -471,7 +471,7 @@ fn check_path(path: &str, home: Home, round: fn(&LateCommit) -> Vec<Probe>, fail
 // (i) Strong `GET` on the other node, followed by a strong `GET` on the lease holder.
 
 #[test]
-fn strong_gets_never_go_back_when_the_lease_holder_is_home() {
+fn strong_gets_never_go_back_if_the_lease_holder_is_home() {
     check_path(
         "(i) home = holder",
         Home::LeaseHolder,
@@ -493,7 +493,7 @@ fn strong_gets_never_go_back_after_a_node_joins() {
 // (ii) Strong change-feed long poll on the home node, followed by a strong `GET`.
 
 #[test]
-fn change_feed_then_strong_get_never_go_back_when_the_lease_holder_is_home() {
+fn change_feed_then_strong_get_never_go_back_if_the_lease_holder_is_home() {
     check_path(
         "(ii) home = holder",
         Home::LeaseHolder,

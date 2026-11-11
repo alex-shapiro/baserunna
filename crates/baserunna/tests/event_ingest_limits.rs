@@ -883,8 +883,8 @@ fn bulk_insert_partitions_are_limited() {
                 out.body.to_string().chars().take(200).collect::<String>()
             );
             eprintln!(
-                "  PUTs: {puts_at_answer} when the response arrived, {total_puts} in total, the last one {last_put_at:?} \
-                 after the request started; heap peak +{:.1} MiB, heap growth sampled up to +{:.1} MiB",
+                "  PUTs: {puts_at_answer} at response arrival, {total_puts} in total, the last at {last_put_at:?} \
+                 after request start; heap peak +{:.1} MiB, heap growth sampled up to +{:.1} MiB",
                 mib(peak),
                 heap_max_during as f64 / MIB as f64
             );
@@ -974,7 +974,7 @@ fn event_merges_share_a_node_wide_limit() {
         for (tables, peak, _) in &measured {
             assert!(
                 *peak <= (2 * single).max(budget),
-                "merges in {tables} tables grew the heap by {:.0} MiB, {:.1}x the {:.0} MiB of one merge",
+                "merges in {tables} tables grew the heap by {:.0} MiB, {:.1}x the {:.0} MiB of a single merge",
                 mib(*peak),
                 *peak as f64 / single as f64,
                 mib(single)

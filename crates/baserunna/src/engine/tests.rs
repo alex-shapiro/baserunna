@@ -1589,7 +1589,7 @@ impl Drop for BuggifyScope {
 /// Node name and database handle that [`check_lease_views`] checks.
 type NodeDb<'a> = (&'a str, &'a Arc<Db>);
 
-/// Checks that each node stops relying on its lease before another node's view of it can end.
+/// Checks that each node stops relying on its lease before its lease term ends.
 /// Also checks that each lease-served view without an in-flight write is the stored manifest and
 /// that no buffered write can replace it.
 fn check_lease_views(dbs: &[NodeDb], store: &LateManifestPutStore) -> Result<(), String> {
@@ -1600,7 +1600,7 @@ fn check_lease_views(dbs: &[NodeDb], store: &LateManifestPutStore) -> Result<(),
             let overrun = view.lease_overrun(applied_at, db.shared().cfg.lease_margin_ms);
             if !overrun.is_zero() {
                 return Err(format!(
-                    "{node} relies on its lease at write {} for {} ms after another node's view of it can end",
+                    "{node} relies on its lease at write {} for {} ms after its lease term ends",
                     view.write_seq,
                     overrun.as_millis()
                 ));

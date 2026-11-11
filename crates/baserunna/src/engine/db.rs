@@ -174,12 +174,14 @@ pub struct LeasedView {
 }
 
 impl LeasedView {
-    /// Returns how long this node relies on its lease after another node's view of the lease can
-    /// end, if the store applied the manifest at `applied_at`. Another node honors the lease for
-    /// `lease_ms + margin_ms` from its first read of the manifest, which is not earlier than
-    /// `applied_at`.
+    /// Returns how long this node relies on its lease after the lease term ends, if the store
+    /// applied the manifest at `applied_at`. The term is `lease_ms - margin_ms` from `applied_at`,
+    /// because the holder times its lease from before it sends the manifest. Another node honors
+    /// the lease for `lease_ms + margin_ms` from its first read of the manifest, so the term ends
+    /// first.
     pub fn lease_overrun(&self, applied_at: Instant, margin_ms: u64) -> Duration {
-        self.expires_at.saturating_duration_since(applied_at + Duration::from_millis(self.lease_ms + margin_ms))
+        let term = Duration::from_millis(self.lease_ms - margin_ms.min(self.lease_ms));
+        self.expires_at.saturating_duration_since(applied_at + term)
     }
 }
 

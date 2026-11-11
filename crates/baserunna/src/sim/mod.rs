@@ -707,7 +707,7 @@ impl Sim {
     }
 
     /// Verifies that at most one node holds an active lease per database, and that each holder
-    /// stops relying on its lease before another node's view of it can end. Also checks that any
+    /// stops relying on its lease before its lease term ends. Also checks that any
     /// leased node without an in-flight manifest write matches the latest manifest in object
     /// storage, and that no late write can replace it.
     fn check_oracles(&self) -> Result<(), String> {
@@ -724,7 +724,7 @@ impl Sim {
                     let overrun = view.lease_overrun(applied_at, db.shared().cfg.lease_margin_ms);
                     if !overrun.is_zero() {
                         return Err(format!(
-                            "n{i} relies on its lease on {} at write {} for {} ms after another node's view of it can end",
+                            "n{i} relies on its lease on {} at write {} for {} ms after its lease term ends",
                             db.id,
                             view.write_seq,
                             overrun.as_millis()

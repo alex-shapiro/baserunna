@@ -1,6 +1,7 @@
 //! Lease oracle that the simulator and the engine tests share.
 
 use crate::engine::{Db, LeasedView};
+use std::time::Duration;
 use tokio::time::Instant;
 
 /// Manifest writes that a fault-injecting store applied or can still apply.
@@ -15,13 +16,12 @@ pub(crate) trait ManifestHistory {
     fn late_manifest_put_targets(&self, db: &str) -> Vec<String>;
 }
 
-/// Checks that the node of `db` stops relying on its lease before its lease term ends. Also checks
-/// that a lease-served view without an in-flight manifest write matches the stored manifest, and
-/// that a failed write cannot replace it.
-pub(crate) fn check_lease_view(db: &Db, history: &impl ManifestHistory) -> Result<(), String> {
-    let Some(view) = db.leased_view() else { return Ok(()) };
+/// Checks `view`, the lease view of the node of `db`. The node must stop relying on its lease
+/// before its lease term ends. A view without an in-flight manifest write must match the stored
+/// manifest, and a failed write must not be able to replace it.
+pub(crate) fn check_lease_view(db: &Db, view: &LeasedView, history: &impl ManifestHistory) -> Result<(), String> {
     if let Some(applied_at) = history.manifest_applied_at(&db.id, &view.etag) {
-        let overrun = view.lease_overrun(applied_at, db.shared().cfg.lease_margin_ms);
+        let overrun = lease_overrun(view, applied_at, db.shared().cfg.lease_margin_ms);
         if !overrun.is_zero() {
             return Err(format!(
                 "relies on its lease on {} at write {} for {} ms after the lease term",
@@ -33,18 +33,27 @@ pub(crate) fn check_lease_view(db: &Db, history: &impl ManifestHistory) -> Resul
     }
     let LeasedView { write_seq, etag, write_in_flight: false, .. } = view else { return Ok(()) };
     if let Some(stored) = history.stored_manifest_etag(&db.id)
-        && stored != etag
+        && stored != *etag
     {
         return Err(format!(
             "serves lease reads on {} at write {write_seq} ({etag}), but the store has {stored}",
             db.id
         ));
     }
-    if history.late_manifest_put_targets(&db.id).contains(&etag) {
+    if history.late_manifest_put_targets(&db.id).contains(etag) {
         return Err(format!(
             "serves lease reads on {} at write {write_seq} ({etag}), but a late write can replace it",
             db.id
         ));
     }
     Ok(())
+}
+
+/// Returns how long the node of `view` relies on its lease after the lease term ends, if the store
+/// applied the manifest at `applied_at`. The holder times its lease from before it sends the
+/// manifest, so the term is `lease_ms - margin_ms` from `applied_at`. Another node honors the lease
+/// for `lease_ms + margin_ms` from its first read of the manifest, so the term ends first.
+fn lease_overrun(view: &LeasedView, applied_at: Instant, margin_ms: u64) -> Duration {
+    let term = Duration::from_millis(view.lease_ms - margin_ms.min(view.lease_ms));
+    view.expires_at.saturating_duration_since(applied_at + term)
 }

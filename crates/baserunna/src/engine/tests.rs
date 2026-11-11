@@ -1752,7 +1752,9 @@ type NodeDb<'a> = (&'a str, &'a Arc<Db>);
 /// Checks each node's lease view with [`check_lease_view`].
 fn check_lease_views(dbs: &[NodeDb], store: &LateManifestPutStore) -> Result<(), String> {
     for (node, db) in dbs {
-        check_lease_view(db, store).map_err(|e| format!("{node} {e}"))?;
+        if let Some(view) = db.leased_view() {
+            check_lease_view(db, &view, store).map_err(|e| format!("{node} {e}"))?;
+        }
     }
     Ok(())
 }
@@ -1766,7 +1768,7 @@ fn lease_oracle_reports_a_lease_that_outlives_its_term() {
         let db_a = opened(&a, "d").await;
         put(&db_a, "k", "v").await;
         let view = db_a.leased_view().expect("setup: A holds its lease");
-        assert_eq!(check_lease_view(&db_a, &*store), Ok(()), "setup: the oracle reports a valid lease");
+        assert_eq!(check_lease_view(&db_a, &view, &*store), Ok(()), "setup: the oracle reports a valid lease");
         let applied_at = store.manifest_applied_at("d", &view.etag).expect("setup: the store applied the manifest");
         for (etag, at) in store.applied_manifest_puts.lock().iter_mut() {
             if *etag == view.etag {
@@ -1774,7 +1776,7 @@ fn lease_oracle_reports_a_lease_that_outlives_its_term() {
             }
         }
         let overrun = format!("relies on its lease on d at write {} for 100 ms after the lease term", view.write_seq);
-        assert_eq!(check_lease_view(&db_a, &*store), Err(overrun));
+        assert_eq!(check_lease_view(&db_a, &view, &*store), Err(overrun));
     });
 }
 

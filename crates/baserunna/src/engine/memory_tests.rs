@@ -4,7 +4,6 @@ use super::tests::{delayed_engine, delayed_engine_with, opened, put, put_many, r
 use super::*;
 use crate::error::Error;
 use bytes::Bytes;
-use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
 const MIB: usize = 1024 * 1024;
@@ -111,39 +110,6 @@ fn unloaded_lease_holder_retains_lease() {
         tokio::time::sleep(Duration::from_millis(1)).await;
         other.refresh(tokio::time::Instant::now(), false).await.unwrap();
         put(&other, "k", "b").await;
-    });
-}
-
-#[test]
-fn databases_with_in_flight_work_are_not_unloaded() {
-    rt().block_on(async {
-        let (a, store) = delayed_engine("a");
-        let db = opened(&a, "d").await;
-        put(&db, "k", "v").await;
-        store.put_reply_ms.store(1_000, SeqCst);
-        let writer = db.clone();
-        let commit = tokio::spawn(async move { put(&writer, "k", "w").await });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!db.unload());
-        store.put_reply_ms.store(0, SeqCst);
-        commit.await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
-        assert!(db.unload());
-    });
-}
-
-/// Tests that a database stays loaded while a blob upload holds a reservation against its quota.
-#[test]
-fn databases_with_a_blob_upload_in_flight_are_not_unloaded() {
-    rt().block_on(async {
-        let (a, _store) =
-            delayed_engine_with("a", EngineConfig { db_max_bytes: MIB as u64, ..EngineConfig::default() });
-        let db = opened(&a, "d").await;
-        let mut upload = db.blob_writer("application/octet-stream").await;
-        upload.write(b"partial").await.unwrap();
-        assert!(!db.unload(), "unloaded a database with a blob upload in flight");
-        drop(upload);
-        assert!(db.unload());
     });
 }
 

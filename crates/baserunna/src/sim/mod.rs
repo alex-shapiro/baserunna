@@ -714,11 +714,9 @@ impl Sim {
         for i in self.up_nodes() {
             let Some(n) = self.node(i) else { continue };
             for db in n.node.engine.open_dbs() {
-                if db.leased_view().is_none() {
-                    continue;
-                }
+                let Some(view) = db.leased_view() else { continue };
                 holders.entry(db.id.clone()).or_default().push(i);
-                lease_check::check_lease_view(&db, &*self.store).map_err(|e| format!("n{i} {e}"))?;
+                lease_check::check_lease_view(&db, &view, &*self.store).map_err(|e| format!("n{i} {e}"))?;
             }
         }
         match holders.into_iter().find(|(_, ns)| ns.len() > 1) {

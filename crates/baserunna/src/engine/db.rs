@@ -178,17 +178,6 @@ pub struct LeasedView {
     pub expires_at: Instant,
 }
 
-impl LeasedView {
-    /// Returns how long this node relies on its lease after the lease term ends, if the store
-    /// applied the manifest at `applied_at`. The holder times its lease from before it sends the
-    /// manifest, so the term is `lease_ms - margin_ms` from `applied_at`. Another node honors the
-    /// lease for `lease_ms + margin_ms` from its first read of the manifest, so the term ends first.
-    pub fn lease_overrun(&self, applied_at: Instant, margin_ms: u64) -> Duration {
-        let term = Duration::from_millis(self.lease_ms - margin_ms.min(self.lease_ms));
-        self.expires_at.saturating_duration_since(applied_at + term)
-    }
-}
-
 /// Lease that a database handle holds for this node, which lets it serve strong reads from cache.
 /// A handle takes the lease only from a manifest `PUT` that returned success.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -210,7 +199,7 @@ impl OwnLease {
 
     /// Returns how long this node can still rely on the lease that the manifest at `write_seq`
     /// gives it.
-    fn left_at(self, write_seq: u64) -> Duration {
+    fn time_left_at(self, write_seq: u64) -> Duration {
         match self {
             OwnLease::Held { write_seq: ws, expires_at } if ws == write_seq => {
                 expires_at.saturating_duration_since(Instant::now())
@@ -435,7 +424,7 @@ impl Db {
     /// not the manifest write that last renewed it.
     fn own_lease_left(&self, st: &State, m: &Manifest) -> Duration {
         match m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id) {
-            true => st.own_lease.left_at(m.write_seq),
+            true => st.own_lease.time_left_at(m.write_seq),
             false => Duration::ZERO,
         }
     }
@@ -3095,8 +3084,13 @@ mod tests {
         }
         /// Starts (`true`) or ends (`false`) one kind of work on a database.
         type SetWorkInProgress = fn(&Db, bool);
-        let work: [(&str, SetWorkInProgress); 7] = [
+        let work: [(&str, SetWorkInProgress); 9] = [
             ("a reload of a noticed version", |db, on| db.refreshing.store(on, SeqCst)),
+            ("a manifest write", |db, on| match on {
+                true => drop(db.write_started()),
+                false => db.write_finished(),
+            }),
+            ("a blob upload", |db, on| db.staging().uploading = u64::from(on)),
             ("a commit batch", |db, on| db.q.lock().running = on),
             ("a parked flush install", |db, on| db.q.lock().parked_flush = on.then(parked_flush)),
             ("a compaction", |db, on| db.st.lock().compacting = on),

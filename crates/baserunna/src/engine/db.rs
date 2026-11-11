@@ -455,13 +455,11 @@ impl Db {
 
     /// Records that a manifest `PUT` from this node, sent at `sent`, failed.
     fn fail_own_write(&self, sent: Instant) {
-        self.shared.update_own_lease(&self.id, |l| {
-            if l.has_time_left() {
-                probe::hit(Probe::LeaseReadsStopped);
-                self.shared.metrics.lease_reads_stopped();
-            }
-            l.after_failed_put(sent)
-        });
+        let (before, _) = self.shared.update_own_lease(&self.id, |l| l.after_failed_put(sent));
+        if before.has_time_left() {
+            probe::hit(Probe::LeaseReadsStopped);
+            self.shared.metrics.lease_reads_stopped();
+        }
     }
 
     /// Records that the store holds `m`, which this node sent at `sent`, and that no failed manifest
@@ -475,17 +473,14 @@ impl Db {
     /// [`Db::confirm_own_write`] does. Times the lease in `m` from the earliest failed `PUT`, because
     /// a manifest read cannot tell which failed `PUT` wrote `m`.
     fn confirm_landed_write(&self, m: &Manifest) {
-        self.shared.update_own_lease(&self.id, |l| match l {
-            OwnLease::Unconfirmed { earliest_failed_put_at } => {
-                let granted = self.granted_lease(m, earliest_failed_put_at);
-                if granted.has_time_left() {
-                    probe::hit(Probe::LeaseReadsRestoredFromLandedWrite);
-                    self.shared.metrics.lease_reads_restored_from_landed_write();
-                }
-                granted
-            }
+        let (before, after) = self.shared.update_own_lease(&self.id, |l| match l {
+            OwnLease::Unconfirmed { earliest_failed_put_at } => self.granted_lease(m, earliest_failed_put_at),
             l => l,
         });
+        if before.is_unconfirmed() && after.has_time_left() {
+            probe::hit(Probe::LeaseReadsRestoredFromLandedWrite);
+            self.shared.metrics.lease_reads_restored_from_landed_write();
+        }
     }
 
     /// Caps our lease to the expiration granted by `m` at `sent` because peers can observe `m`
@@ -495,13 +490,15 @@ impl Db {
             OwnLease::Held { expires_at, .. } => expires_at,
             _ => sent,
         };
-        self.shared.update_own_lease(&self.id, |l| match l {
+        let (before, after) = self.shared.update_own_lease(&self.id, |l| match l {
             OwnLease::Held { write_seq, expires_at } if granted < expires_at => {
-                probe::hit(Probe::LeaseShortenedInFlight);
                 OwnLease::Held { write_seq, expires_at: granted }
             }
             l => l,
         });
+        if before != after {
+            probe::hit(Probe::LeaseShortenedInFlight);
+        }
     }
 
     fn foreign_lease<'a>(&self, v: &'a Version) -> Option<(&'a Lease, Duration)> {

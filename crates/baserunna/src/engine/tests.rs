@@ -1278,6 +1278,54 @@ fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_answers() {
     });
 }
 
+/// Tests that this node's lease map removes expired leases at its size bound, and that inserts do
+/// not scan the unexpired leases that the last removal kept until the map doubles.
+#[test]
+fn own_leases_remove_expired_leases_at_the_bound() {
+    use super::db::OwnLease;
+    rt().block_on(async {
+        let (a, _b, _store) = late_manifest_put_nodes();
+        let expired = OwnLease::Held { write_seq: 1, expires_at: Instant::now() };
+        let unconfirmed = OwnLease::Unconfirmed { earliest_failed_put_at: Instant::now() };
+        let len = || a.shared.own_leases.lock().by_db.len();
+        let insert = |db: String, l: OwnLease| {
+            a.shared.update_own_lease(&db, |_| l);
+        };
+        for i in 0..OWN_LEASES_PRUNE_LEN {
+            insert(format!("expired{i}"), expired);
+        }
+        insert("unconfirmed0".into(), unconfirmed);
+        assert_eq!(len(), 1, "the insert at the bound kept the expired leases");
+        for i in 1..=OWN_LEASES_PRUNE_LEN {
+            insert(format!("unconfirmed{i}"), unconfirmed);
+        }
+        assert_eq!(len(), OWN_LEASES_PRUNE_LEN + 1, "setup: the removal at the bound kept the unconfirmed leases");
+        for i in 0..OWN_LEASES_PRUNE_LEN - 1 {
+            insert(format!("expired{i}"), expired);
+        }
+        assert_eq!(len(), 2 * OWN_LEASES_PRUNE_LEN, "an insert removed leases before the map doubled");
+        insert("last".into(), unconfirmed);
+        assert_eq!(len(), OWN_LEASES_PRUNE_LEN + 2, "the insert at twice the kept leases kept the expired leases");
+    });
+}
+
+/// Tests that forgetting a database drops this node's lease state for it.
+#[test]
+fn forget_drops_the_own_lease_of_a_database() {
+    rt().block_on(async {
+        let (a, _b, store) = late_manifest_put_nodes();
+        let db_a = opened(&a, "d").await;
+        put(&db_a, "k", "old").await;
+        *store.cycled_manifest_put_outcomes.lock() = Some((vec![ManifestPutOutcome::FailedBeforeApply], 0));
+        let outcome = commit_new(db_a.clone()).await;
+        assert!(outcome.is_err(), "setup: the commit answered {outcome:?}");
+        let unconfirmed = matches!(a.shared.own_lease("d"), super::db::OwnLease::Unconfirmed { .. });
+        assert!(unconfirmed, "setup: the failed PUT left A unconfirmed");
+        a.forget("d");
+        assert!(a.shared.own_leases.lock().by_db.is_empty(), "A kept its lease state for a forgotten database");
+    });
+}
+
 /// Returns `lease_reads_stopped` and `lease_reads_restored_from_landed_writes` of `e`.
 fn lease_read_counters(e: &Engine) -> (u64, u64) {
     let mut metrics = baserunna_api::Metrics::default();

@@ -357,18 +357,6 @@ only.
       a hedged duplicate fails with `412` and retries are exhausted, so the
       committer can determine the outcome instead of returning
       `outcome: "unknown"`.
-- [ ] [nice-to-have · Lease] **Take the lease only from a successful manifest
-      `PUT`.** Remove the retry-loop restore that takes the lease from a
-      manifest written by an ambiguous `PUT` from this node. This product
-      tradeoff needs a decision. The restore has caused three stale strong
-      reads, and it requires the node-wide `Shared::own_leases` map on the
-      strong-read path. If a node takes a lease only from a successful `PUT`,
-      the lease returns to the database handle. The cost is a few manifest `GET`s
-      after a lost response. In the 15 s after a lost response, reads every
-      1.5 s send 10 `GET`s instead of 8, and reads every 250 ms send 14 `GET`s
-      instead of 0. A hot database sends one lease `PUT` with or without the restore.
-      Recommended. If the restore stays, also restore the lease from a manifest
-      `PUT` that the store applied after its batch ended.
 - [ ] [nice-to-have · Operations] **Account for object overhead in the segment
       block cache.** Increase the per-entry overhead in `CacheVal::size` above
       48 bytes so small block-cache entries are not undercounted by half of
@@ -532,6 +520,14 @@ only.
       `PUT` failed, the node does not send a commit notice (`Shared::committed`)
       or start event maintenance (`Shared::events_changed`). Change-feed
       waiters on other nodes find the commit at their next poll.
+- [ ] [tangential · Lease] **Request the read lease after a landed ambiguous
+      `PUT` on a read-heavy database.** After the store applies an ambiguous
+      manifest `PUT`, the committer requests a lease-only `PUT` with the 5 s
+      commit lease (SPEC §5.5). If no strong read requests the read lease
+      before that `PUT`, a read-heavy database sends a second lease-only `PUT`
+      about 3.5 s later for the 15 s read lease. One `PUT` with the read lease
+      is sufficient. The saving is not measured. It is at most one `PUT` for
+      each landed ambiguous `PUT`.
 - [ ] [tangential · API] **Return `200` if a retried database deletion
       completes cleanup.** Return `200` instead of `404 not_found` if a
       retried `DELETE /v1/dbs/{db}` finishes an interrupted database deletion.

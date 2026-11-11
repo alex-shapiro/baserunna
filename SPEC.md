@@ -544,12 +544,14 @@ If a conditional `PUT` on the manifest does not succeed on the first attempt:
 - On `412 Precondition Failed`, the stored manifest changed. Another node updated it, or storage applied an earlier failed `PUT` from this node or this `PUT` itself. The committer reloads the manifest. If another node now holds a valid lease, the batch fails with `not_owner`; otherwise the committer re-runs validation and applies the batch against the new `base`.
 - On a timeout or network error, it is unknown whether the `PUT` succeeded. The committer reloads the manifest and retries against the new `base`. If an earlier `PUT` succeeded, step 4 finds the batch's commit records in the reloaded manifest and returns their committed versions without re-applying the writes. If the reloaded manifest's etag differs from all etags targeted by the batch's ambiguous `PUT`s and contains none of the batch's commit records, none of the ambiguous `PUT`s can succeed, so the batch outcome is settled. If retries are exhausted or the lease is lost while the outcome remains ambiguous, the committer returns `503 unavailable` with `outcome: "unknown"` for undecided transactions, while returning the recorded outcome for any transaction in the batch whose commit record is already present in the latest manifest.
 
-A manifest `PUT` that fails with any error stops strong reads from cache on this node (§5.7, §5.9). Storage can apply a failed `PUT` at a later time while the stored manifest still has the `If-Match` etag. A `412` response also shows that the cached manifest is old. A manifest read that returns the cached version does not end this state. Strong reads from cache start again only if this node confirms a manifest version that a failed `PUT` from this node cannot replace:
+A manifest `PUT` that fails with any error stops strong reads from cache on this node (§5.7, §5.9). Storage can apply a failed `PUT` at a later time while the stored manifest still has the `If-Match` etag. A `412` response also shows that the cached manifest is old. Strong reads from cache start again only after a manifest `PUT` from this node succeeds. A successful `PUT` gives the stored manifest a new etag, so storage rejects each earlier failed `PUT` from this node. The node times its lease from the start of the successful `PUT`.
 
-- A manifest `PUT` from this node succeeds.
-- A reload in the same batch finds a manifest with this node's lease and the `write_seq` of an ambiguous `PUT` from this batch. In addition, that manifest's etag differs from the `If-Match` etags of the batch's ambiguous `PUT`s. Each manifest write contains its writer's lease unless it releases the lease, so a failed `PUT` from this node wrote that manifest. That `PUT` can be from this batch or from an earlier batch that sent the same `write_seq`. A reload cannot show which failed `PUT` wrote the manifest. Therefore, the node times the lease in that manifest from the start of the earliest failed `PUT` since the last confirmed version. The node keeps that instant if it evicts or unloads the database handle.
+A manifest read does not end this state. A reload can find a manifest that a failed `PUT` from this node wrote, with this node's lease. The reload cannot show which failed `PUT` wrote that manifest or when storage applied it, so the node does not take the lease from it. The node keeps its lease state in the database handle. A new handle holds no lease until one of its `PUT`s succeeds, so a handle eviction cannot start strong reads from cache.
 
-Until then, each strong read on this node sends a conditional `GET` (§5.9). On a read-heavy database, strong reads request a lease-only `PUT` (§5.7). That `PUT` confirms a version.
+Until a `PUT` succeeds, each strong read on this node sends a conditional `GET` (§5.9). Two rules end this state without a commit:
+
+- If the reload of a commit batch finds a manifest with this node's lease and the `write_seq` of an ambiguous `PUT` from that batch, and the batch has nothing more to write, the committer requests one lease-only `PUT`. After the failed `PUT`, a lost response then costs the same as a lost request: one manifest `GET` and one `PUT`.
+- On a read-heavy database, strong reads request a lease-only `PUT` (§5.7).
 
 #### Hedged Manifest Writes
 
@@ -656,7 +658,7 @@ Each node tracks lease timing on its own monotonic clock, with a 0.5 second marg
 - Every other node considers that lease valid until `duration + 0.5 s` after it first observed that renewal. Observed lease timestamps are retained even if an idle database handle is evicted from memory.
 - A node that loads a manifest from object storage also treats its lease as expired if the store's clock (§5.8), minus clock error, exceeds `last_modified + precision + 2 × duration + 0.5 s`. Because the holder started its lease timer before the store recorded `last_modified`, stale leases left behind by crashed nodes can be taken over immediately without waiting for a local timer.
 - A manifest write can shorten the holder's lease (for example, a commit after a longer read renewal) or release it. Because other nodes can observe the write as soon as it is sent, the holder immediately bounds its lease to the duration granted by the sent write regardless of whether the write succeeds.
-- If a manifest `PUT` from the holder fails with any error, the holder stops relying on its lease. Storage can still apply that `PUT`. The holder relies on a lease again only after it confirms a manifest version (§5.5).
+- If a manifest `PUT` from the holder fails with any error, the holder stops relying on its lease. Storage can still apply that `PUT`. The holder relies on a lease again only after one of its manifest `PUT`s succeeds (§5.5).
 
 Each commit renews the lease for 5 seconds. On a read-heavy database where at least 16 strong reads occured within the current or previous lease window, the holder issues a lease-only manifest CAS about 1 s before expiry to renew the lease for 15 seconds. At ~$0.005 per 1,000 `PUT` versus ~$0.0004 per 1,000 `GET`s, a read-lease renewal pays for itself if it saves 12 conditional `GET` requests.
 
@@ -710,7 +712,7 @@ Deleting a database marks its record as deleted in the system database. After a 
 There are two read consistency modes:
 
 - `snapshot` consistency serves reads from a cached serializable snapshot that is at most `max_staleness_ms` old (5 s by default). Each node caches its own snapshot, so a client that reads from different nodes can observe an older snapshot after a newer snapshot.
-- `strong` consistency guarantees linearizability. A node serves a strong read from cache if its lease is valid and confirmed (§5.5) and it is not writing the manifest. Otherwise, the node sends `GET manifest If-None-Match: etag` first.
+- `strong` consistency guarantees linearizability. A node serves a strong read from cache if it holds a valid lease from a successful manifest `PUT` (§5.5) and it is not writing the manifest. Otherwise, the node sends `GET manifest If-None-Match: etag` first.
 
 ### 5.10 Size Quotas
 
@@ -1459,9 +1461,7 @@ participating `request_ids`. The mail webhook receives `{"from", "to",
 operations, commit batches, HTTP routes, and tokio scheduler lag, along with
 process CPU time and host steal time on Linux. The commit metrics also count
 failed manifest `PUT`s that stop strong reads from cache under an unexpired
-lease (`lease_reads_stopped`). In addition, they count manifest reloads that
-start strong reads from cache again from a landed write with an unexpired lease
-(`lease_reads_restored_from_landed_writes`, §5.5).
+lease (`lease_reads_stopped`, §5.5).
 `DELETE /v1/admin/metrics` returns and resets the metrics.
 
 On SIGTERM or SIGINT, a node drains (failing `/healthz`), stops accepting
@@ -1649,7 +1649,7 @@ scripts/mutants.sh                                               # run mutation 
 24. _Commit status checks after commit record expiration._ Checking `/commits/{id}` after `commit_retention_ms` elapsed returned `not_committed` even when the commit had been applied. The response now includes `retention_ms` so callers know when the status is no longer definitive (§6.2).
 25. _Obsolete objects retained after ambiguous writes._ Obsolete objects removed from a manifest were deleted from storage only when the manifest `PUT` returned `Ok`. Obsolete objects past their grace period are now deleted even when the manifest `PUT` outcome is unknown (§5.5).
 26. _Self-forwarding after a restart._ A node that restarted at the same network address treated its previous node ID as a live peer and forwarded requests to itself. Nodes now ignore membership entries with their own address (§7).
-27. _Lease state lost after ambiguous writes._ When a manifest `PUT` timed out after being applied and a retry reloaded the committed manifest, the node did not record itself as the lease holder. Reloading a manifest written by an ambiguous write from the same node now restores the local lease state (§5.5).
+27. _Lease state lost after ambiguous writes._ When a manifest `PUT` timed out after being applied and a retry reloaded the committed manifest, the node did not record itself as the lease holder. If a commit batch now ends at a manifest that an ambiguous write from the same node wrote, the committer requests a lease-only `PUT`. That `PUT` gives the node its lease (§5.5).
 28. _Stale authorization cached after a slow read._ Caching role lookups relative to when the read completed allowed a lookup that started before a role revocation to remain cached after the revocation committed. Cache expiration is now measured from the start of the read (§8).
 29. _Unknown lease holder in routing table._ When a newly started node acquired a lease before peers refreshed their membership table, peers failed to forward requests to it. Nodes now trigger a strong membership refresh when a lease holder is missing from the cached member list (§7).
 30. _Non-idempotent password reset retries._ If session creation failed after a password reset updated the password hash, retrying with the same reset link failed with `401`. Retrying a reset token with the same password now completes the reset.
@@ -1669,7 +1669,7 @@ scripts/mutants.sh                                               # run mutation 
 44. _Duplicate background flushes shadowing sealed stream chunks._ Installing a stale background flush after another flush of the same entries produced duplicate stream records that shadowed sealed stream chunks. Flush installs now verify that `flush_seq` is unchanged (§5.5).
 45. _Referenced stream chunks deleted after ambiguous flush install._ Retrying a flush install after an ambiguous manifest write treated the already-installed flush as superseded and deleted its chunks. Superseded flushes after an ambiguous write now preserve their output objects.
 46. _Precondition failure overtaken by in-flight attempt._ If a retried idempotent request failed a precondition while an earlier attempt was still in flight, the earlier attempt could still be committed after the `412` response. Precondition failures now write an abort record before returning (§6.2).
-47. _Stale leased reads during hedged manifest writes._ If a hedged duplicate `PUT` failed with `412` while the primary `PUT` was still in flight, the node reloaded the prior manifest and served leased reads before the primary `PUT` completed. A failed manifest `PUT` now stops strong reads from cache until this node confirms a manifest write that a failed `PUT` cannot replace. A manifest read that returns the cached version does not end this state (§5.5).
+47. _Stale leased reads during hedged manifest writes._ If a hedged duplicate `PUT` failed with `412` while the primary `PUT` was still in flight, the node reloaded the prior manifest and served leased reads before the primary `PUT` completed. A failed manifest `PUT` now stops strong reads from cache until a manifest `PUT` from this node succeeds. A manifest read does not end this state (§5.5).
 48. _Levels object garbage-collected during stalled manifest read._ If a manifest read stalled past the GC grace period, its `.levels` object could be deleted before being fetched, causing a `500` error. The node now reloads the manifest if a `.levels` object is not found (§5.8).
 49. _Forwards rejected after a peer restart._ When a node forwarded a request to a peer that had restarted at the same address with a new node ID, the peer returned `503` and the entry node returned that error to the client until its membership cache refreshed. The peer now tags the rejection with `x-baserunna-stale-target`, and the entry node marks the peer as suspect and handles buffered requests locally (§7).
 50. _Event table drops starved by inserts._ Dropping an event table previously scanned all part references into the transaction read set, causing concurrent binds, seals, or merges to trigger serializable conflicts under steady insert load. Dropping an event table now writes range tombstones without reading individual part references and subtracts the table's recorded part bytes in the committer (§5.13).

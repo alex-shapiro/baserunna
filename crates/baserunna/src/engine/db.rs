@@ -184,34 +184,22 @@ impl LeasedView {
     }
 }
 
-/// This node's lease on a database, which lets it serve strong reads from cache.
+/// Lease that a database handle holds for this node, which lets it serve strong reads from cache.
+/// A handle takes the lease only from a manifest `PUT` that returned success.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum OwnLease {
+enum OwnLease {
     #[default]
     NotHeld,
-    /// The store holds the manifest at `write_seq`, which this node wrote with its lease. This node
-    /// serves strong reads from cache until `expires_at`.
+    /// The store holds the manifest at `write_seq`, which this handle wrote with this node's lease.
+    /// This node serves strong reads from cache until `expires_at`.
     Held { write_seq: u64, expires_at: Instant },
-    /// A manifest `PUT` from this node failed, and no later `PUT` succeeded. The store can still
+    /// A manifest `PUT` from this handle failed, and no later `PUT` succeeded. The store can still
     /// apply a failed `PUT`, or a `412` response showed that the cached manifest is old. Therefore,
-    /// this node validates each strong read against storage. `earliest_failed_put_at` is the
-    /// send instant of the first of these `PUT`s.
-    Unconfirmed { earliest_failed_put_at: Instant },
+    /// this node validates each strong read against storage.
+    Unconfirmed,
 }
 
 impl OwnLease {
-    /// Returns the lease after a manifest `PUT` from this node, sent at `sent`, fails.
-    fn after_failed_put(self, sent: Instant) -> OwnLease {
-        match self {
-            OwnLease::Unconfirmed { .. } => self,
-            _ => OwnLease::Unconfirmed { earliest_failed_put_at: sent },
-        }
-    }
-
-    fn is_unconfirmed(self) -> bool {
-        matches!(self, OwnLease::Unconfirmed { .. })
-    }
-
     fn has_time_left(self) -> bool {
         matches!(self, OwnLease::Held { expires_at, .. } if expires_at > Instant::now())
     }
@@ -239,6 +227,7 @@ struct UnknownWrite {
 
 struct State {
     current: Option<Arc<Version>>,
+    own_lease: OwnLease,
     verified_at: Option<Instant>,
     last_access: Instant,
     last_access_seq: u64,
@@ -329,6 +318,7 @@ impl Db {
         Arc::new(Db {
             st: Mutex::new(State {
                 current: None,
+                own_lease: OwnLease::NotHeld,
                 verified_at: None,
                 last_access: now,
                 last_access_seq: 0,
@@ -430,15 +420,15 @@ impl Db {
 
     /// Remaining duration we may rely on our lease in `m`, or zero if `m` is
     /// not the manifest write that last renewed it.
-    fn own_lease_left(&self, m: &Manifest) -> Duration {
+    fn own_lease_left(&self, st: &State, m: &Manifest) -> Duration {
         match m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id) {
-            true => self.shared.own_lease(&self.id).left_at(m.write_seq),
+            true => st.own_lease.left_at(m.write_seq),
             false => Duration::ZERO,
         }
     }
 
-    fn holds_lease(&self, m: &Manifest) -> bool {
-        !self.own_lease_left(m).is_zero()
+    fn holds_lease(&self, st: &State, m: &Manifest) -> bool {
+        !self.own_lease_left(st, m).is_zero()
     }
 
     /// Returns the lease that `m` gives this node if this node sent `m` at `sent`.
@@ -452,35 +442,20 @@ impl Db {
         }
     }
 
-    /// Records that a manifest `PUT` from this node, sent at `sent`, failed.
-    fn fail_own_write(&self, sent: Instant) {
-        let (before, _) = self.shared.update_own_lease(&self.id, |l| l.after_failed_put(sent));
+    /// Records that a manifest `PUT` from this handle failed.
+    fn fail_own_write(&self) {
+        let before = std::mem::replace(&mut self.st.lock().own_lease, OwnLease::Unconfirmed);
         if before.has_time_left() {
             probe::hit(Probe::LeaseReadsStopped);
             self.shared.metrics.lease_reads_stopped();
         }
     }
 
-    /// Records that the store holds `m`, which this node sent at `sent`, and that a failed
+    /// Records that the store holds `m`, which this handle sent at `sent`, and that a failed
     /// manifest `PUT` from this node cannot replace `m`. Takes the lease in `m` if `m` contains
     /// this node's lease.
     fn confirm_own_write(&self, m: &Manifest, sent: Instant) {
-        let granted = self.granted_lease(m, sent);
-        self.shared.update_own_lease(&self.id, |_| granted);
-    }
-
-    /// Records that the store holds `m`, which a failed `PUT` from this node wrote, as
-    /// [`Db::confirm_own_write`] does. A manifest read cannot show which failed `PUT` wrote `m`, so
-    /// this node times the lease in `m` from the earliest failed `PUT`.
-    fn confirm_landed_write(&self, m: &Manifest) {
-        let (before, after) = self.shared.update_own_lease(&self.id, |l| match l {
-            OwnLease::Unconfirmed { earliest_failed_put_at } => self.granted_lease(m, earliest_failed_put_at),
-            l => l,
-        });
-        if before.is_unconfirmed() && after.has_time_left() {
-            probe::hit(Probe::LeaseReadsRestoredFromLandedWrite);
-            self.shared.metrics.lease_reads_restored_from_landed_write();
-        }
+        self.st.lock().own_lease = self.granted_lease(m, sent);
     }
 
     /// Caps our lease to the expiration granted by `m` at `sent` because peers can observe `m`
@@ -490,13 +465,10 @@ impl Db {
             OwnLease::Held { expires_at, .. } => expires_at,
             _ => sent,
         };
-        let (before, after) = self.shared.update_own_lease(&self.id, |l| match l {
-            OwnLease::Held { write_seq, expires_at } if granted < expires_at => {
-                OwnLease::Held { write_seq, expires_at: granted }
-            }
-            l => l,
-        });
-        if before != after {
+        if let OwnLease::Held { expires_at, .. } = &mut self.st.lock().own_lease
+            && granted < *expires_at
+        {
+            *expires_at = granted;
             probe::hit(Probe::LeaseShortenedInFlight);
         }
     }
@@ -533,7 +505,7 @@ impl Db {
     pub fn leased_view(&self) -> Option<LeasedView> {
         let st = self.st.lock();
         let cur = st.current.as_ref()?;
-        let left = self.own_lease_left(&cur.m);
+        let left = self.own_lease_left(&st, &cur.m);
         (!left.is_zero()).then(|| LeasedView {
             write_seq: cur.m.write_seq,
             etag: cur.etag.clone(),
@@ -544,8 +516,9 @@ impl Db {
     }
 
     pub fn lease_holder(&self) -> Option<String> {
-        let cur = self.current()?;
-        if self.holds_lease(&cur.m) {
+        let st = self.st.lock();
+        let cur = st.current.clone()?;
+        if self.holds_lease(&st, &cur.m) {
             return Some(self.shared.node_id.clone());
         }
         self.observed_lease(&cur).map(|(l, _)| l.node.clone())
@@ -664,7 +637,7 @@ impl Db {
     /// Returns a version validated after `not_before`, fetching the manifest from storage
     /// if needed. Creates the database if `create` is true and the manifest does not exist.
     /// Equal instants do not order the validation and the call, so a validation at `not_before`
-    /// counts only if this node's lease is not [`OwnLease::Unconfirmed`].
+    /// counts only if this handle's lease is not [`OwnLease::Unconfirmed`].
     pub async fn refresh(self: &Arc<Self>, not_before: Instant, create: bool) -> Result<Arc<Version>> {
         Ok(self.refresh_at(not_before, create).await?.0)
     }
@@ -674,7 +647,7 @@ impl Db {
         let (etag, cur) = {
             let st = self.st.lock();
             if let (Some(c), Some(va)) = (&st.current, st.verified_at)
-                && (va > not_before || va == not_before && !self.shared.own_lease(&self.id).is_unconfirmed())
+                && (va > not_before || va == not_before && st.own_lease != OwnLease::Unconfirmed)
             {
                 return Ok((c.clone(), va));
             }
@@ -822,7 +795,7 @@ impl Db {
         let hot = {
             let mut st = self.st.lock();
             let hot = st.hot(self.shared.cfg.lease_read_threshold) && !st.lease_requested;
-            if hot && !self.holds_lease(&v.m) && self.foreign_lease(&v).is_none() && !self.has_in_flight_write() {
+            if hot && !self.holds_lease(&st, &v.m) && self.foreign_lease(&v).is_none() && !self.has_in_flight_write() {
                 st.lease_requested = true;
                 true
             } else {
@@ -853,7 +826,7 @@ impl Db {
         if buggify() {
             return None;
         }
-        let lease_left = self.own_lease_left(&cur.m);
+        let lease_left = self.own_lease_left(&st, &cur.m);
         let leased = !lease_left.is_zero();
         let current_at = leased.then(|| st.manifest_write_started_at.unwrap_or(now)).max(st.verified_at);
         let fresh = match c {
@@ -1011,7 +984,7 @@ impl Db {
             let st = self.st.lock();
             let in_manifest =
                 st.current.as_ref().is_some_and(|c| c.m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id));
-            in_manifest || self.shared.own_lease(&self.id).has_time_left()
+            in_manifest || st.own_lease.has_time_left()
         };
         if !held {
             return Ok(false);
@@ -1256,6 +1229,14 @@ impl Db {
                     let o = mark_superseded_flush_unknown(&w, o, maybe_applied);
                     w.deliver(o);
                 }
+                if unknown_writes.iter().any(|w| w.write_seq == base.m.write_seq)
+                    && base.m.lease.as_ref().is_some_and(|l| l.node == self.shared.node_id)
+                {
+                    // The store applied an ambiguous `PUT` with this node's lease. Only a `PUT`
+                    // that succeeds gives this handle the lease.
+                    probe::hit(Probe::AmbiguousWriteLanded);
+                    self.enqueue(Work::Lease { release: false, for_reads: false, tx: None });
+                }
                 return;
             };
             if crate::buggify::fires(0.02) {
@@ -1274,7 +1255,7 @@ impl Db {
             };
             let res = self.put_manifest(data, &base.etag).await;
             if !res.is_ok() {
-                self.fail_own_write(attempt_started);
+                self.fail_own_write();
                 self.write_finished();
             }
             match res {
@@ -1342,16 +1323,12 @@ impl Db {
             loop {
                 match self.refresh(Instant::now(), false).await {
                     Ok(v) => {
-                        let replaceable_by_unknown_write = unknown_writes.iter().any(|w| w.base_etag == v.etag);
-                        if unknown_writes.iter().any(|w| w.write_seq == v.m.write_seq) {
-                            probe::hit(Probe::AmbiguousWriteLanded);
-                            if !replaceable_by_unknown_write {
-                                self.confirm_landed_write(&v.m);
-                            }
-                        }
                         // Once the manifest moves past every ETag targeted by an ambiguous write,
                         // any write that was not applied cannot succeed.
-                        if maybe_applied && !replaceable_by_unknown_write && !self.has_applied_work(&v, &batch).await {
+                        if maybe_applied
+                            && !unknown_writes.iter().any(|w| w.base_etag == v.etag)
+                            && !self.has_applied_work(&v, &batch).await
+                        {
                             probe::hit(Probe::AmbiguousWriteSettled);
                             maybe_applied = false;
                         }
@@ -2148,7 +2125,7 @@ impl Db {
         }
         {
             let mut st = self.st.lock();
-            if st.flushing || !self.holds_lease(&v.m) {
+            if st.flushing || !self.holds_lease(&st, &v.m) {
                 return;
             }
             st.flushing = true;
@@ -2177,7 +2154,7 @@ impl Db {
     /// state lock, clearing `flag` if not.
     fn has_more_work(&self, flag: fn(&mut State) -> &mut bool, due: impl Fn(&Manifest) -> bool) -> bool {
         let mut st = self.st.lock();
-        let again = st.current.as_ref().is_some_and(|c| self.holds_lease(&c.m) && due(&c.m));
+        let again = st.current.as_ref().is_some_and(|c| self.holds_lease(&st, &c.m) && due(&c.m));
         if !again {
             *flag(&mut st) = false;
         }
@@ -2357,7 +2334,7 @@ impl Db {
         loop {
             let store_now = self.shared.store_time_ms().await?;
             let Some(v) = self.current() else { return Ok(()) };
-            if !self.holds_lease(&v.m) {
+            if !self.holds_lease(&self.st.lock(), &v.m) {
                 probe::hit(Probe::CompactionLostLease);
                 return Ok(());
             }
@@ -2414,7 +2391,7 @@ impl Db {
         let cfg = self.shared.cfg.clone();
         let now_ms = self.shared.store_time_ms().await?;
         let v = self.refresh(Instant::now(), false).await?;
-        if !self.holds_lease(&v.m) {
+        if !self.holds_lease(&self.st.lock(), &v.m) {
             return Ok(());
         }
         let mut referenced: BTreeSet<(ObjKind, String)> =
@@ -2994,7 +2971,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_write_recovery_renews_lease() {
+    fn ambiguous_write_recovery_renews_lease_with_a_lease_put() {
         use crate::engine::tests::{delayed_engine_with, opened, put};
         use std::sync::atomic::Ordering::SeqCst;
         rt().block_on(async {
@@ -3002,10 +2979,15 @@ mod tests {
             let (eng, store) = delayed_engine_with("a", cfg);
             let db = opened(&eng, "d").await;
             put(&db, "k", "1").await;
+            store.put_reply_ms.store(50, SeqCst);
             store.manifest_put_lost.store(1, SeqCst);
             put(&db, "k", "2").await;
-            let cur = db.current().unwrap();
-            assert!(db.holds_lease(&cur.m));
+            let landed = db.current().unwrap();
+            assert!(!db.holds_lease(&db.st.lock(), &landed.m), "took the lease from a PUT that returned an error");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let renewed = db.current().unwrap();
+            assert_eq!(renewed.m.write_seq, landed.m.write_seq + 1, "no lease-only PUT followed the landed write");
+            assert!(db.holds_lease(&db.st.lock(), &renewed.m));
         });
     }
 

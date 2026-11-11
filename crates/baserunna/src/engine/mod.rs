@@ -27,7 +27,6 @@ use tokio::sync::Semaphore;
 
 pub use baserunna_api::{DbStats, LevelStats};
 pub use config::EngineConfig;
-use db::OwnLease;
 pub use db::{CommitState, Committed, Consistency, Db, LeasedView};
 pub use stream::{Appended, Record, Retention, Seek, StreamOp, StreamState};
 pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
@@ -49,8 +48,6 @@ pub struct Shared {
     /// Latest observed foreign lease `(holder, write_seq, first_seen)` per
     /// database, retained across `Db` handle evictions.
     pub(crate) observed_leases: Mutex<DetHashMap<String, (String, u64, tokio::time::Instant)>>,
-    /// This node's own lease per database, retained across `Db` handle evictions.
-    own_leases: Mutex<OwnLeases>,
     system: Mutex<std::collections::BTreeSet<String>>,
     pub memory: Arc<memory::Memory>,
     engine: std::sync::OnceLock<std::sync::Weak<Engine>>,
@@ -179,46 +176,7 @@ impl Shared {
         g.insert(db.to_string(), (lease.node.clone(), write_seq, now));
         now
     }
-
-    /// Returns this node's own lease for `db`.
-    pub(crate) fn own_lease(&self, db: &str) -> OwnLease {
-        self.own_leases.lock().by_db.get(db).copied().unwrap_or_default()
-    }
-
-    /// Replaces this node's own lease for `db` with `f` applied to it. Returns the lease before and
-    /// after the change.
-    pub(crate) fn update_own_lease(&self, db: &str, f: impl FnOnce(OwnLease) -> OwnLease) -> (OwnLease, OwnLease) {
-        let mut g = self.own_leases.lock();
-        let before = g.by_db.get(db).copied().unwrap_or_default();
-        let after = f(before);
-        if after == OwnLease::NotHeld {
-            g.by_db.remove(db);
-        } else if let Some(l) = g.by_db.get_mut(db) {
-            *l = after;
-        } else {
-            if g.by_db.len() >= g.prune_at_len.max(OWN_LEASES_PRUNE_LEN) {
-                let now = tokio::time::Instant::now();
-                g.by_db.retain(|_, l| !matches!(l, OwnLease::Held { expires_at, .. } if *expires_at <= now));
-                g.prune_at_len = 2 * g.by_db.len();
-            }
-            g.by_db.insert(db.to_string(), after);
-        }
-        (before, after)
-    }
 }
-
-/// This node's own lease per database. A database without an entry has [`OwnLease::NotHeld`].
-#[derive(Default)]
-struct OwnLeases {
-    by_db: DetHashMap<String, OwnLease>,
-    /// Entry count at which an insert removes expired leases, if the count is at least
-    /// [`OWN_LEASES_PRUNE_LEN`]. Each removal sets this threshold to twice the remaining entries,
-    /// so inserts do not repeatedly scan the same unexpired entries.
-    prune_at_len: usize,
-}
-
-/// Minimum entry count at which [`Shared::update_own_lease`] removes expired leases.
-const OWN_LEASES_PRUNE_LEN: usize = 100_000;
 
 pub fn manifest_key(db: &str) -> String {
     format!("dbs/{db}/manifest")
@@ -333,7 +291,6 @@ impl Engine {
             retry: Retry::default(),
             clock: clock::StoreClock::new(),
             observed_leases: Mutex::new(DetHashMap::default()),
-            own_leases: Mutex::default(),
             system: Mutex::new(Default::default()),
             memory,
             engine: std::sync::OnceLock::new(),
@@ -449,11 +406,10 @@ impl Engine {
         g.retain(|_, db| Arc::strong_count(db) > 1 || !db.idle_for(idle_ms));
     }
 
-    /// Removes the handle, cached entries, and this node's lease state for database `id`.
+    /// Removes the handle and cached entries for database `id`.
     pub fn forget(&self, id: &str) {
         self.dbs.lock().remove(id);
         self.shared.cache.evict_db(id);
-        self.shared.update_own_lease(id, |_| OwnLease::NotHeld);
     }
 
     /// Deletes all objects belonging to database `id` from storage.

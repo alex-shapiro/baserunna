@@ -67,13 +67,11 @@ probes! {
     ManifestCasLost,
     /// A manifest write failed with an ambiguous outcome.
     ManifestWriteAmbiguous,
-    /// A manifest reload confirmed that a previous ambiguous write was applied.
+    /// A commit batch ended at a manifest that the store applied from an ambiguous `PUT` with this
+    /// node's lease, and requested a lease-only `PUT`.
     AmbiguousWriteLanded,
     /// A failed manifest `PUT` stopped strong reads from cache under an unexpired lease.
     LeaseReadsStopped,
-    /// A manifest reload restarted strong reads from cache using an unexpired lease from a failed
-    /// `PUT` of this node.
-    LeaseReadsRestoredFromLandedWrite,
     /// A commit was rejected because another node held an active lease.
     CommitNotOwner,
     /// A commit batch encountered a foreign lease after an ambiguous write attempt.

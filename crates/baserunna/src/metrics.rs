@@ -104,7 +104,6 @@ pub struct StoreMetrics {
     batch_txns: AtomicU64,
     batch_txns_max: AtomicU64,
     lease_reads_stopped: AtomicU64,
-    lease_reads_restored_from_landed_writes: AtomicU64,
 }
 
 impl StoreMetrics {
@@ -126,12 +125,6 @@ impl StoreMetrics {
         self.lease_reads_stopped.fetch_add(1, Relaxed);
     }
 
-    /// Counts a manifest reload that restarted strong reads from cache using an unexpired lease
-    /// from a failed `PUT`.
-    pub fn lease_reads_restored_from_landed_write(&self) {
-        self.lease_reads_restored_from_landed_writes.fetch_add(1, Relaxed);
-    }
-
     /// Sets the object store and commit metrics in `out`.
     pub fn fill(&self, out: &mut api::Metrics) {
         for class in ObjectClass::ALL {
@@ -150,7 +143,6 @@ impl StoreMetrics {
             txns_per_batch: (self.batch_txns.load(Relaxed) as f64 / batches * 10.0).round() / 10.0,
             max_txns_per_batch: self.batch_txns_max.load(Relaxed),
             lease_reads_stopped: self.lease_reads_stopped.load(Relaxed),
-            lease_reads_restored_from_landed_writes: self.lease_reads_restored_from_landed_writes.load(Relaxed),
         };
     }
 
@@ -161,7 +153,6 @@ impl StoreMetrics {
         self.batch_txns.store(0, Relaxed);
         self.batch_txns_max.store(0, Relaxed);
         self.lease_reads_stopped.store(0, Relaxed);
-        self.lease_reads_restored_from_landed_writes.store(0, Relaxed);
     }
 }
 

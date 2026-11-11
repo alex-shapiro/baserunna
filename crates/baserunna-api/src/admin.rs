@@ -87,11 +87,9 @@ pub struct CommitMetrics {
     pub txns_per_batch: f64,
     pub max_txns_per_batch: u64,
     /// Failed manifest `PUT`s that stopped strong reads from cache under an unexpired lease. Until
-    /// this node confirms a manifest write, each strong read on that database reads the manifest.
+    /// a manifest `PUT` from this node succeeds, each strong read on that database reads the
+    /// manifest.
     pub lease_reads_stopped: u64,
-    /// Manifest reloads that restarted strong reads from cache using an unexpired lease from a
-    /// failed `PUT` of this node.
-    pub lease_reads_restored_from_landed_writes: u64,
 }
 
 /// Process and host-steal CPU time in milliseconds, or `None` if `/proc` is unavailable.

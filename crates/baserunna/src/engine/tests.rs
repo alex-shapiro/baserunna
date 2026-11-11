@@ -651,6 +651,20 @@ pub(super) async fn put(db: &Arc<Db>, k: &str, v: &str) -> Seq {
     db.commit(t.into_request()).await.unwrap()
 }
 
+/// Commits `k = v` on `db` as soon as `db` reads no valid lease of another node.
+pub(super) async fn put_when_owner(db: &Arc<Db>, k: &str, v: &str) -> Seq {
+    loop {
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        t.put(Bytes::from(k.to_string()), Value::Inline(Bytes::from(v.to_string()))).unwrap();
+        match db.commit(t.into_request()).await {
+            Err(Error::NotOwner { retry_after_ms, .. }) => {
+                tokio::time::sleep(Duration::from_millis(retry_after_ms)).await;
+            }
+            committed => return committed.unwrap(),
+        }
+    }
+}
+
 #[test]
 fn installed_versions_never_go_back() {
     rt().block_on(async {
@@ -1246,9 +1260,10 @@ fn strong_read_after_an_applied_manifest_put_returns_412_is_new() {
 }
 
 /// Tests that a node validates each strong read against storage after a rejected commit retry until
-/// the commit finishes.
+/// a later manifest `PUT` from the node succeeds. The reload that finds the landed write does not
+/// give the lease back. The lease-only `PUT` that the commit batch requests gives it back.
 #[test]
-fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_finishes() {
+fn lease_reads_stay_off_from_a_rejected_retry_until_a_put_succeeds() {
     use crate::util::{Either, race};
     rt().block_on(async {
         let (a, _b, store) = late_manifest_put_nodes();
@@ -1256,6 +1271,7 @@ fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_finishes() {
         put(&db_a, "k", "old").await;
         store.failed_manifest_puts.store(1, SeqCst);
         store.apply_late_puts_on_next_put.store(true, SeqCst);
+        let puts_before_commit = store.manifest_puts.load(SeqCst);
         let mut commit = Box::pin(commit_new(db_a.clone()));
         let mut rejected = Box::pin(store.manifest_put_rejected.notified());
         if let Either::Left(outcome) = race(&mut commit, &mut rejected).await {
@@ -1275,63 +1291,20 @@ fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_finishes() {
             }
         };
         assert!(outcome.is_ok(), "setup: the commit answered {outcome:?}");
-        assert_eq!(lease_read_counters(&a), (1, 1), "the metrics do not count the stop and the restore of lease reads");
+        assert_eq!(lease_reads_stopped(&a), 1, "the metrics do not count the stop of lease reads");
+        sleep_ms(1).await;
+        let puts = store.manifest_puts.load(SeqCst) - puts_before_commit;
+        assert_eq!(puts, 3, "want a failed PUT, a rejected PUT, and a lease-only PUT");
+        let stored = store.stored_manifest_etag("d").unwrap();
+        assert_eq!(db_a.leased_view().map(|v| v.etag), Some(stored), "the lease-only PUT did not give A its lease");
     });
 }
 
-/// Tests that this node's lease map removes expired leases at its size bound, and that inserts do
-/// not scan the remaining unexpired leases until the map doubles.
-#[test]
-fn own_leases_remove_expired_leases_at_the_bound() {
-    use super::db::OwnLease;
-    rt().block_on(async {
-        let (a, _b, _store) = late_manifest_put_nodes();
-        let expired = OwnLease::Held { write_seq: 1, expires_at: Instant::now() };
-        let unconfirmed = OwnLease::Unconfirmed { earliest_failed_put_at: Instant::now() };
-        let len = || a.shared.own_leases.lock().by_db.len();
-        let insert = |db: String, l: OwnLease| {
-            a.shared.update_own_lease(&db, |_| l);
-        };
-        for i in 0..OWN_LEASES_PRUNE_LEN {
-            insert(format!("expired{i}"), expired);
-        }
-        insert("unconfirmed0".into(), unconfirmed);
-        assert_eq!(len(), 1, "the insert at the bound kept the expired leases");
-        for i in 1..=OWN_LEASES_PRUNE_LEN {
-            insert(format!("unconfirmed{i}"), unconfirmed);
-        }
-        assert_eq!(len(), OWN_LEASES_PRUNE_LEN + 1, "setup: the removal at the bound kept the unconfirmed leases");
-        for i in 0..OWN_LEASES_PRUNE_LEN - 1 {
-            insert(format!("expired{i}"), expired);
-        }
-        assert_eq!(len(), 2 * OWN_LEASES_PRUNE_LEN, "an insert removed leases before the map doubled");
-        insert("last".into(), unconfirmed);
-        assert_eq!(len(), OWN_LEASES_PRUNE_LEN + 2, "the insert at twice the kept leases kept the expired leases");
-    });
-}
-
-/// Tests that forgetting a database drops this node's lease state for it.
-#[test]
-fn forget_drops_the_own_lease_of_a_database() {
-    rt().block_on(async {
-        let (a, _b, store) = late_manifest_put_nodes();
-        let db_a = opened(&a, "d").await;
-        put(&db_a, "k", "old").await;
-        *store.cycled_manifest_put_outcomes.lock() = Some((vec![ManifestPutOutcome::FailedBeforeApply], 0));
-        let outcome = commit_new(db_a.clone()).await;
-        assert!(outcome.is_err(), "setup: the commit answered {outcome:?}");
-        let unconfirmed = matches!(a.shared.own_lease("d"), super::db::OwnLease::Unconfirmed { .. });
-        assert!(unconfirmed, "setup: the failed PUT left A unconfirmed");
-        a.forget("d");
-        assert!(a.shared.own_leases.lock().by_db.is_empty(), "A kept its lease state for a forgotten database");
-    });
-}
-
-/// Returns `lease_reads_stopped` and `lease_reads_restored_from_landed_writes` of `e`.
-fn lease_read_counters(e: &Engine) -> (u64, u64) {
+/// Returns the `lease_reads_stopped` metric of `e`.
+fn lease_reads_stopped(e: &Engine) -> u64 {
     let mut metrics = baserunna_api::Metrics::default();
     e.shared.metrics.fill(&mut metrics);
-    (metrics.commits.lease_reads_stopped, metrics.commits.lease_reads_restored_from_landed_writes)
+    metrics.commits.lease_reads_stopped
 }
 
 /// Tests that a failed manifest `PUT` after the lease ended does not count as stopped lease reads.
@@ -1345,7 +1318,7 @@ fn lease_reads_stopped_ignores_a_failed_put_after_the_lease_ended() {
         assert_eq!(db_a.leased_view(), None, "setup: A's lease ended");
         store.failed_manifest_puts.store(1, SeqCst);
         put(&db_a, "k", "new").await;
-        assert_eq!(lease_read_counters(&a), (0, 0), "A served no lease reads before the failed PUT");
+        assert_eq!(lease_reads_stopped(&a), 0, "A served no lease reads before the failed PUT");
     });
 }
 
@@ -1364,28 +1337,7 @@ fn lease_reads_stopped_ignores_a_lost_cas_without_a_lease() {
         t.put(Bytes::from_static(b"j"), inline("b")).unwrap();
         let outcome = db_b.commit_detailed(t.into_request()).await;
         assert!(matches!(outcome, Err(Error::NotOwner { .. })), "setup: B's commit answered {outcome:?}");
-        assert_eq!(lease_read_counters(&b), (0, 0), "B served no lease reads before its CAS was lost");
-    });
-}
-
-/// Tests that a restored lease that has already expired does not count as restarted lease reads.
-#[test]
-fn lease_reads_restored_ignores_an_expired_lease() {
-    use ManifestPutOutcome::{Applied, AppliedThenFailed, FailedBeforeApply};
-    rt().block_on(async {
-        let (a, _b, store) = late_manifest_put_nodes();
-        let db_a = opened(&a, "d").await;
-        put(&db_a, "k", "old").await;
-        *store.cycled_manifest_put_outcomes.lock() = Some((vec![FailedBeforeApply], 0));
-        let first = commit_new(db_a.clone()).await;
-        assert!(first.is_err(), "setup: the first commit answered {first:?}");
-        *store.cycled_manifest_put_outcomes.lock() = None;
-        sleep_ms(10_000).await;
-        *store.cycled_manifest_put_outcomes.lock() = Some((vec![AppliedThenFailed, Applied], 0));
-        let second = commit_new(db_a.clone()).await;
-        assert!(second.is_ok(), "setup: the second commit answered {second:?}");
-        assert_eq!(db_a.leased_view(), None, "setup: the lease timed from the first failed PUT expired");
-        assert_eq!(lease_read_counters(&a), (1, 0), "the metrics count a restore of an expired lease");
+        assert_eq!(lease_reads_stopped(&b), 0, "B served no lease reads before its CAS was lost");
     });
 }
 
@@ -1420,8 +1372,9 @@ async fn drop_idle_handle(engine: &Engine, db: Arc<Db>, how: IdleHandleDrop) -> 
 
 /// Tests strong reads if the retry read of a failed commit finds a late manifest write from an
 /// earlier batch. Other nodes time the lease in that write from their first read of it. Therefore,
-/// the holder must not time the lease from the later failed `PUT`, even if the holder dropped its
-/// handle in between.
+/// the holder must not time the lease from the later failed `PUT`, also after the holder dropped
+/// its handle in between. The holder takes a new lease only from a `PUT` that succeeds, which B
+/// also reads. B commits as soon as it reads no valid lease of A.
 fn strong_read_after_late_manifest_put_from_an_earlier_batch(handle_drop: IdleHandleDrop) {
     rt().block_on(async {
         let (a, b, store) = late_manifest_put_nodes();
@@ -1447,9 +1400,7 @@ fn strong_read_after_late_manifest_put_from_an_earlier_batch(handle_drop: IdleHa
         let outcome = db_a.commit_detailed(t.into_request()).await;
         assert!(outcome.is_err(), "setup: A's commit on the old manifest answered {outcome:?}");
         sleep_ms(2600).await;
-        let mut t = db_b.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-        t.put(Bytes::from_static(b"k"), inline("newer")).unwrap();
-        db_b.commit_detailed(t.into_request()).await.expect("setup: B could not commit");
+        put_when_owner(&db_b, "k", "newer").await;
         let got = strong_get(&db_a, "k").await;
         assert_eq!(got, Some(inline("newer")), "A served a strong read from cache after B committed");
     });
@@ -1504,6 +1455,51 @@ fn assert_late_puts_rejected(store: &LateManifestPutStore) {
         applied.iter().all(|r| matches!(r, Err(StoreError::PreconditionFailed))),
         "a late write was not rejected: {applied:?}"
     );
+}
+
+/// Tests that A takes no lease from a manifest that a failed `PUT` wrote, also after A dropped the
+/// handle that sent the `PUT`. A validates each strong read against storage until a manifest `PUT`
+/// from A succeeds.
+fn landed_manifest_put_gives_no_lease(handle_drop: IdleHandleDrop) {
+    rt().block_on(async {
+        let (db_a, store, a) = unknown_commit_outcome_nodes().await;
+        let (db_a, dropped) = drop_idle_handle(&a, db_a, handle_drop).await;
+        assert_eq!(dropped, !matches!(handle_drop, IdleHandleDrop::Kept), "setup: {handle_drop:?} dropped {dropped}");
+        let applied = store.apply_late_puts();
+        assert!(applied[0].is_ok(), "setup: the first late write is applied, got {applied:?}");
+        for read in 0..3 {
+            sleep_ms(1).await;
+            let (gets, puts, value) = manifest_requests(&store, strong_get(&db_a, "k")).await;
+            assert_eq!(value, Some(inline("new")), "strong read {read} did not return the late write");
+            assert_eq!((gets, puts), (1, 0), "strong read {read} sent (manifest GETs, PUTs) = {:?}", (gets, puts));
+            assert_eq!(db_a.leased_view(), None, "strong read {read} took the lease from the late write");
+        }
+        let holder = db_a.current().unwrap().m.lease.as_ref().map(|l| l.node.clone());
+        assert_eq!(holder.as_ref(), Some(&a.shared.node_id), "setup: the late write contains A's lease");
+        put(&db_a, "k", "newer").await;
+        let stored = store.stored_manifest_etag("d").unwrap();
+        assert_eq!(db_a.leased_view().map(|v| v.etag), Some(stored), "a successful PUT did not give A its lease");
+    });
+}
+
+#[test]
+fn landed_manifest_put_gives_no_lease_to_its_handle() {
+    landed_manifest_put_gives_no_lease(IdleHandleDrop::Kept);
+}
+
+#[test]
+fn landed_manifest_put_gives_no_lease_after_a_handle_eviction() {
+    landed_manifest_put_gives_no_lease(IdleHandleDrop::Evicted { idle_ms: 0 });
+}
+
+#[test]
+fn landed_manifest_put_gives_no_lease_after_an_idle_eviction() {
+    landed_manifest_put_gives_no_lease(IdleHandleDrop::Evicted { idle_ms: 1000 });
+}
+
+#[test]
+fn landed_manifest_put_gives_no_lease_after_a_memory_unload() {
+    landed_manifest_put_gives_no_lease(IdleHandleDrop::UnloadedForMemory);
 }
 
 /// Tests the store requests that strong reads and a commit send after an unknown commit outcome.
@@ -1876,9 +1872,8 @@ const LEASE_SEARCH_STEPS: [LeaseStep; 12] = [
 ///
 /// Limits: the search drives one database on two nodes, drops handles only by eviction, and checks
 /// the lease views between steps and every 20 ms. The search does not interleave steps inside a
-/// commit batch, so the property test finds defects that the search misses. Depth 4 also misses a
-/// handle eviction that loses the lease state, which depth 5 finds. Run depth 5 (about 100 s on 16
-/// cores) with `LEASE_SEARCH_DEPTH=5 cargo test -p baserunna --lib lease_search`.
+/// commit batch, so the property test finds defects that the search misses. Run depth 5 (about
+/// 100 s on 16 cores) with `LEASE_SEARCH_DEPTH=5 cargo test -p baserunna --lib lease_search`.
 fn lease_search(outcomes: &[ManifestPutOutcome]) {
     let depth = prop::env_u64("LEASE_SEARCH_DEPTH").unwrap_or(4) as u32;
     let total = LEASE_SEARCH_STEPS.len().pow(depth);
@@ -2497,7 +2492,7 @@ fn commit_with_lost_reply_after_takeover(reply_delay_leases: u64, hedge_ms: u64)
         store.put_reply_ms.store(0, SeqCst);
         let db_a = opened(&node_a, "d").await;
         tokio::time::sleep(Duration::from_millis(lease_ms + 100)).await;
-        put(&db_a, "k", "a").await;
+        put_when_owner(&db_a, "k", "a").await;
         commit.await.unwrap()
     })
 }
@@ -2604,6 +2599,26 @@ fn holders_stop_relying_on_their_lease_a_margin_early() {
         tokio::time::sleep_until(start + rely + Duration::from_millis(1)).await;
         db.read_version(Consistency::Strong).await.unwrap();
         assert_eq!(manifest_gets(), before + 1, "a read past the lease was served from the cache");
+    });
+}
+
+/// Tests that a holder stops relying on its lease when it sends a manifest write that releases the
+/// lease. Another node can commit as soon as the store applies that write.
+#[test]
+fn holders_stop_relying_on_their_lease_while_a_release_is_in_flight() {
+    rt().block_on(async {
+        let (eng, store) = delayed_engine("a");
+        let db = opened(&eng, "d").await;
+        put(&db, "k", "v").await;
+        assert!(db.leased_view().is_some(), "setup: the node holds its lease");
+        store.put_reply_ms.store(1_000, SeqCst);
+        let release = tokio::spawn({
+            let db = db.clone();
+            async move { db.release_lease().await }
+        });
+        sleep_ms(10).await;
+        assert_eq!(db.leased_view(), None, "the node relies on its lease while its release is in flight");
+        assert!(release.await.unwrap().unwrap(), "setup: the node did not release its lease");
     });
 }
 

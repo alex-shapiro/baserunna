@@ -1601,8 +1601,8 @@ enum LeaseStep {
     },
 }
 
-/// Generates `n` steps. Each seed disables a random subset of the step kinds other than `Advance`
-/// so that some runs omit commits or lease renewals.
+/// Generates `n` steps. Each seed disables a random subset of the step kinds other than `Advance`.
+/// This produces long step sequences that have no interfering write.
 fn gen_lease_steps(r: &mut Rng, n: usize) -> Vec<LeaseStep> {
     let mut weights = [8.0, 4.0, 6.0, 8.0, 12.0, 27.0, 10.0, 5.0, 5.0, 20.0];
     let advance = weights.len() - 1;

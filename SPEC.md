@@ -1556,7 +1556,7 @@ At the end of every run, storage invariant checks verify that all manifests, lev
 - **Unit tests** in each module.
 - **Property tests** using the in-crate generator and shrinker (`crates/baserunna/src/util/prop.rs`) verify:
   - Codecs, base64, varints, bloom filters, and tuple ordering.
-  - Segments, range tombstones, and LSM-tree operations and change feeds against a reference model.
+  - LSM-tree operations and change feeds against a reference model, segments, and range tombstones.
   - Streams, tables, and indexes.
   - Fair memory allocation and metadata access control.
   - Lease reads under ambiguous manifest `PUT`s, alongside a bounded exhaustive search over short sequences of lease steps on two nodes (`lease_search` in `engine/tests.rs`).

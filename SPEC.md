@@ -544,9 +544,16 @@ If a conditional `PUT` on the manifest does not succeed on the first attempt:
 - On `412 Precondition Failed`, another node updated the manifest. The committer reloads the manifest. If another node now holds a valid lease, the batch fails with `not_owner`; otherwise the committer re-runs validation and applies the batch against the new `base`.
 - On a timeout or network error, it is unknown whether the `PUT` succeeded. The committer reloads the manifest and retries against the new `base`. If an earlier `PUT` succeeded, step 4 finds the batch's commit records in the reloaded manifest and returns their committed versions without re-applying the writes. If the reloaded manifest's etag differs from all etags targeted by the batch's ambiguous `PUT`s and contains none of the batch's commit records, none of the ambiguous `PUT`s can succeed, so the batch outcome is settled. If retries are exhausted or the lease is lost while the outcome remains ambiguous, the committer returns `503 unavailable` with `outcome: "unknown"` for undecided transactions, while returning the recorded outcome for any transaction in the batch whose commit record is already present in the latest manifest.
 
+A manifest `PUT` that fails with any error stops strong reads from cache on this node (§5.7, §5.9). Storage can apply a failed `PUT` at any later time while the stored manifest still has the `If-Match` etag, and a `412` shows that the cached manifest is old. A manifest read that returns the cached version does not end this state. Strong reads from cache start again only when this node confirms a manifest version that no failed `PUT` from this node can replace:
+
+- A manifest `PUT` from this node succeeds.
+- A reload in the same batch finds a manifest written by one of the batch's failed `PUT`s, and no failed `PUT` of the batch targets that manifest's etag. A reload cannot show which failed `PUT` wrote the manifest, so the node times the lease in that manifest from the start of the earliest failed `PUT` since the last confirmed version.
+
+Until then, each strong read on this node sends a conditional `GET` (§5.9). On a read-heavy database, strong reads request a lease-only `PUT` (§5.7), which confirms a version.
+
 #### Hedged Manifest Writes
 
-If a manifest `PUT` does not complete within `manifest_put_hedge_ms` (250 ms), the committer sends a duplicate `PUT` with the same `If-Match` precondition. Because both requests use the same precondition, storage applies at most 1 of them. The attempt succeeds as soon as either request succeeds. If the duplicate fails with `412 Precondition Failed` while the first request is still in flight, the first request may have already been applied, so the committer treats the attempt as a timeout and reloads the manifest immediately. While the first request remains in flight after a rejected duplicate, strong reads bypass the local lease and validate the manifest from storage. On any other error, the committer waits for both requests to finish. Objects removed from `obsolete` by the planned manifest have already passed their grace period, so they are deleted even if the outcome of the `PUT` is unknown.
+If a manifest `PUT` does not complete within `manifest_put_hedge_ms` (250 ms), the committer sends a duplicate `PUT` with the same `If-Match` precondition. Because both requests use the same precondition, storage applies at most 1 of them. The attempt succeeds as soon as either request succeeds. If the duplicate fails with `412 Precondition Failed` while the first request is still in flight, the first request may have already been applied, so the committer treats the attempt as a timeout and reloads the manifest immediately. On any other error, the committer waits for both requests to finish. Objects removed from `obsolete` by the planned manifest have already passed their grace period, so they are deleted even if the outcome of the `PUT` is unknown.
 
 #### Commit Records
 
@@ -649,10 +656,11 @@ Each node tracks lease timing on its own monotonic clock, with a 0.5 second marg
 - Every other node considers that lease valid until `duration + 0.5 s` after it first observed that renewal. Observed lease timestamps are retained even if an idle database handle is evicted from memory.
 - A node that loads a manifest from object storage also treats its lease as expired if the store's clock (§5.8), minus clock error, exceeds `last_modified + precision + 2 × duration + 0.5 s`. Because the holder started its lease timer before the store recorded `last_modified`, stale leases left behind by crashed nodes can be taken over immediately without waiting for a local timer.
 - A manifest write can shorten the holder's lease (for example, a commit after a longer read renewal) or release it. Because other nodes can observe the write as soon as it is sent, the holder immediately bounds its lease to the duration granted by the sent write regardless of whether the write succeeds.
+- If a manifest `PUT` from the holder fails with any error, the holder stops relying on its lease, because storage can still apply that `PUT`. The holder relies on a lease again only after it confirms a manifest version (§5.5).
 
 Each commit renews the lease for 5 seconds. On a read-heavy database where at least 16 strong reads occured within the current or previous lease window, the holder issues a lease-only manifest CAS about 1 s before expiry to renew the lease for 15 seconds. At ~$0.005 per 1,000 `PUT` versus ~$0.0004 per 1,000 `GET`s, a read-lease renewal pays for itself if it saves 12 conditional `GET` requests.
 
-Because other nodes refuse to commit while a lease is valid, the holder's cached `Version` is guaranteed to be current, allowing it to serve strong reads directly from memory.
+Because other nodes refuse to commit while a lease is valid, and the holder stops relying on its lease after a failed manifest `PUT`, the holder's cached `Version` is current while the holder relies on its lease. The holder then serves strong reads directly from memory.
 
 If a lease holder crashes, database writes pause until `duration + 0.5 s` after another node first observes the dead holder's last renewal, or until the store clock shows the lease has expired, whichever comes first. If another node checks the manifest just before the lease would have expired, failover takes at most `2 * duration + 0.5 s`: up to 11 s after a commit renewal or 31 s after a read renewal. Strong reads remain available on all nodes during failover via conditional `GET` validation (§5.9).
 
@@ -702,7 +710,7 @@ Deleting a database marks its record as deleted in the system database. After a 
 There are two read consistency modes:
 
 - `snapshot` consistency serves reads from a cached serializable snapshot that is at most `max_staleness_ms` old (5 s by default). Each node caches its own snapshot, so a client that reads from different nodes can observe an older snapshot after a newer snapshot.
-- `strong` consistency guarantees linearizability. It is served from cache if the serving node holds a valid lease and has no manifest write in flight; otherwise it requests `GET manifest If-None-Match: etag` first.
+- `strong` consistency guarantees linearizability. It is served from cache if the serving node holds a valid lease, has no manifest write in flight, and has no failed manifest `PUT` since its last confirmed manifest version (§5.5); otherwise it requests `GET manifest If-None-Match: etag` first.
 
 ### 5.10 Size Quotas
 

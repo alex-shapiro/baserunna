@@ -162,9 +162,6 @@ impl Work {
 
 struct State {
     current: Option<Arc<Version>>,
-    /// False after an ambiguous write until a manifest read that started after the failure completes.
-    trusted: bool,
-    distrusted_at: Option<Instant>,
     verified_at: Option<Instant>,
     last_access: Instant,
     last_access_seq: u64,
@@ -172,11 +169,9 @@ struct State {
     reads_in_window: u32,
     reads_last_window: u32,
     lease_requested: bool,
-    /// `(write_seq, expires_at)` for the lease held by this node.
+    /// `(write_seq, expires_at)` for the lease that this node got from its last manifest `PUT`,
+    /// if that `PUT` succeeded.
     own_lease: Option<(u64, Instant)>,
-    /// Hedged manifest `PUT` requests that remain in flight in the background.
-    /// Lease-based reads are disabled while this count is non-zero.
-    in_flight_hedged_puts: u32,
     /// Start instant of this node's in-flight manifest write.
     manifest_write_started_at: Option<Instant>,
     compacting: bool,
@@ -191,11 +186,6 @@ struct State {
 }
 
 impl State {
-    fn distrust(&mut self) {
-        self.trusted = false;
-        self.distrusted_at = Some(Instant::now());
-    }
-
     fn hot(&self, threshold: u32) -> bool {
         self.reads_in_window.max(self.reads_last_window) >= threshold
     }
@@ -265,8 +255,6 @@ impl Db {
         Arc::new(Db {
             st: Mutex::new(State {
                 current: None,
-                trusted: false,
-                distrusted_at: None,
                 verified_at: None,
                 last_access: now,
                 last_access_seq: 0,
@@ -275,7 +263,6 @@ impl Db {
                 reads_last_window: 0,
                 lease_requested: false,
                 own_lease: None,
-                in_flight_hedged_puts: 0,
                 manifest_write_started_at: None,
                 compacting: false,
                 flushing: false,
@@ -348,7 +335,7 @@ impl Db {
         let mut st = self.st.lock();
         let q = self.q.lock();
         let busy = q.running || !q.items.is_empty() || q.parked_flush.is_some();
-        if busy || st.compacting || st.flushing || st.sweeping || st.trimming || st.in_flight_hedged_puts > 0 {
+        if busy || st.compacting || st.flushing || st.sweeping || st.trimming {
             return false;
         }
         let Some(cur) = st.current.take() else { return false };
@@ -436,8 +423,7 @@ impl Db {
     pub fn leased_view(&self) -> Option<(u64, String, bool)> {
         let st = self.st.lock();
         let cur = st.current.as_ref()?;
-        (st.trusted && st.in_flight_hedged_puts == 0 && self.holds_lease(&st, &cur.m))
-            .then(|| (cur.m.write_seq, cur.etag.clone(), self.has_in_flight_write()))
+        self.holds_lease(&st, &cur.m).then(|| (cur.m.write_seq, cur.etag.clone(), self.has_in_flight_write()))
     }
 
     pub fn lease_holder(&self) -> Option<String> {
@@ -522,8 +508,8 @@ impl Db {
         }
     }
 
-    /// Installs `v` if it is newer than `current`, and marks `current` as trusted if `verified`
-    /// is not earlier than `distrusted_at`.
+    /// Installs `v` if it is newer than `current`, and records that `current` was the stored
+    /// manifest at `verified`.
     fn install(&self, v: Arc<Version>, verified: Instant) -> Arc<Version> {
         let mut st = self.st.lock();
         self.shared.env.trace(|| {
@@ -551,11 +537,8 @@ impl Db {
         if let Some(l) = installed.m.lease.as_ref().filter(|l| l.node != self.shared.node_id) {
             self.shared.lease_seen(&self.id, l, installed.m.write_seq);
         }
-        if st.distrusted_at.is_none_or(|d| verified >= d) {
-            st.trusted = true;
-            if st.verified_at.is_none_or(|old| verified > old) {
-                st.verified_at = Some(verified);
-            }
+        if st.verified_at.is_none_or(|old| verified > old) {
+            st.verified_at = Some(verified);
         }
         drop(st);
         self.shared.unload_idle();
@@ -574,7 +557,6 @@ impl Db {
             let st = self.st.lock();
             if let (Some(c), Some(va)) = (&st.current, st.verified_at)
                 && va >= not_before
-                && st.trusted
             {
                 return Ok((c.clone(), va));
             }
@@ -753,10 +735,7 @@ impl Db {
         if buggify() {
             return None;
         }
-        let lease_left = match st.trusted && st.in_flight_hedged_puts == 0 {
-            true => self.own_lease_left(&st, &cur.m),
-            false => Duration::ZERO,
-        };
+        let lease_left = self.own_lease_left(&st, &cur.m);
         let leased = !lease_left.is_zero();
         let current_at = leased.then(|| st.manifest_write_started_at.unwrap_or(now)).max(st.verified_at);
         let fresh = match c {
@@ -1089,25 +1068,15 @@ impl Db {
         log::event(Level::Info, "commit", &fields);
     }
 
-    async fn base_for_commit(self: &Arc<Self>) -> Result<Arc<Version>> {
-        let (cur, trusted) = {
-            let st = self.st.lock();
-            (st.current.clone(), st.trusted)
-        };
-        match cur {
-            Some(c) if trusted => Ok(c),
-            _ => self.refresh(Instant::now(), false).await,
-        }
-    }
-
     async fn process(self: &Arc<Self>, batch: Vec<Work>) {
         let cfg = self.shared.cfg.clone();
         let mut maybe_applied = false;
-        let mut unknown_writes: Vec<(u64, Instant, String)> = Vec::new();
+        // `(write_seq, If-Match ETag)` of each manifest `PUT` from this batch with an unknown outcome.
+        let mut unknown_writes: Vec<(u64, String)> = Vec::new();
         // Commit IDs included in an unfenced ambiguous manifest PUT from this batch.
         let mut ambiguous_commit_ids: BTreeSet<u64> = BTreeSet::new();
         let mut attempt = 0u32;
-        let mut base = match self.base_for_commit().await {
+        let mut base = match self.open(false).await {
             Ok(v) => v,
             Err(e) => {
                 self.clear_lease_flag(&batch);
@@ -1187,10 +1156,8 @@ impl Db {
                 data
             };
             let res = self.put_manifest(data, &base.etag).await;
-            if !res.is_ok() {
-                if matches!(res, Err(StoreError::Unavailable(_))) {
-                    self.st.lock().distrust();
-                }
+            if res.is_err() {
+                self.st.lock().own_lease = None;
                 self.write_finished();
             }
             match res {
@@ -1227,11 +1194,10 @@ impl Db {
                         probe::hit(Probe::ObsoleteDeletedAfterAmbiguousWrite);
                     }
                     maybe_applied = true;
-                    unknown_writes.push((m.write_seq, attempt_started, base.etag.clone()));
+                    unknown_writes.push((m.write_seq, base.etag.clone()));
                     for (w, o) in batch.iter().zip(&plan.outcomes) {
                         ambiguous_commit_ids.extend(newly_committed_ids(w, o));
                     }
-                    self.st.lock().distrust();
                     // If the write was applied, `plan.gc` was removed from `obsolete` in the manifest.
                     // These objects have already passed their grace period, so they can be deleted safely
                     // even if the write failed.
@@ -1259,16 +1225,13 @@ impl Db {
             loop {
                 match self.refresh(Instant::now(), false).await {
                     Ok(v) => {
-                        let sent =
-                            unknown_writes.iter().filter(|(ws, ..)| *ws == v.m.write_seq).map(|(_, s, _)| *s).min();
-                        if let Some(sent) = sent {
+                        if unknown_writes.iter().any(|(ws, _)| *ws == v.m.write_seq) {
                             probe::hit(Probe::AmbiguousWriteLanded);
-                            self.note_own_lease(&v.m, sent);
                         }
                         // Once the manifest moves past every ETag targeted by an ambiguous write,
                         // any write that was not applied cannot succeed.
                         if maybe_applied
-                            && !unknown_writes.iter().any(|(.., etag)| *etag == v.etag)
+                            && !unknown_writes.iter().any(|(_, etag)| *etag == v.etag)
                             && !self.has_applied_work(&v, &batch).await
                         {
                             probe::hit(Probe::AmbiguousWriteSettled);
@@ -1364,9 +1327,8 @@ impl Db {
 
     /// Writes the manifest with `If-Match: etag`, issuing a hedged `PUT` after `manifest_put_hedge_ms`.
     /// If the hedged `PUT` fails with `PreconditionFailed` while the first `PUT` is still in flight,
-    /// returns `StoreError::Unavailable` and tracks the first `PUT` in `in_flight_hedged_puts` until
-    /// it finishes.
-    async fn put_manifest(self: &Arc<Self>, data: Bytes, etag: &str) -> crate::store::SResult<String> {
+    /// returns `StoreError::Unavailable` because the store may have applied the first `PUT`.
+    async fn put_manifest(&self, data: Bytes, etag: &str) -> crate::store::SResult<String> {
         let (store, key, etag) = (self.shared.store.clone(), manifest_key(&self.id), etag.to_string());
         let put = || -> crate::store::BoxFut<'static, crate::store::SResult<String>> {
             let (store, key, data, etag) = (store.clone(), key.clone(), data.clone(), etag.clone());
@@ -1402,16 +1364,6 @@ impl Db {
             }
             Err(StoreError::PreconditionFailed) if hedge_won => {
                 probe::hit(Probe::HedgeRejectedFirstInFlight);
-                self.st.lock().in_flight_hedged_puts += 1;
-                let me = self.clone();
-                self.shared.env.spawn(async move {
-                    let landed = !matches!(first.await, Err(StoreError::PreconditionFailed));
-                    let mut st = me.st.lock();
-                    st.in_flight_hedged_puts -= 1;
-                    if landed {
-                        st.distrust();
-                    }
-                });
                 return Err(ambiguous());
             }
             Err(e) => e,
@@ -2924,7 +2876,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_write_recovery_renews_lease() {
+    fn lease_returns_only_with_a_successful_manifest_put() {
         use crate::engine::tests::{delayed_engine_with, opened, put};
         use std::sync::atomic::Ordering::SeqCst;
         rt().block_on(async {
@@ -2932,10 +2884,12 @@ mod tests {
             let (eng, store) = delayed_engine_with("a", cfg);
             let db = opened(&eng, "d").await;
             put(&db, "k", "1").await;
+            assert!(db.leased_view().is_some(), "setup: the commit gives the lease");
             store.manifest_put_lost.store(1, SeqCst);
             put(&db, "k", "2").await;
-            let cur = db.current().unwrap();
-            assert!(db.holds_lease(&db.st.lock(), &cur.m));
+            assert!(db.leased_view().is_none(), "the reload that found the lost reply's write gave the lease");
+            put(&db, "k", "3").await;
+            assert!(db.leased_view().is_some(), "the next successful PUT did not give the lease");
         });
     }
 
@@ -2970,15 +2924,15 @@ mod tests {
         let down = || Unavailable("timeout".into());
         let fatal = || Fatal("403".into());
         let cases = [
-            ((100, ok()), None, Ok(()), 100, false),
-            ((1_000, ok()), Some((10, Err(Refused))), Err(down()), 260, true),
-            ((300, Err(Refused)), Some((500, ok())), Ok(()), 750, false),
-            ((300, Err(down())), Some((100, Err(fatal()))), Err(down()), 350, false),
-            ((300, Err(Refused)), Some((200, Err(Refused))), Err(Refused), 450, false),
-            ((300, Err(fatal())), Some((100, Err(Refused))), Err(fatal()), 350, false),
-            ((1_000, Err(down())), Some((100, Err(fatal()))), Err(down()), 1_000, false),
+            ((100, ok()), None, Ok(()), 100),
+            ((1_000, ok()), Some((10, Err(Refused))), Err(down()), 260),
+            ((300, Err(Refused)), Some((500, ok())), Ok(()), 750),
+            ((300, Err(down())), Some((100, Err(fatal()))), Err(down()), 350),
+            ((300, Err(Refused)), Some((200, Err(Refused))), Err(Refused), 450),
+            ((300, Err(fatal())), Some((100, Err(Refused))), Err(fatal()), 350),
+            ((1_000, Err(down())), Some((100, Err(fatal()))), Err(down()), 1_000),
         ];
-        for (first, hedge, want, ms, in_flight) in cases {
+        for (first, hedge, want, ms) in cases {
             rt().block_on(async {
                 let script = Scripted(parking_lot::Mutex::new(
                     [Some(first.clone()), hedge.clone()].into_iter().flatten().collect(),
@@ -2990,7 +2944,6 @@ mod tests {
                 let db = eng.db("d");
                 let got = db.put_manifest(Bytes::from_static(b"m"), "e1").await.map(drop);
                 let case = format!("first {first:?}, hedge {hedge:?}");
-                assert_eq!(db.st.lock().in_flight_hedged_puts, u32::from(in_flight), "{case}");
                 match (&got, &want) {
                     (Err(Unavailable(_)), Err(Unavailable(_))) => {}
                     _ => assert_eq!(got, want, "{case}"),

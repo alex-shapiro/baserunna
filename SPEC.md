@@ -1457,8 +1457,11 @@ participating `request_ids`. The mail webhook receives `{"from", "to",
 
 `GET /v1/admin/metrics` returns latency histograms for object-store
 operations, commit batches, HTTP routes, and tokio scheduler lag, along with
-process CPU time and host steal time on Linux. `DELETE /v1/admin/metrics`
-returns and resets the histograms.
+process CPU time and host steal time on Linux. The commit metrics also count
+failed manifest `PUT`s that stop strong reads from cache
+(`lease_reads_stopped`), and manifest reloads that start them again from a
+landed write (`lease_reads_restored_from_landed_writes`, §5.5).
+`DELETE /v1/admin/metrics` returns and resets the metrics.
 
 On SIGTERM or SIGINT, a node drains (failing `/healthz`), stops accepting
 connections, ends active `wait_ms` long polls immediately, waits for in-flight

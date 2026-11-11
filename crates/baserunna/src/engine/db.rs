@@ -449,7 +449,13 @@ impl Db {
 
     /// Records that a manifest `PUT` from this node, sent at `sent`, failed.
     fn fail_own_write(&self, sent: Instant) {
-        self.shared.update_own_lease(&self.id, |l| l.after_failed_put(sent));
+        self.shared.update_own_lease(&self.id, |l| {
+            if !l.is_unconfirmed() {
+                probe::hit(Probe::LeaseReadsStopped);
+                self.shared.metrics.lease_reads_stopped();
+            }
+            l.after_failed_put(sent)
+        });
     }
 
     /// Records that the store holds `m`, which this node sent at `sent`, and that no failed manifest
@@ -464,7 +470,14 @@ impl Db {
     /// a manifest read cannot tell which failed `PUT` wrote `m`.
     fn confirm_landed_write(&self, m: &Manifest) {
         self.shared.update_own_lease(&self.id, |l| match l {
-            OwnLease::Unconfirmed { earliest_failed_put_at } => self.granted_lease(m, earliest_failed_put_at),
+            OwnLease::Unconfirmed { earliest_failed_put_at } => {
+                let granted = self.granted_lease(m, earliest_failed_put_at);
+                if granted != OwnLease::NotHeld {
+                    probe::hit(Probe::LeaseReadsRestoredFromLandedWrite);
+                    self.shared.metrics.lease_reads_restored_from_landed_write();
+                }
+                granted
+            }
             l => l,
         });
     }

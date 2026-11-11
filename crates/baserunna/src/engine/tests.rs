@@ -1228,6 +1228,14 @@ fn lease_reads_stay_off_from_a_rejected_retry_until_the_commit_answers() {
             }
         };
         assert!(outcome.is_ok(), "setup: the commit answered {outcome:?}");
+        let mut metrics = baserunna_api::Metrics::default();
+        a.shared.metrics.fill(&mut metrics);
+        let c = metrics.commits;
+        assert_eq!(
+            (c.lease_reads_stopped, c.lease_reads_restored_from_landed_writes),
+            (1, 1),
+            "the metrics do not count the stop and the restore of lease reads"
+        );
     });
 }
 

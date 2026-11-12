@@ -1199,7 +1199,7 @@ async fn commit_applied_with_a_412(cfg: EngineConfig) -> crate::error::Result<Co
 
 /// Tests that a commit that the store applies with a `412` reply is not reported as replayed.
 #[test]
-#[ignore = "TODO.md blocker: Report the correct commit result if the store applies a manifest PUT and returns 412"]
+#[ignore = "TODO.md: Report the correct commit result if the store applies a manifest PUT and returns 412"]
 fn commit_applied_with_a_412_is_not_replayed() {
     rt().block_on(async {
         let outcome = commit_applied_with_a_412(EngineConfig::default()).await;
@@ -1210,7 +1210,7 @@ fn commit_applied_with_a_412_is_not_replayed() {
 /// Tests that a commit whose last manifest `PUT` the store applies with a `412` reply is not
 /// reported as not applied.
 #[test]
-#[ignore = "TODO.md blocker: Report the correct commit result if the store applies a manifest PUT and returns 412"]
+#[ignore = "TODO.md: Report the correct commit result if the store applies a manifest PUT and returns 412"]
 fn commit_applied_with_a_412_on_the_last_attempt_is_not_reported_as_not_applied() {
     rt().block_on(async {
         let cfg = EngineConfig { commit_retry_max: 1, ..EngineConfig::default() };
@@ -1223,7 +1223,7 @@ fn commit_applied_with_a_412_on_the_last_attempt_is_not_reported_as_not_applied(
 /// Tests that a commit is reported as replayed if another node applied its commit ID after this
 /// node sent it in a manifest `PUT` with an unknown outcome that the store did not apply.
 #[test]
-#[ignore = "TODO.md blocker: Report replayed: true if another node applied the commit ID"]
+#[ignore = "TODO.md: Report replayed: true if another node applied the commit ID"]
 fn commit_applied_by_another_node_after_an_unknown_put_is_replayed() {
     rt().block_on(async {
         let (a, b, store) = late_manifest_put_nodes();

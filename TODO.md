@@ -35,30 +35,6 @@ only.
       and `watch`, and 1 failure in 23,571 `events` runs. That failure (seed
       11581) is the `delete_events` deadline defect below, not a lease defect.
       Main fails 588 of 122,174 `register` runs with the same edit.
-- [ ] [blocker · Wrong commit result] **Report the correct commit result if the
-      store applies a manifest `PUT` and returns `412`.** Send a unique write ID
-      in each manifest `PUT` and in its commit records, so that a reload shows
-      which `PUT` wrote the manifest. The store can apply a manifest `PUT` and
-      return `412` (SPEC §5.5), but the committer treats each `412` as not
-      applied. On the first attempt, the commit then returns `replayed: true`,
-      so the API returns `results: null` for the commit that it applied. After
-      the last attempt, the commit returns `503` with `outcome: "not_applied"`,
-      but another node reads the commit. Tests:
-      `commit_applied_with_a_412_is_not_replayed` and
-      `commit_applied_with_a_412_on_the_last_attempt_is_not_reported_as_not_applied`
-      in `src/engine/tests.rs`.
-- [ ] [blocker · Wrong commit result] **Report `replayed: true` if another node
-      applied the commit ID.** Send a unique write ID in each manifest `PUT` and
-      in its commit records, and report `replayed: false` only if the commit
-      record has the write ID of a `PUT` from this batch.
-      `clear_replay_if_sent_in_batch` reports `replayed: false` for each commit
-      ID that the batch sent in a `PUT` with an unknown outcome. If the store
-      did not apply that `PUT` and another node then applied the same commit
-      ID, the commit returns `replayed: false`. The API then returns the
-      results of an execution that did not commit, in place of
-      `replayed: true` and `results: null` (SPEC §6.2). Test:
-      `commit_applied_by_another_node_after_an_unknown_put_is_replayed` in
-      `src/engine/tests.rs`.
 - [ ] [blocker · Tenant resource exhaustion] **Charge event query memory to the
       node `MemoryGate` and fair-share `Node::query_slot`.** Reserve
       `MemoryGate` capacity for event queries and share `Node::query_slot`
@@ -408,13 +384,6 @@ only.
       deletes in `where` and `delete_range`.** Require an explicit full-delete
       flag before an empty `where` selector deletes all table rows or an empty
       `prefix` in `delete_range` deletes all keys.
-- [ ] [nice-to-have · Events] **Fix transactional `delete_events` ops that
-      exceed the request deadline.** Extend or resume a `/txn` `delete_events`
-      op with a cold cache so a slow object store does not fail it repeatedly
-      at `commit_timeout_ms` with `503 request deadline exceeded`. Under a node
-      crash every 24 s, each retry restarts with a cold cache, and the client
-      gives up after 200 attempts (`sim_tool trace events 11581` with
-      `p_late_apply` on). Main also returns this `503` for the same op.
 - [ ] [nice-to-have · Streams] **Fix stream reads that exceed the request
       deadline.** Extend or paginate cold filtered stream reads so slow object
       stores do not fail repeatedly at `commit_timeout_ms` with
@@ -593,3 +562,76 @@ only.
 - [ ] [tangential · Docs] **Correct the deploy trigger statement in
       `DEPLOYING.md`.** Update `DEPLOYING.md` to reflect that the push trigger
       in `deploy.yml` is commented out.
+
+## Untriaged
+
+- [ ] [untriaged · Wrong commit result] **Report the correct commit result if the
+      store applies a manifest `PUT` and returns `412`.** Send a unique write ID
+      in each manifest `PUT` and in its commit records, so that a reload shows
+      which `PUT` wrote the manifest. The store can apply a manifest `PUT` and
+      return `412` (SPEC §5.5), but the committer treats each `412` as not
+      applied. On the first attempt, the commit then returns `replayed: true`,
+      so the API returns `results: null` for the commit that it applied. After
+      the last attempt, the commit returns `503` with `outcome: "not_applied"`,
+      but another node reads the commit. Tests:
+      `commit_applied_with_a_412_is_not_replayed` and
+      `commit_applied_with_a_412_on_the_last_attempt_is_not_reported_as_not_applied`
+      in `src/engine/tests.rs`. Open question: this fault needs a store
+      client that retries a conditional `PUT` after the first attempt applied.
+      It is not known whether a production store client does this.
+- [ ] [untriaged · Wrong commit result] **Report `replayed: true` if another node
+      applied the commit ID.** Send a unique write ID in each manifest `PUT` and
+      in its commit records, and report `replayed: false` only if the commit
+      record has the write ID of a `PUT` from this batch.
+      `clear_replay_if_sent_in_batch` reports `replayed: false` for each commit
+      ID that the batch sent in a `PUT` with an unknown outcome. If the store
+      did not apply that `PUT` and another node then applied the same commit
+      ID, the commit returns `replayed: false`. The API then returns the
+      results of an execution that did not commit, in place of
+      `replayed: true` and `results: null` (SPEC §6.2). Test:
+      `commit_applied_by_another_node_after_an_unknown_put_is_replayed` in
+      `src/engine/tests.rs`.
+- [ ] [untriaged · Events] **Fix transactional `delete_events` ops that
+      exceed the request deadline.** Extend or resume a `/txn` `delete_events`
+      op with a cold cache so a slow object store does not fail it repeatedly
+      at `commit_timeout_ms` with `503 request deadline exceeded`. Under a node
+      crash every 24 s, each retry restarts with a cold cache, and the client
+      gives up after 200 attempts (`sim_tool trace events 11581` with
+      `p_late_apply` on). Main also returns this `503` for the same op.
+- [ ] [untriaged · Background maintenance] **Run background maintenance
+      after a manifest `PUT` error.** Decide which node runs the sweep, flush,
+      and compaction from the lease that the manifest names, not from this
+      node's `own_lease`. A manifest `PUT` error clears `own_lease`, so the
+      gates at `Db` maintenance entry points (`holds_lease`) stop that work
+      until the node's next `PUT` returns success. On a quiet database, garbage
+      then stays. The same path runs without a store fault if a hedged
+      duplicate `PUT` gets `412` before the first reply arrives. Reproduce:
+      `sim_tool trace blobs 1002` (also 1589 and 2033) fails with "garbage
+      blob … remained after a full GC cycle" and passes on main. Test that a
+      sweep with a pending late `PUT` cannot mark a referenced object as
+      obsolete.
+- [ ] [untriaged · Lease] **Skip the hot-read lease request while a commit
+      batch runs.** A hot database sends one extra lease-only `PUT` while a
+      commit retry is in backoff, because the request checks only for an
+      in-flight write. SPEC §5.7 also omits that the hedge path above loses
+      the lease without a store fault.
+- [ ] [untriaged · Docs] **Update bugzoo patch 27 and defect note 27 for
+      the lease rule.** `bugzoo/27-lease-state-lost-after-ambiguous-writes.patch`
+      no longer applies, and its README row and `SPEC.md` defect note 27
+      describe the old behavior. SPEC §5.5 also uses "lease" both for this
+      node's own lease state and for another node's lease.
+- [ ] [untriaged · Tests] **Tighten the lease tests.**
+      `lease_reads_resume_after_a_lost_put_reply` prints its numbers and
+      asserts nothing. A 1 ms paused-clock advance and its comment appear in
+      three tests; a 1 ms manifest `GET` latency in the test store removes
+      them. `DelayStore::manifest_put_lost` and
+      `ManifestPutOutcome::AppliedThenFailed` inject the same fault.
+- [ ] [untriaged · Lease] **Keep the lease rule in one function.**
+      `Db::process` clears `own_lease` before `put_manifest` and sets it after
+      success, so a new caller of `put_manifest` can skip both. One function
+      that sends the `PUT`, updates the lease, installs the version, and ends
+      the write enforces the rule.
+- [ ] [untriaged · Change feed] **Run `after_commit` for a commit whose
+      `PUT` reply was lost.** A commit that the store applied with an unknown
+      reply skips `shared.committed` and the flush and compaction start, so
+      peers get no commit notice. Main has the same gap.

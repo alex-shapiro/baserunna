@@ -27,20 +27,6 @@ only.
 
 ## Blocker
 
-- [ ] [blocker · Stale strong read] **Keep the cached manifest distrusted after
-      an ambiguous manifest `PUT`.** Clear `own_lease` on an ambiguous `PUT` and
-      on a `412`, and restore it only after a write or commit confirms the
-      manifest version. A manifest `PUT` that returns an error can still be
-      applied by the store later. The committer distrusts its cache on the
-      error, but the next manifest read that returns the old version restores
-      trust (`install`) and the node's own lease (`own_lease`). If the `PUT` is
-      then applied, the lease holder serves strong reads from the old manifest
-      for 2.6 s to 3.5 s. A client observes newer data and then older data in
-      two cases: a strong event query on another node followed by a strong read
-      on the lease holder, and a change-feed long poll on a non-lease home node
-      followed by a strong `GET`. A `412` on the commit retry causes the same
-      issue over a 21 ms window. Tests: `tests/stale_strong_read.rs` and
-      `late_manifest_put` in `src/engine/tests.rs`.
 - [ ] [blocker · Stale strong read] **Enable the late-apply fault in the swarm
       profiles.** Enable `StoreFaults::p_late_apply` in the swarm profiles once
       the stale strong read defect above is fixed. `StoreFaults::p_late_apply`

@@ -6,34 +6,38 @@ fn queries(slots: usize) -> Arc<Queries> {
     Queries::new(slots, Arc::new(Memory::new(1 << 20)))
 }
 
-async fn slot(q: &Arc<Queries>, user: &str) -> QuerySlot {
-    let mut s = QuerySlot { queries: Some(q.clone()), user_id: user.into(), holds: false, started: false };
-    s.wait(false, None).await;
+async fn acquire_slot(q: &Arc<Queries>, user: &str) -> QuerySlot {
+    let mut s = QuerySlot { queries: Some(q.clone()), user_id: user.into(), holds_slot: false, has_started: false };
+    s.wait_for_slot(false, None).await;
     s
 }
 
-fn held(q: &Queries, user: &str) -> usize {
-    q.state.lock().held(user)
+fn held_slots(q: &Queries, user: &str) -> usize {
+    q.state.lock().held_slots(user)
 }
 
 #[test]
 fn freed_slot_goes_to_the_user_with_the_fewest_slots() {
     crate::sim::cost::run_paused(async {
         let q = queries(2);
-        let a1 = slot(&q, "a").await;
-        let _a2 = slot(&q, "a").await;
+        let a1 = acquire_slot(&q, "a").await;
+        let _a2 = acquire_slot(&q, "a").await;
         let qa = q.clone();
-        let a3 = tokio::spawn(async move { slot(&qa, "a").await });
+        let a3 = tokio::spawn(async move { acquire_slot(&qa, "a").await });
         tokio::task::yield_now().await;
         let qb = q.clone();
-        let b = tokio::spawn(async move { slot(&qb, "b").await });
+        let b = tokio::spawn(async move { acquire_slot(&qb, "b").await });
         tokio::task::yield_now().await;
         drop(a1);
         let b = b.await.unwrap();
-        assert_eq!((held(&q, "a"), held(&q, "b")), (1, 1), "the earlier waiter of a busier user got the slot");
+        assert_eq!(
+            (held_slots(&q, "a"), held_slots(&q, "b")),
+            (1, 1),
+            "the earlier waiter of a busier user got the slot"
+        );
         drop(b);
         let _a3 = a3.await.unwrap();
-        assert_eq!(held(&q, "a"), 2);
+        assert_eq!(held_slots(&q, "a"), 2);
     });
 }
 
@@ -41,21 +45,21 @@ fn freed_slot_goes_to_the_user_with_the_fewest_slots() {
 fn busy_user_yields_a_slot_to_a_waiting_user() {
     crate::sim::cost::run_paused(async {
         let q = queries(1);
-        let mut a = slot(&q, "a").await;
+        let mut a = acquire_slot(&q, "a").await;
         a.yield_to_waiters(None).await;
-        assert!(a.holds, "yielded without a waiter");
+        assert!(a.holds_slot, "yielded without a waiter");
         let qb = q.clone();
         let b = tokio::spawn(async move {
-            let mut b = slot(&qb, "b").await;
+            let mut b = acquire_slot(&qb, "b").await;
             b.yield_to_waiters(None).await;
             b
         });
         tokio::task::yield_now().await;
         a.yield_to_waiters(None).await;
-        assert!(a.holds && held(&q, "a") == 1, "the slot did not return after the other user yielded");
+        assert!(a.holds_slot && held_slots(&q, "a") == 1, "the slot did not return after the other user yielded");
         drop(a);
         let b = b.await.unwrap();
-        assert!(b.holds && held(&q, "b") == 1);
+        assert!(b.holds_slot && held_slots(&q, "b") == 1);
     });
 }
 
@@ -63,15 +67,15 @@ fn busy_user_yields_a_slot_to_a_waiting_user() {
 fn abandoned_wait_returns_its_slot() {
     crate::sim::cost::run_paused(async {
         let q = queries(1);
-        let a = slot(&q, "a").await;
+        let a = acquire_slot(&q, "a").await;
         let qb = q.clone();
-        let b = tokio::spawn(async move { slot(&qb, "b").await });
+        let b = tokio::spawn(async move { acquire_slot(&qb, "b").await });
         tokio::task::yield_now().await;
         drop(a);
         b.abort();
         let _ = b.await;
-        assert_eq!(q.state.lock().free, 1, "an abandoned grant leaked a slot");
-        let _c = tokio::time::timeout(Duration::from_secs(1), slot(&q, "c")).await.expect("slot is free");
+        assert_eq!(q.state.lock().free_slots, 1, "an abandoned grant leaked a slot");
+        let _c = tokio::time::timeout(Duration::from_secs(1), acquire_slot(&q, "c")).await.expect("slot is free");
     });
 }
 
@@ -79,17 +83,17 @@ fn abandoned_wait_returns_its_slot() {
 fn uneven_slot_split_does_not_trade_slots() {
     crate::sim::cost::run_paused(async {
         let q = queries(3);
-        let mut a1 = slot(&q, "a").await;
-        let _a2 = slot(&q, "a").await;
-        let mut b1 = slot(&q, "b").await;
+        let mut a1 = acquire_slot(&q, "a").await;
+        let _a2 = acquire_slot(&q, "a").await;
+        let mut b1 = acquire_slot(&q, "b").await;
         let (qa, qb) = (q.clone(), q.clone());
-        let a3 = tokio::spawn(async move { slot(&qa, "a").await });
-        let b2 = tokio::spawn(async move { slot(&qb, "b").await });
+        let a3 = tokio::spawn(async move { acquire_slot(&qa, "a").await });
+        let b2 = tokio::spawn(async move { acquire_slot(&qb, "b").await });
         tokio::task::yield_now().await;
         a1.yield_to_waiters(None).await;
         b1.yield_to_waiters(None).await;
-        assert!(a1.holds && b1.holds, "a 2/1 split traded a slot");
-        assert_eq!((held(&q, "a"), held(&q, "b")), (2, 1));
+        assert!(a1.holds_slot && b1.holds_slot, "a 2/1 split traded a slot");
+        assert_eq!((held_slots(&q, "a"), held_slots(&q, "b")), (2, 1));
         a3.abort();
         b2.abort();
     });
@@ -99,12 +103,12 @@ fn uneven_slot_split_does_not_trade_slots() {
 fn yielded_query_resumes_before_new_queries_of_its_user() {
     crate::sim::cost::run_paused(async {
         let q = queries(1);
-        let mut a1 = slot(&q, "a").await;
+        let mut a1 = acquire_slot(&q, "a").await;
         let qa = q.clone();
-        let a2 = tokio::spawn(async move { slot(&qa, "a").await });
+        let a2 = tokio::spawn(async move { acquire_slot(&qa, "a").await });
         tokio::task::yield_now().await;
         let qb = q.clone();
-        let b = tokio::spawn(async move { slot(&qb, "b").await });
+        let b = tokio::spawn(async move { acquire_slot(&qb, "b").await });
         tokio::task::yield_now().await;
         let resumed = tokio::spawn(async move {
             a1.yield_to_waiters(None).await;
@@ -113,7 +117,7 @@ fn yielded_query_resumes_before_new_queries_of_its_user() {
         tokio::task::yield_now().await;
         drop(b.await.unwrap());
         let a1 = resumed.await.unwrap();
-        assert!(a1.holds, "a new query of the user started ahead of its yielded query");
+        assert!(a1.holds_slot, "a new query of the user started ahead of its yielded query");
         drop(a1);
         drop(a2.await.unwrap());
     });
@@ -125,7 +129,7 @@ fn query_memory(seq: u64, limit_bytes: usize) -> Arc<QueryMemory> {
         user_id: "a".into(),
         bytes: AtomicUsize::new(0),
         charge: Mutex::new(Charge::default()),
-        cancelled: AtomicBool::new(false),
+        is_evicted: AtomicBool::new(false),
         evicted: tokio::sync::Notify::new(),
         failure: Mutex::new(None),
         txns: Weak::new(),
@@ -156,26 +160,26 @@ fn evicted_query_is_releasing_and_not_evicted_again() {
     assert_eq!(q.running().iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1], "an evicted query is a candidate");
     assert_eq!(q.releasing_bytes(), 500, "the evicted query's memory is not counted as releasing");
     crate::sim::cost::run_paused(async {
-        let mut a = slot(&q, "a").await;
-        let mut b = QuerySlot { queries: Some(q.clone()), user_id: "b".into(), holds: false, started: false };
-        let waiting = b.wait(false, Some(&young));
+        let mut a = acquire_slot(&q, "a").await;
+        let mut b = QuerySlot { queries: Some(q.clone()), user_id: "b".into(), holds_slot: false, has_started: false };
+        let waiting = b.wait_for_slot(false, Some(&young));
         assert!(tokio::time::timeout(Duration::from_secs(1), waiting).await.is_ok(), "an evicted query kept waiting");
         let later = query_memory(3, usize::MAX);
         let evict = async {
             tokio::time::sleep(Duration::from_millis(10)).await;
             later.cancel();
         };
-        let waiting = tokio::time::timeout(Duration::from_secs(1), b.wait(false, Some(&later)));
+        let waiting = tokio::time::timeout(Duration::from_secs(1), b.wait_for_slot(false, Some(&later)));
         let (woke, ()) = tokio::join!(waiting, evict);
-        assert!(woke.is_ok(), "a query evicted while it waited for a slot kept waiting");
-        assert!(!b.holds);
+        assert!(woke.is_ok(), "a query evicted while waiting for a slot kept waiting");
+        assert!(!b.holds_slot);
         a.yield_to_waiters(None).await;
-        assert!(a.holds);
+        assert!(a.holds_slot);
     });
 }
 
-/// Runs one query of 50 parts per user that yields after each 1 ms part read and returns the
-/// times at which each user first held a slot and finished.
+/// Runs 1 query of 50 parts per user that yields after each 1 ms part read. Returns the elapsed
+/// time to first slot grant and to completion for each user.
 fn slot_times(users: usize, slots: usize) -> Vec<(Duration, Duration)> {
     crate::sim::cost::run_paused(async move {
         let q = queries(slots);
@@ -184,12 +188,12 @@ fn slot_times(users: usize, slots: usize) -> Vec<(Duration, Duration)> {
             .map(|u| {
                 let q = q.clone();
                 tokio::spawn(async move {
-                    let mut s = slot(&q, &format!("u{u}")).await;
+                    let mut s = acquire_slot(&q, &format!("u{u}")).await;
                     let first = started.elapsed();
                     for _ in 0..50 {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                         s.yield_to_waiters(None).await;
-                        assert!(q.state.lock().started <= STARTED_PER_SLOT * slots, "too many queries started");
+                        assert!(q.state.lock().started_queries <= STARTED_PER_SLOT * slots, "too many queries started");
                     }
                     (first, started.elapsed())
                 })

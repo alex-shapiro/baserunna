@@ -334,9 +334,9 @@ pub struct OpCtx<'a> {
     pub json_value_max: u64,
     /// Resource limits for `query_events` operations.
     pub query_limits: crate::events::exec::Limits,
-    /// Node that admits `query_events` operations, or `None` to run them without admission.
+    /// Node that admits `query_events` operations, or `None` to skip admission.
     pub node: Option<&'a crate::node::Node>,
-    /// User that the operations run for.
+    /// User ID of the caller.
     pub user_id: &'a str,
 }
 

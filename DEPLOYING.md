@@ -249,11 +249,11 @@ S3 lifecycle configuration with the rule above:
 Rate limits and memory budgets are enforced per node, so an N-node cluster
 allows up to N times each configured rate. Set a rate limit to 0 to disable it.
 `BASERUNNA_DB_MEMORY_MB` has a minimum value of 16 and cannot be disabled. If
-memory usage exceeds this budget after idle databases are unloaded, the node
-enforces max-min fair sharing across users: it rejects interactive transactions
-and event queries from users at or above their fair share with `503`, and it
-aborts idle transactions and the newest event queries of users above their fair
-share (SPEC §5.12). A single event query can use at most this budget.
+memory usage exceeds this budget after the node unloads idle databases, the
+node shares memory fairly across users (SPEC §5.12). It rejects interactive
+transactions and event queries from users at or above their fair share with
+`503`. It also aborts idle transactions and the newest event queries of users
+above their fair share. A single event query can use at most this budget.
 
 - `BASERUNNA_DB_MAX_MB` (default `10240`): maximum size of each database in MiB (segments and blobs).
 - `BASERUNNA_DB_MEMORY_MB` (default `256`): per-node memory budget in MiB for open databases, transactions, and event queries.

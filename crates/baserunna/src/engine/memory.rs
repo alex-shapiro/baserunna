@@ -111,7 +111,7 @@ pub trait MemoryGate: Send + Sync {
     fn step_bytes(&self) -> usize;
 }
 
-/// Memory usage of an open interactive transaction.
+/// Memory usage of an open interactive transaction or a running event query.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Held<K> {
     pub holder: K,
@@ -136,15 +136,14 @@ pub fn fair_share(mut available: usize, mut others: Vec<usize>) -> usize {
     available / claimants
 }
 
-/// Checks whether `requester` can allocate transaction memory if total node memory `used`
-/// exceeds `budget`, given the open transactions in `held` ordered by eviction priority.
+/// Checks whether `requester` can allocate memory if total node memory `used` exceeds `budget`,
+/// given the open transactions and running queries in `held` ordered by eviction priority.
 ///
-/// Bytes not tracked in `held` are deducted from `budget`, and the remainder is divided among
-/// holders by [`fair_share`]. If `requester` uses at least its fair share, returns `None`.
-/// Otherwise, returns the indices in `held` of evictable transactions to abort until `used` is
-/// within `budget`. In each step, the earliest evictable transaction of the holder with the
-/// largest usage is selected, provided that it holds memory and aborting it moves that holder's
-/// usage closer to the fair share.
+/// Deducts bytes not tracked in `held` from `budget` and divides the remainder among holders by
+/// [`fair_share`]. Returns `None` if `requester` uses at least its fair share. Otherwise, returns
+/// the indices in `held` of evictable entries to abort until `used` fits in `budget`. Each step
+/// selects the earliest evictable entry of the holder with the largest usage, if that entry holds
+/// memory and aborting it moves that holder's usage closer to the fair share.
 pub fn fair_admission<K: Ord>(budget: usize, used: usize, requester: &K, held: &[Held<K>]) -> Option<Vec<usize>> {
     let mut usage: BTreeMap<&K, usize> = BTreeMap::new();
     for h in held {

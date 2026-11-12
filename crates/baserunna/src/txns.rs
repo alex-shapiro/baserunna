@@ -80,9 +80,9 @@ impl OpenTxns {
         self.open.lock().values().filter(|t| t.db_id == db_id).count()
     }
 
-    /// Enforces the node memory budget for a transaction of `user_id` on `db_id`, unloading idle
-    /// databases and evicting idle transactions and running queries via
-    /// [`memory::fair_admission`] if needed.
+    /// Enforces the node memory budget for a transaction of `user_id` on `db_id`. Unloads idle
+    /// databases and evicts idle transactions and running queries via [`memory::fair_admission`]
+    /// if needed.
     pub fn admit(&self, user_id: &str, db_id: &str) -> Result<()> {
         if self.engine.shared.is_system(db_id) {
             return Ok(());
@@ -98,9 +98,9 @@ impl OpenTxns {
         })
     }
 
-    /// Enforces the node memory budget for growth of query `q`, and stops `q` if its user holds
-    /// at least its fair share. The oldest running query is always admitted, so that a query
-    /// finishes while database memory fills the budget.
+    /// Enforces the node memory budget for growth of query `q`. Aborts `q` if its user holds at
+    /// least its fair share. Always admits the oldest running query so at least 1 query finishes
+    /// even if databases fill the budget.
     pub(crate) fn admit_query(&self, q: &QueryMemory) -> Result<()> {
         if self.fair_admission(&q.user_id) || self.queries.running().last().is_some_and(|o| o.seq == q.seq) {
             return Ok(());
@@ -113,9 +113,9 @@ impl OpenTxns {
         }))
     }
 
-    /// Returns false if the node memory budget is exceeded and `user_id` holds at least its fair
-    /// share. Otherwise, evicts the idle transactions and running queries that
-    /// [`memory::fair_admission`] selects and returns true.
+    /// Returns false if node memory exceeds the budget and `user_id` holds at least its fair
+    /// share. Otherwise, evicts the idle transactions and running queries selected by
+    /// [`memory::fair_admission`] and returns true.
     fn fair_admission(&self, user_id: &str) -> bool {
         let shared = &self.engine.shared;
         if shared.reclaim_to_budget() {
@@ -131,12 +131,12 @@ impl OpenTxns {
         };
         for i in victims {
             match &holders[i] {
-                Holder::Txn(t) => {
+                MemoryHolder::Txn(t) => {
                     if self.abort(t, "it was aborted to free node memory for other users") {
                         crate::probe::hit(crate::probe::Probe::TxnEvicted);
                     }
                 }
-                Holder::Query(q) => q.cancel(),
+                MemoryHolder::Query(q) => q.cancel(),
             }
         }
         true
@@ -281,9 +281,9 @@ impl OpenTxns {
         }
     }
 
-    /// Returns open transactions ordered from least to most recently used, followed by running
-    /// queries from youngest to oldest, paired with their memory usage.
-    fn held_memory(&self) -> Vec<(Holder, Held<String>)> {
+    /// Returns open transactions from least to most recently used, then running queries from
+    /// newest to oldest, paired with their memory usage.
+    fn held_memory(&self) -> Vec<(MemoryHolder, Held<String>)> {
         let idle_since = |t: &OpenTxn| t.txn.try_lock().ok().filter(|g| g.is_some()).map(|_| t.last_used());
         let mut open: Vec<(Option<Instant>, Arc<OpenTxn>)> =
             self.open.lock().values().map(|t| (idle_since(t), t.clone())).collect();
@@ -308,18 +308,18 @@ impl OpenTxns {
                         + v.as_ref().map_or(0, |v| v.memory_bytes() / readers[&Arc::as_ptr(v)]),
                     evictable: idle.is_some(),
                 };
-                (Holder::Txn(t), held)
+                (MemoryHolder::Txn(t), held)
             })
             .chain(self.queries.running().into_iter().map(|q| {
                 let held = Held { holder: q.user_id.clone(), bytes: q.charged(), evictable: true };
-                (Holder::Query(q), held)
+                (MemoryHolder::Query(q), held)
             }))
             .collect()
     }
 }
 
 /// An open transaction or running query that holds node memory.
-enum Holder {
+enum MemoryHolder {
     Txn(Arc<OpenTxn>),
     Query(Arc<QueryMemory>),
 }

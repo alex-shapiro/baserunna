@@ -25,48 +25,52 @@ pub struct Queries {
 const STARTED_PER_SLOT: usize = 2;
 
 struct SlotState {
-    free: usize,
-    held_by_user: BTreeMap<String, usize>,
-    /// Waiting queries of each user, in the order that the user's queries get slots.
+    free_slots: usize,
+    slots_by_user: BTreeMap<String, usize>,
+    /// Waiting queries per user, in slot grant order.
     waiters: BTreeMap<String, VecDeque<SlotWaiter>>,
     /// Number of queries that received a slot and have not finished.
-    started: usize,
-    max_started: usize,
-    /// Number of the latest slot grant to each user.
-    last_grant: BTreeMap<String, u64>,
-    grants: u64,
+    started_queries: usize,
+    max_started_queries: usize,
+    /// Sequence number of the latest slot grant per user.
+    last_grant_seq: BTreeMap<String, u64>,
+    grant_seq: u64,
     next_query_seq: u64,
 }
 
 struct SlotWaiter {
-    grant: oneshot::Sender<()>,
+    grant_tx: oneshot::Sender<()>,
     /// True if the query started before and yielded its slot.
-    resumes: bool,
+    is_resuming: bool,
 }
 
 impl SlotState {
-    fn held(&self, user_id: &str) -> usize {
-        self.held_by_user.get(user_id).copied().unwrap_or(0)
+    fn held_slots(&self, user_id: &str) -> usize {
+        self.slots_by_user.get(user_id).copied().unwrap_or(0)
     }
 
-    /// Returns true if the first waiting query of `user_id` resumes, or if the node can start
-    /// another query.
+    /// Returns true if the first waiting query of `user_id` is resuming, or if the node can
+    /// start another query.
     fn can_grant(&self, user_id: &str) -> bool {
-        self.waiters.get(user_id).and_then(|q| q.front()).is_some_and(|w| w.resumes || self.started < self.max_started)
+        self.waiters
+            .get(user_id)
+            .and_then(|q| q.front())
+            .is_some_and(|w| w.is_resuming || self.started_queries < self.max_started_queries)
     }
 
-    /// Returns the waiting user that holds the fewest slots, and on ties the user whose latest
-    /// slot grant is the oldest, among the users whose first waiting query can get a slot.
+    /// Selects the next user to receive a slot from the users whose first waiting query can
+    /// receive one. Prefers the user with the fewest held slots, breaking ties by the oldest
+    /// slot grant.
     fn next_user(&self) -> Option<String> {
         self.waiters
             .keys()
             .filter(|u| self.can_grant(u))
-            .min_by_key(|u| (self.held(u), self.last_grant.get(*u).copied().unwrap_or(0)))
+            .min_by_key(|u| (self.held_slots(u), self.last_grant_seq.get(*u).copied().unwrap_or(0)))
             .cloned()
     }
 
-    /// Grants a slot to the first waiting query of `user_id` that still waits and can get a
-    /// slot. Returns false if none does.
+    /// Grants a slot to the first waiting query of `user_id` that is still waiting and can
+    /// receive one. Returns false if no query of `user_id` receives a slot.
     fn grant_to(&mut self, user_id: &str) -> bool {
         while self.can_grant(user_id) {
             let queue = self.waiters.get_mut(user_id).expect("a user with a waiting query has a queue");
@@ -74,43 +78,43 @@ impl SlotState {
             if queue.is_empty() {
                 self.waiters.remove(user_id);
             }
-            if w.grant.send(()).is_ok() {
-                *self.held_by_user.entry(user_id.to_string()).or_default() += 1;
-                self.started += !w.resumes as usize;
-                self.grants += 1;
-                self.last_grant.insert(user_id.to_string(), self.grants);
+            if w.grant_tx.send(()).is_ok() {
+                *self.slots_by_user.entry(user_id.to_string()).or_default() += 1;
+                self.started_queries += !w.is_resuming as usize;
+                self.grant_seq += 1;
+                self.last_grant_seq.insert(user_id.to_string(), self.grant_seq);
                 return true;
             }
         }
         false
     }
 
-    fn finish(&mut self) {
-        self.started -= 1;
+    fn finish_query(&mut self) {
+        self.started_queries -= 1;
         self.grant_waiters();
     }
 
     fn grant_waiters(&mut self) {
-        while self.free > 0
+        while self.free_slots > 0
             && let Some(user_id) = self.next_user()
         {
             if self.grant_to(&user_id) {
-                self.free -= 1;
+                self.free_slots -= 1;
             }
         }
     }
 
-    fn release(&mut self, user_id: &str) {
-        self.release_held(user_id);
-        self.free += 1;
+    fn release_slot(&mut self, user_id: &str) {
+        self.decrement_user_slots(user_id);
+        self.free_slots += 1;
         self.grant_waiters();
     }
 
-    fn release_held(&mut self, user_id: &str) {
-        if let Some(n) = self.held_by_user.get_mut(user_id) {
+    fn decrement_user_slots(&mut self, user_id: &str) {
+        if let Some(n) = self.slots_by_user.get_mut(user_id) {
             *n -= 1;
             if *n == 0 {
-                self.held_by_user.remove(user_id);
+                self.slots_by_user.remove(user_id);
             }
         }
     }
@@ -118,16 +122,17 @@ impl SlotState {
 
 impl Queries {
     pub fn new(slots: usize, memory: Arc<Memory>) -> Arc<Queries> {
+        let slots = slots.max(1);
         Arc::new(Queries {
             memory,
             state: Mutex::new(SlotState {
-                free: slots.max(1),
-                held_by_user: BTreeMap::new(),
+                free_slots: slots,
+                slots_by_user: BTreeMap::new(),
                 waiters: BTreeMap::new(),
-                started: 0,
-                max_started: STARTED_PER_SLOT * slots.max(1),
-                last_grant: BTreeMap::new(),
-                grants: 0,
+                started_queries: 0,
+                max_started_queries: STARTED_PER_SLOT * slots,
+                last_grant_seq: BTreeMap::new(),
+                grant_seq: 0,
                 next_query_seq: 0,
             }),
             running: Mutex::new(BTreeMap::new()),
@@ -135,11 +140,15 @@ impl Queries {
     }
 
     /// Admits a query of `user_id`, waiting up to 5 s for a query slot, and registers its memory
-    /// for admission by `txns`.
+    /// with `txns`.
     pub async fn start(self: &Arc<Self>, user_id: &str, txns: &Arc<OpenTxns>) -> Result<QueryGrant> {
-        let mut slot =
-            QuerySlot { queries: Some(self.clone()), user_id: user_id.to_string(), holds: false, started: false };
-        match tokio::time::timeout(SLOT_WAIT, slot.wait(false, None)).await {
+        let mut slot = QuerySlot {
+            queries: Some(self.clone()),
+            user_id: user_id.to_string(),
+            holds_slot: false,
+            has_started: false,
+        };
+        match tokio::time::timeout(SLOT_WAIT, slot.wait_for_slot(false, None)).await {
             Ok(()) => {}
             Err(_) => {
                 return Err(Error::Unavailable {
@@ -159,7 +168,7 @@ impl Queries {
             user_id: user_id.to_string(),
             bytes: AtomicUsize::new(0),
             charge: Mutex::new(Charge::new(&self.memory, 0)),
-            cancelled: AtomicBool::new(false),
+            is_evicted: AtomicBool::new(false),
             evicted: tokio::sync::Notify::new(),
             failure: Mutex::new(None),
             txns: Arc::downgrade(txns),
@@ -170,23 +179,23 @@ impl Queries {
         Ok(QueryGrant { slot, memory, queries: Some(self.clone()) })
     }
 
-    /// Returns the number of queries that hold or wait for a query slot after their admission.
+    /// Returns the number of admitted queries that have not finished.
     pub fn running_count(&self) -> usize {
         self.running.lock().len()
     }
 
-    /// Returns the queries that compete for memory, from youngest to oldest.
+    /// Returns active queries that compete for memory, ordered from newest to oldest.
     pub(crate) fn running(&self) -> Vec<Arc<QueryMemory>> {
         self.running.lock().values().rev().filter(|q| !q.is_stopping()).cloned().collect()
     }
 
-    /// Returns the bytes charged by evicted and failed queries, which are releasing their memory.
+    /// Returns the bytes charged by evicted or failed queries while they release their memory.
     pub(crate) fn releasing_bytes(&self) -> usize {
         self.running.lock().values().filter(|q| q.is_stopping()).map(|q| q.charged()).sum()
     }
 }
 
-/// Admission of a single event query: its query slot and its memory.
+/// Admission grant for a single event query, holding its query slot and memory tracker.
 pub struct QueryGrant {
     pub slot: QuerySlot,
     pub memory: Arc<QueryMemory>,
@@ -194,16 +203,16 @@ pub struct QueryGrant {
 }
 
 impl QueryGrant {
-    /// Returns a grant without a query slot or a memory budget, for queries outside a node.
+    /// Returns a grant without a query slot or memory limit, for queries outside a node.
     pub fn unlimited() -> QueryGrant {
         QueryGrant {
-            slot: QuerySlot { queries: None, user_id: String::new(), holds: false, started: false },
+            slot: QuerySlot { queries: None, user_id: String::new(), holds_slot: false, has_started: false },
             memory: Arc::new(QueryMemory {
                 seq: 0,
                 user_id: String::new(),
                 bytes: AtomicUsize::new(0),
                 charge: Mutex::new(Charge::default()),
-                cancelled: AtomicBool::new(false),
+                is_evicted: AtomicBool::new(false),
                 evicted: tokio::sync::Notify::new(),
                 failure: Mutex::new(None),
                 txns: Weak::new(),
@@ -213,11 +222,9 @@ impl QueryGrant {
             queries: None,
         }
     }
-}
 
-impl QueryGrant {
-    /// Gives the query's slot to a user that holds fewer slots, if one waits, and waits for a
-    /// slot again. Returns an error if the node evicted the query or it failed a memory check.
+    /// Yields the query's slot to a waiting user with fewer slots and waits to reacquire a slot.
+    /// Returns an error if the node evicted the query or the query failed a memory check.
     pub async fn yield_slot(&mut self) -> Result<()> {
         self.slot.yield_to_waiters(Some(&self.memory)).await;
         self.memory.check_stopped()
@@ -232,34 +239,33 @@ impl Drop for QueryGrant {
     }
 }
 
-/// A query slot that a query holds while it runs and yields to users that hold fewer slots.
+/// Query slot held while a query runs and yielded to users with fewer slots.
 pub struct QuerySlot {
     queries: Option<Arc<Queries>>,
     user_id: String,
-    holds: bool,
-    /// True once the query first received a slot.
-    started: bool,
+    holds_slot: bool,
+    /// True after the query first receives a slot.
+    has_started: bool,
 }
 
 impl QuerySlot {
-    /// Waits until this query holds a slot, or until the node evicts the query that `memory`
-    /// tracks. A query that `resumes` waits ahead of the queries of its user that have not
-    /// started.
-    async fn wait(&mut self, resumes: bool, memory: Option<&QueryMemory>) {
+    /// Waits until this query holds a slot or the node evicts `memory`. If `is_resuming` is
+    /// true, the query waits ahead of its user's unstarted queries.
+    async fn wait_for_slot(&mut self, is_resuming: bool, memory: Option<&QueryMemory>) {
         let Some(queries) = self.queries.clone() else { return };
         let (tx, rx) = oneshot::channel();
         {
             let mut s = queries.state.lock();
             let queue = s.waiters.entry(self.user_id.clone()).or_default();
-            let waiter = SlotWaiter { grant: tx, resumes };
-            match resumes {
+            let waiter = SlotWaiter { grant_tx: tx, is_resuming };
+            match is_resuming {
                 true => queue.push_front(waiter),
                 false => queue.push_back(waiter),
             }
             s.grant_waiters();
         }
-        let mut wait = SlotWait { queries: &queries, user_id: &self.user_id, rx: Some(rx), resumes };
-        let Some(rx) = wait.rx.as_mut() else { return };
+        let mut wait_guard = SlotWaitGuard { queries: &queries, user_id: &self.user_id, rx: Some(rx), is_resuming };
+        let Some(rx) = wait_guard.rx.as_mut() else { return };
         let granted = match memory {
             None => rx.await.is_ok(),
             Some(m) => {
@@ -277,28 +283,28 @@ impl QuerySlot {
             }
         };
         if granted {
-            wait.rx = None;
-            self.holds = true;
-            self.started = true;
+            wait_guard.rx = None;
+            self.holds_slot = true;
+            self.has_started = true;
         }
     }
 
-    /// Gives this query's slot to the next waiting user if that user holds no slots or at least
-    /// 2 fewer slots than this query's user, and waits for a slot again.
+    /// Yields this query's slot if the next waiting user holds 0 slots or at least 2 fewer
+    /// slots than this query's user, then waits to reacquire a slot.
     async fn yield_to_waiters(&mut self, memory: Option<&QueryMemory>) {
         let Some(queries) = &self.queries else { return };
         {
             let mut s = queries.state.lock();
-            let mine = s.held(&self.user_id);
-            let fairer = |theirs: usize| theirs == 0 || theirs + 1 < mine;
-            let Some(user_id) = s.next_user().filter(|u| fairer(s.held(u))) else { return };
-            self.holds = false;
-            s.release_held(&self.user_id);
+            let mine = s.held_slots(&self.user_id);
+            let can_yield_to = |theirs: usize| theirs == 0 || theirs + 1 < mine;
+            let Some(user_id) = s.next_user().filter(|u| can_yield_to(s.held_slots(u))) else { return };
+            self.holds_slot = false;
+            s.decrement_user_slots(&self.user_id);
             if !s.grant_to(&user_id) {
-                s.free += 1;
+                s.free_slots += 1;
             }
         }
-        self.wait(true, memory).await;
+        self.wait_for_slot(true, memory).await;
     }
 }
 
@@ -306,60 +312,60 @@ impl Drop for QuerySlot {
     fn drop(&mut self) {
         let Some(q) = &self.queries else { return };
         let mut s = q.state.lock();
-        if self.holds {
-            s.release(&self.user_id);
+        if self.holds_slot {
+            s.release_slot(&self.user_id);
         }
-        if self.started {
-            s.finish();
+        if self.has_started {
+            s.finish_query();
         }
     }
 }
 
-/// Releases a slot granted to a waiter that stopped waiting before it received the grant.
-struct SlotWait<'a> {
+/// Guard that releases a granted slot if a waiter is dropped before receiving the grant.
+struct SlotWaitGuard<'a> {
     queries: &'a Queries,
     user_id: &'a str,
     rx: Option<oneshot::Receiver<()>>,
-    resumes: bool,
+    is_resuming: bool,
 }
 
-impl Drop for SlotWait<'_> {
+impl Drop for SlotWaitGuard<'_> {
     fn drop(&mut self) {
         if let Some(mut rx) = self.rx.take() {
             rx.close();
             if rx.try_recv().is_ok() {
                 let mut s = self.queries.state.lock();
-                s.release(self.user_id);
-                if !self.resumes {
-                    s.finish();
+                s.release_slot(self.user_id);
+                if !self.is_resuming {
+                    s.finish_query();
                 }
             }
         }
     }
 }
 
-/// Memory that a running query holds, charged to the node memory budget.
+/// Memory usage of a running query, charged to the node memory budget.
 pub struct QueryMemory {
-    /// Start order of the query on this node.
+    /// Start sequence number of the query on this node.
     pub seq: u64,
     pub user_id: String,
     bytes: AtomicUsize,
     charge: Mutex<Charge>,
-    /// Set if the node evicted the query to free memory for another user.
-    cancelled: AtomicBool,
-    /// Wakes the query when the node evicts it.
+    /// True if the node evicted the query to free memory for other users.
+    is_evicted: AtomicBool,
+    /// Notifies the query if the node evicts it.
     evicted: tokio::sync::Notify,
-    /// Error of the query's own failed memory check. Set while the query releases its memory.
+    /// Error from the query's first failed memory check.
     failure: Mutex<Option<Error>>,
     txns: Weak<OpenTxns>,
     step_bytes: usize,
-    /// Node memory budget, and the largest amount of memory a query can use.
+    /// Node memory budget, which is the maximum memory a single query can use.
     pub limit_bytes: usize,
 }
 
 impl QueryMemory {
-    /// Changes a part of the query's memory from `old` to `new` bytes. Returns an error if the
-    /// query was cancelled or the node cannot admit the growth.
+    /// Updates a component of the query's memory from `old` to `new` bytes. Returns an error if
+    /// the query was evicted or the node rejects the growth.
     pub fn resize(&self, old: usize, new: usize) -> Result<()> {
         let total = if new >= old {
             self.bytes.fetch_add(new - old, Relaxed) + (new - old)
@@ -400,27 +406,26 @@ impl QueryMemory {
     }
 
     pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Relaxed);
+        self.is_evicted.store(true, Relaxed);
         self.evicted.notify_waiters();
     }
 
-    /// Records `e` as the query's failure, so that its later memory changes return the same
-    /// error, and returns the recorded failure.
+    /// Records `e` as the query's failure if none is recorded, and returns the recorded error.
     pub(crate) fn fail(&self, e: Error) -> Error {
         self.failure.lock().get_or_insert(e).clone()
     }
 
-    /// Returns true if the query no longer competes for memory because it was evicted or failed.
+    /// Returns true if the query was evicted or failed a memory check.
     pub(crate) fn is_stopping(&self) -> bool {
-        self.cancelled.load(Relaxed) || self.failure.lock().is_some()
+        self.is_evicted.load(Relaxed) || self.failure.lock().is_some()
     }
 
-    /// Returns an error if the node evicted the query or the query failed a memory check.
+    /// Returns an error if the query was evicted or failed a memory check.
     pub fn check_stopped(&self) -> Result<()> {
         if let Some(e) = self.failure.lock().clone() {
             return Err(e);
         }
-        if self.cancelled.load(Relaxed) {
+        if self.is_evicted.load(Relaxed) {
             return Err(Error::Unavailable {
                 message: "the query was stopped to free node memory for other queries; retry".into(),
                 retry_after_ms: Some(1000),
@@ -431,27 +436,27 @@ impl QueryMemory {
     }
 }
 
-/// Bytes that one part of a query holds, reported to its [`QueryMemory`] in steps.
+/// Memory tracker for one part of a query, reporting changes to [`QueryMemory`] in 64 KiB steps.
 pub struct QueryBytes {
     query: Arc<QueryMemory>,
     bytes: usize,
-    reported: usize,
+    reported_bytes: usize,
 }
 
-/// Change in held bytes that triggers a report to [`QueryMemory`].
-const REPORT_BYTES: usize = 64 * 1024;
+/// Byte delta that triggers a report to [`QueryMemory`].
+const REPORT_STEP_BYTES: usize = 64 * 1024;
 
 impl QueryBytes {
     pub fn new(query: &Arc<QueryMemory>) -> QueryBytes {
-        QueryBytes { query: query.clone(), bytes: 0, reported: 0 }
+        QueryBytes { query: query.clone(), bytes: 0, reported_bytes: 0 }
     }
 
     pub fn set(&mut self, bytes: usize) -> Result<()> {
         self.bytes = bytes;
-        if bytes.abs_diff(self.reported) < REPORT_BYTES {
+        if bytes.abs_diff(self.reported_bytes) < REPORT_STEP_BYTES {
             return Ok(());
         }
-        let old = std::mem::replace(&mut self.reported, bytes);
+        let old = std::mem::replace(&mut self.reported_bytes, bytes);
         self.query.resize(old, bytes)
     }
 
@@ -462,7 +467,7 @@ impl QueryBytes {
 
 impl Drop for QueryBytes {
     fn drop(&mut self) {
-        self.query.release(self.reported);
+        self.query.release(self.reported_bytes);
     }
 }
 

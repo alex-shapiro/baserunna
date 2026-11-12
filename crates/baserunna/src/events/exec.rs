@@ -1102,7 +1102,7 @@ struct Run<'p, 'a> {
     max_mem: usize,
     overflowed: bool,
     /// State and active column bytes reported to the query's node memory charge.
-    held: Option<QueryBytes>,
+    held_bytes: Option<QueryBytes>,
 }
 
 impl<'p, 'a> Run<'p, 'a> {
@@ -1125,7 +1125,7 @@ impl<'p, 'a> Run<'p, 'a> {
             agg_fns,
             max_mem,
             overflowed: false,
-            held: memory.map(QueryBytes::new),
+            held_bytes: memory.map(QueryBytes::new),
         }
     }
 
@@ -1140,13 +1140,13 @@ impl<'p, 'a> Run<'p, 'a> {
     }
 
     /// Reports the run's state and `batch` bytes of active columns to the query's memory charge.
-    fn report(&mut self, batch: usize) -> Result<()> {
+    fn report_memory(&mut self, batch: usize) -> Result<()> {
         let bytes = self.state_mem() + batch;
-        self.held.as_mut().map_or(Ok(()), |h| h.set(bytes))
+        self.held_bytes.as_mut().map_or(Ok(()), |h| h.set(bytes))
     }
 
     fn hold(&mut self, batch: usize) -> Result<()> {
-        self.report(batch)?;
+        self.report_memory(batch)?;
         let state = self.state_mem();
         if state.saturating_add(batch) > self.max_mem {
             self.overflowed = true;
@@ -1169,7 +1169,7 @@ impl<'p, 'a> Run<'p, 'a> {
         if let (Some(g), Some(og)) = (&mut self.groups, o.groups) {
             g.absorb(og)?;
         }
-        self.report(0)
+        self.report_memory(0)
     }
 
     async fn select(&self, b: &mut Batch<'_>, f: &BFilter, base: &[bool]) -> Result<Vec<bool>> {
@@ -1264,7 +1264,7 @@ impl<'p, 'a> Run<'p, 'a> {
                 }
             }
         }
-        self.report(b.mem)
+        self.report_memory(b.mem)
     }
 
     fn lookups(&self, b: &mut Batch<'_>) {
@@ -1885,7 +1885,7 @@ async fn lookup_maps(
 }
 
 /// Executes query `q` on event table `s` at `txn`'s snapshot within the query slot and memory
-/// that `grant` admits.
+/// budget of `grant`.
 pub async fn run(
     shared: &Shared,
     db: &str,
@@ -2084,7 +2084,7 @@ async fn run_within(
 }
 
 fn finish(run: Run<'_, '_>, q: &Query, limits: &Limits, memory: &Arc<QueryMemory>) -> Result<Output> {
-    let Run { plan, stats, groups, kept, more, agg_fns, held: _held, .. } = run;
+    let Run { plan, stats, groups, kept, more, agg_fns, held_bytes: _held_bytes, .. } = run;
     match &plan.kind {
         Kind::Rows { columns, limit, .. } => {
             let limit = *limit;

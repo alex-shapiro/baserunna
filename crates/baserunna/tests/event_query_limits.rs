@@ -527,3 +527,83 @@ fn long_string_queries_respect_memory_limit() {
         w.shutdown();
     });
 }
+
+/// Returns the user and system CPU time this process has used.
+fn process_cpu_time() -> Duration {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: `getrusage` fills `usage` and does not keep the pointer.
+    let usage = unsafe {
+        assert_eq!(libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()), 0, "getrusage");
+        usage.assume_init()
+    };
+    let time = |t: libc::timeval| Duration::from_secs(t.tv_sec as u64) + Duration::from_micros(t.tv_usec as u64);
+    time(usage.ru_utime) + time(usage.ru_stime)
+}
+
+/// Aggregation and row queries that `event_scan_cpu` runs against table `ev`.
+fn scan_bench_queries() -> Vec<(&'static str, Json)> {
+    let all = |q: Json| {
+        let mut q = q;
+        q["from"] = json!(0);
+        q["to"] = json!(QUERY_TO_MS);
+        q
+    };
+    vec![
+        ("count", count_query()),
+        ("count by event", all(json!({"group_by": ["event"], "aggregates": {"n": {"fn": "count"}}}))),
+        ("top users", top_users_query(0, QUERY_TO_MS)),
+        ("unique users", all(json!({"aggregates": {"u": {"fn": "uniq", "of": {"col": "user"}}}}))),
+        (
+            "filtered count",
+            all(json!({"where": {"col": "event", "op": "eq", "value": "e3"}, "aggregates": {"n": {"fn": "count"}}})),
+        ),
+        ("filtered rows", all(json!({"where": {"col": "event", "op": "eq", "value": "e1"}, "limit": 1000}))),
+        ("latest rows", all(json!({"order_by": [{"col": "time", "desc": true}], "limit": 100}))),
+    ]
+}
+
+/// Measures the process CPU time of repeated event scans on a warm block cache.
+#[test]
+#[ignore = "benchmark: run with --ignored --nocapture"]
+fn event_scan_cpu() {
+    let _turn = TURN.lock();
+    run_paused(async {
+        let w = World::with_config(1, 0, production_limits).await;
+        let t = w.signup(0, "bench@scan.test").await;
+        let info = setup_user_events(&w, &t, 1_000_000, 500_000).await;
+        eprintln!(
+            "table: {} rows in {} parts, {} stored bytes",
+            info["rows"],
+            info["parts"].as_array().map_or(0, Vec::len),
+            info["bytes"]
+        );
+        let path = "/v1/dbs/d/events/ev/rows/query";
+        let queries = scan_bench_queries();
+        for (name, q) in &queries {
+            let r = post(&w, &t, path, q.to_string()).await;
+            assert_eq!(r.status, 200, "{name}: {}", excerpt(&r));
+        }
+        const ROUNDS: usize = 20;
+        let mut query_cpu = vec![Duration::ZERO; queries.len()];
+        let (cpu_before, wall_before) = (process_cpu_time(), std::time::Instant::now());
+        for _ in 0..ROUNDS {
+            for ((name, q), spent) in queries.iter().zip(&mut query_cpu) {
+                let started = process_cpu_time();
+                let r = post(&w, &t, path, q.to_string()).await;
+                *spent += process_cpu_time() - started;
+                assert_eq!(r.status, 200, "{name}: {}", excerpt(&r));
+            }
+        }
+        let cpu = process_cpu_time() - cpu_before;
+        for ((name, _), spent) in queries.iter().zip(&query_cpu) {
+            eprintln!("{name}: {:.2} s of process CPU time", spent.as_secs_f64());
+        }
+        eprintln!(
+            "event scan CPU: {ROUNDS} rounds of {} queries took {:.2} s of process CPU time, {:.2} s of wall time",
+            queries.len(),
+            cpu.as_secs_f64(),
+            wall_before.elapsed().as_secs_f64()
+        );
+        w.shutdown();
+    });
+}

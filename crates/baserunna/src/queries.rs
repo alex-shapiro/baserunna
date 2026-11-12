@@ -56,14 +56,18 @@ impl SlotState {
     }
 
     fn release(&mut self, user_id: &str) {
+        self.release_held(user_id);
+        self.free += 1;
+        self.grant_waiters();
+    }
+
+    fn release_held(&mut self, user_id: &str) {
         if let Some(n) = self.held_by_user.get_mut(user_id) {
             *n -= 1;
             if *n == 0 {
                 self.held_by_user.remove(user_id);
             }
         }
-        self.free += 1;
-        self.grant_waiters();
     }
 }
 
@@ -85,7 +89,7 @@ impl Queries {
     /// for admission by `txns`.
     pub async fn start(self: &Arc<Self>, user_id: &str, txns: &Arc<OpenTxns>) -> Result<QueryGrant> {
         let mut slot = QuerySlot { queries: Some(self.clone()), user_id: user_id.to_string(), holds: false };
-        match tokio::time::timeout(SLOT_WAIT, slot.wait()).await {
+        match tokio::time::timeout(SLOT_WAIT, slot.wait(false)).await {
             Ok(()) => {}
             Err(_) => {
                 return Err(Error::Unavailable {
@@ -106,6 +110,7 @@ impl Queries {
             bytes: AtomicUsize::new(0),
             charge: Mutex::new(Charge::new(&self.memory, 0)),
             cancelled: AtomicBool::new(false),
+            failure: Mutex::new(None),
             txns: Arc::downgrade(txns),
             step_bytes: (self.memory.limit() / 1024).max(1),
             limit_bytes: self.memory.limit(),
@@ -119,14 +124,15 @@ impl Queries {
         self.running.lock().len()
     }
 
-    /// Returns the queries that have not been cancelled, from youngest to oldest.
+    /// Returns the queries that compete for memory, from youngest to oldest.
     pub(crate) fn running(&self) -> Vec<Arc<QueryMemory>> {
-        self.running.lock().values().rev().filter(|q| !q.is_cancelled()).cloned().collect()
+        self.running.lock().values().rev().filter(|q| !q.is_stopping()).cloned().collect()
     }
 
-    /// Returns the bytes charged by cancelled queries that have not finished.
-    pub(crate) fn cancelled_bytes(&self) -> usize {
-        self.running.lock().values().filter(|q| q.is_cancelled()).map(|q| q.charged()).sum()
+    /// Returns the bytes charged by queries whose own memory check failed and that are releasing
+    /// their memory.
+    pub(crate) fn failed_bytes(&self) -> usize {
+        self.running.lock().values().filter(|q| q.failure.lock().is_some()).map(|q| q.charged()).sum()
     }
 }
 
@@ -148,6 +154,7 @@ impl QueryGrant {
                 bytes: AtomicUsize::new(0),
                 charge: Mutex::new(Charge::default()),
                 cancelled: AtomicBool::new(false),
+                failure: Mutex::new(None),
                 txns: Weak::new(),
                 step_bytes: usize::MAX,
                 limit_bytes: usize::MAX,
@@ -173,13 +180,18 @@ pub struct QuerySlot {
 }
 
 impl QuerySlot {
-    /// Waits until this query holds a slot.
-    async fn wait(&mut self) {
+    /// Waits until this query holds a slot. A query that `resumes` waits ahead of the queries of
+    /// its user that have not started.
+    async fn wait(&mut self, resumes: bool) {
         let Some(queries) = self.queries.clone() else { return };
         let (tx, rx) = oneshot::channel();
         {
             let mut s = queries.state.lock();
-            s.waiters.push_back(SlotWaiter { user_id: self.user_id.clone(), grant: tx });
+            let waiter = SlotWaiter { user_id: self.user_id.clone(), grant: tx };
+            match resumes {
+                true => s.waiters.push_front(waiter),
+                false => s.waiters.push_back(waiter),
+            }
             s.grant_waiters();
         }
         let mut wait = SlotWait { queries: &queries, user_id: &self.user_id, rx: Some(rx) };
@@ -191,20 +203,24 @@ impl QuerySlot {
         }
     }
 
-    /// Gives this query's slot to a waiting query whose user holds fewer slots than this query's
-    /// user, and waits for a slot again.
+    /// Gives this query's slot to a waiting query if its user holds no slots or at least 2 fewer
+    /// slots than this query's user, and waits for a slot again.
     pub async fn yield_to_waiters(&mut self) {
         let Some(queries) = &self.queries else { return };
         {
             let mut s = queries.state.lock();
             let mine = s.held(&self.user_id);
-            if !s.next_waiter().is_some_and(|i| s.held(&s.waiters[i].user_id) < mine) {
-                return;
-            }
+            let fairer = |theirs: usize| theirs == 0 || theirs + 1 < mine;
+            let Some(i) = s.next_waiter().filter(|&i| fairer(s.held(&s.waiters[i].user_id))) else { return };
+            let w = s.waiters.remove(i).expect("waiter index is in range");
             self.holds = false;
-            s.release(&self.user_id);
+            s.release_held(&self.user_id);
+            match w.grant.send(()) {
+                Ok(()) => *s.held_by_user.entry(w.user_id).or_default() += 1,
+                Err(_) => s.free += 1,
+            }
         }
-        self.wait().await;
+        self.wait(true).await;
     }
 }
 
@@ -243,7 +259,10 @@ pub struct QueryMemory {
     pub user_id: String,
     bytes: AtomicUsize,
     charge: Mutex<Charge>,
+    /// Set if the node evicted the query to free memory for another user.
     cancelled: AtomicBool,
+    /// Error of the query's own failed memory check. Set while the query releases its memory.
+    failure: Mutex<Option<Error>>,
     txns: Weak<OpenTxns>,
     step_bytes: usize,
     /// Node memory budget, and the largest amount of memory a query can use.
@@ -259,7 +278,14 @@ impl QueryMemory {
         } else {
             self.bytes.fetch_sub(old - new, Relaxed) - (old - new)
         };
-        self.check_cancelled()?;
+        self.check_stopped()?;
+        if total > self.limit_bytes {
+            return Err(self.fail(Error::TooLarge(format!(
+                "the query needs more than the node's {} byte memory budget; narrow the time range, group by \
+                 fewer values, or read fewer columns",
+                self.limit_bytes
+            ))));
+        }
         let charged = self.charged();
         if total.abs_diff(charged) < self.step_bytes {
             return Ok(());
@@ -289,12 +315,23 @@ impl QueryMemory {
         self.cancelled.store(true, Relaxed);
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Relaxed)
+    /// Records `e` as the query's failure, so that its later memory changes return the same
+    /// error, and returns the recorded failure.
+    pub(crate) fn fail(&self, e: Error) -> Error {
+        self.failure.lock().get_or_insert(e).clone()
     }
 
-    fn check_cancelled(&self) -> Result<()> {
-        if self.is_cancelled() {
+    /// Returns true if the query no longer competes for memory because it was evicted or failed.
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.cancelled.load(Relaxed) || self.failure.lock().is_some()
+    }
+
+    /// Returns an error if the node evicted the query or the query failed a memory check.
+    pub fn check_stopped(&self) -> Result<()> {
+        if let Some(e) = self.failure.lock().clone() {
+            return Err(e);
+        }
+        if self.cancelled.load(Relaxed) {
             return Err(Error::Unavailable {
                 message: "the query was stopped to free node memory for other queries; retry".into(),
                 retry_after_ms: Some(1000),

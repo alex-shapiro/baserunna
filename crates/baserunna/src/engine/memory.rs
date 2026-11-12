@@ -143,8 +143,8 @@ pub fn fair_share(mut available: usize, mut others: Vec<usize>) -> usize {
 /// holders by [`fair_share`]. If `requester` uses at least its fair share, returns `None`.
 /// Otherwise, returns the indices in `held` of evictable transactions to abort until `used` is
 /// within `budget`. In each step, the earliest evictable transaction of the holder with the
-/// largest usage is selected, provided that aborting it moves that holder's usage closer to the
-/// fair share.
+/// largest usage is selected, provided that it holds memory and aborting it moves that holder's
+/// usage closer to the fair share.
 pub fn fair_admission<K: Ord>(budget: usize, used: usize, requester: &K, held: &[Held<K>]) -> Option<Vec<usize>> {
     let mut usage: BTreeMap<&K, usize> = BTreeMap::new();
     for h in held {
@@ -169,7 +169,7 @@ pub fn fair_admission<K: Ord>(budget: usize, used: usize, requester: &K, held: &
         let mut victim: Option<(&K, usize)> = None;
         for (k, txns) in &candidates {
             let over = usage[k].saturating_sub(share).saturating_mul(2);
-            let Some(pos) = txns.iter().position(|&i| held[i].bytes < over) else { continue };
+            let Some(pos) = txns.iter().position(|&i| held[i].bytes > 0 && held[i].bytes < over) else { continue };
             if victim.is_none_or(|(v, _)| usage[k] > usage[v]) {
                 victim = Some((k, pos));
             }
@@ -300,7 +300,7 @@ mod tests {
     }
 
     fn moves_closer_to_share(usage: usize, share: usize, bytes: usize) -> bool {
-        usage > share && bytes < 2 * (usage - share)
+        usage > share && bytes > 0 && bytes < 2 * (usage - share)
     }
 
     #[test]

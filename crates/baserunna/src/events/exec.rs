@@ -1896,7 +1896,12 @@ pub async fn run(
     grant: &mut QueryGrant,
 ) -> Result<Output> {
     let limit = std::time::Duration::from_millis(limits.max_ms);
-    let limits = Limits { max_memory_bytes: limits.max_memory_bytes.min(grant.memory.limit_bytes), ..*limits };
+    let budget = grant.memory.limit_bytes;
+    let limits = Limits {
+        max_memory_bytes: limits.max_memory_bytes.min(budget),
+        lookup_max_bytes: limits.lookup_max_bytes.min(budget),
+        ..*limits
+    };
     match tokio::time::timeout(limit, run_within(shared, db, txn, s, q, &limits, grant)).await {
         Ok(r) => r,
         Err(_) => Err(timed_out(limits.max_ms)),
@@ -2043,6 +2048,7 @@ async fn run_within(
     let mut launched = 0;
     for (i, r) in refs.iter().enumerate() {
         grant.slot.yield_to_waiters().await;
+        grant.memory.check_stopped()?;
         if frontier.as_mut().is_some_and(|f| f.is_done(&mut run, &refs, i)) {
             probe::hit(Probe::RowPageStoppedEarly);
             break;

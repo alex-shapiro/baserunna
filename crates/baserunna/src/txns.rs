@@ -100,26 +100,17 @@ impl OpenTxns {
 
     /// Enforces the node memory budget for growth of query `q`, and stops `q` if its user holds
     /// at least its fair share. The oldest running query is always admitted, so that a query
-    /// finishes while database memory fills the budget. Returns a `413` error if `q` alone
-    /// exceeds the budget.
+    /// finishes while database memory fills the budget.
     pub(crate) fn admit_query(&self, q: &QueryMemory) -> Result<()> {
         if self.fair_admission(&q.user_id) || self.queries.running().last().is_some_and(|o| o.seq == q.seq) {
             return Ok(());
         }
-        q.cancel();
-        if q.charged() > self.engine.shared.memory.limit() {
-            return Err(Error::TooLarge(format!(
-                "the query needs more than the node's {} byte memory budget; narrow the time range, group by \
-                 fewer values, or read fewer columns",
-                self.engine.shared.memory.limit()
-            )));
-        }
-        Err(Error::Unavailable {
+        Err(q.fail(Error::Unavailable {
             message: "this user's queries and transactions hold their fair share of the node memory budget; retry"
                 .into(),
             retry_after_ms: Some(1_000),
             outcome_unknown: false,
-        })
+        }))
     }
 
     /// Returns false if the node memory budget is exceeded and `user_id` holds at least its fair
@@ -130,7 +121,7 @@ impl OpenTxns {
         if shared.reclaim_to_budget() {
             return true;
         }
-        let used = shared.memory.used().saturating_sub(self.queries.cancelled_bytes());
+        let used = shared.memory.used().saturating_sub(self.queries.failed_bytes());
         if used <= shared.memory.limit() {
             return true;
         }

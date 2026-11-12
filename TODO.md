@@ -596,17 +596,12 @@ only.
       crashes every 24 s, each retry starts with a cold cache and the client
       fails after 200 attempts (`sim_tool trace events 11581` with
       `p_late_apply` enabled). Main also returns `503` for this op.
-- [ ] [untriaged · Background maintenance] **Run background maintenance
-      after a manifest `PUT` error.** Select the node that runs sweeps, flushes,
-      and compaction from the lease in the manifest instead of `own_lease`. A
-      manifest `PUT` error clears `own_lease`. Because `Db` maintenance checks
-      `holds_lease`, background work stops until the node's next `PUT` succeeds.
-      On an idle database, obsolete objects are not collected. The same state
-      occurs without a store fault if a hedged duplicate `PUT` returns `412`
-      before the primary reply arrives. Reproduction: `sim_tool trace blobs 1002`
-      (and seeds 1589 and 2033) fails with uncollected garbage blobs after a
-      full GC cycle. Also test that a sweep during a pending late `PUT` does not
-      mark a referenced object as obsolete.
+- [ ] [untriaged · Simulator] **Allow for paused maintenance in the `blobs`
+      final GC check.** After a manifest `PUT` error, a node runs no sweep,
+      flush, or compaction for that database until one of its `PUT`s succeeds.
+      This is the intended lease rule. The `blobs` scenario expects a full GC
+      cycle to remove all garbage without a successful `PUT`, so
+      `sim_tool trace blobs 1002`, `1589`, and `2033` fail.
 - [ ] [untriaged · Lease] **Skip the hot-read lease request while a commit
       batch runs.** Check whether a commit batch is running before enqueueing a
       hot-read lease renewal. Today, the check only inspects whether a manifest

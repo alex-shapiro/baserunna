@@ -27,13 +27,6 @@ only.
 
 ## Blocker
 
-- [ ] [blocker · Tenant resource exhaustion] **Extend the deadline of
-      transactional `query_events` ops.** Apply the event query deadline if
-      `/txn` executes `query_events`. A query that returned `200` after 12.5 s
-      on the event query route (`/events/{t}/rows/query`) failed with `503` and
-      `outcome: "unknown"` after 10 s in `/txn`. Test:
-      `transactional_event_queries_get_the_event_query_deadline` in
-      `tests/event_query_limits.rs`.
 - [ ] [blocker · Tenant resource exhaustion] **Estimate granule run memory from
       actual string lengths.** Use the column index byte length to estimate run
       memory before decoding. `Run::run_rows` estimates string columns at 4
@@ -207,6 +200,15 @@ only.
 - [ ] [nice-to-have · Duplicate requests] **Display `outcome: "unknown"` in the
       web console.** The console displays only the error message, so an
       ambiguous write appears to have failed.
+- [ ] [nice-to-have · Event tables] **Extend the deadline of transactional
+      `query_events` ops.** Apply the event query deadline if `/txn` executes
+      `query_events`. A query that returned `200` after 12.5 s on the event
+      query route (`/events/{t}/rows/query`) failed with `503` and `outcome:
+      "unknown"` after 10 s in `/txn`. To work around this, send the query to
+      the event query route. The query then does not read the same snapshot as
+      the other ops of the transaction. Test:
+      `transactional_event_queries_get_the_event_query_deadline` in
+      `tests/event_query_limits.rs`.
 - [ ] [nice-to-have · Event tables] **Prevent event deletes from conflicting
       with concurrent inserts.** Evaluate the delete filter against rows and
       part references added after the snapshot inside the committer instead of

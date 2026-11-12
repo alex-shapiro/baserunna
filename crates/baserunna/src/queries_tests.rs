@@ -7,7 +7,7 @@ fn queries(slots: usize) -> Arc<Queries> {
 }
 
 async fn slot(q: &Arc<Queries>, user: &str) -> QuerySlot {
-    let mut s = QuerySlot { queries: Some(q.clone()), user_id: user.into(), holds: false };
+    let mut s = QuerySlot { queries: Some(q.clone()), user_id: user.into(), holds: false, started: false };
     s.wait(false, None).await;
     s
 }
@@ -157,7 +157,7 @@ fn evicted_query_is_releasing_and_not_evicted_again() {
     assert_eq!(q.releasing_bytes(), 500, "the evicted query's memory is not counted as releasing");
     crate::sim::cost::run_paused(async {
         let mut a = slot(&q, "a").await;
-        let mut b = QuerySlot { queries: Some(q.clone()), user_id: "b".into(), holds: false };
+        let mut b = QuerySlot { queries: Some(q.clone()), user_id: "b".into(), holds: false, started: false };
         let waiting = b.wait(false, Some(&young));
         assert!(tokio::time::timeout(Duration::from_secs(1), waiting).await.is_ok(), "an evicted query kept waiting");
         let later = query_memory(3, usize::MAX);
@@ -174,9 +174,9 @@ fn evicted_query_is_releasing_and_not_evicted_again() {
     });
 }
 
-/// Runs one query per user that yields after each 1 ms part read and returns the time at which
-/// each user first held a slot.
-fn first_slot_times(users: usize, slots: usize) -> Vec<Duration> {
+/// Runs one query of 50 parts per user that yields after each 1 ms part read and returns the
+/// times at which each user first held a slot and finished.
+fn slot_times(users: usize, slots: usize) -> Vec<(Duration, Duration)> {
     crate::sim::cost::run_paused(async move {
         let q = queries(slots);
         let started = tokio::time::Instant::now();
@@ -189,8 +189,9 @@ fn first_slot_times(users: usize, slots: usize) -> Vec<Duration> {
                     for _ in 0..50 {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                         s.yield_to_waiters(None).await;
+                        assert!(q.state.lock().started <= STARTED_PER_SLOT * slots, "too many queries started");
                     }
-                    first
+                    (first, started.elapsed())
                 })
             })
             .collect();
@@ -204,12 +205,21 @@ fn first_slot_times(users: usize, slots: usize) -> Vec<Duration> {
 
 #[test]
 fn every_waiting_user_gets_a_slot_while_others_take_turns() {
-    for (users, slots) in [(2, 1), (3, 1), (5, 2), (18, 16)] {
-        let times = first_slot_times(users, slots);
-        let latest = times.iter().max().unwrap();
+    for (users, slots) in [(2, 1), (4, 2), (5, 3), (18, 16), (32, 16)] {
+        let times = slot_times(users, slots);
+        let latest = times.iter().map(|t| t.0).max().unwrap();
         assert!(
-            *latest <= Duration::from_millis(2 * users as u64),
+            latest <= Duration::from_millis(2 * users as u64),
             "{users} users on {slots} slots: a user first got a slot after {latest:?}: {times:?}"
         );
     }
+}
+
+#[test]
+fn overload_finishes_the_started_queries_first() {
+    let times = slot_times(5, 1);
+    let mut done: Vec<Duration> = times.iter().map(|t| t.1).collect();
+    done.sort();
+    assert!(done[1] <= Duration::from_millis(110), "the 2 started queries finished after {:?}", done[1]);
+    assert!(times.iter().filter(|t| t.0 >= done[0]).count() >= 3, "more than 2 queries started at once: {times:?}");
 }

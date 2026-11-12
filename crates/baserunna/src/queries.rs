@@ -21,15 +21,27 @@ pub struct Queries {
     running: Mutex<BTreeMap<u64, Arc<QueryMemory>>>,
 }
 
+/// Maximum number of started queries per query slot, counting queries that yielded their slot.
+const STARTED_PER_SLOT: usize = 2;
+
 struct SlotState {
     free: usize,
     held_by_user: BTreeMap<String, usize>,
     /// Waiting queries of each user, in the order that the user's queries get slots.
-    waiters: BTreeMap<String, VecDeque<oneshot::Sender<()>>>,
+    waiters: BTreeMap<String, VecDeque<SlotWaiter>>,
+    /// Number of queries that received a slot and have not finished.
+    started: usize,
+    max_started: usize,
     /// Number of the latest slot grant to each user.
     last_grant: BTreeMap<String, u64>,
     grants: u64,
     next_query_seq: u64,
+}
+
+struct SlotWaiter {
+    grant: oneshot::Sender<()>,
+    /// True if the query started before and yielded its slot.
+    resumes: bool,
 }
 
 impl SlotState {
@@ -37,31 +49,45 @@ impl SlotState {
         self.held_by_user.get(user_id).copied().unwrap_or(0)
     }
 
-    /// Returns the waiting user that holds the fewest slots, and on ties the user whose latest
-    /// slot grant is the oldest.
-    fn next_user(&self) -> Option<String> {
-        self.waiters.keys().min_by_key(|u| (self.held(u), self.last_grant.get(*u).copied().unwrap_or(0))).cloned()
+    /// Returns true if the first waiting query of `user_id` resumes, or if the node can start
+    /// another query.
+    fn can_grant(&self, user_id: &str) -> bool {
+        self.waiters.get(user_id).and_then(|q| q.front()).is_some_and(|w| w.resumes || self.started < self.max_started)
     }
 
-    /// Grants a slot to the first waiting query of `user_id` that still waits. Returns false if
-    /// none does.
+    /// Returns the waiting user that holds the fewest slots, and on ties the user whose latest
+    /// slot grant is the oldest, among the users whose first waiting query can get a slot.
+    fn next_user(&self) -> Option<String> {
+        self.waiters
+            .keys()
+            .filter(|u| self.can_grant(u))
+            .min_by_key(|u| (self.held(u), self.last_grant.get(*u).copied().unwrap_or(0)))
+            .cloned()
+    }
+
+    /// Grants a slot to the first waiting query of `user_id` that still waits and can get a
+    /// slot. Returns false if none does.
     fn grant_to(&mut self, user_id: &str) -> bool {
-        while let Some(queue) = self.waiters.get_mut(user_id) {
-            let Some(grant) = queue.pop_front() else {
-                self.waiters.remove(user_id);
-                return false;
-            };
+        while self.can_grant(user_id) {
+            let queue = self.waiters.get_mut(user_id).expect("a user with a waiting query has a queue");
+            let w = queue.pop_front().expect("a user with a waiting query has a queue entry");
             if queue.is_empty() {
                 self.waiters.remove(user_id);
             }
-            if grant.send(()).is_ok() {
+            if w.grant.send(()).is_ok() {
                 *self.held_by_user.entry(user_id.to_string()).or_default() += 1;
+                self.started += !w.resumes as usize;
                 self.grants += 1;
                 self.last_grant.insert(user_id.to_string(), self.grants);
                 return true;
             }
         }
         false
+    }
+
+    fn finish(&mut self) {
+        self.started -= 1;
+        self.grant_waiters();
     }
 
     fn grant_waiters(&mut self) {
@@ -98,6 +124,8 @@ impl Queries {
                 free: slots.max(1),
                 held_by_user: BTreeMap::new(),
                 waiters: BTreeMap::new(),
+                started: 0,
+                max_started: STARTED_PER_SLOT * slots.max(1),
                 last_grant: BTreeMap::new(),
                 grants: 0,
                 next_query_seq: 0,
@@ -109,7 +137,8 @@ impl Queries {
     /// Admits a query of `user_id`, waiting up to 5 s for a query slot, and registers its memory
     /// for admission by `txns`.
     pub async fn start(self: &Arc<Self>, user_id: &str, txns: &Arc<OpenTxns>) -> Result<QueryGrant> {
-        let mut slot = QuerySlot { queries: Some(self.clone()), user_id: user_id.to_string(), holds: false };
+        let mut slot =
+            QuerySlot { queries: Some(self.clone()), user_id: user_id.to_string(), holds: false, started: false };
         match tokio::time::timeout(SLOT_WAIT, slot.wait(false, None)).await {
             Ok(()) => {}
             Err(_) => {
@@ -168,7 +197,7 @@ impl QueryGrant {
     /// Returns a grant without a query slot or a memory budget, for queries outside a node.
     pub fn unlimited() -> QueryGrant {
         QueryGrant {
-            slot: QuerySlot { queries: None, user_id: String::new(), holds: false },
+            slot: QuerySlot { queries: None, user_id: String::new(), holds: false, started: false },
             memory: Arc::new(QueryMemory {
                 seq: 0,
                 user_id: String::new(),
@@ -208,6 +237,8 @@ pub struct QuerySlot {
     queries: Option<Arc<Queries>>,
     user_id: String,
     holds: bool,
+    /// True once the query first received a slot.
+    started: bool,
 }
 
 impl QuerySlot {
@@ -220,13 +251,14 @@ impl QuerySlot {
         {
             let mut s = queries.state.lock();
             let queue = s.waiters.entry(self.user_id.clone()).or_default();
+            let waiter = SlotWaiter { grant: tx, resumes };
             match resumes {
-                true => queue.push_front(tx),
-                false => queue.push_back(tx),
+                true => queue.push_front(waiter),
+                false => queue.push_back(waiter),
             }
             s.grant_waiters();
         }
-        let mut wait = SlotWait { queries: &queries, user_id: &self.user_id, rx: Some(rx) };
+        let mut wait = SlotWait { queries: &queries, user_id: &self.user_id, rx: Some(rx), resumes };
         let Some(rx) = wait.rx.as_mut() else { return };
         let granted = match memory {
             None => rx.await.is_ok(),
@@ -247,6 +279,7 @@ impl QuerySlot {
         if granted {
             wait.rx = None;
             self.holds = true;
+            self.started = true;
         }
     }
 
@@ -271,10 +304,13 @@ impl QuerySlot {
 
 impl Drop for QuerySlot {
     fn drop(&mut self) {
-        if self.holds
-            && let Some(q) = &self.queries
-        {
-            q.state.lock().release(&self.user_id);
+        let Some(q) = &self.queries else { return };
+        let mut s = q.state.lock();
+        if self.holds {
+            s.release(&self.user_id);
+        }
+        if self.started {
+            s.finish();
         }
     }
 }
@@ -284,6 +320,7 @@ struct SlotWait<'a> {
     queries: &'a Queries,
     user_id: &'a str,
     rx: Option<oneshot::Receiver<()>>,
+    resumes: bool,
 }
 
 impl Drop for SlotWait<'_> {
@@ -291,7 +328,11 @@ impl Drop for SlotWait<'_> {
         if let Some(mut rx) = self.rx.take() {
             rx.close();
             if rx.try_recv().is_ok() {
-                self.queries.state.lock().release(self.user_id);
+                let mut s = self.queries.state.lock();
+                s.release(self.user_id);
+                if !self.resumes {
+                    s.finish();
+                }
             }
         }
     }

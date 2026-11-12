@@ -926,28 +926,28 @@ enum ManifestPutOutcome {
     Applied,
     FailedBeforeApply,
     AppliedThenFailed,
-    /// Fails now, and stays buffered with its precondition until the test applies it.
+    /// Returns an error and buffers the write with its precondition until the test applies it.
     FailedThenAppliedLate,
-    /// Applies the write, and returns `412`.
+    /// Applies the write and returns `412`.
     AppliedThenRejected,
 }
 
-/// Object store wrapper that gives each manifest write an outcome: the next queued outcome, else a
-/// random outcome if `random_faults` is set, else [`ManifestPutOutcome::Applied`].
-/// [`LateManifestPutStore::apply_late_puts`] applies the buffered writes with their original
-/// preconditions.
+/// Object store wrapper that injects manifest write faults.
+/// Each manifest write uses the next queued outcome, a random outcome if `random_faults` is set,
+/// or [`ManifestPutOutcome::Applied`]. [`LateManifestPutStore::apply_late_puts`] applies buffered
+/// writes with their original preconditions.
 struct LateManifestPutStore {
     mem: Arc<MemStore>,
     queued_outcomes: Mutex<std::collections::VecDeque<ManifestPutOutcome>>,
-    /// Source of random outcomes and of manifest request latencies up to 30 ms.
+    /// Random generator for manifest write outcomes and request latencies up to 30 ms.
     random_faults: Mutex<Option<Rng>>,
     late_puts: Mutex<Vec<(String, Bytes, PutMode)>>,
-    /// Applies the buffered writes before the next manifest write.
+    /// True if buffered writes should be applied before the next manifest write.
     apply_late_puts_on_next_put: std::sync::atomic::AtomicBool,
     manifest_put_rejected: tokio::sync::Notify,
     manifest_gets: AtomicU32,
     manifest_puts: AtomicU32,
-    /// ETags of the applied manifest writes, in order.
+    /// ETags of applied manifest writes in application order.
     applied_etags: Mutex<Vec<String>>,
 }
 
@@ -1081,8 +1081,7 @@ async fn commit_new(db: Arc<Db>) -> crate::error::Result<Committed> {
 /// Polls strong reads on `db` every `every_ms` until a read returns `new`.
 /// Returns the elapsed milliseconds and the time at which `db` lost its lease.
 async fn ms_until_strong_read_is_new(db: &Arc<Db>, every_ms: u64) -> (u64, Option<u64>) {
-    // A paused clock gives this read the instant of the last manifest check, so `Db::refresh` reuses
-    // that check. A real clock gives a read that starts after the late write a later instant.
+    // Advance the paused clock by 1 ms so `Db::refresh` does not reuse a manifest check from the same instant.
     tokio::time::sleep(Duration::from_millis(1)).await;
     let start = Instant::now();
     let mut lease_lost_ms = None;
@@ -1183,8 +1182,8 @@ fn strong_read_after_an_applied_manifest_put_returns_412_is_new() {
     });
 }
 
-/// Commits `new` on A of two nodes with `cfg`. The store applies the first manifest `PUT` of the
-/// commit and returns `412`. Returns the commit outcome.
+/// Commits `new` on node A in a two-node cluster with `cfg`. The store applies the first manifest
+/// `PUT` of the commit and returns `412`. Returns the commit outcome.
 async fn commit_applied_with_a_412(cfg: EngineConfig) -> crate::error::Result<Committed> {
     let (a, b, store) = late_manifest_put_nodes_with(11, cfg);
     let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
@@ -1197,7 +1196,7 @@ async fn commit_applied_with_a_412(cfg: EngineConfig) -> crate::error::Result<Co
     outcome
 }
 
-/// Tests that a commit that the store applies with a `412` reply is not reported as replayed.
+/// Tests that a commit is not reported as replayed if the store applies its manifest `PUT` and returns `412`.
 #[test]
 #[ignore = "TODO.md: Report the correct commit result if the store applies a manifest PUT and returns 412"]
 fn commit_applied_with_a_412_is_not_replayed() {
@@ -1207,8 +1206,8 @@ fn commit_applied_with_a_412_is_not_replayed() {
     });
 }
 
-/// Tests that a commit whose last manifest `PUT` the store applies with a `412` reply is not
-/// reported as not applied.
+/// Tests that a commit is not reported as not applied if the store applies its last manifest `PUT`
+/// and returns `412`.
 #[test]
 #[ignore = "TODO.md: Report the correct commit result if the store applies a manifest PUT and returns 412"]
 fn commit_applied_with_a_412_on_the_last_attempt_is_not_reported_as_not_applied() {
@@ -1220,8 +1219,8 @@ fn commit_applied_with_a_412_on_the_last_attempt_is_not_reported_as_not_applied(
     });
 }
 
-/// Tests that a commit is reported as replayed if another node applied its commit ID after this
-/// node sent it in a manifest `PUT` with an unknown outcome that the store did not apply.
+/// Tests that a commit is reported as replayed if an ambiguous `PUT` from this node is not applied
+/// and another node later commits the same commit ID.
 #[test]
 #[ignore = "TODO.md: Report replayed: true if another node applied the commit ID"]
 fn commit_applied_by_another_node_after_an_unknown_put_is_replayed() {
@@ -1279,8 +1278,8 @@ fn gen_lease_steps(r: &mut Rng, n: usize) -> Vec<LeaseStep> {
         .collect()
 }
 
-/// Checks that each node serves lease reads only from the stored manifest, and only if no buffered
-/// write can replace that manifest.
+/// Checks that each node serves lease reads only from the stored manifest and only if no buffered
+/// write matches that manifest's ETag.
 fn check_lease_views(dbs: &[(&str, &Arc<Db>)], store: &LateManifestPutStore) -> Result<(), String> {
     for (node, db) in dbs {
         let Some((write_seq, etag, false)) = db.leased_view() else { continue };
@@ -1309,8 +1308,7 @@ async fn advance_checking(ms: u64, dbs: &[(&str, &Arc<Db>)], store: &LateManifes
 
 /// Checks that a strong read on `db` returns a manifest that the store held during the read.
 async fn check_strong_read(db: &Arc<Db>, waits_for_write: bool, store: &LateManifestPutStore) -> Result<(), String> {
-    // A paused clock gives this read the instant of earlier store changes. A real clock gives it a
-    // later instant.
+    // Advance the paused clock by 1 ms so `Db::refresh` does not reuse a manifest check from the same instant.
     tokio::time::sleep(Duration::from_millis(1)).await;
     let first = store.applied_etags.lock().len() - 1;
     let (snap, write_in_flight) = match waits_for_write {
@@ -1340,8 +1338,8 @@ fn spawn_commit(db: &Arc<Db>, value: String) -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// Runs `steps` after A commits once and holds its lease, with random manifest request outcomes.
-/// Returns the failing step and the broken invariant.
+/// Runs `steps` with random manifest request outcomes after node A commits once and holds its lease.
+/// Returns an error if any step breaks a lease or strong-read invariant.
 async fn run_lease_steps(seed: u64, steps: &[LeaseStep]) -> Result<(), String> {
     let mut r = Rng::new(seed ^ 0x1ea5e);
     // Two attempts make it likely that every manifest `PUT` of a batch fails.
@@ -1404,8 +1402,7 @@ async fn run_lease_steps(seed: u64, steps: &[LeaseStep]) -> Result<(), String> {
     Ok(())
 }
 
-/// Tests that lease-served strong reads match the stored manifest while manifest writes fail,
-/// apply and fail, apply and return `412`, or apply late with their original precondition.
+/// Tests that lease-served strong reads match the stored manifest under random manifest `PUT` faults.
 #[test]
 fn prop_lease_reads_match_the_store_under_late_manifest_puts() {
     let cases = prop::env_u64("PROP_CASES").unwrap_or(256);
@@ -1425,9 +1422,9 @@ fn prop_lease_reads_match_the_store_under_late_manifest_puts() {
     assert!(failures.is_empty(), "{} of {cases} seeds failed:\n{}", failures.len(), failures.join("\n"));
 }
 
-/// Measures the manifest requests and the time without lease reads that a lost `PUT` reply costs on a
-/// quiet and on a hot database. A reads from the start and commits every 3 s. The store applies the
-/// commit at 3 s, and loses its reply.
+/// Measures the manifest request count and lease recovery time after a lost `PUT` reply on quiet
+/// and hot databases. Node A reads from the start and commits every 3 s. At 3 s, the store applies
+/// the commit and loses its reply.
 #[test]
 fn lease_reads_resume_after_a_lost_put_reply() {
     async fn run(read_every_ms: u64, lose_reply: bool) -> (u32, u32, Option<u64>) {

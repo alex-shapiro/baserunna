@@ -460,8 +460,7 @@ fn check_path(path: &str, home: Home, round: fn(&LateCommit) -> Vec<Probe>, fail
         let probes = round(&lc);
         lc.ask(Probe::StrongGet(lc.holder)).await;
         lc.apply_late_put();
-        // A paused clock gives the next read the instant of the last manifest check, so the node
-        // reuses that check. A real clock gives a read that starts after the late write a later instant.
+        // Advance the paused clock by 1 ms so `Db::refresh` does not reuse a manifest check from the same instant.
         tokio::time::sleep(Duration::from_millis(1)).await;
         lc.c.fail_forwards_to(lc.holder, failed_forwards);
         lc.ask_until_new(&probes).await;

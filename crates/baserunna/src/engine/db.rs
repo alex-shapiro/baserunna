@@ -169,8 +169,7 @@ struct State {
     reads_in_window: u32,
     reads_last_window: u32,
     lease_requested: bool,
-    /// `(write_seq, expires_at)` for the lease that this node got from its last manifest `PUT`,
-    /// if that `PUT` succeeded.
+    /// `(write_seq, expires_at)` for the lease granted by this node's last successful manifest `PUT`.
     own_lease: Option<(u64, Instant)>,
     /// Start instant of this node's in-flight manifest write.
     manifest_write_started_at: Option<Instant>,
@@ -508,8 +507,7 @@ impl Db {
         }
     }
 
-    /// Installs `v` if it is newer than `current`, and records that `current` was the stored
-    /// manifest at `verified`.
+    /// Installs `v` if it is newer than `current` and updates `verified_at` to `verified`.
     fn install(&self, v: Arc<Version>, verified: Instant) -> Arc<Version> {
         let mut st = self.st.lock();
         self.shared.env.trace(|| {
@@ -2876,7 +2874,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_returns_only_with_a_successful_manifest_put() {
+    fn lease_is_restored_only_after_a_successful_manifest_put() {
         use crate::engine::tests::{delayed_engine_with, opened, put};
         use std::sync::atomic::Ordering::SeqCst;
         rt().block_on(async {
@@ -2884,12 +2882,12 @@ mod tests {
             let (eng, store) = delayed_engine_with("a", cfg);
             let db = opened(&eng, "d").await;
             put(&db, "k", "1").await;
-            assert!(db.leased_view().is_some(), "setup: the commit gives the lease");
+            assert!(db.leased_view().is_some(), "setup: the commit grants the lease");
             store.manifest_put_lost.store(1, SeqCst);
             put(&db, "k", "2").await;
-            assert!(db.leased_view().is_none(), "the reload that found the lost reply's write gave the lease");
+            assert!(db.leased_view().is_none(), "reloading the manifest after a lost PUT reply restored the lease");
             put(&db, "k", "3").await;
-            assert!(db.leased_view().is_some(), "the next successful PUT did not give the lease");
+            assert!(db.leased_view().is_some(), "the next successful PUT did not restore the lease");
         });
     }
 

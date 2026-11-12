@@ -363,7 +363,7 @@ fn transactional_event_queries_take_query_slots() {
 }
 
 #[test]
-#[ignore = "TODO blocker: extend the deadline of transactional query_events ops"]
+#[ignore = "TODO nice-to-have: extend the deadline of transactional query_events ops"]
 fn transactional_event_queries_get_the_event_query_deadline() {
     let _turn = TURN.lock();
     run_paused(async {

@@ -45,6 +45,30 @@ only.
       profiles.** Enable `StoreFaults::p_late_apply` in the swarm profiles once
       the stale strong read defect above is fixed. `StoreFaults::p_late_apply`
       makes the simulated store return an error for a `PUT` and apply it later.
+- [ ] [blocker · Wrong commit result] **Report the correct commit result if the
+      store applies a manifest `PUT` and returns `412`.** Send a unique write ID
+      in each manifest `PUT` and in its commit records, so that a reload shows
+      which `PUT` wrote the manifest. The store can apply a manifest `PUT` and
+      return `412` (SPEC §5.5), but the committer treats each `412` as not
+      applied. On the first attempt, the commit then returns `replayed: true`,
+      so the API returns `results: null` for the commit that it applied. After
+      the last attempt, the commit returns `503` with `outcome: "not_applied"`,
+      but another node reads the commit. Tests:
+      `commit_applied_with_a_412_is_not_replayed` and
+      `commit_applied_with_a_412_on_the_last_attempt_is_not_reported_as_not_applied`
+      in `src/engine/tests.rs`.
+- [ ] [blocker · Wrong commit result] **Report `replayed: true` if another node
+      applied the commit ID.** Send a unique write ID in each manifest `PUT` and
+      in its commit records, and report `replayed: false` only if the commit
+      record has the write ID of a `PUT` from this batch.
+      `clear_replay_if_sent_in_batch` reports `replayed: false` for each commit
+      ID that the batch sent in a `PUT` with an unknown outcome. If the store
+      did not apply that `PUT` and another node then applied the same commit
+      ID, the commit returns `replayed: false`. The API then returns the
+      results of an execution that did not commit, in place of
+      `replayed: true` and `results: null` (SPEC §6.2). Test:
+      `commit_applied_by_another_node_after_an_unknown_put_is_replayed` in
+      `src/engine/tests.rs`.
 - [ ] [blocker · Tenant resource exhaustion] **Charge event query memory to the
       node `MemoryGate` and fair-share `Node::query_slot`.** Reserve
       `MemoryGate` capacity for event queries and share `Node::query_slot`

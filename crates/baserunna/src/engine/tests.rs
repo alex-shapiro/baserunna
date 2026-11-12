@@ -1183,6 +1183,76 @@ fn strong_read_after_an_applied_manifest_put_returns_412_is_new() {
     });
 }
 
+/// Commits `new` on A of two nodes with `cfg`. The store applies the first manifest `PUT` of the
+/// commit and returns `412`. Returns the commit outcome.
+async fn commit_applied_with_a_412(cfg: EngineConfig) -> crate::error::Result<Committed> {
+    let (a, b, store) = late_manifest_put_nodes_with(11, cfg);
+    let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
+    put(&db_a, "k", "old").await;
+    db_b.open(false).await.unwrap();
+    store.queue_manifest_puts(ManifestPutOutcome::AppliedThenRejected, 1);
+    let outcome = commit_new(db_a).await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(strong_get(&db_b, "k").await, Some(inline("new")), "setup: the store applied the commit, {outcome:?}");
+    outcome
+}
+
+/// Tests that a commit that the store applies with a `412` reply is not reported as replayed.
+#[test]
+#[ignore = "TODO.md blocker: Report the correct commit result if the store applies a manifest PUT and returns 412"]
+fn commit_applied_with_a_412_is_not_replayed() {
+    rt().block_on(async {
+        let outcome = commit_applied_with_a_412(EngineConfig::default()).await;
+        assert!(matches!(outcome, Ok(Committed { replayed: false, .. })), "the commit answered {outcome:?}");
+    });
+}
+
+/// Tests that a commit whose last manifest `PUT` the store applies with a `412` reply is not
+/// reported as not applied.
+#[test]
+#[ignore = "TODO.md blocker: Report the correct commit result if the store applies a manifest PUT and returns 412"]
+fn commit_applied_with_a_412_on_the_last_attempt_is_not_reported_as_not_applied() {
+    rt().block_on(async {
+        let cfg = EngineConfig { commit_retry_max: 1, ..EngineConfig::default() };
+        let outcome = commit_applied_with_a_412(cfg).await;
+        let not_applied = matches!(outcome, Err(Error::Unavailable { outcome_unknown: false, .. }));
+        assert!(!not_applied, "the commit answered {outcome:?}");
+    });
+}
+
+/// Tests that a commit is reported as replayed if another node applied its commit ID after this
+/// node sent it in a manifest `PUT` with an unknown outcome that the store did not apply.
+#[test]
+#[ignore = "TODO.md blocker: Report replayed: true if another node applied the commit ID"]
+fn commit_applied_by_another_node_after_an_unknown_put_is_replayed() {
+    rt().block_on(async {
+        let (a, b, store) = late_manifest_put_nodes();
+        let (db_a, db_b) = (opened(&a, "d").await, b.db("d"));
+        put(&db_a, "k", "old").await;
+        db_b.open(false).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(a.shared.cfg.lease_ms + a.shared.cfg.lease_margin_ms + 1)).await;
+        let request = |db: Arc<Db>| async move {
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            t.put(Bytes::from_static(b"k"), inline("new")).unwrap();
+            CommitRequest { commit_id: 7, ..t.into_request() }
+        };
+        let (req_a, req_b) = (request(db_a.clone()).await, request(db_b.clone()).await);
+        store.queue_manifest_puts(ManifestPutOutcome::FailedBeforeApply, 1);
+        let puts = store.manifest_puts.load(SeqCst);
+        let commit_a = tokio::spawn({
+            let db_a = db_a.clone();
+            async move { db_a.commit_detailed(req_a).await }
+        });
+        while store.manifest_puts.load(SeqCst) == puts {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let outcome_b = db_b.commit_detailed(req_b).await;
+        assert!(matches!(outcome_b, Ok(Committed { replayed: false, .. })), "setup: B answered {outcome_b:?}");
+        let outcome_a = commit_a.await.unwrap();
+        assert!(matches!(outcome_a, Ok(Committed { replayed: true, .. })), "A answered {outcome_a:?}");
+    });
+}
+
 /// Step of a [`run_lease_steps`] run on two nodes, A and B.
 #[derive(Clone, Copy, Debug)]
 enum LeaseStep {

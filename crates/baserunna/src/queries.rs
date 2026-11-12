@@ -185,13 +185,13 @@ impl Queries {
     }
 
     /// Returns active queries that compete for memory, ordered from newest to oldest.
-    pub(crate) fn running(&self) -> Vec<Arc<QueryMemory>> {
+    pub(crate) fn active_queries(&self) -> Vec<Arc<QueryMemory>> {
         self.running.lock().values().rev().filter(|q| !q.is_stopping()).cloned().collect()
     }
 
     /// Returns the bytes charged by evicted or failed queries while they release their memory.
     pub(crate) fn releasing_bytes(&self) -> usize {
-        self.running.lock().values().filter(|q| q.is_stopping()).map(|q| q.charged()).sum()
+        self.running.lock().values().filter(|q| q.is_stopping()).map(|q| q.charged_bytes()).sum()
     }
 }
 
@@ -380,7 +380,7 @@ impl QueryMemory {
                 self.limit_bytes
             ))));
         }
-        let charged = self.charged();
+        let charged = self.charged_bytes();
         if total.abs_diff(charged) < self.step_bytes {
             return Ok(());
         }
@@ -401,11 +401,11 @@ impl QueryMemory {
     }
 
     /// Returns the bytes charged to the node memory budget.
-    pub fn charged(&self) -> usize {
+    pub fn charged_bytes(&self) -> usize {
         self.charge.lock().bytes()
     }
 
-    pub(crate) fn cancel(&self) {
+    pub(crate) fn evict(&self) {
         self.is_evicted.store(true, Relaxed);
         self.evicted.notify_waiters();
     }

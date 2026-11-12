@@ -1,5 +1,5 @@
 //! Per-node memory accounting and max-min fair allocation across users for interactive
-//! transactions (SPEC §5.12).
+//! transactions and event queries (SPEC §5.12).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

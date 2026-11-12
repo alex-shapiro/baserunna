@@ -156,8 +156,12 @@ fn evicted_query_is_releasing_and_not_evicted_again() {
         *memory.charge.lock() = Charge::new(&m, bytes);
         q.running.lock().insert(memory.seq, memory.clone());
     }
-    young.cancel();
-    assert_eq!(q.running().iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1], "an evicted query is a candidate");
+    young.evict();
+    assert_eq!(
+        q.active_queries().iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![1],
+        "an evicted query is a candidate"
+    );
     assert_eq!(q.releasing_bytes(), 500, "the evicted query's memory is not counted as releasing");
     crate::sim::cost::run_paused(async {
         let mut a = acquire_slot(&q, "a").await;
@@ -167,7 +171,7 @@ fn evicted_query_is_releasing_and_not_evicted_again() {
         let later = query_memory(3, usize::MAX);
         let evict = async {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            later.cancel();
+            later.evict();
         };
         let waiting = tokio::time::timeout(Duration::from_secs(1), b.wait_for_slot(false, Some(&later)));
         let (woke, ()) = tokio::join!(waiting, evict);

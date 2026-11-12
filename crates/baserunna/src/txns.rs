@@ -102,7 +102,7 @@ impl OpenTxns {
     /// least its fair share. Always admits the oldest running query so at least 1 query finishes
     /// even if databases fill the budget.
     pub(crate) fn admit_query(&self, q: &QueryMemory) -> Result<()> {
-        if self.fair_admission(&q.user_id) || self.queries.running().last().is_some_and(|o| o.seq == q.seq) {
+        if self.fair_admission(&q.user_id) || self.queries.active_queries().last().is_some_and(|o| o.seq == q.seq) {
             return Ok(());
         }
         Err(q.fail(Error::Unavailable {
@@ -136,7 +136,7 @@ impl OpenTxns {
                         crate::probe::hit(crate::probe::Probe::TxnEvicted);
                     }
                 }
-                MemoryHolder::Query(q) => q.cancel(),
+                MemoryHolder::Query(q) => q.evict(),
             }
         }
         true
@@ -310,8 +310,8 @@ impl OpenTxns {
                 };
                 (MemoryHolder::Txn(t), held)
             })
-            .chain(self.queries.running().into_iter().map(|q| {
-                let held = Held { holder: q.user_id.clone(), bytes: q.charged(), evictable: true };
+            .chain(self.queries.active_queries().into_iter().map(|q| {
+                let held = Held { holder: q.user_id.clone(), bytes: q.charged_bytes(), evictable: true };
                 (MemoryHolder::Query(q), held)
             }))
             .collect()

@@ -27,24 +27,14 @@ only.
 
 ## Blocker
 
-- [ ] [blocker · Stale strong read] **Keep the cached manifest distrusted after
-      an ambiguous manifest `PUT`.** Clear `own_lease` on an ambiguous `PUT` and
-      on a `412`, and restore it only after a write or commit confirms the
-      manifest version. A manifest `PUT` that returns an error can still be
-      applied by the store later. The committer distrusts its cache on the
-      error, but the next manifest read that returns the old version restores
-      trust (`install`) and the node's own lease (`own_lease`). If the `PUT` is
-      then applied, the lease holder serves strong reads from the old manifest
-      for 2.6 s to 3.5 s. A client observes newer data and then older data in
-      two cases: a strong event query on another node followed by a strong read
-      on the lease holder, and a change-feed long poll on a non-lease home node
-      followed by a strong `GET`. A `412` on the commit retry causes the same
-      issue over a 21 ms window. Tests: `tests/stale_strong_read.rs` and
-      `late_manifest_put` in `src/engine/tests.rs`.
 - [ ] [blocker · Stale strong read] **Enable the late-apply fault in the swarm
-      profiles.** Enable `StoreFaults::p_late_apply` in the swarm profiles once
-      the stale strong read defect above is fixed. `StoreFaults::p_late_apply`
-      makes the simulated store return an error for a `PUT` and apply it later.
+      profiles.** Enable `StoreFaults::p_late_apply` in the swarm profiles.
+      This fault makes the simulated store return an error for a `PUT` and apply
+      it later. With `p_late_apply` set to 0.01, 5-minute campaigns had 0
+      failures in `register`, `history`, `kv_model`, and `watch`. The `events`
+      campaign had 1 failure in 23,571 runs (`delete_events` deadline defect,
+      seed 11581). Main fails 588 of 122,174 `register` runs with the same
+      setting.
 - [ ] [blocker · Tenant resource exhaustion] **Charge event query memory to the
       node `MemoryGate` and fair-share `Node::query_slot`.** Reserve
       `MemoryGate` capacity for event queries and share `Node::query_slot`
@@ -572,3 +562,68 @@ only.
 - [ ] [tangential · Docs] **Correct the deploy trigger statement in
       `DEPLOYING.md`.** Update `DEPLOYING.md` to reflect that the push trigger
       in `deploy.yml` is commented out.
+
+## Untriaged
+
+- [ ] [untriaged · Wrong commit result] **Report the correct commit result if the
+      store applies a manifest `PUT` and returns `412`.** Include a unique write
+      ID in each manifest `PUT` and its commit records so a reload identifies
+      which `PUT` wrote the manifest. The store can apply a manifest `PUT` and
+      return `412` (SPEC §5.5), but the committer treats every `412` as not
+      applied. If the first attempt is applied and returns `412`, the retry sees
+      the commit record and returns `replayed: true` with `results: null`. If
+      the last attempt is applied and returns `412`, the commit returns `503`
+      with `outcome: "not_applied"` even though the commit is visible to other
+      nodes. Tests: `commit_applied_with_a_412_is_not_replayed` and
+      `commit_applied_with_a_412_on_the_last_attempt_is_not_reported_as_not_applied`
+      in `src/engine/tests.rs`. This fault occurs only if a store client retries
+      a conditional `PUT` after the first attempt is applied.
+- [ ] [untriaged · Wrong commit result] **Report `replayed: true` if another node
+      applied the commit ID.** Include a unique write ID in each manifest `PUT`
+      and its commit records, and report `replayed: false` only if the commit
+      record matches a `PUT` from this batch. `clear_replay_if_sent_in_batch`
+      reports `replayed: false` for any commit ID sent in an ambiguous `PUT`
+      from the batch. If that `PUT` was not applied and another node later
+      commits the same commit ID, the first node returns `replayed: false` with
+      the results of its uncommitted execution instead of `replayed: true` with
+      `results: null` (SPEC §6.2). Test:
+      `commit_applied_by_another_node_after_an_unknown_put_is_replayed` in
+      `src/engine/tests.rs`.
+- [ ] [untriaged · Events] **Fix transactional `delete_events` ops that
+      exceed the request deadline.** Extend or resume a `/txn` `delete_events`
+      op on a cold cache so a slow object store does not fail it repeatedly at
+      `commit_timeout_ms` with `503 request deadline exceeded`. If a node
+      crashes every 24 s, each retry starts with a cold cache and the client
+      fails after 200 attempts (`sim_tool trace events 11581` with
+      `p_late_apply` enabled). Main also returns `503` for this op.
+- [ ] [untriaged · Simulator] **Allow for paused maintenance in the `blobs`
+      final GC check.** After a manifest `PUT` error, a node runs no sweep,
+      flush, or compaction for that database until one of its `PUT`s succeeds.
+      This is the intended lease rule. The `blobs` scenario expects a full GC
+      cycle to remove all garbage without a successful `PUT`, so
+      `sim_tool trace blobs 1002`, `1589`, and `2033` fail.
+- [ ] [untriaged · Lease] **Skip the hot-read lease request while a commit
+      batch runs.** Check whether a commit batch is running before enqueueing a
+      hot-read lease renewal. Today, the check only inspects whether a manifest
+      write is in flight, so a hot database enqueues an extra lease-only `PUT`
+      during commit retry backoff. Also document in SPEC §5.7 that a rejected
+      hedged `PUT` clears the lease even without a store fault.
+- [ ] [untriaged · Docs] **Update bugzoo patch 27 and defect note 27 for
+      the lease rule.** Update
+      `bugzoo/27-lease-state-lost-after-ambiguous-writes.patch`, its README
+      entry, and `SPEC.md` defect note 27 to match the current lease rule. Also
+      distinguish this node's lease state from another node's lease in SPEC
+      §5.5.
+- [ ] [untriaged · Tests] **Tighten the lease tests.** Add assertions to
+      `lease_reads_resume_after_a_lost_put_reply`. Add a 1 ms manifest `GET`
+      latency in the test store so the tests do not need manual 1 ms clock
+      advances. Unify `DelayStore::manifest_put_lost` and
+      `ManifestPutOutcome::AppliedThenFailed`.
+- [ ] [untriaged · Lease] **Keep the lease rule in one function.** Move
+      `own_lease` updates, version installation, and write-tracking into
+      `put_manifest` so callers cannot bypass the lease rule.
+- [ ] [untriaged · Change feed] **Run `after_commit` for a commit whose
+      `PUT` reply was lost.** Run `after_commit` and `shared.committed` if a
+      retry reload discovers that an earlier ambiguous `PUT` from the batch was
+      applied. Today, the node skips commit notifications and background flush
+      or compaction triggers on that path.

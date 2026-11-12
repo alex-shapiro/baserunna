@@ -24,13 +24,12 @@ pub struct Queries {
 struct SlotState {
     free: usize,
     held_by_user: BTreeMap<String, usize>,
-    waiters: VecDeque<SlotWaiter>,
+    /// Waiting queries of each user, in the order that the user's queries get slots.
+    waiters: BTreeMap<String, VecDeque<oneshot::Sender<()>>>,
+    /// Number of the latest slot grant to each user.
+    last_grant: BTreeMap<String, u64>,
+    grants: u64,
     next_query_seq: u64,
-}
-
-struct SlotWaiter {
-    user_id: String,
-    grant: oneshot::Sender<()>,
 }
 
 impl SlotState {
@@ -38,19 +37,39 @@ impl SlotState {
         self.held_by_user.get(user_id).copied().unwrap_or(0)
     }
 
-    /// Returns the index of the waiter whose user holds the fewest slots, the earliest on ties.
-    fn next_waiter(&self) -> Option<usize> {
-        (0..self.waiters.len()).min_by_key(|&i| (self.held(&self.waiters[i].user_id), i))
+    /// Returns the waiting user that holds the fewest slots, and on ties the user whose latest
+    /// slot grant is the oldest.
+    fn next_user(&self) -> Option<String> {
+        self.waiters.keys().min_by_key(|u| (self.held(u), self.last_grant.get(*u).copied().unwrap_or(0))).cloned()
+    }
+
+    /// Grants a slot to the first waiting query of `user_id` that still waits. Returns false if
+    /// none does.
+    fn grant_to(&mut self, user_id: &str) -> bool {
+        while let Some(queue) = self.waiters.get_mut(user_id) {
+            let Some(grant) = queue.pop_front() else {
+                self.waiters.remove(user_id);
+                return false;
+            };
+            if queue.is_empty() {
+                self.waiters.remove(user_id);
+            }
+            if grant.send(()).is_ok() {
+                *self.held_by_user.entry(user_id.to_string()).or_default() += 1;
+                self.grants += 1;
+                self.last_grant.insert(user_id.to_string(), self.grants);
+                return true;
+            }
+        }
+        false
     }
 
     fn grant_waiters(&mut self) {
         while self.free > 0
-            && let Some(i) = self.next_waiter()
+            && let Some(user_id) = self.next_user()
         {
-            let w = self.waiters.remove(i).expect("waiter index is in range");
-            if w.grant.send(()).is_ok() {
+            if self.grant_to(&user_id) {
                 self.free -= 1;
-                *self.held_by_user.entry(w.user_id).or_default() += 1;
             }
         }
     }
@@ -78,7 +97,9 @@ impl Queries {
             state: Mutex::new(SlotState {
                 free: slots.max(1),
                 held_by_user: BTreeMap::new(),
-                waiters: VecDeque::new(),
+                waiters: BTreeMap::new(),
+                last_grant: BTreeMap::new(),
+                grants: 0,
                 next_query_seq: 0,
             }),
             running: Mutex::new(BTreeMap::new()),
@@ -89,7 +110,7 @@ impl Queries {
     /// for admission by `txns`.
     pub async fn start(self: &Arc<Self>, user_id: &str, txns: &Arc<OpenTxns>) -> Result<QueryGrant> {
         let mut slot = QuerySlot { queries: Some(self.clone()), user_id: user_id.to_string(), holds: false };
-        match tokio::time::timeout(SLOT_WAIT, slot.wait(false)).await {
+        match tokio::time::timeout(SLOT_WAIT, slot.wait(false, None)).await {
             Ok(()) => {}
             Err(_) => {
                 return Err(Error::Unavailable {
@@ -110,6 +131,7 @@ impl Queries {
             bytes: AtomicUsize::new(0),
             charge: Mutex::new(Charge::new(&self.memory, 0)),
             cancelled: AtomicBool::new(false),
+            evicted: tokio::sync::Notify::new(),
             failure: Mutex::new(None),
             txns: Arc::downgrade(txns),
             step_bytes: (self.memory.limit() / 1024).max(1),
@@ -129,10 +151,9 @@ impl Queries {
         self.running.lock().values().rev().filter(|q| !q.is_stopping()).cloned().collect()
     }
 
-    /// Returns the bytes charged by queries whose own memory check failed and that are releasing
-    /// their memory.
-    pub(crate) fn failed_bytes(&self) -> usize {
-        self.running.lock().values().filter(|q| q.failure.lock().is_some()).map(|q| q.charged()).sum()
+    /// Returns the bytes charged by evicted and failed queries, which are releasing their memory.
+    pub(crate) fn releasing_bytes(&self) -> usize {
+        self.running.lock().values().filter(|q| q.is_stopping()).map(|q| q.charged()).sum()
     }
 }
 
@@ -154,6 +175,7 @@ impl QueryGrant {
                 bytes: AtomicUsize::new(0),
                 charge: Mutex::new(Charge::default()),
                 cancelled: AtomicBool::new(false),
+                evicted: tokio::sync::Notify::new(),
                 failure: Mutex::new(None),
                 txns: Weak::new(),
                 step_bytes: usize::MAX,
@@ -161,6 +183,15 @@ impl QueryGrant {
             }),
             queries: None,
         }
+    }
+}
+
+impl QueryGrant {
+    /// Gives the query's slot to a user that holds fewer slots, if one waits, and waits for a
+    /// slot again. Returns an error if the node evicted the query or it failed a memory check.
+    pub async fn yield_slot(&mut self) -> Result<()> {
+        self.slot.yield_to_waiters(Some(&self.memory)).await;
+        self.memory.check_stopped()
     }
 }
 
@@ -180,47 +211,61 @@ pub struct QuerySlot {
 }
 
 impl QuerySlot {
-    /// Waits until this query holds a slot. A query that `resumes` waits ahead of the queries of
-    /// its user that have not started.
-    async fn wait(&mut self, resumes: bool) {
+    /// Waits until this query holds a slot, or until the node evicts the query that `memory`
+    /// tracks. A query that `resumes` waits ahead of the queries of its user that have not
+    /// started.
+    async fn wait(&mut self, resumes: bool, memory: Option<&QueryMemory>) {
         let Some(queries) = self.queries.clone() else { return };
         let (tx, rx) = oneshot::channel();
         {
             let mut s = queries.state.lock();
-            let waiter = SlotWaiter { user_id: self.user_id.clone(), grant: tx };
+            let queue = s.waiters.entry(self.user_id.clone()).or_default();
             match resumes {
-                true => s.waiters.push_front(waiter),
-                false => s.waiters.push_back(waiter),
+                true => queue.push_front(tx),
+                false => queue.push_back(tx),
             }
             s.grant_waiters();
         }
         let mut wait = SlotWait { queries: &queries, user_id: &self.user_id, rx: Some(rx) };
-        if let Some(rx) = wait.rx.as_mut()
-            && rx.await.is_ok()
-        {
+        let Some(rx) = wait.rx.as_mut() else { return };
+        let granted = match memory {
+            None => rx.await.is_ok(),
+            Some(m) => {
+                let evicted = m.evicted.notified();
+                tokio::pin!(evicted);
+                evicted.as_mut().enable();
+                if m.is_stopping() {
+                    false
+                } else {
+                    match futures_util::future::select(rx, evicted).await {
+                        futures_util::future::Either::Left((r, _)) => r.is_ok(),
+                        futures_util::future::Either::Right(_) => false,
+                    }
+                }
+            }
+        };
+        if granted {
             wait.rx = None;
             self.holds = true;
         }
     }
 
-    /// Gives this query's slot to a waiting query if its user holds no slots or at least 2 fewer
-    /// slots than this query's user, and waits for a slot again.
-    pub async fn yield_to_waiters(&mut self) {
+    /// Gives this query's slot to the next waiting user if that user holds no slots or at least
+    /// 2 fewer slots than this query's user, and waits for a slot again.
+    async fn yield_to_waiters(&mut self, memory: Option<&QueryMemory>) {
         let Some(queries) = &self.queries else { return };
         {
             let mut s = queries.state.lock();
             let mine = s.held(&self.user_id);
             let fairer = |theirs: usize| theirs == 0 || theirs + 1 < mine;
-            let Some(i) = s.next_waiter().filter(|&i| fairer(s.held(&s.waiters[i].user_id))) else { return };
-            let w = s.waiters.remove(i).expect("waiter index is in range");
+            let Some(user_id) = s.next_user().filter(|u| fairer(s.held(u))) else { return };
             self.holds = false;
             s.release_held(&self.user_id);
-            match w.grant.send(()) {
-                Ok(()) => *s.held_by_user.entry(w.user_id).or_default() += 1,
-                Err(_) => s.free += 1,
+            if !s.grant_to(&user_id) {
+                s.free += 1;
             }
         }
-        self.wait(true).await;
+        self.wait(true, memory).await;
     }
 }
 
@@ -261,6 +306,8 @@ pub struct QueryMemory {
     charge: Mutex<Charge>,
     /// Set if the node evicted the query to free memory for another user.
     cancelled: AtomicBool,
+    /// Wakes the query when the node evicts it.
+    evicted: tokio::sync::Notify,
     /// Error of the query's own failed memory check. Set while the query releases its memory.
     failure: Mutex<Option<Error>>,
     txns: Weak<OpenTxns>,
@@ -313,6 +360,7 @@ impl QueryMemory {
 
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Relaxed);
+        self.evicted.notify_waiters();
     }
 
     /// Records `e` as the query's failure, so that its later memory changes return the same

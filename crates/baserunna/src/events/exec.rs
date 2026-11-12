@@ -2030,8 +2030,9 @@ async fn run_within(
     // exceeds its share, re-read it directly into `run`.
     let n = shared.cfg.event_read_concurrency.max(1);
     let share = limits.max_memory_bytes / n;
+    let memory = grant.memory.clone();
     let read = |i: usize| {
-        let (mut partial, rd, r) = (Run::new(&plan, share, Some(&grant.memory)), &rd, refs[i]);
+        let (mut partial, rd, r) = (Run::new(&plan, share, Some(&memory)), &rd, refs[i]);
         async move {
             let read = match rd.meta(r).await {
                 Ok(meta) if !partial.fits(r, &meta) => {
@@ -2047,8 +2048,7 @@ async fn run_within(
     let mut reads = FuturesOrdered::new();
     let mut launched = 0;
     for (i, r) in refs.iter().enumerate() {
-        grant.slot.yield_to_waiters().await;
-        grant.memory.check_stopped()?;
+        grant.yield_slot().await?;
         if frontier.as_mut().is_some_and(|f| f.is_done(&mut run, &refs, i)) {
             probe::hit(Probe::RowPageStoppedEarly);
             break;

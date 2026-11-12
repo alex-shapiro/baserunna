@@ -121,7 +121,7 @@ impl OpenTxns {
         if shared.reclaim_to_budget() {
             return true;
         }
-        let used = shared.memory.used().saturating_sub(self.queries.failed_bytes());
+        let used = shared.memory.used().saturating_sub(self.queries.releasing_bytes());
         if used <= shared.memory.limit() {
             return true;
         }

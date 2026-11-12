@@ -192,7 +192,6 @@ fn top_users_query(from: i64, to: i64) -> Json {
 }
 
 #[test]
-#[ignore = "TODO blocker: charge event query memory to the node MemoryGate"]
 fn concurrent_event_queries_respect_node_memory_budget() {
     let _turn = TURN.lock();
     run_paused(async {
@@ -235,6 +234,7 @@ fn concurrent_event_queries_respect_node_memory_budget() {
         }
         for (n, peak, statuses) in &peaks {
             let admitted = statuses.iter().filter(|s| **s == 200).count();
+            assert!(admitted >= 1, "none of {n} concurrent queries succeeded: {statuses:?}");
             assert!(
                 *peak <= budget + budget / 8,
                 "{n} concurrent queries ({admitted} admitted) grew heap by {:.0} MiB; the node's memory budgets \
@@ -286,7 +286,6 @@ async fn acquire_lease(w: &World, token: &str, db: &str) {
 }
 
 #[test]
-#[ignore = "TODO blocker: fair-share Node::query_slot"]
 fn one_user_cannot_hold_every_query_slot() {
     let _turn = TURN.lock();
     run_paused(async {
@@ -328,51 +327,43 @@ fn one_user_cannot_hold_every_query_slot() {
 }
 
 #[test]
-#[ignore = "TODO blocker: acquire a query slot for transactional query_events ops"]
 fn transactional_event_queries_take_query_slots() {
     let _turn = TURN.lock();
     run_paused(async {
-        let w = World::with_config(1, 0, production_limits).await;
+        let mut w = World::with_config(1, 0, production_limits).await;
         let t = w.signup(0, "b1@slots.test").await;
         setup_user_events(&w, &t, 200_000, 100_000).await;
+        restart_with_cold_cache(&mut w).await;
+        acquire_lease(&w, &t, "d").await;
         w.store.set_latency_ms(STORE_LATENCY_MS);
         let q = top_users_query(0, QUERY_TO_MS);
-        let rest_path = "/v1/dbs/d/events/ev/rows/query";
-        let (warm, _) = concurrent_posts(&w, &t, rest_path, vec![q.to_string()]).await;
-        assert_eq!(warm[0].status, 200, "{}", warm[0].body);
         let slots = w.node(0).cfg.query_concurrency;
-        let mut peaks = std::collections::BTreeMap::new();
-        for (route, path, body) in
-            [("REST", rest_path, q.to_string()), ("/txn", "/v1/dbs/d/txn", txn_query_body("ev", &q))]
-        {
-            for n in [1, slots, 2 * slots] {
-                let (out, peak) = concurrent_posts(&w, &t, path, vec![body.clone(); n]).await;
-                let ok = out.iter().filter(|o| o.status == 200).count();
-                eprintln!(
-                    "{route}: {n} concurrent queries, {ok} succeeded, heap peak +{:.1} MiB ({:.1} MiB per query)",
-                    mib(peak),
-                    mib(peak / n)
-                );
-                assert_eq!(ok, n, "{route}: {:?}", out.iter().map(|o| &o.body).find(|b| b.get("rows").is_none()));
-                peaks.insert((route, n), peak);
-            }
+        let tasks = spawn_posts(&w, &t, "/v1/dbs/d/txn", vec![txn_query_body("ev", &q); 2 * slots]);
+        let mut most_running = 0;
+        while !tasks.iter().all(|t| t.is_finished()) {
+            most_running = most_running.max(w.node(0).queries.running_count());
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let (at_slots, at_twice) = (peaks[&("/txn", slots)], peaks[&("/txn", 2 * slots)]);
-        assert!(
-            at_twice * 10 <= at_slots * 13,
-            "{} concurrent /txn queries grew heap by {:.0} MiB, {:.2}x the {:.0} MiB of {slots} queries, \
-             so more queries ran at once than the node has query slots",
+        let out = join_posts(tasks).await;
+        eprintln!(
+            "{} concurrent /txn queries: statuses {:?}, at most {most_running} running",
             2 * slots,
-            mib(at_twice),
-            at_twice as f64 / at_slots as f64,
-            mib(at_slots)
+            statuses(&out)
+        );
+        for o in &out {
+            assert!(o.status == 200 || (o.status == 503 && o.body["error"]["retryable"] == json!(true)), "{}", o.body);
+        }
+        assert!(out.iter().any(|o| o.status == 200), "no /txn query succeeded");
+        assert!(
+            (1..=slots).contains(&most_running),
+            "{most_running} /txn queries ran at once on a node with {slots} query slots"
         );
         w.shutdown();
     });
 }
 
 #[test]
-#[ignore = "TODO blocker: acquire a query slot for transactional query_events ops and extend their deadline"]
+#[ignore = "TODO blocker: extend the deadline of transactional query_events ops"]
 fn transactional_event_queries_get_the_event_query_deadline() {
     let _turn = TURN.lock();
     run_paused(async {

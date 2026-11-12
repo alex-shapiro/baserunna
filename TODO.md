@@ -27,25 +27,11 @@ only.
 
 ## Blocker
 
-- [ ] [blocker · Tenant resource exhaustion] **Charge event query memory to the
-      node `MemoryGate` and fair-share `Node::query_slot`.** Reserve
-      `MemoryGate` capacity for event queries and share `Node::query_slot`
-      permits fairly across tenants. Eight concurrent queries held 2,630 MiB
-      against a 768 MiB `memory_bytes` budget without being queued or rejected.
-      A single heavy query holds 55 MiB to 550 MiB, and `query_concurrency`
-      defaults to the core count. In addition, a user held all 16 query slots
-      for 12.5 s per query while another user's 1-row query timed out with `503`
-      after 5 s. Tests: `concurrent_event_queries_respect_node_memory_budget`
-      and `one_user_cannot_hold_every_query_slot` in
-      `tests/event_query_limits.rs`.
-- [ ] [blocker · Tenant resource exhaustion] **Acquire a query slot for
-      transactional `query_events` ops and extend their deadline.** Acquire a
-      `Node::query_slot` permit and apply the event query deadline if `/txn`
-      executes `query_events`. In `/txn`, 32 concurrent event queries held twice
-      the heap of 16, whereas the event query route (`/events/{t}/rows/query`)
-      stayed flat. A query that returned `200` after 12.5 s on the event query
-      route also failed with `503` and `outcome: "unknown"` after 10 s in
-      `/txn`. Tests: `transactional_event_queries_take_query_slots` and
+- [ ] [blocker · Tenant resource exhaustion] **Extend the deadline of
+      transactional `query_events` ops.** Apply the event query deadline if
+      `/txn` executes `query_events`. A query that returned `200` after 12.5 s
+      on the event query route (`/events/{t}/rows/query`) failed with `503` and
+      `outcome: "unknown"` after 10 s in `/txn`. Test:
       `transactional_event_queries_get_the_event_query_deadline` in
       `tests/event_query_limits.rs`.
 - [ ] [blocker · Tenant resource exhaustion] **Estimate granule run memory from

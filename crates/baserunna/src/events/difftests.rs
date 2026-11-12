@@ -81,7 +81,8 @@ async fn query_at(db: &Arc<Db>, q: &Json, c: Consistency) -> Result<exec::Output
     let q = Query::parse(q.clone())?;
     let mut t = db.begin(Isolation::Serializable, c).await?;
     let s = get_schema(&mut t, "events").await?;
-    exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits::default()).await
+    exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits::default(), &mut crate::queries::QueryGrant::unlimited())
+        .await
 }
 
 static VARIANT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -616,7 +617,17 @@ async fn compare(a: &Arc<Db>, b: &Arc<Db>, q: &Json) -> std::result::Result<bool
                 let mut t = b.begin(Isolation::Serializable, Consistency::Strong).await.map_err(|e| e.to_string())?;
                 let s = get_schema(&mut t, "events").await.map_err(|e| e.to_string())?;
                 let limits = Limits { max_memory_bytes: max, ..Limits::default() };
-                match exec::run(b.shared(), &b.id, &mut t, &s, &parsed, &limits).await {
+                match exec::run(
+                    b.shared(),
+                    &b.id,
+                    &mut t,
+                    &s,
+                    &parsed,
+                    &limits,
+                    &mut crate::queries::QueryGrant::unlimited(),
+                )
+                .await
+                {
                     Ok(o) if o.rows != ob.rows || o.next_cursor != ob.next_cursor => {
                         return Err(format!("query {qb} with {max} bytes\n got {:?}\nwant {:?}", o.rows, ob.rows));
                     }

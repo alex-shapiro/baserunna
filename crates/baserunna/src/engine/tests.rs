@@ -1953,6 +1953,8 @@ fn op_batches_limits_and_defaults() {
                     access,
                     json_value_max: 1 << 20,
                     query_limits: Default::default(),
+                    node: None,
+                    user_id: "",
                 };
                 let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
                 exec_ops(&ctx, &mut t, &ops).await

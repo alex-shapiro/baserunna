@@ -355,12 +355,12 @@ async fn query(
     let (b, c) = query_consistency(b)?;
     let q = Query::parse(b)?;
     let limits = node.cfg.query_limits;
-    let _slot = node.query_slot().await?;
-    let run = async |c: Consistency| -> Result<(exec::Output, u64)> {
+    let mut grant = node.start_query(&ctx.principal.user.id).await?;
+    let mut run = async |c: Consistency| -> Result<(exec::Output, u64)> {
         let db = ctx.db.clone();
         Ok(with_read!(ctx.db, c, |t| {
             let s = events::get_schema(t, &name).await?;
-            exec::run(db.shared(), &db.id, t, &s, &q, &limits).await
+            exec::run(db.shared(), &db.id, t, &s, &q, &limits, &mut grant).await
         }))
     };
     // Retry with strong consistency if the local snapshot predates a new table or column.

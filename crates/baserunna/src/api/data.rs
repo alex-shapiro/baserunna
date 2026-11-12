@@ -65,13 +65,15 @@ pub(super) fn param<'a>(p: &'a HashMap<String, String>, k: &str) -> Result<&'a s
     p.get(k).map(|s| s.as_str()).ok_or_else(|| Error::invalid(format!("missing path parameter {k}")))
 }
 
-fn op_ctx<'a>(node: &Node, ctx: &'a DbCtx, enc: api::Encoding) -> OpCtx<'a> {
+fn op_ctx<'a>(node: &'a Node, ctx: &'a DbCtx, enc: api::Encoding) -> OpCtx<'a> {
     OpCtx {
         db: &ctx.db,
         encoding: enc,
         access: ctx.access,
         json_value_max: node.cfg.json_value_max,
         query_limits: node.cfg.query_limits,
+        node: Some(node),
+        user_id: &ctx.principal.user.id,
     }
 }
 

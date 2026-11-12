@@ -334,6 +334,10 @@ pub struct OpCtx<'a> {
     pub json_value_max: u64,
     /// Resource limits for `query_events` operations.
     pub query_limits: crate::events::exec::Limits,
+    /// Node that admits `query_events` operations, or `None` to run them without admission.
+    pub node: Option<&'a crate::node::Node>,
+    /// User that the operations run for.
+    pub user_id: &'a str,
 }
 
 pub fn user_key(k: &[u8]) -> Result<Bytes> {
@@ -684,7 +688,13 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
         }
         Op::QueryEvents(EventsQuery { table, query }) => {
             let s = crate::events::get_schema(txn, table).await?;
-            let out = crate::events::exec::run(ctx.db.shared(), &ctx.db.id, txn, &s, query, &ctx.query_limits).await?;
+            let mut grant = match ctx.node {
+                Some(node) => node.start_query(ctx.user_id).await?,
+                None => crate::queries::QueryGrant::unlimited(),
+            };
+            let out =
+                crate::events::exec::run(ctx.db.shared(), &ctx.db.id, txn, &s, query, &ctx.query_limits, &mut grant)
+                    .await?;
             Ok(OpResult::QueryEvents(
                 json!({"columns": out.columns, "rows": out.rows, "next_cursor": out.next_cursor, "stats": out.stats}),
             ))

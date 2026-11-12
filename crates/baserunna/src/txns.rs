@@ -1,9 +1,11 @@
 //! Per-node registry of open interactive transactions, enforcing per-user concurrency limits,
-//! idle and lifetime expiration, and max-min fair memory admission (SPEC §5.12, §6.2).
+//! idle and lifetime expiration, and max-min fair memory admission of transactions and event
+//! queries (SPEC §5.12, §6.2).
 
 use crate::engine::memory::{self, Held, MemoryGate};
 use crate::engine::{Engine, Txn, Version};
 use crate::error::{Error, Result};
+use crate::queries::{Queries, QueryMemory};
 use crate::util::{DetHashMap, TtlCache};
 use baserunna_api::Encoding;
 use parking_lot::Mutex;
@@ -47,6 +49,7 @@ impl OpenTxn {
 pub struct OpenTxns {
     engine: Arc<Engine>,
     limits: TxnLimits,
+    queries: Arc<Queries>,
     open: Mutex<DetHashMap<String, Arc<OpenTxn>>>,
     aborted: TtlCache<String, &'static str>,
     /// Maps transaction IDs whose commit has started to their commit IDs.
@@ -54,10 +57,11 @@ pub struct OpenTxns {
 }
 
 impl OpenTxns {
-    pub fn new(engine: Arc<Engine>, limits: TxnLimits) -> Arc<OpenTxns> {
+    pub fn new(engine: Arc<Engine>, limits: TxnLimits, queries: Arc<Queries>) -> Arc<OpenTxns> {
         Arc::new(OpenTxns {
             engine,
             limits,
+            queries,
             open: Mutex::new(DetHashMap::default()),
             aborted: TtlCache::new(limits.lifetime, 100_000),
             started_commits: TtlCache::new(limits.lifetime, 100_000),
@@ -77,28 +81,74 @@ impl OpenTxns {
     }
 
     /// Enforces the node memory budget for a transaction of `user_id` on `db_id`, unloading idle
-    /// databases and evicting idle transactions via [`memory::fair_admission`] if needed.
+    /// databases and evicting idle transactions and running queries via
+    /// [`memory::fair_admission`] if needed.
     pub fn admit(&self, user_id: &str, db_id: &str) -> Result<()> {
-        let shared = &self.engine.shared;
-        if shared.is_system(db_id) || shared.reclaim_to_budget() {
+        if self.engine.shared.is_system(db_id) {
             return Ok(());
         }
-        let (open, held): (Vec<_>, Vec<_>) = self.held_memory().into_iter().unzip();
-        let user = user_id.to_string();
-        let Some(victims) = memory::fair_admission(shared.memory.limit(), shared.memory.used(), &user, &held) else {
-            crate::probe::hit(crate::probe::Probe::MemoryExhausted);
-            return Err(Error::Unavailable {
-                message: "this user's open transactions hold their fair share of the node memory budget".into(),
-                retry_after_ms: Some(1_000),
-                outcome_unknown: false,
-            });
+        if self.fair_admission(user_id) {
+            return Ok(());
+        }
+        crate::probe::hit(crate::probe::Probe::MemoryExhausted);
+        Err(Error::Unavailable {
+            message: "this user's transactions and queries hold their fair share of the node memory budget".into(),
+            retry_after_ms: Some(1_000),
+            outcome_unknown: false,
+        })
+    }
+
+    /// Enforces the node memory budget for growth of query `q`, and stops `q` if its user holds
+    /// at least its fair share. The oldest running query is always admitted, so that a query
+    /// finishes while database memory fills the budget. Returns a `413` error if `q` alone
+    /// exceeds the budget.
+    pub(crate) fn admit_query(&self, q: &QueryMemory) -> Result<()> {
+        if self.fair_admission(&q.user_id) || self.queries.running().last().is_some_and(|o| o.seq == q.seq) {
+            return Ok(());
+        }
+        q.cancel();
+        if q.charged() > self.engine.shared.memory.limit() {
+            return Err(Error::TooLarge(format!(
+                "the query needs more than the node's {} byte memory budget; narrow the time range, group by \
+                 fewer values, or read fewer columns",
+                self.engine.shared.memory.limit()
+            )));
+        }
+        Err(Error::Unavailable {
+            message: "this user's queries and transactions hold their fair share of the node memory budget; retry"
+                .into(),
+            retry_after_ms: Some(1_000),
+            outcome_unknown: false,
+        })
+    }
+
+    /// Returns false if the node memory budget is exceeded and `user_id` holds at least its fair
+    /// share. Otherwise, evicts the idle transactions and running queries that
+    /// [`memory::fair_admission`] selects and returns true.
+    fn fair_admission(&self, user_id: &str) -> bool {
+        let shared = &self.engine.shared;
+        if shared.reclaim_to_budget() {
+            return true;
+        }
+        let used = shared.memory.used().saturating_sub(self.queries.cancelled_bytes());
+        if used <= shared.memory.limit() {
+            return true;
+        }
+        let (holders, held): (Vec<_>, Vec<_>) = self.held_memory().into_iter().unzip();
+        let Some(victims) = memory::fair_admission(shared.memory.limit(), used, &user_id.to_string(), &held) else {
+            return false;
         };
         for i in victims {
-            if self.abort(&open[i], "it was aborted to free node memory for other users") {
-                crate::probe::hit(crate::probe::Probe::TxnEvicted);
+            match &holders[i] {
+                Holder::Txn(t) => {
+                    if self.abort(t, "it was aborted to free node memory for other users") {
+                        crate::probe::hit(crate::probe::Probe::TxnEvicted);
+                    }
+                }
+                Holder::Query(q) => q.cancel(),
             }
         }
-        Ok(())
+        true
     }
 
     pub fn admit_begin(&self, user_id: &str, db_id: &str) -> Result<()> {
@@ -240,9 +290,9 @@ impl OpenTxns {
         }
     }
 
-    /// Returns open transactions ordered from least to most recently used, paired with their
-    /// memory usage.
-    fn held_memory(&self) -> Vec<(Arc<OpenTxn>, Held<String>)> {
+    /// Returns open transactions ordered from least to most recently used, followed by running
+    /// queries from youngest to oldest, paired with their memory usage.
+    fn held_memory(&self) -> Vec<(Holder, Held<String>)> {
         let idle_since = |t: &OpenTxn| t.txn.try_lock().ok().filter(|g| g.is_some()).map(|_| t.last_used());
         let mut open: Vec<(Option<Instant>, Arc<OpenTxn>)> =
             self.open.lock().values().map(|t| (idle_since(t), t.clone())).collect();
@@ -267,10 +317,20 @@ impl OpenTxns {
                         + v.as_ref().map_or(0, |v| v.memory_bytes() / readers[&Arc::as_ptr(v)]),
                     evictable: idle.is_some(),
                 };
-                (t, held)
+                (Holder::Txn(t), held)
             })
+            .chain(self.queries.running().into_iter().map(|q| {
+                let held = Held { holder: q.user_id.clone(), bytes: q.charged(), evictable: true };
+                (Holder::Query(q), held)
+            }))
             .collect()
     }
+}
+
+/// An open transaction or running query that holds node memory.
+enum Holder {
+    Txn(Arc<OpenTxn>),
+    Query(Arc<QueryMemory>),
 }
 
 /// Exclusive guard for an open transaction during a single request. If dropped before

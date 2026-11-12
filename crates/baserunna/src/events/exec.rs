@@ -17,6 +17,7 @@ use crate::engine::{Shared, Txn, Value};
 use crate::error::{Error, Result};
 use crate::filter::{self, Plain, Target, Test};
 use crate::probe::{self, Probe};
+use crate::queries::{QueryBytes, QueryGrant, QueryMemory};
 use crate::table::schema::{Datum, Row, decode_row};
 use crate::util::DetHashMap;
 use crate::util::codec::{Reader, Writer};
@@ -941,7 +942,8 @@ struct Group {
 
 struct Groups {
     map: DetHashMap<Vec<u8>, Group>,
-    mem: usize,
+    /// Heap bytes of group keys and states, excluding the map's table.
+    entry_mem: usize,
     max_mem: usize,
 }
 
@@ -951,12 +953,17 @@ fn state_mem(states: &[State]) -> usize {
 
 impl Groups {
     fn new(max_mem: usize) -> Groups {
-        Groups { map: DetHashMap::default(), mem: 0, max_mem }
+        Groups { map: DetHashMap::default(), entry_mem: 0, max_mem }
+    }
+
+    fn mem(&self) -> usize {
+        let buckets = (self.map.capacity() * 8 / 7).next_power_of_two();
+        self.entry_mem + buckets * (std::mem::size_of::<(Vec<u8>, Group)>() + 1)
     }
 
     fn charge(&mut self, old: usize, new: usize) -> Result<()> {
-        self.mem = (self.mem + new).saturating_sub(old);
-        if self.mem > self.max_mem {
+        self.entry_mem = (self.entry_mem + new).saturating_sub(old);
+        if self.mem() > self.max_mem {
             return Err(Error::TooLarge(format!(
                 "the query's state exceeds {} bytes of memory; narrow the time range or group by fewer values",
                 self.max_mem
@@ -974,7 +981,7 @@ impl Groups {
         let g = match self.map.entry(kb) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
-                let key_mem = 64 + 2 * e.key().len() + keys.iter().map(|k| k.mem_size() + 32).sum::<usize>();
+                let key_mem = 2 * e.key().len() + keys.iter().map(|k| k.mem_size() + 32).sum::<usize>();
                 new += key_mem;
                 let states: Vec<State> = fns.iter().map(|f| State::new(f)).collect();
                 e.insert(Group { keys, states, key_mem, state_mem: 0 })
@@ -988,7 +995,7 @@ impl Groups {
     }
 
     fn full(&self) -> bool {
-        self.mem > self.max_mem
+        self.mem() > self.max_mem
     }
 
     fn absorb(&mut self, o: Groups) -> Result<()> {
@@ -1094,10 +1101,12 @@ struct Run<'p, 'a> {
     agg_fns: Vec<AggFn>,
     max_mem: usize,
     overflowed: bool,
+    /// State and active column bytes reported to the query's node memory charge.
+    held: Option<QueryBytes>,
 }
 
 impl<'p, 'a> Run<'p, 'a> {
-    fn new(plan: &'p Plan<'a>, max_mem: usize) -> Run<'p, 'a> {
+    fn new(plan: &'p Plan<'a>, max_mem: usize, memory: Option<&Arc<QueryMemory>>) -> Run<'p, 'a> {
         let (groups, kept, agg_fns) = match &plan.kind {
             Kind::Rows { order, limit, .. } => {
                 (None, Some(TopRows::new(order.iter().map(|(_, d)| *d).collect(), *limit, max_mem)), Vec::new())
@@ -1116,6 +1125,7 @@ impl<'p, 'a> Run<'p, 'a> {
             agg_fns,
             max_mem,
             overflowed: false,
+            held: memory.map(QueryBytes::new),
         }
     }
 
@@ -1125,8 +1135,19 @@ impl<'p, 'a> Run<'p, 'a> {
             || self.kept.as_ref().is_some_and(TopRows::full)
     }
 
+    fn state_mem(&self) -> usize {
+        self.groups.as_ref().map_or(0, Groups::mem) + self.kept.as_ref().map_or(0, |k| k.mem)
+    }
+
+    /// Reports the run's state and `batch` bytes of active columns to the query's memory charge.
+    fn report(&mut self, batch: usize) -> Result<()> {
+        let bytes = self.state_mem() + batch;
+        self.held.as_mut().map_or(Ok(()), |h| h.set(bytes))
+    }
+
     fn hold(&mut self, batch: usize) -> Result<()> {
-        let state = self.groups.as_ref().map_or(0, |g| g.mem) + self.kept.as_ref().map_or(0, |k| k.mem);
+        self.report(batch)?;
+        let state = self.state_mem();
         if state.saturating_add(batch) > self.max_mem {
             self.overflowed = true;
             return Err(Error::TooLarge(format!(
@@ -1148,7 +1169,7 @@ impl<'p, 'a> Run<'p, 'a> {
         if let (Some(g), Some(og)) = (&mut self.groups, o.groups) {
             g.absorb(og)?;
         }
-        Ok(())
+        self.report(0)
     }
 
     async fn select(&self, b: &mut Batch<'_>, f: &BFilter, base: &[bool]) -> Result<Vec<bool>> {
@@ -1243,7 +1264,7 @@ impl<'p, 'a> Run<'p, 'a> {
                 }
             }
         }
-        Ok(())
+        self.report(b.mem)
     }
 
     fn lookups(&self, b: &mut Batch<'_>) {
@@ -1816,7 +1837,12 @@ pub async fn input(txn: &mut Txn, s: &EventSchema, from: i64, to: i64) -> Result
     Ok(Input { refs, unsealed })
 }
 
-async fn lookup_maps(txn: &mut Txn, q: &Query, limits: &Limits) -> Result<Vec<(String, Arc<LookupMap>)>> {
+async fn lookup_maps(
+    txn: &mut Txn,
+    q: &Query,
+    limits: &Limits,
+    held: &mut QueryBytes,
+) -> Result<Vec<(String, Arc<LookupMap>)>> {
     let mut values: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for l in q.lookups.values() {
         values.entry(l.table.as_str()).or_default().insert(l.value.as_str());
@@ -1845,11 +1871,12 @@ async fn lookup_maps(txn: &mut Txn, q: &Query, limits: &Limits) -> Result<Vec<(S
                 map.push(&key, &row.get(id).map_or(Val::Null, datum_val))?;
                 budget = budget.checked_sub(map.mem() - before).ok_or_else(too_large)?;
             }
-            Ok(())
+            held.set(limits.lookup_max_bytes - budget)
         })
         .await?;
         for (value, _, mut map) in cols {
             budget = budget.checked_sub(map.index_mem()).ok_or_else(too_large)?;
+            held.set(limits.lookup_max_bytes - budget)?;
             map.index();
             maps.insert((table, value), Arc::new(map));
         }
@@ -1857,7 +1884,8 @@ async fn lookup_maps(txn: &mut Txn, q: &Query, limits: &Limits) -> Result<Vec<(S
     Ok(q.lookups.iter().map(|(name, l)| (name.clone(), maps[&(l.table.as_str(), l.value.as_str())].clone())).collect())
 }
 
-/// Executes query `q` on event table `s` at `txn`'s snapshot.
+/// Executes query `q` on event table `s` at `txn`'s snapshot within the query slot and memory
+/// that `grant` admits.
 pub async fn run(
     shared: &Shared,
     db: &str,
@@ -1865,9 +1893,11 @@ pub async fn run(
     s: &EventSchema,
     q: &Query,
     limits: &Limits,
+    grant: &mut QueryGrant,
 ) -> Result<Output> {
     let limit = std::time::Duration::from_millis(limits.max_ms);
-    match tokio::time::timeout(limit, run_within(shared, db, txn, s, q, limits)).await {
+    let limits = Limits { max_memory_bytes: limits.max_memory_bytes.min(grant.memory.limit_bytes), ..*limits };
+    match tokio::time::timeout(limit, run_within(shared, db, txn, s, q, &limits, grant)).await {
         Ok(r) => r,
         Err(_) => Err(timed_out(limits.max_ms)),
     }
@@ -1888,8 +1918,10 @@ async fn run_within(
     s: &EventSchema,
     q: &Query,
     limits: &Limits,
+    grant: &mut QueryGrant,
 ) -> Result<Output> {
-    let maps = lookup_maps(txn, q, limits).await?;
+    let mut lookup_mem = QueryBytes::new(&grant.memory);
+    let maps = lookup_maps(txn, q, limits, &mut lookup_mem).await?;
     let names: BTreeMap<String, usize> = maps.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
     let binder = Binder { schema: s, lookups: &names };
     let mut lookups = Vec::new();
@@ -1960,7 +1992,7 @@ async fn run_within(
     let input = input(txn, s, from, to).await?;
     let deadline = Some((tokio::time::Instant::now() + std::time::Duration::from_millis(limits.max_ms), limits.max_ms));
     let plan = Plan::new(s, filter, lookups, kind, deadline);
-    let mut run = Run::new(&plan, limits.max_memory_bytes);
+    let mut run = Run::new(&plan, limits.max_memory_bytes, Some(&grant.memory));
     run.stats = Stats { source: "columns".into(), nodes: 1, parts: input.refs.len() as u64, ..Default::default() };
     let read_stats = ReadStats::default();
     let rd = Reading { shared, db, cache: Caching::Shared, stats: &read_stats };
@@ -1994,7 +2026,7 @@ async fn run_within(
     let n = shared.cfg.event_read_concurrency.max(1);
     let share = limits.max_memory_bytes / n;
     let read = |i: usize| {
-        let (mut partial, rd, r) = (Run::new(&plan, share), &rd, refs[i]);
+        let (mut partial, rd, r) = (Run::new(&plan, share, Some(&grant.memory)), &rd, refs[i]);
         async move {
             let read = match rd.meta(r).await {
                 Ok(meta) if !partial.fits(r, &meta) => {
@@ -2010,6 +2042,7 @@ async fn run_within(
     let mut reads = FuturesOrdered::new();
     let mut launched = 0;
     for (i, r) in refs.iter().enumerate() {
+        grant.slot.yield_to_waiters().await;
         if frontier.as_mut().is_some_and(|f| f.is_done(&mut run, &refs, i)) {
             probe::hit(Probe::RowPageStoppedEarly);
             break;
@@ -2041,11 +2074,11 @@ async fn run_within(
     }
     run.stats.bytes_read = read_stats.bytes.load(Relaxed);
     run.stats.store_gets = read_stats.gets.load(Relaxed);
-    finish(run, q, limits)
+    finish(run, q, limits, &grant.memory)
 }
 
-fn finish(run: Run<'_, '_>, q: &Query, limits: &Limits) -> Result<Output> {
-    let Run { plan, stats, groups, kept, more, agg_fns, .. } = run;
+fn finish(run: Run<'_, '_>, q: &Query, limits: &Limits, memory: &Arc<QueryMemory>) -> Result<Output> {
+    let Run { plan, stats, groups, kept, more, agg_fns, held: _held, .. } = run;
     match &plan.kind {
         Kind::Rows { columns, limit, .. } => {
             let limit = *limit;
@@ -2073,7 +2106,7 @@ fn finish(run: Run<'_, '_>, q: &Query, limits: &Limits) -> Result<Output> {
             };
             if let Some(second) = then {
                 probe::hit(Probe::QuerySecondStage);
-                (names, rows) = second_stage(&names, rows, second, limits)?;
+                (names, rows) = second_stage(&names, rows, second, limits, memory)?;
             }
             if rows.len() > q.limit && !q.limited {
                 return Err(Error::TooLarge(format!(
@@ -2122,6 +2155,7 @@ fn second_stage(
     rows: Vec<Vec<Val>>,
     s: &Stage,
     limits: &Limits,
+    memory: &Arc<QueryMemory>,
 ) -> Result<(Vec<String>, Vec<Vec<Val>>)> {
     let bind = |e: &Expr| -> Result<BExpr> {
         match e {
@@ -2160,6 +2194,7 @@ fn second_stage(
     };
     let fns: Vec<&AggFn> = aggs.iter().map(|(_, f, _)| f).collect();
     let mut groups = Groups::new(limits.max_memory_bytes);
+    let mut held = QueryBytes::new(memory);
     for row in &rows {
         let keys: Vec<Val> = group_by.iter().map(|(_, e)| eval(e, row).canonical()).collect();
         groups.update(keys, &fns, |states| {
@@ -2168,6 +2203,7 @@ fn second_stage(
                 states[i].add(&v, None);
             }
         })?;
+        held.set(groups.mem())?;
     }
     let mut out_names: Vec<String> = group_by.iter().map(|(n, _)| n.clone()).collect();
     out_names.extend(aggs.iter().map(|(n, _, _)| n.clone()));
@@ -2212,7 +2248,7 @@ pub async fn matching_rows(
         return Ok(Vec::new());
     }
     let plan = Plan::new(s, filter, Vec::new(), only_filter(), None);
-    let run = Run::new(&plan, usize::MAX);
+    let run = Run::new(&plan, usize::MAX, None);
     let read_stats = ReadStats::default();
     let rd = Reading { shared, db, cache: Caching::Shared, stats: &read_stats };
     let meta = rd.meta(r).await?;
@@ -2254,7 +2290,7 @@ pub fn row_matches(s: &EventSchema, row: &Row, f: &Filter, from: i64, to: i64) -
         return Ok(false);
     }
     let plan = Plan::new(s, binder.filter(f)?, Vec::new(), only_filter(), None);
-    let run = Run::new(&plan, usize::MAX);
+    let run = Run::new(&plan, usize::MAX, None);
     let mut b = Batch::new(1, vec![Pos::default()]);
     for need in run.plan.first.iter() {
         let v = match need {

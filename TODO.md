@@ -28,9 +28,13 @@ only.
 ## Blocker
 
 - [ ] [blocker · Stale strong read] **Enable the late-apply fault in the swarm
-      profiles.** Enable `StoreFaults::p_late_apply` in the swarm profiles once
-      the stale strong read defect above is fixed. `StoreFaults::p_late_apply`
-      makes the simulated store return an error for a `PUT` and apply it later.
+      profiles.** Enable `StoreFaults::p_late_apply` in the swarm profiles.
+      `StoreFaults::p_late_apply` makes the simulated store return an error for
+      a `PUT` and apply it later. With `p_late_apply` at 0.01 in a local edit,
+      5-minute campaigns had 0 failures in `register`, `history`, `kv_model`,
+      and `watch`, and 1 failure in 23,571 `events` runs. That failure (seed
+      11581) is the `delete_events` deadline defect below, not a lease defect.
+      Main fails 588 of 122,174 `register` runs with the same edit.
 - [ ] [blocker · Wrong commit result] **Report the correct commit result if the
       store applies a manifest `PUT` and returns `412`.** Send a unique write ID
       in each manifest `PUT` and in its commit records, so that a reload shows
@@ -404,6 +408,13 @@ only.
       deletes in `where` and `delete_range`.** Require an explicit full-delete
       flag before an empty `where` selector deletes all table rows or an empty
       `prefix` in `delete_range` deletes all keys.
+- [ ] [nice-to-have · Events] **Fix transactional `delete_events` ops that
+      exceed the request deadline.** Extend or resume a `/txn` `delete_events`
+      op with a cold cache so a slow object store does not fail it repeatedly
+      at `commit_timeout_ms` with `503 request deadline exceeded`. Under a node
+      crash every 24 s, each retry restarts with a cold cache, and the client
+      gives up after 200 attempts (`sim_tool trace events 11581` with
+      `p_late_apply` on). Main also returns this `503` for the same op.
 - [ ] [nice-to-have · Streams] **Fix stream reads that exceed the request
       deadline.** Extend or paginate cold filtered stream reads so slow object
       stores do not fail repeatedly at `commit_timeout_ms` with

@@ -27,14 +27,6 @@ only.
 
 ## Blocker
 
-- [ ] [blocker · Stale strong read] **Enable the late-apply fault in the swarm
-      profiles.** Enable `StoreFaults::p_late_apply` in the swarm profiles.
-      This fault makes the simulated store return an error for a `PUT` and apply
-      it later. With `p_late_apply` set to 0.01, 5-minute campaigns had 0
-      failures in `register`, `history`, `kv_model`, and `watch`. The `events`
-      campaign had 1 failure in 23,571 runs (`delete_events` deadline defect,
-      seed 11581). Main fails 588 of 122,174 `register` runs with the same
-      setting.
 - [ ] [blocker · Tenant resource exhaustion] **Charge event query memory to the
       node `MemoryGate` and fair-share `Node::query_slot`.** Reserve
       `MemoryGate` capacity for event queries and share `Node::query_slot`
@@ -627,3 +619,11 @@ only.
       retry reload discovers that an earlier ambiguous `PUT` from the batch was
       applied. Today, the node skips commit notifications and background flush
       or compaction triggers on that path.
+- [ ] [untriaged · Stale strong read] **Enable the late-apply fault in the swarm
+      profiles.** Enable `StoreFaults::p_late_apply` in the swarm profiles.
+      This fault makes the simulated store return an error for a `PUT` and apply
+      it later. With `p_late_apply` set to 0.01, 5-minute campaigns had 0
+      failures in `register`, `history`, `kv_model`, and `watch`. The `events`
+      campaign had 1 failure in 23,571 runs (`delete_events` deadline defect,
+      seed 11581). Main fails 588 of 122,174 `register` runs with the same
+      setting.

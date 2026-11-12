@@ -562,8 +562,10 @@ only.
       within a small factor. Memory charges are hand-written size estimates, and
       only the heavy tests in `tests/event_query_limits.rs` and
       `tests/memory_bound.rs` compare them with the real heap. Those tests do
-      not run in normal test runs. On `main`, the estimate for a 500,000-group
-      query was 209 MiB, while the real heap grew by 338 MiB.
+      not run in normal test runs. In
+      `concurrent_event_queries_respect_node_memory_budget`, a 500,000-group
+      query has a peak charge of 255.9 MiB, while the real heap grows by
+      272.8 MiB.
 - [ ] [untriaged · Wrong commit result] **Report the correct commit result if the
       store applies a manifest `PUT` and returns `412`.** Include a unique write
       ID in each manifest `PUT` and its commit records so a reload identifies

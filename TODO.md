@@ -137,6 +137,18 @@ only.
 
 ## Nice-to-have
 
+- [ ] [nice-to-have · Tenant resource exhaustion] **Improve the event query
+      slot scheduler.** Two changes are open:
+      - A node starts at most 2 queries per query slot. On a 1-slot node, two
+        users with long queries can fill both places, so a third user's small
+        query waits more than 5 s and fails with a retryable `503`. A unit test
+        measured this with two 10 s queries and a small query 1 s later. One
+        fix: stop the newest query of the user with the most started queries
+        when a user with no started queries waits.
+      - A simpler scheduler can replace slot yielding: at most 2 queries per
+        slot run at once, each user runs at most half the slots, and no query
+        pauses. This removes about 100 lines, but a user who is alone can run
+        only half as many queries at once.
 - [ ] [nice-to-have · Verification] **Enable the CI triggers.** Uncomment the
       pull request, push, and schedule triggers in `.github/workflows/test.yml`
       and `deploy.yml`. Today both workflows run only on `workflow_dispatch`.

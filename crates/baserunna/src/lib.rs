@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod node;
 pub mod ops;
 pub mod probe;
+pub mod queries;
 pub mod sim;
 pub mod store;
 pub mod stream;

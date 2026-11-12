@@ -55,7 +55,8 @@ async fn query(db: &Arc<Db>, q: &Json) -> Result<exec::Output> {
     let q = Query::parse(q.clone())?;
     let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await?;
     let s = get_schema(&mut t, "events").await?;
-    exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits::default()).await
+    exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits::default(), &mut crate::queries::QueryGrant::unlimited())
+        .await
 }
 
 fn buffers() -> Arc<Buffers> {
@@ -747,7 +748,9 @@ mod query_semantics {
         let q = Query::parse(q).unwrap();
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         let s = get_schema(&mut t, table).await.unwrap();
-        exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits::default()).await.unwrap()
+        exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits::default(), &mut crate::queries::QueryGrant::unlimited())
+            .await
+            .unwrap()
     }
 
     async fn ins(db: &Arc<Db>, table: &str, rows: Vec<Json>) {
@@ -948,7 +951,8 @@ mod query_semantics {
                 let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
                 let s = get_schema(&mut t, "e").await.unwrap();
                 let limits = Limits { lookup_max_bytes: max, ..Limits::default() };
-                exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await
+                exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits, &mut crate::queries::QueryGrant::unlimited())
+                    .await
             };
             let mut max = 1;
             while run(&["people"], max).await.is_err() {
@@ -1331,7 +1335,8 @@ fn queries_stop_at_their_time_limit() {
         let s = get_schema(&mut t, "events").await.unwrap();
         let start = tokio::time::Instant::now();
         let limits = Limits { max_ms: 300, ..Limits::default() };
-        let r = exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await;
+        let r =
+            exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits, &mut crate::queries::QueryGrant::unlimited()).await;
         assert!(
             matches!(&r, Err(Error::Unavailable { outcome_unknown: false, message, .. }) if message.contains("300 ms")),
             "{r:?}"
@@ -1447,7 +1452,16 @@ mod partial_results {
         .unwrap();
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         let s = get_schema(&mut t, "events").await.unwrap();
-        exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits { max_memory_bytes, ..Limits::default() }).await
+        exec::run(
+            db.shared(),
+            &db.id,
+            &mut t,
+            &s,
+            &q,
+            &Limits { max_memory_bytes, ..Limits::default() },
+            &mut crate::queries::QueryGrant::unlimited(),
+        )
+        .await
     }
 
     /// ObjectStore wrapper that stalls the first part `GET` after `armed` is set.
@@ -1528,9 +1542,9 @@ mod partial_results {
         rt().block_on(async {
             let days = 64;
             let serial = EngineConfig { event_read_concurrency: 1, ..cfg() };
-            let single = group_by_user_with_slow_first_part(days, serial, 450).await;
+            let single = group_by_user_with_slow_first_part(days, serial, 1_000).await;
             assert!(single.is_ok(), "serial part reads: {single:?}");
-            let many = group_by_user_with_slow_first_part(days, cfg(), 450).await;
+            let many = group_by_user_with_slow_first_part(days, cfg(), 1_000).await;
             assert_eq!(many.map(|o| o.rows), Ok(single.unwrap().rows), "32 concurrent part reads");
         });
     }
@@ -1564,7 +1578,16 @@ mod partial_results {
         .unwrap();
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         let s = get_schema(&mut t, "events").await.unwrap();
-        exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits { max_memory_bytes, ..Limits::default() }).await
+        exec::run(
+            db.shared(),
+            &db.id,
+            &mut t,
+            &s,
+            &q,
+            &Limits { max_memory_bytes, ..Limits::default() },
+            &mut crate::queries::QueryGrant::unlimited(),
+        )
+        .await
     }
 
     #[test]
@@ -1984,7 +2007,17 @@ mod maintenance_limits {
             assert_eq!(insert(&mut t, "events", &[], 0).await.unwrap(), 0);
             let s = get_schema(&mut t, "events").await.unwrap();
             let q = Query::parse(json!({"from": 0, "to": T0, "aggregates": {"n": {"fn": "count"}}})).unwrap();
-            let r = exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits::default()).await.map(|o| o.rows);
+            let r = exec::run(
+                db.shared(),
+                &db.id,
+                &mut t,
+                &s,
+                &q,
+                &Limits::default(),
+                &mut crate::queries::QueryGrant::unlimited(),
+            )
+            .await
+            .map(|o| o.rows);
             assert_eq!(r, Ok(vec![vec![json!(0)]]));
         });
     }
@@ -2374,7 +2407,7 @@ mod query_limits {
         let q = Query::parse(q).unwrap();
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         let s = get_schema(&mut t, "events").await.unwrap();
-        exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await
+        exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits, &mut crate::queries::QueryGrant::unlimited()).await
     }
 
     #[test]
@@ -2633,7 +2666,16 @@ mod costly_filters {
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         let s = get_schema(&mut t, "events").await.unwrap();
         let start = tokio::time::Instant::now();
-        let r = exec::run(db.shared(), &db.id, &mut t, &s, &q, &Limits { max_ms: 100, ..Limits::default() }).await;
+        let r = exec::run(
+            db.shared(),
+            &db.id,
+            &mut t,
+            &s,
+            &q,
+            &Limits { max_ms: 100, ..Limits::default() },
+            &mut crate::queries::QueryGrant::unlimited(),
+        )
+        .await;
         let ms = start.elapsed().as_millis();
         match r {
             Ok(o) => {
@@ -2756,7 +2798,7 @@ mod answers {
         let q = Query::parse(q).unwrap();
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         let s = get_schema(&mut t, "events").await.unwrap();
-        exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await
+        exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits, &mut crate::queries::QueryGrant::unlimited()).await
     }
 
     async fn ins(db: &Arc<Db>, rows: Vec<Json>) {
@@ -3631,7 +3673,9 @@ mod partial_reads_wide_json {
                 let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
                 let s = get_schema(&mut t, "events").await.unwrap();
                 let limits = Limits { max_memory_bytes: max, ..Limits::default() };
-                exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await.unwrap()
+                exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits, &mut crate::queries::QueryGrant::unlimited())
+                    .await
+                    .unwrap()
             };
             let big = run(4 << 30).await;
             let small = run(128 << 20).await;
@@ -3699,7 +3743,7 @@ mod partial_reads_at_defaults {
                 let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
                 let s = get_schema(&mut t, "events").await.unwrap();
                 let limits = Limits { max_memory_bytes: max, ..Limits::default() };
-                exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits).await.unwrap()
+                exec::run(db.shared(), &db.id, &mut t, &s, &q, &limits, &mut crate::queries::QueryGrant::unlimited()).await.unwrap()
             };
             let big = run(32 << 30).await;
             let dflt = run(Limits::default().max_memory_bytes).await;

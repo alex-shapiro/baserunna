@@ -306,7 +306,7 @@ pub struct Node {
     pub limiter: Limiter,
     pub metrics: crate::metrics::ServerMetrics,
     hash_slots: tokio::sync::Semaphore,
-    query_slots: tokio::sync::Semaphore,
+    pub queries: Arc<crate::queries::Queries>,
     draining: std::sync::atomic::AtomicBool,
     event_buffers: OnceLock<Arc<crate::events::bulk::Buffers>>,
     pub maintainer: Arc<crate::events::maint::Maintainer>,
@@ -335,7 +335,8 @@ impl Node {
         cfg.engine.validate().map_err(|e| Error::invalid(format!("engine configuration: {e}")))?;
         let id = format!("{}-{}", cfg.name, env.random_hex(4));
         let engine = Engine::new(store, env.clone(), cfg.engine.clone(), id.clone());
-        let txns = OpenTxns::new(engine.clone(), cfg.txn_limits());
+        let queries = crate::queries::Queries::new(cfg.query_concurrency, engine.shared.memory.clone());
+        let txns = OpenTxns::new(engine.clone(), cfg.txn_limits(), queries.clone());
         engine.mark_system(SYS_DB);
         let node = Arc::new(Node {
             id,
@@ -359,7 +360,7 @@ impl Node {
             limiter: Limiter::default(),
             metrics: Default::default(),
             hash_slots: tokio::sync::Semaphore::new(cfg.limits.hash_concurrency.max(1)),
-            query_slots: tokio::sync::Semaphore::new(cfg.query_concurrency.max(1)),
+            queries,
             draining: std::sync::atomic::AtomicBool::new(false),
             event_buffers: OnceLock::new(),
             maintainer: Arc::default(),
@@ -853,16 +854,9 @@ impl Node {
         self.event_buffers.get().expect("event buffers are set at start")
     }
 
-    /// Acquires a permit to run an event query, waiting up to 5 s.
-    pub async fn query_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
-        match tokio::time::timeout(Duration::from_secs(5), self.query_slots.acquire()).await {
-            Ok(Ok(p)) => Ok(p),
-            _ => Err(Error::Unavailable {
-                message: "the node is busy running queries; retry".into(),
-                retry_after_ms: Some(1000),
-                outcome_unknown: false,
-            }),
-        }
+    /// Admits an event query of `user_id`, waiting up to 5 s for a query slot.
+    pub async fn start_query(&self, user_id: &str) -> Result<crate::queries::QueryGrant> {
+        self.queries.start(user_id, &self.txns).await
     }
 
     /// Binds staged event parts on the lease holder, forwarding if another node

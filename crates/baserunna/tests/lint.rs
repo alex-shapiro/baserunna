@@ -25,6 +25,7 @@ const RULES: &[(&str, &[&str], &str)] = &[
             "src/sim/",
             "src/engine/tests.rs",
             "src/engine/memory_tests.rs",
+            "src/queries_tests.rs",
             "src/stream/tests.rs",
             "src/store/conformance.rs",
             "../baserunna-client/src/",

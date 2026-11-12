@@ -27,25 +27,11 @@ only.
 
 ## Blocker
 
-- [ ] [blocker · Tenant resource exhaustion] **Charge event query memory to the
-      node `MemoryGate` and fair-share `Node::query_slot`.** Reserve
-      `MemoryGate` capacity for event queries and share `Node::query_slot`
-      permits fairly across tenants. Eight concurrent queries held 2,630 MiB
-      against a 768 MiB `memory_bytes` budget without being queued or rejected.
-      A single heavy query holds 55 MiB to 550 MiB, and `query_concurrency`
-      defaults to the core count. In addition, a user held all 16 query slots
-      for 12.5 s per query while another user's 1-row query timed out with `503`
-      after 5 s. Tests: `concurrent_event_queries_respect_node_memory_budget`
-      and `one_user_cannot_hold_every_query_slot` in
-      `tests/event_query_limits.rs`.
-- [ ] [blocker · Tenant resource exhaustion] **Acquire a query slot for
-      transactional `query_events` ops and extend their deadline.** Acquire a
-      `Node::query_slot` permit and apply the event query deadline if `/txn`
-      executes `query_events`. In `/txn`, 32 concurrent event queries held twice
-      the heap of 16, whereas the event query route (`/events/{t}/rows/query`)
-      stayed flat. A query that returned `200` after 12.5 s on the event query
-      route also failed with `503` and `outcome: "unknown"` after 10 s in
-      `/txn`. Tests: `transactional_event_queries_take_query_slots` and
+- [ ] [blocker · Tenant resource exhaustion] **Extend the deadline of
+      transactional `query_events` ops.** Apply the event query deadline if
+      `/txn` executes `query_events`. A query that returned `200` after 12.5 s
+      on the event query route (`/events/{t}/rows/query`) failed with `503` and
+      `outcome: "unknown"` after 10 s in `/txn`. Test:
       `transactional_event_queries_get_the_event_query_deadline` in
       `tests/event_query_limits.rs`.
 - [ ] [blocker · Tenant resource exhaustion] **Estimate granule run memory from
@@ -151,6 +137,18 @@ only.
 
 ## Nice-to-have
 
+- [ ] [nice-to-have · Tenant resource exhaustion] **Improve the event query
+      slot scheduler.** Two changes are open:
+      - A node starts at most 2 queries per query slot. On a 1-slot node, 2
+        users with long queries can fill both places. A third user's small query
+        then waits more than 5 s and fails with a retryable `503`. A unit test
+        reproduced this with two 10 s queries and a small query 1 s later. To
+        fix this, abort the newest query of the user with the most started
+        queries if a user with 0 started queries is waiting.
+      - Replace slot yielding with a static per-user slot cap. At most 2 queries
+        per slot run at once, each user holds at most half the slots, and
+        queries do not yield slots. This removes about 100 lines of code, but a
+        single active user can use only half the slots.
 - [ ] [nice-to-have · Verification] **Enable the CI triggers.** Uncomment the
       pull request, push, and schedule triggers in `.github/workflows/test.yml`
       and `deploy.yml`. Today both workflows run only on `workflow_dispatch`.
@@ -557,6 +555,17 @@ only.
 
 ## Untriaged
 
+- [ ] [untriaged · Verification] **Check memory estimates against the real
+      heap in simulation.** Add a counting allocator to simulation builds that
+      charges each allocation to the memory account of the task that makes it,
+      and check that each query and transaction charge covers its real heap
+      within a small factor. Memory charges are hand-written size estimates, and
+      only the heavy tests in `tests/event_query_limits.rs` and
+      `tests/memory_bound.rs` compare them with the real heap. Those tests do
+      not run in normal test runs. In
+      `concurrent_event_queries_respect_node_memory_budget`, a 500,000-group
+      query has a peak charge of 255.9 MiB, while the real heap grows by
+      272.8 MiB.
 - [ ] [untriaged · Wrong commit result] **Report the correct commit result if the
       store applies a manifest `PUT` and returns `412`.** Include a unique write
       ID in each manifest `PUT` and its commit records so a reload identifies

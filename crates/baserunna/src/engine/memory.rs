@@ -1,5 +1,5 @@
 //! Per-node memory accounting and max-min fair allocation across users for interactive
-//! transactions (SPEC §5.12).
+//! transactions and event queries (SPEC §5.12).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -111,7 +111,7 @@ pub trait MemoryGate: Send + Sync {
     fn step_bytes(&self) -> usize;
 }
 
-/// Memory usage of an open interactive transaction.
+/// Memory usage of an open interactive transaction or a running event query.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Held<K> {
     pub holder: K,
@@ -136,15 +136,14 @@ pub fn fair_share(mut available: usize, mut others: Vec<usize>) -> usize {
     available / claimants
 }
 
-/// Checks whether `requester` can allocate transaction memory if total node memory `used`
-/// exceeds `budget`, given the open transactions in `held` ordered by eviction priority.
+/// Checks whether `requester` can allocate memory if total node memory `used` exceeds `budget`,
+/// given the open transactions and running queries in `held` ordered by eviction priority.
 ///
-/// Bytes not tracked in `held` are deducted from `budget`, and the remainder is divided among
-/// holders by [`fair_share`]. If `requester` uses at least its fair share, returns `None`.
-/// Otherwise, returns the indices in `held` of evictable transactions to abort until `used` is
-/// within `budget`. In each step, the earliest evictable transaction of the holder with the
-/// largest usage is selected, provided that aborting it moves that holder's usage closer to the
-/// fair share.
+/// Deducts bytes not tracked in `held` from `budget` and divides the remainder among holders by
+/// [`fair_share`]. Returns `None` if `requester` uses at least its fair share. Otherwise, returns
+/// the indices in `held` of evictable entries to abort until `used` fits in `budget`. Each step
+/// selects the earliest evictable entry of the holder with the largest usage, if that entry holds
+/// memory and aborting it moves that holder's usage closer to the fair share.
 pub fn fair_admission<K: Ord>(budget: usize, used: usize, requester: &K, held: &[Held<K>]) -> Option<Vec<usize>> {
     let mut usage: BTreeMap<&K, usize> = BTreeMap::new();
     for h in held {
@@ -169,7 +168,7 @@ pub fn fair_admission<K: Ord>(budget: usize, used: usize, requester: &K, held: &
         let mut victim: Option<(&K, usize)> = None;
         for (k, txns) in &candidates {
             let over = usage[k].saturating_sub(share).saturating_mul(2);
-            let Some(pos) = txns.iter().position(|&i| held[i].bytes < over) else { continue };
+            let Some(pos) = txns.iter().position(|&i| held[i].bytes > 0 && held[i].bytes < over) else { continue };
             if victim.is_none_or(|(v, _)| usage[k] > usage[v]) {
                 victim = Some((k, pos));
             }
@@ -300,7 +299,7 @@ mod tests {
     }
 
     fn moves_closer_to_share(usage: usize, share: usize, bytes: usize) -> bool {
-        usage > share && bytes < 2 * (usage - share)
+        usage > share && bytes > 0 && bytes < 2 * (usage - share)
     }
 
     #[test]

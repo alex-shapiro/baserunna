@@ -409,6 +409,8 @@ async fn querier(c: Client, w: Shared, steps: usize) -> Result<(), String> {
                 g.answers.push(Answer { sent_ms, strong, col, aggregate, json: r.json });
             }
             Ok(r) if r.status == 503 || r.status == 429 || r.status == 404 => {}
+            // A page of up to 10,000 rows can exceed a small node memory budget.
+            Ok(r) if r.status == 413 && r.json["error"]["message"].as_str().is_some_and(|m| m.contains("memory")) => {}
             Ok(r) if r.status == 400 && col.is_some_and(|n| r.json.to_string().contains(&format!("c{n}"))) => {}
             Ok(r) => return Err(format!("{}: churn query {q} failed: {} {}", c.name, r.status, r.json)),
             Err(_) => {}

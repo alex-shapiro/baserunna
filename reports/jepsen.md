@@ -273,15 +273,15 @@ The five real-cluster runs on MinIO tested three binary revisions:
   `9e2df7b`, `fb22d2c`) affect only unsent commits, non-UTF-8 environment
   variables, and cache eviction above 100,000 entries.
 
-| Run | Binary | Nodes | Lease | Minutes | Faults | `ok` | `info` | Elle |
-| --- | ------ | ----- | ----- | ------- | ------ | ---- | ------ | ---- |
-| r1 | before fixes | 3 | 5 s | 10 | 54 | 39,803 | 116 | valid |
-| r2 | before fixes | 3 | 5 s | 20 | 126 | 134,310 | 488 | valid |
-| r3 | fixed | 3 | 1 s | 30 | 182 | 268,679 | 613 | valid |
-| r4 | fixed | 5 | 5 s | 60 | 354 | 465,539 | 3,379 | valid |
-| r5 | final | 3 | 1 s | 40 | 228 | 328,164 | 1,502 | valid |
-| r6 | `07a7f79` | 5 | 1 s | 40 | 237 | 370,842 | 933 | valid |
-| r7 | `63c268f` | 3 | 1 s | 22 | 127 | 187,315 | 484 | not run |
+| Run | Binary       | Nodes | Lease | Minutes | Faults | `ok`    | `info` | Elle    |
+| --- | ------------ | ----- | ----- | ------- | ------ | ------- | ------ | ------- |
+| r1  | before fixes | 3     | 5 s   | 10      | 54     | 39,803  | 116    | valid   |
+| r2  | before fixes | 3     | 5 s   | 20      | 126    | 134,310 | 488    | valid   |
+| r3  | fixed        | 3     | 1 s   | 30      | 182    | 268,679 | 613    | valid   |
+| r4  | fixed        | 5     | 5 s   | 60      | 354    | 465,539 | 3,379  | valid   |
+| r5  | final        | 3     | 1 s   | 40      | 228    | 328,164 | 1,502  | valid   |
+| r6  | `07a7f79`    | 5     | 1 s   | 40      | 237    | 370,842 | 933    | valid   |
+| r7  | `63c268f`    | 3     | 1 s   | 22      | 127    | 187,315 | 484    | not run |
 
 In the table, `ok` is the number of successful transactions, including
 read-only ones, and `info` is the number of transactions with an unknown
@@ -667,17 +667,17 @@ checked (r1 to r6):
   caused by the stream-creation harness bug described in section 3.11.
 - **r2:** `--minutes 20 --seed 2`, binary `76c411c`. 0 client errors.
 - **r3:** `--minutes 30 --seed 3 --lease-ms 1000 --clients 30 --active-keys 4
-  --max-appends 16`, binary `d32f75a`. 0 client errors.
+--max-appends 16`, binary `d32f75a`. 0 client errors.
 - **r4:** `--minutes 60 --seed 4 --nodes 5 --clients 20`, binary `d32f75a`. 0
   client errors. Nodes exited 83 times because startup preflight checks
   coincided with injected storage faults, and the supervisor restarted them.
 - **r5:** `--minutes 40 --seed 5 --lease-ms 1000 --clients 12 --active-keys 6`,
   binary `cd30b18`. 0 client errors.
 - **r6:** `--minutes 40 --seed 6 --nodes 5 --lease-ms 1000 --clients 15
-  --active-keys 5`, binary `07a7f79`, which has every fix. 0 client errors,
+--active-keys 5`, binary `07a7f79`, which has every fix. 0 client errors,
   and the harness ran `elle_check` itself and exited with status 0.
 - **r7:** `--minutes 22 --seed 8 --lease-ms 1000 --clients 20 --active-keys 3
-  --max-appends 12`, binary `63c268f`. 0 client errors, and `elle_check`
+--max-appends 12`, binary `63c268f`. 0 client errors, and `elle_check`
   accepted the history. We did not run `elle-cli` on it.
 
 The bug-zoo comparisons used commits `7ab104b` and `cd30b18`:

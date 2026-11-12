@@ -555,6 +555,15 @@ only.
 
 ## Untriaged
 
+- [ ] [untriaged · Verification] **Check memory estimates against the real
+      heap in simulation.** Add a counting allocator to simulation builds that
+      charges each allocation to the memory account of the task that makes it,
+      and check that each query and transaction charge covers its real heap
+      within a small factor. Memory charges are hand-written size estimates, and
+      only the heavy tests in `tests/event_query_limits.rs` and
+      `tests/memory_bound.rs` compare them with the real heap. Those tests do
+      not run in normal test runs. On `main`, the estimate for a 500,000-group
+      query was 209 MiB, while the real heap grew by 338 MiB.
 - [ ] [untriaged · Wrong commit result] **Report the correct commit result if the
       store applies a manifest `PUT` and returns `412`.** Include a unique write
       ID in each manifest `PUT` and its commit records so a reload identifies

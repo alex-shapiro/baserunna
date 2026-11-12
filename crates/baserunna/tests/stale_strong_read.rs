@@ -1,5 +1,5 @@
 //! Verifies that strong reads never return older data after a client observes newer data.
-//! This file tests the case where the object store applies a manifest `PUT` after returning an error.
+//! This file tests the case in which the object store applies a manifest `PUT` after returning an error.
 //!
 //! Each test commits `k = old` and an event row. It then commits `k = new` and a second event row on
 //! the lease holder while [`LateManifestPutStore`] fails every manifest `PUT` of that commit. The

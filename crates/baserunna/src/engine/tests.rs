@@ -1291,7 +1291,7 @@ fn check_lease_views(dbs: &[(&str, &Arc<Db>)], store: &LateManifestPutStore) -> 
         }
         if store.late_puts.lock().iter().any(|(.., mode)| matches!(mode, PutMode::IfMatch(e) if *e == etag)) {
             return Err(format!(
-                "{node} serves lease reads at write {write_seq} ({etag}), but a late write can replace it"
+                "{node} serves lease reads at write {write_seq} ({etag}), but a buffered write matches that ETag"
             ));
         }
     }

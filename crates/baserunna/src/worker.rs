@@ -35,8 +35,14 @@ enum Job {
 #[derive(Serialize, Deserialize)]
 enum JobResult {
     Merged(Option<(Vec<u8>, Vec<u8>)>),
-    Failed { too_large: bool, message: String },
+    /// The job's error as the JSON body of an HTTP error response.
+    Failed(serde_json::Value),
 }
+
+/// Reads the `owner_id` of a database ID, or `None` if the database does not exist.
+pub type OwnerResolver = Box<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send>> + Send + Sync,
+>;
 
 /// Settings for the worker pool.
 #[derive(Clone, Debug)]
@@ -53,6 +59,7 @@ pub struct PoolConfig {
 pub struct WorkerPool {
     cfg: PoolConfig,
     db_owners: Mutex<HashMap<String, String>>,
+    owner_resolver: std::sync::OnceLock<OwnerResolver>,
     next_worker_id: std::sync::atomic::AtomicU64,
 }
 
@@ -60,7 +67,12 @@ impl WorkerPool {
     /// Enables the memory and CPU controllers below `cfg.cgroup_root`.
     pub fn new(cfg: PoolConfig) -> std::io::Result<WorkerPool> {
         std::fs::write(cfg.cgroup_root.join("cgroup.subtree_control"), "+memory +cpu")?;
-        Ok(WorkerPool { cfg, db_owners: Mutex::new(HashMap::new()), next_worker_id: 0.into() })
+        Ok(WorkerPool {
+            cfg,
+            db_owners: Mutex::new(HashMap::new()),
+            owner_resolver: Default::default(),
+            next_worker_id: 0.into(),
+        })
     }
 
     /// Records that database `db` belongs to owner `owner`.
@@ -71,8 +83,21 @@ impl WorkerPool {
         }
     }
 
-    fn owner_of(&self, db: &str) -> String {
-        self.db_owners.lock().get(db).cloned().unwrap_or_else(|| db.to_string())
+    /// Sets the function that reads a database's `owner_id` from the system database.
+    pub fn set_owner_resolver(&self, f: OwnerResolver) {
+        let _ = self.owner_resolver.set(f);
+    }
+
+    /// Returns the `owner_id` of database `db`, so that all databases of an owner share one cgroup.
+    async fn owner_of(&self, db: &str) -> Result<String> {
+        if let Some(o) = self.db_owners.lock().get(db) {
+            return Ok(o.clone());
+        }
+        let resolve =
+            self.owner_resolver.get().ok_or_else(|| Error::internal("the worker pool has no owner resolver"))?;
+        let owner = resolve(db.to_string()).await?.ok_or_else(|| Error::not_found("database not found"))?;
+        self.set_db_owner(db, &owner);
+        Ok(owner)
     }
 
     fn owner_cgroup(&self, owner: &str) -> std::io::Result<PathBuf> {
@@ -103,13 +128,12 @@ impl WorkerPool {
             JobResult::Merged(Some((k, v))) => {
                 PartRef::decode(&k, &v).map(Some).map_err(|e| Error::internal(format!("worker part ref: {e}")))
             }
-            JobResult::Failed { too_large: true, message } => Err(Error::TooLarge(message)),
-            JobResult::Failed { message, .. } => Err(Error::internal(message)),
+            JobResult::Failed(e) => Err(crate::api::error_from_json(500, &e)),
         }
     }
 
     async fn run(&self, db: &str, job: Job, deadline: Duration) -> Result<JobResult> {
-        let owner = self.owner_of(db);
+        let owner = self.owner_of(db).await?;
         let io = |e: std::io::Error| Error::internal(format!("worker: {e}"));
         let owner_dir = self.owner_cgroup(&owner).map_err(io)?;
         // Each worker has its own leaf below the owner's cgroup, so a deadline
@@ -195,7 +219,7 @@ pub async fn serve(store: crate::store::DynStore, cfg: EngineConfig) -> std::io:
 }
 
 async fn run_job(shared: &Arc<Shared>, job: Job) -> JobResult {
-    let failed = |e: Error| JobResult::Failed { too_large: matches!(e, Error::TooLarge(_)), message: e.to_string() };
+    let failed = |e: Error| JobResult::Failed(serde_json::json!({ "error": crate::api::error_json(&e) }));
     match job {
         Job::Merge { db, schema, inputs } => {
             let mut refs = Vec::with_capacity(inputs.len());

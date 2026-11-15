@@ -187,6 +187,15 @@ async fn run() -> Result<(), String> {
     let services = Services { transport, oidc, mailer };
     let node = Node::start(cfg, env.clone(), store, services).await.map_err(|e| format!("startup failed: {e}"))?;
     if let Some(w) = workers {
+        let weak = Arc::downgrade(&node);
+        w.set_owner_resolver(Box::new(move |db| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let Some(node) = weak.upgrade() else { return Ok(None) };
+                let mut t = node.sys_read().await?;
+                Ok(baserunna::meta::get_db(&mut t, &db).await?.map(|r| r.owner_id))
+            })
+        }));
         let _ = node.engine.shared.workers.set(w);
     }
     let n = node.clone();

@@ -158,6 +158,7 @@ async fn run() -> Result<(), String> {
                 owner_memory_bytes: parse("BASERUNNA_OWNER_MEMORY_MB", baserunna::worker::OWNER_MEMORY_BYTES >> 20)?
                     << 20,
                 owner_cpu_weight: parse("BASERUNNA_OWNER_CPU_WEIGHT", 100u32)?,
+                main_cpu_weight: parse("BASERUNNA_MAIN_CPU_WEIGHT", 1000u32)?,
             };
             let pool = baserunna::worker::WorkerPool::new(pool.clone())
                 .map_err(|e| format!("cannot enable controllers in {}: {e}", pool.cgroup_root.display()))?;

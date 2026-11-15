@@ -130,6 +130,8 @@ pub struct PoolConfig {
     pub exe: PathBuf,
     pub owner_memory_bytes: u64,
     pub owner_cpu_weight: u32,
+    /// The CPU weight of the node process, which runs the light requests of all owners.
+    pub main_cpu_weight: u32,
 }
 
 /// Starts workers in per-owner cgroups and runs jobs in them.
@@ -142,9 +144,15 @@ pub struct WorkerPool {
 }
 
 impl WorkerPool {
-    /// Enables the memory and CPU controllers below `cfg.cgroup_root`.
+    /// Enables the memory and CPU controllers below `cfg.cgroup_root`, and gives the node
+    /// process its CPU weight if the node runs in a child cgroup of `cfg.cgroup_root`.
     pub fn new(cfg: PoolConfig) -> std::io::Result<WorkerPool> {
         std::fs::write(cfg.cgroup_root.join("cgroup.subtree_control"), "+memory +cpu")?;
+        if let Some(own) = own_cgroup()
+            && own.parent() == Some(cfg.cgroup_root.as_path())
+        {
+            std::fs::write(own.join("cpu.weight"), cfg.main_cpu_weight.to_string())?;
+        }
         Ok(WorkerPool {
             cfg,
             db_owners: Mutex::new(HashMap::new()),
@@ -562,6 +570,13 @@ async fn read_job_frame(r: &mut (impl tokio::io::AsyncRead + Unpin)) -> std::io:
     let mut payload = vec![0u8; r.read_u64_le().await? as usize];
     r.read_exact(&mut payload).await?;
     Ok((job_id, header.into(), payload.into()))
+}
+
+/// Returns the cgroup v2 directory of this process.
+fn own_cgroup() -> Option<PathBuf> {
+    let line = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = line.lines().find_map(|l| l.strip_prefix("0::"))?;
+    Some(PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
 }
 
 fn oom_kills(cgroup: &std::path::Path) -> u64 {

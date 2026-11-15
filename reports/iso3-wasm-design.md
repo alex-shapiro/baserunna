@@ -411,7 +411,11 @@ The guest build already holds `engine`, `events`, `ops`, `queries`,
 `node`, `auth`, or `cluster`, which need the `server` feature (code,
 `crates/baserunna/src/lib.rs:7`–`:45`). So rounds 3 and 4 must build the
 database handlers with axum but without hyper or tokio networking, and
-`meta` for the system instance.
+`meta` for the system instance. Only axum's `tokio` and `http1` features pull in
+tokio networking and hyper (code, axum 0.8.9 `Cargo.toml`, `[features]`).
+The guest enables `json`, `query`, `form`, `matched-path`, and
+`original-uri` only. Whether that build succeeds for `wasm32-wasip1` is
+not tested yet (inferred).
 
 This plan does not fit with margin. Rounds 2 to 4 move almost all of the
 node into the guest, and each step needs the axum handlers, `OpenTxns`,

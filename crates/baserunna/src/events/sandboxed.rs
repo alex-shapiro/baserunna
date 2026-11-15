@@ -85,6 +85,32 @@ pub struct MergeInput {
     pub now_ms: u64,
 }
 
+/// Input of an event query in the sandbox.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueryInput {
+    pub db: String,
+    pub schema: EventSchema,
+    /// The query body, which the guest parses with `Query::parse`.
+    pub query: serde_json::Value,
+    pub limits: super::exec::Limits,
+    /// Encoded manifest of the host transaction's snapshot version.
+    pub manifest: Vec<u8>,
+    pub etag: String,
+    pub read_time: u64,
+    pub config: EventConfig,
+    pub seed: u64,
+    pub now_ms: u64,
+}
+
+/// Output of an event query in the sandbox.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueryOutput {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub next_cursor: Option<String>,
+    pub stats: super::exec::Stats,
+}
+
 /// Runs event work in the node's WebAssembly sandbox, charged to the database owner.
 pub trait SandboxRunner: Send + Sync {
     /// Runs `maint::merge_parts` over `inputs` in the sandbox.
@@ -94,4 +120,14 @@ pub trait SandboxRunner: Send + Sync {
         schema: &'a EventSchema,
         inputs: &'a [PartRef],
     ) -> BoxFut<'a, Result<Option<PartRef>>>;
+
+    /// Runs `exec::run` for `query` in the sandbox, at the snapshot of `txn`.
+    fn query_events<'a>(
+        &'a self,
+        db: &'a str,
+        txn: &'a crate::engine::Txn,
+        schema: &'a EventSchema,
+        query: &'a serde_json::Value,
+        limits: &'a super::exec::Limits,
+    ) -> BoxFut<'a, Result<super::exec::Output>>;
 }

@@ -3761,7 +3761,7 @@ mod partial_reads_at_defaults {
 
 mod sandbox_merge {
     use super::*;
-    use crate::events::sandboxed::{EventConfig, MergeInput};
+    use crate::events::sandboxed::{EventConfig, MergeInput, SandboxRunner};
     use crate::sandbox::Sandbox;
 
     /// Seals `parts` parts of `rows` rows each and returns a merge input over them.
@@ -3870,6 +3870,27 @@ mod sandbox_merge {
             assert_eq!(runner.sandbox.last_instance_peak(), 0, "no instance started");
             let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
             assert_eq!(refs(&mut t, input.schema.id).await.unwrap().len(), inputs.len());
+        });
+    }
+
+    #[test]
+    fn sandbox_query_matches_native_query() {
+        rt().block_on(async {
+            let (eng, _mem, input, _) = sealed_parts(4, 200).await;
+            let db = eng.db("db");
+            let unsealed: Vec<Json> = (0..30).map(|i| json!({"time": T0 + 5000 + i, "event": "late", "user": "u", "n": i})).collect();
+            txn_do(&db, async |t| insert(t, "events", &unsealed, 0).await).await.unwrap();
+            let runner = node_sandbox(&eng, Some("owner-1"));
+            let q = json!({"from": T0, "to": T0 + DAY, "group_by": ["event"],
+                "aggregates": {"n": {"fn": "count"}, "s": {"fn": "sum", "of": "n"}}, "order_by": ["event"]});
+            let native = query(&db, &q).await.unwrap();
+            let t = db.begin(Isolation::Snapshot, Consistency::Strong).await.unwrap();
+            let started = std::time::Instant::now();
+            let guest = runner.query_events("db", &t, &input.schema, &q, &exec::Limits::default()).await.unwrap();
+            eprintln!("guest query took {:?}; peak {} KiB", started.elapsed(), runner.sandbox.last_instance_peak() >> 10);
+            assert_eq!(guest.columns, native.columns);
+            assert_eq!(guest.rows, native.rows);
+            assert!(!guest.rows.is_empty());
         });
     }
 }

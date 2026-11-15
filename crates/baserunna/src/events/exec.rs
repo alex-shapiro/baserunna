@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 /// Resource limits for a single query.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Limits {
     /// Maximum compressed bytes read from storage.
     pub max_bytes_read: u64,
@@ -51,7 +51,7 @@ impl Default for Limits {
 }
 
 /// Execution statistics returned in the query response.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
     pub source: String,
     pub nodes: u32,

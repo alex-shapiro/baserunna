@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use crate::engine::events::PartRef;
 use crate::engine::Shared;
-use crate::events::sandboxed::{EventConfig, MergeInput, SandboxRunner};
+use crate::events::sandboxed::{EventConfig, MergeInput, QueryInput, QueryOutput, SandboxRunner};
 use crate::events::schema::EventSchema;
 use crate::store::BoxFut;
 use crate::store::{DynStore, GetOpts, PutMode, StoreError};
@@ -408,7 +408,54 @@ impl NodeSandbox {
     }
 }
 
+impl NodeSandbox {
+    fn seed(&self) -> u64 {
+        let mut seed = [0u8; 8];
+        self.shared.env.fill_random(&mut seed);
+        u64::from_le_bytes(seed)
+    }
+}
+
 impl SandboxRunner for NodeSandbox {
+    fn query_events<'a>(
+        &'a self,
+        db: &'a str,
+        txn: &'a crate::engine::Txn,
+        schema: &'a EventSchema,
+        query: &'a serde_json::Value,
+        limits: &'a crate::events::exec::Limits,
+    ) -> BoxFut<'a, Result<crate::events::exec::Output>> {
+        Box::pin(async move {
+            let owner = self.owner(db).await?;
+            let version = txn.snapshot();
+            let input = QueryInput {
+                db: db.to_string(),
+                schema: schema.clone(),
+                query: query.clone(),
+                limits: *limits,
+                manifest: version.m.encode().to_vec(),
+                etag: version.etag.clone(),
+                read_time: txn.read_time,
+                config: EventConfig::of(&self.shared.cfg),
+                seed: self.seed(),
+                now_ms: self.shared.env.now_ms(),
+            };
+            let body = serde_json::to_vec(&input).map_err(|e| Error::internal(format!("query input: {e}")))?;
+            let out = self
+                .sandbox
+                .call_with_input(&owner, Some(self.shared.store.clone()), input.seed, &body, CALL_FUEL, "guest_query_events")
+                .await?;
+            let out: QueryOutput =
+                serde_json::from_slice(&out).map_err(|e| Error::internal(format!("query output: {e}")))?;
+            Ok(crate::events::exec::Output {
+                columns: out.columns,
+                rows: out.rows,
+                next_cursor: out.next_cursor,
+                stats: out.stats,
+            })
+        })
+    }
+
     fn merge_parts<'a>(
         &'a self,
         db: &'a str,

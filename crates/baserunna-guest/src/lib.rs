@@ -290,3 +290,50 @@ pub unsafe extern "C" fn guest_merge_parts(ptr: *const u8, len: u32) -> u32 {
         }
     }
 }
+
+/// Runs an event query with the node's `exec::run` at the host's snapshot version.
+///
+/// Returns 0 with a JSON `QueryOutput`, or 1 with an error message.
+///
+/// # Safety
+/// `ptr` and `len` must name `len` initialized bytes from `guest_alloc`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn guest_query_events(ptr: *const u8, len: u32) -> u32 {
+    use baserunna::engine::{Isolation, Snapshot, Txn, Version, manifest::Manifest};
+    use baserunna::events::sandboxed::{QueryInput, QueryOutput};
+    let body = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let input: QueryInput = match serde_json::from_slice(body) {
+        Ok(i) => i,
+        Err(e) => {
+            set_output(e.to_string().into_bytes());
+            return 1;
+        }
+    };
+    let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
+    let out = rt.block_on(async move {
+        let env = baserunna::env::Env::sim(input.seed, input.now_ms, tokio::time::Instant::now(), 0);
+        let cfg = input.config.engine_config();
+        let max_write = cfg.txn_max_write_bytes;
+        let engine =
+            baserunna::engine::Engine::new(std::sync::Arc::new(HostStore), std::sync::Arc::new(env), cfg, "guest".into());
+        let m = Manifest::decode(&bytes::Bytes::from(input.manifest))
+            .map_err(|_| baserunna::Error::internal("corrupt snapshot manifest"))?;
+        let version = std::sync::Arc::new(Version::new(m, input.etag, engine.shared.clone()));
+        let mut txn = Txn::new(Snapshot { version, time_ms: input.read_time }, Isolation::Snapshot, 0, max_write);
+        let q = baserunna::events::query::Query::parse(input.query)?;
+        let mut grant = baserunna::queries::QueryGrant::unlimited();
+        baserunna::events::exec::run(&engine.shared, &input.db, &mut txn, &input.schema, &q, &input.limits, &mut grant)
+            .await
+    });
+    match out {
+        Ok(o) => {
+            let o = QueryOutput { columns: o.columns, rows: o.rows, next_cursor: o.next_cursor, stats: o.stats };
+            set_output(serde_json::to_vec(&o).unwrap_or_default());
+            0
+        }
+        Err(e) => {
+            set_output(format!("{e:?}").into_bytes());
+            1
+        }
+    }
+}

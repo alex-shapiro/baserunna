@@ -161,6 +161,7 @@ dependencies = [
  "libc",
  "object_store",
  "parking_lot",
+ "postcard",
  "reqwest",
  "serde",
  "serde_json",
@@ -214,8 +215,10 @@ name = "baserunna-guest"
 version = "0.1.0"
 dependencies = [
  "baserunna",
+ "baserunna-api",
  "baserunna-core",
  "bytes",
+ "postcard",
  "serde",
  "serde_json",
  "tokio",
@@ -259,6 +262,9 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "cc"

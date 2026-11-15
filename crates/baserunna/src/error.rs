@@ -4,7 +4,7 @@ use crate::store::StoreError;
 use baserunna_api::ErrorCode;
 use std::fmt;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     InvalidArgument(String),
     Unauthenticated(String),

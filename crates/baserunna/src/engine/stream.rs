@@ -198,7 +198,7 @@ fn decode_entry(e: &Entry) -> Result<(u64, Stored)> {
     stored(e).ok_or_else(corrupt)
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Retention {
     pub retention_ms: Option<u64>,
     pub max_bytes: Option<u64>,
@@ -296,7 +296,7 @@ pub fn state_of(e: &Entry) -> Option<(u64, StreamState)> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum StreamOp {
     Create {
         id: u64,

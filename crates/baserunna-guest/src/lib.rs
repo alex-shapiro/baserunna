@@ -477,3 +477,69 @@ pub unsafe extern "C" fn guest_blob_equals(ptr: *const u8, len: u32) -> u32 {
         }
     }
 }
+
+/// Runs transaction ops with the node's `exec_ops` at the host transaction's snapshot.
+///
+/// The input is a postcard `OpsInput`. Returns 0 with the JSON of each op
+/// result, then a postcard `OpsOutput`, then its `u32` length; or 1 with an
+/// error message.
+///
+/// # Safety
+/// `ptr` and `len` must name `len` initialized bytes from `guest_alloc`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn guest_exec_ops(ptr: *const u8, len: u32) -> u32 {
+    use baserunna::engine::{Snapshot, Txn, Version, manifest::Manifest};
+    use baserunna::events::sandboxed::{OpsInput, OpsOutput};
+    let body = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let input: OpsInput = match postcard::from_bytes(body) {
+        Ok(i) => i,
+        Err(e) => {
+            set_output(e.to_string().into_bytes());
+            return 1;
+        }
+    };
+    let config = input.config.clone();
+    let out = run_on_engine(input.seed, input.now_ms, &config, |engine| async move {
+        let m = Manifest::decode(&bytes::Bytes::from(input.manifest))
+            .map_err(|_| baserunna::Error::internal("corrupt snapshot manifest"))?;
+        let version = std::sync::Arc::new(Version::new(m, input.etag, engine.shared.clone()));
+        let snapshot = Snapshot { version, time_ms: input.read_time };
+        let mut txn = Txn::new(snapshot, input.isolation, input.commit_id, input.max_write_bytes)
+            .with_read_limit(input.max_read_bytes);
+        txn.adopt_effects(input.effects)?;
+        let api_ops: Vec<baserunna_api::Op> =
+            serde_json::from_slice(&input.ops).map_err(|e| baserunna::Error::invalid(e.to_string()))?;
+        let ops = baserunna::ops::parse_ops(api_ops)?;
+        let db = engine.db(&input.db);
+        let ctx = baserunna::ops::OpCtx {
+            db: &db,
+            encoding: input.encoding,
+            json_value_max: input.json_value_max,
+            query_limits: input.query_limits,
+            user_id: &input.user_id,
+        };
+        let results = baserunna::ops::exec_ops(&ctx, &mut txn, &ops).await;
+        Ok::<_, baserunna::Error>((txn.effects(), results))
+    });
+    let (effects, results) = match out {
+        Ok(o) => o,
+        Err(e) => {
+            set_output(format!("{e:?}").into_bytes());
+            return 1;
+        }
+    };
+    let mut out = Vec::new();
+    let result_ends = results.map(|results| {
+        let mut ends = Vec::with_capacity(results.len());
+        for r in results {
+            serde_json::to_writer(&mut out, &r).expect("op results encode as JSON");
+            ends.push(out.len() as u32);
+        }
+        ends
+    });
+    let header = postcard::to_allocvec(&OpsOutput { effects, result_ends }).expect("ops output encodes");
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    set_output(out);
+    0
+}

@@ -12,7 +12,10 @@ use std::sync::Arc;
 use crate::engine::events::PartRef;
 use crate::engine::Shared;
 use crate::engine::events::Pos;
-use crate::events::sandboxed::{CheckInput, EventConfig, MergeInput, QueryInput, QueryOutput, SandboxRunner, WriteInput, WrittenPart};
+use crate::events::sandboxed::{
+    CheckInput, EventConfig, GuestOpResults, MergeInput, OpsInput, OpsOutput, OpsSettings, QueryInput, QueryOutput, SandboxRunner,
+    WriteInput, WrittenPart,
+};
 use crate::events::schema::EventSchema;
 use crate::store::BoxFut;
 use crate::store::{DynStore, GetOpts, PutMode, StoreError};
@@ -115,6 +118,60 @@ impl Drop for OwnerLimiter {
         let mut owners = self.owner_memory.lock();
         if let Some(owner) = owners.get_mut(&self.owner) {
             owner.used -= self.charged;
+            if owner.used == 0 {
+                owners.remove(&self.owner);
+            }
+        }
+    }
+}
+
+/// Output of a guest call, copied out of its instance.
+///
+/// Every byte that leaves the sandbox passes through this type, and it stays
+/// charged to the owner's memory bound until it is dropped.
+pub struct GuestOutput {
+    bytes: Vec<u8>,
+    _charge: OwnerCharge,
+}
+
+impl std::fmt::Debug for GuestOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GuestOutput({} bytes)", self.bytes.len())
+    }
+}
+
+impl std::ops::Deref for GuestOutput {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl AsRef<[u8]> for GuestOutput {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl GuestOutput {
+    /// Converts the output into `Bytes` that keep the charge until the last clone drops.
+    pub fn into_bytes(self) -> Bytes {
+        Bytes::from_owner(self)
+    }
+}
+
+/// Host memory charged to an owner's bound, released on drop.
+struct OwnerCharge {
+    owner: String,
+    owner_memory: Arc<Mutex<HashMap<String, OwnerMemory>>>,
+    bytes: usize,
+}
+
+impl Drop for OwnerCharge {
+    fn drop(&mut self) {
+        let mut owners = self.owner_memory.lock();
+        if let Some(owner) = owners.get_mut(&self.owner) {
+            owner.used -= self.bytes;
             if owner.used == 0 {
                 owners.remove(&self.owner);
             }
@@ -322,6 +379,12 @@ impl Sandbox {
         self.owner_memory.lock().get(owner).map_or(0, |o| o.used)
     }
 
+    /// Memory that all owners' instances and outputs hold.
+    #[cfg(test)]
+    pub fn all_owners_memory_used(&self) -> usize {
+        self.owner_memory.lock().values().map(|o| o.used).sum()
+    }
+
     /// Drops every idle instance, which returns its memory to its owner.
     pub fn evict_idle_instances(&self) {
         let idle = std::mem::take(&mut *self.idle.lock());
@@ -334,7 +397,7 @@ impl Sandbox {
     }
 
     /// Parses a JSON body inside the sandbox and returns its canonical encoding.
-    pub async fn parse_json(&self, owner: &str, body: &[u8]) -> Result<Vec<u8>> {
+    pub async fn parse_json(&self, owner: &str, body: &[u8]) -> Result<GuestOutput> {
         self.call_with_input(owner, None, 0, body, CALL_FUEL, "guest_parse_json").await
     }
 
@@ -398,7 +461,7 @@ impl Sandbox {
         input: &[u8],
         fuel: u64,
         export: &str,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<GuestOutput> {
         self.call_with_pieces(owner, object_store, seed, &[input], fuel, export).await
     }
 
@@ -411,7 +474,7 @@ impl Sandbox {
         pieces: &[&[u8]],
         fuel: u64,
         export: &str,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<GuestOutput> {
         let warm = self.idle.lock().get_mut(owner).and_then(|v| v.pop());
         let (mut store, instance) = match warm {
             Some(WarmInstance { mut store, instance, .. }) => {
@@ -445,21 +508,52 @@ impl Sandbox {
         free.call_async(&mut store, (ptr, len)).await.map_err(|e| guest_error(&store, e))?;
         let out_at = out_ptr.call_async(&mut store, ()).await.map_err(|e| guest_error(&store, e))? as usize;
         let out_len = out_len.call_async(&mut store, ()).await.map_err(|e| guest_error(&store, e))? as usize;
+        let charge = self.charge_output(owner, out_len)?;
         let out = memory
             .data(&store)
             .get(out_at..out_at + out_len)
             .ok_or_else(|| Error::internal("sandbox output out of bounds"))?
             .to_vec();
+        let out = GuestOutput { bytes: out, _charge: charge };
         let linear_memory = memory.data_size(&store);
         self.release(owner, WarmInstance { store, instance, linear_memory, idle_since: tokio::time::Instant::now() });
         match status {
             0 | 2 => Ok(out),
-            _ => Err(Error::invalid(String::from_utf8_lossy(&out).into_owned())),
+            _ => Err(Error::invalid(String::from_utf8_lossy(&out.bytes).into_owned())),
         }
     }
 }
 
 impl Sandbox {
+    /// Charges `bytes` of guest output to `owner`, after its idle instances if needed.
+    fn charge_output(&self, owner: &str, bytes: usize) -> Result<OwnerCharge> {
+        for attempt in 0..2 {
+            {
+                let mut owners = self.owner_memory.lock();
+                let o = owners.entry(owner.to_string()).or_default();
+                if o.used + bytes <= self.owner_memory_bound {
+                    o.used += bytes;
+                    return Ok(OwnerCharge { owner: owner.to_string(), owner_memory: self.owner_memory.clone(), bytes });
+                }
+                if o.used == 0 {
+                    owners.remove(owner);
+                }
+            }
+            if attempt == 0 {
+                let evicted = self.idle.lock().remove(owner);
+                drop(evicted);
+            }
+        }
+        if bytes > self.owner_memory_bound / 2 {
+            Err(Error::TooLarge(format!(
+                "response needs more than half of the owner memory bound of {} MiB",
+                self.owner_memory_bound >> 20
+            )))
+        } else {
+            Err(Error::unavailable("owner memory bound reached; retry later"))
+        }
+    }
+
     /// Keeps `warm` for the next call of `owner` within the idle pool's limits.
     ///
     /// The pool drops instances idle for longer than `IDLE_INSTANCE_TTL`, and
@@ -583,7 +677,68 @@ impl NodeSandbox {
     }
 }
 
+/// Bytes of an ops output header beyond the transaction's read and write limits.
+const OPS_HEADER_SLACK: usize = 1 << 20;
+
 impl SandboxRunner for NodeSandbox {
+    fn exec_ops<'a>(
+        &'a self,
+        db: &'a str,
+        txn: &'a mut crate::engine::Txn,
+        ops: Vec<u8>,
+        settings: OpsSettings<'a>,
+    ) -> BoxFut<'a, Result<GuestOpResults>> {
+        Box::pin(async move {
+            let seed = self.seed();
+            let version = txn.snapshot();
+            let (max_write_bytes, max_read_bytes) = txn.limits();
+            let input = OpsInput {
+                db: db.to_string(),
+                config: EventConfig::of(&self.shared.cfg),
+                seed,
+                now_ms: self.shared.env.now_ms(),
+                manifest: version.m.encode().to_vec(),
+                etag: version.etag.clone(),
+                read_time: txn.read_time,
+                isolation: txn.isolation,
+                commit_id: txn.commit_id,
+                max_write_bytes,
+                max_read_bytes,
+                effects: txn.effects(),
+                ops,
+                encoding: settings.encoding,
+                json_value_max: settings.json_value_max,
+                query_limits: settings.query_limits,
+                user_id: settings.user_id.to_string(),
+            };
+            let body = postcard::to_allocvec(&input).map_err(|e| Error::internal(format!("ops input: {e}")))?;
+            drop(input);
+            let out = self
+                .sandbox
+                .call_with_input(settings.owner, Some(self.shared.store.clone()), seed, &body, CALL_FUEL, "guest_exec_ops")
+                .await?;
+            drop(body);
+            let n = out.len();
+            let header_len = out
+                .get(n.saturating_sub(4)..)
+                .and_then(|b| b.try_into().ok())
+                .map(|b: [u8; 4]| u32::from_le_bytes(b) as usize)
+                .ok_or_else(|| Error::internal("ops output has no header"))?;
+            if header_len > max_write_bytes + max_read_bytes + OPS_HEADER_SLACK || header_len + 4 > n {
+                return Err(Error::TooLarge(format!(
+                    "transaction reads and writes exceed {} bytes",
+                    max_write_bytes + max_read_bytes
+                )));
+            }
+            let results_len = n - 4 - header_len;
+            let header: OpsOutput = postcard::from_bytes(&out[results_len..n - 4])
+                .map_err(|e| Error::internal(format!("ops output: {e}")))?;
+            txn.adopt_effects(header.effects)?;
+            let ends = header.result_ends?;
+            GuestOpResults::new(out.into_bytes().slice(..results_len), ends)
+        })
+    }
+
     fn blob_equals<'a>(
         &'a self,
         db: &'a str,
@@ -608,7 +763,7 @@ impl SandboxRunner for NodeSandbox {
                 .sandbox
                 .call_with_pieces(&owner, Some(self.shared.store.clone()), seed, &[&len_prefix, &header, want], CALL_FUEL, "guest_blob_equals")
                 .await?;
-            Ok(out == b"1")
+            Ok(&out[..] == b"1")
         })
     }
 
@@ -745,8 +900,10 @@ pub(crate) mod tests {
     fn sandbox_parses_small_json() {
         let sandbox = Sandbox::new(&guest_wasm(), OWNER_MEMORY_BOUND).unwrap();
         let out = block_on(sandbox.parse_json("o1", br#"{"a": [1, 2, {"b": "c"}]}"#)).unwrap();
-        assert_eq!(out, br#"{"a":[1,2,{"b":"c"}]}"#);
+        assert_eq!(&out[..], br#"{"a":[1,2,{"b":"c"}]}"#);
         assert!(block_on(sandbox.parse_json("o1", b"{")).is_err());
+        assert!(sandbox.owner_memory_used("o1") >= out.len(), "the output stays charged to its owner");
+        drop(out);
         sandbox.evict_idle_instances();
         assert_eq!(sandbox.owner_memory_used("o1"), 0);
     }

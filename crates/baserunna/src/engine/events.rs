@@ -27,7 +27,7 @@ fn table_prefix(space: u8, table: u32) -> Vec<u8> {
 }
 
 /// Unique row position ordered by commit `version` and `ordinal` within the table's rows in that commit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Pos {
     pub version: u64,
     pub ordinal: u32,
@@ -159,7 +159,7 @@ pub fn state_of(e: &Entry) -> Option<(u32, TableState)> {
 }
 
 /// Sorted, disjoint, non-adjacent `(start, len)` runs of row offsets in a part.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Runs(pub Vec<(u32, u32)>);
 
 impl Runs {
@@ -247,7 +247,7 @@ impl Runs {
 }
 
 /// Deletion mask for a part, stored inline in [`PartRef`] or as a separate object.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum Mask {
     Inline(Runs),
     /// Mask object at `part/{id}/0000` containing encoded runs and a CRC32C checksum.
@@ -257,7 +257,7 @@ pub enum Mask {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PartRef {
     pub id: String,
     pub table: u32,
@@ -468,7 +468,7 @@ pub fn decode_mask_object(b: &[u8]) -> DResult<Runs> {
     Ok(runs)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum EventOp {
     /// Inserts encoded rows into `table` and assigns their positions at commit.
     Insert {
@@ -492,7 +492,7 @@ pub enum EventOp {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RefChange {
     pub old: Option<PartRef>,
     pub new: Option<PartRef>,

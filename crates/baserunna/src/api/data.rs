@@ -8,6 +8,8 @@ use super::{
 use crate::engine::manifest::ObjKind;
 use crate::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn, Value, blob};
 use crate::error::{Error, Result};
+use crate::events::sandboxed::{GuestOpResults, OpsSettings};
+use bytes::Bytes;
 use crate::meta::{self, DbRecord, DbRef, MetaCmd};
 use crate::node::Node;
 use crate::ops::{self, EncodingExt, Op, OpCtx, exec_ops, user_key};
@@ -483,6 +485,11 @@ async fn one_shot(
     Extension(ctx): Extension<DbCtx>,
     Req(req): Req<api::Txn>,
 ) -> Result<Reply<api::Txn>> {
+    let sandbox = ctx.db.shared().sandbox.get().cloned();
+    let guest_ops = match &sandbox {
+        Some(_) => Some(serde_json::to_vec(&req.ops).map_err(|e| Error::internal(format!("ops: {e}")))?),
+        None => None,
+    };
     let ops = ops::parse_ops(req.ops)?;
     let writes = ops.iter().any(|o| o.is_write());
     if writes {
@@ -495,23 +502,92 @@ async fn one_shot(
     let octx = op_ctx(&node, &ctx, req.encoding);
     // Ignore idempotency keys on read-only requests so a failed check cannot abort a write key without write permission.
     let key = req.idempotency_key.as_deref().filter(|_| writes);
-    let (commit_id, ran) = run_txn!(node, ctx, isolation(req.isolation), c, key, |t| exec_ops(&octx, t, &ops).await);
+    let (commit_id, ran) = run_txn!(node, ctx, isolation(req.isolation), c, key, |t| match (&sandbox, &guest_ops) {
+        (Some(sandbox), Some(guest_ops)) => {
+            let settings = OpsSettings {
+                owner: &ctx.rec.owner_id,
+                encoding: req.encoding,
+                json_value_max: node.cfg.json_value_max,
+                query_limits: node.cfg.query_limits,
+                user_id: &ctx.principal.user.id,
+            };
+            sandbox.exec_ops(&ctx.db.id, t, guest_ops.clone(), settings).await.map(TxnResults::Guest)
+        }
+        _ => exec_ops(&octx, t, &ops).await.map(TxnResults::Native),
+    });
     node.env.crash_point().await;
-    let reply = |version: u64, committed: bool, replayed: bool, results, appends| {
+    let head = |version: u64, committed: bool, replayed: bool, appends| {
         let commit_id = committed.then(|| commit_hex(commit_id));
-        Reply::new(api::TxnResponse { version, committed, commit_id, replayed, results, appends })
+        api::TxnResponse { version, committed, commit_id, replayed, results: None, appends }
     };
-    Ok(match ran {
-        Ran::Read { out, version } => reply(version, false, false, Some(out), None),
-        Ran::Committed { mut out, commit } => {
-            ops::fill_appends(&ops, &mut out, &commit.appends);
-            reply(commit.version, true, false, Some(out), Some(first_seqs(&commit)))
+    match ran {
+        Ran::Read { out, version } => txn_response(head(version, false, false, None), out, &ops, &[]),
+        Ran::Committed { out, commit } => {
+            txn_response(head(commit.version, true, false, Some(first_seqs(&commit))), out, &ops, &commit.appends)
         }
         Ran::Replayed(c) if c.inserted.is_some() => {
-            return Err(Error::invalid("the idempotency key was used by an event bulk insert"));
+            Err(Error::invalid("the idempotency key was used by an event bulk insert"))
         }
-        Ran::Replayed(c) => reply(c.version, true, true, None, Some(first_seqs(&c))),
-    })
+        Ran::Replayed(c) => Ok(Reply::new(head(c.version, true, true, Some(first_seqs(&c))))),
+    }
+}
+
+/// Op results of a transaction, from native code or from the sandbox.
+enum TxnResults {
+    Native(Vec<api::OpResult>),
+    Guest(GuestOpResults),
+}
+
+/// Builds the response of a transaction from `head` and its op results.
+///
+/// Sandbox results go into the body as the guest encoded them, so the host
+/// holds only the charged guest output.
+fn txn_response(
+    mut head: api::TxnResponse,
+    results: TxnResults,
+    ops: &[Op],
+    appends: &[crate::engine::Appended],
+) -> Result<Reply<api::Txn>> {
+    let guest = match results {
+        TxnResults::Native(mut out) => {
+            ops::fill_appends(ops, &mut out, appends);
+            head.results = Some(out);
+            return Ok(Reply::new(head));
+        }
+        TxnResults::Guest(g) => g,
+    };
+    if guest.len() != ops.len() {
+        return Err(Error::internal("sandbox returned a result count that differs from the op count"));
+    }
+    let head_json = api::Body::encode(&head);
+    const NO_RESULTS: &[u8] = b"\"results\":null";
+    let at = head_json
+        .windows(NO_RESULTS.len())
+        .position(|w| w == NO_RESULTS)
+        .ok_or_else(|| Error::internal("transaction response has no results field"))?;
+    let mut chunks = vec![head_json.slice(..at), Bytes::from_static(b"\"results\":[")];
+    let mut appended = appends.iter();
+    for (i, op) in ops.iter().enumerate() {
+        if i > 0 {
+            chunks.push(Bytes::from_static(b","));
+        }
+        let mut result = guest.get(i);
+        if matches!(op, Op::Append { .. })
+            && let Some(a) = appended.next()
+        {
+            let mut parsed: api::OpResult =
+                serde_json::from_slice(&result).map_err(|e| Error::internal(format!("sandbox append result: {e}")))?;
+            if let api::OpResult::Append(r) = &mut parsed {
+                r.first_seq = Some(a.first_seq);
+            }
+            result = Bytes::from(serde_json::to_vec(&parsed).map_err(|e| Error::internal(e.to_string()))?);
+        }
+        chunks.push(result);
+    }
+    chunks.push(Bytes::from_static(b"]"));
+    chunks.push(head_json.slice(at + NO_RESULTS.len()..));
+    let body = Body::from_stream(futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::convert::Infallible>)));
+    Ok(Reply::streamed(head, body))
 }
 
 fn first_seqs(c: &Committed) -> Vec<u64> {

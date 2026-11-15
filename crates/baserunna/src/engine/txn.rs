@@ -13,28 +13,28 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Isolation {
     #[default]
     Serializable,
     Snapshot,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum ReadItem {
     Key(Bytes),
     Range(KeyRange),
 }
 
 /// A value a transaction writes, and when it expires.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Put {
     pub value: Value,
     pub ttl: Option<Ttl>,
 }
 
 /// When a written value expires.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ttl {
     /// At this store time (ms).
     Until(u64),
@@ -53,7 +53,7 @@ impl Ttl {
 }
 
 /// What a transaction asks the committer to apply.
-#[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 pub struct WriteSet {
     /// `None` = delete.
     pub puts: BTreeMap<Bytes, Option<Put>>,
@@ -102,6 +102,21 @@ impl WriteSet {
             _ => None,
         })
     }
+}
+
+/// Reads and writes of a transaction, as they cross the sandbox boundary.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct TxnEffects {
+    pub reads: Vec<ReadItem>,
+    pub pinned_reads: Vec<Bytes>,
+    pub read_expiry: Option<u64>,
+    pub pinned_expiry: Option<u64>,
+    pub writes: WriteSet,
+    pub write_bytes: usize,
+    pub read_bytes: usize,
+    pub appended: usize,
+    pub inserted: usize,
+    pub has_untracked_reads: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -545,6 +560,52 @@ impl Txn {
     /// from `lo` on, in the read set.
     pub fn note_stream_read(&mut self, id: u64, lo: u64, hi: Option<u64>) -> Result<()> {
         self.record_read(ReadItem::Range(stream::records_between(id, lo, hi)))
+    }
+
+    /// Returns this transaction's reads and writes, to run its next ops in the sandbox.
+    pub fn effects(&self) -> TxnEffects {
+        TxnEffects {
+            reads: self.reads.clone(),
+            pinned_reads: self.pinned_reads.clone(),
+            read_expiry: self.read_expiry,
+            pinned_expiry: self.pinned_expiry,
+            writes: self.writes.clone(),
+            write_bytes: self.write_bytes,
+            read_bytes: self.read_bytes,
+            appended: self.appended,
+            inserted: self.inserted,
+            has_untracked_reads: self.has_untracked_reads,
+        }
+    }
+
+    /// Replaces this transaction's reads and writes with `e`, which ops in the sandbox produced.
+    ///
+    /// Fails with `TooLarge` if `e` exceeds the transaction's read or write limit.
+    pub fn adopt_effects(&mut self, e: TxnEffects) -> Result<()> {
+        if e.write_bytes > self.max_write_bytes {
+            return Err(Error::TooLarge(format!("transaction writes exceed {} bytes", self.max_write_bytes)));
+        }
+        if e.read_bytes > self.max_read_bytes {
+            return Err(Error::TooLarge(format!("transaction read sets exceed {} bytes", self.max_read_bytes)));
+        }
+        let grown = (e.write_bytes + e.read_bytes).saturating_sub(self.write_bytes + self.read_bytes);
+        self.charge.add(grown);
+        self.reads = e.reads;
+        self.pinned_reads = e.pinned_reads;
+        self.read_expiry = e.read_expiry;
+        self.pinned_expiry = e.pinned_expiry;
+        self.writes = e.writes;
+        self.write_bytes = e.write_bytes;
+        self.read_bytes = e.read_bytes;
+        self.appended = e.appended;
+        self.inserted = e.inserted;
+        self.has_untracked_reads = e.has_untracked_reads;
+        self.admit_growth()
+    }
+
+    /// Byte limits of this transaction's writes and its read set.
+    pub fn limits(&self) -> (usize, usize) {
+        (self.max_write_bytes, self.max_read_bytes)
     }
 
     pub fn into_request(self) -> CommitRequest {

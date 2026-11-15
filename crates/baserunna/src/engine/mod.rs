@@ -29,7 +29,7 @@ pub use baserunna_api::{DbStats, LevelStats};
 pub use config::EngineConfig;
 pub use db::{CommitState, Committed, Consistency, Db};
 pub use stream::{Appended, Record, Retention, Seek, StreamOp, StreamState};
-pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn};
+pub use txn::{CommitRequest, Isolation, Put, ReadItem, ReadValue, Ttl, Txn, TxnEffects};
 pub use types::{BlobRef, Entry, Seq, Value};
 pub use version::{Change, ChangeCursor, ChangePage, ChangePos, KeyRange, Snapshot, Version};
 

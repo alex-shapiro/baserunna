@@ -147,12 +147,19 @@ fn error_from_api(status: u16, e: api::ApiError) -> Error {
 
 pub(crate) struct Reply<E: Endpoint> {
     body: E::Response,
+    /// Body to send in place of the encoding of `body`, for sandbox output that the host does not decode.
+    streamed: Option<Body>,
     headers: HeaderMap,
 }
 
 impl<E: Endpoint> Reply<E> {
     pub(crate) fn new(body: E::Response) -> Reply<E> {
-        Reply { body, headers: HeaderMap::new() }
+        Reply { body, streamed: None, headers: HeaderMap::new() }
+    }
+
+    /// Reply whose body is `streamed`, with the status and content type of `E`.
+    pub(crate) fn streamed(head: E::Response, streamed: Body) -> Reply<E> {
+        Reply { body: head, streamed: Some(streamed), headers: HeaderMap::new() }
     }
 
     pub(crate) fn header(mut self, name: http::HeaderName, value: HeaderValue) -> Reply<E> {
@@ -163,7 +170,11 @@ impl<E: Endpoint> Reply<E> {
 
 impl<E: Endpoint> IntoResponse for Reply<E> {
     fn into_response(self) -> Response {
-        let mut resp = Response::new(Body::from(self.body.encode()));
+        let body = match self.streamed {
+            Some(b) => b,
+            None => Body::from(self.body.encode()),
+        };
+        let mut resp = Response::new(body);
         *resp.status_mut() = E::STATUS;
         *resp.headers_mut() = self.headers;
         if let Some(ct) = <E::Response as api::Body>::CONTENT_TYPE {
@@ -1403,3 +1414,5 @@ mod tests {
 
 #[cfg(test)]
 mod events_tests;
+#[cfg(test)]
+mod sandbox_tests;

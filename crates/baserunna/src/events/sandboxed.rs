@@ -77,6 +77,42 @@ impl EventConfig {
     }
 }
 
+/// Input of a run of transaction ops in the sandbox, at the host transaction's snapshot.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpsInput {
+    pub db: String,
+    pub config: EventConfig,
+    pub seed: u64,
+    pub now_ms: u64,
+    /// Encoded manifest of the host transaction's snapshot version.
+    pub manifest: Vec<u8>,
+    pub etag: String,
+    pub read_time: u64,
+    pub isolation: crate::engine::Isolation,
+    pub commit_id: u64,
+    pub max_write_bytes: usize,
+    pub max_read_bytes: usize,
+    /// Reads and writes of the host transaction before these ops.
+    pub effects: crate::engine::TxnEffects,
+    /// JSON of the `api::Op` list.
+    pub ops: Vec<u8>,
+    pub encoding: baserunna_api::Encoding,
+    pub json_value_max: u64,
+    pub query_limits: crate::events::exec::Limits,
+    pub user_id: String,
+}
+
+/// Header of the output of a run of transaction ops in the sandbox.
+///
+/// The JSON of each op result follows the header; `result_ends` holds
+/// the end offset of each result after the header.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpsOutput {
+    /// Reads and writes of the transaction after the ops.
+    pub effects: crate::engine::TxnEffects,
+    pub result_ends: std::result::Result<Vec<u32>, crate::error::Error>,
+}
+
 /// Input of a part merge in the sandbox.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MergeInput {
@@ -145,7 +181,61 @@ pub struct CheckInput {
 }
 
 /// Runs event work in the node's WebAssembly sandbox, charged to the database owner.
+/// Caller settings of a run of transaction ops in the sandbox.
+pub struct OpsSettings<'a> {
+    pub owner: &'a str,
+    pub encoding: baserunna_api::Encoding,
+    pub json_value_max: u64,
+    pub query_limits: crate::events::exec::Limits,
+    pub user_id: &'a str,
+}
+
+/// JSON results of transaction ops that ran in the sandbox, charged to the owner until dropped.
+pub struct GuestOpResults {
+    body: bytes::Bytes,
+    ends: Vec<u32>,
+}
+
+impl GuestOpResults {
+    /// Checks that `ends` are ascending offsets within `body`.
+    pub fn new(body: bytes::Bytes, ends: Vec<u32>) -> Result<GuestOpResults> {
+        let mut at = 0;
+        for &end in &ends {
+            if (end as usize) < at || end as usize > body.len() {
+                return Err(crate::error::Error::internal("sandbox op result offsets out of order"));
+            }
+            at = end as usize;
+        }
+        Ok(GuestOpResults { body, ends })
+    }
+
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// JSON of the result of op `i`.
+    pub fn get(&self, i: usize) -> bytes::Bytes {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
+        self.body.slice(start..self.ends[i] as usize)
+    }
+}
+
 pub trait SandboxRunner: Send + Sync {
+    /// Runs `ops`, the JSON of an `api::Op` list, inside `txn` in the sandbox of `settings.owner`.
+    ///
+    /// The reads and writes of the ops replace those of `txn`, also when the ops fail.
+    fn exec_ops<'a>(
+        &'a self,
+        db: &'a str,
+        txn: &'a mut crate::engine::Txn,
+        ops: Vec<u8>,
+        settings: OpsSettings<'a>,
+    ) -> BoxFut<'a, Result<GuestOpResults>>;
+
     /// Runs `maint::merge_parts` over `inputs` in the sandbox.
     fn merge_parts<'a>(
         &'a self,

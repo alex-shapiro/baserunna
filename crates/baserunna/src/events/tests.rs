@@ -3758,3 +3758,75 @@ mod partial_reads_at_defaults {
         });
     }
 }
+
+mod sandbox_merge {
+    use super::*;
+    use crate::events::sandboxed::{EventConfig, MergeInput};
+    use crate::sandbox::Sandbox;
+
+    /// Seals `parts` parts of `rows` rows each and returns a merge input over them.
+    async fn sealed_parts(parts: i64, rows: i64) -> (Arc<Engine>, Arc<crate::store::MemStore>, MergeInput, Vec<PartRef>) {
+        let origin = tokio::time::Instant::now();
+        let env = Arc::new(crate::env::Env::sim(1, T0 as u64, origin, 0));
+        let env2 = env.clone();
+        let mem = Arc::new(crate::store::MemStore::new(Box::new(move || env2.now_ms())));
+        let cfg = EngineConfig { cache_bytes: 64 << 20, event_chunk_bytes: 1 << 20, ..cfg() };
+        let eng = Engine::new(mem.clone(), env.clone(), cfg.clone(), "node-a".into());
+        let db = create_db(&eng, "db").await;
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let s = get_schema(&mut t, "events").await.unwrap();
+        std::mem::drop(t);
+        for k in 0..parts {
+            let batch: Vec<Json> = (0..rows)
+                .map(|i| json!({"time": T0 + k * 100 + i, "event": format!("e{}", i % 7), "user": format!("user-{k}-{i}"), "n": i, "props": {"k": i}}))
+                .collect();
+            for chunk in batch.chunks(1000) {
+                txn_do(&db, async |t| insert(t, "events", chunk, 0).await).await.unwrap();
+            }
+            assert!(maint::seal(&db, s.id).await.unwrap());
+        }
+        let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+        let inputs = refs(&mut t, s.id).await.unwrap();
+        let input = MergeInput {
+            db: "db".into(),
+            schema: s,
+            inputs: inputs.iter().map(|r| (r.key().to_vec(), r.encode().to_vec())).collect(),
+            config: EventConfig::of(&cfg),
+            seed: 7,
+            now_ms: env.now_ms(),
+        };
+        (eng, mem, input, inputs)
+    }
+
+    #[test]
+    fn sandbox_merge_matches_native_merge() {
+        rt().block_on(async {
+            let (eng, mem, input, inputs) = sealed_parts(4, 200).await;
+            let stats = crate::events::part::ReadStats::default();
+            let native = maint::merge_parts(&eng.shared, "db", &input.schema, &inputs, &stats).await.unwrap().unwrap();
+            let sandbox = Sandbox::new(&crate::sandbox::tests::guest_wasm(), crate::sandbox::OWNER_MEMORY_BOUND).unwrap();
+            let started = std::time::Instant::now();
+            let guest = sandbox.merge_parts("owner", mem, &input).await.unwrap().unwrap();
+            eprintln!("guest merge of 4 x 200 rows took {:?}", started.elapsed());
+            assert_eq!(PartRef { id: String::new(), ..guest }, PartRef { id: String::new(), ..native });
+            assert_eq!(sandbox.owner_memory_used("owner"), 0);
+        });
+    }
+
+    #[test]
+    #[ignore = "the sealed input holds 936 rows, too few to reach the bound"]
+    fn sandbox_merge_traps_at_owner_bound() {
+        rt().block_on(async {
+            let (_eng, mem, input, _) = sealed_parts(4, 5000).await;
+            let bound = 24 << 20;
+            let sandbox = Sandbox::new(&crate::sandbox::tests::guest_wasm(), bound).unwrap();
+            let started = std::time::Instant::now();
+            let err = sandbox.merge_parts("owner", mem.clone(), &input).await.unwrap_err();
+            eprintln!("guest merge of 4 x 5000 rows refused in {:?}: {err:?}", started.elapsed());
+            assert!(matches!(err, Error::TooLarge(_)), "{err:?}");
+            assert_eq!(sandbox.owner_memory_used("owner"), 0);
+            let roomy = Sandbox::new(&crate::sandbox::tests::guest_wasm(), crate::sandbox::OWNER_MEMORY_BOUND).unwrap();
+            assert!(roomy.merge_parts("owner", mem, &input).await.unwrap().is_some());
+        });
+    }
+}

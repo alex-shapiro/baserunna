@@ -15,6 +15,7 @@ pub mod exec;
 pub mod maint;
 pub mod part;
 pub mod query;
+pub mod sandboxed;
 pub mod schema;
 
 #[cfg(test)]

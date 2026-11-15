@@ -89,25 +89,52 @@ pub extern "C" fn guest_vector_probe(n: u32) -> u32 {
 mod host {
     #[link(wasm_import_module = "baserunna")]
     unsafe extern "C" {
-        /// Starts a store GET. Returns the length of the pending reply, or a negative error code.
-        pub fn store_get(key_ptr: *const u8, key_len: u32, start: u64, end: u64, ranged: u32) -> i64;
-        /// Runs a store PUT. Returns the length of the pending reply, or a negative error code.
-        pub fn store_put(key_ptr: *const u8, key_len: u32, data_ptr: *const u8, data_len: u32, mode: u32, etag_ptr: *const u8, etag_len: u32) -> i64;
+        /// Runs a store GET and writes the data into `dst` and a `GetReply` into `reply`.
+        /// Returns the data length, -6 if `dst_cap` is too small (the reply then holds the
+        /// needed length in `size`), or another negative error code.
+        pub fn store_get(
+            key_ptr: *const u8,
+            key_len: u32,
+            start: u64,
+            end: u64,
+            ranged: u32,
+            dst: *mut u8,
+            dst_cap: u32,
+            reply: *mut u8,
+        ) -> i64;
+        /// Runs a store PUT and writes the etag into `etag_out`. Returns the etag length or a
+        /// negative error code.
+        pub fn store_put(
+            key_ptr: *const u8,
+            key_len: u32,
+            data_ptr: *const u8,
+            data_len: u32,
+            mode: u32,
+            etag_ptr: *const u8,
+            etag_len: u32,
+            etag_out: *mut u8,
+        ) -> i64;
         /// Runs a store DELETE. Returns 0, or a negative error code.
         pub fn store_delete(key_ptr: *const u8, key_len: u32) -> i64;
-        /// Copies the pending reply into `dst`.
-        pub fn take_pending(dst: *mut u8);
     }
 }
 
+/// Reply metadata of `host::store_get`.
+#[repr(C)]
+struct GetReply {
+    size: u64,
+    last_modified_ms: u64,
+    etag_len: u32,
+    etag: [u8; ETAG_MAX],
+}
+
+const ETAG_MAX: usize = 256;
+const ERR_TOO_SMALL: i64 = -6;
+/// First destination size for a GET without a range.
+const UNRANGED_GET_CAP: u64 = 1 << 20;
+
 /// Object store that reaches the node's store through host calls.
 struct HostStore;
-
-fn take_pending(len: i64) -> Vec<u8> {
-    let mut buf = vec![0u8; len as usize];
-    unsafe { host::take_pending(buf.as_mut_ptr()) };
-    buf
-}
 
 fn store_error(code: i64) -> baserunna::store::StoreError {
     use baserunna::store::StoreError;
@@ -128,18 +155,38 @@ impl baserunna::store::ObjectStore for HostStore {
     ) -> baserunna::store::BoxFut<'a, baserunna::store::SResult<baserunna::store::GetResult>> {
         Box::pin(async move {
             let (start, end, ranged) = opts.range.map_or((0, 0, 0), |r| (r.start, r.end, 1));
-            let n = unsafe { host::store_get(key.as_ptr(), key.len() as u32, start, end, ranged) };
-            if n < 0 {
-                return Err(store_error(n));
+            let mut cap = if ranged == 1 { end.saturating_sub(start) } else { UNRANGED_GET_CAP };
+            loop {
+                let mut dst = Vec::<u8>::with_capacity(cap as usize);
+                let mut reply = GetReply { size: 0, last_modified_ms: 0, etag_len: 0, etag: [0; ETAG_MAX] };
+                let n = unsafe {
+                    host::store_get(
+                        key.as_ptr(),
+                        key.len() as u32,
+                        start,
+                        end,
+                        ranged,
+                        dst.as_mut_ptr(),
+                        cap as u32,
+                        (&raw mut reply).cast(),
+                    )
+                };
+                if n == ERR_TOO_SMALL {
+                    cap = reply.size;
+                    continue;
+                }
+                if n < 0 {
+                    return Err(store_error(n));
+                }
+                unsafe { dst.set_len(n as usize) };
+                let etag = String::from_utf8_lossy(&reply.etag[..reply.etag_len as usize]).into_owned();
+                return Ok(baserunna::store::GetResult {
+                    data: bytes::Bytes::from(dst),
+                    etag,
+                    size: reply.size,
+                    last_modified_ms: reply.last_modified_ms,
+                });
             }
-            let reply = take_pending(n);
-            let etag_len = u32::from_le_bytes(reply[0..4].try_into().unwrap()) as usize;
-            let etag = String::from_utf8_lossy(&reply[4..4 + etag_len]).into_owned();
-            let at = 4 + etag_len;
-            let size = u64::from_le_bytes(reply[at..at + 8].try_into().unwrap());
-            let last_modified_ms = u64::from_le_bytes(reply[at + 8..at + 16].try_into().unwrap());
-            let data = bytes::Bytes::from(reply).slice(at + 16..);
-            Ok(baserunna::store::GetResult { data, etag, size, last_modified_ms })
         })
     }
 
@@ -156,13 +203,23 @@ impl baserunna::store::ObjectStore for HostStore {
                 PutMode::Create => (1, ""),
                 PutMode::IfMatch(e) => (2, e.as_str()),
             };
+            let mut out = [0u8; ETAG_MAX];
             let n = unsafe {
-                host::store_put(key.as_ptr(), key.len() as u32, data.as_ptr(), data.len() as u32, mode, etag.as_ptr(), etag.len() as u32)
+                host::store_put(
+                    key.as_ptr(),
+                    key.len() as u32,
+                    data.as_ptr(),
+                    data.len() as u32,
+                    mode,
+                    etag.as_ptr(),
+                    etag.len() as u32,
+                    out.as_mut_ptr(),
+                )
             };
             if n < 0 {
                 return Err(store_error(n));
             }
-            Ok(String::from_utf8_lossy(&take_pending(n)).into_owned())
+            Ok(String::from_utf8_lossy(&out[..n as usize]).into_owned())
         })
     }
 
@@ -185,34 +242,16 @@ impl baserunna::store::ObjectStore for HostStore {
     }
 }
 
-/// Input of `guest_merge_parts`.
-#[derive(serde::Deserialize)]
-struct MergeInput {
-    db: String,
-    schema: baserunna::events::schema::EventSchema,
-    /// Part reference keys and encodings, hex.
-    inputs: Vec<(String, String)>,
-    seed: u64,
-    now_ms: u64,
-}
-
-fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or(0)).collect()
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-/// Merges event parts with the node's `merge_parts` and returns the new part reference.
+/// Merges event parts with the node's `merge_parts`.
 ///
-/// Returns 0 with `[key_hex, ref_hex]` JSON output, 2 if no rows remain, and 1 with
-/// an error message.
+/// Returns 0 with the JSON `[key, encoded part reference]` of the new part, 2 if no
+/// rows remain, and 1 with an error message.
 ///
 /// # Safety
 /// `ptr` and `len` must name `len` initialized bytes from `guest_alloc`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn guest_merge_parts(ptr: *const u8, len: u32) -> u32 {
+    use baserunna::events::sandboxed::MergeInput;
     let body = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     let input: MergeInput = match serde_json::from_slice(body) {
         Ok(i) => i,
@@ -227,12 +266,12 @@ pub unsafe extern "C" fn guest_merge_parts(ptr: *const u8, len: u32) -> u32 {
         let engine = baserunna::engine::Engine::new(
             std::sync::Arc::new(HostStore),
             std::sync::Arc::new(env),
-            baserunna::engine::EngineConfig::default(),
+            input.config.engine_config(),
             "guest".into(),
         );
         let mut refs = Vec::new();
         for (k, v) in &input.inputs {
-            let r = baserunna::engine::events::PartRef::decode(&unhex(k), &unhex(v))
+            let r = baserunna::engine::events::PartRef::decode(k, v)
                 .map_err(|_| baserunna::Error::internal("corrupt part reference"))?;
             refs.push(r);
         }
@@ -241,7 +280,7 @@ pub unsafe extern "C" fn guest_merge_parts(ptr: *const u8, len: u32) -> u32 {
     });
     match out {
         Ok(Some(r)) => {
-            set_output(serde_json::to_vec(&(hex(&r.key()), hex(&r.encode()))).unwrap_or_default());
+            set_output(serde_json::to_vec(&(r.key().to_vec(), r.encode().to_vec())).unwrap_or_default());
             0
         }
         Ok(None) => 2,

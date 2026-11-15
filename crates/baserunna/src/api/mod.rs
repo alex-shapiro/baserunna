@@ -644,7 +644,6 @@ pub const HOST_ROUTES: &[(&str, HostRouteKind)] = &[
     ("/v1/dbs/{db}/tables/{t}/rows/get", HostRouteKind::NotMoved),
     ("/v1/dbs/{db}/tables/{t}/rows/update", HostRouteKind::NotMoved),
     ("/v1/dbs/{db}/tables/{t}/rows/delete", HostRouteKind::NotMoved),
-    ("/v1/dbs/{db}/tables/{t}/rows/query", HostRouteKind::NotMoved),
     ("/v1/dbs/{db}/tables/{t}/changes", HostRouteKind::NotMoved),
     ("/v1/dbs/{db}/streams", HostRouteKind::NotMoved),
     ("/v1/dbs/{db}/streams/{s}", HostRouteKind::NotMoved),

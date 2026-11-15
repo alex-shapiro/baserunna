@@ -100,3 +100,40 @@ fn host_reads_of_a_sandboxed_database_fail() {
         assert!(other.is_ok(), "the scope denies only its own database");
     });
 }
+
+#[test]
+fn table_queries_in_sandbox_match_native() {
+    run_paused(async {
+        let (native, native_token) = world_with_db("tq-native@api.test").await;
+        let (guest, guest_token) = world_with_db("tq-guest@api.test").await;
+        let runner = set_sandbox(&guest, OWNER_MEMORY_BOUND);
+        let table = json!({"name": "t", "primary_key": ["id"], "columns": [
+            {"name": "id", "type": "int", "nullable": false}, {"name": "tag", "type": "string"}]});
+        let rows: Vec<Json> = (0..300).map(|i| json!({"id": i, "tag": format!("t{}", i % 16)})).collect();
+        let queries = [
+            json!({"filter": {"col": "tag", "op": "eq", "value": "no such tag"}}),
+            json!({"filter": {"col": "tag", "op": "eq", "value": "t3"}, "limit": 5}),
+            json!({"limit": 2, "reverse": true}),
+            json!({"bogus": 1}),
+        ];
+        for (w, token) in [(&native, &native_token), (&guest, &guest_token)] {
+            let router = w.node(0).router().unwrap();
+            let r = call_router(&router, "POST", "/v1/dbs/d/tables", token, Bytes::from(table.to_string())).await;
+            assert!(r.status == 200 || r.status == 201, "{}", String::from_utf8_lossy(&r.body));
+            let body = Bytes::from(json!({"rows": rows}).to_string());
+            let r = call_router(&router, "POST", "/v1/dbs/d/tables/t/rows", token, body).await;
+            assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        }
+        for q in &queries {
+            let mut out = Vec::new();
+            for (w, token) in [(&native, &native_token), (&guest, &guest_token)] {
+                let router = w.node(0).router().unwrap();
+                let r = call_router(&router, "POST", "/v1/dbs/d/tables/t/rows/query", token, Bytes::from(q.to_string())).await;
+                let body: Json = serde_json::from_slice(&r.body).unwrap();
+                out.push((r.status, body));
+            }
+            assert_eq!(out[1], out[0], "query {q}");
+        }
+        assert!(runner.sandbox.last_instance_peak() > 0, "the queries ran in an instance");
+    });
+}

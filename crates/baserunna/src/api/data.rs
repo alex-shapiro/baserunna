@@ -1075,10 +1075,47 @@ fn with_version(mut out: Json, v: u64) -> Json {
     out
 }
 
-async fn query_rows(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, JsonBody(b): JsonBody<Json>) -> Result<J> {
+async fn query_rows(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+    JsonBody(b): JsonBody<Json>,
+) -> Result<Response> {
     let name = param(&p, "t")?.to_string();
     let (b, c) = split_consistency(b)?;
-    let q: Query = serde_json::from_value(b).map_err(|e| Error::invalid(format!("invalid query: {e}")))?;
-    let (r, v) = with_read!(ctx.db, c, |t| table::query(t, &name, &q).await);
-    Ok(axum::Json(json!({"rows": r.rows, "next_cursor": r.next_cursor, "version": v})))
+    let Some(sandbox) = ctx.db.shared().sandbox.get().cloned() else {
+        let q: Query = serde_json::from_value(b).map_err(|e| Error::invalid(format!("invalid query: {e}")))?;
+        let (r, v) = with_read!(ctx.db, c, |t| table::query(t, &name, &q).await);
+        return Ok(axum::Json(json!({"rows": r.rows, "next_cursor": r.next_cursor, "version": v})).into_response());
+    };
+    let _: Query = serde_json::from_value(b.clone()).map_err(|e| Error::invalid(format!("invalid query: {e}")))?;
+    let mut op = b;
+    op["op"] = json!("query_rows");
+    op["table"] = json!(name);
+    let ops = serde_json::to_vec(&[op]).map_err(|e| Error::internal(format!("query op: {e}")))?;
+    let settings = OpsSettings {
+        owner: &ctx.rec.owner_id,
+        encoding: api::Encoding::default(),
+        json_value_max: node.cfg.json_value_max,
+        query_limits: node.cfg.query_limits,
+        user_id: &ctx.principal.user.id,
+    };
+    let (r, v) = with_read!(ctx.db, c, |t| sandbox.exec_ops(&ctx.db.id, t, ops, settings).await);
+    guest_object_with_version(r, v)
+}
+
+/// Response that holds the single sandbox op result in `results`, a JSON object, with a `version` field added.
+fn guest_object_with_version(results: GuestOpResults, version: u64) -> Result<Response> {
+    if results.len() != 1 {
+        return Err(Error::internal("sandbox returned a result count that differs from the op count"));
+    }
+    let object = results.get(0);
+    if object.last() != Some(&b'}') {
+        return Err(Error::internal("sandbox op result is not a JSON object"));
+    }
+    let chunks = [object.slice(..object.len() - 1), Bytes::from(format!(",\"version\":{version}}}"))];
+    let body = Body::from_stream(futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::convert::Infallible>)));
+    let mut resp = Response::new(body);
+    resp.headers_mut().insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(resp)
 }

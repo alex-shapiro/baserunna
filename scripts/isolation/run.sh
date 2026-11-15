@@ -88,6 +88,11 @@ export BASERUNNA_LISTEN=127.0.0.1:$NODE_PORT BASERUNNA_SIGNUP=open BASERUNNA_CGR
 if [ "$WORKLOAD" = kv_throughput ]; then
   export BASERUNNA_USER_RPS=0 BASERUNNA_API_KEY_RPS=0 BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT=0
 fi
+# The idle cost setup signs up 1,000 owners from one client address. The per-client auth limit
+# turns off only at inf. Fewer PBKDF2 iterations keep the 1,000 password hashes short.
+if [ "$WORKLOAD" = idle_cost ]; then
+  export BASERUNNA_AUTH_RPS_PER_CLIENT=inf BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT=0 BASERUNNA_PBKDF2_ITERATIONS=1000
+fi
 GO=$WORK/go
 sh -c 'while [ ! -e "$0" ]; do sleep 0.01; done; exec "$1"' "$GO" "$NODE_BIN" >"$WORK/node.log" 2>&1 &
 NODE_PID=$!
@@ -122,4 +127,4 @@ if [ -f "$OUT" ]; then
     "$OUT" >"$WORK/out.json" && mv "$WORK/out.json" "$OUT"
 fi
 echo "result: $OUT"
-jq -c '{workload, variant, conditions, kv_throughput: (.kv_throughput.result // null), run, error}' "$OUT" 2>/dev/null || true
+jq -c '{workload, variant, conditions, kv_throughput: (.kv_throughput.result // null), idle_cost: (.idle_cost.summary // null), run, error}' "$OUT" 2>/dev/null || true

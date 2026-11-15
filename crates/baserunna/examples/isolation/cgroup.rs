@@ -37,12 +37,37 @@ impl NodeCgroup {
         self.keyed("cpu.stat", "usage_usec")
     }
 
+    /// Process count and descendant cgroup count of the node cgroup's subtree.
+    pub fn subtree_census(&self) -> SubtreeCensus {
+        let mut census = SubtreeCensus::default();
+        let mut dirs = vec![self.0.clone()];
+        while let Some(dir) = dirs.pop() {
+            if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
+                census.processes += procs.lines().filter(|l| !l.trim().is_empty()).count();
+            }
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    census.cgroups += 1;
+                    dirs.push(entry.path());
+                }
+            }
+        }
+        census
+    }
+
     pub fn exists(&self) -> bool {
         Path::new(&self.0).join("memory.current").exists()
     }
 }
 
-/// Summary of `memory.current` samples taken every 10 ms.
+/// Processes and descendant cgroups in the node cgroup's subtree.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct SubtreeCensus {
+    pub processes: usize,
+    pub cgroups: usize,
+}
+
+/// Summary of `memory.current` samples taken at a fixed interval.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct MemorySamples {
     pub start_bytes: u64,
@@ -54,14 +79,19 @@ pub struct MemorySamples {
     pub peak_mib_per_second: Vec<f64>,
 }
 
-/// Background thread that samples `memory.current` every 10 ms.
+/// Background thread that samples `memory.current` at a fixed interval.
 pub struct MemorySampler {
     stop: Arc<AtomicBool>,
     thread: std::thread::JoinHandle<MemorySamples>,
 }
 
 impl MemorySampler {
+    /// Starts sampling every 10 ms.
     pub fn start(cg: NodeCgroup) -> MemorySampler {
+        MemorySampler::start_every(cg, Duration::from_millis(10))
+    }
+
+    pub fn start_every(cg: NodeCgroup, interval: Duration) -> MemorySampler {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let thread = std::thread::spawn(move || {
@@ -81,7 +111,7 @@ impl MemorySampler {
                     let slot = &mut out.peak_mib_per_second[second];
                     *slot = slot.max((mib * 10.0).round() / 10.0);
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(interval);
             }
             out.growth_bytes = out.peak_bytes.saturating_sub(start);
             out

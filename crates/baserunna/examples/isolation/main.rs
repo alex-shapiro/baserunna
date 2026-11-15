@@ -8,6 +8,7 @@
 //!     --workload <name> --variant small|attack --out result.json [--node-pid PID]
 //! isolation --node ... --cgroup ... --workload event_scan --out result.json [--rounds 20]
 //! isolation --node ... --cgroup ... --workload kv_throughput --out result.json [--clients 64 | --find-saturation]
+//! isolation --node ... --cgroup ... --workload idle_cost --out result.json
 //! ```
 //!
 //! A workload run has three phases. Phase A runs the victim alone. Phase B runs the attacker
@@ -18,6 +19,7 @@
 mod cgroup;
 mod event_scan;
 mod http;
+mod idle_cost;
 mod kv_throughput;
 mod victim;
 mod workloads;
@@ -53,7 +55,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: isolation --node URL --cgroup DIR --workload NAME [--variant small|attack] --out FILE \
          [--node-pid PID] [--deadline-ms 10000] [--victim-secs 15] [--victim-rps 400] [--rounds 20] [--clients 64] [--find-saturation]\n\
-         workloads: {} event_scan kv_throughput",
+         workloads: {} event_scan kv_throughput idle_cost",
         workloads::NAMES.join(" ")
     );
     std::process::exit(2)
@@ -175,6 +177,11 @@ async fn run(a: &Args, watch: &NodeWatch, out: &mut Json) -> Result<(), String> 
     let client_timeout = 6 * a.deadline + Duration::from_secs(60);
     let api = Arc::new(Api::new(&a.node, client_timeout));
     api.wait_healthy(Duration::from_secs(60)).await?;
+    if a.workload == "idle_cost" {
+        out["idle_cost"] = idle_cost::run(&api, &a.cgroup).await?;
+        out["node_survived"] = json!(watch.alive() && watch.new_oom_kills() == 0);
+        return Ok(());
+    }
     if a.workload == "kv_throughput" {
         out["kv_throughput"] = kv_throughput::run(&api, &a.node, &a.cgroup, a.clients, a.find_saturation).await?;
         out["node_survived"] = json!(watch.alive() && watch.new_oom_kills() == 0);

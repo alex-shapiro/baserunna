@@ -43,3 +43,11 @@ harness = false
 [[example]]
 name = "loadgen"
 required-features = ["cloud"]
+
+[[example]]
+name = "fake_s3_server"
+required-features = ["cloud"]
+
+[[example]]
+name = "isolation"
+required-features = ["cloud"]

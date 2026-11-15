@@ -153,8 +153,9 @@ One host tokio task drives each instance. It loops:
   The boundary does the work. The host applies only what the boundary
   computed, after a size check and a charge (item 3).
 - A `not_owner` result after a request ran comes back as a fixed-size
-  status. The host forwards the request only if it still holds the whole
-  body, up to a fixed 1 MiB. Otherwise the client gets a retryable 503.
+  status. The host forwards the request only if the whole body fit in its
+  one 16 KiB chunk, which the host still holds. Otherwise the client gets a
+  retryable 503. So forwarding adds no host buffer.
 
 ### 1.6 How CPU is bounded
 
@@ -237,7 +238,7 @@ the item of the requirement. "Planned" paths do not exist yet.
 | Look up the database record: name cache, miss goes to the system instance | 1 | `node.rs` `name_cache`, planned `SystemInstance::db_record` |
 | Org and role caches, fixed entry count and entry size | 1 | `node.rs:296`, `:298` `TtlCache` with planned caps |
 | Route: host lease table, rendezvous, peer address | 1 | `node.rs:733` `route`, changed to read only the lease table |
-| Forward a request to a peer, with a fixed held-body limit | 2 | `api/mod.rs:460` `db_routing`, `:676` `tag_forward` |
+| Forward a request to a peer; after `not_owner`, only a body of one 16 KiB chunk | 2 | `api/mod.rs:460` `db_routing`, `:676` `tag_forward` |
 | Forward dedup table: ids only, fixed entry count | 1 | `cluster::ForwardDedup`; the replay bodies move to the guest (today `api/mod.rs:790` `dedup_forwarded` holds whole bodies) |
 | Rate limiter per client, fixed entries | 1 | `node.rs:306` `limiter` |
 | Per-owner limit on requests in flight | 2 | planned `sandbox::OwnerSlots` |

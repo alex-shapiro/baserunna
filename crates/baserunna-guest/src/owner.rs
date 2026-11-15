@@ -6,6 +6,7 @@
 //! the task that waits on a ticket resumes when the host completes it.
 
 use baserunna::engine::{Consistency, Engine, Isolation, Value};
+use baserunna::node::{Node, NodeConfig};
 use baserunna::env::SIM_TASK_POLLS;
 use baserunna::store::{BoxFut, GetOpts, GetResult, ListPage, ObjectStore, PutMode, SResult, StoreError};
 use bytes::Bytes;
@@ -62,9 +63,10 @@ struct TicketSlot {
     waker: Option<Waker>,
 }
 
-/// Engine and executor of this owner instance.
+/// Node and executor of this owner instance.
 struct OwnerRuntime {
     rt: tokio::runtime::Runtime,
+    node: Arc<Node>,
     engine: Arc<Engine>,
 }
 
@@ -245,11 +247,13 @@ fn decode_list(mut buf: &[u8]) -> Option<ListPage> {
 pub extern "C" fn owner_start(seed: u64, now_ms: u64) {
     let _ = baserunna::engine::OWN_LEASE_SINK.set(|db, left_ms| unsafe { host::lease_noted(db.as_ptr(), db.len() as u32, left_ms) });
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
-    let engine = rt.block_on(async {
+    let node = rt.block_on(async {
         let env = baserunna::env::Env::sim(seed, now_ms, tokio::time::Instant::now(), 0);
-        Engine::new(Arc::new(TicketStore), Arc::new(env), baserunna::engine::EngineConfig::default(), "owner".into())
+        Node::create_in_instance(NodeConfig::default(), Arc::new(env), Arc::new(TicketStore))
     });
-    OWNER_RUNTIME.with(|r| *r.borrow_mut() = Some(std::rc::Rc::new(OwnerRuntime { rt, engine })));
+    let node = node.expect("the default node configuration is valid");
+    let engine = node.engine.clone();
+    OWNER_RUNTIME.with(|r| *r.borrow_mut() = Some(std::rc::Rc::new(OwnerRuntime { rt, node, engine })));
 }
 
 fn owner_runtime() -> std::rc::Rc<OwnerRuntime> {

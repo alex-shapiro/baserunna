@@ -108,22 +108,30 @@ Each line: what it does | allowed item | code path (today, or planned).
 21. Health endpoint: fixed text | 4 | `api/mod.rs` `healthz` (today).
 22. Drain and shutdown: stop new requests, send `Stop` to each worker, wait for each `populated 0` | 4 | `main.rs` shutdown, `node.rs` `shutdown` (today; planned: workers release their own leases).
 
-**Status after round 5 (commit 882af90).** The node process no longer
-opens a tenant database on the request path: `db_routing` sends each
-database request to the owner's worker without a manifest read, and
-workers commit and bind their own databases. These node-process uses of
-a tenant `Db` remain, and each one breaks the requirement until it moves:
+**Status after round 6 (commit 538bdb4).** The node process opens no
+tenant database on any path that I know of. Account deletion, the create
+retry, and the reaper's purge run their database work as worker jobs.
+Peer binds and console database pages stream to the owner's worker.
+These parts of the requirement are still unmet:
 
-- user deletion marks each database deleted (code, `node.rs:1299`);
-- database deletion runs `mark_deleted` in the handler (code,
-  `api/data.rs:189`); this handler now runs in the worker, but the
-  console's delete path still calls it from the node process (inferred);
-- the retry of a create after an interrupted deletion (code,
-  `api/data.rs:150`);
-- the reaper's purge (code, `node.rs:1625`);
-- `POST /internal/v1/events/bind` (code, `api/events.rs:497`);
-- console database pages render tenant data in the node process, and
-  the upload page reads the whole body (code, `console/db.rs:486`).
+1. Account, org, and token routes, the database list and create, and
+   the console pages outside `/console/dbs/{db}` run in the node process.
+   The anonymous, user, and org workers are not built.
+2. The node process holds the `SYS_DB` lease and runs its committer,
+   flush, compaction, and sweep, the reaper scan, session expiry, and
+   `run_meta` (code, `node.rs` `run_meta`, `reap_deleted`). The system
+   worker is not built.
+3. A worker that serves a database route that runs a meta command calls
+   `run_meta` against `SYS_DB` under the node's ID (inferred from
+   `node.rs` `run_meta`). Two processes can then act as the `SYS_DB`
+   lease holder.
+4. The node process still parses `/internal/v1/meta` and
+   `/internal/v1/notice` bodies. Notices do not reach workers.
+5. Forward dedup slots still keep whole responses in the node process
+   (code, `api/mod.rs` `dedup_forwarded`). Peer routing uses rendezvous
+   only, with no redirect to the lease holder.
+6. No guard and no route tests.
+7. No connection limits and no explicit hyper limits.
 
 **Cgroup layout (changed in round 5).** Each worker runs in its owner's
 cgroup itself, `<root>/owner-<id>`, one level below the node's cgroup.

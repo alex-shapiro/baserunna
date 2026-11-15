@@ -87,7 +87,7 @@ fn encode_list(page: &crate::store::ListPage) -> Vec<u8> {
     out
 }
 
-fn link_owner_calls(linker: &mut Linker<GuestState>) -> wasmtime::Result<()> {
+pub(super) fn link_owner_calls(linker: &mut Linker<GuestState>) -> wasmtime::Result<()> {
     const M: &str = "baserunna_owner";
     linker.func_wrap(
         M,

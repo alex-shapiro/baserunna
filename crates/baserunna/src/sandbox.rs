@@ -372,6 +372,7 @@ impl Sandbox {
         let module = Module::new(&engine, guest_wasm).map_err(sandbox_err)?;
         let mut linker = Linker::new(&engine);
         link_host_calls(&mut linker).map_err(sandbox_err)?;
+        owner::link_owner_calls(&mut linker).map_err(sandbox_err)?;
         Ok(Sandbox {
             engine,
             module,

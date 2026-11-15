@@ -119,23 +119,22 @@ old item 18; the system worker sends the store time with each answer).
 
 | Cache | Entry count | Largest entry | Code |
 | --- | --- | --- | --- |
-| `auth_cache` (token hash → `Principal`) | today 100,000; planned 4,096 | planned 1 KiB | `node.rs:330`, `:360` |
-| `name_cache` (owner, name → `DbRecord`) | today 100,000; planned 4,096 | planned 1 KiB | `node.rs:361` |
-| `org_cache` (id → `Org`) | today 100,000; planned 4,096 | planned 1 KiB | `node.rs:362` |
-| `role_cache` (org, user → `Role`) | today 100,000; planned 4,096 | planned 1 KiB | `node.rs:363` |
-| limiter buckets and failures | today 100,000 keys; planned 16,384 | planned 512 B key | `limits.rs:138` |
+| `auth_cache` (token hash → `Principal`) | 4,096 | 1 KiB | `node.rs:330`, `:360`; `util/ttl.rs` |
+| `name_cache` (owner, name → `DbRecord`) | 4,096 | 1 KiB | `node.rs:361` |
+| `org_cache` (id → `Org`) | 4,096 | 1 KiB | `node.rs:362` |
+| `role_cache` (org, user → `Role`) | 4,096 | 1 KiB | `node.rs:363` |
+| limiter buckets and failures | 16,384 keys | planned 512 B key (not built) | `limits.rs:138` |
 
-- **Today the entry count is fixed** at 100,000 per cache (code,
-  `node.rs:330`; `util/ttl.rs:31`). Negative entries count too, so an
-  attacker fills a cache cheaply with names that do not exist (code,
-  `util/ttl.rs:27` stores `Option<V>`).
+- **The entry count is fixed** at 4,096 per cache (code, `node.rs:330`;
+  `util/ttl.rs` `store`). A miss stores no entry: `store` with `None`
+  removes the key (code, `util/ttl.rs` `store`).
 - **Today the entry size is fixed only in part.** An email is at most
   254 bytes (code, `auth.rs:45`). A database name is at most 63 bytes
   (code, `meta/mod.rs:194`). An org name is at most 39 bytes (code,
   `meta/org.rs:154`). `User.google_sub` and `User.password_hash` have no
   length check in our code (inferred: a search found none).
-- **Planned fix.** `TtlCache::store` refuses an entry whose encoded key
-  plus value is over 1 KiB. Such a request reads from the system worker
+- **Built in round 4.** `TtlCache::store` refuses an entry whose JSON
+  key plus value is over 1 KiB (code, `util/ttl.rs` `TTL_ENTRY_BYTES_MAX`). Such a request reads from the system worker
   each time and is not cached. The count drops to 4,096. So the four
   caches hold at most 4 × 4,096 × 1 KiB = 16 MiB (inferred bound from
   the planned limits). The limiter holds at most 16,384 × 512 B = 8 MiB.

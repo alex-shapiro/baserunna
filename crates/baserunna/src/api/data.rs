@@ -478,11 +478,22 @@ pub(super) fn commit_hex(id: u64) -> String {
     format!("{id:016x}")
 }
 
+/// The largest number of ops in a read-only transaction that the node runs in its own process.
+const LIGHT_READ_OPS_MAX: usize = 16;
+
+/// Returns true if read-only `ops` read at most [`LIGHT_READ_OPS_MAX`] single keys, so the
+/// node process runs them. A worker in the owner's cgroup runs every other read-only transaction.
+fn is_light_read(ops: &[Op]) -> bool {
+    ops.len() <= LIGHT_READ_OPS_MAX && ops.iter().all(|o| matches!(o, Op::Get { .. }))
+}
+
 async fn one_shot(
     State(node): State<Arc<Node>>,
     Extension(ctx): Extension<DbCtx>,
     Req(req): Req<api::Txn>,
 ) -> Result<Reply<api::Txn>> {
+    let request = node.engine.shared.workers.get().map(|_| serde_json::to_value(&req)).transpose();
+    let request = request.map_err(|e| Error::internal(e.to_string()))?;
     let ops = ops::parse_ops(req.ops)?;
     let writes = ops.iter().any(|o| o.is_write());
     if writes {
@@ -491,6 +502,17 @@ async fn one_shot(
     let c = consistency_from(req.consistency, req.max_staleness_ms);
     if writes && c != Consistency::Strong {
         return Err(Error::invalid("transactions with writes must use strong consistency"));
+    }
+    if let (Some(w), Some(request)) = (node.engine.shared.workers.get(), request)
+        && !writes
+        && !is_light_read(&ops)
+    {
+        let wait = ctx.deadline.instant().saturating_duration_since(tokio::time::Instant::now());
+        let (body, _) = with_read!(ctx.db, c, |t| {
+            w.read_txn(&ctx.rec.owner_id, &ctx.db.id, t, request, node.cfg.json_value_max, &node.cfg.query_limits, wait)
+                .await
+        });
+        return Ok(Reply::encoded(body));
     }
     let octx = op_ctx(&node, &ctx, req.encoding);
     // Ignore idempotency keys on read-only requests so a failed check cannot abort a write key without write permission.
@@ -999,10 +1021,22 @@ fn with_version(mut out: Json, v: u64) -> Json {
     out
 }
 
-async fn query_rows(Extension(ctx): Extension<DbCtx>, Path(p): PathMap, JsonBody(b): JsonBody<Json>) -> Result<J> {
+async fn query_rows(
+    State(node): State<Arc<Node>>,
+    Extension(ctx): Extension<DbCtx>,
+    Path(p): PathMap,
+    JsonBody(b): JsonBody<Json>,
+) -> Result<Response> {
     let name = param(&p, "t")?.to_string();
     let (b, c) = split_consistency(b)?;
+    if let Some(w) = node.engine.shared.workers.get() {
+        let wait = ctx.deadline.instant().saturating_duration_since(tokio::time::Instant::now());
+        let (body, _) = with_read!(ctx.db, c, |t| w.table_query(&ctx.rec.owner_id, t, &name, b, wait).await);
+        let mut resp = Response::new(axum::body::Body::from(body));
+        resp.headers_mut().insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+        return Ok(resp);
+    }
     let q: Query = serde_json::from_value(b).map_err(|e| Error::invalid(format!("invalid query: {e}")))?;
     let (r, v) = with_read!(ctx.db, c, |t| table::query(t, &name, &q).await);
-    Ok(axum::Json(json!({"rows": r.rows, "next_cursor": r.next_cursor, "version": v})))
+    Ok(axum::Json(json!({"rows": r.rows, "next_cursor": r.next_cursor, "version": v})).into_response())
 }

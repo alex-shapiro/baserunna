@@ -70,6 +70,24 @@ enum Job {
         schema: EventSchema,
         state: Vec<u8>,
     },
+    /// Runs the ops of a read-only one-shot transaction request at a snapshot whose encoded
+    /// manifest is the job's payload, and returns the JSON response body as the result's payload.
+    ReadTxn {
+        db: String,
+        etag: String,
+        read_time: u64,
+        request: serde_json::Value,
+        json_value_max: u64,
+        limits: (u64, usize, usize, u64),
+    },
+    /// Runs table query `query` on table `table` at a snapshot whose encoded manifest is the
+    /// job's payload, and returns the JSON response body as the result's payload.
+    TableQuery {
+        etag: String,
+        read_time: u64,
+        table: String,
+        query: serde_json::Value,
+    },
     BulkInsert {
         db: String,
         schema: EventSchema,
@@ -87,7 +105,7 @@ enum JobResult {
     BlobDecimal(Option<i64>),
     /// The last sealed row as `(version, ordinal)`, the sealed row and byte counts, and the written parts.
     Sealed(Option<((u64, u32), u64, u64, Vec<(Vec<u8>, Vec<u8>)>)>),
-    /// The query's JSON response body is the result's payload.
+    /// The JSON response body of a query or a read-only transaction is the result's payload.
     Queried,
     /// The body's idempotency key and, on success, the encoded [`Bind`] as the payload.
     Staged {
@@ -219,6 +237,59 @@ impl WorkerPool {
         drop(version);
         // The worker enforces the query deadline; the extra second lets its own error arrive first.
         let deadline = Duration::from_millis(limits.max_ms) + Duration::from_secs(1);
+        match self.run(owner, job, manifest, deadline).await? {
+            (JobResult::Queried, body) => Ok(body),
+            (JobResult::Failed(e), _) => Err(crate::api::error_from_json(500, &e)),
+            _ => Err(Error::internal("the worker returned a result of another job")),
+        }
+    }
+
+    /// Runs read-only one-shot transaction `request` on `txn`'s snapshot in a worker inside
+    /// `owner`'s cgroup and returns the JSON response body.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn read_txn(
+        &self,
+        owner: &str,
+        db: &str,
+        txn: &mut crate::engine::Txn,
+        request: serde_json::Value,
+        json_value_max: u64,
+        limits: &crate::events::exec::Limits,
+        deadline: Duration,
+    ) -> Result<Bytes> {
+        let version = txn.untracked_snapshot().clone();
+        let job = Job::ReadTxn {
+            db: db.to_string(),
+            etag: version.etag.clone(),
+            read_time: txn.read_time,
+            request,
+            json_value_max,
+            limits: (limits.max_bytes_read, limits.max_memory_bytes, limits.lookup_max_bytes, limits.max_ms),
+        };
+        let manifest = version.m.encode();
+        drop(version);
+        match self.run(owner, job, manifest, deadline).await? {
+            (JobResult::Queried, body) => Ok(body),
+            (JobResult::Failed(e), _) => Err(crate::api::error_from_json(500, &e)),
+            _ => Err(Error::internal("the worker returned a result of another job")),
+        }
+    }
+
+    /// Runs table query `query` on `txn`'s snapshot in a worker inside `owner`'s cgroup and
+    /// returns the JSON response body.
+    pub async fn table_query(
+        &self,
+        owner: &str,
+        txn: &mut crate::engine::Txn,
+        table: &str,
+        query: serde_json::Value,
+        deadline: Duration,
+    ) -> Result<Bytes> {
+        let version = txn.untracked_snapshot().clone();
+        let job =
+            Job::TableQuery { etag: version.etag.clone(), read_time: txn.read_time, table: table.to_string(), query };
+        let manifest = version.m.encode();
+        drop(version);
         match self.run(owner, job, manifest, deadline).await? {
             (JobResult::Queried, body) => Ok(body),
             (JobResult::Failed(e), _) => Err(crate::api::error_from_json(500, &e)),
@@ -511,11 +582,11 @@ pub async fn serve(store: crate::store::DynStore, cfg: EngineConfig) -> std::io:
     });
     let mut stdin = tokio::io::stdin();
     while let Ok((job_id, header, payload)) = read_job_frame(&mut stdin).await {
-        let shared = engine.shared.clone();
+        let engine = engine.clone();
         let results = results.clone();
         tokio::spawn(async move {
             let (result, out) = match serde_json::from_slice::<Job>(&header) {
-                Ok(job) => run_job(&shared, job, payload).await,
+                Ok(job) => run_job(&engine, job, payload).await,
                 Err(e) => (
                     JobResult::Failed(json!({ "error": crate::api::error_json(&Error::internal(e.to_string())) })),
                     Bytes::new(),
@@ -529,7 +600,8 @@ pub async fn serve(store: crate::store::DynStore, cfg: EngineConfig) -> std::io:
     writer.await.map_err(std::io::Error::other)?
 }
 
-async fn run_job(shared: &Arc<Shared>, job: Job, payload: Bytes) -> (JobResult, Bytes) {
+async fn run_job(engine: &Arc<crate::engine::Engine>, job: Job, payload: Bytes) -> (JobResult, Bytes) {
+    let shared = &engine.shared;
     let failed =
         |e: Error| (JobResult::Failed(serde_json::json!({ "error": crate::api::error_json(&e) })), Bytes::new());
     match job {
@@ -582,6 +654,29 @@ async fn run_job(shared: &Arc<Shared>, job: Job, payload: Bytes) -> (JobResult, 
                 Err(e) => failed(e),
             }
         }
+        Job::ReadTxn { db, etag, read_time, request, json_value_max, limits } => {
+            let db = engine.db(&db);
+            let snapshot = match snapshot_version(shared, etag, &payload) {
+                Ok(v) => crate::engine::Snapshot { version: Arc::new(v), time_ms: read_time },
+                Err(e) => return failed(e),
+            };
+            drop(payload);
+            match run_read_txn(shared, &db, snapshot, request, json_value_max, limits).await {
+                Ok(body) => (JobResult::Queried, body),
+                Err(e) => failed(e),
+            }
+        }
+        Job::TableQuery { etag, read_time, table, query } => {
+            let snapshot = match snapshot_version(shared, etag, &payload) {
+                Ok(v) => crate::engine::Snapshot { version: Arc::new(v), time_ms: read_time },
+                Err(e) => return failed(e),
+            };
+            drop(payload);
+            match run_table_query(shared, snapshot, &table, query).await {
+                Ok(body) => (JobResult::Queried, body),
+                Err(e) => failed(e),
+            }
+        }
         Job::Merge { db, schema, inputs } => {
             let mut refs = Vec::with_capacity(inputs.len());
             for (k, v) in &inputs {
@@ -622,6 +717,69 @@ async fn run_query(
     let mut grant = crate::queries::QueryGrant::unlimited();
     let out = crate::events::exec::run(shared, db, &mut txn, schema, &q, &limits, &mut grant).await?;
     let body = crate::api::events::output_json(&out, version);
+    serde_json::to_vec(&body).map(Bytes::from).map_err(|e| Error::internal(e.to_string()))
+}
+
+/// Runs the ops of read-only one-shot transaction `request` at `snapshot` of `db`.
+async fn run_read_txn(
+    shared: &Arc<Shared>,
+    db: &Arc<crate::engine::Db>,
+    snapshot: crate::engine::Snapshot,
+    request: serde_json::Value,
+    json_value_max: u64,
+    (max_bytes_read, max_memory_bytes, lookup_max_bytes, max_ms): (u64, usize, usize, u64),
+) -> Result<Bytes> {
+    use baserunna_api::Body;
+    let req: baserunna_api::TxnRequest =
+        serde_json::from_value(request).map_err(|e| Error::internal(format!("transaction request: {e}")))?;
+    let ops = crate::ops::parse_ops(req.ops)?;
+    if ops.iter().any(|o| o.is_write()) {
+        return Err(Error::internal("a worker transaction has a write op"));
+    }
+    let isolation = match req.isolation {
+        baserunna_api::Isolation::Serializable => crate::engine::Isolation::Serializable,
+        baserunna_api::Isolation::Snapshot => crate::engine::Isolation::Snapshot,
+    };
+    let cfg = &shared.cfg;
+    let mut txn = crate::engine::Txn::new(snapshot, isolation, 0, cfg.txn_max_write_bytes)
+        .with_read_limit(cfg.txn_max_read_bytes);
+    let ctx = crate::ops::OpCtx {
+        db,
+        encoding: req.encoding,
+        access: crate::meta::Access { role: crate::meta::Role::Reader, read_only_key: true },
+        json_value_max,
+        query_limits: crate::events::exec::Limits { max_bytes_read, max_memory_bytes, lookup_max_bytes, max_ms },
+        node: None,
+        user_id: "",
+    };
+    let results = crate::ops::exec_ops(&ctx, &mut txn, &ops).await?;
+    let version = txn.read_version();
+    let body = baserunna_api::TxnResponse {
+        version,
+        committed: false,
+        commit_id: None,
+        replayed: false,
+        results: Some(results),
+        appends: None,
+    };
+    Ok(body.encode())
+}
+
+/// Runs table query `query` on table `table` at `snapshot`.
+async fn run_table_query(
+    shared: &Arc<Shared>,
+    snapshot: crate::engine::Snapshot,
+    table: &str,
+    query: serde_json::Value,
+) -> Result<Bytes> {
+    let version = snapshot.version.m.version;
+    let cfg = &shared.cfg;
+    let mut txn = crate::engine::Txn::new(snapshot, crate::engine::Isolation::Serializable, 0, cfg.txn_max_write_bytes)
+        .with_read_limit(cfg.txn_max_read_bytes);
+    let q: crate::table::Query =
+        serde_json::from_value(query).map_err(|e| Error::invalid(format!("invalid query: {e}")))?;
+    let r = crate::table::query(&mut txn, table, &q).await?;
+    let body = json!({"rows": r.rows, "next_cursor": r.next_cursor, "version": version});
     serde_json::to_vec(&body).map(Bytes::from).map_err(|e| Error::internal(e.to_string()))
 }
 

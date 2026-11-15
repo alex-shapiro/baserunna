@@ -146,13 +146,24 @@ fn error_from_api(status: u16, e: api::ApiError) -> Error {
 }
 
 pub(crate) struct Reply<E: Endpoint> {
-    body: E::Response,
+    body: ReplyBody<E::Response>,
     headers: HeaderMap,
+}
+
+/// The body of a [`Reply`]: a response value, or a response that a worker already encoded.
+enum ReplyBody<R> {
+    Value(R),
+    Encoded(Bytes),
 }
 
 impl<E: Endpoint> Reply<E> {
     pub(crate) fn new(body: E::Response) -> Reply<E> {
-        Reply { body, headers: HeaderMap::new() }
+        Reply { body: ReplyBody::Value(body), headers: HeaderMap::new() }
+    }
+
+    /// Returns a reply whose body is `body`, the encoded response that a worker returned.
+    pub(crate) fn encoded(body: Bytes) -> Reply<E> {
+        Reply { body: ReplyBody::Encoded(body), headers: HeaderMap::new() }
     }
 
     pub(crate) fn header(mut self, name: http::HeaderName, value: HeaderValue) -> Reply<E> {
@@ -163,7 +174,11 @@ impl<E: Endpoint> Reply<E> {
 
 impl<E: Endpoint> IntoResponse for Reply<E> {
     fn into_response(self) -> Response {
-        let mut resp = Response::new(Body::from(self.body.encode()));
+        let body = match self.body {
+            ReplyBody::Value(v) => Body::from(v.encode()),
+            ReplyBody::Encoded(b) => Body::from(b),
+        };
+        let mut resp = Response::new(body);
         *resp.status_mut() = E::STATUS;
         *resp.headers_mut() = self.headers;
         if let Some(ct) = <E::Response as api::Body>::CONTENT_TYPE {

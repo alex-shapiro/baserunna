@@ -465,12 +465,34 @@ pub(crate) fn db_routes() -> Router<Arc<Node>> {
     data::routes().merge(streams::routes()).merge(events::routes())
 }
 
-/// Returns the routes that an owner's worker serves for requests that the node sends it.
+/// Returns the routes that an owner's worker serves for requests that the node sends it: the
+/// database routes, peer binds, and the console pages of a database.
 pub(crate) fn worker_routes() -> Router<Arc<Node>> {
-    db_routes().route(
-        "/internal/v1/dbs/{db}/events/bind",
-        post(events::internal_bind).layer(DefaultBodyLimit::max(BIND_BODY_MAX)),
-    )
+    db_routes()
+        .route("/internal/v1/dbs/{db}/events/bind", post(events::internal_bind).layer(DefaultBodyLimit::max(BIND_BODY_MAX)))
+        .merge(crate::console::routes())
+}
+
+/// With workers, streams each console request for a database to the worker of the database's
+/// owner, which renders the page. The node reads only the session and the database record.
+async fn console_db_routing(State(node): State<Arc<Node>>, req: Request, next: Next) -> Response {
+    let Some(w) = node.engine.shared.workers.get() else { return next.run(req).await };
+    let Some(seg) = req.uri().path().strip_prefix("/console/dbs/").and_then(|r| r.split('/').next()) else {
+        return next.run(req).await;
+    };
+    let Some(name) = db_name_from_path(&format!("/v1/dbs/{seg}")) else { return next.run(req).await };
+    let Some(token) = cookie(req.headers(), SESSION_COOKIE).filter(|t| !t.is_empty()) else {
+        return next.run(req).await;
+    };
+    let rec = match node.authenticate(&token).await {
+        Ok(p) => match node.resolve_db(&p, &name).await {
+            Ok((rec, _)) => rec,
+            Err(_) => return next.run(req).await,
+        },
+        Err(_) => return next.run(req).await,
+    };
+    let deadline = Deadline::new(request_deadline(&node, req.headers()));
+    w.http(None, rec, deadline, req).await.unwrap_or_else(|e| e.into_response())
 }
 
 /// Authenticates database-scoped requests and routes them to the target node or handles them locally.
@@ -1202,7 +1224,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route(api::ListDbs::ROUTE, get(data::list_dbs).post(data::create_db))
         .merge(db_routes)
         .merge(internal)
-        .merge(crate::console::routes())
+        .merge(crate::console::routes().layer(middleware::from_fn_with_state(node.clone(), console_db_routing)))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(node.clone(), dedup_forwarded))
         .layer(middleware::from_fn_with_state(node.clone(), tag_client))

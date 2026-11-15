@@ -809,6 +809,9 @@ fn oom_kills(cgroup: &std::path::Path) -> u64 {
 /// Runs the jobs that the node sends on stdin and writes each result to stdout (the `baserunna worker` command).
 pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
     let engine = node.engine.clone();
+    // Console pages call the API in process, so the worker's node serves the full router and
+    // handles each database request itself.
+    node.set_router(crate::api::router(node.clone()));
     let router = crate::api::worker_routes()
         .layer(axum::extract::DefaultBodyLimit::max(node.cfg.max_json_body))
         .with_state(node.clone());

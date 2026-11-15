@@ -2,27 +2,27 @@
 
 ## Decision
 
-Round 2 of the contest is in progress, under the rules in section 4.
-The decision below is from round 1, and round 2 will replace it.
+**No design qualifies, so the choice is yours (rule 4.6 step 4). I
+recommend the worker pool under cgroups.** It passed 6 of the 8
+workloads in round 2, and the WebAssembly sandbox passed 4. It passed
+the hidden CPU workload, and the sandbox did not pass either hidden
+workload. Its costs were small: KV throughput and idle cost stayed
+within noise of today's code, and most event queries took at most 15%
+longer. The sandbox ran event queries 1.4 to 9.0 times slower. The
+worker pool still fails in two ways. A light request can download a
+large blob outside the worker, with a memory charge that is too small.
+And the node holds each request and response body whole, outside the
+owner's limit. Section "Before adoption" lists the work that closes
+these gaps, and the two product decisions that remain.
 
-**No design is ready to adopt. The next step is one experiment: put all
-tenant work inside a WebAssembly boundary and check its cost.** Two
-boundary designs went into the contest: a worker pool under cgroups, and
-a WebAssembly sandbox. Both kept a tenant inside its memory bound on the
-paths that they covered. Both failed the two hidden workloads, because
-each hidden workload used a path outside the boundary. A boundary
-protects a path that no one has named only if all tenant work crosses
-it. A process boundary cannot carry all work: its cheapest crossing
-halves the throughput of light requests. A WebAssembly crossing costs
-2.6%, so it is the only boundary that can carry all work. Its open risk
-is the speed of code in the sandbox: event queries ran 2.6 times slower.
-If that experiment fails its cost limits, every remaining design
-changes the product. You would then decide between them.
+The round 1 decision, which came before round 2, is in section "Round
+1 evidence". Round 2 replaced it.
 
 Each claim below has a label:
 
-- **measured:** a judge result file (`<node>-<workload>-<variant>.json`,
-  summarized in `reports/tenant-isolation-results.json`) or a named
+- **measured:** a judge result file (`<node>-<workload>-<variant>.json`),
+  summarized in `reports/tenant-isolation-round2-results.json` for round
+  2 and `reports/tenant-isolation-results.json` for round 1, or a named
   benchmark run;
 - **code:** file:line;
 - **inferred:** not checked by a test or a source.
@@ -32,7 +32,96 @@ A **tenant** is the owner of a database: the user or organization in the
 cost per database, not per user, and an organization pays for its databases.
 So a member who sends requests does not get a separate share.
 
-## Evidence
+## Round 2 evidence
+
+The rules are in section 4, committed in 854d4e3 and 75ff637 before
+either round 2 advocate reported. An independent judge agent applied
+them (commit eaa6b97). All results are measured, from one run per cell,
+with a 20 ms store delay. Per-file data is in
+`reports/tenant-isolation-round2-results.json`.
+
+### Isolation
+
+Growth is node memory above its value after setup. The bound is
+576 MiB.
+
+| Workload, attack variant      | Today's code  | Worker pool   | WebAssembly    |
+| ----------------------------- | ------------- | ------------- | -------------- |
+| long_strings                  | fail, 882 MiB | pass, 325 MiB | not measured   |
+| bulk_inserts                  | node killed   | fail          | fail, 829 MiB  |
+| merges                        | node killed   | pass, 105 MiB | pass, 492 MiB  |
+| blob_checks                   | fail, 1021    | pass, 500 MiB | pass, 265 MiB  |
+| txn_scans                     | node killed   | pass, 451 MiB | pass, 508 MiB  |
+| table_filter_scans            | p99 818 ms    | pass, 68 ms   | pass, 46 ms    |
+| blob_downloads (hidden)       | node killed   | fail, 929 MiB | node killed    |
+| stream_filter_scans (hidden)  | p99 2,905 ms  | pass, 69 ms   | p99 1,764 ms   |
+
+- **Worker pool, `bulk_inserts`.** The 4 MiB setup insert needs about
+  580 MiB with today's JSON parse (measured on today's code), so the
+  worker refused it with a clean 413. The small variant needs about
+  1 GiB (inferred). Rule 3.5 forbids a change to the parse, so no
+  candidate can pass this small variant. The measurement here is of
+  the 32 to 54 times parse cost that `TODO.md` already lists as a
+  blocker.
+- **Worker pool, `blob_downloads`.** Blob downloads are on the light
+  list, so they stay in the node process. Each one is charged 1 MiB
+  (code, `iso2/cgroup` `crates/baserunna/src/worker.rs:204`), but each
+  one holds an 8 MiB chunk. This is a per-site charge, so it has the
+  weakness of design 7.
+- **Worker pool, the event scan.** It refused the "top users" query in
+  19 of 40 runs, when its worker reached the 512 MiB owner limit.
+  Today's code answered it in 40 of 40.
+- **WebAssembly.** The two hidden workloads use routes that the build
+  never moved into the sandbox (code, `iso2/wasm`
+  `crates/baserunna/src/api/mod.rs:629`, `:651`). The `long_strings`
+  setup got a retryable 503 at the owner bound, so its attack never
+  ran. One library test fails.
+
+### Costs
+
+| Cost, against today's code      | Worker pool    | WebAssembly         |
+| ------------------------------- | -------------- | ------------------- |
+| KV throughput, 256 clients      | −1.0%          | −0.1%               |
+| CPU per KV request              | +1.3%          | −0.4%               |
+| Idle memory, 1,000 owners       | +7%            | +97 MiB, fixed      |
+| Event query, median per query   | −2% to +15%, one query +45% | 1.4× to 9.0× |
+| Node CPU for the event scan     | −11%           | +88%                |
+| Victim p99 with no attacker     | about +33%     | about the same      |
+
+All of these are measured. Neither build sends KV requests across its
+boundary, so the KV numbers do not measure either boundary. The
+sandbox's fixed 97 MiB comes from compiling the guest module at start
+(inferred). The worker pool's extra victim latency has no known cause.
+
+## Before adoption
+
+**Work that closes the worker pool's gaps:**
+
+- Stream request bodies to the worker, and results back, through
+  bounded buffers. Today the node buffers both whole (code,
+  `iso2/cgroup` `crates/baserunna/src/worker.rs:487`, `:819`).
+- Bound blob downloads by their real size. Either send them to the
+  worker, or charge each one by the chunk that it holds.
+- Find the cause of the victim's extra 33% latency with no attacker.
+
+**Product decisions for you:**
+
+1. **The tenant memory bound.** At 512 MiB, the worker pool refuses one
+   event query that today's code answers, and a 4 MiB bulk insert of
+   empty rows. A larger bound accepts both. A smaller worker cache or
+   a fix of the JSON parse also helps.
+2. **The deployment requirement.** The worker pool needs Linux with a
+   delegated cgroup v2 subtree. The simulator runs with workers off, so
+   it does not test the kernel bound.
+
+## Round 1 evidence
+
+The round 1 decision was: "No design is ready to adopt. The next step
+is one experiment: put all tenant work inside a WebAssembly boundary
+and check its cost." Round 2 tested that claim with real network
+requests and a store delay. The WebAssembly crossing then cost 7.0%,
+not 2.6%. The worker pool's router showed that a boundary can cover
+every unnamed path without a crossing for light requests.
 
 ### Contest results
 
@@ -109,7 +198,7 @@ A real worker needs only one round trip. That would cut the process cost
 to about 25%, which is still 5 times the 5% limit (inferred). So a
 process boundary can carry heavy work only.
 
-## Risks
+### Round 1 risks
 
 - **Code in the sandbox is slower.** Event queries took 2.6 times as
   long (measured). Each call builds a new engine with an empty block
@@ -137,7 +226,7 @@ process boundary can carry heavy work only.
   narrowest passes, such as cgroup `blob_checks` at 526 MiB, could
   change on a second run.
 
-## The experiment that decides
+### The experiment that round 1 proposed
 
 **Full WebAssembly coverage.** All tenant request work runs inside one
 persistent instance per owner. The work includes KV ops, transactions,
@@ -164,12 +253,24 @@ At the pace of this contest, it needs about ten agent rounds of
 
 ## Reproduction
 
-- Branches: `iso/base` (harness and this report), `iso/cgroup`
-  (400f6a3), `iso/wasm` (e4b39fa), `iso/hidden` (the hidden workloads,
-  merged into `iso/base`), and `iso/floor` (the crossing benchmark).
-- One workload: in the VM, run
+- **Harness and this report:** branch `iso/base`.
+- **Round 2 candidates:** `iso2/cgroup` (8fca510) and `iso2/wasm`
+  (6cee4e4).
+- **Round 1 candidates:** `iso/cgroup` (400f6a3) and `iso/wasm`
+  (e4b39fa).
+- **Hidden workloads:** `iso/hidden` for round 1 and `iso2/hidden` for
+  round 2. Both are merged into `iso/base`.
+- **Crossing benchmark:** `iso/floor` (cf7262c in process, e7085b8 over
+  TCP).
+- **One workload:** in the VM, run
   `scripts/isolation/run.sh <workload> <small|attack> <out.json> <node binary>`.
-  For the WebAssembly node, set `BASERUNNA_GUEST_WASM`.
+  For the WebAssembly node, set `BASERUNNA_GUEST_WASM`. Keep the Mac
+  awake during the run, for example with `caffeinate -i -s`.
+- **The full round 2 judge run:** `scripts/isolation/judge2/`. In the
+  VM, run `build.sh`, then `run-all.sh`. On the host, run `tests.sh`,
+  then `summarize.sh`. The scripts use the worktree paths of the machine
+  that ran them. `tests.sh` expects the guest module at
+  `target/judge2/guest.wasm`.
 
 ## 1. Requirements
 

@@ -8,7 +8,7 @@ use super::ValidRows;
 use super::build::write_encoded;
 use super::schema::EventSchema;
 use crate::engine::events::{Bind, BindSlot, Pos, Runs, StagedPart};
-use crate::engine::{Committed, Db};
+use crate::engine::{Committed, Db, Shared};
 use crate::error::{Error, Result};
 use crate::store::BoxFut;
 use parking_lot::Mutex;
@@ -132,52 +132,21 @@ impl Buffers {
     }
 
     async fn flush(&self, db: Arc<Db>, schema: EventSchema, slots: Vec<Slot>) {
-        let mut ranges = Vec::with_capacity(slots.len());
-        let mut by_partition: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
-        let mut ordinal = 0u32;
         let mut senders = Vec::with_capacity(slots.len());
         let mut bind_slots = Vec::with_capacity(slots.len());
         let mut rows = Vec::with_capacity(slots.len());
-        for (si, s) in slots.into_iter().enumerate() {
-            let start = ordinal;
-            for (ri, (partition, _)) in s.rows.iter().enumerate() {
-                by_partition.entry(partition).or_default().push((si as u32, ri as u32));
-                ordinal += 1;
-            }
-            ranges.push(start..ordinal);
+        for s in slots {
             senders.push(s.tx);
             bind_slots.push(BindSlot { commit_id: s.commit_id, deadline: Some(s.deadline) });
             rows.push(s.rows);
         }
         let shared = db.shared().clone();
-        let mut written = Vec::new();
-        let mut failed = None;
-        for (partition, idx) in by_partition {
-            let encoded = idx.into_iter().map(|(si, ri)| {
-                let pos = Pos { version: 0, ordinal: ranges[si as usize].start + ri };
-                (pos, rows[si as usize].get(ri as usize).1)
-            });
-            if let Err(e) = write_encoded(&shared, &db.id, &schema, partition, encoded, false, &mut written).await {
-                failed = Some(e);
-                break;
-            }
-        }
+        let staged = stage(&shared, &db.id, &schema, &rows).await;
         drop(rows);
-        let parts = written
-            .into_iter()
-            .map(|(part, positions)| {
-                let mut offsets: Vec<Vec<u32>> = vec![Vec::new(); ranges.len()];
-                for (i, p) in positions.iter().enumerate() {
-                    let slot = ranges.partition_point(|rg| rg.end <= p.ordinal);
-                    offsets[slot].push(i as u32);
-                }
-                StagedPart { part, slot_rows: offsets.into_iter().map(Runs::from_sorted).collect() }
-            })
-            .collect();
         shared.env.crash_point().await;
-        let results = match failed {
-            Some(e) => Err(e),
-            None => (self.bind)(db, Bind { table: schema.id, slots: bind_slots, parts }).await,
+        let results = match staged {
+            Err(e) => Err(e),
+            Ok(parts) => (self.bind)(db, Bind { table: schema.id, slots: bind_slots, parts }).await,
         };
         match results {
             Ok(rs) => {
@@ -197,4 +166,44 @@ impl Buffers {
     pub fn pending(&self) -> usize {
         self.map.lock().values().map(|b| b.slots.len()).sum()
     }
+}
+
+/// Writes the rows of each request in `slots` as level 0 parts of `schema` and returns the staged
+/// parts with the rows of each request.
+pub(crate) async fn stage(
+    shared: &Shared,
+    db: &str,
+    schema: &EventSchema,
+    slots: &[ValidRows],
+) -> Result<Vec<StagedPart>> {
+    let mut ranges = Vec::with_capacity(slots.len());
+    let mut by_partition: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
+    let mut ordinal = 0u32;
+    for (si, rows) in slots.iter().enumerate() {
+        let start = ordinal;
+        for (ri, (partition, _)) in rows.iter().enumerate() {
+            by_partition.entry(partition).or_default().push((si as u32, ri as u32));
+            ordinal += 1;
+        }
+        ranges.push(start..ordinal);
+    }
+    let mut written = Vec::new();
+    for (partition, idx) in by_partition {
+        let encoded = idx.into_iter().map(|(si, ri)| {
+            let pos = Pos { version: 0, ordinal: ranges[si as usize].start + ri };
+            (pos, slots[si as usize].get(ri as usize).1)
+        });
+        write_encoded(shared, db, schema, partition, encoded, false, &mut written).await?;
+    }
+    Ok(written
+        .into_iter()
+        .map(|(part, positions)| {
+            let mut offsets: Vec<Vec<u32>> = vec![Vec::new(); ranges.len()];
+            for (i, p) in positions.iter().enumerate() {
+                let slot = ranges.partition_point(|rg| rg.end <= p.ordinal);
+                offsets[slot].push(i as u32);
+            }
+            StagedPart { part, slot_rows: offsets.into_iter().map(Runs::from_sorted).collect() }
+        })
+        .collect())
 }

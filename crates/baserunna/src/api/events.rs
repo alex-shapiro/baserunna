@@ -170,7 +170,11 @@ const BODY_SHAPE: &str = "the body is {\"rows\": [...]}, an array of events, or 
 
 /// Streams events from a JSON or NDJSON insert body into `f` without buffering
 /// the parsed array, and returns the body's `idempotency_key` if present.
-fn each_event(content_type: &str, data: &[u8], f: &mut dyn FnMut(Json) -> Result<()>) -> Result<Option<String>> {
+pub(crate) fn each_event(
+    content_type: &str,
+    data: &[u8],
+    f: &mut dyn FnMut(Json) -> Result<()>,
+) -> Result<Option<String>> {
     crate::util::json::reject_inexact_integers(data).map_err(Error::invalid)?;
     match content_type {
         "" | "application/json" => {
@@ -296,6 +300,24 @@ async fn insert(
     let data = axum::body::to_bytes(req.into_body(), limit)
         .await
         .map_err(|_| Error::TooLarge(format!("bulk inserts are limited to {limit} bytes")))?;
+    if let Some(w) = node.engine.shared.workers.get() {
+        let (schema, _) = with_read!(ctx.db, Consistency::Strong, |t| events::get_schema(t, &name).await);
+        let row_bytes_max = (8 * data.len()).max(limit);
+        let wait = ctx.deadline.instant().saturating_duration_since(tokio::time::Instant::now());
+        let now = node.now_ms() as i64;
+        let (body_key, staged) =
+            w.bulk_insert(&ctx.rec.owner_id, &ctx.db.id, &schema, &ct, data, now, row_bytes_max, wait).await?;
+        let key = one_idempotency_key(header_key, body_key)?;
+        let commit_id = super::commit_id_for(&node, &ctx, key.as_deref())?;
+        if let Some(c) = super::earlier_attempt(&ctx, commit_id, key.as_deref()).await? {
+            return inserted(&c, commit_id);
+        }
+        let mut bind = staged?;
+        bind.slots = vec![crate::engine::events::BindSlot { commit_id, deadline: Some(ctx.deadline.instant()) }];
+        let c = node.bind_events(ctx.db.clone(), bind).await.map_err(|e| super::naming_commit(e, commit_id))?;
+        let c = c.into_iter().next().ok_or_else(|| Error::internal("the bind returned no result"))?;
+        return inserted(&c.map_err(|e| super::naming_commit(e, commit_id))?, commit_id);
+    }
     // Extract the idempotency key first so a replay returns before validating rows.
     let body_key = each_event(&ct, &data, &mut |_| Ok(()))?;
     let key = one_idempotency_key(header_key, body_key)?;

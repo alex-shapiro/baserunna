@@ -8,13 +8,14 @@
 //! The simulator never sets `BASERUNNA_CGROUP_ROOT`, so it runs the same jobs
 //! in process without kernel limits.
 
-use crate::engine::events::PartRef;
+use crate::engine::events::{Bind, BindSlot, PartRef};
 use crate::engine::{EngineConfig, Shared};
 use crate::error::{Error, Result};
 use crate::events::schema::EventSchema;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -40,6 +41,9 @@ enum Job {
         query: serde_json::Value,
         limits: (u64, usize, usize, u64),
     },
+    /// Parses and validates the bulk insert body in the payload, writes its rows as staged
+    /// parts, and returns the encoded [`Bind`] as the result's payload.
+    BulkInsert { db: String, schema: EventSchema, content_type: String, now_ms: i64, row_bytes_max: usize },
 }
 
 /// The result of a [`Job`].
@@ -48,6 +52,11 @@ enum JobResult {
     Merged(Option<(Vec<u8>, Vec<u8>)>),
     /// The query's JSON response body is the result's payload.
     Queried,
+    /// The body's idempotency key and, on success, the encoded [`Bind`] as the payload.
+    Staged {
+        body_key: Option<String>,
+        error: Option<serde_json::Value>,
+    },
     /// The job's error as the JSON body of an HTTP error response.
     Failed(serde_json::Value),
 }
@@ -143,7 +152,7 @@ impl WorkerPool {
                 PartRef::decode(&k, &v).map(Some).map_err(|e| Error::internal(format!("worker part ref: {e}")))
             }
             JobResult::Failed(e) => Err(crate::api::error_from_json(500, &e)),
-            JobResult::Queried => Err(Error::internal("the worker returned a query result for a merge")),
+            _ => Err(Error::internal("the worker returned a result of another job")),
         }
     }
 
@@ -174,7 +183,41 @@ impl WorkerPool {
         match self.run(owner, job, manifest, deadline).await? {
             (JobResult::Queried, body) => Ok(body),
             (JobResult::Failed(e), _) => Err(crate::api::error_from_json(500, &e)),
-            _ => Err(Error::internal("the worker returned a merge result for a query")),
+            _ => Err(Error::internal("the worker returned a result of another job")),
+        }
+    }
+
+    /// Parses, validates, and stages bulk insert `body` in a worker inside `owner`'s cgroup.
+    /// Returns the body's idempotency key and the staged rows, or the error that rejects them.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bulk_insert(
+        &self,
+        owner: &str,
+        db: &str,
+        schema: &EventSchema,
+        content_type: &str,
+        body: Bytes,
+        now_ms: i64,
+        row_bytes_max: usize,
+        deadline: Duration,
+    ) -> Result<(Option<String>, Result<Bind>)> {
+        let job = Job::BulkInsert {
+            db: db.to_string(),
+            schema: schema.clone(),
+            content_type: content_type.to_string(),
+            now_ms,
+            row_bytes_max,
+        };
+        match self.run(owner, job, body, deadline).await? {
+            (JobResult::Staged { body_key, error: Some(e) }, _) => {
+                Ok((body_key, Err(crate::api::error_from_json(500, &e))))
+            }
+            (JobResult::Staged { body_key, error: None }, bind) => {
+                let bind = Bind::decode(&bind).map_err(|e| Error::internal(format!("worker bind: {e}")))?;
+                Ok((body_key, Ok(bind)))
+            }
+            (JobResult::Failed(e), _) => Err(crate::api::error_from_json(500, &e)),
+            _ => Err(Error::internal("the worker returned a result of another job")),
         }
     }
 
@@ -277,6 +320,19 @@ async fn run_job(shared: &Arc<Shared>, job: Job, payload: Bytes) -> (JobResult, 
     let failed =
         |e: Error| (JobResult::Failed(serde_json::json!({ "error": crate::api::error_json(&e) })), Bytes::new());
     match job {
+        Job::BulkInsert { db, schema, content_type, now_ms, row_bytes_max } => {
+            let body_key = match crate::api::events::each_event(&content_type, &payload, &mut |_| Ok(())) {
+                Ok(k) => k,
+                Err(e) => return failed(e),
+            };
+            match stage_insert(shared, &db, &schema, &content_type, &payload, now_ms, row_bytes_max).await {
+                Ok(bind) => (JobResult::Staged { body_key, error: None }, bind.encode()),
+                Err(e) => (
+                    JobResult::Staged { body_key, error: Some(json!({ "error": crate::api::error_json(&e) })) },
+                    Bytes::new(),
+                ),
+            }
+        }
         Job::Query { db, etag, read_time, schema, query, limits } => {
             match run_query(shared, &db, etag, read_time, &schema, query, limits, payload).await {
                 Ok(body) => (JobResult::Queried, body),
@@ -325,4 +381,22 @@ async fn run_query(
     let out = crate::events::exec::run(shared, db, &mut txn, schema, &q, &limits, &mut grant).await?;
     let body = crate::api::events::output_json(&out, version);
     serde_json::to_vec(&body).map(Bytes::from).map_err(|e| Error::internal(e.to_string()))
+}
+
+async fn stage_insert(
+    shared: &Arc<Shared>,
+    db: &str,
+    schema: &EventSchema,
+    content_type: &str,
+    body: &[u8],
+    now_ms: i64,
+    row_bytes_max: usize,
+) -> Result<Bind> {
+    let mut valid = crate::events::ValidRows::up_to(row_bytes_max);
+    crate::api::events::each_event(content_type, body, &mut |v| valid.push(schema, &v, now_ms))?;
+    if valid.is_empty() {
+        return Err(Error::invalid("insert at least one event"));
+    }
+    let parts = crate::events::bulk::stage(shared, db, schema, std::slice::from_ref(&valid)).await?;
+    Ok(Bind { table: schema.id, slots: vec![BindSlot { commit_id: 0, deadline: None }], parts })
 }

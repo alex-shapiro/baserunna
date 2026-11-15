@@ -19,6 +19,7 @@ NODE=$!
 for i in $(seq 50); do curl -sf 127.0.0.1:18080/healthz >/dev/null && break; sleep 0.2; done
 timeout 200 python3 $(dirname $0)/merge_oom.py http://127.0.0.1:18080 $2
 echo "node alive: $(kill -0 $NODE 2>/dev/null && echo yes || echo no)"
+echo "node main cgroup peak $(( $(cat $CG/node/main/memory.peak) >> 20 )) MiB"
 for d in $CG/node/owner-*; do echo "$d: $(grep oom_kill $d/memory.events | head -1); peak $(( $(cat $d/memory.peak) >> 20 )) MiB"; done
 grep -iE "merge|worker|\"error\"" $DIR/node.log | grep -v '^\s*$' | head -8
 kill $NODE $S3; wait $NODE $S3 2>/dev/null

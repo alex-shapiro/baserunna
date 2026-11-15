@@ -56,7 +56,9 @@ fi
 # Other agents' nodes or compilers in the VM add noise. Record them; do not stop them.
 BUSY_PROCS=$( (pgrep -a baserunna; pgrep -a cargo) || true)
 
-# The store runs outside the node cgroup.
+# The store runs outside the node cgroup. It delays every request by
+# $FAKE_S3_LATENCY_MS (default 20 ms), as a remote object store would.
+export FAKE_S3_LATENCY_MS=${FAKE_S3_LATENCY_MS:-20}
 "$EXAMPLES_DIR/fake_s3_server" "127.0.0.1:$S3_PORT" >"$WORK/s3.env" &
 S3_PID=$!
 for _ in $(seq 100); do grep -q BASERUNNA_STORE "$WORK/s3.env" 2>/dev/null && break; sleep 0.05; done
@@ -102,8 +104,8 @@ PEAK=$(cat "$NODE_CG/memory.peak" 2>/dev/null || echo null)
 cp "$WORK/node.log" "${OUT%.json}.node.log"
 if [ -f "$OUT" ]; then
   jq --argjson exit "$NODE_EXIT" --argjson oom "${OOM_KILLS:-0}" --argjson subtree_oom "${SUBTREE_OOM_KILLS:-0}" --argjson peak "$PEAK" \
-    --arg bin "$NODE_BIN" --argjson client "$CLIENT_STATUS" --arg busy "$BUSY_PROCS" \
-    '.vm_busy = ($busy != "") | .vm_busy_processes = ($busy | split("\n") | map(select(. != "")))
+    --arg bin "$NODE_BIN" --argjson client "$CLIENT_STATUS" --arg busy "$BUSY_PROCS" --argjson store_latency_ms "$FAKE_S3_LATENCY_MS" \
+    '.store_latency_ms = $store_latency_ms | .vm_busy = ($busy != "") | .vm_busy_processes = ($busy | split("\n") | map(select(. != "")))
      | .run = {node_binary: $bin, node_exit_status: $exit, node_oom_kills: $oom, subtree_oom_kills: $subtree_oom, cgroup_memory_peak_bytes: $peak,
              client_exit_status: $client, node_died: ($exit != null or $oom > 0)}
      | if .run.node_died and .conditions then .conditions["1_node_survives"] = false | .conditions.pass = false else . end' \

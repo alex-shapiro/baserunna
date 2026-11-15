@@ -32,6 +32,7 @@ struct Inner {
     requests: BTreeMap<String, usize>,
     writes: u64,
     max_list_keys: Option<usize>,
+    latency: Option<Duration>,
 }
 
 #[derive(Clone, Default)]
@@ -72,8 +73,15 @@ impl FakeS3 {
     }
 
     /// Sets the largest page that a list request returns, which defaults to 3 keys.
+    #[allow(dead_code)]
     pub fn set_max_list_keys(&self, max: usize) {
         self.inner.lock().max_list_keys = Some(max);
+    }
+
+    /// Delays every request by `latency`, as a remote object store would.
+    #[allow(dead_code)]
+    pub fn set_latency(&self, latency: Duration) {
+        self.inner.lock().latency = Some(latency);
     }
 
     pub fn inject_fault(&self, method: Method, fault: Fault) {
@@ -173,14 +181,18 @@ fn xml_escape(s: &str) -> String {
 }
 
 async fn handle(State(s): State<FakeS3>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
-    let fault = {
+    let (fault, latency) = {
         let mut g = s.inner.lock();
         *g.requests.entry(method.to_string()).or_default() += 1;
-        match g.faults.iter().position(|(m, _)| *m == method) {
+        let fault = match g.faults.iter().position(|(m, _)| *m == method) {
             Some(i) => g.faults.remove(i).map(|(_, f)| f),
             None => None,
-        }
+        };
+        (fault, g.latency)
     };
+    if let Some(d) = latency {
+        tokio::time::sleep(d).await;
+    }
     match fault {
         Some(Fault::Fail(code)) => return xml_error_response(code, "InjectedFault"),
         Some(Fault::Delay(d)) => tokio::time::sleep(d).await,

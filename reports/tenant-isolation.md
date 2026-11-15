@@ -2,8 +2,41 @@
 
 ## Decision
 
-**No design qualifies, so the choice is yours. I recommend the worker
-pool under cgroups.**
+**The user stopped the contest on 2026-11-15, during round 3. No design
+qualifies. The next step is the user's choice.**
+
+Round 3 required all tenant work inside the boundary. For both designs,
+that is a rewrite of the node: every route, every background job, the
+system database, and the connection handling. That work does not fit in
+8 rounds of 20 minutes. So the time box, not the designs, would have
+decided the result.
+
+- **Worker pool:** after 8 rounds, branch `iso3/cgroup` at 90fd667.
+  - It is unfinished. Account, org and database-create routes still run
+    in the main process. Its own route test fails on `POST
+    /v1/auth/signup` and `POST /v1/dbs` (measured,
+    `tests/boundary_routes.rs`).
+  - In single self-test runs, 7 of the 8 known workloads passed their
+    attack variant at least once. Blob downloads failed condition 4,
+    with responses cut after a 200 (measured, advocate runs in
+    `target/isolation-results/iso3-cgroup/`; not judge runs).
+  - KV throughput was 81% below today's code (measured, one run). The
+    advocate infers that most of this cost is avoidable.
+- **WebAssembly sandbox:** stopped in round 4, branch `iso3/wasm` at
+  be00152, with uncommitted work in its worktree.
+  - Every database route still ran on the host.
+  - It also changed the crate's `forbid(unsafe_code)` to
+    `deny(unsafe_code)`, so that store writes can read guest memory in
+    place.
+- **Not run:** the hidden workloads, the judge run, and the judge.
+
+My mistake: the worker pool advocate said in round 2 that its plan
+needed more rounds than it had. I did not tell the user then that the
+time box would decide the outcome.
+
+## Round 2 decision
+
+**No design qualified. I recommended the worker pool under cgroups.**
 
 - **Workloads:** the worker pool passed 6 of the 8 workloads in round 2.
   The WebAssembly sandbox passed 4.
@@ -21,9 +54,8 @@ The worker pool still fails in two ways:
   owner's limit.
 
 Both failures come from work that stayed outside the boundary. Round 3
-requires all tenant work inside the boundary, with a guard at run time
-that proves it. Its prompt is `target/round3-prompt.md` on the machine
-that ran this contest.
+required all tenant work inside the boundary, with a guard at run time
+that proves it.
 
 Each claim below has a label:
 

@@ -3,61 +3,77 @@
 Each claim has a label: **code** (file:line on `iso3/cgroup` at 8fca510),
 **measured** (a named run), or **inferred** (nothing checked it yet).
 
+Revision 2 changes the design after the coordinator's check of
+revision 1. Section 6 lists each change against each rejected or
+missing item.
+
 ## 1. The design
 
-**The owner's worker owns the owner's databases.** The main process never
-opens a tenant database. Only the worker does.
+**The main process opens no database and makes no store call.** Workers
+do all reads and writes of the store.
 
-- **Unit.** One worker process per owner (`owner_id` of the database
-  record). It runs in the cgroup `<root>/<owner>/worker` with
-  `memory.max` = 512 MiB. This part is the same as round 2 (code,
-  `worker.rs:676`).
+- **Owner workers.** One worker process per owner: the `owner_id` of a
+  database record, or the user or org of an account route. It runs in
+  the cgroup `<root>/<owner>/worker` with `memory.max` = 512 MiB (code,
+  `worker.rs:676`). It holds the owner's tenant `Engine`: each `Db`, its
+  lease, its committer, and all of its background jobs.
+- **The system worker.** One worker process per node, in the cgroup
+  `<root>/system/worker`, with its own `memory.max` (planned 256 MiB). It
+  holds the `SYS_DB` lease and runs its committer, flush, compaction, GC
+  sweep, the reaper scan, session expiry, heartbeat writes, and
+  membership reads. It answers point reads for the main process
+  (authentication, the database record, the org role) with fixed-size
+  answers.
+- **The anonymous worker.** One worker process per node in its own
+  cgroup (planned 128 MiB). It serves the routes before sign-in: signup,
+  login, verify, password reset, OpenAPI, and static console pages.
 - **No light list.** `light_request`, `light_txn`, `admit_light`, and the
-  per-site MiB charges go away (code, `worker.rs:194`-`:340`). Every
-  request that names a database goes to the owner's worker.
-- **The worker holds the tenant `Engine`.** Today the lease lives in the
-  manifest and names the node ID (code, `engine/db.rs:372`). The manifest
-  holds the tail, so the manifest is tenant data. So the worker, not the
-  main process, takes the lease, runs the committer, and writes the
-  manifest. It writes under the node's ID. The main process keeps only
-  `SYS_DB`.
+  per-site MiB charges go away (code, `worker.rs:194`-`:340`).
+- **Why the lease moves.** The lease is a field of the manifest and
+  names the node ID (code, `engine/db.rs:372`). The manifest holds the
+  tail, so it is tenant data. So each worker writes its manifests under
+  the node's ID.
 - **One incarnation at a time.** The main process starts a new worker for
-  an owner only after the old one's cgroup reports `populated 0` in
-  `cgroup.events`. The kernel enforces this, so two workers of one owner
-  never hold the same lease. A killed worker is the same case as a killed
-  node, which the system already survives (inferred from the
-  "stateless nodes" property in `AGENTS.md`; the simulator must prove it,
-  see round 5).
-- **How bytes move.** One Unix socket pair per worker carries many
-  requests. Each request is a stream of frames: `Open` (method, URI,
-  headers, principal, database record, deadline), body `Chunk`s, `End`.
-  The response comes back the same way. Each chunk is at most 64 KiB.
-  Each direction of each request has a credit window of 2 chunks. So the
-  main process holds at most 4 × 64 KiB = 256 KiB per request. Each owner
-  has at most 64 requests in flight (a semaphore in the main process).
-  Over that, the main process returns a retryable 503.
-- **How commits come back.** Tenant commits and binds do not come back.
-  The worker applies them itself, because it holds the lease. Only
-  `SYS_DB` writes come back: a worker that serves an account or database
-  route sends a `MetaCmd` frame. The main process checks the frame length
-  against a fixed maximum before it parses the frame, charges it to the
-  owner's in-flight limit, and runs `run_meta`. This is allowed item 3.
-- **Background jobs.** All tenant background jobs start from a tenant
-  `Db` (code, `engine/db.rs:1996`-`:2023`, `:2114`, `:2133`;
-  `events/bulk.rs:102`, `:131`; `events/maint.rs:1046`). The tenant `Db`
-  exists only in the worker, so these jobs run only in the worker, under
-  the owner's limit. The purge of a deleted database also goes to the
-  owner's worker.
-- **Routes without a database.** Account, org, and console routes also
-  run in a worker: the worker of the signed-in principal's owner ID (the
-  user, or the org for org routes). Routes before sign-in (signup, login,
-  verify, password reset, OpenAPI, static console pages) run in one
-  shared "anonymous" worker in its own cgroup with a 128 MiB limit.
-  Workers read `SYS_DB` from snapshots and send writes as `MetaCmd`.
-- **Idle workers.** The main process stops a worker after 20 s with no
-  request (code, `worker.rs:646`). Before a planned stop, it sends `Stop`.
-  The worker ends its flushes and releases its leases, then exits. A kill
-  is also safe.
+  a cgroup only after the old one's `cgroup.events` reports
+  `populated 0`. The kernel enforces this, so two incarnations never hold
+  the same lease.
+- **How bytes move.** One multiplexed Unix socket per worker, with
+  binary frames. Each request is `Open` (method, URI, headers, principal,
+  database record, deadline), body `Chunk`s of at most 64 KiB, then
+  `End`. The response comes back the same way. Each direction of each
+  request has a credit window of 2 chunks, so the main process holds at
+  most 4 × 64 KiB = 256 KiB per request. Each owner has at most 64
+  requests in flight. Over that, the main process returns a retryable
+  503.
+- **`SYS_DB` writes from a tenant worker.** The tenant worker opens
+  `SYS_DB` read-only, from store snapshots, inside its own cgroup. It
+  runs the meta command logic in its own `Txn` (today in `run_meta`,
+  code, `meta/mod.rs:319`, `:1155`). It then sends a commit frame: the
+  `CommitRequest` with its read set and write set. This reuses the
+  engine's `remote_commit` path (code, `engine/db.rs:846`). The main
+  process checks the frame length against a fixed maximum (planned
+  1 MiB) before it reads any byte of the content. It charges the length
+  to the owner's in-flight limit, and it moves the frame to the system
+  worker. The system worker runs the conflict check on the read set and
+  commits. The main process never parses the frame.
+- **Peers.** A commit frame for a `SYS_DB` lease on a peer goes to the
+  peer's main process as `POST /internal/v1/sys/commit`, with the same
+  length check, and on to the peer's system worker. `/internal/v1/meta`
+  goes away. A tenant bind for a database on a peer goes to
+  `POST /internal/v1/dbs/{db}/events/bind`, and the peer's main process
+  routes it to the owner's worker by the path. A notice goes to
+  `POST /internal/v1/dbs/{db}/notice` the same way. So the main process
+  routes internal requests by path and never parses their bodies.
+- **Forward dedup moves into the worker.** Today the receiving main
+  process keeps each forwarded response whole for 60 s (code,
+  `api/mod.rs:793`; `node.rs:367`) in up to 100,000 slots (code,
+  `cluster.rs:160`). In the new design, the owner's worker keeps the
+  dedup slots, inside its cgroup. The main process passes
+  `x-baserunna-forward-id` through.
+- **Idle workers.** The main process stops an owner worker after 20 s
+  with no request (code, `worker.rs:646`). Before a planned stop, it
+  sends `Stop`. The worker ends its flushes, releases its leases, and
+  exits. A kill is also safe. The system and anonymous workers stay up.
 - **The simulator.** The simulator runs each worker as a separate
   in-process `Node` and `Engine` with its own store handle, joined by an
   in-memory duplex with the same frames. So the simulator tests the
@@ -67,185 +83,239 @@ opens a tenant database. Only the worker does.
 ## 2. The main-process list
 
 Each line: what it does | allowed item | code path (today, or planned).
+**[changed]** marks a line that revision 2 changed or added.
 
-1. Accept TCP connections, set `TCP_NODELAY` | 1 | `main.rs` `run`, `axum::serve` (today).
-2. Read HTTP headers under hyper's fixed header limits | 1 | `main.rs` `axum::serve` (today; planned: set explicit `max_headers` and header buffer size).
-3. Authenticate the request: token or session cookie, through `auth_cache` | 1 | `api/mod.rs` auth middleware, `node.rs` principal lookup (today).
-4. Look up the database record and its `owner_id` in `SYS_DB` | 1 | `node.rs` db record lookup, `WorkerPool::owner_of` (today, `worker.rs:355`).
-5. Route: pick the owner (database owner, principal owner, or anonymous) from the path; forward to the lease-holder node if the database lives on a peer | 1 | planned `api/mod.rs` `router` reduced to one fallback handler `proxy_to_worker`.
-6. Per-client and per-account rate limits on auth attempts | 1 | `node.rs` `limiter.take`, `limit_client` (today).
-7. Move request body bytes to the worker in 64 KiB chunks with a 2-chunk credit window | 2 | planned `worker.rs` `RequestStream` (replaces `worker.rs:487`).
+1. Accept TCP connections and set `TCP_NODELAY` | 1 | `main.rs` `axum::serve` (today).
+2. Read HTTP headers under hyper's fixed header limits | 1 | `main.rs` `axum::serve` (today; planned: explicit header count and buffer size).
+3. **[changed]** Authenticate the request: look up the token or cookie in `auth_cache`; on a miss, send one fixed-size point-read frame to the system worker | 1 | `node.rs` `authenticate_metered` (today `node.rs:1019`; planned: the miss goes to the system worker).
+4. **[changed]** Look up the database record and its `owner_id`, and the org role, the same way: cache, then one point-read frame | 1 | `node.rs` `resolve_db` (today; planned: the miss goes to the system worker).
+5. **[changed]** Route by the path only: a database path goes to the worker of the record's `owner_id` (for an org's database, the org's worker). This includes `/v1/dbs/{db}/...` and `/console/dbs/{db}/...` (KV, KV download and upload, blobs, transactions, tables, event queries, stream records). An org path goes to the org's worker. Other signed-in paths go to the user's worker. Paths before sign-in go to the anonymous worker. A database with its lease on a peer goes to the peer | 1 | planned `api/mod.rs` `router` with one fallback handler `proxy_to_worker`.
+6. Rate-limit auth attempts and requests per client and account | 1 | `node.rs` `limiter.take`, `limit_client` (today).
+7. Move request body bytes to a worker in 64 KiB chunks with a 2-chunk window | 2 | planned `worker.rs` `RequestStream` (replaces `worker.rs:487`).
 8. Move response body bytes to the client the same way | 2 | planned `worker.rs` `ResponseStream` (replaces `worker.rs:503`).
-9. Proxy a request to a peer node with fixed-size buffers | 2 | `cluster.rs` forward path (today; planned: check and bound its buffers).
-10. Hold each owner's in-flight semaphore (64 requests) | 2 | planned `WorkerPool::admit` (replaces `admit_light`).
-11. Apply `MetaCmd` frames from workers to `SYS_DB` after a length check, charged to the owner | 3 | planned `worker.rs` frame reader calling `node.rs` `run_meta`.
-12. Hold the `SYS_DB` lease and run its committer, flush, compaction, and sweep | 3 and 4 | `engine/db.rs` jobs on `SYS_DB` only (today).
+9. **[changed]** Forward a request to a peer: stream the body in 64 KiB chunks; keep at most one 64 KiB copy of a body for a local retry after a stale target; stream the response back | 2 | `api/mod.rs` `db_routing` (today `api/mod.rs:497` keeps up to 1 MiB, `BUFFER_FORWARD_MAX` at `api/mod.rs:426`; planned: 64 KiB).
+10. Hold each owner's in-flight semaphore of 64 requests | 2 | planned `WorkerPool::admit` (replaces `admit_light`).
+11. **[changed]** Move a `SYS_DB` commit frame from a tenant worker, or from `POST /internal/v1/sys/commit`, to the system worker: check the length before any read of the content, charge the length to the owner | 2 and 3 | planned `worker.rs` frame relay (replaces `run_meta` in the main process, and `/internal/v1/meta` at `api/mod.rs:1195`).
+12. **[changed]** Route `POST /internal/v1/dbs/{db}/events/bind` and `POST /internal/v1/dbs/{db}/notice` by the path to the owner's worker | 1 | planned `proxy_to_worker` (replaces `api/events.rs:451` `internal_bind` and `api/mod.rs:1196` `commit_notice`).
 13. Start, stop, and kill workers; wait for `populated 0`; read `memory.events` for OOM counts | 4 | `worker.rs` `start_worker`, `stop_idle_workers`, `oom_kills` (today).
-14. Heartbeat to the cluster | 4 | `node.rs` `spawn_background`, `heartbeat` (today).
-15. Refresh cluster membership | 4 | `node.rs` `refresh_members` (today).
-16. Send version notices to a database's home node: one fixed-size message | 4 | `node.rs` `notify_home` (today; planned: the worker asks the main process to send it).
-17. Receive `/internal/v1/notice` and pass the version number to the owner's worker | 1 and 4 | planned `proxy_to_worker`.
-18. Housekeeping: prune auth, name, org, and role caches; expire forward dedup entries; prune the limiter; refresh the store clock | 4 | `node.rs` `housekeeping` (today, `node.rs:1581`), minus the tenant parts below.
-19. Evict idle databases from the main `Engine`: `SYS_DB` only | 4 | `engine/mod.rs` `evict_idle` (today).
-20. Reaper: list deleted databases and expired sessions in `SYS_DB`; send each purge to the owner's worker; record the purge pass | 4 | `node.rs` `reap_deleted` (today `node.rs:1595`; planned: `engine.purge` moves to the worker).
-21. Expire sessions in `SYS_DB` | 4 | `node.rs` `reap_deleted` `MetaCmd::ExpireSessions` (today).
-22. Event-loop lag metric | 4 | `main.rs` lag loop (today).
-23. Log writer thread | 4 | `log.rs:74` (today).
-24. Health endpoint | 4 | planned `proxy_to_worker` exception; returns fixed text.
-25. Drain and shutdown: stop new requests, send `Stop` to each worker, wait for exits | 4 | `main.rs` shutdown, `node.rs` `shutdown` (today; planned: workers release their own leases).
+14. **[changed]** Heartbeat timer: send one fixed-size frame to the system worker, which writes the node record | 4 | `node.rs` `spawn_background` (today `node.rs:528`; planned: the write moves).
+15. **[changed]** Membership timer: send one fixed-size frame to the system worker; keep the member list it returns (its size is the cluster size) | 4 | `node.rs` `refresh_members` (today `node.rs:543`; planned: the read moves).
+16. Send a fixed-size version notice to a database's home node, when a worker asks | 4 | `node.rs` `notify_home` (today `node.rs:410`).
+17. **[changed]** Prune the auth, name, org, and role caches and the limiter | 4 | `node.rs` `housekeeping` (today `node.rs:1581`); see the sizes below.
+18. **[changed]** Reaper timer: send one fixed-size frame to the system worker | 4 | `node.rs:561` (today it runs `reap_deleted` in process, `node.rs:1595`).
+19. Event-loop lag metric | 4 | `main.rs:245` (today).
+20. Log writer thread | 4 | `log.rs:74` (today).
+21. Health endpoint: fixed text | 4 | `api/mod.rs` `healthz` (today).
+22. Drain and shutdown: stop new requests, send `Stop` to each worker, wait for each `populated 0` | 4 | `main.rs` shutdown, `node.rs` `shutdown` (today; planned: workers release their own leases).
+
+**Removed from revision 1:** `run_meta` in the main process (old item
+11); `SYS_DB` flush, compaction, and sweep in the main process (old item
+12); the reaper scan and session expiry in the main process (old items
+20 and 21); idle eviction of `SYS_DB` in the main process (old item 19,
+because the main process has no `Db` now); the store clock refresh (in
+old item 18; the system worker sends the store time with each answer).
+
+**Cache and limiter sizes (item 17).**
+
+| Cache | Entry count | Largest entry | Code |
+| --- | --- | --- | --- |
+| `auth_cache` (token hash → `Principal`) | today 100,000; planned 4,096 | planned 1 KiB | `node.rs:330`, `:360` |
+| `name_cache` (owner, name → `DbRecord`) | today 100,000; planned 4,096 | planned 1 KiB | `node.rs:361` |
+| `org_cache` (id → `Org`) | today 100,000; planned 4,096 | planned 1 KiB | `node.rs:362` |
+| `role_cache` (org, user → `Role`) | today 100,000; planned 4,096 | planned 1 KiB | `node.rs:363` |
+| limiter buckets and failures | today 100,000 keys; planned 16,384 | planned 512 B key | `limits.rs:138` |
+
+- **Today the entry count is fixed** at 100,000 per cache (code,
+  `node.rs:330`; `util/ttl.rs:31`). Negative entries count too, so an
+  attacker fills a cache cheaply with names that do not exist (code,
+  `util/ttl.rs:27` stores `Option<V>`).
+- **Today the entry size is fixed only in part.** An email is at most
+  254 bytes (code, `auth.rs:45`). A database name is at most 63 bytes
+  (code, `meta/mod.rs:194`). An org name is at most 39 bytes (code,
+  `meta/org.rs:154`). `User.google_sub` and `User.password_hash` have no
+  length check in our code (inferred: a search found none).
+- **Planned fix.** `TtlCache::store` refuses an entry whose encoded key
+  plus value is over 1 KiB. Such a request reads from the system worker
+  each time and is not cached. The count drops to 4,096. So the four
+  caches hold at most 4 × 4,096 × 1 KiB = 16 MiB (inferred bound from
+  the planned limits). The limiter holds at most 16,384 × 512 B = 8 MiB.
 
 **Background jobs the node runs today, and where each runs after the change:**
 
 | Job | Code (today) | Runs in |
 | --- | --- | --- |
-| Commit batching (`committer`) | `engine/db.rs:1010` | worker (tenant); main (`SYS_DB`) |
-| Tail flush | `engine/db.rs:2040` | worker; main for `SYS_DB` |
-| Parked flush | `engine/db.rs:2114` | worker; main for `SYS_DB` |
-| LSM compaction | `engine/db.rs:2007` | worker; main for `SYS_DB` |
-| GC delete of obsolete objects | `engine/db.rs:1986` | worker; main for `SYS_DB` |
-| GC sweep | `engine/db.rs:2296` (`maybe_sweep`) | worker; main for `SYS_DB` |
-| Stream retention trims | `engine/db.rs:2133` | worker |
-| Reload on notice (`load_noticed`) | `engine/db.rs:973` | worker |
-| Segment and levels uploads | `engine/version.rs:207`, `:230`, `:250` | worker; main for `SYS_DB` |
-| Event seals | `events/maint.rs:73` | worker (no job hop) |
-| Event part merges | `events/maint.rs:906`, `:1046` | worker (no job hop) |
-| Event bulk flush | `events/bulk.rs:102`, `:131` | worker |
-| Stream follow (SSE) | `api/streams.rs:375` | worker |
-| Interactive transaction expiry | `node.rs` `txns.expire` | worker |
-| Database purge | `engine/mod.rs:446` | worker of the owner |
-| Heartbeat, membership, notices | `node.rs:528`-`:561`, `:427` | main |
-| Housekeeping (caches, limiter) | `node.rs:553` | main |
-| Reaper scan of `SYS_DB` | `node.rs:561` | main |
+| Commit batching (`committer`) | `engine/db.rs:1010` | owner worker; system worker for `SYS_DB` |
+| Tail flush | `engine/db.rs:2040` | owner worker; system worker for `SYS_DB` |
+| Parked flush | `engine/db.rs:2114` | owner worker; system worker for `SYS_DB` |
+| LSM compaction | `engine/db.rs:2007` | owner worker; system worker for `SYS_DB` |
+| GC delete of obsolete objects | `engine/db.rs:1986` | owner worker; system worker for `SYS_DB` |
+| GC sweep | `engine/db.rs:2296` (`maybe_sweep`) | owner worker; system worker for `SYS_DB` |
+| Stream retention trims | `engine/db.rs:2133` | owner worker |
+| Reload on notice (`load_noticed`) | `engine/db.rs:973` | owner worker |
+| Segment and levels uploads | `engine/version.rs:207`, `:230`, `:250` | owner worker; system worker for `SYS_DB` |
+| Event seals | `events/maint.rs:73` | owner worker |
+| Event part merges | `events/maint.rs:906`, `:1046` | owner worker |
+| Event bulk flush | `events/bulk.rs:102`, `:131` | owner worker |
+| Stream follow (SSE) | `api/streams.rs:375` | owner worker |
+| Interactive transaction expiry | `node.rs:1584` `txns.expire` | owner worker |
+| Idle database eviction | `engine/mod.rs:433` | owner worker; system worker for `SYS_DB` |
+| Forward dedup expiry | `node.rs:1589` | owner worker |
+| Reaper scan of deleted databases | `node.rs:1607` | system worker |
+| Database purge | `engine/mod.rs:446` | owner worker, on a frame from the system worker |
+| Session expiry | `node.rs:1616` | system worker |
+| Heartbeat write | `node.rs:528` | system worker (main keeps the timer) |
+| Membership read | `node.rs:543` | system worker (main keeps the timer) |
+| Version notices to peers | `node.rs:427` | main |
+| Cache and limiter prunes | `node.rs:553` | main |
 | Idle worker stop | `main.rs:236` | main |
 | Lag metric | `main.rs:245` | main |
-| Mail send retries | `node.rs:1307` | worker that served the route |
+| Mail send retries | `node.rs:1307` | the worker that served the route |
 
 **Items I am unsure about:**
 
-- **`SYS_DB` as tenant data.** Item 4 reads one record, which the rules
-  allow. Routes that list an owner's databases, tokens, or members scan
-  `SYS_DB`. I put those in the worker. The `MetaCmd` apply (item 11) does
-  conflict checks on `SYS_DB`, whose size grows with the number of
-  records. I count `SYS_DB` as system data, not tenant data.
-- **Lease placement.** Rule item 3 lets the main process hold leases. I
-  move tenant leases into the worker, because the lease is a field of the
-  tenant manifest. The main process does less than item 3 allows.
-- **Health endpoint** (item 24) answers in the main process.
-- **Peer forwarding** (item 9). I have not read the forward path yet.
-  If it buffers whole bodies, round 2 changes it to the same chunked
-  frames.
+- **The system worker is shared.** One tenant that floods `SYS_DB`
+  commits can slow authentication for other tenants on that node. Its
+  memory has a kernel bound, so it cannot kill the node. Each owner's
+  commit frames count against its 64 in-flight requests, and the
+  limiter caps account actions. I have not measured this.
+- **Health endpoint** (item 21) answers in the main process with fixed
+  text.
+- **Hyper's own buffers** on the peer client and server (item 9). I
+  infer they are of fixed size per connection; I have not checked the
+  hyper settings.
 
 ## 3. The guard and the two tests
 
-**Two layers make a main-process read of tenant data impossible.**
+**The main process has no path to tenant data, and two layers enforce
+it.**
 
-1. **No tenant `Db` in the main process.** `Shared` gets a
-   `ProcessRole`: `Main`, or `Worker { owner }`. In `Main`,
-   `Engine::db(id)` fails for every `id` other than `SYS_DB`. Every
-   `Txn`, `Version`, segment read, blob read, event part read, and stream
-   read starts from a `Db`. So with no `Db`, none of these can exist.
-   Each of those six constructors also checks the role and the database
-   ID, so the checker can see the guard at each named path:
-   `Txn::new`, `Version::new`, segment open, `BlobRef` read, part read,
-   stream read.
-2. **A store guard below everything.** The main process's store handle
-   is a `GuardedStore`. It fails every `get`, `head`, `list`, `put`, and
-   `delete` whose key is under a tenant database prefix, and it records
-   `Probe::MainTenantStoreAccess`. Every read path, cache fill, and
-   background job ends in the store, so this layer catches any path that
-   layer 1 misses. In a worker, the same guard fails a key of a database
-   whose record names another owner.
+1. **No `Db` in the main process.** `Shared` gets a `ProcessRole`:
+   `Main`, `System`, `Anonymous`, or `Owner { owner }`. In `Main`,
+   `Engine::db(id)` fails for every `id`, `SYS_DB` included. Every `Txn`,
+   `Version`, segment read, blob read, event part read, and stream read
+   starts from a `Db`, so none of them can exist in the main process.
+   Each of these six constructors also checks the role, so the checker
+   can see the guard at each named path: `Txn::new`, `Version::new`,
+   segment open, `BlobRef` read, part read, and stream read.
+2. **No store in the main process.** The main process's store handle is
+   `DeniedStore`. It fails every `get`, `head`, `list`, `put`, and
+   `delete`, and records `Probe::MainStoreAccess`. Every read path,
+   cache fill, and background job ends in the store, so this layer
+   catches any path that layer 1 misses.
+
+The coordinator allows `SYS_DB` point reads in the main process for
+authentication and the database lookup. This design does not use that
+permission: those reads happen in the system worker. So the guard has no
+exception.
+
+In a worker, `GuardedStore` fails a key of a database whose record names
+another owner, and a tenant key in the system worker.
 
 In tests and the simulator, a guard hit panics. In production, it returns
 an internal error and counts a metric.
 
-**Background jobs.** Tenant background jobs start only from a tenant
-`Db`, so layer 1 stops them in the main process. Layer 2 catches any job
-that reaches the store another way. The reaper's purge goes to a worker,
-so the main process never lists tenant keys.
+**Background jobs.** All storage background jobs start from a `Db`, so
+layer 1 stops them in the main process. Layer 2 catches any job that
+reaches the store another way. The main process's own timers (items 14,
+15, 18) send frames and touch no store.
 
 **Test 1: every route runs with the guard on.** The route table becomes
-one constant, `DB_ROUTES` (and `ACCOUNT_ROUTES`, `CONSOLE_ROUTES`), and
-the worker router is built from it. A test builds the router, then
-checks that the OpenAPI spec and the console route list name the same
-set (so no route escapes the table). For each entry, a fixture sends a
-valid request through a real main process and a real worker (in-process
-duplex), with the guard in panic mode. The test fails on any guard hit
-or on a 5xx.
+constants (`DB_ROUTES`, `ACCOUNT_ROUTES`, `ORG_ROUTES`, `CONSOLE_ROUTES`,
+`INTERNAL_ROUTES`, `ANON_ROUTES`), and the worker router is built from
+them. A test checks that the OpenAPI spec and the console route list
+name the same set as the tables, so no route escapes them. For each
+entry, a fixture sends a valid request through a real main process and
+real workers (in-process duplex), with the guard in panic mode. The test
+fails on any guard hit or any 5xx.
 
 **Test 2: every route goes through the boundary.** The main router has
-auth middleware and one fallback handler, `proxy_to_worker`, and no
-other handler except health. The test runs every entry of the route
-table and asserts that each request produced exactly one `Open` frame to
-a worker (a counter per frame). A second check asserts that the main
-router has no route besides health, by a request to each table path on a
-main router whose worker side is cut: each must fail with the worker's
-"unavailable" error, not a handler's answer.
+the auth middleware, `healthz`, and one fallback, `proxy_to_worker`. The
+test runs every table entry and asserts that each request produced
+exactly one `Open` frame to the expected worker: owner, org, user,
+system, or anonymous. A second check cuts the worker side and sends each
+table path. Each must fail with the "worker unavailable" error, not with
+a handler's answer. So no table path has a handler in the main process.
 
 ## 4. Sources of extra cost
 
 1. **The crossing.** An empty Unix-socket round trip cost 42% of KV
    throughput (measured, `BENCH_BOUNDARY` on `iso/floor` at e7085b8).
-   Every KV request now crosses. To keep it small:
+   Every request now crosses. To keep it small:
    - binary frame headers instead of `serde_json` (code, `worker.rs:614`
      encodes every header as JSON);
    - one writer task per direction that writes all queued frames in one
      `write` call, so one syscall carries many requests under load;
    - a body that fits in the `Open` frame (most KV requests) needs no
      extra frame;
-   - a worker runtime with one thread per core, so one owner's 256
-     clients are not serial.
-   - If the cost stays above about 10%, a shared-memory ring with an
-     eventfd replaces the socket (round 4).
-2. **Copies.** Each body is copied once more: socket to worker. Chunks
+   - a worker runtime with one thread per core;
+   - if the cost stays above about 10%, a shared-memory ring with an
+     eventfd replaces the socket (round 6).
+2. **Auth cache misses** now cost a crossing to the system worker. The
+   cache has a 30 s TTL (code, `node.rs:101`), so a steady client pays it
+   once per 30 s.
+3. **Copies.** Each body is copied once more: socket to worker. Chunks
    are `Bytes`, so the main process does not copy them again.
-3. **Idle workers.** Workers stop after 20 s idle, so 1,000 idle owners
-   have no processes. A cold owner pays a process start, a lease
-   acquire, and a manifest load on its first request.
-4. **Worker memory.** Each running worker has its own runtime, caches,
-   and allocator. The worker block cache counts against its 512 MiB.
-   I set a smaller cache per worker (a limit, which rule 3.5 allows; the
-   report names this option in "Product decisions"). This also helps the
-   "top users" query that hit the 512 MiB limit in 19 of 40 runs
-   (measured, round 2 verdict eaa6b97).
-5. **Victim latency, about +33% with no attacker** (measured, round 2).
-   Suspects, to test one at a time in round 4:
-   `GLIBC_TUNABLES` `mmap_threshold=131072` (code, `worker.rs:686`), which
-   maps and unmaps each large buffer; the JSON frame headers; the cold
-   worker start inside phase A.
-6. **Lease handoff on restart.** A new worker incarnation must take the
-   lease again. Today's lease code fences by the manifest etag, so this
-   costs one store round trip per database (inferred).
+4. **Idle workers.** Owner workers stop after 20 s idle, so 1,000 idle
+   owners have no processes. A cold owner pays a process start, a lease
+   acquire, and a manifest load on its first request. The system and
+   anonymous workers are a fixed cost per node.
+5. **Worker memory.** Each running worker has its own runtime, caches,
+   and allocator. The worker block cache counts against its bound. I set
+   a smaller cache per worker (a limit, which rule 3.5 allows). This
+   also helps the "top users" query that hit the 512 MiB limit in 19 of
+   40 runs (measured, round 2 verdict eaa6b97).
+6. **Victim latency, about +33% with no attacker** (measured, round 2).
+   Suspects, to test one at a time:
+   `GLIBC_TUNABLES` `mmap_threshold=131072` (code, `worker.rs:686`), the
+   JSON frame headers, and the cold worker start inside phase A.
+7. **Lease handoff on restart.** A new worker incarnation takes the
+   lease again: about one store round trip per database (inferred).
+8. **Peer forwards.** A retry buffer of 64 KiB instead of 1 MiB means a
+   body between 64 KiB and 1 MiB gets a retryable 503 after a stale
+   target, where today the node runs it locally (code,
+   `api/mod.rs:512`).
 
 ## 5. Plan for rounds 2 to 8
 
 1. **Round 2: boundary and streaming.** Binary frames; streamed request
    and response bodies with credit windows; per-owner in-flight
-   semaphore; delete the light list and the per-site charges; main
-   router reduced to `proxy_to_worker`.
-2. **Round 3: the worker owns the database.** Tenant `Db`, lease,
-   committer, flush, compaction, sweep, trims, and event maintenance move
-   into the worker. Remove `Job::Query`, `ReadTxn`, `TableQuery`,
-   `BlobValue`, `Merge`, `Seal`, `BulkInsert` and the commit and bind
-   frames: the worker's own router runs them. Add `MetaCmd` frames and
-   the purge job. Account, org, console, and anonymous routes go to
-   workers.
-3. **Round 4: the guard and the two route tests.** `ProcessRole`,
-   `GuardedStore`, constructor checks, `DB_ROUTES` table, both tests.
-   Run `cargo test -p baserunna --lib`.
-4. **Round 5: the simulator.** In-process workers over a duplex,
-   worker kills and restarts as simulator faults, lease handoff between
-   incarnations. Run `cargo test -p baserunna --test sim`.
-5. **Round 6: cost.** Measure the crossing on KV throughput, idle cost,
-   the event scan, and the victim's latency alone. Fix the largest cost
-   first. Shared-memory ring if the socket stays above about 10%.
-6. **Round 7: all 8 workloads, small and attack, two runs each,** in
-   the VM. Fix failures without changes to the exercised algorithms.
-7. **Round 8: margin and review.** Re-run failing cells, check the 64 MiB
-   margin over the victim's worker plus the main process, and review the
-   diff against rule 3.5.
+   semaphore; delete the light list and the per-site charges.
+2. **Round 3: the main router and the system worker.** Main router
+   reduced to `proxy_to_worker`; the system worker with the `SYS_DB`
+   lease, point-read frames, heartbeat, membership, reaper, and session
+   expiry; the anonymous worker; path-routed internal routes; bounded
+   caches and limiter; 64 KiB forward retry buffer.
+3. **Round 4: the owner worker owns the database.** Tenant `Db`, lease,
+   committer, flush, compaction, sweep, trims, and event maintenance in
+   the worker; meta command logic in the worker's `Txn` with commit
+   frames; forward dedup in the worker; purge frames. Remove the old job
+   kinds (`Query`, `ReadTxn`, `TableQuery`, `BlobValue`, `Merge`,
+   `Seal`, `BulkInsert`) and the bind frame.
+4. **Round 5: the guard and the two route tests.** `ProcessRole`,
+   `DeniedStore`, `GuardedStore`, constructor checks, route tables, both
+   tests. Run `cargo test -p baserunna --lib`.
+5. **Round 6: the simulator and cost.** In-process workers over a
+   duplex, worker kills as simulator faults, lease handoff. Run
+   `cargo test -p baserunna --test sim`. Measure the crossing.
+6. **Round 7: all 8 workloads, small and attack, two runs each,** in the
+   VM. Fix failures without changes to the exercised algorithms.
+7. **Round 8: margin, costs, and review.** Re-run failing cells, check
+   the 64 MiB margin, review the diff against rule 3.5.
 
-**Fit.** Rounds 2 and 3 are the largest. They move every handler and
-every background job. If round 3 does not finish, the guard (round 4)
-still lands, and its panics list what remains. The plan is tight; the
-simulator round is the most likely to slip.
+**Fit.** The plan does not fit well in 8 rounds. The system worker adds
+about one round. Rounds 3 and 4 move every handler and every background
+job, and the simulator and cost work share round 6. I drop no work. If
+a round slips, the order stays the same, and the guard (round 5) lists
+by its panics what remains.
+
+## 6. Changes in revision 2
+
+| Coordinator item | Change |
+| --- | --- |
+| 1. `run_meta` in the main process | The tenant worker runs the meta logic in its own `Txn` and sends a commit frame. The main process checks its length and moves it. The system worker checks conflicts and commits. `/internal/v1/meta` becomes `/internal/v1/sys/commit`. List items 11 and 12. |
+| 2. `SYS_DB` upkeep in the main process | The system worker holds the `SYS_DB` lease and runs all its upkeep. The main process opens no `Db` at all. |
+| 3. Reaper and session expiry | Both run in the system worker. The main process keeps only the timer (item 18). |
+| 4. Peer forwarding | Today the sender keeps up to 1 MiB per request (code, `api/mod.rs:426`, `:497`). The receiver keeps each forwarded response whole for 60 s in up to 100,000 slots (code, `api/mod.rs:793`, `cluster.rs:160`, `node.rs:367`). `forward_internal` and `forward_meta` collect whole responses (code, `node.rs:947`, `:983`). Fix: 64 KiB retry buffer; dedup in the owner worker; the internal forwards move to workers. Item 9. |
+| 5. `/internal/v1/events/bind` | Path-routed to the owner's worker. Item 12. |
+| 6. Console routes for a database | Routed to the worker of the record's `owner_id`, which is the org for an org's database. Item 5. |
+| Item 18 condition | Sizes above. Today only the count is fixed (100,000); the planned limits fix both. |

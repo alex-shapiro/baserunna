@@ -181,10 +181,23 @@ One host tokio task drives each instance. It loops:
 
 ### 1.7 Idle owners
 
-An instance with no requests in flight, no open transactions, and no
-pending background work for a fixed time (planned 30 s) quiesces and goes
-away. Its state is on the store. So 1,000 idle owners hold no instance
-memory.
+- The idle cost test makes 1,000 owners touch one database each, then
+  reads node memory for 30 s (code, `examples/isolation/idle_cost.rs:1`,
+  `:12`, `:14`). If all 1,000 instances stay live, the node holds 1,000
+  instance heaps.
+- So an instance with no requests in flight, no open transactions, and no
+  pending background work for 2 s quiesces and goes away. Its state is on
+  the store. After that, an idle owner holds no instance memory.
+- The host lease table keeps the lease of a dropped instance's databases
+  until the lease ends, because the host holds leases (item 3).
+- New instances map the initial heap copy-on-write (`memory_init_cow`), so
+  an instance's resident memory is only the pages it touches. The size of
+  a fresh instance with one open database is not measured yet. Round 2
+  measures it.
+- A fixed node-wide cap on live instances (planned 512) protects the node
+  if many owners are active at once. When the cap is full, the host drops
+  the least recently used quiesced instance. If no instance is quiesced, the
+  new owner's request gets a retryable 503.
 
 ## 2. The main-process list
 
@@ -334,7 +347,9 @@ where it runs after the change.
 | Crossing per request | A small request crosses once in (head and body together) and once out (head and body together). A warm-instance call cost 7% of KV throughput for 2 crossings (measured, round 2 evidence, `BENCH_BOUNDARY`). |
 | Crossings per store call | Start and completion share the next `guest_poll`. One poll delivers all completions that are ready. |
 | Copies into and out of guest memory | One copy each way for HTTP bodies, in 64 KiB chunks. One copy for store gets, frame by frame. No copy for store puts. |
-| One core per owner | All work of one owner runs on one instance. A single hot owner cannot use more than one core. KV throughput at 256 clients is the test of this cost (inferred risk; measure in round 3). |
+| One core per owner | All work of one owner runs on one instance, so a single hot owner cannot use more than one core. The KV throughput test uses 10 owners with 200 databases each on 4 vCPUs (code, `examples/isolation/kv_throughput.rs:5`, `:6`, `:11`), so this limit does not bind there. |
+| Instance per active owner | Each active owner pays one guest heap. The 2 s idle drop and copy-on-write heap keep idle cost small. Measure the fresh-instance size in round 2. |
+| Reload after an idle drop | A dropped owner's next request reloads its manifest from the store (one GET at 20 ms in the harness). |
 | Speed of guest code | Epoch interruption instead of fuel. Build the guest with `simd128`, `opt-level=3`, LTO, one codegen unit. Cranelift with `opt_level=speed`. |
 | Module compile at start | Compile ahead of time to a `.cwasm` and load it with `Module::deserialize_file`, which maps the file. Round 2 paid a fixed 97 MiB (measured, round 2 evidence; its cause is inferred). |
 | Instance start | Pooling allocator with copy-on-write memory images, so a new instance maps the initial heap. |

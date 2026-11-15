@@ -58,6 +58,7 @@ pub struct Sandbox {
     linker: Linker<GuestState>,
     owner_memory: Arc<Mutex<HashMap<String, OwnerMemory>>>,
     idle: IdleInstances,
+    idle_sweeper_running: Arc<std::sync::atomic::AtomicBool>,
     owner_memory_bound: usize,
     last_instance_peak: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -310,6 +311,7 @@ impl Sandbox {
             linker,
             owner_memory: Arc::default(),
             idle: Arc::default(),
+            idle_sweeper_running: Arc::default(),
             owner_memory_bound,
             last_instance_peak: Arc::default(),
         })
@@ -478,13 +480,7 @@ impl Sandbox {
         } else {
             dropped.push(warm);
         }
-        let now = tokio::time::Instant::now();
-        for pool in idle.values_mut() {
-            let (fresh, stale): (Vec<_>, Vec<_>) =
-                std::mem::take(pool).into_iter().partition(|w| now.duration_since(w.idle_since) < IDLE_INSTANCE_TTL);
-            *pool = fresh;
-            dropped.extend(stale);
-        }
+        dropped.extend(take_stale(&mut idle));
         let mut idle_memory: usize = idle.values().flatten().map(|w| w.linear_memory).sum();
         while idle_memory > NODE_IDLE_MEMORY_MAX {
             let oldest = idle
@@ -497,8 +493,45 @@ impl Sandbox {
             dropped.push(w);
         }
         idle.retain(|_, pool| !pool.is_empty());
+        let start_sweeper = !idle.is_empty() && !self.idle_sweeper_running.swap(true, std::sync::atomic::Ordering::AcqRel);
         drop(idle);
         drop(dropped);
+        if start_sweeper {
+            tokio::spawn(sweep_idle(Arc::downgrade(&self.idle), self.idle_sweeper_running.clone()));
+        }
+    }
+}
+
+/// Removes the instances idle for `IDLE_INSTANCE_TTL` or longer from `idle`.
+fn take_stale(idle: &mut HashMap<String, Vec<WarmInstance>>) -> Vec<WarmInstance> {
+    let now = tokio::time::Instant::now();
+    let mut stale = Vec::new();
+    for pool in idle.values_mut() {
+        let (fresh, old): (Vec<_>, Vec<_>) =
+            std::mem::take(pool).into_iter().partition(|w| now.duration_since(w.idle_since) < IDLE_INSTANCE_TTL);
+        *pool = fresh;
+        stale.extend(old);
+    }
+    idle.retain(|_, pool| !pool.is_empty());
+    stale
+}
+
+/// Drops stale idle instances until the pool is empty, so an idle node holds no instance and wakes no task.
+async fn sweep_idle(idle: std::sync::Weak<Mutex<HashMap<String, Vec<WarmInstance>>>>, running: Arc<std::sync::atomic::AtomicBool>) {
+    loop {
+        tokio::time::sleep(IDLE_INSTANCE_TTL / 4).await;
+        let Some(idle) = idle.upgrade() else { break };
+        let mut pool = idle.lock();
+        let stale = take_stale(&mut pool);
+        let empty = pool.is_empty();
+        if empty {
+            running.store(false, std::sync::atomic::Ordering::Release);
+        }
+        drop(pool);
+        drop(stale);
+        if empty {
+            break;
+        }
     }
 }
 
@@ -734,6 +767,22 @@ pub(crate) mod tests {
         assert!(matches!(err, Error::TooLarge(_) | Error::Unavailable { .. }), "{err:?}");
         sandbox.evict_idle_instances();
         assert_eq!(sandbox.owner_memory_used("o1"), 0);
+    }
+
+    #[test]
+    fn idle_instances_return_memory_to_their_owner() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+        rt.block_on(async {
+            let sandbox = Sandbox::new(&guest_wasm(), OWNER_MEMORY_BOUND).unwrap();
+            sandbox.parse_json("o1", b"[1]").await.unwrap();
+            let held = sandbox.owner_memory_used("o1");
+            assert!(held > 0, "the idle instance stays charged to its owner");
+            sandbox.parse_json("o1", b"[2]").await.unwrap();
+            assert_eq!(sandbox.owner_memory_used("o1"), held, "the second call reuses the idle instance");
+            tokio::time::sleep(IDLE_INSTANCE_TTL * 2).await;
+            assert_eq!(sandbox.owner_memory_used("o1"), 0);
+            assert!(!sandbox.idle_sweeper_running.load(std::sync::atomic::Ordering::Acquire), "the sweeper stops");
+        });
     }
 
     #[test]

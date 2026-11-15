@@ -329,6 +329,7 @@ fn batch_limit(limit: Option<usize>) -> Result<Option<usize>> {
 pub struct OpCtx<'a> {
     pub db: &'a Arc<Db>,
     pub encoding: api::Encoding,
+    #[cfg(feature = "server")]
     pub access: crate::meta::Access,
     /// Blob values up to this size are returned inline in JSON.
     pub json_value_max: u64,
@@ -464,6 +465,7 @@ pub async fn exec_ops(ctx: &OpCtx<'_>, txn: &mut Txn, ops: &[Op]) -> Result<Vec<
     let mut results = Vec::with_capacity(ops.len());
     for (i, op) in ops.iter().enumerate() {
         if op.is_write() {
+            #[cfg(feature = "server")]
             ctx.access.require_write()?;
         }
         let r = exec_one(ctx, txn, op, i).await.map_err(|e| match e {

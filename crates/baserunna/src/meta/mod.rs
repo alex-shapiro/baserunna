@@ -94,12 +94,10 @@ pub struct Session {
     pub password_fp: String,
 }
 
-#[cfg(feature = "server")]
 pub fn password_fp(user: &User) -> String {
     password_hash_fp(user.password_hash.as_deref())
 }
 
-#[cfg(feature = "server")]
 fn password_hash_fp(hash: Option<&str>) -> String {
     crate::auth::fingerprint(hash.unwrap_or(""))
 }

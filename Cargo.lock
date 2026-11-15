@@ -165,6 +165,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "sha2",
  "tokio",
  "tower",
  "wasmtime",
@@ -212,8 +213,12 @@ dependencies = [
 name = "baserunna-guest"
 version = "0.1.0"
 dependencies = [
+ "baserunna",
  "baserunna-core",
+ "bytes",
+ "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

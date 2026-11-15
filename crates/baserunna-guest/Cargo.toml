@@ -10,4 +10,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 serde_json.workspace = true
+serde.workspace = true
 baserunna-core.workspace = true
+baserunna = { path = "../baserunna", default-features = false, features = ["guest"] }
+bytes = "1"
+tokio = { version = "1", default-features = false, features = ["rt", "time", "test-util"] }

@@ -34,6 +34,30 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+#[cfg(not(feature = "server"))]
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).into()
+}
+
+/// Incremental SHA-256 for builds without the server, such as the guest.
+#[cfg(not(feature = "server"))]
+#[derive(Default)]
+pub struct Sha256(sha2::Sha256);
+
+#[cfg(not(feature = "server"))]
+impl Sha256 {
+    pub fn new() -> Sha256 {
+        Sha256::default()
+    }
+    pub fn update(&mut self, data: &[u8]) {
+        sha2::Digest::update(&mut self.0, data);
+    }
+    pub fn finish(self) -> [u8; 32] {
+        sha2::Digest::finalize(self.0).into()
+    }
+}
+
 #[cfg(feature = "server")]
 pub struct Sha256(aws_lc_rs::digest::Context);
 

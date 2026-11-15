@@ -23,6 +23,7 @@ pub mod limits;
 pub mod log;
 #[cfg(feature = "server")]
 pub mod mail;
+#[cfg(feature = "server")]
 pub mod meta;
 pub mod metrics;
 #[cfg(feature = "server")]

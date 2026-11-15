@@ -537,7 +537,7 @@ fn input_type(meta: &PartMeta, ci: usize) -> JType {
     }
 }
 
-async fn merge_parts(
+pub async fn merge_parts(
     shared: &Shared,
     db: &str,
     s: &EventSchema,

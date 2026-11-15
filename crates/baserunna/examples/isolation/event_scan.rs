@@ -41,7 +41,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 /// Loads the table, runs `rounds` rounds of the 7 queries, and returns the measurements.
-/// A failed query in a round counts in `failed_queries` and is left out of the medians.
+/// A failed query, in the warm-up or in a round, counts in `failed_queries` and is left out of the medians.
 pub async fn run(api: &Api, owner: &Owner, cg: &NodeCgroup, rounds: usize) -> Result<Json, String> {
     let (token, db) = (&owner.token, &owner.db);
     api.create_event_table(
@@ -74,11 +74,13 @@ pub async fn run(api: &Api, owner: &Owner, cg: &NodeCgroup, rounds: usize) -> Re
     let setup_s = started.elapsed().as_secs_f64();
     let path = format!("/v1/dbs/{db}/events/ev/rows/query");
     let queries = queries();
+    let mut failures = Vec::new();
     for (name, q) in &queries {
-        api.expect(Method::POST, &path, token, q.to_string(), &[200]).await.map_err(|e| format!("{name}: {e}"))?;
+        if let Err(e) = api.expect(Method::POST, &path, token, q.to_string(), &[200]).await {
+            failures.push(format!("warm-up {name}: {e}"));
+        }
     }
     let mut wall_ms = vec![Vec::new(); queries.len()];
-    let mut failures = Vec::new();
     let cpu_before = cg.cpu_usage_usec();
     let bench_started = Instant::now();
     for _ in 0..rounds {

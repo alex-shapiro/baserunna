@@ -1,5 +1,5 @@
-//! Event scan benchmark from `event_scan_cpu` (tests/event_query_limits.rs), run over HTTP:
-//! 1,000,000 events from 500,000 users over 10 days, then rounds of 7 queries.
+//! Event scan benchmark over HTTP: 1,000,000 events from 500,000 users over 10 days, then rounds
+//! of 7 queries.
 
 use crate::cgroup::NodeCgroup;
 use crate::http::{Api, Owner};

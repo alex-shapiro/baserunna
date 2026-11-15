@@ -1,5 +1,4 @@
-//! Value checks on a 256 MiB blob, from `full_blob_reads_respect_node_memory_budget`
-//! (tests/blob_memory_limits.rs). Each check compares the whole blob with a short value and
+//! Value checks on a 256 MiB blob. Each check compares the whole blob with a short value and
 //! fails with 412.
 
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload, concurrent_posts};

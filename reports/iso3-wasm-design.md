@@ -58,8 +58,10 @@ store calls for the guest, and holds leases.
 - A paused tokio clock jumps to the next timer when the runtime has no
   ready task. A host call in flight must not let it jump. So `guest_poll`
   runs tasks with `yield_now` steps, which park with a zero timeout and so
-  advance the clock by zero (inferred from tokio's time driver; verify in
-  round 2). `Env::spawn` already wraps each task in `SimTask` (code,
+  advance the clock by zero. A runtime with a deferred task parks with a
+  zero timeout (code, tokio 1.54.1 `runtime/scheduler/current_thread/mod.rs:445`,
+  `:457`), and the time driver caps the advance at that timeout (code,
+  tokio 1.54.1 `runtime/time/mod.rs:235`). `Env::spawn` already wraps each task in `SimTask` (code,
   `env.rs:38`). A poll counter in `SimTask` tells the step loop when one
   full step polled no task, which means the guest is idle.
 - Tokio does not expose the next timer deadline. So the host polls an
@@ -92,16 +94,32 @@ One host tokio task drives each instance. It loops:
   hyper body. A slow client makes the guest task wait. It does not make
   the host buffer grow.
 - **Store calls.** The guest's `ObjectStore` is `GuestStore`. Each method
-  is a host call that starts the store call and returns a ticket. The host
-  does the call and streams the body into guest memory in chunks of at
-  most 1 MiB. A put streams its body out of guest memory in chunks of at
-  most 1 MiB. This needs streaming get and put on `store::cloud`. Today
-  `ObjectStore::get` returns the whole object as one `Bytes` (code,
-  `store/mod.rs:109`). Each owner has a fixed limit on store calls in
-  flight (planned 16). The host never parses, decodes, caches, or indexes
-  these bytes. The harness store is a fake S3 in another process (code,
-  `scripts/isolation/run.sh:64`), so the node uses `store::cloud`, and an
-  HTTP body can stream.
+  is a host call that starts the store call and returns a ticket. Each
+  owner has a fixed limit on store calls in flight (planned 16). The host
+  never parses, decodes, caches, or indexes these bytes. The harness store
+  is a fake S3 in another process (code, `scripts/isolation/run.sh:64`),
+  so the node uses `store::cloud`.
+- **Store gets.** The host reads the response body as a stream of HTTP
+  frames and copies each frame into guest memory. The host holds one frame
+  per call. Today `ObjectStore::get` returns the whole object as one
+  `Bytes` (code, `store/mod.rs:109`), so round 5 adds a streaming get.
+- **Store puts.** A put can be large: an event part can be 32 MiB (code,
+  `engine/config.rs:172`, `event_chunk_bytes`). `object_store` puts take
+  the whole payload (code, `store/cloud.rs:154`, `PutPayload`). A host
+  copy of a 32 MiB body would not fit in the 64 MiB margin with the
+  victim. So the host does not copy a put body. It gives `object_store` a
+  `Bytes` that points into the guest's linear memory, where the bytes
+  already count against the guest's limit.
+  - This is safe only if the linear memory does not move or unmap while
+    the put is in flight. Wasmtime on a 64-bit host reserves the whole
+    4 GiB address range of a 32-bit memory, so a grow does not move it
+    (inferred from wasmtime's default `memory_reservation`; set it
+    explicitly and test it in round 5).
+  - The guest keeps the buffer alive and unchanged until the ticket
+    completes. The host keeps the instance's store alive until each put in
+    flight ends, also after a trap.
+  - If this proves unsafe, the fallback is a host buffer of fixed size per
+    put (the largest object size) and at most 2 puts in flight per owner.
 - **Block cache and disk cache.** The block cache lives in the guest
   (`engine::cache`), so the instance memory limit bounds it. The local disk
   tier (`engine::local`) keeps an LRU index of tenant objects in the host
@@ -200,14 +218,17 @@ the item of the requirement. "Planned" paths do not exist yet.
 | `/internal/v1/meta` | 2, 3 | sent to the system instance; size check and charge first |
 | `/internal/v1/notice` (fixed-size: database id and version) | 2 | sent to the owner instance if it is live; dropped if not |
 | Internal auth of peer requests | 1 | `api/mod.rs:873` `internal_auth` |
+| Per-route latency metrics, keyed by route template (a fixed set) | 1 | `metrics.rs:155` `ServerMetrics::routes` |
+| Guest log lines: copy each line, cut at a fixed length, to the log writer | 2 | `sandbox.rs:338` `fd_write`, `log.rs:74` |
+| Event query admission across users | moves: the host CPU turns replace it; each owner instance keeps its own `Queries` | `queries.rs:1` |
 
 ### 2.2 Store calls, commits, and leases
 
 | What it does | Allowed | Code path |
 | --- | --- | --- |
 | Start a store call for a guest, fixed calls in flight per owner | 2 (store ruling) | planned `sandbox` host calls `store_get`, `store_put`, `store_list`, `store_delete` |
-| Stream a store body into guest memory, 1 MiB chunks | 2 (store ruling) | planned streaming `store::cloud` get |
-| Stream a put body out of guest memory, 1 MiB chunks | 2 (store ruling) | planned streaming `store::cloud` put |
+| Copy store get frames into guest memory, one frame at a time | 2 (store ruling) | planned streaming `store::cloud` get |
+| Send a put body from guest memory with no copy | 2 (store ruling) | planned host call `store_put`, `Bytes` over guest memory |
 | Commit: size check, charge, lease timer, manifest `PUT If-Match` | 3 | planned host call `commit_manifest` |
 | Hold the lease table, fixed entry count | 3 | planned `sandbox::LeaseTable` |
 | Record leases of other nodes that a guest reports | 3 | planned host call `lease_observed` |
@@ -312,7 +333,7 @@ where it runs after the change.
 | --- | --- |
 | Crossing per request | A small request crosses once in (head and body together) and once out (head and body together). A warm-instance call cost 7% of KV throughput for 2 crossings (measured, round 2 evidence, `BENCH_BOUNDARY`). |
 | Crossings per store call | Start and completion share the next `guest_poll`. One poll delivers all completions that are ready. |
-| Copies into and out of guest memory | One copy each way, in 64 KiB or 1 MiB chunks. Store bytes are copied once into guest memory, then used in place. |
+| Copies into and out of guest memory | One copy each way for HTTP bodies, in 64 KiB chunks. One copy for store gets, frame by frame. No copy for store puts. |
 | One core per owner | All work of one owner runs on one instance. A single hot owner cannot use more than one core. KV throughput at 256 clients is the test of this cost (inferred risk; measure in round 3). |
 | Speed of guest code | Epoch interruption instead of fuel. Build the guest with `simd128`, `opt-level=3`, LTO, one codegen unit. Cranelift with `opt_level=speed`. |
 | Module compile at start | Compile ahead of time to a `.cwasm` and load it with `Module::deserialize_file`, which maps the file. Round 2 paid a fixed 97 MiB (measured, round 2 evidence; its cause is inferred). |
@@ -338,7 +359,7 @@ The requirement comes first. Workload tuning comes last.
    Internal routes. Remove `Engine` from the host `Node`.
 4. **Round 5.** Process-wide guard on every read path, route tables, and
    the two router tests. Connection limit and hyper limits. Fixed caps on
-   the host caches. Streaming store get and put.
+   the host caches. Streaming store get and the put with no copy.
 5. **Round 6.** Epoch interruption, turns by owner, the CPU budget kill,
    ahead-of-time compile, pooling allocator. Fix
    `event_inserts_in_sandbox_match_native`. Library tests pass.

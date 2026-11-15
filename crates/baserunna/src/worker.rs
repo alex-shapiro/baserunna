@@ -385,8 +385,14 @@ impl WorkerPool {
         req: axum::extract::Request,
     ) -> Result<axum::response::Response> {
         let owner = rec.owner_id.clone();
-        let in_flight = self.admit(&owner, deadline.instant()).await?;
         let (parts, body) = req.into_parts();
+        let in_flight = match self.admit(&owner, deadline.instant()).await {
+            Ok(p) => p,
+            Err(e) => {
+                tokio::spawn(boundary::drain_body(body));
+                return Err(e);
+            }
+        };
         let left = deadline.instant().saturating_duration_since(tokio::time::Instant::now());
         let context = HttpContext { caller, rec };
         let head = boundary::RequestHead {
@@ -397,7 +403,13 @@ impl WorkerPool {
             context: serde_json::to_vec(&context).map_err(|e| Error::internal(e.to_string()))?.into(),
         };
         let id = self.next_job_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let worker = self.owner_worker(&owner)?;
+        let worker = match self.owner_worker(&owner) {
+            Ok(w) => w,
+            Err(e) => {
+                tokio::spawn(boundary::drain_body(body));
+                return Err(e);
+            }
+        };
         *worker.last_used.lock() = std::time::Instant::now();
         let (head_done, head_wait) = tokio::sync::oneshot::channel();
         let (inbox, resp_body) = boundary::credited_body(id, worker.frames.clone());
@@ -405,9 +417,10 @@ impl WorkerPool {
         let open = boundary::Frame::new(boundary::FrameKind::Open, id, head.encode());
         if worker.exited.load(std::sync::atomic::Ordering::Acquire) || worker.frames.send(open).is_err() {
             worker.streams.remove(id);
+            tokio::spawn(boundary::drain_body(body));
             return Err(Error::unavailable("the owner's worker exited"));
         }
-        tokio::spawn(boundary::send_body(id, body, credits, worker.frames.clone()));
+        tokio::spawn(boundary::send_body(id, body, credits, worker.frames.clone(), boundary::AfterEnd::Drain));
         let head = match tokio::time::timeout(left + Duration::from_secs(1), head_wait).await {
             Ok(Ok(head)) => head?,
             Ok(Err(_)) => return Err(Error::internal("the owner's worker dropped the request")),
@@ -1073,9 +1086,6 @@ async fn serve_stream(
 ) {
     let id = open.id;
     let resp = match boundary::RequestHead::decode(open.data) {
-        Ok(_) if !admits_new_request() => {
-            Err(Error::unavailable("the owner's work is near the owner's memory limit; retry later"))
-        }
         Ok(head) => match route_stream(&node, router, head, body).await {
             Ok(resp) => {
                 let (parts, body) = resp.into_parts();
@@ -1089,7 +1099,7 @@ async fn serve_stream(
     let (parts, body) = resp.into_parts();
     let head = boundary::ResponseHead { status: parts.status.as_u16(), headers: boundary::header_pairs(&parts.headers) };
     if out.send(boundary::Frame::new(boundary::FrameKind::Head, id, head.encode())).is_ok() {
-        boundary::send_body(id, body, credits, out).await;
+        boundary::send_body(id, body, credits, out, boundary::AfterEnd::Stop).await;
     }
     streams.remove(id);
 }
@@ -1107,39 +1117,6 @@ async fn with_first_chunk(body: axum::body::Body) -> Result<axum::body::Body> {
             Ok(axum::body::Body::from_stream(first.chain(data)))
         }
     }
-}
-
-/// The percentage of the owner's `memory.max` at or above which a worker starts no new request.
-const ADMIT_MEMORY_PERCENT: u64 = 75;
-
-/// The kernel counters that a worker's admission reads: its own cgroup's `memory.current`, and
-/// the nearest `memory.max` at or above that cgroup.
-struct MemoryGauge {
-    current: PathBuf,
-    max_bytes: u64,
-}
-
-/// Returns this worker's [`MemoryGauge`], or `None` outside a cgroup with a memory limit.
-fn memory_gauge() -> Option<&'static MemoryGauge> {
-    static GAUGE: std::sync::OnceLock<Option<MemoryGauge>> = std::sync::OnceLock::new();
-    GAUGE
-        .get_or_init(|| {
-            let own = own_cgroup()?;
-            let max_bytes = own.ancestors().take_while(|d| d.starts_with("/sys/fs/cgroup/")).find_map(|d| {
-                std::fs::read_to_string(d.join("memory.max")).ok()?.trim().parse::<u64>().ok()
-            })?;
-            Some(MemoryGauge { current: own.join("memory.current"), max_bytes })
-        })
-        .as_ref()
-}
-
-/// Returns false if the worker's cgroup uses at least [`ADMIT_MEMORY_PERCENT`] of its memory
-/// limit. This is the one admission point of every request stream; the kernel's `memory.max`
-/// stays the bound of a request that starts below it and then grows.
-fn admits_new_request() -> bool {
-    let Some(g) = memory_gauge() else { return true };
-    let current = std::fs::read_to_string(&g.current).ok().and_then(|s| s.trim().parse::<u64>().ok());
-    current.is_none_or(|c| c.saturating_mul(100) < g.max_bytes.saturating_mul(ADMIT_MEMORY_PERCENT))
 }
 
 /// Runs one request with head `head` and body `body` through `router` on the worker's node.

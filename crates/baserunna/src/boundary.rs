@@ -244,9 +244,37 @@ pub fn credited_body(id: u64, out: Outbox) -> (BodyInbox, axum::body::Body) {
     (tx, axum::body::Body::from_stream(stream))
 }
 
+/// The most bytes of a request body that the main process reads and discards after the worker
+/// stops reading it, so that the client can read the worker's early answer.
+pub const DRAIN_BYTES_MAX: u64 = 256 << 20;
+
+/// What [`send_body`] does with the rest of its body after the other side ends the stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AfterEnd {
+    /// It drops the body.
+    Stop,
+    /// It reads and discards up to [`DRAIN_BYTES_MAX`] more bytes, then drops the body.
+    Drain,
+}
+
+/// Reads and discards up to [`DRAIN_BYTES_MAX`] bytes of `body`. A client that sends a request
+/// body then sees the answer that came before the body's end, instead of a closed connection.
+pub async fn drain_body(body: axum::body::Body) {
+    use futures_util::StreamExt;
+    let mut body = body.into_data_stream();
+    let mut left = DRAIN_BYTES_MAX;
+    while let Some(Ok(data)) = body.next().await {
+        left = left.saturating_sub(data.len() as u64);
+        if left == 0 {
+            return;
+        }
+    }
+}
+
 /// Sends `body` as `Chunk` frames of stream `id` to `out`, each after it takes one credit from
-/// `credits`, then sends `End`. A body error sends `Reset`.
-pub async fn send_body(id: u64, body: axum::body::Body, credits: Arc<Semaphore>, out: Outbox) {
+/// `credits`, then sends `End`. A body error sends `Reset`. If the other side ends the stream
+/// first, `after_end` says what happens to the rest of the body.
+pub async fn send_body(id: u64, body: axum::body::Body, credits: Arc<Semaphore>, out: Outbox, after_end: AfterEnd) {
     use futures_util::StreamExt;
     let mut body = body.into_data_stream();
     while let Some(item) = body.next().await {
@@ -258,7 +286,12 @@ pub async fn send_body(id: u64, body: axum::body::Body, credits: Arc<Semaphore>,
             }
         };
         while !data.is_empty() {
-            let Ok(permit) = credits.acquire().await else { return };
+            let Ok(permit) = credits.acquire().await else {
+                if after_end == AfterEnd::Drain {
+                    drain_body(axum::body::Body::from_stream(body)).await;
+                }
+                return;
+            };
             permit.forget();
             let chunk = data.split_to(data.len().min(CHUNK_MAX));
             if out.send(Frame::new(FrameKind::Chunk, id, chunk)).is_err() {
@@ -392,6 +425,23 @@ mod tests {
         assert_eq!(ResponseHead::decode(r.encode()).unwrap(), r);
     }
 
+    /// After the other side ends a stream, a draining sender reads the rest of the body, so the
+    /// client can finish its upload and read the early answer.
+    #[tokio::test]
+    async fn ended_streams_drain_the_rest_of_the_body() {
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = read.clone();
+        let chunks = futures_util::stream::iter((0..64).map(move |_| {
+            counted.fetch_add(CHUNK_MAX, std::sync::atomic::Ordering::Relaxed);
+            Ok::<_, std::io::Error>(Bytes::from(vec![1u8; CHUNK_MAX]))
+        }));
+        let (out, _wire) = mpsc::unbounded_channel::<Frame>();
+        let credits = Arc::new(Semaphore::new(0));
+        credits.close();
+        send_body(9, axum::body::Body::from_stream(chunks), credits, out, AfterEnd::Drain).await;
+        assert_eq!(read.load(std::sync::atomic::Ordering::Relaxed), 64 * CHUNK_MAX);
+    }
+
     #[tokio::test]
     async fn frames_over_the_length_limit_fail() {
         let mut wire = Vec::new();
@@ -411,7 +461,7 @@ mod tests {
         let (inbox, body) = credited_body(1, out.clone());
         let credits = streams.register(1, Some(inbox), None);
         let sent = vec![5u8; 1 << 20];
-        tokio::spawn(send_body(1, axum::body::Body::from(sent.clone()), credits, out.clone()));
+        tokio::spawn(send_body(1, axum::body::Body::from(sent.clone()), credits, out.clone(), AfterEnd::Stop));
         // With no reader, only the window's chunks leave the sender.
         let mut in_flight = Vec::new();
         for _ in 0..WINDOW_CHUNKS {

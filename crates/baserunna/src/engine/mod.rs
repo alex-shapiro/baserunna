@@ -65,6 +65,8 @@ pub struct Shared {
     pub workers: std::sync::OnceLock<Arc<crate::worker::WorkerPool>>,
     /// Commits this process's write sets in another process, which holds the leases (a worker's node process).
     pub remote_commit: std::sync::OnceLock<RemoteCommit>,
+    /// Binds staged event parts in another process, which holds the leases (a worker's node process).
+    pub remote_bind: std::sync::OnceLock<RemoteBind>,
 }
 
 /// Callback invoked on the lease holder after a commit modifies event table rows or parts (SPEC §5.13).
@@ -192,6 +194,17 @@ pub type RemoteCommit = Box<
         + Sync,
 >;
 
+/// Binds staged event parts to database `db` in the process that holds its lease.
+pub type RemoteBind = Box<
+    dyn Fn(
+            String,
+            events::Bind,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::error::Result<Vec<crate::error::Result<Committed>>>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 pub fn manifest_key(db: &str) -> String {
     format!("dbs/{db}/manifest")
 }
@@ -316,6 +329,7 @@ impl Engine {
             event_hook: std::sync::OnceLock::new(),
             workers: std::sync::OnceLock::new(),
             remote_commit: std::sync::OnceLock::new(),
+            remote_bind: std::sync::OnceLock::new(),
         });
         let engine = Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) });
         let _ = engine.shared.engine.set(Arc::downgrade(&engine));

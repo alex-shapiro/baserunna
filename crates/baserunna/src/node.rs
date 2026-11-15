@@ -873,6 +873,9 @@ impl Node {
         db: Arc<crate::engine::Db>,
         bind: crate::engine::events::Bind,
     ) -> Result<Vec<Result<crate::engine::Committed>>> {
+        if let Some(remote) = self.engine.shared.remote_bind.get() {
+            return remote(db.id.clone(), bind).await;
+        }
         let n = bind.slots.len();
         let mut last = Error::unavailable("the database's lease holder is unavailable");
         for attempt in 0..6u32 {

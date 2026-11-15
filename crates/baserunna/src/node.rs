@@ -279,6 +279,10 @@ pub fn current_deadline() -> Option<Deadline> {
     REQUEST_DEADLINE.try_with(Deadline::clone).ok()
 }
 
+/// Runs a metadata command in another process and returns its JSON answer.
+pub type MetaRunner =
+    Box<dyn Fn(MetaCmd) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Json>> + Send>> + Send + Sync>;
+
 pub struct Node {
     pub id: String,
     pub cfg: NodeConfig,
@@ -300,6 +304,9 @@ pub struct Node {
     cookie_key: Mutex<Vec<u8>>,
     cluster_key: Mutex<Option<String>>,
     pub forwards: cluster::ForwardDedup,
+    /// Runs metadata commands in another process (the node process's system worker) instead
+    /// of on this process's copy of the system database.
+    pub meta_runner: std::sync::OnceLock<MetaRunner>,
     pub started_ms: u64,
     /// HTTP router for this node. [`Node::stop`] clears this field to break the reference cycle.
     router: Mutex<Option<axum::Router>>,
@@ -372,6 +379,7 @@ impl Node {
             cookie_key: Mutex::new(Vec::new()),
             cluster_key: Mutex::new(None),
             forwards: cluster::ForwardDedup::new(Duration::from_secs(60)),
+            meta_runner: std::sync::OnceLock::new(),
             router: Mutex::new(None),
             limiter: Limiter::default(),
             metrics: Default::default(),
@@ -569,7 +577,11 @@ impl Node {
             loop {
                 tokio::time::sleep(Duration::from_millis(REAP_INTERVAL_MS)).await;
                 let Some(n) = me.upgrade() else { return };
-                if let Err(e) = n.reap_deleted().await {
+                let reaped = match n.engine.shared.workers.get() {
+                    Some(w) => w.reap().await,
+                    None => n.reap_deleted().await.map(drop),
+                };
+                if let Err(e) = reaped {
                     crate::debug!("{}: reaper: {e}", n.id);
                 }
             }
@@ -791,6 +803,9 @@ impl Node {
     }
 
     async fn run_meta_json(&self, cmd: MetaCmd) -> Result<Json> {
+        if let Some(run) = self.meta_runner.get() {
+            return run(cmd).await;
+        }
         with_deadline(self.meta_deadline(), self.run_meta_attempts(cmd)).await
     }
 

@@ -92,6 +92,10 @@ enum Job {
         table: String,
         query: serde_json::Value,
     },
+    /// Runs metadata command `cmd` on the system database; only the system worker gets it.
+    Meta { cmd: crate::meta::MetaCmd },
+    /// Runs one pass of the reaper; only the system worker gets it.
+    Reap,
     /// Marks database `db` deleted, so the owner's workers stop serving it.
     MarkDeleted { db: String },
     /// Returns whether the manifest of database `db` is marked deleted.
@@ -112,6 +116,8 @@ enum Job {
 enum JobResult {
     /// The job finished with no value.
     Finished,
+    /// The JSON answer of a [`Job::Meta`].
+    Meta(serde_json::Value),
     /// Whether the database of an [`Job::IsDeleted`] is marked deleted.
     Deleted(bool),
     Merged(Option<(Vec<u8>, Vec<u8>)>),
@@ -143,6 +149,10 @@ enum FromWorker {
     /// The result of the job with the frame's ID.
     Done(JobResult),
 }
+
+/// The key of the system worker among the pool's workers. It holds the system database's
+/// lease, runs its metadata commands and upkeep, and runs the reaper. No owner ID has this form.
+pub const SYSTEM_WORKER: &str = "@system";
 
 /// The environment variable that gives a worker the node's ID.
 pub const WORKER_NODE_ID_VAR: &str = "BASERUNNA_WORKER_NODE_ID";
@@ -257,7 +267,10 @@ impl WorkerPool {
     fn owner_cgroup(&self, owner: &str) -> std::io::Result<PathBuf> {
         let name: String =
             owner.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-        let dir = self.cfg.cgroup_root.join(format!("owner-{name}"));
+        let dir = match owner {
+            SYSTEM_WORKER => self.cfg.cgroup_root.join("system"),
+            _ => self.cfg.cgroup_root.join(format!("owner-{name}")),
+        };
         if !dir.exists() {
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join("memory.max"), self.cfg.owner_memory_bytes.to_string())?;
@@ -453,6 +466,21 @@ impl WorkerPool {
         }
     }
 
+    /// Runs metadata command `cmd` in the system worker, which holds the system database.
+    pub async fn run_meta(&self, cmd: crate::meta::MetaCmd) -> Result<serde_json::Value> {
+        match self.run(SYSTEM_WORKER, Job::Meta { cmd }, Bytes::new(), MAINTENANCE_DEADLINE).await?.0 {
+            JobResult::Meta(j) => Ok(j),
+            JobResult::Failed(e) => Err(crate::api::error_from_json(500, &e)),
+            _ => Err(Error::internal("the worker returned a result of another job")),
+        }
+    }
+
+    /// Runs one pass of the reaper in the system worker: purges deleted databases past their
+    /// grace period and deletes expired sessions.
+    pub async fn reap(&self) -> Result<()> {
+        self.finish(SYSTEM_WORKER, Job::Reap).await
+    }
+
     /// Marks database `db` of owner `owner` deleted in the owner's worker.
     pub async fn mark_deleted(&self, owner: &str, db: &str) -> Result<()> {
         self.finish(owner, Job::MarkDeleted { db: db.to_string() }).await
@@ -621,7 +649,10 @@ impl WorkerPool {
         let dirs: Vec<PathBuf> = std::fs::read_dir(&self.cfg.cgroup_root)
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
-                    .filter(|e| e.file_name().to_string_lossy().starts_with("owner-"))
+                    .filter(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        name.starts_with("owner-") || name == "system"
+                    })
                     .map(|e| e.path())
                     .collect()
             })
@@ -867,10 +898,18 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
             Ok(ToWorker::Job(job)) => Ok(*job),
             Err(e) => Err(e),
         };
-        let engine = engine.clone();
+        let (engine, node) = (engine.clone(), node.clone());
         let results = results.clone();
         tokio::spawn(async move {
             let (result, out) = match job {
+                Ok(Job::Meta { cmd }) => match node.run_meta_as::<serde_json::Value>(cmd).await {
+                    Ok(j) => (JobResult::Meta(j), Bytes::new()),
+                    Err(e) => (JobResult::Failed(json!({ "error": crate::api::error_json(&e) })), Bytes::new()),
+                },
+                Ok(Job::Reap) => match node.reap_deleted().await {
+                    Ok(_) => (JobResult::Finished, Bytes::new()),
+                    Err(e) => (JobResult::Failed(json!({ "error": crate::api::error_json(&e) })), Bytes::new()),
+                },
                 Ok(job) => run_job(&engine, job, payload).await,
                 Err(e) => (
                     JobResult::Failed(json!({ "error": crate::api::error_json(&Error::internal(e.to_string())) })),
@@ -903,6 +942,7 @@ async fn run_job(engine: &Arc<crate::engine::Engine>, job: Job, payload: Bytes) 
                 ),
             }
         }
+        Job::Meta { .. } | Job::Reap => failed(Error::internal("a system job reached run_job")),
         Job::MarkDeleted { db } => {
             let db = engine.db(&db);
             match db.open(false).await {

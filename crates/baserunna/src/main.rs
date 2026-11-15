@@ -209,6 +209,20 @@ async fn run() -> Result<(), String> {
             })
         }));
         w.set_node_id(node.id.clone());
+        // The system worker now writes the system database, so this process reads it from the
+        // store again after each command, and never as the lease holder.
+        let (pool, weak) = (w.clone(), Arc::downgrade(&node));
+        let _ = node.meta_runner.set(Box::new(move |cmd| {
+            let (pool, weak) = (pool.clone(), weak.clone());
+            Box::pin(async move {
+                let answer = pool.run_meta(cmd).await;
+                if let Some(node) = weak.upgrade() {
+                    node.engine.forget(baserunna::meta::SYS_DB);
+                }
+                answer
+            })
+        }));
+        node.engine.forget(baserunna::meta::SYS_DB);
         let idle = w.clone();
         tokio::spawn(async move {
             loop {

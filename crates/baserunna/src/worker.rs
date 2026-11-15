@@ -12,6 +12,7 @@ use crate::engine::events::PartRef;
 use crate::engine::{EngineConfig, Shared};
 use crate::error::{Error, Result};
 use crate::events::schema::EventSchema;
+use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -29,12 +30,24 @@ pub const OWNER_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 enum Job {
     /// Merges event parts into one new part and returns its reference.
     Merge { db: String, schema: EventSchema, inputs: Vec<(Vec<u8>, Vec<u8>)> },
+    /// Runs an event query at a snapshot whose encoded manifest is the job's payload, and
+    /// returns the JSON response body as the result's payload.
+    Query {
+        db: String,
+        etag: String,
+        read_time: u64,
+        schema: EventSchema,
+        query: serde_json::Value,
+        limits: (u64, usize, usize, u64),
+    },
 }
 
 /// The result of a [`Job`].
 #[derive(Serialize, Deserialize)]
 enum JobResult {
     Merged(Option<(Vec<u8>, Vec<u8>)>),
+    /// The query's JSON response body is the result's payload.
+    Queried,
     /// The job's error as the JSON body of an HTTP error response.
     Failed(serde_json::Value),
 }
@@ -123,19 +136,52 @@ impl WorkerPool {
     ) -> Result<Option<PartRef>> {
         let inputs = inputs.iter().map(|r| (r.key().to_vec(), r.encode().to_vec())).collect();
         let job = Job::Merge { db: db.to_string(), schema: schema.clone(), inputs };
-        match self.run(db, job, deadline).await? {
+        let owner = self.owner_of(db).await?;
+        match self.run(&owner, job, Bytes::new(), deadline).await?.0 {
             JobResult::Merged(None) => Ok(None),
             JobResult::Merged(Some((k, v))) => {
                 PartRef::decode(&k, &v).map(Some).map_err(|e| Error::internal(format!("worker part ref: {e}")))
             }
             JobResult::Failed(e) => Err(crate::api::error_from_json(500, &e)),
+            JobResult::Queried => Err(Error::internal("the worker returned a query result for a merge")),
         }
     }
 
-    async fn run(&self, db: &str, job: Job, deadline: Duration) -> Result<JobResult> {
-        let owner = self.owner_of(db).await?;
+    /// Runs event query `query` on `txn`'s snapshot in a worker inside `owner`'s cgroup and
+    /// returns the JSON response body.
+    pub async fn query(
+        &self,
+        owner: &str,
+        db: &str,
+        txn: &mut crate::engine::Txn,
+        schema: &EventSchema,
+        query: serde_json::Value,
+        limits: &crate::events::exec::Limits,
+    ) -> Result<Bytes> {
+        let version = txn.untracked_snapshot().clone();
+        let job = Job::Query {
+            db: db.to_string(),
+            etag: version.etag.clone(),
+            read_time: txn.read_time,
+            schema: schema.clone(),
+            query,
+            limits: (limits.max_bytes_read, limits.max_memory_bytes, limits.lookup_max_bytes, limits.max_ms),
+        };
+        let manifest = version.m.encode();
+        drop(version);
+        // The worker enforces the query deadline; the extra second lets its own error arrive first.
+        let deadline = Duration::from_millis(limits.max_ms) + Duration::from_secs(1);
+        match self.run(owner, job, manifest, deadline).await? {
+            (JobResult::Queried, body) => Ok(body),
+            (JobResult::Failed(e), _) => Err(crate::api::error_from_json(500, &e)),
+            _ => Err(Error::internal("the worker returned a merge result for a query")),
+        }
+    }
+
+    /// Runs `job` with `payload` in a new worker in `owner`'s cgroup and returns the result and its payload.
+    async fn run(&self, owner: &str, job: Job, payload: Bytes, deadline: Duration) -> Result<(JobResult, Bytes)> {
         let io = |e: std::io::Error| Error::internal(format!("worker: {e}"));
-        let owner_dir = self.owner_cgroup(&owner).map_err(io)?;
+        let owner_dir = self.owner_cgroup(owner).map_err(io)?;
         // Each worker has its own leaf below the owner's cgroup, so a deadline
         // kills exactly that worker while `memory.max` bounds all of the owner's workers.
         let worker_id = self.next_worker_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -145,7 +191,7 @@ impl WorkerPool {
         let limit_mib = self.cfg.owner_memory_bytes >> 20;
         let job = serde_json::to_vec(&job).map_err(|e| Error::internal(e.to_string()))?;
         let leaf2 = leaf.clone();
-        let task = tokio::task::spawn_blocking(move || -> Result<JobResult> {
+        let task = tokio::task::spawn_blocking(move || -> Result<(JobResult, Bytes)> {
             let leaf = leaf2;
             let ooms_before = oom_kills(&owner_dir);
             let mut child = Command::new(exe)
@@ -163,14 +209,18 @@ impl WorkerPool {
                 return Err(io(e));
             }
             let mut stdin = child.stdin.take().expect("piped stdin");
-            let sent = write_frame(&mut stdin, &job);
+            let sent = write_frame(&mut stdin, &job).and_then(|_| write_frame(&mut stdin, &payload));
             drop(stdin);
             let mut out = Vec::new();
             let read = sent.and_then(|_| child.stdout.take().expect("piped stdout").read_to_end(&mut out));
             let status = child.wait().map_err(io)?;
             if read.is_ok() && status.success() {
-                let frame = read_frame(&mut out.as_slice()).map_err(io)?;
-                return serde_json::from_slice(&frame).map_err(|e| Error::internal(format!("worker result: {e}")));
+                let mut r = out.as_slice();
+                let header = read_frame(&mut r).map_err(io)?;
+                let payload = read_frame(&mut r).map_err(io)?;
+                let header =
+                    serde_json::from_slice(&header).map_err(|e| Error::internal(format!("worker result: {e}")))?;
+                return Ok((header, payload.into()));
             }
             if oom_kills(&owner_dir) > ooms_before {
                 return Err(Error::TooLarge(format!("the work exceeded the owner's memory limit of {limit_mib} MiB")));
@@ -210,17 +260,29 @@ fn read_frame(r: &mut impl Read) -> std::io::Result<Vec<u8>> {
 
 /// Runs one job from stdin and writes its result to stdout (the `baserunna worker` command).
 pub async fn serve(store: crate::store::DynStore, cfg: EngineConfig) -> std::io::Result<()> {
-    let job = read_frame(&mut std::io::stdin().lock())?;
+    let (job, payload) = {
+        let mut stdin = std::io::stdin().lock();
+        (read_frame(&mut stdin)?, read_frame(&mut stdin)?)
+    };
     let job: Job = serde_json::from_slice(&job).map_err(std::io::Error::other)?;
     let engine = crate::engine::Engine::new(store, Arc::new(crate::env::Env::real()), cfg, "worker".into());
-    let result = run_job(&engine.shared, job).await;
+    let (result, out) = run_job(&engine.shared, job, payload.into()).await;
     let result = serde_json::to_vec(&result).map_err(std::io::Error::other)?;
-    write_frame(&mut std::io::stdout().lock(), &result)
+    let mut stdout = std::io::stdout().lock();
+    write_frame(&mut stdout, &result)?;
+    write_frame(&mut stdout, &out)
 }
 
-async fn run_job(shared: &Arc<Shared>, job: Job) -> JobResult {
-    let failed = |e: Error| JobResult::Failed(serde_json::json!({ "error": crate::api::error_json(&e) }));
+async fn run_job(shared: &Arc<Shared>, job: Job, payload: Bytes) -> (JobResult, Bytes) {
+    let failed =
+        |e: Error| (JobResult::Failed(serde_json::json!({ "error": crate::api::error_json(&e) })), Bytes::new());
     match job {
+        Job::Query { db, etag, read_time, schema, query, limits } => {
+            match run_query(shared, &db, etag, read_time, &schema, query, limits, payload).await {
+                Ok(body) => (JobResult::Queried, body),
+                Err(e) => failed(e),
+            }
+        }
         Job::Merge { db, schema, inputs } => {
             let mut refs = Vec::with_capacity(inputs.len());
             for (k, v) in &inputs {
@@ -231,9 +293,36 @@ async fn run_job(shared: &Arc<Shared>, job: Job) -> JobResult {
             }
             let stats = crate::events::part::ReadStats::default();
             match crate::events::maint::merge_parts(shared, &db, &schema, &refs, &stats).await {
-                Ok(out) => JobResult::Merged(out.map(|r| (r.key().to_vec(), r.encode().to_vec()))),
+                Ok(out) => (JobResult::Merged(out.map(|r| (r.key().to_vec(), r.encode().to_vec()))), Bytes::new()),
                 Err(e) => failed(e),
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_query(
+    shared: &Arc<Shared>,
+    db: &str,
+    etag: String,
+    read_time: u64,
+    schema: &EventSchema,
+    query: serde_json::Value,
+    (max_bytes_read, max_memory_bytes, lookup_max_bytes, max_ms): (u64, usize, usize, u64),
+    manifest: Bytes,
+) -> Result<Bytes> {
+    use crate::engine::{Isolation, Snapshot, Txn, Version, manifest::Manifest};
+    let m = Manifest::decode(&manifest).map_err(|e| Error::internal(format!("snapshot manifest: {e}")))?;
+    drop(manifest);
+    let version = m.version;
+    let snapshot = Snapshot { version: Arc::new(Version::new(m, etag, shared.clone())), time_ms: read_time };
+    let cfg = &shared.cfg;
+    let mut txn =
+        Txn::new(snapshot, Isolation::Serializable, 0, cfg.txn_max_write_bytes).with_read_limit(cfg.txn_max_read_bytes);
+    let q = crate::events::query::Query::parse(query)?;
+    let limits = crate::events::exec::Limits { max_bytes_read, max_memory_bytes, lookup_max_bytes, max_ms };
+    let mut grant = crate::queries::QueryGrant::unlimited();
+    let out = crate::events::exec::run(shared, db, &mut txn, schema, &q, &limits, &mut grant).await?;
+    let body = crate::api::events::output_json(&out, version);
+    serde_json::to_vec(&body).map(Bytes::from).map_err(|e| Error::internal(e.to_string()))
 }

@@ -3,7 +3,7 @@
 mod account;
 pub mod body;
 mod data;
-mod events;
+pub(crate) mod events;
 pub mod openapi;
 mod orgs;
 mod streams;

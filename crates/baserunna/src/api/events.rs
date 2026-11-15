@@ -15,6 +15,7 @@ use axum::Router;
 use axum::extract::{Extension, Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use bytes::Bytes;
 use http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
@@ -350,12 +351,29 @@ async fn query(
     Extension(ctx): Extension<DbCtx>,
     Path(p): PathMap,
     JsonBody(b): JsonBody<Json>,
-) -> Result<J> {
+) -> Result<Response> {
     let name = param(&p, "t")?.to_string();
     let (b, c) = query_consistency(b)?;
-    let q = Query::parse(b)?;
+    let q = Query::parse(b.clone())?;
     let limits = node.cfg.query_limits;
     let mut grant = node.start_query(&ctx.principal.user.id).await?;
+    if let Some(w) = node.engine.shared.workers.get() {
+        let run = async |c: Consistency| -> Result<Bytes> {
+            let (body, _) = with_read!(ctx.db, c, |t| {
+                let s = events::get_schema(t, &name).await?;
+                w.query(&ctx.rec.owner_id, &ctx.db.id, t, &s, b.clone(), &limits).await
+            });
+            Ok(body)
+        };
+        let body = match run(c).await {
+            Err(Error::NotFound(_) | Error::InvalidArgument(_)) if matches!(c, Consistency::Snapshot { .. }) => {
+                run(Consistency::Strong).await?
+            }
+            r => r?,
+        };
+        drop(grant);
+        return Ok(([(http::header::CONTENT_TYPE, "application/json")], body).into_response());
+    }
     let mut run = async |c: Consistency| -> Result<(exec::Output, u64)> {
         let db = ctx.db.clone();
         Ok(with_read!(ctx.db, c, |t| {
@@ -370,7 +388,7 @@ async fn query(
         }
         r => r?,
     };
-    Ok(axum::Json(output_json(&out, v)))
+    Ok(axum::Json(output_json(&out, v)).into_response())
 }
 
 pub fn output_json(out: &exec::Output, v: u64) -> Json {

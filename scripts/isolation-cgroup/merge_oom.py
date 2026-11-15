@@ -22,5 +22,9 @@ for _ in range(60):
     n = len(info.get("parts", []))
     if n < 8: break
 print("parts after wait", n, "healthz", call("GET", "/healthz")[0])
-s, q = call("POST", "/v1/dbs/m/events/ev/rows/query", json.dumps({"from": T0, "to": T0 + DAY, "select": ["u"], "limit": 1}), tok)
-print("query", s, json.dumps(q)[:200])
+for name, body in [("count by u", {"group_by": ["u"], "aggregates": {"n": {"fn": "count"}}}),
+                   ("rows by u", {"columns": ["t", "u", "e"], "order_by": ["u"], "limit": 10000})]:
+    body.update({"from": T0, "to": T0 + DAY})
+    t = time.time(); s, q = call("POST", "/v1/dbs/m/events/ev/rows/query", json.dumps(body), tok)
+    print("query", name, s, "%.2f s" % (time.time() - t), json.dumps(q)[:160])
+print("healthz after queries", call("GET", "/healthz")[0])

@@ -1,5 +1,6 @@
 //! LSM storage engine backed by object storage.
 
+pub mod host_reads;
 pub mod blob;
 pub mod cache;
 pub mod clock;

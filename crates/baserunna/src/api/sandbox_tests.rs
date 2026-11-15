@@ -78,3 +78,25 @@ fn txn_scan_output_over_owner_bound_is_refused() {
         assert_eq!(runner.sandbox.all_owners_memory_used(), 0);
     });
 }
+
+#[test]
+fn host_reads_of_a_sandboxed_database_fail() {
+    run_paused(async {
+        let (w, token) = world_with_db("deny@api.test").await;
+        let (s, r) = txn(&w, &token, &json!({"ops": [{"op": "put", "key": "k", "value": "v"}]})).await;
+        assert_eq!(s, 200, "{r}");
+        let info = call_router(&w.node(0).router().unwrap(), "GET", "/v1/dbs/d", &token, Bytes::new()).await;
+        let info: Json = serde_json::from_slice(&info.body).unwrap();
+        let db_id = info["id"].as_str().expect("database id").to_string();
+        let db = w.node(0).engine.db(&db_id);
+        let read = || async {
+            let mut t = db.begin(crate::engine::Isolation::Serializable, crate::engine::Consistency::Strong).await?;
+            t.get(b"\x01k").await
+        };
+        assert!(read().await.is_ok(), "reads outside a request scope pass");
+        let denied = crate::engine::host_reads::sandboxed_request(db_id.clone(), read()).await;
+        assert!(matches!(denied, Err(crate::error::Error::Internal(_))), "{denied:?}");
+        let other = crate::engine::host_reads::sandboxed_request("other".into(), read()).await;
+        assert!(other.is_ok(), "the scope denies only its own database");
+    });
+}

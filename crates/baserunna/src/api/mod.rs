@@ -592,8 +592,15 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
             }
         };
         req.extensions_mut().insert(principal.clone());
+        let sandboxed = db.shared().sandbox.get().is_some()
+            && req.extensions().get::<MatchedPath>().is_none_or(|p| host_route_kind(p.as_str()).is_none());
+        let db_id = db.id.clone();
         req.extensions_mut().insert(DbCtx { principal, rec: rec.clone(), access, db, deadline });
-        let resp = next.run(req).await;
+        let resp = if sandboxed {
+            crate::engine::host_reads::sandboxed_request(db_id, next.run(req)).await
+        } else {
+            next.run(req).await
+        };
         if resp.status() == StatusCode::NOT_FOUND {
             node.forget_db_name(&rec.owner_id, &rec.name);
         }
@@ -601,6 +608,65 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
     })
     .await;
     res.unwrap_or_else(|e| e.into_response())
+}
+
+/// Why a route of a database runs on the host, outside the sandbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostRouteKind {
+    /// The route has not moved into the sandbox yet. Nothing bounds its host work.
+    NotMoved,
+}
+
+/// Routes of a database that may read its data on the host, by route template.
+///
+/// Every other route of a database runs with the host reads of that
+/// database denied (`engine::host_reads`), so it reaches tenant data only
+/// through the sandbox.
+pub const HOST_ROUTES: &[(&str, HostRouteKind)] = &[
+    ("/v1/dbs/{db}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/kv", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/changes", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/kv/{*key}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/blobs", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/blobs/{blob_id}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/transactions", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/transactions/{id}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/transactions/{id}/ops", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/transactions/{id}/commit", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/commits/{id}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/tables", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/tables/{t}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/tables/{t}/columns", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/tables/{t}/columns/{c}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/tables/{t}/indexes", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/tables/{t}/indexes/{i}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/tables/{t}/rows", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/tables/{t}/rows/get", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/tables/{t}/rows/update", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/tables/{t}/rows/delete", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/tables/{t}/rows/query", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/tables/{t}/changes", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/streams", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/streams/{s}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/streams/{s}/records", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/streams/{s}/records/query", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/streams/{s}/trim", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/streams/{s}/consumers", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/streams/{s}/consumers/{c}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/events", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/events/{t}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/events/{t}/columns", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/events/{t}/columns/{c}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/events/{t}/skip-indexes", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/events/{t}/skip-indexes/{c}", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/events/{t}/rows", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/events/{t}/rows/query", HostRouteKind::NotMoved),
+    ("/v1/dbs/{db}/events/{t}/rows/delete", HostRouteKind::NotMoved),
+];
+
+/// Kind of the host route with template `route`, or `None` if the route runs in the sandbox.
+pub fn host_route_kind(route: &str) -> Option<HostRouteKind> {
+    HOST_ROUTES.iter().find(|(r, _)| *r == route).map(|(_, k)| *k)
 }
 
 fn forwarded(mut resp: Response, target: String) -> Response {

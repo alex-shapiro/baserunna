@@ -1895,6 +1895,7 @@ pub async fn run(
     limits: &Limits,
     grant: &mut QueryGrant,
 ) -> Result<Output> {
+    crate::engine::host_reads::check_host_read(db)?;
     let limit = std::time::Duration::from_millis(limits.max_ms);
     let budget = grant.memory.limit_bytes;
     let limits = Limits {

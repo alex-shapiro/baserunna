@@ -211,6 +211,7 @@ pub async fn read_chunk(shared: &Shared, db: &str, blob: &BlobRef, ci: u64, r: R
 
 /// Reads a byte range of `blob` into memory.
 pub async fn read_range(shared: &Shared, db: &str, blob: &BlobRef, range: Range<u64>) -> Result<Bytes> {
+    super::host_reads::check_host_read(db)?;
     if range.start > range.end || range.end > blob.size {
         return Err(Error::invalid("blob range out of bounds"));
     }

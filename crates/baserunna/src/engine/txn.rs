@@ -295,6 +295,7 @@ impl Txn {
 
     /// Reads `key`, recording it in the transaction's read set.
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<ReadValue>> {
+        super::host_reads::check_host_read(&self.snapshot.m.db_id)?;
         if let Some(p) = self.writes.puts.get(key) {
             return Ok(Txn::own(key, p));
         }
@@ -335,6 +336,7 @@ impl Txn {
 
     /// Scans `range` with read-your-writes, recording the scanned interval in the read set.
     pub async fn scan(&mut self, range: &KeyRange, reverse: bool, limit: usize) -> Result<Vec<ReadValue>> {
+        super::host_reads::check_host_read(&self.snapshot.m.db_id)?;
         let mut out: Vec<ReadValue> = Vec::new();
         if limit == 0 || range.is_empty() {
             return Ok(out);

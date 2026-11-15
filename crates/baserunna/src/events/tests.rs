@@ -3783,10 +3783,11 @@ mod sandbox_merge {
             for chunk in batch.chunks(1000) {
                 txn_do(&db, async |t| insert(t, "events", chunk, 0).await).await.unwrap();
             }
-            assert!(maint::seal(&db, s.id).await.unwrap());
+            while maint::seal(&db, s.id).await.unwrap() {}
         }
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
         let inputs = refs(&mut t, s.id).await.unwrap();
+        eprintln!("merge input: {} parts, {} rows", inputs.len(), inputs.iter().map(|r| r.rows).sum::<u64>());
         let input = MergeInput {
             db: "db".into(),
             schema: s,
@@ -3814,19 +3815,21 @@ mod sandbox_merge {
     }
 
     #[test]
-    #[ignore = "the sealed input holds 936 rows, too few to reach the bound"]
     fn sandbox_merge_traps_at_owner_bound() {
         rt().block_on(async {
             let (_eng, mem, input, _) = sealed_parts(4, 5000).await;
-            let bound = 24 << 20;
-            let sandbox = Sandbox::new(&crate::sandbox::tests::guest_wasm(), bound).unwrap();
+            let wasm = crate::sandbox::tests::guest_wasm();
+            let roomy = Sandbox::new(&wasm, crate::sandbox::OWNER_MEMORY_BOUND).unwrap();
+            assert!(roomy.merge_parts("owner", mem.clone(), &input).await.unwrap().is_some());
+            let peak = roomy.last_instance_peak();
+            let bound = peak * 3 / 4;
+            eprintln!("merge peak linear memory {} KiB; test bound {} KiB", peak >> 10, bound >> 10);
+            let sandbox = Sandbox::new(&wasm, bound).unwrap();
             let started = std::time::Instant::now();
-            let err = sandbox.merge_parts("owner", mem.clone(), &input).await.unwrap_err();
-            eprintln!("guest merge of 4 x 5000 rows refused in {:?}: {err:?}", started.elapsed());
+            let err = sandbox.merge_parts("owner", mem, &input).await.unwrap_err();
+            eprintln!("merge refused in {:?}: {err:?}", started.elapsed());
             assert!(matches!(err, Error::TooLarge(_)), "{err:?}");
             assert_eq!(sandbox.owner_memory_used("owner"), 0);
-            let roomy = Sandbox::new(&crate::sandbox::tests::guest_wasm(), crate::sandbox::OWNER_MEMORY_BOUND).unwrap();
-            assert!(roomy.merge_parts("owner", mem, &input).await.unwrap().is_some());
         });
     }
 }

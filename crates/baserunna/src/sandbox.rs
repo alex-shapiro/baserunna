@@ -31,6 +31,7 @@ pub struct Sandbox {
     linker: Linker<GuestState>,
     owner_memory: Arc<Mutex<HashMap<String, OwnerMemory>>>,
     owner_memory_bound: usize,
+    last_instance_peak: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Charges an instance's linear memory to its owner's bound.
@@ -40,6 +41,8 @@ struct OwnerLimiter {
     owner_memory_bound: usize,
     charged: usize,
     refused_grow: Option<usize>,
+    /// Receives `charged` when the instance ends: its peak linear memory.
+    peak: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ResourceLimiter for OwnerLimiter {
@@ -63,6 +66,7 @@ impl ResourceLimiter for OwnerLimiter {
 
 impl Drop for OwnerLimiter {
     fn drop(&mut self) {
+        self.peak.store(self.charged, std::sync::atomic::Ordering::Relaxed);
         let mut owners = self.owner_memory.lock();
         if let Some(owner) = owners.get_mut(&self.owner) {
             owner.used -= self.charged;
@@ -256,12 +260,17 @@ impl Sandbox {
         let module = Module::new(&engine, guest_wasm).map_err(sandbox_err)?;
         let mut linker = Linker::new(&engine);
         link_host_calls(&mut linker).map_err(sandbox_err)?;
-        Ok(Sandbox { engine, module, linker, owner_memory: Arc::default(), owner_memory_bound })
+        Ok(Sandbox { engine, module, linker, owner_memory: Arc::default(), owner_memory_bound, last_instance_peak: Arc::default() })
     }
 
     /// Linear memory that `owner`'s running instances hold.
     pub fn owner_memory_used(&self, owner: &str) -> usize {
         self.owner_memory.lock().get(owner).map_or(0, |o| o.used)
+    }
+
+    /// Peak linear memory of the instance that ended last.
+    pub fn last_instance_peak(&self) -> usize {
+        self.last_instance_peak.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Parses a JSON body inside the sandbox and returns its canonical encoding.
@@ -306,6 +315,7 @@ impl Sandbox {
             owner_memory_bound: self.owner_memory_bound,
             charged: 0,
             refused_grow: None,
+            peak: self.last_instance_peak.clone(),
         };
         let state = GuestState { limiter, store: object_store, clock_ns: 0, rng: Rng::new(seed), stderr: Vec::new() };
         let mut store = Store::new(&self.engine, state);

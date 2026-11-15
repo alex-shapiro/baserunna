@@ -269,6 +269,7 @@ the item of the requirement. "Planned" paths do not exist yet.
 | Record leases of other nodes that a guest reports | 3 | planned host call `lease_observed` |
 | Send commit notices to the home node | 2 | `node.rs:419` `notify_home`, fed by a planned host call |
 | Send mail that the system instance made, fixed largest size | 2 | `node.rs:1311` `send_mail` (unsure, see report) |
+| Relay a metadata call from an owner instance to the system instance (for example `run_meta`, `access_strong`, `resolve_db_strong` in database handlers), with a fixed largest request and reply | 2 | planned host call `sys_call`; today `node.run_meta`, `node.access_strong`, `node.resolve_db_strong` in `api/data.rs`, `api/events.rs`, `api/streams.rs` |
 
 ### 2.3 Background jobs
 

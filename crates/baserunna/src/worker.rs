@@ -228,6 +228,17 @@ impl WorkerPool {
         }
     }
 
+    /// Returns the node ID that the worker of `owner` takes: the node's ID for an owner worker,
+    /// so it takes over the leases of the last one, and a separate ID for the system worker, so
+    /// the node process never sees its own ID on the system database's lease.
+    fn worker_node_id(&self, owner: &str) -> String {
+        let id = self.node_id.get().cloned().unwrap_or_default();
+        match owner {
+            SYSTEM_WORKER if !id.is_empty() => format!("{id}-system"),
+            _ => id,
+        }
+    }
+
     /// Returns the number of request streams that the pool has opened to workers.
     pub fn opened_streams(&self) -> u64 {
         self.opened_streams.load(std::sync::atomic::Ordering::Relaxed)
@@ -747,7 +758,7 @@ impl WorkerPool {
         }
         let mut child = tokio::process::Command::new(&self.cfg.exe)
             .arg("worker")
-            .env(WORKER_NODE_ID_VAR, self.node_id.get().map(String::as_str).unwrap_or_default())
+            .env(WORKER_NODE_ID_VAR, self.worker_node_id(owner))
             // Large buffers map their own pages and the heap trims its top, so freed job
             // memory leaves the owner's cgroup instead of staying in the allocator.
             .env(

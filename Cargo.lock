@@ -202,7 +202,9 @@ dependencies = [
 name = "baserunna-guest"
 version = "0.1.0"
 dependencies = [
+ "crc32c",
  "serde_json",
+ "zstd",
 ]
 
 [[package]]

@@ -153,7 +153,7 @@ fn read_only_keys_and_strangers_cannot_write_events() {
             }
         }
         let body = json!({"db": id, "bind": ""}).to_string();
-        let (s, _) = send(&w, 0, &t, "POST", "/internal/v1/events/bind", &j, &body).await;
+        let (s, _) = send(&w, 0, &t, "POST", &format!("/internal/v1/dbs/{id}/events/bind"), &j, &body).await;
         assert_eq!(s, 403);
         assert_eq!(count(&w, 0, &t).await, json!(0));
         w.shutdown();

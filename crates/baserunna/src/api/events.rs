@@ -447,7 +447,7 @@ async fn delete_rows(
     Ok(axum::Json(json!({"deleted": n, "version": v})))
 }
 
-/// Request body for `POST /internal/v1/events/bind`.
+/// Request body for `POST /internal/v1/dbs/{db}/events/bind`.
 #[derive(serde::Serialize, Deserialize)]
 pub(crate) struct ForwardedBind {
     pub db: String,
@@ -488,10 +488,38 @@ pub(crate) fn bind_results_from_json(j: &Json, n: usize) -> Result<Vec<Result<Co
         .collect())
 }
 
+/// Serves `POST /internal/v1/dbs/{db}/events/bind` in the node process: with workers, the
+/// owner's worker binds the parts, and the node moves the request's bytes there unread.
+pub(super) async fn route_internal_bind(
+    State(node): State<Arc<Node>>,
+    axum::extract::Path(db): axum::extract::Path<String>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let routed = async {
+        let Some(w) = node.engine.shared.workers.get() else {
+            let body = axum::body::to_bytes(req.into_body(), super::BIND_BODY_MAX)
+                .await
+                .map_err(|e| Error::invalid(format!("cannot read the request body: {e}")))?;
+            let b: ForwardedBind = super::parse_json(&body).map_err(Error::invalid)?;
+            return bind_locally(&node, b).await.map(axum::response::IntoResponse::into_response);
+        };
+        let deadline = crate::node::Deadline::new(super::request_deadline(&node, req.headers()));
+        let mut t = node.sys_read().await?;
+        let rec = crate::meta::get_db(&mut t, &db).await?.ok_or_else(|| Error::not_found("no such database"))?;
+        w.http(None, rec, deadline, req).await
+    };
+    routed.await.unwrap_or_else(axum::response::IntoResponse::into_response)
+}
+
+/// Serves `POST /internal/v1/dbs/{db}/events/bind` in the owner's worker.
 pub(super) async fn internal_bind(
     State(node): State<Arc<Node>>,
     axum::Json(b): axum::Json<ForwardedBind>,
 ) -> Result<J> {
+    bind_locally(&node, b).await
+}
+
+async fn bind_locally(node: &Node, b: ForwardedBind) -> Result<J> {
     let data = baserunna_api::b64::decode(&b.bind).ok_or_else(|| Error::invalid("bad bind encoding"))?;
     let bind = crate::engine::events::Bind::decode(&data).map_err(|e| Error::invalid(e.to_string()))?;
     let db = node.engine.db(&b.db);

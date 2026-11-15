@@ -375,11 +375,12 @@ impl WorkerPool {
     /// Serves database request `req` in a worker inside the owner's cgroup. The request and
     /// response bodies stream through the boundary's credit windows, so the node holds at most
     /// [`boundary::WINDOW_CHUNKS`] chunks of each body.
+    ///
+    /// `caller` is the signed-in principal and its access, or `None` for a request from a peer.
     pub async fn http(
         &self,
-        principal: crate::node::Principal,
+        caller: Option<(crate::node::Principal, crate::meta::Access)>,
         rec: crate::meta::DbRecord,
-        access: crate::meta::Access,
         deadline: crate::node::Deadline,
         req: axum::extract::Request,
     ) -> Result<axum::response::Response> {
@@ -387,7 +388,7 @@ impl WorkerPool {
         let in_flight = self.admit(&owner, deadline.instant()).await?;
         let (parts, body) = req.into_parts();
         let left = deadline.instant().saturating_duration_since(tokio::time::Instant::now());
-        let context = HttpContext { principal, rec, access };
+        let context = HttpContext { caller, rec };
         let head = boundary::RequestHead {
             method: parts.method.to_string(),
             uri: parts.uri.to_string(),
@@ -731,9 +732,9 @@ type JobDone = tokio::sync::oneshot::Sender<Result<(JobResult, Bytes)>>;
 /// The principal, database record, and access of a request that a worker serves.
 #[derive(Serialize, Deserialize)]
 struct HttpContext {
-    principal: crate::node::Principal,
+    /// The signed-in caller and its access, or `None` for a request from a peer node.
+    caller: Option<(crate::node::Principal, crate::meta::Access)>,
     rec: crate::meta::DbRecord,
-    access: crate::meta::Access,
 }
 
 /// Keeps a request stream open, and its owner's in-flight permit taken, until the response
@@ -808,7 +809,7 @@ fn oom_kills(cgroup: &std::path::Path) -> u64 {
 /// Runs the jobs that the node sends on stdin and writes each result to stdout (the `baserunna worker` command).
 pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
     let engine = node.engine.clone();
-    let router = crate::api::db_routes()
+    let router = crate::api::worker_routes()
         .layer(axum::extract::DefaultBodyLimit::max(node.cfg.max_json_body))
         .with_state(node.clone());
     let (results, to_write) = tokio::sync::mpsc::unbounded_channel::<boundary::Frame>();
@@ -1148,23 +1149,20 @@ async fn route_stream(
     use tower::ServiceExt;
     let context: HttpContext =
         serde_json::from_slice(&head.context).map_err(|e| Error::internal(format!("worker request context: {e}")))?;
-    let db = node.open_db(&context.rec).await?;
-    let deadline = crate::node::Deadline::new(tokio::time::Instant::now() + Duration::from_millis(head.deadline_ms));
-    let ctx = crate::api::DbCtx {
-        principal: context.principal.clone(),
-        rec: context.rec,
-        access: context.access,
-        db,
-        deadline,
-    };
     let mut req = http::Request::builder()
         .method(head.method.as_str())
         .uri(head.uri)
         .body(body)
         .map_err(|e| Error::internal(format!("worker request: {e}")))?;
     boundary::append_headers(req.headers_mut(), head.headers);
-    req.extensions_mut().insert(context.principal);
-    req.extensions_mut().insert(ctx);
+    if let Some((principal, access)) = context.caller {
+        let db = node.open_db(&context.rec).await?;
+        let deadline =
+            crate::node::Deadline::new(tokio::time::Instant::now() + Duration::from_millis(head.deadline_ms));
+        let ctx = crate::api::DbCtx { principal: principal.clone(), rec: context.rec, access, db, deadline };
+        req.extensions_mut().insert(principal);
+        req.extensions_mut().insert(ctx);
+    }
     router.oneshot(req).await.map_err(|e| Error::internal(format!("worker router: {e}")))
 }
 

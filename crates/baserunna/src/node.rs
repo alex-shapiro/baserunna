@@ -907,7 +907,8 @@ impl Node {
                         db: db.id.clone(),
                         bind: baserunna_api::b64::encode(&bind.encode()),
                     };
-                    match self.forward_internal(&holder, &addr, "/internal/v1/events/bind", &body).await {
+                    let path = format!("/internal/v1/dbs/{}/events/bind", db.id);
+                    match self.forward_internal(&holder, &addr, &path, &body).await {
                         Ok(j) => crate::api::bind_results_from_json(&j, n)?,
                         Err(Ok(e @ Error::Unavailable { outcome_unknown: false, .. }))
                         | Err(Ok(e @ Error::NotOwner { .. })) => {

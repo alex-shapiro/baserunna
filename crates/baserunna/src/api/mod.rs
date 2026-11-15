@@ -88,7 +88,7 @@ pub fn error_json(e: &Error) -> Json {
     serde_json::to_value(api_error(e)).expect("errors serialize")
 }
 
-/// Maximum body size for `/internal/v1/events/bind`.
+/// Maximum body size for `/internal/v1/dbs/{db}/events/bind`.
 const BIND_BODY_MAX: usize = 1 << 30;
 
 /// Reconstructs an [`Error`] from a JSON error response, falling back to `status`
@@ -460,9 +460,17 @@ fn is_long_poll(req: &Request) -> bool {
     !long_poll_wait(req).is_zero()
 }
 
-/// Returns the database routes, which a worker serves for requests that the node sends it.
+/// Returns the database routes.
 pub(crate) fn db_routes() -> Router<Arc<Node>> {
     data::routes().merge(streams::routes()).merge(events::routes())
+}
+
+/// Returns the routes that an owner's worker serves for requests that the node sends it.
+pub(crate) fn worker_routes() -> Router<Arc<Node>> {
+    db_routes().route(
+        "/internal/v1/dbs/{db}/events/bind",
+        post(events::internal_bind).layer(DefaultBodyLimit::max(BIND_BODY_MAX)),
+    )
 }
 
 /// Authenticates database-scoped requests and routes them to the target node or handles them locally.
@@ -560,7 +568,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
             }
         }
         if let Some(w) = node.engine.shared.workers.get() {
-            let resp = w.http(principal, rec.clone(), access, deadline, req).await?;
+            let resp = w.http(Some((principal, access)), rec.clone(), deadline, req).await?;
             if resp.status() == StatusCode::NOT_FOUND {
                 node.forget_db_name(&rec.owner_id, &rec.name);
             }
@@ -1180,7 +1188,10 @@ pub fn router(node: Arc<Node>) -> Router {
     let internal = Router::new()
         .route("/internal/v1/meta", post(account::internal_meta))
         .route("/internal/v1/notice", post(commit_notice))
-        .route("/internal/v1/events/bind", post(events::internal_bind).layer(DefaultBodyLimit::max(BIND_BODY_MAX)))
+        .route(
+            "/internal/v1/dbs/{db}/events/bind",
+            post(events::route_internal_bind).layer(DefaultBodyLimit::max(BIND_BODY_MAX)),
+        )
         .route_layer(middleware::from_fn_with_state(node.clone(), internal_auth));
     let r = Router::new()
         .route("/healthz", get(healthz))

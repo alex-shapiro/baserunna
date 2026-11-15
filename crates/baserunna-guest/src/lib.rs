@@ -7,6 +7,8 @@
 
 use std::cell::RefCell;
 
+pub mod owner;
+
 thread_local! {
     static OUTPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }

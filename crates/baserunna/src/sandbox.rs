@@ -6,6 +6,8 @@
 //! instruction budget (fuel) stops the instance.
 
 use crate::error::{Error, Result};
+
+pub mod owner;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -200,6 +202,8 @@ struct GuestState {
     clock_ns: u64,
     rng: Rng,
     stderr: Vec<u8>,
+    /// Calls of an owner instance; `None` in a round 2 call instance.
+    owner_io: Option<owner::OwnerIo>,
 }
 
 fn store_code(e: &StoreError) -> i64 {
@@ -448,7 +452,7 @@ impl Sandbox {
             refused_grow: None,
             peak: self.last_instance_peak.clone(),
         };
-        let state = GuestState { limiter, store: object_store, clock_ns: 0, rng: Rng::new(seed), stderr: Vec::new() };
+        let state = GuestState { limiter, store: object_store, clock_ns: 0, rng: Rng::new(seed), stderr: Vec::new(), owner_io: None };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.limiter);
         store.set_fuel(fuel).map_err(|e| Error::internal(format!("sandbox fuel: {e}")))?;

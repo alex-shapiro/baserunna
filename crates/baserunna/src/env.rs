@@ -35,6 +35,11 @@ struct Gate {
 }
 
 /// Wraps a simulated node task to support node pauses and task reordering.
+/// Count of polls of all simulated tasks in this process.
+///
+/// The guest's step loop reads it to tell when no task made progress.
+pub static SIM_TASK_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct SimTask<F> {
     inner: std::pin::Pin<Box<F>>,
     gate: Arc<Gate>,
@@ -44,6 +49,7 @@ impl<F: Future<Output = ()>> Future for SimTask<F> {
     type Output = ();
 
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        SIM_TASK_POLLS.fetch_add(1, Ordering::Relaxed);
         if self.gate.paused.load(Ordering::SeqCst) {
             self.gate.waiting.lock().push(cx.waker().clone());
             return std::task::Poll::Pending;

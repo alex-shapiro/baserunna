@@ -231,7 +231,7 @@ the item of the requirement. "Planned" paths do not exist yet.
 | --- | --- | --- |
 | Accept connections, with a fixed limit on open connections | 1 | `main.rs` `run`, planned `ConnLimit` (today no limit) |
 | Read HTTP headers with fixed hyper buffer and header limits | 1 | `main.rs` `run`, planned hyper builder settings |
-| One hyper task per connection, under the connection limit | 1 | `main.rs` `run` (the serve loop) |
+| One hyper task per connection, under the connection limit | 1 | today `main.rs:204` `axum::serve`; planned hyper-util accept loop, because `axum::serve` sets no connection limit and no header limits |
 | Request context: deadline, client address, metrics | 1 | `api/mod.rs:715` `request_context`, `:346` `tag_client` |
 | Close a connection with an unread body | 2 | `api/mod.rs:1169` `close_if_body_unread` |
 | Authenticate: auth cache, miss goes to the system instance | 1 | `auth.rs`, planned `SystemInstance::auth` |
@@ -395,7 +395,8 @@ The requirement comes first. Workload tuning comes last.
    routes, `run_meta`, the reaper, session expiry, and `SYS_DB` upkeep.
    Internal routes. Remove `Engine` from the host `Node`.
 4. **Round 5.** Process-wide guard on every read path, route tables, and
-   the two router tests. Connection limit and hyper limits. Fixed caps on
+   the two router tests. Replace `axum::serve` with a hyper-util accept
+   loop that has a connection limit and fixed header limits. Fixed caps on
    the host caches. Streaming store get and the put with no copy.
 5. **Round 6.** Epoch interruption, turns by owner, the CPU budget kill,
    ahead-of-time compile, pooling allocator. Fix

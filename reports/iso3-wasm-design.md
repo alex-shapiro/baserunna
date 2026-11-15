@@ -250,7 +250,7 @@ the item of the requirement. "Planned" paths do not exist yet.
 | Console database pages `/console/dbs/{db}/...` | 2 | one host route that sends the request to the owner instance |
 | Account, org, API key, session, and database-list routes | 2 | sent to the system instance |
 | `/internal/v1/events/bind` | 2, 3 | streamed in 16 KiB chunks to the owner instance, which decodes and applies the bind. Today the host decodes a body of up to 1 GiB (code, `api/events.rs:418` `internal_bind`, `api/mod.rs:92` `BIND_BODY_MAX`) |
-| `/internal/v1/meta` | 2, 3 | sent to the system instance; size check and charge first |
+| `/internal/v1/meta` | 2, 3 | streamed in 16 KiB chunks to the system instance, which parses the command and runs `run_meta_local`. Today the host parses it and runs it with up to 5 retries (code, `api/account.rs` `internal_meta`) |
 | `/internal/v1/notice` (fixed-size: database id and version) | 2 | sent to the owner instance if it is live; dropped if not |
 | Internal auth of peer requests | 1 | `api/mod.rs:873` `internal_auth` |
 | Per-route latency metrics, keyed by route template (a fixed set) | 1 | `metrics.rs:155` `ServerMetrics::routes` |

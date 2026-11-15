@@ -20,6 +20,8 @@ pub const OWNER_INSTANCE_MEMORY_BOUND: usize = 512 << 20;
 const TIMER_TICK: std::time::Duration = std::time::Duration::from_millis(5);
 /// Requests that may wait for one owner instance before callers wait.
 const REQUEST_QUEUE: usize = 256;
+/// Store calls of one owner instance that may run at once; later calls wait for a slot.
+const STORE_CALLS_IN_FLIGHT: usize = 16;
 
 /// Response of an owner instance to one request.
 #[derive(Debug)]
@@ -41,6 +43,7 @@ pub(super) struct OwnerIo {
     next_ticket: u32,
     completions: mpsc::UnboundedSender<Completion>,
     responses: HashMap<u64, oneshot::Sender<OwnerResponse>>,
+    store_slots: Arc<tokio::sync::Semaphore>,
 }
 
 fn owner_io<'a>(caller: &'a mut Caller<'_, GuestState>) -> wasmtime::Result<&'a mut OwnerIo> {
@@ -56,8 +59,10 @@ where
     let ticket = io.next_ticket;
     io.next_ticket = io.next_ticket.wrapping_add(1);
     let done = io.completions.clone();
+    let slots = io.store_slots.clone();
     let work = call(io.store.clone());
     tokio::spawn(async move {
+        let Ok(_slot) = slots.acquire_owned().await else { return };
         let (code, data) = work.await;
         let _ = done.send(Completion { ticket, code, data });
     });
@@ -237,7 +242,13 @@ impl OwnerInstances {
             refused_grow: None,
             peak: Arc::default(),
         };
-        let io = OwnerIo { store, next_ticket: 0, completions: completions_tx, responses: HashMap::new() };
+        let io = OwnerIo {
+            store,
+            next_ticket: 0,
+            completions: completions_tx,
+            responses: HashMap::new(),
+            store_slots: Arc::new(tokio::sync::Semaphore::new(STORE_CALLS_IN_FLIGHT)),
+        };
         let state = GuestState { limiter, store: None, clock_ns: 0, rng: Rng::new(seed), stderr: Vec::new(), owner_io: Some(io) };
         let mut wstore = Store::new(&self.engine, state);
         wstore.limiter(|s| &mut s.limiter);

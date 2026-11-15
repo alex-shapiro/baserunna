@@ -34,16 +34,19 @@ pub trait Transport: Send + Sync + 'static {
 }
 
 /// HTTP/1.1 peer transport.
+#[cfg(feature = "server")]
 pub struct HttpTransport {
     client: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
 }
 
+#[cfg(feature = "server")]
 impl Default for HttpTransport {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "server")]
 impl HttpTransport {
     pub fn new() -> HttpTransport {
         let mut conn = hyper_util::client::legacy::connect::HttpConnector::new();
@@ -56,6 +59,7 @@ impl HttpTransport {
     }
 }
 
+#[cfg(feature = "server")]
 impl Transport for HttpTransport {
     fn call(&self, addr: &str, mut req: Request<Body>) -> BoxFut<'static, Result<Response<Body>, TransportError>> {
         let pq = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());

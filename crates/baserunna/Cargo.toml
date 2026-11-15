@@ -11,15 +11,17 @@ cloud = ["server", "dep:object_store", "dep:reqwest"]
 # The HTTP server, the OS environment, and the sandbox host. Without it the
 # crate builds for the WebAssembly guest.
 # The build that runs inside the WebAssembly sandbox.
-guest = ["dep:sha2"]
-server = ["dep:aws-lc-rs", "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:wasmtime", "tokio/net", "tokio/signal", "tokio/rt-multi-thread"]
+guest = ["dep:sha2", "handlers"]
+# The HTTP handlers of database routes, without a server. The guest and the server both use them.
+handlers = ["dep:axum", "dep:tower"]
+server = ["handlers", "axum/http1", "axum/tokio", "dep:aws-lc-rs", "dep:hyper", "dep:hyper-util", "dep:wasmtime", "tokio/net", "tokio/signal", "tokio/rt-multi-thread"]
 
 [dependencies]
 baserunna-api.workspace = true
 baserunna-core.workspace = true
 baserunna-client.workspace = true
 aws-lc-rs = { version = "1.18", optional = true }
-axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "json", "query", "form", "tokio", "matched-path", "original-uri"] }
+axum = { version = "0.8", optional = true, default-features = false, features = ["json", "query", "form", "matched-path", "original-uri"] }
 bytes = { version = "1", features = ["serde"] }
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 crc32c = "0.6"

@@ -71,9 +71,11 @@ fn op_ctx<'a>(node: &'a Node, ctx: &'a DbCtx, enc: api::Encoding) -> OpCtx<'a> {
     OpCtx {
         db: &ctx.db,
         encoding: enc,
+        #[cfg(feature = "server")]
         access: ctx.access,
         json_value_max: node.cfg.json_value_max,
         query_limits: node.cfg.query_limits,
+        #[cfg(feature = "server")]
         node: Some(node),
         user_id: &ctx.principal.user.id,
     }

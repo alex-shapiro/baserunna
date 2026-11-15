@@ -6,12 +6,14 @@ use crate::store::BoxFut;
 use crate::util::{ct_eq, hmac_sha256, sha256};
 use baserunna_api::b64;
 use serde_json::Value as Json;
+#[cfg(feature = "server")]
 use std::num::NonZeroU32;
 
 pub const SESSION_PREFIX: &str = "brs_";
 pub const API_KEY_PREFIX: &str = "brk_";
 
 /// Hashes `password` as `pbkdf2-sha256$<iters>$<salt b64>$<hash b64>`.
+#[cfg(feature = "server")]
 pub fn hash_password(env: &Env, password: &str, iterations: u32) -> String {
     let salt = env.random_bytes(16);
     let iters = NonZeroU32::new(iterations.max(1)).unwrap_or(NonZeroU32::MIN);
@@ -20,6 +22,7 @@ pub fn hash_password(env: &Env, password: &str, iterations: u32) -> String {
     format!("pbkdf2-sha256${}${}${}", iters, b64::encode(&salt), b64::encode(&out))
 }
 
+#[cfg(feature = "server")]
 pub fn verify_password(password: &str, stored: &str) -> bool {
     let parts: Vec<&str> = stored.split('$').collect();
     if parts.len() != 4 || parts[0] != "pbkdf2-sha256" {
@@ -31,6 +34,22 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
     };
     let Some(iters) = NonZeroU32::new(iters) else { return false };
     aws_lc_rs::pbkdf2::verify(aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA256, iters, &salt, password.as_bytes(), &hash).is_ok()
+}
+
+/// Password hashing runs in the host, so an owner instance cannot hash.
+#[cfg(not(feature = "server"))]
+pub fn hash_password(_env: &Env, _password: &str, _iterations: u32) -> String {
+    unreachable!("password hashing runs in the host")
+}
+
+#[cfg(not(feature = "server"))]
+pub fn verify_password(_password: &str, _stored: &str) -> bool {
+    false
+}
+
+#[cfg(not(feature = "server"))]
+pub fn verify_id_token(_token: &str, _jwks: &Json, _client_id: &str, _issuers: &[String], _now_ms: u64) -> Result<IdClaims> {
+    Err(Error::unavailable("sign-in runs in the host"))
 }
 
 pub fn validate_password(p: &str) -> Result<()> {
@@ -159,12 +178,14 @@ pub trait OidcProvider: Send + Sync + 'static {
     fn jwks(&self) -> BoxFut<'_, Result<Json>>;
 }
 
+#[cfg(feature = "server")]
 fn jwt_part(s: &str) -> Result<Json> {
     let b = b64::decode_url(s).ok_or_else(|| Error::Unauthenticated("malformed ID token".into()))?;
     serde_json::from_slice(&b).map_err(|_| Error::Unauthenticated("malformed ID token".into()))
 }
 
 /// Verifies an RS256 ID token against `jwks`.
+#[cfg(feature = "server")]
 pub fn verify_id_token(token: &str, jwks: &Json, client_id: &str, issuers: &[String], now_ms: u64) -> Result<IdClaims> {
     let unauth = |m: &str| Error::Unauthenticated(format!("ID token rejected: {m}"));
     let parts: Vec<&str> = token.split('.').collect();

@@ -345,7 +345,10 @@ fn client_addr(headers: &HeaderMap, peer: Option<std::net::SocketAddr>, hops: us
 
 async fn tag_client(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
     if req.extensions().get::<ClientAddr>().is_none() {
+        #[cfg(feature = "server")]
         let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
+        #[cfg(not(feature = "server"))]
+        let peer = None;
         let addr = client_addr(req.headers(), peer, node.cfg.limits.trusted_proxy_hops);
         req.extensions_mut().insert(ClientAddr(addr));
     }

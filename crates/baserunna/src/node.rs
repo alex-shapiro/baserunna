@@ -387,6 +387,7 @@ impl Node {
                 maintainer.schedule(db, tables);
             }
         }));
+        #[cfg(feature = "server")]
         if let Ok(path) = std::env::var("BASERUNNA_GUEST_WASM") {
             let wasm = std::fs::read(&path).map_err(|e| Error::internal(format!("guest module {path}: {e}")))?;
             let sandbox = crate::sandbox::Sandbox::new(&wasm, crate::sandbox::OWNER_MEMORY_BOUND)?;

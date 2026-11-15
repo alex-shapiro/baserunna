@@ -93,6 +93,24 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// HMAC-SHA256 of `data` under `key` (RFC 2104), for builds without the server's crypto library.
+#[cfg(not(feature = "server"))]
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&sha256(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let pad = |b: u8| k.iter().map(|x| x ^ b).collect::<Vec<u8>>();
+    let mut inner = pad(0x36);
+    inner.extend_from_slice(data);
+    let mut outer = pad(0x5c);
+    outer.extend_from_slice(&sha256(&inner));
+    sha256(&outer)
+}
+
 /// Constant-time byte slice equality.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {

@@ -26,16 +26,14 @@ use std::time::Duration;
 /// Default memory limit of one owner's cgroup.
 pub const OWNER_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
-/// The owner's `memory.high` as a percentage of its `memory.max`. Above it, the kernel slows the
-/// owner's allocations, so the owner's streams in flight slow down before the kernel's
-/// `memory.max` stops them.
-pub const OWNER_MEMORY_HIGH_PERCENT: u64 = 87;
-
 /// Idle time after which the node stops an owner's worker.
 pub const WORKER_IDLE_STOP: Duration = Duration::from_secs(20);
 
 /// Longest time a worker may take to seal unsealed rows.
 const SEAL_DEADLINE: Duration = Duration::from_secs(600);
+
+/// Longest time a worker may take to mark a database deleted, check it, or purge it.
+const MAINTENANCE_DEADLINE: Duration = Duration::from_secs(300);
 
 /// Longest time a worker may take to read a whole blob value.
 const BLOB_READ_DEADLINE: Duration = Duration::from_secs(120);
@@ -94,6 +92,12 @@ enum Job {
         table: String,
         query: serde_json::Value,
     },
+    /// Marks database `db` deleted, so the owner's workers stop serving it.
+    MarkDeleted { db: String },
+    /// Returns whether the manifest of database `db` is marked deleted.
+    IsDeleted { db: String },
+    /// Deletes every object of database `db` from the store.
+    Purge { db: String },
     BulkInsert {
         db: String,
         schema: EventSchema,
@@ -106,6 +110,10 @@ enum Job {
 /// The result of a [`Job`].
 #[derive(Serialize, Deserialize)]
 enum JobResult {
+    /// The job finished with no value.
+    Finished,
+    /// Whether the database of an [`Job::IsDeleted`] is marked deleted.
+    Deleted(bool),
     Merged(Option<(Vec<u8>, Vec<u8>)>),
     BlobEquals(bool),
     BlobDecimal(Option<i64>),
@@ -253,8 +261,6 @@ impl WorkerPool {
         if !dir.exists() {
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join("memory.max"), self.cfg.owner_memory_bytes.to_string())?;
-            let high = self.cfg.owner_memory_bytes / 100 * OWNER_MEMORY_HIGH_PERCENT;
-            std::fs::write(dir.join("memory.high"), high.to_string())?;
             let _ = std::fs::write(dir.join("memory.swap.max"), "0");
             std::fs::write(dir.join("cpu.weight"), self.cfg.owner_cpu_weight.to_string())?;
         }
@@ -433,6 +439,34 @@ impl WorkerPool {
         }
     }
 
+    /// Marks database `db` of owner `owner` deleted in the owner's worker.
+    pub async fn mark_deleted(&self, owner: &str, db: &str) -> Result<()> {
+        self.finish(owner, Job::MarkDeleted { db: db.to_string() }).await
+    }
+
+    /// Deletes every object of database `db` of owner `owner` in the owner's worker.
+    pub async fn purge(&self, owner: &str, db: &str) -> Result<()> {
+        self.finish(owner, Job::Purge { db: db.to_string() }).await
+    }
+
+    /// Returns whether the manifest of database `db` of owner `owner` is marked deleted, read in
+    /// the owner's worker.
+    pub async fn is_deleted(&self, owner: &str, db: &str) -> Result<bool> {
+        match self.run(owner, Job::IsDeleted { db: db.to_string() }, Bytes::new(), MAINTENANCE_DEADLINE).await?.0 {
+            JobResult::Deleted(d) => Ok(d),
+            JobResult::Failed(e) => Err(crate::api::error_from_json(500, &e)),
+            _ => Err(Error::internal("the worker returned a result of another job")),
+        }
+    }
+
+    async fn finish(&self, owner: &str, job: Job) -> Result<()> {
+        match self.run(owner, job, Bytes::new(), MAINTENANCE_DEADLINE).await?.0 {
+            JobResult::Finished => Ok(()),
+            JobResult::Failed(e) => Err(crate::api::error_from_json(500, &e)),
+            _ => Err(Error::internal("the worker returned a result of another job")),
+        }
+    }
+
     /// Returns blob `blob` of `db` parsed as a decimal integer, read in a worker inside the owner's cgroup.
     pub async fn blob_decimal(&self, db: &str, blob: &BlobRef) -> Result<Option<i64>> {
         match self.blob_value(db, blob, false, Bytes::new()).await? {
@@ -562,6 +596,34 @@ impl WorkerPool {
             let _ = std::fs::write(w.leaf.join("cgroup.kill"), "1");
             false
         });
+    }
+
+    /// Stops every worker, waits up to `wait` until the kernel reports each owner cgroup empty,
+    /// and removes the owner cgroups, so a stopped node leaves no cgroups behind.
+    pub async fn stop_all(&self, wait: Duration) {
+        for (_, w) in self.owner_workers.lock().drain() {
+            w.exited.store(true, std::sync::atomic::Ordering::Release);
+        }
+        let dirs: Vec<PathBuf> = std::fs::read_dir(&self.cfg.cgroup_root)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("owner-"))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for d in &dirs {
+            let _ = std::fs::write(d.join("cgroup.kill"), "1");
+        }
+        let until = tokio::time::Instant::now() + wait;
+        for d in &dirs {
+            while !cgroup_empty(d) && tokio::time::Instant::now() < until {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if let Err(e) = std::fs::remove_dir(d) {
+                crate::warn!("cannot remove cgroup {}: {e}", d.display());
+            }
+        }
     }
 
     /// Returns the number of running workers.
@@ -733,6 +795,11 @@ fn own_cgroup() -> Option<PathBuf> {
     Some(PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
 }
 
+/// Returns true if the kernel reports that `cgroup` and its children hold no process.
+fn cgroup_empty(cgroup: &std::path::Path) -> bool {
+    std::fs::read_to_string(cgroup.join("cgroup.events")).map_or(true, |e| e.lines().any(|l| l == "populated 0"))
+}
+
 fn oom_kills(cgroup: &std::path::Path) -> u64 {
     let events = std::fs::read_to_string(cgroup.join("memory.events")).unwrap_or_default();
     events.lines().find_map(|l| l.strip_prefix("oom_kill ")).and_then(|n| n.trim().parse().ok()).unwrap_or(0)
@@ -819,6 +886,27 @@ async fn run_job(engine: &Arc<crate::engine::Engine>, job: Job, payload: Bytes) 
                 ),
             }
         }
+        Job::MarkDeleted { db } => {
+            let db = engine.db(&db);
+            match db.open(false).await {
+                Ok(_) => match db.mark_deleted().await {
+                    Ok(()) => (JobResult::Finished, Bytes::new()),
+                    Err(e) => failed(e),
+                },
+                Err(Error::NotFound(_)) => (JobResult::Finished, Bytes::new()),
+                Err(e) => failed(e),
+            }
+        }
+        Job::IsDeleted { db } => {
+            let db = engine.db(&db);
+            let deleted = db.read_version(crate::engine::Consistency::Strong).await.is_err()
+                && db.current().is_some_and(|v| v.m.is_deleted());
+            (JobResult::Deleted(deleted), Bytes::new())
+        }
+        Job::Purge { db } => match engine.purge(&db).await {
+            Ok(()) => (JobResult::Finished, Bytes::new()),
+            Err(e) => failed(e),
+        },
         Job::BlobValue { db, blob, equals } => {
             let read = async {
                 let blob = BlobRef::decode(&mut crate::util::codec::Reader::new(&blob))

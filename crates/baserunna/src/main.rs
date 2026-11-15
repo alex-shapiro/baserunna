@@ -139,6 +139,9 @@ async fn main() {
     }
 }
 
+/// The longest time that a stopping node waits for its workers to exit.
+const WORKER_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 async fn run() -> Result<(), String> {
     let (mut cfg, listen, store_url, shutdown) = config()?;
     let store = store_from_url(&store_url)?;
@@ -236,6 +239,9 @@ async fn run() -> Result<(), String> {
         n2.drain();
         tokio::time::sleep(shutdown.drain_delay).await;
         n2.end_waits();
+        if let Some(w) = n2.engine.shared.workers.get() {
+            w.stop_all(WORKER_STOP_WAIT).await;
+        }
         // Allow in-flight requests up to `timeout` to complete before forcing lease release.
         let n3 = n2.clone();
         env.spawn(async move {

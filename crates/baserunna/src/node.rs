@@ -1296,10 +1296,17 @@ impl Node {
         };
         // Mark each database manifest deleted so nodes with cached handles stop serving it immediately.
         for id in dbs {
-            let db = self.engine.db(&id);
-            if db.open(false).await.is_ok()
-                && let Err(e) = db.mark_deleted().await
-            {
+            let marked = match self.engine.shared.workers.get() {
+                Some(w) => w.mark_deleted(&user.id, &id).await,
+                None => {
+                    let db = self.engine.db(&id);
+                    match db.open(false).await {
+                        Ok(_) => db.mark_deleted().await,
+                        Err(_) => Ok(()),
+                    }
+                }
+            };
+            if let Err(e) = marked {
                 crate::warn!("flagging database {id} of a deleted account: {e}");
             }
             self.engine.forget(&id);
@@ -1622,7 +1629,10 @@ impl Node {
             if d.deleted_at + (self.cfg.db_delete_grace_ms as i64) > store_now as i64 {
                 continue;
             }
-            self.engine.purge(&d.id).await?;
+            match self.engine.shared.workers.get() {
+                Some(w) => w.purge(&d.owner_id, &d.id).await?,
+                None => self.engine.purge(&d.id).await?,
+            }
             self.env.crash_point().await;
             self.run_meta(MetaCmd::PurgePass { id: d.id.clone(), passes: d.purge_passes }).await?;
             n += 1;

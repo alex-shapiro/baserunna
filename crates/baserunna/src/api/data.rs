@@ -147,9 +147,14 @@ pub async fn create_db(
         Err(Error::AlreadyExists(m)) => {
             // If a prior deletion stopped after marking the manifest deleted, finish it and retry.
             let (existing, _) = node.resolve_db_strong(&p, &DbRef::format(c.org.as_deref(), &c.name)).await?;
-            let db = node.open_db(&existing).await?;
-            let deleted =
-                db.read_version(Consistency::Strong).await.is_err() && db.current().is_some_and(|v| v.m.is_deleted());
+            let deleted = match node.engine.shared.workers.get() {
+                Some(w) => w.is_deleted(&existing.owner_id, &existing.id).await?,
+                None => {
+                    let db = node.open_db(&existing).await?;
+                    db.read_version(Consistency::Strong).await.is_err()
+                        && db.current().is_some_and(|v| v.m.is_deleted())
+                }
+            };
             if !deleted {
                 return Err(Error::AlreadyExists(m));
             }

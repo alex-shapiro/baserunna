@@ -1,0 +1,3478 @@
+{
+  "results": [
+    {
+      "file": "base-blob_checks-attack.json",
+      "workload": "blob_checks",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 1021.34765625,
+        "2_tenant_bound_holds": false,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 60.668149,
+          "p99_attacked_ms": 70.772289,
+          "p99_limit_ms": 121.336298,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 1149689856,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 214323200,
+        "growth_bytes": 1070960640,
+        "peak_bytes": 1118842880,
+        "peak_mib_per_second": [
+          823.3,
+          1067.0
+        ],
+        "samples": 112,
+        "start_bytes": 47882240
+      }
+    },
+    {
+      "file": "base-blob_checks-small.json",
+      "workload": "blob_checks",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 257.9453125,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 63.140167999999996,
+          "p99_attacked_ms": 65.193432,
+          "p99_limit_ms": 126.28033599999999,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 319979520,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 58503168,
+        "growth_bytes": 270475264,
+        "peak_bytes": 311590912,
+        "peak_mib_per_second": [
+          242.0,
+          297.2
+        ],
+        "samples": 110,
+        "start_bytes": 41115648
+      }
+    },
+    {
+      "file": "base-blob_downloads-attack.json",
+      "workload": "blob_downloads",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": false,
+        "2_growth_mib": 1445.1015625,
+        "2_tenant_bound_holds": false,
+        "3_victim_not_harmed": null,
+        "4_refusal_is_clean": false,
+        "5_small_variant_succeeds": null,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": 137,
+        "node_oom_kills": 1,
+        "subtree_oom_kills": 1,
+        "cgroup_memory_peak_bytes": 1614512128,
+        "client_exit_status": 0,
+        "node_died": true
+      },
+      "attacker_memory": {
+        "end_bytes": 3641344,
+        "growth_bytes": 1515298816,
+        "peak_bytes": 1546289152,
+        "peak_mib_per_second": [
+          1474.7
+        ],
+        "samples": 66,
+        "start_bytes": 30990336
+      }
+    },
+    {
+      "file": "base-blob_downloads-small.json",
+      "workload": "blob_downloads",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 17.34375,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 60.612716,
+          "p99_attacked_ms": 72.434546,
+          "p99_limit_ms": 121.225432,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 58953728,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 48021504,
+        "growth_bytes": 18186240,
+        "peak_bytes": 48762880,
+        "peak_mib_per_second": [
+          46.5
+        ],
+        "samples": 50,
+        "start_bytes": 30576640
+      }
+    },
+    {
+      "file": "base-bulk_inserts-attack.json",
+      "workload": "bulk_inserts",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": false,
+        "2_growth_mib": 875.17578125,
+        "2_tenant_bound_holds": false,
+        "3_victim_not_harmed": null,
+        "4_refusal_is_clean": false,
+        "5_small_variant_succeeds": null,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": 137,
+        "node_oom_kills": 1,
+        "subtree_oom_kills": 1,
+        "cgroup_memory_peak_bytes": 1610612736,
+        "client_exit_status": 0,
+        "node_died": true
+      },
+      "attacker_memory": {
+        "end_bytes": 339968,
+        "growth_bytes": 917688320,
+        "peak_bytes": 1586143232,
+        "peak_mib_per_second": [
+          1512.7
+        ],
+        "samples": 73,
+        "start_bytes": 668454912
+      }
+    },
+    {
+      "file": "base-bulk_inserts-small.json",
+      "workload": "bulk_inserts",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 533.2734375,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 60.84891399999999,
+          "p99_attacked_ms": 146.386963,
+          "p99_limit_ms": 121.69782799999999,
+          "pass": false
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 1511432192,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 1213005824,
+        "growth_bytes": 559177728,
+        "peak_bytes": 1225342976,
+        "peak_mib_per_second": [
+          948.1,
+          1133.9,
+          1168.6
+        ],
+        "samples": 209,
+        "start_bytes": 666165248
+      }
+    },
+    {
+      "file": "base-event_scan---r1.json",
+      "workload": "event_scan",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": {
+        "bench_wall_s": 25.13207411,
+        "failed_queries": 0,
+        "failure_samples": [],
+        "median_query_ms": 41.988672,
+        "node_cpu_usage_usec": 25012968,
+        "parts": 32,
+        "per_query": [
+          {
+            "median_ms": 41.988672,
+            "query": "count",
+            "successes": 20
+          },
+          {
+            "median_ms": 89.37192900000001,
+            "query": "count by event",
+            "successes": 20
+          },
+          {
+            "median_ms": 905.9927,
+            "query": "top users",
+            "successes": 20
+          },
+          {
+            "median_ms": 161.815089,
+            "query": "unique users",
+            "successes": 20
+          },
+          {
+            "median_ms": 35.664424,
+            "query": "filtered count",
+            "successes": 20
+          },
+          {
+            "median_ms": 11.578456000000001,
+            "query": "filtered rows",
+            "successes": 20
+          },
+          {
+            "median_ms": 1.144691,
+            "query": "latest rows",
+            "successes": 20
+          }
+        ],
+        "queries": 7,
+        "rounds": 20,
+        "rows": 1000000,
+        "setup_s": 13.235712853,
+        "stored_bytes": 3041923
+      },
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 1348247552,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "base-event_scan---r2.json",
+      "workload": "event_scan",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": {
+        "bench_wall_s": 24.657390836,
+        "failed_queries": 0,
+        "failure_samples": [],
+        "median_query_ms": 42.510560000000005,
+        "node_cpu_usage_usec": 24608164,
+        "parts": 32,
+        "per_query": [
+          {
+            "median_ms": 42.510560000000005,
+            "query": "count",
+            "successes": 20
+          },
+          {
+            "median_ms": 92.75625099999999,
+            "query": "count by event",
+            "successes": 20
+          },
+          {
+            "median_ms": 897.658023,
+            "query": "top users",
+            "successes": 20
+          },
+          {
+            "median_ms": 150.87229299999998,
+            "query": "unique users",
+            "successes": 20
+          },
+          {
+            "median_ms": 32.915289,
+            "query": "filtered count",
+            "successes": 20
+          },
+          {
+            "median_ms": 11.881667,
+            "query": "filtered rows",
+            "successes": 20
+          },
+          {
+            "median_ms": 1.141303,
+            "query": "latest rows",
+            "successes": 20
+          }
+        ],
+        "queries": 7,
+        "rounds": 20,
+        "rows": 1000000,
+        "setup_s": 13.392821422,
+        "stored_bytes": 3041923
+      },
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 1273548800,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "base-idle_cost---r1.json",
+      "workload": "idle_cost",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": {
+        "dbs": 1000,
+        "idle_cpu_usage_usec": 50385,
+        "idle_memory": {
+          "end_bytes": 36458496,
+          "growth_bytes": 0,
+          "peak_bytes": 36798464,
+          "peak_mib_per_second": [
+            35.1,
+            35.0,
+            35.0,
+            35.0,
+            35.0,
+            35.0,
+            35.0,
+            35.0,
+            34.9,
+            34.9,
+            34.9,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8,
+            34.8
+          ],
+          "samples": 284,
+          "start_bytes": 36798464
+        },
+        "idle_s": 30.006750822,
+        "keys_per_db": 1,
+        "memory_after_create_bytes": 37949440,
+        "memory_after_setup_bytes": 36798464,
+        "memory_before_setup_bytes": 4972544,
+        "memory_idle_end_bytes": 36458496,
+        "owners": 1000,
+        "setup_s": 14.025628209,
+        "subtree_idle_end": {
+          "cgroups": 1,
+          "processes": 1
+        },
+        "subtree_idle_start": {
+          "cgroups": 1,
+          "processes": 1
+        },
+        "summary": {
+          "idle_cpu_usec_per_s": 1679.1221515079637,
+          "memory_after_setup_mib": 35.09375,
+          "memory_before_setup_mib": 4.7421875,
+          "memory_idle_end_mib": 34.76953125,
+          "processes_idle_end": 1,
+          "processes_idle_start": 1
+        },
+        "touch_s": 2.188801658
+      },
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 39067648,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "base-idle_cost---r2.json",
+      "workload": "idle_cost",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": {
+        "dbs": 1000,
+        "idle_cpu_usage_usec": 47232,
+        "idle_memory": {
+          "end_bytes": 33902592,
+          "growth_bytes": 0,
+          "peak_bytes": 34291712,
+          "peak_mib_per_second": [
+            32.7,
+            32.6,
+            32.6,
+            32.6,
+            32.6,
+            32.6,
+            32.6,
+            32.6,
+            32.5,
+            32.5,
+            32.5,
+            32.5,
+            32.5,
+            32.5,
+            32.5,
+            32.3,
+            32.3,
+            32.3,
+            32.3,
+            32.3,
+            32.3,
+            32.3,
+            32.3,
+            32.3,
+            32.3,
+            32.3,
+            32.3,
+            32.3,
+            32.3,
+            32.3
+          ],
+          "samples": 284,
+          "start_bytes": 34291712
+        },
+        "idle_s": 30.007260082,
+        "keys_per_db": 1,
+        "memory_after_create_bytes": 35655680,
+        "memory_after_setup_bytes": 34291712,
+        "memory_before_setup_bytes": 5177344,
+        "memory_idle_end_bytes": 33898496,
+        "owners": 1000,
+        "setup_s": 13.750713493,
+        "subtree_idle_end": {
+          "cgroups": 1,
+          "processes": 1
+        },
+        "subtree_idle_start": {
+          "cgroups": 1,
+          "processes": 1
+        },
+        "summary": {
+          "idle_cpu_usec_per_s": 1574.019083079576,
+          "memory_after_setup_mib": 32.703125,
+          "memory_before_setup_mib": 4.9375,
+          "memory_idle_end_mib": 32.328125,
+          "processes_idle_end": 1,
+          "processes_idle_start": 1
+        },
+        "touch_s": 2.12084395
+      },
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 38121472,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "base-kv_throughput---r1.json",
+      "workload": "kv_throughput",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": {
+        "dbs": 2000,
+        "keys_per_db": 1,
+        "owners": 10,
+        "result": {
+          "client_cpu_vcpus": 0.622967526875414,
+          "clients": 256,
+          "error_samples": [],
+          "errors": 0,
+          "max_ms": 44.655,
+          "node_cpu_usage_usec": 37312781,
+          "node_cpu_usec_per_op": 33.01101641757637,
+          "node_cpu_vcpus": 2.487358464867895,
+          "ops": 1130313,
+          "ops_per_s": 75349.34500058371,
+          "p50_ms": 0.447,
+          "p99_ms": 22.772,
+          "seconds": 15.000966498
+        },
+        "setup_s": 47.148135259,
+        "value_bytes": 8,
+        "write_pct": 10
+      },
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 425828352,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "base-kv_throughput---r2.json",
+      "workload": "kv_throughput",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": {
+        "dbs": 2000,
+        "keys_per_db": 1,
+        "owners": 10,
+        "result": {
+          "client_cpu_vcpus": 0.6223580213298079,
+          "clients": 256,
+          "error_samples": [],
+          "errors": 0,
+          "max_ms": 45.248,
+          "node_cpu_usage_usec": 37074220,
+          "node_cpu_usec_per_op": 32.95345620809068,
+          "node_cpu_vcpus": 2.4714823794189495,
+          "ops": 1125048,
+          "ops_per_s": 74999.18563358934,
+          "p50_ms": 0.458,
+          "p99_ms": 22.856,
+          "seconds": 15.000802882
+        },
+        "setup_s": 46.455038128,
+        "value_bytes": 8,
+        "write_pct": 10
+      },
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 423055360,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "base-long_strings-attack.json",
+      "workload": "long_strings",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 882.16015625,
+        "2_tenant_bound_holds": false,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 110.466225,
+          "p99_attacked_ms": 111.633156,
+          "p99_limit_ms": 220.93245,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 1475502080,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 1193377792,
+        "growth_bytes": 925011968,
+        "peak_bytes": 1322414080,
+        "peak_mib_per_second": [
+          783.9,
+          1193.9,
+          1261.2
+        ],
+        "samples": 216,
+        "start_bytes": 397402112
+      }
+    },
+    {
+      "file": "base-long_strings-small.json",
+      "workload": "long_strings",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 80.58203125,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 60.832961999999995,
+          "p99_attacked_ms": 73.205334,
+          "p99_limit_ms": 121.66592399999999,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 194818048,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 184143872,
+        "growth_bytes": 84496384,
+        "peak_bytes": 184143872,
+        "peak_mib_per_second": [
+          175.6
+        ],
+        "samples": 35,
+        "start_bytes": 99647488
+      }
+    },
+    {
+      "file": "base-merges-attack.json",
+      "workload": "merges",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": false,
+        "2_growth_mib": 757.625,
+        "2_tenant_bound_holds": false,
+        "3_victim_not_harmed": null,
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": 137,
+        "node_oom_kills": 1,
+        "subtree_oom_kills": 1,
+        "cgroup_memory_peak_bytes": 1610612736,
+        "client_exit_status": 0,
+        "node_died": true
+      },
+      "attacker_memory": {
+        "end_bytes": 309972992,
+        "growth_bytes": 794427392,
+        "peak_bytes": 1609277440,
+        "peak_mib_per_second": [
+          1157.6,
+          1534.7
+        ],
+        "samples": 125,
+        "start_bytes": 814850048
+      }
+    },
+    {
+      "file": "base-merges-small.json",
+      "workload": "merges",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 89.01953125,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 60.417378,
+          "p99_attacked_ms": 58.07215,
+          "p99_limit_ms": 120.834756,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 405405696,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 401920000,
+        "growth_bytes": 93343744,
+        "peak_bytes": 401956864,
+        "peak_mib_per_second": [
+          383.3
+        ],
+        "samples": 62,
+        "start_bytes": 308613120
+      }
+    },
+    {
+      "file": "base-stream_filter_scans-attack.json",
+      "workload": "stream_filter_scans",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 15.6875,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 63.93807999999999,
+          "p99_attacked_ms": 2904.905095,
+          "p99_limit_ms": 127.87615999999998,
+          "pass": false
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 167903232,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 166522880,
+        "growth_bytes": 16449536,
+        "peak_bytes": 167677952,
+        "peak_mib_per_second": [
+          158.1,
+          159.9,
+          158.7,
+          158.8,
+          158.8,
+          158.8,
+          158.8,
+          158.9,
+          158.9,
+          158.9,
+          158.9
+        ],
+        "samples": 1017,
+        "start_bytes": 151228416
+      }
+    },
+    {
+      "file": "base-stream_filter_scans-small.json",
+      "workload": "stream_filter_scans",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 8.078125,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 60.180308000000004,
+          "p99_attacked_ms": 78.657223,
+          "p99_limit_ms": 120.36061600000001,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 163196928,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 158769152,
+        "growth_bytes": 8470528,
+        "peak_bytes": 159031296,
+        "peak_mib_per_second": [
+          148.8,
+          151.7
+        ],
+        "samples": 151,
+        "start_bytes": 150560768
+      }
+    },
+    {
+      "file": "base-table_filter_scans-attack.json",
+      "workload": "table_filter_scans",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 4.44921875,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 61.361706000000005,
+          "p99_attacked_ms": 818.254126,
+          "p99_limit_ms": 122.72341200000001,
+          "pass": false
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 63688704,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 59592704,
+        "growth_bytes": 4665344,
+        "peak_bytes": 59711488,
+        "peak_mib_per_second": [
+          52.9,
+          54.6,
+          56.5,
+          56.6,
+          56.6,
+          56.7,
+          56.6,
+          56.7,
+          56.9,
+          56.9,
+          56.9
+        ],
+        "samples": 1000,
+        "start_bytes": 55046144
+      }
+    },
+    {
+      "file": "base-table_filter_scans-small.json",
+      "workload": "table_filter_scans",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 0.25,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 60.032065,
+          "p99_attacked_ms": 53.614895000000004,
+          "p99_limit_ms": 120.06413,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 49053696,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 46772224,
+        "growth_bytes": 262144,
+        "peak_bytes": 47050752,
+        "peak_mib_per_second": [
+          44.9
+        ],
+        "samples": 33,
+        "start_bytes": 46788608
+      }
+    },
+    {
+      "file": "base-txn_scans-attack.json",
+      "workload": "txn_scans",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": false,
+        "2_growth_mib": 1386.203125,
+        "2_tenant_bound_holds": false,
+        "3_victim_not_harmed": null,
+        "4_refusal_is_clean": false,
+        "5_small_variant_succeeds": null,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": 137,
+        "node_oom_kills": 1,
+        "subtree_oom_kills": 1,
+        "cgroup_memory_peak_bytes": 1610612736,
+        "client_exit_status": 0,
+        "node_died": true
+      },
+      "attacker_memory": {
+        "end_bytes": 4227072,
+        "growth_bytes": 1453539328,
+        "peak_bytes": 1545572352,
+        "peak_mib_per_second": [
+          1474.0
+        ],
+        "samples": 26,
+        "start_bytes": 92033024
+      }
+    },
+    {
+      "file": "base-txn_scans-small.json",
+      "workload": "txn_scans",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 79.7578125,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 69.864475,
+          "p99_attacked_ms": 73.448078,
+          "p99_limit_ms": 139.72895,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/base",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 180002816,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 148287488,
+        "growth_bytes": 83632128,
+        "peak_bytes": 167714816,
+        "peak_mib_per_second": [
+          159.9
+        ],
+        "samples": 15,
+        "start_bytes": 84082688
+      }
+    },
+    {
+      "file": "cgroup-blob_checks-attack.json",
+      "workload": "blob_checks",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 500.11328125,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 78.785798,
+          "p99_attacked_ms": 79.496455,
+          "p99_limit_ms": 157.571596,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 2,
+        "cgroup_memory_peak_bytes": 615424000,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 295378944,
+        "growth_bytes": 524406784,
+        "peak_bytes": 591835136,
+        "peak_mib_per_second": [
+          564.4
+        ],
+        "samples": 68,
+        "start_bytes": 67428352
+      }
+    },
+    {
+      "file": "cgroup-blob_checks-small.json",
+      "workload": "blob_checks",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 261.40625,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 83.633713,
+          "p99_attacked_ms": 77.172702,
+          "p99_limit_ms": 167.267426,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 337641472,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 169472000,
+        "growth_bytes": 274104320,
+        "peak_bytes": 328364032,
+        "peak_mib_per_second": [
+          232.7,
+          313.2
+        ],
+        "samples": 123,
+        "start_bytes": 54259712
+      }
+    },
+    {
+      "file": "cgroup-blob_downloads-attack.json",
+      "workload": "blob_downloads",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 929.12890625,
+        "2_tenant_bound_holds": false,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 85.315007,
+          "p99_attacked_ms": 118.85681600000001,
+          "p99_limit_ms": 170.630014,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 1024888832,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 502108160,
+        "growth_bytes": 974262272,
+        "peak_bytes": 1017671680,
+        "peak_mib_per_second": [
+          750.2,
+          750.6,
+          851.3,
+          822.3,
+          746.2,
+          802.8,
+          737.0,
+          762.9,
+          970.5,
+          767.6,
+          733.0
+        ],
+        "samples": 893,
+        "start_bytes": 43409408
+      }
+    },
+    {
+      "file": "cgroup-blob_downloads-small.json",
+      "workload": "blob_downloads",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 21.92578125,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 81.655278,
+          "p99_attacked_ms": 77.73493500000001,
+          "p99_limit_ms": 163.310556,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 72011776,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 65228800,
+        "growth_bytes": 22990848,
+        "peak_bytes": 65757184,
+        "peak_mib_per_second": [
+          62.7
+        ],
+        "samples": 51,
+        "start_bytes": 42766336
+      }
+    },
+    {
+      "file": "cgroup-bulk_inserts-attack.json",
+      "workload": "bulk_inserts",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": "POST /v1/dbs/attacker/events/probe_empty/rows: status 413: {\"error\":{\"code\":\"too_large\",\"message\":\"the work exceeded the owner's memory limit of 512 MiB\",\"retryable\":false}}",
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 1,
+        "cgroup_memory_peak_bytes": 568967168,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "cgroup-bulk_inserts-small.json",
+      "workload": "bulk_inserts",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": "POST /v1/dbs/attacker/events/probe_empty/rows: status 413: {\"error\":{\"code\":\"too_large\",\"message\":\"the work exceeded the owner's memory limit of 512 MiB\",\"retryable\":false}}",
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 1,
+        "cgroup_memory_peak_bytes": 568852480,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "cgroup-event_scan---r1.json",
+      "workload": "event_scan",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": {
+        "bench_wall_s": 23.330070721,
+        "failed_queries": 7,
+        "failure_samples": [
+          "top users: status 413: {\"error\":{\"code\":\"too_large\",\"message\":\"the work exceeded the owner's memory limit of 512 MiB\",\"retryable\":false}}",
+          "top users: status 413: {\"error\":{\"code\":\"too_large\",\"message\":\"the work exceeded the owner's memory limit of 512 MiB\",\"retryable\":false}}",
+          "top users: status 413: {\"error\":{\"code\":\"too_large\",\"message\":\"the work exceeded the owner's memory limit of 512 MiB\",\"retryable\":false}}",
+          "top users: status 413: {\"error\":{\"code\":\"too_large\",\"message\":\"the work exceeded the owner's memory limit of 512 MiB\",\"retryable\":false}}",
+          "top users: status 413: {\"error\":{\"code\":\"too_large\",\"message\":\"the work exceeded the owner's memory limit of 512 MiB\",\"retryable\":false}}"
+        ],
+        "median_query_ms": 42.895931999999995,
+        "node_cpu_usage_usec": 22781428,
+        "parts": 32,
+        "per_query": [
+          {
+            "median_ms": 43.186909,
+            "query": "count",
+            "successes": 20
+          },
+          {
+            "median_ms": 98.081159,
+            "query": "count by event",
+            "successes": 20
+          },
+          {
+            "median_ms": 960.865679,
+            "query": "top users",
+            "successes": 13
+          },
+          {
+            "median_ms": 156.682817,
+            "query": "unique users",
+            "successes": 20
+          },
+          {
+            "median_ms": 36.222673,
+            "query": "filtered count",
+            "successes": 20
+          },
+          {
+            "median_ms": 12.658317,
+            "query": "filtered rows",
+            "successes": 20
+          },
+          {
+            "median_ms": 1.522281,
+            "query": "latest rows",
+            "successes": 20
+          }
+        ],
+        "queries": 7,
+        "rounds": 20,
+        "rows": 1000000,
+        "setup_s": 13.550032847,
+        "stored_bytes": 3041923
+      },
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 7,
+        "cgroup_memory_peak_bytes": 547713024,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "cgroup-event_scan---r2.json",
+      "workload": "event_scan",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": {
+        "bench_wall_s": 21.419487534,
+        "failed_queries": 12,
+        "failure_samples": [
+          "top users: status 413: {\"error\":{\"code\":\"too_large\",\"message\":\"the query needs more than the node's 268435456 byte memory budget; narrow the time range, group by fewer values, or read fewer columns\",\"retryable\":false}}",
+          "top users: status 413: {\"error\":{\"code\":\"too_large\",\"message\":\"the work exceeded the owner's memory limit of 512 MiB\",\"retryable\":false}}",
+          "top users: status 413: {\"error\":{\"code\":\"too_large\",\"message\":\"the query needs more than the node's 268435456 byte memory budget; narrow the time range, group by fewer values, or read fewer columns\",\"retryable\":false}}",
+          "top users: status 413: {\"error\":{\"code\":\"too_large\",\"message\":\"the query needs more than the node's 268435456 byte memory budget; narrow the time range, group by fewer values, or read fewer columns\",\"retryable\":false}}",
+          "top users: status 413: {\"error\":{\"code\":\"too_large\",\"message\":\"the work exceeded the owner's memory limit of 512 MiB\",\"retryable\":false}}"
+        ],
+        "median_query_ms": 43.54983,
+        "node_cpu_usage_usec": 21130816,
+        "parts": 32,
+        "per_query": [
+          {
+            "median_ms": 43.879989,
+            "query": "count",
+            "successes": 20
+          },
+          {
+            "median_ms": 92.471848,
+            "query": "count by event",
+            "successes": 20
+          },
+          {
+            "median_ms": 976.5171499999999,
+            "query": "top users",
+            "successes": 8
+          },
+          {
+            "median_ms": 295.475285,
+            "query": "unique users",
+            "successes": 20
+          },
+          {
+            "median_ms": 31.095773,
+            "query": "filtered count",
+            "successes": 20
+          },
+          {
+            "median_ms": 14.262561999999999,
+            "query": "filtered rows",
+            "successes": 20
+          },
+          {
+            "median_ms": 1.525977,
+            "query": "latest rows",
+            "successes": 20
+          }
+        ],
+        "queries": 7,
+        "rounds": 20,
+        "rows": 1000000,
+        "setup_s": 13.597211972,
+        "stored_bytes": 3041923
+      },
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 5,
+        "cgroup_memory_peak_bytes": 559861760,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "cgroup-idle_cost---r1.json",
+      "workload": "idle_cost",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": {
+        "dbs": 1000,
+        "idle_cpu_usage_usec": 52845,
+        "idle_memory": {
+          "end_bytes": 35540992,
+          "growth_bytes": 0,
+          "peak_bytes": 36110336,
+          "peak_mib_per_second": [
+            34.4,
+            34.1,
+            34.1,
+            34.1,
+            34.1,
+            34.1,
+            34.1,
+            34.1,
+            34.0,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            34.1,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            33.9,
+            33.9
+          ],
+          "samples": 284,
+          "start_bytes": 36110336
+        },
+        "idle_s": 30.007682105,
+        "keys_per_db": 1,
+        "memory_after_create_bytes": 38191104,
+        "memory_after_setup_bytes": 36110336,
+        "memory_before_setup_bytes": 5160960,
+        "memory_idle_end_bytes": 35540992,
+        "owners": 1000,
+        "setup_s": 14.738554597,
+        "subtree_idle_end": {
+          "cgroups": 1,
+          "processes": 1
+        },
+        "subtree_idle_start": {
+          "cgroups": 1,
+          "processes": 1
+        },
+        "summary": {
+          "idle_cpu_usec_per_s": 1761.049047876802,
+          "memory_after_setup_mib": 34.4375,
+          "memory_before_setup_mib": 4.921875,
+          "memory_idle_end_mib": 33.89453125,
+          "processes_idle_end": 1,
+          "processes_idle_start": 1
+        },
+        "touch_s": 2.06190827
+      },
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 39333888,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "cgroup-idle_cost---r2.json",
+      "workload": "idle_cost",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": {
+        "dbs": 1000,
+        "idle_cpu_usage_usec": 50781,
+        "idle_memory": {
+          "end_bytes": 39837696,
+          "growth_bytes": 0,
+          "peak_bytes": 40177664,
+          "peak_mib_per_second": [
+            38.3,
+            38.3,
+            38.2,
+            38.2,
+            38.2,
+            38.2,
+            38.2,
+            38.2,
+            38.1,
+            38.1,
+            38.1,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0,
+            38.0
+          ],
+          "samples": 284,
+          "start_bytes": 40177664
+        },
+        "idle_s": 30.011390961,
+        "keys_per_db": 1,
+        "memory_after_create_bytes": 41553920,
+        "memory_after_setup_bytes": 40177664,
+        "memory_before_setup_bytes": 5074944,
+        "memory_idle_end_bytes": 39837696,
+        "owners": 1000,
+        "setup_s": 14.049472149,
+        "subtree_idle_end": {
+          "cgroups": 1,
+          "processes": 1
+        },
+        "subtree_idle_start": {
+          "cgroups": 1,
+          "processes": 1
+        },
+        "summary": {
+          "idle_cpu_usec_per_s": 1692.0575279563097,
+          "memory_after_setup_mib": 38.31640625,
+          "memory_before_setup_mib": 4.83984375,
+          "memory_idle_end_mib": 37.9921875,
+          "processes_idle_end": 1,
+          "processes_idle_start": 1
+        },
+        "touch_s": 2.09526436
+      },
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 42508288,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "cgroup-kv_throughput---r1.json",
+      "workload": "kv_throughput",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": {
+        "dbs": 2000,
+        "keys_per_db": 1,
+        "owners": 10,
+        "result": {
+          "client_cpu_vcpus": 0.6342292612622606,
+          "clients": 256,
+          "error_samples": [],
+          "errors": 0,
+          "max_ms": 45.016,
+          "node_cpu_usage_usec": 37371823,
+          "node_cpu_usec_per_op": 33.65875719953347,
+          "node_cpu_vcpus": 2.4912940566248643,
+          "ops": 1110315,
+          "ops_per_s": 74016.22234166731,
+          "p50_ms": 0.507,
+          "p99_ms": 23.05,
+          "seconds": 15.000968232
+        },
+        "setup_s": 47.111942523,
+        "value_bytes": 8,
+        "write_pct": 10
+      },
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 421314560,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "cgroup-kv_throughput---r2.json",
+      "workload": "kv_throughput",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": {
+        "dbs": 2000,
+        "keys_per_db": 1,
+        "owners": 10,
+        "result": {
+          "client_cpu_vcpus": 0.6318243225669515,
+          "clients": 256,
+          "error_samples": [],
+          "errors": 0,
+          "max_ms": 44.867,
+          "node_cpu_usage_usec": 37263998,
+          "node_cpu_usec_per_op": 33.16901744435484,
+          "node_cpu_vcpus": 2.484105817979978,
+          "ops": 1123458,
+          "ops_per_s": 74892.35465438117,
+          "p50_ms": 0.465,
+          "p99_ms": 22.871,
+          "seconds": 15.000970462
+        },
+        "setup_s": 47.051079182,
+        "value_bytes": 8,
+        "write_pct": 10
+      },
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 425017344,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "cgroup-long_strings-attack.json",
+      "workload": "long_strings",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 324.71484375,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 79.479189,
+          "p99_attacked_ms": 74.096502,
+          "p99_limit_ms": 158.958378,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 2,
+        "cgroup_memory_peak_bytes": 598482944,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 349663232,
+        "growth_bytes": 340488192,
+        "peak_bytes": 586031104,
+        "peak_mib_per_second": [
+          558.9
+        ],
+        "samples": 75,
+        "start_bytes": 245542912
+      }
+    },
+    {
+      "file": "cgroup-long_strings-small.json",
+      "workload": "long_strings",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 55.546875,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 80.369288,
+          "p99_attacked_ms": 81.358347,
+          "p99_limit_ms": 160.738576,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 139362304,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 129712128,
+        "growth_bytes": 58245120,
+        "peak_bytes": 131833856,
+        "peak_mib_per_second": [
+          125.7
+        ],
+        "samples": 36,
+        "start_bytes": 73588736
+      }
+    },
+    {
+      "file": "cgroup-merges-attack.json",
+      "workload": "merges",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 105.1015625,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 83.12209700000001,
+          "p99_attacked_ms": 78.119522,
+          "p99_limit_ms": 166.24419400000002,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 2,
+        "cgroup_memory_peak_bytes": 588009472,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 46628864,
+        "growth_bytes": 110206976,
+        "peak_bytes": 577064960,
+        "peak_mib_per_second": [
+          550.3,
+          49.3,
+          49.3,
+          49.4,
+          49.4,
+          49.6,
+          49.6,
+          49.4,
+          49.4,
+          49.6,
+          49.4,
+          49.4,
+          49.6,
+          49.6,
+          49.7,
+          49.4,
+          49.7,
+          49.5,
+          49.5,
+          49.7,
+          49.5,
+          49.5,
+          44.8,
+          44.8,
+          44.6,
+          44.8,
+          44.8,
+          44.6,
+          44.6,
+          44.6,
+          44.6,
+          44.7,
+          44.9,
+          44.7,
+          44.9,
+          44.9,
+          44.9,
+          45.0,
+          44.9,
+          45.0,
+          44.7
+        ],
+        "samples": 3063,
+        "start_bytes": 466857984
+      }
+    },
+    {
+      "file": "cgroup-merges-small.json",
+      "workload": "merges",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 41.43359375,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 82.634811,
+          "p99_attacked_ms": 86.03121,
+          "p99_limit_ms": 165.269622,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 266227712,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 233545728,
+        "growth_bytes": 43446272,
+        "peak_bytes": 266227712,
+        "peak_mib_per_second": [
+          253.9
+        ],
+        "samples": 70,
+        "start_bytes": 222781440
+      }
+    },
+    {
+      "file": "cgroup-stream_filter_scans-attack.json",
+      "workload": "stream_filter_scans",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 13.72265625,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 95.338067,
+          "p99_attacked_ms": 69.19383599999999,
+          "p99_limit_ms": 190.676134,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 220286976,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 215642112,
+        "growth_bytes": 14389248,
+        "peak_bytes": 217116672,
+        "peak_mib_per_second": [
+          207.1,
+          205.7,
+          205.9,
+          205.7,
+          205.7,
+          205.7,
+          205.9,
+          205.7,
+          205.7,
+          205.9,
+          205.7,
+          205.7
+        ],
+        "samples": 982,
+        "start_bytes": 202727424
+      }
+    },
+    {
+      "file": "cgroup-stream_filter_scans-small.json",
+      "workload": "stream_filter_scans",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 10.5859375,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 82.330257,
+          "p99_attacked_ms": 79.55816899999999,
+          "p99_limit_ms": 164.660514,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 221376512,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 217178112,
+        "growth_bytes": 11100160,
+        "peak_bytes": 217677824,
+        "peak_mib_per_second": [
+          207.6,
+          207.1
+        ],
+        "samples": 115,
+        "start_bytes": 206577664
+      }
+    },
+    {
+      "file": "cgroup-table_filter_scans-attack.json",
+      "workload": "table_filter_scans",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 14.74609375,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 83.319764,
+          "p99_attacked_ms": 68.303901,
+          "p99_limit_ms": 166.639528,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 92413952,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 83255296,
+        "growth_bytes": 15462400,
+        "peak_bytes": 86806528,
+        "peak_mib_per_second": [
+          82.8,
+          79.4,
+          79.5,
+          79.3,
+          79.5,
+          79.5,
+          79.6,
+          79.6,
+          79.6,
+          79.6,
+          79.6
+        ],
+        "samples": 944,
+        "start_bytes": 71344128
+      }
+    },
+    {
+      "file": "cgroup-table_filter_scans-small.json",
+      "workload": "table_filter_scans",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 0.28515625,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 82.35651700000001,
+          "p99_attacked_ms": 80.680325,
+          "p99_limit_ms": 164.71303400000002,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 74330112,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 71966720,
+        "growth_bytes": 299008,
+        "peak_bytes": 72237056,
+        "peak_mib_per_second": [
+          68.9
+        ],
+        "samples": 61,
+        "start_bytes": 71938048
+      }
+    },
+    {
+      "file": "cgroup-txn_scans-attack.json",
+      "workload": "txn_scans",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 450.55859375,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 82.996313,
+          "p99_attacked_ms": 77.957469,
+          "p99_limit_ms": 165.992626,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 2,
+        "cgroup_memory_peak_bytes": 639582208,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 480133120,
+        "growth_bytes": 472444928,
+        "peak_bytes": 580571136,
+        "peak_mib_per_second": [
+          553.7
+        ],
+        "samples": 16,
+        "start_bytes": 108126208
+      }
+    },
+    {
+      "file": "cgroup-txn_scans-small.json",
+      "workload": "txn_scans",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 112.2265625,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 83.751611,
+          "p99_attacked_ms": 79.647308,
+          "p99_limit_ms": 167.503222,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/cgroup",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 239616000,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 206184448,
+        "growth_bytes": 117678080,
+        "peak_bytes": 225902592,
+        "peak_mib_per_second": [
+          215.4
+        ],
+        "samples": 16,
+        "start_bytes": 108224512
+      }
+    },
+    {
+      "file": "wasm-blob_checks-attack.json",
+      "workload": "blob_checks",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 264.8359375,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 62.963855,
+          "p99_attacked_ms": 74.562004,
+          "p99_limit_ms": 125.92771,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 453111808,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 200302592,
+        "growth_bytes": 277700608,
+        "peak_bytes": 430333952,
+        "peak_mib_per_second": [
+          354.2,
+          410.4
+        ],
+        "samples": 110,
+        "start_bytes": 152633344
+      }
+    },
+    {
+      "file": "wasm-blob_checks-small.json",
+      "workload": "blob_checks",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 262.33984375,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 62.865283999999996,
+          "p99_attacked_ms": 71.178078,
+          "p99_limit_ms": 125.73056799999999,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 448245760,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 238395392,
+        "growth_bytes": 275083264,
+        "peak_bytes": 428503040,
+        "peak_mib_per_second": [
+          342.8,
+          408.7
+        ],
+        "samples": 111,
+        "start_bytes": 153419776
+      }
+    },
+    {
+      "file": "wasm-blob_downloads-attack.json",
+      "workload": "blob_downloads",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": false,
+        "2_growth_mib": 1389.46484375,
+        "2_tenant_bound_holds": false,
+        "3_victim_not_harmed": null,
+        "4_refusal_is_clean": false,
+        "5_small_variant_succeeds": null,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": 137,
+        "node_oom_kills": 1,
+        "subtree_oom_kills": 1,
+        "cgroup_memory_peak_bytes": 1616056320,
+        "client_exit_status": 0,
+        "node_died": true
+      },
+      "attacker_memory": {
+        "end_bytes": 3563520,
+        "growth_bytes": 1456959488,
+        "peak_bytes": 1605107712,
+        "peak_mib_per_second": [
+          1530.8
+        ],
+        "samples": 40,
+        "start_bytes": 148148224
+      }
+    },
+    {
+      "file": "wasm-blob_downloads-small.json",
+      "workload": "blob_downloads",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 10.91796875,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 74.94943099999999,
+          "p99_attacked_ms": 72.771079,
+          "p99_limit_ms": 149.89886199999998,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 160784384,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 156962816,
+        "growth_bytes": 11448320,
+        "peak_bytes": 157892608,
+        "peak_mib_per_second": [
+          150.6
+        ],
+        "samples": 49,
+        "start_bytes": 146444288
+      }
+    },
+    {
+      "file": "wasm-bulk_inserts-attack.json",
+      "workload": "bulk_inserts",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 829.296875,
+        "2_tenant_bound_holds": false,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 73.519877,
+          "p99_attacked_ms": 50.930457999999994,
+          "p99_limit_ms": 147.039754,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 1131864064,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 258469888,
+        "growth_bytes": 869580800,
+        "peak_bytes": 1053106176,
+        "peak_mib_per_second": [
+          423.1,
+          1004.3,
+          804.4,
+          822.0,
+          821.9,
+          721.1,
+          483.9
+        ],
+        "samples": 602,
+        "start_bytes": 183525376
+      }
+    },
+    {
+      "file": "wasm-bulk_inserts-small.json",
+      "workload": "bulk_inserts",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 668.1640625,
+        "2_tenant_bound_holds": false,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 63.883641000000004,
+          "p99_attacked_ms": 66.054475,
+          "p99_limit_ms": 127.76728200000001,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": false,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 881446912,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 242311168,
+        "growth_bytes": 700620800,
+        "peak_bytes": 875294720,
+        "peak_mib_per_second": [
+          236.3,
+          806.7,
+          824.4,
+          834.7,
+          482.0,
+          488.5
+        ],
+        "samples": 442,
+        "start_bytes": 174673920
+      }
+    },
+    {
+      "file": "wasm-event_scan---r1.json",
+      "workload": "event_scan",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": {
+        "bench_wall_s": 63.532228067,
+        "failed_queries": 0,
+        "failure_samples": [],
+        "median_query_ms": 97.84077400000001,
+        "node_cpu_usage_usec": 47016953,
+        "parts": 32,
+        "per_query": [
+          {
+            "median_ms": 97.84077400000001,
+            "query": "count",
+            "successes": 20
+          },
+          {
+            "median_ms": 297.458231,
+            "query": "count by event",
+            "successes": 20
+          },
+          {
+            "median_ms": 1268.663109,
+            "query": "top users",
+            "successes": 20
+          },
+          {
+            "median_ms": 1394.817827,
+            "query": "unique users",
+            "successes": 20
+          },
+          {
+            "median_ms": 73.88552700000001,
+            "query": "filtered count",
+            "successes": 20
+          },
+          {
+            "median_ms": 21.35641,
+            "query": "filtered rows",
+            "successes": 20
+          },
+          {
+            "median_ms": 2.3305890000000002,
+            "query": "latest rows",
+            "successes": 20
+          }
+        ],
+        "queries": 7,
+        "rounds": 20,
+        "rows": 1000000,
+        "setup_s": 14.676536001,
+        "stored_bytes": 3041923
+      },
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 583790592,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "wasm-event_scan---r2.json",
+      "workload": "event_scan",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": {
+        "bench_wall_s": 62.945612751,
+        "failed_queries": 0,
+        "failure_samples": [],
+        "median_query_ms": 98.87816000000001,
+        "node_cpu_usage_usec": 46395142,
+        "parts": 32,
+        "per_query": [
+          {
+            "median_ms": 98.87816000000001,
+            "query": "count",
+            "successes": 20
+          },
+          {
+            "median_ms": 300.366695,
+            "query": "count by event",
+            "successes": 20
+          },
+          {
+            "median_ms": 1251.101313,
+            "query": "top users",
+            "successes": 20
+          },
+          {
+            "median_ms": 1406.0468689999998,
+            "query": "unique users",
+            "successes": 20
+          },
+          {
+            "median_ms": 73.71798100000001,
+            "query": "filtered count",
+            "successes": 20
+          },
+          {
+            "median_ms": 21.444319999999998,
+            "query": "filtered rows",
+            "successes": 20
+          },
+          {
+            "median_ms": 2.331584,
+            "query": "latest rows",
+            "successes": 20
+          }
+        ],
+        "queries": 7,
+        "rounds": 20,
+        "rows": 1000000,
+        "setup_s": 14.574393893,
+        "stored_bytes": 3041923
+      },
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 591798272,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "wasm-idle_cost---r1.json",
+      "workload": "idle_cost",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": {
+        "dbs": 1000,
+        "idle_cpu_usage_usec": 49524,
+        "idle_memory": {
+          "end_bytes": 137408512,
+          "growth_bytes": 0,
+          "peak_bytes": 138002432,
+          "peak_mib_per_second": [
+            131.6,
+            131.3,
+            131.3,
+            131.3,
+            131.2,
+            131.2,
+            131.2,
+            131.2,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.0,
+            131.0,
+            131.0,
+            131.0,
+            131.0,
+            131.0,
+            131.0,
+            131.0,
+            131.0,
+            131.0,
+            131.0,
+            131.0,
+            131.0,
+            131.0,
+            131.0,
+            131.0
+          ],
+          "samples": 285,
+          "start_bytes": 138002432
+        },
+        "idle_s": 30.001832728,
+        "keys_per_db": 1,
+        "memory_after_create_bytes": 136818688,
+        "memory_after_setup_bytes": 138002432,
+        "memory_before_setup_bytes": 102182912,
+        "memory_idle_end_bytes": 137408512,
+        "owners": 1000,
+        "setup_s": 14.318001179,
+        "subtree_idle_end": {
+          "cgroups": 1,
+          "processes": 1
+        },
+        "subtree_idle_start": {
+          "cgroups": 1,
+          "processes": 1
+        },
+        "summary": {
+          "idle_cpu_usec_per_s": 1650.6991572478312,
+          "memory_after_setup_mib": 131.609375,
+          "memory_before_setup_mib": 97.44921875,
+          "memory_idle_end_mib": 131.04296875,
+          "processes_idle_end": 1,
+          "processes_idle_start": 1
+        },
+        "touch_s": 2.256662376
+      },
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 138702848,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "wasm-idle_cost---r2.json",
+      "workload": "idle_cost",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": {
+        "dbs": 1000,
+        "idle_cpu_usage_usec": 47768,
+        "idle_memory": {
+          "end_bytes": 137515008,
+          "growth_bytes": 0,
+          "peak_bytes": 137854976,
+          "peak_mib_per_second": [
+            131.5,
+            131.3,
+            131.3,
+            131.3,
+            131.3,
+            131.3,
+            131.3,
+            131.3,
+            131.3,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1,
+            131.1
+          ],
+          "samples": 285,
+          "start_bytes": 137854976
+        },
+        "idle_s": 30.005620338,
+        "keys_per_db": 1,
+        "memory_after_create_bytes": 137187328,
+        "memory_after_setup_bytes": 137854976,
+        "memory_before_setup_bytes": 102002688,
+        "memory_idle_end_bytes": 137515008,
+        "owners": 1000,
+        "setup_s": 14.380395944,
+        "subtree_idle_end": {
+          "cgroups": 1,
+          "processes": 1
+        },
+        "subtree_idle_start": {
+          "cgroups": 1,
+          "processes": 1
+        },
+        "summary": {
+          "idle_cpu_usec_per_s": 1591.968419979813,
+          "memory_after_setup_mib": 131.46875,
+          "memory_before_setup_mib": 97.27734375,
+          "memory_idle_end_mib": 131.14453125,
+          "processes_idle_end": 1,
+          "processes_idle_start": 1
+        },
+        "touch_s": 2.189696633
+      },
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 138809344,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "wasm-kv_throughput---r1.json",
+      "workload": "kv_throughput",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": {
+        "dbs": 2000,
+        "keys_per_db": 1,
+        "owners": 10,
+        "result": {
+          "client_cpu_vcpus": 0.6251958306704525,
+          "clients": 256,
+          "error_samples": [],
+          "errors": 0,
+          "max_ms": 45.262,
+          "node_cpu_usage_usec": 36956191,
+          "node_cpu_usec_per_op": 32.89860825256201,
+          "node_cpu_vcpus": 2.463602489555977,
+          "ops": 1123336,
+          "ops_per_s": 74884.70243613183,
+          "p50_ms": 0.461,
+          "p99_ms": 22.866,
+          "seconds": 15.00087419
+        },
+        "setup_s": 47.624827616,
+        "value_bytes": 8,
+        "write_pct": 10
+      },
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 520388608,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "wasm-kv_throughput---r2.json",
+      "workload": "kv_throughput",
+      "variant": null,
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": {
+        "dbs": 2000,
+        "keys_per_db": 1,
+        "owners": 10,
+        "result": {
+          "client_cpu_vcpus": 0.6188313514025963,
+          "clients": 256,
+          "error_samples": [],
+          "errors": 0,
+          "max_ms": 46.25,
+          "node_cpu_usage_usec": 37011445,
+          "node_cpu_usec_per_op": 32.78134078509176,
+          "node_cpu_vcpus": 2.467267601562506,
+          "ops": 1129040,
+          "ops_per_s": 75264.38951162626,
+          "p50_ms": 0.441,
+          "p99_ms": 22.861,
+          "seconds": 15.000985291
+        },
+        "setup_s": 47.659373874,
+        "value_bytes": 8,
+        "write_pct": 10
+      },
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 523784192,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "wasm-long_strings-attack.json",
+      "workload": "long_strings",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": null,
+      "error": "POST /v1/dbs/attacker/events/blobs/rows: status 503: {\"error\":{\"code\":\"unavailable\",\"message\":\"owner memory bound reached; retry later\",\"retryable\":true,\"details\":{\"outcome\":\"not_applied\"}}}",
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 817664000,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": null
+    },
+    {
+      "file": "wasm-long_strings-small.json",
+      "workload": "long_strings",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 72.4765625,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 59.89421,
+          "p99_attacked_ms": 66.992021,
+          "p99_limit_ms": 119.78842,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 338579456,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 215449600,
+        "growth_bytes": 75997184,
+        "peak_bytes": 215449600,
+        "peak_mib_per_second": [
+          205.5
+        ],
+        "samples": 43,
+        "start_bytes": 139452416
+      }
+    },
+    {
+      "file": "wasm-merges-attack.json",
+      "workload": "merges",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 491.98046875,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 70.99083300000001,
+          "p99_attacked_ms": 92.25910900000001,
+          "p99_limit_ms": 141.98166600000002,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 696315904,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 168706048,
+        "growth_bytes": 515878912,
+        "peak_bytes": 686366720,
+        "peak_mib_per_second": [
+          652.3,
+          654.6,
+          329.8,
+          329.9,
+          329.6,
+          329.9,
+          329.9,
+          330.1,
+          329.7,
+          329.9,
+          329.7,
+          329.7,
+          329.7,
+          329.7,
+          160.7,
+          160.7,
+          160.7,
+          160.5,
+          160.7,
+          160.7,
+          160.5,
+          160.8,
+          160.8,
+          160.8,
+          161.0,
+          160.8,
+          160.6,
+          160.6,
+          160.6,
+          160.6,
+          160.8,
+          160.8,
+          160.8,
+          160.9,
+          160.9,
+          160.9,
+          160.9,
+          160.9,
+          160.9,
+          160.9,
+          160.9
+        ],
+        "samples": 3059,
+        "start_bytes": 170487808
+      }
+    },
+    {
+      "file": "wasm-merges-small.json",
+      "workload": "merges",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 84.27734375,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 75.27462799999999,
+          "p99_attacked_ms": 76.466025,
+          "p99_limit_ms": 150.54925599999999,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 247427072,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 242937856,
+        "growth_bytes": 88371200,
+        "peak_bytes": 242991104,
+        "peak_mib_per_second": [
+          231.7,
+          231.7
+        ],
+        "samples": 85,
+        "start_bytes": 154619904
+      }
+    },
+    {
+      "file": "wasm-stream_filter_scans-attack.json",
+      "workload": "stream_filter_scans",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 13.37890625,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 56.278829,
+          "p99_attacked_ms": 1764.0059780000001,
+          "p99_limit_ms": 112.557658,
+          "pass": false
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": false
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 280596480,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 278409216,
+        "growth_bytes": 14028800,
+        "peak_bytes": 280412160,
+        "peak_mib_per_second": [
+          267.0,
+          267.4,
+          266.5,
+          266.5,
+          266.8,
+          266.6,
+          266.6,
+          266.6,
+          266.6,
+          266.9,
+          265.6
+        ],
+        "samples": 1021,
+        "start_bytes": 266383360
+      }
+    },
+    {
+      "file": "wasm-stream_filter_scans-small.json",
+      "workload": "stream_filter_scans",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 10.9296875,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 70.571293,
+          "p99_attacked_ms": 85.56801999999999,
+          "p99_limit_ms": 141.142586,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 274669568,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 270360576,
+        "growth_bytes": 11460608,
+        "peak_bytes": 270622720,
+        "peak_mib_per_second": [
+          253.4,
+          258.1,
+          257.8
+        ],
+        "samples": 150,
+        "start_bytes": 259162112
+      }
+    },
+    {
+      "file": "wasm-table_filter_scans-attack.json",
+      "workload": "table_filter_scans",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 187.83203125,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 70.08158,
+          "p99_attacked_ms": 46.030308,
+          "p99_limit_ms": 140.16316,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 362209280,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 275324928,
+        "growth_bytes": 196956160,
+        "peak_bytes": 356564992,
+        "peak_mib_per_second": [
+          338.7,
+          339.4,
+          339.5,
+          339.5,
+          339.5,
+          339.7,
+          339.7,
+          339.7,
+          340.0,
+          340.0,
+          326.4
+        ],
+        "samples": 999,
+        "start_bytes": 159608832
+      }
+    },
+    {
+      "file": "wasm-table_filter_scans-small.json",
+      "workload": "table_filter_scans",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 5.98046875,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 64.897496,
+          "p99_attacked_ms": 81.953201,
+          "p99_limit_ms": 129.794992,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 165097472,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 162484224,
+        "growth_bytes": 6270976,
+        "peak_bytes": 162742272,
+        "peak_mib_per_second": [
+          155.2
+        ],
+        "samples": 44,
+        "start_bytes": 156471296
+      }
+    },
+    {
+      "file": "wasm-txn_scans-attack.json",
+      "workload": "txn_scans",
+      "variant": "attack",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 508.4140625,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 63.780016999999994,
+          "p99_attacked_ms": 61.231079,
+          "p99_limit_ms": 127.56003399999999,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": null,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 754057216,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 515465216,
+        "growth_bytes": 533110784,
+        "peak_bytes": 749830144,
+        "peak_mib_per_second": [
+          715.1
+        ],
+        "samples": 26,
+        "start_bytes": 216719360
+      }
+    },
+    {
+      "file": "wasm-txn_scans-small.json",
+      "workload": "txn_scans",
+      "variant": "small",
+      "vm_busy": false,
+      "store_latency_ms": 20,
+      "conditions": {
+        "1_node_survives": true,
+        "2_growth_mib": 129.78125,
+        "2_tenant_bound_holds": true,
+        "3_victim_not_harmed": {
+          "failures": 0,
+          "p99_alone_ms": 64.152174,
+          "p99_attacked_ms": 73.638428,
+          "p99_limit_ms": 128.304348,
+          "pass": true
+        },
+        "4_refusal_is_clean": true,
+        "5_small_variant_succeeds": true,
+        "pass": true
+      },
+      "error": null,
+      "event_scan": null,
+      "kv_throughput": null,
+      "idle_cost": null,
+      "run": {
+        "node_binary": "/home/alex.linux/iso-judge2/wasm",
+        "node_exit_status": null,
+        "node_oom_kills": 0,
+        "subtree_oom_kills": 0,
+        "cgroup_memory_peak_bytes": 418578432,
+        "client_exit_status": 0,
+        "node_died": false
+      },
+      "attacker_memory": {
+        "end_bytes": 361811968,
+        "growth_bytes": 136085504,
+        "peak_bytes": 361811968,
+        "peak_mib_per_second": [
+          345.1
+        ],
+        "samples": 12,
+        "start_bytes": 225726464
+      }
+    }
+  ]
+}

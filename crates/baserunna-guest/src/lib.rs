@@ -546,7 +546,7 @@ pub unsafe extern "C" fn guest_exec_ops(ptr: *const u8, len: u32) -> u32 {
 
 /// Parses an event insert body and validates its rows with the node's `each_event` and `ValidRows`.
 ///
-/// The input is a `u32` header length, a postcard `ValidateInput`, and the
+/// The input is a `u32` header length, a JSON `ValidateInput`, and the
 /// body. Returns 0 with a postcard `ValidateOutput`, or 1 with an error message.
 ///
 /// # Safety
@@ -556,7 +556,7 @@ pub unsafe extern "C" fn guest_validate_events(ptr: *const u8, len: u32) -> u32 
     use baserunna::events::sandboxed::{ValidateInput, ValidateOutput};
     let input = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     let header_len = u32::from_le_bytes(input[..4].try_into().unwrap()) as usize;
-    let header: ValidateInput = match postcard::from_bytes(&input[4..4 + header_len]) {
+    let header: ValidateInput = match serde_json::from_slice(&input[4..4 + header_len]) {
         Ok(h) => h,
         Err(e) => {
             set_output(e.to_string().into_bytes());

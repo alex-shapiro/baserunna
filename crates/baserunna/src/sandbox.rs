@@ -700,7 +700,7 @@ impl SandboxRunner for NodeSandbox {
         body: &'a [u8],
     ) -> BoxFut<'a, Result<(ValidateOutput, Box<dyn std::any::Any + Send + Sync>)>> {
         Box::pin(async move {
-            let header = postcard::to_allocvec(&input).map_err(|e| Error::internal(format!("validate input: {e}")))?;
+            let header = serde_json::to_vec(&input).map_err(|e| Error::internal(format!("validate input: {e}")))?;
             let len_prefix = (header.len() as u32).to_le_bytes();
             let out = self
                 .sandbox

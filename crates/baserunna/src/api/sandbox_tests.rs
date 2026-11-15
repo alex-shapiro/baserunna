@@ -7,7 +7,7 @@ use std::sync::Arc;
 /// Sets a sandbox with `bound` bytes per owner on node 0 of `w`.
 fn set_sandbox(w: &World, bound: usize) -> Arc<NodeSandbox> {
     let sandbox = Sandbox::new(&crate::sandbox::tests::guest_wasm(), bound).unwrap();
-    let owner_of: OwnerResolver = Arc::new(|_db: String| Box::pin(async { Ok(None) }));
+    let owner_of: OwnerResolver = Arc::new(|_db: String| Box::pin(async { Ok(Some("test-owner".to_string())) }));
     let runner = Arc::new(NodeSandbox { sandbox, shared: w.node(0).engine.shared.clone(), owner_of });
     w.node(0).engine.set_sandbox(runner.clone());
     runner

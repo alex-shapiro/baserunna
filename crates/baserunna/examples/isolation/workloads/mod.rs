@@ -82,7 +82,7 @@ pub const NAMES: &[&str] = &["long_strings", "bulk_inserts", "merges", "blob_che
 pub fn by_name(name: &str) -> Option<Box<dyn Workload>> {
     Some(match name {
         "long_strings" => Box::new(long_strings::LongStrings),
-        "bulk_inserts" => Box::new(bulk_inserts::BulkInserts::default()),
+        "bulk_inserts" => Box::new(bulk_inserts::BulkInserts),
         "merges" => Box::new(merges::Merges),
         "blob_checks" => Box::new(blob_checks::BlobChecks),
         _ => return None,

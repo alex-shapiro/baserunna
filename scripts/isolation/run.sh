@@ -53,6 +53,9 @@ if [ -d "$CG" ]; then
   exit 1
 fi
 
+# Other agents' nodes or compilers in the VM add noise. Record them; do not stop them.
+BUSY_PROCS=$( (pgrep -a baserunna; pgrep -a cargo) || true)
+
 # The store runs outside the node cgroup.
 "$EXAMPLES_DIR/fake_s3_server" "127.0.0.1:$S3_PORT" >"$WORK/s3.env" &
 S3_PID=$!
@@ -97,8 +100,9 @@ PEAK=$(cat "$NODE_CG/memory.peak" 2>/dev/null || echo null)
 cp "$WORK/node.log" "${OUT%.json}.node.log"
 if [ -f "$OUT" ]; then
   jq --argjson exit "$NODE_EXIT" --argjson oom "${OOM_KILLS:-0}" --argjson peak "$PEAK" \
-    --arg bin "$NODE_BIN" --argjson client "$CLIENT_STATUS" \
-    '.run = {node_binary: $bin, node_exit_status: $exit, cgroup_oom_kills: $oom, cgroup_memory_peak_bytes: $peak,
+    --arg bin "$NODE_BIN" --argjson client "$CLIENT_STATUS" --arg busy "$BUSY_PROCS" \
+    '.vm_busy = ($busy != "") | .vm_busy_processes = ($busy | split("\n") | map(select(. != "")))
+     | .run = {node_binary: $bin, node_exit_status: $exit, cgroup_oom_kills: $oom, cgroup_memory_peak_bytes: $peak,
              client_exit_status: $client, node_died: ($exit != null or $oom > 0)}
      | if .run.node_died and .conditions then .conditions["1_node_survives"] = false | .conditions.pass = false else . end' \
     "$OUT" >"$WORK/out.json" && mv "$WORK/out.json" "$OUT"

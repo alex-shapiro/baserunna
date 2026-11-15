@@ -9,7 +9,7 @@
 //! in process without kernel limits.
 
 use crate::engine::events::{Bind, BindSlot, PartRef};
-use crate::engine::{EngineConfig, Shared};
+use crate::engine::{BlobRef, EngineConfig, Shared};
 use crate::error::{Error, Result};
 use crate::events::schema::EventSchema;
 use bytes::Bytes;
@@ -28,6 +28,9 @@ pub const OWNER_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Longest time a worker may take to seal unsealed rows.
 const SEAL_DEADLINE: Duration = Duration::from_secs(600);
+
+/// Longest time a worker may take to read a whole blob value.
+const BLOB_READ_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Heavy tenant work that a worker process runs.
 #[derive(Serialize, Deserialize)]
@@ -50,6 +53,13 @@ enum Job {
     },
     /// Parses and validates the bulk insert body in the payload, writes its rows as staged
     /// parts, and returns the encoded [`Bind`] as the result's payload.
+    /// Reads a whole blob value and compares it with the payload (`equals`) or parses it as a
+    /// decimal integer.
+    BlobValue {
+        db: String,
+        blob: Vec<u8>,
+        equals: bool,
+    },
     /// Seals unsealed rows at a snapshot whose encoded manifest is the job's payload.
     Seal {
         db: String,
@@ -71,6 +81,8 @@ enum Job {
 #[derive(Serialize, Deserialize)]
 enum JobResult {
     Merged(Option<(Vec<u8>, Vec<u8>)>),
+    BlobEquals(bool),
+    BlobDecimal(Option<i64>),
     /// The last sealed row as `(version, ordinal)`, the sealed row and byte counts, and the written parts.
     Sealed(Option<((u64, u32), u64, u64, Vec<(Vec<u8>, Vec<u8>)>)>),
     /// The query's JSON response body is the result's payload.
@@ -207,6 +219,33 @@ impl WorkerPool {
             (JobResult::Queried, body) => Ok(body),
             (JobResult::Failed(e), _) => Err(crate::api::error_from_json(500, &e)),
             _ => Err(Error::internal("the worker returned a result of another job")),
+        }
+    }
+
+    /// Returns true if blob `blob` of `db` equals `want`, read in a worker inside the owner's cgroup.
+    pub async fn blob_equals(&self, db: &str, blob: &BlobRef, want: Bytes) -> Result<bool> {
+        match self.blob_value(db, blob, true, want).await? {
+            JobResult::BlobEquals(eq) => Ok(eq),
+            _ => Err(Error::internal("the worker returned a result of another job")),
+        }
+    }
+
+    /// Returns blob `blob` of `db` parsed as a decimal integer, read in a worker inside the owner's cgroup.
+    pub async fn blob_decimal(&self, db: &str, blob: &BlobRef) -> Result<Option<i64>> {
+        match self.blob_value(db, blob, false, Bytes::new()).await? {
+            JobResult::BlobDecimal(n) => Ok(n),
+            _ => Err(Error::internal("the worker returned a result of another job")),
+        }
+    }
+
+    async fn blob_value(&self, db: &str, blob: &BlobRef, equals: bool, want: Bytes) -> Result<JobResult> {
+        let owner = self.owner_of(db).await?;
+        let mut w = crate::util::codec::Writer::new();
+        blob.encode(&mut w);
+        let job = Job::BlobValue { db: db.to_string(), blob: w.into_inner(), equals };
+        match self.run(&owner, job, want, BLOB_READ_DEADLINE).await?.0 {
+            JobResult::Failed(e) => Err(crate::api::error_from_json(500, &e)),
+            r => Ok(r),
         }
     }
 
@@ -386,6 +425,18 @@ async fn run_job(shared: &Arc<Shared>, job: Job, payload: Bytes) -> (JobResult, 
                     JobResult::Staged { body_key, error: Some(json!({ "error": crate::api::error_json(&e) })) },
                     Bytes::new(),
                 ),
+            }
+        }
+        Job::BlobValue { db, blob, equals } => {
+            let read = async {
+                let blob = BlobRef::decode(&mut crate::util::codec::Reader::new(&blob))
+                    .map_err(|e| Error::internal(format!("blob ref: {e}")))?;
+                crate::engine::blob::read_range(shared, &db, &blob, 0..blob.size).await
+            };
+            match read.await {
+                Ok(got) if equals => (JobResult::BlobEquals(got == payload), Bytes::new()),
+                Ok(got) => (JobResult::BlobDecimal(crate::ops::decimal_of(&got)), Bytes::new()),
+                Err(e) => failed(e),
             }
         }
         Job::Seal { db, etag, read_time, schema, state } => {

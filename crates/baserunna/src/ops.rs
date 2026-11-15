@@ -455,6 +455,29 @@ pub async fn value_bytes(db: &Db, v: &Value) -> Result<Bytes> {
     }
 }
 
+/// Returns true if stored value `v` equals `want`, reading a blob value in the owner's worker
+/// when workers are on.
+async fn value_equals(db: &Arc<Db>, v: &Value, want: Bytes) -> Result<bool> {
+    if let (Value::Blob(r), Some(w)) = (v, db.shared().workers.get()) {
+        return w.blob_equals(&db.id, r, want).await;
+    }
+    Ok(value_bytes(db, v).await? == want)
+}
+
+/// Returns stored value `v` parsed as a decimal integer, or `None` if it is not one, reading a
+/// blob value in the owner's worker when workers are on.
+async fn value_decimal(db: &Arc<Db>, v: &Value) -> Result<Option<i64>> {
+    if let (Value::Blob(r), Some(w)) = (v, db.shared().workers.get()) {
+        return w.blob_decimal(&db.id, r).await;
+    }
+    Ok(decimal_of(&value_bytes(db, v).await?))
+}
+
+/// Parses `b` as a decimal integer.
+pub(crate) fn decimal_of(b: &[u8]) -> Option<i64> {
+    std::str::from_utf8(b).ok().and_then(|s| s.trim().parse::<i64>().ok())
+}
+
 /// Executes `ops` sequentially inside `txn`, returning one JSON result per operation.
 pub async fn exec_ops(ctx: &OpCtx<'_>, txn: &mut Txn, ops: &[Op]) -> Result<Vec<OpResult>> {
     if ops.len() > MAX_TXN_OPS {
@@ -574,11 +597,11 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
             }
             if let Some(want) = value {
                 let want = enc.decode(want, "value")?;
-                let got = match &r {
-                    Some(rv) => Some(value_bytes(ctx.db, &rv.value).await?),
-                    None => None,
+                let equal = match &r {
+                    Some(rv) => value_equals(ctx.db, &rv.value, want.into()).await?,
+                    None => false,
                 };
-                if got.as_deref() != Some(&want[..]) {
+                if !equal {
                     return Err(fail(format!("key {key} does not have the expected value")));
                 }
             }
@@ -590,10 +613,8 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
             let (cur, kept) = match txn.get(&k).await? {
                 None => (0i64, None),
                 Some(rv) => {
-                    let b = value_bytes(ctx.db, &rv.value).await?;
-                    let n = std::str::from_utf8(&b)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<i64>().ok())
+                    let n = value_decimal(ctx.db, &rv.value)
+                        .await?
                         .ok_or_else(|| Error::invalid(format!("value of {key} is not a decimal integer")))?;
                     (n, rv.ttl)
                 }

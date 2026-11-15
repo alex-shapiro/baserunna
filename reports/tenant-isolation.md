@@ -463,19 +463,40 @@ same process, so it skipped the network.
 
 ### 4.5 Measurements
 
+Costs are measured and reported. They are not pass or fail limits.
+
 - The fake store delays every request by 20 ms (`FAKE_S3_LATENCY_MS`,
   commit 470075b).
-- **Throughput:** the client process sends the KV mix of the throughput
-  benchmark (2,000 databases, 10% writes) to the node over HTTP. The
-  node runs with its boundary on. The client count is the smallest that
-  keeps today's node at 90% or more of its CPU. The limit is a loss of
-  5% ops/s against today's code.
+- **Throughput:** the `kv_throughput` harness mode (commit de18b70)
+  sends the KV mix of the throughput benchmark (2,000 databases,
+  10 owners, 10% writes) to the node over HTTP, with the boundary on.
+  It uses 256 clients, the count at which today's node stops gaining
+  throughput in this VM. The report gives ops/s, node CPU per request,
+  and p50 and p99 latency, each against today's code.
 - **Event query cost:** the event scan benchmark through the node, with
-  the store delay. The limit is 50% more median wall time for each of
-  the 7 queries on its own. A query that today's code answers and a
-  candidate refuses is over the limit.
+  the store delay. The report gives the median wall time of each of
+  the 7 queries, against today's code.
+- **Idle cost:** node memory and CPU with 1,000 idle owners, each with
+  one database.
 - **Tests:** the library tests and `cargo test --test sim` must pass.
 
 ### 4.6 How the winner is chosen
 
-The steps of section 3.6 apply, with the cost readings of section 4.5.
+This section replaces section 3.6 for round 2.
+
+1. **Adequate isolation.** A candidate isolates adequately if it passes
+   the §3.3 conditions on every workload, known and hidden. Normal work
+   must also succeed: every small variant, and every event scan query
+   that today's code answers.
+2. **Performance.** Among the candidates that isolate adequately, the
+   one that performs best wins. The judge compares the costs of section
+   4.5.
+3. **Every cost has a source.** Each advocate lists each source of
+   extra cost in its design, with its measured cost. Examples are one
+   crossing per request, one copy of each body, or one process per
+   owner. The judge checks each source for a cheaper way to get the
+   same isolation, and reports any avoidable cost.
+4. **The user decides tradeoffs.** If no candidate isolates adequately,
+   the judge ranks the candidates by the workloads that they pass and
+   reports their costs side by side. The user then decides. The user
+   can also reject a candidate for its cost alone.

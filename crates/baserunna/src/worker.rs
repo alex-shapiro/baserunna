@@ -10,6 +10,7 @@
 
 use crate::engine::events::{Bind, BindSlot, PartRef};
 use crate::engine::{BlobRef, Shared};
+use crate::boundary;
 use crate::error::{Error, Result};
 use crate::events::schema::EventSchema;
 use bytes::Bytes;
@@ -88,17 +89,6 @@ enum Job {
         table: String,
         query: serde_json::Value,
     },
-    /// Serves a database request on the worker's node. The payload is the request body, and the
-    /// result's payload is the response body.
-    Http {
-        method: String,
-        uri: String,
-        headers: Vec<(String, Vec<u8>)>,
-        principal: crate::node::Principal,
-        rec: crate::meta::DbRecord,
-        access: crate::meta::Access,
-        deadline_ms: u64,
-    },
     BulkInsert {
         db: String,
         schema: EventSchema,
@@ -122,11 +112,6 @@ enum JobResult {
     Staged {
         body_key: Option<String>,
         error: Option<serde_json::Value>,
-    },
-    /// The response status and headers of an [`Job::Http`]; the response body is the payload.
-    Http {
-        status: u16,
-        headers: Vec<(String, Vec<u8>)>,
     },
     /// The job's error as the JSON body of an HTTP error response.
     Failed(serde_json::Value),
@@ -181,79 +166,8 @@ pub type WorkerCommitter = Box<
         + Sync,
 >;
 
-/// Where the node runs a database request.
-pub enum Placement {
-    /// In the node process: the request is on the light list. The second field is its
-    /// largest memory use in MiB, which the owner's light budget admits.
-    Node(axum::extract::Request, u32),
-    /// In the owner's worker: every request that is not on the light list.
-    Worker(axum::extract::Request),
-}
-
-/// The largest one-shot transaction body that the node process runs itself.
-const LIGHT_TXN_BODY_MAX: u64 = 64 * 1024;
-
-/// The most ops in a one-shot transaction that the node process runs itself.
-const LIGHT_TXN_OPS_MAX: usize = 16;
-
-/// The memory in MiB that one owner's light requests may use at once in the node process.
-pub const LIGHT_BUDGET_MIB: u32 = 64;
-
-/// The largest memory use of one light KV request in MiB: one value of at most
-/// `json_value_max` (1 MiB), or one blob chunk in flight.
-const LIGHT_KV_MIB: u32 = 1;
-
-/// The largest memory use of one light transaction in MiB: [`LIGHT_TXN_OPS_MAX`] values of at
-/// most 1 MiB each.
-const LIGHT_TXN_MIB: u32 = 16;
-
-/// Decides where database request `req` runs. The node process keeps only requests whose cost
-/// has a fixed bound; every other request, including routes that this list does not name, runs
-/// in the owner's worker.
-///
-/// The light list:
-/// - `GET` and `HEAD` of one KV key (a blob value streams one chunk at a time);
-/// - `PUT` and `DELETE` of one KV key, and blob staging (the body streams into chunks);
-/// - a one-shot transaction with a body of at most 64 KiB and at most 16 `get`, `put`, or
-///   `delete` ops.
-pub async fn light_request(node: &crate::node::Node, req: axum::extract::Request) -> Result<Placement> {
-    use http::Method;
-    let path = req.uri().path();
-    let Some(rest) = path.strip_prefix("/v1/dbs/") else { return Ok(Placement::Worker(req)) };
-    let (_, route) = rest.split_once('/').unwrap_or((rest, ""));
-    let one_key = route.strip_prefix("kv/").is_some_and(|k| !k.is_empty());
-    let light = match (req.method().clone(), route) {
-        (Method::GET | Method::HEAD | Method::PUT | Method::DELETE, _) if one_key => true,
-        (Method::POST, "blobs") => true,
-        (Method::POST, "txn") => return light_txn(node, req).await,
-        _ => false,
-    };
-    Ok(if light { Placement::Node(req, LIGHT_KV_MIB) } else { Placement::Worker(req) })
-}
-
-/// Places a one-shot transaction: the node reads its body only if the body is at most
-/// [`LIGHT_TXN_BODY_MAX`] long.
-async fn light_txn(node: &crate::node::Node, req: axum::extract::Request) -> Result<Placement> {
-    let _ = node;
-    let len = req.headers().get(http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
-    if !len.is_some_and(|l| l <= LIGHT_TXN_BODY_MAX) {
-        return Ok(Placement::Worker(req));
-    }
-    let (parts, body) = req.into_parts();
-    let bytes = axum::body::to_bytes(body, LIGHT_TXN_BODY_MAX as usize)
-        .await
-        .map_err(|e| Error::invalid(format!("cannot read the request body: {e}")))?;
-    let light = serde_json::from_slice::<baserunna_api::TxnRequest>(&bytes).is_ok_and(|t| {
-        t.ops.len() <= LIGHT_TXN_OPS_MAX
-            && crate::ops::parse_ops(t.ops).is_ok_and(|ops| {
-                ops.iter().all(|o| {
-                    matches!(o, crate::ops::Op::Get { .. } | crate::ops::Op::Put { .. } | crate::ops::Op::Delete { .. })
-                })
-            })
-    });
-    let req = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
-    Ok(if light { Placement::Node(req, LIGHT_TXN_MIB) } else { Placement::Worker(req) })
-}
+/// The most requests of one owner that the node has in flight in the owner's worker.
+pub const OWNER_IN_FLIGHT_MAX: usize = 64;
 
 /// Reads the `owner_id` of a database ID, or `None` if the database does not exist.
 pub type OwnerResolver = Box<
@@ -269,7 +183,7 @@ pub struct PoolConfig {
     pub exe: PathBuf,
     pub owner_memory_bytes: u64,
     pub owner_cpu_weight: u32,
-    /// The CPU weight of the node process, which runs the light requests of all owners.
+    /// The CPU weight of the node process.
     pub main_cpu_weight: u32,
 }
 
@@ -279,8 +193,8 @@ pub struct WorkerPool {
     db_owners: Mutex<HashMap<String, String>>,
     owner_resolver: std::sync::OnceLock<OwnerResolver>,
     committer: Arc<std::sync::OnceLock<WorkerCommitter>>,
-    /// Each owner's light budget: [`LIGHT_BUDGET_MIB`] permits of 1 MiB.
-    light_budgets: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Each owner's requests in flight: [`OWNER_IN_FLIGHT_MAX`] permits.
+    owner_in_flight: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     binder: Arc<std::sync::OnceLock<WorkerBinder>>,
     owner_workers: Mutex<HashMap<String, Arc<OwnerWorker>>>,
     next_job_id: std::sync::atomic::AtomicU64,
@@ -301,7 +215,7 @@ impl WorkerPool {
             db_owners: Mutex::new(HashMap::new()),
             owner_resolver: Default::default(),
             committer: Default::default(),
-            light_budgets: Mutex::new(HashMap::new()),
+            owner_in_flight: Mutex::new(HashMap::new()),
             binder: Default::default(),
             owner_workers: Mutex::new(HashMap::new()),
             next_job_id: 0.into(),
@@ -316,21 +230,16 @@ impl WorkerPool {
         }
     }
 
-    /// Waits until `owner`'s light budget admits a request that uses at most `mib` MiB, or
-    /// fails with a retryable 503 at `deadline`. The permit returns to the budget when it drops.
-    pub async fn admit_light(
-        &self,
-        owner: &str,
-        mib: u32,
-        deadline: tokio::time::Instant,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
-        let budget = self
-            .light_budgets
+    /// Waits until `owner` has fewer than [`OWNER_IN_FLIGHT_MAX`] requests in flight, or fails
+    /// with a retryable 503 at `deadline`. The request counts until the permit drops.
+    async fn admit(&self, owner: &str, deadline: tokio::time::Instant) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let in_flight = self
+            .owner_in_flight
             .lock()
             .entry(owner.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(LIGHT_BUDGET_MIB as usize)))
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(OWNER_IN_FLIGHT_MAX)))
             .clone();
-        match tokio::time::timeout_at(deadline, budget.acquire_many_owned(mib)).await {
+        match tokio::time::timeout_at(deadline, in_flight.acquire_owned()).await {
             Ok(Ok(permit)) => Ok(permit),
             _ => Err(Error::unavailable("the owner has too many requests in progress")),
         }
@@ -481,39 +390,56 @@ impl WorkerPool {
         }
     }
 
-    /// Serves database request `req` with context `ctx` on the worker of the database's owner.
+    /// Serves database request `req` in a worker inside the owner's cgroup. The request and
+    /// response bodies stream through the boundary's credit windows, so the node holds at most
+    /// [`boundary::WINDOW_CHUNKS`] chunks of each body.
     pub async fn http(&self, ctx: crate::api::DbCtx, req: axum::extract::Request) -> Result<axum::response::Response> {
+        let owner = ctx.rec.owner_id.clone();
+        let in_flight = self.admit(&owner, ctx.deadline.instant()).await?;
         let (parts, body) = req.into_parts();
-        let body = axum::body::to_bytes(body, usize::MAX)
-            .await
-            .map_err(|e| Error::invalid(format!("cannot read the request body: {e}")))?;
         let left = ctx.deadline.instant().saturating_duration_since(tokio::time::Instant::now());
-        let headers =
-            parts.headers.iter().map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec())).collect::<Vec<_>>();
-        let job = Job::Http {
+        let context = HttpContext { principal: ctx.principal, rec: ctx.rec, access: ctx.access };
+        let head = boundary::RequestHead {
             method: parts.method.to_string(),
             uri: parts.uri.to_string(),
-            headers,
-            principal: ctx.principal,
-            rec: ctx.rec.clone(),
-            access: ctx.access,
+            headers: boundary::header_pairs(&parts.headers),
             deadline_ms: left.as_millis() as u64,
+            context: serde_json::to_vec(&context).map_err(|e| Error::internal(e.to_string()))?.into(),
         };
-        match self.run(&ctx.rec.owner_id, job, body, left + Duration::from_secs(1)).await? {
-            (JobResult::Http { status, headers }, body) => {
-                let mut resp = axum::response::Response::new(axum::body::Body::from(body));
-                *resp.status_mut() =
-                    http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-                for (k, v) in headers {
-                    if let (Ok(k), Ok(v)) = (http::HeaderName::try_from(k), http::HeaderValue::from_bytes(&v)) {
-                        resp.headers_mut().append(k, v);
-                    }
-                }
-                Ok(resp)
-            }
-            (JobResult::Failed(e), _) => Err(crate::api::error_from_json(500, &e)),
-            _ => Err(Error::internal("the worker returned a result of another job")),
+        let id = self.next_job_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let worker = self.owner_worker(&owner)?;
+        *worker.last_used.lock() = std::time::Instant::now();
+        let (head_done, head_wait) = tokio::sync::oneshot::channel();
+        let (inbox, resp_body) = boundary::credited_body(id, worker.frames.clone());
+        let credits = worker.streams.register(id, Some(inbox), Some(head_done));
+        let open = boundary::Frame::new(boundary::FrameKind::Open, id, head.encode());
+        if worker.exited.load(std::sync::atomic::Ordering::Acquire) || worker.frames.send(open).is_err() {
+            worker.streams.remove(id);
+            return Err(Error::unavailable("the owner's worker exited"));
         }
+        tokio::spawn(boundary::send_body(id, body, credits, worker.frames.clone()));
+        let head = match tokio::time::timeout(left + Duration::from_secs(1), head_wait).await {
+            Ok(Ok(head)) => head?,
+            Ok(Err(_)) => return Err(Error::internal("the owner's worker dropped the request")),
+            Err(_) => {
+                worker.streams.remove(id);
+                // A request cannot be stopped inside the worker, so the deadline ends all of the owner's work.
+                let _ = std::fs::write(worker.leaf.join("cgroup.kill"), "1");
+                return Err(Error::TooLarge(format!("the work ran longer than {} ms", left.as_millis())));
+            }
+        };
+        let open = StreamGuard { id, worker: worker.clone(), _in_flight: in_flight };
+        let body = {
+            use futures_util::StreamExt;
+            axum::body::Body::from_stream(resp_body.into_data_stream().map(move |chunk| {
+                let _ = &open;
+                chunk
+            }))
+        };
+        let mut resp = axum::response::Response::new(body);
+        *resp.status_mut() = http::StatusCode::from_u16(head.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+        boundary::append_headers(resp.headers_mut(), head.headers);
+        Ok(resp)
     }
 
     /// Returns true if blob `blob` of `db` equals `want`, read in a worker inside the owner's cgroup.
@@ -621,7 +547,7 @@ impl WorkerPool {
             worker.pending.lock().insert(job_id, done);
             *worker.last_used.lock() = std::time::Instant::now();
             let exited = worker.exited.load(std::sync::atomic::Ordering::Acquire);
-            if !exited && worker.frames.send((job_id, header.clone(), payload.clone())).is_ok() {
+            if !exited && worker.frames.send(job_frame(job_id, &header, &payload)).is_ok() {
                 break (worker, result);
             }
             worker.pending.lock().remove(&job_id);
@@ -646,7 +572,7 @@ impl WorkerPool {
     pub fn stop_idle_workers(&self, idle: Duration) {
         self.owner_workers.lock().retain(|_, w| {
             let pending = w.pending.lock();
-            if !pending.is_empty() || w.last_used.lock().elapsed() < idle {
+            if !pending.is_empty() || !w.streams.is_empty() || w.last_used.lock().elapsed() < idle {
                 return true;
             }
             w.exited.store(true, std::sync::atomic::Ordering::Release);
@@ -698,23 +624,18 @@ impl WorkerPool {
             let _ = child.start_kill();
             return Err(e);
         }
-        let mut stdin = child.stdin.take().expect("piped stdin");
+        let stdin = child.stdin.take().expect("piped stdin");
         let mut stdout = child.stdout.take().expect("piped stdout");
-        let (frames, mut to_send) = tokio::sync::mpsc::unbounded_channel::<(u64, Bytes, Bytes)>();
+        let (frames, to_send) = tokio::sync::mpsc::unbounded_channel::<boundary::Frame>();
         let worker = Arc::new(OwnerWorker {
             frames,
             pending: Mutex::new(HashMap::new()),
+            streams: boundary::Streams::default(),
             leaf,
             exited: false.into(),
             last_used: Mutex::new(std::time::Instant::now()),
         });
-        tokio::spawn(async move {
-            while let Some((job_id, header, payload)) = to_send.recv().await {
-                if write_job_frame(&mut stdin, job_id, &header, &payload).await.is_err() {
-                    break;
-                }
-            }
-        });
+        tokio::spawn(boundary::write_frames(stdin, to_send));
         let reader = worker.clone();
         let committer = self.committer.clone();
         let binder = self.binder.clone();
@@ -722,7 +643,12 @@ impl WorkerPool {
         let limit_mib = self.cfg.owner_memory_bytes >> 20;
         let ooms_before = oom_kills(&owner_dir);
         tokio::spawn(async move {
-            while let Ok((job_id, header, payload)) = read_job_frame(&mut stdout).await {
+            while let Ok(frame) = boundary::read_frame(&mut stdout).await {
+                if frame.kind != boundary::FrameKind::Job {
+                    reader.streams.deliver(frame);
+                    continue;
+                }
+                let Ok((job_id, header, payload)) = split_job(frame) else { break };
                 let result = match serde_json::from_slice::<FromWorker>(&header) {
                     Ok(FromWorker::Done(h)) => Ok((h, payload)),
                     Ok(FromWorker::Commit { db, request }) => {
@@ -736,7 +662,7 @@ impl WorkerPool {
                                 committed.map_err(|e| json!({ "error": crate::api::error_json(&e) })),
                             );
                             let header = serde_json::to_vec(&reply).unwrap_or_default();
-                            let _ = frames.send((job_id, header.into(), Bytes::new()));
+                            let _ = frames.send(job_frame(job_id, &header, &[]));
                         });
                         continue;
                     }
@@ -753,7 +679,7 @@ impl WorkerPool {
                                 bound.map(|rs| rs.into_iter().map(|r| r.map_err(err)).collect()).map_err(err),
                             );
                             let header = serde_json::to_vec(&reply).unwrap_or_default();
-                            let _ = frames.send((job_id, header.into(), Bytes::new()));
+                            let _ = frames.send(job_frame(job_id, &header, &[]));
                         });
                         continue;
                     }
@@ -767,12 +693,16 @@ impl WorkerPool {
             reader.exited.store(true, std::sync::atomic::Ordering::Release);
             let status = child.wait().await;
             let oom = oom_kills(&owner_dir) > ooms_before;
-            for (_, done) in reader.pending.lock().drain() {
-                let _ = done.send(Err(if oom {
+            let exit_error = |oom: bool| {
+                if oom {
                     Error::TooLarge(format!("the work exceeded the owner's memory limit of {limit_mib} MiB"))
                 } else {
                     Error::internal(format!("worker exited with {status:?}"))
-                }));
+                }
+            };
+            reader.streams.fail_all(&exit_error(oom));
+            for (_, done) in reader.pending.lock().drain() {
+                let _ = done.send(Err(exit_error(oom)));
             }
         });
         Ok(worker)
@@ -785,10 +715,37 @@ type CommitDone = tokio::sync::oneshot::Sender<Result<crate::engine::Committed>>
 /// Delivers a job's result and payload to the request that waits for it.
 type JobDone = tokio::sync::oneshot::Sender<Result<(JobResult, Bytes)>>;
 
-/// One owner's worker process, which runs the owner's jobs concurrently.
+/// The principal, database record, and access of a request that a worker serves.
+#[derive(Serialize, Deserialize)]
+struct HttpContext {
+    principal: crate::node::Principal,
+    rec: crate::meta::DbRecord,
+    access: crate::meta::Access,
+}
+
+/// Keeps a request stream open, and its owner's in-flight permit taken, until the response
+/// body ends or the client goes away. On drop it ends the stream in the worker.
+struct StreamGuard {
+    id: u64,
+    worker: Arc<OwnerWorker>,
+    _in_flight: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.worker.streams.remove(self.id);
+        *self.worker.last_used.lock() = std::time::Instant::now();
+        let reset = boundary::Frame::new(boundary::FrameKind::Reset, self.id, Bytes::from_static(b"the client left"));
+        let _ = self.worker.frames.send(reset);
+    }
+}
+
+/// One owner's worker process, which runs the owner's jobs and request streams concurrently.
 struct OwnerWorker {
-    /// Job frames for the task that writes the worker's stdin.
-    frames: tokio::sync::mpsc::UnboundedSender<(u64, Bytes, Bytes)>,
+    /// Frames for the task that writes the worker's stdin.
+    frames: boundary::Outbox,
+    /// The worker's open request streams.
+    streams: boundary::Streams,
     /// Jobs sent to the worker that wait for their results, by job ID.
     pending: Mutex<HashMap<u64, JobDone>>,
     /// The worker's cgroup, below the owner's cgroup.
@@ -798,29 +755,24 @@ struct OwnerWorker {
     last_used: Mutex<std::time::Instant>,
 }
 
-async fn write_job_frame(
-    w: &mut (impl tokio::io::AsyncWrite + Unpin),
-    job_id: u64,
-    header: &[u8],
-    payload: &[u8],
-) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    w.write_all(&job_id.to_le_bytes()).await?;
-    w.write_all(&(header.len() as u64).to_le_bytes()).await?;
-    w.write_all(header).await?;
-    w.write_all(&(payload.len() as u64).to_le_bytes()).await?;
-    w.write_all(payload).await?;
-    w.flush().await
+/// Builds the boundary frame of job frame `job_id`: the header's length, the header, then the payload.
+fn job_frame(job_id: u64, header: &[u8], payload: &[u8]) -> boundary::Frame {
+    let mut data = Vec::with_capacity(8 + header.len() + payload.len());
+    data.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    data.extend_from_slice(header);
+    data.extend_from_slice(payload);
+    boundary::Frame::new(boundary::FrameKind::Job, job_id, data.into())
 }
 
-async fn read_job_frame(r: &mut (impl tokio::io::AsyncRead + Unpin)) -> std::io::Result<(u64, Bytes, Bytes)> {
-    use tokio::io::AsyncReadExt;
-    let job_id = r.read_u64_le().await?;
-    let mut header = vec![0u8; r.read_u64_le().await? as usize];
-    r.read_exact(&mut header).await?;
-    let mut payload = vec![0u8; r.read_u64_le().await? as usize];
-    r.read_exact(&mut payload).await?;
-    Ok((job_id, header.into(), payload.into()))
+/// Splits a boundary job frame into its job ID, header, and payload.
+fn split_job(f: boundary::Frame) -> std::io::Result<(u64, Bytes, Bytes)> {
+    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "a job frame is too short");
+    let len = f.data.get(..8).ok_or_else(bad)?;
+    let len = u64::from_le_bytes(len.try_into().map_err(|_| bad())?) as usize;
+    if f.data.len() < 8 + len {
+        return Err(bad());
+    }
+    Ok((f.id, f.data.slice(8..8 + len), f.data.slice(8 + len..)))
 }
 
 /// Returns the cgroup v2 directory of this process.
@@ -841,14 +793,9 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
     let router = crate::api::db_routes()
         .layer(axum::extract::DefaultBodyLimit::max(node.cfg.max_json_body))
         .with_state(node.clone());
-    let (results, mut to_write) = tokio::sync::mpsc::unbounded_channel::<(u64, Bytes, Bytes)>();
-    let writer = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
-        while let Some((job_id, header, payload)) = to_write.recv().await {
-            write_job_frame(&mut stdout, job_id, &header, &payload).await?;
-        }
-        Ok::<_, std::io::Error>(())
-    });
+    let (results, to_write) = tokio::sync::mpsc::unbounded_channel::<boundary::Frame>();
+    let writer = tokio::spawn(boundary::write_frames(tokio::io::stdout(), to_write));
+    let streams = Arc::new(boundary::Streams::default());
     let commit_calls: Arc<Mutex<HashMap<u64, CommitDone>>> = Default::default();
     let next_call_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
@@ -860,7 +807,7 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
             let header = serde_json::to_vec(&FromWorker::Commit { db, request: Box::new(request) });
             let sent =
                 header.map_err(|e| Error::internal(format!("cannot encode the commit: {e}"))).and_then(
-                    |h| match results.send((call_id, h.into(), Bytes::new())) {
+                    |h| match results.send(job_frame(call_id, &h, &[])) {
                         Ok(()) => Ok(()),
                         Err(_) => Err(Error::internal("the worker cannot reach the node")),
                     },
@@ -883,7 +830,7 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
             let header = serde_json::to_vec(&FromWorker::Bind { db, bind: bind.encode().to_vec() });
             let sent = header.map_err(|e| Error::internal(format!("cannot encode the bind: {e}"))).and_then(|h| {
                 results
-                    .send((call_id, h.into(), Bytes::new()))
+                    .send(job_frame(call_id, &h, &[]))
                     .map_err(|_| Error::internal("the worker cannot reach the node"))
             });
             Box::pin(async move {
@@ -896,7 +843,20 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
         let _ = engine.shared.remote_bind.set(remote);
     }
     let mut stdin = tokio::io::stdin();
-    while let Ok((job_id, header, payload)) = read_job_frame(&mut stdin).await {
+    while let Ok(frame) = boundary::read_frame(&mut stdin).await {
+        match frame.kind {
+            boundary::FrameKind::Job => {}
+            boundary::FrameKind::Open => {
+                let (node, router, streams, out) = (node.clone(), router.clone(), streams.clone(), results.clone());
+                tokio::spawn(serve_stream(node, router, streams, out, frame));
+                continue;
+            }
+            _ => {
+                streams.deliver(frame);
+                continue;
+            }
+        }
+        let Ok((job_id, header, payload)) = split_job(frame) else { break };
         let job = match serde_json::from_slice::<ToWorker>(&header) {
             Ok(ToWorker::Committed(r)) => {
                 if let Some(done) = commit_calls.lock().remove(&job_id) {
@@ -913,17 +873,10 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
             Ok(ToWorker::Job(job)) => Ok(*job),
             Err(e) => Err(e),
         };
-        let (engine, node, router) = (engine.clone(), node.clone(), router.clone());
+        let engine = engine.clone();
         let results = results.clone();
         tokio::spawn(async move {
             let (result, out) = match job {
-                Ok(Job::Http { method, uri, headers, principal, rec, access, deadline_ms }) => {
-                    let ctx = HttpJob { method, uri, headers, principal, rec, access, deadline_ms };
-                    match run_http(&node, router, ctx, payload).await {
-                        Ok((status, headers, body)) => (JobResult::Http { status, headers }, body),
-                        Err(e) => (JobResult::Failed(json!({ "error": crate::api::error_json(&e) })), Bytes::new()),
-                    }
-                }
                 Ok(job) => run_job(&engine, job, payload).await,
                 Err(e) => (
                     JobResult::Failed(json!({ "error": crate::api::error_json(&Error::internal(e.to_string())) })),
@@ -931,7 +884,7 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
                 ),
             };
             let header = serde_json::to_vec(&FromWorker::Done(result)).unwrap_or_default();
-            let _ = results.send((job_id, header.into(), out));
+            let _ = results.send(job_frame(job_id, &header, &out));
         });
     }
     drop(results);
@@ -1015,7 +968,6 @@ async fn run_job(engine: &Arc<crate::engine::Engine>, job: Job, payload: Bytes) 
                 Err(e) => failed(e),
             }
         }
-        Job::Http { .. } => failed(Error::internal("the worker serves requests outside run_job")),
         Job::Merge { db, schema, inputs } => {
             let mut refs = Vec::with_capacity(inputs.len());
             for (k, v) in &inputs {
@@ -1105,46 +1057,59 @@ async fn run_read_txn(
 }
 
 /// The fields of a [`Job::Http`].
-struct HttpJob {
-    method: String,
-    uri: String,
-    headers: Vec<(String, Vec<u8>)>,
-    principal: crate::node::Principal,
-    rec: crate::meta::DbRecord,
-    access: crate::meta::Access,
-    deadline_ms: u64,
+/// Serves the request stream that `open` starts on the worker's node with the database routes
+/// of the node process, and streams the response back to `out`.
+async fn serve_stream(
+    node: Arc<crate::node::Node>,
+    router: axum::Router,
+    streams: Arc<boundary::Streams>,
+    out: boundary::Outbox,
+    open: boundary::Frame,
+) {
+    let id = open.id;
+    let (inbox, body) = boundary::credited_body(id, out.clone());
+    let credits = streams.register(id, Some(inbox), None);
+    let resp = match boundary::RequestHead::decode(open.data) {
+        Ok(head) => route_stream(&node, router, head, body).await,
+        Err(e) => Err(e),
+    };
+    let resp = resp.unwrap_or_else(|e| axum::response::IntoResponse::into_response(e));
+    let (parts, body) = resp.into_parts();
+    let head = boundary::ResponseHead { status: parts.status.as_u16(), headers: boundary::header_pairs(&parts.headers) };
+    if out.send(boundary::Frame::new(boundary::FrameKind::Head, id, head.encode())).is_ok() {
+        boundary::send_body(id, body, credits, out).await;
+    }
+    streams.remove(id);
 }
 
-/// Serves one database request on the worker's node with the database routes of the node process.
-async fn run_http(
+/// Runs one request with head `head` and body `body` through `router` on the worker's node.
+async fn route_stream(
     node: &Arc<crate::node::Node>,
     router: axum::Router,
-    job: HttpJob,
-    body: Bytes,
-) -> Result<(u16, Vec<(String, Vec<u8>)>, Bytes)> {
+    head: boundary::RequestHead,
+    body: axum::body::Body,
+) -> Result<axum::response::Response> {
     use tower::ServiceExt;
-    let db = node.open_db(&job.rec).await?;
-    let deadline = crate::node::Deadline::new(tokio::time::Instant::now() + Duration::from_millis(job.deadline_ms));
-    let ctx = crate::api::DbCtx { principal: job.principal.clone(), rec: job.rec, access: job.access, db, deadline };
+    let context: HttpContext =
+        serde_json::from_slice(&head.context).map_err(|e| Error::internal(format!("worker request context: {e}")))?;
+    let db = node.open_db(&context.rec).await?;
+    let deadline = crate::node::Deadline::new(tokio::time::Instant::now() + Duration::from_millis(head.deadline_ms));
+    let ctx = crate::api::DbCtx {
+        principal: context.principal.clone(),
+        rec: context.rec,
+        access: context.access,
+        db,
+        deadline,
+    };
     let mut req = http::Request::builder()
-        .method(job.method.as_str())
-        .uri(job.uri)
-        .body(axum::body::Body::from(body))
+        .method(head.method.as_str())
+        .uri(head.uri)
+        .body(body)
         .map_err(|e| Error::internal(format!("worker request: {e}")))?;
-    for (k, v) in job.headers {
-        if let (Ok(k), Ok(v)) = (http::HeaderName::try_from(k), http::HeaderValue::from_bytes(&v)) {
-            req.headers_mut().append(k, v);
-        }
-    }
-    req.extensions_mut().insert(job.principal);
+    boundary::append_headers(req.headers_mut(), head.headers);
+    req.extensions_mut().insert(context.principal);
     req.extensions_mut().insert(ctx);
-    let resp = router.oneshot(req).await.map_err(|e| Error::internal(format!("worker router: {e}")))?;
-    let (parts, body) = resp.into_parts();
-    let body = axum::body::to_bytes(body, usize::MAX)
-        .await
-        .map_err(|e| Error::internal(format!("worker response body: {e}")))?;
-    let headers = parts.headers.iter().map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec())).collect();
-    Ok((parts.status.as_u16(), headers, body))
+    router.oneshot(req).await.map_err(|e| Error::internal(format!("worker router: {e}")))
 }
 
 /// Runs table query `query` on table `table` at `snapshot`.

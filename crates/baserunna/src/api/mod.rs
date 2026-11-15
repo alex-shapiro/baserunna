@@ -602,23 +602,7 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
         };
         let ctx = DbCtx { principal, rec: rec.clone(), access, db, deadline };
         let resp = match node.engine.shared.workers.get() {
-            Some(w) => match crate::worker::light_request(&node, req).await? {
-                crate::worker::Placement::Node(r, mib) => {
-                    let permit = w.admit_light(&ctx.rec.owner_id, mib, ctx.deadline.instant()).await?;
-                    req = r;
-                    req.extensions_mut().insert(ctx.principal.clone());
-                    req.extensions_mut().insert(ctx);
-                    // The permit stays with the response body, so a streamed blob counts until it ends.
-                    next.run(req).await.map(|body| {
-                        use futures_util::StreamExt;
-                        Body::from_stream(body.into_data_stream().map(move |chunk| {
-                            let _ = &permit;
-                            chunk
-                        }))
-                    })
-                }
-                crate::worker::Placement::Worker(r) => w.http(ctx, r).await?,
-            },
+            Some(w) => w.http(ctx, req).await?,
             None => {
                 req.extensions_mut().insert(ctx.principal.clone());
                 req.extensions_mut().insert(ctx);

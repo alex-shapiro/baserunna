@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod boundary;
 pub mod buggify;
 pub mod catalog;
 pub mod cluster;

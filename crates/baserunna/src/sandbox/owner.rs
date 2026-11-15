@@ -194,6 +194,7 @@ struct QueuedRequest {
 /// Handle to a running owner instance.
 pub struct OwnerInstance {
     requests: mpsc::Sender<QueuedRequest>,
+    memory: Arc<parking_lot::Mutex<HashMap<String, super::OwnerMemory>>>,
 }
 
 /// Guest exports that the driver task calls.
@@ -226,9 +227,10 @@ impl OwnerInstances {
     /// Starts the instance of `owner` on `store` and the host task that drives it.
     pub async fn start(&self, owner: &str, store: DynStore, seed: u64) -> Result<OwnerInstance> {
         let (completions_tx, completions) = mpsc::unbounded_channel();
+        let memory: Arc<parking_lot::Mutex<HashMap<String, super::OwnerMemory>>> = Arc::default();
         let limiter = OwnerLimiter {
             owner: owner.to_string(),
-            owner_memory: Arc::default(),
+            owner_memory: memory.clone(),
             owner_memory_bound: OWNER_INSTANCE_MEMORY_BOUND,
             idle: Arc::default(),
             charged: 0,
@@ -253,11 +255,16 @@ impl OwnerInstances {
         };
         let (requests_tx, requests) = mpsc::channel(REQUEST_QUEUE);
         tokio::spawn(drive(wstore, instance, exports, requests, completions));
-        Ok(OwnerInstance { requests: requests_tx })
+        Ok(OwnerInstance { requests: requests_tx, memory })
     }
 }
 
 impl OwnerInstance {
+    /// Linear memory that the instance holds.
+    pub fn linear_memory(&self) -> usize {
+        self.memory.lock().values().map(|m| m.used).sum()
+    }
+
     /// Sends `body` to the instance and waits for its response.
     pub async fn call(&self, body: Vec<u8>) -> Result<OwnerResponse> {
         let (reply, rx) = oneshot::channel();
@@ -363,6 +370,8 @@ mod tests {
             assert_eq!((got.status, &got.body[..]), (200, &b"v1"[..]), "{}", String::from_utf8_lossy(&got.body));
             let miss = owner.call(kv_body(1, "d1", "other", b"")).await.unwrap();
             assert_eq!(miss.status, 404, "{}", String::from_utf8_lossy(&miss.body));
+            eprintln!("owner instance linear memory with one open database: {} KiB", owner.linear_memory() >> 10);
+            assert!(owner.linear_memory() > 0 && owner.linear_memory() <= OWNER_INSTANCE_MEMORY_BOUND);
         });
     }
 }

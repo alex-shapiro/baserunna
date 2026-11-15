@@ -22,11 +22,15 @@
 //! | `BENCH_VALUE_BYTES`| 8       | bytes per written value                              |
 //! | `BENCH_TAIL_KB`    | default | manifest tail limit (`tail_max_bytes`) in KiB        |
 //! | `BENCH_BOUNDARY`   | none    | isolation boundary each request crosses twice: `none`, `pipe` (owner worker process), `wasm` (owner WebAssembly instance) |
+//! | `BENCH_TRANSPORT`  | inproc  | `inproc` calls the router directly; `tcp` sends HTTP/1.1 over localhost keep-alive connections |
 
 mod boundary;
 
 use baserunna::env::Env;
-use boundary::{BoundaryHost, BoundaryMode, WORKER_SOCKET_VAR};
+use boundary::{BoundaryHost, BoundaryMode, ClientCrossings, PooledCrossings, WORKER_SOCKET_VAR};
+use http_body_util::{BodyExt, Full};
+use hyper::client::conn::http1::SendRequest;
+use std::net::SocketAddr;
 use baserunna::node::{Node, Services};
 use baserunna::sim::cost::{MeteredStore, call_router, node_config};
 use baserunna::store::{DynStore, MemStore};
@@ -58,6 +62,102 @@ fn value(seed: u64, len: usize) -> Bytes {
     Bytes::from(Rng::new(seed).text(len.max(1)))
 }
 
+/// Path that a client task's requests take to the router.
+enum ClientPath {
+    /// Crosses the boundary in the client task and calls the router in-process.
+    InProcess(axum::Router, ClientCrossings),
+    /// Sends HTTP/1.1 on one keep-alive connection to a server that crosses the boundary.
+    Tcp(SendRequest<Full<Bytes>>),
+}
+
+impl ClientPath {
+    async fn call(&mut self, owner: usize, method: &str, path: &str, token: &str, body: Bytes) -> (u16, Bytes) {
+        match self {
+            ClientPath::InProcess(router, crossings) => {
+                crossings.round_trip(owner, &[method.as_bytes(), b" ", path.as_bytes(), b"\n", &body[..]]).await;
+                let r = call_router(router, method, path, token, body).await;
+                crossings.round_trip(owner, &[&r.body[..]]).await;
+                (r.status, r.body)
+            }
+            ClientPath::Tcp(sender) => {
+                let req = http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("host", "127.0.0.1")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Full::new(body))
+                    .expect("http request");
+                sender.ready().await.expect("http connection ready");
+                let resp = sender.send_request(req).await.expect("http response");
+                let status = resp.status().as_u16();
+                (status, resp.into_body().collect().await.expect("http body").to_bytes())
+            }
+        }
+    }
+}
+
+/// Owner of the database that a `/v1/dbs/d{n}/...` path names.
+fn path_owner(path: &str) -> Option<usize> {
+    let rest = path.strip_prefix("/v1/dbs/d")?;
+    let end = rest.find('/').unwrap_or(rest.len());
+    rest[..end].parse::<usize>().ok().map(|d| d / DBS_PER_USER)
+}
+
+/// Middleware that sends the request and then the response body across the owner's boundary.
+async fn cross_boundary(
+    axum::extract::State(crossings): axum::extract::State<Arc<PooledCrossings>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(owner) = path_owner(req.uri().path()) else {
+        return next.run(req).await;
+    };
+    let (parts, body) = req.into_parts();
+    let body = axum::body::to_bytes(body, usize::MAX).await.expect("request body");
+    let request = [parts.method.as_str().as_bytes(), b" ", parts.uri.path().as_bytes(), b"\n", &body[..]];
+    crossings.round_trip(owner, &request).await;
+    let resp = next.run(axum::extract::Request::from_parts(parts, axum::body::Body::from(body))).await;
+    let (parts, body) = resp.into_parts();
+    let body = axum::body::to_bytes(body, usize::MAX).await.expect("response body");
+    crossings.round_trip(owner, &[&body[..]]).await;
+    axum::response::Response::from_parts(parts, axum::body::Body::from(body))
+}
+
+/// Serves `app` on a localhost TCP listener the way `main.rs` does.
+async fn serve_tcp(app: axum::Router) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind localhost");
+    let addr = listener.local_addr().expect("listener address");
+    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.expect("serve");
+    });
+    addr
+}
+
+async fn connect_http(addr: SocketAddr) -> SendRequest<Full<Bytes>> {
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect server");
+    tcp.set_nodelay(true).expect("nodelay");
+    let (sender, conn) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp)).await.expect("http handshake");
+    tokio::spawn(conn);
+    sender
+}
+
+/// Raises the open file limit to its hard maximum for thousands of sockets.
+fn raise_fd_limit() {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit and setrlimit read and write a valid rlimit struct.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+            lim.rlim_cur = lim.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+        }
+    }
+}
+
 fn main() {
     if let Ok(socket) = std::env::var(WORKER_SOCKET_VAR) {
         boundary::run_worker(&socket);
@@ -76,6 +176,11 @@ async fn bench(threads: usize) {
     let keys = env("BENCH_KEYS", 1).max(1);
     let value_bytes = env("BENCH_VALUE_BYTES", 8) as usize;
     let mode = BoundaryMode::from_env();
+    let tcp = match std::env::var("BENCH_TRANSPORT").as_deref() {
+        Err(_) | Ok("") | Ok("inproc") => false,
+        Ok("tcp") => true,
+        Ok(other) => panic!("BENCH_TRANSPORT={other}: expected inproc or tcp"),
+    };
     let owners = dbs.div_ceil(DBS_PER_USER);
     baserunna::log::set_level(Some(baserunna::log::Level::Error));
 
@@ -108,10 +213,25 @@ async fn bench(threads: usize) {
     }
     eprintln!("setup: {dbs} databases in {:.1}s", t0.elapsed().as_secs_f64());
 
-    let mut boundary = BoundaryHost::start(mode, owners);
-    let mut crossings = Vec::with_capacity(clients);
-    for _ in 0..clients {
-        crossings.push(boundary.client_crossings(owners).await);
+    let boundary = Arc::new(BoundaryHost::start(mode, owners));
+    let mut client_paths = Vec::with_capacity(clients);
+    if tcp {
+        raise_fd_limit();
+        let app = match mode {
+            BoundaryMode::None => router.clone(),
+            BoundaryMode::Pipe | BoundaryMode::Wasm => {
+                let crossings = Arc::new(PooledCrossings::new(boundary.clone(), owners));
+                router.clone().layer(axum::middleware::from_fn_with_state(crossings, cross_boundary))
+            }
+        };
+        let addr = serve_tcp(app).await;
+        for _ in 0..clients {
+            client_paths.push(ClientPath::Tcp(connect_http(addr).await));
+        }
+    } else {
+        for _ in 0..clients {
+            client_paths.push(ClientPath::InProcess(router.clone(), boundary.client_crossings(owners).await));
+        }
     }
 
     store.set_latency_ms(latency);
@@ -121,8 +241,8 @@ async fn bench(threads: usize) {
     let stop = Arc::new(AtomicBool::new(false));
     let start = Instant::now();
     let mut hs = Vec::new();
-    for (c, mut crossing) in crossings.into_iter().enumerate() {
-        let (router, tokens, stop) = (router.clone(), tokens.clone(), stop.clone());
+    for (c, mut client_path) in client_paths.into_iter().enumerate() {
+        let (tokens, stop) = (tokens.clone(), stop.clone());
         hs.push(tokio::spawn(async move {
             let mut rng = Rng::new(c as u64 + 1);
             let mut lat = Vec::new();
@@ -139,14 +259,12 @@ async fn bench(threads: usize) {
                 } else {
                     ("GET", Bytes::new())
                 };
-                let request: [&[u8]; 5] = [method.as_bytes(), b" ", path.as_bytes(), b"\n", &body[..]];
-                crossing.round_trip(owner, &request).await;
-                let r = call_router(&router, method, &path, t, body.clone()).await;
-                crossing.round_trip(owner, &[&r.body[..]]).await;
+                let request_len = method.len() + 1 + path.len() + 1 + body.len();
+                let (status, response) = client_path.call(owner, method, &path, t, body).await;
                 lat.push(t1.elapsed().as_micros() as u32);
-                request_bytes += request.iter().map(|p| p.len() as u64).sum::<u64>();
-                response_bytes += r.body.len() as u64;
-                if r.status != 200 {
+                request_bytes += request_len as u64;
+                response_bytes += response.len() as u64;
+                if status != 200 {
                     errors += 1;
                 }
             }
@@ -195,8 +313,9 @@ async fn bench(threads: usize) {
     );
     let ops = lat.len().max(1) as f64;
     println!(
-        "  boundary         {} ({:.1} µs worker cpu per op; per op {:.1} B request, {:.1} B response)",
+        "  boundary         {} over {} ({:.1} µs worker cpu per op; per op {:.1} B request, {:.1} B response)",
         mode.name(),
+        if tcp { "tcp" } else { "inproc" },
         far_cpu * 1e6 / ops,
         request_bytes as f64 / ops,
         response_bytes as f64 / ops

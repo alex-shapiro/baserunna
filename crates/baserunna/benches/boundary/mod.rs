@@ -6,7 +6,9 @@
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream as StdUnixStream};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use parking_lot::Mutex;
 use tokio::net::UnixStream;
 use wasmtime::{Config, Engine, Instance, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc};
 
@@ -93,8 +95,7 @@ pub struct OwnerWorkers {
 
 struct OwnerWorker {
     child: Child,
-    control_in: ChildStdin,
-    control_out: BufReader<ChildStdout>,
+    control: Mutex<(ChildStdin, BufReader<ChildStdout>)>,
     socket: PathBuf,
 }
 
@@ -115,20 +116,22 @@ impl OwnerWorkers {
                 let mut line = String::new();
                 control_out.read_line(&mut line).expect("worker ready line");
                 assert_eq!(line.trim(), "ready", "worker {owner} did not start");
-                OwnerWorker { child, control_in, control_out, socket }
+                OwnerWorker { child, control: Mutex::new((control_in, control_out)), socket }
             })
             .collect();
         OwnerWorkers { workers }
     }
 
     /// CPU seconds that all workers have used.
-    pub fn cpu_secs(&mut self) -> f64 {
+    pub fn cpu_secs(&self) -> f64 {
         self.workers
-            .iter_mut()
+            .iter()
             .map(|w| {
-                writeln!(w.control_in).and_then(|()| w.control_in.flush()).expect("ask worker cpu");
+                let mut control = w.control.lock();
+                let (control_in, control_out) = &mut *control;
+                writeln!(control_in).and_then(|()| control_in.flush()).expect("ask worker cpu");
                 let mut line = String::new();
-                w.control_out.read_line(&mut line).expect("worker cpu line");
+                control_out.read_line(&mut line).expect("worker cpu line");
                 line.trim().parse::<f64>().expect("worker cpu value")
             })
             .sum()
@@ -287,7 +290,7 @@ impl WasmCrossing {
     }
 }
 
-/// Shared state that each client task's crossings start from.
+/// Shared state that each crossing starts from.
 pub enum BoundaryHost {
     None,
     Pipe(OwnerWorkers),
@@ -304,43 +307,81 @@ impl BoundaryHost {
     }
 
     /// CPU seconds spent outside this process on the far side of the boundary.
-    pub fn far_cpu_secs(&mut self) -> f64 {
+    pub fn far_cpu_secs(&self) -> f64 {
         match self {
             BoundaryHost::Pipe(workers) => workers.cpu_secs(),
             BoundaryHost::None | BoundaryHost::Wasm(_) => 0.0,
         }
     }
 
+    /// Opens a warm crossing to `owner`'s far side, or none when the mode has no boundary.
+    async fn open_crossing(&self, owner: usize) -> Option<OwnerCrossing> {
+        match self {
+            BoundaryHost::None => None,
+            BoundaryHost::Pipe(workers) => Some(OwnerCrossing::Pipe(workers.connect(owner).await)),
+            BoundaryHost::Wasm(module) => Some(OwnerCrossing::Wasm(module.instantiate())),
+        }
+    }
+
     /// Opens one client task's warm crossing to each of `owners` owners.
     pub async fn client_crossings(&self, owners: usize) -> ClientCrossings {
+        let mut crossings = Vec::with_capacity(owners);
+        for owner in 0..owners {
+            crossings.extend(self.open_crossing(owner).await);
+        }
+        ClientCrossings(crossings)
+    }
+}
+
+/// Warm crossing to one owner's far side.
+pub enum OwnerCrossing {
+    Pipe(PipeCrossing),
+    Wasm(WasmCrossing),
+}
+
+impl OwnerCrossing {
+    async fn round_trip(&mut self, pieces: &[&[u8]]) {
         match self {
-            BoundaryHost::None => ClientCrossings::None,
-            BoundaryHost::Pipe(workers) => {
-                let mut conns = Vec::with_capacity(owners);
-                for owner in 0..owners {
-                    conns.push(workers.connect(owner).await);
-                }
-                ClientCrossings::Pipe(conns)
-            }
-            BoundaryHost::Wasm(module) => ClientCrossings::Wasm((0..owners).map(|_| module.instantiate()).collect()),
+            OwnerCrossing::Pipe(conn) => conn.round_trip(pieces).await,
+            OwnerCrossing::Wasm(guest) => guest.round_trip(pieces),
         }
     }
 }
 
-/// One client task's warm crossings, indexed by owner.
-pub enum ClientCrossings {
-    None,
-    Pipe(Vec<PipeCrossing>),
-    Wasm(Vec<WasmCrossing>),
-}
+/// One client task's warm crossings, indexed by owner, and empty without a boundary.
+pub struct ClientCrossings(Vec<OwnerCrossing>);
 
 impl ClientCrossings {
     /// Sends the concatenation of `pieces` to `owner`'s far side and reads back the echo.
     pub async fn round_trip(&mut self, owner: usize, pieces: &[&[u8]]) {
-        match self {
-            ClientCrossings::None => {}
-            ClientCrossings::Pipe(conns) => conns[owner].round_trip(pieces).await,
-            ClientCrossings::Wasm(guests) => guests[owner].round_trip(pieces),
+        if let Some(crossing) = self.0.get_mut(owner) {
+            crossing.round_trip(pieces).await;
         }
+    }
+}
+
+/// Idle warm crossings per owner that server request handlers share.
+pub struct PooledCrossings {
+    host: Arc<BoundaryHost>,
+    idle: Vec<Mutex<Vec<OwnerCrossing>>>,
+}
+
+impl PooledCrossings {
+    pub fn new(host: Arc<BoundaryHost>, owners: usize) -> PooledCrossings {
+        PooledCrossings { host, idle: (0..owners).map(|_| Mutex::default()).collect() }
+    }
+
+    /// Sends the concatenation of `pieces` to `owner`'s far side on an idle
+    /// crossing, or on a new one when all are busy, and reads back the echo.
+    pub async fn round_trip(&self, owner: usize, pieces: &[&[u8]]) {
+        let idle = self.idle[owner].lock().pop();
+        let Some(mut crossing) = (match idle {
+            Some(crossing) => Some(crossing),
+            None => self.host.open_crossing(owner).await,
+        }) else {
+            return;
+        };
+        crossing.round_trip(pieces).await;
+        self.idle[owner].lock().push(crossing);
     }
 }

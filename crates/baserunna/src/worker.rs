@@ -847,8 +847,11 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
         match frame.kind {
             boundary::FrameKind::Job => {}
             boundary::FrameKind::Open => {
+                // The stream exists before the next frame is read, so its first chunk finds it.
+                let (inbox, body) = boundary::credited_body(frame.id, results.clone());
+                let credits = streams.register(frame.id, Some(inbox), None);
                 let (node, router, streams, out) = (node.clone(), router.clone(), streams.clone(), results.clone());
-                tokio::spawn(serve_stream(node, router, streams, out, frame));
+                tokio::spawn(serve_stream(node, router, streams, out, frame, body, credits));
                 continue;
             }
             _ => {
@@ -1057,18 +1060,19 @@ async fn run_read_txn(
 }
 
 /// The fields of a [`Job::Http`].
-/// Serves the request stream that `open` starts on the worker's node with the database routes
-/// of the node process, and streams the response back to `out`.
+/// Serves the request stream that `open` starts, with request body `body`, on the worker's
+/// node with the database routes of the node process. It streams the response back to `out`
+/// within the window of `credits`.
 async fn serve_stream(
     node: Arc<crate::node::Node>,
     router: axum::Router,
     streams: Arc<boundary::Streams>,
     out: boundary::Outbox,
     open: boundary::Frame,
+    body: axum::body::Body,
+    credits: Arc<tokio::sync::Semaphore>,
 ) {
     let id = open.id;
-    let (inbox, body) = boundary::credited_body(id, out.clone());
-    let credits = streams.register(id, Some(inbox), None);
     let resp = match boundary::RequestHead::decode(open.data) {
         Ok(head) => route_stream(&node, router, head, body).await,
         Err(e) => Err(e),

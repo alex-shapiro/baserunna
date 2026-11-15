@@ -6,6 +6,9 @@ use serde::Serialize;
 use serde_json::{Value as Json, json};
 use std::time::{Duration, Instant};
 
+/// Longest time that [`Api::expect`] retries a retryable 503.
+pub const SETUP_RETRY_LIMIT: Duration = Duration::from_secs(60);
+
 /// Node API client that sends requests to one node URL.
 pub struct Api {
     http: reqwest::Client,
@@ -64,13 +67,24 @@ impl Api {
         Ok(Reply { status, body })
     }
 
-    /// Sends a request and fails unless its status is in `expect`.
+    /// Sends a setup or status request and fails unless its status is in `expect`. A retryable
+    /// 503 gets retries with backoff for up to [`SETUP_RETRY_LIMIT`].
     pub async fn expect(&self, method: Method, path: &str, token: &str, body: impl Into<Bytes>, expect: &[u16]) -> Result<Reply, String> {
-        let r = self.send(method.clone(), path, token, body.into()).await.map_err(|e| format!("{method} {path}: {e}"))?;
-        if !expect.contains(&r.status) {
-            return Err(format!("{method} {path}: status {}: {}", r.status, r.excerpt()));
+        let body = body.into();
+        let started = Instant::now();
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            let r = self.send(method.clone(), path, token, body.clone()).await.map_err(|e| format!("{method} {path}: {e}"))?;
+            if expect.contains(&r.status) {
+                return Ok(r);
+            }
+            let retryable = r.status == 503 && r.json()["error"]["retryable"] == json!(true);
+            if !retryable || started.elapsed() + backoff > SETUP_RETRY_LIMIT {
+                return Err(format!("{method} {path}: status {}: {}", r.status, r.excerpt()));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(5));
         }
-        Ok(r)
     }
 
     /// Sends a request and records its status and elapsed time.

@@ -11,10 +11,10 @@
 //! isolation --node ... --cgroup ... --workload idle_cost --out result.json
 //! ```
 //!
-//! A workload run has three phases. Phase A runs the victim alone. Phase B runs the attacker
-//! alone and samples the node cgroup's `memory.current` every 10 ms. Phase C runs the attacker and
-//! the victim together. The output JSON has every measurement and the result of each §3.3
-//! condition.
+//! A workload run records the idle node's `memory.current` before any setup, and then runs three
+//! phases. Phase A runs the victim alone. Phase B runs the attacker alone and samples the node
+//! cgroup's `memory.current` every 10 ms. Phase C runs the attacker and the victim together. The
+//! output JSON has every measurement and the result of each §3.3 condition.
 
 mod cgroup;
 mod event_scan;
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use workloads::{AttackContext, AttackOutcome, Round, Variant};
 
 const MIB: u64 = 1 << 20;
-/// Largest node memory growth over its value at the start of the attack (§3.3 rule 2).
+/// Largest node memory growth in phase B over the idle node's memory before setup (§3.3 rule 2).
 const TENANT_BOUND_BYTES: u64 = (512 + 64) * MIB;
 
 struct Args {
@@ -194,6 +194,8 @@ async fn run(a: &Args, watch: &NodeWatch, out: &mut Json) -> Result<(), String> 
         return Ok(());
     }
     let workload = workloads::by_name(&a.workload).ok_or_else(|| format!("unknown workload {:?}", a.workload))?;
+    let idle_node_bytes = a.cgroup.memory_current().ok_or("cannot read the node's memory.current")?;
+    out["idle_node_bytes"] = json!(idle_node_bytes);
     let variant = a.variant.ok_or("--variant is required for this workload")?;
     let victim_owner = api.create_owner("victim@iso.test", "victim").await?;
     victim::prepare(&api, &victim_owner).await?;
@@ -251,14 +253,15 @@ async fn run(a: &Args, watch: &NodeWatch, out: &mut Json) -> Result<(), String> 
         with_victim = Some(attack);
         victim_attacked = Some(victim_stats);
     }
-    out["conditions"] = conditions(watch, Some(&memory), Some(&victim_alone), victim_attacked.as_ref(), Some((&alone, with_victim.as_ref())), variant, a.deadline);
+    let growth_from_idle = memory.peak_bytes.saturating_sub(idle_node_bytes);
+    out["conditions"] = conditions(watch, Some(growth_from_idle), Some(&victim_alone), victim_attacked.as_ref(), Some((&alone, with_victim.as_ref())), variant, a.deadline);
     Ok(())
 }
 
 /// Evaluates the §3.3 conditions. A condition is `null` when a phase it needs did not run.
 fn conditions(
     watch: &NodeWatch,
-    memory: Option<&cgroup::MemorySamples>,
+    growth_from_idle: Option<u64>,
     victim_alone: Option<&victim::VictimStats>,
     victim_attacked: Option<&victim::VictimStats>,
     attacks: Option<(&AttackOutcome, Option<&AttackOutcome>)>,
@@ -266,7 +269,7 @@ fn conditions(
     deadline: Duration,
 ) -> Json {
     let survived = watch.alive() && watch.new_oom_kills() == 0;
-    let bound = memory.map(|m| m.growth_bytes <= TENANT_BOUND_BYTES);
+    let bound = growth_from_idle.map(|g| g <= TENANT_BOUND_BYTES);
     let victim = match (victim_alone, victim_attacked) {
         (Some(alone), Some(attacked)) => {
             let limit = (2.0 * alone.p99_ms).max(alone.p99_ms + 50.0);
@@ -295,7 +298,7 @@ fn conditions(
     json!({
         "1_node_survives": survived,
         "2_tenant_bound_holds": bound,
-        "2_growth_mib": memory.map(|m| m.growth_bytes as f64 / MIB as f64),
+        "2_growth_mib": growth_from_idle.map(|g| g as f64 / MIB as f64),
         "3_victim_not_harmed": victim,
         "4_refusal_is_clean": clean,
         "5_small_variant_succeeds": small,

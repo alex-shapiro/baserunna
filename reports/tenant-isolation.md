@@ -37,6 +37,133 @@ A **tenant** is the owner of a database: the user or organization in the
 pays for its databases, so each member who sends requests does not get
 a separate share.
 
+## Round 3 rules
+
+These rules were committed before either round 3 advocate started. The
+round 2 rules (commits 854d4e3 and 75ff637) still apply, except where
+this section changes them.
+
+### The requirement
+
+All tenant work runs inside the isolation boundary. A candidate that
+breaks this requirement does not qualify, whatever its test results.
+
+- **Tenant work** is any work whose memory or CPU depends on tenant
+  data, or on the size or number of a tenant's requests. It includes
+  every handler body, parse, read, scan, query, and response encode. It
+  also includes background work on tenant data: flush, LSM compaction,
+  seals, merges, garbage collection sweeps, and stream trims.
+- **No light list.** No kind of tenant work stays outside the boundary
+  because it is small or cheap.
+- **No per-site charges.** A charge or a cap in our own code at one call
+  site is not a bound.
+
+The main process does only these things:
+
+1. It accepts connections, reads HTTP headers under fixed limits,
+   authenticates, looks up the database record, and routes.
+2. It moves request and response bytes between the client and the
+   boundary. It uses buffers of a fixed size per request, and a fixed
+   limit per owner on requests in flight.
+3. It holds leases. It applies the commits and binds that the boundary
+   sends. It checks the size of each one before it reads the content,
+   and it charges that size to the owner.
+4. It runs background work that touches no tenant data, such as lease
+   renewal and cluster membership.
+
+**Enforcement at run time.** Each candidate must make it impossible for
+the main process to read tenant data. It needs:
+
+- a guard that fails a main-process read on every read path: `Txn`,
+  `Version`, segments, blobs, event parts, and streams;
+- the same guard on background jobs;
+- a test that runs every route in the router with the guard on;
+- a test that every route goes through the boundary.
+
+### The tenant memory bound
+
+The bound stays at 512 MiB per owner. The user chose it on 2026-11-15,
+with this tradeoff:
+
+- A higher bound lets larger queries and inserts succeed.
+- A higher bound also lets one tenant take more of the node.
+- In round 2, the WebAssembly sandbox answered every event query inside
+  512 MiB (measured, commit eaa6b97).
+
+### Candidates and time
+
+- **Worker pool under cgroups:** branch `iso3/cgroup`, from `iso2/cgroup`
+  at 8fca510.
+- **WebAssembly sandbox:** branch `iso3/wasm`, from `iso2/wasm` at
+  6cee4e4.
+- A new advocate agent builds each design. Each advocate gets 8 rounds
+  of 20 minutes.
+- In its first round, each advocate writes its design and the list of
+  what its main process does. I check that list against the
+  requirement, item by item, before the build starts. A violation stops
+  the build until the advocate removes it.
+- The advocates run one at a time, so that each has the machine alone.
+
+### Harness changes
+
+These changes are in the commit that registers round 3.
+
+1. **The small variant of `bulk_inserts` is possible.** The small variant
+   sends one 512 KiB body of empty rows and one 4 MiB body of user event
+   rows. The setup probe sends 256 KiB of each shape. The attack sizes
+   do not change.
+   - Before: the small variant needed about 1 GiB on today's code, over
+     the bound (round 2 verdict, commit eaa6b97).
+   - After: today's code completed the small variant in 3 of 3 runs,
+     with growth of 301, 322, and 322 MiB from the idle node (measured,
+     `scripts/isolation/judge3/prove-bulk-small.sh`). Its victim failed
+     the latency condition in 2 of the 3 runs. That is a real isolation
+     failure of today's code.
+2. **Setup retries a retryable 503.** `Api::expect` sends each setup and
+   status request again, with backoff, for up to 60 s (code,
+   `examples/isolation/http.rs`). Attack requests do not retry.
+3. **Growth starts at the idle node.** The harness reads the node's
+   `memory.current` before any setup. Condition 2 compares the peak of
+   phase B to that value. In round 2, memory that the allocator kept
+   from setup hid real growth.
+   - Growth now includes the victim's setup and the node's own memory.
+     The 64 MiB margin above the bound must cover both.
+   - `run.sh` records the node's `anon`, `file`, and `kernel` memory at
+     the end of each run.
+4. **Two runs per cell.** A cell is one node, one workload, and one
+   variant. A cell passes only if both of its runs pass
+   (`scripts/isolation/judge3/measure.sh`, `summarize.py`).
+5. **The victim's latency alone is a cost.** The judge reports the
+   median of the victim's p99 in phase A, over all workload runs of each
+   node, against today's code.
+
+### Workloads
+
+- **Known:** the 8 workloads in
+  `crates/baserunna/examples/isolation/workloads/`.
+- **Hidden:** 3 new workloads. A new agent writes them after both
+  round 3 prototypes are final. It reads neither prototype, no advocate
+  report, and no `iso2/*` or `iso3/*` branch except its own.
+- Rule 3.5 of round 2 still applies. A candidate may change where code
+  runs. It may not change the algorithms or the allocations of code that
+  the workloads exercise.
+
+### How the winner is chosen
+
+1. A candidate qualifies only if it meets the requirement and passes
+   every cell, known and hidden. Every small variant must succeed.
+2. Among the candidates that qualify, the one that performs best wins.
+3. Costs are reported. They are not limits. The costs are
+   `kv_throughput`, `idle_cost`, the event scan, the victim's latency
+   alone, and the library and simulator test results.
+   - This changes round 2 rule 4.6.1. That rule made each event query
+     that today's code answers a pass condition. In round 3, a refused
+     event query is a cost.
+4. Each advocate lists each source of extra cost. The judge names each
+   cost that a cheaper design could avoid.
+5. If no candidate qualifies, the user decides.
+6. A separate judge agent applies these rules to the data and the diffs.
+
 ## Round 2 evidence
 
 ### How the contest worked

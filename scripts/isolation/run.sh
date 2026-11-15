@@ -116,12 +116,14 @@ fi
 OOM_KILLS=$(awk '$1 == "oom_kill" {print $2}' "$NODE_CG/main/memory.events.local")
 SUBTREE_OOM_KILLS=$(awk '$1 == "oom_kill" {print $2}' "$NODE_CG/memory.events")
 PEAK=$(cat "$NODE_CG/memory.peak" 2>/dev/null || echo null)
+# anon is process memory; file is page cache that the kernel can reclaim.
+STAT_END=$(awk '$1 == "anon" || $1 == "file" || $1 == "kernel" {printf "%s\"%s\": %s", sep, $1, $2; sep = ", "}' "$NODE_CG/memory.stat" 2>/dev/null)
 cp "$WORK/node.log" "${OUT%.json}.node.log"
 if [ -f "$OUT" ]; then
-  jq --argjson exit "$NODE_EXIT" --argjson oom "${OOM_KILLS:-0}" --argjson subtree_oom "${SUBTREE_OOM_KILLS:-0}" --argjson peak "$PEAK" \
+  jq --argjson exit "$NODE_EXIT" --argjson oom "${OOM_KILLS:-0}" --argjson subtree_oom "${SUBTREE_OOM_KILLS:-0}" --argjson peak "$PEAK" --argjson stat_end "{${STAT_END}}" \
     --arg bin "$NODE_BIN" --argjson client "$CLIENT_STATUS" --arg busy "$BUSY_PROCS" --argjson store_latency_ms "$FAKE_S3_LATENCY_MS" \
     '.store_latency_ms = $store_latency_ms | .vm_busy = ($busy != "") | .vm_busy_processes = ($busy | split("\n") | map(select(. != "")))
-     | .run = {node_binary: $bin, node_exit_status: $exit, node_oom_kills: $oom, subtree_oom_kills: $subtree_oom, cgroup_memory_peak_bytes: $peak,
+     | .run = {node_binary: $bin, node_exit_status: $exit, node_oom_kills: $oom, subtree_oom_kills: $subtree_oom, cgroup_memory_peak_bytes: $peak, memory_stat_end_bytes: $stat_end,
              client_exit_status: $client, node_died: ($exit != null or $oom > 0)}
      | if .run.node_died and .conditions then .conditions["1_node_survives"] = false | .conditions.pass = false else . end' \
     "$OUT" >"$WORK/out.json" && mv "$WORK/out.json" "$OUT"

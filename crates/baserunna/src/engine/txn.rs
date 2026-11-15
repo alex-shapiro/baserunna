@@ -13,28 +13,28 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Isolation {
     #[default]
     Serializable,
     Snapshot,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReadItem {
     Key(Bytes),
     Range(KeyRange),
 }
 
 /// A value a transaction writes, and when it expires.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Put {
     pub value: Value,
     pub ttl: Option<Ttl>,
 }
 
 /// When a written value expires.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Ttl {
     /// At this store time (ms).
     Until(u64),
@@ -53,7 +53,7 @@ impl Ttl {
 }
 
 /// What a transaction asks the committer to apply.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct WriteSet {
     /// `None` = delete.
     pub puts: BTreeMap<Bytes, Option<Put>>,
@@ -104,11 +104,12 @@ impl WriteSet {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CommitRequest {
     pub commit_id: u64,
     /// Instant after which the committer rejects this request without applying it.
     /// Defaults to `commit_timeout_ms` after enqueueing when `None`.
+    #[serde(skip)]
     pub deadline: Option<tokio::time::Instant>,
     pub read_version: Seq,
     /// Store time at which the transaction evaluated expiries.
@@ -120,6 +121,7 @@ pub struct CommitRequest {
     /// Reads validated under every isolation level; see [`Txn::get_pinned`].
     pub pinned_reads: Vec<Bytes>,
     pub writes: WriteSet,
+    #[serde(skip)]
     pub charge: Charge,
 }
 

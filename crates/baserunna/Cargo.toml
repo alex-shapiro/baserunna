@@ -14,7 +14,7 @@ baserunna-api.workspace = true
 baserunna-client.workspace = true
 aws-lc-rs = "1.18"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "form", "tokio", "matched-path", "original-uri"] }
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 crc32c = "0.6"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 http = "1"

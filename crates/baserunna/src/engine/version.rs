@@ -28,7 +28,7 @@ pub struct Version {
 }
 
 /// Owned key range.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyRange {
     pub start: Bound<Bytes>,
     pub end: Bound<Bytes>,

@@ -238,7 +238,7 @@ pub enum CommitState {
     Aborted,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Committed {
     pub version: Seq,
     pub replayed: bool,
@@ -842,6 +842,9 @@ impl Db {
     pub async fn commit_detailed(self: &Arc<Self>, mut req: CommitRequest) -> Result<Committed> {
         if req.writes.is_empty() {
             return Ok(Committed { version: req.read_version, time_ms: req.read_time, ..Committed::default() });
+        }
+        if let Some(remote) = self.shared.remote_commit.get() {
+            return remote(self.id.clone(), req).await;
         }
         if req.deadline.is_none() {
             req.deadline = Some(Instant::now() + Duration::from_millis(self.shared.cfg.commit_timeout_ms));

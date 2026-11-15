@@ -200,6 +200,21 @@ async fn run() -> Result<(), String> {
                 Ok(baserunna::meta::get_db(&mut t, &db).await?.map(|r| r.owner_id))
             })
         }));
+        let weak = Arc::downgrade(&node);
+        w.set_committer(Box::new(move |owner, db, request| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let Some(node) = weak.upgrade() else {
+                    return Err(baserunna::Error::unavailable("the node is stopping"));
+                };
+                let mut t = node.sys_read().await?;
+                let rec = baserunna::meta::get_db(&mut t, &db).await?;
+                if rec.is_none_or(|r| r.owner_id != owner) {
+                    return Err(baserunna::Error::internal("a worker committed to a database of another owner"));
+                }
+                node.engine.db(&db).commit_detailed(request).await
+            })
+        }));
         let idle = w.clone();
         tokio::spawn(async move {
             loop {

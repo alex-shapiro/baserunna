@@ -9,7 +9,7 @@ pub type Seq = u64;
 
 pub const MAX_KEY_LEN: usize = 4096 + 64; // user keys + internal prefixes
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlobRef {
     /// 32 lowercase hex chars: 48-bit creation ms + 80 random bits.
     pub id: String,
@@ -111,7 +111,7 @@ pub fn make_blob_id(now_ms: u64, random: &[u8]) -> String {
     s
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Inline(Bytes),
     Blob(BlobRef),

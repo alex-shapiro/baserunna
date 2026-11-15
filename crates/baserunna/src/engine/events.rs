@@ -468,7 +468,7 @@ pub fn decode_mask_object(b: &[u8]) -> DResult<Runs> {
     Ok(runs)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EventOp {
     /// Inserts encoded rows into `table` and assigns their positions at commit.
     Insert {
@@ -492,9 +492,11 @@ pub enum EventOp {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RefChange {
+    #[serde(with = "part_ref_serde")]
     pub old: Option<PartRef>,
+    #[serde(with = "part_ref_serde")]
     pub new: Option<PartRef>,
 }
 
@@ -860,5 +862,20 @@ mod tests {
             let _ = Bind::decode(&d);
             let _ = Runs::decode(&mut Reader::new(&d));
         }
+    }
+}
+
+/// Serializes an optional [`PartRef`] as its key and its encoding.
+mod part_ref_serde {
+    use super::PartRef;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(r: &Option<PartRef>, s: S) -> Result<S::Ok, S::Error> {
+        r.as_ref().map(|r| (r.key().to_vec(), r.encode().to_vec())).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PartRef>, D::Error> {
+        let Some((k, v)) = Option::<(Vec<u8>, Vec<u8>)>::deserialize(d)? else { return Ok(None) };
+        PartRef::decode(&k, &v).map(Some).map_err(|e| serde::de::Error::custom(format!("part ref: {e}")))
     }
 }

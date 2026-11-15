@@ -63,6 +63,8 @@ pub struct Shared {
     event_hook: std::sync::OnceLock<EventHook>,
     /// Worker processes that run heavy tenant work under kernel limits; unset in the simulator.
     pub workers: std::sync::OnceLock<Arc<crate::worker::WorkerPool>>,
+    /// Commits this process's write sets in another process, which holds the leases (a worker's node process).
+    pub remote_commit: std::sync::OnceLock<RemoteCommit>,
 }
 
 /// Callback invoked on the lease holder after a commit modifies event table rows or parts (SPEC §5.13).
@@ -179,6 +181,16 @@ impl Shared {
         now
     }
 }
+
+/// Commits a write set to database `db` in the process that holds its lease.
+pub type RemoteCommit = Box<
+    dyn Fn(
+            String,
+            CommitRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<Committed>> + Send>>
+        + Send
+        + Sync,
+>;
 
 pub fn manifest_key(db: &str) -> String {
     format!("dbs/{db}/manifest")
@@ -303,6 +315,7 @@ impl Engine {
             commit_hook: std::sync::OnceLock::new(),
             event_hook: std::sync::OnceLock::new(),
             workers: std::sync::OnceLock::new(),
+            remote_commit: std::sync::OnceLock::new(),
         });
         let engine = Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) });
         let _ = engine.shared.engine.set(Arc::downgrade(&engine));

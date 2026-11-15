@@ -116,6 +116,35 @@ enum JobResult {
     Failed(serde_json::Value),
 }
 
+/// A frame header that the node sends to a worker.
+#[derive(Serialize, Deserialize)]
+enum ToWorker {
+    /// A job to run; the frame's ID names the job.
+    Job(Box<Job>),
+    /// The outcome of the worker's commit call with the frame's ID, or its error as a JSON error body.
+    Committed(std::result::Result<crate::engine::Committed, serde_json::Value>),
+}
+
+/// A frame header that a worker sends to the node.
+#[derive(Serialize, Deserialize)]
+enum FromWorker {
+    /// The result of the job with the frame's ID.
+    Done(JobResult),
+    /// A call to commit `request` to database `db` as the lease holder; the frame's ID names the call.
+    Commit { db: String, request: Box<crate::engine::CommitRequest> },
+}
+
+/// Commits a worker's write set for owner `owner` to database `db` in the node process.
+pub type WorkerCommitter = Box<
+    dyn Fn(
+            String,
+            String,
+            crate::engine::CommitRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::engine::Committed>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Reads the `owner_id` of a database ID, or `None` if the database does not exist.
 pub type OwnerResolver = Box<
     dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send>> + Send + Sync,
@@ -139,6 +168,7 @@ pub struct WorkerPool {
     cfg: PoolConfig,
     db_owners: Mutex<HashMap<String, String>>,
     owner_resolver: std::sync::OnceLock<OwnerResolver>,
+    committer: Arc<std::sync::OnceLock<WorkerCommitter>>,
     owner_workers: Mutex<HashMap<String, Arc<OwnerWorker>>>,
     next_job_id: std::sync::atomic::AtomicU64,
 }
@@ -157,6 +187,7 @@ impl WorkerPool {
             cfg,
             db_owners: Mutex::new(HashMap::new()),
             owner_resolver: Default::default(),
+            committer: Default::default(),
             owner_workers: Mutex::new(HashMap::new()),
             next_job_id: 0.into(),
         })
@@ -168,6 +199,11 @@ impl WorkerPool {
         if g.get(db).map(String::as_str) != Some(owner) {
             g.insert(db.to_string(), owner.to_string());
         }
+    }
+
+    /// Sets the function that commits workers' write sets in the node process.
+    pub fn set_committer(&self, f: WorkerCommitter) {
+        let _ = self.committer.set(f);
     }
 
     /// Sets the function that reads a database's `owner_id` from the system database.
@@ -400,7 +436,8 @@ impl WorkerPool {
 
     /// Runs `job` with `payload` in `owner`'s worker and returns the result and its payload.
     async fn run(&self, owner: &str, job: Job, payload: Bytes, deadline: Duration) -> Result<(JobResult, Bytes)> {
-        let header: Bytes = serde_json::to_vec(&job).map_err(|e| Error::internal(e.to_string()))?.into();
+        let header: Bytes =
+            serde_json::to_vec(&ToWorker::Job(Box::new(job))).map_err(|e| Error::internal(e.to_string()))?.into();
         let job_id = self.next_job_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut attempts = 0;
         let (worker, result) = loop {
@@ -504,13 +541,31 @@ impl WorkerPool {
             }
         });
         let reader = worker.clone();
+        let committer = self.committer.clone();
+        let owner = owner.to_string();
         let limit_mib = self.cfg.owner_memory_bytes >> 20;
         let ooms_before = oom_kills(&owner_dir);
         tokio::spawn(async move {
             while let Ok((job_id, header, payload)) = read_job_frame(&mut stdout).await {
-                let result = serde_json::from_slice::<JobResult>(&header)
-                    .map(|h| (h, payload))
-                    .map_err(|e| Error::internal(format!("worker result: {e}")));
+                let result = match serde_json::from_slice::<FromWorker>(&header) {
+                    Ok(FromWorker::Done(h)) => Ok((h, payload)),
+                    Ok(FromWorker::Commit { db, request }) => {
+                        let (committer, frames, owner) = (committer.clone(), reader.frames.clone(), owner.clone());
+                        tokio::spawn(async move {
+                            let committed = match committer.get() {
+                                Some(commit) => commit(owner, db, *request).await,
+                                None => Err(Error::internal("the worker pool has no committer")),
+                            };
+                            let reply = ToWorker::Committed(
+                                committed.map_err(|e| json!({ "error": crate::api::error_json(&e) })),
+                            );
+                            let header = serde_json::to_vec(&reply).unwrap_or_default();
+                            let _ = frames.send((job_id, header.into(), Bytes::new()));
+                        });
+                        continue;
+                    }
+                    Err(e) => Err(Error::internal(format!("worker result: {e}"))),
+                };
                 *reader.last_used.lock() = std::time::Instant::now();
                 if let Some(done) = reader.pending.lock().remove(&job_id) {
                     let _ = done.send(result);
@@ -530,6 +585,9 @@ impl WorkerPool {
         Ok(worker)
     }
 }
+
+/// Delivers the node's answer to a worker's commit call.
+type CommitDone = tokio::sync::oneshot::Sender<Result<crate::engine::Committed>>;
 
 /// Delivers a job's result and payload to the request that waits for it.
 type JobDone = tokio::sync::oneshot::Sender<Result<(JobResult, Bytes)>>;
@@ -595,19 +653,48 @@ pub async fn serve(store: crate::store::DynStore, cfg: EngineConfig) -> std::io:
         }
         Ok::<_, std::io::Error>(())
     });
+    let commit_calls: Arc<Mutex<HashMap<u64, CommitDone>>> = Default::default();
+    let next_call_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let (results, calls) = (results.clone(), commit_calls.clone());
+        let remote: crate::engine::RemoteCommit = Box::new(move |db, request| {
+            let call_id = next_call_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (done, committed) = tokio::sync::oneshot::channel();
+            calls.lock().insert(call_id, done);
+            let header = serde_json::to_vec(&FromWorker::Commit { db, request: Box::new(request) });
+            let sent = header.map(|h| results.send((call_id, h.into(), Bytes::new())).is_ok());
+            Box::pin(async move {
+                if !sent.unwrap_or(false) {
+                    return Err(Error::internal("the worker cannot reach the node"));
+                }
+                committed.await.map_err(|_| Error::internal("the node dropped the commit"))?
+            })
+        });
+        let _ = engine.shared.remote_commit.set(remote);
+    }
     let mut stdin = tokio::io::stdin();
     while let Ok((job_id, header, payload)) = read_job_frame(&mut stdin).await {
+        let job = match serde_json::from_slice::<ToWorker>(&header) {
+            Ok(ToWorker::Committed(r)) => {
+                if let Some(done) = commit_calls.lock().remove(&job_id) {
+                    let _ = done.send(r.map_err(|e| crate::api::error_from_json(500, &e)));
+                }
+                continue;
+            }
+            Ok(ToWorker::Job(job)) => Ok(*job),
+            Err(e) => Err(e),
+        };
         let engine = engine.clone();
         let results = results.clone();
         tokio::spawn(async move {
-            let (result, out) = match serde_json::from_slice::<Job>(&header) {
+            let (result, out) = match job {
                 Ok(job) => run_job(&engine, job, payload).await,
                 Err(e) => (
                     JobResult::Failed(json!({ "error": crate::api::error_json(&Error::internal(e.to_string())) })),
                     Bytes::new(),
                 ),
             };
-            let header = serde_json::to_vec(&result).unwrap_or_default();
+            let header = serde_json::to_vec(&FromWorker::Done(result)).unwrap_or_default();
             let _ = results.send((job_id, header.into(), out));
         });
     }

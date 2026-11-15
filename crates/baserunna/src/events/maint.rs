@@ -72,54 +72,19 @@ pub fn refs_per_txn(cfg: &crate::engine::EngineConfig) -> usize {
 /// true if any rows were sealed.
 pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
     let shared = db.shared().clone();
-    let cfg = &shared.cfg;
     let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await?;
     let Some(s) = schema_by_id(&mut txn, table).await? else { return Ok(false) };
     let st = super::state(&mut txn, table).await?;
     if st.unsealed_rows == 0 {
         return Ok(false);
     }
-    let avg = (st.unsealed_bytes / st.unsealed_rows).max(1) as usize;
-    let limit = (cfg.event_insert_part_max_bytes / avg).max(1);
-    // Scan untracked and record only `rows_through(table, last)` so rows
-    // appended after `last` do not cause a read-write conflict.
     let snap = txn.untracked_snapshot().clone();
-    let items = snap.scan(&ev::rows(table), false, limit, txn.read_time).await?;
-    let max_parts = refs_per_txn(cfg);
-    let (mut bytes, mut rows, mut last) = (0u64, 0u64, None);
-    let mut by_partition: BTreeMap<u32, Vec<(Pos, &[u8])>> = BTreeMap::new();
-    let mut sizes: BTreeMap<u32, PartSize> = BTreeMap::new();
-    let defaults = Defaults::of(&s);
-    let parts_of = |size: PartSize| size.parts(cfg.event_insert_part_max_bytes);
-    let mut parts_needed = 0;
-    for it in &items {
-        let (_, pos) = ev::parse_row_key(&it.key).ok_or_else(|| Error::internal("bad unsealed row key"))?;
-        let Value::Inline(b) = &it.value else { return Err(Error::internal("unsealed row stored out of line")) };
-        let row = decode_row(b).map_err(|_| Error::internal("corrupt unsealed row"))?;
-        let partition = ev::partition_key(s.bucket(s.time_of(&row)));
-        let old = sizes.get(&partition).copied();
-        let new = old.unwrap_or_default() + PartSize::of(&row, b.len(), &defaults);
-        let needed = parts_needed - old.map_or(0, parts_of) + parts_of(new);
-        if needed > max_parts && last.is_some() {
-            break;
-        }
-        parts_needed = needed;
-        sizes.insert(partition, new);
-        bytes += (it.key.len() + b.len()) as u64;
-        rows += 1;
-        last = Some(pos);
-        by_partition.entry(partition).or_default().push((pos, b));
-    }
-    let Some(last) = last else { return Ok(false) };
+    let sealed = match shared.workers.get() {
+        Some(w) => w.seal(&db.id, &s, &st, &snap, txn.read_time).await?,
+        None => seal_parts(&shared, &db.id, &s, &st, &snap, txn.read_time).await?,
+    };
+    let Some(Sealed { last, rows, bytes, written }) = sealed else { return Ok(false) };
     txn.note_read(ev::rows_through(table, last));
-    let mut parts = Vec::new();
-    for (partition, rows) in by_partition {
-        if let Err(e) = write_encoded(&shared, &db.id, &s, partition, rows.into_iter(), true, &mut parts).await {
-            delete_parts(&shared, &db.id, parts.into_iter().map(|(r, _)| r.id)).await;
-            return Err(e);
-        }
-    }
-    let written: Vec<PartRef> = parts.into_iter().map(|(r, _)| r).collect();
     shared.env.crash_point().await;
     let committed = async {
         txn.delete_range(ev::rows_through(table, last))?;
@@ -144,6 +109,68 @@ pub async fn seal(db: &Arc<Db>, table: u32) -> Result<bool> {
             Err(e)
         }
     }
+}
+
+/// Unsealed rows that [`seal_parts`] wrote as level-0 parts.
+pub(crate) struct Sealed {
+    /// Position of the last sealed row.
+    pub last: Pos,
+    pub rows: u64,
+    pub bytes: u64,
+    pub written: Vec<PartRef>,
+}
+
+/// Writes a prefix of the unsealed rows of table `s` at snapshot `snap` as level-0 parts.
+/// Returns `None` if the snapshot has no unsealed rows.
+pub(crate) async fn seal_parts(
+    shared: &Shared,
+    db: &str,
+    s: &EventSchema,
+    st: &TableState,
+    snap: &crate::engine::Version,
+    read_time: u64,
+) -> Result<Option<Sealed>> {
+    let cfg = &shared.cfg;
+    let avg = (st.unsealed_bytes / st.unsealed_rows).max(1) as usize;
+    let limit = (cfg.event_insert_part_max_bytes / avg).max(1);
+    // The caller records only `rows_through(table, last)` so rows appended
+    // after `last` do not cause a read-write conflict.
+    let items = snap.scan(&ev::rows(s.id), false, limit, read_time).await?;
+    let max_parts = refs_per_txn(cfg);
+    let (mut bytes, mut rows, mut last) = (0u64, 0u64, None);
+    let mut by_partition: BTreeMap<u32, Vec<(Pos, &[u8])>> = BTreeMap::new();
+    let mut sizes: BTreeMap<u32, PartSize> = BTreeMap::new();
+    let defaults = Defaults::of(s);
+    let parts_of = |size: PartSize| size.parts(cfg.event_insert_part_max_bytes);
+    let mut parts_needed = 0;
+    for it in &items {
+        let (_, pos) = ev::parse_row_key(&it.key).ok_or_else(|| Error::internal("bad unsealed row key"))?;
+        let Value::Inline(b) = &it.value else { return Err(Error::internal("unsealed row stored out of line")) };
+        let row = decode_row(b).map_err(|_| Error::internal("corrupt unsealed row"))?;
+        let partition = ev::partition_key(s.bucket(s.time_of(&row)));
+        let old = sizes.get(&partition).copied();
+        let new = old.unwrap_or_default() + PartSize::of(&row, b.len(), &defaults);
+        let needed = parts_needed - old.map_or(0, parts_of) + parts_of(new);
+        if needed > max_parts && last.is_some() {
+            break;
+        }
+        parts_needed = needed;
+        sizes.insert(partition, new);
+        bytes += (it.key.len() + b.len()) as u64;
+        rows += 1;
+        last = Some(pos);
+        by_partition.entry(partition).or_default().push((pos, b));
+    }
+    let Some(last) = last else { return Ok(None) };
+    let mut parts = Vec::new();
+    for (partition, rows) in by_partition {
+        if let Err(e) = write_encoded(shared, db, s, partition, rows.into_iter(), true, &mut parts).await {
+            delete_parts(shared, db, parts.into_iter().map(|(r, _)| r.id)).await;
+            return Err(e);
+        }
+    }
+    let written: Vec<PartRef> = parts.into_iter().map(|(r, _)| r).collect();
+    Ok(Some(Sealed { last, rows, bytes, written }))
 }
 
 /// Maintenance task selected for a partition.

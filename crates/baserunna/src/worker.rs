@@ -26,11 +26,18 @@ use std::time::Duration;
 /// Default memory limit of one owner's cgroup.
 pub const OWNER_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Longest time a worker may take to seal unsealed rows.
+const SEAL_DEADLINE: Duration = Duration::from_secs(600);
+
 /// Heavy tenant work that a worker process runs.
 #[derive(Serialize, Deserialize)]
 enum Job {
     /// Merges event parts into one new part and returns its reference.
-    Merge { db: String, schema: EventSchema, inputs: Vec<(Vec<u8>, Vec<u8>)> },
+    Merge {
+        db: String,
+        schema: EventSchema,
+        inputs: Vec<(Vec<u8>, Vec<u8>)>,
+    },
     /// Runs an event query at a snapshot whose encoded manifest is the job's payload, and
     /// returns the JSON response body as the result's payload.
     Query {
@@ -43,13 +50,29 @@ enum Job {
     },
     /// Parses and validates the bulk insert body in the payload, writes its rows as staged
     /// parts, and returns the encoded [`Bind`] as the result's payload.
-    BulkInsert { db: String, schema: EventSchema, content_type: String, now_ms: i64, row_bytes_max: usize },
+    /// Seals unsealed rows at a snapshot whose encoded manifest is the job's payload.
+    Seal {
+        db: String,
+        etag: String,
+        read_time: u64,
+        schema: EventSchema,
+        state: Vec<u8>,
+    },
+    BulkInsert {
+        db: String,
+        schema: EventSchema,
+        content_type: String,
+        now_ms: i64,
+        row_bytes_max: usize,
+    },
 }
 
 /// The result of a [`Job`].
 #[derive(Serialize, Deserialize)]
 enum JobResult {
     Merged(Option<(Vec<u8>, Vec<u8>)>),
+    /// The last sealed row as `(version, ordinal)`, the sealed row and byte counts, and the written parts.
+    Sealed(Option<((u64, u32), u64, u64, Vec<(Vec<u8>, Vec<u8>)>)>),
     /// The query's JSON response body is the result's payload.
     Queried,
     /// The body's idempotency key and, on success, the encoded [`Bind`] as the payload.
@@ -183,6 +206,38 @@ impl WorkerPool {
         match self.run(owner, job, manifest, deadline).await? {
             (JobResult::Queried, body) => Ok(body),
             (JobResult::Failed(e), _) => Err(crate::api::error_from_json(500, &e)),
+            _ => Err(Error::internal("the worker returned a result of another job")),
+        }
+    }
+
+    /// Runs `seal_parts` for table `schema` at snapshot `snap` in a worker inside the owner's cgroup.
+    pub(crate) async fn seal(
+        &self,
+        db: &str,
+        schema: &EventSchema,
+        st: &crate::engine::events::TableState,
+        snap: &crate::engine::Version,
+        read_time: u64,
+    ) -> Result<Option<crate::events::maint::Sealed>> {
+        let owner = self.owner_of(db).await?;
+        let job = Job::Seal {
+            db: db.to_string(),
+            etag: snap.etag.clone(),
+            read_time,
+            schema: schema.clone(),
+            state: st.encode().to_vec(),
+        };
+        match self.run(&owner, job, snap.m.encode(), SEAL_DEADLINE).await?.0 {
+            JobResult::Sealed(None) => Ok(None),
+            JobResult::Sealed(Some(((version, ordinal), rows, bytes, written))) => {
+                let written = written
+                    .iter()
+                    .map(|(k, v)| PartRef::decode(k, v).map_err(|e| Error::internal(format!("worker part ref: {e}"))))
+                    .collect::<Result<_>>()?;
+                let last = crate::engine::events::Pos { version, ordinal };
+                Ok(Some(crate::events::maint::Sealed { last, rows, bytes, written }))
+            }
+            JobResult::Failed(e) => Err(crate::api::error_from_json(500, &e)),
             _ => Err(Error::internal("the worker returned a result of another job")),
         }
     }
@@ -333,6 +388,24 @@ async fn run_job(shared: &Arc<Shared>, job: Job, payload: Bytes) -> (JobResult, 
                 ),
             }
         }
+        Job::Seal { db, etag, read_time, schema, state } => {
+            let sealed = async {
+                let st = crate::engine::events::TableState::decode(&state)
+                    .map_err(|e| Error::internal(format!("table state: {e}")))?;
+                let version = snapshot_version(shared, etag, &payload)?;
+                crate::events::maint::seal_parts(shared, &db, &schema, &st, &version, read_time).await
+            };
+            match sealed.await {
+                Ok(out) => {
+                    let out = out.map(|o| {
+                        let written = o.written.iter().map(|r| (r.key().to_vec(), r.encode().to_vec())).collect();
+                        ((o.last.version, o.last.ordinal), o.rows, o.bytes, written)
+                    });
+                    (JobResult::Sealed(out), Bytes::new())
+                }
+                Err(e) => failed(e),
+            }
+        }
         Job::Query { db, etag, read_time, schema, query, limits } => {
             match run_query(shared, &db, etag, read_time, &schema, query, limits, payload).await {
                 Ok(body) => (JobResult::Queried, body),
@@ -367,11 +440,10 @@ async fn run_query(
     (max_bytes_read, max_memory_bytes, lookup_max_bytes, max_ms): (u64, usize, usize, u64),
     manifest: Bytes,
 ) -> Result<Bytes> {
-    use crate::engine::{Isolation, Snapshot, Txn, Version, manifest::Manifest};
-    let m = Manifest::decode(&manifest).map_err(|e| Error::internal(format!("snapshot manifest: {e}")))?;
+    use crate::engine::{Isolation, Snapshot, Txn};
+    let snapshot = Snapshot { version: Arc::new(snapshot_version(shared, etag, &manifest)?), time_ms: read_time };
     drop(manifest);
-    let version = m.version;
-    let snapshot = Snapshot { version: Arc::new(Version::new(m, etag, shared.clone())), time_ms: read_time };
+    let version = snapshot.version.m.version;
     let cfg = &shared.cfg;
     let mut txn =
         Txn::new(snapshot, Isolation::Serializable, 0, cfg.txn_max_write_bytes).with_read_limit(cfg.txn_max_read_bytes);
@@ -399,4 +471,11 @@ async fn stage_insert(
     }
     let parts = crate::events::bulk::stage(shared, db, schema, std::slice::from_ref(&valid)).await?;
     Ok(Bind { table: schema.id, slots: vec![BindSlot { commit_id: 0, deadline: None }], parts })
+}
+
+/// Rebuilds the snapshot [`Version`](crate::engine::Version) whose encoded manifest the node sent.
+fn snapshot_version(shared: &Arc<Shared>, etag: String, manifest: &Bytes) -> Result<crate::engine::Version> {
+    let m = crate::engine::manifest::Manifest::decode(manifest)
+        .map_err(|e| Error::internal(format!("snapshot manifest: {e}")))?;
+    Ok(crate::engine::Version::new(m, etag, shared.clone()))
 }

@@ -2,23 +2,28 @@
 # Runs one tenant isolation workload against a node in a memory-limited cgroup
 # (reports/tenant-isolation.md §3.1) and writes the result JSON.
 #
-# Usage: run.sh <workload> <small|attack|-> <out.json> [node binary]
+# Usage: run.sh <workload> <small|attack|-> <out.json> [node binary] [client flags]
 #
 # Run inside the Linux VM. The node binary defaults to $NODE_BIN, then to
 # $HOME/target-iso-base/release/baserunna. The harness binaries (isolation and
 # fake_s3_server) come from $EXAMPLES_DIR, which defaults to
 # $HOME/target-iso-base/release/examples. Ports are free ports unless $S3_PORT
-# and $NODE_PORT are set. $ISO_CGROUP replaces /sys/fs/cgroup/iso.
+# and $NODE_PORT are set. $ISO_CGROUP replaces /sys/fs/cgroup/iso. Arguments that
+# start with -- go to the isolation client, such as --find-saturation.
 set -euo pipefail
 
 if [ $# -lt 3 ]; then
-  echo "usage: $0 <workload> <small|attack|-> <out.json> [node binary]" >&2
+  echo "usage: $0 <workload> <small|attack|-> <out.json> [node binary] [client flags]" >&2
   exit 2
 fi
 WORKLOAD=$1
 VARIANT=$2
 OUT=$(realpath -m "$3")
-NODE_BIN=$(realpath "${4:-${NODE_BIN:-$HOME/target-iso-base/release/baserunna}}")
+shift 3
+NODE_ARG=
+if [ $# -gt 0 ] && [[ $1 != --* ]]; then NODE_ARG=$1; shift; fi
+CLIENT_FLAGS=("$@")
+NODE_BIN=$(realpath "${NODE_ARG:-${NODE_BIN:-$HOME/target-iso-base/release/baserunna}}")
 EXAMPLES_DIR=${EXAMPLES_DIR:-$HOME/target-iso-base/release/examples}
 free_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 S3_PORT=${S3_PORT:-$(free_port)}
@@ -79,6 +84,10 @@ set -a
 . "$WORK/s3.env"
 set +a
 export BASERUNNA_LISTEN=127.0.0.1:$NODE_PORT BASERUNNA_SIGNUP=open BASERUNNA_CGROUP_ROOT=$NODE_CG BASERUNNA_CACHE_MB=64
+# The throughput load is 10 owners from one client address; 0 turns each limit off.
+if [ "$WORKLOAD" = kv_throughput ]; then
+  export BASERUNNA_USER_RPS=0 BASERUNNA_API_KEY_RPS=0 BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT=0
+fi
 GO=$WORK/go
 sh -c 'while [ ! -e "$0" ]; do sleep 0.01; done; exec "$1"' "$GO" "$NODE_BIN" >"$WORK/node.log" 2>&1 &
 NODE_PID=$!
@@ -87,6 +96,7 @@ touch "$GO"
 
 CLIENT_ARGS=(--node "http://127.0.0.1:$NODE_PORT" --cgroup "$NODE_CG" --workload "$WORKLOAD" --out "$OUT" --node-pid "$NODE_PID")
 [ "$VARIANT" != "-" ] && CLIENT_ARGS+=(--variant "$VARIANT")
+CLIENT_ARGS+=("${CLIENT_FLAGS[@]}")
 mkdir -p "$(dirname "$OUT")"
 set +e
 "$EXAMPLES_DIR/isolation" "${CLIENT_ARGS[@]}"
@@ -112,4 +122,4 @@ if [ -f "$OUT" ]; then
     "$OUT" >"$WORK/out.json" && mv "$WORK/out.json" "$OUT"
 fi
 echo "result: $OUT"
-jq -c '{workload, variant, conditions, run, error}' "$OUT" 2>/dev/null || true
+jq -c '{workload, variant, conditions, kv_throughput: (.kv_throughput.result // null), run, error}' "$OUT" 2>/dev/null || true

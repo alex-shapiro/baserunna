@@ -7,6 +7,7 @@
 //! isolation --node http://127.0.0.1:8080 --cgroup /sys/fs/cgroup/iso/node \
 //!     --workload <name> --variant small|attack --out result.json [--node-pid PID]
 //! isolation --node ... --cgroup ... --workload event_scan --out result.json [--rounds 20]
+//! isolation --node ... --cgroup ... --workload kv_throughput --out result.json [--clients 64 | --find-saturation]
 //! ```
 //!
 //! A workload run has three phases. Phase A runs the victim alone. Phase B runs the attacker
@@ -17,6 +18,7 @@
 mod cgroup;
 mod event_scan;
 mod http;
+mod kv_throughput;
 mod victim;
 mod workloads;
 
@@ -43,13 +45,15 @@ struct Args {
     victim_alone: Duration,
     victim_rps: f64,
     rounds: usize,
+    clients: usize,
+    find_saturation: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: isolation --node URL --cgroup DIR --workload NAME [--variant small|attack] --out FILE \
-         [--node-pid PID] [--deadline-ms 10000] [--victim-secs 15] [--victim-rps 400] [--rounds 20]\n\
-         workloads: {} event_scan",
+         [--node-pid PID] [--deadline-ms 10000] [--victim-secs 15] [--victim-rps 400] [--rounds 20] [--clients 64] [--find-saturation]\n\
+         workloads: {} event_scan kv_throughput",
         workloads::NAMES.join(" ")
     );
     std::process::exit(2)
@@ -67,9 +71,15 @@ fn args() -> Args {
         victim_alone: Duration::from_secs(15),
         victim_rps: 400.0,
         rounds: 20,
+        clients: 64,
+        find_saturation: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
+        if flag == "--find-saturation" {
+            a.find_saturation = true;
+            continue;
+        }
         let v = it.next().unwrap_or_else(|| usage());
         match flag.as_str() {
             "--node" => a.node = v,
@@ -82,6 +92,7 @@ fn args() -> Args {
             "--victim-secs" => a.victim_alone = Duration::from_secs(v.parse().unwrap_or_else(|_| usage())),
             "--victim-rps" => a.victim_rps = v.parse().unwrap_or_else(|_| usage()),
             "--rounds" => a.rounds = v.parse().unwrap_or_else(|_| usage()),
+            "--clients" => a.clients = v.parse().unwrap_or_else(|_| usage()),
             _ => usage(),
         }
     }
@@ -164,6 +175,11 @@ async fn run(a: &Args, watch: &NodeWatch, out: &mut Json) -> Result<(), String> 
     let client_timeout = 6 * a.deadline + Duration::from_secs(60);
     let api = Arc::new(Api::new(&a.node, client_timeout));
     api.wait_healthy(Duration::from_secs(60)).await?;
+    if a.workload == "kv_throughput" {
+        out["kv_throughput"] = kv_throughput::run(&api, &a.node, &a.cgroup, a.clients, a.find_saturation).await?;
+        out["node_survived"] = json!(watch.alive() && watch.new_oom_kills() == 0);
+        return Ok(());
+    }
     let attacker = api.create_owner("attacker@iso.test", "attacker").await?;
     if a.workload == "event_scan" {
         out["event_scan"] = event_scan::run(&api, &attacker, &a.cgroup, a.rounds).await?;

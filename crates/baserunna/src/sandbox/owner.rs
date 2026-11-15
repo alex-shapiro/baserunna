@@ -60,6 +60,8 @@ pub(super) struct OwnerIo {
     /// Held for reading by every PUT body in guest memory; the driver takes it for writing
     /// before it drops the instance.
     store_live: Arc<tokio::sync::RwLock<()>>,
+    /// Tickets of PUT bodies in guest memory that the host no longer reads.
+    released_bodies: mpsc::UnboundedSender<u32>,
 }
 
 fn owner_io<'a>(caller: &'a mut Caller<'_, GuestState>) -> wasmtime::Result<&'a mut OwnerIo> {
@@ -119,14 +121,14 @@ async fn stream_get(store: DynStore, key: String, opts: GetOpts, ticket: u32, ev
 }
 
 /// Returns the `len` bytes at `ptr` in guest memory as `Bytes`, with no copy.
-fn guest_bytes(caller: &mut Caller<'_, GuestState>, ptr: u32, len: u32) -> wasmtime::Result<Bytes> {
+fn guest_bytes(caller: &mut Caller<'_, GuestState>, ptr: u32, len: u32) -> wasmtime::Result<(u32, Bytes)> {
     let memory = super::guest_memory(caller)?;
-    let live = owner_io(caller)?
-        .store_live
-        .clone()
-        .try_read_owned()
-        .map_err(|_| wasmtime::Error::msg("owner instance is stopping"))?;
-    super::guest_bytes::in_place(memory.data_ptr(&*caller), memory.data_size(&*caller), ptr, len, live)
+    let io = owner_io(caller)?;
+    let ticket = io.next_ticket;
+    let released = io.released_bodies.clone();
+    let live = io.store_live.clone().try_read_owned().map_err(|_| wasmtime::Error::msg("owner instance is stopping"))?;
+    super::guest_bytes::in_place(memory.data_ptr(&*caller), memory.data_size(&*caller), ptr, len, live, ticket, released)
+        .map(|b| (ticket, b))
         .ok_or_else(|| wasmtime::Error::msg("guest PUT body out of bounds"))
 }
 
@@ -171,14 +173,15 @@ pub(super) fn link_owner_calls(linker: &mut Linker<GuestState>) -> wasmtime::Res
          etag_ptr: u32,
          etag_len: u32| {
             let key = String::from_utf8(read_guest(&mut caller, key_ptr, key_len)?)?;
-            let data = guest_bytes(&mut caller, data_ptr, data_len)?;
+            let (body_ticket, data) = guest_bytes(&mut caller, data_ptr, data_len)?;
             let etag = String::from_utf8(read_guest(&mut caller, etag_ptr, etag_len)?)?;
             let mode = match mode {
                 0 => PutMode::Overwrite,
                 1 => PutMode::Create,
                 _ => PutMode::IfMatch(etag),
             };
-            start_ticket(&mut caller, move |store, _, _| async move {
+            start_ticket(&mut caller, move |store, ticket, _| async move {
+                debug_assert_eq!(ticket, body_ticket);
                 match store.put(&key, data, mode).await {
                     Ok(etag) => (0, etag.into_bytes()),
                     Err(e) => (store_code(&e), Vec::new()),
@@ -255,6 +258,7 @@ struct OwnerExports {
     complete: TypedFunc<(u32, i64, u32, u32), ()>,
     request: TypedFunc<(u64, u32, u32), ()>,
     poll: TypedFunc<u64, u32>,
+    release_body: TypedFunc<u32, ()>,
 }
 
 fn host_now_ms() -> u64 {
@@ -281,6 +285,7 @@ impl OwnerInstances {
     /// Starts the instance of `owner` on `store` and the host task that drives it.
     pub async fn start(&self, owner: &str, store: DynStore, seed: u64) -> Result<OwnerInstance> {
         let (events_tx, events) = mpsc::channel(STORE_CALLS_IN_FLIGHT);
+        let (released_tx, released) = mpsc::unbounded_channel();
         let memory: Arc<parking_lot::Mutex<HashMap<String, super::OwnerMemory>>> = Arc::default();
         let limiter = OwnerLimiter {
             owner: owner.to_string(),
@@ -298,6 +303,7 @@ impl OwnerInstances {
             responses: HashMap::new(),
             store_slots: Arc::new(tokio::sync::Semaphore::new(STORE_CALLS_IN_FLIGHT)),
             store_live: Arc::default(),
+            released_bodies: released_tx,
         };
         let state = GuestState { limiter, store: None, clock_ns: 0, rng: Rng::new(seed), stderr: Vec::new(), owner_io: Some(io) };
         let mut wstore = Store::new(&self.engine, state);
@@ -313,9 +319,10 @@ impl OwnerInstances {
             complete: instance.get_typed_func(&mut wstore, "owner_complete").map_err(sandbox_err)?,
             request: instance.get_typed_func(&mut wstore, "owner_request").map_err(sandbox_err)?,
             poll: instance.get_typed_func(&mut wstore, "owner_poll").map_err(sandbox_err)?,
+            release_body: instance.get_typed_func(&mut wstore, "owner_release_body").map_err(sandbox_err)?,
         };
         let (requests_tx, requests) = mpsc::channel(REQUEST_QUEUE);
-        tokio::spawn(drive(wstore, instance, exports, requests, events));
+        tokio::spawn(drive(wstore, instance, exports, requests, events, released));
         Ok(OwnerInstance { requests: requests_tx, memory })
     }
 }
@@ -358,9 +365,10 @@ async fn drive(
     exports: OwnerExports,
     requests: mpsc::Receiver<QueuedRequest>,
     events: mpsc::Receiver<StoreEvent>,
+    released: mpsc::UnboundedReceiver<u32>,
 ) {
     let live = store.data().owner_io.as_ref().expect("owner instance").store_live.clone();
-    if let Err(e) = drive_until_done(&mut store, &instance, &exports, requests, events).await {
+    if let Err(e) = drive_until_done(&mut store, &instance, &exports, requests, events, released).await {
         crate::warn!("owner instance stopped: {e}");
     }
     let _stopped = live.write().await;
@@ -373,6 +381,7 @@ async fn drive_until_done(
     exports: &OwnerExports,
     mut requests: mpsc::Receiver<QueuedRequest>,
     mut events: mpsc::Receiver<StoreEvent>,
+    mut released: mpsc::UnboundedReceiver<u32>,
 ) -> Result<()> {
     let memory = instance.get_memory(&mut *store, "memory").ok_or_else(|| Error::internal("owner instance memory"))?;
     let mut gets: HashMap<u32, GetBuffer> = HashMap::new();
@@ -382,13 +391,21 @@ async fn drive_until_done(
     loop {
         let mut ready_events = Vec::new();
         let mut ready_requests = Vec::new();
+        let mut ready_releases = Vec::new();
         tokio::select! {
+            Some(t) = released.recv() => ready_releases.push(t),
             Some(e) = events.recv() => ready_events.push(e),
             r = requests.recv(), if requests_open => match r {
                 Some(r) => ready_requests.push(r),
                 None => requests_open = false,
             },
             _ = tokio::time::sleep(TIMER_TICK), if live_tasks > 0 => {}
+        }
+        while let Ok(t) = released.try_recv() {
+            ready_releases.push(t);
+        }
+        for t in ready_releases {
+            exports.release_body.call_async(&mut *store, t).await.map_err(sandbox_err)?;
         }
         while let Ok(e) = events.try_recv() {
             ready_events.push(e);
@@ -454,6 +471,51 @@ mod tests {
         }
         b.extend_from_slice(value);
         b
+    }
+
+    /// Memory store whose streamed GETs yield frames of `FRAME` bytes, as a network client would.
+    struct FramedStore(crate::store::MemStore);
+
+    const FRAME: usize = 3;
+
+    impl crate::store::ObjectStore for FramedStore {
+        fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> crate::store::BoxFut<'a, crate::store::SResult<crate::store::GetResult>> {
+            self.0.get(key, opts)
+        }
+        fn get_stream<'a>(&'a self, key: &'a str, opts: GetOpts) -> crate::store::BoxFut<'a, crate::store::SResult<crate::store::StreamedGet>> {
+            Box::pin(async move {
+                let got = self.0.get(key, opts).await?;
+                let frames: Vec<_> = got.data.chunks(FRAME).map(|c| Ok(Bytes::copy_from_slice(c))).collect();
+                let len = got.data.len() as u64;
+                let body: crate::store::BodyStream = Box::pin(futures_util::stream::iter(frames));
+                Ok(crate::store::StreamedGet { etag: got.etag, size: got.size, last_modified_ms: got.last_modified_ms, len, body })
+            })
+        }
+        fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> crate::store::BoxFut<'a, crate::store::SResult<String>> {
+            self.0.put(key, data, mode)
+        }
+        fn delete<'a>(&'a self, key: &'a str) -> crate::store::BoxFut<'a, crate::store::SResult<()>> {
+            self.0.delete(key)
+        }
+        fn list<'a>(&'a self, prefix: &'a str, start_after: Option<&'a str>, limit: usize) -> crate::store::BoxFut<'a, crate::store::SResult<crate::store::ListPage>> {
+            self.0.list(prefix, start_after, limit)
+        }
+    }
+
+    #[test]
+    fn owner_instance_reads_framed_gets_after_a_restart() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let instances = OwnerInstances::new(&super::super::tests::guest_wasm()).unwrap();
+            let store: DynStore = Arc::new(FramedStore(crate::store::MemStore::new(Box::new(host_now_ms))));
+            let first = instances.start("o1", store.clone(), 1).await.unwrap();
+            let put = first.call(kv_body(2, "d1", "k", b"a value longer than one frame")).await.unwrap();
+            assert_eq!(put.status, 200, "{}", String::from_utf8_lossy(&put.body));
+            drop(first);
+            let second = instances.start("o1", store, 2).await.unwrap();
+            let got = second.call(kv_body(1, "d1", "k", b"")).await.unwrap();
+            assert_eq!((got.status, &got.body[..]), (200, &b"a value longer than one frame"[..]), "{}", String::from_utf8_lossy(&got.body));
+        });
     }
 
     #[test]

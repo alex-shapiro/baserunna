@@ -8,7 +8,8 @@
 //!   driver takes that lock for writing before it drops the instance, so the
 //!   memory stays mapped while any body lives;
 //! - the guest keeps each PUT body alive and unchanged until the host
-//!   completes the PUT's ticket.
+//!   releases it. A body sends its ticket on `released` when the last copy
+//!   drops, which can be after the PUT ends: a store may keep the body.
 #![allow(unsafe_code)]
 
 use bytes::Bytes;
@@ -18,6 +19,14 @@ struct GuestBytes {
     ptr: *const u8,
     len: usize,
     _live: tokio::sync::OwnedRwLockReadGuard<()>,
+    ticket: u32,
+    released: tokio::sync::mpsc::UnboundedSender<u32>,
+}
+
+impl Drop for GuestBytes {
+    fn drop(&mut self) {
+        let _ = self.released.send(self.ticket);
+    }
 }
 
 // SAFETY: see the module comment; the bytes do not move, stay mapped, and do not change.
@@ -40,6 +49,8 @@ pub(super) fn in_place(
     ptr: u32,
     len: u32,
     live: tokio::sync::OwnedRwLockReadGuard<()>,
+    ticket: u32,
+    released: tokio::sync::mpsc::UnboundedSender<u32>,
 ) -> Option<Bytes> {
     let end = (ptr as usize).checked_add(len as usize)?;
     if end > size {
@@ -47,5 +58,5 @@ pub(super) fn in_place(
     }
     // SAFETY: `ptr..end` is inside the `size` bytes at `base`, checked above.
     let at = unsafe { base.add(ptr as usize) }.cast_const();
-    Some(Bytes::from_owner(GuestBytes { ptr: at, len: len as usize, _live: live }))
+    Some(Bytes::from_owner(GuestBytes { ptr: at, len: len as usize, _live: live, ticket, released }))
 }

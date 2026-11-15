@@ -58,10 +58,6 @@ struct TicketDone {
 struct TicketSlot {
     done: Option<TicketDone>,
     waker: Option<Waker>,
-    /// PUT body that the host reads in place; it stays alive and unchanged until completion.
-    body: Option<Bytes>,
-    /// The waiting task went away; the completion only releases `body`.
-    abandoned: bool,
 }
 
 /// Engine and executor of this owner instance.
@@ -72,6 +68,10 @@ struct OwnerRuntime {
 
 thread_local! {
     static TICKETS: RefCell<HashMap<u32, TicketSlot>> = RefCell::new(HashMap::new());
+    /// Tickets whose waiting task went away before completion.
+    static ABANDONED: RefCell<std::collections::HashSet<u32>> = RefCell::new(std::collections::HashSet::new());
+    /// PUT bodies that the host reads in place, by ticket, until it releases them.
+    static PUT_BODIES: RefCell<HashMap<u32, Bytes>> = RefCell::new(HashMap::new());
     static OWNER_RUNTIME: RefCell<Option<std::rc::Rc<OwnerRuntime>>> = const { RefCell::new(None) };
 }
 
@@ -100,9 +100,9 @@ impl Future for Ticket {
 }
 
 impl Ticket {
-    /// Keeps `body` alive until the host completes this ticket.
+    /// Keeps `body` alive and unchanged until the host releases it with `owner_release_body`.
     fn hold(self, body: Bytes) -> Self {
-        TICKETS.with(|t| t.borrow_mut().entry(self.0).or_default().body = Some(body));
+        PUT_BODIES.with(|b| b.borrow_mut().insert(self.0, body));
         self
     }
 }
@@ -111,11 +111,8 @@ impl Drop for Ticket {
     fn drop(&mut self) {
         TICKETS.with(|t| {
             let mut t = t.borrow_mut();
-            match t.get_mut(&self.0) {
-                Some(slot) if slot.body.is_some() && slot.done.is_none() => slot.abandoned = true,
-                _ => {
-                    t.remove(&self.0);
-                }
+            if !t.remove(&self.0).is_some_and(|slot| slot.done.is_some()) {
+                ABANDONED.with(|a| a.borrow_mut().insert(self.0));
             }
         });
     }
@@ -273,19 +270,23 @@ pub unsafe extern "C" fn owner_complete(ticket: u32, code: i64, ptr: *mut u8, le
         }
         (_, false) => unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) },
     };
+    if ABANDONED.with(|a| a.borrow_mut().remove(&ticket)) {
+        return;
+    }
     TICKETS.with(|t| {
         let mut t = t.borrow_mut();
-        if t.get(&ticket).is_some_and(|slot| slot.abandoned) {
-            t.remove(&ticket);
-            return;
-        }
         let slot = t.entry(ticket).or_default();
-        slot.body = None;
         slot.done = Some(TicketDone { code, data });
         if let Some(w) = slot.waker.take() {
             w.wake();
         }
     });
+}
+
+/// Releases the PUT body of `ticket`, which the host no longer reads.
+#[unsafe(no_mangle)]
+pub extern "C" fn owner_release_body(ticket: u32) {
+    PUT_BODIES.with(|b| b.borrow_mut().remove(&ticket));
 }
 
 /// Request kinds of the KV protocol that the owner instance answers.

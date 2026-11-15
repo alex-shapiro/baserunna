@@ -144,7 +144,9 @@ async fn run() -> Result<(), String> {
     let store = store_from_url(&store_url)?;
     if std::env::args().nth(1).as_deref() == Some("worker") {
         cfg.engine.local_tier = None;
-        return baserunna::worker::serve(store, cfg.engine).await.map_err(|e| format!("worker: {e}"));
+        let services = Services { transport: Arc::new(HttpTransport::new()), oidc: None, mailer: None };
+        let node = Node::new(cfg, Arc::new(Env::real()), store, services).map_err(|e| format!("worker: {e}"))?;
+        return baserunna::worker::serve(node).await.map_err(|e| format!("worker: {e}"));
     }
     let workers = match var("BASERUNNA_CGROUP_ROOT") {
         None => None,

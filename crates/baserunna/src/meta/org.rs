@@ -85,7 +85,7 @@ impl Role {
 }
 
 /// Effective permissions of a principal on a database.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Access {
     pub role: Role,
     pub read_only_key: bool,

@@ -56,6 +56,7 @@ impl Ttl {
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct WriteSet {
     /// `None` = delete.
+    #[serde(with = "puts_as_pairs")]
     pub puts: BTreeMap<Bytes, Option<Put>>,
     /// Range deletes, applied to committed state before `puts`.
     pub range_deletes: Vec<KeyRange>,
@@ -619,4 +620,38 @@ pub async fn validate(
         }
     }
     Ok(())
+}
+
+/// Serializes a write set's puts as a list of pairs, because JSON map keys must be strings.
+mod puts_as_pairs {
+    use super::Put;
+    use bytes::Bytes;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(puts: &BTreeMap<Bytes, Option<Put>>, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(puts.iter())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<Bytes, Option<Put>>, D::Error> {
+        Ok(Vec::<(Bytes, Option<Put>)>::deserialize(d)?.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod write_set_json_tests {
+    use super::*;
+
+    #[test]
+    fn a_write_set_round_trips_through_json() {
+        let mut w = WriteSet::default();
+        let put = Put { value: Value::Inline(Bytes::from_static(b"v")), ttl: None };
+        w.puts.insert(Bytes::from_static(b"k\xff"), Some(put));
+        w.puts.insert(Bytes::from_static(b"gone"), None);
+        w.range_deletes.push(KeyRange::prefix(b"p"));
+        let json = serde_json::to_vec(&w).unwrap();
+        let back: WriteSet = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.puts, w.puts);
+        assert_eq!(back.range_deletes, w.range_deletes);
+    }
 }

@@ -9,7 +9,7 @@
 //! in process without kernel limits.
 
 use crate::engine::events::{Bind, BindSlot, PartRef};
-use crate::engine::{BlobRef, EngineConfig, Shared};
+use crate::engine::{BlobRef, Shared};
 use crate::error::{Error, Result};
 use crate::events::schema::EventSchema;
 use bytes::Bytes;
@@ -88,6 +88,17 @@ enum Job {
         table: String,
         query: serde_json::Value,
     },
+    /// Serves a database request on the worker's node. The payload is the request body, and the
+    /// result's payload is the response body.
+    Http {
+        method: String,
+        uri: String,
+        headers: Vec<(String, Vec<u8>)>,
+        principal: crate::node::Principal,
+        rec: crate::meta::DbRecord,
+        access: crate::meta::Access,
+        deadline_ms: u64,
+    },
     BulkInsert {
         db: String,
         schema: EventSchema,
@@ -111,6 +122,11 @@ enum JobResult {
     Staged {
         body_key: Option<String>,
         error: Option<serde_json::Value>,
+    },
+    /// The response status and headers of an [`Job::Http`]; the response body is the payload.
+    Http {
+        status: u16,
+        headers: Vec<(String, Vec<u8>)>,
     },
     /// The job's error as the JSON body of an HTTP error response.
     Failed(serde_json::Value),
@@ -144,6 +160,68 @@ pub type WorkerCommitter = Box<
         + Send
         + Sync,
 >;
+
+/// Where the node runs a database request.
+pub enum Placement {
+    /// In the node process: the request is on the light list.
+    Node(axum::extract::Request),
+    /// In the owner's worker: every request that is not on the light list.
+    Worker(axum::extract::Request),
+}
+
+/// The largest one-shot transaction body that the node process runs itself.
+const LIGHT_TXN_BODY_MAX: u64 = 64 * 1024;
+
+/// The most ops in a one-shot transaction that the node process runs itself.
+const LIGHT_TXN_OPS_MAX: usize = 16;
+
+/// Decides where database request `req` runs. The node process keeps only requests whose cost
+/// has a fixed bound; every other request, including routes that this list does not name, runs
+/// in the owner's worker.
+///
+/// The light list:
+/// - `GET` and `HEAD` of one KV key (a blob value streams one chunk at a time);
+/// - `PUT` and `DELETE` of one KV key, and blob staging (the body streams into chunks);
+/// - a one-shot transaction with a body of at most 64 KiB and at most 16 `get`, `put`, or
+///   `delete` ops.
+pub async fn light_request(node: &crate::node::Node, req: axum::extract::Request) -> Result<Placement> {
+    use http::Method;
+    let path = req.uri().path();
+    let Some(rest) = path.strip_prefix("/v1/dbs/") else { return Ok(Placement::Worker(req)) };
+    let (_, route) = rest.split_once('/').unwrap_or((rest, ""));
+    let one_key = route.strip_prefix("kv/").is_some_and(|k| !k.is_empty());
+    let light = match (req.method().clone(), route) {
+        (Method::GET | Method::HEAD | Method::PUT | Method::DELETE, _) if one_key => true,
+        (Method::POST, "blobs") => true,
+        (Method::POST, "txn") => return light_txn(node, req).await,
+        _ => false,
+    };
+    Ok(if light { Placement::Node(req) } else { Placement::Worker(req) })
+}
+
+/// Places a one-shot transaction: the node reads its body only if the body is at most
+/// [`LIGHT_TXN_BODY_MAX`] long.
+async fn light_txn(node: &crate::node::Node, req: axum::extract::Request) -> Result<Placement> {
+    let _ = node;
+    let len = req.headers().get(http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+    if !len.is_some_and(|l| l <= LIGHT_TXN_BODY_MAX) {
+        return Ok(Placement::Worker(req));
+    }
+    let (parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, LIGHT_TXN_BODY_MAX as usize)
+        .await
+        .map_err(|e| Error::invalid(format!("cannot read the request body: {e}")))?;
+    let light = serde_json::from_slice::<baserunna_api::TxnRequest>(&bytes).is_ok_and(|t| {
+        t.ops.len() <= LIGHT_TXN_OPS_MAX
+            && crate::ops::parse_ops(t.ops).is_ok_and(|ops| {
+                ops.iter().all(|o| {
+                    matches!(o, crate::ops::Op::Get { .. } | crate::ops::Op::Put { .. } | crate::ops::Op::Delete { .. })
+                })
+            })
+    });
+    let req = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
+    Ok(if light { Placement::Node(req) } else { Placement::Worker(req) })
+}
 
 /// Reads the `owner_id` of a database ID, or `None` if the database does not exist.
 pub type OwnerResolver = Box<
@@ -336,6 +414,41 @@ impl WorkerPool {
         drop(version);
         match self.run(owner, job, manifest, deadline).await? {
             (JobResult::Queried, body) => Ok(body),
+            (JobResult::Failed(e), _) => Err(crate::api::error_from_json(500, &e)),
+            _ => Err(Error::internal("the worker returned a result of another job")),
+        }
+    }
+
+    /// Serves database request `req` with context `ctx` on the worker of the database's owner.
+    pub async fn http(&self, ctx: crate::api::DbCtx, req: axum::extract::Request) -> Result<axum::response::Response> {
+        let (parts, body) = req.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .map_err(|e| Error::invalid(format!("cannot read the request body: {e}")))?;
+        let left = ctx.deadline.instant().saturating_duration_since(tokio::time::Instant::now());
+        let headers =
+            parts.headers.iter().map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec())).collect::<Vec<_>>();
+        let job = Job::Http {
+            method: parts.method.to_string(),
+            uri: parts.uri.to_string(),
+            headers,
+            principal: ctx.principal,
+            rec: ctx.rec.clone(),
+            access: ctx.access,
+            deadline_ms: left.as_millis() as u64,
+        };
+        match self.run(&ctx.rec.owner_id, job, body, left + Duration::from_secs(1)).await? {
+            (JobResult::Http { status, headers }, body) => {
+                let mut resp = axum::response::Response::new(axum::body::Body::from(body));
+                *resp.status_mut() =
+                    http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+                for (k, v) in headers {
+                    if let (Ok(k), Ok(v)) = (http::HeaderName::try_from(k), http::HeaderValue::from_bytes(&v)) {
+                        resp.headers_mut().append(k, v);
+                    }
+                }
+                Ok(resp)
+            }
             (JobResult::Failed(e), _) => Err(crate::api::error_from_json(500, &e)),
             _ => Err(Error::internal("the worker returned a result of another job")),
         }
@@ -643,8 +756,9 @@ fn oom_kills(cgroup: &std::path::Path) -> u64 {
 }
 
 /// Runs the jobs that the node sends on stdin and writes each result to stdout (the `baserunna worker` command).
-pub async fn serve(store: crate::store::DynStore, cfg: EngineConfig) -> std::io::Result<()> {
-    let engine = crate::engine::Engine::new(store, Arc::new(crate::env::Env::real()), cfg, "worker".into());
+pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
+    let engine = node.engine.clone();
+    let router = crate::api::db_routes().with_state(node.clone());
     let (results, mut to_write) = tokio::sync::mpsc::unbounded_channel::<(u64, Bytes, Bytes)>();
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
@@ -662,11 +776,15 @@ pub async fn serve(store: crate::store::DynStore, cfg: EngineConfig) -> std::io:
             let (done, committed) = tokio::sync::oneshot::channel();
             calls.lock().insert(call_id, done);
             let header = serde_json::to_vec(&FromWorker::Commit { db, request: Box::new(request) });
-            let sent = header.map(|h| results.send((call_id, h.into(), Bytes::new())).is_ok());
+            let sent =
+                header.map_err(|e| Error::internal(format!("cannot encode the commit: {e}"))).and_then(
+                    |h| match results.send((call_id, h.into(), Bytes::new())) {
+                        Ok(()) => Ok(()),
+                        Err(_) => Err(Error::internal("the worker cannot reach the node")),
+                    },
+                );
             Box::pin(async move {
-                if !sent.unwrap_or(false) {
-                    return Err(Error::internal("the worker cannot reach the node"));
-                }
+                sent?;
                 committed.await.map_err(|_| Error::internal("the node dropped the commit"))?
             })
         });
@@ -684,10 +802,17 @@ pub async fn serve(store: crate::store::DynStore, cfg: EngineConfig) -> std::io:
             Ok(ToWorker::Job(job)) => Ok(*job),
             Err(e) => Err(e),
         };
-        let engine = engine.clone();
+        let (engine, node, router) = (engine.clone(), node.clone(), router.clone());
         let results = results.clone();
         tokio::spawn(async move {
             let (result, out) = match job {
+                Ok(Job::Http { method, uri, headers, principal, rec, access, deadline_ms }) => {
+                    let ctx = HttpJob { method, uri, headers, principal, rec, access, deadline_ms };
+                    match run_http(&node, router, ctx, payload).await {
+                        Ok((status, headers, body)) => (JobResult::Http { status, headers }, body),
+                        Err(e) => (JobResult::Failed(json!({ "error": crate::api::error_json(&e) })), Bytes::new()),
+                    }
+                }
                 Ok(job) => run_job(&engine, job, payload).await,
                 Err(e) => (
                     JobResult::Failed(json!({ "error": crate::api::error_json(&Error::internal(e.to_string())) })),
@@ -779,6 +904,7 @@ async fn run_job(engine: &Arc<crate::engine::Engine>, job: Job, payload: Bytes) 
                 Err(e) => failed(e),
             }
         }
+        Job::Http { .. } => failed(Error::internal("the worker serves requests outside run_job")),
         Job::Merge { db, schema, inputs } => {
             let mut refs = Vec::with_capacity(inputs.len());
             for (k, v) in &inputs {
@@ -865,6 +991,49 @@ async fn run_read_txn(
         appends: None,
     };
     Ok(body.encode())
+}
+
+/// The fields of a [`Job::Http`].
+struct HttpJob {
+    method: String,
+    uri: String,
+    headers: Vec<(String, Vec<u8>)>,
+    principal: crate::node::Principal,
+    rec: crate::meta::DbRecord,
+    access: crate::meta::Access,
+    deadline_ms: u64,
+}
+
+/// Serves one database request on the worker's node with the database routes of the node process.
+async fn run_http(
+    node: &Arc<crate::node::Node>,
+    router: axum::Router,
+    job: HttpJob,
+    body: Bytes,
+) -> Result<(u16, Vec<(String, Vec<u8>)>, Bytes)> {
+    use tower::ServiceExt;
+    let db = node.open_db(&job.rec).await?;
+    let deadline = crate::node::Deadline::new(tokio::time::Instant::now() + Duration::from_millis(job.deadline_ms));
+    let ctx = crate::api::DbCtx { principal: job.principal.clone(), rec: job.rec, access: job.access, db, deadline };
+    let mut req = http::Request::builder()
+        .method(job.method.as_str())
+        .uri(job.uri)
+        .body(axum::body::Body::from(body))
+        .map_err(|e| Error::internal(format!("worker request: {e}")))?;
+    for (k, v) in job.headers {
+        if let (Ok(k), Ok(v)) = (http::HeaderName::try_from(k), http::HeaderValue::from_bytes(&v)) {
+            req.headers_mut().append(k, v);
+        }
+    }
+    req.extensions_mut().insert(job.principal);
+    req.extensions_mut().insert(ctx);
+    let resp = router.oneshot(req).await.map_err(|e| Error::internal(format!("worker router: {e}")))?;
+    let (parts, body) = resp.into_parts();
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map_err(|e| Error::internal(format!("worker response body: {e}")))?;
+    let headers = parts.headers.iter().map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec())).collect();
+    Ok((parts.status.as_u16(), headers, body))
 }
 
 /// Runs table query `query` on table `table` at `snapshot`.

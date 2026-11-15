@@ -460,6 +460,11 @@ fn is_long_poll(req: &Request) -> bool {
     !long_poll_wait(req).is_zero()
 }
 
+/// Returns the database routes, which a worker serves for requests that the node sends it.
+pub(crate) fn db_routes() -> Router<Arc<Node>> {
+    data::routes().merge(streams::routes()).merge(events::routes())
+}
+
 /// Authenticates database-scoped requests and routes them to the target node or handles them locally.
 async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
     let arrived = tokio::time::Instant::now();
@@ -595,9 +600,23 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 node.open_db(&rec).await?
             }
         };
-        req.extensions_mut().insert(principal.clone());
-        req.extensions_mut().insert(DbCtx { principal, rec: rec.clone(), access, db, deadline });
-        let resp = next.run(req).await;
+        let ctx = DbCtx { principal, rec: rec.clone(), access, db, deadline };
+        let resp = match node.engine.shared.workers.get() {
+            Some(w) => match crate::worker::light_request(&node, req).await? {
+                crate::worker::Placement::Node(r) => {
+                    req = r;
+                    req.extensions_mut().insert(ctx.principal.clone());
+                    req.extensions_mut().insert(ctx);
+                    next.run(req).await
+                }
+                crate::worker::Placement::Worker(r) => w.http(ctx, r).await?,
+            },
+            None => {
+                req.extensions_mut().insert(ctx.principal.clone());
+                req.extensions_mut().insert(ctx);
+                next.run(req).await
+            }
+        };
         if resp.status() == StatusCode::NOT_FOUND {
             node.forget_db_name(&rec.owner_id, &rec.name);
         }
@@ -1163,10 +1182,7 @@ async fn not_found() -> Error {
 
 /// Builds the HTTP router for the node.
 pub fn router(node: Arc<Node>) -> Router {
-    let db_routes = data::routes()
-        .merge(streams::routes())
-        .merge(events::routes())
-        .route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
+    let db_routes = db_routes().route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
     let internal = Router::new()
         .route("/internal/v1/meta", post(account::internal_meta))
         .route("/internal/v1/notice", post(commit_notice))

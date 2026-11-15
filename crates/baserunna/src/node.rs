@@ -124,7 +124,7 @@ impl Default for NodeConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Credential {
     Session { token_hash: String },
     ApiKey { id: String, db_id: Option<String>, read_only: bool, rate_limit: Option<u32> },
@@ -141,7 +141,7 @@ pub enum Meter {
     Exempt,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Principal {
     pub user: User,
     pub cred: Credential,

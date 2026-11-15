@@ -148,6 +148,9 @@ async fn run() -> Result<(), String> {
     }
     let workers = match var("BASERUNNA_CGROUP_ROOT") {
         None => None,
+        Some(_) if !store_url.starts_with("s3://") => {
+            return Err("BASERUNNA_CGROUP_ROOT needs an s3:// store, which workers open directly".into());
+        }
         Some(root) => {
             let pool = baserunna::worker::PoolConfig {
                 cgroup_root: root.into(),

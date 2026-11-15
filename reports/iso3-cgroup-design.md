@@ -108,28 +108,34 @@ Each line: what it does | allowed item | code path (today, or planned).
 21. Health endpoint: fixed text | 4 | `api/mod.rs` `healthz` (today).
 22. Drain and shutdown: stop new requests, send `Stop` to each worker, wait for each `populated 0` | 4 | `main.rs` shutdown, `node.rs` `shutdown` (today; planned: workers release their own leases).
 
-**Status after round 7 (commit b2a4f69).** The node process opens no
-tenant database. With workers, it sends each metadata command and each
-reaper pass to the system worker (cgroup `<root>/system`), which holds the
-`SYS_DB` lease and its upkeep. These parts of the requirement are unmet:
+**Status after round 8 (final).** With workers, the node process starts
+on `TenantDenyingStore` (code, `store/guard.rs`, `main.rs`). It fails
+every get, put, delete, and list of a tenant database's objects, and of
+the prefixes that cover all databases. Every read path (`Txn`, `Version`,
+segments, blobs, event parts, streams) and every background job ends in
+the store, so the guard covers all of them. It does not add checks in
+each constructor. `tests/boundary_routes.rs` has the two route tests;
+see section 3. These parts of the requirement are unmet:
 
 1. Account, org, and token routes, the database list and create, and
    the console pages outside `/console/dbs/{db}` run in the node process.
-   The anonymous, user, and org workers are not built.
+   The anonymous, user, and org workers are not built. The route test
+   `routes_go_through_the_boundary` shows `POST /v1/auth/signup` and
+   `POST /v1/dbs` at run time.
 2. The node process bootstraps `SYS_DB` and holds its lease at start,
    before the pool exists (code, `node.rs` `Node::start`).
 3. Owner workers run their metadata commands on `SYS_DB` themselves,
    under the node's ID, instead of through the system worker.
-4. The node process parses `/internal/v1/meta` bodies from peers before
-   it sends the command to the system worker, and parses
+4. The node process parses `/internal/v1/meta` bodies from peers and
    `/internal/v1/notice` bodies. Notices do not reach workers.
-5. The reaper's purge runs in the system worker, not in the owner's
-   worker.
+5. The reaper's purge runs in the system worker, not the owner's worker.
 6. Forward dedup slots keep whole responses in the node process (code,
    `api/mod.rs` `dedup_forwarded`). Peer routing uses rendezvous only.
-7. No guard and no route tests.
+7. The route tests cover a tour of 7 routes, not every route of the
+   router; no route table exists.
 8. No connection limits and no explicit hyper limits.
 9. The system worker has the owner memory limit, not its own limit.
+10. Workers have no guard against another owner's objects.
 
 **Cgroup layout (changed in round 5).** Each worker runs in its owner's
 cgroup itself, `<root>/owner-<id>`, one level below the node's cgroup.

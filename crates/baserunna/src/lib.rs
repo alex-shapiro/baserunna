@@ -14,6 +14,8 @@ pub mod catalog;
 pub mod cluster;
 #[cfg(feature = "server")]
 pub mod console;
+#[cfg(feature = "server")]
+pub mod cpu_slots;
 pub mod engine;
 pub mod env;
 pub mod error;

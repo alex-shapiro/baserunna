@@ -64,6 +64,7 @@ pub struct Sandbox {
     idle_sweeper_running: Arc<std::sync::atomic::AtomicBool>,
     owner_memory_bound: usize,
     last_instance_peak: Arc<std::sync::atomic::AtomicUsize>,
+    cpu: Arc<crate::cpu_slots::CpuSlots>,
 }
 
 /// Charges an instance's linear memory to its owner's bound.
@@ -177,6 +178,11 @@ impl Drop for OwnerCharge {
             }
         }
     }
+}
+
+/// CPU slots for guest work: one per core, less one core for host request work.
+fn guest_cpu_slots() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1))
 }
 
 /// Fuel that one guest call may burn before the runtime stops it.
@@ -369,6 +375,7 @@ impl Sandbox {
             owner_memory: Arc::default(),
             idle: Arc::default(),
             idle_sweeper_running: Arc::default(),
+            cpu: crate::cpu_slots::CpuSlots::new(guest_cpu_slots()),
             owner_memory_bound,
             last_instance_peak: Arc::default(),
         })
@@ -504,7 +511,8 @@ impl Sandbox {
             at += piece.len();
         }
         let free = instance.get_typed_func::<(u32, u32), ()>(&mut store, "guest_free").map_err(export_err)?;
-        let status = work.call_async(&mut store, (ptr, len)).await.map_err(|e| guest_error(&store, e))?;
+        let status = self.cpu.run(owner, work.call_async(&mut store, (ptr, len))).await;
+        let status = status.map_err(|e| guest_error(&store, e))?;
         free.call_async(&mut store, (ptr, len)).await.map_err(|e| guest_error(&store, e))?;
         let out_at = out_ptr.call_async(&mut store, ()).await.map_err(|e| guest_error(&store, e))? as usize;
         let out_len = out_len.call_async(&mut store, ()).await.map_err(|e| guest_error(&store, e))? as usize;

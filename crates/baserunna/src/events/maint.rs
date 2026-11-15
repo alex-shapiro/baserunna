@@ -880,7 +880,10 @@ pub async fn merge(db: &Arc<Db>, s: &EventSchema, inputs: &[PartRef]) -> Result<
     let shared = db.shared().clone();
     let started = shared.env.now_ms();
     let stats = ReadStats::default();
-    let out = merge_parts(&shared, &db.id, s, inputs, &stats).await?;
+    let out = match shared.sandbox.get() {
+        Some(sandbox) => sandbox.merge_parts(&db.id, s, inputs).await?,
+        None => merge_parts(&shared, &db.id, s, inputs, &stats).await?,
+    };
     let cfg = &shared.cfg;
     let max_ms = cfg.event_merge_max_ms.min(cfg.blob_stage_ttl_ms.saturating_sub(4 * cfg.clock_sync_max_error_ms));
     if shared.env.now_ms().saturating_sub(started) > max_ms {

@@ -3832,4 +3832,44 @@ mod sandbox_merge {
             assert_eq!(sandbox.owner_memory_used("owner"), 0);
         });
     }
+
+    fn node_sandbox(eng: &Arc<Engine>, owner: Option<&'static str>) -> Arc<crate::sandbox::NodeSandbox> {
+        let sandbox = Sandbox::new(&crate::sandbox::tests::guest_wasm(), crate::sandbox::OWNER_MEMORY_BOUND).unwrap();
+        let owner_of: crate::sandbox::OwnerResolver =
+            Arc::new(move |_db: String| Box::pin(async move { Ok(owner.map(str::to_string)) }));
+        Arc::new(crate::sandbox::NodeSandbox { sandbox, shared: eng.shared.clone(), owner_of })
+    }
+
+    #[test]
+    fn maintenance_merge_runs_in_sandbox() {
+        rt().block_on(async {
+            let (eng, _mem, input, inputs) = sealed_parts(4, 200).await;
+            let runner = node_sandbox(&eng, Some("owner-1"));
+            eng.set_sandbox(runner.clone());
+            let db = eng.db("db");
+            maint::merge(&db, &input.schema, &inputs).await.unwrap();
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            let after = refs(&mut t, input.schema.id).await.unwrap();
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].rows, 800);
+            assert!(runner.sandbox.last_instance_peak() > 0, "the merge ran in an instance");
+            let q = json!({"from": T0, "to": T0 + DAY, "aggregates": {"n": {"fn": "count"}}});
+            assert_eq!(query(&db, &q).await.unwrap().rows, vec![vec![json!(800)]]);
+        });
+    }
+
+    #[test]
+    fn maintenance_merge_fails_without_owner() {
+        rt().block_on(async {
+            let (eng, _mem, input, inputs) = sealed_parts(2, 50).await;
+            let runner = node_sandbox(&eng, None);
+            eng.set_sandbox(runner.clone());
+            let db = eng.db("db");
+            let err = maint::merge(&db, &input.schema, &inputs).await.unwrap_err();
+            assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+            assert_eq!(runner.sandbox.last_instance_peak(), 0, "no instance started");
+            let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
+            assert_eq!(refs(&mut t, input.schema.id).await.unwrap().len(), inputs.len());
+        });
+    }
 }

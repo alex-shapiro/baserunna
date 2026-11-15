@@ -5,6 +5,9 @@
 
 use super::schema::EventSchema;
 use crate::engine::EngineConfig;
+use crate::engine::events::PartRef;
+use crate::error::Result;
+use crate::store::BoxFut;
 use serde::{Deserialize, Serialize};
 
 /// Engine settings that event part code reads.
@@ -80,4 +83,15 @@ pub struct MergeInput {
     pub config: EventConfig,
     pub seed: u64,
     pub now_ms: u64,
+}
+
+/// Runs event work in the node's WebAssembly sandbox, charged to the database owner.
+pub trait SandboxRunner: Send + Sync {
+    /// Runs `maint::merge_parts` over `inputs` in the sandbox.
+    fn merge_parts<'a>(
+        &'a self,
+        db: &'a str,
+        schema: &'a EventSchema,
+        inputs: &'a [PartRef],
+    ) -> BoxFut<'a, Result<Option<PartRef>>>;
 }

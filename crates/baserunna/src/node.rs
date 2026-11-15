@@ -387,6 +387,21 @@ impl Node {
                 maintainer.schedule(db, tables);
             }
         }));
+        if let Ok(path) = std::env::var("BASERUNNA_GUEST_WASM") {
+            let wasm = std::fs::read(&path).map_err(|e| Error::internal(format!("guest module {path}: {e}")))?;
+            let sandbox = crate::sandbox::Sandbox::new(&wasm, crate::sandbox::OWNER_MEMORY_BOUND)?;
+            let weak = Arc::downgrade(&node);
+            let owner_of: crate::sandbox::OwnerResolver = Arc::new(move |db: String| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    let n = weak.upgrade().ok_or_else(|| Error::unavailable("node stopped"))?;
+                    let mut t = n.sys_read_at(false).await?;
+                    Ok(meta::get_db(&mut t, &db).await?.map(|r| r.owner_id))
+                })
+            });
+            let shared = node.engine.shared.clone();
+            node.engine.set_sandbox(Arc::new(crate::sandbox::NodeSandbox { sandbox, shared, owner_of }));
+        }
         let weak = Arc::downgrade(&node);
         node.engine.set_commit_hook(Box::new(move |db: &str, version: u64| {
             if let Some(n) = weak.upgrade() {

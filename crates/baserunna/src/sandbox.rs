@@ -9,7 +9,10 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::engine::events::PartRef;
-use crate::events::sandboxed::MergeInput;
+use crate::engine::Shared;
+use crate::events::sandboxed::{EventConfig, MergeInput, SandboxRunner};
+use crate::events::schema::EventSchema;
+use crate::store::BoxFut;
 use crate::store::{DynStore, GetOpts, PutMode, StoreError};
 use crate::util::rng::Rng;
 use bytes::Bytes;
@@ -384,6 +387,48 @@ fn guest_error(store: &Store<GuestState>, e: wasmtime::Error) -> Error {
             "sandbox trap: {e}; guest stderr: {}",
             String::from_utf8_lossy(&store.data().stderr)
         )),
+    }
+}
+
+/// Resolves the `owner_id` of a database from the system database.
+pub type OwnerResolver = Arc<dyn Fn(String) -> BoxFut<'static, Result<Option<String>>> + Send + Sync>;
+
+/// Sandbox runner of one node: it charges each job to the database owner.
+pub struct NodeSandbox {
+    pub sandbox: Sandbox,
+    pub shared: Arc<Shared>,
+    pub owner_of: OwnerResolver,
+}
+
+impl NodeSandbox {
+    async fn owner(&self, db: &str) -> Result<String> {
+        (self.owner_of)(db.to_string())
+            .await?
+            .ok_or_else(|| Error::not_found(format!("database {db} has no owner record")))
+    }
+}
+
+impl SandboxRunner for NodeSandbox {
+    fn merge_parts<'a>(
+        &'a self,
+        db: &'a str,
+        schema: &'a EventSchema,
+        inputs: &'a [PartRef],
+    ) -> BoxFut<'a, Result<Option<PartRef>>> {
+        Box::pin(async move {
+            let owner = self.owner(db).await?;
+            let mut seed = [0u8; 8];
+            self.shared.env.fill_random(&mut seed);
+            let input = MergeInput {
+                db: db.to_string(),
+                schema: schema.clone(),
+                inputs: inputs.iter().map(|r| (r.key().to_vec(), r.encode().to_vec())).collect(),
+                config: EventConfig::of(&self.shared.cfg),
+                seed: u64::from_le_bytes(seed),
+                now_ms: self.shared.env.now_ms(),
+            };
+            self.sandbox.merge_parts(&owner, self.shared.store.clone(), &input).await
+        })
     }
 }
 

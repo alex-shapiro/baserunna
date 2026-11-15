@@ -61,6 +61,8 @@ pub struct Shared {
     /// Called with a database id and version after this node commits a new data version.
     commit_hook: std::sync::OnceLock<CommitHook>,
     event_hook: std::sync::OnceLock<EventHook>,
+    /// Runs heavy event work in the WebAssembly sandbox when the node sets it.
+    pub sandbox: std::sync::OnceLock<Arc<dyn crate::events::sandboxed::SandboxRunner>>,
 }
 
 /// Callback invoked on the lease holder after a commit modifies event table rows or parts (SPEC §5.13).
@@ -300,6 +302,7 @@ impl Engine {
             waits_ended: false.into(),
             commit_hook: std::sync::OnceLock::new(),
             event_hook: std::sync::OnceLock::new(),
+            sandbox: std::sync::OnceLock::new(),
         });
         let engine = Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) });
         let _ = engine.shared.engine.set(Arc::downgrade(&engine));
@@ -334,6 +337,11 @@ impl Engine {
 
     pub fn set_event_hook(&self, h: EventHook) {
         let _ = self.shared.event_hook.set(h);
+    }
+
+    /// Sets the sandbox that runs heavy event work.
+    pub fn set_sandbox(&self, s: Arc<dyn crate::events::sandboxed::SandboxRunner>) {
+        let _ = self.shared.sandbox.set(s);
     }
 
     pub fn open_count(&self) -> usize {

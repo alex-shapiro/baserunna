@@ -61,7 +61,11 @@ impl Workload for BlobDownloads {
                                 r.error = Some(format!("short download: {n} of {BLOB_BYTES} bytes"));
                                 short += 1;
                             }
+                            let dropped = r.status.is_none();
                             records.push(r);
+                            if dropped {
+                                break;
+                            }
                         }
                         (records, short)
                     })

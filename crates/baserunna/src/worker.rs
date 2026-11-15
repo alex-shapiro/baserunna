@@ -406,8 +406,8 @@ impl WorkerPool {
             Ok(Err(_)) => return Err(Error::internal("the owner's worker dropped the request")),
             Err(_) => {
                 worker.streams.remove(id);
-                // A request cannot be stopped inside the worker, so the deadline ends all of the owner's work.
-                let _ = std::fs::write(worker.leaf.join("cgroup.kill"), "1");
+                let reset = Bytes::from_static(b"the request deadline passed");
+                let _ = worker.frames.send(boundary::Frame::new(boundary::FrameKind::Reset, id, reset));
                 return Err(Error::TooLarge(format!("the work ran longer than {} ms", left.as_millis())));
             }
         };
@@ -747,6 +747,7 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
     let (results, to_write) = tokio::sync::mpsc::unbounded_channel::<boundary::Frame>();
     let writer = tokio::spawn(boundary::write_frames(tokio::io::stdout(), to_write));
     let streams = Arc::new(boundary::Streams::default());
+    let stream_tasks: Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>> = Default::default();
     let mut stdin = tokio::io::stdin();
     while let Ok(frame) = boundary::read_frame(&mut stdin).await {
         match frame.kind {
@@ -756,7 +757,20 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
                 let (inbox, body) = boundary::credited_body(frame.id, results.clone());
                 let credits = streams.register(frame.id, Some(inbox), None);
                 let (node, router, streams, out) = (node.clone(), router.clone(), streams.clone(), results.clone());
-                tokio::spawn(serve_stream(node, router, streams, out, frame, body, credits));
+                let (id, tasks) = (frame.id, stream_tasks.clone());
+                let task = tokio::spawn(async move {
+                    serve_stream(node, router, streams, out, frame, body, credits).await;
+                    tasks.lock().remove(&id);
+                });
+                stream_tasks.lock().insert(id, task.abort_handle());
+                continue;
+            }
+            boundary::FrameKind::Reset => {
+                // The node gave up on the stream, so its work stops at its next await.
+                if let Some(task) = stream_tasks.lock().remove(&frame.id) {
+                    task.abort();
+                }
+                streams.deliver(frame);
                 continue;
             }
             _ => {

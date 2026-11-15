@@ -406,6 +406,13 @@ The requirement comes first. Workload tuning comes last.
    what fails without workload-specific code.
 7. **Round 8.** Second run of each cell, cost measurements, final report.
 
+The guest build already holds `engine`, `events`, `ops`, `queries`,
+`stream`, `table`, and `txns`. It does not hold `api`, `console`, `meta`,
+`node`, `auth`, or `cluster`, which need the `server` feature (code,
+`crates/baserunna/src/lib.rs:7`–`:45`). So rounds 3 and 4 must build the
+database handlers with axum but without hyper or tokio networking, and
+`meta` for the system instance.
+
 This plan does not fit with margin. Rounds 2 to 4 move almost all of the
 node into the guest, and each step needs the axum handlers, `OpenTxns`,
 `Queries`, and the event code to build for `wasm32-wasip1`. If the plan

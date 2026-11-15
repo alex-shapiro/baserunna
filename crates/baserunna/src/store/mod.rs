@@ -1,12 +1,14 @@
 //! Object storage abstraction.
 
 pub mod conformance;
+#[cfg(feature = "server")]
 mod fs;
 mod mem;
 
 #[cfg(feature = "cloud")]
 mod cloud;
 
+#[cfg(feature = "server")]
 pub use fs::FsStore;
 pub use mem::MemStore;
 

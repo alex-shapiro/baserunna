@@ -335,6 +335,7 @@ pub struct OpCtx<'a> {
     /// Resource limits for `query_events` operations.
     pub query_limits: crate::events::exec::Limits,
     /// Node that admits `query_events` operations, or `None` to skip admission.
+    #[cfg(feature = "server")]
     pub node: Option<&'a crate::node::Node>,
     /// User ID of the caller.
     pub user_id: &'a str,
@@ -688,10 +689,13 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
         }
         Op::QueryEvents(EventsQuery { table, query }) => {
             let s = crate::events::get_schema(txn, table).await?;
+            #[cfg(feature = "server")]
             let mut grant = match ctx.node {
                 Some(node) => node.start_query(ctx.user_id).await?,
                 None => crate::queries::QueryGrant::unlimited(),
             };
+            #[cfg(not(feature = "server"))]
+            let mut grant = crate::queries::QueryGrant::unlimited();
             let out =
                 crate::events::exec::run(ctx.db.shared(), &ctx.db.id, txn, &s, query, &ctx.query_limits, &mut grant)
                     .await?;

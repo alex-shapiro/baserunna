@@ -26,6 +26,7 @@ pub async fn race<A: Future + Unpin, B: Future + Unpin>(a: &mut A, b: &mut B) ->
     .await
 }
 
+#[cfg(feature = "server")]
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let d = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data);
     let mut out = [0u8; 32];
@@ -33,14 +34,17 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+#[cfg(feature = "server")]
 pub struct Sha256(aws_lc_rs::digest::Context);
 
+#[cfg(feature = "server")]
 impl Default for Sha256 {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "server")]
 impl Sha256 {
     pub fn new() -> Sha256 {
         Sha256(aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256))
@@ -56,6 +60,7 @@ impl Sha256 {
     }
 }
 
+#[cfg(feature = "server")]
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let k = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, key);
     let tag = aws_lc_rs::hmac::sign(&k, data);

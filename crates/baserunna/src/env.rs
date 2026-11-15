@@ -148,7 +148,10 @@ impl Env {
     pub fn fill_random(&self, out: &mut [u8]) {
         match &self.rng {
             Some(r) => r.lock().fill(out),
+            #[cfg(feature = "server")]
             None => os_random(out),
+            #[cfg(not(feature = "server"))]
+            None => unreachable!("the guest environment is always seeded"),
         }
     }
 
@@ -240,6 +243,7 @@ pub async fn sleep_ms(ms: u64) {
 }
 
 /// Fills `out` with random bytes from the OS CSPRNG, using a thread-local buffer for small reads.
+#[cfg(feature = "server")]
 fn os_random(out: &mut [u8]) {
     const POOL: usize = 512;
     thread_local! {

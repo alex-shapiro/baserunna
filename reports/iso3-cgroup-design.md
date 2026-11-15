@@ -108,6 +108,29 @@ Each line: what it does | allowed item | code path (today, or planned).
 21. Health endpoint: fixed text | 4 | `api/mod.rs` `healthz` (today).
 22. Drain and shutdown: stop new requests, send `Stop` to each worker, wait for each `populated 0` | 4 | `main.rs` shutdown, `node.rs` `shutdown` (today; planned: workers release their own leases).
 
+**Status after round 5 (commit 882af90).** The node process no longer
+opens a tenant database on the request path: `db_routing` sends each
+database request to the owner's worker without a manifest read, and
+workers commit and bind their own databases. These node-process uses of
+a tenant `Db` remain, and each one breaks the requirement until it moves:
+
+- user deletion marks each database deleted (code, `node.rs:1299`);
+- database deletion runs `mark_deleted` in the handler (code,
+  `api/data.rs:189`); this handler now runs in the worker, but the
+  console's delete path still calls it from the node process (inferred);
+- the retry of a create after an interrupted deletion (code,
+  `api/data.rs:150`);
+- the reaper's purge (code, `node.rs:1625`);
+- `POST /internal/v1/events/bind` (code, `api/events.rs:497`);
+- console database pages render tenant data in the node process, and
+  the upload page reads the whole body (code, `console/db.rs:486`).
+
+**Cgroup layout (changed in round 5).** Each worker runs in its owner's
+cgroup itself, `<root>/owner-<id>`, one level below the node's cgroup.
+The harness teardown waits only for the node's direct child cgroups to
+empty, so a deeper leaf left cgroups that blocked the next run
+(measured, round 4 and the first round 5 run).
+
 **Removed from revision 1:** `run_meta` in the main process (old item
 11); `SYS_DB` flush, compaction, and sweep in the main process (old item
 12); the reaper scan and session expiry in the main process (old items

@@ -371,7 +371,17 @@ impl Db {
     fn note_own_lease(&self, m: &Manifest, sent: Instant) {
         if let Some(l) = m.lease.as_ref().filter(|l| l.node == self.shared.node_id) {
             let margin = self.shared.cfg.lease_margin_ms.min(l.ms);
-            self.st.lock().own_lease = Some((m.write_seq, sent + Duration::from_millis(l.ms - margin)));
+            let until = sent + Duration::from_millis(l.ms - margin);
+            self.st.lock().own_lease = Some((m.write_seq, until));
+            self.report_own_lease(Some(until));
+        }
+    }
+
+    /// Sends the end of this node's own lease, or `None` when it has none, to `OWN_LEASE_SINK`.
+    fn report_own_lease(&self, until: Option<Instant>) {
+        if let Some(sink) = super::OWN_LEASE_SINK.get() {
+            let left = until.map_or(0, |u| u.saturating_duration_since(Instant::now()).as_millis() as u64);
+            sink(&self.id, left);
         }
     }
 
@@ -387,6 +397,8 @@ impl Db {
         if granted < until {
             probe::hit(Probe::LeaseShortenedInFlight);
             st.own_lease = Some((ws, granted));
+            drop(st);
+            self.report_own_lease(Some(granted));
         }
     }
 
@@ -1156,6 +1168,7 @@ impl Db {
             let res = self.put_manifest(data, &base.etag).await;
             if res.is_err() {
                 self.st.lock().own_lease = None;
+                self.report_own_lease(None);
                 self.write_finished();
             }
             match res {

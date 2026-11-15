@@ -62,6 +62,8 @@ pub(super) struct OwnerIo {
     store_live: Arc<tokio::sync::RwLock<()>>,
     /// Tickets of PUT bodies in guest memory that the host no longer reads.
     released_bodies: mpsc::UnboundedSender<u32>,
+    leases: Arc<parking_lot::Mutex<super::lease_table::LeaseTable>>,
+    node_id: String,
 }
 
 fn owner_io<'a>(caller: &'a mut Caller<'_, GuestState>) -> wasmtime::Result<&'a mut OwnerIo> {
@@ -219,6 +221,21 @@ pub(super) fn link_owner_calls(linker: &mut Linker<GuestState>) -> wasmtime::Res
             })
         },
     )?;
+    linker.func_wrap(M, "lease_noted", |mut caller: Caller<'_, GuestState>, db_ptr: u32, db_len: u32, left_ms: u64| {
+        if db_len as usize > super::lease_table::LEASE_ID_MAX {
+            return Ok(());
+        }
+        let db = String::from_utf8(read_guest(&mut caller, db_ptr, db_len)?)?;
+        let io = owner_io(&mut caller)?;
+        let mut leases = io.leases.lock();
+        match left_ms {
+            0 => leases.clear(&db),
+            ms => {
+                leases.report(&db, &io.node_id, tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
+            }
+        }
+        Ok(())
+    })?;
     linker.func_wrap(
         M,
         "respond",
@@ -235,6 +252,9 @@ pub(super) fn link_owner_calls(linker: &mut Linker<GuestState>) -> wasmtime::Res
 
 /// Compiled guest module that starts owner instances.
 pub struct OwnerInstances {
+    /// Leases that this node's owner instances hold, for routing.
+    pub leases: Arc<parking_lot::Mutex<super::lease_table::LeaseTable>>,
+    node_id: String,
     engine: Engine,
     module: Module,
     linker: Linker<GuestState>,
@@ -271,7 +291,7 @@ fn sandbox_err(e: wasmtime::Error) -> Error {
 
 impl OwnerInstances {
     /// Compiles the guest module for owner instances.
-    pub fn new(guest_wasm: &[u8]) -> Result<OwnerInstances> {
+    pub fn new(guest_wasm: &[u8], node_id: &str) -> Result<OwnerInstances> {
         let mut config = Config::new();
         config.memory_may_move(false).memory_reservation(1 << 32);
         let engine = Engine::new(&config).map_err(sandbox_err)?;
@@ -279,7 +299,8 @@ impl OwnerInstances {
         let mut linker = Linker::new(&engine);
         link_host_calls(&mut linker).map_err(sandbox_err)?;
         link_owner_calls(&mut linker).map_err(sandbox_err)?;
-        Ok(OwnerInstances { engine, module, linker })
+        let leases = Arc::new(parking_lot::Mutex::new(super::lease_table::LeaseTable::new(super::lease_table::LEASE_TABLE_ENTRIES)));
+        Ok(OwnerInstances { leases, node_id: node_id.to_string(), engine, module, linker })
     }
 
     /// Starts the instance of `owner` on `store` and the host task that drives it.
@@ -304,6 +325,8 @@ impl OwnerInstances {
             store_slots: Arc::new(tokio::sync::Semaphore::new(STORE_CALLS_IN_FLIGHT)),
             store_live: Arc::default(),
             released_bodies: released_tx,
+            leases: self.leases.clone(),
+            node_id: self.node_id.clone(),
         };
         let state = GuestState { limiter, store: None, clock_ns: 0, rng: Rng::new(seed), stderr: Vec::new(), owner_io: Some(io) };
         let mut wstore = Store::new(&self.engine, state);
@@ -506,7 +529,7 @@ mod tests {
     fn owner_instance_reads_framed_gets_after_a_restart() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            let instances = OwnerInstances::new(&super::super::tests::guest_wasm()).unwrap();
+            let instances = OwnerInstances::new(&super::super::tests::guest_wasm(), "n1").unwrap();
             let store: DynStore = Arc::new(FramedStore(crate::store::MemStore::new(Box::new(host_now_ms))));
             let first = instances.start("o1", store.clone(), 1).await.unwrap();
             let put = first.call(kv_body(2, "d1", "k", b"a value longer than one frame")).await.unwrap();
@@ -522,7 +545,7 @@ mod tests {
     fn owner_instance_answers_kv_put_and_get() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            let instances = OwnerInstances::new(&super::super::tests::guest_wasm()).unwrap();
+            let instances = OwnerInstances::new(&super::super::tests::guest_wasm(), "n1").unwrap();
             let store: DynStore = Arc::new(crate::store::MemStore::new(Box::new(host_now_ms)));
             let owner = instances.start("o1", store, 7).await.unwrap();
             let put = owner.call(kv_body(2, "d1", "k", b"v1")).await.unwrap();
@@ -531,6 +554,7 @@ mod tests {
             assert_eq!((got.status, &got.body[..]), (200, &b"v1"[..]), "{}", String::from_utf8_lossy(&got.body));
             let miss = owner.call(kv_body(1, "d1", "other", b"")).await.unwrap();
             assert_eq!(miss.status, 404, "{}", String::from_utf8_lossy(&miss.body));
+            assert_eq!(instances.leases.lock().holder("d1", tokio::time::Instant::now()), Some("n1"), "the put's commit reports its lease");
             eprintln!("owner instance linear memory with one open database: {} KiB", owner.linear_memory() >> 10);
             assert!(owner.linear_memory() > 0 && owner.linear_memory() <= OWNER_INSTANCE_MEMORY_BOUND);
         });

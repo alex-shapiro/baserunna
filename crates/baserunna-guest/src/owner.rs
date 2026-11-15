@@ -43,6 +43,8 @@ mod host {
             has_after: u32,
             limit: u32,
         ) -> u32;
+        /// Reports that this node's lease of database `db` has `left_ms` left; 0 means none.
+        pub fn lease_noted(db_ptr: *const u8, db_len: u32, left_ms: u64);
         /// Sends the response to request `request_id`.
         pub fn respond(request_id: u64, status: u32, body_ptr: *const u8, body_len: u32);
     }
@@ -241,6 +243,7 @@ fn decode_list(mut buf: &[u8]) -> Option<ListPage> {
 /// Starts the engine of this owner instance at host time `now_ms`.
 #[unsafe(no_mangle)]
 pub extern "C" fn owner_start(seed: u64, now_ms: u64) {
+    let _ = baserunna::engine::OWN_LEASE_SINK.set(|db, left_ms| unsafe { host::lease_noted(db.as_ptr(), db.len() as u32, left_ms) });
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
     let engine = rt.block_on(async {
         let env = baserunna::env::Env::sim(seed, now_ms, tokio::time::Instant::now(), 0);

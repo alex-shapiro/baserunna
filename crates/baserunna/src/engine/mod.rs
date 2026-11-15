@@ -27,6 +27,10 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 pub use baserunna_api::{DbStats, LevelStats};
+
+/// Receives each change of this process's own lease of a database: the database id and the
+/// milliseconds left on the lease, 0 when it ends. An owner instance reports these to its host.
+pub static OWN_LEASE_SINK: std::sync::OnceLock<fn(&str, u64)> = std::sync::OnceLock::new();
 pub use config::EngineConfig;
 pub use db::{CommitState, Committed, Consistency, Db};
 pub use stream::{Appended, Record, Retention, Seek, StreamOp, StreamState};

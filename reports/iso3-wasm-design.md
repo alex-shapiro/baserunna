@@ -86,12 +86,12 @@ One host tokio task drives each instance. It loops:
 - **Requests.** The host router reads headers under fixed limits,
   authenticates, looks up the database record, and picks the owner. It
   then sends the request head and the body to the owner instance in
-  chunks of at most 64 KiB. The host holds at most one chunk per request.
+  chunks of at most 16 KiB. The host holds at most one chunk per request.
   The guest allocates the destination in its own linear memory, so the
   instance's memory limit bounds the body. Each owner has a fixed limit
   on requests in flight (planned 256); the next request gets a 503.
 - **Responses.** The guest calls `respond_head` and `respond_chunk`. Each
-  chunk is at most 64 KiB, and a bounded channel of one chunk feeds the
+  chunk is at most 16 KiB, and a bounded channel of one chunk feeds the
   hyper body. A slow client makes the guest task wait. It does not make
   the host buffer grow.
 - **Store calls.** The guest's `ObjectStore` is `GuestStore`. Each method
@@ -210,11 +210,11 @@ growth includes the attacker, the victim, and the host. Planned budget
 | --- | --- |
 | Attacker instance, linear memory at its maximum | 512 MiB |
 | Victim instance: heap, 16 MiB block cache, open databases | at most 40 MiB |
-| Host: request chunks (2 owners × 256 × 64 KiB at most), store frames, fiber stacks, instance metadata | at most 20 MiB |
+| Host: request chunks (2 owners × 256 requests × 16 KiB = 8 MiB at most), store frames, fiber stacks, instance metadata | at most 20 MiB |
 | Total | at most 572 MiB |
 
 - The request chunk line is a worst case. Each request holds at most one
-  64 KiB chunk in the host, and only while it moves.
+  16 KiB chunk in the host, and only while it moves.
 - A wasm memory does not shrink. An attacker instance that reached
   512 MiB keeps it until the instance goes away. That is still inside the
   bound.
@@ -241,8 +241,8 @@ the item of the requirement. "Planned" paths do not exist yet.
 | Forward dedup table: ids only, fixed entry count | 1 | `cluster::ForwardDedup`; the replay bodies move to the guest (today `api/mod.rs:790` `dedup_forwarded` holds whole bodies) |
 | Rate limiter per client, fixed entries | 1 | `node.rs:306` `limiter` |
 | Per-owner limit on requests in flight | 2 | planned `sandbox::OwnerSlots` |
-| Move request body chunks into the guest, 64 KiB | 2 | planned `sandbox::OwnerInstance::send_body` |
-| Move response chunks out of the guest, 64 KiB | 2 | planned `sandbox` host call `respond_chunk` |
+| Move request body chunks into the guest, 16 KiB | 2 | planned `sandbox::OwnerInstance::send_body` |
+| Move response chunks out of the guest, 16 KiB | 2 | planned `sandbox` host call `respond_chunk` |
 | Routes with no tenant data: `/healthz`, `/v1/openapi.json`, `GetLimits`, console static pages and forms | 1 | `api/mod.rs:1193` `healthz`, `:1217` `openapi`, `:1200` `limits`, `console/mod.rs` |
 | Every database route `/v1/dbs/{db}/...` | 2 | one host route that sends the request to the owner instance |
 | Console database pages `/console/dbs/{db}/...` | 2 | one host route that sends the request to the owner instance |
@@ -366,7 +366,7 @@ where it runs after the change.
 | --- | --- |
 | Crossing per request | A small request crosses once in (head and body together) and once out (head and body together). A warm-instance call cost 7% of KV throughput for 2 crossings (measured, round 2 evidence, `BENCH_BOUNDARY`). |
 | Crossings per store call | Start and completion share the next `guest_poll`. One poll delivers all completions that are ready. |
-| Copies into and out of guest memory | One copy each way for HTTP bodies, in 64 KiB chunks. One copy for store gets, frame by frame. No copy for store puts. |
+| Copies into and out of guest memory | One copy each way for HTTP bodies, in 16 KiB chunks. One copy for store gets, frame by frame. No copy for store puts. |
 | One core per owner | All work of one owner runs on one instance, so a single hot owner cannot use more than one core. The KV throughput test uses 10 owners with 200 databases each on 4 vCPUs (code, `examples/isolation/kv_throughput.rs:5`, `:6`, `:11`), so this limit does not bind there. |
 | Instance per active owner | Each active owner pays one guest heap. The 2 s idle drop and copy-on-write heap keep idle cost small. Measure the fresh-instance size in round 2. |
 | Reload after an idle drop | A dropped owner's next request reloads its manifest from the store (one GET at 20 ms in the harness). |

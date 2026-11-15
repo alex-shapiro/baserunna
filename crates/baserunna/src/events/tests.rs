@@ -3810,6 +3810,7 @@ mod sandbox_merge {
             let guest = sandbox.merge_parts("owner", mem, &input).await.unwrap().unwrap();
             eprintln!("guest merge of 4 x 200 rows took {:?}", started.elapsed());
             assert_eq!(PartRef { id: String::new(), ..guest }, PartRef { id: String::new(), ..native });
+            sandbox.evict_idle_instances();
             assert_eq!(sandbox.owner_memory_used("owner"), 0);
         });
     }
@@ -3829,6 +3830,7 @@ mod sandbox_merge {
             let err = sandbox.merge_parts("owner", mem, &input).await.unwrap_err();
             eprintln!("merge refused in {:?}: {err:?}", started.elapsed());
             assert!(matches!(err, Error::TooLarge(_)), "{err:?}");
+            sandbox.evict_idle_instances();
             assert_eq!(sandbox.owner_memory_used("owner"), 0);
         });
     }
@@ -3891,6 +3893,16 @@ mod sandbox_merge {
             assert_eq!(guest.columns, native.columns);
             assert_eq!(guest.rows, native.rows);
             assert!(!guest.rows.is_empty());
+            let started = std::time::Instant::now();
+            let warm = runner.query_events("db", &t, &input.schema, &q, &exec::Limits::default()).await.unwrap();
+            eprintln!(
+                "warm guest query took {:?}; store gets {} cold, {} warm",
+                started.elapsed(),
+                guest.stats.store_gets,
+                warm.stats.store_gets
+            );
+            assert_eq!(warm.rows, native.rows);
+            assert!(warm.stats.store_gets < guest.stats.store_gets, "the warm instance keeps its block cache");
         });
     }
 
@@ -3933,6 +3945,7 @@ mod sandbox_merge {
             let err = tight.blob_equals("db", &blob, &data).await.unwrap_err();
             eprintln!("blob check under {} KiB: {err:?}", (peak * 3 / 4) >> 10);
             assert!(matches!(err, Error::TooLarge(_)), "{err:?}");
+            tight.sandbox.evict_idle_instances();
             assert_eq!(tight.sandbox.owner_memory_used("owner-1"), 0);
         });
     }

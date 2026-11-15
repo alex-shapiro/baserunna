@@ -43,6 +43,55 @@ fn set_output(out: Vec<u8>) {
     OUTPUT.with(|o| *o.borrow_mut() = out);
 }
 
+/// Engine of this instance, with the runtime that drives it.
+///
+/// The instance lives across host calls, so the engine's block cache and
+/// part caches serve later calls of the same owner.
+struct InstanceEngine {
+    rt: tokio::runtime::Runtime,
+    engine: std::sync::Arc<baserunna::engine::Engine>,
+}
+
+thread_local! {
+    static INSTANCE_ENGINE: RefCell<Option<std::rc::Rc<InstanceEngine>>> = const { RefCell::new(None) };
+}
+
+/// Runs `work` on this instance's engine at the host's clock time `now_ms`.
+fn run_on_engine<T, F>(
+    seed: u64,
+    now_ms: u64,
+    config: &baserunna::events::sandboxed::EventConfig,
+    work: impl FnOnce(std::sync::Arc<baserunna::engine::Engine>) -> F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let instance = INSTANCE_ENGINE.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
+                let engine = rt.block_on(async {
+                    let env = baserunna::env::Env::sim(seed, now_ms, tokio::time::Instant::now(), 0);
+                    baserunna::engine::Engine::new(
+                        std::sync::Arc::new(HostStore),
+                        std::sync::Arc::new(env),
+                        config.engine_config(),
+                        "guest".into(),
+                    )
+                });
+                std::rc::Rc::new(InstanceEngine { rt, engine })
+            })
+            .clone()
+    });
+    instance.rt.block_on(async {
+        let behind = now_ms.saturating_sub(instance.engine.shared.env.now_ms());
+        if behind > 0 {
+            tokio::time::advance(std::time::Duration::from_millis(behind)).await;
+        }
+        work(instance.engine.clone()).await
+    })
+}
+
 /// Parses a JSON body into a value tree and returns its canonical encoding.
 ///
 /// Returns 0 on success and 1 if the body is not valid JSON; the output then
@@ -260,15 +309,8 @@ pub unsafe extern "C" fn guest_merge_parts(ptr: *const u8, len: u32) -> u32 {
             return 1;
         }
     };
-    let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
-    let out = rt.block_on(async move {
-        let env = baserunna::env::Env::sim(input.seed, input.now_ms, tokio::time::Instant::now(), 0);
-        let engine = baserunna::engine::Engine::new(
-            std::sync::Arc::new(HostStore),
-            std::sync::Arc::new(env),
-            input.config.engine_config(),
-            "guest".into(),
-        );
+    let config = input.config.clone();
+    let out = run_on_engine(input.seed, input.now_ms, &config, |engine| async move {
         let mut refs = Vec::new();
         for (k, v) in &input.inputs {
             let r = baserunna::engine::events::PartRef::decode(k, v)
@@ -309,14 +351,10 @@ pub unsafe extern "C" fn guest_query_events(ptr: *const u8, len: u32) -> u32 {
             return 1;
         }
     };
-    let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
-    let out = rt.block_on(async move {
-        let env = baserunna::env::Env::sim(input.seed, input.now_ms, tokio::time::Instant::now(), 0);
-        let cfg = input.config.engine_config();
-        let max_write = cfg.txn_max_write_bytes;
-        let engine =
-            baserunna::engine::Engine::new(std::sync::Arc::new(HostStore), std::sync::Arc::new(env), cfg, "guest".into());
-        let m = Manifest::decode(&bytes::Bytes::from(input.manifest))
+    let config = input.config.clone();
+    let out = run_on_engine(input.seed, input.now_ms, &config, |engine| async move {
+        let max_write = engine.shared.cfg.txn_max_write_bytes;
+        let m =Manifest::decode(&bytes::Bytes::from(input.manifest))
             .map_err(|_| baserunna::Error::internal("corrupt snapshot manifest"))?;
         let version = std::sync::Arc::new(Version::new(m, input.etag, engine.shared.clone()));
         let mut txn = Txn::new(Snapshot { version, time_ms: input.read_time }, Isolation::Snapshot, 0, max_write);
@@ -368,15 +406,8 @@ pub unsafe extern "C" fn guest_write_encoded(ptr: *const u8, len: u32) -> u32 {
         rows.push((Pos { version, ordinal }, &body[at + 16..at + 16 + n]));
         at += 16 + n;
     }
-    let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
-    let out = rt.block_on(async move {
-        let env = baserunna::env::Env::sim(input.seed, input.now_ms, tokio::time::Instant::now(), 0);
-        let engine = baserunna::engine::Engine::new(
-            std::sync::Arc::new(HostStore),
-            std::sync::Arc::new(env),
-            input.config.engine_config(),
-            "guest".into(),
-        );
+    let config = input.config.clone();
+    let out = run_on_engine(input.seed, input.now_ms, &config, |engine| async move {
         let mut written = Vec::new();
         baserunna::events::build::write_encoded(
             &engine.shared,
@@ -428,15 +459,8 @@ pub unsafe extern "C" fn guest_blob_equals(ptr: *const u8, len: u32) -> u32 {
         }
     };
     let want = &body[4 + header_len..];
-    let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
-    let out = rt.block_on(async move {
-        let env = baserunna::env::Env::sim(input.seed, input.now_ms, tokio::time::Instant::now(), 0);
-        let engine = baserunna::engine::Engine::new(
-            std::sync::Arc::new(HostStore),
-            std::sync::Arc::new(env),
-            input.config.engine_config(),
-            "guest".into(),
-        );
+    let config = input.config.clone();
+    let out = run_on_engine(input.seed, input.now_ms, &config, |engine| async move {
         let blob = baserunna::engine::BlobRef::decode(&mut baserunna::util::codec::Reader::new(&input.blob))
             .map_err(|_| baserunna::Error::internal("corrupt blob reference"))?;
         let got = baserunna::engine::blob::read_range(&engine.shared, &input.db, &blob, 0..blob.size).await?;

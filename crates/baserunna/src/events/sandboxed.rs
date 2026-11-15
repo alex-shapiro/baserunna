@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 pub struct EventConfig {
     blob_chunk_size: usize,
     blob_stage_ttl_ms: u64,
+    cache_bytes: usize,
     clock_sync_max_error_ms: u64,
     event_block_bytes: usize,
     event_chunk_bytes: usize,
@@ -37,6 +38,7 @@ macro_rules! event_config_fields {
         $m!(
             blob_chunk_size,
             blob_stage_ttl_ms,
+            cache_bytes,
             clock_sync_max_error_ms,
             event_block_bytes,
             event_chunk_bytes,

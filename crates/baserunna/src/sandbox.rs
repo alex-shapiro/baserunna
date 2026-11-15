@@ -1,8 +1,9 @@
 //! WebAssembly sandbox for tenant work whose cost grows with tenant input.
 //!
-//! Each call runs in a fresh instance of the guest module. The runtime, not
-//! our code, enforces the bounds: a linear-memory grow over the owner's
-//! memory bound fails, and an instruction budget (fuel) stops the instance.
+//! Each owner's calls run in warm instances of the guest module, which keep
+//! their engine caches between calls. The runtime, not our code, enforces the
+//! bounds: a linear-memory grow over the owner's memory bound fails, and an
+//! instruction budget (fuel) stops the instance.
 
 use crate::error::{Error, Result};
 use parking_lot::Mutex;
@@ -28,12 +29,35 @@ struct OwnerMemory {
     used: usize,
 }
 
+/// Instances that finished a call, kept for the next call of the same owner.
+///
+/// An idle instance stays charged to its owner's memory bound.
+type IdleInstances = Arc<Mutex<HashMap<String, Vec<WarmInstance>>>>;
+
+/// Guest instance with the store that holds its state.
+struct WarmInstance {
+    store: Store<GuestState>,
+    instance: Instance,
+    linear_memory: usize,
+    idle_since: tokio::time::Instant,
+}
+
+/// Count of idle instances that one owner may keep.
+const IDLE_INSTANCES_PER_OWNER: usize = 4;
+/// Largest linear memory of an instance that goes back to the idle pool.
+const IDLE_INSTANCE_MEMORY_MAX: usize = 160 << 20;
+/// Linear memory that all idle instances of the node may hold.
+const NODE_IDLE_MEMORY_MAX: usize = 256 << 20;
+/// Time after which an idle instance is dropped, so an idle owner holds no memory.
+const IDLE_INSTANCE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Sandbox that runs guest work under per-owner memory and CPU bounds.
 pub struct Sandbox {
     engine: Engine,
     module: Module,
     linker: Linker<GuestState>,
     owner_memory: Arc<Mutex<HashMap<String, OwnerMemory>>>,
+    idle: IdleInstances,
     owner_memory_bound: usize,
     last_instance_peak: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -43,6 +67,7 @@ struct OwnerLimiter {
     owner: String,
     owner_memory: Arc<Mutex<HashMap<String, OwnerMemory>>>,
     owner_memory_bound: usize,
+    idle: IdleInstances,
     charged: usize,
     refused_grow: Option<usize>,
     /// Receives `charged` when the instance ends: its peak linear memory.
@@ -52,19 +77,34 @@ struct OwnerLimiter {
 impl ResourceLimiter for OwnerLimiter {
     fn memory_growing(&mut self, current: usize, desired: usize, _maximum: Option<usize>) -> wasmtime::Result<bool> {
         let grow = desired.saturating_sub(current);
-        let mut owners = self.owner_memory.lock();
-        let owner = owners.entry(self.owner.clone()).or_default();
-        if owner.used + grow > self.owner_memory_bound {
-            self.refused_grow = Some(desired);
-            return Ok(false);
+        if self.try_charge(grow) {
+            return Ok(true);
         }
-        owner.used += grow;
-        self.charged += grow;
-        Ok(true)
+        let evicted = self.idle.lock().remove(&self.owner);
+        drop(evicted);
+        if self.try_charge(grow) {
+            return Ok(true);
+        }
+        self.refused_grow = Some(desired);
+        Ok(false)
     }
 
     fn table_growing(&mut self, _current: usize, desired: usize, _maximum: Option<usize>) -> wasmtime::Result<bool> {
         Ok(desired <= 10_000)
+    }
+}
+
+impl OwnerLimiter {
+    /// Charges `grow` bytes to the owner, or returns false if they exceed its bound.
+    fn try_charge(&mut self, grow: usize) -> bool {
+        let mut owners = self.owner_memory.lock();
+        let owner = owners.entry(self.owner.clone()).or_default();
+        if owner.used + grow > self.owner_memory_bound {
+            return false;
+        }
+        owner.used += grow;
+        self.charged += grow;
+        true
     }
 }
 
@@ -264,7 +304,15 @@ impl Sandbox {
         let module = Module::new(&engine, guest_wasm).map_err(sandbox_err)?;
         let mut linker = Linker::new(&engine);
         link_host_calls(&mut linker).map_err(sandbox_err)?;
-        Ok(Sandbox { engine, module, linker, owner_memory: Arc::default(), owner_memory_bound, last_instance_peak: Arc::default() })
+        Ok(Sandbox {
+            engine,
+            module,
+            linker,
+            owner_memory: Arc::default(),
+            idle: Arc::default(),
+            owner_memory_bound,
+            last_instance_peak: Arc::default(),
+        })
     }
 
     /// Linear memory that `owner`'s running instances hold.
@@ -272,7 +320,13 @@ impl Sandbox {
         self.owner_memory.lock().get(owner).map_or(0, |o| o.used)
     }
 
-    /// Peak linear memory of the instance that ended last.
+    /// Drops every idle instance, which returns its memory to its owner.
+    pub fn evict_idle_instances(&self) {
+        let idle = std::mem::take(&mut *self.idle.lock());
+        drop(idle);
+    }
+
+    /// Peak linear memory of the instance that finished a call last.
     pub fn last_instance_peak(&self) -> usize {
         self.last_instance_peak.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -317,6 +371,7 @@ impl Sandbox {
             owner: owner.to_string(),
             owner_memory: self.owner_memory.clone(),
             owner_memory_bound: self.owner_memory_bound,
+            idle: self.idle.clone(),
             charged: 0,
             refused_grow: None,
             peak: self.last_instance_peak.clone(),
@@ -355,7 +410,18 @@ impl Sandbox {
         fuel: u64,
         export: &str,
     ) -> Result<Vec<u8>> {
-        let (mut store, instance) = self.instantiate(owner, object_store, seed, fuel).await?;
+        let warm = self.idle.lock().get_mut(owner).and_then(|v| v.pop());
+        let (mut store, instance) = match warm {
+            Some(WarmInstance { mut store, instance, .. }) => {
+                let state = store.data_mut();
+                state.store = object_store;
+                state.rng = Rng::new(seed);
+                state.stderr.clear();
+                store.set_fuel(fuel).map_err(|e| Error::internal(format!("sandbox fuel: {e}")))?;
+                (store, instance)
+            }
+            None => self.instantiate(owner, object_store, seed, fuel).await?,
+        };
         let export_err = |e: wasmtime::Error| Error::internal(format!("sandbox export: {e}"));
         let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| Error::internal("sandbox memory"))?;
         let alloc = instance.get_typed_func::<u32, u32>(&mut store, "guest_alloc").map_err(export_err)?;
@@ -372,18 +438,67 @@ impl Sandbox {
                 .map_err(|e| Error::internal(format!("sandbox input: {e}")))?;
             at += piece.len();
         }
+        let free = instance.get_typed_func::<(u32, u32), ()>(&mut store, "guest_free").map_err(export_err)?;
         let status = work.call_async(&mut store, (ptr, len)).await.map_err(|e| guest_error(&store, e))?;
-        let ptr = out_ptr.call_async(&mut store, ()).await.map_err(|e| guest_error(&store, e))? as usize;
-        let len = out_len.call_async(&mut store, ()).await.map_err(|e| guest_error(&store, e))? as usize;
+        free.call_async(&mut store, (ptr, len)).await.map_err(|e| guest_error(&store, e))?;
+        let out_at = out_ptr.call_async(&mut store, ()).await.map_err(|e| guest_error(&store, e))? as usize;
+        let out_len = out_len.call_async(&mut store, ()).await.map_err(|e| guest_error(&store, e))? as usize;
         let out = memory
             .data(&store)
-            .get(ptr..ptr + len)
+            .get(out_at..out_at + out_len)
             .ok_or_else(|| Error::internal("sandbox output out of bounds"))?
             .to_vec();
+        let linear_memory = memory.data_size(&store);
+        self.release(owner, WarmInstance { store, instance, linear_memory, idle_since: tokio::time::Instant::now() });
         match status {
             0 | 2 => Ok(out),
             _ => Err(Error::invalid(String::from_utf8_lossy(&out).into_owned())),
         }
+    }
+}
+
+impl Sandbox {
+    /// Keeps `warm` for the next call of `owner` within the idle pool's limits.
+    ///
+    /// The pool drops instances idle for longer than `IDLE_INSTANCE_TTL`, and
+    /// the oldest instances while the node's idle memory exceeds `NODE_IDLE_MEMORY_MAX`.
+    fn release(&self, owner: &str, mut warm: WarmInstance) {
+        let state = warm.store.data_mut();
+        state.store = None;
+        self.last_instance_peak.store(state.limiter.charged, std::sync::atomic::Ordering::Relaxed);
+        let mut dropped = Vec::new();
+        let mut idle = self.idle.lock();
+        if warm.linear_memory <= IDLE_INSTANCE_MEMORY_MAX {
+            let pool = idle.entry(owner.to_string()).or_default();
+            if pool.len() < IDLE_INSTANCES_PER_OWNER {
+                pool.push(warm);
+            } else {
+                dropped.push(warm);
+            }
+        } else {
+            dropped.push(warm);
+        }
+        let now = tokio::time::Instant::now();
+        for pool in idle.values_mut() {
+            let (fresh, stale): (Vec<_>, Vec<_>) =
+                std::mem::take(pool).into_iter().partition(|w| now.duration_since(w.idle_since) < IDLE_INSTANCE_TTL);
+            *pool = fresh;
+            dropped.extend(stale);
+        }
+        let mut idle_memory: usize = idle.values().flatten().map(|w| w.linear_memory).sum();
+        while idle_memory > NODE_IDLE_MEMORY_MAX {
+            let oldest = idle
+                .iter()
+                .flat_map(|(o, pool)| pool.iter().enumerate().map(move |(i, w)| (w.idle_since, o.clone(), i)))
+                .min_by_key(|(since, _, _)| *since);
+            let Some((_, o, i)) = oldest else { break };
+            let w = idle.get_mut(&o).expect("owner of the oldest idle instance").remove(i);
+            idle_memory -= w.linear_memory;
+            dropped.push(w);
+        }
+        idle.retain(|_, pool| !pool.is_empty());
+        drop(idle);
+        drop(dropped);
     }
 }
 
@@ -599,6 +714,7 @@ pub(crate) mod tests {
         let out = block_on(sandbox.parse_json("o1", br#"{"a": [1, 2, {"b": "c"}]}"#)).unwrap();
         assert_eq!(out, br#"{"a":[1,2,{"b":"c"}]}"#);
         assert!(block_on(sandbox.parse_json("o1", b"{")).is_err());
+        sandbox.evict_idle_instances();
         assert_eq!(sandbox.owner_memory_used("o1"), 0);
     }
 
@@ -616,6 +732,7 @@ pub(crate) mod tests {
         let err = block_on(sandbox.parse_json("o1", &body)).unwrap_err();
         eprintln!("refused in {:?}: {err:?}", start.elapsed());
         assert!(matches!(err, Error::TooLarge(_) | Error::Unavailable { .. }), "{err:?}");
+        sandbox.evict_idle_instances();
         assert_eq!(sandbox.owner_memory_used("o1"), 0);
     }
 

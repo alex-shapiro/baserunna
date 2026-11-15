@@ -113,6 +113,25 @@ pub struct OpsOutput {
     pub result_ends: std::result::Result<Vec<u32>, crate::error::Error>,
 }
 
+/// Header of an event insert body to validate in the sandbox; the body follows it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidateInput {
+    /// Schema of the table, or `None` to read only the idempotency key.
+    pub schema: Option<EventSchema>,
+    pub content_type: String,
+    pub now_ms: i64,
+    /// Encoded size limit of the valid rows.
+    pub limit: usize,
+}
+
+/// Output of an event insert body validated in the sandbox.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidateOutput {
+    /// The body's `idempotency_key`, or the parse error of the key pass.
+    pub key: std::result::Result<Option<String>, crate::error::Error>,
+    pub rows: std::result::Result<super::ValidRows, crate::error::Error>,
+}
+
 /// Input of a part merge in the sandbox.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MergeInput {
@@ -225,6 +244,19 @@ impl GuestOpResults {
 }
 
 pub trait SandboxRunner: Send + Sync {
+    /// Charges `bytes` of host memory to `owner` until the returned guard drops.
+    fn charge_host_memory(&self, owner: &str, bytes: usize) -> Result<Box<dyn std::any::Any + Send + Sync>>;
+
+    /// Parses an event insert body and validates its rows in the sandbox of `owner`.
+    ///
+    /// The returned guard keeps the output charged to the owner; hold it while the rows live.
+    fn validate_events<'a>(
+        &'a self,
+        owner: &'a str,
+        input: ValidateInput,
+        body: &'a [u8],
+    ) -> BoxFut<'a, Result<(ValidateOutput, Box<dyn std::any::Any + Send + Sync>)>>;
+
     /// Runs `ops`, the JSON of an `api::Op` list, inside `txn` in the sandbox of `settings.owner`.
     ///
     /// The reads and writes of the ops replace those of `txn`, also when the ops fail.

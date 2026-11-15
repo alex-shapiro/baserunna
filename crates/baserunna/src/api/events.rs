@@ -165,121 +165,7 @@ async fn drop_skip_index(
     Ok(axum::Json(out))
 }
 
-const BODY_SHAPE: &str = "the body is {\"rows\": [...]}, an array of events, or NDJSON";
-
-/// Streams events from a JSON or NDJSON insert body into `f` without buffering
-/// the parsed array, and returns the body's `idempotency_key` if present.
-fn each_event(content_type: &str, data: &[u8], f: &mut dyn FnMut(Json) -> Result<()>) -> Result<Option<String>> {
-    crate::util::json::reject_inexact_integers(data).map_err(Error::invalid)?;
-    match content_type {
-        "" | "application/json" => {
-            let mut failed = None;
-            let mut de = serde_json::Deserializer::from_slice(data);
-            let parsed = serde::de::DeserializeSeed::deserialize(Body { f, failed: &mut failed }, &mut de)
-                .and_then(|key| de.end().map(|()| key));
-            match (failed, parsed) {
-                (Some(e), _) => Err(e),
-                (None, Ok(key)) => Ok(key),
-                (None, Err(e)) => Err(Error::invalid(format!("invalid JSON body: {e}"))),
-            }
-        }
-        "application/x-ndjson" | "application/jsonl" | "application/json-lines" => {
-            let text = std::str::from_utf8(data).map_err(|_| Error::invalid("NDJSON must be UTF-8"))?;
-            let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-            for (i, l) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
-                f(serde_json::from_str(l).map_err(|e| Error::invalid(format!("line {}: {e}", i + 1)))?)?;
-            }
-            Ok(None)
-        }
-        other => Err(Error::invalid(format!(
-            "unsupported content type {other:?}: use application/json or application/x-ndjson"
-        ))),
-    }
-}
-
-struct Events<'a> {
-    f: &'a mut dyn FnMut(Json) -> Result<()>,
-    failed: &'a mut Option<Error>,
-}
-
-impl<'de> serde::de::DeserializeSeed<'de> for Events<'_> {
-    type Value = ();
-    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> std::result::Result<(), D::Error> {
-        d.deserialize_seq(self)
-    }
-}
-
-impl<'de> serde::de::Visitor<'de> for Events<'_> {
-    type Value = ();
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("an array of events")
-    }
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<(), A::Error> {
-        while let Some(v) = seq.next_element::<Json>()? {
-            if let Err(e) = (self.f)(v) {
-                *self.failed = Some(e);
-                return Err(serde::de::Error::custom("rejected"));
-            }
-        }
-        Ok(())
-    }
-}
-
-struct Body<'a> {
-    f: &'a mut dyn FnMut(Json) -> Result<()>,
-    failed: &'a mut Option<Error>,
-}
-
-impl Body<'_> {
-    fn serde_err<E: serde::de::Error>(self, e: Error) -> E {
-        *self.failed = Some(e);
-        E::custom("rejected")
-    }
-}
-
-impl<'de> serde::de::DeserializeSeed<'de> for Body<'_> {
-    type Value = Option<String>;
-    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> std::result::Result<Option<String>, D::Error> {
-        d.deserialize_any(self)
-    }
-}
-
-impl<'de> serde::de::Visitor<'de> for Body<'_> {
-    type Value = Option<String>;
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(BODY_SHAPE)
-    }
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> std::result::Result<Option<String>, A::Error> {
-        serde::de::Visitor::visit_seq(Events { f: self.f, failed: self.failed }, seq).map(|()| None)
-    }
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<Option<String>, A::Error> {
-        let (mut key, mut rows, mut keyed) = (None, false, false);
-        while let Some(k) = map.next_key::<String>()? {
-            if (k == "rows" && rows) || (k == "idempotency_key" && keyed) {
-                return Err(self.serde_err(Error::invalid(format!("{k:?} appears twice"))));
-            }
-            match k.as_str() {
-                "rows" => {
-                    map.next_value_seed(Events { f: &mut *self.f, failed: &mut *self.failed })?;
-                    rows = true;
-                }
-                "idempotency_key" => {
-                    keyed = true;
-                    match map.next_value::<Json>()? {
-                        Json::Null => key = None,
-                        Json::String(k) => key = Some(k),
-                        _ => return Err(self.serde_err(Error::invalid("idempotency_key is a string"))),
-                    }
-                }
-                other => return Err(self.serde_err(Error::invalid(format!("unknown field {other:?}")))),
-            }
-        }
-        if !rows {
-            return Err(self.serde_err(Error::invalid(BODY_SHAPE)));
-        }
-        Ok(key)
-    }
-}
+use crate::events::insert_body::each_event;
 
 async fn insert(
     State(node): State<Arc<Node>>,
@@ -292,6 +178,9 @@ async fn insert(
     let ct = content_type(req.headers());
     let header_key = idempotency_header(req.headers())?;
     let limit = node.cfg.max_json_body;
+    if let Some(sandbox) = ctx.db.shared().sandbox.get().cloned() {
+        return insert_in_sandbox(&node, &ctx, &name, ct, header_key, req, sandbox.as_ref()).await;
+    }
     let data = axum::body::to_bytes(req.into_body(), limit)
         .await
         .map_err(|_| Error::TooLarge(format!("bulk inserts are limited to {limit} bytes")))?;
@@ -317,6 +206,79 @@ async fn insert(
         .await
         .map_err(|e| super::naming_commit(e, commit_id))?;
     inserted(&c, commit_id)
+}
+
+/// Inserts events with the body parse and row checks in the owner's sandbox.
+///
+/// The body, the valid rows and the guest output stay charged to the owner
+/// until the insert commits.
+async fn insert_in_sandbox(
+    node: &Arc<Node>,
+    ctx: &DbCtx,
+    name: &str,
+    content_type: String,
+    header_key: Option<String>,
+    req: Request,
+    sandbox: &dyn crate::events::sandboxed::SandboxRunner,
+) -> Result<Response> {
+    let owner = &ctx.rec.owner_id;
+    let limit = node.cfg.max_json_body;
+    let (data, body_charge) = read_charged_body(req.into_body(), limit, sandbox, owner).await?;
+    let schema = async { Ok::<_, Error>(with_read!(ctx.db, Consistency::Strong, |t| events::get_schema(t, name).await).0) }.await;
+    let input = crate::events::sandboxed::ValidateInput {
+        schema: schema.as_ref().ok().cloned(),
+        content_type,
+        now_ms: node.now_ms() as i64,
+        limit: (8 * data.len()).max(limit),
+    };
+    let (out, rows_charge) = sandbox.validate_events(owner, input, &data).await?;
+    drop(data);
+    drop(body_charge);
+    let key = one_idempotency_key(header_key, out.key?)?;
+    let commit_id = super::commit_id_for(node, ctx, key.as_deref())?;
+    if let Some(c) = super::earlier_attempt(ctx, commit_id, key.as_deref()).await? {
+        return inserted(&c, commit_id);
+    }
+    let schema = schema?;
+    let valid = out.rows?;
+    if valid.is_empty() {
+        return Err(Error::invalid("insert at least one event"));
+    }
+    let c = node
+        .event_buffers()
+        .submit(ctx.db.clone(), schema, valid, commit_id, ctx.deadline.instant())
+        .await
+        .map_err(|e| super::naming_commit(e, commit_id))?;
+    drop(rows_charge);
+    inserted(&c, commit_id)
+}
+
+/// Reads a request body of at most `limit` bytes, charging each growth of its buffer to `owner` first.
+async fn read_charged_body(
+    mut body: axum::body::Body,
+    limit: usize,
+    sandbox: &dyn crate::events::sandboxed::SandboxRunner,
+    owner: &str,
+) -> Result<(Vec<u8>, Vec<Box<dyn std::any::Any + Send + Sync>>)> {
+    use http_body_util::BodyExt;
+    let too_large = || Error::TooLarge(format!("bulk inserts are limited to {limit} bytes"));
+    let mut data = Vec::new();
+    let mut charges = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| Error::invalid(format!("request body: {e}")))?;
+        let Ok(chunk) = frame.into_data() else { continue };
+        let need = data.len() + chunk.len();
+        if need > limit {
+            return Err(too_large());
+        }
+        if need > data.capacity() {
+            let capacity = need.next_power_of_two().clamp(need, limit);
+            charges.push(sandbox.charge_host_memory(owner, capacity - data.capacity())?);
+            data.reserve_exact(capacity - data.len());
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok((data, charges))
 }
 
 fn inserted(c: &Committed, commit_id: u64) -> Result<Response> {

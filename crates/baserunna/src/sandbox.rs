@@ -13,7 +13,7 @@ use crate::engine::events::PartRef;
 use crate::engine::Shared;
 use crate::engine::events::Pos;
 use crate::events::sandboxed::{
-    CheckInput, EventConfig, GuestOpResults, MergeInput, OpsInput, OpsOutput, OpsSettings, QueryInput, QueryOutput, SandboxRunner,
+    CheckInput, EventConfig, GuestOpResults, ValidateInput, ValidateOutput, MergeInput, OpsInput, OpsOutput, OpsSettings, QueryInput, QueryOutput, SandboxRunner,
     WriteInput, WrittenPart,
 };
 use crate::events::schema::EventSchema;
@@ -689,6 +689,30 @@ impl NodeSandbox {
 const OPS_HEADER_SLACK: usize = 1 << 20;
 
 impl SandboxRunner for NodeSandbox {
+    fn charge_host_memory(&self, owner: &str, bytes: usize) -> Result<Box<dyn std::any::Any + Send + Sync>> {
+        Ok(Box::new(self.sandbox.charge_output(owner, bytes)?))
+    }
+
+    fn validate_events<'a>(
+        &'a self,
+        owner: &'a str,
+        input: ValidateInput,
+        body: &'a [u8],
+    ) -> BoxFut<'a, Result<(ValidateOutput, Box<dyn std::any::Any + Send + Sync>)>> {
+        Box::pin(async move {
+            let header = postcard::to_allocvec(&input).map_err(|e| Error::internal(format!("validate input: {e}")))?;
+            let len_prefix = (header.len() as u32).to_le_bytes();
+            let out = self
+                .sandbox
+                .call_with_pieces(owner, None, self.seed(), &[&len_prefix, &header, body], CALL_FUEL, "guest_validate_events")
+                .await?;
+            let parsed: ValidateOutput =
+                postcard::from_bytes(&out).map_err(|e| Error::internal(format!("validate output: {e}")))?;
+            let decoded = self.sandbox.charge_output(owner, out.len())?;
+            Ok((parsed, Box::new((out, decoded)) as Box<dyn std::any::Any + Send + Sync>))
+        })
+    }
+
     fn exec_ops<'a>(
         &'a self,
         db: &'a str,

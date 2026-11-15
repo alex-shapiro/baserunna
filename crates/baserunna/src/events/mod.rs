@@ -8,6 +8,7 @@
 //! time partitions, and queries read both unsealed rows and parts from a
 //! single snapshot.
 
+pub mod insert_body;
 pub mod agg;
 pub mod build;
 pub mod bulk;
@@ -261,7 +262,7 @@ pub async fn set_retention(txn: &mut Txn, table: &str, retention_ms: Option<u64>
 }
 
 /// Validated and encoded rows stored in a single buffer.
-#[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 pub struct ValidRows {
     data: Vec<u8>,
     /// Partition key and end offset in `data` for each row.

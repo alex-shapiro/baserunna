@@ -543,3 +543,35 @@ pub unsafe extern "C" fn guest_exec_ops(ptr: *const u8, len: u32) -> u32 {
     set_output(out);
     0
 }
+
+/// Parses an event insert body and validates its rows with the node's `each_event` and `ValidRows`.
+///
+/// The input is a `u32` header length, a postcard `ValidateInput`, and the
+/// body. Returns 0 with a postcard `ValidateOutput`, or 1 with an error message.
+///
+/// # Safety
+/// `ptr` and `len` must name `len` initialized bytes from `guest_alloc`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn guest_validate_events(ptr: *const u8, len: u32) -> u32 {
+    use baserunna::events::sandboxed::{ValidateInput, ValidateOutput};
+    let input = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let header_len = u32::from_le_bytes(input[..4].try_into().unwrap()) as usize;
+    let header: ValidateInput = match postcard::from_bytes(&input[4..4 + header_len]) {
+        Ok(h) => h,
+        Err(e) => {
+            set_output(e.to_string().into_bytes());
+            return 1;
+        }
+    };
+    let body = &input[4 + header_len..];
+    let each_event = baserunna::events::insert_body::each_event;
+    let key = each_event(&header.content_type, body, &mut |_| Ok(()));
+    let rows = key.as_ref().map_err(Clone::clone).and_then(|_| {
+        let schema = header.schema.as_ref().ok_or_else(|| baserunna::Error::internal("no schema to validate rows"))?;
+        let mut valid = baserunna::events::ValidRows::up_to(header.limit);
+        each_event(&header.content_type, body, &mut |v| valid.push(schema, &v, header.now_ms))?;
+        Ok(valid)
+    });
+    set_output(postcard::to_allocvec(&ValidateOutput { key, rows }).unwrap_or_default());
+    0
+}

@@ -137,3 +137,41 @@ fn table_queries_in_sandbox_match_native() {
         assert!(runner.sandbox.last_instance_peak() > 0, "the queries ran in an instance");
     });
 }
+
+#[test]
+fn event_inserts_in_sandbox_match_native() {
+    run_paused(async {
+        let (native, native_token) = world_with_db("ev-native@api.test").await;
+        let (guest, guest_token) = world_with_db("ev-guest@api.test").await;
+        let runner = set_sandbox(&guest, OWNER_MEMORY_BOUND);
+        let table = json!({"name": "ev", "columns": [{"name": "time", "type": "time", "default": "now"},
+            {"name": "event", "type": "string"}], "time_column": "time", "order_by": ["event", "time"]});
+        let rows: Vec<Json> = (0..50).map(|i| json!({"event": format!("e{}", i % 3)})).collect();
+        let bodies = [
+            json!({"rows": rows}).to_string(),
+            json!({"rows": [{"event": 5}]}).to_string(),
+            "[{\"event\": \"x\"}".to_string(),
+            json!({"rows": []}).to_string(),
+        ];
+        let mut out = Vec::new();
+        for (w, token) in [(&native, &native_token), (&guest, &guest_token)] {
+            let router = w.node(0).router().unwrap();
+            let r = call_router(&router, "POST", "/v1/dbs/d/events", token, Bytes::from(table.to_string())).await;
+            assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+            let mut answers = Vec::new();
+            for body in &bodies {
+                let r = call_router(&router, "POST", "/v1/dbs/d/events/ev/rows", token, Bytes::from(body.clone())).await;
+                let mut v: Json = serde_json::from_slice(&r.body).unwrap_or(json!(null));
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("commit_id");
+                }
+                answers.push((r.status, v));
+            }
+            out.push(answers);
+        }
+        assert_eq!(out[1], out[0]);
+        assert_eq!(out[0][0].0, 200, "{:?}", out[0][0]);
+        runner.sandbox.evict_idle_instances();
+        assert_eq!(runner.sandbox.all_owners_memory_used(), 0, "the body and rows charges are released");
+    });
+}

@@ -67,9 +67,10 @@ store calls for the guest, and holds leases.
 - Tokio does not expose the next timer deadline. So the host polls an
   instance that has timers pending every 5 ms. An idle instance with no
   timers gets no polls.
-- Each owner instance has its own block cache of 64 MiB inside its
+- Each owner instance has its own block cache of 16 MiB inside its
   512 MiB, in place of the node-wide `cache_bytes` (code, `main.rs:79`;
-  the harness sets 64 MiB in `scripts/isolation/run.sh:86`).
+  the harness sets 64 MiB in `scripts/isolation/run.sh:86`). Section 1.8
+  gives the reason for 16 MiB.
 
 ### 1.3 Host driver per instance
 
@@ -198,6 +199,25 @@ One host tokio task drives each instance. It loops:
   if many owners are active at once. When the cap is full, the host drops
   the least recently used quiesced instance. If no instance is quiesced, the
   new owner's request gets a retryable 503.
+
+### 1.8 Memory budget at the limit
+
+The pass condition allows 576 MiB of growth from the idle node. That
+growth includes the attacker, the victim, and the host. Planned budget
+(all inferred until round 7 measures it):
+
+| Part | Budget |
+| --- | --- |
+| Attacker instance, linear memory at its maximum | 512 MiB |
+| Victim instance: heap, 16 MiB block cache, open databases | at most 40 MiB |
+| Host: request chunks (2 owners × 256 × 64 KiB at most), store frames, fiber stacks, instance metadata | at most 20 MiB |
+| Total | at most 572 MiB |
+
+- The request chunk line is a worst case. Each request holds at most one
+  64 KiB chunk in the host, and only while it moves.
+- A wasm memory does not shrink. An attacker instance that reached
+  512 MiB keeps it until the instance goes away. That is still inside the
+  bound.
 
 ## 2. The main-process list
 

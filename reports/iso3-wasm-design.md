@@ -111,10 +111,10 @@ One host tokio task drives each instance. It loops:
   `Bytes` that points into the guest's linear memory, where the bytes
   already count against the guest's limit.
   - This is safe only if the linear memory does not move or unmap while
-    the put is in flight. Wasmtime on a 64-bit host reserves the whole
-    4 GiB address range of a 32-bit memory, so a grow does not move it
-    (inferred from wasmtime's default `memory_reservation`; set it
-    explicitly and test it in round 5).
+    the put is in flight. The engine config sets
+    `memory_may_move(false)` with a 4 GiB `memory_reservation`. Then
+    wasmtime never moves a linear memory when it grows (code, wasmtime
+    48.0.8 `src/config.rs:1960`, the version in `Cargo.lock`).
   - The guest keeps the buffer alive and unchanged until the ticket
     completes. The host keeps the instance's store alive until each put in
     flight ends, also after a trap.

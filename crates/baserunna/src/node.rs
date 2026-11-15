@@ -332,7 +332,7 @@ const CACHE_MAX: usize = 4_096;
 impl Node {
     /// Starts a node, bootstrapping the system database and background tasks.
     pub async fn start(cfg: NodeConfig, env: Arc<Env>, store: DynStore, services: Services) -> Result<Arc<Node>> {
-        let node = Node::new(cfg, env, store, services)?;
+        let node = Node::new(cfg, env, store, services, None)?;
         node.bootstrap().await?;
         node.spawn_background();
         Ok(node)
@@ -340,9 +340,16 @@ impl Node {
 
     /// Returns a node that serves requests but has not bootstrapped the system database or
     /// started background tasks, as a worker process uses it.
-    pub fn new(cfg: NodeConfig, env: Arc<Env>, store: DynStore, services: Services) -> Result<Arc<Node>> {
+    /// The node takes the ID `id`, or a new one.
+    pub fn new(
+        cfg: NodeConfig,
+        env: Arc<Env>,
+        store: DynStore,
+        services: Services,
+        id: Option<String>,
+    ) -> Result<Arc<Node>> {
         cfg.engine.validate().map_err(|e| Error::invalid(format!("engine configuration: {e}")))?;
-        let id = format!("{}-{}", cfg.name, env.random_hex(4));
+        let id = id.unwrap_or_else(|| format!("{}-{}", cfg.name, env.random_hex(4)));
         let engine = Engine::new(store, env.clone(), cfg.engine.clone(), id.clone());
         let queries = crate::queries::Queries::new(cfg.query_concurrency, engine.shared.memory.clone());
         let txns = OpenTxns::new(engine.clone(), cfg.txn_limits(), queries.clone());
@@ -726,9 +733,16 @@ impl Node {
         if crate::buggify::fault(0.02) {
             return None;
         }
-        let db = self.engine.db(db_id);
-        let _ = db.open(false).await;
-        let target = match db.lease_holder().filter(|_| !is_long_poll) {
+        // With workers, the database's lease and manifest live only in its owner's worker.
+        let holder = match self.engine.shared.workers.get() {
+            Some(_) => None,
+            None => {
+                let db = self.engine.db(db_id);
+                let _ = db.open(false).await;
+                db.lease_holder()
+            }
+        };
+        let target = match holder.filter(|_| !is_long_poll) {
             Some(h) => h,
             None => {
                 let live = self.live_members();

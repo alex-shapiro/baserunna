@@ -144,8 +144,10 @@ async fn run() -> Result<(), String> {
     let store = store_from_url(&store_url)?;
     if std::env::args().nth(1).as_deref() == Some("worker") {
         cfg.engine.local_tier = None;
+        cfg.engine.cache_bytes = baserunna::worker::WORKER_CACHE_BYTES;
         let services = Services { transport: Arc::new(HttpTransport::new()), oidc: None, mailer: None };
-        let node = Node::new(cfg, Arc::new(Env::real()), store, services).map_err(|e| format!("worker: {e}"))?;
+        let id = var(baserunna::worker::WORKER_NODE_ID_VAR).filter(|id| !id.is_empty());
+        let node = Node::new(cfg, Arc::new(Env::real()), store, services, id).map_err(|e| format!("worker: {e}"))?;
         return baserunna::worker::serve(node).await.map_err(|e| format!("worker: {e}"));
     }
     let workers = match var("BASERUNNA_CGROUP_ROOT") {
@@ -164,6 +166,7 @@ async fn run() -> Result<(), String> {
             };
             let pool = baserunna::worker::WorkerPool::new(pool.clone())
                 .map_err(|e| format!("cannot enable controllers in {}: {e}", pool.cgroup_root.display()))?;
+            cfg.engine.cache_bytes = baserunna::worker::MAIN_CACHE_BYTES;
             Some(Arc::new(pool))
         }
     };
@@ -202,36 +205,7 @@ async fn run() -> Result<(), String> {
                 Ok(baserunna::meta::get_db(&mut t, &db).await?.map(|r| r.owner_id))
             })
         }));
-        let weak = Arc::downgrade(&node);
-        w.set_committer(Box::new(move |owner, db, request| {
-            let weak = weak.clone();
-            Box::pin(async move {
-                let Some(node) = weak.upgrade() else {
-                    return Err(baserunna::Error::unavailable("the node is stopping"));
-                };
-                let mut t = node.sys_read().await?;
-                let rec = baserunna::meta::get_db(&mut t, &db).await?;
-                if rec.is_none_or(|r| r.owner_id != owner) {
-                    return Err(baserunna::Error::internal("a worker committed to a database of another owner"));
-                }
-                node.engine.db(&db).commit_detailed(request).await
-            })
-        }));
-        let weak = Arc::downgrade(&node);
-        w.set_binder(Box::new(move |owner, db, bind| {
-            let weak = weak.clone();
-            Box::pin(async move {
-                let Some(node) = weak.upgrade() else {
-                    return Err(baserunna::Error::unavailable("the node is stopping"));
-                };
-                let mut t = node.sys_read().await?;
-                let rec = baserunna::meta::get_db(&mut t, &db).await?;
-                if rec.is_none_or(|r| r.owner_id != owner) {
-                    return Err(baserunna::Error::internal("a worker bound parts to a database of another owner"));
-                }
-                node.bind_events(node.engine.db(&db), bind).await
-            })
-        }));
+        w.set_node_id(node.id.clone());
         let idle = w.clone();
         tokio::spawn(async move {
             loop {

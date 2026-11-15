@@ -559,6 +559,13 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
                 };
             }
         }
+        if let Some(w) = node.engine.shared.workers.get() {
+            let resp = w.http(principal, rec.clone(), access, deadline, req).await?;
+            if resp.status() == StatusCode::NOT_FOUND {
+                node.forget_db_name(&rec.owner_id, &rec.name);
+            }
+            return Ok(resp);
+        }
         // Verify that the database manifest is not deleted, and re-resolve the name with a
         // strong metadata read if it is.
         let read_only = matches!(*req.method(), http::Method::GET | http::Method::HEAD);
@@ -601,14 +608,9 @@ async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next)
             }
         };
         let ctx = DbCtx { principal, rec: rec.clone(), access, db, deadline };
-        let resp = match node.engine.shared.workers.get() {
-            Some(w) => w.http(ctx, req).await?,
-            None => {
-                req.extensions_mut().insert(ctx.principal.clone());
-                req.extensions_mut().insert(ctx);
-                next.run(req).await
-            }
-        };
+        req.extensions_mut().insert(ctx.principal.clone());
+        req.extensions_mut().insert(ctx);
+        let resp = next.run(req).await;
         if resp.status() == StatusCode::NOT_FOUND {
             node.forget_db_name(&rec.owner_id, &rec.name);
         }

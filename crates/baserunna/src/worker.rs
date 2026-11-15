@@ -127,49 +127,23 @@ enum JobResult {
 enum ToWorker {
     /// A job to run; the frame's ID names the job.
     Job(Box<Job>),
-    /// The outcome of the worker's commit call with the frame's ID, or its error as a JSON error body.
-    Committed(std::result::Result<crate::engine::Committed, serde_json::Value>),
-    /// The outcome of the worker's bind call with the frame's ID: one result for each bind slot.
-    Bound(BindOutcome),
 }
-
-/// The JSON form of a bind's outcome: one result for each slot, or the error of the whole bind.
-type BindOutcome =
-    std::result::Result<Vec<std::result::Result<crate::engine::Committed, serde_json::Value>>, serde_json::Value>;
 
 /// A frame header that a worker sends to the node.
 #[derive(Serialize, Deserialize)]
 enum FromWorker {
     /// The result of the job with the frame's ID.
     Done(JobResult),
-    /// A call to commit `request` to database `db` as the lease holder; the frame's ID names the call.
-    Commit { db: String, request: Box<crate::engine::CommitRequest> },
-    /// A call to bind the encoded [`Bind`] to database `db` as the lease holder; the frame's ID names the call.
-    Bind { db: String, bind: Vec<u8> },
 }
 
-/// Binds a worker's staged event parts for owner `owner` to database `db` in the node process.
-pub type WorkerBinder = Box<
-    dyn Fn(
-            String,
-            String,
-            Bind,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Result<crate::engine::Committed>>>> + Send>>
-        + Send
-        + Sync,
->;
+/// The environment variable that gives a worker the node's ID.
+pub const WORKER_NODE_ID_VAR: &str = "BASERUNNA_WORKER_NODE_ID";
 
-/// Commits a worker's write set for owner `owner` to database `db` in the node process.
-pub type WorkerCommitter = Box<
-    dyn Fn(
-            String,
-            String,
-            crate::engine::CommitRequest,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::engine::Committed>> + Send>>
-        + Send
-        + Sync,
->;
+/// The engine cache of the node process, which holds only the system database.
+pub const MAIN_CACHE_BYTES: usize = 16 << 20;
+
+/// The engine cache of one worker; it counts against the owner's memory limit.
+pub const WORKER_CACHE_BYTES: usize = 64 << 20;
 
 /// The most requests of one owner that the node has in flight in the owner's worker.
 pub const OWNER_IN_FLIGHT_MAX: usize = 64;
@@ -197,10 +171,10 @@ pub struct WorkerPool {
     cfg: PoolConfig,
     db_owners: Mutex<HashMap<String, String>>,
     owner_resolver: std::sync::OnceLock<OwnerResolver>,
-    committer: Arc<std::sync::OnceLock<WorkerCommitter>>,
+    /// The node's ID, under which workers hold the leases of their databases.
+    node_id: std::sync::OnceLock<String>,
     /// Each owner's requests in flight: [`OWNER_IN_FLIGHT_MAX`] permits.
     owner_in_flight: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
-    binder: Arc<std::sync::OnceLock<WorkerBinder>>,
     owner_workers: Mutex<HashMap<String, Arc<OwnerWorker>>>,
     next_job_id: std::sync::atomic::AtomicU64,
 }
@@ -219,9 +193,8 @@ impl WorkerPool {
             cfg,
             db_owners: Mutex::new(HashMap::new()),
             owner_resolver: Default::default(),
-            committer: Default::default(),
+            node_id: Default::default(),
             owner_in_flight: Mutex::new(HashMap::new()),
-            binder: Default::default(),
             owner_workers: Mutex::new(HashMap::new()),
             next_job_id: 0.into(),
         })
@@ -250,17 +223,13 @@ impl WorkerPool {
         }
     }
 
-    /// Sets the function that commits workers' write sets in the node process.
-    pub fn set_committer(&self, f: WorkerCommitter) {
-        let _ = self.committer.set(f);
+    /// Sets the node's ID, which each worker uses as its own, so a new worker of an owner
+    /// holds the leases that the owner's last worker held.
+    pub fn set_node_id(&self, id: String) {
+        let _ = self.node_id.set(id);
     }
 
-    /// Sets the function that binds workers' staged event parts in the node process.
-    pub fn set_binder(&self, f: WorkerBinder) {
-        let _ = self.binder.set(f);
-    }
-
-    /// Sets the function that reads a database's `owner_id` from the system database.
+    /// Sets the function that reads the owner of a database.
     pub fn set_owner_resolver(&self, f: OwnerResolver) {
         let _ = self.owner_resolver.set(f);
     }
@@ -400,12 +369,19 @@ impl WorkerPool {
     /// Serves database request `req` in a worker inside the owner's cgroup. The request and
     /// response bodies stream through the boundary's credit windows, so the node holds at most
     /// [`boundary::WINDOW_CHUNKS`] chunks of each body.
-    pub async fn http(&self, ctx: crate::api::DbCtx, req: axum::extract::Request) -> Result<axum::response::Response> {
-        let owner = ctx.rec.owner_id.clone();
-        let in_flight = self.admit(&owner, ctx.deadline.instant()).await?;
+    pub async fn http(
+        &self,
+        principal: crate::node::Principal,
+        rec: crate::meta::DbRecord,
+        access: crate::meta::Access,
+        deadline: crate::node::Deadline,
+        req: axum::extract::Request,
+    ) -> Result<axum::response::Response> {
+        let owner = rec.owner_id.clone();
+        let in_flight = self.admit(&owner, deadline.instant()).await?;
         let (parts, body) = req.into_parts();
-        let left = ctx.deadline.instant().saturating_duration_since(tokio::time::Instant::now());
-        let context = HttpContext { principal: ctx.principal, rec: ctx.rec, access: ctx.access };
+        let left = deadline.instant().saturating_duration_since(tokio::time::Instant::now());
+        let context = HttpContext { principal, rec, access };
         let head = boundary::RequestHead {
             method: parts.method.to_string(),
             uri: parts.uri.to_string(),
@@ -601,19 +577,25 @@ impl WorkerPool {
         {
             return Ok(w.clone());
         }
-        let worker = self.start_worker(owner).map_err(|e| Error::internal(format!("worker: {e}")))?;
+        let worker = self.start_worker(owner).map_err(|e| Error::unavailable(format!("cannot start the owner's worker: {e}")))?;
         workers.insert(owner.to_string(), worker.clone());
         Ok(worker)
     }
 
     fn start_worker(&self, owner: &str) -> std::io::Result<Arc<OwnerWorker>> {
         let owner_dir = self.owner_cgroup(owner)?;
-        let leaf = owner_dir.join("worker");
-        if !leaf.exists() {
-            std::fs::create_dir(&leaf)?;
+        // The worker runs in the owner's cgroup itself, one level below the node's cgroup, so a
+        // teardown that waits for the node's child cgroups to empty also waits for workers.
+        let leaf = owner_dir.clone();
+        // Two workers of one owner would both hold the owner's leases, so a new worker starts
+        // only after the kernel reports that the last one has exited.
+        if std::fs::read_to_string(leaf.join("cgroup.procs")).is_ok_and(|p| !p.trim().is_empty()) {
+            let _ = std::fs::write(leaf.join("cgroup.kill"), "1");
+            return Err(std::io::Error::other("the owner's last worker is still exiting"));
         }
         let mut child = tokio::process::Command::new(&self.cfg.exe)
             .arg("worker")
+            .env(WORKER_NODE_ID_VAR, self.node_id.get().map(String::as_str).unwrap_or_default())
             // Large buffers map their own pages and the heap trims its top, so freed job
             // memory leaves the owner's cgroup instead of staying in the allocator.
             .env(
@@ -644,9 +626,6 @@ impl WorkerPool {
         });
         tokio::spawn(boundary::write_frames(stdin, to_send));
         let reader = worker.clone();
-        let committer = self.committer.clone();
-        let binder = self.binder.clone();
-        let owner = owner.to_string();
         let limit_mib = self.cfg.owner_memory_bytes >> 20;
         let ooms_before = oom_kills(&owner_dir);
         tokio::spawn(async move {
@@ -658,38 +637,6 @@ impl WorkerPool {
                 let Ok((job_id, header, payload)) = split_job(frame) else { break };
                 let result = match serde_json::from_slice::<FromWorker>(&header) {
                     Ok(FromWorker::Done(h)) => Ok((h, payload)),
-                    Ok(FromWorker::Commit { db, request }) => {
-                        let (committer, frames, owner) = (committer.clone(), reader.frames.clone(), owner.clone());
-                        tokio::spawn(async move {
-                            let committed = match committer.get() {
-                                Some(commit) => commit(owner, db, *request).await,
-                                None => Err(Error::internal("the worker pool has no committer")),
-                            };
-                            let reply = ToWorker::Committed(
-                                committed.map_err(|e| json!({ "error": crate::api::error_json(&e) })),
-                            );
-                            let header = serde_json::to_vec(&reply).unwrap_or_default();
-                            let _ = frames.send(job_frame(job_id, &header, &[]));
-                        });
-                        continue;
-                    }
-                    Ok(FromWorker::Bind { db, bind }) => {
-                        let (binder, frames, owner) = (binder.clone(), reader.frames.clone(), owner.clone());
-                        tokio::spawn(async move {
-                            let bound = match (binder.get(), Bind::decode(&bind)) {
-                                (Some(bind_parts), Ok(bind)) => bind_parts(owner, db, bind).await,
-                                (None, _) => Err(Error::internal("the worker pool has no binder")),
-                                (_, Err(e)) => Err(Error::internal(format!("worker bind: {e}"))),
-                            };
-                            let err = |e: Error| json!({ "error": crate::api::error_json(&e) });
-                            let reply = ToWorker::Bound(
-                                bound.map(|rs| rs.into_iter().map(|r| r.map_err(err)).collect()).map_err(err),
-                            );
-                            let header = serde_json::to_vec(&reply).unwrap_or_default();
-                            let _ = frames.send(job_frame(job_id, &header, &[]));
-                        });
-                        continue;
-                    }
                     Err(e) => Err(Error::internal(format!("worker result: {e}"))),
                 };
                 *reader.last_used.lock() = std::time::Instant::now();
@@ -715,9 +662,6 @@ impl WorkerPool {
         Ok(worker)
     }
 }
-
-/// Delivers the node's answer to a worker's commit call.
-type CommitDone = tokio::sync::oneshot::Sender<Result<crate::engine::Committed>>;
 
 /// Delivers a job's result and payload to the request that waits for it.
 type JobDone = tokio::sync::oneshot::Sender<Result<(JobResult, Bytes)>>;
@@ -755,7 +699,7 @@ struct OwnerWorker {
     streams: boundary::Streams,
     /// Jobs sent to the worker that wait for their results, by job ID.
     pending: Mutex<HashMap<u64, JobDone>>,
-    /// The worker's cgroup, below the owner's cgroup.
+    /// The owner's cgroup, which holds the worker process.
     leaf: PathBuf,
     exited: std::sync::atomic::AtomicBool,
     /// When the last job of this worker started or ended.
@@ -803,52 +747,6 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
     let (results, to_write) = tokio::sync::mpsc::unbounded_channel::<boundary::Frame>();
     let writer = tokio::spawn(boundary::write_frames(tokio::io::stdout(), to_write));
     let streams = Arc::new(boundary::Streams::default());
-    let commit_calls: Arc<Mutex<HashMap<u64, CommitDone>>> = Default::default();
-    let next_call_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    {
-        let (results, calls) = (results.clone(), commit_calls.clone());
-        let remote: crate::engine::RemoteCommit = Box::new(move |db, request| {
-            let call_id = next_call_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let (done, committed) = tokio::sync::oneshot::channel();
-            calls.lock().insert(call_id, done);
-            let header = serde_json::to_vec(&FromWorker::Commit { db, request: Box::new(request) });
-            let sent =
-                header.map_err(|e| Error::internal(format!("cannot encode the commit: {e}"))).and_then(
-                    |h| match results.send(job_frame(call_id, &h, &[])) {
-                        Ok(()) => Ok(()),
-                        Err(_) => Err(Error::internal("the worker cannot reach the node")),
-                    },
-                );
-            Box::pin(async move {
-                sent?;
-                committed.await.map_err(|_| Error::internal("the node dropped the commit"))?
-            })
-        });
-        let _ = engine.shared.remote_commit.set(remote);
-    }
-    let bind_calls: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<BindOutcome>>>> = Default::default();
-    {
-        let (results, calls) = (results.clone(), bind_calls.clone());
-        let next_bind_id = std::sync::atomic::AtomicU64::new(u64::MAX / 2);
-        let remote: crate::engine::RemoteBind = Box::new(move |db, bind| {
-            let call_id = next_bind_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let (done, bound) = tokio::sync::oneshot::channel();
-            calls.lock().insert(call_id, done);
-            let header = serde_json::to_vec(&FromWorker::Bind { db, bind: bind.encode().to_vec() });
-            let sent = header.map_err(|e| Error::internal(format!("cannot encode the bind: {e}"))).and_then(|h| {
-                results
-                    .send(job_frame(call_id, &h, &[]))
-                    .map_err(|_| Error::internal("the worker cannot reach the node"))
-            });
-            Box::pin(async move {
-                sent?;
-                let from_json = |e: serde_json::Value| crate::api::error_from_json(500, &e);
-                let bound = bound.await.map_err(|_| Error::internal("the node dropped the bind"))?;
-                bound.map(|rs| rs.into_iter().map(|r| r.map_err(from_json)).collect()).map_err(from_json)
-            })
-        });
-        let _ = engine.shared.remote_bind.set(remote);
-    }
     let mut stdin = tokio::io::stdin();
     while let Ok(frame) = boundary::read_frame(&mut stdin).await {
         match frame.kind {
@@ -868,18 +766,6 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
         }
         let Ok((job_id, header, payload)) = split_job(frame) else { break };
         let job = match serde_json::from_slice::<ToWorker>(&header) {
-            Ok(ToWorker::Committed(r)) => {
-                if let Some(done) = commit_calls.lock().remove(&job_id) {
-                    let _ = done.send(r.map_err(|e| crate::api::error_from_json(500, &e)));
-                }
-                continue;
-            }
-            Ok(ToWorker::Bound(r)) => {
-                if let Some(done) = bind_calls.lock().remove(&job_id) {
-                    let _ = done.send(r);
-                }
-                continue;
-            }
             Ok(ToWorker::Job(job)) => Ok(*job),
             Err(e) => Err(e),
         };

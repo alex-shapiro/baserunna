@@ -231,6 +231,7 @@ the item of the requirement. "Planned" paths do not exist yet.
 | --- | --- | --- |
 | Accept connections, with a fixed limit on open connections | 1 | `main.rs` `run`, planned `ConnLimit` (today no limit) |
 | Read HTTP headers with fixed hyper buffer and header limits | 1 | `main.rs` `run`, planned hyper builder settings |
+| One hyper task per connection, under the connection limit | 1 | `main.rs` `run` (the serve loop) |
 | Request context: deadline, client address, metrics | 1 | `api/mod.rs:715` `request_context`, `:346` `tag_client` |
 | Close a connection with an unread body | 2 | `api/mod.rs:1169` `close_if_body_unread` |
 | Authenticate: auth cache, miss goes to the system instance | 1 | `auth.rs`, planned `SystemInstance::auth` |

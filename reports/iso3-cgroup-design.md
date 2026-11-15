@@ -85,8 +85,8 @@ do all reads and writes of the store.
 Each line: what it does | allowed item | code path (today, or planned).
 **[changed]** marks a line that revision 2 changed or added.
 
-1. Accept TCP connections and set `TCP_NODELAY` | 1 | `main.rs` `axum::serve` (today).
-2. Read HTTP headers under hyper's fixed header limits | 1 | `main.rs` `axum::serve` (today; planned: explicit header count and buffer size).
+1. **[changed, revision 3]** Accept TCP connections up to a fixed limit for the node and a fixed limit for each client address; refuse the rest at accept | 1 | `main.rs:279` `axum::serve` (today: no limit; planned: a counting accept loop in `main.rs` with `NODE_CONNECTIONS_MAX` and `CLIENT_CONNECTIONS_MAX`).
+2. **[changed, revision 3]** Read HTTP headers with hyper's limits set in the code: HTTP/1 `max_buf_size`, header count, and header size. HTTP/2 is off (code, `Cargo.toml`: axum feature `http1` only) | 1 | planned `main.rs` `hyper_util::server::conn::auto::Builder` with explicit limits, and a test that each limit holds.
 3. **[changed]** Authenticate the request: look up the token or cookie in `auth_cache`; on a miss, send one fixed-size point-read frame to the system worker | 1 | `node.rs` `authenticate_metered` (today `node.rs:1019`; planned: the miss goes to the system worker).
 4. **[changed]** Look up the database record and its `owner_id`, and the org role, the same way: cache, then one point-read frame | 1 | `node.rs` `resolve_db` (today; planned: the miss goes to the system worker).
 5. **[changed]** Route by the path only: a database path goes to the worker of the record's `owner_id` (for an org's database, the org's worker). This includes `/v1/dbs/{db}/...` and `/console/dbs/{db}/...` (KV, KV download and upload, blobs, transactions, tables, event queries, stream records). An org path goes to the org's worker. Other signed-in paths go to the user's worker. Paths before sign-in go to the anonymous worker. A database with its lease on a peer goes to the peer | 1 | planned `api/mod.rs` `router` with one fallback handler `proxy_to_worker`.
@@ -277,7 +277,7 @@ a handler's answer. So no table path has a handler in the main process.
 
 ## 5. Plan for rounds 2 to 8
 
-1. **Round 2: boundary and streaming.** Binary frames; streamed request
+1. **Round 2 (done in round 3, commits 0f57ebb and a36c16b): boundary and streaming.** Binary frames; streamed request
    and response bodies with credit windows; per-owner in-flight
    semaphore; delete the light list and the per-site charges.
 2. **Round 3: the main router and the system worker.** Main router

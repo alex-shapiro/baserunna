@@ -195,9 +195,44 @@ pub struct WorkerPool {
     owner_in_flight: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     owner_workers: Mutex<HashMap<String, Arc<OwnerWorker>>>,
     next_job_id: std::sync::atomic::AtomicU64,
+    /// Makes the node of each new worker in this process, for tests; `None` starts processes.
+    in_process: Option<WorkerNodeFactory>,
+    /// The request streams that the pool has opened to workers.
+    opened_streams: std::sync::atomic::AtomicU64,
 }
 
+/// Makes the node of a worker that runs in the node process, for tests.
+pub type WorkerNodeFactory = Box<dyn Fn() -> Arc<crate::node::Node> + Send + Sync>;
+
 impl WorkerPool {
+    /// Returns a pool whose workers run in this process over in-memory pipes, without cgroups,
+    /// each with a node from `make`. Tests use it to drive real request streams.
+    pub fn in_process(make: WorkerNodeFactory) -> WorkerPool {
+        let cfg = PoolConfig {
+            cgroup_root: PathBuf::new(),
+            exe: PathBuf::new(),
+            owner_memory_bytes: OWNER_MEMORY_BYTES,
+            owner_cpu_weight: 100,
+            main_cpu_weight: 100,
+        };
+        WorkerPool {
+            cfg,
+            db_owners: Mutex::new(HashMap::new()),
+            owner_resolver: Default::default(),
+            node_id: Default::default(),
+            owner_in_flight: Mutex::new(HashMap::new()),
+            owner_workers: Mutex::new(HashMap::new()),
+            next_job_id: 0.into(),
+            in_process: Some(make),
+            opened_streams: 0.into(),
+        }
+    }
+
+    /// Returns the number of request streams that the pool has opened to workers.
+    pub fn opened_streams(&self) -> u64 {
+        self.opened_streams.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Enables the memory and CPU controllers below `cfg.cgroup_root`, and gives the node
     /// process its CPU weight if the node runs in a child cgroup of `cfg.cgroup_root`.
     pub fn new(cfg: PoolConfig) -> std::io::Result<WorkerPool> {
@@ -215,6 +250,8 @@ impl WorkerPool {
             owner_in_flight: Mutex::new(HashMap::new()),
             owner_workers: Mutex::new(HashMap::new()),
             next_job_id: 0.into(),
+            in_process: None,
+            opened_streams: 0.into(),
         })
     }
 
@@ -428,6 +465,7 @@ impl WorkerPool {
         let (inbox, resp_body) = boundary::credited_body(id, worker.frames.clone());
         let credits = worker.streams.register(id, Some(inbox), Some(head_done));
         let open = boundary::Frame::new(boundary::FrameKind::Open, id, head.encode());
+        self.opened_streams.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if worker.exited.load(std::sync::atomic::Ordering::Acquire) || worker.frames.send(open).is_err() {
             worker.streams.remove(id);
             tokio::spawn(boundary::drain_body(body));
@@ -690,6 +728,13 @@ impl WorkerPool {
     }
 
     fn start_worker(&self, owner: &str) -> std::io::Result<Arc<OwnerWorker>> {
+        if let Some(make) = &self.in_process {
+            let (node_side, worker_side) = tokio::io::duplex(4 * boundary::CHUNK_MAX);
+            let (worker_in, worker_out) = tokio::io::split(worker_side);
+            tokio::spawn(serve_io(make(), worker_in, worker_out));
+            let (from_worker, to_worker) = tokio::io::split(node_side);
+            return Ok(self.attach(owner, PathBuf::new(), None, to_worker, from_worker));
+        }
         let owner_dir = self.owner_cgroup(owner)?;
         // The worker runs in the owner's cgroup itself, one level below the node's cgroup, so a
         // teardown that waits for the node's child cgroups to empty also waits for workers.
@@ -721,22 +766,36 @@ impl WorkerPool {
             return Err(e);
         }
         let stdin = child.stdin.take().expect("piped stdin");
-        let mut stdout = child.stdout.take().expect("piped stdout");
+        let stdout = child.stdout.take().expect("piped stdout");
+        Ok(self.attach(owner, leaf, Some(child), stdin, stdout))
+    }
+
+    /// Joins a started worker to the pool: `to_worker` carries frames to it and `from_worker`
+    /// carries its frames back. `child` is its process, if it has one.
+    fn attach(
+        &self,
+        owner: &str,
+        leaf: PathBuf,
+        child: Option<tokio::process::Child>,
+        to_worker: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+        mut from_worker: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    ) -> Arc<OwnerWorker> {
+        let _ = owner;
         let (frames, to_send) = tokio::sync::mpsc::unbounded_channel::<boundary::Frame>();
         let worker = Arc::new(OwnerWorker {
             frames,
             pending: Mutex::new(HashMap::new()),
             streams: boundary::Streams::default(),
-            leaf,
+            leaf: leaf.clone(),
             exited: false.into(),
             last_used: Mutex::new(std::time::Instant::now()),
         });
-        tokio::spawn(boundary::write_frames(stdin, to_send));
+        tokio::spawn(boundary::write_frames(to_worker, to_send));
         let reader = worker.clone();
         let limit_mib = self.cfg.owner_memory_bytes >> 20;
-        let ooms_before = oom_kills(&owner_dir);
+        let ooms_before = oom_kills(&leaf);
         tokio::spawn(async move {
-            while let Ok(frame) = boundary::read_frame(&mut stdout).await {
+            while let Ok(frame) = boundary::read_frame(&mut from_worker).await {
                 if frame.kind != boundary::FrameKind::Job {
                     reader.streams.deliver(frame);
                     continue;
@@ -752,13 +811,16 @@ impl WorkerPool {
                 }
             }
             reader.exited.store(true, std::sync::atomic::Ordering::Release);
-            let status = child.wait().await;
-            let oom = oom_kills(&owner_dir) > ooms_before;
+            let status = match child {
+                Some(mut child) => format!("{:?}", child.wait().await),
+                None => "the end of its pipe".to_string(),
+            };
+            let oom = oom_kills(&leaf) > ooms_before;
             let exit_error = |oom: bool| {
                 if oom {
                     Error::TooLarge(format!("the work exceeded the owner's memory limit of {limit_mib} MiB"))
                 } else {
-                    Error::internal(format!("worker exited with {status:?}"))
+                    Error::internal(format!("worker exited with {status}"))
                 }
             };
             reader.streams.fail_all(&exit_error(oom));
@@ -766,7 +828,7 @@ impl WorkerPool {
                 let _ = done.send(Err(exit_error(oom)));
             }
         });
-        Ok(worker)
+        worker
     }
 }
 
@@ -852,6 +914,16 @@ fn oom_kills(cgroup: &std::path::Path) -> u64 {
 
 /// Runs the jobs that the node sends on stdin and writes each result to stdout (the `baserunna worker` command).
 pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
+    serve_io(node, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// Runs the jobs and request streams that the node sends on `input`, and writes each result
+/// and response to `output`.
+async fn serve_io(
+    node: Arc<crate::node::Node>,
+    mut input: impl tokio::io::AsyncRead + Unpin,
+    output: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+) -> std::io::Result<()> {
     let engine = node.engine.clone();
     // Console pages call the API in process, so the worker's node serves the full router and
     // handles each database request itself.
@@ -860,11 +932,10 @@ pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
         .layer(axum::extract::DefaultBodyLimit::max(node.cfg.max_json_body))
         .with_state(node.clone());
     let (results, to_write) = tokio::sync::mpsc::unbounded_channel::<boundary::Frame>();
-    let writer = tokio::spawn(boundary::write_frames(tokio::io::stdout(), to_write));
+    let writer = tokio::spawn(boundary::write_frames(output, to_write));
     let streams = Arc::new(boundary::Streams::default());
     let stream_tasks: Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>> = Default::default();
-    let mut stdin = tokio::io::stdin();
-    while let Ok(frame) = boundary::read_frame(&mut stdin).await {
+    while let Ok(frame) = boundary::read_frame(&mut input).await {
         match frame.kind {
             boundary::FrameKind::Job => {}
             boundary::FrameKind::Open => {

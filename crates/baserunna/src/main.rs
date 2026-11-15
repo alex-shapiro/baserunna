@@ -197,6 +197,12 @@ async fn run() -> Result<(), String> {
     let transport: Arc<dyn Transport> = Arc::new(HttpTransport::new());
     let env = Arc::new(Env::real());
     let services = Services { transport, oidc, mailer };
+    // With workers, this process may touch only the system database and objects outside any
+    // database; its store fails every access to a tenant database.
+    let store: baserunna::store::DynStore = match workers {
+        Some(_) => Arc::new(baserunna::store::TenantDenyingStore::new(store)),
+        None => store,
+    };
     let node = Node::start(cfg, env.clone(), store, services).await.map_err(|e| format!("startup failed: {e}"))?;
     if let Some(w) = workers {
         let weak = Arc::downgrade(&node);

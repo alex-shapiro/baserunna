@@ -1,6 +1,8 @@
 //! Object storage abstraction.
 
 pub mod conformance;
+mod guard;
+pub use guard::TenantDenyingStore;
 mod fs;
 mod mem;
 

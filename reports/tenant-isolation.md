@@ -2,6 +2,9 @@
 
 ## Decision
 
+Round 2 of the contest is in progress, under the rules in section 4.
+The decision below is from round 1, and round 2 will replace it.
+
 **No design is ready to adopt. The next step is one experiment: put all
 tenant work inside a WebAssembly boundary and check its cost.** Two
 boundary designs went into the contest: a worker pool under cgroups, and
@@ -55,7 +58,13 @@ neither passed a hidden workload. Under rule 3.6 step 5, neither wins.
 ended with 413 or 503, and the node survived (measured,
 `cgroup-blob_checks-attack.json`, `wasm-blob_checks-attack.json`).
 
-**Every failure was on a path outside the boundary:**
+**Every failure was on a path outside the boundary.** My instructions
+put these paths outside the boundary. The advocates did not choose to
+leave them out. The cgroup prompt told that design to keep "light
+requests" in the main process. A transaction is a light request. I then
+cut both plans to the four known workloads to save time. So the hidden
+workloads measured my scope limits, not what the designs can cover.
+Round 2 (section 4) removes both limits. The failing paths:
 
 - `txn_scans`: the scan ops of one transaction build whole pages of
   values in the node process (code, `crates/baserunna/src/ops.rs:500`).
@@ -408,3 +417,65 @@ Each workload has a **small variant** that a correct node must complete.
    then names the experiment that would decide.
 
 Today's code (`main`) runs as a control. It is not a candidate.
+
+## 4. Round 2 rules
+
+These rules were committed before either round 2 advocate started.
+Section 3 still applies, except where this section changes it.
+
+### 4.1 Why round 2 exists
+
+Round 1 measured my scope limits more than the designs. The cgroup
+prompt kept light requests out of the boundary, and I cut both plans to
+the four known workloads. Round 1 also had two measurement flaws. The
+store had no delay. The throughput benchmark called the router in the
+same process, so it skipped the network.
+
+### 4.2 Candidates and time
+
+- A new advocate agent builds each design, starting from its round 1
+  branch. The branches are `iso2/cgroup` (from 400f6a3) and `iso2/wasm`
+  (from e4b39fa).
+- Each advocate gets the round 1 results, the failures, and their
+  causes.
+- Each advocate gets 6 rounds of 20 minutes. Both get the same count.
+
+### 4.3 The boundary
+
+- Each advocate decides which work goes inside its boundary.
+- For each kind of tenant work that stays outside, the advocate must
+  name it and the mechanism that bounds it at run time. A test must show
+  that the bound holds.
+- CPU is in scope. Work of one owner must not slow another owner past
+  the §3.3 latency bound.
+
+### 4.4 Workloads
+
+- **Known:** the four workloads from section 3.2, plus `txn_scans` and
+  `table_filter_scans` from round 1.
+  - `txn_scans`: 4 concurrent transactions, each with 16 scans of
+    32 MiB of values.
+  - `table_filter_scans`: 32 clients run table queries with filters
+    that match no row, so each query examines 10,000 rows.
+- **Hidden:** two new workloads. A separate agent writes them after
+  both round 2 prototypes are final. That agent reads neither prototype
+  and no advocate report.
+
+### 4.5 Measurements
+
+- The fake store delays every request by 20 ms (`FAKE_S3_LATENCY_MS`,
+  commit 470075b).
+- **Throughput:** the client process sends the KV mix of the throughput
+  benchmark (2,000 databases, 10% writes) to the node over HTTP. The
+  node runs with its boundary on. The client count is the smallest that
+  keeps today's node at 90% or more of its CPU. The limit is a loss of
+  5% ops/s against today's code.
+- **Event query cost:** the event scan benchmark through the node, with
+  the store delay. The limit is 50% more median wall time for each of
+  the 7 queries on its own. A query that today's code answers and a
+  candidate refuses is over the limit.
+- **Tests:** the library tests and `cargo test --test sim` must pass.
+
+### 4.6 How the winner is chosen
+
+The steps of section 3.6 apply, with the cost readings of section 4.5.

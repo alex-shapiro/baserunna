@@ -407,3 +407,49 @@ pub unsafe extern "C" fn guest_write_encoded(ptr: *const u8, len: u32) -> u32 {
         }
     }
 }
+
+/// Reads a blob value with the node's `blob::read_range` and compares it with the expected value.
+///
+/// The input is a `u32` header length, a JSON `CheckInput`, and the expected
+/// value. Returns 0 with output `1` (equal) or `0`, or 1 with an error message.
+///
+/// # Safety
+/// `ptr` and `len` must name `len` initialized bytes from `guest_alloc`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn guest_blob_equals(ptr: *const u8, len: u32) -> u32 {
+    use baserunna::events::sandboxed::CheckInput;
+    let body = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let header_len = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+    let input: CheckInput = match serde_json::from_slice(&body[4..4 + header_len]) {
+        Ok(i) => i,
+        Err(e) => {
+            set_output(e.to_string().into_bytes());
+            return 1;
+        }
+    };
+    let want = &body[4 + header_len..];
+    let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
+    let out = rt.block_on(async move {
+        let env = baserunna::env::Env::sim(input.seed, input.now_ms, tokio::time::Instant::now(), 0);
+        let engine = baserunna::engine::Engine::new(
+            std::sync::Arc::new(HostStore),
+            std::sync::Arc::new(env),
+            input.config.engine_config(),
+            "guest".into(),
+        );
+        let blob = baserunna::engine::BlobRef::decode(&mut baserunna::util::codec::Reader::new(&input.blob))
+            .map_err(|_| baserunna::Error::internal("corrupt blob reference"))?;
+        let got = baserunna::engine::blob::read_range(&engine.shared, &input.db, &blob, 0..blob.size).await?;
+        Ok::<_, baserunna::Error>(got[..] == want[..])
+    });
+    match out {
+        Ok(equal) => {
+            set_output(if equal { b"1".to_vec() } else { b"0".to_vec() });
+            0
+        }
+        Err(e) => {
+            set_output(format!("{e:?}").into_bytes());
+            1
+        }
+    }
+}

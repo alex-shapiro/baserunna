@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::engine::events::PartRef;
 use crate::engine::Shared;
 use crate::engine::events::Pos;
-use crate::events::sandboxed::{EventConfig, MergeInput, QueryInput, QueryOutput, SandboxRunner, WriteInput, WrittenPart};
+use crate::events::sandboxed::{CheckInput, EventConfig, MergeInput, QueryInput, QueryOutput, SandboxRunner, WriteInput, WrittenPart};
 use crate::events::schema::EventSchema;
 use crate::store::BoxFut;
 use crate::store::{DynStore, GetOpts, PutMode, StoreError};
@@ -436,6 +436,34 @@ impl NodeSandbox {
 }
 
 impl SandboxRunner for NodeSandbox {
+    fn blob_equals<'a>(
+        &'a self,
+        db: &'a str,
+        blob: &'a crate::engine::types::BlobRef,
+        want: &'a [u8],
+    ) -> BoxFut<'a, Result<bool>> {
+        Box::pin(async move {
+            let owner = self.owner(db).await?;
+            let seed = self.seed();
+            let mut w = crate::util::codec::Writer::with_capacity(96);
+            blob.encode(&mut w);
+            let header = CheckInput {
+                db: db.to_string(),
+                blob: w.buf,
+                config: EventConfig::of(&self.shared.cfg),
+                seed,
+                now_ms: self.shared.env.now_ms(),
+            };
+            let header = serde_json::to_vec(&header).map_err(|e| Error::internal(format!("check input: {e}")))?;
+            let len_prefix = (header.len() as u32).to_le_bytes();
+            let out = self
+                .sandbox
+                .call_with_pieces(&owner, Some(self.shared.store.clone()), seed, &[&len_prefix, &header, want], CALL_FUEL, "guest_blob_equals")
+                .await?;
+            Ok(out == b"1")
+        })
+    }
+
     fn write_encoded<'a>(
         &'a self,
         db: &'a str,

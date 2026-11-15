@@ -577,11 +577,12 @@ async fn exec_one(ctx: &OpCtx<'_>, txn: &mut Txn, op: &Op, index: usize) -> Resu
             }
             if let Some(want) = value {
                 let want = enc.decode(want, "value")?;
-                let got = match &r {
-                    Some(rv) => Some(value_bytes(ctx.db, &rv.value).await?),
-                    None => None,
+                let equal = match (r.as_ref().map(|rv| &rv.value), ctx.db.shared().sandbox.get()) {
+                    (Some(Value::Blob(b)), Some(sandbox)) => sandbox.blob_equals(&ctx.db.id, b, &want).await?,
+                    (Some(v), _) => value_bytes(ctx.db, v).await?[..] == want[..],
+                    (None, _) => false,
                 };
-                if got.as_deref() != Some(&want[..]) {
+                if !equal {
                     return Err(fail(format!("key {key} does not have the expected value")));
                 }
             }

@@ -3913,4 +3913,27 @@ mod sandbox_merge {
             assert_eq!(query(&db, &q).await.unwrap().rows, vec![vec![json!(3010)]]);
         });
     }
+
+    #[test]
+    fn blob_value_check_runs_in_sandbox_and_traps_at_bound() {
+        rt().block_on(async {
+            let (eng, _mem, _input, _) = sealed_parts(1, 10).await;
+            let data: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 251) as u8).collect();
+            let blob = crate::engine::blob::write_blob(&eng.shared, "db", &data, "application/octet-stream").await.unwrap();
+            let runner = node_sandbox(&eng, Some("owner-1"));
+            assert!(runner.blob_equals("db", &blob, &data).await.unwrap());
+            let mut other = data.clone();
+            other[17] ^= 1;
+            assert!(!runner.blob_equals("db", &blob, &other).await.unwrap());
+            let peak = runner.sandbox.last_instance_peak();
+            eprintln!("blob check of 1 MiB: peak guest memory {} KiB", peak >> 10);
+            let small = Sandbox::new(&crate::sandbox::tests::guest_wasm(), peak * 3 / 4).unwrap();
+            let owner_of: crate::sandbox::OwnerResolver = Arc::new(|_db: String| Box::pin(async { Ok(Some("owner-1".to_string())) }));
+            let tight = crate::sandbox::NodeSandbox { sandbox: small, shared: eng.shared.clone(), owner_of };
+            let err = tight.blob_equals("db", &blob, &data).await.unwrap_err();
+            eprintln!("blob check under {} KiB: {err:?}", (peak * 3 / 4) >> 10);
+            assert!(matches!(err, Error::TooLarge(_)), "{err:?}");
+            assert_eq!(tight.sandbox.owner_memory_used("owner-1"), 0);
+        });
+    }
 }

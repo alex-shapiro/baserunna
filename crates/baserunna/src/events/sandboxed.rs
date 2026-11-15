@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Engine settings that event part code reads.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventConfig {
+    blob_chunk_size: usize,
     blob_stage_ttl_ms: u64,
     clock_sync_max_error_ms: u64,
     event_block_bytes: usize,
@@ -34,6 +35,7 @@ pub struct EventConfig {
 macro_rules! event_config_fields {
     ($m:ident) => {
         $m!(
+            blob_chunk_size,
             blob_stage_ttl_ms,
             clock_sync_max_error_ms,
             event_block_bytes,
@@ -128,6 +130,18 @@ pub struct WriteInput {
 /// `(version, ordinal)` row positions.
 pub type WrittenPart = (Vec<u8>, Vec<u8>, Vec<(u64, u32)>);
 
+/// Header of a blob value check in the sandbox. The expected value follows it
+/// in guest memory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CheckInput {
+    pub db: String,
+    /// Encoded `BlobRef` of the stored value.
+    pub blob: Vec<u8>,
+    pub config: EventConfig,
+    pub seed: u64,
+    pub now_ms: u64,
+}
+
 /// Runs event work in the node's WebAssembly sandbox, charged to the database owner.
 pub trait SandboxRunner: Send + Sync {
     /// Runs `maint::merge_parts` over `inputs` in the sandbox.
@@ -137,6 +151,14 @@ pub trait SandboxRunner: Send + Sync {
         schema: &'a EventSchema,
         inputs: &'a [PartRef],
     ) -> BoxFut<'a, Result<Option<PartRef>>>;
+
+    /// Reads the blob value `blob` in the sandbox and returns whether it equals `want`.
+    fn blob_equals<'a>(
+        &'a self,
+        db: &'a str,
+        blob: &'a crate::engine::types::BlobRef,
+        want: &'a [u8],
+    ) -> BoxFut<'a, Result<bool>>;
 
     /// Runs `build::write_encoded` for one partition's encoded rows in the sandbox.
     fn write_encoded<'a>(

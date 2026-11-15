@@ -41,6 +41,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 /// Loads the table, runs `rounds` rounds of the 7 queries, and returns the measurements.
+/// A failed query in a round counts in `failed_queries` and is left out of the medians.
 pub async fn run(api: &Api, owner: &Owner, cg: &NodeCgroup, rounds: usize) -> Result<Json, String> {
     let (token, db) = (&owner.token, &owner.db);
     api.create_event_table(
@@ -77,17 +78,18 @@ pub async fn run(api: &Api, owner: &Owner, cg: &NodeCgroup, rounds: usize) -> Re
         api.expect(Method::POST, &path, token, q.to_string(), &[200]).await.map_err(|e| format!("{name}: {e}"))?;
     }
     let mut wall_ms = vec![Vec::new(); queries.len()];
+    let mut failures = Vec::new();
     let cpu_before = cg.cpu_usage_usec();
     let bench_started = Instant::now();
     for _ in 0..rounds {
         for ((name, q), spent) in queries.iter().zip(&mut wall_ms) {
             let t = Instant::now();
-            api.send(Method::POST, &path, token, Bytes::from(q.to_string()))
-                .await
-                .ok()
-                .filter(|r| r.status == 200)
-                .ok_or_else(|| format!("{name} failed during the benchmark"))?;
-            spent.push(t.elapsed().as_secs_f64() * 1000.0);
+            let r = api.send(Method::POST, &path, token, Bytes::from(q.to_string())).await;
+            match r {
+                Ok(r) if r.status == 200 => spent.push(t.elapsed().as_secs_f64() * 1000.0),
+                Ok(r) => failures.push(format!("{name}: status {}: {}", r.status, r.excerpt())),
+                Err(e) => failures.push(format!("{name}: {e}")),
+            }
         }
     }
     let wall_s = bench_started.elapsed().as_secs_f64();
@@ -98,7 +100,7 @@ pub async fn run(api: &Api, owner: &Owner, cg: &NodeCgroup, rounds: usize) -> Re
     let per_query: Vec<Json> = queries
         .iter()
         .zip(&wall_ms)
-        .map(|((name, _), ms)| json!({"query": name, "median_ms": median(ms.clone())}))
+        .map(|((name, _), ms)| json!({"query": name, "median_ms": median(ms.clone()), "successes": ms.len()}))
         .collect();
     Ok(json!({
         "rows": info["rows"], "parts": info["parts"].as_array().map_or(0, Vec::len), "stored_bytes": info["bytes"],
@@ -107,5 +109,7 @@ pub async fn run(api: &Api, owner: &Owner, cg: &NodeCgroup, rounds: usize) -> Re
         "per_query": per_query,
         "bench_wall_s": wall_s,
         "node_cpu_usage_usec": cpu_usec,
+        "failed_queries": failures.len(),
+        "failure_samples": failures.iter().take(5).collect::<Vec<_>>(),
     }))
 }

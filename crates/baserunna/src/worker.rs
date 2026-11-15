@@ -26,6 +26,11 @@ use std::time::Duration;
 /// Default memory limit of one owner's cgroup.
 pub const OWNER_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
+/// The owner's `memory.high` as a percentage of its `memory.max`. Above it, the kernel slows the
+/// owner's allocations, so the owner's streams in flight slow down before the kernel's
+/// `memory.max` stops them.
+pub const OWNER_MEMORY_HIGH_PERCENT: u64 = 87;
+
 /// Idle time after which the node stops an owner's worker.
 pub const WORKER_IDLE_STOP: Duration = Duration::from_secs(20);
 
@@ -279,6 +284,8 @@ impl WorkerPool {
         if !dir.exists() {
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join("memory.max"), self.cfg.owner_memory_bytes.to_string())?;
+            let high = self.cfg.owner_memory_bytes / 100 * OWNER_MEMORY_HIGH_PERCENT;
+            std::fs::write(dir.join("memory.high"), high.to_string())?;
             let _ = std::fs::write(dir.join("memory.swap.max"), "0");
             std::fs::write(dir.join("cpu.weight"), self.cfg.owner_cpu_weight.to_string())?;
         }
@@ -1074,7 +1081,16 @@ async fn serve_stream(
 ) {
     let id = open.id;
     let resp = match boundary::RequestHead::decode(open.data) {
-        Ok(head) => route_stream(&node, router, head, body).await,
+        Ok(_) if !admits_new_request() => {
+            Err(Error::unavailable("the owner's work is near the owner's memory limit; retry later"))
+        }
+        Ok(head) => match route_stream(&node, router, head, body).await {
+            Ok(resp) => {
+                let (parts, body) = resp.into_parts();
+                with_first_chunk(body).await.map(|body| axum::response::Response::from_parts(parts, body))
+            }
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     };
     let resp = resp.unwrap_or_else(|e| axum::response::IntoResponse::into_response(e));
@@ -1084,6 +1100,54 @@ async fn serve_stream(
         boundary::send_body(id, body, credits, out).await;
     }
     streams.remove(id);
+}
+
+/// Waits for the first chunk of response body `body`, so that a response whose body fails
+/// before any byte is ready becomes an HTTP error instead of a cut 200.
+async fn with_first_chunk(body: axum::body::Body) -> Result<axum::body::Body> {
+    use futures_util::StreamExt;
+    let mut data = body.into_data_stream();
+    match data.next().await {
+        None => Ok(axum::body::Body::empty()),
+        Some(Err(e)) => Err(Error::internal(format!("the response body failed: {e}"))),
+        Some(Ok(first)) => {
+            let first = futures_util::stream::once(async move { Ok::<_, axum::Error>(first) });
+            Ok(axum::body::Body::from_stream(first.chain(data)))
+        }
+    }
+}
+
+/// The percentage of the owner's `memory.max` at or above which a worker starts no new request.
+const ADMIT_MEMORY_PERCENT: u64 = 75;
+
+/// The kernel counters that a worker's admission reads: its own cgroup's `memory.current`, and
+/// the nearest `memory.max` at or above that cgroup.
+struct MemoryGauge {
+    current: PathBuf,
+    max_bytes: u64,
+}
+
+/// Returns this worker's [`MemoryGauge`], or `None` outside a cgroup with a memory limit.
+fn memory_gauge() -> Option<&'static MemoryGauge> {
+    static GAUGE: std::sync::OnceLock<Option<MemoryGauge>> = std::sync::OnceLock::new();
+    GAUGE
+        .get_or_init(|| {
+            let own = own_cgroup()?;
+            let max_bytes = own.ancestors().take_while(|d| d.starts_with("/sys/fs/cgroup/")).find_map(|d| {
+                std::fs::read_to_string(d.join("memory.max")).ok()?.trim().parse::<u64>().ok()
+            })?;
+            Some(MemoryGauge { current: own.join("memory.current"), max_bytes })
+        })
+        .as_ref()
+}
+
+/// Returns false if the worker's cgroup uses at least [`ADMIT_MEMORY_PERCENT`] of its memory
+/// limit. This is the one admission point of every request stream; the kernel's `memory.max`
+/// stays the bound of a request that starts below it and then grows.
+fn admits_new_request() -> bool {
+    let Some(g) = memory_gauge() else { return true };
+    let current = std::fs::read_to_string(&g.current).ok().and_then(|s| s.trim().parse::<u64>().ok());
+    current.is_none_or(|c| c.saturating_mul(100) < g.max_bytes.saturating_mul(ADMIT_MEMORY_PERCENT))
 }
 
 /// Runs one request with head `head` and body `body` through `router` on the worker's node.

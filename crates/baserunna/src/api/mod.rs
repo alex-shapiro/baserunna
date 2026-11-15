@@ -423,7 +423,7 @@ fn clone_parts(req: &Request) -> http::request::Builder {
     b
 }
 
-pub(crate) const BUFFER_FORWARD_MAX: u64 = 1024 * 1024;
+pub(crate) const BUFFER_FORWARD_MAX: u64 = 64 * 1024;
 
 /// Maximum `wait_ms` duration for change-feed and stream long polls, chosen to
 /// stay below a 60 s load-balancer idle timeout.

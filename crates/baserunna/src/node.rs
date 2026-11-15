@@ -327,7 +327,7 @@ const SUSPECT_MIN: Duration = Duration::from_secs(10);
 /// Timeout for a `/internal/v1/notice` request to a peer node.
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(2);
 
-const CACHE_MAX: usize = 100_000;
+const CACHE_MAX: usize = 4_096;
 
 impl Node {
     /// Starts a node, bootstrapping the system database and background tasks.

@@ -135,7 +135,7 @@ pub struct Limiter {
 }
 
 /// Maximum tracked keys before pruning idle state.
-const MAX_KEYS: usize = 100_000;
+const MAX_KEYS: usize = 16_384;
 
 fn limited(what: &str, wait: Duration) -> Error {
     let ms = (wait.as_millis() as u64).max(1);

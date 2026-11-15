@@ -6,15 +6,18 @@ use std::hash::Hash;
 use std::time::Duration;
 use tokio::time::Instant;
 
+/// The largest entry of any [`TtlCache`]: its key and value, encoded as JSON.
+pub const TTL_ENTRY_BYTES_MAX: usize = 1024;
+
 /// Bounded cache whose entries expire after `ttl`. If the cache holds `max` live entries, an
-/// insert evicts the oldest eighth.
+/// insert evicts the oldest eighth. It does not keep an entry larger than [`TTL_ENTRY_BYTES_MAX`].
 pub struct TtlCache<K, V> {
     ttl: Duration,
     max: usize,
     map: Mutex<DetHashMap<K, (Instant, V)>>,
 }
 
-impl<K: Hash + Eq + Clone, V: Clone> TtlCache<K, V> {
+impl<K: Hash + Eq + Clone + serde::Serialize, V: Clone + serde::Serialize> TtlCache<K, V> {
     pub fn new(ttl: Duration, max: usize) -> TtlCache<K, V> {
         TtlCache { ttl, max, map: Mutex::new(DetHashMap::default()) }
     }
@@ -27,6 +30,9 @@ impl<K: Hash + Eq + Clone, V: Clone> TtlCache<K, V> {
     pub fn store(&self, k: K, v: Option<V>, read_at: Instant) {
         let mut m = self.map.lock();
         match v {
+            Some(v) if !fits_entry(&k, &v) => {
+                m.remove(&k);
+            }
             Some(v) => {
                 if m.len() >= self.max {
                     m.retain(|_, (at, _)| at.elapsed() < self.ttl);
@@ -70,9 +76,40 @@ impl<K: Hash + Eq + Clone, V: Clone> TtlCache<K, V> {
     }
 }
 
+/// Returns true if the JSON encodings of `k` and `v` together are at most [`TTL_ENTRY_BYTES_MAX`] long.
+fn fits_entry(k: &impl serde::Serialize, v: &impl serde::Serialize) -> bool {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            if self.0 > TTL_ENTRY_BYTES_MAX {
+                return Err(std::io::Error::other("the entry is too large"));
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut n = Counter(0);
+    serde_json::to_writer(&mut n, k).is_ok() && serde_json::to_writer(&mut n, v).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entries_over_the_size_limit_are_not_kept() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
+        rt.block_on(async {
+            let c: TtlCache<String, String> = TtlCache::new(Duration::from_secs(10), 8);
+            c.store("small".into(), Some("v".into()), Instant::now());
+            c.store("large".into(), Some("x".repeat(TTL_ENTRY_BYTES_MAX)), Instant::now());
+            assert_eq!(c.get(&"small".to_string()).as_deref(), Some("v"));
+            assert_eq!(c.get(&"large".to_string()), None);
+        });
+    }
 
     #[test]
     fn entries_expire_and_stay_bounded() {

@@ -785,6 +785,10 @@ If memory usage remains above the budget after the node unloads all idle databas
 
 Single-request transactions, interactive transaction commits, and interactive transaction aborts are always admitted so that in-flight work can finish and release memory. Each user is limited to 100 concurrent open interactive transactions per node.
 
+#### Worker processes
+
+If `BASERUNNA_CGROUP_ROOT` names a delegated cgroup v2 directory, the node runs tenant work whose cost grows with input or stored data in worker processes: event queries, bulk insert parsing and staging, event seals and merges, and whole reads of blob values for `check` and `increment` ops. Each worker runs in a leaf cgroup under its owner's cgroup (`memory.max` from `BASERUNNA_OWNER_MEMORY_MB`, default 512 MiB, and `cpu.weight` from `BASERUNNA_OWNER_CPU_WEIGHT`). The node resolves the owner from the system database and fails the work if the database has no owner. Workers open the `s3://` store directly and return results; the main process commits them. If the kernel OOM-kills a worker, the request fails with `413`. If a worker passes its deadline, the node kills it through `cgroup.kill`. Without `BASERUNNA_CGROUP_ROOT`, and in the simulator, the same functions run in the node process.
+
 ### 5.13 Event storage
 
 Event tables combine transactional LSM writes for low-volume inserts with immutable columnar objects ("parts") for bulk ingestion and analytical scans. Queries read a consistent snapshot across both unsealed LSM rows and columnar parts, while idle event tables consume zero compute.

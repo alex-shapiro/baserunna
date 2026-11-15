@@ -332,6 +332,15 @@ const CACHE_MAX: usize = 100_000;
 impl Node {
     /// Starts a node, bootstrapping the system database and background tasks.
     pub async fn start(cfg: NodeConfig, env: Arc<Env>, store: DynStore, services: Services) -> Result<Arc<Node>> {
+        let node = Node::new(cfg, env, store, services)?;
+        node.bootstrap().await?;
+        node.spawn_background();
+        Ok(node)
+    }
+
+    /// Returns a node that serves requests but has not bootstrapped the system database or
+    /// started background tasks, as a worker process uses it.
+    pub fn new(cfg: NodeConfig, env: Arc<Env>, store: DynStore, services: Services) -> Result<Arc<Node>> {
         cfg.engine.validate().map_err(|e| Error::invalid(format!("engine configuration: {e}")))?;
         let id = format!("{}-{}", cfg.name, env.random_hex(4));
         let engine = Engine::new(store, env.clone(), cfg.engine.clone(), id.clone());
@@ -393,8 +402,6 @@ impl Node {
                 n.notify_home(db, version);
             }
         }));
-        node.bootstrap().await?;
-        node.spawn_background();
         Ok(node)
     }
 

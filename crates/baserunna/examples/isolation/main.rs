@@ -91,7 +91,7 @@ fn args() -> Args {
     a
 }
 
-/// Node liveness: its process exists and its cgroup has no new OOM kills.
+/// Node liveness: its process exists and its leaf cgroup has no new OOM kills.
 struct NodeWatch {
     pid: Option<u32>,
     cgroup: NodeCgroup,
@@ -104,7 +104,7 @@ impl NodeWatch {
     }
 
     fn new_oom_kills(&self) -> u64 {
-        match (self.oom_kills_before, self.cgroup.oom_kills()) {
+        match (self.oom_kills_before, self.cgroup.node_oom_kills()) {
             (Some(a), Some(b)) => b.saturating_sub(a),
             _ => 0,
         }
@@ -148,7 +148,7 @@ async fn main() {
         "workload": a.workload, "variant": a.variant, "node": a.node, "cgroup": a.cgroup.0,
         "request_deadline_ms": a.deadline.as_millis() as u64, "tenant_bound_bytes": TENANT_BOUND_BYTES,
     });
-    let watch = NodeWatch { pid: a.node_pid, cgroup: a.cgroup.clone(), oom_kills_before: a.cgroup.oom_kills() };
+    let watch = NodeWatch { pid: a.node_pid, cgroup: a.cgroup.clone(), oom_kills_before: a.cgroup.node_oom_kills() };
     if let Err(e) = run(&a, &watch, &mut out).await {
         eprintln!("isolation: {e}");
         out["error"] = json!(e);

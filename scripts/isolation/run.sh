@@ -95,14 +95,16 @@ NODE_EXIT=null
 if ! kill -0 "$NODE_PID" 2>/dev/null; then
   wait "$NODE_PID" 2>/dev/null && NODE_EXIT=0 || NODE_EXIT=$?
 fi
-OOM_KILLS=$(awk '$1 == "oom_kill" {print $2}' "$NODE_CG/memory.events")
+# Only kills in the node's own leaf mean the node died; kills in worker cgroups are refusals.
+OOM_KILLS=$(awk '$1 == "oom_kill" {print $2}' "$NODE_CG/main/memory.events.local")
+SUBTREE_OOM_KILLS=$(awk '$1 == "oom_kill" {print $2}' "$NODE_CG/memory.events")
 PEAK=$(cat "$NODE_CG/memory.peak" 2>/dev/null || echo null)
 cp "$WORK/node.log" "${OUT%.json}.node.log"
 if [ -f "$OUT" ]; then
-  jq --argjson exit "$NODE_EXIT" --argjson oom "${OOM_KILLS:-0}" --argjson peak "$PEAK" \
+  jq --argjson exit "$NODE_EXIT" --argjson oom "${OOM_KILLS:-0}" --argjson subtree_oom "${SUBTREE_OOM_KILLS:-0}" --argjson peak "$PEAK" \
     --arg bin "$NODE_BIN" --argjson client "$CLIENT_STATUS" --arg busy "$BUSY_PROCS" \
     '.vm_busy = ($busy != "") | .vm_busy_processes = ($busy | split("\n") | map(select(. != "")))
-     | .run = {node_binary: $bin, node_exit_status: $exit, cgroup_oom_kills: $oom, cgroup_memory_peak_bytes: $peak,
+     | .run = {node_binary: $bin, node_exit_status: $exit, node_oom_kills: $oom, subtree_oom_kills: $subtree_oom, cgroup_memory_peak_bytes: $peak,
              client_exit_status: $client, node_died: ($exit != null or $oom > 0)}
      | if .run.node_died and .conditions then .conditions["1_node_survives"] = false | .conditions.pass = false else . end' \
     "$OUT" >"$WORK/out.json" && mv "$WORK/out.json" "$OUT"

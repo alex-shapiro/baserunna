@@ -24,9 +24,13 @@ impl NodeCgroup {
         self.read(file)?.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(' ')?.trim().parse().ok())
     }
 
-    /// Sum of `oom_kill` in `memory.events` of the cgroup, which includes its descendants.
-    pub fn oom_kills(&self) -> Option<u64> {
-        self.keyed("memory.events", "oom_kill")
+    /// OOM kills of processes in the node's own leaf cgroup `main`.
+    ///
+    /// Kills in sibling cgroups that the node creates for its workers do not count: a design may
+    /// refuse a tenant's work by letting the kernel kill that tenant's worker.
+    pub fn node_oom_kills(&self) -> Option<u64> {
+        let leaf = NodeCgroup(self.0.join("main"));
+        leaf.keyed("memory.events.local", "oom_kill")
     }
 
     pub fn cpu_usage_usec(&self) -> Option<u64> {

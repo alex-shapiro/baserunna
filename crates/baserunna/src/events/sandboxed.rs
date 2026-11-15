@@ -111,6 +111,23 @@ pub struct QueryOutput {
     pub stats: super::exec::Stats,
 }
 
+/// Header of a part build in the sandbox. Encoded rows follow it in guest
+/// memory as `(version u64, ordinal u32, len u32, bytes)` records.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WriteInput {
+    pub db: String,
+    pub schema: EventSchema,
+    pub partition: u32,
+    pub versions: bool,
+    pub config: EventConfig,
+    pub seed: u64,
+    pub now_ms: u64,
+}
+
+/// One part that a sandboxed part build wrote: key, encoded reference, and
+/// `(version, ordinal)` row positions.
+pub type WrittenPart = (Vec<u8>, Vec<u8>, Vec<(u64, u32)>);
+
 /// Runs event work in the node's WebAssembly sandbox, charged to the database owner.
 pub trait SandboxRunner: Send + Sync {
     /// Runs `maint::merge_parts` over `inputs` in the sandbox.
@@ -120,6 +137,17 @@ pub trait SandboxRunner: Send + Sync {
         schema: &'a EventSchema,
         inputs: &'a [PartRef],
     ) -> BoxFut<'a, Result<Option<PartRef>>>;
+
+    /// Runs `build::write_encoded` for one partition's encoded rows in the sandbox.
+    fn write_encoded<'a>(
+        &'a self,
+        db: &'a str,
+        schema: &'a EventSchema,
+        partition: u32,
+        rows: Vec<(crate::engine::events::Pos, &'a [u8])>,
+        versions: bool,
+        out: &'a mut Vec<(PartRef, Vec<crate::engine::events::Pos>)>,
+    ) -> BoxFut<'a, Result<()>>;
 
     /// Runs `exec::run` for `query` in the sandbox, at the snapshot of `txn`.
     fn query_events<'a>(

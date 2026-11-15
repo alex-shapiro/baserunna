@@ -3893,4 +3893,24 @@ mod sandbox_merge {
             assert!(!guest.rows.is_empty());
         });
     }
+
+    #[test]
+    fn bulk_insert_builds_parts_in_sandbox() {
+        rt().block_on(async {
+            let (eng, _mem, input, _) = sealed_parts(1, 10).await;
+            let runner = node_sandbox(&eng, Some("owner-1"));
+            eng.set_sandbox(runner.clone());
+            let db = eng.db("db");
+            let rows: Vec<Json> = (0..3000)
+                .map(|i| json!({"time": T0 + 10_000 + i, "event": format!("bulk{}", i % 5), "user": format!("u{i}"), "n": i}))
+                .collect();
+            let valid = validate_rows(&input.schema, &rows, 0).unwrap();
+            let bufs = buffers();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            bufs.submit(db.clone(), input.schema.clone(), valid, 99, deadline).await.unwrap();
+            assert!(runner.sandbox.last_instance_peak() > 0, "the part build ran in an instance");
+            let q = json!({"from": T0, "to": T0 + DAY, "aggregates": {"n": {"fn": "count"}}});
+            assert_eq!(query(&db, &q).await.unwrap().rows, vec![vec![json!(3010)]]);
+        });
+    }
 }

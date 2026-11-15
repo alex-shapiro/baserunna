@@ -337,3 +337,73 @@ pub unsafe extern "C" fn guest_query_events(ptr: *const u8, len: u32) -> u32 {
         }
     }
 }
+
+/// Builds level 0 parts from one partition's encoded rows with the node's `write_encoded`.
+///
+/// The input is a `u32` header length, a JSON `WriteInput`, and row records of
+/// `(version u64, ordinal u32, len u32, bytes)`. Returns 0 with a JSON list of
+/// `WrittenPart`, or 1 with an error message.
+///
+/// # Safety
+/// `ptr` and `len` must name `len` initialized bytes from `guest_alloc`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn guest_write_encoded(ptr: *const u8, len: u32) -> u32 {
+    use baserunna::engine::events::Pos;
+    use baserunna::events::sandboxed::{WriteInput, WrittenPart};
+    let body = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let header_len = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+    let input: WriteInput = match serde_json::from_slice(&body[4..4 + header_len]) {
+        Ok(i) => i,
+        Err(e) => {
+            set_output(e.to_string().into_bytes());
+            return 1;
+        }
+    };
+    let mut rows: Vec<(Pos, &[u8])> = Vec::new();
+    let mut at = 4 + header_len;
+    while at < body.len() {
+        let version = u64::from_le_bytes(body[at..at + 8].try_into().unwrap());
+        let ordinal = u32::from_le_bytes(body[at + 8..at + 12].try_into().unwrap());
+        let n = u32::from_le_bytes(body[at + 12..at + 16].try_into().unwrap()) as usize;
+        rows.push((Pos { version, ordinal }, &body[at + 16..at + 16 + n]));
+        at += 16 + n;
+    }
+    let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
+    let out = rt.block_on(async move {
+        let env = baserunna::env::Env::sim(input.seed, input.now_ms, tokio::time::Instant::now(), 0);
+        let engine = baserunna::engine::Engine::new(
+            std::sync::Arc::new(HostStore),
+            std::sync::Arc::new(env),
+            input.config.engine_config(),
+            "guest".into(),
+        );
+        let mut written = Vec::new();
+        baserunna::events::build::write_encoded(
+            &engine.shared,
+            &input.db,
+            &input.schema,
+            input.partition,
+            rows.into_iter(),
+            input.versions,
+            &mut written,
+        )
+        .await?;
+        Ok::<_, baserunna::Error>(written)
+    });
+    match out {
+        Ok(written) => {
+            let parts: Vec<WrittenPart> = written
+                .into_iter()
+                .map(|(r, positions)| {
+                    (r.key().to_vec(), r.encode().to_vec(), positions.into_iter().map(|p| (p.version, p.ordinal)).collect())
+                })
+                .collect();
+            set_output(serde_json::to_vec(&parts).unwrap_or_default());
+            0
+        }
+        Err(e) => {
+            set_output(format!("{e:?}").into_bytes());
+            1
+        }
+    }
+}

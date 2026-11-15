@@ -157,7 +157,11 @@ impl Buffers {
                 let pos = Pos { version: 0, ordinal: ranges[si as usize].start + ri };
                 (pos, rows[si as usize].get(ri as usize).1)
             });
-            if let Err(e) = write_encoded(&shared, &db.id, &schema, partition, encoded, false, &mut written).await {
+            let result = match shared.sandbox.get() {
+                Some(sandbox) => sandbox.write_encoded(&db.id, &schema, partition, encoded.collect(), false, &mut written).await,
+                None => write_encoded(&shared, &db.id, &schema, partition, encoded, false, &mut written).await,
+            };
+            if let Err(e) = result {
                 failed = Some(e);
                 break;
             }

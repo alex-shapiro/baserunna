@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use crate::engine::events::PartRef;
 use crate::engine::Shared;
-use crate::events::sandboxed::{EventConfig, MergeInput, QueryInput, QueryOutput, SandboxRunner};
+use crate::engine::events::Pos;
+use crate::events::sandboxed::{EventConfig, MergeInput, QueryInput, QueryOutput, SandboxRunner, WriteInput, WrittenPart};
 use crate::events::schema::EventSchema;
 use crate::store::BoxFut;
 use crate::store::{DynStore, GetOpts, PutMode, StoreError};
@@ -341,6 +342,19 @@ impl Sandbox {
         fuel: u64,
         export: &str,
     ) -> Result<Vec<u8>> {
+        self.call_with_pieces(owner, object_store, seed, &[input], fuel, export).await
+    }
+
+    /// Writes the concatenation of `pieces` straight into guest memory and runs `export` on it.
+    async fn call_with_pieces(
+        &self,
+        owner: &str,
+        object_store: Option<DynStore>,
+        seed: u64,
+        pieces: &[&[u8]],
+        fuel: u64,
+        export: &str,
+    ) -> Result<Vec<u8>> {
         let (mut store, instance) = self.instantiate(owner, object_store, seed, fuel).await?;
         let export_err = |e: wasmtime::Error| Error::internal(format!("sandbox export: {e}"));
         let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| Error::internal("sandbox memory"))?;
@@ -348,11 +362,16 @@ impl Sandbox {
         let work = instance.get_typed_func::<(u32, u32), u32>(&mut store, export).map_err(export_err)?;
         let out_ptr = instance.get_typed_func::<(), u32>(&mut store, "guest_output_ptr").map_err(export_err)?;
         let out_len = instance.get_typed_func::<(), u32>(&mut store, "guest_output_len").map_err(export_err)?;
-        let len = u32::try_from(input.len()).map_err(|_| Error::TooLarge("sandbox input over 4 GiB".into()))?;
+        let total: usize = pieces.iter().map(|p| p.len()).sum();
+        let len = u32::try_from(total).map_err(|_| Error::TooLarge("sandbox input over 4 GiB".into()))?;
         let ptr = alloc.call_async(&mut store, len).await.map_err(|e| guest_error(&store, e))?;
-        memory
-            .write(&mut store, ptr as usize, input)
-            .map_err(|e| Error::internal(format!("sandbox input: {e}")))?;
+        let mut at = ptr as usize;
+        for piece in pieces {
+            memory
+                .write(&mut store, at, piece)
+                .map_err(|e| Error::internal(format!("sandbox input: {e}")))?;
+            at += piece.len();
+        }
         let status = work.call_async(&mut store, (ptr, len)).await.map_err(|e| guest_error(&store, e))?;
         let ptr = out_ptr.call_async(&mut store, ()).await.map_err(|e| guest_error(&store, e))? as usize;
         let len = out_len.call_async(&mut store, ()).await.map_err(|e| guest_error(&store, e))? as usize;
@@ -417,6 +436,60 @@ impl NodeSandbox {
 }
 
 impl SandboxRunner for NodeSandbox {
+    fn write_encoded<'a>(
+        &'a self,
+        db: &'a str,
+        schema: &'a EventSchema,
+        partition: u32,
+        rows: Vec<(Pos, &'a [u8])>,
+        versions: bool,
+        out: &'a mut Vec<(PartRef, Vec<Pos>)>,
+    ) -> BoxFut<'a, Result<()>> {
+        Box::pin(async move {
+            let owner = self.owner(db).await?;
+            let seed = self.seed();
+            let header = WriteInput {
+                db: db.to_string(),
+                schema: schema.clone(),
+                partition,
+                versions,
+                config: EventConfig::of(&self.shared.cfg),
+                seed,
+                now_ms: self.shared.env.now_ms(),
+            };
+            let header = serde_json::to_vec(&header).map_err(|e| Error::internal(format!("write input: {e}")))?;
+            let len_prefix = (header.len() as u32).to_le_bytes();
+            let records: Vec<[u8; 16]> = rows
+                .iter()
+                .map(|(pos, b)| {
+                    let mut r = [0u8; 16];
+                    r[..8].copy_from_slice(&pos.version.to_le_bytes());
+                    r[8..12].copy_from_slice(&pos.ordinal.to_le_bytes());
+                    r[12..].copy_from_slice(&(b.len() as u32).to_le_bytes());
+                    r
+                })
+                .collect();
+            let mut pieces: Vec<&[u8]> = Vec::with_capacity(2 + 2 * rows.len());
+            pieces.push(&len_prefix);
+            pieces.push(&header);
+            for (r, (_, b)) in records.iter().zip(&rows) {
+                pieces.push(r);
+                pieces.push(b);
+            }
+            let out_bytes = self
+                .sandbox
+                .call_with_pieces(&owner, Some(self.shared.store.clone()), seed, &pieces, CALL_FUEL, "guest_write_encoded")
+                .await?;
+            let parts: Vec<WrittenPart> =
+                serde_json::from_slice(&out_bytes).map_err(|e| Error::internal(format!("write output: {e}")))?;
+            for (key, enc, positions) in parts {
+                let r = PartRef::decode(&key, &enc).map_err(|_| Error::internal("corrupt written part"))?;
+                out.push((r, positions.into_iter().map(|(version, ordinal)| Pos { version, ordinal }).collect()));
+            }
+            Ok(())
+        })
+    }
+
     fn query_events<'a>(
         &'a self,
         db: &'a str,

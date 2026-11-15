@@ -74,4 +74,14 @@ pub extern "C" fn guest_spin(iters: u64) -> u64 {
     }
     x
 }
-#[unsafe(no_mangle)] pub extern "C" fn guest_zstd_probe(n: u32) -> u32 { let v = vec![7u8; n as usize]; let c = zstd::bulk::compress(&v, 3).unwrap(); zstd::bulk::decompress(&c, n as usize).unwrap().len() as u32 + crc32c::crc32c(&c) }
+/// Builds a dictionary-encoded string vector of `n` rows and returns its row count.
+///
+/// This probe runs node compute code from `baserunna-core` inside the guest.
+#[unsafe(no_mangle)]
+pub extern "C" fn guest_vector_probe(n: u32) -> u32 {
+    let texts: Vec<String> = (0..n).map(|i| format!("v{}", i % 97)).collect();
+    let strs = baserunna_core::vector::Strs::from_values(texts.iter().map(|t| Some(t.as_str())));
+    let raw = texts.concat().into_bytes();
+    let packed = baserunna_core::zstd::compress(&raw, 3).unwrap_or_default();
+    strs.codes.len() as u32 + baserunna_core::crc32c::crc32c(&packed) % 2
+}

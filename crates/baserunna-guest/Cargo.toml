@@ -10,5 +10,4 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 serde_json.workspace = true
-zstd = { version = "0.13", default-features = false }
-crc32c = "0.6"
+baserunna-core.workspace = true

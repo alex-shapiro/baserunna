@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/baserunna", "crates/baserunna-api", "crates/baserunna-client", "crates/baserunna-guest"]
-default-members = ["crates/baserunna", "crates/baserunna-api", "crates/baserunna-client"]
+members = ["crates/baserunna", "crates/baserunna-api", "crates/baserunna-client", "crates/baserunna-core", "crates/baserunna-guest"]
+default-members = ["crates/baserunna", "crates/baserunna-api", "crates/baserunna-client", "crates/baserunna-core"]
 
 [workspace.package]
 edition = "2024"
@@ -9,6 +9,7 @@ version = "0.1.0"
 license = "AGPLv3"
 
 [workspace.dependencies]
+baserunna-core = { path = "crates/baserunna-core" }
 baserunna-api = { path = "crates/baserunna-api" }
 baserunna-client = { path = "crates/baserunna-client", default-features = false }
 bytes = "1"

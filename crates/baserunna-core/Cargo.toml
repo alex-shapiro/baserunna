@@ -1,0 +1,11 @@
+[package]
+name = "baserunna-core"
+version.workspace = true
+edition.workspace = true
+description = "tenant compute code that runs both in the node and in its WebAssembly sandbox"
+license.workspace = true
+
+[dependencies]
+crc32c = "0.6"
+serde_json.workspace = true
+zstd = { version = "0.13", default-features = false }

@@ -118,7 +118,7 @@ pub fn unflatten(leaves: impl IntoIterator<Item = (Vec<String>, Json)>) -> Map<S
 
 /// Returns the shared bucket index in `0..BUCKETS` for canonical path `key`.
 pub fn bucket(key: &str) -> u8 {
-    (crate::util::bloom::key_hash(key.as_bytes()) % BUCKETS as u64) as u8
+    (crate::bloom::key_hash(key.as_bytes()) % BUCKETS as u64) as u8
 }
 
 /// Storage type of values for a single JSON path.

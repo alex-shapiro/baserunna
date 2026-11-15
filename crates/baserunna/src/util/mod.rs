@@ -1,19 +1,13 @@
-pub mod bloom;
-pub mod codec;
-pub mod crc32c;
+#[cfg(test)]
+mod codec_tests;
 pub mod json;
 pub mod prop;
 pub mod rng;
 mod ttl;
-pub mod zstd;
+
+pub use baserunna_core::{DetHashMap, bloom, codec, crc32c, zstd};
 
 pub use ttl::TtlCache;
-
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, DefaultHasher};
-
-/// `HashMap` with a deterministic hasher.
-pub type DetHashMap<K, V> = HashMap<K, V, BuildHasherDefault<DefaultHasher>>;
 
 pub enum Either<A, B> {
     Left(A),

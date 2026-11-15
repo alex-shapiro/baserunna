@@ -24,7 +24,7 @@ impl Strs {
     /// order.
     pub fn from_values<'a>(vals: impl IntoIterator<Item = Option<&'a str>>) -> Strs {
         let mut dict: Vec<String> = Vec::new();
-        let mut ids: crate::util::DetHashMap<&'a str, u32> = Default::default();
+        let mut ids: crate::DetHashMap<&'a str, u32> = Default::default();
         let mut codes = Vec::new();
         for v in vals {
             codes.push(match v {

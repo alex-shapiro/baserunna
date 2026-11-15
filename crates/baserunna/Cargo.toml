@@ -11,6 +11,7 @@ cloud = ["dep:object_store", "dep:reqwest"]
 
 [dependencies]
 baserunna-api.workspace = true
+baserunna-core.workspace = true
 baserunna-client.workspace = true
 aws-lc-rs = "1.18"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "form", "tokio", "matched-path", "original-uri"] }

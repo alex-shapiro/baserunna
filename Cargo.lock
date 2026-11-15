@@ -149,6 +149,7 @@ dependencies = [
  "axum",
  "baserunna-api",
  "baserunna-client",
+ "baserunna-core",
  "bytes",
  "crc32c",
  "futures-util",
@@ -199,12 +200,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "baserunna-guest"
+name = "baserunna-core"
 version = "0.1.0"
 dependencies = [
  "crc32c",
  "serde_json",
  "zstd",
+]
+
+[[package]]
+name = "baserunna-guest"
+version = "0.1.0"
+dependencies = [
+ "baserunna-core",
+ "serde_json",
 ]
 
 [[package]]

@@ -12,13 +12,10 @@ pub mod agg;
 pub mod build;
 pub mod bulk;
 pub mod exec;
-pub mod json;
 pub mod maint;
 pub mod part;
 pub mod query;
 pub mod schema;
-pub mod sketch;
-pub mod vector;
 
 #[cfg(test)]
 mod difftests;
@@ -26,6 +23,10 @@ mod difftests;
 mod reference;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod sketch_tests;
+
+pub use baserunna_core::{json, sketch, vector};
 
 use crate::engine::events::{self as ev, EventOp, PartRef, TableState};
 use crate::engine::{ReadValue, Txn, Value};

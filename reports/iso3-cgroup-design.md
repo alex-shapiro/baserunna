@@ -85,7 +85,7 @@ do all reads and writes of the store.
 Each line: what it does | allowed item | code path (today, or planned).
 **[changed]** marks a line that revision 2 changed or added.
 
-1. **[changed, revision 3]** Accept TCP connections up to a fixed limit for the node and a fixed limit for each client address; refuse the rest at accept | 1 | `main.rs:279` `axum::serve` (today: no limit; planned: a counting accept loop in `main.rs` with `NODE_CONNECTIONS_MAX` and `CLIENT_CONNECTIONS_MAX`).
+1. **[changed, revision 3]** Accept TCP connections up to a fixed limit for the node and a fixed limit for each client address; refuse the rest at accept | 1 | `main.rs:278` `axum::serve` (today: no limit; planned: a counting accept loop in `main.rs` with `NODE_CONNECTIONS_MAX` and `CLIENT_CONNECTIONS_MAX`).
 2. **[changed, revision 3]** Read HTTP headers with hyper's limits set in the code: HTTP/1 `max_buf_size`, header count, and header size. HTTP/2 is off (code, `Cargo.toml`: axum feature `http1` only) | 1 | planned `main.rs` `hyper_util::server::conn::auto::Builder` with explicit limits, and a test that each limit holds.
 3. **[changed]** Authenticate the request: look up the token or cookie in `auth_cache`; on a miss, send one fixed-size point-read frame to the system worker | 1 | `node.rs` `authenticate_metered` (today `node.rs:1019`; planned: the miss goes to the system worker).
 4. **[changed]** Look up the database record and its `owner_id`, and the org role, the same way: cache, then one point-read frame | 1 | `node.rs` `resolve_db` (today; planned: the miss goes to the system worker).

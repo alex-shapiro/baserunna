@@ -537,7 +537,7 @@ fn input_type(meta: &PartMeta, ci: usize) -> JType {
     }
 }
 
-async fn merge_parts(
+pub(crate) async fn merge_parts(
     shared: &Shared,
     db: &str,
     s: &EventSchema,
@@ -879,10 +879,12 @@ async fn union_dicts(
 pub async fn merge(db: &Arc<Db>, s: &EventSchema, inputs: &[PartRef]) -> Result<()> {
     let shared = db.shared().clone();
     let started = shared.env.now_ms();
-    let stats = ReadStats::default();
-    let out = merge_parts(&shared, &db.id, s, inputs, &stats).await?;
     let cfg = &shared.cfg;
     let max_ms = cfg.event_merge_max_ms.min(cfg.blob_stage_ttl_ms.saturating_sub(4 * cfg.clock_sync_max_error_ms));
+    let out = match shared.workers.get() {
+        Some(w) => w.merge(&db.id, s, inputs, std::time::Duration::from_millis(max_ms)).await?,
+        None => merge_parts(&shared, &db.id, s, inputs, &ReadStats::default()).await?,
+    };
     if shared.env.now_ms().saturating_sub(started) > max_ms {
         if let Some(o) = out {
             delete_parts(&shared, &db.id, [o.id]).await;

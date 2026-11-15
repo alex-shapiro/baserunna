@@ -140,8 +140,27 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    let (cfg, listen, store_url, shutdown) = config()?;
+    let (mut cfg, listen, store_url, shutdown) = config()?;
     let store = store_from_url(&store_url)?;
+    if std::env::args().nth(1).as_deref() == Some("worker") {
+        cfg.engine.local_tier = None;
+        return baserunna::worker::serve(store, cfg.engine).await.map_err(|e| format!("worker: {e}"));
+    }
+    let workers = match var("BASERUNNA_CGROUP_ROOT") {
+        None => None,
+        Some(root) => {
+            let pool = baserunna::worker::PoolConfig {
+                cgroup_root: root.into(),
+                exe: std::env::current_exe().map_err(|e| format!("cannot find the worker executable: {e}"))?,
+                owner_memory_bytes: parse("BASERUNNA_OWNER_MEMORY_MB", baserunna::worker::OWNER_MEMORY_BYTES >> 20)?
+                    << 20,
+                owner_cpu_weight: parse("BASERUNNA_OWNER_CPU_WEIGHT", 100u32)?,
+            };
+            let pool = baserunna::worker::WorkerPool::new(pool.clone())
+                .map_err(|e| format!("cannot enable controllers in {}: {e}", pool.cgroup_root.display()))?;
+            Some(Arc::new(pool))
+        }
+    };
     #[cfg(feature = "cloud")]
     if store_url.starts_with("s3://") {
         verify_store_conditional_writes(&store_url).await?;
@@ -167,6 +186,9 @@ async fn run() -> Result<(), String> {
     let env = Arc::new(Env::real());
     let services = Services { transport, oidc, mailer };
     let node = Node::start(cfg, env.clone(), store, services).await.map_err(|e| format!("startup failed: {e}"))?;
+    if let Some(w) = workers {
+        let _ = node.engine.shared.workers.set(w);
+    }
     let n = node.clone();
     env.spawn(async move {
         const PERIOD: std::time::Duration = std::time::Duration::from_millis(100);

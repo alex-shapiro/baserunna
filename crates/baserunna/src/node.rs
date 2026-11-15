@@ -1513,6 +1513,9 @@ impl Node {
         let read_at = Instant::now();
         let mut t = self.sys_read_at(strong).await?;
         let rec = meta::resolve_db(&mut t, owner_id, name).await?;
+        if let (Some(w), Some(r)) = (self.engine.shared.workers.get(), &rec) {
+            w.set_db_owner(&r.id, &r.owner_id);
+        }
         self.name_cache.store(key, rec.clone(), read_at);
         Ok(rec)
     }

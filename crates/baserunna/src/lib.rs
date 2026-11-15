@@ -31,5 +31,6 @@ pub mod table;
 pub mod timing;
 pub mod txns;
 pub mod util;
+pub mod worker;
 
 pub use error::{Error, Result};

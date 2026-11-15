@@ -61,6 +61,8 @@ pub struct Shared {
     /// Called with a database id and version after this node commits a new data version.
     commit_hook: std::sync::OnceLock<CommitHook>,
     event_hook: std::sync::OnceLock<EventHook>,
+    /// Worker processes that run heavy tenant work under kernel limits; unset in the simulator.
+    pub workers: std::sync::OnceLock<Arc<crate::worker::WorkerPool>>,
 }
 
 /// Callback invoked on the lease holder after a commit modifies event table rows or parts (SPEC §5.13).
@@ -300,6 +302,7 @@ impl Engine {
             waits_ended: false.into(),
             commit_hook: std::sync::OnceLock::new(),
             event_hook: std::sync::OnceLock::new(),
+            workers: std::sync::OnceLock::new(),
         });
         let engine = Arc::new(Engine { shared, dbs: Mutex::new(DetHashMap::default()) });
         let _ = engine.shared.engine.set(Arc::downgrade(&engine));

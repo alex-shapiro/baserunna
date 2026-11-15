@@ -30,20 +30,36 @@ pub struct OwnerResponse {
     pub body: Vec<u8>,
 }
 
-/// Result of a store call that the host completes into the guest.
-struct Completion {
-    ticket: u32,
-    code: i64,
-    data: Vec<u8>,
+/// Largest GET header: size, last modified, etag length, and an etag of up to 256 bytes.
+const GET_HEADER_MAX: usize = 20 + 256;
+
+/// Progress of a store call that the driver delivers into the guest.
+enum StoreEvent {
+    /// A GET's header and data length; the driver allocates the guest buffer for both.
+    GetHead { ticket: u32, header: Vec<u8>, len: u64 },
+    /// One frame of a GET's data, as the store client received it.
+    GetFrame { ticket: u32, frame: Bytes },
+    /// The end of a call. A GET's data is already in its guest buffer.
+    Done { ticket: u32, code: i64, data: Vec<u8> },
+}
+
+/// Guest buffer that receives the frames of one GET.
+struct GetBuffer {
+    ptr: u32,
+    cap: u32,
+    written: u32,
 }
 
 /// Host side of the calls between an owner instance and its driver task.
 pub(super) struct OwnerIo {
     store: DynStore,
     next_ticket: u32,
-    completions: mpsc::UnboundedSender<Completion>,
+    events: mpsc::Sender<StoreEvent>,
     responses: HashMap<u64, oneshot::Sender<OwnerResponse>>,
     store_slots: Arc<tokio::sync::Semaphore>,
+    /// Held for reading by every PUT body in guest memory; the driver takes it for writing
+    /// before it drops the instance.
+    store_live: Arc<tokio::sync::RwLock<()>>,
 }
 
 fn owner_io<'a>(caller: &'a mut Caller<'_, GuestState>) -> wasmtime::Result<&'a mut OwnerIo> {
@@ -51,22 +67,67 @@ fn owner_io<'a>(caller: &'a mut Caller<'_, GuestState>) -> wasmtime::Result<&'a 
 }
 
 /// Starts `call` on the host and returns its ticket; `call` yields the completion code and data.
-fn start_ticket<F>(caller: &mut Caller<'_, GuestState>, call: impl FnOnce(DynStore) -> F) -> wasmtime::Result<u32>
+fn start_ticket<F>(
+    caller: &mut Caller<'_, GuestState>,
+    call: impl FnOnce(DynStore, u32, mpsc::Sender<StoreEvent>) -> F,
+) -> wasmtime::Result<u32>
 where
     F: Future<Output = (i64, Vec<u8>)> + Send + 'static,
 {
     let io = owner_io(caller)?;
     let ticket = io.next_ticket;
     io.next_ticket = io.next_ticket.wrapping_add(1);
-    let done = io.completions.clone();
+    let events = io.events.clone();
     let slots = io.store_slots.clone();
-    let work = call(io.store.clone());
+    let work = call(io.store.clone(), ticket, events.clone());
     tokio::spawn(async move {
         let Ok(_slot) = slots.acquire_owned().await else { return };
         let (code, data) = work.await;
-        let _ = done.send(Completion { ticket, code, data });
+        let _ = events.send(StoreEvent::Done { ticket, code, data }).await;
     });
     Ok(ticket)
+}
+
+/// Runs a streamed GET and sends its header and frames to the driver.
+async fn stream_get(store: DynStore, key: String, opts: GetOpts, ticket: u32, events: mpsc::Sender<StoreEvent>) -> (i64, Vec<u8>) {
+    let got = match store.get_stream(&key, opts).await {
+        Ok(g) => g,
+        Err(e) => return (store_code(&e), Vec::new()),
+    };
+    let etag = got.etag.as_bytes();
+    let etag = &etag[..etag.len().min(GET_HEADER_MAX - 20)];
+    let mut header = Vec::with_capacity(20 + etag.len());
+    header.extend_from_slice(&got.size.to_le_bytes());
+    header.extend_from_slice(&got.last_modified_ms.to_le_bytes());
+    header.extend_from_slice(&(etag.len() as u32).to_le_bytes());
+    header.extend_from_slice(etag);
+    if events.send(StoreEvent::GetHead { ticket, header, len: got.len }).await.is_err() {
+        return (-5, Vec::new());
+    }
+    let mut body = got.body;
+    while let Some(frame) = futures_util::StreamExt::next(&mut body).await {
+        match frame {
+            Ok(frame) => {
+                if events.send(StoreEvent::GetFrame { ticket, frame }).await.is_err() {
+                    return (-5, Vec::new());
+                }
+            }
+            Err(e) => return (store_code(&e), Vec::new()),
+        }
+    }
+    (0, Vec::new())
+}
+
+/// Returns the `len` bytes at `ptr` in guest memory as `Bytes`, with no copy.
+fn guest_bytes(caller: &mut Caller<'_, GuestState>, ptr: u32, len: u32) -> wasmtime::Result<Bytes> {
+    let memory = super::guest_memory(caller)?;
+    let live = owner_io(caller)?
+        .store_live
+        .clone()
+        .try_read_owned()
+        .map_err(|_| wasmtime::Error::msg("owner instance is stopping"))?;
+    super::guest_bytes::in_place(memory.data_ptr(&*caller), memory.data_size(&*caller), ptr, len, live)
+        .ok_or_else(|| wasmtime::Error::msg("guest PUT body out of bounds"))
 }
 
 /// Encodes a list page for the guest's `decode_list`.
@@ -94,22 +155,8 @@ pub(super) fn link_owner_calls(linker: &mut Linker<GuestState>) -> wasmtime::Res
         "start_get",
         |mut caller: Caller<'_, GuestState>, key_ptr: u32, key_len: u32, start: u64, end: u64, ranged: u32| {
             let key = String::from_utf8(read_guest(&mut caller, key_ptr, key_len)?)?;
-            start_ticket(&mut caller, move |store| async move {
-                let opts = GetOpts { range: (ranged == 1).then_some(start..end), if_none_match: None };
-                match store.get(&key, opts).await {
-                    Ok(got) => {
-                        let etag = got.etag.as_bytes();
-                        let mut out = Vec::with_capacity(20 + etag.len() + got.data.len());
-                        out.extend_from_slice(&got.size.to_le_bytes());
-                        out.extend_from_slice(&got.last_modified_ms.to_le_bytes());
-                        out.extend_from_slice(&(etag.len() as u32).to_le_bytes());
-                        out.extend_from_slice(etag);
-                        out.extend_from_slice(&got.data);
-                        (0, out)
-                    }
-                    Err(e) => (store_code(&e), Vec::new()),
-                }
-            })
+            let opts = GetOpts { range: (ranged == 1).then_some(start..end), if_none_match: None };
+            start_ticket(&mut caller, move |store, ticket, events| stream_get(store, key, opts, ticket, events))
         },
     )?;
     linker.func_wrap(
@@ -124,14 +171,14 @@ pub(super) fn link_owner_calls(linker: &mut Linker<GuestState>) -> wasmtime::Res
          etag_ptr: u32,
          etag_len: u32| {
             let key = String::from_utf8(read_guest(&mut caller, key_ptr, key_len)?)?;
-            let data = Bytes::from(read_guest(&mut caller, data_ptr, data_len)?);
+            let data = guest_bytes(&mut caller, data_ptr, data_len)?;
             let etag = String::from_utf8(read_guest(&mut caller, etag_ptr, etag_len)?)?;
             let mode = match mode {
                 0 => PutMode::Overwrite,
                 1 => PutMode::Create,
                 _ => PutMode::IfMatch(etag),
             };
-            start_ticket(&mut caller, move |store| async move {
+            start_ticket(&mut caller, move |store, _, _| async move {
                 match store.put(&key, data, mode).await {
                     Ok(etag) => (0, etag.into_bytes()),
                     Err(e) => (store_code(&e), Vec::new()),
@@ -141,7 +188,7 @@ pub(super) fn link_owner_calls(linker: &mut Linker<GuestState>) -> wasmtime::Res
     )?;
     linker.func_wrap(M, "start_delete", |mut caller: Caller<'_, GuestState>, key_ptr: u32, key_len: u32| {
         let key = String::from_utf8(read_guest(&mut caller, key_ptr, key_len)?)?;
-        start_ticket(&mut caller, move |store| async move {
+        start_ticket(&mut caller, move |store, _, _| async move {
             match store.delete(&key).await {
                 Ok(()) => (0, Vec::new()),
                 Err(e) => (store_code(&e), Vec::new()),
@@ -160,7 +207,7 @@ pub(super) fn link_owner_calls(linker: &mut Linker<GuestState>) -> wasmtime::Res
          limit: u32| {
             let prefix = String::from_utf8(read_guest(&mut caller, prefix_ptr, prefix_len)?)?;
             let after = String::from_utf8(read_guest(&mut caller, after_ptr, after_len)?)?;
-            start_ticket(&mut caller, move |store| async move {
+            start_ticket(&mut caller, move |store, _, _| async move {
                 let after = (has_after == 1).then_some(after.as_str());
                 match store.list(&prefix, after, limit as usize).await {
                     Ok(page) => (0, encode_list(&page)),
@@ -221,7 +268,9 @@ fn sandbox_err(e: wasmtime::Error) -> Error {
 impl OwnerInstances {
     /// Compiles the guest module for owner instances.
     pub fn new(guest_wasm: &[u8]) -> Result<OwnerInstances> {
-        let engine = Engine::new(&Config::new()).map_err(sandbox_err)?;
+        let mut config = Config::new();
+        config.memory_may_move(false).memory_reservation(1 << 32);
+        let engine = Engine::new(&config).map_err(sandbox_err)?;
         let module = Module::new(&engine, guest_wasm).map_err(sandbox_err)?;
         let mut linker = Linker::new(&engine);
         link_host_calls(&mut linker).map_err(sandbox_err)?;
@@ -231,7 +280,7 @@ impl OwnerInstances {
 
     /// Starts the instance of `owner` on `store` and the host task that drives it.
     pub async fn start(&self, owner: &str, store: DynStore, seed: u64) -> Result<OwnerInstance> {
-        let (completions_tx, completions) = mpsc::unbounded_channel();
+        let (events_tx, events) = mpsc::channel(STORE_CALLS_IN_FLIGHT);
         let memory: Arc<parking_lot::Mutex<HashMap<String, super::OwnerMemory>>> = Arc::default();
         let limiter = OwnerLimiter {
             owner: owner.to_string(),
@@ -245,9 +294,10 @@ impl OwnerInstances {
         let io = OwnerIo {
             store,
             next_ticket: 0,
-            completions: completions_tx,
+            events: events_tx,
             responses: HashMap::new(),
             store_slots: Arc::new(tokio::sync::Semaphore::new(STORE_CALLS_IN_FLIGHT)),
+            store_live: Arc::default(),
         };
         let state = GuestState { limiter, store: None, clock_ns: 0, rng: Rng::new(seed), stderr: Vec::new(), owner_io: Some(io) };
         let mut wstore = Store::new(&self.engine, state);
@@ -265,7 +315,7 @@ impl OwnerInstances {
             poll: instance.get_typed_func(&mut wstore, "owner_poll").map_err(sandbox_err)?,
         };
         let (requests_tx, requests) = mpsc::channel(REQUEST_QUEUE);
-        tokio::spawn(drive(wstore, instance, exports, requests, completions));
+        tokio::spawn(drive(wstore, instance, exports, requests, events));
         Ok(OwnerInstance { requests: requests_tx, memory })
     }
 }
@@ -300,56 +350,94 @@ async fn place(store: &mut Store<GuestState>, instance: &Instance, alloc: &Typed
 }
 
 /// Drives one owner instance until every request handle is gone and no task is live.
+///
+/// It drops the instance only after every PUT body in guest memory is released.
 async fn drive(
     mut store: Store<GuestState>,
     instance: Instance,
     exports: OwnerExports,
-    mut requests: mpsc::Receiver<QueuedRequest>,
-    mut completions: mpsc::UnboundedReceiver<Completion>,
+    requests: mpsc::Receiver<QueuedRequest>,
+    events: mpsc::Receiver<StoreEvent>,
 ) {
+    let live = store.data().owner_io.as_ref().expect("owner instance").store_live.clone();
+    if let Err(e) = drive_until_done(&mut store, &instance, &exports, requests, events).await {
+        crate::warn!("owner instance stopped: {e}");
+    }
+    let _stopped = live.write().await;
+    drop(store);
+}
+
+async fn drive_until_done(
+    store: &mut Store<GuestState>,
+    instance: &Instance,
+    exports: &OwnerExports,
+    mut requests: mpsc::Receiver<QueuedRequest>,
+    mut events: mpsc::Receiver<StoreEvent>,
+) -> Result<()> {
+    let memory = instance.get_memory(&mut *store, "memory").ok_or_else(|| Error::internal("owner instance memory"))?;
+    let mut gets: HashMap<u32, GetBuffer> = HashMap::new();
     let mut live_tasks = 0u32;
     let mut next_request = 0u64;
     let mut requests_open = true;
     loop {
-        let mut ready_completions = Vec::new();
+        let mut ready_events = Vec::new();
         let mut ready_requests = Vec::new();
         tokio::select! {
-            Some(c) = completions.recv() => ready_completions.push(c),
+            Some(e) = events.recv() => ready_events.push(e),
             r = requests.recv(), if requests_open => match r {
                 Some(r) => ready_requests.push(r),
                 None => requests_open = false,
             },
             _ = tokio::time::sleep(TIMER_TICK), if live_tasks > 0 => {}
         }
-        while let Ok(c) = completions.try_recv() {
-            ready_completions.push(c);
+        while let Ok(e) = events.try_recv() {
+            ready_events.push(e);
         }
         while requests_open && let Ok(r) = requests.try_recv() {
             ready_requests.push(r);
         }
-        let step = async {
-            for c in ready_completions {
-                let ptr = place(&mut store, &instance, &exports.alloc, &c.data).await?;
-                exports.complete.call_async(&mut store, (c.ticket, c.code, ptr, c.data.len() as u32)).await.map_err(sandbox_err)?;
-            }
-            for r in ready_requests {
-                let id = next_request;
-                next_request += 1;
-                store.data_mut().owner_io.as_mut().expect("owner instance").responses.insert(id, r.reply);
-                let ptr = place(&mut store, &instance, &exports.alloc, &r.body).await?;
-                exports.request.call_async(&mut store, (id, ptr, r.body.len() as u32)).await.map_err(sandbox_err)?;
-            }
-            exports.poll.call_async(&mut store, host_now_ms()).await.map_err(sandbox_err)
-        };
-        match step.await {
-            Ok(n) => live_tasks = n,
-            Err(e) => {
-                crate::warn!("owner instance stopped: {e}");
-                return;
+        for e in ready_events {
+            match e {
+                StoreEvent::GetHead { ticket, header, len } => {
+                    let cap = u32::try_from(header.len() as u64 + len).map_err(|_| Error::TooLarge("GET over 4 GiB".into()))?;
+                    let ptr = exports.alloc.call_async(&mut *store, cap).await.map_err(sandbox_err)?;
+                    memory.write(&mut *store, ptr as usize, &header).map_err(|e| Error::internal(format!("GET header: {e}")))?;
+                    gets.insert(ticket, GetBuffer { ptr, cap, written: header.len() as u32 });
+                }
+                StoreEvent::GetFrame { ticket, frame } => {
+                    let Some(b) = gets.get_mut(&ticket) else { continue };
+                    if b.written as usize + frame.len() > b.cap as usize {
+                        b.written = u32::MAX;
+                        continue;
+                    }
+                    memory
+                        .write(&mut *store, (b.ptr + b.written) as usize, &frame)
+                        .map_err(|e| Error::internal(format!("GET frame: {e}")))?;
+                    b.written += frame.len() as u32;
+                }
+                StoreEvent::Done { ticket, code, data } => {
+                    let (code, ptr, len) = match gets.remove(&ticket) {
+                        Some(b) if code == 0 && b.written == b.cap => (0, b.ptr, b.cap),
+                        Some(b) => (if code < 0 { code } else { -5 }, b.ptr, b.cap),
+                        None => {
+                            let ptr = place(store, instance, &exports.alloc, &data).await?;
+                            (code, ptr, data.len() as u32)
+                        }
+                    };
+                    exports.complete.call_async(&mut *store, (ticket, code, ptr, len)).await.map_err(sandbox_err)?;
+                }
             }
         }
+        for r in ready_requests {
+            let id = next_request;
+            next_request += 1;
+            store.data_mut().owner_io.as_mut().expect("owner instance").responses.insert(id, r.reply);
+            let ptr = place(store, instance, &exports.alloc, &r.body).await?;
+            exports.request.call_async(&mut *store, (id, ptr, r.body.len() as u32)).await.map_err(sandbox_err)?;
+        }
+        live_tasks = exports.poll.call_async(&mut *store, host_now_ms()).await.map_err(sandbox_err)?;
         if !requests_open && live_tasks == 0 {
-            return;
+            return Ok(());
         }
     }
 }

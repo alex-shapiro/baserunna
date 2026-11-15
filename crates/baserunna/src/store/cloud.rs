@@ -141,6 +141,29 @@ impl ObjectStore for CloudStore {
         })
     }
 
+    fn get_stream<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<super::StreamedGet>> {
+        Box::pin(async move {
+            if opts.range.as_ref().is_some_and(|r| r.start == r.end) {
+                let got = self.get(key, opts).await?;
+                let body: super::BodyStream = Box::pin(futures_util::stream::empty());
+                return Ok(super::StreamedGet { etag: got.etag, size: got.size, last_modified_ms: got.last_modified_ms, len: 0, body });
+            }
+            let o = GetOptions {
+                range: opts.range.clone().map(GetRange::Bounded),
+                if_none_match: opts.if_none_match.clone(),
+                ..Default::default()
+            };
+            let res = self.inner.get_opts(&self.path(key), o).await.map_err(map_err)?;
+            let size = res.meta.size;
+            let etag = res.meta.e_tag.clone().unwrap_or_default();
+            let last_modified_ms = res.meta.last_modified.timestamp_millis().max(0) as u64;
+            let len = res.range.end - res.range.start;
+            let body: super::BodyStream =
+                Box::pin(futures_util::StreamExt::map(res.into_stream(), |f| f.map_err(map_err)));
+            Ok(super::StreamedGet { etag, size, last_modified_ms, len, body })
+        })
+    }
+
     fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
         Box::pin(async move {
             let mode = match mode {

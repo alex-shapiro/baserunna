@@ -7,6 +7,7 @@
 
 use crate::error::{Error, Result};
 
+mod guest_bytes;
 pub mod owner;
 use parking_lot::Mutex;
 use std::collections::HashMap;

@@ -1,7 +1,7 @@
 //! Object storage database host with stateless compute nodes.
 //! See `SPEC.md` for full design.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![recursion_limit = "512"]
 
 #[cfg(feature = "server")]

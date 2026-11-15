@@ -116,6 +116,18 @@ pub trait ObjectStore: Send + Sync + 'static {
     /// must be empty or end with `/`.
     fn list<'a>(&'a self, prefix: &'a str, start_after: Option<&'a str>, limit: usize)
     -> BoxFut<'a, SResult<ListPage>>;
+    /// Reads an object like [`ObjectStore::get`], with the data as a stream of frames.
+    ///
+    /// The default reads the whole object and returns it as one frame. A store
+    /// whose client receives the body in frames returns those frames.
+    fn get_stream<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<StreamedGet>> {
+        Box::pin(async move {
+            let got = self.get(key, opts).await?;
+            let len = got.data.len() as u64;
+            let body: BodyStream = Box::pin(futures_util::stream::once(std::future::ready(Ok(got.data))));
+            Ok(StreamedGet { etag: got.etag, size: got.size, last_modified_ms: got.last_modified_ms, len, body })
+        })
+    }
     /// Granularity of `last_modified_ms` in milliseconds. Timestamps are rounded down to a
     /// multiple of this value on a single store clock.
     fn time_precision_ms(&self) -> u64 {
@@ -124,6 +136,20 @@ pub trait ObjectStore: Send + Sync + 'static {
 }
 
 pub type DynStore = Arc<dyn ObjectStore>;
+
+/// Frames of the data of a streamed GET.
+pub type BodyStream = std::pin::Pin<Box<dyn futures_util::Stream<Item = SResult<Bytes>> + Send>>;
+
+/// Result of [`ObjectStore::get_stream`]: the object's metadata, then its data in frames.
+pub struct StreamedGet {
+    pub etag: String,
+    /// Total object size in bytes.
+    pub size: u64,
+    pub last_modified_ms: u64,
+    /// Length of the data that `body` yields.
+    pub len: u64,
+    pub body: BodyStream,
+}
 
 pub fn is_valid_key_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')

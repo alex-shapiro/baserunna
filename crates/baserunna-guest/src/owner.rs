@@ -58,6 +58,10 @@ struct TicketDone {
 struct TicketSlot {
     done: Option<TicketDone>,
     waker: Option<Waker>,
+    /// PUT body that the host reads in place; it stays alive and unchanged until completion.
+    body: Option<Bytes>,
+    /// The waiting task went away; the completion only releases `body`.
+    abandoned: bool,
 }
 
 /// Engine and executor of this owner instance.
@@ -95,9 +99,25 @@ impl Future for Ticket {
     }
 }
 
+impl Ticket {
+    /// Keeps `body` alive until the host completes this ticket.
+    fn hold(self, body: Bytes) -> Self {
+        TICKETS.with(|t| t.borrow_mut().entry(self.0).or_default().body = Some(body));
+        self
+    }
+}
+
 impl Drop for Ticket {
     fn drop(&mut self) {
-        TICKETS.with(|t| t.borrow_mut().remove(&self.0));
+        TICKETS.with(|t| {
+            let mut t = t.borrow_mut();
+            match t.get_mut(&self.0) {
+                Some(slot) if slot.body.is_some() && slot.done.is_none() => slot.abandoned = true,
+                _ => {
+                    t.remove(&self.0);
+                }
+            }
+        });
     }
 }
 
@@ -146,6 +166,7 @@ impl ObjectStore for TicketStore {
                 PutMode::Create => (1, ""),
                 PutMode::IfMatch(e) => (2, e.as_str()),
             };
+            let body = data.clone();
             let ticket = Ticket(unsafe {
                 host::start_put(
                     key.as_ptr(),
@@ -156,7 +177,8 @@ impl ObjectStore for TicketStore {
                     etag.as_ptr(),
                     etag.len() as u32,
                 )
-            });
+            })
+            .hold(body);
             let done = ticket.await;
             drop(data);
             if done.code < 0 {
@@ -236,14 +258,29 @@ fn owner_runtime() -> std::rc::Rc<OwnerRuntime> {
 
 /// Completes host call `ticket` with `code` and the `len` bytes at `ptr` from `guest_alloc`.
 ///
+/// With a negative `code`, the buffer is freed unread.
+///
 /// # Safety
-/// `ptr` and `len` must come from one `guest_alloc(len)` call, with all `len` bytes written.
+/// `ptr` and `len` must come from one `guest_alloc(len)` call. With a code of 0 or more, all
+/// `len` bytes must be written.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn owner_complete(ticket: u32, code: i64, ptr: *mut u8, len: u32) {
-    let data = if len == 0 { Vec::new() } else { unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) } };
+    let data = match (len, code < 0) {
+        (0, _) => Vec::new(),
+        (_, true) => {
+            drop(unsafe { Vec::from_raw_parts(ptr, 0, len as usize) });
+            Vec::new()
+        }
+        (_, false) => unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) },
+    };
     TICKETS.with(|t| {
         let mut t = t.borrow_mut();
+        if t.get(&ticket).is_some_and(|slot| slot.abandoned) {
+            t.remove(&ticket);
+            return;
+        }
         let slot = t.entry(ticket).or_default();
+        slot.body = None;
         slot.done = Some(TicketDone { code, data });
         if let Some(w) = slot.waker.take() {
             w.wake();

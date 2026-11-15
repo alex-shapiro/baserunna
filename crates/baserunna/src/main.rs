@@ -199,6 +199,13 @@ async fn run() -> Result<(), String> {
                 Ok(baserunna::meta::get_db(&mut t, &db).await?.map(|r| r.owner_id))
             })
         }));
+        let idle = w.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(baserunna::worker::WORKER_IDLE_STOP / 4).await;
+                idle.stop_idle_workers(baserunna::worker::WORKER_IDLE_STOP);
+            }
+        });
         let _ = node.engine.shared.workers.set(w);
     }
     let n = node.clone();

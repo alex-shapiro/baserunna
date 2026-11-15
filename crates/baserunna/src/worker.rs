@@ -1,8 +1,8 @@
 //! Worker processes that run an owner's heavy work inside the owner's cgroup.
 //!
-//! The node starts each worker as `baserunna worker`. The worker reads one job
-//! frame from stdin, runs it against the store, and writes one result frame
-//! to stdout. The kernel enforces the owner's `memory.max` and `cpu.weight`, so
+//! The node starts one worker for each active owner as `baserunna worker`. The
+//! worker reads job frames from stdin, runs them concurrently against the
+//! store, and writes each result frame to stdout. The kernel enforces the owner's `memory.max` and `cpu.weight`, so
 //! an owner that exceeds its memory loses only its own worker.
 //!
 //! The simulator never sets `BASERUNNA_CGROUP_ROOT`, so it runs the same jobs
@@ -17,14 +17,16 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Default memory limit of one owner's cgroup.
 pub const OWNER_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Idle time after which the node stops an owner's worker.
+pub const WORKER_IDLE_STOP: Duration = Duration::from_secs(20);
 
 /// Longest time a worker may take to seal unsealed rows.
 const SEAL_DEADLINE: Duration = Duration::from_secs(600);
@@ -117,7 +119,8 @@ pub struct WorkerPool {
     cfg: PoolConfig,
     db_owners: Mutex<HashMap<String, String>>,
     owner_resolver: std::sync::OnceLock<OwnerResolver>,
-    next_worker_id: std::sync::atomic::AtomicU64,
+    owner_workers: Mutex<HashMap<String, Arc<OwnerWorker>>>,
+    next_job_id: std::sync::atomic::AtomicU64,
 }
 
 impl WorkerPool {
@@ -128,7 +131,8 @@ impl WorkerPool {
             cfg,
             db_owners: Mutex::new(HashMap::new()),
             owner_resolver: Default::default(),
-            next_worker_id: 0.into(),
+            owner_workers: Mutex::new(HashMap::new()),
+            next_job_id: 0.into(),
         })
     }
 
@@ -315,65 +319,178 @@ impl WorkerPool {
         }
     }
 
-    /// Runs `job` with `payload` in a new worker in `owner`'s cgroup and returns the result and its payload.
+    /// Runs `job` with `payload` in `owner`'s worker and returns the result and its payload.
     async fn run(&self, owner: &str, job: Job, payload: Bytes, deadline: Duration) -> Result<(JobResult, Bytes)> {
-        let io = |e: std::io::Error| Error::internal(format!("worker: {e}"));
-        let owner_dir = self.owner_cgroup(owner).map_err(io)?;
-        // Each worker has its own leaf below the owner's cgroup, so a deadline
-        // kills exactly that worker while `memory.max` bounds all of the owner's workers.
-        let worker_id = self.next_worker_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let leaf = owner_dir.join(format!("worker-{worker_id}"));
-        std::fs::create_dir(&leaf).map_err(io)?;
-        let exe = self.cfg.exe.clone();
-        let limit_mib = self.cfg.owner_memory_bytes >> 20;
-        let job = serde_json::to_vec(&job).map_err(|e| Error::internal(e.to_string()))?;
-        let leaf2 = leaf.clone();
-        let task = tokio::task::spawn_blocking(move || -> Result<(JobResult, Bytes)> {
-            let leaf = leaf2;
-            let ooms_before = oom_kills(&owner_dir);
-            let mut child = Command::new(exe)
-                .arg("worker")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .map_err(io)?;
-            // The worker reads nothing and allocates little until it receives the job,
-            // so it joins the owner's cgroup before any tenant data reaches it.
-            if let Err(e) = std::fs::write(leaf.join("cgroup.procs"), child.id().to_string()) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(io(e));
+        let header: Bytes = serde_json::to_vec(&job).map_err(|e| Error::internal(e.to_string()))?.into();
+        let job_id = self.next_job_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut attempts = 0;
+        let (worker, result) = loop {
+            let worker = self.owner_worker(owner)?;
+            let (done, result) = tokio::sync::oneshot::channel();
+            worker.pending.lock().insert(job_id, done);
+            *worker.last_used.lock() = std::time::Instant::now();
+            let exited = worker.exited.load(std::sync::atomic::Ordering::Acquire);
+            if !exited && worker.frames.send((job_id, header.clone(), payload.clone())).is_ok() {
+                break (worker, result);
             }
-            let mut stdin = child.stdin.take().expect("piped stdin");
-            let sent = write_frame(&mut stdin, &job).and_then(|_| write_frame(&mut stdin, &payload));
-            drop(stdin);
-            let mut out = Vec::new();
-            let read = sent.and_then(|_| child.stdout.take().expect("piped stdout").read_to_end(&mut out));
-            let status = child.wait().map_err(io)?;
-            if read.is_ok() && status.success() {
-                let mut r = out.as_slice();
-                let header = read_frame(&mut r).map_err(io)?;
-                let payload = read_frame(&mut r).map_err(io)?;
-                let header =
-                    serde_json::from_slice(&header).map_err(|e| Error::internal(format!("worker result: {e}")))?;
-                return Ok((header, payload.into()));
-            }
-            if oom_kills(&owner_dir) > ooms_before {
-                return Err(Error::TooLarge(format!("the work exceeded the owner's memory limit of {limit_mib} MiB")));
-            }
-            Err(Error::internal(format!("worker exited with {status}")))
-        });
-        let result = match tokio::time::timeout(deadline, task).await {
-            Ok(joined) => joined.map_err(|e| Error::internal(format!("worker task: {e}")))?,
-            Err(_) => {
-                let _ = std::fs::write(leaf.join("cgroup.kill"), "1");
-                Err(Error::TooLarge(format!("the work ran longer than {} ms", deadline.as_millis())))
+            worker.pending.lock().remove(&job_id);
+            attempts += 1;
+            if attempts == 2 {
+                return Err(Error::unavailable("the owner's worker exited"));
             }
         };
-        let _ = std::fs::remove_dir(&leaf);
-        result
+        match tokio::time::timeout(deadline, result).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err(Error::internal("the owner's worker dropped the job")),
+            Err(_) => {
+                worker.pending.lock().remove(&job_id);
+                // A job cannot be stopped inside the worker, so the deadline ends all of the owner's jobs.
+                let _ = std::fs::write(worker.leaf.join("cgroup.kill"), "1");
+                Err(Error::TooLarge(format!("the work ran longer than {} ms", deadline.as_millis())))
+            }
+        }
     }
+
+    /// Stops each worker that has no job and has been idle for at least `idle`, so an idle owner has no process.
+    pub fn stop_idle_workers(&self, idle: Duration) {
+        self.owner_workers.lock().retain(|_, w| {
+            let pending = w.pending.lock();
+            if !pending.is_empty() || w.last_used.lock().elapsed() < idle {
+                return true;
+            }
+            w.exited.store(true, std::sync::atomic::Ordering::Release);
+            let _ = std::fs::write(w.leaf.join("cgroup.kill"), "1");
+            false
+        });
+    }
+
+    /// Returns the number of running workers.
+    pub fn running_workers(&self) -> usize {
+        self.owner_workers.lock().len()
+    }
+
+    /// Returns `owner`'s running worker, or starts one in the owner's cgroup.
+    fn owner_worker(&self, owner: &str) -> Result<Arc<OwnerWorker>> {
+        let mut workers = self.owner_workers.lock();
+        if let Some(w) = workers.get(owner)
+            && !w.exited.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(w.clone());
+        }
+        let worker = self.start_worker(owner).map_err(|e| Error::internal(format!("worker: {e}")))?;
+        workers.insert(owner.to_string(), worker.clone());
+        Ok(worker)
+    }
+
+    fn start_worker(&self, owner: &str) -> std::io::Result<Arc<OwnerWorker>> {
+        let owner_dir = self.owner_cgroup(owner)?;
+        let leaf = owner_dir.join("worker");
+        if !leaf.exists() {
+            std::fs::create_dir(&leaf)?;
+        }
+        let mut child = tokio::process::Command::new(&self.cfg.exe)
+            .arg("worker")
+            // Large buffers map their own pages and the heap trims its top, so freed job
+            // memory leaves the owner's cgroup instead of staying in the allocator.
+            .env(
+                "GLIBC_TUNABLES",
+                "glibc.malloc.arena_max=2:glibc.malloc.mmap_threshold=131072:glibc.malloc.trim_threshold=131072",
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        // The worker reads nothing and allocates little until it receives a job,
+        // so it joins the owner's cgroup before any tenant data reaches it.
+        let pid = child.id().unwrap_or(0);
+        if let Err(e) = std::fs::write(leaf.join("cgroup.procs"), pid.to_string()) {
+            let _ = child.start_kill();
+            return Err(e);
+        }
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let (frames, mut to_send) = tokio::sync::mpsc::unbounded_channel::<(u64, Bytes, Bytes)>();
+        let worker = Arc::new(OwnerWorker {
+            frames,
+            pending: Mutex::new(HashMap::new()),
+            leaf,
+            exited: false.into(),
+            last_used: Mutex::new(std::time::Instant::now()),
+        });
+        tokio::spawn(async move {
+            while let Some((job_id, header, payload)) = to_send.recv().await {
+                if write_job_frame(&mut stdin, job_id, &header, &payload).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let reader = worker.clone();
+        let limit_mib = self.cfg.owner_memory_bytes >> 20;
+        let ooms_before = oom_kills(&owner_dir);
+        tokio::spawn(async move {
+            while let Ok((job_id, header, payload)) = read_job_frame(&mut stdout).await {
+                let result = serde_json::from_slice::<JobResult>(&header)
+                    .map(|h| (h, payload))
+                    .map_err(|e| Error::internal(format!("worker result: {e}")));
+                *reader.last_used.lock() = std::time::Instant::now();
+                if let Some(done) = reader.pending.lock().remove(&job_id) {
+                    let _ = done.send(result);
+                }
+            }
+            reader.exited.store(true, std::sync::atomic::Ordering::Release);
+            let status = child.wait().await;
+            let oom = oom_kills(&owner_dir) > ooms_before;
+            for (_, done) in reader.pending.lock().drain() {
+                let _ = done.send(Err(if oom {
+                    Error::TooLarge(format!("the work exceeded the owner's memory limit of {limit_mib} MiB"))
+                } else {
+                    Error::internal(format!("worker exited with {status:?}"))
+                }));
+            }
+        });
+        Ok(worker)
+    }
+}
+
+/// Delivers a job's result and payload to the request that waits for it.
+type JobDone = tokio::sync::oneshot::Sender<Result<(JobResult, Bytes)>>;
+
+/// One owner's worker process, which runs the owner's jobs concurrently.
+struct OwnerWorker {
+    /// Job frames for the task that writes the worker's stdin.
+    frames: tokio::sync::mpsc::UnboundedSender<(u64, Bytes, Bytes)>,
+    /// Jobs sent to the worker that wait for their results, by job ID.
+    pending: Mutex<HashMap<u64, JobDone>>,
+    /// The worker's cgroup, below the owner's cgroup.
+    leaf: PathBuf,
+    exited: std::sync::atomic::AtomicBool,
+    /// When the last job of this worker started or ended.
+    last_used: Mutex<std::time::Instant>,
+}
+
+async fn write_job_frame(
+    w: &mut (impl tokio::io::AsyncWrite + Unpin),
+    job_id: u64,
+    header: &[u8],
+    payload: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    w.write_all(&job_id.to_le_bytes()).await?;
+    w.write_all(&(header.len() as u64).to_le_bytes()).await?;
+    w.write_all(header).await?;
+    w.write_all(&(payload.len() as u64).to_le_bytes()).await?;
+    w.write_all(payload).await?;
+    w.flush().await
+}
+
+async fn read_job_frame(r: &mut (impl tokio::io::AsyncRead + Unpin)) -> std::io::Result<(u64, Bytes, Bytes)> {
+    use tokio::io::AsyncReadExt;
+    let job_id = r.read_u64_le().await?;
+    let mut header = vec![0u8; r.read_u64_le().await? as usize];
+    r.read_exact(&mut header).await?;
+    let mut payload = vec![0u8; r.read_u64_le().await? as usize];
+    r.read_exact(&mut payload).await?;
+    Ok((job_id, header.into(), payload.into()))
 }
 
 fn oom_kills(cgroup: &std::path::Path) -> u64 {
@@ -381,33 +498,35 @@ fn oom_kills(cgroup: &std::path::Path) -> u64 {
     events.lines().find_map(|l| l.strip_prefix("oom_kill ")).and_then(|n| n.trim().parse().ok()).unwrap_or(0)
 }
 
-fn write_frame(w: &mut impl Write, b: &[u8]) -> std::io::Result<()> {
-    w.write_all(&(b.len() as u64).to_le_bytes())?;
-    w.write_all(b)?;
-    w.flush()
-}
-
-fn read_frame(r: &mut impl Read) -> std::io::Result<Vec<u8>> {
-    let mut len = [0u8; 8];
-    r.read_exact(&mut len)?;
-    let mut b = vec![0u8; u64::from_le_bytes(len) as usize];
-    r.read_exact(&mut b)?;
-    Ok(b)
-}
-
-/// Runs one job from stdin and writes its result to stdout (the `baserunna worker` command).
+/// Runs the jobs that the node sends on stdin and writes each result to stdout (the `baserunna worker` command).
 pub async fn serve(store: crate::store::DynStore, cfg: EngineConfig) -> std::io::Result<()> {
-    let (job, payload) = {
-        let mut stdin = std::io::stdin().lock();
-        (read_frame(&mut stdin)?, read_frame(&mut stdin)?)
-    };
-    let job: Job = serde_json::from_slice(&job).map_err(std::io::Error::other)?;
     let engine = crate::engine::Engine::new(store, Arc::new(crate::env::Env::real()), cfg, "worker".into());
-    let (result, out) = run_job(&engine.shared, job, payload.into()).await;
-    let result = serde_json::to_vec(&result).map_err(std::io::Error::other)?;
-    let mut stdout = std::io::stdout().lock();
-    write_frame(&mut stdout, &result)?;
-    write_frame(&mut stdout, &out)
+    let (results, mut to_write) = tokio::sync::mpsc::unbounded_channel::<(u64, Bytes, Bytes)>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some((job_id, header, payload)) = to_write.recv().await {
+            write_job_frame(&mut stdout, job_id, &header, &payload).await?;
+        }
+        Ok::<_, std::io::Error>(())
+    });
+    let mut stdin = tokio::io::stdin();
+    while let Ok((job_id, header, payload)) = read_job_frame(&mut stdin).await {
+        let shared = engine.shared.clone();
+        let results = results.clone();
+        tokio::spawn(async move {
+            let (result, out) = match serde_json::from_slice::<Job>(&header) {
+                Ok(job) => run_job(&shared, job, payload).await,
+                Err(e) => (
+                    JobResult::Failed(json!({ "error": crate::api::error_json(&Error::internal(e.to_string())) })),
+                    Bytes::new(),
+                ),
+            };
+            let header = serde_json::to_vec(&result).unwrap_or_default();
+            let _ = results.send((job_id, header.into(), out));
+        });
+    }
+    drop(results);
+    writer.await.map_err(std::io::Error::other)?
 }
 
 async fn run_job(shared: &Arc<Shared>, job: Job, payload: Bytes) -> (JobResult, Bytes) {

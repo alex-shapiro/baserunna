@@ -1,0 +1,12 @@
+[package]
+name = "baserunna-guest"
+version.workspace = true
+edition.workspace = true
+description = "tenant work that the node runs inside its WebAssembly sandbox"
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde_json.workspace = true

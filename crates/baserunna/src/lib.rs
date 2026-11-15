@@ -24,6 +24,7 @@ pub mod node;
 pub mod ops;
 pub mod probe;
 pub mod queries;
+pub mod sandbox;
 pub mod sim;
 pub mod store;
 pub mod stream;

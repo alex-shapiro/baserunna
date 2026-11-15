@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/baserunna", "crates/baserunna-api", "crates/baserunna-client"]
+members = ["crates/baserunna", "crates/baserunna-api", "crates/baserunna-client", "crates/baserunna-guest"]
 default-members = ["crates/baserunna", "crates/baserunna-api", "crates/baserunna-client"]
 
 [workspace.package]

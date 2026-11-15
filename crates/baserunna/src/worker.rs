@@ -183,8 +183,9 @@ pub type WorkerCommitter = Box<
 
 /// Where the node runs a database request.
 pub enum Placement {
-    /// In the node process: the request is on the light list.
-    Node(axum::extract::Request),
+    /// In the node process: the request is on the light list. The second field is its
+    /// largest memory use in MiB, which the owner's light budget admits.
+    Node(axum::extract::Request, u32),
     /// In the owner's worker: every request that is not on the light list.
     Worker(axum::extract::Request),
 }
@@ -194,6 +195,17 @@ const LIGHT_TXN_BODY_MAX: u64 = 64 * 1024;
 
 /// The most ops in a one-shot transaction that the node process runs itself.
 const LIGHT_TXN_OPS_MAX: usize = 16;
+
+/// The memory in MiB that one owner's light requests may use at once in the node process.
+pub const LIGHT_BUDGET_MIB: u32 = 64;
+
+/// The largest memory use of one light KV request in MiB: one value of at most
+/// `json_value_max` (1 MiB), or one blob chunk in flight.
+const LIGHT_KV_MIB: u32 = 1;
+
+/// The largest memory use of one light transaction in MiB: [`LIGHT_TXN_OPS_MAX`] values of at
+/// most 1 MiB each.
+const LIGHT_TXN_MIB: u32 = 16;
 
 /// Decides where database request `req` runs. The node process keeps only requests whose cost
 /// has a fixed bound; every other request, including routes that this list does not name, runs
@@ -216,7 +228,7 @@ pub async fn light_request(node: &crate::node::Node, req: axum::extract::Request
         (Method::POST, "txn") => return light_txn(node, req).await,
         _ => false,
     };
-    Ok(if light { Placement::Node(req) } else { Placement::Worker(req) })
+    Ok(if light { Placement::Node(req, LIGHT_KV_MIB) } else { Placement::Worker(req) })
 }
 
 /// Places a one-shot transaction: the node reads its body only if the body is at most
@@ -240,7 +252,7 @@ async fn light_txn(node: &crate::node::Node, req: axum::extract::Request) -> Res
             })
     });
     let req = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
-    Ok(if light { Placement::Node(req) } else { Placement::Worker(req) })
+    Ok(if light { Placement::Node(req, LIGHT_TXN_MIB) } else { Placement::Worker(req) })
 }
 
 /// Reads the `owner_id` of a database ID, or `None` if the database does not exist.
@@ -267,6 +279,8 @@ pub struct WorkerPool {
     db_owners: Mutex<HashMap<String, String>>,
     owner_resolver: std::sync::OnceLock<OwnerResolver>,
     committer: Arc<std::sync::OnceLock<WorkerCommitter>>,
+    /// Each owner's light budget: [`LIGHT_BUDGET_MIB`] permits of 1 MiB.
+    light_budgets: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     binder: Arc<std::sync::OnceLock<WorkerBinder>>,
     owner_workers: Mutex<HashMap<String, Arc<OwnerWorker>>>,
     next_job_id: std::sync::atomic::AtomicU64,
@@ -287,6 +301,7 @@ impl WorkerPool {
             db_owners: Mutex::new(HashMap::new()),
             owner_resolver: Default::default(),
             committer: Default::default(),
+            light_budgets: Mutex::new(HashMap::new()),
             binder: Default::default(),
             owner_workers: Mutex::new(HashMap::new()),
             next_job_id: 0.into(),
@@ -298,6 +313,26 @@ impl WorkerPool {
         let mut g = self.db_owners.lock();
         if g.get(db).map(String::as_str) != Some(owner) {
             g.insert(db.to_string(), owner.to_string());
+        }
+    }
+
+    /// Waits until `owner`'s light budget admits a request that uses at most `mib` MiB, or
+    /// fails with a retryable 503 at `deadline`. The permit returns to the budget when it drops.
+    pub async fn admit_light(
+        &self,
+        owner: &str,
+        mib: u32,
+        deadline: tokio::time::Instant,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let budget = self
+            .light_budgets
+            .lock()
+            .entry(owner.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(LIGHT_BUDGET_MIB as usize)))
+            .clone();
+        match tokio::time::timeout_at(deadline, budget.acquire_many_owned(mib)).await {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err(Error::unavailable("the owner has too many requests in progress")),
         }
     }
 
@@ -803,7 +838,9 @@ fn oom_kills(cgroup: &std::path::Path) -> u64 {
 /// Runs the jobs that the node sends on stdin and writes each result to stdout (the `baserunna worker` command).
 pub async fn serve(node: Arc<crate::node::Node>) -> std::io::Result<()> {
     let engine = node.engine.clone();
-    let router = crate::api::db_routes().with_state(node.clone());
+    let router = crate::api::db_routes()
+        .layer(axum::extract::DefaultBodyLimit::max(node.cfg.max_json_body))
+        .with_state(node.clone());
     let (results, mut to_write) = tokio::sync::mpsc::unbounded_channel::<(u64, Bytes, Bytes)>();
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();

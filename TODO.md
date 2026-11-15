@@ -557,6 +557,22 @@ only.
 
 ## Untriaged
 
+- [ ] [untriaged · Tenant resource exhaustion] **Bound the memory of scan
+      results in a transaction.** `exec_ops` keeps the result of every op until
+      the transaction ends (`ops.rs:463`). Each scan op returns up to 1,000
+      items with their values (`ops.rs:500`). The transaction read limit counts
+      the scanned range, not the values (`engine/txn.rs:398`). Measured: 4
+      concurrent transactions of 16 scans of 32 MiB each OOM-killed a node with
+      a 1,536 MiB limit in 0.15 s. Workload: `txn_scans` in
+      `crates/baserunna/examples/isolation/` (see
+      `reports/tenant-isolation.md`).
+- [ ] [untriaged · Tenant resource exhaustion] **Share node CPU between
+      owners for table queries.** A table query examines up to 10,000 rows and
+      decodes each row twice (`table/mod.rs:1115`, `:1141`). The only control is
+      a request-count rate limit (`limits.rs:70`). Measured: 32 clients of one
+      owner sent about 375 queries per second, under the rate limit, and raised
+      another owner's p99 latency from 7.5 ms to 758 ms. Workload:
+      `table_filter_scans` in `crates/baserunna/examples/isolation/`.
 - [ ] [untriaged · Verification] **Check memory estimates against the real
       heap in simulation.** Add a counting allocator to simulation builds that
       charges each allocation to the memory account of the task that makes it,

@@ -90,6 +90,41 @@ impl Api {
         }
     }
 
+    /// Sends a request and records its status and elapsed time, and the response size in place of
+    /// its body, so that a large response does not stay in client memory.
+    pub async fn timed_drain(&self, label: &str, method: Method, path: &str, token: &str, body: Bytes, ok: &[u16]) -> (RequestRecord, u64) {
+        let started = Instant::now();
+        let mut req = self.http.request(method, format!("{}{path}", self.base)).header("content-type", "application/json");
+        if !token.is_empty() {
+            req = req.bearer_auth(token);
+        }
+        let record = |status: Option<u16>, error: Option<String>| RequestRecord {
+            label: label.into(),
+            status,
+            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+            expected: error.is_none() && status.is_some_and(|s| ok.contains(&s)),
+            error,
+        };
+        let mut resp = match req.body(body).send().await {
+            Ok(r) => r,
+            Err(e) => return (record(None, Some(format!("{e:?}"))), 0),
+        };
+        let status = resp.status().as_u16();
+        let (mut bytes, mut excerpt) = (0u64, Vec::new());
+        loop {
+            match resp.chunk().await {
+                Ok(Some(c)) => {
+                    bytes += c.len() as u64;
+                    excerpt.extend_from_slice(&c[..c.len().min(300usize.saturating_sub(excerpt.len()))]);
+                }
+                Ok(None) => break,
+                Err(e) => return (record(Some(status), Some(format!("body after {bytes} bytes: {e:?}"))), bytes),
+            }
+        }
+        let error = (!ok.contains(&status)).then(|| String::from_utf8_lossy(&excerpt).into_owned());
+        (record(Some(status), error), bytes)
+    }
+
     pub async fn wait_healthy(&self, limit: Duration) -> Result<(), String> {
         let started = Instant::now();
         while started.elapsed() < limit {

@@ -7,6 +7,8 @@ mod blob_checks;
 mod bulk_inserts;
 mod long_strings;
 mod merges;
+mod table_filter_scans;
+mod txn_scans;
 
 use crate::http::{Api, Owner, RequestRecord};
 use futures_util::future::BoxFuture;
@@ -77,7 +79,7 @@ pub trait Workload: Send + Sync {
     fn attack<'a>(&'a self, cx: &'a AttackContext, round: Round) -> BoxFuture<'a, Result<AttackOutcome, String>>;
 }
 
-pub const NAMES: &[&str] = &["long_strings", "bulk_inserts", "merges", "blob_checks"];
+pub const NAMES: &[&str] = &["long_strings", "bulk_inserts", "merges", "blob_checks", "txn_scans", "table_filter_scans"];
 
 pub fn by_name(name: &str) -> Option<Box<dyn Workload>> {
     Some(match name {
@@ -85,6 +87,8 @@ pub fn by_name(name: &str) -> Option<Box<dyn Workload>> {
         "bulk_inserts" => Box::new(bulk_inserts::BulkInserts),
         "merges" => Box::new(merges::Merges),
         "blob_checks" => Box::new(blob_checks::BlobChecks),
+        "txn_scans" => Box::new(txn_scans::TxnScans),
+        "table_filter_scans" => Box::new(table_filter_scans::TableFilterScans),
         _ => return None,
     })
 }

@@ -7,7 +7,8 @@
 # Run inside the Linux VM. The node binary defaults to $NODE_BIN, then to
 # $HOME/target-iso-base/release/baserunna. The harness binaries (isolation and
 # fake_s3_server) come from $EXAMPLES_DIR, which defaults to
-# $HOME/target-iso-base/release/examples.
+# $HOME/target-iso-base/release/examples. Ports are free ports unless $S3_PORT
+# and $NODE_PORT are set. $ISO_CGROUP replaces /sys/fs/cgroup/iso.
 set -euo pipefail
 
 if [ $# -lt 3 ]; then
@@ -19,9 +20,10 @@ VARIANT=$2
 OUT=$(realpath -m "$3")
 NODE_BIN=$(realpath "${4:-${NODE_BIN:-$HOME/target-iso-base/release/baserunna}}")
 EXAMPLES_DIR=${EXAMPLES_DIR:-$HOME/target-iso-base/release/examples}
-S3_PORT=${S3_PORT:-19000}
-NODE_PORT=${NODE_PORT:-18080}
-CG=/sys/fs/cgroup/iso
+free_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+S3_PORT=${S3_PORT:-$(free_port)}
+NODE_PORT=${NODE_PORT:-$(free_port)}
+CG=${ISO_CGROUP:-/sys/fs/cgroup/iso}
 NODE_CG=$CG/node
 WORK=$(mktemp -d)
 NODE_PID=

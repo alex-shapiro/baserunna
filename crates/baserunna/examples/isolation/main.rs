@@ -174,7 +174,7 @@ async fn run(a: &Args, watch: &NodeWatch, out: &mut Json) -> Result<(), String> 
     let variant = a.variant.ok_or("--variant is required for this workload")?;
     let victim_owner = api.create_owner("victim@iso.test", "victim").await?;
     victim::prepare(&api, &victim_owner).await?;
-    let cx = AttackContext { api: api.clone(), attacker, variant };
+    let cx = AttackContext { api: api.clone(), attacker, variant, cgroup: a.cgroup.clone() };
     let prep_started = Instant::now();
     let prepare = json!({
         "alone": workload.prepare(&cx, Round::Alone).await?,

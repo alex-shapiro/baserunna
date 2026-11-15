@@ -1,6 +1,10 @@
 //! Concurrent 30 MiB bulk event inserts, from `concurrent_bulk_inserts_respect_node_memory_budget`
 //! (tests/event_ingest_limits.rs), for the `{}` and `user event` row shapes.
+//!
+//! As in the test, a 4 MiB insert first estimates the node memory per body byte, and the body
+//! size is the smaller of 30 MiB and the size whose estimate is 1 GiB.
 
+use crate::cgroup::MemorySampler;
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload, concurrent_posts};
 use crate::http::json_rows;
 use bytes::Bytes;
@@ -22,7 +26,11 @@ fn table(round: Round, shape: &str) -> String {
     format!("bulk{}_{shape}", round.index())
 }
 
-pub struct BulkInserts;
+#[derive(Default)]
+pub struct BulkInserts {
+    /// Body size of each row shape, from the 4 MiB calibration insert.
+    body_bytes: std::sync::Mutex<Vec<usize>>,
+}
 
 impl Workload for BulkInserts {
     fn prepare<'a>(&'a self, cx: &'a AttackContext, round: Round) -> BoxFuture<'a, Result<Json, String>> {
@@ -33,7 +41,28 @@ impl Workload for BulkInserts {
                     "time_column": "time", "order_by": ["time"]});
                 cx.api.create_event_table(&cx.attacker.token, &cx.attacker.db, t).await?;
             }
-            Ok(Json::Null)
+            if round == Round::WithVictim {
+                return Ok(Json::Null);
+            }
+            let mut notes = Vec::new();
+            let mut sizes = Vec::new();
+            for &(shape, row) in ROW_SHAPES {
+                let table = format!("calibrate_{shape}");
+                let t = json!({"name": table, "columns": [{"name": "time", "type": "time", "default": "now"},
+                    {"name": "user", "type": "string"}, {"name": "event", "type": "string"}],
+                    "time_column": "time", "order_by": ["time"]});
+                cx.api.create_event_table(&cx.attacker.token, &cx.attacker.db, t).await?;
+                let (small, _) = json_rows(4 << 20, row);
+                let sampler = MemorySampler::start(cx.cgroup.clone());
+                cx.api.bulk_insert(&cx.attacker.token, &cx.attacker.db, &table, small.clone()).await?;
+                let growth = sampler.finish().growth_bytes;
+                let per_byte = (growth as f64 / small.len() as f64).max(1.0);
+                let body_bytes = BODY_BYTES.min(((1u64 << 30) as f64 / per_byte) as usize);
+                notes.push(json!({"shape": shape, "node_bytes_per_body_byte": per_byte, "body_bytes": body_bytes}));
+                sizes.push(body_bytes);
+            }
+            *self.body_bytes.lock().expect("body sizes") = sizes;
+            Ok(Json::Array(notes))
         })
     }
 
@@ -45,8 +74,9 @@ impl Workload for BulkInserts {
             };
             let mut requests = Vec::new();
             let mut notes = Vec::new();
-            for &(shape, row) in ROW_SHAPES {
-                let (body, rows) = json_rows(BODY_BYTES, row);
+            let sizes = self.body_bytes.lock().expect("body sizes").clone();
+            for (&(shape, row), &size) in ROW_SHAPES.iter().zip(&sizes) {
+                let (body, rows) = json_rows(size, row);
                 let body = Bytes::from(body);
                 let path = format!("/v1/dbs/{}/events/{}/rows", cx.attacker.db, table(round, shape));
                 let batch = (0..n).map(|i| (format!("{shape} insert {i}"), path.clone(), body.clone())).collect();

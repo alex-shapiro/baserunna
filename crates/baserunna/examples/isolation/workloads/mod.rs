@@ -53,6 +53,7 @@ pub struct AttackContext {
     pub api: Arc<Api>,
     pub attacker: Owner,
     pub variant: Variant,
+    pub cgroup: crate::cgroup::NodeCgroup,
 }
 
 /// Result of one attack round.
@@ -81,7 +82,7 @@ pub const NAMES: &[&str] = &["long_strings", "bulk_inserts", "merges", "blob_che
 pub fn by_name(name: &str) -> Option<Box<dyn Workload>> {
     Some(match name {
         "long_strings" => Box::new(long_strings::LongStrings),
-        "bulk_inserts" => Box::new(bulk_inserts::BulkInserts),
+        "bulk_inserts" => Box::new(bulk_inserts::BulkInserts::default()),
         "merges" => Box::new(merges::Merges),
         "blob_checks" => Box::new(blob_checks::BlobChecks),
         _ => return None,

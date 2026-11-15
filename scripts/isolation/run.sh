@@ -45,6 +45,7 @@ teardown() {
   rm -rf "$WORK"
 }
 trap teardown EXIT
+trap "exit 143" TERM INT
 
 if [ -d "$CG" ]; then
   echo "$CG exists; another run is active or did not tear down" >&2

@@ -15,8 +15,8 @@ const DAY_MS: i64 = 86_400_000;
 const MERGE_DAY_MS: i64 = 1_749_000_000_000 / DAY_MS * DAY_MS;
 const ROWS_PER_TABLE: usize = 500_000;
 const PARTS_BEFORE_TRIGGER: usize = 7;
-const MERGE_TIMEOUT: Duration = Duration::from_secs(90);
-/// Setup bulk inserts in flight at once.
+const MERGE_TIMEOUT: Duration = Duration::from_secs(40);
+/// Tables that receive setup inserts at once.
 const SETUP_CONCURRENCY: usize = 4;
 
 fn tables(v: Variant) -> usize {
@@ -44,27 +44,26 @@ impl Workload for Merges {
             let (api, token, db) = (&cx.api, &cx.attacker.token, db(round));
             api.create_db(token, &db).await?;
             let n = tables(cx.variant);
-            let mut inserts = Vec::new();
             for i in 0..n {
                 let table = json!({"name": format!("ev{i}"), "columns": [{"name": "t", "type": "time"},
                     {"name": "u", "type": "string"}, {"name": "e", "type": "string"}], "time_column": "t", "order_by": ["t"]});
                 api.create_event_table(token, &db, table).await?;
-                let per_part = ROWS_PER_TABLE.div_ceil(PARTS_BEFORE_TRIGGER);
-                for p in 0..PARTS_BEFORE_TRIGGER {
-                    let first = i * ROWS_PER_TABLE + p * per_part;
-                    let end = (i * ROWS_PER_TABLE + ROWS_PER_TABLE).min(first + per_part);
-                    inserts.push((format!("ev{i}"), first..end));
-                }
             }
-            for chunk in inserts.chunks(SETUP_CONCURRENCY) {
-                let tasks: Vec<_> = chunk
+            // Inserts into one table run one at a time, so that the insert buffer does not join them into one part.
+            for tables in (0..n).collect::<Vec<_>>().chunks(SETUP_CONCURRENCY) {
+                let tasks: Vec<_> = tables
                     .iter()
-                    .map(|(table, rows)| {
-                        let (api, token, db, table, rows) =
-                            (cx.api.clone(), token.clone(), db.clone(), table.clone(), rows.clone());
+                    .map(|&i| {
+                        let (api, token, db) = (cx.api.clone(), token.clone(), db.clone());
                         tokio::spawn(async move {
-                            let body = format!("[{}]", rows.map(small_event).collect::<Vec<_>>().join(","));
-                            api.bulk_insert(&token, &db, &table, body).await
+                            let per_part = ROWS_PER_TABLE.div_ceil(PARTS_BEFORE_TRIGGER);
+                            for p in 0..PARTS_BEFORE_TRIGGER {
+                                let first = i * ROWS_PER_TABLE + p * per_part;
+                                let end = (i * ROWS_PER_TABLE + ROWS_PER_TABLE).min(first + per_part);
+                                let body = format!("[{}]", (first..end).map(small_event).collect::<Vec<_>>().join(","));
+                                api.bulk_insert(&token, &db, &format!("ev{i}"), body).await?;
+                            }
+                            Ok::<(), String>(())
                         })
                     })
                     .collect();

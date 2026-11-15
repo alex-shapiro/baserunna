@@ -4,9 +4,11 @@
 //! [`by_name`] and [`NAMES`].
 
 mod blob_checks;
+mod blob_downloads;
 mod bulk_inserts;
 mod long_strings;
 mod merges;
+mod stream_filter_scans;
 mod table_filter_scans;
 mod txn_scans;
 
@@ -79,7 +81,7 @@ pub trait Workload: Send + Sync {
     fn attack<'a>(&'a self, cx: &'a AttackContext, round: Round) -> BoxFuture<'a, Result<AttackOutcome, String>>;
 }
 
-pub const NAMES: &[&str] = &["long_strings", "bulk_inserts", "merges", "blob_checks", "txn_scans", "table_filter_scans"];
+pub const NAMES: &[&str] = &["long_strings", "bulk_inserts", "merges", "blob_checks", "txn_scans", "table_filter_scans", "blob_downloads", "stream_filter_scans"];
 
 pub fn by_name(name: &str) -> Option<Box<dyn Workload>> {
     Some(match name {
@@ -89,6 +91,8 @@ pub fn by_name(name: &str) -> Option<Box<dyn Workload>> {
         "blob_checks" => Box::new(blob_checks::BlobChecks),
         "txn_scans" => Box::new(txn_scans::TxnScans),
         "table_filter_scans" => Box::new(table_filter_scans::TableFilterScans),
+        "blob_downloads" => Box::new(blob_downloads::BlobDownloads),
+        "stream_filter_scans" => Box::new(stream_filter_scans::StreamFilterScans),
         _ => return None,
     })
 }

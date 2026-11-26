@@ -30,7 +30,8 @@ The contest taught these lessons:
 
 `main` does not enforce these invariants today.
 
-1. Each lease holder is a single process. Today it is the node (`Shared::node_id`).
+1. Each lease holder has its own lease identity. Today the identity belongs to
+   the node (`Shared::node_id`).
 2. Each tenant's use of every resource counts against that tenant's share.
    Resources are memory, CPU, caches, disk, store requests, and the work of
    the trusted process and the system database. Over a share, only that
@@ -44,14 +45,14 @@ Split the `baserunna` crate into three crates:
 2. `baserunna-worker`: the request handlers and the background jobs of each
    tenant. All tenant work runs in this crate. It depends on
    `baserunna-storage` and `baserunna-server`.
-3. `baserunna-server`: connections, authentication, routing, and byte
-   movement. It also defines the frames that move requests and responses
-   across the boundary. It does not depend on `baserunna-storage`.
+3. `baserunna-server`: connections, authentication, and the routing of each
+   request to a worker through the `Transport` trait. It does not depend on
+   `baserunna-storage`.
 
 `baserunna-server` and `baserunna-worker` each build their own binary. The
 server process cannot open a database, because its binary does not link
 `baserunna-storage`. A CI check on `cargo tree` keeps that dependency out. This
-check replaces the store guard from milestone 4.
+check replaces the store guard from milestone 3.
 
 The split of the storage engine is easy. Today `engine/` imports only `store`,
 `util`, `probe`, `error`, `buggify`, `env`, `metrics`, and `log`.
@@ -60,8 +61,8 @@ The split of the storage engine is easy. Today `engine/` imports only `store`,
 
 A milestone is a group of PRs. The PR counts are estimates.
 
-Milestones 1 to 4 do not depend on each other. Start them in any order.
-Milestone 5 needs milestones 2 and 4. Milestone 6 comes last.
+Milestones 1 to 3 do not depend on each other. Start them in any order.
+Milestone 4 needs milestone 3. Milestone 5 comes last.
 
 ### 1. Make each operation fit in a fixed amount of memory
 
@@ -97,14 +98,7 @@ bytes".
       code (`main.rs`).
 - [ ] Time out stalled request bodies. TODO: "Time out stalled request bodies".
 
-### 2. Give each process its own lease identity
-
-- [ ] Make the lease identity belong to a process, for example the node ID
-      plus a value that is new at each process start.
-- [ ] Make the simulator run more than one lease holder on each node, and kill
-      them one at a time.
-
-### 3. Give each metadata command a fixed maximum cost
+### 2. Give each metadata command a fixed maximum cost
 
 A per-tenant boundary does not fit metadata commands. All of them go through
 the single lease holder of the system database. Many of them also read the data
@@ -124,48 +118,39 @@ ceiling. This is a limit on scale, not on isolation.
       runs a command. Use a queue for each account, and a queue for each client
       address before sign-in.
 
-### 4. Put all tenant work behind an in-process boundary
+### 3. Run tenant work in workers
 
-The in-process boundary is permanent. The simulator uses it, because the
-simulator cannot run worker processes or kernel limits. It also lets each PR
-move a part of the work while `main` stays in a working state.
+A worker is a node that serves the databases of a single owner. The server
+sends each request to the worker of its owner through the `Transport` trait
+(`cluster.rs`). Nodes already use this trait to forward requests to each
+other. So the boundary protocol is HTTP. The simulator already runs nodes,
+forwards requests between them, and kills them.
+
+Each worker has its own node ID, and the ID is new each time the worker
+starts. This keeps invariant 1. In this milestone, the workers run in the
+process of the server. Milestone 4 chooses the mechanism that separates them.
 
 - [ ] Move the storage engine and the database features into `baserunna-storage`.
-- [ ] Add the frames and an in-process boundary over an in-memory channel, in
-      the `baserunna` crate. A body crosses the boundary in fixed-size chunks,
-      and the receiver grants credit for each chunk. So each side holds a fixed
-      amount of memory for each request, whatever the size of the body.
-- [ ] Make the route table data. Add two tests: each route crosses the
-      boundary, and the server has no handler for any tenant route.
-- [ ] Send each group of routes through the frames, one PR for each group. Both
-      sides still share one `Engine`, so these PRs test the frames, not the
-      separation.
-  - [ ] KV
-  - [ ] Transactions
-  - [ ] Tables
-  - [ ] Streams
-  - [ ] Event tables
-  - [ ] Blobs
-  - [ ] Accounts and organizations
-  - [ ] Console
-  - [ ] Internal routes between nodes
-- [ ] Give the worker side its own `Engine`, and remove tenant databases from
-      the server side. The background jobs of each database move with it. A
-      store guard on the server side fails each read of a tenant object, in
-      tests and in the simulator.
-- [ ] Run the system database behind its own boundary, with its own memory
-      bound. Metadata commands and the account and organization routes run
-      there. Authentication and routing get metadata records from it.
-- [ ] Move connections, authentication, routing, and the frames into
-      `baserunna-server`. Add the `cargo tree` check. Rename the rest of the
-      `baserunna` crate to `baserunna-worker`.
+- [ ] Send each database request to an in-process worker for its owner. Each
+      worker has its own `Engine` and node ID. The background jobs of each
+      database run in its worker. The server sends the authenticated
+      principal with the request, and it streams each body. The simulator runs
+      each worker as a node.
+- [ ] Add a store guard on the server side. It fails each read of a tenant
+      object, in tests and in the simulator.
+- [ ] Run the system database in its own worker. Metadata commands and the
+      account and organization routes run there. Authentication and routing get
+      metadata records from it.
+- [ ] Move connections, authentication, and routing into `baserunna-server`.
+      Add the `cargo tree` check. Rename the rest of the `baserunna` crate to
+      `baserunna-worker`.
 
-### 5. Choose the boundary mechanism by measurement
+### 4. Choose the boundary mechanism by measurement
 
 At this point the only difference between the designs is the boundary.
 
-- [ ] Measure the worker pool and the WebAssembly sandbox behind the protocol
-      from milestone 4. Known numbers: an empty round trip costs 42% of
+- [ ] Measure the worker pool and the WebAssembly sandbox with the workers from
+      milestone 3. Known numbers: an empty round trip costs 42% of
       throughput over a Unix socket, and 7% for a call into a WebAssembly
       instance (`BENCH_BOUNDARY` on branch `iso/floor`).
 - [ ] Find the cause of the 81% loss of KV throughput in `iso3/cgroup`.
@@ -179,9 +164,9 @@ At this point the only difference between the designs is the boundary.
 - [ ] Remove the memory counter (`engine/memory.rs`). This also removes the
       fair share of memory among the users of an organization.
 
-### 6. Give each tenant a share of the caches and the store
+### 5. Give each tenant a share of the caches and the store
 
-The right method depends on the mechanism from milestone 5.
+The right method depends on the mechanism from milestone 4.
 
 - [ ] Block cache
 - [ ] Disk cache

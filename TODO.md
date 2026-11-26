@@ -645,3 +645,14 @@ only.
       probe test, the table layer accepts a 5,000-byte indexed value. The
       commit then fails with `500 internal: corrupt data: key too long`. The
       database stays readable. The server logs a false corruption message.
+- [ ] [untriaged · Tenant isolation] **Remove tombstones that slow scans of the
+      system database.** A deleted row stays in the LSM tree as a tombstone,
+      and each later scan of its range steps over it. No compaction trigger
+      looks at tombstone density. A tenant can repeat create and delete
+      requests to make its own metadata scans slower on the lease holder for
+      the system database. In a probe test, 80,000 created and deleted API keys
+      made `DeleteApiKeys` for that user take 7.4 ms instead of 0.02 ms. The
+      slowdown stayed after 30 minutes idle. `Txn::cost` counts only live
+      entries, so `metadata_command_cost_does_not_grow_with_stored_data` does
+      not see this cost. The reaper's scan of expired sessions has the same
+      cause across all tenants.

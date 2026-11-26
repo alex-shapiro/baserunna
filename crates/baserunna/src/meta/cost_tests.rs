@@ -1,11 +1,11 @@
-//! Tests that each metadata command reads and writes at most a fixed number of rows and bytes.
+//! Tests that the cost of each metadata command does not grow with the amount of stored data.
 
 use super::tests::{engine, rt, session};
 use super::*;
 use crate::node::{META_BATCH, NodeConfig};
 use baserunna_api::PAGE_MAX;
 use baserunna_storage::engine::{Consistency, Db, EngineConfig, Isolation, TxnCost};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Length limits from SPEC §8 for emails and API key names.
@@ -14,52 +14,8 @@ const API_KEY_NAME_MAX: usize = 100;
 const NOW_MS: i64 = 1_000;
 const LIVE_UNTIL_MS: i64 = 1 << 50;
 
-/// Store entries that one metadata row costs: the row, its index entries, and the table schema.
-const ENTRIES_PER_ROW: usize = 8;
-/// Bytes that one metadata row costs with every field at its length limit.
-const BYTES_PER_ROW: usize = 2048;
-/// Rows that a command without a multi-row step can touch.
-const SINGLE_ROWS: usize = 16;
-
 fn member_limits(cfg: &NodeConfig) -> MemberLimits {
     MemberLimits { max_members: cfg.max_members_per_org, max_orgs: cfg.max_orgs_per_user }
-}
-
-/// Returns the most metadata rows that `cmd` can touch.
-fn row_limit(cmd: &MetaCmd, cfg: &NodeConfig) -> usize {
-    match cmd {
-        MetaCmd::Migrate
-        | MetaCmd::EnsureConfig { .. }
-        | MetaCmd::Signup { .. }
-        | MetaCmd::GoogleLogin { .. }
-        | MetaCmd::SetPassword { .. }
-        | MetaCmd::VerifyEmail { .. }
-        | MetaCmd::SetDisabled { .. }
-        | MetaCmd::CreateSession { .. }
-        | MetaCmd::DeleteSession { .. }
-        | MetaCmd::RevokeSession { .. }
-        | MetaCmd::CreateApiKey { .. }
-        | MetaCmd::DeleteApiKey { .. }
-        | MetaCmd::CreateDb { .. }
-        | MetaCmd::DeleteDb { .. }
-        | MetaCmd::PurgePass { .. }
-        | MetaCmd::Leave { .. }
-        | MetaCmd::CreateOrg { .. }
-        | MetaCmd::AddMember { .. }
-        | MetaCmd::SetRole { .. }
-        | MetaCmd::RemoveMember { .. } => SINGLE_ROWS,
-        MetaCmd::RevokeSessions { .. } | MetaCmd::DeleteApiKeys { .. } | MetaCmd::ExpireSessions { .. } => {
-            SINGLE_ROWS + PAGE_MAX
-        }
-        // Each database has a row and a deleted row. Each membership has a row and up to two counter rows.
-        MetaCmd::DeleteUser { .. } => {
-            SINGLE_ROWS + 2 * PAGE_MAX + 2 * cfg.max_dbs_per_owner + 3 * cfg.max_orgs_per_user
-        }
-        // Each membership has a row and a counter row for its user.
-        MetaCmd::DeleteOrg { .. } => SINGLE_ROWS + 2 * cfg.max_members_per_org,
-        // Heartbeat reads every node row. Operators control the node count, and tenants cannot change it.
-        MetaCmd::Heartbeat { .. } => SINGLE_ROWS,
-    }
 }
 
 const COMMAND_NAMES: [&str; 26] = [
@@ -304,37 +260,96 @@ fn worst_case_commands(
     ]
 }
 
+/// Adds data that no per-owner limit caps: other tenants, sessions, API keys, organizations, and deleted
+/// databases. Every capped count in `fill_limits` stays at its cap.
+async fn grow_unlimited(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeConfig) {
+    let mut cmds = sessions("m0", 2 * PAGE_MAX, LIVE_UNTIL_MS).split_off(PAGE_MAX + 1);
+    for i in 0..cfg.max_members_per_org {
+        let id = format!("o{i}");
+        cmds.push(signup_cmd(env, &id));
+        cmds.extend(sessions(&id, 1, LIVE_UNTIL_MS));
+        cmds.extend(sessions(&format!("{id}-expired"), 1, 10).into_iter().map(|mut cmd| {
+            if let MetaCmd::CreateSession { user_id, .. } = &mut cmd {
+                *user_id = id.clone();
+            }
+            cmd
+        }));
+        cmds.push(MetaCmd::CreateApiKey { key: api_key(&id, 0) });
+        for name in ["kept", "gone"] {
+            cmds.push(MetaCmd::CreateDb {
+                id: format!("db-{id}-{name}"),
+                owner_id: id.clone(),
+                actor: id.clone(),
+                name: long_name(name, i, 63),
+                max_dbs: cfg.max_dbs_per_owner,
+            });
+        }
+        cmds.push(MetaCmd::DeleteDb { id: format!("db-{id}-gone") });
+        cmds.push(MetaCmd::CreateOrg {
+            id: format!("org-{id}"),
+            name: long_name("o", i, ORG_NAME_MAX),
+            actor: id.clone(),
+            max_orgs: cfg.max_orgs_per_user,
+        });
+    }
+    apply_all(db, cmds).await;
+    let mut t = begin(db).await;
+    check_integrity(&mut t).await.unwrap();
+}
+
+async fn table_rows(db: &Arc<Db>) -> BTreeMap<String, usize> {
+    let mut t = begin(db).await;
+    let mut rows = BTreeMap::new();
+    for def in tables() {
+        let name = def["name"].as_str().unwrap();
+        rows.insert(name.to_string(), query_all::<Json>(&mut t, name, Query::default()).await.unwrap().len());
+    }
+    rows
+}
+
+/// Runs each command in `worst_case_commands` without a commit, and returns the cost of each.
+async fn measure_all(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeConfig) -> Vec<(&'static str, TxnCost)> {
+    let victim = get_user(&mut begin(db).await, "victim").await.unwrap().unwrap();
+    let mut costs = Vec::new();
+    for cmd in worst_case_commands(env, cfg, victim.password_hash) {
+        let (answer, cost) = measure(db, &cmd).await;
+        if let MetaCmd::DeleteUser { user_id } = &cmd {
+            let deletion: UserDeletion = serde_json::from_value(answer).unwrap();
+            let full = user_id == "victim";
+            assert_eq!(matches!(deletion, UserDeletion::Deleted { .. }), full, "{user_id}: {deletion:?}");
+        }
+        costs.push((cmd.name(), cost));
+    }
+    costs
+}
+
+/// Field length limits bound the bytes in each entry, so the test compares entry counts.
 #[test]
-fn every_metadata_command_has_a_fixed_cost() {
+fn metadata_command_cost_does_not_grow_with_stored_data() {
     rt().block_on(async {
         let (eng, _store, env) = engine(5, EngineConfig::small_for_tests());
         let db = eng.db(SYS_DB);
         db.open(true).await.unwrap();
         let cfg = NodeConfig::default();
         fill_limits(&db, &env, &cfg).await;
-        let mut measured = BTreeSet::new();
-        let mut report = String::new();
-        let mut failures = Vec::new();
-        let victim = get_user(&mut begin(&db).await, "victim").await.unwrap().unwrap();
-        for cmd in worst_case_commands(&env, &cfg, victim.password_hash) {
-            let (answer, cost) = measure(&db, &cmd).await;
-            let rows = row_limit(&cmd, &cfg);
-            let (entries_max, bytes_max) = (ENTRIES_PER_ROW * rows, BYTES_PER_ROW * rows);
-            report.push_str(&format!("{:<16} {cost:?} for {rows} rows\n", cmd.name()));
-            if cost.entries_read.max(cost.entries_written) > entries_max
-                || cost.bytes_read.max(cost.bytes_written) > bytes_max
-            {
-                failures.push(format!("{}: {cost:?} exceeds {entries_max} entries or {bytes_max} bytes", cmd.name()));
+        let (rows_before, costs_before) = (table_rows(&db).await, measure_all(&db, &env, &cfg).await);
+        grow_unlimited(&db, &env, &cfg).await;
+        let (rows_after, costs_after) = (table_rows(&db).await, measure_all(&db, &env, &cfg).await);
+        for (table, before) in &rows_before {
+            let grows = !["nodes", "config"].contains(&table.as_str());
+            assert_eq!(rows_after[table] > *before, grows, "{table}: {before} rows, then {}", rows_after[table]);
+        }
+        let measured: BTreeSet<&str> = costs_before.iter().map(|(name, _)| *name).collect();
+        assert_eq!(measured, BTreeSet::from(COMMAND_NAMES), "every metadata command is measured");
+        let mut report = format!("rows before: {rows_before:?}\nrows after: {rows_after:?}\n");
+        let mut grew = Vec::new();
+        for ((name, before), (_, after)) in costs_before.iter().zip(&costs_after) {
+            report.push_str(&format!("{name:<16} {before:?}\n"));
+            if (before.entries_read, before.entries_written) != (after.entries_read, after.entries_written) {
+                grew.push(format!("{name}: {before:?}, then {after:?}"));
             }
-            if let MetaCmd::DeleteUser { user_id } = &cmd {
-                let deletion: UserDeletion = serde_json::from_value(answer).unwrap();
-                let full = user_id == "victim";
-                assert_eq!(matches!(deletion, UserDeletion::Deleted { .. }), full, "{user_id}: {deletion:?}");
-            }
-            measured.insert(cmd.name());
         }
         eprintln!("{report}");
-        assert_eq!(measured, BTreeSet::from(COMMAND_NAMES), "every metadata command is measured");
-        assert!(failures.is_empty(), "{failures:#?}");
+        assert!(grew.is_empty(), "{grew:#?}");
     });
 }

@@ -1137,24 +1137,13 @@ The client address in a session must parse as an IP address. If a trusted
 proxy sends an entry in `X-Forwarded-For` that is not an IP address, the node
 uses the peer address.
 
-Each metadata command reads and writes at most a fixed number of rows. The
-amount of stored data does not change this maximum:
-
-- Most commands touch at most 16 rows.
-- A command that deletes sessions or API keys in a batch deletes at most
-  1,000 rows (`PAGE_MAX`). The node runs these commands in a loop until no
-  rows remain.
-- `delete_user` touches at most 999 sessions, 999 API keys, all personal
-  databases, and all memberships of the user. If the user has more sessions
-  or API keys, the node first deletes them in batches. The per-owner limits
-  on databases and organizations set the maximum for the other rows.
-- `delete_org` touches all memberships of the organization. The limit on
-  members per organization sets the maximum.
-- `heartbeat` reads all node rows. Only operators change the number of
-  nodes.
-
-A tenant can reach the maximum of `delete_user` or `delete_org` only if it
-first runs one command for each row.
+No metadata command scans rows that a tenant can add without a limit.
+Commands that delete sessions or API keys delete at most `PAGE_MAX` rows each.
+The node runs them in a loop until no rows remain. `delete_user` and
+`delete_org` delete all databases and memberships of the owner in one
+transaction, so the per-owner limits set their maximum cost. A tenant reaches
+that maximum only after it runs one command for each row. `heartbeat` reads all
+node rows, and only operators change the number of nodes.
 
 Listings of users, sessions, API keys, organizations, members and
 databases are paginated (`limit`, default 100 and at most 1000, and

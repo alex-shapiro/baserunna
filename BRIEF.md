@@ -27,10 +27,13 @@ transaction:
   and up to `max_orgs_per_user` (100) memberships.
 - `delete_org` deletes up to `max_members_per_org` (1,000) memberships.
 
-These limits are fixed for each deployment. A tenant can reach them only after
-it runs one command for each row. Thus the cost of the large command is paid in
-advance by many small commands from the same account. I keep these deletes in
-one transaction and correct the plan text.
+The per-owner limits set the maximum cost of these commands. SPEC §1 lets an
+administrator change the limits for each tenant, so an administrator also
+changes this maximum. A tenant can reach the maximum only after it runs one
+command for each row. Thus the cost of the large command is paid in advance by
+many small commands from the same account. This branch keeps these deletes in
+one transaction and corrects the plan text. `TRADEOFFS.md` asks whether to
+delete them in batches.
 
 ## Precedent
 
@@ -55,13 +58,10 @@ cost against a bound. Correct the plan text about batched deletes.
 
 ## Design
 
-The test bounds each command by the number of metadata rows that it can touch.
-Each row costs at most a fixed number of store entries and bytes, because the
-system tables have a fixed set of indexes and limits on field lengths.
-
-- Most commands touch a fixed number of rows.
-- Batch deletes touch at most `PAGE_MAX` rows.
-- `delete_user` and `delete_org` touch at most the per-owner limits.
+The test fills every per-owner limit and measures each command. Then it adds
+data that no limit caps and measures again. Each command must read and write
+the same number of store entries both times. Field length limits bound the
+bytes in each entry.
 
 Other approaches:
 
@@ -71,3 +71,14 @@ Other approaches:
   release, without a new failure mode. We can add the run-time limit later.
 - Batch `delete_user` and `delete_org`. This makes partial deletes visible to
   users and adds code. The per-owner limits already give a fixed maximum.
+
+## Review decisions
+
+Round 1:
+
+- Design 1, compare costs at two data sizes instead of a fitted per-row bound: accepted. The new test catches a full scan of `deleted_databases`, which the old test missed.
+- Design 2, delete databases and memberships of `delete_user` and `delete_org` in batches: deferred to the user in `TRADEOFFS.md`. It needs a product tradeoff.
+- Design 3, SPEC text records test constants as design: accepted. SPEC now states the rule.
+- Design, outside question, the fair queue should charge measured cost instead of command count: reported to the user. It belongs to the next plan item.
+- Correctness 1, tombstones make scans slower and `Txn::cost` does not count them: real but rejected for this branch. The fix belongs to the storage engine. Added to `TODO.md`.
+- Correctness, `delete_user` can delete 1,000 sessions: rejected. The test shows that exactly 1,000 sessions return `TooManyCredentials`.

@@ -65,30 +65,8 @@ on `store` and the shared modules we will put in `baserunna-util`.
 
 ## Milestones
 
-Each milestone is a group of PRs. After each milestone, run the isolation
-harness from milestone 0. Record the results in this file.
-
-Start with milestone 0. Milestones 1 to 3 are independent. Start them in any
-order. Milestone 4 depends on milestone 3. Finish with milestone 5.
-
-### 0. Measure isolation on `main`
-
-The isolation harness checks whether the node continues to serve a victim
-tenant while an attacker tenant runs a heavy workload. The harness is on branch
-`iso/base` at `crates/baserunna/examples/isolation/` and
-`scripts/isolation/run.sh`.
-
-A workload passes if it meets all five criteria:
-
-- The node continues to run.
-- All victim requests succeed.
-- The victim p99 latency does not exceed the larger of `2 * baseline` or
-  `baseline + 50 ms`.
-- The server returns an HTTP error for requests that exceed a limit.
-- A small version of the workload succeeds.
-
-- [ ] Move the isolation harness and its pass criteria to `main`. Record the
-      baseline result for each workload on `main`.
+Each milestone is a group of PRs. Milestones 1 to 3 are independent. Start
+them in any order. Milestone 4 depends on milestone 3. Finish with milestone 5.
 
 ### 1. Limit memory use for each operation
 
@@ -192,13 +170,29 @@ kernel enforces cgroup limits across all memory allocations and CPU time,
 including dependencies. In-process counters miss allocations outside our
 tracking code.
 
+- [ ] Merge the isolation harness from branch `iso/m0-harness`. The harness
+      checks if the node serves a victim tenant while an attacker runs a heavy
+      workload. A workload passes if it meets all five conditions:
+  - The node continues to run.
+  - All victim requests succeed.
+  - Victim p99 latency is at most the larger of `2 * baseline` or
+    `baseline + 50 ms`.
+  - The server returns an HTTP error for requests that exceed a limit.
+  - A small version of the workload succeeds.
+
+  Under per-owner cgroups, the harness tests isolation. It checks if the kernel
+  stops only the attacker. It also checks if victim requests stay fast. On
+  `main`, the harness shows only node-wide effects. Milestone 1 and `TODO.md`
+  already list the per-operation memory problems that cause most of those
+  effects. The CPU effects of filter scans need the `cpu.max` limits from this
+  milestone.
 - [ ] Record absolute target numbers for the worker pool before you run
       benchmarks. Include these metrics:
   - CPU time per request
   - Hot read latency
   - Memory and CPU use with 1,000 active owners on a node
   - Duration of each event query in the harness
-  - Isolation harness results from milestone 0
+  - Isolation harness results
 
   On branch `iso/floor`, `BENCH_BOUNDARY` measured 25.6 µs of CPU time per
   request for an empty round trip over a Unix socket.

@@ -149,6 +149,10 @@ Each worker has its own node ID, and the ID is new each time the worker
 starts. This keeps invariant 1. In this milestone, the workers run in the
 process of the server. Milestone 4 chooses the mechanism that separates them.
 
+If a worker stops, all requests in flight for that owner on that node fail.
+The writes of its databases pause until their leases expire, for at most one
+lease period. SPEC §1 allows the same pause after a node stops.
+
 - [ ] Move the storage engine and the database features into `baserunna-storage`.
 - [ ] Send each database request to an in-process worker for its owner. Each
       worker has its own `Engine` and node ID. The background jobs of each
@@ -212,7 +216,9 @@ The right method depends on the mechanism from milestone 4.
 - The memory bound for each tenant. The contest used 512 MiB. A higher bound
   lets larger operations succeed, but it also lets a tenant take more of the
   node. Also decide whether the bound applies to each tenant on each node, or
-  to each tenant across the cluster.
+  to each tenant across the cluster. Today a single event query can use 1 GiB.
+  In the contest, the worker pool at 512 MiB returned an error for a query in
+  19 of 40 runs, and today's code answered all 40.
 - The deployment requirement. The worker pool needs Linux with a delegated
   cgroup v2 subtree.
 

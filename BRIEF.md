@@ -31,8 +31,8 @@ Multi-tenant services isolate tenants in two common ways:
 - a sandboxed runtime, such as the V8 isolates of Cloudflare Workers.
 
 Shared components, such as a front proxy or a metadata service, use a fixed
-cost for each request and fair admission. The plan keeps both mechanisms as
-candidates, and it chooses between them by measurement after the common work.
+cost for each request and fair admission. The plan uses a process for each
+owner under cgroups.
 
 ## Cost
 
@@ -109,4 +109,4 @@ after changes.
   holds.
 - In-process workers for `fs:` stores (Gemini): replaced by the user's
   decision that macOS runs without enforcement.
-- Drop the WebAssembly candidate (all three): not decided in this round.
+- Drop the WebAssembly candidate (all three): accepted by the user.

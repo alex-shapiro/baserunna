@@ -152,7 +152,7 @@ does today.
 The lease identity of a worker is the node ID plus a suffix that is new each
 time the worker starts. This keeps invariant 1, and a peer still finds the node
 from the identity. In this milestone, the workers run in the process of the
-server. Milestone 4 chooses the mechanism that separates them.
+server. Milestone 4 moves each worker into its own process.
 
 If a worker stops, all requests in flight for that owner on that node fail.
 The writes of its databases pause until their leases expire, for at most one
@@ -176,27 +176,25 @@ lease period. SPEC §1 allows the same pause after a node stops.
       Add the `cargo tree` check. Rename the rest of the `baserunna` crate to
       `baserunna-worker`.
 
-### 4. Choose the boundary mechanism by measurement
+### 4. Run each worker in its own process
 
-At this point the only difference between the designs is the boundary.
+Each worker runs in its own process, in a cgroup for its owner. The kernel
+enforces the limits of the cgroup, so the limits cover every allocation and all
+CPU use, including those of dependencies. A counter in our code cannot.
 
-- [ ] Before any measurement, record the result that makes each mechanism win.
-      Use absolute numbers, not percentages. Include these measurements:
+- [ ] Before any measurement, record the results that the worker pool must
+      reach. Use absolute numbers, not percentages. Include these measurements:
   - CPU time for each request
   - the latency of a hot read
   - memory and CPU with 1,000 active owners on a node
   - the time of each event query in the harness
   - the results of the harness from milestone 0
 
-  Known numbers: an empty round trip adds 25.6 µs of CPU for each request over
-  a Unix socket, and 2.4 µs for a call into a WebAssembly instance
-  (`BENCH_BOUNDARY` on branch `iso/floor`).
+  Known number: an empty round trip over a Unix socket adds 25.6 µs of CPU for
+  each request (`BENCH_BOUNDARY` on branch `iso/floor`).
 - [ ] Find the cause of the 81% loss of KV throughput in `iso3/cgroup`.
-- [ ] Measure the worker pool and the WebAssembly sandbox with the workers from
-      milestone 3. Adopt the winner by the recorded rule.
-- [ ] Build the chosen mechanism. It must see every allocation and all CPU use,
-      including those of dependencies. A counter in our code cannot. The number
-      of PRs depends on the mechanism.
+- [ ] Run each worker from milestone 3 in its own process, and measure it. If
+      it misses a recorded result, stop and review the plan.
 - [ ] Give each worker a limit. With cgroups, these are `memory.max` and
       `cpu.max`, and each worker has the same `cpu.weight`. On a host without
       cgroup v2, such as macOS, workers run without limits, and the server logs
@@ -224,8 +222,6 @@ At this point the only difference between the designs is the boundary.
 
 ### 5. Give each tenant a limit for the caches and the store
 
-The right method depends on the mechanism from milestone 4.
-
 - [ ] Block cache
 - [ ] Disk cache
 - [ ] Store requests
@@ -242,6 +238,9 @@ The right method depends on the mechanism from milestone 4.
 - Each limit has a default, and an administrator can override the limits of
   each owner (2026-11-25). For example, a paying customer can get larger limits
   than a free customer.
+- The worker pool is the only mechanism (2026-11-25). The workers from
+  milestone 3 cannot compile to WebAssembly, and in the contest the WebAssembly
+  sandbox ran event queries 1.4 to 9.0 times slower.
 - Only Linux enforces the limits (2026-11-25). Enforcement needs a delegated
   cgroup v2 subtree. macOS stays supported for development, without
   enforcement.

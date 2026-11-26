@@ -65,3 +65,8 @@ serializes, so the module renames it.
 - Nothing more can be deleted. Each helper has a caller.
 
 ## Review Decisions
+
+- Round 1 design review: verdict "merge", no findings. No second round.
+- Outside problem from the reviewer: the counting allocator counts requested
+  bytes, but a cgroup limit counts RSS. Not accepted for this branch. The claim
+  is not measured, and it concerns later milestone 1 PRs, not this refactor.

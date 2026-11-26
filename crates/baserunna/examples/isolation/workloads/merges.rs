@@ -91,7 +91,11 @@ impl Workload for Merges {
             let triggers = (0..table_count)
                 .map(|table_index| {
                     let path = format!("/v1/dbs/{db}/events/ev{table_index}/rows");
-                    (format!("trigger ev{table_index}"), path, Bytes::from(format!("[{}]", format_event_row(table_index))))
+                    (
+                        format!("trigger ev{table_index}"),
+                        path,
+                        Bytes::from(format!("[{}]", format_event_row(table_index))),
+                    )
                 })
                 .collect();
             let requests = concurrent_posts(ctx, triggers, &[201]).await;

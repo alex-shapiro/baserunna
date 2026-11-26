@@ -69,7 +69,7 @@ We considered four approaches:
 
 We chose approach 4. It is one mechanism. The lease holder enforces it at run
 time for local and forwarded commands. Users get a clear error:
-`400 invalid_argument: the metadata field "id" is longer than 1024 bytes`.
+`400 invalid_argument: the field "id" is longer than 1024 bytes`.
 
 We also enforce the OIDC rule in `verify_id_token`: `sub` must be 1 to 255
 ASCII characters. This check gives a clear sign-in error at the correct layer.
@@ -110,3 +110,12 @@ untriaged.
 - The diff is 63 lines. The estimate was about 100 lines.
 
 ## Review decisions
+
+- Design round 1, verdict "merge", no findings.
+- Design note "check the field lengths before `begin`": rejected. The saved
+  work is one strong `begin` for a request that no valid client sends, and the
+  check in `apply` keeps one enforcement point.
+- Design note "delete the OIDC `sub` check": rejected. The check is small,
+  follows OIDC Core §2, and gives a clear sign-in error.
+- Correctness round 1: no bugs. I accepted no findings, so the review stops
+  after one round.

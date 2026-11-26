@@ -1,63 +1,19 @@
 //! Verifies that request parsing, bulk event inserts, and event maintenance stay within the node's memory
 //! budget and per-request limits.
 
+#[path = "support/counting_alloc.rs"]
+mod counting_alloc;
+
 use baserunna::node::NodeConfig;
 use baserunna::probe::{self, Probe};
 use baserunna::sim::cost::{Resp, World, call_router, run_paused};
 use bytes::Bytes;
+use counting_alloc::{HEAP_MEASUREMENT_LOCK, allocated_bytes, heap_growth, peak_growth, reset_peak};
 use serde_json::{Value as Json, json};
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 use tokio::time::Instant;
-
-struct CountingAllocator;
-
-static ALLOCATED_BYTES: AtomicIsize = AtomicIsize::new(0);
-static PEAK_BYTES: AtomicIsize = AtomicIsize::new(0);
-
-fn add_allocated(by: isize) {
-    let now = ALLOCATED_BYTES.fetch_add(by, Relaxed) + by;
-    PEAK_BYTES.fetch_max(now, Relaxed);
-}
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        add_allocated(l.size() as isize);
-        unsafe { System.alloc(l) }
-    }
-
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        ALLOCATED_BYTES.fetch_sub(l.size() as isize, Relaxed);
-        unsafe { System.dealloc(p, l) }
-    }
-
-    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        add_allocated(n as isize - l.size() as isize);
-        unsafe { System.realloc(p, l, n) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-// Serializes tests so allocations from concurrent tests do not inflate PEAK_BYTES.
-static TURN: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-fn reset_peak() -> isize {
-    let now = ALLOCATED_BYTES.load(Relaxed);
-    PEAK_BYTES.store(now, Relaxed);
-    now
-}
-
-fn peak_growth(before: isize) -> usize {
-    (PEAK_BYTES.load(Relaxed) - before).max(0) as usize
-}
-
-fn heap_growth(before: isize) -> isize {
-    ALLOCATED_BYTES.load(Relaxed) - before
-}
 
 const MIB: usize = 1024 * 1024;
 const HOUR_MS: i64 = 3_600_000;
@@ -231,7 +187,7 @@ fn txn_insert_body(table: &str, max_bytes: usize, row: fn(usize) -> String) -> (
 #[test]
 #[ignore = "TODO blocker: stream JSON request bodies and charge bulk insert buffers to MemoryGate"]
 fn txn_event_insert_parse_stays_near_body_size() {
-    let _turn = TURN.lock();
+    let _turn = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::with_config(1, 0, production_limits).await;
         let t = w.signup(0, "d1@ingest.test").await;
@@ -291,7 +247,7 @@ fn run_threaded<F: std::future::Future>(f: F) -> F::Output {
 #[test]
 #[ignore = "TODO blocker: stream JSON request bodies and charge bulk insert buffers to MemoryGate"]
 fn concurrent_bulk_inserts_respect_node_memory_budget() {
-    let _turn = TURN.lock();
+    let _turn = HEAP_MEASUREMENT_LOCK.lock();
     run_threaded(async {
         let defaults = NodeConfig::default();
         let budget = defaults.engine.memory_bytes + defaults.engine.cache_bytes;
@@ -428,7 +384,7 @@ async fn stall_request_body(w: &World, token: &str, path: &str) -> (Option<u16>,
         .body(axum::body::Body::new(body))
         .expect("request");
     let router = w.node(0).router().expect("router");
-    let before = ALLOCATED_BYTES.load(Relaxed);
+    let before = allocated_bytes();
     let task = tokio::spawn(async move {
         use tower::ServiceExt;
         let Ok(resp) = router.oneshot(req).await;
@@ -461,7 +417,7 @@ async fn stall_request_body(w: &World, token: &str, path: &str) -> (Option<u16>,
 #[test]
 #[ignore = "TODO blocker: stream JSON request bodies and charge bulk insert buffers to MemoryGate (body read timeout)"]
 fn stalled_request_body_times_out() {
-    let _turn = TURN.lock();
+    let _turn = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::with_config(1, 0, production_limits).await;
         let t = w.signup(0, "d3@ingest.test").await;
@@ -501,7 +457,7 @@ async fn write_all(s: &tokio::net::TcpStream, mut data: &[u8]) {
 #[test]
 #[ignore = "TODO blocker: stream JSON request bodies and charge bulk insert buffers to MemoryGate (body read timeout)"]
 fn stalled_request_body_times_out_over_tcp() {
-    let _turn = TURN.lock();
+    let _turn = HEAP_MEASUREMENT_LOCK.lock();
     let level = baserunna::log::level();
     baserunna::log::set_level(Some(baserunna::log::Level::Error));
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime");
@@ -518,7 +474,7 @@ fn stalled_request_body_times_out_over_tcp() {
             axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await
         });
         let s = tokio::net::TcpStream::connect(addr).await.expect("connect");
-        let before = ALLOCATED_BYTES.load(Relaxed);
+        let before = allocated_bytes();
         let head = format!(
             "POST /v1/dbs/d/events/ev/rows HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\n\
              authorization: Bearer {t}\r\ncontent-length: {STALLED_BODY_BYTES}\r\n\r\n["
@@ -712,7 +668,7 @@ async fn measure_merge(rows: usize) -> MergePeak {
 #[test]
 #[ignore = "TODO blocker: bound memory usage during part merges"]
 fn merge_memory_does_not_grow_with_rows() {
-    let _turn = TURN.lock();
+    let _turn = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         probe::record();
         let mut measured = Vec::new();
@@ -769,7 +725,7 @@ async fn trigger_maintenance(w: &World, token: &str, db_id: &str, row: usize) ->
 #[test]
 #[ignore = "TODO blocker: bound memory usage during part merges (failed merges repeat after a restart)"]
 fn failed_merge_is_not_retried_after_restart() {
-    let _turn = TURN.lock();
+    let _turn = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let mut w = World::with_config(1, STORE_LATENCY_MS, merges_time_out).await;
         let t = w.signup(0, "e2@merge.test").await;
@@ -817,7 +773,7 @@ const SPREAD_FROM_MS: i64 = 1_700_000_000_000 / HOUR_MS * HOUR_MS;
 #[test]
 #[ignore = "TODO blocker: limit partitions per bulk insert"]
 fn bulk_insert_partitions_are_limited() {
-    let _turn = TURN.lock();
+    let _turn = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let mut measured = Vec::new();
         for k in [100usize, 1_000, 10_000] {
@@ -925,7 +881,7 @@ const CONCURRENT_MERGE_ROWS: usize = 500_000;
 #[test]
 #[ignore = "TODO blocker: limit event maintenance concurrency across the node and charge its memory"]
 fn event_merges_share_a_node_wide_limit() {
-    let _turn = TURN.lock();
+    let _turn = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         probe::record();
         let w = World::with_config(1, 0, production_limits).await;

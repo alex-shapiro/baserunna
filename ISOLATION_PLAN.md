@@ -79,7 +79,7 @@ to run.
 Each PR adds a test to check that a request of size `N` uses at most
 `k * N + C` bytes.
 
-- [ ] Move the counting allocator into `tests/support/` and remove the extra
+- [x] Move the counting allocator into `tests/support/` and remove the extra
       copies in `memory_bound.rs`, `event_ingest_limits.rs`, and
       `event_query_limits.rs`.
 - [ ] Stream-parse JSON request bodies for KV and transaction operations. This

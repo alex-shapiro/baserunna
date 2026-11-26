@@ -57,3 +57,34 @@ Build it.
 - The crate names are `baserunna-storage`, `baserunna-worker`, and
   `baserunna-server`.
 - Tenant isolation is goal 4 of SPEC §1, above testability.
+
+## Review round 1
+
+Reviewers: Opus 5.5 and Fable 5.2. Both verdicts: merge after changes. The
+Gemini Neon review did not run: `agy` waited for an MCP server and never
+called the model.
+
+- Workers are nodes, reached through `Transport` (Fable 2, Opus 4): accepted.
+  It removes the frame protocol and nine PRs, and the simulator already runs
+  nodes.
+- Acceptance test on `main` before the other milestones (Opus 2): accepted.
+- A selection rule for the mechanism, recorded before the measurement (Opus 3,
+  Fable 3): accepted.
+- The failure contract if a worker stops (Fable 4): accepted.
+- `engine/` also imports `timing` (Fable 5): accepted.
+- What a share is, and who gets one (Opus 1, Fable 1): open tradeoff in
+  `TRADEOFFS.md`.
+- Isolation of data access (Fable, outside the questions): open tradeoff in
+  `TRADEOFFS.md`.
+- Frames in their own crate, and the `cargo tree` check misses the simulator
+  (Opus 5): rejected. The frames no longer exist, and the check works for each
+  crate, so it also covers the simulator.
+- "No process boundary" as a candidate (Fable 3): rejected. Counters failed
+  the hidden workloads in all three contest rounds, and they cannot see every
+  allocation.
+- Delete the testability bullet in SPEC §1 (Fable): rejected. The user asked
+  for it.
+- Delete the decisions section of this brief (Fable): rejected. This file is
+  temporary, and that section informs the reviewers.
+- Push `iso/base` and `iso/floor`, which the plan cites (Fable 5): asked the
+  user.

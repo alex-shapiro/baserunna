@@ -474,9 +474,7 @@ impl MetaCmd {
         let encoded =
             serde_json::to_value(self).map_err(|e| Error::internal(format!("encode metadata command: {e}")))?;
         match find_field_over_limit(&encoded, "") {
-            Some(field) => {
-                Err(Error::invalid(format!("field {field:?} is longer than {META_FIELD_MAX_BYTES} bytes")))
-            }
+            Some(field) => Err(Error::invalid(format!("field {field:?} is longer than {META_FIELD_MAX_BYTES} bytes"))),
             None => Ok(()),
         }
     }

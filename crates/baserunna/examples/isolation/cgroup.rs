@@ -15,7 +15,7 @@ impl NodeCgroup {
         std::fs::read_to_string(self.0.join(file_name)).ok()
     }
 
-    pub fn memory_current(&self) -> Option<u64> {
+    pub fn memory_current_bytes(&self) -> Option<u64> {
         self.read_file("memory.current")?.trim().parse().ok()
     }
 
@@ -28,8 +28,8 @@ impl NodeCgroup {
 
     /// Counts OOM kills of processes inside the node's `main` leaf cgroup.
     ///
-    /// Excludes kills in worker cgroups, because the kernel may stop a worker to enforce a tenant
-    /// limit.
+    /// Counts only kills in `main`. The kernel can stop workers in child cgroups to enforce
+    /// tenant limits.
     pub fn node_oom_kills(&self) -> Option<u64> {
         let leaf = NodeCgroup(self.0.join("main"));
         leaf.read_keyed_u64("memory.events.local", "oom_kill")
@@ -40,21 +40,21 @@ impl NodeCgroup {
     }
 
     /// Counts all processes and descendant cgroups under this cgroup.
-    pub fn subtree_census(&self) -> SubtreeCensus {
-        let mut census = SubtreeCensus::default();
-        let mut dirs = vec![self.0.clone()];
-        while let Some(dir) = dirs.pop() {
-            if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
-                census.processes += procs.lines().filter(|line| !line.trim().is_empty()).count();
+    pub fn subtree_counts(&self) -> SubtreeCounts {
+        let mut counts = SubtreeCounts::default();
+        let mut pending_dirs = vec![self.0.clone()];
+        while let Some(dir) = pending_dirs.pop() {
+            if let Ok(procs_text) = std::fs::read_to_string(dir.join("cgroup.procs")) {
+                counts.processes += procs_text.lines().filter(|line| !line.trim().is_empty()).count();
             }
             for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
                 if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-                    census.cgroups += 1;
-                    dirs.push(entry.path());
+                    counts.cgroups += 1;
+                    pending_dirs.push(entry.path());
                 }
             }
         }
-        census
+        counts
     }
 
     pub fn exists(&self) -> bool {
@@ -64,27 +64,27 @@ impl NodeCgroup {
 
 /// Process and descendant cgroup counts under a cgroup subtree.
 #[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct SubtreeCensus {
+pub struct SubtreeCounts {
     pub processes: usize,
     pub cgroups: usize,
 }
 
 /// Summary of periodic `memory.current` samples.
 #[derive(Clone, Debug, Default, Serialize)]
-pub struct MemorySamples {
+pub struct MemorySummary {
     pub start_bytes: u64,
     pub peak_bytes: u64,
     pub end_bytes: u64,
     pub growth_bytes: u64,
-    pub samples: usize,
-    /// Peak memory usage in MiB for each 1-second window from the start.
+    pub sample_count: usize,
+    /// Peak memory use in MiB for each 1-second window from the start.
     pub peak_mib_per_second: Vec<f64>,
 }
 
 /// Background thread that samples `memory.current` at a fixed interval.
 pub struct MemorySampler {
-    stop: Arc<AtomicBool>,
-    thread: std::thread::JoinHandle<MemorySamples>,
+    stop_flag: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<MemorySummary>,
 }
 
 impl MemorySampler {
@@ -94,36 +94,40 @@ impl MemorySampler {
     }
 
     pub fn start_every(cgroup: NodeCgroup, interval: Duration) -> MemorySampler {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let thread_stop_flag = stop_flag.clone();
         let thread = std::thread::spawn(move || {
-            let started = Instant::now();
-            let start = cgroup.memory_current().unwrap_or(0);
-            let mut summary =
-                MemorySamples { start_bytes: start, peak_bytes: start, end_bytes: start, ..Default::default() };
-            while !stopped.load(Relaxed) {
-                if let Some(current_bytes) = cgroup.memory_current() {
-                    summary.samples += 1;
+            let started_at = Instant::now();
+            let start_bytes = cgroup.memory_current_bytes().unwrap_or(0);
+            let mut summary = MemorySummary {
+                start_bytes,
+                peak_bytes: start_bytes,
+                end_bytes: start_bytes,
+                ..Default::default()
+            };
+            while !thread_stop_flag.load(Relaxed) {
+                if let Some(current_bytes) = cgroup.memory_current_bytes() {
+                    summary.sample_count += 1;
                     summary.peak_bytes = summary.peak_bytes.max(current_bytes);
                     summary.end_bytes = current_bytes;
-                    let second = started.elapsed().as_secs() as usize;
+                    let second = started_at.elapsed().as_secs() as usize;
                     if summary.peak_mib_per_second.len() <= second {
                         summary.peak_mib_per_second.resize(second + 1, 0.0);
                     }
                     let mib = current_bytes as f64 / (1 << 20) as f64;
-                    let slot = &mut summary.peak_mib_per_second[second];
-                    *slot = slot.max((mib * 10.0).round() / 10.0);
+                    let second_peak_mib = &mut summary.peak_mib_per_second[second];
+                    *second_peak_mib = second_peak_mib.max((mib * 10.0).round() / 10.0);
                 }
                 std::thread::sleep(interval);
             }
-            summary.growth_bytes = summary.peak_bytes.saturating_sub(start);
+            summary.growth_bytes = summary.peak_bytes.saturating_sub(start_bytes);
             summary
         });
-        MemorySampler { stop, thread }
+        MemorySampler { stop_flag, thread }
     }
 
-    pub fn finish(self) -> MemorySamples {
-        self.stop.store(true, Relaxed);
+    pub fn finish(self) -> MemorySummary {
+        self.stop_flag.store(true, Relaxed);
         self.thread.join().expect("memory sampler")
     }
 }

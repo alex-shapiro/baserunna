@@ -37,7 +37,7 @@ pub struct RequestRecord {
     pub label: String,
     pub status: Option<u16>,
     pub elapsed_ms: f64,
-    /// True if the response status matches an expected success code.
+    /// True if the response status is in the expected status list.
     pub expected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -57,20 +57,21 @@ impl NodeApi {
     }
 
     pub async fn send(&self, method: Method, path: &str, token: &str, body: Bytes) -> Result<HttpReply, String> {
-        let mut req =
+        let mut request =
             self.http.request(method, format!("{}{path}", self.base_url)).header("content-type", "application/json");
         if !token.is_empty() {
-            req = req.bearer_auth(token);
+            request = request.bearer_auth(token);
         }
-        let resp = req.body(body).send().await.map_err(|err| format!("{err:?}"))?;
-        let status = resp.status().as_u16();
-        let body = resp.bytes().await.map_err(|err| format!("{err:?}"))?;
+        let response = request.body(body).send().await.map_err(|err| format!("{err:?}"))?;
+        let status = response.status().as_u16();
+        let body = response.bytes().await.map_err(|err| format!("{err:?}"))?;
         Ok(HttpReply { status, body })
     }
 
     /// Sends a request and requires the response status to match `expected_statuses`.
     ///
-    /// Retries retryable HTTP 503 responses with exponential backoff up to [`SETUP_RETRY_LIMIT`].
+    /// Retries HTTP 503 responses marked retryable with exponential backoff up to
+    /// [`SETUP_RETRY_LIMIT`].
     pub async fn send_expect(
         &self,
         method: Method,
@@ -126,9 +127,10 @@ impl NodeApi {
         }
     }
 
-    /// Sends a request, discards its response body as chunks arrive, and returns the record and byte count.
+    /// Sends a request and discards its response body in chunks. Returns the request record and
+    /// total response bytes.
     ///
-    /// Streaming avoids buffering large responses in client memory.
+    /// Reads chunks as they arrive so the client does not buffer large responses in memory.
     pub async fn send_timed_drain(
         &self,
         label: &str,
@@ -139,10 +141,10 @@ impl NodeApi {
         expected_statuses: &[u16],
     ) -> (RequestRecord, u64) {
         let started = Instant::now();
-        let mut req =
+        let mut request =
             self.http.request(method, format!("{}{path}", self.base_url)).header("content-type", "application/json");
         if !token.is_empty() {
-            req = req.bearer_auth(token);
+            request = request.bearer_auth(token);
         }
         let build_record = |status: Option<u16>, error: Option<String>| RequestRecord {
             label: label.into(),
@@ -151,31 +153,34 @@ impl NodeApi {
             expected: error.is_none() && status.is_some_and(|code| expected_statuses.contains(&code)),
             error,
         };
-        let mut resp = match req.body(body).send().await {
-            Ok(resp) => resp,
+        let mut response = match request.body(body).send().await {
+            Ok(response) => response,
             Err(err) => return (build_record(None, Some(format!("{err:?}"))), 0),
         };
-        let status = resp.status().as_u16();
-        let (mut bytes, mut excerpt) = (0u64, Vec::new());
+        let status = response.status().as_u16();
+        let (mut total_bytes, mut excerpt) = (0u64, Vec::new());
         loop {
-            match resp.chunk().await {
+            match response.chunk().await {
                 Ok(Some(chunk)) => {
-                    bytes += chunk.len() as u64;
+                    total_bytes += chunk.len() as u64;
                     excerpt.extend_from_slice(&chunk[..chunk.len().min(300usize.saturating_sub(excerpt.len()))]);
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    return (build_record(Some(status), Some(format!("body after {bytes} bytes: {err:?}"))), bytes);
+                    return (
+                        build_record(Some(status), Some(format!("response body error after {total_bytes} bytes: {err:?}"))),
+                        total_bytes,
+                    );
                 }
             }
         }
         let error = (!expected_statuses.contains(&status)).then(|| String::from_utf8_lossy(&excerpt).into_owned());
-        (build_record(Some(status), error), bytes)
+        (build_record(Some(status), error), total_bytes)
     }
 
-    pub async fn wait_healthy(&self, limit: Duration) -> Result<(), String> {
+    pub async fn wait_healthy(&self, timeout: Duration) -> Result<(), String> {
         let started = Instant::now();
-        while started.elapsed() < limit {
+        while started.elapsed() < timeout {
             if let Ok(reply) = self.send(Method::GET, "/healthz", "", Bytes::new()).await
                 && reply.status == 200
             {
@@ -183,7 +188,7 @@ impl NodeApi {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        Err(format!("{}/healthz did not return 200 within {limit:?}", self.base_url))
+        Err(format!("{}/healthz did not return 200 within {timeout:?}", self.base_url))
     }
 
     /// Registers a user account and creates database `db`.
@@ -224,13 +229,13 @@ impl NodeApi {
     }
 }
 
-/// Builds a JSON array of generated rows within `max_bytes` and returns the JSON text and row count.
-pub fn json_rows(max_bytes: usize, row: impl Fn(usize) -> String) -> (String, usize) {
+/// Builds a JSON array of generated rows up to `max_bytes`. Returns the JSON text and row count.
+pub fn json_rows(max_bytes: usize, format_row: impl Fn(usize) -> String) -> (String, usize) {
     let mut json_text = String::with_capacity(max_bytes);
     json_text.push('[');
     let mut row_count = 0;
     loop {
-        let entry = row(row_count);
+        let entry = format_row(row_count);
         if json_text.len() + entry.len() + 2 > max_bytes {
             break;
         }

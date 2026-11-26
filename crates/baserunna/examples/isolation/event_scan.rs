@@ -1,6 +1,6 @@
 //! HTTP event scan benchmark.
 //!
-//! Inserts 1,000,000 events for 500,000 users across 10 days, then runs seven queries per round.
+//! Inserts 1,000,000 events for 500,000 users across 10 days. Then runs 7 queries per round.
 
 use crate::cgroup::NodeCgroup;
 use crate::http::{NodeApi, Owner};
@@ -49,9 +49,10 @@ fn median(mut values: Vec<f64>) -> f64 {
     if values.is_empty() { 0.0 } else { values[values.len() / 2] }
 }
 
-/// Loads the event table, runs `rounds` query rounds, and returns timing results.
+/// Loads the event table and runs `rounds` query rounds. Returns timing results as JSON.
 ///
-/// Failed warm-up and benchmark queries increment `failed_queries` and are excluded from medians.
+/// Counts failed warm-up and benchmark queries in `failed_queries`. Omits failed queries from
+/// medians.
 pub async fn run(api: &NodeApi, owner: &Owner, cgroup: &NodeCgroup, rounds: usize) -> Result<Json, String> {
     let (token, db) = (&owner.token, &owner.db);
     api.create_event_table(
@@ -62,25 +63,25 @@ pub async fn run(api: &NodeApi, owner: &Owner, cgroup: &NodeCgroup, rounds: usiz
     )
     .await?;
     let started = Instant::now();
-    let span = 10 * DAY_MS;
-    for start in (0..EVENT_ROW_COUNT).step_by(100_000) {
-        let rows: Vec<String> = (start..EVENT_ROW_COUNT.min(start + 100_000))
+    let time_span_ms = 10 * DAY_MS;
+    for batch_start in (0..EVENT_ROW_COUNT).step_by(100_000) {
+        let rows: Vec<String> = (batch_start..EVENT_ROW_COUNT.min(batch_start + 100_000))
             .map(|i| {
-                let time = START_TIME_MS + (i as i64 * 7_919) % span;
+                let time = START_TIME_MS + (i as i64 * 7_919) % time_span_ms;
                 format!(r#"{{"time": {time}, "user": "user-{:07}", "event": "e{}"}}"#, (i * 7_919) % USER_COUNT, i % 8)
             })
             .collect();
         api.bulk_insert(token, db, "ev", format!("[{}]", rows.join(","))).await?;
     }
-    let mut parts = api.part_count(token, db, "ev").await?;
-    let mut unchanged = 0;
-    while unchanged < 5 && started.elapsed() < Duration::from_secs(60) {
+    let mut part_count = api.part_count(token, db, "ev").await?;
+    let mut stable_polls = 0;
+    while stable_polls < 5 && started.elapsed() < Duration::from_secs(60) {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let now = api.part_count(token, db, "ev").await?;
-        unchanged = if now == parts { unchanged + 1 } else { 0 };
-        parts = now;
+        let current_part_count = api.part_count(token, db, "ev").await?;
+        stable_polls = if current_part_count == part_count { stable_polls + 1 } else { 0 };
+        part_count = current_part_count;
     }
-    let info = api.table_info(token, db, "ev").await?;
+    let table_info = api.table_info(token, db, "ev").await?;
     let setup_s = started.elapsed().as_secs_f64();
     let path = format!("/v1/dbs/{db}/events/ev/rows/query");
     let queries = benchmark_queries();
@@ -90,34 +91,37 @@ pub async fn run(api: &NodeApi, owner: &Owner, cgroup: &NodeCgroup, rounds: usiz
             failures.push(format!("warm-up {name}: {err}"));
         }
     }
-    let mut wall_ms = vec![Vec::new(); queries.len()];
-    let cpu_before = cgroup.cpu_usage_usec();
+    let mut query_latencies_ms = vec![Vec::new(); queries.len()];
+    let cpu_usec_before = cgroup.cpu_usage_usec();
     let bench_started = Instant::now();
     for _ in 0..rounds {
-        for ((name, query), spent) in queries.iter().zip(&mut wall_ms) {
+        for ((name, query), latencies_ms) in queries.iter().zip(&mut query_latencies_ms) {
             let query_started = Instant::now();
             let result = api.send(Method::POST, &path, token, Bytes::from(query.to_string())).await;
             match result {
-                Ok(reply) if reply.status == 200 => spent.push(query_started.elapsed().as_secs_f64() * 1000.0),
+                Ok(reply) if reply.status == 200 => latencies_ms.push(query_started.elapsed().as_secs_f64() * 1000.0),
                 Ok(reply) => failures.push(format!("{name}: status {}: {}", reply.status, reply.excerpt())),
                 Err(err) => failures.push(format!("{name}: {err}")),
             }
         }
     }
     let wall_s = bench_started.elapsed().as_secs_f64();
-    let cpu_usec = match (cpu_before, cgroup.cpu_usage_usec()) {
+    let cpu_usec = match (cpu_usec_before, cgroup.cpu_usage_usec()) {
         (Some(before), Some(after)) => Some(after - before),
         _ => None,
     };
     let per_query: Vec<Json> = queries
         .iter()
-        .zip(&wall_ms)
-        .map(|((name, _), ms)| json!({"query": name, "median_ms": median(ms.clone()), "successes": ms.len()}))
+        .zip(&query_latencies_ms)
+        .map(|((name, _), latencies_ms)| {
+            json!({"query": name, "median_ms": median(latencies_ms.clone()), "successes": latencies_ms.len()})
+        })
         .collect();
     Ok(json!({
-        "rows": info["rows"], "parts": info["parts"].as_array().map_or(0, Vec::len), "stored_bytes": info["bytes"],
-        "setup_s": setup_s, "rounds": rounds, "queries": queries.len(),
-        "median_query_ms": median(wall_ms.concat()),
+        "rows": table_info["rows"], "parts": table_info["parts"].as_array().map_or(0, Vec::len),
+        "stored_bytes": table_info["bytes"],
+        "setup_s": setup_s, "rounds": rounds, "query_count": queries.len(),
+        "median_query_ms": median(query_latencies_ms.concat()),
         "per_query": per_query,
         "bench_wall_s": wall_s,
         "node_cpu_usage_usec": cpu_usec,

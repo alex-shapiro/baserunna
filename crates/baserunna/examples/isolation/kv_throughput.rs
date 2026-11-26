@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 const DB_COUNT: usize = 2000;
 const DBS_PER_OWNER: usize = 200;
 const VALUE_BYTES: usize = 8;
-const WRITE_PCT: u64 = 10;
+const WRITE_PERCENT: u64 = 10;
 const SETUP_CONCURRENCY: usize = 64;
 const WARMUP_DURATION: Duration = Duration::from_secs(3);
 const MEASURE_DURATION: Duration = Duration::from_secs(15);
@@ -49,9 +49,9 @@ pub struct LoadWindow {
     /// Node cgroup CPU time used during the window, in microseconds.
     pub node_cpu_usage_usec: Option<u64>,
     pub node_cpu_usec_per_op: Option<f64>,
-    /// Average node CPU consumption in vCPUs during the window.
+    /// Average node CPU use in vCPUs during the window.
     pub node_cpu_vcpus: Option<f64>,
-    /// Average client process CPU consumption in vCPUs during the window.
+    /// Average client process CPU use in vCPUs during the window.
     pub client_cpu_vcpus: f64,
     pub error_samples: Vec<String>,
 }
@@ -62,9 +62,9 @@ pub async fn run(api: &NodeApi, node_url: &str, cgroup: &NodeCgroup, client_coun
     let keys = Arc::new(setup(api, node_url).await?);
     let setup_s = setup_started.elapsed().as_secs_f64();
     let http: LoadClient = Client::builder(TokioExecutor::new()).build_http();
-    let mut out = json!({
+    let mut report = json!({
         "dbs": DB_COUNT, "owners": DB_COUNT.div_ceil(DBS_PER_OWNER), "keys_per_db": 1, "value_bytes": VALUE_BYTES,
-        "write_pct": WRITE_PCT, "setup_s": setup_s,
+        "write_pct": WRITE_PERCENT, "setup_s": setup_s,
     });
     let window = measure(&http, &keys, cgroup, client_count, WARMUP_DURATION, MEASURE_DURATION).await;
     eprintln!(
@@ -78,8 +78,8 @@ pub async fn run(api: &NodeApi, node_url: &str, cgroup: &NodeCgroup, client_coun
         window.node_cpu_usec_per_op.unwrap_or(f64::NAN),
         window.client_cpu_vcpus,
     );
-    out["result"] = json!(window);
-    Ok(out)
+    report["result"] = json!(window);
+    Ok(report)
 }
 
 /// Creates owners, databases, and initial `k0` keys.
@@ -111,7 +111,7 @@ async fn setup(api: &NodeApi, node_url: &str) -> Result<Vec<DbKey>, String> {
         .map(|db_index| {
             let uri = format!("{base_url}/v1/dbs/d{db_index}/kv/k0")
                 .parse()
-                .map_err(|err| format!("bad node URL {base_url}: {err}"))?;
+                .map_err(|err| format!("invalid node URL {base_url}: {err}"))?;
             let auth = HeaderValue::from_str(&format!("Bearer {}", tokens[db_index / DBS_PER_OWNER]))
                 .map_err(|err| err.to_string())?;
             Ok(DbKey { uri, auth })
@@ -137,7 +137,7 @@ const PHASE_WARMING: u8 = 0;
 const PHASE_MEASURING: u8 = 1;
 const PHASE_STOPPED: u8 = 2;
 
-/// Warms up `client_count` closed-loop clients, then measures throughput for `measure_window`.
+/// Warms up `client_count` closed-loop clients. Then measures throughput for `measure_window`.
 async fn measure(
     http: &LoadClient,
     keys: &Arc<Vec<DbKey>>,
@@ -155,18 +155,18 @@ async fn measure(
         })
         .collect();
     tokio::time::sleep(warmup).await;
-    let cpu_before = cgroup.cpu_usage_usec();
-    let client_cpu_before = process_cpu_secs();
+    let node_cpu_usec_before = cgroup.cpu_usage_usec();
+    let client_cpu_secs_before = process_cpu_secs();
     let started = Instant::now();
     phase.store(PHASE_MEASURING, Relaxed);
     tokio::time::sleep(measure_window).await;
     phase.store(PHASE_STOPPED, Relaxed);
     let seconds = started.elapsed().as_secs_f64();
-    let cpu = match (cpu_before, cgroup.cpu_usage_usec()) {
+    let node_cpu_usec = match (node_cpu_usec_before, cgroup.cpu_usage_usec()) {
         (Some(before), Some(after)) => Some(after.saturating_sub(before)),
         _ => None,
     };
-    let client_cpu = process_cpu_secs() - client_cpu_before;
+    let client_cpu_secs = process_cpu_secs() - client_cpu_secs_before;
     let (mut latencies_us, mut errors, mut error_samples) = (Vec::new(), 0, Vec::new());
     for task in tasks {
         let (task_latencies, task_errors, task_samples) = task.await.expect("kv client");
@@ -190,10 +190,10 @@ async fn measure(
         p50_ms: percentile_ms(0.5),
         p99_ms: percentile_ms(0.99),
         max_ms: latencies_us.last().map_or(0.0, |&value| value as f64 / 1000.0),
-        node_cpu_usage_usec: cpu,
-        node_cpu_usec_per_op: cpu.map(|value| value as f64 / ops.max(1) as f64),
-        node_cpu_vcpus: cpu.map(|value| value as f64 / 1e6 / seconds.max(1e-9)),
-        client_cpu_vcpus: client_cpu / seconds.max(1e-9),
+        node_cpu_usage_usec: node_cpu_usec,
+        node_cpu_usec_per_op: node_cpu_usec.map(|value| value as f64 / ops.max(1) as f64),
+        node_cpu_vcpus: node_cpu_usec.map(|value| value as f64 / 1e6 / seconds.max(1e-9)),
+        client_cpu_vcpus: client_cpu_secs / seconds.max(1e-9),
         error_samples,
     }
 }
@@ -218,21 +218,21 @@ async fn client_loop(
             break;
         }
         let key = &keys[rng.usize(keys.len())];
-        let is_write = rng.below(100) < WRITE_PCT;
+        let is_write = rng.below(100) < WRITE_PERCENT;
         let body = if is_write { values[rng.usize(values.len())].clone() } else { Bytes::new() };
-        let mut req = Request::new(Full::new(body));
-        *req.method_mut() = if is_write { Method::PUT } else { Method::GET };
-        *req.uri_mut() = key.uri.clone();
-        req.headers_mut().insert(AUTHORIZATION, key.auth.clone());
+        let mut request = Request::new(Full::new(body));
+        *request.method_mut() = if is_write { Method::PUT } else { Method::GET };
+        *request.uri_mut() = key.uri.clone();
+        request.headers_mut().insert(AUTHORIZATION, key.auth.clone());
         let started = Instant::now();
-        let failure = match http.request(req).await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                match resp.into_body().collect().await {
+        let failure = match http.request(request).await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                match response.into_body().collect().await {
                     Ok(_) if status == 200 => None,
                     Ok(body) => Some(format!("status {status}: {}", String::from_utf8_lossy(&body.to_bytes()[..])))
                         .map(|text| text.chars().take(200).collect()),
-                    Err(err) => Some(format!("body: {err}")),
+                    Err(err) => Some(format!("response body error: {err}")),
                 }
             }
             Err(err) => Some(format!("{err:?}")),
@@ -258,6 +258,6 @@ fn process_cpu_secs() -> f64 {
         libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
         usage.assume_init()
     };
-    let to_secs = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
+    let to_secs = |timeval: libc::timeval| timeval.tv_sec as f64 + timeval.tv_usec as f64 / 1e6;
     to_secs(usage.ru_utime) + to_secs(usage.ru_stime)
 }

@@ -62,15 +62,15 @@ fn percentile(sorted: &[f64], quantile: f64) -> f64 {
 
 struct RequestSample {
     label: &'static str,
-    ok: bool,
-    ms: f64,
+    succeeded: bool,
+    elapsed_ms: f64,
     detail: String,
 }
 
 /// Runs victim traffic until `stop` is true and returns latency statistics.
 ///
-/// `max_rps` caps the combined KV and transaction request rate to stay below the per-user rate
-/// limit.
+/// `max_rps` limits the combined KV and transaction request rate so the victim stays below the
+/// per-user rate limit.
 pub async fn run(api: Arc<NodeApi>, victim: Owner, stop: Arc<AtomicBool>, max_rps: f64) -> VictimStats {
     let started = Instant::now();
     let interval = Duration::from_secs_f64(CLIENT_COUNT as f64 / max_rps);
@@ -78,10 +78,10 @@ pub async fn run(api: Arc<NodeApi>, victim: Owner, stop: Arc<AtomicBool>, max_rp
     for client_index in 0..CLIENT_COUNT {
         let (api, victim, stop) = (api.clone(), victim.clone(), stop.clone());
         tasks.push(tokio::spawn(async move {
-            let mut out = Vec::new();
+            let mut samples = Vec::new();
             let mut step = client_index;
             while !stop.load(Relaxed) {
-                let next = tokio::time::Instant::now() + interval;
+                let next_request_at = tokio::time::Instant::now() + interval;
                 let key_index = (step * 7) % KEY_COUNT;
                 let (label, method, path, body) = match step % 3 {
                     0 => ("kv get", Method::GET, format!("/v1/dbs/{}/kv/k{key_index}", victim.db), Bytes::new()),
@@ -97,50 +97,50 @@ pub async fn run(api: Arc<NodeApi>, victim: Owner, stop: Arc<AtomicBool>, max_rp
                         ("txn", Method::POST, format!("/v1/dbs/{}/txn", victim.db), Bytes::from(ops.to_string()))
                     }
                 };
-                out.push(send_sample(&api, &victim, label, method, &path, body).await);
+                samples.push(send_sample(&api, &victim, label, method, &path, body).await);
                 step += CLIENT_COUNT;
-                tokio::time::sleep_until(next).await;
+                tokio::time::sleep_until(next_request_at).await;
             }
-            out
+            samples
         }));
     }
     let query_task = {
         let (api, victim, stop) = (api.clone(), victim.clone(), stop.clone());
         tokio::spawn(async move {
-            let mut out = Vec::new();
+            let mut samples = Vec::new();
             let query =
                 json!({"from": 0, "to": 9_999_999_999_999i64, "group_by": ["e"], "aggregates": {"n": {"fn": "count"}}});
             while !stop.load(Relaxed) {
-                let next = tokio::time::Instant::now() + Duration::from_secs(1);
+                let next_request_at = tokio::time::Instant::now() + Duration::from_secs(1);
                 let path = format!("/v1/dbs/{}/events/{EVENT_TABLE}/rows/query", victim.db);
-                out.push(
+                samples.push(
                     send_sample(&api, &victim, "event query", Method::POST, &path, Bytes::from(query.to_string()))
                         .await,
                 );
-                tokio::time::sleep_until(next).await;
+                tokio::time::sleep_until(next_request_at).await;
             }
-            out
+            samples
         })
     };
     let mut samples = Vec::new();
     for task in tasks {
         samples.extend(task.await.expect("victim client"));
     }
-    let queries = query_task.await.expect("victim event queries");
-    let mut query_ms: Vec<f64> = queries.iter().map(|sample| sample.ms).collect();
-    query_ms.sort_by(f64::total_cmp);
-    samples.extend(queries);
-    let mut ms: Vec<f64> = samples.iter().map(|sample| sample.ms).collect();
-    ms.sort_by(f64::total_cmp);
-    let failed: Vec<&RequestSample> = samples.iter().filter(|sample| !sample.ok).collect();
+    let query_samples = query_task.await.expect("victim event queries");
+    let mut query_latencies_ms: Vec<f64> = query_samples.iter().map(|sample| sample.elapsed_ms).collect();
+    query_latencies_ms.sort_by(f64::total_cmp);
+    samples.extend(query_samples);
+    let mut all_latencies_ms: Vec<f64> = samples.iter().map(|sample| sample.elapsed_ms).collect();
+    all_latencies_ms.sort_by(f64::total_cmp);
+    let failed: Vec<&RequestSample> = samples.iter().filter(|sample| !sample.succeeded).collect();
     VictimStats {
         requests: samples.len(),
         failures: failed.len(),
-        p50_ms: percentile(&ms, 0.50),
-        p99_ms: percentile(&ms, 0.99),
-        max_ms: ms.last().copied().unwrap_or(0.0),
-        event_queries: query_ms.len(),
-        event_query_p99_ms: percentile(&query_ms, 0.99),
+        p50_ms: percentile(&all_latencies_ms, 0.50),
+        p99_ms: percentile(&all_latencies_ms, 0.99),
+        max_ms: all_latencies_ms.last().copied().unwrap_or(0.0),
+        event_queries: query_latencies_ms.len(),
+        event_query_p99_ms: percentile(&query_latencies_ms, 0.99),
         seconds: started.elapsed().as_secs_f64(),
         failure_samples: failed.iter().take(10).map(|sample| format!("{}: {}", sample.label, sample.detail)).collect(),
     }
@@ -156,12 +156,17 @@ async fn send_sample(
 ) -> RequestSample {
     let started = Instant::now();
     let result = api.send(method, path, &victim.token, body).await;
-    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     match result {
-        Ok(reply) if (200..300).contains(&reply.status) => RequestSample { label, ok: true, ms, detail: String::new() },
-        Ok(reply) => {
-            RequestSample { label, ok: false, ms, detail: format!("status {}: {}", reply.status, reply.excerpt()) }
+        Ok(reply) if (200..300).contains(&reply.status) => {
+            RequestSample { label, succeeded: true, elapsed_ms, detail: String::new() }
         }
-        Err(err) => RequestSample { label, ok: false, ms, detail: err },
+        Ok(reply) => RequestSample {
+            label,
+            succeeded: false,
+            elapsed_ms,
+            detail: format!("status {}: {}", reply.status, reply.excerpt()),
+        },
+        Err(err) => RequestSample { label, succeeded: false, elapsed_ms, detail: err },
     }
 }

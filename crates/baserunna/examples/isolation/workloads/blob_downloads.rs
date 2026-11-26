@@ -3,8 +3,8 @@
 //! `BlobBody` in `api/body.rs` streams blob values chunk by chunk.
 //! For each chunk, `read_chunk` in `engine/blob.rs` fetches the chunk from object storage and
 //! buffers it in memory until the client reads it.
-//! Because the node does not bound concurrent chunk buffers, each active download consumes an
-//! extra `blob_chunk_size` buffer in memory.
+//! Because the node does not limit concurrent chunk buffers, each active download uses an extra
+//! `blob_chunk_size` buffer in memory.
 
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload};
 use bytes::Bytes;
@@ -17,11 +17,11 @@ use std::time::{Duration, Instant};
 const BLOB_BYTES: usize = 24 << 20;
 /// Concurrent attack clients. Together they buffer up to 1 GiB of 8 MiB chunks.
 const ATTACK_CLIENTS: usize = 128;
-/// Duration of each attack round so victim requests overlap with the load.
+/// Duration of each attack round. Keeps the attack active while victim requests run.
 const ATTACK_DURATION: Duration = Duration::from_secs(10);
 /// Sequential downloads sent by a single client in the small variant.
 const SMALL_DOWNLOADS: usize = 4;
-const KEY: &str = "files/large.bin";
+const BLOB_KEY: &str = "files/large.bin";
 
 pub struct BlobDownloads;
 
@@ -31,7 +31,7 @@ impl Workload for BlobDownloads {
             if round == Round::WithVictim {
                 return Ok(json!({"reuses": "the blob of the first round"}));
             }
-            let path = format!("/v1/dbs/{}/kv/{KEY}", ctx.attacker.db);
+            let path = format!("/v1/dbs/{}/kv/{BLOB_KEY}", ctx.attacker.db);
             let body = Bytes::from(vec![b'b'; BLOB_BYTES]);
             ctx.api.send_expect(Method::PUT, &path, &ctx.attacker.token, body, &[200]).await?;
             Ok(json!({"blob_bytes": BLOB_BYTES}))
@@ -40,12 +40,12 @@ impl Workload for BlobDownloads {
 
     fn attack<'a>(&'a self, ctx: &'a AttackContext, _round: Round) -> BoxFuture<'a, Result<AttackOutcome, String>> {
         Box::pin(async move {
-            let path = format!("/v1/dbs/{}/kv/{KEY}", ctx.attacker.db);
-            let (clients, deadline, max_downloads) = match ctx.variant {
+            let path = format!("/v1/dbs/{}/kv/{BLOB_KEY}", ctx.attacker.db);
+            let (client_count, deadline, max_downloads) = match ctx.variant {
                 Variant::Small => (1, None, SMALL_DOWNLOADS),
                 Variant::Attack => (ATTACK_CLIENTS, Some(Instant::now() + ATTACK_DURATION), usize::MAX),
             };
-            let tasks: Vec<_> = (0..clients)
+            let tasks: Vec<_> = (0..client_count)
                 .map(|client_index| {
                     let (api, token, path) = (ctx.api.clone(), ctx.attacker.token.clone(), path.clone());
                     tokio::spawn(async move {
@@ -79,13 +79,13 @@ impl Workload for BlobDownloads {
                 .collect();
             let (mut requests, mut short_downloads) = (Vec::new(), 0);
             for task in tasks {
-                let (task_records, task_short) = task.await.map_err(|err| err.to_string())?;
+                let (task_records, task_short_downloads) = task.await.map_err(|err| err.to_string())?;
                 requests.extend(task_records);
-                short_downloads += task_short;
+                short_downloads += task_short_downloads;
             }
             let completed_downloads = requests.iter().filter(|record| record.expected).count();
             let notes = json!({
-                "clients": clients,
+                "clients": client_count,
                 "downloads": requests.len(),
                 "completed_downloads": completed_downloads,
                 "short_downloads": short_downloads,

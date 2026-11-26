@@ -17,7 +17,7 @@ use serde::Serialize;
 use serde_json::Value as Json;
 use std::sync::Arc;
 
-/// Workload scale. A healthy node must complete the [`Variant::Small`] variant.
+/// Workload scale. A healthy node must complete [`Variant::Small`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Variant {
@@ -64,15 +64,15 @@ pub struct AttackContext {
 pub struct AttackOutcome {
     /// All attacker requests sent during the round.
     pub requests: Vec<RequestRecord>,
-    /// True if background work started by the round finished before the timeout.
+    /// True if background work from this round finished before the timeout.
     pub completed: bool,
     /// Workload-specific measurements.
     pub notes: Json,
 }
 
-/// Attacker workload whose resource cost the node must bound per tenant.
+/// Attacker workload whose resource cost the node must limit per tenant.
 pub trait Workload: Send + Sync {
-    /// Creates attacker data for `round` before any measured phase begins.
+    /// Creates attacker data for `round` before the harness starts the measured phases.
     fn prepare<'a>(&'a self, ctx: &'a AttackContext, round: Round) -> BoxFuture<'a, Result<Json, String>>;
 
     /// Sends attack requests for `round` and waits for triggered background work to finish.

@@ -4,7 +4,7 @@
 //! The transaction charges only the scanned range to its read set, excluding the returned values.
 //! `exec_ops` holds all operation results in memory until the handler serializes them into a single
 //! HTTP response.
-//! Repeating scan operations up to `MAX_TXN_OPS` multiplies per-request node memory usage.
+//! Repeating scan operations up to `MAX_TXN_OPS` multiplies per-request node memory use.
 
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload};
 use bytes::Bytes;
@@ -13,7 +13,7 @@ use reqwest::Method;
 use serde_json::{Value as Json, json};
 
 /// Key count matching `PAGE_MAX`, the maximum page size of a scan operation.
-const KEYS: usize = 1000;
+const KEY_COUNT: usize = 1000;
 /// Value size matching `value_inline_max`, so a full scan returns 32 MiB of values.
 const VALUE_BYTES: usize = 32 << 10;
 /// Puts per setup transaction, totaling 8 MiB within the 16 MiB transaction write limit.
@@ -24,7 +24,7 @@ const ATTACK_SCANS: usize = 16;
 const ATTACK_REQUESTS: usize = 4;
 /// Scan operations per small transaction, returning a single full page.
 const SMALL_SCANS: usize = 1;
-const PREFIX: &str = "scan/";
+const KEY_PREFIX: &str = "scan/";
 
 pub struct TxnScans;
 
@@ -36,15 +36,15 @@ impl Workload for TxnScans {
             }
             let value = "x".repeat(VALUE_BYTES);
             let path = format!("/v1/dbs/{}/txn", ctx.attacker.db);
-            for first in (0..KEYS).step_by(PUTS_PER_TXN) {
-                let ops: Vec<Json> = (first..(first + PUTS_PER_TXN).min(KEYS))
-                    .map(|i| json!({"op": "put", "key": format!("{PREFIX}{i:06}"), "value": value}))
+            for batch_start in (0..KEY_COUNT).step_by(PUTS_PER_TXN) {
+                let ops: Vec<Json> = (batch_start..(batch_start + PUTS_PER_TXN).min(KEY_COUNT))
+                    .map(|i| json!({"op": "put", "key": format!("{KEY_PREFIX}{i:06}"), "value": value}))
                     .collect();
                 ctx.api
                     .send_expect(Method::POST, &path, &ctx.attacker.token, json!({"ops": ops}).to_string(), &[200])
                     .await?;
             }
-            Ok(json!({"keys": KEYS, "value_bytes": VALUE_BYTES}))
+            Ok(json!({"keys": KEY_COUNT, "value_bytes": VALUE_BYTES}))
         })
     }
 
@@ -54,7 +54,7 @@ impl Workload for TxnScans {
                 Variant::Small => (1, SMALL_SCANS),
                 Variant::Attack => (ATTACK_REQUESTS, ATTACK_SCANS),
             };
-            let scan = json!({"op": "scan", "prefix": PREFIX, "limit": KEYS});
+            let scan = json!({"op": "scan", "prefix": KEY_PREFIX, "limit": KEY_COUNT});
             let body = Bytes::from(json!({"ops": vec![scan; scans_per_txn]}).to_string());
             let path = format!("/v1/dbs/{}/txn", ctx.attacker.db);
             let tasks: Vec<_> = (0..txn_count)

@@ -1,6 +1,6 @@
 //! Concurrent value checks against a 256 MiB blob.
 //!
-//! Each check compares the full blob against a short string and expects HTTP 412.
+//! Each check compares the full blob against a short string. The harness expects HTTP 412.
 
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload, concurrent_posts};
 use bytes::Bytes;
@@ -20,7 +20,9 @@ impl Workload for BlobChecks {
             }
             let started = std::time::Instant::now();
             let path = format!("/v1/dbs/{}/kv/big", ctx.attacker.db);
-            ctx.api.send_expect(Method::PUT, &path, &ctx.attacker.token, vec![b'x'; BLOB_BYTES], &[200, 201, 204]).await?;
+            ctx.api
+                .send_expect(Method::PUT, &path, &ctx.attacker.token, vec![b'x'; BLOB_BYTES], &[200, 201, 204])
+                .await?;
             Ok(json!({"blob_bytes": BLOB_BYTES, "upload_s": started.elapsed().as_secs_f64()}))
         })
     }
@@ -31,11 +33,11 @@ impl Workload for BlobChecks {
                 Variant::Small => 1,
                 Variant::Attack => 4,
             };
-            let check =
+            let request_body =
                 Bytes::from(json!({"ops": [{"op": "check", "key": "big", "value": "not the blob"}]}).to_string());
             let path = format!("/v1/dbs/{}/txn", ctx.attacker.db);
-            let requests = (0..check_count).map(|i| (format!("check {i}"), path.clone(), check.clone())).collect();
-            let requests = concurrent_posts(ctx, requests, &[412]).await;
+            let batch = (0..check_count).map(|i| (format!("check {i}"), path.clone(), request_body.clone())).collect();
+            let requests = concurrent_posts(ctx, batch, &[412]).await;
             Ok(AttackOutcome { completed: true, requests, notes: json!({"concurrent_checks": check_count}) })
         })
     }

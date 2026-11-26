@@ -46,9 +46,9 @@ impl FakeS3 {
         FakeS3::start_on("127.0.0.1:0").await
     }
 
-    /// Starts a fake S3 server bound to `addr`.
-    pub async fn start_on(addr: &str) -> FakeS3 {
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    /// Starts a fake S3 server bound to `listen_addr`.
+    pub async fn start_on(listen_addr: &str) -> FakeS3 {
+        let listener = tokio::net::TcpListener::bind(listen_addr).await.unwrap();
         let s = FakeS3 { inner: Default::default(), url: format!("http://{}", listener.local_addr().unwrap()) };
         let app = axum::Router::new()
             .fallback(handle)
@@ -74,11 +74,11 @@ impl FakeS3 {
 
     /// Sets the maximum key count returned per list request. The default is 3.
     #[allow(dead_code)]
-    pub fn set_max_list_keys(&self, max: usize) {
-        self.inner.lock().max_list_keys = Some(max);
+    pub fn set_max_list_keys(&self, max_keys: usize) {
+        self.inner.lock().max_list_keys = Some(max_keys);
     }
 
-    /// Adds a fixed `latency` delay to each request to simulate remote object storage.
+    /// Adds `latency` to each request to simulate remote object storage.
     #[allow(dead_code)]
     pub fn set_latency(&self, latency: Duration) {
         self.inner.lock().latency = Some(latency);

@@ -4,7 +4,7 @@ Usage: python3 -I summarize.py <results dir>
 
 A workload passes only if every run of its small and attack variants passes.
 For each failed run, the table lists the failed criteria numbers.
-Cost benchmarks do not have pass criteria, so the summary prints their key metrics.
+For cost benchmarks, the summary prints key metrics.
 """
 
 import json
@@ -60,21 +60,24 @@ def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     results_dir = Path(sys.argv[1])
-    runs = defaultdict(list)
-    costs = defaultdict(list)
+    isolation_runs = defaultdict(list)
+    cost_runs = defaultdict(list)
     for path in sorted(results_dir.glob("*.json")):
         result = json.loads(path.read_text())
         workload = result.get("workload")
         if workload in COST_WORKLOADS:
-            costs[workload].append(result)
+            cost_runs[workload].append(result)
         else:
-            runs[(workload, result.get("variant"))].append(result)
+            isolation_runs[(workload, result.get("variant"))].append(result)
 
-    workloads = sorted({workload for workload, _ in runs})
+    workloads = sorted({workload for workload, _ in isolation_runs})
     print("| Workload | Result | Small runs | Attack runs |")
     print("| --- | --- | --- | --- |")
     for workload in workloads:
-        small, attack = runs[(workload, "small")], runs[(workload, "attack")]
+        small, attack = (
+            isolation_runs[(workload, "small")],
+            isolation_runs[(workload, "attack")],
+        )
         passed = (
             bool(small)
             and bool(attack)
@@ -91,37 +94,37 @@ def main():
             f"| {workload} | {'pass' if passed else 'fail'} | {cells[0]} | {cells[1]} |"
         )
 
-    victim_alone = [
+    victim_alone_p99_ms = [
         run_result["phase_a_victim_alone"]["p99_ms"]
-        for group in runs.values()
+        for group in isolation_runs.values()
         for run_result in group
         if run_result.get("phase_a_victim_alone")
     ]
-    if victim_alone:
+    if victim_alone_p99_ms:
         print(
-            f"\nVictim p99 without an attacker: median {statistics.median(victim_alone):.1f} ms over {len(victim_alone)} runs."
+            f"\nVictim p99 without an attacker: median {statistics.median(victim_alone_p99_ms):.1f} ms over {len(victim_alone_p99_ms)} runs."
         )
 
-    for result in costs["kv_throughput"]:
-        kv = (result.get("kv_throughput") or {}).get("result") or {}
+    for result in cost_runs["kv_throughput"]:
+        kv_result = (result.get("kv_throughput") or {}).get("result") or {}
         print(
-            f"\nkv_throughput: {kv.get('ops_per_s', 0):,.0f} ops/s, {kv.get('node_cpu_usec_per_op', 0):.1f} µs node CPU per op, "
-            f"p99 {kv.get('p99_ms', 0):.1f} ms, {kv.get('errors')} errors"
+            f"\nkv_throughput: {kv_result.get('ops_per_s', 0):,.0f} ops/s, {kv_result.get('node_cpu_usec_per_op', 0):.1f} µs node CPU per op, "
+            f"p99 {kv_result.get('p99_ms', 0):.1f} ms, {kv_result.get('errors')} errors"
         )
-    for result in costs["idle_cost"]:
-        idle = (result.get("idle_cost") or {}).get("summary") or {}
+    for result in cost_runs["idle_cost"]:
+        idle_summary = (result.get("idle_cost") or {}).get("summary") or {}
         print(
-            f"\nidle_cost: {idle.get('memory_idle_end_mib', 0):.1f} MiB idle after setup, "
-            f"{idle.get('idle_cpu_usec_per_s', 0):.0f} µs CPU per s"
+            f"\nidle_cost: {idle_summary.get('memory_idle_end_mib', 0):.1f} MiB idle after setup, "
+            f"{idle_summary.get('idle_cpu_usec_per_s', 0):.0f} µs CPU per s"
         )
-    for result in costs["event_scan"]:
-        scan = result.get("event_scan") or {}
+    for result in cost_runs["event_scan"]:
+        event_scan = result.get("event_scan") or {}
         queries = ", ".join(
             f"{query['query']} {query['median_ms']:.0f} ms"
-            for query in scan.get("per_query", [])
+            for query in event_scan.get("per_query", [])
         )
         print(
-            f"\nevent_scan: {scan.get('failed_queries')} failed queries; median per query: {queries}"
+            f"\nevent_scan: {event_scan.get('failed_queries')} failed queries; median per query: {queries}"
         )
 
 

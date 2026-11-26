@@ -3,7 +3,7 @@
 Usage: python3 -I run.py <workload> <small|attack|-> <out.json> [node binary] [client flags]
 
 Run this script inside a Linux VM with cgroup v2 and sudo access.
-Recorded baselines use a VM with 4 vCPUs and 8 GiB of memory.
+We recorded baselines on a VM with 4 vCPUs and 8 GiB of memory.
 Do not compare results across VMs of different sizes.
 Each output file records the VM vCPU count, memory, and kernel version.
 
@@ -36,9 +36,9 @@ DEFAULT_STORE_LATENCY_MS = "20"
 
 
 def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return str(sock.getsockname()[1])
+    with socket.socket() as probe_socket:
+        probe_socket.bind(("127.0.0.1", 0))
+        return str(probe_socket.getsockname()[1])
 
 
 def sudo_write(path, text):
@@ -94,8 +94,8 @@ def node_environment(workload, s3_env, node_port):
         )
     if workload == "idle_cost":
         # Setup creates 1,000 owners from a single client IP.
-        # Set the auth rate limit to `inf` to disable it.
-        # Use fewer PBKDF2 iterations so password hashing finishes quickly.
+        # Set the authentication rate limit to `inf` to disable it.
+        # Use fewer PBKDF2 iterations so the node hashes passwords quickly.
         env.update(
             BASERUNNA_AUTH_RPS_PER_CLIENT="inf",
             BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT="0",
@@ -108,7 +108,7 @@ def create_node_cgroup(cgroup_root, node_cgroup):
     """Create the node cgroup with a memory limit and swap disabled.
 
     Delegate ownership to the current user so the node can create child cgroups.
-    Run the node process inside the `main` leaf cgroup.
+    Create the `main` leaf cgroup for the node process.
     """
     sudo_write("/sys/fs/cgroup/cgroup.subtree_control", CONTROLLERS)
     subprocess.run(["sudo", "mkdir", "-p", str(node_cgroup)], check=True)
@@ -123,7 +123,7 @@ def create_node_cgroup(cgroup_root, node_cgroup):
     (node_cgroup / "cgroup.subtree_control").write_text(CONTROLLERS)
 
 
-# Wait for a start byte on the pipe in argv[1], then exec the node binary.
+# Wait for a start byte on the pipe in argv[1]. Then exec the node binary.
 # If the parent exits early, os.read returns an empty byte string and the wrapper exits.
 WAIT_THEN_EXEC = """
 import os, sys
@@ -138,21 +138,21 @@ os.execv(sys.argv[2], sys.argv[2:])
 def start_node_in_cgroup(node_bin, env, log, leaf_cgroup):
     """Start the node inside `leaf_cgroup` and return the child process.
 
-    A wrapper process waits on a pipe until the parent moves it with sudo, then calls exec.
-    This guarantees the node allocates all memory inside the cgroup.
+    A wrapper process waits on a pipe while the parent moves it into `leaf_cgroup` with sudo.
+    The wrapper then calls exec so the node allocates all memory inside the cgroup.
     """
-    go_read, go_write = os.pipe()
+    pipe_read_fd, pipe_write_fd = os.pipe()
     node = subprocess.Popen(
-        [sys.executable, "-I", "-c", WAIT_THEN_EXEC, str(go_read), str(node_bin)],
+        [sys.executable, "-I", "-c", WAIT_THEN_EXEC, str(pipe_read_fd), str(node_bin)],
         env=env,
         stdout=log,
         stderr=subprocess.STDOUT,
-        pass_fds=(go_read,),
+        pass_fds=(pipe_read_fd,),
     )
-    os.close(go_read)
+    os.close(pipe_read_fd)
     sudo_write(leaf_cgroup / "cgroup.procs", str(node.pid))
-    os.write(go_write, b"g")
-    os.close(go_write)
+    os.write(pipe_write_fd, b"g")
+    os.close(pipe_write_fd)
     return node
 
 
@@ -181,12 +181,12 @@ def teardown(node, s3_server, cgroup_root, node_cgroup):
             pass
     if node_cgroup.is_dir():
         sudo_write(node_cgroup / "cgroup.kill", "1")
-        procs = lambda: "".join(
+        read_cgroup_procs = lambda: "".join(
             path.read_text()
             for path in node_cgroup.glob("**/cgroup.procs")
             if path.exists()
         )
-        wait_until(lambda: not procs(), 5)
+        wait_until(lambda: not read_cgroup_procs(), 5)
         cgroup_dirs = sorted(
             (path for path in cgroup_root.glob("**/") if path.is_dir()),
             key=lambda path: len(path.parts),
@@ -214,9 +214,13 @@ def main():
     if len(args) < 3:
         sys.exit(__doc__)
     workload, variant, result_path = args[0], args[1], Path(args[2]).resolve()
-    rest = args[3:]
-    node_arg = rest.pop(0) if rest and not rest[0].startswith("--") else None
-    client_flags = rest
+    remaining_args = args[3:]
+    node_arg = (
+        remaining_args.pop(0)
+        if remaining_args and not remaining_args[0].startswith("--")
+        else None
+    )
+    client_flags = remaining_args
     target_dir = Path(
         os.environ.get("ISOLATION_TARGET_DIR", Path.home() / "target-isolation")
     )
@@ -231,13 +235,13 @@ def main():
     store_latency_ms = os.environ.get("FAKE_S3_LATENCY_MS", DEFAULT_STORE_LATENCY_MS)
 
     if cgroup_root.exists():
-        sys.exit(f"{cgroup_root} exists; another run is active or did not tear down")
+        sys.exit(f"{cgroup_root} exists; another run is active or did not clean up")
     # Convert termination signals into normal exit so the finally block runs teardown.
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: sys.exit(143))
 
     # Record other running nodes or Cargo builds in the VM without stopping them.
-    busy = subprocess.run(
+    busy_processes = subprocess.run(
         ["pgrep", "-a", "baserunna|cargo"], capture_output=True, text=True
     ).stdout.splitlines()
     vm = {
@@ -289,27 +293,27 @@ def main():
 
         node_exit = None if node.poll() is None else exit_status(node.returncode)
         # Count only OOM kills in the `main` leaf as node crashes.
-        # OOM kills in worker cgroups reject tenant work.
+        # The kernel uses OOM kills in worker cgroups to stop tenant work.
         oom_kills = keyed_value(node_cgroup / "main/memory.events.local", "oom_kill")
         subtree_oom_kills = keyed_value(node_cgroup / "memory.events", "oom_kill")
         try:
-            peak = int((node_cgroup / "memory.peak").read_text())
+            peak_memory_bytes = int((node_cgroup / "memory.peak").read_text())
         except OSError:
-            peak = None
+            peak_memory_bytes = None
         shutil.copy(node_log, result_path.with_suffix(".node.log"))
         if result_path.exists():
             result = json.loads(result_path.read_text())
             result["store_latency_ms"] = int(store_latency_ms)
             result["vm"] = vm
-            result["vm_busy"] = bool(busy)
-            result["vm_busy_processes"] = busy
+            result["vm_busy"] = bool(busy_processes)
+            result["vm_busy_processes"] = busy_processes
             node_stopped = node_exit is not None or oom_kills > 0
             result["run"] = {
                 "node_binary": str(node_bin),
                 "node_exit_status": node_exit,
                 "node_oom_kills": oom_kills,
                 "subtree_oom_kills": subtree_oom_kills,
-                "cgroup_memory_peak_bytes": peak,
+                "cgroup_memory_peak_bytes": peak_memory_bytes,
                 "memory_stat_end_bytes": memory_stat(node_cgroup),
                 "client_exit_status": client_status,
                 "node_stopped": node_stopped,

@@ -3,10 +3,10 @@
 Usage: python3 -I measure.py <results dir> [workload...]
 
 Run this script inside the Linux VM after build.py.
-Stop other nodes and builds in the VM, and keep the host Mac awake.
+Stop other nodes and builds in the VM. Keep the host Mac awake.
 If you omit workloads, this script runs all isolation workloads and all cost benchmarks.
-Each isolation workload runs both its small and attack variants.
-Set $REPS to change the repeat count per workload; the default is 2.
+This script runs both the small and attack variants of each isolation workload.
+Set $REPS to change the repeat count per workload. The default is 2.
 Use summarize.py to format the saved results directory.
 """
 
@@ -74,11 +74,11 @@ def run_workload(results_dir, bin_dir, workload, variant, iteration, client_flag
     except (OSError, ValueError):
         print("missing result file", flush=True)
         return
-    run = result.get("run") or {}
+    run_info = result.get("run") or {}
     print(
         json.dumps(
             result.get("conditions")
-            or {"stopped": run.get("node_stopped"), "error": result.get("error")}
+            or {"stopped": run_info.get("node_stopped"), "error": result.get("error")}
         ),
         flush=True,
     )

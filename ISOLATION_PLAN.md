@@ -55,7 +55,7 @@ server process cannot open a database, because its binary does not link
 check replaces the store guard from milestone 3.
 
 The split of the storage engine is easy. Today `engine/` imports only `store`,
-`util`, `probe`, `error`, `buggify`, `env`, `metrics`, and `log`.
+`util`, `probe`, `error`, `buggify`, `env`, `metrics`, `log`, and `timing`.
 
 ## Milestones
 

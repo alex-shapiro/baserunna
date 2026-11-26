@@ -1,56 +1,15 @@
 //! Verifies that event queries stay within the node's memory budgets and query slots.
 
+#[path = "support/counting_alloc.rs"]
+mod counting_alloc;
+
 use baserunna::node::NodeConfig;
 use baserunna::sim::cost::{Resp, World, call_router, run_paused};
 use bytes::Bytes;
+use counting_alloc::{HEAP_MEASUREMENT_LOCK, peak_growth_bytes, reset_peak_bytes};
 use serde_json::{Value as Json, json};
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
 use std::time::Duration;
 use tokio::time::Instant;
-
-struct CountingAllocator;
-
-static ALLOCATED_BYTES: AtomicIsize = AtomicIsize::new(0);
-static PEAK_BYTES: AtomicIsize = AtomicIsize::new(0);
-
-fn add_allocated(by: isize) {
-    let now = ALLOCATED_BYTES.fetch_add(by, Relaxed) + by;
-    PEAK_BYTES.fetch_max(now, Relaxed);
-}
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        add_allocated(l.size() as isize);
-        unsafe { System.alloc(l) }
-    }
-
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        ALLOCATED_BYTES.fetch_sub(l.size() as isize, Relaxed);
-        unsafe { System.dealloc(p, l) }
-    }
-
-    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        add_allocated(n as isize - l.size() as isize);
-        unsafe { System.realloc(p, l, n) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-// Serializes tests so allocations from concurrent tests do not inflate PEAK_BYTES.
-static TURN: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-fn reset_peak() -> isize {
-    let now = ALLOCATED_BYTES.load(Relaxed);
-    PEAK_BYTES.store(now, Relaxed);
-    now
-}
-
-fn peak_growth(before: isize) -> usize {
-    (PEAK_BYTES.load(Relaxed) - before).max(0) as usize
-}
 
 const MIB: usize = 1024 * 1024;
 const HOUR_MS: i64 = 3_600_000;
@@ -147,9 +106,9 @@ async fn join_posts(tasks: Vec<tokio::task::JoinHandle<Outcome>>) -> Vec<Outcome
 
 /// Sends `bodies` to `path` at the same time and returns each outcome and the heap growth peak.
 async fn concurrent_posts(w: &World, token: &str, path: &str, bodies: Vec<String>) -> (Vec<Outcome>, usize) {
-    let before = reset_peak();
+    let before = reset_peak_bytes();
     let out = join_posts(spawn_posts(w, token, path, bodies)).await;
-    (out, peak_growth(before))
+    (out, peak_growth_bytes(before))
 }
 
 fn statuses(out: &[Outcome]) -> Vec<u16> {
@@ -193,7 +152,7 @@ fn top_users_query(from: i64, to: i64) -> Json {
 
 #[test]
 fn concurrent_event_queries_respect_node_memory_budget() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::with_config(1, 0, production_limits).await;
         let t = w.signup(0, "a1@mem.test").await;
@@ -287,7 +246,7 @@ async fn acquire_lease(w: &World, token: &str, db: &str) {
 
 #[test]
 fn one_user_cannot_hold_every_query_slot() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let mut w = World::with_config(1, 0, production_limits).await;
         let heavy = w.signup(0, "heavy@slots.test").await;
@@ -328,7 +287,7 @@ fn one_user_cannot_hold_every_query_slot() {
 
 #[test]
 fn transactional_event_queries_take_query_slots() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let mut w = World::with_config(1, 0, production_limits).await;
         let t = w.signup(0, "b1@slots.test").await;
@@ -365,7 +324,7 @@ fn transactional_event_queries_take_query_slots() {
 #[test]
 #[ignore = "TODO nice-to-have: extend the deadline of transactional query_events ops"]
 fn transactional_event_queries_get_the_event_query_deadline() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let mut w = World::with_config(1, 0, production_limits).await;
         let t = w.signup(0, "b2@slots.test").await;
@@ -495,7 +454,7 @@ async fn long_string_query_peak(w: &mut World, token: &str, days: usize) -> usiz
 #[test]
 #[ignore = "TODO blocker: estimate granule run memory from actual string lengths"]
 fn long_string_queries_respect_memory_limit() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let days = 8;
         let mut w = World::with_config(1, 0, production_limits).await;

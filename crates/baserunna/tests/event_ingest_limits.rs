@@ -1,63 +1,19 @@
 //! Verifies that request parsing, bulk event inserts, and event maintenance stay within the node's memory
 //! budget and per-request limits.
 
+#[path = "support/counting_alloc.rs"]
+mod counting_alloc;
+
 use baserunna::node::NodeConfig;
 use baserunna::probe::{self, Probe};
 use baserunna::sim::cost::{Resp, World, call_router, run_paused};
 use bytes::Bytes;
+use counting_alloc::{HEAP_MEASUREMENT_LOCK, allocated_bytes, heap_change_bytes, peak_growth_bytes, reset_peak_bytes};
 use serde_json::{Value as Json, json};
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 use tokio::time::Instant;
-
-struct CountingAllocator;
-
-static ALLOCATED_BYTES: AtomicIsize = AtomicIsize::new(0);
-static PEAK_BYTES: AtomicIsize = AtomicIsize::new(0);
-
-fn add_allocated(by: isize) {
-    let now = ALLOCATED_BYTES.fetch_add(by, Relaxed) + by;
-    PEAK_BYTES.fetch_max(now, Relaxed);
-}
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        add_allocated(l.size() as isize);
-        unsafe { System.alloc(l) }
-    }
-
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        ALLOCATED_BYTES.fetch_sub(l.size() as isize, Relaxed);
-        unsafe { System.dealloc(p, l) }
-    }
-
-    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        add_allocated(n as isize - l.size() as isize);
-        unsafe { System.realloc(p, l, n) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-// Serializes tests so allocations from concurrent tests do not inflate PEAK_BYTES.
-static TURN: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-fn reset_peak() -> isize {
-    let now = ALLOCATED_BYTES.load(Relaxed);
-    PEAK_BYTES.store(now, Relaxed);
-    now
-}
-
-fn peak_growth(before: isize) -> usize {
-    (PEAK_BYTES.load(Relaxed) - before).max(0) as usize
-}
-
-fn heap_growth(before: isize) -> isize {
-    ALLOCATED_BYTES.load(Relaxed) - before
-}
 
 const MIB: usize = 1024 * 1024;
 const HOUR_MS: i64 = 3_600_000;
@@ -231,7 +187,7 @@ fn txn_insert_body(table: &str, max_bytes: usize, row: fn(usize) -> String) -> (
 #[test]
 #[ignore = "TODO blocker: stream JSON request bodies and charge bulk insert buffers to MemoryGate"]
 fn txn_event_insert_parse_stays_near_body_size() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::with_config(1, 0, production_limits).await;
         let t = w.signup(0, "d1@ingest.test").await;
@@ -246,9 +202,9 @@ fn txn_event_insert_parse_stays_near_body_size() {
                 let (body, rows) = txn_insert_body("ev", (size_mib * MIB).min(limit), row);
                 let body_bytes = body.len();
                 let gate_before = w.node(0).engine.shared.memory.used();
-                let before = reset_peak();
+                let before = reset_peak_bytes();
                 let r = post(&w, &t, "/v1/dbs/d/txn", body).await;
-                let peak = peak_growth(before);
+                let peak = peak_growth_bytes(before);
                 eprintln!(
                     "rows {shape}: {:.1} MiB body, {rows} rows: status {}, heap peak +{:.0} MiB = {:.1}x the body, \
                      MemoryGate {:+.1} MiB: {}",
@@ -291,7 +247,7 @@ fn run_threaded<F: std::future::Future>(f: F) -> F::Output {
 #[test]
 #[ignore = "TODO blocker: stream JSON request bodies and charge bulk insert buffers to MemoryGate"]
 fn concurrent_bulk_inserts_respect_node_memory_budget() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_threaded(async {
         let defaults = NodeConfig::default();
         let budget = defaults.engine.memory_bytes + defaults.engine.cache_bytes;
@@ -305,9 +261,9 @@ fn concurrent_bulk_inserts_respect_node_memory_budget() {
             // Run a 4 MiB request first to estimate the heap usage per body byte.
             let (w, t) = bulk_world().await;
             let (small, _) = json_rows(4 * MIB, row);
-            let before = reset_peak();
+            let before = reset_peak_bytes();
             let r = post(&w, &t, "/v1/dbs/d/events/ev/rows", small.clone()).await;
-            let per_byte = peak_growth(before) as f64 / small.len() as f64;
+            let per_byte = peak_growth_bytes(before) as f64 / small.len() as f64;
             eprintln!("rows {shape}: a 4 MiB bulk insert: status {}, heap peak {per_byte:.1}x the body", r.status);
             close_bulk_world(w, &t).await;
             let body_bytes = BULK_BODY_BYTES.min(((1u64 << 30) as f64 / per_byte) as usize);
@@ -323,9 +279,9 @@ fn concurrent_bulk_inserts_respect_node_memory_budget() {
                 let requests = vec![("/v1/dbs/d/events/ev/rows".to_string(), body.clone()); n];
                 let gate_before = w.node(0).engine.shared.memory.used();
                 let sampler = GaugeSampler::start(&w);
-                let before = reset_peak();
+                let before = reset_peak_bytes();
                 let out = join_posts(spawn_posts(&w, &t, requests)).await;
-                let peak = peak_growth(before);
+                let peak = peak_growth_bytes(before);
                 let gauges = sampler.finish().await;
                 let longest = out.iter().map(|o| o.elapsed).max().unwrap_or_default();
                 let gate_growth = gauges.memory_gate_bytes.saturating_sub(gate_before);
@@ -428,7 +384,7 @@ async fn stall_request_body(w: &World, token: &str, path: &str) -> (Option<u16>,
         .body(axum::body::Body::new(body))
         .expect("request");
     let router = w.node(0).router().expect("router");
-    let before = ALLOCATED_BYTES.load(Relaxed);
+    let before = allocated_bytes();
     let task = tokio::spawn(async move {
         use tower::ServiceExt;
         let Ok(resp) = router.oneshot(req).await;
@@ -442,7 +398,7 @@ async fn stall_request_body(w: &World, token: &str, path: &str) -> (Option<u16>,
     while started.elapsed() < STALL && !task.is_finished() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    let held = heap_growth(before);
+    let held = heap_change_bytes(before);
     let status = match task.is_finished() {
         true => Some(task.await.expect("request task")),
         false => {
@@ -450,7 +406,7 @@ async fn stall_request_body(w: &World, token: &str, path: &str) -> (Option<u16>,
             let s = task.await.expect("request task");
             eprintln!(
                 "  after the client closed the body: status {s}, heap {:+.1} MiB",
-                heap_growth(before) as f64 / MIB as f64
+                heap_change_bytes(before) as f64 / MIB as f64
             );
             None
         }
@@ -461,7 +417,7 @@ async fn stall_request_body(w: &World, token: &str, path: &str) -> (Option<u16>,
 #[test]
 #[ignore = "TODO blocker: stream JSON request bodies and charge bulk insert buffers to MemoryGate (body read timeout)"]
 fn stalled_request_body_times_out() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::with_config(1, 0, production_limits).await;
         let t = w.signup(0, "d3@ingest.test").await;
@@ -501,7 +457,7 @@ async fn write_all(s: &tokio::net::TcpStream, mut data: &[u8]) {
 #[test]
 #[ignore = "TODO blocker: stream JSON request bodies and charge bulk insert buffers to MemoryGate (body read timeout)"]
 fn stalled_request_body_times_out_over_tcp() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     let level = baserunna::log::level();
     baserunna::log::set_level(Some(baserunna::log::Level::Error));
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime");
@@ -518,7 +474,7 @@ fn stalled_request_body_times_out_over_tcp() {
             axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await
         });
         let s = tokio::net::TcpStream::connect(addr).await.expect("connect");
-        let before = ALLOCATED_BYTES.load(Relaxed);
+        let before = allocated_bytes();
         let head = format!(
             "POST /v1/dbs/d/events/ev/rows HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\n\
              authorization: Bearer {t}\r\ncontent-length: {STALLED_BODY_BYTES}\r\n\r\n["
@@ -550,7 +506,7 @@ fn stalled_request_body_times_out_over_tcp() {
                 }
             }
         }
-        let held = heap_growth(before);
+        let held = heap_change_bytes(before);
         eprintln!(
             "TCP: {} MiB of a {} MiB bulk insert body, then no data for up to {STALL:?}: {}, heap held {:+.1} MiB",
             STALLED_PREFIX_BYTES / MIB,
@@ -562,7 +518,7 @@ fn stalled_request_body_times_out_over_tcp() {
         tokio::time::sleep(Duration::from_secs(1)).await;
         eprintln!(
             "TCP: after the client closed the connection: heap {:+.1} MiB",
-            heap_growth(before) as f64 / MIB as f64
+            heap_change_bytes(before) as f64 / MIB as f64
         );
         w.shutdown();
         assert!(answer.is_some(), "a request body that stalled for {STALL:?} over TCP did not time out");
@@ -667,7 +623,7 @@ async fn measure_merge(rows: usize) -> MergePeak {
     // Advance past `event_settle_ms` and insert a row into another day to trigger the settling merge.
     tokio::time::sleep(Duration::from_millis(w.node(0).cfg.engine.event_settle_ms) + Duration::from_secs(3600)).await;
     let merged = probe::count(Probe::PartsMerged);
-    let before = reset_peak();
+    let before = reset_peak_bytes();
     let other_day = format!(r#"[{{"t":{},"u":"x","e":"x"}}]"#, MERGE_DAY_MS - DAY_MS);
     bulk_insert(&w, &t, "d", "ev", other_day).await;
     let started = Instant::now();
@@ -680,8 +636,8 @@ async fn measure_merge(rows: usize) -> MergePeak {
         }
     }
     eprintln!("{} merges ran while the partition settled", probe::count(Probe::PartsMerged) - merged);
-    let peak = peak_growth(before);
-    let retained = heap_growth(before);
+    let peak = peak_growth_bytes(before);
+    let retained = heap_change_bytes(before);
     let info = table_info(&w, &t, "d", "ev").await;
     print_parts(&info);
     let parts: Vec<Json> =
@@ -712,7 +668,7 @@ async fn measure_merge(rows: usize) -> MergePeak {
 #[test]
 #[ignore = "TODO blocker: bound memory usage during part merges"]
 fn merge_memory_does_not_grow_with_rows() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         probe::record();
         let mut measured = Vec::new();
@@ -769,7 +725,7 @@ async fn trigger_maintenance(w: &World, token: &str, db_id: &str, row: usize) ->
 #[test]
 #[ignore = "TODO blocker: bound memory usage during part merges (failed merges repeat after a restart)"]
 fn failed_merge_is_not_retried_after_restart() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let mut w = World::with_config(1, STORE_LATENCY_MS, merges_time_out).await;
         let t = w.signup(0, "e2@merge.test").await;
@@ -817,7 +773,7 @@ const SPREAD_FROM_MS: i64 = 1_700_000_000_000 / HOUR_MS * HOUR_MS;
 #[test]
 #[ignore = "TODO blocker: limit partitions per bulk insert"]
 fn bulk_insert_partitions_are_limited() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let mut measured = Vec::new();
         for k in [100usize, 1_000, 10_000] {
@@ -844,7 +800,7 @@ fn bulk_insert_partitions_are_limited() {
             let stored_before = w.stored_bytes(&db_id);
             w.store.set_latency_ms(STORE_LATENCY_MS);
             let puts_before = w.store.scope(&db_id).puts;
-            let before = reset_peak();
+            let before = reset_peak_bytes();
             let started = Instant::now();
             let task = spawn_posts(&w, &t, vec![("/v1/dbs/d/events/ev/rows".to_string(), body)]).pop().expect("task");
             let (mut answered, mut puts_at_answer) = (None, 0.0);
@@ -852,7 +808,7 @@ fn bulk_insert_partitions_are_limited() {
             let mut heap_max_during = 0isize;
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                heap_max_during = heap_max_during.max(heap_growth(before));
+                heap_max_during = heap_max_during.max(heap_change_bytes(before));
                 let puts = w.store.scope(&db_id).puts;
                 if puts != last_puts {
                     (last_puts, last_put_at) = (puts, started.elapsed());
@@ -868,7 +824,7 @@ fn bulk_insert_partitions_are_limited() {
                 }
             }
             let out = task.await.expect("request task");
-            let peak = peak_growth(before);
+            let peak = peak_growth_bytes(before);
             w.store.set_latency_ms(0);
             tokio::time::sleep(Duration::from_secs(60)).await;
             let info = table_info(&w, &t, "d", "ev").await;
@@ -925,7 +881,7 @@ const CONCURRENT_MERGE_ROWS: usize = 500_000;
 #[test]
 #[ignore = "TODO blocker: limit event maintenance concurrency across the node and charge its memory"]
 fn event_merges_share_a_node_wide_limit() {
-    let _turn = TURN.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         probe::record();
         let w = World::with_config(1, 0, production_limits).await;
@@ -946,12 +902,12 @@ fn event_merges_share_a_node_wide_limit() {
             let merged = probe::count(Probe::PartsMerged);
             let gate_before = w.node(0).engine.shared.memory.used();
             let sampler = GaugeSampler::start(&w);
-            let before = reset_peak();
+            let before = reset_peak_bytes();
             let triggers: Vec<(String, String)> =
                 (0..tables).map(|i| (format!("/v1/dbs/{db}/events/ev{i}/rows"), trigger_body(i))).collect();
             let out = join_posts(spawn_posts(&w, &t, triggers)).await;
             let took = wait_for_merges(merged + tables as u64, Duration::from_secs(3600)).await;
-            let peak = peak_growth(before);
+            let peak = peak_growth_bytes(before);
             let gauges = sampler.finish().await;
             w.store.set_latency_ms(0);
             eprintln!(

@@ -27,11 +27,20 @@ scope for v1.
 - A node can be killed any time without losing committed data.
 - If a node is killed, another node can serve reads immediately or writes within one lease period.
 
-4. **Testability.**
+4. **Tenant resource isolation**
+
+- A tenant is a database owner: a user or an organization.
+- Each tenant has a limit for each resource. The node keeps each tenant within its limits. A tenant cannot crash a node.
+- Each limit has a default value. An administrator can change the limits for each tenant.
+- If a node does not have enough memory, it stops the tenant that uses the most memory first.
+- The node enforces these limits on Linux. On other operating systems, such as macOS for development, the node runs without enforcement.
+
+5. **Testability.**
 
 - The service runs and is tested inside a deterministic simulator with fault injection.
+- The simulator tests isolation recovery by stopping tenant work at any time. A separate harness checks kernel resource limits outside the simulator.
 
-5. **Perf, within reason.**
+6. **Perf, within reason.**
 
 - Hot reads are served from memory.
 - Each commit requires one conditional PUT.

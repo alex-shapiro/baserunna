@@ -46,7 +46,7 @@ impl FakeS3 {
         FakeS3::start_on("127.0.0.1:0").await
     }
 
-    /// Starts a server that listens on `addr`.
+    /// Starts a fake S3 server bound to `addr`.
     pub async fn start_on(addr: &str) -> FakeS3 {
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let s = FakeS3 { inner: Default::default(), url: format!("http://{}", listener.local_addr().unwrap()) };
@@ -72,13 +72,13 @@ impl FakeS3 {
         .collect()
     }
 
-    /// Sets the largest page that a list request returns, which defaults to 3 keys.
+    /// Sets the maximum key count returned per list request. The default is 3.
     #[allow(dead_code)]
     pub fn set_max_list_keys(&self, max: usize) {
         self.inner.lock().max_list_keys = Some(max);
     }
 
-    /// Delays every request by `latency`, as a remote object store would.
+    /// Adds a fixed `latency` delay to each request to simulate remote object storage.
     #[allow(dead_code)]
     pub fn set_latency(&self, latency: Duration) {
         self.inner.lock().latency = Some(latency);
@@ -190,8 +190,8 @@ async fn handle(State(s): State<FakeS3>, method: Method, uri: Uri, headers: Head
         };
         (fault, g.latency)
     };
-    if let Some(d) = latency {
-        tokio::time::sleep(d).await;
+    if let Some(delay) = latency {
+        tokio::time::sleep(delay).await;
     }
     match fault {
         Some(Fault::Fail(code)) => return xml_error_response(code, "InjectedFault"),

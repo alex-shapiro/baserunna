@@ -1,7 +1,6 @@
-//! Attacker workloads. Each workload is one module that implements [`Workload`].
+//! Attacker workload definitions.
 //!
-//! To add a workload, write a module with a type that implements [`Workload`] and add it to
-//! [`by_name`] and [`NAMES`].
+//! Implement [`Workload`] in a submodule and register it in [`by_name`] and [`NAMES`].
 
 mod blob_checks;
 mod blob_downloads;
@@ -12,13 +11,13 @@ mod stream_filter_scans;
 mod table_filter_scans;
 mod txn_scans;
 
-use crate::http::{Api, Owner, RequestRecord};
+use crate::http::{NodeApi, Owner, RequestRecord};
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde_json::Value as Json;
 use std::sync::Arc;
 
-/// Size of a workload run: the small variant must succeed on a correct node.
+/// Workload scale. A healthy node must complete the [`Variant::Small`] variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Variant {
@@ -27,8 +26,8 @@ pub enum Variant {
 }
 
 impl Variant {
-    pub fn parse(s: &str) -> Option<Variant> {
-        match s {
+    pub fn parse(text: &str) -> Option<Variant> {
+        match text {
             "small" => Some(Variant::Small),
             "attack" => Some(Variant::Attack),
             _ => None,
@@ -36,7 +35,7 @@ impl Variant {
     }
 }
 
-/// Attack round: phase B runs the attacker alone, and phase C runs it with the victim.
+/// Execution phase for an attack round: alone in phase B, or alongside the victim in phase C.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Round {
     Alone,
@@ -52,33 +51,32 @@ impl Round {
     }
 }
 
-/// Context that a workload uses to reach the node as the attacker.
+/// Shared state for running attacker requests against the node.
 pub struct AttackContext {
-    pub api: Arc<Api>,
+    pub api: Arc<NodeApi>,
     pub attacker: Owner,
     pub variant: Variant,
     pub cgroup: crate::cgroup::NodeCgroup,
 }
 
-/// Result of one attack round.
+/// Recorded requests and completion status for an attack round.
 #[derive(Debug, Default, Serialize)]
 pub struct AttackOutcome {
-    /// Every attacker request of the round.
+    /// All attacker requests sent during the round.
     pub requests: Vec<RequestRecord>,
-    /// False if background work that the round started, such as merges, did not finish in time.
+    /// True if background work started by the round finished before the timeout.
     pub completed: bool,
     /// Workload-specific measurements.
     pub notes: Json,
 }
 
-/// Attacker workload: a request pattern whose cost the node must bound per tenant.
+/// Attacker workload whose resource cost the node must bound per tenant.
 pub trait Workload: Send + Sync {
-    /// Creates the attacker's data for `round`. The harness calls this for both rounds before
-    /// the victim's first phase, so the setup cost is outside every measured phase.
-    fn prepare<'a>(&'a self, cx: &'a AttackContext, round: Round) -> BoxFuture<'a, Result<Json, String>>;
+    /// Creates attacker data for `round` before any measured phase begins.
+    fn prepare<'a>(&'a self, ctx: &'a AttackContext, round: Round) -> BoxFuture<'a, Result<Json, String>>;
 
-    /// Sends the attack requests of `round` and waits for the background work that they start.
-    fn attack<'a>(&'a self, cx: &'a AttackContext, round: Round) -> BoxFuture<'a, Result<AttackOutcome, String>>;
+    /// Sends attack requests for `round` and waits for triggered background work to finish.
+    fn attack<'a>(&'a self, ctx: &'a AttackContext, round: Round) -> BoxFuture<'a, Result<AttackOutcome, String>>;
 }
 
 pub const NAMES: &[&str] = &[
@@ -106,22 +104,24 @@ pub fn by_name(name: &str) -> Option<Box<dyn Workload>> {
     })
 }
 
-/// Sends every `(label, path, body)` POST at the same time and returns their records.
+/// Sends all `(label, path, body)` POST requests concurrently and returns their records.
 pub async fn concurrent_posts(
-    cx: &AttackContext,
+    ctx: &AttackContext,
     requests: Vec<(String, String, bytes::Bytes)>,
-    ok: &'static [u16],
+    expected_statuses: &'static [u16],
 ) -> Vec<RequestRecord> {
     let tasks: Vec<_> = requests
         .into_iter()
         .map(|(label, path, body)| {
-            let (api, token) = (cx.api.clone(), cx.attacker.token.clone());
-            tokio::spawn(async move { api.timed(&label, reqwest::Method::POST, &path, &token, body, ok).await })
+            let (api, token) = (ctx.api.clone(), ctx.attacker.token.clone());
+            tokio::spawn(async move {
+                api.send_timed(&label, reqwest::Method::POST, &path, &token, body, expected_statuses).await
+            })
         })
         .collect();
-    let mut out = Vec::new();
-    for t in tasks {
-        out.push(t.await.expect("attack request"));
+    let mut records = Vec::new();
+    for task in tasks {
+        records.push(task.await.expect("attack request"));
     }
-    out
+    records
 }

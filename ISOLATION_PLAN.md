@@ -75,9 +75,9 @@ order. Milestone 4 depends on milestone 3. Finish with milestone 5.
 ### 0. Measure isolation on `main`
 
 The isolation harness checks whether the node continues to serve a victim
-tenant while an attacker tenant runs a heavy workload. The harness is in
+tenant while an attacker tenant runs a heavy workload. The harness lives in
 `crates/baserunna/examples/isolation/`. The scripts in `scripts/isolation/`
-build it and run it in a Linux VM.
+build and run the harness in a Linux VM.
 
 A workload passes if it meets all five criteria:
 
@@ -91,21 +91,21 @@ A workload passes if it meets all five criteria:
 - [x] Move the isolation harness and its pass criteria to `main`. Record the
       baseline result for each workload on `main`.
 - [ ] Run each attack for a fixed time while the victim runs. Today the victim
-      sends only about 470 requests during an attack, so one slow request can
-      fail criterion 3.
+      sends only about 470 requests during an attack. A single slow request can
+      cause criterion 3 to fail.
 - [ ] Model tenant memory limits in the simulator. Add a counting allocator to
-      simulation builds that charges each allocation to the tenant whose task
-      makes it. Give each tenant a memory limit. If a tenant exceeds its limit,
-      stop all work of that tenant, as the kernel stops a worker. This PR
-      removes the `TODO.md` item "Check memory estimates against the real heap
-      in simulation".
+      simulation builds. Charge each allocation to the tenant that owns the
+      allocating task. Give each tenant a memory limit. If a tenant exceeds its
+      limit, stop all work for that tenant to match how the kernel stops a
+      worker. This PR removes the `TODO.md` item "Check memory estimates against
+      the real heap in simulation".
 - [ ] Port the isolation workloads to simulator scenarios. Each scenario checks
       criteria 1, 2, 4, and 5 with faults. Record the baseline result for each
       scenario on `main`.
 
-The simulator cannot measure real CPU time, so the VM harness still checks
-criterion 3. The VM harness also checks that the real kernel stops a tenant at
-the same limit as the simulator model.
+The simulator cannot measure real CPU time. The VM harness still checks
+criterion 3. It also checks that the Linux kernel stops a tenant at the same
+memory limit as the simulator model.
 
 ### 1. Limit memory use for each operation
 
@@ -229,8 +229,8 @@ tracking code.
       per-owner overrides in the system database. Apply limit updates
       immediately to the running worker's cgroup. A single event query can use
       1 GiB today. In the contest, a 512 MiB worker limit caused 19 of 40 event
-      query runs to fail. On `main`, the result of the same query changes from
-      run to run.
+      query runs to fail. On `main`, the node returns different results for the
+      same query across runs.
 - [ ] Check a soft memory limit before a worker admits a request. Read live
       heap bytes from a counting global allocator. Return HTTP 503 if the
       worker is near its memory limit. Do not use cgroup `memory.high`. In

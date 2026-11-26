@@ -1,11 +1,10 @@
-"""Prints a Markdown summary of the isolation results that measure.py wrote.
-
-A workload passes only if every run of its small and attack variants passes.
-For each failed run, the table names the pass criteria that failed. The cost
-measurements (kv_throughput, idle_cost, event_scan) have no pass criteria, so
-the summary prints their main numbers.
+"""Print a Markdown summary of isolation results written by measure.py.
 
 Usage: python3 -I summarize.py <results dir>
+
+A workload passes only if every run of its small and attack variants passes.
+For each failed run, the table lists the failed criteria numbers.
+Cost benchmarks do not have pass criteria, so the summary prints their key metrics.
 """
 
 import json
@@ -16,16 +15,16 @@ from pathlib import Path
 
 COST_WORKLOADS = ("kv_throughput", "idle_cost", "event_scan")
 CRITERIA = (
-    "1_node_survives",
+    "1_node_running",
     "2_victim_requests_succeed",
     "3_victim_p99_within_limit",
-    "4_refusals_are_http_errors",
+    "4_rejections_are_http_errors",
     "5_small_variant_succeeds",
 )
 
 
 def failed_criteria(result):
-    """Returns the numbers of the criteria that failed or did not run."""
+    """Return the numbers of criteria that failed or did not run."""
     conditions = result.get("conditions") or {}
     failed = []
     for name in CRITERIA:
@@ -38,7 +37,7 @@ def failed_criteria(result):
 
 
 def run_cell(result):
-    """Returns one table cell for one run: pass, or the failed criteria and the key numbers."""
+    """Format a table cell with the run verdict and key metrics."""
     if (result.get("conditions") or {}).get("pass"):
         verdict = "pass"
     else:
@@ -60,10 +59,10 @@ def run_cell(result):
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
-    results = Path(sys.argv[1])
+    results_dir = Path(sys.argv[1])
     runs = defaultdict(list)
     costs = defaultdict(list)
-    for path in sorted(results.glob("*.json")):
+    for path in sorted(results_dir.glob("*.json")):
         result = json.loads(path.read_text())
         workload = result.get("workload")
         if workload in COST_WORKLOADS:
@@ -71,7 +70,7 @@ def main():
         else:
             runs[(workload, result.get("variant"))].append(result)
 
-    workloads = sorted({w for w, _ in runs})
+    workloads = sorted({workload for workload, _ in runs})
     print("| Workload | Result | Small runs | Attack runs |")
     print("| --- | --- | --- | --- |")
     for workload in workloads:
@@ -79,10 +78,13 @@ def main():
         passed = (
             bool(small)
             and bool(attack)
-            and all((r.get("conditions") or {}).get("pass") for r in small + attack)
+            and all(
+                (run_result.get("conditions") or {}).get("pass")
+                for run_result in small + attack
+            )
         )
         cells = [
-            "<br>".join(run_cell(r) for r in group) or "not run"
+            "<br>".join(run_cell(run_result) for run_result in group) or "not run"
             for group in (small, attack)
         ]
         print(
@@ -90,14 +92,14 @@ def main():
         )
 
     victim_alone = [
-        r["phase_a_victim_alone"]["p99_ms"]
+        run_result["phase_a_victim_alone"]["p99_ms"]
         for group in runs.values()
-        for r in group
-        if r.get("phase_a_victim_alone")
+        for run_result in group
+        if run_result.get("phase_a_victim_alone")
     ]
     if victim_alone:
         print(
-            f"\nVictim p99 with no attacker: median {statistics.median(victim_alone):.1f} ms over {len(victim_alone)} runs."
+            f"\nVictim p99 without an attacker: median {statistics.median(victim_alone):.1f} ms over {len(victim_alone)} runs."
         )
 
     for result in costs["kv_throughput"]:
@@ -115,7 +117,8 @@ def main():
     for result in costs["event_scan"]:
         scan = result.get("event_scan") or {}
         queries = ", ".join(
-            f"{q['query']} {q['median_ms']:.0f} ms" for q in scan.get("per_query", [])
+            f"{query['query']} {query['median_ms']:.0f} ms"
+            for query in scan.get("per_query", [])
         )
         print(
             f"\nevent_scan: {scan.get('failed_queries')} failed queries; median per query: {queries}"

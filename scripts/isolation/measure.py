@@ -1,13 +1,13 @@
-"""Runs isolation workloads against one node binary and writes one result file
-per run into a results directory. Run inside the Linux VM after build.py, with
-no other node or build in the VM, and with the Mac held awake.
+"""Run isolation and cost workloads against a node binary and save JSON results.
 
 Usage: python3 -I measure.py <results dir> [workload...]
 
-With no workloads, it runs every isolation workload and then the cost
-measurements kv_throughput, idle_cost, and event_scan. Each isolation workload
-runs its small and attack variants. Each run repeats $REPS times (default 2).
-summarize.py reads the results directory.
+Run this script inside the Linux VM after build.py.
+Stop other nodes and builds in the VM, and keep the host Mac awake.
+If you omit workloads, this script runs all isolation workloads and all cost benchmarks.
+Each isolation workload runs both its small and attack variants.
+Set $REPS to change the repeat count per workload; the default is 2.
+Use summarize.py to format the saved results directory.
 """
 
 import json
@@ -30,12 +30,14 @@ ISOLATION_WORKLOADS = [
 ]
 COST_WORKLOADS = ["kv_throughput", "idle_cost", "event_scan"]
 COST_CLIENT_FLAGS = {"kv_throughput": ["--clients", "256"]}
-RUN_PY = Path(__file__).resolve().with_name("run.py")
+RUN_SCRIPT = Path(__file__).resolve().with_name("run.py")
 
 
 def copy_binaries(target_dir, bin_dir):
-    """Copies the binaries, so that a build during the runs cannot change them. Removes the old
-    copies first: on a shared mount, a copy over a running binary can kill it."""
+    """Copy binaries into `bin_dir` so concurrent builds do not overwrite them.
+
+    Delete old copies first because overwriting a running binary on a shared mount can crash it.
+    """
     bin_dir.mkdir(parents=True, exist_ok=True)
     sources = [
         target_dir / "release/baserunna",
@@ -47,33 +49,36 @@ def copy_binaries(target_dir, bin_dir):
         shutil.copy2(source, bin_dir / source.name)
 
 
-def run_one(out_dir, bin_dir, workload, variant, rep, client_flags):
-    out = out_dir / f"{workload}-{variant}-r{rep}.json"
-    print(f"== {time.strftime('%H:%M:%S')} {workload} {variant} r{rep}", flush=True)
+def run_workload(results_dir, bin_dir, workload, variant, iteration, client_flags):
+    result_path = results_dir / f"{workload}-{variant}-r{iteration}.json"
+    print(
+        f"== {time.strftime('%H:%M:%S')} {workload} {variant} r{iteration}",
+        flush=True,
+    )
     command = [
         sys.executable,
         "-I",
-        str(RUN_PY),
+        str(RUN_SCRIPT),
         workload,
         variant,
-        str(out),
+        str(result_path),
         str(bin_dir / "baserunna"),
     ]
     env = dict(os.environ, EXAMPLES_DIR=str(bin_dir))
-    with open(out.with_suffix(".stdout"), "w") as log:
+    with open(result_path.with_suffix(".stdout"), "w") as log:
         subprocess.run(
             command + client_flags, env=env, stdout=log, stderr=subprocess.STDOUT
         )
     try:
-        result = json.loads(out.read_text())
+        result = json.loads(result_path.read_text())
     except (OSError, ValueError):
-        print("no result file", flush=True)
+        print("missing result file", flush=True)
         return
     run = result.get("run") or {}
     print(
         json.dumps(
             result.get("conditions")
-            or {"died": run.get("node_died"), "error": result.get("error")}
+            or {"stopped": run.get("node_stopped"), "error": result.get("error")}
         ),
         flush=True,
     )
@@ -82,28 +87,28 @@ def run_one(out_dir, bin_dir, workload, variant, rep, client_flags):
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
-    out_dir = Path(sys.argv[1]).resolve()
+    results_dir = Path(sys.argv[1]).resolve()
     workloads = sys.argv[2:] or ISOLATION_WORKLOADS + COST_WORKLOADS
-    reps = int(os.environ.get("REPS", "2"))
+    repeats = int(os.environ.get("REPS", "2"))
     target_dir = Path(
         os.environ.get("ISOLATION_TARGET_DIR", Path.home() / "target-isolation")
     )
-    bin_dir = out_dir / "bin"
+    bin_dir = results_dir / "bin"
     copy_binaries(target_dir, bin_dir)
     for workload in workloads:
-        for rep in range(1, reps + 1):
+        for iteration in range(1, repeats + 1):
             if workload in COST_WORKLOADS:
-                run_one(
-                    out_dir,
+                run_workload(
+                    results_dir,
                     bin_dir,
                     workload,
                     "-",
-                    rep,
+                    iteration,
                     COST_CLIENT_FLAGS.get(workload, []),
                 )
             else:
                 for variant in ("small", "attack"):
-                    run_one(out_dir, bin_dir, workload, variant, rep, [])
+                    run_workload(results_dir, bin_dir, workload, variant, iteration, [])
 
 
 if __name__ == "__main__":

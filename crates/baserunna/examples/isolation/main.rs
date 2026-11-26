@@ -8,7 +8,7 @@
 //! isolation --node http://127.0.0.1:8080 --cgroup /sys/fs/cgroup/iso/node \
 //!     --workload <name> --variant small|attack --out result.json [--node-pid PID]
 //! isolation --node ... --cgroup ... --workload event_scan --out result.json [--rounds 20]
-//! isolation --node ... --cgroup ... --workload kv_throughput --out result.json [--clients 64 | --find-saturation]
+//! isolation --node ... --cgroup ... --workload kv_throughput --out result.json [--clients 64]
 //! isolation --node ... --cgroup ... --workload idle_cost --out result.json
 //! ```
 //!
@@ -47,13 +47,12 @@ struct Args {
     victim_rps: f64,
     rounds: usize,
     clients: usize,
-    find_saturation: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: isolation --node URL --cgroup DIR --workload NAME [--variant small|attack] --out FILE \
-         [--node-pid PID] [--deadline-ms 10000] [--victim-secs 15] [--victim-rps 400] [--rounds 20] [--clients 64] [--find-saturation]\n\
+         [--node-pid PID] [--deadline-ms 10000] [--victim-secs 15] [--victim-rps 400] [--rounds 20] [--clients 64]\n\
          workloads: {} event_scan kv_throughput idle_cost",
         workloads::NAMES.join(" ")
     );
@@ -73,14 +72,9 @@ fn args() -> Args {
         victim_rps: 400.0,
         rounds: 20,
         clients: 64,
-        find_saturation: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
-        if flag == "--find-saturation" {
-            a.find_saturation = true;
-            continue;
-        }
         let v = it.next().unwrap_or_else(|| usage());
         match flag.as_str() {
             "--node" => a.node = v,
@@ -183,7 +177,7 @@ async fn run(a: &Args, watch: &NodeWatch, out: &mut Json) -> Result<(), String> 
         return Ok(());
     }
     if a.workload == "kv_throughput" {
-        out["kv_throughput"] = kv_throughput::run(&api, &a.node, &a.cgroup, a.clients, a.find_saturation).await?;
+        out["kv_throughput"] = kv_throughput::run(&api, &a.node, &a.cgroup, a.clients).await?;
         out["node_survived"] = json!(watch.alive() && watch.new_oom_kills() == 0);
         return Ok(());
     }

@@ -22,15 +22,6 @@ const DBS_PER_OWNER: usize = 200;
 const VALUE_BYTES: usize = 8;
 const WRITE_PCT: u64 = 10;
 const SETUP_CONCURRENCY: usize = 64;
-/// vCPUs of the VM that runs the node and this client.
-const NODE_VCPUS: f64 = 4.0;
-/// Node CPU, as a share of [`NODE_VCPUS`], at which a client count saturates the node.
-const SATURATED_CPU_SHARE: f64 = 0.9;
-/// Smallest ops/s gain over the previous trial that counts as a rise.
-const MIN_TRIAL_GAIN: f64 = 1.05;
-const TRIAL_CLIENT_COUNTS: [usize; 6] = [16, 32, 64, 128, 256, 512];
-const TRIAL_WARMUP: Duration = Duration::from_secs(1);
-const TRIAL_WINDOW: Duration = Duration::from_secs(4);
 const WARMUP: Duration = Duration::from_secs(3);
 const WINDOW: Duration = Duration::from_secs(15);
 
@@ -63,14 +54,8 @@ pub struct LoadWindow {
     pub error_samples: Vec<String>,
 }
 
-/// Creates the databases, finds or takes the client count, and measures one load window.
-pub async fn run(
-    api: &Api,
-    node: &str,
-    cg: &NodeCgroup,
-    clients: usize,
-    find_saturation: bool,
-) -> Result<Json, String> {
+/// Creates the databases and measures one load window with `clients` clients.
+pub async fn run(api: &Api, node: &str, cg: &NodeCgroup, clients: usize) -> Result<Json, String> {
     let setup_started = Instant::now();
     let keys = Arc::new(setup(api, node).await?);
     let setup_s = setup_started.elapsed().as_secs_f64();
@@ -79,17 +64,6 @@ pub async fn run(
         "dbs": DBS, "owners": DBS.div_ceil(DBS_PER_OWNER), "keys_per_db": 1, "value_bytes": VALUE_BYTES,
         "write_pct": WRITE_PCT, "setup_s": setup_s,
     });
-    let clients = if find_saturation {
-        measure(&http, &keys, cg, 64, WARMUP, Duration::ZERO).await;
-        let (chosen, reason, trials) = saturating_clients(&http, &keys, cg).await;
-        eprintln!("kv_throughput: chosen client count {chosen} ({reason})");
-        out["saturation"] = json!({"chosen_clients": chosen, "reason": reason, "trials": trials,
-            "rule": format!("smallest count with node CPU >= {SATURATED_CPU_SHARE} x {NODE_VCPUS} vCPUs, \
-                or the last count before ops/s rose less than {MIN_TRIAL_GAIN}x")});
-        chosen
-    } else {
-        clients
-    };
     let window = measure(&http, &keys, cg, clients, WARMUP, WINDOW).await;
     eprintln!(
         "kv_throughput: {clients} clients: {:.0} ops/s, {} errors, p50 {:.2} ms, p99 {:.2} ms, node CPU {:.2} vCPUs, \
@@ -149,34 +123,6 @@ async fn create_db_with_retries(api: &Api, token: &str, db: &str) -> Result<(), 
         }
     }
     Err(format!("POST /v1/dbs {db}: 50 conflicts"))
-}
-
-/// Runs short trials with more clients each time and returns the chosen count, the reason, and the trials.
-async fn saturating_clients(
-    http: &LoadClient,
-    keys: &Arc<Vec<DbKey>>,
-    cg: &NodeCgroup,
-) -> (usize, &'static str, Vec<LoadWindow>) {
-    let mut trials: Vec<LoadWindow> = Vec::new();
-    for clients in TRIAL_CLIENT_COUNTS {
-        let trial = measure(http, keys, cg, clients, TRIAL_WARMUP, TRIAL_WINDOW).await;
-        eprintln!(
-            "kv_throughput: trial {clients} clients: {:.0} ops/s, node CPU {:.2} vCPUs, client CPU {:.2} vCPUs",
-            trial.ops_per_s,
-            trial.node_cpu_vcpus.unwrap_or(f64::NAN),
-            trial.client_cpu_vcpus
-        );
-        let saturated = trial.node_cpu_vcpus.is_some_and(|v| v >= SATURATED_CPU_SHARE * NODE_VCPUS);
-        let flat = trials.last().map(|prev| (prev.clients, trial.ops_per_s < prev.ops_per_s * MIN_TRIAL_GAIN));
-        trials.push(trial);
-        if saturated {
-            return (clients, "node CPU reached 90% of 4 vCPUs", trials);
-        }
-        if let Some((prev, true)) = flat {
-            return (prev, "ops/s stopped rising", trials);
-        }
-    }
-    (TRIAL_CLIENT_COUNTS[TRIAL_CLIENT_COUNTS.len() - 1], "largest trial count", trials)
 }
 
 const WARMING: u8 = 0;

@@ -53,8 +53,8 @@ About 40 lines in the engine and about 250 lines of test code.
 ## Verdict
 
 Build it. Count the entries and bytes that each transaction reads and writes.
-Fill every limit through metadata commands, then run each command and check its
-cost against a bound. Correct the plan text about batched deletes.
+Fill every limit through metadata commands, then check that the cost of each
+command does not grow when stored data grows. Correct the plan text about batched deletes.
 
 ## Design
 

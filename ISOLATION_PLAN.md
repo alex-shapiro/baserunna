@@ -171,20 +171,19 @@ including dependencies. In-process counters miss allocations outside our
 tracking code.
 
 - [ ] Merge the isolation harness from branch `iso/m0-harness`. The harness
-      checks whether the node continues to serve a victim tenant while an
-      attacker tenant runs a heavy workload. A workload passes if it meets all
-      five criteria:
+      checks if the node serves a victim tenant while an attacker runs a heavy
+      workload. A workload passes if it meets all five conditions:
   - The node continues to run.
   - All victim requests succeed.
-  - The victim p99 latency does not exceed the larger of `2 * baseline` or
+  - Victim p99 latency is at most the larger of `2 * baseline` or
     `baseline + 50 ms`.
   - The server returns an HTTP error for requests that exceed a limit.
   - A small version of the workload succeeds.
 
-  On `main`, the harness reports whole-node symptoms of failures that
-  milestone 1 and `TODO.md` already describe for each operation. Under
-  per-owner cgroups, the harness shows whether the kernel stops only the
-  attacker and the victim stays fast.
+  Under per-owner cgroups, the harness tests isolation. It checks if the kernel
+  stops only the attacker. It also checks if victim requests stay fast. On
+  `main`, the harness shows only node-wide effects. Milestone 1 and `TODO.md`
+  already list the per-operation problems that cause them.
 - [ ] Record absolute target numbers for the worker pool before you run
       benchmarks. Include these metrics:
   - CPU time per request

@@ -387,10 +387,6 @@ fn batched_deletes_remove_owners_at_their_limits() {
         assert_eq!(org::get_org(&mut txn, "org-big").await.unwrap(), None);
         assert_eq!(dbs_page(&mut txn, "dbowner", 10, None).await.unwrap().items, vec![]);
         let deleted = list_deleted_dbs(&mut txn).await.unwrap();
-        assert_eq!(
-            deleted.len(),
-            cfg.max_dbs_per_owner + 1,
-            "every deleted database is recorded for storage purge"
-        );
+        assert_eq!(deleted.len(), cfg.max_dbs_per_owner + 1, "every deleted database is recorded for storage purge");
     });
 }

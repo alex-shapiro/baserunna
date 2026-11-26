@@ -49,8 +49,8 @@ server binary from linking the storage engine:
 1. `baserunna-util`: shared support modules and the `Transport` trait.
 2. `baserunna-storage`: the storage engine and database features. It depends on
    `baserunna-util`.
-3. `baserunna-worker`: tenant request handlers and background jobs. All tenant
-   work runs in this crate. It depends on `baserunna-storage` and
+3. `baserunna-worker`: tenant request handlers and background jobs. This crate
+   contains all tenant code. It depends on `baserunna-storage` and
    `baserunna-util`.
 4. `baserunna-server`: network connections, authentication, and request
    routing. It does not depend on `baserunna-storage`.
@@ -114,7 +114,7 @@ Each PR adds a test to check that a request of size `N` uses at most
 - [ ] Limit partitions per bulk insert. This PR removes the matching `TODO.md`
       item.
 - [ ] Merge parts block by block. Split this work into two PRs if needed. This
-      PR removes the `TODO.md` item "Bound memory usage during part merges".
+      change removes the `TODO.md` item "Bound memory usage during part merges".
 - [ ] Limit concurrent event maintenance tasks on a node. This PR removes the
       `TODO.md` item "Limit event maintenance concurrency across the node and
       charge its memory".
@@ -200,8 +200,8 @@ tracking code.
   - Duration of each event query in the harness
   - Isolation harness results from milestone 0
 
-  For baseline context, `BENCH_BOUNDARY` on branch `iso/floor` measured 25.6 µs
-  of CPU time per request for an empty round trip over a Unix socket.
+  On branch `iso/floor`, `BENCH_BOUNDARY` measured 25.6 µs of CPU time per
+  request for an empty round trip over a Unix socket.
 - [ ] Find the cause of the 81% loss of KV throughput in `iso3/cgroup`.
 - [ ] Move each worker from milestone 3 into its own process and benchmark it.
       If any metric misses its target, stop and revise the plan.
@@ -255,9 +255,9 @@ tracking code.
   limits. We do not enforce per-user fairness inside an organization yet. If a
   user reaches the limit, other users in that organization get retryable HTTP
   503 errors.
-- **Per-owner limits.** Each organization is a separate owner, and a user can
-  create up to 100 organizations. This is acceptable because deployments either
-  run a single organization or bill for each organization.
+- **Per-owner limits.** Each organization is a separate owner. A user can
+  create up to 100 organizations. Deployments either run a single organization
+  or bill for each organization, so this limit is acceptable.
 - **Node-local workers.** Each node runs its own workers. Peers see only nodes.
   Cluster membership, routing, and placement do not change.
 - **Limits without guarantees.** Tenants get resource limits, not resource
